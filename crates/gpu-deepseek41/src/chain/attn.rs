@@ -95,6 +95,10 @@ use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
 use crate::transpose::TransposeKernels;
 
+mod batch;
+
+pub use batch::{AttnBatch, BatchIo, ChunkCaches, ChunkSource, SUB_TOKENS};
+
 const WHAT: &str = "deepseek41 AttnChain";
 
 /// The compressed rows a layer's attention reads, and what it writes.
@@ -608,6 +612,8 @@ struct LayerPlan {
     /// with a stream, the window rope otherwise.
     forward: usize,
     back: usize,
+    /// Those two tables.
+    tables: (Table, Table),
 }
 
 struct Kernels {
@@ -2111,7 +2117,7 @@ fn enqueue_indexer(
     joined: Joined,
     io: IndexerIo<'_>,
 ) -> Result<(), GpuError> {
-    let (d, w, gpu, stream, m) = (cx.d, cx.w, cx.gpu, cx.gpu.stream(), cx.m);
+    let (d, w, gpu, m) = (cx.d, cx.w, cx.gpu, cx.m);
     let refuse = |detail: &str| GpuError::Shape {
         what: WHAT,
         detail: detail.to_string(),
@@ -2184,15 +2190,34 @@ fn enqueue_indexer(
             rows_of(&r.qkv, w_at, w_rows, m)?,
         ),
     };
+    enqueue_select(cx, lp, kernels, sel, &q_in, &w_in, io)
+}
+
+/// The indexer's score and top-k passes of the pass's tokens into the list,
+/// from its two projections in the gemvs' layout, a token per column: `q_in`
+/// the query's, `w_in` the weights'.
+fn enqueue_select(
+    cx: &Cx<'_>,
+    lp: &LayerPlan,
+    kernels: &IndexerKernels,
+    sel: &mut SelectScratch,
+    q_in: &DeviceBuffer<f32>,
+    w_in: &DeviceBuffer<f32>,
+    io: IndexerIo<'_>,
+) -> Result<(), GpuError> {
+    let (d, m) = (cx.d, cx.m);
     let words = cx.words.view::<u32>(0, cx.words.layout.len)?;
     let scratch = count_of(&mut sel.streams, m)?[io.stream]
         .as_mut()
-        .ok_or_else(|| refuse("an indexer layer's stream has no indexer scratch"))?;
+        .ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: "an indexer layer's stream has no indexer scratch".to_string(),
+        })?;
     kernels.enqueue(
-        stream,
+        cx.gpu.stream(),
         IndexerArgs {
-            q: &q_in,
-            w: &w_in,
+            q: q_in,
+            w: w_in,
             ints: &words,
             n_vis_at: cx.words.layout.streams[io.stream].nvis,
             top_k_at: cx.words.layout.top_k,
@@ -2223,27 +2248,69 @@ fn enqueue_source(
     raw: &mut Option<Raw>,
     io: &mut SourceIo<'_>,
 ) -> Result<(), GpuError> {
-    let (d, w, gpu, stream, m) = (cx.d, cx.w, cx.gpu, cx.gpu.stream(), cx.m);
-    let sw = &cx.words.layout.streams[sp.stream];
-    let step = cx.words.view::<u32>(sw.step, sw.geom.words())?;
-    let cs = cx
-        .words
-        .view::<f32>(sw.cs, sw.geom.max_groups * d.rope_dims)?;
-    let gain = vector(w, &sp.norm)?;
+    let ratio = cx.words.layout.streams[sp.stream].geom.ratio;
+    let st = SourceTensors::of(cx.w, sp, ratio, io.ring.is_some())?;
     let missing = GpuError::State {
         what: WHAT,
         missing: "the compressor's row-major scratch",
     };
-    let (mut raw_proj, raw_key) = match raw.as_mut() {
+    let (raw_proj, raw_key) = match raw.as_mut() {
         Some(r) => (Some(r.proj.as_mut().ok_or(missing)?), r.key.as_mut()),
         None => (None, None),
     };
-    let act = count_of(&mut src.act, m)?;
-    let width = compress::WIDTH;
-    match (&sp.gate, io.ring.as_mut()) {
-        (Some(gate), Some((values, scores))) => {
-            let joint = match joint_q3k(w, &sp.kv_gate)? {
-                Some(t) if t.rows() == 2 * width => Some(t),
+    let act = count_of(&mut src.act, cx.m)?;
+    source_project(cx, &st, act, &mut src.proj, raw_proj)?;
+    source_rows(
+        cx,
+        sp,
+        &st,
+        SourceRows {
+            kv: src.proj.part(COMP_KV),
+            score: src.proj.part(COMP_SCORE),
+            pre: &mut src.pre,
+            act_pre: &mut src.act_pre,
+            key: &mut src.key,
+            raw_key,
+        },
+        io,
+    )
+}
+
+/// A compressor layer's tensors as resident, for its launches.
+struct SourceTensors<'w> {
+    proj: SourceProj<'w>,
+    gain: &'w DeviceBuffer<f32>,
+    /// The index key's projection and norm, on a layer that owns index keys.
+    keys: Option<(&'w DeviceTensor<u32>, &'w DeviceBuffer<f32>)>,
+}
+
+/// A compressor's projections of its normed input as resident.
+#[derive(Clone, Copy)]
+enum SourceProj<'w> {
+    /// At ratio 1: kv alone.
+    Kv(&'w DeviceTensor<u32>),
+    /// Above it: kv and the gate as one joined row stream …
+    Joint(&'w DeviceTensor<u32>),
+    /// … or each its own.
+    Split {
+        kv: &'w DeviceTensor<u32>,
+        gate: &'w DeviceTensor<u32>,
+    },
+}
+
+impl<'w> SourceTensors<'w> {
+    /// `sp`'s, at `ratio`: a gate and a ring go together (above ratio 1), a
+    /// join is refused unless it is kv's and the gate's rows.
+    fn of(
+        w: &'w Weights,
+        sp: &SourcePlan,
+        ratio: usize,
+        ring: bool,
+    ) -> Result<SourceTensors<'w>, GpuError> {
+        let width = compress::WIDTH;
+        let proj = match (&sp.gate, ring) {
+            (Some(gate), true) => match joint_q3k(w, &sp.kv_gate)? {
+                Some(t) if t.rows() == 2 * width => SourceProj::Joint(t),
                 Some(t) => {
                     return Err(GpuError::Shape {
                         what: WHAT,
@@ -2254,111 +2321,192 @@ fn enqueue_source(
                         ),
                     });
                 }
-                None => None,
-            };
-            match (joint, raw_proj.as_deref_mut()) {
-                (Some(t), None) => gpu.enqueue_gemv_q3k(t, act, src.proj.whole_mut())?,
-                (Some(t), Some(r)) => gpu.enqueue_gemv_q3k(t, act, r)?,
-                (None, None) => {
-                    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, act, src.proj.part_mut(COMP_KV))?;
-                    gpu.enqueue_gemv_q3k(q3_k(w, gate)?, act, src.proj.part_mut(COMP_SCORE))?;
-                }
-                (None, Some(r)) => {
-                    let mut kv = rows_of_mut(r, 0, width, m)?;
-                    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, act, &mut kv)?;
-                    drop(kv);
-                    let mut score = rows_of_mut(r, width, width, m)?;
-                    gpu.enqueue_gemv_q3k(q3_k(w, gate)?, act, &mut score)?;
-                }
-            }
-            if let Some(r) = raw_proj.as_deref() {
-                for (part, r0) in [(COMP_KV, 0), (COMP_SCORE, width)] {
-                    let rows = rows_of(r, r0, width, m)?;
-                    cx.k.transpose
-                        .enqueue(stream, &rows, width, m, src.proj.part_mut(part))?;
-                }
-            }
-            cx.k.comp.enqueue_pool(
-                stream,
-                PoolArgs {
-                    geom: sw.geom,
-                    step: &step,
-                    kv: src.proj.part(COMP_KV),
-                    score: src.proj.part(COMP_SCORE),
-                    gain,
-                    cs: &cs,
-                    eps: d.eps,
-                    n_dims: d.rope_dims,
-                    ring_kv: values.buf_mut(),
-                    ring_score: scores.buf_mut(),
-                    pre: &mut src.pre,
-                    cache: &mut *io.rows,
+                None => SourceProj::Split {
+                    kv: q3_k(w, &sp.kv)?,
+                    gate: q3_k(w, gate)?,
                 },
-            )?;
-        }
-        (None, None) => {
-            match raw_proj {
-                None => {
-                    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, act, src.proj.part_mut(COMP_KV))?;
-                }
-                Some(r) => {
-                    let mut kv = rows_of_mut(r, 0, width, m)?;
-                    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, act, &mut kv)?;
-                    drop(kv);
-                    let rows = rows_of(r, 0, width, m)?;
-                    cx.k.transpose
-                        .enqueue(stream, &rows, width, m, src.proj.part_mut(COMP_KV))?;
-                }
+            },
+            (None, false) => SourceProj::Kv(q3_k(w, &sp.kv)?),
+            (gate, ring) => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "a compressor of ratio {ratio} with a gate {} and a ring passed {ring}",
+                        gate.is_some(),
+                    ),
+                });
             }
+        };
+        let keys = match &sp.keys {
+            Some((proj, norm)) => Some((q3_k(w, proj)?, vector(w, norm)?)),
+            None => None,
+        };
+        Ok(SourceTensors {
+            proj,
+            gain: vector(w, &sp.norm)?,
+            keys,
+        })
+    }
+}
+
+/// The compressor's projections of the pass's normed input `act` into
+/// `proj`, token-major: in place without `raw` (one token), else through
+/// `raw` in the gemvs' row-major layout.
+fn source_project(
+    cx: &Cx<'_>,
+    st: &SourceTensors<'_>,
+    act: &Q8Act,
+    proj: &mut PartedBuffer<f32, 2>,
+    mut raw: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    let (gpu, stream, m) = (cx.gpu, cx.gpu.stream(), cx.m);
+    let width = compress::WIDTH;
+    match (st.proj, raw.as_deref_mut()) {
+        (SourceProj::Joint(t), None) => gpu.enqueue_gemv_q3k(t, act, proj.whole_mut())?,
+        (SourceProj::Joint(t), Some(r)) => gpu.enqueue_gemv_q3k(t, act, r)?,
+        (SourceProj::Split { kv, gate }, None) => {
+            gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?;
+            gpu.enqueue_gemv_q3k(gate, act, proj.part_mut(COMP_SCORE))?;
+        }
+        (SourceProj::Split { kv, gate }, Some(r)) => {
+            let mut kv_rows = rows_of_mut(r, 0, width, m)?;
+            gpu.enqueue_gemv_q3k(kv, act, &mut kv_rows)?;
+            drop(kv_rows);
+            let mut score = rows_of_mut(r, width, width, m)?;
+            gpu.enqueue_gemv_q3k(gate, act, &mut score)?;
+        }
+        (SourceProj::Kv(kv), None) => gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?,
+        (SourceProj::Kv(kv), Some(r)) => {
+            let mut kv_rows = rows_of_mut(r, 0, width, m)?;
+            gpu.enqueue_gemv_q3k(kv, act, &mut kv_rows)?;
+        }
+    }
+    if let Some(r) = raw.as_deref() {
+        let parts: &[(usize, usize)] = match st.proj {
+            SourceProj::Kv(_) => &[(COMP_KV, 0)],
+            _ => &[(COMP_KV, 0), (COMP_SCORE, width)],
+        };
+        for &(part, r0) in parts {
+            let rows = rows_of(r, r0, width, m)?;
+            cx.k.transpose
+                .enqueue(stream, &rows, width, m, proj.part_mut(part))?;
+        }
+    }
+    Ok(())
+}
+
+/// What a compressor's rows read and write besides its caches: its
+/// projections token-major (`score` read above ratio 1 alone), the pooled
+/// row before the rope, the index key's input in q8_1 and its projection,
+/// and the key's row-major scratch.
+struct SourceRows<'a> {
+    kv: &'a DeviceBuffer<f32>,
+    score: &'a DeviceBuffer<f32>,
+    pre: &'a mut DeviceBuffer<f32>,
+    act_pre: &'a mut Q8Act,
+    key: &'a mut DeviceBuffer<f32>,
+    raw_key: Option<&'a mut DeviceBuffer<f32>>,
+}
+
+/// A compressor's state-carrying launches over the pass's tokens, from its
+/// projections: the pooled (or ratio-1) row into the cache, then the index
+/// key.
+fn source_rows(
+    cx: &Cx<'_>,
+    sp: &SourcePlan,
+    st: &SourceTensors<'_>,
+    r: SourceRows<'_>,
+    io: &mut SourceIo<'_>,
+) -> Result<(), GpuError> {
+    let (d, gpu, stream) = (cx.d, cx.gpu, cx.gpu.stream());
+    let sw = &cx.words.layout.streams[sp.stream];
+    let step = cx.words.view::<u32>(sw.step, sw.geom.words())?;
+    let cs = cx
+        .words
+        .view::<f32>(sw.cs, sw.geom.max_groups * d.rope_dims)?;
+    let SourceRows {
+        kv,
+        score,
+        pre,
+        act_pre,
+        key,
+        raw_key,
+    } = r;
+    match (st.proj, io.ring.as_mut()) {
+        (SourceProj::Kv(_), None) => {
             cx.k.comp.enqueue_rows(
                 stream,
                 RowsArgs {
                     geom: sw.geom,
                     step: &step,
-                    kv: src.proj.part(COMP_KV),
-                    gain,
+                    kv,
+                    gain: st.gain,
                     cs: &cs,
                     eps: d.eps,
                     n_dims: d.rope_dims,
-                    pre: &mut src.pre,
+                    pre: &mut *pre,
                     cache: &mut *io.rows,
                 },
             )?;
         }
-        (gate, ring) => {
+        (SourceProj::Joint(_) | SourceProj::Split { .. }, Some((values, scores))) => {
+            cx.k.comp.enqueue_pool(
+                stream,
+                PoolArgs {
+                    geom: sw.geom,
+                    step: &step,
+                    kv,
+                    score,
+                    gain: st.gain,
+                    cs: &cs,
+                    eps: d.eps,
+                    n_dims: d.rope_dims,
+                    ring_kv: values.buf_mut(),
+                    ring_score: scores.buf_mut(),
+                    pre: &mut *pre,
+                    cache: &mut *io.rows,
+                },
+            )?;
+        }
+        (_, ring) => {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!(
-                    "a compressor of ratio {} with a gate {} and a ring passed {}",
+                    "a compressor of ratio {} whose projections were resolved {} a ring; it was \
+                     passed {}",
                     sw.geom.ratio,
-                    gate.is_some(),
-                    ring.is_some()
+                    if matches!(st.proj, SourceProj::Kv(_)) {
+                        "without"
+                    } else {
+                        "with"
+                    },
+                    if ring.is_some() { "one" } else { "none" }
                 ),
             });
         }
     }
-    match (&sp.keys, io.keys.as_deref_mut()) {
+    match (st.keys, io.keys.as_deref_mut()) {
         (Some((proj, norm)), Some(keys)) => {
-            let groups = src.act_pre.m();
-            gpu.enqueue_quantize_q8_1_layer(&src.pre, &mut src.act_pre, cx.layer)?;
+            let groups = act_pre.m();
+            gpu.enqueue_quantize_q8_1_layer(pre, act_pre, cx.layer)?;
             match raw_key {
                 // The key's gemv runs the geometry's group slots, a column
                 // each: the pooling wrote the pre-rope rows of the groups the
                 // pass completes, and the index key reads only those.
                 Some(rk) if groups > 1 => {
-                    gpu.enqueue_gemv_q3k(q3_k(w, proj)?, &src.act_pre, rk)?;
+                    gpu.enqueue_gemv_q3k(proj, act_pre, rk)?;
                     cx.k.transpose
-                        .enqueue(stream, rk, index_key::WIDTH, groups, &mut src.key)?;
+                        .enqueue(stream, rk, index_key::WIDTH, groups, key)?;
                 }
-                _ => gpu.enqueue_gemv_q3k(q3_k(w, proj)?, &src.act_pre, &mut src.key)?,
+                _ => gpu.enqueue_gemv_q3k(proj, act_pre, key)?,
             }
             cx.k.key.enqueue_index_key(
                 stream,
                 IndexKeyArgs {
                     geom: sw.geom,
                     step: &step,
-                    k: &src.key,
-                    gain: vector(w, norm)?,
+                    k: key,
+                    gain: norm,
                     cs: &cs,
                     eps: d.eps,
                     n_dims: d.rope_dims,
@@ -2483,11 +2631,12 @@ fn layer_plan(
         }
         _ => None,
     };
-    let t = |table| words.tables[table_index(table)];
-    let (forward, back) = match stream {
-        Some(_) => (t(Table::YarnForward), t(Table::YarnBack)),
-        None => (t(Table::WindowForward), t(Table::WindowBack)),
+    let tables = match stream {
+        Some(_) => (Table::YarnForward, Table::YarnBack),
+        None => (Table::WindowForward, Table::WindowBack),
     };
+    let t = |table| words.tables[table_index(table)];
+    let (forward, back) = (t(tables.0), t(tables.1));
     Ok(LayerPlan {
         names: Names {
             hc_fn: names::hc_attn_fn(l),
@@ -2510,6 +2659,7 @@ fn layer_plan(
         indexer,
         forward,
         back,
+        tables,
     })
 }
 

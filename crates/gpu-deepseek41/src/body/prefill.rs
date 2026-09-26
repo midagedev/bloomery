@@ -21,14 +21,16 @@
 //! 1. before the first layer, once per batch: each chunk planned in order
 //!    (the host step plan, after the tokens before it), every token's rows
 //!    read at once ([`PromptRows`]), each chunk's image built and every image
-//!    copied to the card in one transfer, the attention piece's gather of
-//!    each chunk's words into its own row, the embedding broadcast;
+//!    copied to the card in one transfer with every token's rope tables
+//!    ([`AttnBatch::stage_tables`]), the attention piece's gather of each
+//!    chunk's words into its own row, the embedding broadcast;
 //! 2. per layer: the engram step where the layer carries a site, chunk by
-//!    chunk; the attention sub-layer chunk by chunk in position order — a
-//!    chunk of the block's staged and committed to the ring before the next
-//!    chunk attends ([`AttnChain::enqueue_layer_staged`]), a chunk before the
-//!    block's first its latent rows alone
-//!    ([`AttnChain::enqueue_layer_part`]); the MoE sub-layer over the block's
+//!    chunk; the attention sub-layer ([`AttnChain::enqueue_batch_layer`]):
+//!    its projections once over sub-blocks of chunks, and chunk by chunk in
+//!    position order only what carries state from a position to the next — a
+//!    chunk of the block's latent rows staged and committed to the ring
+//!    before the next chunk attends, a chunk before the block's first its
+//!    latent rows alone; the MoE sub-layer over the block's
 //!    chunks in its batch phases ([`crate::chain::ffn::FfnBatch`]) — the
 //!    route of every chunk, the handoffs to the host, the card's shadow work
 //!    of every chunk while one union call serves the layer's host experts for
@@ -56,9 +58,11 @@ use std::time::Instant;
 use cuda_core::{CudaEvent, sys};
 use model::moe::UNION_MAX_COLS;
 
+use bloomery_gpu::COL_GROUP;
+
 use super::ced::Mode;
 use super::*;
-use crate::chain::attn::{PartIo, StageIo};
+use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
 use crate::chain::ffn::{BlockIo, CardExperts, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
@@ -70,6 +74,8 @@ pub const T_MAX: usize = UNION_MAX_COLS;
 
 /// Positions one chunk runs at most: the m-column kernels' and HC_PRE's.
 pub const CHUNK: usize = HC_MAX_TOKENS;
+// A chunk is a column group of the batch-wide projections.
+const _: () = assert!(CHUNK == COL_GROUP);
 
 /// Chunks a batch cuts into at most: an unaligned first position adds one.
 const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
@@ -316,8 +322,9 @@ pub(super) struct Batch {
     images: Vec<u32>,
     params: DeviceBuffer<u32>,
     /// The attention piece over images of [`CHUNK`] tokens, a row of words
-    /// per chunk.
+    /// per chunk, and its batch-wide buffers.
     attn: AttnChain,
+    proj: AttnBatch,
     glue: GlueBatch,
     ffn: FfnBatch,
     rows: PromptRows,
@@ -370,10 +377,24 @@ pub struct PrefillStats {
     pub copy_ns: u64,
     /// Card time, with [`Body::set_prefill_card_timing`] on: from each
     /// layer's first launch to its route's copies (its attention alone where
-    /// it has no block), and its shadow, which runs under the union.
+    /// it has no block), and its shadow, which runs under the union; and the
+    /// attention's batch-wide projection phases, summed.
     pub card_timed: bool,
     pub card_out_ms: f64,
     pub card_in_ms: f64,
+    pub card_proj_ms: f64,
+    /// Entries the batches put in the launch queue — launches, copies, event
+    /// records, stream waits: those before each layer-batch's wait on its
+    /// route's copies (the batch's first steps, the engram step, the
+    /// attention, the route and its copies, the previous layer's upload,
+    /// join and tap) and those of each shadow ([`Body::enqueue_batch`]'s
+    /// counts). The attention's are counted as enqueued; the rest by the
+    /// launches each site's code makes.
+    pub entries_route: u64,
+    pub entries_shadow: u64,
+    /// Of the host slots the batch services listed, those the service's
+    /// exclusion set skipped (`HybridStats::batch_excluded_slots`).
+    pub excluded_slots: u64,
 }
 
 impl PrefillStats {
@@ -401,11 +422,14 @@ impl PrefillStats {
         };
         let card = if self.card_timed {
             format!(
-                "card_out_ms={:.1} card_in_ms={:.1} card_out_lb={:.2} card_in_lb={:.2}",
+                "card_out_ms={:.1} card_in_ms={:.1} card_proj_ms={:.1} card_out_lb={:.2} \
+                 card_in_lb={:.2} card_proj_lb={:.2}",
                 self.card_out_ms,
                 self.card_in_ms,
+                self.card_proj_ms,
                 per(self.card_out_ms),
-                per(self.card_in_ms)
+                per(self.card_in_ms),
+                per(self.card_proj_ms)
             )
         } else {
             "card=untimed".to_string()
@@ -413,7 +437,8 @@ impl PrefillStats {
         format!(
             "batches={} layer_batches={} prologue_ms={:.1} chain_ms={:.1} union_ms={:.1} \
              wait_ms={:.1} enqueue_ms={:.1} copy_ms={:.1} union_lb={:.2} wait_lb={:.2} \
-             enqueue_lb={:.2} copy_lb={:.2} {card}",
+             enqueue_lb={:.2} copy_lb={:.2} entries_route={:.1} entries_shadow={:.1} \
+             excluded_lb={:.1} {card}",
             self.batches,
             self.layer_batches,
             ms(self.prologue_ns),
@@ -426,6 +451,9 @@ impl PrefillStats {
             per(ms(self.wait_ns)),
             per(ms(self.enqueue_ns())),
             per(ms(self.copy_ns)),
+            per(self.entries_route as f64),
+            per(self.entries_shadow as f64),
+            per(self.excluded_slots as f64),
         )
     }
 }
@@ -438,6 +466,7 @@ impl Batch {
     fn device_bytes(&self) -> usize {
         self.params.num_bytes()
             + self.attn.device_bytes()
+            + self.proj.device_bytes()
             + self.glue.device_bytes()
             + self.ffn.device_bytes()
             + self.hc.iter().map(|b| b.num_bytes()).sum::<usize>()
@@ -459,6 +488,154 @@ struct BatchRun<'a> {
     ids: &'a [u32],
     pos: u32,
     last: bool,
+}
+
+/// A layer's caches with each chunk's list ([`Batch::lists`]), as
+/// [`AttnChain::enqueue_batch_layer`] asks for them chunk by chunk.
+struct LayerCaches<'a> {
+    kv: &'a mut [LayerKv],
+    shadows: &'a mut Shadows,
+    lists: &'a mut [Vec<DeviceBuffer<u32>>],
+    i: usize,
+    step: LayerStep,
+}
+
+impl ChunkSource for LayerCaches<'_> {
+    fn chunk(&mut self, k: usize) -> Result<ChunkCaches<'_>, GpuError> {
+        let lists = self.lists.get_mut(k).ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the chunk's lists",
+        })?;
+        let LayerIo {
+            ring,
+            shadow,
+            compressed,
+            selection,
+        } = layer_io(self.kv, self.shadows, lists, self.i, &self.step)?;
+        Ok(ChunkCaches {
+            ring,
+            shadow,
+            compressed,
+            selection,
+        })
+    }
+}
+
+/// Queue entries — launches, copies, event records, stream waits — of the
+/// batch's launch sites outside the attention piece, by the launches each
+/// site's code makes; the piece counts its own
+/// ([`AttnBatch::take_entries`]).
+mod queue {
+    use std::ops::Range;
+
+    use bloomery_gpu::weights::{DevWeight, Weights};
+    use gguf::quant::GgmlType;
+    use model::arch::deepseek41::names;
+
+    use crate::chain::ffn::CardExperts;
+
+    /// A chunk's words gather (`AttnChain::enqueue_step_of`).
+    pub(super) const GATHER: u64 = 1;
+    /// After a layer-batch's union: the host sums' copy
+    /// (`FfnBatch::enqueue_upload`) and the join (`enqueue_batch_join`).
+    pub(super) const UPLOAD_JOIN: u64 = 2;
+
+    /// Whether the resident weight `name` is read in q8_1: a Q3_K or Q4_K
+    /// row stream.
+    pub(super) fn q8(w: &Weights, name: &str) -> bool {
+        matches!(
+            w.get(name),
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q3_K | GgmlType::Q4_K,
+                ..
+            })
+        )
+    }
+
+    /// The embedding broadcast of `tokens` tokens
+    /// (`GlueBatch::enqueue_batch_embed`): a launch a token.
+    pub(super) fn embed(tokens: usize) -> u64 {
+        tokens as u64
+    }
+
+    /// A chunk of `m` tokens' engram step (`Glue::enqueue_batch_engram`): a
+    /// row launch a token, the q8_1 form when `wkv` reads one, the wkv
+    /// projection and past one token its copy token-major, the key norm, the
+    /// gate and the fold.
+    pub(super) fn engram(m: usize, wkv_q8: bool) -> u64 {
+        m as u64 + u64::from(wkv_q8) + 1 + u64::from(m > 1) + 3
+    }
+
+    /// The route of a block of `chunks` chunks (`FfnPiece::enqueue_batch_route`
+    /// and `FfnBatch::enqueue_download`): each chunk's norm, the router's two
+    /// launches, the places, the three copies to the host and their event.
+    pub(super) fn route(chunks: usize) -> u64 {
+        chunks as u64 + 2 + 1 + 3 + 1
+    }
+
+    /// A layer's shared expert as resident: gate·up both Q3_K (one launch
+    /// for a chunk, else one a token), and a down read in q8_1.
+    #[derive(Clone, Copy)]
+    pub(super) struct Shared {
+        gate_up_q3k: bool,
+        down_q8: bool,
+    }
+
+    impl Shared {
+        pub(super) fn of(w: &Weights, l: usize) -> Shared {
+            let q3k = |name: &str| {
+                matches!(
+                    w.get(name),
+                    Some(DevWeight::KQuant {
+                        ty: GgmlType::Q3_K,
+                        ..
+                    })
+                )
+            };
+            Shared {
+                gate_up_q3k: q3k(&names::ffn_gate_shexp(l)) && q3k(&names::ffn_up_shexp(l)),
+                down_q8: q8(w, &names::ffn_down_shexp(l)),
+            }
+        }
+    }
+
+    /// The shadow of a block of `chunks` (`FfnPiece::enqueue_batch_shadow`)
+    /// on the `experts` arm, with card experts or not: per chunk HC_PRE and
+    /// the norm; per expert, the norm's q8_1 codes and scales copied into the
+    /// block's planes when there are card experts; per slot, the card's
+    /// gate·up, its q8_1 form and the down when there are, and the card sum;
+    /// the shared expert's gate·up, its down's q8_1 form, the down and past
+    /// one token its copy token-major. Per expert, then over the block: the
+    /// buckets, the grouped gate·up, its q8_1 form and the grouped down when
+    /// there are card experts, and the card sum.
+    pub(super) fn shadow(
+        chunks: &[Range<usize>],
+        experts: CardExperts,
+        card: bool,
+        shared: Shared,
+    ) -> u64 {
+        let expert = matches!(experts, CardExperts::Expert);
+        let per_chunk: u64 = chunks
+            .iter()
+            .map(|r| {
+                let m = r.len() as u64;
+                let routed = match (expert, card) {
+                    (true, true) => 2,
+                    (true, false) => 0,
+                    (false, true) => 3 + 1,
+                    (false, false) => 1,
+                };
+                let gate_up = if shared.gate_up_q3k { 1 } else { m };
+                2 + routed + gate_up + u64::from(shared.down_q8) + 1 + u64::from(m > 1)
+            })
+            .sum();
+        let block = match (expert, card) {
+            (true, true) => 4 + 1,
+            (true, false) => 1,
+            (false, _) => 0,
+        };
+        per_chunk + block
+    }
 }
 
 /// The positions `b .. b + u` cut into chunks: at every multiple of
@@ -514,44 +691,57 @@ impl Body {
         let list_len = attn.list_len();
         let n = hp.n_embd;
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        let params = DeviceBuffer::zeroed(stream, CHUNKS_MAX * words)?;
+        let glue = self.glue.batch(gpu, image.layout())?;
+        let ffn = FfnBatch::new(gpu, n, hp.experts.ff, T_MAX, CardExperts::from_env()?)?;
+        let hc = [
+            DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
+            DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
+        ];
+        let folds = [
+            DeviceBuffer::zeroed(stream, T_MAX * n)?,
+            DeviceBuffer::zeroed(stream, T_MAX * n)?,
+        ];
+        let lists = (0..CHUNKS_MAX)
+            .map(|_| {
+                (0..writers)
+                    .map(|_| DeviceBuffer::zeroed(stream, CHUNK * list_len))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let staging = DeviceTensor::zeroed(stream, CHUNK, hp.head_dim)?;
+        let taps = (tap_width > 0)
+            .then(|| DeviceBuffer::zeroed(stream, T_MAX * tap_width))
+            .transpose()?;
+        let card_marks = (0..CARD_MARKS * self.layers.len())
+            .map(|_| {
+                gpu.context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Last: its refusal names the card's free bytes with every other
+        // buffer of the batch already taken.
+        let proj = attn.batch(gpu, T_MAX)?;
         Ok(Batch {
             plans: vec![StepPlan::default(); CHUNKS_MAX],
             images: vec![0; CHUNKS_MAX * words],
-            params: DeviceBuffer::zeroed(stream, CHUNKS_MAX * words)?,
-            glue: self.glue.batch(gpu, image.layout())?,
-            ffn: FfnBatch::new(gpu, n, hp.experts.ff, T_MAX, CardExperts::from_env()?)?,
+            params,
+            glue,
+            ffn,
             rows: self.rows.prompt_rows(T_MAX),
-            hc: [
-                DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
-                DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
-            ],
-            folds: [
-                DeviceBuffer::zeroed(stream, T_MAX * n)?,
-                DeviceBuffer::zeroed(stream, T_MAX * n)?,
-            ],
-            lists: (0..CHUNKS_MAX)
-                .map(|_| {
-                    (0..writers)
-                        .map(|_| DeviceBuffer::zeroed(stream, CHUNK * list_len))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            staging: DeviceTensor::zeroed(stream, CHUNK, hp.head_dim)?,
-            taps: (tap_width > 0)
-                .then(|| DeviceBuffer::zeroed(stream, T_MAX * tap_width))
-                .transpose()?,
+            hc,
+            folds,
+            lists,
+            staging,
+            taps,
             taps_host: vec![0.0; T_MAX * tap_width],
             stats: PrefillStats::default(),
             card_timing: false,
-            card_marks: (0..CARD_MARKS * self.layers.len())
-                .map(|_| {
-                    gpu.context()
-                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            card_marks,
             card_served: vec![false; self.layers.len()],
             image,
             attn,
+            proj,
         })
     }
 
@@ -568,14 +758,24 @@ impl Body {
     /// ([`PrefillStats`]); off, no event is recorded. Makes the batch's
     /// buffers.
     pub fn set_prefill_card_timing(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
-        self.batch_mut(gpu)?.card_timing = on;
-        Ok(())
+        let layers = self.layers.len();
+        let batch = self.batch_mut(gpu)?;
+        batch.card_timing = on;
+        batch.proj.set_card_timing(gpu, on, layers)
     }
 
     /// Device bytes of the batch's buffers; 0 before the first batch.
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.device_bytes())
+    }
+
+    /// The part of [`Body::batch_bytes`] the batch-wide attention
+    /// projections hold ([`crate::chain::attn::AttnBatch`]); 0 before the
+    /// first batch.
+    #[must_use]
+    pub fn batch_proj_bytes(&self) -> usize {
+        self.batch.as_ref().map_or(0, |b| b.proj.device_bytes())
     }
 
     /// A prompt call of positions `first .. end`, fed as batches from
@@ -732,12 +932,17 @@ impl Body {
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];
         }
-        let union0 = self.hybrid.stats().batch_ns;
+        let (union0, excluded0) = {
+            let st = self.hybrid.stats();
+            (st.batch_ns, st.batch_excluded_slots)
+        };
         let t1 = Instant::now();
         self.enqueue_batch_chain(gpu, w, head, &cuts, last, observe)?;
         let chain = nanos(t1.elapsed());
-        let union = self.hybrid.stats().batch_ns.saturating_sub(union0);
-        self.account_batch(prologue, chain, union)?;
+        let st = self.hybrid.stats();
+        let union = st.batch_ns.saturating_sub(union0);
+        let excluded = st.batch_excluded_slots.saturating_sub(excluded0);
+        self.account_batch(prologue, chain, union, excluded)?;
         if last {
             return Ok(true);
         }
@@ -747,9 +952,16 @@ impl Body {
         }
     }
 
-    /// Add one batch's times to the stats; with card timing on, read its
-    /// layers' event pairs, which waits for the last of them.
-    fn account_batch(&mut self, prologue: u64, chain: u64, union: u64) -> Result<(), GpuError> {
+    /// Add one batch's times and the host slots its services' exclusion
+    /// skipped to the stats; with card timing on, read its layers' event
+    /// pairs, which waits for the last of them.
+    fn account_batch(
+        &mut self,
+        prologue: u64,
+        chain: u64,
+        union: u64,
+        excluded: u64,
+    ) -> Result<(), GpuError> {
         let layers = self.layers.len();
         let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
@@ -763,10 +975,12 @@ impl Body {
         st.union_ns += union;
         st.wait_ns += serve.wait_ns;
         st.copy_ns += serve.copy_ns;
+        st.excluded_slots += excluded;
         if !batch.card_timing {
             return Ok(());
         }
         st.card_timed = true;
+        st.card_proj_ms += batch.proj.take_card_ms()?;
         let (marks, _) = batch.card_marks.as_chunks::<CARD_MARKS>();
         for ([e0, e1, e2], &served) in marks.iter().zip(&batch.card_served).take(layers) {
             st.card_out_ms += f64::from(e0.elapsed_ms(e1)?);
@@ -814,13 +1028,19 @@ impl Body {
             batch.image.build(
                 &batch.plans[k],
                 batch.rows.embd(at.clone())?,
-                batch.rows.engram(at)?,
+                batch.rows.engram(at.clone())?,
             )?;
             batch.images[k * words..(k + 1) * words].copy_from_slice(batch.image.words());
+            batch.proj.stage_tables(
+                batch.image.layout(),
+                batch.image.words(),
+                at.start,
+                at.len(),
+            )?;
         }
         let mut dst = span_mut(WHAT, &mut batch.params, 0, n * words)?;
         dst.copy_from_host(stream, &batch.images[..n * words])?;
-        Ok(())
+        batch.proj.upload_tables(stream)
     }
 
     /// The batch's launches (the module comment's steps 1 to 3 on the card),
@@ -863,10 +1083,13 @@ impl Body {
         let b = cuts.first().map_or(0, |r| r.start);
         let u: usize = cuts.iter().map(Range::len).sum();
         let s4 = HC_STREAMS * n;
+        // Queue entries before each layer-batch's wait, and of its shadow.
+        let (mut route, mut shadow) = (0u64, 0u64);
         for k in 0..cuts.len() {
             let p = span(WHAT, &batch.params, k * words, words)?;
             batch.attn.enqueue_step_of(gpu, &p, k)?;
         }
+        route += queue::GATHER * cuts.len() as u64 + queue::embed(u);
         for (k, r) in cuts.iter().enumerate() {
             let (at, m) = (r.start - b, r.len());
             let p = span(WHAT, &batch.params, k * words, words)?;
@@ -885,6 +1108,7 @@ impl Body {
             let timed = batch.card_timing;
             if timed {
                 batch.card_marks[CARD_MARKS * i].record(stream)?;
+                route += 1;
             }
             batch.card_served[i] = false;
             // The layer runs a suffix of the chunks: its latent part from
@@ -898,8 +1122,10 @@ impl Body {
                 .position(|r| need.mode(i, r.start) == Mode::Full)
                 .unwrap_or(cuts.len());
             if step.engram {
+                let wkv_q8 = queue::q8(w, &names::engram_wkv(l));
                 for (k, r) in cuts.iter().enumerate().skip(run) {
                     let (at, m) = (r.start - b, r.len());
+                    route += queue::engram(m, wkv_q8);
                     let p = span(WHAT, &batch.params, k * words, words)?;
                     let (hin, hout) = ping(&mut batch.hc, cur.s);
                     let streams = span(WHAT, hin, at * s4, m * s4)?;
@@ -936,59 +1162,35 @@ impl Body {
                     },
                 )?;
             }
-            for (k, r) in cuts.iter().enumerate().skip(run) {
-                let (at, m) = (r.start - b, r.len());
-                let LayerIo {
-                    ring,
-                    shadow,
-                    compressed,
-                    selection,
-                } = layer_io(kv, shadows, &mut batch.lists[k], i, &step)?;
-                if k < full {
-                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
-                    batch.attn.enqueue_layer_part(
-                        gpu,
-                        w,
-                        l,
-                        k,
-                        m,
-                        PartIo {
-                            fold_in: &fold_in,
-                            ring,
-                            shadow,
-                            compressed,
-                        },
-                    )?;
-                    continue;
-                }
+            {
                 let (sin, sout) = ping(&mut batch.hc, cur.s);
                 let (fin, fout) = ping(&mut batch.folds, cur.f);
-                let streams_in = span(WHAT, sin, at * s4, m * s4)?;
-                let mut streams_out = span_mut(WHAT, sout, at * s4, m * s4)?;
-                let fold_in = span(WHAT, fin, at * n, m * n)?;
-                let mut fold_out = span_mut(WHAT, fout, at * n, m * n)?;
-                batch.attn.enqueue_layer_staged(
+                let mut caches = LayerCaches {
+                    kv: &mut kv[..],
+                    shadows: &mut *shadows,
+                    lists: &mut batch.lists[..],
+                    i,
+                    step,
+                };
+                batch.attn.enqueue_batch_layer(
                     gpu,
                     w,
                     l,
-                    k,
-                    m,
-                    AttnIo {
-                        streams_in: &streams_in,
-                        fold_in: &fold_in,
-                        streams_out: &mut streams_out,
-                        fold_out: &mut fold_out,
-                        ring,
-                        shadow,
-                        compressed,
-                        selection,
+                    &mut batch.proj,
+                    BatchIo {
+                        cuts,
+                        run,
+                        full,
+                        streams_in: sin,
+                        fold_in: fin,
+                        streams_out: sout,
+                        fold_out: fout,
+                        staging: &mut batch.staging,
                     },
-                    StageIo {
-                        rows: &mut batch.staging,
-                        first: r.start,
-                    },
+                    &mut caches,
                 )?;
             }
+            route += batch.proj.take_entries();
             cur.s ^= 1;
             cur.f ^= 1;
             let at = token(full);
@@ -1002,11 +1204,12 @@ impl Body {
                     tokens: u - at,
                     streams: &batch.hc[cur.s],
                     fold: Some(&batch.folds[cur.f]),
-                    attn: Some(batch.attn.taps()),
+                    attn: Some(batch.attn.batch_taps(&batch.proj)),
                 },
             )?;
             if full == cuts.len() && timed {
                 batch.card_marks[CARD_MARKS * i + 1].record(stream)?;
+                route += 1;
             }
             if full < cuts.len() {
                 batch.card_served[i] = true;
@@ -1020,8 +1223,10 @@ impl Body {
                 let bl = ffn.resolve_batch(w, l)?;
                 ffn.enqueue_batch_route(gpu, &bl, &mut batch.ffn, &block, slots)?;
                 batch.ffn.enqueue_download(gpu, at, u)?;
+                route += queue::route(cuts.len() - full);
                 if timed {
                     batch.card_marks[CARD_MARKS * i + 1].record(stream)?;
+                    route += 1;
                 }
                 let card = CardStacks::of(w, l)?;
                 let block = BlockIo {
@@ -1030,12 +1235,20 @@ impl Body {
                     streams: &batch.hc[cur.s],
                     fold_in: &batch.folds[cur.f],
                 };
+                shadow += queue::shadow(
+                    &cuts[full..],
+                    batch.ffn.experts(),
+                    card.is_some(),
+                    queue::Shared::of(w, l),
+                );
                 ffn.enqueue_batch_shadow(gpu, &bl, card, &mut batch.ffn, &block)?;
                 if timed {
                     batch.card_marks[CARD_MARKS * i + 2].record(stream)?;
+                    shadow += 1;
                 }
                 batch.ffn.serve(hybrid, l, at, u)?;
                 batch.ffn.enqueue_upload(gpu, at, u)?;
+                route += queue::UPLOAD_JOIN;
                 let (sin, sout) = ping(&mut batch.hc, cur.s);
                 let (_, fout) = ping(&mut batch.folds, cur.f);
                 ffn.enqueue_batch_join(
@@ -1081,8 +1294,11 @@ impl Body {
                 batch
                     .ffn
                     .enqueue_tap_means(gpu, &s, m, width, slot * n, &mut rows)?;
+                route += 1;
             }
         }
+        batch.stats.entries_route += route;
+        batch.stats.entries_shadow += shadow;
         if last {
             let t = u - 1;
             let s = span(WHAT, &batch.hc[cur.s], t * s4, s4)?;

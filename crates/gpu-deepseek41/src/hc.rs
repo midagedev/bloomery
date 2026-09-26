@@ -51,7 +51,9 @@
 
 use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
 use bloomery_gpu::fault::quad_finite;
-use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
+use bloomery_gpu::{
+    COL_GROUP, ColGroups, DeviceTensor, FaultSink, FaultSite, GpuError, col_group, launch_u32,
+};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -80,6 +82,8 @@ const _: () = assert!(HC_ROWS_PER_WARP * HC_PRE_WARPS == HC_MIX && HC_ROWS_PER_W
 /// warp for HC_PRE and a thread per partial sum.
 pub const HC_MAX_TOKENS: usize = 8;
 const _: () = assert!(HC_MAX_TOKENS <= HC_PRE_WARPS);
+// A grouped launch's groups are the gemvs' column groups, and each fits one.
+const _: () = assert!(COL_GROUP == HC_MAX_TOKENS);
 /// The finishing block's first squares thread: token `t`'s squares are
 /// summed by thread `HC_SS_THREAD + t`, in the last warp, so the sum does
 /// not run behind the partial sums of threads `0..24m` in their warps.
@@ -396,6 +400,260 @@ unsafe fn column_sum(buf: &mut DisjointSlice<f32>, off: usize, stride: usize, n:
     acc
 }
 
+/// Where one HC_PRE block works: its piece `p`, the first of its group's
+/// tokens `t0` in the launch's input and output, and its group's scratch —
+/// partials from `part0`, squares from `ss0`, the ticket at `ticket`.
+#[derive(Clone, Copy)]
+struct HcPreAt {
+    p: usize,
+    t0: usize,
+    part0: usize,
+    ss0: usize,
+    ticket: usize,
+}
+
+/// A HC_PRE block's shared slots: the last-ticket flag, [`HC_MIX_SLOTS`]
+/// mixes and [`HC_MAX_TOKENS`] scales.
+#[derive(Clone, Copy)]
+struct HcPreShared {
+    last: *mut u32,
+    mix: *mut f32,
+    scl: *mut f32,
+}
+
+/// One block of HC_PRE over the `m` tokens of a group (the module doc's
+/// rule, steps 1-5): piece `at.p` of the tokens from `at.t0`, and — for the
+/// block that takes the group's last ticket — the finish of those tokens,
+/// which puts the ticket back to 0. `ds41_hc_pre`'s body with the group's
+/// offsets added; that kernel keeps its own copy because calling this one
+/// changes its PTX (the decode step's code), and the prefill gate's grouped
+/// case holds the two bit for bit.
+///
+/// # Safety
+///
+/// Called by every thread of a 256-thread block, the launch contract of
+/// `ds41_hc_pre` holding for `m` (1..=8) tokens read from token `at.t0` of
+/// `x` and written from `at.t0` of `mixes` and `hc`, with the group's
+/// partials, squares and ticket at `at.part0`, `at.ss0` and `at.ticket` of
+/// `part`, `ss` and `ctr` (`24 * n_pieces * 8`, `n_pieces * 8` and one
+/// slot); the group has exactly `n_pieces` blocks, no other group's block
+/// touches its scratch or its tokens, and `sh` holds the block's own shared
+/// slots.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn hc_pre_block(
+    w: &[u32],
+    x: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    n_pieces: u32,
+    m: u32,
+    rms_eps: f32,
+    hc_eps: f32,
+    iters: u32,
+    part: &mut DisjointSlice<f32>,
+    ss: &mut DisjointSlice<f32>,
+    ctr: &mut DisjointSlice<u32>,
+    mixes: &mut DisjointSlice<f32>,
+    hc: &mut DisjointSlice<f32>,
+    fault: FaultSink,
+    at: HcPreAt,
+    sh: HcPreShared,
+) {
+    let p = at.p;
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let wp = tid / 32;
+    let (np, mm) = (n_pieces as usize, m as usize);
+    let k = HC_PIECE * np;
+    let n_sb = 2 * np;
+
+    // The lane geometry of `cores::q3k_row_dot`: lanes 0..15 read
+    // super-block 2p, 16..31 super-block 2p + 1; the lane's qs word
+    // `w16` covers 16 values of one 128-value q8 block, four quads 32
+    // apart, with sub-block scales s0, s0 + 2, s0 + 4, s0 + 6.
+    let w16 = lane & 15;
+    let sb = 2 * p + (lane >> 4);
+    let s0 = 8 * (w16 >> 3) + ((w16 & 7) >> 2);
+    let vb = 256 * sb + 128 * (w16 >> 3) + 4 * (w16 & 7);
+    let row_bytes = 110 * n_sb;
+    // The warp's three rows, decoded once for every token.
+    // SAFETY: wp + 16 < 24 and sb < n_sb; `w` holds 24 rows of 110 * n_sb bytes by contract.
+    let (d0, d1, d2) = unsafe {
+        (
+            q3k_sb_decode(w, wp * row_bytes + 110 * sb, w16, s0),
+            q3k_sb_decode(w, (wp + 8) * row_bytes + 110 * sb, w16, s0),
+            q3k_sb_decode(w, (wp + 16) * row_bytes + 110 * sb, w16, s0),
+        )
+    };
+
+    let mut t = 0usize;
+    while t < mm {
+        let xb = (at.t0 + t) * k + vb;
+        // SAFETY: xb + 99 < (t0 + t)*k + 256*(sb + 1) <= (t0 + t + 1)*k <=
+        // x.len() by this fn's contract (sb < 2*n_pieces, t < m); the
+        // sixteen reads are this lane's four quads.
+        let v = unsafe {
+            [
+                *x.get_unchecked(xb),
+                *x.get_unchecked(xb + 1),
+                *x.get_unchecked(xb + 2),
+                *x.get_unchecked(xb + 3),
+                *x.get_unchecked(xb + 32),
+                *x.get_unchecked(xb + 33),
+                *x.get_unchecked(xb + 34),
+                *x.get_unchecked(xb + 35),
+                *x.get_unchecked(xb + 64),
+                *x.get_unchecked(xb + 65),
+                *x.get_unchecked(xb + 66),
+                *x.get_unchecked(xb + 67),
+                *x.get_unchecked(xb + 96),
+                *x.get_unchecked(xb + 97),
+                *x.get_unchecked(xb + 98),
+                *x.get_unchecked(xb + 99),
+            ]
+        };
+        if !(quad_finite([v[0], v[1], v[2], v[3]])
+            & quad_finite([v[4], v[5], v[6], v[7]])
+            & quad_finite([v[8], v[9], v[10], v[11]])
+            & quad_finite([v[12], v[13], v[14], v[15]]))
+        {
+            fault.raise(FaultSite::HcQuant);
+        }
+        // The block amax: the eight lanes that differ in bits 0..2 hold
+        // the block's 128 values.
+        let mut am = abs_max16(&v);
+        am = am.max(warp::shuffle_xor_f32(am, 1));
+        am = am.max(warp::shuffle_xor_f32(am, 2));
+        am = am.max(warp::shuffle_xor_f32(am, 4));
+        // `q3k_quantize_q8_1`'s block scale.
+        let d8 = if am > 0.0 { am / 127.0 } else { 1.0 };
+        let (q0, _) = q8_quad([v[0], v[1], v[2], v[3]], d8);
+        let (q1, _) = q8_quad([v[4], v[5], v[6], v[7]], d8);
+        let (q2, _) = q8_quad([v[8], v[9], v[10], v[11]], d8);
+        let (q3, _) = q8_quad([v[12], v[13], v[14], v[15]], d8);
+        // The q3 permutation's u64 pairs: fields 0/1, then 2/3.
+        let w01 = u64::from(q0) | (u64::from(q1) << 32);
+        let w23 = u64::from(q2) | (u64::from(q3) << 32);
+
+        let s_a = piece_sum(q3k_chain(&d0.0, w01, w23, &d0.1), d8 * d0.2);
+        let s_b = piece_sum(q3k_chain(&d1.0, w01, w23, &d1.1), d8 * d1.2);
+        let s_c = piece_sum(q3k_chain(&d2.0, w01, w23, &d2.1), d8 * d2.2);
+        if lane == 0 {
+            let pb = at.part0 + (p * mm + t) * HC_MIX + wp;
+            // SAFETY: pb + 16 < (p*m + t + 1)*24 <= 24*n_pieces*m <=
+            // part.len(); lane 0 of warp wp alone writes rows wp, wp + 8,
+            // wp + 16 of (piece p, token t).
+            unsafe {
+                *part.get_unchecked_mut(pb) = s_a;
+                *part.get_unchecked_mut(pb + 8) = s_b;
+                *part.get_unchecked_mut(pb + 16) = s_c;
+            }
+        }
+        if wp == 0 {
+            let sq = warp::reduce_sum_f32(squares16(&v));
+            if lane == 0 {
+                // SAFETY: p*m + t < n_pieces*m <= ss.len(); lane 0 of
+                // warp 0 alone writes (piece p, token t).
+                unsafe {
+                    *ss.get_unchecked_mut(at.ss0 + p * mm + t) = sq;
+                }
+            }
+        }
+        t += 1;
+    }
+
+    // Every thread's stores reach the device before the block takes its
+    // ticket; the ticket that completes the count is the last block's.
+    threadfence();
+    thread::sync_threads();
+    // Thread 0 writes the flag's slot before the barrier that publishes it.
+    let last = sh.last;
+    if tid == 0 {
+        // SAFETY: `ctr` is a live u32 device buffer of at least one
+        // element (launch contract), aligned, and every access to it in
+        // this launch is atomic.
+        let ticket = unsafe { DeviceAtomicU32::from_ptr(ctr.as_mut_ptr().add(at.ticket)) };
+        let done = ticket.fetch_add(1, AtomicOrdering::AcqRel) + 1 == n_pieces;
+        if done {
+            ticket.store(0, AtomicOrdering::Relaxed);
+        }
+        // SAFETY: slot 0 of LAST, written by thread 0 alone.
+        unsafe {
+            *last = u32::from(done);
+        }
+    }
+    thread::sync_threads();
+    // SAFETY: slot 0 was written before the barrier above.
+    if unsafe { *last } == 0 {
+        return;
+    }
+
+    // The finishing block. Threads 0..24m sum one (token, row) partial
+    // each, threads HC_SS_THREAD..+m one token's squares, each over the
+    // pieces in ascending order.
+    // SAFETY: MIX and SCL are this block's own shared allocations; each
+    // slot below is written by one thread before the barrier that
+    // publishes it (24m <= 192, m <= 8 by the contract).
+    let (mix_s, scl_s) = (sh.mix, sh.scl);
+    if tid < HC_MIX * mm {
+        // SAFETY: piece q's slot (q*m + t)*24 + r = q*24m + tid <
+        // 24*n_pieces*m <= part.len() for every q < n_pieces; the ticket
+        // ordered every block's stores before these reads, and no thread
+        // writes `part` again.
+        let acc = unsafe { column_sum(part, at.part0 + tid, HC_MIX * mm, np) };
+        // SAFETY: tid < 24m <= 192, this thread's own slot.
+        unsafe {
+            *mix_s.add(tid) = acc;
+        }
+    } else if (HC_SS_THREAD..HC_SS_THREAD + mm).contains(&tid) {
+        let tt = tid - HC_SS_THREAD;
+        // SAFETY: q*m + tt < n_pieces*m <= ss.len() for every q <
+        // n_pieces; the ticket ordered every block's stores first.
+        let acc = unsafe { column_sum(ss, at.ss0 + tt, mm, np) };
+        let mean = acc / k as f32;
+        // SAFETY: tt < m <= 8, this thread's own slot.
+        unsafe {
+            *scl_s.add(tt) = 1.0 / (mean + rms_eps).sqrt();
+        }
+    }
+    thread::sync_threads();
+    if wp < mm {
+        // SAFETY: scale.len() >= 3 by the launch contract.
+        let sc = unsafe {
+            [
+                *scale.get_unchecked(0),
+                *scale.get_unchecked(1),
+                *scale.get_unchecked(2),
+            ]
+        };
+        let (mv, bv) = if lane < HC_MIX {
+            // SAFETY: wp*24 + lane < 24m, written before the barrier;
+            // lane < 24 <= base.len().
+            unsafe {
+                (
+                    *mix_s.add(wp * HC_MIX + lane) * *scl_s.add(wp),
+                    *base.get_unchecked(lane),
+                )
+            }
+        } else {
+            (0.0, 0.0)
+        };
+        let y = hc_pre_lane(mv, lane as u32, sc, bv, hc_eps, iters);
+        if lane < HC_MIX {
+            // SAFETY: wp*24 + lane < 24m <= mixes.len(), hc.len(); one
+            // lane per slot.
+            unsafe {
+                *mixes.get_unchecked_mut((at.t0 + wp) * HC_MIX + lane) = mv;
+                *hc.get_unchecked_mut((at.t0 + wp) * HC_MIX + lane) = y;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -656,6 +914,102 @@ mod hc_kernels {
         }
     }
 
+    /// [`ds41_hc_pre`] over `tokens` tokens in groups of at most
+    /// [`HC_MAX_TOKENS`] in one grid — the first `lead`, then eights
+    /// ([`col_group`]): block `b` is piece `b % n_pieces` of group `g = b /
+    /// n_pieces`, which keeps its own partials, squares and ticket `ctr[g]`
+    /// and whose last block finishes its tokens. A token's result is a
+    /// function of its own streams alone, so every token holds what
+    /// `ds41_hc_pre` over its group writes. `n_groups` is
+    /// [`bloomery_gpu::col_group_count`]`(lead, tokens)`, the launch has
+    /// exactly `n_pieces · n_groups` blocks, and every `ctr[g]` holds 0 when
+    /// it starts (each group's finish leaves it 0).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= 5280 * n_pieces,
+            x.len() >= 512 * n_pieces * tokens,
+            scale.len() >= 3,
+            base.len() >= 24,
+            part.len() >= 192 * n_pieces * n_groups,
+            ss.len() >= 8 * n_pieces * n_groups,
+            ctr.len() >= n_groups,
+            mixes.len() >= 24 * tokens,
+            hc.len() >= 24 * tokens,
+            lead >= 1,
+            lead <= 8,
+            lead <= tokens,
+            n_pieces >= 1
+        )
+    )]
+    pub fn ds41_hc_pre_groups(
+        w: &[u32],
+        x: &[f32],
+        scale: &[f32],
+        base: &[f32],
+        n_pieces: u32,
+        lead: u32,
+        tokens: u32,
+        n_groups: u32,
+        rms_eps: f32,
+        hc_eps: f32,
+        iters: u32,
+        mut part: DisjointSlice<f32>,
+        mut ss: DisjointSlice<f32>,
+        mut ctr: DisjointSlice<u32>,
+        mut mixes: DisjointSlice<f32>,
+        mut hc: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+        static mut MIX: SharedArray<f32, HC_MIX_SLOTS> = SharedArray::UNINIT;
+        static mut SCL: SharedArray<f32, HC_MAX_TOKENS> = SharedArray::UNINIT;
+
+        let np = n_pieces as usize;
+        let b = thread::blockIdx_x() as usize;
+        let g = b / np;
+        let (t0, m) = col_group(g, lead as usize, tokens as usize);
+        // Block-uniform: a block past the last group, none by the launch's
+        // geometry, touches nothing.
+        if g >= n_groups as usize || m == 0 {
+            return;
+        }
+        // SAFETY: LAST, MIX and SCL are this block's own shared allocations;
+        // the raw form is the only way to reach them without a reference to
+        // a `static mut`.
+        let sh = unsafe {
+            HcPreShared {
+                last: SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                mix: SharedArray::as_raw_mut_ptr(&raw mut MIX),
+                scl: SharedArray::as_raw_mut_ptr(&raw mut SCL),
+            }
+        };
+        let at = HcPreAt {
+            p: b % np,
+            t0,
+            part0: g * HC_MIX * np * HC_MAX_TOKENS,
+            ss0: g * np * HC_MAX_TOKENS,
+            ticket: g,
+        };
+        // SAFETY: group g is m <= 8 tokens from t0 (t0 + m <= tokens), its
+        // n_pieces blocks the consecutive b of g; its scratch regions lie
+        // inside part, ss and ctr (g < n_groups) and no other group's block
+        // touches them, by the launch contract.
+        unsafe {
+            hc_pre_block(
+                w, x, scale, base, n_pieces, m as u32, rms_eps, hc_eps, iters, &mut part, &mut ss,
+                &mut ctr, &mut mixes, &mut hc, fault, at, sh,
+            );
+        }
+    }
+
     /// HC_POST and the next input fold, one thread per value `d` of token
     /// `t`: `x` the sub-layer output (`n` per token), `res` the streams it
     /// read (`4n` per token), `hc` the sub-layer's HC_PRE result; writes the
@@ -792,17 +1146,31 @@ impl HcPreScratch {
     /// [`HC_PIECE`]) and up to [`HC_MAX_TOKENS`] tokens a launch. Load-time
     /// only.
     pub fn new(stream: &CudaStream, k: usize) -> Result<HcPreScratch, GpuError> {
-        if k == 0 || !k.is_multiple_of(HC_PIECE) {
+        HcPreScratch::with_groups(stream, k, 1)
+    }
+
+    /// [`HcPreScratch::new`] for a grouped launch of up to `groups` token
+    /// groups ([`HcKernels::enqueue_pre_groups`]): each group's partials,
+    /// squares and ticket of their own. Load-time only.
+    pub fn with_groups(
+        stream: &CudaStream,
+        k: usize,
+        groups: usize,
+    ) -> Result<HcPreScratch, GpuError> {
+        if k == 0 || !k.is_multiple_of(HC_PIECE) || groups == 0 {
             return Err(GpuError::Shape {
                 what: "HcPreScratch::new",
-                detail: format!("k must be a positive multiple of {HC_PIECE}, got {k}"),
+                detail: format!(
+                    "k must be a positive multiple of {HC_PIECE}, got {k}, and groups at least \
+                     1, got {groups}"
+                ),
             });
         }
         let n_pieces = k / HC_PIECE;
         Ok(HcPreScratch {
-            part: DeviceBuffer::zeroed(stream, HC_MIX * n_pieces * HC_MAX_TOKENS)?,
-            ss: DeviceBuffer::zeroed(stream, n_pieces * HC_MAX_TOKENS)?,
-            ctr: DeviceBuffer::zeroed(stream, 1)?,
+            part: DeviceBuffer::zeroed(stream, HC_MIX * n_pieces * HC_MAX_TOKENS * groups)?,
+            ss: DeviceBuffer::zeroed(stream, n_pieces * HC_MAX_TOKENS * groups)?,
+            ctr: DeviceBuffer::zeroed(stream, groups)?,
             n_pieces,
         })
     }
@@ -811,6 +1179,18 @@ impl HcPreScratch {
     #[must_use]
     pub fn k(&self) -> usize {
         self.n_pieces * HC_PIECE
+    }
+
+    /// Token groups a launch into this scratch may run.
+    #[must_use]
+    pub fn groups(&self) -> usize {
+        self.ctr.len()
+    }
+
+    /// Device bytes of the scratch.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.part.num_bytes() + self.ss.num_bytes() + self.ctr.num_bytes()
     }
 }
 
@@ -835,7 +1215,8 @@ pub struct HcPreArgs<'a> {
     pub params: &'a HcParams<'a>,
     /// The streams the sub-layer reads: `m` tokens of the scratch's K values.
     pub x: &'a DeviceBuffer<f32>,
-    /// Tokens, `1..=`[`HC_MAX_TOKENS`].
+    /// Tokens: `1..=`[`HC_MAX_TOKENS`] a launch of [`HcKernels::enqueue_pre`],
+    /// any count of [`HcKernels::enqueue_pre_groups`].
     pub tokens: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
@@ -920,6 +1301,78 @@ impl HcKernels {
             p.base,
             n_pieces,
             m,
+            a.rms_eps,
+            p.eps,
+            p.iters,
+            &mut scratch.part,
+            &mut scratch.ss,
+            &mut scratch.ctr,
+            mixes,
+            hc,
+            a.fault,
+        )?;
+        Ok(())
+    }
+
+    /// [`HcKernels::enqueue_pre`] over `a.tokens` tokens in one launch, as
+    /// token groups — the first `lead` (`1 ..= HC_MAX_TOKENS`), then groups
+    /// of [`HC_MAX_TOKENS`] — each group what `enqueue_pre` over its tokens
+    /// writes (`ds41_hc_pre_groups`). The scratch holds a group's partials
+    /// and ticket for each group ([`HcPreScratch::with_groups`]).
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pre_groups(
+        &self,
+        stream: &CudaStream,
+        a: &HcPreArgs<'_>,
+        lead: usize,
+        scratch: &mut HcPreScratch,
+        mixes: &mut DeviceBuffer<f32>,
+        hc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "HcKernels::enqueue_pre_groups";
+        let (k, m, p) = (scratch.k(), a.tokens, a.params);
+        check_params(what, p, k)?;
+        let groups = ColGroups::new(0, lead, m)?.count();
+        if groups > scratch.groups()
+            || a.x.len() < k * m
+            || mixes.len() < HC_MIX * m
+            || hc.len() < HC_MIX * m
+        {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "tokens = {m} in {groups} groups (the scratch holds {}), x.len() {} (need {}), \
+                     mixes.len() {} / hc.len() {} (need {})",
+                    scratch.groups(),
+                    a.x.len(),
+                    k * m,
+                    mixes.len(),
+                    hc.len(),
+                    HC_MIX * m
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", scratch.n_pieces * groups)?;
+        let n_pieces = launch_u32(what, "n_pieces", scratch.n_pieces)?;
+        let lead = launch_u32(what, "lead", lead)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let groups = launch_u32(what, "groups", groups)?;
+        let prep = self.module.prepare_ds41_hc_pre_groups(LaunchConfig1D::new(
+            grid,
+            HC_PRE_THREADS_U32,
+            0,
+        ))?;
+        self.module.ds41_hc_pre_groups(
+            stream,
+            &prep,
+            p.w.buf(),
+            a.x,
+            p.scale,
+            p.base,
+            n_pieces,
+            lead,
+            m,
+            groups,
             a.rms_eps,
             p.eps,
             p.iters,

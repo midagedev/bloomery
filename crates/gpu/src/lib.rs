@@ -262,6 +262,186 @@ fn q3k_split_rule() -> (usize, usize) {
     })
 }
 
+/// Columns a group of [`ColGroups`] holds at most: the m-column cores'.
+pub const COL_GROUP: usize = 8;
+
+/// Columns `col0 .. col0 + cols` of an activation cut into the column groups
+/// a grouped launch runs ([`Gpu::enqueue_gemv_q3k_groups`] and the grouped
+/// entries built on it): the first group of `lead` columns, then groups of
+/// [`COL_GROUP`], the last the rest. Each group is the m-column launch over
+/// its own columns — column `c` bit for bit the one-column launch on that
+/// column (`cores::q3k_row_dot`) — and a row-major output keeps group `g`'s
+/// `rows × m` block at `rows · c0`, `c0` its first column counted from
+/// `col0`: the groups' own outputs laid end to end. A prompt batch cuts its
+/// tokens into chunks the same way, so each chunk's block is the one its own
+/// launch writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColGroups {
+    col0: usize,
+    lead: usize,
+    cols: usize,
+}
+
+impl ColGroups {
+    /// The groups of `cols` columns from `col0` whose first holds `lead`;
+    /// refused unless `1 <= lead <= min(COL_GROUP, cols)`.
+    pub fn new(col0: usize, lead: usize, cols: usize) -> Result<ColGroups, GpuError> {
+        if lead == 0 || lead > COL_GROUP.min(cols) {
+            return Err(GpuError::shape(
+                "ColGroups::new",
+                format!(
+                    "a first group of {lead} columns out of {cols}: it holds 1..={COL_GROUP} of them"
+                ),
+            ));
+        }
+        Ok(ColGroups { col0, lead, cols })
+    }
+
+    /// The first column, counted in the activation.
+    #[must_use]
+    pub fn col0(&self) -> usize {
+        self.col0
+    }
+
+    /// The first group's columns.
+    #[must_use]
+    pub fn lead(&self) -> usize {
+        self.lead
+    }
+
+    /// Columns over every group.
+    #[must_use]
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Groups: the first, then `⌈(cols − lead) / COL_GROUP⌉`.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        col_group_count(self.lead, self.cols)
+    }
+
+    /// Group `g`'s first column counted from `col0`, and its columns (0 past
+    /// the last group).
+    #[must_use]
+    pub fn group(&self, g: usize) -> (usize, usize) {
+        col_group(g, self.lead, self.cols)
+    }
+}
+
+/// Group `g` of the column groups whose first holds `lead` of `cols`
+/// columns ([`ColGroups`]): its first column and its column count, 0 for a
+/// group past the last. Integer arithmetic only: kernels and hosts read the
+/// groups through this one rule.
+#[inline(always)]
+#[must_use]
+pub fn col_group(g: usize, lead: usize, cols: usize) -> (usize, usize) {
+    let c0 = if g == 0 {
+        0
+    } else {
+        lead + COL_GROUP * (g - 1)
+    };
+    let len = if g == 0 { lead } else { COL_GROUP };
+    (c0, len.min(cols.saturating_sub(c0)))
+}
+
+/// Groups of `cols` columns whose first holds `lead` ([`col_group`]): the
+/// first, then `⌈(cols − lead) / COL_GROUP⌉`. `1 <= lead <= cols`.
+#[inline(always)]
+#[must_use]
+pub fn col_group_count(lead: usize, cols: usize) -> usize {
+    1 + (cols - lead).div_ceil(COL_GROUP)
+}
+
+/// The group column `c` belongs to among the column groups whose first holds
+/// `lead` ([`col_group`]).
+#[inline(always)]
+#[must_use]
+pub fn col_group_of(c: usize, lead: usize) -> usize {
+    if c < lead {
+        0
+    } else {
+        1 + (c - lead) / COL_GROUP
+    }
+}
+
+/// A row's `m` sums from the per-lane partials of an m-column core:
+/// `warp::reduce_sum_f32` per column, the one-column kernels' tree, the
+/// columns past `m` left at 0.0. `m` must be warp-uniform — a launch-wide or
+/// group-wide constant in every caller.
+#[inline(always)]
+#[must_use]
+pub fn col_sums(f: [f32; 8], m: usize) -> [f32; 8] {
+    let mut s = [0.0f32; 8];
+    s[0] = warp::reduce_sum_f32(f[0]);
+    if m > 1 {
+        s[1] = warp::reduce_sum_f32(f[1]);
+    }
+    if m > 2 {
+        s[2] = warp::reduce_sum_f32(f[2]);
+    }
+    if m > 3 {
+        s[3] = warp::reduce_sum_f32(f[3]);
+    }
+    if m > 4 {
+        s[4] = warp::reduce_sum_f32(f[4]);
+    }
+    if m > 5 {
+        s[5] = warp::reduce_sum_f32(f[5]);
+    }
+    if m > 6 {
+        s[6] = warp::reduce_sum_f32(f[6]);
+    }
+    if m > 7 {
+        s[7] = warp::reduce_sum_f32(f[7]);
+    }
+    s
+}
+
+/// Lane 0's store of a row's `m` values: `y[base + c·stride] = v[c]` for
+/// `c < m`, one guarded store per column with a constant index (a loop over
+/// `c` would index `v` at run time and put it in a local depot).
+///
+/// # Safety
+///
+/// `1 <= m <= 8`, every slot `base + c·stride` for `c < m` inside `y`, and
+/// no other thread of the launch writes any of them.
+#[inline(always)]
+pub unsafe fn store_cols(
+    y: &mut DisjointSlice<f32>,
+    base: usize,
+    stride: usize,
+    m: usize,
+    v: [f32; 8],
+) {
+    // SAFETY: each store is guarded by c < m, so its slot is one this fn's
+    // contract puts inside y and gives to this thread alone.
+    unsafe {
+        *y.get_unchecked_mut(base) = v[0];
+        if m > 1 {
+            *y.get_unchecked_mut(base + stride) = v[1];
+        }
+        if m > 2 {
+            *y.get_unchecked_mut(base + 2 * stride) = v[2];
+        }
+        if m > 3 {
+            *y.get_unchecked_mut(base + 3 * stride) = v[3];
+        }
+        if m > 4 {
+            *y.get_unchecked_mut(base + 4 * stride) = v[4];
+        }
+        if m > 5 {
+            *y.get_unchecked_mut(base + 5 * stride) = v[5];
+        }
+        if m > 6 {
+            *y.get_unchecked_mut(base + 6 * stride) = v[6];
+        }
+        if m > 7 {
+            *y.get_unchecked_mut(base + 7 * stride) = v[7];
+        }
+    }
+}
+
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1674,6 +1854,194 @@ mod kernels {
         }
     }
 
+    /// [`q3k_gemv`] over the column groups of a [`ColGroups`] in one grid:
+    /// block `b` runs group `b % n_groups` ([`col_group_count`]) on the eight
+    /// rows from `8 · (b / n_groups)`, the group's `m` columns from `col0 +
+    /// c0` through `cores::q3k_row_dot` — `q3k_gemv`'s core, its one-column
+    /// body at m = 1 included, so a group's rows are that launch's bits on
+    /// the group's columns alone — and stores them at `y[n_rows·c0 + row·m +
+    /// c]`: the groups' own row-major outputs laid end to end. A row
+    /// stretch's blocks are consecutive, so its groups run side by side on
+    /// the same weight words.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes its arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= col0 * 64 * iters + cols * 64 * iters,
+            d8.len() >= col0 * 2 * n_sb + cols * 2 * n_sb,
+            y.len() >= n_rows * cols,
+            lead >= 1,
+            lead <= 8,
+            lead <= cols
+        )
+    )]
+    pub fn q3k_gemv_groups(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        col0: u32,
+        lead: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let (lead, cols) = (lead as usize, cols as usize);
+        let n_groups = col_group_count(lead, cols);
+        let b = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let row = (b / n_groups) * 8 + t / 32;
+        let (c0, m) = col_group(b % n_groups, lead, cols);
+        // Both tests are block-uniform: a block past the rows, or past the
+        // last group, stores nothing.
+        if row >= n_rows as usize || m == 0 {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // q3k_row_dot's contract: the row inside w and columns col0 + c0 ..
+        // col0 + c0 + m (c0 + m <= cols) inside q and d8, by the launch
+        // contract; every lane of the warp calls it.
+        let f = q3k_row_dot(
+            w,
+            q,
+            d8,
+            n_sb as usize,
+            iters,
+            row,
+            col0 as usize + c0,
+            m,
+            lane,
+        );
+        let s = col_sums(f, m);
+        if lane == 0 {
+            // SAFETY: slots n_rows·c0 + row·m + c for c < m are the group's
+            // block, inside y (n_rows·(c0 + m) <= n_rows·cols <= y.len()),
+            // and belong to this row's warp alone.
+            unsafe { store_cols(&mut y, n_rows as usize * c0 + row * m, 1, m, s) };
+        }
+    }
+
+    /// [`q3k_gemv_split_mcol`] over the column groups of a [`ColGroups`] in
+    /// one grid, laid out as [`q3k_gemv_groups`] lays them: block `b` runs
+    /// group `b % n_groups` on the `8 >> split_shift` rows of row stretch `b
+    /// / n_groups`, each row's warps, spans and fold those of
+    /// `q3k_gemv_split_mcol` (`cores::q3k_row_dot_cols_span`, the
+    /// single-column span at m = 1, so a one-column group is
+    /// [`q3k_gemv_split`]'s bits), the group's block at `y[n_rows·c0 ..]`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes its arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= col0 * 64 * iters + cols * 64 * iters,
+            d8.len() >= col0 * 2 * n_sb + cols * 2 * n_sb,
+            y.len() >= n_rows * cols,
+            lead >= 1,
+            lead <= 8,
+            lead <= cols,
+            split_shift >= 1,
+            split_shift <= 3
+        )
+    )]
+    pub fn q3k_gemv_split_groups(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        col0: u32,
+        lead: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        split_shift: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // One reduced partial per (warp, column): 8 warps x 8 columns.
+        static mut PART: SharedArray<f32, 64> = SharedArray::UNINIT;
+
+        let (lead, cols) = (lead as usize, cols as usize);
+        let n_groups = col_group_count(lead, cols);
+        let b = thread::blockIdx_x() as usize;
+        let (c0, m) = col_group(b % n_groups, lead, cols);
+        let (warp_of, row, split) = q3k_split_warp(
+            (b / n_groups) * 256 + thread::threadIdx_x() as usize,
+            split_shift,
+        );
+        // Warp-uniform: a warp past the last row walks nothing but still
+        // reaches the barrier below.
+        let live = row < n_rows as usize && m > 0;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: PART is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every index is `warp_of * 8 + c` with warp_of < 8 and c < 8, and
+        // the barrier orders each warp's stores before the reads.
+        let part = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PART) };
+        if live {
+            let it0 = (split * iters) >> split_shift;
+            let it1 = ((split + 1) * iters) >> split_shift;
+            let f = q3k_row_dot_cols_span(
+                w,
+                q,
+                d8,
+                n_sb as usize,
+                iters,
+                row,
+                col0 as usize + c0,
+                1,
+                m,
+                lane,
+                it0,
+                it1,
+            );
+            let s = col_sums(f, m);
+            if lane == 0 {
+                let b8 = warp_of * 8;
+                // SAFETY: b8 + 7 < 64; one lane per warp writes its own eight
+                // slots (those past m are never read).
+                unsafe {
+                    *part.add(b8) = s[0];
+                    *part.add(b8 + 1) = s[1];
+                    *part.add(b8 + 2) = s[2];
+                    *part.add(b8 + 3) = s[3];
+                    *part.add(b8 + 4) = s[4];
+                    *part.add(b8 + 5) = s[5];
+                    *part.add(b8 + 6) = s[6];
+                    *part.add(b8 + 7) = s[7];
+                }
+            }
+        }
+        thread::sync_threads();
+        if live && split == 0 && lane == 0 {
+            let base = n_rows as usize * c0 + row * m;
+            let mut c = 0usize;
+            while c < m {
+                // SAFETY: the row's warps' slots (warp_of + s) * 8 + c, all
+                // < 64 and written before the barrier.
+                let v = unsafe { q3k_split_fold(part.add(c), warp_of * 8, 8, split_shift) };
+                // SAFETY: only this lane writes the group's slots base ..
+                // base + m, inside y as in `q3k_gemv_groups`.
+                unsafe {
+                    *y.get_unchecked_mut(base + c) = v;
+                }
+                c += 1;
+            }
+        }
+    }
+
     /// Q3_K gemv over expert slots selected on the device (the MoE decode
     /// shape): one launch computes `n_slots` experts of a resident flat
     /// stack — `n_experts * rows_per_expert` rows of `110 * n_sb` bytes —
@@ -2176,6 +2544,22 @@ impl Gpu {
         self.quantize_q8_1_at(x, x0, act, self.unlabelled_sink())
     }
 
+    /// [`Gpu::enqueue_quantize_q8_1_layer`] over the first `cols` columns of
+    /// `act` alone (`1 ..=` its `m()`), `x` holding at least `cols · k` f32:
+    /// each column the bytes the full launch writes it — the quantizer is
+    /// column-local — and the columns past `cols` untouched. The per-slot
+    /// activation of a prompt pass, quantized for the tokens the pass holds.
+    pub fn enqueue_quantize_q8_1_cols(
+        &self,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        cols: usize,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        let sink = self.layer_sink(layer)?;
+        self.quantize_q8_1_cols_at(x, 0, act, cols, sink)
+    }
+
     /// The launcher of `q3k_quantize_q8_1` into a [`Q8Act`], raising into
     /// `fault`; [`Gpu::enqueue_quantize_gemm`] is its other launcher, into a
     /// [`gemm::GemmAct`].
@@ -2187,7 +2571,26 @@ impl Gpu {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let m = act.m();
+        self.quantize_q8_1_cols_at(x, x0, act, m, fault)
+    }
+
+    /// [`Gpu::quantize_q8_1_at`] over `act`'s first `m` columns, refused
+    /// unless `1 <= m <= act.m()`.
+    fn quantize_q8_1_cols_at(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+        m: usize,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         let n_sb = act.n_sb();
+        if !(1..=act.m()).contains(&m) {
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_1_at",
+                format!("{m} columns of an activation of {}", act.m()),
+            ));
+        }
         if x.len() < x0 + m * act.k() {
             return Err(GpuError::shape(
                 "enqueue_quantize_q8_1_at",
@@ -2459,6 +2862,91 @@ impl Gpu {
                     y,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Enqueue `y = w · act` over the column groups `groups` of `act`
+    /// ([`ColGroups`]) in one launch: group `g`'s `rows × m` block at `y[rows
+    /// · c0 ..]`, bit for bit [`Gpu::enqueue_gemv_q3k`] on an activation of
+    /// the group's columns alone, its split-K rule ([`q3k_splits`])
+    /// included. Refused when the groups pass `act`'s columns or `y` holds
+    /// fewer than `rows · cols`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gemv_q3k_groups(
+        &self,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        groups: ColGroups,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gemv_q3k_groups";
+        let (n_rows, n_sb) = (w.rows(), act.n_sb());
+        let words = (n_rows * 110 * n_sb).div_ceil(4).div_ceil(n_rows.max(1));
+        if w.cols() != words {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "Q3_K rows are {words} words at K={}, got {}",
+                    act.k(),
+                    w.cols()
+                ),
+            ));
+        }
+        let (col0, lead, cols) = (groups.col0(), groups.lead(), groups.cols());
+        if col0 + cols > act.m() || y.len() < n_rows * cols {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "columns {col0}..{} of an activation of {}; y.len() {} (need rows*cols = {})",
+                    col0 + cols,
+                    act.m(),
+                    y.len(),
+                    n_rows * cols
+                ),
+            ));
+        }
+        let splits = q3k_splits(n_sb);
+        let grid = launch_u32(what, "grid", groups.count() * n_rows.div_ceil(8 / splits))?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let col0 = launch_u32(what, "col0", col0)?;
+        let lead = launch_u32(what, "lead", lead)?;
+        let cols = launch_u32(what, "cols", cols)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let iters = n_sb.div_ceil(2);
+        let cfg = LaunchConfig1D::new(grid, 256, 0);
+        if splits == 1 {
+            let prep = self.module.prepare_q3k_gemv_groups(cfg)?;
+            self.module.q3k_gemv_groups(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q3,
+                &act.d8,
+                n_rows,
+                col0,
+                lead,
+                cols,
+                n_sb,
+                iters,
+                y,
+            )?;
+        } else {
+            let prep = self.module.prepare_q3k_gemv_split_groups(cfg)?;
+            self.module.q3k_gemv_split_groups(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q3,
+                &act.d8,
+                n_rows,
+                col0,
+                lead,
+                cols,
+                n_sb,
+                iters,
+                splits.trailing_zeros(),
+                y,
+            )?;
         }
         Ok(())
     }

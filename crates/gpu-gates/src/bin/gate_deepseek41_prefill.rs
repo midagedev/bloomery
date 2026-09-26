@@ -33,6 +33,20 @@
 //!   raises nothing and writes each card slot, and over a table whose last
 //!   run ends past the slots, or starts after its end, raises `expert_id` —
 //!   the run past the slots writes none of its rows.
+//! - **Projections.** On layer 3's resident weights and synthetic
+//!   activations, the batch-wide launches of the attention projections
+//!   against the chunk launches they replace: the grouped Q3_K gemv
+//!   (`attn_output_b`, columns 3..17 in groups of 5, 8, 1) group by group
+//!   against the plain launch on the group's columns alone, and its
+//!   token-major copy against the host's; wo_a's grouped block diagonal
+//!   (tokens 2..15 in groups of 1, 8, 4) against the m-column launch;
+//!   HC_PRE in groups of 3, 8, 8, 1 against the plain launch per group, and
+//!   a second grouped launch equal to the first; nothing written past any
+//!   output. Then the launchers' refusals: a first group outside
+//!   `1..=min(8, cols)`, columns past the activation, an output a column
+//!   short, a quantizer past its form's columns, rows past the projection's,
+//!   more groups than HC_PRE's scratch. A group that reads its neighbour's
+//!   column fails here, before the cases.
 //! - **Fault, reset, clean.** A NaN in the scale of every card expert's
 //!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
 //!   scales put back and the model reset, a prefill of the smallest case's
@@ -78,8 +92,12 @@
 //! `BLOOMERY_CARD_EXPERTS=slot|expert` picks the shadow's routed gate·up arm
 //! (the `loaded` line names it); both must pass. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
-//! `stat prefill split` line (`body::PrefillStats`): runtime values on the
-//! gate card, not measurements, and the events' reads add a wait per batch.
+//! `stat prefill split` line (`body::PrefillStats`) — with the queue entries
+//! the route and the shadow put in a layer-batch (`entries_route=`,
+//! `entries_shadow=`), the host tier's batch-excluded slots (`excluded_lb=`)
+//! and the batch-wide projections' card time (`card_proj_ms=`,
+//! `card_proj_lb=`): runtime values on the gate card, not measurements, and
+//! the events' reads add a wait per batch.
 //!
 //! `--seams P` is the locator, not a verdict: `P` eager steps with every
 //! seam's streams read back (the finite probe's `observed_step`), then a
@@ -125,18 +143,30 @@ mod gate {
 
     use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget};
     use bloomery_gpu::model::{ChainBody, StepMode};
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
+    use bloomery_gpu::weights::{DevWeight, Weights};
+    use bloomery_gpu::{
+        ColGroups, DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group,
+        col_group_of,
+    };
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
     use bloomery_gpu_deepseek41::body::{self, CedState, Deepseek41Model, Need};
     use bloomery_gpu_deepseek41::chain::ffn::{
         CardExperts, CardStacks, FfnBatchKernels, FfnKernels, GroupedGateUp, Handoff, Places,
+    };
+    use bloomery_gpu_deepseek41::dense::{
+        DenseKernels, Q3kHeadsGroupsArgs, Q3kHeadsMcolArgs, RowsPart,
+    };
+    use bloomery_gpu_deepseek41::hc::{
+        HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{GateError, activations, checks_failed, data_dir, verdict};
     use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, sys};
     use gguf::Split;
+    use gguf::quant::GgmlType;
     use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::names;
     use model::placement::workstation;
 
     use crate::{dspark, finite};
@@ -282,6 +312,7 @@ mod gate {
         let mut pass = count_cases(&mut m)?;
         pass &= router_cases(&mut m)?;
         pass &= raise_cases(&mut m)?;
+        pass &= proj_cases(&mut m, &hp)?;
         let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
         let top = args
             .cases
@@ -294,12 +325,14 @@ mod gate {
         let steps = (top + 1).min(ORACLE);
         let ids = corpus(ORACLE + 1)?;
         println!(
-            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; batch buffers {} B; ids \
+            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; batch buffers {} B \
+             (attention projections {} B); ids \
              corpus-prose.ids[..{}] first {:?}; tap layers {layers:?}, draft window {}; oracle \
              {steps} steps; cases {:?} splits {splits:?} extra {}",
             t.elapsed().as_secs_f64(),
             CardExperts::from_env()?.name(),
             m.body(NAME)?.batch_bytes(),
+            m.body(NAME)?.batch_proj_bytes(),
             ORACLE + 1,
             &ids[..4],
             dhp.window,
@@ -800,6 +833,414 @@ mod gate {
         }
         gpu.clear_fault()?;
         Ok(ok)
+    }
+
+    /// The layer whose resident weights the projection cases read.
+    const PROJ_LAYER: usize = 3;
+
+    /// The batch-wide projections' launches (`chain::attn::AttnBatch`)
+    /// against the chunk launches they replace, on [`PROJ_LAYER`]'s resident
+    /// weights and synthetic activations (module doc): the groups start past
+    /// column 0 and have a short group at one end, so a group that reads a
+    /// neighbour's column or writes past its block differs from its own
+    /// launch; then the refusals.
+    fn proj_cases(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        let (gpu, w, _) = m.body_parts(NAME)?;
+        let dense = DenseKernels::load(gpu.context())?;
+        let hck = HcKernels::load(gpu.context())?;
+        gpu.clear_fault()?;
+        let mut ok = gemv_groups_case(gpu, w, &dense)?;
+        ok &= heads_groups_case(gpu, w, &dense, hp)?;
+        ok &= hc_groups_case(gpu, w, &hck, hp)?;
+        ok &= proj_refusals(gpu, w, &dense, &hck, hp)?;
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// Resident Q3_K weight `name` and its values a row.
+    fn q3k<'w>(w: &'w Weights, name: &str) -> Result<(&'w DeviceTensor<u32>, usize), GateError> {
+        match w.get(name) {
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q3_K,
+                w,
+                k,
+            }) => Ok((w, *k)),
+            _ => Err(format!("{name}: not resident as Q3_K").into()),
+        }
+    }
+
+    /// Resident F32 vector `name`.
+    fn f32s<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GateError> {
+        match w.get(name) {
+            Some(DevWeight::F32 { w, .. }) => Ok(w.buf()),
+            _ => Err(format!("{name}: not resident as F32").into()),
+        }
+    }
+
+    /// `x`'s columns `c0 .. c0 + n` of `k` values in q8_1, alone.
+    fn q8_cols(gpu: &Gpu, x: &[f32], k: usize, c0: usize, n: usize) -> Result<Q8Act, GateError> {
+        let stream = gpu.stream();
+        let dev = DeviceBuffer::from_host(stream, &x[c0 * k..(c0 + n) * k])?;
+        let mut act = Q8Act::with_slots(stream, n, k)?;
+        gpu.enqueue_quantize_q8_1(&dev, &mut act)?;
+        Ok(act)
+    }
+
+    /// The column groups' sizes, for the lines.
+    fn sizes(g: ColGroups) -> Vec<usize> {
+        (0..g.count()).map(|i| g.group(i).1).collect()
+    }
+
+    /// The grouped Q3_K gemv on `attn_output_b` over columns `3 .. 17` in
+    /// groups of 5, 8, 1: each group's block against the plain launch on
+    /// its columns alone, and nothing written past `rows · cols`; then the
+    /// token-major copy of rows `7 .. 107` of that output against the same
+    /// copy made on the host.
+    fn gemv_groups_case(gpu: &Gpu, w: &Weights, dense: &DenseKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let name = names::attn_output_b(PROJ_LAYER);
+        let (wt, k) = q3k(w, &name)?;
+        let rows = wt.rows();
+        let groups = ColGroups::new(3, 5, 14)?;
+        let (col0, cols) = (groups.col0(), groups.cols());
+        let x = activations(k, col0 + cols, 5101);
+        let act = q8_cols(gpu, &x, k, 0, col0 + cols)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * (cols + 1)])?;
+        gpu.enqueue_gemv_q3k_groups(wt, &act, groups, &mut y)?;
+        let got = y.to_host_vec(stream)?;
+        let mut blocks_ok = true;
+        for g in 0..groups.count() {
+            let (c0, n) = groups.group(g);
+            let a = q8_cols(gpu, &x, k, col0 + c0, n)?;
+            let mut yg = DeviceBuffer::zeroed(stream, rows * n)?;
+            gpu.enqueue_gemv_q3k(wt, &a, &mut yg)?;
+            let want = yg.to_host_vec(stream)?;
+            blocks_ok &= bits(&want) == bits(&got[rows * c0..rows * (c0 + n)]);
+        }
+        let past_ok = got[rows * cols..]
+            .iter()
+            .all(|v| v.to_bits() == SENT.to_bits());
+        let part = RowsPart {
+            total_rows: rows,
+            r0: 7,
+            rows: 100,
+        };
+        let mut dst = DeviceBuffer::from_host(stream, &vec![SENT; part.rows * (cols + 1)])?;
+        dense.enqueue_groups_to_tokens(stream, &y, part, groups, &mut dst)?;
+        let copied = dst.to_host_vec(stream)?;
+        stream.synchronize()?;
+        let mut want = vec![SENT; part.rows * (cols + 1)];
+        for t in 0..cols {
+            let (c0, n) = col_group(col_group_of(t, groups.lead()), groups.lead(), cols);
+            for r in 0..part.rows {
+                want[t * part.rows + r] = got[rows * c0 + (part.r0 + r) * n + (t - c0)];
+            }
+        }
+        let copy_ok = bits(&copied) == bits(&want);
+        let (fault_ok, fault) = fault_is(gpu.fault()?, None);
+        let pass = blocks_ok && past_ok && copy_ok && fault_ok;
+        println!(
+            "{NAME}: grouped Q3_K gemv, {name} ({rows} rows, K {k}), columns {col0}..{} in groups \
+             {:?}: each group's block the plain launch on its columns {}, nothing past rows·cols \
+             {}; token-major copy of rows {}..{} as the host copies it {}; {fault}: {}",
+            col0 + cols,
+            sizes(groups),
+            verdict(blocks_ok),
+            verdict(past_ok),
+            part.r0,
+            part.r0 + part.rows,
+            verdict(copy_ok),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// wo_a's grouped block diagonal on `attn_output_a` over tokens `2 ..
+    /// 15` in groups of 1, 8, 4: each group's tokens against the m-column
+    /// launch on that group's columns alone.
+    fn heads_groups_case(
+        gpu: &Gpu,
+        w: &Weights,
+        dense: &DenseKernels,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let name = names::attn_output_a(PROJ_LAYER);
+        let (wt, k) = q3k(w, &name)?;
+        let (heads, rph, n_rows) = (hp.o_groups, hp.o_lora_rank, wt.rows());
+        let tokens = ColGroups::new(2, 1, 13)?;
+        let (col0, n_tok) = (tokens.col0(), tokens.cols());
+        let x = activations(k, (col0 + n_tok) * heads, 5102);
+        let act = q8_cols(gpu, &x, k, 0, (col0 + n_tok) * heads)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; n_rows * (n_tok + 1)])?;
+        dense.enqueue_q3k_heads_groups(
+            stream,
+            Q3kHeadsGroupsArgs {
+                w: wt,
+                act: &act,
+                groups: heads,
+                rows_per_head: rph,
+                tokens,
+                y: &mut y,
+            },
+        )?;
+        let got = y.to_host_vec(stream)?;
+        let mut blocks_ok = true;
+        for g in 0..tokens.count() {
+            let (t0, n) = tokens.group(g);
+            let a = q8_cols(gpu, &x, k, (col0 + t0) * heads, n * heads)?;
+            let mut yg = DeviceBuffer::zeroed(stream, n_rows * n)?;
+            dense.enqueue_q3k_heads_mcol(
+                stream,
+                Q3kHeadsMcolArgs {
+                    w: wt,
+                    q3: a.q3(),
+                    d8: a.d8(),
+                    n_sb: a.n_sb(),
+                    groups: heads,
+                    rows_per_head: rph,
+                    m: n,
+                    y: &mut yg,
+                },
+            )?;
+            let want = yg.to_host_vec(stream)?;
+            blocks_ok &= bits(&want) == bits(&got[n_rows * t0..n_rows * (t0 + n)]);
+        }
+        stream.synchronize()?;
+        let past_ok = got[n_rows * n_tok..]
+            .iter()
+            .all(|v| v.to_bits() == SENT.to_bits());
+        let (fault_ok, fault) = fault_is(gpu.fault()?, None);
+        let pass = blocks_ok && past_ok && fault_ok;
+        println!(
+            "{NAME}: grouped heads gemv, {name} ({heads} heads of {rph} rows, K {k}), tokens \
+             {col0}..{} in groups {:?}: each group's tokens the m-column launch on its columns \
+             {}, nothing past tokens·rows {}; {fault}: {}",
+            col0 + n_tok,
+            sizes(tokens),
+            verdict(blocks_ok),
+            verdict(past_ok),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// HC_PRE in token groups of 3, 8, 8, 1 in one grid on the layer's
+    /// attention parameters: each group's mixes and result against the
+    /// plain launch over its tokens alone, and a second grouped launch equal
+    /// to the first (each group's finish put its ticket back to 0).
+    fn hc_groups_case(
+        gpu: &Gpu,
+        w: &Weights,
+        hck: &HcKernels,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let l = PROJ_LAYER;
+        let params = HcParams {
+            w: q3k(w, &names::hc_attn_fn(l))?.0,
+            scale: f32s(w, &names::hc_attn_scale(l))?,
+            base: f32s(w, &names::hc_attn_base(l))?,
+            eps: hp.hc.eps,
+            iters: u32::try_from(hp.hc.sinkhorn_iters)?,
+        };
+        let k = HC_STREAMS * hp.n_embd;
+        let groups = ColGroups::new(0, 3, 20)?;
+        let n = groups.cols();
+        let x = activations(k, n, 5103);
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let mut scratch = HcPreScratch::with_groups(stream, k, groups.count())?;
+        let mut grouped = |seed: f32| -> Result<(Vec<f32>, Vec<f32>), GateError> {
+            let mut mixes = DeviceBuffer::from_host(stream, &vec![seed; HC_MIX * (n + 1)])?;
+            let mut hc = DeviceBuffer::from_host(stream, &vec![seed; HC_MIX * (n + 1)])?;
+            hck.enqueue_pre_groups(
+                stream,
+                &HcPreArgs {
+                    params: &params,
+                    x: &x_dev,
+                    tokens: n,
+                    rms_eps: hp.rms_eps,
+                    fault: gpu.unlabelled_sink(),
+                },
+                groups.lead(),
+                &mut scratch,
+                &mut mixes,
+                &mut hc,
+            )?;
+            Ok((mixes.to_host_vec(stream)?, hc.to_host_vec(stream)?))
+        };
+        let (mixes, hc) = grouped(SENT)?;
+        let (mixes2, hc2) = grouped(-SENT)?;
+        let mut groups_ok = true;
+        for g in 0..groups.count() {
+            let (t0, m) = groups.group(g);
+            let xg = DeviceBuffer::from_host(stream, &x[t0 * k..(t0 + m) * k])?;
+            let mut one = HcPreScratch::new(stream, k)?;
+            let mut mg = DeviceBuffer::zeroed(stream, HC_MIX * m)?;
+            let mut hg = DeviceBuffer::zeroed(stream, HC_MIX * m)?;
+            hck.enqueue_pre(
+                stream,
+                &HcPreArgs {
+                    params: &params,
+                    x: &xg,
+                    tokens: m,
+                    rms_eps: hp.rms_eps,
+                    fault: gpu.unlabelled_sink(),
+                },
+                &mut one,
+                &mut mg,
+                &mut hg,
+            )?;
+            let span = HC_MIX * t0..HC_MIX * (t0 + m);
+            groups_ok &= bits(&mg.to_host_vec(stream)?) == bits(&mixes[span.clone()])
+                && bits(&hg.to_host_vec(stream)?) == bits(&hc[span]);
+        }
+        stream.synchronize()?;
+        let tail = HC_MIX * n..;
+        let past_ok = mixes[tail.clone()]
+            .iter()
+            .chain(&hc[tail.clone()])
+            .all(|v| v.to_bits() == SENT.to_bits());
+        let again_ok = bits(&mixes2[..HC_MIX * n]) == bits(&mixes[..HC_MIX * n])
+            && bits(&hc2[..HC_MIX * n]) == bits(&hc[..HC_MIX * n]);
+        let (fault_ok, fault) = fault_is(gpu.fault()?, None);
+        let pass = groups_ok && past_ok && again_ok && fault_ok;
+        println!(
+            "{NAME}: grouped HC_PRE, layer {l}'s attention parameters, {n} tokens in groups {:?}: \
+             each group the plain launch over its tokens {}, nothing past the tokens {}, a \
+             second launch the first {}; {fault}: {}",
+            sizes(groups),
+            verdict(groups_ok),
+            verdict(past_ok),
+            verdict(again_ok),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Whether `r` is a refusal, printed.
+    fn refused<T>(what: &str, r: Result<T, GpuError>) -> bool {
+        let pass = r.is_err();
+        println!(
+            "{NAME}: {what}: {}: {}",
+            r.err()
+                .map_or_else(|| "accepted".to_string(), |e| format!("refused ({e})")),
+            verdict(pass)
+        );
+        pass
+    }
+
+    /// The shapes the batch-wide launchers refuse before a launch: a lead
+    /// outside `1 ..= min(8, cols)`, groups past the activation's columns,
+    /// an output a column short, a quantizer over more columns than its
+    /// form holds, rows past a projection's, and more groups than HC_PRE's
+    /// scratch holds.
+    fn proj_refusals(
+        gpu: &Gpu,
+        w: &Weights,
+        dense: &DenseKernels,
+        hck: &HcKernels,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut ok = refused("column groups led by 0", ColGroups::new(0, 0, 5));
+        ok &= refused("column groups led by 9", ColGroups::new(0, 9, 20));
+        ok &= refused(
+            "column groups led by 6 of 5 columns",
+            ColGroups::new(0, 6, 5),
+        );
+        let (wt, k) = q3k(w, &names::attn_output_b(PROJ_LAYER))?;
+        let rows = wt.rows();
+        let x = activations(k, 9, 5104);
+        let act = q8_cols(gpu, &x, k, 0, 9)?;
+        let mut y = DeviceBuffer::zeroed(stream, rows * 9)?;
+        ok &= refused(
+            "grouped gemv over columns 2..11 of 9",
+            gpu.enqueue_gemv_q3k_groups(wt, &act, ColGroups::new(2, 1, 9)?, &mut y),
+        );
+        let mut short = DeviceBuffer::zeroed(stream, rows * 8)?;
+        ok &= refused(
+            "grouped gemv of 9 columns into rows·8 values",
+            gpu.enqueue_gemv_q3k_groups(wt, &act, ColGroups::new(0, 1, 9)?, &mut short),
+        );
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let mut act8 = Q8Act::with_slots(stream, 8, k)?;
+        ok &= refused(
+            "quantizer over 9 columns into a form of 8",
+            gpu.enqueue_quantize_q8_1_cols(&x_dev, &mut act8, 9, PROJ_LAYER),
+        );
+        ok &= refused(
+            "quantizer over 0 columns",
+            gpu.enqueue_quantize_q8_1_cols(&x_dev, &mut act8, 0, PROJ_LAYER),
+        );
+        let mut dst = DeviceBuffer::zeroed(stream, 64 * 9)?;
+        ok &= refused(
+            "token-major copy of rows past the projection's",
+            dense.enqueue_groups_to_tokens(
+                stream,
+                &y,
+                RowsPart {
+                    total_rows: rows,
+                    r0: rows - 32,
+                    rows: 64,
+                },
+                ColGroups::new(0, 1, 9)?,
+                &mut dst,
+            ),
+        );
+        let (wa, ka) = q3k(w, &names::attn_output_a(PROJ_LAYER))?;
+        let heads = hp.o_groups;
+        let xa = activations(ka, 2 * heads, 5105);
+        let act_a = q8_cols(gpu, &xa, ka, 0, 2 * heads)?;
+        let mut ya = DeviceBuffer::zeroed(stream, 3 * wa.rows())?;
+        ok &= refused(
+            "grouped heads gemv over tokens 0..3 of an activation of 2",
+            dense.enqueue_q3k_heads_groups(
+                stream,
+                Q3kHeadsGroupsArgs {
+                    w: wa,
+                    act: &act_a,
+                    groups: heads,
+                    rows_per_head: hp.o_lora_rank,
+                    tokens: ColGroups::new(0, 3, 3)?,
+                    y: &mut ya,
+                },
+            ),
+        );
+        let l = PROJ_LAYER;
+        let params = HcParams {
+            w: q3k(w, &names::hc_attn_fn(l))?.0,
+            scale: f32s(w, &names::hc_attn_scale(l))?,
+            base: f32s(w, &names::hc_attn_base(l))?,
+            eps: hp.hc.eps,
+            iters: u32::try_from(hp.hc.sinkhorn_iters)?,
+        };
+        let kh = HC_STREAMS * hp.n_embd;
+        let xh = DeviceBuffer::from_host(stream, &activations(kh, 17, 5106))?;
+        let mut scratch = HcPreScratch::with_groups(stream, kh, 2)?;
+        let mut mixes = DeviceBuffer::zeroed(stream, HC_MIX * 17)?;
+        let mut hc = DeviceBuffer::zeroed(stream, HC_MIX * 17)?;
+        ok &= refused(
+            "grouped HC_PRE of 17 tokens led by 1 (3 groups) into a scratch of 2",
+            hck.enqueue_pre_groups(
+                stream,
+                &HcPreArgs {
+                    params: &params,
+                    x: &xh,
+                    tokens: 17,
+                    rms_eps: hp.rms_eps,
+                    fault: gpu.unlabelled_sink(),
+                },
+                1,
+                &mut scratch,
+                &mut mixes,
+                &mut hc,
+            ),
+        );
+        stream.synchronize()?;
+        let (fault_ok, fault) = fault_is(gpu.fault()?, None);
+        println!("{NAME}: after the refusals, {fault}: {}", verdict(fault_ok));
+        Ok(ok && fault_ok)
     }
 
     /// A f16 NaN, as the Q3_K super-block scale's two bytes.

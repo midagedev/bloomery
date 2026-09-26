@@ -44,7 +44,10 @@
 
 use bloomery_gpu::cores::{q3k_row_dot, q3k_row_dot_cols};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, launch_u32};
+use bloomery_gpu::{
+    ColGroups, DeviceTensor, Gpu, GpuError, Q8Act, col_group, col_group_count, col_group_of,
+    col_sums, launch_u32, store_cols,
+};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
@@ -262,81 +265,6 @@ unsafe fn q5k_lane_partials(
     [a0, a1, a2, a3, a4, a5, a6, a7]
 }
 
-/// The row's m sums from the per-lane partials: `warp::reduce_sum_f32` per
-/// column, the one-column kernels' tree, columns past `m` left at 0.0. `m`
-/// must be warp-uniform — a launch-wide constant in every caller.
-#[inline(always)]
-fn col_sums(f: [f32; 8], m: usize) -> [f32; 8] {
-    let mut s = [0.0f32; 8];
-    s[0] = warp::reduce_sum_f32(f[0]);
-    if m > 1 {
-        s[1] = warp::reduce_sum_f32(f[1]);
-    }
-    if m > 2 {
-        s[2] = warp::reduce_sum_f32(f[2]);
-    }
-    if m > 3 {
-        s[3] = warp::reduce_sum_f32(f[3]);
-    }
-    if m > 4 {
-        s[4] = warp::reduce_sum_f32(f[4]);
-    }
-    if m > 5 {
-        s[5] = warp::reduce_sum_f32(f[5]);
-    }
-    if m > 6 {
-        s[6] = warp::reduce_sum_f32(f[6]);
-    }
-    if m > 7 {
-        s[7] = warp::reduce_sum_f32(f[7]);
-    }
-    s
-}
-
-/// Lane 0's store of a row's `m` values: `y[base + c·stride] = v[c]` for
-/// `c < m`, one guarded store per column with a constant index (a loop over
-/// `c` would index `v` at run time and put it in a local depot).
-///
-/// # Safety
-///
-/// `1 <= m <= 8`, every slot `base + c·stride` for `c < m` inside `y`, and
-/// no other thread of the launch writes any of them.
-#[inline(always)]
-unsafe fn store_cols(
-    y: &mut DisjointSlice<f32>,
-    base: usize,
-    stride: usize,
-    m: usize,
-    v: [f32; 8],
-) {
-    // SAFETY: each store is guarded by c < m, so its slot is one this fn's
-    // contract puts inside y and gives to this thread alone.
-    unsafe {
-        *y.get_unchecked_mut(base) = v[0];
-        if m > 1 {
-            *y.get_unchecked_mut(base + stride) = v[1];
-        }
-        if m > 2 {
-            *y.get_unchecked_mut(base + 2 * stride) = v[2];
-        }
-        if m > 3 {
-            *y.get_unchecked_mut(base + 3 * stride) = v[3];
-        }
-        if m > 4 {
-            *y.get_unchecked_mut(base + 4 * stride) = v[4];
-        }
-        if m > 5 {
-            *y.get_unchecked_mut(base + 5 * stride) = v[5];
-        }
-        if m > 6 {
-            *y.get_unchecked_mut(base + 6 * stride) = v[6];
-        }
-        if m > 7 {
-            *y.get_unchecked_mut(base + 7 * stride) = v[7];
-        }
-    }
-}
-
 #[cuda_module]
 mod dense_kernels {
     use super::*;
@@ -540,6 +468,132 @@ mod dense_kernels {
             // SAFETY: slots t·n_rows + row for t < m are inside y (y.len()
             // >= m·n_rows) and belong to this row's warp alone.
             unsafe { store_cols(&mut y, row, n_rows as usize, m, s) };
+        }
+    }
+
+    /// [`ds41_q3k_gemv_heads_mcol`] over the token groups of a
+    /// [`ColGroups`] in one grid: block `b` runs token group `b % n_groups`
+    /// ([`col_group_count`]) on the eight rows from `8 · (b / n_groups)` —
+    /// row `r` of head group `h = r / rows_per_head` against columns
+    /// `(col0 + t0 + c)·groups + h` of the group's `m` tokens from `t0`, the
+    /// core `ds41_q3k_gemv_heads_mcol` runs (its one-column body at m = 1,
+    /// `ds41_q3k_gemv_heads`'s) — into the token-major `y[(t0 + c)·n_rows +
+    /// r]`: token t bit for bit the one-token launch on its `groups` columns,
+    /// the groups' outputs end to end.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= col0 * groups * 64 * iters + tokens * groups * 64 * iters,
+            d8.len() >= col0 * groups * 2 * n_sb + tokens * groups * 2 * n_sb,
+            groups * rows_per_head >= n_rows,
+            y.len() >= tokens * n_rows,
+            lead >= 1,
+            lead <= 8,
+            lead <= tokens
+        )
+    )]
+    pub fn ds41_q3k_gemv_heads_groups(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        rows_per_head: u32,
+        groups: u32,
+        col0: u32,
+        lead: u32,
+        tokens: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let (lead, tokens) = (lead as usize, tokens as usize);
+        let n_groups = col_group_count(lead, tokens);
+        let b = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let row = (b / n_groups) * 8 + t / 32;
+        let (t0, m) = col_group(b % n_groups, lead, tokens);
+        let h = row / rows_per_head as usize;
+        // Block-uniform tests; the second is the contract's.
+        if row >= n_rows as usize || h >= groups as usize || m == 0 {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let groups = groups as usize;
+        // q3k_row_dot_cols's contract: the row inside w, and column (col0 +
+        // t0 + m − 1)·groups + h < (col0 + tokens)·groups inside q and d8, by
+        // the launch contract; every lane of the warp calls it.
+        let f = q3k_row_dot_cols(
+            w,
+            q,
+            d8,
+            n_sb as usize,
+            iters,
+            row,
+            (col0 as usize + t0) * groups + h,
+            groups,
+            m,
+            lane,
+        );
+        let s = col_sums(f, m);
+        if lane == 0 {
+            // SAFETY: slots (t0 + c)·n_rows + row for c < m are inside y
+            // (y.len() >= tokens·n_rows, t0 + m <= tokens) and belong to this
+            // row's warp alone.
+            unsafe { store_cols(&mut y, t0 * n_rows as usize + row, n_rows as usize, m, s) };
+        }
+    }
+
+    /// The token-major copy of rows `r0 .. r0 + rows` of a grouped launch's
+    /// output over `tokens` tokens ([`ColGroups`]: group `g`'s `total_rows ×
+    /// m` row-major block at `total_rows · c0`): `dst[t·rows + r] =
+    /// src[total_rows·c0 + (r0 + r)·m + (t − c0)]`, token `t` in group `g` —
+    /// each group's block what `transpose::ds41_rows_to_tokens` copies of
+    /// its own launch. One thread per value.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            src.len() >= total_rows * tokens,
+            dst.len() >= rows * tokens,
+            total_rows >= r0 + rows,
+            lead >= 1,
+            lead <= 8,
+            lead <= tokens
+        )
+    )]
+    pub fn ds41_groups_to_tokens(
+        src: &[f32],
+        total_rows: u32,
+        r0: u32,
+        rows: u32,
+        lead: u32,
+        tokens: u32,
+        mut dst: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, lead, tokens) = (rows as usize, lead as usize, tokens as usize);
+        if i >= rows * tokens {
+            return;
+        }
+        let (t, r) = (i / rows, i % rows);
+        let (c0, m) = col_group(col_group_of(t, lead), lead, tokens);
+        let at = total_rows as usize * c0 + (r0 as usize + r) * m + (t - c0);
+        // SAFETY: t < tokens puts t in a group with c0 <= t < c0 + m, so at <
+        // total_rows·(c0 + m) <= total_rows·tokens <= src.len() (r0 + r <
+        // total_rows); i < rows·tokens <= dst.len(), and thread i is dst[i]'s
+        // only writer.
+        unsafe {
+            *dst.get_unchecked_mut(i) = *src.get_unchecked(at);
         }
     }
 
@@ -975,6 +1029,122 @@ impl DenseKernels {
         Ok(())
     }
 
+    /// Enqueue the block diagonal of Q3_K weight `a.w` over a prompt pass's
+    /// token groups in one launch ([`Q3kHeadsGroupsArgs`]): each group's
+    /// tokens [`DenseKernels::enqueue_q3k_heads_mcol`] on that group's
+    /// columns alone, bit for bit, token-major into `a.y` from the groups'
+    /// first token. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_q3k_heads_groups(
+        &self,
+        stream: &CudaStream,
+        a: Q3kHeadsGroupsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "DenseKernels::enqueue_q3k_heads_groups";
+        let (n_rows, groups, n_sb) = (a.w.rows(), a.groups, a.act.n_sb());
+        let (col0, lead, tokens) = (a.tokens.col0(), a.tokens.lead(), a.tokens.cols());
+        if a.rows_per_head == 0 || n_rows != groups * a.rows_per_head {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{n_rows} rows are not {groups} groups of {}",
+                    a.rows_per_head
+                ),
+            });
+        }
+        kquant_rows(what, a.w, 110, n_sb)?;
+        if (col0 + tokens) * groups > a.act.m() || a.y.len() < tokens * n_rows {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "tokens {col0}..{} of {groups} columns each in an activation of {}; y wants \
+                     {}, got {}",
+                    col0 + tokens,
+                    a.act.m(),
+                    tokens * n_rows,
+                    a.y.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", a.tokens.count() * n_rows.div_ceil(8))?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", a.rows_per_head)?;
+        let groups = launch_u32(what, "groups", groups)?;
+        let col0 = launch_u32(what, "col0", col0)?;
+        let lead = launch_u32(what, "lead", lead)?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_ds41_q3k_gemv_heads_groups(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.ds41_q3k_gemv_heads_groups(
+            stream,
+            &prep,
+            a.w.buf(),
+            a.act.q3(),
+            a.act.d8(),
+            n_rows,
+            rows_per_head,
+            groups,
+            col0,
+            lead,
+            tokens,
+            n_sb,
+            n_sb.div_ceil(2),
+            a.y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the token-major copy of `part`'s rows of a grouped launch's
+    /// output `src` over the tokens of `groups` (laid out as
+    /// `Gpu::enqueue_gemv_q3k_groups` lays it) into `dst`, `part.rows`
+    /// values a token: each group's tokens what the transpose of its own
+    /// launch's output copies. Refused before the launch when the rows pass
+    /// the output's or a buffer is short. Asynchronous, allocation-free.
+    pub fn enqueue_groups_to_tokens(
+        &self,
+        stream: &CudaStream,
+        src: &DeviceBuffer<f32>,
+        part: RowsPart,
+        groups: ColGroups,
+        dst: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "DenseKernels::enqueue_groups_to_tokens";
+        let RowsPart {
+            total_rows,
+            r0,
+            rows,
+        } = part;
+        let tokens = groups.cols();
+        if rows == 0
+            || r0 + rows > total_rows
+            || src.len() < total_rows * tokens
+            || dst.len() < rows * tokens
+        {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "rows {r0}..{} of {total_rows} over {tokens} tokens from {} values into {}",
+                    r0 + rows,
+                    src.len(),
+                    dst.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", (rows * tokens).div_ceil(BLOCK as usize))?;
+        let total_rows = launch_u32(what, "total_rows", total_rows)?;
+        let r0 = launch_u32(what, "r0", r0)?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let lead = launch_u32(what, "lead", groups.lead())?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let prep = self
+            .module
+            .prepare_ds41_groups_to_tokens(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module
+            .ds41_groups_to_tokens(stream, &prep, src, total_rows, r0, rows, lead, tokens, dst)?;
+        Ok(())
+    }
+
     /// Enqueue the shared expert's gate·up·SwiGLU for `act.m()` (1..=8)
     /// tokens from Q3_K `gate` and `up` (the same rows of `act.n_sb()`
     /// super-blocks) and the tokens' q8_1 columns `act`; `h` takes one f32
@@ -1065,6 +1235,31 @@ pub struct Q3kHeadsMcolArgs<'a> {
     pub m: usize,
     /// `m · rows` outputs, token-major.
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// Arguments of [`DenseKernels::enqueue_q3k_heads_groups`].
+pub struct Q3kHeadsGroupsArgs<'a> {
+    /// The Q3_K block-diagonal weight, `groups · rows_per_head` rows.
+    pub w: &'a DeviceTensor<u32>,
+    /// The heads in q8_1, `groups` columns a token — token t's group g at
+    /// column `t·groups + g`, [`Q3kHeadsMcolArgs::q3`]'s layout.
+    pub act: &'a Q8Act,
+    pub groups: usize,
+    pub rows_per_head: usize,
+    /// The tokens, counted in the activation's tokens, and their groups.
+    pub tokens: ColGroups,
+    /// `tokens.cols() · rows` outputs, token-major from the groups' first
+    /// token.
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// Rows `r0 .. r0 + rows` of a projection of `total_rows` rows: a part of a
+/// joined launch's output.
+#[derive(Clone, Copy, Debug)]
+pub struct RowsPart {
+    pub total_rows: usize,
+    pub r0: usize,
+    pub rows: usize,
 }
 
 /// Refuse a K-quant tensor whose rows are not `n_sb` super-blocks of

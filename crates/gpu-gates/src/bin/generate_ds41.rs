@@ -67,7 +67,8 @@
 //! keys `generate`'s does (`p50_ms=`, `mean_ms=`, `warm=`), so the runners
 //! that read one read the other.
 //!
-//! A batched feed prints the batch's device bytes (`prefill batch_bytes=`)
+//! A batched feed prints the batch's device bytes (`prefill batch_bytes=`,
+//! of them the batch-wide attention projections' `proj_bytes=`)
 //! before the prompt and a `stat prefill` line after its `step 0` line: the
 //! host tier's batch services since load (`union_layers`, `union_cols`,
 //! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
@@ -75,9 +76,14 @@
 //! A `stat prefill split` line follows (`body::PrefillStats`): the prologue,
 //! the enqueue with its union calls, waits on the route's copies and
 //! activation copies, and the enqueue time left, summed and per
-//! layer-batch; with `BLOOMERY_STEP_STATS=1` also each layer's card time by
-//! event pairs (`card_out`: its first launch to its route's copies;
-//! `card_in`: its shadow), whose reads add a wait per batch to the feed.
+//! layer-batch; the queue entries — launches, event records, stream waits —
+//! the route and the shadow put in a layer-batch (`entries_route=`,
+//! `entries_shadow=`, the launch-queue model's N_r and N_s) and the host
+//! tier's batch-excluded slots a layer-batch (`excluded_lb=`); with
+//! `BLOOMERY_STEP_STATS=1` also each layer's card time by event pairs
+//! (`card_out`: its first launch to its route's copies; `card_in`: its
+//! shadow; `card_proj`: the batch-wide attention projections, inside
+//! `card_out`), whose reads add a wait per batch to the feed.
 //! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`expert`,
 //! the default, or `slot`), the shadow's routed gate·up arm.
 //! A second `stat prefill ced=` line names the triangle's state (the `load`
@@ -537,9 +543,11 @@ mod drive {
                 let (gpu, _, b) = m.body_parts("generate_ds41")?;
                 b.set_prefill_card_timing(gpu, true)?;
             }
+            let body = m.body("generate_ds41")?;
             println!(
-                "prefill batch_bytes={}",
-                m.body("generate_ds41")?.batch_bytes()
+                "prefill batch_bytes={} proj_bytes={}",
+                body.batch_bytes(),
+                body.batch_proj_bytes()
             );
         }
         let mut check = if check_finite {
