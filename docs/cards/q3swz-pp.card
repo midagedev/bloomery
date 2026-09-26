@@ -1,0 +1,25 @@
+# q3swz lands q3fa's instruction diet, the K/V tiles' XOR swizzle and the query prologue diet in gqa_prefill_flash,
+# bit for bit. Sitting 18 (rig-log 09-26#q3swz-ncu) measured one layer-24 launch at P = 4096 at 2,319,186 cycles
+# (1.80 GHz); sitting 16 (#q3ncu-s16) measured main's at 2,911,224: -592,038 cycles a launch. Every layer's flash has
+# the same shape, so the window moves by 48 x 592,038 = 28.4 M cycles: -14.6..-18.1 ms at 1.57..1.95 GHz (q3tail's
+# nsys put main's launch at 1.854 ms in the pipeline, 2,911,224 cycles at 1.57 GHz) [derived]. pp4096 on main is
+# 8,818 tok/s (q3gemmb, rig-log 09-26#q3gemmb-ab): the 464.5 ms window becomes 446.4..449.9 ms, +3.2..+4.1 %,
+# widened to +2.5..+4.5 % for the L2 state an isolated ncu launch does not share with the pipeline [derived]. At
+# P = 512 the flash is about 1.8 ms of a 66 ms window and a fifth of it is about +0.5 %: a screen for 0. The decode
+# rows run the decode flash, not this kernel: screens for 0.
+kind: ab
+question: does the swizzled flash shorten the Qwen3 prompt at P = 4096 by the cycles sitting 18 measured?
+term: pp tok/s @ P = 4096, n = 0, A6000, Qwen3-30B-A3B Q4_K_M - (q3swz - base) / base, paired by round
+unit: %
+predict: +2.5..+4.5
+rounds: 4
+condition: main after the q3swz landing and the base (main 4786c1e, /root/repo/bloomery-ee-sit/target/release/
+  generate_qwen3moe, sha256 11ed3969c4c7, a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=4 just
+  depth-gpu-qwen3moe 512 bin:<base>:512 4096 bin:<base>:4096, the order rotated every round; no row carries
+  [other-busy]; P = 512 and the decode rows are screens for 0
+decide-in: the launch's cycles carry into the window at the pipeline's clock; price the flash's next lever (the L2
+  order) with the same translation
+decide-below: the window gains less than the launches' cycles say: take an nsys of the P = 4096 prompt and read the
+  flash launches' in-pipeline duration against the ncu launch before any further flash round
+decide-above: the pipeline's clock sits below 1.57 GHz or the pipeline's L2 state helps the swizzle more than the
+  isolated launch: re-fit the clock term from an nsys before pricing the next flash lever
