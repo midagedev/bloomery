@@ -607,19 +607,21 @@ mod queue {
     /// the shared expert's gate·up, its down's q8_1 form, the down and past
     /// one token its copy token-major. Per expert, then over the block: the
     /// buckets, the grouped gate·up, its q8_1 form and the grouped down when
-    /// there are card experts, and the card sum.
+    /// there are card experts, and the card sum; on the tile arm also the
+    /// tile table and the gather into run order.
     pub(super) fn shadow(
         chunks: &[Range<usize>],
         experts: CardExperts,
         card: bool,
         shared: Shared,
     ) -> u64 {
-        let expert = matches!(experts, CardExperts::Expert);
+        let grouped = !matches!(experts, CardExperts::Slot);
+        let tile = matches!(experts, CardExperts::Tile);
         let per_chunk: u64 = chunks
             .iter()
             .map(|r| {
                 let m = r.len() as u64;
-                let routed = match (expert, card) {
+                let routed = match (grouped, card) {
                     (true, true) => 2,
                     (true, false) => 0,
                     (false, true) => 3 + 1,
@@ -629,8 +631,10 @@ mod queue {
                 2 + routed + gate_up + u64::from(shared.down_q8) + 1 + u64::from(m > 1)
             })
             .sum();
-        let block = match (expert, card) {
-            (true, true) => 4 + 1,
+        let block = match (grouped, card) {
+            // The buckets, the gate·up, its q8_1 form and the down, and the
+            // card sum; the tile arm adds the tile table and the gather.
+            (true, true) => 4 + 2 * u64::from(tile) + 1,
             (true, false) => 1,
             (false, _) => 0,
         };

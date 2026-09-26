@@ -26,12 +26,14 @@ generate_ds41   ds41_attn_seg_sel_stage                 0          0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 generate_ds41   ds41_attn_seg_stage                     8          8
 generate_ds41   ds41_card_buckets                       0          0
+generate_ds41   ds41_card_gather                        0          0
 generate_ds41   ds41_comp_pool                          0          0
 generate_ds41   ds41_comp_rows                          0          0
 generate_ds41   ds41_engram_gate                        0          0
 generate_ds41   ds41_engram_key_norm                    0          0
 generate_ds41   ds41_expert_gate_up                     0          0
 generate_ds41   ds41_expert_gate_up_grouped             0          0
+generate_ds41   ds41_expert_gate_up_tiles               0          0
 generate_ds41   ds41_expert_gate_up_tok                 0          0
 generate_ds41   ds41_ffn_card_acc                       0          0
 generate_ds41   ds41_ffn_handoff                        0          0
@@ -105,6 +107,7 @@ generate_ds41   gqa_flash_merge                         0          0
 generate_ds41   gqa_flash_seg                           0          0
 generate_ds41   gqa_flash_seg_mma                       0          0
 generate_ds41   gqa_prefill_flash                       0          0
+generate_ds41   grouped_tiles                           0          0
 generate_ds41   half_decode                             0          0
 generate_ds41   head_norm_neox_append                   0          0
 generate_ds41   iq2_xs_rows                             0          0
@@ -133,6 +136,7 @@ generate_ds41   q4k_gemv                                0          0
 generate_ds41   q4k_gemv_grouped                        0          0
 generate_ds41   q4k_gemv_mcol                           0          0
 generate_ds41   q4k_gemv_sel                            0          0
+generate_ds41   q4k_gemv_tiles                          0          0
 generate_ds41   q5_0_gemv                               0          0
 generate_ds41   q5_0_gemv_sel                           0          0
 generate_ds41   q5_1_gemv                               0          0
@@ -144,6 +148,7 @@ generate_ds41   q8_0_gemv                               0          0
 generate_ds41   q8_0_gemv_heads                         0          0
 generate_ds41   q8_0_gemv_heads_mcol                    0          0
 generate_ds41   q8_0_gemv_mcol                          0          0
+generate_ds41   q8_1_quantize_ord                       0          0
 generate_ds41   q8_1_quantize_sel                       0          0
 generate_ds41   qwen3moe_combine                        0          0
 generate_ds41   qwen3moe_gate_up_swiglu_q4k             0          0
@@ -206,6 +211,7 @@ gate_e2e        gqa_flash_merge                         0          0
 gate_e2e        gqa_flash_seg                           0          0
 gate_e2e        gqa_flash_seg_mma                       0          0
 gate_e2e        gqa_prefill_flash                       0          0
+gate_e2e        grouped_tiles                           0          0
 gate_e2e        half_decode                             0          0
 gate_e2e        head_norm_neox_append                   0          0
 gate_e2e        iq2_xs_rows                             0          0
@@ -234,6 +240,7 @@ gate_e2e        q4k_gemv                                0          0
 gate_e2e        q4k_gemv_grouped                        0          0
 gate_e2e        q4k_gemv_mcol                           0          0
 gate_e2e        q4k_gemv_sel                            0          0
+gate_e2e        q4k_gemv_tiles                          0          0
 gate_e2e        q5_0_gemv                               0          0
 gate_e2e        q5_0_gemv_sel                           0          0
 gate_e2e        q5_1_gemv                               0          0
@@ -245,6 +252,7 @@ gate_e2e        q8_0_gemv                               0          0
 gate_e2e        q8_0_gemv_heads                         0          0
 gate_e2e        q8_0_gemv_heads_mcol                    0          0
 gate_e2e        q8_0_gemv_mcol                          0          0
+gate_e2e        q8_1_quantize_ord                       0          0
 gate_e2e        q8_1_quantize_sel                       0          0
 gate_e2e        qwen3moe_combine                        0          0
 gate_e2e        qwen3moe_gate_up_swiglu_q4k             0          0

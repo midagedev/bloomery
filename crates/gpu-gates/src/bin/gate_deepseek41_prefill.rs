@@ -89,8 +89,8 @@
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
 //! short subset.
 //!
-//! `BLOOMERY_CARD_EXPERTS=slot|expert` picks the shadow's routed gate·up arm
-//! (the `loaded` line names it); both must pass. `BLOOMERY_STEP_STATS=1`
+//! `BLOOMERY_CARD_EXPERTS=tile|expert|slot` picks the shadow's routed experts'
+//! arm (the `loaded` line names it); all three must pass. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
 //! `stat prefill split` line (`body::PrefillStats`) — with the queue entries
 //! the route and the shadow put in a layer-batch (`entries_route=`,

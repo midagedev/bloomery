@@ -24,15 +24,26 @@
 //! slots whose place is on the card — the columns a routed gate·up wrote —
 //! and no other, so a column the host serves is never read, even by the
 //! quantizer.
+//!
+//! [`q4k_gemv_tiles`] cuts the same table into tiles — up to [`TILE_COLS`]
+//! consecutive entries of one expert's run, listed by [`grouped_tiles`] —
+//! and runs a block per tile and eight weight rows with the m-column core,
+//! so a weight row is read once for up to eight slots at a time. Its columns
+//! are the table's entries (column `j` is the slot `order[j]`), which
+//! [`Q4kSelKernels::enqueue_quantize_ord`] fills, and it scatters each
+//! column's value to its slot. [`tile_at`] is the one reading of a tile,
+//! shared with the other tiled kernels.
 
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{q4k_row_dot, q4k_row_dot_1col};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
-use crate::q8_1_quant_block;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
+use crate::{col_sums, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::ops::Range;
 use std::sync::Arc;
@@ -80,6 +91,115 @@ pub unsafe fn grouped_run(
             fault.raise(FaultSite::ExpertId);
         }
         None
+    }
+}
+
+/// Slots a column tile covers at most: the m-column cores' width.
+pub const TILE_COLS: usize = 8;
+
+/// The shift of a tile word's expert: word `(e << TILE_E_SHIFT) | j` is
+/// expert `e`'s tile from table entry `j`.
+const TILE_E_SHIFT: u32 = 22;
+
+/// The most experts, and the most table entries, a tile word can name.
+pub const TILE_MAX_EXPERTS: usize = 1 << (32 - TILE_E_SHIFT);
+pub const TILE_MAX_SLOTS: usize = 1 << TILE_E_SHIFT;
+
+/// The most column tiles a grouped slot table of `n_slots` slots over
+/// `n_experts` runs cuts into ([`grouped_tiles`]): a run of `r` slots makes
+/// `⌈r / 8⌉ <= (r + 7) / 8` tiles and each tile holds a slot, so the count is
+/// at most `min(n_slots, ⌊(n_slots + 7 · n_experts) / 8⌋)`. A tile table for
+/// them is one count word and a word a tile.
+#[must_use]
+pub fn tile_cap(n_slots: usize, n_experts: usize) -> usize {
+    n_slots.min((n_slots + (TILE_COLS - 1) * n_experts) / TILE_COLS)
+}
+
+/// Tile `g` of a tile table ([`grouped_tiles`]): its expert `e`, first table
+/// entry `j` and column count `m` (`1 <= m <= TILE_COLS`, the run of `e` in
+/// `start` ending at or past `j + m`). `None` for a tile past the table's
+/// count `tiles[0]`, and for a word that names an expert past `n_experts` or
+/// columns outside its run or past `n_slots` — for which lane 0 raises
+/// [`FaultSite::ExpertId`] on `fault`.
+///
+/// # Safety
+///
+/// `1 + g < tiles.len()`, `n_experts < start.len()`, and the 32 lanes of the
+/// warp call it with the same `g`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: the tile table, the runs and their bounds (rust-quality R8)"
+)]
+#[inline(always)]
+pub unsafe fn tile_at(
+    tiles: &[u32],
+    start: &[u32],
+    n_experts: u32,
+    n_slots: u32,
+    g: u32,
+    lane: usize,
+    fault: FaultSink,
+) -> Option<(usize, usize, usize)> {
+    // SAFETY: 1 + g < tiles.len() by this fn's contract.
+    let (count, word) = unsafe {
+        (
+            *tiles.get_unchecked(0),
+            *tiles.get_unchecked(1 + g as usize),
+        )
+    };
+    if g >= count {
+        return None;
+    }
+    let (e, j) = (word >> TILE_E_SHIFT, word & ((1 << TILE_E_SHIFT) - 1));
+    // An expert past the stack has no run: j1 = 0 fails the test below.
+    let j1 = if e < n_experts {
+        // SAFETY: e + 1 <= n_experts < start.len() by this fn's contract.
+        unsafe { *start.get_unchecked(e as usize + 1) }
+    } else {
+        0
+    };
+    if j < j1 && j1 <= n_slots {
+        let m = ((j1 - j) as usize).min(TILE_COLS);
+        Some((e as usize, j as usize, m))
+    } else {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        None
+    }
+}
+
+/// Lane 0's store of one tile column: the value `v` of table entry `at`
+/// into row `r` of its slot `order[at]`'s rows of `y`, or
+/// [`FaultSite::ExpertId`] on `fault` for an entry that names no slot.
+///
+/// # Safety
+///
+/// `at < order.len()`, `r < rpe`, `y.len() >= n_slots * rpe`, and no other
+/// thread writes row `r` of that slot.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: a kernel's output, table and bounds (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn scatter_col(
+    y: &mut DisjointSlice<f32>,
+    order: &[u32],
+    at: usize,
+    n_slots: usize,
+    rpe: usize,
+    r: usize,
+    v: f32,
+    fault: FaultSink,
+) {
+    // SAFETY: at < order.len() by this fn's contract.
+    let slot = unsafe { *order.get_unchecked(at) } as usize;
+    if slot < n_slots {
+        // SAFETY: slot < n_slots and r < rpe, so the index is below
+        // n_slots * rpe <= y.len(); this thread is its only writer.
+        unsafe { *y.get_unchecked_mut(slot * rpe + r) = v };
+    } else {
+        fault.raise(FaultSite::ExpertId);
     }
 }
 
@@ -275,6 +395,311 @@ mod q4k_sel_kernels {
             }
             j += 1;
         }
+    }
+
+    /// The tile table of a grouped slot table ([`q4k_gemv_grouped`]'s layout,
+    /// runs `start` of `n_experts` experts inside `n_slots` slots), in one
+    /// block: expert `e`'s run `start[e] .. start[e + 1]` is cut into
+    /// `⌈run / 8⌉` column tiles of up to [`TILE_COLS`] consecutive entries,
+    /// the tiles of the experts in turn, tile `g` written as the word `(e <<
+    /// 22) | j` — its expert and first entry — at `tiles[1 + g]`, and their
+    /// count at `tiles[0]`. A run that does not lie inside `0 ..
+    /// start[n_experts] <= n_slots`, or tiles past `cap`, raise
+    /// [`FaultSite::ExpertId`] on `fault` and leave a count of 0: no tile
+    /// kernel then reads the table.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(
+        domain = 1,
+        block = (1024, 1, 1),
+        requires = (
+            start.len() >= n_experts + 1,
+            tiles.len() >= cap + 1,
+            n_experts <= 1024,
+            n_slots <= 4194304
+        )
+    )]
+    pub fn grouped_tiles(
+        start: &[u32],
+        n_experts: u32,
+        n_slots: u32,
+        cap: u32,
+        fault: FaultSink,
+        mut tiles: DisjointSlice<u32>,
+    ) {
+        static mut AT: SharedArray<u32, TILE_MAX_EXPERTS> = SharedArray::UNINIT;
+        static mut COUNT: SharedArray<u32, 1> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let n = n_experts as usize;
+        // SAFETY: block-shared; the raw forms reach the `static mut`s without
+        // a reference.
+        let (at, total) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut AT),
+                SharedArray::as_raw_mut_ptr(&raw mut COUNT),
+            )
+        };
+        // SAFETY: n < start.len() by the launch contract.
+        let end = unsafe { *start.get_unchecked(n) };
+        if tid < n {
+            // SAFETY: tid + 1 <= n < start.len() by the launch contract.
+            let (j0, j1) = unsafe { (*start.get_unchecked(tid), *start.get_unchecked(tid + 1)) };
+            let c = if j0 <= j1 && j1 <= end && end <= n_slots {
+                (j1 - j0).div_ceil(TILE_COLS as u32)
+            } else {
+                u32::MAX
+            };
+            // SAFETY: tid < n <= TILE_MAX_EXPERTS; thread tid is the entry's
+            // only writer before the barrier.
+            unsafe { *at.add(tid) = c };
+        }
+        thread::sync_threads();
+        if tid == 0 {
+            let mut sum = 0u32;
+            let mut e = 0usize;
+            while e < n {
+                // SAFETY: e < n <= TILE_MAX_EXPERTS, published by the barrier;
+                // thread 0 alone rewrites it now, before the next.
+                let c = unsafe { *at.add(e) };
+                if c == u32::MAX || c > cap - sum {
+                    sum = u32::MAX;
+                    break;
+                }
+                // SAFETY: as above.
+                unsafe { *at.add(e) = sum };
+                sum += c;
+                e += 1;
+            }
+            let count = if sum == u32::MAX {
+                fault.raise(FaultSite::ExpertId);
+                0
+            } else {
+                sum
+            };
+            // SAFETY: the one shared word; thread 0 is its only writer, and
+            // tiles[0] is its only writer too.
+            unsafe {
+                *total = count;
+                *tiles.get_unchecked_mut(0) = count;
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: the word thread 0 wrote before the barrier.
+        if tid < n && unsafe { *total } != 0 {
+            // SAFETY: tid < n, the entry thread 0 left before the barrier;
+            // start as above.
+            let (g0, j0, j1) = unsafe {
+                (
+                    *at.add(tid) as usize,
+                    *start.get_unchecked(tid),
+                    *start.get_unchecked(tid + 1),
+                )
+            };
+            let mut j = j0;
+            let mut g = g0;
+            while j < j1 {
+                // SAFETY: g < the count <= cap < tiles.len() - 1; the experts'
+                // tiles are disjoint ranges of it, so thread tid is the only
+                // writer of its tiles.
+                unsafe { *tiles.get_unchecked_mut(1 + g) = (tid as u32) << TILE_E_SHIFT | j };
+                j += TILE_COLS as u32;
+                g += 1;
+            }
+        }
+    }
+
+    /// [`q4k_gemv_grouped`] by tile items: block `g + tile_cap · ρ` (of
+    /// `tile_cap · row_tiles`, [`tile_cap`] of the table) is tile `g` of the
+    /// table `tiles` ([`grouped_tiles`], [`tile_at`]) — expert `e`, the `m`
+    /// table entries from `j` — on the eight weight rows `8ρ ..`, warp `w`
+    /// dotting row `r = 8ρ + w` with the `m` columns `j .. j + m` of the q8_1
+    /// scratch (column `j` holding slot `order[j]`'s activation) through the
+    /// m-column core `cores::q4k_row_dot`, whose column c is
+    /// `q4k_row_dot_1col` on that column bit for bit; lane 0 stores column c's
+    /// sum into `y[order[j + c] · rows_per_expert + r]`, `q4k_gemv_sel`'s
+    /// value for that slot. The blocks of one row tile are consecutive, so an
+    /// expert's tiles run side by side on the same weight rows, each row read
+    /// once for up to [`TILE_COLS`] slots. A block past the table's count
+    /// returns; a tile word [`tile_at`] refuses and an entry that names no slot
+    /// raise [`FaultSite::ExpertId`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    // Five blocks an SM: 48 registers a thread, what the m-column core
+    // takes in `q4k_gemv_mcol`.
+    #[launch_bounds(256, 5)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            q.len() >= n_slots * 256 * iters,
+            s8.len() >= n_slots * 8 * n_sb,
+            d8.len() >= n_slots * 2 * n_sb,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            tiles.len() >= tile_cap + 1,
+            tile_cap >= 1,
+            y.len() >= n_slots * rows_per_expert,
+            rows_per_expert >= 8 * row_tiles
+        )
+    )]
+    pub fn q4k_gemv_tiles(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        order: &[u32],
+        start: &[u32],
+        tiles: &[u32],
+        tile_cap: u32,
+        row_tiles: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // Block b is tile b mod tile_cap (tile_cap >= 1 by the launch
+        // contract) of row tile b / tile_cap: the tiles of one row tile are
+        // consecutive blocks.
+        let b = thread::blockIdx_x();
+        let (g, rho) = (b % tile_cap, b / tile_cap);
+        // Block-uniform: a block past the grid the tables were sized for
+        // reads nothing.
+        if rho >= row_tiles {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: 1 + g <= tile_cap < tiles.len() and n_experts < start.len()
+        // by the launch contract; the block's warps share g.
+        let tile = unsafe { tile_at(tiles, start, n_experts, n_slots, g, lane, fault) };
+        // Block-uniform: every warp reads the same word.
+        let Some((e, j, m)) = tile else {
+            return;
+        };
+        let rpe = rows_per_expert as usize;
+        let r = rho as usize * ROWS_PER_BLOCK + thread::threadIdx_x() as usize / 32;
+        // The core's caller contract: row e·rpe + r < n_experts·rpe rows of
+        // `w` (r < 8 · row_tiles <= rows_per_expert); columns j + m <= n_slots
+        // of `q`/`s8`/`d8` by `tile_at` and the launch contract; iters =
+        // ceil(n_sb/4) from the host; the warp's 32 lanes are here and m is
+        // block-uniform.
+        let f = q4k_row_dot(w, q, s8, d8, n_sb as usize, iters, e * rpe + r, j, m, lane);
+        let v = col_sums(f, m);
+        if lane == 0 {
+            let n_slots = n_slots as usize;
+            // SAFETY: each at = j + c < j + m <= n_slots <= order.len(), r <
+            // rpe, y.len() >= n_slots·rpe by the launch contract; a table
+            // entry sits in one tile, so lane 0 of this warp is the only
+            // writer of its slot's row r.
+            unsafe {
+                scatter_col(&mut y, order, j, n_slots, rpe, r, v[0], fault);
+                if m > 1 {
+                    scatter_col(&mut y, order, j + 1, n_slots, rpe, r, v[1], fault);
+                }
+                if m > 2 {
+                    scatter_col(&mut y, order, j + 2, n_slots, rpe, r, v[2], fault);
+                }
+                if m > 3 {
+                    scatter_col(&mut y, order, j + 3, n_slots, rpe, r, v[3], fault);
+                }
+                if m > 4 {
+                    scatter_col(&mut y, order, j + 4, n_slots, rpe, r, v[4], fault);
+                }
+                if m > 5 {
+                    scatter_col(&mut y, order, j + 5, n_slots, rpe, r, v[5], fault);
+                }
+                if m > 6 {
+                    scatter_col(&mut y, order, j + 6, n_slots, rpe, r, v[6], fault);
+                }
+                if m > 7 {
+                    scatter_col(&mut y, order, j + 7, n_slots, rpe, r, v[7], fault);
+                }
+            }
+        }
+    }
+
+    /// The q8_1 form of the first `start[n_experts]` columns of `x` — the
+    /// entries of a grouped slot table ([`grouped_run`]'s layout), column `j` the
+    /// activation of slot `order[j]` — each into the same column of the five
+    /// planes: one 32-thread block per 128-value block of column `j <
+    /// m_cols`, `q8_1_quant_block` as in [`q8_1_quantize_sel`], which does
+    /// not depend on the column's position, so column `j` holds the bytes the
+    /// plain quantizer writes for it. Columns from the count on return before
+    /// any load and keep what they held. A non-finite value raises
+    /// [`FaultSite::QuantColumn`] on `fault`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= m_cols * 256 * n_sb,
+            start.len() >= n_experts + 1,
+            q3.len() >= m_cols * 64 * half_it,
+            q4.len() >= m_cols * 256 * quad_it,
+            q6.len() >= m_cols * 128 * half_it,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb
+        )
+    )]
+    pub fn q8_1_quantize_ord(
+        x: &[f32],
+        start: &[u32],
+        n_experts: u32,
+        m_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let blocks_per_col = 2 * n_sb;
+        if blk >= m_cols as usize * blocks_per_col {
+            return;
+        }
+        let (j, b) = (blk / blocks_per_col, blk % blocks_per_col);
+        // SAFETY: n_experts < start.len() by the launch contract. The 32 lanes
+        // of the block share `j`: the return is uniform.
+        if j >= unsafe { *start.get_unchecked(n_experts as usize) } as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // The block body's contract: column j < m_cols and b < 2 n_sb by the
+        // lines above, the launch contract bounds `x` (at base 0) and the five
+        // planes at m_cols columns, and the block index is warp-uniform.
+        q8_1_quant_block(
+            x,
+            0,
+            j,
+            b,
+            n_sb,
+            half_it,
+            quad_it,
+            lane,
+            &mut q3,
+            &mut q4,
+            &mut q6,
+            &mut s8,
+            &mut d8,
+            fault,
+            FaultSite::QuantColumn,
+        );
     }
 
     /// The q8_1 form of the activation columns the card's expert slots read:
@@ -588,6 +1013,209 @@ impl Q4kSelKernels {
             launch_u32(what, "iters", n_sb.div_ceil(4))?,
             fault,
             y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`grouped_tiles`]: the tile table of the grouped slot table
+    /// `start` (runs of `n_experts` experts inside `n_slots` slots) into
+    /// `tiles`, which holds [`tile_cap`]`(n_slots, n_experts) + 1` words. A run
+    /// outside the table raises [`FaultSite::ExpertId`] on `fault` and leaves
+    /// no tiles. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_grouped_tiles(
+        &self,
+        stream: &CudaStream,
+        start: &DeviceBuffer<u32>,
+        n_experts: usize,
+        n_slots: usize,
+        fault: FaultSink,
+        tiles: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_grouped_tiles";
+        let cap = tile_cap(n_slots, n_experts);
+        if n_experts == 0
+            || n_experts > TILE_MAX_EXPERTS
+            || n_slots > TILE_MAX_SLOTS
+            || start.len() < n_experts + 1
+            || tiles.len() < cap + 1
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots over {n_experts} experts (1..={TILE_MAX_EXPERTS}, at most \
+                     {TILE_MAX_SLOTS} slots): start {}, tiles {} for {} tiles",
+                    start.len(),
+                    tiles.len(),
+                    cap
+                ),
+            ));
+        }
+        let prep = self.module.prepare_grouped_tiles(LaunchConfig1D::new(
+            1,
+            TILE_MAX_EXPERTS as u32,
+            0,
+        ))?;
+        self.module.grouped_tiles(
+            stream,
+            &prep,
+            start,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "cap", cap)?,
+            fault,
+            tiles,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q4k_gemv_tiles`]: the down of the `n_slots` slots of the
+    /// grouped slot table `order`/`start` (one run per expert of `w`,
+    /// `w.rows() / rows_per_expert` of them) by the tiles of `tiles`
+    /// ([`Q4kSelKernels::enqueue_grouped_tiles`] of the same table), table
+    /// entry `j` reading column `j` of `act` and writing its slot `order[j]`'s
+    /// rows `y[order[j] · rows_per_expert ..]`. Each slot's value is
+    /// [`Q4kSelKernels::enqueue_gemv_q4k_sel`]'s. A tile word that names no
+    /// run and an entry that names no slot raise [`FaultSite::ExpertId`] on
+    /// `fault`. The tile count is the table's, a device value: the grid is
+    /// sized for [`tile_cap`] of them and a block past the count returns.
+    /// Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
+    )]
+    pub fn enqueue_gemv_q4k_tiles(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        order: &DeviceBuffer<u32>,
+        start: &DeviceBuffer<u32>,
+        tiles: &DeviceBuffer<u32>,
+        n_slots: usize,
+        rows_per_expert: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gemv_q4k_tiles";
+        let n_sb = act.n_sb();
+        let shape = |detail: String| GpuError::shape(what, detail);
+        if w.cols() != 36 * n_sb
+            || rows_per_expert == 0
+            || !rows_per_expert.is_multiple_of(ROWS_PER_BLOCK)
+            || !w.rows().is_multiple_of(rows_per_expert)
+        {
+            return Err(shape(format!(
+                "Q4_K rows of 36*{n_sb} words in experts of {rows_per_expert} rows (a multiple of \
+                 {ROWS_PER_BLOCK}), got {} x {}",
+                w.rows(),
+                w.cols()
+            )));
+        }
+        let n_experts = w.rows() / rows_per_expert;
+        let cap = tile_cap(n_slots, n_experts);
+        if cap == 0
+            || n_slots > act.m()
+            || order.len() < n_slots
+            || start.len() < n_experts + 1
+            || tiles.len() < cap + 1
+            || y.len() < n_slots * rows_per_expert
+        {
+            return Err(shape(format!(
+                "{n_slots} slots over {} columns: order {}, start {} for {n_experts} experts, \
+                 tiles {} for {cap} tiles, y {}",
+                act.m(),
+                order.len(),
+                start.len(),
+                tiles.len(),
+                y.len()
+            )));
+        }
+        let row_tiles = rows_per_expert / ROWS_PER_BLOCK;
+        let blocks = launch_u32(what, "grid", cap * row_tiles)?;
+        let grid = (
+            launch_u32(what, "tile_cap", cap)?,
+            launch_u32(what, "row_tiles", row_tiles)?,
+        );
+        let prep = self
+            .module
+            .prepare_q4k_gemv_tiles(LaunchConfig1D::new(blocks, THREADS, 0))?;
+        self.module.q4k_gemv_tiles(
+            stream,
+            &prep,
+            w.buf(),
+            &act.q4,
+            &act.s8,
+            &act.d8,
+            order,
+            start,
+            tiles,
+            grid.0,
+            grid.1,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rows_per_expert)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q8_1_quantize_ord`]: the q8_1 form of the first
+    /// `start[n_experts]` columns of `x` (`act.k()` values a column; at most
+    /// `m_cols`, the columns launched), each into the same column of `act`
+    /// with the bytes [`crate::Gpu::enqueue_quantize_q8_1`] writes for it;
+    /// every other column keeps what it held. A non-finite value raises
+    /// [`FaultSite::QuantColumn`] on `fault`. Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
+    )]
+    pub fn enqueue_quantize_ord(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        start: &DeviceBuffer<u32>,
+        n_experts: usize,
+        m_cols: usize,
+        fault: FaultSink,
+        act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_quantize_ord";
+        let (k, n_sb) = (act.k(), act.n_sb());
+        if m_cols == 0 || m_cols > act.m() || x.len() < m_cols * k || start.len() < n_experts + 1 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{m_cols} columns of {k} values from {} into {} columns, start {} for \
+                     {n_experts} experts",
+                    x.len(),
+                    act.m(),
+                    start.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m_cols * 2 * n_sb)?;
+        let prep = self
+            .module
+            .prepare_q8_1_quantize_ord(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.q8_1_quantize_ord(
+            stream,
+            &prep,
+            x,
+            start,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "m_cols", m_cols)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "half_it", n_sb.div_ceil(2))?,
+            launch_u32(what, "quad_it", n_sb.div_ceil(4))?,
+            &mut act.q3,
+            &mut act.q4,
+            &mut act.q6,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
         )?;
         Ok(())
     }

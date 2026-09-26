@@ -31,6 +31,20 @@
 //! — as the plain quantizer's column, every other column as what the act
 //! held before; a NaN in a column the host serves raises nothing, one in a
 //! card column raises `QuantColumn`.
+//!
+//! And the tile table (`enqueue_grouped_tiles`) and the tiled down
+//! (`q4k_gemv_tiles`) at V4.1's geometry: runs of 0, 1, 7, 8, 9, 16, 17 and
+//! 237 slots spread over the stack's experts in a shuffled slot order, with
+//! slots the host serves between them. The table must be the host's cut of
+//! the runs; the down's input is the order-position quantizer's
+//! (`enqueue_quantize_ord`) on the slots' columns gathered on the host into
+//! table order, NaN in every column past the table's count — so a quantized
+//! column past it raises `QuantColumn`. Every card slot must equal
+//! `q4k_gemv_grouped` over the same table bit for bit, every host slot stay
+//! untouched, and nothing raise. Then a count past the slots and a run past
+//! the count each leave no tiles and raise `ExpertId` from the table; a tile
+//! word past its run and an entry that names no slot raise it from the down
+//! and leave that tile's (that entry's) slots untouched.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -42,7 +56,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HOST;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::q4k_sel::QuantSel;
+use bloomery_gpu::q4k_sel::{QuantSel, TILE_COLS, tile_cap};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
@@ -163,6 +177,9 @@ fn run() -> Result<(), GateError> {
     // 6. The card slots' quantizer, read back through the grouped down.
     ok &= check_quantize_sel(&gpu, &a)?;
 
+    // 7. The tiled down and the order-position quantizer, at V4.1's geometry.
+    ok &= check_tiles(&gpu, &c)?;
+
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }
@@ -174,7 +191,8 @@ fn run() -> Result<(), GateError> {
          a shared-input act and a non-dividing rows_per_expert; the grouped down gives each \
          slot its reference over a bucket table and raises expert_id on a run that does not \
          fit; the card slots' quantizer writes the plain quantizer's bytes into card columns \
-         alone"
+         alone; the tile table is the host's cut of runs of 0..237 slots, the tiled down over \
+         it is the grouped down bit for bit, and both raise expert_id on a table they cannot read"
     );
     Ok(())
 }
@@ -697,6 +715,262 @@ fn check_quantize_sel(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
             shown(want_fault),
             verdict(pass),
             mismatch("first_mismatch", &got, &want, rpe),
+        );
+    }
+    Ok(ok)
+}
+
+/// Check 7's runs, one per expert of [`TILE_EXPERTS`]: the tile walk's
+/// edges — an empty run, one column, a tile short of full, full, one past,
+/// two full, two and one, and a long run with a short last tile.
+#[cfg(feature = "gpu")]
+const TILE_RUNS: [usize; 8] = [0, 1, 7, 8, 9, 16, 17, 237];
+/// The experts that carry [`TILE_RUNS`], out of order; the stack's others
+/// carry no slot.
+#[cfg(feature = "gpu")]
+const TILE_EXPERTS: [u32; 8] = [3, 0, 5, 15, 9, 2, 12, 7];
+/// Check 7's slots the host serves, between the card slots.
+#[cfg(feature = "gpu")]
+const TILE_HOST_SLOTS: usize = 20;
+
+/// Check 7: the tile table and the tiled down on stack `st` (module doc).
+#[cfg(feature = "gpu")]
+fn check_tiles(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let (k, rpe) = (st.k, st.rpe);
+    // Each slot's place: the runs' experts and the host's, shuffled by a
+    // fixed xorshift so a run's slots are not consecutive.
+    let mut sel: Vec<u32> = TILE_EXPERTS
+        .iter()
+        .zip(TILE_RUNS)
+        .flat_map(|(&e, n)| std::iter::repeat_n(e, n))
+        .chain(std::iter::repeat_n(HOST, TILE_HOST_SLOTS))
+        .collect();
+    let mut x32 = 0x2545_f491_u32;
+    for i in (1..sel.len()).rev() {
+        x32 ^= x32 << 13;
+        x32 ^= x32 >> 17;
+        x32 ^= x32 << 5;
+        sel.swap(i, x32 as usize % (i + 1));
+    }
+    let n_slots = sel.len();
+    let (mut order, start) = bucket_table(&sel, N_EXPERTS);
+    let count = start[N_EXPERTS] as usize;
+    // The table holds an entry a slot; those past the count are never read.
+    order.resize(n_slots, u32::MAX);
+    let x = activations(k, n_slots, 6607);
+    // The reference: the grouped down, slot s reading column s.
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let mut act = Q8Act::with_slots(stream, n_slots, k)?;
+    gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+    let order_dev = DeviceBuffer::from_host(stream, &order)?;
+    let start_dev = DeviceBuffer::from_host(stream, &start)?;
+    let mut want = DeviceBuffer::from_host(stream, &vec![SENT; n_slots * rpe])?;
+    gpu.q4k_sel().enqueue_gemv_q4k_grouped(
+        stream,
+        &st.w,
+        &act,
+        &order_dev,
+        &start_dev,
+        n_slots,
+        0,
+        rpe,
+        gpu.unlabelled_sink(),
+        &mut want,
+    )?;
+    stream.synchronize()?;
+    let want = want.to_host_vec(stream)?;
+    let mut ok = gpu.take_fault()?.is_none();
+    // The tiled input: column j is slot order[j]'s, NaN past the count.
+    let mut x_ord = vec![f32::NAN; n_slots * k];
+    for (j, &s) in order[..count].iter().enumerate() {
+        let s = s as usize;
+        x_ord[j * k..(j + 1) * k].copy_from_slice(&x[s * k..(s + 1) * k]);
+    }
+    let x_ord_dev = DeviceBuffer::from_host(stream, &x_ord)?;
+    let cap = tile_cap(n_slots, N_EXPERTS);
+    let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+    // The table's tiles, as the host cuts them: count, then (e << 22) | j.
+    let mut host_tiles = vec![0u32];
+    for e in 0..N_EXPERTS {
+        host_tiles.extend(
+            (start[e]..start[e + 1])
+                .step_by(TILE_COLS)
+                .map(|j| (e as u32) << 22 | j),
+        );
+    }
+    host_tiles[0] = host_tiles.len() as u32 - 1;
+    // One pass: the tile table from `start` (or `tiles` as given), the
+    // order-position quantizer, the tiled down; the builder's fault, the
+    // table, the quantizer's fault, the down's fault and its output.
+    type Pass = (
+        Option<Fault>,
+        Vec<u32>,
+        Option<Fault>,
+        Option<Fault>,
+        Vec<f32>,
+    );
+    let run = |start: &[u32], order: &[u32], tiles: Option<&[u32]>| -> Result<Pass, GateError> {
+        let start_dev = DeviceBuffer::from_host(stream, start)?;
+        let order_dev = DeviceBuffer::from_host(stream, order)?;
+        let mut tiles_dev = DeviceBuffer::from_host(stream, &vec![0u32; cap + 1])?;
+        match tiles {
+            Some(t) => {
+                let mut v = t.to_vec();
+                v.resize(cap + 1, 0);
+                tiles_dev = DeviceBuffer::from_host(stream, &v)?;
+            }
+            None => gpu.q4k_sel().enqueue_grouped_tiles(
+                stream,
+                &start_dev,
+                N_EXPERTS,
+                n_slots,
+                gpu.unlabelled_sink(),
+                &mut tiles_dev,
+            )?,
+        }
+        stream.synchronize()?;
+        let table_fault = gpu.take_fault()?;
+        let table = tiles_dev.to_host_vec(stream)?;
+        let mut act = Q8Act::with_slots(stream, n_slots, k)?;
+        gpu.q4k_sel().enqueue_quantize_ord(
+            stream,
+            &x_ord_dev,
+            &start_dev,
+            N_EXPERTS,
+            n_slots,
+            gpu.unlabelled_sink(),
+            &mut act,
+        )?;
+        stream.synchronize()?;
+        let quant_fault = gpu.take_fault()?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; n_slots * rpe])?;
+        gpu.q4k_sel().enqueue_gemv_q4k_tiles(
+            stream,
+            &st.w,
+            &act,
+            &order_dev,
+            &start_dev,
+            &tiles_dev,
+            n_slots,
+            rpe,
+            gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        Ok((
+            table_fault,
+            table,
+            quant_fault,
+            gpu.take_fault()?,
+            y.to_host_vec(stream)?,
+        ))
+    };
+    let runs = start.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+    {
+        let (table_fault, table, quant_fault, fault, got) = run(&start, &order, None)?;
+        let tiles_n = host_tiles.len() - 1;
+        let table_ok = table[..=tiles_n] == host_tiles[..];
+        let values_ok = bits_equal(&got, &want);
+        let pass = table_fault.is_none()
+            && table_ok
+            && quant_fault.is_none()
+            && fault.is_none()
+            && values_ok;
+        ok &= pass;
+        println!(
+            "q4k_tiles[{}:bucket_table] slots={n_slots} card={count} runs={runs:?} tiles={} \
+             cap={cap} table_as_host={table_ok} faults=\"{}\",\"{}\",\"{}\" \
+             slots_as_grouped={values_ok} {}{}",
+            st.tag,
+            table[0],
+            shown(table_fault),
+            shown(quant_fault),
+            shown(fault),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &want, rpe),
+        );
+    }
+    // The table faults: a count past the slots and a run past the count
+    // leave no tiles (nothing written); a tile word past its expert's run
+    // skips that tile's slots; an entry that names no slot skips its slot.
+    let bad_run = TILE_EXPERTS[4] as usize;
+    let mut past_count = start.clone();
+    past_count[N_EXPERTS] = n_slots as u32 + 3;
+    let mut run_past = start.clone();
+    run_past[bad_run + 1] = count as u32 + 1;
+    let mut stray = order.clone();
+    let stray_at = count / 2;
+    stray[stray_at] = n_slots as u32 + 5;
+    // The long run's second tile, pointed one past its run's end.
+    let long = TILE_EXPERTS[7] as usize;
+    let bad_tile = host_tiles
+        .iter()
+        .skip(1)
+        .position(|&w| (w >> 22) as usize == long)
+        .ok_or("gate_q4k_sel: the long run has no tile")?
+        + 2;
+    let mut word_past = host_tiles.clone();
+    word_past[bad_tile] = (long as u32) << 22 | start[long + 1];
+    let bad_tile_slots: Vec<usize> = (0..TILE_COLS)
+        .map(|c| order[(host_tiles[bad_tile] & 0x3f_ffff) as usize + c] as usize)
+        .collect();
+    let none = |_: usize| true;
+    let untouched_tile = |s: usize| bad_tile_slots.contains(&s);
+    let untouched_stray = |s: usize| s == order[stray_at] as usize;
+    // (case, start, order, a tile table to use instead of the builder's, the
+    // slots left untouched)
+    type TileCase<'a> = (
+        &'static str,
+        &'a [u32],
+        &'a [u32],
+        Option<&'a [u32]>,
+        &'a dyn Fn(usize) -> bool,
+    );
+    let cases: [TileCase<'_>; 4] = [
+        ("count_past_the_slots", &past_count, &order, None, &none),
+        ("a_run_past_the_count", &run_past, &order, None, &none),
+        (
+            "a_tile_past_its_run",
+            &start,
+            &order,
+            Some(&word_past),
+            &untouched_tile,
+        ),
+        (
+            "an_entry_naming_no_slot",
+            &start,
+            &stray,
+            None,
+            &untouched_stray,
+        ),
+    ];
+    let expert_id = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+    for (case, start, order, tiles, untouched) in cases {
+        let (table_fault, table, _, fault, got) = run(start, order, tiles)?;
+        let mut expect = want.clone();
+        for s in (0..n_slots).filter(|&s| sel[s] != HOST && untouched(s)) {
+            expect[s * rpe..(s + 1) * rpe].fill(SENT);
+        }
+        let values_ok = bits_equal(&got, &expect);
+        // The builder's refusals are the table's; the rest are the down's.
+        let raised = if tiles.is_none() && table[0] == 0 {
+            table_fault
+        } else {
+            fault
+        };
+        let pass = raised == expert_id && values_ok;
+        ok &= pass;
+        println!(
+            "q4k_tiles[{}:{case}] tiles={} table_fault=\"{}\" down_fault=\"{}\" want=\"{}\" \
+             written_as_want={values_ok} {}{}",
+            st.tag,
+            table[0],
+            shown(table_fault),
+            shown(fault),
+            shown(expert_id),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &expect, rpe),
         );
     }
     Ok(ok)

@@ -84,8 +84,8 @@
 //! (`card_out`: its first launch to its route's copies; `card_in`: its
 //! shadow; `card_proj`: the batch-wide attention projections, inside
 //! `card_out`), whose reads add a wait per batch to the feed.
-//! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`expert`,
-//! the default, or `slot`), the shadow's routed gate·up arm.
+//! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`tile`,
+//! the default, `expert` or `slot`), the shadow's routed gate·up arm.
 //! A second `stat prefill ced=` line names the triangle's state (the `load`
 //! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
 //! positions, the first whose features were kept, the blocks and latent

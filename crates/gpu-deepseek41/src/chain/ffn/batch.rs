@@ -22,11 +22,15 @@
 //!    routed experts over the chunk's slots (the gate·up, the step's dot on
 //!    column `slot / 6`; the q8_1 of the card slots' columns of `h`, the only
 //!    columns the gate·up wrote; `q4k_sel` over the slots) and their sum
-//!    (`ds41_ffn_card_acc`), the shared expert. The gate·up reads each
-//!    card expert once over the whole block by default
-//!    (`ds41_card_buckets`, `ds41_expert_gate_up_grouped`, between the
-//!    chunks' parts before and after it), or once per slot chunk by chunk
-//!    (`ds41_expert_gate_up_tok`, [`CardExperts::Slot`]);
+//!    (`ds41_ffn_card_acc`), the shared expert. By default the card's
+//!    routed experts run over the whole block by tile items — an expert, a
+//!    tile of its rows, up to eight of its slots — each weight row read
+//!    once for the tile's slots (`ds41_card_buckets`, `ds41_card_gather`,
+//!    `ds41_expert_gate_up_tiles`, `q4k_gemv_tiles`, between the chunks'
+//!    parts before and after them, [`CardExperts::Tile`]); or each card
+//!    expert's row walks its slots one at a time over the block
+//!    (`ds41_expert_gate_up_grouped`, [`CardExperts::Expert`]); or per slot
+//!    chunk by chunk (`ds41_expert_gate_up_tok`, [`CardExperts::Slot`]);
 //! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
 //!    the card sum, the host sum and the shared expert combined, then HC_POST
 //!    with the next fold where the layer folds.
@@ -48,8 +52,8 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use bloomery_gpu::cores::q3k_row_dot;
-use bloomery_gpu::q4k_sel::{QuantSel, grouped_run};
-use bloomery_gpu::{FaultSink, FaultSite};
+use bloomery_gpu::q4k_sel::{QuantSel, TILE_MAX_EXPERTS, grouped_run, tile_at, tile_cap};
+use bloomery_gpu::{FaultSink, FaultSite, col_sums, store_cols};
 use cuda_core::{CudaContext, CudaEvent, IntoResult, PinnedHostBuffer, sys};
 use cuda_device::{SharedArray, warp};
 
@@ -77,6 +81,8 @@ const BUCKET_EXPERTS: usize = 1024;
 // launch attributes and contract spell both as a literal.
 const _: () = assert!(BUCKET_THREADS as usize >= BUCKET_EXPERTS);
 const _: () = assert!(BUCKET_THREADS == 1024 && BUCKET_EXPERTS == 1024);
+// A tile word names any expert the bucket kernel takes.
+const _: () = assert!(BUCKET_EXPERTS <= TILE_MAX_EXPERTS);
 
 #[cuda_module]
 mod ffn_batch_kernels {
@@ -389,6 +395,185 @@ mod ffn_batch_kernels {
         }
     }
 
+    /// The q8_1 planes of a grouped table's entries (`order`, runs `start`,
+    /// [`ds41_card_buckets`]): block `j` copies token column `col0 + order[j]
+    /// / 6` of `q_in` and `d8_in` (`cols` columns, the block's from `col0`)
+    /// to column `j` of `q_out` and `d8_out`, for each entry `j` below the
+    /// count `start[n_experts]` — a byte copy, so column `j` is its slot's
+    /// activation as the per-slot gate·up reads it. Entries from the count on
+    /// are left as they were; an entry that names no slot of the block raises
+    /// [`FaultSite::ExpertId`] on `fault` and is skipped.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            q_in.len() >= 64 * iters * cols,
+            d8_in.len() >= 2 * n_sb * cols,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            q_out.len() >= 64 * iters * n_slots,
+            d8_out.len() >= 2 * n_sb * n_slots
+        )
+    )]
+    pub fn ds41_card_gather(
+        q_in: &[u64],
+        d8_in: &[f32],
+        order: &[u32],
+        start: &[u32],
+        n_experts: u32,
+        n_slots: u32,
+        col0: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut q_out: DisjointSlice<u64>,
+        mut d8_out: DisjointSlice<f32>,
+    ) {
+        let j = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        // SAFETY: n_experts < start.len() by the launch contract.
+        let count = unsafe { *start.get_unchecked(n_experts as usize) } as usize;
+        // Block-uniform: j, the count and the entry are the block's.
+        if j >= n_slots as usize || j >= count {
+            return;
+        }
+        // SAFETY: j < n_slots <= order.len() by the launch contract.
+        let slot = unsafe { *order.get_unchecked(j) } as usize;
+        let col = col0 as usize + slot / N_USED;
+        if slot >= n_slots as usize || col >= cols as usize {
+            if tid == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let (qc, dc) = (64 * iters as usize, 2 * n_sb as usize);
+        let mut k = tid;
+        while k < qc {
+            // SAFETY: col < cols and j < n_slots with k < qc, inside both
+            // buffers by the launch contract; thread tid of block j is the
+            // only writer of value k of column j.
+            unsafe { *q_out.get_unchecked_mut(j * qc + k) = *q_in.get_unchecked(col * qc + k) };
+            k += THREADS as usize;
+        }
+        let mut k = tid;
+        while k < dc {
+            // SAFETY: as above, with dc values a column.
+            unsafe { *d8_out.get_unchecked_mut(j * dc + k) = *d8_in.get_unchecked(col * dc + k) };
+            k += THREADS as usize;
+        }
+    }
+
+    /// [`ds41_expert_gate_up_grouped`] by tile items: block `g + tile_cap · ρ` (of
+    /// `tile_cap · row_tiles`) is tile `g` of the table `tiles`
+    /// (`q4k_sel::grouped_tiles`, `q4k_sel::tile_at`) — expert `e`, the `m`
+    /// table entries from `j` — on the eight weight rows `8ρ ..`: warp `w`
+    /// takes row `r = 8ρ + w` of both stacks and dots it with the `m` columns
+    /// `j .. j + m` of the q8_1 planes — the table's entries
+    /// ([`ds41_card_gather`]) — through the m-column core
+    /// `cores::q3k_row_dot`, whose column c is the one-column call on that
+    /// column bit for bit, then the warp tree and `swiglu_clamp` into `h[(j +
+    /// c) · rows_per_expert + r]`: entry `j + c`'s value, the per-slot
+    /// kernel's for its slot and row. The blocks of one row tile are
+    /// consecutive, so an expert's tiles run side by side on the same weight
+    /// rows, each read once for up to eight slots. A block past the table's
+    /// count returns; a tile word `tile_at` refuses raises
+    /// [`FaultSite::ExpertId`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    // Five blocks an SM: 48 registers a thread, the budget of the m-column
+    // core over two stacks.
+    #[launch_bounds(256, 5)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * wg.len() >= n_experts * rows_per_expert * 110 * n_sb,
+            4 * wu.len() >= n_experts * rows_per_expert * 110 * n_sb,
+            q.len() >= 64 * iters * n_slots,
+            d8.len() >= 2 * n_sb * n_slots,
+            start.len() >= n_experts + 1,
+            tiles.len() >= tile_cap + 1,
+            tile_cap >= 1,
+            h.len() >= n_slots * rows_per_expert,
+            rows_per_expert >= 8 * row_tiles
+        )
+    )]
+    pub fn ds41_expert_gate_up_tiles(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        start: &[u32],
+        tiles: &[u32],
+        tile_cap: u32,
+        row_tiles: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // Block b is tile b mod tile_cap (tile_cap >= 1 by the launch
+        // contract) of row tile b / tile_cap: the tiles of one row tile are
+        // consecutive blocks.
+        let b = thread::blockIdx_x();
+        let (g, rho) = (b % tile_cap, b / tile_cap);
+        // Block-uniform: a block past the grid the tables were sized for
+        // reads nothing.
+        if rho >= row_tiles {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: 1 + g <= tile_cap < tiles.len() and n_experts < start.len()
+        // by the launch contract; the block's warps share g.
+        let tile = unsafe { tile_at(tiles, start, n_experts, n_slots, g, lane, fault) };
+        // Block-uniform: every warp reads the same word.
+        let Some((e, j, m)) = tile else {
+            return;
+        };
+        let rpe = rows_per_expert as usize;
+        let r = rho as usize * ROWS_PER_BLOCK + thread::threadIdx_x() as usize / 32;
+        // The core's caller contract: row e·rpe + r < n_experts·rpe rows of
+        // both stacks (r < 8 · row_tiles <= rows_per_expert); columns j + m <=
+        // n_slots of `q`/`d8` by `tile_at` and the launch contract; iters =
+        // ceil(n_sb/2) from the host; the warp's 32 lanes are here and m is
+        // block-uniform.
+        let row_abs = e * rpe + r;
+        let fg = q3k_row_dot(wg, q, d8, n_sb as usize, iters, row_abs, j, m, lane);
+        let fu = q3k_row_dot(wu, q, d8, n_sb as usize, iters, row_abs, j, m, lane);
+        let g = col_sums(fg, m);
+        let u = col_sums(fu, m);
+        if lane == 0 {
+            let v = [
+                swiglu_clamp(g[0], u[0], limit),
+                swiglu_clamp(g[1], u[1], limit),
+                swiglu_clamp(g[2], u[2], limit),
+                swiglu_clamp(g[3], u[3], limit),
+                swiglu_clamp(g[4], u[4], limit),
+                swiglu_clamp(g[5], u[5], limit),
+                swiglu_clamp(g[6], u[6], limit),
+                swiglu_clamp(g[7], u[7], limit),
+            ];
+            // SAFETY: values (j + c)·rpe + r for c < m are below n_slots·rpe
+            // <= h.len(); a table entry sits in one tile, so lane 0 of this
+            // row's warp is their only writer.
+            unsafe { store_cols(&mut h, j * rpe + r, rpe, m, v) };
+        }
+    }
+
     /// The card slots' sum of `m` tokens: thread `i < m·n` is token `t = i /
     /// n`, value `d = i % n`, and writes [`card_sum_elem`] of its six slots'
     /// down outputs `down[(6t + j)·n + d]`, weights `w[6t + j]` and places
@@ -636,6 +821,42 @@ pub struct GroupedGateUp<'a> {
     pub limit: f32,
 }
 
+/// What [`FfnBatchKernels::enqueue_gate_up_tiles`] reads: both Q3_K stacks
+/// of `n_experts` card experts of `rows_per_expert` rows, the q8_1 planes of
+/// the table's `n_slots` entries of `n_sb` super-blocks (entry `j` the
+/// activation of slot `order[j]`, [`ds41_card_gather`]), the table's runs
+/// `start` and its tiles (`q4k_sel::grouped_tiles`); `limit` is the SwiGLU
+/// clamp.
+struct TiledGateUp<'a> {
+    wg: &'a DeviceBuffer<u32>,
+    wu: &'a DeviceBuffer<u32>,
+    q3: &'a DeviceBuffer<u64>,
+    d8: &'a DeviceBuffer<f32>,
+    start: &'a DeviceBuffer<u32>,
+    tiles: &'a DeviceBuffer<u32>,
+    n_experts: usize,
+    rows_per_expert: usize,
+    n_slots: usize,
+    n_sb: usize,
+    limit: f32,
+}
+
+/// What [`FfnBatchKernels::enqueue_card_gather`] reads: the block's q8_1
+/// planes by token (`q3`, `d8`, `cols` columns of `n_sb` super-blocks, the
+/// block's tokens from `col0`) and the table of its `n_slots` slots
+/// (`order`, runs `start` of `n_experts` experts).
+struct CardGather<'a> {
+    q3: &'a DeviceBuffer<u64>,
+    d8: &'a DeviceBuffer<f32>,
+    order: &'a DeviceBuffer<u32>,
+    start: &'a DeviceBuffer<u32>,
+    n_experts: usize,
+    n_slots: usize,
+    col0: usize,
+    cols: usize,
+    n_sb: usize,
+}
+
 impl FfnBatchKernels {
     /// Load the batch's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FfnBatchKernels, GpuError> {
@@ -708,6 +929,138 @@ impl FfnBatchKernels {
             launch_u32(what, "n_slots", g.n_slots)?,
             launch_u32(what, "col0", g.col0)?,
             launch_u32(what, "cols", g.cols)?,
+            launch_u32(what, "n_sb", g.n_sb)?,
+            launch_u32(what, "iters", g.n_sb.div_ceil(2))?,
+            g.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_card_buckets`: the table of the `n_slots` places `sel`
+    /// grouped by their `n_experts` card experts, into `order` and `start`.
+    /// One launch. Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
+    )]
+    fn enqueue_buckets(
+        &self,
+        stream: &CudaStream,
+        sel: &DeviceBuffer<u32>,
+        n_slots: usize,
+        n_experts: usize,
+        fault: FaultSink,
+        order: &mut DeviceBuffer<u32>,
+        start: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_card_buckets";
+        let prep =
+            self.module
+                .prepare_ds41_card_buckets(LaunchConfig1D::new(1, BUCKET_THREADS, 0))?;
+        self.module.ds41_card_buckets(
+            stream,
+            &prep,
+            sel,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "n_experts", n_experts)?,
+            fault,
+            order,
+            start,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_card_gather`: the q8_1 planes of `g`'s table entries
+    /// into columns `0 .. g.n_slots` of `q3` and `d8`. One launch.
+    /// Asynchronous, allocation-free.
+    fn enqueue_card_gather(
+        &self,
+        stream: &CudaStream,
+        g: &CardGather<'_>,
+        fault: FaultSink,
+        q3: &mut DeviceBuffer<u64>,
+        d8: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_card_gather";
+        let prep = self.module.prepare_ds41_card_gather(LaunchConfig1D::new(
+            launch_u32(what, "grid", g.n_slots)?,
+            THREADS,
+            0,
+        ))?;
+        self.module.ds41_card_gather(
+            stream,
+            &prep,
+            g.q3,
+            g.d8,
+            g.order,
+            g.start,
+            launch_u32(what, "n_experts", g.n_experts)?,
+            launch_u32(what, "n_slots", g.n_slots)?,
+            launch_u32(what, "col0", g.col0)?,
+            launch_u32(what, "cols", g.cols)?,
+            launch_u32(what, "n_sb", g.n_sb)?,
+            launch_u32(what, "iters", g.n_sb.div_ceil(2))?,
+            fault,
+            q3,
+            d8,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_expert_gate_up_tiles`: the SwiGLU outputs of `g`'s
+    /// table entries by tiles, entry `j`'s rows into `h[j ·
+    /// g.rows_per_expert ..]`. One launch of `tile_cap · row_tiles`
+    /// blocks; the tile count is the table's, a device value, and a block
+    /// past it returns. Asynchronous, allocation-free.
+    fn enqueue_gate_up_tiles(
+        &self,
+        stream: &CudaStream,
+        g: &TiledGateUp<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_expert_gate_up_tiles";
+        if g.rows_per_expert == 0
+            || !g.rows_per_expert.is_multiple_of(ROWS_PER_BLOCK)
+            || tile_cap(g.n_slots, g.n_experts) == 0
+        {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "{what} of {} slots over {} experts of {} rows: at least one tile, rows a \
+                     positive multiple of {ROWS_PER_BLOCK}",
+                    g.n_slots, g.n_experts, g.rows_per_expert
+                ),
+            });
+        }
+        let (cap, row_tiles) = (
+            tile_cap(g.n_slots, g.n_experts),
+            g.rows_per_expert / ROWS_PER_BLOCK,
+        );
+        let blocks = launch_u32(what, "grid", cap * row_tiles)?;
+        let grid = (
+            launch_u32(what, "tile_cap", cap)?,
+            launch_u32(what, "row_tiles", row_tiles)?,
+        );
+        let prep = self
+            .module
+            .prepare_ds41_expert_gate_up_tiles(LaunchConfig1D::new(blocks, THREADS, 0))?;
+        self.module.ds41_expert_gate_up_tiles(
+            stream,
+            &prep,
+            g.wg,
+            g.wu,
+            g.q3,
+            g.d8,
+            g.start,
+            g.tiles,
+            grid.0,
+            grid.1,
+            launch_u32(what, "n_experts", g.n_experts)?,
+            launch_u32(what, "rows_per_expert", g.rows_per_expert)?,
+            launch_u32(what, "n_slots", g.n_slots)?,
             launch_u32(what, "n_sb", g.n_sb)?,
             launch_u32(what, "iters", g.n_sb.div_ceil(2))?,
             g.limit,
@@ -820,11 +1173,14 @@ pub struct FfnBatch {
     /// The exchange: page-locked copies of the activations, the routing and
     /// the host sums, the union reading the activations in place; the event
     /// the route's copies complete at.
-    /// The grouped arm's block buffers ([`CardExperts::Expert`]): per token
-    /// the norm's q8_1 planes the gate·up reads (q3 and d8, as the chunk's
-    /// scratch lays out a column), per slot the SwiGLU output, its q8_1 form
-    /// and the down output, and the block's card slots by expert (`order`,
-    /// runs `start`).
+    /// The block-wide arms' buffers ([`CardExperts::Tile`],
+    /// [`CardExperts::Expert`]): per token the norm's q8_1 planes the gate·up
+    /// reads (q3 and d8, as the chunk's scratch lays out a column), per slot
+    /// the SwiGLU output, its q8_1 form and the down output, and the block's
+    /// card slots by expert (`order`, runs `start`). The tile arm keeps the
+    /// SwiGLU output and its q8_1 form by table entry — column `j` is slot
+    /// `order[j]`'s — gathers the norm's planes by entry into `q3_ord` and
+    /// `d8_ord`, and lists the table's tiles in `tiles`.
     experts: CardExperts,
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
@@ -833,6 +1189,9 @@ pub struct FfnBatch {
     down_all: DeviceBuffer<f32>,
     order: DeviceBuffer<u32>,
     start: DeviceBuffer<u32>,
+    q3_ord: DeviceBuffer<u64>,
+    d8_ord: DeviceBuffer<f32>,
+    tiles: DeviceBuffer<u32>,
     host_x: PinnedHostBuffer<f32>,
     host_ids: PinnedHostBuffer<u32>,
     host_w: PinnedHostBuffer<f32>,
@@ -846,26 +1205,32 @@ pub struct FfnBatch {
 }
 
 /// How a batch's shadow reads the card's routed experts
-/// ([`CardExperts::from_env`]): once per expert over the layer's block
-/// (`ds41_card_buckets`, then `ds41_expert_gate_up_grouped`), or once per
-/// slot chunk by chunk (`ds41_expert_gate_up_tok`) — the same-binary arm;
-/// both write the same bits.
+/// ([`CardExperts::from_env`]): over the layer's block by tile items, each
+/// weight row once for up to eight slots (`ds41_card_buckets`, then
+/// `ds41_card_gather`, `ds41_expert_gate_up_tiles` and `q4k_gemv_tiles`);
+/// over the block with each expert's row walking its slots one at a time
+/// (`ds41_expert_gate_up_grouped`, `q4k_gemv_grouped`); or once per slot
+/// chunk by chunk (`ds41_expert_gate_up_tok`). The last two are the
+/// same-binary arms; all three write the same bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardExperts {
+    Tile,
     Expert,
     Slot,
 }
 
 impl CardExperts {
-    /// `BLOOMERY_CARD_EXPERTS`: unset or `expert` groups by expert, `slot`
-    /// reads per slot; any other value is refused by name.
+    /// `BLOOMERY_CARD_EXPERTS`: unset or `tile` walks tile items, `expert`
+    /// walks each expert's slots, `slot` reads per slot; any other value is
+    /// refused by name.
     pub fn from_env() -> Result<CardExperts, GpuError> {
         match std::env::var("BLOOMERY_CARD_EXPERTS").as_deref() {
-            Err(_) | Ok("expert") => Ok(CardExperts::Expert),
+            Err(_) | Ok("tile") => Ok(CardExperts::Tile),
+            Ok("expert") => Ok(CardExperts::Expert),
             Ok("slot") => Ok(CardExperts::Slot),
             Ok(_) => Err(GpuError::State {
                 what: "BLOOMERY_CARD_EXPERTS",
-                missing: "expert or slot",
+                missing: "tile, expert or slot",
             }),
         }
     }
@@ -874,6 +1239,7 @@ impl CardExperts {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            CardExperts::Tile => "tile",
             CardExperts::Expert => "expert",
             CardExperts::Slot => "slot",
         }
@@ -928,6 +1294,7 @@ impl FfnBatch {
         let counts = 1..=c;
         let n_sb = n_embd / 256;
         let kernels = FfnBatchKernels::load(ctx)?;
+        let slot_cols = cap * N_USED;
         Ok(FfnBatch {
             kernels,
             cap,
@@ -974,6 +1341,9 @@ impl FfnBatch {
             down_all: z(cap * N_USED * n_embd)?,
             order: DeviceBuffer::zeroed(stream, cap * N_USED)?,
             start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
+            q3_ord: DeviceBuffer::zeroed(stream, slot_cols * 64 * n_sb.div_ceil(2))?,
+            d8_ord: z(slot_cols * 2 * n_sb)?,
+            tiles: DeviceBuffer::zeroed(stream, tile_cap(slot_cols, BUCKET_EXPERTS) + 1)?,
             host_x: pinned("cuMemAllocHost (the batch's activations)", cap * n_embd)?,
             host_ids: PinnedHostBuffer::<u32>::zeroed(ctx, cap * N_USED).map_err(|source| {
                 GpuError::Driver {
@@ -1041,6 +1411,7 @@ impl FfnBatch {
             &self.d8_all,
             &self.h_all,
             &self.down_all,
+            &self.d8_ord,
         ];
         let acts = self
             .act_x
@@ -1052,6 +1423,8 @@ impl FfnBatch {
             + self.ids.num_bytes()
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
+            + self.q3_ord.num_bytes()
+            + self.tiles.num_bytes()
             + self.order.num_bytes()
             + self.start.num_bytes()
             + acts.map(q8act_bytes).sum::<usize>()
@@ -1412,7 +1785,7 @@ impl FfnPiece {
         let card = self.check_card(layer, i, card)?;
         let phase = match b.experts {
             CardExperts::Slot => Phase::Whole,
-            CardExperts::Expert => Phase::Before,
+            CardExperts::Tile | CardExperts::Expert => Phase::Before,
         };
         let n = self.n_embd;
         {
@@ -1436,12 +1809,13 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// The grouped arm's block launches for tokens `at .. u`, after every
+    /// The block-wide arms' launches for tokens `at .. u`, after every
     /// chunk's part before them: with card experts, the card slots by expert
-    /// ([`ds41_card_buckets`]), the gate·up of every card slot
-    /// ([`ds41_expert_gate_up_grouped`]) into the block's SwiGLU outputs,
-    /// their q8_1 form and the down (`q4k_gemv_grouped`), each card expert
-    /// read once; then the card sum of every token of the block.
+    /// ([`ds41_card_buckets`]) and the gate·up, its q8_1 form and the down of
+    /// every card slot — by tile items ([`FfnPiece::enqueue_tiled_experts`])
+    /// or each expert's slots in turn ([`FfnPiece::enqueue_grouped_experts`])
+    /// — into the block's down outputs by slot; then the card sum of every
+    /// token of the block.
     #[allow(
         clippy::too_many_arguments,
         reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
@@ -1460,7 +1834,11 @@ impl FfnPiece {
         let c = &self.cfg[i];
         let slots_n = (u - at) * N_USED;
         if let Some(s) = card {
-            self.enqueue_grouped_experts(gpu, i, s, b, layer, at, u)?;
+            if b.experts == CardExperts::Tile {
+                self.enqueue_tiled_experts(gpu, i, s, b, layer, at, u)?;
+            } else {
+                self.enqueue_grouped_experts(gpu, i, s, b, layer, at, u)?;
+            }
         }
         let what = "ds41_ffn_card_acc";
         let m = u - at;
@@ -1487,6 +1865,47 @@ impl FfnPiece {
         Ok(())
     }
 
+    /// The card's stack count for layer `layer`'s block, refused past the
+    /// bucket kernel's width, and the block's table `b.order`/`b.start` of
+    /// its `slots_n` slots from `at`. One launch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stack, buffers and tokens (rust-quality R8)"
+    )]
+    fn enqueue_block_buckets(
+        &self,
+        gpu: &Gpu,
+        s: CardStacks<'_>,
+        b: &mut FfnBatch,
+        layer: usize,
+        at: usize,
+        slots_n: usize,
+        fault: FaultSink,
+    ) -> Result<usize, GpuError> {
+        let n_experts = s.gate.rows() / self.ff;
+        if n_experts > BUCKET_EXPERTS {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s card stack of {n_experts} experts; the block-wide arms \
+                     take at most {BUCKET_EXPERTS} (BLOOMERY_CARD_EXPERTS=slot runs any)"
+                ),
+            });
+        }
+        let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+        let mut order = span_mut(WHAT, &mut b.order, 0, slots_n)?;
+        b.kernels.enqueue_buckets(
+            gpu.stream(),
+            &sel,
+            slots_n,
+            n_experts,
+            fault,
+            &mut order,
+            &mut b.start,
+        )?;
+        Ok(n_experts)
+    }
+
     /// The card experts of the block `at .. u` ([`FfnPiece::enqueue_grouped_block`]).
     #[allow(
         clippy::too_many_arguments,
@@ -1505,37 +1924,9 @@ impl FfnPiece {
         let (stream, ff, n) = (gpu.stream(), self.ff, self.n_embd);
         let c = &self.cfg[i];
         let fault = gpu.layer_sink(layer)?;
-        let n_experts = s.gate.rows() / ff;
-        if n_experts > BUCKET_EXPERTS {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "layer {layer}'s card stack of {n_experts} experts; the grouped gate·up \
-                     takes at most {BUCKET_EXPERTS} (BLOOMERY_CARD_EXPERTS=slot runs any)"
-                ),
-            });
-        }
         let slots_n = (u - at) * N_USED;
+        let n_experts = self.enqueue_block_buckets(gpu, s, b, layer, at, slots_n, fault)?;
         let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
-        let mut order = span_mut(WHAT, &mut b.order, 0, slots_n)?;
-        {
-            let what = "ds41_card_buckets";
-            let prep = b
-                .kernels
-                .module
-                .prepare_ds41_card_buckets(LaunchConfig1D::new(1, BUCKET_THREADS, 0))?;
-            b.kernels.module.ds41_card_buckets(
-                stream,
-                &prep,
-                &sel,
-                launch_u32(what, "n_slots", slots_n)?,
-                launch_u32(what, "n_experts", n_experts)?,
-                fault,
-                &mut order,
-                &mut b.start,
-            )?;
-        }
-        drop(order);
         let order = span(WHAT, &b.order, 0, slots_n)?;
         let mut h = span_mut(WHAT, &mut b.h_all, at * N_USED * ff, slots_n * ff)?;
         let g = GroupedGateUp {
@@ -1573,6 +1964,103 @@ impl FfnPiece {
             &b.start,
             slots_n,
             at * N_USED,
+            n,
+            fault,
+            &mut down,
+        )?;
+        Ok(())
+    }
+
+    /// The card experts of the block `at .. u` by tile items
+    /// ([`FfnPiece::enqueue_grouped_block`]): the table and its tiles
+    /// (`q4k_sel::grouped_tiles`), the norm's q8_1 planes gathered by table
+    /// entry (`ds41_card_gather`), the gate·up
+    /// (`ds41_expert_gate_up_tiles`) into the SwiGLU outputs by entry, their
+    /// q8_1 form by entry, and the down (`q4k_gemv_tiles`), which scatters
+    /// each entry's rows to its slot's down outputs. The table's size is a
+    /// device value: no launch here reads it on the host.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
+    )]
+    fn enqueue_tiled_experts(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        s: CardStacks<'_>,
+        b: &mut FfnBatch,
+        layer: usize,
+        at: usize,
+        u: usize,
+    ) -> Result<(), GpuError> {
+        let (stream, ff, n) = (gpu.stream(), self.ff, self.n_embd);
+        let c = &self.cfg[i];
+        let fault = gpu.layer_sink(layer)?;
+        let n_sb = self.n_embd / 256;
+        let slots_n = (u - at) * N_USED;
+        let n_experts = self.enqueue_block_buckets(gpu, s, b, layer, at, slots_n, fault)?;
+        gpu.q4k_sel().enqueue_grouped_tiles(
+            stream,
+            &b.start,
+            n_experts,
+            slots_n,
+            fault,
+            &mut b.tiles,
+        )?;
+        let order = span(WHAT, &b.order, 0, slots_n)?;
+        {
+            let g = CardGather {
+                q3: &b.q3_all,
+                d8: &b.d8_all,
+                order: &order,
+                start: &b.start,
+                n_experts,
+                n_slots: slots_n,
+                col0: at,
+                cols: u,
+                n_sb,
+            };
+            let mut q3 = span_mut(WHAT, &mut b.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
+            let mut d8 = span_mut(WHAT, &mut b.d8_ord, 0, slots_n * 2 * n_sb)?;
+            b.kernels
+                .enqueue_card_gather(stream, &g, fault, &mut q3, &mut d8)?;
+        }
+        let q3 = span(WHAT, &b.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
+        let d8 = span(WHAT, &b.d8_ord, 0, slots_n * 2 * n_sb)?;
+        let mut h = span_mut(WHAT, &mut b.h_all, 0, slots_n * ff)?;
+        let g = TiledGateUp {
+            wg: s.gate.buf(),
+            wu: s.up.buf(),
+            q3: &q3,
+            d8: &d8,
+            start: &b.start,
+            tiles: &b.tiles,
+            n_experts,
+            rows_per_expert: ff,
+            n_slots: slots_n,
+            n_sb,
+            limit: c.limit,
+        };
+        b.kernels.enqueue_gate_up_tiles(stream, &g, fault, &mut h)?;
+        drop(h);
+        gpu.q4k_sel().enqueue_quantize_ord(
+            stream,
+            &b.h_all,
+            &b.start,
+            n_experts,
+            slots_n,
+            fault,
+            &mut b.act_h_all,
+        )?;
+        let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
+        gpu.q4k_sel().enqueue_gemv_q4k_tiles(
+            stream,
+            s.down,
+            &b.act_h_all,
+            &order,
+            &b.start,
+            &b.tiles,
+            slots_n,
             n,
             fault,
             &mut down,
