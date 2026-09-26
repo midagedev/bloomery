@@ -31,7 +31,18 @@ chain/attn/batch.rs:778-800), `tile` (cardtile: the grouped shadow per (card exp
 `imma` (the IMMA grouped GEMM in its place), `G` with `wrap` (the layer-first scheduler that issues
 route(i + 1) before union(i), across the layer boundary too, cardnext-design-report.md 1.1), `timed`
 (the card-timing marks a BLOOMERY_STEP_STATS=1 run records, as queue events) and `_clk` (the card's
-SM-bound kernels at an SM clock ratio: the prose prompt ran its route clk_cardbound slower).
+SM-bound kernels at an SM clock ratio: the prose prompt ran its route clk_cardbound slower in the expert arm,
+clk_tile_prose in the tile arm). T's items cost their SASS issue (tile_inst_fix + tile_inst_col x m an item, scaled to
+t_tile_ab at cardnext's lcg mix) plus GT's activation re-reads from DRAM once its row-tile sweep outgrows L2 (prose).
+
+Host streaming (`stream`, in the stock order and in the wrap): `ring` (slots; `borrow` takes them from
+the coldest card experts for the prompt, re-upload in the wall; unset, the triage rule: 128 borrowed from
+P 1024, else 8), `krule` (balance: the layer's k searched for its least wall; serial / onecall: the
+per-expert break-even rules; a number: that k every layer), `pick` (static: k ranks of a load-time table,
+of which a prose prompt routes to phi; oracle: the prompt's own hottest), `sgemm` (tile: the streamed
+experts through T's grouped kernels, the bit rule (b'); gemm: the IMMA rate), `fill_gate` (layer: a
+layer's fill starts with the layer; free: whenever a slot is). The PCIe rate and the fill's DRAM
+crossings are constants (pcie_pinned, fill_crossings; --stream prints the pageable and direct variants).
 
 Every value is a row of constants.tsv or a count transcribed from the code (path:line).
 
@@ -42,6 +53,8 @@ Every value is a row of constants.tsv or a count transcribed from the code (path
     --explain ROW      every term of a backtest row or a ladder step, with its constants
     --uncalibrated     the uncalibrated terms and the runner command that calibrates each
     --cells            B1, B1+T, B1+G, B1+T+G per cell with bands, and the IMMA shadow over T at G 1 and G 2
+    --stream           host streaming after B1 + T: the per-expert rules, pp by G and ring, the card bytes,
+                       the timeline per layer of a group, the DRAM term and its variants
 
 Python 3 standard library only; the t table is tools/gpu-ab.py's.
 """
@@ -154,6 +167,9 @@ IDX_ONLY = frozenset({24, 28, 32, 36})
 INDEXERS = SOURCES | IDX_ONLY
 ENGRAM = frozenset({1, 14})
 EVERY = SOURCES     # body/ced.rs:302-316: every = compressor || index_keys
+# The two layers whose routed down is Q5_K (docs/facts.md:13; docs/plan-ledger.md:206 '0·1층 down'): their
+# experts are expert_gu_bytes + expert_down_q5_bytes, the ring's largest slot.
+Q5_LAYERS = frozenset({0, 1})
 
 
 def ratio(l):
@@ -282,6 +298,13 @@ POST_ACTS = 2                  # batch.rs:1155-1164 upload, batch.rs:1769-1838 j
 HEAD_ACTS = 7                  # the trace: 7 activities after the last join
 SHADOW_EXPERT_CHUNK = 8        # batch.rs:1593-1766: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
 SHADOW_EXPERT_BLOCK = 5        # batch.rs:1449-1593: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
+SHADOW_TILE_BLOCK = 7          # cardtile, batch.rs:1986-2080: buckets, grouped_tiles, gather, GT, quantize_ord, DT,
+                               # card_acc (entries_shadow 478.9 against the expert arm's 477.0 at P 512, 38 card lbs)
+# T's GT (gate-up) kernel over one (card expert, 8-column tile) item: 2304 / 8 row tiles, blocks in rho-major order
+# (b = g + tile_cap x rho, batch.rs:540-541), so each row tile's sweep reads every item's activation columns again
+GT_ROW_TILES = 2304 // 8
+ACT_GT_BYTES = 5120 // 128 * 132     # one q8_1 column at 128 values a block, 5,280 B (cardnext-design-report.md:139)
+GT_ROW_W_BYTES = 8 * 2 * 5120 // 256 * 110   # a GT row tile's gate + up weights (8 rows, Q3_K 110 B a 256 block)
 SHADOW_NOCARD_CHUNK = 5        # the trace, layers 0-1 (no card expert): N_s 321 = 64 x 5 + 1
 SHADOW_NOCARD_BLOCK = 1
 SHADOW_SLOT_CHUNK = 10         # cardroute-design-report.md:73 (per slot: gu, quantize_sel, q4k_sel, acc + shexp)
@@ -344,8 +367,13 @@ def batch_acts(s, u):
 class Routing:
     """Per layer: host experts and card experts as (columns per 512 tokens, count), hottest first."""
 
-    def __init__(self, name, host, card):
-        self.name, self.host, self.card = name, tuple(host), tuple(card)
+    def __init__(self, name, host, card, phi=1.0):
+        # phi: the fraction of a host rank's experts this prompt routes to (routing_prose); a static
+        # rank table streams whole ranks, so it saves the host only phi of what it streams
+        self.name, self.host, self.card, self.phi = name, tuple(host), tuple(card), phi
+
+    def n_host_ranks(self, l):
+        return self.n_host(l) / self.phi
 
     def host_slots_tok(self, l):
         return sum(lam * n for lam, n in self.host[l]) / 512.0
@@ -367,13 +395,13 @@ class Routing:
             for lam, n in reversed(self.card[l]):
                 take = min(n, left)
                 left -= take
-                if take > 0:
-                    moved.append((lam, take))
+                if take > 0:            # a borrowed expert joins the host ranks at the prompt's spread phi
+                    moved.append((lam / self.phi, take * self.phi))
                 if n - take > 0:
                     kept.append((lam, n - take))
             card.append(tuple(sorted(kept, key=lambda g: -g[0])))
             host.append(tuple(sorted(tuple(self.host[l]) + tuple(moved), key=lambda g: -g[0])))
-        return Routing(self.name + "+borrow", host, card)
+        return Routing(self.name + "+borrow", host, card, self.phi)
 
 
 def routing_lcg(p, hot=True):
@@ -423,18 +451,22 @@ def routing_prose_trace(p):
     return Routing("prose-in", host, card)
 
 
-def routing_prose(p):
+def routing_prose(p, P=512):
     """prose: the prose prompt the lease feeds (corpus-prose.ids, the first 512) under plan (a) and hot
     list 384, from the trace's per-layer rank curve. Three facts the trace alone does not give:
     layers below card_first_layer hold no card expert (plan (a)); the hot list is learned from other
     sets too, so the card holds the trace's ranks [s, s + n_l) instead of [0, n_l) — the prompt's s
     hottest experts stay on the host (prose_swap, fixed by the prompt's host-slot count); and a
     512-token window routes burstier than the 50,000-token average, so its host columns land on a
-    fraction phi of the host experts at rates / phi (prose_phi, fixed by the prompt's union). The card
+    fraction phi of the host experts at rates / phi (prose_phi_five, fixed by the prompt's union; a prompt past one
+    batch reads prose_swap_4096 and prose_phi_4096, fixed by the P 4096 prompt's host slots and union). The card
     list keeps the trace's rates (its per-slot cost does not read the spread; T's tiles would read
     fewer, so T is priced conservatively)."""
     n_l, ntok = int(p["prose_n_l"]), p["prose_ntok"]
-    n0, sw, phi = int(p["card_first_layer"]), p["prose_swap"], p["prose_phi"]
+    n0 = int(p["card_first_layer"])
+    # a prompt past one batch reads the P 4096 lease's capture and spread (cardtile lease): 3.058 host slots a block
+    # position against P 512's 2.714, so the card holds hotter ranks less often over the longer prompt
+    sw, phi = (p["prose_swap"], p["prose_phi_five"]) if P <= T_MAX else (p["prose_swap_4096"], p["prose_phi_4096"])
     i, f = int(sw), sw - int(sw)
     host, card = [], []
     for l in range(L):
@@ -449,14 +481,14 @@ def routing_prose(p):
         card.append(tuple((cols[r], w[r]) for r in range(len(cols)) if w[r] > 1e-12))
         host.append(tuple((cols[r] / phi, (1.0 - w[r]) * phi) for r in range(len(cols))
                           if 1.0 - w[r] > 1e-12 and cols[r] > 0))
-    return Routing("prose", host, card)
+    return Routing("prose", host, card, phi)
 
 
-def routing(p, name, hot=True):
+def routing(p, name, hot=True, P=512):
     if name == "lcg":
         return routing_lcg(p, hot)
     if name == "prose":
-        return routing_prose(p)
+        return routing_prose(p, P)
     if name == "prose-in":
         return routing_prose_trace(p)
     raise SystemExit(f"ds41_prefill.py: no routing {name!r} (lcg, prose, prose-in)")
@@ -569,8 +601,12 @@ def union_anchor(p, anchors):
     f, the join-tail share of a steal block: the uniondispatch A/B at P 512 (no hot list, CED on, one
     lease) measured the chunk flow minus the five dispatches; X_u is the same per slot in both arms,
     so that difference is f x (tail coefficients) + the other cause terms, linear in f.
-    X_u, the union's named residual: its anchor row minus the kernel sum and the chunk flow's causes,
-    per host slot ("slot") or per kernel ms ("prop")."""
+    X_u, the union's named residual: its anchor row minus the kernel sum and the anchor flow's causes,
+    per host slot ("slot") or per kernel ms ("prop"). Two anchors by era: the sittings before uniondispatch (configs
+    with xu_old) read anchors["union"] (S13b); the uniondispatch lease and every lease since read anchors["union_ud"],
+    the uniondispatch new arm, today's code (None: S13b's carried over, the transfer every row since ran on until the
+    B1, cardtile and prefillgroup leases read today's union 1.2-3.0 ms a layer-batch over it). f's own derivation
+    needs X_u the same in both arms of the uniondispatch lease, and x_ud is that lease's."""
     a, c, w = p["a_union"], p["c_union"], p["w"]
     coef = rest = 0.0
     n = 0
@@ -581,21 +617,32 @@ def union_anchor(p, anchors):
         rest += sum(o0.values()) - sum(n0.values())
         n += 1
     f = (p["ud_delta_512"] - rest / n) / (coef / n)
-    name = anchors["union"]
-    # (P, CED, hot list, flow) of the anchor row: S13b CED off and S14's slot arm ran the chunk flow with the hot
-    # list; the uniondispatch lease's new arm ran today's five dispatches without it
-    P, ced, hot, flow = {"anchor_union_s13b": (512, False, True, "chunks"), "anchor_union_s14s": (512, True, True, "chunks"),
-                         "anchor_union_ud512": (512, True, False, "five")}[name]
-    Ks = sl = ex = 0.0
-    m = 0
-    for lb, K, s, t in _layer_calls(routing_lcg(p, hot), P, ced, a, c, w):
-        Ks += K
-        sl += s
-        ex += sum(cause_terms(p, flow, K, s, t, lb.T, f, a, c).values())
-        m += 1
-    left = p[name] * m - Ks - ex
     mode = anchors.get("resid_mode", "slot")
-    return dict(f=f, mode=mode, x=left / sl if mode == "slot" else left / Ks, anchor=name)
+
+    def resid(name):
+        # (P, CED, hot list, flow) of the anchor row: S13b CED off and S14's slot arm ran the chunk flow with the hot
+        # list; the uniondispatch lease's new arm ran today's five dispatches without it
+        P, ced, hot, flow = {"anchor_union_s13b": (512, False, True, "chunks"),
+                             "anchor_union_s14s": (512, True, True, "chunks"),
+                             "anchor_union_ud512": (512, True, False, "five")}[name]
+        Ks = sl = ex = 0.0
+        m = 0
+        for lb, K, s, t in _layer_calls(routing_lcg(p, hot), P, ced, a, c, w):
+            Ks += K
+            sl += s
+            ex += sum(cause_terms(p, flow, K, s, t, lb.T, f, a, c).values())
+            m += 1
+        left = p[name] * m - Ks - ex
+        return left / sl if mode == "slot" else left / Ks
+
+    name, ud = anchors["union"], anchors.get("union_ud")
+    x = resid(name)
+    return dict(f=f, mode=mode, x=x, x_ud=resid(ud) if ud else x, anchor=name, anchor_ud=ud or name)
+
+
+def x_of(U, cfg):
+    """The union's named residual for the configuration's era (union_anchor)."""
+    return U["x"] if cfg.get("xu_old") else U["x_ud"]
 
 
 def union_call(p, cfg, rt, l, T, U, skip=0.0):
@@ -611,7 +658,7 @@ def union_call(p, cfg, rt, l, T, U, skip=0.0):
         parts, x = {}, 0.0
     else:
         parts = cause_terms(p, cfg.get("flow", "chunks"), K, slots, touched, T, U["f"], a, c)
-        x = U["x"] * (slots if U["mode"] == "slot" else K)
+        x = x_of(U, cfg) * (slots if U["mode"] == "slot" else K)
     expl = sum(parts.values())
     res = expl + x + (p["unionreal_cut"] if cfg.get("unionreal_cut") else 0.0)
     return dict(ms=K + res, raw=K, resid=res, expl=expl, x=x, slots=slots, touched=touched,
@@ -871,7 +918,7 @@ def shadow_lb(p, cfg, lb, rt):
     """Card time (ms), activities and events of a layer-batch's shadow (batch.rs:1402-1766), under the
     union. Expert arm: the per-chunk kernels as traced and the grouped gate-up and down per card slot;
     slot arm: the same per-chunk kernels and each slot's expert bytes (derived, not traced). `tile` (T,
-    cardtile) prices the grouped pair per (card expert, 8-column tile) item at t_tile_T; `imma` prices
+    cardtile) prices the grouped pair as card_tile_us (the items' m mix and GT's L2 spill); `imma` prices
     it as the IMMA grouped GEMM (gemm_q3k/gemm_q4k): imma_lb a layer-batch of 512 columns, in
     proportion below, at least the card experts' bytes once. `_clk` stretches the SM-bound parts (the per-chunk kernels, T's issue-bound
     items), not the per-slot grouped pair, which reads its weights from DRAM once a slot."""
@@ -899,13 +946,14 @@ def shadow_lb(p, cfg, lb, rt):
                 floor = rt.n_card(l) * (p["expert_gu_bytes"] + p["expert_down_bytes"]) / bw * 1e6
                 grouped = max(floor, p["imma_lb"] * 1000.0 * lb.T / T_MAX)
             elif cfg.get("tile"):
-                grouped = card_tiles(rt, l, lb.T) * p["t_tile_T"] * clk
+                grouped = card_tile_us(p, cfg, rt, l, lb.T, clk)
             elif cfg.get("_tile_us"):
                 grouped = card_tiles(rt, l, lb.T) * cfg["_tile_us"]
             else:
                 grouped = lb.T * cs_tok * p["shadow_slot"]
-            t += (p["shadow_lb"] * clk + grouped) / 1000.0 + SHADOW_EXPERT_BLOCK * g
-            acts += SHADOW_EXPERT_BLOCK
+            nb = SHADOW_TILE_BLOCK if cfg.get("tile") and not cfg.get("imma") else SHADOW_EXPERT_BLOCK
+            t += (p["shadow_lb"] * clk + grouped) / 1000.0 + nb * g
+            acts += nb
         else:
             t += SHADOW_NOCARD_BLOCK * g
             acts += SHADOW_NOCARD_BLOCK
@@ -931,6 +979,57 @@ def card_tiles(rt, l, T):
     return sum(n * tiles_of(T, round(lam, 6)) for lam, n in rt.card[l])
 
 
+def touched_of(T, lam):
+    """P(m >= 1) for m ~ Binomial(T, lam / 512): the chance an expert of rate lam serves a block of T columns."""
+    if T <= 0 or lam <= 0:
+        return 0.0
+    q = min(lam / 512.0, 1.0)
+    return 1.0 if q >= 1.0 else -math.expm1(T * math.log1p(-q))
+
+
+def tile_kappa(p):
+    """us per SASS instruction-unit of T's m-column cores: t_tile_ab (t_tile_T's rate) was derived for cardnext's lcg
+    layer (tile_cal_tiles items over tile_cal_slots card slots, T 512), and an item of m columns issues tile_inst_fix +
+    tile_inst_col x m a row iteration (cardinread's SASS count), so an item costs kappa (fix + col m) and a block of
+    items kappa (fix x tiles + col x slots): the m mix is the slots per tile."""
+    fix, col = p["tile_inst_fix"], p["tile_inst_col"]
+    return p["t_tile_ab"] * p["tile_cal_tiles"] / (fix * p["tile_cal_tiles"] + col * p["tile_cal_slots"])
+
+
+def tile_compute_us(p, tiles, slots):
+    return tile_kappa(p) * (p["tile_inst_fix"] * tiles + p["tile_inst_col"] * slots)
+
+
+def l2_miss(p, cfg, slots, touched):
+    """The fraction of GT's activation reads that miss L2 in one launch over `slots` columns of `touched` experts: a
+    row tile's sweep reads every column (ACT_GT_BYTES) and its experts' row-tile weights, so the reuse distance is that
+    working set W. 'lru' (the default): cyclic reuse over W > L2 misses every time, W <= L2 never; 'edge90' (the band's
+    alternative): the same step at 0.9 L2 (other data holding a tenth of it), which puts lcg with the hot list (W 0.975
+    L2) over the edge; 'random': the random-replacement hit rate L2 / W, which the cardtile lease's card_in rejects at
+    both P (-9 %). DT's set (2,376 B a column) stays under L2 on prose."""
+    w = slots * ACT_GT_BYTES + touched * GT_ROW_W_BYTES
+    l2 = p["l2_bytes"]
+    mode = cfg.get("_l2", "lru")
+    if mode == "random":
+        return max(0.0, 1.0 - l2 / w) if w > 0 else 0.0
+    return 1.0 if w > l2 * (0.9 if mode == "edge90" else 1.0) else 0.0
+
+
+def spill_us(p, cfg, slots, touched):
+    """GT's activation re-reads from DRAM (us) when its sweep set exceeds L2: every row tile after the first reads the
+    launch's columns again (the first read is paid in both regimes), at bw_card, not stretched by the SM clock."""
+    return l2_miss(p, cfg, slots, touched) * (GT_ROW_TILES - 1) * slots * ACT_GT_BYTES / (p["bw_card"] * 1e3)
+
+
+def card_tile_us(p, cfg, rt, l, T, clk=1.0):
+    """T's grouped pair over layer l's card experts for a block of T columns (us): the tile items' issue cost at the SM
+    clock ratio plus the L2 spill of GT's activation sweep."""
+    tiles = card_tiles(rt, l, T)
+    slots = T * rt.card_slots_tok(l)
+    touched = sum(n * touched_of(T, round(lam, 6)) for lam, n in rt.card[l])
+    return tile_compute_us(p, tiles, slots) * clk + spill_us(p, cfg, slots, touched)
+
+
 def shadow_tile_us(p):
     """The grouped kernels' cost per (card expert, 8-column tile), from the same trace mean shadow_slot was
     read from (lcg, hot list 384, P 512 CED on, layers 2-39) [derived]."""
@@ -948,6 +1047,12 @@ def post_card(p, lb):
     """The upload of the host sums and the join (batch.rs:1155-1164, :1769-1838), card ms."""
     return lb.T * X_BYTES / (p["post_h2d_gbs"] * 1e6) + (lb.T * p["post_batch_tok"]) / 1000.0 \
         + POST_ACTS * p["gap_act"] / 1000.0
+
+
+def post_parts(p, lb):
+    """post_card as its two activities, (upload, join) card ms: a streamed layer defers the joins."""
+    g = p["gap_act"] / 1000.0
+    return lb.T * X_BYTES / (p["post_h2d_gbs"] * 1e6) + g, (lb.T * p["post_batch_tok"]) / 1000.0 + g
 
 
 # ============================================================================ the launch queue
@@ -1004,20 +1109,26 @@ class Card:
 
 
 class State:
-    __slots__ = ("t", "issued", "card", "pcie", "slots", "fills")
+    """The host clock, the card FIFO, the PCIe copy engine and the ring's slots (when each is free again),
+    the fill intervals still ahead; in the wrap order also the end of the route issued ahead (wev) and the
+    enqueue an unserved item passed to the next (wfirst)."""
+    __slots__ = ("t", "issued", "card", "pcie", "slots", "fills", "wev", "wfirst")
 
     def __init__(self, ring=0):
         self.t, self.issued, self.card = 0.0, 0.0, Card()
         self.pcie, self.slots, self.fills = 0.0, [0.0] * ring, []
+        self.wev, self.wfirst = 0.0, 0.0
 
     def copy(self):
         s = State()
         s.t, s.issued, s.card = self.t, self.issued, self.card.copy()
         s.pcie, s.slots, s.fills = self.pcie, list(self.slots), list(self.fills)
+        s.wev, s.wfirst = self.wev, self.wfirst
         return s
 
     def take(self, o):
         self.t, self.issued, self.card, self.pcie, self.slots, self.fills = o.t, o.issued, o.card, o.pcie, o.slots, o.fills
+        self.wev, self.wfirst = o.wev, o.wfirst
 
 
 def issue(p, st, jobs, Q):
@@ -1084,6 +1195,97 @@ def hot_lams(hostlist, k):
     return out
 
 
+def expert_bytes_stream(p, l):
+    """Bytes of one routed expert of layer l as a streamed fill moves them."""
+    return p["expert_gu_bytes"] + (p["expert_down_q5_bytes"] if l in Q5_LAYERS else p["expert_down_bytes"])
+
+
+def weighted_ranks(hostlist, k, per=1.0):
+    """The hottest k ranks of a host list as [(lam, weight)]: whole ranks weigh 1, a partial last one its
+    fraction. `per` is list units a rank holds (phi for a prose list, whose entries count phi of a rank)."""
+    out, left = [], k
+    for lam, n in hostlist:
+        if left <= 1e-12:
+            break
+        take = min(n / per, left)
+        whole = int(take + 1e-9)
+        out.extend([(lam, 1.0)] * whole)
+        if take - whole > 1e-9:
+            out.append((lam, take - whole))
+        left -= take
+    return out
+
+
+def stream_items(p, cfg, rt, l, Ts, k):
+    """k streamed experts of layer l over batches of Ts columns: [(fill ms, card ms)] in fill order and the
+    union's skip in host-list units. pick 'static' (the default) streams k ranks of a load-time table: a
+    prose prompt routes to phi of each rank at lam, so a streamed rank saves the host phi of an expert and
+    costs PCIe and a slot whole; 'oracle' streams the prompt's own hottest k (perfect foresight). sgemm
+    'tile' (the default, bit rule (b')) prices an expert as T's grouped kernels price a card expert (card_tile_us's
+    items per 8-column tile per batch, and GT's L2 spill for a launch over a ring's worth of experts on one batch's
+    columns: the hottest min(ring, k)); 'gemm' at stream_gfix + stream_gcol a column (the IMMA arm (a))."""
+    static = cfg.get("pick", "static") == "static"
+    phi = rt.phi if static else 1.0
+    fms = expert_bytes_stream(p, l) / (p["pcie_pinned"] * 1e9) * 1e3
+    tile = cfg.get("sgemm", "tile") == "tile"
+    clk = cfg.get("_clk", 1.0)
+    ranks = weighted_ranks(rt.host[l], k, phi)
+    miss = {}
+    if tile:
+        launch = ranks[:max(1, min(int(cfg.get("ring") or len(ranks)), len(ranks)))]
+        for T in Ts:
+            if T:
+                sl = sum(T * lam / 512.0 * w * phi for lam, w in launch)
+                tc = sum(touched_of(T, round(lam, 6)) * w * phi for lam, w in launch)
+                miss[T] = l2_miss(p, cfg, sl, tc)
+    out = []
+    for lam, wgt in ranks:
+        if tile:
+            tl = sum(tiles_of(T, round(lam, 6)) for T in Ts if T)
+            sl = sum(T * lam / 512.0 for T in Ts if T)
+            sp = sum(miss[T] * (GT_ROW_TILES - 1) * T * lam / 512.0 * ACT_GT_BYTES / (p["bw_card"] * 1e3)
+                     for T in Ts if T)
+            g = (tile_compute_us(p, tl, sl) * clk + sp) / 1000.0
+        else:
+            g = (p["stream_gfix"] + p["stream_gcol"] * sum(Ts) * lam / 512.0) / 1000.0
+        out.append((fms * wgt, g * wgt * phi))
+    return out, k * phi
+
+
+def fill_start(cfg, st):
+    """When a layer's fill may start: 'layer' (the default, the design's rule) when the host starts the
+    layer; 'free' as soon as a ring slot is, since the load-time k table names the ranks before any route
+    (the ring alone gates it)."""
+    return st.t if cfg.get("fill_gate", "layer") == "layer" else 0.0
+
+
+def stream_job(p, st, items, ring, layer_start, info):
+    """The card job of a layer's streamed experts: (activities, events, card ms, end_fn). The fill starts
+    with the layer and runs whenever a ring slot is free; expert i's card work needs its arrival, the
+    group's routes before the job in the FIFO, and expert i - 1's."""
+
+    def end_fn(start):
+        a_prev, e_prev, fl = max(st.pcie, layer_start), start, []
+        for i, (f, g) in enumerate(items):
+            j = i % ring
+            a0 = max(a_prev, st.slots[j])
+            a = a0 + f
+            if fl and abs(fl[-1][1] - a0) < 1e-9:
+                fl[-1] = (fl[-1][0], a)
+            else:
+                fl.append((a0, a))
+            e_prev = max(a, e_prev) + g
+            st.slots[j] = e_prev
+            a_prev = a
+        st.pcie = a_prev
+        info.update(fills=fl, start=start, end=e_prev, pcie_end=a_prev)
+        return e_prev
+
+    info["gemm"] = sum(g for _, g in items)
+    info["pcie"] = sum(f for f, _ in items)
+    return (2 + math.ceil(len(items) / ring), 0, 0.0, end_fn)
+
+
 def run_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring, fills_guess):
     """Host and card through one layer over the group's batches (G = len(lbs)), k host experts
     streamed through a ring of `ring` slots. Mutates `st`; returns per-lb records and stream info."""
@@ -1097,36 +1299,12 @@ def run_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring, fills_guess):
                 acts_s=shadows[b][1] if served[b] else 0, ev_s=shadows[b][2] if served[b] else 0,
                 terms=routes[b][3], parts={})
            for b, lb in enumerate(lbs)]
-    info = dict(fills=[], start=None, end=None, pcie_end=None, k=k, gemm=0.0)
+    info = dict(fills=[], start=None, end=None, pcie_end=None, k=k, gemm=0.0, pcie=0.0)
     stream = None
+    skip = 0.0
     if k > 0:
-        lams = hot_lams(rt.host[l], k)
-        cols = sum(lb.T for lb in lbs)
-        gem = [(p["stream_gfix"] + p["stream_gcol"] * cols * lam / 512.0) / 1000.0 for lam in lams]
-        info["gemm"] = sum(gem)
-        pms = p["expert_bytes_host"] / (p["pcie_pinned"] * 1e9) * 1e3
-        layer_start = st.t
-
-        def end_fn(start):
-            # the fill of a layer starts with the layer and runs whenever a ring slot is free; the GEMM
-            # of expert i needs its arrival, the group's last route and shadow, and GEMM i - 1
-            a_prev, e_prev, fl = max(st.pcie, layer_start), start, []
-            for i, g in enumerate(gem):
-                j = i % ring
-                a0 = max(a_prev, st.slots[j])
-                a = a0 + pms
-                if fl and abs(fl[-1][1] - a0) < 1e-9:
-                    fl[-1] = (fl[-1][0], a)
-                else:
-                    fl.append((a0, a))
-                e_prev = max(a, e_prev) + g
-                st.slots[j] = e_prev
-                a_prev = a
-            st.pcie = a_prev
-            info.update(fills=fl, start=start, end=e_prev, pcie_end=a_prev)
-            return e_prev
-
-        stream = (2 + math.ceil(len(gem) / ring), 0, 0.0, end_fn)
+        items, skip = stream_items(p, cfg, rt, l, [lb.T for lb in lbs], k)
+        stream = stream_job(p, st, items, ring, fill_start(cfg, st), info)
     fills = [f for f in st.fills] + list(fills_guess or [])
     ev = [None] * G
     first = [(routes[0][1], routes[0][2], routes[0][0])]
@@ -1163,7 +1341,7 @@ def run_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring, fills_guess):
         if cfg.get("copy"):
             r["copy"] = lb.T * X_BYTES / (p["copy_gbs"] * 1e6)
             st.t += r["copy"]
-        u = union_call(p, cfg, rt, l, lb.T, U, skip=k)
+        u = union_call(p, cfg, rt, l, lb.T, U, skip=skip)
         dur = dram_stretch(p, st.t, u["ms"], u["bytes"], fills) if k else u["ms"]
         r.update(union=dur, union_raw=u["raw"], union_resid=u["resid"], union_expl=u["expl"], union_x=u["x"],
                  slots=u["slots"], touched=u["touched"], union_dram=dur - u["ms"], parts=u["parts"])
@@ -1189,37 +1367,83 @@ def _close(a, b):
                                     for (x0, x1), (y0, y1) in zip(a, b))
 
 
-def settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring):
-    """run_layer to a fixed point of its fill intervals: a union sees the fill it overlaps, and in a
-    group the fill is issued after the first unions."""
+def settle(step, st, k):
+    """step(trial state, k, fill guess) to a fixed point of its fill intervals: a union sees the fill it
+    overlaps, and in a group the fill is issued after the first unions."""
     guess = []
     for _ in range(8):
         trial = st.copy()
-        rec, info = run_layer(p, cfg, lbs, rt, work, U, Q, trial, k, ring, guess)
+        rec, info = step(trial, k, guess)
         if not k or _close(info["fills"], guess):
             break
         guess = info["fills"]
     return trial, rec, info
 
 
-def best_k(p, cfg, lbs, rt, work, U, Q, st, ring):
+def settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring):
+    return settle(lambda s, kk, g: run_layer(p, cfg, lbs, rt, work, U, Q, s, kk, ring, g), st, k)
+
+
+def expert_saving_us(p, cfg, rt, l, Ts, lam, U):
+    """Host us one streamed expert of list rate lam saves over batches of Ts columns: per 512-column call its
+    E[max(W, a + c m)] (the W floor is paid per call, hoststream-recal-report.md:24) and X_u a slot."""
+    a, c = union_kernel(p, cfg)
+    xs = x_of(U, cfg) * 1000.0 if U.get("mode") == "slot" else 0.0
+    return sum(ecost(T, round(lam, 6), a, c, p["w"])[0] + xs * T * lam / 512.0 for T in Ts if T)
+
+
+def rule_k(p, cfg, rt, l, Ts, U, rule):
+    """Streamed ranks of layer l under a per-expert rule: 'serial', a rank whose host saving (phi of it for a
+    static pick) exceeds its fill time; 'onecall', the lead's rule a + c x (the group's columns) > fill time
+    (one call a group, no W floor per call: hoststream-design-report.md:11-12). Both ignore that PCIe runs
+    beside the host (the balance rule prices that)."""
+    static = cfg.get("pick", "static") == "static"
+    phi = rt.phi if static else 1.0
+    fus = expert_bytes_stream(p, l) / (p["pcie_pinned"] * 1e9) * 1e6
+    a, c = union_kernel(p, cfg)
+    k = 0.0
+    for lam, wgt in weighted_ranks(rt.host[l], rt.n_host(l) / phi, phi):
+        if rule == "onecall":
+            save = phi * (a + c * sum(T * lam / 512.0 for T in Ts))
+        else:
+            save = phi * expert_saving_us(p, cfg, rt, l, Ts, lam, U)
+        if save <= fus:
+            break
+        k += wgt
+    return k
+
+
+def best_k(step, st, n):
     """The layer's streamed count that minimizes its wall: the resource-balance rule of
     hoststream-design-report.md:92, a load-time constant per (layer, T)."""
-    n = rt.n_host(lbs[0].l)
     memo = {}
 
     def wall(k):
         if k not in memo:
-            s, _, _ = settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring)
+            s, _, _ = settle(step, st, k)
             memo[k] = max(s.t, s.card.free)
         return memo[k]
 
-    cands = sorted(set([0.0] + [float(x) for x in range(8, int(n) + 1, 8)] + [float(n)]))
+    cands = sorted(set([0.0] + [float(x) for x in range(8, int(n) + 1, 8)] + [float(int(n))]))
     best = min(cands, key=lambda k: (wall(k), k))
     for k in range(max(0, int(best) - 7), min(int(n), int(best) + 7) + 1):
         if wall(float(k)) < wall(best) - 1e-9:
             best = float(k)
     return best
+
+
+def choose_k(p, cfg, rt, lbs, U, step, st):
+    """k for a layer by cfg['krule']: 'balance' (default, the search), 'serial' or 'onecall' (rule_k), or a
+    number (every layer the same, capped at the layer's ranks)."""
+    l = lbs[0].l
+    rule = cfg.get("krule", "balance")
+    phi = rt.phi if cfg.get("pick", "static") == "static" else 1.0
+    n = rt.n_host(l) / phi
+    if rule == "balance":
+        return best_k(step, st, n)
+    if rule in ("serial", "onecall"):
+        return rule_k(p, cfg, rt, l, [lb.T for lb in lbs], U, rule)
+    return min(float(rule), n)
 
 
 def resolve_cfg(cfg, P):
@@ -1230,7 +1454,9 @@ def resolve_cfg(cfg, P):
     g = c.get("G", 1)
     c["G"] = min(8, nb) if g == "auto" else g
     if c.get("stream"):
-        if P >= C["borrow_min_p"].value or c.get("force_borrow"):
+        if c.get("ring"):                   # a ring given: its slots, borrowed only if said so
+            c["ring"], c["borrow"] = int(c["ring"]), bool(c.get("borrow", False))
+        elif P >= C["borrow_min_p"].value or c.get("force_borrow"):
             c["ring"], c["borrow"] = int(C["ring_borrow"].value), True
         else:
             c["ring"], c["borrow"] = int(C["ring_small"].value), False
@@ -1251,78 +1477,137 @@ def new_rec(lb, route, shadow):
                 ev_s=shadow[2] if lb.T else 0, terms=route[3], parts={})
 
 
-def run_group_wrap(p, cfg, grp, rt, U, Q, st, recs, binds, busy):
-    """One group of G >= 2 batches through the wrap order (cardnext-design-report.md section 1.1): the
-    group's (layer, batch) items layer-first, and for each item i the host issues [shadow(i), route(i + 1)],
-    waits for route(i)'s D2H, runs union(i), then issues its upload and join. route(l + 1, b) reads
-    join(l, b), issued G items earlier, so the stream's FIFO keeps every read after its write; the
-    stock G (run_layer) issues a layer's first route only after the previous layer's last post."""
-    t_i = p["t_issue"] / 1000.0
-    seq = [x[2][l] for l in range(L) for x in grp]
-    work = [(route_lb(p, cfg, lb), shadow_lb(p, cfg, lb, rt)) for lb in seq]
-    ev = [None] * len(seq)
-    e, placed = issue(p, st, [(work[0][0][1], work[0][0][2], work[0][0][0])], Q)
-    ev[0] = placed[0][1]
-    layer_t0, lay_host, lay_card = max(st.t, st.card.free), 0.0, 0.0
-    first = e
-    for i, lb in enumerate(seq):
-        route, shadow = work[i]
+def run_wrap_layer(p, cfg, items, nxt, rt, U, Q, st, k, ring, fills_guess):
+    """One layer of a group in the wrap order (cardnext-design-report.md section 1.1): for each item (l, b)
+    the host issues [S(l, b), R(next)], waits for R(l, b)'s D2H (st.wev), runs union(l, b), then issues
+    its upload and join; the layer's last item issues R(l + 1, 0) (`nxt`), which reads J(l, 0) issued G
+    items earlier. With k streamed experts (group mode: an expert serves every batch of the group before
+    its slot is reused, so any ring works) the layer's stream job goes into the last served item's burst
+    after its shadow, the joins of the earlier batches are deferred behind it (a join reads the streamed
+    sums), and the union skips the streamed experts. items: [(lb, route, shadow)]. Mutates `st`."""
+    G = len(items)
+    l = items[0][0].l
+    served = [lb.T > 0 for lb, _, _ in items]
+    last = max((b for b in range(G) if served[b]), default=None)
+    info = dict(fills=[], start=None, end=None, pcie_end=None, k=k, gemm=0.0, pcie=0.0)
+    stream, skip = None, 0.0
+    if k > 0 and last is not None:
+        its, skip = stream_items(p, cfg, rt, l, [lb.T for lb, _, _ in items], k)
+        stream = stream_job(p, st, its, ring, fill_start(cfg, st), info)
+    fills = list(st.fills) + list(fills_guess or [])
+    recs = []
+    for b, (lb, route, shadow) in enumerate(items):
         r = new_rec(lb, route, shadow)
-        r["enqueue"] += first
-        first = 0.0
-        burst, at_next = [], None
+        r["enqueue"] += st.wfirst
+        st.wfirst = 0.0
+        burst = []
         if lb.T:
             burst.append((shadow[1], shadow[2], shadow[0]))
-        if i + 1 < len(seq):
+        if stream and b == last:
+            burst.append(stream)
+            burst.extend((1, 0, post_parts(p, items[j][0])[1]) for j in range(b) if served[j])
+        nr = items[b + 1][1] if b + 1 < G else nxt
+        at_next = None
+        if nr is not None:
             at_next = len(burst)
-            nxt = work[i + 1][0]
-            burst.append((nxt[1], nxt[2], nxt[0]))
+            burst.append((nr[1], nr[2], nr[0]))
         e, placed = issue(p, st, burst, Q)
+        ev_this = st.wev
         if at_next is not None:
-            ev[i + 1] = placed[at_next][1]
+            st.wev = placed[at_next][1]
         if lb.T:
             r["enqueue"] += e
             w0 = st.t
-            st.t = max(st.t, ev[i])
+            st.t = max(st.t, ev_this)
             r["wait"] = st.t - w0
-            u = union_call(p, cfg, rt, lb.l, lb.T, U)
-            r.update(union=u["ms"], union_raw=u["raw"], union_resid=u["resid"], union_expl=u["expl"], union_x=u["x"],
-                     slots=u["slots"], touched=u["touched"], parts=u["parts"])
-            st.t += u["ms"]
-            r["enqueue"] += issue(p, st, [(POST_ACTS, 0, post_card(p, lb))], Q)[0]
+            u = union_call(p, cfg, rt, l, lb.T, U, skip=skip)
+            dur = dram_stretch(p, st.t, u["ms"], u["bytes"], fills) if stream else u["ms"]
+            r.update(union=dur, union_raw=u["raw"], union_resid=u["resid"], union_expl=u["expl"], union_x=u["x"],
+                     slots=u["slots"], touched=u["touched"], union_dram=dur - u["ms"], parts=u["parts"])
+            st.t += dur
+            up, join = post_parts(p, lb)
+            post = [(1, 0, up)] if stream and b < last else [(POST_ACTS, 0, up + join)]
+            r["enqueue"] += issue(p, st, post, Q)[0]
         else:
-            first = e                      # the next item's route was issued here: its enqueue
-        host = r["union"] + (r["acts_r"] + r["ev_r"] + r["acts_s"] + r["ev_s"] + POST_ACTS * (lb.T > 0)) * t_i
-        card = r["card_out"] + r["card_in"] + (post_card(p, lb) if lb.T else 0.0)
-        busy["host"] += host
-        busy["card"] += card
-        busy["dram"] += r["touched"] * p["expert_bytes_host"] / 1e9 / p["dram_eff"] * 1e3
-        lay_host += host * (lb.T > 0)
-        lay_card += card
+            st.wfirst = e                  # the next item's route was issued here: its enqueue
         recs.append(r)
-        if (i + 1) % len(grp) == 0:        # the layer's last batch
-            if any(x.T for x in seq[i + 1 - len(grp):i + 1]):
-                wall_l = st.t - layer_t0
-                top = max((lay_host, "host"), (lay_card, "card"))
-                binds.append("serial" if wall_l > 1.10 * top[0] else top[1])
-            layer_t0, lay_host, lay_card = st.t, 0.0, 0.0
+    if stream:
+        st.fills = [f for f in st.fills if f[1] > st.t] + info["fills"]
+    return recs, info
+
+
+def layer_row(p, gi, l, rec, info, host, card, wall, bind):
+    """One layer of one group, the resource timeline's unit: each resource's busy ms, the DRAM bytes (GB)
+    the union reads and the fill moves (fill_crossings times the fill's bytes), and the wall."""
+    served = [r for r in rec if r["lb"].T]
+    fill_gb = info["pcie"] * p["pcie_pinned"] / 1e3
+    union_gb = sum(r["touched"] for r in served) * p["expert_bytes_host"] / 1e9
+    return dict(gi=gi, l=l, n=len(served), cols=sum(r["lb"].T for r in served), k=info["k"], host=host,
+                union=sum(r["union"] for r in served), dram_x=sum(r["union_dram"] for r in served), card=card,
+                gemm=info["gemm"], pcie=info["pcie"], fill_gb=fill_gb, union_gb=union_gb,
+                dram_gb=union_gb + fill_gb * p["fill_crossings"], wall=wall, bind=bind)
+
+
+def run_group_wrap(p, cfg, grp, rt, U, Q, st, recs, binds, busy, gi=0, ks=None, kfix=None, lays=None):
+    """One group of G >= 2 batches through the wrap order, layer by layer (run_wrap_layer), k per layer
+    as run_prompt chooses it for the stock order. g = 1 is today's order (run_layer)."""
+    t_i = p["t_issue"] / 1000.0
+    ring = cfg.get("ring", 0)
+    layers = [[(x[2][l], route_lb(p, cfg, x[2][l]), shadow_lb(p, cfg, x[2][l], rt)) for x in grp] for l in range(L)]
+    r0 = layers[0][0][1]
+    e, placed = issue(p, st, [(r0[1], r0[2], r0[0])], Q)
+    st.wev, st.wfirst = placed[0][1], e
+    layer_t0 = max(st.t, st.card.free)
+    for l in range(L):
+        items = layers[l]
+        nxt = layers[l + 1][0][1] if l + 1 < L else None
+
+        def step(s, kk, g, items=items, nxt=nxt):
+            return run_wrap_layer(p, cfg, items, nxt, rt, U, Q, s, kk, ring, g)
+
+        k = 0.0
+        if ring and any(lb.T for lb, _, _ in items):
+            k = kfix[(gi, l)] if kfix is not None else choose_k(p, cfg, rt, [x[0] for x in items], U, step, st)
+        st2, rec, info = settle(step, st, k)
+        st.take(st2)
+        if ks is not None:
+            ks[(gi, l)] = k
+        lay_host = lay_card = 0.0
+        for r in rec:
+            lb = r["lb"]
+            host = r["union"] + (r["acts_r"] + r["ev_r"] + r["acts_s"] + r["ev_s"] + POST_ACTS * (lb.T > 0)) * t_i
+            card = r["card_out"] + r["card_in"] + (post_card(p, lb) if lb.T else 0.0)
+            busy["host"] += host
+            busy["card"] += card
+            busy["dram"] += r["touched"] * p["expert_bytes_host"] / 1e9 / p["dram_eff"] * 1e3
+            lay_host += host * (lb.T > 0)
+            lay_card += card
+            recs.append(r)
+        lay_card += info["gemm"]
+        busy["card"] += info["gemm"]
+        busy["pcie"] += info["pcie"]
+        busy["dram"] += info["pcie"] * p["fill_crossings"] * p["pcie_pinned"] / p["dram_eff"]
+        if any(lb.T for lb, _, _ in items):
+            wall_l = st.t - layer_t0
+            top = max((lay_host, "host"), (lay_card, "card"), (info["pcie"], "pcie"))
+            binds.append("serial" if wall_l > 1.10 * top[0] else top[1])
+            if lays is not None:
+                lays.append(layer_row(p, gi, l, rec, info, lay_host, lay_card, wall_l, top[1]))
+        layer_t0 = st.t
 
 
 def run_prompt(p, cfg, P, rt, U, kfix=None):
     """One prompt of P ids: per-lb records, the wall (ms) and pp (tok/s)."""
     cfg = resolve_cfg(cfg, P)
-    if cfg.get("wrap") and cfg.get("stream"):
-        raise SystemExit("ds41_prefill.py: the wrap order is not modelled with host streaming")
     plan = prompt_plan(P, cfg.get("ced", True))
     G, ring = cfg["G"], cfg["ring"]
     if cfg["borrow"]:
-        rt = rt.borrow(p["ring_borrow"] / L)
+        rt = rt.borrow(ring / L)
     Q = p["q_act"]
     st = State(ring)
-    recs, ks, binds = [], {}, []
+    recs, ks, binds, lays = [], {}, [], []
     batch_enq = batch_n = 0.0
     busy = dict(host=0.0, card=0.0, pcie=0.0, dram=0.0)
-    pms = p["expert_bytes_host"] / (p["pcie_pinned"] * 1e9) * 1e3
     t_i = p["t_issue"] / 1000.0
     for gi in range(0, len(plan), G):
         grp = plan[gi:gi + G]
@@ -1334,14 +1619,16 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
             batch_enq += e
             batch_n += a
         if cfg.get("wrap") and len(grp) >= 2:
-            run_group_wrap(p, cfg, grp, rt, U, Q, st, recs, binds, busy)
+            run_group_wrap(p, cfg, grp, rt, U, Q, st, recs, binds, busy, gi, ks, kfix, lays)
             continue
         for l in range(L):
             lbs = [x[2][l] for x in grp]
             work = layer_work(p, cfg, lbs, rt)
             k = 0.0
             if ring and any(lb.T for lb in lbs):
-                k = kfix[(gi, l)] if kfix is not None else best_k(p, cfg, lbs, rt, work, U, Q, st, ring)
+                k = kfix[(gi, l)] if kfix is not None else choose_k(
+                    p, cfg, rt, lbs, U, lambda s, kk, g, lbs=lbs, work=work: run_layer(p, cfg, lbs, rt, work, U, Q, s, kk, ring, g),
+                    st)
             t0 = max(st.t, st.card.free)
             st2, rec, info = settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring)
             st.take(st2)
@@ -1352,16 +1639,17 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
             card += info["gemm"]                    # the stream's GEMMs; its waits on PCIe are not card work
             busy["host"] += host
             busy["card"] += card
-            busy["pcie"] += k * pms
+            busy["pcie"] += info["pcie"]
             busy["dram"] += sum(r["touched"] * p["expert_bytes_host"] for r in rec) / 1e9 / p["dram_eff"] * 1e3 \
-                + k * pms * p["fill_crossings"] * p["pcie_pinned"] / p["dram_eff"]
+                + info["pcie"] * p["fill_crossings"] * p["pcie_pinned"] / p["dram_eff"]
             if any(lb.T for lb in lbs):
                 wall_l = max(st.t, st.card.free) - t0
-                top = max((host, "host"), (card, "card"), (k * pms, "pcie"))
+                top = max((host, "host"), (card, "card"), (info["pcie"], "pcie"))
                 binds.append("serial" if wall_l > 1.10 * top[0] else top[1])
+                lays.append(layer_row(p, gi, l, rec, info, host, card, wall_l, top[1]))
     issue(p, st, [(HEAD_ACTS, 0, p["head"])], Q)
     wall = max(st.t, st.card.free)
-    reup = p["borrow_reupload"] if cfg["borrow"] else 0.0
+    reup = p["borrow_reupload"] * ring / p["ring_borrow"] if cfg["borrow"] else 0.0
     wall += reup
     served = [r for r in recs if r["lb"].T]
     n = max(1, len(served))
@@ -1375,10 +1663,11 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
     agg["route"] = agg["wait"] + agg["enqueue"]
     agg["nonunion"] = (wall - sum(r["union"] for r in served)) / n
     agg["prologue"] = sum(u for _, u, _ in plan) * p["prologue_tok"] / 1000.0
+    agg["chain"] = wall - reup - agg["prologue"]          # the stat line's chain_ms: the prompt less its prologues
     agg["host_slots"] = sum(r["slots"] for r in served)
     busy["host"] += agg["prologue"] + batch_enq
     return dict(wall=wall, pp=P / wall * 1000.0, recs=recs, agg=agg, n_lb=len(served), ks=ks, binds=binds,
-                cfg=cfg, reupload=reup, busy=busy, duty=busy["card"] / wall)
+                cfg=cfg, reupload=reup, busy=busy, duty=busy["card"] / wall, layers=lays)
 
 
 # ============================================================================ configurations
@@ -1387,15 +1676,16 @@ CONFIGS = {
     # what each recorded commit ran: route "prebulk" = one-token router launches and a places launch
     # per chunk (d37136c batch.rs:815-866) and the per-slot shadow; copy = the union's copy of x before
     # hostserve (c58cb37); the union kernel (hosttile before h1fold, 5685a15); flow = the union's
-    # dispatch flow (chunks before 9626c7f, five after); hot = the hot list 384 (else the id prefix)
+    # dispatch flow (chunks before 9626c7f, five after); hot = the hot list 384 (else the id prefix); xu_old = the
+    # union's residual from the S13b anchor (the sittings before the uniondispatch lease; union_anchor)
     "ds41batch": dict(commit="43cd107", route="prebulk", union="hosttile", unionreal_cut=True, copy=True, ced=False,
-                      flow="chunks"),
-    "S13": dict(commit="e4d0aae", route="prebulk", copy=True, flow="chunks"),
-    "S13b": dict(commit="672ffab", route="prebulk", copy=True, flow="chunks"),
-    "S14pre": dict(commit="d37136c", route="prebulk", copy=True, flow="chunks"),
-    "S14": dict(commit="9d61a13", route="bulk", copy=True, flow="chunks"),
-    "S15": dict(commit="de3a086", route="bulk", copy=True, flow="chunks"),
-    "nsys": dict(commit="afe86d5", route="bulk", copy=False, flow="chunks"),
+                      flow="chunks", xu_old=True),
+    "S13": dict(commit="e4d0aae", route="prebulk", copy=True, flow="chunks", xu_old=True),
+    "S13b": dict(commit="672ffab", route="prebulk", copy=True, flow="chunks", xu_old=True),
+    "S14pre": dict(commit="d37136c", route="prebulk", copy=True, flow="chunks", xu_old=True),
+    "S14": dict(commit="9d61a13", route="bulk", copy=True, flow="chunks", xu_old=True),
+    "S15": dict(commit="de3a086", route="bulk", copy=True, flow="chunks", xu_old=True),
+    "nsys": dict(commit="afe86d5", route="bulk", copy=False, flow="chunks", xu_old=True),
     "UDbase": dict(commit="af929ae", route="bulk", copy=False, flow="chunks", hot=False),
     "UD": dict(commit="9626c7f", route="bulk", copy=False, flow="five", hot=False),
     "now": dict(commit="9626c7f", route="bulk", copy=False, flow="five"),
@@ -1405,8 +1695,17 @@ CONFIGS = {
     "B1": dict(commit="0bcee2c", route="bulk", copy=False, flow="five", b1=True, hot=False, timed=True),
     "B1base": dict(commit="74fe84c", route="bulk", copy=False, flow="five", hot=False, timed=True),
     "B1prose": dict(commit="0bcee2c", route="bulk", copy=False, flow="five", b1=True, timed=True),
+    # the cardtile lease (09-26#cardtile-ab): main efc202f (B1, udfix, cardtile), hot list 384, the prose prompt,
+    # BLOOMERY_CARD_EXPERTS=tile (the default) against =expert, one binary; the prefillgroup lease
+    # (09-26#prefillgroup-ab): main e690f54 (+ prefillgroup), lcg without the hot list, BLOOMERY_PREFILL_GROUP=2
+    # (the wrap) against =1, one binary
+    "CT": dict(commit="efc202f", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True),
+    "CTexp": dict(commit="efc202f", route="bulk", copy=False, flow="five", b1=True, timed=True),
+    "PG1": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True),
+    "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
+                wrap=True),
 }
-DEFAULT_ANCHORS = dict(union="anchor_union_s13b", resid_mode="slot")
+DEFAULT_ANCHORS = dict(union="anchor_union_s13b", union_ud="anchor_union_ud512", resid_mode="slot")
 
 
 def evaluate(p, cfg, P, rname="lcg", anchors=None, kfix=None):
@@ -1415,7 +1714,9 @@ def evaluate(p, cfg, P, rname="lcg", anchors=None, kfix=None):
     U = union_anchor(p, anchors)
     if anchors.get("shadow") == "tile":
         cfg = dict(cfg, _tile_us=shadow_tile_us(p))
-    r = run_prompt(p, cfg, P, routing(p, rname, cfg.get("hot", True)), U, kfix)
+    if anchors.get("l2"):
+        cfg = dict(cfg, _l2=anchors["l2"])
+    r = run_prompt(p, cfg, P, routing(p, rname, cfg.get("hot", True), P), U, kfix)
     r["U"] = U
     return r
 
@@ -1445,6 +1746,8 @@ def tol_ratio(p, n):
 UDS = "09-26#uniondispatch-ab (ud-sit depth.log, rounds"
 B1S = "09-26#b1-pp-ab (b1pp, b1pp2 run.log; clean rounds"
 PRS = "09-26#b1-pp-ab (cardin run.log;"
+CTS = "09-26#cardtile-ab (cardab run.log; rounds"
+PGS = "09-26#prefillgroup-ab (gab run.log; rounds"
 ROWS = [
     ("B.pp512", "ds41batch", 512, {}, "pp", 91.2, 2, "abs", "09-25#ds41batch-pp: 90.95, 91.46"),
     ("B.pp4096", "ds41batch", 4096, {}, "pp", 89.2, 2, "abs", "89.40, 89.02"),
@@ -1593,13 +1896,87 @@ ROWS = [
     ("B1.prose.slots", "B1prose", 512, {"rt": "prose"}, "host_slots", 52189, 1, "info", "a routing count, no timing ruler"),
     ("B1.prose.prologue", "B1prose", 512, {"rt": "prose"}, "prologue", 81.3, 1, "info",
      "no model term: the prompt's first process in its lease (eng_cold 2,741; lcg's warm 44.3)"),
+    # cardtile (T), one lease, prose, hot list 384, both arms of one binary (generate_ds41 e7870ea97ffb), two
+    # rounds each, 0/8 busy rows; values are the rounds' means (scratch cardab/run.log:150-435)
+    ("CT.p512.tile.pp", "CT", 512, {"rt": "prose", "clk": "tile"}, "pp", 216.10, 2, "abs", CTS + " 217.02, 215.17)"),
+    ("CT.p512.expert.pp", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "pp", 173.585, 2, "abs", "173.67, 173.50"),
+    ("CT.p4096.tile.pp", "CT", 4096, {"rt": "prose", "clk": "tile"}, "pp", 292.085, 2, "abs", "291.80, 292.37"),
+    ("CT.p4096.expert.pp", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "pp", 250.295, 2, "abs", "250.24, 250.35"),
+    ("CT.ratio512", "CT", 512, {"rt": "prose", "clk": "tile", "vs": ("CTexp", {"rt": "prose", "clk": "cardbound"})},
+     "ratio", 1.2449, 2, "ratio", "+-0.060; rounds 1.2496, 1.2402"),
+    ("CT.ratio4096", "CT", 4096, {"rt": "prose", "clk": "tile", "vs": ("CTexp", {"rt": "prose", "clk": "cardbound"})},
+     "ratio", 1.1670, 2, "ratio", "+-0.011; rounds 1.1661, 1.1678"),
+    ("CT.p512.tile.card_in", "CT", 512, {"rt": "prose", "clk": "tile"}, "card_in", 23.13, 2, "abs", "23.05, 23.21"),
+    ("CT.p512.tile.card_out", "CT", 512, {"rt": "prose", "clk": "tile"}, "card_out", 20.125, 2, "abs", "20.10, 20.15"),
+    ("CT.p512.tile.wait", "CT", 512, {"rt": "prose", "clk": "tile"}, "wait", 17.505, 2, "abs", "17.48, 17.53"),
+    ("CT.p512.tile.enqueue", "CT", 512, {"rt": "prose", "clk": "tile"}, "enqueue", 3.96, 2, "abs", "3.93, 3.99"),
+    ("CT.p512.tile.union", "CT", 512, {"rt": "prose", "clk": "tile"}, "union", 36.81, 2, "abs", "36.61, 37.01"),
+    ("CT.p512.tile.card_proj", "CT", 512, {"rt": "prose", "clk": "tile"}, "card_proj", 12.42, 2, "abs", "12.40, 12.44"),
+    ("CT.p512.tile.entries", "CT", 512, {"rt": "prose", "clk": "tile"}, "entries", 985.3, 2, "info",
+     "entries_route 506.4 + entries_shadow 478.9 (the expert arm 477.0: two more launches a card layer-batch)"),
+    ("CT.p512.expert.card_in", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "card_in", 45.415, 2, "abs",
+     "45.38, 45.45"),
+    ("CT.p512.expert.card_out", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "card_out", 22.165, 2, "abs",
+     "22.16, 22.17"),
+    ("CT.p512.expert.wait", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "wait", 30.66, 2, "abs", "30.61, 30.71"),
+    ("CT.p512.expert.enqueue", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "enqueue", 5.63, 2, "abs", "5.62, 5.64"),
+    ("CT.p512.expert.union", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "union", 36.49, 2, "abs", "36.51, 36.47"),
+    ("CT.p512.expert.card_proj", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "card_proj", 13.825, 2, "abs",
+     "13.82, 13.83"),
+    ("CT.p4096.tile.card_in", "CT", 4096, {"rt": "prose", "clk": "tile"}, "card_in", 21.705, 2, "abs", "21.72, 21.69"),
+    ("CT.p4096.tile.card_out", "CT", 4096, {"rt": "prose", "clk": "tile"}, "card_out", 22.53, 2, "abs", "22.54, 22.52"),
+    ("CT.p4096.tile.wait", "CT", 4096, {"rt": "prose", "clk": "tile"}, "wait", 18.615, 2, "abs", "18.63, 18.60"),
+    ("CT.p4096.tile.enqueue", "CT", 4096, {"rt": "prose", "clk": "tile"}, "enqueue", 4.725, 2, "abs", "4.72, 4.73"),
+    ("CT.p4096.tile.card_proj", "CT", 4096, {"rt": "prose", "clk": "tile"}, "card_proj", 12.555, 2, "abs", "12.56, 12.55"),
+    ("CT.p4096.expert.card_in", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "card_in", 40.81, 2, "abs",
+     "40.80, 40.82"),
+    ("CT.p4096.expert.card_out", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "card_out", 24.845, 2, "abs",
+     "24.83, 24.86"),
+    ("CT.p4096.expert.wait", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "wait", 28.245, 2, "abs", "28.18, 28.31"),
+    ("CT.p4096.expert.enqueue", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "enqueue", 5.85, 2, "abs", "5.84, 5.86"),
+    ("CT.p4096.expert.card_proj", "CTexp", 4096, {"rt": "prose", "clk": "cardbound"}, "card_proj", 13.945, 2, "abs",
+     "13.93, 13.96"),
+    ("CT.p4096.union", "CT", 4096, {"rt": "prose", "clk": "tile"}, "union", 39.0725, 4, "abs",
+     "both arms: tile 39.19, 39.08; expert 39.10, 38.92"),
+    ("CT.p4096.slots", "CT", 4096, {"rt": "prose"}, "host_slots", 325368, 2, "info",
+     "a routing count, no timing ruler: 3.058 a block position against P 512's 2.714"),
+    ("CT.p512.prologue", "CT", 512, {"rt": "prose"}, "prologue", 37.7, 2, "info", "37.7, 37.7"),
+    ("CT.p4096.prologue", "CT", 4096, {"rt": "prose"}, "prologue", 271.6, 2, "info", "270.6, 272.6"),
+    # prefillgroup (G), one lease, lcg, no hot list, G 2 against G 1 (generate_ds41 of e690f54), 0/4 busy rows
+    # (scratch gab/run.log:145-274). G 2's round 1 was the lease's first process (prologue 1,018.5 ms, eng_cold 286):
+    # the named exception PG.g2.r1.*, printed, not data; G 2's values are round 2's
+    ("PG.g1.pp", "PG1", 4096, {}, "pp", 200.43, 2, "abs", PGS + " 199.91, 200.95)"),
+    ("PG.g2.pp", "PG2", 4096, {}, "pp", 247.46, 1, "abs", "round 2"),
+    ("PG.g2.r1.pp", "PG2", 4096, {}, "pp", 235.21, 1, "info", "round 1: cold (prologue 1,018.5 against 323.2), not data"),
+    ("PG.ratio4096", "PG2", 4096, {"vs": ("PG1", {})}, "ratio", 1.2315, 1, "ratio",
+     "round 2's pair 247.46 / 200.95; the two rounds' mean 1.204 carries round 1's cold G 2 row"),
+    ("PG.chain_ratio", "PG2", 4096, {"vs": ("PG1", {})}, "ratio:chain", 0.8096, 1, "ratio",
+     "chain_ms round 2 16,225.3 / 20,041.1 (round 1 0.8140, cold)"),
+    ("PG.g1.union", "PG1", 4096, {}, "union", 68.875, 2, "abs", "69.07, 68.68"),
+    ("PG.g1.wait", "PG1", 4096, {}, "wait", 17.82, 2, "abs", "17.84, 17.80"),
+    ("PG.g1.enqueue", "PG1", 4096, {}, "enqueue", 4.625, 2, "abs", "4.63, 4.62"),
+    ("PG.g1.card_out", "PG1", 4096, {}, "card_out", 21.695, 2, "abs", "21.72, 21.67"),
+    ("PG.g1.card_in", "PG1", 4096, {}, "card_in", 11.84, 2, "abs", "11.85, 11.83 (the lcg tile shadow)"),
+    ("PG.g1.card_proj", "PG1", 4096, {}, "card_proj", 12.15, 2, "abs", "12.15, 12.15"),
+    ("PG.g1.chain", "PG1", 4096, {}, "chain", 20089.2, 2, "abs", "20,137.3, 20,041.1 ms"),
+    ("PG.g1.prologue", "PG1", 4096, {}, "prologue", 339.5, 2, "info", "344.1, 334.9"),
+    ("PG.g1.slots", "PG1", 4096, {}, "host_slots", 529761, 2, "info", "a routing count: 4.9790 a block position"),
+    ("PG.g2.union", "PG2", 4096, {}, "union", 68.60, 1, "abs", "round 2 (round 1 69.28)"),
+    ("PG.g2.wait", "PG2", 4096, {}, "wait", 0.84, 1, "info", "round 2 (round 1 0.83): under a ms, no relative ruler"),
+    ("PG.g2.enqueue", "PG2", 4096, {}, "enqueue", 4.31, 1, "abs", "round 2 (round 1 4.40)"),
+    ("PG.g2.card_out", "PG2", 4096, {}, "card_out", 21.99, 1, "abs", "round 2 (round 1 21.85)"),
+    ("PG.g2.card_in", "PG2", 4096, {}, "card_in", 11.77, 1, "abs", "round 2 (round 1 11.69)"),
+    ("PG.g2.chain", "PG2", 4096, {}, "chain", 16225.3, 1, "abs", "round 2 (round 1 16,392.5)"),
+    ("PG.g2.prologue", "PG2", 4096, {}, "prologue", 323.2, 1, "info", "round 2"),
+    ("PG.g2.r1.prologue", "PG2", 4096, {}, "prologue", 1018.5, 1, "info", "round 1, cold: the named exception"),
 ]
 
 # rows a constant in use was taken from: printed as 'anchor', not scored
 ANCHOR_ROWS = {
     "anchor_union_s13b": {"S13b.union.off"},
     "anchor_union_s14s": {"S14.p512.slot.union"},
-    "anchor_union_ud512": {"UD.new512.union"},
+    # with f from the same lease's difference, X_u from its new arm fixes its base arm's union too
+    "anchor_union_ud512": {"UD.new512.union", "UD.base512.union"},
     "s_host_lcg": {"S13b.slots.off"},
     "prologue_tok": {"S14.prologue512", "S14.prologue4096"},
     "ud_delta_512": {"UD.delta512", "UD.ratio512"},
@@ -1607,7 +1984,10 @@ ANCHOR_ROWS = {
     "t_issue": {"B1.p512.enqueue"},
     "clk_cardbound": {"B1.prose.card_out"},
     "prose_swap": {"B1.prose.slots"},
-    "prose_phi": {"B1.prose.union"},
+    "prose_phi_five": {"B1.prose.union"},
+    "prose_swap_4096": {"CT.p4096.slots"},
+    "prose_phi_4096": {"CT.p4096.union"},
+    "clk_tile_prose": {"CT.p512.tile.card_out"},
 }
 
 # the term that breaks a red row, named after reading its terms (--explain <row>, the diagnostics below)
@@ -1621,17 +2001,17 @@ TERMS = {
     "slot-shadow": "the slot arm's shadow is derived (the traced per-chunk kernels + each slot's expert bytes at bw_card),"
                    " not traced; S15's card_in reads it 2.4 ms longer at P 384 (the per-slot kernels are latency-bound"
                    " m-column launches, not DRAM-bound)",
-    "union-duty": "the same union code reads 0.54 (P 512) and 0.88 (P 4096) ms a layer-batch longer in the B1 arm than in"
-                  " the base arm of the same lease (67.01 / 66.47, 68.43 / 67.55), where the host spends a larger share of"
-                  " the wall in the union (P 4096: 75 % against 67 %); the model's union is a function of the routing"
-                  " alone, so it gives B1 the base's union and reads B1's P 4096 gain 1.2 % high. A host clock under"
-                  " the higher all-core duty is the candidate (CPU frequency is not in the witness lines)",
+    "route-4096": "the route window at P 4096 reads 0.4-1.0 ms a layer-batch short in every lease since B1 (card_out"
+                  " B1 21.31/21.90, prefillgroup 21.31/21.70-21.99, cardtile tile 21.85/22.53, expert 23.88/24.85; P 512"
+                  " is its anchor): the deep positions' attention and indexer terms (attn_seg's decode slope, idx_row_ns)"
+                  " carried from layer 2 at P 512. In the card-bound expert arm the host waits for it in the queue: with"
+                  " the route at its measured length (clk 1.166 on that row) enqueue reads 5.63 (-3.8 %) and wait 28.11",
 }
 BLAME = dict({r: "router_tok" for r in ("S13.pp4096.on", "S13.pp4096.off", "S13b.nonunion.on", "S14.ratio512.expert_pre",
                                         "S14.ratio4096.expert_pre", "S14.p512.pre.nonunion", "S14.p4096.pre.nonunion",
                                         "S14.pp4096.pre", "B.pp4096")},
              **{r: "union-T" for r in ("S15.slot.union", "S15.slot.pp")},
-             **{"S15.slot.card_in": "slot-shadow", "B1.ratio4096": "union-duty"})
+             **{"S15.slot.card_in": "slot-shadow", "CT.p4096.expert.enqueue": "route-4096"})
 
 
 def cold_pp(p, res, P, frac):
@@ -1646,8 +2026,11 @@ def row_cfg(p, cname, over):
     runs the card at clk_cardbound (the row's own measured condition)."""
     over = dict(over)
     rname = over.pop("rt", "lcg")
-    if over.pop("clk", None) == "cardbound":
+    clk = over.pop("clk", None)
+    if clk == "cardbound":
         over["_clk"] = p["clk_cardbound"]
+    elif clk == "tile":
+        over["_clk"] = p["clk_tile_prose"] if "clk_tile_prose" in p else 1.0
     return dict(CONFIGS[cname], **over), rname
 
 
@@ -1663,6 +2046,11 @@ def predict_row(p, row, anchors=None):
         ocfg, orn = row_cfg(p, *vs)
         other = evaluate(p, ocfg, P, orn, anchors)
         return pp / other["pp"], res
+    if q.startswith("ratio:"):
+        term = q.split(":")[1]
+        ocfg, orn = row_cfg(p, *vs)
+        other = evaluate(p, ocfg, P, orn, anchors)
+        return res["agg"][term] / other["agg"][term], res
     if q.startswith("diff:"):
         term = q.split(":")[1]
         ocfg, orn = row_cfg(p, *vs)
@@ -1677,8 +2065,8 @@ def scored(rid, kind, q, skip, n=2):
     return rid not in skip and kind != "info" and not q.startswith("diff:") and not (kind == "ratio" and n <= 1)
 
 
-IN_USE = ("anchor_union_s13b", "s_host_lcg", "prologue_tok", "ud_delta_512", "full_res_lat", "t_issue", "clk_cardbound",
-          "prose_swap", "prose_phi")
+IN_USE = ("anchor_union_s13b", "anchor_union_ud512", "s_host_lcg", "prologue_tok", "ud_delta_512", "full_res_lat",
+          "t_issue", "clk_cardbound", "prose_swap", "prose_phi_five", "prose_swap_4096", "prose_phi_4096", "clk_tile_prose")
 
 
 def backtest(verbose=True, out_rows=None):
@@ -1734,11 +2122,10 @@ def backtest(verbose=True, out_rows=None):
     U = union_anchor(p, DEFAULT_ANCHORS)
     flo = union_anchor(p.but(ud_delta_512=C["ud_delta_512"].lo), DEFAULT_ANCHORS)["f"]
     fhi = union_anchor(p.but(ud_delta_512=C["ud_delta_512"].hi), DEFAULT_ANCHORS)["f"]
-    xud = union_anchor(p, dict(DEFAULT_ANCHORS, union="anchor_union_ud512"))["x"]
-    out += ["", f"union [derived]: f {U['f']:.3f} ({flo:.3f}-{fhi:.3f} over the difference's 95 % interval)"
-                f"; X_u anchored on the uniondispatch new arm instead: {xud * 1000:.3f} us a slot"]
+    out += ["", f"union [derived]: f {U['f']:.3f} ({flo:.3f}-{fhi:.3f} over the difference's 95 % interval)"]
     out += [f"  f is the join-tail share of a steal block, from the uniondispatch A/B's {p['ud_delta_512']:.2f} ms at"
-            f" P 512; X_u {U['x'] * 1000:.3f} us per host slot is the named residual, anchor {U['anchor']}"]
+            f" P 512; X_u, the named residual per host slot: {U['x_ud'] * 1000:.3f} us since the uniondispatch lease"
+            f" ({U['anchor_ud']}), {U['x'] * 1000:.3f} us on the sittings before it ({U['anchor']})"]
     if TERMS:
         out += ["", "named terms of the red rows:"] + [f"  {k}: {v}" for k, v in TERMS.items()]
     out += ["", "diagnostics [derived; the constants stay as recorded]:"]
@@ -1841,10 +2228,82 @@ def diagnostics(p):
     out.append("  with router_tok 21.0 those rows would read: " + ", ".join(closes))
     s4 = [(q, evaluate(p, CONFIGS["S14"], 4096)["agg"][q], m) for q, m in (("union", 73.9), ("route", 32.9),
                                                                          ("nonunion", 35.1))]
+    out += tile_diagnostics(p)
+    out += group_diagnostics(p)
     out.append("P dependence: S14 at P 4096 reads " + ", ".join(f"{q} {v:.2f}/{m} ({(v - m) / m * 100:+.1f} %)"
                                                                   for q, v, m in s4)
                + f"; CED off P 4096/512 {evaluate(p, dict(CONFIGS['S13'], ced=False), 4096)['pp'] / evaluate(p, dict(CONFIGS['S13'], ced=False), 512)['pp']:.3f}"
                " against S13's 102.56/104.66 = 0.980")
+    return out
+
+
+def tile_parts(p, cfg, rt, P, clk):
+    """T's grouped pair over a prompt's card layer-batches, per served layer-batch: (items, slots, compute ms, spill ms,
+    layer-batches whose GT set passes L2)."""
+    it = sl = comp = sp = 0.0
+    over = n = 0
+    for _, _, lbs in prompt_plan(P, True):
+        for lb in lbs:
+            if not lb.T:
+                continue
+            n += 1
+            if rt.n_card(lb.l) == 0:
+                continue
+            tiles, slots = card_tiles(rt, lb.l, lb.T), lb.T * rt.card_slots_tok(lb.l)
+            touched = sum(k * touched_of(lb.T, round(lam, 6)) for lam, k in rt.card[lb.l])
+            it += tiles
+            sl += slots
+            comp += tile_compute_us(p, tiles, slots) * clk / 1000.0
+            sp += spill_us(p, cfg, slots, touched) / 1000.0
+            over += l2_miss(p, dict(cfg, _l2="lru"), slots, touched) > 0
+    return it / n, sl / n, comp / n, sp / n, over
+
+
+def tile_diagnostics(p):
+    """T's grouped pair on the three prompts it was measured on: items, m mix, compute and spill, us an item."""
+    out = [f"T's grouped pair (tile_kappa {tile_kappa(p) * 1000:.2f} ns an instruction-unit: t_tile_ab {p['t_tile_ab']} us at"
+           f" cardnext's {p['tile_cal_slots'] / p['tile_cal_tiles']:.2f} columns an item; L2 {p['l2_bytes'] / 2 ** 20:.0f} MiB),"
+           " per served layer-batch [derived] against the rows' card_in:"]
+    for label, cname, P, over, meas in (("lcg no hot list P 4096 (PG G 1)", "PG1", 4096, {}, 11.84),
+                                         ("prose P 512 (CT tile)", "CT", 512, {"rt": "prose", "clk": "tile"}, 23.13),
+                                         ("prose P 4096 (CT tile)", "CT", 4096, {"rt": "prose", "clk": "tile"}, 21.705)):
+        cfg, rn = row_cfg(p, cname, over)
+        rt = routing(p, rn, cfg.get("hot", True), P)
+        clk = cfg.get("_clk", 1.0)
+        it, sl, comp, sp, nover = tile_parts(p, cfg, rt, P, clk)
+        a = evaluate(p, cfg, P, rn)["agg"]
+        rnd = evaluate(p, cfg, P, rn, dict(DEFAULT_ANCHORS, l2="random"))["agg"]["card_in"]
+        flat = evaluate(p, dict(cfg, _tile_us=p["t_tile_ab"] * clk, tile=False), P, rn)["agg"]["card_in"]
+        out.append(f"  {label}: {it:.1f} items, {sl:.0f} card slots (m {sl / it:.2f} an item); compute {comp:.2f} + spill"
+                   f" {sp:.2f} ms ({(comp + sp) / it * 1000:.1f} us an item, {nover} layer-batches over L2); card_in"
+                   f" {a['card_in']:.2f} against {meas} ({(a['card_in'] - meas) / meas * 100:+.1f} %); random"
+                   f" replacement (rejected) {rnd:.2f}; the flat t_tile_T {flat:.2f}")
+    return out
+
+
+def group_diagnostics(p):
+    """The prefillgroup lease against the model: the union's share of the wall in both arms, and G 1's miss by term."""
+    out = []
+    g1, g2 = evaluate(p, CONFIGS["PG1"], 4096), evaluate(p, CONFIGS["PG2"], 4096)
+    hot = evaluate(p, dict(CONFIGS["PG2"], hot=True), 4096)["agg"]["union"]
+    cold = [evaluate(p, dict(CONFIGS["PG1"], ced=False), P)["agg"]["union"] for P in (512, 4096)]
+    m1 = dict(union=68.875, wait=17.82, enqueue=4.625, chain=20089.2, prologue=339.5)
+    share = [(68.875 * 220 / 20089.2), (68.60 * 220 / 16225.3)]
+    out.append(f"prefillgroup: the union's share of the chain {share[0] * 100:.0f} % at G 1, {share[1] * 100:.0f} % at G 2 (round"
+               f" 2), the union 68.875 / 68.60 ms a layer-batch: the same binary's union does not move with its duty. The card's"
+               f" 'union 63' was the hot-list cell (63.28 in the model before flowg, {hot:.2f} now); without the list, the"
+               f" lease's condition, it read 65.90 and reads {g1['agg']['union']:.2f} now")
+    out.append(f"  the five-dispatch union from P 512 to P 4096 in one lease: +1.41 (UD), +1.42 (B1), +1.08 (B1 base) ms against"
+               f" the model's +{g1['agg']['union'] - evaluate(p, CONFIGS['B1'], 512)['agg']['union']:.2f} (the chunk flow: +0.52"
+               f" against +{evaluate(p, CONFIGS['UDbase'], 4096)['agg']['union'] - evaluate(p, CONFIGS['UDbase'], 512)['agg']['union']:.2f});"
+               f" with CED off every layer-batch is T 512 and the model reads {cold[0]:.2f} / {cold[1]:.2f}")
+    a = g1["agg"]
+    d = {k: (m1[k] - a[k]) * (220 if k in ("union", "wait", "enqueue") else 1) for k in ("union", "wait", "enqueue")}
+    dp = m1["prologue"] - a["prologue"]
+    out.append(f"  G 1 wall, model {g1['wall']:.0f} ms against the lease's {4096 / 200.43 * 1000:.0f}: union"
+               f" {a['union']:.2f}/68.875 ({d['union']:+.0f} ms over 220), wait {a['wait']:.2f}/17.82 ({d['wait']:+.0f}),"
+               f" enqueue {a['enqueue']:.2f}/4.625 ({d['enqueue']:+.0f}), prologue {a['prologue']:.0f}/339.5 ({dp:+.0f});"
+               f" G 2 {g2['pp']:.1f} against 247.46")
     return out
 
 
@@ -1859,12 +2318,13 @@ STEPS = [
      " (cardnext-design-report.md section 2.3)", None),
     ("B1+T+G", {"b1": True, "tile": True, "G": 2, "wrap": True},
      "+ prefillgroup: the layer-first scheduler with the cross-layer wrap over pairs of batches (section 1.1)", None),
-    ("+stream", {"b1": True, "tile": True, "G": "auto", "stream": True, "force_borrow": True},
-     "+ host streaming through a 128-slot ring borrowed from cold card experts for the prompt (stock G <= 8, no wrap)",
+    ("+stream", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8},
+     "+ host streaming (steps 2 and 3): the wrap over up to 8 batches, an unborrowed 8-slot ring, k(T) by resource"
+     " balance, a static rank table, the streamed experts through T's kernels (bit rule b')",
      None),
-    ("+h3tile-b", {"b1": True, "tile": True, "G": "auto", "stream": True, "force_borrow": True, "union": "r8"},
+    ("+h3tile-b", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
      "+ the r8 host tile alone (h3tile-b-design-report.md:236-256; R1 landed as uniondispatch 9626c7f and is in now)", None),
-    ("+B4", {"b4": True, "tile": True, "G": "auto", "stream": True, "force_borrow": True, "union": "r8"},
+    ("+B4", {"b4": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
      "+ int8 GEMM projections (B4; the prefill = step bits stay on the off arm)", None),
 ]
 COMPARE = [
@@ -1875,13 +2335,25 @@ COMPARE = [
     ("B1+IMMA+G", {"b1": True, "imma": True, "G": 2, "wrap": True}, "the IMMA grouped GEMM in T's place, G 2 wrap"),
     ("G without B1", {"G": "auto"}, "the G scheduler with one host thread and no B1"),
     ("+stream R8", {"b1": True, "tile": True, "G": "auto", "stream": True},
-     "the triage rule instead: no borrowing below P 1024, the unborrowed 8-slot ring"),
+     "the triage rule instead: no borrowing below P 1024, the unborrowed 8-slot ring (stock G, no wrap)"),
+    ("+stream G2", {"b1": True, "tile": True, "G": 2, "wrap": True, "stream": True, "ring": 8},
+     "streaming on prefillgroup's shipped default G 2, ring 8"),
+    ("+stream G8 R128B", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 128, "borrow": True},
+     "the triage's borrowed 128-slot ring on the G <= 8 wrap"),
     ("h3tile-b on now", {"union": "r8"}, "the r8 host tile alone on today's flow (no B1, G 1)"),
 ]
 MEASURED = {
     "B1": "measured 09-26#b1-pp-ab on the lcg prompt without the hot list: 144.6 / 201.0 (the B1 rows; the model"
-          " reads 147.8 / 208.2 there), and on the prose prompt with it: 171.6 at P 512, where the card was busy 0.93"
-          " of the wall and its route ran clk_cardbound slower (175.8 with the ratio, 183.8 without)",
+          " reads 145.3 / 204.8 there), and on the prose prompt with it: 171.6 at P 512, where the card was busy 0.93"
+          " of the wall and its route ran clk_cardbound slower (175.7 with the ratio, 183.6 without); the cardtile"
+          " lease's expert arm (B1 on efc202f) read 173.6 / 250.3 on prose (the model 175.7 / 254.5)",
+    "B1+T": "measured 09-26#cardtile-ab on the prose prompt, hot list 384: 216.1 / 292.1 (the model 219.6 / 294.9 at the"
+            " tile arm's card clock, clk_tile_prose); card_in 23.13 / 21.71 (22.95 / 21.58: the items' m mix x1.13 and"
+            " GT's L2 spill 3.5 ms a layer-batch, which the flat t_tile_T left out at 18.2 / 17.4); lcg without the"
+            " hot list 200.4 at P 4096 (the prefillgroup lease's G 1 arm, the model 204.8)",
+    "B1+T+G": "measured 09-26#prefillgroup-ab on lcg without the hot list, P 4096: 247.5 (round 2; the model 251.6),"
+              " G 2 / G 1 1.232 (round 2's pair; the model 1.228); the union 68.6-69.3 ms a layer-batch in both arms"
+              " (the model 67.4) — it does not move with its share of the wall",
 }
 DECISIONS = {
     "now": ("today's flow is off the model (the route or the union moved): re-sit one arm with BLOOMERY_STEP_STATS=1"
@@ -1890,41 +2362,35 @@ DECISIONS = {
             " kernels, 45.3 ms a layer-batch measured after B1 against a 36.4 ms union): for a prose prompt the next"
             " lever is the grouped shadow, not the host",
             "same as low"),
-    "B1+T": ("the prose P 512 wall still carries the shadow: read card_in (predicted 17.8 [15.5-19.9] ms a layer-batch"
-             " at lcg's clock); above ~22 the tile items run below e 0.45 (registers, occupancy) — ptxas -v and ncu the GT kernel, split"
-             " gate and up (cardnext 2.3) before G",
-             "build prefillgroup (G): after T the prose P 4096 card (40 ms a layer-batch) and host (42) balance and"
-             " only the wrap overlaps them; lcg moves 0 at both P (the shadow was already under the union)",
-             "the route ran faster than the card-bound clock allows (card duty fell to ~0.66): G at P 4096 next, the"
-             " IMMA shadow is worth 0 at G 1"),
-    "B1+T+G": ("wait_lb near the route (the exchange set shared: F4) or enqueue_lb above ~8 (the queue): fix the"
-               " scheduler before anything else",
-               "lcg P 4096 is host-bound (the union 63 of a 70 ms layer-batch): h3tile-b or streaming next; prose P 4096"
-               " is card-bound on most layers (route 21 + shadow 18 + posts): the route (B4) and the per-chunk shadow"
-               " (7 ms) are the card's next terms, the IMMA shadow +4 %",
-               "the union runs faster overlapped than alone: re-derive k(T) before streaming"),
-    "+stream": ("the fill takes more DRAM than 3 x 26.3 GB/s under a 126 GB/s ceiling (fill_crossings 4 costs 16 at P 4096):"
-                " the 5-minute DRAM probe before building, then a smaller k(T)",
-                "the card binds 26 of 40 layers at P 4096 (route 24 + shadow 21 + stream GEMMs): a card lever (the grouped"
-                " shadow, B4) is worth more there than h3tile-b (+5.5 %); at P 512 the host still binds",
-                "the card terms are smaller than derived (stream_gfix, stream_gcol): calibrate them, then h3tile-b"),
+    "+stream": ("the union slows more than dram_eff 126 and 3 crossings allow (the model: 0.59 of its speed inside a fill):"
+                " the DRAM probe first; if union + fill traffic sums to <= 126 GB/s, the fill as one DMA read of a"
+                " registered copy (fill_crossings_direct: lcg P 512 R32 +16 %, G 2 R128 +21 %, G 8 R8 +1 %) before k(T)",
+                "lcg P 4096 binds on the card on 16 of 40 layers (the streamed experts' tile items ~82 ms a layer of a"
+                " group of 8): the card levers (IMMA shadow, B4) next; prose binds on the card at every G (+5..+7 % from"
+                " streaming): GT's (e, rho, t) order, which keeps the sweep in L2 (+4.6 % at G 2, +6.3 % with streaming),"
+                " and B4 before any bigger ring; a launch over more than ~80 lcg experts (7.6 columns and a 35 KB row tile each) spills GT's sweep too (G 8 R128B"
+                " under R8)",
+                "the streamed tile items run faster than card_tile_us: read a streamed arm's card work, then a ring of ~32 for"
+                " P 512"),
     "+h3tile-b": ("the r8 tile's bench gain did not survive the five-dispatch flow: time it alone on today's flow first"
-                  " (164 / 231 predicted, the comparison row 'h3tile-b on now')",
+                  " (161 / 227 predicted, the comparison row 'h3tile-b on now')",
                   "at P 4096 the card binds: B4 or the grouped shadow next; at P 512 the route before the union is the"
                   " serial term",
                   "the host sits at the W floor at P 512: only card levers remain"),
     "+B4": ("the int8 projection GEMM runs under the MoE rate: the Q3_K GEMM bench arm before building",
-            "host and card balance at P 4096 (8.1 / 8.2 s busy): the DRAM/PCIe terms and the grouped shadow are next",
+            "host and card balance at P 4096 (lcg 6.9 / 7.4 s busy, prose 6.2 / 7.6): the DRAM/PCIe terms and the grouped"
+            " shadow are next",
             "the stream GEMMs and the shadow are cheaper than derived: a bigger ring or G"),
 }
 
 VARY = [k for k, c in C.items() if c.lo != c.hi and k not in ("between_lease", "sd_same_binary")]
-# The grouped shadow per (expert, tile) was a fourth alternative until the prose prompt's card_in: per slot
+# The expert arm's grouped shadow per (expert, tile) was an alternative until the prose prompt's card_in: per slot
 # it reads 45.6 against 45.28 measured, per tile 39.3 (-13 %); on lcg the two sit within 3 % of each
-# other, so only the prose row separates them (diagnostics print both).
+# other, so only the prose row separates them (diagnostics print both). The tile arm's own items are card_tile_us.
 STRUCT = (("resid_mode=prop", dict(DEFAULT_ANCHORS, resid_mode="prop")),
           ("union anchor=S14 slot", dict(DEFAULT_ANCHORS, union="anchor_union_s14s")),
-          ("union anchor=UD new 512", dict(DEFAULT_ANCHORS, union="anchor_union_ud512")))
+          ("X_u carried from S13b", dict(DEFAULT_ANCHORS, union_ud=None)),
+          ("GT spills at 0.9 L2", dict(DEFAULT_ANCHORS, l2="edge90")))
 
 
 def step_cfg(over):
@@ -1933,20 +2399,26 @@ def step_cfg(over):
 
 @lru_cache(maxsize=None)
 def duty_ends():
-    """The card duty (busy / wall) of the two rows clk_cardbound was read between, at the central constants
-    and the lcg clock: B1 lcg P 512 (no slowdown) and the B1 prose prompt (clk_cardbound)."""
+    """The card duty (busy / wall) of the three rows the card-bound clock was read on, at the central constants
+    and the lcg clock: B1 lcg P 512 (no slowdown), the cardtile lease's tile arm on the prose prompt
+    (clk_tile_prose) and the B1 prose prompt (clk_cardbound)."""
     p = central()
     c1, r1 = row_cfg(p, "B1", {})
-    c2, r2 = row_cfg(p, "B1prose", {"rt": "prose"})
-    return evaluate(p, c1, 512, r1)["duty"], evaluate(p, c2, 512, r2)["duty"]
+    c2, r2 = row_cfg(p, "CT", {"rt": "prose"})
+    c3, r3 = row_cfg(p, "B1prose", {"rt": "prose"})
+    return tuple(evaluate(p, c, 512, r)["duty"] for c, r in ((c1, r1), (c2, r2), (c3, r3)))
 
 
 def clk_at(p, duty):
-    """The card-bound clock ratio at a run's card duty: 1 at B1 lcg's duty, clk_cardbound at the prose
-    prompt's, linear between (the shape is assumed; the ends are measured)."""
-    lo, hi = duty_ends()
-    w = min(1.0, max(0.0, (duty - lo) / (hi - lo)))
-    return 1.0 + (p["clk_cardbound"] - 1.0) * w
+    """The card-bound clock ratio at a run's card duty, piecewise linear through the three measured points: 1 at B1
+    lcg's duty, clk_tile_prose at the cardtile tile arm's, clk_cardbound at the B1 prose prompt's (the shape between
+    the points is assumed; the middle point showed it is not the straight line the two ends suggested)."""
+    lo, mid, hi = duty_ends()
+    if duty <= mid:
+        w = min(1.0, max(0.0, (duty - lo) / (mid - lo)))
+        return 1.0 + (p["clk_tile_prose"] - 1.0) * w
+    w = min(1.0, (duty - mid) / (hi - mid))
+    return p["clk_tile_prose"] + (p["clk_cardbound"] - p["clk_tile_prose"]) * w
 
 
 def band_of(cfg, P, rname):
@@ -1998,10 +2470,10 @@ def predict(which):
         raise SystemExit(f"--predict: no step {which!r}; steps: all, " + ", ".join(s[0] for s in STEPS))
     print("pp tok/s [derived] @ A6000 300 W, plan (a), hot list 384, CED on, CARD_EXPERTS expert, the lcg prompt or the"
           " prose prompt (corpus-prose.ids; routing calibrated on its B1 row), from main 9626c7f.")
-    print("band = central -/+ quadrature of every read constant's lo/hi and three structural alternatives (resid_mode prop,"
-          " X_u anchored on the S14 slot arm or on the uniondispatch lease's new arm (today's code, no hot list: it sits 2 %"
-          " under the model)) and, where the card is busier than"
-          " on B1 lcg, the card-bound clock at the cell's duty (clk_cardbound); corner = all constants at their adverse /"
+    print("band = central -/+ quadrature of every read constant's lo/hi and the structural alternatives (resid_mode prop,"
+          " X_u carried from S13b instead of today's uniondispatch arm, GT's sweep spilling at 0.9 of L2) and,"
+          " where the card is busier than on B1 lcg, the card-bound clock at the cell's duty (clk_at, through"
+          " clk_tile_prose and clk_cardbound); corner = all constants at their adverse /"
           " favourable ends together; k per layer is searched at the central constants and held across the band.")
     prev = {}
     for name, over, what, _ in todo:
@@ -2067,18 +2539,18 @@ def predict(which):
 CELL_STEPS = (("B1", {"b1": True}), ("B1+T", {"b1": True, "tile": True}), ("B1+G", {"b1": True, "G": 2, "wrap": True}),
               ("B1+T+G", {"b1": True, "tile": True, "G": 2, "wrap": True}))
 CELL_MEASURED = {("lcg", 512): "144.6 (no hot list)", ("lcg", 4096): "201.0 (no hot list)", ("prose", 512): "171.6",
-                 ("prose", 4096): "-"}
+                 ("prose", 4096): "250.3 (CT expert)"}
 
 
 def imma_over_t(cfg_t, cfg_i, P, rname):
-    """pp(IMMA shadow) / pp(T shadow) - 1 at the central constants, and its range over imma_lb and t_tile_T at
+    """pp(IMMA shadow) / pp(T shadow) - 1 at the central constants, and its range over imma_lb and t_tile_ab at
     their ends and the card-bound clock at each arm's duty."""
     p = central()
     out = []
     for il in (C["imma_lb"].lo, C["imma_lb"].value, C["imma_lb"].hi):
-        for tt in (C["t_tile_T"].lo, C["t_tile_T"].value, C["t_tile_T"].hi):
+        for tt in (C["t_tile_ab"].lo, C["t_tile_ab"].value, C["t_tile_ab"].hi):
             for clk in (False, True):
-                q = p.but(imma_lb=il, t_tile_T=tt)
+                q = p.but(imma_lb=il, t_tile_ab=tt)
                 rs = []
                 for cfg in (cfg_t, cfg_i):
                     r = evaluate(q, cfg, P, rname)
@@ -2194,7 +2666,7 @@ def explain(target):
         print(f"  union a layer-batch: kernel {a['union_raw']:.2f} + causes {a['union_expl']:.2f} ("
               + ", ".join(f"{k} {v:.2f}" for k, v in parts.items()) + f") + X_u {a['union_x']:.2f} + DRAM"
               f" {a['union_dram']:.2f} = {a['union']:.2f} ms; {a['slots']:.0f} host slots, {a['touched']:.1f} experts"
-              f" touched; f {r['U']['f']:.3f}, X_u {r['U']['mode']} {r['U']['x']:.5f}")
+              f" touched; f {r['U']['f']:.3f}, X_u {r['U']['mode']} {x_of(r['U'], cfg):.5f}")
         print(f"  shadow {a['card_in']:.2f}, copy {a['copy']:.2f}, non-union {a['nonunion']:.2f} ms a layer-batch;"
               f" prologue {a['prologue']:.1f} ms a prompt; layers bound: {bind_summary(r)}")
         lb = next((x["lb"] for x in served if len(x["lb"].full) >= 8 and x["lb"].l == 3),
@@ -2224,6 +2696,167 @@ def explain(target):
         print(f"    {name:24} {c.value:>11g} [{c.lo:g}, {c.hi:g}] {c.unit:18} {c.kind:9} {c.source}")
 
 
+# ============================================================================ host streaming (hoststream steps 2 and 3)
+
+STREAM_BASE = {"b1": True, "tile": True}      # after B1 and T; G and the wrap per row
+RINGS = ((8, False), (24, False), (128, True))
+
+
+def stream_cfg(G, ring=None, borrow=False, **kw):
+    """B1 + T, G batches a group (the wrap from 2 on), streaming through `ring` slots when given."""
+    c = dict(STREAM_BASE, G=G, wrap=G > 1, **kw)
+    if ring:
+        c.update(stream=True, ring=ring, borrow=borrow)
+    return step_cfg(c)
+
+
+def group_sets(G):
+    """Buffer sets the prefillgroup code makes for a lever of G: G + 1 from 2 on (a lone last batch joins
+    the group before it; prefillgroup worktree body/prefill.rs group_sets, uncommitted)."""
+    return G + 1 if G >= 2 else 1
+
+
+def group_bytes(p, G, which="value"):
+    """Card bytes a group of G adds over G 1: (sets - 1) extra sets at the G 2 load line's per-set bytes
+    (group_bytes_g2 / 2, measured); `which` = "lo"/"hi" reads the derived bounds (set_bytes_fixed + set_bytes_shared)
+    instead, the range a set's share could take at another G."""
+    if which == "value":
+        return (group_sets(G) - 1) * p["group_bytes_g2"] / 2.0
+    return (group_sets(G) - 1) * (p["set_bytes_fixed"] + getattr(C["set_bytes_shared"], which))
+
+
+def ring_slot(p):
+    return p["expert_gu_bytes"] + p["expert_down_q5_bytes"]
+
+
+def layer_means(res, full_only=True):
+    """Per layer of a group, the mean over the layers every batch of the group serves in full (T = 512
+    each: layers 0-19 of a 4096 prompt)."""
+    rows = [x for x in res["layers"] if not full_only or x["cols"] == 512 * x["n"]]
+    if not rows:
+        return None
+    keys = ("n", "cols", "k", "host", "union", "dram_x", "card", "gemm", "pcie", "fill_gb", "union_gb", "dram_gb", "wall")
+    return {k: sum(x[k] for x in rows) / len(rows) for k in keys}
+
+
+def stream_report():
+    p = central()
+    U = union_anchor(p, DEFAULT_ANCHORS)
+    fus = expert_bytes_stream(p, 2) / (p["pcie_pinned"] * 1e9) * 1e6
+    fus0 = expert_bytes_stream(p, 0) / (p["pcie_pinned"] * 1e9) * 1e6
+    print("host streaming after B1 + T [derived]: A6000 300 W, plan (a), hot list 384, CED on; streamed experts priced at"
+          " T's tile rate (bit rule b'), a static rank table (pick static), the fill gated by the layer's start, pinned"
+          f" {p['pcie_pinned']:.2f} GB/s, fill {p['fill_crossings']:.0f} DRAM crossings under dram_eff {p['dram_eff']:.0f} GB/s.")
+    a, c = union_kernel(p, step_cfg(STREAM_BASE))
+    print(f"\n1. experts a layer that beat PCIe (fill {fus:.1f} us, {fus0:.1f} on the Q5_K layers 0-1), 512-column batches:"
+          f" 'onecall' = a + c x G x m > fill (a {a}, c {c}); 'serial' = sum over the G calls of E[max(W, a + c m)] + X_u m"
+          f" > fill (W {p['w']}, X_u {U['x_ud'] * 1000:.2f} us a slot); prose static saves phi {p['prose_phi_five']} (P 512),"
+          f" {p['prose_phi_4096']} (P 4096) of a streamed rank")
+    print(f"   {'routing (count unit)':22} {'layer':>5} {'of':>6} " + " ".join(f"{'G' + str(G) + ' 1call/serial':>18}" for G in (1, 2, 4, 8)))
+    for rn, pick in (("lcg", "static"), ("prose", "static"), ("prose", "oracle")):
+        rt = routing(p, rn)
+        cfg = step_cfg(dict(STREAM_BASE, pick=pick))
+        for l in (0, 2, 30):
+            phi = rt.phi if pick == "static" else 1.0
+            cells = []
+            for G in (1, 2, 4, 8):
+                cells.append(f"{rule_k(p, cfg, rt, l, [512] * G, U, 'onecall'):7.0f} /{rule_k(p, cfg, rt, l, [512] * G, U, 'serial'):5.0f}")
+            unit = "ranks" if pick == "static" else "experts"
+            print(f"   {rn + ' ' + pick + ' ' + unit:22} {l:5d} {rt.n_host(l) / phi:6.0f} " + " ".join(f"{x:>18}" for x in cells))
+    print("   the serial count is not the rule: PCIe runs beside the host, so a layer streams until host, card and"
+          " PCIe balance (krule balance, the rows below)")
+
+    print("\n2. pp tok/s [derived, central], P 4096 and 512; k = streamed experts a layer (mean over layers, layer 0);"
+          " R = ring slots (B = borrowed from cold card experts for the prompt, re-upload in the wall)")
+    res = {}
+    for rn in ("lcg", "prose"):
+        for P in (4096, 512):
+            for G in ((1, 2, 4, 8) if P == 4096 else (1,)):
+                base = evaluate(p, stream_cfg(G), P, rn)
+                row = [f"no stream {base['pp']:6.1f}"]
+                res[(rn, P, G, 0)] = base
+                for ring, bor in RINGS:
+                    r = evaluate(p, stream_cfg(G, ring, bor), P, rn)
+                    res[(rn, P, G, ring)] = r
+                    ks = list(r["ks"].values())
+                    row.append(f"R{ring}{'B' if bor else ''} {r['pp']:6.1f} ({(r['pp'] / base['pp'] - 1) * 100:+5.1f} %, k"
+                               f" {sum(ks) / len(ks):3.0f}/{r['ks'].get((0, 0), 0):3.0f})")
+                print(f"   {rn:5} P {P:4d} G {G}: " + "; ".join(row))
+    for rn in ("lcg", "prose"):
+        fr = evaluate(p, stream_cfg(2, 128, True, fill_gate="free"), 4096, rn)["pp"]
+        f8 = evaluate(p, stream_cfg(2, 8, fill_gate="free"), 4096, rn)["pp"]
+        o = evaluate(p, stream_cfg(1, 24, pick="oracle"), 512, rn)["pp"]
+        print(f"   {rn:5}: G 2 with the fill free of the layer start (the ring alone gates it): R8 {f8:.1f}, R128B {fr:.1f};"
+              f" P 512 G 1 R24 with a prose oracle pick {o:.1f}")
+
+    print("\n3. card bytes: free after the load and the G 1 batch (vram_free_g1, measured); a group adds (sets - 1) extra"
+          " sets at the G 2 load line's per-set bytes (lo..hi: set_bytes_fixed + set_bytes_shared's bounds) [derived]; a"
+          " ring slot holds the largest expert")
+    free1 = p["vram_free_g1"]
+    slot, cexp = int(ring_slot(p)), int(p["expert_gu_bytes"] + p["expert_down_bytes"])
+    step_us = 1e6 / p["decode_tok_s"]
+    print(f"   free after the G 1 batch {free1 / 1e6:.1f} MB (the plan's MARGIN is {1 << 30} B: the batch already lives inside"
+          f" it); ring slot {slot:,} B, card expert {cexp:,} B")
+    for G in (1, 2, 4, 8):
+        lo, mid, hi = (group_bytes(p, G, w) for w in ("lo", "value", "hi"))
+        cells = []
+        for R in (8, 24, 64, 128):
+            need = R * slot - (free1 - mid)
+            ev_n = max(0, math.ceil(need / cexp))
+            loss = ev_n * p["decode_us_card_expert"] / step_us * 100
+            cells.append(f"R{R} {R * slot / 1e6:5.0f} MB: evict {ev_n:3d} ({loss:.2f} % decode)")
+        print(f"   G {G}: {group_sets(G)} sets, +{mid / 1e6:.0f} MB (derived {lo / 1e6:.0f}..{hi / 1e6:.0f}), free"
+              f" {(free1 - mid) / 1e6:5.0f} MB | " + "; ".join(cells))
+    print(f"   a borrowed ring gives its slots back after the prompt: {p['borrow_reupload']:.0f} ms a 128-slot re-upload from a"
+          f" pinned copy ({128 * cexp / 1e9:.2f} GB of host RAM pinned), {p['borrow_reupload_nvme']:.0f} ms from NVMe")
+
+    print("\n4. the resource timeline per layer of a group (ms, layers 0-19 of P 4096, every batch 512 columns), central:"
+          " host = unions + issue calls, card = route + shadow + posts + streamed experts, PCIe = the fill, DRAM = union"
+          " reads + fill x crossings at dram_eff")
+    print(f"   {'cell':24} {'k':>4} {'host':>6} {'(union':>7} {'+DRAM)':>6} {'card':>6} {'(strm)':>6} {'PCIe':>6} {'DRAM GB':>7}"
+          f" {'DRAM ms':>7} {'wall':>6} {'max':>6} {'sum':>6}")
+    for rn in ("lcg", "prose"):
+        for G, ring in ((2, 0), (2, 8), (2, 128), (4, 8), (8, 0), (8, 8), (8, 128)):
+            r = res.get((rn, 4096, G, ring))
+            if r is None:
+                continue
+            x = layer_means(r)
+            dms = x["dram_gb"] / p["dram_eff"] * 1e3
+            top = max(x["host"], x["card"], x["pcie"], dms)
+            print(f"   {rn + ' G' + str(G) + (' R' + str(ring) if ring else ' no stream'):24} {x['k']:4.0f} {x['host']:6.1f}"
+                  f" {x['union']:7.1f} {x['dram_x']:6.1f} {x['card']:6.1f} {x['gemm']:6.1f} {x['pcie']:6.1f} {x['dram_gb']:7.2f}"
+                  f" {dms:7.1f} {x['wall']:6.1f} {x['wall'] / top:6.2f} {x['wall'] / (x['host'] + x['card'] + x['pcie']):6.2f}")
+    print("   max = wall / the busiest resource (1 = a max), sum = wall / (host + card + PCIe)")
+
+    print("\n5. the term the derivation cannot fix: DRAM while the fill and the union overlap")
+    for rn, G, ring, bor in (("lcg", 2, 8, False), ("lcg", 8, 128, True), ("prose", 2, 8, False)):
+        r = res[(rn, 4096, G, ring)]
+        x = layer_means(r)
+        rate = x["union_gb"] / (x["union"] - x["dram_x"]) * 1e3 if x["union"] > x["dram_x"] else 0.0
+        room = p["dram_eff"] - p["fill_crossings"] * p["pcie_pinned"]
+        phi = min(1 - p["fill_steal"], room / rate) if rate else 1.0
+        print(f"   {rn} G {G} R{ring}: the union reads {rate:.0f} GB/s on its own; beside a {p['pcie_pinned']:.1f} GB/s fill at"
+              f" {p['fill_crossings']:.0f} crossings the room is {room:.0f} GB/s, so it runs at {phi:.2f} of its speed inside the"
+              f" fill (+{(1 / phi - 1) * 100:.0f} %); DRAM stretch {x['dram_x']:.1f} ms a layer of {x['union']:.1f}")
+    for label, cfg_over, pov in (
+            ("central", {}, {}),
+            ("fill direct (1 crossing, no fill threads)", {}, dict(fill_crossings=p["fill_crossings_direct"], fill_steal=0.0)),
+            ("fill_crossings 4 (RFO)", {}, dict(fill_crossings=C["fill_crossings"].hi)),
+            ("dram_eff 112", {}, dict(dram_eff=C["dram_eff"].lo)),
+            ("dram_eff 140", {}, dict(dram_eff=C["dram_eff"].hi)),
+            ("fill_steal 0.08", {}, dict(fill_steal=C["fill_steal"].hi)),
+            ("pageable (21.16 GB/s: the driver stages it, still 3 crossings)", {}, dict(pcie_pinned=p["pcie_pageable"])),
+            ("sgemm gemm (IMMA arm a)", {"sgemm": "gemm"}, {}),
+            ("t_tile_ab lo", {}, dict(t_tile_ab=C["t_tile_ab"].lo)),
+            ("t_tile_ab hi", {}, dict(t_tile_ab=C["t_tile_ab"].hi))):
+        q = p.but(**pov)
+        cells = []
+        for rn, G, ring, bor in (("lcg", 2, 8, False), ("lcg", 2, 128, True), ("lcg", 8, 128, True), ("prose", 2, 8, False)):
+            cells.append(f"{rn} G{G} R{ring} {evaluate(q, stream_cfg(G, ring, bor, **cfg_over), 4096, rn)['pp']:6.1f}")
+        print(f"   {label:62} " + ", ".join(cells))
+    return res
+
+
 # ============================================================================ uncalibrated terms
 
 SWEEP = ("BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt"
@@ -2240,33 +2873,48 @@ def uncal_rows(p):
         sw.append(f"P {P}: union {a['union']:.1f} (prop {b['union']:.1f}), wait {a['wait']:.1f}, enqueue {a['enqueue']:.1f},"
                   f" card_in {a['card_in']:.1f}")
     t = evaluate(p, step_cfg({"b1": True, "tile": True}), 512, "prose")["agg"]
-    tlo = evaluate(p.but(t_tile_T=C["t_tile_T"].lo), step_cfg({"b1": True, "tile": True}), 512, "prose")["agg"]
-    thi = evaluate(p.but(t_tile_T=C["t_tile_T"].hi), step_cfg({"b1": True, "tile": True}), 512, "prose")["agg"]
+    tlo = evaluate(p.but(t_tile_ab=C["t_tile_ab"].lo), step_cfg({"b1": True, "tile": True}), 512, "prose")["agg"]
+    thi = evaluate(p.but(t_tile_ab=C["t_tile_ab"].hi), step_cfg({"b1": True, "tile": True}), 512, "prose")["agg"]
     return [
         ("the card-bound clock (clk_cardbound)", "the route and the per-chunk shadow 1.124x slower when the card is busy"
          " most of the wall (the prose prompt against lcg, same binary); central predictions leave it out, the band carries"
          " it at the cell's duty", "the SM clock sampled through one prose prompt (nvidia-smi --query-gpu=clocks.sm"
          " -lms 20 beside generate_ds41 under the lease; no runner arm yet), or the card-timing stat line of the T A/B",
          "~1,810 MHz under the prose prompt against ~2,030 on lcg (2,030 / 1.124), if the clock is the cause", "3"),
-        ("t_tile_T (cardtile)", "44.97 us a (card expert, 8-column tile) item, from cardnext's lcg 5.3 ms a layer-batch",
-         "the T landing A/B's stat line on the prose prompt (card_in)", f"card_in {t['card_in']:.1f} ms a layer-batch"
-         f" (band {tlo['card_in']:.1f}-{thi['card_in']:.1f})", "0 on top of the T A/B"),
+        ("GT's L2 spill (cardtile, prose)", "a GT row-tile sweep over more than L2 re-reads every activation column from DRAM"
+         " (l2_miss 'lru'): 3.5 ms a prose layer-batch at P 512, which with the m mix closes card_in to -0.8 % (T's A/B);"
+         " random replacement reads 21.1 instead of 23.1", "ncu on one full prose layer's GT and DT (cardinread's"
+         " gtdram.card: dram__bytes_read and gpu__time_duration), or bundle it into the gtocc sitting",
+         f"GT dram__bytes_read 2.7-3.5 GB on a full layer if the sweep re-reads, 0.57 GB if L2 holds it; card_in"
+         f" {t['card_in']:.1f} ms a layer-batch (t_tile_ab band {tlo['card_in']:.1f}-{thi['card_in']:.1f})", "3"),
+        ("the five-dispatch union from P 512 to P 4096", "the model's +0.65 ms a layer-batch against +1.1-1.4 measured in"
+         " three leases: the CED tail's small-T calls or a sustained-load host term (20 s of union at P 4096, 3 s at"
+         " P 512)", "BLOOMERY_CED=off at P 512 and P 4096, lcg, no hot list, one lease, BLOOMERY_STEP_STATS=1 (every"
+         " layer-batch is T 512 at both P)", f"union {evaluate(p, dict(CONFIGS['PG1'], ced=False), 512)['agg']['union']:.2f}"
+         " ms a layer-batch at both P: equal = the CED tail's small calls; P 4096 +1 ms = the sustained-load term", "8"),
         ("union T-scaling (union-T)", f"X_u {union_anchor(p, DEFAULT_ANCHORS)['x'] * 1000:.2f} us a host slot on top of the"
          " causes; S15 P 384 reads below the kernel sum's slope", SWEEP, "; ".join(sw) + " (ms a layer-batch, CED off so"
          " T = P)", "5: four arms, one round"),
         ("small_bytes_tok (B1)", "780 kB a token for B1's batch-wide small kernels (HC_PRE on the branch)",
          "the nsys prefill form after B1 lands", "0.4-0.8 ms a layer-batch at T 512", "5 (warm load, one prompt)"),
-        ("dram_eff, fill_crossings, fill_steal", "126 GB/s ceiling, 3 crossings of 26.3 GB/s, 4 % of the union's cores",
+        ("dram_eff, fill_crossings, fill_steal", "126 GB/s ceiling, 3 crossings of 26.3 GB/s, 4 % of the union's cores;"
+         " the fill keeps its rate and the union takes the room left",
          "the DRAM probe: bench_v41_host union5:4x8u0.125 beside two fill threads and a 26 GB/s pinned reader"
          " (hoststream-design-report.md:144-146; the bench has no such arm yet)",
-         "the fill holds >= 26.3 GB/s and the union slows 4-10 %", "5, no GPU"),
-        ("stream_gcol, stream_gfix", "3.0 us a column and 28 us an expert", "just bench-gpu-kernels with a grouped arm"
-         " at ~60 columns an expert (no such arm yet)", "20-40 us + 1.5-5 us a column; the card binds at G8", "3"),
-        ("prose routing past 512 tokens (prose_swap, prose_phi)", "the P 512 prompt's card capture and host spread,"
-         " carried to every batch of a longer prompt", "a prose prompt of 4,096 ids through time-gate.sh with"
-         " BLOOMERY_STEP_STATS=1 (union_host_slots and union_lb per batch)", "union"
-         f" {evaluate(p, dict(CONFIGS['B1prose'], _clk=p['clk_cardbound']), 4096, 'prose')['agg']['union']:.1f} ms a"
-         " layer-batch at P 4096", "5"),
+         "union ~81 GB/s alone; beside the fill it runs at 0.58 of its speed (+72 %) if the pair is capped at 126 GB/s;"
+         " the design report's '4-10 %' holds only if the pair's ceiling is >= ~150 GB/s", "5, no GPU"),
+        ("the streamed experts' card cost (sgemm tile)", "a streamed expert costs card_tile_us's items per batch (its m"
+         " mix: a cold expert's m 1-3 items issue half an lcg item's instructions, below any measured mix) and GT's spill"
+         " for a launch over min(ring, k) experts (none at R8)", "a streamed arm's card work (no such arm yet: step 2's"
+         " DEMOTE gate run under BLOOMERY_STEP_STATS=1)", "lcg G 8 R8: ~82 ms of streamed items a layer of a group of 8",
+         "0 on top of step 2"),
+        ("stream_gcol, stream_gfix (sgemm gemm only)", "3.0 us a column and 28 us an expert", "just bench-gpu-kernels with a"
+         " grouped arm at ~60 columns an expert (no such arm yet)", "20-40 us + 1.5-5 us a column", "3"),
+        ("prose routing past 512 tokens (prose_swap_4096, prose_phi_4096)", "the P 4096 prompt's aggregate capture and"
+         " spread, one value for all eight batches; phi_4096 0.38 sits under phi_five's band (0.39-0.59): the longer"
+         " prompt's batches spread over fewer host experts, or the swap's rank shift puts other experts on the card",
+         "union_host_slots and union_lb per batch in the stat line (no such split yet) on the cardtile lease's prose 4096"
+         " arm", "per-batch host slots 1,305 (batch 0, P 512's) rising to ~1,480 a layer-batch mean", "5"),
         ("router_tok, copy_gbs", "15.1 us, 15 GB/s: only the pre-ds41bulk / pre-hostserve rows read them",
          "none: both paths are gone from main", "S14 implies router_tok ~20 us", "0"),
     ]
@@ -2430,6 +3078,44 @@ def self_test():
     w1 = evaluate(p, step_cfg({"b1": True, "G": 1, "wrap": True}), 4096)["pp"]
     s1 = evaluate(p, step_cfg({"b1": True}), 4096)["pp"]
     check("the wrap order at G 1 is today's order", abs(w1 - s1) < 1e-9, f"{w1:.3f} vs {s1:.3f}")
+    # host streaming (stream_report); the wrap pins are model values, not measurements: first the values before the
+    # wrap was split into layer steps (266.2 ... 395.2), re-pinned after the flowg recalibration (the union's X_u
+    # from today's code, the prose P 4096 routing, T's items with the m mix and the L2 spill)
+    pins = {("lcg", 2): 260.9, ("lcg", 4): 260.6, ("lcg", 8): 260.1, ("prose", 2): 376.0, ("prose", 4): 374.4,
+            ("prose", 8): 372.4}
+    got = {key: evaluate(p, stream_cfg(key[1]), 4096, key[0])["pp"] for key in pins}
+    check("the wrap as layer steps keeps B1+T+G at P 4096 (lcg 260.9/260.6/260.1, prose 376.0/374.4/372.4 at G 2/4/8)",
+          all(abs(got[key] - v) < 0.05 for key, v in pins.items()), " ".join(f"{v:.1f}" for v in got.values()))
+    k0 = evaluate(p, stream_cfg(2, 8, krule=0), 4096)["pp"]
+    check("the wrap with a ring and k 0 is the wrap alone", abs(k0 - got[("lcg", 2)]) < 1e-9, f"{k0:.3f}")
+    inf = p.but(pcie_pinned=1e12, t_tile_ab=0.0)
+    ra = evaluate(inf, stream_cfg(2, 8, krule=384), 4096)
+    check("every host expert streamed over an infinite PCIe leaves no union (G 2 wrap)",
+          sum(x["union"] for x in ra["recs"]) < 1e-9, f"{sum(x['union'] for x in ra['recs']):.3g} ms")
+    check("expert bytes: 18,247,680 on the Q5_K layers 0-1, 16,773,120 elsewhere (facts.md:9-13)",
+          (expert_bytes_stream(p, 0), expert_bytes_stream(p, 1), expert_bytes_stream(p, 2)) == (18247680, 18247680, 16773120))
+    check("group bytes: (sets - 1) sets, G + 1 from 2 on; G 2 = its load line's 238,191,200 B; G 1 leaves 1,020,264,448 free",
+          group_bytes(p, 1) == 0 and group_bytes(p, 2) == 238191200 and group_bytes(p, 8) == 8 * group_bytes(p, 2) / 2
+          and p["vram_free_g1"] == 1020264448)
+    check("T's cost function at its calibration: cardnext's 117.9 items over 694 slots read t_tile_ab an item",
+          abs(tile_compute_us(p, p["tile_cal_tiles"], p["tile_cal_slots"]) / p["tile_cal_tiles"] - p["t_tile_ab"]) < 1e-9)
+    lcg_over = [tile_parts(p, CONFIGS["B1"], routing_lcg(p, h), 512, 1.0)[4] for h in (True, False)]
+    pr_over = tile_parts(p, CONFIGS["CT"], routing_prose(p, 512), 512, 1.0)[4]
+    check("GT's sweep set: under L2 on every lcg layer-batch (hot list or not), over it on most prose ones",
+          lcg_over == [0, 0] and pr_over >= 30, f"lcg {lcg_over}, prose {pr_over} of 38")
+    for P, want in ((512, 52189), (4096, 325368)):
+        cfg, rn = row_cfg(p, "CT", {"rt": "prose"})
+        got = evaluate(p, cfg, P, rn)["agg"]["host_slots"]
+        check(f"the prose routing reproduces the cardtile lease's host slots at P {P} ({want:,}, 0.1 %)",
+              abs(got - want) / want < 1e-3, f"{got:.0f}")
+    cfg, rn = row_cfg(p, "CT", {"rt": "prose"})
+    ce, cx = evaluate(p, cfg, 512, rn)["agg"]["entries"], evaluate(p, dict(cfg, tile=False), 512, rn)["agg"]["entries"]
+    check("the tile arm issues two more launches a card layer-batch: entries 985.3 against the expert arm's 983.4 at P 512",
+          abs(ce - 985.3) < 0.05 and abs(cx - 983.4) < 0.05, f"{ce:.1f}, {cx:.1f}")
+    lc, cf = routing_lcg(p), step_cfg(STREAM_BASE)
+    ks = [rule_k(p, cf, lc, 2, [512] * G, U, "serial") for G in (1, 2, 4)]
+    check("lcg's uniform host experts: none beats PCIe serially at G 1-2, all 314 at G 4 (2 E[t] < 638 us < 4 E[t])",
+          ks[0] == 0 and ks[1] == 0 and abs(ks[2] - lc.n_host(2)) < 1e-6, str(ks))
     print(f"self-test: {len(fails)} failed")
     return fails
 
@@ -2444,6 +3130,7 @@ def main():
     ap.add_argument("--explain", metavar="ROW")
     ap.add_argument("--uncalibrated", action="store_true")
     ap.add_argument("--cells", action="store_true", help="B1, B1+T, B1+G, B1+T+G per cell and the IMMA shadow over T")
+    ap.add_argument("--stream", action="store_true", help="host streaming after B1 + T: G, ring, bytes, timeline, DRAM")
     args = ap.parse_args()
     rc = 0
     if args.self_test:
@@ -2458,7 +3145,9 @@ def main():
         uncalibrated()
     if args.cells:
         cells()
-    if not any((args.self_test, args.backtest, args.predict, args.explain, args.uncalibrated, args.cells)):
+    if args.stream:
+        stream_report()
+    if not any((args.self_test, args.backtest, args.predict, args.explain, args.uncalibrated, args.cells, args.stream)):
         ap.print_help()
     return rc
 
