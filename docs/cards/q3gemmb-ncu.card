@@ -1,0 +1,20 @@
+# Round q3gemmb landed at +10.8 % pp4096 against a card band of +18..+24 % (rig-log 09-26#q3gemmb-ab).
+# Two terms can carry the miss: the kernel (the q3gemmlat CPI model read gemm_q4k's T = 4096 launch at
+# x1.49-1.52 fewer cycles) or the window share the report's section G gave it. This run reads the
+# kernel alone: its elapsed cycles under the gemm form against the pre-landing 2,190,925 (rig-log
+# 09-26#q3gemma-ab, same form, same arm) divided by the model's factor [derived].
+kind: profile
+question: is gemm_q4k's T = 4096 launch as short as the instructions-times-CPI model says after
+  q3gemmb, so that the window share (section G) carries the miss, or did the CPI term overstate it?
+term: Elapsed Cycles (sm__cycles_elapsed) of one gemm_q4k launch of the gemm_q4k_moe_t4096 arm, the
+  median of two profiled launches, A6000, the gemm form's base clock
+unit: M cycles
+predict: 1.44..1.47
+condition: BLOOMERY_NCU_SOURCE=1 BLOOMERY_NCU_COUNT=2 just ncu-gpu-gemm under the lease on main
+  after q3gemmb (ccdd3dc or a descendant with gemm.rs unchanged); the same arm and skip as the
+  pre-landing run; the source page is kept for the stall-per-instruction reading
+decide-in: the kernel is as modeled: re-derive the window share of gemm_q4k from a P = 4096 nsys
+  before the next GEMM round, and correct section G's dilution in the design report
+decide-below: faster than modeled: the same, and the model's CPI is conservative; note it
+decide-above: the CPI term overstated the cut: read the source page's stalls per instruction on the
+  step path and name the instructions that did not shorten, before any further GEMM round

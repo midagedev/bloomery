@@ -32,7 +32,7 @@
 # and the top stall reasons (medians over the collected launches). The profile runs under
 # BLOOMERY_ARM_BOUND seconds (default 900). BLOOMERY_DRY=1 prints the command line and exits before
 # the binary check and the lease; the depth form has no dry path and refuses the variable.
-# BLOOMERY_NCU_SOURCE=1 (this form only; unset is the form above) adds the per-instruction view: the
+# BLOOMERY_NCU_SOURCE=1 (this form and q3pp; unset is the form above) adds the per-instruction view: the
 # sections SourceCounters (sampled warp stalls per SASS instruction), ComputeWorkloadAnalysis (the
 # pipes' active cycles), InstructionStats and SchedulerStats beside BLOOMERY_NCU_SECTIONS, keeps the
 # report as <out>.ncu-rep, and after the run prints its source page — SASS with the counters per
@@ -61,6 +61,50 @@
 # reasons. Sections SpeedOfLight, LaunchStats, Occupancy (BLOOMERY_NCU_SECTIONS) and the metrics in
 # DS41PP_METRICS; BLOOMERY_ARM_BOUND bounds the profile. The card is full, so before a profiled launch's
 # first pass ncu saves every device allocation to host memory: this form's prompt runs for minutes.
+#
+# The Qwen3 prompt form (BLOOMERY_NCU_FORM=q3pp, `just ncu-gpu-qwen3-pp [P] [LAYER] [KERNEL]`): one launch
+# of KERNEL (BLOOMERY_NCU_KERNEL, default gqa_prefill_flash) in layer LAYER (BLOOMERY_NCU_LAYER, default 24)
+# of a P-token prompt (BLOOMERY_NCU_PROMPT, default 4096), profiled in the process tools/ref/depth-qwen3moe.sh's
+# `<P>` arm runs: generate_qwen3moe --tokens <lcg_prompt P> --ctx C, C = P + BLOOMERY_DECODE_N (default 96)
+# rounded up to 256 as there (or BLOOMERY_GEN_CTX), with -n 1 — the smallest the binary takes — and no
+# --time, which -n 1 refuses and the prefill path does not read. The skip is derived from the code, not
+# read from a trace: tools/ref/q3pp.py plan reads the launch order's terms from the source tree the binary
+# was built from and the layer and head counts from the model file, and refuses by name when a line it
+# reads is gone. For gqa_prefill_flash (the one kernel its table holds; another is refused by name):
+#   - before the prompt, 0 launches: load_full only loads the module (arch/qwen3moe/body.rs Ubatch::new,
+#     flash_gqa_prefill.rs FlashGqaPrefill::load); graph mode's capture_step and capture_prefill record
+#     graphs and execute nothing (graph.rs Graph::capture), and a captured pass attends through the decode
+#     flash (arch/qwen3moe/dispatch.rs k.flash.enqueue_pass, the gqa_flash_seg kernels). A whole-process nsys
+#     trace of main's binary agrees: its first kernel is embed_rows_q4k, and it holds 48 gqa_prefill_flash
+#     launches at P = 4096, none in a graph, the first at kernel index 8 (layer 0's ninth launch);
+#   - the prompt runs as PrefillPlan::new(P, Auto, U) (arch/qwen3moe/prefill.rs): ubatches of U =
+#     BLOOMERY_QWEN3_UBATCH, else UBATCH = GEMM_MAX_SLOTS / N_USED = 4096, then a tail of at most
+#     MAX_TOKENS as a pass (the decode flash) or a longer tail as one more ubatch;
+#   - each ubatch launches it once per layer, layers in order (ubatch.rs Ubatch::enqueue -> attention);
+# so the skip is K x n_layer + LAYER and the count 1, K the ubatch profiled (BLOOMERY_NCU_UNIT, default the
+# last). At P = 4096 and U = 4096: skip 24, grid ceil(4096 / 8) x 4 key heads = 2,048 blocks of 128 threads.
+# The grid does not depend on the ubatch's first position, so the proof is the tensor pipe's count: 128
+# HMMA per key tile a warp is live on, summed over the grid (34,078,720 at P = 4096 [derived]). The summary
+# checks, before any table, the run's `load` line (layers, ubatch, ctx, ubatch_attn), its `step 0` plan
+# against the derived plan, one profiled launch of the plan's name, grid and block, and that count; a
+# mismatch is rc 3 and no table. At P <= U every layer's launch has the same shape and work, so the counters
+# prove the ubatch and its position, not the layer: the layer rests on the zero before the prompt.
+# The clock is the card's own (--clock-control none, where the other forms fix it at base), because the
+# question is the step under the 300 W cap; the summary prints sm__cycles_elapsed.avg.per_second. Kernel
+# replay idles the card between passes, so a clock well above the prompt's (1.46-1.55 GHz [derived,
+# docs/research/q3tail-design-report.md 3.2]) means the replay ran uncapped: then only the cycle figures
+# carry, and its microseconds are not records in any case (ncu serializes and replays). Sections
+# SpeedOfLight WarpStateStats SchedulerStats ComputeWorkloadAnalysis Occupancy LaunchStats
+# (BLOOMERY_NCU_SECTIONS) and `q3pp.py metrics` (the tensor pipe, issue, every pipe's count, L2 and DRAM
+# bytes, every stall reason ga102 lists); BLOOMERY_NCU_SOURCE=1 adds SourceCounters and InstructionStats and
+# the source page as in the gemm form. The summary prints the clock, the elapsed cycles, the block-steps
+# (key tiles walked) an SM and the list schedule of the deepest-first grid over the resident slots, each
+# unit's demand in the step's SM cycles beside it, the sum and max models of the tail design, and the stall
+# composition with that design's four tests as numbers. BLOOMERY_NCU_BIN=<absolute path> profiles another
+# tree's generate_qwen3moe (the plan reads that tree's source): its sha256 goes into the witness, and the
+# freshness check covers this tree's binary only. BLOOMERY_NCU_SKIP and BLOOMERY_NCU_COUNT are refused
+# (the form derives both). BLOOMERY_DRY=1 prints the derivation and the command line and exits before the
+# lease.
 set -uo pipefail
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
@@ -123,9 +167,46 @@ case $FORM in
   generate)
     [ -z "$DRY" ] || { echo "ncu-gpu.sh: BLOOMERY_DRY is read by the gemm and ds41pp forms only; the depth form has no dry path" >&2; exit 64; }
     ;;
-  gemm | ds41pp) ;;
-  *) echo "ncu-gpu.sh: BLOOMERY_NCU_FORM is generate, gemm or ds41pp, got '$FORM'" >&2; exit 64 ;;
+  gemm | ds41pp | q3pp) ;;
+  *) echo "ncu-gpu.sh: BLOOMERY_NCU_FORM is generate, gemm, ds41pp or q3pp, got '$FORM'" >&2; exit 64 ;;
 esac
+
+# BLOOMERY_NCU_SOURCE=1 (the gemm and q3pp forms): the report kept as <out>.ncu-rep, and after the run,
+# GPU-free, its details page (only when the live CSV is empty) and its source page.
+source_parse() {
+  SOURCE=${BLOOMERY_NCU_SOURCE:-}
+  case $SOURCE in
+    '' | 1) ;;
+    *) echo "ncu-gpu.sh: BLOOMERY_NCU_SOURCE is 1 or unset, got '$SOURCE'" >&2; exit 64 ;;
+  esac
+}
+# source_setup <out>: export_args for the profile command, DETAILS_CMD and SOURCE_CMD for after it.
+source_setup() {
+  export_args=()
+  [ -z "$SOURCE" ] || export_args=(--export "$1.ncu-rep" --force-overwrite)
+  DETAILS_CMD=("$NCU" --import "$1.ncu-rep" --csv --page details)
+  SOURCE_CMD=("$NCU" --import "$1.ncu-rep" --page source --print-source sass --csv)
+}
+source_dry() {
+  [ -n "$SOURCE" ] || return 0
+  echo "[dry] then, when $1.csv is empty: ${DETAILS_CMD[*]} > $1.csv"
+  echo "[dry] then: ${SOURCE_CMD[*]} > $1.source.csv"
+}
+# source_pages <out>: the two pages after the run; a failure sets rc when the run's own rc is 0.
+source_pages() {
+  local src_rc
+  [ -n "$SOURCE" ] || return 0
+  if [ -s "$1.ncu-rep" ]; then
+    [ -s "$1.csv" ] || "${DETAILS_CMD[@]}" > "$1.csv" 2>> "$1.txt"
+    "${SOURCE_CMD[@]}" > "$1.source.csv" 2>> "$1.txt"
+    src_rc=$?
+    echo "[source] rc=$src_rc lines=$(wc -l < "$1.source.csv") report=$1.ncu-rep page=$1.source.csv"
+    [ $src_rc -eq 0 ] || [ "$rc" -ne 0 ] || rc=$src_rc
+  else
+    echo "[source] no report at $1.ncu-rep"
+    [ "$rc" -ne 0 ] || rc=3
+  fi
+}
 
 if [ "$FORM" = gemm ]; then
   GEMM_BIN=${BLOOMERY_NCU_GEMM_BIN:-target/release/gate_p8}
@@ -133,12 +214,8 @@ if [ "$FORM" = gemm ]; then
   GEMM_KERNELS=${BLOOMERY_NCU_KERNELS:-^gemm_q4k}
   GEMM_SKIP=${BLOOMERY_NCU_SKIP:-64}
   GEMM_SECTIONS=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight WarpStateStats MemoryWorkloadAnalysis}
-  SOURCE=${BLOOMERY_NCU_SOURCE:-}
-  case $SOURCE in
-    '') ;;
-    1) GEMM_SECTIONS="$GEMM_SECTIONS SourceCounters ComputeWorkloadAnalysis InstructionStats SchedulerStats" ;;
-    *) echo "ncu-gpu.sh: BLOOMERY_NCU_SOURCE is 1 or unset, got '$SOURCE'" >&2; exit 64 ;;
-  esac
+  source_parse
+  [ -z "$SOURCE" ] || GEMM_SECTIONS="$GEMM_SECTIONS SourceCounters ComputeWorkloadAnalysis InstructionStats SchedulerStats"
   BOUND=${BLOOMERY_ARM_BOUND:-900}
   # The pipe metrics the summary names, in its order: the L1TEX unit's throughput; the LSU data-pipe
   # wavefronts (every global and shared access the unit's data stage serves) and the shared-memory
@@ -164,25 +241,17 @@ if [ "$FORM" = gemm ]; then
   list=$GEMM_METRICS
   for s in $STALLS; do list="$list,smsp__warp_issue_stalled_${s}_per_warp_active"; done
   out="$OUTDIR/ncu-gemm-${GEMM_ARM}-$(date -u +%H%M%S)"
-  export_args=()
-  [ -z "$SOURCE" ] || export_args=(--export "$out.ncu-rep" --force-overwrite)
+  source_setup "$out"
   CMD=(timeout --kill-after=10 "$BOUND" "$NCU" --target-processes application-only --clock-control base
        --launch-skip "$GEMM_SKIP" --launch-count "$COUNT"
        --kernel-name "regex:$GEMM_KERNELS" --kernel-name-base function
        "${sec_args[@]}" --metrics "$list" --csv --log-file "$out.csv"
        ${export_args[@]+"${export_args[@]}"}
        "$GEMM_BIN" --bench-kernels --bench-arm "$GEMM_ARM")
-  # GPU-free, after the run: the report's details page (only when the live CSV is empty) and its
-  # source page.
-  DETAILS_CMD=("$NCU" --import "$out.ncu-rep" --csv --page details)
-  SOURCE_CMD=("$NCU" --import "$out.ncu-rep" --page source --print-source sass --csv)
   if [ -n "$DRY" ]; then
     echo "[dry] form=gemm bin=$GEMM_BIN arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES source=${SOURCE:-off}"
     echo "[dry] ${CMD[*]}"
-    if [ -n "$SOURCE" ]; then
-      echo "[dry] then, when $out.csv is empty: ${DETAILS_CMD[*]} > $out.csv"
-      echo "[dry] then: ${SOURCE_CMD[*]} > $out.source.csv"
-    fi
+    source_dry "$out"
     exit 0
   fi
   assert_fresh_binary "$GEMM_BIN" || exit $?
@@ -200,18 +269,7 @@ if [ "$FORM" = gemm ]; then
   witness post
   echo "[rc] $rc"
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
-  if [ -n "$SOURCE" ]; then
-    if [ -s "$out.ncu-rep" ]; then
-      [ -s "$out.csv" ] || "${DETAILS_CMD[@]}" > "$out.csv" 2>> "$out.txt"
-      "${SOURCE_CMD[@]}" > "$out.source.csv" 2>> "$out.txt"
-      src_rc=$?
-      echo "[source] rc=$src_rc lines=$(wc -l < "$out.source.csv") report=$out.ncu-rep page=$out.source.csv"
-      [ $src_rc -eq 0 ] || [ $rc -ne 0 ] || rc=$src_rc
-    else
-      echo "[source] no report at $out.ncu-rep"
-      [ $rc -ne 0 ] || rc=3
-    fi
-  fi
+  source_pages "$out"
   if [ -s "$out.csv" ]; then
     echo "--- summary (median over the collected launches; the durations are not numbers of record). Raw: $out.csv"
     lease_bounded "$LEASE_ARM_BOUND" python3 - "$out.csv" <<'PY'
@@ -377,6 +435,128 @@ if [ "$FORM" = ds41pp ]; then
   elif [ -s "$out.csv" ]; then
     echo "--- summary. Raw: $out.csv, the plan $out.plan, the run $out.txt"
     lease_bounded "$LEASE_ARM_BOUND" python3 "$PP" ncu-summary "$out.csv" "$out.plan" "$MODEL"
+    prc=$?
+    [ $prc -eq 0 ] || [ $rc -ne 0 ] || rc=$prc
+  else
+    echo "[summary] no CSV at $out.csv"
+    [ $rc -ne 0 ] || rc=3
+  fi
+  echo "[lease] released at $(now)"
+  exit $rc
+fi
+
+if [ "$FORM" = q3pp ]; then
+  [ "$MODEL_NAME" = qwen3moe ] || { echo "ncu-gpu.sh: the q3pp form profiles generate_qwen3moe; the profile is '$MODEL_NAME' (BLOOMERY_MODEL=qwen3moe)" >&2; exit 64; }
+  Q3=${BASH_SOURCE[0]%/*}/q3pp.py
+  P=${BLOOMERY_NCU_PROMPT:-4096}
+  LAYER=${BLOOMERY_NCU_LAYER:-24}
+  KERNEL=${BLOOMERY_NCU_KERNEL:-gqa_prefill_flash}
+  UNIT=${BLOOMERY_NCU_UNIT:-}
+  UB=${BLOOMERY_QWEN3_UBATCH:-}
+  DEPTH_N=${BLOOMERY_DECODE_N:-96}
+  # whole <name> <value> [optional]: a whole number, or refused by name; an optional one may be empty.
+  whole() {
+    case $2 in
+      '') [ -n "${3:-}" ] || { echo "ncu-gpu.sh: $1 is empty" >&2; exit 64; } ;;
+      *[!0-9]* | 0[0-9]*) echo "ncu-gpu.sh: $1 is a whole number, got '$2'" >&2; exit 64 ;;
+    esac
+  }
+  whole BLOOMERY_NCU_PROMPT "$P"
+  whole BLOOMERY_NCU_LAYER "$LAYER"
+  whole BLOOMERY_DECODE_N "$DEPTH_N"
+  whole BLOOMERY_NCU_UNIT "$UNIT" optional
+  whole BLOOMERY_QWEN3_UBATCH "$UB" optional
+  whole BLOOMERY_GEN_CTX "${BLOOMERY_GEN_CTX:-}" optional
+  [ "${BLOOMERY_GEN_CTX:-1}" != 0 ] || { echo "ncu-gpu.sh: BLOOMERY_GEN_CTX is a cache height, got 0" >&2; exit 64; }
+  case $KERNEL in '' | *[!A-Za-z0-9_]*) echo "ncu-gpu.sh: BLOOMERY_NCU_KERNEL is a kernel's entry name, got '$KERNEL'" >&2; exit 64 ;; esac
+  if [ -n "${BLOOMERY_NCU_SKIP:-}${BLOOMERY_NCU_COUNT:-}" ]; then
+    echo "ncu-gpu.sh: the q3pp form derives its launch skip and profiles one launch; BLOOMERY_NCU_SKIP='${BLOOMERY_NCU_SKIP:-}' BLOOMERY_NCU_COUNT='${BLOOMERY_NCU_COUNT:-}' are refused (pick the launch with BLOOMERY_NCU_LAYER and BLOOMERY_NCU_UNIT)" >&2
+    exit 64
+  fi
+  CTX=${BLOOMERY_GEN_CTX:-$(((P + DEPTH_N + 255) / 256 * 256))}
+  # The binary, and the source tree its plan is read from.
+  if [ -n "${BLOOMERY_NCU_BIN:-}" ]; then
+    GEN=$BLOOMERY_NCU_BIN
+    case $GEN in /*/target/*) ;; *) echo "ncu-gpu.sh: BLOOMERY_NCU_BIN is an absolute path under a tree's target/, got '$GEN'" >&2; exit 64 ;; esac
+    [ -x "$GEN" ] || { echo "ncu-gpu.sh: no binary at BLOOMERY_NCU_BIN=$GEN" >&2; exit 2; }
+    SRC=${GEN%%/target/*}
+    LABEL=${SRC##*/}
+    # shellcheck disable=SC2034 # BIN_PATH and BIN_MTIME are read by timing-card.sh's witness_card
+    BIN_PATH=$GEN BIN_SHA=$(sha256sum "$GEN" | cut -c1-12) BIN_MTIME=$(date -u -r "$GEN" +%Y-%m-%dT%H:%M:%SZ)
+    WHICH="another tree's ($SRC; freshness not asked) sha256=$BIN_SHA mtime=$BIN_MTIME"
+  else
+    GEN=target/release/generate_qwen3moe
+    SRC=$PWD
+    LABEL=this
+    WHICH="this tree's (freshness checked before the lease)"
+  fi
+  Q3_SECTIONS=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight WarpStateStats SchedulerStats ComputeWorkloadAnalysis Occupancy LaunchStats}
+  source_parse
+  [ -z "$SOURCE" ] || Q3_SECTIONS="$Q3_SECTIONS SourceCounters InstructionStats"
+  BOUND=${BLOOMERY_ARM_BOUND:-900}
+  out="$OUTDIR/ncu-q3pp-${KERNEL}-p${P}-l${LAYER}-${LABEL}-$(date -u +%H%M%S)"
+  sec_args=()
+  for s in $Q3_SECTIONS; do sec_args+=(--section "$s"); done
+  list=$(python3 "$Q3" metrics) || exit $?
+  source_setup "$out"
+  plan_args=("$MODEL" "$SRC" "$P" "$LAYER" "$KERNEL")
+  opt_args=(--ctx "$CTX")
+  [ -z "$UB" ] || opt_args+=(--ubatch "$UB")
+  [ -z "$UNIT" ] || opt_args+=(--unit "$UNIT")
+  # The command for a launch skip and a prompt, into CMD.
+  q3_cmd() {
+    CMD=(timeout --kill-after=10 "$BOUND" "$NCU" --target-processes application-only --clock-control none
+         --launch-skip "$1" --launch-count 1
+         --kernel-name "regex:^${KERNEL}\$" --kernel-name-base function
+         "${sec_args[@]}" --metrics "$list" --csv --log-file "$out.csv"
+         ${export_args[@]+"${export_args[@]}"}
+         "$GEN" --tokens "$2" -n 1 --ctx "$CTX")
+  }
+  if [ -n "$DRY" ]; then
+    echo "[dry] form=q3pp kernel=$KERNEL P=$P layer=$LAYER unit=${UNIT:-last} ctx=$CTX ubatch=${UB:-<UBATCH of the source>} bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES source=${SOURCE:-off}"
+    if [ -n "${BLOOMERY_NCU_BIN:-}" ]; then
+      echo "[dry] bin=$GEN: $WHICH"
+    elif [ -x "$GEN" ]; then
+      echo "[dry] bin=$GEN: $WHICH sha256=$(sha256sum "$GEN" | cut -c1-12)"
+    else
+      echo "[dry] bin=$GEN: $WHICH, not built yet (the recipe builds it outside a dry run)"
+    fi
+    plan=$(mktemp)
+    python3 "$Q3" plan "${plan_args[@]}" "$plan" "${opt_args[@]}"
+    prc=$?
+    SKIP=$(sed -n 's/^skip=//p' "$plan")
+    rm -f "$plan"
+    [ $prc -eq 0 ] || exit $prc
+    q3_cmd "$SKIP" "<lcg_prompt $P>"
+    echo "[dry] ${CMD[*]}"
+    source_dry "$out"
+    exit 0
+  fi
+  if [ -z "${BLOOMERY_NCU_BIN:-}" ]; then assert_fresh_binary "$GEN" || exit $?; fi
+  [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
+  [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
+  mkdir -p "$OUTDIR"
+  python3 "$Q3" plan "${plan_args[@]}" "$out.plan" "${opt_args[@]}" || exit $?
+  SKIP=$(sed -n 's/^skip=//p' "$out.plan")
+  q3_cmd "$SKIP" "$(lcg_prompt "$P")"
+  # shellcheck disable=SC2034 # read by lease.sh's witness()
+  WITNESS=(head-open indent card model)
+  lease_take
+  echo "[config] ncu=$($NCU --version | sed -n 3p) form=q3pp kernel=$KERNEL P=$P layer=$LAYER skip=$SKIP count=1 ctx=$CTX clock-control=none bound=${BOUND}s"
+  echo "[config] profiled binary: $GEN, $WHICH"
+  echo "[config] sections='$Q3_SECTIONS' out=$out"
+  witness pre
+  guard_other
+  t0=$(date +%s)
+  "${CMD[@]}" > "$out.txt" 2>&1
+  rc=$?
+  witness post
+  echo "[rc] $rc wall $(($(date +%s) - t0))s"
+  [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
+  source_pages "$out"
+  if [ -s "$out.csv" ]; then
+    echo "--- summary. Raw: $out.csv, the plan $out.plan, the run $out.txt"
+    lease_bounded "$LEASE_ARM_BOUND" python3 "$Q3" summary "$out.csv" "$out.plan" "$out.txt"
     prc=$?
     [ $prc -eq 0 ] || [ $rc -ne 0 ] || rc=$prc
   else

@@ -1,0 +1,23 @@
+# The one term the q3tail design leaves open (docs/research/q3tail-design-report.md 3.2 and 4): which
+# of its two readings holds for gqa_prefill_flash's step. One sitting, two runs of the q3pp form
+# (main's binary, then q3fa's through BLOOMERY_NCU_BIN). The band is the tail design's tensor demand
+# at full rate over the step it measured [derived]; the stall composition then names the reading.
+kind: profile
+question: in one gqa_prefill_flash launch (layer 24 of a P = 4096 Qwen3 prompt, one ubatch), is the
+  step a lockstep of the two co-resident blocks' HMMA phases, a per-warp dependency chain, an
+  instruction-cache miss, or a tensor pipe at half rate?
+term: the tensor pipe's active share (smsp__pipe_tensor_op_hmma_cycles_active, % of peak) of that
+  launch under ncu at the card's own clock, A6000 300 W, with the stall composition beside it
+unit: %
+predict: 56..60
+condition: just ncu-gpu-qwen3-pp 4096 24 under the lease, A6000, --clock-control none; the summary's
+  proof passes (the run's load and step 0 plan lines, one launch of grid 2,048 x 128 and 34,078,720
+  HMMA), else the run is void; the clock line is read first, and above ~1.65 GHz only the cycle
+  figures carry
+decide-in: read the stall composition: math_pipe_throttle >= 25 % opens FS (the stagger); short_scoreboard
+  + wait above every other reason keeps FA alone; no_instruction > 10 % puts the loop body's size ahead
+  of both
+decide-below: the tensor pipe idles more than the sum model allows: write the step's other terms from
+  the demand table (barrier, the smem pipe) before any flash round
+decide-above: past 90 % the full-rate reading was wrong: FA predicts about 0, re-derive the flash row of
+  the ladder before opening it

@@ -229,6 +229,19 @@ ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
 ncu-gpu-ds41-pp P='512':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
 
+# The Qwen3 prompt's counters (ncu, A6000, under the lease, lead-only): one KERNEL launch (gqa_prefill_flash, the one the
+# form's table holds) in layer LAYER of a P-token prompt, in the process of depth-qwen3moe.sh's `<P>` arm (-n 1), at the
+# card's own clock. The launch skip is derived from the code (tools/ref/q3pp.py plan: 24 at P = 4096) and the profiled
+# launch is proved before the summary: the run's load and plan lines, the name, grid (2,048 x 128 at P = 4096) and the
+# tensor pipe's HMMA count, which depends on the ubatch's rows and position (34,078,720). Then the clock, the step's
+# cycles and each unit's demand beside them, and the stall composition. BLOOMERY_NCU_BIN=<absolute path> profiles
+# another tree's generate_qwen3moe instead (nothing is built). Expected on main for gqa_prefill_flash at P = 4096 [derived,
+# docs/research/q3tail-design-report.md 3.2 and 4; not numbers of record]: SM clock 1.46-1.55 GHz, tensor pipe 56-60 %,
+# issue 0.36-0.40 a scheduler, 3,400-3,620 SM cycles a block-step. The header of tools/ref/ncu-gpu.sh has the form.
+# Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints the derivation and its command line.
+ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ] && [ -z "${BLOOMERY_NCU_BIN:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NCU_FORM=q3pp BLOOMERY_NCU_PROMPT={{P}} BLOOMERY_NCU_LAYER={{LAYER}} BLOOMERY_NCU_KERNEL={{KERNEL}} bash tools/ref/ncu-gpu.sh'
+
 # V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
 # 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
