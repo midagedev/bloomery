@@ -100,8 +100,8 @@ mod gate {
         Ok(a)
     }
 
-    /// Prompt row 0's ids (`$BLOOMERY_DATA/greedy-ds41/prompt0.tsv`), the
-    /// step gate's `--greedy` prompt.
+    /// Prompt row 0's ids (`$BLOOMERY_DATA/greedy-ds41/prompt0.tsv`, written
+    /// by `just ik-greedy-ds41`).
     fn prompt0() -> Result<Vec<u32>, GateError> {
         let path = data_dir().join("greedy-ds41").join("prompt0.tsv");
         let text = std::fs::read_to_string(&path)

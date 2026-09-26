@@ -10,8 +10,8 @@
 # The one thing it changes is fenced: every exit path writes back each CPU's `disable` flag as it
 # read it at start (EXIT trap) and prints the flags it left. The command runs once per arm per
 # round from the repo root with the timing card pinned (timing-card.sh); of its output only the
-# lines matching CSTATE_AB_KEEP (grep -E; default: generate's SMOKE footer and bench_join's timed
-# lines) are printed, each behind a `<state>=<on|off> round=<r> |` tag, so the log answers per arm.
+# lines matching CSTATE_AB_KEEP (grep -E; default: generate's SMOKE footer and `time` lines) are
+# printed, each behind a `<state>=<on|off> round=<r> |` tag, so the log answers per arm.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -27,7 +27,7 @@ shift
 case $ROUNDS in
   '' | *[!0-9]* | 0*) echo "cstate-ab: ROUNDS is a positive integer, got '$ROUNDS'" >&2; exit 64 ;;
 esac
-KEEP=${CSTATE_AB_KEEP:-'^SMOKE|^time |mech='}
+KEEP=${CSTATE_AB_KEEP:-'^SMOKE|^time '}
 STATE=${CSTATE_AB_STATE:-state2}
 FILES=(/sys/devices/system/cpu/cpu[0-9]*/cpuidle/"$STATE"/disable)
 [ -e "${FILES[0]}" ] || { echo "cstate-ab: no idle state $STATE on this machine" >&2; exit 2; }

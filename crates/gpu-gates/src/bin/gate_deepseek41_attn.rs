@@ -25,14 +25,8 @@
 //! ik attends by one of two CPU paths, and the dump says which. The generic
 //! flash attention rounds the query to f16 and keeps the value sum in f16.
 //! The iqk kernels, taken where the graph builds their key index
-//! (`mask_to_idx-L`), keep the query in f32 and sum in f32. On their T = 1
-//! index branch the builds in [`T1_SINK_DEFECT_BUILDS`] hand each thread's
-//! run of heads the sinks of the first heads (`iqk_flash_attn.cpp`, the
-//! `neq1 == 1` branch passes `sinks` without the run's offset), so on such a
-//! layer of such a set the dump is the attention of those sinks, and the
-//! layer's rules and launches take them ([`ik_index_sinks`]); every other
-//! build folds each head's own sink there. Three distances per layer, all
-//! asserted:
+//! (`mask_to_idx-L`), keep the query in f32 and sum in f32. Both fold each
+//! head's own sink. Three distances per layer, all asserted:
 //! - (i) ik's arithmetic simulated here over ik's key order vs `fattn-L`.
 //!   On a generic layer, bit for bit: the f16 dot's fixed lane tree, the
 //!   value sum rounded to f16 at every key, glibc's `expf`, the sink folded
@@ -160,12 +154,6 @@ mod gate {
     /// The visible entry the past-stream case plants: it names row
     /// `DEPTH_COMP_ROWS`, the first row past the stream.
     const DEPTH_PAST_ENTRY: usize = 100;
-    /// The ik builds, by `# build` (the part before any `-`), whose T = 1
-    /// index branch hands each thread's run of heads the sinks of the first
-    /// heads. A set from any other build is held to each head's own sink, so
-    /// an unlisted build with that branch reddens its iqk layers instead of
-    /// passing them.
-    const T1_SINK_DEFECT_BUILDS: &[&str] = &["c10fbbcc", "49ef19d0"];
 
     /// What a whole set shares: its shape, positions and the model's
     /// attention parameters.
@@ -184,8 +172,6 @@ mod gate {
         scale: f32,
         /// ik's threads, `-t` on the set's `# flags` line.
         threads: Option<usize>,
-        /// The set's build is one of [`T1_SINK_DEFECT_BUILDS`].
-        t1_first_sinks: bool,
     }
 
     /// Which of ik's CPU flash attention paths a layer took.
@@ -197,9 +183,7 @@ mod gate {
         /// head's own sink.
         Iqk,
         /// The iqk kernels on the index path's T = 1 branch, where a head
-        /// folds its own sink — or, in a set of a
-        /// [`T1_SINK_DEFECT_BUILDS`] build, the sink [`ik_index_sinks`]
-        /// gives it.
+        /// folds its own sink.
         IqkT1,
     }
 
@@ -238,8 +222,7 @@ mod gate {
         /// `blk.L.attn_sinks.weight`: the model's sink per head.
         model_sinks: Vec<f32>,
         /// The sink per head ik folded, which this layer's rules and
-        /// launches take: the model's, or on [`IkPath::IqkT1`] in a set of
-        /// a [`T1_SINK_DEFECT_BUILDS`] build the index branch's.
+        /// launches take: the model's.
         sinks: Vec<f32>,
         /// `fattn-L`, `[token][head][LATENT]` f32.
         dump: Vec<f32>,
@@ -310,7 +293,7 @@ mod gate {
         for (s, (man, set)) in sets.iter().zip(&infos).enumerate() {
             println!(
                 "gate_deepseek41_attn: set {} ({}, build {}), tokens {} at positions {:?}, heads {}, \
-                 window {}, scale {:e}, ik threads {:?}, T = 1 index branch sinks {}",
+                 window {}, scale {:e}, ik threads {:?}",
                 set.label,
                 man.dir.display(),
                 man.build.as_deref().unwrap_or("-"),
@@ -320,11 +303,6 @@ mod gate {
                 set.window,
                 set.scale,
                 set.threads,
-                if set.t1_first_sinks {
-                    "the first heads'"
-                } else {
-                    "each head's own"
-                }
             );
             for l in 0..set.ratios.len() {
                 let case = layer_case(man, &split, set, l)?;
@@ -492,10 +470,6 @@ mod gate {
             ratios: ratios[..layers].to_vec(),
             scale: 1.0 / (LATENT as f32).sqrt(),
             threads: man.header.threads.map(usize::try_from).transpose()?,
-            t1_first_sinks: man
-                .build
-                .as_deref()
-                .is_some_and(|b| T1_SINK_DEFECT_BUILDS.contains(&b.split('-').next().unwrap_or(b))),
         })
     }
 
@@ -554,14 +528,7 @@ mod gate {
             Some(_) => IkPath::Iqk,
         };
         let model_sinks = sinks_of(split, l, set.heads)?;
-        let sinks = if path == IkPath::IqkT1 && set.t1_first_sinks {
-            let threads = set.threads.ok_or_else(|| {
-                format!("layer {l}: ik's T = 1 index branch, but no -t in # flags")
-            })?;
-            ik_index_sinks(&model_sinks, threads)
-        } else {
-            model_sinks.clone()
-        };
+        let sinks = model_sinks.clone();
         Ok(LayerCase {
             layer: l,
             source: k.source,
@@ -1061,31 +1028,6 @@ mod gate {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect())
-    }
-
-    /// The sink each head folds on ik's T = 1 index branch
-    /// (`iqk_flash_attn.cpp`, `neq1 == 1`): the heads are split over the
-    /// threads in runs of `n = ceil(heads / threads)`, one fewer from
-    /// thread `heads - threads * (n - 1)` on, and each thread hands its run
-    /// the sinks from the first head on — head `first + j` of a run folds
-    /// `sinks[j]`.
-    fn ik_index_sinks(sinks: &[f32], threads: usize) -> Vec<f32> {
-        let heads = sinks.len();
-        let per = heads.div_ceil(threads);
-        let mut out = sinks.to_vec();
-        for ith in 0..threads {
-            let (mut n, mut first) = (per, ith * per);
-            if per * threads > heads {
-                let mid = heads - threads * (per - 1);
-                if ith >= mid {
-                    n -= 1;
-                    first = mid * per + (ith - mid) * n;
-                }
-            }
-            let n = n.min(heads.saturating_sub(first));
-            out[first..first + n].copy_from_slice(&sinks[..n]);
-        }
-        out
     }
 
     // ------------------------------------------------------------ host rules

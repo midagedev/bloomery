@@ -49,11 +49,16 @@
 //! here from the headers — exactly. Lock wall time per shard and in total is
 //! printed, never asserted.
 //!
-//! `--plan a|b` picks design §5's plan; b, the serving target, by default.
+//! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
+//! layers over both cards (`workstation::plan_b`), and this gate is the tree's
+//! one run of that two-card staging, the exercise ahead of the two-card tier
+//! (T2 of `docs/plan.md`'s target profile). The engine itself opens one card:
+//! `body::open` in `bloomery_gpu_deepseek41` refuses a placement on more than
+//! one. Plan (a) is the one-card plan.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
-    eprintln!("gate_load_v41: built without the `gpu` feature; see `just gate-gpu-load-v41`.");
+    eprintln!("gate_load_v41: built without the `gpu` feature; see `just stage-gpu-load-v41`.");
     std::process::exit(2);
 }
 

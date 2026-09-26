@@ -2,7 +2,7 @@
 """Interleaved GPU A/B across trees and levers: the lead's timing rounds as one tool.
 
 An arm is a (tree, environment) pair. Every round runs every arm once, through the tree's own
-timing recipe — `just time-gpu-v41`, `just time-gpu-generate` — so every arm takes the machine-wide
+timing recipe — `just time-gpu-generate` — so every arm takes the machine-wide
 lease and prints its witness blocks through tools/ref/time-gate.sh, like a hand-run of that recipe.
 The order rotates by one arm per round (round r starts at arm r-1): in a fixed order a round's
 first arm read slow (AGENTS.md), and rotation spreads that over every arm. Only interleaved,
@@ -10,7 +10,7 @@ same-window numbers are compared, and only as each arm's difference from the fir
 
   gpu-ab.py run [--dry-run] --out DIR --rounds N --recipe RECIPE [--recipe ...] --arm NAME=TREE[:K=V,K=V] ...
   gpu-ab.py summary DIR
-  gpu-ab.py summary --instrument v41|generate NAME=LOG_GLOB ...
+  gpu-ab.py summary --instrument generate NAME=LOG_GLOB ...
 
 run      one --arm per arm, the first is the reference. TREE is a path or a directory name beside this
          repository's own; its box directory is ~/repo/<tree name>. K=V pairs reach the timed binary
@@ -29,9 +29,8 @@ run      one --arm per arm, the first is the reference. TREE is a path or a dire
          --dry-run prints the arm order and the exact commands, and runs nothing.
 summary  per recipe it knows: each arm's rounds, mean, SD, and difference from the first arm with
          its 95 % interval (two-sample t, pooled SD, df = n1 + n2 - 2 — the ruler of AGENTS.md
-         "Know the ruler"). time-gpu-v41: the token graphs' us_mean (every `token plan=` the logs
-         print, in the order they first print them) and the per-site table (graph µs per launch and µs per token). time-gpu-generate: the
-         SMOKE line's p50_ms. The second form reads any logs, e.g. the lead's older ones.
+         "Know the ruler"). time-gpu-generate: the SMOKE line's p50_ms. The second form reads any
+         logs, e.g. the lead's older ones.
 """
 import glob
 import math
@@ -46,7 +45,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'ref'))
 from tdist import t975  # noqa: E402
 
-INSTRUMENTS = {'time-gpu-v41': 'v41', 'time-gpu-generate': 'generate'}
+INSTRUMENTS = {'time-gpu-generate': 'generate'}
 KV = re.compile(r'(\S+?)=(\S+)')
 
 
@@ -64,18 +63,6 @@ def versus(ref, xs):
         return m1 - m0, float('nan')
     sp = math.sqrt(((len(ref) - 1) * s0 ** 2 + (len(xs) - 1) * s1 ** 2) / df)
     return m1 - m0, t975(df) * sp * math.sqrt(1 / len(ref) + 1 / len(xs))
-
-
-def parse_v41(path):
-    shapes, plans = {}, {}
-    for line in open(path, errors='replace'):
-        if line.startswith('bench shape='):
-            d = dict(KV.findall(line))
-            shapes[d['shape']] = (float(d['graph_us_mean']), float(d['token_graph_us']))
-        elif line.startswith('token plan='):
-            d = dict(KV.findall(line))
-            plans[d['plan']] = float(d['us_mean'])
-    return {'plans': plans, 'shapes': shapes} if plans else None
 
 
 def parse_generate(path):
@@ -100,10 +87,9 @@ def row(name, xs, ref, unit, digits):
 
 def summarize(instrument, arms):
     """arms: [(name, [log paths])] with the reference first."""
-    parse = parse_v41 if instrument == 'v41' else parse_generate
     data = []
     for name, logs in arms:
-        runs = [(p, parse(p)) for p in logs]
+        runs = [(p, parse_generate(p)) for p in logs]
         bad = [p for p, r in runs if r is None]
         for p in bad:
             print(f'  {name}: no {instrument} result in {p} (left out)')
@@ -112,50 +98,21 @@ def summarize(instrument, arms):
     if not data:
         print(f'  no {instrument} results')
         return
-    if instrument == 'generate':
-        print('p50_ms of the SMOKE line, per arm (graph mode, one process per arm and round)')
-        ref = [r['p50_ms'] for r in data[0][1]]
-        for name, rs in data:
-            xs = [r['p50_ms'] for r in rs]
-            print(row(name, xs, ref if name != data[0][0] else xs, 'ms', 4)
-                  + f'  tok/s={1e3 / st.mean(xs):.2f}  p50s={[round(x, 4) for x in xs]}')
-        return
-    # The plans come from the logs: bench_v41 grows a plan whenever a round adds a token graph.
-    plans = list(dict.fromkeys(p for _, rs in data for r in rs for p in r['plans']))
-    for plan in plans:
-        have =[(n, [r['plans'][plan] for r in rs if plan in r['plans']]) for n, rs in data]
-        have = [(n, xs) for n, xs in have if xs]
-        if not have:
-            continue
-        print(f'token plan={plan}: us_mean per round, per arm')
-        ref = have[0][1]
-        for name, xs in have:
-            print(row(name, xs, ref if name != have[0][0] else xs, 'us', 1) + f'  per-round={[round(x, 1) for x in xs]}')
-    sites = [s for s in data[0][1][0]['shapes']]
-    head = f'{"site":24s}' + ''.join(f' {n + " us":>10s} {n + " tok":>10s}' for n, _ in data)
-    head += ''.join(f' {"d" + n + " tok":>10s}' for n, _ in data[1:])
-    print('per site: graph us per launch and us per token, mean over rounds; d = arm - first, per token')
-    print(head)
-    total = [0.0] * len(data)
-    for s in sites:
-        cells, toks = '', []
-        for name, rs in data:
-            got = [r['shapes'][s] for r in rs if s in r['shapes']]
-            g = st.mean(x[0] for x in got) if got else float('nan')
-            t = st.mean(x[1] for x in got) if got else float('nan')
-            toks.append(t)
-            cells += f' {g:10.3f} {t:10.1f}'
-        cells += ''.join(f' {t - toks[0]:+10.1f}' for t in toks[1:])
-        for i, t in enumerate(toks):
-            total[i] += t - toks[0]
-        print(f'{s:24s}{cells}')
-    for i, (name, _) in enumerate(data[1:], 1):
-        print(f'sum of per-site token deltas, {name} - {data[0][0]}: {total[i]:+.1f} us')
+    print('p50_ms of the SMOKE line, per arm (graph mode, one process per arm and round)')
+    ref = [r['p50_ms'] for r in data[0][1]]
+    for name, rs in data:
+        xs = [r['p50_ms'] for r in rs]
+        print(row(name, xs, ref if name != data[0][0] else xs, 'ms', 4)
+              + f'  tok/s={1e3 / st.mean(xs):.2f}  p50s={[round(x, 4) for x in xs]}')
 
 
 def summary(args):
     if args[:1] == ['--instrument']:
         instrument, specs = args[1], args[2:]
+        if instrument not in INSTRUMENTS.values():
+            print(f'gpu-ab: no instrument {instrument}; the instruments are {", ".join(INSTRUMENTS.values())}',
+                  file=sys.stderr)
+            return 2
         arms = []
         for spec in specs:
             name, _, pattern = spec.partition('=')

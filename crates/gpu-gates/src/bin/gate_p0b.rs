@@ -18,9 +18,7 @@
 //! named `CachePos` fault, the cache untouched). Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
-//! here). `--time` (lead-only, under the machine lease) replays each
-//! captured graph 2000x and prints us/replay plus 4- and 8-node empty-graph
-//! references; without the flag nothing is timed or printed about time.
+//! here).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -33,7 +31,7 @@ use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model,
-    ref_manifest, row_bytes, tensor_bytes_as, us_per_replay, verdict,
+    ref_manifest, row_bytes, tensor_bytes_as, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -54,7 +52,6 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::fused::{FusedKernels, readback_q8act};
-    use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 
@@ -67,7 +64,9 @@ fn run() -> Result<(), GateError> {
     const ROWS: usize = 2048;
     const TOKENS: usize = 6;
 
-    let time_mode = std::env::args().any(|a| a == "--time");
+    if let Some(arg) = std::env::args().nth(1) {
+        return Err(format!("gate_p0b takes no arguments, got `{arg}`").into());
+    }
     let mut ok = true;
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
@@ -761,26 +760,6 @@ fn run() -> Result<(), GateError> {
         let ik_h = max_rel_err(&h_fu_1, &up_gate[(TOKENS - 1) * FF..TOKENS * FF])?;
         println!(
             "ik l_out-0[last] ik_rel={ik_y:.3e} ffn_up_gate-0[last] ik_rel={ik_h:.3e} (printed, not asserted)"
-        );
-    }
-
-    // ---- lead-only timing under the machine lease; correctness runs never
-    // reach this. Replays each captured graph N times, one synchronize at
-    // the end, plus 4- and 8-node empty-graph references.
-    if time_mode {
-        const N: u32 = 2000;
-        let probe = Probe::load(gpu.context())?;
-        let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
-        let g4 =
-            gpu.capture(|_| (0..4).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
-        let g8 =
-            gpu.capture(|_| (0..8).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
-        println!(
-            "time n={N} op_us_per_replay={:.3} fused_us_per_replay={:.3} touch4_us_per_replay={:.3} touch8_us_per_replay={:.3}",
-            us_per_replay(&graph_op, stream, N)?,
-            us_per_replay(&graph_fu, stream, N)?,
-            us_per_replay(&g4, stream, N)?,
-            us_per_replay(&g8, stream, N)?,
         );
     }
 

@@ -77,13 +77,6 @@
 //!   reader's list are our own step's, and the bands against ik's nodes
 //!   are conditioned on the measured distance of the fold the layer reads,
 //!   not on a distance carried along ik's path.
-//! - `--greedy PROMPT` (G3): 64 tokens greedy from `tools/ref/prompts.tsv`
-//!   row PROMPT after a reset, on the engine's own step, against ik's
-//!   (`tools/ref/ik-greedy.sh`, which stops at EOS): at the first position
-//!   where the ids differ, our margin must be below
-//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN). Also
-//!   printed: the allocator calls and the calling thread's page faults per
-//!   steady step.
 //! - `--ppl TAG` (G4): ik's KL-divergence base file `$BLOOMERY_DATA/ikppl/
 //!   TAG.kld`, chunk by chunk from a reset, one step per id; at every scored
 //!   position the paired difference `d = NLL_ours − NLL_ik`, KL(ik‖ours), the
@@ -141,9 +134,7 @@ mod shadow;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use crate::shadow;
-    use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     use bloomery_gpu::head::Head;
@@ -163,8 +154,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed,
-        data_dir, patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
+        GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed, data_dir,
+        patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
@@ -177,41 +168,6 @@ mod gate {
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
     use model::placement::workstation;
-
-    // ------------------------------------------------------------ allocator
-
-    /// Counts allocator calls, for the per-step allocation line.
-    struct Counting;
-
-    static ALLOCS: AtomicU64 = AtomicU64::new(0);
-
-    // SAFETY: every call forwards to `System` with the caller's own
-    // arguments; the counter is a relaxed atomic that allocates nothing.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: AllocLayout) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: the caller's layout, passed through unchanged.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: AllocLayout) {
-            // SAFETY: `ptr` came from `alloc` above with this layout.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: AllocLayout) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: the caller's layout, passed through unchanged.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: AllocLayout, new_size: usize) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `ptr` came from this allocator with `layout`; the new
-            // size is the caller's.
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[global_allocator]
-    static GLOBAL: Counting = Counting;
 
     // ------------------------------------------------------------ constants
 
@@ -245,9 +201,6 @@ mod gate {
     const BAND_SIGMAS: f64 = 4.5;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
-    /// G3: tokens generated; a first difference is judged by
-    /// [`GREEDY_MARGIN`].
-    const GREEDY: usize = 64;
     /// G4: red above this Δ_PPL [derived, plan.md].
     const PPL_RED: f64 = 0.015;
     /// Selection-band terms the MoE chain gate's `tie_margin` takes
@@ -262,18 +215,16 @@ mod gate {
         structure: bool,
         sets: bool,
         select: bool,
-        greedy: Option<u32>,
         ppl: Option<String>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] \
-             [--greedy PROMPT] [--ppl TAG]";
+        const USAGE: &str =
+            "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG]";
         let mut a = Args {
             structure: false,
             sets: false,
             select: false,
-            greedy: None,
             ppl: None,
         };
         let mut it = std::env::args().skip(1);
@@ -282,12 +233,6 @@ mod gate {
                 "--structure" => a.structure = true,
                 "--sets" => a.sets = true,
                 "--select" => a.select = true,
-                "--greedy" => {
-                    let id = it
-                        .next()
-                        .ok_or_else(|| format!("--greedy needs a prompt id: {USAGE}"))?;
-                    a.greedy = Some(id.parse()?);
-                }
                 "--ppl" => {
                     a.ppl = Some(
                         it.next()
@@ -297,7 +242,7 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.structure || a.sets || a.select || a.greedy.is_some() || a.ppl.is_some()) {
+        if !(a.structure || a.sets || a.select || a.ppl.is_some()) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -350,9 +295,6 @@ mod gate {
         }
         if args.select {
             pass &= sets(&mut m, &mut head, &split, &hp, &SELECT_SETS)?;
-        }
-        if let Some(prompt) = args.greedy {
-            pass &= greedy(&mut m, &split, prompt)?;
         }
         if let Some(tag) = &args.ppl {
             pass &= ppl(&mut m, &hp, tag)?;
@@ -2546,182 +2488,6 @@ mod gate {
             }
         );
         Ok(ok || carried.is_none())
-    }
-
-    // --------------------------------------------------------------- greedy
-
-    /// ik's greedy row for prompt 0 (`tools/ref/ik-greedy.sh`): the prompt's
-    /// ids and the generated ids with their margins.
-    struct IkGreedy {
-        prompt: Vec<u32>,
-        ids: Vec<u32>,
-        margins: Vec<f32>,
-    }
-
-    fn read_ik_greedy(p: u32) -> Result<IkGreedy, GateError> {
-        let dir = data_dir().join("greedy-ds41");
-        let list = |s: &str| -> Result<Vec<String>, GateError> {
-            Ok(s.split(',').map(|v| v.trim().to_string()).collect())
-        };
-        let prompt_path = dir.join(format!("prompt{p}.tsv"));
-        let prompt_text = std::fs::read_to_string(&prompt_path).map_err(|e| {
-            format!(
-                "{}: {e} — run just ik-greedy-ds41 {p}",
-                prompt_path.display()
-            )
-        })?;
-        let row = prompt_text
-            .lines()
-            .find(|l| !l.starts_with('#') && !l.is_empty())
-            .ok_or("no prompt row")?;
-        let f: Vec<&str> = row.split('\t').collect();
-        let prompt = list(f.get(2).ok_or("prompt row has no ids")?)?
-            .iter()
-            .map(|v| v.parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?;
-        let out_path = dir.join(format!("greedy-ik-cpu-{GREEDY}-p{p}.tsv"));
-        let out = std::fs::read_to_string(&out_path)
-            .map_err(|e| format!("{}: {e} — run just ik-greedy-ds41 {p}", out_path.display()))?;
-        let row = out
-            .lines()
-            .find(|l| !l.starts_with('#') && !l.is_empty())
-            .ok_or("no greedy row")?;
-        let f: Vec<&str> = row.split('\t').collect();
-        let ids = list(f.get(5).ok_or("greedy row has no gen_ids")?)?
-            .iter()
-            .map(|v| v.parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?;
-        let margins = list(f.get(6).ok_or("greedy row has no gen_margins")?)?
-            .iter()
-            .map(|v| v.parse::<f32>())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(IkGreedy {
-            prompt,
-            ids,
-            margins,
-        })
-    }
-
-    /// The file's token strings, for printing the two continuations.
-    fn vocab(split: &Split) -> Vec<String> {
-        match split.value("tokenizer.ggml.tokens") {
-            Some(gguf::Value::Array(v)) => v
-                .iter()
-                .map(|t| match t {
-                    gguf::Value::String(s) => s.clone(),
-                    _ => "?".to_string(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn text(vocab: &[String], ids: &[u32]) -> String {
-        ids.iter()
-            .map(|&i| vocab.get(i as usize).map_or("?", String::as_str))
-            .collect::<String>()
-            .replace('Ġ', " ")
-            .replace('Ċ', "\\n")
-    }
-
-    fn vmstat(key: &str) -> u64 {
-        std::fs::read_to_string("/proc/vmstat")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix(key)?.trim().parse().ok())
-            })
-            .unwrap_or(0)
-    }
-
-    fn greedy(m: &mut Deepseek41Model, split: &Split, p: u32) -> Result<bool, GateError> {
-        let ik = read_ik_greedy(p)?;
-        let eos = bloomery_gpu_gates::eos_token_id(split)?;
-        let vocab = vocab(split);
-        m.reset()?;
-        let t = Instant::now();
-        let mut ids = Vec::with_capacity(GREEDY);
-        let mut margins = Vec::with_capacity(GREEDY);
-        let mut tok = m.step(&ik.prompt)?;
-        let (mut allocs, mut minor, mut major, mut steady) = (0u64, 0u64, 0u64, 0u64);
-        let pgmaj0 = vmstat("pgmajfault ");
-        for i in 0..GREEDY {
-            let logits = m.logits()?;
-            let (a, av, _, bv) = top2(&logits);
-            if a != tok as usize {
-                return Err(
-                    format!("step {i}: the engine picked {tok}, its logits' top is {a}").into(),
-                );
-            }
-            ids.push(tok);
-            margins.push(av - bv);
-            if i + 1 == GREEDY {
-                break;
-            }
-            let (a0, f0) = (ALLOCS.load(Ordering::Relaxed), engram::faults_thread());
-            tok = m.step(&[tok])?;
-            let (a1, f1) = (ALLOCS.load(Ordering::Relaxed), engram::faults_thread());
-            if i >= 8 {
-                allocs += a1 - a0;
-                minor += f1.minor - f0.minor;
-                major += f1.major - f0.major;
-                steady += 1;
-            }
-        }
-        let wall = t.elapsed().as_secs_f64();
-        let pgmaj = vmstat("pgmajfault ") - pgmaj0;
-        // ik stops at its EOS and records it: the comparison runs over ik's ids.
-        let ik_stopped = ik.ids.len() < GREEDY && ik.ids.last() == Some(&eos);
-        let first = ids.iter().zip(&ik.ids).position(|(a, b)| a != b);
-        let ok = match first {
-            None => ik.ids.len() == GREEDY || ik_stopped,
-            Some(p) => margins[p] < GREEDY_MARGIN,
-        };
-        println!(
-            "greedy prompt ids {:?} ({:?})",
-            ik.prompt,
-            text(&vocab, &ik.prompt)
-        );
-        println!("greedy ours {:?}", ids);
-        println!("greedy ik   {:?}", ik.ids);
-        println!("greedy ours text {:?}", text(&vocab, &ids));
-        println!("greedy ik   text {:?}", text(&vocab, &ik.ids));
-        match first {
-            None => println!(
-                "greedy prompt {p}: ik's {} ids equal ours{}; margins ours min {:.3}, ik min {:.3}; \
-                 {GREEDY} steps in {wall:.1} s (runtime value): {}",
-                ik.ids.len(),
-                if ik_stopped {
-                    " (ik stopped at EOS)"
-                } else {
-                    ""
-                },
-                margins[..ik.ids.len().min(GREEDY)]
-                    .iter()
-                    .copied()
-                    .fold(f32::INFINITY, f32::min),
-                ik.margins.iter().copied().fold(f32::INFINITY, f32::min),
-                verdict(ok)
-            ),
-            Some(at) => println!(
-                "greedy prompt {p}: first difference at {at}: ours {} (margin {:.4}) ik {} (margin \
-                 {:.4}); pass rule our margin < {GREEDY_MARGIN}: {}",
-                ids[at],
-                margins[at],
-                ik.ids[at],
-                ik.margins.get(at).copied().unwrap_or(f32::NAN),
-                verdict(ok)
-            ),
-        }
-        println!(
-            "steady steps {steady}: allocs_per_step={:.2} minor_faults_per_step={:.1} \
-             major_faults_per_step={:.2} (calling thread); pgmajfault over the run {pgmaj} \
-             (machine-wide)",
-            allocs as f64 / steady.max(1) as f64,
-            minor as f64 / steady.max(1) as f64,
-            major as f64 / steady.max(1) as f64
-        );
-        Ok(ok)
     }
 
     // ------------------------------------------------------------------ ppl

@@ -41,7 +41,7 @@
 //! argmax is not the engine's token; and, on the free arm, a first difference
 //! with ik's greedy ids (`greedy-ik-cpu-64-p7.tsv`, which would stop at ik's EOS)
 //! where our margin is not below
-//! [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN), the step gate's rule,
+//! [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN),
 //! or, where ours equals ik's through ik's EOS, a run that did not stop at
 //! that EOS itself. A run that differs from ik's within the margin rule does
 //! not have to reach ik's EOS; the case says whether and where it stopped.

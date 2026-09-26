@@ -187,13 +187,9 @@ generate *ARGS:
 time-gpu-generate *ARGS:
     ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/time-gate.sh generate {{ARGS}} --time'
 
-# P0b: 블록 0 FFN 융합 스파이크 — 융합 4런치가 op 8런치와 비트 동일한지(정확성 실행). 시간은 리드가 임대 안에서 `--time`으로 잰다.
+# P0b: 블록 0 FFN 융합 스파이크 — 융합 4런치가 op 8런치와 비트 동일한지(정확성 실행).
 gate-gpu-p0b *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/gpu-gate.sh gate_p0b {{ARGS}}'
-
-# P0b 시간(리드 전용): 기계 전역 임대 아래 op 8노드 대 융합 4노드 그래프의 재생 µs, 빈 커널 4/8노드 참조 포함, 증인 블록 전후.
-time-gpu-p0b:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-gate.sh gate_p0b'
 
 # P8a 블록 0 스텝(ctx_max 64에서 21노드 — fuse1 뒤; 한 구간보다 큰 캐시에서는 flash_merge가 붙어 22)의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-p8:
@@ -242,43 +238,18 @@ ncu-gpu-ds41-pp P='512':
 ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ] && [ -z "${BLOOMERY_NCU_BIN:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NCU_FORM=q3pp BLOOMERY_NCU_PROMPT={{P}} BLOOMERY_NCU_LAYER={{LAYER}} BLOOMERY_NCU_KERNEL={{KERNEL}} bash tools/ref/ncu-gpu.sh'
 
-# V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
-# 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
-# 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
-# 대조하고, 사본마다 그 발사의 출력 전체에 대한 FNV-1a digest를 한 줄 찍는다 — 커널을 재편하는 라운드는 이 줄로
-# 비트 동일을 보인다. 인덱서 사이트(두 런치)는 `deepseek41` 피처 뒤에 있어 그 피처로 짓는다 — `gpu`로 지으면
-# `not_built site=indexer` 한 줄만 찍고 빠진다. 3090, 게이트 락.
-bench-gpu-v41-check:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/gpu-gate.sh bench_v41 --check'
-
-# 같은 벤치의 시간(리드 전용): 사이트마다 eager 버스트와 그래프 재생, 토큰 하나를 통째로 잡은 그래프 셋(오늘의
-# 묶음 attn_output_a, 밀집 등가, heads 한 번)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
+# 캡처된 그래프의 노드당 값, 비용 모형의 `c_node`(리드 전용): cnode_probe --time이 빈 `touch` 노드 784개와 504개짜리
+# 그래프를 잡아, 그래프마다 노드 수와 재생 한 번의 기록을 먼저 확인한 뒤 `touch_us_min`·`touch_us_mean`·
+# `touch_us_per_node`를 찍는다. 정확성만 볼 때는 `bash tools/gpu-gate.sh cnode_probe --check`. 임대·증인·A6000 고정은
 # time-gate.sh가 쥔다.
-time-gpu-v41:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
-
-# 캡처된 그래프가 호스트 스레드에 일을 넘기고 기다리는 방식 다섯 × 결과를 받는 팔 둘의 벤치(bench_join) — 정확성 실행이다.
-# 방식은 블로킹 호스트 노드(넘기는 노드와 기다리는 노드 한 쌍, 그리고 일을 통째로 하는 노드 하나), 스핀 호스트 노드,
-# 스트림 memop, memop 원자 축소다. 팔은 H2D와 호스트 매핑 메모리 직접 읽기다. 재생마다 순번이 바뀌고, 소비 커널이
-# 그 재생의 호스트 값만 읽었는지 전부 대조한다. 캡처가 받아들였는지도 방식마다 찍는다. 3090, 게이트 락.
-bench-gpu-join-check *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/gpu-gate.sh bench_join --check {{ARGS}}'
-
-# 같은 벤치의 시간(리드 전용): 방식·팔마다 일이 없는 왕복(P 끝 → C 시작, `%globaltimer`), 호스트 일·GPU 일 격자에서 겹친
-# 몫, 스핀하는 쪽이 태우는 CPU. 임대·증인·A6000 고정은 time-gate.sh가 쥔다.
-time-gpu-join *ARGS:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
+time-gpu-cnode:
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
 
 # 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
 # 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
-# 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`,
-# `just cstate-ab 3 target/release/bench_join --time`.
+# 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`.
 cstate-ab ROUNDS *CMD:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate --bin bench_join && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
-
-# MoE 융합 op 8노드 대 융합 4노드의 재생 µs — 임대·증인, 리드 전용.
-time-gpu-moe:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
 
 # P8: 조립된 디코드 스텝(블록 0부터)을 덤프와 대조 — 엔진 자신의 탭.
 gate-gpu-p8 *ARGS:
@@ -309,24 +280,18 @@ gate-gpu-p10:
 
 # V4.1 적재 게이트 ②: 배치 계획이 카드마다 두는 세그먼트를, 이름으로 찾은 카드에 올리고 계획과 바이트 단위로 대조한다.
 # 할당기 반올림도 계획의 항과 바이트까지 같아야 한다. 정확성 실행이지 측정이 아니다. 계획 a는 --plan a.
+# 착륙 묶음이 고르지 않는 opt-in이다(gate-* 레시피가 아니라 `just affected`에 잡히지 않는다). 호스트 세트의 populate·lock
+# 경로나 두 카드 staging이 바뀌면 이름으로 돌린다 — 계획 (b)가 트리에서 유일한 두 카드 적재다.
 [group('solo')]
-gate-gpu-load-v41 *ARGS='--plan b':
+stage-gpu-load-v41 *ARGS='--plan b':
     BLOOMERY_CARD=both ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && bash tools/gpu-gate.sh gate_load_v41 {{ARGS}}'
 
 # 같은 게이트 ②의 호스트 절반: 계획 (b)의 호스트 세그먼트 전부(유도 약 196 GB)를 샤드 매핑째 잠근다. 리드 전용이고,
 # RAM을 크게 쓰는 트랙이 없을 때만 돈다.
+# stage-gpu-load-v41처럼 opt-in이고, 같은 변경에서 이름으로 돌린다.
 [group('solo')]
-gate-gpu-load-v41-lock:
+stage-gpu-load-v41-lock:
     BLOOMERY_CARD=both ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh gate_load_v41 --plan b --lock'
-
-# 원시-x 측정 프로브(호스트 전용, 게이트 아님): ref_cuda의 실활성화에 대해 q8_1 양자화 바닥을 잰다.
-# 정확 참조(ref_gemv)를 재사용하고 판정은 하지 않는다 — 수치로 밴드·생성기를 재판단하는 건 리드다.
-rawx-floor:
-    ./tools/box.sh 'cargo run --release -p bloomery-gpu-gates --bin rawx_floor'
-# 실제 활성값(ref_cuda 덤프)에서 q8_1 커널의 편차를 잰다: 정확 참조 대비, ik CUDA 자신의 출력 대비. 단언 없는 계측기 —
-# KERNEL_BAND를 합성 활성값이 아니라 실분포에서 핀하기 위한 표를 낸다. 정확성 실행이고 시간 측정이 아니다.
-probe-gpu-real-x:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin real_x && ./target/release/real_x'
 
 build-cpu:
     ./tools/box.sh 'cd crates/q3k-cpu && cargo build --release'
@@ -884,15 +849,10 @@ gate-gpu-ds41-long *ARGS:
 gate-gpu-ds41-faults:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --faults'
 
-# ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트
-# --greedy의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
+# ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — long 게이트
+# --free의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'PROMPT={{PROMPT}} bash tools/ref/ik-greedy.sh'
-
-# G3: 엔진 자신의 스텝으로 prompts.tsv 행 PROMPT에서 64토큰 greedy, ik-greedy-ds41의 파일과 대조(첫 불일치에서 우리
-# margin < 1.5면 통과). 정상 상태 스텝의 allocator 호출·페이지 폴트 수를 옆에 찍는다.
-run-ds41-greedy PROMPT='0':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step --greedy {{PROMPT}}'
 
 # G4: ik의 KLD 기준 파일 TAG($BLOOMERY_DATA/ikppl/TAG.kld)에 대한 우리 NLL·KLD·top-1 — 청크마다 리셋하고 id마다 엔진
 # 스텝 하나. 512 × 16청크는 약 8,200스텝이라 한도를 28분으로 올린다. 빨강은 Δ_PPL > +1.5 %.
@@ -901,7 +861,7 @@ run-ds41-ppl TAG:
 
 # V4.1 decode CLI, functional run (no timing): generate_ds41 feeds the prompt one real step per id, then greedy
 # -n tokens, and prints them. The recipe loads the step gate's placement on the 3090 (--place gate), so its tokens
-# are comparable with run-ds41-greedy's; later arguments override it (a flag given twice takes its last value) —
+# are comparable with gate-gpu-ds41-long's free arm; later arguments override it (a flag given twice takes its last value) —
 # `BLOOMERY_CARD=a6000 just gen-ds41 --place a …` loads the serving placement (a) on the A6000. 3090, gate lock.
 gen-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
@@ -960,25 +920,6 @@ gate-gpu-ds41-serve:
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
 time-gpu-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
-
-# 호스트 → 카드 전송 탐침(리드 전용): A6000에서 1 GiB를 세 경로로 보낸다 — 페이지 잠금 메모리, V4.1 첫 샤드의 따뜻한
-# 읽기 전용 mmap(pageable), 그 매핑을 cuMemHostRegister(READ_ONLY)로 등록한 것(등록·해제 시간 포함). 머신 전역 임대
-# 안에서, 증인 블록을 두르고 돈다(tools/ref/time-gate.sh). 등록을 지원하지 않는 카드면 앞의 두 줄을 찍고 rc 1.
-# 예: `just time-gpu-h2d --reps 10`.
-time-gpu-h2d *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/time-gate.sh h2d_probe --reps 8 {{ARGS}}'
-
-# (lead: Korean comment to replace)
-# M2b probe (lead-only): cuMemHostRegister on 1 GiB of an anonymous map and of a MAP_PRIVATE RW
-# window of the V4.1 first shard (flags 0), a MAP_SHARED read-only window (flags 0, the engine's own
-# mapping) and a MAP_PRIVATE read-only window (READ_ONLY), with
-# the card's two register attributes — the rc by name, register
-# s/GiB, H2D GB/s best and median of 8, RssAnon/RssFile before, registered and after. Refuses (rc 75)
-# while another run holds the CPU lease; the lease, the A6000 pin and the witness are time-gate.sh's.
-# A functional run: `just probe-host-register --bytes 64M` with
-# BLOOMERY_BOX_ENV="BLOOMERY_TIMING_GPU=<the 3090's UUID>".
-probe-host-register *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { . tools/ref/lease-probe.sh; lease_free || case $? in 1) echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75 ;; *) exit 70 ;; esac; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
 
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header

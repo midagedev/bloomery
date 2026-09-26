@@ -47,9 +47,9 @@ use std::path::{Path, PathBuf};
 /// sub-block scale defect landing near 1e-3 on a shape with no hash pin.
 pub const KERNEL_BAND: f32 = 1e-5;
 
-/// The V4.1 greedy rule, shared by the step gate's `--greedy` and the long
-/// gate's free arm: at the first generated id that differs from ik's, our
-/// top-1 margin must be below this — a near tie [derived, plan.md: ≈ 3 σ_rel].
+/// The V4.1 greedy rule of the long gate's free arm: at the first generated
+/// id that differs from ik's, our top-1 margin must be below this — a near
+/// tie [derived, plan.md: ≈ 3 σ_rel].
 pub const GREEDY_MARGIN: f32 = 1.5;
 
 pub type GateError = Box<dyn std::error::Error>;
@@ -1241,18 +1241,10 @@ pub fn ref_tensor_of_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>,
     Ok(vals)
 }
 
-/// `ref_dir()`'s `(name, occurrence)` f32 file with its manifest row (dims,
-/// op, sum) for chain checking. Reads the manifest on every call: a gate
-/// that loads more than one row holds a [`RefManifest`] and calls
-/// [`load_ref_in`].
-pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
-    load_ref_in(&RefManifest::read(&ref_dir())?, name, occurrence)
-}
-
-/// `ref_tensor` over a manifest the caller already parsed: load
-/// `(name, occ)`'s f32 file with its manifest row. A gate that reads many
-/// tensors parses the manifest once and calls this, or [`load_ref_in`] with
-/// a held [`RefManifest`].
+/// `ref_dir()`'s `(name, occ)` f32 file with its manifest row (dims, op, sum)
+/// for chain checking, over a manifest the caller already parsed. A gate that
+/// reads many tensors parses the manifest once and calls this, or
+/// [`load_ref_in`] with a held [`RefManifest`].
 pub fn load_ref(man: &[RefRow], name: &str, occ: u32) -> Result<(RefRow, Vec<f32>), GateError> {
     let row = find_ref_row(man, name, occ)?;
     Ok((row.clone(), ref_tensor_of(row)?))
@@ -1280,25 +1272,18 @@ pub fn load_ref_logical_in(
     Ok((row.clone(), ref_tensor_logical_in(&man.dir, row)?))
 }
 
-/// The tensor's LOGICAL elements in ggml index order from `ref_dir()`: the
-/// `.logical.f32` twin when the dump wrote one, else the plain file when
-/// the row is provably not a flat VIEW read (a contiguous tensor's plain
-/// file IS its logical order; a pre-v2 manifest without the `contig`
-/// column is accepted for non-VIEW rows only). A VIEW row without a
-/// logical twin is an error, never a silent flat read — that flat read is
-/// a different tensor than the one being asked for. Reads the manifest on
-/// every call: a gate that loads more than one row holds a [`RefManifest`]
-/// and calls [`load_ref_logical_in`].
-pub fn ref_tensor_logical(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
-    load_ref_logical_in(&RefManifest::read(&ref_dir())?, name, occurrence)
-}
-
-/// `ref_tensor_logical` of the set at `dir`, over a row already found.
+/// The LOGICAL elements, in ggml index order, of row `row` of the set at
+/// `dir`: the `.logical.f32` twin when the dump wrote one, else the plain
+/// file when the row is provably not a flat VIEW read (a contiguous tensor's
+/// plain file IS its logical order; a pre-v2 manifest without the `contig`
+/// column is accepted for non-VIEW rows only). A VIEW row without a logical
+/// twin is an error, never a silent flat read — that flat read is a
+/// different tensor than the one being asked for.
 pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>, GateError> {
     if row.logical == Some(1) {
         if row.ty != "f32" {
             return Err(format!(
-                "ref_tensor_logical: {} has type {}, want f32",
+                "ref_tensor_logical_in: {} has type {}, want f32",
                 row.name, row.ty
             )
             .into());
@@ -1306,12 +1291,12 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
         let path = dir.join(row.logical_file_name());
         let expect = 4_u64
             .checked_mul(row.count())
-            .ok_or("ref_tensor_logical: element count overflows")?;
+            .ok_or("ref_tensor_logical_in: element count overflows")?;
         let raw = std::fs::read(&path)
-            .map_err(|e| format!("ref_tensor_logical: cannot read {}: {e}", path.display()))?;
+            .map_err(|e| format!("ref_tensor_logical_in: cannot read {}: {e}", path.display()))?;
         if raw.len() as u64 != expect {
             return Err(format!(
-                "ref_tensor_logical: {} is {} bytes, want {} (4*count)",
+                "ref_tensor_logical_in: {} is {} bytes, want {} (4*count)",
                 path.display(),
                 raw.len(),
                 expect
@@ -1326,7 +1311,7 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
             .collect();
         if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
             return Err(format!(
-                "ref_tensor_logical: non-finite value at index {i} of {}",
+                "ref_tensor_logical_in: non-finite value at index {i} of {}",
                 path.display()
             )
             .into());
@@ -1335,7 +1320,7 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
     }
     if !plain_is_logical(row) {
         return Err(format!(
-            "ref_tensor_logical: {} is a view/non-contiguous row with no \
+            "ref_tensor_logical_in: {} is a view/non-contiguous row with no \
              logical twin in {} — the plain file is a flat read, not the tensor",
             row.name,
             dir.display()
@@ -1605,25 +1590,6 @@ pub fn no_local_depot(entries: &[&str]) -> Result<bool, GateError> {
             ),
         ))
     })
-}
-
-/// Mean microseconds per replay of graph `g`: one warm replay and a
-/// synchronize, then `n` replays timed to a single synchronize at the end.
-/// Lead-only timing under the machine lease — no correctness path calls it.
-#[cfg(feature = "gpu")]
-pub fn us_per_replay(
-    g: &bloomery_gpu::Graph,
-    stream: &cuda_core::CudaStream,
-    n: u32,
-) -> Result<f64, GateError> {
-    g.launch(stream)?;
-    stream.synchronize()?;
-    let t0 = std::time::Instant::now();
-    for _ in 0..n {
-        g.launch(stream)?;
-    }
-    stream.synchronize()?;
-    Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(n))
 }
 
 /// Replace the `N` bytes at byte `at_bytes` of `buf` with `new` and return
@@ -1948,14 +1914,6 @@ pub fn mask_bits_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
         .collect()
 }
 
-/// [`topk_ids_logical_in`] of a row of `ref_dir()`'s manifest, which it
-/// reads on every call: a gate reading more than one row holds a
-/// [`RefManifest`] and calls [`topk_ids_logical_in`] or
-/// [`topk_ids_logical_within`].
-pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
-    topk_ids_logical_in(&RefManifest::read(&ref_dir())?, row)
-}
-
 /// [`topk_ids_logical_within`] of a row of `man`, a manifest already read,
 /// with every id below the V2-Lite model's expert count.
 pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, GateError> {
@@ -1979,7 +1937,7 @@ pub fn topk_ids_logical_within(
 ) -> Result<Vec<i32>, GateError> {
     if row.logical != Some(1) {
         return Err(format!(
-            "topk_ids_logical: {} has no logical twin — the ids need a v2 dump set",
+            "topk_ids_logical_within: {} has no logical twin — the ids need a v2 dump set",
             row.name
         )
         .into());
@@ -1988,7 +1946,7 @@ pub fn topk_ids_logical_within(
         let ids = ref_ints(man, &row.name, row.occurrence, row.kind, Layout::Logical)?;
         if ids.len() as u64 != row.count() {
             return Err(format!(
-                "topk_ids_logical: {}/{} has {} elements, its integer twin {}",
+                "topk_ids_logical_within: {}/{} has {} elements, its integer twin {}",
                 row.name,
                 row.occurrence,
                 row.count(),
@@ -2001,7 +1959,7 @@ pub fn topk_ids_logical_within(
             .map(|&v| match i32::try_from(v) {
                 Ok(id) if u32::try_from(id).is_ok_and(|e| e < n_expert) => Ok(id),
                 _ => Err(format!(
-                    "topk_ids_logical: {}/{} holds id {v}, outside 0..{n_expert}",
+                    "topk_ids_logical_within: {}/{} holds id {v}, outside 0..{n_expert}",
                     row.name, row.occurrence
                 )
                 .into()),
@@ -2009,14 +1967,18 @@ pub fn topk_ids_logical_within(
             .collect();
     }
     let path = man.dir.join(row.logical_file_name());
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("topk_ids_logical: cannot read {}: {e}", path.display()))?;
+    let raw = std::fs::read(&path).map_err(|e| {
+        format!(
+            "topk_ids_logical_within: cannot read {}: {e}",
+            path.display()
+        )
+    })?;
     let expect = 4_u64
         .checked_mul(row.count())
-        .ok_or("topk_ids_logical: topk element count overflows")?;
+        .ok_or("topk_ids_logical_within: topk element count overflows")?;
     if raw.len() as u64 != expect {
         return Err(format!(
-            "topk_ids_logical: {} is {} bytes, want {expect} (4*count)",
+            "topk_ids_logical_within: {} is {} bytes, want {expect} (4*count)",
             path.display(),
             raw.len()
         )
@@ -2031,7 +1993,7 @@ pub fn topk_ids_logical_within(
                 Ok(v as i32)
             } else {
                 Err(format!(
-                    "topk_ids_logical: {} holds non-integral id {v} — not ids cast to f32",
+                    "topk_ids_logical_within: {} holds non-integral id {v} — not ids cast to f32",
                     path.display()
                 )
                 .into())

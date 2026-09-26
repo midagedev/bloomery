@@ -96,7 +96,7 @@ gpuab() {
   local name=$1 want=$2 pat=$3 box_env=$4
   shift 4
   run "$name" "$want" "$pat" env BLOOMERY_BOX_ENV="$box_env" python3 "$T/tools/gpu-ab.py" run --dry-run \
-    --out "$tmp/gpuab" --recipe time-gpu-v41 "$@"
+    --out "$tmp/gpuab" --recipe time-gpu-generate "$@"
 }
 
 absent() {
