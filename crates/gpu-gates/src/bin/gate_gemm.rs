@@ -55,8 +55,8 @@
 //! stable grouping — experts ascending, each expert's slots ascending, runs
 //! cut into tiles of at most `GEMM_BN`. Then at 32,768 slots: three ids past
 //! the stack in three different chunks end as the named fault with the
-//! table the host builds without them, and a captured route's replay writes
-//! the eager table.
+//! table the host builds without them and their slots listed as refused, in
+//! slot order, and a captured route's replay writes the eager table.
 //!
 //! The ubatch router the GEMM prefill routes with
 //! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
@@ -65,9 +65,11 @@
 //! bit for bit what the fused router (`enqueue_fused`, eight tokens a launch)
 //! writes for the same columns, and every logit within `γ(k/32 + 5) · Σ
 //! |w·x|` of the f64 dot (each lane's sequential sum of `k/32` products, then
-//! the five-step butterfly), T = 4096 included. Then its refusals (tokens
-//! past the buffers, none, a short input, a weight of the wrong shape, a
-//! ubatch past `UBATCH` tokens).
+//! the five-step butterfly), T = 4096 included, and every buffer past T's
+//! tokens still holding the sentinel written before the launch. Then its
+//! refusals (tokens past the buffers, none, a short input, a weight of the
+//! wrong shape or a `k` not a multiple of 64, a weight or an input not
+//! 16-byte aligned, a ubatch past `UBATCH` tokens).
 //!
 //! The SwiGLU quantizer between gate·up and down
 //! (`GemmKernels::enqueue_swiglu_quant`, case `swiglu`) at K ∈ {768, 2048}
@@ -76,14 +78,19 @@
 //! the scales and code sums the host transcription of the quantizer gives
 //! from those SwiGLU rows; every SwiGLU value within four f32 ulps (and
 //! 2^-126) of the f64 `g / (1 + e^-g) · u`. A NaN in a gate row ends as the
-//! named `QuantColumn` fault; its refusals (no columns, more than the
-//! activation holds, a short input).
+//! named `QuantColumn` fault with its 128-value block refused: a NaN scale,
+//! and every other byte of the five planes what the same input with that
+//! block zeroed leaves; its refusals (no columns, more than the activation
+//! holds, a short input).
 //!
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
-//! faults: a NaN activation and an out-of-range id each end as the named
-//! error `GpuError::Fault`, the refused slot's outputs untouched; the same
-//! for the three `_sel` gemvs, where an id past the stack raises
+//! faults: a NaN activation ends as the named error `GpuError::Fault`, its
+//! block refused as in the SwiGLU case, every slot reading its column NaN
+//! and every other slot the zeroed block's run bit for bit; ids past the
+//! stack end as the same error with their slots listed as refused at the
+//! table's end and every output row of theirs NaN; the same fault for the
+//! three `_sel` gemvs, where an id past the stack raises
 //! `FaultSite::ExpertId` and a host-served slot (`hybrid::HOST`) raises
 //! nothing; and the host API's refusals (type, K, slot count, row count,
 //! unfilled table, token shape, activation capacity). Last, the fault's site
@@ -112,13 +119,14 @@ mod gate {
     };
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, window};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, bytes_to_words, checks_failed, open_model, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+    use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// What `y` holds before a launch, so an output the kernel leaves alone
@@ -1093,6 +1101,38 @@ mod gate {
         })
     }
 
+    /// A [`GemmAct`]'s five planes, read back: q3, q4, q6, s8, d8.
+    type Planes = (Vec<u64>, Vec<u32>, Vec<u32>, Vec<i32>, Vec<f32>);
+
+    fn planes(act: &GemmAct, stream: &cuda_core::CudaStream) -> Result<Planes, GateError> {
+        Ok((
+            act.q3().to_host_vec(stream)?,
+            act.q4().to_host_vec(stream)?,
+            act.q6().to_host_vec(stream)?,
+            act.s8().to_host_vec(stream)?,
+            act.d8().to_host_vec(stream)?,
+        ))
+    }
+
+    /// Whether `got` holds block `blk` (its index among the 128-value block
+    /// scales) refused: `zero` is what the same input with that block's
+    /// values zeroed quantizes to — scale 1.0, zero codes and sums — so a
+    /// refused block leaves every plane equal to it but for its scale, NaN.
+    fn refused_block(got: &Planes, zero: &Planes, blk: usize) -> bool {
+        got.0 == zero.0
+            && got.1 == zero.1
+            && got.2 == zero.2
+            && got.3 == zero.3
+            && got.4.len() == zero.4.len()
+            && got.4.iter().zip(&zero.4).enumerate().all(|(i, (g, z))| {
+                if i == blk {
+                    g.is_nan() && *z == 1.0
+                } else {
+                    g.to_bits() == z.to_bits()
+                }
+            })
+    }
+
     /// Faults and host refusals (module doc, last paragraph).
     fn faults(dev: &Dev<'_>) -> Result<bool, GateError> {
         if !wanted("fault") {
@@ -1114,28 +1154,54 @@ mod gate {
         let mut ok = true;
         gpu.clear_fault()?;
 
-        // A NaN in token 3's column: the quantizer raises, the named error.
+        // A NaN in token 3's column, in its first 128-value block: the
+        // quantizer refuses the block and raises, the named error, and every
+        // slot reading the column (its `top_k` slots) is NaN. The same input
+        // with that block zeroed is the yardstick: its planes are the refused
+        // ones but for the block's scale (1.0 there), and every other slot's
+        // outputs are its bits.
         let n_tok = 8;
         let ids = route_ids(Routing::Uniform, n_tok, top_k, n_exp, 17);
         let mut x = activations(k, n_tok, 991);
+        x[3 * k..3 * k + 128].fill(0.0);
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        let y_zero = dev.run(&st, &mut res, &xd, &ids)?;
+        let zero = planes(&res.act, stream)?;
+        let zero_clean = gpu.take_fault()?.is_none();
         x[3 * k + 77] = f32::NAN;
         let xd = DeviceBuffer::from_host(stream, &x)?;
-        dev.run(&st, &mut res, &xd, &ids)?;
-        let err = gpu.take_fault()?.map(|fault| GpuError::Fault {
+        let y = dev.run(&st, &mut res, &xd, &ids)?;
+        let fault = gpu.take_fault()?;
+        let err = fault.map(|fault| GpuError::Fault {
             what: "gate_gemm",
             fault,
         });
-        let nan_ok = matches!(&err, Some(GpuError::Fault { fault, .. })
-            if fault.site() == Some(FaultSite::QuantColumn));
+        let site_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+        let block_refused = refused_block(&planes(&res.act, stream)?, &zero, 3 * (k / 128));
+        let reads_col3 = |s: usize| s / top_k == 3;
+        let col3_nan = (0..ids.len())
+            .filter(|&s| reads_col3(s))
+            .all(|s| y[s * rows..(s + 1) * rows].iter().all(|v| v.is_nan()));
+        let others_same = (0..ids.len()).filter(|&s| !reads_col3(s)).all(|s| {
+            bits_equal(
+                &y[s * rows..(s + 1) * rows],
+                &y_zero[s * rows..(s + 1) * rows],
+            )
+        });
+        let nan_ok = zero_clean && site_ok && block_refused && col3_nan && others_same;
         println!(
-            "gemm fault=nan_activation error=\"{}\" {}",
+            "gemm fault=nan_activation error=\"{}\" zeroed_block_run_clean={zero_clean} \
+             block_refused(d8 NaN, codes and sums zero, other bytes as zeroed)={block_refused} \
+             column_3_slots_nan={col3_nan} other_slots_bit_identical={others_same} {}",
             err.as_ref()
                 .map_or_else(|| "none".to_string(), ToString::to_string),
             verdict(nan_ok)
         );
         ok &= nan_ok;
 
-        // Ids past the stack: the route raises and leaves the slots out.
+        // Ids past the stack: the route raises, leaves the slots out of the
+        // tiles and lists them at the table's end, and every GEMM writes
+        // their output rows NaN.
         let mut ids = route_ids(Routing::Uniform, n_tok, top_k, n_exp, 23);
         ids[5] = n_exp as u32;
         ids[9] = u32::MAX;
@@ -1148,24 +1214,25 @@ mod gate {
         });
         let site_ok = matches!(&err, Some(GpuError::Fault { fault, .. })
             if fault.site() == Some(FaultSite::ExpertId));
-        let refused_untouched = [5usize, 9].iter().all(|&s| {
-            y[s * rows..(s + 1) * rows]
-                .iter()
-                .all(|v| v.to_bits() == SENT.to_bits())
-        });
+        let refused_nan = [5usize, 9]
+            .iter()
+            .all(|&s| y[s * rows..(s + 1) * rows].iter().all(|v| v.is_nan()));
         let others_written = (0..ids.len()).filter(|s| *s != 5 && *s != 9).all(|s| {
             y[s * rows..(s + 1) * rows]
                 .iter()
-                .all(|v| v.to_bits() != SENT.to_bits())
+                .all(|v| v.to_bits() != SENT.to_bits() && !v.is_nan())
         });
         let (cols, tiles) = res.route.read_back(stream)?;
         let listed: usize = tiles.iter().map(|t| t.len as usize).sum();
-        let table_ok =
-            listed == ids.len() - 2 && !cols[..listed].contains(&5) && !cols[..listed].contains(&9);
-        let pass = site_ok && refused_untouched && others_written && table_ok;
+        let refused = res.route.refused_back(stream)?;
+        let table_ok = listed == ids.len() - 2
+            && !cols[..listed].contains(&5)
+            && !cols[..listed].contains(&9)
+            && refused == [5, 9];
+        let pass = site_ok && refused_nan && others_written && table_ok;
         println!(
-            "gemm fault=expert_id_out_of_range error=\"{}\" refused_slots_untouched={refused_untouched} \
-             other_slots_written={others_written} table_lists={listed}_of_{} {}",
+            "gemm fault=expert_id_out_of_range error=\"{}\" refused_slots_nan={refused_nan} \
+             other_slots_written={others_written} table_lists={listed}_of_{} refused_listed={refused:?} {}",
             err.as_ref()
                 .map_or_else(|| "none".to_string(), ToString::to_string),
             ids.len(),
@@ -1466,7 +1533,8 @@ mod gate {
                 continue;
             }
             // Ids past the stack in three chunks of the largest table: the
-            // named fault, and the table without their slots.
+            // named fault, the table without their slots, and their slots
+            // listed as refused, in slot order.
             let mut ids = route_ids(Routing::Uniform, max_tok, top_k, n_exp, 0xbad1d);
             let bad = [0usize, max_slots / 2 + 1, max_slots - 1];
             ids[bad[0]] = n_exp as u32;
@@ -1477,13 +1545,15 @@ mod gate {
                 .enqueue_route(stream, &ids_d, ids.len(), &mut route, sink)?;
             let fault = gpu.take_fault()?;
             let site_ok = fault.is_some_and(|f| f.site() == Some(FaultSite::ExpertId));
+            let refused = route.refused_back(stream)?;
+            let listed_ok = refused.iter().map(|&s| s as usize).eq(bad);
             println!(
                 "gemm case=route_table fault=ids_past_stack slots={max_slots} at {bad:?}: fault=\"{}\" \
-                 (want ExpertId) {}",
+                 (want ExpertId) refused_listed={refused:?} {}",
                 fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
-                verdict(site_ok)
+                verdict(site_ok && listed_ok)
             );
-            ok &= site_ok;
+            ok &= site_ok && listed_ok;
             ok &= route_matches(dev, &route, &ids, n_exp, "fault=ids_past_stack")?;
             // A captured route's replay writes the eager table.
             let ids = route_ids(Routing::Uniform, max_tok, top_k, n_exp, 0x9a9f);
@@ -1597,27 +1667,43 @@ mod gate {
                 ok &= pass;
             }
         }
-        // A NaN in one gate row: the named fault.
+        // A NaN in one gate row, in block 2 of column 5: the named fault and
+        // that block refused, against the same rows with the block's gate
+        // and up values zeroed (a SwiGLU of 0).
         let k = 768;
         let mut act = GemmAct::new(stream, 8, k)?;
         let mut gh = activations(k, 8, 77);
-        gh[5 * k + 300] = f32::NAN;
-        let uh = activations(k, 8, 78);
+        let mut uh = activations(k, 8, 78);
+        gh[5 * k + 256..5 * k + 384].fill(0.0);
+        uh[5 * k + 256..5 * k + 384].fill(0.0);
+        gpu.clear_fault()?;
         let (g, u) = (
             DeviceBuffer::from_host(stream, &gh)?,
             DeviceBuffer::from_host(stream, &uh)?,
         );
-        gpu.clear_fault()?;
         dev.gk
             .enqueue_swiglu_quant(stream, &g, &u, 8, &mut act, gpu.unlabelled_sink())?;
-        let err = gpu.take_fault()?.map(|fault| GpuError::Fault {
+        let zero = planes(&act, stream)?;
+        let zero_clean = gpu.take_fault()?.is_none();
+        gh[5 * k + 300] = f32::NAN;
+        let (g, u) = (
+            DeviceBuffer::from_host(stream, &gh)?,
+            DeviceBuffer::from_host(stream, &uh)?,
+        );
+        dev.gk
+            .enqueue_swiglu_quant(stream, &g, &u, 8, &mut act, gpu.unlabelled_sink())?;
+        let fault = gpu.take_fault()?;
+        let err = fault.map(|fault| GpuError::Fault {
             what: "gate_gemm",
             fault,
         });
-        let nan_ok = matches!(&err, Some(GpuError::Fault { fault, .. })
-            if fault.site() == Some(FaultSite::QuantColumn));
+        let block_refused = refused_block(&planes(&act, stream)?, &zero, 5 * (k / 128) + 2);
+        let nan_ok = zero_clean
+            && fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn))
+            && block_refused;
         println!(
-            "gemm case=swiglu fault=nan_gate error=\"{}\" {}",
+            "gemm case=swiglu fault=nan_gate error=\"{}\" zeroed_block_run_clean={zero_clean} \
+             block_refused(d8 NaN, codes and sums zero, other bytes as zeroed)={block_refused} {}",
             err.as_ref()
                 .map_or_else(|| "none".to_string(), ToString::to_string),
             verdict(nan_ok)
@@ -1676,9 +1762,20 @@ mod gate {
         let mut ub = RouterOut::for_ubatch(stream, max)?;
         let mut fused = RouterOut::with_tokens(stream, MAX_TOKENS)?;
         let mut ok = true;
+        // What every output buffer holds before a launch: a store past the
+        // launch's T tokens reads back as something else.
+        const SENT_ID: u32 = 0xA5A5_A5A5;
         for &t in &ROUTER_TOKENS {
             let x = activations(k, t, 9100 + t as u32);
             let xd = DeviceBuffer::from_host(stream, &x)?;
+            ub.logits
+                .copy_from_host(stream, &vec![SENT; ub.logits.len()])?;
+            ub.probs
+                .copy_from_host(stream, &vec![SENT; ub.probs.len()])?;
+            ub.ids
+                .copy_from_host(stream, &vec![SENT_ID; ub.ids.len()])?;
+            ub.weights
+                .copy_from_host(stream, &vec![SENT; ub.weights.len()])?;
             rk.enqueue_ubatch(stream, &wd, &xd, t, sink, &mut ub)?;
             stream.synchronize()?;
             let (lg, pr, id, wt) = (
@@ -1687,6 +1784,11 @@ mod gate {
                 ub.ids.to_host_vec(stream)?,
                 ub.weights.to_host_vec(stream)?,
             );
+            let sent = |v: &[f32]| v.iter().all(|x| x.to_bits() == SENT.to_bits());
+            let past_untouched = sent(&lg[t * N_EXPERT..])
+                && sent(&pr[t * N_EXPERT..])
+                && id[t * N_USED..].iter().all(|&v| v == SENT_ID)
+                && sent(&wt[t * N_USED..]);
             let mut same = true;
             for c0 in (0..t).step_by(MAX_TOKENS) {
                 let m = (t - c0).min(MAX_TOKENS);
@@ -1728,10 +1830,10 @@ mod gate {
                     }
                 }
             }
-            let pass = same && in_band;
+            let pass = same && in_band && past_untouched;
             println!(
                 "gemm case=router T={t} ubatch_eq_fused_bits={same} logits_in_band={in_band} \
-                 worst_err_over_band={worst:.3} {}",
+                 worst_err_over_band={worst:.3} past_T_untouched={past_untouched} {}",
                 verdict(pass)
             );
             ok &= pass;
@@ -1739,6 +1841,30 @@ mod gate {
         let x = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
         let short = DeviceBuffer::<f32>::zeroed(stream, k)?;
         let wrong = DeviceTensor::upload(stream, &w[..64 * k], 64, k)?;
+        let k_96 = DeviceTensor::upload(stream, &w[..N_EXPERT * 96], N_EXPERT, 96)?;
+        // The logits launch copies both operands in 16-byte pieces: a window
+        // one f32 into an allocation is aligned for f32 and not for that.
+        let w_pad = DeviceBuffer::from_host(stream, &[w, &[0.0f32; 4][..]].concat())?;
+        let x_pad = DeviceBuffer::<f32>::zeroed(stream, 8 * k + 4)?;
+        let ctx = dev.gpu.context();
+        // SAFETY: each window is the f32 span after the first element of its
+        // own live allocation, which holds four more than the span; both
+        // allocations outlive the calls below, and the windows are given
+        // back right after them.
+        let (w_off, x_off) = unsafe {
+            (
+                DeviceTensor::<f32>::window(w_pad.cu_deviceptr() + 4, N_EXPERT, k, ctx),
+                window::<f32>(x_pad.cu_deviceptr() + 4, 8 * k, ctx),
+            )
+        };
+        let weight_misaligned = rk
+            .enqueue_ubatch(stream, &w_off, &x, 8, sink, &mut ub)
+            .is_err();
+        let input_misaligned = rk
+            .enqueue_ubatch(stream, &wd, &x_off, 8, sink, &mut ub)
+            .is_err();
+        DeviceTensor::release(w_off);
+        drop(ManuallyDrop::into_inner(x_off).into_raw_parts());
         let refusals = [
             (
                 "tokens_past_buffers",
@@ -1760,6 +1886,13 @@ mod gate {
                 rk.enqueue_ubatch(stream, &wrong, &x, 8, sink, &mut ub)
                     .is_err(),
             ),
+            (
+                "k_not_64",
+                rk.enqueue_ubatch(stream, &k_96, &x, 8, sink, &mut ub)
+                    .is_err(),
+            ),
+            ("weight_misaligned", weight_misaligned),
+            ("input_misaligned", input_misaligned),
             (
                 "ubatch_over_limit",
                 RouterOut::for_ubatch(stream, UBATCH + 1).is_err(),

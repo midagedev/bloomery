@@ -247,6 +247,7 @@ fn run() -> Result<(), GateError> {
         &mut probs,
         &mut ids,
         &mut weights,
+        gpu.unlabelled_sink(),
     )?;
     stream.synchronize()?;
     let (logits_h, probs_h, ids_h, weights_h) = (

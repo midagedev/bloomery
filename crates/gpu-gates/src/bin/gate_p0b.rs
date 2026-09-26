@@ -13,7 +13,9 @@
 //! (rope + rms_norm + kvr gather + kv_append), on the dump's own
 //! `kv_rope_compressed-0` column and the model's real rope cache — `kv_s`,
 //! `kvr` and the appended f16 cache row bit for bit, rerun, eager vs
-//! captured-graph replay, and the SAME captured graph at a second position. Printed, never asserted: `ik_rel` of
+//! captured-graph replay, and the SAME captured graph at a second position;
+//! then a position at the cache's height, which both appends refuse (the
+//! named `CachePos` fault, the cache untouched). Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
 //! here). `--time` (lead-only, under the machine lease) replays each
@@ -38,6 +40,12 @@ use cuda_core::DeviceBuffer;
 #[cfg(feature = "gpu")]
 use gguf::quant::GgmlType;
 
+/// A fault as a gate line prints it: its text, or `none`.
+#[cfg(feature = "gpu")]
+fn shown(f: Option<bloomery_gpu::Fault>) -> String {
+    f.map_or_else(|| "none".to_owned(), |f| f.to_string())
+}
+
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_p0b", run())
@@ -48,7 +56,7 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::fused::{FusedKernels, readback_q8act};
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 
     // The block-0 shapes (asserted from the file below): hidden width 2048,
     // FFN intermediate 10944 (gate/up rows, down K), down rows 2048. The
@@ -489,8 +497,14 @@ fn run() -> Result<(), GateError> {
             gpu.elem()
                 .enqueue_rms_norm(stream, kv_a, gain, eps, latent, 1, kv_s)?;
             step.enqueue_gather(stream, kv_s, src, dst, width, kvr)?;
-            gpu.flash()
-                .enqueue_kv_append_pos_buf(stream, kvr, pos, cache, 1)?;
+            gpu.flash().enqueue_kv_append_pos_buf(
+                stream,
+                kvr,
+                pos,
+                cache,
+                1,
+                gpu.unlabelled_sink(),
+            )?;
             Ok(())
         }
 
@@ -533,6 +547,7 @@ fn run() -> Result<(), GateError> {
             &mut kv_s_fu,
             &mut kvr_fu,
             &mut cache_fu,
+            gpu.unlabelled_sink(),
         )?;
         stream.synchronize()?;
         let (kv_s_fu_1, kvr_fu_1) = (kv_s_fu.to_host_vec(stream)?, kvr_fu.to_host_vec(stream)?);
@@ -569,6 +584,7 @@ fn run() -> Result<(), GateError> {
             &mut kv_s_fu,
             &mut kvr_fu,
             &mut cache_fu,
+            gpu.unlabelled_sink(),
         )?;
         stream.synchronize()?;
         let key_rerun = bits_equal(&kvr_op_1, &kvr_op.to_host_vec(stream)?)
@@ -614,6 +630,7 @@ fn run() -> Result<(), GateError> {
                 &mut kv_s_fu,
                 &mut kvr_fu,
                 &mut cache_fu,
+                gpu.unlabelled_sink(),
             )
         })?;
         let key_fu_nodes = g_key_fu.node_count();
@@ -659,6 +676,70 @@ fn run() -> Result<(), GateError> {
             verdict(second_same)
         );
         if !second_same {
+            ok = false;
+        }
+
+        // A position at the cache's height: both appends refuse it — the
+        // named `CachePos` fault, no cache row touched — while the norm's
+        // own outputs are still the op path's.
+        pos_dev.copy_from_host(stream, &[CACHE_ROWS as u32])?;
+        gpu.clear_fault()?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::CachePos));
+        key_op(
+            &gpu,
+            &step,
+            stream,
+            &kv_a_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            &g_src_dev,
+            &g_dst_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_op,
+            &mut kvr_op,
+            &mut cache_op,
+        )?;
+        stream.synchronize()?;
+        let op_fault = gpu.take_fault()?;
+        let op_untouched = cache_op.buf().to_host_vec(stream)? == cache_op_2;
+        let op_pass = op_fault == want && op_untouched;
+        println!(
+            "key cache_pos op=kv_append_pos_buf pos={CACHE_ROWS} of a {CACHE_ROWS}-row cache:              fault=\"{}\" want=\"{}\" cache_untouched={op_untouched} {}",
+            shown(op_fault),
+            shown(want),
+            verdict(op_pass)
+        );
+        fused.enqueue_kv_norm_rope_append(
+            stream,
+            &kv_a_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_fu,
+            &mut kvr_fu,
+            &mut cache_fu,
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        let fu_fault = gpu.take_fault()?;
+        let fu_untouched = cache_fu.buf().to_host_vec(stream)? == cache_fu_2;
+        let fu_rows_as_op =
+            bits_equal(&kv_s_op.to_host_vec(stream)?, &kv_s_fu.to_host_vec(stream)?)
+                && bits_equal(&kvr_op.to_host_vec(stream)?, &kvr_fu.to_host_vec(stream)?);
+        let fu_pass = fu_fault == want && fu_untouched && fu_rows_as_op;
+        println!(
+            "key cache_pos fused=kv_norm_rope_append pos={CACHE_ROWS} of a {CACHE_ROWS}-row cache:              fault=\"{}\" want=\"{}\" cache_untouched={fu_untouched}              kv_s_kvr_bit_identical_to_op={fu_rows_as_op} {}",
+            shown(fu_fault),
+            shown(want),
+            verdict(fu_pass)
+        );
+        if !(op_pass && fu_pass) {
             ok = false;
         }
     }

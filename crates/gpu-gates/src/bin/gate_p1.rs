@@ -17,6 +17,8 @@
 //! the Q5 path's 32-value quantizer each raise the fault word at their own
 //! site instead of rounding the value to code 0 — planted NaN and inf lanes,
 //! the word read back and cleared per case; the pinned shapes leave it clean.
+//! The two q8_1 quantizers store a refused block with a NaN scale, so the
+//! q3_K gemv over the planted column is NaN in every row.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -211,7 +213,7 @@ fn run() -> Result<(), GateError> {
     println!(
         "PASSED: gate_p1 K-quant gemvs within {KERNEL_BAND} of the q8_1 reference, \
          reruns bit-identical, pins matched, every planted non-finite lane raised its \
-         quantizer's fault"
+         quantizer's fault and the gemv over a refused q8_1 column is NaN"
     );
     Ok(())
 }
@@ -219,12 +221,11 @@ fn run() -> Result<(), GateError> {
 /// The quantizers' fault contract on planted input. The pinned shapes above
 /// ran on finite activations, so the word must still be clean; then per case
 /// the planted column goes through one quantizer, and the word read back
-/// (and cleared) must name that quantizer's site with no layer. The
-/// `silent_zero` column is the evidence of what the codes alone say: the
-/// q3_K gemv of the planted column against the same column with the planted
-/// lanes set to 0.0 — equal bits mean the non-finite lane became code 0 and
-/// nothing downstream could tell. Printed, not asserted: the codes of a
-/// faulted column are not a contract.
+/// (and cleared) must name that quantizer's site with no layer. For the two
+/// q8_1 quantizers the refused block is a contract too: the q3_K gemv of the
+/// planted column must be NaN in every row, where a block rounded to code 0
+/// would give the gemv of the same column with the planted lanes set to 0.0
+/// and nothing downstream could tell.
 #[cfg(feature = "gpu")]
 fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, GateError> {
     use bloomery_gpu::fused::FusedKernels;
@@ -281,10 +282,11 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
         let got = gpu.take_fault()?;
         let y_zero = gemv(&z, &mut act)?;
         let after = gpu.take_fault()?;
-        let pass = got == Some(want(FaultSite::QuantColumn)) && after.is_none();
+        let gemv_nan = y_bad.iter().all(|v| v.is_nan());
+        let pass = got == Some(want(FaultSite::QuantColumn)) && after.is_none() && gemv_nan;
         println!(
             "fault case={name} entry=q3k_quantize_q8_1 want=quant_column got={} zero_lane_clean={} \
-             silent_zero={} {}",
+             gemv_nan={gemv_nan} silent_zero={} {}",
             got.map_or("none".to_string(), |f| f.to_string()),
             after.is_none(),
             bits_equal(&y_bad, &y_zero),
@@ -294,8 +296,9 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
     }
 
     // norm_quant: one NaN lane makes the column's sum of squares NaN, so
-    // every normalized value is NaN and every code 0 — the whole column
-    // quantizes to zeros.
+    // every normalized value is NaN and every block of the column is
+    // refused — the gemv over it is NaN, not the zero a column of code 0
+    // would give.
     let fused = FusedKernels::load(gpu.context())?;
     let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; K])?;
     let (x, _) = planted(LANE..LANE + 1, f32::NAN);
@@ -314,11 +317,11 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
     gpu.enqueue_gemv_q3k(&w, &act, &mut y)?;
     let y = y.to_host_vec(stream)?;
     let got = gpu.take_fault()?;
-    let pass = got == Some(want(FaultSite::NormQuant));
+    let gemv_nan = y.iter().all(|v| v.is_nan());
+    let pass = got == Some(want(FaultSite::NormQuant)) && gemv_nan;
     println!(
-        "fault case=nan_lane entry=norm_quant want=norm_quant got={} gemv_all_zero={} {}",
+        "fault case=nan_lane entry=norm_quant want=norm_quant got={} gemv_nan={gemv_nan} {}",
         got.map_or("none".to_string(), |f| f.to_string()),
-        y.iter().all(|&v| v == 0.0),
         verdict(pass)
     );
     ok &= pass;

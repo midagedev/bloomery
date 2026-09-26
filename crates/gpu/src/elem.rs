@@ -520,9 +520,12 @@ mod elem_kernels {
     }
 
     /// The card's slot list of a hybrid layer whose card holds the id
-    /// prefix `[0, n_card)`: `sel[i] = ids[i]` for an id below `n_card`,
-    /// [`HOST`] otherwise — the one value the `_sel` kernels skip without a
-    /// fault. One thread per slot.
+    /// prefix `[0, n_card)` of a stack of `n_expert`: `sel[i] = ids[i]` for
+    /// an id below `n_card`, [`HOST`] otherwise — the one value the `_sel`
+    /// kernels skip without a fault. An id at or past `n_expert` names no
+    /// expert at all: it raises [`FaultSite::ExpertId`] on `fault` and is
+    /// written as [`HOST`] too, so no card kernel reads a row for it. One
+    /// thread per slot.
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -530,13 +533,23 @@ mod elem_kernels {
         block = (32, 1, 1),
         requires = (ids.len() >= n, sel.len() >= n)
     )]
-    pub fn card_sel(ids: &[u32], n: u32, n_card: u32, mut sel: DisjointSlice<u32>) {
+    pub fn card_sel(
+        ids: &[u32],
+        n: u32,
+        n_card: u32,
+        n_expert: u32,
+        fault: FaultSink,
+        mut sel: DisjointSlice<u32>,
+    ) {
         let i = thread::index_1d().get();
         if i >= n as usize {
             return;
         }
         // SAFETY: i < n <= ids.len() by the launch contract.
         let id = unsafe { *ids.get_unchecked(i) };
+        if id >= n_expert {
+            fault.raise(FaultSite::ExpertId);
+        }
         // SAFETY: i < n <= sel.len() by the launch contract; thread i alone
         // writes it.
         unsafe {
@@ -1101,15 +1114,23 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// Enqueue the card's slot list (`card_sel`) of the first `n` ids: an
-    /// id below `n_card` as it is, any other as [`HOST`]. Asynchronous,
-    /// allocation-free, capturable.
+    /// Enqueue the card's slot list (`card_sel`) of the first `n` ids over a
+    /// stack of `n_expert` whose card holds `[0, n_card)`: an id below
+    /// `n_card` as it is, any other as [`HOST`], and an id at or past
+    /// `n_expert` raised on `fault` as [`FaultSite::ExpertId`].
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the kernel's arguments; a fault sink and the stack's size joined them"
+    )]
     pub fn enqueue_card_sel(
         &self,
         stream: &CudaStream,
         ids: &DeviceBuffer<u32>,
         n: usize,
         n_card: usize,
+        n_expert: usize,
+        fault: FaultSink,
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_card_sel";
@@ -1119,12 +1140,20 @@ impl ElemKernels {
                 format!("n={n}, ids.len() {}, sel.len() {}", ids.len(), sel.len()),
             ));
         }
+        if n_card > n_expert {
+            return Err(GpuError::shape(
+                what,
+                format!("the card's {n_card} experts are more than the stack's {n_expert}"),
+            ));
+        }
         let n = launch_u32(what, "n", n)?;
         let n_card = launch_u32(what, "n_card", n_card)?;
+        let n_expert = launch_u32(what, "n_expert", n_expert)?;
         let prep = self
             .module
             .prepare_card_sel(LaunchConfig1D::new(n.div_ceil(32), 32, 0))?;
-        self.module.card_sel(stream, &prep, ids, n, n_card, sel)?;
+        self.module
+            .card_sel(stream, &prep, ids, n, n_card, n_expert, fault, sel)?;
         Ok(())
     }
 

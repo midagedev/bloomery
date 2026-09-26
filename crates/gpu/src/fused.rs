@@ -5,15 +5,16 @@
 //! path's `rope + rms_norm + gather + kv_append` as one launch.
 
 use crate::GpuError;
-use crate::cores::{q3_slot, q3k_row_dot, q4_slot, q6_slot, q8_quad};
+use crate::cores::q3k_row_dot;
 use crate::elem::{
     RMS_THREADS, RMS_THREADS_U32, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree,
     rope_pair_core, silu_mul,
 };
-use crate::fault::{FaultSink, FaultSite, quad_finite};
+use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
 use crate::launch_u32;
 use crate::q5::{Q8Blocks32, q5_row_dot};
+use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -65,11 +66,11 @@ mod fused_kernels {
     /// [`RMS_THREADS`] threads, is `elem::rms_norm`'s body verbatim
     /// (`rms_partial_sq` per thread, the fixed butterfly per warp,
     /// `rms_warp_tree`, `rms_scale`), phase B is
-    /// `kernels::q3k_quantize_q8_1`'s body per 128-value block with the
-    /// normalized value computed in registers as `(scale · gain) · x` — the
-    /// same expression and order `elem::rms_norm` stores — then the same
-    /// block amax / scale / rounding / permuted stores, warp `w` of the
-    /// block's `NORM_QUANT_WARPS` taking blocks `w, w + NORM_QUANT_WARPS, …`.
+    /// `kernels::q3k_quantize_q8_1`'s body (`q8_1_quant_vals`) per 128-value
+    /// block with the normalized value computed in registers as
+    /// `(scale · gain) · x` — the same expression and order `elem::rms_norm`
+    /// stores — warp `w` of the block's `NORM_QUANT_WARPS` taking blocks
+    /// `w, w + NORM_QUANT_WARPS, …`.
     /// One block owning the whole column is
     /// what removes the launch boundary: the 128-value amax needs the
     /// normalized values, the normalized values need the row's sum of
@@ -84,12 +85,13 @@ mod fused_kernels {
     /// f32 consumer passes a buffer it is about to overwrite anyway.
     ///
     /// A column whose normalized values are not all finite, or whose scale
-    /// is not positive (a sum of squares that overflowed), has no q8_1 form:
-    /// a lane that sees it raises [`FaultSite::NormQuant`] on `fault`, and
-    /// the whole 128-value block holding it is refused — every value of the
-    /// block lands in `y` as NaN and the block's scale in `d8` as NaN (zero
-    /// codes), so every consumer's dot over it is NaN. A finite block is
-    /// stored as always.
+    /// is not positive (a sum of squares that overflowed), has no q8_1 form.
+    /// A scale that is not positive hands the quantizer NaN values, and the
+    /// quantizer refuses every 128-value block holding a non-finite value —
+    /// its scale in `d8` NaN, its codes zero — which raises
+    /// [`FaultSite::NormQuant`] on `fault` and lands every value of the
+    /// block in `y` as NaN, so every consumer's dot over it is NaN. A finite
+    /// block is stored as always.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -203,88 +205,43 @@ mod fused_kernels {
                     *gain.get_unchecked(128 * b + 4 * lane + 3),
                 )
             };
-            // `elem::rms_norm`'s store expression, per value.
-            let nv0 = (scale * gn0) * v0;
-            let nv1 = (scale * gn1) * v1;
-            let nv2 = (scale * gn2) * v2;
-            let nv3 = (scale * gn3) * v3;
-            let bad = !(quad_finite([nv0, nv1, nv2, nv3]) & (scale > 0.0));
-            if bad {
+            // `elem::rms_norm`'s store expression, per value; a scale that
+            // is not positive (NaN, or 0 from an overflowed sum of squares)
+            // leaves finite values with no norm behind them, so the
+            // quantizer is handed NaN and refuses the block. The scale is the
+            // whole block's, so the select is block-uniform.
+            let nv = if scale > 0.0 {
+                [
+                    (scale * gn0) * v0,
+                    (scale * gn1) * v1,
+                    (scale * gn2) * v2,
+                    (scale * gn3) * v3,
+                ]
+            } else {
+                [f32::NAN; 4]
+            };
+            // SAFETY: column t < m and b < k/128 = 2*n_sb (the host passes
+            // n_sb = k/256), the output bounds are the launch contract's, the
+            // whole warp is here with the same `(t, b)` (one warp owns the
+            // block), and `nv` holds values 128*b + 4*lane .. +3 of column t.
+            let refused = unsafe {
+                q8_1_quant_vals(
+                    nv, t, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
+                    &mut d8,
+                )
+            };
+            if refused && lane == 0 {
                 fault.raise(FaultSite::NormQuant);
             }
-            // One warp owns the block, so the ballot refuses all of it.
-            let refused = warp::ballot(bad) != 0;
-            let (nv0, nv1, nv2, nv3) = if refused {
-                (f32::NAN, f32::NAN, f32::NAN, f32::NAN)
-            } else {
-                (nv0, nv1, nv2, nv3)
-            };
+            let nv = if refused { [f32::NAN; 4] } else { nv };
             // SAFETY: vb + 3 < base + k <= k*m <= y.len() by the launch
             // contract; each value of the column is written by exactly one
             // lane of exactly one warp.
             unsafe {
-                *y.get_unchecked_mut(vb) = nv0;
-                *y.get_unchecked_mut(vb + 1) = nv1;
-                *y.get_unchecked_mut(vb + 2) = nv2;
-                *y.get_unchecked_mut(vb + 3) = nv3;
-            }
-            let amax = warp::reduce_max_f32(nv0.abs().max(nv1.abs()).max(nv2.abs()).max(nv3.abs()));
-            let d = if refused {
-                f32::NAN
-            } else if amax > 0.0 {
-                amax / 127.0
-            } else {
-                1.0
-            };
-            let (word, quad) = q8_quad([nv0, nv1, nv2, nv3], d);
-
-            // v4 = this word's index in value order within the column (the
-            // quantizer's tie: the word covers values 128b + 4*lane .. +3).
-            let v4 = (32 * b + lane) as u32;
-            // Q3_K u64 pairing: the two fields of a gemv load PAIR (j, j^1)
-            // are always held by quantize lanes lane and lane^8 of one
-            // block, so all lanes run the collective shuffle and the
-            // bit3-clear half stores.
-            let g3 = q3_slot(v4);
-            let partner = warp::shuffle_xor(word, 8);
-            let cb = t * 64 * half_it as usize;
-            let p4 = q4_slot(v4);
-            let p6 = q6_slot(v4);
-            let cu4 = t * 256 * quad_it as usize;
-            let cu6 = t * 128 * half_it as usize;
-            // SAFETY: q3_slot < 64*half_it, q4_slot < 256*quad_it and
-            // q6_slot < 128*half_it per column (permutations of the column's
-            // value words onto its group slots, host-verified bijections);
-            // the three stores hit three distinct buffers, bit3-clear lanes
-            // of a block write disjoint u64 positions, every lane its own
-            // u32 position.
-            unsafe {
-                if lane & 8 == 0 {
-                    *q3.get_unchecked_mut(cb + g3 as usize) =
-                        (word as u64) | ((partner as u64) << 32);
-                }
-                *q4.get_unchecked_mut(cu4 + p4 as usize) = word;
-                *q6.get_unchecked_mut(cu6 + p6 as usize) = word;
-            }
-
-            // 32-value-group signed sums: butterfly over the lane-local
-            // quad sums (masks 1, 2, 4); lanes 8k write group 4b + k.
-            let mut g = quad;
-            g += warp::shuffle_xor(g as u32, 1) as i32;
-            g += warp::shuffle_xor(g as u32, 2) as i32;
-            g += warp::shuffle_xor(g as u32, 4) as i32;
-            if lane & 7 == 0 {
-                // SAFETY: group index 4b + lane/8 < 8*n_sb per column; s8
-                // holds m*8*n_sb words and one lane writes each group.
-                unsafe {
-                    *s8.get_unchecked_mut(t * 8 * n_sb + 4 * b + (lane >> 3)) = g;
-                }
-            }
-            if lane == 0 {
-                // SAFETY: lane 0 of each warp writes its own d8 slot.
-                unsafe {
-                    *d8.get_unchecked_mut(t * 2 * n_sb + b) = d;
-                }
+                *y.get_unchecked_mut(vb) = nv[0];
+                *y.get_unchecked_mut(vb + 1) = nv[1];
+                *y.get_unchecked_mut(vb + 2) = nv[2];
+                *y.get_unchecked_mut(vb + 3) = nv[3];
             }
 
             b += NORM_QUANT_WARPS;
@@ -307,8 +264,10 @@ mod fused_kernels {
     /// two spans leaves `kv_s` in the same state), the permutation is the
     /// `[k_rope | kv_compressed]` concat written from registers instead of
     /// through a gather's pair table, and the cache row is
-    /// `flash::kv_append_pos_buf`'s `f32_to_f16_bits` at `pos_buf[0]`, with
-    /// the same skip for a position at or past the cache's height.
+    /// `flash::kv_append_pos_buf`'s `f32_to_f16_bits` at `pos_buf[0]`. A
+    /// position at or past the cache's height has no row: it raises
+    /// [`FaultSite::CachePos`] on `fault` and appends nothing, as
+    /// `kv_append_pos_buf` does.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -340,6 +299,7 @@ mod fused_kernels {
         mut kv_s: DisjointSlice<f32>,
         mut kvr: DisjointSlice<f32>,
         mut cache: DisjointSlice<u16>,
+        fault: FaultSink,
     ) {
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
 
@@ -381,9 +341,12 @@ mod fused_kernels {
         // SAFETY: pos_buf.len() >= 1 by the launch contract.
         let pos = unsafe { *pos_buf.get_unchecked(0) } as usize;
         // The append's own bound: `pos` comes from device memory, so a row
-        // at or past the cache's height is skipped, not clamped. Launch
+        // at or past the cache's height is refused, not clamped. Launch
         // uniform — every thread reads the same slot.
         let live = pos < dst_rows as usize;
+        if !live && tid == 0 {
+            fault.raise(FaultSite::CachePos);
+        }
         let crow = pos * width;
 
         // The latent half, on `elem::rms_norm`'s own loop order. Each value
@@ -663,8 +626,8 @@ impl FusedKernels {
     /// `elem::rope` + `elem::rms_norm` + the `kvr` gather +
     /// `FlashKernels::enqueue_kv_append_pos_buf` produce, bit for bit.
     /// `cache` rows are `latent + rope` wide; a position at or past its
-    /// height leaves the cache untouched. m = 1. Asynchronous,
-    /// allocation-free, capturable.
+    /// height leaves the cache untouched and raises [`FaultSite::CachePos`]
+    /// on `fault`. m = 1. Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher; folding these into a *Args struct is the R8 round"
@@ -682,6 +645,7 @@ impl FusedKernels {
         kv_s: &mut DeviceBuffer<f32>,
         kvr: &mut DeviceBuffer<f32>,
         cache: &mut DeviceTensor<u16>,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let width = latent + rope;
         if latent == 0 || !latent.is_multiple_of(32) {
@@ -763,6 +727,7 @@ impl FusedKernels {
             kv_s,
             kvr,
             cache.buf_mut(),
+            fault,
         )?;
         Ok(())
     }

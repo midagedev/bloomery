@@ -796,6 +796,8 @@ mod qwen3moe_router_kernels {
                 if bad {
                     fault.raise(FaultSite::NormQuant);
                 }
+                // A refused group reaches the quantizer as NaN, which
+                // refuses it in turn: a NaN scale, zero codes.
                 // SAFETY: one column (col 0 < 1), b < k/128 = 2·n_sb (the
                 // host passes n_sb = k/256), the output bounds are the launch
                 // contract's, the whole warp is here with the same `b`, and
@@ -805,12 +807,6 @@ mod qwen3moe_router_kernels {
                         nv, 0, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
                         &mut d8,
                     );
-                }
-                if refused && lane == 0 {
-                    // SAFETY: the group's d8 slot b < 2·n_sb <= d8.len() (launch
-                    // contract), which lane 0 of this warp just wrote; nothing
-                    // else writes it.
-                    unsafe { *d8.get_unchecked_mut(b) = f32::NAN };
                 }
             }
             b += FUSED_WARPS;

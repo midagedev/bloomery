@@ -74,6 +74,7 @@
 //! They are instruments; no step ships through one.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
 use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -798,9 +799,11 @@ mod flash_kernels {
 
     /// `kv_append` with `pos` read from `pos_buf[0]` at run time — the
     /// variant a captured decode step replays against a new position by
-    /// rewriting the buffer between launches. Rows that would land at or
-    /// past `dst_rows` (the cache's allocated height) are skipped: `pos`
-    /// comes from device memory, so that bound cannot be a launch contract.
+    /// rewriting the buffer between launches. A row that would land at or
+    /// past `dst_rows` (the cache's allocated height) is refused: `pos`
+    /// comes from device memory, so that bound cannot be a launch contract;
+    /// the row is stored nowhere and raises [`FaultSite::CachePos`] on
+    /// `fault`.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -819,6 +822,7 @@ mod flash_kernels {
         pos_buf: &[u32],
         src: &[f32],
         mut dst: DisjointSlice<u16>,
+        fault: FaultSink,
     ) {
         let w = width as usize;
         let total = m as usize * w;
@@ -829,13 +833,16 @@ mod flash_kernels {
         // SAFETY: pos_buf.len() >= 1 by the launch contract.
         let pos = unsafe { *pos_buf.get_unchecked(0) } as usize;
         let row = i / w;
+        let col = i - row * w;
         if pos + row >= dst_rows as usize {
+            if col == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
             return;
         }
         // SAFETY: i < total <= src.len(); pos + row < dst_rows and col <
         // width, so the store index is < dst_rows * width <= dst.len().
         unsafe {
-            let col = i - row * w;
             *dst.get_unchecked_mut((pos + row) * w + col) = f32_to_f16_bits(*src.get_unchecked(i));
         }
     }
@@ -984,6 +991,7 @@ mod flash_kernels {
         mut q6b: DisjointSlice<u32>,
         mut s8b: DisjointSlice<i32>,
         mut d8b: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
         static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
@@ -1039,7 +1047,7 @@ mod flash_kernels {
         unsafe {
             quant_row(
                 v, qs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
-                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b, fault,
             );
         }
     }
@@ -1849,6 +1857,7 @@ mod flash_kernels {
         mut q6b: DisjointSlice<u32>,
         mut s8b: DisjointSlice<i32>,
         mut d8b: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut VROW: SharedArray<f32, LATENT> = SharedArray::UNINIT;
 
@@ -1880,7 +1889,7 @@ mod flash_kernels {
         unsafe {
             quant_row(
                 v, vs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
-                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b, fault,
             );
         }
     }
@@ -1941,6 +1950,7 @@ mod flash_kernels {
         mut d8b: DisjointSlice<f32>,
         shift: u32,
         jig: f32,
+        fault: FaultSink,
     ) {
         static mut VROW: SharedArray<f32, LATENT> = SharedArray::UNINIT;
 
@@ -1980,7 +1990,7 @@ mod flash_kernels {
         unsafe {
             quant_row(
                 v, vs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
-                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b, fault,
             );
         }
     }
@@ -2107,7 +2117,10 @@ mod flash_kernels {
     /// The q8_1 side output of a block that holds one whole column: thread
     /// `tid` contributes its value `v`, the block transposes through shared
     /// memory, and the first `lat / 128` warps each quantize one 128-value
-    /// block through `q8_1_quant_vals` — the one owner of that body.
+    /// block through `q8_1_quant_vals` — the one owner of that body, and of
+    /// its refusal: a block holding a non-finite value is stored with a NaN
+    /// scale and zero codes, and raises [`FaultSite::QuantColumn`] on
+    /// `fault`, as the quantize launch it replaces does.
     ///
     /// The transpose is what makes the fold bit-identical rather than merely
     /// close: the quantizer's warp sees the same 128 values in the same
@@ -2140,6 +2153,7 @@ mod flash_kernels {
         q6b: &mut DisjointSlice<u32>,
         s8b: &mut DisjointSlice<i32>,
         d8b: &mut DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // SAFETY: tid < lat <= LATENT, the shared array's length.
         unsafe {
@@ -2158,14 +2172,14 @@ mod flash_kernels {
         };
         let n_sb = n_sb as usize;
         // The branch is on the block index, so each arm runs block-uniform.
-        if row < m_lo as usize {
+        let refused = if row < m_lo as usize {
             // SAFETY: the values are block `blk`'s, held four per lane in
             // value order (`q8_1_quant_vals`'s precondition); `row < m_lo` is
             // inside the first half and the launch contract bounds its outputs.
             unsafe {
                 q8_1_quant_vals(
                     vals, row, blk, n_sb, half_it, quad_it, lane, q3a, q4a, q6a, s8a, d8a,
-                );
+                )
             }
         } else {
             // SAFETY: the values are block `blk`'s, held four per lane in
@@ -2185,8 +2199,11 @@ mod flash_kernels {
                     q6b,
                     s8b,
                     d8b,
-                );
+                )
             }
+        };
+        if refused && lane == 0 {
+            fault.raise(FaultSite::QuantColumn);
         }
     }
 
@@ -2613,12 +2630,14 @@ pub struct FlashLatentArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`FlashKernels::enqueue_flash_latent_q8`]'s arguments.
-pub(crate) struct FlashLatentQ8Args<'a> {
+/// [`FlashKernels::enqueue_flash_latent_q8`]'s arguments: the side
+/// output's refusal raises on `fault`.
+pub struct FlashLatentQ8Args<'a> {
     pub inputs: FlashInputs<'a>,
     pub y: &'a mut DeviceBuffer<f32>,
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
+    pub fault: FaultSink,
 }
 
 /// [`FlashKernels::enqueue_flash_latent_split`]'s arguments.
@@ -2659,11 +2678,13 @@ pub struct FlashMergeArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`FlashKernels::enqueue_flash_merge_q8`]'s arguments.
-pub(crate) struct FlashMergeQ8Args<'a> {
+/// [`FlashKernels::enqueue_flash_merge_q8`]'s arguments: the side output's
+/// refusal raises on `fault`.
+pub struct FlashMergeQ8Args<'a> {
     pub merge: FlashMergeArgs<'a>,
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
+    pub fault: FaultSink,
 }
 
 /// [`FlashKernels::enqueue_flash_merge2_q8`]'s arguments: the q8 merge's
@@ -2673,6 +2694,7 @@ pub(crate) struct FlashMerge2Q8Args<'a> {
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
     pub shift_segs: usize,
+    pub fault: FaultSink,
 }
 
 impl FlashKernels {
@@ -2725,7 +2747,8 @@ impl FlashKernels {
     /// [`FlashKernels::enqueue_kv_append`] with `pos` read from
     /// `pos_buf[0]` on the device at run time — the captured-graph form: the
     /// graph replays unchanged while the position advances through the
-    /// buffer. Rows past the cache's height are skipped in-kernel. `pos_buf`
+    /// buffer. A row past the cache's height is refused in-kernel: stored
+    /// nowhere, it raises [`FaultSite::CachePos`] on `fault`. `pos_buf`
     /// must stay allocated and in place for as long as a captured graph
     /// replaying this launch lives. Asynchronous, allocation-free,
     /// capturable.
@@ -2736,6 +2759,7 @@ impl FlashKernels {
         pos_buf: &DeviceBuffer<u32>,
         cache: &mut DeviceTensor<u16>,
         m: usize,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let (rows, width) = (cache.rows(), cache.cols());
         if pos_buf.is_empty() {
@@ -2762,6 +2786,7 @@ impl FlashKernels {
             pos_buf,
             src,
             cache.buf_mut(),
+            fault,
         )?;
         Ok(())
     }
@@ -3192,13 +3217,19 @@ impl FlashKernels {
     /// `lo`'s columns in order, the rest `hi`'s. The bytes are the ones
     /// `Gpu::enqueue_quantize_q8_1_pair(y, 0, lo, lo.m() * latent, hi)`
     /// would have written, so this deletes that launch rather than merging
-    /// it. Asynchronous, allocation-free, capturable.
-    pub(crate) fn enqueue_flash_merge_q8(
+    /// it; a refused block raises [`FaultSite::QuantColumn`] on `a.fault`.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_flash_merge_q8(
         &self,
         stream: &CudaStream,
         a: FlashMergeQ8Args<'_>,
     ) -> Result<(), GpuError> {
-        let FlashMergeQ8Args { merge, lo, hi } = a;
+        let FlashMergeQ8Args {
+            merge,
+            lo,
+            hi,
+            fault,
+        } = a;
         let what = "enqueue_flash_merge_q8";
         let (q_rows, segs) = check_merge(what, &merge)?;
         let FlashMergeArgs {
@@ -3252,6 +3283,7 @@ impl FlashKernels {
             &mut hi.q6,
             &mut hi.s8,
             &mut hi.d8,
+            fault,
         )?;
         Ok(())
     }
@@ -3271,6 +3303,7 @@ impl FlashKernels {
             lo,
             hi,
             shift_segs: shift,
+            fault,
         } = a;
         let what = "enqueue_flash_merge2_q8";
         let (q_rows, segs) = check_merge(what, &merge)?;
@@ -3328,19 +3361,26 @@ impl FlashKernels {
             &mut hi.d8,
             shift,
             PROBE_JIG,
+            fault,
         )?;
         Ok(())
     }
 
     /// [`FlashKernels::enqueue_flash_latent`] with the same q8_1 side output
     /// as [`FlashKernels::enqueue_flash_merge_q8`] — the single-segment path,
-    /// so both paths of the folded step quantize.
-    pub(crate) fn enqueue_flash_latent_q8(
+    /// so both paths of the folded step quantize, and refuse alike.
+    pub fn enqueue_flash_latent_q8(
         &self,
         stream: &CudaStream,
         a: FlashLatentQ8Args<'_>,
     ) -> Result<(), GpuError> {
-        let FlashLatentQ8Args { inputs, y, lo, hi } = a;
+        let FlashLatentQ8Args {
+            inputs,
+            y,
+            lo,
+            hi,
+            fault,
+        } = a;
         let FlashInputs {
             q,
             kv,
@@ -3396,6 +3436,7 @@ impl FlashKernels {
             &mut hi.q6,
             &mut hi.s8,
             &mut hi.d8,
+            fault,
         )?;
         Ok(())
     }

@@ -526,11 +526,9 @@ impl From<::model::ModelError> for GpuError {
 /// device-callable body. It is not in `cores` because its stores need the
 /// module's `DisjointSlice` outputs, which no core takes.
 ///
-/// A block holding a non-finite value has no q8_1 form (its NaN lanes would
-/// round to code 0 and nothing downstream could tell): the lane that holds
-/// one raises `site` on `fault`, and the block is still stored — the codes
-/// of a finite block are what they always were, and a faulted step is
-/// refused before anything reads them.
+/// A block holding a non-finite value has no q8_1 form:
+/// [`q8_1_quant_vals`] refuses it (NaN scale, zero codes and sums), and this
+/// raises `site` on `fault` for it.
 ///
 /// SAFETY: the caller guarantees `col < m_cols`, `b < 2 * n_sb`, the launch
 /// contract's bounds on `x` at base `x0` and on the five outputs, and that
@@ -573,14 +571,15 @@ pub fn q8_1_quant_block(
             *x.get_unchecked(base + 3),
         ]
     };
-    if !crate::fault::quad_finite(v) {
-        fault.raise(site);
-    }
     // SAFETY: this fn's own contract gives `col < m_cols`, `b < 2*n_sb`, the
     // output bounds and the warp-uniform `(col, b)` that
     // [`q8_1_quant_vals`] requires, and `v` holds exactly its values
     // `128*b + 4*lane .. +3` of column `col` — the rest of its contract.
-    unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) }
+    let refused =
+        unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) };
+    if refused && lane == 0 {
+        fault.raise(site);
+    }
 }
 
 /// The same 128-value q8_1 quantization from the four values already in a
@@ -589,6 +588,16 @@ pub fn q8_1_quant_block(
 /// holding the same block's 128 values in the same order, because the amax
 /// below is a warp collective and a scale computed over a different set of
 /// values changes every byte quantized with it.
+///
+/// The one owner of the q8_1 refusal. A block holding a non-finite value
+/// has no q8_1 form (a NaN lane would round to code 0 and the scale come
+/// from the finite lanes, a plausible block), and `f32::max` drops a NaN, so
+/// the amax cannot tell: each lane tests its four values and one ballot
+/// refuses the block. A refused block is stored with a NaN scale and zero
+/// codes and code sums, so every dot over it is NaN. The return says
+/// whether this block was refused — the same on every lane — for the caller
+/// to raise its own fault site; a caller that ignores it still stores no
+/// plausible block. A finite block is stored as it always was.
 ///
 /// SAFETY: as [`q8_1_quant_block`], and `v` must be values `128 * b + 4 *
 /// lane .. +3` of column `col`.
@@ -610,13 +619,19 @@ pub(crate) unsafe fn q8_1_quant_vals(
     q6: &mut DisjointSlice<u32>,
     s8: &mut DisjointSlice<i32>,
     d8: &mut DisjointSlice<f32>,
-) {
+) -> bool {
     use crate::cores::{q3_slot, q4_slot, q6_slot, q8_quad};
 
     let (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+    let refused = warp::ballot(!crate::fault::quad_finite(v)) != 0;
     let amax = warp::reduce_max_f32(v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()));
     let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
     let (word, quad) = q8_quad([v0, v1, v2, v3], d);
+    let (word, quad, d) = if refused {
+        (0, 0, f32::NAN)
+    } else {
+        (word, quad, d)
+    };
 
     // v4 = this word's index in value order within the column: the word
     // covers values 128b + 4*lane .. +3, so v4 = 32b + lane (32 words per
@@ -672,6 +687,7 @@ pub(crate) unsafe fn q8_1_quant_vals(
             *d8.get_unchecked_mut(col * 2 * n_sb + b) = d;
         }
     }
+    refused
 }
 
 #[cuda_module]

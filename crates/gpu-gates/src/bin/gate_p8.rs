@@ -832,9 +832,10 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
     }
 
     {
+        let sink = gpu.unlabelled_sink();
         let mut enq = |s: &CudaStream| {
             gpu.router()
-                .enqueue_router_topk(s, &x, 1, 1.0, &mut probs, &mut ids, &mut wts)
+                .enqueue_router_topk(s, &x, 1, 1.0, &mut probs, &mut ids, &mut wts, sink)
         };
         let e = burst(stream, &mut enq)?;
         let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;

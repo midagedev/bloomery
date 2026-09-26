@@ -61,7 +61,7 @@ pub const fn mask_index(layer: u32) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FaultSite {
-    /// The q8_1 activation quantizer (`q8_1_quant_block`: `q3k_quantize_q8_1`
+    /// The q8_1 activation quantizer (`q8_1_quant_vals`: `q3k_quantize_q8_1`
     /// and every entry that runs its body) met a non-finite value.
     QuantColumn = 1,
     /// `norm_quant` normalized a column to a non-finite value, or to a zero
@@ -71,8 +71,8 @@ pub enum FaultSite {
     Q5Quant = 3,
     /// `ds41_hc_pre`'s in-register q8_1 activation met a non-finite value.
     HcQuant = 4,
-    /// A router found fewer finite candidates than slots, or produced a
-    /// non-finite weight.
+    /// A router met a non-finite logit, found fewer finite candidates than
+    /// slots, or produced a non-finite weight.
     Router = 5,
     /// A selected-attention list named a row past the compressed stream.
     AttnSel = 6,
@@ -136,7 +136,7 @@ impl FaultSite {
             | FaultSite::Q5Quant
             | FaultSite::HcQuant => "non-finite activation",
             FaultSite::Router => {
-                "fewer finite router candidates than slots, or a non-finite weight"
+                "a non-finite router logit, fewer finite candidates than slots, or a non-finite weight"
             }
             FaultSite::AttnSel => "a selected row past the compressed stream",
             FaultSite::ExpertId => "a routed expert id past the stack's expert count",
@@ -164,21 +164,22 @@ pub mod step_order {
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
-    /// the layer's entry, the projections' q8_1 quantizer, the routed `_sel`
-    /// kernels, the down projection's 32-value quantizer. Its attention and
-    /// router raise nothing.
+    /// the layer's entry, the key path's cache append, the attention
+    /// output's q8_1 quantizer (in the flash launch or its own), the router,
+    /// the card's slot list and the routed `_sel` kernels, the down
+    /// projection's 32-value quantizer.
     pub const DEEPSEEK2: &[FaultSite] = &[
         TokenId,
         NormQuant,
+        CachePos,
         QuantColumn,
+        Router,
         ExpertId,
         Q5Quant,
-        Router,
         AttnCount,
         AttnSel,
         KeyCount,
         HcQuant,
-        CachePos,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible

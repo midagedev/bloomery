@@ -20,7 +20,7 @@ use crate::model::probe::{
 use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, launch_u32};
+use crate::{FaultSink, Gpu, GpuError, launch_u32};
 use cuda_core::DeviceBuffer;
 use model::arch::deepseek2::attn::MlaParams;
 
@@ -175,7 +175,9 @@ fn enqueue_attn(
     // fold would leave the single-segment path unquantized. The kqvc
     // quantizer reads the same flag to skip its own launch.
     let fold_quant = !s.probe_cfg.skip_quant && !s.probe_cfg.split_flash_quant;
-    attn_flash(gpu, kv_l, s, mla, fold_quant, i, obs)?;
+    // Unlabelled, as the split path's own quantizer launches are: either
+    // path leaves the same fault word.
+    attn_flash(gpu, kv_l, s, mla, fold_quant, gpu.unlabelled_sink(), i, obs)?;
     attn_kqvc_quant(gpu, s, mla, fold_quant, i, obs)?;
     attn_wv_b(gpu, step, w, names, s, mla, i, obs)?;
     attn_out(gpu, w, names, s, i, obs)
@@ -293,6 +295,7 @@ fn attn_proj(
         &mut s.kv_s,
         &mut s.kvr,
         kv_l,
+        gpu.layer_sink(names.layer)?,
     )?;
     // kv_a, the latent gain and the cos/sin pair in; the two f32 forms and
     // the one f16 cache row out.
@@ -385,13 +388,19 @@ fn attn_qrows(
 }
 
 /// Stage 8 of the attention half: flash over the live rows of `kv_l` into
-/// `s.kqvc`, and its q8_1 form alongside when `fold_quant` is set.
+/// `s.kqvc`, and its q8_1 form alongside when `fold_quant` is set, whose
+/// refusal raises on `fault`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_attn`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
 fn attn_flash(
     gpu: &Gpu,
     kv_l: &DeviceTensor<u16>,
     s: &mut LayerScratch,
     mla: &MlaParams,
     fold_quant: bool,
+    fault: FaultSink,
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
@@ -435,6 +444,7 @@ fn attn_flash(
                     y: &mut s.kqvc,
                     lo: &mut s.act_kv_lo,
                     hi: &mut s.act_kv_hi,
+                    fault,
                 },
             )?;
         } else {
@@ -520,6 +530,7 @@ fn attn_flash(
                         lo: &mut s.act_kv_lo,
                         hi: &mut s.act_kv_hi,
                         shift_segs: 0,
+                        fault,
                     },
                 )?;
             } else {
@@ -529,6 +540,7 @@ fn attn_flash(
                         merge,
                         lo: &mut s.act_kv_lo,
                         hi: &mut s.act_kv_hi,
+                        fault,
                     },
                 )?;
             }
@@ -920,8 +932,9 @@ fn enqueue_ffn_moe(
 /// slot list (`card_sel`) writes a host slot — an id past the resident
 /// prefix — as [`crate::hybrid::HOST`], which the `_sel` kernels leave
 /// untouched without a fault, so the combine reads zero there and never an
-/// earlier layer's output. The host reads the router's raw ids from the
-/// handoff. The
+/// earlier layer's output; an id past the whole stack raises the layer's
+/// [`crate::FaultSite::ExpertId`] there. The host reads the router's raw
+/// ids from the handoff. The
 /// host's sum joins the shared expert's output in one add, and the combine
 /// keeps its grouping — `(Σ_card w·down + (shexp + hsum)) + resid`. With no
 /// expert on the card the `_sel` launches and the zeroing drop out, and the
@@ -978,8 +991,15 @@ fn enqueue_ffn_moe_hybrid(
     if card {
         m.down.zero_async(stream)?;
         tick(i, obs, "hybrid_zero_down", bsum(&[Some(4 * m.down.len())]))?;
-        gpu.elem()
-            .enqueue_card_sel(stream, &b.ids, dims.n_used, n_card, &mut m.ids)?;
+        gpu.elem().enqueue_card_sel(
+            stream,
+            &b.ids,
+            dims.n_used,
+            n_card,
+            dims.n_expert,
+            gpu.layer_sink(names.layer)?,
+            &mut m.ids,
+        )?;
         tick(i, obs, "hybrid_card_sel", bsum(&[Some(8 * dims.n_used)]))?;
         moe_expert_gate_up(gpu, w, names, act_ffn, &m.ids, &mut m.h_exp, dims, i, obs)?;
     }
@@ -1156,7 +1176,14 @@ fn moe_router(
         ]),
     )?;
     gpu.router().enqueue_router_topk(
-        stream, io.logits, 1, dims.scale, io.probs, io.ids, io.weights,
+        stream,
+        io.logits,
+        1,
+        dims.scale,
+        io.probs,
+        io.ids,
+        io.weights,
+        gpu.layer_sink(names.layer)?,
     )?;
     // The logits in; the probabilities, the chosen ids and their weights out.
     tick(

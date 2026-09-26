@@ -46,9 +46,13 @@
 //! when it does not. With two columns not finite it records the first, with
 //! what it saw there, and both come back NaN. The word is clean before and
 //! after a clean service.
+//! The card's slot list (`card_sel`) on the same boundary: an id past the
+//! card's prefix is written `HOST` with the word clean, and an id past the
+//! whole stack is written `HOST` and raises the layer's `ExpertId`.
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
-//! layer, with one refusal recorded by the host tier.
+//! layer — its norm's and its router's sites in the mask, printed in the
+//! Deepseek2 step order — with one refusal recorded by the host tier.
 //!
 //! And the batch service's exclusion set, on the same stub boundary: a
 //! service given a set of host experts computes, for every column, what the
@@ -97,7 +101,8 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fused::FusedKernels;
     use bloomery_gpu::hybrid::{
-        Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, SlotMap, levers, name_refusal,
+        Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, SlotMap, levers,
+        name_refusal,
     };
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{
@@ -1194,6 +1199,48 @@ mod gate {
             verdict(pass)
         );
         ok &= pass;
+
+        // The card's slot list (`card_sel`) over this boundary's stack: a
+        // known id is kept below the card's prefix and written HOST past
+        // it, with the word clean; an id past the whole stack names no
+        // expert, so it raises the layer's ExpertId and is written HOST
+        // too — no card kernel reads a row for it.
+        let known = [0u32, 5, 7, 8, 15, 3];
+        let past = [0u32, 5, 7, 8, 15, 16, u32::MAX, 3];
+        let sel_cases = [
+            ("known ids", &known[..], &[0, 5, 7, HOST, HOST, 3][..], None),
+            (
+                "ids 16 and u32::MAX past a 16-expert stack",
+                &past[..],
+                &[0, 5, 7, HOST, HOST, HOST, HOST, 3][..],
+                Some(Fault::at(layer, FaultSite::ExpertId)),
+            ),
+        ];
+        for (name, ids_in, want_sel, want_fault) in sel_cases {
+            let ids_dev = DeviceBuffer::from_host(stream, ids_in)?;
+            let mut sel = DeviceBuffer::from_host(stream, &vec![0xA5A5_A5A5u32; ids_in.len()])?;
+            gpu.elem().enqueue_card_sel(
+                stream,
+                &ids_dev,
+                ids_in.len(),
+                R_CARD,
+                R_EXPERTS,
+                gpu.layer_sink(R_LAYER)?,
+                &mut sel,
+            )?;
+            stream.synchronize()?;
+            let got = sel.to_host_vec(stream)?;
+            let word = gpu.take_fault()?;
+            let pass = got == want_sel && word == want_fault;
+            println!(
+                "refusal card_sel {name}: n_card={R_CARD} n_expert={R_EXPERTS} sel={got:?} want={want_sel:?} \
+                 fault=\"{}\" want=\"{}\" {}",
+                word.map_or_else(|| "none".to_string(), |f| f.to_string()),
+                want_fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
         stream.synchronize()?;
         println!("refusal verdict {}", verdict(ok));
         Ok(ok)
@@ -1422,9 +1469,11 @@ mod gate {
 
             // The engine's own naming on a real layer: a NaN in a hybrid
             // layer's input residual is refused by the card's norm at that
-            // layer and met by the host service in its handoff, and the
-            // caller sees the card's fault (`GpuModel::name_host_refusal`),
-            // never the host's error. It poisons the tier, so it runs last.
+            // layer (and by its router) and met by the host service in its
+            // handoff, and the caller sees the card's fault
+            // (`GpuModel::name_host_refusal`), never the host's error, its
+            // mask printed in this architecture's step order. It poisons the
+            // tier, so it runs last.
             let (l, x_in, _) = chains
                 .first()
                 .and_then(|c| c.layers.first())
@@ -1433,22 +1482,28 @@ mod gate {
             x_nan[0] = f32::NAN;
             let r = h.step_layer_hybrid(*l, &x_nan, 0);
             let refused = h.hybrid_stats().is_some_and(|s| s.refusals == 1);
-            let named = match &r {
+            let raised = |site: FaultSite| match &r {
                 Err(GpuError::Fault { fault, .. }) => {
                     usize::try_from(fault.layer).is_ok_and(|fl| fl == *l)
-                        && fault.sites & (1 << FaultSite::NormQuant as u32) != 0
+                        && fault.sites & (1 << site as u32) != 0
                 }
                 _ => false,
             };
-            let pass = named && refused;
+            // The norm refuses the NaN column, and the router meets the NaN
+            // logits it leads to: both raised on the layer's sink.
+            let named = raised(FaultSite::NormQuant);
+            let routed = raised(FaultSite::Router);
+            let answer = match &r {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => e.to_string(),
+            };
+            let in_order = answer.contains("Deepseek2 step order");
+            let pass = named && routed && in_order && refused;
             ok &= pass;
             println!(
-                "n_l=32 engine refusal layer={l} input NaN at value 0: answer \"{}\" names the card's \
-                 fault at the layer {named}, the host recorded one refusal {refused} {}",
-                match &r {
-                    Ok(_) => "Ok".to_string(),
-                    Err(e) => e.to_string(),
-                },
+                "n_l=32 engine refusal layer={l} input NaN at value 0: answer \"{answer}\" names the \
+                 card's fault at the layer {named}, the router's refusal there too {routed}, in the \
+                 Deepseek2 step order {in_order}, the host recorded one refusal {refused} {}",
                 verdict(pass)
             );
         }

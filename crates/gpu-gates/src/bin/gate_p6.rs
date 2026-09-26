@@ -22,9 +22,14 @@
 //! cast to f32) and every token's ids must equal the routing reference.
 //! Synthetic inputs cover what the dump cannot supply (an exact tie at the
 //! 6th/7th rank, ties filling the whole top-6, tie pairs across the range,
-//! all-equal logits, ±80 extreme logits, `-inf` logits in the tail, inside
-//! the top and everywhere but one expert, and m = 8) and pin the tie rule
-//! and overflow behaviour against the same host reference.
+//! all-equal logits, ±80 extreme logits, and m = 8) and pin the tie rule
+//! and overflow behaviour against the same host reference. A non-finite
+//! logit has no routing and is refused: NaN, `+inf` and `-inf` logits (in
+//! the tail, inside the top, everywhere but one expert, and in two tokens
+//! of an m = 8 call) must raise the router's fault site at the launch's
+//! layer, write the refused token's probabilities and weights NaN and leave
+//! its ids as the buffer held them, while every other token of the call
+//! routes as the host reference does.
 //!
 //! Every case also prints an FNV-1a 64 digest of its (probs, ids, weights)
 //! bits. The digest asserts nothing — it is the line a kernel reshape is
@@ -209,7 +214,7 @@ fn run() -> Result<(), GateError> {
 
         // Device run on the same logits (transposed into the gemv layout).
         let x_dev_layout = to_expert_major(&x_ik, N_EXPERT, m);
-        let out = run_router(&router, stream, &x_dev_layout, m, scale)?;
+        let out = run_router(&router, &gpu, &x_dev_layout, m, scale)?;
         let probs_t = transpose(&out.probs, N_EXPERT, m);
         let ids_t: Vec<i32> = transpose(&out.ids, N_USED, m)
             .iter()
@@ -280,11 +285,11 @@ fn run() -> Result<(), GateError> {
             1.4 - 0.01 * (e - 7) as f32
         };
     }
-    ok &= synth_case(&router, stream, "tie_6th_7th", &tie, scale)?;
+    ok &= synth_case(&router, &gpu, "tie_6th_7th", &tie, scale)?;
 
     // All-equal logits: probs all 1/64, ids 0..=5 (every rank a tie).
     let flat = vec![1.25f32; N_EXPERT];
-    ok &= synth_case(&router, stream, "all_equal", &flat, scale)?;
+    ok &= synth_case(&router, &gpu, "all_equal", &flat, scale)?;
 
     // Extreme finite logits (+80 vs -80, rest moderate): exp underflows to
     // 0 for the far tail and nothing becomes non-finite.
@@ -296,7 +301,7 @@ fn run() -> Result<(), GateError> {
             _ => e as f32 * 0.25 - 7.75,
         };
     }
-    ok &= synth_case(&router, stream, "extreme_pm80", &ext, scale)?;
+    ok &= synth_case(&router, &gpu, "extreme_pm80", &ext, scale)?;
 
     // Ties filling the whole top-6 and one rank past it: experts 0..=7 share
     // the largest logit, so every one of the six ranks is decided by the tie
@@ -305,46 +310,56 @@ fn run() -> Result<(), GateError> {
     for v in tie_top.iter_mut().take(8) {
         *v = 2.0;
     }
-    ok &= synth_case(&router, stream, "tie_fills_top6", &tie_top, scale)?;
+    ok &= synth_case(&router, &gpu, "tie_fills_top6", &tie_top, scale)?;
 
     // Ties two by two across the whole range: experts 2j and 2j+1 share a
     // logit, so each rank picks the even id and the ids are 0, 2, 4, 6, 8, 10.
     let tie_pairs: Vec<f32> = (0..N_EXPERT).map(|e| -0.5 * (e / 2) as f32).collect();
-    ok &= synth_case(&router, stream, "tie_pairs", &tie_pairs, scale)?;
+    ok &= synth_case(&router, &gpu, "tie_pairs", &tie_pairs, scale)?;
 
-    // `-inf` in the tail: experts 40.. are masked off entirely. Their exps
-    // are exactly +0.0, so nothing becomes non-finite and the top-6 comes
-    // from the live head.
-    let mut inf_tail: Vec<f32> = (0..N_EXPERT).map(|e| 1.0 - 0.02 * e as f32).collect();
+    // ---- non-finite logits: refused, never routed. The m = 1 path tests
+    // expert L and L + 32 in lane L, so the cases put the value in both
+    // halves: a NaN at 17 (lane 17's first), `+inf` at 45 (lane 13's
+    // second), and `-inf` — which a softmax would read as probability 0 —
+    // in the tail, in the head and everywhere but one expert.
+    let live: Vec<f32> = (0..N_EXPERT).map(|e| 1.0 - 0.02 * e as f32).collect();
+    let mut nan_one = live.clone();
+    nan_one[17] = f32::NAN;
+    ok &= refused_case(&router, &gpu, "nan_logit", &nan_one, 1, &[0], scale)?;
+    let mut pos_inf = live.clone();
+    pos_inf[45] = f32::INFINITY;
+    ok &= refused_case(&router, &gpu, "pos_inf_logit", &pos_inf, 1, &[0], scale)?;
+    let mut inf_tail = live.clone();
     for v in inf_tail.iter_mut().skip(40) {
         *v = f32::NEG_INFINITY;
     }
-    ok &= synth_case(&router, stream, "neg_inf_tail", &inf_tail, scale)?;
-
-    // `-inf` inside what would have been the top-6: experts 0 and 2 are
-    // masked off the head of the ranking, so the six slots must come from
-    // the live experts below them and no masked id may appear. The pair at
-    // 8 and 9 is an exact tie sitting well under the cut — it must stay
-    // under it. The boundary tie itself is `tie_6th_7th`'s.
-    let mut inf_top = inf_tail.clone();
+    ok &= refused_case(&router, &gpu, "neg_inf_tail", &inf_tail, 1, &[0], scale)?;
+    let mut inf_top = live.clone();
     inf_top[0] = f32::NEG_INFINITY;
     inf_top[2] = f32::NEG_INFINITY;
-    inf_top[8] = 0.5;
-    inf_top[9] = 0.5;
-    ok &= synth_case(&router, stream, "neg_inf_in_top6", &inf_top, scale)?;
-
-    // Everything but one expert masked: that expert takes prob 1.0 and the
-    // five remaining slots are an all-zero tie, so the ids are the live
-    // expert followed by the five smallest masked ids.
+    ok &= refused_case(&router, &gpu, "neg_inf_in_top6", &inf_top, 1, &[0], scale)?;
     let mut inf_all_but_one = vec![f32::NEG_INFINITY; N_EXPERT];
     inf_all_but_one[37] = 0.0;
-    ok &= synth_case(
+    ok &= refused_case(
         &router,
-        stream,
+        &gpu,
         "neg_inf_all_but_one",
         &inf_all_but_one,
+        1,
+        &[0],
         scale,
     )?;
+    // m = 8, where one thread owns one token: a NaN in token 3's last
+    // expert and `-inf` in token 5's first refuse those two tokens alone.
+    let mut mixed = vec![0.0f32; N_EXPERT * 8];
+    for t in 0..8usize {
+        for e in 0..N_EXPERT {
+            mixed[t * N_EXPERT + e] = (((e * 5 + t * 11) % N_EXPERT) as f32) / 8.0 - 4.0;
+        }
+    }
+    mixed[3 * N_EXPERT + 63] = f32::NAN;
+    mixed[5 * N_EXPERT] = f32::NEG_INFINITY;
+    ok &= refused_case(&router, &gpu, "m8_two_tokens", &mixed, 8, &[3, 5], scale)?;
 
     // m = 8 (the layout bound): distinct logits per token, one exact tie in
     // token 2, extremes in token 6.
@@ -359,7 +374,7 @@ fn run() -> Result<(), GateError> {
     xt[6 * N_EXPERT + 3] = 80.0;
     xt[6 * N_EXPERT + 40] = -80.0;
     let x8 = to_expert_major(&xt, N_EXPERT, 8);
-    let out = run_router(&router, stream, &x8, 8, scale)?;
+    let out = run_router(&router, &gpu, &x8, 8, scale)?;
     let probs_t = transpose(&out.probs, N_EXPERT, 8);
     let ids_t: Vec<i32> = transpose(&out.ids, N_USED, 8)
         .iter()
@@ -407,6 +422,7 @@ fn run() -> Result<(), GateError> {
     let mut r0g = DeviceBuffer::<u32>::zeroed(stream, N_USED)?;
     let mut r0u = DeviceBuffer::<u32>::zeroed(stream, N_USED)?;
     let mut r0d = DeviceBuffer::<u32>::zeroed(stream, N_USED)?;
+    let sink = gpu.unlabelled_sink();
     let chain = |probs: &mut DeviceBuffer<f32>,
                  ids: &mut DeviceBuffer<u32>,
                  w: &mut DeviceBuffer<f32>,
@@ -414,7 +430,7 @@ fn run() -> Result<(), GateError> {
                  r0u: &mut DeviceBuffer<u32>,
                  r0d: &mut DeviceBuffer<u32>|
      -> Result<(), bloomery_gpu::GpuError> {
-        router.enqueue_router_topk(stream, &x_dev, m, scale, probs, ids, w)?;
+        router.enqueue_router_topk(stream, &x_dev, m, scale, probs, ids, w, sink)?;
         router.enqueue_expert_table(stream, ids, rows_gu, rows_dn, r0g, r0u, r0d)?;
         Ok(())
     };
@@ -469,9 +485,11 @@ fn run() -> Result<(), GateError> {
         && eager.4 == replay.4
         && eager.5 == replay.5;
     let nodes = graph.node_count();
-    let pass = identical && nodes == 2;
+    let fault = gpu.take_fault()?;
+    let pass = identical && nodes == 2 && fault.is_none();
     println!(
-        "graph op=router_topk+expert_table src=ffn_moe_logits-13 m={m} eager_vs_graph_bit_identical={identical} graph_nodes={nodes} {}",
+        "graph op=router_topk+expert_table src=ffn_moe_logits-13 m={m} eager_vs_graph_bit_identical={identical} graph_nodes={nodes} fault={} {}",
+        fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
         verdict(pass)
     );
     if !pass {
@@ -498,7 +516,7 @@ fn run() -> Result<(), GateError> {
         let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
         let empty = gpu.capture(|_| probe.enqueue_touch(stream, &mut tbuf))?;
         let rt = gpu.capture(|_| {
-            router.enqueue_router_topk(stream, &x1_dev, 1, scale, &mut p1, &mut i1, &mut w1)
+            router.enqueue_router_topk(stream, &x1_dev, 1, scale, &mut p1, &mut i1, &mut w1, sink)
         })?;
         let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, GateError> {
             for _ in 0..2 {
@@ -526,7 +544,7 @@ fn run() -> Result<(), GateError> {
         return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
-        "PASSED: router ids exact / probs+weights within 1e-6 of the route_inner reference; expert table exact; eager == graph replay; the router kernels compile with no local depot at the width their host side launches"
+        "PASSED: router ids exact / probs+weights within 1e-6 of the route_inner reference; a non-finite logit refused by name with NaN probs and weights; expert table exact; eager == graph replay; the router kernels compile with no local depot at the width their host side launches"
     );
     Ok(())
 }
@@ -536,7 +554,7 @@ fn run() -> Result<(), GateError> {
 #[cfg(feature = "gpu")]
 fn synth_case(
     router: &bloomery_gpu::router::RouterKernels,
-    stream: &cuda_core::CudaStream,
+    gpu: &bloomery_gpu::Gpu,
     name: &str,
     logits: &[f32],
     scale: f32,
@@ -544,8 +562,8 @@ fn synth_case(
     use bloomery_gpu_gates::{max_rel_err, route_ref};
 
     const BAND: f32 = 1e-6;
-    let out = run_router(router, stream, logits, 1, scale)?;
-    let (probs_ref, ids_ref, w_ref) = route_ref(&finite_logits(logits), 1, scale)?;
+    let out = run_router(router, gpu, logits, 1, scale)?;
+    let (probs_ref, ids_ref, w_ref) = route_ref(logits, 1, scale)?;
     let ids_dev: Vec<i32> = out.ids.iter().map(|&v| v as i32).collect();
     let ids_exact = ids_dev == ids_ref;
     let probs_err = max_rel_err(&out.probs, &probs_ref)?;
@@ -561,19 +579,95 @@ fn synth_case(
     Ok(pass)
 }
 
-/// The host reference's input for a case carrying `-inf` logits.
-/// `route_ref` takes finite logits only, and `f32::MIN` routes identically:
-/// the ascending `f32::max` fold picks neither over a larger logit, `exp`
-/// of either minus a finite max is exactly `+0.0`, and a `+0.0` term leaves
-/// the f64 sum and every quotient unchanged. Finite logits pass through, so
-/// a case that is not about `-inf` compares against its own vector; any
-/// other non-finite value stays non-finite and `route_ref` rejects it.
+/// One router call carrying a non-finite logit, run once on output buffers
+/// that already hold values; returns its verdict. `x_tok` is token-major
+/// (the dump's layout) and `refused` lists the tokens holding a non-finite
+/// logit. The fault word must name [`bloomery_gpu::FaultSite::Router`] at
+/// the launch's layer; a refused token's probabilities and weights must be
+/// NaN and its ids what the buffer held; every other token must route as
+/// the host reference does.
 #[cfg(feature = "gpu")]
-fn finite_logits(logits: &[f32]) -> Vec<f32> {
-    logits
-        .iter()
-        .map(|&v| if v == f32::NEG_INFINITY { f32::MIN } else { v })
-        .collect()
+fn refused_case(
+    router: &bloomery_gpu::router::RouterKernels,
+    gpu: &bloomery_gpu::Gpu,
+    name: &str,
+    x_tok: &[f32],
+    m: usize,
+    refused: &[usize],
+    scale: f32,
+) -> Result<bool, GateError> {
+    use bloomery_gpu::router::{N_EXPERT, N_USED};
+    use bloomery_gpu::{Fault, FaultSite, LAYER_NONE};
+    use bloomery_gpu_gates::{max_rel_err, route_ref};
+    use cuda_core::DeviceBuffer;
+
+    const BAND: f32 = 1e-6;
+    // What the output buffers hold before the call: a refused token's ids
+    // must still read HELD_ID, its probabilities and weights no longer HELD.
+    const HELD: f32 = 0.25;
+    const HELD_ID: u32 = 0xA5A5_A5A5;
+    let stream = gpu.stream();
+    let x_dev = DeviceBuffer::from_host(stream, &to_expert_major(x_tok, N_EXPERT, m))?;
+    let mut probs = DeviceBuffer::from_host(stream, &vec![HELD; N_EXPERT * m])?;
+    let mut ids = DeviceBuffer::from_host(stream, &vec![HELD_ID; N_USED * m])?;
+    let mut w = DeviceBuffer::from_host(stream, &vec![HELD; N_USED * m])?;
+    router.enqueue_router_topk(
+        stream,
+        &x_dev,
+        m,
+        scale,
+        &mut probs,
+        &mut ids,
+        &mut w,
+        gpu.unlabelled_sink(),
+    )?;
+    stream.synchronize()?;
+    let fault = gpu.take_fault()?;
+    let probs_t = transpose(&probs.to_host_vec(stream)?, N_EXPERT, m);
+    let ids_t = transpose(&ids.to_host_vec(stream)?, N_USED, m);
+    let w_t = transpose(&w.to_host_vec(stream)?, N_USED, m);
+    let want = Fault::at(LAYER_NONE, FaultSite::Router);
+    let refused_nan = refused.iter().all(|&t| {
+        probs_t[t * N_EXPERT..(t + 1) * N_EXPERT]
+            .iter()
+            .chain(&w_t[t * N_USED..(t + 1) * N_USED])
+            .all(|v| v.is_nan())
+    });
+    let ids_held = refused.iter().all(|&t| {
+        ids_t[t * N_USED..(t + 1) * N_USED]
+            .iter()
+            .all(|&i| i == HELD_ID)
+    });
+    let live: Vec<usize> = (0..m).filter(|t| !refused.contains(t)).collect();
+    let pick = |v: &[f32], per: usize| -> Vec<f32> {
+        live.iter()
+            .flat_map(|&t| v[t * per..(t + 1) * per].iter().copied())
+            .collect()
+    };
+    let live_as_ref = if live.is_empty() {
+        true
+    } else {
+        let (probs_ref, ids_ref, w_ref) = route_ref(&pick(x_tok, N_EXPERT), live.len(), scale)?;
+        let ids_live: Vec<i32> = live
+            .iter()
+            .flat_map(|&t| {
+                ids_t[t * N_USED..(t + 1) * N_USED]
+                    .iter()
+                    .map(|&i| i as i32)
+            })
+            .collect();
+        ids_live == ids_ref
+            && max_rel_err(&pick(&probs_t, N_EXPERT), &probs_ref)? <= BAND
+            && max_rel_err(&pick(&w_t, N_USED), &w_ref)? <= BAND
+    };
+    let pass = fault == Some(want) && refused_nan && ids_held && live_as_ref;
+    println!(
+        "refusal op=router_topk synthetic={name} m={m} refused_tokens={refused:?}: fault=\"{}\" want=\"{want}\" refused_probs_and_weights_nan={refused_nan} refused_ids_held={ids_held} live_tokens={} routed_as_reference={live_as_ref} {}",
+        fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
+        live.len(),
+        verdict(pass)
+    );
+    Ok(pass)
 }
 
 /// FNV-1a 64 over the bits of one case's whole routing output, probs then
@@ -743,6 +837,7 @@ fn q3k_half_decode_shape() -> Result<bool, GateError> {
 
 /// The router on resident-free (fresh) buffers, run twice: the outputs of
 /// the first run and whether the second run reproduced them bit for bit.
+/// Its inputs are finite, so a raised fault word is an error.
 #[cfg(feature = "gpu")]
 struct RouterOut {
     probs: Vec<f32>,
@@ -754,7 +849,7 @@ struct RouterOut {
 #[cfg(feature = "gpu")]
 fn run_router(
     router: &bloomery_gpu::router::RouterKernels,
-    stream: &cuda_core::CudaStream,
+    gpu: &bloomery_gpu::Gpu,
     x: &[f32],
     m: usize,
     scale: f32,
@@ -762,20 +857,25 @@ fn run_router(
     use bloomery_gpu::router::{N_EXPERT, N_USED};
     use cuda_core::DeviceBuffer;
 
+    let stream = gpu.stream();
+    let sink = gpu.unlabelled_sink();
     let x_dev = DeviceBuffer::from_host(stream, x)?;
     let mut probs = DeviceBuffer::<f32>::zeroed(stream, N_EXPERT * m)?;
     let mut ids = DeviceBuffer::<u32>::zeroed(stream, N_USED * m)?;
     let mut w = DeviceBuffer::<f32>::zeroed(stream, N_USED * m)?;
-    router.enqueue_router_topk(stream, &x_dev, m, scale, &mut probs, &mut ids, &mut w)?;
+    router.enqueue_router_topk(stream, &x_dev, m, scale, &mut probs, &mut ids, &mut w, sink)?;
     stream.synchronize()?;
     let p1 = probs.to_host_vec(stream)?;
     let i1 = ids.to_host_vec(stream)?;
     let w1 = w.to_host_vec(stream)?;
-    router.enqueue_router_topk(stream, &x_dev, m, scale, &mut probs, &mut ids, &mut w)?;
+    router.enqueue_router_topk(stream, &x_dev, m, scale, &mut probs, &mut ids, &mut w, sink)?;
     stream.synchronize()?;
     let rerun = p1 == probs.to_host_vec(stream)?
         && i1 == ids.to_host_vec(stream)?
         && w1 == w.to_host_vec(stream)?;
+    if let Some(f) = gpu.take_fault()? {
+        return Err(format!("gate_p6: the router raised {f} on finite logits").into());
+    }
     if let Some(i) = p1.iter().position(|v| !v.is_finite()) {
         return Err(format!("gate_p6: non-finite prob at {i}").into());
     }

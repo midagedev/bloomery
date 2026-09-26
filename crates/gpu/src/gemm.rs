@@ -617,6 +617,10 @@ macro_rules! gemm_stage {
 /// `sb_units` per super-block. The expansion's `unsafe` blocks rest on the
 /// entry's launch contract and on the route table the host guarantees was
 /// built for this stack and slot count.
+///
+/// The blocks of tile index 0 — there is one per slab whatever the table
+/// holds — first write NaN over their slab's rows of every slot the route
+/// refused (`n_tiles[1]` of them, the last entries of `cols`).
 macro_rules! gemm_block {
     (
         dec: $dec:ident,
@@ -624,6 +628,7 @@ macro_rules! gemm_block {
         w: $w:ident, q6: $q6:ident, s8: $s8:ident, d8: $d8:ident,
         cols: $cols:ident, tiles: $tiles:ident, n_tiles: $n_tiles:ident,
         rows: $rows:ident, n_sb: $n_sb:ident, half_it: $half_it:ident,
+        n_slots: $n_slots:ident,
         slot_div: $slot_div:ident, row_tiles: $row_tiles:ident, y: $y:ident,
         scratch: ($bt:ident, $s8t:ident, $d8t:ident, $slot_sh:ident, $acol_sh:ident) $(,)?
     ) => {{
@@ -631,7 +636,34 @@ macro_rules! gemm_block {
         let rt_n = $row_tiles as usize;
         let tile = b / rt_n;
         let rt = b - tile * rt_n;
-        // SAFETY: n_tiles.len() >= 1 by the launch contract.
+        if tile == 0 {
+            // SAFETY: n_tiles.len() >= 2 by the launch contract.
+            let refused = unsafe { *$n_tiles.get_unchecked(1) } as usize;
+            // Block-uniform: every thread read the same word.
+            if refused > 0 {
+                let rows_n = $rows as usize;
+                let first = $n_slots as usize - refused;
+                let r0 = rt * GEMM_BM;
+                let mut u = thread::threadIdx_x() as usize;
+                while u < refused * GEMM_BM {
+                    let r = r0 + u % GEMM_BM;
+                    if r < rows_n {
+                        // SAFETY: the route wrote `refused` slots below
+                        // n_slots at cols[first..n_slots], inside cols; so
+                        // slot · rows + r < n_slots · rows <= y.len(). No
+                        // tile lists a refused slot, so no other block
+                        // writes these outputs, and each (slot, row) is one
+                        // thread's.
+                        unsafe {
+                            let slot = *$cols.get_unchecked(first + u / GEMM_BM) as usize;
+                            *$y.get_unchecked_mut(slot * rows_n + r) = f32::NAN;
+                        }
+                    }
+                    u += GEMM_THREADS;
+                }
+            }
+        }
+        // SAFETY: n_tiles.len() >= 2 by the launch contract.
         if tile >= unsafe { *$n_tiles.get_unchecked(0) } as usize {
             return; // block-uniform: the grid's bound is the table's worst case
         }
@@ -876,7 +908,6 @@ mod gemm_kernels {
     use super::*;
     use crate::cores::{q4k_scale_min, q6k_dequant};
     use crate::elem::silu_mul;
-    use crate::fault::quad_finite;
     use crate::flash::half_bits_to_f32;
     use crate::q8_1_quant_vals;
     use cuda_device::async_copy::{
@@ -895,7 +926,10 @@ mod gemm_kernels {
     ///
     /// An id at or past `n_experts` has no expert to go to: it raises
     /// [`FaultSite::ExpertId`] on `fault` and its slot is left out of the
-    /// table, so no GEMM writes its outputs.
+    /// tiles. The refused slots take the end of `cols` instead, in ascending
+    /// slot order after the `n_slots − r` listed ones, and `n_tiles[1]` is
+    /// their count `r`: every GEMM over the table writes NaN to each of their
+    /// output rows.
     ///
     /// One block, a stable counting sort over chunks. The slots are cut into
     /// `chunks = min(ROUTE_WARPS, ROUTE_HIST / n_experts)` consecutive
@@ -921,7 +955,7 @@ mod gemm_kernels {
             ids.len() >= n_slots,
             cols.len() >= n_slots,
             tiles.len() >= 2 * max_tiles,
-            n_tiles.len() >= 1
+            n_tiles.len() >= 2
         )
     )]
     pub fn gemm_route(
@@ -936,6 +970,8 @@ mod gemm_kernels {
     ) {
         static mut HIST: SharedArray<u32, ROUTE_HIST> = SharedArray::UNINIT;
         static mut WT: SharedArray<u32, 32> = SharedArray::UNINIT;
+        // Per chunk: its refused slots' count, then their first index.
+        static mut BAD: SharedArray<u32, ROUTE_WARPS> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
@@ -951,10 +987,11 @@ mod gemm_kernels {
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; every index below is inside its array and every
         // cross-thread read follows a block or warp barrier.
-        let (hist, wt) = unsafe {
+        let (hist, wt, bad_at) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut HIST),
                 SharedArray::as_raw_mut_ptr(&raw mut WT),
+                SharedArray::as_raw_mut_ptr(&raw mut BAD),
             )
         };
         // Warp `wid`'s counts, one per expert: row `wid` of the `chunks`
@@ -972,8 +1009,10 @@ mod gemm_kernels {
         thread::sync_threads();
 
         // Counts, per chunk in slot order: per pass, the lowest lane of each
-        // group of equal ids adds the group's size to its warp's row.
+        // group of equal ids adds the group's size to its warp's row, and the
+        // refused slots are counted per chunk.
         if wid < chunks {
+            let mut refused = 0u32;
             let mut base = lo;
             while base < hi {
                 // SAFETY: hi <= n_slots <= ids.len().
@@ -982,6 +1021,7 @@ mod gemm_kernels {
                     // Raised here only: the fill walk reads each slot again.
                     fault.raise(FaultSite::ExpertId);
                 }
+                refused += warp::ballot(bad).count_ones();
                 let peers = warp::match_any_sync(u32::MAX, id);
                 if id != NO_EXPERT && peers.trailing_zeros() as usize == lane {
                     // SAFETY: id < e_n, inside this warp's row; one lane per
@@ -991,8 +1031,40 @@ mod gemm_kernels {
                 warp::sync_mask(u32::MAX);
                 base += 32;
             }
+            if lane == 0 {
+                // SAFETY: wid < chunks <= ROUTE_WARPS; one lane per chunk.
+                unsafe { *bad_at.add(wid) = refused };
+            }
         }
         thread::sync_threads();
+
+        if tid == 0 {
+            // The refused slots' first index per chunk: the end of `cols`,
+            // chunk after chunk, so they follow every listed slot; and their
+            // count for the GEMMs.
+            let mut total = 0u32;
+            let mut w = 0usize;
+            while w < chunks {
+                // SAFETY: w < chunks <= ROUTE_WARPS, each written above and
+                // published by the barrier; thread 0 alone touches them now.
+                total += unsafe { *bad_at.add(w) };
+                w += 1;
+            }
+            let mut run = s_n as u32 - total;
+            let mut w = 0usize;
+            while w < chunks {
+                // SAFETY: as above.
+                unsafe {
+                    let p = bad_at.add(w);
+                    let n = *p;
+                    *p = run;
+                    run += n;
+                }
+                w += 1;
+            }
+            // SAFETY: n_tiles.len() >= 2; one thread writes it.
+            unsafe { *n_tiles.get_unchecked_mut(1) = total };
+        }
 
         // Expert `tid`'s count, and each chunk's count of it replaced by the
         // chunks before it: the chunk's first index within the expert.
@@ -1057,7 +1129,7 @@ mod gemm_kernels {
         let off = excl & 0xffff;
         let toff = excl >> 16;
         if tid == ROUTE_THREADS - 1 {
-            // SAFETY: n_tiles.len() >= 1; one thread writes it.
+            // SAFETY: n_tiles.len() >= 2; one thread writes it.
             unsafe { *n_tiles.get_unchecked_mut(0) = (excl + v) >> 16 };
         }
         if tid < e_n {
@@ -1092,13 +1164,17 @@ mod gemm_kernels {
 
         // The stable fill: each chunk in slot order, slot s to its expert's
         // next free index in the warp's row; the lanes of one pass that share
-        // an id take consecutive indices in lane (= slot) order.
+        // an id take consecutive indices in lane (= slot) order, and so do
+        // the refused ones from the chunk's first refused index.
         if wid < chunks {
+            // SAFETY: wid < chunks <= ROUTE_WARPS, published by the barriers
+            // since thread 0 wrote it.
+            let mut next_bad = unsafe { *bad_at.add(wid) };
             let mut base = lo;
             while base < hi {
                 let s = base + lane;
                 // SAFETY: hi <= n_slots <= ids.len().
-                let (id, _) = unsafe { route_id(ids, s, hi, n_experts, e_n) };
+                let (id, bad) = unsafe { route_id(ids, s, hi, n_experts, e_n) };
                 let peers = warp::match_any_sync(u32::MAX, id);
                 let rank = (peers & warp::lanemask_lt()).count_ones();
                 if id != NO_EXPERT {
@@ -1111,6 +1187,17 @@ mod gemm_kernels {
                         *cols.get_unchecked_mut(pos as usize) = s as u32;
                     }
                 }
+                let bads = warp::ballot(bad);
+                if bad {
+                    // SAFETY: the chunk's refused slots take the indices from
+                    // its first one on, below the next chunk's and all below
+                    // s_n <= n_slots <= cols.len(); each slot writes its own.
+                    unsafe {
+                        let pos = next_bad + (bads & warp::lanemask_lt()).count_ones();
+                        *cols.get_unchecked_mut(pos as usize) = s as u32;
+                    }
+                }
+                next_bad += bads.count_ones();
                 warp::sync_mask(u32::MAX);
                 if id != NO_EXPERT && peers.trailing_zeros() as usize == lane {
                     // SAFETY: as above; one lane per id, after every lane of
@@ -1129,7 +1216,9 @@ mod gemm_kernels {
     /// route table (`cols`, `tiles`, `n_tiles`) was built for `n_slots`
     /// slots of this stack, and slot `s` reads column `s / slot_div`. Block
     /// `b` is tile `b / row_tiles`, row slab `b % row_tiles`; it writes
-    /// `y[s · rows + r]` for its tile's slots and its slab's rows.
+    /// `y[s · rows + r]` for its tile's slots and its slab's rows, and the
+    /// blocks of tile 0 write NaN over their slab's rows of every slot the
+    /// route refused.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1146,7 +1235,7 @@ mod gemm_kernels {
             d8.len() >= act_cols * 2 * n_sb,
             cols.len() >= n_slots,
             tiles.len() >= 2 * max_tiles,
-            n_tiles.len() >= 1,
+            n_tiles.len() >= 2,
             y.len() >= n_slots * rows
         )
     )]
@@ -1186,13 +1275,13 @@ mod gemm_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
             )
         };
-        let _ = (n_experts, act_cols, n_slots, max_tiles);
+        let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q4k_dec,
             sb_units: 36,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
-            rows: rows, n_sb: n_sb, half_it: half_it,
+            rows: rows, n_sb: n_sb, half_it: half_it, n_slots: n_slots,
             slot_div: slot_div, row_tiles: row_tiles, y: y,
             scratch: (bt, s8t, d8t, slot_sh, acol_sh),
         );
@@ -1215,7 +1304,7 @@ mod gemm_kernels {
             d8.len() >= act_cols * 2 * n_sb,
             cols.len() >= n_slots,
             tiles.len() >= 2 * max_tiles,
-            n_tiles.len() >= 1,
+            n_tiles.len() >= 2,
             y.len() >= n_slots * rows
         )
     )]
@@ -1253,13 +1342,13 @@ mod gemm_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
             )
         };
-        let _ = (n_experts, act_cols, n_slots, max_tiles);
+        let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q5k_dec,
             sb_units: 44,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
-            rows: rows, n_sb: n_sb, half_it: half_it,
+            rows: rows, n_sb: n_sb, half_it: half_it, n_slots: n_slots,
             slot_div: slot_div, row_tiles: row_tiles, y: y,
             scratch: (bt, s8t, d8t, slot_sh, acol_sh),
         );
@@ -1284,7 +1373,7 @@ mod gemm_kernels {
             d8.len() >= act_cols * 2 * n_sb,
             cols.len() >= n_slots,
             tiles.len() >= 2 * max_tiles,
-            n_tiles.len() >= 1,
+            n_tiles.len() >= 2,
             y.len() >= n_slots * rows
         )
     )]
@@ -1322,13 +1411,13 @@ mod gemm_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
             )
         };
-        let _ = (n_experts, act_cols, n_slots, max_tiles);
+        let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q6k_dec,
             sb_units: 210,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
-            rows: rows, n_sb: n_sb, half_it: half_it,
+            rows: rows, n_sb: n_sb, half_it: half_it, n_slots: n_slots,
             slot_div: slot_div, row_tiles: row_tiles, y: y,
             scratch: (bt, s8t, d8t, slot_sh, acol_sh),
         );
@@ -1351,7 +1440,7 @@ mod gemm_kernels {
             d8.len() >= act_cols * 2 * n_sb,
             cols.len() >= n_slots,
             tiles.len() >= 2 * max_tiles,
-            n_tiles.len() >= 1,
+            n_tiles.len() >= 2,
             y.len() >= n_slots * rows
         )
     )]
@@ -1389,13 +1478,13 @@ mod gemm_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
             )
         };
-        let _ = (n_experts, act_cols, n_slots, max_tiles);
+        let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q3k_dec,
             sb_units: 110,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
-            rows: rows, n_sb: n_sb, half_it: half_it,
+            rows: rows, n_sb: n_sb, half_it: half_it, n_slots: n_slots,
             slot_div: slot_div, row_tiles: row_tiles, y: y,
             scratch: (bt, s8t, d8t, slot_sh, acol_sh),
         );
@@ -1407,9 +1496,9 @@ mod gemm_kernels {
     /// `g` and `u`, forms `elem::silu_mul` of each pair, and hands the four
     /// to `q8_1_quant_vals` — the values `elem::swiglu` stores and the bytes
     /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
-    /// on the same geometry. A non-finite value raises
-    /// [`FaultSite::QuantColumn`], as the quantizer does, and the block is
-    /// still stored.
+    /// on the same geometry. A block holding a non-finite value is refused
+    /// as the quantizer refuses it (NaN scale, zero codes) and raises
+    /// [`FaultSite::QuantColumn`].
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1477,17 +1566,17 @@ mod gemm_kernels {
             silu_mul(gv[2], uv[2]),
             silu_mul(gv[3], uv[3]),
         ];
-        if !quad_finite(v) {
-            fault.raise(FaultSite::QuantColumn);
-        }
         // SAFETY: col < n_cols and b < 2·n_sb by the lines above, the output
         // bounds are the launch contract's, the block is one warp with one
         // `(col, b)`, and `v` holds values 128·b + 4·lane .. +3 of column col.
-        unsafe {
+        let refused = unsafe {
             q8_1_quant_vals(
                 v, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
                 &mut d8,
-            );
+            )
+        };
+        if refused && lane == 0 {
+            fault.raise(FaultSite::QuantColumn);
         }
     }
 }
@@ -1598,8 +1687,8 @@ impl GemmAct {
 
 impl Gpu {
     /// Enqueue the q8_1 quantization of the first `n_cols` columns of `x`
-    /// (`act.k()` f32 each) into `act`, raising into `fault` on a
-    /// non-finite value — `q3k_quantize_q8_1`, the kernel every gemv's
+    /// (`act.k()` f32 each) into `act`, a block holding a non-finite value
+    /// stored refused and raised into `fault` — `q3k_quantize_q8_1`, the kernel every gemv's
     /// activations come from, so column `c` holds the bytes a `Q8Act`
     /// quantized from the same values holds. Asynchronous, allocation-free,
     /// capturable.
@@ -1663,7 +1752,8 @@ pub struct GemmTile {
 
 /// The device route table one [`GemmKernels::enqueue_route`] fills and any
 /// number of GEMMs over the same slots and stack read: the slot list grouped
-/// by expert, the tiles, and the tile count. Remembers the slot count and
+/// by expert with the refused slots at its end, the tiles, the tile count
+/// and the refused count. Remembers the slot count and
 /// stack it was last filled for, so a GEMM over another count, another
 /// stack or an unfilled table is a named error rather than a launch that
 /// computes nothing.
@@ -1709,7 +1799,7 @@ impl GemmRoute {
         Ok(GemmRoute {
             cols: DeviceBuffer::zeroed(stream, max_slots)?,
             tiles: DeviceBuffer::zeroed(stream, 2 * gemm_max_tiles(max_slots, n_experts))?,
-            n_tiles: DeviceBuffer::zeroed(stream, 1)?,
+            n_tiles: DeviceBuffer::zeroed(stream, 2)?,
             zeros,
             max_slots,
             n_experts,
@@ -1760,6 +1850,25 @@ impl GemmRoute {
         cols.truncate(n_slots);
         Ok((cols, tiles))
     }
+
+    /// The slots the last fill refused (an expert id past the stack), in
+    /// ascending slot order — the end of the slot list. A blocking read on
+    /// `stream`, for gates and diagnostics.
+    pub fn refused_back(&self, stream: &CudaStream) -> Result<Vec<u32>, GpuError> {
+        let what = "GemmRoute::refused_back";
+        let n_slots = self
+            .filled
+            .ok_or_else(|| GpuError::state(what, "the table was never filled"))?;
+        let refused = self.n_tiles.to_host_vec(stream)?[1] as usize;
+        if refused > n_slots {
+            return Err(GpuError::shape(
+                what,
+                format!("refused count {refused} exceeds the table's {n_slots} slots"),
+            ));
+        }
+        let cols = self.cols.to_host_vec(stream)?;
+        Ok(cols[n_slots - refused..n_slots].to_vec())
+    }
 }
 
 /// The loaded GEMM module and its enqueue API. Owns no context and no
@@ -1782,8 +1891,9 @@ impl GemmKernels {
     /// `ids[0..n_slots]` (slot `token * top_k + k`), read on the card: no
     /// host synchronisation, capturable. An id at or past the table's expert
     /// count raises [`FaultSite::ExpertId`] on `fault` and its slot is left
-    /// out, so its outputs are never written — the step that reads the fault
-    /// word back turns it into `GpuError::Fault`.
+    /// out of the tiles and listed as refused, so every GEMM over the table
+    /// writes NaN to its outputs — the step that reads the fault word back
+    /// turns it into `GpuError::Fault`.
     pub fn enqueue_route(
         &self,
         stream: &CudaStream,
@@ -1842,9 +1952,10 @@ impl GemmKernels {
     /// Enqueue `act = q8_1(silu(g) · u)` over the first `n_cols` slot
     /// columns (`act.k()` values each, slot-major as the gate and up GEMMs
     /// write them): one launch, the bytes `ElemKernels::enqueue_swiglu` then
-    /// [`Gpu::enqueue_quantize_gemm`] leave, a non-finite value raised on
-    /// `fault` as [`FaultSite::QuantColumn`]. Asynchronous, allocation-free,
-    /// capturable.
+    /// [`Gpu::enqueue_quantize_gemm`] leave: a 128-value block holding a
+    /// non-finite value is stored refused (NaN scale, zero codes) and raised
+    /// on `fault` as [`FaultSite::QuantColumn`]. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_swiglu_quant(
         &self,
         stream: &CudaStream,
@@ -1937,9 +2048,9 @@ impl GemmKernels {
     /// format (the file's byte stream as u32 words, zero-padded at its end
     /// to a whole number of words per row), K = `act.k()`; `input` picks each
     /// slot's activation column; `y` holds `n_slots · rows_per_expert` f32,
-    /// slot-major. Asynchronous, allocation-free, capturable — but every
-    /// expert id the table was built from must be valid, or the slot's rows
-    /// are left as they were and the fault word says so.
+    /// slot-major. Asynchronous, allocation-free, capturable. A slot the
+    /// route refused (an expert id past the stack) gets NaN in every row,
+    /// and the fault word says so.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher; folding these into a *Args struct is the R8 round"

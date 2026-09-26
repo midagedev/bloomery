@@ -32,6 +32,11 @@
 //! height; a grid derived from the key count passes every other arm and
 //! fails that one.
 //!
+//! The q8_1 side output the attention folds into its last launch
+//! (`flash_latent_q8`, `flash_merge_q8`) refuses a query row whose output is
+//! NaN: that column's blocks stored with a NaN scale and zero codes, the
+//! named `QuantColumn` fault, every other column the finite run's bits.
+//!
 //! One shape check joins them, read off the device code this binary carries
 //! rather than off a clock: every flash entry — the single-block
 //! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, the
@@ -50,12 +55,14 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
-    FlashGeom, FlashInputs, FlashKernels, FlashLatentArgs, FlashMergeArgs, FlashSegArgs,
-    FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len, seg_keys,
-    segments_for,
+    FlashGeom, FlashInputs, FlashKernels, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs,
+    FlashMergeQ8Args, FlashSegArgs, FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len,
+    partials_v_len, seg_keys, segments_for,
 };
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph};
+use bloomery_gpu::fused::{Q8ActHost, readback_q8act};
+#[cfg(feature = "gpu")]
+use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, Graph, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
@@ -139,6 +146,7 @@ fn run() -> Result<(), GateError> {
         mma_band: FLASH_MMA_BAND,
     };
     ok &= depth_cases(&gpu, &flash, &case)?;
+    ok &= side_quant_refusal(&gpu, &flash, &case)?;
     ok &= edge_values(&flash, stream)?;
     // This package's kernels, read off the PTX this executable embeds;
     // `tools/ptx-scan.sh` prints the same counts for every entry without
@@ -1105,6 +1113,167 @@ fn graph_check_flash(
     Ok(pass)
 }
 
+/// The q8_1 side output the attention folds into its last launch — the
+/// single-block `flash_latent_q8` and the merge `flash_merge_q8` — refuses a
+/// query row whose output is not finite as the quantize launch it replaces
+/// does: every 128-value block of that column holding a non-finite value is
+/// stored with a NaN scale and zero codes and code sums, and the launch
+/// raises the named `QuantColumn` fault; every other column is the finite
+/// run's to the bit. The single-block run gets its NaN from query row
+/// `ROW`; the merge from every value of that row's first segment partial,
+/// so the merged row is NaN whatever the segment pass makes of a NaN score.
+#[cfg(feature = "gpu")]
+fn side_quant_refusal(
+    gpu: &Gpu,
+    flash: &FlashKernels,
+    case: &DepthCase,
+) -> Result<bool, GateError> {
+    /// The query row, a column of the lower half, that carries the NaN.
+    const ROW: usize = 3;
+    /// Live keys: four 256-key segments of the depth cache.
+    const KEYS: u32 = 1000;
+    let DepthCase {
+        dims, cache_rows, ..
+    } = *case;
+    let (n_heads, latent) = (dims.heads, dims.latent_dims);
+    let half = n_heads / 2;
+    let blocks = latent / 128;
+    let stream = gpu.stream();
+    let d = DepthInputs::new(stream, case)?;
+    let n_keys_dev = DeviceBuffer::from_host(stream, &[KEYS])?;
+    let want = Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+    let segs = segments_for(cache_rows);
+    // The finite run's partials, and the same with row ROW's first segment
+    // all NaN.
+    let mut part = Partials::zeroed(stream, n_heads, cache_rows)?;
+    let mut y_split = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+    flash.enqueue_flash_latent_split(
+        stream,
+        FlashSplitArgs {
+            inputs: d.inputs(&n_keys_dev, dims),
+            part_v: &mut part.v,
+            part_ms: &mut part.ms,
+            y: &mut y_split,
+        },
+    )?;
+    stream.synchronize()?;
+    let mut v_nan = part.v.to_host_vec(stream)?;
+    let first = ROW * segs * latent;
+    v_nan[first..first + latent].fill(f32::NAN);
+    let part_v_nan = DeviceBuffer::from_host(stream, &v_nan)?;
+    let mut q_nan = d.queries.clone();
+    q_nan[ROW * dims.width + 7] = f32::NAN;
+    let q_nan_dev = DeviceBuffer::from_host(stream, &q_nan)?;
+
+    // One launch of `path`: the NaN arm or the finite one, read back.
+    let run = |path: &str, nan: bool| -> Result<(Vec<f32>, Q8ActHost, Q8ActHost), GateError> {
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+        let mut lo = Q8Act::with_k(stream, half, latent)?;
+        let mut hi = Q8Act::with_k(stream, n_heads - half, latent)?;
+        let fault = gpu.unlabelled_sink();
+        if path == "flash_latent_q8" {
+            let q = if nan { &q_nan_dev } else { &d.q_dev };
+            flash.enqueue_flash_latent_q8(
+                stream,
+                FlashLatentQ8Args {
+                    inputs: FlashInputs {
+                        q,
+                        kv: &d.cache,
+                        n_keys_buf: &n_keys_dev,
+                        kq_scale: dims.kq_scale,
+                        geom: dims.geom(1),
+                    },
+                    y: &mut y,
+                    lo: &mut lo,
+                    hi: &mut hi,
+                    fault,
+                },
+            )?;
+        } else {
+            flash.enqueue_flash_merge_q8(
+                stream,
+                FlashMergeQ8Args {
+                    merge: FlashMergeArgs {
+                        n_keys_buf: &n_keys_dev,
+                        cache_rows,
+                        tokens: 1,
+                        heads: n_heads,
+                        latent_dims: latent,
+                        part_v: if nan { &part_v_nan } else { &part.v },
+                        part_ms: &part.ms,
+                        y: &mut y,
+                    },
+                    lo: &mut lo,
+                    hi: &mut hi,
+                    fault,
+                },
+            )?;
+        }
+        stream.synchronize()?;
+        Ok((
+            y.to_host_vec(stream)?,
+            readback_q8act(stream, &lo)?,
+            readback_q8act(stream, &hi)?,
+        ))
+    };
+    // Column `c` of a side scratch: its five planes' spans.
+    let col = |a: &Q8ActHost, c: usize| {
+        let (q3, q4, q6) = (a.q3.len() / half, a.q4.len() / half, a.q6.len() / half);
+        (
+            a.q3[c * q3..(c + 1) * q3].to_vec(),
+            a.q4[c * q4..(c + 1) * q4].to_vec(),
+            a.q6[c * q6..(c + 1) * q6].to_vec(),
+            a.s8[c * 4 * blocks..(c + 1) * 4 * blocks].to_vec(),
+            a.d8[c * blocks..(c + 1) * blocks].to_vec(),
+        )
+    };
+
+    let mut ok = true;
+    for path in ["flash_latent_q8", "flash_merge_q8"] {
+        gpu.clear_fault()?;
+        let (y0, lo0, hi0) = run(path, false)?;
+        let clean = gpu.take_fault()?.is_none();
+        let (y1, lo1, hi1) = run(path, true)?;
+        let fault = gpu.take_fault()?;
+        let row_nan = y1[ROW * latent..(ROW + 1) * latent]
+            .iter()
+            .all(|v| v.is_nan());
+        let (q3, q4, q6, s8, d8) = col(&lo1, ROW);
+        let refused = d8.iter().all(|v| v.is_nan())
+            && q3.iter().all(|&w| w == 0)
+            && q4.iter().all(|&w| w == 0)
+            && q6.iter().all(|&w| w == 0)
+            && s8.iter().all(|&g| g == 0);
+        let col_same = |c: usize| {
+            let (a, b) = (col(&lo1, c), col(&lo0, c));
+            a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && bits_equal(&a.4, &b.4)
+        };
+        let others = (0..half).filter(|&c| c != ROW).all(col_same)
+            && hi1.q3 == hi0.q3
+            && hi1.q4 == hi0.q4
+            && hi1.q6 == hi0.q6
+            && hi1.s8 == hi0.s8
+            && bits_equal(&hi1.d8, &hi0.d8)
+            && (0..n_heads).filter(|&r| r != ROW).all(|r| {
+                bits_equal(
+                    &y1[r * latent..(r + 1) * latent],
+                    &y0[r * latent..(r + 1) * latent],
+                )
+            });
+        let pass = clean && fault == want && row_nan && refused && others;
+        println!(
+            "side_quant op={path} keys={KEYS} NaN reaching query row {ROW}: fault=\"{}\" want=\"{}\" \
+             finite_run_clean={clean} row_output_nan={row_nan} column_refused(d8 NaN, codes and \
+             sums zero)={refused} other_columns_and_rows_bit_identical={others} {}",
+            fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+    Ok(ok)
+}
+
 /// The pos-buffer append inside a captured graph: rewriting the buffer
 /// between replays moves the landing rows — the form a captured decode step
 /// needs. The scalar-pos append captured beside it stays frozen at its
@@ -1116,8 +1285,10 @@ fn graph_check_append(gpu: &Gpu, flash: &FlashKernels, one_row: &[f32]) -> Resul
     let mut pos_buf = DeviceBuffer::from_host(stream, &[0u32])?;
     let width = one_row.len();
     let mut cache = DeviceTensor::<u16>::zeroed(stream, 8, width)?;
-    let graph =
-        gpu.capture(|_s| flash.enqueue_kv_append_pos_buf(stream, &src, &pos_buf, &mut cache, 1))?;
+    let sink = gpu.unlabelled_sink();
+    let graph = gpu.capture(|_s| {
+        flash.enqueue_kv_append_pos_buf(stream, &src, &pos_buf, &mut cache, 1, sink)
+    })?;
 
     let want: Vec<u16> = one_row.iter().map(|&v| f32_to_f16_bits(v)).collect();
     let rows_equal =

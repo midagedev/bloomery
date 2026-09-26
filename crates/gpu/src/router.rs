@@ -14,8 +14,16 @@
 //! thread computes one token serially, so the summation and selection orders
 //! are fixed by construction. Logits arrive in the f32 gemv output layout
 //! `x[e * m + t]` (expert e of token t) — the router gemv's `y` as produced.
+//!
+//! No silent routing. The softmax is defined on finite logits; a token with
+//! any non-finite logit — NaN, ±inf — has none (a NaN turns every
+//! probability NaN and the six slots into six copies of expert 0; a −inf
+//! reads as a probability of 0). The router raises [`FaultSite::Router`] on
+//! its fault sink for such a token, writes its probabilities and weights
+//! NaN, and leaves its ids as they stand.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
 use crate::route_core::take;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -80,6 +88,10 @@ mod router_kernels {
     /// the f64 sum of the 64 exps is specified in ascending expert order,
     /// and a tree over lanes is a different sum. `m <= 8`, so one warp
     /// covers every shape the router is launched at.
+    ///
+    /// A token with a non-finite logit (the module doc) raises
+    /// [`FaultSite::Router`] on `fault`, gets NaN probabilities and weights,
+    /// and keeps its ids; it returns before the softmax.
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -99,6 +111,7 @@ mod router_kernels {
         mut probs: DisjointSlice<f32>,
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // The token's 64 probabilities for the decode path below: lane 0
         // writes them in the contract's order, the whole warp reads them past
@@ -110,6 +123,31 @@ mod router_kernels {
 
         let t = thread::index_1d().get();
         if m == 1 {
+            // The refusal first: lane L tests experts L and L + 32, and one
+            // ballot refuses the token — warp-uniform, so the whole block
+            // returns together and no barrier below is skipped by half of it.
+            let lane = warp::lane_id() as usize;
+            // SAFETY: lane + 32 < 64 = 64*m <= x.len() by the launch contract.
+            let (x0, x1) = unsafe { (*x.get_unchecked(lane), *x.get_unchecked(lane + 32)) };
+            if warp::ballot(!(x0.is_finite() & x1.is_finite())) != 0 {
+                // SAFETY: lane + 32 < 64 <= probs.len(); the two slots are
+                // this lane's own.
+                unsafe {
+                    *probs.get_unchecked_mut(lane) = f32::NAN;
+                    *probs.get_unchecked_mut(lane + 32) = f32::NAN;
+                }
+                if lane == 0 {
+                    fault.raise(FaultSite::Router);
+                    let mut s = 0usize;
+                    while s < N_USED {
+                        // SAFETY: s < 6 <= weights.len(); lane 0 alone
+                        // writes them.
+                        unsafe { *weights.get_unchecked_mut(s) = f32::NAN };
+                        s += 1;
+                    }
+                }
+                return;
+            }
             // SAFETY: P is this block's own shared allocation; the raw form
             // is the only way to reach it without a reference to a
             // `static mut`. Every index below is an expert id < N_EXPERT, and
@@ -166,7 +204,6 @@ mod router_kernels {
             // probability never enters the reduction: `take::<false>` takes a
             // candidate only on `>` or `==`, both false for NaN, so no lane's
             // running best is ever NaN and the merge only ever sees numbers.
-            let lane = warp::lane_id() as usize;
             let (e0, e1) = (lane, lane + 32);
             // SAFETY: e0 < 32 and e1 < 64 — inside P, written above and
             // visible past the barrier.
@@ -218,15 +255,35 @@ mod router_kernels {
         let mi = m as usize;
 
         // Pass 1: the largest of the token's 64 logits, by a serial
-        // ascending `f32::max` fold.
+        // ascending `f32::max` fold, and whether all 64 are finite.
         let mut mx = f32::NEG_INFINITY;
+        let mut finite = true;
         let mut e = 0usize;
         while e < 64 {
             // SAFETY: e < 64 and t < m, so e*mi + t < 64*m <= x.len() by the
             // launch contract.
             let le = unsafe { *x.get_unchecked(e * mi + t) };
             mx = mx.max(le);
+            finite &= le.is_finite();
             e += 1;
+        }
+        if !finite {
+            // The refusal: this thread's token alone, its probabilities and
+            // weights NaN, its ids as they stand.
+            fault.raise(FaultSite::Router);
+            let mut e = 0usize;
+            while e < 64 {
+                // SAFETY: e < 64 and t < m — this thread's own prob slot.
+                unsafe { *probs.get_unchecked_mut(e * mi + t) = f32::NAN };
+                e += 1;
+            }
+            let mut s = 0usize;
+            while s < 6 {
+                // SAFETY: s < 6 and t < m, so s*mi + t < 6*m <= weights.len().
+                unsafe { *weights.get_unchecked_mut(s * mi + t) = f32::NAN };
+                s += 1;
+            }
+            return;
         }
 
         // Pass 2: `exp` in f32 into the token's own prob slots, the sum
@@ -358,8 +415,9 @@ impl RouterKernels {
     /// the same layout; `ids` takes `6 * m` u32 and `weights` `6 * m` f32,
     /// both slot-major (`ids[s*m + t]`, slot s = rank by descending
     /// probability, ties to the smaller id). `scale` is the file's
-    /// `expert_weights_scale` (1.0 in this model). Asynchronous,
-    /// allocation-free, capturable.
+    /// `expert_weights_scale` (1.0 in this model). A token with a non-finite
+    /// logit is refused (the module doc) on `fault`, as
+    /// [`FaultSite::Router`]. Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher; folding these into a *Args struct is the R8 round"
@@ -373,6 +431,7 @@ impl RouterKernels {
         probs: &mut DeviceBuffer<f32>,
         ids: &mut DeviceBuffer<u32>,
         weights: &mut DeviceBuffer<f32>,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(
@@ -408,7 +467,7 @@ impl RouterKernels {
             self.module
                 .prepare_router_topk(LaunchConfig1D::new(1, ROUTER_THREADS_U32, 0))?;
         self.module
-            .router_topk(stream, &prep, x, m, scale, probs, ids, weights)?;
+            .router_topk(stream, &prep, x, m, scale, probs, ids, weights, fault)?;
         Ok(())
     }
 
