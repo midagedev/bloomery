@@ -85,8 +85,12 @@
 //!
 //! `--dump DIR` also writes each greedy prompt's tokens (u32 LE) and last
 //! logits (f32 LE) of the graph, the eager and the prefilled pass as raw
-//! files under DIR (`p{i}-{graph,eager,prefill}.{tokens,logits}`), for a
-//! byte comparison across builds (`md5sum DIR/*`).
+//! files under DIR (`p{i}-{graph,eager,prefill}.{tokens,logits}`), and each
+//! (u) prompt's GEMM prefill — every layer's K/V rows (u16 LE, layer after
+//! layer as `kv_rows` returns them), the last logits and the greedy tokens
+//! after it (`u{n}-gemm.{kv,logits,tokens}`), for a byte comparison across
+//! builds (`md5sum DIR/*`). With `--gemm-only` only the (u) files are
+//! written.
 //!
 //! `--ppl TAG` instead scores the chain against ik's KL-divergence base file
 //! `$BLOOMERY_DATA/ikppl/TAG.kld` (`tools/ref/ik-ppl.sh --kld-base`): chunk by
@@ -336,7 +340,7 @@ mod gate {
             return Ok(());
         }
         if args.iter().any(|a| a == "--gemm-only") {
-            let mut ok = gemm_prefill(&mut m)?;
+            let mut ok = gemm_prefill(&mut m, dump.as_deref())?;
             drop(m);
             ok &= ubatch_sizes()?;
             println!("gate_qwen3moe_e2e --gemm-only: {}", verdict(ok));
@@ -809,7 +813,7 @@ mod gate {
         );
         let prefill_ok = prefilled(m, &prompts, &graph, &graph_logits, dump_dir)?;
         let passes_ok = prefill_replay(m, &prompts)?;
-        let gemm_ok = gemm_prefill(m)?;
+        let gemm_ok = gemm_prefill(m, dump_dir)?;
         Ok(replay_ok && greedy_ok && prefill_ok && passes_ok && gemm_ok)
     }
 
@@ -1129,7 +1133,26 @@ mod gate {
         (num / den.max(f64::MIN_POSITIVE)).sqrt()
     }
 
-    fn gemm_prefill(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+    /// One (u) prompt's GEMM prefill as raw little-endian files under `dir`
+    /// (`--dump`): every layer's K/V rows in `kv_rows` order, the last
+    /// logits, the greedy tokens after it.
+    fn dump_long(dir: &Path, n: usize, run: &LongRun) -> Result<(), GateError> {
+        std::fs::create_dir_all(dir)?;
+        let kv: Vec<u8> = run
+            .kv
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let l: Vec<u8> = run.logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t: Vec<u8> = run.tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join(format!("u{n}-gemm.kv")), kv)?;
+        std::fs::write(dir.join(format!("u{n}-gemm.logits")), l)?;
+        std::fs::write(dir.join(format!("u{n}-gemm.tokens")), t)?;
+        Ok(())
+    }
+
+    fn gemm_prefill(m: &mut Qwen3moeModel, dump_dir: Option<&Path>) -> Result<bool, GateError> {
         m.set_mode(StepMode::Graph);
         let longest = LONG.iter().copied().max().ok_or("no long prompt")?;
         let prose = prose(longest)?;
@@ -1142,6 +1165,9 @@ mod gate {
             let t0 = Instant::now();
             let gemm = long_run(m, ids, Some(PrefillPath::Auto), None)?;
             let wall = t0.elapsed().as_secs_f64();
+            if let Some(dir) = dump_dir {
+                dump_long(dir, n, &gemm)?;
+            }
             // The ruler: the same prompt on the other flash pass, eager.
             let mma = m.body("gemm_prefill")?.flash_mma();
             m.set_mode(StepMode::Eager);

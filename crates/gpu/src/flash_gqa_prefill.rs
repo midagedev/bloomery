@@ -23,9 +23,17 @@
 //! 2. Per query row: the tile max (the lane's 16 values, then the xor
 //!    butterfly over the row's four lanes), `m' = max(m, tile max)`, on a bump
 //!    `f = dev_exp(m − m')` (0 for the first) else `f = 1`; the weights
-//!    `p = dev_exp(s − m')` (0 for a masked key) rounded to f16; the lane's
+//!    `p = exp_weight(s − m')` (0 for a masked key) rounded to f16; the lane's
 //!    running sum `l = l·f + Σ p̂` of the rounded weights, and the output
-//!    accumulators times `f`.
+//!    accumulators times `f` — skipped when every lane of the warp has
+//!    `f = 1`, a multiply that would return every accumulator unchanged.
+//!
+//! A tile whose keys are all below both of a warp's counts (every tile but
+//! the one holding the warp's first count, and the ones past it) runs the
+//! same arithmetic without the per-key mask, and a tile whose keys are all
+//! below the block's largest count is staged without the per-copy bound:
+//! on such a tile every mask and bound the general path tests is true, so
+//! both paths evaluate the same expressions and write the same bits.
 //! 3. `O += P̂·V` on `mma.m16n8k16`, the rounded weights as the A fragment
 //!    straight from the score registers, the value tile through
 //!    `ldmatrix.trans`, f32 accumulation, the tile's four k16 steps ascending.
@@ -61,6 +69,7 @@ use crate::flash::{dev_exp, f32_to_f16_bits, mma_row_words};
 use crate::flash_gqa::{GROUP, HEAD};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::ptx_asm;
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, shared, thread, warp, wmma,
 };
@@ -96,7 +105,17 @@ const KEY_NT: usize = KEY_TILE / 8;
 const PV_STEPS: usize = KEY_TILE / 16;
 const DIM_PAIRS: usize = HEAD / 16;
 
+/// Keys one pass of the block's copies covers: a tile is staged in
+/// [`CHUNKS`] passes, thread `tid` copying column `tid % ROW_CHUNKS` of key
+/// `tid / ROW_CHUNKS` of each.
+const PASS_KEYS: usize = THREADS / ROW_CHUNKS;
+/// u32 words of one cache row, and of one tile of rows.
+const ROW_WORDS: usize = HEAD / 2;
+const TILE_WORDS: usize = KEY_TILE * ROW_WORDS;
+const KEY_TILE_U32: u32 = KEY_TILE as u32;
+
 const _: () = assert!(GROUP == 8 && Q_ROWS == WARPS * 16 && Q_ROWS <= KEY_TILE);
+const _: () = assert!(PASS_KEYS * ROW_CHUNKS == THREADS && PASS_KEYS * CHUNKS == KEY_TILE);
 const _: () = assert!((ROW_W * 4) % 128 == 16 && ROW_W >= HEAD / 2);
 const _: () = assert!(CHUNKS * THREADS == KEY_TILE * ROW_CHUNKS);
 const _: () = assert!(Q_WORDS * THREADS == Q_ROWS * Q_PAIRS);
@@ -106,6 +125,41 @@ const _: () = assert!(KEY_TILE == 4 * 16 && HEAD.is_multiple_of(16));
 #[must_use]
 pub fn blocks_for(t: usize, n_kv: usize) -> usize {
     t.div_ceil(POSITIONS) * n_kv
+}
+
+/// `exp(x)` for a weight that is rounded to f16 next: `ex2.approx.ftz` on
+/// `x · log2 e`. It runs the same `MUFU.EX2` on the same argument as
+/// [`dev_exp`] wherever that argument is at least −126; below it `dev_exp`
+/// returns a value under 2^-126 and this returns 0, and both round to the f16
+/// +0 (anything under 2^-25 does). So the rounded weight — the only thing a
+/// weight reaches — is `dev_exp`'s bit for bit. Never for a rescale factor,
+/// which multiplies the accumulators unrounded.
+#[inline(always)]
+fn exp_weight(x: f32) -> f32 {
+    cuda_device::float::ex2_approx_ftz_f32(x * std::f32::consts::LOG2_E)
+}
+
+/// `max.f32`: one instruction, where `f32::max` lowers to a compare, a NaN
+/// test and a select. Both return the other operand when one is NaN; they
+/// may differ only in the sign of a zero result, and the walk's maxima reach
+/// the bits only through `s − m` (unchanged by the sign of a zero `m` unless
+/// `s` is a zero too, where `ex2(±0) = 1`) and through `m' > m`, which reads
+/// the two zeros as equal. The walk's running maxima start at −∞ and are
+/// never NaN, so the two-NaN case does not occur.
+#[inline(always)]
+fn fmax(a: f32, b: f32) -> f32 {
+    let r: f32;
+    // SAFETY: a register-only arithmetic instruction; no memory is touched.
+    unsafe {
+        ptx_asm!(
+            "max.f32 %0, %1, %2;",
+            out("=f") r,
+            in("f") a,
+            in("f") b,
+            options(register_only),
+        );
+    }
+    r
 }
 
 #[cuda_module]
@@ -168,7 +222,6 @@ mod flash_gqa_prefill_kernels {
         let wid = tid / 32;
         let g = lane / 4;
         let t4 = lane % 4;
-        let ctx = ctx as usize;
         let n_head = nkv * GROUP;
         let t0 = qt * POSITIONS;
 
@@ -184,8 +237,9 @@ mod flash_gqa_prefill_kernels {
 
         // Every row's count as the walk uses it: 0 for a row past `t_rows`
         // and for a refused one; the block's largest bounds the keys loaded.
-        let mut hi = 0usize;
-        let mut cnt = [0usize; 2];
+        // Keys and counts are u32: the host keeps `ctx + KEY_TILE` in range.
+        let mut hi = 0u32;
+        let mut cnt = [0u32; 2];
         let mut bad = [false; 2];
         let mut lp = 0usize;
         while lp < POSITIONS {
@@ -193,7 +247,7 @@ mod flash_gqa_prefill_kernels {
             let t = t0 + lp;
             let (c, refused) = if t < rows {
                 // SAFETY: t < t_rows <= n_keys_buf.len() (launch contract).
-                let c = unsafe { *n_keys_buf.get_unchecked(t) } as usize;
+                let c = unsafe { *n_keys_buf.get_unchecked(t) };
                 if c == 0 || c > ctx {
                     (0, true)
                 } else {
@@ -213,6 +267,7 @@ mod flash_gqa_prefill_kernels {
             fault.raise(FaultSite::KeyCount);
         }
         let warp_hi = cnt[0].max(cnt[1]);
+        let warp_lo = cnt[0].min(cnt[1]);
 
         // The block's query rows, rounded to f16 pairs, into the key tile:
         // staged row `lp·GROUP + g` is position `t0 + lp`'s head `kh·GROUP +
@@ -278,32 +333,41 @@ mod flash_gqa_prefill_kernels {
         // Every warp has its fragments before the first key tile lands.
         thread::sync_threads();
 
-        let plane = kh * ctx * HEAD;
-        let k32 = kc.as_ptr().cast::<u32>();
-        let v32 = vc.as_ptr().cast::<u32>();
-        let tiles = hi.div_ceil(KEY_TILE);
+        // Thread `tid`'s copies of a tile: pass `i` is key `tid / ROW_CHUNKS
+        // + PASS_KEYS·i`, 16-byte column `tid % ROW_CHUNKS` — source word
+        // `4·tid + PASS_KEYS·ROW_WORDS·i` past the tile's first row, so a tile
+        // is one pointer step and each pass a constant offset from it.
+        let src_word = kh * ctx as usize * ROW_WORDS + 4 * tid;
+        let k_src = kc.as_ptr().cast::<u32>().wrapping_add(src_word);
+        let v_src = vc.as_ptr().cast::<u32>().wrapping_add(src_word);
+        let dst_word = (tid / ROW_CHUNKS) * ROW_W + 4 * (tid % ROW_CHUNKS);
+        let key_of_pass0 = (tid / ROW_CHUNKS) as u32;
+        let tiles = hi.div_ceil(KEY_TILE_U32);
         // Stage tile `kb` of the plane `src` into `dst`: 16-byte copies of
-        // the keys below `hi`, zeros past it, committed as one group.
+        // the keys below `hi`, zeros past it, committed as one group. `full`
+        // (a literal) is the tile lying below `hi`, where no copy is tested.
         macro_rules! stage {
-            ($dst:expr, $src:expr, $kb:expr) => {{
-                let (dst, src, kb): (*mut u32, *const u32, usize) = ($dst, $src, $kb);
+            ($dst:expr, $src:expr, $kb:expr, $full:literal) => {{
+                let (dst, src, kb): (*mut u32, *const u32, u32) = ($dst, $src, $kb);
+                let tile_src = src.wrapping_add(kb as usize * TILE_WORDS);
+                let key0 = kb * KEY_TILE_U32 + key_of_pass0;
                 let mut i = 0usize;
                 while i < CHUNKS {
                     cuda_device::thread::__unroll_config::<0>();
-                    let c = tid + THREADS * i;
-                    let key = c / ROW_CHUNKS;
-                    let ch = c - key * ROW_CHUNKS;
-                    let ka = kb * KEY_TILE + key;
-                    // SAFETY: key < KEY_TILE and 4·ch + 4 <= HEAD/2 <= ROW_W:
-                    // the 16 destination bytes are inside the tile and 16-byte
+                    // SAFETY: key tid / ROW_CHUNKS + PASS_KEYS·i < KEY_TILE and
+                    // column 4·(tid % ROW_CHUNKS) + 4 <= HEAD/2 <= ROW_W: the 16
+                    // destination bytes are inside the tile and 16-byte
                     // aligned (ROW_W·4 is a multiple of 16).
-                    let d = unsafe { dst.add(key * ROW_W + 4 * ch) };
-                    if ka < hi {
-                        // SAFETY: ka < hi <= ctx, so the row is inside key
-                        // head kh's plane (launch contract); rows are HEAD
-                        // f16 = 256 bytes from a device allocation, so the
-                        // source is 16-byte aligned.
-                        unsafe { cp_async_cg_16(d, src.add((plane + ka * HEAD) / 2 + 4 * ch)) };
+                    let d = unsafe { dst.add(dst_word + i * PASS_KEYS * ROW_W) };
+                    if $full || key0 + ((i * PASS_KEYS) as u32) < hi {
+                        // SAFETY: the key is below hi <= ctx (every key of a
+                        // full tile is), so its row is inside key head kh's
+                        // plane (launch contract); rows are HEAD f16 = 256
+                        // bytes from a device allocation, so the source is
+                        // 16-byte aligned.
+                        unsafe {
+                            cp_async_cg_16(d, tile_src.wrapping_add(i * PASS_KEYS * ROW_WORDS))
+                        };
                     } else {
                         // SAFETY: as above, the 16 bytes are this thread's own.
                         unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
@@ -315,22 +379,33 @@ mod flash_gqa_prefill_kernels {
             }};
         }
         if tiles > 0 {
-            stage!(kt, k32, 0);
+            if KEY_TILE_U32 <= hi {
+                stage!(kt, k_src, 0, true);
+            } else {
+                stage!(kt, k_src, 0, false);
+            }
         }
 
+        let t4k = 2 * t4 as u32;
         let mut m = [f32::NEG_INFINITY; 2];
         let mut l = [0.0f32; 2];
         let mut o = [[0.0f32; 4]; 2 * DIM_PAIRS];
-        let mut kb = 0usize;
+        let mut kb = 0u32;
         while kb < tiles {
+            // One past the tile's last key.
+            let end = KEY_TILE_U32 * (kb + 1);
             // Key tile kb has landed, and every warp is done reading the
             // value tile of kb − 1.
             // SAFETY: waits for this thread's outstanding groups; the barrier
             // then publishes every thread's copies.
             unsafe { cp_async_wait_group(0) };
             thread::sync_threads();
-            stage!(vt, v32, kb);
-            let live = KEY_TILE * kb < warp_hi;
+            if end <= hi {
+                stage!(vt, v_src, kb, true);
+            } else {
+                stage!(vt, v_src, kb, false);
+            }
+            let live = KEY_TILE_U32 * kb < warp_hi;
 
             // ---- S = Q·Kᵀ, then the online softmax into f16 weights.
             let mut pa = [[0u32; 4]; PV_STEPS];
@@ -364,90 +439,110 @@ mod flash_gqa_prefill_kernels {
                     kk += 1;
                 }
 
-                // Register j of key tile nt is row half j / 2 (the warp's
-                // position 2·w + j / 2, head g), key 64·kb + 8·nt + 2·t4 + j % 2.
-                let mut tmax = [f32::NEG_INFINITY; 2];
-                let mut nt = 0usize;
-                while nt < KEY_NT {
-                    cuda_device::thread::__unroll_config::<0>();
-                    let mut j = 0usize;
-                    while j < 4 {
-                        cuda_device::thread::__unroll_config::<0>();
-                        let key = KEY_TILE * kb + 8 * nt + 2 * t4 + j % 2;
-                        let v = if key < cnt[j / 2] {
-                            mul_rn_f32(sc[nt][j], scale)
-                        } else {
-                            f32::NEG_INFINITY
-                        };
-                        sc[nt][j] = v;
-                        tmax[j / 2] = tmax[j / 2].max(v);
-                        j += 1;
-                    }
-                    nt += 1;
+                // The softmax over the tile's scores. `masked` (a literal)
+                // tests each key against its row's count; a tile below both
+                // counts takes the copy without the tests.
+                macro_rules! softmax {
+                    ($masked:literal) => {{
+                        let kb0 = KEY_TILE_U32 * kb + t4k;
+                        // Register j of key tile nt is row half j / 2 (the
+                        // warp's position 2·w + j / 2, head g), key
+                        // 64·kb + 8·nt + 2·t4 + j % 2.
+                        let mut tmax = [f32::NEG_INFINITY; 2];
+                        let mut nt = 0usize;
+                        while nt < KEY_NT {
+                            cuda_device::thread::__unroll_config::<0>();
+                            let mut j = 0usize;
+                            while j < 4 {
+                                cuda_device::thread::__unroll_config::<0>();
+                                let key = kb0 + (8 * nt + j % 2) as u32;
+                                let v = if !$masked || key < cnt[j / 2] {
+                                    mul_rn_f32(sc[nt][j], scale)
+                                } else {
+                                    f32::NEG_INFINITY
+                                };
+                                sc[nt][j] = v;
+                                tmax[j / 2] = fmax(tmax[j / 2], v);
+                                j += 1;
+                            }
+                            nt += 1;
+                        }
+                        let mut mn = [f32::NEG_INFINITY; 2];
+                        let mut h = 0usize;
+                        while h < 2 {
+                            cuda_device::thread::__unroll_config::<0>();
+                            let mut x = tmax[h];
+                            x = fmax(x, warp::shuffle_xor_f32(x, 1));
+                            x = fmax(x, warp::shuffle_xor_f32(x, 2));
+                            let m_new = fmax(m[h], x);
+                            if m_new > m[h] {
+                                f[h] = if m[h] > f32::NEG_INFINITY {
+                                    dev_exp(m[h] - m_new)
+                                } else {
+                                    0.0
+                                };
+                                m[h] = m_new;
+                            }
+                            mn[h] = m[h];
+                            l[h] = mul_rn_f32(l[h], f[h]);
+                            h += 1;
+                        }
+                        // The weights, rounded to f16 pairs as the A fragment
+                        // of the value product: k16 step kk2 is key tiles
+                        // 2·kk2 and 2·kk2 + 1, registers (0, 1) then (2, 3) of
+                        // each, low key first. The lane's sum takes the
+                        // rounded values in that order. The mask is the key's
+                        // position, not its score: a NaN score stays NaN.
+                        let mut kk2 = 0usize;
+                        while kk2 < PV_STEPS {
+                            cuda_device::thread::__unroll_config::<0>();
+                            let mut e = 0usize;
+                            while e < 4 {
+                                cuda_device::thread::__unroll_config::<0>();
+                                let nt = 2 * kk2 + e / 2;
+                                let j0 = 2 * (e % 2);
+                                let h = e % 2;
+                                let key = kb0 + (8 * nt) as u32;
+                                let p0 = if !$masked || key < cnt[h] {
+                                    exp_weight(sc[nt][j0] - mn[h])
+                                } else {
+                                    0.0
+                                };
+                                let p1 = if !$masked || key + 1 < cnt[h] {
+                                    exp_weight(sc[nt][j0 + 1] - mn[h])
+                                } else {
+                                    0.0
+                                };
+                                let packed = cvt_f16x2_f32(p0, p1);
+                                let (r0, r1) = cvt_f32x2_f16x2(packed);
+                                l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
+                                pa[kk2][e] = packed;
+                                e += 1;
+                            }
+                            kk2 += 1;
+                        }
+                    }};
                 }
-                let mut mn = [f32::NEG_INFINITY; 2];
-                let mut h = 0usize;
-                while h < 2 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    let mut x = tmax[h];
-                    x = x.max(warp::shuffle_xor_f32(x, 1));
-                    x = x.max(warp::shuffle_xor_f32(x, 2));
-                    let m_new = m[h].max(x);
-                    if m_new > m[h] {
-                        f[h] = if m[h] > f32::NEG_INFINITY {
-                            dev_exp(m[h] - m_new)
-                        } else {
-                            0.0
-                        };
-                        m[h] = m_new;
-                    }
-                    mn[h] = m[h];
-                    l[h] = mul_rn_f32(l[h], f[h]);
-                    h += 1;
+                if end <= warp_lo {
+                    softmax!(false);
+                } else {
+                    softmax!(true);
                 }
-                // The weights, rounded to f16 pairs as the A fragment of the
-                // value product: k16 step kk2 is key tiles 2·kk2 and 2·kk2 + 1,
-                // registers (0, 1) then (2, 3) of each, low key first. The
-                // lane's sum takes the rounded values in that order. The mask
-                // is the key's position, not its score: a NaN score stays NaN.
-                let mut kk2 = 0usize;
-                while kk2 < PV_STEPS {
-                    cuda_device::thread::__unroll_config::<0>();
-                    let mut e = 0usize;
-                    while e < 4 {
+
+                // The accumulators times f, unless no lane of the warp has a
+                // factor other than 1 (the vote keeps the branch uniform).
+                if warp::any(f[0] != 1.0 || f[1] != 1.0) {
+                    let mut nd = 0usize;
+                    while nd < 2 * DIM_PAIRS {
                         cuda_device::thread::__unroll_config::<0>();
-                        let nt = 2 * kk2 + e / 2;
-                        let j0 = 2 * (e % 2);
-                        let h = e % 2;
-                        let key = KEY_TILE * kb + 8 * nt + 2 * t4;
-                        let p0 = if key < cnt[h] {
-                            dev_exp(sc[nt][j0] - mn[h])
-                        } else {
-                            0.0
-                        };
-                        let p1 = if key + 1 < cnt[h] {
-                            dev_exp(sc[nt][j0 + 1] - mn[h])
-                        } else {
-                            0.0
-                        };
-                        let packed = cvt_f16x2_f32(p0, p1);
-                        let (r0, r1) = cvt_f32x2_f16x2(packed);
-                        l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                        pa[kk2][e] = packed;
-                        e += 1;
+                        let mut j = 0usize;
+                        while j < 4 {
+                            cuda_device::thread::__unroll_config::<0>();
+                            o[nd][j] = mul_rn_f32(o[nd][j], f[j / 2]);
+                            j += 1;
+                        }
+                        nd += 1;
                     }
-                    kk2 += 1;
-                }
-                let mut nd = 0usize;
-                while nd < 2 * DIM_PAIRS {
-                    cuda_device::thread::__unroll_config::<0>();
-                    let mut j = 0usize;
-                    while j < 4 {
-                        cuda_device::thread::__unroll_config::<0>();
-                        o[nd][j] = mul_rn_f32(o[nd][j], f[j / 2]);
-                        j += 1;
-                    }
-                    nd += 1;
                 }
             }
 
@@ -457,7 +552,11 @@ mod flash_gqa_prefill_kernels {
             unsafe { cp_async_wait_group(0) };
             thread::sync_threads();
             if kb + 1 < tiles {
-                stage!(kt, k32, kb + 1);
+                if end + KEY_TILE_U32 <= hi {
+                    stage!(kt, k_src, kb + 1, true);
+                } else {
+                    stage!(kt, k_src, kb + 1, false);
+                }
             }
 
             // ---- O += P̂·V.
@@ -606,6 +705,13 @@ impl FlashGqaPrefill {
             return Err(GpuError::shape(
                 what,
                 format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        // The walk counts keys in u32 up to one tile past the largest count.
+        if ctx > u32::MAX as usize - KEY_TILE {
+            return Err(GpuError::shape(
+                what,
+                format!("ctx = {ctx}: the key walk counts to ctx + {KEY_TILE} in u32"),
             ));
         }
         let grid = launch_u32(what, "grid", blocks_for(t, n_kv))?;

@@ -1,0 +1,23 @@
+# Round q3fa: gqa_prefill_flash's non-HMMA instructions per warp-tile 1,137 -> 496 on the interior
+# path (sass_inflight.py --step; masked path 622), registers 255 -> 194, spill 0, smem 34,816, two
+# blocks per SM unchanged; bits unchanged (ubatch dump md5 equal to the base's, twice). The q3tail
+# sum model (a warp pair's step = tensor + issue + barriers) at 1.46-1.60 GHz gives the window
+# -15.6..-19.5 ms at P = 4096 [derived] of ~510 ms: pp4096 8,024 -> 8,277..8,343. At P = 512 flash
+# is ~1.8 ms of ~75 ms and the model gives ~-0.3 ms: a screen for 0.
+kind: ab
+question: does the flash instruction diet shorten the Qwen3 prompt as the q3tail sum model says?
+term: pp tok/s @ P = 4096, n = 0, A6000, Qwen3-30B-A3B Q4_K_M - (q3fa - base) / base, paired by
+  round
+unit: %
+predict: +3.0..+4.2
+rounds: 3
+condition: this tree's generate_qwen3moe and the base's (main after the hostreset landing, a bin:
+  arm) alternate in one lease, BLOOMERY_AB_ROUNDS=3 just depth-gpu-qwen3moe 512 bin:<base>:512
+  4096 bin:<base>:4096, the order rotated every round; no row carries [other-busy]. P = 512 and the
+  decode rows (tg96 at depth 512 and 4096) are screens for 0 (decode runs the decode flash, not this
+  kernel)
+decide-in: land q3fa; the sum model holds for flash, so FS/FB wait for the ncu stall split
+decide-below: if the effect is still past the ruler, land it and take one ncu of layer 24's flash
+  launch (the q3tail stall split) before any further flash round; if not, hold it: the step is not
+  the chain the sum model says, and the max model (a tensor-bound step) is back on the table
+decide-above: land it and re-fit the clock term (1.46-1.60 GHz) before FS/FB are specified
