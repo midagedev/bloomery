@@ -865,6 +865,32 @@ Not items:
 - **K5: the GLM collapse.** `ds41_hc_mean` computes `((s0+s1)+s2)+s3` then × 0.25. Does that match ik's "sum of streams × 1/hc" (build_glm5next.cpp:520-545) bit for bit?
 - **K6: one `pool` op?** GLM's k-pool and V4's indexer compressor are both a softmax(gate + ape) pool, and they share tensor names (`indexer_compressor_{gate,ape}`). Their key paths differ: V4 uses `_kv` plus an RMS `_norm`; GLM uses `indexer.attn_k` plus a LayerNorm with bias. One op with two key paths may cover both. This is unverified beyond the tensor lists.
 
+**03's answers (2026-09-27, from the `kernelshape` report, `specs/wave-m7/report-kernelshape.md` outside the repo):**
+- **K1.** 03's kernels have three compile-time keys only: the flash HEAD (the register arrays `acc`/`qa`/`o`), the
+  flash GROUP or PACK (the MMA fragment's row role — a GROUP-8 body at 16 drops rows 8–15, so it is wrong, not slow),
+  and the router's N_EXPERT in `route_warp` (four PER_LANE registers on the step's critical path). **Top-k (N_USED)
+  is a free runtime argument**, so the router key is E alone, not (E, K) — this corrects the recommendation above.
+  NORM_K as a compile-time maximum with a runtime k is agreed (at 8192 about 37 KB a block, two blocks an SM, a grid
+  of 128 inside one wave [derived]). hidden, window, ratio, eps, scales and vocab stay runtime. latent, delta, index,
+  hc and draft are aa's kernels.
+- **K2.** Agreed, by `macro_rules!` instantiating a whole `#[cuda_module]` — not a const-generic `#[kernel]`: a static
+  `SharedArray` cannot be sized by a const (E0401), `requires` cannot name a const, loading a generic module turns
+  into a JIT of every merged bundle, and entry names become `_TID_` hashes. A Qwen3 instance is ptx-scan-identical by
+  construction. One list, two users: a list macro (`for_each_flash_instance!($cb)`) in a crate plain cargo builds;
+  the device crate makes the modules from it and the host the instance table.
+- **K3.** With equal positions on the three axes, IMROPE's section assignment [11,11,10,0] does not change any angle,
+  so the same pairing (neox halves) and frequency formula equal partial NeoX over 64 of 256 [derived]. Whether the
+  per-section theta exponent and the pairing match is checked once against a host reference in 03's rope round (M3).
+- **K4.** aa's; 03 recommends K2's macro instances for `hc_pre<STREAMS, Fmt>` too.
+- **K5.** × 0.25 and × (1/hc) are the same exact operation at hc = 4 (a power of two, exact unless subnormal), so bit
+  identity depends only on ik's addition order: same if `build_glm5next.cpp:520-545` is `add(add(add(s0,s1),s2),s3)`,
+  different if it sums in pairs. **Read (aa, 09-27, ik `c10fbbcc`): same.** The collapse
+  (`build_glm5next.cpp:536-542`) folds `summed = summed ? ggml_add(summed, stream) : stream` over `s = 0 .. hc`, then
+  `ggml_scale(summed, 1.0f / hc)` — `((s0 + s1) + s2) + s3`, then × 0.25, the order of `hc_mean_elem`
+  (`crates/gpu-deepseek41/src/hc.rs`). Bit-identical [derived from the code; no run]. The same block says GLM-5.3-Flash
+  has no head mHC: the head reads the unweighted mean.
+- **K6.** aa's; one op looks enough if the key path is split by instance or argument.
+
 ### 8. Improvement spots (report only)
 
 | path:line | Spot | Size |
