@@ -1520,8 +1520,8 @@ impl Ds41Host {
     /// `hp`. Load-time only: every stack is found and checked here. A body
     /// passes its own mapping, so the pages its load populated are the ones
     /// the step reads; the routed gates and ups come from `file`'s r8 sidecar
-    /// when the load reads one ([`HostR8::at_load`], the reading and the
-    /// mapping the load's host set took).
+    /// when the load reads one ([`HostR8::at_load`] under the load's host
+    /// levers: the reading and the mapping the load's host set took).
     pub fn build(
         file: impl Into<Arc<Split>>,
         hp: &Hparams,
@@ -1529,7 +1529,7 @@ impl Ds41Host {
     ) -> Result<Ds41Host, GpuError> {
         let file = file.into();
         let first = layers.start;
-        let r8 = HostR8::at_load(&file)?;
+        let r8 = HostR8::at_load(&file, bloomery_gpu::hybrid::host_levers()?.r8)?;
         let views = layers
             .map(|l| host::layer_r8(&file, r8.sidecar(), hp, l))
             .collect::<Result<Vec<_>, _>>()?;

@@ -509,6 +509,26 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: "BLOOMERY_R8",
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "V4.1 host tier: its routed gates and ups are read from the r8 sidecar at \
+              `r8file::sidecar_path` of the first shard (`just r8-sidecar` writes it) through \
+              the row-lane tile, and the load's host set populates and locks those stacks' \
+              pages in the sidecar instead of the source; no file there reads the source; a \
+              file that does not match the source is its named `R8Error`, never a fall-back. \
+              `off` reads the source, the same-binary arm; both write the same bits. The load \
+              prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
+              (no sidecar at <path>: just r8-sidecar)`.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: HYBRID,
+                round: R03,
+            }],
+        },
+    },
+    LeverSpec {
         name: "BLOOMERY_LAUNCH_THREAD",
         class: Class::A,
         kind: Kind::Flag,

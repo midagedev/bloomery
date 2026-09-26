@@ -10,14 +10,22 @@
 //! those stacks' runs in the sidecar's mapping, everything else in the
 //! shards'.
 //!
+//! Every walk over a set — the populate, the lock and the residency count —
+//! cuts the set's files into the same chunks of about equal pages, a thread
+//! each: one thread reads a file's pages one fault's read-around at a time,
+//! and the device serves several at once, so no file, however large, is left
+//! to one thread.
+//!
 //! The complement lives here too: [`PageDrop`] releases file bytes the load
 //! has put on a card and no later reader needs, so that the upload does not
 //! leave them in the page cache in place of the host tier's.
 
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +46,28 @@ pub fn page_bytes() -> u64 {
     u64::try_from(page).map_or(4096, |p| p.max(4096))
 }
 
+/// About how many chunks, a thread each, a walk cuts a set into: several
+/// times the reads one thread keeps in flight, so that the device, not one
+/// thread, bounds the walk.
+const WALK_CHUNKS: u64 = 16;
+
+/// A file of a host set: a shard of the split, or the r8 sidecar, which
+/// messages name by its path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostFile {
+    Shard(usize),
+    Sidecar(PathBuf),
+}
+
+impl fmt::Display for HostFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostFile::Shard(s) => write!(f, "shard {s}"),
+            HostFile::Sidecar(p) => write!(f, "sidecar {}", p.display()),
+        }
+    }
+}
+
 /// The pages of every host segment a plan keeps, per shard: page ranges
 /// `[first, end)` of the shard's mapping, sorted and merged where they touch;
 /// and, for a host tier that reads the r8 sidecar, the same of its mapping.
@@ -50,26 +80,38 @@ pub struct HostSet {
     side: Option<(Arc<Sidecar>, Vec<Range<u64>>)>,
 }
 
-/// One file's side of a walk over a [`HostSet`] — a populate or a lock.
+/// One chunk of a walk over a [`HostSet`]: one thread's pages of one file.
 #[derive(Clone, Debug)]
-pub struct ShardWalk {
-    /// The shard; the sidecar's walk is numbered one past the last shard.
-    pub shard: usize,
-    /// Whether this is the sidecar's walk.
-    pub sidecar: bool,
-    /// Page spans walked: the host segments' ranges, merged where they touch.
+pub struct ChunkWalk {
+    pub file: HostFile,
+    /// Page spans walked: the host segments' ranges, merged where they
+    /// touch, cut where two chunks meet.
     pub spans: usize,
     /// Bytes walked, whole pages.
     pub bytes: u64,
-    /// This shard's calls end to end — the reads of the pages that were not
+    /// This chunk's calls end to end — the reads of the pages that were not
     /// in the page cache.
     pub wall: Duration,
 }
 
-/// A walk over every shard of a [`HostSet`], one thread per shard.
+/// One file's chunks of a [`Walk`].
+#[derive(Clone, Debug)]
+pub struct FileWalk {
+    pub file: HostFile,
+    /// Its chunks, a thread each.
+    pub chunks: usize,
+    /// Its chunks' spans.
+    pub spans: usize,
+    /// Its chunks' bytes, whole pages.
+    pub bytes: u64,
+    /// Its slowest chunk's wall.
+    pub wall: Duration,
+}
+
+/// A walk over every file of a [`HostSet`], one thread per chunk.
 #[derive(Clone, Debug)]
 pub struct Walk {
-    shards: Vec<ShardWalk>,
+    chunks: Vec<ChunkWalk>,
     wall: Duration,
 }
 
@@ -77,30 +119,63 @@ impl Walk {
     /// Bytes walked, whole pages, over every shard and the sidecar.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.shards.iter().map(|s| s.bytes).sum()
+        self.chunks.iter().map(|c| c.bytes).sum()
     }
 
     /// The part of [`Walk::bytes`] in the sidecar's mapping; 0 without one.
     #[must_use]
     pub fn sidecar_bytes(&self) -> u64 {
-        self.shards
+        self.chunks
             .iter()
-            .filter(|s| s.sidecar)
-            .map(|s| s.bytes)
+            .filter(|c| matches!(c.file, HostFile::Sidecar(_)))
+            .map(|c| c.bytes)
             .sum()
     }
 
-    /// Per shard, in shard order.
+    /// Per chunk, in file order and in page order within a file.
     #[must_use]
-    pub fn shards(&self) -> &[ShardWalk] {
-        &self.shards
+    pub fn chunks(&self) -> &[ChunkWalk] {
+        &self.chunks
     }
 
-    /// The whole walk end to end, all shards' threads.
+    /// Per file, in file order.
+    #[must_use]
+    pub fn files(&self) -> Vec<FileWalk> {
+        let mut out: Vec<FileWalk> = Vec::new();
+        for c in &self.chunks {
+            match out.last_mut() {
+                Some(f) if f.file == c.file => {
+                    f.chunks += 1;
+                    f.spans += c.spans;
+                    f.bytes += c.bytes;
+                    f.wall = f.wall.max(c.wall);
+                }
+                _ => out.push(FileWalk {
+                    file: c.file.clone(),
+                    chunks: 1,
+                    spans: c.spans,
+                    bytes: c.bytes,
+                    wall: c.wall,
+                }),
+            }
+        }
+        out
+    }
+
+    /// The whole walk end to end, all chunks' threads.
     #[must_use]
     pub fn wall(&self) -> Duration {
         self.wall
     }
+}
+
+/// One file's pages in a [`HostSet`] and how many of them `mincore` found
+/// resident ([`HostSet::resident`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileResidency {
+    pub file: HostFile,
+    pub resident: u64,
+    pub pages: u64,
 }
 
 impl HostSet {
@@ -167,6 +242,22 @@ impl HostSet {
             .sum()
     }
 
+    /// Pages of the set per file, in file order: each shard with ranges,
+    /// then the sidecar, when the set reads one.
+    #[must_use]
+    pub fn files(&self) -> Vec<(HostFile, u64)> {
+        let pages = |runs: &[Range<u64>]| runs.iter().map(|r| r.end - r.start).sum();
+        let mut out: Vec<(HostFile, u64)> = self
+            .shards
+            .iter()
+            .map(|(s, runs)| (HostFile::Shard(*s), pages(runs)))
+            .collect();
+        if let Some((side, runs)) = &self.side {
+            out.push((HostFile::Sidecar(side.path().to_path_buf()), pages(runs)));
+        }
+        out
+    }
+
     /// The sidecar whose pages the set holds, when it holds some.
     #[must_use]
     pub(crate) fn sidecar(&self) -> Option<&Arc<Sidecar>> {
@@ -174,10 +265,10 @@ impl HostSet {
     }
 
     /// Read every page of the set into the page cache and map it in `split`'s
-    /// mappings (`MADV_POPULATE_READ`), one thread per shard. A page already
+    /// mappings (`MADV_POPULATE_READ`), one thread per chunk. A page already
     /// cached costs its page-table entry only.
     pub fn populate(&self, split: &Split) -> Result<Walk, PlacementError> {
-        walk_shards(split, self, |span| {
+        walk(split, self, |span| {
             // SAFETY: `span` is a live sub-slice of a read-only file mapping;
             // MADV_POPULATE_READ reads its pages in and maps them, and never
             // writes them.
@@ -189,7 +280,7 @@ impl HostSet {
                 )
             };
             if rc == 0 {
-                Ok(())
+                Ok(0)
             } else {
                 Err(format!(
                     "madvise(MADV_POPULATE_READ): {}",
@@ -198,46 +289,114 @@ impl HostSet {
             }
         })
         .1
+        .map(|(w, _)| w)
     }
 
-    /// Pages of the set `mincore` reports resident in the page cache, and
-    /// all of them, the sidecar's included. `split` must be the split the set
-    /// was made from.
-    pub fn resident(&self, split: &Split) -> Result<(u64, u64), PlacementError> {
-        let (mut resident, mut total) = (0, 0);
-        for (s, g, runs) in files(split, self)? {
-            for r in runs {
-                let span = run_span(g, s, r, self.page)?;
-                let (n_in, n) = resident_pages(span, self.page).map_err(|e| {
-                    PlacementError::Host(format!("mincore over shard {s} pages {r:?}: {e}"))
-                })?;
-                resident += n_in;
-                total += n;
+    /// Per file, the pages of the set `mincore` reports resident in the page
+    /// cache, and all of them, over the same chunks as a populate, a thread
+    /// each. `split` must be the split the set was made from.
+    pub fn resident(&self, split: &Split) -> Result<Vec<FileResidency>, PlacementError> {
+        let page = self.page;
+        let (walked, counts) = walk(split, self, |span| {
+            resident_pages(span, page)
+                .map(|(n_in, _)| n_in)
+                .map_err(|e| format!("mincore: {e}"))
+        })
+        .1?;
+        let mut out: Vec<FileResidency> = Vec::new();
+        for (c, n_in) in walked.chunks.iter().zip(counts) {
+            let n = c.bytes / page;
+            match out.last_mut() {
+                Some(f) if f.file == c.file => {
+                    f.resident += n_in;
+                    f.pages += n;
+                }
+                _ => out.push(FileResidency {
+                    file: c.file.clone(),
+                    resident: n_in,
+                    pages: n,
+                }),
             }
         }
-        Ok((resident, total))
+        Ok(out)
     }
 }
 
 /// Page ranges `[first, end)` of one mapping.
 type Runs = Vec<Range<u64>>;
 
-/// One file of a walk: its number (a shard's, or one past the last shard for
-/// the sidecar), its mapping and its ranges.
-type FileRuns<'a> = (usize, &'a Gguf, &'a [Range<u64>]);
+/// One file of a set: its name, its mapping and its ranges.
+type FileRuns<'a> = (HostFile, &'a Gguf, &'a [Range<u64>]);
 
-/// The files of `set` in walk order — each shard with ranges, then the
-/// sidecar numbered one past `split`'s last shard — with their mappings and
-/// ranges.
-fn files<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<FileRuns<'a>>, PlacementError> {
+/// The files of `set` in file order — each shard with ranges, then the
+/// sidecar — with their mappings and ranges.
+fn file_runs<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<FileRuns<'a>>, PlacementError> {
     let mut out = Vec::with_capacity(set.shards.len() + 1);
     for (s, runs) in &set.shards {
-        out.push((*s, shard_of(split, *s)?, runs.as_slice()));
+        out.push((HostFile::Shard(*s), shard_of(split, *s)?, runs.as_slice()));
     }
     if let Some((side, runs)) = &set.side {
-        out.push((split.shard_count(), side.gguf(), runs.as_slice()));
+        let file = HostFile::Sidecar(side.path().to_path_buf());
+        out.push((file, side.gguf(), runs.as_slice()));
     }
     Ok(out)
+}
+
+/// One thread's part of a walk: a file, its mapping, and page ranges of it
+/// in order.
+struct Chunk<'a> {
+    file: HostFile,
+    g: &'a Gguf,
+    runs: Runs,
+}
+
+/// `set`'s files cut into chunks, in file order and in page order within a
+/// file: each file's pages into `⌈pages / per⌉` chunks ([`cut`]), `per`
+/// being the set's pages over [`WALK_CHUNKS`]. The set alone fixes the cut.
+fn chunks<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<Chunk<'a>>, PlacementError> {
+    let per = set.pages().div_ceil(WALK_CHUNKS).max(1);
+    let mut out = Vec::new();
+    for (file, g, runs) in file_runs(split, set)? {
+        let pages: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        for piece in cut(runs, pages.div_ceil(per)) {
+            out.push(Chunk {
+                file: file.clone(),
+                g,
+                runs: piece,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `runs`, page ranges in order, cut into `n` pieces of equal pages — the
+/// first `pages % n` a page more — in order: a run is cut at the page where
+/// two pieces meet. `n` is taken between 1 and the pages; no pages, no
+/// pieces.
+fn cut(runs: &[Range<u64>], n: u64) -> Vec<Runs> {
+    let pages: u64 = runs.iter().map(|r| r.end - r.start).sum();
+    let n = n.clamp(1, pages.max(1));
+    let mut sizes = (0..n).map(|c| pages / n + u64::from(c < pages % n));
+    let mut want = sizes.next().unwrap_or(0);
+    let mut out = Vec::new();
+    let mut piece = Vec::new();
+    for r in runs {
+        let mut at = r.start;
+        while at < r.end {
+            let take = (r.end - at).min(want);
+            piece.push(at..at + take);
+            at += take;
+            want -= take;
+            if want == 0 {
+                out.push(std::mem::take(&mut piece));
+                want = sizes.next().unwrap_or(u64::MAX);
+            }
+        }
+    }
+    if !piece.is_empty() {
+        out.push(piece);
+    }
+    out
 }
 
 /// The pages of a [`HostSet`], locked in the shards' mappings (and the
@@ -258,16 +417,16 @@ pub struct HostLock {
 }
 
 impl HostLock {
-    /// Lock every page of `set` in `split`'s mappings, one thread per shard.
+    /// Lock every page of `set` in `split`'s mappings, one thread per chunk.
     /// A page not yet in the page cache is read first, so a set populated
     /// just before locks at page-table speed. A refusal — `RLIMIT_MEMLOCK`,
     /// most often — unlocks what was taken and names the limit.
     pub fn lock(split: &Split, set: &HostSet) -> Result<HostLock, PlacementError> {
-        let (spans, walk) = walk_shards(split, set, |span| {
+        let (spans, walked) = walk(split, set, |span| {
             // SAFETY: `span` is a live sub-slice of a read-only file mapping;
             // mlock faults its pages in and pins them, and never writes them.
             if unsafe { libc::mlock(span.as_ptr().cast(), span.len()) } == 0 {
-                Ok(())
+                Ok(0)
             } else {
                 let e = io::Error::last_os_error();
                 Err(format!("mlock: {e} ({})", memlock_limit()))
@@ -276,13 +435,13 @@ impl HostLock {
         let mut lock = HostLock {
             spans,
             walk: Walk {
-                shards: Vec::new(),
+                chunks: Vec::new(),
                 wall: Duration::ZERO,
             },
             _sidecar: set.sidecar().cloned(),
         };
         // An error drops the partial lock, which unlocks what was taken.
-        lock.walk = walk?;
+        lock.walk = walked?.0;
         Ok(lock)
     }
 
@@ -298,13 +457,19 @@ impl HostLock {
         self.walk.sidecar_bytes()
     }
 
-    /// Per shard, in shard order.
+    /// Per chunk, in file order.
     #[must_use]
-    pub fn shards(&self) -> &[ShardWalk] {
-        self.walk.shards()
+    pub fn chunks(&self) -> &[ChunkWalk] {
+        self.walk.chunks()
     }
 
-    /// The whole lock end to end, all shards' threads.
+    /// Per file, in file order.
+    #[must_use]
+    pub fn files(&self) -> Vec<FileWalk> {
+        self.walk.files()
+    }
+
+    /// The whole lock end to end, all chunks' threads.
     #[must_use]
     pub fn wall(&self) -> Duration {
         self.walk.wall()
@@ -378,62 +543,22 @@ impl<'s> PageDrop<'s> {
     /// mapped, so this process's page-table entries go first
     /// (`MADV_DONTNEED`); a page another process maps stays cached.
     pub fn release(&mut self, shard: usize, at: Range<u64>) -> Result<(), PlacementError> {
-        let first = at.start.div_ceil(self.page) * self.page;
-        let end = at.end / self.page * self.page;
-        if end <= first {
-            return Ok(());
-        }
         let g = shard_of(self.split, shard)?;
-        let map = g.mapping();
-        let span = usize::try_from(first)
-            .ok()
-            .zip(usize::try_from(end).ok())
-            .and_then(|(a, b)| map.get(a..b))
-            .ok_or_else(|| {
-                PlacementError::Host(format!(
-                    "shard {shard} bytes {at:?} run past its {} bytes",
-                    map.len()
-                ))
-            })?;
-        // SAFETY: `span` is a live sub-slice of a read-only MAP_SHARED file
-        // mapping. MADV_DONTNEED on it drops this process's page-table
-        // entries only; the next touch re-faults the same file bytes, so no
-        // borrow of the mapping ever sees other contents.
-        if unsafe {
-            libc::madvise(
-                span.as_ptr().cast_mut().cast(),
-                span.len(),
-                libc::MADV_DONTNEED,
-            )
-        } != 0
-        {
-            return Err(PlacementError::Host(format!(
-                "madvise(MADV_DONTNEED) of shard {shard} bytes {first}..{end}: {}",
-                io::Error::last_os_error()
-            )));
-        }
+        let page = self.page;
         let file = self.file(shard)?;
-        let off = |v: u64| {
-            libc::off_t::try_from(v)
-                .map_err(|_| PlacementError::Host(format!("shard {shard} offset {v} passes off_t")))
-        };
-        // SAFETY: the descriptor is this shard file's own and lives in `self`
-        // across the call; fadvise reads no memory of ours.
-        let rc = unsafe {
-            libc::posix_fadvise(
-                file.as_raw_fd(),
-                off(first)?,
-                off(end - first)?,
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-        if rc != 0 {
-            return Err(PlacementError::Host(format!(
-                "posix_fadvise(DONTNEED) of shard {shard} bytes {first}..{end}: {}",
-                io::Error::from_raw_os_error(rc)
-            )));
-        }
-        self.bytes += end - first;
+        let dropped = drop_pages(&HostFile::Shard(shard), g.mapping(), file, page, at)?;
+        self.bytes += dropped;
+        Ok(())
+    }
+
+    /// Release every whole page of the r8 sidecar `side`, as
+    /// [`PageDrop::release`] does a shard's.
+    pub fn release_sidecar(&mut self, side: &Sidecar) -> Result<(), PlacementError> {
+        let name = HostFile::Sidecar(side.path().to_path_buf());
+        let file = File::open(side.path())
+            .map_err(|e| PlacementError::Host(format!("open {name} to release pages: {e}")))?;
+        let map = side.gguf().mapping();
+        self.bytes += drop_pages(&name, map, &file, self.page, 0..map.len() as u64)?;
         Ok(())
     }
 
@@ -463,38 +588,108 @@ impl<'s> PageDrop<'s> {
     }
 }
 
-/// What one shard's thread hands back: every span its call succeeded on —
+/// Drop the whole pages inside bytes `at` of `name`'s mapping `map`, whose
+/// file `file` is, from this process's page tables and then from the page
+/// cache; the bytes dropped.
+fn drop_pages(
+    name: &HostFile,
+    map: &[u8],
+    file: &File,
+    page: u64,
+    at: Range<u64>,
+) -> Result<u64, PlacementError> {
+    let first = at.start.div_ceil(page) * page;
+    let end = at.end / page * page;
+    if end <= first {
+        return Ok(0);
+    }
+    let span = usize::try_from(first)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(a, b)| map.get(a..b))
+        .ok_or_else(|| {
+            PlacementError::Host(format!(
+                "{name} bytes {at:?} run past its {} bytes",
+                map.len()
+            ))
+        })?;
+    // SAFETY: `span` is a live sub-slice of a read-only MAP_SHARED file
+    // mapping. MADV_DONTNEED on it drops this process's page-table entries
+    // only; the next touch re-faults the same file bytes, so no borrow of the
+    // mapping ever sees other contents.
+    if unsafe {
+        libc::madvise(
+            span.as_ptr().cast_mut().cast(),
+            span.len(),
+            libc::MADV_DONTNEED,
+        )
+    } != 0
+    {
+        return Err(PlacementError::Host(format!(
+            "madvise(MADV_DONTNEED) of {name} bytes {first}..{end}: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let off = |v: u64| {
+        libc::off_t::try_from(v)
+            .map_err(|_| PlacementError::Host(format!("{name} offset {v} passes off_t")))
+    };
+    // SAFETY: the descriptor is this file's own and lives across the call;
+    // fadvise reads no memory of ours.
+    let rc = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            off(first)?,
+            off(end - first)?,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+    if rc != 0 {
+        return Err(PlacementError::Host(format!(
+            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {}",
+            io::Error::from_raw_os_error(rc)
+        )));
+    }
+    Ok(end - first)
+}
+
+/// What one chunk's thread hands back: every span its call succeeded on —
 /// also when a later one failed, so that a lock's drop unlocks them — and
-/// its record.
-type ShardResult = (Vec<(usize, usize)>, Result<ShardWalk, PlacementError>);
+/// its record with the sum of `op`'s counts.
+type ChunkResult = (
+    Vec<(usize, usize)>,
+    Result<(ChunkWalk, u64), PlacementError>,
+);
+
+/// A walk and each chunk's count, in chunk order.
+type Walked = (Walk, Vec<u64>);
 
 /// Run `op` over every page run of `set` in `split`'s mappings and the
-/// sidecar's, one thread per file, runs in order within a file. Returns the
-/// spans `op` succeeded on and the walk, or the first file's refusal.
-fn walk_shards(
+/// sidecar's, one thread per chunk ([`chunks`]), a chunk's runs in order.
+/// `op` returns a count each chunk sums (the resident pages of a residency
+/// count; 0 for a populate or a lock). Returns the spans `op` succeeded on
+/// and the walk, or the first refusal in chunk order.
+fn walk(
     split: &Split,
     set: &HostSet,
-    op: impl Fn(&[u8]) -> Result<(), String> + Sync,
-) -> (Vec<(usize, usize)>, Result<Walk, PlacementError>) {
-    let work = match files(split, set) {
+    op: impl Fn(&[u8]) -> Result<u64, String> + Sync,
+) -> (Vec<(usize, usize)>, Result<Walked, PlacementError>) {
+    let work = match chunks(split, set) {
         Ok(work) => work,
         Err(e) => return (Vec::new(), Err(e)),
     };
-    let sidecar = split.shard_count();
     let start = Instant::now();
     let op = &op;
-    let results: Vec<ShardResult> = thread::scope(|scope| {
+    let results: Vec<ChunkResult> = thread::scope(|scope| {
         let handles: Vec<_> = work
             .iter()
-            .map(|&(s, g, runs)| {
-                scope.spawn(move || walk_shard(g, s, s == sidecar, runs, set.page, op))
-            })
+            .map(|c| (c, scope.spawn(move || walk_chunk(c, set.page, op))))
             .collect();
         handles
             .into_iter()
-            .map(|h| {
+            .map(|(c, h)| {
                 h.join().unwrap_or_else(|_| {
-                    let e = PlacementError::Host("a shard's walk thread panicked".into());
+                    let e = PlacementError::Host(format!("{}: a walk thread panicked", c.file));
                     (Vec::new(), Err(e))
                 })
             })
@@ -502,54 +697,71 @@ fn walk_shards(
     });
     let wall = start.elapsed();
     let mut done = Vec::new();
-    let mut shards = Vec::with_capacity(results.len());
+    let mut walked = Vec::with_capacity(results.len());
+    let mut counts = Vec::with_capacity(results.len());
     let mut refused = None;
-    for (spans, shard) in results {
+    for (spans, chunk) in results {
         done.extend(spans);
-        match shard {
-            Ok(s) => shards.push(s),
+        match chunk {
+            Ok((c, n)) => {
+                walked.push(c);
+                counts.push(n);
+            }
             Err(e) => refused = refused.or(Some(e)),
         }
     }
     match refused {
         Some(e) => (done, Err(e)),
-        None => (done, Ok(Walk { shards, wall })),
+        None => (
+            done,
+            Ok((
+                Walk {
+                    chunks: walked,
+                    wall,
+                },
+                counts,
+            )),
+        ),
     }
 }
 
-/// `op` over `runs` of shard `shard`'s mapping (the sidecar's when
-/// `sidecar`), in order.
-fn walk_shard(
-    g: &Gguf,
-    shard: usize,
-    sidecar: bool,
-    runs: &[Range<u64>],
+/// `op` over chunk `c`'s runs, in order; a refusal names the file and the
+/// run's bytes.
+fn walk_chunk(
+    c: &Chunk<'_>,
     page: u64,
-    op: &(impl Fn(&[u8]) -> Result<(), String> + Sync),
-) -> ShardResult {
+    op: &(impl Fn(&[u8]) -> Result<u64, String> + Sync),
+) -> ChunkResult {
     let start = Instant::now();
-    let mut done = Vec::with_capacity(runs.len());
-    let mut bytes = 0;
-    for r in runs {
-        let span = match run_span(g, shard, r, page) {
+    let mut done = Vec::with_capacity(c.runs.len());
+    let (mut bytes, mut count) = (0, 0);
+    for r in &c.runs {
+        let span = match run_span(c.g, &c.file, r, page) {
             Ok(span) => span,
             Err(e) => return (done, Err(e)),
         };
-        if let Err(e) = op(span) {
-            let e = PlacementError::Host(format!("shard {shard} pages {r:?}: {e}"));
-            return (done, Err(e));
+        match op(span) {
+            Ok(n) => count += n,
+            Err(e) => {
+                let at = r.start * page;
+                let e = PlacementError::Host(format!(
+                    "{} bytes {at}..{}: {e}",
+                    c.file,
+                    at + span.len() as u64
+                ));
+                return (done, Err(e));
+            }
         }
         done.push((span.as_ptr() as usize, span.len()));
         bytes += (r.end - r.start) * page;
     }
-    let record = ShardWalk {
-        shard,
-        sidecar,
-        spans: runs.len(),
+    let record = ChunkWalk {
+        file: c.file.clone(),
+        spans: c.runs.len(),
         bytes,
         wall: start.elapsed(),
     };
-    (done, Ok(record))
+    (done, Ok((record, count)))
 }
 
 fn shard_of(split: &Split, s: usize) -> Result<&Gguf, PlacementError> {
@@ -559,10 +771,10 @@ fn shard_of(split: &Split, s: usize) -> Result<&Gguf, PlacementError> {
 }
 
 /// Pages `r` of `g`'s mapping as a slice, the last one clamped to the
-/// mapping's end.
+/// mapping's end; `file` names the mapping in a refusal.
 fn run_span<'g>(
     g: &'g Gguf,
-    shard: usize,
+    file: &HostFile,
     r: &Range<u64>,
     page: u64,
 ) -> Result<&'g [u8], PlacementError> {
@@ -575,7 +787,7 @@ fn run_span<'g>(
         .and_then(|(a, b)| map.get(a..b))
         .ok_or_else(|| {
             PlacementError::Host(format!(
-                "shard {shard} pages {r:?} run past its {} bytes",
+                "{file} bytes {first}..{end} run past its {} bytes",
                 map.len()
             ))
         })
@@ -680,4 +892,45 @@ fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
         return Err(io::Error::last_os_error());
     }
     Ok((vec.iter().filter(|&&b| b & 1 != 0).count() as u64, n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut;
+    use std::ops::Range;
+
+    /// A cut keeps every page once and in order, and its pieces differ by at
+    /// most a page, into any count from one to the pages: over one run, runs
+    /// shorter and longer than a piece (so cuts fall inside runs and on
+    /// their edges), and a single page.
+    #[test]
+    fn a_cut_keeps_every_page_once_and_evens_its_pieces() {
+        let shapes: [&[(u64, u64)]; 3] = [
+            &[(0, 100)],
+            &[(0, 3), (5, 9), (20, 21), (30, 60)],
+            &[(7, 8)],
+        ];
+        for shape in shapes {
+            let runs: Vec<Range<u64>> = shape.iter().map(|&(a, b)| a..b).collect();
+            let runs = runs.as_slice();
+            let want: Vec<u64> = runs.iter().flat_map(Clone::clone).collect();
+            let pages = want.len() as u64;
+            for n in 1..=pages {
+                let pieces = cut(runs, n);
+                assert_eq!(pieces.len() as u64, n, "{runs:?} into {n}");
+                let sizes: Vec<u64> = pieces
+                    .iter()
+                    .map(|p| p.iter().map(|r| r.end - r.start).sum())
+                    .collect();
+                let (lo, hi) = (sizes.iter().min(), sizes.iter().max());
+                assert!(
+                    lo.zip(hi).is_some_and(|(lo, hi)| *lo >= 1 && hi - lo <= 1),
+                    "{runs:?} into {n}: sizes {sizes:?}"
+                );
+                let got: Vec<u64> = pieces.iter().flatten().flat_map(Clone::clone).collect();
+                assert_eq!(got, want, "{runs:?} into {n}");
+            }
+        }
+        assert!(cut(&[], 3).is_empty(), "no pages, no pieces");
+    }
 }

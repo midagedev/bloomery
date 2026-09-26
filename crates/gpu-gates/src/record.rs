@@ -481,12 +481,13 @@ pub static LOAD_GENERATOR: Kind = Kind {
 pub static HOST_POPULATE: Kind = Kind {
     name: "host_populate",
     head: "host_populate=",
-    doc: "The plan's host set read in at load (MADV_POPULATE_READ), and the wall it took.",
+    doc: "The plan's host set read in at load (MADV_POPULATE_READ), the wall it took, and the part of it in the r8 sidecar.",
     parts: &[
         pos("host_populate_bytes", U64, "B"),
         lit(" in "),
         pos("populate_s", F64(1), "s"),
         lit(" s (runtime value)"),
+        key("sidecar_bytes", U64, "B"),
     ],
 };
 
@@ -502,8 +503,12 @@ pub static HOST_POPULATE_OFF: Kind = Kind {
 pub static HOST_LOCK: Kind = Kind {
     name: "host_lock",
     head: "host_lock=",
-    doc: "The host set mlocked for the model's life (BLOOMERY_HOST_LOCK=1).",
-    parts: &[pos("host_lock_bytes", U64, "B"), lit(" B")],
+    doc: "The host set mlocked for the model's life (BLOOMERY_HOST_LOCK=1), and the part of it in the r8 sidecar.",
+    parts: &[
+        pos("host_lock_bytes", U64, "B"),
+        lit(" B"),
+        key("sidecar_bytes", U64, "B"),
+    ],
 };
 
 /// The DSpark draft's load.
@@ -1131,17 +1136,22 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>, hot_list: &str) -> 
 }
 
 /// A placed load's host-set records: the set read in, with its wall, or not;
-/// then the set locked, when it was.
+/// then the set locked, when it was — each with its bytes in the r8 sidecar.
 #[cfg(feature = "gpu")]
 pub fn host_residency(h: &HostResidency) -> Vec<Record> {
     let mut out = vec![match h.populated() {
         Some(w) => Record::new(&HOST_POPULATE)
             .u("host_populate_bytes", w.bytes())
-            .f("populate_s", w.wall().as_secs_f64()),
+            .f("populate_s", w.wall().as_secs_f64())
+            .u("sidecar_bytes", w.sidecar_bytes()),
         None => Record::new(&HOST_POPULATE_OFF),
     }];
     if let Some(l) = h.lock() {
-        out.push(Record::new(&HOST_LOCK).u("host_lock_bytes", l.bytes()));
+        out.push(
+            Record::new(&HOST_LOCK)
+                .u("host_lock_bytes", l.bytes())
+                .u("sidecar_bytes", l.sidecar_bytes()),
+        );
     }
     out
 }
@@ -1208,8 +1218,11 @@ mod tests {
             prompt,
             "time prompt n=512 ms=4285.3406 tok/s=119.48 passes=1 kind=batch"
         );
-        let lock = Record::new(&HOST_LOCK).u("host_lock_bytes", 4096).line();
-        assert_eq!(lock, "host_lock=4096 B");
+        let lock = Record::new(&HOST_LOCK)
+            .u("host_lock_bytes", 8192)
+            .u("sidecar_bytes", 4096)
+            .line();
+        assert_eq!(lock, "host_lock=8192 B sidecar_bytes=4096");
         let smoke = Record::new(&SMOKE)
             .w("mode", "graph")
             .w("place", "a")

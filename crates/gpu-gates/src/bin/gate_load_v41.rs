@@ -32,22 +32,30 @@
 //! (`HostResidency::at_load` with the engine's levers, the call
 //! `GpuModel::load_placed` makes):
 //!
-//! 4. Resident host set: before anything is loaded the shard files are
-//!    dropped from the page cache (`posix_fadvise(DONTNEED)`, the pages
-//!    another process maps excepted — the count still resident is printed),
-//!    so a lazy mapping cannot pass by luck; after the host step `mincore`
-//!    must find every page of the plan's host set resident. Red with
-//!    `BLOOMERY_HOST_POPULATE=0`. `Cached` of `/proc/meminfo` before the
-//!    load, after the cards and after the host step is printed, never
-//!    asserted: with `BLOOMERY_CARD_DONTNEED` at its default the cards'
-//!    file bytes leave the page cache as they are uploaded.
+//! 4. Resident host set: the gate derives the plan's host set as the engine
+//!    does — the r8 reading under the engine's `BLOOMERY_R8`
+//!    (`HostR8::at_load`) and `HostSet::of_r8` over the sidecar it reads,
+//!    `HostSet::of` without one — and before anything is loaded drops the
+//!    shard files and that sidecar from the page cache
+//!    (`posix_fadvise(DONTNEED)`, the pages another process maps excepted —
+//!    the count still resident is printed), so a lazy mapping cannot pass by
+//!    luck. After the host step the engine's set must be this one, file for
+//!    file, and `mincore` must find every page of it resident — the
+//!    sidecar's among them, since only the load read them back. Red with
+//!    `BLOOMERY_HOST_POPULATE=0`, and red when the engine walks another set
+//!    than the one its host tier reads. `Cached` of `/proc/meminfo` before
+//!    the load, after the cards and after the host step is printed, never
+//!    asserted: with `BLOOMERY_CARD_DONTNEED` at its default the cards' file
+//!    bytes leave the page cache as they are uploaded. The populate's wall
+//!    per file and per chunk (a thread each) is printed, never asserted.
 //!
 //! With `--lock` (every host segment) or `--lock-layers L0..L1` (the host
 //! segments of those layers, which narrows check 4's set too), the engine's
 //! lever `BLOOMERY_HOST_LOCK=1` must be set, and the host step locks the set:
 //! `VmLck` must grow by the page-rounded union of the locked ranges — derived
-//! here from the headers — exactly. Lock wall time per shard and in total is
-//! printed, never asserted.
+//! here from the headers, per file: a tensor the sidecar holds from the
+//! sidecar's header, every other from its shard's — exactly. Lock wall time
+//! per file and in total is printed, never asserted.
 //!
 //! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
 //! layers over both cards (`workstation::plan_b`), and this gate is the tree's
@@ -81,11 +89,12 @@ mod gate {
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::host_lock::{HostSet, PageDrop, page_bytes};
+    use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
     use model::placement::{
         Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
         PlanLevers, Segment, workstation,
     };
+    use model::r8file::HostR8;
 
     /// Design §5's two plans.
     #[derive(Clone, Copy)]
@@ -174,10 +183,12 @@ mod gate {
             );
         }
         println!(
-            "levers: BLOOMERY_HOST_POPULATE={} BLOOMERY_HOST_LOCK={} BLOOMERY_CARD_DONTNEED={}",
+            "levers: BLOOMERY_HOST_POPULATE={} BLOOMERY_HOST_LOCK={} BLOOMERY_CARD_DONTNEED={} \
+             BLOOMERY_R8={}",
             u8::from(levers.populate),
             u8::from(levers.lock),
-            u8::from(levers.card_dontneed)
+            u8::from(levers.card_dontneed),
+            if levers.r8 { "on" } else { "off" }
         );
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -223,15 +234,25 @@ mod gate {
 
         let cards = open_cards(&plan)?;
         let lock = args.lock.as_ref();
-        let set = HostSet::of(&split, &plan, |t| keeps(lock, t))?;
-        evict(&split, &set)?;
+        let r8 = HostR8::at_load(&split, levers.r8)?;
+        let set = match r8.sidecar() {
+            Some(side) => HostSet::of_r8(&split, side, &plan, |t| keeps(lock, t))?,
+            None => HostSet::of(&split, &plan, |t| keeps(lock, t))?,
+        };
+        evict(&split, &set, &r8)?;
         let cached_before = meminfo_cached()?;
         let mut ok = true;
         for (c, on) in cards.iter().enumerate() {
             ok &= check_card(&split, &plan, c, on)?;
         }
         let cached_cards = meminfo_cached()?;
-        ok &= check_host(&split, &plan, lock, levers, [cached_before, cached_cards])?;
+        let host = Host {
+            set: &set,
+            r8: &r8,
+            lock,
+            levers,
+        };
+        ok &= check_host(&split, &plan, &host, [cached_before, cached_cards])?;
         if !ok {
             return Err(checks_failed());
         }
@@ -649,15 +670,17 @@ mod gate {
         Ok(pass)
     }
 
-    /// Per shard, the pages of the page-rounded union of the host segments
-    /// `lock` keeps, from the headers alone.
+    /// Per file, the pages of the page-rounded union of the host segments
+    /// `lock` keeps, from the headers alone: a tensor `r8`'s sidecar holds
+    /// at the sidecar's offsets, every other at its shard's.
     fn page_union(
         split: &Split,
         plan: &Plan<'_>,
+        r8: &HostR8,
         lock: &Lock,
         page: u64,
-    ) -> Result<BTreeMap<usize, u64>, GateError> {
-        let mut spans: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+    ) -> Result<BTreeMap<HostFile, u64>, GateError> {
+        let mut spans: BTreeMap<HostFile, Vec<(u64, u64)>> = BTreeMap::new();
         for row in &plan.rows {
             let t = &plan.model.tensors[row.tensor];
             if !lock.keeps(t) {
@@ -667,28 +690,39 @@ mod gate {
                 if seg.device != Device::Host || seg.format != Format::HostFile {
                     continue;
                 }
-                let (shard, info) = split
-                    .find(&t.name)
-                    .ok_or_else(|| format!("{} is not in the split", t.name))?;
-                let base =
-                    split.shard(shard).ok_or("shard out of range")?.data_base() + info.offset;
-                let per = info.nbytes / plan.model.experts;
+                let in_sidecar = r8
+                    .sidecar()
+                    .and_then(|side| Some((side, side.file_bytes(&t.name)?)));
+                let (file, bytes) = match in_sidecar {
+                    Some((side, bytes)) => (HostFile::Sidecar(side.path().to_path_buf()), bytes),
+                    None => {
+                        let (shard, info) = split
+                            .find(&t.name)
+                            .ok_or_else(|| format!("{} is not in the split", t.name))?;
+                        let base = split.shard(shard).ok_or("shard out of range")?.data_base()
+                            + info.offset;
+                        (HostFile::Shard(shard), base..base + info.nbytes)
+                    }
+                };
+                let base = bytes.start;
+                let nbytes = bytes.end - bytes.start;
+                let per = nbytes / plan.model.experts;
                 let held: Vec<(u64, u64)> = match &seg.experts {
-                    None => vec![(0, info.nbytes)],
+                    None => vec![(0, nbytes)],
                     Some(e) => e
                         .ids()
                         .iter()
                         .map(|&id| (u64::from(id) * per, (u64::from(id) + 1) * per))
                         .collect(),
                 };
-                let entry = spans.entry(shard).or_default();
+                let entry = spans.entry(file).or_default();
                 for (a, b) in held {
                     entry.push(((base + a) / page, (base + b).div_ceil(page)));
                 }
             }
         }
         let mut pages = BTreeMap::new();
-        for (shard, mut s) in spans {
+        for (file, mut s) in spans {
             s.sort_unstable();
             let (mut n, mut end) = (0, 0);
             for (a, b) in s {
@@ -698,7 +732,7 @@ mod gate {
                     end = b;
                 }
             }
-            pages.insert(shard, n);
+            pages.insert(file, n);
         }
         Ok(pages)
     }
@@ -725,49 +759,86 @@ mod gate {
         Ok(kb.trim().parse::<u64>()? * 1024)
     }
 
-    /// Check 4's precondition: every shard file out of the page cache, so the
-    /// host set is resident afterwards only if the load read it in. Pages
-    /// another process maps stay; the count left is printed.
-    fn evict(split: &Split, set: &HostSet) -> Result<(), GateError> {
+    /// Check 4's precondition: every shard file and the sidecar `r8` reads
+    /// out of the page cache, so the host set is resident afterwards only if
+    /// the load read it in. Pages another process maps stay; the count left
+    /// is printed.
+    fn evict(split: &Split, set: &HostSet, r8: &HostR8) -> Result<(), GateError> {
         let mut release = PageDrop::new(split);
         for s in 0..split.shard_count() {
             let len = split.shard(s).ok_or("shard out of range")?.mapping().len() as u64;
             release.release(s, 0..len)?;
         }
-        let (resident, pages) = set.resident(split)?;
+        let shards = release.bytes();
+        if let Some(side) = r8.sidecar() {
+            release.release_sidecar(side)?;
+        }
+        let files = set.resident(split)?;
+        let resident: u64 = files.iter().map(|f| f.resident).sum();
+        let pages: u64 = files.iter().map(|f| f.pages).sum();
         println!(
-            "evict: the shard files' {} B advised out of the page cache; host set {resident} of \
-             {pages} pages still resident before the load (pages another process maps stay)",
-            release.bytes()
+            "evict: the shard files' {shards} B and the sidecar's {} B advised out of the page \
+             cache; host set {resident} of {pages} pages still resident before the load (pages \
+             another process maps stay)",
+            release.bytes() - shards
         );
         Ok(())
     }
 
-    /// The host half: the engine's host step over the host segments `lock`
-    /// keeps (every one without it), then check 4 — `mincore` finds the
-    /// whole set resident — and, when the step locked, `VmLck` against the
-    /// derived page union. `cached` is `Cached` before the load and after the
-    /// cards.
+    /// What the host half checks: the gate's own host set and the r8
+    /// reading it was derived under, the host segments `lock` keeps (every
+    /// one without it), and the engine's levers.
+    struct Host<'a> {
+        set: &'a HostSet,
+        r8: &'a HostR8,
+        lock: Option<&'a Lock>,
+        levers: HostLevers,
+    }
+
+    /// The host half: the engine's host step over the host segments the
+    /// gate's set keeps, then check 4 — the engine walked the gate's set,
+    /// file for file, and `mincore` finds all of it resident — and, when the
+    /// step locked, `VmLck` against the derived page union. `cached` is
+    /// `Cached` before the load and after the cards.
     fn check_host(
         split: &Split,
         plan: &Plan<'_>,
-        lock: Option<&Lock>,
-        levers: HostLevers,
+        h: &Host<'_>,
         cached: [u64; 2],
     ) -> Result<bool, GateError> {
         let page = page_bytes();
         let before = vm_lck()?;
-        let host = HostResidency::at_load(split, plan, |t| keeps(lock, t), levers)?;
+        let host = HostResidency::at_load(split, plan, |t| keeps(h.lock, t), h.levers)?;
         let after = vm_lck()?;
         let cached_host = meminfo_cached()?;
-        let set = host.set();
         match host.populated() {
-            Some(w) => println!(
-                "host_populate={} in {:.1} s over {} shards (runtime value)",
-                w.bytes(),
-                w.wall().as_secs_f64(),
-                w.shards().len()
-            ),
+            Some(w) => {
+                println!(
+                    "host_populate={} in {:.1} s over {} chunks (runtime value), the sidecar's {} B",
+                    w.bytes(),
+                    w.wall().as_secs_f64(),
+                    w.chunks().len(),
+                    w.sidecar_bytes()
+                );
+                for f in w.files() {
+                    println!(
+                        "  populate {}: {} B in {} chunks, the slowest {:.1} s (runtime value)",
+                        f.file,
+                        f.bytes,
+                        f.chunks,
+                        f.wall.as_secs_f64()
+                    );
+                }
+                for (i, c) in w.chunks().iter().enumerate() {
+                    println!(
+                        "  populate chunk {i}: {} {} B in {} spans, {:.1} s (runtime value)",
+                        c.file,
+                        c.bytes,
+                        c.spans,
+                        c.wall.as_secs_f64()
+                    );
+                }
+            }
             None => println!("host_populate=off"),
         }
         let delta = |a: u64, b: u64| i128::from(b) - i128::from(a);
@@ -777,20 +848,46 @@ mod gate {
             cached[0],
             cached[1],
             delta(cached[0], cached[1]),
-            u8::from(levers.card_dontneed),
+            u8::from(h.levers.card_dontneed),
             cached_host,
             delta(cached[1], cached_host),
-            set.bytes()
+            h.set.bytes()
         );
-        let (resident, pages) = set.resident(split)?;
-        let four = resident == pages;
+        let theirs = host.set().files();
+        let ours = h.set.files();
+        let same_set = theirs == ours;
+        if !same_set {
+            eprintln!(
+                "FAIL: check 4 host: the engine walked {theirs:?} pages per file, the host tier's \
+                 set is {ours:?}"
+            );
+        }
+        let files = h.set.resident(split)?;
+        let (mut resident, mut pages) = (0, 0);
+        for f in &files {
+            println!(
+                "check 4 {}: {} of {} pages resident after the host step",
+                f.file, f.resident, f.pages
+            );
+            resident += f.resident;
+            pages += f.pages;
+        }
+        let side = files
+            .iter()
+            .find(|f| matches!(f.file, HostFile::Sidecar(_)))
+            .map_or_else(
+                || format!("no sidecar ({})", h.r8),
+                |f| format!("{} {} pages", f.file, f.pages),
+            );
+        let four = same_set && resident == pages;
         println!(
             "check 4 host: {resident} of {pages} host-set pages resident after the host step \
-             ({} B): {}",
+             ({} B; {side}), the engine's set {}: {}",
             pages * page,
+            if same_set { "the same" } else { "another" },
             verdict(four)
         );
-        if !four {
+        if resident != pages {
             eprintln!(
                 "FAIL: check 4 host: {} host-set pages not resident after the load",
                 pages - resident
@@ -799,30 +896,33 @@ mod gate {
         let Some(held) = host.lock() else {
             return Ok(four);
         };
-        let union = page_union(split, plan, lock.unwrap_or(&Lock::All), page)?;
+        let union = page_union(split, plan, h.r8, h.lock.unwrap_or(&Lock::All), page)?;
         let union_bytes = union.values().sum::<u64>() * page;
-        for s in held.shards() {
+        for f in held.files() {
             println!(
-                "lock shard {}: {} spans, {} B in {:.1} s (runtime value); derived union {} B",
-                s.shard,
-                s.spans,
-                s.bytes,
-                s.wall.as_secs_f64(),
-                union.get(&s.shard).map_or(0, |p| p * page)
+                "lock {}: {} chunks, {} spans, {} B, the slowest chunk {:.1} s (runtime value); \
+                 derived union {} B",
+                f.file,
+                f.chunks,
+                f.spans,
+                f.bytes,
+                f.wall.as_secs_f64(),
+                union.get(&f.file).map_or(0, |p| p * page)
             );
         }
         println!(
-            "host_lock={} vm_lck={after} over {} shards in {:.1} s (runtime value)",
+            "host_lock={} vm_lck={after} over {} chunks in {:.1} s (runtime value), the sidecar's {} B",
             held.bytes(),
-            held.shards().len(),
-            held.wall().as_secs_f64()
+            held.chunks().len(),
+            held.wall().as_secs_f64(),
+            held.sidecar_bytes()
         );
         let grew = after.checked_sub(before);
         let vm_ok = grew == Some(union_bytes) && held.bytes() == union_bytes;
         println!(
             "host VmLck: {before} B before, {after} B after the lock; the derived page-rounded union \
              {union_bytes} B, the host set {} B: {}",
-            set.bytes(),
+            h.set.bytes(),
             verdict(vm_ok)
         );
         Ok(four && vm_ok)

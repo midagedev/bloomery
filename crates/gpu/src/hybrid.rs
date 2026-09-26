@@ -188,7 +188,14 @@ pub struct HostLevers {
     /// file pages from the page cache once uploaded
     /// ([`crate::weights::Weights::load_placed`]); `0` keeps them cached.
     pub card_dontneed: bool,
+    /// `BLOOMERY_R8`: unset or `on` reads a V4.1 host tier's routed gates and
+    /// ups from the r8 sidecar when there is one ([`HostR8::at_load`]); `off`
+    /// reads the source's, the same-binary arm.
+    pub r8: bool,
 }
+
+/// `BLOOMERY_R8`, the one lever of the four taken as `on`/`off`.
+const R8_LEVER: &str = "BLOOMERY_R8";
 
 /// The host levers, read once per process.
 pub fn host_levers() -> Result<HostLevers, GpuError> {
@@ -199,6 +206,7 @@ pub fn host_levers() -> Result<HostLevers, GpuError> {
                 populate: flag("BLOOMERY_HOST_POPULATE", true)?,
                 lock: flag("BLOOMERY_HOST_LOCK", false)?,
                 card_dontneed: flag("BLOOMERY_CARD_DONTNEED", true)?,
+                r8: on_off(R8_LEVER, std::env::var(R8_LEVER), true)?,
             })
         })
         .clone()
@@ -212,6 +220,22 @@ fn flag(name: &str, default: bool) -> Result<bool, String> {
         Ok(v) if v.trim() == "1" => Ok(true),
         Ok(v) if v.trim() == "0" => Ok(false),
         Ok(v) => Err(format!("{name}={v:?}: want 0 or 1")),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+/// An `on`/`off` lever as `value` read it, exactly as written — ` on` or
+/// `ON` is refused like any other value; `default` when unset.
+fn on_off(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+    default: bool,
+) -> Result<bool, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Ok(v) if v == "on" => Ok(true),
+        Ok(v) if v == "off" => Ok(false),
+        Ok(v) => Err(format!("{name}={v:?}: want on or off")),
         Err(e) => Err(format!("{name}: {e}")),
     }
 }
@@ -230,10 +254,10 @@ impl HostResidency {
     /// The host set of `plan` over `split` — the host segments whose tensor
     /// `keep` selects — populated, then locked, as `levers` ask. Populating
     /// first makes the lock a walk over resident pages. When the host tier
-    /// reads the r8 sidecar ([`HostR8::at_load`], the same reading and the
-    /// same mapping a V4.1 host tier's build takes), the stacks it holds are
-    /// walked in its mapping and their source pages are not; everything else
-    /// is the source's.
+    /// reads the r8 sidecar ([`HostR8::at_load`] under `levers.r8`, the same
+    /// reading and the same mapping a V4.1 host tier's build takes), the
+    /// stacks it holds are walked in its mapping and their source pages are
+    /// not; everything else is the source's.
     pub fn at_load(
         split: &Split,
         plan: &Plan<'_>,
@@ -241,7 +265,7 @@ impl HostResidency {
         levers: HostLevers,
     ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
-        let r8 = HostR8::at_load(split)?;
+        let r8 = HostR8::at_load(split, levers.r8)?;
         let set = match r8.sidecar() {
             Some(side) => HostSet::of_r8(split, side, plan, keep),
             None => HostSet::of(split, plan, keep),
@@ -2367,9 +2391,29 @@ fn read_fault(word: &DeviceBuffer<u32>) -> Result<Option<Fault>, GpuError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, HOST, SlotMap};
+    use super::{Boundary, BoundaryShape, HOST, R8_LEVER, SlotMap, on_off};
     use cuda_core::CudaContext;
+    use std::env::VarError;
+    use std::os::unix::ffi::OsStringExt;
     use std::sync::Arc;
+
+    /// `BLOOMERY_R8` takes `on` or `off` exactly as written, unset is `on`,
+    /// and every other value — another case, a space around it, a flag's
+    /// `1`, bytes that are not UTF-8 — is refused naming the lever.
+    #[test]
+    fn r8_takes_on_or_off_as_written() {
+        let read = |v: Result<String, VarError>| on_off(R8_LEVER, v, true);
+        assert_eq!(read(Err(VarError::NotPresent)), Ok(true));
+        assert_eq!(read(Ok("on".into())), Ok(true));
+        assert_eq!(read(Ok("off".into())), Ok(false));
+        for v in [" on", "off\n", "ON", "On", "1", "0", "", "x"] {
+            let e = read(Ok(v.into())).expect_err(v);
+            assert_eq!(e, format!("BLOOMERY_R8={v:?}: want on or off"));
+        }
+        let bad = std::ffi::OsString::from_vec(vec![b'o', b'n', 0xff]);
+        let e = read(Err(VarError::NotUnicode(bad))).expect_err("not UTF-8");
+        assert!(e.starts_with("BLOOMERY_R8: "), "{e}");
+    }
 
     /// A boundary gives back every context handle its windows took: the
     /// context's count after one is dropped is the count before it was made.
