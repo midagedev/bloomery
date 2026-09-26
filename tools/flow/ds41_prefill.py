@@ -18,19 +18,20 @@ and stream waits cost the host a call and take no slot. The union is the kernel 
 causes (join tails, wakes, stash, zero fill, scan, preparation, per flow) plus one named residual.
 
 Today the host issues a layer-batch's route and shadow, waits for the route and then runs the union,
-so the wall is a sum (cardroute-design-report.md:142-153; body/prefill.rs:1175-1265). The card runs the
-route while the host issues it (an eager stream, prefill.rs:877-882), so the issue sits inside the
-route window unless the launch queue is full; the batch's prologue ends in a synchronous H2D
-(prefill.rs:1041-1043) and is serial. The G scheduler (layer-first over G
+so the wall is a sum (cardroute-design-report.md:142-153; body/prefill.rs Body::enqueue_group_chain). The
+card runs the route while the host issues it (an eager stream, body/prefill.rs Body::enqueue_group), so the
+issue sits inside the route window unless the launch queue is full; the batch's prologue ends in a
+synchronous H2D (body/prefill.rs Body::plan_group) and is serial. The G scheduler (layer-first over G
 batches, hoststream-design-report.md:37-49) issues batch b+1's route before batch b's union, which is
 a max once the host is not blocked in the queue. Host streaming adds a PCIe pipe and a ring, and its
 k per layer is the resource-balance choice (hoststream-design-report.md:92).
 
 Configuration knobs beyond the recorded commits: `b1` (the projections per 128-token sub-block,
-chain/attn/batch.rs:778-800), `tile` (cardtile: the grouped shadow per (card expert, 8-column tile) item),
+chain/attn/batch.rs sub_pre, sub_post), `tile` (cardtile: the grouped shadow per (card expert, 8-column tile) item),
 `imma` (the IMMA grouped GEMM in its place), `G` with `wrap` (the layer-first scheduler that issues
 route(i + 1) before union(i), across the layer boundary too, cardnext-design-report.md 1.1), `timed`
-(the card-timing marks a BLOOMERY_STEP_STATS=1 run records, as queue events) and `_clk` (the card's
+(the card-timing marks a BLOOMERY_STEP_STATS=1 run records, as queue events; `marks4`, prefillgroup's four a
+layer-batch, the shadow's start among them) and `_clk` (the card's
 SM-bound kernels at an SM clock ratio: the prose prompt ran its route clk_cardbound slower in the expert arm,
 clk_tile_prose in the tile arm). T's items cost their SASS issue (tile_inst_fix + tile_inst_col x m an item, scaled to
 t_tile_ab at cardnext's lcg mix) plus GT's activation re-reads from DRAM once its row-tile sweep outgrows L2 (prose).
@@ -44,7 +45,9 @@ experts through T's grouped kernels, the bit rule (b'); gemm: the IMMA rate), `f
 layer's fill starts with the layer; free: whenever a slot is). The PCIe rate and the fill's DRAM
 crossings are constants (pcie_pinned, fill_crossings; --stream prints the pageable and direct variants).
 
-Every value is a row of constants.tsv or a count transcribed from the code (path:line).
+Every value is a row of constants.tsv or a count transcribed from the code (path and symbol); a prompt
+call's geometry — its batches, chunks, needs, sub-blocks, groups and the layer table — is the engine's own
+plan of it (plans/, `generate_ds41 --plan` records).
 
     --backtest         the recorded sittings, predicted against measured, rc != 0 on a red row that names
                        no model term (BLAME, TERMS); a named red row prints RED and its term
@@ -55,6 +58,8 @@ Every value is a row of constants.tsv or a count transcribed from the code (path
     --cells            B1, B1+T, B1+G, B1+T+G per cell with bands, and the IMMA shadow over T at G 1 and G 2
     --stream           host streaming after B1 + T: the per-expert rules, pp by G and ring, the card bytes,
                        the timeline per layer of a group, the DRAM term and its variants
+    --counts LOG       a generate_ds41 run's queue-entry counter (BLOOMERY_STEP_STATS=1: `stat prefill front`,
+                       `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch
 
 Python 3 standard library only; the t table is tools/gpu-ab.py's.
 """
@@ -68,6 +73,9 @@ from bisect import bisect_right
 from functools import lru_cache
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "bloomery"))
+import records  # noqa: E402 - the engine's record lines, read by kind and field
+
 CONSTANTS = os.path.join(HERE, "constants.tsv")
 PROSE_COUNTS = os.path.join(HERE, "prose-counts.tsv")
 GPU_AB = os.path.join(HERE, "..", "gpu-ab.py")
@@ -148,47 +156,61 @@ def central(log=None):
 
 # ============================================================================ geometry
 
-L = 40              # every layer routed (docs/plan-ledger.md:701)
-CHUNK = 8           # crates/gpu-deepseek41/src/body/prefill.rs:72 (CHUNK = HC_MAX_TOKENS)
-T_MAX = 512         # body/prefill.rs:69 (T_MAX = UNION_MAX_COLS)
-RING = 128          # the window ring's rows, body.rs:2165-2167; body/ced.rs:364-386 pins the triangle with 128
-TOP_K = 512         # attention.indexer.top_k (crates/model/src/arch/deepseek41/hparams.rs:185-187)
+# The engine's own plans of the prompt calls this model evaluates, as records (tools/bloomery/records.py):
+# `generate_ds41 --plan --depth P --place a` under BLOOMERY_CED=on and off, for P 128, 256, 384, 512 and 4096, in
+# plans/ (`just records-refresh` writes them). Each carries the call's batches and their chunks, the
+# triangle's needs, each layer-batch's starts and sub-blocks, the groups under every group lever, each
+# layer's facts and the sizes it cuts by — body/prefill.rs BodyLevers::call_plan, the functions the call's
+# enqueue runs by. Nothing below re-derives them; chunk_cuts and sub_blocks cut hypothetical blocks, and
+# the self-test holds them to every plan.
+PLANS = os.path.join(HERE, "plans")
+
+
+@lru_cache(maxsize=None)
+def call_records(P, ced_on):
+    """The records of the engine's plan of a prompt of P ids from position 0, CED on or off."""
+    path = os.path.join(PLANS, f"ds41-p{P}-ced-{'on' if ced_on else 'off'}.rec")
+    if not os.path.exists(path):
+        raise SystemExit(f"ds41_prefill.py: no engine plan of a prompt of {P} ids, CED {'on' if ced_on else 'off'} "
+                         f"({path}): just records-refresh writes the prompts it lists; a new P goes there first")
+    return tuple(records.read(path))
+
+
+_PLAN = call_records(512, True)
+_HEAD = records.first(_PLAN, "call_plan")
+L = _HEAD["layers"]             # every layer routed
+CHUNK = _HEAD["chunk"]          # body/prefill.rs CHUNK (= HC_MAX_TOKENS)
+T_MAX = _HEAD["t_max"]          # body/prefill.rs T_MAX (= UNION_MAX_COLS)
+RING = _HEAD["ring"]            # the window ring's rows at the plan's ctx_max
+SUB_CHUNKS = _HEAD["sub_chunks"]  # chain/attn/batch.rs SUB_TOKENS / CHUNK: B1's projections run per sub-block of <= this
+TOP_K = 512         # attention.indexer.top_k (model::arch::deepseek41::hparams Hparams::read)
 N_EMBD = 5120
 X_BYTES = N_EMBD * 4  # one column of x or of the host sums, f32
-N_USED = 6          # crates/gpu-deepseek41/src/router.rs:63
-N_EXPERT = 384      # router.rs:60
-# The served layer table, hparams.rs:1265-1283: ratio 0 on 0-1, 2 on 2-19, 1 on 20-39; compressors
-# and index keys on 2, 8, 14 (gated) and 20; indexer queries on 2, 8, 14, 20, 24, 28, 32, 36.
-# Engram tables on blk.1 and blk.14 (docs/facts.md:11).
-SRC_GATED = frozenset({2, 8, 14})
-SRC_PLAIN = frozenset({20})
+N_USED = 6          # gpu-deepseek41 router.rs N_USED
+N_EXPERT = 384      # router.rs N_EXPERT
+# The served layer table, from the plan's `call layer` records: ratio 0 on 0-1, 2 on 2-19, 1 on 20-39;
+# compressors and index keys on 2, 8, 14 (gated) and 20; indexer queries on 2, 8, 14, 20, 24, 28, 32, 36;
+# engram tables on blk.1 and blk.14.
+_LAYERS = records.of_kind(_PLAN, "call_layer")
+SRC_GATED = frozenset(x["l"] for x in _LAYERS if x["compressor"] and x["gated"])
+SRC_PLAIN = frozenset(x["l"] for x in _LAYERS if x["compressor"] and not x["gated"])
 SOURCES = SRC_GATED | SRC_PLAIN
-IDX_ONLY = frozenset({24, 28, 32, 36})
+IDX_ONLY = frozenset(x["l"] for x in _LAYERS if x["indexer"]) - SOURCES
 INDEXERS = SOURCES | IDX_ONLY
-ENGRAM = frozenset({1, 14})
-EVERY = SOURCES     # body/ced.rs:302-316: every = compressor || index_keys
+ENGRAM = frozenset(x["l"] for x in _LAYERS if x["engram"])
+_RATIO = {x["l"]: x["ratio"] for x in _LAYERS}
 # The two layers whose routed down is Q5_K (docs/facts.md:13; docs/plan-ledger.md:206 '0·1층 down'): their
 # experts are expert_gu_bytes + expert_down_q5_bytes, the ring's largest slot.
 Q5_LAYERS = frozenset({0, 1})
 
 
 def ratio(l):
-    return 0 if l < 2 else (2 if l < 20 else 1)
-
-
-def batches(P):
-    """body/prefill.rs:137-146: ceil(P / T_MAX) batches, the first P mod k of them one longer."""
-    k = -(-P // T_MAX)
-    out, p = [], 0
-    for j in range(k):
-        n = P // k + (1 if j < P % k else 0)
-        out.append((p, p + n))
-        p += n
-    return out
+    return _RATIO[l]
 
 
 def chunk_cuts(b, u):
-    """body/prefill.rs:466-476: chunks cut at every multiple of CHUNK."""
+    """body/prefill.rs chunks: cut at every multiple of CHUNK. For a hypothetical block; a call's chunks are
+    its plan's."""
     out, p, end = [], b, b + u
     while p < end:
         nxt = min((p // CHUNK + 1) * CHUNK, end)
@@ -197,12 +219,10 @@ def chunk_cuts(b, u):
     return out
 
 
-SUB_CHUNKS = 16     # chain/attn/batch.rs:51 (SUB_CHUNKS): B1's projections run per sub-block of <= 16 chunks
-
-
 def sub_blocks(chunks):
-    """chain/attn/batch.rs:78-111 (SubBlocks): a short chunk alone, each run of whole chunks as runs of
-    16, then 8, 4, 2 and 1 chunks. `chunks` is [(position, m)]; returns lists of them."""
+    """chain/attn/batch.rs SubBlocks: a short chunk alone, each run of whole chunks as runs of SUB_CHUNKS, then
+    8, 4, 2 and 1 chunks. `chunks` is [(position, m)]; returns lists of them. For a hypothetical block; a
+    call's sub-blocks are its plan's."""
     out, k, n = [], 0, len(chunks)
     while k < n:
         if chunks[k][1] == CHUNK:
@@ -217,53 +237,59 @@ def sub_blocks(chunks):
     return out
 
 
-def ced_need(first, end, starts, on):
-    """body/ced.rs:256-296: (part, full) per layer, walked from the last layer down."""
-    if not on:
-        return [(first, first)] * L
-
-    def floor(x):
-        x = max(x, first)
-        batch = max((s for s in starts if s <= x), default=first)
-        return max(x - x % CHUNK, batch, first)
-
-    out = [None] * L
-    read_from = end - 1
-    for i in reversed(range(L)):
-        full = floor(read_from)
-        part = first if i in EVERY else floor(min(max(full + 1 - RING, 0), max(end - RING, 0)))
-        out[i] = (part, full)
-        read_from = part
+def split_by(chunks, sizes):
+    """`chunks` cut into consecutive runs of `sizes` chunks (a plan's sub-blocks)."""
+    out, k = [], 0
+    for n in sizes:
+        out.append(chunks[k:k + n])
+        k += n
+    if k != len(chunks):
+        raise SystemExit(f"ds41_prefill.py: sub-blocks of {sum(sizes)} chunks over a run of {len(chunks)}")
     return out
 
 
 class LB:
-    """One layer of one batch: its chunks by mode (body/prefill.rs:891-1041)."""
-    __slots__ = ("b", "l", "full", "part", "engram", "T", "u", "first_layer")
+    """One layer of one batch: its chunks by mode (body/prefill.rs lb_starts) and the sub-blocks the
+    projections run over each (the plan's `call lb` record)."""
+    __slots__ = ("b", "l", "full", "part", "engram", "T", "u", "first_layer", "chunks", "part_sb", "full_sb")
 
-    def __init__(self, b, l, full, part, engram, u, first_layer):
-        self.b, self.l, self.full, self.part, self.engram = b, l, full, part, engram
+    def __init__(self, b, l, cuts, run, full, sbs, u, first_layer):
+        part, full = cuts[run:full], cuts[full:]
+        self.b, self.l, self.full, self.part = b, l, full, part
+        self.engram = sorted(part + full) if l in ENGRAM else []
         self.T = sum(m for _, m in full)
-        self.u, self.first_layer = u, first_layer
+        self.u, self.first_layer, self.chunks = u, first_layer, len(cuts)
+        self.part_sb, self.full_sb = split_by(part, sbs[0]), split_by(full, sbs[1])
 
 
 @lru_cache(maxsize=None)
 def prompt_plan(P, ced_on):
-    """((start, u, (LB per layer)) per batch) for a prompt of P ids from position 0."""
-    runs = batches(P)
-    need = ced_need(0, P, [s for s, _ in runs], ced_on)
+    """((start, u, (LB per layer)) per batch) for a prompt of P ids from position 0: its plan's batches and
+    layer-batches (call_records)."""
+    recs = call_records(P, ced_on)
+    lbs = {(x["b"], x["layer"]): x for x in records.of_kind(recs, "call_lb")}
     plan = []
-    for j, (s, e) in enumerate(runs):
-        cuts = chunk_cuts(s, e - s)
-        lbs = []
-        for l in range(L):
-            part_from, full_from = need[l]
-            full = [(a, z - a) for a, z in cuts if a >= full_from]
-            part = [(a, z - a) for a, z in cuts if part_from <= a < full_from]
-            engram = sorted(part + full) if l in ENGRAM else []
-            lbs.append(LB(j, l, full, part, engram, e - s, l == 0))
-        plan.append((s, e - s, tuple(lbs)))
+    for x in sorted(records.of_kind(recs, "call_batch"), key=lambda x: x["b"]):
+        j, s, e = x["b"], x["first"], x["end"]
+        cuts = [(a, z - a) for a, z in zip(x["cuts"], x["cuts"][1:])]
+        plan.append((s, e - s, tuple(
+            LB(j, l, cuts, lbs[(j, l)]["run"], lbs[(j, l)]["full"], (lbs[(j, l)]["part_sb"], lbs[(j, l)]["full_sb"]),
+               e - s, l == 0) for l in range(L))))
     return tuple(plan)
+
+
+def plan_groups(P, ced_on, G):
+    """The groups of the plan's batches under a group lever of G: (first batch, its batches' entries)."""
+    sizes = next(x["sizes"] for x in records.of_kind(call_records(P, ced_on), "call_groups") if x["g"] == G)
+    plan, out, k = prompt_plan(P, ced_on), [], 0
+    for n in sizes:
+        out.append((k, plan[k:k + n]))
+        k += n
+    return out
+
+
+def batch_count(P, ced_on):
+    return records.first(call_records(P, ced_on), "call_plan")["batches"]
 
 
 def block_positions(P, ced_on):
@@ -282,26 +308,27 @@ def served_lbs(P, ced_on):
 # N_r/N_s/ev columns (a normal layer 1,350 / 517 / 257).
 
 def attn_kernels(l):
-    """Kernels of one staged attention chunk (chain/attn.rs:1430-1685): hc_pre, norm_quant, joint qkv
+    """Kernels of one staged attention chunk (chain/attn.rs AttnChain::enqueue_layer_of): hc_pre, norm_quant, joint qkv
     gemv + 2 transposes, q_a norm, q_b gemv + transpose, rope tail, kv append, seg, merge, commit,
     rope back, quantize, wo_a, quantize, wo_b + transpose, hc_post = 20; the indexer adds 2 and a
     source's compressor and index key 8 (7 ungated) (docs/research/cardroute-design-report.md:66-77)."""
     return 30 if l in SRC_GATED else 29 if l in SRC_PLAIN else 22 if l in IDX_ONLY else 20
 
 
-FORK_EVENTS = 4                # gpu/src/graph.rs:251-253, :283-286: record + wait, twice (chain/attn.rs:1493, :1671)
-ROUTE_NQ = 1                   # chain/ffn/batch.rs:1350-1368: the route's norm_quant, per chunk
-TAIL_BULK_ACTS = 6             # batch.rs:1370-1399 scores + pick + places; batch.rs:1105-1122 three D2H
-TAIL_EVENTS = 1                # batch.rs:1105-1122: the event the host waits on
+FORK_EVENTS = 4                # gpu/src/graph.rs Branch::fork, Forked::join: record + wait, twice (chain/attn.rs)
+ROUTE_NQ = 1                   # chain/ffn/batch.rs FfnPiece::enqueue_batch_route: the route's norm_quant, per chunk
+TAIL_BULK_ACTS = 6             # enqueue_batch_route: scores + pick + places; FfnBatch::enqueue_download: three D2H
+TAIL_EVENTS = 1                # FfnBatch::enqueue_download: the event the host waits on
 TAIL_PREBULK_ACTS = 3          # three D2H; router and places ran per chunk (d37136c batch.rs:815-866)
-POST_ACTS = 2                  # batch.rs:1155-1164 upload, batch.rs:1769-1838 join
+POST_ACTS = 2                  # FfnBatch::enqueue_upload, FfnPiece::enqueue_batch_join
 HEAD_ACTS = 7                  # the trace: 7 activities after the last join
-SHADOW_EXPERT_CHUNK = 8        # batch.rs:1593-1766: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
-SHADOW_EXPERT_BLOCK = 5        # batch.rs:1449-1593: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
-SHADOW_TILE_BLOCK = 7          # cardtile, batch.rs:1986-2080: buckets, grouped_tiles, gather, GT, quantize_ord, DT,
+SHADOW_EXPERT_CHUNK = 8        # enqueue_batch_shadow_chunk: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
+SHADOW_EXPERT_BLOCK = 5        # the expert arm's block: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
+SHADOW_TILE_BLOCK = 7          # cardtile, enqueue_tiled_experts: buckets, grouped_tiles, gather, GT, quantize_ord, DT,
                                # card_acc (entries_shadow 478.9 against the expert arm's 477.0 at P 512, 38 card lbs)
 # T's GT (gate-up) kernel over one (card expert, 8-column tile) item: 2304 / 8 row tiles, blocks in rho-major order
-# (b = g + tile_cap x rho, batch.rs:540-541), so each row tile's sweep reads every item's activation columns again
+# (b = g + tile_cap x rho, chain/ffn/batch.rs ds41_expert_gate_up_tiles), so each row tile's sweep reads every item's
+# activation columns again
 GT_ROW_TILES = 2304 // 8
 ACT_GT_BYTES = 5120 // 128 * 132     # one q8_1 column at 128 values a block, 5,280 B (cardnext-design-report.md:139)
 GT_ROW_W_BYTES = 8 * 2 * 5120 // 256 * 110   # a GT row tile's gate + up weights (8 rows, Q3_K 110 B a 256 block)
@@ -311,13 +338,13 @@ SHADOW_SLOT_CHUNK = 10         # cardroute-design-report.md:73 (per slot: gu, qu
 
 
 def part_acts(l):
-    """chain/attn.rs:1336-1424, a latent-only chunk: norm, qkv gemv, transpose, kv append, and a
+    """chain/attn.rs AttnChain::enqueue_layer_of, a latent-only chunk: norm, qkv gemv, transpose, kv append, and a
     source layer's compressor and index key."""
     return 4 + (8 if l in SRC_GATED else 7 if l in SRC_PLAIN else 0)
 
 
 def engram_acts(m):
-    """chain/glue/batch.rs:190-297: an engram_rows launch per token, quantize, wkv gemv, transpose,
+    """chain/glue/batch.rs Glue::enqueue_batch_engram: an engram_rows launch per token, quantize, wkv gemv, transpose,
     key norm, gate, fold."""
     return m + 6
 
@@ -327,39 +354,42 @@ def full_acts(l):
 
 
 def src_sub_acts(l):
-    """A source layer's projection launches in a B1 sub-block (chain/attn/batch.rs:871-909): the gated
+    """A source layer's projection launches in a B1 sub-block (chain/attn/batch.rs sub_pre): the gated
     compressors' joint projection and its two token-major copies (3), the ungated one's kv projection
     and its copy (2). The rest of the source stays in the chunk loop (src_chunk_acts)."""
     return 3 if l in SRC_GATED else 2 if l in SRC_PLAIN else 0
 
 
 def src_chunk_acts(l):
-    """A source layer's chunk launches (chain/attn/batch.rs:1015-1034, attn.rs:2436-2499): the pool (or
+    """A source layer's chunk launches (chain/attn/batch.rs chunk_rows, chain/attn.rs enqueue_source): the pool (or
     the ratio-1 rows), then the index key's quantize, gemv, token-major copy and key (1 + 4)."""
     return 5 if l in SOURCES else 0
 
 
 def b1_chunk_acts(l):
-    """B1 (chain/attn/batch.rs:979-1213): only the ring-ordered launches stay in the attention chunk loop
+    """B1 (chain/attn/batch.rs chunk_rows): only the ring-ordered launches stay in the attention chunk loop
     (kv append, seg, merge, commit, the source's and the indexer's); the route's per-chunk norm_quant is
-    the FFN's (batch.rs:1350-1368) and stays."""
+    the FFN's (FfnPiece::enqueue_batch_route) and stays."""
     return 4 + ROUTE_NQ + src_chunk_acts(l) + (2 if l in INDEXERS else 0)
 
 
-B1_SB_ACTS = 14                # chain/attn/batch.rs:833-954, :1219-1262: a block sub-block's sub_pre (8) + sub_post (6)
+B1_SB_ACTS = 14                # chain/attn/batch.rs sub_pre, sub_post: a block sub-block's sub_pre (8) + sub_post (6)
 B1_SB_SMALL = 10               # of them the small ones (norms, quantizes, token-major copies, ropes)
-B1_PART_SB_ACTS = 3            # attn/batch.rs:778-787: a latent-only sub-block's norm_quant, qkv, latent copy
-B1_FORK_ACTS = 2               # attn/batch.rs:753-822: HC_PRE on the fork, HC_POST after the join
-TIMED_SB_EVENTS = 4            # attn/batch.rs:789-799: with card timing, a mark pair around sub_pre and sub_post
-TIMED_PART_SB_EVENTS = 2       # attn/batch.rs:779-781: around a latent-only sub_pre
-TIMED_ROUTE_EVENTS = 2         # body/prefill.rs:1110, :1211/:1228: the layer's start and the route's end
-TIMED_SHADOW_EVENTS = 1        # body/prefill.rs:1246: the shadow's end
+B1_PART_SB_ACTS = 3            # chain/attn/batch.rs sub_pre (no block): a latent-only sub-block's norm_quant, qkv, latent copy
+B1_FORK_ACTS = 2               # chain/attn/batch.rs AttnChain::enqueue_batch_layer: HC_PRE on the fork, HC_POST after the join
+TIMED_SB_EVENTS = 4            # chain/attn/batch.rs enqueue_batch_layer: with card timing, a mark pair around sub_pre and sub_post
+TIMED_PART_SB_EVENTS = 2       # chain/attn/batch.rs enqueue_batch_layer: around a latent-only sub_pre
+TIMED_ROUTE_EVENTS = 2         # body/prefill.rs GroupCx::route (CARD_MARKS): the layer's start and the route's end
+TIMED_SHADOW_EVENTS = 1        # before prefillgroup (three CARD_MARKS a layer-batch): the shadow's end
+TIMED_SHADOW_EVENTS_G = 2      # body/prefill.rs GroupCx::shadow (four CARD_MARKS since prefillgroup, `marks4`): the
+                               # shadow's start and end
 
 
-def batch_acts(s, u):
-    """body/prefill.rs:1088-1101 (queue::GATHER, queue::embed): per batch before layer 0, a words gather a
-    chunk and an embedding broadcast a token."""
-    return len(chunk_cuts(s, u)) + u
+def batch_acts(chunks, u):
+    """body/prefill.rs enqueue_group_chain, a batch's first steps (Tally::front): per batch before layer 0, a
+    words gather a chunk (AttnChain::enqueue_step_of) and an embedding broadcast a token
+    (Glue::enqueue_batch_embed)."""
+    return chunks + u
 
 
 # ============================================================================ routing
@@ -563,7 +593,7 @@ def cause_terms(p, flow, K, slots, touched, T, f, a, c):
     chunks). Each row dispatch ends in a join tail, f of the last participant's steal block, and a
     block is lane / steal_blocks, so the tails are f x K / steal_blocks. Serial on the calling
     thread: the set_cols zero fill per chunk, the non-finite scan of x, the chunk preparation.
-    five (9626c7f, moe.rs:1347-1490): quantize x, gate/up, combine, down, sum (two for a call of <= 8
+    five (9626c7f, model/src/moe.rs serve_union): quantize x, gate/up, combine, down, sum (two for a call of <= 8
     columns); the row dispatches' blocks are capped at union_block_rows rows, so the two tails are f
     of a 144-row block each; the combine re-reads the gate/up slab; the scan is a pool pass."""
     wide = T > 8
@@ -762,9 +792,9 @@ def proj_sb(p, l, sb):
             + launch_us(p, "wo_a", 8192, m, g, True) + launch_us(p, "wo_b", 5120, m, g, True))
 
 
-def proj_b1(p, l, chunks):
-    """B1 (2f45a79): the projections per sub-block of the block's chunks (chain/attn/batch.rs:788-800)."""
-    return sum(proj_sb(p, l, sb) for sb in sub_blocks(chunks))
+def proj_b1(p, l, sbs):
+    """B1 (2f45a79): the projections per sub-block of the block's chunks (chain/attn/batch.rs sub_pre, sub_post)."""
+    return sum(proj_sb(p, l, sb) for sb in sbs)
 
 
 def full_chunks(T):
@@ -828,8 +858,8 @@ def special_chunk(p, l, pos, m):
 
 def route_lb(p, cfg, lb):
     """Card time (ms), activities, events and terms of a layer-batch's route: everything the host
-    issues before it waits for the route's D2H (body/prefill.rs:1106-1230). With B1 the projections
-    and their small launches run per sub-block (chain/attn/batch.rs:778-800), the latent-only part's
+    issues before it waits for the route's D2H (body/prefill.rs Body::enqueue_group_chain). With B1 the projections
+    and their small launches run per sub-block (chain/attn/batch.rs sub_pre, sub_post), the latent-only part's
     too; `timed` adds the card-timing marks (events) a BLOOMERY_STEP_STATS=1 run records; `_clk`
     stretches the card's kernels (not the D2H) by an SM clock ratio."""
     b1, b4 = cfg.get("b1") or cfg.get("b4"), cfg.get("b4")
@@ -845,7 +875,7 @@ def route_lb(p, cfg, lb):
     terms["engram"] = eg
     pt = pp_ = 0.0
     if b1 and lb.part:
-        for sb in sub_blocks(lb.part):
+        for sb in lb.part_sb:
             a = B1_PART_SB_ACTS + src_sub_acts(l)
             gs, ms = (len(sb), 8) if sb[0][1] == CHUNK else (1, sb[0][1])
             pp_ += (launch_us(p, "qkv", 1792, ms, gs, True) + 2 * sk) / 1000.0 + a * g
@@ -882,11 +912,11 @@ def route_lb(p, cfg, lb):
         gaps += a * g
     if b1 and nfull:
         T = lb.T
-        sbs = sub_blocks(lb.full)
+        sbs = lb.full_sb
         if b4:
             proj = 2.0 * proj_macs(l) * T / (p["gemm_tops_proj"] * 1e12) * 1e3
         else:
-            proj = proj_b1(p, l, lb.full) / 1000.0
+            proj = proj_b1(p, l, lb.full_sb) / 1000.0
         # HC_PRE stays on the fork branch beside the sub-blocks' launches (hidden, as in the loop)
         small = max((B1_SB_SMALL * len(sbs) + B1_FORK_ACTS) * sk / 1000.0,
                     p["small_bytes_tok"] * T / (p["bw_card"] * 1e9) * 1e3)
@@ -915,7 +945,7 @@ def route_lb(p, cfg, lb):
 
 
 def shadow_lb(p, cfg, lb, rt):
-    """Card time (ms), activities and events of a layer-batch's shadow (batch.rs:1402-1766), under the
+    """Card time (ms), activities and events of a layer-batch's shadow (FfnPiece::enqueue_batch_shadow), under the
     union. Expert arm: the per-chunk kernels as traced and the grouped gate-up and down per card slot;
     slot arm: the same per-chunk kernels and each slot's expert bytes (derived, not traced). `tile` (T,
     cardtile) prices the grouped pair as card_tile_us (the items' m mix and GT's L2 spill); `imma` prices
@@ -957,7 +987,8 @@ def shadow_lb(p, cfg, lb, rt):
         else:
             t += SHADOW_NOCARD_BLOCK * g
             acts += SHADOW_NOCARD_BLOCK
-    return t, acts, (TIMED_SHADOW_EVENTS if cfg.get("timed") else 0)
+    ev = TIMED_SHADOW_EVENTS_G if cfg.get("marks4") else TIMED_SHADOW_EVENTS
+    return t, acts, (ev if cfg.get("timed") else 0)
 
 
 @lru_cache(maxsize=None)
@@ -1044,7 +1075,7 @@ def shadow_tile_us(p):
 
 
 def post_card(p, lb):
-    """The upload of the host sums and the join (batch.rs:1155-1164, :1769-1838), card ms."""
+    """The upload of the host sums and the join (FfnBatch::enqueue_upload, FfnPiece::enqueue_batch_join), card ms."""
     return lb.T * X_BYTES / (p["post_h2d_gbs"] * 1e6) + (lb.T * p["post_batch_tok"]) / 1000.0 \
         + POST_ACTS * p["gap_act"] / 1000.0
 
@@ -1450,7 +1481,7 @@ def resolve_cfg(cfg, P):
     """The per-prompt choices of a configuration: G (G = 'auto' is every batch, at most 8) and the ring
     (128 borrowed from P >= borrow_min_p, else the unborrowed 8; docs/plan-triage.md:43)."""
     c = dict(cfg)
-    nb = len(batches(P))
+    nb = batch_count(P, cfg.get("ced", True))
     g = c.get("G", 1)
     c["G"] = min(8, nb) if g == "auto" else g
     if c.get("stream"):
@@ -1609,12 +1640,11 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
     batch_enq = batch_n = 0.0
     busy = dict(host=0.0, card=0.0, pcie=0.0, dram=0.0)
     t_i = p["t_issue"] / 1000.0
-    for gi in range(0, len(plan), G):
-        grp = plan[gi:gi + G]
+    for gi, grp in plan_groups(P, cfg.get("ced", True), G):
         for _, u, _ in grp:                  # a batch's prologue ends in a synchronous H2D
             st.t = max(st.t, st.card.free) + u * p["prologue_tok"] / 1000.0
-        for s0, u, _ in grp:                 # then its gathers and embeddings, before layer 0
-            a = batch_acts(s0, u)
+        for _, u, lbs0 in grp:               # then its gathers and embeddings, before layer 0
+            a = batch_acts(lbs0[0].chunks, u)
             e, _ = issue(p, st, [(a, 0, a * (p["small_k"] + p["gap_act"]) / 1000.0)], Q)
             batch_enq += e
             batch_n += a
@@ -1654,7 +1684,7 @@ def run_prompt(p, cfg, P, rt, U, kfix=None):
     served = [r for r in recs if r["lb"].T]
     n = max(1, len(served))
     # the stat line's per-layer-batch values are sums over every layer of every batch over the served
-    # ones (body/prefill.rs:414-456, :985-990): a layer with no block still issues and runs its route
+    # ones (body/prefill.rs PrefillStats, Body::account_group): a layer with no block still issues and runs its route
     agg = {k2: sum(r[k2] for r in (recs if k2 in OVER_ALL else served)) / n for k2 in AGG}
     agg["enqueue"] += batch_enq / n
     agg["card_proj"] = sum(r["terms"]["proj"] + r["terms"]["small"] + r["terms"]["part_proj"] for r in recs) / n
@@ -1698,12 +1728,14 @@ CONFIGS = {
     # the cardtile lease (09-26#cardtile-ab): main efc202f (B1, udfix, cardtile), hot list 384, the prose prompt,
     # BLOOMERY_CARD_EXPERTS=tile (the default) against =expert, one binary; the prefillgroup lease
     # (09-26#prefillgroup-ab): main e690f54 (+ prefillgroup), lcg without the hot list, BLOOMERY_PREFILL_GROUP=2
-    # (the wrap) against =1, one binary
+    # (the wrap) against =1, one binary; marks4 = prefillgroup's four card-timing marks a layer-batch (the shadow's
+    # start as well as its end; three before it)
     "CT": dict(commit="efc202f", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True),
     "CTexp": dict(commit="efc202f", route="bulk", copy=False, flow="five", b1=True, timed=True),
-    "PG1": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True),
+    "PG1": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True,
+                marks4=True),
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
-                wrap=True),
+                wrap=True, marks4=True),
 }
 DEFAULT_ANCHORS = dict(union="anchor_union_s13b", union_ud="anchor_union_ud512", resid_mode="slot")
 
@@ -2930,6 +2962,60 @@ def uncalibrated():
             print(f"  {k:18} {c.value:g} [{c.lo:g}, {c.hi:g}] {c.unit}: {c.conditions}")
 
 
+# ============================================================================ the engine's counter
+
+def counts(P, cname="PG2", ced=True):
+    """The queue entries this model issues for a prompt call of P under config `cname`, keyed as the engine's counter
+    prints them (generate_ds41 under BLOOMERY_STEP_STATS=1): ({batch: its first steps' entries}, {(batch, layer):
+    (route entries, shadow entries)}), the route's with the upload and join of a layer-batch that has a block."""
+    cfg = dict(CONFIGS[cname], ced=ced)
+    recs = evaluate(central(), cfg, P)["recs"]
+    lbs = {(x["lb"].b, x["lb"].l): (x["acts_r"] + x["ev_r"] + (POST_ACTS if x["lb"].T else 0), x["acts_s"] + x["ev_s"])
+           for x in recs}
+    front = {j: batch_acts(lbs0[0].chunks, u) for j, (_, u, lbs0) in enumerate(prompt_plan(P, ced))}
+    return front, lbs
+
+
+def check_counts(path):
+    """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
+    printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
+    CED, G: PG1 or PG2), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
+    cannot be compared."""
+    recs = records.read(path)
+    cp = records.first(recs, "call_plan")
+    front = {r["b"]: r["entries"] for r in records.of_kind(recs, "stat_prefill_front")}
+    got = {(r["b"], r["layer"]): (r["entries_route"], r["entries_shadow"])
+           for r in records.of_kind(recs, "stat_prefill_lb")}
+    if cp is None or not got:
+        print(f"{path}: no `call plan` or no `stat prefill lb` record (a batched run under BLOOMERY_STEP_STATS=1 "
+              f"prints both)")
+        return 64
+    P, ced, G = cp["end"] - cp["first"], cp["ced"] == "on", cp["group"]
+    if cp["first"] != 0 or G not in (1, 2):
+        print(f"{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from position 0 "
+              f"under G 1 (PG1) or 2 (PG2)")
+        return 64
+    cname = "PG2" if G == 2 else "PG1"
+    want_front, want = counts(P, cname, ced)
+    df = {b: front.get(b, 0) - want_front.get(b, 0) for b in sorted(set(front) | set(want_front))}
+    rows = [(k, got.get(k, (0, 0)), want.get(k, (0, 0))) for k in sorted(set(got) | set(want))]
+    bad = [(k, g, w) for k, g, w in rows if g != w]
+    print(f"{path}: P {P}, CED {'on' if ced else 'off'}, {cname}: {len(want_front)} batches and {len(want)} layer-batches "
+          f"in the model, {len(front)} and {len(got)} in the log")
+    print(f"  first steps, counted - model, by batch: {df}")
+    for side, i in (("route", 0), ("shadow", 1)):
+        d = {}
+        for _, g, w in rows:
+            d[g[i] - w[i]] = d.get(g[i] - w[i], 0) + 1
+        print(f"  {side}: counted - model on each layer-batch, by value: {dict(sorted(d.items()))}")
+    for (b, l), g, w in bad:
+        print(f"  batch {b} layer {l:2d}: route {g[0]} against {w[0]} ({g[0] - w[0]:+d}), "
+              f"shadow {g[1]} against {w[1]} ({g[1] - w[1]:+d})")
+    ok = not bad and not any(df.values())
+    print(f"counts: {'equal' if ok else 'DIFFER'}")
+    return 0 if ok else 1
+
+
 # ============================================================================ self-test
 
 ZERO_CARD = ("gemv_launch", "gemv_lat_iter", "proj_qkv_us", "proj_qb_us", "proj_woa_us", "proj_wob_us", "attn_seg_l2",
@@ -2954,13 +3040,25 @@ def self_test():
     check("CED at P 512: 19,232 of 20,480 block positions",
           (block_positions(512, True), block_positions(512, False)) == (19232, 20480),
           f"{block_positions(512, True)}, {block_positions(512, False)}")
-    check("CED at P 4096: 106,400 of 163,840 (body/ced.rs:386)",
+    check("CED at P 4096: 106,400 of 163,840 (body/ced.rs Ced::need)",
           (block_positions(4096, True), block_positions(4096, False)) == (106400, 163840),
           f"{block_positions(4096, True)}, {block_positions(4096, False)}")
-    need = ced_need(0, 4096, [s for s, _ in batches(4096)], True)
+    cn = records.first(call_records(4096, True), "call_need")
+    need = list(zip(cn["part_from"], cn["full_from"]))
     ok = all(need[39 - j] == (4096 - (136 + 128 * j), 4096 - (8 + 128 * j)) for j in range(19))
     ok = ok and need[20] == (0, 4096 - 2440) and all(need[l] == (0, 0) for l in range(20))
-    check("the triangle body/ced.rs:362-387 pins (layers 39 - j, 20, 0-19)", ok)
+    check("the triangle body/ced.rs v41_triangle_from_zero pins (layers 39 - j, 20, 0-19)", ok)
+    held = []
+    for P in (128, 256, 384, 512, 4096):
+        for on in (True, False):
+            for s0, u, lbs in prompt_plan(P, on):
+                cuts = chunk_cuts(s0, u)
+                held.append(all(len(lb.part) + len(lb.full) <= len(cuts) and lb.chunks == len(cuts)
+                                and [(a, z - a) for a, z in cuts][lb.chunks - len(lb.full):] == lb.full
+                                and sub_blocks(lb.part) == lb.part_sb and sub_blocks(lb.full) == lb.full_sb
+                                for lb in lbs))
+    check("chunk_cuts and sub_blocks cut every plan's batches and layer-batches as the engine does "
+          f"(P 128, 256, 384, 512, 4096, CED on and off: {len(held)} batches)", all(held))
     check("P 4096 serves 220 layer-batches (S14's 73.9 + 35.1 ms x 220 = its wall)", served_lbs(4096, True) == 220,
           str(served_lbs(4096, True)))
     check("CED slot ratio 19,232/20,480 = S13b's 90,629/96,525 (0.1 %)",
@@ -3064,13 +3162,20 @@ def self_test():
           f"{d:.3f} ms, phi {phi:.3f}")
     sb = [len(x) for x in sub_blocks([(8 * i, 8) for i in range(64)])], [len(x) for x in sub_blocks(
         [(8 * i, 8) for i in range(49)])], [len(x) for x in sub_blocks([(0, 5)] + [(5 + 8 * i, 8) for i in range(15)])]
-    check("B1's sub-blocks (chain/attn/batch.rs:78-111): 64 chunks 16x4, 49 16,16,16,1, a short first chunk alone",
+    check("B1's sub-blocks (chain/attn/batch.rs SubBlocks): 64 chunks 16x4, 49 16,16,16,1, a short first chunk alone",
           sb == ([16] * 4, [16, 16, 16, 1], [1, 8, 4, 2, 1]), str(sb))
     for P, want in ((512, 983.4), (4096, 1024.9)):
         cfg, rn = row_cfg(p, "B1", {})
         got = evaluate(p, cfg, P, rn)["agg"]["entries"]
         check(f"B1's calls at P {P} = the stat line's entries_route + entries_shadow ({want}), 0.1 %",
               abs(got - want) / want < 1e-3, f"{got:.1f}")
+    # the counter's sums over the call (`stat prefill front` and `stat prefill lb`) on the records round's tree:
+    # generate_ds41 --place gate --depth P -n 2 under BLOOMERY_STEP_STATS=1, G 2, CED on; --counts compares a log
+    # layer-batch by layer-batch
+    for P, want in ((128, (144, 5595, 5252)), (512, (576, 19680, 19196)), (4096, (4608, 116284, 105212))):
+        front, lbs = counts(P)
+        got = (sum(front.values()), sum(r for r, _ in lbs.values()), sum(s for _, s in lbs.values()))
+        check(f"PG2's calls at P {P} = the counter's first steps, route and shadow {want}", got == want, str(got))
     cfg, rn = row_cfg(p, "B1prose", {"rt": "prose"})
     got = evaluate(p, cfg, 512, rn)["agg"]["host_slots"]
     check("the prose routing reproduces its anchor: 52,189 host slots at P 512 (0.1 %)", abs(got - 52189) / 52189 < 1e-3,
@@ -3131,8 +3236,11 @@ def main():
     ap.add_argument("--uncalibrated", action="store_true")
     ap.add_argument("--cells", action="store_true", help="B1, B1+T, B1+G, B1+T+G per cell and the IMMA shadow over T")
     ap.add_argument("--stream", action="store_true", help="host streaming after B1 + T: G, ring, bytes, timeline, DRAM")
+    ap.add_argument("--counts", metavar="LOG", help="a generate_ds41 run's queue-entry counter against the model's")
     args = ap.parse_args()
     rc = 0
+    if args.counts:
+        rc |= check_counts(args.counts)
     if args.self_test:
         rc |= 1 if self_test() else 0
     if args.backtest:
@@ -3147,7 +3255,8 @@ def main():
         cells()
     if args.stream:
         stream_report()
-    if not any((args.self_test, args.backtest, args.predict, args.explain, args.uncalibrated, args.cells, args.stream)):
+    if not any((args.self_test, args.backtest, args.predict, args.explain, args.uncalibrated, args.cells, args.stream,
+                args.counts)):
         ap.print_help()
     return rc
 
