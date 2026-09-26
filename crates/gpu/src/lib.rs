@@ -134,8 +134,16 @@ pub enum GpuError {
     /// A kernel raised the card's fault word (crate::fault): an input it has
     /// no defined answer for, at `fault`'s layer and site. The step that
     /// read it back returned no token, and the state it wrote — caches,
-    /// rings — holds what the fault condemned.
-    Fault { what: &'static str, fault: Fault },
+    /// rings — holds what the fault condemned. `behind` is the call's other
+    /// error when the word was read after it failed (a later token refused,
+    /// a launch failed, a host refusal the card did not make at or before
+    /// that layer): the fault is the call's error because it poisons the
+    /// model, and that error's text rides along.
+    Fault {
+        what: &'static str,
+        fault: Fault,
+        behind: Option<Box<GpuError>>,
+    },
     /// A model refused a step because an earlier step raised `fault`; its
     /// state is condemned until a `reset`.
     Poisoned { what: &'static str, fault: Fault },
@@ -180,6 +188,16 @@ impl GpuError {
         GpuError::Protocol {
             what,
             detail: detail.into(),
+        }
+    }
+
+    /// The fault `fault` that `what` read back from the card's fault word.
+    #[must_use]
+    pub fn fault(what: &'static str, fault: Fault) -> GpuError {
+        GpuError::Fault {
+            what,
+            fault,
+            behind: None,
         }
     }
 
@@ -461,7 +479,17 @@ impl std::fmt::Display for GpuError {
             GpuError::Plan { what, source } => write!(f, "{what}: {source}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
             GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
-            GpuError::Fault { what, fault } => write!(f, "{what}: device fault at {fault}"),
+            GpuError::Fault {
+                what,
+                fault,
+                behind,
+            } => {
+                write!(f, "{what}: device fault at {fault}")?;
+                match behind {
+                    Some(e) => write!(f, "; the call also failed: {e}"),
+                    None => Ok(()),
+                }
+            }
             GpuError::Poisoned { what, fault } => write!(
                 f,
                 "{what}: the model is poisoned by an earlier device fault at {fault}; reset() \
@@ -480,6 +508,9 @@ impl std::error::Error for GpuError {
             GpuError::Load(e) => Some(&**e),
             GpuError::Model(e) => Some(&**e),
             GpuError::Plan { source, .. } => Some(&**source),
+            GpuError::Fault {
+                behind: Some(e), ..
+            } => Some(&**e),
             _ => None,
         }
     }

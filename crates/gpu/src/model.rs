@@ -875,10 +875,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// refused, it released every wait of the step, so the step drains, and
     /// the fault word read on the engine stream behind it names the refusal
     /// ([`name_refusal`]) — the card's fault when the card raised one at or
-    /// before that layer, else the host's error. The caller's
-    /// [`GpuModel::note_fault`] then turns a host error into the fault when
-    /// the word holds a later layer's, so the call still ends poisoned; the
-    /// refusal itself stays in the tier's record. A failed read names the
+    /// before that layer, else the host's error. When the word holds a later
+    /// layer's fault, the caller's [`GpuModel::note_fault`] returns that fault
+    /// with the host's error behind it, so the call ends poisoned and still
+    /// names the refusal's layer, which came first. A failed read names the
     /// refusal and the step's error beside its own. Any other result passes
     /// through.
     pub(crate) fn name_host_refusal(&mut self, r: Result<(), GpuError>) -> Result<(), GpuError> {
@@ -934,10 +934,10 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// `e`, the error of `what` after launches that may have raised the
     /// fault word, named by the word: the engine stream waited for, then the
-    /// word read. A raised word is the error whatever `e` was, so the fault
-    /// never outlives the call that raised it — the next call's readback
-    /// would name it. A clean word leaves `e`. A failed wait or read names
-    /// `e` beside its own error.
+    /// word read. A raised word is the error whatever `e` was, with `e`
+    /// behind it, so the fault never outlives the call that raised it — the
+    /// next call's readback would name it. A clean word leaves `e`. A failed
+    /// wait or read names `e` beside its own error.
     fn fault_behind(&self, what: &'static str, e: GpuError) -> GpuError {
         let Some(gpu) = self.stages.first().map(|s| &s.gpu) else {
             return e;
@@ -948,7 +948,11 @@ impl<B: ChainBody> GpuModel<B> {
             .map_err(GpuError::from)
             .and_then(|()| gpu.fault());
         match read {
-            Ok(Some(fault)) => GpuError::Fault { what, fault },
+            Ok(Some(fault)) => GpuError::Fault {
+                what,
+                fault,
+                behind: Some(Box::new(e)),
+            },
             Ok(None) => e,
             Err(s) => GpuError::shape(
                 what,

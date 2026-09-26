@@ -1203,7 +1203,7 @@ impl Body {
         // Before anything else can fail: a fault the group raised is the
         // call's error, never the next call's.
         if let Some(fault) = gpu.fault()? {
-            return Err(GpuError::Fault { what: WHAT, fault });
+            return Err(GpuError::fault(WHAT, fault));
         }
         sums.chain_ns = chain;
         let st = self.hybrid.stats();
@@ -1785,8 +1785,9 @@ impl<'a> GroupCx<'a> {
 
 /// The error of a group from position `b` that failed with `e` after its
 /// first launch: the stream waited for, then the fault word read — a fault
-/// any of the group's launches raised is the error whatever `e` was, so it
-/// poisons the model and never reaches a later call. A fault `e` that names
+/// any of the group's launches raised is the error whatever `e` was, with
+/// `e` behind it, so it poisons the model, never reaches a later call, and
+/// keeps `e`'s text (a host refusal's layer, say). A fault `e` that names
 /// the same fault stays as it is: it names the reader that met it first. A
 /// failed wait or read names `e` beside its own error, and a fault `e`
 /// stays.
@@ -1798,7 +1799,11 @@ fn fault_or(gpu: &Gpu, b: usize, e: GpuError) -> GpuError {
         .and_then(|()| gpu.fault());
     match read {
         Ok(Some(fault)) if matches!(&e, GpuError::Fault { fault: seen, .. } if *seen == fault) => e,
-        Ok(Some(fault)) => GpuError::Fault { what: WHAT, fault },
+        Ok(Some(fault)) => GpuError::Fault {
+            what: WHAT,
+            fault,
+            behind: Some(Box::new(e)),
+        },
         Ok(None) => e,
         Err(_) if matches!(e, GpuError::Fault { .. }) => e,
         Err(s) => GpuError::Shape {

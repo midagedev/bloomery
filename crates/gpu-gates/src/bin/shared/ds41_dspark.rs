@@ -227,7 +227,7 @@ impl Dspark {
     pub fn check_fault(&mut self) -> Result<(), GpuError> {
         match self.on_card(|gpu, _| gpu.fault())? {
             None => Ok(()),
-            Some(fault) => Err(GpuError::Fault { what: WHAT, fault }),
+            Some(fault) => Err(GpuError::fault(WHAT, fault)),
         }
     }
 }

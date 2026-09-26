@@ -42,10 +42,10 @@
 //!   vocabulary runs the first token's whole chain — the head's q8_1
 //!   quantizer raises `quant_column` at the output head — and then refuses
 //!   the second id's embedding row on the host, before its launch. The step
-//!   must return exactly that fault and stand one position on, poisoned by
-//!   it; with the gain put back, the next step must refuse as poisoned
-//!   rather than read the word back as a fault of its own; and after a
-//!   reset the prompt answers its clean token again.
+//!   must return exactly that fault, with that refusal behind it, and stand
+//!   one position on, poisoned by it; with the gain put back, the next step
+//!   must refuse as poisoned rather than read the word back as a fault of
+//!   its own; and after a reset the prompt answers its clean token again.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -561,13 +561,18 @@ mod gate {
             Ok(t) => format!("token {t}"),
             Err(e) => format!("error \"{e}\""),
         };
-        let named = matches!(&first, Err(GpuError::Fault { fault, .. }) if *fault == want);
+        // The fault is the step's error, and the refusal of the second id,
+        // which the fault word was read behind, rides along by name.
+        let named = matches!(&first, Err(GpuError::Fault { fault, behind: Some(b), .. })
+            if *fault == want
+                && matches!(**b, GpuError::Shape { what: "StepRows::fill", .. }));
         let refused = matches!(&next, Err(GpuError::Poisoned { fault, .. }) if *fault == want);
         let cleared = reset.is_ok() && unpoisoned && matches!(&again, Ok(t) if *t == clean);
         let pass = named && at == 1 && poisoned == Some(want) && refused && cleared;
         println!(
             "fault behind an error: NaN in {HEAD_GAIN}[0], a step of [{}, {bad}] (want the fault \
-             {want} at the first token's head, then the second id refused before its launch): \
+             {want} at the first token's head, then the second id refused before its launch, that \
+             refusal behind the fault): \
              step {} at position {at} (want 1), poisoned {}; next step with the gain put back {} \
              (want refused as poisoned); reset {}, the prompt again {} (clean token {clean}) {}",
             FAULT_PROMPT[0],

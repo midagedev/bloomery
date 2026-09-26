@@ -1173,10 +1173,7 @@ mod gate {
         let xd = DeviceBuffer::from_host(stream, &x)?;
         let y = dev.run(&st, &mut res, &xd, &ids)?;
         let fault = gpu.take_fault()?;
-        let err = fault.map(|fault| GpuError::Fault {
-            what: "gate_gemm",
-            fault,
-        });
+        let err = fault.map(|fault| GpuError::fault("gate_gemm", fault));
         let site_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
         let block_refused = refused_block(&planes(&res.act, stream)?, &zero, 3 * (k / 128));
         let reads_col3 = |s: usize| s / top_k == 3;
@@ -1209,10 +1206,9 @@ mod gate {
         let x = activations(k, n_tok, 993);
         let xd = DeviceBuffer::from_host(stream, &x)?;
         let y = dev.run(&st, &mut res, &xd, &ids)?;
-        let err = gpu.take_fault()?.map(|fault| GpuError::Fault {
-            what: "gate_gemm",
-            fault,
-        });
+        let err = gpu
+            .take_fault()?
+            .map(|fault| GpuError::fault("gate_gemm", fault));
         let site_ok = matches!(&err, Some(GpuError::Fault { fault, .. })
             if fault.site() == Some(FaultSite::ExpertId));
         let refused_nan = [5usize, 9]
@@ -1725,10 +1721,7 @@ mod gate {
         dev.gk
             .enqueue_swiglu_quant(stream, &g, &u, 8, &mut act, gpu.unlabelled_sink())?;
         let fault = gpu.take_fault()?;
-        let err = fault.map(|fault| GpuError::Fault {
-            what: "gate_gemm",
-            fault,
-        });
+        let err = fault.map(|fault| GpuError::fault("gate_gemm", fault));
         let block_refused = refused_block(&planes(&act, stream)?, &zero, 5 * (k / 128) + 2);
         let nan_ok = zero_clean
             && fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn))

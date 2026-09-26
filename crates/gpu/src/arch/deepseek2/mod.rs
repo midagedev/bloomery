@@ -628,9 +628,14 @@ impl GpuModel<Body> {
         let r = body.enqueue_hybrid_layer(gpu, w, slot);
         // A fault printed in this architecture's step order.
         self.name_host_refusal(r).map_err(|e| match e {
-            GpuError::Fault { what, fault } => GpuError::Fault {
+            GpuError::Fault {
+                what,
+                fault,
+                behind,
+            } => GpuError::Fault {
                 what,
                 fault: fault.in_arch(Body::arch()),
+                behind,
             },
             e => e,
         })?;

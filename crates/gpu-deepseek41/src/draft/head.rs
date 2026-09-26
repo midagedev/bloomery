@@ -181,10 +181,7 @@ impl DraftHead {
         self.check(m)?;
         let out = self.tok.to_host_vec(stream)?;
         if let Some(fault) = Fault::from_words(out[m], out[m + 1]) {
-            return Err(GpuError::Fault {
-                what: "draft::head::tokens",
-                fault,
-            });
+            return Err(GpuError::fault("draft::head::tokens", fault));
         }
         Ok(out[..m].to_vec())
     }

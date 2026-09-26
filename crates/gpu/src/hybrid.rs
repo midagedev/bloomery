@@ -2301,10 +2301,7 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
             if fault.layer == LAYER_NONE
                 || usize::try_from(fault.layer).is_ok_and(|l| l <= r.layer) =>
         {
-            return GpuError::Fault {
-                what: r.what,
-                fault,
-            };
+            return GpuError::fault(r.what, fault);
         }
         Some(f) => format!("first names {f} — later than this layer"),
         None => "is clean".to_owned(),

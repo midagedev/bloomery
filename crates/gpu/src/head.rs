@@ -322,10 +322,7 @@ impl Head {
             ));
         };
         if let Some(fault) = Fault::from_words(word, sites) {
-            return Err(GpuError::Fault {
-                what: "Head::tokens",
-                fault,
-            });
+            return Err(GpuError::fault("Head::tokens", fault));
         }
         Ok(out)
     }
