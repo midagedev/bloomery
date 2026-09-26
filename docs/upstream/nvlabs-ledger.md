@@ -54,4 +54,10 @@ GPU 단계에서 만나는 이슈·PR 후보를 발견 즉시 여기 적는다(�
 
 **§8 런치마다 드라이버 속성 질의와 인자 `Vec` 할당(2026-09-26, cardroute-design → 리드가 레지스트리·체크아웃 소스로 대조).** cuda-core 0.3.1 `src/simt/launch.rs:899-911`의 `__prepare`가 런치마다 `context.launch_limits()`(장치 속성 여럿, `src/simt/context.rs:555`)와 함수 속성 셋(`src/simt/module.rs:468-486`)을 묻는다 — 장치·함수마다 한 번이면 되는 값이다. cuda-macros(핀 `b9847e95`) `crates/cuda-macros/src/cuda_module/launchers.rs:269`가 런치마다 `Vec<*mut c_void>`를 새로 만든다(고정 배열 후보). V4.1 프롬프트 배치의 호스트 발행 ≈ 3.2 µs/항목[유도] 중 이 둘의 몫은 따로 재지 않았고, 카드 route가 실행 바운드라 벽시계에는 지금 작다. 우회 없음. 이슈 후보(S): 속성 캐시, 인자 배열.
 
+**§9 m-column 코어를 그리드 스트라이드 루프로 감싸면 레지스터가 두 배(2026-09-26, cardtile).** 같은 몸체가 루프 없이 56 regs, 루프만 더하면 104(GT), DT는 128 — ptxas가 uniform datapath를 잃는 것으로 읽힌다(u32 산술·lane-0 shuffle로도 110/127). 우회는 (타일, 행 타일)당 블록 하나 + `launch_bounds(256, 5)`(48/48). 재현자 후보: 루프 유무만 다른 두 커널의 ptxas `-v`. cuda-oxide 쪽인지 ptxas 쪽인지는 가르지 않았다.
+
+**§10 `launch_contract`의 `requires`가 그리드 차원을 이름으로 쓸 수 없고, `domain = 2`가 일반 `DisjointSlice`를 거부한다(2026-09-26, cardtile).** 그래서 2D 그리드 대신 1D에서 `b % tile_cap`으로 나눴다. 이슈 후보(기능 공백).
+
+**§11 호스트 코드만 바뀌어도 PTX 모듈의 `.shared` 선언 번호 순서가 바뀐다(2026-09-26, attndead).** 호스트 함수 제거만 한 트리에서 `generate_ds41` 번들이 5 B 짧아졌다 — `__shared_mem_N`을 (align, size)로 치환하면 선언 50개·본문 전부 같고 엔트리 순서도 같다. `ptx-scan` 표 행·md5는 같아 증명은 서지만, 번들 바이트 동일성(gatesel (a))은 이것으로도 깨진다. 결정성 이슈 후보(낮음).
+
 발견 규칙: 우회로를 쓰기로 했더라도 여기 먼저 한 줄 적고 우회한다. 우회가 증거를 지운다.
