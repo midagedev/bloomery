@@ -1,0 +1,11 @@
+# The V4.1 gate fixture's full generation (crates/model/src/bin/v41fixture.rs, round fxgen; the design
+# is docs/research/fixture-design-report.md): nine real-shaped layers and the DSpark draft, random
+# weights at derived scales, into /models. The round's estimate [derived]: 60,854,838,208 B of target
+# and 7,972,960,256 B of draft, gen 2.4 s + page-cache write 18-20 s + NVMe flush 16-17 s, 38-40 s
+# at 3.19 GB peak RSS; then `v41fixture verify` reads it back. Approved by the user 2026-09-26 (the
+# disk and the run).
+kind: exclusive
+reason: writes about 69 GB to /models and reads it back to verify; beside a timed run it would evict
+  that run's page cache (the real file's pages go out of the 243 GB cache) and share the NVMe, so it
+  holds the lease; why now: fxgen landed and the fixture tier needs the file
+minutes: 1..5

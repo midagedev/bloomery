@@ -1,0 +1,29 @@
+# Round ds41proj (B1), the engine-level A/B: the prompt batch's four attention projections batch-wide
+# per 128-token sub-block against the per-chunk launches. The round's re-derivation from the nsys/ncu
+# sitting (rig-log 09-26#v41-prefill-nsys): the card route -5.4..-9.5 ms a layer-batch [derived]; the
+# flow model (tools/flow, main 8181acc) puts B1 at +8.9 % (lcg, P = 512, hot list 384) with band
+# 144.4-157.8 over 136.0 [derived]. Runtime value from the round's gate run (3090 gate placement, not a
+# lease number): card_out 28.8-29.3 -> 19.14 ms a layer-batch. On uniondispatch's arms (hot list off,
+# rig-log 09-26#uniondispatch-ab) the round's band is pp512 137-143 over 129.6 = +5.7..+10.3 %.
+kind: ab
+question: does running the attention projections batch-wide shorten the V4.1 prompt call by the
+  card route the round derived?
+term: pp tok/s @ P = 512, lcg prompt, A6000, plan (a), no hot list - (B1 - base) / base, paired by
+  round
+unit: %
+predict: +5.7..+10.3
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55
+  and 1.1 %; the larger
+condition: main's generate_ds41 with B1 and the tree before it (built in a base worktree before the
+  lease, a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 512
+  bin:<base>:512 4096 bin:<base>:4096, the order rotated every round, BLOOMERY_STEP_STATS=1 on both
+  so card_out, card_proj and enqueue print per arm; no row carries [cpu-busy] or [other-busy]. The
+  P = 4096 rows are read against the same three decisions (the round's band there: 190-198 over
+  180.0, +5.6..+10.0 %)
+decide-in: keep B1; write card_proj into the flow model's full_res_lat and specify the G scheduler
+  round (the route's burst is under Q, so one host thread can overlap route and union)
+decide-below: read card_proj and the per-kernel times with the nsys prefill form before G: a
+  grouped launch runs above its m = 8 latency and the model's B1 term is wrong
+decide-above: the grouped weights came from L2 and the route is near its unit bound: after G the
+  host union is the whole P = 4096 path, so h3tile-b (the r8 tile) moves ahead of streaming
