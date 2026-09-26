@@ -323,7 +323,7 @@ c_node는 창의 간격 1.06 ms ÷ 964 = 1.1 µs로 측정했습니다.
 **mistral.rs**
 
 - **flash:** FA2 포트이고, sm8x causal hdim128에서 `Flash_fwd_kernel_traits<Headdim, 64, 64, 4, …>`를 씁니다(`flash_fwd_launch_template.h:274`, 주석 `:268` "64 x 64 is the fastest for causal").
-  - CTA 하나가 쿼리 헤드 하나를 맡으므로 K/V L2 트래픽이 우리의 8배입니다.
+  - ~~CTA 하나가 쿼리 헤드 하나를 맡으므로 K/V L2 트래픽이 우리의 8배입니다.~~ 정정(09-26, q3flashlit): L2→SM 트래픽은 같다(둘 다 블록-타일 66,560 × 32 KB = 2.18 GB/런치[유도]). FA2 블록은 위치를 8배 덮는 대신 헤드를 1/8만 덮는다. 또 FA2는 키 타일을 내림차순으로 돈다(`flash_fwd_kernel.h:300`).
   - 공개된 pp 행은 flash-attn 없이 잰 값입니다(`mrs-pp4096-report.md:18`).
 - ~~**MoE:** `let down_in = (up * gate.apply(&config.act)?)?;`(`moe/experts/backends.rs:1181`)로 활성을 따로 돕니다. combine은 `to_dtype(F32).broadcast_mul(..).sum(D::Minus2)?.to_dtype(..)`(`:1214-1217`)로 네 패스이고 bf16이라 우리 계약과 다릅니다.~~ 정정(09-26, mrsq3): 위는 gather 경로다. 32토큰 이상 프롬프트는 grouped 경로(`backends.rs:1121-1133`)로 가서, gate·up 뒤 `quantize_mmq_q8_1_glu`가 SiLU·곱·양자화를 한 번에 하고, 가중합은 `moe_weighted_reduce_flat_bf16` 한 패스다(`moe_grouped.cu:679-703`).
 

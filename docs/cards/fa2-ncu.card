@@ -1,0 +1,21 @@
+# The control row for q3ncu-flash (docs/research/q3flashlit-design-report.md): mistral.rs's FA2
+# flash_fwd_kernel (hdim 128, 64 x 64, 4 warps, causal, bf16) does the same work as our
+# gqa_prefill_flash — the same HMMA count, block-tiles and bytes [derived + SASS] — in 1.276 ms a launch
+# against our 1.854 (rig-log 09-26#mrs-nsys). The design reads its step as tensor-bound at 86-96 %
+# [derived from the measured time and the make-span model]. This run checks that reading, so the
+# gap in ours is read against a measured ceiling, not a derived one.
+kind: profile
+question: is FA2's step tensor-bound as the q3flashlit reading derives, with math_pipe_throttle its
+  top stall and barriers and fetch below 10 %?
+term: the tensor pipe's active share (sm__pipe_tensor_op_hmma_cycles_active, % of peak) of mistral.rs's
+  flash_fwd_kernel in layer 24 of a P = 4096 prompt under ncu at the card's own clock, A6000 300 W
+unit: %
+predict: 86..96
+condition: one lease through tools/ref/lease-hold.sh, the A6000, mistralrs sha256 8da64b84d5e5;
+  MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1 with ncu --profile-from-start off so the warm-up is outside,
+  launch-skip 24 count 1; the launch's grid is (64, 1, 32) x 128, else the run is void
+decide-in: FA2's step is the target; open the FA2 step-shape lever for ours if the q3ncu-flash rows
+  show barrier and short_scoreboard stalls on the loop's softmax PCs
+decide-below: FA2 is not tensor-bound either: read its stall mix beside ours before any flash round,
+  the realistic ceiling is lower than the design says
+decide-above: impossible past 100 %: a clock or counter reading error, void the row

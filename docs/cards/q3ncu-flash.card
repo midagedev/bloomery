@@ -13,7 +13,9 @@ predict: 56..60
 condition: just ncu-gpu-qwen3-pp 4096 24 under the lease, A6000, --clock-control none; the summary's
   proof passes (the run's load and step 0 plan lines, one launch of grid 2,048 x 128 and 34,078,720
   HMMA), else the run is void; the clock line is read first, and above ~1.65 GHz only the cycle
-  figures carry
+  figures carry; warps active about 8 a SM (two blocks) in both builds, else occupancy is the first
+  term; the q3fa row's duration is read against 1.70..1.78 ms, the value q3flashlit derived from pp4096,
+  and one at or under 1.60 shrinks the residue that design rests on
 decide-in: read the stall composition: math_pipe_throttle >= 25 % opens FS (the stagger); short_scoreboard
   + wait above every other reason keeps FA alone; no_instruction > 10 % puts the loop body's size ahead
   of both
