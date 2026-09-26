@@ -84,7 +84,7 @@ use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
     w_row,
 };
-use crate::dense::{Dense, DenseKernels, Q3kHeadsMcolArgs};
+use crate::dense::{Dense, DenseKernels};
 use crate::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
     HcPreScratch,
@@ -163,18 +163,8 @@ pub enum Selection<'a> {
     },
 }
 
-/// The buffers [`AttnChain::enqueue_layer_part`] reads and writes: the
-/// folded input the previous sub-layer left, the layer's ring and its
-/// shadow, and its compressed rows as [`AttnIo::compressed`] names them.
-pub struct PartIo<'a> {
-    pub fold_in: &'a DeviceBuffer<f32>,
-    pub ring: &'a mut DeviceTensor<u16>,
-    pub shadow: &'a mut DeviceTensor<u16>,
-    pub compressed: Compressed<'a>,
-}
-
 /// Where a chunk of a prompt batch stages its latent rows
-/// ([`AttnChain::enqueue_layer_staged`]): a ring of `rows.rows()` rows — the
+/// ([`AttnChain::enqueue_batch_layer`]): a ring of `rows.rows()` rows — the
 /// batch's chunk size — position `p` in row `p % rows.rows()`, which the
 /// chunk's append writes and its attention reads beside the window ring
 /// until its commit copies them into it.
@@ -633,10 +623,9 @@ struct Kernels {
 /// The indexer's scratch, present when a layer of the card runs it. Its
 /// projections' outputs are parts of the piece's ([`INDEX_W`], [`INDEX_Q`]).
 struct SelectScratch {
-    /// Per token count `m` (index `m − 1`): the normed input in q8_1, on an
-    /// indexer layer that owns no compressor (one that does has it in
-    /// [`SourceScratch::act`]).
-    act: Vec<Q8Act>,
+    /// The step token's normed input in q8_1, on an indexer layer that owns
+    /// no compressor (one that does has it in [`SourceScratch::act`]).
+    act: Q8Act,
     /// Per token count, per plan stream whose keys a layer scores: the score
     /// and top-k passes' scratch over the stream's rows.
     streams: Vec<Vec<Option<IndexerScratch>>>,
@@ -646,9 +635,9 @@ struct SelectScratch {
 
 /// A compressor layer's scratch.
 struct SourceScratch {
-    /// Per token count `m` (index `m − 1`): the normed input in q8_1, which
-    /// the q3_K projections read.
-    act: Vec<Q8Act>,
+    /// The step token's normed input in q8_1, which the q3_K projections
+    /// read.
+    act: Q8Act,
     /// The kv projection ([`COMP_KV`]) and the gate's ([`COMP_SCORE`]), one
     /// allocation: a joined launch writes both.
     proj: PartedBuffer<f32, 2>,
@@ -658,26 +647,12 @@ struct SourceScratch {
     key: DeviceBuffer<f32>,
 }
 
-/// Where a piece of more than one token a pass puts its projections before
-/// their token-major copies ([`crate::transpose`]), in the gemvs' row-major
-/// layout: a launch over `m` tokens writes `y[r·m + c]`, so the part of a
-/// joined launch whose rows start at row `r0` of the join starts at `r0 · m`
-/// ([`rows_of`]) — a place that moves with `m`, which is why these are whole
-/// buffers and not the scratch's fixed parts. The indexer reads its two
-/// projections here, in that layout, as it reads them at one token. A piece
-/// of one token has none: its layouts agree, and its projections land in
-/// place.
+/// The row-major scratch of a piece of more than one token.
 struct Raw {
-    /// The normed input's projections: q_a, kv, the indexer's weights.
-    qkv: DeviceBuffer<f32>,
-    /// q_a's norm's projections: the heads, the indexer's query.
-    q: DeviceBuffer<f32>,
-    /// On a card with a compressor layer: its kv and gate projections, and
-    /// its index key's.
-    proj: Option<DeviceBuffer<f32>>,
+    /// On a card with a compressor layer: the index key's projection over
+    /// the geometry's group slots, in the gemv's layout (`y[r·g + c]`),
+    /// before its copy group-major ([`crate::transpose`]).
     key: Option<DeviceBuffer<f32>>,
-    /// wo_b's output.
-    out: DeviceBuffer<f32>,
 }
 
 struct Scratch {
@@ -701,11 +676,11 @@ struct Scratch {
     y: DeviceBuffer<f32>,
     wo_a: DeviceBuffer<f32>,
     out: DeviceBuffer<f32>,
-    /// Per token count `m` (index `m − 1`), the q8_1 forms the K-quant
-    /// projections read ([`crate::dense`]): the normed input on a layer that
-    /// owns no compressor, q_a's norm, the heads after the inverse rope (one
-    /// column per output group and token) and wo_a.
-    acts: Vec<Acts>,
+    /// The step token's q8_1 forms the K-quant projections read
+    /// ([`crate::dense`]): the normed input on a layer that owns no
+    /// compressor, q_a's norm, the heads after the inverse rope (one column
+    /// per output group) and wo_a.
+    acts: Acts,
     /// Present when a layer of the card owns a compressor.
     source: Option<SourceScratch>,
     select: Option<SelectScratch>,
@@ -916,15 +891,9 @@ impl AttnChain {
             .map(|s| s.geom.max_groups)
             .max()
             .unwrap_or(1);
-        // Per token count 1..=m: a prompt batch's chunks run every count up
-        // to the image's; a decode piece holds the one count.
-        let counts = 1..=m;
         let source = if plans.iter().any(|p| p.source.is_some()) {
             Some(SourceScratch {
-                act: counts
-                    .clone()
-                    .map(|c| Q8Act::with_k(stream, c, hp.n_embd))
-                    .collect::<Result<_, _>>()?,
+                act: Q8Act::with_k(stream, 1, hp.n_embd)?,
                 proj: PartedBuffer::zeroed(stream, [m * compress::WIDTH; 2])?,
                 pre: DeviceBuffer::zeroed(stream, gm * compress::WIDTH)?,
                 act_pre: Q8Act::with_k(stream, gm, compress::WIDTH)?,
@@ -941,8 +910,9 @@ impl AttnChain {
                     .ok_or_else(|| refuse("an indexer layer that attends no stream".to_string()))?;
                 indexed[s] = true;
             }
-            let streams = counts
-                .clone()
+            // Per token count 1..=m: a prompt batch's chunks run every count
+            // up to the image's; a decode piece holds the one count.
+            let streams = (1..=m)
                 .map(|c| {
                     indexed
                         .iter()
@@ -955,10 +925,7 @@ impl AttnChain {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Some(SelectScratch {
-                act: counts
-                    .clone()
-                    .map(|c| Q8Act::with_k(stream, c, hp.n_embd))
-                    .collect::<Result<_, _>>()?,
+                act: Q8Act::with_k(stream, 1, hp.n_embd)?,
                 streams,
                 last: None,
             })
@@ -978,37 +945,24 @@ impl AttnChain {
             index_rows * indexer::HEADS * indexer::HEAD_DIM,
         ];
         let group_k = hp.n_head * hp.head_dim / hp.o_groups;
-        let acts = counts
-            .clone()
-            .map(|c| {
-                // A heads column per output group and token: past eight
-                // columns only the per-slot allocation takes them.
-                let heads = c * hp.o_groups;
-                Ok(Acts {
-                    normed: Q8Act::with_k(stream, c, hp.n_embd)?,
-                    q_a: Q8Act::with_k(stream, c, hp.q_lora_rank)?,
-                    heads: if heads <= 8 {
-                        Q8Act::with_k(stream, heads, group_k)?
-                    } else {
-                        Q8Act::with_slots(stream, heads, group_k)?
-                    },
-                    wo_a: Q8Act::with_k(stream, c, hp.o_groups * hp.o_lora_rank)?,
-                })
-            })
-            .collect::<Result<Vec<_>, GpuError>>()?;
+        // A heads column per output group: past eight columns only the
+        // per-slot allocation takes them.
+        let acts = Acts {
+            normed: Q8Act::with_k(stream, 1, hp.n_embd)?,
+            q_a: Q8Act::with_k(stream, 1, hp.q_lora_rank)?,
+            heads: if hp.o_groups <= 8 {
+                Q8Act::with_k(stream, hp.o_groups, group_k)?
+            } else {
+                Q8Act::with_slots(stream, hp.o_groups, group_k)?
+            },
+            wo_a: Q8Act::with_k(stream, 1, hp.o_groups * hp.o_lora_rank)?,
+        };
         let raw = if m > 1 {
             Some(Raw {
-                qkv: DeviceBuffer::zeroed(stream, qkv_parts.iter().sum())?,
-                q: DeviceBuffer::zeroed(stream, q_parts.iter().sum())?,
-                proj: source
-                    .as_ref()
-                    .map(|_| DeviceBuffer::zeroed(stream, 2 * m * compress::WIDTH))
-                    .transpose()?,
                 key: source
                     .as_ref()
                     .map(|_| DeviceBuffer::zeroed(stream, gm * index_key::WIDTH))
                     .transpose()?,
-                out: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
             })
         } else {
             None
@@ -1139,17 +1093,11 @@ impl AttnChain {
                 .iter()
                 .map(|b| b.num_bytes())
                 .sum::<usize>()
-                + x.act
-                    .iter()
-                    .map(|a| q8act_bytes(a.m(), d.n_embd))
-                    .sum::<usize>()
+                + q8act_bytes(x.act.m(), d.n_embd)
                 + q8act_bytes(x.act_pre.m(), compress::WIDTH)
         });
         let select = s.select.as_ref().map_or(0, |x| {
-            x.act
-                .iter()
-                .map(|a| q8act_bytes(a.m(), d.n_embd))
-                .sum::<usize>()
+            q8act_bytes(x.act.m(), d.n_embd)
                 + x.streams
                     .iter()
                     .flatten()
@@ -1157,23 +1105,16 @@ impl AttnChain {
                     .map(IndexerScratch::device_bytes)
                     .sum::<usize>()
         });
-        let acts = s
-            .acts
-            .iter()
-            .map(|a| {
-                q8act_bytes(a.normed.m(), d.n_embd)
-                    + q8act_bytes(a.q_a.m(), d.q_lora_rank)
-                    + q8act_bytes(a.heads.m(), d.group_k)
-                    + q8act_bytes(a.wo_a.m(), a.wo_a.n_sb() * 256)
-            })
-            .sum::<usize>();
-        let raw = s.raw.as_ref().map_or(0, |r| {
-            r.qkv.num_bytes()
-                + r.q.num_bytes()
-                + r.proj.as_ref().map_or(0, DeviceBuffer::num_bytes)
-                + r.key.as_ref().map_or(0, DeviceBuffer::num_bytes)
-                + r.out.num_bytes()
-        });
+        let a = &s.acts;
+        let acts = q8act_bytes(a.normed.m(), d.n_embd)
+            + q8act_bytes(a.q_a.m(), d.q_lora_rank)
+            + q8act_bytes(a.heads.m(), d.group_k)
+            + q8act_bytes(a.wo_a.m(), a.wo_a.n_sb() * 256);
+        let raw = s
+            .raw
+            .as_ref()
+            .and_then(|r| r.key.as_ref())
+            .map_or(0, DeviceBuffer::num_bytes);
         plain
             + source
             + select
@@ -1282,10 +1223,11 @@ impl AttnChain {
             .enqueue_gather(gpu.stream(), &x, &w.src, &w.dst, w.pairs, buf)
     }
 
-    /// Enqueue layer `layer`'s attention sub-layer on `gpu`'s stream, its
-    /// weights resident in `w`: the module comment's launches, reading the
-    /// words the step's [`enqueue_step`](Self::enqueue_step) gathered.
-    /// Asynchronous, allocation-free, capturable. Row 0's words.
+    /// Enqueue layer `layer`'s attention sub-layer for one token on `gpu`'s
+    /// stream, its weights resident in `w`: the module comment's launches,
+    /// reading the words the step's [`enqueue_step`](Self::enqueue_step)
+    /// gathered — their first token's. Asynchronous, allocation-free,
+    /// capturable. Row 0's words.
     pub fn enqueue_layer(
         &mut self,
         gpu: &Gpu,
@@ -1306,58 +1248,6 @@ impl AttnChain {
         row: usize,
         io: AttnIo<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_layer_at(gpu, w, layer, row, 1, io, None)
-    }
-
-    /// Layer `layer`'s attention sub-layer for a chunk of a prompt batch:
-    /// the first `m` tokens (`1 ..=` [`AttnChain::tokens`]) of row `row`'s
-    /// words, token `t` at position `stage.first + t`. The chunk's latent
-    /// rows go to `stage` (and their shadow rows to `io.shadow`) instead of
-    /// the ring, its tokens attend the ring ⧺ those rows
-    /// ([`AttnKernels::enqueue_staged`]), and one launch then commits them
-    /// to `io.ring` ([`AttnKernels::enqueue_commit`]): the ring is left as
-    /// `m` decode steps leave it, every output bit for bit theirs — each
-    /// launch here writes, per token, what its one-token launch writes, and
-    /// a projection's row-major output reaches its readers token-major
-    /// ([`crate::transpose`]). Asynchronous, allocation-free.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the layer enqueue's arguments, the chunk's token count and its staging (rust-quality R8)"
-    )]
-    pub fn enqueue_layer_staged(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        layer: usize,
-        row: usize,
-        m: usize,
-        io: AttnIo<'_>,
-        stage: StageIo<'_>,
-    ) -> Result<(), GpuError> {
-        self.enqueue_layer_at(gpu, w, layer, row, m, io, Some(stage))
-    }
-
-    /// Layer `layer`'s latent rows alone, for a chunk of a prompt batch whose
-    /// positions only later positions' windows read — the first `m` tokens
-    /// (`1 ..=` [`AttnChain::tokens`]) of row `row`'s words: the attention
-    /// norm of `io.fold_in`, on a compressor's layer the compressor and its
-    /// index key, the latent projection and each token's row into its slot
-    /// of `io.ring` and its row of `io.shadow`. Nothing else runs — no query,
-    /// indexer, attention, output or HC_POST — so the chunk leaves no streams
-    /// and no fold. Each launch is one [`AttnChain::enqueue_layer_staged`]
-    /// makes over the same tokens (the append into the ring instead of the
-    /// staging, the rows its commit would copy there), so the ring, the
-    /// shadow, the compressed rows and keys and the compressor's state are
-    /// its bits. Asynchronous, allocation-free.
-    pub fn enqueue_layer_part(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        layer: usize,
-        row: usize,
-        m: usize,
-        io: PartIo<'_>,
-    ) -> Result<(), GpuError> {
         let lp = layer
             .checked_sub(self.layers.start)
             .and_then(|i| self.plans.get(i))
@@ -1365,107 +1255,6 @@ impl AttnChain {
                 what: WHAT,
                 detail: format!("layer {layer} is not one of {:?}", self.layers),
             })?;
-        if !(1..=self.tokens).contains(&m) {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("a pass of {m} tokens; the piece runs 1..={}", self.tokens),
-            });
-        }
-        let PartIo {
-            fold_in,
-            ring,
-            shadow,
-            mut compressed,
-        } = io;
-        let cx = Cx {
-            gpu,
-            w,
-            k: &self.kernels,
-            d: &self.dims,
-            words: self.words.of(row)?,
-            layer,
-            fault: gpu.layer_sink(layer)?,
-            m,
-        };
-        let s = &mut self.scratch;
-        let (d, k, stream) = (cx.d, cx.k, gpu.stream());
-        let qkv = Qkv::of(w, lp, d)?;
-        let normed_act = enqueue_norm(&cx, lp, s, fold_in, &mut compressed, qkv.reads_q8_1())?;
-        let act = normed_act_of(&s.source, &s.acts, normed_act, m)?;
-        match qkv {
-            Qkv::Joint(t) => {
-                let act = act.ok_or_else(|| GpuError::Shape {
-                    what: WHAT,
-                    detail: format!("layer {layer}: a joined q_a·kv without the normed q8_1"),
-                })?;
-                match s.raw.as_mut() {
-                    None => gpu.enqueue_gemv_q3k(t, act, s.qkv.whole_mut())?,
-                    Some(raw) => {
-                        gpu.enqueue_gemv_q3k(t, act, &mut raw.qkv)?;
-                        let src = rows_of(&raw.qkv, d.q_lora_rank, d.head_dim, m)?;
-                        k.transpose
-                            .enqueue(stream, &src, d.head_dim, m, s.qkv.part_mut(KV))?;
-                    }
-                }
-            }
-            Qkv::Parts { kv, .. } => project(
-                &cx,
-                kv,
-                &s.normed,
-                act,
-                d.head_dim,
-                s.raw.as_mut().map(|r| &mut r.qkv),
-                s.qkv.part_mut(KV),
-            )?,
-        }
-        let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
-        let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
-        k.rope.enqueue_kv_norm_rope_append(
-            stream,
-            KvAppendArgs {
-                kv: s.qkv.part(KV),
-                gain: vector(w, &lp.names.kv_norm)?,
-                cs: &table,
-                pos: &pos,
-                eps: d.eps,
-                n_dims: d.rope_dims,
-                m,
-                out: &mut s.kv_row,
-                cache: ring,
-                shadow,
-            },
-        )
-    }
-
-    /// The layer's launches over `m` tokens: into the ring (`stage` `None`,
-    /// the decode step's, one token) or through a chunk's staging.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the layer enqueue's arguments, the token count and the staging (rust-quality R8)"
-    )]
-    fn enqueue_layer_at(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        layer: usize,
-        row: usize,
-        m: usize,
-        io: AttnIo<'_>,
-        stage: Option<StageIo<'_>>,
-    ) -> Result<(), GpuError> {
-        let lp = layer
-            .checked_sub(self.layers.start)
-            .and_then(|i| self.plans.get(i))
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} is not one of {:?}", self.layers),
-            })?;
-        if !(1..=self.tokens).contains(&m) {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("a pass of {m} tokens; the piece runs 1..={}", self.tokens),
-            });
-        }
         let AttnIo {
             streams_in,
             fold_in,
@@ -1485,8 +1274,9 @@ impl AttnChain {
             words: self.words.of(row)?,
             layer,
             fault: gpu.layer_sink(layer)?,
-            m,
+            m: 1,
         };
+        let m = cx.m;
         let s = &mut self.scratch;
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
         let branch = &self.branch;
@@ -1514,25 +1304,13 @@ impl AttnChain {
 
         let q_a = match qkv {
             Qkv::Joint(t) => {
-                let act = normed_act_of(&s.source, &s.acts, normed_act, m)?.ok_or_else(|| {
+                let act = normed_act_of(&s.source, &s.acts, normed_act).ok_or_else(|| {
                     GpuError::Shape {
                         what: WHAT,
                         detail: format!("layer {layer}: a joined q_a·kv without the normed q8_1"),
                     }
                 })?;
-                match s.raw.as_mut() {
-                    None => gpu.enqueue_gemv_q3k(t, act, s.qkv.whole_mut())?,
-                    Some(raw) => {
-                        gpu.enqueue_gemv_q3k(t, act, &mut raw.qkv)?;
-                        for (part, r0, rows) in
-                            [(Q_A, 0, d.q_lora_rank), (KV, d.q_lora_rank, d.head_dim)]
-                        {
-                            let src = rows_of(&raw.qkv, r0, rows, m)?;
-                            k.transpose
-                                .enqueue(stream, &src, rows, m, s.qkv.part_mut(part))?;
-                        }
-                    }
-                }
+                gpu.enqueue_gemv_q3k(t, act, s.qkv.whole_mut())?;
                 None
             }
             Qkv::Parts { q_a, .. } => Some(q_a),
@@ -1541,39 +1319,25 @@ impl AttnChain {
         let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
         let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
         if let Qkv::Parts { kv, .. } = qkv {
-            let act = normed_act_of(&s.source, &s.acts, normed_act, m)?;
-            project(
-                &cx,
-                kv,
-                &s.normed,
-                act,
-                d.head_dim,
-                s.raw.as_mut().map(|r| &mut r.qkv),
-                s.qkv.part_mut(KV),
-            )?;
+            let act = normed_act_of(&s.source, &s.acts, normed_act);
+            k.dense
+                .enqueue_m(gpu, kv, &s.normed, act, m, s.qkv.part_mut(KV))?;
         }
-        let mut stage = stage;
-        {
-            let cache: &mut DeviceTensor<u16> = match stage.as_mut() {
-                Some(st) => &mut *st.rows,
-                None => &mut *ring,
-            };
-            k.rope.enqueue_kv_norm_rope_append(
-                stream,
-                KvAppendArgs {
-                    kv: s.qkv.part(KV),
-                    gain: vector(w, &n.kv_norm)?,
-                    cs: &table,
-                    pos: &pos,
-                    eps: d.eps,
-                    n_dims: d.rope_dims,
-                    m,
-                    out: &mut s.kv_row,
-                    cache,
-                    shadow,
-                },
-            )?;
-        }
+        k.rope.enqueue_kv_norm_rope_append(
+            stream,
+            KvAppendArgs {
+                kv: s.qkv.part(KV),
+                gain: vector(w, &n.kv_norm)?,
+                cs: &table,
+                pos: &pos,
+                eps: d.eps,
+                n_dims: d.rope_dims,
+                m,
+                out: &mut s.kv_row,
+                cache: &mut *ring,
+                shadow,
+            },
+        )?;
 
         let (rows, vis_at) = match (&compressed, lp.stream) {
             (Compressed::Read(rows), Some(st)) => (Some(*rows), cx.words.layout.streams[st].vis),
@@ -1655,34 +1419,7 @@ impl AttnChain {
             y: &mut s.y,
             fault: cx.fault,
         };
-        match stage.as_ref() {
-            None => k.attn.enqueue(stream, args)?,
-            Some(st) => {
-                let base = cx.words.view::<u32>(cx.words.layout.pos, 1)?;
-                let staged = staging_view(st, m)?;
-                k.attn.enqueue_staged(
-                    stream,
-                    args,
-                    Staged {
-                        rows: &staged,
-                        base: &base,
-                    },
-                )?;
-                let committed = k.attn.enqueue_commit(
-                    stream,
-                    CommitArgs {
-                        staged: Staged {
-                            rows: &staged,
-                            base: &base,
-                        },
-                        tokens: m,
-                        ring: &mut *ring,
-                    },
-                );
-                DeviceTensor::release(staged);
-                committed?;
-            }
-        }
+        k.attn.enqueue(stream, args)?;
         enqueue_output(&cx, lp, s)?;
         fork.join()?;
 
@@ -1719,17 +1456,17 @@ fn enqueue_norm(
     let gain = vector(w, &lp.names.norm)?;
     Ok(match (&lp.source, compressed, s.source.as_mut()) {
         (Some(sp), Compressed::Source(io), Some(src)) => {
-            let act = count_of(&mut src.act, m)?;
             k.fused.enqueue_norm_quant(
                 stream,
                 fold_in,
                 gain,
                 d.eps,
-                act,
+                &mut src.act,
                 &mut s.normed,
                 cx.fault,
             )?;
-            enqueue_source(cx, sp, src, &mut s.raw, io)?;
+            let raw_key = s.raw.as_mut().and_then(|r| r.key.as_mut());
+            enqueue_source(cx, sp, src, raw_key, io)?;
             NormedAct::Source
         }
         (None, Compressed::Read(_), _) if lp.stream.is_some() && quantized => {
@@ -1738,7 +1475,7 @@ fn enqueue_norm(
                 fold_in,
                 gain,
                 d.eps,
-                &mut count_of(&mut s.acts, m)?.normed,
+                &mut s.acts.normed,
                 &mut s.normed,
                 cx.fault,
             )?;
@@ -1750,7 +1487,7 @@ fn enqueue_norm(
                 fold_in,
                 gain,
                 d.eps,
-                &mut count_of(&mut s.acts, m)?.normed,
+                &mut s.acts.normed,
                 &mut s.normed,
                 cx.fault,
             )?;
@@ -1840,7 +1577,8 @@ struct Cx<'a> {
     /// The model layer the launches belong to, and its fault sink.
     layer: usize,
     fault: FaultSink,
-    /// Tokens of the pass.
+    /// Tokens of the pass: one on the decode step, the chunk's on a prompt
+    /// batch.
     m: usize,
 }
 
@@ -1855,74 +1593,17 @@ fn count_of<T>(by_count: &mut [T], m: usize) -> Result<&mut T, GpuError> {
         })
 }
 
-/// The part of a joined launch's row-major output `whole` over `m` tokens
-/// whose rows start at row `r0` of the join: `rows · m` values from `r0 ·
-/// m`.
-fn rows_of(
-    whole: &DeviceBuffer<f32>,
-    r0: usize,
-    rows: usize,
-    m: usize,
-) -> Result<View<'_, f32>, GpuError> {
-    view(whole, r0 * m, rows * m)
-}
-
-/// [`rows_of`], to write.
-fn rows_of_mut(
-    whole: &mut DeviceBuffer<f32>,
-    r0: usize,
-    rows: usize,
-    m: usize,
-) -> Result<crate::span::SpanMut<'_, f32>, GpuError> {
-    crate::span::span_mut(WHAT, whole, r0 * m, rows * m)
-}
-
-/// The normed input's q8_1 form for `m` tokens where `at` says it is: the
+/// The step token's normed input in q8_1 where `at` says it is: the
 /// compressor's scratch `source` or the piece's `acts`.
 fn normed_act_of<'a>(
     source: &'a Option<SourceScratch>,
-    acts: &'a [Acts],
+    acts: &'a Acts,
     at: NormedAct,
-    m: usize,
-) -> Result<Option<&'a Q8Act>, GpuError> {
-    let of = |v: usize| {
-        m.checked_sub(1)
-            .filter(|&i| i < v)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("a pass of {m} tokens; the scratch holds 1..={v}"),
-            })
-    };
-    Ok(match at {
+) -> Option<&'a Q8Act> {
+    match at {
         NormedAct::None => None,
-        NormedAct::Source => match source.as_ref() {
-            Some(x) => Some(&x.act[of(x.act.len())?]),
-            None => None,
-        },
-        NormedAct::Own => Some(&acts[of(acts.len())?].normed),
-    })
-}
-
-/// A plain projection of the pass's `m` tokens (`rows` outputs each) into
-/// `dst`, token-major: straight into `dst` without `raw` (a piece of one
-/// token, where the layouts agree); else into the start of `raw`, the
-/// gemvs' row-major layout, then copied token-major into `dst`.
-fn project(
-    cx: &Cx<'_>,
-    d: Dense<'_>,
-    x: &DeviceBuffer<f32>,
-    act: Option<&Q8Act>,
-    rows: usize,
-    raw: Option<&mut DeviceBuffer<f32>>,
-    dst: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    match raw {
-        None => cx.k.dense.enqueue_m(cx.gpu, d, x, act, cx.m, dst),
-        Some(raw) => {
-            cx.k.dense.enqueue_m(cx.gpu, d, x, act, cx.m, raw)?;
-            cx.k.transpose
-                .enqueue(cx.gpu.stream(), raw, rows, cx.m, dst)
-        }
+        NormedAct::Source => source.as_ref().map(|x| &x.act),
+        NormedAct::Own => Some(&acts.normed),
     }
 }
 
@@ -1930,9 +1611,7 @@ fn project(
 /// projections wrote it — `q_a` is `None` then), its norm, q_b (joined with
 /// the indexer's query projection when [`join_projections`] filed that) and
 /// the tail rope of every head. q_a's norm leaves its q8_1 form too when
-/// q_b, or the layer's indexer query, reads one. At more than one token each
-/// projection's row-major output is copied token-major before its reader,
-/// the indexer's query excepted: the indexer reads the gemv's layout.
+/// q_b, or the layer's indexer query, reads one.
 fn enqueue_query(
     cx: &Cx<'_>,
     lp: &LayerPlan,
@@ -1943,19 +1622,12 @@ fn enqueue_query(
     let (d, w, n, stream, m) = (cx.d, cx.w, &lp.names, cx.gpu.stream(), cx.m);
     let query = Query::of(w, lp, d)?;
     if let Some(q_a) = q_a {
-        let act = normed_act_of(&s.source, &s.acts, normed_act, m)?;
-        project(
-            cx,
-            q_a,
-            &s.normed,
-            act,
-            d.q_lora_rank,
-            s.raw.as_mut().map(|r| &mut r.qkv),
-            s.qkv.part_mut(Q_A),
-        )?;
+        let act = normed_act_of(&s.source, &s.acts, normed_act);
+        cx.k.dense
+            .enqueue_m(cx.gpu, q_a, &s.normed, act, m, s.qkv.part_mut(Q_A))?;
     }
     let gain = vector(w, &n.q_a_norm)?;
-    let acts = count_of(&mut s.acts, m)?;
+    let acts = &mut s.acts;
     if query.reads_q8_1() {
         cx.k.fused.enqueue_norm_quant(
             stream,
@@ -1977,26 +1649,12 @@ fn enqueue_query(
             &mut s.q_a_normed,
         )?;
     }
-    let q_rows = d.n_head * d.head_dim;
-    match (query, s.raw.as_mut()) {
-        (Query::Joint(t), None) => cx.gpu.enqueue_gemv_q3k(t, &acts.q_a, s.q.whole_mut())?,
-        (Query::Joint(t), Some(raw)) => {
-            cx.gpu.enqueue_gemv_q3k(t, &acts.q_a, &mut raw.q)?;
-            let src = rows_of(&raw.q, 0, q_rows, m)?;
-            cx.k.transpose
-                .enqueue(stream, &src, q_rows, m, s.q.part_mut(Q))?;
-        }
-        (Query::Parts { q_b, .. }, raw) => {
+    match query {
+        Query::Joint(t) => cx.gpu.enqueue_gemv_q3k(t, &acts.q_a, s.q.whole_mut())?,
+        Query::Parts { q_b, .. } => {
             let act = q_b.reads_q8_1().then_some(&acts.q_a);
-            project(
-                cx,
-                q_b,
-                &s.q_a_normed,
-                act,
-                q_rows,
-                raw.map(|r| &mut r.q),
-                s.q.part_mut(Q),
-            )?;
+            cx.k.dense
+                .enqueue_m(cx.gpu, q_b, &s.q_a_normed, act, m, s.q.part_mut(Q))?;
         }
     }
     let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
@@ -2021,9 +1679,9 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
     cx.k.rope
         .enqueue_rope_tail(stream, &mut s.y, &table, heads(d, m))?;
     let groups = d.n_head * d.head_dim / d.group_k;
-    let acts = count_of(&mut s.acts, m)?;
+    let acts = &mut s.acts;
     match Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)? {
-        Dense::Q8_0 { qs, d: qd } if m == 1 => cx.k.step.enqueue_q8_0_gemv_heads(
+        Dense::Q8_0 { qs, d: qd } => cx.k.step.enqueue_q8_0_gemv_heads(
             stream,
             Q8_0GemvHeadsArgs {
                 qs,
@@ -2038,38 +1696,17 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
         )?,
         Dense::Q3K(wa) => {
             // The groups' windows of the heads are the columns of one q8_1
-            // activation of `groups` columns a token, token after token.
+            // activation of `groups` columns.
             cx.gpu
                 .enqueue_quantize_q8_1_layer(&s.y, &mut acts.heads, cx.layer)?;
-            if m == 1 {
-                cx.k.dense.enqueue_q3k_heads(
-                    stream,
-                    wa,
-                    &acts.heads,
-                    d.o_lora_rank,
-                    &mut s.wo_a,
-                )?;
-            } else {
-                cx.k.dense.enqueue_q3k_heads_mcol(
-                    stream,
-                    Q3kHeadsMcolArgs {
-                        w: wa,
-                        q3: acts.heads.q3(),
-                        d8: acts.heads.d8(),
-                        n_sb: acts.heads.n_sb(),
-                        groups,
-                        rows_per_head: d.o_lora_rank,
-                        m,
-                        y: &mut s.wo_a,
-                    },
-                )?;
-            }
+            cx.k.dense
+                .enqueue_q3k_heads(stream, wa, &acts.heads, d.o_lora_rank, &mut s.wo_a)?;
         }
         _ => {
             return Err(GpuError::Tensor {
                 what: WHAT,
                 name: n.out_a.clone(),
-                need: "Q3_K, or Q8_0 on a one-token pass",
+                need: "Q3_K or Q8_0",
             });
         }
     }
@@ -2081,15 +1718,8 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
     } else {
         None
     };
-    project(
-        cx,
-        out_b,
-        &s.wo_a,
-        act,
-        d.n_embd,
-        s.raw.as_mut().map(|r| &mut r.out),
-        &mut s.out,
-    )
+    cx.k.dense
+        .enqueue_m(cx.gpu, out_b, &s.wo_a, act, m, &mut s.out)
 }
 
 /// What an indexer layer's selection reads and writes besides the scratch.
@@ -2116,8 +1746,8 @@ struct Joined {
 /// — each unless `joined` says a joined launch wrote it — then the score and
 /// top-k passes into the list. The visible counts and `top_k` are words of
 /// the piece's copy; the rope table is the layer's forward table (YaRN: the
-/// layer attends a stream). Both projections are read in the gemvs' layout,
-/// a token per column: at more than one token, the row-major scratch's.
+/// layer attends a stream). Both projections are read in the scratch's
+/// parts.
 fn enqueue_indexer(
     cx: &Cx<'_>,
     lp: &LayerPlan,
@@ -2143,63 +1773,33 @@ fn enqueue_indexer(
     let Scratch {
         qkv,
         q,
-        raw,
         acts,
         source,
         normed,
         q_a_normed,
         ..
     } = s;
-    // Where the two projections sit in the gemvs' layout: the scratch's
-    // parts on a piece of one token, the joins' places in the row-major
-    // scratch otherwise.
-    let q_rows = d.n_head * d.head_dim;
-    let w_at = d.q_lora_rank + d.head_dim;
     let (w_rows, q_len) = (indexer::HEADS, indexer::HEADS * indexer::HEAD_DIM);
-    let acts = count_of(acts, m)?;
     if !joined.query {
         let q_b = Dense::of(w, &ip.q_b, d.q_lora_rank, q_len)?;
         let q_act = q_b.reads_q8_1().then_some(&acts.q_a);
-        match raw.as_mut() {
-            None => {
-                cx.k.dense
-                    .enqueue_m(gpu, q_b, q_a_normed, q_act, m, q.part_mut(INDEX_Q))?
-            }
-            Some(r) => {
-                let mut dst = rows_of_mut(&mut r.q, q_rows, q_len, m)?;
-                cx.k.dense
-                    .enqueue_m(gpu, q_b, q_a_normed, q_act, m, &mut dst)?;
-            }
-        }
+        cx.k.dense
+            .enqueue_m(gpu, q_b, q_a_normed, q_act, m, q.part_mut(INDEX_Q))?;
     }
     if !joined.weights {
-        let own = count_of(&mut sel.act, m)?;
+        let own = &mut sel.act;
         let act = match (lp.source.is_some(), source.as_ref(), normed_act) {
-            (true, Some(src), _) => &src.act[m - 1],
+            (true, Some(src), _) => &src.act,
             (_, _, NormedAct::Own) => &acts.normed,
             _ => {
                 gpu.enqueue_quantize_q8_1_layer(normed, own, cx.layer)?;
                 &*own
             }
         };
-        match raw.as_mut() {
-            None => gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, qkv.part_mut(INDEX_W))?,
-            Some(r) => {
-                let mut dst = rows_of_mut(&mut r.qkv, w_at, w_rows, m)?;
-                gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, &mut dst)?;
-            }
-        }
+        gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, qkv.part_mut(INDEX_W))?;
     }
-    let (q_in, w_in) = match raw.as_ref() {
-        None => (
-            view(q.part(INDEX_Q), 0, q_len * m)?,
-            view(qkv.part(INDEX_W), 0, w_rows * m)?,
-        ),
-        Some(r) => (
-            rows_of(&r.q, q_rows, q_len, m)?,
-            rows_of(&r.qkv, w_at, w_rows, m)?,
-        ),
-    };
+    let q_in = view(q.part(INDEX_Q), 0, q_len * m)?;
+    let w_in = view(qkv.part(INDEX_W), 0, w_rows * m)?;
     enqueue_select(cx, lp, kernels, sel, &q_in, &w_in, io)
 }
 
@@ -2248,28 +1848,18 @@ fn enqueue_select(
 /// A compressor layer's own launches, after the norm left the q8_1 input:
 /// the projections (kv and the gate in one launch when [`join_projections`]
 /// joined them), the pooled (or ratio-1) row into the cache, then the index
-/// key. At more than one token the projections reach the pooling
-/// token-major through `raw`; so does the key whenever the geometry holds
-/// more than one group slot, whatever the pass's token count.
+/// key — through `raw_key` ([`Raw::key`]) when there is one and the
+/// geometry holds more than one group slot.
 fn enqueue_source(
     cx: &Cx<'_>,
     sp: &SourcePlan,
     src: &mut SourceScratch,
-    raw: &mut Option<Raw>,
+    raw_key: Option<&mut DeviceBuffer<f32>>,
     io: &mut SourceIo<'_>,
 ) -> Result<(), GpuError> {
     let ratio = cx.words.layout.streams[sp.stream].geom.ratio;
     let st = SourceTensors::of(cx.w, sp, ratio, io.ring.is_some())?;
-    let missing = GpuError::State {
-        what: WHAT,
-        missing: "the compressor's row-major scratch",
-    };
-    let (raw_proj, raw_key) = match raw.as_mut() {
-        Some(r) => (Some(r.proj.as_mut().ok_or(missing)?), r.key.as_mut()),
-        None => (None, None),
-    };
-    let act = count_of(&mut src.act, cx.m)?;
-    source_project(cx, &st, act, &mut src.proj, raw_proj)?;
+    source_project(cx, &st, &src.act, &mut src.proj)?;
     source_rows(
         cx,
         sp,
@@ -2359,48 +1949,22 @@ impl<'w> SourceTensors<'w> {
     }
 }
 
-/// The compressor's projections of the pass's normed input `act` into
-/// `proj`, token-major: in place without `raw` (one token), else through
-/// `raw` in the gemvs' row-major layout.
+/// The compressor's projections of the step token's normed input `act`
+/// into `proj`.
 fn source_project(
     cx: &Cx<'_>,
     st: &SourceTensors<'_>,
     act: &Q8Act,
     proj: &mut PartedBuffer<f32, 2>,
-    mut raw: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
-    let (gpu, stream, m) = (cx.gpu, cx.gpu.stream(), cx.m);
-    let width = compress::WIDTH;
-    match (st.proj, raw.as_deref_mut()) {
-        (SourceProj::Joint(t), None) => gpu.enqueue_gemv_q3k(t, act, proj.whole_mut())?,
-        (SourceProj::Joint(t), Some(r)) => gpu.enqueue_gemv_q3k(t, act, r)?,
-        (SourceProj::Split { kv, gate }, None) => {
+    let gpu = cx.gpu;
+    match st.proj {
+        SourceProj::Joint(t) => gpu.enqueue_gemv_q3k(t, act, proj.whole_mut())?,
+        SourceProj::Split { kv, gate } => {
             gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?;
             gpu.enqueue_gemv_q3k(gate, act, proj.part_mut(COMP_SCORE))?;
         }
-        (SourceProj::Split { kv, gate }, Some(r)) => {
-            let mut kv_rows = rows_of_mut(r, 0, width, m)?;
-            gpu.enqueue_gemv_q3k(kv, act, &mut kv_rows)?;
-            drop(kv_rows);
-            let mut score = rows_of_mut(r, width, width, m)?;
-            gpu.enqueue_gemv_q3k(gate, act, &mut score)?;
-        }
-        (SourceProj::Kv(kv), None) => gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?,
-        (SourceProj::Kv(kv), Some(r)) => {
-            let mut kv_rows = rows_of_mut(r, 0, width, m)?;
-            gpu.enqueue_gemv_q3k(kv, act, &mut kv_rows)?;
-        }
-    }
-    if let Some(r) = raw.as_deref() {
-        let parts: &[(usize, usize)] = match st.proj {
-            SourceProj::Kv(_) => &[(COMP_KV, 0)],
-            _ => &[(COMP_KV, 0), (COMP_SCORE, width)],
-        };
-        for &(part, r0) in parts {
-            let rows = rows_of(r, r0, width, m)?;
-            cx.k.transpose
-                .enqueue(stream, &rows, width, m, proj.part_mut(part))?;
-        }
+        SourceProj::Kv(kv) => gpu.enqueue_gemv_q3k(kv, act, proj.part_mut(COMP_KV))?,
     }
     Ok(())
 }

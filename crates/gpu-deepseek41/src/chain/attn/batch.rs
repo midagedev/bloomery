@@ -1,10 +1,10 @@
 //! A prompt batch's attention sub-layer with its projections batch-wide
 //! ([`AttnChain::enqueue_batch_layer`]; its buffers are an [`AttnBatch`]).
 //!
-//! The layer's chunks run in position order, as
-//! [`AttnChain::enqueue_layer_staged`] and [`AttnChain::enqueue_layer_part`]
-//! run them one chunk at a time, but a launch that reads the layer's input
-//! alone runs once over a sub-block of chunks instead of once a chunk:
+//! The layer's chunks run in position order, each chunk's tokens as that
+//! many decode steps ([`AttnChain::enqueue_layer`]) would run them, but a
+//! launch that reads the layer's input alone runs once over a sub-block of
+//! chunks instead of once a chunk:
 //!
 //! 1. before the chunks, once over the layer's block: HC_PRE on the piece's
 //!    branch, in groups of [`HC_MAX_TOKENS`] tokens in one grid
@@ -25,11 +25,14 @@
 //! 5. after the chunks, once over the block: the branch's join and HC_POST
 //!    with the next fold.
 //!
-//! Every launch writes, per token, what the chunk's own launch writes: a
-//! column group is the m-column launch on its columns, bit for bit
-//! (`cores::q3k_row_dot`'s contract), the norms and the quantizer are
-//! column-local, HC_PRE, the ropes and HC_POST token-local. The projections'
-//! tensors are resolved once a layer-batch ([`LayerTensors`]).
+//! Every launch writes, per token, what the decode step's launch writes at
+//! that token's position, and the prefill gate holds a prompt to its steps:
+//! a column group is the one-column launch on each of its columns, bit for
+//! bit (`cores::q3k_row_dot`'s contract), the norms and the quantizer are
+//! column-local, HC_PRE, the ropes and HC_POST token-local, and a chunk's
+//! staged attention and commit leave each of its tokens what its step
+//! leaves. The projections' tensors are resolved once a layer-batch
+//! ([`LayerTensors`]).
 //!
 //! A sub-block is a chunk shorter than [`HC_MAX_TOKENS`] alone, or a run of
 //! 1, 2, 4, 8 or 16 whole chunks ([`SubBlocks`]): the fused norm writes the
@@ -666,13 +669,12 @@ impl AttnChain {
     }
 
     /// Layer `layer`'s attention sub-layer over a prompt batch's chunks with
-    /// its projections batch-wide (the module doc): the latent rows of the
-    /// chunks `io.run ..` before `io.full` as
-    /// [`AttnChain::enqueue_layer_part`] writes them, and from `io.full` on
-    /// the block as [`AttnChain::enqueue_layer_staged`] runs it chunk by
-    /// chunk — each launch here writes, per token, what the chunk's launch
-    /// writes, so the caches, the streams and the fold are its bits. Chunk
-    /// `k` reads row `k` of the piece's words and `caches`' chunk `k`.
+    /// its projections batch-wide (the module doc): the latent rows alone of
+    /// the chunks `io.run ..` before `io.full`, and from `io.full` on the
+    /// whole block. The caches it writes, and in the block the streams and
+    /// the fold, are the bits the decode step ([`AttnChain::enqueue_layer`])
+    /// leaves at each of those positions, fed one token at a time. Chunk `k`
+    /// reads row `k` of the piece's words and `caches`' chunk `k`.
     /// Asynchronous, allocation-free.
     pub fn enqueue_batch_layer(
         &mut self,
