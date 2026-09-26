@@ -330,6 +330,26 @@ def read_plan(path):
     return plan
 
 
+# The live CSV carries ncu's base units (byte, hz, ns); the details page a run with BLOOMERY_NCU_SOURCE=1 falls
+# back to carries human ones (Kbyte, Ghz, ms), rounded to about three digits. Every value is read in the base
+# unit, and a launch read from human units says so.
+SI = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+TIME_NS = {"ns": 1.0, "us": 1e3, "usecond": 1e3, "ms": 1e6, "msecond": 1e6, "s": 1e9, "second": 1e9}
+
+
+def base_unit(unit, v):
+    """(unit, value) in ncu's base units: byte[/x], hz, ns; any other unit as it came."""
+    m = re.fullmatch(r"([KMGT]?)byte(/.+)?", unit)
+    if m:
+        return "byte" + (m.group(2) or ""), v * SI[m.group(1)]
+    m = re.fullmatch(r"([kKMGT]?)hz", unit, re.I)
+    if m:
+        return "hz", v * SI[m.group(1).upper()]
+    if unit in TIME_NS:
+        return "ns", v * TIME_NS[unit]
+    return unit, v
+
+
 def read_csv(path):
     rows = list(csv.reader(open(path)))
     hdr = next((i for i, r in enumerate(rows) if r and r[0] == "ID"), None)
@@ -351,7 +371,10 @@ def read_csv(path):
             v = float(r[col["Metric Value"]].replace(",", ""))
         except ValueError:
             continue
-        d["m"][(r[col["Metric Name"]], r[col["Metric Unit"]])] = v
+        unit, v = base_unit(r[col["Metric Unit"]], v)
+        if unit != r[col["Metric Unit"]]:
+            d["human"] = True
+        d["m"][(r[col["Metric Name"]], unit)] = v
     return per
 
 
@@ -425,6 +448,9 @@ def cmd_summary(argv):
     step = elapsed * n_sm / bs
     slot_step = elapsed / span
     print("--- the launch (cycles are SM cycles at the card's own clock; microseconds are not records)")
+    if d.get("human"):
+        print("    [units] this CSV is ncu's details page: human units (Kbyte, Ghz, ms) read in base units, each "
+              "value rounded to about three digits by ncu; counts (cycles, instructions, sectors) are exact")
     dur = [(u, v) for (n, u), v in d["m"].items() if n == "Duration"]
     print(f"    clock {clock / 1e9 if clock else float('nan'):.3f} GHz (sm__cycles_elapsed.avg.per_second), elapsed "
           f"{elapsed:,.0f} cycles an SM, active {met('sm__cycles_active.avg') or float('nan'):,.0f}; duration "
