@@ -454,4 +454,4 @@ decide-above: the GEMM's reads got faster too (L2): an nsys of both arms, re-fit
 9. B edits aa's files mechanically at a wave boundary (fallback: a shim).
 10. The host tier keeps its own storage (`quantize_col`), and the handoff stays f32.
 
-**Lead decision.** Deleting `gemm_q5k` is on hold "until the IMMA decision" (`docs/rebuild.md:302`). Deleting it would empty the (Q5_K, Gemm) cell of the table. Qwen3.6 routes down through Q5_K on 36 of its 40 layers, and GLM UD-Q4_K_XL on 40 of its 43 (`modelspec-design.md:9-15`). Without `gemm_q5k`, neither next model has a down GEMM on its prompt path.
+**Lead decision** (decided by the user on 2026-09-27: `gemm_q5k` stays). Deleting `gemm_q5k` is on hold "until the IMMA decision" (`docs/rebuild.md:302`). Deleting it would empty the (Q5_K, Gemm) cell of the table. Qwen3.6 routes down through Q5_K on 36 of its 40 layers, and GLM UD-Q4_K_XL on 40 of its 43 (`modelspec-design.md:9-15`). Without `gemm_q5k`, neither next model has a down GEMM on its prompt path.

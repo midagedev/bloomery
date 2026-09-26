@@ -299,7 +299,7 @@ extras   = Engram | Ple | Deepstack
 **결정 뒤에 지우는 것**
 - `Q3K_SPLIT` 가족: 판정하든지 지우든지. 게이트가 3090 레인에서 묶음마다 337–357 s를 쓴다.
 - `LAUNCH_THREAD`: 판정하든지 지우든지. 판정하려면 13바퀴 시팅이 필요하다.
-- `gemm_q5k`: IMMA 결정 뒤.
+- ~~`gemm_q5k`: IMMA 결정 뒤.~~ **남긴다**(사용자 결정 2026-09-27). Qwen3.6-35B-A3B는 routed down이 40층 중 36층, GLM-5.3-Flash UD-Q4_K_XL은 43층 중 40층이 Q5_K라, 두 새 모델의 프롬프트 down GEMM이 이 커널이다(`docs/research/act-planes-design.md` §7).
 - `kld_diff`, `forced_probe`: 확신이 낮다.
 - V2-Lite 전부(결정 1).
 
