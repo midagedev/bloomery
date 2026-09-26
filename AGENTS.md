@@ -90,7 +90,15 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # old the box's dep-info of each selected bin is (read-only ssh;
                       # `--no-box` skips it). A change in crates/gpu or crates/model
                       # selects every GPU gate: the graph's true answer. A gate left out
-                      # of a batch is then a printed record, not a judgment
+                      # of a batch is then a printed record, not a judgment.
+                      # The graph over-selects a host-only change (user, 2026-09-26: "heavy
+                      # experiments again; read the code instead"): when `just ptx-scan` is
+                      # identical to the base for every bin the change reaches, no kernel
+                      # moved, so the landing batch is the gates that run the changed host
+                      # path (for the V4.1 prompt call: ds41-prefill, -step, -long, -faults,
+                      # e2e and the changed bins' own gates) plus the static checks; the
+                      # batch's list names the gates it leaves out and the ptx-scan line that
+                      # lets it. A kernel, a launch or a byte formula moved runs the whole list
     just gate         # check-recipes + fmt-check + lint + both builds + gate-1-1
     just smoke        # the smoke tier: the static checks, gate-gpu-ds41-step, gate-gpu-ds41-prefill at
                       # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
