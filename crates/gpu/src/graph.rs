@@ -150,12 +150,6 @@ impl Graph {
         unsafe { launch_exec(self.exec, stream.cu_stream()) }
     }
 
-    /// The instantiated graph, for a launch issued from another thread while
-    /// this graph is kept alive ([`launch_exec`]).
-    pub(crate) fn exec(&self) -> sys::CUgraphExec {
-        self.exec
-    }
-
     /// Number of nodes the capture recorded — kernel launches plus any memset
     /// or copy nodes. This is the "launch count" column of the first lease
     /// measurement (docs/gpu-design.md §런치 수).
@@ -486,9 +480,11 @@ impl Drop for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_WAIT_OPS, Graph, HostFlags, cu};
+    use super::{FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu};
+    use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
     use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
+    use std::panic::AssertUnwindSafe;
     use std::time::Duration;
 
     /// A captured wait on a flag holds the copy behind it until the host
@@ -596,5 +592,175 @@ mod tests {
                 .any(|n| n.kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET),
             "{nodes:?}"
         );
+    }
+
+    /// The step shape of the capture tests below: one [`ROWS`] × [`K`] Q4_K
+    /// weight against one f32 column.
+    const K: usize = 2048;
+    const ROWS: usize = 2048;
+
+    /// `rows` Q4_K rows of `n_sb` super-blocks as u32 words, from a
+    /// fixed-seed xorshift64: word 0 of each super-block carries `d` and
+    /// `dmin` as positive normal f16 (no NaN or Inf enters), and any pattern
+    /// of the other 35 words is a valid Q4_K block. `seed` must be nonzero.
+    fn q4k_words(rows: usize, n_sb: usize, seed: u64) -> Vec<u32> {
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let half = |r: u64| -> u32 { ((1 + (r % 9) as u32) << 10) | ((r >> 32) as u32 & 0x3ff) };
+        let mut out = Vec::with_capacity(rows * n_sb * 36);
+        for _ in 0..rows * n_sb {
+            let (d, dmin) = (half(next()), half(next()));
+            out.push(d | (dmin << 16));
+            for _ in 1..36 {
+                out.push((next() >> 32) as u32);
+            }
+        }
+        out
+    }
+
+    /// Resident weight, column, q8_1 scratch and output of a two-kernel
+    /// sequence: quantize the column, then the Q4_K gemv over it.
+    struct Step {
+        w: DeviceTensor<u32>,
+        x: DeviceBuffer<f32>,
+        act: Q8Act,
+        y: DeviceBuffer<f32>,
+    }
+
+    impl Step {
+        fn new(gpu: &Gpu) -> Step {
+            let s = gpu.stream();
+            let n_sb = K / 256;
+            let words = q4k_words(ROWS, n_sb, 0x9e37_79b9_7f4a_7c15);
+            let w = DeviceTensor::upload(s, &words, ROWS, 36 * n_sb).expect("the weight");
+            let x: Vec<f32> = (0..K).map(|i| (i * 37 % 97) as f32 / 48.0 - 1.0).collect();
+            let x = DeviceBuffer::from_host(s, &x).expect("the column");
+            let act = Q8Act::with_k(s, 1, K).expect("the q8_1 scratch");
+            let y = DeviceBuffer::<f32>::zeroed(s, ROWS).expect("the output");
+            s.synchronize()
+                .expect("the uploads land before any capture");
+            Step { w, x, act, y }
+        }
+
+        fn enqueue(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+            gpu.enqueue_quantize_q8_1(&self.x, &mut self.act)?;
+            gpu.enqueue_gemv_q4k(&self.w, &self.act, &mut self.y)
+        }
+
+        /// The sequence enqueued eagerly: what it wrote to `y`.
+        fn eager(&mut self, gpu: &Gpu) -> Vec<f32> {
+            self.enqueue(gpu).expect("the eager sequence");
+            gpu.stream().synchronize().expect("the eager run");
+            let y = self.y.to_host_vec(gpu.stream()).expect("readback");
+            assert!(
+                y.iter().all(|v| v.is_finite()) && y.iter().any(|&v| v != 0.0),
+                "the eager output is not finite and nonzero, so a replay that runs nothing \
+                 could match it"
+            );
+            y
+        }
+
+        /// `y` zeroed, the sequence captured and replayed once: the graph's
+        /// node count and what the replay wrote.
+        fn replayed(&mut self, gpu: &Gpu) -> (usize, Vec<f32>) {
+            let s = gpu.stream();
+            self.y.zero_async(s).expect("zero y");
+            s.synchronize().expect("the zero lands before the capture");
+            let graph = gpu.capture(|_| self.enqueue(gpu)).expect("the capture");
+            graph.launch(s).expect("a replay");
+            s.synchronize().expect("the replay");
+            (graph.node_count(), self.y.to_host_vec(s).expect("readback"))
+        }
+
+        /// A capture of the sequence records its two launches and replays
+        /// `eager` bit for bit; `after` names what ran on the stream before.
+        fn assert_replays(&mut self, gpu: &Gpu, eager: &[f32], after: &str) {
+            let (nodes, got) = self.replayed(gpu);
+            assert_eq!(
+                nodes, 2,
+                "after {after}: the capture recorded {nodes} nodes"
+            );
+            let off = eager
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                off, 0,
+                "after {after}: {off} of {ROWS} replayed outputs differ from the eager bits"
+            );
+        }
+    }
+
+    /// Eager = replay: the two-kernel sequence captured into a graph records
+    /// two nodes, and one replay over a zeroed output writes the bytes the
+    /// same sequence enqueued eagerly wrote — the same launches on the same
+    /// addresses.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_two_kernel_capture_replays_the_eager_bytes() {
+        let gpu = Gpu::new().expect("a Gpu on device 0");
+        let mut step = Step::new(&gpu);
+        let eager = step.eager(&gpu);
+        step.assert_replays(&gpu, &eager, "an eager run");
+    }
+
+    /// A capture body that returns `Err` or panics ends the capture it ran
+    /// in: the error or the panic comes back to the caller, the stream is not
+    /// left capturing, and the next capture on it records the two nodes and
+    /// replays the eager bytes. The test owns its `Gpu` and so its stream;
+    /// the context is the device's primary one, shared with every test of
+    /// this binary, and a hw test that runs after this one inherits it.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_capture_body_that_fails_or_panics_leaves_the_stream_capturable() {
+        let gpu = Gpu::new().expect("a Gpu on device 0");
+        let mut step = Step::new(&gpu);
+        let eager = step.eager(&gpu);
+
+        let failed = gpu.capture(|_| {
+            step.enqueue(&gpu)?;
+            Err(GpuError::state("graph test", "injected body failure"))
+        });
+        assert!(
+            matches!(
+                failed,
+                Err(GpuError::State {
+                    missing: "injected body failure",
+                    ..
+                })
+            ),
+            "the body's own error does not come back from the capture"
+        );
+        assert!(
+            !capturing(gpu.stream()).expect("the capture status"),
+            "the stream is still capturing after a body that returned Err"
+        );
+        step.assert_replays(&gpu, &eager, "a body that returned Err");
+
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gpu.capture(|_| -> Result<(), GpuError> {
+                step.enqueue(&gpu)?;
+                panic!("injected body panic")
+            })
+        }));
+        let payload = panicked
+            .err()
+            .expect("the body's panic does not reach the caller");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"injected body panic"),
+            "the caller's panic is not the body's"
+        );
+        assert!(
+            !capturing(gpu.stream()).expect("the capture status"),
+            "the stream is still capturing after a body that panicked"
+        );
+        step.assert_replays(&gpu, &eager, "a body that panicked");
     }
 }

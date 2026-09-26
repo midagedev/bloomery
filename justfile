@@ -62,19 +62,10 @@ check-comments:
 check-levers:
     ./tools/check-levers.sh
 
-# GPU 커널 빌드. 디바이스 크레이트는 반드시 cargo oxide로, 평범한 cargo build로는 안 된다.
-build-gpu:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv'
-
-# GPU P0 게이트(docs/gpu-design.md 꾸러미 P0): 라이브러리 gemv가 y_ref 1e-2 안이고, 즉시 실행과
-# 그래프 재생의 출력 바이트가 같아야 한다. 호스트 제출 비용도 찍으므로 release 호스트 빌드다
-# (dev 호스트는 P0가 재려는 그 숫자를 부풀린다). 3090만 쓴다(박스 env가 UUID를 핀).
-# GPU 게이트 바이너리는 박스의 게이트 락 하나에 줄을 선다(빌드는 병렬, 실행만 직렬). 게이트 하나가 모델을 12 GB
-# 올리므로 둘이 같은 카드에 겹치면 OOM이다 — 2026-09-22, 세 워크트리의 게이트가 3090에 동시에 올라 하나가
-# DriverError(2)로 죽었다. 시간 러너의 임대(/root/bloomery-cpu.lock)와는 다른 락이다: 게이트는 3090, 시간은 A6000.
-gate-gpu-p0:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-spike --features gpu --release && bash tools/gpu-gate.sh gpu-spike'
-
+# GPU 게이트 바이너리는 tools/gpu-gate.sh 아래에서 카드마다 하나인 게이트 락에 줄을 선다(빌드는 병렬, 실행만 직렬).
+# 게이트 하나가 모델을 12 GB 올리므로 둘이 같은 카드에 겹치면 OOM이다. 시간 러너의 임대(/root/bloomery-cpu.lock)와는
+# 다른 락이다.
+#
 # GPU 커널 게이트 P1–P3: 트랙마다 자기 바이너리 하나(crates/gpu-gates/src/bin/gate_pN.rs).
 # 참조는 bloomery_gpu_gates(gguf 디퀀트 + f64 내적), 밴드는 KERNEL_BAND = 1e-2. 정확성 실행이고 측정이 아니다.
 gate-gpu-p1:
@@ -291,22 +282,6 @@ stage-gpu-load-v41 *ARGS='--plan b':
 stage-gpu-load-v41-lock:
     BLOOMERY_CARD=both ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh gate_load_v41 --plan b --lock'
 
-build-cpu:
-    ./tools/box.sh 'cd crates/q3k-cpu && cargo build --release'
-
-# 빌드는 레시피 의존성이 한다(measure-decode와 같은 모양) — 러너가 재는 것은 방금 빌드된
-# 바이너리여야 하고, 빌드는 임대·유휴 대기 밖에서 끝나야 한다. build-ref-bench는 두 참조 하네스
-# ($BLOOMERY_DATA/bin/q3k_ref·q3k_cpu_ref)를 만든다: cpu-measure.sh는 그것을 부르면서
-# 빌드는 하지 않았다. 전부(x4 하네스와 덤프까지)가 필요하면 build-ref다 — 측정 앞에 그것을
-# 걸면 매 측정이 gate-qdot의 참조 덤프를 다시 쓰게 된다.
-# 측정. 러너가 조용한 기계 규약(GPU 유휴 대기 / 기계 전역 flock)과 증인 기록을 소유한다.
-# 측정값을 손으로 모으지 말고 이 두 타깃만 쓴다.
-measure-gpu: build-ref-bench build-gpu
-    ./tools/box.sh 'bash tools/ref/measure.sh'
-
-measure-cpu: build-ref-bench build-cpu
-    ./tools/box.sh 'bash tools/ref/cpu-measure.sh'
-
 # qdot 커널률(리드 전용): ik 자신의 x4 커널과 Rust qdot-rate를 같은 CPU 임대 안에서 한 코어에 고정해 번갈아 돈다.
 # ik 하네스는 build-ref가 짓는다. 인자는 라운드 수(기본 3).
 measure-qdot-rate *ARGS:
@@ -391,14 +366,7 @@ perf-decode *ARGS: build-decode
 # (*-ik-dot.txt 다섯과 q5_K의 to_float 행)가 그 산출물이다. q5_K는 V2-Lite에 없어서 V4.1 첫
 # 샤드를 읽는다. 나머지 다섯(*_rate)은 빌드만 한다: 실행은 측정이다.
 build-ref:
-    ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh && bash tools/ref/build-qdot-ref.sh'
-
-# measure-gpu·measure-cpu가 거는 좁은 쪽: 두 러너가 실제로 부르는 ggml 링크 하네스
-# ($BLOOMERY_DATA/bin/q3k_ref·q3k_cpu_ref)만 짓는다. x4 하네스를 짓고 **실행**하는
-# build-qdot-ref.sh는 여기 없다 — 그 실행이 gate-qdot의 참조 덤프를 덮어쓰므로, 측정 하나가
-# 다른 트랙의 게이트 입력을 갈아치우는 일이 된다.
-build-ref-bench:
-    ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
+    ./tools/box.sh 'bash tools/ref/build-qdot-ref.sh'
 
 # The V4.1 file's r8 sidecar (model::r8file): builds r8conv, then tools/ref/r8-sidecar.sh converts and
 # verifies it under the CPU lease — 155.7 GB written beside the source on /models. A tool run, not a
@@ -710,15 +678,15 @@ kvclear-probe *ARGS:
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 # 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드는 파일의 타입들(공개 Q3_K_M 파일이면
-# f32·q3_K·q4_K·q5_K·q6_K의 다섯)을 $BLOOMERY_DATA/ref-v41<세트 접미>에 — 공개 파일은 ref-v41_plain, 혼합 파일은 ref-v41. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
+# f32·q3_K·q4_K·q5_K·q6_K의 다섯)을 $BLOOMERY_DATA/ref-v41<세트 접미>에 — 공개 파일은 ref-v41_plain. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
 # 박스의 모델 파일에 없는 q2_K·iq2_xs·iq3_xxs·iq4_xs는 --synthetic이 ggml로 양자화한 행과 무작위 코드 행을
 # $BLOOMERY_DATA/ref-synth에 덤프하고, i-quant 코드북(iq_tables.rs)은 gen-iq-tables.py --check가 ik 헤더에서
 # 다시 뽑아 커밋된 파일과 바이트로 대조한다.
 gate-1-1:
-    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && T= && { [ -n "$S" ] || T="f32 bf16 q8_0"; } && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" $T && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
+    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments check-levers fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+gate: check-recipes check-rustflags check-arch check-comments check-levers fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (docs/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
@@ -745,8 +713,9 @@ gate-gpu-mcol:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && bash tools/gpu-gate.sh gate_mcol'
 
 # bloomery-gpu 라이브러리의 단위 시험. 디바이스 크레이트라 cargo oxide test로 돌고, tools/gate.sh --oxide가 상한과
-# 종료 코드를 쥔다. hw_ 시험 하나(graph.rs — 노드 분류가 캡처한 호스트 함수를 호스트 노드로 세는지)는 3090에
-# 컨텍스트와 빈 버퍼만 잡고 커널을 돌리지 않으므로, 게이트 락 없이 --include-ignored로 함께 돈다. just gate가 부른다.
+# 종료 코드를 쥔다. hw_ 시험(graph.rs의 캡처·재생·호스트 플래그·노드 분류, hybrid.rs의 경계)은 box env가 고정한
+# 3090에서 작은 커널과 몇 MB 버퍼만 쓰고, 게이트 락 없이 --include-ignored로 함께 돈다 — 옆에서 도는 3090 게이트와
+# 카드를 나눠 쓴다. just gate가 부른다.
 gate-gpu-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored'
 
@@ -924,14 +893,6 @@ gate-gpu-ds41-dspark-loop:
 # `--no-split`은 FAIL-first용 부분 실행, `--seams P`는 판정이 아니라 첫 어긋난 이음매를 찾는 로케이터.
 gate-gpu-ds41-prefill *ARGS='':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
-
-# The same gate under BLOOMERY_Q3K_SPLIT=2, the split-K lever arm: wo_b (K = 8192, the only V4.1 Q3_K row the rule
-# splits) runs q3k_gemv_split in every decode step and q3k_gemv_split_groups in every prompt batch, so this is the only
-# gate that runs those kernels. The gate compares the prompt with the steps of one process under one setting, so the
-# split is on both sides and the contract stays bit for bit; the split moves the bits against the unsplit arm, and
-# nothing here compares the two. ARGS as above.
-gate-gpu-ds41-prefill-q3ksplit *ARGS='':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_Q3K_SPLIT=2 bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
 
 # Text in, text out (3090, placement gate). Prompt rows 0 and 7: bloomery-chat --greedy on the row's text must
 # tokenize to the row's ids (llama-tokenize's) and its ids must be the start of generate_ds41 --tokens <those ids> -n 16

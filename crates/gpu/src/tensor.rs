@@ -213,8 +213,8 @@ const _: () = assert!(Q8ACT_MAX_SLOTS == model::moe::UNION_MAX_COLS * 6);
 /// The q3/q6 buffers are permuted per 2-super-block group and q4 per
 /// 4-super-block group; a partial final group (n_sb odd, or n_sb not a
 /// multiple of 4) leaves the group's tail slots allocated but never written
-/// or read — hence the ceil. At k = 2048 (n_sb = 8) these are the stage-0
-/// constants: 256 u64 / 512 / 512 / 64 / 16 per column.
+/// or read — hence the ceil. At k = 2048 (n_sb = 8) these are 256 u64 /
+/// 512 / 512 / 64 / 16 per column.
 pub struct Q8Act {
     pub(crate) q3: DeviceBuffer<u64>,
     pub(crate) q4: DeviceBuffer<u32>,
@@ -226,12 +226,6 @@ pub struct Q8Act {
 }
 
 impl Q8Act {
-    /// Allocate scratch for `m` (1..=8) columns of k = 2048 values — the
-    /// stage-0 geometry. Load-time only.
-    pub fn new(stream: &CudaStream, m: usize) -> Result<Self, GpuError> {
-        Q8Act::with_k(stream, m, 2048)
-    }
-
     /// Allocate scratch for `m` (1..=8) columns of `k` values. Load-time
     /// only.
     pub fn with_k(stream: &CudaStream, m: usize, k: usize) -> Result<Self, GpuError> {

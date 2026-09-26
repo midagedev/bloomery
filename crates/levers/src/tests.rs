@@ -306,6 +306,28 @@ fn flash_mma_is_refused() {
     fail_first(FLASH_MMA, "0", before, |_| String::new());
 }
 
+/// The split-K names were read at the first Q3_K gemv and took their arm;
+/// with the split kernels deleted a stale command line would run the
+/// one-warp gemv under the arm's label, so both are refused at `main`.
+#[test]
+fn q3k_split_is_refused() {
+    // `match std::env::var("BLOOMERY_Q3K_SPLIT") { … Ok(n @ (1 | 2 | 4 | 8)) => n, … }`
+    let before = |v: &str| -> Reading { Ok(format!("split width {v}")) };
+    fail_first(Q3K_SPLIT, "2", before, |_| String::new());
+    // `match std::env::var("BLOOMERY_Q3K_SPLIT_ITERS") { … Ok(n) if n >= 1 => n, … }`
+    let before = |v: &str| -> Reading { Ok(format!("split from {v} iterations")) };
+    fail_first(Q3K_SPLIT_ITERS, "8", before, |_| String::new());
+}
+
+/// `1` gave the replays' launches their own thread; the decode thread
+/// issues every launch now, so the name is refused at `main`.
+#[test]
+fn launch_thread_is_refused() {
+    // `match std::env::var("BLOOMERY_LAUNCH_THREAD") { … Ok(v) if v.trim() == "1" => Ok(true), … }`
+    let before = |_: &str| -> Reading { Ok("the launch thread".to_string()) };
+    fail_first(LAUNCH_THREAD, "1", before, |_| String::new());
+}
+
 /// The levers that refused a value by name before the registry still do,
 /// naming the lever: one test each.
 macro_rules! refuses_by_name {

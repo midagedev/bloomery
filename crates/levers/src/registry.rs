@@ -22,11 +22,13 @@ pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
 pub const CARD_EXPERTS: &str = "BLOOMERY_CARD_EXPERTS";
 pub const STEP_PAIR: &str = "BLOOMERY_STEP_PAIR";
 pub const FLASH_MMA: &str = "BLOOMERY_FLASH_MMA";
+pub const Q3K_SPLIT: &str = "BLOOMERY_Q3K_SPLIT";
+pub const Q3K_SPLIT_ITERS: &str = "BLOOMERY_Q3K_SPLIT_ITERS";
+pub const LAUNCH_THREAD: &str = "BLOOMERY_LAUNCH_THREAD";
 
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
-const DECISION_4: &str = "decision 4";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
@@ -402,38 +404,6 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: "BLOOMERY_Q3K_SPLIT",
-        class: Class::A,
-        kind: Kind::Words(&["1", "2", "4", "8"]),
-        default: Unset::Is("1"),
-        doc: "GPU Q3_K gemv: the split-K width of a row whose walk has at least \
-              `BLOOMERY_Q3K_SPLIT_ITERS` two-super-block iterations the width divides (on \
-              V4.1, `wo_b` alone); 1 is the plain kernel.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: "crates/gpu/src/lib.rs",
-                round: DECISION_4,
-            }],
-        },
-    },
-    LeverSpec {
-        name: "BLOOMERY_Q3K_SPLIT_ITERS",
-        class: Class::A,
-        kind: Kind::Count {
-            min: 1,
-            max: u64::MAX,
-            trim: false,
-        },
-        default: Unset::Is("16"),
-        doc: "GPU Q3_K gemv: the walk length from which `BLOOMERY_Q3K_SPLIT` splits a row.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: "crates/gpu/src/lib.rs",
-                round: DECISION_4,
-            }],
-        },
-    },
-    LeverSpec {
         name: "BLOOMERY_HYBRID_NL",
         class: Class::C,
         kind: Kind::Count {
@@ -529,21 +499,6 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: "BLOOMERY_LAUNCH_THREAD",
-        class: Class::A,
-        kind: Kind::Flag,
-        default: Unset::Is("0"),
-        doc: "`GpuModel`: `1` runs each replay's `cuGraphLaunch` on a launcher thread, the \
-              SMT sibling of a pinned opener's cpu, while the decode thread goes straight \
-              into the first host service's wait.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: "crates/gpu/src/model/launcher.rs",
-                round: DECISION_4,
-            }],
-        },
-    },
-    LeverSpec {
         name: "BLOOMERY_QWEN3_UBATCH",
         class: Class::C,
         kind: Kind::Count {
@@ -624,6 +579,43 @@ pub static REGISTRY: &[LeverSpec] = &[
                 file: "crates/gpu/src/flash.rs",
                 round: V2FENCE,
             }],
+        },
+    },
+    LeverSpec {
+        name: Q3K_SPLIT,
+        class: Class::A,
+        kind: Kind::Words(&["1", "2", "4", "8"]),
+        default: Unset::Means("the only path"),
+        doc: "Was the GPU Q3_K gemv's split-K width.",
+        site: Site::Retired {
+            why: "a Q3_K row runs the one-warp gemv only",
+            left: &[],
+        },
+    },
+    LeverSpec {
+        name: Q3K_SPLIT_ITERS,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: u64::MAX,
+            trim: false,
+        },
+        default: Unset::Means("the only path"),
+        doc: "Was the walk length from which the GPU Q3_K gemv split a row.",
+        site: Site::Retired {
+            why: "a Q3_K row runs the one-warp gemv only",
+            left: &[],
+        },
+    },
+    LeverSpec {
+        name: LAUNCH_THREAD,
+        class: Class::A,
+        kind: Kind::Flag,
+        default: Unset::Means("the only path"),
+        doc: "Was `GpuModel`'s launch thread for each replay's `cuGraphLaunch`.",
+        site: Site::Retired {
+            why: "the decode thread issues every replay's launch",
+            left: &[],
         },
     },
     LeverSpec {

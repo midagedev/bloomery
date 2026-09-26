@@ -28,7 +28,7 @@ cargo oxide doctor
 
 ## The two builds
 
-**The GPU build** needs the CUDA codegen backend. Never build a crate with device code (`crates/gpu`, `crates/gpu-deepseek41`, `crates/q3k-gemv`, or `bloomery-gpu-gates` with `--features gpu` or `deepseek41`) with plain `cargo build`. The result is not usable. Use `cargo oxide`:
+**The GPU build** needs the CUDA codegen backend. Never build a crate with device code (`crates/gpu`, `crates/gpu-deepseek41`, `crates/gpu-vision`, or `bloomery-gpu-gates` with `--features gpu` or `deepseek41`) with plain `cargo build`. The result is not usable. Use `cargo oxide`:
 
 ```sh
 cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41

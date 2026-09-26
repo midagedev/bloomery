@@ -48,7 +48,7 @@
 #            (Prefill below). Refused when the profile's flags already name -ub or -b.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
-#            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_LAUNCH_THREAD=1`.
+#            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`.
 #            An arm with BLOOMERY_DRAFT=dspark also sees the other card, where the draft runs, and
 #            gets the profile's DSPARK_MODEL unless it names one (timing-card.sh dspark_env).
 #   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
@@ -80,7 +80,7 @@
 # each with the host's share of the probability), the shape is not: ours joins the host once per
 # layer, ik's card layers never wait on the host and its CPU layers never use the card's share.
 # Mainline places by the same rule (--n-cpu-moe), so an lcpp row has ik's shape; the profile sizes
-# both counts per file from MODEL (IK_NCMOE and LCPP_NCMOE, one arithmetic — the two engines place
+# both counts for MODEL (IK_NCMOE and LCPP_NCMOE, one arithmetic — the two engines place
 # the same tensors on the card), so the two references hold the same layers on the card.
 #
 # Paging. The two engines' host expert sets differ (ours: experts n_l.. of every layer, ik: all

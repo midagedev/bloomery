@@ -111,9 +111,6 @@ generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
 generate_ds41   q3k_gemv_heads_pair                     0          0
 generate_ds41   q3k_gemv_sel                            0          0
-generate_ds41   q3k_gemv_split                          0          0
-generate_ds41   q3k_gemv_split_groups                   0          0
-generate_ds41   q3k_gemv_split_mcol                     0          0
 generate_ds41   q3k_quantize_q8_1                       0          0
 generate_ds41   q4k_gemv                                0          0
 generate_ds41   q4k_gemv_mcol                           0          0
@@ -147,7 +144,6 @@ generate_ds41   rope                                    0          0
 generate_ds41   router_topk                             0          0
 generate_ds41   swiglu                                  0          0
 generate_ds41   touch                                   0          0
-generate_ds41   two_phase                               0          0
 generate_ds41   weighted_sum                            0          0
 
 # gate_e2e (--features gpu)
@@ -198,9 +194,6 @@ gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0
 gate_e2e        q3k_gemv_heads_pair                     0          0
 gate_e2e        q3k_gemv_sel                            0          0
-gate_e2e        q3k_gemv_split                          0          0
-gate_e2e        q3k_gemv_split_groups                   0          0
-gate_e2e        q3k_gemv_split_mcol                     0          0
 gate_e2e        q3k_quantize_q8_1                       0          0
 gate_e2e        q4k_gemv                                0          0
 gate_e2e        q4k_gemv_mcol                           0          0
@@ -234,5 +227,4 @@ gate_e2e        rope                                    0          0
 gate_e2e        router_topk                             0          0
 gate_e2e        swiglu                                  0          0
 gate_e2e        touch                                   0          0
-gate_e2e        two_phase                               0          0
 gate_e2e        weighted_sum                            0          0

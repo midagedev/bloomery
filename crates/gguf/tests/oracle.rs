@@ -1,10 +1,9 @@
 //! Oracle gate for stage 1, round 1-1. The tests are `hw_` (model files +
 //! box) and `#[ignore]`d: `cargo nextest` is not installed on the box
 //! (checked 2026-09-19), so `just gate-1-1` runs them through `tools/box.sh`
-//! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref` and the
-//! f32, bf16 and q8_0 tensors of V4.1's first shard into
-//! `$BLOOMERY_DATA/ref-v41`, and its synthetic q2_K and i-quant rows into
-//! `$BLOOMERY_DATA/ref-synth`.
+//! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref`, every
+//! type of V4.1's first shard into `$BLOOMERY_DATA/ref-v41_plain`, and its
+//! synthetic q2_K and i-quant rows into `$BLOOMERY_DATA/ref-synth`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -219,12 +218,11 @@ fn read_meta(dir: &Path, tname: &str) -> (String, usize, usize) {
 /// V4.1's first shard opens strictly, and each type it holds that this engine
 /// dequantizes on the host side reproduces ggml's `to_float` bit for bit:
 /// every one of these conversions is exact, so any difference is a bug, not
-/// rounding. The mixed file's are f32, bf16 and q8_0; the public file's are
-/// every type of its first shard (its engram and embedding rows, its gains
-/// and scales are all decoded on the host), from the dump
-/// `ref-v41` + [`gguf::v41::set_suffix_of`]. Each requested type must be in
-/// the dump (a type the dump lacks fails here instead of passing with nothing
-/// compared), with ggml's tensor count for it equal to the loader's.
+/// rounding. Every type of the shard is checked (the public file's engram
+/// and embedding rows, its gains and scales are all decoded on the host),
+/// from the dump `ref-v41` + [`gguf::v41::set_suffix_of`]. Each type must be
+/// in the dump (a type the dump lacks fails here instead of passing with
+/// nothing compared), with ggml's tensor count for it equal to the loader's.
 #[test]
 #[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-v41[_plain]"]
 fn hw_dequant_matches_ggml_v41() {
@@ -250,12 +248,7 @@ fn hw_dequant_matches_ggml_v41() {
         })
         .collect();
 
-    let want: Vec<&str> = if gguf::v41::set_suffix_of(&path).is_empty() {
-        vec!["f32", "bf16", "q8_0"]
-    } else {
-        counts.keys().copied().collect()
-    };
-    for tname in want {
+    for &tname in counts.keys() {
         let &(type_num, ggml_count) = oracle
             .get(tname)
             .unwrap_or_else(|| panic!("{tname} is not in {set}/manifest.txt"));

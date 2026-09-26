@@ -441,8 +441,6 @@ pub static LOAD: Kind = Kind {
         key("place", Word, ""),
         key("pin_main", Word, ""),
         key("pinned", Bool, ""),
-        key("launch_thread", Word, ""),
-        opt("launch_cpu", Word, ""),
         key("prefill", Word, ""),
         key("ced", Text, ""),
         key("group", U64, "batches"),
@@ -845,7 +843,7 @@ pub static TOKENS: Kind = Kind {
 pub static STAT_STEP: Kind = Kind {
     name: "stat_step",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, launch costs, page faults, free device bytes and engram rows.",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows.",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -869,10 +867,6 @@ pub static STAT_STEP: Kind = Kind {
         key("eng_wait_us", F64(1), "us"),
         key("eng_helper_us", F64(1), "us"),
         key("eng_classify_us", F64(1), "us"),
-        key("go_early_first", U64, ""),
-        key("launch_us", F64(1), "us"),
-        key("first_serve_lag_us", F64(1), "us"),
-        key("launch_wake_us", F64(1), "us"),
     ],
 };
 
@@ -880,7 +874,7 @@ pub static STAT_STEP: Kind = Kind {
 pub static STAT_SUMMARY: Kind = Kind {
     name: "stat_summary",
     head: "stat summary",
-    doc: "BLOOMERY_STEP_STATS: the kept steps' host-tier, fault, device-memory, engram and launch statistics.",
+    doc: "BLOOMERY_STEP_STATS: the kept steps' host-tier, fault, device-memory and engram statistics.",
     parts: &[
         key("steps", U64, ""),
         key("leg_us_mean", F64(1), "us"),
@@ -901,10 +895,6 @@ pub static STAT_SUMMARY: Kind = Kind {
         key("eng_wait_us_max", F64(1), "us"),
         key("eng_helper_us_mean", F64(1), "us"),
         key("eng_classify_us_mean", F64(1), "us"),
-        key("go_early_first_mean", F64(3), ""),
-        key("launch_us_mean", F64(1), "us"),
-        key("first_serve_lag_us_mean", F64(1), "us"),
-        key("launch_wake_us_mean", F64(1), "us"),
     ],
 };
 

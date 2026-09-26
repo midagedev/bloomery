@@ -6,15 +6,20 @@ The plan lives in `docs/plan.md`. This file is the working contract.
 
 ## Never
 
-- **Never build a device crate with plain `cargo`.** `q3k-gemv` contains
-  `#[cuda_module]`/`#[kernel]` code that needs the CUDA codegen backend.
-  `cargo build -p q3k-gemv` produces nothing usable. Use `cargo oxide`.
-- **Never run a gate on the Mac.** The Mac is arm64 and an editor; `q3k-cpu`
-  uses `std::arch::x86_64` and Linux affinity calls and does not compile there.
+- **Never build a device crate with plain `cargo`.** `crates/gpu` (and every
+  crate that links it: `gpu-deepseek41`, `gpu-vision`, `gpu-gates` with its
+  `gpu` feature) contains `#[cuda_module]`/`#[kernel]` code that needs the CUDA
+  codegen backend; a plain `cargo build` of it produces nothing usable. Use
+  `cargo oxide` (the recipes do).
+- **Never run a gate on the Mac.** The Mac is arm64 and an editor; the CPU
+  kernels (`qdot`) use `std::arch::x86_64` and the worker pool (`threads`)
+  Linux affinity calls, neither of which the Mac runs.
   Every command below goes through `tools/box.sh`, which rsyncs the tree to the
   workstation and runs there. That rsync is `--delete`: never edit on the box.
-- **Never hand-run a benchmark.** Measurements belong to `tools/ref/measure.sh`
-  (GPU) and `tools/ref/cpu-measure.sh` (CPU). They own the quiet-machine
+- **Never hand-run a benchmark.** Measurements belong to the lease runners in
+  `tools/ref/` (`decode-measure.sh`, `ab-decode.sh`, `depth-gpu.sh`,
+  `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes; each takes
+  the timing lease through `lease_take`). They own the quiet-machine
   protocol: a machine-wide lock, GPU-idle wait, and witness blocks around every
   timed region. A number produced outside them is not admissible. While the
   lock is held, `netdata-lease-gate.service` (source in rig-log `configs/`)
@@ -81,12 +86,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # box never sees it — to force a rebuild of UNCHANGED
                       # source, touch on the box (`box.sh 'touch <file> && …'`).
     just fmt          # cargo fmt --all
-    just build-gpu    # cargo oxide build --arch sm_86 -- -p q3k-gemv
-    just build-cpu    # release build with -C target-cpu=znver3
     just build-ref    # the C++ reference harnesses that link ggml
     just deny         # cargo deny check; fails if the cuda-oxide pin ever floats
-    just measure-gpu  # quiet-machine GPU measurement, witnesses included
-    just measure-cpu  # same for the CPU tier, serialized by a file lock
     just affected [BASE|A..B]  # the gate-* recipes a change touches, from the crate graph,
                       # each target's module tree (a module under `#[cfg(test)]` belongs to
                       # its own target's test build, not to the lib its dependents link), the
@@ -106,7 +107,7 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # e2e and the changed bins' own gates) plus the static checks; the
                       # batch's list names the gates it leaves out and the ptx-scan line that
                       # lets it. A kernel, a launch or a byte formula moved runs the whole list
-    just gate         # check-recipes + fmt-check + lint + both builds + gate-1-1
+    just gate         # the static checks, lint, gate-1-1 and the fast library gates
     just smoke        # the smoke tier: the static checks, gate-gpu-ds41-step, gate-gpu-ds41-prefill at
                       # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
                       # run for a round's loop and the lead's first look, never a landing batch.
@@ -357,8 +358,6 @@ first suspect is a hung gate on the box, not the agent.
                            (ik node dumps, DSpark draft sets, greedy files, KLD bases, the vision
                            set), each set refused by name unless it was dumped from the file the
                            tree runs; the family table per architecture under src/arch
-    crates/q3k-gemv/       stage 0: Q3_K gemv, CUDA-Rust device code (cargo oxide only)
-    crates/q3k-cpu/        stage 0: Q3_K x Q8_K gemv, AVX2 intrinsics, pinned threads
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile;
                                excluded from the workspace on purpose
     tools/ref/             C++ harnesses linking ggml: ground truth and baseline
@@ -604,8 +603,8 @@ are dummy mains and their bodies are never linted). The ratchet counter is
 appears in (an agent's unique-count will read lower — same direction, different
 ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
 `gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
-and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast), 169 through the 09-23/24 waves, **168 on main `76c9ad8`** (q8dead, 2026-09-24), 167 through the 09-25 waves, **144 on main after `fixup5`** (2026-09-25 night: the model test harness split into `tests/common/{model_path,manifest,prompt,oracle,asserts,exact}` removed the per-test dead-code warnings), **133 on main `5cd4859`** (2026-09-27, rebuild wave 1: the museum bins, settled arms and dead entries deleted). Of the 175, 58 are
-`undocumented_unsafe_blocks` and all 58 are in the stage-0 crates.
+and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast), 169 through the 09-23/24 waves, **168 on main `76c9ad8`** (q8dead, 2026-09-24), 167 through the 09-25 waves, **144 on main after `fixup5`** (2026-09-25 night: the model test harness split into `tests/common/{model_path,manifest,prompt,oracle,asserts,exact}` removed the per-test dead-code warnings), **133 on main `5cd4859`** (2026-09-27, rebuild wave 1: the museum bins, settled arms and dead entries deleted), **48 on main after `del2`** (2026-09-27, rebuild wave 2: stage 0 deleted — q3k-gemv's 60 and q3k-cpu's 21 warnings and their four summary lines). Of the 175, 58 are
+`undocumented_unsafe_blocks` and all 58 are in the stage-0 crates; since del2 the tree has none (0 of 48).
 `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` — six read
 `*-ik-dot.txt`, one reads q5_K's `q5k-v41-dequant.raw`/`.meta` (q5_K comes from the V4.1
 first shard: V2-Lite has no Q5_K tensor); `just build-ref` writes them
@@ -640,8 +639,6 @@ intrinsics is either `#[inline(always)]` (it inherits the caller's features)
 or carries the attribute itself; with neither it runs tens of times slower in
 any build without the config — on the box the config now hides that mistake.
 
-Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
-them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
 Runtime levers are the rows of `crates/levers/src/registry.rs`, and nothing
 else documents them. A binary parses the `parsed` rows once, first thing in
 `main` (`bloomery_levers::at_main`), refuses by name a value its kind does not

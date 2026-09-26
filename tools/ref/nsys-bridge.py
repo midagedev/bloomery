@@ -17,8 +17,7 @@ stream memory operations, which the trace records as nothing. So, per replay:
   launch             the `cuGraphLaunch` call's own span, where its first kernel started relative to
                      the call, when the call returned relative to that kernel, and relative to the
                      end of handoff 0 (positive: layer 0's go was issued before the host could
-                     serve it, which it does only after the call returns — unless the launch runs
-                     on its own thread, whose id the `tid` column shows).
+                     serve it, which it does only after the call returns).
   idle               the last kernel end -> the next replay's first kernel start, and -> the next
                      launch call's start (the host turnaround between steps).
 
@@ -26,7 +25,7 @@ stream memory operations, which the trace records as nothing. So, per replay:
 boundary kernels; the names the trace holds are printed so a rename shows. --replay R prints that
 replay's every segment and bridge. The per-join table is over the replays from --from (default: the
 first replay with the modal join count) to the last. µs are the tracer's; the tracer stretches the
-launch call itself (see ds41join's launch_us for the untraced value). Read-only.
+launch call itself. Read-only.
 """
 import argparse
 import sqlite3
