@@ -1,0 +1,39 @@
+# Round q3gemmc changed gemm_q4k's step as a flow, bit for bit: F2 hoists the staging's column
+# addresses out of the step (full-tile warp-step 630/682 -> 599/650 instructions, compile time), F1
+# cuts the step to one barrier and issues the next step's copies as one run after n-tile 1 of a full
+# tile, right after the barrier in a partial one (BAR 2 -> 1 a step; ptxas padding brings the
+# full-tile step to 608/670, still under main's 630/682). The q3gemmsrc page (sitting 16, ...-082817,
+# rig-log 09-26#q3ncu-s16) split main's full-tile warp-step into staging 765, bar1 357, compute 3,473
+# and bar2 304 warp-cycles (tools/ref/srcpage.py reproduces them).
+# Terms after the round [derived]: the staging phase leaves the serial path and its ~31 instructions
+# cost +60..+190 inside compute (2..6 cycles each); one barrier of 300..450 replaces bar1 + bar2
+# (bar2's 304 plus up to +150 of the skew bar1 carried); ptxas padding +30..+90; compute otherwise
+# unchanged. Full-tile warp-step 4,899 -> 3,863..4,203 (-14.2..-21.1 %); the partial-tile loop has
+# the same structure, the two loops are 89.9 % of the samples, so the launch 1.746 M x (0.810..0.872)
+# = 1.41..1.53 M cycles. q3gemmsrc's own band for F1 + F2 was 1.43..1.59 M. Not in the terms: copy
+# latency the step no longer covers. A full tile issues its copies with 6 of 8 n-tiles left (about
+# 6 x 434 warp-cycles, the page's compute / 8 [derived]); a partial tile issues them before its first.
+kind: profile
+question: does one barrier a step, with the next step's copies issued inside the compute and no
+  per-step column address arithmetic, take gemm_q4k's T = 4096 launch off the barrier and staging
+  terms, or does the time move into MIO inside the compute?
+term: Elapsed Cycles (sm__cycles_elapsed) of one gemm_q4k launch of gate_p8's gemm_q4k_moe_t4096
+  arm, the median of two profiled launches, A6000, the gemm form's base clock
+unit: M cycles
+predict: 1.41..1.53
+condition: BLOOMERY_NCU_SOURCE=1 BLOOMERY_NCU_COUNT=2 just ncu-gpu-gemm under the lease on the
+  q3gemmc tree (gemm.rs as the round left it; the build log shows Compiling bloomery-gpu), the same
+  arm and skip as sitting 16's base page; the source page is kept and read with tools/ref/srcpage.py
+  (--bars-per-step 1) for the phase split of both loops, whose DEPBAR.LE SB0, 0x0 rows show any copy
+  latency left uncovered (main's DEPBAR row: 13 samples); ncu prints two launches' elapsed cycles
+  within 1 % of each other, else the run is void
+decide-in: F1 + F2 did what the terms say: take the pp A/B card for q3gemmc (pp512 and pp4096 in
+  one lease against main's binary) and land by it; read the new page's phase table before opening
+  F3 (the s8/d8 gather) or F4 (the sector alignment)
+decide-below: faster than the terms: land the same way, and name from srcpage.py's phases which
+  term was over-counted before sizing F3/F4
+decide-above: read srcpage.py's phases on the new page: if the barrier fell but mio and lg rose in
+  the compute by as much (q3gemmsrc's refutation), the wall is LSU/MIO throughput and F3/F4 come
+  next, not more flow; if the DEPBAR rows carry the excess, the copies land late and the full
+  tile's STAGE_NT moves earlier; if the barrier did not fall, the skew is the compute's own and F1
+  is reverted to F2 alone before any A/B
