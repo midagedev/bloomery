@@ -30,6 +30,19 @@ use crate::placement::PlacementError;
 /// ik's `LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` (llama-hparams.h:18).
 const IK_SQRT_SOFTPLUS: u64 = 4;
 
+/// The V4.1 reference's two-level candidate mask (`select_candidate_blocks`,
+/// model.py:583-610), which the HF `config.json` carries (:125-127) and the GGUF
+/// does not: every layer after the source layer takes its index top-k among
+/// the [`CANDIDATE_TOPK_BLOCKS`] blocks of [`CANDIDATE_BLOCK_SIZE`] compressed
+/// rows that the source layer's index scores rank first. This engine does not
+/// build it; [`Hparams::candidate_free_positions`] bounds where that changes
+/// nothing.
+pub const CANDIDATE_SOURCE_LAYER: usize = 20;
+/// Blocks the candidate mask keeps ([`CANDIDATE_SOURCE_LAYER`]).
+pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
+/// Compressed rows per candidate block ([`CANDIDATE_SOURCE_LAYER`]).
+pub const CANDIDATE_BLOCK_SIZE: usize = 8;
+
 /// Which model of this module a file holds, by its `general.architecture`
 /// ([`crate::arch::deepseek41_model`] reads it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,6 +511,35 @@ impl Hparams {
     pub fn with_indexer_top_k(mut self, top_k: usize) -> Hparams {
         self.indexer.top_k = top_k;
         self
+    }
+
+    /// The positions at which an index top-k over every compressed row is
+    /// the reference's. V4.1's candidate mask keeps every block while the
+    /// source layer's stream holds at most `CANDIDATE_TOPK_BLOCKS ·
+    /// CANDIDATE_BLOCK_SIZE` rows, and a query at position `p` reaches
+    /// `(p + 1) / ratio` of them (model.py:562-567): so the first `blocks ·
+    /// size · ratio` positions, exact at ratio 1 (the V4.1 file's) and a
+    /// bound below the exact end above it. `usize::MAX` for V4, which has no
+    /// mask; 0 for a V4.1 file without that layer or whose layer compresses
+    /// nothing, where the mask's reach is unknown.
+    pub fn candidate_free_positions(&self) -> usize {
+        candidate_free_positions(
+            self.model,
+            self.layers
+                .get(CANDIDATE_SOURCE_LAYER)
+                .map(LayerKind::ratio),
+        )
+    }
+}
+
+/// [`Hparams::candidate_free_positions`] for `model` whose candidate source
+/// layer compresses at `source_ratio` (`None`: the file has no such layer).
+fn candidate_free_positions(model: Model, source_ratio: Option<u32>) -> usize {
+    match model {
+        Model::Deepseek4 => usize::MAX,
+        Model::Deepseek41 => {
+            CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE * source_ratio.unwrap_or(0) as usize
+        }
     }
 }
 
@@ -1506,6 +1548,24 @@ mod tests {
             e.to_string()
                 .contains("blk.8.attn_compressor_ape.weight: is not a deepseek41 tensor"),
             "{e}"
+        );
+    }
+
+    /// V4.1's served table computes the reference for exactly the first
+    /// 16,384 positions (its source layer 20 compresses at ratio 1: 2,048
+    /// blocks of 8 rows); a ratio scales the bound; a missing or uncompressed
+    /// source layer computes none; V4 has no mask.
+    #[test]
+    fn candidate_mask_bounds_the_positions() {
+        let (_, ratios) = served();
+        let source = ratios.get(CANDIDATE_SOURCE_LAYER).copied();
+        assert_eq!(candidate_free_positions(Model::Deepseek41, source), 16_384);
+        assert_eq!(candidate_free_positions(Model::Deepseek41, Some(2)), 32_768);
+        assert_eq!(candidate_free_positions(Model::Deepseek41, Some(0)), 0);
+        assert_eq!(candidate_free_positions(Model::Deepseek41, None), 0);
+        assert_eq!(
+            candidate_free_positions(Model::Deepseek4, source),
+            usize::MAX
         );
     }
 }

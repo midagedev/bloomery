@@ -986,8 +986,9 @@ impl Body {
     /// `starts`, whose reader keeps the features of its last `window`
     /// positions when `window` is given: its needs ([`super::ced`]), kept for
     /// the batches and [`Body::prefill_need`]. Its hole is recorded when its
-    /// first group has planned ([`Body::plan_group`]). Refused with a window
-    /// and no tap, and on a card that does not run every layer.
+    /// first group has planned ([`Body::plan_group`]). Refused past the
+    /// positions the body computes the reference at ([`Body::check_defined`]),
+    /// with a window and no tap, and on a card that does not run every layer.
     fn begin_call(
         &mut self,
         first: usize,
@@ -995,6 +996,7 @@ impl Body {
         starts: &[usize],
         window: Option<usize>,
     ) -> Result<(), GpuError> {
+        self.check_defined(WHAT, end)?;
         if self.layers.start != 0 || self.layers.end != self.hp.n_layer {
             return Err(GpuError::State {
                 what: WHAT,
