@@ -1,0 +1,7 @@
+# Sitting 10, the DSpark draft oracle set code64_n32_w3, re-taken on the public Q3_K_M file:
+# `just dump-ref-draft` (dump_draft from /home/user/ik-dspark-draft, the 3090, host experts on the CPU).
+# Minutes [derived, round sit10plan]: the mixed-file run took 39 s for the recipe (18 s of dump).
+kind: exclusive
+reason: dump_draft runs the target's experts on 32 CPU threads and the draft on the 3090; beside a timed
+  run it would take that run's cores; why now: sitting 10 (approved 2026-09-25) re-takes the mixed-file sets
+minutes: 0.5..2

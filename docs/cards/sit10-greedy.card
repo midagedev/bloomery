@@ -1,0 +1,8 @@
+# Sitting 10, ik's greedy continuations of prompts.tsv rows 7 (the long gate's --free reference) and 0,
+# re-taken on the public Q3_K_M file: `just ik-greedy-ds41 7` and `just ik-greedy-ds41 0`, one hold each.
+# Minutes [derived, round sit10plan]: 22 s fixed + 0.107 s per decode (68 for row 7) with the experts warm
+# from the KLD bases; up to about 2 min if they are cold.
+kind: exclusive
+reason: argmax_ref decodes on 32 CPU threads over the expert set; beside a timed run it would take that
+  run's cores; why now: sitting 10 (approved 2026-09-25) re-takes the mixed-file sets
+minutes: 0.5..2

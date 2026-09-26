@@ -1,0 +1,9 @@
+# Sitting 10, the two KLD bases of `gate-ds41-kld`, re-taken on the public Q3_K_M file (the old ones came
+# from the mixed-quant file): `just ik-ppl /home/user/ik-idxkey kldbase-c2048x4 --kld-base` and
+# `just ik-ppl /home/user/ik-idxkey kldbase-c512x16 --ctx 512 --chunks 16 --kld-base`, one hold each.
+# Minutes [derived, round sit10plan]: c2048x4 2.3-4.8 (the mixed-file run's fixed cost and compute plus
+# today's cold expert bytes at 0.145 s/GB, up to every expert cold), c512x16 1.9-2.2 after it.
+kind: exclusive
+reason: ik's llama-perplexity runs 32 CPU threads over the whole expert set; beside a timed run it would take
+  that run's cores and page cache; why now: sitting 10 (approved 2026-09-25) re-takes the mixed-file sets
+minutes: 2..5
