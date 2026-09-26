@@ -1,0 +1,30 @@
+# Round cardtile (T), the landing A/B: the grouped shadow as (card expert, row tile, 8-column tile) items
+# against today's per-slot walk, one binary, BLOOMERY_CARD_EXPERTS=tile against =expert. Flow model
+# (tools/flow, round flowb1): on the prose prompt the B1 shadow is 45.3 ms a layer-batch measured (per slot
+# 45.6 [derived] with the prompt's routing) against a 36.4 ms union, and after T 17.8 [15.5-19.9] [derived],
+# under the union on every layer; the wall becomes route window + union + prologue. B1+T 221.5 [213.4-228.3]
+# over B1 183.8 at the lcg clock, 175.8 at the measured card-bound clock (171.6 measured, 09-26#b1-pp-ab).
+# lcg moves 0 at both P (its shadow is already under the union), so the lcg arm is not the term.
+kind: ab
+question: does cardtile take the grouped shadow off the prose prompt's P = 512 path, as the flow
+  model's route + union wall says?
+term: pp tok/s @ P = 512, prose prompt (corpus-prose.ids, the first 512), hot list 384, A6000, plan
+  (a), CED on - (tile - expert) / expert, paired by round
+unit: %
+predict: +17.1..+25.2
+rounds: 2
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55
+  and 1.1 %; the larger
+condition: the cardtile binary, both arms in one lease through its lever, the prose prompt fed as in
+  the calibration (time-gate.sh generate_ds41 --tokens from corpus-prose.ids) by a runner that
+  alternates the two lever arms (depth-gpu-ds41's lever arms feed the lcg prompt, where T predicts 0;
+  a prose-prompt arm is a small runner change before this lease), the order rotated each round, BLOOMERY_STEP_STATS=1 on both so card_in, card_out and wait print per arm; no row carries
+  [cpu-busy] or [other-busy]. The same arms at P = 4096 (4,096 prose ids, if corpus-prose.ids holds
+  them) are read against the band +15.8..+22.8
+decide-in: keep T and build prefillgroup (G): after T the prose P = 4096 card (40 ms a layer-batch)
+  and host (42) are balanced and only the wrap overlaps them
+decide-below: read card_in: above ~22 ms the tile items run below e 0.45 (registers, occupancy) -
+  ptxas -v and ncu the GT kernel and split gate and up before G; at or under 20 ms the route kept the
+  card-bound clock - sample the SM clock through one prompt
+decide-above: the route ran faster than the card-bound clock allows (card duty fell to ~0.66): write
+  the tile arm's card_out into clk_cardbound's duty curve, then G
