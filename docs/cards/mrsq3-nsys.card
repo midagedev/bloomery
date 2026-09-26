@@ -1,0 +1,19 @@
+# The one term the mrsq3 decomposition leaves open (docs/research/mrsq3-design-report.md section 3):
+# mistral.rs's MMQ sum in a P = 4096 Qwen3 prompt forward. Structure model 260-363 ms, the wall
+# minus the other terms 312-363 ms [derived]; the band is their union trimmed to the wall.
+kind: profile
+question: which terms of mistral.rs's Qwen3-30B-A3B Q4_K_M prompt forward are shorter than ours at
+  P = 4096, and is the MMQ sum the term the paper decomposition leaves open?
+term: the sum of mul_mat_q* and mul_mat_q_stream_k_fixup* kernel time (nsys cuda_gpu_kern_sum) in
+  one P = 4096 prompt forward of mistral.rs d5ae0f18f built with cuda flash-attn, A6000 300 W
+unit: ms
+predict: 300..370
+condition: one lease through tools/ref/lease-hold.sh; the A6000 pinned; the binary of 2026-09-26
+  07:46 KST (sha256 8da64b84d5e5); MISTRALRS_BENCH_CUDA_PROFILER_RANGE=1 limits capture to the
+  measured iteration; the trace has 48 flash_fwd_kernel launches and no P x P softmax, else the run
+  is void; P = 512 in the same lease splits the MMQ terms
+decide-in: write the per-term table to rig-log; the ladder order stays q3gemmb, FA, H1 and Q
+decide-below: FA2 or the glue carries more than the byte and FLOP model; read those rows, and if
+  flash_fwd_kernel is past 90 ms put FA behind the tail levers
+decide-above: FA2 and the glue sum under 145 ms: move FA, FS and FB ahead of the tail levers and
+  re-derive the attention row

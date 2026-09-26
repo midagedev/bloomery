@@ -5,14 +5,20 @@
 # assembles each module with ptxas for the card's arch, disassembles the cubin with cuobjdump, and
 # hands the listings to tools/sass_inflight.py, whose header says what is counted and how.
 #
-# Usage: tools/sass-scan.sh [--exact] <binary name> [entry substring [decisions]]
+# Usage: tools/sass-scan.sh [--exact] [--step HEAD|auto] [--raw] <binary name> [entry substring [decisions]]
 #   --exact    the entry argument is a whole name, not a substring (`ds41_attn_seg` alone, not also
 #              `ds41_attn_seg_sel`); it may stand anywhere among the arguments. Through the recipe it
 #              goes after `--`, or just reads it as a recipe option:
 #              `just sass-scan --features deepseek41 <binary> -- --exact <entry>`.
+#   --step     instead of the table, the instructions one iteration of the loop at HEAD (0x-hex, or
+#              auto: the largest loop) executes along the decisions, by class (sass_inflight.py's
+#              header), e.g. `just sass-scan gate_gemm -- --exact --step 0x15f0 gemm_q4k 0x1cf0=t,0x2370=t`.
+#   --raw      instead of the table, the matching entries' cuobjdump listings verbatim, control words
+#              included — a file sass_inflight.py reads back on any machine.
 #   decisions  the path's conditional branches in order, t (taken) or n (not taken), comma-separated,
-#              e.g. n,t,t,n; without them the path falls through every conditional branch. `list`
-#              instead prints the matching entries' listings (<addr> <instruction>) to pick them from.
+#              e.g. n,t,t,n; without them the path falls through every conditional branch. With --step
+#              they may be keyed by address instead (ADDR=t|n|tK). `list` instead prints the matching
+#              entries' listings (<addr> <instruction>) to pick them from.
 #   The recipe (`just sass-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds the
 #   binary and the extractor first. SASS_SCAN_PTXAS and SASS_SCAN_CUOBJDUMP (default the box env's
 #   CUDA_TOOLKIT_PATH, else /usr/local/cuda), SASS_SCAN_ARCH (default sm_86) and SASS_SCAN_EXTRACT
@@ -24,15 +30,26 @@
 # or no entry matches; 2 on a usage error.
 set -uo pipefail
 EXACT=
+STEP=
+RAW=
 POS=()
-for a in "$@"; do
-  if [ "$a" = --exact ]; then EXACT=1; else POS+=("$a"); fi
+while [ $# -gt 0 ]; do
+  case $1 in
+    --exact) EXACT=1 ;;
+    --raw) RAW=1 ;;
+    --step)
+      [ $# -ge 2 ] || { echo "sass-scan.sh: --step needs HEAD (0x-hex or auto)" >&2; exit 2; }
+      STEP=$2
+      shift ;;
+    *) POS+=("$1") ;;
+  esac
+  shift
 done
 NAME=${POS[0]:-}
 FILTER=${POS[1]:-}
 DECISIONS=${POS[2]:-}
 if [ -z "$NAME" ] || [ ${#POS[@]} -gt 3 ] || { [ -n "$EXACT" ] && [ -z "$FILTER" ]; }; then
-  echo "usage: sass-scan.sh [--exact] <binary name> [entry substring [decisions|list]]" >&2
+  echo "usage: sass-scan.sh [--exact] [--step HEAD|auto] [--raw] <binary name> [entry substring [decisions|list]]" >&2
   echo "       (--exact needs the entry argument)" >&2
   exit 2
 fi
@@ -69,6 +86,8 @@ ARGS=(--banner "sass-scan bin=$BIN ptxas=$PTXAS ptxas-version=${VER:-unknown} ar
 [ -z "$FILTER" ] || ARGS+=(--filter "$FILTER")
 [ -z "$EXACT" ] || ARGS+=(--exact)
 [ -z "$DECISIONS" ] || ARGS+=(--decisions "$DECISIONS")
+[ -z "$STEP" ] || ARGS+=(--step "$STEP")
+[ -z "$RAW" ] || ARGS+=(--raw)
 MODS=()
 for ((i = 1; i <= NMOD; i++)); do MODS+=("$TMP/mod$i.sass"); done
 python3 "${BASH_SOURCE[0]%/*}/sass_inflight.py" "${ARGS[@]}" "${MODS[@]}"

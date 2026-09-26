@@ -26,17 +26,37 @@ Two readings per entry:
          taken.
 Decisions are per entry and per run: pick them from the listing (`list`) for the shape in question.
 
-usage: sass_inflight.py [--filter SUBSTR [--exact]] [--decisions t,n,...|list] [--banner TEXT] FILE...
+A third reading, `--step HEAD`, replaces the table: the instructions one iteration of the loop at
+HEAD executes along the decisions, by class — the count a latency-bound kernel's step is judged by
+(its cycles are instructions × CPI ÷ warps a scheduler). The walk starts at HEAD, the loop's first
+instruction (a backward BRA's target; `auto` takes the loop with the largest body), follows the
+path rules above, and ends at the first BRA back to HEAD, which it counts. Decisions here may also
+be keyed by address, `0x1cf0=t,0x2370=n,0x2030=t2`: a keyed branch takes its decision every time it
+is met (`tK`: taken the first K times, then not — a nested loop run K + 1 times), a branch not
+keyed falls through, and a keyed address the walk never meets fails the reading (`unmet=`: keys
+read off another build's listing name other instructions). The iteration is cut after every second
+barrier (BAR), so a loop that runs two steps an iteration reports each (`segs`), the instructions
+after the last cut joining the last step. Classes: LDG, LDGSTS, LDS by width (@!PT dummies apart), IMMA (tensor), IMAD (every form),
+ALU, FP32 (FFMA, FMUL, FADD), BRA/WARPSYNC (with BSSY, BSYNC, CALL, RET), BAR, other (uniform
+datapath, dependency barriers and the rest); a line per class breaks it down by opcode. With a
+cuobjdump listing it also sums the stall counts of the control words (`stall`).
+`--raw` prints the matching entries of a cuobjdump listing verbatim, control words included, which
+this script reads back.
+
+usage: sass_inflight.py [--filter SUBSTR [--exact]] [--decisions t,n,...|ADDR=t|n|tK,...|list]
+                        [--step HEAD|auto] [--raw] [--banner TEXT] FILE...
 A FILE is a cuobjdump listing ("Function : <name>" sections) or a condensed one ("<addr> <op>" per
 line, one entry named after the file). Exit status: 0 with rows, 1 when no entry was read or none
-matches the filter, 2 on a usage error. With --exact the filter is a whole entry name instead of a
-substring.
+matches the filter (or, for --step, a walk did not end at its back edge or left a keyed decision
+unmet), 2 on a usage error. With
+--exact the filter is a whole entry name instead of a substring.
 """
 import os
 import re
 import sys
 
 INS = re.compile(r'/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;')
+HIWORD = re.compile(r'^\s*/\*\s*0x([0-9a-f]{16})\s*\*/\s*$')
 FUNC = re.compile(r'^\s*Function\s*:\s*(\S+)')
 CONDENSED = re.compile(r'^([0-9a-f]{4,})\s+(\S.*?)\s*$')
 REG = re.compile(r'\bR(\d+)((?:\.[A-Za-z0-9]+)*)')
@@ -44,26 +64,52 @@ GUARD = re.compile(r'^@(!?)(U?P[T0-9]+)\s+')
 BRANCH = re.compile(r'^(BRA|CALL)(?:\.[A-Z]+)*\s+(?:!?U?P[T0-9]+\s*,\s*)?(0x[0-9a-f]+)$')
 STORES = {'STG', 'ST', 'STS', 'STL', 'RED'}
 WALK_LIMIT = 100_000
+CLASSES = ('LDG', 'LDGSTS', 'LDS', 'IMMA', 'IMAD', 'ALU', 'FP32', 'BRA/WARPSYNC', 'BAR', 'other')
+ALU = {'LOP3', 'LOP', 'SHF', 'SGXT', 'IADD3', 'LEA', 'ISETP', 'PLOP3', 'SEL', 'I2FP', 'CS2R', 'HADD2',
+       'MOV', 'PRMT', 'IMNMX', 'IABS', 'POPC', 'FLO', 'BMSK', 'BREV', 'P2R', 'R2P', 'FSEL', 'FSETP',
+       'FMNMX'}
+CONTROL = {'BRA', 'WARPSYNC', 'BSSY', 'BSYNC', 'CALL', 'RET', 'BRX', 'JMP', 'JMX', 'EXIT'}
 
 
-def read(path):
-    """Entries in file order: name -> [(address, instruction text)]."""
+def read_full(path):
+    """Entries in file order: name -> (instructions [(address, text)], control words {address:
+    the instruction's high 64 bits}, raw listing lines). A condensed listing has no control words
+    and no raw lines."""
     entries, name = {}, None
     lines = open(path, errors='replace').read().splitlines()
     if not any(FUNC.match(line) for line in lines):
         name = os.path.basename(path).rsplit('.', 1)[0]
-        entries[name] = [(int(m.group(1), 16), m.group(2)) for m in map(CONDENSED.match, lines) if m]
+        entries[name] = ([(int(m.group(1), 16), m.group(2)) for m in map(CONDENSED.match, lines) if m],
+                         {}, [])
         return entries
+    last = None
     for line in lines:
         f = FUNC.match(line)
         if f:
             name = f.group(1)
-            entries[name] = []
+            entries[name] = ([], {}, [line])
+            last = None
             continue
+        if name is None:
+            continue
+        ins, ctrl, raw = entries[name]
         m = INS.search(line)
-        if m and name is not None:
-            entries[name].append((int(m.group(1), 16), m.group(2)))
+        if m:
+            last = int(m.group(1), 16)
+            ins.append((last, m.group(2)))
+            raw.append(line)
+            continue
+        h = HIWORD.match(line)
+        if h and last is not None:
+            ctrl[last] = int(h.group(1), 16)
+            raw.append(line)
+            last = None
     return entries
+
+
+def read(path):
+    """Entries in file order: name -> [(address, instruction text)]."""
+    return {name: ins for name, (ins, _, _) in read_full(path).items()}
 
 
 def split(text):
@@ -194,12 +240,166 @@ def walk(ins, decisions):
                 bssy=bssy, taken=taken, conditional=used, end=end)
 
 
+def parse_decisions(text):
+    """A decision string: a positional list [bool], or keyed {address: times taken (None = always,
+    0 = never)}. Returns (positional, keyed) or raises ValueError."""
+    items = [d for d in text.split(',') if d] if text else []
+    if not any('=' in d for d in items):
+        bad = [d for d in items if d not in ('t', 'n')]
+        if bad:
+            raise ValueError(f'decisions are t or n, comma-separated; got {bad}')
+        return [d == 't' for d in items], {}
+    keyed = {}
+    for d in items:
+        a, _, v = d.partition('=')
+        m = re.fullmatch(r't(\d*)|n', v)
+        if not re.fullmatch(r'0x[0-9a-f]+', a) or not m:
+            raise ValueError(f'keyed decisions are ADDR=t|n|tK (ADDR 0x-hex); got {d!r}')
+        keyed[int(a, 16)] = 0 if v == 'n' else (int(m.group(1)) if m.group(1) else None)
+    return [], keyed
+
+
+def loop_heads(ins):
+    """(head, back-edge address) of every backward BRA, largest body first."""
+    out = []
+    for a, t in ins:
+        _, op, ops = split(t)
+        m = BRANCH.match(' '.join([op] + ([', '.join(ops)] if ops else [])))
+        if m and m.group(1) == 'BRA' and int(m.group(2), 16) < a:
+            out.append((int(m.group(2), 16), a))
+    return sorted(out, key=lambda x: x[0] - x[1])
+
+
+def step_walk(ins, head, positional, keyed):
+    """One iteration of the loop at `head` (the path rules of `walk`; keyed decisions count their
+    uses): (executed [(address, text)], decided [(address, text, taken)], end)."""
+    idx = {a: i for i, (a, _) in enumerate(ins)}
+    if head not in idx:
+        return [], [], f'no instruction at 0x{head:04x}'
+    i, path, decided, returns, used, seen = idx[head], [], [], [], 0, {}
+    while True:
+        if len(path) >= WALK_LIMIT:
+            return path, decided, f'stopped after {WALK_LIMIT} instructions: a loop the decisions never leave'
+        a, t = ins[i]
+        guard, op, ops = split(t)
+        path.append((a, t))
+        if op == 'EXIT' and not guard:
+            return path, decided, 'EXIT'
+        m = BRANCH.match(' '.join([op] + ([', '.join(ops)] if ops else [])))
+        if m and not op.startswith('BRA.DIV') and guard != '@!PT':
+            target = int(m.group(2), 16)
+            if m.group(1) == 'BRA' and target == head:
+                return path, decided, 'back edge'
+            if guard in ('', '@PT'):
+                go = True
+            else:
+                if keyed:
+                    k = keyed.get(a, 0)
+                    go = k is None or seen.get(a, 0) < k
+                    seen[a] = seen.get(a, 0) + 1
+                else:
+                    go = used < len(positional) and positional[used]
+                    used += 1
+                decided.append((a, t, go))
+            if go:
+                if target not in idx:
+                    return path, decided, f'branch to 0x{target:04x} outside the listing'
+                if m.group(1) == 'CALL':
+                    returns.append(i + 1)
+                i = idx[target]
+                continue
+        elif op.split('.')[0] == 'RET' and not guard:
+            if not returns:
+                return path, decided, 'RET with no CALL on the path'
+            i = returns.pop()
+            continue
+        i += 1
+        if i >= len(ins):
+            return path, decided, 'fell off the listing'
+
+
+def klass(text):
+    """(class, detail) of one instruction: the detail names the opcode, or an LDS/LDGSTS width."""
+    guard, op, _ = split(text)
+    base = op.split('.')[0]
+    width = '128' if '.128' in op else '64' if '.64' in op else '16' if '16' in op else \
+        '8' if ('.U8' in op or '.S8' in op) else '32'
+    if base in ('LDG', 'LDGSTS'):
+        return base, width
+    if base == 'LDS':
+        return 'LDS', '@!PT' if guard == '@!PT' else width
+    if base in ('IMMA', 'HMMA', 'DMMA', 'BMMA'):
+        return 'IMMA', base
+    if base == 'IMAD':
+        return 'IMAD', op
+    if base in ('FFMA', 'FMUL', 'FADD'):
+        return 'FP32', base
+    if base in CONTROL:
+        return 'BRA/WARPSYNC', base
+    if base == 'BAR':
+        return 'BAR', base
+    if base in ALU:
+        return 'ALU', base
+    return 'other', base
+
+
+def stall_of(ctrl, a):
+    """The stall count of the instruction at `a` from its control word (bits 41..44 of the high
+    word), or None without one."""
+    return None if a not in ctrl else (ctrl[a] >> 41) & 0xf
+
+
+def segments(path):
+    """Instruction counts of the iteration cut after every second barrier; the rest joins the last."""
+    cuts, bars = [], 0
+    for n, (_, t) in enumerate(path, 1):
+        if split(t)[1].split('.')[0] == 'BAR':
+            bars += 1
+            if bars % 2 == 0:
+                cuts.append(n)
+    edges = [0] + cuts[:-1] + [len(path)]
+    return [edges[k + 1] - edges[k] for k in range(len(edges) - 1)]
+
+
+def step_report(name, ins, ctrl, head_arg, decisions):
+    """The --step lines of one entry, and whether its walk ended at the back edge."""
+    heads = loop_heads(ins)
+    if head_arg == 'auto':
+        if not heads:
+            return [f'step {name} no loop'], False
+        head = heads[0][0]
+    else:
+        head = int(head_arg, 16)
+    positional, keyed = parse_decisions(decisions)
+    path, decided, end = step_walk(ins, head, positional, keyed)
+    stalls = [stall_of(ctrl, a) for a, _ in path]
+    stall = '-' if not path or None in stalls else str(sum(stalls))
+    back = next((b for h, b in heads if h == head), None)
+    unmet = sorted(set(keyed) - {a for a, _, _ in decided})
+    lines = [f'step {name} head=0x{head:04x} back={hexa(back)} instrs={len(path)} '
+             f'segs={"/".join(map(str, segments(path)))} stall={stall} end={end}'
+             + (' unmet=' + ','.join(f'0x{a:04x}' for a in unmet) if unmet else '')]
+    by, detail = {c: 0 for c in CLASSES}, {c: {} for c in CLASSES}
+    for _, t in path:
+        c, d = klass(t)
+        by[c] += 1
+        detail[c][d] = detail[c].get(d, 0) + 1
+    lines.append('  classes ' + ' '.join(f'{c}={by[c]}' for c in CLASSES))
+    for c in CLASSES:
+        if detail[c]:
+            parts = sorted(detail[c].items(), key=lambda x: (-x[1], x[0]))
+            lines.append(f'  {c:12s} ' + ' '.join(f'{d}:{n}' for d, n in parts))
+    lines.append(f'  decided {len(decided)}: '
+                 + ' '.join(f'0x{a:04x}={"t" if go else "n"}' for a, _, go in decided))
+    return lines, end == 'back edge' and not unmet
+
+
 def hexa(a):
     return '-' if a is None else f'0x{a:04x}'
 
 
 def main(argv):
-    filt, exact, decisions, banner, files = '', False, None, None, []
+    filt, exact, decisions, banner, files, head, raw = '', False, None, None, [], None, False
     it = iter(argv)
     for arg in it:
         if arg == '--filter':
@@ -210,25 +410,36 @@ def main(argv):
             decisions = next(it, '')
         elif arg == '--banner':
             banner = next(it, '')
+        elif arg == '--step':
+            head = next(it, '')
+            if head != 'auto' and not re.fullmatch(r'0x[0-9a-f]+', head):
+                print(f'sass_inflight: --step takes a 0x-hex address or auto, got {head!r}', file=sys.stderr)
+                return 2
+        elif arg == '--raw':
+            raw = True
         elif arg.startswith('--'):
             print(f'sass_inflight: unknown flag {arg}', file=sys.stderr)
             return 2
         else:
             files.append(arg)
     if not files:
-        print(__doc__.split('usage: ')[1].split('\n')[0], file=sys.stderr)
+        print(__doc__.split('usage: ')[1].split('\nA FILE')[0], file=sys.stderr)
         return 2
     listing = decisions == 'list'
     choice = []
     if decisions and not listing:
-        bad = [d for d in decisions.split(',') if d not in ('t', 'n')]
-        if bad:
-            print(f'sass_inflight: decisions are t or n, comma-separated; got {bad}', file=sys.stderr)
+        try:
+            choice, keyed = parse_decisions(decisions)
+        except ValueError as e:
+            print(f'sass_inflight: {e}', file=sys.stderr)
             return 2
-        choice = [d == 't' for d in decisions.split(',')]
-    entries = {}
+        if keyed and head is None:
+            print('sass_inflight: keyed decisions are read by --step only', file=sys.stderr)
+            return 2
+    full = {}
     for f in files:
-        entries.update(read(f))
+        full.update(read_full(f))
+    entries = {name: ins for name, (ins, _, _) in full.items()}
     if exact and not filt:
         print('sass_inflight: --exact needs --filter NAME', file=sys.stderr)
         return 2
@@ -247,6 +458,17 @@ def main(argv):
             for a, t in ins:
                 print(f'{a:04x} {t}')
         return 0
+    if raw:
+        for name, _ in rows:
+            print('\n'.join(full[name][2]))
+        return 0
+    if head is not None:
+        ok = True
+        for name, ins in rows:
+            lines, done = step_report(name, ins, full[name][1], head, '' if listing else decisions)
+            print('\n'.join(lines))
+            ok = ok and done
+        return 0 if ok else 1
     print(f'{"entry":32s} {"instrs":>6s} {"LDG":>4s} {"BSSY":>4s} {"loops":>5s} {"path":>6s} '
           f'{"1st_LDG":>7s} {"p_LDG":>5s} {"LDG<wait":>8s} {"1st_wait":>8s}')
     details = []

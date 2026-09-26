@@ -32,6 +32,13 @@
 # and the top stall reasons (medians over the collected launches). The profile runs under
 # BLOOMERY_ARM_BOUND seconds (default 900). BLOOMERY_DRY=1 prints the command line and exits before
 # the binary check and the lease; the depth form has no dry path and refuses the variable.
+# BLOOMERY_NCU_SOURCE=1 (this form only; unset is the form above) adds the per-instruction view: the
+# sections SourceCounters (sampled warp stalls per SASS instruction), ComputeWorkloadAnalysis (the
+# pipes' active cycles), InstructionStats and SchedulerStats beside BLOOMERY_NCU_SECTIONS, keeps the
+# report as <out>.ncu-rep, and after the run prints its source page — SASS with the counters per
+# instruction — into <out>.source.csv (`ncu --import`, no GPU). The source page is per profiled
+# launch: pair it with BLOOMERY_NCU_COUNT=1 or 2. The summary reads <out>.csv as without it; when the
+# live run leaves that file empty, it is the report's details page.
 #
 # The V4.1 prompt form (BLOOMERY_NCU_FORM=ds41pp, `just ncu-gpu-ds41-pp [P]`): one launch of each of the
 # four attention projections (the joined qkv, q_b, wo_a heads, wo_b) at m = 8 in one full chunk of a
@@ -126,6 +133,12 @@ if [ "$FORM" = gemm ]; then
   GEMM_KERNELS=${BLOOMERY_NCU_KERNELS:-^gemm_q4k}
   GEMM_SKIP=${BLOOMERY_NCU_SKIP:-64}
   GEMM_SECTIONS=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight WarpStateStats MemoryWorkloadAnalysis}
+  SOURCE=${BLOOMERY_NCU_SOURCE:-}
+  case $SOURCE in
+    '') ;;
+    1) GEMM_SECTIONS="$GEMM_SECTIONS SourceCounters ComputeWorkloadAnalysis InstructionStats SchedulerStats" ;;
+    *) echo "ncu-gpu.sh: BLOOMERY_NCU_SOURCE is 1 or unset, got '$SOURCE'" >&2; exit 64 ;;
+  esac
   BOUND=${BLOOMERY_ARM_BOUND:-900}
   # The pipe metrics the summary names, in its order: the L1TEX unit's throughput; the LSU data-pipe
   # wavefronts (every global and shared access the unit's data stage serves) and the shared-memory
@@ -151,14 +164,25 @@ if [ "$FORM" = gemm ]; then
   list=$GEMM_METRICS
   for s in $STALLS; do list="$list,smsp__warp_issue_stalled_${s}_per_warp_active"; done
   out="$OUTDIR/ncu-gemm-${GEMM_ARM}-$(date -u +%H%M%S)"
+  export_args=()
+  [ -z "$SOURCE" ] || export_args=(--export "$out.ncu-rep" --force-overwrite)
   CMD=(timeout --kill-after=10 "$BOUND" "$NCU" --target-processes application-only --clock-control base
        --launch-skip "$GEMM_SKIP" --launch-count "$COUNT"
        --kernel-name "regex:$GEMM_KERNELS" --kernel-name-base function
        "${sec_args[@]}" --metrics "$list" --csv --log-file "$out.csv"
+       ${export_args[@]+"${export_args[@]}"}
        "$GEMM_BIN" --bench-kernels --bench-arm "$GEMM_ARM")
+  # GPU-free, after the run: the report's details page (only when the live CSV is empty) and its
+  # source page.
+  DETAILS_CMD=("$NCU" --import "$out.ncu-rep" --csv --page details)
+  SOURCE_CMD=("$NCU" --import "$out.ncu-rep" --page source --print-source sass --csv)
   if [ -n "$DRY" ]; then
-    echo "[dry] form=gemm bin=$GEMM_BIN arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "[dry] form=gemm bin=$GEMM_BIN arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES source=${SOURCE:-off}"
     echo "[dry] ${CMD[*]}"
+    if [ -n "$SOURCE" ]; then
+      echo "[dry] then, when $out.csv is empty: ${DETAILS_CMD[*]} > $out.csv"
+      echo "[dry] then: ${SOURCE_CMD[*]} > $out.source.csv"
+    fi
     exit 0
   fi
   assert_fresh_binary "$GEMM_BIN" || exit $?
@@ -176,6 +200,18 @@ if [ "$FORM" = gemm ]; then
   witness post
   echo "[rc] $rc"
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
+  if [ -n "$SOURCE" ]; then
+    if [ -s "$out.ncu-rep" ]; then
+      [ -s "$out.csv" ] || "${DETAILS_CMD[@]}" > "$out.csv" 2>> "$out.txt"
+      "${SOURCE_CMD[@]}" > "$out.source.csv" 2>> "$out.txt"
+      src_rc=$?
+      echo "[source] rc=$src_rc lines=$(wc -l < "$out.source.csv") report=$out.ncu-rep page=$out.source.csv"
+      [ $src_rc -eq 0 ] || [ $rc -ne 0 ] || rc=$src_rc
+    else
+      echo "[source] no report at $out.ncu-rep"
+      [ $rc -ne 0 ] || rc=3
+    fi
+  fi
   if [ -s "$out.csv" ]; then
     echo "--- summary (median over the collected launches; the durations are not numbers of record). Raw: $out.csv"
     lease_bounded "$LEASE_ARM_BOUND" python3 - "$out.csv" <<'PY'

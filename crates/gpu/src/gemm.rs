@@ -44,11 +44,15 @@
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps over
 //! [`GEMM_BM`] rows, sixteen rows per warp, every warp over all of the
-//! tile's columns in n-tiles of eight. A warp reads its own rows' weight
-//! bytes from global memory straight into its `mma` fragments; the tile's
-//! activation codes, `s8` and `d8` are staged into shared memory with
-//! `cp.async`, double-buffered one 128-value block at a time, and read by
-//! every warp. The fragment k-mapping is the instruction's own (lane
+//! tile's columns in n-tiles of eight. The tile's activation codes, `s8` and
+//! `d8` are staged into shared memory with `cp.async`, double-buffered one
+//! 128-value block at a time, and read by every warp. A Q4_K block stages its
+//! slab's weight words with them, in the same copy group — per row the
+//! super-block's header at its first half and the half's sixteen qs words —
+//! and each warp reads its own rows' words from there, the header once per
+//! super-block; a Q5_K, Q6_K or Q3_K warp reads its own rows' weight bytes
+//! from global memory straight into its `mma` fragments at the head of each
+//! step. The fragment k-mapping is the instruction's own (lane
 //! `4g + t` holds values `4t..4t+3` and `16+4t..16+4t+3` of each 32), and in
 //! the quantizer's q6 permutation those two words of a column are one u64 —
 //! the staging copies that permutation verbatim, 16 bytes at a time.
@@ -73,8 +77,11 @@ pub const GEMM_BM: usize = 128;
 /// Columns (slots) one tile holds: eight n-tiles of eight.
 pub const GEMM_BN: usize = 64;
 /// Threads per GEMM block. The entries declare two resident blocks per SM
-/// (`launch_bounds(256, 2)`), which caps them at 128 registers a thread: the
-/// sixteen warps an SM then holds are what hides a step's weight loads.
+/// (`launch_bounds(256, 2)`), which caps them at 128 registers a thread. The
+/// four warps a scheduler then holds do not hide one warp's dependency chain,
+/// so a step lasts as long as its instructions take to issue along it: the
+/// Q4_K entry's weight words arrive one step ahead with the activations,
+/// while the other entries' loads at a step's head sit on the chain.
 pub const GEMM_THREADS: usize = 256;
 /// [`GEMM_THREADS`] as the block width a launch takes.
 const GEMM_THREADS_U32: u32 = GEMM_THREADS as u32;
@@ -101,6 +108,13 @@ const B_COL_W: usize = 36;
 const B_STAGE_W: usize = GEMM_BN * B_COL_W;
 /// i32 words one stage of the staged `s8` takes: four per column.
 const S8_STAGE: usize = GEMM_BN * 4;
+/// u32 words one staged Q4_K row takes: the super-block's four header words,
+/// then the half's sixteen qs words. The pitch is 4 mod 8, so a warp's eight
+/// row groups start in eight distinct bank quads: its four-lane qs reads hit
+/// 32 distinct banks and its 16-byte header reads eight distinct bank groups.
+const WT_ROW_W: usize = 20;
+/// u32 words one stage of the staged Q4_K slab takes: the block's rows.
+const WT_STAGE_W: usize = GEMM_BM * WT_ROW_W;
 
 const _: () = assert!(GEMM_BM == 16 * (GEMM_THREADS / 32));
 const _: () = assert!(GEMM_BN.is_multiple_of(8) && GEMM_BN <= 64);
@@ -111,6 +125,12 @@ const _: () = assert!(GEMM_MAX_EXPERTS <= ROUTE_THREADS);
 // warp per chunk.
 const _: () = assert!(ROUTE_HIST >= GEMM_MAX_EXPERTS && ROUTE_WARPS * 32 == ROUTE_THREADS);
 const _: () = assert!((B_COL_W / 4) % 8 == 1 && B_COL_W >= 32 && B_COL_W.is_multiple_of(4));
+// A tile's staged codes are at most the same count of chunks for every thread.
+const _: () = assert!((GEMM_BN * 8).is_multiple_of(GEMM_THREADS));
+// The Q4_K staging's chunk map: thread `tid` copies qs chunk `tid % 4` of
+// slab rows `tid / 4` and `tid / 4 + GEMM_BM / 2`, and a thread below
+// GEMM_BM the header of row `tid` — every chunk of a step once.
+const _: () = assert!(WT_ROW_W % 8 == 4 && WT_ROW_W == 4 + 16 && GEMM_THREADS == 2 * GEMM_BM);
 // The route packs a count and a tile count into one scanned u32, 16 bits
 // each, and a tile's start and length into another.
 const _: () = assert!(GEMM_MAX_SLOTS < 1 << 16 && GEMM_MAX_EXPERTS + GEMM_MAX_SLOTS < 1 << 16);
@@ -179,23 +199,27 @@ pub fn gemm_max_tiles(n_slots: usize, n_experts: usize) -> usize {
 /// and `dmin`, then the twelve scale bytes), then for its two 64-value
 /// pairs `p = 2·hh, 2·hh + 1` the qs words `8p + t` and `8p + 4 + t` —
 /// values `4t..4t+3` and `16+4t..16+4t+3` of both sub-blocks of the pair,
-/// low nibbles the even one.
+/// low nibbles the even one. `@load` takes the header from `hdr` and the qs
+/// words from the row's staged copy at `row` ([`WT_ROW_W`] words: the header,
+/// then the half's sixteen qs words in file order).
 macro_rules! q4k_dec {
-    (@load $w:ident, $wb:expr, $hh:expr, $t:expr) => {{
-        let wb: usize = $wb;
-        let q = wb + 4 + 16 * $hh + $t;
-        // SAFETY: `wb` is a super-block's first word and every index is below
-        // `wb + 36`, inside the stack by the launch contract.
+    (@load $hdr:expr, $row:expr, $t:expr) => {{
+        let hdr: [u32; 4] = $hdr;
+        let row: *mut u32 = $row;
+        let t: usize = $t;
+        // SAFETY: `row` is a staged row of this step's stage, which the
+        // barrier after the stage's wait has published; words `4 + t` to
+        // `16 + t` are inside its twenty.
         unsafe {
             [
-                *$w.get_unchecked(wb),
-                *$w.get_unchecked(wb + 1),
-                *$w.get_unchecked(wb + 2),
-                *$w.get_unchecked(wb + 3),
-                *$w.get_unchecked(q),
-                *$w.get_unchecked(q + 4),
-                *$w.get_unchecked(q + 8),
-                *$w.get_unchecked(q + 12),
+                hdr[0],
+                hdr[1],
+                hdr[2],
+                hdr[3],
+                *row.add(4 + t),
+                *row.add(8 + t),
+                *row.add(12 + t),
+                *row.add(16 + t),
             ]
         }
     }};
@@ -218,15 +242,15 @@ macro_rules! q4k_dec {
         ];
         (even, odd, sc)
     }};
-    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $nt:expr) => {{
+    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {{
         // SAFETY: every lane of the warp reaches this `mma.sync` (the branch
         // around it is on the warp's rows and the block's tile, both uniform)
         // with its fragments in the instruction's layout.
         let d = unsafe { mma_m16n8k32_s32_s8([0; 4], $a, [$b0, $b1]) };
-        $isum[4 * $nt] += $sc[2 * $par] * d[0];
-        $isum[4 * $nt + 1] += $sc[2 * $par] * d[1];
-        $isum[4 * $nt + 2] += $sc[2 * $par + 1] * d[2];
-        $isum[4 * $nt + 3] += $sc[2 * $par + 1] * d[3];
+        isum_add!($isum, 0, $sc[2 * $par] * d[0], $first);
+        isum_add!($isum, 1, $sc[2 * $par] * d[1], $first);
+        isum_add!($isum, 2, $sc[2 * $par + 1] * d[2], $first);
+        isum_add!($isum, 3, $sc[2 * $par + 1] * d[3], $first);
     }};
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         qk_min_rows!($r0, $r1, $hh)
@@ -284,14 +308,27 @@ macro_rules! q5k_dec {
         ];
         (even, odd, sc)
     }};
-    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $nt:expr) => {
-        q4k_dec!(@mma $a, $b0, $b1, $sc, $par, $isum, $nt)
+    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {
+        q4k_dec!(@mma $a, $b0, $b1, $sc, $par, $isum, $first)
     };
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         qk_min_rows!($r0, $r1, $hh)
     };
     (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {
         qk_min_epi!($rw, $s8st, $n0, $dcol, $isum, $acc, $nt)
+    };
+}
+
+/// One product into an `isum` word: its first of the n-tile's step (`first`,
+/// a constant after unrolling) writes the word, every later one adds — so
+/// each n-tile's `isum` starts from the exact integer 0 without a reset.
+macro_rules! isum_add {
+    ($isum:ident, $i:expr, $v:expr, $first:expr) => {
+        if $first {
+            $isum[$i] = $v;
+        } else {
+            $isum[$i] += $v;
+        }
     };
 }
 
@@ -325,9 +362,9 @@ macro_rules! qk_min_rows {
     }};
 }
 
-/// Q4_K/Q5_K epilogue of one n-tile for one 128-value block: `imin = Σ_c
-/// m_c · s8_c` per (row, column), then the contract's order, `acc =
-/// fma(d8, fma(−dmin, f32(imin), d·f32(isum)), acc)`.
+/// Q4_K/Q5_K epilogue of n-tile `nt` for one 128-value block, `isum` its
+/// four sums: `imin = Σ_c m_c · s8_c` per (row, column), then the
+/// contract's order, `acc = fma(d8, fma(−dmin, f32(imin), d·f32(isum)), acc)`.
 macro_rules! qk_min_epi {
     ($rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
         let (dr, ndr, m0, m1) = $rw;
@@ -363,10 +400,9 @@ macro_rules! qk_min_epi {
         while i < 4 {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
             let r = i / 2;
-            let tv = mul_rn_f32(dr[r], $isum[4 * $nt + i] as f32);
+            let tv = mul_rn_f32(dr[r], $isum[i] as f32);
             let tv = fma_rn_f32(ndr[r], imin[i] as f32, tv);
             $acc[4 * $nt + i] = fma_rn_f32($dcol[i & 1], tv, $acc[4 * $nt + i]);
-            $isum[4 * $nt + i] = 0;
             i += 1;
         }
     }};
@@ -376,7 +412,7 @@ macro_rules! qk_min_epi {
 /// 32 values, each scaled by its own sub-block scale. `sc` holds, per
 /// chunk parity, (row g low, row g high, row g+8 low, row g+8 high).
 macro_rules! k16_mma {
-    ($a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $nt:expr) => {{
+    ($a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {{
         let a: [u32; 4] = $a;
         // SAFETY: as the k32 form — the whole warp issues both `mma.sync`
         // with fragments in the layout; the low half of a k32 A fragment is
@@ -388,23 +424,23 @@ macro_rules! k16_mma {
             )
         };
         let s = 4 * $par;
-        $isum[4 * $nt] += $sc[s] * dl[0] + $sc[s + 1] * dh[0];
-        $isum[4 * $nt + 1] += $sc[s] * dl[1] + $sc[s + 1] * dh[1];
-        $isum[4 * $nt + 2] += $sc[s + 2] * dl[2] + $sc[s + 3] * dh[2];
-        $isum[4 * $nt + 3] += $sc[s + 2] * dl[3] + $sc[s + 3] * dh[3];
+        isum_add!($isum, 0, $sc[s] * dl[0] + $sc[s + 1] * dh[0], $first);
+        isum_add!($isum, 1, $sc[s] * dl[1] + $sc[s + 1] * dh[1], $first);
+        isum_add!($isum, 2, $sc[s + 2] * dl[2] + $sc[s + 3] * dh[2], $first);
+        isum_add!($isum, 3, $sc[s + 2] * dl[3] + $sc[s + 3] * dh[3], $first);
     }};
 }
 
-/// Q6_K/Q3_K epilogue of one n-tile: `acc = fma(d8, d·f32(isum), acc)`.
+/// Q6_K/Q3_K epilogue of n-tile `nt`, `isum` its four sums: `acc = fma(d8,
+/// d·f32(isum), acc)`.
 macro_rules! k16_epi {
     ($rw:ident, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
         let dr = $rw;
         let mut i = 0usize;
         while i < 4 {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
-            let tv = mul_rn_f32(dr[i / 2], $isum[4 * $nt + i] as f32);
+            let tv = mul_rn_f32(dr[i / 2], $isum[i] as f32);
             $acc[4 * $nt + i] = fma_rn_f32($dcol[i & 1], tv, $acc[4 * $nt + i]);
-            $isum[4 * $nt + i] = 0;
             i += 1;
         }
     }};
@@ -468,8 +504,8 @@ macro_rules! q6k_dec {
         ];
         (even, odd, sc)
     }};
-    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $nt:expr) => {
-        k16_mma!($a, $b0, $b1, $sc, $par, $isum, $nt)
+    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {
+        k16_mma!($a, $b0, $b1, $sc, $par, $isum, $first)
     };
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         [
@@ -539,8 +575,8 @@ macro_rules! q3k_dec {
         ];
         (even, odd, sc)
     }};
-    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $nt:expr) => {
-        k16_mma!($a, $b0, $b1, $sc, $par, $isum, $nt)
+    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {
+        k16_mma!($a, $b0, $b1, $sc, $par, $isum, $first)
     };
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         [
@@ -558,36 +594,45 @@ macro_rules! q3k_dec {
 /// shared tiles: per column the four runs of the q6 permutation at this
 /// block's eight positions (two 16-byte copies each), the four s8 of its four
 /// sub-blocks (one 16-byte copy) and its d8 (one 4-byte copy). Only the live
-/// columns `n < ncols` are copied.
+/// columns `n < ncols` are copied; a full tile (`full`, a literal) tests none.
+/// The code chunks are at most two a thread, each thread's at `tid` and
+/// `tid + GEMM_THREADS`.
 macro_rules! gemm_stage {
     (
-        $h:expr, $st:expr, $tid:ident, $ncols:ident, $n_sb:ident, $col_words:ident,
-        $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident, $acol_sh:ident
+        $h:expr, $st:expr, $full:literal, $tid:ident, $ncols:ident, $n_sb:ident,
+        $col_words:ident, $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident,
+        $acol_sh:ident
     ) => {{
         let h: usize = $h;
         let st: usize = $st;
+        let ncols: usize = if $full { GEMM_BN } else { $ncols };
         let sb = h / 2;
         let off = 128 * (sb / 2) + 16 * (sb & 1) + 8 * (h & 1);
-        let mut u = $tid;
-        while u < $ncols * 8 {
-            let n = u / 8;
-            let i = (u / 2) & 3;
-            let q = u & 1;
-            // SAFETY: n < ncols <= GEMM_BN; the column index is an activation
-            // column below act_cols, so the source's 16 bytes (inside that
-            // column's 128*half_it words, 16-byte aligned: every term is a
-            // multiple of four words) are inside q6; the destination is inside
-            // stage `st` and 16-byte aligned.
-            unsafe {
-                let c = *$acol_sh.add(n) as usize;
-                cp_async_cg_16(
-                    $bt.add(st * B_STAGE_W + n * B_COL_W + 8 * i + 4 * q),
-                    $q6.as_ptr().add(c * $col_words + off + 32 * i + 4 * q),
-                );
+        let mut k = 0usize;
+        while k < GEMM_BN * 8 / GEMM_THREADS {
+            ::cuda_device::thread::__unroll_config::<{ 0 }>();
+            // tid < GEMM_THREADS, the launch's block width, so u < GEMM_BN · 8.
+            let u = $tid + k * GEMM_THREADS;
+            if $full || u < ncols * 8 {
+                let n = u / 8;
+                let i = (u / 2) & 3;
+                let q = u & 1;
+                // SAFETY: n < ncols <= GEMM_BN; the column index is an
+                // activation column below act_cols, so the source's 16 bytes
+                // (inside that column's 128*half_it words, 16-byte aligned:
+                // every term is a multiple of four words) are inside q6; the
+                // destination is inside stage `st` and 16-byte aligned.
+                unsafe {
+                    let c = *$acol_sh.add(n) as usize;
+                    cp_async_cg_16(
+                        $bt.add(st * B_STAGE_W + n * B_COL_W + 8 * i + 4 * q),
+                        $q6.as_ptr().add(c * $col_words + off + 32 * i + 4 * q),
+                    );
+                }
             }
-            u += GEMM_THREADS;
+            k += 1;
         }
-        if $tid < $ncols {
+        if $tid < ncols {
             // SAFETY: tid < ncols <= GEMM_BN. The s8 source is groups
             // 4h..4h+3 of the column (16 bytes, aligned: 8*n_sb words per
             // column, 4h words in), the d8 source its block h.
@@ -606,17 +651,253 @@ macro_rules! gemm_stage {
     }};
 }
 
+/// Weight words of the direct entries (Q5_K, Q6_K, Q3_K): each warp reads its
+/// two rows' raw words from global memory at the head of every step, before
+/// the step's barrier. `@decl` is the rows' first units, `@head` the loads and
+/// `@after` hands them on; there is nothing to stage.
+macro_rules! wst_direct {
+    (@decl [] $ws:ident, $hdr:ident; $w:ident, $e:ident, $rows_n:ident, $rt:ident,
+     $row0:ident, $g:ident, $tid:ident, $wid:ident, $n_sb:ident, $rows32:ident, $n_sb32:ident,
+     $sb_units:expr) => {
+        let r0 = $e * $rows_n + $row0 + $g;
+        let $ws = (r0 * $n_sb * $sb_units, (r0 + 8) * $n_sb * $sb_units);
+        let $hdr = ();
+    };
+    (@stage [] $ws:ident; $w:ident, $sb:expr, $hh:expr, $st:expr, $tid:ident, $sb_units:expr) => {};
+    (@head [] $dec:ident, $w:ident, $ws:ident, $active:ident, $sb:ident, $hh:ident, $t:ident,
+     $sb_units:expr) => {
+        if $active {
+            (
+                $dec!(@load $w, $ws.0 + $sb * $sb_units, $hh, $t),
+                $dec!(@load $w, $ws.1 + $sb * $sb_units, $hh, $t),
+            )
+        } else {
+            Default::default()
+        }
+    };
+    (@after [] $ws:ident, $hdr:ident; $st:ident, $hh:ident, $t:ident, $raw:ident) => {{
+        let () = $hdr;
+        $raw
+    }};
+}
+
+/// Weight words of the Q4_K entry, staged: step `h`'s slab — per row the
+/// super-block's header at its first half, and the half's sixteen qs words —
+/// is copied into stage `h & 1` of `wt` one step ahead, in the activations'
+/// copy group (`@stage`), and after the barrier each active warp reads its two
+/// rows from there (`@after`), the header at a super-block's first half,
+/// carried in registers into its second.
+///
+/// A thread's chunks are the same at every step (the map at [`WT_ROW_W`]), so
+/// `@decl` fixes their offsets into the stack at step 0 — bytes, in 32 bits,
+/// so each is one register the step's 64-bit add extends with zero — and into
+/// stage 0 once, and a step adds its own offset in the row. A row past the
+/// slab's live rows copies the slab's last live row instead: every source
+/// stays inside the stack, and those rows belong to warps that stage and wait
+/// but read nothing.
+macro_rules! wst_q4k {
+    (@decl [$wt:ident] $ws:ident, $hdr:ident; $w:ident, $e:ident, $rows_n:ident, $rt:ident,
+     $row0:ident, $g:ident, $tid:ident, $wid:ident, $n_sb:ident, $rows32:ident, $n_sb32:ident,
+     $sb_units:expr) => {
+        // The host refuses a stack of 2^32 bytes or more, so no offset wraps.
+        let $ws = {
+            let slab = $rt as u32 * GEMM_BM as u32;
+            let last = ($rows32 - slab).min(GEMM_BM as u32) - 1;
+            let row_bytes = 4 * $n_sb32 * $sb_units;
+            let wrow0 = $e as u32 * $rows32 + slab;
+            let tid = $tid as u32;
+            let (ra, c) = (tid / 4, tid % 4);
+            let rb = ra + GEMM_BM as u32 / 2;
+            let rh = tid.min(GEMM_BM as u32 - 1);
+            (
+                (wrow0 + ra.min(last)) * row_bytes + 16 + 16 * c,
+                (wrow0 + rb.min(last)) * row_bytes + 16 + 16 * c,
+                (wrow0 + rh.min(last)) * row_bytes,
+                ra as usize * WT_ROW_W + 4 + 4 * c as usize,
+                rh as usize * WT_ROW_W,
+                (16 * $wid + $g) * WT_ROW_W,
+            )
+        };
+        let mut $hdr = [[0u32; 4]; 2];
+    };
+    (@stage [$wt:ident] $ws:ident; $w:ident, $sb:expr, $hh:expr, $st:expr, $tid:ident,
+     $sb_units:expr) => {{
+        let hh: usize = $hh;
+        // SAFETY: each source is 16 bytes at a chunk's offset in its row at
+        // step 0, moved `sb · sb_units + 16 · hh` words on: inside that row's
+        // super-block `sb` (the launch contract holds the rows), 16-byte
+        // aligned — every term is a multiple of sixteen bytes over a stack
+        // enqueue_gemm checked 16-byte aligned. Each destination is that
+        // chunk's place in stage `st`, 16-byte aligned.
+        unsafe {
+            let src = $w.as_ptr().add($sb * $sb_units + 16 * hh);
+            let dst = $wt.add($st * WT_STAGE_W);
+            cp_async_cg_16(dst.add($ws.3), src.byte_add($ws.0 as usize));
+            cp_async_cg_16(dst.add($ws.3 + GEMM_BM / 2 * WT_ROW_W), src.byte_add($ws.1 as usize));
+            if hh == 0 && $tid < GEMM_BM {
+                cp_async_cg_16(dst.add($ws.4), src.byte_add($ws.2 as usize));
+            }
+        }
+    }};
+    // Nothing is read at a step's head: the step's words arrived with its
+    // copy group.
+    (@head [$wt:ident] $dec:ident, $w:ident, $ws:ident, $active:ident, $sb:ident, $hh:ident,
+     $t:ident, $sb_units:expr) => {{
+        let _ = $sb;
+    }};
+    (@after [$wt:ident] $ws:ident, $hdr:ident; $st:ident, $hh:ident, $t:ident, $raw:ident) => {{
+        let () = $raw;
+        // SAFETY: rows 16·wid + g and 16·wid + g + 8 of the slab are this
+        // active warp's, so both are rows of stage `st`.
+        let (p0, p1) = unsafe {
+            let p0 = $wt.add($st * WT_STAGE_W).add($ws.5);
+            (p0, p0.add(8 * WT_ROW_W))
+        };
+        if $hh == 0 {
+            // SAFETY: a row's first four words are its super-block's header,
+            // staged at the super-block's first half, 16-byte aligned, and
+            // published by the barrier after the stage's wait.
+            unsafe {
+                $hdr = [(*(p0 as *const U32x4)).0, (*(p1 as *const U32x4)).0];
+            }
+        }
+        (q4k_dec!(@load $hdr[0], p0, $t), q4k_dec!(@load $hdr[1], p1, $t))
+    }};
+}
+
+/// The walks an entry takes: `split` runs a full tile and a partial one
+/// through their own [`gemm_walk`] (the choice is block-uniform), `plain`
+/// through [`gemm_walk_plain`].
+macro_rules! gemm_walks {
+    (split, $nt_live:ident, $n_sb:ident, $args:tt) => {
+        if $nt_live == GEMM_NT {
+            gemm_walk!(true, $n_sb, $args);
+        } else {
+            gemm_walk!(false, $n_sb, $args);
+        }
+    };
+    (plain, $nt_live:ident, $n_sb:ident, $args:tt) => {
+        gemm_walk_plain!($n_sb, $args)
+    };
+}
+
+/// The step walk of [`gemm_block`]: super-block by super-block, each one's
+/// two 128-value halves as two expansions of [`gemm_step`], so a half's stage,
+/// its weight offsets and its decode's scale arm are constants. `full` (a
+/// literal) is whether the tile is full.
+macro_rules! gemm_walk {
+    ($full:literal, $n_sb:ident, $args:tt) => {{
+        let mut sb = 0usize;
+        while sb < $n_sb {
+            gemm_step!(0usize, $full, sb, $n_sb, $args);
+            gemm_step!(1usize, $full, sb, $n_sb, $args);
+            sb += 1;
+        }
+    }};
+}
+
+/// The step walk of Q5_K and Q3_K: one expansion of [`gemm_step`], the half
+/// `hh` a runtime value and every n-tile tested against the tile's length.
+/// Only `gate_gemm` launches them, and the split walk doubles a loop's code.
+macro_rules! gemm_walk_plain {
+    ($n_sb:ident, $args:tt) => {{
+        let mut h = 0usize;
+        while h < 2 * $n_sb {
+            let sb = h / 2;
+            gemm_step!(h & 1, false, sb, $n_sb, $args);
+            h += 1;
+        }
+    }};
+}
+
+/// One step of [`gemm_block`]: half `hh` of super-block `sb` (128-value block
+/// `h = 2·sb + hh`). It loads a direct entry's weight words, stages step
+/// `h + 1` into the other stage (this super-block's second half, or the next
+/// super-block's first while there is one), waits for step `h`'s copies,
+/// decodes both 64-value pairs, then per n-tile multiplies and folds — so
+/// an n-tile's four `isum` words are all the sums a warp holds. A full tile
+/// (`full`) runs every n-tile with no test against the tile's length.
+macro_rules! gemm_step {
+    ($hh:expr, $full:literal, $sb:ident, $n_sb:ident, (
+        $dec:ident, $wst:ident($($wsa:ident),*), $sb_units:expr, $w:ident, $ws:ident, $hdr:ident,
+        $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident, $acol_sh:ident,
+        $tid:ident, $ncols:ident, $col_words:ident,
+        $active:ident, $t:ident, $g:ident, $nt_live:ident, $acc:ident
+    )) => {{
+        let hh: usize = $hh;
+        let st = hh;
+        let raw = $wst!(@head [$($wsa),*] $dec, $w, $ws, $active, $sb, hh, $t, $sb_units);
+        let (nsb, nhh) = ($sb + hh, 1 - hh);
+        if hh == 0 || nsb < $n_sb {
+            gemm_stage!(2 * nsb + nhh, nhh, $full, $tid, $ncols, $n_sb, $col_words,
+                $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
+            $wst!(@stage [$($wsa),*] $ws; $w, nsb, nhh, nhh, $tid, $sb_units);
+        }
+        // SAFETY: one group per step (possibly empty), so waiting for all
+        // but the newest leaves step h's copies complete; the barrier then
+        // publishes every thread's copies of it.
+        unsafe {
+            cp_async_commit_group();
+            cp_async_wait_group(1);
+        }
+        thread::sync_threads();
+
+        if $active {
+            let (raw0, raw1) = $wst!(@after [$($wsa),*] $ws, $hdr; st, hh, $t, raw);
+            // SAFETY: stage `st` is inside each shared array.
+            let (bst, s8st, d8st) = unsafe {
+                (
+                    $bt.add(st * B_STAGE_W),
+                    $s8t.add(st * S8_STAGE),
+                    $d8t.add(st * GEMM_BN),
+                )
+            };
+            let (even0, odd0, sc0) = $dec!(@frag raw0, raw1, 0usize, hh);
+            let (even1, odd1, sc1) = $dec!(@frag raw0, raw1, 1usize, hh);
+            let rw = $dec!(@rows raw0, raw1, hh);
+            let mut isum = [0i32; 4];
+            let mut nt = 0usize;
+            while nt < GEMM_NT {
+                ::cuda_device::thread::__unroll_config::<{ 0 }>();
+                if $full || nt < $nt_live {
+                    // SAFETY: column 8*nt + g < ncols and words 8t .. 8t + 7
+                    // < 32 of its block: inside this stage, 16-byte aligned,
+                    // published above.
+                    let (bw0, bw1) = unsafe {
+                        let p = bst.add((8 * nt + $g) * B_COL_W + 8 * $t);
+                        ((*(p as *const U32x4)).0, (*(p.add(4) as *const U32x4)).0)
+                    };
+                    $dec!(@mma even0, bw0[0], bw0[1], sc0, 0, isum, true);
+                    $dec!(@mma odd0, bw0[2], bw0[3], sc0, 1, isum, false);
+                    $dec!(@mma even1, bw1[0], bw1[1], sc1, 0, isum, false);
+                    $dec!(@mma odd1, bw1[2], bw1[3], sc1, 1, isum, false);
+                    let n0 = 8 * nt + 2 * $t;
+                    // SAFETY: n0 is even and n0 + 1 < GEMM_BN: one 8-byte
+                    // read inside this stage's d8.
+                    let dcol = unsafe { *(d8st.add(n0) as *const F32x2) }.0;
+                    $dec!(@epi rw, s8st, n0, dcol, isum, $acc, nt);
+                }
+                nt += 1;
+            }
+        }
+        // Every warp is done with stage `st` before step h + 1 stages step
+        // h + 2 into it.
+        thread::sync_threads();
+    }};
+}
+
 /// The GEMM block: one tile's columns against one 128-row slab of that
 /// tile's expert. A macro, not a function, for the reason
 /// `mma_segment_walk` is one: the four entries share the walk and differ
 /// only in the decode `dec` names, and a function boundary would move the
 /// accumulators out of registers.
 ///
-/// `sb_base` is the unit (words for Q4_K and Q5_K, bytes for Q6_K and Q3_K)
-/// the decode's `@load` takes, `row_units` those units per row and
-/// `sb_units` per super-block. The expansion's `unsafe` blocks rest on the
-/// entry's launch contract and on the route table the host guarantees was
-/// built for this stack and slot count.
+/// `sb_units` is the unit (words for Q4_K and Q5_K, bytes for Q6_K and Q3_K)
+/// the weight words are addressed in, per super-block. `wst` names how the
+/// weight words reach the warps ([`wst_direct`] or the staged [`wst_q4k`])
+/// with its shared arrays, `walk` the step walk ([`gemm_walks`]). The
+/// expansion's `unsafe` blocks rest on the entry's launch contract and on the
+/// route table the host guarantees was built for this stack and slot count.
 ///
 /// The blocks of tile index 0 — there is one per slab whatever the table
 /// holds — first write NaN over their slab's rows of every slot the route
@@ -624,6 +905,8 @@ macro_rules! gemm_stage {
 macro_rules! gemm_block {
     (
         dec: $dec:ident,
+        wst: $wst:ident($($wsa:ident),*),
+        walk: $walk:ident,
         sb_units: $sb_units:expr,
         w: $w:ident, q6: $q6:ident, s8: $s8:ident, d8: $d8:ident,
         cols: $cols:ident, tiles: $tiles:ident, n_tiles: $n_tiles:ident,
@@ -706,95 +989,19 @@ macro_rules! gemm_block {
         // the block but loads, multiplies and stores nothing.
         let active = row0 < rows_n;
         let n_sb = $n_sb as usize;
-        let steps = 2 * n_sb;
         let col_words = 128 * $half_it as usize;
-        let r0 = e * rows_n + row0 + g;
-        let base0 = r0 * n_sb * $sb_units;
-        let base1 = (r0 + 8) * n_sb * $sb_units;
+        $wst!(@decl [$($wsa),*] ws, hdr; $w, e, rows_n, rt, row0, g, tid, wid, n_sb, $rows, $n_sb,
+            $sb_units);
 
         let mut acc = [0.0f32; 4 * GEMM_NT];
-        let mut isum = [0i32; 4 * GEMM_NT];
-        gemm_stage!(0usize, 0usize, tid, ncols, n_sb, col_words,
+        gemm_stage!(0usize, 0usize, false, tid, ncols, n_sb, col_words,
             $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
+        $wst!(@stage [$($wsa),*] ws; $w, 0usize, 0usize, 0usize, tid, $sb_units);
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
-        let mut h = 0usize;
-        while h < steps {
-            let sb = h / 2;
-            let hh = h & 1;
-            let st = hh;
-            let (raw0, raw1) = if active {
-                (
-                    $dec!(@load $w, base0 + sb * $sb_units, hh, t),
-                    $dec!(@load $w, base1 + sb * $sb_units, hh, t),
-                )
-            } else {
-                Default::default()
-            };
-            if h + 1 < steps {
-                gemm_stage!(h + 1, st ^ 1, tid, ncols, n_sb, col_words,
-                    $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
-            }
-            // SAFETY: one group per step (possibly empty), so waiting for all
-            // but the newest leaves block h's copies complete; the barrier
-            // then publishes every thread's copies of it.
-            unsafe {
-                cp_async_commit_group();
-                cp_async_wait_group(1);
-            }
-            thread::sync_threads();
-
-            if active {
-                // SAFETY: stage `st` is inside each shared array.
-                let (bst, s8st, d8st) = unsafe {
-                    (
-                        $bt.add(st * B_STAGE_W),
-                        $s8t.add(st * S8_STAGE),
-                        $d8t.add(st * GEMM_BN),
-                    )
-                };
-                let mut pp = 0usize;
-                while pp < 2 {
-                    ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                    let (even, odd, sc) = $dec!(@frag raw0, raw1, pp, hh);
-                    let mut nt = 0usize;
-                    while nt < GEMM_NT {
-                        ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                        if nt < nt_live {
-                            // SAFETY: column 8*nt + g < ncols and word
-                            // 8t + 4pp + 3 < 32 of its block: inside this
-                            // stage, 16-byte aligned, published above.
-                            let bw = unsafe {
-                                *(bst.add((8 * nt + g) * B_COL_W + 8 * t + 4 * pp)
-                                    as *const U32x4)
-                            }
-                            .0;
-                            $dec!(@mma even, bw[0], bw[1], sc, 0, isum, nt);
-                            $dec!(@mma odd, bw[2], bw[3], sc, 1, isum, nt);
-                        }
-                        nt += 1;
-                    }
-                    pp += 1;
-                }
-                let rw = $dec!(@rows raw0, raw1, hh);
-                let mut nt = 0usize;
-                while nt < GEMM_NT {
-                    ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                    if nt < nt_live {
-                        let n0 = 8 * nt + 2 * t;
-                        // SAFETY: n0 is even and n0 + 1 < GEMM_BN: one 8-byte
-                        // read inside this stage's d8.
-                        let dcol = unsafe { *(d8st.add(n0) as *const F32x2) }.0;
-                        $dec!(@epi rw, s8st, n0, dcol, isum, acc, nt);
-                    }
-                    nt += 1;
-                }
-            }
-            // Every warp is done with stage `st` before step h + 1 stages
-            // block h + 2 into it.
-            thread::sync_threads();
-            h += 1;
-        }
+        gemm_walks!($walk, nt_live, n_sb, ($dec, $wst($($wsa),*), $sb_units, $w, ws, hdr,
+            $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh, tid, ncols, col_words,
+            active, t, g, nt_live, acc));
 
         if active {
             let mut nt = 0usize;
@@ -1211,7 +1418,9 @@ mod gemm_kernels {
     }
 
     /// The grouped GEMM for a Q4_K stack: `w` is `n_experts · rows` rows of
-    /// `36 · n_sb` words (the file's super-blocks); the activations are the
+    /// `36 · n_sb` words (the file's super-blocks), 16-byte aligned and fewer
+    /// than 2^30 words (its slabs are staged in 16-byte copies from 32-bit
+    /// byte offsets); the activations are the
     /// q6 permutation, `s8` and `d8` of `act_cols` quantized columns; the
     /// route table (`cols`, `tiles`, `n_tiles`) was built for `n_slots`
     /// slots of this stack, and slot `s` reads column `s / slot_div`. Block
@@ -1263,21 +1472,25 @@ mod gemm_kernels {
         static mut D8T: SharedArray<f32, { 2 * GEMM_BN }, 16> = SharedArray::UNINIT;
         static mut SLOT: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
         static mut ACOL: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
+        static mut WT: SharedArray<u32, { 2 * WT_STAGE_W }, 16> = SharedArray::UNINIT;
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; the block walk bounds every index and orders every
         // cross-thread read behind a barrier.
-        let (bt, s8t, d8t, slot_sh, acol_sh) = unsafe {
+        let (bt, s8t, d8t, slot_sh, acol_sh, wt) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut BT),
                 SharedArray::as_raw_mut_ptr(&raw mut S8T),
                 SharedArray::as_raw_mut_ptr(&raw mut D8T),
                 SharedArray::as_raw_mut_ptr(&raw mut SLOT),
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
+                SharedArray::as_raw_mut_ptr(&raw mut WT),
             )
         };
         let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q4k_dec,
+            wst: wst_q4k(wt),
+            walk: split,
             sb_units: 36,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
@@ -1345,6 +1558,8 @@ mod gemm_kernels {
         let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q5k_dec,
+            wst: wst_direct(),
+            walk: plain,
             sb_units: 44,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
@@ -1414,6 +1629,8 @@ mod gemm_kernels {
         let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q6k_dec,
+            wst: wst_direct(),
+            walk: split,
             sb_units: 210,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
@@ -1481,6 +1698,8 @@ mod gemm_kernels {
         let _ = (n_experts, act_cols, max_tiles);
         gemm_block!(
             dec: q3k_dec,
+            wst: wst_direct(),
+            walk: plain,
             sb_units: 110,
             w: w, q6: q6, s8: s8, d8: d8,
             cols: cols, tiles: tiles, n_tiles: n_tiles,
@@ -2097,6 +2316,21 @@ impl GemmKernels {
                     act.k(),
                     w.cols(),
                     4 * w.buf().len()
+                ),
+            ));
+        }
+        if ty == GemmWeight::Q4K
+            && (!w.buf().cu_deviceptr().is_multiple_of(16)
+                || w.buf().len() > (u32::MAX / 4) as usize)
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a Q4_K stack is staged in 16-byte copies from 32-bit byte offsets: it must \
+                     start 16-byte aligned and hold fewer than 2^30 words; this one starts at \
+                     device address {:#x} and holds {} words",
+                    w.buf().cu_deviceptr(),
+                    w.buf().len()
                 ),
             ));
         }

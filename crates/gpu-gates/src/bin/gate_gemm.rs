@@ -93,7 +93,8 @@
 //! three `_sel` gemvs, where an id past the stack raises
 //! `FaultSite::ExpertId` and a host-served slot (`hybrid::HOST`) raises
 //! nothing; and the host API's refusals (type, K, slot count, row count,
-//! unfilled table, token shape, activation capacity). Last, the fault's site
+//! unfilled table, token shape, activation capacity, a Q4_K stack that does
+//! not start 16-byte aligned). Last, the fault's site
 //! mask: two sites raised in one layer after a third in a later layer are
 //! all the first layer's mask holds, on the card and in the argmax's copy.
 
@@ -1330,6 +1331,37 @@ mod gate {
                     &mut y,
                 )
                 .is_err(),
+        ));
+        // The Q4_K staging copies the stack in 16-byte pieces: a window one
+        // word into an allocation is aligned for u32 and not for that. The
+        // refusal comes before any launch, so the window's bytes are never
+        // read; the error must name the alignment, not another shape check.
+        let pad = DeviceBuffer::<u32>::zeroed(stream, res.w.buf().len() + 4)?;
+        // SAFETY: the window is the span after the first word of `pad`, which
+        // holds four more words than the span; `pad` outlives the call and the
+        // window is given back right after it.
+        let w_off = unsafe {
+            DeviceTensor::<u32>::window(
+                pad.cu_deviceptr() + 4,
+                res.w.rows(),
+                res.w.cols(),
+                dev.gpu.context(),
+            )
+        };
+        let misaligned = dev.gk.enqueue_gemm(
+            stream,
+            GemmWeight::Q4K,
+            &w_off,
+            rows,
+            &res.act,
+            &res.route,
+            st.input.gemm(),
+            &mut y,
+        );
+        DeviceTensor::release(w_off);
+        refusals.push((
+            "q4k_stack_misaligned",
+            misaligned.is_err_and(|e| e.to_string().contains("16-byte aligned")),
         ));
         let mut dense = GemmRoute::new(stream, 64, 1)?;
         refusals.push((
