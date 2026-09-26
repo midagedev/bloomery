@@ -1,0 +1,27 @@
+# The implementation round q3swz (docs/research q3fstep report): gqa_prefill_flash's K/V tiles in a
+# 256-byte row with the 16-byte chunks XOR-swizzled by row & 7 instead of the 272-byte padded row,
+# on q3fa's kernel, plus the prologue diet (32 query loads in flight, cvt.rn.f16x2.f32 with a NaN
+# select). Sitting 16 measured 102,959,116 L2->SM read sectors for q3fa against 69,337,088 of K/V and
+# Q bytes; the excess equals 256 bytes a live key a block to 2,060 sectors — every odd key row's
+# 16-byte chunks straddle 32-byte smem sectors [derived]. The band is the stall model fitted to
+# sitting 16 (long_scoreboard 18.1 % -> 2..5 %) at its lower edge and the L2-demand model at u 0.79
+# at its upper, plus the prologue's instruction term [derived].
+kind: profile
+question: does gqa_prefill_flash with swizzled K/V tiles and the prologue diet read the L2 once per
+  staged byte, and how many SM cycles does its launch take at layer 24 of a P = 4096 prompt?
+term: elapsed SM cycles of one gqa_prefill_flash launch (the q3pp form, layer 24, P = 4096, one
+  ubatch) under ncu at the card's own clock, A6000 300 W, beside q3fa's row in the same lease
+unit: M cycles
+predict: 2.14..2.50
+condition: just ncu-gpu-qwen3-pp 4096 24 under the lease, A6000, --clock-control none, the q3fa tree
+  and the round's tree through BLOOMERY_NCU_BIN in one sitting; the summary's proof passes (grid
+  2,048 x 128, 34,078,720 HMMA); lts__t_sectors_srcunit_tex_op_read.sum reads 69.34 M within 0.1 %
+  (69,337,088 + the count reads), else the swizzle did not take and the row is void; warps active
+  about 8 a SM; registers at most 255 and 2 blocks a SM
+decide-in: land the round; run the pp4096 ab card (+1.8..+4.4 %, resolvable at 4 rounds); open the
+  FA2 step shape (fstep) only if this row's long_scoreboard is at most 5 %, else the L2 order
+  lever (head-grouped LPT, DRAM re-reads 55 MB) first
+decide-below: land; the L2 sectors were the whole residue: open fstep next with its band re-fitted
+  to this row, and strike the lockstep and stagger items from the flash triage
+decide-above: sectors exact but cycles not: the residue is DRAM-miss latency on the tile copies,
+  not bandwidth; price the L2 order lever from this row's long_scoreboard before any step-shape work

@@ -12,12 +12,17 @@
 //! `[64·i, 64·i + 64)` whatever the ubatch's first position), ascending, and
 //! stages each tile's key and value rows into shared memory once for all of
 //! its rows: the value tile is copied (`cp.async`) while the scores run on the
-//! key tile, the next key tile while the values are accumulated.
+//! key tile, the next key tile while the values are accumulated. A staged row
+//! is the cache row's 256 bytes unpadded, its sixteen 16-byte chunks permuted
+//! within each 128-byte half by `chunk ^ (row & 7)` ([`staged_word`]): each
+//! 32-byte source sector lands in one 32-byte shared sector, and the eight rows
+//! of one `ldmatrix` phase hit the thirty-two banks once.
 //!
 //! Per tile and warp:
 //! 1. `S = Q·Kᵀ` on `mma.m16n8k16`: the query rows rounded to f16 once per
-//!    block (`f32_to_f16_bits`, nearest even) and held in registers, the
-//!    head's eight k16 steps ascending from zero, then `s = S · scale` rounded
+//!    block (`f32x2_to_f16x2_bits`: `f32_to_f16_bits` of each value, nearest
+//!    even) and held in registers, the head's eight k16 steps ascending from
+//!    zero, then `s = S · scale` rounded
 //!    — the scores `gqa_flash_seg_mma` computes for the same row and key, bit
 //!    for bit. A key at or past the row's count is `−inf`.
 //! 2. Per query row: the tile max (the lane's 16 values, then the xor
@@ -65,7 +70,7 @@
 //! it.
 
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::{dev_exp, f32_to_f16_bits, mma_row_words};
+use crate::flash::{dev_exp, f32x2_to_f16x2_bits};
 use crate::flash_gqa::{GROUP, HEAD};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -87,16 +92,16 @@ const _: () = assert!(THREADS_U32 as usize == THREADS);
 /// Query rows one block covers: every position's group of heads, staged
 /// through the key tile before the first key tile lands.
 const Q_ROWS: usize = POSITIONS * GROUP;
-/// u32 words between two staged rows: eight rows of one `ldmatrix` phase
-/// (plain or `.trans`) cover the thirty-two banks once.
-const ROW_W: usize = mma_row_words(HEAD);
-const TILE_W: usize = KEY_TILE * ROW_W;
 /// 16-byte chunks of one cache row, and per thread per staged tile.
 const ROW_CHUNKS: usize = HEAD / 8;
 const CHUNKS: usize = KEY_TILE * ROW_CHUNKS / THREADS;
 /// f16 pairs of one query row, and per thread in the query staging.
 const Q_PAIRS: usize = HEAD / 2;
 const Q_WORDS: usize = Q_ROWS * Q_PAIRS / THREADS;
+/// Staged query rows one pass of the block's loads covers, and the passes
+/// that cover one position's group of heads.
+const Q_ROW_STEP: usize = THREADS / Q_PAIRS;
+const Q_POS_PASSES: usize = GROUP / Q_ROW_STEP;
 /// The score's k16 steps over the head, and its n8 tiles of keys.
 const QK_STEPS: usize = HEAD / 16;
 const KEY_NT: usize = KEY_TILE / 8;
@@ -109,16 +114,89 @@ const DIM_PAIRS: usize = HEAD / 16;
 /// [`CHUNKS`] passes, thread `tid` copying column `tid % ROW_CHUNKS` of key
 /// `tid / ROW_CHUNKS` of each.
 const PASS_KEYS: usize = THREADS / ROW_CHUNKS;
-/// u32 words of one cache row, and of one tile of rows.
+/// u32 words of one cache row, and of one tile of rows — in the cache plane
+/// and staged alike.
 const ROW_WORDS: usize = HEAD / 2;
 const TILE_WORDS: usize = KEY_TILE * ROW_WORDS;
 const KEY_TILE_U32: u32 = KEY_TILE as u32;
 
+/// The staged word of word `w` of tile row `row`: rows `ROW_WORDS` apart,
+/// 16-byte chunk `w / 4` stored at chunk `(w / 4) ^ (row & 7)`. The one owner
+/// of the tile layout: every staging store and `cp.async` destination goes
+/// through it, and every `ldmatrix` address is a lane base taken from it plus
+/// an offset [`staged_offsets_hold`] proves.
+#[inline(always)]
+const fn staged_word(row: usize, w: usize) -> usize {
+    row * ROW_WORDS + ((((w >> 2) ^ (row & 7)) << 2) | (w & 3))
+}
+
+/// The layout's sector facts, over the eight rows `row & 7` distinguishes:
+/// every logical 32-byte pair of chunks lands in one aligned 32-byte sector,
+/// and every chunk stays in its 128-byte half of the row.
+const fn staged_pairs_hold() -> bool {
+    let mut row = 0;
+    while row < 8 {
+        let mut w = 0;
+        while w < ROW_WORDS {
+            let at = staged_word(row, w) - row * ROW_WORDS;
+            let mate = staged_word(row, w ^ 4) - row * ROW_WORDS;
+            if at / 8 != mate / 8 || at / 32 != w / 32 {
+                return false;
+            }
+            w += 1;
+        }
+        row += 1;
+    }
+    true
+}
+
+/// u32 words of half a staged row: the XOR never crosses it. An `ldmatrix`
+/// step reads a pair of chunks (8 words), so a half-row is HALF_PAIRS steps.
+const HALF_ROW: usize = ROW_WORDS / 2;
+const HALF_PAIRS: usize = HALF_ROW / 8;
+
+/// The layout's offsets, over a whole tile: word `w` of row `row` is the same
+/// word of row `row % 8` in the first half-row plus whole rows and a whole
+/// half-row — so an address `8·i` rows or a half-row further on is the same
+/// lane's address plus a constant.
+const fn staged_offsets_hold() -> bool {
+    let mut row = 0;
+    while row < KEY_TILE {
+        let mut w = 0;
+        while w < ROW_WORDS {
+            let base = staged_word(row % 8, w % HALF_ROW);
+            if staged_word(row, w) != base + (row - row % 8) * ROW_WORDS + (w - w % HALF_ROW) {
+                return false;
+            }
+            w += 1;
+        }
+        row += 1;
+    }
+    true
+}
+
 const _: () = assert!(GROUP == 8 && Q_ROWS == WARPS * 16 && Q_ROWS <= KEY_TILE);
 const _: () = assert!(PASS_KEYS * ROW_CHUNKS == THREADS && PASS_KEYS * CHUNKS == KEY_TILE);
-const _: () = assert!((ROW_W * 4) % 128 == 16 && ROW_W >= HEAD / 2);
+// A row is whole 128-byte lines, so a row's 32-byte sectors and halves are
+// aligned whenever the tile base is (the tiles are 128-byte aligned).
+const _: () = assert!((ROW_WORDS * 4).is_multiple_of(128));
+// The XOR takes the low three chunk bits: a row needs whole groups of eight
+// chunks for it to stay inside the row.
+const _: () = assert!(ROW_CHUNKS.is_multiple_of(8));
+// Tile rows start at key 64·i, so a row's `row & 7` is its key's; eight
+// consecutive rows (an `ldmatrix` phase) take every value of it once.
+const _: () = assert!(KEY_TILE.is_multiple_of(8));
+// A thread's copies of a tile are PASS_KEYS rows apart and so share `row & 7`:
+// its destinations are one constant plus a pass stride.
+const _: () = assert!(PASS_KEYS.is_multiple_of(8));
+const _: () = assert!(staged_pairs_hold());
+const _: () = assert!(staged_offsets_hold());
 const _: () = assert!(CHUNKS * THREADS == KEY_TILE * ROW_CHUNKS);
 const _: () = assert!(Q_WORDS * THREADS == Q_ROWS * Q_PAIRS);
+// Pass `e` of a thread is row `Q_ROW_STEP·e + tid / Q_PAIRS`: position
+// `e / Q_POS_PASSES`, head `Q_ROW_STEP·(e % Q_POS_PASSES) + tid / Q_PAIRS`.
+const _: () = assert!(Q_ROW_STEP * Q_PAIRS == THREADS && Q_POS_PASSES * Q_ROW_STEP == GROUP);
+const _: () = assert!(Q_WORDS == Q_POS_PASSES * POSITIONS);
 const _: () = assert!(KEY_TILE == 4 * 16 && HEAD.is_multiple_of(16));
 
 /// Blocks a ubatch of `t` rows over `n_kv` key heads launches.
@@ -205,8 +283,10 @@ mod flash_gqa_prefill_kernels {
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
-        static mut KT: SharedArray<u32, TILE_W> = SharedArray::UNINIT;
-        static mut VT: SharedArray<u32, TILE_W> = SharedArray::UNINIT;
+        // 128-byte aligned: the layout's sectors and halves are aligned only
+        // if the tile base is.
+        static mut KT: SharedArray<u32, TILE_WORDS, 128> = SharedArray::UNINIT;
+        static mut VT: SharedArray<u32, TILE_WORDS, 128> = SharedArray::UNINIT;
 
         let b = thread::blockIdx_x() as usize;
         let nkv = n_kv as usize;
@@ -225,7 +305,7 @@ mod flash_gqa_prefill_kernels {
         let n_head = nkv * GROUP;
         let t0 = qt * POSITIONS;
 
-        // SAFETY: block-shared, TILE_W words each; every write is ordered
+        // SAFETY: block-shared, TILE_WORDS words each; every write is ordered
         // before its reads by a block barrier (the cp.async copies by the
         // wait before it).
         let (kt, vt) = unsafe {
@@ -272,44 +352,56 @@ mod flash_gqa_prefill_kernels {
         // The block's query rows, rounded to f16 pairs, into the key tile:
         // staged row `lp·GROUP + g` is position `t0 + lp`'s head `kh·GROUP +
         // g`, which puts position `2·w + h` at rows `16·w + 8·h ..` — warp
-        // `w`'s fragment. A row past `t_rows` is zero.
+        // `w`'s fragment. A row past `t_rows` is zero. Thread `tid` stages
+        // word `tid % Q_PAIRS` of every row its passes cover, and every load
+        // is issued before the first conversion.
+        let wd = tid % Q_PAIRS;
+        let r0 = tid / Q_PAIRS;
+        // u64 words of q: this thread's word of position t0's head kh·GROUP +
+        // r0, and the step from one position to the next.
+        let q_first = (t0 * n_head + kh * GROUP + r0) * Q_PAIRS + wd;
+        let q_pos = n_head * Q_PAIRS;
         let q64 = q.as_ptr().cast::<u64>();
-        let mut sb = 0usize;
-        while sb < Q_WORDS / 8 {
+        let mut raw = [0u64; Q_WORDS];
+        let mut e = 0usize;
+        while e < Q_WORDS {
             cuda_device::thread::__unroll_config::<0>();
-            let s = 8 * sb;
-            let mut raw = [0u64; 8];
-            let mut e = 0usize;
-            while e < 8 {
-                cuda_device::thread::__unroll_config::<0>();
-                let i = tid + THREADS * (s + e);
-                let r = i / Q_PAIRS;
-                let wd = i - r * Q_PAIRS;
-                let t = t0 + r / GROUP;
-                if t < rows {
-                    let row = t * n_head + kh * GROUP + r % GROUP;
-                    // SAFETY: t < t_rows and kh·GROUP + r % GROUP < n_head, so
-                    // the row lies inside q (launch contract); a row is HEAD
-                    // f32 = HEAD/2 u64 and the buffer is device-allocated, so
-                    // the u64 read of values 2·wd, 2·wd + 1 is aligned.
-                    raw[e] = unsafe { *q64.add(row * Q_PAIRS + wd) };
-                }
-                e += 1;
+            let t = t0 + e / Q_POS_PASSES;
+            if t < rows {
+                let at = q_first
+                    + (e / Q_POS_PASSES) * q_pos
+                    + Q_ROW_STEP * (e % Q_POS_PASSES) * Q_PAIRS;
+                // SAFETY: t < t_rows and the head kh·GROUP + Q_ROW_STEP·(e %
+                // Q_POS_PASSES) + r0 < n_head, so the row lies inside q
+                // (launch contract); a row is HEAD f32 = HEAD/2 u64 and the
+                // buffer is device-allocated, so the u64 read of values
+                // 2·wd, 2·wd + 1 is aligned.
+                raw[e] = unsafe { *q64.add(at) };
             }
-            let mut e = 0usize;
-            while e < 8 {
-                cuda_device::thread::__unroll_config::<0>();
-                let i = tid + THREADS * (s + e);
-                let r = i / Q_PAIRS;
-                let wd = i - r * Q_PAIRS;
-                let lo = f32_to_f16_bits(f32::from_bits(raw[e] as u32)) as u32;
-                let hi16 = f32_to_f16_bits(f32::from_bits((raw[e] >> 32) as u32)) as u32;
-                // SAFETY: r < Q_ROWS <= KEY_TILE and wd < HEAD/2 <= ROW_W:
-                // inside KT; one owner per word.
-                unsafe { *kt.add(r * ROW_W + wd) = lo | (hi16 << 16) };
-                e += 1;
-            }
-            sb += 1;
+            e += 1;
+        }
+        // The staged word of each pass of the first position; a later
+        // position's is it plus whole groups of rows (staged_offsets_hold).
+        let mut q_at = [0usize; Q_POS_PASSES];
+        let mut j = 0usize;
+        while j < Q_POS_PASSES {
+            cuda_device::thread::__unroll_config::<0>();
+            q_at[j] = staged_word(Q_ROW_STEP * j + r0, wd);
+            j += 1;
+        }
+        let mut e = 0usize;
+        while e < Q_WORDS {
+            cuda_device::thread::__unroll_config::<0>();
+            let pair = f32x2_to_f16x2_bits(
+                f32::from_bits(raw[e] as u32),
+                f32::from_bits((raw[e] >> 32) as u32),
+            );
+            // SAFETY: row Q_ROW_STEP·e + r0 < Q_ROWS <= KEY_TILE and wd <
+            // ROW_WORDS: inside KT; one owner per word.
+            unsafe {
+                *kt.add(q_at[e % Q_POS_PASSES] + (e / Q_POS_PASSES) * GROUP * ROW_WORDS) = pair
+            };
+            e += 1;
         }
         thread::sync_threads();
 
@@ -320,10 +412,11 @@ mod flash_gqa_prefill_kernels {
             cuda_device::thread::__unroll_config::<0>();
             let row = wid * 16 + lane % 16;
             // SAFETY: row < Q_ROWS and words 8·kk + 4·(lane/16) .. + 4 <=
-            // HEAD/2 keep the 16-byte row inside KT, published by the barrier
-            // above; every lane issues the load.
+            // HEAD/2 are one whole chunk, which staged_word keeps whole and
+            // 16-byte aligned inside KT, published by the barrier above;
+            // every lane issues the load.
             qa[kk] = unsafe {
-                let p = kt.add(row * ROW_W + 8 * kk + 4 * (lane / 16));
+                let p = kt.add(staged_word(row, 8 * kk + 4 * (lane / 16)));
                 wmma::ldmatrix_x4_shared_u32(shared::cvta_generic_to_shared_u32(
                     p.cast_const().cast::<u8>(),
                 ))
@@ -340,7 +433,7 @@ mod flash_gqa_prefill_kernels {
         let src_word = kh * ctx as usize * ROW_WORDS + 4 * tid;
         let k_src = kc.as_ptr().cast::<u32>().wrapping_add(src_word);
         let v_src = vc.as_ptr().cast::<u32>().wrapping_add(src_word);
-        let dst_word = (tid / ROW_CHUNKS) * ROW_W + 4 * (tid % ROW_CHUNKS);
+        let dst_col = 4 * (tid % ROW_CHUNKS);
         let key_of_pass0 = (tid / ROW_CHUNKS) as u32;
         let tiles = hi.div_ceil(KEY_TILE_U32);
         // Stage tile `kb` of the plane `src` into `dst`: 16-byte copies of
@@ -354,11 +447,12 @@ mod flash_gqa_prefill_kernels {
                 let mut i = 0usize;
                 while i < CHUNKS {
                     cuda_device::thread::__unroll_config::<0>();
+                    let at = staged_word(tid / ROW_CHUNKS + i * PASS_KEYS, dst_col);
                     // SAFETY: key tid / ROW_CHUNKS + PASS_KEYS·i < KEY_TILE and
-                    // column 4·(tid % ROW_CHUNKS) + 4 <= HEAD/2 <= ROW_W: the 16
-                    // destination bytes are inside the tile and 16-byte
-                    // aligned (ROW_W·4 is a multiple of 16).
-                    let d = unsafe { dst.add(dst_word + i * PASS_KEYS * ROW_W) };
+                    // words 4·(tid % ROW_CHUNKS) .. + 4 are one whole chunk,
+                    // which staged_word keeps whole: the 16 destination bytes
+                    // are inside the tile and 16-byte aligned.
+                    let d = unsafe { dst.add(at) };
                     if $full || key0 + ((i * PASS_KEYS) as u32) < hi {
                         // SAFETY: the key is below hi <= ctx (every key of a
                         // full tile is), so its row is inside key head kh's
@@ -384,6 +478,35 @@ mod flash_gqa_prefill_kernels {
             } else {
                 stage!(kt, k_src, 0, false);
             }
+        }
+
+        // This lane's `ldmatrix` addresses in the first sixteen rows and the
+        // first half-row, one per chunk pair `j`: the scores' key row and
+        // chunk `2·j + (lane/8) % 2`, the values' row and chunk `2·j +
+        // lane/16`. Every other address of the walk is one of these plus a
+        // constant (`staged_offsets_hold`).
+        let k_row = lane % 8 + 8 * (lane / 16);
+        let v_row = lane % 8 + 8 * ((lane / 8) % 2);
+        let mut k_at = [0u32; HALF_PAIRS];
+        let mut v_at = [0u32; HALF_PAIRS];
+        let mut j = 0usize;
+        while j < HALF_PAIRS {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: k_row, v_row < 16 <= KEY_TILE and words 8·j + 4 .. + 4
+            // <= HALF_ROW: inside the tiles; only the addresses are formed here.
+            unsafe {
+                k_at[j] = shared::cvta_generic_to_shared_u32(
+                    kt.add(staged_word(k_row, 8 * j + 4 * ((lane / 8) % 2)))
+                        .cast_const()
+                        .cast::<u8>(),
+                );
+                v_at[j] = shared::cvta_generic_to_shared_u32(
+                    vt.add(staged_word(v_row, 8 * j + 4 * (lane / 16)))
+                        .cast_const()
+                        .cast::<u8>(),
+                );
+            }
+            j += 1;
         }
 
         let t4k = 2 * t4 as u32;
@@ -418,17 +541,16 @@ mod flash_gqa_prefill_kernels {
                     let mut nj = 0usize;
                     while nj < KEY_NT / 2 {
                         cuda_device::thread::__unroll_config::<0>();
-                        let key = 16 * nj + lane % 8 + 8 * (lane / 16);
-                        // SAFETY: key < KEY_TILE and words 8·kk + 4·((lane/8)
-                        // % 2) .. + 4 <= HEAD/2 keep the row inside KT,
+                        // Key row 16·nj + k_row, chunk 2·kk + (lane/8) % 2.
+                        let at = k_at[kk % HALF_PAIRS]
+                            + (4 * (16 * nj * ROW_WORDS + HALF_ROW * (kk / HALF_PAIRS))) as u32;
+                        // SAFETY: the row is below KEY_TILE and the chunk is
+                        // whole inside KT (staged_word, staged_offsets_hold),
                         // published by the barrier above; every lane issues
                         // the load, then both `mma.sync` with its own
                         // fragments.
                         unsafe {
-                            let p = kt.add(key * ROW_W + 8 * kk + 4 * ((lane / 8) % 2));
-                            let bf = wmma::ldmatrix_x4_shared_u32(
-                                shared::cvta_generic_to_shared_u32(p.cast_const().cast::<u8>()),
-                            );
+                            let bf = wmma::ldmatrix_x4_shared_u32(at);
                             sc[2 * nj] =
                                 wmma::mma_m16n8k16_f32_f16(sc[2 * nj], qa[kk], [bf[0], bf[1]]);
                             sc[2 * nj + 1] =
@@ -567,16 +689,16 @@ mod flash_gqa_prefill_kernels {
                     let mut nd = 0usize;
                     while nd < DIM_PAIRS {
                         cuda_device::thread::__unroll_config::<0>();
-                        let key = 16 * kk2 + lane % 8 + 8 * ((lane / 8) % 2);
-                        // SAFETY: key < KEY_TILE and words 8·nd + 4·(lane/16)
-                        // .. + 4 <= HEAD/2 keep the row inside VT, published by
-                        // the barrier above; every lane issues the load, then
-                        // both `mma.sync` with its own fragments.
+                        // Value row 16·kk2 + v_row, chunk 2·nd + lane/16.
+                        let at = v_at[nd % HALF_PAIRS]
+                            + (4 * (16 * kk2 * ROW_WORDS + HALF_ROW * (nd / HALF_PAIRS))) as u32;
+                        // SAFETY: the row is below KEY_TILE and the chunk is
+                        // whole inside VT (staged_word, staged_offsets_hold),
+                        // published by the barrier above; every lane issues
+                        // the load, then both `mma.sync` with its own
+                        // fragments.
                         unsafe {
-                            let p = vt.add(key * ROW_W + 8 * nd + 4 * (lane / 16));
-                            let bf = wmma::ldmatrix_x4_trans_shared_u32(
-                                shared::cvta_generic_to_shared_u32(p.cast_const().cast::<u8>()),
-                            );
+                            let bf = wmma::ldmatrix_x4_trans_shared_u32(at);
                             o[2 * nd] =
                                 wmma::mma_m16n8k16_f32_f16(o[2 * nd], pa[kk2], [bf[0], bf[1]]);
                             o[2 * nd + 1] =

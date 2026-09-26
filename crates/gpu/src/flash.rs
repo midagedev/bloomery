@@ -79,7 +79,7 @@ use crate::launch_u32;
 use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::convert::cvt_f32_f16x2_lo;
+use cuda_device::convert::{cvt_f16x2_f32, cvt_f32_f16x2_lo};
 use cuda_device::{
     DisjointSlice, DynamicSharedArray, SharedArray, kernel, launch_bounds, launch_contract, thread,
     warp,
@@ -334,6 +334,28 @@ pub fn partials_ms_len(q_rows: usize, cache_rows: usize) -> usize {
 #[inline(always)]
 pub fn dev_exp(x: f32) -> f32 {
     cuda_device::float::ex2_approx_f32(x * std::f32::consts::LOG2_E)
+}
+
+/// Two f32 rounded to f16 and packed, `lo` in the low half: the hardware's
+/// `cvt.rn.f16x2.f32`, with a NaN lane replaced by `sign | 0x7e00`. Each half
+/// is [`f32_to_f16_bits`] of its value on every f32 — the conversion is IEEE
+/// nearest even as that function is, and only its canonical NaN differs,
+/// which the select restores; `gate-gpu-p4` holds the two over all 2^32
+/// inputs. Device only.
+#[inline(always)]
+pub fn f32x2_to_f16x2_bits(lo: f32, hi: f32) -> u32 {
+    let p = cvt_f16x2_f32(lo, hi);
+    let l = if lo.is_nan() {
+        ((lo.to_bits() >> 16) & 0x8000) | 0x7e00
+    } else {
+        p & 0xffff
+    };
+    let h = if hi.is_nan() {
+        ((hi.to_bits() >> 16) & 0x8000) | 0x7e00
+    } else {
+        p >> 16
+    };
+    l | (h << 16)
 }
 
 /// One `f16` bit pattern widened to `f32` by the hardware's widening

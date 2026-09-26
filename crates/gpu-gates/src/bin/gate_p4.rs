@@ -59,7 +59,9 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::arch::deepseek2::MlaParams;
-    use bloomery_gpu::elem::{ARGMAX_THREADS, ElemKernels};
+    use bloomery_gpu::elem::{
+        ARGMAX_THREADS, ElemKernels, HALF_ENCODE_MUL, HALF_ENCODE_REPORT, HALF_ENCODE_SAMPLES,
+    };
     use bloomery_gpu::{DeviceTensor, Gpu};
 
     // Reduction ops' band vs the f64 host reference (the package's gate rule:
@@ -744,6 +746,58 @@ fn run() -> Result<(), GateError> {
         println!(
             "shape op=half_decode patterns={N16} non_nan_mismatches={finite_bad} \
              nan_bit_pattern_diffs={nan_bad} {shown} {}",
+            verdict(pass)
+        );
+        if !pass {
+            ok = false;
+        }
+    }
+
+    // ======================================================= f16 encode
+    // Exhaustive: every one of the 2^32 f32 bit patterns through the device's
+    // `flash::f32x2_to_f16x2_bits` (the hardware's `cvt.rn.f16x2.f32` with a
+    // NaN select), in the low half and in the high, against the device build
+    // of `f32_to_f16_bits` — the engine's one f32 -> f16 rounding — bit for
+    // bit, NaN signs included. A sample of 2^20 patterns scattered over the
+    // space then holds that device build against the host's, so the
+    // reference itself is pinned. The two mismatch classes are counted apart
+    // so a failure says which.
+    {
+        let mut report = DeviceBuffer::from_host(stream, &[0u32, 0, u32::MAX])?;
+        let mut sample = DeviceBuffer::<u32>::zeroed(stream, HALF_ENCODE_SAMPLES)?;
+        elem.enqueue_half_encode_check(stream, &mut report, &mut sample)?;
+        stream.synchronize()?;
+        let rep = report.to_host_vec(stream)?;
+        let sample = sample.to_host_vec(stream)?;
+        let [non_nan, nan, first] =
+            <[u32; HALF_ENCODE_REPORT]>::try_from(&rep[..HALF_ENCODE_REPORT])
+                .map_err(|_| "half_encode report length")?;
+        let shown = if first == u32::MAX {
+            "first_diff=none".to_string()
+        } else {
+            let want = gguf::quant::f32_to_f16_bits(f32::from_bits(first));
+            format!("first_diff=0x{first:08x}:host=0x{want:04x}")
+        };
+        // The slot's pattern: the multiplier's inverse mod 2^32 (Newton).
+        let mut inv = HALF_ENCODE_MUL;
+        for _ in 0..5 {
+            inv = inv.wrapping_mul(2u32.wrapping_sub(HALF_ENCODE_MUL.wrapping_mul(inv)));
+        }
+        let mut ref_bad = 0usize;
+        let mut ref_first: Option<u32> = None;
+        for (k, &got) in sample.iter().enumerate() {
+            let x = (k as u32).wrapping_mul(inv);
+            if got != u32::from(gguf::quant::f32_to_f16_bits(f32::from_bits(x))) {
+                ref_bad += 1;
+                ref_first.get_or_insert(x);
+            }
+        }
+        let ref_shown = ref_first.map_or("none".to_string(), |x| format!("0x{x:08x}"));
+        let pass = non_nan == 0 && nan == 0 && ref_bad == 0;
+        println!(
+            "shape op=half_encode patterns=4294967296 non_nan_mismatches={non_nan} \
+             nan_mismatches={nan} {shown} ref_sample={HALF_ENCODE_SAMPLES} \
+             ref_mismatches={ref_bad} ref_first_diff={ref_shown} {}",
             verdict(pass)
         );
         if !pass {

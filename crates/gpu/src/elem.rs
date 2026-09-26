@@ -19,10 +19,12 @@
 use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
+use crate::flash::{f32_to_f16_bits, f32x2_to_f16x2_bits};
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -40,6 +42,25 @@ pub(crate) const RMS_THREADS_U32: u32 = RMS_THREADS as u32;
 const _: () = assert!(RMS_THREADS_U32 as usize == RMS_THREADS);
 /// Warps in that block, and so the width of the second-stage combine.
 pub const RMS_WARPS: usize = RMS_THREADS / 32;
+
+/// f32 patterns `half_encode_check` also runs through the device build of
+/// `f32_to_f16_bits` alone, for the host to hold against its own: the
+/// patterns `x` with `x · HALF_ENCODE_MUL < HALF_ENCODE_SAMPLES` (mod 2^32),
+/// slot `x · HALF_ENCODE_MUL` — an odd multiplier, so a bijection that
+/// scatters the sample over the whole space.
+pub const HALF_ENCODE_SAMPLES: usize = 1 << 20;
+/// The sample's multiplier (odd).
+pub const HALF_ENCODE_MUL: u32 = 0x9e37_79b1;
+const _: () = assert!(HALF_ENCODE_MUL % 2 == 1);
+/// `half_encode_check`'s report words: mismatches on a non-NaN input, on a
+/// NaN input, and the smallest mismatching input (`u32::MAX` for none).
+pub const HALF_ENCODE_REPORT: usize = 3;
+/// Threads a `half_encode_check` block runs; the grid is `2^32 /` this.
+const HALF_ENCODE_THREADS: u32 = 256;
+// The kernel's launch contract states these three as literals.
+const _: () = assert!(
+    HALF_ENCODE_SAMPLES == 1_048_576 && HALF_ENCODE_REPORT == 3 && HALF_ENCODE_THREADS == 256
+);
 
 /// Threads the argmax gives one vector: a whole block's worth, since the
 /// scan is a latency chain — each thread's strided loads (the head's row is
@@ -659,6 +680,57 @@ mod elem_kernels {
         // SAFETY: i < n <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = half_to_f32(b);
+        }
+    }
+
+    /// Every f32 bit pattern `x`, one per thread (the launch is exactly 2^32
+    /// threads), through [`f32x2_to_f16x2_bits`] as the pair `(x, !x)` — so
+    /// each pattern is tested in both halves — against the device build of
+    /// [`f32_to_f16_bits`] of each. A mismatching half counts into `report[0]`
+    /// (its input is not a NaN) or `report[1]` (it is), and `report[2]` keeps
+    /// the smallest mismatching input by atomic minimum; the host zeroes the
+    /// counts and sets `report[2]` to `u32::MAX` first. The sample patterns
+    /// ([`HALF_ENCODE_SAMPLES`]) also write `f32_to_f16_bits(x)` to their slot
+    /// of `sample`. The gate's instrument, not a step op.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (report.len() >= 3, sample.len() >= 1048576)
+    )]
+    pub fn half_encode_check(mut report: DisjointSlice<u32>, mut sample: DisjointSlice<u32>) {
+        let x = thread::index_1d().get() as u32;
+        let nx = !x;
+        let got = f32x2_to_f16x2_bits(f32::from_bits(x), f32::from_bits(nx));
+        let rep = report.as_mut_ptr();
+        let mut h = 0;
+        while h < 2 {
+            let (input, got16) = if h == 0 {
+                (x, got & 0xffff)
+            } else {
+                (nx, got >> 16)
+            };
+            let v = f32::from_bits(input);
+            if got16 != f32_to_f16_bits(v) as u32 {
+                let class = if v.is_nan() { 1 } else { 0 };
+                // SAFETY: class < 2 < 3 <= report.len() by the launch
+                // contract; these words are only reached atomically while
+                // the launch runs.
+                unsafe {
+                    DeviceAtomicU32::from_ptr(rep.add(class)).fetch_add(1, AtomicOrdering::Relaxed);
+                    DeviceAtomicU32::from_ptr(rep.add(2)).fetch_min(input, AtomicOrdering::Relaxed);
+                }
+            }
+            h += 1;
+        }
+        let slot = x.wrapping_mul(HALF_ENCODE_MUL) as usize;
+        if slot < HALF_ENCODE_SAMPLES {
+            // SAFETY: slot < HALF_ENCODE_SAMPLES <= sample.len() by the launch
+            // contract; the multiplier is odd, so one thread owns each slot.
+            unsafe {
+                *sample.get_unchecked_mut(slot) = f32_to_f16_bits(f32::from_bits(x)) as u32;
+            }
         }
     }
 
@@ -1287,6 +1359,41 @@ impl ElemKernels {
             .module
             .prepare_half_decode(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.half_decode(stream, &prep, bits, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue the exhaustive check of `flash::f32x2_to_f16x2_bits` against
+    /// the device build of `f32_to_f16_bits` over every f32 pattern: the
+    /// counts and the smallest mismatching input into `report` (the caller
+    /// sets it to `[0, 0, u32::MAX]`), the sample of the reference into
+    /// `sample` ([`HALF_ENCODE_SAMPLES`] slots). The gate's instrument, not a
+    /// step op. Asynchronous, allocation-free.
+    pub fn enqueue_half_encode_check(
+        &self,
+        stream: &CudaStream,
+        report: &mut DeviceBuffer<u32>,
+        sample: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        if report.len() < HALF_ENCODE_REPORT || sample.len() < HALF_ENCODE_SAMPLES {
+            return Err(GpuError::shape(
+                "enqueue_half_encode_check",
+                format!(
+                    "report.len() {} (need {HALF_ENCODE_REPORT}), sample.len() {} (need \
+                     {HALF_ENCODE_SAMPLES})",
+                    report.len(),
+                    sample.len()
+                ),
+            ));
+        }
+        let blocks = (1u64 << 32) / u64::from(HALF_ENCODE_THREADS);
+        let blocks = launch_u32("enqueue_half_encode_check", "blocks", blocks as usize)?;
+        let prep = self.module.prepare_half_encode_check(LaunchConfig1D::new(
+            blocks,
+            HALF_ENCODE_THREADS,
+            0,
+        ))?;
+        self.module
+            .half_encode_check(stream, &prep, report, sample)?;
         Ok(())
     }
 

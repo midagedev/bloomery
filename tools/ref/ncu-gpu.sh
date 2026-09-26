@@ -38,7 +38,10 @@
 # report as <out>.ncu-rep, and after the run prints its source page — SASS with the counters per
 # instruction — into <out>.source.csv (`ncu --import`, no GPU). The source page is per profiled
 # launch: pair it with BLOOMERY_NCU_COUNT=1 or 2. The summary reads <out>.csv as without it; when the
-# live run leaves that file empty, it is the report's details page.
+# live run leaves that file empty, it is the report's details page. After the summary, `q3pp.py source`
+# reads the page: each global memory instruction's L2 Theoretical Sectors Global against ncu's Ideal,
+# flagged above 1.05 by address and instruction (a 16-byte copy whose sectors split across a shared
+# row is the class it names).
 #
 # The V4.1 prompt form (BLOOMERY_NCU_FORM=ds41pp, `just ncu-gpu-ds41-pp [P]`): one launch of each of the
 # four attention projections (the joined qkv, q_b, wo_a heads, wo_b) at m = 8 in one full chunk of a
@@ -191,6 +194,17 @@ source_dry() {
   [ -n "$SOURCE" ] || return 0
   echo "[dry] then, when $1.csv holds no metric row: ${DETAILS_CMD[*]} > $1.csv"
   echo "[dry] then: ${SOURCE_CMD[*]} > $1.source.csv"
+  echo "[dry] then, after the summary: python3 ${BASH_SOURCE[0]%/*}/q3pp.py source $1.source.csv"
+}
+# source_sectors <out>: after the summary, each global memory instruction's L2 sectors against ncu's ideal
+# from the source page (q3pp.py source), flagged above 1.05; a failure sets rc when the run's own rc is 0.
+source_sectors() {
+  local sec_rc
+  [ -n "${SOURCE:-}" ] && [ -s "$1.source.csv" ] || return 0
+  echo "--- L2 sectors per instruction (the source page)"
+  lease_bounded "$LEASE_ARM_BOUND" python3 "${BASH_SOURCE[0]%/*}/q3pp.py" source "$1.source.csv"
+  sec_rc=$?
+  [ $sec_rc -eq 0 ] || [ "$rc" -ne 0 ] || rc=$sec_rc
 }
 # source_pages <out>: the two pages after the run; a failure sets rc when the run's own rc is 0.
 source_pages() {
@@ -346,6 +360,7 @@ PY
     echo "[summary] no CSV at $out.csv"
     [ $rc -ne 0 ] || rc=3
   fi
+  source_sectors "$out"
   echo "[lease] released at $(now)"
   exit $rc
 fi
@@ -567,6 +582,7 @@ if [ "$FORM" = q3pp ]; then
     echo "[summary] no CSV at $out.csv"
     [ $rc -ne 0 ] || rc=3
   fi
+  source_sectors "$out"
   echo "[lease] released at $(now)"
   exit $rc
 fi

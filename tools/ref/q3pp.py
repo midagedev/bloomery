@@ -9,6 +9,13 @@
       the proof against the profiled run, then the step's cycles and each unit's demand beside them
   q3pp.py metrics
       the --metrics list the summary reads, comma-joined: this file owns the names
+  q3pp.py source <source csv> [--limit R]
+      the source page (ncu-gpu.sh's <out>.source.csv, BLOOMERY_NCU_SOURCE=1, the q3pp and gemm forms): per
+      global memory instruction (LDG, LDGSTS, STG, ...) of each kernel, ncu's L2 Theoretical Sectors
+      Global against its Ideal, summed over the page's launches, flagged above R (default 1.05) by address,
+      offset from the kernel's first instruction (the offsets tools/sass-scan.sh lists) and instruction.
+      A ratio above 1 on a 16-byte copy is a layout symptom (a source or destination 32-byte sector split
+      in two); on a narrower access it is the access size alone. No GPU; exit 3 when the page holds no row
 
 The profiled command is tools/ref/depth-qwen3moe.sh's `<P>` arm, `generate_qwen3moe --tokens
 <lcg_prompt P> --ctx C` with -n 1 (the smallest the binary takes) and without --time, which -n 1
@@ -533,6 +540,65 @@ def cmd_summary(argv):
     return 0
 
 
+def cmd_source(argv):
+    if not argv:
+        refuse("usage: q3pp.py source <source csv> [--limit R]", 64)
+    path, limit = argv[0], float(opt(argv, "--limit", "1.05"))
+    try:
+        rows = list(csv.reader(open(path)))
+    except OSError as e:
+        refuse(f"[source] {path}: {e.strerror}")
+    agg, order, pages, first = {}, {}, {}, {}
+    kernel, col = None, None
+    for r in rows:
+        if r and r[0] == "Kernel Name":
+            kernel, col = r[1], None
+            pages[kernel] = pages.get(kernel, 0) + 1
+            continue
+        if r and r[0] == "Address":
+            col = {n: i for i, n in enumerate(r)}
+            need = ("Source", "Access Size", "L2 Theoretical Sectors Global", "L2 Theoretical Sectors Global Ideal")
+            if any(n not in col for n in need):
+                refuse(f"[source] {path}: the page lacks one of {need}")
+            continue
+        if kernel is None or col is None or len(r) < len(col):
+            continue
+        first.setdefault(kernel, int(r[0], 16))
+        try:
+            th = float(r[col["L2 Theoretical Sectors Global"]].replace(",", ""))
+            ideal = float(r[col["L2 Theoretical Sectors Global Ideal"]].replace(",", ""))
+        except ValueError:
+            continue
+        if th <= 0:
+            continue
+        key = (kernel, int(r[0], 16))
+        a = agg.setdefault(key, [0.0, 0.0, " ".join(r[col["Source"]].split()), r[col["Access Size"]]])
+        a[0] += th
+        a[1] += ideal
+        order.setdefault(kernel, []).append(key)
+    if not agg:
+        refuse(f"[source] {path}: no global memory instruction with L2 theoretical sectors")
+    print(f"[source] {path}: L2 Theoretical Sectors Global / Ideal per global memory instruction, summed over "
+          f"the page's launches; FLAG above {limit:g}")
+    for kernel in order:
+        keys = list(dict.fromkeys(order[kernel]))
+        print(f"  [{kernel}]  launch pages {pages[kernel]}")
+        print(f"    {'address':16s} {'offset':>8s} {'ratio':>7s} {'theoretical':>12s} {'ideal':>12s} {'bits':>5s}  instruction")
+        flagged, th_all, ideal_all = 0, 0.0, 0.0
+        for key in keys:
+            th, ideal, src, size = agg[key]
+            ratio = th / ideal if ideal > 0 else float("inf")
+            flag = ratio > limit
+            flagged += flag
+            th_all += th
+            ideal_all += ideal
+            print(f"    0x{key[1]:x} {'+0x%x' % (key[1] - first[kernel]):>8s} {ratio:7.3f} {th:12.0f} {ideal:12.0f} "
+                  f"{size:>5s}  {src}{'   FLAG' if flag else ''}")
+        print(f"    {len(keys)} instructions, {flagged} above {limit:g}; sectors {th_all:.0f} against ideal "
+              f"{ideal_all:.0f} ({th_all / ideal_all if ideal_all else float('inf'):.3f}x)")
+    return 0
+
+
 def fmt_bytes(v):
     if v is None:
         return "?"
@@ -543,13 +609,13 @@ def fmt_bytes(v):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("plan", "summary", "metrics"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("plan", "summary", "metrics", "source"):
         print(__doc__)
         raise SystemExit(64)
     if sys.argv[1] == "metrics":
         print(",".join(METRICS))
         raise SystemExit(0)
-    raise SystemExit({"plan": cmd_plan, "summary": cmd_summary}[sys.argv[1]](sys.argv[2:]))
+    raise SystemExit({"plan": cmd_plan, "summary": cmd_summary, "source": cmd_source}[sys.argv[1]](sys.argv[2:]))
 
 
 if __name__ == "__main__":
