@@ -406,7 +406,12 @@ first suspect is a hung gate on the box, not the agent.
   09-26#uniondispatch-ab). Since `2f45a79` (B1: the prompt batch's attention projections once per
   128-token sub-block instead of per 8-token chunk) pp512 **144.6** and pp4096 **201.0** with no hot
   list (the tree before it 130.6 / 182.4 in the same leases, 1.108 ± 0.011 / 1.102 ± 0.011 over four
-  clean rounds; the card route 29.7 → 19.6 ms per layer-batch; rig-log 09-26#b1-pp-ab).
+  clean rounds; the card route 29.7 → 19.6 ms per layer-batch; rig-log 09-26#b1-pp-ab). Since `237321a`
+  (cardtile, T: the prompt batch's card experts by (slot tile, row tile) blocks) the prose prompt
+  (`corpus-prose.ids`, hot list 384) runs pp512 **216.1** and pp4096 **292.1** against the `expert` arm's
+  173.6 / 250.3 in the same lease (1.245 ± 0.060 / 1.167 ± 0.011 over two rounds; the shadow 45.4 → 23.1 ms
+  per layer-batch at P = 512; prose rows and the lcg rows above do not share a table; rig-log
+  09-26#cardtile-ab).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
