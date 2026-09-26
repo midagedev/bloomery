@@ -117,9 +117,19 @@
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
 # (seconds one arm may run, default 900: a hung arm fails the runner with rc 124/137 instead of
-# holding the lease), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines, the
-# CPU guard's settings and reading, and the rotation, then exit 0 before the lease: nothing is loaded
-# and nothing is timed).
+# holding the lease), BLOOMERY_AB_WARMUP (below), BLOOMERY_DRY=1 (print each arm's command line, the
+# binaries' tree lines, the CPU guard's settings and reading, the warm-up and the rotation, then exit
+# 0 before the lease: nothing is loaded and nothing is timed).
+#
+# Warm-up. The lease's first process reads the model's pages cold — the plan's reads of the file and
+# the host tier's experts through the mapping, both inside our arm's timed window — so the first row
+# of a lease reads low. The runner runs the first arm once before round 1 and discards it: its row
+# prints as `WARMUP r0 …`, between its own witness blocks and after the same guards, and is in no
+# mean, ratio or row count; a warm-up that fails stops the runner as a round's arm does. It costs one
+# row's wall, 73-128 s for the V4.1 rows at P = 512 and 4096 (lcg and prose) [derived: those rows'
+# `wall` column], so the lease is that much longer. BLOOMERY_AB_WARMUP=0 skips it; any value but 0 or
+# 1 is refused. depth-qwen3moe.sh has none: its model sits on the card, so no timed window reads the
+# file.
 #
 # Contention. Before every arm the runner checks both the other card (guard_other, timing-card.sh:
 # `[other-busy]`) and the CPU (guard_cpu, lease.sh: `[cpu-busy]` when builds or reference engines it
@@ -144,6 +154,15 @@ ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_ds41}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 DRY=${BLOOMERY_DRY:-}
+AB_WARMUP=${BLOOMERY_AB_WARMUP:-1}
+case $AB_WARMUP in
+  0 | 1) ;;
+  *) echo "depth-ds41.sh: BLOOMERY_AB_WARMUP is 1 (the default: one discarded run of the first arm) or 0, got '$AB_WARMUP'" >&2; exit 64 ;;
+esac
+# The word an arm's row starts with: ROW, a row of the tables, or WARMUP, the discarded warm-up run.
+# counted: whether the row goes into the sums and the row counts (only a ROW row does).
+ROW_TAG=ROW
+counted() { [ "$ROW_TAG" = ROW ]; }
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
 ours=0 ik=0 lcpp=0
@@ -387,10 +406,12 @@ $(tail -n 40 "$errf" 2>/dev/null)"
     dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
   fi
   if pp_eng "$eng"; then
-    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    counted || return 0
     pp_sums+=("$eng|$dep|$r|$val|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
   else
-    echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    echo "$ROW_TAG r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    counted || return 0
     sums+=("$eng|$dep|$r|$val|")
   fi
   count_row
@@ -490,7 +511,8 @@ ours_arm() {
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft}$PP_COL | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft}$PP_COL | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+  counted || return 0
   count_row
   if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
@@ -560,6 +582,11 @@ if [ -n "$DRY" ]; then
         ;;
     esac
   done
+  if [ "$AB_WARMUP" = 1 ]; then
+    echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
+  else
+    echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): round 1's first row is the lease's first process"
+  fi
   for r in $(seq "$ROUNDS"); do
     order=()
     for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
@@ -569,7 +596,7 @@ if [ -n "$DRY" ]; then
 fi
 
 lease_take
-echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
+echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s warmup=$AB_WARMUP"
 echo "[config] ours: $BIN (placement (a), default ctx)"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $PROSE ($PROSE_N ids)"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
@@ -584,6 +611,18 @@ guard_cpu pre
 
 sums=() pp_sums=()
 n_rows=0 busy_rows=0 other_rows=0
+if [ "$AB_WARMUP" = 1 ]; then
+  CPU_BUSY_TAG=
+  guard_other
+  guard_cpu "pre warmup ${ARMS[0]}"
+  ROW_TAG=WARMUP
+  case ${A_KIND[0]} in
+    ref) ref_arm "${A_ENG[0]}" "${A_DEP[0]}" 0 ;;
+    *) ours_arm 0 0 ;;
+  esac
+  ROW_TAG=ROW
+  echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP row above): the lease's first process reads the model's pages cold"
+fi
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
     j=$(((i + r - 1) % ${#ARMS[@]}))

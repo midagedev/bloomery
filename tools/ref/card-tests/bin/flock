@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """A stand-in for util-linux flock(1) where there is none (the Mac), for tools/ref/card-tests/run.sh.
 
-It takes the two forms lease.sh and the tests use, `flock [-n | -w SECS] FD` and
-`flock [-n | -w SECS] FILE COMMAND...`, and locks with flock(2) through fcntl.flock, as util-linux
-does: the lock belongs to the open file description, so one taken on an inherited FD outlives this
-process for as long as the caller keeps FD open. A lock it cannot get exits 1, as util-linux; any
-other form is refused with 64, never run as something else.
+It takes the forms lease.sh and the tests use, `flock [-s] [-n | -w SECS] [-E CODE] FD` and
+`flock [-s] [-n | -w SECS] [-E CODE] FILE COMMAND...`, and locks with flock(2) through fcntl.flock, as
+util-linux does: the lock belongs to the open file description, so one taken on an inherited FD
+outlives this process for as long as the caller keeps FD open. -s takes a shared lock, the default an
+exclusive one. A lock it cannot get exits 1, or CODE with -E, as util-linux; a FILE it cannot open
+exits 66 (util-linux's EX_NOINPUT); any other form is refused with 64, never run as something else.
 """
 import fcntl
 import os
@@ -15,22 +16,29 @@ import time
 
 
 def refuse(why):
-    print(f'flock (test stand-in): {why}; forms: [-n | -w SECS] FD, [-n | -w SECS] FILE COMMAND...',
-          file=sys.stderr)
+    print(f'flock (test stand-in): {why}; forms: [-s] [-n | -w SECS] [-E CODE] FD, '
+          '[-s] [-n | -w SECS] [-E CODE] FILE COMMAND...', file=sys.stderr)
     sys.exit(64)
 
 
 def main(argv):
-    nonblock, wait = False, None
+    nonblock, wait, mode, conflict = False, None, fcntl.LOCK_EX, 1
     while argv and argv[0].startswith('-'):
         opt = argv.pop(0)
         if opt == '-n':
             nonblock = True
+        elif opt == '-s':
+            mode = fcntl.LOCK_SH
         elif opt == '-w' and argv:
             try:
                 wait = float(argv.pop(0))
             except ValueError:
                 refuse('-w takes seconds')
+        elif opt == '-E' and argv:
+            try:
+                conflict = int(argv.pop(0))
+            except ValueError:
+                refuse('-E takes an exit code')
         else:
             refuse(f'option {opt!r}')
     if not argv:
@@ -39,21 +47,25 @@ def main(argv):
     if target.isdigit() and not command:
         fd = int(target)
     elif not target.isdigit() and command:
-        fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            print(f'flock (test stand-in): cannot open lock file {target}: {e.strerror}', file=sys.stderr)
+            return 66
     else:
         refuse('an FD takes no command, a FILE needs one')
     if nonblock or wait is not None:
         deadline = time.monotonic() + (0 if nonblock else wait)
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, mode | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    return 1
+                    return conflict
                 time.sleep(0.05)
     else:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, mode)
     return subprocess.call(command) if command else 0
 
 

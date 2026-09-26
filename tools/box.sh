@@ -5,10 +5,53 @@
 # 데이터·참조 바이너리 디렉터리는 BLOOMERY_DATA 하나가 소유한다. 병렬 트랙은 이 값과 REMOTE만 바꾼다.
 #   tools/box.sh cargo oxide doctor
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
+#
+# The guard. Before the command, on the box and in the same ssh, lease_guard (tools/ref/lease-probe.sh)
+# reads the timing lease (/root/bloomery-cpu.lock, through lease_free: a shared-lock probe) and every
+# hold (/root/bloomery-<owner>-hold, up while the file exists). While either is up the command does
+# not start: a build or a gate beside a sitting puts [cpu-busy] on the sitting's rows and voids them.
+# It waits, naming what is up — the lease's holders, each hold's owner and age — at once and once a
+# minute, polls every 30 s, and after a wait starts only on two quiet polls in a row (a sitting of
+# several runs leaves the lease free for seconds between them). Still busy at the bound: exit 75,
+# contention, naming what is up. A lease that cannot be tested: 70. The guard holds nothing while
+# the command runs, so a runner in the command takes the lease after it as before.
+#   BLOOMERY_BOX_WAIT=<s>     the bound, default 1800: the wait lease_take and gpu-gate.sh give up
+#                             after. 0 does not wait: 75 at once when busy (gate-batch.sh's checks)
+#   BLOOMERY_HOLD_OWNER=<o>   this call belongs to the owner of /root/bloomery-<o>-hold and passes that
+#                             hold — a sitting script puts its hold up and runs its runners through
+#                             box.sh; the lease and every other hold still stop it, and with its own
+#                             hold up and another that went up first it gives way at once (75)
+#   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
+#                             guard: the way to read a sitting's log, the owner's own included, while it
+#                             runs. Refused (64) when the command names cargo, just, make, cmake, ninja
+#                             or target/, so the opt-in cannot carry a build or one of our binaries
 set -euo pipefail
 HOST=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+BOX_WAIT=${BLOOMERY_BOX_WAIT:-1800}
+case $BOX_WAIT in
+  '' | *[!0-9]*) echo "box.sh: BLOOMERY_BOX_WAIT is whole seconds (0: do not wait), got '$BOX_WAIT'" >&2; exit 64 ;;
+esac
+HOLD_OWNER=${BLOOMERY_HOLD_OWNER:-}
+case $HOLD_OWNER in
+  *[!A-Za-z0-9_]*) echo "box.sh: BLOOMERY_HOLD_OWNER is the <owner> of /root/bloomery-<owner>-hold (letters, digits, _), got '$HOLD_OWNER'" >&2; exit 64 ;;
+esac
+case ${BLOOMERY_BOX_READONLY:-0} in
+  0) GUARD="( cd $REMOTE && . tools/ref/lease-probe.sh && lease_guard $BOX_WAIT $HOLD_OWNER ) && " ;;
+  1)
+    GUARD=
+    ro_build='(^|[^A-Za-z0-9_])(cargo|just|make|cmake|ninja)([^A-Za-z0-9_]|$)'
+    if [[ $* =~ $ro_build ]]; then
+      echo "box.sh: BLOOMERY_BOX_READONLY=1 is for reads, and this command names '${BASH_REMATCH[2]}': run it without the opt-in, behind the guard" >&2
+      exit 64
+    fi
+    case $* in
+      *target/*) echo "box.sh: BLOOMERY_BOX_READONLY=1 is for reads, and this command names 'target/' (one of our binaries): run it without the opt-in, behind the guard" >&2; exit 64 ;;
+    esac
+    ;;
+  *) echo "box.sh: BLOOMERY_BOX_READONLY is 1 (a read), or 0 or unset (behind the guard), got '$BLOOMERY_BOX_READONLY'" >&2; exit 64 ;;
+esac
 ssh "$HOST" "mkdir -p $REMOTE"
 # 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
 # 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
@@ -112,5 +155,5 @@ esac
 # 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
-ssh "$HOST" "source ~/bloomery-env.sh && { $PICK
+ssh "$HOST" "${GUARD}source ~/bloomery-env.sh && { $PICK
 } && cd $REMOTE && $V41 && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT && $OXIDE$ENVS$*"

@@ -59,7 +59,10 @@ fi
 [ ! -e "$SAVE" ] || md5sum "$SAVE"
 [ ! -e "$BIN" ] || md5sum "$BIN"
 
-flock -n "$LEASE_LOCK" true || fail "the timing lease is held (a sitting is running); start again after it" 75
+lease_free || case $? in
+  1) fail "the timing lease is held (a sitting is running); start again after it" 75 ;;
+  *) fail "the timing lease cannot be tested (above); not starting" 70 ;;
+esac
 free -g | head -n 2
 t0=$(date +%s)
 systemd-run --scope --quiet -p "MemoryHigh=$MEM_HIGH" -p "MemoryMax=$MEM_MAX" \

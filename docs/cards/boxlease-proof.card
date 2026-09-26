@@ -1,0 +1,10 @@
+# The boxlease round's box proof: tools/box.sh's guard (lease_guard, tools/ref/lease-probe.sh) meets a
+# real held lease. The lease is held through lease-hold.sh for under a minute (`sleep 45`); while it is
+# held, a `just check` through main's box.sh runs beside it (the FAIL-first), a read goes through
+# BLOOMERY_BOX_READONLY=1, and a `just check` through the round's box.sh waits, names this card's
+# holder, and starts once the lease is released. Nothing is timed.
+kind: exclusive
+reason: the guard's behaviour is only visible against a lease that is really held — a box command
+  must wait on it, name its holder and start after it; the hold is a sleep, so the box does nothing
+  else under it; why now: the round's proof before it lands
+minutes: 1

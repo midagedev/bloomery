@@ -76,10 +76,16 @@
 # gitignored and outside box.sh's rsync, so the logs neither ship to the box nor mark the tree dirty.
 # A DIR inside the tree but outside target/ is refused for that reason.
 #
-# Refuses to start while the timing lease (/root/bloomery-cpu.lock or /root/bloomery-lease.lock) is
-# held, naming the lock (exit 75); no override. --dry-run validates, prints each item's lane, command
-# and plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and
-# touches neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
+# Refuses to start while the timing lease (/root/bloomery-cpu.lock) or a hold
+# (/root/bloomery-<owner>-hold, other than BLOOMERY_HOLD_OWNER's) is up, naming what is up (exit 75);
+# a lease that cannot be tested is exit 70; no override. The check is tools/box.sh's own guard
+# (lease_guard, tools/ref/lease-probe.sh) with BLOOMERY_BOX_WAIT=0. Once the batch runs, every item's box.sh
+# call passes that guard with its default wait: a sitting that takes the lease mid-batch gets a quiet
+# box — the item waits (up to 30 min, then rc 75, which retries below) and starts after the sitting.
+# The wait comes before the item's command, so the runners' 900 s bound does not count it; the item's
+# times row does (its final try's seconds). --dry-run validates, prints each item's lane, command and
+# plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
+# neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
 #
 # Ledger (--ledger: the lead's batches; a round never passes it — a round's green is not the lead's).
 # Each item's input key is `tools/recipes.py key` (its section header lists the parts): the files its
@@ -88,7 +94,8 @@
 # of every recipe it depends on, the scripts those name, the cargo globals and the cuda-oxide pin, its
 # ARGS, its full BLOOMERY_BOX_ENV (the caller's, the item's, its lane's card), the Mac-side variables
 # box.sh carries, and a box manifest read once per batch through one box.sh call (`recipes.py
-# box-manifest`, refused while the timing lease is held): ~/bloomery-env.sh, the kernel, each card's
+# box-manifest` behind box.sh's guard with BLOOMERY_BOX_WAIT=0: refused while the lease or a hold is
+# up): ~/bloomery-env.sh, the kernel, each card's
 # name, UUID, driver and VBIOS, rustc, llc, ptxas and cargo-oxide, the cuda-oxide backend, the content
 # of $BLOOMERY_DATA (sha256 per file, cached by stat on the box in ~/.cache/bloomery/sha256-cache.tsv,
 # so a file rewritten with the same bytes keeps its hash; the first fetch hashes everything, later ones
@@ -145,7 +152,6 @@ SMOKE=(
 )
 TRIES_MAX=11
 RETRY_WAIT=30
-LEASES="/root/bloomery-cpu.lock /root/bloomery-lease.lock"
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 
@@ -255,7 +261,8 @@ UNLOCKED = re.compile(r"tools/gate\.sh --oxide|cargo oxide (test|run)\b")
 SEGMENT = re.compile(r"&&|\|\||;|\||\n")
 # A script a recipe names takes the timing lease when it calls lease_take (tools/ref/lease.sh), or
 # opens the lease lock for a descriptor and waits on it with flock -w (the runners that take it by
-# hand). `flock -n <lock> true` only tests the lock (tools/gpu-gate.sh) and is no take.
+# hand). A probe (lease_free, `flock -s -n <lock> true`: tools/gpu-gate.sh, box.sh's guard) only tests
+# the lock and is no take.
 SCRIPT = re.compile(r"(?:crates/[A-Za-z0-9_-]+/)?tools/[A-Za-z0-9_./-]+\.sh\b")
 # A word in command position: at a line's start or after ; & | ( { ! or a keyword, before any `#`.
 CMD = r"^[^#\n]*?(?:^|[;&|({!]|\b(?:then|do|else|if|while|until)(?=\s))\s*"
@@ -787,8 +794,6 @@ item_of() { # the item as it runs, for the key: NAME[@its env and its lane's car
 
 LEDGER_FILE=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
 LEDGER_PARTS=$LEDGER_FILE.parts
-LEASE_ARGS=''
-for l in $LEASES; do LEASE_ARGS="$LEASE_ARGS --lease $l"; done
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
 # once the record does), then the line, one write(2) on an O_APPEND descriptor under an exclusive flock.
 IFS= read -r -d '' PYAPPEND << 'PY' || true
@@ -817,13 +822,16 @@ ledger_plan() { # the box manifest, then every candidate's key and status (C_*),
   local m=$1/box-manifest.txt merr='' rc=0 try i key item status detail kargs=()
   for try in 1 2; do
     rc=0
-    "$ROOT/tools/box.sh" "python3 tools/recipes.py box-manifest$LEASE_ARGS" > "$m" 2> "$1/box-manifest.err" || rc=$?
+    BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" "python3 tools/recipes.py box-manifest" > "$m" 2> "$1/box-manifest.err" || rc=$?
     if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then break; fi
     [ "$try" = 2 ] || sleep 10
   done
   if [ "$rc" = 75 ]; then
-    [ "$DRY" = 1 ] || RC=75 die "the timing lease is held ($(tail -1 "$1/box-manifest.err")) — a batch's builds contaminate a sitting; not starting"
-    merr="the timing lease is held, so the manifest was not read"
+    if [ "$DRY" = 0 ]; then
+      grep '^\[' "$1/box-manifest.err" >&2 || true
+      RC=75 die "the timing lease or a hold is up (above) — a batch's builds contaminate a sitting; not starting"
+    fi
+    merr="the timing lease or a hold was up, so the manifest was not read"
   elif [ "$rc" != 0 ]; then
     merr="box.sh rc=$rc: $(tail -1 "$1/box-manifest.err")"
     echo "gate-batch: ledger: the box manifest failed ($merr) — every item runs and none is recorded" >&2
@@ -924,19 +932,17 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-# The timing lease, each lock tested on its own so the refusal names it. flock -E 75 separates "held"
-# from "could not test"; a held lock's holder is named by lease_holders (tools/ref/lease.sh), the lines
-# a runner waiting on the lease prints.
+# The start check is box.sh's guard with no wait (the header): the lease or a hold up is 75 at once,
+# with the guard's lines naming what is up (the lease's holders through lease_holders, each hold's
+# owner and age); a lease that cannot be tested is 70.
 if [ "$SKIP_N" -lt "$N" ]; then
-  lease=$("$ROOT/tools/box.sh" 'for l in '"$LEASES"'; do flock -n -E 75 "$l" true; r=$?; if [ "$r" = 0 ]; then echo "free $l"; elif [ "$r" = 75 ]; then echo "held $l"; (. tools/ref/lease.sh && lease_holders "$l"); else echo "error $l rc=$r"; fi; done' 2>&1) \
-    || RC=70 die "the lease check through box.sh failed: $lease"
-  for l in $LEASES; do
-    case "$lease" in
-      *"held $l"*) echo "$lease" >&2; RC=75 die "the timing lease $l is held — a batch's builds contaminate a sitting; not starting" ;;
-      *"free $l"*) ;;
-      *) RC=70 die "the lease $l could not be tested: $lease" ;;
-    esac
-  done
+  rc=0
+  lease=$(BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" true 2>&1) || rc=$?
+  case $rc in
+    0) ;;
+    75) echo "$lease" >&2; RC=75 die "the timing lease or a hold is up (above) — a batch's builds contaminate a sitting; not starting" ;;
+    *) echo "$lease" >&2; RC=70 die "the start check through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)" ;;
+  esac
 else
   echo "gate-batch: every item skips — nothing runs on the box, so no lease check"
 fi

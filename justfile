@@ -367,8 +367,9 @@ time-cpu-v41-host *ARGS:
 # 자기 argv에 든 셸(스캔하는 셸 자신, ssh 핸들러)도 같이 고른다. 자신과 조상 pid는 접두
 # 비교 전에 제외한다. 죽이는 것은 TERM → 5초 → KILL. 목록만 보려면 `just box-gc --dry-run`.
 # 이 트랙 원격 디렉터리 아래 실행 파일을 문 고아 프로세스를 죽인다. 병렬 트랙 시작·끝에 한 번씩.
+# 시팅의 가드를 지나간다(BLOOMERY_BOX_READONLY=1): 아무것도 빌드하지 않고, 찾는 고아가 임대를 쥔 그 프로세스일 수 있다.
 box-gc *ARGS='--kill':
-    ./tools/box.sh 'bash tools/box-gc.sh {{ARGS}}'
+    BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash tools/box-gc.sh {{ARGS}}'
 
 # 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove`로 stale 삭제.
 box-tracks *ARGS:
@@ -977,7 +978,7 @@ time-gpu-h2d *ARGS:
 # A functional run: `just probe-host-register --bytes 64M` with
 # BLOOMERY_BOX_ENV="BLOOMERY_TIMING_GPU=<the 3090's UUID>".
 probe-host-register *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { flock -n /root/bloomery-cpu.lock true || { echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75; }; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { . tools/ref/lease-probe.sh; lease_free || case $? in 1) echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75 ;; *) exit 70 ;; esac; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
 
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header

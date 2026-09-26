@@ -252,6 +252,21 @@ box.sh's header already reserved. Lease-taking measurements (decode-measure,
 profile-of-record) stay with the main track: the lease is machine-wide, so
 measurement is serialized by design.
 
+**Every box command waits for a sitting.** `tools/box.sh` runs `lease_guard`
+(`tools/ref/lease-probe.sh`) on the box before its command, in the same ssh:
+while the timing lease is held or a hold `/root/bloomery-<owner>-hold` is up,
+the command waits — naming what is up at once and once a minute, polling every
+30 s, starting after two quiet polls in a row — and exits 75 after
+`BLOOMERY_BOX_WAIT` seconds (default 1800; 0 does not wait). A sitting of
+several runs puts its hold up first and exports `BLOOMERY_HOLD_OWNER=<owner>`,
+which passes its own hold only; of two holds up at once, the later one gives
+way. A command that builds nothing and must run beside a sitting (`ps`, `tail`,
+`nvidia-smi`, `just box-gc`) passes with `BLOOMERY_BOX_READONLY=1`, which
+refuses a command naming cargo, just, make, cmake, ninja or `target/`. The
+lease's one probe is `lease_free`, a shared lock: an exclusive `flock -n <lease>
+true` is a take for a few ms and reads a free lease as held beside another
+probe (429 of 1,000 parallel probes on the box, 2026-09-26).
+
 Track checklist, first and last:
 
 1. **First**: `just box-gc` — clear anything a previous track left under this
@@ -259,7 +274,9 @@ Track checklist, first and last:
    every later command wait forever.
 2. **Always** run long box commands through the `gate-*` recipes or with an
    explicit `timeout` — never bare `cargo test` at a prompt you are not
-   watching. If a command produces no output for minutes, assume it is hung on
+   watching. A command waiting for a sitting is not silent (box.sh's guard
+   prints `[guard]` lines at once and once a minute), so if a command produces
+   no output for minutes, assume it is hung on
    the box, not thinking: check `just box-gc --dry-run` (it selects by
    `/proc/<pid>/exe`, never by cmdline — a `pgrep -f '<dir>'` also matches the
    shell that runs it).

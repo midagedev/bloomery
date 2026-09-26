@@ -56,12 +56,16 @@ lease_take
 # The release line says whether the lease is free: a process the command left running still holds it.
 trap 'lease_release; lease_hold_released' EXIT
 lease_hold_released() {
-  if flock -n "$LEASE_LOCK" true; then
-    echo "[lease] released at $(now)"
-  else
-    echo "[lease] this process let go at $(now), but the lease is still held — by what the command left running, or by the next runner that took it:"
-    lease_holders "$LEASE_LOCK"
-  fi
+  local rc=0
+  lease_free || rc=$?
+  case $rc in
+    0) echo "[lease] released at $(now)" ;;
+    1)
+      echo "[lease] this process let go at $(now), but the lease is still held — by what the command left running, or by the next runner that took it:"
+      lease_holders "$LEASE_LOCK"
+      ;;
+    *) echo "[lease] this process let go at $(now); whether the lease is free cannot be told (above)" ;;
+  esac
 }
 echo "[lease-hold] command: $*"
 witness pre

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # The card and lease stub tests: tools/ref/card.py on the fixtures here and on docs/cards/, lease_take
-# (tools/ref/lease.sh) and its holder naming, tools/ref/lease-hold.sh, tools/ref/card-precheck.sh,
-# tools/gpu-ab.py's card check, the witness fields with a failing nvidia-smi, the t table's four
-# readers (tdump.sh) and tools/gate-batch.sh's script walker (--classes on a stub tree).
+# (tools/ref/lease.sh) and its holder naming, tools/ref/lease-hold.sh, the lease's probe (lease_free),
+# the holds and box.sh's guard (lease_guard), tools/box.sh's remote command and its read-only
+# refusals (stub ssh), tools/ref/card-precheck.sh, tools/gpu-ab.py's card check, the witness fields
+# with a failing nvidia-smi, the t table's four readers (tdump.sh) and tools/gate-batch.sh's script
+# walker (--classes on a stub tree).
 #
 #   tools/ref/card-tests/run.sh
 #
@@ -28,7 +30,7 @@ n=0 failed=0
 # exist and name BLOOMERY_BOX_ENV (gpu-ab.py reads it); nothing runs it.
 T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/docs/cards" "$tmp/old/tools" "$tmp/nocard/tools/ref"
-cp "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/lease-hold.sh" "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" \
+cp "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease-hold.sh" "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/card-precheck.sh" "$T/tools/ref/"
 cp "$ROOT/tools/gpu-ab.py" "$T/tools/"
 cp "$ROOT"/docs/cards/*.card "$HERE/hcpre-ab.card" "$HERE/exclusive.card" "$T/docs/cards/"
@@ -100,11 +102,36 @@ gpuab() {
 absent() {
   if [ -e "$2" ]; then fail "$1" "$2 exists: the lease file was opened before the refusal"; else pass "$1"; fi
 }
+# lock_state <lock>: the copy's lease_free on <lock> — free, held, or untestable (rc N).
+lock_state() {
+  local rc=0
+  bash -c 'source "$1" && lease_free "$2"' _ "$T/tools/ref/lease-probe.sh" "$1" 2> /dev/null || rc=$?
+  case $rc in 0) echo free ;; 1) echo held ;; *) echo "untestable (rc $rc)" ;; esac
+}
 free() {
-  if flock -n "$2" true; then pass "$1"; else fail "$1" "$2 is still locked"; fi
+  local s
+  s=$(lock_state "$2")
+  if [ "$s" = free ]; then pass "$1"; else fail "$1" "$2 is $s"; fi
 }
 held() {
-  if flock -n "$2" true; then fail "$1" "$2 is free"; else pass "$1"; fi
+  local s
+  s=$(lock_state "$2")
+  if [ "$s" = held ]; then pass "$1"; else fail "$1" "$2 is $s"; fi
+}
+# bg_lock <mode> <lock> <marker> <seconds>: a background process that holds <lock> (-s shared, -x
+# exclusive) for <seconds>, started once the lock is taken (<marker> appears); its pid is in BG.
+bg_lock() {
+  local mode=$1 lock=$2 mark=$3 secs=$4 i
+  rm -f "$mark"
+  if [ "$mode" = -s ]; then
+    flock -s "$lock" bash -c 'touch "$1"; sleep "$2"' _ "$mark" "$secs" &
+  else
+    flock "$lock" bash -c 'touch "$1"; sleep "$2"' _ "$mark" "$secs" &
+  fi
+  BG=$!
+  for i in $(seq 100); do [ -e "$mark" ] && return 0; sleep 0.05; done
+  echo "bg_lock: $lock was not taken within 5 s" >&2
+  return 1
 }
 
 # fakeproc <dir> <lock file>: a /proc tree for lease_holders (BLOOMERY_LEASE_PROC) with one process,
@@ -251,7 +278,7 @@ else
   done
   free 'lease-hold released the lease after the command failed' "$L"
   hold "$T" 'lease-hold holds the lease while the command runs' 0 '^\[lease-hold\] rc=0 ' "$L" --card docs/cards/exclusive.card -- \
-    bash -c 'if flock -n "$1" true; then exit 3; fi' _ "$L"
+    bash -c 'source "$2" && if lease_free "$1"; then exit 3; fi' _ "$L" "$T/tools/ref/lease.sh"
   hold "$T" 'lease-hold marks its command' 0 '^held-by=[0-9]+$' "$L" --card docs/cards/exclusive.card -- \
     bash -c 'echo "held-by=$BLOOMERY_LEASE_HELD"'
   # A process the command leaves running inherits descriptor 9 and keeps the lease until it exits
@@ -277,12 +304,167 @@ else
     env BLOOMERY_LEASE_PROC="$tmp/proc-empty" bash -c 'mkdir -p "$2" && : > "$3" && source "$1" && lease_holders "$3"' _ "$T/tools/ref/lease.sh" "$tmp/proc-empty" "$tmp/free.lock"
   run 'lease_holders without a /proc tree says so' 0 'cannot be named: .*/no-proc cannot be listed' \
     env BLOOMERY_LEASE_PROC="$tmp/no-proc" bash -c 'source "$1" && lease_holders "$2"' _ "$T/tools/ref/lease.sh" "$L"
+  # A probe (lease_free's shared lock) in at the instant lease_take tries its exclusive `flock -n 9`
+  # fails that try: the runner waits (`flock -w 60 9`) and takes the lease once the probe lets go.
+  if bg_lock -s "$tmp/l3.lock" "$tmp/l3.mark" 2; then
+    take "$T" 'lease_take meeting a shared probe waits for it' 0 "^\\[lease\\] $tmp/l3\\.lock is held; waiting up to 30 min\\. Its holder:\$" \
+      "$tmp/l3.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card BLOOMERY_LEASE_PROC="$tmp/proc-empty"
+    has 'lease_take takes the lease once the probe lets go' '^\[lease\] held by pid'
+    wait "$BG"
+  else
+    fail 'lease_take meeting a shared probe' 'the background shared lock was not taken'
+  fi
   hold "$T" 'lease-hold refuses a card outside docs/cards' 66 'refused CARD_ABSENT' "$tmp/h2.lock" --card tools/ref/card-tests/valid-ab.card -- true
   absent 'lease-hold refused: no lease file opened' "$tmp/h2.lock"
   hold "$ROOT" 'this tree: lease-hold with the self-test card' 0 '^\[lease\] card: ok kind=exclusive minutes=1 ' "$tmp/h3.lock" \
     --card docs/cards/selftest-lease-hold.card -- true
   free 'this tree: the self-test lease is released' "$tmp/h3.lock"
 fi
+
+# rc_is <name> <rc> <command…>: the command's exit code only (its output may be empty).
+rc_is() {
+  local name=$1 want=$2 rc=0
+  shift 2
+  "$@" > "$tmp/out" 2>&1 || rc=$?
+  if [ "$rc" = "$want" ]; then pass "$name"; else fail "$name" "rc $rc, want $want" "$tmp/out"; fi
+}
+# silent <name>: the last command printed nothing.
+silent() {
+  if [ -s "$tmp/out" ]; then fail "$1" 'it printed' "$tmp/out"; else pass "$1"; fi
+}
+
+# lease_free, the one probe of the lease: a shared lock, so another probe (shared) never reads as held
+# and only an exclusive holder does; a lock it cannot open is untestable (rc 2) and is not free in any
+# `if`/`||` form. The old exclusive probe under the same shared holder reads it as held: the false read.
+# These take lock files of their own (not the lease), so they run on the box too.
+P=$tmp/probe.lock
+: > "$P"
+probe() { bash -c 'source "$1" && lease_free "$2"' _ "$T/tools/ref/lease-probe.sh" "$1"; }
+rc_is 'lease_free: a free lock reads free (0)' 0 probe "$P"
+if bg_lock -s "$P" "$tmp/probe.mark" 2; then
+  rc_is 'lease_free: a shared holder (another probe) does not read as held (0)' 0 probe "$P"
+  rc_is 'the old exclusive probe reads that shared holder as held (1, the false read)' 1 flock -n "$P" true
+  wait "$BG"
+else
+  fail 'lease_free: a shared holder' 'the background shared lock was not taken'
+fi
+if bg_lock -x "$P" "$tmp/probe.mark" 2; then
+  rc_is 'lease_free: an exclusive holder (the lease) reads held (1)' 1 probe "$P"
+  wait "$BG"
+else
+  fail 'lease_free: an exclusive holder' 'the background exclusive lock was not taken'
+fi
+run 'lease_free: a lock it cannot open is untestable (2), named' 2 'no-such-dir/x\.lock cannot be tested \(flock rc 66\): read as not free' \
+  probe "$tmp/no-such-dir/x.lock"
+run 'if lease_free reads an untestable lock as not free' 0 '^not free$' \
+  bash -c 'source "$1" && if lease_free "$2" 2> /dev/null; then echo free; else echo "not free"; fi' _ "$T/tools/ref/lease-probe.sh" "$tmp/no-such-dir/x.lock"
+
+# The holds and lease_guard (what tools/box.sh runs before a command), from lease-probe.sh alone — the
+# file box.sh sources — against a lock and a hold directory of their own; BLOOMERY_LEASE_POLL=1 so a
+# wait takes seconds.
+H=$tmp/holds
+mkdir -p "$H"
+guardenv() {
+  env BLOOMERY_LEASE_LOCK="$P" BLOOMERY_LEASE_HOLDS="$H/bloomery-*-hold" BLOOMERY_LEASE_POLL=1 \
+    BLOOMERY_LEASE_PROC="$tmp/proc-none" bash -c 'source "$1" && shift && "$@"' _ "$T/tools/ref/lease-probe.sh" "$@"
+}
+guard() {
+  local name=$1 want=$2 pat=$3
+  shift 3
+  run "$name" "$want" "$pat" guardenv "$@"
+}
+rc_is 'no hold up: lease_holds_up is 0' 0 guardenv lease_holds_up
+silent 'no hold up: lease_holds_up prints nothing'
+touch "$H/bloomery-03-hold"
+guard 'a hold up: lease_holds_up names it, its owner, age and start' 0 "^$H/bloomery-03-hold owner=03 up=0h00m0[0-9]s since=[0-9]+\$" lease_holds_up
+rc_is "the owner's own hold is passed" 0 guardenv lease_holds_up 03
+silent "the owner's own hold is passed: nothing printed"
+touch "$H/bloomery-aa-hold"
+guard "another owner's hold is not passed" 0 "^$H/bloomery-aa-hold owner=aa " lease_holds_up 03
+if grep -q 'bloomery-03-hold' "$tmp/out"; then fail "the owner's own hold is not listed to it" 'the 03 hold is listed to owner 03' "$tmp/out"; else
+  pass "the owner's own hold is not listed to it"; fi
+guard 'lease_guard 0 with a hold up: 75 at once' 75 'BLOOMERY_BOX_WAIT=0 does not wait: the command did not run \(rc 75\)' lease_guard 0 03
+has 'lease_guard names the hold, its owner and how the owner passes' "hold $H/bloomery-aa-hold owner=aa up=.* its owner passes with BLOOMERY_HOLD_OWNER"
+rm -f "$H/bloomery-aa-hold"
+rc_is "lease_guard 0 with only the caller's own hold up: 0" 0 guardenv lease_guard 0 03
+silent "lease_guard 0 with only the caller's own hold up: silent"
+guard "lease_guard 0 with another owner's hold up: 75" 75 'did not run \(rc 75\)' lease_guard 0 aa
+rm -f "$H/bloomery-03-hold"
+rc_is 'lease_guard 0 on a quiet box: 0 at once' 0 guardenv lease_guard 0
+silent 'lease_guard 0 on a quiet box: silent'
+if bg_lock -x "$P" "$tmp/probe.mark" 2; then
+  guard 'lease_guard 0 with the lease held: 75, naming the lease' 75 'the timing lease .*probe\.lock is held \(a sitting runs\); its holders:' lease_guard 0
+  has 'lease_guard asks lease_holders for the holder' '^\[lease\]   the holder of .* cannot be named'
+  wait "$BG"
+else
+  fail 'lease_guard with the lease held' 'the background exclusive lock was not taken'
+fi
+if bg_lock -x "$P" "$tmp/probe.mark" 2; then
+  guard 'lease_guard waits for the lease, then starts on two quiet polls' 0 'quiet on two polls in a row after [0-9]+ s: the command starts' lease_guard 20
+  has 'lease_guard says it waits, with its bound and poll' 'the box is busy; the command waits up to 20 s \(BLOOMERY_BOX_WAIT\), polling every 1 s:'
+  wait "$BG"
+else
+  fail 'lease_guard waits for the lease' 'the background exclusive lock was not taken'
+fi
+touch "$H/bloomery-aa-hold"
+guard 'lease_guard gives up at its bound: 75, naming what is up' 75 'still busy after [0-9]+ s \(the bound, BLOOMERY_BOX_WAIT=2\): the command did not run \(rc 75\)' lease_guard 2
+rm -f "$H/bloomery-aa-hold"
+# Two holds up, each owner running its own sitting: the hold that went up later gives way at once.
+touch -t 202601010000 "$H/bloomery-03-hold"
+touch -t 202601010100 "$H/bloomery-aa-hold"
+guard 'two holds up: the later owner gives way at once (75)' 75 'hold .*bloomery-03-hold \(owner 03\) went up before .*bloomery-aa-hold: two sittings would wait on each other, so this one gives way' lease_guard 20 aa
+guard 'two holds up: the earlier owner waits as for any hold' 75 'BLOOMERY_BOX_WAIT=0 does not wait' lease_guard 0 03
+if grep -q 'gives way' "$tmp/out"; then fail 'the earlier owner does not give way' 'it gave way' "$tmp/out"; else pass 'the earlier owner does not give way'; fi
+touch -t 202601010000 "$H/bloomery-aa-hold"
+guard 'two holds up in the same second: the owner that sorts later gives way' 75 'bloomery-03-hold \(owner 03\) went up before' lease_guard 20 aa
+rm -f "$H/bloomery-03-hold" "$H/bloomery-aa-hold"
+run 'lease_guard on an untestable lease: 70 at once' 70 'the lease cannot be tested \(above\): the command did not run \(rc 70\)' \
+  env BLOOMERY_LEASE_LOCK="$tmp/no-such-dir/x.lock" BLOOMERY_LEASE_HOLDS="$H/bloomery-*-hold" bash -c 'source "$1" && lease_guard 0' _ "$T/tools/ref/lease-probe.sh"
+guard 'lease_guard refuses a bound that is not seconds' 64 'the bound is whole seconds' lease_guard 1m
+guard 'lease_guard refuses an owner that is not a word' 64 'an owner is letters, digits and _' lease_guard 0 0/3
+run 'lease_guard refuses a hold pattern without one * for the owner' 64 'is not <prefix>\*<suffix> with one' \
+  env BLOOMERY_LEASE_LOCK="$P" BLOOMERY_LEASE_HOLDS="$H/hold" bash -c 'source "$1" && lease_guard 0' _ "$T/tools/ref/lease-probe.sh"
+
+# tools/box.sh builds the guard into the remote command, before the environment and the command; the
+# read-only opt-in leaves it out and refuses a build. ssh and rsync are stubs that record their
+# arguments and reach nothing; every refusal happens before the first ssh. The remote command spans
+# two lines (box.sh's card pick ends in a newline), so the guard is on the first and the command on
+# the last.
+B=$tmp/boxtree
+mkdir -p "$B/tools" "$tmp/stub"
+cp "$ROOT/tools/box.sh" "$B/tools/"
+cp "$ROOT/Cargo.toml" "$B/"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$tmp/ssh.log" > "$tmp/stub/ssh"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/stub/rsync"
+chmod +x "$tmp/stub/ssh" "$tmp/stub/rsync"
+# The caller's own box.sh variables are dropped (a batch run with BLOOMERY_HOLD_OWNER set runs these
+# tests too); a test that wants one sets it after `box`.
+box() {
+  : > "$tmp/ssh.log"
+  env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_READONLY -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD \
+    -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL -u BLOOMERY_DATA \
+    PATH="$tmp/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' "$@"
+}
+sshlog() {
+  if grep -Eq -- "$2" "$tmp/ssh.log"; then pass "$1"; else fail "$1" "no ssh line matches /$2/" "$tmp/ssh.log"; fi
+}
+rc_is 'box.sh: a command reaches the stub ssh' 0 box "$B/tools/box.sh" 'cargo check'
+sshlog 'box.sh: the guard comes first, before the environment' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 1800  \) && source ~/bloomery-env\.sh && \{ :$'
+sshlog 'box.sh: the command comes last' '^\} && cd ~/repo/x && .*cargo check$'
+rc_is 'box.sh: BLOOMERY_BOX_WAIT and BLOOMERY_HOLD_OWNER reach the guard' 0 box env BLOOMERY_BOX_WAIT=0 BLOOMERY_HOLD_OWNER=03 "$B/tools/box.sh" true
+sshlog 'box.sh: lease_guard 0 03' '^stub \( cd ~/repo/x && \. tools/ref/lease-probe\.sh && lease_guard 0 03 \) && source '
+rc_is 'box.sh: a read-only command runs' 0 box env BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'ps -e | wc -l'
+sshlog 'box.sh: the read-only command has no guard' '^stub source ~/bloomery-env\.sh && \{ :$'
+sshlog 'box.sh: the read-only command is the command' '^\} && cd ~/repo/x && .*ps -e \| wc -l$'
+for word in 'cargo --version' 'just check' 'make -j' 'cmake ..' 'ninja -C build' './target/release/generate_ds41 --time'; do
+  w=${word%% *}
+  [ "${w#./target/}" = "$w" ] || w=target/
+  run "box.sh: BLOOMERY_BOX_READONLY=1 refuses '$word' by name" 64 "names '$w'" box env BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" "$word"
+  if [ -s "$tmp/ssh.log" ]; then fail "box.sh: the refusal of '$word' reached ssh" 'ssh ran' "$tmp/ssh.log"; else pass "box.sh: the refusal of '$word' reached no ssh"; fi
+done
+run 'box.sh: BLOOMERY_BOX_READONLY takes 1 or 0' 64 'BLOOMERY_BOX_READONLY is 1' box env BLOOMERY_BOX_READONLY=yes "$B/tools/box.sh" ls
+run 'box.sh: BLOOMERY_BOX_WAIT is seconds' 64 'BLOOMERY_BOX_WAIT is whole seconds' box env BLOOMERY_BOX_WAIT=30m "$B/tools/box.sh" ls
+run 'box.sh: BLOOMERY_HOLD_OWNER is a word' 64 'BLOOMERY_HOLD_OWNER is the <owner>' box env BLOOMERY_HOLD_OWNER=/root/bloomery-03-hold "$B/tools/box.sh" ls
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {

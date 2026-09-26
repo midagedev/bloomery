@@ -25,7 +25,11 @@ EXE=./target/release/$NAME
 # 카드 고르기. 락은 카드마다 하나: 3090은 예전 경로 그대로(돌고 있는 트랙의 옛 사본이 그 경로를 잡는다),
 # A6000은 새 파일. BLOOMERY_GATE_CARD=3090(기본 — 예전과 같다) | a6000 | any. any는 A6000을 먼저 본다 —
 # V4.1 `--place gate` 게이트는 3090에서만 돌 수 있으니 떠도는 게이트가 3090을 비워 두는 편이 낫다. A6000은
-# 타이밍 임대(/root/bloomery-cpu.lock)가 잡혀 있거나 그 카드에 컴퓨트 프로세스가 있으면 건너뛴다.
+# 타이밍 임대(/root/bloomery-cpu.lock)가 잡혀 있거나 그 카드에 컴퓨트 프로세스가 있으면 건너뛴다. 임대 탐침은
+# lease-probe.sh의 lease_free(공유 잠금) 하나다 — 대기 중 5초마다 도는 이 탐침이 배타 잠금이면 다른 탐침과 부딪혀
+# 빈 임대를 잡힌 것으로 읽고, 테스트할 수 없는 임대도 비었다고 읽지 않는다.
+# shellcheck source=tools/ref/lease-probe.sh
+source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
 CARD=${BLOOMERY_GATE_CARD:-3090}
 case "$CARD" in
   3090 | a6000 | any) ;;
@@ -38,7 +42,7 @@ a6000_idle() {
 }
 exec 9>/root/bloomery-gate.lock
 exec 8>/root/bloomery-gate-a6000.lock
-take_a6000() { flock -n 8 || return 1; if [ "$CARD" = any ] && ! { flock -n /root/bloomery-cpu.lock true && a6000_idle; }; then flock -u 8; return 1; fi; GOT=a6000; }
+take_a6000() { flock -n 8 || return 1; if [ "$CARD" = any ] && ! { lease_free && a6000_idle; }; then flock -u 8; return 1; fi; GOT=a6000; }
 take_3090() { flock -n 9 || return 1; GOT=3090; }
 GOT=
 for ((waited = 0; waited <= 1800; waited += 5)); do
