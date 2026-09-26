@@ -1,8 +1,8 @@
-//! Fused block kernels (package P0b — filled by its track): the dense FFN
-//! half as four launches, bit-identical to the eight-launch op path, plus the
-//! two attention-chain fusions built on the same rule — `norm_quant`'s f32
-//! side-output (the norm's two consumers from one launch) and the MLA key
-//! path's `rope + rms_norm + gather + kv_append` as one launch.
+//! Fused block kernels: the dense FFN half as four launches, bit-identical
+//! to the eight-launch op path, plus the two attention-chain fusions built
+//! on the same rule — `norm_quant`'s f32 side-output (the norm's two
+//! consumers from one launch) and the MLA key path's `rope + rms_norm +
+//! gather + kv_append` as one launch.
 
 use crate::GpuError;
 use crate::cores::q3k_row_dot;

@@ -403,32 +403,6 @@ impl ExpertKernels {
         Ok(())
     }
 
-    /// Enqueue `y[d] = Σ_s w[s] · down[s · rows + d] + resid[d]` over `rows
-    /// = resid.len()` values and `n_slots` slots (module doc): one token.
-    /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_combine(
-        &self,
-        stream: &CudaStream,
-        down: &DeviceBuffer<f32>,
-        w: &DeviceBuffer<f32>,
-        resid: &DeviceBuffer<f32>,
-        n_slots: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        self.enqueue_combine_tokens(
-            stream,
-            CombineArgs {
-                down,
-                w,
-                resid,
-                rows: resid.len(),
-                n_slots,
-                m: 1,
-                y,
-            },
-        )
-    }
-
     /// Enqueue the combine of `a.m` tokens (module doc): token `t`'s `rows`
     /// values from its `n_slots` down rows and weights. Asynchronous,
     /// allocation-free, capturable.
@@ -437,7 +411,7 @@ impl ExpertKernels {
         stream: &CudaStream,
         a: CombineArgs<'_>,
     ) -> Result<(), GpuError> {
-        let what = "qwen3moe::enqueue_combine";
+        let what = "qwen3moe::enqueue_combine_tokens";
         let CombineArgs {
             down,
             w,

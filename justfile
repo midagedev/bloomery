@@ -533,14 +533,9 @@ gate-ds41-meta:
 gate-qwen3moe-meta:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen3moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen3moe_meta -- --ignored --nocapture'
 
-# qwen3moe 배치 게이트: 3090 한 장에 전부(ctx 32768) — 모든 expert가 카드에, 계획 바이트 = 헤더에서 다시 센 상주
-# 바이트, 전체 계획의 바이트 예산에서 whole, 1바이트 모자라면 not whole, 무-expert 바닥 아래면 거부. 헤더만.
-gate-qwen3moe-placement:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test qwen3moe_placement -- --ignored --nocapture'
-
 # qwen3moe 커널 게이트(3090, ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). 헤드별 QK RMS 노름,
 # NEOX 로프와 K/V 캐시 쓰기(한 런치), 소프트맥스 라우터 128/8과 재정규화, 다운 `_sel`(Q6_K 새 커널, Q4_K 기존 커널),
-# GQA 플래시 디코드(스칼라·텐서 코어 두 패스). 레시피마다 바이너리 하나, 마지막 것은 다섯을 한 번에 짓고 차례로 돈다.
+# GQA 플래시 디코드(스칼라·텐서 코어 두 패스). 레시피마다 바이너리 하나.
 gate-gpu-qwen3moe-qknorm:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_qknorm'
 
@@ -566,9 +561,6 @@ gate-gpu-qwen3moe-flash:
 # (ffn_moe_gate_par 대조), combine(routed_out 대조).
 gate-gpu-qwen3moe-experts:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
-
-gate-gpu-qwen3moe-kernels:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm --bin gate_qwen3moe_rope --bin gate_qwen3moe_router --bin gate_qwen3moe_down --bin gate_qwen3moe_flash --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_qknorm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
 # 파일), graph = eager. 플래시 패스는 프로세스마다 한 번 읽으므로 MMA 기본과 스칼라(BLOOMERY_GQA_MMA=0)를 따로 돈다.

@@ -2,20 +2,19 @@
 //! probability, and their weights renormalized to sum to one
 //! (`norm_topk_prob`).
 //!
-//! Four entries share one warp-level routing body, [`route_warp`]:
+//! Three entries share one warp-level routing body, [`route_warp`]:
 //! `qwen3moe_router_fused` — the router's logit gemv with the routing fused
 //! into it, one launch for up to [`MAX_TOKENS`] tokens; `qwen3moe_router_norm`,
 //! the chain's at one token — the same launch with `fused::norm_quant` run
 //! in every block first (its q8_1 bytes out, its normed row kept in shared
-//! memory for the gemv); `qwen3moe_router`, the routing alone over one
-//! token's given logits; and `qwen3moe_router_route`, the routing alone over
-//! a ubatch's logits, one warp per token. `qwen3moe_router_logits` writes
-//! those: the fused entry's lane sums over a ubatch of up to [`UBATCH`]
-//! tokens as register tiles — a block of sixteen warps covers 32 tokens and
-//! 32 expert rows, each warp eight rows by eight tokens, the rows' and the
-//! tokens' values staged in shared memory — so the two ubatch launches leave
-//! each token's logits, ids and weights bit for bit what the fused launch
-//! leaves for it. The
+//! memory for the gemv); and `qwen3moe_router_route`, the routing alone over
+//! given logits, one warp per token. A ubatch's logits come from
+//! `qwen3moe_router_logits`: the fused entry's lane sums over a ubatch of up
+//! to [`UBATCH`] tokens as register tiles — a block of sixteen warps covers
+//! 32 tokens and 32 expert rows, each warp eight rows by eight tokens, the
+//! rows' and the tokens' values staged in shared memory — so the two ubatch
+//! launches leave each token's logits, ids and weights bit for bit what the
+//! fused launch leaves for it. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
 //! `f32_lane_partials`' sum (at one token the same sum through
 //! `f32_lane_partial_1col_w32`, which keeps 32 chunks' loads in flight) and
@@ -77,9 +76,6 @@ pub const N_USED: usize = 8;
 /// Tokens one fused launch routes: the f32 gemv's column bound, and one
 /// warp of the routing block per token.
 pub const MAX_TOKENS: usize = 8;
-
-/// Threads per routing-only launch: one warp.
-const ROUTER_THREADS: u32 = 32;
 
 /// Tokens and expert rows one `qwen3moe_router_logits` block covers.
 const LOGITS_TOKENS: usize = 32;
@@ -160,6 +156,9 @@ const _: () = assert!(STAGE_CHUNKS == 2 && STAGES == 3);
 const _: () = assert!(STAGES * STAGE_FLOATS * size_of::<f32>() <= 48 * 1024);
 // `qwen3moe_router_logits`' launch contract spells the block out.
 const _: () = assert!(LOGITS_THREADS == 512);
+// The entries' launch contracts spell N_EXPERT, N_USED and MAX_TOKENS out as
+// 128, 8 and 8.
+const _: () = assert!(N_EXPERT == 128 && N_USED == 8 && MAX_TOKENS == 8);
 
 /// One token's routing by one warp, the module doc's contract: lane `L`
 /// brings the token's logits of experts `L + 32 j` in `v`; `p` and `slot_p`
@@ -482,55 +481,6 @@ unsafe fn store_rows(y: &mut DisjointSlice<f32>, base: usize, sums: &[f32; TILE]
 mod qwen3moe_router_kernels {
     use super::*;
     use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
-
-    /// The routing alone for one token: its [`N_EXPERT`] logits in `x` →
-    /// every probability in `probs`, the ids in rank order in `ids` and
-    /// their renormalized weights in `weights`. One block of one warp,
-    /// [`route_warp`]; a non-finite logit raises [`FaultSite::Router`] on
-    /// `fault`.
-    #[kernel]
-    #[launch_bounds(32)]
-    #[launch_contract(
-        domain = 1,
-        block = (32, 1, 1),
-        requires = (
-            x.len() >= 128,
-            probs.len() >= 128,
-            ids.len() >= 8,
-            weights.len() >= 8
-        )
-    )]
-    pub fn qwen3moe_router(
-        x: &[f32],
-        mut probs: DisjointSlice<f32>,
-        mut ids: DisjointSlice<u32>,
-        mut weights: DisjointSlice<f32>,
-        fault: FaultSink,
-    ) {
-        static mut P: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
-        static mut SLOT_P: SharedArray<f32, N_USED> = SharedArray::UNINIT;
-
-        let lane = warp::lane_id() as usize;
-        // SAFETY: block-shared, N_EXPERT entries; the raw form reaches the
-        // `static mut` without a reference.
-        let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut P) };
-        // SAFETY: block-shared, N_USED entries; the raw form reaches the
-        // `static mut` without a reference.
-        let slot_p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SLOT_P) };
-        // SAFETY: lane + 96 < 128 <= x.len() by the launch contract.
-        let v = unsafe {
-            (
-                *x.get_unchecked(lane),
-                *x.get_unchecked(lane + 32),
-                *x.get_unchecked(lane + 64),
-                *x.get_unchecked(lane + 96),
-            )
-        };
-        // SAFETY: the block is this one warp, converged here; P and SLOT_P
-        // are its own; token 0's slots are inside probs, ids and weights by
-        // the launch contract.
-        unsafe { route_warp(v, p, slot_p, 0, &mut probs, &mut ids, &mut weights, fault) };
-    }
 
     /// The router of `m_cols` tokens: `w` the router weight ([`N_EXPERT`]
     /// rows of `k` f32), `x` the tokens' normed activations (`m_cols`
@@ -943,7 +893,9 @@ mod qwen3moe_router_kernels {
         if stages > 1 {
             stage_copy!(1, 1);
         }
-        // SAFETY: as above; the group is empty for a single stage.
+        // SAFETY: commits this thread's copies of stage 1 as the second
+        // group, empty when `stages` is 1 (no copy was issued); the loop's
+        // wait counts it as stage 1's either way.
         unsafe { cp_async_commit_group() };
 
         let mut acc = [[0.0f32; TILE]; TILE];
@@ -1075,7 +1027,8 @@ mod qwen3moe_router_kernels {
 /// the probabilities, per slot the expert id and the weight, and the fused
 /// launch's block ticket count, which it returns to zero. The count serves
 /// one launch at a time, so launches that share a `RouterOut` must be
-/// ordered on one stream.
+/// ordered on one stream. `tokens` is how many tokens the buffers hold, and
+/// only that: each launcher checks its own launch's bound beside it.
 pub struct RouterOut {
     pub logits: DeviceBuffer<f32>,
     pub probs: DeviceBuffer<f32>,
@@ -1086,40 +1039,42 @@ pub struct RouterOut {
 }
 
 impl RouterOut {
-    /// Allocate the buffers for one token, the ticket count zeroed.
-    /// Load-time only.
-    pub fn new(stream: &CudaStream) -> Result<RouterOut, GpuError> {
-        RouterOut::with_tokens(stream, 1)
-    }
-
     /// Allocate the buffers for up to `tokens` (1..=[`MAX_TOKENS`]) tokens
     /// per launch. Load-time only.
     pub fn with_tokens(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-        if !(1..=MAX_TOKENS).contains(&tokens) {
-            return Err(GpuError::shape(
-                "qwen3moe::router::RouterOut::with_tokens",
-                format!("{tokens} tokens, want 1..={MAX_TOKENS}"),
-            ));
-        }
-        Ok(RouterOut {
-            logits: DeviceBuffer::zeroed(stream, tokens * N_EXPERT)?,
-            probs: DeviceBuffer::zeroed(stream, tokens * N_EXPERT)?,
-            ids: DeviceBuffer::zeroed(stream, tokens * N_USED)?,
-            weights: DeviceBuffer::zeroed(stream, tokens * N_USED)?,
-            done: DeviceBuffer::zeroed(stream, 1)?,
+        RouterOut::alloc(
+            stream,
             tokens,
-        })
+            MAX_TOKENS,
+            "qwen3moe::router::RouterOut::with_tokens",
+        )
     }
 
     /// Allocate the buffers for a ubatch of up to `tokens` (1..=[`UBATCH`])
-    /// tokens, the output of [`RouterKernels::enqueue_ubatch`]. The fused
-    /// launch still refuses more than [`MAX_TOKENS`] tokens into them by its
-    /// own contract. Load-time only.
+    /// tokens, the output of [`RouterKernels::enqueue_ubatch`]. A fused
+    /// launch into them still routes at most [`MAX_TOKENS`] tokens and is
+    /// refused by name past that. Load-time only.
     pub fn for_ubatch(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-        if !(1..=UBATCH).contains(&tokens) {
+        RouterOut::alloc(
+            stream,
+            tokens,
+            UBATCH,
+            "qwen3moe::router::RouterOut::for_ubatch",
+        )
+    }
+
+    /// The buffers for `tokens` (1..=`most`) tokens, the ticket count zeroed;
+    /// a count outside that is refused as `what`.
+    fn alloc(
+        stream: &CudaStream,
+        tokens: usize,
+        most: usize,
+        what: &'static str,
+    ) -> Result<RouterOut, GpuError> {
+        if !(1..=most).contains(&tokens) {
             return Err(GpuError::shape(
-                "qwen3moe::router::RouterOut::for_ubatch",
-                format!("{tokens} tokens, want 1..={UBATCH}"),
+                what,
+                format!("{tokens} tokens, want 1..={most}"),
             ));
         }
         Ok(RouterOut {
@@ -1132,7 +1087,8 @@ impl RouterOut {
         })
     }
 
-    /// The tokens one launch into these buffers may route.
+    /// The tokens these buffers hold: a ubatch or routing launch may take all
+    /// of them, a fused launch at most [`MAX_TOKENS`].
     pub fn tokens(&self) -> usize {
         self.tokens
     }
@@ -1167,44 +1123,12 @@ impl RouterKernels {
         Ok(RouterKernels { module })
     }
 
-    /// Enqueue the routing alone of one token over its `x` ([`N_EXPERT`]
-    /// logits) into `out`'s first token; a non-finite logit raises
-    /// [`FaultSite::Router`] on `fault`. Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue(
-        &self,
-        stream: &CudaStream,
-        x: &DeviceBuffer<f32>,
-        fault: FaultSink,
-        out: &mut RouterOut,
-    ) -> Result<(), GpuError> {
-        if x.len() < N_EXPERT {
-            return Err(GpuError::shape(
-                "qwen3moe::router::enqueue",
-                format!("x.len() {} needs {N_EXPERT}", x.len()),
-            ));
-        }
-        let prep =
-            self.module
-                .prepare_qwen3moe_router(LaunchConfig1D::new(1, ROUTER_THREADS, 0))?;
-        self.module.qwen3moe_router(
-            stream,
-            &prep,
-            x,
-            &mut out.probs,
-            &mut out.ids,
-            &mut out.weights,
-            fault,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue the router of `m` (1..=`out.tokens()`) tokens: `w` the
-    /// router weight as f32 ([`N_EXPERT`] rows of `k`, `k` a positive
-    /// multiple of 32), `x` the tokens' `m` columns of `k` activations;
-    /// results into `out`, a token with a non-finite logit raising
-    /// [`FaultSite::Router`] on `fault`. Asynchronous, allocation-free,
-    /// capturable.
+    /// Enqueue the router of `m` tokens, 1..=[`MAX_TOKENS`] and at most
+    /// `out.tokens()`: `w` the router weight as f32 ([`N_EXPERT`] rows of
+    /// `k`, `k` a positive multiple of 32), `x` the tokens' `m` columns of
+    /// `k` activations; results into `out`, a token with a non-finite logit
+    /// raising [`FaultSite::Router`] on `fault`. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_fused(
         &self,
         stream: &CudaStream,
@@ -1225,11 +1149,12 @@ impl RouterKernels {
                 ),
             ));
         }
-        if !(1..=out.tokens).contains(&m) || x.len() < m * k {
+        if !(1..=MAX_TOKENS.min(out.tokens)).contains(&m) || x.len() < m * k {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "{m} tokens into buffers for {}, x.len() {} for {m} x {k}",
+                    "{m} tokens: one launch routes 1..={MAX_TOKENS}, into buffers for {}; x.len() \
+                     {} for {m} x {k}",
                     out.tokens,
                     x.len()
                 ),
@@ -1259,7 +1184,8 @@ impl RouterKernels {
     }
 
     /// Enqueue the router of a ubatch of `n` (1..=`out.tokens()`) tokens in
-    /// two launches, `qwen3moe_router_logits` then `qwen3moe_router_route`:
+    /// two launches, `qwen3moe_router_logits` then `qwen3moe_router_route`
+    /// ([`RouterKernels::enqueue_route`]):
     /// `w` the router weight as f32 ([`N_EXPERT`] rows of `k`, `k` a
     /// positive multiple of 64), `x` the tokens' `n` columns of `k` normed
     /// activations, both 16-byte aligned (the logits launch copies them in
@@ -1313,7 +1239,32 @@ impl RouterKernels {
             .prepare_qwen3moe_router_logits(LaunchConfig1D::new(grid, LOGITS_THREADS_U32, 0))?;
         self.module
             .qwen3moe_router_logits(stream, &prep, w.buf(), x, k, n_tok, &mut out.logits)?;
-        let grid = launch_u32(what, "route grid", n.div_ceil(FUSED_WARPS))?;
+        self.enqueue_route(stream, n, fault, out)
+    }
+
+    /// Enqueue the routing alone of the first `n` (1..=`out.tokens()`)
+    /// tokens' logits in `out.logits` (`qwen3moe_router_route`, warp `w` of
+    /// block `b` routing token `8·b + w`): each token's probabilities, ids
+    /// and weights into `out` where the fused launch writes a token's, a
+    /// token with a non-finite logit raising [`FaultSite::Router`] on
+    /// `fault`. The second launch of [`RouterKernels::enqueue_ubatch`].
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_route(
+        &self,
+        stream: &CudaStream,
+        n: usize,
+        fault: FaultSink,
+        out: &mut RouterOut,
+    ) -> Result<(), GpuError> {
+        let what = "qwen3moe::router::enqueue_route";
+        if !(1..=out.tokens).contains(&n) {
+            return Err(GpuError::shape(
+                what,
+                format!("{n} tokens into buffers for {}", out.tokens),
+            ));
+        }
+        let n_tok = launch_u32(what, "n", n)?;
+        let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
         let prep = self
             .module
             .prepare_qwen3moe_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;

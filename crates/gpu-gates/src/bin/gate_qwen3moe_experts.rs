@@ -35,9 +35,8 @@
 //! 4. Combine: ik's `ffn_moe_down-L` and `ffn_moe_weights_norm-L` in with a
 //!    zero residual, against ik's `routed_out-L` (its weighted sum): max
 //!    relative distance within `γ(8)` of `Σ|w·d|` per value, and the count
-//!    of bit-equal values printed.
-//!
-//! PIN(2026-09-25): removed — the engine no longer runs `qwen3moe_gate_up_swiglu_quant_q4k` (gate·up with the down's q8_1 folded in through per-group tickets, section 5): decode was slower with it (rig-log 2026-09-25.md#qwen3fuse-regression-nsys), the step quantizes `h` in its own launch again, and the kernel is gone with its check.
+//!    of bit-equal values printed; the combine is the engine's launcher
+//!    (`enqueue_combine_tokens`) at one token.
 //!
 //! And each kernel as a captured graph: one node, the replay equal to the
 //! eager launch.
@@ -57,7 +56,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
+    use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
@@ -548,7 +547,18 @@ mod gate {
                     let dd = DeviceBuffer::from_host(stream, d)?;
                     let wd = DeviceBuffer::from_host(stream, w)?;
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows])?;
-                    ex.enqueue_combine(stream, &dd, &wd, &zero, slots, &mut y)?;
+                    ex.enqueue_combine_tokens(
+                        stream,
+                        CombineArgs {
+                            down: &dd,
+                            w: &wd,
+                            resid: &zero,
+                            rows,
+                            n_slots: slots,
+                            m: 1,
+                            y: &mut y,
+                        },
+                    )?;
                     stream.synchronize()?;
                     let ours = y.to_host_vec(stream)?;
                     for r in 0..rows {
@@ -566,8 +576,20 @@ mod gate {
                     }
                     if !graph_checked {
                         let mut yg = DeviceBuffer::from_host(stream, &vec![SENT; rows])?;
-                        let graph = gpu
-                            .capture(|s| ex.enqueue_combine(s, &dd, &wd, &zero, slots, &mut yg))?;
+                        let graph = gpu.capture(|s| {
+                            ex.enqueue_combine_tokens(
+                                s,
+                                CombineArgs {
+                                    down: &dd,
+                                    w: &wd,
+                                    resid: &zero,
+                                    rows,
+                                    n_slots: slots,
+                                    m: 1,
+                                    y: &mut yg,
+                                },
+                            )
+                        })?;
                         graph.launch(stream)?;
                         stream.synchronize()?;
                         let g_same = bits_equal(&yg.to_host_vec(stream)?, &ours);

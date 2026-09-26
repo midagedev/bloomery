@@ -2,7 +2,8 @@
 //! over 128 experts, the top 8, and the weights renormalized
 //! (`norm_topk_prob`).
 //!
-//! The routing alone (`qwen3moe_router`, one token's logits in) against the
+//! The routing alone (`qwen3moe_router_route`, the engine's ubatch routing
+//! entry, at one token: its logits in) against the
 //! host rule (`route_ref_within` at 128/8 — the serial max fold, f32 `exp`,
 //! the f64 ascending sum, the f32 divide, ties to the smaller id — then the
 //! chosen probabilities summed in f64 in slot order and each divided by the
@@ -57,7 +58,10 @@
 //! overflowing to +inf at one expert (the column is `1e38` with the sign of
 //! that expert's weights); the ubatch pair at nine tokens with the ninth so;
 //! a NaN in the router weight, which refuses every token of the fused launch
-//! and the norm-fused launch's token (its q8_1 bytes unchanged).
+//! and the norm-fused launch's token (its q8_1 bytes unchanged). And on the
+//! host: the fused launch of nine tokens into ubatch buffers that hold nine
+//! is refused by name (`enqueue_fused`'s shape error, one launch routes at
+//! most eight) before any launch.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -78,7 +82,9 @@ mod gate {
         MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
     };
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
+    use bloomery_gpu::{
+        DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act,
+    };
     use bloomery_gpu_gates::qwen3moe::sets;
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, open_model, open_split, ref_tensor_logical_in,
@@ -101,6 +107,9 @@ mod gate {
         weights: Vec<f32>,
     }
 
+    /// The routing alone of one token's logits `x` ([`N_EXPERT`] values) by
+    /// the engine's routing entry at one token: `x` copied into `out.logits`
+    /// (a one-token `RouterOut`), routed there, read back.
     fn route(
         k: &RouterKernels,
         stream: &CudaStream,
@@ -108,7 +117,8 @@ mod gate {
         sink: FaultSink,
         out: &mut RouterOut,
     ) -> Result<Routed, GateError> {
-        k.enqueue(stream, x, sink, out)?;
+        out.logits.copy_from_device_async(x, stream)?;
+        k.enqueue_route(stream, 1, sink, out)?;
         stream.synchronize()?;
         Ok(Routed {
             probs: out.probs.to_host_vec(stream)?,
@@ -482,8 +492,8 @@ mod gate {
         let stream = gpu.stream();
         let cpu = &sets()?[0].1;
         let mut ok = true;
-        let mut out_s = RouterOut::new(stream)?;
-        let mut out_f = RouterOut::new(stream)?;
+        let mut out_s = RouterOut::with_tokens(stream, 1)?;
+        let mut out_f = RouterOut::with_tokens(stream, 1)?;
         let norm = FusedKernels::load(gpu.context())?;
         let mut last = None;
         for (l, src) in [(13usize, "l_out-12"), (47, "l_out-46")] {
@@ -707,7 +717,7 @@ mod gate {
 
         // The routing alone: a NaN, a +inf and a −inf logit.
         let before = gpu.fault()?;
-        let mut out = RouterOut::new(stream)?;
+        let mut out = RouterOut::with_tokens(stream, 1)?;
         let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
         let clean = route(k, stream, &x, sink, &mut out)?;
         let after_clean = gpu.fault()?;
@@ -743,7 +753,7 @@ mod gate {
                 && bits_equal(&again.weights, &clean.weights);
             let pass = word == want && refused && ids_kept && clean_after;
             println!(
-                "fault op=qwen3moe_router logit[37]={name}: word \"{}\" (want \"{}\") probs_weights_nan={refused} \
+                "fault op=qwen3moe_router_route logit[37]={name}: word \"{}\" (want \"{}\") probs_weights_nan={refused} \
                  ids_kept={ids_kept} clean_rerun_word_none_and_bits={clean_after} {}",
                 word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
                 want.map_or_else(String::new, |f| f.to_string()),
@@ -824,6 +834,29 @@ mod gate {
         );
         ok &= pass;
 
+        // The fused launch routes at most MAX_TOKENS tokens whatever its
+        // buffers hold: nine into the ubatch buffers for nine is refused by
+        // name before any launch, the buffers as they were.
+        let held = read_fused(stream, &ub, ub_n)?;
+        let r = k.enqueue_fused(stream, &w, &xu, ub_n, sink, &mut ub);
+        stream.synchronize()?;
+        let untouched = fused_equal(&read_fused(stream, &ub, ub_n)?, &held);
+        let named = matches!(
+            r,
+            Err(GpuError::Shape {
+                what: "qwen3moe::router::enqueue_fused",
+                ..
+            })
+        );
+        let seen = r.map_or_else(|e| format!("Err: {e}"), |()| "Ok (accepted)".to_string());
+        let pass = named && untouched;
+        println!(
+            "refuse op=qwen3moe_router_fused m={ub_n} into ubatch buffers for {ub_n}: {seen} (want \
+             enqueue_fused's shape error) buffers_untouched={untouched} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
         // A NaN router weight: every token of the fused launch is refused, and
         // the norm-fused launch's routing too, its q8_1 bytes the clean run's.
         let mut wn = wh.clone();
@@ -888,7 +921,7 @@ mod gate {
         let k = RouterKernels::load(gpu.context())?;
         let stream = gpu.stream();
         let sink = gpu.unlabelled_sink();
-        let mut out = RouterOut::new(stream)?;
+        let mut out = RouterOut::with_tokens(stream, 1)?;
         println!("gate_qwen3moe_router: device {}", gpu.device_name()?);
         let mut ok = true;
 
@@ -1018,7 +1051,9 @@ mod gate {
         out.ids.zero_async(stream)?;
         out.weights.zero_async(stream)?;
         stream.synchronize()?;
-        let graph = gpu.capture(|s| k.enqueue(s, &x, sink, &mut out))?;
+        // The eager run left the token's logits in `out.logits`; the graph
+        // routes them there.
+        let graph = gpu.capture(|s| k.enqueue_route(s, 1, sink, &mut out))?;
         graph.launch(stream)?;
         stream.synchronize()?;
         let replay = Routed {
@@ -1032,7 +1067,7 @@ mod gate {
         let nodes = graph.node_count();
         let pass = identical && nodes == 1;
         println!(
-            "graph op=qwen3moe_router src=ffn_moe_logits-13 eager_vs_graph_bit_identical={identical} \
+            "graph op=qwen3moe_router_route src=ffn_moe_logits-13 eager_vs_graph_bit_identical={identical} \
              graph_nodes={nodes} {}",
             verdict(pass)
         );

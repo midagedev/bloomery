@@ -198,10 +198,13 @@ const _: () = assert!(Q_WORDS * THREADS == Q_ROWS * Q_PAIRS);
 const _: () = assert!(Q_ROW_STEP * Q_PAIRS == THREADS && Q_POS_PASSES * Q_ROW_STEP == GROUP);
 const _: () = assert!(Q_WORDS == Q_POS_PASSES * POSITIONS);
 const _: () = assert!(KEY_TILE == 4 * 16 && HEAD.is_multiple_of(16));
+// `gqa_prefill_flash`'s launch contract spells GROUP and HEAD out as 8 and
+// 128.
+const _: () = assert!(GROUP == 8 && HEAD == 128);
 
 /// Blocks a ubatch of `t` rows over `n_kv` key heads launches.
 #[must_use]
-pub fn blocks_for(t: usize, n_kv: usize) -> usize {
+fn blocks_for(t: usize, n_kv: usize) -> usize {
     t.div_ceil(POSITIONS) * n_kv
 }
 
@@ -373,9 +376,9 @@ mod flash_gqa_prefill_kernels {
                     + Q_ROW_STEP * (e % Q_POS_PASSES) * Q_PAIRS;
                 // SAFETY: t < t_rows and the head kh·GROUP + Q_ROW_STEP·(e %
                 // Q_POS_PASSES) + r0 < n_head, so the row lies inside q
-                // (launch contract); a row is HEAD f32 = HEAD/2 u64 and the
-                // buffer is device-allocated, so the u64 read of values
-                // 2·wd, 2·wd + 1 is aligned.
+                // (launch contract); a row is HEAD f32 = HEAD/2 u64 and q
+                // starts 8-byte aligned (host-checked), so the u64 read of
+                // values 2·wd, 2·wd + 1 is aligned.
                 raw[e] = unsafe { *q64.add(at) };
             }
             e += 1;
@@ -457,13 +460,18 @@ mod flash_gqa_prefill_kernels {
                         // SAFETY: the key is below hi <= ctx (every key of a
                         // full tile is), so its row is inside key head kh's
                         // plane (launch contract); rows are HEAD f16 = 256
-                        // bytes from a device allocation, so the source is
-                        // 16-byte aligned.
+                        // bytes and both planes start 16-byte aligned
+                        // (host-checked), so the source is 16-byte aligned.
                         unsafe {
                             cp_async_cg_16(d, tile_src.wrapping_add(i * PASS_KEYS * ROW_WORDS))
                         };
                     } else {
-                        // SAFETY: as above, the 16 bytes are this thread's own.
+                        // SAFETY: `d` is 16 bytes inside the tile and 16-byte
+                        // aligned (formed above), the chunk of key
+                        // tid / ROW_CHUNKS + PASS_KEYS·i, column tid % ROW_CHUNKS
+                        // — no other thread's copy or store names it — and no
+                        // warp reads the tile before the barrier after this
+                        // stage's wait.
                         unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
                     }
                     i += 1;
@@ -670,7 +678,10 @@ mod flash_gqa_prefill_kernels {
 
             // The value tile has landed, and every warp is done reading the
             // key tile.
-            // SAFETY: as at the top of the loop.
+            // SAFETY: waits until none of this thread's groups is pending —
+            // its copies of value tile kb, the one group issued since the
+            // wait above; the barrier then publishes every thread's copies
+            // before the value product reads VT.
             unsafe { cp_async_wait_group(0) };
             thread::sync_threads();
             if kb + 1 < tiles {
@@ -783,9 +794,11 @@ impl FlashGqaPrefill {
         Ok(FlashGqaPrefill { module })
     }
 
-    /// Enqueue `t` rows' attention: one launch of [`blocks_for`]`(t, n_kv)`
+    /// Enqueue `t` rows' attention: one launch of `blocks_for(t, n_kv)`
     /// blocks. A shape the kernel is not built for (`n_head ≠ n_kv ·
-    /// GROUP`), an empty launch or a short buffer is refused by name.
+    /// GROUP`), an empty launch, a short buffer, or a `q` not 8-byte aligned
+    /// or `kc`/`vc` not 16-byte aligned (the query staging reads u64 words,
+    /// the tiles copy 16-byte pieces) is refused by name before any launch.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue(&self, stream: &CudaStream, args: GqaPrefillArgs<'_>) -> Result<(), GpuError> {
         let what = "flash_gqa_prefill::enqueue";
@@ -827,6 +840,21 @@ impl FlashGqaPrefill {
             return Err(GpuError::shape(
                 what,
                 format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        // A window at another offset is a misaligned access on the card.
+        let starts = [
+            ("q", q.cu_deviceptr(), 8u64),
+            ("kc", kc.cu_deviceptr(), 16),
+            ("vc", vc.cu_deviceptr(), 16),
+        ];
+        if let Some((name, at, align)) = starts
+            .iter()
+            .find(|(_, at, align)| !at.is_multiple_of(*align))
+        {
+            return Err(GpuError::shape(
+                what,
+                format!("{name} at {at:#x} is not {align}-byte aligned"),
             ));
         }
         // The walk counts keys in u32 up to one tile past the largest count.

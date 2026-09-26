@@ -78,7 +78,13 @@
 //! launch's largest count changing no bit, a rerun bit-identical. A count of
 //! zero or past the cache raises the `key_count` fault, writes NaN in that
 //! row and changes no other row's bit; the captured launch (one node) replays
-//! bit-identical; a head count the kernel is not built for is refused.
+//! bit-identical; a head count the kernel is not built for is refused. Last,
+//! windows into padded allocations: at aligned offsets accepted and bit for
+//! bit the plain launch; `q` at an odd f32 offset (4 bytes past an 8-byte
+//! boundary — the query staging reads u64 words) and `kc` or `vc` 8 bytes past
+//! a 16-byte boundary (the tiles copy 16-byte pieces) each refused by name
+//! before any launch — the last check, because a launch through such a
+//! window is a sticky error that ends the context.
 //!
 //! PIN(2026-09-25): removed — the engine no longer runs `qwen3moe_o_resid_quant_q4k` (the output projection with its input's q8_1 folded in, every block re-quantizing the attention row): decode was slower with it (rig-log 2026-09-25.md#qwen3fuse-regression-nsys), the step quantizes in its own launch again, and the kernel is gone with its check.
 
@@ -97,13 +103,13 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::Gpu;
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
         FlashGqaKernels, GROUP, GqaArgs, HEAD, KEY_TILE, SEG_KEYS, partials_ms_len, partials_v_len,
         segments_for,
     };
     use bloomery_gpu::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, KEY_TILE as PREF_TILE};
+    use bloomery_gpu::{Gpu, GpuError, window};
     use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
@@ -114,6 +120,7 @@ mod gate {
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
     use model::arch::Arch;
     use model::arch::qwen3moe::hparams::Hparams;
+    use std::mem::ManuallyDrop;
 
     /// An f16 NaN the padded rows are overwritten with.
     const NAN16: u16 = 0x7e00;
@@ -808,6 +815,112 @@ mod gate {
             verdict(refuse_ok)
         );
         ok &= refuse_ok;
+        ok &= misaligned_refusals(k, gpu, &q, (&kb, &vb), (&clean, &y), &g)?;
+        Ok(ok)
+    }
+
+    /// Windows the kernel's loads cannot take (module doc), on the fault
+    /// check's inputs `q`, `kb`/`vb` and counts `clean`, whose plain launch
+    /// wrote `y`: the same windows at aligned offsets first — `q` two f32
+    /// into its allocation, the planes eight f16 into theirs — accepted and
+    /// bit for bit `y`; then `q` one f32 in (the query staging reads u64
+    /// words) and `kc` or `vc` four f16 in (the tiles copy 16-byte pieces),
+    /// each refused by name before a launch. The last check of the gate: a
+    /// launch through a misaligned window is a sticky error that ends the
+    /// context. Returns whether every check held.
+    fn misaligned_refusals(
+        k: &FlashGqaPrefill,
+        gpu: &Gpu,
+        q: &[f32],
+        (kb, vb): (&[u16], &[u16]),
+        (clean, y): (&[u32], &[f32]),
+        g: &Geom,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (n_head, t) = (g.n_kv * GROUP, clean.len());
+        let qd = DeviceBuffer::from_host(stream, q)?;
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, kb)?,
+            DeviceBuffer::from_host(stream, vb)?,
+        );
+        let nk = DeviceBuffer::from_host(stream, clean)?;
+        let q_pad = DeviceBuffer::from_host(stream, &[&[0.0f32; 2][..], q].concat())?;
+        let k_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], kb].concat())?;
+        let v_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], vb].concat())?;
+        let ctx = gpu.context();
+        // SAFETY: each window is `q.len()` f32 starting one or two f32 into
+        // `q_pad`, or `kb.len()` (= `vb.len()`) f16 starting four or eight
+        // f16 into `k_pad` or `v_pad` — inside its own live allocation, which
+        // holds two f32 or eight f16 more than the span. The allocations
+        // outlive every call below, and the windows are given back after them.
+        let (q_al, q_mis, k_al, k_mis, v_al, v_mis) = unsafe {
+            (
+                window::<f32>(q_pad.cu_deviceptr() + 8, q.len(), ctx),
+                window::<f32>(q_pad.cu_deviceptr() + 4, q.len(), ctx),
+                window::<u16>(k_pad.cu_deviceptr() + 16, kb.len(), ctx),
+                window::<u16>(k_pad.cu_deviceptr() + 8, kb.len(), ctx),
+                window::<u16>(v_pad.cu_deviceptr() + 16, vb.len(), ctx),
+                window::<u16>(v_pad.cu_deviceptr() + 8, vb.len(), ctx),
+            )
+        };
+        let ya = run_pref(k, gpu, &q_al, clean, (&*k_al, &*v_al), g)?;
+        let aligned_ok = bits_equal(&ya, y);
+        println!(
+            "prefill windows at aligned offsets (q 8 bytes, kc and vc 16 bytes into their \
+             allocations): accepted, bit-identical to the plain launch {aligned_ok} {}",
+            verdict(aligned_ok)
+        );
+        let mut ok = aligned_ok;
+        let mut ym = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
+        let cases = [
+            ("q", "4 bytes past an 8-byte boundary", &*q_mis, &kc, &vc),
+            ("kc", "8 bytes past a 16-byte boundary", &qd, &*k_mis, &vc),
+            ("vc", "8 bytes past a 16-byte boundary", &qd, &kc, &*v_mis),
+        ];
+        for (name, off, q_in, kc_in, vc_in) in cases {
+            let r = k.enqueue(
+                stream,
+                GqaPrefillArgs {
+                    q: q_in,
+                    kc: kc_in,
+                    vc: vc_in,
+                    n_keys: &nk,
+                    scale: g.scale,
+                    n_head,
+                    n_kv: g.n_kv,
+                    ctx: g.ctx,
+                    t,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut ym,
+                },
+            );
+            let named = matches!(
+                r,
+                Err(GpuError::Shape {
+                    what: "flash_gqa_prefill::enqueue",
+                    ref detail,
+                }) if detail.starts_with(&format!("{name} at "))
+            );
+            let seen = match &r {
+                _ if named => "refused by name".to_string(),
+                Ok(()) => format!(
+                    "accepted; the stream then reads {:?}",
+                    stream.synchronize().err().map(|e| e.to_string())
+                ),
+                Err(e) => format!("refused without the name: {e}"),
+            };
+            println!(
+                "prefill refusal {name} window {off}: {seen} {}",
+                verdict(named)
+            );
+            ok &= named;
+        }
+        for w in [q_al, q_mis] {
+            drop(ManuallyDrop::into_inner(w).into_raw_parts());
+        }
+        for w in [k_al, k_mis, v_al, v_mis] {
+            drop(ManuallyDrop::into_inner(w).into_raw_parts());
+        }
         Ok(ok)
     }
 
