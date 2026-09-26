@@ -38,7 +38,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
   `[other-busy]` (abort with `BLOOMERY_OTHER_STRICT=1`). `BLOOMERY_CARD=a6000|
   both tools/box.sh …` still exists for functional runs on the A6000 and
   refuses (rc 75) while that card has a compute process — i.e. while a timing
-  run holds it.
+  run holds it; its pick reaches the box as `BLOOMERY_BOX_CARD`, and the gate
+  runner takes the gate lock of every card in view (see Commands).
 - **Never start a box job longer than 30 minutes without the user's approval**
   (user, 2026-09-22). Estimate the wall time before launching — full-set CPU
   simulations, truth-file builds, depth sweeps, timing tables — and batch such
@@ -185,9 +186,17 @@ runner, `tools/gpu-gate.sh`: it takes a card's gate lock, runs the
 binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`: whole seconds from 1 up,
 one parser for the three runners in `tools/gate-bound.sh`; any other value, empty included,
 ends the runner with 64 before the binary runs), and
-returns the binary's exit code (124/137 timed out, 75 lock contention).
+returns the binary's exit code (124/137 timed out, 75 lock contention, 69 a lock
+file it cannot open: not root on the box).
 There is one lock per card: `/root/bloomery-gate.lock` (the 3090) and
-`/root/bloomery-gate-a6000.lock`. `BLOOMERY_GATE_CARD=3090|a6000|any`
+`/root/bloomery-gate-a6000.lock`. The cards box.sh put in view decide the lock
+(2026-09-27: a two-card load that held the 3090's lock alone shared the A6000
+with another track's `any` gate, which ran out of memory): under `BLOOMERY_CARD=a6000|both` the runner takes that card's lock, or
+both locks for `both` — the 3090's, then the A6000's while holding it (every other run holds one lock,
+so the order cannot deadlock) — and refuses (64) a
+`BLOOMERY_GATE_CARD` that names another card, so the two-card
+`stage-gpu-load-v41*` recipes need no card of their own. Under box.sh's default
+pin `BLOOMERY_GATE_CARD=3090|a6000|any`
 picks (the runner's default is `3090`; since 2026-09-25 the recipes that do
 not need the V4.1 gate placement — the qwen3moe gates, `gate-gpu-gemm`,
 `gate-gpu-e2e`, `gate-gpu-p6`, `gate-gpu-ds41-chain-ffn`, `gate-gpu-vision`,

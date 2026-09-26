@@ -34,8 +34,9 @@
 #   X  alone, after both lanes end: a recipe (or a dependency) that carries the just attribute
 #      `[group('solo')]`, whose gate pins a host-memory count (page faults, page-cache residency) that
 #      another lane's model loads move; and a recipe that uses box.sh's own card pick
-#      BLOOMERY_CARD=both|a6000 (stage-gpu-load-v41*, which carry the attribute too), which holds both
-#      cards without the A6000 gate lock. A solo gpu-gate.sh item keeps a card (3090 for a 3090 gate,
+#      BLOOMERY_CARD=both|a6000 (stage-gpu-load-v41*, which carry the attribute too): its gpu-gate.sh call
+#      takes the gate lock of every card box.sh put in view (both cards: both locks), so it holds them
+#      against other tracks' gates, and it still runs alone here. A solo gpu-gate.sh item keeps a card (3090 for a 3090 gate,
 #      a6000 for an `any` one); a BLOOMERY_CARD recipe gets none (box.sh picks). Alone means within
 #      this batch: another track's box jobs still run. The attribute is read from `just --dump --dump-format json`, where a recipe's
 #      "attributes" list holds {"group": "solo"}; a `[group('…')]` value anywhere in the justfile other
@@ -304,13 +305,15 @@ def takes_lease(path):
 # call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
 # any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
 # a message (echo, printf, die, fail, say) is not a script the file runs.
-# tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed. A stub-test
+# tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed; nor is this file's
+# (check-recipes runs its --classes): its patterns and messages name the runner in strings the call pattern
+# would read as calls. A stub-test
 # harness (a directory named *-tests, tools/ref/card-tests) is named in the reason and not read: it
 # runs the lease and runner code against a lock of its own, and its fixtures hold both on purpose.
 WALK_DEPTH = 6
 BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
 GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b", re.M)
-RUNNER_SELF = {GPU_GATE}
+RUNNER_SELF = {GPU_GATE, "tools/gate-batch.sh"}
 MESSAGE = re.compile(r"^[\s{(!]*(?:echo|printf|die|fail|say)\b")
 
 
@@ -417,7 +420,7 @@ def classify(name):
         m = BOX_CARD.search(text)
         if m:
             lanes_seen.add("X")
-            reasons.append(f"{n}: {m.group(0)} (both cards, no A6000 gate lock)")
+            reasons.append(f"{n}: {m.group(0)} (box.sh picks the cards, and the gate runner takes their locks)")
             continue
         oxide = "cargo oxide" in text
         for seg in SEGMENT.split(text):

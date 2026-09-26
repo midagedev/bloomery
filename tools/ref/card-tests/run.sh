@@ -465,6 +465,34 @@ done
 run 'box.sh: BLOOMERY_BOX_READONLY takes 1 or 0' 64 'BLOOMERY_BOX_READONLY is 1' box env BLOOMERY_BOX_READONLY=yes "$B/tools/box.sh" ls
 run 'box.sh: BLOOMERY_BOX_WAIT is seconds' 64 'BLOOMERY_BOX_WAIT is whole seconds' box env BLOOMERY_BOX_WAIT=30m "$B/tools/box.sh" ls
 run 'box.sh: BLOOMERY_HOLD_OWNER is a word' 64 'BLOOMERY_HOLD_OWNER is the <owner>' box env BLOOMERY_HOLD_OWNER=/root/bloomery-03-hold "$B/tools/box.sh" ls
+rc_is 'box.sh: a command with the default card runs' 0 box "$B/tools/box.sh" true
+sshlog 'box.sh: the default card reaches the box as BLOOMERY_BOX_CARD=3090' ' BLOOMERY_BOX_CARD=3090 && .*true$'
+rc_is 'box.sh: a command with BLOOMERY_CARD=both runs' 0 box env BLOOMERY_CARD=both "$B/tools/box.sh" true
+sshlog 'box.sh: BLOOMERY_CARD=both reaches the box as BLOOMERY_BOX_CARD=both' ' BLOOMERY_BOX_CARD=both && .*true$'
+
+# tools/gpu-gate.sh takes the gate lock of the card box.sh put in view (BLOOMERY_BOX_CARD): a card named
+# against it, and `both` without both cards in view, are refused before any lock is opened. The paths
+# that take a lock open /root's gate locks, so they are the box's to show, not these tests'.
+G=$tmp/gatetree
+mkdir -p "$G/tools/ref" "$G/target/release"
+cp "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$G/tools/"
+cp "$ROOT/tools/ref/lease-probe.sh" "$G/tools/ref/"
+printf '#!/bin/sh\nexit 0\n' > "$G/target/release/x"
+chmod +x "$G/target/release/x"
+gg() { (cd "$G" && env -u BLOOMERY_GATE_CARD -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND "$@" bash tools/gpu-gate.sh x); }
+run 'gpu-gate.sh: both cards in view refuse the 3090 lock alone' 64 'box.sh put both cards in view \(BLOOMERY_CARD=both\), and BLOOMERY_GATE_CARD=3090 names another lock' \
+  gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=3090
+run 'gpu-gate.sh: both cards in view refuse any' 64 'box.sh put both cards in view' gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=any
+run 'gpu-gate.sh: the A6000 in view refuses the 3090 lock' 64 'box.sh put the A6000 in view \(BLOOMERY_CARD=a6000\)' \
+  gg BLOOMERY_BOX_CARD=a6000 BLOOMERY_GATE_CARD=3090
+run 'gpu-gate.sh: both needs both cards in view' 64 "run it under box.sh's BLOOMERY_CARD=both" gg BLOOMERY_GATE_CARD=both
+run 'gpu-gate.sh: BLOOMERY_BOX_CARD is a card box.sh picks' 64 'BLOOMERY_BOX_CARD is 3090, a6000 or both' gg BLOOMERY_BOX_CARD=two
+run 'gpu-gate.sh: BLOOMERY_GATE_CARD is a card' 64 'BLOOMERY_GATE_CARD is 3090, a6000, any or both' gg BLOOMERY_GATE_CARD=all
+if [ -w /root ]; then
+  echo "skip gpu-gate.sh lock-open test: /root is writable here (the box), where it would take the real gate lock"
+else
+  run 'gpu-gate.sh: a lock file it cannot open ends at once, by name' 69 'cannot open /root/bloomery-gate\.lock' gg
+fi
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {

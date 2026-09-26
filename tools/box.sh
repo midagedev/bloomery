@@ -83,6 +83,7 @@ fi
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
 # 2026-09-21에 끝났고 llm.service는 꺼져 있다). 그래도 그 카드에 이미 컴퓨트 프로세스가 있으면 — 우리 다른
 # 라운드일 것이다 — 겹쳐 올리지 않고 rc 75로 끝난다. llm.service 검사는 누가 다시 켰을 때의 안전장치다.
+# 고른 값은 박스 쪽에 BLOOMERY_BOX_CARD로 넘어가고, tools/gpu-gate.sh가 그 카드의 게이트 락을 잡는다(both = 둘 다).
 CARD=${BLOOMERY_CARD:-3090}
 case "$CARD" in
   3090) PICK=":" ;;
@@ -174,4 +175,4 @@ esac
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 ssh "$HOST" "${GUARD}source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $V41 && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT && $OXIDE$ENVS$*"
+} && cd $REMOTE && $V41 && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$CARD && $OXIDE$ENVS$*"
