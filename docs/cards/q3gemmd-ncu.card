@@ -1,0 +1,54 @@
+# Round q3gemmd, the T = 4096 arm; the T = 512 arm is q3gemmd-ncu-t512.card (the format takes one
+# term, so one card an arm). gemm_q4k's step is back in main's two-barrier order (the next step's
+# copies issued before a barrier of their own; q3gemmc's F1 reverted) with q3gemmc's F2 (the
+# staging's column offsets once a tile), the s8 and d8 copies moved to warps 4-5 and 6-7 (no warp's
+# lanes stage more than five copies a step, main's warps 0-1 six and seven; active copies a scheduler
+# 10/10/8/8 -> 9/9/9/9 in hh0 and 11/11/9/9 -> 10/10/10/10 in hh1, every warp still issuing each
+# predicated copy), and every staging copy on an address pair no later instruction of its step
+# writes (tools/sass_inflight.py --step: ldgsts-war n=0 on both loops; F2 alone keeps one, hh1's
+# header). Bit for bit (gate_gemm y_fnv 328/328, the six ubatch --dump md5s). ptxas warp-steps
+# 599/652 full, 624/677 partial (F2 alone 599/653 and 624/678, main 630/685 and 656/709), two BAR a
+# step; registers q4k 128, q5k 126, q6k 124, q3k 123, spill 0 (JIT the same).
+# Terms [derived, main's page ...-082817, rig-log 09-26#q3ncu-s16]: no unit fills main's full-tile
+# step (issue 2,611, tensor 2,048, L1TEX ~2,780 of 4,899 cycles), so the step is its serial phases.
+# F2 deletes the staging rows that carry 434 warp-cycles a warp-step in the full-tile loop and 398
+# in the partial one (the acol LDS and the short_scoreboard waits they feed, the column address
+# chains, the s8/d8 MOV R4 WARs, six of nine never-taken LDS a step); 60-100 % of it leaves the step,
+# the rest comes back as the copies' mio/lg throttle, now issued back to back. The tree takes 22-67
+# (full) and 18-58 (partial) more: hh1's header WAR (main's 0x9d80, 24 lsb) and one or two copies
+# off the busiest warp. Launch cycles: a block schedule of gate_p8's routing (gemm_ids(4096, 8, 128):
+# 475 full tiles and 104 partial ones of nt_live 1-7, six 128-row slabs each, 168 block slots),
+# 16 steps a block, a 3,543-cycle prologue and 660 a stored n-tile (main's page), a partial step of
+# 1,794 + 433 x nt_live (main's page), calibrated on main's 1.746 M (x 1.003; the same model puts
+# q3gemmc's measured steps at 1.708 M against its measured 1.715 M).
+# Bands, T = 4096 [derived]: main 1.737..1.755 M (its measured 1.746 M); F2 alone 1.59..1.66 M; this
+# tree 1.57..1.66 M, 0.4..1.5 % under F2 alone.
+kind: profile
+question: do the two-barrier order, F2 and the rebalanced WAR-free staging take gemm_q4k's T = 4096
+  launch to the terms' band, and does F2 alone, the floor q3gemmc's F1 was measured against, sit
+  where the paper puts it?
+term: Elapsed Cycles (sm__cycles_elapsed) of one gemm_q4k launch of gate_p8's gemm_q4k_moe_t4096
+  arm on the q3gemmd tree, the median of two profiled launches, A6000, the gemm form's base clock
+unit: M cycles
+predict: 1.57..1.66
+condition: one sitting, three binaries, each under the lease with BLOOMERY_NCU_SOURCE=1
+  BLOOMERY_NCU_COUNT=2 just ncu-gpu-gemm gemm_q4k_moe_t4096 and the same skip: the q3gemmd tree
+  (/root/repo/bloomery-q3gemmd/target/release/gate_p8, sha256
+  f1391a243544edbe0e14102b75b7664a6676a6fb510f58c29d970727e2687a5e; the recipe's own build of it
+  must leave that sha), F2 alone
+  (BLOOMERY_NCU_GEMM_BIN=/root/repo/bloomery-q3gemmd-f2/target/release/gate_p8, sha256
+  b1c894a802214b8b3a37c6e8b4dd8b1b0bc721109aec55c2cdaf9ceaab620d3c) and main (the lead's gate_p8;
+  main's gemm.rs is q3gemmc~1's); every page kept and read with tools/ref/srcpage.py
+  --bars-per-step 2, and the tree's page listing (srcpage.py --listing) through
+  tools/sass_inflight.py --step on both loops, since the timed code is the driver's JIT and not the
+  ptxas build the proofs read; a binary whose two launches differ by more than 1 % is void
+decide-in: the terms hold: write the pp A/B card for q3gemmd (pp512 and pp4096 in one lease against
+  main's binary) and land by it; F3 and F4 wait for the tree's page
+decide-below: faster than the terms: land the same way, and name from srcpage.py's phases which
+  removed term also held the barrier or another warp (the staging's share of bar1)
+decide-above: if F2 alone is in its band, the tree's extras cost more than they remove: land F2
+  alone by the pp A/B and read the tree's page for the rebalance (warps 4-7's copies) or the new
+  order; if F2 alone is above its band too, less than 60 % of the deleted rows left the step, the
+  staging is bound by the copies' MIO drain, and F3 (fewer copy instructions) comes before any
+  address work; if the tree's JIT listing reads ldgsts-war n > 0, the driver undid the pairs and
+  that is the term

@@ -1,0 +1,31 @@
+# Round q3gemmd, the T = 512 arm; the tree, the terms and the T = 4096 arm are in q3gemmd-ncu.card
+# (one term a card). At T = 512 every tile is partial: gemm_ids(512, 8, 128) routes 18..46 slots to
+# each of the 128 experts, one tile an expert of nt_live 3 (5 tiles), 4 (64), 5 (51) or 6 (8), 768
+# blocks on 168 slots, and each expert's weights stream from DRAM once (113 MB a launch, ~60 % of
+# the A6000's DRAM at these cycles [derived]). The partial step is main's page's 1,794 + 433 x
+# nt_live warp-cycles; F2 deletes 398 of it, the tree 18..58 more (q3gemmd-ncu.card). Not in the
+# block schedule: DRAM latency the prologue's first copies pay (T = 4096 reads them from L2), up to
+# +3 % on the launch. q3gemmc's measured partial step (3,533, uniform +153 a live n-tile past the
+# first) puts its tree at 0.375 M here, 11 % over main: the reason it did not land.
+# Bands, T = 512 [derived, no T = 512 page exists]: main 0.33..0.36 M (the block schedule's 0.337
+# M); F2 alone 0.30..0.33 M; this tree 0.30..0.33 M, 0.4..1.5 % under F2 alone.
+kind: profile
+question: does the partial tile's step, which q3gemmc made slower, come out of the two-barrier order
+  with F2 and the rebalanced staging under main's at T = 512, where every tile is partial?
+term: Elapsed Cycles (sm__cycles_elapsed) of one gemm_q4k launch of gate_p8's gemm_q4k_moe_t512 arm
+  on the q3gemmd tree, the median of two profiled launches, A6000, the gemm form's base clock
+unit: M cycles
+predict: 0.30..0.33
+condition: the same sitting and three binaries as q3gemmd-ncu.card, with just ncu-gpu-gemm
+  gemm_q4k_moe_t512 (the arm runs its own warm-up burst, so the default skip of 64 applies);
+  BLOOMERY_NCU_SOURCE=1 BLOOMERY_NCU_COUNT=2; pages kept and read with tools/ref/srcpage.py
+  --bars-per-step 2 on the partial loop (the only loop this arm runs); a binary whose two launches
+  differ by more than 1 % is void
+decide-in: the terms hold at T = 512 as well: the pp A/B card for q3gemmd judges pp512 on this
+  arm's ratio to main
+decide-below: faster than the terms: land by the pp A/B, and read the partial loop's phases for the
+  term the T = 4096 mix under-weighted (the staging at nt_live 3-6)
+decide-above: if main is above its band too, the block schedule missed T = 512's DRAM term (the
+  prologue's copy wait on the page's first DEPBAR rows), not the step; if only F2 alone and the tree
+  are, the deleted rows' share is smaller at nt_live 3-6 than in T = 4096's mix: price pp512 on the
+  measured ratio before the pp A/B, and read the partial loop's staging rows

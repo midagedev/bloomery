@@ -34,17 +34,28 @@ path rules above, and ends at the first BRA back to HEAD, which it counts. Decis
 be keyed by address, `0x1cf0=t,0x2370=n,0x2030=t2`: a keyed branch takes its decision every time it
 is met (`tK`: taken the first K times, then not — a nested loop run K + 1 times), a branch not
 keyed falls through, and a keyed address the walk never meets fails the reading (`unmet=`: keys
-read off another build's listing name other instructions). The iteration is cut after every second
-barrier (BAR), so a loop that runs two steps an iteration reports each (`segs`), the instructions
-after the last cut joining the last step. Classes: LDG, LDGSTS, LDS by width (@!PT dummies apart), IMMA (tensor), IMAD (every form),
-ALU, FP32 (FFMA, FMUL, FADD), BRA/WARPSYNC (with BSSY, BSYNC, CALL, RET), BAR, other (uniform
-datapath, dependency barriers and the rest); a line per class breaks it down by opcode. With a
-cuobjdump listing it also sums the stall counts of the control words (`stall`).
+read off another build's listing name other instructions). The iteration is cut into steps after
+every `--bars-per-step`-th barrier (BAR; default 2) and `segs` reports each step's count: the
+instructions after the last cut join the last step, and a first piece with no load, copy or MMA —
+the wait and barrier at the head of a loop whose steps wait there — joins it too, since around the
+back edge it runs right after it. Classes: LDG, LDGSTS, LDS by width (@!PT dummies apart), IMMA
+(tensor), IMAD (every form), ALU, FP32 (FFMA, FMUL, FADD), BRA/WARPSYNC (with BSSY, BSYNC, CALL,
+RET), BAR, other (uniform datapath, dependency barriers and the rest); a line per class breaks it
+down by opcode. With a cuobjdump listing it also sums the stall counts of the control words
+(`stall`).
+The walk also checks its copies' address registers (`ldgsts-war`). An LDGSTS or LDG reads the
+registers of its bracketed operands when the memory queue takes it, not when it issues, so an
+instruction that writes one of them before then waits for the queue (a long-scoreboard stall on
+the writer, not on the load). Per step, the first instruction that writes a register an earlier
+LDGSTS/LDG of the step reads in brackets, before the step's next DEPBAR (or its end), is listed
+with the load it waits for and how many instructions of the step later it comes (+d); a later
+writer is already ordered behind that one. The count line reads `ldgsts-war: n=N PASS` at N = 0
+and `FLAG` otherwise; the exit status does not change with it.
 `--raw` prints the matching entries of a cuobjdump listing verbatim, control words included, which
 this script reads back.
 
 usage: sass_inflight.py [--filter SUBSTR [--exact]] [--decisions t,n,...|ADDR=t|n|tK,...|list]
-                        [--step HEAD|auto] [--raw] [--banner TEXT] FILE...
+                        [--step HEAD|auto] [--bars-per-step N] [--raw] [--banner TEXT] FILE...
 A FILE is a cuobjdump listing ("Function : <name>" sections) or a condensed one ("<addr> <op>" per
 line, one entry named after the file). Exit status: 0 with rows, 1 when no entry was read or none
 matches the filter (or, for --step, a walk did not end at its back edge or left a keyed decision
@@ -63,6 +74,10 @@ REG = re.compile(r'\bR(\d+)((?:\.[A-Za-z0-9]+)*)')
 GUARD = re.compile(r'^@(!?)(U?P[T0-9]+)\s+')
 BRANCH = re.compile(r'^(BRA|CALL)(?:\.[A-Z]+)*\s+(?:!?U?P[T0-9]+\s*,\s*)?(0x[0-9a-f]+)$')
 STORES = {'STG', 'ST', 'STS', 'STL', 'RED'}
+BRACKET = re.compile(r'\[([^\]]*)\]')
+# Opcodes whose first operand is not a register they write.
+NO_DEST = STORES | {'LDGSTS', 'BAR', 'DEPBAR', 'LDGDEPBAR', 'WARPSYNC', 'BRA', 'BSSY', 'BSYNC', 'CALL',
+                    'RET', 'BRX', 'JMP', 'JMX', 'EXIT', 'NOP', 'MEMBAR', 'ERRBAR', 'CCTL', 'YIELD'}
 WALK_LIMIT = 100_000
 CLASSES = ('LDG', 'LDGSTS', 'LDS', 'IMMA', 'IMAD', 'ALU', 'FP32', 'BRA/WARPSYNC', 'BAR', 'other')
 ALU = {'LOP3', 'LOP', 'SHF', 'SGXT', 'IADD3', 'LEA', 'ISETP', 'PLOP3', 'SEL', 'I2FP', 'CS2R', 'HADD2',
@@ -349,19 +364,85 @@ def stall_of(ctrl, a):
     return None if a not in ctrl else (ctrl[a] >> 41) & 0xf
 
 
-def segments(path):
-    """Instruction counts of the iteration cut after every second barrier; the rest joins the last."""
+def steps_of(path, bars_per_step):
+    """The iteration's steps as lists of path positions (the module header's cut rule)."""
     cuts, bars = [], 0
     for n, (_, t) in enumerate(path, 1):
         if split(t)[1].split('.')[0] == 'BAR':
             bars += 1
-            if bars % 2 == 0:
+            if bars % bars_per_step == 0:
                 cuts.append(n)
-    edges = [0] + cuts[:-1] + [len(path)]
-    return [edges[k + 1] - edges[k] for k in range(len(edges) - 1)]
+    edges = [0] + [c for c in cuts if c < len(path)] + [len(path)]
+    pieces = [list(range(edges[k], edges[k + 1])) for k in range(len(edges) - 1)]
+    if len(pieces) == 1:
+        return pieces
+    work = ('LDS', 'LDG', 'LDGSTS', 'IMMA', 'HMMA')
+    if not any(split(path[i][1])[1].split('.')[0] in work for i in pieces[0]):
+        return pieces[1:-1] + [pieces[-1] + pieces[0]]
+    if cuts[-1] == len(path):
+        return pieces
+    return pieces[:-2] + [pieces[-2] + pieces[-1]]
 
 
-def step_report(name, ins, ctrl, head_arg, decisions):
+def writes(text):
+    """Registers an instruction writes: its first operand (a SHFL's second), widened by the opcode —
+    four for a .128 access, an IMMA's accumulator or an HMMA's f32 one; two for a .64 access, a
+    .WIDE multiply, an F16 HMMA accumulator, a 64-bit conversion result or a CS2R pair; an LDSM its
+    matrix count. None for stores, copies, barriers and branches, and none that is not a vector
+    register (predicates, uniform registers, RZ)."""
+    _, op, ops = split(text)
+    parts = op.split('.')
+    base = parts[0]
+    if base in NO_DEST or not ops:
+        return set()
+    dest = ops[1] if base == 'SHFL' and len(ops) > 1 else ops[0]
+    if '[' in dest:
+        return set()
+    if base == 'IMMA':
+        width = 4
+    elif base == 'HMMA':
+        width = 2 if len(parts) > 2 and parts[2] == 'F16' else 4
+    elif base == 'LDSM':
+        width = 4 if parts[-1] == '4' else 2 if parts[-1] == '2' else 1
+    elif base in ('F2F', 'I2F', 'F2I') and len(parts) > 1 and '64' in parts[1]:
+        width = 2
+    elif base == 'CS2R':
+        width = 1 if '32' in parts[1:] else 2
+    elif '.WIDE' in op or base in ('DADD', 'DMUL', 'DFMA', 'DMNMX'):
+        width = 2
+    else:
+        width = load_width(op) if base.startswith('LD') else 1
+    return set(regs(dest, width))
+
+
+def war_writers(path, steps):
+    """Per step, the first instruction that writes a register an earlier LDGSTS/LDG of the step reads
+    in brackets, before the step's next DEPBAR: [(step, writer position, load position, register,
+    instructions of the step between them)]."""
+    out = []
+    for k, step in enumerate(steps, 1):
+        pending = []  # [load position, its order in the step, its unread bracket registers]
+        for q, i in enumerate(step):
+            _, op, ops = split(path[i][1])
+            base = op.split('.')[0]
+            if base == 'DEPBAR':
+                pending = []
+                continue
+            w = writes(path[i][1])
+            for p in pending:
+                hit = w & p[2]
+                if hit:
+                    out.append((k, i, p[0], min(hit), q - p[1]))
+                    p[2] = set()
+            pending = [p for p in pending if p[2]]
+            if base in ('LDGSTS', 'LDG'):
+                read = {r for o in ops for b in BRACKET.findall(o) for r in regs(b)}
+                if read:
+                    pending.append([i, q, read])
+    return out
+
+
+def step_report(name, ins, ctrl, head_arg, decisions, bars_per_step=2):
     """The --step lines of one entry, and whether its walk ended at the back edge."""
     heads = loop_heads(ins)
     if head_arg == 'auto':
@@ -376,8 +457,9 @@ def step_report(name, ins, ctrl, head_arg, decisions):
     stall = '-' if not path or None in stalls else str(sum(stalls))
     back = next((b for h, b in heads if h == head), None)
     unmet = sorted(set(keyed) - {a for a, _, _ in decided})
+    steps = steps_of(path, bars_per_step)
     lines = [f'step {name} head=0x{head:04x} back={hexa(back)} instrs={len(path)} '
-             f'segs={"/".join(map(str, segments(path)))} stall={stall} end={end}'
+             f'segs={"/".join(str(len(s)) for s in steps)} stall={stall} end={end}'
              + (' unmet=' + ','.join(f'0x{a:04x}' for a in unmet) if unmet else '')]
     by, detail = {c: 0 for c in CLASSES}, {c: {} for c in CLASSES}
     for _, t in path:
@@ -391,6 +473,11 @@ def step_report(name, ins, ctrl, head_arg, decisions):
             lines.append(f'  {c:12s} ' + ' '.join(f'{d}:{n}' for d, n in parts))
     lines.append(f'  decided {len(decided)}: '
                  + ' '.join(f'0x{a:04x}={"t" if go else "n"}' for a, _, go in decided))
+    war = war_writers(path, steps)
+    for k, i, j, r, d in war:
+        lines.append(f'  ldgsts-war step {k} 0x{path[i][0]:04x} {path[i][1]}  <- R{r} of '
+                     f'0x{path[j][0]:04x} {path[j][1]} (+{d})')
+    lines.append(f'  ldgsts-war: n={len(war)} {"PASS" if not war else "FLAG"}')
     return lines, end == 'back edge' and not unmet
 
 
@@ -400,6 +487,7 @@ def hexa(a):
 
 def main(argv):
     filt, exact, decisions, banner, files, head, raw = '', False, None, None, [], None, False
+    bars_per_step = 2
     it = iter(argv)
     for arg in it:
         if arg == '--filter':
@@ -415,6 +503,13 @@ def main(argv):
             if head != 'auto' and not re.fullmatch(r'0x[0-9a-f]+', head):
                 print(f'sass_inflight: --step takes a 0x-hex address or auto, got {head!r}', file=sys.stderr)
                 return 2
+        elif arg == '--bars-per-step':
+            n = next(it, '')
+            if not re.fullmatch(r'[1-9][0-9]*', n):
+                print(f'sass_inflight: --bars-per-step takes a positive integer, got {n!r}',
+                      file=sys.stderr)
+                return 2
+            bars_per_step = int(n)
         elif arg == '--raw':
             raw = True
         elif arg.startswith('--'):
@@ -465,7 +560,8 @@ def main(argv):
     if head is not None:
         ok = True
         for name, ins in rows:
-            lines, done = step_report(name, ins, full[name][1], head, '' if listing else decisions)
+            lines, done = step_report(name, ins, full[name][1], head, '' if listing else decisions,
+                                      bars_per_step)
             print('\n'.join(lines))
             ok = ok and done
         return 0 if ok else 1
