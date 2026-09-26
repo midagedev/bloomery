@@ -15,12 +15,14 @@ predict: +17.1..+25.2
 rounds: 2
 sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55
   and 1.1 %; the larger
-condition: the cardtile binary, both arms in one lease through its lever, the prose prompt fed as in
-  the calibration (time-gate.sh generate_ds41 --tokens from corpus-prose.ids) by a runner that
-  alternates the two lever arms (depth-gpu-ds41's lever arms feed the lcg prompt, where T predicts 0;
-  a prose-prompt arm is a small runner change before this lease), the order rotated each round, BLOOMERY_STEP_STATS=1 on both so card_in, card_out and wait print per arm; no row carries
-  [cpu-busy] or [other-busy]. The same arms at P = 4096 (4,096 prose ids, if corpus-prose.ids holds
-  them) are read against the band +15.8..+22.8
+condition: the cardtile binary, both arms in one lease through its lever, BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt BLOOMERY_STEP_STATS=1
+  BLOOMERY_LEASE_CARD=docs/cards/cardtile-pp.card' just depth-gpu-ds41 prose:512
+  prose:512@BLOOMERY_CARD_EXPERTS=expert prose:4096 prose:4096@BLOOMERY_CARD_EXPERTS=expert (the prose
+  arm, fixup7b), the order rotated each round, card_in, card_out and wait printed per arm; no row
+  carries [cpu-busy] or [other-busy]. The P = 4096 rows are read against the band +15.8..+22.8, and the
+  witness clocks (SM clock, the power-slowdown counter's post - pre) are read beside card_out for the
+  card-bound clock hypothesis
 decide-in: keep T and build prefillgroup (G): after T the prose P = 4096 card (40 ms a layer-batch)
   and host (42) are balanced and only the wrap overlaps them
 decide-below: read card_in: above ~22 ms the tile items run below e 0.45 (registers, occupancy) -

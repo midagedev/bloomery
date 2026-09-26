@@ -413,6 +413,13 @@ first suspect is a hung gate on the box, not the agent.
   `llama-bench -gp d,96`); 2026-09-21: +1.7 % at depth 6, −15 % at 1024, −39 %
   at 4096 (3.4 vs 0.87 µs per cached key per step). Any round that touches
   attention or the KV cache is judged on the deep rows too.
+  For V4.1, `just depth-gpu-ds41 prose:<P>[@K=V,…]` feeds generate_ds41 the first P ids of
+  `corpus-prose.ids` (`--tokens`) instead of the lcg prompt; prose arms are compared only with prose
+  arms of the same P, in their own decode and prefill tables — a lever that moves the card's routed
+  experts (the shadow) is judged on them, because the lcg prompt's routing leaves the shadow under the
+  union. The `card` witness field prints the timing card's SM clock, the active clock-event mask and
+  the cumulative power and thermal slowdown counters (post − pre bounds the arm's capped time), and a
+  `cpu-freq` line (`scaling_cur_freq` mean/min/max over the cores at the block's instant).
 - **The step does no load-time work.** Anything that does not depend on the
   tokens — tensor lookups, names, metadata keys, views, decoded gains — is
   resolved once into `Derived`; the calling thread's serial time is the step's
@@ -617,13 +624,17 @@ runs every layer at every position, the same-binary A/B arm; the `load` line pri
 `generate_ds41` prints a `stat prefill ced=` line with each layer's block and latent starts; after
 a triangle call `Body::keep_point` grants only the call's boundaries and its last positions and
 `Body::rollback` to any other point is a named error; any other value is refused by name),
-`BLOOMERY_CARD_EXPERTS=expert|slot` (gpu-deepseek41 `FfnBatch`, read once when the batch's buffers are made,
-default `expert`: a prompt batch's shadow reads each card expert once over the layer's whole block —
-`ds41_card_buckets` groups the block's card slots by expert, then `ds41_expert_gate_up_grouped` and
-`q4k_gemv_grouped` walk each expert's run — or, with `slot`, once per slot chunk by chunk through the
-per-slot kernels, the same-binary A/B arm; both write the same bits (`just gate-gpu-ds41-prefill` runs
-the default and `BLOOMERY_BOX_ENV='BLOOMERY_CARD_EXPERTS=slot'` the other); any other value is refused
-by name; the `load` line prints `card_experts=`, and with `BLOOMERY_STEP_STATS=1` `generate_ds41` prints a
+`BLOOMERY_CARD_EXPERTS=tile|expert|slot` (gpu-deepseek41 `FfnBatch`, read once when the batch's buffers are
+made, default `tile`: a prompt batch's shadow runs the card's routed experts over the layer's whole block
+by tiles — `ds41_card_buckets` groups the block's card slots by expert, `grouped_tiles` cuts each
+expert's run into tiles of up to 8 slots, `ds41_card_gather` copies each slot's q8_1 column into run
+order, and `ds41_expert_gate_up_tiles` and `q4k_gemv_tiles` run a block per (tile, 8 weight rows) with
+the m-column cores, reading each weight row once for up to 8 slots, the down scattering each column back
+to its slot; with `expert`, each expert's rows walk its slots one at a time (`ds41_expert_gate_up_grouped`,
+`q4k_gemv_grouped`); with `slot`, once per slot chunk by chunk through the per-slot kernels — `expert`
+and `slot` are the same-binary A/B arms; all three write the same bits (`just gate-gpu-ds41-prefill` runs
+the default and `BLOOMERY_BOX_ENV='BLOOMERY_CARD_EXPERTS=expert'` and `=slot`); any other value is
+refused by name; the `load` line prints `card_experts=`, and with `BLOOMERY_STEP_STATS=1` `generate_ds41` prints a
 `stat prefill split` line — `prologue/chain/union/wait/enqueue/copy` ms and, per layer-batch, the card's
 `card_out` (first launch to the route's D2H) and `card_in` (the shadow under the union) from event pairs),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
