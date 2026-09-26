@@ -122,13 +122,18 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # one log per item and a run.log ending in `DONE total= red= wall=`; refuses to
                       # start while the timing lease is held and refuses a recipe that names a timing runner
                       # or whose script takes the lease.
-                      # `--ledger` (the lead's batches only, never a round's): an item whose input key
-                      # (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env and
-                      # card, and a box manifest read once per batch) is in the green ledger
-                      # ~/.cache/bloomery/gate-ledger.tsv is not run and prints `rc=skip green-at=<commit>`;
-                      # an item whose final rc is 0 is recorded; `--rerun` runs every item and still records;
-                      # `--dry-run --ledger` prints what would skip and what moved; the header lists what
-                      # the key cannot see
+                      # `--ledger` (the lead's batches) and `--round-ledger` (a round's): an item whose input
+                      # key (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env
+                      # and card, and a box manifest read once per batch) is green in a ledger it reads is not
+                      # run and prints `rc=skip green-at=<commit> src=lead|round`; an item whose final rc is 0 is
+                      # recorded — the lead's in ~/.cache/bloomery/gate-ledger.tsv, a round's only in
+                      # gate-ledger-rounds.tsv beside it. A round reads both files. The lead reads the rounds'
+                      # file only with `--trust-rounds`, and passes it only for a change that moves no
+                      # behaviour: a move whose `just ptx-scan` equals the base (user, 2026-09-27: a round
+                      # runner's recorded green at the same key is not re-run at landing; an agent saying
+                      # "green" is not a record). A rebase still moves the key of every item the landed
+                      # commits touch. `--rerun` runs every item and still records; `--dry-run --ledger`
+                      # prints what would skip and what moved; the header lists what the key cannot see
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
                       # alloc threads qdot engram prompts placement 1-1

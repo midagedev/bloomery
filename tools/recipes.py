@@ -9,7 +9,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes]
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
-    python3 tools/recipes.py key --manifest F [--ledger L] ITEM...  # the green ledger's key per item
+    python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py --self-test
 
@@ -1821,10 +1821,12 @@ class LedgerRecord:
 
 
 class Ledger:
-    """The green ledger, read-only here: `key recipe item commit date tree`, appended by gate-batch.sh."""
+    """The green ledger, read-only here: `key recipe item commit date tree`, appended by gate-batch.sh.
+    `src` names whose runner wrote it: `lead` (gate-batch.sh --ledger) or `round` (--round-ledger)."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, src: str = "lead"):
         self.path = path
+        self.src = src
         self.by_key: dict[str, LedgerRecord] = {}
         self.by_item: dict[tuple[str, str], LedgerRecord] = {}
         self.by_recipe: dict[str, LedgerRecord] = {}
@@ -1870,12 +1872,30 @@ class Ledger:
         return head + f"; moved since: {shown}" + (f" (+{len(moved) - 4})" if len(moved) > 4 else "")
 
 
+def ledger_status(key: str, name: str, item: str, parts: list[str], ledgers: list[Ledger]) -> tuple[str, str]:
+    """skip with the first ledger (in order) that holds a green run at this key, else run with why.
+    The detail names the source (`src=lead|round`) before `tree=`, the last field gate-batch.sh cuts."""
+    for led in ledgers:
+        r = led.by_key.get(key)
+        if r is not None:
+            return "skip", f"green-at={r.commit} {r.date} src={led.src} tree={r.tree}"
+    for led in ledgers:
+        if (name, item) in led.by_item or name in led.by_recipe:
+            return "run", led.why(name, item, parts) + (f" (src={led.src})" if led.src != "lead" else "")
+    return "run", f"no green record of {name}"
+
+
 def cmd_key(args: argparse.Namespace) -> int:
     side = make_side(ROOT)
     ctx = KeyContext(side, args.manifest, args.box_env or "", manifest_error=args.manifest_error)
-    ledger = Ledger(args.ledger) if args.ledger else None
-    if ledger is not None and ledger.bad:
-        print(f"recipes.py key: {args.ledger}: {ledger.bad} malformed line(s) ignored (they cannot skip an item)", file=sys.stderr)
+    if args.round_ledger and not args.ledger:
+        raise RecipeError("--round-ledger reads a second ledger beside --ledger; give --ledger too")
+    ledgers = [Ledger(args.ledger)] if args.ledger else []
+    if args.round_ledger:
+        ledgers.append(Ledger(args.round_ledger, "round"))
+    for led in ledgers:
+        if led.bad:
+            print(f"recipes.py key: {led.path}: {led.bad} malformed line(s) ignored (they cannot skip an item)", file=sys.stderr)
     if args.parts_dir:
         os.makedirs(args.parts_dir, exist_ok=True)
     for i, item in enumerate(args.items):
@@ -1890,15 +1910,12 @@ def cmd_key(args: argparse.Namespace) -> int:
         name = ITEM_RE.match(item).group(1)
         if never is not None:
             status, detail = "never", never
-        elif ledger is None:
+        elif not ledgers:
             status, detail = "key", summary
         elif args.rerun:
             status, detail = "rerun", "--rerun: runs whatever the ledger holds"
-        elif key in ledger.by_key:
-            r = ledger.by_key[key]
-            status, detail = "skip", f"green-at={r.commit} {r.date} tree={r.tree}"
         else:
-            status, detail = "run", ledger.why(name, item, parts)
+            status, detail = ledger_status(key, name, item, parts, ledgers)
         print(f"{key}\t{item}\t{status}\t{detail}".replace("\n", " "))
         if args.show_parts:
             for p in parts:
@@ -2376,6 +2393,36 @@ def key_self_test(expect, real: Side) -> None:
 
 
 
+def ledger_self_test(expect) -> None:
+    """Two ledgers, the lead's and the rounds': a key green in either skips, the lead's first; the
+    detail names the source before `tree=`; a key in neither runs; a malformed line is counted."""
+    k_lead, k_round, k_both, k_none = ("a" * 64), ("b" * 64), ("c" * 64), ("d" * 64)
+    with tempfile.TemporaryDirectory() as d:
+        lead, rnd = os.path.join(d, "lead.tsv"), os.path.join(d, "round.tsv")
+        with open(lead, "w") as fh:
+            fh.write(f"{k_lead}\tgate-x\tgate-x\tc1\t2026-09-27T09:00:00+0900\t/t/main\n")
+            fh.write(f"{k_both}\tgate-z\tgate-z\tc1\t2026-09-27T09:00:00+0900\t/t/main\n")
+        with open(rnd, "w") as fh:
+            fh.write(f"{k_round}\tgate-y\tgate-y\tc2\t2026-09-27T09:10:00+0900\t/t/round\n")
+            fh.write(f"{k_both}\tgate-z\tgate-z\tc2\t2026-09-27T09:10:00+0900\t/t/round\n")
+            fh.write("not a record\n")
+        leds = [Ledger(lead), Ledger(rnd, "round")]
+        expect(leds[1].bad == 1, f"round ledger malformed count {leds[1].bad}, want 1")
+        st, det = ledger_status(k_lead, "gate-x", "gate-x", [], leds)
+        expect(st == "skip" and "src=lead tree=/t/main" in det, f"lead key: {st} {det}")
+        st, det = ledger_status(k_round, "gate-y", "gate-y", [], leds)
+        expect(st == "skip" and "src=round tree=/t/round" in det, f"round key: {st} {det}")
+        expect(det.split(" tree=")[0].endswith("src=round"), f"src must sit right before tree= (gate-batch.sh cuts at it): {det}")
+        st, det = ledger_status(k_both, "gate-z", "gate-z", [], leds)
+        expect(st == "skip" and "src=lead" in det, f"a key in both skips on the lead's: {st} {det}")
+        st, det = ledger_status(k_round, "gate-y", "gate-y", [], leds[:1])
+        expect(st == "run", f"the lead ledger alone must not skip a round's green: {st} {det}")
+        st, det = ledger_status(k_none, "gate-q", "gate-q", [], leds)
+        expect(st == "run" and "no green record of gate-q" in det, f"unknown item: {st} {det}")
+        st, det = ledger_status(k_none, "gate-y", "gate-y", [], leds)
+        expect(st == "run" and det.endswith("(src=round)"), f"history from the rounds' ledger is labelled: {st} {det}")
+
+
 def self_test() -> int:
     fails: list[str] = []
 
@@ -2554,6 +2601,7 @@ def self_test() -> int:
 
     # the green ledger's key
     key_self_test(expect, side)
+    ledger_self_test(expect)
 
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
@@ -2584,6 +2632,8 @@ def main(argv: list[str]) -> int:
     k.add_argument("--manifest-error", help="the manifest fetch failed with this message: every item is an error")
     k.add_argument("--box-env", default=os.environ.get("BLOOMERY_BOX_ENV", ""), help="the caller's BLOOMERY_BOX_ENV")
     k.add_argument("--ledger", help="the ledger file: status skip | run | rerun | never | error instead of key")
+    k.add_argument("--round-ledger", help="with --ledger: a second ledger, the rounds' (gate-batch.sh --round-ledger, "
+                   "--trust-rounds); a key green there skips too, after the first ledger, as src=round")
     k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
     k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")

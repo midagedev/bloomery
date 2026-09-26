@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
@@ -88,7 +88,19 @@
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
 #
-# Ledger (--ledger: the lead's batches; a round never passes it — a round's green is not the lead's).
+# Ledgers. Two files, one format, written only by this script: the lead's (--ledger, the lead's
+# batches) and the rounds' (--round-ledger, a delegated round's batches). A round never passes --ledger:
+# it writes the rounds' file only. What a batch reads to skip an item:
+#   --ledger                  the lead's file (the default landing batch)
+#   --ledger --trust-rounds   the lead's, then the rounds'; writes the lead's. The lead passes it only
+#                             for a change that moves no behaviour — a move whose `just ptx-scan` equals
+#                             the base (user, 2026-09-27: a round runner's recorded green at the same
+#                             key is not re-run at landing; an agent saying "green" is not a record).
+#                             The tool cannot tell a move from a change, so the flag is that judgment.
+#   --round-ledger            the lead's, then the rounds'; writes the rounds'.
+# A skip names its source, `src=lead` or `src=round`, in run.log and the dry run. A rebase moves the
+# key of every item whose closure the landed commits touched, so a landing still reruns those; the
+# saving is in the items the rebase left alone.
 # Each item's input key is `tools/recipes.py key` (its section header lists the parts): the files its
 # targets read (the walk `just affected` uses; the whole tree for a command run on the Mac, a cargo
 # subcommand the parser does not model, or a script that walks the tree), the text of its recipe and
@@ -117,8 +129,9 @@
 # absolute path the manifest does not read, and — with --lanes 1, where no card is forced — a recipe
 # whose gpu-gate.sh call takes the `any` card, which it picks at run time. A key that cannot be computed
 # (a missing file, a failed manifest) is a named error: the item runs and is not recorded.
-#   The ledger: ${BLOOMERY_GATE_LEDGER:-~/.cache/bloomery/gate-ledger.tsv}, on the Mac, outside every
-# tree and shared by the leads' trees, `key<TAB>recipe<TAB>item<TAB>commit<TAB>date<TAB>tree`, one line
+#   The files: ${BLOOMERY_GATE_LEDGER:-~/.cache/bloomery/gate-ledger.tsv} (the lead's) and
+# ${BLOOMERY_GATE_ROUND_LEDGER:-~/.cache/bloomery/gate-ledger-rounds.tsv} (the rounds'), on the Mac,
+# outside every tree and shared by every lead's and round's tree, `key<TAB>recipe<TAB>item<TAB>commit<TAB>date<TAB>tree`, one line
 # per green item. Only this script appends to it, each line with one write(2) on an O_APPEND descriptor
 # while holding an exclusive flock on it: two leads' batches cannot interleave a line.
 # Honest limits — what the key cannot see:
@@ -156,10 +169,10 @@ RETRY_WAIT=30
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]] | --classes"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -169,7 +182,11 @@ while [ $# -gt 0 ]; do
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
       [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    --ledger) LEDGER=1; shift ;;
+    --ledger) [ "$LMODE" != round ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+      LEDGER=1 LMODE=lead; shift ;;
+    --round-ledger) [ "$LMODE" != lead ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+      LEDGER=1 LMODE=round; shift ;;
+    --trust-rounds) TRUST=1; shift ;;
     --rerun) RERUN=1; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
@@ -184,7 +201,8 @@ if [ "$SRC" = list ]; then
   [ -f "$LIST" ] && [ -r "$LIST" ] || die "--list $LIST: not a readable file"
 fi
 [ "$SRC" = smoke ] && ITEMS=("${SMOKE[@]}")
-[ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger; $USAGE"
+[ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger or --round-ledger; $USAGE"
+[ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
 command -v just > /dev/null || die "just is not on PATH"
 command -v python3 > /dev/null || die "python3 is not on PATH"
 
@@ -795,7 +813,13 @@ item_of() { # the item as it runs, for the key: NAME[@its env and its lane's car
   item_str "${P_NAME[$1]}" "${P_ENV[$1]}" "${P_ARGS[$1]}"
 }
 
-LEDGER_FILE=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
+LEAD_LEDGER=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
+ROUND_LEDGER=${BLOOMERY_GATE_ROUND_LEDGER:-$HOME/.cache/bloomery/gate-ledger-rounds.tsv}
+[ "$LEAD_LEDGER" != "$ROUND_LEDGER" ] || die "BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_ROUND_LEDGER name one file ($LEAD_LEDGER): a round's green would land in the lead's ledger"
+# The file this batch writes, and the second file it reads (empty: none).
+if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; else LEDGER_FILE=$LEAD_LEDGER; fi
+ALSO_READ=''
+if [ "$LMODE" = round ] || [ "$TRUST" = 1 ]; then ALSO_READ=$ROUND_LEDGER; fi
 LEDGER_PARTS=$LEDGER_FILE.parts
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
 # once the record does), then the line, one write(2) on an O_APPEND descriptor under an exclusive flock.
@@ -839,7 +863,8 @@ ledger_plan() { # the box manifest, then every candidate's key and status (C_*),
     merr="box.sh rc=$rc: $(tail -1 "$1/box-manifest.err")"
     echo "gate-batch: ledger: the box manifest failed ($merr) — every item runs and none is recorded" >&2
   fi
-  kargs=(key --manifest "$m" --box-env "${BLOOMERY_BOX_ENV:-}" --ledger "$LEDGER_FILE" --parts-dir "$1/parts")
+  kargs=(key --manifest "$m" --box-env "${BLOOMERY_BOX_ENV:-}" --ledger "$LEAD_LEDGER" --parts-dir "$1/parts")
+  [ -z "$ALSO_READ" ] || kargs+=(--round-ledger "$ALSO_READ")
   [ -z "$merr" ] || kargs+=(--manifest-error "$merr")
   [ "$RERUN" = 0 ] || kargs+=(--rerun)
   rc=0
@@ -911,7 +936,9 @@ if [ "$LEDGER" = 1 ]; then
 fi
 balance
 for ((i = 0; i < N; i++)); do [ "${P_LST[$i]}" != skip ] || SKIP_N=$((SKIP_N + 1)); done
-[ "$LEDGER" = 0 ] || echo "gate-batch: ledger $LEDGER_FILE: $SKIP_N of $N items skip"
+if [ "$LEDGER" = 1 ]; then
+  echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
+fi
 if [ "$LANES" = 1 ]; then
   PREDICTED="laneA=${SUM_A}s wall=${SUM_W}s"
 else
