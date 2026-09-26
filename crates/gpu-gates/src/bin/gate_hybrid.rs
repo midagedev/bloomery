@@ -45,14 +45,24 @@
 //! run's bit for bit) names it itself when it watches the word and returns
 //! when it does not. With two columns not finite it records the first, with
 //! what it saw there, and both come back NaN. The word is clean before and
-//! after a clean service.
+//! after a clean service. A reset (`Hybrid::reset`) lifts a refused step
+//! service's poison: the protocol's words, read at the drain against the
+//! release's arithmetic, come back to a fresh tier's relation (generation =
+//! services, every counter 0), and a clean service after it is served by the
+//! host with the fresh tier's sum, bit for bit. A panic inside the host
+//! experts poisons the tier for good: its reset fails naming the panic and a
+//! reload, changes no word, and the next service is refused.
 //! The card's slot list (`card_sel`) on the same boundary: an id past the
 //! card's prefix is written `HOST` with the word clean, and an id past the
 //! whole stack is written `HOST` and raises the layer's `ExpertId`.
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer — its norm's and its router's sites in the mask, printed in the
-//! Deepseek2 step order — with one refusal recorded by the host tier.
+//! Deepseek2 step order — with one refusal recorded by the host tier. The
+//! model's reset then lifts the tier's poison (one reset counted, the poison
+//! kept as refused at that layer), and the first prompt, eagerly and by
+//! replay, gives the overlap-on run's logits bit for bit with every step
+//! served by the host on every routed layer and the words at rest after it.
 //!
 //! And the batch service's exclusion set, on the same stub boundary: a
 //! service given a set of host experts computes, for every column, what the
@@ -101,8 +111,8 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fused::FusedKernels;
     use bloomery_gpu::hybrid::{
-        Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, SlotMap, levers,
-        name_refusal,
+        Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, Poison, PoisonKind,
+        RELEASE, SlotMap, levers, name_refusal,
     };
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{
@@ -749,10 +759,12 @@ mod gate {
     /// Host experts for the refusal arm: a column's sum is its activation
     /// times the sum of its listed weights, so it depends on its own input
     /// and list alone; `experts` counts the experts run. An id past the
-    /// file is refused as the engine's host tier refuses it, by name.
+    /// file is refused as the engine's host tier refuses it, by name. With
+    /// `panics` set, a call panics instead.
     #[derive(Default)]
     struct Stub {
         experts: usize,
+        panics: bool,
     }
 
     impl HostExperts for Stub {
@@ -763,6 +775,7 @@ mod gate {
             experts: &[(u32, f32)],
             out: &mut [f32],
         ) -> Result<(), GpuError> {
+            assert!(!self.panics, "the refusal arm's planted host panic");
             if let Some(&(id, _)) = experts.iter().find(|e| e.0 as usize >= R_EXPERTS) {
                 return Err(GpuError::Shape {
                     what: "refusal arm host",
@@ -822,7 +835,7 @@ mod gate {
         x: &[f32],
     ) -> Result<(Result<(), GpuError>, Vec<f32>), GateError> {
         let stream = gpu.stream();
-        let seq = u32::try_from(h.stats().served)?;
+        let seq = h.words().served;
         h.begin_chain(stream)?;
         {
             let t = h.boundary_mut().handoff_target();
@@ -936,6 +949,103 @@ mod gate {
         h.stats().refusals == 1
             && h.refusal()
                 .is_some_and(|r| r.layer == R_LAYER && r.detail.starts_with(at))
+    }
+
+    /// The counter a failed service's release leaves after one wait drained
+    /// through it.
+    const RELEASED_ONCE: u32 = RELEASE - 1;
+
+    /// A reset of the step tier (module doc): a refusal's poison is lifted —
+    /// the words come back to a fresh tier's relation and a clean service is
+    /// served by the host, its sum the fresh tier's (`fresh_sum`, of `ids`,
+    /// `w`, `x`) bit for bit — and a panic's is not: the reset fails by name
+    /// and the tier stays poisoned. Whether both held.
+    fn reset_cases(
+        gpu: &Gpu,
+        ids: &[u32],
+        unknown: &[u32],
+        w: &[f32],
+        x: &[f32],
+        fresh_sum: &[f32],
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut h = refusal_tier(gpu, false)?;
+        let (r, _) = serve_step(gpu, &mut h, unknown, w, x)?;
+        drop(h.take_step_refusal());
+        let at_fault = h.words();
+        let refused = r.is_err()
+            && h.last_poison()
+                .is_some_and(|p| matches!(p, Poison::Refused(_)))
+            && at_fault.generation == 1
+            && at_fault.served == 0
+            && at_fault.counters[0] == RELEASED_ONCE;
+        let reset = h.reset(stream);
+        let after_reset = h.words();
+        let (served0, experts0) = (h.stats().served, h.host_mut().experts);
+        let (r2, sum) = serve_step(gpu, &mut h, ids, w, x)?;
+        let words = h.words();
+        let st = h.stats();
+        let served = st.served - served0 == 1 && h.host_mut().experts - experts0 == 3;
+        let same = r2.is_ok() && bits_equal(&sum, fresh_sum);
+        let rest = after_reset.at_rest() && after_reset.served == 1 && words.at_rest();
+        let lifted = reset.is_ok() && st.resets == 1 && gpu.take_fault()?.is_none();
+        let pass = refused && lifted && rest && served && same;
+        println!(
+            "reset refused: at the fault {at_fault} (predicted generation 1 served 0 counters \
+             [{RELEASED_ONCE}]) poison \"{}\" {refused}; reset {} resets={} lifted {lifted}; words \
+             after the reset {after_reset}, after a clean service {words} at rest {rest}; the host \
+             served it (services +{}, experts +{}) {served}; its sum the fresh tier's bit for bit \
+             {same} {}",
+            h.last_poison()
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            show(&reset),
+            st.resets,
+            st.served - served0,
+            h.host_mut().experts - experts0,
+            verdict(pass)
+        );
+
+        // A panic in the host experts: the service unwinds through the
+        // caller, past `serve_step`'s drain, so the drain is here.
+        let mut h = refusal_tier(gpu, false)?;
+        h.host_mut().panics = true;
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_step(gpu, &mut h, ids, w, x)
+        }));
+        std::panic::set_hook(hook);
+        stream.synchronize()?;
+        h.host_mut().panics = false;
+        let at_panic = h.words();
+        let kept = h
+            .last_poison()
+            .is_some_and(|p| matches!(p, Poison::Panicked { .. }))
+            && h.stats()
+                .last_poison
+                .is_some_and(|m| m.kind == PoisonKind::Panicked);
+        let reset = h.reset(stream);
+        let named = reset.as_ref().is_err_and(|e| {
+            let t = e.to_string();
+            t.contains("panicked") && t.contains("reload the model")
+        });
+        let unchanged = h.words() == at_panic && h.stats().resets == 0;
+        let refuses = serve_step(gpu, &mut h, ids, w, x).is_err_and(|e| {
+            e.to_string()
+                .contains("an earlier hybrid service failed and released the stream")
+        });
+        let panic_pass = unwound.is_err() && kept && named && unchanged && refuses;
+        println!(
+            "reset panicked: the service unwound {}; at the drain {at_panic}; poison \"{}\" kept \
+             {kept}; reset \"{}\" names the reload {named}; words and resets unchanged {unchanged}; \
+             the next service refused {refuses} {}",
+            unwound.is_err(),
+            h.last_poison()
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            show(&reset),
+            verdict(panic_pass)
+        );
+        Ok(pass && panic_pass)
     }
 
     /// The host tier's refusals (module doc): whether every case held.
@@ -1069,6 +1179,7 @@ mod gate {
             );
             ok &= pass;
         }
+        ok &= reset_cases(&gpu, &ids, &unknown, &w, x0, &sum)?;
 
         // The batch service: three columns, column 1 or 2 refused. It runs
         // after the card's work has finished (`plant` synchronizes, as the
@@ -1473,7 +1584,9 @@ mod gate {
             // handoff, and the caller sees the card's fault
             // (`GpuModel::name_host_refusal`), never the host's error, its
             // mask printed in this architecture's step order. It poisons the
-            // tier, so it runs last.
+            // tier; the model's reset lifts it, and a prompt after the reset
+            // replays as it did before the refusal (below).
+            let services_per_step = routed;
             let (l, x_in, _) = chains
                 .first()
                 .and_then(|c| c.layers.first())
@@ -1504,6 +1617,55 @@ mod gate {
                 "n_l=32 engine refusal layer={l} input NaN at value 0: answer \"{answer}\" names the \
                  card's fault at the layer {named}, the router's refusal there too {routed}, in the \
                  Deepseek2 step order {in_order}, the host recorded one refusal {refused} {}",
+                verdict(pass)
+            );
+
+            // The reset: the first prompt eagerly and by replay gives the
+            // logits the overlap-on run gave, every step served by the host
+            // on every routed layer, the words at rest after it.
+            let s0 = h.hybrid_stats().unwrap_or_default();
+            let reset = h.reset();
+            let p0 = prompts.first().ok_or("gate_hybrid: no prompt")?;
+            let steps = 2 * (p0.tokens.len() + GEN_STEPS);
+            let want_served = (services_per_step * steps) as u64;
+            let run = eager_replay(&mut h, std::slice::from_ref(p0));
+            let s1 = h.hybrid_stats().unwrap_or_default();
+            let words = h.hybrid_words();
+            let n = 1 + GEN_STEPS;
+            let same = match &run {
+                Ok((e, g)) => {
+                    logits_equal(e, g)
+                        && on32.replay.len() >= n
+                        && logits_equal(g, &on32.replay[..n])
+                }
+                Err(e) => {
+                    arm_err("n_l=32 engine reset replay", e);
+                    false
+                }
+            };
+            let served = s1.served - s0.served == want_served;
+            let rest = words.is_some_and(|w| w.at_rest());
+            let lifted = reset.is_ok()
+                && s1.resets == s0.resets + 1
+                && s1
+                    .last_poison
+                    .is_some_and(|m| m.kind == PoisonKind::Refused && m.layer == *l);
+            let pass = lifted && same && served && rest && h.poisoned().is_none();
+            ok &= pass;
+            println!(
+                "n_l=32 engine reset after the refusal: reset {} resets={} last_poison={:?} lifted \
+                 {lifted}; prompt {} eager and replay, {steps} steps, logits = the overlap-on run's \
+                 bit for bit {same}; services {} (want {services_per_step} routed layers x {steps} \
+                 steps = {want_served}) {served}; words {} at rest {rest} {}",
+                match &reset {
+                    Ok(()) => "Ok".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                s1.resets,
+                s1.last_poison,
+                p0.id,
+                s1.served - s0.served,
+                words.map_or_else(|| "none".to_string(), |w| w.to_string()),
                 verdict(pass)
             );
         }

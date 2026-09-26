@@ -69,7 +69,9 @@
 //! raised one at or before the layer, the host's error when it did not —
 //! never the host's own failure in place of the card's. A batch service
 //! runs after the card's event, so with the word watched
-//! ([`Hybrid::watch_fault`]) it reads the word itself.
+//! ([`Hybrid::watch_fault`]) it reads the word itself. A failed service
+//! poisons the tier; the model's reset lifts a refusal's poison
+//! ([`Hybrid::reset`]), and any other stays until a reload.
 
 use crate::GpuError;
 use crate::fault::{FAULT_NONE, Fault, LAYER_NONE, mask_index};
@@ -450,7 +452,7 @@ const _: () = assert!(X_W - WTS_W >= MAX_USED && MAX_USED >= EXPERTS_INTO_MAX);
 
 /// What the counter is set to when a service fails: every wait still pending
 /// in the stream passes, so a failed step drains instead of hanging.
-const RELEASE: u32 = 1 << 30;
+pub const RELEASE: u32 = 1 << 30;
 
 /// How long a service waits for its go before it gives up and releases the
 /// stream.
@@ -680,6 +682,18 @@ fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
     let rc = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut status) };
     cu(rc, "cuStreamIsCapturing")?;
     Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
+}
+
+/// Whether every operation enqueued on `stream` has finished, without
+/// waiting for any.
+fn stream_idle(stream: &CudaStream) -> Result<bool, GpuError> {
+    // SAFETY: the stream is live; the call only queries it.
+    let rc = unsafe { sys::cuStreamQuery(stream.cu_stream()) };
+    if rc == sys::cudaError_enum_CUDA_ERROR_NOT_READY {
+        return Ok(false);
+    }
+    cu(rc, "cuStreamQuery")?;
+    Ok(true)
 }
 
 /// Serial-number order on a wrapping u32: `a` comes strictly before `b`.
@@ -1188,6 +1202,11 @@ pub struct HybridStats {
     /// Services, step or batch, that met input the card should already have
     /// refused ([`Hybrid::refusal`] names the first).
     pub refusals: u64,
+    /// Resets that lifted a refusal's poison ([`Hybrid::reset`]).
+    pub resets: u64,
+    /// The last poison's kind, service and layer; [`Hybrid::last_poison`]
+    /// holds what it saw. Kept across a reset.
+    pub last_poison: Option<PoisonMark>,
 }
 
 /// Input a host service met that the card should already have refused: a
@@ -1199,6 +1218,119 @@ pub struct Refusal {
     pub layer: usize,
     /// Where and what: `row r: …` of a step, `column j of n: …` of a batch.
     pub detail: String,
+}
+
+/// Why a service poisoned the tier ([`Hybrid::last_poison`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Poison {
+    /// Input the card should already have refused: the engine is sound, and
+    /// [`Hybrid::reset`] lifts it.
+    Refused(Refusal),
+    /// The service failed with an error of its own — the protocol's words,
+    /// the handoff's shape, the host experts' answer: a broken engine, which
+    /// only a reload clears.
+    Failed {
+        what: &'static str,
+        layer: usize,
+        error: String,
+    },
+    /// The host experts panicked: what they left behind is unknown, and only
+    /// a reload clears it.
+    Panicked {
+        what: &'static str,
+        layer: usize,
+        message: String,
+    },
+}
+
+/// A [`Poison`]'s kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoisonKind {
+    Refused,
+    Failed,
+    Panicked,
+}
+
+/// A [`Poison`] without what it saw: what [`HybridStats`] carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoisonMark {
+    pub kind: PoisonKind,
+    /// The service: `Hybrid::serve` or `Hybrid::serve_batch`.
+    pub what: &'static str,
+    pub layer: usize,
+}
+
+impl Poison {
+    #[must_use]
+    pub fn mark(&self) -> PoisonMark {
+        let (kind, what, layer) = match self {
+            Poison::Refused(r) => (PoisonKind::Refused, r.what, r.layer),
+            Poison::Failed { what, layer, .. } => (PoisonKind::Failed, *what, *layer),
+            Poison::Panicked { what, layer, .. } => (PoisonKind::Panicked, *what, *layer),
+        };
+        PoisonMark { kind, what, layer }
+    }
+}
+
+impl std::fmt::Display for Poison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Poison::Refused(r) => write!(
+                f,
+                "{} refused input at layer {}: {}",
+                r.what, r.layer, r.detail
+            ),
+            Poison::Failed { what, layer, error } => {
+                write!(f, "{what} failed at layer {layer}: {error}")
+            }
+            Poison::Panicked {
+                what,
+                layer,
+                message,
+            } => write!(f, "{what} panicked at layer {layer}: {message}"),
+        }
+    }
+}
+
+/// The protocol's words as the host reads them ([`Hybrid::words`]): the
+/// card's go count, the host's service count, and each row's counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridWords {
+    pub generation: u32,
+    pub served: u32,
+    /// Row `r`'s counter at `r`, for the boundary's rows; 0 past them.
+    pub counters: [u32; MAX_ROWS],
+    pub rows: usize,
+}
+
+impl HybridWords {
+    /// What a drained stream leaves on a tier that serves every go and whose
+    /// every signal a wait took back: the host has served every go the card
+    /// made, and no counter holds a signal. A fresh tier holds all zeros.
+    #[must_use]
+    pub fn at_rest(&self) -> bool {
+        self.generation == self.served && self.counters.iter().all(|&c| c == 0)
+    }
+}
+
+impl std::fmt::Display for HybridWords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "generation {} served {} counters {:?}",
+            self.generation,
+            self.served,
+            &self.counters[..self.rows]
+        )
+    }
+}
+
+/// What a panic carried, as text.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
 /// Row 0's host slot ids of the layer its two-row pass served last — what
@@ -1287,8 +1419,16 @@ pub struct Hybrid<H> {
     /// step.
     chain: Chain,
     capturing: bool,
-    /// A service failed and released the stream; nothing is served again.
+    /// A service failed and released the stream; nothing is served again
+    /// until a reset lifts it ([`Hybrid::reset`]), which only a refusal's
+    /// poison allows.
     poisoned: bool,
+    /// Why the last service that failed poisoned the tier; kept across a
+    /// reset.
+    poison: Option<Poison>,
+    /// The refusal a service is failing on, from the moment it is recorded
+    /// to the catch that poisons the tier.
+    failing: Option<Refusal>,
     stats: HybridStats,
     /// For the row overlap in `stats`; `None` until a pair's row 0 is served.
     pair_row0: Option<PairRow0>,
@@ -1327,6 +1467,8 @@ impl<H: HostExperts> Hybrid<H> {
             chain: Chain::Step,
             capturing: false,
             poisoned: false,
+            poison: None,
+            failing: None,
             stats: HybridStats::default(),
             pair_row0: None,
             batch_lists: Vec::new(),
@@ -1372,9 +1514,157 @@ impl<H: HostExperts> Hybrid<H> {
     /// first.
     fn record_refusal(&mut self, r: Refusal, fails: bool) {
         self.stats.refusals += 1;
+        if fails {
+            self.failing = Some(r.clone());
+        }
         if fails || self.refusal.is_none() {
             self.refusal = Some(r);
         }
+    }
+
+    /// Poison the tier: a service of layer `layer` failed with `error`, or
+    /// panicked with `panic`. A refusal the service recorded as it failed is
+    /// the cause; anything else is the service's own failure.
+    fn set_poison(
+        &mut self,
+        what: &'static str,
+        layer: usize,
+        error: Option<&GpuError>,
+        panic: Option<&(dyn std::any::Any + Send)>,
+    ) {
+        let refused = self.failing.take();
+        let cause = match (panic, refused, error) {
+            (Some(p), _, _) => Poison::Panicked {
+                what,
+                layer,
+                message: panic_message(p),
+            },
+            (None, Some(r), _) => Poison::Refused(r),
+            (None, None, e) => Poison::Failed {
+                what,
+                layer,
+                error: e.map_or_else(|| "no error recorded".to_string(), ToString::to_string),
+            },
+        };
+        self.poisoned = true;
+        self.stats.last_poison = Some(cause.mark());
+        self.poison = Some(cause);
+    }
+
+    /// Why the last service that failed poisoned the tier, kept across a
+    /// reset; `None` if none has.
+    #[must_use]
+    pub fn last_poison(&self) -> Option<&Poison> {
+        self.poison.as_ref()
+    }
+
+    /// The protocol's words as they stand now. On a drained stream a sound
+    /// tier is [`HybridWords::at_rest`].
+    #[must_use]
+    pub fn words(&self) -> HybridWords {
+        let page = &self.boundary.page;
+        let rows = self.boundary.rows();
+        let mut counters = [0u32; MAX_ROWS];
+        for (row, c) in counters.iter_mut().enumerate().take(rows) {
+            *c = page.word(Word::Cnt(row)).load(Ordering::Acquire);
+        }
+        HybridWords {
+            generation: page.word(Word::Gen).load(Ordering::Acquire),
+            served: self.served,
+            counters,
+            rows,
+        }
+    }
+
+    /// Lift a refusal's poison, so that the next step is served as on a
+    /// fresh tier; the model's reset calls it before it empties the caches.
+    ///
+    /// A tier poisoned by refused input is sound: the service refused before
+    /// any host expert ran, and released the stream. Nothing that could still
+    /// write the words runs: this call holds the tier mutably, so no service
+    /// is running on any thread; every pool job a service dispatched ended
+    /// before the service returned or unwound (`for_each_chunk` returns, and
+    /// replays a chunk's panic, only once every worker has marked the job
+    /// done), and the pool's threads only read the generation; a refusal
+    /// means the go landed, so the replay's graph launch had been issued, and
+    /// the replay read its launch thread's answer before it returned. The
+    /// card is the last writer, and the synchronize below waits it out. Then
+    /// the words take a fresh tier's relation: every counter at 0 — the
+    /// release left `RELEASE` less the waits that drained through it, and a
+    /// counter left there lets every later wait pass with no service — and
+    /// `served` at the card's generation. A go adds one to the generation
+    /// and to the sequence in one batch, and a handoff carries the sequence
+    /// as it stood before its go, so the next go brings the generation to
+    /// `served + 1` with the handoff's sequence at `served`: what a service
+    /// waits for and checks, as on a fresh tier at 0. A captured chain keeps
+    /// its nodes and addresses; its next replay meets these words.
+    ///
+    /// A tier poisoned any other way — a failure of its own, a panic in the
+    /// host experts — stays poisoned and the call fails by name: only a
+    /// reload clears it. On a tier that is not poisoned the call changes
+    /// nothing, and fails by name when the stream has drained and the words
+    /// are not at rest; a stream still running may hold a signal its wait has
+    /// yet to take back.
+    pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "Hybrid::reset";
+        if !self.poisoned {
+            if !stream_idle(stream)? {
+                return Ok(());
+            }
+            let w = self.words();
+            if !w.at_rest() {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "the stream has drained and the host tier is not at rest ({w}): a go the \
+                         host never served, or a signal no wait took back"
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        let cause = match &self.poison {
+            Some(Poison::Refused(_)) => None,
+            Some(p) => Some(p.to_string()),
+            None => Some("a failure with no cause recorded".to_string()),
+        };
+        if let Some(cause) = cause {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "the host tier is poisoned ({cause}); a reset lifts only refused input — \
+                     reload the model"
+                ),
+            ));
+        }
+        stream.synchronize()?;
+        let generation = self.boundary.page.word(Word::Gen).load(Ordering::Acquire);
+        let mut seq = [0u32; 1];
+        self.boundary.seq.copy_to_host(stream, &mut seq)?;
+        if seq[0] != generation {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "the card's generation is {generation} and its sequence {}: a go added to one \
+                     and not the other — reload the model",
+                    seq[0]
+                ),
+            ));
+        }
+        for row in 0..self.boundary.rows() {
+            self.boundary
+                .page
+                .word(Word::Cnt(row))
+                .store(0, Ordering::Release);
+        }
+        self.served = generation;
+        self.poisoned = false;
+        self.refusal = None;
+        self.step_refusal = None;
+        self.pair_row0 = None;
+        self.failing = None;
+        self.stats.resets += 1;
+        Ok(())
     }
 
     /// The boundary the chain enqueues its handoffs and waits on.
@@ -1515,11 +1805,11 @@ impl<H: HostExperts> Hybrid<H> {
         match r {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                self.poisoned = true;
+                self.set_poison(WHAT, layer, Some(&e), None);
                 Err(e)
             }
             Err(p) => {
-                self.poisoned = true;
+                self.set_poison(WHAT, layer, None, Some(&*p));
                 std::panic::resume_unwind(p)
             }
         }
@@ -1691,12 +1981,12 @@ impl<H: HostExperts> Hybrid<H> {
         match r {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                self.poisoned = true;
+                self.set_poison("Hybrid::serve", layer, Some(&e), None);
                 self.boundary.release();
                 Err(e)
             }
             Err(p) => {
-                self.poisoned = true;
+                self.set_poison("Hybrid::serve", layer, None, Some(&*p));
                 self.boundary.release();
                 std::panic::resume_unwind(p)
             }

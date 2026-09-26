@@ -782,6 +782,16 @@ fn hc_pre_bytes(k: usize) -> usize {
 }
 
 impl AttnChain {
+    /// Zero the source compressor's pooled rows. Every step quantizes all of
+    /// them and the index key reads only the groups the step completed, so a
+    /// row a faulted step left non-finite would raise on every later step.
+    pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if let Some(src) = self.scratch.source.as_mut() {
+            src.pre.zero_async(stream)?;
+        }
+        Ok(())
+    }
+
     /// The piece for `layers` of the model `hp` describes, reading images of
     /// `layout` and caches sized by `planner`'s `ctx_max`: every name,
     /// layer kind, table offset and gather pair resolved, the kernels loaded

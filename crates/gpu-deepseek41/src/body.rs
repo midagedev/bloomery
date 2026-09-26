@@ -1951,16 +1951,20 @@ impl ChainBody for Body {
         self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
     }
 
-    /// Every ring, compressed row, index key, compressor state, and every
-    /// row's streams, folds and lists are zeroed in place — a captured chain
-    /// keeps their addresses — and the token history is emptied. The ring
-    /// shadows are not: a cut reads only shadow rows a step since wrote.
-    /// Rows due or in flight are taken back first; a failure there is
-    /// returned before anything is zeroed, and a second reset finds nothing
-    /// in flight. A reset lifts the refusal a failed step's rows left.
+    /// Every ring, compressed row, index key, compressor state, the source
+    /// compressor's pooled rows, and every row's streams, folds and lists are
+    /// zeroed in place — a captured chain keeps their addresses — and the
+    /// token history is emptied. The ring shadows are not: a cut reads only
+    /// shadow rows a step since wrote. Rows due or in flight are taken back
+    /// first; a failure there is returned before anything is zeroed, and a
+    /// second reset finds nothing in flight. A reset clears what a failed step
+    /// left: the rows' refusal, the host tier's poison, and the pooled rows
+    /// every later step would re-quantize.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.arrive()?;
         self.rows.finish()?;
+        self.hybrid.reset(gpu.stream())?;
+        self.attn.reset(gpu.stream())?;
         self.rows_failed = false;
         let stream = gpu.stream();
         for layer in &mut self.kv {

@@ -26,7 +26,17 @@
 //!   NaN, so the next step's layer-0 attention reads a NaN key. The engine's
 //!   `step` must return the fault at layer 0 instead of a token, the step
 //!   after it must refuse as poisoned naming the same fault, and a `reset`
-//!   must clear both — the prompt then answers the token it answered before.
+//!   must clear both. The host tier refused the NaN at layer 0 and released
+//!   the stream: its words at the fault are the release's arithmetic (the
+//!   card's generation one go per layer past the host's services, row 0's
+//!   counter the release less one per layer, row 1's the release), and the
+//!   reset lifts that poison (one reset counted, the poison kept as refused
+//!   at layer 0, the words at rest). The eight steps after it — the prompt
+//!   one token a step, then greedy — are each served by the host once per
+//!   layer the gate plan places, with the words at rest after every one (a
+//!   counter left at the release would let every wait pass with no host
+//!   service), and answer, bit for bit, the tokens the same steps answered
+//!   from a reset before the fault.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -128,7 +138,7 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::hybrid::HostExperts;
+    use bloomery_gpu::hybrid::{HostExperts, PoisonKind, RELEASE};
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
@@ -326,7 +336,7 @@ mod gate {
         let mut pass = true;
         if args.structure {
             pass &= structure(&mut m, &mut head, &split, &hp)?;
-            pass &= fault_case(&mut m)?;
+            pass &= fault_case(&mut m, plan.n_l.len())?;
         }
         if args.sets {
             pass &= sets(&mut m, &mut head, &split, &hp, &SETS)?;
@@ -349,13 +359,72 @@ mod gate {
 
     // ----------------------------------------------------------- the fault
 
+    /// The fault case's prompt, fed one token a step.
+    const FAULT_PROMPT: [u32; 3] = [1, 2, 3];
+    /// Steps of a fault run: the prompt's, then greedy ones.
+    const FAULT_STEPS: usize = 8;
+
+    /// [`FAULT_STEPS`] steps from where the model stands: per step its token,
+    /// the host tier's services and whether the tier's words were at rest
+    /// after it; the first error ends the run.
+    #[derive(Default)]
+    struct FaultRun {
+        tokens: Vec<u32>,
+        served: Vec<u64>,
+        rest: Vec<bool>,
+        error: Option<String>,
+    }
+
+    impl FaultRun {
+        /// Every step ran, served `services` layers and left the words at
+        /// rest.
+        fn served_all(&self, services: usize) -> bool {
+            self.error.is_none()
+                && self.tokens.len() == FAULT_STEPS
+                && self.served.len() == FAULT_STEPS
+                && self.served.iter().all(|&s| s == services as u64)
+                && self.rest.iter().all(|&r| r)
+        }
+    }
+
+    fn fault_run(m: &mut Deepseek41Model) -> Result<FaultRun, GateError> {
+        const WHAT: &str = "gate_deepseek41_step fault_run";
+        let mut run = FaultRun::default();
+        let mut next = 0u32;
+        for i in 0..FAULT_STEPS {
+            let t = FAULT_PROMPT.get(i).copied().unwrap_or(next);
+            let s0 = m.body(WHAT)?.hybrid().stats().served;
+            let r = m.step(&[t]);
+            let h = m.body(WHAT)?.hybrid();
+            run.served.push(h.stats().served - s0);
+            run.rest.push(h.words().at_rest());
+            match r {
+                Ok(tok) => {
+                    run.tokens.push(tok);
+                    next = tok;
+                }
+                Err(e) => {
+                    run.error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        Ok(run)
+    }
+
     /// The engine's step on a condemned state (the module doc's fault case).
-    fn fault_case(m: &mut Deepseek41Model) -> Result<bool, GateError> {
-        const PROMPT: [u32; 3] = [1, 2, 3];
+    /// `services` is the host services a step makes: the gate plan puts every
+    /// layer on the one card, and each layer's FFN piece hands its routed
+    /// slots to the host tier once a step — one service per layer the plan
+    /// places.
+    fn fault_case(m: &mut Deepseek41Model, services: usize) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step fault";
         m.reset()?;
-        let tok = m.step(&PROMPT)?;
+        let fresh = fault_run(m)?;
+        m.reset()?;
+        let tok = m.step(&FAULT_PROMPT)?;
         {
-            let (gpu, _, body) = m.body_parts("gate_deepseek41_step fault")?;
+            let (gpu, _, body) = m.body_parts(WHAT)?;
             let stream = gpu.stream();
             let ring = body
                 .state_mut(0)
@@ -368,9 +437,17 @@ mod gate {
         }
         let first = m.step(&[tok]);
         let poisoned = m.poisoned();
+        let at_fault = m.body(WHAT)?.hybrid().words();
         let second = m.step(&[tok]);
-        m.reset()?;
-        let again = m.step(&PROMPT)?;
+        let resets0 = m.body(WHAT)?.hybrid().stats().resets;
+        let reset = m.reset();
+        let unpoisoned = m.poisoned().is_none();
+        let h = m.body(WHAT)?.hybrid();
+        let (st, after_reset) = (h.stats(), h.words());
+        let poison = h
+            .last_poison()
+            .map_or_else(|| "none".to_string(), ToString::to_string);
+        let after = fault_run(m)?;
         let faulted = match &first {
             Err(GpuError::Fault { fault, .. }) => Some(*fault),
             _ => None,
@@ -383,18 +460,62 @@ mod gate {
             Ok(t) => format!("token {t}"),
             Err(e) => format!("error \"{e}\""),
         };
+        // The refusal at layer 0 serves nothing and releases both rows'
+        // counters; every one of the step's waits then drains through row
+        // 0's, each taking one back, and the card makes every go.
+        let n = u32::try_from(services)?;
+        let released = at_fault.generation.wrapping_sub(at_fault.served) == n
+            && at_fault.counters[..at_fault.rows]
+                .iter()
+                .enumerate()
+                .all(|(r, &c)| c == if r == 0 { RELEASE - n } else { RELEASE });
         let pass = faulted.is_some_and(|f| f.layer == 0 && f.site().is_some())
             && poisoned == faulted
             && refused
-            && again == tok
-            && m.poisoned().is_none();
+            && released;
         println!(
-            "fault nan_key layer=0: step {}; next {}; after reset token {again} (before {tok}) {}",
+            "fault nan_key layer=0: step {}; next {}; words at the fault {at_fault} (predicted: \
+             generation {services} past served, counters [RELEASE - {services}, RELEASE] with \
+             RELEASE = {RELEASE}) {released} {}",
             describe(&first),
             describe(&second),
             verdict(pass)
         );
-        Ok(pass)
+        let lifted = reset.is_ok()
+            && st.resets == resets0 + 1
+            && st
+                .last_poison
+                .is_some_and(|p| p.kind == PoisonKind::Refused && p.layer == 0)
+            && after_reset.at_rest()
+            && after_reset.generation == at_fault.generation
+            && unpoisoned;
+        let served = fresh.served_all(services) && after.served_all(services);
+        let same = after.tokens == fresh.tokens && after.tokens.get(2) == Some(&tok);
+        let reset_pass = lifted && served && same;
+        println!(
+            "fault reset: {} resets={} last poison \"{poison}\" lifted {lifted}, words after it \
+             {after_reset}; {FAULT_STEPS} steps after it served {:?} with the words at rest {:?}{} \
+             (want {services} each: the gate plan's {services} layers on the one card, one host \
+             service each; the fresh run {:?} {:?}) {served}; tokens {:?} = the fresh run's {:?} \
+             bit for bit, token {tok} after the prompt {same} {}",
+            match &reset {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => format!("error \"{e}\""),
+            },
+            st.resets,
+            after.served,
+            after.rest,
+            after
+                .error
+                .as_ref()
+                .map_or_else(String::new, |e| format!(", then error \"{e}\"")),
+            fresh.served,
+            fresh.rest,
+            after.tokens,
+            fresh.tokens,
+            verdict(reset_pass)
+        );
+        Ok(pass && reset_pass)
     }
 
     // ------------------------------------------------------- the set's state

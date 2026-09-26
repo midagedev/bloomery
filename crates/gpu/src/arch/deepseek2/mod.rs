@@ -32,7 +32,8 @@ pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
 use crate::hybrid::{
-    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, Refusal, SlotMap,
+    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, HybridWords, Refusal,
+    SlotMap,
 };
 use crate::model::probe::Observer;
 use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe, one_shard};
@@ -338,8 +339,19 @@ impl ChainBody for Body {
 
     /// Every layer's cache is zeroed, because the flash walks whole key
     /// segments and a stale row inside the last segment of a short run is a
-    /// real key row, not a skipped one.
+    /// real key row, not a skipped one. The host tier's reset comes first
+    /// ([`Hybrid::reset`]): a poison it cannot lift fails the reset before
+    /// anything is zeroed. On a hybrid load the routed experts' gate/up rows
+    /// are zeroed too: a hybrid step quantizes every slot's row and writes
+    /// only the card's, so a host slot's row keeps what an earlier step left
+    /// there — NaN, after a step that faulted.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if let Some(h) = self.hybrid.as_mut() {
+            h.reset(gpu.stream())?;
+            if let Some(m) = self.scratch.moe.as_mut() {
+                m.h_exp.zero_async(gpu.stream())?;
+            }
+        }
         let zero_row = vec![0u16; self.cache_cols("GpuModel::reset")?];
         for cache in self.kv.iter_mut() {
             seed_cache(gpu, cache, &zero_row, "reset")?;
@@ -651,5 +663,14 @@ impl GpuModel<Body> {
             .hybrid
             .as_ref()
             .map(Hybrid::stats)
+    }
+
+    /// The host tier's protocol words, on a hybrid load.
+    pub fn hybrid_words(&self) -> Option<HybridWords> {
+        self.body("GpuModel::hybrid_words")
+            .ok()?
+            .hybrid
+            .as_ref()
+            .map(Hybrid::words)
     }
 }
