@@ -10,6 +10,9 @@
       projections of one full chunk, the launch skip that reaches them and the shapes they must have
   ds41pp.py ncu-summary <csv> <plan> <model>
       the shape check of the profiled launches, then each unit's demand next to the block-step
+  ds41pp.py self-test
+      the cut of the projections-per-sub-block form held to synthetic traces written in the engine's
+      launch order; prints `self-test: ok` or the failures (exit 1)
 
 The trace is `generate_ds41 --depth P -n N --time` under `nsys profile -t cuda --cuda-graph-trace=node`
 (the prefill form's command); its run log's lines are read by tools/bloomery/records.py, by kind and
@@ -17,20 +20,30 @@ field. What it holds and how it is cut:
   - the prompt window: every kernel with no graph node (the batch runs eagerly and refuses a capture;
     the capture before it executes nothing), from the first to the first graph replay, which is the
     first generated step's;
-  - the batches and their chunks: the engine's own plan of the call, its `call plan` and `call batch`
-    records — the run log's (a batched feed prints them before its load), else --plan FILE's
+  - the batches and their chunks: the engine's own plan of the call, its `call plan`, `call batch` and
+    `call lb` records — the run log's (a batched feed prints them before its load), else --plan FILE's
     (`generate_ds41 --plan` with the run's arguments, for a log from before them), whose needs must be
     the run's `stat prefill ced=` line's; checked against the trace — one `gather_pairs` a chunk per
-    batch, one `ds41_hc_post` a full chunk per layer-batch;
+    batch, and per layer-batch the attention's form below;
   - a layer-batch: a layer's block in one batch, the launches from the previous one's join to its own
     join (`ds41_ffn_post_batch*`); its route ends at its `ds41_ffn_places`, the route's three copies to
     the host and their event; the shadow runs from there to the serve's event sync; the post is the
     host sums' copy and the join. Which layer each is comes from the run's `stat prefill ced=` line
     (each layer's block and latent starts), and the count must equal the `stat prefill split` line's
-    `layer_batches`, or no table;
-  - inside the attention, a full chunk runs from its fork (the event record and wait before
-    `ds41_hc_pre`) to its `ds41_hc_post`; the launches before the first full chunk are the engram step
-    (its rows, gate and fold) and the latent-only chunks.
+    `layer_batches`, or no table. A group of two or more batches (BLOOMERY_PREFILL_GROUP over a call of
+    two or more batches) enqueues a layer-batch's route before the previous one's serve and join: that
+    order is refused by name;
+  - inside the attention, one of two forms, told apart by the trace's launches:
+    - the projections per full chunk (one `ds41_hc_pre` a full chunk): a full chunk runs from its fork
+      (the event record and wait before `ds41_hc_pre`) to its `ds41_hc_post`; the launches before the
+      first full chunk are the engram step (its rows, gate and fold) and the latent-only chunks;
+    - the projections per sub-block (one `ds41_hc_pre_groups` a layer-batch; chain/attn/batch.rs
+      `enqueue_batch_layer`): the engram step, the fork and `ds41_hc_pre_groups` on the branch, the
+      latent sub-blocks, the block's sub-blocks, the join and `ds41_hc_post`. The sub-blocks are the
+      plan's `call lb` record's (part_sb, full_sb, in chunks); each starts at its first `norm_quant`
+      (`sub_pre`'s: a latent sub-block has one, a block sub-block two, `chunk_rows` none) and holds one
+      `ds41_kv_norm_rope_append` a chunk, or no table. A block sub-block is then the unit the per-chunk
+      columns count (`irr`: the units without the four projections); the ncu form refuses this form.
 Order is launch order: the main thread's API calls by start time, each tied to its card activity by
 correlation id — the fork stream's HC_PRE runs beside the main stream, so card start order is not it.
 
@@ -41,13 +54,16 @@ Exit status: 0 with tables; 3 a named refusal (a boundary, a skip or a shape tha
 64 a usage error.
 """
 import bisect
+import contextlib
 import csv
+import io
 import os
 import re
 import sqlite3
 import statistics
 import struct
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery"))
@@ -63,19 +79,27 @@ ENGRAM_ROWS = {"ds41_glue_engram_rows", "ds41_glue_engram_rows_q3k"}
 JOIN = {"ds41_ffn_post_batch", "ds41_ffn_post_batch_streams"}
 PLACES = "ds41_ffn_places"
 HC_PRE = "ds41_hc_pre"
+HC_PRE_GROUPS = "ds41_hc_pre_groups"
 HC_POST = "ds41_hc_post"
 FOLD = "ds41_hc_fold"
 PROJ_ROW = "q3k_gemv"
 PROJ_HEADS = "ds41_q3k_gemv_heads_mcol"
+# The row and heads launches a unit's projections are among: per chunk (m columns) and per sub-block
+# (grouped columns; split past a row length, `Gpu::enqueue_gemv_q3k_groups`).
+ROWS = {PROJ_ROW, "q3k_gemv_groups", "q3k_gemv_split_groups"}
+HEADS = {PROJ_HEADS, "ds41_q3k_gemv_heads_groups"}
 ROPE = "ds41_rope_tail"
+NORM = "norm_quant"
+KV_APPEND = "ds41_kv_norm_rope_append"
+EVENTS = ("cuEventRecord", "cuStreamWaitEvent")
 ATTN = {"ds41_attn_seg", "ds41_attn_seg_sel", "ds41_attn_seg_stage", "ds41_attn_seg_sel_stage",
-        "ds41_attn_merge", "ds41_ring_commit", "ds41_kv_norm_rope_append", "kv_norm_rope_append"}
-SMALL = {"norm_quant", "rms_norm", "q3k_quantize_q8_1", "ds41_rows_to_tokens",
-         ROPE, HC_PRE, "ds41_hc_pre_f32", HC_POST}
+        "ds41_attn_merge", "ds41_ring_commit", KV_APPEND, "kv_norm_rope_append"}
+SMALL = {NORM, "rms_norm", "q3k_quantize_q8_1", "ds41_rows_to_tokens", "ds41_groups_to_tokens",
+         ROPE, HC_PRE, "ds41_hc_pre_f32", HC_PRE_GROUPS, HC_POST}
 SOURCE = {"ds41_comp_pool", "ds41_comp_rows", "ds41_index_key", "ds41_indexer_score", "ds41_indexer_topk"}
 ROUTE_TAIL = {"ds41_router", "ds41_router_scores", "ds41_router_pick", PLACES}
-# The terms of a layer-batch, in print order. `projections` are the chunk's four (qkv, q_b, wo_a,
-# wo_b); a chunk's other q3k_gemv (a compressor's joined kv·gate) goes to `source + indexer`.
+# The terms of a layer-batch, in print order. `projections` are a unit's four (qkv, q_b, wo_a, wo_b);
+# a unit's other row launch (a compressor's projections, an index key's) goes to `source + indexer`.
 TERMS = ("projections", "attention", "small", "source + indexer", "latent-only chunks", "engram",
          "route norm_quant", "route tail", "other")
 ROLES = ("qkv", "q_b", "wo_a", "wo_b")
@@ -125,7 +149,8 @@ def read_runlog(path):
 
 def batch_plan(run, plan_path):
     """Per layer-batch in launch order: (batch, layer, full chunks, latent chunks, the full chunks'
-    lengths): the engine's plan of the call — its batches and their chunks, the run log's own `call`
+    lengths, and where the plan has its `call lb` record the latent part's and the block's sub-blocks
+    in chunks): the engine's plan of the call — its batches and their chunks, the run log's own `call`
     records or `plan_path`'s — under the run's needs (each layer's block and latent starts), held to
     the run's stat line; and the plan's chunk size."""
     need = ("full_from", "part_from", "ced_first", "ced_end", "n_layer", "batches", "layer_batches")
@@ -153,6 +178,7 @@ def batch_plan(run, plan_path):
     if len(runs) != run["batches"]:
         refuse(f"[boundary] the plan runs {len(runs)} batches, the run's stat line says {run['batches']}: "
                f"no table")
+    sbs = {(x["b"], x["layer"]): x for x in records.of_kind(plan, "call_lb")}
     out = []
     for bi, x in enumerate(batches):
         cuts = list(zip(x["cuts"], x["cuts"][1:]))
@@ -160,8 +186,16 @@ def batch_plan(run, plan_path):
             f = [c for c in cuts if c[0] >= full[layer]]
             p = [c for c in cuts if part[layer] <= c[0] < full[layer]]
             if f:
-                out.append({"batch": bi, "layer": layer, "full": len(f), "part": len(p),
-                            "m": [c[1] - c[0] for c in f], "cuts": len(cuts)})
+                lb = {"batch": bi, "layer": layer, "full": len(f), "part": len(p),
+                      "m": [c[1] - c[0] for c in f], "cuts": len(cuts)}
+                sb = sbs.get((x["b"], layer))
+                if sb is not None:
+                    if (sum(sb["part_sb"]), sum(sb["full_sb"])) != (len(p), len(f)):
+                        refuse(f"[boundary] the plan's `call lb b={x['b']} layer={layer}` record cuts "
+                               f"{sum(sb['part_sb'])} latent and {sum(sb['full_sb'])} block chunks into "
+                               f"sub-blocks, the needs give {len(p)} and {len(f)}: no table")
+                    lb["part_sb"], lb["full_sb"] = sb["part_sb"], sb["full_sb"]
+                out.append(lb)
     if len(out) != run["layer_batches"]:
         refuse(f"[boundary] the plan gives {len(out)} layer-batches, the stat line says "
                f"{run['layer_batches']}: no table")
@@ -262,7 +296,11 @@ def cut_layer_batches(en, plan, runs):
         refuse("    no table: the layer-batch cut does not match the run")
     lbs, start = [], 0
     for k, (p, j) in enumerate(zip(places, joins)):
-        if not start <= p < j:
+        if p < start:
+            refuse(f"[boundary] layer-batch {k}: its route ({PLACES}) is enqueued before layer-batch {k - 1}'s "
+                   f"join: a group of two or more batches (BLOOMERY_PREFILL_GROUP) interleaves its layer-batches, "
+                   f"which this cut does not read (under BLOOMERY_PREFILL_GROUP=1 a group is one batch), no table")
+        if not p < j:
             refuse(f"[boundary] layer-batch {k}: its places launch is not before its join, no table")
         end = j
         if end + 1 < len(en) and en[end + 1]["kernel"] == "ds41_tap_means":
@@ -286,16 +324,18 @@ def cut_layer_batches(en, plan, runs):
     return lbs, head
 
 
-def phases(en, lb):
-    """Tag the layer-batch's entries: engram, latent, full chunk k, route, d2h, shadow, sync, post."""
-    lo, p, j, hi = lb["lo"], lb["places"], lb["join"], lb["hi"]
+def attn_chunks(en, lb):
+    """The attention of a layer-batch whose projections run per full chunk: each full chunk (unit k)
+    from its fork (the event record and wait before `ds41_hc_pre`) to its `ds41_hc_post`; before the
+    first, the engram step (rows ... fold, chunk after chunk) and the latent parts. The tags and the
+    route's first entry."""
+    lo, p = lb["lo"], lb["places"]
     posts = [i for i in range(lo, p) if en[i]["kernel"] == HC_POST]
     if len(posts) != lb["full"]:
         refuse(f"[boundary] layer {lb['layer']} batch {lb['batch']}: {len(posts)} {HC_POST} launches, "
                f"the ced line gives {lb['full']} full chunks, no table")
     route0 = posts[-1] + 1
     tag = {}
-    # Full chunks: from the fork before each HC_PRE to its HC_POST.
     pres = [i for i in range(lo, route0) if en[i]["kernel"] == HC_PRE]
     if len(pres) != lb["full"]:
         refuse(f"[boundary] layer {lb['layer']} batch {lb['batch']}: {len(pres)} {HC_PRE} launches in "
@@ -303,15 +343,13 @@ def phases(en, lb):
     chunk_lo = []
     for k, i in enumerate(pres):
         s = i
-        while s - 1 >= lo and en[s - 1]["api"].startswith(("cuEventRecord", "cuStreamWaitEvent")) \
-                and (k == 0 or s - 1 > posts[k - 1]):
+        while s - 1 >= lo and en[s - 1]["api"].startswith(EVENTS) and (k == 0 or s - 1 > posts[k - 1]):
             s -= 1
         chunk_lo.append(s)
     for k in range(lb["full"]):
         for i in range(chunk_lo[k], posts[k] + 1):
             tag[i] = ("chunk", k)
-    # Before the first full chunk: the engram step (rows ... fold, chunk after chunk), then latent parts.
-    i, engram_end = lo, lo
+    engram_end = lo
     if lo < chunk_lo[0] and en[lo]["kernel"] in ENGRAM_ROWS:
         last_fold = None
         for q in range(lo, chunk_lo[0]):
@@ -322,6 +360,90 @@ def phases(en, lb):
         engram_end = last_fold + 1
     for i in range(lo, chunk_lo[0]):
         tag[i] = ("engram", 0) if i < engram_end else ("latent", 0)
+    lb.update(form="chunk", units=lb["full"], chunk_lo=chunk_lo, chunk_hi=posts, posts=posts,
+              engram=(lo, engram_end), latent=(engram_end, chunk_lo[0]))
+    return tag, route0
+
+
+def back_over(en, i, floor, n, apis):
+    """`i` moved back over at most `n` entries right before it whose API starts with one of `apis`,
+    never below `floor`."""
+    while n and i - 1 >= floor and en[i - 1]["api"].startswith(apis):
+        i -= 1
+        n -= 1
+    return i
+
+
+def attn_sub_blocks(en, lb):
+    """The attention of a layer-batch whose projections run per sub-block, in chain/attn/batch.rs
+    `enqueue_batch_layer`'s order: the engram step where the layer has one (body/prefill.rs `route`
+    enqueues it first), the fork (an event record and the branch's wait) and `ds41_hc_pre_groups`, the
+    latent sub-blocks (`sub_pre` without the query, then each chunk's `chunk_rows`), the block's
+    sub-blocks (`sub_pre`, each chunk's `chunk_rows`, `sub_post`; unit k is the k-th), the join (an
+    event record and the stream's wait) and `ds41_hc_post`. A sub-block starts at its `sub_pre`'s first
+    `norm_quant`, after the event a timed run records before it. The tags and the route's first entry."""
+    lo, p = lb["lo"], lb["places"]
+    where = f"layer {lb['layer']} batch {lb['batch']}"
+    if "full_sb" not in lb:
+        refuse(f"[boundary] {where}: the trace runs the projections per sub-block ({HC_PRE_GROUPS}) and the "
+               f"plan has no `call lb` record of the layer-batch (its sub-blocks), no table")
+    part_sb, full_sb = lb["part_sb"], lb["full_sb"]
+    pres = [i for i in range(lo, p) if en[i]["kernel"] == HC_PRE_GROUPS]
+    posts = [i for i in range(lo, p) if en[i]["kernel"] == HC_POST]
+    if len(pres) != 1 or len(posts) != 1 or posts[0] < pres[0]:
+        refuse(f"[boundary] {where}: {len(pres)} {HC_PRE_GROUPS} and {len(posts)} {HC_POST} launches before "
+               f"its {PLACES}; the sub-block form has one of each, in that order, no table")
+    pre, post = pres[0], posts[0]
+    fork, join = back_over(en, pre, lo, 2, EVENTS), back_over(en, post, pre + 1, 2, EVENTS)
+    norms = [i for i in range(pre + 1, join) if en[i]["kernel"] == NORM]
+    want = len(part_sb) + 2 * len(full_sb)
+    if len(norms) != want:
+        refuse(f"[boundary] {where}: {len(norms)} {NORM} launches between {HC_PRE_GROUPS} and the join; the "
+               f"plan's {len(part_sb)} latent and {len(full_sb)} block sub-blocks have {want} (one a latent "
+               f"sub-block, two a block one), no table")
+    firsts = norms[:len(part_sb)] + norms[len(part_sb)::2]
+    starts = [back_over(en, i, pre + 1, 1, ("cuEventRecord",)) for i in firsts]
+    ends = [s - 1 for s in starts[1:]] + [join - 1]
+    for s, e, n in zip(starts, ends, part_sb + full_sb):
+        kv = sum(1 for i in range(s, e + 1) if en[i]["kernel"] == KV_APPEND)
+        if kv != n:
+            refuse(f"[boundary] {where}: a sub-block from launch {s - lo} of the layer-batch holds {kv} "
+                   f"{KV_APPEND} launches, the plan's sub-block {n} chunks (one a chunk), no table")
+    engram_end = lo
+    lead = [i for i in range(lo, fork) if en[i]["act"] is not None]
+    if lead and en[lead[0]]["kernel"] in ENGRAM_ROWS:
+        folds = [i for i in lead if en[i]["kernel"] == FOLD]
+        if not folds:
+            refuse(f"[boundary] layer {lb['layer']}: an engram step with no {FOLD}, no table")
+        engram_end = folds[-1] + 1
+    stray = [i for i in range(engram_end, fork) if en[i]["act"] is not None]
+    stray += [i for i in range(pre + 1, starts[0]) if en[i]["act"] is not None]
+    if stray:
+        refuse(f"[boundary] {where}: {en[stray[0]]['kernel'] or en[stray[0]]['copy']} at launch "
+               f"{stray[0] - lo} of the layer-batch, outside the engram step and the sub-blocks, no table")
+    tag = {}
+    for i in range(lo, fork):
+        tag[i] = ("engram", 0) if i < engram_end else ("latent", 0)
+    for i in list(range(fork, pre + 1)) + list(range(join, post + 1)):
+        tag[i] = ("hc", 0)
+    blocks = starts[len(part_sb):]
+    for i in range(pre + 1, blocks[0]):
+        tag[i] = ("latent", 0)
+    for k, (s, e) in enumerate(zip(blocks, ends[len(part_sb):])):
+        for i in range(s, e + 1):
+            tag[i] = ("chunk", k)
+    lb.update(form="sub", units=len(full_sb), chunk_lo=blocks, chunk_hi=ends[len(part_sb):], posts=posts,
+              engram=(lo, engram_end), latent=(pre + 1, blocks[0]))
+    return tag, post + 1
+
+
+def phases(en, lb):
+    """Tag the layer-batch's entries: engram, latent, hc (the sub-block form's fork, HC_PRE, join and
+    HC_POST), unit k (a full chunk, or in the sub-block form a block sub-block), route, d2h, shadow,
+    sync, post."""
+    lo, p, j, hi = lb["lo"], lb["places"], lb["join"], lb["hi"]
+    grouped = any(en[i]["kernel"] == HC_PRE_GROUPS for i in range(lo, p))
+    tag, route0 = (attn_sub_blocks if grouped else attn_chunks)(en, lb)
     for i in range(route0, p + 1):
         tag[i] = ("route", 0)
     # After places: the route's copies to the host and their event, then the shadow up to the sync.
@@ -344,20 +466,20 @@ def phases(en, lb):
     tag[s] = ("sync", 0)
     for i in range(s + 1, hi + 1):
         tag[i] = ("post", 0)
-    lb.update(tag=tag, chunk_lo=chunk_lo, posts=posts, route0=route0, d2h=d2h, sync=s,
-              engram=(lo, engram_end), latent=(engram_end, chunk_lo[0]))
+    lb.update(tag=tag, route0=route0, d2h=d2h, sync=s)
     h2d = [i for i in range(s + 1, hi + 1) if en[i]["copy"] == "H2D"]
     lb["h2d"] = h2d[0] if h2d else None
     return lb
 
 
 def chunk_roles(en, lb, k):
-    """The four projections of full chunk k: wo_a is its heads launch, wo_b the q3k_gemv after it,
-    q_b the last q3k_gemv before its first rope tail, qkv the q3k_gemv before q_b. Others: None."""
-    idx = [i for i in range(lb["chunk_lo"][k], lb["posts"][k] + 1)]
-    heads = [i for i in idx if en[i]["kernel"] == PROJ_HEADS]
+    """The four projections of unit k (a full chunk, or a block sub-block): wo_a is its heads launch,
+    wo_b the row launch after it, q_b the last row launch before its first rope tail, qkv the row
+    launch before q_b. Others: None."""
+    idx = range(lb["chunk_lo"][k], lb["chunk_hi"][k] + 1)
+    heads = [i for i in idx if en[i]["kernel"] in HEADS]
     rope = [i for i in idx if en[i]["kernel"] == ROPE]
-    gem = [i for i in idx if en[i]["kernel"] == PROJ_ROW]
+    gem = [i for i in idx if en[i]["kernel"] in ROWS]
     if len(heads) != 1 or not rope:
         return None
     wob = [i for i in gem if i > heads[0]]
@@ -371,11 +493,11 @@ def term_of(en, lb, i, roles):
     ph, k = lb["tag"].get(i, ("?", 0))
     name = en[i]["kernel"] or en[i]["copy"]
     if ph == "chunk":
-        if name in (PROJ_ROW, PROJ_HEADS):
+        if name in ROWS or name in HEADS:
             r = roles.get(k)
             if r is not None and i in r.values():
                 return "projections"
-            return "source + indexer" if name == PROJ_ROW else "projections"
+            return "source + indexer" if name in ROWS else "projections"
         if name in ATTN:
             return "attention"
         if name in SMALL:
@@ -385,6 +507,8 @@ def term_of(en, lb, i, roles):
         return "other"
     if ph == "latent":
         return "latent-only chunks"
+    if ph == "hc":
+        return "small" if name in SMALL else "other"
     if ph == "engram":
         return "engram"
     if ph == "route":
@@ -428,12 +552,12 @@ def measure(en, lbs, head, busy_of, blocked_ns):
     """Per layer-batch: the terms, the card windows and the host and queue numbers."""
     for n_, lb in enumerate(lbs):
         roles = {}
-        for k in range(lb["full"]):
+        for k in range(lb["units"]):
             r = chunk_roles(en, lb, k)
             if r is not None:
                 roles[k] = r
         lb["roles"] = roles
-        lb["irregular"] = lb["full"] - len(roles)
+        lb["irregular"] = lb["units"] - len(roles)
         terms = defaultdict(float)
         by_kernel = defaultdict(lambda: [0, 0.0, ""])
         for i in range(lb["lo"], lb["hi"] + 1):
@@ -566,6 +690,15 @@ def cmd_tables(argv):
     lbs, head = cut_layer_batches(en, plan, runs)
     for lb in lbs:
         phases(en, lb)
+    sub = [lb for lb in lbs if lb["form"] == "sub"]
+    if sub and len(sub) != len(lbs):
+        refuse(f"[boundary] {len(sub)} of {len(lbs)} layer-batches run the projections per sub-block "
+               f"({HC_PRE_GROUPS}): one trace is one engine's form, no table")
+    if sub:
+        print(f"[boundary] the attention runs its projections per sub-block ({HC_PRE_GROUPS} once a "
+              f"layer-batch): {sum(lb['units'] for lb in sub)} block sub-blocks over "
+              f"{sum(lb['full'] for lb in sub)} full chunks, cut at the plan's `call lb` sub-blocks; the "
+              f"per-unit columns (irr) count sub-blocks")
     measure(en, lbs, head, busy_of, blocked_ns)
     apis = Counter(x["api"] for x in en)
     print(f"    window API calls {len(en)}: " + ", ".join(f"{k} {v}" for k, v in apis.most_common(12)))
@@ -615,8 +748,10 @@ def cmd_tables(argv):
     if one is None:
         refuse(f"[boundary] no layer-batch of layer {layer_pick}: no table")
     print()
-    print(f"=== kernel table: layer {one['layer']} of batch {one['batch']} ({one['full']} full chunks, "
-          f"{one['part']} latent-only, {one['irregular']} chunks without the four projections), ms")
+    unit = "sub-blocks" if one["form"] == "sub" else "chunks"
+    held = f" in {one['units']} sub-blocks" if one["form"] == "sub" else ""
+    print(f"=== kernel table: layer {one['layer']} of batch {one['batch']} ({one['full']} full chunks{held}, "
+          f"{one['part']} latent-only, {one['irregular']} {unit} without the four projections), ms")
     print(f"  {'term':20s} {'kernel':34s} {'launches':>8s} {'total ms':>9s} {'µs/launch':>9s} {'µs/chunk':>9s}")
     for t in TERMS + ("shadow", "post"):
         rows = sorted(((k[1], v) for k, v in one["by_kernel"].items() if k[0] == t), key=lambda x: -x[1][1])
@@ -632,7 +767,7 @@ def cmd_tables(argv):
           f"+ card idle {c['idle']:.3f}; union gap {c['gap']:.3f} (shadow {c['shadow']:.3f}, idle "
           f"{c['gap_idle']:.3f}); post {c['post']:.3f}")
     if one["roles"]:
-        print("  the four projections, per chunk (µs, mean over the chunks that have them):")
+        print(f"  the four projections, per {unit[:-1]} (µs, mean over the {unit} that have them):")
         for r in ROLES:
             ds = [(en[v[r]]["act"]["e"] - en[v[r]]["act"]["s"]) / 1e3 for v in one["roles"].values()]
             g = en[next(iter(one["roles"].values()))[r]]["act"]["grid"]
@@ -714,6 +849,10 @@ def cmd_ncu_plan(argv):
     lbs, head = cut_layer_batches(en, plan, runs)
     for lb in lbs:
         phases(en, lb)
+    if any(lb["form"] == "sub" for lb in lbs):
+        refuse(f"[skip] the trace runs the projections per sub-block ({HC_PRE_GROUPS}): the form profiles one "
+               f"full chunk's four m-column launches, and a sub-block's are grouped launches over up to 16 "
+               f"chunks that ncu-summary's shape check (the m-column walk's global loads) does not read: no target")
     pick = None
     for lb in lbs:
         if lb["layer"] < 2 or (want is not None and lb["layer"] != int(want)):
@@ -1017,12 +1156,396 @@ def cmd_ncu_summary(argv):
     return 0
 
 
+# ---- the self-test ----
+
+TID, MAIN, BRANCH = 7001, 7, 8
+# The synthetic call: 64 positions in chunks of 8, three layers. Layer 0 runs every chunk as its block;
+# layer 1 an engram step, a joint compressor with index keys and the indexer, a latent part of two
+# chunks and a block of six; layer 2 a split compressor, two latent chunks and a block of one.
+SYN_FULL, SYN_PART = [0, 16, 56], [0, 0, 40]
+SYN_LAYERS = [dict(engram=False, source=None, keys=False, indexer=False),
+              dict(engram=True, source="joint", keys=True, indexer=True),
+              dict(engram=False, source="split", keys=False, indexer=False)]
+
+
+def syn_sub_blocks(k, end):
+    """chain/attn/batch.rs `SubBlocks` over whole chunks: runs of the largest power of two up to 16."""
+    out = []
+    while k < end:
+        n = 1 << (min(end - k, 16).bit_length() - 1)
+        out.append(n)
+        k += n
+    return out
+
+
+class Synth:
+    """A prompt call's trace written in the order the engine enqueues it, as read from the code:
+    body/prefill.rs `enqueue_group_chain` (the members' `front`, then per layer-batch `route`, `shadow`,
+    `serve`, `post`, and in a group of two or more the next `route` before the `serve`), `route` (the
+    engram step, the attention, the route's launches, its three copies to the host and their event),
+    chain/attn/batch.rs `enqueue_batch_layer`, `sub_pre`, `chunk_rows`, `sub_post`. Each activity
+    carries the term the cut must give it, and each block sub-block its four projections."""
+
+    def __init__(self, timed):
+        self.timed = timed
+        self.names, self.api, self.kernels, self.copies = {}, [], [], []
+        self.t, self.corr = 1_000_000, 0
+        self.free = {MAIN: 0, BRANCH: 0}
+        self.want, self.roles = {}, []
+
+    def sid(self, s):
+        return self.names.setdefault(s, len(self.names) + 1)
+
+    def call(self, api, until=0):
+        self.corr += 1
+        s, e = self.t, max(self.t + 3000, until)
+        self.api.append((s, e, self.sid(api), self.corr, TID))
+        self.t = e + 1000
+        return self.corr, s
+
+    def launch(self, name, term, stream=MAIN, after=0, graph=None):
+        c, s = self.call("cuGraphLaunch" if graph else "cuLaunchKernel")
+        k0 = max(s + 2000, self.free[stream], after)
+        self.free[stream] = k0 + 4000
+        self.kernels.append((k0, k0 + 4000, self.sid(name), c, stream, 0, 1, 1, 1, 256, 1, 1, graph))
+        if term is not None:
+            self.want[c] = term
+        return c
+
+    def copy(self, kind, term):
+        c, s = self.call("cuMemcpyDtoHAsync_v2" if kind == 2 else "cuMemcpyHtoDAsync_v2")
+        k0 = max(s + 2000, self.free[MAIN])
+        self.free[MAIN] = k0 + 2000
+        self.copies.append((k0, k0 + 2000, kind, 4096, c, MAIN, 0, None))
+        self.want[c] = term
+
+    def mark(self):
+        if self.timed:
+            self.call("cuEventRecord")
+
+    def front(self, cuts):
+        for _ in cuts:
+            self.launch("gather_pairs", None)
+        for a, b in cuts:
+            for _ in range(a, b):
+                self.launch("ds41_glue_embed", None)
+
+    def engram(self, cuts):
+        for a, b in cuts:
+            for _ in range(a, b):
+                self.launch("ds41_glue_engram_rows", "engram")
+            for name in ("q3k_quantize_q8_1", "q3k_gemv") + (("ds41_rows_to_tokens",) if b - a > 1 else ()):
+                self.launch(name, "engram")
+            for name in ("ds41_engram_key_norm", "ds41_engram_gate", FOLD):
+                self.launch(name, "engram")
+
+    def sub_pre(self, ly, latent, unit):
+        def t(term):
+            return "latent-only chunks" if latent else term
+        self.launch(NORM, t("small"))
+        if ly["source"]:
+            for _ in range(2 if ly["source"] == "split" else 1):
+                self.launch("q3k_gemv_groups", t("source + indexer"))
+            for _ in range(1 if ly["source"] == "kv" else 2):
+                self.launch("ds41_groups_to_tokens", t("small"))
+        qkv = self.launch("q3k_gemv_split_groups", t("projections"))
+        self.launch("ds41_groups_to_tokens", t("small"))
+        if latent:
+            return
+        self.launch("ds41_groups_to_tokens", "small")
+        self.launch(NORM, "small")
+        q_b = self.launch("q3k_gemv_groups", "projections")
+        self.launch("ds41_groups_to_tokens", "small")
+        self.launch(ROPE, "small")
+        unit.update(qkv=qkv, q_b=q_b)
+
+    def chunk_rows(self, ly, latent):
+        def t(term):
+            return "latent-only chunks" if latent else term
+        if ly["source"]:
+            self.launch("ds41_comp_pool", t("source + indexer"))
+            if ly["keys"]:
+                self.launch("q3k_quantize_q8_1", t("small"))
+                self.launch("q3k_gemv", t("source + indexer"))
+                self.launch("ds41_rows_to_tokens", t("small"))
+                self.launch("ds41_index_key", t("source + indexer"))
+        self.launch(KV_APPEND, t("attention"))
+        if latent:
+            return
+        if ly["indexer"]:
+            self.launch("ds41_indexer_score", "source + indexer")
+            self.launch("ds41_indexer_topk", "source + indexer")
+        for name in ("ds41_attn_seg_sel_stage" if ly["indexer"] else "ds41_attn_seg_stage", "ds41_attn_merge",
+                     "ds41_ring_commit"):
+            self.launch(name, "attention")
+
+    def sub_post(self, unit):
+        self.launch(ROPE, "small")
+        self.launch("q3k_quantize_q8_1", "small")
+        wo_a = self.launch("ds41_q3k_gemv_heads_groups", "projections")
+        self.launch("q3k_quantize_q8_1", "small")
+        wo_b = self.launch("q3k_gemv_groups", "projections")
+        self.launch("ds41_groups_to_tokens", "small")
+        unit.update(wo_a=wo_a, wo_b=wo_b)
+
+    def route(self, ly, cuts, run, full):
+        """A layer-batch up to its route's copies; whether it has a block."""
+        self.mark()
+        if ly["engram"]:
+            self.engram(cuts[run:])
+        n = len(cuts)
+        if full < n:
+            self.call("cuEventRecord")
+            self.call("cuStreamWaitEvent")
+            self.launch(HC_PRE_GROUPS, "small", stream=BRANCH, after=self.free[MAIN])
+        for c in syn_sub_blocks(run, full):
+            self.mark()
+            self.sub_pre(ly, True, None)
+            self.mark()
+            for _ in range(c):
+                self.chunk_rows(ly, True)
+        for c in syn_sub_blocks(full, n):
+            unit = {}
+            self.mark()
+            self.sub_pre(ly, False, unit)
+            self.mark()
+            for _ in range(c):
+                self.chunk_rows(ly, False)
+            self.mark()
+            self.sub_post(unit)
+            self.mark()
+            self.roles.append(unit)
+        if full == n:
+            self.mark()
+            return False
+        self.call("cuEventRecord")
+        self.call("cuStreamWaitEvent")
+        self.free[MAIN] = max(self.free[MAIN], self.free[BRANCH])
+        self.launch(HC_POST, "small")
+        for _ in range(full, n):
+            self.launch(NORM, "route norm_quant")
+        for name in ("ds41_router_scores", "ds41_router_pick", PLACES):
+            self.launch(name, "route tail")
+        for _ in range(3):
+            self.copy(2, "route tail")
+        self.call("cuEventRecord")
+        self.routed = self.free[MAIN]
+        self.mark()
+        return True
+
+    def after_route(self, block, part):
+        """The layer-batch's `shadow`, `serve` or `post` (`part`), where it has a block."""
+        if not block:
+            return
+        if part == "shadow":
+            self.mark()
+            for name in ("ds41_card_buckets", "ds41_card_gather", "ds41_expert_gate_up_tiles", "q4k_gemv_tiles"):
+                self.launch(name, "shadow")
+            self.mark()
+        elif part == "serve":
+            self.call("cuEventSynchronize", until=self.routed)
+            self.t += 40_000
+        else:
+            self.copy(1, "post")
+            self.launch("ds41_ffn_post_batch_streams", "post")
+
+    def call_of(self, batches, group):
+        """The call's batches (their cuts, in positions) in groups of `group`, then the head and the
+        first generated step's replay; the plan's `call` lines."""
+        lines = [f"call plan first=0 end={batches[-1][-1]} batches={len(batches)} group={group} "
+                 f"groups={-(-len(batches) // group)} t_max={max(c[-1] - c[0] for c in batches)} chunk=8 "
+                 f"sub_chunks=16 ring=128 layers={len(SYN_LAYERS)} ced=on"]
+        per = []
+        for b, bounds in enumerate(batches):
+            cuts = list(zip(bounds, bounds[1:]))
+            lines.append(f"call batch b={b} first={bounds[0]} end={bounds[-1]} group={b // group} set={b % group} "
+                         f"chunks={len(cuts)} cuts=[{','.join(map(str, bounds))}]")
+            lbs = []
+            for layer in range(len(SYN_LAYERS)):
+                full = sum(1 for c in cuts if c[0] < SYN_FULL[layer])
+                run = sum(1 for c in cuts if c[0] < SYN_PART[layer])
+                lines.append(f"call lb b={b} layer={layer} run={run} full={full} part_sb=[{','.join(map(str, syn_sub_blocks(run, full)))}] "
+                             f"full_sb=[{','.join(map(str, syn_sub_blocks(full, len(cuts))))}]")
+                lbs.append((cuts, run, full))
+            per.append(lbs)
+        for g0 in range(0, len(batches), group):
+            members = list(range(g0, min(g0 + group, len(batches))))
+            for b in members:
+                self.front(per[b][0][0])
+            items = [(layer, b) for layer in range(len(SYN_LAYERS)) for b in members]
+
+            def route(x):
+                layer, b = items[x]
+                cuts, run, full = per[b][layer]
+                return self.route(SYN_LAYERS[layer], cuts, run, full)
+            nxt = route(0)
+            for x in range(len(items)):
+                now = nxt
+                self.after_route(now, "shadow")
+                if len(members) >= 2 and x + 1 < len(items):
+                    nxt = route(x + 1)
+                self.after_route(now, "serve")
+                self.after_route(now, "post")
+                if len(members) == 1 and x + 1 < len(items):
+                    nxt = route(x + 1)
+        self.launch("ds41_head_logits", None)
+        self.call("cuStreamSynchronize", until=self.free[MAIN])
+        self.launch("ds41_step_replay", None, graph=1)
+        return lines
+
+    def write(self, path):
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(v, k) for k, v in self.names.items()])
+        db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start, end, shortName, correlationId, streamId, "
+                   "deviceId, gridX, gridY, gridZ, blockX, blockY, blockZ, graphNodeId)")
+        db.executemany(f"INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ({','.join('?' * 13)})", self.kernels)
+        db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start, end, copyKind, bytes, correlationId, streamId, "
+                   "deviceId, graphNodeId)")
+        db.executemany(f"INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES ({','.join('?' * 8)})", self.copies)
+        db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (start, end, bytes, correlationId, streamId, deviceId, "
+                   "graphNodeId)")
+        db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (start, end, nameId, correlationId, globalTid)")
+        db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, ?, ?, ?)", self.api)
+        db.commit()
+        db.close()
+
+
+def syn_runlog(call_lines, n_batches, layer_batches, edit=None):
+    """The run's own lines for the synthetic call: its load, needs, split and time prompt rows, and the
+    plan's `call` lines (`edit` maps a line's start to its replacement)."""
+    lists = f"full_from=[{','.join(map(str, SYN_FULL))}] part_from=[{','.join(map(str, SYN_PART))}]"
+    lines = [f"load resident_bytes=1 shadow=host 0 unified_addressing=1 ctx=4096 layers={len(SYN_LAYERS)} "
+             f"top_k=512 mode=graph place=gate pin_main=on pinned=true launch_thread=off prefill=batch ced=on "
+             f"group=2 in 1.0 s (runtime value)",
+             f"stat prefill ced=on first=0 end=64 features_from=64 block_positions=1 part_positions=1 {lists}",
+             f"stat prefill split group=2 batches={n_batches} layer_batches={layer_batches} prologue_ms=1.0 "
+             f"chain_ms=1.0 union_ms=1.0 wait_ms=1.0 enqueue_ms=1.0 copy_ms=1.0 union_lb=1.00 wait_lb=1.00 "
+             f"wait_first_lb=1.00 enqueue_lb=1.00 copy_lb=1.00 entries_route=1.0 entries_shadow=1.0 excluded_lb=0.0",
+             "time prompt n=64 ms=10.0000 tok/s=6400.00 passes=1 kind=batch"]
+    lines += call_lines + [f"call need features_from=64 block_positions=1 part_positions=1 {lists}"]
+    for k, v in (edit or {}).items():
+        lines = [v if x.startswith(k) else x for x in lines]
+    return "\n".join(lines) + "\n"
+
+
+def quiet(fn, *args):
+    """`fn(*args)` with its stdout kept: (its value or None, the exit status it raised or None, the
+    text)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        try:
+            return fn(*args), None, out.getvalue()
+        except SystemExit as e:
+            return None, e.code, out.getvalue()
+
+
+def cut_of(sqlite, runlog):
+    run = read_runlog(runlog)
+    tr = Trace(sqlite)
+    eager, replay = prompt_window(tr, run)
+    plan, runs, _ = batch_plan(run, None)
+    en = entries(tr, eager, replay)
+    busy_of = Busy([(k["s"], k["e"]) for k in tr.kernels] + [(c["s"], c["e"]) for c in tr.copies])
+    lbs, head = cut_layer_batches(en, plan, runs)
+    for lb in lbs:
+        phases(en, lb)
+    measure(en, lbs, head, busy_of, 8e3)
+    return en, lbs
+
+
+def cmd_self_test(argv):
+    keep = opt(argv, "--keep", None)
+    fails, checks = [], 0
+
+    def check(ok, what):
+        nonlocal checks
+        checks += 1
+        if not ok:
+            fails.append(what)
+
+    one = [[0, 8, 16, 24, 32, 40, 48, 56, 64]]
+    with tempfile.TemporaryDirectory() as d:
+        for timed in (False, True):
+            syn = Synth(timed)
+            calls = syn.call_of(one, 2)
+            db, log = os.path.join(d, f"one-{timed}.sqlite"), os.path.join(d, f"one-{timed}.txt")
+            syn.write(db)
+            with open(log, "w") as f:
+                f.write(syn_runlog(calls, 1, 3))
+            if keep and not timed:
+                os.makedirs(keep, exist_ok=True)
+                syn.write(os.path.join(keep, "synthetic-pp64.sqlite"))
+                with open(os.path.join(keep, "synthetic-pp64.txt"), "w") as f:
+                    f.write(syn_runlog(calls, 1, 3))
+            got, rc, text = quiet(cut_of, db, log)
+            check(rc is None, f"timed={timed}: the cut refused: {text.strip()}")
+            if rc is not None:
+                continue
+            en, lbs = got
+            check([lb["units"] for lb in lbs] == [1, 2, 1], f"timed={timed}: units {[lb['units'] for lb in lbs]}, "
+                                                             f"the plan's block sub-blocks [1, 2, 1]")
+            check(all(lb["form"] == "sub" and lb["irregular"] == 0 for lb in lbs),
+                  f"timed={timed}: a layer-batch in another form or with a unit lacking its projections")
+            roles = [{r: en[i]["corr"] for r, i in lb["roles"][k].items()} for lb in lbs for k in range(lb["units"])
+                     if k in lb["roles"]]
+            check(roles == syn.roles, f"timed={timed}: the four projections {roles}, written {syn.roles}")
+            seen = set()
+            for lb in lbs:
+                for i in range(lb["lo"], lb["hi"] + 1):
+                    if en[i]["act"] is None:
+                        continue
+                    seen.add(en[i]["corr"])
+                    t, w = term_of(en, lb, i, lb["roles"]), syn.want.get(en[i]["corr"])
+                    check(t == w, f"timed={timed}: layer {lb['layer']} launch {i - lb['lo']} "
+                                  f"{en[i]['kernel'] or en[i]['copy']}: term {t}, written {w}")
+            check(not set(syn.want) - seen, f"timed={timed}: {len(set(syn.want) - seen)} written launches in no "
+                                            f"layer-batch")
+            _, rc, text = quiet(cmd_tables, [db, "64", "2", log])
+            check(rc is None and "0 sub-blocks without the four projections" in text,
+                  f"timed={timed}: tables rc {rc}: {text.strip()[-300:]}")
+            _, rc, text = quiet(cmd_ncu_plan, [db, "64", log, os.path.join(d, "ncu.plan")])
+            check(rc == 3 and "per sub-block" in text, f"timed={timed}: ncu-plan rc {rc}: {text.strip()[-200:]}")
+        # The plan's sub-blocks held to the trace: another cut of layer 1's block with the same
+        # norm_quant count, one with another count, one whose sum is not the block.
+        for edit, want in ((("call lb b=0 layer=1", "call lb b=0 layer=1 run=0 full=2 part_sb=[2] full_sb=[2,4]"),
+                            f"{KV_APPEND} launches"),
+                           (("call lb b=0 layer=1", "call lb b=0 layer=1 run=0 full=2 part_sb=[2] full_sb=[4,1,1]"),
+                            f"{NORM} launches between"),
+                           (("call lb b=0 layer=1", "call lb b=0 layer=1 run=0 full=2 part_sb=[2] full_sb=[4]"),
+                            "`call lb b=0 layer=1` record")):
+            syn = Synth(False)
+            calls = syn.call_of(one, 2)
+            db, log = os.path.join(d, "edit.sqlite"), os.path.join(d, "edit.txt")
+            if os.path.exists(db):
+                os.remove(db)
+            syn.write(db)
+            with open(log, "w") as f:
+                f.write(syn_runlog(calls, 1, 3, dict([edit])))
+            _, rc, text = quiet(cut_of, db, log)
+            check(rc == 3 and want in text, f"{edit[1]}: rc {rc}, {text.strip()[-200:]}")
+        # A group of two batches interleaves its layer-batches: refused by name.
+        syn = Synth(False)
+        calls = syn.call_of([[0, 8, 16, 24, 32], [32, 40, 48, 56, 64]], 2)
+        db, log = os.path.join(d, "group.sqlite"), os.path.join(d, "group.txt")
+        syn.write(db)
+        with open(log, "w") as f:
+            f.write(syn_runlog(calls, 2, 5))
+        _, rc, text = quiet(cut_of, db, log)
+        check(rc == 3 and "interleaves its layer-batches" in text, f"a group of two: rc {rc}, {text.strip()[-200:]}")
+    for f in fails:
+        print(f"self-test FAIL: {f}")
+    print(f"self-test: {'ok' if not fails else 'FAIL'} ({checks} checks, {len(fails)} failures)")
+    return 1 if fails else 0
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("tables", "ncu-plan", "ncu-summary"):
+    cmds = {"tables": cmd_tables, "ncu-plan": cmd_ncu_plan, "ncu-summary": cmd_ncu_summary,
+            "self-test": cmd_self_test}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         print(__doc__)
         raise SystemExit(64)
-    cmd = {"tables": cmd_tables, "ncu-plan": cmd_ncu_plan, "ncu-summary": cmd_ncu_summary}[sys.argv[1]]
-    raise SystemExit(cmd(sys.argv[2:]))
+    raise SystemExit(cmds[sys.argv[1]](sys.argv[2:]))
 
 
 if __name__ == "__main__":

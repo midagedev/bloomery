@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Orphan collector for one track's remote directory. Runs ON THE BOX — either through
-# tools/box.sh (`just box-gc`) or piped over ssh stdin (`ssh box 'bash -s -- --dry-run <dir>'
-# < tools/box-gc.sh`, which is how box-tracks.sh reuses it without the script being there).
+# Orphan collector for one track's remote directory. Runs ON THE BOX, piped over ssh stdin, so the
+# script need not be there: `just box-gc` sends it through tools/box.sh's read-only path (which syncs
+# nothing and runs in the remote directory as it is), box-tracks.sh over plain ssh (`ssh box 'bash -s
+# -- --dry-run <dir>' < tools/box-gc.sh`).
 #
 #   bash tools/box-gc.sh [--dry-run|--check|--kill] [root]     root defaults to $PWD
 #

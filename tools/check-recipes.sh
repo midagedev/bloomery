@@ -105,6 +105,12 @@ with open(classes, encoding="utf-8") as fh:
         deps = list(dep_builds(f[0], set()))
         if deps:
             via_dep.append(f"{f[0]} ({', '.join(deps)})")
+run = sorted(n for n in recipes if n.startswith("gate-") and re.search(r"\bcargo (?:oxide )?run\b", body(n)))
+if run:
+    print("check-recipes: a gate-* recipe runs its binary with `cargo run` — no bound and no runner's exit code; "
+          "build it and run it through tools/host-gate.sh or tools/gpu-gate.sh:", file=sys.stderr)
+    print("\n".join(f"  {n}" for n in run), file=sys.stderr)
+    sys.exit(1)
 if bad:
     print("check-recipes: a timed recipe builds before its card check — put {{precheck}} first in its box "
           "command (a forgotten card then costs no build):", file=sys.stderr)
@@ -123,4 +129,33 @@ if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
   exit 1
 fi
 echo "${cards##*$'\n'}"
+# Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
+# that grows one is listed here, and the comparison below fails on one that is not.
+selftests=(
+  "tools/bloomery/manifest.py --self-test"
+  "tools/flow/ds41_prefill.py --self-test"
+  "tools/ref/check-int-twins.py --self-test"
+  "tools/ref/draft-accept.py --self-test"
+  "tools/ref/ds41pp.py self-test"
+  "tools/ref/router-coverage.py --self-test"
+  "tools/ref/router-hotlist.py --self-test"
+  "tools/ref/window-union.py --self-test"
+)
+root="$(cd "$(dirname "$0")/.." && pwd)"
+listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
+found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
+if [ "$listed" != "$found" ]; then
+  echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
+  diff <(echo "$listed") <(echo "$found") >&2 || true
+  exit 1
+fi
+for t in "${selftests[@]}"; do
+  read -r f arg <<< "$t"
+  if ! out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
+    echo "$out" >&2
+    echo "check-recipes: $f $arg failed" >&2
+    exit 1
+  fi
+done
+echo "check-recipes: ${#selftests[@]} tool self-tests ok"
 echo "check-recipes: ok"

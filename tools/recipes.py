@@ -24,7 +24,11 @@ A recipe's inputs are:
     workspace dependencies — feature-aware, so an optional dependency counts only when the recipe's
     `--features` enable it, dev-dependencies only for test targets — each package's Cargo.toml and
     build script, and repository paths named by a whole string literal (`"../../tools/ref/prompts.tsv"`
-    joined to CARGO_MANIFEST_DIR is read at run time and is in no dep-info);
+    joined to CARGO_MANIFEST_DIR is read at run time and is in no dep-info). A module declared under
+    `#[cfg(test)]` (or `cfg(all(…, test, …))`), and whatever it includes or names, belongs to the test
+    builds of its own target — a lib's test target (`--lib` under cargo test, `--tests`,
+    `--all-targets`), a test, a bench, and a bin's or example's own tree — never to the lib as a
+    dependency sees it;
   - on the box's last build, the bin's top-level dep-info (`target/release/<bin>.d`, which lists every
     local source file of the binary) — a cross-check of the walk, and a union with it;
   - the scripts the recipe text names (`tools/**`, `crates/*/tools/**`) and, transitively, the repository
@@ -384,6 +388,14 @@ def recipe_commands(recipe: Recipe) -> RecipeCommands:
         if not stripped or stripped.startswith("#"):
             continue
         local = shell_words(stripped)
+        # A repository file on a Mac-side `<` is read by the command (a script over ssh's stdin:
+        # `tools/box.sh 'bash -s' < tools/box-gc.sh`); simple_commands drops redirect targets.
+        for w, nxt in zip(local, local[1:]):
+            if w == "<" and re.match(r"^(\./)?(tools|crates)/", nxt):
+                p = _norm(nxt)
+                rc.paths.append(p)
+                if p.endswith(_SCRIPT_EXT):
+                    rc.scripts.append(p)
         for cmd in simple_commands(local):
             env, rest = strip_wrappers(cmd)
             if rest and _norm(rest[0]) == "tools/box.sh":
@@ -454,6 +466,17 @@ def cargo_metadata(root: str) -> dict:
     return json.loads(proc.stdout)
 
 
+@dataclass
+class ModuleTree:
+    """One target root's module tree (`Tree.walk`): its files and (file, literal) repository-path
+    literals, and apart from them the ones only a module under `#[cfg(test)]` reaches."""
+
+    files: set[str]
+    literals: list[tuple[str, str]]
+    test_files: set[str]
+    test_literals: list[tuple[str, str]]
+
+
 def _kind_of(kinds: list[str]) -> str:
     for k in kinds:
         if k in ("lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"):
@@ -507,7 +530,7 @@ class Tree:
                 deps=deps,
                 targets=targets,
             )
-        self._walk_cache: dict[str, tuple[set[str], list[tuple[str, str]]]] = {}
+        self._walk_cache: dict[str, ModuleTree] = {}
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
 
@@ -528,21 +551,50 @@ class Tree:
     _PATH = re.compile(r"#\[\s*path\s*=\s*\"([^\"]+)\"\s*\]")
     _INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?!\s*\(\s*\"([^\"]+)\"\s*\)")
     _LITERAL = re.compile(r"\"(/?(?:\.\./)*(?:tools|crates|docs)/[A-Za-z0-9_./-]+)\"")
+    _CFG = re.compile(r"^#\[\s*cfg\s*\((.*)\)\s*\]$")
 
-    def walk(self, src: str) -> tuple[set[str], list[tuple[str, str]]]:
-        """The module tree rooted at `src`: its files, and (file, literal) repository-path literals."""
-        files: set[str] = set()
-        literals: list[tuple[str, str]] = []
-        self._walk(src, os.path.dirname(src), files, literals)
-        return files, literals
+    @staticmethod
+    def cfg_test(attr: str) -> bool:
+        """Whether a one-line `#[cfg(…)]` holds in test builds only: `test`, or `all(…)` with `test`
+        among its own items. Any other predicate (`any(test, …)`, `not(…)`, a feature) does not, and a
+        multi-line attribute is not read: the item stays in every build."""
+        m = Tree._CFG.match(attr)
+        if not m:
+            return False
+        pred = m.group(1).strip()
+        if pred == "test":
+            return True
+        a = re.match(r"^all\s*\((.*)\)$", pred)
+        if not a:
+            return False
+        items, depth, cur = [], 0, ""
+        for ch in a.group(1):
+            if ch == "," and depth == 0:
+                items.append(cur.strip())
+                cur = ""
+                continue
+            depth += (ch == "(") - (ch == ")")
+            cur += ch
+        items.append(cur.strip())
+        return "test" in items
 
-    def _walk(self, rel: str, moddir: str, files: set[str], literals: list[tuple[str, str]]) -> None:
-        if rel in files:
+    def walk(self, src: str) -> ModuleTree:
+        """The module tree rooted at `src`. A module declared under a test-only `cfg` (`cfg_test`),
+        file or inline, and what it declares, includes and names go to the test side; a file reached
+        both ways is on the build side."""
+        acc = ModuleTree(set(), [], set(), [])
+        self._walk(src, os.path.dirname(src), acc, False)
+        acc.test_files -= acc.files
+        return acc
+
+    def _walk(self, rel: str, moddir: str, acc: ModuleTree, test: bool) -> None:
+        if rel in acc.files or (test and rel in acc.test_files):
             return
-        files.add(rel)
+        (acc.test_files if test else acc.files).add(rel)
         fdir = os.path.dirname(rel)
         pending_path: str | None = None
-        inline: list[tuple[int, str]] = []
+        pending_test = False  # a test-only `#[cfg]` since the last item: the next module is test-only
+        inline: list[tuple[int, str, bool]] = []  # (indent, name, test-only)
         attr_depth = 0  # open brackets of a multi-line attribute (`#[allow(\n…\n)]`)
         for line in self.read(rel).split("\n"):
             s = line.strip()
@@ -555,12 +607,13 @@ class Tree:
             if s == "}" and inline and inline[-1][0] == indent:
                 inline.pop()
                 continue
+            here = inline[-1][2] if inline else test
             for lit in self._LITERAL.findall(line):
-                literals.append((rel, lit))
+                (acc.test_literals if here else acc.literals).append((rel, lit))
             for inc in self._INCLUDE.findall(line):
                 p = os.path.normpath(os.path.join(fdir, inc))
                 if self.exists(p):
-                    files.add(p)
+                    (acc.test_files if here else acc.files).add(p)
                 else:
                     self.unresolved.append(f"{rel}: include of {inc} ({p} not found)")
             pm = self._PATH.search(line)
@@ -572,8 +625,10 @@ class Tree:
             if m:
                 name = m.group(2)
                 path_attr = pm.group(1) if pm else pending_path
+                child_test = here or pending_test
                 pending_path = None
-                inner = [n for (i, n) in inline if i < indent]
+                pending_test = False
+                inner = [n for (i, n, _) in inline if i < indent]
                 if path_attr is not None:
                     base = os.path.join(fdir, *inner) if inner else fdir
                     child = os.path.normpath(os.path.join(base, path_attr))
@@ -581,7 +636,7 @@ class Tree:
                         self.unresolved.append(f"{rel}: #[path = \"{path_attr}\"] mod {name} ({child} not found)")
                         continue
                     # a #[path] file is a mod-rs file: its children live beside it
-                    self._walk(child, os.path.dirname(child), files, literals)
+                    self._walk(child, os.path.dirname(child), acc, child_test)
                     continue
                 base = os.path.join(moddir, *inner) if inner else moddir
                 cand = [os.path.normpath(os.path.join(base, name + ".rs")), os.path.normpath(os.path.join(base, name, "mod.rs"))]
@@ -590,21 +645,29 @@ class Tree:
                     self.unresolved.append(f"{rel}: mod {name} (neither {cand[0]} nor {cand[1]})")
                     continue
                 child_dir = os.path.dirname(hit) if hit.endswith("mod.rs") else hit[: -len(".rs")]
-                self._walk(hit, child_dir, files, literals)
+                self._walk(hit, child_dir, acc, child_test)
                 continue
             if im:
-                inline.append((len(im.group(1)), im.group(2)))
+                inline.append((len(im.group(1)), im.group(2), here or pending_test))
                 pending_path = None
+                pending_test = False
                 continue
             if s.startswith("#["):
+                pending_test = pending_test or self.cfg_test(s)
                 attr_depth = max(0, s.count("[") - s.count("]"))
                 continue
             pending_path = None
+            pending_test = False
 
-    def tree_of(self, src: str) -> tuple[set[str], list[tuple[str, str]]]:
+    def tree_of(self, src: str, test: bool = False) -> tuple[set[str], list[tuple[str, str]]]:
+        """`src`'s module tree as one build of it sees it: a test build (`test`) with its test-only
+        modules, any other build without them."""
         if src not in self._walk_cache:
             self._walk_cache[src] = self.walk(src)
-        return self._walk_cache[src]
+        w = self._walk_cache[src]
+        if test:
+            return w.files | w.test_files, w.literals + w.test_literals
+        return w.files, w.literals
 
     # ---------------- features and dependencies ----------------
 
@@ -700,7 +763,10 @@ class Tree:
         return seen
 
     def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False) -> dict[str, str]:
-        """file -> origin for one target. kind: lib bin test example bench doctest libtest."""
+        """file -> origin for one target. kind: lib bin test example bench doctest libtest. The
+        target's own test-only modules count for every kind but `lib` and `doctest` (rustdoc sets no
+        cfg(test)); for a bin or an example that is also its plain build, an over-selection confined to
+        its own recipes. Every lib it links, its own package's included, is seen without them."""
         pkg = self.packages[pkg_name]
         out: dict[str, str] = {}
         dev = kind in ("test", "bench", "doctest", "libtest", "example")
@@ -712,7 +778,7 @@ class Tree:
             label = f"{kind} {name}"
         if own is None:
             raise RecipeError(f"{pkg_name} has no {kind} target {name or ''}".rstrip())
-        files, lits = self.tree_of(own.src)
+        files, lits = self.tree_of(own.src, test=kind not in ("lib", "doctest"))
         for f in files:
             out[f] = f"{pkg_name} {label}"
         for f in self._resolve_literals(pkg, lits):
@@ -761,9 +827,12 @@ class Tree:
             if inv.packages:
                 for u in unknown:
                     errors.append(f"--features {u}: {pname} has no such feature")
+            # features from a recipe parameter are known at run time only, where cargo refuses a bin
+            # whose required features they lack
+            param = any("{{" in f for f in inv.features)
 
             def req_ok(t: TargetMeta) -> bool:
-                return inv.all_features or set(t.required) <= enabled
+                return inv.all_features or param or set(t.required) <= enabled
 
             def add(kind: str, t: TargetMeta | None, name: str | None) -> None:
                 out.append((pname, kind, name, feats))
@@ -819,7 +888,9 @@ class Tree:
                     for t in pkg.targets:
                         if t.kind == k and req_ok(t):
                             add(k, t, t.name)
-                    if kind == "tests" and test and pkg.lib() is not None and not implicit:
+                    # `--tests` (and `--all-targets`) compile the lib's test target under check, clippy
+                    # and build as well as under test
+                    if kind == "tests" and pkg.lib() is not None and not implicit:
                         add("libtest", pkg.lib(), None)
         return out, errors
 
@@ -2335,6 +2406,8 @@ def self_test() -> int:
         fails.append("unknown cargo option accepted")
     except RecipeError:
         pass
+    rc = recipe_commands(Recipe("x", ["BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash -s -- {{ARGS}}' < tools/box-gc.sh"], [], ""))
+    expect(rc.box and rc.scripts == ["tools/box-gc.sh"], f"a script over stdin: scripts {rc.scripts}")
 
     # the real tree
     side = make_side(ROOT)
@@ -2372,6 +2445,58 @@ def self_test() -> int:
     cases = sel("crates/tokenizer/tests/cases.txt")
     expect(cases == {"gate-tokenizer"}, f"tokenizer cases.txt (read by oracle.sh) selects {sorted(cases)}")
     expect(len(sel("tools/box.sh")) == len(gates), "tools/box.sh does not select every gate")
+    # a #[cfg(test)] module's includes belong to the recipes that run that lib's tests: levers' tests.rs
+    # (a file module) reads levers-direct.txt, gpu-gates' record.rs (an inline one) the record schemas;
+    # check and lint compile both (--all-targets)
+    lev = sel("tools/levers-direct.txt")
+    expect(lev == {"gate-levers"}, f"tools/levers-direct.txt selects {sorted(lev)}")
+    schema = sel("tools/bloomery/schema/generate_ds41.jsonl")
+    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld"}, f"a record schema selects {sorted(schema)}")
+    for n in ("check", "lint"):
+        expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
+
+    # the walk on a synthetic tree: a file module and an inline one under #[cfg(test)], cfg(all(test, …)),
+    # cfg(any(test, …)) (not test-only), a file reached both ways, and a dependent's view of the lib
+    with tempfile.TemporaryDirectory(prefix="recipes-cfgtest-") as tmp:
+        def put(rel: str, text: str = "") -> None:
+            p = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        put("p/Cargo.toml")
+        put("q/Cargo.toml")
+        put(
+            "p/src/lib.rs",
+            '#[cfg(all(feature = "x", test))]\n#[path = "a.rs"]\nmod a_again;\nmod a;\n#[cfg(test)]\nmod tests;\n'
+            '#[cfg(all(test, feature = "x"))]\nmod c;\n#[cfg(any(test, feature = "x"))]\nmod b;\n#[cfg(test)]\n'
+            '#[allow(dead_code)]\nmod inline {\n    const I: &str = include_str!("../data/inline.txt");\n}\n'
+            'const N: &str = include_str!("../data/normal.txt");\n',
+        )
+        put("p/src/tests.rs", 'mod deep;\nconst T: &str = include_str!("../data/test.txt");\n')
+        put("p/src/tests/deep.rs", 'const D: &str = "../tools/deep.txt";\n')
+        for f in ("p/src/a.rs", "p/src/b.rs", "p/src/c.rs", "p/data/normal.txt", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt", "q/src/main.rs"):
+            put(f)
+
+        def pkg(name: str, kind: str, src: str, deps: list[str]) -> dict:
+            return {
+                "id": name,
+                "name": name,
+                "manifest_path": os.path.join(tmp, name, "Cargo.toml"),
+                "features": {},
+                "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in deps],
+                "targets": [{"kind": [kind], "name": name, "src_path": os.path.join(tmp, name, src)}],
+            }
+
+        meta = {"workspace_root": tmp, "workspace_members": ["p", "q"], "packages": [pkg("p", "lib", "src/lib.rs", []), pkg("q", "bin", "src/main.rs", ["p"])]}
+        st = Tree(tmp, meta)
+        only_test = {"p/src/tests.rs", "p/src/tests/deep.rs", "p/src/c.rs", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt"}
+        built = {"p/src/lib.rs", "p/src/a.rs", "p/src/b.rs", "p/data/normal.txt"}
+        lib, libtest, dep = (set(st.target_files(*t, [])) for t in (("p", "lib", None), ("p", "libtest", None), ("q", "bin", "q")))
+        expect(built <= lib and not lib & only_test, f"cfg(test) walk: the lib build reads {sorted(lib & only_test)}, misses {sorted(built - lib)}")
+        expect(built | only_test <= libtest, f"cfg(test) walk: the lib tests miss {sorted((built | only_test) - libtest)}")
+        expect(built <= dep and not dep & only_test, f"cfg(test) walk: a dependent reads {sorted(dep & only_test)}, misses {sorted(built - dep)}")
+        expect(not st.unresolved, f"cfg(test) walk: unresolved {st.unresolved[:2]}")
 
     # FAIL-first on a mutated justfile: a typo'd --bin, --test, -p, feature and runner name
     with open(os.path.join(ROOT, "justfile"), encoding="utf-8") as fh:
@@ -2398,6 +2523,17 @@ def self_test() -> int:
                 fh.write(text[:start] + bad + text[end:])
             probs = check(Tree(ROOT), load_justfile(p))
             expect(any(bad in x for x in probs), f"mutation {bad} not caught: {probs[:2]}")
+        # a feature-gated bin built without its feature: cargo refuses it (required-features), and so
+        # does the check, before the recipe runs
+        m = re.search(r"--features deepseek41 (--release --bin generate_ds41)", text)
+        if m is None:
+            fails.append("no mutation anchor for the generate_ds41 build")
+        else:
+            p = os.path.join(tmp, "justfile")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text[: m.start()] + "--features gpu " + m.group(1) + text[m.end() :])
+            probs = check(Tree(ROOT), load_justfile(p))
+            expect(any("--bin generate_ds41: needs features ['deepseek41']" in x for x in probs), f"generate_ds41 without deepseek41 not caught: {probs[:2]}")
 
     # a changed recipe text selects that recipe and no other
     import copy

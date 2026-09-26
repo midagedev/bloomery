@@ -68,10 +68,239 @@ deepseek41 = [
 ]
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 
+# A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
+# feature before it links anything, instead of linking the feature-off stub `main` over the working
+# target/release/<bin>. The bins not named here are found in src/bin/ and need no feature.
 [[bin]]
 name = "bloomery-chat"
 path = "src/bin/bloomery_chat.rs"
+required-features = ["deepseek41"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
 path = "src/bin/bloomery_serve_ds41.rs"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_attn"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_chain_attn"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_chain_ffn"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_chain_glue"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_comp"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_dsloop"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_engram"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_hc"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_index"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_load"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_long"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_moe"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_prefill"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_rope"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_skew"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_step"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_woa"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_ds41_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_dspark_experts"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_dspark_graph"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_dspark_hc"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_dspark_kv"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_mcol"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "generate_ds41"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "cnode_probe"
+required-features = ["gpu"]
+
+[[bin]]
+name = "forced_probe"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_e2e"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_gemm"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_head_gpu"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_hybrid"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_iq"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_load_v41"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_moe_fused"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p0b"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p1"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p10"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p2"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p3"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p4"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p5"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p6"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p8"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p8b"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_p9"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_q4k_sel"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_down"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_e2e"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_experts"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_flash"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_qknorm"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_rope"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_qwen3moe_router"
+required-features = ["gpu"]
+
+[[bin]]
+name = "generate"
+required-features = ["gpu"]
+
+[[bin]]
+name = "generate_qwen3moe"
+required-features = ["gpu"]
+
+[[bin]]
+name = "oxart_jit"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_vision_encoder"
+required-features = ["vision"]

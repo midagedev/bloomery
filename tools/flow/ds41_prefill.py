@@ -581,7 +581,7 @@ def union_kernel(p, cfg):
     return p["a_union"], p["c_union"]
 
 
-GU_SLOT_BYTES = 2 * 2304 * 4 + 2664   # the combine re-reads a slot's gate/up (f32) and writes qc (moe.rs D3)
+GU_SLOT_BYTES = 2 * 2304 * 4 + 2664   # the combine re-reads a slot's gate/up (f32) and writes qc (model/src/ops.rs UnionCall::combine)
 
 
 def cause_terms(p, flow, K, slots, touched, T, f, a, c):

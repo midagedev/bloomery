@@ -566,9 +566,17 @@ int main(int argc, char ** argv) {
     }
 
     // This binary's side effect is an oracle set: without BLOOMERY_REF_WRITE=1 it writes nothing
-    // (dump_ref's rule, for the reason its header gives), and it never picks its own directory.
-    const char * ref_dir = getenv("BLOOMERY_REF_DIR");
-    if (!getenv("BLOOMERY_REF_WRITE") || !ref_dir || !*ref_dir) {
+    // (dump_ref's rule, for the reason its header gives), and it never picks its own directory. The
+    // value is read, not the presence: exactly 1 writes, unset or 0 is the refusal below, and any
+    // other value is refused by name.
+    const char * ref_dir   = getenv("BLOOMERY_REF_DIR");
+    const char * write_env = getenv("BLOOMERY_REF_WRITE");
+    if (write_env && strcmp(write_env, "0") != 0 && strcmp(write_env, "1") != 0) {
+        fprintf(stderr, "dump_draft: BLOOMERY_REF_WRITE is 1 (write the draft oracle set) or 0 or unset (refuse), got '%s'\n",
+                write_env);
+        return 64;
+    }
+    if (!write_env || strcmp(write_env, "1") != 0 || !ref_dir || !*ref_dir) {
         fprintf(stderr,
                 "dump_draft: refusing to run -- this tool writes the draft oracle set. It is not a general ik\n"
                 "            harness; tools/ref/dump-draft.sh sets BLOOMERY_REF_WRITE=1 and BLOOMERY_REF_DIR to a\n"

@@ -59,8 +59,10 @@
 # which activity it is full, the calls longer than BLOOMERY_NSYS_BLOCKED_US µs, default 8, after and
 # before that, and the queue model at those values). ds41pp.py's header has the cut. The profile writes
 # <out>.meta beside the report (the binary's sha256, P, N, the command, the hot list): the ncu ds41pp
-# form reads it and the sqlite to derive its launch skip. `--analyze <sqlite> <P> <n> <run log>` under
-# BLOOMERY_NSYS_FORM=prefill re-prints the tables (the run log is required: the cut reads it).
+# form reads it and the sqlite to derive its launch skip. `--analyze <sqlite> <P> <n> <run log> [--plan FILE]`
+# under BLOOMERY_NSYS_FORM=prefill re-prints the tables (the run log is required: the cut reads it); --plan
+# FILE is the call's plan for a run log from before the engine printed it (`generate_ds41 --plan` with the
+# run's arguments, or tools/flow/plans/), handed to ds41pp.py.
 #
 # Environment: BLOOMERY_NSYS_N (N, default 8, 2 in the prefill form), BLOOMERY_NSYS_LAST (replays
 # tabled, default 8), BLOOMERY_NSYS_TOP (kernel rows, default 24), BLOOMERY_NSYS_OUT (default
@@ -273,15 +275,22 @@ if dec:
 PY
 }
 
-# The prefill form's tables: sqlite, P, n, the run log.
+# The prefill form's tables: sqlite, P, n, the run log, then ds41pp.py's --plan FILE when given.
 analyze_prefill() {
-  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$PP" tables "$1" "$2" "$3" "$4" --layer "$LAYER" --blocked-us "$BLOCKED_US"
+  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$PP" tables "$@" --layer "$LAYER" --blocked-us "$BLOCKED_US"
 }
 
 if [ "${1:-}" = --analyze ]; then
   if [ "$FORM" = prefill ]; then
-    [ $# -ge 5 ] || { echo "usage: BLOOMERY_NSYS_FORM=prefill nsys-ds41.sh --analyze <sqlite> <P> <n> <run log>" >&2; exit 64; }
-    analyze_prefill "$2" "$3" "$4" "$5"
+    usage="usage: BLOOMERY_NSYS_FORM=prefill nsys-ds41.sh --analyze <sqlite> <P> <n> <run log> [--plan FILE]"
+    case $# in
+      5) PLAN=() ;;
+      7) [ "$6" = --plan ] || { echo "$usage (got '$6' after the run log)" >&2; exit 64; }
+         [ -f "$7" ] || { echo "nsys-ds41.sh: --plan $7 is not a file" >&2; exit 64; }
+         PLAN=(--plan "$7") ;;
+      *) echo "$usage" >&2; exit 64 ;;
+    esac
+    analyze_prefill "$2" "$3" "$4" "$5" "${PLAN[@]}"
     exit $?
   fi
   [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth> <n> [<run log>]" >&2; exit 64; }

@@ -552,8 +552,16 @@ int main(int argc, char ** argv) {
     // "never run dump_ref yourself" and the spec was not the right place for that rule --
     // the round was not reaching for the dumper, it was reaching for the one binary that
     // links ik and takes --tokens. So the rule lives here instead, where it cannot be
-    // missed: without BLOOMERY_REF_WRITE=1 this tool refuses to write anything.
-    if (!getenv("BLOOMERY_REF_WRITE")) {
+    // missed: without BLOOMERY_REF_WRITE=1 this tool refuses to write anything. The value is
+    // read, not the presence: exactly 1 writes, unset or 0 is the refusal below, and any other
+    // value is refused by name.
+    const char * write_env = getenv("BLOOMERY_REF_WRITE");
+    if (write_env && strcmp(write_env, "0") != 0 && strcmp(write_env, "1") != 0) {
+        fprintf(stderr, "dump_ref: BLOOMERY_REF_WRITE is 1 (write the oracle set) or 0 or unset (refuse), got '%s'\n",
+                write_env);
+        return 64;
+    }
+    if (!write_env || strcmp(write_env, "1") != 0) {
         fprintf(stderr,
                 "dump_ref: refusing to run -- this tool OVERWRITES the oracle reference set,\n"
                 "          which every gate in this repo reads. It is not a general ik harness.\n"

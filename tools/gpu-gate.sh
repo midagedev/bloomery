@@ -16,10 +16,9 @@ set -uo pipefail
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
 shift
-BOUND=${BLOOMERY_GATE_BOUND:-900}
-case "$BOUND" in
-  '' | *[!0-9]* | 0) echo "gpu-gate.sh: BLOOMERY_GATE_BOUND must be a positive integer, got '$BOUND'" >&2; exit 64 ;;
-esac
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
+gate_bound gpu-gate.sh || exit $?
 EXE=./target/release/$NAME
 [ -x "$EXE" ] || { echo "gpu-gate.sh: no $EXE — the recipe builds it before calling this" >&2; exit 2; }
 # 카드 고르기. 락은 카드마다 하나: 3090은 예전 경로 그대로(돌고 있는 트랙의 옛 사본이 그 경로를 잡는다),

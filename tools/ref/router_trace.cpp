@@ -598,7 +598,15 @@ int main(int argc, char ** argv) {
     std::vector<char *> passthrough;
     if (!parse_options(argc, argv, o, passthrough)) return 2;
 
-    if (!getenv("BLOOMERY_ROUTER_WRITE")) {
+    // The value is read, not the presence: exactly 1 writes, unset or 0 is the refusal below, and
+    // any other value is refused by name.
+    const char * write_env = getenv("BLOOMERY_ROUTER_WRITE");
+    if (write_env && strcmp(write_env, "0") != 0 && strcmp(write_env, "1") != 0) {
+        fprintf(stderr, "router_trace: BLOOMERY_ROUTER_WRITE is 1 (write the trace set) or 0 or unset (refuse), got '%s'\n",
+                write_env);
+        return 64;
+    }
+    if (!write_env || strcmp(write_env, "1") != 0) {
         fprintf(stderr,
                 "router_trace: refusing to run -- this tool writes a router trace set under\n"
                 "              $BLOOMERY_DATA/router/ and pages in most of the model file set.\n"

@@ -20,7 +20,7 @@ f32 파일 27개(`ffn_moe_gate_par` 26개와 `ffn_up_gate` 하나)가 두 실행
 
 | 층 | 어디 | 무엇 |
 |---|---|---|
-| 구조적 봉쇄 | `dump_ref` main | `BLOOMERY_REF_WRITE=1` 없이는 **아무것도 쓰지 않고 exit 3**. 실측: 라운드가 쓴 그 호출이 그대로 거부된다 |
+| 구조적 봉쇄 | `dump_ref` main | `BLOOMERY_REF_WRITE=1` 없이는 **아무것도 쓰지 않고 exit 3**. 실측: 라운드가 쓴 그 호출이 그대로 거부된다. 가드는 값을 읽는다: 정확히 `1`이면 쓰고, 없거나 `0`이면 exit 3, 그 밖의 값(`yes`, `01`, 빈 값)은 이름을 대고 exit 64다. `dump_draft`(`BLOOMERY_REF_WRITE`)와 `router_trace`(`BLOOMERY_ROUTER_WRITE`)도 같다 |
 | 구조적 봉쇄 | `dump.sh` | `$BLOOMERY_DATA/ref.staging`에 쓰고 **성공했을 때만 교체**. 실패한 덤프는 값이 0이다 — 옛 `rm -f *.f32`가 사고를 "중복 실행"에서 "오라클 소실"로 키웠다 |
 | 구조적 봉쇄 | `dump_ref` | 매니페스트를 `.partial`에 쓰고 디코드가 반환한 뒤에만 rename. 중단된 실행이 이전 매니페스트를 0바이트로 자르지 못한다 |
 | 재발 방지 | `tests/common/oracle.rs` | 매니페스트에 `# complete` 트레일러가 없으면 **패닉**하고 `just dump-ref`를 이름한다. 파일 개수로는 못 잡는 것을 트레일러가 잡는다. FAIL-first 확인함 |

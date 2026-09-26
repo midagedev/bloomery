@@ -12,8 +12,12 @@
 #     꼴이었고, echo가 성공하므로 시험 실패든 타임아웃이든 레시피가 0으로 끝났다(같은 날 저녁 리뷰에서
 #     발견; 평범한 시험 실패에도 "TIMED OUT"이 찍혔다). 종료 코드의 소유자는 이 스크립트 하나다:
 #     cargo의 코드를 그대로 돌려주고, 타임아웃 문구는 타임아웃일 때만 찍는다.
+# The bound is BLOOMERY_GATE_BOUND, parsed by tools/gate-bound.sh: a value it refuses ends this runner
+# with 64 before cargo runs.
 set -uo pipefail
-BOUND=${BLOOMERY_GATE_BOUND:-900}
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
+gate_bound gate.sh || exit $?
 RUN=(cargo test)
 if [ "${1:-}" = --oxide ]; then
   shift

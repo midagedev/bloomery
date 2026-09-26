@@ -270,7 +270,7 @@ gate-gpu-ds41-chain-ffn:
 
 # P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
 gate-gpu-block:
-    ./tools/box.sh 'cargo run --release -p bloomery-gpu-gates --bin gate_block'
+    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin gate_block && bash tools/host-gate.sh gate_block'
 
 # P10: 가중치 상주 — 모델 파일의 모든 텐서를 커널이 먹는 디바이스 형식으로 올린다(정확성 실행, 측정 아님).
 gate-gpu-p10:
@@ -331,8 +331,15 @@ time-cpu-v41-host *ARGS:
 # 비교 전에 제외한다. 죽이는 것은 TERM → 5초 → KILL. 목록만 보려면 `just box-gc --dry-run`.
 # 이 트랙 원격 디렉터리 아래 실행 파일을 문 고아 프로세스를 죽인다. 병렬 트랙 시작·끝에 한 번씩.
 # 시팅의 가드를 지나간다(BLOOMERY_BOX_READONLY=1): 아무것도 빌드하지 않고, 찾는 고아가 임대를 쥔 그 프로세스일 수 있다.
+# 읽기는 아무것도 동기화하지 않으므로 스크립트를 stdin으로 보낸다: 이 트리의 box-gc.sh가 원격 디렉터리에서 있는 그대로 돈다.
+# 한 번도 동기화하지 않은 트랙에는 원격 디렉터리가 없다(box.sh의 66). 거기서 돈 것이 없으니 거둘 것도 없다.
 box-gc *ARGS='--kill':
-    BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash tools/box-gc.sh {{ARGS}}'
+    #!/usr/bin/env bash
+    set -uo pipefail
+    BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash -s -- {{ARGS}}' < tools/box-gc.sh
+    rc=$?
+    if [ "$rc" = 66 ]; then echo "box-gc: this track has no remote directory on the box (box.sh rc 66): nothing ran there, nothing to collect"; rc=0; fi
+    exit "$rc"
 
 # 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove`로 stale 삭제.
 box-tracks *ARGS:
@@ -883,6 +890,14 @@ gen-ds41 *ARGS:
 # (generate_ds41 --plan, placement (a), P 128/256/384/512/4096, CED on and off) into tools/flow/plans/. Loads nothing onto a card.
 records-refresh:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin gate_deepseek41_prefill >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 gate_deepseek41_prefill; do target/release/$b --records-schema; done && for P in 128 256 384 512 4096; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+
+# The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 --depth 512 -n 2 under
+# BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), once at the default group and once
+# under BLOOMERY_PREFILL_GROUP=1, each a tools/gpu-gate.sh run whose log goes to a file; then tools/flow/ds41_prefill.py
+# --counts on each log, which compares it layer-batch by layer-batch with the model's config for the log's `call plan`
+# (PG2 or PG1). Red unless both print `counts: equal`. Two loads; logs and --counts output in target/flowcounts-gate/.
+gate-gpu-ds41-flowcounts:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/flowcounts-gate && rm -rf $D && mkdir -p $D && BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 --place gate --depth 512 -n 2 > $D/g-default.log && BLOOMERY_STEP_STATS=1 BLOOMERY_PREFILL_GROUP=1 bash tools/gpu-gate.sh generate_ds41 --place gate --depth 512 -n 2 > $D/g1.log && { python3 tools/flow/ds41_prefill.py --counts $D/g-default.log > $D/g-default.counts; rd=$?; python3 tools/flow/ds41_prefill.py --counts $D/g1.log > $D/g1.counts; r1=$?; cat $D/g-default.counts $D/g1.counts; echo "--counts rc: default group $rd, BLOOMERY_PREFILL_GROUP=1 $r1"; [ "$rd" = 0 ] && [ "$r1" = 0 ] && grep -qx "counts: equal" $D/g-default.counts && grep -qx "counts: equal" $D/g1.counts && echo "gate-gpu-ds41-flowcounts: PASS"; }'
 
 # The served draft, bit for bit (3090, placement gate): generate_ds41 under BLOOMERY_DRAFT=lookup must emit the plain
 # run's tokens. Two prompts, both arms each, -n 64: the lcg depth-6 sequence, and the first 128 ids of the code corpus.

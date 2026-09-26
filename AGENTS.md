@@ -87,8 +87,10 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just measure-gpu  # quiet-machine GPU measurement, witnesses included
     just measure-cpu  # same for the CPU tier, serialized by a file lock
     just affected [BASE|A..B]  # the gate-* recipes a change touches, from the crate graph,
-                      # each target's module tree, the scripts a recipe names and the
-                      # cargo globals (tools/recipes.py, the parser check-recipes shares);
+                      # each target's module tree (a module under `#[cfg(test)]` belongs to
+                      # its own target's test build, not to the lib its dependents link), the
+                      # scripts a recipe names and the cargo globals (tools/recipes.py, the
+                      # parser check-recipes shares);
                       # Mac-only, builds nothing, runs nothing — it prints the list a
                       # landing batch runs, the `unmapped:` files no gate reads, and how
                       # old the box's dep-info of each selected bin is (read-only ssh;
@@ -175,9 +177,14 @@ that window. The exit code now has one owner, `tools/gate.sh`, and
 `just check-recipes` fails on a test recipe that carries `||` or a bare
 `cargo test`, and (through `tools/recipes.py check`, `cargo metadata` on the Mac, no build) on a
 `--bin`, `--test`, `-p` or feature that names nothing, a runner name the recipe does not build, a
-script not in the tree, or a `gate-*` recipe with no cargo target.) GPU gate binaries have the same bound through their own
+script not in the tree, a `gate-*` recipe with no cargo target, a bin built without its
+`required-features`, or a `gate-*` recipe that runs its binary with `cargo run` (no bound, no
+runner's exit code); it also runs every Python tool's self-test under `tools/`, and fails on a
+tool that grows one without being listed there.) GPU gate binaries have the same bound through their own
 runner, `tools/gpu-gate.sh`: it takes a card's gate lock, runs the
-binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`), and
+binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`: whole seconds from 1 up,
+one parser for the three runners in `tools/gate-bound.sh`; any other value, empty included,
+ends the runner with 64 before the binary runs), and
 returns the binary's exit code (124/137 timed out, 75 lock contention).
 There is one lock per card: `/root/bloomery-gate.lock` (the 3090) and
 `/root/bloomery-gate-a6000.lock`. `BLOOMERY_GATE_CARD=3090|a6000|any`
@@ -286,8 +293,10 @@ several runs puts its hold up first and exports `BLOOMERY_HOLD_OWNER=<owner>`,
 which passes its own hold only; of two holds up at once, the later one gives
 way. A command that builds nothing and must run beside a sitting (`ps`, `tail`,
 `nvidia-smi`, `just box-gc`) passes with `BLOOMERY_BOX_READONLY=1`, which
-refuses a command naming cargo, just, make, cmake, ninja or `target/`. The
-lease's one probe is `lease_free`, a shared lock: an exclusive `flock -n <lease>
+refuses a command naming cargo, just, make, cmake, ninja or `target/`. It
+syncs nothing — the command runs in the remote directory as it is, and one that
+is not there is refused (66) — so a script it needs goes over stdin (`just
+box-gc` sends `tools/box-gc.sh` that way). The lease's one probe is `lease_free`, a shared lock: an exclusive `flock -n <lease>
 true` is a take for a few ms and reads a free lease as held beside another
 probe (429 of 1,000 parallel probes on the box, 2026-09-26).
 
@@ -410,6 +419,11 @@ first suspect is a hung gate on the box, not the agent.
   share their shard names), of another ik build or architecture, or without its completion
   trailer. A new kind
   of set is a new family row with its writer's recipe, not a parser in the gate.
+- **A feature-gated bin says so to cargo.** A `crates/gpu-gates` bin whose `main` sits behind a
+  feature declares `required-features` in the crate's `Cargo.toml`: cargo refuses to build it
+  without them instead of linking the stub `main` over the working binary (twice a scan built a
+  host-only `generate_ds41` over a track's binary). `just check-recipes` holds every recipe's
+  features to them.
 - **Do not split a `#[target_feature]` kernel body into helpers** (measured:
   10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
   fits on two screens gets split.
