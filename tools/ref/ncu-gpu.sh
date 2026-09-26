@@ -172,7 +172,7 @@ case $FORM in
 esac
 
 # BLOOMERY_NCU_SOURCE=1 (the gemm and q3pp forms): the report kept as <out>.ncu-rep, and after the run,
-# GPU-free, its details page (only when the live CSV is empty) and its source page.
+# GPU-free, its details page (when the live CSV holds no metric row) and its source page.
 source_parse() {
   SOURCE=${BLOOMERY_NCU_SOURCE:-}
   case $SOURCE in
@@ -189,7 +189,7 @@ source_setup() {
 }
 source_dry() {
   [ -n "$SOURCE" ] || return 0
-  echo "[dry] then, when $1.csv is empty: ${DETAILS_CMD[*]} > $1.csv"
+  echo "[dry] then, when $1.csv holds no metric row: ${DETAILS_CMD[*]} > $1.csv"
   echo "[dry] then: ${SOURCE_CMD[*]} > $1.source.csv"
 }
 # source_pages <out>: the two pages after the run; a failure sets rc when the run's own rc is 0.
@@ -197,7 +197,11 @@ source_pages() {
   local src_rc
   [ -n "$SOURCE" ] || return 0
   if [ -s "$1.ncu-rep" ]; then
-    [ -s "$1.csv" ] || "${DETAILS_CMD[@]}" > "$1.csv" 2>> "$1.txt"
+    # With --export, ncu's --log-file holds only its ==PROF== lines: non-empty, no metric row.
+    if ! grep -q '^"ID",' "$1.csv" 2>/dev/null; then
+      [ ! -e "$1.csv" ] || cat "$1.csv" >> "$1.txt"
+      "${DETAILS_CMD[@]}" > "$1.csv" 2>> "$1.txt"
+    fi
     "${SOURCE_CMD[@]}" > "$1.source.csv" 2>> "$1.txt"
     src_rc=$?
     echo "[source] rc=$src_rc lines=$(wc -l < "$1.source.csv") report=$1.ncu-rep page=$1.source.csv"
