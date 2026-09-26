@@ -16,23 +16,25 @@
 //! odd super-block count needs no load-time repack (unlike Q3_K): the core's
 //! guarded tail runs the partial last four-super-block iteration.
 //!
-//! [`q4k_gemv_grouped`] reads each expert's rows once for all its slots,
-//! walking a table that groups the slots by expert; [`grouped_run`] is the
-//! one rule of that table's runs, shared with the other grouped kernels.
-//! Their input, the q8_1 form of each slot's own column, comes from
-//! [`Q4kSelKernels::enqueue_quantize_sel`]: it quantizes the columns of the
-//! slots whose place is on the card — the columns a routed gate·up wrote —
-//! and no other, so a column the host serves is never read, even by the
+//! The `_sel` down's input, the q8_1 form of each slot's own column, comes
+//! from [`Q4kSelKernels::enqueue_quantize_sel`]: it quantizes the columns of
+//! the slots whose place is on the card — the columns a routed gate·up wrote
+//! — and no other, so a column the host serves is never read, even by the
 //! quantizer.
 //!
-//! [`q4k_gemv_tiles`] cuts the same table into tiles — up to [`TILE_COLS`]
-//! consecutive entries of one expert's run, listed by [`grouped_tiles`] —
-//! and runs a block per tile and eight weight rows with the m-column core,
-//! so a weight row is read once for up to eight slots at a time. Its columns
-//! are the table's entries (column `j` is the slot `order[j]`), which
-//! [`Q4kSelKernels::enqueue_quantize_ord`] fills, and it scatters each
-//! column's value to its slot. [`tile_at`] is the one reading of a tile,
-//! shared with the other tiled kernels.
+//! A grouped slot table lists a block's card slots by expert: `order` holds
+//! them, and expert `e`'s run is `order[start[e] .. start[e + 1]]`, one run
+//! per expert, each inside `order[.. n_slots]` — the layout a bucket pass
+//! writes. A run that starts after its end or ends past `n_slots` names
+//! entries the table does not hold, and a kernel that meets one raises
+//! [`FaultSite::ExpertId`]. [`q4k_gemv_tiles`] cuts such a table
+//! into tiles — up to [`TILE_COLS`] consecutive entries of one expert's run,
+//! listed by [`grouped_tiles`] — and runs a block per tile and eight weight
+//! rows with the m-column core, so a weight row is read once for up to eight
+//! slots at a time. Its columns are the table's entries (column `j` is the
+//! slot `order[j]`), which [`Q4kSelKernels::enqueue_quantize_ord`] fills,
+//! and it scatters each column's value to its slot. [`tile_at`] is the one
+//! reading of a tile, shared with the other tiled kernels.
 
 use crate::cores::{q4k_row_dot, q4k_row_dot_1col};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
@@ -55,44 +57,6 @@ const _: () = assert!(THREADS == 256);
 
 /// Output rows a gemv block computes: one per warp.
 const ROWS_PER_BLOCK: usize = THREADS as usize / 32;
-
-/// The run of expert `e` in a grouped slot table: entries `j0 .. j1` of
-/// `order`, `(j0, j1) = (start[e], start[e + 1])` — the layout a bucket pass
-/// writes, one run per expert, each inside `order[.. n_slots]`. A run that
-/// starts after its end or ends past `n_slots` names entries the table does
-/// not hold: lane 0 raises [`FaultSite::ExpertId`] on `fault` and the answer
-/// is `None`. A caller returns on `None` before it reads `order`, rather than
-/// walk an empty run: joined into the walk's entry, the refusal costs the
-/// kernel registers.
-///
-/// # Safety
-///
-/// `e + 1 < start.len()`, and the 32 lanes of the warp call it with the same
-/// `e`: the run, like the fault, is the warp's.
-#[inline(always)]
-pub unsafe fn grouped_run(
-    start: &[u32],
-    e: usize,
-    n_slots: usize,
-    lane: usize,
-    fault: FaultSink,
-) -> Option<(usize, usize)> {
-    // SAFETY: e + 1 < start.len() by this fn's contract.
-    let (j0, j1) = unsafe {
-        (
-            *start.get_unchecked(e) as usize,
-            *start.get_unchecked(e + 1) as usize,
-        )
-    };
-    if j0 <= j1 && j1 <= n_slots {
-        Some((j0, j1))
-    } else {
-        if lane == 0 {
-            fault.raise(FaultSite::ExpertId);
-        }
-        None
-    }
-}
 
 /// Slots a column tile covers at most: the m-column cores' width.
 pub const TILE_COLS: usize = 8;
@@ -290,114 +254,7 @@ mod q4k_sel_kernels {
         }
     }
 
-    /// [`q4k_gemv_sel`] with each expert's rows read once for all its
-    /// slots: block `b` is expert `e = b / ⌈rows_per_expert / 8⌉` and warp
-    /// `j` of it row `r = 8 (b mod ⌈rows_per_expert / 8⌉) + j`; the warp
-    /// walks the expert's slots `order[start[e] .. start[e + 1]]` (a run per
-    /// expert, as a bucket pass lays them out) and for slot `s` dots column
-    /// `col0 + s` of the q8_1 scratch (`cols` columns) with
-    /// `cores::q4k_row_dot_1col`, the warp reduction and the lane-0 store
-    /// into `y[s * rows_per_expert + r]` — `q4k_gemv_sel`'s value for that
-    /// slot, bit for bit. The row comes from memory once and from the cache
-    /// for the expert's other slots. A run [`grouped_run`] refuses, and an
-    /// `order` entry not below `n_slots`, name no slot: each raises
-    /// [`FaultSite::ExpertId`] and is skipped.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            w.len() >= n_experts * rows_per_expert * 36 * n_sb,
-            q.len() >= cols * 256 * iters,
-            s8.len() >= cols * 8 * n_sb,
-            d8.len() >= cols * 2 * n_sb,
-            n_slots + col0 <= cols,
-            order.len() >= n_slots,
-            start.len() >= n_experts + 1,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn q4k_gemv_grouped(
-        w: &[u32],
-        q: &[u32],
-        s8: &[i32],
-        d8: &[f32],
-        order: &[u32],
-        start: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        col0: u32,
-        cols: u32,
-        n_sb: u32,
-        iters: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::threadIdx_x() as usize;
-        let rpe = rows_per_expert as usize;
-        let tiles = rpe.div_ceil(ROWS_PER_BLOCK);
-        let b = thread::blockIdx_x() as usize;
-        let (e, r) = (b / tiles, (b % tiles) * ROWS_PER_BLOCK + t / 32);
-        // Warp-uniform: all 32 lanes share e and r.
-        if e >= n_experts as usize || r >= rpe {
-            return;
-        }
-        let row_abs = e * rpe + r;
-        let lane = warp::lane_id() as usize;
-        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract, and
-        // the warp's lanes share e.
-        let run = unsafe { grouped_run(start, e, n_slots as usize, lane, fault) };
-        // Block-uniform: the block's warps share e, hence the run.
-        let Some((j0, j1)) = run else {
-            return;
-        };
-        let mut j = j0;
-        while j < j1 {
-            // SAFETY: j < j1 <= n_slots <= order.len() by `grouped_run` and the
-            // launch contract; the load is warp-uniform.
-            let slot = unsafe { *order.get_unchecked(j) } as usize;
-            if slot >= n_slots as usize || col0 as usize + slot >= cols as usize {
-                if lane == 0 {
-                    fault.raise(FaultSite::ExpertId);
-                }
-            } else {
-                // The core's caller contract, from the launch contract:
-                // row_abs < n_experts * rows_per_expert rows of `w`, column
-                // col0 + slot < cols of `q`/`s8`/`d8`, iters = ceil(n_sb/4)
-                // from the host, and all 32 lanes of the warp are here.
-                let f0 = q4k_row_dot_1col(
-                    w,
-                    q,
-                    s8,
-                    d8,
-                    n_sb as usize,
-                    iters,
-                    row_abs,
-                    col0 as usize + slot,
-                    lane,
-                );
-                let s0 = warp::reduce_sum_f32(f0);
-                if lane == 0 {
-                    // SAFETY: slot < n_slots and r < rows_per_expert, so the
-                    // value is below n_slots * rows_per_expert <= y.len();
-                    // each slot sits in one expert's run, so lane 0 of this
-                    // warp is its only writer.
-                    unsafe {
-                        *y.get_unchecked_mut(slot * rpe + r) = s0;
-                    }
-                }
-            }
-            j += 1;
-        }
-    }
-
-    /// The tile table of a grouped slot table ([`q4k_gemv_grouped`]'s layout,
+    /// The tile table of a grouped slot table (the module doc's layout,
     /// runs `start` of `n_experts` experts inside `n_slots` slots), in one
     /// block: expert `e`'s run `start[e] .. start[e + 1]` is cut into
     /// `⌈run / 8⌉` column tiles of up to [`TILE_COLS`] consecutive entries,
@@ -508,10 +365,11 @@ mod q4k_sel_kernels {
         }
     }
 
-    /// [`q4k_gemv_grouped`] by tile items: block `g + tile_cap · ρ` (of
-    /// `tile_cap · row_tiles`, [`tile_cap`] of the table) is tile `g` of the
-    /// table `tiles` ([`grouped_tiles`], [`tile_at`]) — expert `e`, the `m`
-    /// table entries from `j` — on the eight weight rows `8ρ ..`, warp `w`
+    /// The down of a grouped slot table's slots by tile items: block `g +
+    /// tile_cap · ρ` (of `tile_cap · row_tiles`, [`tile_cap`] of the table) is
+    /// tile `g` of the table `tiles` ([`grouped_tiles`], [`tile_at`]) —
+    /// expert `e`, the `m` table entries from `j` — on the eight weight rows
+    /// `8ρ ..`, warp `w`
     /// dotting row `r = 8ρ + w` with the `m` columns `j .. j + m` of the q8_1
     /// scratch (column `j` holding slot `order[j]`'s activation) through the
     /// m-column core `cores::q4k_row_dot`, whose column c is
@@ -625,7 +483,7 @@ mod q4k_sel_kernels {
     }
 
     /// The q8_1 form of the first `start[n_experts]` columns of `x` — the
-    /// entries of a grouped slot table ([`grouped_run`]'s layout), column `j` the
+    /// entries of a grouped slot table (the module doc's layout), column `j` the
     /// activation of slot `order[j]` — each into the same column of the five
     /// planes: one 32-thread block per 128-value block of column `j <
     /// m_cols`, `q8_1_quant_block` as in [`q8_1_quantize_sel`], which does
@@ -932,91 +790,6 @@ impl Q4kSelKernels {
         Ok(())
     }
 
-    /// Enqueue [`q4k_gemv_grouped`]: the down of `n_slots` slots, each
-    /// expert's rows read once, slot `s` reading column `col0 + s` of `act`
-    /// and writing `y[s * rows_per_expert ..]`; `order` and `start` group the
-    /// slots by expert, one run per expert of `w` (`w.rows() /
-    /// rows_per_expert` of them). Each slot's value is
-    /// [`Q4kSelKernels::enqueue_gemv_q4k_sel`]'s. A run that does not fit
-    /// the table ([`grouped_run`]) and an `order` entry that names no slot
-    /// raise [`FaultSite::ExpertId`] on `fault`. Asynchronous,
-    /// allocation-free.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
-    )]
-    pub fn enqueue_gemv_q4k_grouped(
-        &self,
-        stream: &CudaStream,
-        w: &DeviceTensor<u32>,
-        act: &Q8Act,
-        order: &DeviceBuffer<u32>,
-        start: &DeviceBuffer<u32>,
-        n_slots: usize,
-        col0: usize,
-        rows_per_expert: usize,
-        fault: FaultSink,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let what = "enqueue_gemv_q4k_grouped";
-        let n_sb = act.n_sb();
-        let shape = |detail: String| GpuError::shape(what, detail);
-        if w.cols() != 36 * n_sb
-            || rows_per_expert == 0
-            || !w.rows().is_multiple_of(rows_per_expert)
-        {
-            return Err(shape(format!(
-                "Q4_K rows of 36*{n_sb} words in experts of {rows_per_expert} rows, got {} x {}",
-                w.rows(),
-                w.cols()
-            )));
-        }
-        let n_experts = w.rows() / rows_per_expert;
-        if n_slots == 0
-            || col0 + n_slots > act.m()
-            || order.len() < n_slots
-            || start.len() < n_experts + 1
-            || y.len() < n_slots * rows_per_expert
-        {
-            return Err(shape(format!(
-                "{n_slots} slots from column {col0} of {}: order {}, start {} for {n_experts} \
-                 experts, y {}",
-                act.m(),
-                order.len(),
-                start.len(),
-                y.len()
-            )));
-        }
-        let grid = launch_u32(
-            what,
-            "grid",
-            n_experts * rows_per_expert.div_ceil(ROWS_PER_BLOCK),
-        )?;
-        let prep = self
-            .module
-            .prepare_q4k_gemv_grouped(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.q4k_gemv_grouped(
-            stream,
-            &prep,
-            w.buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            order,
-            start,
-            launch_u32(what, "n_experts", n_experts)?,
-            launch_u32(what, "rows_per_expert", rows_per_expert)?,
-            launch_u32(what, "n_slots", n_slots)?,
-            launch_u32(what, "col0", col0)?,
-            launch_u32(what, "cols", act.m())?,
-            launch_u32(what, "n_sb", n_sb)?,
-            launch_u32(what, "iters", n_sb.div_ceil(4))?,
-            fault,
-            y,
-        )?;
-        Ok(())
-    }
-
     /// Enqueue [`grouped_tiles`]: the tile table of the grouped slot table
     /// `start` (runs of `n_experts` experts inside `n_slots` slots) into
     /// `tiles`, which holds [`tile_cap`]`(n_slots, n_experts) + 1` words. A run
@@ -1225,7 +998,7 @@ impl Q4kSelKernels {
     /// same column of `act` with the bytes [`crate::Gpu::enqueue_quantize_q8_1`]
     /// writes for it; every other column of `act` keeps what it held. These
     /// are the columns a routed gate·up wrote and the only ones the `_sel`
-    /// and grouped downs read. A non-finite value raises
+    /// down reads. A non-finite value raises
     /// [`FaultSite::QuantColumn`] on `fault`. Asynchronous, allocation-free,
     /// capturable.
     pub fn enqueue_quantize_sel(

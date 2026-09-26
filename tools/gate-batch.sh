@@ -9,7 +9,7 @@
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
 # recipe, word-split (shell quoting allowed). Env comes before ARGS, e.g.
-#   gate-gpu-ds41-prefill@BLOOMERY_CARD_EXPERTS=slot:--cases 512 --no-split --no-extra
+#   gate-gpu-ds41-prefill@BLOOMERY_PREFILL_GROUP=1:--cases 512 --no-split --no-extra
 # --list FILE: one item per line (blank lines and `#` lines skipped), or the raw output of `just
 # affected …` (first line `affected:`): then only lines starting with two spaces and `gate-` count, the
 # first word is the recipe, everything else is ignored — the `always:` checks are not taken from it.

@@ -28,11 +28,14 @@
 //! - **Raise sites.** Launched alone on synthetic inputs, where no route can
 //!   send them: `ds41_ffn_places` and `ds41_ffn_handoff` with ids at and
 //!   past the stack raise `expert_id` and give those slots HOST (the handoff
-//!   still carries the ids as they came), with ids inside it raise nothing;
-//!   `ds41_expert_gate_up_grouped` over the table the bucket rule writes
-//!   raises nothing and writes each card slot, and over a table whose last
-//!   run ends past the slots, or starts after its end, raises `expert_id` —
-//!   the run past the slots writes none of its rows.
+//!   still carries the ids as they came), with ids inside it raise nothing.
+//!   Then `ds41_expert_gate_up_tiles` on a layer's card stacks over the tiles
+//!   of the table the bucket rule writes for two tokens routed to the same
+//!   four card experts and two host slots each: it raises nothing, every card
+//!   entry is the step's gate·up (`enqueue_expert_gate_up`) of its slot's
+//!   token bit for bit, and the entries past the table's count keep what they
+//!   held; over the same tiles with the table's last run ending past the
+//!   slots, that run's tile raises `expert_id` and writes none of its entries.
 //! - **Projections.** On layer 3's resident weights and synthetic
 //!   activations, the batch-wide launches of the attention projections
 //!   against the chunk launches they replace: the grouped Q3_K gemv
@@ -104,8 +107,6 @@
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
 //! short subset.
 //!
-//! `BLOOMERY_CARD_EXPERTS=tile|expert|slot` picks the shadow's routed experts'
-//! arm (the `loaded` line names it); all three must pass.
 //! `BLOOMERY_PREFILL_GROUP=n` picks how many batches a group runs layer by
 //! layer (default 2; the `loaded` line names it, with the bytes the batches
 //! past a group's first hold); 1 and 2 must pass. The cases hold calls of
@@ -163,6 +164,7 @@ mod gate {
 
     use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget};
     use bloomery_gpu::model::{ChainBody, StepMode};
+    use bloomery_gpu::q4k_sel::tile_cap;
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{
         ColGroups, DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group,
@@ -171,19 +173,20 @@ mod gate {
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
     use bloomery_gpu_deepseek41::body::{self, CedState, Deepseek41Model, Need};
     use bloomery_gpu_deepseek41::chain::ffn::{
-        CardExperts, CardStacks, FfnBatchKernels, FfnKernels, GroupedGateUp, Handoff, Places,
+        CardStacks, FfnBatchKernels, FfnKernels, Handoff, Places, TiledGateUp,
     };
     use bloomery_gpu_deepseek41::dense::{
         DenseKernels, Q3kHeadsGroupsArgs, Q3kHeadsMcolArgs, RowsPart,
     };
+    use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{
-        GateError, NAN_F16, activations, checks_failed, data_dir, kquant_d_at, patch_bytes,
-        row_bytes, verdict,
+        GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
+        patch_bytes, row_bytes, verdict,
     };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -342,7 +345,7 @@ mod gate {
         let (group, group_bytes) = m.body(NAME)?.prefill_group().unwrap_or_default();
         let mut pass = count_cases(&mut m)?;
         pass &= router_cases(&mut m)?;
-        pass &= raise_cases(&mut m)?;
+        pass &= raise_cases(&mut m, &hp)?;
         pass &= proj_cases(&mut m, &hp)?;
         let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
         let top = args
@@ -356,13 +359,12 @@ mod gate {
         let steps = (top + 1).min(ORACLE);
         let ids = corpus(ORACLE + 1)?;
         println!(
-            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; group={group}; batch \
+            "{NAME}: loaded in {:.1} s; ced={ced}; group={group}; batch \
              buffers {} B (attention projections {} B, batches past a group's first \
              {group_bytes} B); ids \
              corpus-prose.ids[..{}] first {:?}; tap layers {layers:?}, draft window {}; oracle \
              {steps} steps; cases {:?} splits {splits:?} extra {}",
             t.elapsed().as_secs_f64(),
-            CardExperts::from_env()?.name(),
             m.body(NAME)?.batch_bytes(),
             m.body(NAME)?.batch_proj_bytes(),
             ORACLE + 1,
@@ -617,11 +619,12 @@ mod gate {
 
     /// The raise sites (module doc), each launched alone on synthetic inputs;
     /// the fault word cleared after each.
-    fn raise_cases(m: &mut Deepseek41Model) -> Result<bool, GateError> {
-        let (gpu, _, _) = m.body_parts(NAME)?;
+    fn raise_cases(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        let layers = m.body(NAME)?.layers();
+        let (gpu, w, _) = m.body_parts(NAME)?;
         let mut ok = places_cases(gpu)?;
         ok &= handoff_cases(gpu)?;
-        ok &= grouped_cases(gpu)?;
+        ok &= tile_case(gpu, w, layers, hp)?;
         gpu.clear_fault()?;
         Ok(ok)
     }
@@ -789,83 +792,158 @@ mod gate {
         Ok(ok)
     }
 
-    /// `ds41_expert_gate_up_grouped` over a stack of zeros (every row it
-    /// writes is 0) for two token columns: eight card slots, two per expert,
-    /// then four the host serves, whose indices pad the table.
-    fn grouped_cases(gpu: &Gpu) -> Result<bool, GateError> {
+    /// `ds41_expert_gate_up_tiles` on the card stacks of the first of
+    /// `layers` whose card holds four experts, over the tiles of the table
+    /// the bucket rule writes for two tokens, each routed to those four
+    /// experts and to two host slots: every run holds one slot of each
+    /// token, so a tile's columns read different activations. Every card
+    /// entry must be the step's gate·up (`enqueue_expert_gate_up`) of its
+    /// slot's token, bit for bit, the entries past the table's count keep
+    /// what they held, and nothing raises. Then the same tiles over the table
+    /// with its last run ending past the slots, which the builder would refuse
+    /// whole: that run's tile raises `expert_id` and writes none of its
+    /// entries, the other tiles write theirs as before.
+    fn tile_case(
+        gpu: &Gpu,
+        w: &Weights,
+        layers: Range<usize>,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
         const E: usize = 4;
-        const RPE: usize = 16;
-        const K: usize = 512;
         const COLS: usize = 2;
         const SLOTS: usize = N_USED * COLS;
-        let kernels = FfnBatchKernels::load(gpu.context())?;
+        let (ff, k) = (hp.experts.ff, hp.n_embd);
+        let mut found = None;
+        for l in layers {
+            let Some(s) = CardStacks::of(w, l)? else {
+                continue;
+            };
+            if s.gate.rows() >= E * ff {
+                found = Some((l, s));
+                break;
+            }
+        }
+        let Some((l, s)) = found else {
+            return Err(format!("{NAME}: no layer's card holds {E} experts").into());
+        };
         let stream = gpu.stream();
-        let n_sb = K / 256;
-        let w = DeviceBuffer::from_host(stream, &vec![0u32; E * RPE * 110 * n_sb / 4])?;
-        let x = DeviceBuffer::from_host(stream, &activations(K, COLS, 4101))?;
-        let mut act = Q8Act::with_k(stream, COLS, K)?;
-        gpu.enqueue_quantize_q8_1(&x, &mut act)?;
-        // Slot s < 8 is expert s / 2's; slots 8.. are the host's.
-        let order: Vec<u32> = (0..SLOTS as u32).collect();
-        let order_dev = DeviceBuffer::from_host(stream, &order)?;
-        let card_slots = 2 * E;
-        // (what, start, fault, the slots whose rows are written)
-        type GroupedCase = (&'static str, [u32; E + 1], Option<FaultSite>, Range<usize>);
-        let cases: [GroupedCase; 3] = [
-            ("the bucket table", [0, 2, 4, 6, 8], None, 0..card_slots),
-            (
-                "a last run that ends past the slots",
-                [0, 2, 4, 6, SLOTS as u32 + 3],
-                Some(FaultSite::ExpertId),
-                0..card_slots - 2,
-            ),
-            (
-                "a last run that starts after its end",
-                [0, 2, 4, 8, 6],
-                Some(FaultSite::ExpertId),
-                0..card_slots,
-            ),
-        ];
-        let mut ok = true;
-        for (what, start, want, written) in cases {
-            gpu.clear_fault()?;
-            let start_dev = DeviceBuffer::from_host(stream, &start)?;
-            let mut h = DeviceBuffer::from_host(stream, &vec![SENT; SLOTS * RPE])?;
-            let g = GroupedGateUp {
-                wg: &w,
-                wu: &w,
-                q3: act.q3(),
-                d8: act.d8(),
-                order: &order_dev,
-                start: &start_dev,
-                n_experts: E,
-                rows_per_expert: RPE,
-                n_slots: SLOTS,
-                col0: 0,
-                cols: COLS,
-                n_sb,
+        // Slot `N_USED · t + e` of token t is expert e's for e < E, the rest
+        // the host's; the bucket rule lists each expert's slots in slot order.
+        let sel: Vec<u32> = (0..SLOTS)
+            .map(|slot| {
+                let e = slot % N_USED;
+                if e < E { e as u32 } else { HOST }
+            })
+            .collect();
+        let order: Vec<u32> = (0..E)
+            .flat_map(|e| (0..COLS).map(move |t| (N_USED * t + e) as u32))
+            .collect();
+        let start: Vec<u32> = (0..=E).map(|e| (COLS * e) as u32).collect();
+        let x = activations(k, COLS, 4101);
+        // The table's entries: entry j is slot order[j]'s token; the entries
+        // past the count are zeros, which no launch reads.
+        let mut x_ord = vec![0.0f32; SLOTS * k];
+        for (j, &slot) in order.iter().enumerate() {
+            let t = slot as usize / N_USED;
+            x_ord[j * k..(j + 1) * k].copy_from_slice(&x[t * k..(t + 1) * k]);
+        }
+        let x_ord = DeviceBuffer::from_host(stream, &x_ord)?;
+        let mut act_ord = Q8Act::with_slots(stream, SLOTS, k)?;
+        gpu.enqueue_quantize_q8_1(&x_ord, &mut act_ord)?;
+        let start_dev = DeviceBuffer::from_host(stream, &start)?;
+        let mut tiles = DeviceBuffer::from_host(stream, &vec![0u32; tile_cap(SLOTS, E) + 1])?;
+        let mut h = DeviceBuffer::from_host(stream, &vec![SENT; SLOTS * ff])?;
+        let kernels = FfnBatchKernels::load(gpu.context())?;
+        stream.synchronize()?;
+        gpu.clear_fault()?;
+        gpu.q4k_sel().enqueue_grouped_tiles(
+            stream,
+            &start_dev,
+            E,
+            SLOTS,
+            gpu.unlabelled_sink(),
+            &mut tiles,
+        )?;
+        let g = TiledGateUp {
+            wg: s.gate.buf(),
+            wu: s.up.buf(),
+            q3: act_ord.q3(),
+            d8: act_ord.d8(),
+            start: &start_dev,
+            tiles: &tiles,
+            n_experts: E,
+            rows_per_expert: ff,
+            n_slots: SLOTS,
+            n_sb: k / 256,
+            limit: 0.0,
+        };
+        kernels.enqueue_gate_up_tiles(stream, &g, gpu.unlabelled_sink(), &mut h)?;
+        let got = h.to_host_vec(stream)?;
+        stream.synchronize()?;
+        let (fault_ok, fault) = fault_is(gpu.fault()?, None);
+        // The step's gate·up, one token at a time, by slot.
+        let experts = ExpertKernels::load(gpu.context())?;
+        let mut by_slot = Vec::with_capacity(SLOTS * ff);
+        for t in 0..COLS {
+            let xt = DeviceBuffer::from_host(stream, &x[t * k..(t + 1) * k])?;
+            let mut act = Q8Act::with_k(stream, 1, k)?;
+            gpu.enqueue_quantize_q8_1(&xt, &mut act)?;
+            let sel_t = DeviceBuffer::from_host(stream, &sel[N_USED * t..N_USED * (t + 1)])?;
+            let mut ht = DeviceBuffer::from_host(stream, &vec![SENT; N_USED * ff])?;
+            let a = ExpertGateUp {
+                wg: s.gate,
+                wu: s.up,
+                act: &act,
+                sel: &sel_t,
+                n_slots: N_USED,
+                rows_per_expert: ff,
                 limit: 0.0,
             };
-            kernels.enqueue_gate_up_grouped(stream, &g, gpu.unlabelled_sink(), &mut h)?;
-            let got = h.to_host_vec(stream)?;
-            stream.synchronize()?;
-            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
-            let rows_of = |s: usize| &got[s * RPE..(s + 1) * RPE];
-            let rows_ok = (0..SLOTS).all(|s| {
-                let v = if written.contains(&s) { 0.0f32 } else { SENT };
-                rows_of(s).iter().all(|r| r.to_bits() == v.to_bits())
-            });
-            let pass = fault_ok && rows_ok;
-            ok &= pass;
-            println!(
-                "{NAME}: grouped gate·up, {what} {start:?} over {SLOTS} slots: {fault}; rows of \
-                 slots {written:?} written, the rest untouched {}: {}",
-                verdict(rows_ok),
-                verdict(pass)
-            );
+            experts.enqueue_expert_gate_up(stream, &a, &mut ht)?;
+            by_slot.extend(ht.to_host_vec(stream)?);
         }
+        stream.synchronize()?;
+        let mut want = vec![SENT; SLOTS * ff];
+        for (j, &slot) in order.iter().enumerate() {
+            let slot = slot as usize;
+            want[j * ff..(j + 1) * ff].copy_from_slice(&by_slot[slot * ff..(slot + 1) * ff]);
+        }
+        let values_ok = bits_equal(&got, &want);
+        let pass = fault_ok && values_ok;
+        println!(
+            "{NAME}: tile gate·up, layer {l}'s card stacks, the bucket table {start:?} of order \
+             {order:?} over {SLOTS} slots: {fault}; card entries the step's gate·up of their \
+             slot's token, the rest untouched {}: {}",
+            verdict(values_ok),
+            verdict(pass)
+        );
+        let mut past = start.clone();
+        past[E] = SLOTS as u32 + 3;
+        let past_dev = DeviceBuffer::from_host(stream, &past)?;
+        let mut h_past = DeviceBuffer::from_host(stream, &vec![SENT; SLOTS * ff])?;
+        stream.synchronize()?;
         gpu.clear_fault()?;
-        Ok(ok)
+        let g_past = TiledGateUp {
+            start: &past_dev,
+            ..g
+        };
+        kernels.enqueue_gate_up_tiles(stream, &g_past, gpu.unlabelled_sink(), &mut h_past)?;
+        let got_past = h_past.to_host_vec(stream)?;
+        stream.synchronize()?;
+        let (fault_ok, fault) = fault_is(gpu.fault()?, Some(FaultSite::ExpertId));
+        let written = 0..start[E - 1] as usize;
+        let mut want_past = vec![SENT; SLOTS * ff];
+        want_past[..written.end * ff].copy_from_slice(&want[..written.end * ff]);
+        let past_values_ok = bits_equal(&got_past, &want_past);
+        let past_pass = fault_ok && past_values_ok;
+        println!(
+            "{NAME}: tile gate·up, a last run that ends past the slots {past:?} over the tiles of \
+             {start:?}: {fault}; entries {written:?} as above, the rest untouched {}: {}",
+            verdict(past_values_ok),
+            verdict(past_pass)
+        );
+        gpu.clear_fault()?;
+        Ok(pass && past_pass)
     }
 
     /// The layer whose resident weights the projection cases read.

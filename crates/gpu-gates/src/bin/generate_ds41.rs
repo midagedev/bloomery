@@ -87,10 +87,8 @@
 //! (`card_out`: its first launch to its route's copies; `card_in`: its
 //! shadow; `card_proj`: the batch-wide attention projections, inside
 //! `card_out`), whose reads add a wait per batch to the feed.
-//! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`tile`,
-//! the default, `expert` or `slot`), the shadow's routed gate·up arm, and its
-//! `group=` is `BLOOMERY_PREFILL_GROUP` (default 2; 1 runs each batch alone),
-//! the batches whose layers a batched feed runs in turn.
+//! The `load` line's `group=` is `BLOOMERY_PREFILL_GROUP` (default 2; 1 runs
+//! each batch alone), the batches whose layers a batched feed runs in turn.
 //! A second `stat prefill ced=` line names the triangle's state (the `load`
 //! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
 //! positions, the first whose features were kept, the blocks and latent
@@ -131,8 +129,7 @@
 //! `positions=` and `tok/s(positions)=`, the positions the kept passes
 //! advanced over their summed wall time. The pair pass's head and capture
 //! are made before the prompt by one pair at position 0 and a `reset`, as
-//! the step's capture is. `BLOOMERY_STEP_STATS` reads once per pass;
-//! `BLOOMERY_STEP_PAIR` is refused with it.
+//! the step's capture is. `BLOOMERY_STEP_STATS` reads once per pass.
 //!
 //! `BLOOMERY_DRAFT=dspark` serves the DSpark draft at width 1
 //! (`shared/ds41_dspark.rs`): the draft file is `$BLOOMERY_DSPARK_MODEL`, its
@@ -154,9 +151,9 @@
 //! one's `(layer, site)` and, at a MoE seam, its routing and buffers), a line
 //! per fed position that is not `ok`, and a `stat finite summary`. A position
 //! whose eager argmax differs from the engine's token says so. Refused with
-//! `--time`, `BLOOMERY_DRAFT`, `BLOOMERY_STEP_PAIR` and `BLOOMERY_STEP_STATS`
-//! (its host-tier counters would count the probe's step too). Unset, the
-//! probe does not run.
+//! `--time`, `BLOOMERY_DRAFT` and `BLOOMERY_STEP_STATS` (its host-tier
+//! counters would count the probe's step too). Unset, the probe does not
+//! run.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -187,7 +184,6 @@ mod drive {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{LaunchStats, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
-    use bloomery_gpu_deepseek41::chain::ffn::CardExperts;
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use gguf::Split;
@@ -469,7 +465,7 @@ mod drive {
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
              top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
-             prefill={} ced={} card_experts={} group={} in {:.1} s (runtime value)",
+             prefill={} ced={} group={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -489,7 +485,6 @@ mod drive {
                 prefill_mode.name()
             },
             m.body("generate_ds41")?.ced(),
-            CardExperts::from_env()?.name(),
             body::Body::prefill_group_lever()?,
             t.elapsed().as_secs_f64()
         );
@@ -579,8 +574,8 @@ mod drive {
     }
 
     /// `BLOOMERY_CHECK_FINITE`: unset or `0` is off, `1` on; any other value
-    /// is refused, and so is the lever beside `--time`, the draft, the pair
-    /// arm and the step stats.
+    /// is refused, and so is the lever beside `--time`, the draft and the
+    /// step stats.
     fn finite_lever(a: &Args, draft: Draft) -> Result<bool, GateError> {
         let on = match std::env::var("BLOOMERY_CHECK_FINITE") {
             Err(std::env::VarError::NotPresent) => false,
@@ -599,10 +594,6 @@ mod drive {
             (
                 draft != Draft::Off,
                 "BLOOMERY_DRAFT: the probe reads one-row steps",
-            ),
-            (
-                std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1"),
-                "BLOOMERY_STEP_PAIR=1: the probe reads one-row steps",
             ),
             (
                 std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1"),
@@ -736,8 +727,7 @@ mod drive {
     }
 
     /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` and `dspark` the
-    /// served drafts; any other value is refused, and so is
-    /// `BLOOMERY_STEP_PAIR=1` beside a draft.
+    /// served drafts; any other value is refused.
     fn draft_lever() -> Result<Draft, GateError> {
         let draft = match std::env::var("BLOOMERY_DRAFT") {
             Err(std::env::VarError::NotPresent) => Draft::Off,
@@ -748,14 +738,6 @@ mod drive {
             }
             Err(e) => return Err(format!("BLOOMERY_DRAFT: {e}").into()),
         };
-        if draft != Draft::Off && std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1") {
-            return Err(format!(
-                "BLOOMERY_DRAFT={} drafts every pair itself; unset BLOOMERY_STEP_PAIR, the \
-                 unconditional-accept timing arm",
-                draft.name()
-            )
-            .into());
-        }
         Ok(draft)
     }
 
@@ -919,19 +901,9 @@ mod drive {
             probes.reserve_exact(a.n_gen);
             probes.push(Probe::read(m)?);
         }
-        // `BLOOMERY_STEP_PAIR=1`: every step is one skewed two-row pass whose
-        // draft is the previous pass's row-A argmax, accepted unconditionally —
-        // a timing arm (two positions per `time` row), not a decode. Accepting
-        // every draft collapses the text into repetition, so its routing (host
-        // slots per row, `host_w2`, the row overlap) is not real text's: the
-        // host-tier numbers of this arm are timing shape only.
-        let pair = std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1");
-        let mut draft = next;
         for _ in 1..a.n_gen {
             let t0 = Instant::now();
-            if pair {
-                [draft, next] = m.step_pair(next, draft)?;
-            } else if let Some(c) = check.as_deref_mut() {
+            if let Some(c) = check.as_deref_mut() {
                 next = checked_step(m, c, next)?;
             } else {
                 next = m.step(&[next])?;

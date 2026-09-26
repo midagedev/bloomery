@@ -801,17 +801,6 @@ impl Body {
         &self.rows
     }
 
-    /// The step plan the last [`ChainBody::decode_input`] made.
-    #[must_use]
-    pub fn step_plan(&self) -> &StepPlan {
-        &self.plan
-    }
-
-    /// The layers whose attention an engram step precedes, in order.
-    pub fn engram_layers(&self) -> impl Iterator<Item = usize> + '_ {
-        self.glue.engram_layers()
-    }
-
     /// Kernel launches layer `layer`'s MoE sub-layer enqueues, besides its
     /// two memory-operation batches ([`FfnPiece::launches`]).
     #[must_use]

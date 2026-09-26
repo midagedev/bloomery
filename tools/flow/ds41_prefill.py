@@ -2510,9 +2510,9 @@ def predict(which):
                     print(f"      with the re-upload read back from NVMe (sources dropped by DONTNEED): {nv:.1f}")
                 prev[(rname, P)] = b["pp"]
         if name == "now":
-            print("  variants of today's flow (central; CED off = BLOOMERY_CED=off, slot = BLOOMERY_CARD_EXPERTS=slot,"
+            print("  variants of today's flow (central; CED off = BLOOMERY_CED=off,"
                   " no hot list = the uniondispatch lease's condition, measured 129.63 / 180.02):")
-            for label, vo in (("CED off", {"ced": False}), ("slot arm", {"arm": "slot"}), ("no hot list", {"hot": False})):
+            for label, vo in (("CED off", {"ced": False}), ("no hot list", {"hot": False})):
                 vals = [f"{rn} P {P} {evaluate(central(), dict(cfg, **vo), P, rn)['pp']:.1f}"
                         for rn in (("lcg",) if label == "no hot list" else ("lcg", "prose")) for P in (512, 4096)]
                 print(f"      {label:11}: " + ", ".join(vals))

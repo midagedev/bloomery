@@ -82,7 +82,7 @@ use bloomery_gpu::COL_GROUP;
 use super::ced::Mode;
 use super::*;
 use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
-use crate::chain::ffn::{BatchLayer, BlockIo, CardExperts, ExchangeKey, FfnBatch, JoinIo};
+use crate::chain::ffn::{BatchLayer, BlockIo, ExchangeKey, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -726,8 +726,6 @@ mod queue {
     use gguf::quant::GgmlType;
     use model::arch::deepseek41::names;
 
-    use crate::chain::ffn::CardExperts;
-
     /// A chunk's words gather (`AttnChain::enqueue_step_of`).
     pub(super) const GATHER: u64 = 1;
     /// After a layer-batch's union: the host sums' copy
@@ -793,45 +791,26 @@ mod queue {
         }
     }
 
-    /// The shadow of a block of `chunks` (`FfnPiece::enqueue_batch_shadow`)
-    /// on the `experts` arm, with card experts or not: per chunk HC_PRE and
-    /// the norm; per expert, the norm's q8_1 codes and scales copied into the
-    /// block's planes when there are card experts; per slot, the card's
-    /// gate·up, its q8_1 form and the down when there are, and the card sum;
-    /// the shared expert's gate·up, its down's q8_1 form, the down and past
-    /// one token its copy token-major. Per expert, then over the block: the
-    /// buckets, the grouped gate·up, its q8_1 form and the grouped down when
-    /// there are card experts, and the card sum; on the tile arm also the
-    /// tile table and the gather into run order.
-    pub(super) fn shadow(
-        chunks: &[Range<usize>],
-        experts: CardExperts,
-        card: bool,
-        shared: Shared,
-    ) -> u64 {
-        let grouped = !matches!(experts, CardExperts::Slot);
-        let tile = matches!(experts, CardExperts::Tile);
+    /// The shadow of a block of `chunks` (`FfnPiece::enqueue_batch_shadow`),
+    /// with card experts or not: per chunk HC_PRE and the norm, the norm's
+    /// q8_1 codes and scales copied into the block's planes when there are
+    /// card experts, the shared expert's gate·up, its down's q8_1 form, the
+    /// down and past one token its copy token-major; then over the block the
+    /// buckets, the tile table, the gather into run order, the gate·up, its
+    /// q8_1 form and the down when there are card experts, and the card sum.
+    pub(super) fn shadow(chunks: &[Range<usize>], card: bool, shared: Shared) -> u64 {
         let per_chunk: u64 = chunks
             .iter()
             .map(|r| {
                 let m = r.len() as u64;
-                let routed = match (grouped, card) {
-                    (true, true) => 2,
-                    (true, false) => 0,
-                    (false, true) => 3 + 1,
-                    (false, false) => 1,
-                };
+                let routed = 2 * u64::from(card);
                 let gate_up = if shared.gate_up_q3k { 1 } else { m };
                 2 + routed + gate_up + u64::from(shared.down_q8) + 1 + u64::from(m > 1)
             })
             .sum();
-        let block = match (grouped, card) {
-            // The buckets, the gate·up, its q8_1 form and the down, and the
-            // card sum; the tile arm adds the tile table and the gather.
-            (true, true) => 4 + 2 * u64::from(tile) + 1,
-            (true, false) => 1,
-            (false, _) => 0,
-        };
+        // The buckets, the tile table, the gather, the gate·up, its q8_1 form
+        // and the down, and the card sum.
+        let block = if card { 7 } else { 1 };
         per_chunk + block
     }
 }
@@ -894,13 +873,7 @@ impl Body {
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
         let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
         let glue = self.glue.batch(gpu, image.layout())?;
-        let ffn = FfnBatch::new(
-            gpu,
-            n,
-            hp.experts.ff,
-            [T_MAX, sets],
-            CardExperts::from_env()?,
-        )?;
+        let ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets])?;
         let set = |k: usize| -> Result<BatchSet, GpuError> {
             let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
             let made = || -> Result<BatchSet, GpuError> {
@@ -1679,12 +1652,8 @@ impl<'a> GroupCx<'a> {
             streams: &own.hc[m.cur.s],
             fold_in: &own.folds[m.cur.f],
         };
-        self.sums.entries_shadow += queue::shadow(
-            &m.cuts[r.full..],
-            batch.ffn.experts(),
-            card.is_some(),
-            queue::Shared::of(w, l),
-        );
+        self.sums.entries_shadow +=
+            queue::shadow(&m.cuts[r.full..], card.is_some(), queue::Shared::of(w, l));
         self.ffn
             .enqueue_batch_shadow(gpu, bl, card, &mut batch.ffn, &block)?;
         if timed {

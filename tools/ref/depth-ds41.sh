@@ -55,7 +55,7 @@
 #            generate_ds41 --tokens <those ids> -n N --time, with the variables set as in <D>@…. Row label
 #            `prose`, or `prose@NAME=VALUE[,...]`; the depth column is P. The prompt's routing, and so
 #            its card and host work, is prose's, not the LCG walk's: a prose arm is compared only with
-#            prose arms of the same P — `prose:512 prose:512@BLOOMERY_CARD_EXPERTS=expert` is the
+#            prose arms of the same P — `prose:512 prose:512@BLOOMERY_PREFILL_GROUP=1` is the
 #            same-binary A/B on the prose prompt — in its own decode and prefill tables (prose / each
 #            prose@ label), never with ours or the references. A P the file cannot supply (P < 1, or
 #            past its line count) is refused before anything runs.
