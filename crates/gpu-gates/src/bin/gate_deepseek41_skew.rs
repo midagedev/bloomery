@@ -136,12 +136,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let mut m = body::open(file, workstation::plan_gate, CTX_MAX as usize)?;
+        let mut m = body::open(file, workstation::plan_gate, CTX_MAX as usize, &cfg)?;
         let mut heads = {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_skew")?;
             println!(

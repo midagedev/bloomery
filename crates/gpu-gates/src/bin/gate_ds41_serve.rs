@@ -65,7 +65,7 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::Planner;
-    use model::placement::workstation;
+    use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>";
@@ -367,11 +367,13 @@ mod gate {
 
     /// `/props`' `engine` object (see the module header) against the plan of
     /// the file the server opens, made here from its headers the way the
-    /// server makes it; `argv` and `pid` are the process this gate spawned.
+    /// server makes it, under the placement's `levers` the server inherits;
+    /// `argv` and `pid` are the process this gate spawned.
     fn props_engine(
         url: &dyn Fn(&str) -> String,
         argv: &[String],
         pid: u32,
+        levers: &PlanLevers,
     ) -> Result<bool, GateError> {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
@@ -380,7 +382,7 @@ mod gate {
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         let machine = workstation::plan_gate(inputs.model.layers);
-        let plan = inputs.plan(&machine, workstation::CTX_MAX)?;
+        let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
         let (Some(card), Some(stage)) = (plan.cards.first(), machine.cards.first()) else {
             return Err("the gate's plan has no card".into());
         };
@@ -475,7 +477,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let a = parse_args()?;
+        let place = PlanLevers::from_levers(&levers)?;
         let reference = gen_tokens(&a.gen_log)?;
         let ratios = file_ratios()?;
         println!("compression ratios {ratios:?}");
@@ -502,7 +506,7 @@ mod gate {
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
             .collect();
-        ok &= props_engine(&url, &argv, served.child.id())?;
+        ok &= props_engine(&url, &argv, served.child.id(), &place)?;
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,

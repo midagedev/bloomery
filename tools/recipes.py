@@ -72,7 +72,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GATE_PREFIX = "gate-"
 # The checks the lead's batches always run; the diff does not pick them.
-ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-arch", "check", "fmt-check", "lint"]
+ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check", "fmt-check", "lint"]
 CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
 OXIDE_GLOBALS = [".cargo/cuda-oxide.toml"]
 BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/ref/models/deepseek41.sh"]
@@ -2138,10 +2138,10 @@ def key_self_test(expect, real: Side) -> None:
         tree_scoped <= never,
         f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
     )
-    for n in ("check", "fmt-check", "check-recipes", "check-comments", "check-arch", "check-rustflags"):
+    for n in ("check", "fmt-check", "check-recipes", "check-comments", "check-levers", "check-arch", "check-rustflags"):
         expect(ctx.scope(recipe_closure(real.recipes, n), real.graph.inputs(n))[0] == "tree", f"{n} is not keyed on the whole tree")
     expect(ctx.scope(["lint"], real.graph.inputs("lint"))[0] == "closure", "lint (clippy, modeled) is keyed on the whole tree")
-    for s in ("tools/check-comments.sh", "tools/check-arch.sh", "crates/tokenizer/tools/oracle.sh"):
+    for s in ("tools/check-comments.sh", "tools/check-levers.sh", "tools/check-arch.sh", "crates/tokenizer/tools/oracle.sh"):
         expect(scan_lines(real.tree.read(s), TREE_WALK, s) is not None, f"the walk detector misses {s}")
     quiet = ["tools/box.sh", "tools/gate.sh", "tools/gpu-gate.sh", "tools/host-gate.sh", "tools/ref/ref-paths.sh", "tools/ptx-spill-check.sh", "tools/ptx-scan.sh"]
     quiet += sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, "tools/ref/models/*.sh")))

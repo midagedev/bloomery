@@ -233,7 +233,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
             return Err(checks_failed());
         }
@@ -241,7 +243,12 @@ mod gate {
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&file)?;
         let eos = bloomery_gpu_gates::eos_token_id(&file)?;
-        let mut m = body::open(file, workstation::plan_gate, usize::try_from(CTX_MAX)?)?;
+        let mut m = body::open(
+            file,
+            workstation::plan_gate,
+            usize::try_from(CTX_MAX)?,
+            &cfg,
+        )?;
         m.set_mode(StepMode::Graph);
         let mut head = {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_long")?;

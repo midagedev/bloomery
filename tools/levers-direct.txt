@@ -1,0 +1,48 @@
+# Every environment read left in place in crates/*/src — outside crates/levers/src, where the lever
+# registry parses — with the round that converts or removes it. tools/check-levers.sh fails on a read
+# this list does not name, and on a line whose read is gone; the registry's in-place rows and this
+# list name the same reads (crates/levers, test registry_and_allow_list_agree). The list only shrinks.
+# A line: file<TAB>variables, comma-separated<TAB>round.
+#
+# Levers the registry names, read in place until their round converts them.
+crates/model/src/ops.rs	BLOOMERY_POISON,BLOOMERY_DEFER_QUANT,BLOOMERY_STEAL,BLOOMERY_STEAL_BLOCKS	[03]
+crates/model/src/moe.rs	BLOOMERY_EXPERT_LOG	[03]
+crates/model/src/bin/bench_v41_host.rs	BLOOMERY_PIN_MAIN	[03]
+crates/gpu/src/hybrid.rs	BLOOMERY_HYBRID_NL,BLOOMERY_HYBRID_OVERLAP,BLOOMERY_HOST_POPULATE,BLOOMERY_HOST_LOCK,BLOOMERY_CARD_DONTNEED	[03]
+crates/gpu/src/flash_gqa.rs	BLOOMERY_GQA_MMA	[03]
+crates/gpu/src/arch/qwen3moe/ubatch.rs	BLOOMERY_QWEN3_UBATCH	[03]
+crates/model/src/arch/deepseek2/attn.rs	BLOOMERY_FLASH_SIMD,BLOOMERY_KV_PREFETCH,BLOOMERY_KV_PREFETCH_ROWS,BLOOMERY_FLASH_SEGMENTS,BLOOMERY_ATTN_BUNDLE,BLOOMERY_ATTN_HALVES	v2fence
+crates/model/src/profile.rs	BLOOMERY_PROFILE	v2fence
+crates/model/src/bin/bloomery-decode.rs	BLOOMERY_PROFILE,BLOOMERY_PIN_MAIN,BLOOMERY_POPULATE,BLOOMERY_WEIGHTS	v2fence
+crates/gpu/src/flash.rs	BLOOMERY_FLASH_SEG,BLOOMERY_FLASH_MMA	v2fence
+crates/gpu/src/lib.rs	BLOOMERY_Q3K_SPLIT,BLOOMERY_Q3K_SPLIT_ITERS	decision 4
+crates/gpu/src/model/launcher.rs	BLOOMERY_LAUNCH_THREAD	decision 4
+# Paths and profile facts (audit TL-6).
+crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL	gatestoml
+crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL,BLOOMERY_DATA	gatestoml
+crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml
+crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
+crates/model/src/bin/v41fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_dspark_read.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_dspark_hc.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_dspark_kv.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_dspark_experts.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/gate_dspark_graph.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+# The DSpark draft's card: a setting no registry row holds yet.
+crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_CARD	session
+# Reference sets.
+crates/gpu-gates/src/lib.rs	BLOOMERY_REF_CUDA,BLOOMERY_REF_SET	refset
+crates/gpu-gates/src/kld.rs	BLOOMERY_KLD_FILE	refset
+crates/gpu-gates/src/bin/gate_block.rs	BLOOMERY_REF_CPU_SET	refset
+crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	refset
+# Runner handshakes (audit TL-7).
+crates/model/src/bin/bench_v41_host.rs	BLOOMERY_HOST_LEASE	TL-7
+crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
+# The stage-0 crates, removed whole.
+crates/gpu-spike/src/main.rs	BLOOMERY_DATA	stage0
+crates/q3k-cpu/src/main.rs	BLOOMERY_DATA	stage0
+crates/q3k-gemv/src/main.rs	BLOOMERY_DATA	stage0
+# Not levers, and they stay.
+crates/gpu-gates/src/bind.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list
+crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs	BLOOMERY_CHAIN_ATTN_MUTATE,BLOOMERY_CHAIN_ATTN_LAYERS	stays: the gate's FAIL-first tool

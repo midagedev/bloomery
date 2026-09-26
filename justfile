@@ -57,6 +57,11 @@ check-arch:
 check-comments:
     ./tools/check-comments.sh
 
+# 레버 읽기 점검(맥, 텍스트뿐): crates/*/src에서 레버 레지스트리 밖에서 환경 변수를 읽는 곳은 그 읽기를 옮길
+# 라운드와 함께 tools/levers-direct.txt에 한 줄로 올라 있어야 한다 — 규칙은 tools/check-levers.sh 머리말.
+check-levers:
+    ./tools/check-levers.sh
+
 # GPU 커널 빌드. 디바이스 크레이트는 반드시 cargo oxide로, 평범한 cargo build로는 안 된다.
 build-gpu:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv'
@@ -622,6 +627,11 @@ gate-fixture:
 gate-threads:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool -- --include-ignored --nocapture'
 
+# 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
+# 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.
+gate-levers:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-levers --lib -- --nocapture'
+
 # 샘플러 게이트: greedy·top-k=1이 엔진 argmax와 같고, top-p·min-p·반복 벌점이 참조의 정의대로 자르고,
 # 추첨 빈도가 소프트맥스를 따르며, 같은 시드는 같은 토큰을 내고, 첫 호출 뒤 할당이 0인가. 박스 자원 불필요.
 gate-sampler:
@@ -706,7 +716,7 @@ gate-1-1:
     ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && T= && { [ -n "$S" ] || T="f32 bf16 q8_0"; } && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" $T && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler
+gate: check-recipes check-rustflags check-arch check-comments check-levers fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (docs/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes

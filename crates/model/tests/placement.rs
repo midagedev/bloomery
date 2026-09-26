@@ -617,7 +617,10 @@ fn run(
     cards: &[CardPin],
     host: &HostPin,
 ) {
-    let plan = placement::plan(model, machine, workstation::CTX_MAX, kv)
+    let levers = bloomery_levers::Levers::from_env().unwrap_or_else(|e| panic!("{title}: {e}"));
+    let levers =
+        placement::PlanLevers::from_levers(&levers).unwrap_or_else(|e| panic!("{title}: {e}"));
+    let plan = placement::plan(model, machine, workstation::CTX_MAX, kv, &levers)
         .unwrap_or_else(|e| panic!("{title}: {e}"));
     summary(&mut out, title, &plan, kv);
     if std::env::var("BLOOMERY_PLACEMENT_TABLE").is_ok_and(|v| v == "1") {

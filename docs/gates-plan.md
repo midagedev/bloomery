@@ -54,7 +54,7 @@
 
 | 구성 | s [유도, 오늘 실측에서] | 근거 |
 |---|---:|---|
-| 정적: check-recipes·check-rustflags·check-comments·check-arch·check·fmt-check·lint | ≈ 40 | 오늘 5–17 s씩 |
+| 정적: check-recipes·check-rustflags·check-comments·check-levers·check-arch·check·fmt-check·lint | ≈ 40 | 오늘 5–17 s씩 |
 | `gate-gpu-ds41-step` | 43 | 디코드 스텝 비트 + 폴트 |
 | `gate-gpu-ds41-prefill` **P = 512 케이스만** | ≈ 60–90 | 프리필 = 스텝 비트; 지금 386 s는 12 케이스 합, P = 1100이 11 s |
 | `gate-gpu-e2e` | 150 | V2-Lite 전 경로, 폴트 워드의 argmax 복사 |

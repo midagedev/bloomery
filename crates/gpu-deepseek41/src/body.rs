@@ -83,13 +83,13 @@ use model::arch::deepseek41::hparams::{
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
-use model::placement::{Device, Machine, Plan, Role};
+use model::placement::{Device, Machine, Plan, PlanLevers, Role};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
 };
 use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, ShadowWork};
-use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, StepRows};
+use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
@@ -112,16 +112,70 @@ pub const STEP_TOKENS: usize = 1;
 /// one layer apart. The one-token step runs on row 0.
 pub const PAIR_ROWS: usize = 2;
 
+/// The V4.1 body's own levers, parsed once by the binary
+/// ([`OpenCfg::from_levers`]) and held by the body from its load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyLevers {
+    /// A prompt call runs the CED triangle where the file allows it
+    /// (`BLOOMERY_CED`).
+    pub ced: bool,
+    /// How a binary feeds a prompt (`BLOOMERY_PREFILL`).
+    pub prefill: PrefillMode,
+    /// Batches a prompt group holds, 1 to 8 (`BLOOMERY_PREFILL_GROUP`).
+    pub group: usize,
+    /// The step rows' levers.
+    pub rows: RowsLevers,
+}
+
+/// What [`open`] takes besides the file, the placement and the context: the
+/// body's levers and the placement's.
+#[derive(Clone, Debug)]
+pub struct OpenCfg {
+    pub body: BodyLevers,
+    pub place: PlanLevers,
+}
+
+impl OpenCfg {
+    /// The open's levers of a binary's one parse (`bloomery_levers::at_main`);
+    /// the hot list file is read here.
+    pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<OpenCfg, GpuError> {
+        const WHAT: &str = "deepseek41 OpenCfg";
+        let prefill = PrefillMode::from_name(levers.prefill()).ok_or(GpuError::State {
+            what: "BLOOMERY_PREFILL",
+            missing: "batch or steps",
+        })?;
+        Ok(OpenCfg {
+            body: BodyLevers {
+                ced: levers.ced(),
+                prefill,
+                group: levers.prefill_group(),
+                rows: RowsLevers::from_levers(levers),
+            },
+            place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
+        })
+    }
+}
+
+/// What a placed load hands the V4.1 body ([`ChainBody::load_placed`]): the
+/// hyperparameters the plan was made from, and the body's levers.
+#[derive(Clone, Debug)]
+pub struct BodyMeta {
+    pub hp: Hparams,
+    pub levers: BodyLevers,
+}
+
 /// The whole V4.1 model on this machine's placement `machine`: the file's
 /// headers read once ([`Hparams`]), its tensors classified and planned at
-/// `ctx_max` positions, and the plan's card loaded with its layers and the
-/// head ([`GpuModel::load_placed`]). A plan that breaks its invariants, or
-/// that spreads the layers over more than one card, is refused before
-/// anything is uploaded.
+/// `ctx_max` positions under `cfg`'s placement levers, and the plan's card
+/// loaded with its layers and the head ([`GpuModel::load_placed`]) under
+/// `cfg`'s body levers. A plan that breaks its invariants, or that spreads
+/// the layers over more than one card, is refused before anything is
+/// uploaded.
 pub fn open(
     file: Split,
     machine: fn(usize) -> Machine,
     ctx_max: usize,
+    cfg: &OpenCfg,
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open";
     let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
@@ -136,9 +190,13 @@ pub fn open(
         });
     }
     let plan = inputs
-        .plan(&machine, ctx_max as u64)
+        .plan(&machine, ctx_max as u64, &cfg.place)
         .map_err(|e| GpuError::plan(WHAT, e))?;
-    GpuModel::load_placed(file, &plan, 0, &inputs.hp)
+    let meta = BodyMeta {
+        hp: inputs.hp.clone(),
+        levers: cfg.body,
+    };
+    GpuModel::load_placed(file, &plan, 0, &meta)
 }
 
 /// Build the feature tap a draft reads ([`Body::read_features`]): for every
@@ -620,6 +678,8 @@ pub struct Body {
     /// The hyperparameters the body was loaded from, for the prompt batch's
     /// buffers.
     hp: Hparams,
+    /// The levers the body was loaded with.
+    levers: BodyLevers,
     /// The prompt batch's buffers ([`prefill`]), made by the first batch.
     batch: Option<Box<prefill::Batch>>,
 }
@@ -889,6 +949,13 @@ impl Body {
     #[must_use]
     pub fn ced(&self) -> CedState {
         self.ced.state()
+    }
+
+    /// How a binary feeds this body a prompt: the `BLOOMERY_PREFILL` it was
+    /// loaded with.
+    #[must_use]
+    pub fn prefill_mode(&self) -> PrefillMode {
+        self.levers.prefill
     }
 
     /// The last prompt call's needs: which positions each layer ran.
@@ -1887,7 +1954,7 @@ impl FeatureTap {
 
 impl ChainBody for Body {
     type Input = StepInput;
-    type Meta = Hparams;
+    type Meta = BodyMeta;
 
     fn arch() -> Arch {
         Arch::Deepseek41
@@ -2093,20 +2160,22 @@ impl ChainBody for Body {
         Body::rollback(self, pos)
     }
 
-    /// The body of card `card`: its buffers sized from `hp` — the
+    /// The body of card `card`: its buffers sized from `meta`'s hparams — the
     /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
     /// slot map from the plan's routed segments on the card, the host tier
-    /// over the file, and the three pieces.
+    /// over the file, and the three pieces, under `meta`'s levers.
     fn load_placed(
         gpu: &Gpu,
         file: Split,
         _w: &Weights,
         plan: &Plan<'_>,
         card: usize,
-        hp: &Hparams,
+        meta: &BodyMeta,
     ) -> Result<Body, GpuError> {
         const WHAT: &str = "deepseek41 Body::load_placed";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        let (hp, cfg) = (&meta.hp, meta.levers);
+        prefill::check_group(cfg.group)?;
         let spec = plan
             .machine
             .cards
@@ -2133,7 +2202,7 @@ impl ChainBody for Body {
         let planner =
             Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
         let row_bytes = engram_row_bytes(&file, hp)?;
-        let rows = StepRows::open(&file, hp, STEP_TOKENS)?;
+        let rows = StepRows::open(&file, hp, STEP_TOKENS, cfg.rows)?;
         if rows.row_bytes() != row_bytes {
             return Err(refuse(format!(
                 "the engram tables' rows are {row_bytes} bytes, the step's host half reads {}",
@@ -2190,7 +2259,7 @@ impl ChainBody for Body {
         hybrid.watch_fault(gpu.fault_word())?;
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
-        let ced = ced::Ced::new(&hp.layers, ring_rows, ced::from_env()?);
+        let ced = ced::Ced::new(&hp.layers, ring_rows, cfg.ced);
 
         Ok(Body {
             layers,
@@ -2223,6 +2292,7 @@ impl ChainBody for Body {
             eps: hp.rms_eps,
             tap: None,
             hp: hp.clone(),
+            levers: cfg,
             batch: None,
         })
     }

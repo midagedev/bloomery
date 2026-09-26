@@ -12,4 +12,5 @@ name = "threads"
 workspace = true
 
 [dependencies]
+bloomery-levers = { path = "../levers" }
 libc.workspace = true

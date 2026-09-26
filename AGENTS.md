@@ -563,122 +563,17 @@ any build without the config — on the box the config now hides that mistake.
 
 Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
 them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
-Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads), `BLOOMERY_STEAL_BLOCKS`
-(model::ops: blocks a lane is cut into for stealing, default 4 — 2/8/16 measured no better; a
-host-union block is at most 144 rows; an unusable value panics by name), `BLOOMERY_STEAL=0`
-(model::ops: whole-lane blocks, home lanes only — the steal lever's A/B arm; a value other than
-0 or 1 panics by name),
-`BLOOMERY_PROFILE` (model::profile; `BLOOMERY_PROFILE_DEPTH=d` makes
-`profile-measure.sh` prefill depth-decode's prompt of depth d first),
-`BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_KV_PREFETCH_ROWS=d` (attn: how many
-key rows ahead a decode row prefetches, default 16; `BLOOMERY_KV_PREFETCH=0` turns the hint off), `BLOOMERY_FLASH_SEGMENTS=n` (attn: the fixed
-segment count a decode row's keys are cut into for split-K, 1–32, default 32;
-the plan depends on the visible key count alone, so any thread count writes
-the same bits; 1 is the single-pass online softmax the split is banded
-against), `BLOOMERY_ATTN_BUNDLE=1` (attn: the per-head online
-segment kernel instead of the default head-bundle tile, which runs 8 heads
-over a split-K segment in one key walk; the same-binary arm the tile is
-banded against; a head's bits do not depend on its bundle), `BLOOMERY_ATTN_HALVES=2` (attn: on a multi-query row (prefill) each
-(token, head) row of the fused CPU dispatch runs on two threads, each
-accumulating half the latent — bit-identical, gated, and slower: both threads
-still stream every whole key row for the scores, so the default is 1; a
-decode row takes the split-K path and ignores it), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
-segment, a multiple of 32; an unusable value panics instead of falling back),
-`BLOOMERY_FLASH_MMA` (gpu flash: not a lever — refused by name at first use,
-whatever its value; the tensor-core segment pass is the only V2-Lite segment
-pass), `BLOOMERY_GQA_MMA=0` (qwen3moe
-GQA flash: the scalar segment pass instead of the tensor-core default, its
-banded twin; `just gate-gpu-qwen3moe-e2e` runs both and the `load` line
-prints which one ran), `BLOOMERY_QWEN3_UBATCH=<n>` (qwen3moe GEMM prefill, read once at load:
-tokens per ubatch, 1–4096, default 4096; the arena holds `min(n, ctx)` rows;
-a token's bits do not depend on it — `just gate-gpu-qwen3moe-e2e` holds 512,
-1000 and 4096 to one another; an unusable value is refused by name; the
-`load` line prints `ubatch=`), `BLOOMERY_HYBRID_NL` (gpu hybrid
-MoE: experts `[0, n_l)` of every routed stack stay on the card and the rest
-run on the host tier inside the captured step; unset or equal to the expert
-count is the all-card path; `just gate-gpu-hybrid` refuses to run with it
-set), `BLOOMERY_HYBRID_OVERLAP=0` (gpu hybrid: each layer's wait right after
-its go instead of after the card's experts and the shared expert),
-`BLOOMERY_LAUNCH_THREAD=1` (gpu `GpuModel`, read at open, default off: the step's
-`cuGraphLaunch` runs on a `Launcher` thread and the decode thread goes straight into the
-first host service's wait; a pinned opener puts it on the SMT sibling of its cpu and a core
-without one is refused by name; a failed launch reaches every waiting service and returns as
-the launch's error; `generate_ds41` prints `launch_thread=on launch_cpu=<n>|float` on its
-`load` line and, with `BLOOMERY_STEP_STATS=1`, `go_early_first launch_us first_serve_lag_us
-launch_wake_us` per step; moves no bit — the depth runner's `<D>@BLOOMERY_LAUNCH_THREAD=1`
-arm is its same-binary A/B),
-`BLOOMERY_PIN_MAIN=0` (`bloomery-decode`, `bench_v41_host`, `generate_ds41`: leave the
-main thread floating instead of pinning it to the dispatcher's cpu slot — the
-default pins, and the `load` line prints the ask and the outcome),
-`BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
-step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
-`cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
-`vram_free_load` and `vram_free_min`; after a batched prompt the `stat prefill split` line,
-which prints either way (`prologue/chain/union/wait/enqueue/copy` ms), adds per layer-batch the
-card's `card_out` (first launch to the route's D2H), `card_in` (the shadow under the union) and
-`card_proj` from event pairs; unset, nothing is read),
-`BLOOMERY_CHECK_FINITE=1` (`generate_ds41`: every position is first stepped eagerly outside the
-graph with each sub-layer's streams read back (`shared/ds41_finite.rs`, the probe
-`gate-gpu-ds41-long` runs), then taken back and stepped through the engine, and a `stat finite` line
-per generated step names the first non-finite `(layer, site)` — at a MoE seam its routing and first
-non-finite buffer — or `ok`, then a `stat finite summary`; refused beside `--time`,
-`BLOOMERY_DRAFT` and `BLOOMERY_STEP_STATS=1`; unset, nothing is read),
-`BLOOMERY_DRAFT=lookup` (`generate_ds41`: an n-gram lookup draft — `gpu-gates::draft::Lookup`,
-the n = 3→2→1 most-recent follower of `draft-accept.py`'s lookup-recent, fed the fed ids and every
-emitted token — served through `step_pair`: row A's argmax equal to the draft accepts two positions,
-else the second position is taken back and row A's token stands; a step with no proposal is a plain
-`step`; the `tokens` line is the plain run's and `just gate-gpu-ds41-draft` pins that; `time pass …
-positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` rows, which
-`tools/ref/depth-ds41.sh` reads),
-`BLOOMERY_HOST_POPULATE=0` (gpu placed load, default 1: do not read the plan's host set in with
-`MADV_POPULATE_READ` at load — the fresh-fault arm; the gate prints `host_populate=` and `generate_ds41` prints `host_populate=`/`host_lock=` after its `load` line; the host tier reads the body's own mapping (one `Split` shared by `Arc`), so the populate reaches the step threads' page tables — measured on the 3090 gate placement, steps 2–63 minor faults 590,664 → 1,719 in total, the remainder engram rows),
-`BLOOMERY_HOST_LOCK=1` (default 0: after populating, `mlock` the host set for the model's life;
-`stage-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
-`BLOOMERY_CARD_DONTNEED=0` (default 1: keep the file pages of uploaded card segments in the page
-cache; on, each segment's pages are dropped right after its upload, inward-rounded, `token_embd` and
-the engram table excepted — with a ~~196 GB~~ 214.0 GB host set (plan (a) on the public file, 12,692 experts; corrected 2026-09-25) and 48 GB of cards the machine's 264 GB does not
-hold both, measured: populate then failed residency by 846 pages),
-`BLOOMERY_ENGRAM_HELPER=0` (gpu-deepseek41 `StepRows`: the step thread reads the engram rows from
-the mapping itself instead of the helper thread, which advises every row (`WILLNEED`, one batch),
-copies them and hands them back while the step thread reads the embedding row; the helper pins to
-the SMT sibling of a pinned caller's core and floats otherwise; read once at open; with
-`BLOOMERY_STEP_STATS=1` the step line adds `eng_warm eng_cold eng_direct eng_wait_us eng_helper_us
-eng_classify_us` and the summary `eng_helper=`; cold rows 11–15× faster, all-warm rows tens of µs
-slower — the row-hit check that removes that tax is queued),
-`BLOOMERY_CARD_BUDGET=<bytes|nM|nG>` (placement: every card of a plan plans with `min(usable, budget)`
-usable bytes on the same usable − KV − context − scratch − margin arithmetic, so it keeps fewer experts —
-the A6000 under the 3090's usable bytes plans the gate placement slot for slot, which is how a 24 GB or
-a 38 GB card is emulated for timing; a budget below the card's floor (dense granules + KV + context +
-scratch + margin) is refused with each term; `M`/`G` are binary units; `generate_ds41` prints it as
-`card_budget=` on the plan line),
-`BLOOMERY_Q3K_SPLIT=1|2|4|8` (gpu `enqueue_gemv_q3k`, default 1: the split-K width for a
-Q3_K row whose walk has at least `BLOOMERY_Q3K_SPLIT_ITERS` (default 16) two-super-block
-iterations that the width divides — on V4.1 only `wo_b`, K = 8192 — through `q3k_gemv_split`
-(`_mcol` at m > 1); a function of `n_sb` alone so a joined launch, a row-capped upload and an
-m-column pass write the same bits; the default is unsplit and bit-identical to the plain kernel,
-and 2 is the same-binary A/B arm — the split's fold order moves the greedy trajectory, so it is
-not a default until a lease A/B resolves its predicted −60…−150 µs per step; an unusable value
-panics by name),
-`BLOOMERY_CED=on|off` (gpu-deepseek41 `Body`, read once at open, default on: a prompt call runs
-each layer only at the positions a later reader needs — the CED triangle, `body/ced.rs`; `off`
-runs every layer at every position, the same-binary A/B arm; the `load` line prints `ced=on` or
-`ced=off (<reason>)`, the reason being the lever or the file breaking a fact the walk rests on, and
-`generate_ds41` prints a `stat prefill ced=` line with each layer's block and latent starts; after
-a triangle call `Body::keep_point` grants only the call's boundaries and its last positions and
-`Body::rollback` to any other point is a named error; any other value is refused by name),
-`BLOOMERY_PREFILL_GROUP=<n>` (gpu-deepseek41 prompt batch, read once when the batch's buffers are
-made, default 2, 1–8: a prompt call's batches run in groups of n, layer by layer over the group, each
-layer-batch's route enqueued after the previous one's shadow and ahead of that one's host serve — across a
-layer's last batch to the next layer's first too — so the card routes under the host union; a lone last
-batch joins the group before it, so n + 1 residual sets are held from n = 2 on (G 2: 238 MB more card
-memory without taps); 1 is the batch-first order, the same-binary A/B arm, and both write the same bits
-(`just gate-gpu-ds41-prefill` under each); an unusable value is refused by name; the `load` line prints
-`group=`, the `prefill` line `group_bytes=`, and `stat prefill split` prints `group=` and `wait_first_lb=`,
-the wait of each group's first batch — near the route there means the wrap is missing),
-`BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
-each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
-same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
-Each is read once, at first use.
+Runtime levers are the rows of `crates/levers/src/registry.rs`, and nothing
+else documents them. A binary parses the `parsed` rows once, first thing in
+`main` (`bloomery_levers::at_main`), refuses by name a value its kind does not
+take, and hands typed values down; `<bin> --levers` prints what that process
+parsed. An `in place` row is still read where it is used, each a line of
+`tools/levers-direct.txt` with the round that converts it (`just
+check-levers`). A retired name that is set is refused by name in the binaries
+that parse at `main`. The table — lever, class, what it takes, what unset
+means, who reads it, what it does — is `bloomery_levers::markdown()`, and `just
+gate-levers` prints it. The measurements behind the defaults are in rig-log;
+the prose the registry replaced is this file at `382bde6`, lines 566–681.
 
 A V4.1 prompt batch's shadow runs the card's routed experts over the layer's whole block by
 tiles, one path with no lever: `ds41_card_buckets` groups the block's card slots by expert,

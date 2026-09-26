@@ -251,13 +251,15 @@ mod gate {
     // ------------------------------------------------------------------ run
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
         let inputs = PlanInputs::read(&split)?;
         let machine = workstation::plan_gate(inputs.model.layers);
-        let plan = inputs.plan(&machine, CTX_MAX)?;
+        let plan = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let planned = &plan.cards[0];
         println!(
             "gate plan of {path}: {} layers, ctx_max {}, scratch {} B, headroom {} B",
@@ -266,7 +268,7 @@ mod gate {
 
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let mut m = body::open(file, workstation::plan_gate, CTX_MAX as usize)?;
+        let mut m = body::open(file, workstation::plan_gate, CTX_MAX as usize, &cfg)?;
         let load_s = t.elapsed().as_secs_f64();
         let mut head = {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_step")?;

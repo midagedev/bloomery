@@ -14,7 +14,9 @@
 //! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
 //! state); `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
 //! the same binary's timing arm, and the `load` line prints which one ran
-//! (`prefill=`). Prompt ids are
+//! (`prefill=`, the mode the engine holds). Every lever is parsed once, at
+//! `main` (`bloomery_levers::at_main`); `--levers` prints them with this
+//! process's values and exits. Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
 //! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the long gate's
@@ -186,9 +188,10 @@ mod drive {
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
+    use bloomery_levers::Levers;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{HotList, Machine, workstation};
+    use model::placement::{HotList, Machine, PlanLevers, workstation};
 
     use crate::dspark::{self, Dspark, Verdict};
     use crate::finite;
@@ -239,9 +242,11 @@ mod drive {
         mode: StepMode,
         timed: bool,
         warm: Option<usize>,
+        /// `BLOOMERY_STEP_STATS`, as the levers hold it.
+        stats: bool,
     }
 
-    fn parse_args() -> Result<Args, GateError> {
+    fn parse_args(levers: &Levers) -> Result<Args, GateError> {
         let mut a = Args {
             prompt: Prompt::Default,
             depth: None,
@@ -251,6 +256,7 @@ mod drive {
             mode: StepMode::Graph,
             timed: false,
             warm: None,
+            stats: levers.step_stats(),
         };
         let (mut row, mut ids) = (None, None);
         let mut it = std::env::args().skip(1);
@@ -399,11 +405,12 @@ mod drive {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let a = parse_args()?;
-        let draft = draft_lever()?;
-        let check_finite = finite_lever(&a, draft)?;
-        let prefill_mode = body::PrefillMode::from_env()?;
-        let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
+        let levers = bloomery_levers::at_main()?;
+        let a = parse_args(&levers)?;
+        let draft = Draft::from_levers(&levers)?;
+        let check_finite = finite_lever(&a, draft, &levers)?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let pin_main = levers.pin_main();
         let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
         let depth = ids.len();
@@ -427,7 +434,7 @@ mod drive {
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&file)?;
-        let ctx_max = print_plan(&inputs, a.place, a.ctx)?;
+        let ctx_max = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
         // The caches hold the plan's ctx_max positions, the value the model
         // is loaded with; --ctx only asks for it.
         if fed > ctx_max {
@@ -450,8 +457,9 @@ mod drive {
             .into());
         }
 
-        let mut m = body::open(file, a.place.machine(), a.ctx)?;
+        let mut m = body::open(file, a.place.machine(), a.ctx, &cfg)?;
         m.set_mode(a.mode);
+        let prefill_mode = m.body("generate_ds41")?.prefill_mode();
         let top_k = m.body("generate_ds41")?.indexer_top_k();
         let shadow = m.body("generate_ds41")?.shadow_host();
         if top_k != inputs.hp.indexer.top_k {
@@ -485,7 +493,7 @@ mod drive {
                 prefill_mode.name()
             },
             m.body("generate_ds41")?.ced(),
-            body::Body::prefill_group_lever()?,
+            m.body("generate_ds41")?.prefill_group_lever(),
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -540,7 +548,7 @@ mod drive {
         };
         if feed_mode == body::PrefillMode::Batch {
             body::prepare_prefill(&mut m)?;
-            if std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1") {
+            if a.stats {
                 let (gpu, _, b) = m.body_parts("generate_ds41")?;
                 b.set_prefill_card_timing(gpu, true)?;
             }
@@ -573,19 +581,10 @@ mod drive {
         }
     }
 
-    /// `BLOOMERY_CHECK_FINITE`: unset or `0` is off, `1` on; any other value
-    /// is refused, and so is the lever beside `--time`, the draft and the
-    /// step stats.
-    fn finite_lever(a: &Args, draft: Draft) -> Result<bool, GateError> {
-        let on = match std::env::var("BLOOMERY_CHECK_FINITE") {
-            Err(std::env::VarError::NotPresent) => false,
-            Ok(v) if v == "0" => false,
-            Ok(v) if v == "1" => true,
-            Ok(v) => {
-                return Err(format!("BLOOMERY_CHECK_FINITE is 1, 0 or unset, not {v:?}").into());
-            }
-            Err(e) => return Err(format!("BLOOMERY_CHECK_FINITE: {e}").into()),
-        };
+    /// `BLOOMERY_CHECK_FINITE` as the levers hold it, refused beside `--time`,
+    /// the draft and the step stats.
+    fn finite_lever(a: &Args, draft: Draft, levers: &Levers) -> Result<bool, GateError> {
+        let on = levers.check_finite();
         let beside = [
             (
                 a.timed,
@@ -596,7 +595,7 @@ mod drive {
                 "BLOOMERY_DRAFT: the probe reads one-row steps",
             ),
             (
-                std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1"),
+                a.stats,
                 "BLOOMERY_STEP_STATS=1: the host tier's counters would count the probe's step too",
             ),
         ];
@@ -717,6 +716,19 @@ mod drive {
     }
 
     impl Draft {
+        /// `BLOOMERY_DRAFT` as the levers hold it: unset is the plain path,
+        /// `lookup` and `dspark` the served drafts.
+        fn from_levers(levers: &Levers) -> Result<Draft, GateError> {
+            match levers.draft() {
+                None => Ok(Draft::Off),
+                Some("lookup") => Ok(Draft::Lookup),
+                Some("dspark") => Ok(Draft::Dspark),
+                Some(other) => {
+                    Err(format!("BLOOMERY_DRAFT is lookup, dspark or unset, not {other:?}").into())
+                }
+            }
+        }
+
         fn name(self) -> &'static str {
             match self {
                 Draft::Off => "unset",
@@ -726,27 +738,18 @@ mod drive {
         }
     }
 
-    /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` and `dspark` the
-    /// served drafts; any other value is refused.
-    fn draft_lever() -> Result<Draft, GateError> {
-        let draft = match std::env::var("BLOOMERY_DRAFT") {
-            Err(std::env::VarError::NotPresent) => Draft::Off,
-            Ok(v) if v == "lookup" => Draft::Lookup,
-            Ok(v) if v == "dspark" => Draft::Dspark,
-            Ok(v) => {
-                return Err(format!("BLOOMERY_DRAFT is lookup, dspark or unset, not {v:?}").into());
-            }
-            Err(e) => return Err(format!("BLOOMERY_DRAFT: {e}").into()),
-        };
-        Ok(draft)
-    }
-
-    /// The plan the engine is about to load: where the experts sit. Returns
-    /// the plan's `ctx_max`, the positions the caches are sized for.
-    fn print_plan(inputs: &PlanInputs, place: Place, ctx: usize) -> Result<usize, GateError> {
+    /// The plan the engine is about to load under the placement's `levers`:
+    /// where the experts sit. Returns the plan's `ctx_max`, the positions the
+    /// caches are sized for.
+    fn print_plan(
+        inputs: &PlanInputs,
+        place: Place,
+        ctx: usize,
+        levers: &PlanLevers,
+    ) -> Result<usize, GateError> {
         let machine = place.machine()(inputs.model.layers);
-        let plan = inputs.plan(&machine, u64::try_from(ctx)?)?;
-        let hot_list = HotList::from_env()?.map_or("none", HotList::path);
+        let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
+        let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
         let card = &plan.cards[0];
         println!(
@@ -895,7 +898,7 @@ mod drive {
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
-        let stats_on = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        let stats_on = a.stats;
         let mut probes: Vec<Probe> = Vec::new();
         if stats_on {
             probes.reserve_exact(a.n_gen);
@@ -1011,7 +1014,7 @@ mod drive {
         // (position the token is the argmax after, token), past token 0.
         let mut emitted: Vec<(u32, u32)> = Vec::with_capacity(a.n_gen);
         let mut passes: Vec<(PassKind, f64)> = Vec::with_capacity(a.n_gen - 1);
-        let stats_on = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        let stats_on = a.stats;
         let mut probes: Vec<Probe> = Vec::new();
         if stats_on {
             probes.reserve_exact(a.n_gen);

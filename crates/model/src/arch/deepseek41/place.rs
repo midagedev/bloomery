@@ -16,7 +16,8 @@ use super::hparams::{Collapse, Hparams};
 use super::kv::KvLayout;
 use super::roles;
 use crate::placement::{
-    self, CardFormat, Machine, ModelTensors, PlacementError, Plan, Role, Unimplemented, Violation,
+    self, CardFormat, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, Unimplemented,
+    Violation,
 };
 
 /// What a plan of a V4.1 or V4 file is made from, read from its headers.
@@ -123,10 +124,16 @@ impl PlanInputs {
         out
     }
 
-    /// The placement of the file on `machine` at `ctx_max` positions, refused
-    /// when it cannot be built or breaks an invariant.
-    pub fn plan<'a>(&'a self, machine: &'a Machine, ctx_max: u64) -> Result<Plan<'a>, PlaceError> {
-        let plan = placement::plan(&self.model, machine, ctx_max, &self.kv)?;
+    /// The placement of the file on `machine` at `ctx_max` positions under
+    /// the placement's `levers`, refused when it cannot be built or breaks an
+    /// invariant.
+    pub fn plan<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let plan = placement::plan(&self.model, machine, ctx_max, &self.kv, levers)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)

@@ -107,9 +107,11 @@
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
 //! short subset.
 //!
-//! `BLOOMERY_PREFILL_GROUP=n` picks how many batches a group runs layer by
-//! layer (default 2; the `loaded` line names it, with the bytes the batches
-//! past a group's first hold); 1 and 2 must pass. The cases hold calls of
+//! The levers are parsed once, at `main` (`bloomery_levers::at_main`), and
+//! the model opens under them. `BLOOMERY_PREFILL_GROUP=n` picks how many
+//! batches a group runs layer by layer (default 2; the `loaded` line names
+//! it, with the bytes the batches past a group's first hold); 1 and 2 must
+//! pass. The cases hold calls of
 //! one batch, two, three (one group of three under 2), five (a pair, then
 //! three), six and eight. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
@@ -321,18 +323,25 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
         let path = workstation::model_v41();
         let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = Instant::now();
-        let mut m = body::open(file, workstation::plan_gate, workstation::CTX_MAX as usize)?;
+        let mut m = body::open(
+            file,
+            workstation::plan_gate,
+            workstation::CTX_MAX as usize,
+            &cfg,
+        )?;
         body::attach_features(&mut m, &layers)?;
         m.set_mode(StepMode::Graph);
         body::prepare_prefill(&mut m)?;
-        let stats = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        let stats = levers.step_stats();
         if stats {
             let (gpu, _, b) = m.body_parts(NAME)?;
             b.set_prefill_card_timing(gpu, true)?;

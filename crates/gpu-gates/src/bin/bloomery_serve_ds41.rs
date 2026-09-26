@@ -20,6 +20,10 @@
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
+//!
+//! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
+//! `--levers` prints them with this process's values and exits. A prompt is
+//! fed the way the engine holds `BLOOMERY_PREFILL`.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -55,7 +59,7 @@ mod drive {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::workstation;
+    use model::placement::{PlanLevers, workstation};
     use serve::{EngineProps, FATAL_LINGER, PlacementProps, ServeError, Server, ServerConfig};
     use tokenizer::Tokenizer;
 
@@ -101,7 +105,9 @@ mod drive {
     /// Loads the model and serves until the listener or the engine fails;
     /// `Ok` carries why the server ended.
     pub fn run() -> Result<ServeError, GateError> {
+        let levers = bloomery_levers::at_main()?;
         let a = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = ref_model_path()?;
         let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
         let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -121,7 +127,7 @@ mod drive {
         let inputs = PlanInputs::read(&split)?;
         let model = model_props(&split, &inputs.model);
         drop(split);
-        let (card, placement) = print_plan(&inputs, a.place, a.ctx)?;
+        let (card, placement) = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
         let props = EngineProps {
             model: Some(model),
             placement,
@@ -129,19 +135,17 @@ mod drive {
         };
         let want_top_k = inputs.hp.indexer.top_k;
         let n_layer = inputs.hp.n_layer;
-        let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
-        let prefill_mode = body::PrefillMode::from_env()?;
         let open = OpenArgs {
             place: a.place,
             ctx: a.ctx,
             mode: StepMode::Graph,
-            pin_main,
+            pin_main: levers.pin_main(),
         };
         let engine = Ds41Engine::spawn(
             move || {
                 let mut g = Generator::open(
                     open,
-                    body::open,
+                    |file, machine, ctx| body::open(file, machine, ctx, &cfg),
                     |m: &Deepseek41Model| {
                         let body = m.body("bloomery-serve-ds41")?;
                         let top_k = body.indexer_top_k();
@@ -159,20 +163,24 @@ mod drive {
                              prefill={}",
                             shadow.bytes,
                             shadow.unified_addressing,
-                            prefill_mode.name()
+                            body.prefill_mode().name()
                         ))
                     },
                     &mut std::io::stderr(),
                 )?;
-                if prefill_mode == body::PrefillMode::Batch {
+                let mode = g.model_mut().body("bloomery-serve-ds41")?.prefill_mode();
+                if mode == body::PrefillMode::Batch {
                     body::prepare_prefill(g.model_mut())?;
                 }
                 Ok(g)
             },
             |m: &Deepseek41Model, n| m.body("bloomery-serve-ds41").map_or(0, |b| b.keep_point(n)),
-            move |m: &mut Deepseek41Model, ids: &[u32]| match prefill_mode {
-                body::PrefillMode::Batch => body::prefill(m, ids),
-                body::PrefillMode::Steps => m.step(ids),
+            |m: &mut Deepseek41Model, ids: &[u32]| {
+                let mode = m.body("bloomery-serve-ds41")?.prefill_mode();
+                match mode {
+                    body::PrefillMode::Batch => body::prefill(m, ids),
+                    body::PrefillMode::Steps => m.step(ids),
+                }
             },
             vocab,
             card,
@@ -197,16 +205,18 @@ mod drive {
         Ok(server.run())
     }
 
-    /// The plan the engine is about to load, on stderr; returns the card's
-    /// name and the plan's placement for `/props` (`None`, and a line saying
-    /// why, when a card's nvidia-smi index cannot be found).
+    /// The plan the engine is about to load under the placement's `levers`,
+    /// on stderr; returns the card's name and the plan's placement for
+    /// `/props` (`None`, and a line saying why, when a card's nvidia-smi index
+    /// cannot be found).
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
         ctx: usize,
+        levers: &PlanLevers,
     ) -> Result<(String, Option<PlacementProps>), GateError> {
         let machine = place.machine()(inputs.model.layers);
-        let plan = inputs.plan(&machine, u64::try_from(ctx)?)?;
+        let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
         let card = &plan.cards[0];
         eprintln!(

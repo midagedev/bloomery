@@ -84,7 +84,7 @@ mod gate {
     use model::placement::host_lock::{HostSet, PageDrop, page_bytes};
     use model::placement::{
         Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
-        Segment, workstation,
+        PlanLevers, Segment, workstation,
     };
 
     /// Design §5's two plans.
@@ -163,7 +163,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let parsed = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let place = PlanLevers::from_levers(&parsed)?;
         let levers = host_levers()?;
         if args.lock.is_some() && !levers.lock {
             return Err(
@@ -185,7 +187,7 @@ mod gate {
             PlanId::B => workstation::plan_b(inputs.model.layers),
         };
         let plan = inputs
-            .plan(&machine, workstation::CTX_MAX)
+            .plan(&machine, workstation::CTX_MAX, &place)
             .map_err(|e| format!("plan ({}): {e}", args.plan))?;
         println!(
             "plan ({}) of {path}: {} layers, ctx_max {}",

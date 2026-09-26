@@ -145,7 +145,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 JUST=(just --justfile "$ROOT/justfile" --working-directory "$ROOT")
 
 SMOKE=(
-  check-recipes check-rustflags check-comments check-arch check fmt-check lint gate-ptx-spill
+  check-recipes check-rustflags check-comments check-levers check-arch check fmt-check lint gate-ptx-spill
   gate-gpu-ds41-step
   "gate-gpu-ds41-prefill:--cases 512 --no-split --no-extra"
   gate-gpu-e2e

@@ -10,12 +10,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use super::{ExpertList, ModelTensors, PlacementError};
-
-/// The lever: a path to a hot list, read once per process.
-pub const LEVER: &str = "BLOOMERY_HOT_LIST";
 
 /// A parsed hot list file.
 #[derive(Clone, Debug)]
@@ -29,27 +25,8 @@ pub struct HotList {
 }
 
 impl HotList {
-    /// The list `BLOOMERY_HOT_LIST` names, read and checked on the first
-    /// call of the process; `None` when the variable is not set. Held in a
-    /// `OnceLock` because it is a lever: every plan of the process places by
-    /// the same file.
-    pub fn from_env() -> Result<Option<&'static HotList>, PlacementError> {
-        static READ: OnceLock<Result<Option<HotList>, (String, String)>> = OnceLock::new();
-        let read = READ.get_or_init(|| match std::env::var(LEVER) {
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(e) => Err((LEVER.to_string(), e.to_string())),
-            Ok(path) => HotList::parse_file(&path).map(Some),
-        });
-        match read {
-            Ok(list) => Ok(list.as_ref()),
-            Err((path, detail)) => Err(PlacementError::HotList {
-                path: path.clone(),
-                detail: detail.clone(),
-            }),
-        }
-    }
-
-    /// Read and check the file at `path`.
+    /// Read and check the file at `path` — the one `BLOOMERY_HOT_LIST` names,
+    /// which a binary parses once ([`super::PlanLevers::from_levers`]).
     pub fn read(path: &Path) -> Result<HotList, PlacementError> {
         let p = path.display().to_string();
         HotList::parse_file(&p).map_err(|(path, detail)| PlacementError::HotList { path, detail })

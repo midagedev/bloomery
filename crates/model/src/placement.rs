@@ -16,7 +16,8 @@
 //! hottest ids from a hot list file ([`HotList`], the `BLOOMERY_HOT_LIST`
 //! lever). The count, and so every byte total, is the same either way; only
 //! the ids change. A card byte budget (`BLOOMERY_CARD_BUDGET`,
-//! [`card_budget`]) caps every card's usable bytes before the rule runs.
+//! [`card_budget`]) caps every card's usable bytes before the rule runs. Both
+//! come in as [`PlanLevers`], which a binary parses once.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -760,9 +761,6 @@ pub enum PlacementError {
     /// A hot list file that cannot serve this plan: the file and why.
     #[error("hot list {path}: {detail}")]
     HotList { path: String, detail: String },
-    /// A `BLOOMERY_CARD_BUDGET` value that is not a byte count.
-    #[error("{} {value:?}: {detail}", card_budget::LEVER)]
-    CardBudgetLever { value: String, detail: String },
     /// Features of the file the engine does not run yet — every one, each with
     /// the layer it is on, or none for a model-wide one.
     #[error("{} feature(s) of this file are not implemented: {}", .0.len(), unimplemented_list(.0))]
@@ -1305,17 +1303,44 @@ fn footprint(
     Ok(heap.taken)
 }
 
-/// [`plan_with`] the hot list the `BLOOMERY_HOT_LIST` lever names, or the id
-/// prefix when it is unset ([`HotList::from_env`]), and the card budget the
-/// `BLOOMERY_CARD_BUDGET` lever sets, or none ([`card_budget::from_env`]).
+/// The placement's levers, which a binary parses once
+/// ([`PlanLevers::from_levers`]): the hot list `BLOOMERY_HOT_LIST` names, read
+/// and checked, and the card budget `BLOOMERY_CARD_BUDGET` sets. The default
+/// is neither: the id prefix, and each card's own usable bytes.
+#[derive(Clone, Debug, Default)]
+pub struct PlanLevers {
+    pub hot: Option<HotList>,
+    pub card_budget: Option<u64>,
+}
+
+impl PlanLevers {
+    /// The placement's levers of a binary's one parse; the hot list file is
+    /// read and checked here.
+    pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
+        Ok(PlanLevers {
+            hot: levers.hot_list().map(HotList::read).transpose()?,
+            card_budget: levers.card_budget(),
+        })
+    }
+}
+
+/// [`plan_with`] under `levers`: the hot list's ids, or the id prefix without
+/// one, and the card budget, or none.
 pub fn plan<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
+    levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlacementError> {
-    let hot = HotList::from_env()?;
-    plan_with(model, machine, ctx_max, kv, hot, card_budget::from_env()?)
+    plan_with(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        levers.hot.as_ref(),
+        levers.card_budget,
+    )
 }
 
 /// `card`'s usable bytes under `budget`: the one place the cap is taken.

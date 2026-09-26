@@ -25,6 +25,9 @@
 //! generated id, the end-of-generation one included), a `text_consistent`
 //! line (the streamed text against the vocabulary's one-shot decode of the
 //! same ids), and the `chat:` summary line.
+//!
+//! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
+//! `--levers` prints them with this process's values and exits.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -49,7 +52,7 @@ mod drive {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::workstation;
+    use model::placement::{PlanLevers, workstation};
     use sampler::{Sampler, SamplerParams};
     use tokenizer::{Decoder, Tokenizer};
 
@@ -208,7 +211,9 @@ mod drive {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let a = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let mut sampler = Sampler::new(a.sampling)?;
         let path = ref_model_path()?;
         let tok = Tokenizer::from_gguf(&path)?;
@@ -221,18 +226,17 @@ mod drive {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         drop(split);
-        print_plan(&inputs, a.place, a.ctx)?;
+        print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
         let want_top_k = inputs.hp.indexer.top_k;
-        let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
         let open = OpenArgs {
             place: a.place,
             ctx: a.ctx,
             mode: StepMode::Graph,
-            pin_main,
+            pin_main: levers.pin_main(),
         };
         let mut g = Generator::open(
             open,
-            body::open,
+            |file, machine, ctx| body::open(file, machine, ctx, &cfg),
             |m: &Deepseek41Model| {
                 let body = m.body("bloomery-chat")?;
                 let top_k = body.indexer_top_k();
@@ -254,10 +258,16 @@ mod drive {
         chat(&mut g, &a, &tok, &mut sampler, &ids)
     }
 
-    /// The plan the engine is about to load, on stderr.
-    fn print_plan(inputs: &PlanInputs, place: Place, ctx: usize) -> Result<(), GateError> {
+    /// The plan the engine is about to load under the placement's `levers`,
+    /// on stderr.
+    fn print_plan(
+        inputs: &PlanInputs,
+        place: Place,
+        ctx: usize,
+        levers: &PlanLevers,
+    ) -> Result<(), GateError> {
         let machine = place.machine()(inputs.model.layers);
-        let plan = inputs.plan(&machine, u64::try_from(ctx)?)?;
+        let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
         let card = &plan.cards[0];
         eprintln!(

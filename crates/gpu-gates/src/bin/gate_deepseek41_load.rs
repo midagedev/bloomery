@@ -14,7 +14,8 @@
 //!   and the host mark on the rest, and equals the host copy the host tier
 //!   serves by. The card experts are made here from their source alone — the
 //!   hot list `BLOOMERY_HOT_LIST` names (its first `n_l` ids of the layer), or
-//!   the id prefix `[0, n_l)` when it is unset — not from the plan's segments.
+//!   the id prefix `[0, n_l)` when it is unset, as the levers parsed at `main`
+//!   hold it — not from the plan's segments.
 //! - (ii) state: per layer, the body's window ring, compressed rows, index
 //!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly;
 //!   its ring shadow is `KvLayout`'s shadow bytes, and the page-locked host
@@ -66,7 +67,7 @@ mod gate {
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
-    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, StepInput};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, OpenCfg, StepInput};
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
@@ -102,17 +103,19 @@ mod gate {
     const PINNED_GRANULE: i128 = 2 << 20;
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
+        let cfg = OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&split)?;
         let machine = workstation::plan_gate(inputs.model.layers);
         let plan = inputs
-            .plan(&machine, CTX_MAX)
+            .plan(&machine, CTX_MAX, &cfg.place)
             .map_err(|e| format!("the gate plan: {e}"))?;
         let planner = Planner::from_file(&split, &inputs.hp, CTX_MAX)?;
         let specs = rope_specs_from_keys(&split)?;
         drop(split);
-        let hot = HotList::from_env()?;
+        let hot = cfg.place.hot.as_ref();
         let lists = card_lists(&plan, hot)?;
         print_plan(&path, &plan, hot);
 
@@ -140,7 +143,7 @@ mod gate {
             .into());
         }
 
-        let mut m = load(&path, 1)?;
+        let mut m = load(&path, 1, &cfg)?;
         let free1 = free(&probe)?;
         let mut ok = true;
         let shadow_host;
@@ -163,7 +166,7 @@ mod gate {
         ok &= refusals_ok;
         drop(m);
         let free2 = free(&probe)?;
-        let m = load(&path, 2)?;
+        let m = load(&path, 2, &cfg)?;
         let free3 = free(&probe)?;
         drop(m);
         let free4 = free(&probe)?;
@@ -193,11 +196,12 @@ mod gate {
         Ok(probe.mem_info()?.0 as u64)
     }
 
-    /// Load the model by the gate placement, through the engine's entry.
-    fn load(path: &str, n: usize) -> Result<Deepseek41Model, GateError> {
+    /// Load the model by the gate placement under `cfg`, through the
+    /// engine's entry.
+    fn load(path: &str, n: usize, cfg: &OpenCfg) -> Result<Deepseek41Model, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         let start = Instant::now();
-        let m = body::open(file, workstation::plan_gate, CTX_MAX as usize)?;
+        let m = body::open(file, workstation::plan_gate, CTX_MAX as usize, cfg)?;
         println!(
             "load {n}: {} B resident in {:.1} s (runtime value)",
             m.resident_bytes(),

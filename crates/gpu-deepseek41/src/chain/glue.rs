@@ -1083,8 +1083,7 @@ fn need(what: &'static str, name: &str, len: usize, want: usize) -> Result<(), G
 
 // ---------------------------------------------------------- the host half
 
-/// The levers of [`StepRows`], read once when it opens
-/// ([`RowsLevers::from_env`]).
+/// The levers of [`StepRows`], which it opens with ([`StepRows::open`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowsLevers {
     /// The engram rows are read by a helper thread: the calling thread hashes
@@ -1097,12 +1096,12 @@ pub struct RowsLevers {
 }
 
 impl RowsLevers {
-    /// The levers from the environment.
+    /// The levers of a binary's one parse (`bloomery_levers::at_main`).
     #[must_use]
-    pub fn from_env() -> RowsLevers {
+    pub fn from_levers(levers: &bloomery_levers::Levers) -> RowsLevers {
         RowsLevers {
-            helper: !std::env::var("BLOOMERY_ENGRAM_HELPER").is_ok_and(|v| v == "0"),
-            stats: std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1"),
+            helper: levers.engram_helper(),
+            stats: levers.step_stats(),
         }
     }
 }
@@ -1165,21 +1164,15 @@ pub struct StepRows {
 
 impl StepRows {
     /// The host half for steps of `tokens` tokens of `file`, whose
-    /// hyperparameters are `hp`: the embedding table checked, the engram
-    /// tables opened (headers only) and checked against `hp`, and every
-    /// buffer a fill writes allocated.
+    /// hyperparameters are `hp`, under `levers`: the embedding table checked,
+    /// the engram tables opened (headers only) and checked against `hp`, and
+    /// every buffer a fill writes allocated.
     ///
-    /// The levers come from the environment ([`RowsLevers::from_env`]); a
-    /// helper is pinned to the SMT sibling of the calling thread's core when
+    /// A helper is pinned to the SMT sibling of the calling thread's core when
     /// that thread is pinned ([`caller_sibling`]) — the caller is the pool's
     /// dispatcher, which waits while the helper reads, so that core is idle
     /// then and no worker's core is shared — and floats otherwise.
-    pub fn open(file: &Split, hp: &Hparams, tokens: usize) -> Result<StepRows, GpuError> {
-        StepRows::open_with(file, hp, tokens, RowsLevers::from_env())
-    }
-
-    /// [`StepRows::open`] with the levers named.
-    pub fn open_with(
+    pub fn open(
         file: &Split,
         hp: &Hparams,
         tokens: usize,

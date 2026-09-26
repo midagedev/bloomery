@@ -4,8 +4,9 @@
 //! owns the [`GpuModel`] and nothing else: no sampling, no text.
 //!
 //! Generic over the chain body. The body's own entry (`body::open` of the
-//! V4.1 device crate) and whatever the caller checks on the loaded body come
-//! in as arguments, because this library's source does not name a device
+//! V4.1 device crate, with the levers the binary parsed) and whatever the
+//! caller checks on the loaded body come in as arguments, because this
+//! library's source does not name a device
 //! crate: named here, it would be linked, device bundle and all, into every
 //! gate built with the feature, the ones that launch none of its kernels
 //! too (the reason [`crate::ds41_meta::RopeMeta::read`] takes its ropes as
@@ -69,9 +70,6 @@ pub struct OpenArgs {
     pub pin_main: bool,
 }
 
-/// The body's loader: the file, the placement's machine and the context.
-pub type BodyOpen<B> = fn(Split, fn(usize) -> Machine, usize) -> Result<GpuModel<B>, GpuError>;
-
 /// A loaded model standing at a position, and the context it may reach.
 pub struct Generator<B: ChainBody> {
     model: GpuModel<B>,
@@ -79,18 +77,20 @@ pub struct Generator<B: ChainBody> {
 }
 
 impl<B: ChainBody> Generator<B> {
-    /// Open `$BLOOMERY_REF_MODEL` by `args.place` through `open`, run `check`
+    /// Open `$BLOOMERY_REF_MODEL` by `args.place` through `open`, the body's
+    /// loader (the file, the placement's machine and the context), run `check`
     /// on the loaded model (it refuses a body that cannot run this file, and
     /// returns the fields it adds to the `load` line), then write the `load`
     /// line, the host set's lines of a placed load, and in graph mode capture
     /// the step before any token (the `capture` line) — all to `log`.
-    pub fn open<C>(
+    pub fn open<O, C>(
         args: OpenArgs,
-        open: BodyOpen<B>,
+        open: O,
         check: C,
         log: &mut dyn Write,
     ) -> Result<Generator<B>, GateError>
     where
+        O: FnOnce(Split, fn(usize) -> Machine, usize) -> Result<GpuModel<B>, GpuError>,
         C: FnOnce(&GpuModel<B>) -> Result<String, GateError>,
     {
         let pinned = args.pin_main && threads::pool().pin_caller();

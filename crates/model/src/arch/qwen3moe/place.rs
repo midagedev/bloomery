@@ -13,7 +13,9 @@ use gguf::Split;
 use super::hparams::Hparams;
 use super::kv::KvLayout;
 use super::roles;
-use crate::placement::{self, Machine, ModelTensors, PlacementError, Plan, Violation, workstation};
+use crate::placement::{
+    self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation, workstation,
+};
 
 /// The whole model on one 24 GB card: [`workstation::plan_gate`] (the 3090
 /// runs all `layers` and the head) with the token embedding on that card.
@@ -77,10 +79,21 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement levers (`BLOOMERY_HOT_LIST`, `BLOOMERY_CARD_BUDGET`),
+    /// the placement's `levers` (`BLOOMERY_HOT_LIST`, `BLOOMERY_CARD_BUDGET`),
     /// refused when it cannot be built or breaks an invariant.
-    pub fn plan<'a>(&'a self, machine: &'a Machine, ctx_max: u64) -> Result<Plan<'a>, PlaceError> {
-        checked(placement::plan(&self.model, machine, ctx_max, &self.kv)?)
+    pub fn plan<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlaceError> {
+        checked(placement::plan(
+            &self.model,
+            machine,
+            ctx_max,
+            &self.kv,
+            levers,
+        )?)
     }
 
     /// [`PlanInputs::plan`] with no hot list and the card budget

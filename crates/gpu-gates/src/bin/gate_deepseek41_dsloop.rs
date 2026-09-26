@@ -121,13 +121,20 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let args = parse_args()?;
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
         let layers = dhp.target_layers.clone();
         let path = workstation::model_v41();
         let hp = Hparams::read(&Split::open(&path).map_err(|e| format!("open {path}: {e}"))?)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let mut m = body::open(file, workstation::plan_gate, workstation::CTX_MAX as usize)?;
+        let mut m = body::open(
+            file,
+            workstation::plan_gate,
+            workstation::CTX_MAX as usize,
+            &cfg,
+        )?;
         m.set_mode(StepMode::Graph);
         let ids = prompt0()?;
         println!(

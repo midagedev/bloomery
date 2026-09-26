@@ -109,6 +109,7 @@ dependencies = [
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-gpu",
+ "bloomery-levers",
  "bloomery-model",
  "cuda-core",
  "cuda-device",
@@ -124,6 +125,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-vision",
+ "bloomery-levers",
  "bloomery-model",
  "bloomery-sampler",
  "bloomery-serve",
@@ -158,10 +160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-levers"
+version = "0.1.0"
+
+[[package]]
 name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-levers",
  "bloomery-qdot",
  "bloomery-threads",
  "libc",
@@ -210,6 +217,7 @@ dependencies = [
 name = "bloomery-threads"
 version = "0.1.0"
 dependencies = [
+ "bloomery-levers",
  "libc",
 ]
 

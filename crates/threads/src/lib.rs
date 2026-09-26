@@ -4,8 +4,8 @@
 //! `matmul_q` is called over a thousand times per token, so per-call thread
 //! spawning (`std::thread::scope` with 32 spawns) costs more than the work.
 //! This crate keeps the workers resident instead: they spin briefly for
-//! back-to-back dispatches (`BLOOMERY_SPIN`, default 20000) and park on a
-//! condvar when idle, so a quiet machine does not burn 32 cores spinning.
+//! back-to-back dispatches (`BLOOMERY_SPIN`) and park on a condvar when idle,
+//! so a quiet machine does not burn 32 cores spinning.
 //!
 //! The topology reader, the pin call and the barrier discipline are ported
 //! from `crates/q3k-cpu/src/main.rs` (its `ccd_topology`, `pin` and the
@@ -26,9 +26,6 @@ use std::cell::UnsafeCell;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-
-/// Default spin iterations before a waiting worker parks.
-const DEFAULT_SPIN: u64 = 20_000;
 
 thread_local! {
     /// Set on any thread that is inside `for_each_chunk` — the dispatching
@@ -328,18 +325,20 @@ impl Pool {
             full.extend_from_slice(siblings);
             topo.push(full);
         }
-        // BLOOMERY_THREADS overrides the count; a missing, unparsable or zero
-        // value falls back to physical cores. SMT siblings are a deliberate
-        // opt-in, not the default: this tier is bandwidth-bound.
-        let nthreads = std::env::var("BLOOMERY_THREADS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&t| t > 0)
-            .unwrap_or(physical);
-        let spin = std::env::var("BLOOMERY_SPIN")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SPIN);
+        // The pool is process-wide, so it reads its own two levers, through
+        // the registry's parse (a binary that parses at `main` refused a bad
+        // value there first). BLOOMERY_THREADS overrides the count, unset is
+        // the physical core count; a value the lever does not take — zero, a
+        // word — panics by name. SMT siblings are a deliberate opt-in, not
+        // the default: this tier is bandwidth-bound. BLOOMERY_SPIN is the
+        // spin before a waiting thread parks.
+        let levers = bloomery_levers::Levers::from_env_named(&[
+            bloomery_levers::THREADS,
+            bloomery_levers::SPIN,
+        ])
+        .unwrap_or_else(|e| panic!("the worker pool: {e}"));
+        let nthreads = levers.threads().unwrap_or(physical);
+        let spin = levers.spin();
         Pool {
             nthreads: nthreads.max(1),
             spin,

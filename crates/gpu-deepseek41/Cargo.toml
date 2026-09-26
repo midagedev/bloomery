@@ -17,6 +17,7 @@ bloomery-gpu = { path = "../gpu" }
 # Host only: the body sizes its buffers from the file's hyperparameters and the placement plan,
 # and its step image copies the host step plan.
 bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
 bloomery-model = { path = "../model" }
 # Host only: the glue's host half reads each token's engram rows through the engram tables.
 bloomery-engram = { path = "../engram" }

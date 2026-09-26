@@ -101,9 +101,9 @@ const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
 
 const WHAT: &str = "deepseek41 prefill";
 
-/// How a prompt is fed ([`PrefillMode::from_env`]): in batches ([`prefill`])
-/// or one decode step per id — the same-binary timing arm, which is the
-/// decode step and not a second implementation.
+/// How a prompt is fed (`BLOOMERY_PREFILL`, [`super::BodyLevers::prefill`]):
+/// in batches ([`prefill`]) or one decode step per id — the same-binary timing
+/// arm, which is the decode step and not a second implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillMode {
     Batch,
@@ -111,20 +111,15 @@ pub enum PrefillMode {
 }
 
 impl PrefillMode {
-    /// `BLOOMERY_PREFILL`: unset or `batch` batches, `steps` steps; any other
-    /// value is refused by name.
-    pub fn from_env() -> Result<PrefillMode, GpuError> {
-        match std::env::var("BLOOMERY_PREFILL").as_deref() {
-            Err(_) | Ok("batch") => Ok(PrefillMode::Batch),
-            Ok("steps") => Ok(PrefillMode::Steps),
-            Ok(_) => Err(GpuError::State {
-                what: "BLOOMERY_PREFILL",
-                missing: "batch or steps",
-            }),
-        }
+    /// The mode [`PrefillMode::name`] names; `None` for any other word.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<PrefillMode> {
+        [PrefillMode::Batch, PrefillMode::Steps]
+            .into_iter()
+            .find(|m| m.name() == name)
     }
 
-    /// The name a `load` line prints.
+    /// The name a `load` line prints, and `BLOOMERY_PREFILL` takes.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -339,22 +334,18 @@ fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
     }
 }
 
-/// `BLOOMERY_PREFILL_GROUP`: batches a group holds, read when the batch's
-/// buffers are made — unset 2, at most [`GROUP_MAX`]; any other value is
-/// refused by name. 1 runs each batch alone, every layer of it before the
-/// next batch's first.
-pub(super) fn group_lever() -> Result<usize, GpuError> {
-    let refused = GpuError::State {
-        what: "BLOOMERY_PREFILL_GROUP",
-        missing: "a whole number of batches from 1 to 8",
-    };
-    match std::env::var("BLOOMERY_PREFILL_GROUP") {
-        Err(std::env::VarError::NotPresent) => Ok(2),
-        Err(std::env::VarError::NotUnicode(_)) => Err(refused),
-        Ok(v) => match v.parse::<usize>() {
-            Ok(g) if (1..=GROUP_MAX).contains(&g) => Ok(g),
-            _ => Err(refused),
-        },
+/// `group`, `BLOOMERY_PREFILL_GROUP` — the batches a group holds; 1 runs each
+/// batch alone, every layer of it before the next batch's first — refused by
+/// name unless it is from 1 to [`GROUP_MAX`], the range the lever's kind in the
+/// registry takes too.
+pub(super) fn check_group(group: usize) -> Result<usize, GpuError> {
+    if (1..=GROUP_MAX).contains(&group) {
+        Ok(group)
+    } else {
+        Err(GpuError::State {
+            what: "BLOOMERY_PREFILL_GROUP",
+            missing: "a whole number of batches from 1 to 8",
+        })
     }
 }
 
@@ -849,7 +840,7 @@ impl Body {
     fn make_batch(&self, gpu: &Gpu) -> Result<Batch, GpuError> {
         let hp = &self.hp;
         let stream = gpu.stream();
-        let group = group_lever()?;
+        let group = self.levers.group;
         let sets = group_sets(group);
         let row_bytes = engram_row_bytes(&self.file, hp)?;
         let dims = ImageDims::of(hp, &self.planner, CHUNK, row_bytes);
@@ -975,11 +966,11 @@ impl Body {
         self.batch.as_ref().map(|b| (b.group, b.group_bytes()))
     }
 
-    /// `BLOOMERY_PREFILL_GROUP` as the next batch's buffers would read it:
-    /// batches a group holds (unset 2, from 1 to 8); any other value is
-    /// refused by name.
-    pub fn prefill_group_lever() -> Result<usize, GpuError> {
-        group_lever()
+    /// `BLOOMERY_PREFILL_GROUP` as the body was loaded with it: the batches a
+    /// group of the batch's buffers holds, made or not.
+    #[must_use]
+    pub fn prefill_group_lever(&self) -> usize {
+        self.levers.group
     }
 
     /// A prompt call of positions `first .. end`, fed as batches from

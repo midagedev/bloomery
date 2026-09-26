@@ -12,6 +12,8 @@ workspace = true
 # Host only: the engram row hash, which the V4.1 plan gate runs the plan's n-grams through.
 bloomery-engram = { path = "../engram" }
 bloomery-gguf = { path = "../gguf" }
+# Host only: the lever registry, which the binaries parse once at `main`.
+bloomery-levers = { path = "../levers" }
 # Host-only edge, live with the `gpu` feature off: the oracle table's `Arch`, and the
 # CPU model's deepseek2 names and MLA parameters for the host bin `exact_ref`.
 bloomery-model = { path = "../model" }

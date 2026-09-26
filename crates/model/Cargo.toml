@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
 bloomery-qdot = { path = "../qdot" }
 bloomery-threads = { path = "../threads" }
 libc = { workspace = true }

@@ -449,7 +449,7 @@ mod gate {
     pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
         let hp = Hparams::read(split)?;
         let planner = Planner::from_file(split, &hp, HELPER_STEPS as u64)?;
-        let mut helper = StepRows::open_with(
+        let mut helper = StepRows::open(
             split,
             &hp,
             1,
@@ -458,7 +458,7 @@ mod gate {
                 stats: true,
             },
         )?;
-        let mut direct = StepRows::open_with(
+        let mut direct = StepRows::open(
             split,
             &hp,
             1,

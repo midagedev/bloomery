@@ -35,7 +35,6 @@
 
 use std::ops::Range;
 
-use bloomery_gpu::GpuError;
 use model::arch::deepseek41::hparams::LayerKind;
 
 use super::prefill::CHUNK;
@@ -205,20 +204,6 @@ impl std::fmt::Display for CedState {
     }
 }
 
-/// `BLOOMERY_CED`: unset or `on` runs the triangle where the file allows it,
-/// `off` runs every layer at every position — the same-binary arm the
-/// triangle is timed against; any other value is refused by name.
-pub(super) fn from_env() -> Result<bool, GpuError> {
-    match std::env::var("BLOOMERY_CED").as_deref() {
-        Err(_) | Ok("on") => Ok(true),
-        Ok("off") => Ok(false),
-        Ok(_) => Err(GpuError::State {
-            what: "BLOOMERY_CED",
-            missing: "on or off",
-        }),
-    }
-}
-
 /// The walk's load-time facts: per layer of the card, whether it runs its
 /// latent part at every position; the ring's rows; the state.
 pub(super) struct Ced {
@@ -229,7 +214,9 @@ pub(super) struct Ced {
 
 impl Ced {
     /// The walk for `kinds` (every layer of the model, the card's from 0)
-    /// over rings of `slots` rows, `state` as the load decided it.
+    /// over rings of `slots` rows, `on` the `BLOOMERY_CED` lever: unset or
+    /// `on` runs the triangle where the file allows it, `off` runs every layer
+    /// at every position — the same-binary arm the triangle is timed against.
     pub(super) fn new(kinds: &[LayerKind], slots: usize, on: bool) -> Ced {
         let facts: Vec<CedLayer> = kinds.iter().map(CedLayer::of).collect();
         let state = match (on, exact(&facts)) {

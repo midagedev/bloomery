@@ -62,7 +62,7 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_deepseek41::chain::glue::{EngramStep, Glue, StepRows};
+    use bloomery_gpu_deepseek41::chain::glue::{EngramStep, Glue, RowsLevers, StepRows};
     use bloomery_gpu_deepseek41::engram_gate::{CLAMP_MIN, PER_THREAD, ROW, inv_sqrt_row};
     use bloomery_gpu_deepseek41::hc::{HC_MIX, HC_STREAMS};
     use bloomery_gpu_deepseek41::params::{ImageDims, ImageLayout, StepImage, rope_specs};
@@ -121,6 +121,7 @@ mod gate {
     // --------------------------------------------------------------- the run
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main()?;
         let split = Split::open(ref_model_path()?)?;
         let hp = Hparams::read(&split)?;
         if hp.n_embd != ROW || hp.hc.streams != HC_STREAMS {
@@ -188,7 +189,7 @@ mod gate {
             });
         }
 
-        let mut rows = StepRows::open(&split, &hp, 1)?;
+        let mut rows = StepRows::open(&split, &hp, 1, RowsLevers::from_levers(&levers))?;
         let first = sets.first().ok_or("no set")?;
         let layout = ImageLayout::new(ImageDims::of(&hp, &first.planner, 1, rows.row_bytes()))?;
         let (window, yarn) = rope_specs(&hp)?;
