@@ -1,9 +1,10 @@
 # HostTier: one host tier, two ports (round `hosttier`)
 
 **Status.** Design memo from the read-only round `hosttier` (2026-09-27). 03 designs `HostTier` and aa signs it
-before any code (`docs/rebuild.md:341`). **aa's signature is pending** (§7, items 1–13). The implementation is §6:
-`hostcfg` and `benchprune` first, then `hostone` (steps A–E). The memo was read before r8land landed; §6.4 lists the
-seven places r8land can change an answer.
+before any code (`docs/rebuild.md:341`). **aa signed §7 items 1–11 and 13 on 2026-09-27, and item 12 with a
+condition** (the end of §7; the conditions also set the order of step B against act-planes' B, and what hostcfg
+leaves to `gpumodel`). The implementation is §6: `hostcfg` and `benchprune` first, then `hostone` (steps A–E). The
+memo was read before r8land landed; §6.4 lists the seven places r8land can change an answer.
 
 ## Provenance
 
@@ -481,7 +482,7 @@ All of this lands before aa's DS6, layerprog and batchwide, which then build on 
 
 | Step | 03's files | aa's files |
 |---|---|---|
-| A | `graph.rs`, `fault.rs`, `lib.rs`, `hybrid.rs` | none, as long as `HostFlags` keeps its API (`glue.rs` is not touched) |
+| A | ~~`graph.rs`, `fault.rs`, `lib.rs`, `hybrid.rs`~~ `fault.rs`, `hybrid.rs` | ~~none, as long as `HostFlags` keeps its API (`glue.rs` is not touched)~~ `graph.rs`, `lib.rs` (corrected on aa's signature, 2026-09-27: both are aa's files); `glue.rs` is not touched as long as `HostFlags` keeps its API |
 | B | `hybrid.rs` → `host/*` | `batch.rs` (`mod exchange` moves out), `ffn.rs`, `body.rs`, `prefill.rs`, `model.rs` (option A); also `deepseek2/mod.rs`, `record.rs`, `generate_ds41.rs`, and the gates |
 | C | `ops.rs`, `moe.rs`, `host/step.rs`, the tests, `bench_v41_host.rs` | `ffn.rs` (`Ds41Host`), `deepseek2/mod.rs` |
 | D | `moe.rs`, `ops.rs`, `host/*`, `gate_hybrid.rs` | `record.rs`, `generate_ds41.rs`, `tools/bloomery/records.py` |
@@ -513,3 +514,48 @@ All of this lands before aa's DS6, layerprog and batchwide, which then build on 
 11. Order: steps A and B after gpumodel; steps C, D and E before DS6, layerprog and batchwide.
 12. Step C lands without a timed A/B, on T1–T7 plus the bit-identical gates, because its card falls under the ruler and is refused.
 13. Finding for aa's GLM plans: at today's placement GLM decode is all-host (about 38 ms per token [derived]). Its one missing piece is a card routed-Q5_K expert kernel, which Qwen3.6 needs as well.
+
+**aa's signature (2026-09-27).** aa signed items 1–11 and 13, and item 12 with a condition. The conditions, with
+03's answers where aa asked for a decision:
+
+- On steps A and B: `graph.rs` and `lib.rs` are aa's files (§6.3 corrected), and `del2` has just changed both. Step A
+  rebases onto `del2`. Before A lands, and again before B lands, 03 sends aa the list of hunks in aa's files for review,
+  the same shape as the act-planes condition on its item 9. B's aa files are `batch.rs`, `ffn.rs`, `body.rs`,
+  `prefill.rs`, `model.rs`, `deepseek2/mod.rs`, `record.rs`, `generate_ds41.rs` and the gates.
+- One step at a time on aa's files. Act-planes' step B and this memo's step B both wait for `gpumodel` and touch the
+  same aa files. **03's order: act-planes B first**, since it is ready right after `gpumodel`, while this memo's B also
+  waits for hostcfg, benchprune and step A. This memo's B follows it.
+- hostcfg against `gpumodel`, which rewrites `model.rs` and launches right after `del2` lands. aa asked whether
+  hostcfg's two `model.rs` hunks (the `enum Chain` move, `REPLAY` as an argument) land before `gpumodel`'s base is
+  cut, or go to `gpumodel` as named hunks. **03's answer: neither hunk stays in hostcfg.**
+  - `Chain` stays in `hybrid.rs`, and `gpumodel` imports it where `HostServed` names it. Step B moves it, with the step
+    port, to `host/step.rs`: the chains are the step port's.
+  - `REPLAY` does not become an argument. It goes. After `del2` the replay watch carries nothing: its one
+    construction (`GpuModel::replay_graph` on `del2`) passes `failed: None`, and `first_serve_lag_ns` has no reader.
+    `gpumodel` drops the `serving_replay` wrap when it rewrites `replay_graph`. It also takes the `hybrid.rs` side of
+    the deletion as named hunks: `ReplayWatch`, `REPLAY`, `serving_replay`, the `watch` parameters of the two service
+    functions with the lag they add, and `HybridStats::first_serve_lag_ns`. It sends that hunk list to 03 before
+    landing. The lint count then does not rise between the two sides.
+  - So hostcfg edits no `model.rs` line and can fly beside `gpumodel`. Its hunks in aa's files go to aa as a list before
+    it launches: the `BLOOMERY_HYBRID_OVERLAP=0` branch in `chain/ffn.rs`, and any construction site the typed config
+    changes. A hunk in a file `gpumodel` rewrites waits for `gpumodel`.
+- On 6 (option A): `gpumodel` keeps `host: Option<HostResidency>` as it is today and builds no new API around it.
+  Step B moves it, and `host_residency()` becomes a `HostServed` method in B, so `gate_load_v41`'s path keeps working.
+  B's landing batch runs `stage-gpu-load-v41` and `stage-gpu-load-v41-lock` by name.
+- On 10: `gpumodel` defines `HostServed` as one method, `serve_captured(&mut self, chain: Chain)`, in place of
+  `serve_replay` and `serve_replay_pair`, so the name matches this memo's. The body holds the tier object.
+- On 8: `excluded_lb` is a field of the `stat prefill lb` kind, which `tools/flow/ds41_prefill.py --counts` can read.
+  Step D changes `tools/bloomery/records.py` and `ds41_prefill.py` with it, and lands with `gate-gpu-ds41-flowcounts`
+  green.
+- On 9: `HandoffLayout` has one owner, `host/step.rs`. aa's handoff-kernel constants are tied to it by a compile-time
+  assertion or a unit test.
+- On 12: aa agrees that T1–T7 plus the bit-identical gates are step C's landing proof.
+  - This is also where AGENTS' "a round that touches the dispatch path ends with a same-lease A/B" meets `card.py`'s
+    ruler refusal. So before C launches, the user is asked whether to add a non-inferiority arm. Its margin would be
+    the 4-round ruler; it would ride on a V4.1 sitting already scheduled, with no box time of its own.
+  - §2.2 (a), removing the steal-block cap, also reaches the prompt's narrow tail calls, and (b), the cheap look, also
+    reaches the wide passes; §2.5 counts decode only. So step C's prediction adds the prompt terms at P = 512 and 4096:
+    the RMWs saved per wide pass times the passes, and the tail calls per layer-batch with their block change.
+    Otherwise (a) is limited to `Chain` calls. Prefill is a headline metric.
+- On 13: the card routed-Q5_K expert gemv enters wave 5 as the first kernel of aa's `opslib`, common to both next
+  models. aa adds it to `rebuild.md`'s wave-5 row. The triage's hosttier item names that owner.
