@@ -1436,6 +1436,10 @@ pub struct Hybrid<H> {
     /// and each column's length; grown to the widest batch served, once.
     batch_lists: Vec<(u32, f32)>,
     batch_lens: Vec<usize>,
+    /// A batch service's refused columns, ascending: the loop that refuses a
+    /// column records it here, and the zero and NaN fills read only this
+    /// record. Grown to the widest batch served, once.
+    batch_refused: Vec<usize>,
     /// The storage of a batch service's per-column list slices, empty between
     /// services ([`reuse_slices`]).
     batch_slices: Vec<&'static [(u32, f32)]>,
@@ -1473,6 +1477,7 @@ impl<H: HostExperts> Hybrid<H> {
             pair_row0: None,
             batch_lists: Vec::new(),
             batch_lens: Vec::new(),
+            batch_refused: Vec::new(),
             batch_slices: Vec::new(),
             fault: None,
             refusal: None,
@@ -1855,7 +1860,9 @@ impl<H: HostExperts> Hybrid<H> {
             self.batch_lens.resize(cols, 0);
             self.batch_lists
                 .resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
+            self.batch_refused.reserve(cols);
         }
+        self.batch_refused.clear();
         let (mut host_slots, mut excluded) = (0u64, 0u64);
         // One pool pass over x finds the first column whose activation is not
         // finite; the columns before it are, and only the ones from it on are
@@ -1887,6 +1894,7 @@ impl<H: HostExperts> Hybrid<H> {
             if let Some(saw) = saw {
                 (n, out_of_set) = (0, 0);
                 refused = refused.or(Some((j, saw)));
+                self.batch_refused.push(j);
             }
             self.batch_lens[j] = n;
             host_slots += n as u64;
@@ -1908,24 +1916,17 @@ impl<H: HostExperts> Hybrid<H> {
         };
         // The refused columns reach the host experts as zeros with an empty
         // list, so no refused value is quantized, and come back as NaN.
-        let bad: Vec<bool> = (0..cols)
-            .map(|j| column_refusal(x.col(j), &ids[j * n_used..][..n_used], map_row).is_some())
-            .collect();
         let mut clean = Tensor2::from_vec(hidden, cols, x.data().to_vec());
-        for (j, &b) in bad.iter().enumerate() {
-            if b {
-                clean.col_mut(j).fill(0.0);
-            }
+        for &j in &self.batch_refused {
+            clean.col_mut(j).fill(0.0);
         }
         let r = self
             .host
             .experts_union_into(layer, clean.view(), &lists, out);
         self.batch_slices = reuse_slices(lists);
         r?;
-        for (j, &b) in bad.iter().enumerate() {
-            if b {
-                out[j * hidden..][..hidden].fill(f32::NAN);
-            }
+        for &j in &self.batch_refused {
+            out[j * hidden..][..hidden].fill(f32::NAN);
         }
         self.count_batch(cols, host_slots, excluded, t0);
         let r = Refusal {
@@ -2285,21 +2286,6 @@ fn check_exclude(exclude: &[u32], map_row: &[u32], layer: usize) -> Result<(), G
 /// the slot map's `n_expert` do not include.
 fn unknown_id(slot: usize, id: u32, n_expert: usize) -> String {
     format!("routed slot {slot} names expert {id}, past the slot map's {n_expert} experts")
-}
-
-/// What the host saw in one column — its routing `ids`, then its activation
-/// `x` — that the card should already have refused, if anything.
-fn column_refusal(x: &[f32], ids: &[u32], map_row: &[u32]) -> Option<String> {
-    ids.iter()
-        .enumerate()
-        .find(|&(_, &id)| {
-            usize::try_from(id)
-                .ok()
-                .and_then(|id| map_row.get(id))
-                .is_none()
-        })
-        .map(|(s, &id)| unknown_id(s, id, map_row.len()))
-        .or_else(|| non_finite(x))
 }
 
 /// The error the caller sees for refusal `r`, given `fault`, what the card's

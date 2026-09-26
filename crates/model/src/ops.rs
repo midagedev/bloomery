@@ -476,6 +476,31 @@ impl SharedOut {
         // SAFETY: the caller guarantees the disjointness contract above.
         unsafe { *self.0.add(idx) = v };
     }
+
+    /// The block from cell `first` on: its cell `i` is this one's `first + i`.
+    ///
+    /// # Safety
+    ///
+    /// Cell `first` is inside the block this pointer's construction site
+    /// borrowed (or its end), and every cell written through the result is
+    /// too.
+    pub(crate) unsafe fn offset(&self, first: usize) -> SharedOut {
+        // SAFETY: the caller keeps `first` inside the block, so the offset is
+        // in bounds of one allocation.
+        SharedOut(unsafe { self.0.add(first) })
+    }
+
+    /// Cells `first..first + len` as a slice.
+    ///
+    /// # Safety
+    ///
+    /// The cells lie inside the block this pointer's construction site
+    /// borrowed, and no other participant touches them while the slice lives.
+    pub(crate) unsafe fn cells_mut<'a>(&self, first: usize, len: usize) -> &'a mut [f32] {
+        // SAFETY: the caller's contract — in bounds, and this slice is the
+        // cells' only access while it lives.
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(first), len) }
+    }
 }
 
 /// [`SharedOut`] for a distinct input's quantized-column buffer; the impls add no safety of their own — see the `run_group` construction site.
@@ -514,6 +539,29 @@ impl SharedQuantCols {
                 // SAFETY: same contract; the cell is `cb` bytes, as `col_bytes` allocated.
                 let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * cb), *cb) };
                 qdot::quantize_col(ty, x_col, cell);
+            }
+        }
+    }
+
+    /// Quantized columns from column `col` on: column `t` of the result is
+    /// this buffer's `col + t`. Only the byte form is cut this way; the f32
+    /// form does not carry its column width.
+    ///
+    /// # Safety
+    ///
+    /// Column `col` is inside the buffer this pointer's construction site
+    /// borrowed (or its end), and every column read or written through the
+    /// result is too.
+    unsafe fn offset_cols(self, col: usize) -> SharedQuantCols {
+        match self {
+            SharedQuantCols::Bytes { cb, ptr } => SharedQuantCols::Bytes {
+                cb,
+                // SAFETY: the caller keeps column `col` inside the buffer, so
+                // the offset is in bounds of one allocation.
+                ptr: unsafe { ptr.add(col * cb) },
+            },
+            SharedQuantCols::F32(_) => {
+                unreachable!("only quantized byte columns are cut by column")
             }
         }
     }
@@ -709,7 +757,7 @@ impl QuantizedCols {
         if poison() {
             self.buf.fill(0xA5);
         }
-        quantize_cols_pool(x, [(ty, &mut self.buf[..]), (ty, &mut [][..])]);
+        quantize_cols_pool(x, (ty, &mut self.buf[..]), None);
         self.key = Some(QuantKey {
             ty,
             k,
@@ -749,30 +797,32 @@ impl QuantizedCols {
 }
 
 /// Every column of `x` quantized over the pool in one dispatch: into
-/// `encs[0].1` in `encs[0].0`'s fused encoding and, unless it is empty, into
-/// `encs[1].1` in `encs[1].0`'s — one encoder call per column and encoding,
-/// the call a dispatch's own quantization makes. A destination holds exactly
-/// `x`'s columns at its encoding's `qdot::col_bytes`.
-fn quantize_cols_pool(x: Tensor2View<'_>, encs: [(GgmlType, &mut [u8]); 2]) {
+/// `first.1` in `first.0`'s fused encoding and, when `second` is given, into
+/// its destination in its encoding too — one encoder call per column and
+/// encoding, the call a dispatch's own quantization makes. A destination
+/// holds exactly `x`'s columns at its encoding's `qdot::col_bytes`.
+fn quantize_cols_pool(
+    x: Tensor2View<'_>,
+    first: (GgmlType, &mut [u8]),
+    second: Option<(GgmlType, &mut [u8])>,
+) {
     let (k, ne1) = (x.ne0(), x.ne1());
-    let shared = encs.map(|(ty, dst)| {
-        if dst.is_empty() {
-            return None;
-        }
+    let shared = |(ty, dst): (GgmlType, &mut [u8])| {
         let cb = qdot::col_bytes(ty, k);
         assert_eq!(
             dst.len(),
             ne1 * cb,
             "quantized columns: {ne1} columns of {cb} bytes in {ty:?}"
         );
-        Some((
+        (
             ty,
             SharedQuantCols::Bytes {
                 cb,
                 ptr: dst.as_mut_ptr(),
             },
-        ))
-    });
+        )
+    };
+    let shared = [Some(shared(first)), second.map(shared)];
     // SAFETY (construction site): each destination holds `ne1` columns of its
     // encoding, borrowed for the whole dispatch; each participant writes only
     // the columns of its own chunk of `0..ne1`, the chunks partition them, and
@@ -908,31 +958,93 @@ impl ShardTensor {
     /// the `e`-th of the stack's `n_expert` equal byte runs — the cut
     /// `moe::expert_view` makes, without a header of its own.
     pub fn expert<'a>(&self, split: &'a Split, e: usize) -> Result<Weight<'a>, crate::ModelError> {
-        let dims = &self.info.dims;
-        let n_expert = dims.get(2).copied().unwrap_or(0);
-        if dims.len() != 3 || n_expert == 0 || !self.info.nbytes.is_multiple_of(n_expert) {
-            return Err(crate::ModelError::Shape {
-                what: "expert stack",
-                want_ne0: 3,
-                want_ne1: n_expert as usize,
-                got_ne0: dims.len(),
-                got_ne1: n_expert as usize,
-            });
-        }
-        if e as u64 >= n_expert {
+        let (n_expert, per) = stack_cut(&self.info)?;
+        if e >= n_expert {
             return Err(crate::ModelError::MissingTensor(format!(
                 "expert {e} of {}",
                 self.info.name
             )));
         }
-        let per = (self.info.nbytes / n_expert) as usize;
         let stack = self.file(split)?.data(&self.info)?;
         Ok(Weight {
             ty: self.info.ty,
-            k: dims[0] as usize,
-            n: dims[1] as usize,
+            k: k_of(&self.info),
+            n: n_of(&self.info),
             bytes: &stack[e * per..(e + 1) * per],
         })
+    }
+
+    /// The stacked tensor as a union call reads it, its bytes resolved once
+    /// ([`ExpertStack`]).
+    pub(crate) fn stack<'a>(
+        &'a self,
+        split: &'a Split,
+    ) -> Result<ExpertStack<'a>, crate::ModelError> {
+        ExpertStack::of(&self.info, self.file(split)?.data(&self.info)?)
+    }
+}
+
+/// A stack header's cut: its `n_expert` and the bytes of one expert's matrix,
+/// or the named error of a header that is not `{k, n, n_expert}` in equal
+/// byte runs.
+fn stack_cut(info: &TensorInfo) -> Result<(usize, usize), crate::ModelError> {
+    let dims = &info.dims;
+    let n_expert = dims.get(2).copied().unwrap_or(0);
+    if dims.len() != 3 || n_expert == 0 || !info.nbytes.is_multiple_of(n_expert) {
+        return Err(crate::ModelError::Shape {
+            what: "expert stack",
+            want_ne0: 3,
+            want_ne1: n_expert as usize,
+            got_ne0: dims.len(),
+            got_ne1: n_expert as usize,
+        });
+    }
+    let per = usize::try_from(info.nbytes / n_expert)
+        .expect("one expert's bytes lie in a mapped file, so they fit in usize");
+    Ok((n_expert as usize, per))
+}
+
+/// A stacked expert tensor `{k, n, n_expert}` as a union call reads it,
+/// resolved once per call: matrix `e` is the `e`-th of the stack's `n_expert`
+/// equal byte runs — the cut [`ShardTensor::expert`] and `moe::expert_view`
+/// make — so every matrix has the stack's type and shape.
+#[derive(Clone, Copy)]
+pub(crate) struct ExpertStack<'w> {
+    name: &'w str,
+    ty: GgmlType,
+    k: usize,
+    n: usize,
+    n_expert: usize,
+    /// Bytes of one expert's matrix.
+    per: usize,
+    bytes: &'w [u8],
+}
+
+impl<'w> ExpertStack<'w> {
+    /// The stack `info` over its bytes `bytes`, read from the file `info`
+    /// came from.
+    pub(crate) fn of(info: &'w TensorInfo, bytes: &'w [u8]) -> Result<Self, crate::ModelError> {
+        let (n_expert, per) = stack_cut(info)?;
+        Ok(ExpertStack {
+            name: &info.name,
+            ty: info.ty,
+            k: k_of(info),
+            n: n_of(info),
+            n_expert,
+            per,
+            bytes,
+        })
+    }
+
+    /// `info`, a stack of `gguf` — a one-file model's own header.
+    pub(crate) fn in_file(gguf: &'w Gguf, info: &'w TensorInfo) -> Result<Self, crate::ModelError> {
+        ExpertStack::of(info, gguf.data(info)?)
+    }
+
+    /// Expert `e`'s matrix bytes. `e` is one of the stack's experts: a union
+    /// call checks its ids against the stack by name before any pass.
+    fn matrix(&self, e: usize) -> &'w [u8] {
+        &self.bytes[e * self.per..(e + 1) * self.per]
     }
 }
 
@@ -1055,15 +1167,17 @@ pub fn matmul_q_group_swiglu_into(
 /// the whole slot, so this bounds how long a row waits on one.
 pub const DEFER_MAX_COLS: usize = 8;
 
-/// [`matmul_q_group_swiglu_into`] for the few-column shape — a union of
+/// [`matmul_q_group_swiglu_into`] for the few-column shape — a group of
 /// experts over up to [`DEFER_MAX_COLS`] tokens, its inputs
-/// [`GroupInput::Cols`] of one block or combines of a few columns each.
+/// [`GroupInput::Cols`] of one block or combines of a few columns each. The
+/// engine's host union does not call it (its passes are [`UnionCall`]'s);
+/// the host bench's per-chunk union arms do.
 /// With the deferral lever on, a slot of up to that many columns is claimed
 /// whole by one participant of the row dispatch (its combine, then each of
 /// its columns quantized on its own) instead of the caller combining and the
 /// pool pre-quantizing. The other entries keep the claim to one-column slots,
 /// so a prefill group of a few tokens runs as before. A group with an input
-/// wider than [`DEFER_MAX_COLS`] (a union chunk of a prefill ubatch) takes the
+/// wider than [`DEFER_MAX_COLS`] (a bench union arm's chunk) takes the
 /// pre-pass, which then also produces each combine, column by column, and its
 /// rows are cut into lanes by the tile kernel's cost.
 /// Values are the pre-pass arm's, bit for bit: only who runs the combine and
@@ -1260,7 +1374,7 @@ fn group_core(
                     .all(|s| s.shape_of().ne1() <= entry.defer_cols())
         }
     };
-    // A union chunk of a prefill ubatch: an input wider than any claim takes,
+    // A bench union arm's chunk: an input wider than any claim takes,
     // so the group is on the pre-pass arm whatever the lever says. Narrower
     // groups — every decode and verify call — never set it.
     let wide = entry == Entry::Cols
@@ -1843,7 +1957,8 @@ impl<'a> PairWork<'a> {
         if let Some((cb, aptr)) = self.fused_cols {
             // SAFETY: the slot's buffer is `src_ne1 * cb` bytes as allocated,
             // and its writes are ordered before this read — the pre-pass
-            // join, or the DONE store the wait above just observed.
+            // join, the DONE store the wait above just observed, or, for a
+            // union pass, the claim wait its `compute` ran before this call.
             let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
             // Fused rows: `qdot` dots the weight bytes and the quantized
             // columns directly — no f32 row, ROW_BUF untouched;
@@ -2644,6 +2759,10 @@ fn parse_steal_blocks(v: Option<&str>) -> usize {
 /// participant, where a lane cut by four is a quarter of a layer-wide lane.
 const UNION_BLOCK_ROWS: usize = 144;
 
+// A block's cells of one output column (f32) are whole 64-byte lines, so two
+// blocks share a line only where one ends and the next begins.
+const _: () = assert!((UNION_BLOCK_ROWS * 4).is_multiple_of(64));
+
 /// The rows one row dispatch computes, as [`run_row_pool`] walks them: pairs
 /// laid end to end in one row space, each row a function of its pair and its
 /// index alone, so who computes it and where the space is cut change no bit.
@@ -2803,7 +2922,8 @@ impl ErrGate {
 /// the running byte cost crosses `t/nlanes` of the total — deterministic,
 /// row-granular; a uniform group degenerates to a row-count cut.
 ///
-/// With `tile_lanes` (a wide union group, every union pass) and a tile
+/// With `tile_lanes` (a wide group of the bench's union arms, every union
+/// pass) and a tile
 /// kernel for every pair, the cost is `tile_cost` — a fixed unpack per run of
 /// columns plus each column — and participant `t` starts on lane `t`: the
 /// pool splits the lane indices, not the rows, so every lane the cut balanced
@@ -3029,6 +3149,16 @@ thread_local! {
 /// `moe` holds to this bound).
 pub(crate) const UNION_CLAIM_EXPERTS: usize = 64;
 
+/// Columns up to which a union call sums on the caller: the decode and verify
+/// shapes, whose sums are shorter than a pool dispatch pays back. A wider
+/// call splits its sums by column across the pool.
+const UNION_INLINE_COLS: usize = 8;
+
+// One width flips the call's form: a call that claims its quantizations
+// inside its two row passes also sums on the caller, and a wider one runs all
+// five passes over the pool.
+const _: () = assert!(UNION_INLINE_COLS == DEFER_MAX_COLS);
+
 /// The most bytes one activation column of `k` values takes in an encoding a
 /// fused kernel reads at `k` — q8_K, or q8_2_x4 with its q8_2 tail — and 0
 /// when none does: what a union scratch holds per column before it knows its
@@ -3082,16 +3212,33 @@ impl<'p> UnionPlanView<'p> {
         }
         d
     }
+
+    /// Column `j`'s weighted sum into `o`, from zero in the order of its list
+    /// `list` — the one-column call's order — over the downs in `store`, slot
+    /// `q`'s at `store[q·w..(q + 1)·w]`, `w` the width of `o`.
+    fn sum_col(self, store: &[f32], list: &[(u32, f32)], j: usize, o: &mut [f32]) {
+        let w_col = o.len();
+        o.fill(0.0);
+        for &(e, w) in list {
+            let d = self
+                .ids
+                .binary_search(&e)
+                .expect("every listed expert is in the union");
+            let t = self
+                .cols(d)
+                .binary_search(&j)
+                .expect("a listing column is in its expert's columns");
+            let q = self.off[d] + t;
+            for (o, &dv) in o.iter_mut().zip(&store[q * w_col..(q + 1) * w_col]) {
+                *o += w * dv;
+            }
+        }
+    }
 }
 
-/// An expert's `[gate, up, down]` by id, as a union call's passes resolve it
-/// on the participant that reads the expert.
-pub(crate) type Resolve<'r, 'w> =
-    dyn Fn(u32) -> Result<[Weight<'w>; 3], crate::ModelError> + Sync + 'r;
-
-/// One stack of a union call, read off its first expert: the weight type, the
-/// values a row contracts, its rows, the bytes of a row, and the bytes of one
-/// input column in the type's encoding.
+/// One stack of a union call, read off its [`ExpertStack`]: the weight type,
+/// the values a row contracts, its rows, the bytes of a row, and the bytes of
+/// one input column in the type's encoding.
 #[derive(Clone, Copy)]
 pub(crate) struct UnionStack {
     ty: GgmlType,
@@ -3102,46 +3249,79 @@ pub(crate) struct UnionStack {
 }
 
 impl UnionStack {
-    /// `w` as a stack of `n` rows of `k` values. A matrix of another shape is
-    /// the named error `what`; a type without a fused kernel at `k` — the
-    /// union's passes run fused rows only — is qdot's.
+    /// `s` as a stack of `n` rows of `k` values the union's passes can run —
+    /// they run fused rows only. A stack of another shape is the named error
+    /// `what`; a type without a fused kernel at `k` is
+    /// [`crate::ModelError::HostStack`], naming `what`, the stack, its type
+    /// and `k`, which every expert of the stack shares.
     pub(crate) fn of(
-        w: &Weight<'_>,
+        s: &ExpertStack<'_>,
         what: &'static str,
         k: usize,
         n: usize,
     ) -> Result<UnionStack, crate::ModelError> {
-        if (w.k, w.n) != (k, n) || n == 0 || !w.bytes.len().is_multiple_of(n) {
+        if (s.k, s.n) != (k, n) || n == 0 || !s.per.is_multiple_of(n) {
             return Err(crate::ModelError::Shape {
                 what,
                 want_ne0: k,
                 want_ne1: n,
-                got_ne0: w.k,
-                got_ne1: w.n,
+                got_ne0: s.k,
+                got_ne1: s.n,
             });
         }
-        if !qdot::supports(w.ty) {
-            return Err(qdot::QdotError::UnsupportedType(w.ty).into());
+        let refusal = |why: qdot::QdotError| crate::ModelError::HostStack {
+            what,
+            tensor: s.name.to_owned(),
+            ty: s.ty,
+            k,
+            why,
+        };
+        if !qdot::supports(s.ty) {
+            return Err(refusal(qdot::QdotError::UnsupportedType(s.ty)));
         }
-        if !qdot::fuses(w.ty, k) {
-            return Err(qdot::QdotError::UnalignedK {
+        if !qdot::fuses(s.ty, k) {
+            return Err(refusal(qdot::QdotError::UnalignedK {
                 k,
-                gran: qdot::k_granularity(w.ty),
-            }
-            .into());
+                gran: qdot::k_granularity(s.ty),
+            }));
         }
         Ok(UnionStack {
-            ty: w.ty,
+            ty: s.ty,
             k,
             n,
-            row_bytes: w.bytes.len() / n,
-            cb: qdot::col_bytes(w.ty, k),
+            row_bytes: s.per / n,
+            cb: qdot::col_bytes(s.ty, k),
         })
     }
 
-    /// Bytes of one input column in the stack's encoding.
-    pub(crate) fn cb(&self) -> usize {
-        self.cb
+    /// A union call's `[gate, up, down]` stacks, each checked by
+    /// [`UnionStack::of`]: gate and up map `embd -> ff`, down maps
+    /// `ff -> embd`. The one check both a call and a host tier's load make.
+    pub(crate) fn of_call(
+        stacks: &[ExpertStack<'_>; 3],
+        embd: usize,
+        ff: usize,
+    ) -> Result<[UnionStack; 3], crate::ModelError> {
+        Ok([
+            UnionStack::of(
+                &stacks[0],
+                "host union: the gate must map embd -> ff",
+                embd,
+                ff,
+            )?,
+            UnionStack::of(
+                &stacks[1],
+                "host union: the up must map embd -> ff",
+                embd,
+                ff,
+            )?,
+            UnionStack::of(
+                &stacks[2],
+                "host union: the down must map ff -> embd",
+                ff,
+                embd,
+            )?,
+        ])
     }
 
     /// Whether `other`'s rows read this stack's input bytes: the same `k`,
@@ -3149,21 +3329,6 @@ impl UnionStack {
     pub(crate) fn shares_input(&self, other: &UnionStack) -> bool {
         (self.k, self.cb) == (other.k, other.cb)
             && gguf::activation_format(self.ty) == gguf::activation_format(other.ty)
-    }
-
-    /// `Ok` when `w` is a matrix of this stack — its type, shape and size —
-    /// the named error otherwise.
-    fn check(&self, w: &Weight<'_>) -> Result<(), crate::ModelError> {
-        if (w.ty, w.k, w.n, w.bytes.len()) == (self.ty, self.k, self.n, self.row_bytes * self.n) {
-            return Ok(());
-        }
-        Err(crate::ModelError::Shape {
-            what: "host union: an expert's matrix unlike its stack's first",
-            want_ne0: self.k,
-            want_ne1: self.n,
-            got_ne0: w.k,
-            got_ne1: w.n,
-        })
     }
 
     fn meta(&self) -> PairMeta {
@@ -3185,40 +3350,43 @@ impl UnionStack {
     }
 }
 
-/// Slot `q`, column `q − off[d]` of expert `d`: `silu(gate) · up` (clamped
-/// with `limit`) of its gate and up columns in `gu`, quantized in `ty`'s
-/// encoding into slot `q` of `qc` — the combine and encoder calls every path
-/// makes for a column, one column at a time.
-///
-/// # Safety
-///
-/// The caller owns slot `q` of `qc` — its own chunk of the slots, or the
-/// claim of expert `d` — and `qc` holds the plan's slots.
-#[allow(clippy::too_many_arguments)] // one slot's full address: plan, expert, slot, source, width, clamp, encoding, destination
-unsafe fn combine_slot(
-    plan: UnionPlanView<'_>,
-    d: usize,
-    q: usize,
-    gu: &[f32],
+/// Where a union call's combines come from and go: slot `q` of expert `d` is
+/// `silu(gate) · up` (clamped with `limit`) of its gate and up columns in
+/// `gu`, quantized in `ty`'s encoding into slot `q` of `qc`.
+#[derive(Clone, Copy)]
+struct Combines<'c> {
+    plan: UnionPlanView<'c>,
+    gu: &'c [f32],
     ff: usize,
     limit: Option<f32>,
     ty: GgmlType,
     qc: SharedQuantCols,
-) {
-    let (o, m) = (plan.off[d], plan.off[d + 1] - plan.off[d]);
-    let t = q - o;
-    let gate = &gu[(2 * o + t) * ff..][..ff];
-    let up = &gu[(2 * o + m + t) * ff..][..ff];
-    PAR_BUF.with(|b| {
-        let mut par = b.borrow_mut();
-        if par.len() < ff {
-            par.resize(ff, 0.0);
-        }
-        let par = &mut par[..ff];
-        swiglu_into(gate, up, limit, par);
-        // SAFETY: the caller owns slot `q` of `qc`.
-        unsafe { qc.quantize_into(ty, ff, par, q) };
-    });
+}
+
+impl Combines<'_> {
+    /// Slot `q`, column `q − off[d]` of expert `d`: the combine and encoder
+    /// calls every path makes for a column, one column at a time.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns slot `q` of `qc` — its own chunk of the slots, or the
+    /// claim of expert `d` — and `qc` holds the plan's slots.
+    unsafe fn slot(&self, d: usize, q: usize) {
+        let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
+        let t = q - o;
+        let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+        let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+        PAR_BUF.with(|b| {
+            let mut par = b.borrow_mut();
+            if par.len() < self.ff {
+                par.resize(self.ff, 0.0);
+            }
+            let par = &mut par[..self.ff];
+            swiglu_into(gate, up, self.limit, par);
+            // SAFETY: the caller owns slot `q` of `qc`.
+            unsafe { self.qc.quantize_into(self.ty, self.ff, par, q) };
+        });
+    }
 }
 
 /// Counts a claimed unit done when its scope ends, on unwind too: a claimer
@@ -3232,11 +3400,26 @@ impl Drop for UnitDone<'_> {
     }
 }
 
+/// A claim pass's time at level >= 1: into the participant's quantization
+/// stage, and into `longest` if it is the longest so far.
+fn claim_time(
+    t0: Option<Instant>,
+    acc: &mut profile::CallAcc,
+    longest: &std::sync::atomic::AtomicU64,
+) {
+    if let Some(t0) = t0 {
+        let ns = t0.elapsed().as_nanos() as u64;
+        acc.add_quant_act(ns);
+        longest.fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// x's columns quantized as claims of a narrow union call's gate/up pass:
-/// unit `u` is column `u % k` in encoding `u / k` (the gate's, then the up's
-/// when its rows read other bytes), taken off one counter — the encoder call
-/// a pre-pass makes for that column — and a row reads x only once every unit
-/// is done, so the pass waits about one column's quantization, not a slot's.
+/// unit `u` is column `u % cols` in encoding `u / cols` (the gate's, then the
+/// up's when its rows read other bytes), taken off one counter — the encoder
+/// call a pre-pass makes for that column — and a row reads x only once every
+/// unit is done, so the pass waits about one column's quantization, not a
+/// slot's.
 struct XClaims<'c> {
     x: Tensor2View<'c>,
     encs: [Option<(GgmlType, SharedQuantCols)>; 2],
@@ -3251,29 +3434,24 @@ impl XClaims<'_> {
         self.x.ne1() * self.encs.iter().flatten().count()
     }
 
-    fn claim_pass(&self, lvl: u8) {
+    fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
         let t0 = if lvl >= 1 { Some(Instant::now()) } else { None };
-        let (k, units) = (self.x.ne1(), self.units());
+        let (cols, units) = (self.x.ne1(), self.units());
         loop {
             let u = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if u >= units {
                 break;
             }
             let _done = UnitDone(&self.done);
-            let (ty, dst) = self.encs[u / k].expect("a unit's encoding is one the pass reads");
-            let c = u % k;
+            let (ty, dst) = self.encs[u / cols].expect("a unit's encoding is one the pass reads");
+            let c = u % cols;
             // SAFETY: unit `u` — column `c` in this encoding — is this claimer's
-            // alone (the counter) and inside the destination's `k` columns; no
-            // row reads it before `done` counts every unit (Release on the
+            // alone (the counter) and inside the destination's `cols` columns;
+            // no row reads it before `done` counts every unit (Release on the
             // count, Acquire in `wait`).
             unsafe { dst.quantize_into(ty, self.x.ne0(), self.x.col(c), c) };
         }
-        if let Some(t0) = t0 {
-            self.claim_ns.fetch_max(
-                t0.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        claim_time(t0, acc, &self.claim_ns);
     }
 
     /// Block until every unit is quantized. Bounded: every claimer is a
@@ -3287,16 +3465,11 @@ impl XClaims<'_> {
 }
 
 /// Each expert's combines produced as claims of a narrow union call's down
-/// pass: expert `d`'s claim runs [`combine_slot`] for each of its slots — the
-/// calls the wide pass makes slot by slot — and only expert `d`'s rows wait
-/// for it.
+/// pass: expert `d`'s claim runs [`Combines::slot`] for each of its slots —
+/// the calls the wide pass makes slot by slot — and only expert `d`'s rows
+/// wait for it.
 struct CombineClaims<'c> {
-    plan: UnionPlanView<'c>,
-    gu: &'c [f32],
-    ff: usize,
-    limit: Option<f32>,
-    ty: GgmlType,
-    qc: SharedQuantCols,
+    src: Combines<'c>,
     next: std::sync::atomic::AtomicUsize,
     states: [std::sync::atomic::AtomicU8; UNION_CLAIM_EXPERTS],
     /// The longest claim pass (level >= 1).
@@ -3304,31 +3477,23 @@ struct CombineClaims<'c> {
 }
 
 impl CombineClaims<'_> {
-    fn claim_pass(&self, lvl: u8) {
+    fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
         let t0 = if lvl >= 1 { Some(Instant::now()) } else { None };
+        let plan = self.src.plan;
         loop {
             let d = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if d >= self.plan.n() {
+            if d >= plan.n() {
                 break;
             }
             let _done = ClaimDone(&self.states[d]);
-            for q in self.plan.off[d]..self.plan.off[d + 1] {
+            for q in plan.off[d]..plan.off[d + 1] {
                 // SAFETY: expert `d`'s slots are this claimer's alone (the
                 // counter); no row reads them before its state observes DONE
                 // (the guard's Release store, Acquire in `wait`).
-                unsafe {
-                    combine_slot(
-                        self.plan, d, q, self.gu, self.ff, self.limit, self.ty, self.qc,
-                    );
-                }
+                unsafe { self.src.slot(d, q) };
             }
         }
-        if let Some(t0) = t0 {
-            self.claim_ns.fetch_max(
-                t0.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        claim_time(t0, acc, &self.claim_ns);
     }
 
     /// Block until expert `d`'s combines are quantized. Bounded: its claimer
@@ -3365,15 +3530,15 @@ enum UnionPass {
 struct UnionRows<'p, 'w> {
     pass: UnionPass,
     plan: UnionPlanView<'p>,
-    resolve: &'p Resolve<'p, 'w>,
-    /// The pass's stacks: gate and up, or the down twice.
+    /// The pass's stacks and their bytes: gate and up, or the down twice.
     stacks: [UnionStack; 2],
+    sources: [ExpertStack<'w>; 2],
     /// Each stack's input bytes: x in its encoding, `x_cols` columns read
     /// through the expert's column list (gate/up), or the combines' slab,
     /// slot-indexed (down).
     inputs: [SharedQuantCols; 2],
     x_cols: usize,
-    /// The output slab's first cell.
+    /// The output slab's first cell; the slab holds every slot of the plan.
     out: SharedOut,
     claims: UnionClaims<'p>,
 }
@@ -3401,7 +3566,10 @@ impl RowSet for UnionRows<'_, '_> {
     }
 
     fn pair_at(&self, r: usize, _from: usize) -> usize {
-        (r / self.stacks[0].n).min(self.pairs() - 1)
+        let p = r / self.stacks[0].n;
+        // Row `start(pairs())` is the walk's end marker: it names the last
+        // pair, the one it ends. Every row before it lies inside pair `p`.
+        if p == self.pairs() { p - 1 } else { p }
     }
 
     fn cost(&self, p: usize, tile: bool) -> u64 {
@@ -3419,11 +3587,11 @@ impl RowSet for UnionRows<'_, '_> {
         Some(UNION_BLOCK_ROWS)
     }
 
-    fn claim_pass(&self, lvl: u8, _acc: &mut profile::CallAcc) {
+    fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
         match self.claims {
             UnionClaims::None => {}
-            UnionClaims::X(c) => c.claim_pass(lvl),
-            UnionClaims::Combine(c) => c.claim_pass(lvl),
+            UnionClaims::X(c) => c.claim_pass(lvl, acc),
+            UnionClaims::Combine(c) => c.claim_pass(lvl, acc),
         }
     }
 
@@ -3441,12 +3609,7 @@ impl RowSet for UnionRows<'_, '_> {
             UnionClaims::Combine(c) => c.wait(d),
         }
         let st = &self.stacks[s];
-        let mats = (self.resolve)(self.plan.ids[d])?;
-        let w = match self.pass {
-            UnionPass::GateUp => mats[s],
-            UnionPass::Down => mats[2],
-        };
-        st.check(&w)?;
+        let bytes = self.sources[s].matrix(self.plan.ids[d] as usize);
         let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
         let (src, first) = match self.pass {
             UnionPass::GateUp => (
@@ -3454,19 +3617,18 @@ impl RowSet for UnionRows<'_, '_> {
                 2 * o + s * m,
             ),
             UnionPass::Down => {
-                let SharedQuantCols::Bytes { cb, ptr } = self.inputs[0] else {
-                    unreachable!("a union pass reads quantized bytes");
-                };
-                // SAFETY: slots `o..o + m` lie inside the combines' slab, which
-                // holds the plan's slots and outlives the pass.
-                let ptr = unsafe { ptr.add(o * cb) };
-                ((SharedQuantCols::Bytes { cb, ptr }, m, None), o)
+                // SAFETY: the method's contract — slots `o..o + m` are expert
+                // `d`'s, inside the combines' slab, which holds every slot of
+                // the plan (asserted where the pass is built).
+                let input = unsafe { self.inputs[0].offset_cols(o) };
+                ((input, m, None), o)
             }
         };
-        // SAFETY: slots `first..first + m` of `n` cells each lie inside the
-        // output slab, which holds the plan's slots and outlives the pass.
-        let out = SharedOut(unsafe { self.out.0.add(first * st.n) });
-        PairWork::at((out, m), w.bytes, src, st.meta(), 0, None).compute_rows(rows, lvl, acc)
+        // SAFETY: the method's contract — slots `first..first + m` of `n`
+        // cells each are pair `p`'s, inside the output slab, which holds every
+        // slot of the plan (asserted where the pass is built).
+        let out = unsafe { self.out.offset(first * st.n) };
+        PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(rows, lvl, acc)
     }
 }
 
@@ -3495,7 +3657,8 @@ fn record_union_rows(
                     let rows = (o.n * experts) as u64;
                     (r + rows, kt + rows * o.k as u64, wb + bytes(o))
                 });
-        let share = ((ns as u128 * wb as u128) / total.max(1) as u128) as u64;
+        let share = u64::try_from((u128::from(ns) * u128::from(wb)) / u128::from(total.max(1)))
+            .expect("a byte share of ns is at most ns");
         profile::record(
             site,
             s.ty,
@@ -3508,64 +3671,203 @@ fn record_union_rows(
     }
 }
 
-/// A union call's passes over its plan and the caller's slabs, each one pool
-/// dispatch (`moe`'s `serve_planned` runs the flow): x quantized, every
-/// expert's gate and up, every slot's combine quantized, every expert's down.
-/// Every (row, column) dot is `compute_rows`' — the tile kernel over runs of
-/// up to [`qdot::TILE_COLS`] of the expert's columns — every column's
-/// quantization and combine is the one call any path makes for it, and none
-/// depends on the call's width or on who runs it.
-pub(crate) struct UnionCall<'c, 'w> {
-    pub(crate) plan: UnionPlanView<'c>,
-    pub(crate) resolve: &'c Resolve<'c, 'w>,
-    pub(crate) x: Tensor2View<'c>,
-    pub(crate) limit: Option<f32>,
-    pub(crate) gate: UnionStack,
-    pub(crate) up: UnionStack,
-    pub(crate) down: UnionStack,
+/// The slabs a union call runs through — its scratch's, made once for a
+/// column count and held across calls — each with room for the widest call
+/// the scratch takes; a call uses the front of each.
+pub(crate) struct UnionSlabs<'s> {
+    /// x in the gate's encoding.
+    pub(crate) xq: &'s mut [u8],
+    /// x in the up's encoding, used when the up's rows read other bytes.
+    pub(crate) xq_up: &'s mut [u8],
+    /// Two columns of `ff` a slot: expert `d`'s gate at slots `2·off[d]` on,
+    /// its up at the `m` after them (`m` its columns).
+    pub(crate) gu: &'s mut [f32],
+    /// Slot `q`'s combine in the down's encoding at `q · cb`, `cb` the down's
+    /// column bytes.
+    pub(crate) qc: &'s mut [u8],
+    /// Slot `q`'s down output at `store[q·embd..(q + 1)·embd]`.
+    pub(crate) store: &'s mut [f32],
 }
 
-impl UnionCall<'_, '_> {
+/// The front `len` cells of `slab`, or a named panic when the scratch has no
+/// room for them — a scratch made for fewer columns or narrower encodings
+/// than the call's.
+fn room<'s, T>(slab: &'s mut [T], len: usize, what: &str) -> &'s mut [T] {
+    assert!(
+        len <= slab.len(),
+        "host union: {what} takes {len} cells, the scratch holds {}",
+        slab.len()
+    );
+    &mut slab[..len]
+}
+
+/// One union call — the host leg of `x`'s columns over the union of their
+/// experts — and the one owner of its passes' order ([`UnionCall::run`]): x
+/// quantized, every expert's gate and up, every slot's combine quantized,
+/// every expert's down, every column's sum. Every (row, column) dot is
+/// `compute_rows`' — the tile kernel over runs of up to [`qdot::TILE_COLS`]
+/// of the expert's columns — every column's quantization and combine is the
+/// one call any path makes for it, and none depends on the call's width or
+/// on who runs it.
+pub(crate) struct UnionCall<'c, 'w> {
+    plan: UnionPlanView<'c>,
+    sources: [ExpertStack<'w>; 3],
+    x: Tensor2View<'c>,
+    limit: Option<f32>,
+    gate: UnionStack,
+    up: UnionStack,
+    down: UnionStack,
+}
+
+impl<'c, 'w> UnionCall<'c, 'w> {
+    /// The call over `plan`'s experts of `sources` (`[gate, up, down]`), for
+    /// `x`'s columns and experts `ff` wide: the stacks checked
+    /// ([`UnionStack::of_call`]) and every id of the plan one of every
+    /// stack's experts, each failure its named error before any pass runs.
+    pub(crate) fn new(
+        plan: UnionPlanView<'c>,
+        sources: [ExpertStack<'w>; 3],
+        x: Tensor2View<'c>,
+        limit: Option<f32>,
+        ff: usize,
+    ) -> Result<Self, crate::ModelError> {
+        let [gate, up, down] = UnionStack::of_call(&sources, x.ne0(), ff)?;
+        // The ids ascend: the last is the largest.
+        if let Some(&e) = plan.ids.last()
+            && let Some(s) = sources.iter().find(|s| e as usize >= s.n_expert)
+        {
+            return Err(crate::ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                s.name
+            )));
+        }
+        Ok(UnionCall {
+            plan,
+            sources,
+            x,
+            limit,
+            gate,
+            up,
+            down,
+        })
+    }
+
+    /// The call's passes, in order, through `slabs` into `out`: column `j`
+    /// of `out` (`out[j·embd..(j + 1)·embd]`) is `lists[j]`'s weighted sum of
+    /// its experts' downs of column `j` of x, from zero in list order.
+    /// `lists` are the lists the plan was built from, one per column of x.
+    ///
+    /// A call past [`DEFER_MAX_COLS`] columns runs five passes over the pool:
+    /// x quantized — once more in the up's encoding when the up's rows read
+    /// other bytes than the gate's ([`UnionStack::shares_input`]) — every
+    /// expert's gate and up rows, every slot's combine quantized, every
+    /// expert's down rows, every column's sum. A narrower one claims the
+    /// quantizations inside its two row passes (x column by column, each
+    /// expert's combines at once) and sums on the caller; with the deferral
+    /// lever off it runs the quantize and combine passes too, four. Each
+    /// pass that completes adds one to `passes`; a failing pass ends the call
+    /// and adds nothing.
+    pub(crate) fn run(
+        &self,
+        slabs: UnionSlabs<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        passes: &mut u64,
+    ) -> Result<(), crate::ModelError> {
+        let (cols, ff, embd, slots) = (self.x.ne1(), self.gate.n, self.down.n, self.plan.slots());
+        assert_eq!(lists.len(), cols, "host union: one list a column of x");
+        assert_eq!(
+            out.len(),
+            cols * embd,
+            "host union: out holds every column's sum"
+        );
+        let xq = room(slabs.xq, cols * self.gate.cb, "x in the gate's encoding");
+        let mut xq_up = if self.gate.shares_input(&self.up) {
+            None
+        } else {
+            Some(room(
+                slabs.xq_up,
+                cols * self.up.cb,
+                "x in the up's encoding",
+            ))
+        };
+        let gu = room(slabs.gu, 2 * slots * ff, "the gate/up slab");
+        let qc = room(slabs.qc, slots * self.down.cb, "the combines' slab");
+        let store = room(slabs.store, slots * embd, "the down store");
+        // Poisoned like a dispatch's own buffers, so an unwritten cell shows.
+        if poison() {
+            xq.fill(0xA5);
+            if let Some(xq_up) = xq_up.as_deref_mut() {
+                xq_up.fill(0xA5);
+            }
+            gu.fill(f32::NAN);
+            qc.fill(0xA5);
+            store.fill(f32::NAN);
+        }
+        let lvl = profile::level();
+        let timer = || (lvl > 0).then(Instant::now);
+        let since = |t: Option<Instant>| t.map_or(0, |t| t.elapsed().as_nanos() as u64);
+        let claim = cols <= DEFER_MAX_COLS && defer_quant();
+        let (mut x_ns, mut h_ns) = (0u64, 0u64);
+        if !claim {
+            let t = timer();
+            self.quantize_x(xq, xq_up.as_deref_mut());
+            *passes += 1;
+            x_ns += since(t);
+        }
+        x_ns += self.gate_up(xq, xq_up, gu, claim, lvl)?;
+        *passes += 1;
+        if !claim {
+            let t = timer();
+            self.combine(gu, qc);
+            *passes += 1;
+            h_ns += since(t);
+        }
+        h_ns += self.down(gu, qc, store, claim, lvl)?;
+        *passes += 1;
+        let t_sum = timer();
+        if self.sum(store, lists, out) {
+            *passes += 1;
+        }
+        if lvl > 0 {
+            profile::record_time("host_x_quant", x_ns);
+            profile::record_time("host_h_quant", h_ns);
+            profile::record_time("host_sum", since(t_sum));
+        }
+        Ok(())
+    }
+
     /// x quantized over the pool, one dispatch: in the gate's encoding into
-    /// `xq`, and in the up's into `xq_up` unless that is empty (the up reads
-    /// the gate's bytes).
-    pub(crate) fn quantize_x(&self, xq: &mut [u8], xq_up: &mut [u8]) {
-        quantize_cols_pool(self.x, [(self.gate.ty, xq), (self.up.ty, xq_up)]);
+    /// `xq`, and in the up's into `xq_up` when the up reads other bytes.
+    fn quantize_x(&self, xq: &mut [u8], xq_up: Option<&mut [u8]>) {
+        quantize_cols_pool(
+            self.x,
+            (self.gate.ty, xq),
+            xq_up.map(|xq_up| (self.up.ty, xq_up)),
+        );
     }
 
     /// Every expert's gate and up rows over the columns that list it, into
-    /// `gu`, one dispatch; the up reads `xq_up` unless that is empty. With
-    /// `claim` (a narrow call, the lever on) x is quantized as the dispatch's
-    /// first work, column by column; without, `xq` and `xq_up` hold it.
-    /// Returns the longest claim pass at level >= 1.
-    pub(crate) fn gate_up(
+    /// `gu`, one dispatch; the up reads `xq_up` when given, else the gate's
+    /// `xq`. With `claim` x is quantized as the dispatch's first work, column
+    /// by column; without, `xq` and `xq_up` hold it. Returns the longest
+    /// claim pass at level >= 1.
+    fn gate_up(
         &self,
         xq: &mut [u8],
-        xq_up: &mut [u8],
+        xq_up: Option<&mut [u8]>,
         gu: &mut [f32],
         claim: bool,
         lvl: u8,
     ) -> Result<u64, crate::ModelError> {
-        let (k, ff) = (self.x.ne1(), self.gate.n);
-        assert_eq!(
-            gu.len(),
-            2 * self.plan.slots() * ff,
-            "host union: the gate/up slab holds two columns a slot"
-        );
-        assert_eq!(xq.len(), k * self.gate.cb, "host union: x's gate columns");
         let x_gate = SharedQuantCols::Bytes {
             cb: self.gate.cb,
             ptr: xq.as_mut_ptr(),
         };
-        let x_up = if xq_up.is_empty() {
-            None
-        } else {
-            assert_eq!(xq_up.len(), k * self.up.cb, "host union: x's up columns");
-            Some(SharedQuantCols::Bytes {
-                cb: self.up.cb,
-                ptr: xq_up.as_mut_ptr(),
-            })
-        };
+        let x_up = xq_up.map(|xq_up| SharedQuantCols::Bytes {
+            cb: self.up.cb,
+            ptr: xq_up.as_mut_ptr(),
+        });
         let claims = XClaims {
             x: self.x,
             encs: [
@@ -3577,7 +3879,8 @@ impl UnionCall<'_, '_> {
             claim_ns: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY (construction site, referenced by every access): the slabs are
-        // the caller's, borrowed for the whole dispatch. A pair writes only its
+        // the caller's, borrowed for the whole dispatch, each holding the call's
+        // columns or the plan's slots (`run`'s `room`). A pair writes only its
         // expert's gate or up slots, rows of its own blocks of the lane walk,
         // which partitions them; x's bytes are complete before any row reads
         // them — the quantize dispatch joined, or every claim counted done —
@@ -3585,10 +3888,10 @@ impl UnionCall<'_, '_> {
         let set = UnionRows {
             pass: UnionPass::GateUp,
             plan: self.plan,
-            resolve: self.resolve,
             stacks: [self.gate, self.up],
+            sources: [self.sources[0], self.sources[1]],
             inputs: [x_gate, x_up.unwrap_or(x_gate)],
-            x_cols: k,
+            x_cols: self.x.ne1(),
             out: SharedOut(gu.as_mut_ptr()),
             claims: if claim {
                 UnionClaims::X(&claims)
@@ -3613,24 +3916,34 @@ impl UnionCall<'_, '_> {
         Ok(claim_ns)
     }
 
+    /// The combines of the call: slot `q`'s `silu(gate) · up` of its columns
+    /// in `gu`, quantized in the down's encoding into slot `q` of `qc`.
+    fn combines<'a>(&self, gu: &'a [f32], qc: &mut [u8]) -> Combines<'a>
+    where
+        'c: 'a,
+    {
+        Combines {
+            plan: self.plan,
+            gu,
+            ff: self.gate.n,
+            limit: self.limit,
+            ty: self.down.ty,
+            qc: SharedQuantCols::Bytes {
+                cb: self.down.cb,
+                ptr: qc.as_mut_ptr(),
+            },
+        }
+    }
+
     /// Every slot's combine, quantized in the down's encoding into `qc`, one
     /// dispatch over the slots.
-    pub(crate) fn combine(&self, gu: &[f32], qc: &mut [u8]) {
-        let (ff, slots) = (self.gate.n, self.plan.slots());
-        assert_eq!(
-            qc.len(),
-            slots * self.down.cb,
-            "host union: the combines' slab"
-        );
-        let dst = SharedQuantCols::Bytes {
-            cb: self.down.cb,
-            ptr: qc.as_mut_ptr(),
-        };
+    fn combine(&self, gu: &[f32], qc: &mut [u8]) {
+        let src = self.combines(gu, qc);
         // SAFETY (construction site): `qc` holds the plan's slots in the down's
-        // encoding, borrowed for the whole dispatch; each participant writes
-        // only the slots of its own chunk of `0..slots`, the chunks partition
-        // them, and the join publishes the writes.
-        threads::pool().for_each_chunk(slots, |qs| {
+        // encoding (`run`'s `room`), borrowed for the whole dispatch; each
+        // participant writes only the slots of its own chunk of `0..slots`, the
+        // chunks partition them, and the join publishes the writes.
+        threads::pool().for_each_chunk(self.plan.slots(), |qs| {
             let Some(q0) = qs.clone().next() else {
                 return;
             };
@@ -3638,16 +3951,16 @@ impl UnionCall<'_, '_> {
             for q in qs {
                 d = self.plan.expert_at(q, d);
                 // SAFETY: slot `q` is in this participant's chunk — see the construction site.
-                unsafe { combine_slot(self.plan, d, q, gu, ff, self.limit, self.down.ty, dst) };
+                unsafe { src.slot(d, q) };
             }
         });
     }
 
     /// Every expert's down rows over its combines, into `store`, one
-    /// dispatch. With `claim` (a narrow call, the lever on) each expert's
-    /// combines are the dispatch's first work, from `gu` into `qc`; without,
-    /// `qc` holds them. Returns the longest claim pass at level >= 1.
-    pub(crate) fn down(
+    /// dispatch. With `claim` each expert's combines are the dispatch's first
+    /// work, from `gu` into `qc`; without, `qc` holds them. Returns the
+    /// longest claim pass at level >= 1.
+    fn down(
         &self,
         gu: &[f32],
         qc: &mut [u8],
@@ -3655,45 +3968,31 @@ impl UnionCall<'_, '_> {
         claim: bool,
         lvl: u8,
     ) -> Result<u64, crate::ModelError> {
-        let (embd, slots) = (self.down.n, self.plan.slots());
-        assert_eq!(store.len(), slots * embd, "host union: the down store");
-        assert_eq!(
-            qc.len(),
-            slots * self.down.cb,
-            "host union: the combines' slab"
-        );
         assert!(
             !claim || self.plan.n() <= UNION_CLAIM_EXPERTS,
             "host union: {} experts past the {UNION_CLAIM_EXPERTS} claim states",
             self.plan.n()
         );
-        let qc = SharedQuantCols::Bytes {
-            cb: self.down.cb,
-            ptr: qc.as_mut_ptr(),
-        };
+        let src = self.combines(gu, qc);
         let claims = CombineClaims {
-            plan: self.plan,
-            gu,
-            ff: self.gate.n,
-            limit: self.limit,
-            ty: self.down.ty,
-            qc,
+            src,
             next: std::sync::atomic::AtomicUsize::new(0),
             states: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(SLOT_TODO)),
             claim_ns: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY (construction site, referenced by every access): the slabs are
-        // the caller's, borrowed for the whole dispatch. A pair writes only its
-        // expert's store slots, rows of its own blocks of the lane walk, which
-        // partitions them; an expert's combines are complete before its rows
-        // read them — the combine dispatch joined, or its claim observed DONE —
-        // and each claim writes its expert's slots alone.
+        // the caller's, borrowed for the whole dispatch, each holding the plan's
+        // slots (`run`'s `room`). A pair writes only its expert's store slots,
+        // rows of its own blocks of the lane walk, which partitions them; an
+        // expert's combines are complete before its rows read them — the
+        // combine dispatch joined, or its claim observed DONE — and each claim
+        // writes its expert's slots alone.
         let set = UnionRows {
             pass: UnionPass::Down,
             plan: self.plan,
-            resolve: self.resolve,
             stacks: [self.down, self.down],
-            inputs: [qc, qc],
+            sources: [self.sources[2], self.sources[2]],
+            inputs: [src.qc, src.qc],
             x_cols: 0,
             out: SharedOut(store.as_mut_ptr()),
             claims: if claim {
@@ -3717,6 +4016,34 @@ impl UnionCall<'_, '_> {
             );
         }
         Ok(claim_ns)
+    }
+
+    /// Every column's sum from `store` straight into its column of `out`
+    /// ([`UnionPlanView::sum_col`]): on the caller up to
+    /// [`UNION_INLINE_COLS`] columns, else one dispatch over the columns.
+    /// Returns whether it dispatched.
+    fn sum(&self, store: &[f32], lists: &[&[(u32, f32)]], out: &mut [f32]) -> bool {
+        let (cols, embd) = (self.x.ne1(), self.down.n);
+        if cols <= UNION_INLINE_COLS {
+            for (j, o) in out.chunks_exact_mut(embd).enumerate() {
+                self.plan.sum_col(store, lists[j], j, o);
+            }
+            return false;
+        }
+        // SAFETY (construction site): `out` holds `cols` columns of `embd`
+        // cells (`run`'s assert), borrowed for the whole dispatch; each
+        // participant writes only the columns of its own chunk of `0..cols`,
+        // the chunks partition them, and the join publishes the writes.
+        let out = SharedOut(out.as_mut_ptr());
+        threads::pool().for_each_chunk(cols, |js| {
+            for j in js {
+                // SAFETY: the method's contract — column `j` is in this
+                // participant's chunk, inside `out` (see the construction site).
+                let o = unsafe { out.cells_mut(j * embd, embd) };
+                self.plan.sum_col(store, lists[j], j, o);
+            }
+        });
+        true
     }
 }
 
@@ -3949,7 +4276,8 @@ fn matmul_q_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        GroupInput, Tensor2, matmul_q, matmul_q_group, matmul_q_group_swiglu, matvec_q_local,
+        ExpertStack, GroupInput, Tensor2, UnionCall, UnionPlanView, UnionStack,
+        first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_swiglu, matvec_q_local,
         parse_steal, parse_steal_blocks,
     };
     use gguf::{GgmlType, Gguf};
@@ -4079,5 +4407,173 @@ mod tests {
             );
             println!("refusal {lever}: {e}");
         }
+    }
+
+    /// A stack `name` of `n_expert` zero matrices of `ty`, `k` × `n`, over
+    /// `bytes` (grown to fit) — the stack's type and shape are what a union
+    /// call checks; no row of it is read here.
+    fn stack<'w>(
+        name: &'w str,
+        ty: GgmlType,
+        [k, n, n_expert]: [usize; 3],
+        bytes: &'w mut Vec<u8>,
+    ) -> ExpertStack<'w> {
+        let per = ty.type_size().unwrap() as usize * (k / ty.blck_size().unwrap() as usize) * n;
+        bytes.resize(per * n_expert, 0);
+        ExpertStack {
+            name,
+            ty,
+            k,
+            n,
+            n_expert,
+            per,
+            bytes,
+        }
+    }
+
+    /// Every refusal a union call's stacks can meet is its named error with
+    /// its context: a stack of another shape names which matrix; a type with
+    /// no fused kernel, or a row width off the type's granularity, names the
+    /// matrix, the stack's tensor, its type, `k` and qdot's reason; and an id
+    /// past a stack names the expert and the stack — each before any pass.
+    #[test]
+    fn union_stack_refusals_carry_their_context() {
+        let (embd, ff) = (256, 256);
+        let (mut b0, mut b1, mut b2, mut b3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let gate = stack("stack.gate", GgmlType::Q4_K, [embd, ff, 2], &mut b0);
+        let up = stack("stack.up", GgmlType::Q4_K, [embd, ff, 2], &mut b1);
+        let down = stack("stack.down", GgmlType::Q4_K, [ff, embd, 2], &mut b2);
+        assert!(
+            UnionStack::of_call(&[gate, up, down], embd, ff).is_ok(),
+            "fused Q4_K stacks of the call's widths are a union call's"
+        );
+        let refusal = |r: Result<[UnionStack; 3], crate::ModelError>| match r {
+            Ok(_) => panic!("the stacks must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+        // No fused kernel: an f32 up.
+        let f32_up = stack("stack.up", GgmlType::F32, [embd, ff, 2], &mut b3);
+        let e = refusal(UnionStack::of_call(&[gate, f32_up, down], embd, ff));
+        for want in [
+            "host union: the up must map embd -> ff",
+            "every expert of stack.up",
+            &format!("({}, k = {embd})", GgmlType::F32),
+            "no fused qdot kernel",
+        ] {
+            assert!(e.contains(want), "the refusal names {want:?}, got {e:?}");
+        }
+        println!("refusal no fused kernel: {e}");
+
+        // A row width off the type's 256-value granularity: a Q4_K down of
+        // 128-value rows (no file holds one; the check stands anyway).
+        let (mut b4, mut b5, mut b6) = (Vec::new(), Vec::new(), Vec::new());
+        let gate128 = stack("stack.gate", GgmlType::Q4_K, [embd, 128, 2], &mut b4);
+        let up128 = stack("stack.up", GgmlType::Q4_K, [embd, 128, 2], &mut b5);
+        let narrow = stack("stack.down", GgmlType::Q4_K, [128, embd, 2], &mut b6);
+        let e = refusal(UnionStack::of_call(&[gate128, up128, narrow], embd, 128));
+        for want in [
+            "host union: the down must map ff -> embd",
+            "every expert of stack.down",
+            &format!("({}, k = 128)", GgmlType::Q4_K),
+            "whole 256-value super-blocks",
+        ] {
+            assert!(e.contains(want), "the refusal names {want:?}, got {e:?}");
+        }
+        println!("refusal unaligned k: {e}");
+
+        // Another shape: stacks of other widths than the call's, named by the
+        // first matrix that differs.
+        let e = refusal(UnionStack::of_call(&[gate, up, down], embd, ff / 2));
+        assert!(
+            e.contains("host union: the gate must map embd -> ff")
+                && e.contains(&format!("got [{embd}, {ff}]")),
+            "the shape refusal names the matrix and what it is, got {e:?}"
+        );
+        println!("refusal shape: {e}");
+
+        // An id past the stacks: named by the expert and the stack, before
+        // any pass.
+        let x = Tensor2::zeros(embd, 1);
+        let plan = UnionPlanView {
+            ids: &[0, 2],
+            off: &[0, 1, 2],
+            cols: &[0, 0],
+        };
+        let e = match UnionCall::new(plan, [gate, up, down], x.view(), None, ff) {
+            Ok(_) => panic!("an id past the stacks must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("expert 2 of stack.gate"),
+            "the refusal names the expert and the stack, got {e:?}"
+        );
+        println!("refusal id past the stack: {e}");
+    }
+
+    /// The first column holding a value that is not finite is found wherever
+    /// it sits — the first column overall, and the first, a middle and the
+    /// last column of a pool chunk that holds several — and of two, the
+    /// earlier one; all finite is `None`.
+    #[test]
+    fn first_non_finite_col_finds_every_position_in_a_chunk() {
+        let t = threads::pool().threads();
+        let (ne0, ne1) = (37, 3 * t + 1);
+        let (s, e) = threads::chunk_bounds(ne1, t, (t - 1) / 2);
+        assert!(e - s >= 3, "the chunk holds several columns");
+        let with = |bad: &[(usize, f32)]| {
+            let mut x = Tensor2::zeros(ne0, ne1);
+            for (i, v) in x.data.iter_mut().enumerate() {
+                *v = (i % 11) as f32 - 5.0;
+            }
+            for &(c, v) in bad {
+                x.data[c * ne0 + (c % ne0)] = v;
+            }
+            first_non_finite_col(x.view())
+        };
+        assert_eq!(with(&[]), None, "every value finite");
+        let mut cases = vec![
+            ("the first column overall", vec![(0, f32::NAN)], 0),
+            ("a chunk's first column", vec![(s, f32::NAN)], s),
+            (
+                "a chunk's middle column",
+                vec![(s + (e - s) / 2, f32::INFINITY)],
+                s + (e - s) / 2,
+            ),
+            (
+                "a chunk's last column",
+                vec![(e - 1, f32::NEG_INFINITY)],
+                e - 1,
+            ),
+            (
+                "the overall last column",
+                vec![(ne1 - 1, f32::NAN)],
+                ne1 - 1,
+            ),
+            (
+                "two in one chunk",
+                vec![(e - 1, f32::NAN), (s, f32::INFINITY)],
+                s,
+            ),
+        ];
+        if e < ne1 {
+            cases.push((
+                "a chunk's last and the next chunk's first",
+                vec![(e, f32::NAN), (e - 1, f32::NAN)],
+                e - 1,
+            ));
+        }
+        let n_cases = 1 + cases.len();
+        for (what, bad, want) in cases {
+            assert_eq!(
+                with(&bad),
+                Some(want),
+                "{what} ({t} pool threads, {ne1} columns)"
+            );
+        }
+        println!(
+            "first_non_finite_col: {n_cases} cases over {ne1} columns, {t} pool threads, chunk \
+             {s}..{e}"
+        );
     }
 }

@@ -60,6 +60,18 @@ pub enum ModelError {
     Quant(#[from] gguf::QuantError),
     #[error(transparent)]
     Qdot(#[from] qdot::QdotError),
+    /// A routed expert stack the host union cannot run — it runs fused rows
+    /// only: which of the call's matrices (`what`), the stack's tensor, its
+    /// type and row width, and qdot's refusal. Every expert of the stack
+    /// shares it.
+    #[error("{what}: every expert of {tensor} ({ty}, k = {k}): {why}")]
+    HostStack {
+        what: &'static str,
+        tensor: String,
+        ty: gguf::GgmlType,
+        k: usize,
+        why: qdot::QdotError,
+    },
     /// A metadata key the file lacks, holds in the wrong type, or sets to a
     /// value this engine does not run: the full key and why.
     #[error("metadata {key}: {detail}")]

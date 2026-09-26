@@ -595,10 +595,16 @@ struct UnionBlocks {
 }
 
 impl UnionBlocks {
-    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> Result<UnionBlocks, ModelError> {
+    fn new(
+        xs: &[Tensor2],
+        rows: usize,
+        embd: usize,
+        ff: usize,
+        n_used: usize,
+    ) -> Result<UnionBlocks, ModelError> {
         Ok(UnionBlocks {
             xs: union_xs(xs, rows, embd),
-            scratch: UnionScratch::new(embd, ff, rows)?,
+            scratch: UnionScratch::new_routed(embd, ff, rows, n_used)?,
             out: vec![0.0; embd * rows],
             lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
         })
@@ -2428,6 +2434,7 @@ fn check_union(
     split: &Split,
     slots: &[usize],
     xs: &[Tensor2],
+    n_used: usize,
 ) -> Result<(), BenchError> {
     let n = slots.len();
     let extra = (0..WORKING_SET)
@@ -2439,7 +2446,7 @@ fn check_union(
     let embd = xs[0].ne0;
     let ff = l.weight(0, GATE).n();
     let mut u = ChunkBlocks::new(xs, 2, embd, ff);
-    let mut u5 = UnionBlocks::new(xs, 2, embd, ff)?;
+    let mut u5 = UnionBlocks::new(xs, 2, embd, ff, n_used)?;
     let x0 = l.index % N_X;
     let mut tally = Tally::default();
     union_layer(host, split, l, &rows, n, n + 1, &mut u, x0, &mut tally)?;
@@ -2549,7 +2556,7 @@ fn check_union_r8(
         x0,
         &mut tally,
     )?;
-    let mut u5 = UnionBlocks::new(&bench.xs, rows, embd, ff)?;
+    let mut u5 = UnionBlocks::new(&bench.xs, rows, embd, ff, bench.n_used)?;
     union5_layer(
         host,
         bench.split,
@@ -2632,7 +2639,7 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
                 &mut tally,
             )?;
             let out = if arm.shape == Shape::Union5 {
-                let mut v = UnionBlocks::new(&bench.xs, arm.rows, embd, ff)?;
+                let mut v = UnionBlocks::new(&bench.xs, arm.rows, embd, ff, bench.n_used)?;
                 union5_layer(
                     host,
                     bench.split,
@@ -2712,7 +2719,15 @@ fn check(bench: &Bench<'_>, n_host: usize, verbose: bool) -> Result<(), BenchErr
             .hosts
             .get(li)
             .ok_or("no host layer to check the union shape")?;
-        check_union(&mut c, &layers[li], host, bench.split, &slots, xs)?;
+        check_union(
+            &mut c,
+            &layers[li],
+            host,
+            bench.split,
+            &slots,
+            xs,
+            bench.n_used,
+        )?;
         if bench.r8.get(li).is_some_and(Option::is_some) {
             for shape in R8_CHECKS {
                 check_union_r8(&mut c, bench, li, shape)?;
@@ -3048,6 +3063,9 @@ struct Bench<'a> {
     /// Present when an arm reads the huge-page copy.
     thp: Option<Vec<Vec<ExpertBytes<'a>>>>,
     sink: AtomicU64,
+    /// The file's routed width: every union scratch is made for it, as the
+    /// engine's is.
+    n_used: usize,
 }
 
 /// One arm's round: the timed tokens and the page state around them.
@@ -3173,7 +3191,8 @@ impl Bench<'_> {
                     blocks.chunks = Some(ChunkBlocks::new(&self.xs, arm.rows, embd, ff))
                 }
                 Shape::Union5 => {
-                    blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff)?);
+                    blocks.union =
+                        Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff, self.n_used)?);
                 }
                 // `unionr8` and `unionq` share the blocks.
                 _ => {
@@ -3460,6 +3479,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         mapped,
         thp: copy.as_ref().map(ThpCopy::bytes),
         sink: AtomicU64::new(0),
+        n_used: meta.n_used,
     };
     match mode {
         Mode::Check(arms) if arms.is_empty() => {

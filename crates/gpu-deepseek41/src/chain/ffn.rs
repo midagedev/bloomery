@@ -1565,10 +1565,18 @@ impl Ds41Host {
     /// nothing.
     pub fn prepare_union(&mut self) -> Result<(), GpuError> {
         if self.union.is_none() {
-            self.union = Some(UnionScratch::new(self.embd, self.ff, UNION_MAX_COLS)?);
+            self.union = Some(union_scratch(self.embd, self.ff)?);
         }
         Ok(())
     }
+}
+
+/// The one shape of the tier's union scratch, for [`Ds41Host::prepare_union`]
+/// and the lazy path alike: [`UNION_MAX_COLS`] columns of [`N_USED`] routed
+/// slots, the width the card kernels are built for; a longer list is refused
+/// by name.
+fn union_scratch(embd: usize, ff: usize) -> Result<UnionScratch, GpuError> {
+    Ok(UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, N_USED)?)
 }
 
 impl HostExperts for Ds41Host {
@@ -1603,7 +1611,7 @@ impl HostExperts for Ds41Host {
         let view = host_view(layers, *first, layer, "Ds41Host::experts_union_into")?;
         let scratch = match union {
             Some(s) => s,
-            None => union.insert(UnionScratch::new(*embd, *ff, UNION_MAX_COLS)?),
+            None => union.insert(union_scratch(*embd, *ff)?),
         };
         view.experts_union_into(file, x, lists, out, scratch)?;
         Ok(())

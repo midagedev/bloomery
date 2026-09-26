@@ -1,8 +1,11 @@
 //! Union host call gate: `moe::HostLayer::experts_union_into` over `k` token
 //! columns equals, column for column and bit for bit, `experts_into` of that
 //! column and its own list — on every routed layer of the V4.1 file, for
-//! k = 1, 2, 3 and 6, under both deferral arms (`ops::set_defer_quant`: the
-//! claim inside the dispatch, and the caller-side pre-pass). The bit
+//! k = 1, 2, 3, 6, 8 and 9, under both deferral arms (`ops::set_defer_quant`:
+//! the claim inside the dispatch, and the caller-side pre-pass). k = 8 and 9
+//! are the width where the claims stop and the sums leave the caller: the
+//! widest call that claims, with the most claim states in use, and the
+//! narrowest that runs every pass over the pool. The bit
 //! contract holds by construction — the same `dot_row` per (row, column), the
 //! same per-column quantization, the same list-order sum from zero — so any
 //! differing cell is a bug, not rounding.
@@ -10,17 +13,18 @@
 //! The lists are real routing: the ids of `ffn_moe_topk-L` (the logical twin)
 //! and the weights of `ffn_moe_weights_scaled-L` of the 5-token oracle set
 //! `ref_deepseek41`, whose consecutive positions share experts the way a
-//! verify pass's rows do. k = 6 needs a sixth column the set does not have:
-//! token 0's row doubled (any column is a valid input — the contract is per
-//! column) with token 1's list reversed and token 0's first expert repeated
-//! at a negative weight, so the case also carries a list whose order is
-//! neither the router's nor the union's, and an expert a list names twice.
+//! verify pass's rows do. k = 6, 8 and 9 need columns the set does not have:
+//! the i-th past the set's tokens is token i's row doubled (any column is a
+//! valid input — the contract is per column) with token i + 1's list
+//! reversed and token i's first expert repeated at a negative weight, so the
+//! cases also carry lists whose order is neither the router's nor the
+//! union's, and an expert a list names twice.
 //!
 //! Every union call is also held to its pool dispatches, by the scratch's
-//! count (`UnionScratch::dispatches`) and by the pool's: five a call past
-//! `ops::DEFER_MAX_COLS` columns, two at or under it with the claims, four
-//! with the pre-pass, and a cut call its calls' — so a pass split back into
-//! dispatches of its own turns the gate red.
+//! count of passes (`UnionScratch::passes`) and by the pool's: five a call
+//! past `ops::DEFER_MAX_COLS` columns, two at or under it with the claims,
+//! four with the pre-pass, and a cut call its calls' — so a pass split back
+//! into dispatches of its own turns the gate red.
 //!
 //! The wide shape — a prefill ubatch — is held to the same contract at
 //! k = 16, 64 and 512 on two routed layers (one Q5_K down, one Q4_K down):
@@ -90,10 +94,11 @@ const SET: &str = "ref_deepseek41";
 const BUILD: &str = "db517b69";
 
 /// Column counts the gate runs.
-const KS: [usize; 4] = [1, 2, 3, 6];
+const KS: [usize; 6] = [1, 2, 3, 6, 8, 9];
 
-/// The columns the decode-shape scratch is made for.
-const SMALL_COLS: usize = 8;
+/// The columns the narrow cases' scratch is made for: the widest, one past
+/// `ops::DEFER_MAX_COLS`.
+const SMALL_COLS: usize = 9;
 
 /// The wide column counts, each with the expert pool its lists draw from
 /// (`None`: every expert of the layer).
@@ -156,10 +161,10 @@ fn dispatched<R>(
     us: &mut UnionScratch,
     call: impl FnOnce(&mut UnionScratch) -> R,
 ) -> (R, u64, Option<u64>) {
-    let (s0, p0) = (us.dispatches(), threads::pool().stats().dispatches);
+    let (s0, p0) = (us.passes(), threads::pool().stats().dispatches);
     let r = call(us);
     let pool = (threads::pool().threads() > 1).then(|| threads::pool().stats().dispatches - p0);
-    (r, us.dispatches() - s0, pool)
+    (r, us.passes() - s0, pool)
 }
 
 /// Whether a call's dispatches, by the scratch's count and the pool's, are
@@ -188,7 +193,7 @@ fn diff_cells(got: &[f32], want: &[f32]) -> usize {
 }
 
 /// The V4.1 cases of one layer: the set's first k tokens for k <= 5, and
-/// k = 6 with the sixth column of the module doc.
+/// past them the columns of the module doc.
 fn v41_cases(x_all: &[f32], lists: &[Vec<(u32, f32)>], embd: usize) -> Vec<Case> {
     let n_tokens = lists.len();
     KS.iter()
@@ -200,9 +205,11 @@ fn v41_cases(x_all: &[f32], lists: &[Vec<(u32, f32)>], embd: usize) -> Vec<Case>
                     data.extend_from_slice(&x_all[j * embd..(j + 1) * embd]);
                     ls.push(lists[j].clone());
                 } else {
-                    data.extend(x_all[..embd].iter().map(|&v| 2.0 * v));
-                    let mut l: Vec<(u32, f32)> = lists[1].iter().rev().copied().collect();
-                    l.push((lists[0][0].0, -0.5));
+                    let i = (j - n_tokens) % n_tokens;
+                    data.extend(x_all[i * embd..(i + 1) * embd].iter().map(|&v| 2.0 * v));
+                    let mut l: Vec<(u32, f32)> =
+                        lists[(i + 1) % n_tokens].iter().rev().copied().collect();
+                    l.push((lists[i][0].0, -0.5));
                     ls.push(l);
                 }
             }
@@ -339,7 +346,8 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
         "every column's width",
     );
 
-    let mut other = UnionScratch::new(embd, ff / 2, SMALL_COLS).expect("a scratch of 8 columns");
+    let mut other =
+        UnionScratch::new(embd, ff / 2, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
     check(
         refusal(
             layer.experts_union_into(split, &x, &[&one[..]], &mut out, &mut other),
@@ -366,7 +374,7 @@ fn hw_union_matches_per_column_v41() {
         "{SET}: {n_tokens} tokens, the k = 6 column needs two"
     );
     let mut host = HostScratch::new(embd, ff);
-    let mut us = UnionScratch::new(embd, ff, SMALL_COLS).expect("a scratch of 8 columns");
+    let mut us = UnionScratch::new(embd, ff, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
     // Per k: layers, columns, slots, distinct experts, differing cells.
     let mut tally = [[0usize; 5]; KS.len()];
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
@@ -476,8 +484,8 @@ fn hw_union_matches_per_column_v41() {
     );
     println!(
         "PASSED: union — experts_union_into equals experts_into column for column, bit for bit, \
-         on every routed layer at k = 1, 2, 3, 6 under both deferral arms, in 2 (claims) and 4 \
-         (pre-pass) pool dispatches a call; every refusal named"
+         on every routed layer at k = 1, 2, 3, 6, 8, 9 under both deferral arms, in 2 (claims) \
+         and 4 (pre-pass) pool dispatches a call up to k = 8 and 5 at k = 9; every refusal named"
     );
 }
 
@@ -1060,7 +1068,8 @@ fn hw_union_file_matches_per_column_v2lite() {
         .unwrap();
     }
     let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
-    let mut us = UnionScratch::new(embd, plan.meta.ff, SMALL_COLS).expect("a scratch of 8 columns");
+    let mut us =
+        UnionScratch::new(embd, plan.meta.ff, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
     let mut total = 0;
     let mut counted = true;
     for (arm, on) in ARMS {
