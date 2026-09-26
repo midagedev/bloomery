@@ -818,7 +818,9 @@ impl<B: ChainBody> GpuModel<B> {
     ///
     /// Positions continue from wherever the model stands: a prompt then its
     /// continuation is `step(&prompt)` followed by one `step(&[tok])` per
-    /// generated token. [`GpuModel::reset`] rewinds.
+    /// generated token. [`GpuModel::reset`] rewinds. A fault any token
+    /// raised is the call's error, also when a later token then fails for
+    /// another reason ([`GpuModel::note_fault`]).
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         self.refuse_if_poisoned("GpuModel::step")?;
         if tokens.is_empty() {
@@ -840,6 +842,15 @@ impl<B: ChainBody> GpuModel<B> {
         if self.mode == StepMode::Graph && self.step_graph.is_none() {
             self.capture_step()?;
         }
+        let token = self.run_tokens(tokens);
+        self.note_fault("GpuModel::step", token)
+    }
+
+    /// [`GpuModel::step`]'s tokens once its checks have passed: each
+    /// position's refresh and chain, then the head's readback. An error
+    /// here can follow launches, so the caller passes it through
+    /// [`GpuModel::note_fault`].
+    fn run_tokens(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         for &token in tokens {
             let pos = self.pos;
             self.check_pos(pos, "GpuModel::step")?;
@@ -849,17 +860,14 @@ impl<B: ChainBody> GpuModel<B> {
                 StepMode::Eager => self.enqueue_chain_step(),
                 StepMode::Graph => self.replay_graph(Chain::Step),
             };
-            let r = self.name_host_refusal(r);
-            self.note_fault(r)?;
+            self.name_host_refusal(r)?;
             self.pos = pos + 1;
         }
         let gpu = &self.stages[0].gpu;
-        let token = self
-            .head
+        self.head
             .as_ref()
             .ok_or(GpuError::state("GpuModel::step", "no output head"))?
-            .token(gpu);
-        self.note_fault(token)
+            .token(gpu)
     }
 
     /// A step's enqueue or replay result, with a host refusal named: when the
@@ -867,19 +875,34 @@ impl<B: ChainBody> GpuModel<B> {
     /// refused, it released every wait of the step, so the step drains, and
     /// the fault word read on the engine stream behind it names the refusal
     /// ([`name_refusal`]) — the card's fault when the card raised one at or
-    /// before that layer, else the host's error. Any other result passes
+    /// before that layer, else the host's error. The caller's
+    /// [`GpuModel::note_fault`] then turns a host error into the fault when
+    /// the word holds a later layer's, so the call still ends poisoned; the
+    /// refusal itself stays in the tier's record. A failed read names the
+    /// refusal and the step's error beside its own. Any other result passes
     /// through.
     pub(crate) fn name_host_refusal(&mut self, r: Result<(), GpuError>) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::name_host_refusal";
         let Err(e) = r else {
             return Ok(());
         };
-        let Ok((gpu, _, body)) = self.body_parts("GpuModel::name_host_refusal") else {
+        let Ok((gpu, _, body)) = self.body_parts(WHAT) else {
             return Err(e);
         };
         let Some(refusal) = body.take_host_refusal() else {
             return Err(e);
         };
-        Err(name_refusal(&refusal, gpu.fault()?))
+        match gpu.fault() {
+            Ok(word) => Err(name_refusal(&refusal, word)),
+            Err(s) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} refused the input of layer {} ({}) and the step failed ({e}), and reading \
+                     the fault word behind it failed too ({s})",
+                    refusal.what, refusal.layer, refusal.detail
+                ),
+            )),
+        }
     }
 
     /// A step on a poisoned model is refused, naming the fault.
@@ -890,15 +913,51 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// Pass a readback through, remembering a fault it carries: the state
-    /// the faulted step wrote poisons every later step. The fault prints its
-    /// site mask in this body's step order.
-    fn note_fault<T>(&mut self, mut r: Result<T, GpuError>) -> Result<T, GpuError> {
-        if let Err(GpuError::Fault { fault, .. }) = &mut r {
+    /// Pass through the result of `what`, a call that may have launched,
+    /// remembering a fault it carries: the state the faulted call wrote
+    /// poisons every later call until [`GpuModel::reset`]. A fault is the
+    /// call's error whatever else failed: any other error is read behind
+    /// ([`GpuModel::fault_behind`]). The fault prints its site mask in this
+    /// body's step order.
+    fn note_fault<T>(&mut self, what: &'static str, r: Result<T, GpuError>) -> Result<T, GpuError> {
+        let mut e = match r {
+            Ok(v) => return Ok(v),
+            Err(e @ GpuError::Fault { .. }) => e,
+            Err(e) => self.fault_behind(what, e),
+        };
+        if let GpuError::Fault { fault, .. } = &mut e {
             *fault = fault.in_arch(B::arch());
             self.poisoned = Some(*fault);
         }
-        r
+        Err(e)
+    }
+
+    /// `e`, the error of `what` after launches that may have raised the
+    /// fault word, named by the word: the engine stream waited for, then the
+    /// word read. A raised word is the error whatever `e` was, so the fault
+    /// never outlives the call that raised it — the next call's readback
+    /// would name it. A clean word leaves `e`. A failed wait or read names
+    /// `e` beside its own error.
+    fn fault_behind(&self, what: &'static str, e: GpuError) -> GpuError {
+        let Some(gpu) = self.stages.first().map(|s| &s.gpu) else {
+            return e;
+        };
+        let read = gpu
+            .stream()
+            .synchronize()
+            .map_err(GpuError::from)
+            .and_then(|()| gpu.fault());
+        match read {
+            Ok(Some(fault)) => GpuError::Fault { what, fault },
+            Ok(None) => e,
+            Err(s) => GpuError::shape(
+                what,
+                format!(
+                    "the call failed ({e}), and waiting for its launches or reading the fault \
+                     word failed too ({s})"
+                ),
+            ),
+        }
     }
 
     /// The fault that poisons this model, if a step has read one back.
@@ -913,7 +972,8 @@ impl<B: ChainBody> GpuModel<B> {
     /// `step(&[t1])`; the model stands two positions on. The first call
     /// makes the second row's head, and in graph mode captures the pass.
     /// A caller that does not keep `t1` takes it back with
-    /// [`GpuModel::rollback`].
+    /// [`GpuModel::rollback`]. A fault the pass raised is its error, as
+    /// [`GpuModel::step`]'s is.
     pub fn step_pair(&mut self, t: u32, t1: u32) -> Result<[u32; 2], GpuError> {
         const WHAT: &str = "GpuModel::step_pair";
         self.refuse_if_poisoned(WHAT)?;
@@ -944,17 +1004,24 @@ impl<B: ChainBody> GpuModel<B> {
             let (gpu, _, body) = self.body_parts(WHAT)?;
             body.decode_pair(gpu.stream(), [t, t1], pos)?;
         }
+        let tokens = self.run_pair(pos);
+        self.note_fault(WHAT, tokens)
+    }
+
+    /// [`GpuModel::step_pair`]'s pass at `pos` once its rows are planned:
+    /// the enqueue or replay, then both heads' readbacks. An error here can
+    /// follow launches, so the caller passes it through
+    /// [`GpuModel::note_fault`].
+    fn run_pair(&mut self, pos: u32) -> Result<[u32; 2], GpuError> {
         let r = match self.mode {
             StepMode::Eager => self.enqueue_pair_step(),
             StepMode::Graph => self.replay_graph(Chain::Pair),
         };
-        let r = self.name_host_refusal(r);
-        self.note_fault(r)?;
+        self.name_host_refusal(r)?;
         self.pos = pos + 2;
         let gpu = &self.stages[0].gpu;
         let [a, b] = self.pair_heads()?;
-        let tokens = a.token(gpu).and_then(|ta| Ok([ta, b.token(gpu)?]));
-        self.note_fault(tokens)
+        Ok([a.token(gpu)?, b.token(gpu)?])
     }
 
     /// Wake the launch thread, if any, ahead of a graph replay's refresh.
@@ -1282,8 +1349,11 @@ impl<B: ChainBody> GpuModel<B> {
     /// Run `n` positions as one eager pass the body enqueues itself — `pass`
     /// gets the stage's parts, the output head and the first position — and
     /// stand `n` positions on. When `pass` reports that it enqueued the
-    /// head, return the head's token (a blocking read). A fault the pass
-    /// returns, or the head's readback carries, poisons the model.
+    /// head, return the head's token (a blocking read); a pass that does not
+    /// is not read back, and leaves the fault word to the head of a later
+    /// pass of the same call. A fault the pass returns, the head's readback
+    /// carries, or the word holds behind any other error of the pass
+    /// ([`GpuModel::note_fault`]) poisons the model.
     pub fn run_rows(
         &mut self,
         n: usize,
@@ -1312,7 +1382,7 @@ impl<B: ChainBody> GpuModel<B> {
             Ok(false) => Ok(None),
             Err(e) => Err(e),
         };
-        let token = self.note_fault(token)?;
+        let token = self.note_fault(what, token)?;
         self.pos = pos + n;
         Ok(token)
     }

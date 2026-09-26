@@ -36,7 +36,16 @@
 //!   layer the gate plan places, with the words at rest after every one (a
 //!   counter left at the release would let every wait pass with no host
 //!   service), and answer, bit for bit, the tokens the same steps answered
-//!   from a reset before the fault.
+//!   from a reset before the fault. And a fault is the step's error even
+//!   when the step then fails for another reason: with a NaN in the output
+//!   norm's gain, a step of two tokens whose second id is one past the
+//!   vocabulary runs the first token's whole chain — the head's q8_1
+//!   quantizer raises `quant_column` at the output head — and then refuses
+//!   the second id's embedding row on the host, before its launch. The step
+//!   must return exactly that fault and stand one position on, poisoned by
+//!   it; with the gain put back, the next step must refuse as poisoned
+//!   rather than read the word back as a fault of its own; and after a
+//!   reset the prompt answers its clean token again.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -140,8 +149,8 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::{HostExperts, PoisonKind, RELEASE};
     use bloomery_gpu::model::ChainBody;
-    use bloomery_gpu::weights::Weights;
-    use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
+    use bloomery_gpu::weights::{DevWeight, Weights};
+    use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
     use bloomery_gpu_deepseek41::chain::ffn::{Ds41Host, FfnPiece};
@@ -155,7 +164,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
         GREEDY_MARGIN, GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed,
-        data_dir, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
+        data_dir, patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
@@ -334,6 +343,7 @@ mod gate {
         if args.structure {
             pass &= structure(&mut m, &mut head, &split, &hp)?;
             pass &= fault_case(&mut m, plan.n_l.len())?;
+            pass &= fault_behind_error_case(&mut m, &hp)?;
         }
         if args.sets {
             pass &= sets(&mut m, &mut head, &split, &hp, &SETS)?;
@@ -513,6 +523,65 @@ mod gate {
             verdict(reset_pass)
         );
         Ok(pass && reset_pass)
+    }
+
+    /// The output norm's gain, whose first value the fault-behind-an-error
+    /// case sets to NaN and puts back.
+    const HEAD_GAIN: &str = "output_norm.weight";
+
+    /// Write `bytes` over the first value of [`HEAD_GAIN`] and return the
+    /// bytes it replaced.
+    fn patch_head_gain(m: &mut Deepseek41Model, bytes: [u8; 4]) -> Result<[u8; 4], GateError> {
+        let (gpu, w, _) = m.body_parts("gate_deepseek41_step patch_head_gain")?;
+        let Some(DevWeight::F32 { w: gain, .. }) = w.get(HEAD_GAIN) else {
+            return Err(format!("{HEAD_GAIN} is not resident as F32").into());
+        };
+        patch_bytes(gpu.stream(), gain.buf(), 0, bytes)
+    }
+
+    /// A step that faults and then fails for another reason (the module
+    /// doc's second fault case). `hp.n_vocab` is one past the embedding
+    /// table's rows, which the engine's step rows check against it.
+    fn fault_behind_error_case(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        let bad = u32::try_from(hp.n_vocab)?;
+        let want = Fault::at(LAYER_HEAD, FaultSite::QuantColumn);
+        m.reset()?;
+        let clean = m.step(&FAULT_PROMPT)?;
+        m.reset()?;
+        let old = patch_head_gain(m, f32::NAN.to_le_bytes())?;
+        let first = m.step(&[FAULT_PROMPT[0], bad]);
+        let (at, poisoned) = (m.pos(), m.poisoned());
+        patch_head_gain(m, old)?;
+        let next = m.step(&[FAULT_PROMPT[1]]);
+        let reset = m.reset();
+        let unpoisoned = m.poisoned().is_none();
+        let again = m.step(&FAULT_PROMPT);
+        m.reset()?;
+        let describe = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        let named = matches!(&first, Err(GpuError::Fault { fault, .. }) if *fault == want);
+        let refused = matches!(&next, Err(GpuError::Poisoned { fault, .. }) if *fault == want);
+        let cleared = reset.is_ok() && unpoisoned && matches!(&again, Ok(t) if *t == clean);
+        let pass = named && at == 1 && poisoned == Some(want) && refused && cleared;
+        println!(
+            "fault behind an error: NaN in {HEAD_GAIN}[0], a step of [{}, {bad}] (want the fault \
+             {want} at the first token's head, then the second id refused before its launch): \
+             step {} at position {at} (want 1), poisoned {}; next step with the gain put back {} \
+             (want refused as poisoned); reset {}, the prompt again {} (clean token {clean}) {}",
+            FAULT_PROMPT[0],
+            describe(&first),
+            poisoned.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            describe(&next),
+            match &reset {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => format!("error \"{e}\""),
+            },
+            describe(&again),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     // ------------------------------------------------------- the set's state
