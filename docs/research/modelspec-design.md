@@ -8,9 +8,11 @@ principle 3 and §2-2 are its frame.
 
 - **§0.2 item 1 is not a correction.** `docs/rebuild.md` and `modelvocab-report.md` speak of
   GLM-5.3-Flash **UD-Q4_K_XL** (the quant that fits the host tier); this memo read the box's
-  **UD-Q2_K_XL**, whose routed stacks are IQ2_XS, IQ3_XXS and IQ4_XS. Q5_K routed stacks are read
-  from the header for Qwen3.6-35B-A3B UD-Q4_K_XL; for GLM UD-Q4_K_XL they stay unverified until
-  its header is read. Either way the format owner (§5) must name them.
+  **UD-Q2_K_XL**, whose routed stacks are IQ2_XS, IQ3_XXS and IQ4_XS. The lead read the UD-Q4_K_XL
+  shard headers (Hugging Face range requests of each shard's first 2 MB, 09-27): routed down is Q5_K
+  on layers 3-10, 13-43 and 45 (40 of 43 MoE layers) and Q6_K on 11, 12 and 44; gate and up are Q4_K
+  except layer 11's Q5_K. So the plan's routed Q5_K holds for the quant that fits, and Qwen3.6-35B-A3B
+  UD-Q4_K_XL carries it too (this memo's header). The format owner (§5) must name it.
 - **§0.2 item 2 holds.** The V4.1 Q3_K_M header carries no `nextn.*` or `mtp.*` tensor;
   `docs/rebuild.md` §2-2 is corrected.
 - **L4 landed as a refusal, not a cap** (`ef80083`): every entry that advances V4.1 positions

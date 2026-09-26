@@ -156,7 +156,7 @@ extras   = Engram | Ple | Deepstack
    - `Mtp{layers}`: 모델 자신의 nextn 층이다. GLM 1층, Qwen3.5 이후 1층, V4.1 3층이다. ~~V4.1의 셋은 오늘 `Role::Unused`다(`roles.rs:39-41`).~~ V4.1의 셋은 우리 Q3_K_M 파일에 없다: 헤더에 `nextn.*`·`mtp.*` 텐서가 0개이고, `compress_ratios` 43개 중 `block_count` 40 뒤의 3개만 남아 있다. `roles.rs:39-41`의 규칙은 아무것도 잡지 않는다(specdesign, 09-27). MTP 층도 `LayerSpec`이다.
    - `Block{file}`: DSpark·DFlash 외부 초안. GLM-5.3-Flash·Qwen3.6·MiniMax-M3용이 이미 공개돼 있다.
 
-**커버리지 검사의 첫 출력.** 오늘 GLM-5.3-Flash 파일을 열면, 검사는 다음을 이름 붙은 거부 하나로 모아 낼 것이다(보고 §5(d)): `DeltaRule{Kda}` ×34, `Pool{SoftmaxApe, 4}` ×11, 라우터 `(Sigmoid, 288, 8)`, 카드의 routed Q5_K, pre `glm4`, GLM 도구 파서. routed Q5_K는 UD-Q4_K_XL 이야기이고 그 헤더는 아직 읽지 않았다. 박스에 있는 UD-Q2_K_XL은 routed가 IQ2_XS·IQ3_XXS·IQ4_XS라 형식 항목이 그 셋이 된다. Qwen3.6 UD-Q4_K_XL의 routed Q5_K는 헤더로 확인했다. 두 파일의 헤더에서 계산한 항목별 목록은 `docs/research/modelspec-design.md` §5에 있다.
+**커버리지 검사의 첫 출력.** 오늘 GLM-5.3-Flash 파일을 열면, 검사는 다음을 이름 붙은 거부 하나로 모아 낼 것이다(보고 §5(d)): `DeltaRule{Kda}` ×34, `Pool{SoftmaxApe, 4}` ×11, 라우터 `(Sigmoid, 288, 8)`, 카드의 routed Q5_K, pre `glm4`, GLM 도구 파서. routed Q5_K는 UD-Q4_K_XL 이야기다. 그 샤드 헤더(09-27, HF 범위 요청)로는 routed down이 MoE 층 43개 중 40개에서 Q5_K(11·12·44층은 Q6_K)이고, gate/up은 11층만 Q5_K이고 나머지는 Q4_K다. 박스에 있는 UD-Q2_K_XL은 routed가 IQ2_XS·IQ3_XXS·IQ4_XS라 형식 항목이 그 셋이 된다. Qwen3.6 UD-Q4_K_XL의 routed Q5_K는 헤더로 확인했다. 두 파일의 헤더에서 계산한 항목별 목록은 `docs/research/modelspec-design.md` §5에 있다.
 
 **게이트.**
 - 연산 게이트는 인스턴스마다 모델 파일 없이 돈다. 대상은 모든 (E, K), HEAD × PACK, LATENT × ROPE, D × KDA다.
