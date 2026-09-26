@@ -13,7 +13,11 @@
 //!    formula) and its dequantized RMS is within ±10 % of 1/√K;
 //! 4. end to end: the binary writes small subset files holding every type at
 //!    its real shape, `Split::open` and `verify` pass, a flipped byte and an
-//!    existing directory are refused by name.
+//!    existing directory are refused by name; each written file's sha256 is
+//!    printed, the record that today's generator writes today's bytes;
+//! 5. refusals: a draft naming more target layers than the fixture has, a
+//!    `general.alignment` the writer would not take, and a flag its verb does
+//!    not take are refused by name.
 //!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
@@ -23,12 +27,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use gguf::write::Writer;
+use gguf::write::{Layout, Writer};
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::fixture::{
-    self, FilePlan, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION,
-    LAYER_MAP, Options, Plan, PlannedTensor, Rule, Sample,
+    self, FilePlan, FixtureError, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256,
+    KEY_VERSION, LAYER_MAP, Options, Plan, PlannedTensor, Rule, Sample,
 };
+use model::fileio;
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -366,11 +371,31 @@ fn sample(t: &PlannedTensor, seed: u64) -> Vec<u8> {
 }
 
 fn sha(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    fileio::hex(&Sha256::digest(bytes)[..8])
+}
+
+/// One `e2e: sha256` line per `.gguf` file under `dir`, by path below it.
+fn print_file_shas(dir: &Path) {
+    let mut files = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.extension().is_some_and(|x| x == "gguf") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    for f in files {
+        let hex = fileio::sha256_hex(&std::fs::read(&f).unwrap());
+        println!(
+            "e2e: sha256 {hex}  {}",
+            f.strip_prefix(dir).unwrap().display()
+        );
+    }
 }
 
 /// Contract 2: determinism.
@@ -659,6 +684,20 @@ fn hw_fixture_end_to_end() {
     assert!(
         stdout.contains("v41fixture: verify done tensors=9 ") && stdout.contains("subset=true")
     );
+    print_file_shas(&out);
+    let (rc, _, stderr) = run(&[
+        "verify",
+        first_s,
+        "--source",
+        &src_path,
+        "--draft-source",
+        &draft_src,
+    ]);
+    assert_eq!(rc, Some(1));
+    assert!(
+        stderr.contains("names a draft source, but"),
+        "verify must refuse a draft source with no draft fixture"
+    );
     let (rc, _, stderr) = run(&[
         "generate",
         &src_path,
@@ -742,6 +781,8 @@ fn hw_fixture_end_to_end() {
         dtypes.join("\n  ")
     );
     assert!(dbytes < 1 << 30);
+    drop(dx);
+    print_file_shas(&out);
     let first = out.join(format!("{}-00001-of-00001.gguf", fixture::STEM));
     let (rc, stdout, _) = run(&[
         "verify",
@@ -760,4 +801,127 @@ fn hw_fixture_end_to_end() {
     println!(
         "e2e: target subset {bytes} B generated in {gen_wall:.2} s, draft subset {dbytes} B in {draft_wall:.2} s; children's peak RSS {peak} KiB, then {peak2} KiB; never both on disk"
     );
+}
+
+/// A header-only draft of `kvs`, no tensors, at `path`.
+fn draft_header(path: &Path, kvs: &[(String, Value)]) -> Split {
+    let layout = Layout::new(kvs, Vec::new()).unwrap();
+    Writer::new(File::create(path).unwrap(), layout)
+        .unwrap()
+        .finish()
+        .unwrap();
+    Split::open(path).unwrap()
+}
+
+/// Set the u32 `general.alignment` of the file at `path` to `to`, and pad
+/// the file so its data base, rounded to `to`, lies inside it.
+fn patch_alignment(path: &Path, to: u32) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let key = gguf::GENERAL_ALIGNMENT.as_bytes();
+    let at = bytes
+        .windows(key.len())
+        .position(|w| w == key)
+        .expect("the file holds the alignment key")
+        + key.len();
+    let tag = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    assert_eq!(tag, 4, "the alignment is a u32");
+    bytes[at + 4..at + 8].copy_from_slice(&to.to_le_bytes());
+    bytes.resize(bytes.len() + to as usize, 0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// A draft's metadata: the dflash architecture, `target_layers`, and `extra`.
+fn draft_kvs(target_layers: std::ops::Range<u32>, extra: &[(&str, Value)]) -> Vec<(String, Value)> {
+    let mut kvs = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String(model::arch::DFLASH.into()),
+        ),
+        (
+            format!("{}.target_layers", model::arch::DFLASH),
+            Value::Array(target_layers.map(Value::U32).collect()),
+        ),
+    ];
+    kvs.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    kvs
+}
+
+/// Contract 5: refusals. Every case runs; the failures are listed together.
+#[test]
+#[ignore = "needs the box and the V4.1 file (just gate-fixture)"]
+fn hw_fixture_refusals() {
+    let src_path = gguf::v41::model();
+    let src = source();
+    let n_layer = u32::try_from(src.arch_get_u64("block_count").unwrap()).unwrap();
+    let guard = dir("refusals");
+    let d = &guard.0;
+    let mut bad: Vec<String> = Vec::new();
+
+    // A draft that reads the source's last ten layers: more than the fixture's nine.
+    let n = LAYER_MAP.len() as u32 + 1;
+    let wide = draft_header(&d.join("wide.gguf"), &draft_kvs(n_layer - n..n_layer, &[]));
+    match fixture::plan(&src, Some(&wide), &Options::default()) {
+        Err(e @ FixtureError::Metadata { .. })
+            if e.to_string()
+                .contains("more target layers than the fixture's 9") =>
+        {
+            println!("refusals: {n} target layers: {e}");
+        }
+        Err(e) => bad.push(format!("{n} target layers: refused as {e}")),
+        Ok(p) => bad.push(format!(
+            "{n} target layers: planned, draft kvs {:?}",
+            p.draft.map(|d| d.kvs)
+        )),
+    }
+
+    // A draft whose alignment is 48: the reader takes it, the writer takes only
+    // a power of two. Our writer refuses to write one, so its value is patched.
+    let align_path = d.join("align.gguf");
+    drop(draft_header(
+        &align_path,
+        &draft_kvs(
+            n_layer - 3..n_layer,
+            &[(gguf::GENERAL_ALIGNMENT, Value::U32(32))],
+        ),
+    ));
+    patch_alignment(&align_path, 48);
+    let align = Split::open(&align_path).unwrap();
+    match fixture::plan(&src, Some(&align), &Options::default()) {
+        Err(e @ FixtureError::Alignment { .. }) => println!("refusals: alignment 48: {e}"),
+        Err(e) => bad.push(format!("alignment 48: refused as {e}")),
+        Ok(_) => bad.push("alignment 48: planned".to_string()),
+    }
+
+    // Flags a verb does not take, a flag twice, and a draft subset with no draft.
+    let fx = d.join("none.gguf");
+    let fx_s = fx.to_str().unwrap();
+    for (args, want) in [
+        (
+            vec!["verify", fx_s, "--seed", "7"],
+            "verify does not take --seed",
+        ),
+        (
+            vec!["plan", &src_path, "--source", &src_path],
+            "plan does not take --source",
+        ),
+        (
+            vec!["plan", &src_path, "--seed", "1", "--seed", "2"],
+            "--seed is given twice",
+        ),
+        (
+            vec!["plan", &src_path, "--draft-tensors", "a"],
+            "--draft-tensors needs --draft",
+        ),
+    ] {
+        let (rc, _, stderr) = run(&args);
+        if rc != Some(1) || !stderr.contains(want) {
+            bad.push(format!("{args:?}: rc {rc:?}, not refused with {want:?}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "not refused by name:\n  {}",
+        bad.join("\n  ")
+    );
+    println!("refusals: all 6 refused by name");
 }

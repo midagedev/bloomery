@@ -15,6 +15,8 @@
 //! success. `verify` takes the source from `--source`, else the V4.1 path
 //! (`gguf::v41::model`), and checks `<fixture dir>/draft/v41-fixture-draft.gguf`
 //! when it exists, against `--draft-source`, else `$BLOOMERY_DSPARK_MODEL`.
+//! A flag its verb does not take, a flag given twice, `--draft-tensors`
+//! without `--draft` and `--draft-source` with no draft fixture are refused.
 //! One line per tensor, a summary line, and exit status 1 with the error on
 //! any failure.
 
@@ -31,7 +33,19 @@ use model::placement::card_budget;
 const USAGE: &str = "usage: v41fixture plan <real first shard> [--draft <real draft>] [flags]
        v41fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
        v41fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
-flags: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
+flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...";
+
+/// The flags `plan` and `generate` take.
+const PLAN_FLAGS: [&str; 6] = [
+    "--draft",
+    "--seed",
+    "--card-budget",
+    "--shard-bytes",
+    "--tensors",
+    "--draft-tensors",
+];
+/// The flags `verify` takes.
+const VERIFY_FLAGS: [&str; 2] = ["--source", "--draft-source"];
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -50,7 +64,12 @@ fn run(args: &[String]) -> Res<()> {
     let Some((cmd, rest)) = args.split_first() else {
         return Err(USAGE.into());
     };
-    let a = Args::parse(rest)?;
+    let takes: &[&str] = match cmd.as_str() {
+        "plan" | "generate" => &PLAN_FLAGS,
+        "verify" => &VERIFY_FLAGS,
+        _ => return Err(USAGE.into()),
+    };
+    let a = Args::parse(cmd, takes, rest)?;
     match (cmd.as_str(), a.paths.as_slice()) {
         ("plan", [source]) => plan(source, &a),
         ("generate", [source, out]) => generate(source, out, &a),
@@ -69,7 +88,8 @@ struct Args {
 }
 
 impl Args {
-    fn parse(args: &[String]) -> Res<Args> {
+    /// `args` after verb `cmd`, which takes the flags `takes`.
+    fn parse(cmd: &str, takes: &[&str], args: &[String]) -> Res<Args> {
         let mut a = Args {
             paths: Vec::new(),
             draft: None,
@@ -77,8 +97,15 @@ impl Args {
             draft_source: None,
             opts: Options::default(),
         };
+        let mut seen: Vec<&str> = Vec::new();
         let mut it = args.iter();
         while let Some(arg) = it.next() {
+            if arg.starts_with("--") {
+                if seen.contains(&arg.as_str()) {
+                    return Err(format!("{arg} is given twice\n{USAGE}").into());
+                }
+                seen.push(arg);
+            }
             let mut value = || {
                 it.next()
                     .cloned()
@@ -104,6 +131,12 @@ impl Args {
                 }
                 _ => a.paths.push(arg.clone()),
             }
+        }
+        if let Some(f) = seen.iter().find(|f| !takes.contains(*f)) {
+            return Err(format!("{cmd} does not take {f}\n{USAGE}").into());
+        }
+        if a.opts.draft_tensors.is_some() && a.draft.is_none() {
+            return Err(format!("--draft-tensors needs --draft\n{USAGE}").into());
         }
         Ok(a)
     }
@@ -266,7 +299,17 @@ fn verify(first: &str, a: &Args) -> Res<()> {
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let draft_path = dir.join(fixture::DRAFT_FILE);
-    let draft = if draft_path.exists() {
+    let has_draft = draft_path
+        .try_exists()
+        .map_err(|e| format!("stat {}: {e}", draft_path.display()))?;
+    if !has_draft && let Some(src) = &a.draft_source {
+        return Err(format!(
+            "--draft-source {src} names a draft source, but {} does not exist",
+            draft_path.display()
+        )
+        .into());
+    }
+    let draft = if has_draft {
         let src = a
             .draft_source
             .clone()

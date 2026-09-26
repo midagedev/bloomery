@@ -26,7 +26,26 @@ use std::ops::Range;
 use crate::{GENERAL_ALIGNMENT, Value, ggml_type_info};
 
 /// The alignment of a file whose metadata does not set one.
-const DEFAULT_ALIGNMENT: u64 = 32;
+pub const DEFAULT_ALIGNMENT: u64 = 32;
+
+/// The alignment a `general.alignment` value sets: a power-of-two u32, else
+/// [`WriteError::Alignment`].
+pub fn alignment_value(v: &Value) -> Result<u64, WriteError> {
+    match v {
+        Value::U32(a) if a.is_power_of_two() => Ok(u64::from(*a)),
+        other => Err(WriteError::Alignment {
+            value: format!("{other:?}"),
+        }),
+    }
+}
+
+/// The alignment a file of `kvs` is written at: the first
+/// `general.alignment` by [`alignment_value`], else [`DEFAULT_ALIGNMENT`].
+pub fn file_alignment(kvs: &[(String, Value)]) -> Result<u64, WriteError> {
+    kvs.iter()
+        .find(|(k, _)| k == GENERAL_ALIGNMENT)
+        .map_or(Ok(DEFAULT_ALIGNMENT), |(_, v)| alignment_value(v))
+}
 
 /// One tensor as the header declares it: `dims` in ggml's `ne[]` order
 /// (`dims[0]` the contiguous axis), its ggml type id, and the bytes its data
@@ -123,14 +142,7 @@ impl Layout {
             }
             check_value(key, v)?;
             if key == GENERAL_ALIGNMENT {
-                alignment = match v {
-                    Value::U32(a) if a.is_power_of_two() => u64::from(*a),
-                    other => {
-                        return Err(WriteError::Alignment {
-                            value: format!("{other:?}"),
-                        });
-                    }
-                };
+                alignment = alignment_value(v)?;
             }
         }
         let mut names = HashSet::with_capacity(tensors.len());

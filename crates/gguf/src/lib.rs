@@ -459,6 +459,14 @@ impl Gguf {
     pub fn mapping(&self) -> &[u8] {
         &self.map
     }
+
+    /// The file's bytes before its data base: the header and its padding. A
+    /// file that ends inside that padding (it holds no tensors) gives every
+    /// byte it has.
+    pub fn header_bytes(&self) -> &[u8] {
+        let end = usize::try_from(self.data_base).map_or(self.map.len(), |b| b.min(self.map.len()));
+        &self.map[..end]
+    }
 }
 
 /// The split keys llama.cpp's splitter writes into every shard

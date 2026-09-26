@@ -36,17 +36,17 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter};
 use std::ops::Range;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use gguf::quant::{KVALUES_MXFP4, f32_to_f16_bits, half_to_f32};
-use gguf::write::{Layout, TensorDecl, WriteError, Writer};
-use gguf::{GENERAL_ALIGNMENT, GgmlType, LoadError, Split, Value, dequant_row};
+use gguf::write::{Layout, TensorDecl, WriteError, Writer, file_alignment};
+use gguf::{GgmlType, LoadError, Split, Value, dequant_row};
 use sha2::{Digest, Sha256};
 
 use super::hparams::{DenseStream, Hparams, LayerKind, Stream};
 use crate::arch::dspark::{self, DraftHparams};
+use crate::fileio;
 use crate::placement::PlacementError;
 
 /// Fixture layer `f` holds source layer `LAYER_MAP[f]`: one layer per kind
@@ -99,6 +99,11 @@ pub const D_MIN: f32 = 1.0 / 8192.0;
 /// See [`D_MIN`].
 pub const D_MAX: f32 = 1.0 / 1024.0;
 
+/// [`D_MIN`, `D_MAX`] as powers of two, for an error line.
+fn d_window() -> String {
+    format!("[2^{}, 2^{}]", D_MIN.log2(), D_MAX.log2())
+}
+
 /// A chunk of a tensor's stream is about this many bytes: whole blocks.
 pub const CHUNK_TARGET: usize = 1 << 20;
 
@@ -125,6 +130,11 @@ pub enum FixtureError {
     },
     #[error("{path}: writing: {source}")]
     Write { path: PathBuf, source: WriteError },
+    #[error("the {set}'s metadata: {source}")]
+    Alignment {
+        set: &'static str,
+        source: WriteError,
+    },
     #[error("the source is {got:?}, not a {want} file")]
     Architecture {
         got: Option<String>,
@@ -140,7 +150,10 @@ pub enum FixtureError {
     Tensor { name: String, detail: String },
     #[error("tensor {name}: type {ty} has no fixture generator")]
     UnsupportedType { name: String, ty: GgmlType },
-    #[error("tensor {name}: no {what} of type {ty} at K = {k} puts d in [2^-13, 2^-10]")]
+    #[error(
+        "tensor {name}: no {what} of type {ty} at K = {k} puts d in {}",
+        d_window()
+    )]
     NoScale {
         name: String,
         ty: GgmlType,
@@ -249,9 +262,28 @@ pub enum Rule {
     /// else `e_lo + 1`; `c` uniform over the 16 codes.
     Mxfp4 { e_lo: u8, p_lo: u64 },
     /// Uniform in `[−half_width, half_width)`, rounded to the type.
-    Uniform { ty: GgmlType, half_width: f32 },
+    Uniform { ty: FloatTy, half_width: f32 },
     /// Every element `value` (F32).
     Const { value: f32 },
+}
+
+/// The float types a [`Rule::Uniform`] rounds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatTy {
+    F32,
+    F16,
+    BF16,
+}
+
+impl FloatTy {
+    /// The ggml type it is.
+    pub fn ggml(self) -> GgmlType {
+        match self {
+            FloatTy::F32 => GgmlType::F32,
+            FloatTy::F16 => GgmlType::F16,
+            FloatTy::BF16 => GgmlType::BF16,
+        }
+    }
 }
 
 impl Rule {
@@ -297,7 +329,9 @@ impl Rule {
                 e_lo + 1,
                 i32::from(*e_lo) - 127
             ),
-            Rule::Uniform { ty, half_width } => format!("{ty} uniform in ±{half_width:.4e}"),
+            Rule::Uniform { ty, half_width } => {
+                format!("{} uniform in ±{half_width:.4e}", ty.ggml())
+            }
             Rule::Const { value } => format!("constant {value}"),
         }
     }
@@ -368,6 +402,10 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64) -> Result<Rule, FixtureError> 
         move |d: u16| d_in_window(d) && d_in_window(f32_to_f16_bits(half_to_f32(d) * dmin_per_d))
     };
     let dmin_of = |d: u16, per: f32| f32_to_f16_bits(half_to_f32(d) * per);
+    let uniform = |ty| Rule::Uniform {
+        ty,
+        half_width: (3.0f64.sqrt() * sigma) as f32,
+    };
     match ty {
         GgmlType::Q3_K => widest_band(-32, 31, Q3K_CODE_SQ, sigma, d_in_window)
             .map(|(band, d)| Rule::Q3K { d, band })
@@ -393,10 +431,9 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64) -> Result<Rule, FixtureError> 
             .map(|(band, d)| Rule::Q8_0 { d, band })
             .ok_or_else(|| no_scale("band of i8 codes")),
         GgmlType::MXFP4 => mxfp4_rule(sigma).ok_or_else(|| no_scale("E8M0 exponent pair")),
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => Ok(Rule::Uniform {
-            ty,
-            half_width: (3.0f64.sqrt() * sigma) as f32,
-        }),
+        GgmlType::F32 => Ok(uniform(FloatTy::F32)),
+        GgmlType::F16 => Ok(uniform(FloatTy::F16)),
+        GgmlType::BF16 => Ok(uniform(FloatTy::BF16)),
         _ => Err(FixtureError::UnsupportedType {
             name: name.to_string(),
             ty,
@@ -518,7 +555,9 @@ fn chunk_rng(seed: u64, name: &str, chunk: usize) -> Rng {
 
 /// Bytes of one generated unit — a block, or an element of a float type.
 fn unit_bytes(ty: GgmlType) -> usize {
-    ty.type_size().unwrap_or(1) as usize
+    ty.type_size()
+        .expect("a planned tensor's type has a size: rule_for refuses every other type")
+        as usize
 }
 
 /// A tensor's generator unit and chunk size.
@@ -589,11 +628,23 @@ fn draws<const N: usize>(rng: &mut Rng, band: &Band) -> [i32; N] {
     out
 }
 
+/// `out` as whole `N`-byte units. A remainder would keep a reused buffer's
+/// earlier bytes, so it is a broken caller invariant, not a short fill.
+fn units<const N: usize>(out: &mut [u8]) -> &mut [[u8; N]] {
+    let len = out.len();
+    let (units, rest) = out.as_chunks_mut::<N>();
+    assert!(
+        rest.is_empty(),
+        "{len} bytes are not whole {N}-byte units: a chunk is whole units of its tensor's type"
+    );
+    units
+}
+
 /// Fill `out`, whole units of `rule`'s type, from `rng`.
 fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
     match rule {
         Rule::Q3K { d, band } => {
-            for blk in out.as_chunks_mut::<110>().0 {
+            for blk in units::<110>(out) {
                 rng.fill(&mut blk[..96]);
                 let s: [i32; 16] = draws(rng, band);
                 let l: [u8; 16] = std::array::from_fn(|j| (s[j] + 32) as u8);
@@ -602,7 +653,7 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
         Rule::Q4K { d, dmin, band } => {
-            for blk in out.as_chunks_mut::<144>().0 {
+            for blk in units::<144>(out) {
                 blk[0..2].copy_from_slice(&d.to_le_bytes());
                 blk[2..4].copy_from_slice(&dmin.to_le_bytes());
                 let sc: [i32; 8] = draws(rng, band);
@@ -612,7 +663,7 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
         Rule::Q5K { d, dmin, band } => {
-            for blk in out.as_chunks_mut::<176>().0 {
+            for blk in units::<176>(out) {
                 blk[0..2].copy_from_slice(&d.to_le_bytes());
                 blk[2..4].copy_from_slice(&dmin.to_le_bytes());
                 let sc: [i32; 8] = draws(rng, band);
@@ -622,7 +673,7 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
         Rule::Q6K { d, band } => {
-            for blk in out.as_chunks_mut::<210>().0 {
+            for blk in units::<210>(out) {
                 rng.fill(&mut blk[..192]);
                 let s: [i32; 16] = draws(rng, band);
                 for (b, v) in blk[192..208].iter_mut().zip(s) {
@@ -632,7 +683,7 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
         Rule::Q8_0 { d, band } => {
-            for blk in out.as_chunks_mut::<34>().0 {
+            for blk in units::<34>(out) {
                 blk[0..2].copy_from_slice(&d.to_le_bytes());
                 let q: [i32; 32] = draws(rng, band);
                 for (b, v) in blk[2..].iter_mut().zip(q) {
@@ -641,7 +692,7 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
         Rule::Mxfp4 { e_lo, p_lo } => {
-            for blk in out.as_chunks_mut::<17>().0 {
+            for blk in units::<17>(out) {
                 let r = rng.next() & 0xffff_ffff;
                 blk[0] = if r < *p_lo { *e_lo } else { e_lo + 1 };
                 rng.fill(&mut blk[1..17]);
@@ -650,25 +701,25 @@ fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
         Rule::Uniform { ty, half_width } => {
             let u = |r: u64| ((r >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * half_width;
             match ty {
-                GgmlType::F32 => {
-                    for e in out.as_chunks_mut::<4>().0 {
+                FloatTy::F32 => {
+                    for e in units::<4>(out) {
                         *e = u(rng.next()).to_le_bytes();
                     }
                 }
-                GgmlType::F16 => {
-                    for e in out.as_chunks_mut::<2>().0 {
+                FloatTy::F16 => {
+                    for e in units::<2>(out) {
                         *e = f32_to_f16_bits(u(rng.next())).to_le_bytes();
                     }
                 }
-                _ => {
-                    for e in out.as_chunks_mut::<2>().0 {
+                FloatTy::BF16 => {
+                    for e in units::<2>(out) {
                         *e = bf16_bits(u(rng.next())).to_le_bytes();
                     }
                 }
             }
         }
         Rule::Const { value } => {
-            for e in out.as_chunks_mut::<4>().0 {
+            for e in units::<4>(out) {
                 *e = value.to_le_bytes();
             }
         }
@@ -761,6 +812,8 @@ pub struct FilePlan {
     pub files: Vec<String>,
     /// The split keys every later shard carries, in the first shard's order.
     split_keys: Vec<(String, Value)>,
+    /// The alignment `kvs` sets, by the writer's rule.
+    align: u64,
 }
 
 impl FilePlan {
@@ -820,7 +873,7 @@ impl FilePlan {
 
     /// Bytes a tensor takes in its file, padding included.
     pub fn padded(&self, t: &PlannedTensor) -> u64 {
-        t.nbytes.next_multiple_of(alignment(&self.kvs))
+        t.nbytes.next_multiple_of(self.align)
     }
 }
 
@@ -855,13 +908,6 @@ impl Default for Options {
             draft_tensors: None,
         }
     }
-}
-
-fn alignment(kvs: &[(String, Value)]) -> u64 {
-    kvs.iter()
-        .find(|(k, _)| k == GENERAL_ALIGNMENT)
-        .and_then(|(_, v)| v.as_u64())
-        .unwrap_or(32)
 }
 
 /// `template`'s integer variant holding `v`.
@@ -993,6 +1039,9 @@ fn engram_source(source: &Split) -> Result<EngramSource, FixtureError> {
         .iter()
         .map(|v| unsigned(&key("layer_ids"), v).map(|l| l as usize))
         .collect::<Result<Vec<_>, _>>()?;
+    if layer_ids.is_empty() {
+        return Err(meta(&key("layer_ids"), "is empty"));
+    }
     let heads = unsigned(&key("head_count"), get("head_count")?)? as usize;
     let ngram = unsigned(&key("max_ngram_size"), get("max_ngram_size")?)? as usize;
     let cols = ngram
@@ -1046,11 +1095,9 @@ pub fn header_sha256(split: &Split) -> String {
         let g = split
             .shard(i)
             .expect("a split has a reader for every shard index");
-        let map = g.mapping();
-        let end = usize::try_from(g.data_base()).map_or(map.len(), |b| b.min(map.len()));
-        h.update(&map[..end]);
+        h.update(g.header_bytes());
     }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    fileio::hex(&h.finalize())
 }
 
 /// The fixture's own keys.
@@ -1125,6 +1172,12 @@ fn planned(
             name: name.clone(),
             ty,
         })?;
+    if !dims[0].is_multiple_of(blck) {
+        return Err(FixtureError::Tensor {
+            name,
+            detail: format!("ne[0] {} is not whole blocks of {blck}", dims[0]),
+        });
+    }
     let nbytes = tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>();
     Ok(PlannedTensor {
         name,
@@ -1358,7 +1411,10 @@ fn shard(
     tensors: Vec<PlannedTensor>,
     cap: u64,
 ) -> Result<FilePlan, FixtureError> {
-    let align = alignment(&kvs);
+    let align = file_alignment(&kvs).map_err(|source| FixtureError::Alignment {
+        set: "target",
+        source,
+    })?;
     let mut shards: Vec<Range<usize>> = Vec::new();
     let (mut start, mut bytes) = (0usize, 0u64);
     for (i, t) in tensors.iter().enumerate() {
@@ -1404,11 +1460,17 @@ fn shard(
         shards,
         files,
         split_keys,
+        align,
     };
     if n > 1 && plan.spanning_layers().is_empty() {
         return Err(FixtureError::NoSpanningLayer { shards: n });
     }
     Ok(plan)
+}
+
+/// The last `k` of `n` layers; `None` when `k > n`.
+fn last_layers(n: usize, k: usize) -> Option<Range<usize>> {
+    n.checked_sub(k).map(|first| first..n)
 }
 
 /// The draft fixture: the real draft's metadata with `target_layers` moved
@@ -1440,7 +1502,14 @@ fn plan_draft(
             .iter()
             .map(|x| unsigned(k, x).map(|l| l as usize))
             .collect::<Result<Vec<_>, _>>()?;
-        let last: Vec<usize> = (n_layer - got.len().min(n_layer)..n_layer).collect();
+        let last: Vec<usize> = last_layers(n_layer, got.len())
+            .ok_or_else(|| {
+                meta(
+                    k,
+                    format!("names {} layers of a {n_layer}-layer source", got.len()),
+                )
+            })?
+            .collect();
         if got.is_empty() || got != last {
             return Err(meta(
                 k,
@@ -1449,7 +1518,16 @@ fn plan_draft(
         }
         let n = LAYER_MAP.len();
         let tag = &a[0];
-        let moved = (n - got.len()..n)
+        let moved = last_layers(n, got.len())
+            .ok_or_else(|| {
+                meta(
+                    k,
+                    format!(
+                        "names {} layers, more target layers than the fixture's {n}",
+                        got.len()
+                    ),
+                )
+            })?
             .map(|f| int_like(k, tag, f as u64))
             .collect::<Result<_, _>>()?;
         kvs.push((k.to_string(), Value::Array(moved)));
@@ -1457,6 +1535,10 @@ fn plan_draft(
     if !kvs.iter().any(|(k, _)| *k == tl_key) {
         return Err(meta(&tl_key, "is absent"));
     }
+    let align = file_alignment(&kvs).map_err(|source| FixtureError::Alignment {
+        set: "draft",
+        source,
+    })?;
     kvs.extend(fixture_keys(opts, header_sha256(draft)));
     let tensors = draft
         .iter_tensors()
@@ -1470,6 +1552,7 @@ fn plan_draft(
         shards: vec![Range { start: 0, end: n }],
         files: vec![DRAFT_FILE.to_string()],
         split_keys: Vec::new(),
+        align,
     })
 }
 
@@ -1500,53 +1583,14 @@ pub struct GenerateStats {
     pub secs: f64,
 }
 
-/// Bytes free to this process on the filesystem that holds `dir`.
-fn free_bytes(dir: &Path) -> Result<u64, FixtureError> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
-        io_err(
-            dir,
-            "statvfs",
-            io::Error::new(io::ErrorKind::InvalidInput, e),
-        )
-    })?;
-    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `c` is a NUL-terminated path that lives across the call, and
-    // `st` is storage for one `statvfs`, which the call fills on success.
-    if unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
-        return Err(io_err(dir, "statvfs", io::Error::last_os_error()));
-    }
-    // SAFETY: the call returned 0, so it wrote every field of `st`.
-    let st = unsafe { st.assume_init() };
-    Ok(st.f_bavail.saturating_mul(st.f_frsize))
-}
-
 /// Rename directory `from` to `to`, refused when `to` exists.
 fn rename_new(from: &Path, to: &Path) -> Result<(), FixtureError> {
-    let cstr = |p: &Path| {
-        std::ffi::CString::new(p.as_os_str().as_bytes())
-            .map_err(|e| io_err(p, "rename", io::Error::new(io::ErrorKind::InvalidInput, e)))
-    };
-    let (a, b) = (cstr(from)?, cstr(to)?);
-    // SAFETY: both are NUL-terminated paths that live across the call.
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            a.as_ptr(),
-            libc::AT_FDCWD,
-            b.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let e = io::Error::last_os_error();
-    if e.kind() == io::ErrorKind::AlreadyExists {
-        return Err(FixtureError::Exists {
+    fileio::rename_noreplace(from, to).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => FixtureError::Exists {
             path: to.to_path_buf(),
-        });
-    }
-    Err(io_err(to, "rename", e))
+        },
+        _ => io_err(to, "rename", e),
+    })
 }
 
 /// Write the fixture of `source` (and of `draft`) into directory `out`,
@@ -1579,7 +1623,7 @@ pub fn generate(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let free = free_bytes(parent)?;
+    let free = fileio::free_bytes(parent).map_err(|e| io_err(parent, "statvfs", e))?;
     if free < need {
         return Err(FixtureError::Space {
             path: parent.to_path_buf(),
@@ -1602,7 +1646,7 @@ pub fn generate(
                 .map_err(|e| io_err(parent, "fsync", e))?;
             Ok(stats)
         });
-    let (tensors, bytes, gen_secs, write_secs, sync_secs) = match written {
+    let w = match written {
         Ok(s) => s,
         Err(error) => {
             if let Err(cleanup) = std::fs::remove_dir_all(&tmp)
@@ -1619,17 +1663,26 @@ pub fn generate(
     };
     Ok(GenerateStats {
         out: out.to_path_buf(),
-        tensors,
-        bytes,
+        tensors: w.tensors,
+        bytes: w.bytes,
         file_bytes: need,
-        gen_secs,
-        write_secs,
-        sync_secs,
+        gen_secs: w.gen_secs,
+        write_secs: w.write_secs,
+        sync_secs: w.sync_secs,
         secs: t0.elapsed().as_secs_f64(),
     })
 }
 
-type Written = (usize, u64, f64, f64, f64);
+/// What [`write_files`] wrote: tensors, their bytes, and the seconds spent
+/// generating, writing and syncing them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Written {
+    tensors: usize,
+    bytes: u64,
+    gen_secs: f64,
+    write_secs: f64,
+    sync_secs: f64,
+}
 
 /// Every file of `sets` (each with its count of `files`) into `dir`, one
 /// buffer of the largest tensor's size reused for every tensor.
@@ -1648,8 +1701,7 @@ fn write_files(
         .max()
         .unwrap_or(0);
     let mut buf = vec![0u8; largest];
-    let (mut count, mut bytes, mut gen_all, mut write_all, mut sync_all) =
-        (0usize, 0u64, 0.0, 0.0, 0.0);
+    let mut done = Written::default();
     let mut files = files.into_iter();
     for (plan, n) in sets {
         for range in plan.shards.iter().take(*n) {
@@ -1673,12 +1725,10 @@ fn write_files(
                 let wt = Instant::now();
                 w.tensor(&t.name, out).map_err(werr)?;
                 let write_secs = wt.elapsed().as_secs_f64();
-                (count, bytes, gen_all, write_all) = (
-                    count + 1,
-                    bytes + t.nbytes,
-                    gen_all + gen_secs,
-                    write_all + write_secs,
-                );
+                done.tensors += 1;
+                done.bytes += t.nbytes;
+                done.gen_secs += gen_secs;
+                done.write_secs += write_secs;
                 progress(&TensorStat {
                     name: t.name.clone(),
                     ty: t.ty,
@@ -1695,10 +1745,10 @@ fn write_files(
                 .map_err(|e| io_err(&path, "flush", e.into_error()))?;
             let s = Instant::now();
             file.sync_all().map_err(|e| io_err(&path, "fsync", e))?;
-            sync_all += s.elapsed().as_secs_f64();
+            done.sync_secs += s.elapsed().as_secs_f64();
         }
     }
-    Ok((count, bytes, gen_all, write_all, sync_all))
+    Ok(done)
 }
 
 // --------------------------------------------------------------------- checks
@@ -1740,10 +1790,21 @@ pub fn check_units(
     first_unit: usize,
 ) -> Result<Sample, FixtureError> {
     let unit = unit_bytes(t.ty);
+    if !bytes.len().is_multiple_of(unit) {
+        return Err(FixtureError::Tensor {
+            name: t.name.clone(),
+            detail: format!(
+                "a sample of {} bytes from unit {first_unit} is not whole {unit}-byte units",
+                bytes.len()
+            ),
+        });
+    }
     let per = if matches!(t.rule, Rule::Uniform { .. } | Rule::Const { .. }) {
         1
     } else {
-        t.ty.blck_size().unwrap_or(1) as usize
+        t.ty.blck_size()
+            .expect("a planned tensor's type has a block: rule_for refuses every other type")
+            as usize
     };
     let mut y = vec![0f32; per];
     let mut s = Sample::default();
@@ -1771,9 +1832,10 @@ fn scale_at(blk: &[u8], o: usize, what: &str, want: u16) -> Result<f32, String> 
     let got = u16::from_le_bytes([blk[o], blk[o + 1]]);
     if got != want || !d_in_window(got) {
         return Err(format!(
-            "{what} {} (bits {got:#06x}), the rule's {} in [2^-13, 2^-10]",
+            "{what} {} (bits {got:#06x}), the rule's {} in {}",
             half_to_f32(got),
-            half_to_f32(want)
+            half_to_f32(want),
+            d_window()
         ));
     }
     Ok(half_to_f32(got))
@@ -2024,7 +2086,15 @@ pub fn check_draft(
 ) -> Result<DraftHparams, FixtureError> {
     let hp = DraftHparams::read(draft)?;
     let n = LAYER_MAP.len();
-    let want: Vec<usize> = (n - hp.target_layers.len().min(n)..n).collect();
+    let want: Vec<usize> = last_layers(n, hp.target_layers.len())
+        .ok_or_else(|| FixtureError::Mismatch {
+            what: "draft target_layers".into(),
+            detail: format!(
+                "{:?} is more target layers than the fixture's {n}",
+                hp.target_layers
+            ),
+        })?
+        .collect();
     if hp.target_layers != want {
         return Err(FixtureError::Mismatch {
             what: "draft target_layers".into(),
