@@ -71,14 +71,24 @@
 //!   id more at 512 and at 4,096 (each ending in a one-id pass), and the
 //!   4,096 ids at 4,096 prefilled in two calls cut at [`W_SPLIT`]. Sizes
 //!   outside `1..=UBATCH` are refused with the size kept.
+//! - (t) the rope table: every row of the table the GEMM ubatches read — the
+//!   cache's [`CTX`] positions, 0 and the last among them — holds
+//!   `RopeTable::push`'s bits for its position; and the first [`T_FIRST`]
+//!   prose ids from a reset, then the next [`T_NEXT`] as a continuation (its
+//!   first position [`T_FIRST`]), each prefilled on the GEMM path in
+//!   ubatches of [`T_UB`], leave every ubatch's rope window holding the rows
+//!   of its own positions, the first position past each ubatch boundary
+//!   among them. A window is read through the call the ubatch's rope launch
+//!   takes it from. The ubatch size is put back and the model reset after,
+//!   so the clauses after (t) run as they would without it.
 //! - (x) a fault names its layer: layer [`FAULT_LAYER`]'s FFN half run alone
 //!   on a finite row with one NaN raises inside that layer's launches, and
 //!   the next step returns `GpuError::Fault` with that layer (the site is the
 //!   smallest code among the layer's raises, printed), the model poisoned;
 //!   `reset` leaves the word clean and the next step a token.
 //!
-//! `--gemm-only` runs the load, (u) and (w), `--ubatch-only` (w) alone,
-//! `--fault-only` the load and (x).
+//! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
+//! `--rope-only` the load and (t), `--fault-only` the load and (x).
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
@@ -112,11 +122,12 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
+    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillStep};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{GpuError, Qwen3moeModel};
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -339,8 +350,17 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--rope-only") {
+            let ok = rope_table(&mut m, CTX)?;
+            println!("gate_qwen3moe_e2e --rope-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--gemm-only") {
             let mut ok = gemm_prefill(&mut m, dump.as_deref())?;
+            ok &= rope_table(&mut m, CTX)?;
             drop(m);
             ok &= ubatch_sizes()?;
             println!("gate_qwen3moe_e2e --gemm-only: {}", verdict(ok));
@@ -356,6 +376,7 @@ mod gate {
         ok &= forced(&mut m, &man)?;
         ok &= free(&mut m, &man)?;
         ok &= greedy(&mut m, dump.as_deref())?;
+        ok &= rope_table(&mut m, CTX)?;
         ok &= fault_layer(&mut m)?;
         drop(m);
         ok &= ubatch_sizes()?;
@@ -1280,6 +1301,96 @@ mod gate {
             "gemm prefill: {LONG:?} prose ids against the one-token path, K/V in band (layer 0 \
              {GEMM_L0_REL:e}, later layers and the logits {GEMM_SPREAD_RATIO} x the flash \
              arithmetics' spread), greedy not diverged, split = whole {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // ---------------------------------------------------- (t) the rope table
+
+    /// The ubatch size (t) prefills at: small, so that its prompts cross
+    /// ubatch boundaries far below the cache's height.
+    const T_UB: usize = 64;
+
+    /// (t)'s prompts: the first `T_FIRST` prose ids from a reset, then the
+    /// next `T_NEXT` as a continuation; at [`T_UB`] two and three ubatches,
+    /// the last of each short.
+    const T_FIRST: usize = 100;
+    const T_NEXT: usize = 150;
+
+    /// The positions of `got`'s [`HEAD`]-value rows, the first at position
+    /// `first`, whose bits are not `RopeTable::push`'s at that position.
+    fn rope_rows_differing(
+        rope: &RopeTable,
+        got: &[f32],
+        first: usize,
+    ) -> Result<Vec<usize>, GateError> {
+        let mut want = Vec::with_capacity(HEAD);
+        let mut bad = Vec::new();
+        for (i, row) in got.chunks(HEAD).enumerate() {
+            want.clear();
+            rope.push(u32::try_from(first + i)?, Direction::Forward, &mut want);
+            if !bits_equal(row, &want) {
+                bad.push(first + i);
+            }
+        }
+        Ok(bad)
+    }
+
+    /// (t) (module doc), on a model of `ctx` cache rows.
+    fn rope_table(m: &mut Qwen3moeModel, ctx: usize) -> Result<bool, GateError> {
+        let hp = m.body("rope_table")?.hparams().clone();
+        let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
+        let table = m.rope_rows(0..ctx)?;
+        let bad = rope_rows_differing(&rope, &table, 0)?;
+        let table_ok = table.len() == ctx * HEAD && bad.is_empty();
+        println!(
+            "rope table rows 0..{ctx} (among them position 0, {T_UB} and {} one past a ubatch \
+             boundary, the last {}): {} not RopeTable::push's bits (want 0){} {}",
+            T_FIRST + T_UB,
+            ctx - 1,
+            bad.len(),
+            bad.first()
+                .map_or(String::new(), |p| format!(", the first at position {p}")),
+            verdict(table_ok)
+        );
+        let prose = prose(T_FIRST + T_NEXT)?;
+        let kept = m.ubatch()?;
+        m.set_ubatch(T_UB)?;
+        m.reset()?;
+        let mut windows_ok = true;
+        for ids in [&prose[..T_FIRST], &prose[T_FIRST..]] {
+            let pos0 = m.pos() as usize;
+            let plan = m.prefill_plan(ids.len(), PrefillPath::Gemm)?;
+            m.prefill_with(ids, PrefillPath::Gemm)?;
+            let mut s = 0;
+            for step in &plan.steps {
+                let PrefillStep::Ubatch(t) = *step else {
+                    return Err(format!("the GEMM path's plan {plan} holds a pass").into());
+                };
+                let got = m.ubatch_rope_window(s, t)?;
+                let bad = rope_rows_differing(&rope, &got, pos0 + s)?;
+                let ok = got.len() == t * HEAD && bad.is_empty();
+                println!(
+                    "rope window: prompt from position {pos0}, ubatch of its tokens {s}..{} \
+                     (positions {}..{}): {} rows not RopeTable::push's bits for their position \
+                     (want 0) {}",
+                    s + t,
+                    pos0 + s,
+                    pos0 + s + t,
+                    bad.len(),
+                    verdict(ok)
+                );
+                windows_ok &= ok;
+                s += t;
+            }
+        }
+        m.set_ubatch(kept)?;
+        m.reset()?;
+        let ok = table_ok && windows_ok;
+        println!(
+            "rope: the table holds RopeTable::push's rows, and every ubatch window of a prompt \
+             and of its continuation the rows of its own positions {}",
             verdict(ok)
         );
         Ok(ok)

@@ -588,7 +588,7 @@ impl GpuModel<Body> {
                 prefill, ub, rope, ..
             } = body;
             if n_ub > 0 {
-                ub.write(gpu.stream(), rope, &tokens[..n_ub], pos0)?;
+                ub.write(gpu.stream(), &tokens[..n_ub], pos0)?;
             }
             if !passes.is_empty() {
                 let pos_p = pos0 + launch_u32(WHAT, "ubatch tokens", n_ub)?;

@@ -23,7 +23,9 @@
 //! Lines: `prompt_ids`, `load` (with the decode flash pass: `flash_mma=`; the
 //! ubatches' attention, `ubatch_attn=gqa_prefill_flash`; and their size,
 //! `ubatch=`, on the `load` line because the `time prompt` row's shape is
-//! parsed to its end), in graph
+//! parsed to its end; and `rope_table_us=`, the host time that computed the
+//! ubatches' rope table at load, one `RopeTable::push` for each of the `ctx`
+//! positions — a runtime value), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
 //! and the card's free bytes it took, runtime values), `step 0 pos tok`
@@ -36,6 +38,11 @@
 //! runtime value like the `load` line, a measurement only under the lease;
 //! the prefill arena is allocated at load and the passes captured before
 //! it, so that wall carries neither),
+//! `stat prompt ubatch_tokens=<n> image_bytes= fill_us= copy_us=` (the host
+//! prologue inside that wall before the first ubatch launch: the prompt
+//! image's fill and its copy to the card, which synchronizes; runtime values
+//! read from three clock reads the engine takes on every prompt;
+//! `ubatch_tokens=0` when no ubatch ran),
 //! per feedback step `step i pos tok` (and `time step i ms=` under
 //! `--time`); then
 //! `tokens [..]`, `text` for a `--prompt` run, and under `--time` the
@@ -145,7 +152,7 @@ mod cli {
         m.set_mode(mode);
         println!(
             "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             ubatch_attn=gqa_prefill_flash ubatch={} in {:.1} s (runtime value)",
+             ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.stages()[0].layers().len(),
             if mode == StepMode::Graph {
@@ -155,6 +162,7 @@ mod cli {
             },
             m.body("generate_qwen3moe")?.flash_mma(),
             m.ubatch()?,
+            m.ubatch_prologue()?.table_build.as_secs_f64() * 1e6,
             t.elapsed().as_secs_f64()
         );
         if mode == StepMode::Graph {
@@ -181,6 +189,7 @@ mod cli {
         let t = Instant::now();
         let mut next = m.prefill_with(&ids, path)?;
         let prefill_wall = t.elapsed();
+        let image = m.ubatch_prologue()?.last;
         println!(
             "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={plan}, {:.2} s, \
              runtime value)",
@@ -207,6 +216,17 @@ mod cli {
             plan.steps.len(),
             plan.kind()
         );
+        match image {
+            Some(w) => println!(
+                "stat prompt ubatch_tokens={} image_bytes={} fill_us={:.1} copy_us={:.1} \
+                 (runtime values)",
+                w.tokens,
+                w.bytes,
+                w.fill.as_secs_f64() * 1e6,
+                w.copy.as_secs_f64() * 1e6
+            ),
+            None => println!("stat prompt ubatch_tokens=0 (no ubatch ran)"),
+        }
         for (k, &(pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;
             tokens_out.push(tok);

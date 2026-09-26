@@ -85,7 +85,7 @@ pub struct Body {
     /// first: fields drop in declaration order, and its graphs address the
     /// cache planes below.
     pub(super) prefill: Prefill,
-    /// The GEMM prefill's arena and prompt image.
+    /// The GEMM prefill's arena, prompt image and rope table.
     pub(super) ub: Ubatch,
     pub(super) hp: Hparams,
     pub(super) names: Vec<LayerNames>,
@@ -356,7 +356,7 @@ impl ChainBody for Body {
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
             prefill: Prefill::new(stream, dims, ctx_max)?,
-            ub: Ubatch::new(stream, dims, ctx_max, ubatch_size()?)?,
+            ub: Ubatch::new(stream, dims, ctx_max, ubatch_size()?, &rope)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
             hp,
