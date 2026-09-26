@@ -114,9 +114,6 @@ generate_ds41   head_norm_neox_append                   0          0
 generate_ds41   iq2_xs_rows                             0          0
 generate_ds41   iq3_xxs_rows                            0          0
 generate_ds41   iq4_xs_rows                             0          0
-generate_ds41   join_consume                            0          0
-generate_ds41   join_produce                            0          0
-generate_ds41   join_spin                               0          0
 generate_ds41   kv_append                               0          0
 generate_ds41   kv_append_pos_buf                       0          0
 generate_ds41   kv_norm_rope_append                     0          0
@@ -219,9 +216,6 @@ gate_e2e        head_norm_neox_append                   0          0
 gate_e2e        iq2_xs_rows                             0          0
 gate_e2e        iq3_xxs_rows                            0          0
 gate_e2e        iq4_xs_rows                             0          0
-gate_e2e        join_consume                            0          0
-gate_e2e        join_produce                            0          0
-gate_e2e        join_spin                               0          0
 gate_e2e        kv_append                               0          0
 gate_e2e        kv_append_pos_buf                       0          0
 gate_e2e        kv_norm_rope_append                     0          0
