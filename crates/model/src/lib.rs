@@ -73,6 +73,15 @@ pub enum ModelError {
         k: usize,
         why: qdot::QdotError,
     },
+    /// A routed expert stack whose row layout (`ops::RowLayout`) the host
+    /// union does not take where it stands: which rule (`what`), the stack's
+    /// tensor and its layout.
+    #[error("{what}: {tensor} is in the {layout} row layout")]
+    HostLayout {
+        what: &'static str,
+        tensor: String,
+        layout: &'static str,
+    },
     /// A metadata key the file lacks, holds in the wrong type, or sets to a
     /// value this engine does not run: the full key and why.
     #[error("metadata {key}: {detail}")]

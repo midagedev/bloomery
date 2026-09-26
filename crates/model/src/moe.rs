@@ -23,18 +23,19 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupInput, ShardTensor, Tensor2, Tensor2View, UnionCall,
-    UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q, matmul_q_group, matmul_q_group_into,
-    matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+    self, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor, Tensor2,
+    Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
+    matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
 };
 use crate::profile;
+use crate::r8file::{R8Error, Sidecar};
 
 /// Tokens grouped by the expert they were routed to.
 ///
@@ -1439,30 +1440,78 @@ pub struct HostLayerSpec<'a> {
     pub swiglu_limit: f32,
 }
 
-/// The host tier's matmul path for each (weight type, row width) it serves,
-/// printed once per process when a layer first brings it in:
-/// `load host_tier type=iq3_xxs k=4096 path=fused` — qdot's fused kernel, the
-/// only path a host tier runs: [`HostLayer::build`] refuses a stack without
-/// one before it prints.
-fn announce_paths(stacks: &[(GgmlType, usize)]) {
-    static SEEN: Mutex<Vec<(GgmlType, usize)>> = Mutex::new(Vec::new());
+/// The host tier's matmul path for each (weight type, row width, row
+/// layout) it serves, printed once per process when a layer first brings it
+/// in: `load host_tier type=iq3_xxs k=4096 path=fused` — qdot's fused
+/// kernel, the only path a host tier runs: [`HostLayer::build`] refuses a
+/// stack without one before it prints — or `path=r8`, the row-lane tile over
+/// the r8 sidecar's copy.
+fn announce_paths(stacks: &[(GgmlType, usize, RowLayout)]) {
+    static SEEN: Mutex<Vec<(GgmlType, usize, RowLayout)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
-    for &(ty, k) in stacks {
-        if seen.contains(&(ty, k)) {
+    for &(ty, k, layout) in stacks {
+        if seen.contains(&(ty, k, layout)) {
             continue;
         }
-        seen.push((ty, k));
-        eprintln!("load host_tier type={ty} k={k} path=fused");
+        seen.push((ty, k, layout));
+        let path = match layout {
+            RowLayout::Rows => "fused",
+            RowLayout::R8 => "r8",
+        };
+        eprintln!("load host_tier type={ty} k={k} path={path}");
     }
 }
 
-/// One layer's routed experts as a host tier serves them: the three stacks,
-/// each with the shard that holds it, and the SwiGLU limit. Built once at
-/// load ([`HostLayer::build`]); a call cuts its experts' matrices from the
-/// stacks, so a layer holds three headers, not one view per expert.
+/// A routed gate or up stack as a host tier reads it: the file's own rows,
+/// or the r8 sidecar's row-lane copy of a Q3_K stack — the bytes pick the
+/// kernel.
+enum GateUp {
+    File(ShardTensor),
+    R8(R8Stack),
+}
+
+impl GateUp {
+    /// The source's stack: the file's, or the one the sidecar's copy was
+    /// checked against.
+    fn source(&self) -> &ShardTensor {
+        match self {
+            GateUp::File(t) => t,
+            GateUp::R8(s) => s.source(),
+        }
+    }
+
+    fn layout(&self) -> RowLayout {
+        match self {
+            GateUp::File(_) => RowLayout::Rows,
+            GateUp::R8(_) => RowLayout::R8,
+        }
+    }
+
+    /// Matrix `e` as a dispatch weight.
+    fn expert<'a>(&'a self, split: &'a Split, e: usize) -> Result<Weight<'a>, ModelError> {
+        match self {
+            GateUp::File(t) => t.expert(split, e),
+            GateUp::R8(s) => s.expert(e),
+        }
+    }
+
+    /// The stack as a union call reads it.
+    fn stack<'a>(&'a self, split: &'a Split) -> Result<ExpertStack<'a>, ModelError> {
+        match self {
+            GateUp::File(t) => t.stack(split),
+            GateUp::R8(s) => s.stack(),
+        }
+    }
+}
+
+/// One layer's routed experts as a host tier serves them: the three stacks —
+/// the gate and the up from the file or from its r8 sidecar, the down from
+/// the file — and the SwiGLU limit. Built once at load
+/// ([`HostLayer::build`]); a call cuts its experts' matrices from the stacks,
+/// so a layer holds three headers, not one view per expert.
 pub struct HostLayer {
-    gate: ShardTensor,
-    up: ShardTensor,
+    gate: GateUp,
+    up: GateUp,
     down: ShardTensor,
     n_expert: usize,
     limit: f32,
@@ -1475,6 +1524,22 @@ impl HostLayer {
     /// own check ([`UnionStack::of_call`]), whose error names the stack. Every
     /// stack error a call could meet is raised here, at load.
     pub fn build(split: &Split, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
+        HostLayer::build_r8(split, spec, None)
+    }
+
+    /// [`HostLayer::build`] with the gate and the up read from `r8`, the
+    /// source's r8 sidecar, when given ([`crate::r8file::HostR8`]): each is
+    /// the sidecar's copy of its source stack (`R8Stack::of` — the same
+    /// name, dims and bytes, so every expert keeps its byte range), and the
+    /// down, which a sidecar never holds, is the source's; a sidecar that
+    /// lacks the gate or the up, or holds the down, is refused by name. The
+    /// sidecar is a second byte source the load resolves, not a property of
+    /// the layer's tensors, so it rides beside the spec.
+    pub fn build_r8(
+        split: &Split,
+        spec: &HostLayerSpec<'_>,
+        r8: Option<&Arc<Sidecar>>,
+    ) -> Result<HostLayer, ModelError> {
         let gate = ShardTensor::find(split, spec.gate)?;
         let up = ShardTensor::find(split, spec.up)?;
         let down = ShardTensor::find(split, spec.down)?;
@@ -1487,15 +1552,31 @@ impl HostLayer {
             // The per-expert cut: `expert_view`'s check, once, here.
             expert_view(t.info(), 0, spec.n_expert)?;
         }
+        let (gate, up) = match r8 {
+            None => (GateUp::File(gate), GateUp::File(up)),
+            Some(side) => {
+                if side.find(spec.down).is_some() {
+                    return Err(R8Error::HoldsDown {
+                        path: side.path().to_path_buf(),
+                        tensor: spec.down.to_string(),
+                    }
+                    .into());
+                }
+                (
+                    GateUp::R8(R8Stack::of(split, side, spec.gate)?),
+                    GateUp::R8(R8Stack::of(split, side, spec.up)?),
+                )
+            }
+        };
         UnionStack::of_call(
             &[gate.stack(split)?, up.stack(split)?, down.stack(split)?],
             spec.embd,
             spec.ff,
         )?;
         announce_paths(&[
-            (gate.info().ty, spec.embd),
-            (up.info().ty, spec.embd),
-            (down.info().ty, spec.ff),
+            (gate.source().info().ty, spec.embd, gate.layout()),
+            (up.source().info().ty, spec.embd, up.layout()),
+            (down.info().ty, spec.ff, RowLayout::Rows),
         ]);
         Ok(HostLayer {
             gate,
@@ -1506,9 +1587,26 @@ impl HostLayer {
         })
     }
 
-    /// The three stacks, `[gate, up, down]`.
+    /// The three stacks, `[gate, up, down]`, as the source file holds them:
+    /// for a gate or an up read from the r8 sidecar, the source stack its copy
+    /// was checked against ([`HostLayer::layouts`] tells which).
     pub fn stacks(&self) -> [&ShardTensor; 3] {
-        [&self.gate, &self.up, &self.down]
+        [self.gate.source(), self.up.source(), &self.down]
+    }
+
+    /// Where each stack's rows lie, `[gate, up, down]`, for expert `e` of
+    /// the layer — every expert of a stack shares its layout. A reader of an
+    /// expert's bytes other than this layer's calls (the host stream's fill)
+    /// asks here: a [`RowLayout::R8`] matrix is the sidecar's bytes, which no
+    /// path reads as Q3_K rows. An expert past the layer is refused by name.
+    pub fn layouts(&self, e: usize) -> Result<[RowLayout; 3], ModelError> {
+        if e >= self.n_expert {
+            return Err(ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                self.down.info().name
+            )));
+        }
+        Ok([self.gate.layout(), self.up.layout(), RowLayout::Rows])
     }
 
     /// The three stacks as a union call reads them, resolved once.
@@ -1583,7 +1681,13 @@ impl HostLayer {
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
         let x = x.into();
-        check_union_call(x, lists, out, self.gate.info().dims[1] as usize, scratch)?;
+        check_union_call(
+            x,
+            lists,
+            out,
+            self.gate.source().info().dims[1] as usize,
+            scratch,
+        )?;
         serve_union(
             self.stacks_of(split)?,
             Some(self.limit),

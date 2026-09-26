@@ -3,7 +3,8 @@
 //! reads ([`qdot::repack_q3k_r8`]), under a private type id no other reader
 //! sizes. This module is the one owner of the format: where the file lives
 //! ([`sidecar_path`]), how it is written ([`convert`]), the identity check a
-//! load runs ([`Sidecar::open`]) and the full comparison with its source
+//! load runs ([`Sidecar::open`]), whether a load's host tier reads it
+//! ([`HostR8::at_load`]) and the full comparison with its source
 //! ([`verify`]).
 //!
 //! The file is GGUF v3 with architecture [`R8_ARCH`], `bloomery.r8.layout`
@@ -21,13 +22,14 @@
 //! the card upload reads anyway.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Instant;
 
 use gguf::write::{Layout, TensorDecl, WriteError, Writer};
@@ -35,9 +37,9 @@ use gguf::{
     GENERAL_ARCHITECTURE, GgmlType, Gguf, LoadError, PrivateType, Split, TensorInfo, Value, Weights,
 };
 use qdot::{Q3K_R8_LAYOUT, Q3K_R8_ROWS};
-use sha2::{Digest, Sha256};
 
 use crate::ModelError;
+use crate::fileio::{self, sha256_hex};
 use crate::placement::host_lock::page_bytes;
 
 /// The sidecar's architecture string: a file with any other is not a sidecar.
@@ -181,6 +183,13 @@ pub enum R8Error {
     },
     #[error("{}: no tensor {tensor} in the sidecar", .path.display())]
     NotInSidecar { path: PathBuf, tensor: String },
+    #[error("BLOOMERY_R8={got}: want on or off")]
+    Lever { got: String },
+    #[error(
+        "{}: the sidecar holds {tensor}, a layer's down stack; a host tier reads only a gate and an up from it",
+        .path.display()
+    )]
+    HoldsDown { path: PathBuf, tensor: String },
     #[error(
         "{}: tensor {tensor} unpacks to other bytes than the source's, first at expert {expert} byte {byte}",
         .path.display()
@@ -291,14 +300,6 @@ fn stack<'s>(source: &'s Split, name: &str, path: &Path) -> Result<Stack<'s>, R8
     }
 }
 
-/// Lowercase hex sha256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// The source's shard identity, in split order: file names, lengths, and the
 /// sha256 of each shard's bytes before its data base.
 struct Shards {
@@ -320,17 +321,13 @@ fn shards_of(source: &Split) -> Shards {
         let path = source
             .shard_path(i)
             .expect("a split has a path for every shard index");
-        let map = g.mapping();
-        // A shard that ends inside its data-base padding (it holds no tensors)
-        // hashes to its end.
-        let end = usize::try_from(g.data_base()).map_or(map.len(), |b| b.min(map.len()));
         s.names.push(
             path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
-        s.bytes.push(map.len() as u64);
-        s.headers.push(sha256_hex(&map[..end]));
+        s.bytes.push(g.mapping().len() as u64);
+        s.headers.push(sha256_hex(g.header_bytes()));
     }
     s
 }
@@ -429,7 +426,7 @@ pub fn convert(
     part.push(".part");
     let part = PathBuf::from(part);
     remove_leftover(&part, progress)?;
-    let free = free_bytes(dir)?;
+    let free = fileio::free_bytes(dir).map_err(|e| io_err(dir, "statvfs", e))?;
     if free < layout.file_len() {
         return Err(R8Error::Space {
             path: dir.to_path_buf(),
@@ -538,26 +535,6 @@ fn create_part(part: &Path) -> Result<File, ModelError> {
         .into()),
         Err(TryLockError::Error(e)) => Err(io_err(part, "lock", e)),
     }
-}
-
-/// Bytes free to this process on the filesystem that holds `dir`.
-fn free_bytes(dir: &Path) -> Result<u64, ModelError> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
-        io_err(
-            dir,
-            "statvfs",
-            io::Error::new(io::ErrorKind::InvalidInput, e),
-        )
-    })?;
-    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `c` is a NUL-terminated path that lives across the call, and
-    // `st` is storage for one `statvfs`, which the call fills on success.
-    if unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
-        return Err(io_err(dir, "statvfs", io::Error::last_os_error()));
-    }
-    // SAFETY: the call returned 0, so it wrote every field of `st`.
-    let st = unsafe { st.assume_init() };
-    Ok(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
 /// Every stack repacked, written, synced and dropped from the page cache,
@@ -744,13 +721,40 @@ impl Sidecar {
         self.gguf.iter_tensors().map(|t| t.name.as_str())
     }
 
-    /// Tensor `name`'s bytes, in the row-lane layout.
-    pub fn data(&self, name: &str) -> Result<&[u8], ModelError> {
-        let t = self.gguf.find(name).ok_or_else(|| R8Error::NotInSidecar {
+    /// The file the sidecar was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Tensor `name`'s header entry, `None` for a name the sidecar lacks.
+    pub(crate) fn find(&self, name: &str) -> Option<&TensorInfo> {
+        self.gguf.find(name)
+    }
+
+    /// Tensor `name`'s header entry; a name the sidecar lacks is refused by
+    /// name.
+    pub(crate) fn tensor(&self, name: &str) -> Result<&TensorInfo, ModelError> {
+        Ok(self.find(name).ok_or_else(|| R8Error::NotInSidecar {
             path: self.path.clone(),
             tensor: name.to_string(),
-        })?;
+        })?)
+    }
+
+    /// Tensor `name`'s bytes, in the row-lane layout.
+    pub fn data(&self, name: &str) -> Result<&[u8], ModelError> {
+        self.data_of(self.tensor(name)?)
+    }
+
+    /// The bytes of `t`, one of this sidecar's own header entries
+    /// ([`Sidecar::tensor`]), in the row-lane layout.
+    pub(crate) fn data_of(&self, t: &TensorInfo) -> Result<&[u8], ModelError> {
         Ok(self.gguf.data(t)?)
+    }
+
+    /// The open file: its mapping and data base, for a walk over the pages
+    /// a host set names.
+    pub(crate) fn gguf(&self) -> &Gguf {
+        &self.gguf
     }
 
     /// Drop tensor `t`'s whole pages from this process's mapping (a file
@@ -794,6 +798,135 @@ impl Sidecar {
             }
         }
         drop_cached(file, &self.path, first..end)
+    }
+}
+
+impl fmt::Debug for Sidecar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sidecar")
+            .field("path", &self.path)
+            .field("mapped", &self.mapped)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a host tier reads its routed gates and ups: the source's sidecar,
+/// or the source itself and why ([`HostR8::at_load`]).
+#[derive(Clone, Debug)]
+pub enum HostR8 {
+    /// The sidecar, checked against the source.
+    On(Arc<Sidecar>),
+    /// `BLOOMERY_R8=off`.
+    Lever,
+    /// No file at the sidecar's path.
+    Missing(PathBuf),
+}
+
+impl HostR8 {
+    /// The reading for `source` at load. `BLOOMERY_R8` first — `on` or
+    /// unset reads the sidecar, `off` the source (the same-binary A/B arm),
+    /// read once per process, any other value refused by name — then the
+    /// file at [`sidecar_path`] of the source's first shard. No file is not
+    /// an error: the tier reads the source. A file that does not match the
+    /// source is its named [`R8Error`] ([`Sidecar::open`]), never a
+    /// fall-back to the source. While any holder keeps a sidecar open, a
+    /// second reading of the same file hands back the same one, checked again
+    /// against this source, so the pages a load populates and locks are the
+    /// pages its host tier reads. Each distinct reading prints one
+    /// `load host_tier r8=…` line per process.
+    pub fn at_load(source: &Split) -> Result<HostR8, ModelError> {
+        let r8 = if lever()? {
+            let path = sidecar_path(&first_shard(source));
+            if path.try_exists().map_err(|e| io_err(&path, "stat", e))? {
+                HostR8::On(shared(&path, source)?)
+            } else {
+                HostR8::Missing(path)
+            }
+        } else {
+            HostR8::Lever
+        };
+        announce(&r8);
+        Ok(r8)
+    }
+
+    /// The sidecar the tier reads, when it reads one.
+    pub fn sidecar(&self) -> Option<&Arc<Sidecar>> {
+        match self {
+            HostR8::On(s) => Some(s),
+            HostR8::Lever | HostR8::Missing(_) => None,
+        }
+    }
+}
+
+/// The load line's words: `r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or
+/// `r8=off (no sidecar at <path>: just r8-sidecar)`.
+impl fmt::Display for HostR8 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostR8::On(s) => write!(f, "r8=on ({})", s.path.display()),
+            HostR8::Lever => write!(f, "r8=off (BLOOMERY_R8=off)"),
+            HostR8::Missing(p) => {
+                write!(f, "r8=off (no sidecar at {}: just r8-sidecar)", p.display())
+            }
+        }
+    }
+}
+
+/// `BLOOMERY_R8`, read once per process: `on` or unset is `true`, `off`
+/// `false`, anything else [`R8Error::Lever`].
+fn lever() -> Result<bool, R8Error> {
+    static LEVER: OnceLock<Result<bool, String>> = OnceLock::new();
+    LEVER
+        .get_or_init(|| parse_lever(std::env::var("BLOOMERY_R8")))
+        .clone()
+        .map_err(|got| R8Error::Lever { got })
+}
+
+/// [`lever`]'s reading of the variable; the refused value, quoted, as the
+/// error.
+fn parse_lever(v: Result<String, std::env::VarError>) -> Result<bool, String> {
+    match v {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok(v) if v.trim() == "on" => Ok(true),
+        Ok(v) if v.trim() == "off" => Ok(false),
+        Ok(v) => Err(format!("{v:?}")),
+        Err(std::env::VarError::NotUnicode(v)) => Err(format!("{v:?}")),
+    }
+}
+
+/// Every sidecar a holder keeps open, by the path it was opened from.
+static OPEN: Mutex<Vec<(PathBuf, Weak<Sidecar>)>> = Mutex::new(Vec::new());
+
+/// The sidecar at `path`, checked against `source`: the one a holder keeps
+/// open, checked again, or a fresh lazy mapping — the source's own backing.
+fn shared(path: &Path, source: &Split) -> Result<Arc<Sidecar>, ModelError> {
+    let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+    open.retain(|(_, w)| w.strong_count() > 0);
+    let live = open
+        .iter()
+        .filter(|(p, _)| p == path)
+        .find_map(|(_, w)| w.upgrade());
+    if let Some(s) = live {
+        check(&s.path, &s.gguf, source)?;
+        return Ok(s);
+    }
+    let s = Arc::new(Sidecar::open(
+        path,
+        source,
+        Weights::Mapped { populate: false },
+    )?);
+    open.push((path.to_path_buf(), Arc::downgrade(&s)));
+    Ok(s)
+}
+
+/// The reading's load line, once per process for each distinct line.
+fn announce(r8: &HostR8) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let line = r8.to_string();
+    let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+    if !seen.contains(&line) {
+        eprintln!("load host_tier {line}");
+        seen.push(line);
     }
 }
 
@@ -1060,4 +1193,28 @@ fn first_mismatch(
         })
     })?;
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_lever;
+    use std::env::VarError;
+    use std::os::unix::ffi::OsStringExt;
+
+    /// `BLOOMERY_R8`: unset and `on` read the sidecar, `off` the source, and
+    /// any other value — a typo, another spelling, a value that is not
+    /// UTF-8 — is refused with the value quoted.
+    #[test]
+    fn the_r8_lever_takes_on_or_off_and_refuses_the_rest() {
+        assert_eq!(parse_lever(Err(VarError::NotPresent)), Ok(true));
+        assert_eq!(parse_lever(Ok("on".into())), Ok(true));
+        assert_eq!(parse_lever(Ok("off".into())), Ok(false));
+        assert_eq!(parse_lever(Ok(" off\n".into())), Ok(false));
+        for v in ["", "1", "0", "On", "true", "sidecar"] {
+            assert_eq!(parse_lever(Ok(v.into())), Err(format!("{v:?}")));
+        }
+        let bad = std::ffi::OsString::from_vec(vec![b'o', b'n', 0xff]);
+        assert!(parse_lever(Err(VarError::NotUnicode(bad))).is_err());
+        println!("BLOOMERY_R8: unset/on -> sidecar, off -> source, others refused");
+    }
 }

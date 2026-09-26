@@ -4,7 +4,13 @@
 //! and `verify` pass and the sidecar holds `repack_q3k_r8` of each stack;
 //! every identity difference, every conversion refusal and a flipped sidecar
 //! byte are named; the `r8conv` binary converts and verifies the same source
-//! end to end. No clause reads a model file.
+//! end to end. A host tier's load (`HostR8::at_load`) on a synthetic routed
+//! layer reads the sidecar at its path, builds the layer's gate and up from
+//! it, and refuses by name a sidecar whose source stack's head differs, also
+//! while an earlier load holds it open. No clause reads a model file.
+
+#[path = "common/r8layer.rs"]
+mod r8layer;
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -14,7 +20,9 @@ use std::process::Command;
 use gguf::write::{Layout, TensorDecl, WriteError, Writer};
 use gguf::{GgmlType, Gguf, LoadError, PrivateType, Split, Value, Weights};
 use model::ModelError;
-use model::r8file::{self, Progress, R8Error, Sidecar};
+use model::moe::HostLayer;
+use model::ops::RowLayout;
+use model::r8file::{self, HostR8, Progress, R8Error, Sidecar};
 
 const G0: &str = "blk.0.ffn_gate_exps.weight";
 const U0: &str = "blk.0.ffn_up_exps.weight";
@@ -700,4 +708,100 @@ fn the_r8conv_binary_converts_and_verifies() {
         "convert must name the existing out"
     );
     std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// The reading of `split` at load must be refused by the named head digest
+/// of `tensor`.
+fn head_refused(split: &Split, tensor: &str, what: &str) {
+    match HostR8::at_load(split) {
+        Err(ModelError::R8(R8Error::Head { tensor: t, .. })) => {
+            assert_eq!(t, tensor, "{what}: the refusal names the stack");
+        }
+        Err(other) => panic!("{what}: refused, but not by the head digest: {other}"),
+        Ok(r8) => panic!("{what}: must be refused, got {r8}"),
+    }
+    println!("{what}: refused by the head digest of {tensor}");
+}
+
+/// A host tier's load of a synthetic routed layer: with the sidecar at its
+/// path the reading is `r8=on` and the layer's gate and up are its row-lane
+/// copies (`HostLayer::layouts`, an expert past the layer refused). Once the
+/// source's gate head differs, the load is refused by `R8Error::Head` naming
+/// the gate — while the earlier load's layer still holds the sidecar open
+/// (the second reading checks the held file again) and on a fresh open.
+/// With no file at the path the reading is the source's, named, and the
+/// layer reads its rows.
+#[test]
+fn a_host_tier_load_refuses_a_sidecar_whose_stack_head_differs() {
+    let layer = r8layer::Layer::write("host", 512, 256, 4, GgmlType::Q4_K);
+    let spec = layer.spec();
+    let split = Split::open(&layer.source).unwrap();
+    let r8 = HostR8::at_load(&split).unwrap();
+    let side = r8.sidecar().expect("the sidecar at its path is read");
+    assert_eq!(side.path(), layer.sidecar.as_path());
+    assert_eq!(
+        r8.to_string(),
+        format!("r8=on ({})", layer.sidecar.display())
+    );
+    let held = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
+    assert_eq!(
+        held.layouts(0).unwrap(),
+        [RowLayout::R8, RowLayout::R8, RowLayout::Rows]
+    );
+    let past = held.layouts(layer.n_expert).map(|_| ()).unwrap_err();
+    assert!(
+        past.to_string()
+            .contains(&format!("expert {}", layer.n_expert)),
+        "an expert past the layer is refused by name, got {past}"
+    );
+    drop((r8, split));
+
+    let (at, _) = data_at(&layer.source, r8layer::GATE);
+    flip(&layer.source, at, 0x10);
+    let split = Split::open(&layer.source).unwrap();
+    head_refused(&split, r8layer::GATE, "held open");
+    drop(held);
+    head_refused(&split, r8layer::GATE, "fresh open");
+
+    std::fs::remove_file(&layer.sidecar).unwrap();
+    let r8 = HostR8::at_load(&split).unwrap();
+    assert!(r8.sidecar().is_none());
+    assert_eq!(
+        r8.to_string(),
+        format!(
+            "r8=off (no sidecar at {}: just r8-sidecar)",
+            layer.sidecar.display()
+        )
+    );
+    let rows = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
+    assert_eq!(rows.layouts(0).unwrap(), [RowLayout::Rows; 3]);
+    println!(
+        "host tier load: r8=on reads the sidecar; a changed head is refused; no file reads rows"
+    );
+}
+
+/// A sidecar that holds a layer's down stack — a Q3_K down converted beside
+/// the gate and the up — passes its identity check, and the host layer built
+/// from it is refused by name (`R8Error::HoldsDown`): a host tier reads only
+/// a gate and an up from a sidecar.
+#[test]
+fn a_host_layer_refuses_a_sidecar_that_holds_its_down() {
+    let layer = r8layer::Layer::write("holds-down", 512, 256, 4, GgmlType::Q3_K);
+    std::fs::remove_file(&layer.sidecar).unwrap();
+    let split = Split::open(&layer.source).unwrap();
+    let all = [r8layer::GATE, r8layer::UP, r8layer::DOWN].map(String::from);
+    r8file::convert(&split, &all, &layer.sidecar, &mut |_| {}).unwrap();
+    let r8 = HostR8::at_load(&split).unwrap();
+    assert!(
+        r8.sidecar().is_some(),
+        "the sidecar passes its identity check"
+    );
+    match HostLayer::build_r8(&split, &layer.spec(), r8.sidecar()) {
+        Err(ModelError::R8(R8Error::HoldsDown { tensor, .. })) => {
+            assert_eq!(tensor, r8layer::DOWN);
+        }
+        Err(other) => panic!("refused, but not as holding the down: {other}"),
+        Ok(_) => panic!("a sidecar holding the down must be refused"),
+    }
+    println!("host layer: a sidecar holding {} is refused", r8layer::DOWN);
 }

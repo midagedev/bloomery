@@ -5,7 +5,10 @@
 //! read, and a serving process may also lock them ([`HostLock`]) so that no
 //! other reader of the page cache can evict an expert page from under a step.
 //! Both walk the same set, so the populated bytes and the locked bytes are
-//! the same bytes by construction.
+//! the same bytes by construction. A host tier that reads its routed gates
+//! and ups from the r8 sidecar has a set of both files ([`HostSet::of_r8`]):
+//! those stacks' runs in the sidecar's mapping, everything else in the
+//! shards'.
 //!
 //! The complement lives here too: [`PageDrop`] releases file bytes the load
 //! has put on a card and no later reader needs, so that the upload does not
@@ -15,12 +18,14 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gguf::{Gguf, Split};
 
 use super::{Device, Format, ModelTensor, PlacementError, Plan};
+use crate::r8file::Sidecar;
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
 /// taken and counted in.
@@ -34,18 +39,24 @@ pub fn page_bytes() -> u64 {
 }
 
 /// The pages of every host segment a plan keeps, per shard: page ranges
-/// `[first, end)` of the shard's mapping, sorted and merged where they touch.
+/// `[first, end)` of the shard's mapping, sorted and merged where they touch;
+/// and, for a host tier that reads the r8 sidecar, the same of its mapping.
 #[derive(Clone, Debug)]
 pub struct HostSet {
     page: u64,
     /// Only shards with at least one range, in shard order.
     shards: Vec<(usize, Vec<Range<u64>>)>,
+    /// The sidecar and its ranges ([`HostSet::of_r8`]).
+    side: Option<(Arc<Sidecar>, Vec<Range<u64>>)>,
 }
 
-/// One shard's side of a walk over a [`HostSet`] — a populate or a lock.
+/// One file's side of a walk over a [`HostSet`] — a populate or a lock.
 #[derive(Clone, Debug)]
 pub struct ShardWalk {
+    /// The shard; the sidecar's walk is numbered one past the last shard.
     pub shard: usize,
+    /// Whether this is the sidecar's walk.
+    pub sidecar: bool,
     /// Page spans walked: the host segments' ranges, merged where they touch.
     pub spans: usize,
     /// Bytes walked, whole pages.
@@ -63,10 +74,20 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// Bytes walked, whole pages, over every shard.
+    /// Bytes walked, whole pages, over every shard and the sidecar.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.shards.iter().map(|s| s.bytes).sum()
+    }
+
+    /// The part of [`Walk::bytes`] in the sidecar's mapping; 0 without one.
+    #[must_use]
+    pub fn sidecar_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .filter(|s| s.sidecar)
+            .map(|s| s.bytes)
+            .sum()
     }
 
     /// Per shard, in shard order.
@@ -93,13 +114,40 @@ impl HostSet {
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
     ) -> Result<HostSet, PlacementError> {
+        HostSet::build(split, None, plan, keep)
+    }
+
+    /// [`HostSet::of`] for a host tier that reads every tensor `sidecar`
+    /// holds from it: those tensors' runs are pages of the sidecar's mapping,
+    /// at its offsets — the sidecar keeps each expert's byte range of the
+    /// stack — and pages of no shard; every other tensor's are the shards'.
+    pub fn of_r8(
+        split: &Split,
+        sidecar: &Arc<Sidecar>,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+    ) -> Result<HostSet, PlacementError> {
+        HostSet::build(split, Some(sidecar), plan, keep)
+    }
+
+    fn build(
+        split: &Split,
+        sidecar: Option<&Arc<Sidecar>>,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+    ) -> Result<HostSet, PlacementError> {
         let page = page_bytes();
-        let shards = host_pages(split, plan, keep, page)?
+        let (pages, side) = host_pages(split, sidecar.map(Arc::as_ref), plan, keep, page)?;
+        let shards = pages
             .into_iter()
             .enumerate()
             .filter(|(_, runs)| !runs.is_empty())
             .collect();
-        Ok(HostSet { page, shards })
+        Ok(HostSet {
+            page,
+            shards,
+            side: sidecar.map(|s| (Arc::clone(s), side)),
+        })
     }
 
     /// Bytes of the set, whole pages.
@@ -108,14 +156,21 @@ impl HostSet {
         self.pages() * self.page
     }
 
-    /// Pages of the set.
+    /// Pages of the set, the sidecar's included.
     #[must_use]
     pub fn pages(&self) -> u64 {
         self.shards
             .iter()
             .flat_map(|(_, runs)| runs)
+            .chain(self.side.iter().flat_map(|(_, runs)| runs))
             .map(|r| r.end - r.start)
             .sum()
+    }
+
+    /// The sidecar whose pages the set holds, when it holds some.
+    #[must_use]
+    pub(crate) fn sidecar(&self) -> Option<&Arc<Sidecar>> {
+        self.side.as_ref().map(|(s, _)| s)
     }
 
     /// Read every page of the set into the page cache and map it in `split`'s
@@ -146,13 +201,13 @@ impl HostSet {
     }
 
     /// Pages of the set `mincore` reports resident in the page cache, and
-    /// all of them. `split` must be the split the set was made from.
+    /// all of them, the sidecar's included. `split` must be the split the set
+    /// was made from.
     pub fn resident(&self, split: &Split) -> Result<(u64, u64), PlacementError> {
         let (mut resident, mut total) = (0, 0);
-        for (s, runs) in &self.shards {
-            let g = shard_of(split, *s)?;
+        for (s, g, runs) in files(split, self)? {
             for r in runs {
-                let span = run_span(g, *s, r, self.page)?;
+                let span = run_span(g, s, r, self.page)?;
                 let (n_in, n) = resident_pages(span, self.page).map_err(|e| {
                     PlacementError::Host(format!("mincore over shard {s} pages {r:?}: {e}"))
                 })?;
@@ -164,9 +219,31 @@ impl HostSet {
     }
 }
 
-/// The pages of a [`HostSet`], locked in the shards' mappings until this
-/// drops. Owned: it holds the spans' addresses, not a borrow of the split,
-/// so the owner of the split can hold it too.
+/// Page ranges `[first, end)` of one mapping.
+type Runs = Vec<Range<u64>>;
+
+/// One file of a walk: its number (a shard's, or one past the last shard for
+/// the sidecar), its mapping and its ranges.
+type FileRuns<'a> = (usize, &'a Gguf, &'a [Range<u64>]);
+
+/// The files of `set` in walk order — each shard with ranges, then the
+/// sidecar numbered one past `split`'s last shard — with their mappings and
+/// ranges.
+fn files<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<FileRuns<'a>>, PlacementError> {
+    let mut out = Vec::with_capacity(set.shards.len() + 1);
+    for (s, runs) in &set.shards {
+        out.push((*s, shard_of(split, *s)?, runs.as_slice()));
+    }
+    if let Some((side, runs)) = &set.side {
+        out.push((split.shard_count(), side.gguf(), runs.as_slice()));
+    }
+    Ok(out)
+}
+
+/// The pages of a [`HostSet`], locked in the shards' mappings (and the
+/// sidecar's) until this drops. Owned: it holds the spans' addresses, not a
+/// borrow of the split, so the owner of the split can hold it too; it holds
+/// the sidecar, whose mapping its drop unlocks.
 ///
 /// The split's mappings must outlive the lock (drop the lock first). If they
 /// go first, the unmapping has already released the pages and the drop's
@@ -176,6 +253,8 @@ pub struct HostLock {
     /// `(address, length)` of every span locked.
     spans: Vec<(usize, usize)>,
     walk: Walk,
+    /// Dropped after the spans are unlocked (fields drop after `drop`).
+    _sidecar: Option<Arc<Sidecar>>,
 }
 
 impl HostLock {
@@ -200,16 +279,23 @@ impl HostLock {
                 shards: Vec::new(),
                 wall: Duration::ZERO,
             },
+            _sidecar: set.sidecar().cloned(),
         };
         // An error drops the partial lock, which unlocks what was taken.
         lock.walk = walk?;
         Ok(lock)
     }
 
-    /// Bytes locked, whole pages, over every shard.
+    /// Bytes locked, whole pages, over every shard and the sidecar.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.walk.bytes()
+    }
+
+    /// The part of [`HostLock::bytes`] in the sidecar's mapping.
+    #[must_use]
+    pub fn sidecar_bytes(&self) -> u64 {
+        self.walk.sidecar_bytes()
     }
 
     /// Per shard, in shard order.
@@ -382,27 +468,27 @@ impl<'s> PageDrop<'s> {
 /// its record.
 type ShardResult = (Vec<(usize, usize)>, Result<ShardWalk, PlacementError>);
 
-/// Run `op` over every page run of `set` in `split`'s mappings, one thread
-/// per shard, runs in order within a shard. Returns the spans `op` succeeded
-/// on and the walk, or the first shard's refusal.
+/// Run `op` over every page run of `set` in `split`'s mappings and the
+/// sidecar's, one thread per file, runs in order within a file. Returns the
+/// spans `op` succeeded on and the walk, or the first file's refusal.
 fn walk_shards(
     split: &Split,
     set: &HostSet,
     op: impl Fn(&[u8]) -> Result<(), String> + Sync,
 ) -> (Vec<(usize, usize)>, Result<Walk, PlacementError>) {
-    let mut work = Vec::with_capacity(set.shards.len());
-    for (s, runs) in &set.shards {
-        match shard_of(split, *s) {
-            Ok(g) => work.push((*s, g, runs)),
-            Err(e) => return (Vec::new(), Err(e)),
-        }
-    }
+    let work = match files(split, set) {
+        Ok(work) => work,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let sidecar = split.shard_count();
     let start = Instant::now();
     let op = &op;
     let results: Vec<ShardResult> = thread::scope(|scope| {
         let handles: Vec<_> = work
             .iter()
-            .map(|&(s, g, runs)| scope.spawn(move || walk_shard(g, s, runs, set.page, op)))
+            .map(|&(s, g, runs)| {
+                scope.spawn(move || walk_shard(g, s, s == sidecar, runs, set.page, op))
+            })
             .collect();
         handles
             .into_iter()
@@ -431,10 +517,12 @@ fn walk_shards(
     }
 }
 
-/// `op` over `runs` of shard `shard`'s mapping, in order.
+/// `op` over `runs` of shard `shard`'s mapping (the sidecar's when
+/// `sidecar`), in order.
 fn walk_shard(
     g: &Gguf,
     shard: usize,
+    sidecar: bool,
     runs: &[Range<u64>],
     page: u64,
     op: &(impl Fn(&[u8]) -> Result<(), String> + Sync),
@@ -456,6 +544,7 @@ fn walk_shard(
     }
     let record = ShardWalk {
         shard,
+        sidecar,
         spans: runs.len(),
         bytes,
         wall: start.elapsed(),
@@ -493,14 +582,17 @@ fn run_span<'g>(
 }
 
 /// Per shard, the page ranges `[first, end)` of the host segments `keep`
-/// selects, sorted and merged where they overlap or touch.
+/// selects, sorted and merged where they overlap or touch; with a `sidecar`,
+/// the ranges of the tensors it holds go to the second list, in its mapping.
 fn host_pages(
     split: &Split,
+    sidecar: Option<&Sidecar>,
     plan: &Plan<'_>,
     keep: impl Fn(&ModelTensor) -> bool,
     page: u64,
-) -> Result<Vec<Vec<Range<u64>>>, PlacementError> {
-    let mut pages: Vec<Vec<Range<u64>>> = vec![Vec::new(); split.shard_count()];
+) -> Result<(Vec<Runs>, Runs), PlacementError> {
+    let mut pages: Vec<Runs> = vec![Vec::new(); split.shard_count()];
+    let mut side: Runs = Vec::new();
     for row in &plan.rows {
         let Some(t) = plan.model.tensors.get(row.tensor) else {
             return Err(PlacementError::Host(format!(
@@ -524,6 +616,7 @@ fn host_pages(
                     "is not in the split the host set maps",
                 ));
             };
+            let held = sidecar.and_then(|sc| sc.find(&t.name).map(|i| (sc.gguf(), i)));
             for span in seg.spans(t, plan.model.experts)? {
                 if s != t.shard || span.bytes.end > info.nbytes {
                     return Err(PlacementError::tensor(
@@ -534,13 +627,27 @@ fn host_pages(
                         ),
                     ));
                 }
-                let base = g.data_base() + info.offset;
+                let (base, into) = match held {
+                    Some((sg, side_info)) => {
+                        if span.bytes.end > side_info.nbytes {
+                            return Err(PlacementError::tensor(
+                                t,
+                                format!(
+                                    "the plan's bytes {:?} run past the sidecar's {} bytes of it",
+                                    span.bytes, side_info.nbytes
+                                ),
+                            ));
+                        }
+                        (sg.data_base() + side_info.offset, &mut side)
+                    }
+                    None => (g.data_base() + info.offset, &mut pages[s]),
+                };
                 let (a, b) = (base + span.bytes.start, base + span.bytes.end);
-                pages[s].push(a / page..b.div_ceil(page));
+                into.push(a / page..b.div_ceil(page));
             }
         }
     }
-    for spans in &mut pages {
+    for spans in pages.iter_mut().chain(std::iter::once(&mut side)) {
         spans.sort_by_key(|r| r.start);
         let mut merged: Vec<Range<u64>> = Vec::with_capacity(spans.len());
         for r in spans.drain(..) {
@@ -551,7 +658,7 @@ fn host_pages(
         }
         *spans = merged;
     }
-    Ok(pages)
+    Ok((pages, side))
 }
 
 /// `mincore` over `span`: its resident pages and all of them.

@@ -5,9 +5,11 @@
 
 use crate::ffn::swiglu_timed;
 use crate::profile;
+use crate::r8file::{R8Error, Sidecar};
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A 2-D activation block in ggml's layout: `ne0` contiguous, `ne1` strides by
@@ -951,6 +953,7 @@ impl ShardTensor {
             k: k_of(&self.info),
             n: n_of(&self.info),
             bytes: self.file(split)?.data(&self.info)?,
+            layout: RowLayout::Rows,
         })
     }
 
@@ -958,20 +961,8 @@ impl ShardTensor {
     /// the `e`-th of the stack's `n_expert` equal byte runs — the cut
     /// `moe::expert_view` makes, without a header of its own.
     pub fn expert<'a>(&self, split: &'a Split, e: usize) -> Result<Weight<'a>, crate::ModelError> {
-        let (n_expert, per) = stack_cut(&self.info)?;
-        if e >= n_expert {
-            return Err(crate::ModelError::MissingTensor(format!(
-                "expert {e} of {}",
-                self.info.name
-            )));
-        }
         let stack = self.file(split)?.data(&self.info)?;
-        Ok(Weight {
-            ty: self.info.ty,
-            k: k_of(&self.info),
-            n: n_of(&self.info),
-            bytes: &stack[e * per..(e + 1) * per],
-        })
+        expert_weight(&self.info, stack, e, RowLayout::Rows)
     }
 
     /// The stacked tensor as a union call reads it, its bytes resolved once
@@ -1004,10 +995,172 @@ fn stack_cut(info: &TensorInfo) -> Result<(usize, usize), crate::ModelError> {
     Ok((n_expert as usize, per))
 }
 
+/// Matrix `e` of stack `info` over the stack's bytes `stack`, its rows in
+/// `layout`; an expert past the stack is refused by name.
+fn expert_weight<'a>(
+    info: &TensorInfo,
+    stack: &'a [u8],
+    e: usize,
+    layout: RowLayout,
+) -> Result<Weight<'a>, crate::ModelError> {
+    let (n_expert, per) = stack_cut(info)?;
+    if e >= n_expert {
+        return Err(crate::ModelError::MissingTensor(format!(
+            "expert {e} of {}",
+            info.name
+        )));
+    }
+    Ok(Weight {
+        ty: info.ty,
+        k: k_of(info),
+        n: n_of(info),
+        bytes: &stack[e * per..(e + 1) * per],
+        layout,
+    })
+}
+
+/// How a matrix's rows lie in its bytes. Its type says how a row encodes its
+/// values; the layout says which bytes a row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowLayout {
+    /// Row after row, each in its type's own blocks.
+    Rows,
+    /// Q3_K rows in groups of [`qdot::Q3K_R8_ROWS`], each group's
+    /// super-blocks interleaved in place ([`qdot::repack_q3k_r8`]): the r8
+    /// sidecar's layout, read only by [`qdot::dot_q3k_r8_cols`], a group at a
+    /// time. Only the host tier's r8 stack makes a matrix of it.
+    R8,
+}
+
+impl RowLayout {
+    /// Rows one unit of a row dispatch takes: a row, or a row-lane group,
+    /// which the tile reads whole.
+    fn grain(self) -> usize {
+        match self {
+            RowLayout::Rows => 1,
+            RowLayout::R8 => qdot::Q3K_R8_ROWS,
+        }
+    }
+
+    /// The layout's name in a refusal or a load line.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            RowLayout::Rows => "rows",
+            RowLayout::R8 => "r8",
+        }
+    }
+}
+
+/// A routed Q3_K stack of a split model read from its r8 sidecar
+/// ([`crate::r8file`]): the same experts in the same byte ranges, each 8-row
+/// group's super-blocks interleaved for [`qdot::dot_q3k_r8_cols`]. Made only
+/// by [`R8Stack::of`], once the sidecar's tensor has matched its source
+/// stack's name, dims and bytes; its matrices carry [`RowLayout::R8`], so no
+/// dispatch reads them as Q3_K rows.
+#[derive(Clone)]
+pub(crate) struct R8Stack {
+    /// The source's stack, the header the sidecar's tensor was checked
+    /// against.
+    source: ShardTensor,
+    /// The sidecar's header entry of the same tensor.
+    info: TensorInfo,
+    sidecar: Arc<Sidecar>,
+}
+
+impl R8Stack {
+    /// Stack `name` of `split` as `sidecar` holds it. Refused by name: a name
+    /// the split or the sidecar lacks, a sidecar tensor of another type id,
+    /// dims or byte count than its source's, a source stack that is not
+    /// Q3_K `{k, n, n_expert}` on the tile's grids (`k` whole super-blocks,
+    /// `n` whole groups — so every expert's range holds whole groups and is
+    /// the same range in both files), and a machine where qdot does not fuse
+    /// Q3_K at `k`, whose columns the tile reads.
+    pub(crate) fn of(
+        split: &Split,
+        sidecar: &Arc<Sidecar>,
+        name: &str,
+    ) -> Result<R8Stack, crate::ModelError> {
+        let source = ShardTensor::find(split, name)?;
+        let info = sidecar.tensor(name)?.clone();
+        let path = || sidecar.path().to_path_buf();
+        if info.ty != GgmlType::Unknown(crate::r8file::Q3K_R8_TYPE) {
+            return Err(R8Error::TensorType {
+                path: path(),
+                tensor: name.to_string(),
+                got: info.ty.as_u32(),
+            }
+            .into());
+        }
+        let src = &source.info;
+        if (info.dims.as_slice(), info.nbytes) != (src.dims.as_slice(), src.nbytes) {
+            return Err(R8Error::Shape {
+                path: path(),
+                tensor: name.to_string(),
+                recorded_dims: info.dims.clone(),
+                recorded_bytes: info.nbytes,
+                found_dims: src.dims.clone(),
+                found_bytes: src.nbytes,
+            }
+            .into());
+        }
+        if src.ty != GgmlType::Q3_K {
+            return Err(R8Error::SourceType {
+                path: path(),
+                tensor: name.to_string(),
+                got: src.ty,
+            }
+            .into());
+        }
+        stack_cut(src)?;
+        let (k, n) = (k_of(src), n_of(src));
+        if !n.is_multiple_of(qdot::Q3K_R8_ROWS) || !k.is_multiple_of(256) {
+            return Err(R8Error::Grid {
+                path: path(),
+                tensor: name.to_string(),
+                dims: src.dims.clone(),
+            }
+            .into());
+        }
+        if !qdot::fuses(GgmlType::Q3_K, k) {
+            return Err(crate::ModelError::HostStack {
+                what: "an r8 stack: the row-lane tile reads fused Q3_K columns",
+                tensor: name.to_string(),
+                ty: GgmlType::Q3_K,
+                k,
+                why: qdot::QdotError::UnsupportedType(GgmlType::Q3_K),
+            });
+        }
+        Ok(R8Stack {
+            source,
+            info,
+            sidecar: Arc::clone(sidecar),
+        })
+    }
+
+    /// The source's stack this copy was checked against.
+    pub(crate) fn source(&self) -> &ShardTensor {
+        &self.source
+    }
+
+    /// Matrix `e` as a dispatch weight: its rows in [`RowLayout::R8`].
+    pub(crate) fn expert(&self, e: usize) -> Result<Weight<'_>, crate::ModelError> {
+        let stack = self.sidecar.data_of(&self.info)?;
+        expert_weight(&self.source.info, stack, e, RowLayout::R8)
+    }
+
+    /// The stack as a union call reads it, its bytes resolved once.
+    pub(crate) fn stack(&self) -> Result<ExpertStack<'_>, crate::ModelError> {
+        let bytes = self.sidecar.data_of(&self.info)?;
+        let mut s = ExpertStack::of(&self.source.info, bytes)?;
+        s.layout = RowLayout::R8;
+        Ok(s)
+    }
+}
+
 /// A stacked expert tensor `{k, n, n_expert}` as a union call reads it,
 /// resolved once per call: matrix `e` is the `e`-th of the stack's `n_expert`
 /// equal byte runs — the cut [`ShardTensor::expert`] and `moe::expert_view`
-/// make — so every matrix has the stack's type and shape.
+/// make — so every matrix has the stack's type, shape and row layout.
 #[derive(Clone, Copy)]
 pub(crate) struct ExpertStack<'w> {
     name: &'w str,
@@ -1018,11 +1171,12 @@ pub(crate) struct ExpertStack<'w> {
     /// Bytes of one expert's matrix.
     per: usize,
     bytes: &'w [u8],
+    layout: RowLayout,
 }
 
 impl<'w> ExpertStack<'w> {
     /// The stack `info` over its bytes `bytes`, read from the file `info`
-    /// came from.
+    /// came from, row after row.
     pub(crate) fn of(info: &'w TensorInfo, bytes: &'w [u8]) -> Result<Self, crate::ModelError> {
         let (n_expert, per) = stack_cut(info)?;
         Ok(ExpertStack {
@@ -1033,6 +1187,7 @@ impl<'w> ExpertStack<'w> {
             n_expert,
             per,
             bytes,
+            layout: RowLayout::Rows,
         })
     }
 
@@ -1048,17 +1203,19 @@ impl<'w> ExpertStack<'w> {
     }
 }
 
-/// One weight matrix as a dispatch reads it — type, `k` × `n` and the bytes —
-/// resolved from the file that holds it. Outside this crate the only way to
-/// make one is through a [`ShardTensor`] and its split; a one-file model's
-/// own headers make one inside it. Copy and allocation-free: a host call
-/// cuts its experts' matrices per token.
+/// One weight matrix as a dispatch reads it — type, `k` × `n`, the bytes and
+/// the layout of its rows in them — resolved from the file that holds it.
+/// Outside this crate the only way to make one is through a [`ShardTensor`]
+/// and its split; inside it, a one-file model's own headers and the host
+/// tier's r8 stacks make one too. Copy and allocation-free: a host call cuts
+/// its experts' matrices per token.
 #[derive(Clone, Copy)]
 pub struct Weight<'a> {
     ty: GgmlType,
     k: usize,
     n: usize,
     bytes: &'a [u8],
+    layout: RowLayout,
 }
 
 impl<'a> Weight<'a> {
@@ -1073,6 +1230,7 @@ impl<'a> Weight<'a> {
             k: k_of(info),
             n: n_of(info),
             bytes: gguf.data(info)?,
+            layout: RowLayout::Rows,
         })
     }
 
@@ -1248,6 +1406,15 @@ impl<'a> Weights<'a> {
         match self {
             Weights::File(gguf, ws) => Ok(gguf.data(ws[i])?),
             Weights::Resolved(ws) => Ok(ws[i].bytes),
+        }
+    }
+
+    /// Pair `i`'s row layout: a file header's rows lie in their type's own
+    /// order.
+    fn layout(self, i: usize) -> RowLayout {
+        match self {
+            Weights::File(..) => RowLayout::Rows,
+            Weights::Resolved(ws) => ws[i].layout,
         }
     }
 }
@@ -1451,6 +1618,11 @@ fn group_core(
         // into `qdot::quantize_col`'s layout, and `qdot::fuses` owns the
         // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
         let fused = qdot::fuses(ty, k);
+        let layout = ws.layout(i);
+        assert!(
+            layout == RowLayout::Rows || fused,
+            "a row-lane matrix is made only where qdot fuses Q3_K at its k (R8Stack::of)"
+        );
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
         } else {
@@ -1622,6 +1794,7 @@ fn group_core(
             k,
             n,
             row_bytes: b.len() / n,
+            layout,
         });
         slot_of.push(slot);
         cols_of.push(src.cols());
@@ -1851,6 +2024,9 @@ struct PairWork<'a> {
     /// Output columns.
     ne1: usize,
     out: SharedOut,
+    /// Where each row's bytes lie: a row-lane pair computes its rows a group
+    /// at a time.
+    layout: RowLayout,
     /// The slot whose columns this pair reads, and the claim table when
     /// quantization is deferred into the dispatch (`None`: the pre-pass
     /// completed every column before any row runs).
@@ -1874,6 +2050,7 @@ struct PairMeta {
     k: usize,
     n: usize,
     row_bytes: usize,
+    layout: RowLayout,
 }
 
 impl<'a> PairWork<'a> {
@@ -1927,6 +2104,7 @@ impl<'a> PairWork<'a> {
             cols,
             ne1,
             out: out_ptr,
+            layout: m.layout,
             slot,
             defer,
         }
@@ -1960,6 +2138,9 @@ impl<'a> PairWork<'a> {
             // join, the DONE store the wait above just observed, or, for a
             // union pass, the claim wait its `compute` ran before this call.
             let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
+            if self.layout == RowLayout::R8 {
+                return self.compute_groups(rows, acol, cb, lvl, acc);
+            }
             // Fused rows: `qdot` dots the weight bytes and the quantized
             // columns directly — no f32 row, ROW_BUF untouched;
             // `add_dequant_w` stays 0 (the dequant is in the dot timer). A
@@ -1998,6 +2179,10 @@ impl<'a> PairWork<'a> {
             }
             Ok(())
         } else {
+            assert!(
+                self.layout == RowLayout::Rows,
+                "a row-lane matrix is read only on the fused path (R8Stack::of)"
+            );
             // SAFETY: `k * src_ne1` f32s as allocated, ordered before this
             // read exactly as the fused arm above.
             let q_f32 = unsafe { std::slice::from_raw_parts(self.q_f32, k * self.src_ne1) };
@@ -2057,6 +2242,62 @@ impl<'a> PairWork<'a> {
                 Ok(())
             })
         }
+    }
+
+    /// Rows `rows` of a row-lane pair across every token column, whole
+    /// groups of [`qdot::Q3K_R8_ROWS`] — the units a row dispatch hands a
+    /// row-lane pair — against the quantized columns `acol` of `cb` bytes:
+    /// each group through [`qdot::dot_q3k_r8_cols`] in ⌈`ne1` /
+    /// [`qdot::TILE_COLS`]⌉ runs of columns cut evenly. The tile writes each
+    /// (row, column)'s `dot_row` value bit for bit, so neither the cut nor
+    /// the grouping moves a value.
+    fn compute_groups(
+        &self,
+        rows: Range<usize>,
+        acol: &[u8],
+        cb: usize,
+        lvl: u8,
+        acc: &mut profile::CallAcc,
+    ) -> Result<(), crate::ModelError> {
+        const G: usize = qdot::Q3K_R8_ROWS;
+        assert!(
+            rows.start.is_multiple_of(G) && rows.end.is_multiple_of(G),
+            "a row-lane pair's rows {rows:?} run in whole groups of {G}"
+        );
+        if self.ne1 == 0 {
+            return Ok(());
+        }
+        let (k, n) = (self.k, self.n);
+        let group_bytes = G * self.row_bytes;
+        let runs = self.ne1.div_ceil(qdot::TILE_COLS);
+        let (base, extra) = (self.ne1 / runs, self.ne1 % runs);
+        for g in rows.start / G..rows.end / G {
+            let src = &self.bytes[g * group_bytes..(g + 1) * group_bytes];
+            let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+            let mut t0 = 0;
+            for run in 0..runs {
+                let m = base + usize::from(run < extra);
+                let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
+                    let c = self.col(t0 + i.min(m - 1));
+                    &acol[c * cb..(c + 1) * cb]
+                });
+                let mut v = [[0.0f32; G]; qdot::TILE_COLS];
+                qdot::dot_q3k_r8_cols(src, &cols[..m], k, &mut v[..m])?;
+                for (i, col) in v[..m].iter().enumerate() {
+                    for (r, &val) in col.iter().enumerate() {
+                        // SAFETY: row `g·G + r` is inside `rows`, whole groups
+                        // of this chunk's own (the assert above) — see the
+                        // SharedOut construction site.
+                        unsafe { self.out.write((t0 + i) * n + g * G + r, val) };
+                    }
+                }
+                t0 += m;
+            }
+            if let Some(t_dot) = t_dot {
+                acc.add_dot(t_dot.elapsed().as_nanos() as u64);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2653,11 +2894,12 @@ struct RunTimes {
     stage_ns: u64,
 }
 
-/// What one row of a pair costs a lane: its weight bytes once per input column
-/// — a row is dotted against every column, and a prefill group mixes pairs of
-/// one column with pairs of many.
+/// What one unit of a pair costs a lane — a row, or a row-lane pair's group
+/// ([`RowLayout::grain`]): its weight bytes once per input column — a unit is
+/// dotted against every column, and a prefill group mixes pairs of one column
+/// with pairs of many.
 fn row_cost(p: &PairWork<'_>) -> u64 {
-    p.row_bytes as u64 * p.ne1.max(1) as u64
+    (p.row_bytes * p.layout.grain()) as u64 * p.ne1.max(1) as u64
 }
 
 /// Instructions per super-block of qdot's tile kernels, in half-instruction
@@ -2674,12 +2916,43 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
     }
 }
 
-/// What one row of a pair costs a lane when its columns go through the tile
+/// What one unit of a pair costs a lane when its columns go through the tile
 /// kernel in runs of up to [`qdot::TILE_COLS`], as `compute_rows` walks them:
 /// per super-block one fixed unpack per run plus each column's share. `None`
 /// for a pair without a tile kernel on this machine.
 fn tile_cost(p: &PairWork<'_>) -> Option<u64> {
-    p.fused_cols.and_then(|_| tile_cost_of(p.ty, p.k, p.ne1))
+    p.fused_cols
+        .and_then(|_| unit_tile_cost(p.ty, p.layout, p.k, p.ne1))
+}
+
+/// [`tile_cost`] of one unit of `layout` — a row of `ty`, or a row-lane
+/// group — over `k` values against `ne1` columns.
+fn unit_tile_cost(ty: GgmlType, layout: RowLayout, k: usize, ne1: usize) -> Option<u64> {
+    match layout {
+        RowLayout::Rows => tile_cost_of(ty, k, ne1),
+        RowLayout::R8 => r8_tile_cost(k, ne1),
+    }
+}
+
+/// Instructions per group super-block of qdot's row-lane Q3_K tile, in
+/// [`tile_units`]' half-instruction units: the fixed unpack of one 8-row
+/// group per run of columns, and each column's share (the loop body of
+/// `qdot::dot_q3k_r8_cols` in the disassembly at C = 1 and 8, fitted as
+/// fixed + C · per column). Its unit is a group and [`tile_units`]' a row,
+/// so one lane cut weighs both.
+const R8_TILE_UNITS: (u64, u64) = (540, 506);
+
+/// The cost of one row-lane Q3_K group over `k` values against `ne1` columns
+/// in runs of up to [`qdot::TILE_COLS`], as `compute_groups` walks them;
+/// `None` where qdot does not run Q3_K fused.
+fn r8_tile_cost(k: usize, ne1: usize) -> Option<u64> {
+    if !qdot::supports(GgmlType::Q3_K) {
+        return None;
+    }
+    let (fixed, per_col) = R8_TILE_UNITS;
+    let m = ne1.max(1) as u64;
+    let sb = (k / 256) as u64;
+    Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
 }
 
 /// [`tile_cost`] of a fused row of `ty` over `k` values against `ne1` columns.
@@ -2693,15 +2966,16 @@ fn tile_cost_of(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
     Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
 }
 
-/// One lane of a row dispatch: the next unclaimed row and the lane's end, on
-/// its own cache line so an owner's claims do not fight its neighbours'.
+/// One lane of a row dispatch: the next unclaimed unit ([`RowSet`]) and the
+/// lane's end, on its own cache line so an owner's claims do not fight its
+/// neighbours'.
 #[repr(align(64))]
 struct Lane {
     next: std::sync::atomic::AtomicUsize,
     end: usize,
-    /// Rows per claim. Per lane, not per dispatch: cost-cut lanes differ in row
-    /// count, and a lane of few expensive rows claimed as one block leaves its
-    /// tail nothing to share.
+    /// Units per claim. Per lane, not per dispatch: cost-cut lanes differ in
+    /// unit count, and a lane of few expensive units claimed as one block
+    /// leaves its tail nothing to share.
     block: usize,
 }
 const MAX_LANES: usize = 64;
@@ -2763,38 +3037,43 @@ const UNION_BLOCK_ROWS: usize = 144;
 // blocks share a line only where one ends and the next begins.
 const _: () = assert!((UNION_BLOCK_ROWS * 4).is_multiple_of(64));
 
-/// The rows one row dispatch computes, as [`run_row_pool`] walks them: pairs
-/// laid end to end in one row space, each row a function of its pair and its
-/// index alone, so who computes it and where the space is cut change no bit.
+// A row-lane pass's block is whole groups: 18 of them.
+const _: () = assert!(UNION_BLOCK_ROWS.is_multiple_of(qdot::Q3K_R8_ROWS));
+
+/// The units one row dispatch computes, as [`run_row_pool`] walks them: pairs
+/// laid end to end in one space, a unit a matrix row or, for a row-lane pair,
+/// a group of [`qdot::Q3K_R8_ROWS`] rows ([`RowLayout::grain`]) — the "rows"
+/// of the walk. Each unit is a function of its pair and its index alone, so
+/// who computes it and where the space is cut change no bit.
 trait RowSet: Sync {
     /// The pairs.
     fn pairs(&self) -> usize;
-    /// The first row of pair `p`; `start(pairs())` is the row count.
+    /// The first unit of pair `p`; `start(pairs())` is the unit count.
     fn start(&self, p: usize) -> usize;
-    /// The pair whose rows hold row `r`, searched from pair `from` (at or
+    /// The pair whose units hold unit `r`, searched from pair `from` (at or
     /// before it) on.
     fn pair_at(&self, r: usize, from: usize) -> usize;
-    /// Pair `p`'s per-row lane cost: the tile's with `tile` ([`tile_cost`]),
+    /// Pair `p`'s per-unit lane cost: the tile's with `tile` ([`tile_cost`]),
     /// else its weight bytes once per input column ([`row_cost`]).
     fn cost(&self, p: usize, tile: bool) -> u64;
     /// Whether every pair has a tile cost, so the lanes may be cut by it.
     fn tile_costs(&self) -> bool;
-    /// The most rows a steal block takes; `None`, no cap.
+    /// The most units a steal block takes; `None`, no cap.
     fn block_cap(&self) -> Option<usize>;
-    /// A participant's first work, before any row: the dispatch's claims.
+    /// A participant's first work, before any unit: the dispatch's claims.
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc);
-    /// Rows `rows` of pair `p`.
+    /// Units `units` of pair `p`.
     fn compute(
         &self,
         p: usize,
-        rows: Range<usize>,
+        units: Range<usize>,
         lvl: u8,
         acc: &mut profile::CallAcc,
     ) -> Result<(), crate::ModelError>;
 }
 
-/// The group engine's pairs as a [`RowSet`]: their row starts, and the claim
-/// table of a deferred dispatch.
+/// The group engine's pairs as a [`RowSet`]: their unit starts, and the
+/// claim table of a deferred dispatch.
 struct GroupRows<'g, 'a> {
     pairs: &'g Flex<PairWork<'a>>,
     starts: Flex<usize>,
@@ -2804,11 +3083,12 @@ struct GroupRows<'g, 'a> {
 impl<'g, 'a> GroupRows<'g, 'a> {
     fn new(pairs: &'g Flex<PairWork<'a>>, deferred: Option<&'g DeferredSlots<'a>>) -> Self {
         let mut starts: Flex<usize> = Flex::new();
-        let mut total_rows = 0usize;
+        let mut total_units = 0usize;
         starts.push(0);
         for p in 0..pairs.len() {
-            total_rows += pairs.get(p).n;
-            starts.push(total_rows);
+            let w = pairs.get(p);
+            total_units += w.n / w.layout.grain();
+            starts.push(total_units);
         }
         GroupRows {
             pairs,
@@ -2860,11 +3140,13 @@ impl RowSet for GroupRows<'_, '_> {
     fn compute(
         &self,
         p: usize,
-        rows: Range<usize>,
+        units: Range<usize>,
         lvl: u8,
         acc: &mut profile::CallAcc,
     ) -> Result<(), crate::ModelError> {
-        self.pairs.get(p).compute_rows(rows, lvl, acc)
+        let w = self.pairs.get(p);
+        let g = w.layout.grain();
+        w.compute_rows(units.start * g..units.end * g, lvl, acc)
     }
 }
 
@@ -3237,8 +3519,8 @@ impl<'p> UnionPlanView<'p> {
 }
 
 /// One stack of a union call, read off its [`ExpertStack`]: the weight type,
-/// the values a row contracts, its rows, the bytes of a row, and the bytes of
-/// one input column in the type's encoding.
+/// the values a row contracts, its rows, the bytes of a row, the bytes of one
+/// input column in the type's encoding, and where its rows lie.
 #[derive(Clone, Copy)]
 pub(crate) struct UnionStack {
     ty: GgmlType,
@@ -3246,12 +3528,15 @@ pub(crate) struct UnionStack {
     n: usize,
     row_bytes: usize,
     cb: usize,
+    layout: RowLayout,
 }
 
 impl UnionStack {
     /// `s` as a stack of `n` rows of `k` values the union's passes can run —
     /// they run fused rows only. A stack of another shape is the named error
-    /// `what`; a type without a fused kernel at `k` is
+    /// `what`; rows that are not whole units of the stack's row layout (a
+    /// row-lane stack's groups) are [`crate::ModelError::HostLayout`]; a type
+    /// without a fused kernel at `k` is
     /// [`crate::ModelError::HostStack`], naming `what`, the stack, its type
     /// and `k`, which every expert of the stack shares.
     pub(crate) fn of(
@@ -3267,6 +3552,13 @@ impl UnionStack {
                 want_ne1: n,
                 got_ne0: s.k,
                 got_ne1: s.n,
+            });
+        }
+        if !n.is_multiple_of(s.layout.grain()) {
+            return Err(crate::ModelError::HostLayout {
+                what: "host union: a stack's rows must be whole units of its row layout",
+                tensor: s.name.to_owned(),
+                layout: s.layout.name(),
             });
         }
         let refusal = |why: qdot::QdotError| crate::ModelError::HostStack {
@@ -3291,18 +3583,22 @@ impl UnionStack {
             n,
             row_bytes: s.per / n,
             cb: qdot::col_bytes(s.ty, k),
+            layout: s.layout,
         })
     }
 
     /// A union call's `[gate, up, down]` stacks, each checked by
     /// [`UnionStack::of`]: gate and up map `embd -> ff`, down maps
-    /// `ff -> embd`. The one check both a call and a host tier's load make.
+    /// `ff -> embd`; the gate and the up share one row layout, so their pass
+    /// walks one kind of unit, and the down is read row after row — the r8
+    /// sidecar holds gates and ups only. The one check both a call and a host
+    /// tier's load make.
     pub(crate) fn of_call(
         stacks: &[ExpertStack<'_>; 3],
         embd: usize,
         ff: usize,
     ) -> Result<[UnionStack; 3], crate::ModelError> {
-        Ok([
+        let call = [
             UnionStack::of(
                 &stacks[0],
                 "host union: the gate must map embd -> ff",
@@ -3321,7 +3617,27 @@ impl UnionStack {
                 ff,
                 embd,
             )?,
-        ])
+        ];
+        let layout_refusal = |what: &'static str, s: &ExpertStack<'_>| {
+            Err(crate::ModelError::HostLayout {
+                what,
+                tensor: s.name.to_owned(),
+                layout: s.layout.name(),
+            })
+        };
+        if call[2].layout != RowLayout::Rows {
+            return layout_refusal(
+                "host union: the down must be read row after row",
+                &stacks[2],
+            );
+        }
+        if call[0].layout != call[1].layout {
+            return layout_refusal(
+                "host union: the up must share the gate's row layout",
+                &stacks[1],
+            );
+        }
+        Ok(call)
     }
 
     /// Whether `other`'s rows read this stack's input bytes: the same `k`,
@@ -3337,15 +3653,24 @@ impl UnionStack {
             k: self.k,
             n: self.n,
             row_bytes: self.row_bytes,
+            layout: self.layout,
         }
     }
 
-    /// A row's lane cost against `m` columns: the tile's with `tile`, else
+    /// Units of one expert's matrix: its rows, or its row-lane groups.
+    fn units(&self) -> usize {
+        self.n / self.layout.grain()
+    }
+
+    /// A unit's lane cost against `m` columns: the tile's with `tile`, else
     /// its bytes once per column ([`row_cost`]).
     fn cost(&self, m: usize, tile: bool) -> u64 {
-        match tile.then(|| tile_cost_of(self.ty, self.k, m)).flatten() {
+        match tile
+            .then(|| unit_tile_cost(self.ty, self.layout, self.k, m))
+            .flatten()
+        {
             Some(c) => c,
-            None => self.row_bytes as u64 * m.max(1) as u64,
+            None => (self.row_bytes * self.layout.grain()) as u64 * m.max(1) as u64,
         }
     }
 }
@@ -3523,10 +3848,12 @@ enum UnionPass {
     Down,
 }
 
-/// A union pass as a [`RowSet`]: pairs of equal row counts in expert order,
-/// pair `p` writing its expert's slots of the output slab — slot `q`'s column
-/// at `q · n` of the gate/up slab (expert `d`'s gate at slots `2·off[d]..`,
-/// its up right after) or of the down store (slots `off[d]..`).
+/// A union pass as a [`RowSet`]: pairs of equal unit counts in expert order —
+/// the pass's stacks share one row layout ([`UnionStack::of_call`]), so a
+/// unit is a row of every pair or a row-lane group of every pair — pair `p`
+/// writing its expert's slots of the output slab: slot `q`'s column at
+/// `q · n` of the gate/up slab (expert `d`'s gate at slots `2·off[d]..`, its
+/// up right after) or of the down store (slots `off[d]..`).
 struct UnionRows<'p, 'w> {
     pass: UnionPass,
     plan: UnionPlanView<'p>,
@@ -3551,6 +3878,11 @@ impl UnionRows<'_, '_> {
             UnionPass::Down => (p, 0),
         }
     }
+
+    /// Units of every pair.
+    fn units(&self) -> usize {
+        self.stacks[0].units()
+    }
 }
 
 impl RowSet for UnionRows<'_, '_> {
@@ -3562,13 +3894,13 @@ impl RowSet for UnionRows<'_, '_> {
     }
 
     fn start(&self, p: usize) -> usize {
-        p * self.stacks[0].n
+        p * self.units()
     }
 
     fn pair_at(&self, r: usize, _from: usize) -> usize {
-        let p = r / self.stacks[0].n;
-        // Row `start(pairs())` is the walk's end marker: it names the last
-        // pair, the one it ends. Every row before it lies inside pair `p`.
+        let p = r / self.units();
+        // Unit `start(pairs())` is the walk's end marker: it names the last
+        // pair, the one it ends. Every unit before it lies inside pair `p`.
         if p == self.pairs() { p - 1 } else { p }
     }
 
@@ -3580,11 +3912,11 @@ impl RowSet for UnionRows<'_, '_> {
     fn tile_costs(&self) -> bool {
         self.stacks
             .iter()
-            .all(|s| tile_cost_of(s.ty, s.k, 1).is_some())
+            .all(|s| unit_tile_cost(s.ty, s.layout, s.k, 1).is_some())
     }
 
     fn block_cap(&self) -> Option<usize> {
-        Some(UNION_BLOCK_ROWS)
+        Some(UNION_BLOCK_ROWS / self.stacks[0].layout.grain())
     }
 
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
@@ -3598,7 +3930,7 @@ impl RowSet for UnionRows<'_, '_> {
     fn compute(
         &self,
         p: usize,
-        rows: Range<usize>,
+        units: Range<usize>,
         lvl: u8,
         acc: &mut profile::CallAcc,
     ) -> Result<(), crate::ModelError> {
@@ -3628,7 +3960,12 @@ impl RowSet for UnionRows<'_, '_> {
         // cells each are pair `p`'s, inside the output slab, which holds every
         // slot of the plan (asserted where the pass is built).
         let out = unsafe { self.out.offset(first * st.n) };
-        PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(rows, lvl, acc)
+        let g = st.layout.grain();
+        PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(
+            units.start * g..units.end * g,
+            lvl,
+            acc,
+        )
     }
 }
 
@@ -4102,6 +4439,7 @@ fn matmul_q_one(
         k,
         n,
         row_bytes,
+        layout: RowLayout::Rows,
     });
     let mut out = Tensor2::scratch(n, x.ne1);
     // SAFETY: the construction-site argument in `run_group`'s pair build —
@@ -4276,9 +4614,9 @@ fn matmul_q_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertStack, GroupInput, Tensor2, UnionCall, UnionPlanView, UnionStack,
-        first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_swiglu, matvec_q_local,
-        parse_steal, parse_steal_blocks,
+        ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack, Weight,
+        first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu,
+        matvec_q_local, parse_steal, parse_steal_blocks,
     };
     use gguf::{GgmlType, Gguf};
 
@@ -4428,6 +4766,7 @@ mod tests {
             n_expert,
             per,
             bytes,
+            layout: RowLayout::Rows,
         }
     }
 
@@ -4509,6 +4848,136 @@ mod tests {
             "the refusal names the expert and the stack, got {e:?}"
         );
         println!("refusal id past the stack: {e}");
+    }
+
+    /// A stack in the row-lane layout is a union call's gate and up only, and
+    /// both or neither: an r8 down, an up whose layout is not the gate's, and
+    /// a row-lane stack whose rows are not whole groups are each refused by
+    /// name with the stack and its layout; an r8 gate and up over a row-order
+    /// down pass.
+    #[test]
+    fn union_stack_refuses_row_lane_layouts_where_they_do_not_stand() {
+        fn r8(s: ExpertStack<'_>) -> ExpertStack<'_> {
+            ExpertStack {
+                layout: RowLayout::R8,
+                ..s
+            }
+        }
+        let (embd, ff) = (256, 256);
+        let (mut b0, mut b1, mut b2) = (Vec::new(), Vec::new(), Vec::new());
+        let gate = stack("stack.gate", GgmlType::Q3_K, [embd, ff, 2], &mut b0);
+        let up = stack("stack.up", GgmlType::Q3_K, [embd, ff, 2], &mut b1);
+        let down = stack("stack.down", GgmlType::Q3_K, [ff, embd, 2], &mut b2);
+        let refusal = |r: Result<[UnionStack; 3], crate::ModelError>| match r {
+            Ok(_) => panic!("the stacks must be refused"),
+            Err(e) => e.to_string(),
+        };
+        let call = UnionStack::of_call(&[r8(gate), r8(up), down], embd, ff).unwrap();
+        assert_eq!(
+            call.map(|s| s.layout),
+            [RowLayout::R8, RowLayout::R8, RowLayout::Rows]
+        );
+        for (stacks, want) in [
+            (
+                [r8(gate), r8(up), r8(down)],
+                "host union: the down must be read row after row: stack.down is in the r8 row layout",
+            ),
+            (
+                [r8(gate), up, down],
+                "host union: the up must share the gate's row layout: stack.up is in the rows row layout",
+            ),
+            (
+                [gate, r8(up), down],
+                "host union: the up must share the gate's row layout: stack.up is in the r8 row layout",
+            ),
+        ] {
+            let e = refusal(UnionStack::of_call(&stacks, embd, ff));
+            assert_eq!(e, want);
+            println!("refusal layout: {e}");
+        }
+        let (mut b3, mut b4) = (Vec::new(), Vec::new());
+        let gate12 = stack("stack.gate", GgmlType::Q3_K, [embd, 12, 2], &mut b3);
+        let up12 = stack("stack.up", GgmlType::Q3_K, [embd, 12, 2], &mut b4);
+        let e = refusal(UnionStack::of_call(&[r8(gate12), r8(up12), down], embd, 12));
+        assert_eq!(
+            e,
+            "host union: a stack's rows must be whole units of its row layout: stack.gate is in the r8 row layout"
+        );
+        println!("refusal rows off the group grid: {e}");
+    }
+
+    /// Q3_K rows of random codes and scales, each block's f16 `d` 2^-7: finite
+    /// values of every magnitude the codes reach.
+    fn q3k_rows(k: usize, n: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut b: Vec<u8> = (0..k / 256 * 110 * n).map(|_| next() as u8).collect();
+        for blk in b.as_chunks_mut::<110>().0 {
+            blk[108..110].copy_from_slice(&0x2000u16.to_le_bytes());
+        }
+        b
+    }
+
+    /// A row-lane Q3_K matrix — `qdot::repack_q3k_r8` of a matrix's rows —
+    /// writes through the group engine the values its source rows write, bit
+    /// for bit: alone, and in one dispatch with a row-order pair (a unit is a
+    /// group of the one and a row of the other), at column counts that cut
+    /// the tile's runs evenly and unevenly (1, 2, 3, 8, 9, 17).
+    #[test]
+    fn row_lane_pairs_write_their_source_rows_values() {
+        let (k, n) = (512, 48);
+        let rows = q3k_rows(k, n, 0x8a11);
+        let mut lanes = vec![0u8; rows.len()];
+        qdot::repack_q3k_r8(&rows, n, k, &mut lanes).unwrap();
+        let file = Weight {
+            ty: GgmlType::Q3_K,
+            k,
+            n,
+            bytes: &rows,
+            layout: RowLayout::Rows,
+        };
+        let r8 = Weight {
+            bytes: &lanes,
+            layout: RowLayout::R8,
+            ..file
+        };
+        let bits = |t: &Tensor2| t.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for cols in [1, 2, 3, 8, 9, 17] {
+            let x = Tensor2::from_vec(
+                k,
+                cols,
+                (0..k * cols)
+                    .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                    .collect(),
+            );
+            let mut want = [Tensor2::zeros(n, cols)];
+            matmul_q_group_into("test", &[file], &[&x], &mut want).unwrap();
+            let mut alone = [Tensor2::zeros(n, cols)];
+            matmul_q_group_into("test", &[r8], &[&x], &mut alone).unwrap();
+            let mut mixed = [Tensor2::zeros(n, cols), Tensor2::zeros(n, cols)];
+            matmul_q_group_into("test", &[file, r8], &[&x, &x], &mut mixed).unwrap();
+            assert!(
+                want[0].data.iter().all(|v| v.is_finite() && *v != 0.0),
+                "{cols} columns: the oracle's values are finite and not zero"
+            );
+            for (what, got) in [
+                ("alone", &alone[0]),
+                ("beside a row-order pair", &mixed[1]),
+                ("the row-order pair", &mixed[0]),
+            ] {
+                assert_eq!(
+                    bits(got),
+                    bits(&want[0]),
+                    "{cols} columns, {what}: not the source rows' values"
+                );
+            }
+        }
+        println!("row-lane pairs: equal to their source rows at 1, 2, 3, 8, 9 and 17 columns");
     }
 
     /// The first column holding a value that is not finite is found wherever

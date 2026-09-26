@@ -82,6 +82,7 @@ use gguf::Split;
 use model::moe::EXPERTS_INTO_MAX;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
 use model::placement::{ModelTensor, Plan};
+use model::r8file::HostR8;
 use model::{Tensor2, Tensor2View};
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -216,8 +217,9 @@ fn flag(name: &str, default: bool) -> Result<bool, String> {
 }
 
 /// What a placed load did to its plan's host set: populated it, locked it,
-/// both or neither ([`HostLevers`]). Holds the lock, when there is one, for
-/// as long as it lives; its owner keeps the split's mappings alive longer.
+/// both or neither ([`HostLevers`]), in the files the host tier reads
+/// ([`HostR8`]). Holds the lock, when there is one, for as long as it lives;
+/// its owner keeps the split's mappings alive longer.
 pub struct HostResidency {
     set: HostSet,
     populate: Option<Walk>,
@@ -227,7 +229,11 @@ pub struct HostResidency {
 impl HostResidency {
     /// The host set of `plan` over `split` — the host segments whose tensor
     /// `keep` selects — populated, then locked, as `levers` ask. Populating
-    /// first makes the lock a walk over resident pages.
+    /// first makes the lock a walk over resident pages. When the host tier
+    /// reads the r8 sidecar ([`HostR8::at_load`], the same reading and the
+    /// same mapping a V4.1 host tier's build takes), the stacks it holds are
+    /// walked in its mapping and their source pages are not; everything else
+    /// is the source's.
     pub fn at_load(
         split: &Split,
         plan: &Plan<'_>,
@@ -235,7 +241,12 @@ impl HostResidency {
         levers: HostLevers,
     ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
-        let set = HostSet::of(split, plan, keep).map_err(|e| GpuError::plan(WHAT, e))?;
+        let r8 = HostR8::at_load(split)?;
+        let set = match r8.sidecar() {
+            Some(side) => HostSet::of_r8(split, side, plan, keep),
+            None => HostSet::of(split, plan, keep),
+        }
+        .map_err(|e| GpuError::plan(WHAT, e))?;
         let populate = levers
             .populate
             .then(|| set.populate(split))

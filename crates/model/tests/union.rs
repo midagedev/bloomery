@@ -65,6 +65,15 @@
 //! scratch's refusals (no batch or too many, a budget under one batch's
 //! worst or past its columns') join the refusals below.
 //!
+//! The r8 lane — a layer whose gate and up come from the r8 sidecar, the
+//! row-lane tile over 8-row groups — is held to the file's rows on a
+//! synthetic layer (`common/r8layer.rs`: Q3_K gate and up, Q4_K down, its
+//! sidecar made by `r8file::convert`, which is `qdot::repack_q3k_r8`): the
+//! union call at k = 1, 8, 9, 64 and 512 and `experts_into` of every column
+//! equal, bit for bit, `experts_into` of the same layer read from the file
+//! (each row's `dot_row`), under both deferral arms, in the calls'
+//! dispatches.
+//!
 //! PIN(2026-09-26): the four-expert routing runs whole — the scratch's slabs
 //! are indexed by slot, so no expert's column count bounds a call.
 //!
@@ -75,18 +84,23 @@
 //! `hw_`: needs the V4.1 shards, the oracle set and V2-Lite on the box
 //! (`just gate-union`).
 
+#[path = "common/r8layer.rs"]
+mod r8layer;
 #[path = "common/v41set.rs"]
 mod v41set;
 
-use gguf::Split;
+use std::sync::Arc;
+
+use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{
     EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_BATCH_SLOTS, UNION_MAX_COLS,
     UNION_TAIL_MAX_GROUPS, UnionScratch,
 };
-use model::ops::{self, Tensor2, Tensor2View};
+use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
+use model::r8file::Sidecar;
 
 /// The oracle set: the V4.1 node dumps' 5-token batch set.
 const SET: &str = refset::arch::deepseek41::BATCH;
@@ -1096,4 +1110,104 @@ fn hw_union_file_matches_per_column_v2lite() {
         "the one-file union entry issues its calls' dispatches"
     );
     println!("PASSED: union v2lite — experts_union_into (one file) equals experts_into per column");
+}
+
+/// The r8 lane's synthetic layer: `embd`, `ff` and experts. A gate row is two
+/// super-blocks, an expert 32 row-lane groups — past the 18 of a steal block,
+/// so blocks cut experts — and the lists draw from all 32 experts.
+const R8_LAYER: (usize, usize, usize) = (512, 256, 32);
+
+/// The r8 lane's column counts: one column, the widest call that claims, the
+/// narrowest past the claims, and two wide calls whose experts carry many
+/// columns (tile runs cut evenly, of every length up to eight).
+const R8_KS: [usize; 5] = [1, 8, 9, 64, 512];
+
+#[test]
+#[ignore = "hw: the box's CPU (the row-lane tile runs on AVX2); reads no model file"]
+fn hw_union_r8_matches_file_rows() {
+    let layer = r8layer::Layer::write("union", R8_LAYER.0, R8_LAYER.1, R8_LAYER.2, GgmlType::Q4_K);
+    let (embd, ff, n_expert) = (layer.embd, layer.ff, layer.n_expert);
+    let split = Split::open(&layer.source).unwrap();
+    let side = Arc::new(
+        Sidecar::open(&layer.sidecar, &split, Weights::Mapped { populate: false })
+            .unwrap_or_else(|e| panic!("open {}: {e}", layer.sidecar.display())),
+    );
+    let spec = layer.spec();
+    let rows = HostLayer::build(&split, &spec).unwrap();
+    let r8 = HostLayer::build_r8(&split, &spec, Some(&side)).unwrap();
+    assert_eq!(
+        r8.layouts(0).unwrap(),
+        [RowLayout::R8, RowLayout::R8, RowLayout::Rows],
+        "the gate and the up are the sidecar's"
+    );
+    let x_all: Vec<f32> = (0..4).flat_map(|t| seeded(embd, 0x7e8 + t)).collect();
+    let mut host = HostScratch::new(embd, ff);
+    let mut us = UnionScratch::new(embd, ff, UNION_MAX_COLS).expect("a scratch of UNION_MAX_COLS");
+    let mut failed: Vec<(usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, &str)> = Vec::new();
+    let mut spread = (usize::MAX, 0usize);
+    for k in R8_KS {
+        let case = wide_case(&x_all, embd, k, n_expert, n_expert);
+        let want = per_column(&rows, &split, &case, &mut host);
+        assert!(
+            want.iter().all(|v| v.is_finite()),
+            "k {k}: the file's rows give finite values"
+        );
+        let decode = per_column(&r8, &split, &case, &mut host);
+        let dd = diff_cells(&decode, &want);
+        if dd != 0 {
+            failed.push((k, "experts_into"));
+        }
+        let (lo, hi, past) = cols_per_expert(&case);
+        spread = (spread.0.min(lo), spread.1.max(hi));
+        let lists = case.slices();
+        let mut line = format!(
+            "r8 k={k} slots={} union={} cols_per_expert={lo}..{hi} past_one_run={past} \
+             experts_into: diff_cells={dd}",
+            case.slots(),
+            case.union()
+        );
+        let mut clean = dd == 0;
+        for (arm, on) in ARMS {
+            ops::set_defer_quant(Some(on));
+            let mut got = vec![f32::NAN; embd * k];
+            let (r, ds, dp) = dispatched(&mut us, |us| {
+                r8.experts_union_into(&split, &case.x, &lists, &mut got, us)
+            });
+            ops::set_defer_quant(None);
+            r.unwrap_or_else(|e| panic!("r8 k {k} {arm}: {e}"));
+            let d = diff_cells(&got, &want);
+            let want_d = call_dispatches(k, case.slots(), on);
+            line += &format!(" {arm}: diff_cells={d} {}", dispatch_note(ds, dp, want_d));
+            if d != 0 {
+                failed.push((k, arm));
+                clean = false;
+            }
+            if !dispatches_ok(ds, dp, want_d) {
+                miscounted.push((k, arm));
+                clean = false;
+            }
+        }
+        println!("{line} {}", if clean { "PASS" } else { "FAIL" });
+    }
+    assert!(
+        spread.0 <= 1 && spread.1 > 2 * qdot::TILE_COLS,
+        "the cases must give experts one column and experts several tile runs, got {spread:?}"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} (k, call) r8 cases differ from the file's rows: {failed:?}",
+        failed.len()
+    );
+    assert!(
+        miscounted.is_empty(),
+        "{} (k, arm) r8 calls issued other than their dispatches: {miscounted:?}",
+        miscounted.len()
+    );
+    println!(
+        "PASSED: union r8 — a layer whose gate and up are the sidecar's row-lane copies equals the \
+         file's rows column for column, bit for bit, through experts_into and the union call at \
+         k = 1, 8, 9, 64, 512 under both deferral arms, in 2 / 4 pool dispatches a call up to \
+         k = 8 and 5 past it"
+    );
 }
