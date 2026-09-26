@@ -254,15 +254,22 @@ logits vs element-wise sqrt-softplus; sigmoid joins them), the tie rule (V2-Lite
 `router.rs:11`; V4.1: larger id wins, `gpu-deepseek41/src/router.rs:22-24`), and the compile-time
 widths (`N_EXPERT`, `N_USED`, which size shared arrays). Carry them as a const-generic core
 `route::<SCORE, TIE, N_EXPERT, N_USED>` marked `#[inline(always)]`, with the bias, norm and scale as
-launch arguments; each arch keeps its own `#[kernel]` wrapper, so no existing kernel's PTX changes.
+launch arguments; each arch keeps its own `#[kernel]` wrapper~~, so no existing kernel's PTX changes.
 Proof for the refactor is the move class: `just ptx-scan` table identical and the V4.1 and V2-Lite
-router gates' verdict lines identical. Each new arch adds a wrapper and its gate.
+router gates' verdict lines identical~~. Corrected 2026-09-27: on this toolchain a function boundary
+around the selection loop, even one with scalar arguments, changes the kernel's instruction stream
+(`docs/upstream/nvlabs-ledger.md` #20, `crates/gpu/src/route_core.rs:9-12`), so a shared core keeps
+the PTX only at leaf grain — the score and the tie rule, which is what `route_core.rs` shares; a core
+that carries the loop is a codegen change proved by the bit gates, not a move. Each new arch adds a
+wrapper and its gate.
 
 **Attention: no trait.** Attention kernels, their KV topology and their step inputs are the places
 the types differ (arch-split principle 1). What is shared is the kernel library: a GQA flash-decode
-kernel goes in `crates/gpu/src/` beside `flash.rs` (shape-named, head dim and GQA ratio as launch
-arguments), because Qwen3, GLM-4.x and the full-attention layers of Qwen3.5+ and Qwen3.8-Flash-Next
-all use it. A delta-rule recurrent kernel (KDA for GLM-5.3-Flash, Gated DeltaNet for Qwen3.5+) is one
+kernel goes in `crates/gpu/src/` beside `flash.rs` (shape-named~~, head dim and GQA ratio as launch
+arguments~~; corrected 2026-09-27: the head dim and the GQA ratio size its register arrays, its MMA
+fragment roles and its shared-memory layout, so they are instance keys, and only n_kv, ctx and m are
+launch arguments — the kernelshape report, `docs/plan-triage.md` 「03 재구성이 남긴 것」),
+because Qwen3, GLM-4.x and the full-attention layers of Qwen3.5+ and Qwen3.8-Flash-Next all use it. A delta-rule recurrent kernel (KDA for GLM-5.3-Flash, Gated DeltaNet for Qwen3.5+) is one
 family and one later program; that they can share one kernel is a hypothesis this round did not
 check (ik has them in separate files, `src/llama-kda.cpp` and `src/llama-delta-net.cpp`).
 
