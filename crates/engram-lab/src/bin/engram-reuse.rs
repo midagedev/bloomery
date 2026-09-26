@@ -28,12 +28,12 @@
 //!
 //! ## How the hit rates are computed
 //!
-//! One pass, exact LRU for every capacity at once: [`engram::reuse::Lru`], by
+//! One pass, exact LRU for every capacity at once: [`engram_lab::reuse::Lru`], by
 //! stack distance. An LRU of `C` rows serves an access iff fewer than `C`
 //! distinct rows were touched since that row's last access, so one distance per
 //! access answers every capacity consistently, and a first touch is a
 //! compulsory miss at every size. The row cache's gates hold
-//! [`engram::cache::LruIndex`] to the same simulator.
+//! [`engram_lab::cache::LruIndex`] to the same simulator.
 //!
 //! ## What the tables say
 //!
@@ -53,9 +53,10 @@ use std::collections::HashSet;
 use std::env;
 use std::process::ExitCode;
 
-use engram::cache::{capacity_rows, key_of};
-use engram::reuse::{Lru, read_ids};
-use engram::{Context, Hash};
+use engram::Hash;
+use engram_lab::Context;
+use engram_lab::cache::{capacity_rows, key_of};
+use engram_lab::reuse::{Lru, read_ids};
 
 /// 256 Q8_0 values: 8 blocks of 34 B.
 const ROW_BYTES: u64 = 272;
@@ -164,7 +165,7 @@ fn run() -> Result<(), String> {
     let mut ctx = Context::new(&hash);
     let mut ids = vec![0u32; n_cols];
     for &token in &tokens {
-        ctx.push(token);
+        ctx.push(token).map_err(|e| e.to_string())?;
         let window = ctx.window();
         for (o, seen) in ngrams.iter_mut().enumerate() {
             seen.insert(fold(&window[..=o + 1]));

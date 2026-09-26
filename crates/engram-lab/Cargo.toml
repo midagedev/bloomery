@@ -1,18 +1,17 @@
 [package]
-name = "bloomery-engram"
+name = "bloomery-engram-lab"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
 
 [lib]
-name = "engram"
+name = "engram_lab"
 
 [lints]
 workspace = true
 
 [dependencies]
+bloomery-engram = { path = "../engram" }
 bloomery-gguf = { path = "../gguf" }
-libc.workspace = true
-memmap2.workspace = true
 thiserror.workspace = true

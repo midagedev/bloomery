@@ -1,22 +1,15 @@
-//! Gates for the engram crate: what the mapping serves, which rows the hash
-//! asks it for, and what the row cache in front of it serves. Not how fast —
-//! speed belongs to `engram-rate` under a lease. The identity gates read only
-//! the rows they name, a few hundred page faults; the cache's serving gate
-//! reads what a few thousand tokens of a real stream ask for, and its
-//! exactness gate reads no row at all.
+//! Gates for the engram crate: what the mapping serves, and which rows the
+//! hash asks it for. Not how fast — speed belongs to `engram-rate` under a
+//! lease. The identity gates read only the rows they name, a few hundred page
+//! faults.
 //!
-//! `hw_` prefix: these need the box and the V4.1 split, and the cache gates
-//! also the token streams `just engram-corpus` writes. They do not need the
+//! `hw_` prefix: these need the box and the V4.1 split. They do not need the
 //! oracle — the reference here is the file itself, read a second way.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 
-use engram::cache::{Access, LruIndex, RowCache, capacity_rows, key_of};
-use engram::prefetch::{FillMode, Prefetcher};
-use engram::reuse::{Lru, read_ids};
-use engram::{Context, Engram, EngramError, Hash, SeededRows, Site};
+use engram::{Engram, EngramError, Site};
 
 /// The split set the gates open: the directory of [`gguf::v41::model`].
 fn model_dir() -> String {
@@ -33,32 +26,18 @@ fn open() -> Engram {
     })
 }
 
-/// `$BLOOMERY_DATA/engram/corpus-<name>.ids`: a real token stream.
-fn corpus(name: &str) -> Vec<u32> {
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    let path = format!("{data}/engram/corpus-{name}.ids");
-    read_ids(&path).unwrap_or_else(|e| {
-        panic!(
-            "{e}. The token streams are written on the box by `just engram-corpus`; \
-             run it. Do not skip this test."
-        )
-    })
-}
+/// Ids uniform over a range from a fixed seed (splitmix64), so a gate reads
+/// the same rows on every run.
+struct Draw(u64);
 
-/// Walk a token stream the way the cache is fed: per token, sites in order,
-/// and within a site the buckets in `Hash::rows_into` order — the order
-/// `engram-reuse` feeds its simulator. `f` gets `(site, bucket, row id)`.
-fn walk(hash: &Hash, tokens: &[u32], mut f: impl FnMut(usize, usize, u32)) {
-    let mut ctx = Context::new(hash);
-    let mut ids = vec![0u32; hash.n_cols()];
-    for &token in tokens {
-        ctx.push(token);
-        for site in 0..hash.sites() {
-            hash.rows_into(site, ctx.window(), &mut ids).unwrap();
-            for (bucket, &id) in ids.iter().enumerate() {
-                f(site, bucket, id);
-            }
-        }
+impl Draw {
+    /// The next id in `0..n`.
+    fn below(&mut self, n: u64) -> u32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) % n) as u32
     }
 }
 
@@ -84,10 +63,8 @@ fn sample(site: &Site, n: usize) -> Vec<u32> {
         });
     ids.push(straddler);
 
-    let mut rng = SeededRows::new(0xB3E7_A001);
-    let mut drawn = Vec::new();
-    rng.next_into(site.rows(), n, &mut drawn);
-    ids.extend(drawn);
+    let mut draw = Draw(0xB3E7_A001);
+    ids.extend((0..n).map(|_| draw.below(site.rows())));
     ids
 }
 
@@ -292,10 +269,12 @@ fn reference_rows(hash: &engram::Hash, site: usize, window: &[u64], out: &mut [u
 /// bucket; the ids drawn here are the third fact, checked rather than argued,
 /// because the arithmetic that produces them is the part that can be wrong.
 ///
-/// The contexts cover the three shapes that differ: ids inside the map, ids
-/// past its end (which must map to pad, not panic or index), and a window fresh
-/// from `reset()`, where every older slot is pad — the sequence start the port
-/// spends one token in.
+/// The windows cover the two shapes that differ: every slot a token inside
+/// the map, and a window fresh from a sequence start, where every older slot
+/// is pad — the start the port spends one token in. A third of the ids drawn
+/// are past the map's end; the map is the whole vocabulary, so each of those
+/// is not a token of the model and must be refused by name, with its id and
+/// the map's length, never mapped to a value a window could carry.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_hash_buckets_partition_the_table() {
@@ -315,7 +294,7 @@ fn hw_engram_hash_buckets_partition_the_table() {
     );
 
     let vocab = hash.token_map().len() as u32;
-    let mut rng = SeededRows::new(0xB3D0_1CE5);
+    let mut draw = Draw(0xB3D0_1CE5);
     let mut ids = vec![0u32; n_cols];
 
     for (e, site) in engram.sites().iter().enumerate() {
@@ -341,44 +320,32 @@ fn hw_engram_hash_buckets_partition_the_table() {
             at += p;
         }
 
-        // 10,000 contexts: two thirds inside the vocabulary, one third past its
-        // end, and every hundredth window starting fresh from a reset.
-        let mut ctx = Context::new(hash);
-        let mut draw = Vec::new();
+        // 10,000 draws: two thirds inside the vocabulary, one third past its
+        // end, and every hundredth window starting fresh at a sequence start.
+        let mut window = vec![hash.pad_id(); hash.n_gram()];
         let mut want = vec![0u32; n_cols];
         for n in 0..10_000u32 {
-            let fresh = n % 100 == 0;
-            if fresh {
-                ctx.reset();
+            if n % 100 == 0 {
+                window.fill(hash.pad_id());
             }
-            let previous = ctx.window()[0];
-            rng.next_into(u64::from(vocab) * 3 / 2, 1, &mut draw);
-            ctx.push(draw[0]);
-
-            // The window's slot order is what `reference_rows` cannot check:
-            // it is handed the window and would agree with a shift the wrong
-            // way. Slot 0 is the token just pushed, slot 1 the one before it,
-            // and after a reset every older slot is pad.
-            let window = ctx.window();
-            assert_eq!(
-                window[0],
-                hash.map_token(draw[0]),
-                "context {n}: slot 0 must be the token just pushed, mapped"
-            );
-            if fresh {
-                assert!(
-                    window[1..].iter().all(|&v| v == hash.pad_id()),
-                    "context {n}: after a reset every older slot must be pad, \
-                     the value the port substitutes before a sequence starts"
-                );
-            } else {
-                assert_eq!(
-                    window[1], previous,
-                    "context {n}: slot 1 must be what slot 0 held before the push"
-                );
-            }
-            hash.rows_into(e, ctx.window(), &mut ids).unwrap();
-            reference_rows(hash, e, ctx.window(), &mut want);
+            let token = draw.below(u64::from(vocab) * 3 / 2);
+            let mapped = match hash.map_token(token) {
+                Ok(mapped) if token < vocab => mapped,
+                Err(EngramError::TokenPastMap { token: t, map })
+                    if t == token && token >= vocab && map == vocab as usize =>
+                {
+                    continue;
+                }
+                other => panic!(
+                    "context {n}: token {token} against a map of {vocab} entries gave \
+                     {other:?}: an id inside the map maps, an id past its end is refused \
+                     by name with its id and the map's length"
+                ),
+            };
+            window.rotate_right(1);
+            window[0] = mapped;
+            hash.rows_into(e, &window, &mut ids).unwrap();
+            reference_rows(hash, e, &window, &mut want);
             assert_eq!(
                 ids,
                 want,
@@ -415,10 +382,9 @@ fn hw_engram_hash_buckets_partition_the_table() {
 /// line rests on. Both halves have a witness inside the same file, so neither
 /// is a literal: the domain is checked against `tokenizer.ggml.tokens`, and the
 /// codomain's density is checked against itself — a map with a hole would be a
-/// compression that lost a slot, and `map_token` for an id past the domain
-/// would then be indistinguishable from a real value. The pad the port
-/// substitutes there must itself be inside the codomain, or a sequence start
-/// would address a row no trained embedding sits in.
+/// compression that lost a slot. The pad a window takes before the sequence
+/// starts must itself be inside the codomain, or a sequence start would
+/// address a row no trained embedding sits in.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_token_map_is_the_compressed_vocabulary() {
@@ -466,209 +432,5 @@ fn hw_engram_token_map_is_the_compressed_vocabulary() {
         "pad {} is outside the codomain 0..={max}, so a sequence start would \
          address a row the model never trained",
         hash.pad_id()
-    );
-}
-
-/// The row cache's index is exact LRU: over a real stream, through the real
-/// hash, its misses are the stack-distance simulator's to the integer at every
-/// capacity, and once full it holds exactly its capacity.
-///
-/// Two algorithms that share nothing but the definition — a hash table and a
-/// linked list claiming and evicting slots one access at a time, and a Fenwick
-/// tree counting the distinct rows between two touches of the same one — so an
-/// eviction from the wrong end, or a probe that loses a key, shows up as a
-/// count that differs. The index runs without a payload, which is what lets the
-/// largest budget run here at all.
-///
-/// The capacities are chosen for what can hide. The budgets `engram-reuse`
-/// reports are here, but at 4 and 16 GiB neither stream fills the cache and the
-/// prose stream does not fill even 1 GiB, so two budgets below both streams'
-/// distinct rows make eviction happen on both. A capacity one row off changes
-/// the misses only through accesses at stack distance exactly `C - 1`, and deep
-/// in a stream those are sparse — the heads of one order re-hit together, at
-/// one shared distance — so the budgets alone can agree with a cache a row
-/// short. The two small capacities sit where nearly every distance is taken:
-/// one token's rows, where a row the next token asks again is at distance one
-/// token minus one, and a few thousand. The count of keys held is the same
-/// check without the stream's help.
-#[test]
-#[ignore = "hw: needs the box, the V4.1 split's headers and the token streams"]
-fn hw_engram_cache_is_exact_lru() {
-    const MIB: u64 = 1 << 20;
-    let engram = open();
-    let hash = engram.hash();
-    let row_bytes = engram.sites()[0].row_bytes();
-    let token = (hash.sites() * hash.n_cols()) as u64;
-    let mut caps: Vec<(String, u64)> = [token, 4096]
-        .into_iter()
-        .map(|rows| (format!("{} B", rows * row_bytes), rows))
-        .collect();
-    for mib in [64, 256, 1024, 4096, 16384] {
-        caps.push((format!("{mib} MiB"), capacity_rows(mib * MIB, row_bytes)));
-    }
-    let rows: Vec<u64> = caps.iter().map(|&(_, rows)| rows).collect();
-
-    let mut disagree = Vec::new();
-    for name in ["code", "prose"] {
-        let tokens = corpus(name);
-        let mut lru = Lru::new(tokens.len() * hash.sites() * hash.n_cols(), &rows);
-        walk(hash, &tokens, |site, bucket, id| {
-            lru.access(key_of(site, id), site, hash.order_of_bucket(bucket) - 2)
-                .unwrap();
-        });
-        let total = lru.total().clone();
-        let distinct = lru.distinct() as u64;
-        drop(lru);
-
-        for (i, (label, cap)) in caps.iter().enumerate() {
-            let mut index = LruIndex::new(usize::try_from(*cap).unwrap()).unwrap();
-            let allocated = index.allocated_bytes();
-            let mut misses = 0u64;
-            walk(hash, &tokens, |site, _, id| {
-                if let Access::Miss(_) = index.access(key_of(site, id)) {
-                    misses += 1;
-                }
-            });
-            let want = total.requests - total.hits[i];
-            let held = index.len() as u64;
-            let want_held = distinct.min(*cap);
-            let agree = misses == want && held == want_held;
-            println!(
-                "exact-lru {name} {cap} rows ({label}): stack distance {want} misses, \
-                 linked list {misses}; holds {held} of {want_held} — {}",
-                if agree { "agree" } else { "DISAGREE" }
-            );
-            if !agree {
-                disagree.push(format!(
-                    "{name} at {cap} rows: misses {want} vs {misses}, held {want_held} vs {held}"
-                ));
-            }
-            assert_eq!(
-                index.allocated_bytes(),
-                allocated,
-                "{name} at {cap} rows: the index allocated during the run"
-            );
-        }
-    }
-    assert!(
-        disagree.is_empty(),
-        "the linked-list LRU disagrees with the stack-distance simulator: {disagree:?}"
-    );
-}
-
-/// Every row the cache serves — a hit out of its slab, or a miss the helper
-/// filled — is the table's own bytes, and the cache hits exactly where the
-/// stack-distance simulator says an LRU of its size would.
-///
-/// A small cache over a real stream evicts on nearly every miss, so its slots
-/// are reused all the time: a hit copied from the wrong slot, a fill landed in
-/// the wrong one, or an eviction that left a stale key behind serves some other
-/// row's bytes, and the comparison against `Site::row` — the mapping read that
-/// `hw_engram_rows_match_pread` ties to `pread` — sees it. The payloads go
-/// through the real `Prefetcher`, misses only. And a row still pending is never
-/// served: a lookup before the last token's misses were completed, and a token
-/// that names one row twice, are both refused.
-#[test]
-#[ignore = "hw: needs the box, the V4.1 split and the token streams"]
-fn hw_engram_cache_serves_table_bytes() {
-    const TOKENS: usize = 3000;
-    const CAPACITY: usize = 4096;
-    let engram = Arc::new(open());
-    let hash = engram.hash();
-    let sites = engram.sites();
-    let rb = sites[0].row_bytes() as usize;
-    assert!(
-        sites.iter().all(|s| s.row_bytes() as usize == rb),
-        "the slab has one row stride for every site"
-    );
-    let n_cols = hash.n_cols();
-    let rows_per_site = vec![n_cols; sites.len()];
-
-    let stream = corpus("code");
-    let tokens = stream.get(..TOKENS).unwrap_or_else(|| {
-        panic!(
-            "corpus-code has {} tokens and this gate reads the first {TOKENS}; \
-             rerun `just engram-corpus`",
-            stream.len()
-        )
-    });
-    let mut cache = RowCache::new(CAPACITY, rb, &rows_per_site).unwrap();
-    let mut pf = Prefetcher::new(Arc::clone(&engram), &rows_per_site, FillMode::Touch).unwrap();
-    let mut lru = Lru::new(TOKENS * sites.len() * n_cols, &[CAPACITY as u64]);
-    let allocated = cache.allocated_bytes();
-
-    let mut out = vec![0u8; cache.token_bytes()];
-    let mut ids = vec![vec![0u32; n_cols]; sites.len()];
-    let mut ctx = Context::new(hash);
-    let (mut hits, mut misses, mut no_trip) = (0u64, 0u64, 0u64);
-    for (t, &token) in tokens.iter().enumerate() {
-        ctx.push(token);
-        for (site, site_ids) in ids.iter_mut().enumerate() {
-            hash.rows_into(site, ctx.window(), site_ids).unwrap();
-            for (bucket, &id) in site_ids.iter().enumerate() {
-                lru.access(key_of(site, id), site, hash.order_of_bucket(bucket) - 2)
-                    .unwrap();
-            }
-        }
-        // A row the cache failed to write reads as zeros, not as the bytes the
-        // same place held for the last token.
-        out.fill(0);
-        let got = cache.lookup(&ids, &mut out).unwrap();
-        pf.submit(cache.miss_ids()).unwrap();
-        pf.wait().unwrap();
-        cache.complete(pf.filled(), &mut out).unwrap();
-        hits += got.hits as u64;
-        misses += got.misses as u64;
-        no_trip += u64::from(got.misses == 0);
-
-        for (site, site_ids) in ids.iter().enumerate() {
-            for (bucket, &id) in site_ids.iter().enumerate() {
-                let at = (site * n_cols + bucket) * rb;
-                assert_eq!(
-                    &out[at..at + rb],
-                    sites[site].row(id).unwrap(),
-                    "token {t}, site {site} bucket {bucket}, row {id}: the cache served \
-                     bytes that are not the table's"
-                );
-            }
-        }
-    }
-    let total = lru.total();
-    let want = (total.hits[0], total.requests - total.hits[0]);
-    println!(
-        "serves-table-bytes: {TOKENS} tokens at {CAPACITY} rows, every row byte-identical \
-         to Site::row; cache {hits} hits {misses} misses ({no_trip} tokens with no helper \
-         round trip), stack distance {} hits {} misses",
-        want.0, want.1
-    );
-    assert_eq!(
-        (hits, misses),
-        want,
-        "the cache's hits and misses differ from an LRU of {CAPACITY} rows over the same accesses"
-    );
-    assert_eq!(
-        cache.allocated_bytes(),
-        allocated,
-        "the cache allocated during the run"
-    );
-
-    // A fresh cache misses the whole token, so every row of it is pending.
-    let mut early = RowCache::new(CAPACITY, rb, &rows_per_site).unwrap();
-    early.lookup(&ids, &mut out).unwrap();
-    let refused = early.lookup(&ids, &mut out);
-    println!("serves-table-bytes: a lookup before complete -> {refused:?}");
-    assert!(
-        matches!(refused, Err(EngramError::Cache(_))),
-        "a lookup before the last token's misses were completed must be refused"
-    );
-    // The second name of a row would find the first one's slot unfilled.
-    let mut twice = ids.clone();
-    twice[0][1] = twice[0][0];
-    let mut doubled = RowCache::new(CAPACITY, rb, &rows_per_site).unwrap();
-    let refused = doubled.lookup(&twice, &mut out);
-    println!("serves-table-bytes: a token naming one row twice -> {refused:?}");
-    assert!(
-        matches!(refused, Err(EngramError::Cache(_))),
-        "a hit on a pending slot must be refused, not served"
     );
 }

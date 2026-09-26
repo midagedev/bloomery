@@ -350,7 +350,7 @@ fn engram(
             for (slot, &token) in ctx.iter_mut().zip(window) {
                 blocked |= token.is_none();
                 *slot = match token {
-                    Some(t) if !blocked => hash.map_token(t),
+                    Some(t) if !blocked => hash.map_token(t)?,
                     _ => hash.pad_id(),
                 };
             }

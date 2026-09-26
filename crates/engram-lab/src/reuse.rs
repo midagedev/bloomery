@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::EngramError;
+use crate::LabError;
 
 /// What one slice of the stream asked for.
 #[derive(Clone, Debug)]
@@ -81,9 +81,9 @@ impl Lru {
     /// More accesses than [`Lru::new`] was sized for is an error: the mark of
     /// the extra access would fall past the end of the tree and every later
     /// distance would be short.
-    pub fn access(&mut self, key: u64, site: usize, order: usize) -> Result<(), EngramError> {
+    pub fn access(&mut self, key: u64, site: usize, order: usize) -> Result<(), LabError> {
         if self.pos + 1 >= self.fenwick.len() {
-            return Err(EngramError::Reuse(
+            return Err(LabError::Reuse(
                 "more accesses than the simulator was sized for",
             ));
         }
@@ -191,9 +191,9 @@ impl Lru {
 /// A token stream as `tools/ref/engram-corpus.sh` writes it: one decimal id
 /// per line, blank lines ignored. Text rather than packed `u32` so the file
 /// greps, diffs and truncates like everything else in `$BLOOMERY_DATA`.
-pub fn read_ids(path: impl AsRef<Path>) -> Result<Vec<u32>, EngramError> {
+pub fn read_ids(path: impl AsRef<Path>) -> Result<Vec<u32>, LabError> {
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path).map_err(|source| EngramError::IdsFile {
+    let text = std::fs::read_to_string(path).map_err(|source| LabError::IdsFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -203,7 +203,7 @@ pub fn read_ids(path: impl AsRef<Path>) -> Result<Vec<u32>, EngramError> {
         if line.is_empty() {
             continue;
         }
-        out.push(line.parse::<u32>().map_err(|source| EngramError::TokenId {
+        out.push(line.parse::<u32>().map_err(|source| LabError::TokenId {
             path: path.to_path_buf(),
             line: n + 1,
             text: line.to_string(),

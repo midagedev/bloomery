@@ -3,11 +3,10 @@
 //! **This crate is the IO path first.** It answers one question: can NVMe serve
 //! 48 scattered row reads inside a decode step? Which rows a token wants is the
 //! [`hash`] module's, built from the GGUF metadata's own constants; the two meet
-//! at [`Site::rows_into`], whose only input is a slice of row ids.
-//! [`SeededRows`] stands in for the hash when the point is the access pattern
-//! alone — a uniform draw is the zero-reuse floor. A real stream re-asks for
-//! rows, and [`cache::RowCache`] keeps them in DRAM so that only its misses
-//! reach the disk; [`reuse::Lru`] is the simulator its hits are held to.
+//! at [`Site::rows_into`], whose only input is a slice of row ids. What
+//! measures these reads — a uniform row draw, a DRAM row cache, a reuse
+//! simulator and the `engram-rate` and `engram-reuse` bins — is the
+//! `engram-lab` crate, built on this one; the engine uses none of it.
 //!
 //! The tables are the `engram_embd` weights of the blocks the metadata names
 //! (blk.1 and blk.14 in V4.1-Flash): ~384 M rows of 256 values each, in the
@@ -48,12 +47,10 @@ use std::path::{Path, PathBuf};
 use gguf::{Inventory, LoadError, RawTensorInfo, ggml_type_info, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
-pub mod cache;
 pub mod hash;
 pub mod prefetch;
-pub mod reuse;
 
-pub use hash::{Context, Hash};
+pub use hash::Hash;
 
 /// The tensor one engram site lives in. The block index is metadata, so this is
 /// the only place the name's shape is written down.
@@ -155,24 +152,16 @@ pub enum EngramError {
     },
     #[error("{name}: row {id} is past the {rows} rows the header states")]
     RowOutOfRange { name: String, id: u32, rows: u64 },
+    #[error(
+        "token {token} is past the {map} entries of the engram token map: not a token of this model"
+    )]
+    TokenPastMap { token: u32, map: usize },
+    #[error(
+        "the engram token map has {map} entries and the model's vocabulary {vocab} tokens; the map is indexed by token id, so the two must be equal"
+    )]
+    VocabMismatch { map: usize, vocab: usize },
     #[error("prefetcher: {0}")]
     Prefetch(&'static str),
-    #[error("row cache: {0}")]
-    Cache(&'static str),
-    #[error("reuse simulator: {0}")]
-    Reuse(&'static str),
-    #[error("{path}: {source}")]
-    IdsFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("{path}:{line}: '{text}': {source}")]
-    TokenId {
-        path: PathBuf,
-        line: usize,
-        text: String,
-        source: std::num::ParseIntError,
-    },
 }
 
 /// A byte count as `posix_fadvise` takes it. The mapping is far under
@@ -634,11 +623,6 @@ impl Engram {
     pub fn hash(&self) -> &Hash {
         &self.hash
     }
-
-    /// Bytes in the whole table, both sites summed.
-    pub fn bytes(&self) -> u64 {
-        self.sites.iter().map(|s| s.rows * s.row_bytes).sum()
-    }
 }
 
 /// Faults this process has taken, from `getrusage(RUSAGE_SELF)`.
@@ -685,92 +669,5 @@ fn faults_of(who: libc::c_int) -> Faults {
     Faults {
         major: usage.ru_majflt.max(0) as u64,
         minor: usage.ru_minflt.max(0) as u64,
-    }
-}
-
-/// Bytes this process actually fetched from the block layer (`/proc/self/io`
-/// `read_bytes`), readahead it submitted through `madvise` included.
-///
-/// **Diagnostic, not a hot-path counter**: it opens and reads a file, which
-/// costs about as much as a whole warm token. Sample it at the ends of a run.
-///
-/// This is the only counter that proves a prefetched arm did any IO — see
-/// [`Faults`].
-pub fn read_bytes() -> Result<u64, std::io::Error> {
-    let text = std::fs::read_to_string("/proc/self/io")?;
-    text.lines()
-        .find_map(|l| l.strip_prefix("read_bytes:"))
-        .and_then(|v| v.trim().parse().ok())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "/proc/self/io has no read_bytes line",
-            )
-        })
-}
-
-/// What a run served. Nothing in the lookup path writes one — the caller folds
-/// its own batches in, so an unprofiled path takes no lock, no atomic and no
-/// per-row store.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Counters {
-    pub rows: u64,
-    pub bytes: u64,
-    pub nanos: u64,
-    pub major_faults: u64,
-    pub minor_faults: u64,
-}
-
-impl Counters {
-    /// Fold in one batch's rows and the caller's own elapsed time.
-    pub fn add_batch(&mut self, rows: u64, bytes: u64, nanos: u64) {
-        self.rows += rows;
-        self.bytes += bytes;
-        self.nanos += nanos;
-    }
-
-    /// Fold in the faults taken between two [`faults`] samples.
-    pub fn add_faults(&mut self, before: Faults, after: Faults) {
-        self.major_faults += after.major.saturating_sub(before.major);
-        self.minor_faults += after.minor.saturating_sub(before.minor);
-    }
-}
-
-/// Reproducible row ids, standing in for the model's derivation.
-///
-/// **The real derivation is [`Hash`]**, and an arm that wants the rows a real
-/// token stream asks for uses it. What this reproduces instead is the **access
-/// pattern**: uniform over the table, the same sequence for the same seed, with
-/// no allocation and no metadata.
-///
-/// What it does not reproduce is **reuse** — the real hash keys on n-grams, so
-/// common bigrams re-hit rows that are still resident. A uniform draw over
-/// 384 M rows is the zero-reuse floor; real decode sits between it and an
-/// all-resident table, and `engram-reuse` is where that distance is measured.
-pub struct SeededRows {
-    state: u64,
-}
-
-impl SeededRows {
-    pub fn new(seed: u64) -> SeededRows {
-        SeededRows { state: seed }
-    }
-
-    /// `n` ids uniform in `0..rows`, appended to a cleared caller-owned vector.
-    pub fn next_into(&mut self, rows: u64, n: usize, out: &mut Vec<u32>) {
-        out.clear();
-        for _ in 0..n {
-            out.push((self.next_u64() % rows) as u32);
-        }
-    }
-
-    /// splitmix64 — a fixed sequence per seed, so a run is repeatable and two
-    /// arms can be handed the same rows.
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
     }
 }

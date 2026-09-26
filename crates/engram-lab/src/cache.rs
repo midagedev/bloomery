@@ -6,12 +6,12 @@
 //! serve most of a token from memory. What the cache changes is who does the
 //! work: a **hit** is the step thread's own copy out of the cache, with no
 //! syscall and no fault; only a **miss** goes to the helper of
-//! [`crate::prefetch::Prefetcher`], and a token with none skips it entirely.
+//! [`engram::prefetch::Prefetcher`], and a token with none skips it entirely.
 //!
 //! Three shapes the caller has to know about:
 //!
 //! * **The order is the contract.** Per token, sites in order, and within a
-//!   site the buckets in [`crate::Hash::rows_into`] order — the order
+//!   site the buckets in [`engram::Hash::rows_into`] order — the order
 //!   `engram-reuse` feeds its simulator, so the cache's hits are the hits
 //!   [`crate::reuse::Lru`] reports at the same capacity, to the integer.
 //! * **A miss owns its slot at once.** [`RowCache::lookup`] claims the slot,
@@ -29,7 +29,7 @@
 //! and alone it replays a stream at a capacity whose payload a gate could not
 //! afford to allocate.
 
-use crate::EngramError;
+use crate::LabError;
 
 /// One site's row id as a single key. Sites are separate tables, so the same
 /// row number in two of them is two different rows.
@@ -182,12 +182,12 @@ pub struct LruIndex {
 impl LruIndex {
     /// An empty index of `capacity` slots. Every buffer is allocated and
     /// written here; nothing after this allocates.
-    pub fn new(capacity: usize) -> Result<LruIndex, EngramError> {
+    pub fn new(capacity: usize) -> Result<LruIndex, LabError> {
         if capacity == 0 {
-            return Err(EngramError::Cache("an LRU of no rows holds nothing"));
+            return Err(LabError::Cache("an LRU of no rows holds nothing"));
         }
         let cap = u32::try_from(capacity)
-            .map_err(|_| EngramError::Cache("a capacity must fit a u32 slot number"))?;
+            .map_err(|_| LabError::Cache("a capacity must fit a u32 slot number"))?;
         Ok(LruIndex {
             table: Table::new(capacity),
             // Neither sentinel is zero, so these are written here too.
@@ -334,22 +334,22 @@ impl RowCache {
         capacity: usize,
         row_bytes: usize,
         rows_per_site: &[usize],
-    ) -> Result<RowCache, EngramError> {
+    ) -> Result<RowCache, LabError> {
         if row_bytes == 0 {
-            return Err(EngramError::Cache("a row must have at least one byte"));
+            return Err(LabError::Cache("a row must have at least one byte"));
         }
         let per_token: usize = rows_per_site.iter().sum();
         if per_token == 0 {
-            return Err(EngramError::Cache("a token must ask for at least one row"));
+            return Err(LabError::Cache("a token must ask for at least one row"));
         }
         if capacity < per_token {
-            return Err(EngramError::Cache(
+            return Err(LabError::Cache(
                 "the capacity must hold at least one token's rows",
             ));
         }
         let slab_len = capacity
             .checked_mul(row_bytes)
-            .ok_or(EngramError::Cache("capacity x row size overflows"))?;
+            .ok_or(LabError::Cache("capacity x row size overflows"))?;
         Ok(RowCache {
             index: LruIndex::new(capacity)?,
             row_bytes,
@@ -389,26 +389,26 @@ impl RowCache {
     /// missed, the second would read its unfilled slot — a stale read — so the
     /// lookup is refused there, and the misses claimed before it stay pending.
     /// If the first name hit, both are served from the same ready slot.
-    pub fn lookup(&mut self, ids: &[Vec<u32>], out: &mut [u8]) -> Result<Lookup, EngramError> {
+    pub fn lookup(&mut self, ids: &[Vec<u32>], out: &mut [u8]) -> Result<Lookup, LabError> {
         if !self.misses.is_empty() {
-            return Err(EngramError::Cache(
+            return Err(LabError::Cache(
                 "lookup before the previous token's misses were completed",
             ));
         }
         if ids.len() != self.rows_per_site.len() {
-            return Err(EngramError::Cache("token has a different site count"));
+            return Err(LabError::Cache("token has a different site count"));
         }
         if ids
             .iter()
             .zip(&self.rows_per_site)
             .any(|(ids, &n)| ids.len() != n)
         {
-            return Err(EngramError::Cache(
+            return Err(LabError::Cache(
                 "a site's ids are not the rows per site the cache was built for",
             ));
         }
         if out.len() != self.token_bytes {
-            return Err(EngramError::Cache("output is not one token's rows"));
+            return Err(LabError::Cache("output is not one token's rows"));
         }
 
         let rb = self.row_bytes;
@@ -419,7 +419,7 @@ impl RowCache {
                 match self.index.access(key_of(site, id)) {
                     Access::Hit(slot) => {
                         if self.state[slot] != READY {
-                            return Err(EngramError::Cache("a lookup found its row still pending"));
+                            return Err(LabError::Cache("a lookup found its row still pending"));
                         }
                         out[out_row * rb..][..rb].copy_from_slice(&self.slab[slot * rb..][..rb]);
                         hits += 1;
@@ -440,7 +440,7 @@ impl RowCache {
     }
 
     /// The row ids the last lookup missed, per site in that lookup's order:
-    /// what [`crate::prefetch::Prefetcher::submit`] takes. Every site is empty
+    /// what [`engram::prefetch::Prefetcher::submit`] takes. Every site is empty
     /// when it hit everything.
     pub fn miss_ids(&self) -> &[Vec<u32>] {
         &self.miss_ids
@@ -449,18 +449,18 @@ impl RowCache {
     /// Land the helper's copy of the last lookup's misses.
     ///
     /// `filled` is every missed row in [`RowCache::miss_ids`] order, site by
-    /// site, `row_bytes` each — what [`crate::prefetch::Prefetcher::filled`]
+    /// site, `row_bytes` each — what [`engram::prefetch::Prefetcher::filled`]
     /// returns for that submit. Each row goes into the slot it claimed and
     /// into `out`, and the slot stops being pending.
-    pub fn complete(&mut self, filled: &[u8], out: &mut [u8]) -> Result<(), EngramError> {
+    pub fn complete(&mut self, filled: &[u8], out: &mut [u8]) -> Result<(), LabError> {
         let rb = self.row_bytes;
         if filled.len() != self.misses.len() * rb {
-            return Err(EngramError::Cache(
+            return Err(LabError::Cache(
                 "the filled rows are not the pending misses",
             ));
         }
         if out.len() != self.token_bytes {
-            return Err(EngramError::Cache("output is not one token's rows"));
+            return Err(LabError::Cache("output is not one token's rows"));
         }
         for (m, row) in self.misses.iter().zip(filled.chunks_exact(rb)) {
             self.slab[m.slot * rb..][..rb].copy_from_slice(row);

@@ -1210,6 +1210,10 @@ impl StepRows {
         };
         let paths = (0..file.shard_count()).filter_map(|i| file.shard_path(i));
         let engram = Engram::open(paths).map_err(|e| GpuError::plan(WHAT, e))?;
+        engram
+            .hash()
+            .check_vocab(hp.n_vocab)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         let (hash, en, table_ty) = (engram.hash(), hp.engram()?, hp.rows.engram()?);
         let (_, row_bytes) = TableRows::of(table_ty, en.key_length).ok_or_else(|| {
             refuse(format!(
@@ -1319,6 +1323,7 @@ impl StepRows {
                 missing: "the finish of the rows in flight (StepRows::finish) before the next begin",
             });
         }
+        check_tokens(plan, self.n_vocab)?;
         if self.helper.is_none() {
             embd_rows_into(
                 &self.embd,
@@ -1491,7 +1496,8 @@ impl StepRows {
 /// newest first (a plan's [`StepPlan::engram_window`] run of one token), into
 /// `ids`, `n_cols` per site in site order: the window mapped as the port
 /// maps it — the token, then each older one up to the first missing, the pad
-/// id from there on — into `ctx`, then hashed per site.
+/// id from there on — into `ctx`, then hashed per site. A token past the
+/// table's token map is not a token of the model and is refused by name.
 fn token_rows(
     engram: &Engram,
     ctx: &mut [u64],
@@ -1504,7 +1510,9 @@ fn token_rows(
     for (slot, &token) in ctx.iter_mut().zip(window) {
         blocked |= token.is_none();
         *slot = match token {
-            Some(t) if !blocked => hash.map_token(t),
+            Some(t) if !blocked => hash
+                .map_token(t)
+                .map_err(|e| GpuError::plan("StepRows::begin", e))?,
             _ => hash.pad_id(),
         };
     }
@@ -1513,6 +1521,21 @@ fn token_rows(
             .map_err(|e| GpuError::plan("StepRows::begin", e))?;
     }
     Ok(())
+}
+
+/// Every token of `plan` below `n_vocab`, checked before any row is read: an id
+/// past the vocabulary is not a token of this model. The one refusal for it on
+/// every path — the engram helper hashes a token before the embedding row is
+/// read, so without this the helper and the direct path would name the same
+/// input differently. It carries the embedding read's name, the fill's.
+fn check_tokens(plan: &StepPlan, n_vocab: usize) -> Result<(), GpuError> {
+    match plan.tokens.iter().find(|&&t| t as usize >= n_vocab) {
+        Some(t) => Err(GpuError::Shape {
+            what: "StepRows::fill",
+            detail: format!("token {t} is past the vocabulary of {n_vocab} tokens"),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Every token's embedding row of `plan` into `out` (`row` bytes a token, as

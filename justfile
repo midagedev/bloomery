@@ -660,10 +660,16 @@ gate-tokenizer:
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml -- --include-ignored --nocapture'
 
+# engram IO 실험실의 시험(crates/engram-lab, 엔진 사용처 없음): 컨텍스트 창의 슬롯 순서, 행 캐시의 LRU를 스택
+# 거리 모의와 대조, 캐시가 내주는 바이트. 이름이 gate-가 아니라 lab-이라 `just affected`가 엔진 착륙에서 고르지
+# 않는다. V4.1 분할 파일과 engram-corpus 스트림이 있어야 돈다.
+lab-engram:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram-lab --test lab -- --include-ignored --nocapture'
+
 # engram-rate 바이너리. 측정은 tools/ref/engram-rate.sh가 임대 안에서 돌린다 —
 # 이 레시피는 빌드만 한다(러너가 낡은 바이너리를 재는 것을 막는 단계).
 build-engram:
-    ./tools/box.sh 'cargo build --release -p bloomery-engram --bin engram-rate'
+    ./tools/box.sh 'cargo build --release -p bloomery-engram-lab --bin engram-rate'
 
 # engram 토큰당 비용 표(기본 팔 여덟 — 캐시 팔은 --ids와 함께 --arms로 부를 때만 돈다). 기계 전역 임대를
 # 잡으므로 리드가 조용한 시점에 친다.

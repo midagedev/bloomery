@@ -71,10 +71,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engram::cache::{RowCache, capacity_rows};
 use engram::prefetch::{FillMode, Prefetcher};
-use engram::reuse::read_ids;
-use engram::{Context, Engram, Faults, Hash, SeededRows, Site, faults, faults_thread, read_bytes};
+use engram::{Engram, Faults, Hash, Site, faults, faults_thread};
+use engram_lab::cache::{RowCache, capacity_rows};
+use engram_lab::reuse::read_ids;
+use engram_lab::{Context, SeededRows, read_bytes};
 
 /// The arm that needs a real stream; it runs only when `--arms` names it.
 const CACHED: &str = "helper-cached";
@@ -213,7 +214,7 @@ fn plan_from_stream(hash: &Hash, stream: &[u32]) -> Result<Vec<Vec<Vec<u32>>>, S
     let mut ctx = Context::new(hash);
     let mut plan = Vec::with_capacity(stream.len());
     for &token in stream {
-        ctx.push(token);
+        ctx.push(token).map_err(|e| format!("context: {e}"))?;
         let mut sites = Vec::with_capacity(hash.sites());
         for site in 0..hash.sites() {
             let mut ids = vec![0u32; hash.n_cols()];

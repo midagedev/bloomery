@@ -64,7 +64,8 @@ pub struct Hash {
     prime: Vec<u64>,
     /// `sites * n_cols` offsets, site-major.
     offset: Vec<u64>,
-    /// Token id to compressed-vocabulary id. An id past its end maps to `pad`.
+    /// Token id to compressed-vocabulary id, indexed by token id: exactly as
+    /// long as the model's vocabulary ([`Hash::check_vocab`]).
     token_map: Vec<u32>,
 }
 
@@ -241,21 +242,43 @@ impl Hash {
         bucket / self.n_heads + 2
     }
 
-    /// `token` through the compressed vocabulary. An id past the map's end is
-    /// the pad value, which is how the port treats an unknown token.
-    pub fn map_token(&self, token: u32) -> u64 {
-        match self.token_map.get(token as usize) {
-            Some(&v) => u64::from(v),
-            None => self.pad,
+    /// `token` through the compressed vocabulary.
+    ///
+    /// The map is indexed by token id and is as long as the vocabulary
+    /// ([`Hash::check_vocab`]), so an id past its end is not a token of this
+    /// model: it is refused by name, never mapped to a plausible value. A
+    /// position before the sequence starts is not a token either; its context
+    /// value is [`Hash::pad_id`], which the caller puts there itself.
+    pub fn map_token(&self, token: u32) -> Result<u64, EngramError> {
+        self.token_map
+            .get(token as usize)
+            .map(|&v| u64::from(v))
+            .ok_or(EngramError::TokenPastMap {
+                token,
+                map: self.token_map.len(),
+            })
+    }
+
+    /// Refuse a model whose vocabulary is not the map's domain. The map is
+    /// indexed by token id, so it must be exactly `n_vocab` long: shorter, and
+    /// a token the model accepts would have no mapped value; longer, and the
+    /// file pairs this table with another vocabulary.
+    pub fn check_vocab(&self, n_vocab: usize) -> Result<(), EngramError> {
+        if self.token_map.len() == n_vocab {
+            return Ok(());
         }
+        Err(EngramError::VocabMismatch {
+            map: self.token_map.len(),
+            vocab: n_vocab,
+        })
     }
 
     /// The `n_cols` row ids `site` wants for the token at the head of `ctx`.
     ///
-    /// `ctx` is the mapped window [`Context::window`] returns — `ctx[0]` the
-    /// current token, `ctx[s]` the token `s` positions back — and `out` is
-    /// exactly `n_cols` long. Nothing is allocated: both buffers are the
-    /// caller's and are reused across tokens.
+    /// `ctx` is the mapped window — `ctx[0]` the current token, `ctx[s]` the
+    /// token `s` positions back, the pad id where that position is before the
+    /// sequence start — and `out` is exactly `n_cols` long. Nothing is
+    /// allocated: both buffers are the caller's and are reused across tokens.
     pub fn rows_into(&self, site: usize, ctx: &[u64], out: &mut [u32]) -> Result<(), EngramError> {
         if site >= self.sites() {
             return Err(EngramError::SiteOutOfRange {
@@ -306,53 +329,6 @@ impl Hash {
             });
         }
         Ok(&all[site * stride..][..stride])
-    }
-}
-
-/// The last `n_gram` mapped tokens of one sequence, newest first.
-///
-/// Before the sequence starts every slot is the pad value, and a slot stays pad
-/// until a real token has shifted into it. That covers a **contiguous** stream,
-/// which is the only shape this crate is fed. The port's rule is wider: it
-/// blocks from the first unavailable position outward, so a window with a hole
-/// in the middle pads everything older than the hole. A caller that can produce
-/// such a window — a batch over several sequences, or a cache whose cells were
-/// evicted — needs that rule added here, not assumed.
-pub struct Context<'a> {
-    hash: &'a Hash,
-    window: Vec<u64>,
-}
-
-impl<'a> Context<'a> {
-    /// A window at a sequence start: every slot pad.
-    pub fn new(hash: &'a Hash) -> Context<'a> {
-        Context {
-            hash,
-            window: vec![hash.pad_id(); hash.n_gram()],
-        }
-    }
-
-    /// Back to a sequence start.
-    pub fn reset(&mut self) {
-        let pad = self.hash.pad_id();
-        self.window.fill(pad);
-    }
-
-    /// Advance by one token. Older slots shift back by one; the oldest falls
-    /// off the end. No allocation.
-    pub fn push(&mut self, token: u32) {
-        self.window.rotate_right(1);
-        self.window[0] = self.hash.map_token(token);
-    }
-
-    /// The mapped window, `window()[s]` being the token `s` positions back.
-    pub fn window(&self) -> &[u64] {
-        &self.window
-    }
-
-    /// The hash this window maps its tokens through.
-    pub fn hash(&self) -> &'a Hash {
-        self.hash
     }
 }
 
@@ -429,4 +405,68 @@ fn ints(meta: &Inventory, suffix: &str) -> Result<Vec<u64>, EngramError> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Hash;
+    use crate::EngramError;
+
+    /// A hash whose map covers token ids `0..vocab`, with the smallest
+    /// constants the reader accepts: these tests read the map only.
+    fn with_map(vocab: u32) -> Hash {
+        Hash {
+            layer_ids: vec![1],
+            n_heads: 1,
+            n_gram: 2,
+            n_cols: 1,
+            key_length: 256,
+            pad: 2,
+            mult: vec![1, 1],
+            prime: vec![7],
+            offset: vec![0],
+            token_map: (0..vocab).map(|t| t / 2).collect(),
+        }
+    }
+
+    /// An id past the map is refused by name, with the id and the map's
+    /// length, and never mapped to the pad; the last id inside the map maps.
+    #[test]
+    fn map_token_refuses_an_id_past_the_map() {
+        let hash = with_map(16);
+        assert_eq!(
+            hash.map_token(15).ok(),
+            Some(7),
+            "the last id inside the map"
+        );
+        for token in [16, u32::MAX] {
+            match hash.map_token(token) {
+                Err(EngramError::TokenPastMap { token: t, map: 16 }) if t == token => {}
+                other => panic!(
+                    "token {token} of a 16-entry map: want TokenPastMap naming it and the \
+                     map's length, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// A map whose length is not the model's vocabulary is refused by name,
+    /// with both lengths; equal lengths pass.
+    #[test]
+    fn check_vocab_refuses_a_map_of_another_length() {
+        let hash = with_map(16);
+        assert!(
+            hash.check_vocab(16).is_ok(),
+            "a map as long as the vocabulary"
+        );
+        for vocab in [15, 17] {
+            match hash.check_vocab(vocab) {
+                Err(EngramError::VocabMismatch { map: 16, vocab: v }) if v == vocab => {}
+                other => panic!(
+                    "a 16-entry map against a vocabulary of {vocab}: want VocabMismatch naming \
+                     both, got {other:?}"
+                ),
+            }
+        }
+    }
 }

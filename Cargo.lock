@@ -72,6 +72,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-engram-lab"
+version = "0.1.0"
+dependencies = [
+ "bloomery-engram",
+ "bloomery-gguf",
+ "thiserror",
+]
+
+[[package]]
 name = "bloomery-gguf"
 version = "0.1.0"
 dependencies = [
