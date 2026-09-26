@@ -396,17 +396,27 @@ impl AttnBatch {
         self.tables.num_bytes()
     }
 
-    /// Chunk `m` tokens' rope tables into the host copy of the group's
-    /// batch `set` from token `at` on: token `t`'s tables of the chunk image
-    /// `words` (of `layout`) as
+    /// How the tables are laid out ([`batch_table`]).
+    fn table_dims(&self) -> TableDims {
+        TableDims {
+            tokens: self.tokens,
+            nd: self.rope_dims,
+        }
+    }
+
+    /// A chunk's rope tables into the host copy of the group's batch `set`
+    /// at its batch tokens `tokens`: the chunk's token `t`'s tables of the
+    /// chunk image `words` (of `layout`) as
     /// [`ImageView::table`](crate::params::ImageView::table) reads them.
     /// Refused past the group's batches, the batch's tokens or the image's.
     pub fn stage_tables(
         &mut self,
         layout: &ImageLayout,
         words: &[u32],
-        [set, at, m]: [usize; 3],
+        set: usize,
+        tokens: Range<usize>,
     ) -> Result<(), GpuError> {
+        let (at, m) = (tokens.start, tokens.len());
         let img = layout.view(words)?;
         let nd = self.rope_dims;
         if set >= self.sets
@@ -1002,11 +1012,10 @@ fn sub_pre(
         .enqueue_groups_to_tokens(stream, &b.raw_q, heads_part, groups, &mut b.q)?;
     let table = batch_table(
         &b.tables,
-        [b.tokens, b.rope_dims],
+        b.table_dims(),
         cx.set,
         cx.lp.tables.0,
-        ts,
-        n,
+        ts..ts + n,
     )?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut b.q, &table, heads(d, n))?;
@@ -1014,19 +1023,26 @@ fn sub_pre(
     Ok(())
 }
 
-/// The `n` tokens from batch token `at` of table `table` of the group's
-/// batch `set` in `tables`, the tables of batches of `tokens` positions of
-/// `nd` values ([`AttnBatch::tables`]).
+/// How [`AttnBatch::tables`] is laid out: per batch of a group, per table,
+/// `tokens` positions of `nd` values each.
+#[derive(Clone, Copy)]
+struct TableDims {
+    tokens: usize,
+    nd: usize,
+}
+
+/// The batch tokens `rows` of table `table` of the group's batch `set` in
+/// `tables`, laid out as `dims` says.
 fn batch_table(
     tables: &DeviceBuffer<f32>,
-    [tokens, nd]: [usize; 2],
+    dims: TableDims,
     set: usize,
     table: Table,
-    at: usize,
-    n: usize,
+    rows: Range<usize>,
 ) -> Result<View<'_, f32>, GpuError> {
+    let TableDims { tokens, nd } = dims;
     let t = set * Table::ALL.len() + table_index(table);
-    view::<f32, f32>(tables, (t * tokens + at) * nd, n * nd)
+    view::<f32, f32>(tables, (t * tokens + rows.start) * nd, rows.len() * nd)
 }
 
 /// Chunk `k`'s launches in position order (module doc, step 3), its tokens
@@ -1291,11 +1307,10 @@ fn sub_post(
     let tokens = cx.groups(sb)?;
     let table = batch_table(
         &b.tables,
-        [b.tokens, b.rope_dims],
+        b.table_dims(),
         cx.set,
         cx.lp.tables.1,
-        ts,
-        n,
+        ts..ts + n,
     )?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut b.y, &table, heads(d, n))?;

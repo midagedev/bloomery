@@ -1289,11 +1289,9 @@ impl Body {
                 )?;
                 let row = m.set * CHUNKS_MAX + k;
                 batch.images[row * words..(row + 1) * words].copy_from_slice(batch.image.words());
-                batch.proj.stage_tables(
-                    batch.image.layout(),
-                    batch.image.words(),
-                    [m.set, at.start, at.len()],
-                )?;
+                batch
+                    .proj
+                    .stage_tables(batch.image.layout(), batch.image.words(), m.set, at)?;
             }
             used = m.set * CHUNKS_MAX + n;
         }
@@ -1486,7 +1484,7 @@ impl<'a> GroupCx<'a> {
         i: usize,
         observe: &mut BatchObserver<'_>,
     ) -> Result<Routed<'a>, GpuError> {
-        let (gpu, w, n) = (self.gpu, self.w, self.n);
+        let (gpu, w) = (self.gpu, self.w);
         let l = self.layers.start + i;
         let step = self.steps[i];
         let timed = self.batch.card_timing;
@@ -1495,12 +1493,7 @@ impl<'a> GroupCx<'a> {
             self.mark(m.set, i, 0)?;
             self.sums.entries_route += 1;
         }
-        let batch = &mut *self.batch;
-        batch.card_served[served] = false;
-        let words = batch.image.layout().words();
-        let s4 = HC_STREAMS * n;
-        let row0 = m.set * CHUNKS_MAX;
-        let (u, b) = (m.u, m.b);
+        self.batch.card_served[served] = false;
         // The layer runs a suffix of the chunks: its latent part from
         // `run`, its block from `full`.
         let run = m
@@ -1513,49 +1506,13 @@ impl<'a> GroupCx<'a> {
             .iter()
             .position(|r| self.need.mode(i, r.start) == Mode::Full)
             .unwrap_or(m.cuts.len());
-        let own = set_of(&mut batch.sets, m.set)?;
         if step.engram {
-            let wkv_q8 = queue::q8(w, &names::engram_wkv(l));
-            for (k, r) in m.cuts.iter().enumerate().skip(run) {
-                let (at, len) = (r.start - b, r.len());
-                self.sums.entries_route += queue::engram(len, wkv_q8);
-                let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;
-                let (hin, hout) = ping(&mut own.hc, m.cur.s);
-                let streams = span(WHAT, hin, at * s4, len * s4)?;
-                let mut out = span_mut(WHAT, hout, at * s4, len * s4)?;
-                let pre = span(WHAT, batch.ffn.hc(m.set)?, at * HC_MIX, len * HC_MIX)?;
-                let mut input = span_mut(WHAT, &mut own.folds[m.cur.f], at * n, len * n)?;
-                self.glue.enqueue_batch_engram(
-                    gpu,
-                    w,
-                    &mut batch.glue,
-                    l,
-                    &p,
-                    len,
-                    EngramStep {
-                        streams: &streams,
-                        pre: &pre,
-                        out: &mut out,
-                        input: &mut input,
-                    },
-                )?;
-            }
-            m.cur.s ^= 1;
-            let at = m.token(run);
-            observe(
-                gpu,
-                BatchSeam {
-                    kind: BatchSeamKind::Engram,
-                    layer: l,
-                    first: (b + at) as u32,
-                    at,
-                    tokens: u - at,
-                    streams: &own.hc[m.cur.s],
-                    fold: Some(&own.folds[m.cur.f]),
-                    attn: None,
-                },
-            )?;
+            self.engram(m, l, run, observe)?;
         }
+        let batch = &mut *self.batch;
+        let row0 = m.set * CHUNKS_MAX;
+        let (u, b) = (m.u, m.b);
+        let own = set_of(&mut batch.sets, m.set)?;
         {
             let (sin, sout) = ping(&mut own.hc, m.cur.s);
             let (fin, fout) = ping(&mut own.folds, m.cur.f);
@@ -1640,6 +1597,64 @@ impl<'a> GroupCx<'a> {
             at,
             block: Some(bl),
         })
+    }
+
+    /// Model layer `l`'s engram step over the batch `m`'s chunks from chunk
+    /// `run` on, chunk by chunk. Shows `observe` its seam.
+    fn engram(
+        &mut self,
+        m: &mut Member,
+        l: usize,
+        run: usize,
+        observe: &mut BatchObserver<'_>,
+    ) -> Result<(), GpuError> {
+        let (gpu, w, n) = (self.gpu, self.w, self.n);
+        let batch = &mut *self.batch;
+        let words = batch.image.layout().words();
+        let s4 = HC_STREAMS * n;
+        let row0 = m.set * CHUNKS_MAX;
+        let (u, b) = (m.u, m.b);
+        let own = set_of(&mut batch.sets, m.set)?;
+        let wkv_q8 = queue::q8(w, &names::engram_wkv(l));
+        for (k, r) in m.cuts.iter().enumerate().skip(run) {
+            let (at, len) = (r.start - b, r.len());
+            self.sums.entries_route += queue::engram(len, wkv_q8);
+            let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;
+            let (hin, hout) = ping(&mut own.hc, m.cur.s);
+            let streams = span(WHAT, hin, at * s4, len * s4)?;
+            let mut out = span_mut(WHAT, hout, at * s4, len * s4)?;
+            let pre = span(WHAT, batch.ffn.hc(m.set)?, at * HC_MIX, len * HC_MIX)?;
+            let mut input = span_mut(WHAT, &mut own.folds[m.cur.f], at * n, len * n)?;
+            self.glue.enqueue_batch_engram(
+                gpu,
+                w,
+                &mut batch.glue,
+                l,
+                &p,
+                len,
+                EngramStep {
+                    streams: &streams,
+                    pre: &pre,
+                    out: &mut out,
+                    input: &mut input,
+                },
+            )?;
+        }
+        m.cur.s ^= 1;
+        let at = m.token(run);
+        observe(
+            gpu,
+            BatchSeam {
+                kind: BatchSeamKind::Engram,
+                layer: l,
+                first: (b + at) as u32,
+                at,
+                tokens: u - at,
+                streams: &own.hc[m.cur.s],
+                fold: Some(&own.folds[m.cur.f]),
+                attn: None,
+            },
+        )
     }
 
     /// Layer index `i`'s shadow of the batch `m`'s block, where it has one.
