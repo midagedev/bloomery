@@ -58,7 +58,7 @@ The chat switch needs **no** timed A/B: its predicted effect (≈ 4.8×) is far 
 
 - **V4.1 decode, per token.**
   - Prose 512, plan (a), A6000: 44.8 tok/s (README `:66`, rig-log 09-25#dspark-loop-tps), so 22.3 ms per token [derived].
-  - The nsys row (depth 6, n = 8): step 31.6 ms = card critical 8.56 + bridge 24.06 (`plan-triage.md:173`).
+  - The nsys row (depth 6, n = 8): ~~step 31.6 ms = card critical 8.56 + bridge 24.06 (`plan-triage.md:173`)~~ a generated step 31.6 ms = card critical 8.56 + bridges 22.61 + idle between replays 0.42 (replays 6–12; 24.06 was the mean over all 13 replays, the six prompt-feed replays included — corrected by the lead 09-27 from `tools/ref/nsys-bridge.py` on the same sqlite).
   - Per layer the chain is card → host experts → card. The card's expert shadow sits under the host section, so a layer costs the max of the two, and the wall is the chain (`ds41.md:67-71`).
   - The session's own host work per token (the sampler pick, the stop scan, the UTF-8 decoder) is serial, because the next step needs the token. It costs µs, except the sampler chain over 129,280 logits, which is unmeasured (Open 7).
   - **Flow change for serve.** Today serve runs its gen loop on the connection thread and sends two channel messages per token to the engine thread (`genloop.rs:331-436`, `bind.rs:339-358`). That is µs per token, but a draft loop cannot live there. Move the whole request onto the engine thread (§Q6).
@@ -586,7 +586,7 @@ Report only; I touched nothing.
 - `docs/research/audit/gates-ds41.md:159`: lists `gpu-ab.py` as a `generate_ds41` reader; it reads V2-Lite `generate` only (`tools/gpu-ab.py:48`) (XS).
 - `crates/gpu-gates/src/bin/generate_qwen3moe.rs:148-262`: `println!` outside `record.rs`, no `at_main` (M; 03's).
 - `crates/gpu-gates/src/bin/generate_ds41.rs:1413-1415`: `feed_dspark`'s doc says "one step each", but the batch arm runs `prefill_with` (`:1427-1442`) (XS).
-- `docs/plan-triage.md:173`: "31.6 = 8.56 + 24.06" does not add up; the sum is 32.62 (XS doc check).
+- ~~`docs/plan-triage.md:173`: "31.6 = 8.56 + 24.06" does not add up; the sum is 32.62 (XS doc check).~~ Closed 09-27: 24.06 mixed the prompt-feed replays in; see the corrected line in §0b.
 - `docs/research/audit/ds41.md:228-230`: DS3's anchors are stale (fields now `body.rs:614-685`; the history check is `:2010`) (XS).
 - `docs/research/audit/cpu.md` CPU5: cites `bloomery_serve_ds41.rs:188` for `slot_save_path`; it is `:200` (XS).
 - `docs/plan-triage.md:57` (`q35gdn`): "exllamav3 history slot + ping-pong = k+1 slots". exllamav3 **copies** the history slot back into slot 0 (`gated_delta_net.py:233-244`); the lane-index form is mainline's and mistral.rs's (XS).
