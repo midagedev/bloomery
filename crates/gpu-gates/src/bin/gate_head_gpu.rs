@@ -1,23 +1,16 @@
 //! GPU gate for the output head (docs/gpu-design.md P8's head piece):
-//! `result_norm → lm_head (Q6_K) → argmax` as one captured graph over
-//! resident scratch, m = 1, against the ik CUDA oracle (`ref_cuda_v2`). The
-//! What is asserted:
+//! `result_norm → lm_head (Q6_K) → argmax` over resident scratch, m = 1,
+//! against the ik CUDA oracle (`ref_cuda_v2`). What is asserted:
 //! - (a) every tap finite, and inside the pinned head bands (`BANDS`);
 //! - a structural fence per tap: `rel <= 0.25`, an order of magnitude above
 //!   the head's expected rels and below the O(0.5..1) rels a wrong
 //!   gain/geometry produces (measured with the FAIL-first mutation below). A
 //!   violation here is a layout defect, not noise;
 //! - (b) an eager rerun bit-identical;
-//! - (c) the captured graph replays bit-identical to eager (node count
-//!   printed);
-//! - (d) the argmax: the device token equals the oracle's argmax over
+//! - (c) the argmax: the device token equals the oracle's argmax over
 //!   `result_output`'s last row (both proven against the pinned ik token) and
 //!   equals the host argmax of our own logits under the kernel's tie rule —
-//!   strictly greater replaces, so equal values keep the LOWER index;
-//! - (e) a second input replayed through the SAME graph equals its eager run
-//!   bit for bit — what the mutable input buffer buys. The dump holds the
-//!   head input for the last position only (`l_out-26` is `{2048, 1}`), so
-//!   the second input is a rotation of the first, deterministic.
+//!   strictly greater replaces, so equal values keep the LOWER index.
 //!
 //! The head's input is the dump's `l_out-26` (occurrence 0, the residual ADD,
 //! `{2048, 1}`) — the same tensor the CPU head gate feeds
@@ -171,7 +164,7 @@ fn run() -> Result<(), GateError> {
         }
     }
 
-    // ---- (d) argmax: device token vs the oracle row vs our own logits,
+    // ---- (c) argmax: device token vs the oracle row vs our own logits,
     // one tie rule everywhere (equal values -> lower index).
     let oracle_am = argmax_low(&oracle);
     let host_am = argmax_low(&logits1);
@@ -198,53 +191,6 @@ fn run() -> Result<(), GateError> {
         ok = false;
     }
 
-    // ---- (c) captured graph: replay bit-identical to eager
-    let nodes = head.capture(&gpu, &w)?;
-    head.set_input(&gpu, &x_in)?;
-    head.launch(&gpu)?;
-    let replay_same = bits_equal(&normed1, &head.normed_to_host(&gpu)?)
-        && bits_equal(&logits1, &head.logits_to_host(&gpu)?)
-        && token1 == head.token(&gpu)? as usize;
-    println!(
-        "graph graph_nodes={nodes} eager_vs_replay_bit_identical={replay_same} {}",
-        verdict(replay_same)
-    );
-    if !replay_same {
-        ok = false;
-    }
-
-    // ---- (e) second input through the SAME graph. The replay runs first:
-    // the input buffer still holds the first vector at that point, so a
-    // replay that skipped its set_input reads the STALE input and must break
-    // the equality below (the check's FAIL-first). The eager run then proves
-    // the replay's numbers are the permuted input's own.
-    let n = x_in.len();
-    let second: Vec<f32> = (0..n).map(|i| x_in[(i + 1) % n]).collect();
-    head.set_input(&gpu, &second)?;
-    head.launch(&gpu)?;
-    let normed_r2 = head.normed_to_host(&gpu)?;
-    let logits_r2 = head.logits_to_host(&gpu)?;
-    let token_r2 = head.token(&gpu)? as usize;
-    head.set_input(&gpu, &second)?;
-    head.enqueue(&gpu, &w)?;
-    let normed_e2 = head.normed_to_host(&gpu)?;
-    let logits_e2 = head.logits_to_host(&gpu)?;
-    let token_e2 = head.token(&gpu)? as usize;
-    let second_same = bits_equal(&normed_r2, &normed_e2)
-        && bits_equal(&logits_r2, &logits_e2)
-        && token_r2 == token_e2;
-    // The check is only meaningful if the second input moves the logits; a
-    // rotation of a real hidden vector cannot leave 102400 logits untouched.
-    let second_differs = !bits_equal(&logits1, &logits_e2);
-    println!(
-        "second_input rotation replay_vs_eager_bit_identical={second_same} \
-         changes_logits={second_differs} {}",
-        verdict(second_same && second_differs)
-    );
-    if !(second_same && second_differs) {
-        ok = false;
-    }
-
     // ---- for the record: top-5 of both sides
     println!("top-5 ours: {:?}", top5(&logits1));
     println!("top-5 oracle: {:?}", top5(&oracle));
@@ -254,13 +200,13 @@ fn run() -> Result<(), GateError> {
     }
     println!(
         "PASSED: gate_head_gpu — head chain taps printed against the dump's last \
-         token inside the pinned bands, rerun/replay/second-input bit-identical, \
-         argmax equal to the oracle's under one tie rule"
+         token inside the pinned bands, rerun bit-identical, argmax equal to the \
+         oracle's under one tie rule"
     );
     Ok(())
 }
 
-/// Index of the maximum, ties to the LOWER index — `elem::argmax`'s rule
+/// Index of the maximum, ties to the LOWER index — `elem::argmax_fault`'s rule
 /// (`argmax_take`: strictly greater replaces, equal never does under an
 /// ascending scan). Every argmax in this gate runs through it.
 #[cfg(feature = "gpu")]

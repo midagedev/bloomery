@@ -9,9 +9,8 @@
 //!     forced_probe --prompt-id ID --step S --dump DIR [--against DIR[,DIR…]]
 //!                  [--ctx C] [--top K]
 //!
-//! Two arms of a process-wide lever (`BLOOMERY_FLASH_MMA`, read once) are two
-//! runs: the first writes its dump, the second reads it. `just forced-probe
-//! ID S` runs the scalar arm then the tensor-core arm that way.
+//! Two arms of a process-wide lever (one read once at start) are two runs:
+//! the first writes its dump, the second reads it.
 //!
 //! The state is `gate_e2e`'s forced arm exactly: eager mode, `--ctx` defaults
 //! to that gate's `CTX_MAX` (the cache height fixes the segment count), fresh
@@ -23,7 +22,7 @@
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
-    eprintln!("forced_probe: built without the `gpu` feature; see `just forced-probe`.");
+    eprintln!("forced_probe: built without the `gpu` feature; see `just exact-taps`.");
     std::process::exit(2);
 }
 
@@ -173,9 +172,8 @@ fn run() -> Res<()> {
     model.set_mode(StepMode::Eager);
     let layers = model.stages()[0].layers();
     println!(
-        "arm flash_mma={} seg_keys={} ctx={ctx} prompt={id} tokens={} step={step} \
+        "arm seg_keys={} ctx={ctx} prompt={id} tokens={} step={step} \
          pos={} live_keys={} segments={} live_segments={}",
-        bloomery_gpu::flash::flash_mma(),
         bloomery_gpu::flash::seg_keys(),
         p.tokens.len(),
         p.tokens.len() - 1 + step,

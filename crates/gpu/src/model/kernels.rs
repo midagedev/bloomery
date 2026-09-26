@@ -138,94 +138,25 @@ mod step_kernels {
         }
     }
 
-    /// Q3_K gemv over per-head activation columns: launch row `r` belongs
-    /// to head `h = head_base + r / rows_per_head`, dots absolute weight
-    /// row `h * row_stride_per_head + row_off + r % rows_per_head` against
-    /// activation column `r / rows_per_head` of `q`/`d8` (m = 1 through
-    /// the gated row body, one warp per row, 8 rows per 256-thread block),
-    /// lane 0 storing `y[h * y_head_stride + r % rows_per_head]`.
+    /// Q3_K gemv over per-head activation columns, both head halves in ONE
+    /// launch: launch row `r` belongs to head `h = head_base + hi` with
+    /// `hi = r / rows_per_head`, and dots absolute weight row
+    /// `h * row_stride_per_head + row_off + r % rows_per_head` (m = 1
+    /// through the gated row body, one warp per row, 8 rows per 256-thread
+    /// block), lane 0 storing `y[h * y_head_stride + r % rows_per_head]`.
+    /// Heads below `split` read `(q_lo, d8_lo)` at column `hi`, the rest
+    /// `(q_hi, d8_hi)` at column `hi - split`. The two halves read DIFFERENT
+    /// weight rows, so this saves a launch, not a weight read.
     /// `n_rows` must be `heads * rows_per_head` and
     /// `row_off + rows_per_head <= row_stride_per_head` (host-validated),
     /// which keeps every `row_abs` below
     /// `(head_base + heads) * row_stride_per_head` — the bound the launch
     /// contract puts on `w`. Stores are disjoint: each (head, slot) pair
     /// belongs to exactly one row.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            4 * w.len() >= (head_base + heads) * row_stride_per_head * 110 * n_sb,
-            q.len() >= heads * 64 * iters,
-            d8.len() >= heads * 2 * n_sb,
-            y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
-        )
-    )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
-    )]
-    pub fn q3k_gemv_heads(
-        w: &[u32],
-        q: &[u64],
-        d8: &[f32],
-        n_rows: u32,
-        n_sb: u32,
-        iters: u32,
-        head_base: u32,
-        heads: u32,
-        rows_per_head: u32,
-        row_stride_per_head: u32,
-        row_off: u32,
-        y_head_stride: u32,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() % 256;
-        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
-        if row >= n_rows as usize {
-            return;
-        }
-        let hi = row / rows_per_head as usize;
-        // The launch contract cannot bind n_rows to heads*rows_per_head
-        // (no division in its grammar); this guard keeps a violated
-        // divisibility from reading weight rows past the last head's
-        // block.
-        if hi >= heads as usize {
-            return;
-        }
-        let row_in = row % rows_per_head as usize;
-        let h = head_base as usize + hi;
-        let row_abs = h * row_stride_per_head as usize + row_off as usize + row_in;
-        let lane = warp::lane_id() as usize;
-        // SAFETY: row_abs + 1 <= (head_base + heads) * row_stride_per_head
-        // (the contract's bound on w, given the host-validated
-        // row_off + rows_per_head <= row_stride_per_head); column hi <
-        // heads keeps q/d8 inside their contract bounds.
-        let f = q3k_row_dot(w, q, d8, n_sb as usize, iters, row_abs, hi, 1, lane);
-        let s0 = warp::reduce_sum_f32(f[0]);
-        if lane == 0 {
-            // SAFETY: only lane 0 of the warp owning `row` writes; the slot
-            // h*y_head_stride + row_in is inside y by the launch contract
-            // and belongs to this row alone.
-            unsafe {
-                *y.get_unchecked_mut(h * y_head_stride as usize + row_in) = s0;
-            }
-        }
-    }
-
-    /// Both head halves of [`q3k_gemv_heads`] in ONE launch: the same body
-    /// over the same rows, taking the activation from the half the row's
-    /// head belongs to — heads below `split` read `(q_lo, d8_lo)` at column
-    /// `hi`, the rest `(q_hi, d8_hi)` at column `hi - split`. The two halves
-    /// read DIFFERENT weight rows, so this saves a launch, not a weight
-    /// read.
     ///
     /// The branch is warp-uniform: a warp owns one row, hence one head, so
     /// all 32 lanes take the same side and the warp reduction inside
-    /// `q3k_row_dot` still sees a full warp. Every row's loads, accumulation
-    /// order and store are the ones the two-launch form runs, so the outputs
-    /// agree bit for bit.
+    /// `q3k_row_dot` still sees a full warp.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -268,9 +199,9 @@ mod step_kernels {
             return;
         }
         let hi = row / rows_per_head as usize;
-        // As `q3k_gemv_heads`: the launch contract cannot bind n_rows to
-        // heads*rows_per_head, so a violated divisibility stops here rather
-        // than read weight rows past the last head's block.
+        // The launch contract cannot bind n_rows to heads*rows_per_head (no
+        // division in its grammar), so a violated divisibility stops here
+        // rather than read weight rows past the last head's block.
         if hi >= heads as usize {
             return;
         }
@@ -335,16 +266,9 @@ pub(crate) struct HeadsGeom {
     pub y_head_stride: usize,
 }
 
-/// [`StepKernels::enqueue_q3k_gemv_heads`]'s arguments.
-pub(crate) struct Q3kGemvHeadsArgs<'a> {
-    pub w: &'a DeviceTensor<u32>,
-    pub act: &'a Q8Act,
-    pub geom: HeadsGeom,
-    pub y: &'a mut DeviceBuffer<f32>,
-}
-
-/// [`StepKernels::enqueue_q3k_gemv_heads_pair`]'s arguments: as
-/// [`Q3kGemvHeadsArgs`], the activation columns split over `lo` and `hi`.
+/// [`StepKernels::enqueue_q3k_gemv_heads_pair`]'s arguments: the Q3_K
+/// weight, the per-head geometry and the output, the activation columns
+/// split over `lo` and `hi`.
 pub(crate) struct Q3kGemvHeadsPairArgs<'a> {
     pub w: &'a DeviceTensor<u32>,
     pub lo: &'a Q8Act,
@@ -521,78 +445,16 @@ impl StepKernels {
         Ok(())
     }
 
-    /// Enqueue the per-head Q3_K gemv: `heads` heads starting at
-    /// `head_base` (of the `w.rows()`-row weight, `row_stride_per_head`
-    /// rows per head), each head's `rows_per_head` output rows dotting
-    /// absolute weight row `h*row_stride_per_head + row_off + j` against
-    /// activation column `h - head_base` of `act` (m = 1), lane 0 writing
-    /// `y[h*y_head_stride + j]`. `heads` must be `act.m()` (one column per
-    /// head), `w.cols()` `110 * n_sb / 4` words with even `n_sb` (as
-    /// `enqueue_gemv_q3k`), and `row_off + rows_per_head <=
-    /// row_stride_per_head` so a head's rows stay on its own block.
-    /// Asynchronous, allocation-free, capturable.
-    pub(crate) fn enqueue_q3k_gemv_heads(
-        &self,
-        stream: &CudaStream,
-        a: Q3kGemvHeadsArgs<'_>,
-    ) -> Result<(), GpuError> {
-        let Q3kGemvHeadsArgs { w, act, geom, y } = a;
-        let HeadsGeom {
-            head_base,
-            rows_per_head,
-            row_stride_per_head,
-            row_off,
-            y_head_stride,
-        } = geom;
-        let n_sb = act.n_sb();
-        let heads = act.m();
-        check_q3k_heads(
-            "enqueue_q3k_gemv_heads",
-            w,
-            (n_sb, act.k()),
-            heads,
-            geom,
-            y.len(),
-        )?;
-        let n_rows = heads * rows_per_head;
-        let what = "enqueue_q3k_gemv_heads";
-        let n_rows = launch_u32(what, "n_rows", n_rows)?;
-        let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let head_base = launch_u32(what, "head_base", head_base)?;
-        let heads = launch_u32(what, "heads", heads)?;
-        let rows_per_head = launch_u32(what, "rows_per_head", rows_per_head)?;
-        let row_stride_per_head = launch_u32(what, "row_stride_per_head", row_stride_per_head)?;
-        let row_off = launch_u32(what, "row_off", row_off)?;
-        let y_head_stride = launch_u32(what, "y_head_stride", y_head_stride)?;
-        let prep =
-            self.module
-                .prepare_q3k_gemv_heads(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
-        self.module.q3k_gemv_heads(
-            stream,
-            &prep,
-            w.buf(),
-            &act.q3,
-            &act.d8,
-            n_rows,
-            n_sb,
-            n_sb.div_ceil(2),
-            head_base,
-            heads,
-            rows_per_head,
-            row_stride_per_head,
-            row_off,
-            y_head_stride,
-            y,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue [`StepKernels::enqueue_q3k_gemv_heads`] for BOTH head halves
-    /// in one launch: heads `head_base .. head_base + lo.m()` take their
-    /// activation column from `lo`, the `hi.m()` heads after them from `hi`.
-    /// Same weight, same shapes and the same per-head contract as the single
-    /// call — the two together replace the pair of launches, bit for bit.
-    /// Asynchronous, allocation-free, capturable.
+    /// Enqueue the per-head Q3_K gemv for both head halves in one launch:
+    /// heads `head_base .. head_base + lo.m()` take their activation column
+    /// from `lo`, the `hi.m()` heads after them from `hi`. Head `h` (of the
+    /// `w.rows()`-row weight, `row_stride_per_head` rows per head) has
+    /// `rows_per_head` output rows, each dotting absolute weight row
+    /// `h*row_stride_per_head + row_off + j` against its own activation
+    /// column (m = 1), lane 0 writing `y[h*y_head_stride + j]`. `w.cols()` is
+    /// `110 * n_sb / 4` words with even `n_sb` (as `enqueue_gemv_q3k`), and
+    /// `row_off + rows_per_head <= row_stride_per_head` so a head's rows stay
+    /// on its own block. Asynchronous, allocation-free, capturable.
     pub(crate) fn enqueue_q3k_gemv_heads_pair(
         &self,
         stream: &CudaStream,
@@ -664,7 +526,7 @@ impl StepKernels {
     }
 }
 
-/// The shape checks both per-head Q3_K launches share: even `n_sb`, `w`'s
+/// The shape checks of the per-head Q3_K launch: even `n_sb`, `w`'s
 /// row width, a head's rows inside its own block, the heads inside `w`, and
 /// `y` covering the last head's rows. `(n_sb, k)` is the activation's
 /// super-block count at `K = k`; `heads` heads start at `geom.head_base`.

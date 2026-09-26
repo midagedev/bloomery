@@ -9,9 +9,7 @@
 
 # generate_ds41 (--features gpu,deepseek41)
 generate_ds41   add                                     0          0
-generate_ds41   argmax                                  0          0
 generate_ds41   argmax_fault                            0          0
-generate_ds41   argmax_rows                             0          0
 generate_ds41   argmax_rows_fault                       0          0
 generate_ds41   card_sel                                0          0
 generate_ds41   dflash_expert_down                      0          0
@@ -81,16 +79,7 @@ generate_ds41   f32_gemv                                0          0
 generate_ds41   flash_latent                            0          0
 generate_ds41   flash_latent_mma                        0          0
 generate_ds41   flash_latent_q8                         0          0
-generate_ds41   flash_latent_seg                        0          0
-generate_ds41   flash_latent_seg_coll2                  0          0
-generate_ds41   flash_latent_seg_qk2                    0          0
-generate_ds41   flash_latent_seg_sm2                    0          0
-generate_ds41   flash_latent_seg_sync2                  0          0
-# PIN(2026-09-24): flash_latent_seg_v2 is the TWICE_V probe entry (probe_cfg.flash_v2); its second V pass compiles to a small local spill at the shipped entry's two blocks per SM, which its doc names as the point of the arm.
-generate_ds41   flash_latent_seg_v2                    36         16
 generate_ds41   flash_merge                             0          0
-# PIN(2026-09-24): flash_merge2_q8 is the probe twin of merge_row (runs only under probe_cfg.flash_merge2); its 16-segment merge batch keeps 40 bytes of ptxas spill and 8 of JIT local. MERGE_BATCH stays: the shipped merge carries no spill.
-generate_ds41   flash_merge2_q8                        40          8
 generate_ds41   flash_merge_q8                          0          0
 generate_ds41   gap_coop                                0          0
 generate_ds41   gap_coop_sync                           0          0
@@ -122,14 +111,12 @@ generate_ds41   norm_quant                              0          0
 generate_ds41   q2_k_rows                               0          0
 generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
-generate_ds41   q3k_gemv_heads                          0          0
 generate_ds41   q3k_gemv_heads_pair                     0          0
 generate_ds41   q3k_gemv_sel                            0          0
 generate_ds41   q3k_gemv_split                          0          0
 generate_ds41   q3k_gemv_split_groups                   0          0
 generate_ds41   q3k_gemv_split_mcol                     0          0
 generate_ds41   q3k_quantize_q8_1                       0          0
-generate_ds41   q3k_quantize_q8_1_pair                  0          0
 generate_ds41   q4k_gemv                                0          0
 generate_ds41   q4k_gemv_grouped                        0          0
 generate_ds41   q4k_gemv_mcol                           0          0
@@ -169,9 +156,7 @@ generate_ds41   weighted_sum                            0          0
 
 # gate_e2e (--features gpu)
 gate_e2e        add                                     0          0
-gate_e2e        argmax                                  0          0
 gate_e2e        argmax_fault                            0          0
-gate_e2e        argmax_rows                             0          0
 gate_e2e        argmax_rows_fault                       0          0
 gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
@@ -183,16 +168,7 @@ gate_e2e        f32_gemv                                0          0
 gate_e2e        flash_latent                            0          0
 gate_e2e        flash_latent_mma                        0          0
 gate_e2e        flash_latent_q8                         0          0
-gate_e2e        flash_latent_seg                        0          0
-gate_e2e        flash_latent_seg_coll2                  0          0
-gate_e2e        flash_latent_seg_qk2                    0          0
-gate_e2e        flash_latent_seg_sm2                    0          0
-gate_e2e        flash_latent_seg_sync2                  0          0
-# PIN(2026-09-24): flash_latent_seg_v2 is the TWICE_V probe entry (probe_cfg.flash_v2); its second V pass compiles to a small local spill at the shipped entry's two blocks per SM, which its doc names as the point of the arm.
-gate_e2e        flash_latent_seg_v2                    36         16
 gate_e2e        flash_merge                             0          0
-# PIN(2026-09-24): flash_merge2_q8 is the probe twin of merge_row (runs only under probe_cfg.flash_merge2); its 16-segment merge batch keeps 40 bytes of ptxas spill and 8 of JIT local. MERGE_BATCH stays: the shipped merge carries no spill.
-gate_e2e        flash_merge2_q8                        40          8
 gate_e2e        flash_merge_q8                          0          0
 gate_e2e        gap_coop                                0          0
 gate_e2e        gap_coop_sync                           0          0
@@ -224,14 +200,12 @@ gate_e2e        norm_quant                              0          0
 gate_e2e        q2_k_rows                               0          0
 gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0
-gate_e2e        q3k_gemv_heads                          0          0
 gate_e2e        q3k_gemv_heads_pair                     0          0
 gate_e2e        q3k_gemv_sel                            0          0
 gate_e2e        q3k_gemv_split                          0          0
 gate_e2e        q3k_gemv_split_groups                   0          0
 gate_e2e        q3k_gemv_split_mcol                     0          0
 gate_e2e        q3k_quantize_q8_1                       0          0
-gate_e2e        q3k_quantize_q8_1_pair                  0          0
 gate_e2e        q4k_gemv                                0          0
 gate_e2e        q4k_gemv_grouped                        0          0
 gate_e2e        q4k_gemv_mcol                           0          0

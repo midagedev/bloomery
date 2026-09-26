@@ -66,7 +66,7 @@ PROJ_HEADS = "ds41_q3k_gemv_heads_mcol"
 ROPE = "ds41_rope_tail"
 ATTN = {"ds41_attn_seg", "ds41_attn_seg_sel", "ds41_attn_seg_stage", "ds41_attn_seg_sel_stage",
         "ds41_attn_merge", "ds41_ring_commit", "ds41_kv_norm_rope_append", "kv_norm_rope_append"}
-SMALL = {"norm_quant", "rms_norm", "q3k_quantize_q8_1", "q3k_quantize_q8_1_pair", "ds41_rows_to_tokens",
+SMALL = {"norm_quant", "rms_norm", "q3k_quantize_q8_1", "ds41_rows_to_tokens",
          ROPE, HC_PRE, "ds41_hc_pre_f32", HC_POST}
 SOURCE = {"ds41_comp_pool", "ds41_comp_rows", "ds41_index_key", "ds41_indexer_score", "ds41_indexer_topk"}
 ROUTE_TAIL = {"ds41_router", "ds41_router_scores", "ds41_router_pick", PLACES}

@@ -174,162 +174,20 @@ impl ProfRec {
 /// assembled step, which no per-op table can say: a per-op row is an eager
 /// launch plus a synchronize, and the step runs as graph nodes.
 /// `pad_per_layer` adds empty nodes and prices the slope; `skip_quant` drops
-/// the five small quantize launches and prices their removal, work included.
-///
-/// The `flash_*` levers ask the other question — what one STAGE of the
-/// attention walk costs — and they answer it by doing that stage a second
-/// time (`crate::flash::TWICE_QK` and its siblings). They are launch-shape
-/// neutral and value neutral: the same node count, and the same tokens as
-/// the shipped path, which `gate_e2e` pins. The slowdown of one against
-/// `base` is a lower bound on that stage's price, the second pass running
-/// against a warm cache.
+/// the small quantize launches and prices their removal, work included.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StepProbe {
     /// Empty `probe::touch` launches enqueued once per layer. The captured
     /// step is a linear chain, so the site does not change a node's marginal
     /// cost; these sit at the end of the attention half.
     pub pad_per_layer: usize,
-    /// Skip the layer's small quantize launches — `kqvc`'s (whether it is
-    /// riding inside the attention launch or standing alone), `act_ao`, the
-    /// routed experts' 32-value quantize and the shared expert's q8_1. Their
-    /// consumers then read whatever the activation buffers already hold
-    /// (zeros from load), which addresses the same bytes and runs the same
-    /// launches. `kqvc`'s is the one that has moved into a producer, so this
-    /// also takes the attention launch back to its plain twin.
+    /// Skip the layer's small quantize launches — `act_ao`'s, the routed
+    /// experts' 32-value quantize and the shared expert's q8_1 — and the
+    /// `kqvc` quantization that rides inside the attention launch, which
+    /// takes that launch back to its plain twin. Their consumers then read
+    /// whatever the activation buffers already hold (zeros from load), which
+    /// addresses the same bytes and runs the same launches.
     pub skip_quant: bool,
-    /// Run the head gemv as the two half-launches instead of the merged
-    /// one. Value-neutral — the merged launch is bit-identical to the pair,
-    /// so this is the same-binary arm a sub-1 % claim about the merge is
-    /// judged against, and the rollback if one is ever needed.
-    pub split_heads: bool,
-    /// The same, for the `kqvc` q8_1 quantization: two launches instead of
-    /// the one that covers both halves. Only reachable with
-    /// `split_flash_quant`, which is what puts that quantization back on a
-    /// launch of its own.
-    pub split_kqvc: bool,
-    /// Take the `kqvc` q8_1 quantization back out of the attention launch
-    /// and give it its own, the shape before the side output was folded in.
-    /// Value-neutral — the folded twin writes the bytes the standalone
-    /// quantizer writes — so this is the same-binary arm the fold's claim is
-    /// judged against, and the rollback if one is ever needed.
-    pub split_flash_quant: bool,
-    /// The MoE half's two quantizations as two launches instead of the one
-    /// that carries both geometries. The launch order around them does not
-    /// change, so this arm isolates the merge itself.
-    pub split_moe_quant: bool,
-    /// Run the flash segment pass's QK dot twice, over the same key rows.
-    pub flash_qk2: bool,
-    /// The same, over rows one key tile along inside the segment — the same
-    /// work on rows the tile did not just read, so the pair brackets what a
-    /// cache hit is worth in that loop.
-    pub flash_qk2c: bool,
-    /// Run the segment pass's V accumulation twice, over the same rows.
-    pub flash_v2: bool,
-    /// The same, over the neighbouring tile's rows.
-    pub flash_v2c: bool,
-    /// Run the key butterfly and the two warp reductions twice.
-    pub flash_coll2: bool,
-    /// Give every tile a second pair of block barriers.
-    pub flash_sync2: bool,
-    /// Run warp 0's softmax arithmetic twice, both exponentials included.
-    pub flash_sm2: bool,
-    /// Run the merge pass's fold over the segment partials twice.
-    pub flash_merge2: bool,
-}
-
-impl StepProbe {
-    /// The flash stage-doubling arms, in the order
-    /// `generate --ab-set keyaxis` rotates them: the shipped path and each
-    /// lever alone. One list, so the gate that pins their tokens and the
-    /// runner that times them cannot disagree about what an arm is.
-    pub fn keyaxis_arms() -> [(&'static str, StepProbe); 9] {
-        let arm = |set: fn(&mut StepProbe)| {
-            let mut p = StepProbe::default();
-            set(&mut p);
-            p
-        };
-        [
-            ("base", StepProbe::default()),
-            ("flash_qk2", arm(|p| p.flash_qk2 = true)),
-            ("flash_qk2c", arm(|p| p.flash_qk2c = true)),
-            ("flash_v2", arm(|p| p.flash_v2 = true)),
-            ("flash_v2c", arm(|p| p.flash_v2c = true)),
-            ("flash_coll2", arm(|p| p.flash_coll2 = true)),
-            ("flash_sync2", arm(|p| p.flash_sync2 = true)),
-            ("flash_sm2", arm(|p| p.flash_sm2 = true)),
-            ("flash_merge2", arm(|p| p.flash_merge2 = true)),
-        ]
-    }
-
-    /// The segment-pass probe entry this probe selects, as the stage bit and
-    /// the second pass's row offset; `None` is the shipped entry.
-    pub(crate) fn flash_seg_twice(&self) -> Option<(u32, usize)> {
-        [
-            (self.flash_qk2, crate::flash::TWICE_QK, 0),
-            (
-                self.flash_qk2c,
-                crate::flash::TWICE_QK,
-                crate::flash::KEY_TILE,
-            ),
-            (self.flash_v2, crate::flash::TWICE_V, 0),
-            (
-                self.flash_v2c,
-                crate::flash::TWICE_V,
-                crate::flash::KEY_TILE,
-            ),
-            (self.flash_coll2, crate::flash::TWICE_COLL, 0),
-            (self.flash_sync2, crate::flash::TWICE_SYNC, 0),
-            (self.flash_sm2, crate::flash::TWICE_SM, 0),
-        ]
-        .into_iter()
-        .find(|&(on, _, _)| on)
-        .map(|(_, bit, shift)| (bit, shift))
-    }
-
-    /// Refuse a flash lever that would silently do nothing — the shape a
-    /// later round reads as a broken lever. Two segment-pass levers would
-    /// each claim the one segment launch; a cache short enough to hold one
-    /// segment runs a kernel with no probe twin at all; and the merge lever
-    /// probes the q8 merge, which `skip_quant` and `split_flash_quant`
-    /// replace with the plain one.
-    pub(crate) fn check(&self, cache_rows: usize) -> Result<(), GpuError> {
-        let seg = [
-            self.flash_qk2,
-            self.flash_qk2c,
-            self.flash_v2,
-            self.flash_v2c,
-            self.flash_coll2,
-            self.flash_sync2,
-            self.flash_sm2,
-        ]
-        .iter()
-        .filter(|on| **on)
-        .count();
-        if seg > 1 {
-            return Err(GpuError::shape(
-                "StepProbe",
-                "one flash segment-pass lever at a time — each names the probe \
-                 entry the segment launch runs, and they are one launch",
-            ));
-        }
-        if (seg == 1 || self.flash_merge2) && crate::flash::segments_for(cache_rows) == 1 {
-            return Err(GpuError::shape(
-                "StepProbe",
-                format!(
-                    "the flash levers probe the split launch, and a {cache_rows}-row \
-                 cache takes the single-block kernel — raise ctx or drop the lever"
-                ),
-            ));
-        }
-        if self.flash_merge2 && (self.skip_quant || self.split_flash_quant) {
-            return Err(GpuError::shape(
-                "StepProbe",
-                "flash_merge2 probes the q8 merge, and skip_quant / \
-                 split_flash_quant put the plain merge back in its place",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Tick the observer for op `*i` and advance. `obs` fires on the host after

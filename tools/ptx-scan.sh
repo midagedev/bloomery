@@ -19,10 +19,10 @@
 # read from those files and from nothing else in the section.
 #
 # Asserting is the gates' job. This script only prints a table:
-#   gate_p5 (lib `no_local_depot`)  — depot, ld.local and st.local are all 0 for the four flash
+#   gate_p5 (lib `no_local_depot`)  — depot, ld.local and st.local are all 0 for the three flash
 #                                     kernels and the two kv_append entries
 #   gate_p4 `norm_geometry`         — .reqntid of rms_norm and norm_quant == RMS_THREADS
-#   gate_p4 `argmax_geometry`       — .reqntid of argmax == ARGMAX_THREADS
+#   gate_p4 `argmax_geometry`       — .reqntid of argmax_fault and argmax_rows_fault == ARGMAX_THREADS
 #   gate_p6 `router_shape`          — the fma floor and no depot for f32_gemv, q8_0_gemv and
 #                                     q8_0_gemv_heads, and .reqntid of router_topk and expert_table
 #   gate_p6 `q3k_half_decode_shape` — no clz and a hardware f16 convert in both Q3_K entries
@@ -162,7 +162,7 @@ for MOD in "${MODFILES[@]}"; do
     continue
   fi
   # Key on the name ptxas quotes, never on a substring: `flash_latent` is a prefix of
-  # `flash_latent_seg`, which is a prefix of `flash_latent_seg_v2`.
+  # `flash_latent_q8` and of `flash_latent_mma`.
   LC_ALL=C awk -v q="'" '
     index($0, "Compiling entry function") > 0 {
       i = index($0, q); rest = substr($0, i + 1); j = index(rest, q)

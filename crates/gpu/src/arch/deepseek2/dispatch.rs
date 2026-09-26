@@ -4,18 +4,15 @@
 use super::names::LayerNames;
 use super::scratch::{Gather, LayerScratch, MoeDims, MoeScratch};
 use crate::flash::{
-    FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMerge2Q8Args, FlashMergeArgs,
-    FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
+    FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs, FlashMergeQ8Args,
+    FlashSegArgs,
 };
 use crate::head::Head;
 use crate::hybrid::{Boundary, HostExperts, Hybrid};
-use crate::model::kernels::{
-    HeadsGeom, Q3kGemvHeadsArgs, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels,
-};
+use crate::model::kernels::{HeadsGeom, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels};
 use crate::model::lookup::{dev_weight, f32_gain, f32_tensor, kq_weight, q8_derived};
 use crate::model::probe::{
-    Bytes, Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick,
-    weight_bytes,
+    Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick, weight_bytes,
 };
 use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -172,13 +169,11 @@ fn enqueue_attn(
     // a block there holds one head's whole latent row, which is four whole
     // q8_1 blocks, so the quantization rides inside it instead of taking a
     // launch of its own. Both paths carry it or neither does — a half-done
-    // fold would leave the single-segment path unquantized. The kqvc
-    // quantizer reads the same flag to skip its own launch.
-    let fold_quant = !s.probe_cfg.skip_quant && !s.probe_cfg.split_flash_quant;
-    // Unlabelled, as the split path's own quantizer launches are: either
-    // path leaves the same fault word.
+    // fold would leave the single-segment path unquantized.
+    let fold_quant = !s.probe_cfg.skip_quant;
+    // Unlabelled, as the layer's other quantizer launches (`act_ao`'s and
+    // the MoE pair's) are.
     attn_flash(gpu, kv_l, s, mla, fold_quant, gpu.unlabelled_sink(), i, obs)?;
-    attn_kqvc_quant(gpu, s, mla, fold_quant, i, obs)?;
     attn_wv_b(gpu, step, w, names, s, mla, i, obs)?;
     attn_out(gpu, w, names, s, i, obs)
 }
@@ -470,31 +465,16 @@ fn attn_flash(
             ]),
         )?;
     } else {
-        // A flash lever swaps the segment launch for the probe entry that
-        // does one stage twice — the same launch, the same partials. The
-        // tensor-core pass is the third shape of that one launch: one block
-        // per (head group, segment) instead of per (head, segment), the
-        // same partials, so the merge below and the launch count do not
-        // move.
-        let seg = FlashSegArgs {
-            inputs,
-            part_v: &mut s.part_v,
-            part_ms: &mut s.part_ms,
-        };
-        match s.probe_cfg.flash_seg_twice() {
-            None if crate::flash::flash_mma() => {
-                gpu.flash().enqueue_flash_latent_mma(stream, seg)?
-            }
-            None => gpu.flash().enqueue_flash_latent_seg(stream, seg)?,
-            Some((twice, shift)) => gpu.flash().enqueue_flash_latent_seg_twice(
-                stream,
-                FlashSegTwiceArgs {
-                    seg,
-                    twice,
-                    shift_rows: shift,
-                },
-            )?,
-        }
+        // The tensor-core segment pass: one block per (head group,
+        // segment), each writing its heads' partials for the merge below.
+        gpu.flash().enqueue_flash_latent_mma(
+            stream,
+            FlashSegArgs {
+                inputs,
+                part_v: &mut s.part_v,
+                part_ms: &mut s.part_ms,
+            },
+        )?;
         // Same reads as the single-block launch; the partials of the live
         // segments out, plus the `(−inf, 0)` pair every segment past the
         // live keys still writes so the merge can skip it.
@@ -522,28 +502,15 @@ fn attn_flash(
             y: &mut s.kqvc,
         };
         if fold_quant {
-            if s.probe_cfg.flash_merge2 {
-                gpu.flash().enqueue_flash_merge2_q8(
-                    stream,
-                    FlashMerge2Q8Args {
-                        merge,
-                        lo: &mut s.act_kv_lo,
-                        hi: &mut s.act_kv_hi,
-                        shift_segs: 0,
-                        fault,
-                    },
-                )?;
-            } else {
-                gpu.flash().enqueue_flash_merge_q8(
-                    stream,
-                    FlashMergeQ8Args {
-                        merge,
-                        lo: &mut s.act_kv_lo,
-                        hi: &mut s.act_kv_hi,
-                        fault,
-                    },
-                )?;
-            }
+            gpu.flash().enqueue_flash_merge_q8(
+                stream,
+                FlashMergeQ8Args {
+                    merge,
+                    lo: &mut s.act_kv_lo,
+                    hi: &mut s.act_kv_hi,
+                    fault,
+                },
+            )?;
         } else {
             gpu.flash().enqueue_flash_merge(stream, merge)?;
         }
@@ -565,68 +532,8 @@ fn attn_flash(
     Ok(())
 }
 
-/// Stage 9 of the attention half, first part: `s.kqvc`'s q8_1 form in
-/// `s.act_kv_lo`/`s.act_kv_hi`, unless flash already wrote it
-/// (`fold_quant`) or the probe skips it.
-fn attn_kqvc_quant(
-    gpu: &Gpu,
-    s: &mut LayerScratch,
-    mla: &MlaParams,
-    fold_quant: bool,
-    i: &mut usize,
-    obs: &mut Observer<'_>,
-) -> Result<(), GpuError> {
-    let latent = mla.latent;
-    let half = mla.n_head / 2;
-
-    // 9. wv_b per head: flash's output is head-major — kqvc column h is
-    //    head h's compressed values, the m-column layout the quantizer
-    //    consumes; the heads 8..15 half quantizes from kqvc's base offset
-    //    (the quantizer's x base), so no gathered copy.
-    if !fold_quant && !s.probe_cfg.skip_quant {
-        if s.probe_cfg.split_kqvc {
-            gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
-            tick(
-                i,
-                obs,
-                "quantize_q8_1(kqvc_lo)",
-                bsum(&[
-                    Some(4 * s.act_kv_lo.m() * latent),
-                    Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
-                ]),
-            )?;
-            gpu.enqueue_quantize_q8_1_at(&s.kqvc, half * latent, &mut s.act_kv_hi)?;
-            tick(
-                i,
-                obs,
-                "quantize_q8_1(kqvc_hi)",
-                bsum(&[
-                    Some(4 * s.act_kv_hi.m() * latent),
-                    Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
-                ]),
-            )?;
-        } else {
-            // Both halves of `kqvc` in one launch: the same two planes of
-            // the same buffer, one grid covering both.
-            let (lo, hi) = (&mut s.act_kv_lo, &mut s.act_kv_hi);
-            gpu.enqueue_quantize_q8_1_pair(&s.kqvc, 0, lo, half * latent, hi)?;
-            tick(
-                i,
-                obs,
-                "quantize_q8_1(kqvc)",
-                bsum(&[
-                    Some(4 * (s.act_kv_lo.m() + s.act_kv_hi.m()) * latent),
-                    Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
-                    Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
-                ]),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Stage 9 of the attention half, second part: wv_b per head over the
-/// quantized `kqvc` into `s.kqv_2d`.
+/// Stage 9 of the attention half: wv_b per head over `kqvc`'s q8_1 form
+/// (written by the flash launch) into `s.kqv_2d`.
 #[allow(
     clippy::too_many_arguments,
     reason = "a stage of `enqueue_attn`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
@@ -642,9 +549,8 @@ fn attn_wv_b(
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
-    let half = mla.n_head / 2;
 
-    // Each per-head launch dots only its heads' wv_b rows (absolute row
+    // 9. Each per-head launch dots only its heads' wv_b rows (absolute row
     // h*(nope+v_head) + nope + j, activation column h - head_base, m = 1),
     // writing the flat, head-major kqv_2d directly — the wk_b rows are
     // never read.
@@ -657,65 +563,30 @@ fn attn_wv_b(
         row_off: mla.nope,
         y_head_stride: mla.v_head,
     };
-    if s.probe_cfg.split_heads {
-        // The two-launch form: half the heads' wv_b rows against their own
-        // activation columns, then the other half.
-        let wv_b_bytes = |a: &Q8Act| -> Bytes {
-            bsum(&[
-                weight_bytes(wkvb, half * mla.v_head),
-                gemv_act_bytes(wkvb, a, a.m()),
-                Some(4 * half * mla.v_head),
-            ])
-        };
-        step.enqueue_q3k_gemv_heads(
-            stream,
-            Q3kGemvHeadsArgs {
-                w: kv_b,
-                act: &s.act_kv_lo,
-                geom,
-                y: &mut s.kqv_2d,
-            },
-        )?;
-        tick(i, obs, "gemv_q3k_heads(wv_b_lo)", wv_b_bytes(&s.act_kv_lo))?;
-        step.enqueue_q3k_gemv_heads(
-            stream,
-            Q3kGemvHeadsArgs {
-                w: kv_b,
-                act: &s.act_kv_hi,
-                geom: HeadsGeom {
-                    head_base: half,
-                    ..geom
-                },
-                y: &mut s.kqv_2d,
-            },
-        )?;
-        tick(i, obs, "gemv_q3k_heads(wv_b_hi)", wv_b_bytes(&s.act_kv_hi))?;
-    } else {
-        // Both halves' wv_b rows in one launch, each head against its own
-        // activation column. The halves read different weight rows, so this
-        // saves the launch, not the weight read.
-        step.enqueue_q3k_gemv_heads_pair(
-            stream,
-            Q3kGemvHeadsPairArgs {
-                w: kv_b,
-                lo: &s.act_kv_lo,
-                hi: &s.act_kv_hi,
-                geom,
-                y: &mut s.kqv_2d,
-            },
-        )?;
-        tick(
-            i,
-            obs,
-            "gemv_q3k_heads(wv_b)",
-            bsum(&[
-                weight_bytes(wkvb, mla.n_head * mla.v_head),
-                gemv_act_bytes(wkvb, &s.act_kv_lo, s.act_kv_lo.m()),
-                gemv_act_bytes(wkvb, &s.act_kv_hi, s.act_kv_hi.m()),
-                Some(4 * mla.n_head * mla.v_head),
-            ]),
-        )?;
-    }
+    // Both halves' wv_b rows in one launch, each head against its own
+    // activation column. The halves read different weight rows, so this
+    // saves the launch, not the weight read.
+    step.enqueue_q3k_gemv_heads_pair(
+        stream,
+        Q3kGemvHeadsPairArgs {
+            w: kv_b,
+            lo: &s.act_kv_lo,
+            hi: &s.act_kv_hi,
+            geom,
+            y: &mut s.kqv_2d,
+        },
+    )?;
+    tick(
+        i,
+        obs,
+        "gemv_q3k_heads(wv_b)",
+        bsum(&[
+            weight_bytes(wkvb, mla.n_head * mla.v_head),
+            gemv_act_bytes(wkvb, &s.act_kv_lo, s.act_kv_lo.m()),
+            gemv_act_bytes(wkvb, &s.act_kv_hi, s.act_kv_hi.m()),
+            Some(4 * mla.n_head * mla.v_head),
+        ]),
+    )?;
     Ok(())
 }
 
@@ -905,19 +776,14 @@ fn enqueue_ffn_moe(
         act_ffn,
         moe,
         l_out,
-        probe_cfg:
-            StepProbe {
-                skip_quant,
-                split_moe_quant,
-                ..
-            },
+        probe_cfg: StepProbe { skip_quant, .. },
         ..
     } = s;
     let m = moe_arena(moe, names)?;
     moe_norm_quant(gpu, w, names, mla, ffn_inp, act_ffn, &mut m.normed, i, obs)?;
     moe_route(gpu, w, names, act_ffn, m, dims, hidden, i, obs)?;
     moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
-    moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
+    moe_quantize(gpu, m, dims, *skip_quant, i, obs)?;
     moe_down_combine(gpu, w, names, ffn_inp, l_out, m, dims, hidden, i, obs)
 }
 
@@ -961,12 +827,7 @@ fn enqueue_ffn_moe_hybrid(
         act_ffn,
         moe,
         l_out,
-        probe_cfg:
-            StepProbe {
-                skip_quant,
-                split_moe_quant,
-                ..
-            },
+        probe_cfg: StepProbe { skip_quant, .. },
         ..
     } = s;
     let m = moe_arena(moe, names)?;
@@ -1005,7 +866,7 @@ fn enqueue_ffn_moe_hybrid(
     }
     moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
     if card {
-        moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
+        moe_quantize(gpu, m, dims, *skip_quant, i, obs)?;
         moe_expert_down(
             gpu,
             w,
@@ -1293,61 +1154,39 @@ fn moe_shexp_gate_up(
 }
 
 /// Stage 8 of the routed FFN half: `m.h_exp`'s 32-value form and `m.h_sh`'s
-/// q8_1 form, in one launch or two as the probe asks, or none when it
-/// skips them.
+/// q8_1 form in one launch, or none when the probe skips them.
 fn moe_quantize(
     gpu: &Gpu,
     m: &mut MoeScratch,
     dims: &MoeDims,
     skip_quant: bool,
-    split_moe_quant: bool,
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
     // 8. both quantizations in one launch: the routed experts' 32-value form
     //    and the shared expert's q8_1. Different sources, different outputs,
     //    different geometries — merged because they are two launches, not
     //    because they share work.
     if !skip_quant {
-        if split_moe_quant {
-            gpu.q5().enqueue_quantize_q8(
-                stream,
-                &m.h_exp,
-                &mut m.act32_exp,
-                gpu.unlabelled_sink(),
-            )?;
-            tick(
-                i,
-                obs,
-                "moe_expert_quantize_q8",
-                bsum(&[
-                    Some(4 * dims.n_used * dims.ff),
-                    Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
-                ]),
-            )?;
-            moe_shexp_quantize(gpu, m, dims, i, obs)?;
-        } else {
-            gpu.q5().enqueue_quantize_q8_pair(
-                stream,
-                &m.h_exp,
-                &mut m.act32_exp,
-                &m.h_sh,
-                &mut m.act_sh,
-                gpu.unlabelled_sink(),
-            )?;
-            tick(
-                i,
-                obs,
-                "moe_quantize_pair",
-                bsum(&[
-                    Some(4 * dims.n_used * dims.ff),
-                    Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
-                    Some(4 * dims.shexp_ff),
-                    Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
-                ]),
-            )?;
-        }
+        gpu.q5().enqueue_quantize_q8_pair(
+            gpu.stream(),
+            &m.h_exp,
+            &mut m.act32_exp,
+            &m.h_sh,
+            &mut m.act_sh,
+            gpu.unlabelled_sink(),
+        )?;
+        tick(
+            i,
+            obs,
+            "moe_quantize_pair",
+            bsum(&[
+                Some(4 * dims.n_used * dims.ff),
+                Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
+                Some(4 * dims.shexp_ff),
+                Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
+            ]),
+        )?;
     }
     Ok(())
 }

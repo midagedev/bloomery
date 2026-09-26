@@ -8,7 +8,7 @@
 //!
 //!     generate [--prompt-id <id> | --tokens a,b,c | --seed-depth D]
 //!              [-n N] [--ctx C] [--mode eager|graph] [--time [--warm W]]
-//!              [--ab R [--ab-set SET]]
+//!              [--ab R] [--probe-pad K] [--probe-skip-quant]
 //!
 //! Defaults: prompt 0, N 32, ctx 512, mode graph, W 0.
 //!
@@ -48,21 +48,17 @@
 //! `refresh_params` host-to-device copies, each of which synchronizes the
 //! stream today, and the argmax readback.
 //!
-//! `--ab R` is the same-binary arm comparison, and also a MEASUREMENT. It
-//! runs every `StepProbe` launch-shape arm `R` times inside ONE process on
-//! ONE loaded model, so what separates two arms is the launch shape and not
-//! a rebuild's link layout, a different allocation or a different lease.
-//! The arm order rotates by round: in a fixed order the first arm of a
-//! round reads fast, which is enough to flip a claim of about a percent.
-//! Each arm run rewinds to an empty cache and re-captures its graph, so an
-//! arm never inherits the previous one's state.
+//! `--ab R` is the same-binary ruler, and also a MEASUREMENT. It runs the
+//! shipped path (`base`, every probe lever off) `R` rounds inside ONE
+//! process on ONE loaded model after one untimed warm round, each round
+//! rewinding to an empty cache and re-capturing its graph, and prints each
+//! round's p50 and their mean with its sample standard deviation — the
+//! `ab arm=base` line `tools/ref/depth-gpu.sh` reads beside its `--time`
+//! rows.
 //!
-//! `--ab-set` picks which arms: `launch` (the default) is the launch-shape
-//! levers, each restoring one merge to the pair it replaced; `keyaxis` is
-//! `StepProbe::keyaxis_arms` — the shipped path and each flash
-//! stage-doubling lever alone, where an arm's gap to `base` is the price of
-//! the attention stage it does twice. Both sets are same-binary, and every
-//! arm of either writes the tokens `base` writes.
+//! `--probe-pad K` and `--probe-skip-quant` arm the node-price probe
+//! (`StepProbe`): the run is then a timing instrument, and its footer says
+//! so.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -219,37 +215,25 @@ fn run() -> Result<(), GateError> {
     let probe = StepProbe {
         pad_per_layer: flag_value("--probe-pad")?.map_or(Ok(0), |s| s.parse())?,
         skip_quant: std::env::args().any(|a| a == "--probe-skip-quant"),
-        split_heads: std::env::args().any(|a| a == "--probe-split-heads"),
-        split_kqvc: std::env::args().any(|a| a == "--probe-split-kqvc"),
-        split_flash_quant: std::env::args().any(|a| a == "--probe-split-flash-quant"),
-        split_moe_quant: std::env::args().any(|a| a == "--probe-split-moe-quant"),
-        // The flash stage-doubling levers are an arm set, not flags: they
-        // are only worth reading interleaved against `base`.
-        ..StepProbe::default()
     };
 
-    // `split_kqvc` rolls the kqvc quantize PAIR back into two launches, and
-    // since the fmerge round there is no pair unless `split_flash_quant`
-    // first rolls the fold back into one. Alone it is a silent no-op, which
-    // is the shape a later round mistakes for "the lever is broken" — so it
-    // is refused rather than ignored.
-    if probe.split_kqvc && !probe.split_flash_quant {
-        return Err("--probe-split-kqvc has no effect without \
-                    --probe-split-flash-quant: the kqvc quantize is folded \
-                    into the flash kernel, so there is no separate pair \
-                    launch to split. Pass both, or neither."
+    // Flags that name no arm this binary carries are refused by name: the
+    // parser reads only the flags it knows, so such a command line would
+    // otherwise run the shipped path and read as the arm it asked for.
+    for gone in [
+        "--ab-set",
+        "--probe-split-heads",
+        "--probe-split-kqvc",
+        "--probe-split-flash-quant",
+        "--probe-split-moe-quant",
+    ] {
+        if std::env::args().any(|a| a == gone) {
+            return Err(format!(
+                "generate: {gone} names no arm this binary carries — --ab runs the shipped \
+                 path alone"
+            )
             .into());
-    }
-
-    // Refused rather than ignored: an arm set with no `--ab` to run it is
-    // the shape a later round reads as "the set is broken".
-    let ab_set = flag_value("--ab-set")?;
-    if ab_set.is_some() && flag_value("--ab")?.is_none() {
-        return Err(
-            "generate: --ab-set picks the arms of --ab, which this run has not asked \
-                    for. Pass both, or neither."
-                .into(),
-        );
+        }
     }
 
     // Refused rather than ignored, like the levers above. `--ab` runs one
@@ -282,22 +266,13 @@ fn run() -> Result<(), GateError> {
 
     let file = Split::open(ref_model_path()?)?;
     // The drive below needs more than the `Engine` surface (step mode,
-    // probe, graph capture, the stage table), so it names its arm; the
-    // deepseek41 chain has none of those yet.
+    // probe, graph capture, the stage table), so it names its arm.
     let mut model = match AnyEngine::open(file, ctx)? {
         AnyEngine::Deepseek2(m) => m,
         AnyEngine::Qwen3moe(_) => {
             return Err(
                 "generate: drives the deepseek2 chain; the file is qwen3moe, \
                         whose driver is generate_qwen3moe (just gen-qwen3moe)"
-                    .into(),
-            );
-        }
-        #[cfg(feature = "deepseek41")]
-        AnyEngine::Deepseek41(_) => {
-            return Err(
-                "generate: drives the deepseek2 chain; the file is deepseek41, \
-                        whose driver is generate_ds41 (just gen-ds41)"
                     .into(),
             );
         }
@@ -312,30 +287,24 @@ fn run() -> Result<(), GateError> {
             );
         }
         let rounds: usize = rounds.parse()?;
-        let arms: Vec<(&str, StepProbe)> = match ab_set.as_deref() {
-            None | Some("launch") => launch_arms().to_vec(),
-            Some("keyaxis") => StepProbe::keyaxis_arms().to_vec(),
-            Some(other) => {
-                return Err(format!("generate: --ab-set is launch or keyaxis, not {other}").into());
-            }
-        };
-        return ab(&mut model, &tokens, n_gen, rounds, mode, &arms);
+        return ab(
+            &mut model,
+            &tokens,
+            n_gen,
+            rounds,
+            mode,
+            &[("base", StepProbe::default())],
+        );
     }
     if probe != StepProbe::default() {
         model.set_probe(probe)?;
     }
     println!(
-        "probe pad_per_layer={} skip_quant={} split_heads={} split_kqvc={} \
-         split_flash_quant={} split_moe_quant={}",
-        probe.pad_per_layer,
-        probe.skip_quant,
-        probe.split_heads,
-        probe.split_kqvc,
-        probe.split_flash_quant,
-        probe.split_moe_quant
+        "probe pad_per_layer={} skip_quant={}",
+        probe.pad_per_layer, probe.skip_quant
     );
     println!(
-        "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} seg_keys={}",
+        "load resident_bytes={} ctx={ctx} layers={} mode={} seg_keys={}",
         model.resident_bytes(),
         model.stages()[0].layers().len(),
         if mode == StepMode::Graph {
@@ -343,7 +312,6 @@ fn run() -> Result<(), GateError> {
         } else {
             "eager"
         },
-        bloomery_gpu::flash::flash_mma(),
         bloomery_gpu::flash::seg_keys(),
     );
     if mode == StepMode::Graph {
@@ -403,9 +371,7 @@ fn run() -> Result<(), GateError> {
         println!(
             "SMOKE mode={} prompt_tokens={} depth={depth} seeded={} generated={n_gen} \
              warm={warm} steps={} p50_ms={p50:.4} \
-             mean_ms={mean:.4} tok/s(p50)={:.2} probe_pad={pad} probe_skip_quant={skip} \
-             probe_split_heads={split} probe_split_kqvc={split_kqvc} \
-             probe_split_flash_quant={split_fq} probe_split_moe_quant={split_mq}",
+             mean_ms={mean:.4} tok/s(p50)={:.2} probe_pad={pad} probe_skip_quant={skip}",
             if mode == StepMode::Graph {
                 "graph"
             } else {
@@ -417,28 +383,19 @@ fn run() -> Result<(), GateError> {
             1e3 / p50,
             pad = probe.pad_per_layer,
             skip = probe.skip_quant,
-            split = probe.split_heads,
-            split_kqvc = probe.split_kqvc,
-            split_fq = probe.split_flash_quant,
-            split_mq = probe.split_moe_quant,
         );
         println!("reference {}", ik_reference(depth));
     }
     Ok(())
 }
 
-/// The same-binary arm comparison. Every arm is one `StepProbe` launch
-/// shape; a round runs each arm once, and the round's starting arm rotates
-/// so no arm keeps the first position. Per arm the runner prints every
-/// round's p50 and then the mean of those p50s with its sample standard
-/// deviation, which is what a reader needs to know whether a sub-percent
-/// gap is a gap — this card's same-binary scatter is of that size.
-///
-/// `base` (every lever off) is the shipped path; each other arm of the
-/// `launch` set restores one merge to the launch shape it replaced, and
-/// each arm of the `keyaxis` set does one attention stage twice. Their
-/// outputs are all bit-identical by the gates, so a difference here is
-/// launch cost or that stage's cost alone.
+/// The same-binary ruler over `arms`, each one `StepProbe` launch shape
+/// with `base` (every lever off, the shipped path) first; a round runs each
+/// arm once, and the round's starting arm rotates so no arm keeps the first
+/// position. Per arm the runner prints every round's p50 and then the mean
+/// of those p50s with its sample standard deviation, which is what a reader
+/// needs to know whether a sub-percent gap is a gap — this card's
+/// same-binary scatter is of that size. `--ab` passes `base` alone.
 #[cfg(feature = "gpu")]
 fn ab(
     model: &mut Deepseek2Model,
@@ -493,37 +450,6 @@ fn ab(
     // depth every arm stands at.
     println!("reference {}", ik_reference(tokens.len()));
     Ok(())
-}
-
-/// The launch-shape arm set, `--ab-set launch`: the shipped path and the
-/// rollback of each merge the fusion rounds made.
-#[cfg(feature = "gpu")]
-fn launch_arms() -> [(&'static str, StepProbe); 4] {
-    [
-        ("base", StepProbe::default()),
-        (
-            "split_flash_quant",
-            StepProbe {
-                split_flash_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-        (
-            "split_moe_quant",
-            StepProbe {
-                split_moe_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-        (
-            "split_both",
-            StepProbe {
-                split_flash_quant: true,
-                split_moe_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-    ]
 }
 
 /// One arm run: rewind to an empty cache, set the probe (which drops any

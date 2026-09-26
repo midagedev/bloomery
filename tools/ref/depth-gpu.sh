@@ -13,9 +13,6 @@
 #                        `--ab`에는 워밍 라운드가 있고 `--time`에는 없다 — 둘을 같은 임대 안에
 #                        번갈아 세워야 그 차이가 계기 차이인지 창 표류인지 갈린다. 보고되는 값은
 #                        base 팔(레버 전부 끔 = 실제 경로)의 바퀴별 p50 평균이다.
-#                        BLOOMERY_AB_SET(기본 비어 있음)을 주면 `--ab-set`으로 넘기고, ROW 옆에
-#                        모든 팔의 `ab` 줄을 `ARM` 접두로 같이 찍는다 — keyaxis 세트에서는
-#                        base가 아니라 팔들의 차가 질문이기 때문이다.
 #   toks=<id,id,...>:<ctx>[:<n>]  우리 팔인데 프롬프트를 LCG가 아니라 리터럴 id로 준다.
 #                        헤드라인을 낸 그 프롬프트(id 0 = "The capital of France is")로 계기를
 #                        재현할 때 쓴다 — LCG 팔과 같은 길이에서 값이 같아야 "토큰 값은 시간에
@@ -34,7 +31,7 @@
 #                        변수 목록이 팔 이름에 붙으므로 평균 표에서 두 팔이 섞이지 않는다.
 #   <깊이>:<ctx>[:<n>]   우리 팔. ctx는 generate의 --ctx이고, 세그먼트 수를 정한다
 #                        (flash::segments_for(ctx) = ceil(ctx/seg_keys), seg_keys는 기본 텐서 코어
-#                        패스에서 64, BLOOMERY_FLASH_MMA=0 스칼라 패스에서 128 — generate의 load 줄이
+#                        패스에서 64 — generate의 load 줄이
 #                        찍는다). ctx는 깊이가 아니라 캐시 높이라
 #                        죽은 세그먼트도 블록을 런치한다 — 그래서 ctx는 팔마다 명시한다.
 #   ik:<깊이>            ik 팔. 깊이 0은 llama-bench의 평범한 tg N이고, 그 위는 -gp <깊이>,N이다.
@@ -64,6 +61,7 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$IKBIN" ] || { echo "no llama-bench at $IKBIN" >&2; exit 2; }
+[ -z "${BLOOMERY_AB_SET:-}" ] || { echo "BLOOMERY_AB_SET=$BLOOMERY_AB_SET is not a lever: generate --ab runs the shipped path alone; unset it" >&2; exit 2; }
 
 # The witness before and after every row: the timing card's lines, then this runner's busiest line.
 WITNESS=(head-open indent card busiest model)
@@ -133,7 +131,7 @@ for r in $(seq "$ROUNDS"); do
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
-          out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
+          out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" 2>&1)
         elif [[ "$label" == seed* ]]; then
           out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
         else
@@ -158,10 +156,6 @@ for r in $(seq "$ROUNDS"); do
           # base 팔의 바퀴별 p50 평균이므로, 통계 이름을 키에 박아 두 행을 같은 열에서
           # 잘못 읽지 않게 한다(열 하나에 통계 둘이 들어가는 것이 이 표의 유일한 함정이다).
           sums+=("ours($label,ab:base_p50) d=$dep ctx=$ctx n=$n|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|")
-          # 팔 세트를 준 라운드는 팔들의 차가 질문이므로 모든 ab 줄을 그대로 남긴다.
-          if [ -n "${BLOOMERY_AB_SET:-}" ]; then
-            echo "$out" | grep -E '^ab (round|arm)=' | sed "s/^/ARM r$r d=$dep | /"
-          fi
           continue
         fi
         smoke=$(echo "$out" | grep -E '^SMOKE ')

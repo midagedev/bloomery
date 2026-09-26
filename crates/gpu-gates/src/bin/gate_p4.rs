@@ -516,17 +516,41 @@ fn run() -> Result<(), GateError> {
         out_row.expect("result_output", "f32", [102400, 1, 1, 1], "MUL_MAT")?;
         let host = argmax_ref(&logits);
         let x_dev = DeviceBuffer::from_host(stream, &logits)?;
-        let mut idx_dev = DeviceBuffer::<u32>::zeroed(stream, 1)?;
-        elem.enqueue_argmax(stream, &x_dev, logits.len(), &mut idx_dev)?;
+        // The index, then the fault word and its layer's site mask — the
+        // head's readback. Read as `Head::tokens` reads it: a raised word is
+        // a fault, never an index.
+        let read_argmax = |buf: &DeviceBuffer<u32>| -> Result<(u32, bool), GateError> {
+            let out = buf.to_host_vec(stream)?;
+            Ok((
+                out[0],
+                bloomery_gpu::Fault::from_words(out[1], out[2]).is_none(),
+            ))
+        };
+        let mut idx_dev = DeviceBuffer::<u32>::zeroed(stream, 3)?;
+        elem.enqueue_argmax_fault(
+            stream,
+            &x_dev,
+            logits.len(),
+            gpu.unlabelled_sink(),
+            &mut idx_dev,
+        )?;
         stream.synchronize()?;
-        let dev = idx_dev.to_host_vec(stream)?[0];
-        elem.enqueue_argmax(stream, &x_dev, logits.len(), &mut idx_dev)?;
+        let (dev, clean1) = read_argmax(&idx_dev)?;
+        elem.enqueue_argmax_fault(
+            stream,
+            &x_dev,
+            logits.len(),
+            gpu.unlabelled_sink(),
+            &mut idx_dev,
+        )?;
         stream.synchronize()?;
-        let rerun = idx_dev.to_host_vec(stream)?[0] == dev;
+        let (dev2, clean2) = read_argmax(&idx_dev)?;
+        let rerun = dev2 == dev;
+        let clean = clean1 && clean2;
 
-        let pass = dev == host && dev == IK_ARGMAX && rerun;
+        let pass = dev == host && dev == IK_ARGMAX && rerun && clean;
         println!(
-            "shape op=argmax n={} argmax_dev={dev} argmax_host={host} bit_identical_rerun={rerun} ik_rel=n/a (integer index; ik_argmax={IK_ARGMAX}) {}",
+            "shape op=argmax n={} argmax_dev={dev} argmax_host={host} bit_identical_rerun={rerun} fault_clean={clean} ik_rel=n/a (integer index; ik_argmax={IK_ARGMAX}) {}",
             logits.len(),
             verdict(pass)
         );
@@ -608,16 +632,16 @@ fn run() -> Result<(), GateError> {
             }
             cases.push(("ragged_n_poison_past_n", v, RAGGED_N, 777));
 
-            let mut t_idx = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+            let mut t_idx = DeviceBuffer::<u32>::zeroed(stream, 3)?;
             for (label, x, n, want) in cases {
                 let host = argmax_ref(&x[..n]);
                 let x_dev = DeviceBuffer::from_host(stream, &x)?;
-                elem.enqueue_argmax(stream, &x_dev, n, &mut t_idx)?;
+                elem.enqueue_argmax_fault(stream, &x_dev, n, gpu.unlabelled_sink(), &mut t_idx)?;
                 stream.synchronize()?;
-                let got = t_idx.to_host_vec(stream)?[0];
-                let pass = got == want && host == want;
+                let (got, clean) = read_argmax(&t_idx)?;
+                let pass = got == want && host == want && clean;
                 println!(
-                    "shape op=argmax tie_case={label} n={n} buf={} argmax_dev={got} argmax_host={host} want={want} {}",
+                    "shape op=argmax tie_case={label} n={n} buf={} argmax_dev={got} argmax_host={host} want={want} fault_clean={clean} {}",
                     x.len(),
                     verdict(pass)
                 );
@@ -634,14 +658,14 @@ fn run() -> Result<(), GateError> {
         let gain0_dev = DeviceBuffer::from_host(stream, &gain0)?;
         let mut emb_y = DeviceBuffer::<f32>::zeroed(stream, m * 2048)?;
         let mut norm_y = DeviceBuffer::<f32>::zeroed(stream, m * 2048)?;
-        let mut am_y = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+        let mut am_y = DeviceBuffer::<u32>::zeroed(stream, 3)?;
         let run3 = |emb_y: &mut DeviceBuffer<f32>,
                     norm_y: &mut DeviceBuffer<f32>,
                     am_y: &mut DeviceBuffer<u32>|
          -> Result<(), bloomery_gpu::GpuError> {
             elem.enqueue_embed_rows(stream, &emb_dev, &ids_dev, emb_y)?;
             elem.enqueue_rms_norm(stream, emb_y, &gain0_dev, eps, 2048, m, norm_y)?;
-            elem.enqueue_argmax(stream, &x_dev, logits.len(), am_y)
+            elem.enqueue_argmax_fault(stream, &x_dev, logits.len(), gpu.unlabelled_sink(), am_y)
         };
         run3(&mut emb_y, &mut norm_y, &mut am_y)?;
         stream.synchronize()?;
@@ -677,8 +701,15 @@ fn run() -> Result<(), GateError> {
             let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
             let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
             let empty = gpu.capture(|_| probe.enqueue_touch(stream, &mut tbuf))?;
-            let am =
-                gpu.capture(|_| elem.enqueue_argmax(stream, &x_dev, logits.len(), &mut idx_dev))?;
+            let am = gpu.capture(|_| {
+                elem.enqueue_argmax_fault(
+                    stream,
+                    &x_dev,
+                    logits.len(),
+                    gpu.unlabelled_sink(),
+                    &mut idx_dev,
+                )
+            })?;
             let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, GateError> {
                 for _ in 0..2 {
                     g.launch(stream)?;
@@ -891,8 +922,8 @@ fn argmax_geometry() -> Result<bool, GateError> {
     /// The head's vocabulary: the one vector a decode step argmaxes.
     const ARGMAX_N: usize = 102_400;
 
-    // Every head argmax entry: the step's head runs the `_fault` pair.
-    ptx_shapes(&["argmax", "argmax_fault", "argmax_rows_fault"], |c, _| {
+    // Every argmax entry: the step's head runs this pair.
+    ptx_shapes(&["argmax_fault", "argmax_rows_fault"], |c, _| {
         let ntid = c
             .reqntid
             .ok_or_else(|| format!("gate_p4: PTX entry {} declares no .reqntid", c.name))?;

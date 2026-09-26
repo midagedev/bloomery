@@ -1,8 +1,8 @@
 //! The GPU output head: `result_norm → lm_head (Q6_K) → argmax` as one
 //! capturable sequence over resident scratch (docs/gpu-design.md decisions 4
 //! and 6). No kernels of its own — the chain is the gated `rms_norm`, the
-//! shared q8_1 quantizer, the Q6_K gemv and `argmax` exactly as the block
-//! path launches them, so their gates are this chain's gates.
+//! shared q8_1 quantizer, the Q6_K gemv and `argmax_fault` exactly as the
+//! block path launches them, so their gates are this chain's gates.
 //!
 //! A head carries `m` rows (1..=8), fixed at construction: the decode step
 //! samples one position (`m = 1`), a k-token step every row. Each row's
@@ -18,11 +18,11 @@
 //! site mask, one copy, and a raised word turns the readback into
 //! [`GpuError::Fault`] instead of a token.
 
+use crate::Gpu;
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, Weights};
-use crate::{Gpu, Graph};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
@@ -67,15 +67,9 @@ fn head_out_w(w: &Weights) -> Result<(&DeviceTensor<u32>, usize), GpuError> {
 /// The resident output head for `m` rows: input `m * hidden` f32 (row-major,
 /// one row per token), the normed rows, their q8_1 quantization, `n_vocab * m`
 /// logits (`logits[v*m + c]`, the gemv's layout) and `m` argmax tokens. Every
-/// buffer is allocated at construction; `enqueue` and a graph replay touch
-/// addresses only, so one captured graph serves every input written into `x`.
+/// buffer is allocated at construction and `enqueue` touches addresses only,
+/// so a graph that captures it serves every input written into `x`.
 pub struct Head {
-    /// Declared FIRST: fields drop in declaration order, and a captured graph
-    /// must be destroyed while every buffer it addresses is still alive
-    /// (`GpuModel` and `Stage` order theirs the same way — the reverse order
-    /// segfaulted the 12.4 GB model in the e2e round; this head survived at
-    /// 432 KB only by luck).
-    graph: Option<Graph>,
     eps: f32,
     hidden: usize,
     n_vocab: usize,
@@ -132,7 +126,6 @@ impl Head {
             act: Q8Act::with_k(stream, m, hidden)?,
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
-            graph: None,
         })
     }
 
@@ -166,9 +159,10 @@ impl Head {
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k → argmax (`argmax_rows` when `m > 1`), the argmax copying
-    /// the fault word after the tokens. Pure enqueues — no allocation, no
-    /// synchronization — so the same body is what `capture` records.
+    /// → gemv_q6k → argmax_fault (`argmax_rows_fault` when `m > 1`), the
+    /// argmax copying the fault word after the tokens. Pure enqueues — no
+    /// allocation, no synchronization — so the same body is what a capture
+    /// records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
         gpu.elem().enqueue_rms_norm(
@@ -246,25 +240,6 @@ impl Head {
             &mut self.logits,
             &mut self.token_out,
         )
-    }
-
-    /// Capture `enqueue` over the resident buffers into this head's graph and
-    /// return the node count. The buffers' addresses freeze — they were
-    /// allocated at `new`.
-    pub fn capture(&mut self, gpu: &Gpu, w: &Weights) -> Result<usize, GpuError> {
-        let graph = gpu.capture(|_| self.enqueue(gpu, w))?;
-        let nodes = graph.node_count();
-        self.graph = Some(graph);
-        Ok(nodes)
-    }
-
-    /// Enqueue one replay of the captured graph — no input write, no
-    /// synchronization; the caller reads back what it needs.
-    pub fn launch(&self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.graph
-            .as_ref()
-            .ok_or(GpuError::state("Head::launch", "no captured graph"))?
-            .launch(gpu.stream())
     }
 
     /// Write the chain's input from the host. Synchronizing copy on the

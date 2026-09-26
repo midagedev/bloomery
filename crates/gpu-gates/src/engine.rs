@@ -4,11 +4,11 @@
 //! [`Engine`] surface stays generic over it; one that needs more of the model
 //! (step mode, probes, graph capture, an architecture's taps) takes its arm.
 //!
-//! The enum lives in this crate because it is the one that sees both bodies:
-//! the deepseek41 body is in `bloomery-gpu-deepseek41`, which depends on
-//! `bloomery-gpu`, so `bloomery-gpu` cannot name it. The deepseek41 arm exists
-//! with this crate's `deepseek41` feature only, so a build without it never
-//! compiles V4.1 device code.
+//! The arms are the `bloomery-gpu` bodies. A deepseek41 file is refused by
+//! name before anything is loaded: its engine lives in the V4.1 crate, which
+//! this library never names (a crate named here is linked, whole device
+//! bundle and all, into every binary of the crate), and its drivers
+//! (`generate_ds41`, the V4.1 gates) open it themselves.
 
 #![cfg(feature = "gpu")]
 
@@ -25,17 +25,15 @@ use model::arch::Arch;
 pub enum AnyEngine {
     Deepseek2(Deepseek2Model),
     Qwen3moe(Qwen3moeModel),
-    #[cfg(feature = "deepseek41")]
-    Deepseek41(bloomery_gpu_deepseek41::body::Deepseek41Model),
 }
 
 impl AnyEngine {
     /// Detect `file`'s architecture, then load that architecture's whole
     /// chain and output head with a `ctx`-row cache: deepseek2 through
     /// `load_full` (every weight on the card, or the hybrid load its levers
-    /// ask for), qwen3moe through `load_full` (the whole model on one card),
-    /// deepseek41 by this workstation's serving placement (design §5 (a),
-    /// `workstation::plan_a`). The engine takes the file.
+    /// ask for), qwen3moe through `load_full` (the whole model on one card).
+    /// A deepseek41 file is [`GpuError::UnsupportedArch`] here, before any
+    /// load. The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
         let head = file.shard(0).ok_or(GpuError::State {
             what: "AnyEngine::open",
@@ -43,13 +41,6 @@ impl AnyEngine {
         })?;
         match Arch::detect(head)? {
             Arch::Deepseek2 => Ok(AnyEngine::Deepseek2(Deepseek2Model::load_full(file, ctx)?)),
-            #[cfg(feature = "deepseek41")]
-            Arch::Deepseek41 => Ok(AnyEngine::Deepseek41(bloomery_gpu_deepseek41::body::open(
-                file,
-                model::placement::workstation::plan_a,
-                ctx,
-            )?)),
-            #[cfg(not(feature = "deepseek41"))]
             a @ Arch::Deepseek41 => Err(GpuError::UnsupportedArch(a.name().to_string())),
             Arch::Qwen3moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::load_full(file, ctx)?)),
         }
@@ -61,8 +52,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.step(tokens),
             AnyEngine::Qwen3moe(m) => m.step(tokens),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.step(tokens),
         }
     }
 
@@ -70,8 +59,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.reset(),
             AnyEngine::Qwen3moe(m) => m.reset(),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.reset(),
         }
     }
 
@@ -79,8 +66,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.seed_depth(rows),
             AnyEngine::Qwen3moe(m) => m.seed_depth(rows),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.seed_depth(rows),
         }
     }
 
@@ -88,8 +73,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.pos(),
             AnyEngine::Qwen3moe(m) => m.pos(),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.pos(),
         }
     }
 
@@ -97,8 +80,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.resident_bytes(),
             AnyEngine::Qwen3moe(m) => m.resident_bytes(),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.resident_bytes(),
         }
     }
 
@@ -106,8 +87,6 @@ impl Engine for AnyEngine {
         match self {
             AnyEngine::Deepseek2(m) => m.arch(),
             AnyEngine::Qwen3moe(m) => m.arch(),
-            #[cfg(feature = "deepseek41")]
-            AnyEngine::Deepseek41(m) => m.arch(),
         }
     }
 }

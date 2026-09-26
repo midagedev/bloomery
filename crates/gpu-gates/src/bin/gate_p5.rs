@@ -6,9 +6,11 @@
 //! - asserted: device output vs a host f64 reference computed in this binary
 //!   from the same inputs — plain softmax in f64 over the f16-roundtripped
 //!   keys (the cache bits OUR `kv_append` wrote, read back), band 1e-5 for
-//!   the flash arithmetic; exact bit equality for the conversion (it is
-//!   exact by construction: the device calls the CPU oracle's own
-//!   `f32_to_f16_bits`). Plus a bit-identical rerun per shape.
+//!   the single-block flash arithmetic and a band of its own for the split
+//!   launch, whose segment pass rounds the query rows and products to f16;
+//!   exact bit equality for the conversion (it is exact by construction: the
+//!   device calls the CPU oracle's own `f32_to_f16_bits`). Plus a
+//!   bit-identical rerun per shape.
 //! - printed, not asserted: distance to the oracle — `ik_rel` for the flash
 //!   output vs `kqv_compressed-L`, and `ik_cache_bits_equal` for the cache
 //!   bits vs `kv_cache-L`. The lead pins block-layer bands from these.
@@ -39,9 +41,8 @@
 //!
 //! One shape check joins them, read off the device code this binary carries
 //! rather than off a clock: every flash entry — the single-block
-//! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, the
-//! tensor-core segment pass `flash_latent_mma`, and both appends — must
-//! compile with no local depot.
+//! `flash_latent`, the split pair `flash_latent_mma`/`flash_merge`, and both
+//! appends — must compile with no local depot.
 //! A per-thread accumulator array the backend cannot hold in registers is
 //! spilled to local memory, and every accumulate becomes a dependent local
 //! round trip — a defect that changes no output and no band, so nothing else
@@ -56,8 +57,8 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
     FlashGeom, FlashInputs, FlashKernels, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs,
-    FlashMergeQ8Args, FlashSegArgs, FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len,
-    partials_v_len, seg_keys, segments_for,
+    FlashMergeQ8Args, FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len,
+    seg_keys, segments_for,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu::fused::{Q8ActHost, readback_q8act};
@@ -87,11 +88,12 @@ fn run() -> Result<(), GateError> {
     // The flash arithmetic is not exact by construction (exp, two reduction
     // trees): this package's asserted band. The conversion op asserts bits.
     const FLASH_BAND: f32 = 1e-5;
-    // The tensor-core pass rounds the query rows to f16 and accumulates the
-    // logits from f16 products, so it is a different arithmetic class from
-    // the f32 scalar passes and cannot sit inside their band. Its own band,
-    // twice the largest relative error measured over every depth case
-    // against the f64 reference and against the one-row pass.
+    // The split launch's tensor-core segment pass rounds the query rows to
+    // f16 and accumulates the logits from f16 products, so it is a different
+    // arithmetic class from the f32 single-block pass and cannot sit inside
+    // its band. Its own band holds it against the f64 reference and against
+    // the single-block pass: twice the largest relative error measured over
+    // every depth case.
     // PIN(2026-09-22): 8.49e-4 was the largest over every depth case at both
     // segment sizes, against the f64 reference and against the one-row pass
     // alike; this is twice that. The class is f16 query rows and f16
@@ -153,7 +155,6 @@ fn run() -> Result<(), GateError> {
     // asserting any of them.
     ok &= bloomery_gpu_gates::no_local_depot(&[
         "flash_latent",
-        "flash_latent_seg",
         "flash_latent_mma",
         "flash_merge",
         "kv_append",
@@ -165,12 +166,11 @@ fn run() -> Result<(), GateError> {
     }
     println!(
         "PASSED: gate_p5 kv_append bits exact (incl. IEEE edges, ik cache bits equal); \
-         the single-block flash within {FLASH_BAND} of the f64 reference on real layers, \
-         both paths and their distance inside it on the depth and segment edges; reruns \
+         the single-block flash within {FLASH_BAND} of the f64 reference on real layers \
+         and on the depth and segment edges; the tensor-core split launch within its own \
+         {FLASH_MMA_BAND} band of the reference and of the single-block pass there; reruns \
          bit-identical; padded NaN rows never read; one captured graph replays \
-         bit-identically at every key count; the tensor-core segment pass inside its own \
-         {FLASH_MMA_BAND} band against both the reference and the one-row pass; the flash \
-         kernels compile with no local depot"
+         bit-identically at every key count; the flash kernels compile with no local depot"
     );
     Ok(())
 }
@@ -215,7 +215,7 @@ struct RealCase<'a> {
 }
 
 /// The synthetic depth cases' shape: the cache height (keys plus NaN pad)
-/// and the two bands, the scalar passes' and the tensor-core pass's.
+/// and the two bands, the single-block pass's and the split launch's.
 #[cfg(feature = "gpu")]
 struct DepthCase {
     dims: Dims,
@@ -730,7 +730,7 @@ impl DepthInputs {
 /// The key counts the depth cases run at. 1/31/32/33 are the key-tile
 /// edges; seg-1/seg/seg+1 the segment edges a split launch adds; 1 and 31
 /// are also `n_keys` far below one segment with a tall cache. 4096 is a
-/// whole number of 256-key segments and leaves the last segment of the
+/// whole number of default-size segments and leaves the last segment of the
 /// 4160-row cache wholly empty.
 #[cfg(feature = "gpu")]
 fn depth_key_counts(cache_rows: usize) -> Vec<usize> {
@@ -745,22 +745,12 @@ fn depth_key_counts(cache_rows: usize) -> Vec<usize> {
     cases
 }
 
-/// What the split path measured at one key count.
+/// What the split launch measured at one key count.
 #[cfg(feature = "gpu")]
 struct SplitDepth {
-    y1: Vec<f32>,
     rel: f32,
     one_rel: f32,
     cross_rel: f32,
-    rerun_same: bool,
-    replay_same: bool,
-}
-
-/// What the tensor-core path measured at one key count.
-#[cfg(feature = "gpu")]
-struct MmaDepth {
-    rel: f32,
-    cross: f32,
     rerun_same: bool,
     replay_same: bool,
 }
@@ -790,17 +780,12 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
     let mut part = Partials::zeroed(stream, n_heads, depth_rows)?;
     let mut y_one = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     // One key-count buffer and ONE captured graph for every case below. The
-    // grid was fixed from the cache height at capture time, so a replay must
-    // follow `n_keys_buf` across segment boundaries — from a single live
-    // segment at capture to every segment live at 4096 keys — and still land
-    // bit for bit on the eager run. A grid derived from the key count would
-    // pass every other arm here and fail this one.
+    // grid was fixed from the cache height and the head count at capture
+    // time, so a replay must follow `n_keys_buf` across segment boundaries —
+    // from a single live segment at capture to every segment live at 4096
+    // keys — and still land bit for bit on the eager run. A grid derived
+    // from the key count would pass every other arm here and fail this one.
     let mut n_keys_dev = DeviceBuffer::from_host(stream, &[1u32])?;
-    // The tensor-core pass writes the same partials from its own buffers, so
-    // its distance to the one-row pass is a comparison of two full results
-    // and not of a shared scratch.
-    let mut part_m = Partials::zeroed(stream, n_heads, depth_rows)?;
-    let mut y_m = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     let graph = split_graph(
         gpu,
         flash,
@@ -808,19 +793,6 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
         &mut part,
         &mut y_dev,
     )?;
-    // The tensor-core pass's own graph, captured at the same one live
-    // segment: its grid comes from the cache height and the head count, so a
-    // replay must follow `n_keys_buf` across every segment boundary too.
-    let graph_m = gpu.capture(|_s| {
-        mma_enqueue(
-            flash,
-            stream,
-            d.inputs(&n_keys_dev, dims),
-            depth_rows,
-            &mut part_m,
-            &mut y_m,
-        )
-    })?;
     let lines = DepthLines {
         cache_rows: depth_rows,
         seg,
@@ -829,7 +801,6 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
         band,
         mma_band,
         graph_nodes: graph.node_count(),
-        graph_m_nodes: graph_m.node_count(),
     };
     let mut ok = true;
     for n_keys in depth_key_counts(depth_rows) {
@@ -850,23 +821,14 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
             (&mut part, &mut y_dev, &mut y_one),
             &y_ref,
         )?;
-        let m = depth_mma(
-            flash,
-            stream,
-            inputs,
-            &graph_m,
-            (&mut part_m, &mut y_m),
-            &y_ref,
-            &s.y1,
-        )?;
-        ok &= depth_report(&lines, n_keys, &s, &m);
+        ok &= depth_report(&lines, n_keys, &s);
     }
     Ok(ok)
 }
 
-/// What the two depth verdict lines print besides one key count's results:
-/// the cache and segment geometry, the bands, and the two graphs' node
-/// counts — fixed for the whole run.
+/// What the depth verdict line prints besides one key count's results: the
+/// cache and segment geometry, the bands, and the graph's node count — fixed
+/// for the whole run.
 #[cfg(feature = "gpu")]
 struct DepthLines {
     cache_rows: usize,
@@ -876,14 +838,13 @@ struct DepthLines {
     band: f32,
     mma_band: f32,
     graph_nodes: usize,
-    graph_m_nodes: usize,
 }
 
-/// The two verdict lines of one key count — the tensor-core pass first, the
-/// split path second, the order the log has always had — and their joint
-/// verdict. Both lines print whatever the first one says.
+/// The verdict line of one key count: the split launch inside its own band
+/// of the f64 reference and of the single-block pass, the single-block pass
+/// inside its band of the reference, reruns and the replay bit-identical.
 #[cfg(feature = "gpu")]
-fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth, m: &MmaDepth) -> bool {
+fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth) -> bool {
     let DepthLines {
         cache_rows: depth_rows,
         seg,
@@ -892,21 +853,14 @@ fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth, m: &MmaDepth) -> 
         band,
         mma_band,
         graph_nodes,
-        graph_m_nodes,
     } = *p;
-    let pass_m = m.rel <= mma_band && m.cross <= mma_band && m.rerun_same && m.replay_same;
+    let pass = s.rel <= mma_band
+        && s.one_rel <= band
+        && s.cross_rel <= mma_band
+        && s.rerun_same
+        && s.replay_same;
     println!(
-        "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={groups} band={mma_band:.3e} max_rel_err={:.3e} mma_vs_seg={:.3e} bit_identical_rerun={} graph_nodes={graph_m_nodes} replay_bit_identical={} {}",
-        m.rel,
-        m.cross,
-        m.rerun_same,
-        m.replay_same,
-        verdict(pass_m)
-    );
-    let pass =
-        s.rel <= band && s.one_rel <= band && s.cross_rel <= band && s.rerun_same && s.replay_same;
-    println!(
-        "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
+        "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={groups} live_segs={} nan_pad_rows={} band={mma_band:.3e} max_rel_err={:.3e} single_band={band:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
         n_keys.div_ceil(seg),
         depth_rows - n_keys,
         s.rel,
@@ -916,10 +870,10 @@ fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth, m: &MmaDepth) -> 
         s.replay_same,
         verdict(pass)
     );
-    pass_m & pass
+    pass
 }
 
-/// The split path at one key count: two eager runs, the single-block entry
+/// The split launch at one key count: two eager runs, the single-block entry
 /// on the same inputs, and a replay of the one captured graph.
 #[cfg(feature = "gpu")]
 fn depth_split(
@@ -938,9 +892,8 @@ fn depth_split(
     let rerun_same = bits_equal(&y1, &y2);
     let rel = max_rel_err(&y1, y_ref)?;
     // The single-block entry on the same inputs: the path a cache short
-    // enough to hold one segment takes. Both must land inside the band
-    // against the f64 reference, and so must their distance to each
-    // other — the split moves the summation order, nothing else.
+    // enough to hold one segment takes. It must land inside its own band of
+    // the f64 reference, and the split launch inside its band of both.
     flash.enqueue_flash_latent(
         stream,
         FlashLatentArgs {
@@ -957,81 +910,9 @@ fn depth_split(
     let y_graph = y_dev.to_host_vec(stream)?;
     let replay_same = bits_equal(&y1, &y_graph);
     Ok(SplitDepth {
-        y1,
         rel,
         one_rel,
         cross_rel,
-        rerun_same,
-        replay_same,
-    })
-}
-
-/// The tensor-core segment pass and the merge after it, enqueued (not
-/// synchronized) — the body of both the eager runs and the captured graph.
-#[cfg(feature = "gpu")]
-fn mma_enqueue(
-    flash: &FlashKernels,
-    stream: &CudaStream,
-    inputs: FlashInputs<'_>,
-    cache_rows: usize,
-    part: &mut Partials,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    flash.enqueue_flash_latent_mma(
-        stream,
-        FlashSegArgs {
-            inputs,
-            part_v: &mut part.v,
-            part_ms: &mut part.ms,
-        },
-    )?;
-    flash.enqueue_flash_merge(
-        stream,
-        FlashMergeArgs {
-            n_keys_buf: inputs.n_keys_buf,
-            cache_rows,
-            tokens: inputs.geom.tokens,
-            heads: inputs.geom.heads,
-            latent_dims: inputs.geom.latent_dims,
-            part_v: &part.v,
-            part_ms: &part.ms,
-            y,
-        },
-    )
-}
-
-/// The tensor-core pass at one key count, through the same merge. Its query
-/// rows and products are f16, so it carries its own band (`mma_band`)
-/// against the f64 reference and against the one-row pass (`y_split`);
-/// reruns and graph replays of it are still bit-identical.
-#[cfg(feature = "gpu")]
-fn depth_mma(
-    flash: &FlashKernels,
-    stream: &CudaStream,
-    inputs: FlashInputs<'_>,
-    graph_m: &Graph,
-    (part, y_m): (&mut Partials, &mut DeviceBuffer<f32>),
-    y_ref: &[f32],
-    y_split: &[f32],
-) -> Result<MmaDepth, GateError> {
-    let cache_rows = inputs.kv.rows();
-    let mut run = || -> Result<Vec<f32>, GateError> {
-        mma_enqueue(flash, stream, inputs, cache_rows, &mut *part, &mut *y_m)?;
-        stream.synchronize()?;
-        Ok(y_m.to_host_vec(stream)?)
-    };
-    let m1 = run()?;
-    let m2 = run()?;
-    let rerun_same = bits_equal(&m1, &m2);
-    let rel = max_rel_err(&m1, y_ref)?;
-    let cross = max_rel_err(&m1, y_split)?;
-    graph_m.launch(stream)?;
-    stream.synchronize()?;
-    let m_graph = y_m.to_host_vec(stream)?;
-    let replay_same = bits_equal(&m1, &m_graph);
-    Ok(MmaDepth {
-        rel,
-        cross,
         rerun_same,
         replay_same,
     })
@@ -1130,7 +1011,7 @@ fn side_quant_refusal(
 ) -> Result<bool, GateError> {
     /// The query row, a column of the lower half, that carries the NaN.
     const ROW: usize = 3;
-    /// Live keys: four 256-key segments of the depth cache.
+    /// Live keys: several segments of the depth cache.
     const KEYS: u32 = 1000;
     let DepthCase {
         dims, cache_rows, ..

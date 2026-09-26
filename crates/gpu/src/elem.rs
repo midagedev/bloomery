@@ -67,8 +67,8 @@ const _: () = assert!(
 /// the vocabulary: V2-Lite's 102,400, V4.1's 129,280, Qwen3's 151,936
 /// logits) wait on one another, and more threads mean fewer loads each. The
 /// scan is strided by this width, the merge is a per-warp butterfly then a
-/// fixed ascending walk of the warp slots. `argmax` and `argmax_rows`
-/// declare the same width in their launch contracts.
+/// fixed ascending walk of the warp slots. `argmax_fault` and
+/// `argmax_rows_fault` declare the same width in their launch contracts.
 pub const ARGMAX_THREADS: usize = 1024;
 /// [`ARGMAX_THREADS`] as the `u32` block width a launch takes.
 const ARGMAX_THREADS_U32: u32 = ARGMAX_THREADS as u32;
@@ -735,88 +735,21 @@ mod elem_kernels {
     }
 
     /// Index of the maximum of `n` f32, ties to the lower index — the greedy
-    /// sampler's rule. One [`ARGMAX_THREADS`] block over the whole vector:
-    /// each thread's best over its strided share (indices ascending within a
-    /// thread), the fixed xor butterfly merging by (value desc, index asc)
-    /// inside each warp, then thread 0 walking the [`ARGMAX_WARPS`] warp
-    /// slots in ascending order. Every stage is the same total order
-    /// ([`argmax_take`]), so the result is a function of the input alone
-    /// and the tie rule survives every regrouping. A thread whose share is
-    /// empty keeps the `(-inf, 0)` sentinel and can never win against a real
-    /// value, which is also what an all-`-inf` vector answers: index 0, the
-    /// host reference's answer. The result stays on the device (`out[0]`,
-    /// u32); the step reads it back once. Inputs are finite — the gate's
-    /// loader rejects anything else.
-    #[kernel]
-    #[launch_bounds(1024)]
-    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 1))]
-    pub fn argmax(x: &[f32], n: u32, mut out: DisjointSlice<u32>) {
-        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
-        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
-
-        // SAFETY: both arrays are this block's own shared allocations; the
-        // raw form is the only way to reach them without a reference to a
-        // `static mut`.
-        let (bv, bi) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
-            )
-        };
-        // SAFETY: bv and bi are this block's ARGMAX_WARPS-slot shared arrays,
-        // and x.len() >= n by the launch contract, so element i*1 + 0 of
-        // every i < n is inside x.
-        let fi = unsafe { argmax_block(x, n, 1, 0, bv, bi) };
-        if thread::threadIdx_x() == 0 {
-            // SAFETY: out.len() >= 1 by the launch contract; only thread 0
-            // writes.
-            unsafe {
-                *out.get_unchecked_mut(0) = fi;
-            }
-        }
-    }
-
-    /// [`argmax`] over each of `m` interleaved rows: block c takes row c's
-    /// `n` values `x[i·m + c]` and writes their argmax to `out[c]`, with
-    /// `argmax`'s walk, butterfly, slot order and tie rule — each row's
-    /// answer is `argmax` on that row alone. The layout is the gemvs'
-    /// `y[r·m + c]` output, so a head's m logit rows go straight in.
-    #[kernel]
-    #[launch_bounds(1024)]
-    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m))]
-    pub fn argmax_rows(x: &[f32], n: u32, m: u32, mut out: DisjointSlice<u32>) {
-        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
-        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
-
-        let c = thread::blockIdx_x();
-        if c >= m {
-            return;
-        }
-        // SAFETY: both arrays are this block's own shared allocations; the
-        // raw form is the only way to reach them without a reference to a
-        // `static mut`.
-        let (bv, bi) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
-            )
-        };
-        // SAFETY: bv and bi are this block's shared arrays, and element
-        // i*m + c of every i < n is below n*m <= x.len() because c < m.
-        let fi = unsafe { argmax_block(x, n, m, c, bv, bi) };
-        if thread::threadIdx_x() == 0 {
-            // SAFETY: c < m <= out.len(); block c's thread 0 alone writes it.
-            unsafe {
-                *out.get_unchecked_mut(c as usize) = fi;
-            }
-        }
-    }
-
-    /// [`argmax`], and the fault next to the token: thread 0 writes the
-    /// index to `out[0]`, the first-layer word as it stands to `out[1]` and
-    /// that layer's site mask to `out[2]`, so the head's one readback carries
-    /// all three. Every launch before this one on the stream has finished
-    /// raising, so the copy is the step's whole fault.
+    /// sampler's rule — and the fault next to the token. One
+    /// [`ARGMAX_THREADS`] block over the whole vector: each thread's best over
+    /// its strided share (indices ascending within a thread), the fixed xor
+    /// butterfly merging by (value desc, index asc) inside each warp, then
+    /// thread 0 walking the [`ARGMAX_WARPS`] warp slots in ascending order.
+    /// Every stage is the same total order ([`argmax_take`]), so the result
+    /// is a function of the input alone and the tie rule survives every
+    /// regrouping. A thread whose share is empty keeps the `(-inf, 0)`
+    /// sentinel and can never win against a real value, which is also what an
+    /// all-`-inf` vector answers: index 0, the host reference's answer.
+    ///
+    /// Thread 0 writes the index to `out[0]`, the first-layer word as it
+    /// stands to `out[1]` and that layer's site mask to `out[2]`, so the
+    /// head's one readback carries all three. Every launch before this one on
+    /// the stream has finished raising, so the copy is the step's whole fault.
     #[kernel]
     #[launch_bounds(1024)]
     #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 3))]
@@ -850,9 +783,13 @@ mod elem_kernels {
         }
     }
 
-    /// [`argmax_rows`], and the fault after the tokens: block 0's thread 0
-    /// also writes the first-layer word to `out[m]` and its layer's site mask
-    /// to `out[m + 1]`, as [`argmax_fault`] does.
+    /// [`argmax_fault`]'s walk over each of `m` interleaved rows: block c
+    /// takes row c's `n` values `x[i·m + c]` and writes their argmax to
+    /// `out[c]`, with the same walk, butterfly, slot order and tie rule — each
+    /// row's answer is the argmax of that row alone. The layout is the gemvs'
+    /// `y[r·m + c]` output, so a head's m logit rows go straight in. Block 0's
+    /// thread 0 also writes the first-layer word to `out[m]` and its layer's
+    /// site mask to `out[m + 1]`, as [`argmax_fault`] does.
     #[kernel]
     #[launch_bounds(1024)]
     #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m + 2))]
@@ -900,8 +837,8 @@ mod elem_kernels {
         }
     }
 
-    /// The argmax of `x[i·stride + col]` for `i < n`, as [`argmax`] documents
-    /// its walk, meaningful on thread 0 of the block; every thread of the
+    /// The argmax of `x[i·stride + col]` for `i < n`, as [`argmax_fault`]
+    /// documents its walk, meaningful on thread 0 of the block; every thread of the
     /// block must call it (it holds a block barrier).
     ///
     /// # Safety
@@ -1397,64 +1334,11 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// Enqueue the argmax of `n` f32 into `out[0]` (u32, device-resident;
-    /// ties to the lower index). One [`ARGMAX_THREADS`] block walks the
-    /// whole vector. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_argmax(
-        &self,
-        stream: &CudaStream,
-        x: &DeviceBuffer<f32>,
-        n: usize,
-        out: &mut DeviceBuffer<u32>,
-    ) -> Result<(), GpuError> {
-        if n == 0 || x.len() < n || out.is_empty() {
-            return Err(GpuError::shape(
-                "enqueue_argmax",
-                format!("n={n}, x.len() {}, out.len() {}", x.len(), out.len()),
-            ));
-        }
-        let n = launch_u32("enqueue_argmax", "n", n)?;
-        let prep = self
-            .module
-            .prepare_argmax(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
-        self.module.argmax(stream, &prep, x, n, out)?;
-        Ok(())
-    }
-
-    /// Enqueue the argmax of each of `m` interleaved rows of `n` f32 — row c
-    /// is `x[i*m + c]`, the gemvs' `m`-column output layout — into `out[c]`,
-    /// each row's answer the one [`Self::enqueue_argmax`] gives that row
-    /// alone. One [`ARGMAX_THREADS`] block per row. Asynchronous,
-    /// allocation-free, capturable.
-    pub fn enqueue_argmax_rows(
-        &self,
-        stream: &CudaStream,
-        x: &DeviceBuffer<f32>,
-        n: usize,
-        m: usize,
-        out: &mut DeviceBuffer<u32>,
-    ) -> Result<(), GpuError> {
-        if n == 0 || m == 0 || x.len() < n * m || out.len() < m {
-            return Err(GpuError::shape(
-                "enqueue_argmax_rows",
-                format!("n={n} m={m}, x.len() {}, out.len() {}", x.len(), out.len()),
-            ));
-        }
-        let what = "enqueue_argmax_rows";
-        // The walk indexes i*m + c in u32.
-        launch_u32(what, "n*m", n * m)?;
-        let n = launch_u32(what, "n", n)?;
-        let m = launch_u32(what, "m", m)?;
-        let prep =
-            self.module
-                .prepare_argmax_rows(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
-        self.module.argmax_rows(stream, &prep, x, n, m, out)?;
-        Ok(())
-    }
-
-    /// [`Self::enqueue_argmax`] into `out[0]` with the first-layer word
-    /// `fault` addresses copied to `out[1]` and its layer's site mask to
-    /// `out[2]` — the head's readback of token and fault in one copy. Asynchronous, allocation-free, capturable.
+    /// Enqueue the argmax of `n` f32 (ties to the lower index) into `out[0]`
+    /// (u32, device-resident) with the first-layer word `fault` addresses
+    /// copied to `out[1]` and its layer's site mask to `out[2]` — the head's
+    /// readback of token and fault in one copy. One [`ARGMAX_THREADS`] block
+    /// walks the whole vector. Asynchronous, allocation-free, capturable.
     pub fn enqueue_argmax_fault(
         &self,
         stream: &CudaStream,
@@ -1481,8 +1365,12 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// [`Self::enqueue_argmax_rows`] into `out[..m]` with the first-layer
-    /// word copied to `out[m]` and its layer's site mask to `out[m + 1]`. Asynchronous, allocation-free, capturable.
+    /// Enqueue the argmax of each of `m` interleaved rows of `n` f32 — row c
+    /// is `x[i*m + c]`, the gemvs' `m`-column output layout — into `out[c]`,
+    /// each row's answer the one [`Self::enqueue_argmax_fault`] gives that row
+    /// alone, with the first-layer word copied to `out[m]` and its layer's
+    /// site mask to `out[m + 1]`. One [`ARGMAX_THREADS`] block per row.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_argmax_rows_fault(
         &self,
         stream: &CudaStream,

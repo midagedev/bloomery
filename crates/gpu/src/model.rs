@@ -1,6 +1,6 @@
 //! `GpuModel<B>` — the GPU engine; an architecture's CPU `forward::step` is its reference
 //! (docs/gpu-design.md decisions 1 and 7). Weights and everything a step
-//! touches live on the device from `load`, split into stages by layer range;
+//! touches live on the device from load, split into stages by layer range;
 //! `step` enqueues one decode step stage by stage and synchronizes once for
 //! the argmax.
 //!
@@ -262,14 +262,8 @@ pub trait Engine {
 
 /// A contiguous range of blocks resident on one device (docs/gpu-design.md
 /// decision 7). A stage owns its `Gpu` — context, stream, modules — and its
-/// weights and the body's resident buffers once loaded with residency; what
-/// crosses a stage boundary is one hidden vector. Two stages may sit on the
-/// same card: that is the shape the 2-stage = 1-stage bit-identity gate runs
-/// in.
-///
-/// `residency` is filled by [`GpuModel::load_blocks`]; a stage from
-/// [`GpuModel::load_staged`] carries only the metadata (that entry must stay
-/// cheap — metadata probes call it).
+/// weights and the body's resident buffers. Every `GpuModel` constructor
+/// makes exactly one stage and fills its `residency`.
 pub struct Stage<B> {
     gpu: Gpu,
     /// Blocks `layers.start..layers.end` of the model, in order.
@@ -304,15 +298,14 @@ impl<B: ChainBody> Stage<B> {
         self.layers.clone()
     }
 
-    /// Device bytes held by the residency: weights, caches, arena. Zero for a
-    /// metadata-only stage.
+    /// Device bytes held by the residency: weights, caches, arena.
     pub fn resident_bytes(&self) -> usize {
         self.residency
             .as_ref()
             .map_or(0, |r| r.weights.resident_bytes() + r.body.resident_bytes())
     }
 
-    /// The stage's resident weights; `None` for a metadata-only stage.
+    /// The stage's resident weights.
     pub fn weights(&self) -> Option<&Weights> {
         self.residency.as_ref().map(|r| &r.weights)
     }
@@ -375,62 +368,6 @@ pub struct GpuModel<B: ChainBody> {
 }
 
 impl<B: ChainBody> GpuModel<B> {
-    /// The whole model as one stage (metadata only — a resident stage comes
-    /// from [`GpuModel::load_blocks`]).
-    pub fn load(file: &Split, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
-        GpuModel::load_staged(file, ctx_max, &[])
-    }
-
-    /// Split the blocks at `cuts` (strictly ascending, each in
-    /// `1..block_count`): `cuts.len() + 1` stages. Reads the metadata `step`
-    /// needs; the stages carry no residency until [`GpuModel::load_blocks`]
-    /// fills one.
-    pub(crate) fn load_staged(
-        file: &Split,
-        ctx_max: usize,
-        cuts: &[usize],
-    ) -> Result<GpuModel<B>, GpuError> {
-        if ctx_max == 0 {
-            return Err(GpuError::shape("GpuModel::load", "ctx_max must be >= 1"));
-        }
-        let n_layers = block_count(file, "GpuModel::load")?;
-        let mut bounds = vec![0usize];
-        for &c in cuts {
-            if c <= *bounds.last().unwrap_or(&0) || c >= n_layers {
-                return Err(GpuError::shape(
-                    "GpuModel::load_staged",
-                    format!("cuts must ascend strictly inside 1..{n_layers}, got {cuts:?}"),
-                ));
-            }
-            bounds.push(c);
-        }
-        bounds.push(n_layers);
-        let mut stages = Vec::with_capacity(bounds.len() - 1);
-        for w in bounds.windows(2) {
-            stages.push(Stage {
-                gpu: Gpu::new()?,
-                layers: w[0]..w[1],
-                graph: None,
-                graph_of: None,
-                residency: None,
-            });
-        }
-        Ok(GpuModel {
-            stages,
-            ctx_max,
-            head: None,
-            step_graph: None,
-            pair_graph: None,
-            pair_head: None,
-            host: None,
-            launcher: None,
-            launch_stats: LaunchStats::default(),
-            mode: StepMode::Graph,
-            pos: 0,
-            poisoned: None,
-        })
-    }
-
     /// One stage over `layers` WITH residency: every tensor of that range
     /// plus the globals in its kernels' device format, the weights the body
     /// derives from them, and the body those weights drive — its caches, its
@@ -682,7 +619,6 @@ impl<B: ChainBody> GpuModel<B> {
     /// instrument: `skip_quant` leaves activation buffers unwritten, so the
     /// tokens that come out are not the model's answer.
     pub fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
-        probe.check(self.ctx_max)?;
         let (_, _, body) = self.body_parts("GpuModel::set_probe")?;
         body.set_probe(probe)?;
         self.step_graph = None;

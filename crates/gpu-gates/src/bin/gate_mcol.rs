@@ -22,8 +22,7 @@
 //! - the shared expert's fused Q3_K gate·up·SwiGLU at m tokens;
 //! - `q6k_gemv` on `output.weight`, `q3k_gemv` on an expert stack's rows, and
 //!   the output head at m rows (`Head::with_m`): each row's normed vector,
-//!   logits and argmax token against the m = 1 head on that row alone, and
-//!   the captured graph's tokens against eager.
+//!   logits and argmax token against the m = 1 head on that row alone.
 //!
 //! Activations: seeded random columns for every site, and for the sites
 //! whose input the V4.1 oracle set dumps, the set's own rows (its prefill
@@ -729,8 +728,7 @@ mod gate {
 
     /// The head at every m against m one-row heads: normed rows, logits
     /// columns and tokens bit for bit, each token the host argmax of its own
-    /// logits column (ties to the lower index), and a captured graph's
-    /// tokens equal to eager.
+    /// logits column (ties to the lower index).
     fn check_head(gpu: &Gpu, w: &Weights, eps: f32) -> Result<bool, GateError> {
         let mut one = Head::with_m(gpu, w, eps, 1)?;
         let (hidden, n_vocab) = (one.hidden(), one.n_vocab());
@@ -761,14 +759,10 @@ mod gate {
                 let col: Vec<f32> = (0..n_vocab).map(|v| logits[v * m + c]).collect();
                 argmax_low(&col) == tokens[c] as usize
             });
-            head.capture(gpu, w)?;
-            head.set_input(gpu, &x[..m * hidden])?;
-            head.launch(gpu)?;
-            let graph_ok = head.tokens(gpu)? == tokens;
-            let pass = normed_ok && logit_misses == 0 && tokens_ok && host_ok && graph_ok;
+            let pass = normed_ok && logit_misses == 0 && tokens_ok && host_ok;
             println!(
                 "head m={m} normed_rows_eq_m1={normed_ok} logit_misses={logit_misses} tokens={tokens:?} \
-                 tokens_eq_m1={tokens_ok} tokens_eq_host_argmax={host_ok} graph_eq_eager={graph_ok} {}",
+                 tokens_eq_m1={tokens_ok} tokens_eq_host_argmax={host_ok} {}",
                 verdict(pass)
             );
             ok &= pass;

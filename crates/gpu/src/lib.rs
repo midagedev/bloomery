@@ -548,9 +548,9 @@ impl From<::model::ModelError> for GpuError {
 /// One 128-value q8_1 block of column `col` of the activation plane based at
 /// `x0`, quantized and stored in the three gemv permutations plus the group
 /// sums and the block scale. The body of `kernels::q3k_quantize_q8_1` — the
-/// whole numeric contract of q8_1 activations lives here once, and the
-/// single- and pair-destination kernels are the two ways of reaching it, so
-/// their bytes agree by construction rather than by inspection.
+/// whole numeric contract of q8_1 activations lives here once, and every
+/// kernel that writes q8_1 activations reaches it, so their bytes agree by
+/// construction rather than by inspection.
 ///
 /// Lives outside the `#[cuda_module]` for the reason `cores` does: a
 /// device-callable body. It is not in `cores` because its stores need the
@@ -862,113 +862,6 @@ mod kernels {
             fault,
             FaultSite::QuantColumn,
         );
-    }
-
-    /// Two independent q8_1 quantizations of the SAME source buffer in one
-    /// launch: blocks below `m_cols * 2 * n_sb` quantize the plane at `x0_a`
-    /// into the `_a` outputs, the rest the plane at `x0_b` into `_b`. Both
-    /// planes are `m_cols` columns of `256 * n_sb` values, so the grid is
-    /// twice the single form's and the arm is a block-uniform branch — no
-    /// warp splits, every collective inside the body still warp-wide.
-    ///
-    /// The body is `q8_1_quant_block` either way, so each output is the
-    /// bytes its own `q3k_quantize_q8_1` launch would have written.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(32)]
-    #[launch_contract(
-        domain = 1,
-        block = (32, 1, 1),
-        requires = (
-            x.len() >= x0_a + m_cols * 256 * n_sb,
-            x.len() >= x0_b + m_cols * 256 * n_sb,
-            q3a.len() >= m_cols * 64 * half_it,
-            q4a.len() >= m_cols * 256 * quad_it,
-            q6a.len() >= m_cols * 128 * half_it,
-            s8a.len() >= m_cols * 8 * n_sb,
-            d8a.len() >= m_cols * 2 * n_sb,
-            q3b.len() >= m_cols * 64 * half_it,
-            q4b.len() >= m_cols * 256 * quad_it,
-            q6b.len() >= m_cols * 128 * half_it,
-            s8b.len() >= m_cols * 8 * n_sb,
-            d8b.len() >= m_cols * 2 * n_sb
-        )
-    )]
-    pub fn q3k_quantize_q8_1_pair(
-        x: &[f32],
-        x0_a: u32,
-        x0_b: u32,
-        m_cols: u32,
-        n_sb: u32,
-        half_it: u32,
-        quad_it: u32,
-        mut q3a: DisjointSlice<u64>,
-        mut q4a: DisjointSlice<u32>,
-        mut q6a: DisjointSlice<u32>,
-        mut s8a: DisjointSlice<i32>,
-        mut d8a: DisjointSlice<f32>,
-        mut q3b: DisjointSlice<u64>,
-        mut q4b: DisjointSlice<u32>,
-        mut q6b: DisjointSlice<u32>,
-        mut s8b: DisjointSlice<i32>,
-        mut d8b: DisjointSlice<f32>,
-        fault: FaultSink,
-    ) {
-        let blk = thread::index_1d().get() / 32;
-        let n_sb = n_sb as usize;
-        let blocks_per_col = 2 * n_sb;
-        let total = m_cols as usize * blocks_per_col;
-        if blk >= 2 * total {
-            return;
-        }
-        let lane = warp::lane_id() as usize;
-        // SAFETY (both arms): the arm's index is below `total`, so col <
-        // m_cols and b < 2*n_sb; the launch contract bounds `x` at both
-        // bases and each arm's five outputs. The arm is chosen by the block
-        // index, so a warp never splits across it.
-        if blk < total {
-            let (col, b) = (blk / blocks_per_col, blk % blocks_per_col);
-            q8_1_quant_block(
-                x,
-                x0_a as usize,
-                col,
-                b,
-                n_sb,
-                half_it,
-                quad_it,
-                lane,
-                &mut q3a,
-                &mut q4a,
-                &mut q6a,
-                &mut s8a,
-                &mut d8a,
-                fault,
-                FaultSite::QuantColumn,
-            );
-        } else {
-            let k = blk - total;
-            let (col, b) = (k / blocks_per_col, k % blocks_per_col);
-            q8_1_quant_block(
-                x,
-                x0_b as usize,
-                col,
-                b,
-                n_sb,
-                half_it,
-                quad_it,
-                lane,
-                &mut q3b,
-                &mut q4b,
-                &mut q6b,
-                &mut s8b,
-                &mut d8b,
-                fault,
-                FaultSite::QuantColumn,
-            );
-        }
     }
 
     /// Q4_K packing recap (word arithmetic verified against ggml's
@@ -2576,20 +2469,6 @@ impl Gpu {
         self.quantize_q8_1_at(x, 0, act, self.fault_sink(LAYER_HEAD))
     }
 
-    /// Enqueue the q8_1 quantization of `x[x0 .. x0 + m*k]` (`m = act.m()`
-    /// columns of `act.k()` f32 each) into `act` — the same quantization
-    /// `enqueue_quantize_q8_1` runs, on a base-offset slice of a wider
-    /// buffer, so the quantized bytes equal a copy-then-quantize. Asynchronous,
-    /// allocation-free, capturable.
-    pub(crate) fn enqueue_quantize_q8_1_at(
-        &self,
-        x: &DeviceBuffer<f32>,
-        x0: usize,
-        act: &mut Q8Act,
-    ) -> Result<(), GpuError> {
-        self.quantize_q8_1_at(x, x0, act, self.unlabelled_sink())
-    }
-
     /// [`Gpu::enqueue_quantize_q8_1_layer`] over the first `cols` columns of
     /// `act` alone (`1 ..=` its `m()`), `x` holding at least `cols · k` f32:
     /// each column the bytes the full launch writes it — the quantizer is
@@ -2633,13 +2512,13 @@ impl Gpu {
         let n_sb = act.n_sb();
         if !(1..=act.m()).contains(&m) {
             return Err(GpuError::shape(
-                "enqueue_quantize_q8_1_at",
+                "quantize_q8_1_cols_at",
                 format!("{m} columns of an activation of {}", act.m()),
             ));
         }
         if x.len() < x0 + m * act.k() {
             return Err(GpuError::shape(
-                "enqueue_quantize_q8_1_at",
+                "quantize_q8_1_cols_at",
                 format!(
                     "x.len() {} < x0 + m*k = {} + {}*{}",
                     x.len(),
@@ -2649,7 +2528,7 @@ impl Gpu {
                 ),
             ));
         }
-        let what = "enqueue_quantize_q8_1_at";
+        let what = "quantize_q8_1_cols_at";
         let grid = launch_u32(what, "grid", m * n_sb * 2)?;
         let x0 = launch_u32(what, "x0", x0)?;
         let m = launch_u32(what, "m", m)?;
@@ -2675,73 +2554,6 @@ impl Gpu {
             &mut act.s8,
             &mut act.d8,
             fault,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue the q8_1 quantization of TWO slices of the same buffer in one
-    /// launch: `x[a0 .. a0 + m*k]` into `a` and `x[b0 .. b0 + m*k]` into `b`,
-    /// the same bytes the two `enqueue_quantize_q8_1_at` calls write. Both
-    /// scratches must have the same shape (one grid covers both halves).
-    /// Asynchronous, allocation-free, capturable.
-    pub(crate) fn enqueue_quantize_q8_1_pair(
-        &self,
-        x: &DeviceBuffer<f32>,
-        a0: usize,
-        a: &mut Q8Act,
-        b0: usize,
-        b: &mut Q8Act,
-    ) -> Result<(), GpuError> {
-        let (m, n_sb) = (a.m(), a.n_sb());
-        if b.m() != m || b.k() != a.k() {
-            return Err(GpuError::shape(
-                "enqueue_quantize_q8_1_pair",
-                format!(
-                    "both halves must share a shape, got a {}x{} b {}x{}",
-                    a.m(),
-                    a.k(),
-                    b.m(),
-                    b.k()
-                ),
-            ));
-        }
-        let need = m * a.k();
-        if x.len() < a0 + need || x.len() < b0 + need {
-            return Err(GpuError::shape(
-                "enqueue_quantize_q8_1_pair",
-                format!("x.len() {} < max(a0 {a0}, b0 {b0}) + m*k = {need}", x.len()),
-            ));
-        }
-        let what = "enqueue_quantize_q8_1_pair";
-        let grid = launch_u32(what, "grid", m * n_sb * 4)?;
-        let a0 = launch_u32(what, "a0", a0)?;
-        let b0 = launch_u32(what, "b0", b0)?;
-        let m = launch_u32(what, "m", m)?;
-        let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q3k_quantize_q8_1_pair(LaunchConfig1D::new(grid, 32, 0))?;
-        self.module.q3k_quantize_q8_1_pair(
-            &self.stream,
-            &prep,
-            x,
-            a0,
-            b0,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            &mut a.q3,
-            &mut a.q4,
-            &mut a.q6,
-            &mut a.s8,
-            &mut a.d8,
-            &mut b.q3,
-            &mut b.q4,
-            &mut b.q6,
-            &mut b.s8,
-            &mut b.d8,
-            self.unlabelled_sink(),
         )?;
         Ok(())
     }

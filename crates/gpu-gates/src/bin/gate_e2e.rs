@@ -53,21 +53,13 @@
 //!   must equal the chain's own token at every step (`host_argmax_diff`), or
 //!   the margins describe some other answer. `--margins PATH` writes one row
 //!   per position (`id step our_top1 our_margin exact_top1 exact_margin`) for
-//!   the offline judge. The lever that picks the flash kernel is read once
-//!   per process, so each flash arm is its own run with its own line.
+//!   the offline judge.
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has — and the
 //!   captured chain holds no host node: its node kinds, as the driver lists
 //!   them, are printed and the host count is pinned at zero.
 //! - (3) determinism: two eager runs give identical tables.
-//! - (4) every flash stage-doubling arm (`StepProbe::keyaxis_arms`) writes
-//!   the base path's tokens, on this prompt set and on a deeper prompt, at
-//!   the same node count. Those arms are the ruler the attention rounds
-//!   read their stage prices off, and the reading is only a stage's price
-//!   while nothing else moves: identical tokens mean identical routing, so
-//!   the rest of the step is the same work. This is where the probes'
-//!   `fma(jig, second, first)` fold is pinned as the no-op it claims to be.
-//! - (5) a cache prepared by `GpuModel::seed_depth` leaves the next step at
+//! - (4) a cache prepared by `GpuModel::seed_depth` leaves the next step at
 //!   the same position and live key count a decoded prompt of the same
 //!   depth does, at the same captured node count — the contract
 //!   `generate --seed-depth` rests on. State, not time.
@@ -84,7 +76,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::{Engine, StepMode, StepProbe};
+use bloomery_gpu::model::{Engine, StepMode};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::engine::AnyEngine;
 #[cfg(feature = "gpu")]
@@ -112,15 +104,6 @@ const GEN: usize = 32;
 #[cfg(feature = "gpu")]
 const CTX_MAX: usize = 256;
 
-/// The keyaxis arms' deeper case: a prompt whose live keys reach past one
-/// flash segment, so the merge folds more than one partial and a probe's
-/// second pass wraps inside a whole segment instead of a short first one.
-/// `DEEP_PROMPT + DEEP_GEN` stays inside `CTX_MAX`.
-#[cfg(feature = "gpu")]
-const DEEP_PROMPT: usize = 200;
-#[cfg(feature = "gpu")]
-const DEEP_GEN: usize = 16;
-
 /// PIN(2026-09-21): the reference top1-top2 margin below which a first
 /// difference is a near-tie re-lottery rather than a fault. Derivation: the
 /// A2t round measured the reference's own margin distribution over this set
@@ -144,7 +127,7 @@ const EXACT_FILE: &str = "exact-forced-32.tsv";
 /// PIN(2026-09-22): teacher-forced positions at
 /// which our argmax leaves the model's EXACT top1 (`exact-forced-32.tsv`)
 /// while the exact margin there is at least `MARGIN_FLOOR`. Derivation: the
-/// scalar segment pass (`BLOOMERY_FLASH_MMA=0`) was measured on this set against
+/// scalar segment pass was measured on this set against
 /// the truth and left it at 41 of 1056 positions, 4 of them at or above the
 /// floor — 8/2 (exact margin 1.368), 18/31 (0.682), 21/24 (0.527), and
 /// 29/27 (1.382, where we pick ik's token and ik is the one that is wrong);
@@ -205,15 +188,7 @@ fn data_file(name: &str) -> std::path::PathBuf {
 /// `quantize_q8_1(kqvc_*)` launches became one, again one launch fewer in
 /// every layer. Derivation on the new pins (`NODES_BLOCK0` = 19,
 /// `NODES_LAYER1` = 24, each plus one merge on a split cache):
-/// (19 + 1) + 26 × (24 + 1) + 27 + 4 = 20 + 650 + 27 + 4 = 701. Both merges
-/// carry a value-neutral rollback lever (`StepProbe::split_heads`,
-/// `split_kqvc`). Since the fmerge round the levers nest, so restoring the
-/// original 755 takes all four of them; measured at `--ctx 256`: none 648, `split_heads`+`split_flash_quant` **702**,
-/// plus `split_kqvc` 729, plus `split_moe_quant` **755**. The tokens are
-/// identical to the default path's at every one of those counts.
-/// `split_kqvc` alone does nothing — there is no pair launch to split until
-/// `split_flash_quant` restores one — so `generate` refuses that
-/// combination rather than reading as a broken lever.
+/// (19 + 1) + 26 × (24 + 1) + 27 + 4 = 20 + 650 + 27 + 4 = 701.
 ///
 /// PIN(2026-09-22, fmerge round): 701 → 648. Two launches left every
 /// routed layer and one left block 0: the `kqvc` q8_1 quantization became a
@@ -225,8 +200,7 @@ fn data_file(name: &str) -> std::path::PathBuf {
 /// head's 4 = 19 + 598 + 27 + 4 = 648. FAIL-first held: the same source
 /// with this constant still 701 printed `graph graph_nodes=648 want=701
 /// eager_vs_graph_identical=true FAIL`, with the token classes and the
-/// determinism arm unchanged. Both new merges carry a value-neutral
-/// rollback lever (`StepProbe::split_flash_quant`, `split_moe_quant`).
+/// determinism arm unchanged.
 #[cfg(feature = "gpu")]
 const NODES_CHAIN: usize = 648;
 
@@ -596,46 +570,6 @@ fn load_truth(reference: &[GreedyRow]) -> Result<Vec<ExactRow>, String> {
     Ok(file.rows)
 }
 
-/// A fixed pseudo-random prompt of `n` ids: BOS, then an LCG walk over the
-/// id range the depth runners feed. Random ids are less kind to the caches
-/// than real text, which is what the deep arm wants of them.
-#[cfg(feature = "gpu")]
-fn lcg_prompt(n: usize) -> Vec<u32> {
-    let mut s: u64 = 12345;
-    let mut out = vec![100000u32];
-    while out.len() < n {
-        s = s.wrapping_mul(1103515245).wrapping_add(12345) % 2147483648;
-        out.push(1000 + (s % 90000) as u32);
-    }
-    out
-}
-
-/// One continuation of `prompt`: fresh caches, the prompt fed one token at
-/// a time, then `DEEP_GEN` - 1 feedback steps.
-#[cfg(feature = "gpu")]
-fn run_deep<E: Engine>(model: &mut E, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
-    model.reset()?;
-    let mut next = model.step(prompt)?;
-    let mut seq = Vec::with_capacity(DEEP_GEN);
-    seq.push(next);
-    for _ in 1..DEEP_GEN {
-        next = model.step(&[next])?;
-        seq.push(next);
-    }
-    Ok(seq)
-}
-
-/// The first place two token tables differ, as `(prompt index, token
-/// index)` — what a failing arm needs to say about itself.
-#[cfg(feature = "gpu")]
-fn first_diff(a: &[Vec<u32>], b: &[Vec<u32>]) -> Option<(usize, usize)> {
-    a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
-        (0..x.len().min(y.len()))
-            .find(|&k| x[k] != y[k])
-            .map(|k| (i, k))
-    })
-}
-
 /// The gate's one flag: `--margins PATH` writes the forced arm's per-position
 /// margins (see [`write_margins`]). Anything else is an error, not ignored.
 #[cfg(feature = "gpu")]
@@ -737,18 +671,14 @@ fn run() -> Result<(), GateError> {
     }
 
     let file = Split::open(ref_model_path()?)?;
-    // `run_set` and `run_deep` need only the `Engine` surface; the rest of
-    // this gate reads more (step mode, probes, graph capture, logits, the
-    // device step parameters, the stage table), so it names its arm, and
-    // every other arm is a file this gate has no reference for.
+    // `run_set` needs only the `Engine` surface; the rest of this gate reads
+    // more (step mode, graph capture, logits, the device step parameters,
+    // the stage table), so it names its arm, and every other arm is a file
+    // this gate has no reference for.
     let mut model = match AnyEngine::open(file, CTX_MAX)? {
         AnyEngine::Deepseek2(m) => m,
         AnyEngine::Qwen3moe(_) => {
             return Err("gate_e2e: the references are deepseek2's; the file is qwen3moe".into());
-        }
-        #[cfg(feature = "deepseek41")]
-        AnyEngine::Deepseek41(_) => {
-            return Err("gate_e2e: the references are deepseek2's; the file is deepseek41".into());
         }
     };
     println!(
@@ -813,14 +743,13 @@ fn run() -> Result<(), GateError> {
         report.n_identical, report.n_near_tie, report.n_diverged
     );
 
-    // The segment pass under the lever, and the free-running divergence set
-    // it leaves. Diagnostic: one event per prompt is 33 samples, and past a
+    // The flash segment size, and the free-running divergence set the chain
+    // leaves. Diagnostic: one event per prompt is 33 samples, and past a
     // row's first difference the two engines answer different questions, so
     // this count mixes "is the kernel wrong" with "did a near tie fall the
     // other way". The teacher-forced arm below is where that is decided.
     println!(
-        "flash_mma={} seg_keys={} diverged={} (diagnostic)",
-        bloomery_gpu::flash::flash_mma(),
+        "seg_keys={} diverged={} (diagnostic)",
         bloomery_gpu::flash::seg_keys(),
         report.n_diverged,
     );
@@ -915,59 +844,7 @@ fn run() -> Result<(), GateError> {
         }
     }
 
-    // (4) The flash stage-doubling arms against the base path they are read
-    // against. Every arm runs the whole set and the deeper prompt in graph
-    // mode; `base` runs too, which also says the graph arm above reproduces
-    // itself after a probe rebuild.
-    //
-    // The probe entries double a stage of the SCALAR segment pass, so under
-    // the tensor-core lever an arm would run a different kernel from the
-    // base it is compared against. They are that pass's instruments; the
-    // lever's own arm is the class line above.
-    let deep_prompt = lcg_prompt(DEEP_PROMPT);
-    let mut deep_base: Vec<u32> = Vec::new();
-    for (name, probe) in StepProbe::keyaxis_arms() {
-        if bloomery_gpu::flash::flash_mma() && name != "base" {
-            println!("keyaxis arm={name} skipped — it probes the scalar segment pass");
-            continue;
-        }
-        model.set_probe(probe)?;
-        let nodes = model.capture_step()?;
-        let set = run_set(&mut model, &prompts, &reference)?;
-        let deep = run_deep(&mut model, &deep_prompt)?;
-        if name == "base" {
-            deep_base = deep.clone();
-        }
-        let set_same = set == graph;
-        let deep_same = deep == deep_base;
-        let pass = set_same && deep_same && nodes == NODES_CHAIN;
-        println!(
-            "keyaxis arm={name} graph_nodes={nodes} set_identical={set_same} \
-             deep_identical={deep_same} {}",
-            if pass { "ok" } else { "FAIL" }
-        );
-        if !pass {
-            ok = false;
-            if let Some((i, k)) = first_diff(&set, &graph) {
-                println!(
-                    "  prompt {} token {k}: arm {} vs base {}",
-                    reference[i].id, set[i][k], graph[i][k]
-                );
-            }
-            if let Some(k) = (0..deep.len().min(deep_base.len())).find(|&k| deep[k] != deep_base[k])
-            {
-                println!(
-                    "  deep prompt token {k}: arm {} vs base {}",
-                    deep[k], deep_base[k]
-                );
-            }
-            if nodes != NODES_CHAIN {
-                println!("  the arm captured {nodes} nodes, the pin is {NODES_CHAIN}");
-            }
-        }
-    }
-    model.set_probe(StepProbe::default())?;
-    // (5) A prepared cache stands where a decoded prompt stands.
+    // (4) A prepared cache stands where a decoded prompt stands.
     // `GpuModel::seed_depth` fills KV rows directly so a deep step can be
     // timed without decoding a prompt into them; that is only an instrument
     // if the step which follows has the same shape. Asserted as state, not
@@ -1016,10 +893,8 @@ fn run() -> Result<(), GateError> {
              path, it leaves the model's exact answer on that path at no more than \
              FORCED_PIN positions the exact margin was clear about; graph replay equals eager \
              token for token at the pinned node count, none of them a host node; two eager \
-             runs are identical; every \
-             flash stage-doubling arm writes the base path's tokens at that same node count; a \
-             seeded cache leaves the step at the same position and key count a decoded \
-             prompt does; and the two reference files agree with each other."
+             runs are identical; a seeded cache leaves the step at the same position and key \
+             count a decoded prompt does; and the two reference files agree with each other."
         );
         Ok(())
     } else {

@@ -43,8 +43,6 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::StepProbe;
-#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
@@ -97,8 +95,7 @@ const ROUTER_BAND: f32 = 1e-5;
 /// constant still 24 printed `FAIL: layer 1 captures 22 nodes, the pin is
 /// 24 — a launch was added or removed` while every bit-identity arm stayed
 /// green, including the two new `merge` arms that compare each shape
-/// against the launches it replaced. Both carry a value-neutral rollback
-/// lever (`StepProbe::split_flash_quant`, `split_moe_quant`).
+/// against the launches it replaced.
 #[cfg(feature = "gpu")]
 const NODES_LAYER1: usize = 22;
 /// PIN(2026-09-21): slots the routing probe's input moves. The probe is the
@@ -303,41 +300,6 @@ fn run() -> Result<(), GateError> {
     );
     if !rerun_same {
         ok = false;
-    }
-
-    // ---- (c2) the two merged launch shapes of this layer are bit-identical
-    // to the launch shapes they replaced. `split_flash_quant` puts the
-    // `kqvc` quantization back on a launch of its own instead of riding
-    // inside the attention launch; `split_moe_quant` splits the MoE half's
-    // one mixed-geometry quantize back into its two. Both are launch moves
-    // that may not move a value, and this is the arm that says so — a scale
-    // reduced over a different set of values changes every byte quantized
-    // with it, which no band on `l_out` sees reliably.
-    for (what, probe) in [
-        (
-            "split_flash_quant",
-            StepProbe {
-                split_flash_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-        (
-            "split_moe_quant",
-            StepProbe {
-                split_moe_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-    ] {
-        model.set_probe(probe)?;
-        model.seed_layer_cache(LAYER, &seed5)?;
-        let taps_split = model.step_layer_taps(LAYER, &column(last), last as u32)?;
-        model.set_probe(StepProbe::default())?;
-        let same = taps1.bits_equal(&taps_split);
-        println!("merge {what}_bit_identical={same} {}", verdict(same));
-        if !same {
-            ok = false;
-        }
     }
 
     // ---- (d) captured graph: replay bit-identical to eager

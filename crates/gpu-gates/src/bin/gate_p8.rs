@@ -69,8 +69,6 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::StepProbe;
-#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
@@ -115,9 +113,6 @@ const FENCE: f32 = 0.25;
 /// grid covers both halves of the same buffer, each block running the same
 /// per-block body. Derivation: 20 − 1. FAIL-first held the same way
 /// (`block 0 captures 19 nodes, the pin is 20`, every other arm green).
-/// Both merges carry a value-neutral rollback lever
-/// (`StepProbe::split_heads`, `split_kqvc`), so this count is the default
-/// path's, not the only one the binary can capture.
 ///
 /// PIN(2026-09-22, fmerge round): 19 → 18. The `kqvc` q8_1 quantization
 /// stopped being a launch: the attention launch's last kernel already holds
@@ -127,10 +122,7 @@ const FENCE: f32 = 0.25;
 /// `quantize_q8_1(kqvc)` node. FAIL-first held: the same source with this
 /// constant still 19 printed `FAIL: block 0 captures 18 nodes, the pin is
 /// 19 (NODES_BLOCK0 19 + 0 for the flash merge)` while every bit-identity
-/// arm stayed green, the new `fold` arm included. The rollback lever is
-/// `StepProbe::split_flash_quant`, which puts the quantize back on its own
-/// launch (and is what `split_kqvc` now needs to be set with to have any
-/// effect at all).
+/// arm stayed green, the new `fold` arm included.
 #[cfg(feature = "gpu")]
 const NODES_BLOCK0: usize = 18;
 /// Print-only markers for the profile table, not gates: an op touching at
@@ -327,29 +319,6 @@ fn run() -> Result<(), GateError> {
         verdict(rerun_same)
     );
     if !rerun_same {
-        ok = false;
-    }
-
-    // ---- (b2) the folded q8_1 side output is bit-identical to the
-    // standalone quantize launch. `kqvc`'s quantization moved inside the
-    // attention launch, where a block holds one head's whole latent row;
-    // this asserts what that move is only allowed to be — the same bytes,
-    // reached by a different launch shape. It is the arm that would catch a
-    // scale computed over a different set of values, which changes every
-    // byte quantized with it and which no band on `l_out` is sharp enough to
-    // see reliably.
-    model.set_probe(StepProbe {
-        split_flash_quant: true,
-        ..StepProbe::default()
-    })?;
-    let taps_split = model.step_block0_taps(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32)?;
-    model.set_probe(StepProbe::default())?;
-    let fold_same = taps1.bits_equal(&taps_split);
-    println!(
-        "fold folded_quant_bit_identical_to_split_launch={fold_same} {}",
-        verdict(fold_same)
-    );
-    if !fold_same {
         ok = false;
     }
 
