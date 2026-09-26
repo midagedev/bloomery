@@ -169,6 +169,30 @@ pub struct BatchIo<'a> {
     pub fold_out: &'a mut DeviceBuffer<f32>,
     /// A chunk's latent rows before its commit ([`StageIo::rows`]).
     pub staging: &'a mut DeviceTensor<u16>,
+    /// The layer-batch's queue entries: the sub-layer adds each entry it
+    /// enqueues, where it enqueues it.
+    pub entries: &'a mut u64,
+}
+
+/// The queue entries a layer-batch's sites enqueue — launches, copies, event
+/// records, stream waits — counted at each site as it enqueues: one for each
+/// launch the site makes itself, and for a call that enqueues several (a
+/// fork's record and wait, the compressor's rows, the indexer, the staged
+/// attention and its commit) the entries that call makes.
+struct Entries<'a>(&'a mut u64);
+
+impl Entries<'_> {
+    /// `r`, one launch, counted once it is enqueued.
+    fn one<T, E>(&mut self, r: Result<T, E>) -> Result<T, E> {
+        self.of(1, r)
+    }
+
+    /// `r`, a call that enqueues `n` entries, counted once it has.
+    fn of<T, E>(&mut self, n: u64, r: Result<T, E>) -> Result<T, E> {
+        let v = r?;
+        *self.0 += n;
+        Ok(v)
+    }
 }
 
 /// A layer's tensors as the batch path reads them, resolved once a
@@ -309,8 +333,6 @@ pub struct AttnBatch {
     /// it is uploaded from.
     tables: DeviceBuffer<f32>,
     tables_host: Vec<f32>,
-    /// Queue entries enqueued since the last [`AttnBatch::take_entries`].
-    entries: u64,
     /// With card timing on: an event pair around each projection phase, the
     /// pairs recorded since the last [`AttnBatch::take_card_ms`].
     marks: Vec<CudaEvent>,
@@ -466,10 +488,12 @@ impl AttnBatch {
         Ok(())
     }
 
-    /// Queue entries — launches, event records and stream waits — the batch
-    /// path enqueued since the last call, and zero again.
-    pub fn take_entries(&mut self) -> u64 {
-        std::mem::take(&mut self.entries)
+    /// Batch chunks `k .. end` of `cuts` as the sub-blocks the projections
+    /// run over ([`AttnChain::enqueue_batch_layer`]), in order: a prompt
+    /// call's plan prints them.
+    #[must_use]
+    pub fn sub_blocks(cuts: &[Range<usize>], k: usize, end: usize) -> Vec<Range<usize>> {
+        SubBlocks::new(cuts, k, end.min(cuts.len())).collect()
     }
 
     /// Time each layer's projection phases with events from the next layer
@@ -510,7 +534,7 @@ impl AttnBatch {
     /// With card timing on, the next event recorded on `stream` — a phase's
     /// start or end; the pool is sized for every phase a batch can have, and
     /// running past it is refused.
-    fn mark(&mut self, stream: &CudaStream, entries: &mut u64) -> Result<(), GpuError> {
+    fn mark(&mut self, stream: &CudaStream, ent: &mut Entries<'_>) -> Result<(), GpuError> {
         if !self.timed {
             return Ok(());
         }
@@ -518,9 +542,8 @@ impl AttnBatch {
             what: WHAT_BATCH,
             missing: "an event for a projection phase: the pool is sized for a batch",
         })?;
-        e.record(stream)?;
+        ent.one(e.record(stream))?;
         self.marked += 1;
-        *entries += 1;
         Ok(())
     }
 }
@@ -689,7 +712,6 @@ impl AttnChain {
             out: zeroed(14)?,
             tables: zeroed(15)?,
             tables_host: vec![0.0; lens.f32s[15]],
-            entries: 0,
             marks: Vec::new(),
             marked: 0,
             timed: false,
@@ -764,6 +786,7 @@ impl AttnChain {
             streams_out,
             fold_out,
             staging,
+            entries,
         } = io;
         let n = cuts.len();
         let base = cuts.first().map_or(0, |r| r.start);
@@ -810,17 +833,17 @@ impl AttnChain {
         };
         let stream = gpu.stream();
         let (d, s4) = (cx.d, HC_STREAMS * cx.d.n_embd);
-        let mut entries = 0u64;
+        let mut ent = Entries(entries);
         let t_full = cx.token(full);
         let nb = tokens - t_full;
         // Step 1: only HC_POST reads what HC_PRE writes.
         let fork = if full < n {
-            let fork = branch.fork(stream)?;
-            entries += 2;
+            // The fork: an event record and the branch's wait on it.
+            let fork = ent.of(2, branch.fork(stream))?;
             let x = span(WHAT_BATCH, streams_in, t_full * s4, nb * s4)?;
             let mut mixes = span_mut(WHAT_BATCH, &mut b.mixes, t_full * HC_MIX, nb * HC_MIX)?;
             let mut hc = span_mut(WHAT_BATCH, &mut b.hc, t_full * HC_MIX, nb * HC_MIX)?;
-            cx.k.hc.enqueue_pre_groups(
+            ent.one(cx.k.hc.enqueue_pre_groups(
                 fork.stream(),
                 &HcPreArgs {
                     params: &t.hc,
@@ -833,44 +856,43 @@ impl AttnChain {
                 &mut b.hc_pre,
                 &mut mixes,
                 &mut hc,
-            )?;
-            entries += 1;
+            ))?;
             Some(fork)
         } else {
             None
         };
         for sb in SubBlocks::new(cuts, run, full) {
-            b.mark(stream, &mut entries)?;
-            sub_pre(&cx, b, &sb, fold_in, false, &mut entries)?;
-            b.mark(stream, &mut entries)?;
+            b.mark(stream, &mut ent)?;
+            sub_pre(&cx, b, &sb, fold_in, false, &mut ent)?;
+            b.mark(stream, &mut ent)?;
             for k in sb.clone() {
                 let o = cx.token(k) - cx.token(sb.start);
                 let c = caches.chunk(k)?;
-                chunk_rows(&cx, scratch, b, k, o, c, None, &mut entries)?;
+                chunk_rows(&cx, scratch, b, k, o, c, None, &mut ent)?;
             }
         }
         for sb in SubBlocks::new(cuts, full, n) {
-            b.mark(stream, &mut entries)?;
-            sub_pre(&cx, b, &sb, fold_in, true, &mut entries)?;
-            b.mark(stream, &mut entries)?;
+            b.mark(stream, &mut ent)?;
+            sub_pre(&cx, b, &sb, fold_in, true, &mut ent)?;
+            b.mark(stream, &mut ent)?;
             for k in sb.clone() {
                 let o = cx.token(k) - cx.token(sb.start);
                 let c = caches.chunk(k)?;
-                chunk_rows(&cx, scratch, b, k, o, c, Some(&mut *staging), &mut entries)?;
+                chunk_rows(&cx, scratch, b, k, o, c, Some(&mut *staging), &mut ent)?;
             }
-            b.mark(stream, &mut entries)?;
-            sub_post(&cx, b, &sb, &mut entries)?;
-            b.mark(stream, &mut entries)?;
+            b.mark(stream, &mut ent)?;
+            sub_post(&cx, b, &sb, &mut ent)?;
+            b.mark(stream, &mut ent)?;
         }
         if let Some(fork) = fork {
-            fork.join()?;
-            entries += 2;
+            // The join: the branch's event record and the stream's wait on it.
+            ent.of(2, fork.join())?;
             let x = span(WHAT_BATCH, &b.out, t_full * d.n_embd, nb * d.n_embd)?;
             let res = span(WHAT_BATCH, streams_in, t_full * s4, nb * s4)?;
             let hc = span(WHAT_BATCH, &b.hc, t_full * HC_MIX, nb * HC_MIX)?;
             let mut so = span_mut(WHAT_BATCH, streams_out, t_full * s4, nb * s4)?;
             let mut fo = span_mut(WHAT_BATCH, fold_out, t_full * d.n_embd, nb * d.n_embd)?;
-            cx.k.hc.enqueue_post(
+            ent.one(cx.k.hc.enqueue_post(
                 stream,
                 &HcPostArgs {
                     x: &x,
@@ -881,10 +903,8 @@ impl AttnChain {
                 },
                 &mut so,
                 &mut fo,
-            )?;
-            entries += 1;
+            ))?;
         }
-        b.entries += entries;
         Ok(())
     }
 }
@@ -900,7 +920,7 @@ fn sub_pre(
     sb: &Range<usize>,
     fold_in: &DeviceBuffer<f32>,
     query: bool,
-    entries: &mut u64,
+    ent: &mut Entries<'_>,
 ) -> Result<(), GpuError> {
     let (d, t, gpu, stream) = (cx.d, cx.t, cx.gpu, cx.gpu.stream());
     let (ts, te) = (cx.token(sb.start), cx.token(sb.end));
@@ -908,7 +928,7 @@ fn sub_pre(
     let groups = cx.groups(sb)?;
     let at = count_at(n, b.normed_acts.len().min(b.q_a_acts.len()))?;
     let x = span(WHAT_BATCH, fold_in, ts * d.n_embd, n * d.n_embd)?;
-    cx.k.fused.enqueue_norm_quant(
+    ent.one(cx.k.fused.enqueue_norm_quant(
         stream,
         &x,
         t.norm,
@@ -916,8 +936,7 @@ fn sub_pre(
         &mut b.normed_acts[at],
         &mut b.normed,
         cx.fault,
-    )?;
-    *entries += 1;
+    ))?;
     let act = &b.normed_acts[at];
     if let Some(st) = &t.source {
         let missing = GpuError::State {
@@ -934,8 +953,7 @@ fn sub_pre(
         let split_parts = &[(COMP_KV, 0, width, 0), (COMP_SCORE, gate_at, width, 0)];
         let parts: &[(usize, usize, usize, usize)] = match st.proj {
             SourceProj::Joint(j) => {
-                gpu.enqueue_gemv_q3k_groups(j, act, groups, raw)?;
-                *entries += 1;
+                ent.one(gpu.enqueue_gemv_q3k_groups(j, act, groups, raw))?;
                 &[
                     (COMP_KV, 0, 2 * width, 0),
                     (COMP_SCORE, 0, 2 * width, width),
@@ -943,22 +961,20 @@ fn sub_pre(
             }
             SourceProj::Split { kv, gate } => {
                 let mut kv_rows = span_mut(WHAT_BATCH, raw, 0, n * width)?;
-                gpu.enqueue_gemv_q3k_groups(kv, act, groups, &mut kv_rows)?;
+                ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, &mut kv_rows))?;
                 drop(kv_rows);
                 let mut gate_rows = span_mut(WHAT_BATCH, raw, gate_at, n * width)?;
-                gpu.enqueue_gemv_q3k_groups(gate, act, groups, &mut gate_rows)?;
-                *entries += 2;
+                ent.one(gpu.enqueue_gemv_q3k_groups(gate, act, groups, &mut gate_rows))?;
                 split_parts
             }
             SourceProj::Kv(kv) => {
-                gpu.enqueue_gemv_q3k_groups(kv, act, groups, raw)?;
-                *entries += 1;
+                ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, raw))?;
                 &[(COMP_KV, 0, width, 0)]
             }
         };
         for &(part, off, total_rows, r0) in parts {
             let src = span(WHAT_BATCH, raw, off, total_rows * n)?;
-            cx.k.dense.enqueue_groups_to_tokens(
+            ent.one(cx.k.dense.enqueue_groups_to_tokens(
                 stream,
                 &src,
                 RowsPart {
@@ -968,21 +984,20 @@ fn sub_pre(
                 },
                 groups,
                 comp.part_mut(part),
-            )?;
-            *entries += 1;
+            ))?;
         }
     }
-    gpu.enqueue_gemv_q3k_groups(t.qkv, act, groups, &mut b.raw_qkv)?;
-    *entries += 1;
+    ent.one(gpu.enqueue_gemv_q3k_groups(t.qkv, act, groups, &mut b.raw_qkv))?;
     let total_rows = cx.qkv_rows();
     let latent = RowsPart {
         total_rows,
         r0: d.q_lora_rank,
         rows: d.head_dim,
     };
-    cx.k.dense
-        .enqueue_groups_to_tokens(stream, &b.raw_qkv, latent, groups, &mut b.kv)?;
-    *entries += 1;
+    ent.one(
+        cx.k.dense
+            .enqueue_groups_to_tokens(stream, &b.raw_qkv, latent, groups, &mut b.kv),
+    )?;
     if !query {
         return Ok(());
     }
@@ -991,9 +1006,11 @@ fn sub_pre(
         r0: 0,
         rows: d.q_lora_rank,
     };
-    cx.k.dense
-        .enqueue_groups_to_tokens(stream, &b.raw_qkv, q_a, groups, &mut b.q_a)?;
-    cx.k.fused.enqueue_norm_quant(
+    ent.one(
+        cx.k.dense
+            .enqueue_groups_to_tokens(stream, &b.raw_qkv, q_a, groups, &mut b.q_a),
+    )?;
+    ent.one(cx.k.fused.enqueue_norm_quant(
         stream,
         &b.q_a,
         t.q_a_norm,
@@ -1001,15 +1018,17 @@ fn sub_pre(
         &mut b.q_a_acts[at],
         &mut b.q_a_normed,
         cx.fault,
-    )?;
-    gpu.enqueue_gemv_q3k_groups(t.query, &b.q_a_acts[at], groups, &mut b.raw_q)?;
+    ))?;
+    ent.one(gpu.enqueue_gemv_q3k_groups(t.query, &b.q_a_acts[at], groups, &mut b.raw_q))?;
     let heads_part = RowsPart {
         total_rows: cx.q_rows(),
         r0: 0,
         rows: d.n_head * d.head_dim,
     };
-    cx.k.dense
-        .enqueue_groups_to_tokens(stream, &b.raw_q, heads_part, groups, &mut b.q)?;
+    ent.one(
+        cx.k.dense
+            .enqueue_groups_to_tokens(stream, &b.raw_q, heads_part, groups, &mut b.q),
+    )?;
     let table = batch_table(
         &b.tables,
         b.table_dims(),
@@ -1017,9 +1036,10 @@ fn sub_pre(
         cx.lp.tables.0,
         ts..ts + n,
     )?;
-    cx.k.rope
-        .enqueue_rope_tail(stream, &mut b.q, &table, heads(d, n))?;
-    *entries += 5;
+    ent.one(
+        cx.k.rope
+            .enqueue_rope_tail(stream, &mut b.q, &table, heads(d, n)),
+    )?;
     Ok(())
 }
 
@@ -1063,7 +1083,7 @@ fn chunk_rows(
     o: usize,
     caches: ChunkCaches<'_>,
     staging: Option<&mut DeviceTensor<u16>>,
-    entries: &mut u64,
+    ent: &mut Entries<'_>,
 ) -> Result<(), GpuError> {
     let (d, t, lp, stream) = (cx.d, cx.t, cx.lp, cx.gpu.stream());
     let ccx = cx.chunk(k)?;
@@ -1092,25 +1112,29 @@ fn chunk_rows(
             let kv = view::<f32, f32>(comp.part(COMP_KV), o * width, gt * width)?;
             let score = view::<f32, f32>(comp.part(COMP_SCORE), o * width, gt * width)?;
             let raw_key = s.raw.as_mut().and_then(|r| r.key.as_mut());
+            // The pooled rows, one launch; with index keys their quantize,
+            // gemv and key, and past one token the gemv's copy token-major.
             let keys = match st.keys {
                 Some(_) => 3 + u64::from(raw_key.is_some() && src.act_pre.m() > 1),
                 None => 0,
             };
-            source_rows(
-                &ccx,
-                sp,
-                st,
-                SourceRows {
-                    kv: &kv,
-                    score: &score,
-                    pre: &mut src.pre,
-                    act_pre: &mut src.act_pre,
-                    key: &mut src.key,
-                    raw_key,
-                },
-                io,
+            ent.of(
+                1 + keys,
+                source_rows(
+                    &ccx,
+                    sp,
+                    st,
+                    SourceRows {
+                        kv: &kv,
+                        score: &score,
+                        pre: &mut src.pre,
+                        act_pre: &mut src.act_pre,
+                        key: &mut src.key,
+                        raw_key,
+                    },
+                    io,
+                ),
             )?;
-            *entries += 1 + keys;
         }
         (None, None, Compressed::None | Compressed::Read(_)) => {}
         (sp, _, passed) => {
@@ -1133,7 +1157,7 @@ fn chunk_rows(
     let pos = ccx.words.view::<u32>(ccx.words.layout.pos, m)?;
     let table = ccx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
     let Some(staging) = staging else {
-        cx.k.rope.enqueue_kv_norm_rope_append(
+        ent.one(cx.k.rope.enqueue_kv_norm_rope_append(
             stream,
             KvAppendArgs {
                 kv: &kv,
@@ -1147,11 +1171,10 @@ fn chunk_rows(
                 cache: ring,
                 shadow,
             },
-        )?;
-        *entries += 1;
+        ))?;
         return Ok(());
     };
-    cx.k.rope.enqueue_kv_norm_rope_append(
+    ent.one(cx.k.rope.enqueue_kv_norm_rope_append(
         stream,
         KvAppendArgs {
             kv: &kv,
@@ -1165,8 +1188,7 @@ fn chunk_rows(
             cache: &mut *staging,
             shadow,
         },
-    )?;
-    *entries += 1;
+    ))?;
     let (rows, vis_at) = match (&compressed, lp.stream) {
         (Compressed::Read(rows), Some(st)) => (Some(*rows), ccx.words.layout.streams[st].vis),
         (Compressed::Source(io), Some(st)) => (Some(&*io.rows), ccx.words.layout.streams[st].vis),
@@ -1203,21 +1225,24 @@ fn chunk_rows(
             let (q_at, q_len) = (d.n_head * d.head_dim, indexer::HEADS * indexer::HEAD_DIM);
             let q_in = view::<f32, f32>(&b.raw_q, cx.q_rows() * o + q_at * m, q_len * m)?;
             let w_in = view::<f32, f32>(&b.raw_qkv, cx.qkv_rows() * o + w_at * m, w_rows * m)?;
-            enqueue_select(
-                &ccx,
-                lp,
-                kernels,
-                sel,
-                &q_in,
-                &w_in,
-                IndexerIo {
-                    stream: st,
-                    keys,
-                    list: &mut *list,
-                    top_k: cx.top_k,
-                },
+            // The indexer's score and its top-k.
+            ent.of(
+                2,
+                enqueue_select(
+                    &ccx,
+                    lp,
+                    kernels,
+                    sel,
+                    &q_in,
+                    &w_in,
+                    IndexerIo {
+                        stream: st,
+                        keys,
+                        list: &mut *list,
+                        top_k: cx.top_k,
+                    },
+                ),
             )?;
-            *entries += 2;
             Some(&*list)
         }
         (ip, sel, st) => {
@@ -1264,16 +1289,20 @@ fn chunk_rows(
         first: cx.cuts[k].start,
     };
     let staged = staging_view(&stage, m)?;
-    let attended = cx.k.attn.enqueue_staged(
-        stream,
-        args,
-        Staged {
-            rows: &staged,
-            base: &base,
-        },
+    // The staged attention's segment pass and merge, then the commit.
+    let attended = ent.of(
+        2,
+        cx.k.attn.enqueue_staged(
+            stream,
+            args,
+            Staged {
+                rows: &staged,
+                base: &base,
+            },
+        ),
     );
     let committed = attended.and_then(|()| {
-        cx.k.attn.enqueue_commit(
+        ent.one(cx.k.attn.enqueue_commit(
             stream,
             CommitArgs {
                 staged: Staged {
@@ -1283,12 +1312,10 @@ fn chunk_rows(
                 tokens: m,
                 ring: &mut *ring,
             },
-        )
+        ))
     });
     DeviceTensor::release(staged);
-    committed?;
-    *entries += 3;
-    Ok(())
+    committed
 }
 
 /// Sub-block `sb`'s launches after its chunks (module doc, step 4): the
@@ -1299,7 +1326,7 @@ fn sub_post(
     cx: &BatchCx<'_>,
     b: &mut AttnBatch,
     sb: &Range<usize>,
-    entries: &mut u64,
+    ent: &mut Entries<'_>,
 ) -> Result<(), GpuError> {
     let (d, t, gpu, stream) = (cx.d, cx.t, cx.gpu, cx.gpu.stream());
     let (ts, te) = (cx.token(sb.start), cx.token(sb.end));
@@ -1312,12 +1339,14 @@ fn sub_post(
         cx.lp.tables.1,
         ts..ts + n,
     )?;
-    cx.k.rope
-        .enqueue_rope_tail(stream, &mut b.y, &table, heads(d, n))?;
+    ent.one(
+        cx.k.rope
+            .enqueue_rope_tail(stream, &mut b.y, &table, heads(d, n)),
+    )?;
     drop(table);
     let groups = d.n_head * d.head_dim / d.group_k;
-    gpu.enqueue_quantize_q8_1_cols(&b.y, &mut b.heads, n * groups, cx.layer)?;
-    cx.k.dense.enqueue_q3k_heads_groups(
+    ent.one(gpu.enqueue_quantize_q8_1_cols(&b.y, &mut b.heads, n * groups, cx.layer))?;
+    ent.one(cx.k.dense.enqueue_q3k_heads_groups(
         stream,
         Q3kHeadsGroupsArgs {
             w: t.out_a,
@@ -1327,11 +1356,11 @@ fn sub_post(
             tokens,
             y: &mut b.wo_a,
         },
-    )?;
-    gpu.enqueue_quantize_q8_1_cols(&b.wo_a, &mut b.wo_a_act, n, cx.layer)?;
-    gpu.enqueue_gemv_q3k_groups(t.out_b, &b.wo_a_act, tokens, &mut b.raw_out)?;
+    ))?;
+    ent.one(gpu.enqueue_quantize_q8_1_cols(&b.wo_a, &mut b.wo_a_act, n, cx.layer))?;
+    ent.one(gpu.enqueue_gemv_q3k_groups(t.out_b, &b.wo_a_act, tokens, &mut b.raw_out))?;
     let mut out = span_mut(WHAT_BATCH, &mut b.out, ts * d.n_embd, n * d.n_embd)?;
-    cx.k.dense.enqueue_groups_to_tokens(
+    ent.one(cx.k.dense.enqueue_groups_to_tokens(
         stream,
         &b.raw_out,
         RowsPart {
@@ -1341,7 +1370,6 @@ fn sub_post(
         },
         tokens,
         &mut out,
-    )?;
-    *entries += 6;
+    ))?;
     Ok(())
 }

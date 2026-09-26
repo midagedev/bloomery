@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """The V4.1 prompt batch under Nsight: one owner of the batch's cut for both profilers.
 
-  ds41pp.py tables <sqlite> <P> <n> <run log> [--layer L] [--blocked-us U]
+  ds41pp.py tables <sqlite> <P> <n> <run log> [--plan FILE] [--layer L] [--blocked-us U]
       the nsys prefill form's tables (tools/ref/nsys-ds41.sh, BLOOMERY_NSYS_FORM=prefill, and its
       --analyze): the prompt window, the layer-batches, their kernel terms, the card and host
       timelines and the launch queue
-  ds41pp.py ncu-plan <sqlite> <P> <run log> <plan out> [--layer L]
+  ds41pp.py ncu-plan <sqlite> <P> <run log> <plan out> [--plan FILE] [--layer L]
       the ncu ds41pp form's target (tools/ref/ncu-gpu.sh, BLOOMERY_NCU_FORM=ds41pp): the four
       projections of one full chunk, the launch skip that reaches them and the shapes they must have
   ds41pp.py ncu-summary <csv> <plan> <model>
       the shape check of the profiled launches, then each unit's demand next to the block-step
 
 The trace is `generate_ds41 --depth P -n N --time` under `nsys profile -t cuda --cuda-graph-trace=node`
-(the prefill form's command). What it holds and how it is cut:
+(the prefill form's command); its run log's lines are read by tools/bloomery/records.py, by kind and
+field. What it holds and how it is cut:
   - the prompt window: every kernel with no graph node (the batch runs eagerly and refuses a capture;
     the capture before it executes nothing), from the first to the first graph replay, which is the
     first generated step's;
-  - the batches and chunks: body/prefill.rs `batches` (ceil(P / T_MAX) runs of near-equal length) and
-    `chunks` (cut at multiples of CHUNK); checked against the trace — one `gather_pairs` a chunk per
+  - the batches and their chunks: the engine's own plan of the call, its `call plan` and `call batch`
+    records — the run log's (a batched feed prints them before its load), else --plan FILE's
+    (`generate_ds41 --plan` with the run's arguments, for a log from before them), whose needs must be
+    the run's `stat prefill ced=` line's; checked against the trace — one `gather_pairs` a chunk per
     batch, one `ds41_hc_post` a full chunk per layer-batch;
   - a layer-batch: a layer's block in one batch, the launches from the previous one's join to its own
     join (`ds41_ffn_post_batch*`); its route ends at its `ds41_ffn_places`, the route's three copies to
@@ -39,6 +42,7 @@ Exit status: 0 with tables; 3 a named refusal (a boundary, a skip or a shape tha
 """
 import bisect
 import csv
+import os
 import re
 import sqlite3
 import statistics
@@ -46,9 +50,9 @@ import struct
 import sys
 from collections import Counter, defaultdict
 
-# body/prefill.rs: T_MAX = UNION_MAX_COLS (model::moe), CHUNK = HC_MAX_TOKENS (gpu-deepseek41 hc.rs).
-T_MAX = 512
-CHUNK = 8
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery"))
+import records  # noqa: E402 - the record reader, beside this tree's tools
+
 # The queue's plateau: a call within FULL_MARGIN activities of the most in flight, after which at
 # least FULL_LONG_SHARE of the calls block.
 FULL_MARGIN = 16
@@ -91,63 +95,39 @@ def refuse(msg):
 # ---- the run's own lines ----
 
 def read_runlog(path):
+    """The run's own records: the time prompt row, the load, the prompt call's split and needs, the plan
+    of the call when the log carries it, and the lines the tables echo, in the log's order."""
     r = {"lines": []}
     try:
-        text = open(path).read().splitlines()
+        recs = records.read(path)
     except OSError:
-        text = []
-    for line in text:
-        m = re.match(r"time prompt n=(\d+) ms=([0-9.]+) tok/s=\S+ passes=(\d+) kind=(\w+)", line)
-        if m:
-            r["p_n"], r["p_ms"], r["passes"], r["kind"] = int(m[1]), float(m[2]), int(m[3]), m[4]
-            r["lines"].append(line)
-        m = re.match(r"load .*\blayers=(\d+)\b.*\bprefill=(\w+)", line)
-        if m:
-            r["n_layer"], r["prefill"] = int(m[1]), m[2]
-            r["lines"].append(line)
-        m = re.match(r"stat prefill split batches=(\d+) layer_batches=(\d+) .*union_lb=([0-9.]+) "
-                     r"wait_lb=([0-9.]+) enqueue_lb=([0-9.]+) copy_lb=([0-9.]+)", line)
-        if m:
-            r["batches"], r["layer_batches"] = int(m[1]), int(m[2])
-            r["lb"] = {"union": float(m[3]), "wait": float(m[4]), "enqueue": float(m[5]), "copy": float(m[6])}
-            r["lines"].append(line)
-        m = re.match(r"stat prefill ced=.*\bfirst=(\d+) end=(\d+) .*full_from=\[([0-9,]*)\] part_from=\[([0-9,]*)\]", line)
-        if m:
-            r["ced_first"], r["ced_end"] = int(m[1]), int(m[2])
-            r["full_from"] = [int(x) for x in m[3].split(",") if x]
-            r["part_from"] = [int(x) for x in m[4].split(",") if x]
-            r["lines"].append(line)
-        if line.startswith(("plan ", "capture ", "fed ", "step 0 ", "SMOKE ")):
-            r["lines"].append(line)
-        if line.startswith("plan "):
-            r["plan"] = line
+        recs = []
+    for x in recs:
+        if x.kind == "time_prompt":
+            r["p_n"], r["p_ms"], r["passes"], r["kind"] = x["n"], x["ms"], x["passes"], x["kind"]
+        elif x.kind == "load" and "layers" in x and "prefill" in x:
+            r["n_layer"], r["prefill"] = x["layers"], x["prefill"]
+        elif x.kind == "stat_prefill_split":
+            r["batches"], r["layer_batches"] = x["batches"], x["layer_batches"]
+            r["lb"] = {"union": x["union_lb"], "wait": x["wait_lb"], "enqueue": x["enqueue_lb"],
+                       "copy": x["copy_lb"]}
+        elif x.kind == "stat_prefill_ced":
+            r["ced_first"], r["ced_end"] = x["first"], x["end"]
+            r["full_from"], r["part_from"] = x["full_from"], x["part_from"]
+        elif x.kind == "plan":
+            r["plan"] = x.line
+        elif x.kind not in ("capture", "capture_pair", "fed", "step0", "smoke"):
+            continue
+        r["lines"].append(x.line)
+    r["call"] = [x for x in recs if x.kind.startswith("call_")]
     return r
 
 
-def batches(first, n):
-    """body/prefill.rs `batches`: ceil(n / T_MAX) runs, the first n mod k one position longer."""
-    k = -(-n // T_MAX)
-    out, p = [], first
-    for j in range(k):
-        ln = n // k + (1 if j < n % k else 0)
-        out.append((p, p + ln))
-        p += ln
-    return out
-
-
-def chunks(b, e):
-    """body/prefill.rs `chunks`: cut at every multiple of CHUNK."""
-    out, p = [], b
-    while p < e:
-        nxt = min((p // CHUNK + 1) * CHUNK, e)
-        out.append((p, nxt))
-        p = nxt
-    return out
-
-
-def batch_plan(run):
+def batch_plan(run, plan_path):
     """Per layer-batch in launch order: (batch, layer, full chunks, latent chunks, the full chunks'
-    lengths), from the batch cut, the chunk cut and each layer's block and latent starts."""
+    lengths): the engine's plan of the call — its batches and their chunks, the run log's own `call`
+    records or `plan_path`'s — under the run's needs (each layer's block and latent starts), held to
+    the run's stat line; and the plan's chunk size."""
     need = ("full_from", "part_from", "ced_first", "ced_end", "n_layer", "batches", "layer_batches")
     missing = [k for k in need if k not in run]
     if missing:
@@ -157,23 +137,35 @@ def batch_plan(run):
     if len(full) != n_layer or len(part) != n_layer:
         refuse(f"[boundary] the ced line names {len(full)} block and {len(part)} latent starts for "
                f"{n_layer} layers: no table")
-    runs = batches(run["ced_first"], run["ced_end"] - run["ced_first"])
+    plan = records.read(plan_path) if plan_path else run["call"]
+    head = records.first(plan, "call_plan")
+    batches = sorted(records.of_kind(plan, "call_batch"), key=lambda x: x["b"])
+    if head is None or not batches:
+        refuse("[boundary] no plan of the call: the run log carries no `call plan` and `call batch` records "
+               "and no --plan FILE was given (generate_ds41 --plan with the run's arguments writes one), no "
+               "table")
+    cn = records.first(plan, "call_need")
+    if ((head["first"], head["end"]) != (run["ced_first"], run["ced_end"])
+            or (cn is not None and (cn["full_from"], cn["part_from"]) != (full, part))):
+        refuse(f"[boundary] the plan is of the call {head['first']}..{head['end']} with other needs than "
+               f"the run's ({run['ced_first']}..{run['ced_end']}, its `stat prefill ced=` line): no table")
+    runs = [(x["first"], x["end"]) for x in batches]
     if len(runs) != run["batches"]:
-        refuse(f"[boundary] ceil(P / {T_MAX}) = {len(runs)} batches, the run's stat line says "
-               f"{run['batches']}: T_MAX moved, no table")
-    plan = []
-    for bi, (b, e) in enumerate(runs):
-        cuts = chunks(b, e)
+        refuse(f"[boundary] the plan runs {len(runs)} batches, the run's stat line says {run['batches']}: "
+               f"no table")
+    out = []
+    for bi, x in enumerate(batches):
+        cuts = list(zip(x["cuts"], x["cuts"][1:]))
         for layer in range(n_layer):
             f = [c for c in cuts if c[0] >= full[layer]]
             p = [c for c in cuts if part[layer] <= c[0] < full[layer]]
             if f:
-                plan.append({"batch": bi, "layer": layer, "full": len(f), "part": len(p),
-                             "m": [c[1] - c[0] for c in f], "cuts": len(cuts)})
-    if len(plan) != run["layer_batches"]:
-        refuse(f"[boundary] the ced line gives {len(plan)} layer-batches, the stat line says "
+                out.append({"batch": bi, "layer": layer, "full": len(f), "part": len(p),
+                            "m": [c[1] - c[0] for c in f], "cuts": len(cuts)})
+    if len(out) != run["layer_batches"]:
+        refuse(f"[boundary] the plan gives {len(out)} layer-batches, the stat line says "
                f"{run['layer_batches']}: no table")
-    return plan, runs
+    return out, runs, head["chunk"]
 
 
 # ---- the trace ----
@@ -287,7 +279,7 @@ def cut_layer_batches(en, plan, runs):
         gathers = sum(1 for i in g if en[i]["kernel"] == "gather_pairs")
         if gathers != lb["cuts"]:
             refuse(f"[boundary] batch {bi}: {gathers} gather_pairs launches, the chunk cut gives "
-                   f"{lb['cuts']} chunks (CHUNK moved?), no table")
+                   f"{lb['cuts']} chunks (the plan's), no table")
         lb["prologue"] = (lb["lo"], g[-1] + 1)
         lb["lo"] = g[-1] + 1
     head = (lbs[-1]["hi"] + 1, len(en))
@@ -556,6 +548,7 @@ def cmd_tables(argv):
     path, P, n, runlog = argv[0], int(argv[1]), int(argv[2]), argv[3]
     layer_pick = int(opt(argv, "--layer", "2"))
     blocked_ns = float(opt(argv, "--blocked-us", "8")) * 1e3
+    plan_path = opt(argv, "--plan", None)
     run = read_runlog(runlog)
     for line in run["lines"]:
         print("    " + line)
@@ -565,7 +558,7 @@ def cmd_tables(argv):
     eager, replay = prompt_window(tr, run)
     if run.get("p_n") != P:
         refuse(f"[boundary] the run's `time prompt` row is n={run.get('p_n')}, the form asked for P={P}: no table")
-    plan, runs = batch_plan(run)
+    plan, runs, _ = batch_plan(run, plan_path)
     en = entries(tr, eager, replay)
     dev = eager[0]["dev"]
     busy_of = Busy([(k["s"], k["e"]) for k in tr.kernels if k["dev"] == dev] +
@@ -710,12 +703,13 @@ def cmd_ncu_plan(argv):
         raise SystemExit(64)
     path, P, runlog, out = argv[0], int(argv[1]), argv[2], argv[3]
     want = opt(argv, "--layer", None)
+    plan_path = opt(argv, "--plan", None)
     run = read_runlog(runlog)
     tr = Trace(path)
     eager, replay = prompt_window(tr, run)
     if run.get("p_n") != P:
         refuse(f"[skip] the trace's run fed n={run.get('p_n')}, the form asked for P={P}: no target")
-    plan, runs = batch_plan(run)
+    plan, runs, chunk = batch_plan(run, plan_path)
     en = entries(tr, eager, replay)
     lbs, head = cut_layer_batches(en, plan, runs)
     for lb in lbs:
@@ -739,8 +733,8 @@ def cmd_ncu_plan(argv):
     if r is None:
         refuse(f"[skip] layer {lb['layer']} chunk {k}: the four projections are not all in it: no target")
     m = lb["m"][k]
-    if m != CHUNK:
-        refuse(f"[skip] layer {lb['layer']} full chunk {k} holds {m} positions, the form profiles m = {CHUNK}: no target")
+    if m != chunk:
+        refuse(f"[skip] layer {lb['layer']} full chunk {k} holds {m} positions, the form profiles m = {chunk}: no target")
     names = {PROJ_ROW, PROJ_HEADS}
     order = sorted((x for x in en if x["kernel"] in names and x["act"]["graph"] is None), key=lambda x: x["s"])
     at = {x["corr"]: i for i, x in enumerate(order)}

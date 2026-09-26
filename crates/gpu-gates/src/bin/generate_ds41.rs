@@ -3,7 +3,8 @@
 //!
 //!     generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N]
 //!                   [--ctx C] [--place a|gate] [--mode eager|graph]
-//!                   [--time [--warm W]]
+//!                   [--time [--warm W]] [--plan]
+//!     generate_ds41 --records-schema
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
 //! context (`workstation::CTX_MAX`), place `a`, mode graph, W 0. A flag given
@@ -16,7 +17,9 @@
 //! the same binary's timing arm, and the `load` line prints which one ran
 //! (`prefill=`, the mode the engine holds). Every lever is parsed once, at
 //! `main` (`bloomery_levers::at_main`); `--levers` prints them with this
-//! process's values and exits. Prompt ids are
+//! process's values and exits. Every line the binary writes is a record of a
+//! kind `bloomery_gpu_gates::record` declares; `--records-schema` prints
+//! those kinds (fields, types, units) and exits. Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
 //! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the long gate's
@@ -95,6 +98,20 @@
 //! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
 //! positions, the first whose features were kept, the blocks and latent
 //! parts it ran over every layer, and each layer's block and latent starts.
+//! With `BLOOMERY_STEP_STATS=1`, after the loop, a `stat prefill front` line
+//! per batch and a `stat prefill lb` line per layer-batch: the queue entries
+//! each enqueued (`body::Body::prefill_counts`), whose sums the `split`
+//! line's `entries_route=`/`entries_shadow=` are.
+//!
+//! A batched feed prints the plan of its call before the load (`call plan`,
+//! then a `call batch` line per batch): `body::BodyLevers::call_plan`, the
+//! functions the call's enqueue runs by, and the feed refuses a call whose
+//! needs are not the printed ones. `--plan` prints the whole plan — every
+//! group lever's groups (`call groups`), each batch, each layer's facts and
+//! its card's experts (`call layer`), the needs (`call need`) and every
+//! layer-batch's starts and sub-blocks (`call lb`) — and exits before the
+//! load; it is refused with `--time`, beside `BLOOMERY_DRAFT=dspark` (its
+//! feed widens the tapped layers' blocks) and beside a feed of steps.
 //!
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
@@ -177,7 +194,12 @@ mod finite;
 mod dspark;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_split.rs"]
+mod split;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
+    use std::ops::Range;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -186,19 +208,22 @@ mod drive {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{LaunchStats, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_gates::draft::Lookup;
+    use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::Levers;
     use gguf::Split;
+    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, Machine, PlanLevers, workstation};
 
     use crate::dspark::{self, Dspark, Verdict};
-    use crate::finite;
+    use crate::{finite, split};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
                          [-n N] [--ctx C] [--place a|gate] [--mode eager|graph] \
-                         [--time [--warm W]]";
+                         [--time [--warm W]] [--plan]";
 
     /// Which placement the engine loads by.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -244,6 +269,8 @@ mod drive {
         warm: Option<usize>,
         /// `BLOOMERY_STEP_STATS`, as the levers hold it.
         stats: bool,
+        /// `--plan`: print the call's whole plan and load nothing.
+        plan: bool,
     }
 
     fn parse_args(levers: &Levers) -> Result<Args, GateError> {
@@ -257,12 +284,17 @@ mod drive {
             timed: false,
             warm: None,
             stats: levers.step_stats(),
+            plan: false,
         };
         let (mut row, mut ids) = (None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             if flag == "--time" {
                 a.timed = true;
+                continue;
+            }
+            if flag == "--plan" {
+                a.plan = true;
                 continue;
             }
             let v = it
@@ -406,10 +438,15 @@ mod drive {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main()?;
+        record::at_main("generate_ds41", record::GENERATE_DS41);
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;
         let check_finite = finite_lever(&a, draft, &levers)?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
+        let batched = !check_finite && cfg.body.prefill == body::PrefillMode::Batch;
+        if a.plan {
+            refuse_plan(&a, draft, batched)?;
+        }
         let pin_main = levers.pin_main();
         let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
@@ -434,7 +471,7 @@ mod drive {
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&file)?;
-        let ctx_max = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
+        let (ctx_max, n_l) = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
         // The caches hold the plan's ctx_max positions, the value the model
         // is loaded with; --ctx only asks for it.
         if fed > ctx_max {
@@ -456,6 +493,16 @@ mod drive {
             )
             .into());
         }
+        // The DSpark feed's taps widen the tapped layers' blocks: its call is
+        // not the plain call's plan.
+        let call = (batched && draft != Draft::Dspark)
+            .then(|| CallView::of(&cfg, &inputs.hp, ctx_max, ids.len()));
+        if let Some(c) = &call {
+            c.print(a.plan, &inputs.hp, &n_l);
+        }
+        if a.plan {
+            return Ok(());
+        }
 
         let mut m = body::open(file, a.place.machine(), a.ctx, &cfg)?;
         m.set_mode(a.mode);
@@ -470,43 +517,40 @@ mod drive {
             )
             .into());
         }
-        println!(
-            "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
-             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
-             prefill={} ced={} group={} in {:.1} s (runtime value)",
-            m.resident_bytes(),
-            shadow.bytes,
-            shadow.unified_addressing,
-            a.ctx,
-            inputs.hp.n_layer,
-            mode_name(a.mode),
-            a.place.name(),
-            if pin_main { "on" } else { "off" },
-            m.launch_thread()
-                .map_or("off".to_string(), |cpu| match cpu {
-                    Some(c) => format!("on launch_cpu={c}"),
-                    None => "on launch_cpu=float".to_string(),
-                }),
+        let load = Record::new(&record::LOAD)
+            .u("resident_bytes", m.resident_bytes())
+            .w("shadow", "host")
+            .u("shadow_bytes", shadow.bytes)
+            .u("unified_addressing", shadow.unified_addressing)
+            .u("ctx", a.ctx)
+            .u("layers", inputs.hp.n_layer)
+            .u("top_k", top_k)
+            .w("mode", mode_name(a.mode))
+            .w("place", a.place.name())
+            .w("pin_main", if pin_main { "on" } else { "off" })
+            .w("pinned", pinned);
+        let load = match m.launch_thread() {
+            None => load.w("launch_thread", "off"),
+            Some(cpu) => load.w("launch_thread", "on").w(
+                "launch_cpu",
+                cpu.map_or_else(|| "float".to_string(), |c| c.to_string()),
+            ),
+        };
+        load.w(
+            "prefill",
             if check_finite {
                 "steps"
             } else {
                 prefill_mode.name()
             },
-            m.body("generate_ds41")?.ced(),
-            m.body("generate_ds41")?.prefill_group_lever(),
-            t.elapsed().as_secs_f64()
-        );
+        )
+        .w("ced", m.body("generate_ds41")?.ced())
+        .u("group", m.body("generate_ds41")?.prefill_group_lever())
+        .f("load_s", t.elapsed().as_secs_f64())
+        .print();
         if let Some(h) = m.host_residency() {
-            match h.populated() {
-                Some(w) => println!(
-                    "host_populate={} in {:.1} s (runtime value)",
-                    w.bytes(),
-                    w.wall().as_secs_f64()
-                ),
-                None => println!("host_populate=off"),
-            }
-            if let Some(l) = h.lock() {
-                println!("host_lock={} B", l.bytes());
+            for r in record::host_residency(h) {
+                r.print();
             }
         }
         // The draft builds the target's feature tap, so it loads before the
@@ -520,24 +564,31 @@ mod drive {
                 );
                 let mut d = Dspark::open(&mut m, draft_split, hp, target, card)?;
                 let (free, total) = d.mem_info()?;
-                println!(
-                    "load draft=dspark card={} width={} target_layers={:?} feature_width={} \
-                     draft_card_free={free} of {total} in {:.1} s (runtime value)",
-                    d.card(),
-                    dspark::WIDTH,
-                    m.body("generate_ds41")?
-                        .feature_layers()
-                        .unwrap_or_default(),
-                    m.body("generate_ds41")?.feature_width(),
-                    t.elapsed().as_secs_f64()
-                );
+                Record::new(&record::LOAD_DRAFT)
+                    .w("draft", "dspark")
+                    .w("card", d.card())
+                    .u("width", dspark::WIDTH)
+                    .list(
+                        "target_layers",
+                        m.body("generate_ds41")?
+                            .feature_layers()
+                            .unwrap_or_default(),
+                    )
+                    .u("feature_width", m.body("generate_ds41")?.feature_width())
+                    .u("draft_card_free", free)
+                    .u("draft_card_total", total)
+                    .f("load_s", t.elapsed().as_secs_f64())
+                    .print();
                 Some(d)
             }
             None => None,
         };
         if a.mode == StepMode::Graph {
             // Captured before the prompt, so the first timed step is a replay.
-            println!("capture graph_nodes={}", m.capture_step()?);
+            let nodes = m.capture_step()?;
+            Record::new(&record::CAPTURE)
+                .u("graph_nodes", nodes)
+                .print();
         }
         // The batch's buffers made before the prompt, so the timed feed
         // allocates nothing.
@@ -554,19 +605,17 @@ mod drive {
             }
             let body = m.body("generate_ds41")?;
             let (group, group_bytes) = body.prefill_group().unwrap_or_default();
-            println!(
-                "prefill batch_bytes={} proj_bytes={} group={group} group_bytes={group_bytes}",
-                body.batch_bytes(),
-                body.batch_proj_bytes()
-            );
+            Record::new(&record::PREFILL_BYTES)
+                .u("batch_bytes", body.batch_bytes())
+                .u("proj_bytes", body.batch_proj_bytes())
+                .u("group", group)
+                .u("group_bytes", group_bytes)
+                .print();
         }
         let mut check = if check_finite {
             let (gpu, w, _) = m.body_parts("generate_ds41")?;
             let head = Head::new(gpu, w, inputs.hp.rms_eps)?;
-            println!(
-                "check_finite=on: every position observed eagerly, taken back, then stepped \
-                 through the engine"
-            );
+            Record::new(&record::CHECK_FINITE).print();
             Some(FiniteCheck {
                 head,
                 rows: Vec::with_capacity(fed + 1),
@@ -574,10 +623,201 @@ mod drive {
         } else {
             None
         };
+        let fed = Fed {
+            ids: &ids,
+            prompt_len,
+            mode: feed_mode,
+            need: call.as_ref().map(|c| &c.need),
+        };
         match draft {
-            Draft::Off => decode(&mut m, &a, &ids, prompt_len, feed_mode, check.as_mut()),
-            Draft::Lookup => decode_draft(&mut m, &a, &ids, prompt_len, feed_mode, None),
-            Draft::Dspark => decode_draft(&mut m, &a, &ids, prompt_len, feed_mode, spark.as_mut()),
+            Draft::Off => decode(&mut m, &a, &fed, check.as_mut()),
+            Draft::Lookup => decode_draft(&mut m, &a, &fed, None),
+            Draft::Dspark => decode_draft(&mut m, &a, &fed, spark.as_mut()),
+        }
+    }
+
+    /// What a run feeds before its first generated token: the ids, how many
+    /// of them are the prompt's, the feed's mode, and on a planned batched
+    /// feed the needs its printed plan gives the call.
+    struct Fed<'a> {
+        ids: &'a [u32],
+        prompt_len: usize,
+        mode: body::PrefillMode,
+        need: Option<&'a body::Need>,
+    }
+
+    /// `--plan` prints a batched call's plan and runs nothing: refused with
+    /// `--time`, beside the DSpark draft, whose feed widens the tapped
+    /// layers' blocks, and beside a feed of steps, which runs no batch.
+    fn refuse_plan(a: &Args, draft: Draft, batched: bool) -> Result<(), GateError> {
+        let beside = [
+            (a.timed, "--time: it runs nothing to time"),
+            (
+                draft == Draft::Dspark,
+                "BLOOMERY_DRAFT=dspark: its feed widens the tapped layers' blocks",
+            ),
+            (
+                !batched,
+                "a feed of one step per id (BLOOMERY_PREFILL=steps or BLOOMERY_CHECK_FINITE=1): \
+                 it runs no batch",
+            ),
+        ];
+        match beside.iter().find(|(set, _)| *set) {
+            Some((_, why)) => Err(format!("--plan is refused with {why}").into()),
+            None => Ok(()),
+        }
+    }
+
+    /// A prompt call's plan as the `call` records print it: its batches,
+    /// their chunks, the triangle's needs, the groups under every group
+    /// lever, and each layer-batch's starts and sub-blocks — read off
+    /// `body::BodyLevers::call_plan`, the functions the call's enqueue runs
+    /// by.
+    struct CallView {
+        group: usize,
+        ring: usize,
+        ced: body::CedState,
+        batches: Vec<Range<usize>>,
+        cuts: Vec<Vec<Range<usize>>>,
+        need: body::Need,
+        /// Per group lever, from 1: the groups, as ranges of batches.
+        groups: Vec<(usize, Vec<Range<usize>>)>,
+        /// Per batch, per layer index.
+        lbs: Vec<Vec<LbView>>,
+    }
+
+    /// One layer-batch of a [`CallView`]: the chunks its latent part and its
+    /// block start at, and the sub-blocks the projections run over each.
+    struct LbView {
+        run: usize,
+        full: usize,
+        part: Vec<Range<usize>>,
+        block: Vec<Range<usize>>,
+    }
+
+    impl CallView {
+        /// The plan of a call of `n` ids from position 0 on the body `cfg`
+        /// opens from `hp` with caches of `ctx_max` positions.
+        fn of(cfg: &body::OpenCfg, hp: &Hparams, ctx_max: usize, n: usize) -> CallView {
+            let p = cfg.body.call_plan(hp, ctx_max, 0, n);
+            let lbs = (0..p.batches.len())
+                .map(|b| {
+                    (0..p.need.layers.len())
+                        .map(|i| {
+                            let (run, full) = p.starts(b, i);
+                            LbView {
+                                run,
+                                full,
+                                part: p.sub_blocks(b, run, full),
+                                block: p.sub_blocks(b, full, usize::MAX),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let groups = p.every_group();
+            CallView {
+                group: p.group,
+                ring: p.ring,
+                ced: p.ced,
+                groups,
+                lbs,
+                batches: p.batches,
+                cuts: p.cuts,
+                need: p.need,
+            }
+        }
+
+        /// The groups under the plan's own lever.
+        fn own_groups(&self) -> &[Range<usize>] {
+            self.groups
+                .iter()
+                .find(|(g, _)| *g == self.group)
+                .map_or(&[], |(_, v)| v.as_slice())
+        }
+
+        /// The `call plan` record and a `call batch` record per batch; under
+        /// `whole` (`--plan`) also every lever's groups, every layer's facts
+        /// with its card's experts `n_l`, the needs and every layer-batch.
+        fn print(&self, whole: bool, hp: &Hparams, n_l: &[u64]) {
+            let layers = self.need.layers.len();
+            Record::new(&record::CALL_PLAN)
+                .u("first", self.need.first)
+                .u("end", self.need.end)
+                .u("batches", self.batches.len())
+                .u("group", self.group)
+                .u("groups", self.own_groups().len())
+                .u("t_max", body::T_MAX)
+                .u("chunk", body::CHUNK)
+                .u("sub_chunks", SUB_TOKENS / body::CHUNK)
+                .u("ring", self.ring)
+                .u("layers", layers)
+                .w("ced", self.ced)
+                .print();
+            if whole {
+                for (g, groups) in &self.groups {
+                    Record::new(&record::CALL_GROUPS)
+                        .u("g", g)
+                        .csv("sizes", groups.iter().map(ExactSizeIterator::len))
+                        .print();
+                }
+            }
+            for (gi, g) in self.own_groups().iter().enumerate() {
+                for b in g.clone() {
+                    let (r, cuts) = (&self.batches[b], &self.cuts[b]);
+                    Record::new(&record::CALL_BATCH)
+                        .u("b", b)
+                        .u("first", r.start)
+                        .u("end", r.end)
+                        .u("group", gi)
+                        .u("set", b - g.start)
+                        .u("chunks", cuts.len())
+                        .csv(
+                            "cuts",
+                            cuts.iter()
+                                .map(|c| c.start)
+                                .chain(cuts.last().map(|c| c.end)),
+                        )
+                        .print();
+                }
+            }
+            if !whole {
+                return;
+            }
+            for (l, k) in hp.layers.iter().enumerate() {
+                Record::new(&record::CALL_LAYER)
+                    .u("l", l)
+                    .u("ratio", k.ratio())
+                    .w("compressor", k.compressor.is_some())
+                    .w("gated", k.compressor.is_some_and(|c| c.gated))
+                    .w("index_keys", k.index_keys)
+                    .w("indexer", k.indexer)
+                    .w("engram", k.engram.is_some())
+                    .u("card_experts", n_l[l])
+                    .print();
+            }
+            let (block, part) = self.need.counts();
+            Record::new(&record::CALL_NEED)
+                .u("features_from", self.need.features)
+                .u("block_positions", block)
+                .u("part_positions", part)
+                .csv("full_from", self.need.layers.iter().map(|n| n.full))
+                .csv("part_from", self.need.layers.iter().map(|n| n.part))
+                .print();
+            let sizes =
+                |sbs: &[Range<usize>]| sbs.iter().map(ExactSizeIterator::len).collect::<Vec<_>>();
+            for (b, row) in self.lbs.iter().enumerate() {
+                for (i, lb) in row.iter().enumerate() {
+                    Record::new(&record::CALL_LB)
+                        .u("b", b)
+                        .u("layer", i)
+                        .u("run", lb.run)
+                        .u("full", lb.full)
+                        .csv("part_sb", sizes(&lb.part))
+                        .csv("full_sb", sizes(&lb.block))
+                        .print();
+                }
+            }
         }
     }
 
@@ -663,15 +903,17 @@ mod drive {
         for (k, r) in c.rows.iter().enumerate() {
             if k < fed {
                 if r.observed.first_nonfinite().is_some() || r.observed.token() != r.stepped {
-                    println!("stat finite fed pos {} {}", r.pos, r.describe());
+                    Record::new(&record::STAT_FINITE_FED)
+                        .u("pos", r.pos)
+                        .w("observed", r.describe())
+                        .print();
                 }
             } else {
-                println!(
-                    "stat finite step {} pos {} {}",
-                    k + 1 - fed,
-                    r.pos,
-                    r.describe()
-                );
+                Record::new(&record::STAT_FINITE_STEP)
+                    .u("step", k + 1 - fed)
+                    .u("pos", r.pos)
+                    .w("observed", r.describe())
+                    .print();
             }
         }
         let bad: Vec<&FiniteRow> = c
@@ -696,12 +938,12 @@ mod drive {
                 )
             },
         );
-        println!(
-            "stat finite summary positions={} nonfinite_positions={} first={first} \
-             eager_differs={differs}",
-            c.rows.len(),
-            bad.len()
-        );
+        Record::new(&record::STAT_FINITE_SUMMARY)
+            .u("positions", c.rows.len())
+            .u("nonfinite_positions", bad.len())
+            .w("first", first)
+            .u("eager_differs", differs)
+            .print();
     }
 
     /// Which draft `BLOOMERY_DRAFT` serves.
@@ -740,36 +982,18 @@ mod drive {
 
     /// The plan the engine is about to load under the placement's `levers`:
     /// where the experts sit. Returns the plan's `ctx_max`, the positions the
-    /// caches are sized for.
+    /// caches are sized for, and per layer the experts its card holds.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
         ctx: usize,
         levers: &PlanLevers,
-    ) -> Result<usize, GateError> {
+    ) -> Result<(usize, Vec<u64>), GateError> {
         let machine = place.machine()(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
-        let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
-        let card = &plan.cards[0];
-        println!(
-            "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             host_shadow={} B n_l={}..{} on {} layers card_budget={} hot_list={hot_list}",
-            place.name(),
-            machine.cards[0].name,
-            plan.ctx_max,
-            card.experts,
-            card.expert_bytes,
-            plan.host.experts,
-            plan.host.expert_bytes,
-            plan.host.shadow_bytes,
-            held.iter().min().copied().unwrap_or(0),
-            held.iter().max().copied().unwrap_or(0),
-            held.len(),
-            plan.card_budget
-                .map_or_else(|| "none".to_string(), |b| b.to_string())
-        );
-        Ok(usize::try_from(plan.ctx_max)?)
+        record::plan(place.name(), &machine, &plan, hot_list).print();
+        Ok((usize::try_from(plan.ctx_max)?, plan.n_l))
     }
 
     fn mode_name(mode: StepMode) -> &'static str {
@@ -782,22 +1006,56 @@ mod drive {
 
     /// The host tier's batch services since load, one line: the layers
     /// served, the columns and host slots they carried, and the union calls'
-    /// wall — the part of a batched feed the card waits on the host.
+    /// wall — the part of a batched feed the card waits on the host; then
+    /// the last call's needs and its split.
     fn print_union(m: &mut Deepseek41Model) -> Result<(), GateError> {
-        let split = m.body_parts("generate_ds41")?.2.take_prefill_stats();
+        let stats = m.body_parts("generate_ds41")?.2.take_prefill_stats();
         let b = m.body("generate_ds41")?;
         let s = b.hybrid().stats();
-        println!(
-            "stat prefill union_layers={} union_cols={} union_host_slots={} union_ms={:.1}",
-            s.batch_served,
-            s.batch_cols,
-            s.batch_host_slots,
-            s.batch_ns as f64 / 1e6
-        );
+        Record::new(&record::STAT_PREFILL)
+            .u("union_layers", s.batch_served)
+            .u("union_cols", s.batch_cols)
+            .u("union_host_slots", s.batch_host_slots)
+            .f("union_ms", s.batch_ns as f64 / 1e6)
+            .print();
         if let Some(need) = b.prefill_need() {
-            println!("stat prefill ced={} {}", b.ced(), need.describe());
+            let (block, part) = need.counts();
+            Record::new(&record::STAT_PREFILL_CED)
+                .w("ced", b.ced())
+                .u("first", need.first)
+                .u("end", need.end)
+                .u("features_from", need.features)
+                .u("block_positions", block)
+                .u("part_positions", part)
+                .csv("full_from", need.layers.iter().map(|n| n.full))
+                .csv("part_from", need.layers.iter().map(|n| n.part))
+                .print();
         }
-        println!("stat prefill split {}", split.describe());
+        split::split(&stats).print();
+        Ok(())
+    }
+
+    /// `BLOOMERY_STEP_STATS`: the last prompt call's queue entries, a record
+    /// per batch's first steps and per layer-batch
+    /// (`body::Body::prefill_counts`), after the loop.
+    fn print_counts(m: &Deepseek41Model) -> Result<(), GateError> {
+        if let Some(c) = m.body("generate_ds41")?.prefill_counts() {
+            for f in &c.front {
+                Record::new(&record::STAT_PREFILL_FRONT)
+                    .u("b", f.batch)
+                    .u("entries", f.entries)
+                    .print();
+            }
+            for lb in &c.lbs {
+                Record::new(&record::STAT_PREFILL_LB)
+                    .u("b", lb.batch)
+                    .u("layer", lb.layer)
+                    .w("block", lb.block)
+                    .u("entries_route", lb.route)
+                    .u("entries_shadow", lb.shadow)
+                    .print();
+            }
+        }
         Ok(())
     }
 
@@ -818,32 +1076,67 @@ mod drive {
         /// `time prompt n= ms= tok/s= passes= kind=`, written after the loop.
         fn print(&self) {
             let ms = self.wall.as_secs_f64() * 1e3;
-            println!(
-                "time prompt n={} ms={ms:.4} tok/s={:.2} passes={} kind={}",
-                self.n,
-                self.n as f64 * 1e3 / ms,
-                self.passes,
-                self.kind
-            );
+            Record::new(&record::TIME_PROMPT)
+                .u("n", self.n)
+                .f("ms", ms)
+                .f("tok/s", self.n as f64 * 1e3 / ms)
+                .u("passes", self.passes)
+                .w("kind", self.kind)
+                .print();
         }
     }
 
-    /// Feed `ids` — in batches under `mode` `Batch`, else one real step per
-    /// id, each through the finite probe first under `check` — print the
+    /// The `fed` record: how many ids, the first and last four, and where
+    /// the depth sequence starts.
+    fn print_fed(ids: &[u32], prompt_len: usize) {
+        let depth = ids.len();
+        let head: Vec<u32> = ids.iter().copied().take(4).collect();
+        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
+        Record::new(&record::FED)
+            .u("ids", depth)
+            .list("first", &head)
+            .list("last", &tail)
+            .u("depth_sequence_from", prompt_len)
+            .print();
+    }
+
+    /// The `step 0` record: generated token 0, the position it follows, and
+    /// the feed's wall.
+    fn print_step0(pos: u32, token: u32, fed: usize, wall: Duration) {
+        Record::new(&record::STEP0)
+            .u("pos", pos)
+            .u("token", token)
+            .u("fed", fed)
+            .f("feed_s", wall.as_secs_f64())
+            .print();
+    }
+
+    /// A planned call's needs against its printed plan's: the call the
+    /// `call` records describe is the one that ran, or the run stops.
+    fn check_plan(m: &Deepseek41Model, need: Option<&body::Need>) -> Result<(), GateError> {
+        match need {
+            Some(want) if m.body("generate_ds41")?.prefill_need() != Some(want) => Err(
+                "generate_ds41: the prompt call ran other needs than its printed plan's \
+                 (`call` records)"
+                    .into(),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Feed `f.ids` — in batches under `f.mode` `Batch`, else one real step
+    /// per id, each through the finite probe first under `check` — print the
     /// `fed` and `step 0` lines, and return the first generated token and the
     /// feed's wall.
     fn feed(
         m: &mut Deepseek41Model,
-        ids: &[u32],
-        prompt_len: usize,
-        mode: body::PrefillMode,
+        f: &Fed<'_>,
         check: Option<&mut FiniteCheck>,
     ) -> Result<(u32, FeedTime), GateError> {
+        let ids = f.ids;
         let depth = ids.len();
-        let head: Vec<u32> = ids.iter().copied().take(4).collect();
-        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
-        println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
-        let batch = check.is_none() && mode == body::PrefillMode::Batch;
+        print_fed(ids, f.prompt_len);
+        let batch = check.is_none() && f.mode == body::PrefillMode::Batch;
         let kind = match (&check, batch) {
             (Some(_), _) => "checked",
             (None, true) => "batch",
@@ -862,12 +1155,9 @@ mod drive {
             }
         };
         let wall = t.elapsed();
-        println!(
-            "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
-            m.pos() - 1,
-            wall.as_secs_f64()
-        );
+        print_step0(m.pos() - 1, next, depth, wall);
         if batch {
+            check_plan(m, f.need)?;
             print_union(m)?;
         }
         let time = FeedTime {
@@ -883,18 +1173,16 @@ mod drive {
         Ok((next, time))
     }
 
-    /// Feed `ids`, then the N − 1 feedback steps, timed when asked; every
-    /// line after the loop.
+    /// Feed `f`, then the N − 1 feedback steps, timed when asked; every line
+    /// after the loop.
     fn decode(
         m: &mut Deepseek41Model,
         a: &Args,
-        ids: &[u32],
-        prompt_len: usize,
-        mode: body::PrefillMode,
+        f: &Fed<'_>,
         mut check: Option<&mut FiniteCheck>,
     ) -> Result<(), GateError> {
-        let depth = ids.len();
-        let (mut next, feed_time) = feed(m, ids, prompt_len, mode, check.as_deref_mut())?;
+        let depth = f.ids.len();
+        let (mut next, feed_time) = feed(m, f, check.as_deref_mut())?;
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
@@ -919,17 +1207,21 @@ mod drive {
         }
         let warm = a.warm.unwrap_or(0);
         feed_time.print();
-        for (k, (pos, tok, ms)) in rows.iter().enumerate() {
+        for (k, &(pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;
-            tokens.push(*tok);
-            println!("step {i} {pos} {tok}");
+            tokens.push(tok);
+            print_step(i, pos, tok);
             if a.timed {
-                let tag = if i <= warm { " warm" } else { "" };
-                println!("time step {i}{tag} ms={ms:.4}");
+                Record::new(&record::TIME_STEP)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .print();
             }
         }
-        println!("tokens {tokens:?}");
+        Record::new(&record::TOKENS).list("tokens", &tokens).print();
         if stats_on {
+            print_counts(m)?;
             print_stats(&probes, warm);
         }
         if let Some(c) = check {
@@ -941,17 +1233,43 @@ mod drive {
             sorted.sort_by(f64::total_cmp);
             let p50 = sorted[sorted.len() / 2];
             let mean = counted.iter().sum::<f64>() / counted.len() as f64;
-            println!(
-                "SMOKE mode={} place={} prompt_tokens={prompt_len} depth={depth} generated={} \
-                 warm={warm} steps={} p50_ms={p50:.4} mean_ms={mean:.4} tok/s(p50)={:.2}",
-                mode_name(a.mode),
-                a.place.name(),
-                a.n_gen,
-                counted.len(),
-                1e3 / p50
-            );
+            smoke(a, f.prompt_len, depth, warm, counted.len(), p50, mean).print();
         }
         Ok(())
+    }
+
+    /// The `step` record: generated token `i`, and the position it is the
+    /// argmax after.
+    fn print_step(i: usize, pos: u32, token: u32) {
+        Record::new(&record::STEP)
+            .u("i", i)
+            .u("pos", pos)
+            .u("token", token)
+            .print();
+    }
+
+    /// The `SMOKE` record of `--time`: the kept steps' (or passes') p50 and
+    /// mean, and the rate at the p50; a draft adds its positions.
+    fn smoke(
+        a: &Args,
+        prompt_len: usize,
+        depth: usize,
+        warm: usize,
+        steps: usize,
+        p50: f64,
+        mean: f64,
+    ) -> Record {
+        Record::new(&record::SMOKE)
+            .w("mode", mode_name(a.mode))
+            .w("place", a.place.name())
+            .u("prompt_tokens", prompt_len)
+            .u("depth", depth)
+            .u("generated", a.n_gen)
+            .u("warm", warm)
+            .u("steps", steps)
+            .f("p50_ms", p50)
+            .f("mean_ms", mean)
+            .f("tok/s(p50)", 1e3 / p50)
     }
 
     /// What one draft pass ran, and so how many positions it advanced.
@@ -987,27 +1305,28 @@ mod drive {
     fn decode_draft(
         m: &mut Deepseek41Model,
         a: &Args,
-        ids: &[u32],
-        prompt_len: usize,
-        mode: body::PrefillMode,
+        f: &Fed<'_>,
         mut spark: Option<&mut Dspark>,
     ) -> Result<(), GateError> {
         // The pair pass's second head and, in graph mode, its capture are
         // made by the first pair: one here, then back to the fresh context,
         // so no timed pass pays for them.
-        m.step_pair(ids[0], ids[0])?;
+        m.step_pair(f.ids[0], f.ids[0])?;
         m.reset()?;
         if a.mode == StepMode::Graph {
-            println!("capture pair_graph_nodes={}", m.pair_graph_nodes()?.len());
+            let nodes = m.pair_graph_nodes()?.len();
+            Record::new(&record::CAPTURE_PAIR)
+                .u("pair_graph_nodes", nodes)
+                .print();
         }
-        let depth = ids.len();
+        let depth = f.ids.len();
         let (first, feed_time) = match spark.as_deref_mut() {
-            None => feed(m, ids, prompt_len, mode, None)?,
-            Some(d) => feed_dspark(m, d, ids, prompt_len, mode)?,
+            None => feed(m, f, None)?,
+            Some(d) => feed_dspark(m, d, f)?,
         };
         let mut next = first;
         let mut look = Lookup::new();
-        for &t in ids {
+        for &t in f.ids {
             look.push(t);
         }
         look.push(next);
@@ -1071,10 +1390,11 @@ mod drive {
         feed_time.print();
         print_draft_rows(a, first, &emitted, &passes);
         if stats_on {
+            print_counts(m)?;
             print_stats(&probes, warm);
         }
         let kind = if spark.is_some() { "dspark" } else { "lookup" };
-        print_draft_summary(a, &passes, prompt_len, depth, kind);
+        print_draft_summary(a, &passes, f.prompt_len, depth, kind);
         Ok(())
     }
 
@@ -1096,15 +1416,12 @@ mod drive {
     fn feed_dspark(
         m: &mut Deepseek41Model,
         d: &mut Dspark,
-        ids: &[u32],
-        prompt_len: usize,
-        mode: body::PrefillMode,
+        f: &Fed<'_>,
     ) -> Result<(u32, FeedTime), GateError> {
+        let ids = f.ids;
         let depth = ids.len();
-        let head: Vec<u32> = ids.iter().copied().take(4).collect();
-        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
-        println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
-        let batch = mode == body::PrefillMode::Batch;
+        print_fed(ids, f.prompt_len);
+        let batch = f.mode == body::PrefillMode::Batch;
         let width = m.body("generate_ds41")?.feature_width();
         let t = Instant::now();
         let next = if batch {
@@ -1127,11 +1444,7 @@ mod drive {
             dspark::feed(m, d, ids)?
         };
         let wall = t.elapsed();
-        println!(
-            "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
-            m.pos() - 1,
-            wall.as_secs_f64()
-        );
+        print_step0(m.pos() - 1, next, depth, wall);
         if batch {
             print_union(m)?;
         }
@@ -1152,25 +1465,26 @@ mod drive {
     /// timed, and the `tokens` line, capped at `-n`.
     fn print_draft_rows(a: &Args, first: u32, emitted: &[(u32, u32)], passes: &[(PassKind, f64)]) {
         let kept = &emitted[..a.n_gen - 1];
-        for (k, (pos, tok)) in kept.iter().enumerate() {
-            println!("step {} {pos} {tok}", k + 1);
+        for (k, &(pos, tok)) in kept.iter().enumerate() {
+            print_step(k + 1, pos, tok);
         }
         if a.timed {
             let warm = a.warm.unwrap_or(0);
-            for (k, (kind, ms)) in passes.iter().enumerate() {
+            for (k, &(kind, ms)) in passes.iter().enumerate() {
                 let i = k + 1;
-                let tag = if i <= warm { " warm" } else { "" };
-                println!(
-                    "time pass {i}{tag} ms={ms:.4} positions={} kind={}",
-                    kind.positions(),
-                    kind.name()
-                );
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .u("positions", kind.positions())
+                    .w("kind", kind.name())
+                    .print();
             }
         }
         let tokens: Vec<u32> = std::iter::once(first)
             .chain(kept.iter().map(|&(_, t)| t))
             .collect();
-        println!("tokens {tokens:?}");
+        Record::new(&record::TOKENS).list("tokens", &tokens).print();
     }
 
     /// The `draft summary` over every pass (the rate over the passes past
@@ -1191,26 +1505,23 @@ mod drive {
         let kept_positions: usize = kept.iter().map(|p| p.0.positions()).sum();
         let kept_ms: f64 = kept.iter().map(|p| p.1).sum();
         let rate = kept_positions as f64 * 1e3 / kept_ms;
-        println!(
-            "draft summary proposals={proposals} accepts={accepts} positions={positions} \
-             passes={} tok/s(positions)={rate:.2} kind={kind}",
-            passes.len()
-        );
+        Record::new(&record::DRAFT_SUMMARY)
+            .u("proposals", proposals)
+            .u("accepts", accepts)
+            .u("positions", positions)
+            .u("passes", passes.len())
+            .f("tok/s(positions)", rate)
+            .w("kind", kind)
+            .print();
         if a.timed {
             let mut sorted: Vec<f64> = kept.iter().map(|p| p.1).collect();
             sorted.sort_by(f64::total_cmp);
             let p50 = sorted[sorted.len() / 2];
             let mean = kept_ms / kept.len() as f64;
-            println!(
-                "SMOKE mode={} place={} prompt_tokens={prompt_len} depth={depth} generated={} \
-                 warm={warm} steps={} p50_ms={p50:.4} mean_ms={mean:.4} tok/s(p50)={:.2} \
-                 positions={kept_positions} tok/s(positions)={rate:.2}",
-                mode_name(a.mode),
-                a.place.name(),
-                a.n_gen,
-                kept.len(),
-                1e3 / p50
-            );
+            smoke(a, prompt_len, depth, warm, kept.len(), p50, mean)
+                .u("positions", kept_positions)
+                .f("tok/s(positions)", rate)
+                .print();
         }
     }
 
@@ -1323,24 +1634,33 @@ mod drive {
             let lag_d = q.first_serve_lag_ns - p.first_serve_lag_ns;
             let (lp, lq) = (&w[0].launch, &w[1].launch);
             let (launch_d, wake_d) = (lq.launch_ns - lp.launch_ns, lq.wake_ns - lp.wake_ns);
-            let tag = if i <= warm { " warm" } else { "" };
-            println!(
-                "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
-                 straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} \
-                 overlap={overlap} union={union} go_early={} parks={} majflt={dmaj} minflt={dmin} \
-                 vram_free={} eng_warm={ew} eng_cold={ec} \
-                 eng_direct={ed} eng_wait_us={wait_us:.1} eng_helper_us={:.1} eng_classify_us={:.1} \
-                 go_early_first={early_first_d} launch_us={:.1} first_serve_lag_us={:.1} launch_wake_us={:.1}",
-                q.straggle_max_ns as f64 / 1e3,
-                q.go_early - p.go_early,
-                q.parks_in_service - p.parks_in_service,
-                w[1].vram_free,
-                helper_ns as f64 / 1e3,
-                classify_ns as f64 / 1e3,
-                launch_d as f64 / 1e3,
-                lag_d as f64 / 1e3,
-                wake_d as f64 / 1e3
-            );
+            Record::new(&record::STAT_STEP)
+                .u("i", i)
+                .flag("warm", i <= warm)
+                .u("served", served)
+                .f("leg_us", leg_us)
+                .f("straggle_us", straggle_us)
+                .f("straggle_max_us", q.straggle_max_ns as f64 / 1e3)
+                .u("host_slots", host_slots)
+                .f("host_w2", host_w2)
+                .u("overlap", overlap)
+                .u("union", union)
+                .u("go_early", q.go_early - p.go_early)
+                .u("parks", q.parks_in_service - p.parks_in_service)
+                .u("majflt", dmaj)
+                .u("minflt", dmin)
+                .u("vram_free", w[1].vram_free)
+                .u("eng_warm", ew)
+                .u("eng_cold", ec)
+                .u("eng_direct", ed)
+                .f("eng_wait_us", wait_us)
+                .f("eng_helper_us", helper_ns as f64 / 1e3)
+                .f("eng_classify_us", classify_ns as f64 / 1e3)
+                .u("go_early_first", early_first_d)
+                .f("launch_us", launch_d as f64 / 1e3)
+                .f("first_serve_lag_us", lag_d as f64 / 1e3)
+                .f("launch_wake_us", wake_d as f64 / 1e3)
+                .print();
             if i > warm {
                 early_first += early_first_d;
                 launch_ns += launch_d;
@@ -1380,25 +1700,33 @@ mod drive {
             Some(None) => "floating".to_string(),
             Some(Some(cpu)) => format!("cpu{cpu}"),
         };
-        println!(
-            "stat summary steps={n} leg_us_mean={mean:.1} leg_us_p50={:.1} straggle_us_max={straggle_max:.1} \
-             host_slots_mean={:.1} phi_mean={phi_mean:.4} majflt={majflt} minflt={minflt} vram_free_load={} \
-             vram_free_min={vram_free_min} eng_helper={helper} eng_warm={eng_warm} \
-             eng_cold={eng_cold} eng_direct={eng_direct} eng_wait_us_mean={wait_mean:.1} \
-             eng_wait_us_p50={:.1} eng_wait_us_max={:.1} eng_helper_us_mean={:.1} \
-             eng_classify_us_mean={:.1} go_early_first_mean={:.3} launch_us_mean={:.1} \
-             first_serve_lag_us_mean={:.1} launch_wake_us_mean={:.1}",
-            legs[n / 2],
-            slots as f64 / n as f64,
-            probes[0].vram_free,
-            waits[n / 2],
-            waits[n - 1],
-            eng_helper_ns as f64 / 1e3 / n as f64,
-            eng_classify_ns as f64 / 1e3 / n as f64,
-            early_first as f64 / n as f64,
-            launch_ns as f64 / 1e3 / n as f64,
-            lag_ns as f64 / 1e3 / n as f64,
-            wake_ns as f64 / 1e3 / n as f64
-        );
+        Record::new(&record::STAT_SUMMARY)
+            .u("steps", n)
+            .f("leg_us_mean", mean)
+            .f("leg_us_p50", legs[n / 2])
+            .f("straggle_us_max", straggle_max)
+            .f("host_slots_mean", slots as f64 / n as f64)
+            .f("phi_mean", phi_mean)
+            .u("majflt", majflt)
+            .u("minflt", minflt)
+            .u("vram_free_load", probes[0].vram_free)
+            .u("vram_free_min", vram_free_min)
+            .w("eng_helper", helper)
+            .u("eng_warm", eng_warm)
+            .u("eng_cold", eng_cold)
+            .u("eng_direct", eng_direct)
+            .f("eng_wait_us_mean", wait_mean)
+            .f("eng_wait_us_p50", waits[n / 2])
+            .f("eng_wait_us_max", waits[n - 1])
+            .f("eng_helper_us_mean", eng_helper_ns as f64 / 1e3 / n as f64)
+            .f(
+                "eng_classify_us_mean",
+                eng_classify_ns as f64 / 1e3 / n as f64,
+            )
+            .f("go_early_first_mean", early_first as f64 / n as f64)
+            .f("launch_us_mean", launch_ns as f64 / 1e3 / n as f64)
+            .f("first_serve_lag_us_mean", lag_ns as f64 / 1e3 / n as f64)
+            .f("launch_wake_us_mean", wake_ns as f64 / 1e3 / n as f64)
+            .print();
     }
 }

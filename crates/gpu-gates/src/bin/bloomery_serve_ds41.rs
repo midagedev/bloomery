@@ -23,7 +23,9 @@
 //!
 //! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
 //! `--levers` prints them with this process's values and exits. A prompt is
-//! fed the way the engine holds `BLOOMERY_PREFILL`.
+//! fed the way the engine holds `BLOOMERY_PREFILL`. The stderr lines named
+//! above are records of the kinds `bloomery_gpu_gates::record` declares;
+//! `--records-schema` prints those kinds and exits.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -56,10 +58,11 @@ mod drive {
         Ds41Engine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
     };
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
+    use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{PlanLevers, workstation};
+    use model::placement::{HotList, PlanLevers, workstation};
     use serve::{EngineProps, FATAL_LINGER, PlacementProps, ServeError, Server, ServerConfig};
     use tokenizer::Tokenizer;
 
@@ -106,6 +109,7 @@ mod drive {
     /// `Ok` carries why the server ended.
     pub fn run() -> Result<ServeError, GateError> {
         let levers = bloomery_levers::at_main()?;
+        record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = ref_model_path()?;
@@ -146,7 +150,7 @@ mod drive {
                 let mut g = Generator::open(
                     open,
                     |file, machine, ctx| body::open(file, machine, ctx, &cfg),
-                    |m: &Deepseek41Model| {
+                    |m: &Deepseek41Model, load: Record| {
                         let body = m.body("bloomery-serve-ds41")?;
                         let top_k = body.indexer_top_k();
                         let shadow = body.shadow_host();
@@ -158,13 +162,13 @@ mod drive {
                             )
                             .into());
                         }
-                        Ok(format!(
-                            "layers={n_layer} top_k={top_k} shadow=host {} unified_addressing={} \
-                             prefill={}",
-                            shadow.bytes,
-                            shadow.unified_addressing,
-                            body.prefill_mode().name()
-                        ))
+                        Ok(load
+                            .u("layers", n_layer)
+                            .u("top_k", top_k)
+                            .w("shadow", "host")
+                            .u("shadow_bytes", shadow.bytes)
+                            .u("unified_addressing", shadow.unified_addressing)
+                            .w("prefill", body.prefill_mode().name()))
                     },
                     &mut std::io::stderr(),
                 )?;
@@ -196,12 +200,11 @@ mod drive {
             slot_save_path: None,
         };
         let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
-        eprintln!(
-            "bloomery-serve-ds41: place={} ctx={} listening on http://{}",
-            a.place.name(),
-            a.ctx,
-            server.local_addr()?
-        );
+        Record::new(&record::LISTENING)
+            .w("place", a.place.name())
+            .u("ctx", a.ctx)
+            .w("addr", server.local_addr()?)
+            .eprint();
         Ok(server.run())
     }
 
@@ -217,25 +220,8 @@ mod drive {
     ) -> Result<(String, Option<PlacementProps>), GateError> {
         let machine = place.machine()(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
-        let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
-        let card = &plan.cards[0];
-        eprintln!(
-            "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             host_shadow={} B n_l={}..{} on {} layers card_budget={}",
-            place.name(),
-            machine.cards[0].name,
-            plan.ctx_max,
-            card.experts,
-            card.expert_bytes,
-            plan.host.experts,
-            plan.host.expert_bytes,
-            plan.host.shadow_bytes,
-            held.iter().min().copied().unwrap_or(0),
-            held.iter().max().copied().unwrap_or(0),
-            held.len(),
-            plan.card_budget
-                .map_or_else(|| "none".to_string(), |b| b.to_string())
-        );
+        let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
+        record::plan(place.name(), &machine, &plan, hot_list).eprint();
         let gpus: Result<Vec<String>, String> = machine
             .cards
             .iter()

@@ -31,6 +31,7 @@ pub mod oracle;
 pub mod prompts;
 pub mod ptx;
 pub mod qwen3moe;
+pub mod record;
 pub mod rounding;
 
 use gguf::quant::{GgmlType, dequant_row};

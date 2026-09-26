@@ -27,7 +27,9 @@
 //! same ids), and the `chat:` summary line.
 //!
 //! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
-//! `--levers` prints them with this process's values and exits.
+//! `--levers` prints them with this process's values and exits. The stderr
+//! lines are records of the kinds `bloomery_gpu_gates::record` declares;
+//! `--records-schema` prints those kinds and exits.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -49,10 +51,11 @@ mod drive {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
+    use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{PlanLevers, workstation};
+    use model::placement::{HotList, PlanLevers, workstation};
     use sampler::{Sampler, SamplerParams};
     use tokenizer::{Decoder, Tokenizer};
 
@@ -212,13 +215,14 @@ mod drive {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main()?;
+        record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let mut sampler = Sampler::new(a.sampling)?;
         let path = ref_model_path()?;
         let tok = Tokenizer::from_gguf(&path)?;
         let ids = tok.encode(&a.prompt, true, a.parse_special);
-        eprintln!("prompt_ids {ids:?}");
+        Record::new(&record::PROMPT_IDS).list("ids", &ids).eprint();
         if ids.is_empty() {
             return Err("the prompt encodes to no token".into());
         }
@@ -237,7 +241,7 @@ mod drive {
         let mut g = Generator::open(
             open,
             |file, machine, ctx| body::open(file, machine, ctx, &cfg),
-            |m: &Deepseek41Model| {
+            |m: &Deepseek41Model, load: Record| {
                 let body = m.body("bloomery-chat")?;
                 let top_k = body.indexer_top_k();
                 let shadow = body.shadow_host();
@@ -248,10 +252,12 @@ mod drive {
                     )
                     .into());
                 }
-                Ok(format!(
-                    "layers={} top_k={top_k} shadow=host {} unified_addressing={}",
-                    inputs.hp.n_layer, shadow.bytes, shadow.unified_addressing
-                ))
+                Ok(load
+                    .u("layers", inputs.hp.n_layer)
+                    .u("top_k", top_k)
+                    .w("shadow", "host")
+                    .u("shadow_bytes", shadow.bytes)
+                    .u("unified_addressing", shadow.unified_addressing))
             },
             &mut std::io::stderr(),
         )?;
@@ -268,25 +274,8 @@ mod drive {
     ) -> Result<(), GateError> {
         let machine = place.machine()(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
-        let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
-        let card = &plan.cards[0];
-        eprintln!(
-            "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             host_shadow={} B n_l={}..{} on {} layers card_budget={}",
-            place.name(),
-            machine.cards[0].name,
-            plan.ctx_max,
-            card.experts,
-            card.expert_bytes,
-            plan.host.experts,
-            plan.host.expert_bytes,
-            plan.host.shadow_bytes,
-            held.iter().min().copied().unwrap_or(0),
-            held.iter().max().copied().unwrap_or(0),
-            held.len(),
-            plan.card_budget
-                .map_or_else(|| "none".to_string(), |b| b.to_string())
-        );
+        let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
+        record::plan(place.name(), &machine, &plan, hot_list).eprint();
         Ok(())
     }
 
@@ -353,14 +342,15 @@ mod drive {
             Stop::Eog => &out[..out.len() - 1],
             Stop::Length | Stop::Ctx => &out[..],
         };
-        eprintln!("ids {out:?}");
-        eprintln!("text_consistent={}", text == tok.decode(shown));
-        eprintln!(
-            "chat: prompt_tokens={} generated={} stop={}",
-            prompt.len(),
-            out.len(),
-            stop.name()
-        );
+        Record::new(&record::IDS).list("ids", &out).eprint();
+        Record::new(&record::TEXT_CONSISTENT)
+            .w("consistent", text == tok.decode(shown))
+            .eprint();
+        Record::new(&record::CHAT)
+            .u("prompt_tokens", prompt.len())
+            .u("generated", out.len())
+            .w("stop", stop.name())
+            .eprint();
         Ok(())
     }
 }

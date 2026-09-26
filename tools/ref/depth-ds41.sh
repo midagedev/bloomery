@@ -9,6 +9,7 @@
 #   just depth-gpu-ds41 6 lcpp:6 4096 lcpp:4096
 #   just depth-gpu-ds41 512 ikpp:512 lcpppp:512 4096 ikpp:4096 lcpppp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
+#   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines and row from a saved generate_ds41 output
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
 # quoted as "decode is faster" — a step's attention term grows with the cached keys, so the depth
@@ -139,6 +140,67 @@
 # OTHER_BUSY_TAG), and the closing summary counts both. BLOOMERY_OTHER_STRICT=1 aborts (rc 75) on
 # either instead.
 set -uo pipefail
+# An ours arm's output is read by tools/bloomery/records.py, which owns the record kinds
+# crates/gpu-gates/src/record.rs declares; the runner names kinds and fields, never a column.
+RECORDS="${BASH_SOURCE[0]%/*}/../bloomery/records.py"
+# ours_parse <what>: an ours or bin arm's output on stdin, into what its row reads: the SMOKE footer's
+# p50, mean and warm (P50 empty without a footer) with its depth and generated count, the `time
+# step`/`time pass` walls in order (SERIES), the draft summary (D_*), the generated tokens past token
+# 0 (TOKENS), and the first `time prompt` row (PP_*, empty without one).
+ours_parse() {
+  local rec
+  rec=$(python3 "$RECORDS" sh - P50=smoke.p50_ms MEAN=smoke.mean_ms WARMCOL=smoke.warm \
+    GEN=smoke.generated DEPTH=smoke.depth 'SERIES=time_step|time_pass.ms*' \
+    D_PROP=draft_summary.proposals D_ACC=draft_summary.accepts D_POS=draft_summary.positions \
+    D_PASSES=draft_summary.passes 'D_TPS=draft_summary.tok/s(positions)' 'TOKENS=step.token*' \
+    PP_N=time_prompt.n 'PP_TPS=time_prompt.tok/s' PP_PASSES=time_prompt.passes \
+    PP_KIND=time_prompt.kind) || { echo "$1: records.py did not read the output" >&2; exit 2; }
+  eval "$rec"
+}
+# pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its parsed time prompt
+# row (ours_parse), into PP_COL. A bin arm's base build may print no time prompt row (PP_N empty, the
+# column says so); an ours arm's binary is this tree's, so a missing row stops the runner.
+pp_col() {
+  if [ -n "$PP_N" ]; then
+    PP_COL=" | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES)"
+    [ "$PP_KIND" = steps ] || PP_COL="${PP_COL%)}, kind=$PP_KIND)"
+  elif [ "$1" = bin ]; then
+    PP_COL=" | pp_tok/s ? (the binary prints no time prompt row)"
+  else
+    echo "$2 produced no time prompt row" >&2
+    echo "$3" | tail -n 20 >&2
+    exit 1
+  fi
+}
+# ours_row <arm kind> <label> <depth> <round> <output> <wall s>: an ours or bin arm's lines — the
+# records it echoes, then its row — from its output; into TPS_MEAN, TPS_P50 and DRAFT for the sums.
+ours_row() {
+  local kind=$1 label=$2 dep=$3 r=$4 out=$5 wall=$6 h10 t10 uniq_tok
+  ours_parse "r$r $label d=$dep" <<< "$out"
+  [ -n "$P50" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
+  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt) '
+  pp_col "$kind" "r$r $label d=$dep" "$out"
+  # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
+  # and the `draft summary` line carries the positions-per-second rate the verdict reads.
+  DRAFT=
+  [ -z "$D_PROP" ] || DRAFT="p=$D_PROP/$D_PASSES q=$D_ACC/$D_PROP positions=$D_POS tok/s(positions)=$D_TPS"
+  h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  t10=$(echo "$SERIES" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  uniq_tok=$(printf '%s' "$TOKENS" | sort -u | grep -c .)
+  TPS_MEAN=$(awk -v m="$MEAN" 'BEGIN{printf "%.2f", 1e3/m}')
+  TPS_P50=$(awk -v p="$P50" 'BEGIN{printf "%.2f", 1e3/p}')
+  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+}
+# `--parse FILE`: ours_row over a saved output (`-` for stdin) — its depth and N the SMOKE footer's,
+# the runner's context (round, card, contention) `-` — and nothing loaded, timed or leased.
+if [ "${1:-}" = --parse ]; then
+  [ $# -eq 2 ] || { echo "usage: depth-ds41.sh --parse FILE" >&2; exit 64; }
+  out=$(cat -- "$2") || exit 2
+  ours_parse "$2" <<< "$out"
+  ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG=''
+  ours_row ours ours "${DEPTH:--}" - "$out" -
+  exit 0
+fi
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # LCPP_NCMOE); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so the three
 # engines open one file.
@@ -424,31 +486,6 @@ count_row() {
   [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
 }
 
-# parse_pp: the `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_ds41
-# run on stdin, as `<P> <v> <K> <k>`; nothing when the run printed none (a base tree's build).
-parse_pp() {
-  sed -nE 's/^time prompt n=([0-9]+) ms=[0-9.]+ tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)$/\1 \2 \3 \4/p' | head -n 1
-}
-
-# pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its run's output, into
-# PP_COL, with the parsed P and tok/s in PP_N and PP_TPS for the closing tables. A bin arm's base
-# build may print no time prompt row (PP_N empty, the column says so); an ours arm's binary is this
-# tree's, so a missing row stops the runner.
-pp_col() {
-  local passes kind
-  read -r PP_N PP_TPS passes kind <<< "$(echo "$3" | parse_pp)"
-  if [ -n "$PP_N" ]; then
-    PP_COL=" | pp_tok/s $PP_TPS (n=$PP_N, passes=$passes)"
-    [ "$kind" = steps ] || PP_COL="${PP_COL%)}, kind=$kind)"
-  elif [ "$1" = bin ]; then
-    PP_COL=" | pp_tok/s ? (the binary prints no time prompt row)"
-  else
-    echo "$2 produced no time prompt row" >&2
-    echo "$3" | tail -n 20 >&2
-    exit 1
-  fi
-}
-
 # The variables arm <i> of ours runs with, into ARM_ENVS: its own, and for a DSpark arm
 # (BLOOMERY_DRAFT=dspark) the other card's visibility and the draft file (timing-card.sh dspark_env).
 # The dry run prints the same list.
@@ -470,7 +507,7 @@ arm_feed() {
 # second binary. The row and the sum under the arm's label.
 # ours_arm <index> <round>
 ours_arm() {
-  local i=$1 r=$2 dep label bin out rc t0 t1 smoke p50 mean warmcol series draft h10 t10 uniq_tok tps_mean tps_p50
+  local i=$1 r=$2 dep label bin out rc t0 t1
   local -a envs=() feed=()
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
   arm_envs "$i"
@@ -493,29 +530,11 @@ ours_arm() {
     echo "$out" | tail -n 20 >&2
     exit 1
   fi
-  smoke=$(echo "$out" | grep -E '^SMOKE ')
-  [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt) '
-  pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
-  # shellcheck disable=SC2001 # a regex capture, which ${var//} does not have
-  p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
-  # shellcheck disable=SC2001 # the same
-  mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
-  warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
-  # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
-  # and the `draft summary` line carries the positions-per-second rate the verdict reads.
-  series=$(echo "$out" | awk '/^time (step|pass) /{sub(/.*ms=/,""); sub(/ .*/,""); print}')
-  draft=$(echo "$out" | grep -E '^draft summary ' | sed -n 's/.*proposals=\([0-9]*\) accepts=\([0-9]*\) positions=\([0-9]*\) passes=\([0-9]*\) tok\/s(positions)=\([0-9.]*\).*/p=\1\/\4 q=\2\/\1 positions=\3 tok\/s(positions)=\5/p')
-  h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-  t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-  uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
-  tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
-  tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft}$PP_COL | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+  ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$((t1 - t0))"
   counted || return 0
   count_row
-  if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
-  sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
+  if [ -n "$DRAFT" ]; then TPS_MEAN=${DRAFT##*tok/s(positions)=}; fi
+  sums+=("$label|$dep|$r|$TPS_MEAN|$TPS_P50")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
 }
 

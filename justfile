@@ -875,6 +875,12 @@ run-ds41-ppl TAG:
 gen-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
 
+# The V4.1 binaries' record schemas (crates/gpu-gates/src/record.rs) into tools/bloomery/schema/, which record.rs's
+# checked_in_schemas_are_current holds to the binaries', and the engine's plans the flow model reads
+# (generate_ds41 --plan, placement (a), P 128/256/384/512/4096, CED on and off) into tools/flow/plans/. Loads nothing onto a card.
+records-refresh:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin gate_deepseek41_prefill >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 gate_deepseek41_prefill; do target/release/$b --records-schema; done && for P in 128 256 384 512 4096; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+
 # The served draft, bit for bit (3090, placement gate): generate_ds41 under BLOOMERY_DRAFT=lookup must emit the plain
 # run's tokens. Two prompts, both arms each, -n 64: the lcg depth-6 sequence, and the first 128 ids of the code corpus.
 # Red unless each prompt's two `tokens` lines are identical and the code prompt's draft arm proposed at least once.

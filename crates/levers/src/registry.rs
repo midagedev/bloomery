@@ -114,8 +114,10 @@ pub static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("0"),
         doc: "`generate_ds41`: a `stat step` line per generated step and a `stat summary` \
               (host-tier counters, page faults, free device bytes, engram row timings), \
-              and the card's time per layer-batch in `stat prefill split`; \
-              `gate_deepseek41_prefill`: that split line per case. Off, nothing is read.",
+              the card's time per layer-batch in `stat prefill split`, and the prompt \
+              call's queue entries as each site enqueued them, per batch (`stat prefill \
+              front`) and per layer-batch (`stat prefill lb`); `gate_deepseek41_prefill`: \
+              that split line per case. Off, nothing is read.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

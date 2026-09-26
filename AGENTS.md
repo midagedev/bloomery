@@ -137,6 +137,11 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # or gate_load_v41.rs runs both by name in its landing batch
     just lab-engram   # the engram IO lab's tests (crates/engram-lab, no engine user);
                       # lab-, not gate-, so no engine landing selects it
+    just records-refresh  # the V4.1 binaries' record schemas into tools/bloomery/schema/ and
+                      # generate_ds41 --plan's prompt-call plans (placement (a), P 128/256/384/
+                      # 512/4096, CED on and off) into tools/flow/plans/; loads nothing onto a
+                      # card. Run it after changing a record kind (the gpu-gates lib test
+                      # checked_in_schemas_are_current is red until then) or the prompt call's plan
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -370,6 +375,17 @@ first suspect is a hung gate on the box, not the agent.
   harness code lives in `tests/common`. No print-only tests, no second test
   pinning what another already pins. Removing a gate is a coverage change and
   needs the same dated reason as relaxing one.
+- **Record lines have one owner.** Every line `generate_ds41`, `bloomery-chat`,
+  `bloomery-serve-ds41` and the prefill gate's split print is a `Kind` in
+  `crates/gpu-gates/src/record.rs`, rendered by `Record`, which panics by name on a
+  value out of order, missing or of another type; `<bin> --records-schema` prints
+  the kinds. Readers go through `tools/bloomery/records.py` by kind and field,
+  never by a column or a pattern. `generate_ds41 --plan` prints the prompt call's
+  `call …` records and exits before the load; a batched run prints `call plan` and
+  `call batch` before its load and stops with a named error when the call it ran
+  had other needs than its printed plan. Under `BLOOMERY_STEP_STATS=1`,
+  `tools/flow/ds41_prefill.py --counts <log>` holds the flow model's queue-entry
+  counts to the engine's `stat prefill front` and `stat prefill lb` records.
 - **Do not split a `#[target_feature]` kernel body into helpers** (measured:
   10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
   fits on two screens gets split.

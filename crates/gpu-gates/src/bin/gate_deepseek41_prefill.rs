@@ -159,6 +159,10 @@ mod dspark;
 mod finite;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_split.rs"]
+mod split;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeMap;
     use std::ops::Range;
@@ -188,7 +192,7 @@ mod gate {
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{
         GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
-        patch_bytes, row_bytes, verdict,
+        patch_bytes, record, row_bytes, verdict,
     };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -197,7 +201,7 @@ mod gate {
     use model::arch::deepseek41::names;
     use model::placement::workstation;
 
-    use crate::{dspark, finite};
+    use crate::{dspark, finite, split};
 
     const NAME: &str = "gate_deepseek41_prefill";
     /// Positions the oracle steps at most: the longest case and one more.
@@ -324,6 +328,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main()?;
+        record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
@@ -422,8 +427,8 @@ mod gate {
             m.body_parts(NAME)?.2.take_prefill_stats();
             let case = run_case(&mut m, &hp, &ids, parts, *window, &rows)?;
             if stats {
-                let split = m.body_parts(NAME)?.2.take_prefill_stats();
-                println!("{NAME}: {what} stat prefill split {}", split.describe());
+                let stats = m.body_parts(NAME)?.2.take_prefill_stats();
+                println!("{NAME}: {what} {}", split::split(&stats).line());
             }
             let p: usize = parts.iter().sum();
             pass &= compare(what, &case, &oracle[&p], &rows, t);
