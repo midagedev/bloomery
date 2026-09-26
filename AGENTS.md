@@ -419,7 +419,11 @@ first suspect is a hung gate on the box, not the agent.
   (`corpus-prose.ids`, hot list 384) runs pp512 **216.1** and pp4096 **292.1** against the `expert` arm's
   173.6 / 250.3 in the same lease (1.245 ± 0.060 / 1.167 ± 0.011 over two rounds; the shadow 45.4 → 23.1 ms
   per layer-batch at P = 512; prose rows and the lcg rows above do not share a table; rig-log
-  09-26#cardtile-ab).
+  09-26#cardtile-ab). Since `eb3e08a` (prefillgroup, G: batches in pairs, layer by layer, the route
+  enqueued ahead of the host serve across layers too) the lcg prompt with no hot list runs pp4096
+  **247.5** against the `BLOOMERY_PREFILL_GROUP=1` arm's 201.0 in one lease (rounds 1.177 and 1.232 —
+  round 1's G 2 row was the lease's first run with a 0.7 s colder prologue; the chain ratio 0.814 /
+  0.810; the host's wait for the route 17.8 → 0.8 ms per layer-batch; rig-log 09-26#prefillgroup-ab).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
@@ -650,6 +654,15 @@ the default and `BLOOMERY_BOX_ENV='BLOOMERY_CARD_EXPERTS=expert'` and `=slot`); 
 refused by name; the `load` line prints `card_experts=`, and with `BLOOMERY_STEP_STATS=1` `generate_ds41` prints a
 `stat prefill split` line — `prologue/chain/union/wait/enqueue/copy` ms and, per layer-batch, the card's
 `card_out` (first launch to the route's D2H) and `card_in` (the shadow under the union) from event pairs),
+`BLOOMERY_PREFILL_GROUP=<n>` (gpu-deepseek41 prompt batch, read once when the batch's buffers are
+made, default 2, 1–8: a prompt call's batches run in groups of n, layer by layer over the group, each
+layer-batch's route enqueued after the previous one's shadow and ahead of that one's host serve — across a
+layer's last batch to the next layer's first too — so the card routes under the host union; a lone last
+batch joins the group before it, so n + 1 residual sets are held from n = 2 on (G 2: 238 MB more card
+memory without taps); 1 is the batch-first order, the same-binary A/B arm, and both write the same bits
+(`just gate-gpu-ds41-prefill` under each); an unusable value is refused by name; the `load` line prints
+`group=`, the `prefill` line `group_bytes=`, and `stat prefill split` prints `group=` and `wait_first_lb=`,
+the wait of each group's first batch — near the route there means the wrap is missing),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
