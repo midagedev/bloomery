@@ -79,9 +79,14 @@ pub const GEMM_BN: usize = 64;
 /// Threads per GEMM block. The entries declare two resident blocks per SM
 /// (`launch_bounds(256, 2)`), which caps them at 128 registers a thread. The
 /// four warps a scheduler then holds do not hide one warp's dependency chain,
-/// so a step lasts as long as its instructions take to issue along it: the
-/// Q4_K entry's weight words arrive one step ahead with the activations,
-/// while the other entries' loads at a step's head sit on the chain.
+/// and a step also pays terms its instruction count does not set: each
+/// barrier, where every warp waits for the slowest; the tensor pipe's issue
+/// of its `mma`s; bursts of shared-memory and copy instructions queued behind
+/// one another. So a step has one barrier, and the next step's copies go out
+/// after it, among this step's n-tiles in a full tile, rather than as a burst
+/// before a barrier of their own. The Q4_K entry's weight words arrive with
+/// them, one step ahead; the other entries' loads at a step's head sit on the
+/// chain.
 pub const GEMM_THREADS: usize = 256;
 /// [`GEMM_THREADS`] as the block width a launch takes.
 const GEMM_THREADS_U32: u32 = GEMM_THREADS as u32;
@@ -125,8 +130,23 @@ const _: () = assert!(GEMM_MAX_EXPERTS <= ROUTE_THREADS);
 // warp per chunk.
 const _: () = assert!(ROUTE_HIST >= GEMM_MAX_EXPERTS && ROUTE_WARPS * 32 == ROUTE_THREADS);
 const _: () = assert!((B_COL_W / 4) % 8 == 1 && B_COL_W >= 32 && B_COL_W.is_multiple_of(4));
-// A tile's staged codes are at most the same count of chunks for every thread.
-const _: () = assert!((GEMM_BN * 8).is_multiple_of(GEMM_THREADS));
+// A tile's staged codes are at most the same count of chunks for every thread,
+// and a thread's chunks share their place in a block (`i`, `q` of `tid`).
+const _: () = assert!((GEMM_BN * 8).is_multiple_of(GEMM_THREADS) && GEMM_THREADS.is_multiple_of(8));
+/// 16-byte code chunks one thread stages a step.
+const STAGE_CHUNKS: usize = GEMM_BN * 8 / GEMM_THREADS;
+/// The n-tile after which a full tile's step issues the next step's copies
+/// (`gemm_step`): past the burst of shared-memory loads that opens the step,
+/// and early enough that the rest of the step covers the copies' latency.
+/// They go as one run because ptxas pads a copy that follows a shared-memory
+/// load with never-taken loads, and a run pays that padding once.
+const STAGE_NT: usize = 1;
+const _: () = assert!(STAGE_NT < GEMM_NT);
+/// The q6 words of the most columns a [`GemmAct`] holds at the largest `k`:
+/// every staging offset (`gemm_stage_cols`, plus a step's) is below it in
+/// words, and its four bytes a word fit a u32.
+const STAGE_OFF_MAX: u64 = GEMM_MAX_SLOTS as u64 * 128 * (Q8ACT_MAX_K / 256).div_ceil(2) as u64;
+const _: () = assert!(4 * STAGE_OFF_MAX <= 1 << 32);
 // The Q4_K staging's chunk map: thread `tid` copies qs chunk `tid % 4` of
 // slab rows `tid / 4` and `tid / 4 + GEMM_BM / 2`, and a thread below
 // GEMM_BM the header of row `tid` — every chunk of a step once.
@@ -595,13 +615,14 @@ macro_rules! q3k_dec {
 /// block's eight positions (two 16-byte copies each), the four s8 of its four
 /// sub-blocks (one 16-byte copy) and its d8 (one 4-byte copy). Only the live
 /// columns `n < ncols` are copied; a full tile (`full`, a literal) tests none.
-/// The code chunks are at most two a thread, each thread's at `tid` and
-/// `tid + GEMM_THREADS`.
+/// The code chunks are [`STAGE_CHUNKS`] a thread, chunk `k` at `u = tid +
+/// k · GEMM_THREADS`. `stg` is the thread's [`gemm_stage_cols`]: every
+/// source is its step-0 offset plus the block's own, so a step computes no
+/// column address.
 macro_rules! gemm_stage {
     (
-        $h:expr, $st:expr, $full:literal, $tid:ident, $ncols:ident, $n_sb:ident,
-        $col_words:ident, $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident,
-        $acol_sh:ident
+        $h:expr, $st:expr, $full:literal, $tid:ident, $ncols:ident, $stg:ident,
+        $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident
     ) => {{
         let h: usize = $h;
         let st: usize = $st;
@@ -609,7 +630,7 @@ macro_rules! gemm_stage {
         let sb = h / 2;
         let off = 128 * (sb / 2) + 16 * (sb & 1) + 8 * (h & 1);
         let mut k = 0usize;
-        while k < GEMM_BN * 8 / GEMM_THREADS {
+        while k < STAGE_CHUNKS {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
             // tid < GEMM_THREADS, the launch's block width, so u < GEMM_BN · 8.
             let u = $tid + k * GEMM_THREADS;
@@ -617,37 +638,69 @@ macro_rules! gemm_stage {
                 let n = u / 8;
                 let i = (u / 2) & 3;
                 let q = u & 1;
-                // SAFETY: n < ncols <= GEMM_BN; the column index is an
-                // activation column below act_cols, so the source's 16 bytes
-                // (inside that column's 128*half_it words, 16-byte aligned:
-                // every term is a multiple of four words) are inside q6; the
-                // destination is inside stage `st` and 16-byte aligned.
+                // SAFETY: the source is word `off` of chunk k's column plus
+                // the chunk's place in a block (`gemm_stage_cols`): inside
+                // that activation column's 128*half_it words, so inside q6,
+                // and 16-byte aligned (every term a multiple of sixteen
+                // bytes). n < ncols <= GEMM_BN, so the destination is inside
+                // stage `st`, 16-byte aligned.
                 unsafe {
-                    let c = *$acol_sh.add(n) as usize;
                     cp_async_cg_16(
                         $bt.add(st * B_STAGE_W + n * B_COL_W + 8 * i + 4 * q),
-                        $q6.as_ptr().add(c * $col_words + off + 32 * i + 4 * q),
+                        $q6.as_ptr().add(off).byte_add($stg.0[k] as usize),
                     );
                 }
             }
             k += 1;
         }
         if $tid < ncols {
-            // SAFETY: tid < ncols <= GEMM_BN. The s8 source is groups
-            // 4h..4h+3 of the column (16 bytes, aligned: 8*n_sb words per
-            // column, 4h words in), the d8 source its block h.
+            // SAFETY: tid < ncols <= GEMM_BN; stg.1 is the byte offset of the
+            // column's first block in d8, a quarter of the one in s8. The s8
+            // source is groups 4h..4h+3 of the column (16 bytes, aligned:
+            // 8*n_sb words per column, 4h words in), the d8 source its block h.
             unsafe {
-                let c = *$acol_sh.add($tid) as usize;
                 cp_async_cg_16(
                     $s8t.add(st * S8_STAGE + 4 * $tid).cast::<u32>(),
-                    $s8.as_ptr().add(c * 8 * $n_sb + 4 * h).cast::<u32>(),
+                    $s8.as_ptr()
+                        .add(4 * h)
+                        .byte_add(4 * $stg.1 as usize)
+                        .cast::<u32>(),
                 );
                 cp_async_ca_4(
                     $d8t.add(st * GEMM_BN + $tid).cast::<u32>(),
-                    $d8.as_ptr().add(c * 2 * $n_sb + h).cast::<u32>(),
+                    $d8.as_ptr().add(h).byte_add($stg.1 as usize).cast::<u32>(),
                 );
             }
         }
+    }};
+}
+
+/// The column offsets [`gemm_stage`] adds each step's own to, fixed for the
+/// tile, in bytes: per code chunk `k` of thread `tid`, where the chunk's
+/// place in a block starts in its column's q6 codes (words `acol[n] ·
+/// col_words + 32·i + 4·q` for `u = tid + k · GEMM_THREADS`, `n = u / 8`,
+/// `i = (u / 2) & 3`, `q = u & 1`), and for a thread below [`GEMM_BN`] its
+/// column's first 128-value block in `d8` (block `acol[tid] · 2 · n_sb`; the
+/// same block in `s8` is four times as far, four words a block). u32: the
+/// bound at [`STAGE_OFF_MAX`].
+macro_rules! gemm_stage_cols {
+    ($tid:ident, $acol_sh:ident, $half_it:ident, $n_sb:ident) => {{
+        let col_words = 128 * $half_it;
+        let (i, q) = (($tid / 2) & 3, $tid & 1);
+        let mut a = [0u32; STAGE_CHUNKS];
+        let mut k = 0usize;
+        while k < STAGE_CHUNKS {
+            ::cuda_device::thread::__unroll_config::<{ 0 }>();
+            // SAFETY: tid < GEMM_THREADS, so (tid + k·GEMM_THREADS) / 8 <
+            // GEMM_BN: inside ACOL, written before the tile's barrier.
+            let c = unsafe { *$acol_sh.add(($tid + k * GEMM_THREADS) / 8) };
+            a[k] = 4 * (c * col_words + (32 * i + 4 * q) as u32);
+            k += 1;
+        }
+        // SAFETY: the index is below GEMM_BN, inside ACOL, as above; a
+        // thread at or past GEMM_BN stages no s8 and never uses it.
+        let c = unsafe { *$acol_sh.add($tid.min(GEMM_BN - 1)) };
+        (a, 4 * (c * 2 * $n_sb))
     }};
 }
 
@@ -811,37 +864,43 @@ macro_rules! gemm_walk_plain {
 }
 
 /// One step of [`gemm_block`]: half `hh` of super-block `sb` (128-value block
-/// `h = 2·sb + hh`). It loads a direct entry's weight words, stages step
-/// `h + 1` into the other stage (this super-block's second half, or the next
-/// super-block's first while there is one), waits for step `h`'s copies,
-/// decodes both 64-value pairs, then per n-tile multiplies and folds — so
-/// an n-tile's four `isum` words are all the sums a warp holds. A full tile
-/// (`full`) runs every n-tile with no test against the tile's length.
+/// `h = 2·sb + hh`), one barrier long. It loads a direct entry's weight words,
+/// waits for step `h`'s copies and passes the barrier, which publishes them
+/// and frees the other stage: every warp has left step `h − 1`, the stage's
+/// last reader. Then it decodes both 64-value pairs and per n-tile multiplies
+/// and folds — so an n-tile's four `isum` words are all the sums a warp holds
+/// — and stages step `h + 1` into the other stage (this super-block's second
+/// half, or the next super-block's first while there is one): the weights,
+/// the code chunks, the s8 and d8, in one run after n-tile [`STAGE_NT`] of a
+/// full tile (`full`), and before the first n-tile of a partial one. A warp
+/// past the expert's rows stages them without computing. A full tile runs
+/// every n-tile with no test against the tile's length.
 macro_rules! gemm_step {
     ($hh:expr, $full:literal, $sb:ident, $n_sb:ident, (
         $dec:ident, $wst:ident($($wsa:ident),*), $sb_units:expr, $w:ident, $ws:ident, $hdr:ident,
-        $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident, $acol_sh:ident,
-        $tid:ident, $ncols:ident, $col_words:ident,
+        $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident, $stg:ident,
+        $tid:ident, $ncols:ident,
         $active:ident, $t:ident, $g:ident, $nt_live:ident, $acc:ident
     )) => {{
         let hh: usize = $hh;
         let st = hh;
         let raw = $wst!(@head [$($wsa),*] $dec, $w, $ws, $active, $sb, hh, $t, $sb_units);
-        let (nsb, nhh) = ($sb + hh, 1 - hh);
-        if hh == 0 || nsb < $n_sb {
-            gemm_stage!(2 * nsb + nhh, nhh, $full, $tid, $ncols, $n_sb, $col_words,
-                $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
-            $wst!(@stage [$($wsa),*] $ws; $w, nsb, nhh, nhh, $tid, $sb_units);
-        }
-        // SAFETY: one group per step (possibly empty), so waiting for all
-        // but the newest leaves step h's copies complete; the barrier then
-        // publishes every thread's copies of it.
-        unsafe {
-            cp_async_commit_group();
-            cp_async_wait_group(1);
-        }
+        // SAFETY: the one pending group is step h's, committed by step h − 1
+        // (or the block's prologue), so this completes this thread's copies
+        // of it; the barrier then publishes every thread's.
+        unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
 
+        let (nsb, nhh) = ($sb + hh, 1 - hh);
+        let next = hh == 0 || nsb < $n_sb;
+        let nh = 2 * nsb + nhh;
+        // A partial tile's few n-tiles would not cover copies issued after
+        // its first ones: it stages before them.
+        if !$full && next {
+            $wst!(@stage [$($wsa),*] $ws; $w, nsb, nhh, nhh, $tid, $sb_units);
+            gemm_stage!(nh, nhh, $full, $tid, $ncols, $stg,
+                $q6, $s8, $d8, $bt, $s8t, $d8t);
+        }
         if $active {
             let (raw0, raw1) = $wst!(@after [$($wsa),*] $ws, $hdr; st, hh, $t, raw);
             // SAFETY: stage `st` is inside each shared array.
@@ -877,12 +936,22 @@ macro_rules! gemm_step {
                     let dcol = unsafe { *(d8st.add(n0) as *const F32x2) }.0;
                     $dec!(@epi rw, s8st, n0, dcol, isum, $acc, nt);
                 }
+                // `nt` is a constant after unrolling.
+                if $full && nt == STAGE_NT && next {
+                    $wst!(@stage [$($wsa),*] $ws; $w, nsb, nhh, nhh, $tid, $sb_units);
+                    gemm_stage!(nh, nhh, $full, $tid, $ncols, $stg,
+                        $q6, $s8, $d8, $bt, $s8t, $d8t);
+                }
                 nt += 1;
             }
+        } else if $full && next {
+            $wst!(@stage [$($wsa),*] $ws; $w, nsb, nhh, nhh, $tid, $sb_units);
+            gemm_stage!(nh, nhh, $full, $tid, $ncols, $stg,
+                $q6, $s8, $d8, $bt, $s8t, $d8t);
         }
-        // Every warp is done with stage `st` before step h + 1 stages step
-        // h + 2 into it.
-        thread::sync_threads();
+        // SAFETY: commits this thread's copies of step h + 1 as one group
+        // (empty after the last step).
+        unsafe { cp_async_commit_group() };
     }};
 }
 
@@ -989,18 +1058,18 @@ macro_rules! gemm_block {
         // the block but loads, multiplies and stores nothing.
         let active = row0 < rows_n;
         let n_sb = $n_sb as usize;
-        let col_words = 128 * $half_it as usize;
+        let stg = gemm_stage_cols!(tid, $acol_sh, $half_it, $n_sb);
         $wst!(@decl [$($wsa),*] ws, hdr; $w, e, rows_n, rt, row0, g, tid, wid, n_sb, $rows, $n_sb,
             $sb_units);
 
         let mut acc = [0.0f32; 4 * GEMM_NT];
-        gemm_stage!(0usize, 0usize, false, tid, ncols, n_sb, col_words,
-            $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
+        gemm_stage!(0usize, 0usize, false, tid, ncols, stg,
+            $q6, $s8, $d8, $bt, $s8t, $d8t);
         $wst!(@stage [$($wsa),*] ws; $w, 0usize, 0usize, 0usize, tid, $sb_units);
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
         gemm_walks!($walk, nt_live, n_sb, ($dec, $wst($($wsa),*), $sb_units, $w, ws, hdr,
-            $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh, tid, ncols, col_words,
+            $q6, $s8, $d8, $bt, $s8t, $d8t, stg, tid, ncols,
             active, t, g, nt_live, acc));
 
         if active {
