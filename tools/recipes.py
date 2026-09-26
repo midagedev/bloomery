@@ -1327,6 +1327,11 @@ DATA_UNREAD = {
     "ncu": "profiler reports of a timing runner (tools/ref/ncu-gpu.sh); no gate reads them",
 }
 DATA_UNREAD_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/(?:nsys|ncu)\b|join\(\"(?:nsys|ncu)\"\)|\"(?:nsys|ncu)/")
+# A cargo selector whose value is a recipe parameter (`--features {{FEATURES}}`, `--bin {{BIN}}`): just
+# resolves it when the recipe runs, the closure never sees it (Graph.inputs skips it), so a ledger key
+# cannot name the crates the build pulls in.
+CARGO_PARAM = re.compile(r"(?:--features|--bin|--test|--example|--package|-p|-F)(?:=|\s+)\S*\{\{[^}]*\}\}")
+
 # A reference tree (ik, llama.cpp, mistral.rs) is outside the manifest: a recipe that reads one is
 # never skipped. The profiles and ref-paths.sh only define these names for every box command. The home
 # path is spelled with a class so that this file, which check-recipes runs, does not match itself.
@@ -1594,6 +1599,11 @@ class KeyContext:
 
     def never(self, names: list[str], ri: RecipeInputs, envs: list[str]) -> str | None:
         recipes = self.side.recipes
+        for n in names:
+            for ln in recipes[n].lines:
+                hit = CARGO_PARAM.search(ln)
+                if hit:
+                    return f"justfile:{recipes[n].line} {n}: `{hit.group(0)}` takes its value from a recipe parameter, so the key cannot see the crates the build pulls in"
         for n in names:
             if "tools/gate-batch.sh" in self.side.graph.inputs(n).commands.scripts:
                 return f"{n} runs tools/gate-batch.sh: a batch inside a batch, whose items' inputs are not this item's"
@@ -2274,6 +2284,8 @@ def key_self_test(expect, real: Side) -> None:
             fh.write(plan_text)
         expect(not before.startswith("error") and before != after, "a tree file named in ARGS is not in the key")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-q4k-sel")[2] is None, "a card-determined item was never-skip")
+        expect(c.parts("ptx-scan@BLOOMERY_GATE_CARD=a6000:generate_ds41 --features gpu,deepseek41")[2] is not None,
+               "an item whose cargo selector is a recipe parameter was skippable")
         # a module file the walk reaches through `mod` (not a target root): gone, the item is an error
         roots_src = {t.src for pkg in sa.tree.packages.values() for t in pkg.targets}
         for which in ("cpu", "gpu"):
