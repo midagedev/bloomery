@@ -1220,13 +1220,16 @@ impl Body {
                 ),
             });
         }
+        // Every hole keeps only its part below the cut, also at `to == len`:
+        // a hole that starts at or past it holds no position the history
+        // keeps.
+        self.holes.retain_mut(|h| {
+            h.end = h.end.min(to);
+            h.start < h.end
+        });
         if to < len {
             self.history.truncate(to);
             self.shadow_from = self.shadow_from.min(to);
-            self.holes.retain_mut(|h| {
-                h.end = h.end.min(to);
-                h.start < h.end
-            });
             self.restore = self.holds.stale(to).next().is_some();
         }
         Ok(())

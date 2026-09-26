@@ -61,7 +61,15 @@
 //!   poisoned alone, the same prefill returns the fault at that layer as the
 //!   named error — through the host tier's check at a later serve of the
 //!   group, or the group's own read at its end — and the model is poisoned
-//!   and refuses the next call.
+//!   and refuses the next call. Then the same fault followed in its group by
+//!   an observer's error at the planted batch's next attention seam, before
+//!   any serve can see the fault: the call still returns the fault at the
+//!   planted layer, not the observer's error, and the model is poisoned —
+//!   a fault never outlives a call that is taken back. After each failed
+//!   call the prompt stats (`body::PrefillStats`) hold whole groups only: a
+//!   group that failed added nothing, so the waits, copies and union calls
+//!   sum to at most the enqueue time, and no layer-batch or queue entry is
+//!   counted without its group's batches.
 //! - **Oracle, one run.** From a reset, the ids decode-stepped one at a time
 //!   through the graph, each position's features read after its step (an md5
 //!   per position). After the step at each case's position `P − 1` the gate
@@ -1415,9 +1423,12 @@ mod gate {
         Ok(ok)
     }
 
-    /// The group-fault case (module doc): a fault planted in the second batch
-    /// of a call's first group ends the call with the named error at the
-    /// planted layer and a poisoned model.
+    /// The group-fault cases (module doc): a fault planted in the second
+    /// batch of a call's first group ends the call with the named error at
+    /// the planted layer and a poisoned model — alone, and followed in its
+    /// group by an observer's error at that batch's next attention seam,
+    /// which the stream reaches after the planted layer's join under any
+    /// group size and before the next serve reads the batch.
     fn group_fault_case(
         m: &mut Deepseek41Model,
         hp: &Hparams,
@@ -1452,33 +1463,78 @@ mod gate {
                 )
             })?
         };
-        m.reset()?;
-        let saved = poison_layers(m, hp.experts.ff, layer..layer + 1)?;
-        let faulted = body::prefill(m, &ids[..p]);
-        let poisoned = m.poisoned();
-        put_back(m, &saved)?;
-        let named = matches!(
-            &faulted,
-            Err(GpuError::Fault { fault, .. }) if fault.layer as usize == layer
-        );
-        let refused = matches!(body::prefill(m, &ids[..1]), Err(GpuError::Poisoned { .. }));
-        m.reset()?;
-        let ok = named && poisoned.is_some() && refused;
-        println!(
-            "{NAME}: case group fault P={p}: NaN in layer {layer}'s card experts' gate scale, \
-             whose block starts at {} in batch {b1:?}: {} {} | poisoned {} | the next call \
-             refused {} | {:.1} s: {}",
-            need.layers.get(layer).map_or(p, |n| n.full),
-            match &faulted {
-                Ok(tok) => format!("no fault (token {tok})"),
-                Err(e) => e.to_string(),
-            },
-            verdict(named),
-            verdict(poisoned.is_some()),
-            verdict(refused),
-            t.elapsed().as_secs_f64(),
-            verdict(ok)
-        );
+        let next = layer + 1;
+        if !m.body(NAME)?.layers().contains(&next) {
+            return Err(format!(
+                "{NAME}: group fault: layer {layer} is the last, with no attention seam after it"
+            )
+            .into());
+        }
+        let mut ok = true;
+        for fail_next in [false, true] {
+            m.reset()?;
+            let saved = poison_layers(m, hp.experts.ff, layer..layer + 1)?;
+            m.body_parts(NAME)?.2.take_prefill_stats();
+            let faulted = body::prefill_observed(m, &ids[..p], &mut |_, seam| {
+                let batch = seam.first as usize - seam.at;
+                if fail_next
+                    && seam.kind == body::BatchSeamKind::Attn
+                    && seam.layer == next
+                    && batch == b1.start
+                {
+                    return Err(GpuError::State {
+                        what: NAME,
+                        missing: "an observer that takes the seam (the group-fault case's \
+                                  planted error)",
+                    });
+                }
+                Ok(())
+            });
+            let poisoned = m.poisoned();
+            let st = m.body_parts(NAME)?.2.take_prefill_stats();
+            put_back(m, &saved)?;
+            let named = matches!(
+                &faulted,
+                Err(GpuError::Fault { fault, .. }) if fault.layer as usize == layer
+            );
+            let whole = st.union_ns + st.wait_ns + st.copy_ns <= st.chain_ns
+                && (st.batches > 0
+                    || (st.layer_batches == 0 && st.entries_route == 0 && st.wait_ns == 0));
+            let refused = matches!(body::prefill(m, &ids[..1]), Err(GpuError::Poisoned { .. }));
+            m.reset()?;
+            let pass = named && poisoned.is_some() && refused && whole;
+            ok &= pass;
+            let then = if fail_next {
+                format!(", then an error at layer {next}'s attention seam of that batch")
+            } else {
+                String::new()
+            };
+            println!(
+                "{NAME}: case group fault P={p}: NaN in layer {layer}'s card experts' gate \
+                 scale, whose block starts at {} in batch {b1:?}{then}: {} {} | poisoned {} | \
+                 the next call refused {} | stats batches={} layer_batches={} \
+                 entries_route={} chain_ms={:.1} union_ms={:.1} wait_ms={:.1} copy_ms={:.1} \
+                 {} | {:.1} s: {}",
+                need.layers.get(layer).map_or(p, |n| n.full),
+                match &faulted {
+                    Ok(tok) => format!("no fault (token {tok})"),
+                    Err(e) => e.to_string(),
+                },
+                verdict(named),
+                verdict(poisoned.is_some()),
+                verdict(refused),
+                st.batches,
+                st.layer_batches,
+                st.entries_route,
+                st.chain_ns as f64 / 1e6,
+                st.union_ns as f64 / 1e6,
+                st.wait_ns as f64 / 1e6,
+                st.copy_ns as f64 / 1e6,
+                verdict(whole),
+                t.elapsed().as_secs_f64(),
+                verdict(pass)
+            );
+        }
         Ok(ok)
     }
 

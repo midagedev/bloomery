@@ -66,9 +66,10 @@
 //!
 //! A call that fails is taken back ([`GpuModel::rollback`]) to where it
 //! found the model, unless a fault poisoned it: the fault is the model's
-//! until a reset. The fault word is read at a group's end, so a fault ends
-//! the call there, named by the lowest (layer, site) any of the group's
-//! batches raised.
+//! until a reset. The fault word is read at a group's end and when a group
+//! fails, before anything else can fail, so a fault ends the call there,
+//! named by the lowest (layer, site) any of the group's batches raised,
+//! whatever error the group met after it.
 
 use std::ops::Range;
 use std::time::Instant;
@@ -81,7 +82,7 @@ use bloomery_gpu::COL_GROUP;
 use super::ced::Mode;
 use super::*;
 use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
-use crate::chain::ffn::{BatchLayer, BlockIo, CardExperts, FfnBatch, JoinIo};
+use crate::chain::ffn::{BatchLayer, BlockIo, CardExperts, ExchangeKey, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -257,8 +258,9 @@ fn feed(
     };
     let group = {
         let (gpu, _, body) = m.body_parts(WHAT)?;
+        let group = body.batch_mut(gpu)?.group;
         body.begin_call(first, end, &starts, window)?;
-        body.batch_mut(gpu)?.group
+        group
     };
     let mut token = None;
     for g in groups(runs.len(), group) {
@@ -515,6 +517,46 @@ impl PrefillStats {
         self.chain_ns
             .saturating_sub(self.union_ns + self.wait_ns + self.copy_ns)
     }
+
+    /// A group's sums `o` added to these; `group` stays. Every field is
+    /// named, so a new sum does not compile until it is added here.
+    fn add(&mut self, o: &PrefillStats) {
+        let PrefillStats {
+            group: _,
+            batches,
+            layer_batches,
+            first_layer_batches,
+            prologue_ns,
+            chain_ns,
+            union_ns,
+            wait_ns,
+            wait_first_ns,
+            copy_ns,
+            card_timed,
+            card_out_ms,
+            card_in_ms,
+            card_proj_ms,
+            entries_route,
+            entries_shadow,
+            excluded_slots,
+        } = *o;
+        self.batches += batches;
+        self.layer_batches += layer_batches;
+        self.first_layer_batches += first_layer_batches;
+        self.prologue_ns += prologue_ns;
+        self.chain_ns += chain_ns;
+        self.union_ns += union_ns;
+        self.wait_ns += wait_ns;
+        self.wait_first_ns += wait_first_ns;
+        self.copy_ns += copy_ns;
+        self.card_timed |= card_timed;
+        self.card_out_ms += card_out_ms;
+        self.card_in_ms += card_in_ms;
+        self.card_proj_ms += card_proj_ms;
+        self.entries_route += entries_route;
+        self.entries_shadow += entries_shadow;
+        self.excluded_slots += excluded_slots;
+    }
 }
 
 impl PrefillStats {
@@ -619,6 +661,17 @@ impl Member {
     /// The batch's token where the chunk `k` on starts, `u` past the last.
     fn token(&self, k: usize) -> usize {
         self.cuts.get(k).map_or(self.u, |r| r.start - self.b)
+    }
+
+    /// The host exchange's key of model layer `layer`'s block of the batch,
+    /// from its token `at` on.
+    fn key(&self, layer: usize, at: usize) -> ExchangeKey {
+        ExchangeKey {
+            layer,
+            set: self.set,
+            at,
+            u: self.u,
+        }
     }
 }
 
@@ -959,8 +1012,9 @@ impl Body {
     /// A prompt call of positions `first .. end`, fed as batches from
     /// `starts`, whose reader keeps the features of its last `window`
     /// positions when `window` is given: its needs ([`super::ced`]), kept for
-    /// the batches and [`Body::prefill_need`], and its hole. Refused with a
-    /// window and no tap, and on a card that does not run every layer.
+    /// the batches and [`Body::prefill_need`]. Its hole is recorded when its
+    /// first group has planned ([`Body::plan_group`]). Refused with a window
+    /// and no tap, and on a card that does not run every layer.
     fn begin_call(
         &mut self,
         first: usize,
@@ -985,12 +1039,7 @@ impl Body {
             (Some(_), Some(tap)) => Some(tap.after.iter().map(Option::is_some).collect()),
         };
         let taps = after.as_deref().zip(window);
-        let need = self.ced.need(first, end, starts, taps);
-        let hole = need.hole();
-        if !hole.is_empty() {
-            self.holes.push(hole);
-        }
-        self.need = Some(need);
+        self.need = Some(self.ced.need(first, end, starts, taps));
         Ok(())
     }
 
@@ -1045,11 +1094,12 @@ impl Body {
 
     /// One group: the prompt's ids `ids` as the batches `runs`, the head only
     /// when `last`. Returns whether it enqueued the head. See the module
-    /// comment. A group that is not the last reads the fault word back at
-    /// its end (a blocking read) and returns the fault as the named error:
-    /// the lowest (layer, site) any of its batches raised. A group that
-    /// fails after its first launch waits for the stream before it returns,
-    /// so the call is taken back with no copy in flight.
+    /// comment. A group reads the fault word back at its end (a blocking
+    /// read) and returns the fault as the named error: the lowest (layer,
+    /// site) any of its batches raised. A group that fails after its first
+    /// launch waits for the stream before it returns, so the call is taken
+    /// back with no copy in flight, and reads the fault word too
+    /// ([`fault_or`]).
     fn enqueue_group(
         &mut self,
         gpu: &Gpu,
@@ -1144,69 +1194,49 @@ impl Body {
             (st.batch_ns, st.batch_excluded_slots)
         };
         let t1 = Instant::now();
-        if let Err(e) = self.enqueue_group_chain(gpu, w, head, &mut members, last, observe) {
-            // A fault stays the fault: it poisons the model, which the
-            // caller's take-back leaves as it is.
-            return Err(match stream.synchronize() {
-                Ok(()) => e,
-                Err(_) if matches!(e, GpuError::Fault { .. }) => e,
-                Err(s) => GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "a group from position {b} failed ({e}), and waiting for its launches \
-                         failed too ({s})"
-                    ),
-                },
-            });
-        }
+        let chained = self.enqueue_group_chain(gpu, w, head, &mut members, last, observe);
         let chain = nanos(t1.elapsed());
+        let mut sums = match chained {
+            Ok(sums) => sums,
+            Err(e) => return Err(fault_or(gpu, b, e)),
+        };
+        // Before anything else can fail: a fault the group raised is the
+        // call's error, never the next call's.
+        if let Some(fault) = gpu.fault()? {
+            return Err(GpuError::Fault { what: WHAT, fault });
+        }
+        sums.chain_ns = chain;
         let st = self.hybrid.stats();
-        let union = st.batch_ns.saturating_sub(union0);
-        let excluded = st.batch_excluded_slots.saturating_sub(excluded0);
-        self.account_group(members.len(), prologue, chain, union, excluded)?;
-        if last {
-            return Ok(true);
-        }
-        match gpu.fault()? {
-            Some(fault) => Err(GpuError::Fault { what: WHAT, fault }),
-            None => Ok(false),
-        }
+        sums.union_ns = st.batch_ns.saturating_sub(union0);
+        sums.excluded_slots = st.batch_excluded_slots.saturating_sub(excluded0);
+        sums.prologue_ns = prologue;
+        self.account_group(members.len(), sums)?;
+        Ok(last)
     }
 
-    /// Add one group's times, its `g` batches and the host slots its
-    /// services' exclusion skipped to the stats; with card timing on, read
-    /// its layer-batches' event pairs, which waits for the last of them.
-    fn account_group(
-        &mut self,
-        g: usize,
-        prologue: u64,
-        chain: u64,
-        union: u64,
-        excluded: u64,
-    ) -> Result<(), GpuError> {
+    /// Add one group's sums, its `g` batches and, with card timing on, its
+    /// layer-batches' event pairs — read first, which waits for the last of
+    /// them — to the stats all at once: a group that fails adds nothing.
+    fn account_group(&mut self, g: usize, mut sums: PrefillStats) -> Result<(), GpuError> {
         let layers = self.layers.len();
         let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "the batch's buffers",
         })?;
-        let st = &mut batch.stats;
-        st.batches += g as u64;
-        st.prologue_ns += prologue;
-        st.chain_ns += chain;
-        st.union_ns += union;
-        st.excluded_slots += excluded;
-        if !batch.card_timing {
-            return Ok(());
-        }
-        st.card_timed = true;
-        st.card_proj_ms += batch.proj.take_card_ms()?;
-        let (marks, _) = batch.card_marks.as_chunks::<CARD_MARKS>();
-        for ([e0, e1, e2, e3], &served) in marks.iter().zip(&batch.card_served).take(layers * g) {
-            st.card_out_ms += f64::from(e0.elapsed_ms(e1)?);
-            if served {
-                st.card_in_ms += f64::from(e2.elapsed_ms(e3)?);
+        sums.batches = g as u64;
+        if batch.card_timing {
+            sums.card_timed = true;
+            sums.card_proj_ms = batch.proj.take_card_ms()?;
+            let (marks, _) = batch.card_marks.as_chunks::<CARD_MARKS>();
+            for ([e0, e1, e2, e3], &served) in marks.iter().zip(&batch.card_served).take(layers * g)
+            {
+                sums.card_out_ms += f64::from(e0.elapsed_ms(e1)?);
+                if served {
+                    sums.card_in_ms += f64::from(e2.elapsed_ms(e3)?);
+                }
             }
         }
+        batch.stats.add(&sums);
         Ok(())
     }
 
@@ -1214,7 +1244,10 @@ impl Body {
     /// after the tokens before it (the ids joining the history), each
     /// batch's rows read and its chunks' images built into its own place,
     /// then every batch's images copied to the card in one transfer and its
-    /// rope tables in another, each of which synchronizes the stream.
+    /// rope tables in another, each of which synchronizes the stream. The
+    /// call's first group records the call's hole once the history holds
+    /// the group's positions: a hole always starts below the history's
+    /// length, so taking the call back to its first position drops it.
     fn plan_group(
         &mut self,
         stream: &CudaStream,
@@ -1226,6 +1259,8 @@ impl Body {
             planner,
             history,
             file,
+            holes,
+            need,
             ..
         } = self;
         let batch = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1262,6 +1297,14 @@ impl Body {
             }
             used = m.set * CHUNKS_MAX + n;
         }
+        if let Some(need) = need.as_ref()
+            && need.first == first
+        {
+            let hole = need.hole();
+            if !hole.is_empty() {
+                holes.push(hole);
+            }
+        }
         let mut dst = span_mut(WHAT, &mut batch.params, 0, used * words)?;
         dst.copy_from_host(stream, &batch.images[..used * words])?;
         batch.proj.upload_tables(stream, members.len())
@@ -1281,7 +1324,7 @@ impl Body {
         members: &mut [Member],
         last: bool,
         observe: &mut BatchObserver<'_>,
-    ) -> Result<(), GpuError> {
+    ) -> Result<PrefillStats, GpuError> {
         let Body {
             layers,
             kv,
@@ -1321,8 +1364,7 @@ impl Body {
             batch: &mut *batch,
             need,
             n: hp.n_embd,
-            route: 0,
-            shadow: 0,
+            sums: PrefillStats::default(),
         };
         for m in members.iter_mut() {
             cx.front(m)?;
@@ -1354,9 +1396,7 @@ impl Body {
                 next = Some(cx.route(&mut members[j2], i2, observe)?);
             }
         }
-        let (route, shadow) = (cx.route, cx.shadow);
-        batch.stats.entries_route += route;
-        batch.stats.entries_shadow += shadow;
+        let sums = cx.sums;
         if last && let Some(m) = members.last() {
             let s4 = HC_STREAMS * hp.n_embd;
             let t = m.u - 1;
@@ -1368,13 +1408,14 @@ impl Body {
             let pre = span(WHAT, batch.ffn.hc(m.set)?, t * HC_MIX, HC_MIX)?;
             glue.enqueue_head(gpu, w, &s, &pre, head)?;
         }
-        Ok(())
+        Ok(sums)
     }
 }
 
 /// What a group's layer-batches enqueue through: the body's parts they read
-/// and write, the batch's buffers, the call's needs, and the queue entries
-/// counted so far.
+/// and write, the batch's buffers, the call's needs, and the group's sums so
+/// far — the queue entries, the layer-batches, the serves' waits — which
+/// reach the stats only once the group has run ([`Body::account_group`]).
 struct GroupCx<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
@@ -1390,8 +1431,7 @@ struct GroupCx<'a> {
     batch: &'a mut Batch,
     need: &'a Need,
     n: usize,
-    route: u64,
-    shadow: u64,
+    sums: PrefillStats,
 }
 
 impl<'a> GroupCx<'a> {
@@ -1419,7 +1459,7 @@ impl<'a> GroupCx<'a> {
             let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;
             batch.attn.enqueue_step_of(gpu, &p, row0 + k)?;
         }
-        self.route += queue::GATHER * m.cuts.len() as u64 + queue::embed(m.u);
+        self.sums.entries_route += queue::GATHER * m.cuts.len() as u64 + queue::embed(m.u);
         let own = set_of(&mut batch.sets, m.set)?;
         for (k, r) in m.cuts.iter().enumerate() {
             let (at, len) = (r.start - m.b, r.len());
@@ -1453,7 +1493,7 @@ impl<'a> GroupCx<'a> {
         let served = m.set * self.layers.len() + i;
         if timed {
             self.mark(m.set, i, 0)?;
-            self.route += 1;
+            self.sums.entries_route += 1;
         }
         let batch = &mut *self.batch;
         batch.card_served[served] = false;
@@ -1478,7 +1518,7 @@ impl<'a> GroupCx<'a> {
             let wkv_q8 = queue::q8(w, &names::engram_wkv(l));
             for (k, r) in m.cuts.iter().enumerate().skip(run) {
                 let (at, len) = (r.start - b, r.len());
-                self.route += queue::engram(len, wkv_q8);
+                self.sums.entries_route += queue::engram(len, wkv_q8);
                 let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;
                 let (hin, hout) = ping(&mut own.hc, m.cur.s);
                 let streams = span(WHAT, hin, at * s4, len * s4)?;
@@ -1546,7 +1586,7 @@ impl<'a> GroupCx<'a> {
                 &mut caches,
             )?;
         }
-        self.route += batch.proj.take_entries();
+        self.sums.entries_route += batch.proj.take_entries();
         m.cur.s ^= 1;
         m.cur.f ^= 1;
         let at = m.token(full);
@@ -1566,7 +1606,7 @@ impl<'a> GroupCx<'a> {
         if full == m.cuts.len() {
             if timed {
                 self.mark(m.set, i, 1)?;
-                self.route += 1;
+                self.sums.entries_route += 1;
             }
             return Ok(Routed {
                 full,
@@ -1575,9 +1615,9 @@ impl<'a> GroupCx<'a> {
             });
         }
         batch.card_served[served] = true;
-        batch.stats.layer_batches += 1;
+        self.sums.layer_batches += 1;
         if m.set == 0 {
-            batch.stats.first_layer_batches += 1;
+            self.sums.first_layer_batches += 1;
         }
         let block = BlockIo {
             set: m.set,
@@ -1589,11 +1629,11 @@ impl<'a> GroupCx<'a> {
         let bl = self.ffn.resolve_batch(w, l)?;
         self.ffn
             .enqueue_batch_route(gpu, &bl, &mut batch.ffn, &block, self.slots)?;
-        batch.ffn.enqueue_download(gpu, at, u)?;
-        self.route += queue::route(m.cuts.len() - full);
+        batch.ffn.enqueue_download(gpu, m.key(l, at))?;
+        self.sums.entries_route += queue::route(m.cuts.len() - full);
         if timed {
             self.mark(m.set, i, 1)?;
-            self.route += 1;
+            self.sums.entries_route += 1;
         }
         Ok(Routed {
             full,
@@ -1612,7 +1652,7 @@ impl<'a> GroupCx<'a> {
         let timed = self.batch.card_timing;
         if timed {
             self.mark(m.set, i, 2)?;
-            self.shadow += 1;
+            self.sums.entries_shadow += 1;
         }
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
@@ -1624,7 +1664,7 @@ impl<'a> GroupCx<'a> {
             streams: &own.hc[m.cur.s],
             fold_in: &own.folds[m.cur.f],
         };
-        self.shadow += queue::shadow(
+        self.sums.entries_shadow += queue::shadow(
             &m.cuts[r.full..],
             batch.ffn.experts(),
             card.is_some(),
@@ -1634,7 +1674,7 @@ impl<'a> GroupCx<'a> {
             .enqueue_batch_shadow(gpu, bl, card, &mut batch.ffn, &block)?;
         if timed {
             self.mark(m.set, i, 3)?;
-            self.shadow += 1;
+            self.sums.entries_shadow += 1;
         }
         Ok(())
     }
@@ -1646,8 +1686,8 @@ impl<'a> GroupCx<'a> {
             return Ok(());
         }
         let l = self.layers.start + i;
-        let times = self.batch.ffn.serve(&mut *self.hybrid, l, r.at, m.u)?;
-        let st = &mut self.batch.stats;
+        let times = self.batch.ffn.serve(&mut *self.hybrid, m.key(l, r.at))?;
+        let st = &mut self.sums;
         st.wait_ns += times.wait_ns;
         st.copy_ns += times.copy_ns;
         if m.set == 0 {
@@ -1674,8 +1714,8 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         if r.block.is_some() {
-            batch.ffn.enqueue_upload(gpu, r.at, m.u)?;
-            self.route += queue::UPLOAD_JOIN;
+            batch.ffn.enqueue_upload(gpu, m.key(l, r.at))?;
+            self.sums.entries_route += queue::UPLOAD_JOIN;
             let (sin, sout) = ping(&mut own.hc, m.cur.s);
             let (_, fout) = ping(&mut own.folds, m.cur.f);
             self.ffn.enqueue_batch_join(
@@ -1722,9 +1762,37 @@ impl<'a> GroupCx<'a> {
             batch
                 .ffn
                 .enqueue_tap_means(gpu, &s, k, width, slot * n, &mut rows)?;
-            self.route += 1;
+            self.sums.entries_route += 1;
         }
         Ok(())
+    }
+}
+
+/// The error of a group from position `b` that failed with `e` after its
+/// first launch: the stream waited for, then the fault word read — a fault
+/// any of the group's launches raised is the error whatever `e` was, so it
+/// poisons the model and never reaches a later call. A fault `e` that names
+/// the same fault stays as it is: it names the reader that met it first. A
+/// failed wait or read names `e` beside its own error, and a fault `e`
+/// stays.
+fn fault_or(gpu: &Gpu, b: usize, e: GpuError) -> GpuError {
+    let read = gpu
+        .stream()
+        .synchronize()
+        .map_err(GpuError::from)
+        .and_then(|()| gpu.fault());
+    match read {
+        Ok(Some(fault)) if matches!(&e, GpuError::Fault { fault: seen, .. } if *seen == fault) => e,
+        Ok(Some(fault)) => GpuError::Fault { what: WHAT, fault },
+        Ok(None) => e,
+        Err(_) if matches!(e, GpuError::Fault { .. }) => e,
+        Err(s) => GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a group from position {b} failed ({e}), and waiting for its launches or \
+                 reading the fault word failed too ({s})"
+            ),
+        },
     }
 }
 

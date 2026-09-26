@@ -93,8 +93,8 @@ use crate::transpose::TransposeKernels;
 
 mod batch;
 pub use batch::{
-    BatchLayer, BlockIo, CardExperts, ChunkIo, FfnBatch, FfnBatchKernels, GroupedGateUp, JoinIo,
-    Places,
+    BatchLayer, BlockIo, CardExperts, ChunkIo, ExchangeKey, FfnBatch, FfnBatchKernels,
+    GroupedGateUp, JoinIo, Places,
 };
 
 /// What the enqueue path's errors name.

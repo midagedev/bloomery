@@ -1218,17 +1218,17 @@ mod exchange {
     use std::time::Instant;
 
     use super::{
-        CudaContext, CudaEvent, CudaStream, DeviceBuffer, GpuError, HostExperts, Hybrid, N_USED,
-        PinnedHostBuffer, ServeTimes, Tensor2View, WHAT, dtoh, htod, nanos,
+        CudaContext, CudaEvent, CudaStream, DeviceBuffer, ExchangeKey, GpuError, HostExperts,
+        Hybrid, N_USED, PinnedHostBuffer, ServeTimes, Tensor2View, WHAT, dtoh, htod, nanos,
     };
 
-    /// Where a set stands: free, holding a layer's route copies of tokens
-    /// `at .. u`, or holding that layer's host sums before their upload.
+    /// Where a set stands: free, holding a layer-batch's route copies, or
+    /// holding its host sums before their upload.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Stage {
         Free,
-        Routed(usize, usize),
-        Served(usize, usize),
+        Routed(ExchangeKey),
+        Served(ExchangeKey),
     }
 
     /// One set: page-locked copies of a block's activations, routing and host
@@ -1300,25 +1300,25 @@ mod exchange {
             (self.down, self.serve, self.up) = (0, 0, 0);
         }
 
-        /// Enqueue the copies of tokens `at .. u` of `x` (`n_embd` a token),
-        /// `ids` and `w` (six a token) into the next set, and its event.
-        /// Refused while that set holds a layer not uploaded yet.
+        /// Enqueue the copies of `key`'s tokens `at .. u` of `x` (`n_embd` a
+        /// token), `ids` and `w` (six a token) into the next set, and its
+        /// event. Refused while that set holds a layer not uploaded yet.
         pub(super) fn download(
             &mut self,
             stream: &CudaStream,
             [x, w]: [&DeviceBuffer<f32>; 2],
             ids: &DeviceBuffer<u32>,
-            at: usize,
-            u: usize,
+            key: ExchangeKey,
         ) -> Result<(), GpuError> {
             let (n, s) = (self.n_embd, N_USED);
+            let ExchangeKey { at, u, .. } = key;
             let set = &mut self.sets[self.down];
             if set.stage != Stage::Free {
                 return Err(GpuError::Shape {
                     what: WHAT,
                     detail: format!(
-                        "a route of tokens {at}..{u} into an exchange set that holds {:?}: both \
-                         sets hold a layer not uploaded yet",
+                        "a route of {key:?} into an exchange set that holds {:?}: both sets \
+                         hold a layer not uploaded yet",
                         set.stage
                     ),
                 });
@@ -1336,29 +1336,27 @@ mod exchange {
                 dtoh(stream, &mut set.w, w, at * s..u * s)?;
             }
             set.routed.record(stream)?;
-            set.stage = Stage::Routed(at, u);
+            set.stage = Stage::Routed(key);
             self.down ^= 1;
             Ok(())
         }
 
-        /// Wait for the oldest unserved set's copies, which must be tokens
-        /// `at .. u`'s, then serve layer `layer`'s host experts for them in
-        /// one union call: the sums into the set's copy the upload sends.
+        /// Wait for the oldest unserved set's copies, which must be `key`'s,
+        /// then serve its layer's host experts for its tokens in one union
+        /// call: the sums into the set's copy the upload sends.
         pub(super) fn serve<H: HostExperts>(
             &mut self,
             hybrid: &mut Hybrid<H>,
-            layer: usize,
-            at: usize,
-            u: usize,
+            key: ExchangeKey,
         ) -> Result<ServeTimes, GpuError> {
             let n = self.n_embd;
+            let ExchangeKey { layer, at, u, .. } = key;
             let set = &mut self.sets[self.serve];
-            if set.stage != Stage::Routed(at, u) {
+            if set.stage != Stage::Routed(key) {
                 return Err(GpuError::Shape {
                     what: WHAT,
                     detail: format!(
-                        "layer {layer}'s serve of tokens {at}..{u}; the oldest unserved exchange \
-                         set holds {:?}",
+                        "the serve of {key:?}; the oldest unserved exchange set holds {:?}",
                         set.stage
                     ),
                 });
@@ -1379,27 +1377,27 @@ mod exchange {
                 &[],
                 &mut set.sum[at * n..u * n],
             )?;
-            set.stage = Stage::Served(at, u);
+            set.stage = Stage::Served(key);
             self.serve ^= 1;
             Ok(times)
         }
 
         /// Enqueue the copy of the oldest served set's sums, which must be
-        /// tokens `at .. u`'s, to `hsum`; the set is free again.
+        /// `key`'s, to `hsum`; the set is free again.
         pub(super) fn upload(
             &mut self,
             stream: &CudaStream,
             hsum: &mut DeviceBuffer<f32>,
-            at: usize,
-            u: usize,
+            key: ExchangeKey,
         ) -> Result<(), GpuError> {
             let n = self.n_embd;
+            let ExchangeKey { at, u, .. } = key;
             let set = &mut self.sets[self.up];
-            if set.stage != Stage::Served(at, u) {
+            if set.stage != Stage::Served(key) {
                 return Err(GpuError::Shape {
                     what: WHAT,
                     detail: format!(
-                        "an upload of tokens {at}..{u}; the oldest served exchange set holds {:?}",
+                        "the upload of {key:?}; the oldest served exchange set holds {:?}",
                         set.stage
                     ),
                 });
@@ -1681,48 +1679,66 @@ impl FfnBatch {
         Ok(())
     }
 
-    /// Enqueue the copies of tokens `at .. u`'s activations and routing to
-    /// the host into the next exchange set, and the event they complete at.
+    /// Enqueue the copies of `key`'s tokens' activations and routing to the
+    /// host into the next exchange set, and the event they complete at.
     /// Asynchronous. Refused while both sets hold a layer not uploaded yet.
-    pub fn enqueue_download(&mut self, gpu: &Gpu, at: usize, u: usize) -> Result<(), GpuError> {
-        self.check_tokens(at, u)?;
+    pub fn enqueue_download(&mut self, gpu: &Gpu, key: ExchangeKey) -> Result<(), GpuError> {
+        self.check_key(key)?;
         self.exchange
-            .download(gpu.stream(), [&self.x, &self.weights], &self.ids, at, u)
+            .download(gpu.stream(), [&self.x, &self.weights], &self.ids, key)
     }
 
-    /// Wait for the oldest download not served yet — tokens `at .. u`'s,
-    /// else refused — then serve layer `layer`'s host experts for them in
-    /// one union call: the sums into the set's host copy
+    /// Wait for the oldest download not served yet — `key`'s, else refused
+    /// by name — then serve its layer's host experts for its tokens in one
+    /// union call: the sums into the set's host copy
     /// [`FfnBatch::enqueue_upload`] sends back. Returns the host time
     /// outside the union call.
     pub fn serve<H: HostExperts>(
         &mut self,
         hybrid: &mut Hybrid<H>,
-        layer: usize,
-        at: usize,
-        u: usize,
+        key: ExchangeKey,
     ) -> Result<ServeTimes, GpuError> {
-        self.check_tokens(at, u)?;
-        self.exchange.serve(hybrid, layer, at, u)
+        self.check_key(key)?;
+        self.exchange.serve(hybrid, key)
     }
 
-    /// Enqueue the copy of the oldest served set's host sums — tokens `at ..
-    /// u`'s, else refused — to the card. Asynchronous.
-    pub fn enqueue_upload(&mut self, gpu: &Gpu, at: usize, u: usize) -> Result<(), GpuError> {
-        self.check_tokens(at, u)?;
-        self.exchange.upload(gpu.stream(), &mut self.hsum, at, u)
+    /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
+    /// refused by name — to the card. Asynchronous.
+    pub fn enqueue_upload(&mut self, gpu: &Gpu, key: ExchangeKey) -> Result<(), GpuError> {
+        self.check_key(key)?;
+        self.exchange.upload(gpu.stream(), &mut self.hsum, key)
     }
 
-    /// Tokens `at .. u` of a batch: at least one, at most the cap.
-    fn check_tokens(&self, at: usize, u: usize) -> Result<(), GpuError> {
-        if at >= u || u > self.cap {
+    /// A key's tokens `at .. u` of a batch: at least one, at most the cap;
+    /// its batch within the group's sets.
+    fn check_key(&self, key: ExchangeKey) -> Result<(), GpuError> {
+        let ExchangeKey { set, at, u, .. } = key;
+        if at >= u || u > self.cap || set >= self.hc.len() {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("tokens {at}..{u} of a batch of at most {}", self.cap),
+                detail: format!(
+                    "{key:?}: tokens of a batch of at most {}, a batch of a group of at most {}",
+                    self.cap,
+                    self.hc.len()
+                ),
             });
         }
         Ok(())
     }
+}
+
+/// Which layer-batch a host exchange set holds ([`FfnBatch::enqueue_download`],
+/// [`FfnBatch::serve`], [`FfnBatch::enqueue_upload`]): model layer `layer` of
+/// the group's batch `set`, the batch's tokens `at .. u` of its block. Two
+/// batches' blocks can cover the same tokens of their batches; their keys
+/// still differ, so a serve or an upload out of the route order is refused
+/// by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExchangeKey {
+    pub layer: usize,
+    pub set: usize,
+    pub at: usize,
+    pub u: usize,
 }
 
 /// The group's batch `set`'s HC_PRE results of `hc`, refused past the sets.
