@@ -2,7 +2,7 @@
 """How many host expert reads a k-row pass shares, from router sets and a placement.
 
     tools/ref/window-union.py <set> [<set>...] --n-l <spec> [--hot <file>] [--k 2,3,4,6]
-                              [--ranges 0-1,2-9,10-19,20-29,30-39]
+                              [--ranges 0-1,2-9,10-19,20-29,30-39[,40-49...]]
     tools/ref/window-union.py --self-test
 
 Each <set> is a router_trace directory (tools/ref/router-coverage.py's docstring has the format); a set
@@ -27,7 +27,9 @@ Per set and k:
              mean, p10 and p90 over windows; `pooled` is Σ U / Σ S over every window
     slots    mean host slots per row (Σ_l over one row) and mean union per window
 
-then, per layer range, the pooled ratio per k. The last block (`all`) pools every set's windows.
+then, per layer range, the pooled ratio per k. The default ranges run 0-1, 2-9, then tens up to the
+highest layer the sets trace (V4.1's 40 layers end at 30-39, Qwen3.8's 48 at 40-47). The last block
+(`all`) pools every set's windows.
 """
 import importlib.util
 import os
@@ -41,7 +43,15 @@ rc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rc)
 
 DEFAULT_K = (2, 3, 4, 6)
-DEFAULT_RANGES = "0-1,2-9,10-19,20-29,30-39"
+
+
+def default_ranges(layers):
+    """0-1, 2-9, then tens up to the last layer: every traced layer lands in one range."""
+    last = max(layers)
+    out = ["0-1", f"2-{min(9, last)}"] if last >= 2 else [f"0-{last}"]
+    for lo in range(10, last + 1, 10):
+        out.append(f"{lo}-{min(lo + 9, last)}")
+    return ",".join(out)
 
 
 def parse_range(text):
@@ -177,6 +187,8 @@ def summary(win_k):
 def report(set_dirs, spec, hot_path, ks, ranges):
     sets = [rc.read_manifest(d) for d in set_dirs]
     hot = read_hot(hot_path) if hot_path else None
+    if ranges is None:
+        ranges = default_ranges([l for s in sets for l in s["layers"]])
     ranges = [parse_range(r) for r in ranges.split(",")]
     print(f"# window-union — n_l {spec}, card list {hot_path or 'id prefix'}, k {','.join(map(str, ks))}")
     pooled_all = {k: ([], []) for k in ks}
@@ -237,7 +249,7 @@ def print_ranges(per_layer, row_slots, ks, ranges):
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
-    sets, spec, hot, ks, ranges = [], None, None, DEFAULT_K, DEFAULT_RANGES
+    sets, spec, hot, ks, ranges = [], None, None, DEFAULT_K, None
     it = iter(argv)
     for a in it:
         if a == "--n-l":
@@ -333,6 +345,21 @@ def self_test():
             raise AssertionError("a hot list shorter than n_l was accepted")
         except rc.SetError:
             pass
+        # Qwen3.8's shape: 512 experts, top-10, 48 layers, ids past 255, layer 2 all on the host. Even rows
+        # pick A (ids 250-259, under the id prefix of 301), rows 1 mod 4 B1 (500-509), rows 3 mod 4 B2
+        # (490-499). A k=4 window holds two A rows, one B1 and one B2: on the 47 layers with n_l 301 the host
+        # reads B1 and B2 once each (U 20 = S 20), on layer 2 A as well (U 30 of S 40). Pooled: 970 / 980.
+        a, b1, b2 = tuple(range(250, 260)), tuple(range(500, 510)), tuple(range(490, 500))
+        rows = [a if t % 2 == 0 else (b1 if t % 4 == 1 else b2) for t in range(12)]
+        q38 = rc.read_manifest(_fake_set(root, "q38", {l: rows for l in range(48)}, 512, 10))
+        n_l = parse_n_l("0-1:301,3-47:301", q38["layers"])
+        assert n_l[2] == 0 and n_l[47] == 301 and sum(n_l.values()) == 47 * 301
+        win, per_layer, _ = measure(q38, card_sets(q38["layers"], n_l, 512, None), (4,))
+        m = summary(win[4])
+        assert m["windows"] == 9 and abs(m["pooled"] - 970 / 980) < 1e-12, m
+        assert per_layer[4][2] == (9 * 30, 9 * 40) and per_layer[4][47] == (9 * 20, 9 * 20)
+        assert default_ranges(q38["layers"]) == "0-1,2-9,10-19,20-29,30-39,40-47"
+        assert default_ranges(list(range(40))) == "0-1,2-9,10-19,20-29,30-39"
     print("window-union: self-test ok")
     return 0
 

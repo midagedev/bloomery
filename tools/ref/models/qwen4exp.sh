@@ -38,13 +38,31 @@
 #                   lcppppfit) let llama-bench place to the byte; each row publishes the faster.
 #                   -t 32 is the host's cores, spelled out as deepseek41.sh does: the host layers'
 #                   experts run on them. No flag sweep has been run
+#   MTP_MODEL       unsloth's shared MTP draft beside the split set (block_count 49, the one layer
+#                   blk.48, nextn_shared_target_tensors: it borrows the target's token_embd and output);
+#                   the `mtp` arm of ik-draft.sh loads it with -md. BLOOMERY_REF_MODEL does not move it
+#   IK_MTP_FLAGS    ik's placement for ik-draft.sh's plain and mtp arms (`just time-ik-mtp`), the ik run
+#                   the MTP acceptance is read from. Not IK_GPU_FLAGS: depth-qwen3moe.sh reads that name
+#                   for the public table, whose reference is mainline. Every layer and the head on the
+#                   card and the routed stacks of the first 28 layers on the host: two layers more than
+#                   LCPP_GPU_FLAGS's 26 [derived: 1.57..1.84 GB each] leave room for the draft, which
+#                   ik loads on the card whole (-ngld 99 in the arm; an MTP draft drops the target's
+#                   CPU-MoE overrides, common/speculative.cpp common_speculative_load_draft_model).
+#                   Acceptance is a property of the numerics, not of the placement, so these are "at
+#                   these flags" and no sweep has been run
+#   IK_MTP_ENV      the environment of every ik launch with IK_MTP_FLAGS, as NAME=VALUE words for `env`:
+#                   GGML_CUDA_NO_PINNED_WEIGHTS=1, for the reason models/deepseek41.sh's IK_GPU_ENV gives
+#                   (a CPU override drops ik's mmap of the host context, which would then be pinned)
+#   CORPUS_PROSE_SHA256  the sha256 of $BLOOMERY_DATA/qwen4exp/corpus-prose.ids (the d1k and d3k
+#                   variants' prompt, below; ik-draft.sh checks it before a run on that corpus)
 #
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
 # the page cache (unlike V4.1's), so a later dump of the same file reads nothing from the device.
 #
 # Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs reference arms
 # (IK_GPU_FLAGS, MRS, MRS_FLAGS): the public table's reference is mainline llama.cpp, and nobody has
-# read whether the mistral.rs tree opens this file. Every script
+# read whether the mistral.rs tree opens this file. ik's one run for this model, the MTP acceptance
+# (ik-draft.sh), has names of its own (IK_MTP_FLAGS, IK_MTP_ENV) that no table runner reads. Every script
 # that reads them runs under `set -u`, so such a script stops at the unset name instead of running
 # an engine at flags nobody chose.
 #
@@ -60,6 +78,10 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26 -t 32}"
+MTP_MODEL=/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+: "${IK_MTP_FLAGS:=-ngl 999 --n-cpu-moe 28 -t 32}"
+: "${IK_MTP_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
+CORPUS_PROSE_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints (it loads
 # the vocabulary only). Five ids and no BOS: the file sets tokenizer.ggml.add_bos_token to false.
@@ -89,7 +111,7 @@ REF_DUMP_LEASE=1
 # ik-idxkey's llama-tokenize (md5 8dd4fe8a9bb773f80f8345c87f019b1b) with TOKENIZER_VOCAB = MODEL,
 # --no-parse-special, one id per line, 76,180 ids. The file is byte for byte qwen35moe's
 # corpus-prose.ids, kept under this profile's name so a change on either side cannot move the ids a
-# set of the other is of; the sha256 below is the check.
+# set of the other is of; CORPUS_PROSE_SHA256 is the check.
 ref_step_variant() {
   local name=$1 every_node=0
   case $name in
@@ -105,7 +127,7 @@ ref_step_variant() {
   esac
   case $name in
     d1k|d3k) STEP_TOKENS_FILE=$BLOOMERY_DATA/qwen4exp/corpus-prose.ids
-             STEP_TOKENS_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be ;;
+             STEP_TOKENS_SHA256=$CORPUS_PROSE_SHA256 ;;
   esac
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node

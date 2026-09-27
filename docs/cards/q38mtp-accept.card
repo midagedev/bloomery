@@ -1,0 +1,51 @@
+# Round mtpmeasure (MTP chain step 0c; design specs/wave-m8/reports/q38mtpd.md §5 ①). The one term of the
+# Qwen3.8 verify-window model only the box can close: how many tokens a four-row window keeps, E(4).
+# Every window prediction of the design (x1.31-1.39 all host, x1.45-2.01 with card experts) scales with it.
+# Band [derived]: E(T) = sum_{i<T} (a c)^i with a per-step acceptance a = 0.78-0.88 anchored on the Qwen
+# report's Table 4 (four-step speculative decoding, accepted length 3.47 MT-Bench .. 4.30 MATH, bf16) and
+# discounted for a Q4_K_XL target and a Q8_0 draft. ik's draft reads the full head, so c = 1 here and the
+# run fixes a alone: 1 + a + a^2 + a^3 = 2.80 at a 0.76, 3.35 at a 0.88. The reduced draft head's c
+# (0.95-0.98, HyperQwen's held-out coverage) is not measured by this run.
+# Ruler [derived]: n = 256 at E ~3 is ~85 windows; kept drafts per window in {0..3} with SD ~1.1 put E's
+# 95 % interval at about +-0.24, inside the band's width 0.55. One prompt (prose), one text domain.
+# Wall [derived]: the check before the lease (the vocabulary decode and ik's llama-tokenize) < 10 s; per
+# stage one ik load of the 111.3 GB split set — cold 65-104 s at 1.07-1.72 GB/s (q38ref-dump.card's
+# rates), warm 20-40 s (the host copy of the first 28 layers' experts without mmap, IK_MTP_ENV, and the
+# card upload) — plus the prompt's 512 tokens and 256 decoded, 10-25 s at 20-50 ms a window. Five stages:
+# 3-7 min, every load cold at most 11 min. No user approval needed (under 30 min); the lead's go is.
+kind: baseline
+question: how many tokens does a four-row verify window keep on the Qwen3.8 UD-Q4_K_XL target with the
+  shared Q8_0 MTP draft, greedy, on real text?
+term: E(4) = 1 + #acc tokens / #gen drafts of ik's `statistics mtp` line (the `ik-mtp ... E=` field), stage
+  mtp:n_max=3,p_min=0.0, llama-cli -n 256 --temp 0 --ignore-eos on the first 512 ids of
+  $BLOOMERY_DATA/qwen4exp/corpus-prose.ids, ik at IK_MTP_FLAGS (-ngl 999 --n-cpu-moe 28 -t 32, draft
+  -ngld 99), A6000, ik build db517b69 (the refset qwen4exp family's pin)
+unit: tokens
+predict: 2.80..3.35
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38mtp-accept.card
+  BLOOMERY_IK_SPEC=mtp:n_max=3,p_min=0.0;mtp:n_max=3,p_min=0.3;mtp:n_max=3,p_min=0.5;mtp:n_max=3,p_min=0.75;mtp:n_max=3,p_min=0.9'
+  just time-ik-mtp prose 256 — wall 3-7 min [derived above], under the lease with its witness blocks; the
+  E term is the first stage's row, the other four make the threshold table the p* default is read from.
+  The run guarantees: the prompt ids round-trip both ways (llama-tokenize before the lease, llama-cli's
+  --verbose-prompt after) and the prose file matches the profile's CORPUS_PROSE_SHA256; every row names
+  its ik_build, and a build other than db517b69 makes the rows a note, not the term (re-sit after the
+  lead picks the build); the p_min 0 row's rows= is 3.000 and decoded - 1 is within 3 of windows +
+  accepted (no [check] line), else windows are not verify passes and E is not read. tok/s is printed and
+  is not a result: the placement is chosen to fit, not to be fast
+reason: sets the acceptance term every Qwen3.8 MTP window prediction rests on, before q38rows and mtpprog
+  spend two L rounds on a T=4 window; of the trees read, ik is the one engine that runs this GGUF's MTP
+  layer (exllamav3 runs the draft block from its own EXL3 files, mistral.rs has qwen3_5 MTP only, and
+  mainline's qwen4exp graph has no NextN layer at the local fork's 2026-09-14 base; 53ed051ce on the
+  box is unread); why now: mtprule landed the host rule, and the window's graphs are sized next
+decide-in: go: q38rows and mtpprog build the T=4 window; BLOOMERY_MTP_PMIN's full-head default is the
+  table's p_min with the largest E / (W1 + rows x the plan's per-row cost) (the marginal-row model,
+  q38mtpd.md §2), and when no stage beats p_min 0 by more than E's +-0.24 the default stays the design's
+  derived p* (0.41-0.55 all host, 0.17-0.43 A6000); the reduced head's default comes from mtpwin's own
+  table, since its p (max over the kept rows) reads higher than ik's full-vocabulary p
+decide-below: go at T_max 3: re-derive each plan's T from the measured a with the marginal-row model
+  before q38rows fixes the graph set (every plan's break-even E(4) is 1.8-2.3 [derived, q38mtpd.md §5's
+  window over T=1 ms]);
+  under 2.3 the all-host plan is no-go at T=4 and mtpwin's timed A/B runs on a card plan only; take the
+  full-head p* from the table as in decide-in
+decide-above: go and widen: q38rows keeps graphs up to T=6 (MAX_PASS_ROWS 8) and the round after mtpwin
+  times T=5..6; the full-head p* from the table as in decide-in

@@ -1,0 +1,46 @@
+# Round mtpmeasure (MTP chain step 0c; design specs/wave-m8/reports/q38mtpd.md §5 ②). The window's host term
+# is U_host(T) x (1 - h) x 10 experts a layer; this card's term is U_host(4) / (4 x the host slots of one row)
+# at the raw A6000 arm's placement: how many host expert reads four consecutive positions share.
+# Band [derived]: 0.76 is Strata's self-report for its cache misses (verify.hpp:9-10, U 3.05 of 4 rows);
+# 0.97 is independent routing at k = 4 with near-uniform marginals, (1 - (1 - p)^4) / 4p at p = 10/512. A hot
+# list leaves the colder experts on the host, whose p is small, so the independent value moves toward 0.98
+# and the band's top is the likelier end. The trace is teacher-forced prefill over human prose and code,
+# not windows of the model's own greedy text: the routing of generated text may repeat more.
+# One run, two cards. The trace is the qwen4exp router-trace run strataread's route-coverage card
+# (scratchpad strataread/q38route-coverage.card) asks for, and that card holds its lease; this card is the
+# second reading of the same two sets, off the lease. Only when that card is not scheduled does this one
+# take the lease for the traces, with the same commands.
+# Wall [derived]: a trace of 50,000 ids is ~13 GFLOP a token at 1.25-3 TFLOP/s (q38ref-dump.card), 3.6-8.7
+# min, plus the first cold read of the 111.3 GB set (65-104 s) under --defer-experts: 5-11 min a set, one
+# lease each, under router-trace.sh's 1800 s bound. window-union.py reads 2 x 50,000 x 48 x 20 B = 96 MB of
+# ids and ORs 512-bit masks in Python: 1-4 min for both placements and both sets, no lease.
+kind: baseline
+question: how many host expert reads does a four-row Qwen3.8 verify window share under the A6000 raw
+  placement, against four single rows?
+term: pooled window-union ratio (sum U / sum S over every window, the `all` block's k=4 `pooled`) of
+  tools/ref/window-union.py on the qwen4exp-prose and qwen4exp-code router sets (ik CPU prefill, chunk 2048,
+  50,000 ids each), --n-l 0-1:301,3-47:301 (layer 2's Q5_K stack stays on the host) with the hot list learned
+  from both sets
+unit: ratio
+predict: 0.76..0.97
+condition: the sets: just trace-router-qwen4exp prose --max-tokens 50000 and just trace-router-qwen4exp code
+  --max-tokens 50000, each under the lease with its witness blocks and a lease card (the route-coverage
+  card, or BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38mtp-union.card'), 5-11 min each; each set's
+  manifest has its `# complete` trailer, `# arch qwen4exp`, 50,000 tokens and the qwen4exp profile's model
+  file. The reading, no lease (1-4 min): tools/box.sh 'D=$BLOOMERY_DATA/router && python3
+  tools/ref/router-hotlist.py $D/qwen4exp-prose $D/qwen4exp-code --n all --out $D/qwen4exp-union-hot.txt &&
+  python3 tools/ref/window-union.py $D/qwen4exp-prose $D/qwen4exp-code --n-l 0-1:301,3-47:301 --hot
+  $D/qwen4exp-union-hot.txt --k 2,3,4 && python3 tools/ref/window-union.py $D/qwen4exp-prose
+  $D/qwen4exp-code --n-l 0-47:0 --k 2,3,4'. The term is the first run's `all` block, k=4, `pooled`; each
+  set's own block prints the independent-routing `predict` beside its pooled, the value to read it
+  against; the second run (all host) is printed beside it, not judged
+reason: sets U_host(T), the window model's host term for every plan with host experts; Strata's 0.76 is
+  a self-report of another engine's cache and the independent 0.97 is a bound, not our file's routing;
+  why now: q38rows sizes the window and mtpwin's timed prediction divides by this term
+decide-in: keep the window model's host term as written (U_host(4) = 4 x ratio x the row's host slots);
+  mtpwin's timed prediction uses the measured ratio
+decide-below: consecutive positions share more host experts than Strata reports: raise the host-bound
+  plans' window gain (all host, A6000 static) with the measured ratio and price T=5 for them in the round
+  after mtpwin
+decide-above: the host reads grow with T at least as fast as independent rows: lower T_max to 3 for the
+  host-bound plans and move the adaptive-swap round (runtime residency) ahead of mtpwin

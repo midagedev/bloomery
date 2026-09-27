@@ -503,6 +503,11 @@ trace-router CORPUS *ARGS:
 trace-router-glm5next CORPUS *ARGS:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# Qwen3.8-Flash-Next (qwen4exp) router trace: trace-router's runner under the qwen4exp profile; the corpus is
+# $BLOOMERY_DATA/qwen4exp/corpus-<name>.ids (its own vocabulary), the set is named qwen4exp-<name>.
+trace-router-qwen4exp CORPUS *ARGS:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
+
 # 라우터 세트들을 합쳐 층마다 뜨거운 expert를 순위대로 적은 목록(B12)을 $BLOOMERY_DATA/router/<OUT>에 쓴다. 적재는
 # BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(all = 세트의 expert 수, 전체 순위).
 # GLM: just hotlist all glm5next-hotlist.txt glm5next-prose
@@ -1086,6 +1091,13 @@ time-gpu-ds41 *ARGS:
 # has the prompt round-trip checks, ik's command line and the summary line. Example: `just time-ik-draft prose 96 dspark`.
 time-ik-draft CORPUS N ARM="dspark":
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
+
+# ik's Qwen3.8 (qwen4exp) decode on the first 512 ids of $BLOOMERY_DATA/qwen4exp/corpus-<CORPUS>.ids, plain or with the
+# shared MTP draft, under the lease on the A6000 (lead-only): the run the MTP acceptance per window is read from. The mtp
+# arm runs each stage of BLOOMERY_IK_SPEC (default `mtp:n_max=3,p_min=0.0`; a `;`-separated list is a threshold sweep in one lease);
+# tools/ref/ik-draft.sh's header has the checks, the rows and the threshold table. Example: `just time-ik-mtp prose 256`.
+time-ik-mtp CORPUS N ARM="mtp":
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh '{{precheck}} && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
 
 # mainline llama.cpp(V4.1 포트, 프로필의 LCPP)로 같은 corpus-<CORPUS>.ids 첫 512 id 프롬프트를 A6000에서 임대 안에 디코드한다(리드 전용):
 # `just time-gpu-ds41 --tokens <그 id> -n N`의 mainline 쌍둥이, llama-completion에 LCPP_CLI_FLAGS. 프롬프트 왕복 검사 둘과 요약 줄은
