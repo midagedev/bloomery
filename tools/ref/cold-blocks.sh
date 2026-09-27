@@ -1,9 +1,10 @@
 # shellcheck shell=bash
-# The depth runners' fault witness and engine blocks (depth-ds41.sh, depth-qwen3moe.sh): what the two
-# share of the cold tag and of BLOOMERY_AB_ORDER=blocks, one copy. Sourced; it defines constants and
-# functions and runs nothing. What a runner's own engines decide stays in that runner: which block an
-# arm belongs to (arm_block), how many token ids its process draws (arm_draws), the timed window's
-# start (REF_MARK, the `fed` line) and the header text that explains them.
+# The depth runners' fault witness, engine blocks and failed arms (depth-ds41.sh, depth-qwen3moe.sh): what
+# the two share of the cold tag, of BLOOMERY_AB_ORDER=blocks and of their FAIL rows, one copy. Sourced;
+# it defines constants and functions and runs nothing. What a runner's own engines decide stays in that
+# runner: which block an arm belongs to (arm_block), how many token ids its process draws (arm_draws),
+# the timed window's start (REF_MARK, the `fed` line), why an arm failed and the header text that
+# explains them.
 #
 # The cold tag. A row carries `majflt <n>`, the change in /proc/vmstat pgmajfault across the arm's
 # process, and `timed <n>`, the change over the row's measured window where the runner can see that
@@ -23,7 +24,14 @@
 # longest prompt. Under rotate (the default) every arm runs once a round. depth-ds41.sh's header has the
 # reasoning (Order, Discard).
 #
-# The runner defines, before blocks_plan: ARMS, A_KIND (ref for a reference arm), A_ENG, A_DEP, N,
+# The failed arms. An arm that fails prints a FAIL row where its row would be (arm_fail) and the runner goes
+# on; a counted arm's label drops out of the tables at that depth or P (failed_tally), and the runner ends
+# with the list and exit 1 (failed_end). A warm-up's or a discard's failure is `FAIL r0 …`, in the list and
+# dropping nothing. depth-ds41.sh's header has the contract (Failures).
+#
+# The runner defines, before arm_fail: ARM_FAIL_STEM, and CPU_BUSY_TAG and OTHER_BUSY_TAG (lease.sh,
+# timing-card.sh). Before failed_tally: sums and pp_sums, its decode and prefill records `label|key|…`.
+# Before blocks_plan: ARMS, A_KIND (ref for a reference arm), A_ENG, A_DEP, N,
 # arm_block <i> (the block's name), arm_draws <i> (the ids arm <i>'s process takes), ref_cmd <engine>
 # <dep> (REF_ARGS, honouring REF_K). Before blocks_dry: dry_cmd <i>, round_order <round> <i...>
 # (ORDER_ARMS, ORDER_LOADS), ROUNDS, AB_WARMUP. Before blocks_run: run_unit <round> <i...> and run_round
@@ -36,6 +44,49 @@ COLD_US=75 COLD_PCT=1
 # a block's discard. counted: whether the row goes into the sums and the row counts (only a ROW row does).
 ROW_TAG=ROW
 counted() { [ "$ROW_TAG" = ROW ]; }
+
+# The failed arms (the runners' Failures): FAILED, one `r<r> <label> <d|p>=<key> rc=<rc>` each, and
+# FAILED_KEYS, the `label|key` pairs of the counted ones, which the tables drop. The runner sets
+# ARM_FAIL_STEM, the prefix of each failed arm's output file (its own name without `.sh`).
+FAILED=() FAILED_KEYS=()
+# arm_fail <round> <label> <d=|p=key> <rc> <why> [<output>]: the FAIL row in place of the arm's row; the
+# output, when there is one, goes whole to a file (a loader's reason is many lines above its tail).
+arm_fail() {
+  local r=$1 label=$2 key=$3 rc=$4 why=$5 out=${6:-} f='' last
+  if [ -n "$out" ]; then
+    f=${TMPDIR:-/tmp}/$ARM_FAIL_STEM-${label//[^A-Za-z0-9_.=-]/_}-${key/=/}-r$r.log
+    printf '%s\n' "$out" > "$f"
+    last=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+    echo "$out" | tail -n 20 >&2
+    [ -z "$last" ] || why="$why; last line: $last"
+  fi
+  echo "FAIL r$r $label $key rc=$rc | $why${f:+ | full output: $f}$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+  FAILED+=("r$r $label $key rc=$rc")
+  counted || return 0
+  FAILED_KEYS+=("$label|${key#*=}")
+}
+# drop_failed: the records `label|key|…` on stdin, less those whose `label|key` a counted arm failed at.
+drop_failed() {
+  awk -F'|' -v ex="$(printf '%s\n' "${FAILED_KEYS[@]}")" '
+    BEGIN { n = split(ex, e, "\n"); for (i = 1; i <= n; i++) if (e[i] != "") x[e[i]] = 1 }
+    !(($1 "|" $2) in x)'
+}
+# failed_tally: the closing summary's failed-arm count and, when a counted arm failed, the list of what
+# drops, with those records removed from the runner's decode and prefill records (sums, pp_sums).
+failed_tally() {
+  echo "failed arms: ${#FAILED[@]} (FAIL rows, the warm-up's or the discards' included)"
+  [ ${#FAILED_KEYS[@]} -gt 0 ] || return 0
+  echo "=== dropped from the means and the ratios below, a failed arm each (the FAIL rows above) ==="
+  printf '%s\n' "${FAILED_KEYS[@]}" | sort -u | awk -F'|' '{ printf "    dropped: %s at %s\n", $1, $2 }'
+  [ ${#sums[@]} -eq 0 ] || mapfile -t sums < <(printf '%s\n' "${sums[@]}" | drop_failed)
+  [ ${#pp_sums[@]} -eq 0 ] || mapfile -t pp_sums < <(printf '%s\n' "${pp_sums[@]}" | drop_failed)
+}
+# failed_end: the runner's last line when an arm failed, `failed arms: <each>; …`, and exit 1.
+failed_end() {
+  [ ${#FAILED[@]} -gt 0 ] || return 0
+  echo "failed arms: $(printf '%s; ' "${FAILED[@]}")"
+  exit 1
+}
 
 majflt_now() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 # majflt_require <runner>: exit 2 before the lease when /proc/vmstat has no pgmajfault.
@@ -217,6 +268,22 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   counted && c2=y || c2=n
   ROW_TAG=ROW
   check counted "$c1$c2" yn
+  # The FAIL row and the failed list: a round's arm with its output (the file and the last line), a
+  # discard's without one (in the list, dropping nothing), and the drop of a counted arm's label at its key.
+  TMPDIR=$(mktemp -d) ARM_FAIL_STEM=runner CPU_BUSY_TAG='' OTHER_BUSY_TAG=' [other-busy]'
+  row=$(arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" "$(printf 'load\nggml_cuda_error: x\n\n')" 2> /dev/null)
+  check fail-row "$row" "FAIL r1 lcpppp4096 p=4096 rc=134 | no 'pp4096' row; last line: ggml_cuda_error: x | full output: $TMPDIR/runner-lcpppp4096-p4096-r1.log [other-busy]"
+  check fail-file "$(cat "$TMPDIR/runner-lcpppp4096-p4096-r1.log" 2> /dev/null | head -n 2 | paste -sd'|' -)" "load|ggml_cuda_error: x"
+  arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" > /dev/null
+  ROW_TAG=DISCARD
+  row=$(arm_fail 0 'ours@X=1' d=6 3 "exited 3")
+  arm_fail 0 'ours@X=1' d=6 3 "exited 3" > /dev/null
+  ROW_TAG=ROW
+  check fail-discard "$row" "FAIL r0 ours@X=1 d=6 rc=3 | exited 3 [other-busy]"
+  check fail-list "$(printf '%s; ' "${FAILED[@]}")|${FAILED_KEYS[*]}" "r1 lcpppp4096 p=4096 rc=134; r0 ours@X=1 d=6 rc=3; |lcpppp4096|4096"
+  check fail-drop "$(printf 'lcpppp4096|4096|1|9\nlcpppp4096|512|1|9\nours|4096|1|9\n' | drop_failed | paste -sd';' -)" "lcpppp4096|512|1|9;ours|4096|1|9"
+  rm -rf "$TMPDIR"
+  FAILED=() FAILED_KEYS=()
   # The planner: ours 6 and 512 (prompts), a reference engine `x` at K 26 whose pp arm draws 2P, the same
   # engine's `xk` arm at K 30 in the same block, and a `y` engine with no K. Draws: x:6 -> 105, x:512 ->
   # 1024 (pp), xk:6 -> 105, y:4 -> 8.
