@@ -33,6 +33,12 @@
 #   GLM_PROSE_SHA256  prompt, below) and their sha256
 #   GLM_HOT         the card hot list under $BLOOMERY_DATA (`just hotlist all glm5next-hotlist.txt
 #                   glm5next-prose`: 42 layers x 288 ids ranked over 50,000 prose tokens)
+#   GLM_HOT_TRACE   the ids of GLM_PROSE that trace was made of: the first 50,000 (router-trace.sh
+#                   prose --max-tokens 50000; router_trace.cpp reads the file's first --max-tokens ids;
+#                   the set's manifest `# complete 50000 42`)
+#   GLM_PROSE_FROM  the 0-based index of the first prompt id depth-glm5next.sh feeds: GLM_HOT_TRACE,
+#                   so the measured prompt is text the hot list never saw (docs/fair-measure.md 4.2);
+#                   71,727 - 50,000 = 21,727 ids remain, more than any context the plan allows
 #
 # The public lines (tools/ref/depth-glm5next.sh, `just depth-gpu-glm5next`). Mainline llama.cpp does
 # not build glm5next; two open PR branches do, each in a tree of its own built with mainline's CMake
@@ -88,6 +94,14 @@
 #                   speculation; llama-server prints the draft acceptance and returns it in `timings`
 #   LCPP27752_SRV_FLAGS, LCPP27754_SRV_FLAGS  the CLI flags with one slot (-np 1: the automatic slots
 #                   would set four and a unified cache)
+#   GLM_PREHEAT_K   the --n-cpu-moe K whose host set (tools/ref/gguf-ranges.py host) depth-glm5next.sh
+#                   preheats before our arms and the fit twins: 45, every routed expert of blocks 3-44
+#                   and token_embd. Blocks 3-44 are the engine's routed layers (blk.45, NextN, is no
+#                   arm's host set but an MTP context's, whose leading-layer rule puts it on the card),
+#                   so the set holds ours' host experts under any card rule — id prefix or hot list, the
+#                   plan line's card_experts 39,941,832,704 B plus host_experts 145,536,581,632 B are
+#                   exactly blocks 3-44's 185,478,414,336 — and a fit twin's trailing blocks. It is
+#                   185.5 GB and token_embd of the 199.7 GB file, which the page cache holds whole
 #   GLM_NCMOE_MTP   the MTP arm's --n-cpu-moe, GLM_NCMOE + 1: an MTP context loads the NextN block
 #                   (blk.45, 4,378,853,376 B of experts and 200,306,816 B beside them), which the
 #                   leading-layer rule keeps on the card, so one more block goes to the host: blocks
@@ -141,6 +155,8 @@ REF_DUMP_LEASE=1
 GLM_PROSE=glm5next/corpus-prose.ids
 GLM_PROSE_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64
 GLM_HOT=router/glm5next-hotlist.txt
+GLM_HOT_TRACE=50000
+: "${GLM_PROSE_FROM:=$GLM_HOT_TRACE}"
 : "${LCPP27752:=/home/user/llama.cpp-pr27752}"
 : "${LCPP27752BIN:=$LCPP27752/build/bin/llama-bench}"
 : "${LCPP27754:=/home/user/llama.cpp-pr27754}"
@@ -163,6 +179,7 @@ fi
 : "${LCPP27752SRV:=$LCPP27752/build/bin/llama-server}"
 : "${LCPP27754SRV:=$LCPP27754/build/bin/llama-server}"
 : "${GLM_NCMOE_MTP:=$((GLM_NCMOE + 1))}"
+: "${GLM_PREHEAT_K:=45}"
 : "${LCPP27752_SRV_FLAGS:=$LCPP27752_CLI_FLAGS -np 1}"
 : "${LCPP27754_SRV_FLAGS:=$LCPP27754_CLI_FLAGS -np 1}"
 : "${GLM_MTP_FLAGS:=--spec-type draft-mtp --spec-draft-n-max 2}"

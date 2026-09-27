@@ -14,12 +14,17 @@ place on the host under `-ngl N --n-cpu-moe K`:
     llama-bench's --n-cpu-moe adds (common/common.h LLM_FFN_EXPS_REGEX, llm_add_n_cpu_ffn_overrides;
     ik's llama-bench makes the same list);
   - token_embd.weight: both engines put the input embedding in the host input context.
+Leading dense layers (GLM's 0-2: no expert tensor of the file names them) add nothing: the override
+list matches nothing there. The first layer with expert tensors is f; every layer f..K-1 must have
+them, and the header's <arch>.leading_dense_block_count, when it has one, must be f — otherwise the
+set is refused (65) by name.
 It leaves out the engram tables (their loaders mark them lazy: a few rows a token, read through the
 mapping) and everything the engine uploads to the card, which it reads once at load, before its timer.
 N below block_count + 1 puts whole layers or the output head on the host, a set this rule does not
 model: refused (64). One line on stdout:
-    host K=<k> layers=<block_count> tensors=<n> bytes=<b> ranges=<r> shards=<s> exps_first=<B> exps_last=<B>
-exps_first/exps_last are layer 0's and layer K-1's expert bytes. With --out, the ranges as
+    host K=<k> layers=<block_count> tensors=<n> bytes=<b> ranges=<r> shards=<s> exps_first=<B> exps_last=<B> dense=<f>
+exps_first/exps_last are layer f's and layer K-1's expert bytes (0 for a layer outside the set), dense
+the leading dense layers' count f. With --out, the ranges as
 `<path>\\t<offset>\\t<length>` lines, contiguous tensors merged, in file order.
 
 `preheat` reads every range of FILE into the page cache: pread into a reused buffer per thread, the data
@@ -191,13 +196,17 @@ def shard_paths(first, meta):
 
 
 def tensors_of(first):
-    """(block_count, shards, [(path, name, abs offset, bytes)]) over the whole split set, sizes checked."""
+    """(block_count, shards, [(path, name, abs offset, bytes)], leading_dense_block_count or None) over the
+    whole split set, sizes checked."""
     meta, _, _, _, _ = header(first)
     arch = meta.get("general.architecture")
     arch = arch.decode() if isinstance(arch, bytes) else arch
     layers = meta.get(f"{arch}.block_count")
     if not isinstance(layers, int):
         raise Refusal(65, f"{first}: no {arch}.block_count")
+    dense = meta.get(f"{arch}.leading_dense_block_count")
+    if dense is not None and not isinstance(dense, int):
+        raise Refusal(65, f"{first}: {arch}.leading_dense_block_count {dense!r} is not an integer")
     shards = shard_paths(first, meta)
     out = []
     for i, p in enumerate(shards):
@@ -214,17 +223,28 @@ def tensors_of(first):
                 raise Refusal(65, f"{p}: tensor {name} is {n} B at {off}, but the next starts at {nxt}: "
                                   "the sizes do not tile the data")
             out.append((p, name, start + off, n))
-    return layers, len(shards), out
+    return layers, len(shards), out, dense
 
 
 def host_set(first, k, ngl):
-    """The --n-cpu-moe K host set: (layers, shards, [(path, name, offset, bytes)], exps bytes per layer)."""
-    layers, shards, ts = tensors_of(first)
+    """The --n-cpu-moe K host set: (layers, shards, [(path, name, offset, bytes)], exps bytes per layer, f),
+    f the first layer with routed experts. Layers 0..f-1 are the leading dense layers: no expert tensor
+    of the file names them, so the override list matches nothing there and they add nothing to the set.
+    Every layer f..K-1 must have experts; the header's leading_dense_block_count, when it has one, must
+    be f."""
+    layers, shards, ts, dense = tensors_of(first)
     if k < 0 or k > layers:
         raise Refusal(64, f"--n-cpu-moe {k} outside 0..{layers} (block_count)")
     if ngl is not None and ngl < layers + 1:
         raise Refusal(64, f"-ngl {ngl} < block_count + 1 = {layers + 1}: whole layers or the head on the host, "
                           "a set this rule does not model")
+    have = sorted({int(m.group(1)) for m in (EXPS.search(t[1]) for t in ts) if m})
+    if k and not have:
+        raise Refusal(65, f"{first}: no expert tensors in the file, so --n-cpu-moe {k} places nothing")
+    f = have[0] if have else layers
+    if dense is not None and dense != f:
+        raise Refusal(65, f"{first}: leading_dense_block_count {dense}, but the first layer with expert "
+                          f"tensors is {f}")
     sel, per = [], {}
     for p, name, off, n in ts:
         m = EXPS.search(name)
@@ -232,9 +252,12 @@ def host_set(first, k, ngl):
             sel.append((p, name, off, n))
             if m:
                 per[int(m.group(1))] = per.get(int(m.group(1)), 0) + n
-    if k and len(per) != k:
-        raise Refusal(65, f"{first}: expert tensors for {len(per)} of the layers 0..{k - 1}")
-    return layers, shards, sel, per
+    missing = [i for i in range(f, k) if i not in per]
+    if missing:
+        raise Refusal(65, f"{first}: no expert tensors in layer(s) {','.join(map(str, missing))} after the "
+                          f"first expert layer {f}, inside --n-cpu-moe {k}: a dense layer that is not "
+                          "leading, a set this rule does not model")
+    return layers, shards, sel, per, f
 
 
 def merge(sel):
@@ -265,7 +288,7 @@ def cmd_host(argv):
             raise Refusal(64, f"host: unexpected argument {a!r}")
     if first is None or k is None:
         raise Refusal(64, "usage: gguf-ranges.py host <first shard> --n-cpu-moe K [--ngl N] [--out FILE]")
-    layers, shards, sel, per = host_set(first, k, ngl)
+    layers, shards, sel, per, dense = host_set(first, k, ngl)
     ranges = merge(sel)
     total = sum(n for _, _, _, n in sel)
     if sum(r[2] for r in ranges) != total:
@@ -275,7 +298,7 @@ def cmd_host(argv):
             for p, off, n in ranges:
                 f.write(f"{p}\t{off}\t{n}\n")
     print(f"host K={k} layers={layers} tensors={len(sel)} bytes={total} ranges={len(ranges)} shards={shards} "
-          f"exps_first={per.get(0, 0)} exps_last={per.get(k - 1, 0)}")
+          f"exps_first={per.get(dense, 0)} exps_last={per.get(k - 1, 0)} dense={dense}")
 
 
 def preheat(ranges, threads, chunk):
@@ -423,6 +446,27 @@ def fixture(first):
     return first, second
 
 
+def glm_fixture(path, dense_key=2, exps_layers=(2, 3, 4)):
+    """A one-file GLM-shaped model: block_count 5, layers 0-1 dense (their FFN is plain ffn_up/down/gate),
+    routed experts (Q4_K) and shared experts (ffn_up_shexp, not an override target) in exps_layers, the
+    last of them standing for GLM's NextN block. dense_key is the header's leading_dense_block_count,
+    None for no key."""
+    kvs = [_kv_string("general.architecture", "glmt"), _kv_scalar("glmt.block_count", 4, 5)]
+    if dense_key is not None:
+        kvs.append(_kv_scalar("glmt.leading_dense_block_count", 4, dense_key))
+    ts = [("token_embd.weight", 0, [8, 3], b"\1" * 96)]
+    for i in range(5):
+        ts.append((f"blk.{i}.attn_q.weight", 1, [16, 2], b"\4" * 64))
+        if i in exps_layers:
+            ts.append((f"blk.{i}.ffn_up_shexp.weight", 1, [16, 2], b"\3" * 64))
+            ts += [(f"blk.{i}.ffn_{w}_exps.weight", 12, [256, 1, 2], bytes([16 + i]) * 288)
+                   for w in ("gate", "up", "down")]
+        else:
+            ts += [(f"blk.{i}.ffn_{w}.weight", 1, [16, 2], b"\2" * 64) for w in ("gate", "up", "down")]
+    write_gguf(path, kvs, ts)
+    return path
+
+
 def self_test():
     ok = True
 
@@ -433,12 +477,12 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as d:
         first, second = fixture(os.path.join(d, "m-00001-of-00002.gguf"))
-        layers, shards, sel, per = host_set(first, 1, 999)
+        layers, shards, sel, per, _ = host_set(first, 1, 999)
         names = sorted(n for _, n, _, _ in sel)
         check("K=1 selects token_embd and layer 0's experts",
               names == ["blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_exps.weight", "token_embd.weight"], names)
         check("K=1 bytes", sum(n for *_, n in sel) == 96 + 660 + 660, sum(n for *_, n in sel))
-        _, _, sel2, per2 = host_set(first, 2, None)
+        _, _, sel2, per2, _ = host_set(first, 2, None)
         check("K=2 adds layer 1's up and gate_up (the second shard)",
               per2 == {0: 1320, 1: 720} and sum(n for *_, n in sel2) == 96 + 1320 + 720, (per2, sel2))
         check("K=2 reads both shards", {p for p, *_ in sel2} == {first, second})
@@ -453,7 +497,7 @@ def self_test():
         check("the ranges hold token_embd, then layer 0's gate and down experts",
               blob[off:off + 96] == b"\1" * 96 and blob[off + 96:off + 756] == b"\2" * 660
               and blob[p0[1][1]:p0[1][1] + 660] == b"\3" * 660, p0)
-        _, _, sel0, _ = host_set(first, 0, None)
+        _, _, sel0, _, _ = host_set(first, 0, None)
         check("K=0 is token_embd alone", [n for _, n, _, _ in sel0] == ["token_embd.weight"], sel0)
         for args, code, what in (((first, 3, None), 64, "K past block_count"),
                                  ((first, 1, 2), 64, "-ngl below block_count + 1")):
@@ -462,6 +506,51 @@ def self_test():
                 check(f"refuses {what}", False, "no refusal")
             except Refusal as e:
                 check(f"refuses {what}", e.code == code, (e.code, str(e)))
+        # GLM's shape: leading dense layers hold no expert tensor, so they add nothing and do not count
+        # against K; a dense layer after the first expert layer, or a header whose
+        # leading_dense_block_count names another layer, is refused.
+        glm = glm_fixture(os.path.join(d, "glm.gguf"))
+        try:
+            layers5, _, selg, perg, dense = host_set(glm, 4, None)
+            namesg = sorted(n for _, n, _, _ in selg)
+            check("GLM K=4: token_embd and layers 2-3's experts, no dense or shared-expert tensor",
+                  dense == 2 and layers5 == 5 and perg == {2: 864, 3: 864} and namesg == sorted(
+                      ["token_embd.weight"] + [f"blk.{i}.ffn_{w}_exps.weight" for i in (2, 3)
+                                               for w in ("gate", "up", "down")]), (dense, perg, namesg))
+        except Refusal as e:
+            check("GLM K=4: token_embd and layers 2-3's experts, no dense or shared-expert tensor", False,
+                  (e.code, str(e)))
+        try:
+            _, _, selg5, perg5, _ = host_set(glm, 5, None)
+            check("GLM K=5 adds the last block's experts", sorted(perg5) == [2, 3, 4]
+                  and sum(n for *_, n in selg5) == 96 + 3 * 864, perg5)
+        except Refusal as e:
+            check("GLM K=5 adds the last block's experts", False, (e.code, str(e)))
+        try:
+            _, _, selg1, _, _ = host_set(glm, 1, None)
+            check("GLM K=1, inside the dense lead, is token_embd alone",
+                  [n for _, n, _, _ in selg1] == ["token_embd.weight"], selg1)
+        except Refusal as e:
+            check("GLM K=1, inside the dense lead, is token_embd alone", False, (e.code, str(e)))
+        try:
+            _, _, selk, perk, densek = host_set(glm_fixture(os.path.join(d, "glm-nokey.gguf"), None), 3, None)
+            check("GLM with no leading_dense_block_count key: the lead read from the tensors",
+                  densek == 2 and perk == {2: 864}, (densek, perk))
+        except Refusal as e:
+            check("GLM with no leading_dense_block_count key: the lead read from the tensors", False,
+                  (e.code, str(e)))
+        for path, k, what, frag in (
+                (glm_fixture(os.path.join(d, "gap.gguf"), None, (2, 4)), 5,
+                 "a dense layer after the first expert layer", "layer(s) 3 after the first expert layer 2"),
+                (glm_fixture(os.path.join(d, "key.gguf"), 1), 4,
+                 "a leading_dense_block_count the tensors contradict", "leading_dense_block_count 1"),
+                (glm_fixture(os.path.join(d, "dense.gguf"), None, ()), 2,
+                 "K > 0 on a file with no expert tensor", "no expert tensors in the file")):
+            try:
+                host_set(path, k, None)
+                check(f"refuses {what}", False, "no refusal")
+            except Refusal as e:
+                check(f"refuses {what}", e.code == 65 and frag in str(e), (e.code, str(e)))
         got, _ = preheat(rs, 3, 64)
         check("preheat reads every byte of the ranges", got == sum(r[2] for r in rs), got)
         out = os.path.join(d, "r.tsv")
