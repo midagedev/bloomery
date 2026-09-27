@@ -1,0 +1,27 @@
+[package]
+name = "bloomery-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+# The GPU side of a generation: `Session<B>`, one model on its card behind the runtime's traits
+# (`bloomery-runtime`), and the drafts that run on a card. No device code of its own; the models'
+# device crates come in by feature, so a binary links only the model it opens.
+[lib]
+name = "app"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gpu = { path = "../gpu" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-model = { path = "../model" }
+bloomery-runtime = { path = "../runtime" }
+# The V4.1 session and its DSpark draft on the other card (`arch::deepseek41`).
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
+cuda-core = { workspace = true, optional = true }
+
+[features]
+deepseek41 = ["dep:bloomery-gpu-deepseek41", "dep:cuda-core"]

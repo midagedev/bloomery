@@ -347,6 +347,8 @@ enum Cmd {
     Rollback(u32),
     /// The longest prefix of at most this many positions a rollback keeps.
     Keep(usize),
+    /// Nothing: the reply carries the position the model stands at.
+    Pos,
 }
 
 /// Its answer: the argmax and the logits of a `Next` (the kept length of a
@@ -357,7 +359,8 @@ struct Reply {
     pos: usize,
 }
 
-/// `serve::Engine` over a [`Generator`] that lives on its own thread.
+/// `serve::Engine` over a [`Generator`] that lives on its own thread. The
+/// position is the model's alone: every question about it goes to the thread.
 pub struct Ds41Engine {
     tx: Option<Sender<Cmd>>,
     rx: Receiver<Reply>,
@@ -366,7 +369,6 @@ pub struct Ds41Engine {
     ctx_max: usize,
     card: String,
     props: EngineProps,
-    pos: usize,
 }
 
 impl Ds41Engine {
@@ -412,7 +414,7 @@ impl Ds41Engine {
                 }
                 for cmd in cmds {
                     let result = match cmd {
-                        Cmd::Keep(n) => u32::try_from(keep(g.model(), n))
+                        Cmd::Keep(n) => u32::try_from(keep(g.model(), n.min(g.pos())))
                             .map(|k| (k, None))
                             .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
                         cmd => serve_cmd(&mut g, cmd, n_vocab, &prefill),
@@ -441,14 +443,11 @@ impl Ds41Engine {
             ctx_max,
             card,
             props,
-            pos: 0,
         })
     }
 
     fn call(&mut self, cmd: Cmd) -> Result<(u32, Option<Vec<f32>>), EngineError> {
-        let reply = self.ask(cmd)?;
-        self.pos = reply.pos;
-        reply.result.map_err(EngineError)
+        self.ask(cmd)?.result.map_err(EngineError)
     }
 
     /// One command and its reply, the position left to the caller.
@@ -512,6 +511,7 @@ fn serve_cmd<B: Rollback>(
             .reset()
             .map(|()| (0, None))
             .map_err(|e| format!("reset at position {at}: {e}")),
+        Cmd::Rollback(pos) if pos as usize == at => Ok((0, None)),
         Cmd::Rollback(pos) => g
             .model_mut()
             .rollback(pos)
@@ -520,6 +520,7 @@ fn serve_cmd<B: Rollback>(
         Cmd::Keep(n) => Err(format!(
             "a keep query of {n} reached the step loop; the engine thread answers it"
         )),
+        Cmd::Pos => Ok((0, None)),
     }
 }
 
@@ -559,17 +560,15 @@ impl Engine for Ds41Engine {
     /// thread that does not answer grants nothing: the caller resets, and the
     /// next call reports the thread.
     fn keepable(&self, n: usize) -> usize {
-        let n = n.min(self.pos);
         match self.ask(Cmd::Keep(n)).map(|r| r.result) {
             Ok(Ok((k, _))) => (k as usize).min(n),
             _ => 0,
         }
     }
 
+    /// A cut to where the model stands is nothing to do: the thread answers
+    /// it without a rollback.
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {
-        if n == self.pos {
-            return Ok(());
-        }
         let pos =
             u32::try_from(n).map_err(|_| EngineError(format!("cut to position {n}: past u32")))?;
         self.call(Cmd::Rollback(pos)).map(|_| ())
@@ -580,7 +579,10 @@ impl Engine for Ds41Engine {
     }
 
     fn describe(&self) -> String {
-        format!("card={} position={}", self.card, self.pos)
+        match self.ask(Cmd::Pos) {
+            Ok(r) => format!("card={} position={}", self.card, r.pos),
+            Err(e) => format!("card={} position unknown ({})", self.card, e.0),
+        }
     }
 
     fn props_engine(&self) -> EngineProps {

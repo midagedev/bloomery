@@ -1,0 +1,15 @@
+[package]
+name = "bloomery-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+# Host only, no dependency: the generation loop and the traits it drives. A target is whatever
+# implements them — the GPU session in `bloomery-app`, a mock in a test — so the loop, the stop
+# rule and the drafts' arithmetic are tested without a card.
+[lib]
+name = "runtime"
+
+[lints]
+workspace = true
