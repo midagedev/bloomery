@@ -18,6 +18,7 @@ use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
+use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, KvPlanes, StoreMut};
 use crate::elem::EmbedRowsArgs;
@@ -74,31 +75,52 @@ impl<'a> Ctx<'a> {
 }
 
 /// Enqueue the whole decode chain at m = 1: layer 0 with its embedding,
-/// every later layer reading the previous layer's output, then the head.
-/// The combine writes a layer's output where the next reader takes it — the
-/// arena's `x` for the next layer, the head's input after the last — so no
-/// copy crosses a layer boundary.
+/// every later layer reading the previous layer's output, then the head —
+/// the walk `(1, 1, Step)` ([`Program`]). The combine writes a layer's
+/// output where the next reader takes it — the arena's `x` for the next
+/// layer, the head's input after the last — so no copy crosses a layer
+/// boundary.
 pub(super) fn enqueue_chain(
     gpu: &Gpu,
     w: &Weights,
     b: &mut Body,
     head: &mut Head,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let last = b.plans.len() - 1;
-    for slot in 0..b.plans.len() {
-        let out = (slot == last).then(|| head.input_mut());
-        enqueue_layer(gpu, w, b, slot, slot == 0, out)?;
-        if let Some(t) = b.taps.as_mut() {
-            let src: &DeviceBuffer<f32> = if slot == last {
-                head.input_mut()
-            } else {
-                &b.s.x
-            };
-            t.rows[slot].copy_from_device_async(src, stream)?;
-        }
+    let Body {
+        hp,
+        plans,
+        kv,
+        rope,
+        s,
+        sp,
+        k,
+        head_state,
+        mma,
+        taps,
+        ..
+    } = b;
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+        table: &rope.table,
+    };
+    Program {
+        c: &c,
+        stores: kv.as_mut_slice(),
+        s,
+        io: &sp.io(),
+        m: 1,
+        tail: Tail::Step {
+            head,
+            state: head_state,
+            taps: taps.as_mut(),
+        },
     }
-    enqueue_head(gpu, w, &b.k, &mut b.head_state, head)
+    .walk()
 }
 
 /// Enqueue the one-row head: its norm and quantization, then the Q6_K
@@ -181,7 +203,8 @@ pub(super) struct PassCtx<'a> {
 /// Enqueue one prefill pass of `m` tokens over arena `s` from the input
 /// record windows in `io`: the embedding rows with the rows' positions and
 /// live key counts, then every layer at `m` rows, the combine leaving each
-/// layer's output in `x`. The same enqueues run eager and under a capture.
+/// layer's output in `x` — the walk `(1, m, Step)` ([`Program`]). The same
+/// enqueues run eager and under a capture.
 pub(super) fn enqueue_pass(
     c: &PassCtx<'_>,
     kv: &mut [KvPlanes],
@@ -189,11 +212,15 @@ pub(super) fn enqueue_pass(
     io: &Io<'_>,
     m: usize,
 ) -> Result<(), GpuError> {
-    for (slot, (p, kv)) in c.plans.iter().zip(kv.iter_mut()).enumerate() {
-        let lc = Ctx::new(c.gpu, c.w, (p, slot), c.k, c.mma, c.eps, c.table)?;
-        layer(&lc, StoreMut::Kv(kv), s, io, m, slot == 0, None)?;
+    Program {
+        c,
+        stores: kv,
+        s,
+        io,
+        m,
+        tail: Tail::Pass,
     }
-    Ok(())
+    .walk()
 }
 
 /// Enqueue the head after the last prefill pass of `m` tokens: that pass's
