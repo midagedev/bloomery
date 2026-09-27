@@ -72,8 +72,8 @@ mod gate {
     use bloomery_gpu_gates::qwen3moe::{AttnRows, HEAD, head_norm, neox_rotate, sets};
     use bloomery_gpu_gates::rounding::U_F32;
     use bloomery_gpu_gates::{
-        GateError, bits_equal, checks_failed, ik_norm, max_ulps, open_split, same_bits, split_f32,
-        verdict,
+        GateError, RefManifest, bits_equal, checks_failed, ik_norm, max_ulps, open_split,
+        same_bits, split_f32, verdict,
     };
     use gguf::Split;
     use gguf::quant::f32_to_f16_bits;
@@ -134,34 +134,31 @@ mod gate {
             gpu.device_name()?,
             hp.n_layer
         );
-        let norm_ok = norm_clause(&gpu, &k, &split, &hp)?;
+        let sets = read_sets(&split, &hp)?;
+        let norm_ok = norm_clause(&gpu, &k, &sets, &hp)?;
 
         // The turn and the append.
         let (mut sites, mut failed) = (0u32, 0u32);
-        for (label, man) in sets()? {
+        for SetLayers { label, man, layers } in &sets {
             let mut worst = 0.0f32;
             let mut pos_seen = Vec::new();
-            for layer in 0..hp.n_layer {
-                let rows = AttnRows::read(&man, layer)?
-                    .ok_or_else(|| format!("{label}: no Qcur_normed-{layer}"))?;
+            for (layer, Layer { rows, gq, gk }) in layers.iter().enumerate() {
                 pos_seen.clone_from(&rows.pos);
-                let gq = split_f32(&split, &rows.gq_name, HEAD)?;
-                let gk = split_f32(&split, &rows.gk_name, HEAD)?;
                 let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
                 let tab = table_rows(&table, &mut grown, ctx)?;
                 let cs = rows_at(tab, &rows.pos);
                 let (n_kv, m) = (rows.n_kv, rows.m);
 
                 // Layer 1: the kernel against our rule, and a rerun.
-                let a = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
-                let b = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
+                let a = run_neox(&k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+                let b = run_neox(&k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
                 let norm = |x: &[f32], g: &[f32]| -> Vec<f32> {
                     x.chunks(HEAD)
                         .flat_map(|h| head_norm(h, g, hp.rms_eps))
                         .collect()
                 };
-                let hq = neox_rotate(&norm(&rows.q, &gq), &cs, rows.n_head);
-                let hk = neox_rotate(&norm(&rows.k, &gk), &cs, n_kv);
+                let hq = neox_rotate(&norm(&rows.q, gq), &cs, rows.n_head);
+                let hk = neox_rotate(&norm(&rows.k, gk), &cs, n_kv);
                 let exact = bits_equal(&a.q, &hq) && bits_equal(&a.k, &hk);
                 let mut want_k = vec![SENTINEL; n_kv * ctx * HEAD];
                 let mut want_v = want_k.clone();
@@ -261,15 +258,12 @@ mod gate {
         }
         // The launch as a captured graph: one node, the replay equal to the
         // eager launch on step 4's layer 0.
-        let sets = sets()?;
-        let (label, man) = &sets[1];
-        let rows = AttnRows::read(man, 0)?.ok_or_else(|| format!("{label}: no layer 0"))?;
-        let gq = split_f32(&split, &rows.gq_name, HEAD)?;
-        let gk = split_f32(&split, &rows.gk_name, HEAD)?;
+        let SetLayers { label, layers, .. } = &sets[1];
+        let Layer { rows, gq, gk } = &layers[0];
         let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
         let tab = table_rows(&table, &mut grown, ctx)?;
-        let eager = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
-        let (replay, nodes) = run_graph(&gpu, &k, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
+        let eager = run_neox(&k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let (replay, nodes) = run_graph(&gpu, &k, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
         let same = bits_equal(&eager.q, &replay.q)
             && bits_equal(&eager.k, &replay.k)
             && eager.cache_k == replay.cache_k
@@ -298,11 +292,44 @@ mod gate {
         Ok(())
     }
 
-    /// The norm clause (module doc): whether it held.
+    /// One layer of a set, read once for both clauses: ik's rows and the
+    /// layer's q and k norm gains.
+    struct Layer {
+        rows: AttnRows,
+        gq: Vec<f32>,
+        gk: Vec<f32>,
+    }
+
+    /// One qwen3moe set with each of its layers read.
+    struct SetLayers {
+        label: &'static str,
+        man: RefManifest,
+        layers: Vec<Layer>,
+    }
+
+    /// Every qwen3moe set ([`sets`], in its order) with each of its layers
+    /// read.
+    fn read_sets(split: &Split, hp: &Hparams) -> Result<Vec<SetLayers>, GateError> {
+        let mut out = Vec::new();
+        for (label, man) in sets()? {
+            let mut layers = Vec::with_capacity(hp.n_layer);
+            for layer in 0..hp.n_layer {
+                let rows = AttnRows::read(&man, layer)?
+                    .ok_or_else(|| format!("{label}: no Qcur_normed-{layer}"))?;
+                let gq = split_f32(split, &rows.gq_name, HEAD)?;
+                let gk = split_f32(split, &rows.gk_name, HEAD)?;
+                layers.push(Layer { rows, gq, gk });
+            }
+            out.push(SetLayers { label, man, layers });
+        }
+        Ok(out)
+    }
+
+    /// The norm clause (module doc) over the sets' layers: whether it held.
     fn norm_clause(
         gpu: &Gpu,
         k: &RopeNeoxKernels,
-        split: &Split,
+        sets: &[SetLayers],
         hp: &Hparams,
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
@@ -317,26 +344,22 @@ mod gate {
             hp.rms_eps
         );
         let (mut sites, mut failed) = (0u32, 0u32);
-        for (label, man) in sets()? {
+        for SetLayers { label, man, layers } in sets {
             let mut worst = 0.0f32;
             let (mut same_q, mut same_k, mut n_q, mut n_k) = (0usize, 0usize, 0usize, 0usize);
-            for layer in 0..hp.n_layer {
-                let rows = AttnRows::read(&man, layer)?
-                    .ok_or_else(|| format!("{label}: no Qcur_normed-{layer}"))?;
-                let gq = split_f32(split, &rows.gq_name, HEAD)?;
-                let gk = split_f32(split, &rows.gk_name, HEAD)?;
+            for (layer, Layer { rows, gq, gk }) in layers.iter().enumerate() {
                 let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
                 let identity: Vec<f32> = (0..ctx * HEAD / 2).flat_map(|_| [1.0, 0.0]).collect();
 
                 // Layer 1: the kernel against our rule, and a rerun.
-                let a = run_neox(k, stream, unl, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
-                let b = run_neox(k, stream, unl, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
+                let a = run_neox(k, stream, unl, rows, gq, gk, &identity, hp.rms_eps, ctx)?;
+                let b = run_neox(k, stream, unl, rows, gq, gk, &identity, hp.rms_eps, ctx)?;
                 let host = |x: &[f32], g: &[f32]| -> Vec<f32> {
                     x.chunks(HEAD)
                         .flat_map(|h| head_norm(h, g, hp.rms_eps))
                         .collect()
                 };
-                let (hq, hk) = (host(&rows.q, &gq), host(&rows.k, &gk));
+                let (hq, hk) = (host(&rows.q, gq), host(&rows.k, gk));
                 let exact = bits_equal(&a.q, &hq) && bits_equal(&a.k, &hk);
                 let rerun = bits_equal(&a.q, &b.q) && bits_equal(&a.k, &b.k);
 
@@ -346,8 +369,8 @@ mod gate {
                         .flat_map(|h| ik_norm::fused(h, g, hp.rms_eps))
                         .collect()
                 };
-                let sim_q = same_bits(&sim(&rows.q, &gq), &rows.q_normed);
-                let sim_k = same_bits(&sim(&rows.k, &gk), &rows.k_normed);
+                let sim_q = same_bits(&sim(&rows.q, gq), &rows.q_normed);
+                let sim_k = same_bits(&sim(&rows.k, gk), &rows.k_normed);
                 let sim_ok = sim_q == rows.q_normed.len() && sim_k == rows.k_normed.len();
 
                 // Layer 3: the kernel against the dump, per value.

@@ -54,8 +54,11 @@ pub fn renorm_divisor(sum: f32) -> f32 {
 }
 
 /// `1 / (1 + e^-x)` in f32, the scalar form of ggml's `ggml_vec_sigmoid_f32`.
-/// No kernel routes with it yet: the wrapper that does brings the gate that
-/// pins it against its reference.
+/// The gated router (`arch::qwen3moe::router::gated`) weighs its shared
+/// expert's slot with it, and `gated_quant` gates the attention output with
+/// it; `gate-gpu-qwen35moe-moe` holds the slot's weight within its band of
+/// this function run on the host. No kernel takes it as a top-k score
+/// ([`Sigmoid`]).
 #[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())

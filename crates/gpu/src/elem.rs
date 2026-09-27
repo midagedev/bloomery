@@ -305,8 +305,10 @@ pub(crate) fn silu_mul(g: f32, u: f32) -> f32 {
 
 /// Token `t`'s output value `d` of the routed-expert combine:
 /// `Σ_e w[t·n_exp + e] · down[(t·n_exp + e)·rows + d]`, experts ascending in
-/// the buffer's expert axis, one plain multiply then add per term (no fused
-/// multiply-add), so the sequence of adds is fixed.
+/// the buffer's expert axis, from 0. The device build contracts each
+/// `acc + w·d` into one fused multiply-add, so a host transcription is
+/// `acc = w.mul_add(d, acc)` per term, not a multiply then an add; the
+/// sequence of terms is fixed.
 ///
 /// Caller contract: `down.len() >= rows * n_exp * m`, `w.len() >= n_exp * m`,
 /// `t < m`, `d < rows`.
