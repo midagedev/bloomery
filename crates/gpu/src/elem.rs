@@ -186,6 +186,18 @@ pub(crate) fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
     q as f32 * d1 - m1
 }
 
+/// `v` as a position or live key count word: `v` while it fits a u32, else
+/// `u32::MAX` — a value past every cache, which the rope and the flash
+/// refuse, where a wrapped one would name a plausible row.
+#[inline(always)]
+fn position_word(v: usize) -> u32 {
+    if v > u32::MAX as usize {
+        u32::MAX
+    } else {
+        v as u32
+    }
+}
+
 /// The partial sum of squares thread `tid` of an [`RMS_THREADS`] block owns
 /// for the row of `k` values at `base`: values `tid, tid + RMS_THREADS, …`
 /// ascending, each square added with one fused multiply-add (the device
@@ -387,10 +399,19 @@ mod elem_kernels {
 
     /// Dequantize `ids.len()` rows of the Q4_K embedding table `w` (`36 ·
     /// n_sb` u32 words per row, `256 · n_sb` values) into `y`, token-major,
-    /// one thread per value through [`q4k_embed_value`]. Q4_K rows are whole
-    /// words, so no funnel is needed. An id past the table's `n_rows` rows
-    /// raises [`FaultSite::TokenId`] and writes a NaN row, as `embed_rows`
-    /// does.
+    /// one thread per value through [`q4k_embed_value`], and give each row
+    /// its position and live key count: row `t` is position
+    /// `pos0[0] + first + t` (`first` the ids' offset in the input `pos0`
+    /// heads), its count one more, written by thread `t` into `pos[t]` and
+    /// `n_keys[t]` through [`position_word`]. Q4_K rows are whole words, so
+    /// no funnel is needed.
+    /// An id past the table's `n_rows` rows raises [`FaultSite::TokenId`]
+    /// and writes a NaN row, as `embed_rows` does; the positions do not
+    /// depend on the ids.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -398,18 +419,35 @@ mod elem_kernels {
         block = (256, 1, 1),
         requires = (
             w.len() >= 36 * n_sb * n_rows,
-            y.len() >= 256 * n_sb * ids.len()
+            y.len() >= 256 * n_sb * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
         )
     )]
     pub fn embed_rows_q4k(
         w: &[u32],
         ids: &[u32],
+        pos0: &[u32],
+        first: u32,
         n_rows: u32,
         n_sb: u32,
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
     ) {
         let i = thread::index_1d().get();
+        if i < ids.len() {
+            // SAFETY: pos0 holds a word by the launch contract.
+            let p = unsafe { *pos0.get_unchecked(0) } as usize + first as usize + i;
+            // SAFETY: i < ids.len() <= pos.len(), n_keys.len() by the launch
+            // contract; thread i owns entry i of both.
+            unsafe {
+                *pos.get_unchecked_mut(i) = position_word(p);
+                *n_keys.get_unchecked_mut(i) = position_word(p + 1);
+            }
+        }
         let width = 256 * n_sb as usize;
         if i >= ids.len() * width {
             return;
@@ -909,6 +947,20 @@ mod elem_kernels {
     }
 }
 
+/// [`ElemKernels::enqueue_embed_rows_q4k`]'s arguments: the Q4_K table, one
+/// unit's ids, the word holding the first position of the input the ids are
+/// a window of and the window's offset in that input (`first`), and the
+/// three outputs — the rows, each row's position and its live key count.
+pub struct EmbedRowsArgs<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub pos0: &'a DeviceBuffer<u32>,
+    pub first: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+    pub pos: &'a mut DeviceBuffer<u32>,
+    pub n_keys: &'a mut DeviceBuffer<u32>,
+}
+
 /// The loaded P4 device module. Owns no context and no stream — the caller
 /// passes the engine stream (`Gpu::stream()`) per enqueue, so launches order
 /// with the rest of the step and are capturable.
@@ -980,21 +1032,30 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// Enqueue the Q4_K embedding lookup: `ids` (device-resident token ids)
-    /// each select one row of `w` (`36 · n_sb` u32 words per row, `256 ·
-    /// n_sb` values, `n_sb = w.cols() / 36`), dequantized into `y`
-    /// token-major. Bit-identical to `gguf::quant::dequant_row` on the same
-    /// row bytes. An id past the table raises [`FaultSite::TokenId`] as
-    /// [`Self::enqueue_embed_rows`] does. Asynchronous, allocation-free,
-    /// capturable.
+    /// Enqueue the Q4_K embedding lookup of one unit of rows: `args.ids`
+    /// (device-resident token ids) each select one row of `args.w` (`36 ·
+    /// n_sb` u32 words per row, `256 · n_sb` values, `n_sb = w.cols() / 36`),
+    /// dequantized into `args.y` token-major, and row `t`'s position `pos0 +
+    /// first + t` and live key count one more go into `args.pos[t]` and
+    /// `args.n_keys[t]` ([`EmbedRowsArgs`]). The rows are bit-identical to
+    /// `gguf::quant::dequant_row` on the same row bytes. An id past the table
+    /// raises [`FaultSite::TokenId`] as [`Self::enqueue_embed_rows`] does.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_embed_rows_q4k(
         &self,
         stream: &CudaStream,
-        w: &DeviceTensor<u32>,
-        ids: &DeviceBuffer<u32>,
-        y: &mut DeviceBuffer<f32>,
+        args: EmbedRowsArgs<'_>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_embed_rows_q4k";
+        let EmbedRowsArgs {
+            w,
+            ids,
+            pos0,
+            first,
+            y,
+            pos,
+            n_keys,
+        } = args;
         if w.rows() == 0 || w.cols() == 0 || !w.cols().is_multiple_of(36) {
             return Err(GpuError::shape(
                 what,
@@ -1015,15 +1076,40 @@ impl ElemKernels {
                 format!("y.len() {} < {}*{}", y.len(), 256 * n_sb, ids.len()),
             ));
         }
+        if pos0.is_empty() || pos.len() < ids.len() || n_keys.len() < ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "pos0 holds {} words (want 1), pos {} and n_keys {} (want {} each)",
+                    pos0.len(),
+                    pos.len(),
+                    n_keys.len(),
+                    ids.len()
+                ),
+            ));
+        }
         let grid = launch_u32(what, "grid", (ids.len() * 256 * n_sb).div_ceil(256))?;
+        let first = launch_u32(what, "first", first)?;
         let n_rows = launch_u32(what, "w.rows()", w.rows())?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
             .prepare_embed_rows_q4k(LaunchConfig1D::new(grid, 256, 0))?;
         let fault = crate::sink_over(&self.fault, LAYER_NONE);
-        self.module
-            .embed_rows_q4k(stream, &prep, w.buf(), ids, n_rows, n_sb, fault, y)?;
+        self.module.embed_rows_q4k(
+            stream,
+            &prep,
+            w.buf(),
+            ids,
+            pos0,
+            first,
+            n_rows,
+            n_sb,
+            fault,
+            y,
+            pos,
+            n_keys,
+        )?;
         Ok(())
     }
 

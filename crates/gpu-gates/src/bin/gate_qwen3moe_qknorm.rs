@@ -1,9 +1,9 @@
 //! GPU gate for qwen3moe's per-head RMS norm of the query and key heads
 //! (`attn_q_norm` / `attn_k_norm`), the first half of
 //! `rope_neox::head_norm_neox_append`, against ik's CPU dumps. The kernel
-//! runs with the identity table (every cos 1, every sin 0), under which the
-//! turn returns each normalized value unchanged, so its query and key heads
-//! are the norm alone.
+//! runs with the identity table (every cos 1, every sin 0, a row for each
+//! cache position), under which the turn returns each normalized value
+//! unchanged, so its query and key heads are the norm alone.
 //!
 //! Three layers per (set, layer):
 //! 1. the kernel against this binary's transcription of our rule
@@ -77,8 +77,8 @@ mod gate {
                     .ok_or_else(|| format!("{label}: no Qcur_normed-{layer}"))?;
                 let gq = split_f32(&split, &rows.gq_name, HEAD)?;
                 let gk = split_f32(&split, &rows.gk_name, HEAD)?;
-                let identity: Vec<f32> = (0..rows.m * HEAD / 2).flat_map(|_| [1.0, 0.0]).collect();
                 let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+                let identity: Vec<f32> = (0..ctx * HEAD / 2).flat_map(|_| [1.0, 0.0]).collect();
 
                 // Layer 1: the kernel against our rule, and a rerun.
                 let a = run_neox(&k, stream, unl, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;

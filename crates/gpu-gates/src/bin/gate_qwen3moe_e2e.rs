@@ -71,16 +71,18 @@
 //!   id more at 512 and at 4,096 (each ending in a one-id pass), and the
 //!   4,096 ids at 4,096 prefilled in two calls cut at [`W_SPLIT`]. Sizes
 //!   outside `1..=UBATCH` are refused with the size kept.
-//! - (t) the rope table: every row of the table the GEMM ubatches read — the
+//! - (t) the rope table: every row of the table all three paths read — the
 //!   cache's [`CTX`] positions, 0 and the last among them — holds
-//!   `RopeTable::push`'s bits for its position; and the first [`T_FIRST`]
-//!   prose ids from a reset, then the next [`T_NEXT`] as a continuation (its
-//!   first position [`T_FIRST`]), each prefilled on the GEMM path in
-//!   ubatches of [`T_UB`], leave every ubatch's rope window holding the rows
-//!   of its own positions, the first position past each ubatch boundary
-//!   among them. A window is read through the call the ubatch's rope launch
-//!   takes it from. The ubatch size is put back and the model reset after,
-//!   so the clauses after (t) run as they would without it.
+//!   `RopeTable::push`'s bits for its position. Each token reads the table
+//!   row of the position it is appended at (the rope kernel's one `pos`
+//!   word does both), so where the rows land shows which rows were read:
+//!   from a reset over cache rows seeded with the pattern, the first
+//!   [`T_FIRST`] prose ids and the next [`T_NEXT`] on the GEMM path in
+//!   ubatches of [`T_UB`], the next [`T_PASS`] on the pass path and
+//!   [`T_STEPS`] one-token steps leave every row below their end written in
+//!   every layer's K and V planes and every row past it still the pattern.
+//!   The ubatch size is put back and the model reset after, so the clauses
+//!   after (t) run as they would without it.
 //! - (x) a fault names its layer: layer [`FAULT_LAYER`]'s FFN half run alone
 //!   on a finite row with one NaN raises inside that layer's launches, and
 //!   the next step returns `GpuError::Fault` with that layer (the site is the
@@ -98,9 +100,10 @@
 //! files under DIR (`p{i}-{graph,eager,prefill}.{tokens,logits}`), and each
 //! (u) prompt's GEMM prefill — every layer's K/V rows (u16 LE, layer after
 //! layer as `kv_rows` returns them), the last logits and the greedy tokens
-//! after it (`u{n}-gemm.{kv,logits,tokens}`), for a byte comparison across
-//! builds (`md5sum DIR/*`). With `--gemm-only` only the (u) files are
-//! written.
+//! after it (`u{n}-gemm.{kv,logits,tokens}`) — and the same three of its
+//! one-token run (`u{n}-step.{kv,logits,tokens}`), for a byte comparison
+//! across builds (`md5sum DIR/*`). With `--gemm-only` only the (u) files
+//! are written.
 //!
 //! `--ppl TAG` instead scores the chain against ik's KL-divergence base file
 //! `$BLOOMERY_DATA/ikppl/TAG.kld` (`tools/ref/ik-ppl.sh --kld-base`): chunk by
@@ -122,9 +125,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillStep};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
@@ -1154,10 +1157,10 @@ mod gate {
         (num / den.max(f64::MIN_POSITIVE)).sqrt()
     }
 
-    /// One (u) prompt's GEMM prefill as raw little-endian files under `dir`
-    /// (`--dump`): every layer's K/V rows in `kv_rows` order, the last
-    /// logits, the greedy tokens after it.
-    fn dump_long(dir: &Path, n: usize, run: &LongRun) -> Result<(), GateError> {
+    /// One (u) run of a prompt of `n` ids as raw little-endian files under
+    /// `dir` named by `tag` (`--dump`): every layer's K/V rows in `kv_rows`
+    /// order, the last logits, the greedy tokens after it.
+    fn dump_long(dir: &Path, n: usize, tag: &str, run: &LongRun) -> Result<(), GateError> {
         std::fs::create_dir_all(dir)?;
         let kv: Vec<u8> = run
             .kv
@@ -1167,9 +1170,9 @@ mod gate {
             .collect();
         let l: Vec<u8> = run.logits.iter().flat_map(|v| v.to_le_bytes()).collect();
         let t: Vec<u8> = run.tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(dir.join(format!("u{n}-gemm.kv")), kv)?;
-        std::fs::write(dir.join(format!("u{n}-gemm.logits")), l)?;
-        std::fs::write(dir.join(format!("u{n}-gemm.tokens")), t)?;
+        std::fs::write(dir.join(format!("u{n}-{tag}.kv")), kv)?;
+        std::fs::write(dir.join(format!("u{n}-{tag}.logits")), l)?;
+        std::fs::write(dir.join(format!("u{n}-{tag}.tokens")), t)?;
         Ok(())
     }
 
@@ -1187,7 +1190,8 @@ mod gate {
             let gemm = long_run(m, ids, Some(PrefillPath::Auto), None)?;
             let wall = t0.elapsed().as_secs_f64();
             if let Some(dir) = dump_dir {
-                dump_long(dir, n, &gemm)?;
+                dump_long(dir, n, "step", &one)?;
+                dump_long(dir, n, "gemm", &gemm)?;
             }
             // The ruler: the same prompt on the other flash pass, eager.
             let mma = m.body("gemm_prefill")?.flash_mma();
@@ -1312,11 +1316,15 @@ mod gate {
     /// ubatch boundaries far below the cache's height.
     const T_UB: usize = 64;
 
-    /// (t)'s prompts: the first `T_FIRST` prose ids from a reset, then the
-    /// next `T_NEXT` as a continuation; at [`T_UB`] two and three ubatches,
-    /// the last of each short.
+    /// (t)'s calls, in order from a reset: the first `T_FIRST` prose ids and
+    /// the next `T_NEXT` on the GEMM path (at [`T_UB`] two and three
+    /// ubatches, the last of each short, the second call's first position
+    /// off every ubatch boundary), the next `T_PASS` on the pass path (a full
+    /// pass and a short one), then `T_STEPS` one-token steps.
     const T_FIRST: usize = 100;
     const T_NEXT: usize = 150;
+    const T_PASS: usize = MAX_TOKENS + 5;
+    const T_STEPS: usize = 3;
 
     /// The positions of `got`'s [`HEAD`]-value rows, the first at position
     /// `first`, whose bits are not `RopeTable::push`'s at that position.
@@ -1337,6 +1345,37 @@ mod gate {
         Ok(bad)
     }
 
+    /// Of `kv`'s rows (`kv_rows(ctx)` order: per layer, K then V, each head's
+    /// `ctx` rows), those below `end` still holding `seeded`'s bits and those
+    /// at or past it no longer holding them; `None` when the two differ in
+    /// shape.
+    fn rows_by_end(
+        kv: &[Vec<u16>],
+        seeded: &[Vec<u16>],
+        ctx: usize,
+        end: usize,
+    ) -> Option<(usize, usize)> {
+        let shaped = kv.len() == seeded.len()
+            && kv
+                .iter()
+                .zip(seeded)
+                .all(|(a, b)| a.len() == b.len() && a.len() % (ctx * HEAD) == 0);
+        if !shaped {
+            return None;
+        }
+        let (mut stale, mut stray) = (0, 0);
+        for (a, b) in kv.iter().zip(seeded) {
+            for (i, (x, y)) in a.chunks(HEAD).zip(b.chunks(HEAD)).enumerate() {
+                if i % ctx < end {
+                    stale += usize::from(x == y);
+                } else {
+                    stray += usize::from(x != y);
+                }
+            }
+        }
+        Some((stale, stray))
+    }
+
     /// (t) (module doc), on a model of `ctx` cache rows.
     fn rope_table(m: &mut Qwen3moeModel, ctx: usize) -> Result<bool, GateError> {
         let hp = m.body("rope_table")?.hparams().clone();
@@ -1345,52 +1384,60 @@ mod gate {
         let bad = rope_rows_differing(&rope, &table, 0)?;
         let table_ok = table.len() == ctx * HEAD && bad.is_empty();
         println!(
-            "rope table rows 0..{ctx} (among them position 0, {T_UB} and {} one past a ubatch \
-             boundary, the last {}): {} not RopeTable::push's bits (want 0){} {}",
-            T_FIRST + T_UB,
+            "rope table rows 0..{ctx} (position 0 to the last, {}): {} not RopeTable::push's bits \
+             (want 0){} {}",
             ctx - 1,
             bad.len(),
             bad.first()
                 .map_or(String::new(), |p| format!(", the first at position {p}")),
             verdict(table_ok)
         );
-        let prose = prose(T_FIRST + T_NEXT)?;
+        let end = T_FIRST + T_NEXT + T_PASS + T_STEPS;
+        let prose = prose(end)?;
         let kept = m.ubatch()?;
         m.set_ubatch(T_UB)?;
+        m.seed_depth(ctx - 1)?;
         m.reset()?;
-        let mut windows_ok = true;
-        for ids in [&prose[..T_FIRST], &prose[T_FIRST..]] {
-            let pos0 = m.pos() as usize;
-            let plan = m.prefill_plan(ids.len(), PrefillPath::Gemm)?;
-            m.prefill_with(ids, PrefillPath::Gemm)?;
-            let mut s = 0;
-            for step in &plan.steps {
-                let PrefillStep::Ubatch(t) = *step else {
-                    return Err(format!("the GEMM path's plan {plan} holds a pass").into());
-                };
-                let got = m.ubatch_rope_window(s, t)?;
-                let bad = rope_rows_differing(&rope, &got, pos0 + s)?;
-                let ok = got.len() == t * HEAD && bad.is_empty();
-                println!(
-                    "rope window: prompt from position {pos0}, ubatch of its tokens {s}..{} \
-                     (positions {}..{}): {} rows not RopeTable::push's bits for their position \
-                     (want 0) {}",
-                    s + t,
-                    pos0 + s,
-                    pos0 + s + t,
-                    bad.len(),
-                    verdict(ok)
-                );
-                windows_ok &= ok;
-                s += t;
+        let seeded = m.kv_rows(ctx)?;
+        let mut calls = Vec::new();
+        let mut at = 0;
+        for (n, path) in [
+            (T_FIRST, Some(PrefillPath::Gemm)),
+            (T_NEXT, Some(PrefillPath::Gemm)),
+            (T_PASS, Some(PrefillPath::Pass)),
+            (T_STEPS, None),
+        ] {
+            let ids = &prose[at..at + n];
+            match path {
+                Some(p) => {
+                    calls.push(format!("{at}: {}", m.prefill_plan(n, p)?));
+                    m.prefill_with(ids, p)?;
+                }
+                None => {
+                    calls.push(format!("{at}: {n} steps"));
+                    m.step(ids)?;
+                }
             }
+            at += n;
         }
+        let pos = m.pos() as usize;
+        let kv = m.kv_rows(ctx)?;
         m.set_ubatch(kept)?;
         m.reset()?;
-        let ok = table_ok && windows_ok;
+        let (stale, stray) = rows_by_end(&kv, &seeded, ctx, end)
+            .ok_or("kv_rows returned another shape after the calls")?;
+        let rows_ok = pos == end && stale == 0 && stray == 0;
         println!(
-            "rope: the table holds RopeTable::push's rows, and every ubatch window of a prompt \
-             and of its continuation the rows of its own positions {}",
+            "rope rows by position: calls from a reset over seeded rows [{}]: position {pos} (want \
+             {end}), rows below it still the seeded pattern {stale} (want 0), rows at or past it \
+             not the seeded pattern {stray} (want 0) {}",
+            calls.join("; "),
+            verdict(rows_ok)
+        );
+        let ok = table_ok && rows_ok;
+        println!(
+            "rope: the table holds RopeTable::push's rows, and the ubatch, the pass and the step \
+             each write their tokens' rows at their own positions and no other {}",
             verdict(ok)
         );
         Ok(ok)

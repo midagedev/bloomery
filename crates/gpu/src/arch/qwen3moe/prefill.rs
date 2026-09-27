@@ -28,39 +28,34 @@
 //! eager either way. The decode step's graph stays valid beside these: the
 //! two share the weights and the cache planes and nothing else.
 //!
-//! Inputs: the prompt's image — one [`BLOCK`] per pass of ids, positions,
-//! live key counts and rope rows — is written and copied to the card once
-//! per prompt. An eager pass reads its block where it lies. A captured pass
-//! reads the fixed-address slot instead, and each pass's block is copied
-//! into the slot in stream order right before its replay, so a replay reads
-//! this pass's tokens, not the ones it was captured over. The arena, the
-//! image (room for a prompt as long as the cache) and the slot are allocated
-//! at load; a prompt allocates nothing.
+//! Inputs: the prompt's image — one [`BLOCK`] per pass, the pass's input
+//! record (the position of its first token, then its ids) — is written into
+//! pinned host words and copied to the card once per prompt, asynchronously.
+//! A pass's embedding launch derives its rows' positions and live key counts
+//! from it on the card. An eager pass reads its block where it lies. A
+//! captured pass reads the fixed-address slot instead, and each pass's block
+//! is copied into the slot in stream order right before its replay, so a
+//! replay reads this pass's tokens, not the ones it was captured over. The
+//! arena, the image (room for a prompt as long as the cache) and the slot
+//! are allocated at load; a prompt allocates nothing.
 
 use super::body::Body;
 use super::dispatch::{self, PassCtx};
 use super::router::MAX_TOKENS;
-use super::scratch::{Arena, Dims, Io, param_view};
+use super::scratch::{Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
-use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
-use crate::rope_table::{Direction, RopeTable};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 
-/// Element offsets into one pass's block, image and slot alike:
-/// [`MAX_TOKENS`] ids, positions and live key counts (u32 each), then
-/// [`MAX_TOKENS`] rope rows of [`HEAD`] f32 as bits. A pass of `m` tokens
-/// fills the first `m` of each and reads only those.
-const B_TOKENS: usize = 0;
-const B_POS: usize = MAX_TOKENS;
-const B_N_KEYS: usize = 2 * MAX_TOKENS;
-const B_CS: usize = 3 * MAX_TOKENS;
-/// u32 words of one block.
-const BLOCK: usize = B_CS + MAX_TOKENS * HEAD;
+/// u32 words of one pass's block, image and slot alike: an input record of
+/// [`MAX_TOKENS`] ids. A pass of `m` tokens fills the first `m + 1` words
+/// and its launches read only those.
+const BLOCK: usize = IN_IDS + MAX_TOKENS;
 
 /// The prefill arena, the current prompt's image, the slot the captured
 /// passes read and the passes themselves.
@@ -68,19 +63,19 @@ pub(super) struct Prefill {
     /// The pass of `m` tokens captured over the slot, at `m − 1`. Declared
     /// first: fields drop in declaration order, and a graph is destroyed
     /// while the arena and the slot it addresses are alive (and, since
-    /// `Body` declares this struct first, the cache planes too).
+    /// `Body` declares this struct first, the cache planes and the rope
+    /// table too).
     graphs: Vec<Option<Graph>>,
     pub(super) a: Arena,
-    /// Pass `c`'s block of the current prompt at `c · BLOCK`, for as many
-    /// passes as a prompt of the cache's height takes.
-    image: DeviceBuffer<u32>,
-    image_host: Vec<u32>,
-    /// One position's rope row, reused for every token of a prompt.
-    cs_host: Vec<f32>,
+    /// The captured passes' windows onto the slot, `m` tokens at `m − 1`.
+    /// Declared before the slot, so they drop first (a window frees nothing
+    /// either way).
+    slot_windows: Vec<Windows>,
     /// The block every captured pass reads.
     slot: DeviceBuffer<u32>,
-    /// The captured passes' windows onto the slot, `m` tokens at `m − 1`.
-    slot_windows: Vec<Windows>,
+    /// Pass `c`'s block of the current prompt at `c · BLOCK`, for as many
+    /// passes as a prompt of the cache's height takes.
+    image: Inbox,
     /// Tokens of the prompt the image holds.
     len: usize,
     /// The pass whose block the slot holds, copied and not yet replayed.
@@ -90,15 +85,13 @@ pub(super) struct Prefill {
 /// One pass's windows onto a block, owned so that the arena can be borrowed
 /// beside them.
 pub(super) struct Windows {
-    tokens: ManuallyDrop<DeviceBuffer<u32>>,
-    pos: ManuallyDrop<DeviceBuffer<u32>>,
-    n_keys: ManuallyDrop<DeviceBuffer<u32>>,
-    cs: ManuallyDrop<DeviceBuffer<f32>>,
+    ids: ManuallyDrop<DeviceBuffer<u32>>,
+    pos0: ManuallyDrop<DeviceBuffer<u32>>,
 }
 
 impl Windows {
-    /// The first `m` entries of each array of the block at element `base`
-    /// of `parent`.
+    /// The pass of `m` tokens' windows onto the block at element `base` of
+    /// `parent`: its first `m` ids and its position word.
     ///
     /// # Safety
     ///
@@ -106,24 +99,21 @@ impl Windows {
     /// outlives the windows unmoved in memory (a captured graph bakes the
     /// addresses in).
     unsafe fn over(parent: &DeviceBuffer<u32>, base: usize, m: usize) -> Windows {
-        // SAFETY: each window lies inside the block (`B_*` layout, `m <=
-        // MAX_TOKENS`), which lies inside `parent` — the caller's contract.
+        // SAFETY: each window lies inside the block (`IN_POS0`, `IN_IDS` + `m`
+        // <= BLOCK), which lies inside `parent` — the caller's contract.
         unsafe {
             Windows {
-                tokens: param_view::<u32>(parent, base + B_TOKENS, m),
-                pos: param_view::<u32>(parent, base + B_POS, m),
-                n_keys: param_view::<u32>(parent, base + B_N_KEYS, m),
-                cs: param_view::<f32>(parent, base + B_CS, m * HEAD),
+                ids: param_view::<u32>(parent, base + IN_IDS, m),
+                pos0: param_view::<u32>(parent, base + IN_POS0, 1),
             }
         }
     }
 
     pub(super) fn io(&self) -> Io<'_> {
         Io {
-            tokens: &self.tokens,
-            pos: &self.pos,
-            n_keys: &self.n_keys,
-            cs: &self.cs,
+            ids: &self.ids,
+            pos0: &self.pos0,
+            first: 0,
         }
     }
 }
@@ -131,15 +121,15 @@ impl Windows {
 const WHAT: &str = "qwen3moe::prefill";
 
 impl Prefill {
-    /// The arena for [`MAX_TOKENS`] rows of `d`, an image for a prompt of
-    /// `ctx_max` tokens, the slot and its windows, no pass captured.
-    /// Load-time only.
-    pub(super) fn new(stream: &CudaStream, d: Dims, ctx_max: usize) -> Result<Prefill, GpuError> {
-        let blocks = ctx_max.div_ceil(MAX_TOKENS);
+    /// The arena for [`MAX_TOKENS`] rows of `d`, an image for a prompt as
+    /// long as the cache (`d.ctx` tokens), the slot and its windows, no pass
+    /// captured. Load-time only.
+    pub(super) fn new(stream: &CudaStream, d: Dims) -> Result<Prefill, GpuError> {
+        let blocks = d.ctx.div_ceil(MAX_TOKENS);
         let slot = DeviceBuffer::zeroed(stream, BLOCK)?;
         // SAFETY: the slot is one BLOCK and every `m <= MAX_TOKENS`; the slot
         // moves into the struct beside its windows (a move of the handle,
-        // not of the allocation), where it outlives them.
+        // not of the allocation), declared after them, so it outlives them.
         let slot_windows = unsafe {
             (1..=MAX_TOKENS)
                 .map(|m| Windows::over(&slot, 0, m))
@@ -148,64 +138,43 @@ impl Prefill {
         Ok(Prefill {
             graphs: (0..MAX_TOKENS).map(|_| None).collect(),
             a: Arena::new(stream, d, MAX_TOKENS)?,
-            image: DeviceBuffer::zeroed(stream, blocks * BLOCK)?,
-            image_host: Vec::with_capacity(blocks * BLOCK),
-            cs_host: Vec::with_capacity(HEAD),
-            slot,
             slot_windows,
+            slot,
+            image: Inbox::new(stream, blocks * BLOCK)?,
             len: 0,
             staged: None,
         })
     }
 
-    /// Write the image of `tokens` at positions `pos0 ..` and copy it to the
-    /// card. Synchronizes (the copy of a borrowed host slice does). A prompt
+    /// Write the image of `tokens` at positions `pos0 ..` — pass `c`'s block
+    /// the record of its tokens at `pos0 + c · MAX_TOKENS` — and enqueue its
+    /// copy to the card. Asynchronous: the passes behind it read it. A prompt
     /// of more passes than the image holds is refused.
-    fn write(
-        &mut self,
-        stream: &CudaStream,
-        rope: &RopeTable,
-        tokens: &[u32],
-        pos0: u32,
-    ) -> Result<(), GpuError> {
+    fn write(&mut self, stream: &CudaStream, tokens: &[u32], pos0: u32) -> Result<(), GpuError> {
         launch_u32(WHAT, "tokens", tokens.len())?;
         let passes = tokens.len().div_ceil(MAX_TOKENS);
-        let words = passes * BLOCK;
-        if words > self.image.len() {
+        let held = self.image.dev().len() / BLOCK;
+        if passes > held {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "{} tokens take {passes} passes; the image holds {}",
-                    tokens.len(),
-                    self.image.len() / BLOCK
+                    "{} tokens take {passes} passes; the image holds {held}",
+                    tokens.len()
                 ),
             ));
         }
         self.staged = None;
-        self.image_host.clear();
-        self.image_host.resize(words, 0);
-        let mut pos = pos0;
+        let host = self.image.host_mut()?;
+        let mut words = 0;
         for (chunk, run) in tokens.chunks(MAX_TOKENS).enumerate() {
-            let block = &mut self.image_host[chunk * BLOCK..(chunk + 1) * BLOCK];
-            for (t, &token) in run.iter().enumerate() {
-                block[B_TOKENS + t] = token;
-                block[B_POS + t] = pos;
-                block[B_N_KEYS + t] = pos + 1;
-                self.cs_host.clear();
-                rope.push(pos, Direction::Forward, &mut self.cs_host);
-                for (dst, v) in block[B_CS + t * HEAD..][..HEAD]
-                    .iter_mut()
-                    .zip(&self.cs_host)
-                {
-                    *dst = v.to_bits();
-                }
-                pos += 1;
-            }
+            let first = launch_u32(WHAT, "a pass's first token", chunk * MAX_TOKENS)?;
+            let at = pos0.checked_add(first).ok_or_else(|| {
+                GpuError::shape(WHAT, format!("position {pos0} + {first} past a u32"))
+            })?;
+            put_input(&mut host[chunk * BLOCK..], run, at)?;
+            words = chunk * BLOCK + IN_IDS + run.len();
         }
-        // SAFETY: `words <= self.image.len()` (checked above), so the window
-        // is inside it; it lives for this copy alone.
-        let mut dst = unsafe { param_view::<u32>(&self.image, 0, words) };
-        dst.copy_from_host(stream, &self.image_host)?;
+        self.image.upload(stream, words)?;
         self.len = tokens.len();
         Ok(())
     }
@@ -234,7 +203,7 @@ impl Prefill {
         // `ceil(len / MAX_TOKENS)` blocks `write` checked against the image,
         // so block `chunk` ends inside it; the windows live for one pass,
         // while the image stays in place.
-        Ok(unsafe { Windows::over(&self.image, chunk * BLOCK, m) })
+        Ok(unsafe { Windows::over(self.image.dev(), chunk * BLOCK, m) })
     }
 
     /// Copy pass `chunk`'s block of the image into the slot, in stream order
@@ -244,7 +213,7 @@ impl Prefill {
         // SAFETY: block `chunk` lies inside the image (`image_windows`'s
         // argument); the window lives for this enqueue, and the image stays
         // in place until the copy has run (it is reallocated only at load).
-        let src = unsafe { param_view::<u32>(&self.image, chunk * BLOCK, BLOCK) };
+        let src = unsafe { param_view::<u32>(self.image.dev(), chunk * BLOCK, BLOCK) };
         self.slot.copy_from_device_async(&src, stream)?;
         self.staged = Some(chunk);
         Ok(())
@@ -270,7 +239,7 @@ impl Prefill {
 
     /// Device bytes of the arena, the image and the slot.
     pub(super) fn bytes(&self) -> usize {
-        self.a.bytes() + self.image.num_bytes() + self.slot.num_bytes()
+        self.a.bytes() + self.image.bytes() + self.slot.num_bytes()
     }
 }
 
@@ -295,6 +264,7 @@ impl Body {
             hp,
             names,
             kv,
+            rope,
             k,
             mma,
             prefill,
@@ -307,6 +277,7 @@ impl Body {
             k,
             mma: *mma,
             eps: hp.rms_eps,
+            table: &rope.table,
         };
         let Prefill {
             graphs,
@@ -349,6 +320,7 @@ impl Body {
             hp,
             names,
             kv,
+            rope,
             k,
             mma,
             prefill,
@@ -361,6 +333,7 @@ impl Body {
             k,
             mma: *mma,
             eps: hp.rms_eps,
+            table: &rope.table,
         };
         dispatch::enqueue_pass(&c, kv, &mut prefill.a, &win.io(), m)
     }
@@ -484,20 +457,20 @@ impl std::fmt::Display for PrefillPlan {
 }
 
 impl Body {
-    /// Enqueue the ubatch of the ubatch image's tokens `s .. s + t` at
+    /// Enqueue the ubatch of the ubatch image's `tokens`, the first at
     /// position `pos`.
     fn run_ubatch(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        s: usize,
-        t: usize,
+        tokens: Range<usize>,
         pos: u32,
     ) -> Result<(), GpuError> {
         let Body {
             hp,
             names,
             kv,
+            rope,
             k,
             ub,
             ..
@@ -508,8 +481,9 @@ impl Body {
             names,
             k,
             eps: hp.rms_eps,
+            table: &rope.table,
         };
-        ub.enqueue(&c, kv, s, t, pos)
+        ub.enqueue(&c, kv, tokens, pos)
     }
 }
 
@@ -584,15 +558,13 @@ impl GpuModel<Body> {
                     format!("token {i} is id {id}, past the vocabulary of {n_vocab}"),
                 ));
             }
-            let Body {
-                prefill, ub, rope, ..
-            } = body;
+            let Body { prefill, ub, .. } = body;
             if n_ub > 0 {
                 ub.write(gpu.stream(), &tokens[..n_ub], pos0)?;
             }
             if !passes.is_empty() {
                 let pos_p = pos0 + launch_u32(WHAT, "ubatch tokens", n_ub)?;
-                prefill.write(gpu.stream(), rope, &tokens[n_ub..], pos_p)?;
+                prefill.write(gpu.stream(), &tokens[n_ub..], pos_p)?;
                 if graph {
                     for &m in &passes {
                         if body.prefill.graphs[m - 1].is_none() {
@@ -609,10 +581,10 @@ impl GpuModel<Body> {
             let last = i + 1 == n_steps;
             next = match step {
                 PrefillStep::Ubatch(t) => {
-                    let s0 = s;
+                    let tokens = s..s + t;
                     s += t;
                     self.run_rows(t, WHAT, |gpu, w, body, head, pos| {
-                        body.run_ubatch(gpu, w, s0, t, pos)?;
+                        body.run_ubatch(gpu, w, tokens, pos)?;
                         if last {
                             let row = body.ub.last_row(t)?;
                             head.input_mut()

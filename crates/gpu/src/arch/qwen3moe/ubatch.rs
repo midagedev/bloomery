@@ -24,16 +24,18 @@
 //! the values with f16 weights on the tensor cores, so the two paths agree to
 //! the error of those sums and roundings and are not bit-equal.
 //!
-//! Buffers. The arena holds `min(U, ctx)` rows of every intermediate. The
-//! prompt image has room for a prompt as long as the cache: its token ids,
-//! positions and live key counts, three arrays back to back over the
-//! prompt's tokens, written and copied to the card once per prompt as far as
-//! the prompt reaches. The rope table holds every cache position's rope row
-//! (`RopeTable::push`), made and copied once at load; a position's row does
-//! not depend on the prompt. A ubatch reads windows of the image and of the
-//! table. Nothing is allocated per prompt or per ubatch; a new `U`
-//! ([`Ubatch::resize`]) reallocates the arena alone. The ubatches run eager
-//! in both step modes, so no captured graph holds an arena address.
+//! Buffers. The arena holds `min(U, ctx)` rows of every intermediate, the
+//! rows' positions and live key counts among them. The prompt image is one
+//! input record with room for a prompt as long as the cache — the position
+//! of the prompt's first token, then its ids — written into pinned host
+//! words and copied to the card once per prompt, asynchronously, as far as
+//! the prompt reaches. A ubatch reads a window of the ids; its embedding
+//! launch writes its rows' positions (the image's position plus the
+//! window's offset plus the row) and live key counts, and the rope turns
+//! each row by the body's table at that position. Nothing is allocated per
+//! prompt or per ubatch; a new `U` ([`Ubatch::resize`]) reallocates the
+//! arena alone. The ubatches run eager in both step modes, so no captured
+//! graph holds an arena address.
 //!
 //! Sizes. No kernel of a ubatch needs more of `U` than `1..=UBATCH`: the
 //! route and the GEMM take any slot count up to [`GEMM_MAX_SLOTS`], the
@@ -41,17 +43,17 @@
 //! groups of eight, each guarding the last, and every other launch works per
 //! token or per slot.
 
-use super::body::{Body, Kernels, Kq, LayerNames};
+use super::body::{ATTN_SCALE, Body, Kernels, Kq, LayerNames};
 use super::experts::CombineArgs;
 use super::router::{N_EXPERT, N_USED, RouterOut};
-use super::scratch::{Dims, KvPlanes, f32_view, param_view};
+use super::scratch::{Dims, IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
+use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::HEAD;
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::rope_neox::NeoxArgs;
-use crate::rope_table::{Direction, RopeTable};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -114,6 +116,11 @@ pub(super) struct UbArena {
     /// The layer's input residual (the embedding rows for layer 0), and its
     /// output: the combine writes the next layer's input here.
     x: DeviceBuffer<f32>,
+    /// Row `t`'s position and live key count, which the embedding launch
+    /// writes: the rope turns by the table's row `pos[t]` and appends there,
+    /// the prefill flash attends over `n_keys[t]` keys.
+    pos: DeviceBuffer<u32>,
+    n_keys: DeviceBuffer<u32>,
     /// The normed rows of either norm: the quantizer's input, and the
     /// router's.
     normed: DeviceBuffer<f32>,
@@ -153,6 +160,8 @@ impl UbArena {
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(UbArena {
             x: f(rows * d.hidden)?,
+            pos: DeviceBuffer::zeroed(stream, rows)?,
+            n_keys: DeviceBuffer::zeroed(stream, rows)?,
             normed: f(rows * d.hidden)?,
             act_hid: GemmAct::new(stream, rows, d.hidden)?,
             q: f(rows * q_len)?,
@@ -190,6 +199,8 @@ impl UbArena {
             &self.down,
         ];
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.pos.num_bytes()
+            + self.n_keys.num_bytes()
             + [&self.act_hid, &self.act_attn, &self.act_h]
                 .iter()
                 .map(|a| a.bytes())
@@ -200,19 +211,13 @@ impl UbArena {
     }
 }
 
-/// Element offsets into the prompt image for a prompt of `n` tokens: its
-/// ids, its positions and its live key counts (u32 each), back to back.
-fn img_off(n: usize) -> (usize, usize, usize) {
-    (0, n, 2 * n)
-}
-
 /// What the GEMM prefill spends on the host outside its launches
 /// ([`GpuModel::ubatch_prologue`]).
 #[derive(Clone, Copy, Debug)]
 pub struct UbPrologue {
-    /// Rows of the rope table — the cache's positions — and the host time
-    /// that computed them at load: per row, the `RopeTable::push` of one
-    /// position.
+    /// Rows of the rope table every path reads — the cache's positions —
+    /// and the host time that computed them at load: per row, the
+    /// `RopeTable::push` of one position.
     pub table_rows: usize,
     pub table_build: Duration,
     /// The last prompt image written; `None` before a prompt took a ubatch.
@@ -220,7 +225,8 @@ pub struct UbPrologue {
 }
 
 /// One prompt image's write: its tokens, the bytes copied to the card, the
-/// host's fill of them and the copy, which synchronizes the stream.
+/// host's fill of them and the enqueue of their copy, which does not wait
+/// for it: the launches behind it do.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageWrite {
     pub tokens: usize,
@@ -229,81 +235,47 @@ pub struct ImageWrite {
     pub copy: Duration,
 }
 
-/// The prompt image and the rope table.
+/// The prompt image: one input record, the prompt's first position and its
+/// ids.
 struct UbImage {
-    /// The three arrays of the prompt the image holds, at `img_off(len)`;
-    /// room for a prompt of `cap` tokens.
-    buf: DeviceBuffer<u32>,
-    /// `buf`'s host side at its full length, filled at load (the value is
-    /// never read) so that a prompt's writes fault no page; a prompt of `n`
-    /// tokens writes and copies its first `3n` words.
-    host: Vec<u32>,
-    /// Position `p`'s rope row, [`HEAD`] f32 at `p · HEAD`, for every `p <
-    /// cap`: `RopeTable::push`'s bits, written once at load.
-    rope: DeviceBuffer<f32>,
-    /// Positions the image and the table have room for: the cache's rows.
+    /// The record, with room for a prompt of `cap` tokens; a prompt of `n`
+    /// tokens writes and copies its first `n + 1` words.
+    inbox: Inbox,
+    /// Tokens the image has room for, and positions the rope table holds:
+    /// the cache's rows.
     cap: usize,
     /// Tokens of the prompt the image holds (0 while it holds none), and the
     /// position of its first.
     len: usize,
     pos0: u32,
-    /// The table's build at load and the last prompt's write.
-    stat: UbPrologue,
+    /// The last prompt's write.
+    last: Option<ImageWrite>,
 }
 
-/// One ubatch's windows onto the image and the table.
+/// One ubatch's windows onto the image: its ids and the prompt's position
+/// word, and the ids' offset in the prompt.
 struct UbIo {
-    tokens: ManuallyDrop<DeviceBuffer<u32>>,
-    pos: ManuallyDrop<DeviceBuffer<u32>>,
-    n_keys: ManuallyDrop<DeviceBuffer<u32>>,
-    cs: ManuallyDrop<DeviceBuffer<f32>>,
+    ids: ManuallyDrop<DeviceBuffer<u32>>,
+    pos0: ManuallyDrop<DeviceBuffer<u32>>,
+    first: usize,
 }
 
 impl UbImage {
-    /// The image and the rope table for a cache of `cap` rows, the table's
-    /// rows `rope`'s. Load-time only.
-    fn new(stream: &CudaStream, cap: usize, rope: &RopeTable) -> Result<UbImage, GpuError> {
-        let positions = u32::try_from(cap).map_err(|_| {
-            GpuError::shape(
-                WHAT,
-                format!("a cache of {cap} rows: positions and live key counts are u32"),
-            )
-        })?;
-        if rope.n_dims() != HEAD {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a rope table of {} values a position; a row is {HEAD}",
-                    rope.n_dims()
-                ),
-            ));
-        }
-        let t0 = Instant::now();
-        let mut table = Vec::with_capacity(cap * HEAD);
-        for pos in 0..positions {
-            rope.push(pos, Direction::Forward, &mut table);
-        }
-        let table_build = t0.elapsed();
+    /// The image for a cache of `cap` rows. Load-time only.
+    fn new(stream: &CudaStream, cap: usize) -> Result<UbImage, GpuError> {
         Ok(UbImage {
-            buf: DeviceBuffer::zeroed(stream, 3 * cap)?,
-            host: vec![u32::MAX; 3 * cap],
-            rope: DeviceBuffer::from_host(stream, &table)?,
+            inbox: Inbox::new(stream, IN_IDS + cap)?,
             cap,
             len: 0,
             pos0: 0,
-            stat: UbPrologue {
-                table_rows: cap,
-                table_build,
-                last: None,
-            },
+            last: None,
         })
     }
 
-    /// Write the ids, positions and live key counts of `tokens` at positions
-    /// `pos0 ..` into the image's first `3n` words and copy those to the
-    /// card; the rope rows are the table's. Synchronizes (the copy of a
-    /// borrowed host slice does). A prompt whose positions pass the table is
-    /// refused: this check keeps [`UbImage::io`]'s table window inside it.
+    /// Write the record of `tokens` at positions `pos0 ..` — its first
+    /// `n + 1` words — and enqueue their copy to the card. Asynchronous: the
+    /// ubatches behind it read it. A prompt whose positions pass the cache's
+    /// rows, the rope table's too, is refused.
     fn write(&mut self, stream: &CudaStream, tokens: &[u32], pos0: u32) -> Result<(), GpuError> {
         self.len = 0;
         let n = tokens.len();
@@ -319,89 +291,53 @@ impl UbImage {
             ));
         }
         let t0 = Instant::now();
-        let (o_tok, o_pos, o_nk) = img_off(n);
-        let words = &mut self.host[..3 * n];
-        words[o_tok..o_pos].copy_from_slice(tokens);
-        for (i, pos) in (pos0..).take(n).enumerate() {
-            words[o_pos + i] = pos;
-            words[o_nk + i] = pos + 1;
-        }
+        put_input(self.inbox.host_mut()?, tokens, pos0)?;
         let t1 = Instant::now();
-        // SAFETY: 3n <= 3·cap = buf.len() (`end <= cap` above); the window
-        // lives for this copy alone.
-        let mut dst = unsafe { param_view::<u32>(&self.buf, 0, 3 * n) };
-        dst.copy_from_host(stream, words)?;
+        self.inbox.upload(stream, IN_IDS + n)?;
         let t2 = Instant::now();
         self.len = n;
         self.pos0 = pos0;
-        self.stat.last = Some(ImageWrite {
+        self.last = Some(ImageWrite {
             tokens: n,
-            bytes: 3 * n * size_of::<u32>(),
+            bytes: (IN_IDS + n) * size_of::<u32>(),
             fill: t1 - t0,
             copy: t2 - t1,
         });
         Ok(())
     }
 
-    /// Windows onto tokens `s .. s + t` of the prompt in the image, and onto
-    /// their rope rows in the table: rows `pos0 + s ..`.
-    fn io(&self, s: usize, t: usize) -> Result<UbIo, GpuError> {
-        if t == 0 || s + t > self.len {
+    /// Windows onto the prompt's `tokens` in the image and its position
+    /// word: row `t` of the ubatch is position `pos0 + tokens.start + t`.
+    fn io(&self, tokens: Range<usize>) -> Result<UbIo, GpuError> {
+        if tokens.is_empty() || tokens.end > self.len {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "tokens {s}..{} are not inside the {}-token prompt in the image",
-                    s + t,
+                    "tokens {tokens:?} are not inside the {}-token prompt in the image",
                     self.len
                 ),
             ));
         }
-        let (o_tok, o_pos, o_nk) = img_off(self.len);
-        // SAFETY: s + t <= len, so each window lies inside its array of the
-        // prompt (`img_off(len)`), and 3·len <= 3·cap = buf.len(); the
+        // SAFETY: tokens.end <= len <= cap, so the ids lie inside the
+        // record's `IN_IDS + cap` words, and so does its position word; the
         // windows live for one ubatch, while the image stays in place (it is
         // allocated only at load).
-        let (tokens, pos, n_keys) = unsafe {
+        let (ids, pos0) = unsafe {
             (
-                param_view::<u32>(&self.buf, o_tok + s, t),
-                param_view::<u32>(&self.buf, o_pos + s, t),
-                param_view::<u32>(&self.buf, o_nk + s, t),
+                param_view::<u32>(self.inbox.dev(), IN_IDS + tokens.start, tokens.len()),
+                param_view::<u32>(self.inbox.dev(), IN_POS0, 1),
             )
         };
-        let row = self.pos0 as usize + s;
-        // SAFETY: rows `row .. row + t` end at or below pos0 + len <= cap
-        // (`write` refused a prompt past the table), inside the table's cap
-        // rows of HEAD values; the table stays in place for the model's life.
-        let cs = unsafe { f32_view(&self.rope, row * HEAD, t * HEAD) };
         Ok(UbIo {
-            tokens,
-            pos,
-            n_keys,
-            cs,
+            ids,
+            pos0,
+            first: tokens.start,
         })
-    }
-
-    /// Rows `positions` of the rope table, copied to the host. Synchronizes.
-    fn rope_rows(
-        &self,
-        stream: &CudaStream,
-        positions: Range<usize>,
-    ) -> Result<Vec<f32>, GpuError> {
-        if positions.is_empty() || positions.end > self.cap {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("rope rows {positions:?} of a {}-row table", self.cap),
-            ));
-        }
-        // SAFETY: rows `positions` end at or below cap, inside the table; the
-        // window lives for this copy alone.
-        let rows = unsafe { f32_view(&self.rope, positions.start * HEAD, positions.len() * HEAD) };
-        Ok(rows.to_host_vec(stream)?)
     }
 }
 
-/// The GEMM prefill's resident state: the arena, the prompt image with the
-/// rope table, and the prefill flash.
+/// The GEMM prefill's resident state: the arena, the prompt image and the
+/// prefill flash.
 pub(super) struct Ubatch {
     a: UbArena,
     img: UbImage,
@@ -411,21 +347,14 @@ pub(super) struct Ubatch {
 }
 
 impl Ubatch {
-    /// The arena for `min(u, ctx_max)` rows of `d`, an image for a prompt
-    /// of `ctx_max` tokens, the rope table of the `ctx_max` positions by
-    /// `rope`, and the prefill flash's module; `u` in `1..=UBATCH`, else
-    /// refused. Load-time only.
-    pub(super) fn new(
-        stream: &CudaStream,
-        d: Dims,
-        ctx_max: usize,
-        u: usize,
-        rope: &RopeTable,
-    ) -> Result<Ubatch, GpuError> {
+    /// The arena for `min(u, d.ctx)` rows of `d`, an image for a prompt of
+    /// `d.ctx` tokens, and the prefill flash's module; `u` in `1..=UBATCH`,
+    /// else refused. Load-time only.
+    pub(super) fn new(stream: &CudaStream, d: Dims, u: usize) -> Result<Ubatch, GpuError> {
         let size = ubatch_of(u)?;
         Ok(Ubatch {
-            a: UbArena::new(stream, d, u.min(ctx_max))?,
-            img: UbImage::new(stream, ctx_max, rope)?,
+            a: UbArena::new(stream, d, u.min(d.ctx))?,
+            img: UbImage::new(stream, d.ctx)?,
             flash: FlashGqaPrefill::load(stream.context())?,
             size,
         })
@@ -449,7 +378,7 @@ impl Ubatch {
     }
 
     /// Write the image of the tokens the ubatches of a prompt take, from
-    /// position `pos0`. Synchronizes.
+    /// position `pos0`, and enqueue its copy. Asynchronous.
     pub(super) fn write(
         &mut self,
         stream: &CudaStream,
@@ -459,30 +388,31 @@ impl Ubatch {
         self.img.write(stream, tokens, pos0)
     }
 
-    /// Device bytes of the arena, the image and the rope table.
+    /// Device bytes of the arena and the image.
     pub(super) fn bytes(&self) -> usize {
-        self.a.bytes() + self.img.buf.num_bytes() + self.img.rope.num_bytes()
+        self.a.bytes() + self.img.inbox.bytes()
     }
 
-    /// Enqueue the ubatch of the image's tokens `s .. s + t`, standing at
-    /// position `pos` (the image's position for token `s`, else refused):
-    /// the embedding rows, the one-expert table, then every layer. The last
-    /// layer's output rows stay in the arena's `x`.
+    /// Enqueue the ubatch of the image's `tokens`, standing at position `pos`
+    /// (the image's position for its first token, else refused): the
+    /// embedding rows with their positions and live key counts, the
+    /// one-expert table, then every layer. The last layer's output rows stay
+    /// in the arena's `x`.
     pub(super) fn enqueue(
         &mut self,
         c: &UbCtx<'_>,
         kv: &mut [KvPlanes],
-        s: usize,
-        t: usize,
+        tokens: Range<usize>,
         pos: u32,
     ) -> Result<(), GpuError> {
+        let t = tokens.len();
         if t > self.a.rows {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a ubatch of {t} tokens on a {}-row arena", self.a.rows),
             ));
         }
-        let want = u32::try_from(s)
+        let want = u32::try_from(tokens.start)
             .ok()
             .and_then(|s| self.img.pos0.checked_add(s));
         if want != Some(pos) {
@@ -491,20 +421,26 @@ impl Ubatch {
                 "the ubatch's first position is the image's position for its first token",
             ));
         }
-        let io = self.img.io(s, t)?;
+        let io = self.img.io(tokens)?;
         let (gpu, a) = (c.gpu, &mut self.a);
         let stream = gpu.stream();
         gpu.elem().enqueue_embed_rows_q4k(
             stream,
-            kq_weight(c.w, &token_embd())?,
-            &io.tokens,
-            &mut a.x,
+            EmbedRowsArgs {
+                w: kq_weight(c.w, &token_embd())?,
+                ids: &io.ids,
+                pos0: &io.pos0,
+                first: io.first,
+                y: &mut a.x,
+                pos: &mut a.pos,
+                n_keys: &mut a.n_keys,
+            },
         )?;
         c.k.gemm
             .enqueue_route_dense(stream, t, &mut a.dense, gpu.unlabelled_sink())?;
         for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
             let sink = gpu.layer_sink(slot)?;
-            attention(c, n, kv, a, &self.flash, &io, t, pos as usize, sink)?;
+            attention(c, n, kv, a, &self.flash, t, pos as usize, sink)?;
             ffn(c, n, a, t, sink)?;
         }
         Ok(())
@@ -528,29 +464,15 @@ impl Ubatch {
 }
 
 impl GpuModel<Body> {
-    /// The GEMM prefill's host prologue: the rope table's build at load and
-    /// the last prompt image's write ([`UbPrologue`]).
+    /// The GEMM prefill's host prologue: the build at load of the rope table
+    /// every path reads, and the last prompt image's write ([`UbPrologue`]).
     pub fn ubatch_prologue(&self) -> Result<UbPrologue, GpuError> {
-        Ok(self.body("qwen3moe::ubatch_prologue")?.ub.img.stat)
-    }
-
-    /// Rows `positions` of the rope table the ubatches read, [`HEAD`] f32 a
-    /// row. Synchronizes; gate use.
-    pub fn rope_rows(&self, positions: Range<usize>) -> Result<Vec<f32>, GpuError> {
-        let img = &self.body("qwen3moe::rope_rows")?.ub.img;
-        img.rope_rows(self.stage_stream()?, positions)
-    }
-
-    /// The rope rows the ubatch of the image's tokens `first .. first +
-    /// tokens` reads — the window `Ubatch::enqueue` hands the rope kernel —
-    /// [`HEAD`] f32 a token. Synchronizes; gate use.
-    pub fn ubatch_rope_window(&self, first: usize, tokens: usize) -> Result<Vec<f32>, GpuError> {
-        let io = self
-            .body("qwen3moe::ubatch_rope_window")?
-            .ub
-            .img
-            .io(first, tokens)?;
-        Ok(io.cs.to_host_vec(self.stage_stream()?)?)
+        let body = self.body("qwen3moe::ubatch_prologue")?;
+        Ok(UbPrologue {
+            table_rows: body.rope.rows(),
+            table_build: body.rope.build,
+            last: body.ub.img.last,
+        })
     }
 }
 
@@ -561,13 +483,16 @@ pub(super) struct UbCtx<'a> {
     pub(super) names: &'a [LayerNames],
     pub(super) k: &'a Kernels,
     pub(super) eps: f32,
+    /// The rope table the rope launches read by position.
+    pub(super) table: &'a DeviceBuffer<f32>,
 }
 
 /// The attention half at `t` rows: `x` in, `ffn_inp = x + attn_output(attn(x))`
-/// out; the ubatch's K/V rows appended to the layer's planes.
+/// out; the ubatch's K/V rows appended to the layer's planes at the rows'
+/// positions.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the chain's context, the layer, its arena, the flash, the windows, the ubatch's shape"
+    reason = "the chain's context, the layer, its arena, the flash, the ubatch's shape"
 )]
 fn attention(
     c: &UbCtx<'_>,
@@ -575,7 +500,6 @@ fn attention(
     kv: &mut KvPlanes,
     a: &mut UbArena,
     flash: &FlashGqaPrefill,
-    io: &UbIo,
     t: usize,
     p0: usize,
     sink: FaultSink,
@@ -626,8 +550,8 @@ fn attention(
             v: &a.v,
             gq: f32_gain(w, &n.attn_q_norm)?,
             gk: f32_gain(w, &n.attn_k_norm)?,
-            cs: &io.cs,
-            pos: &io.pos,
+            table: c.table,
+            pos: &a.pos,
             eps: c.eps,
             n_head: d.n_head,
             n_kv: d.n_kv,
@@ -644,8 +568,8 @@ fn attention(
             q: &a.q,
             kc: &kv.k,
             vc: &kv.v,
-            n_keys: &io.n_keys,
-            scale: 1.0 / (HEAD as f32).sqrt(),
+            n_keys: &a.n_keys,
+            scale: ATTN_SCALE,
             n_head: d.n_head,
             n_kv: d.n_kv,
             ctx: d.ctx,

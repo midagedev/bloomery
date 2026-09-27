@@ -9,15 +9,15 @@ use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
-use super::scratch::{Arena, Dims, KvPlanes, SP_CS, SP_N_KEYS, SP_POS, SP_TOKEN, StepParams};
+use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
 use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
 use crate::gemm::GemmKernels;
 use crate::head::Head;
-use crate::model::{ChainBody, StepProbe};
+use crate::model::{ChainBody, GpuModel, StepProbe};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::rope_neox::RopeNeoxKernels;
-use crate::rope_table::{Direction, RopeSpec, RopeTable};
+use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::window;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
@@ -29,6 +29,12 @@ use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
+
+/// The attention's score scale `1/√HEAD` in f32: the bits `1.0 / (HEAD as
+/// f32).sqrt()` rounds to at `HEAD` 128, which every flash launch of every
+/// path takes.
+pub(super) const ATTN_SCALE: f32 = 0.088_388_346;
+const _: () = assert!(HEAD == 128 && ATTN_SCALE.to_bits() == 0x3db5_04f3);
 
 /// The two K-quants a qwen3moe projection comes in: the attention value
 /// projection and the experts' down stack are Q4_K on some layers and Q6_K
@@ -73,7 +79,8 @@ pub(super) struct Kernels {
 }
 
 /// qwen3moe's per-replay host values: the token the chain embeds and the
-/// cache row it lands in. The live key count and the rope table follow.
+/// cache row it lands in — the step's input record. The row's live key count
+/// follows on the card, and its rope row is the table's.
 pub struct DecodeInput {
     token: u32,
     pos: u32,
@@ -83,23 +90,22 @@ pub struct DecodeInput {
 pub struct Body {
     /// The prompt prefill's arena, image, slot and captured passes. Declared
     /// first: fields drop in declaration order, and its graphs address the
-    /// cache planes below.
+    /// cache planes and the rope table below.
     pub(super) prefill: Prefill,
-    /// The GEMM prefill's arena, prompt image and rope table.
+    /// The GEMM prefill's arena and prompt image.
     pub(super) ub: Ubatch,
     pub(super) hp: Hparams,
     pub(super) names: Vec<LayerNames>,
     pub(super) kv: Vec<KvPlanes>,
-    /// The decode step's one-row arena and its parameter image.
+    /// The rope table every path reads by position.
+    pub(super) rope: RopeRows,
+    /// The decode step's one-row arena and its input record.
     pub(super) s: Arena,
     pub(super) sp: StepParams,
     pub(super) k: Kernels,
     /// The fused head argmax's key and ticket, back at their seeds after
     /// every launch.
     pub(super) head_state: HeadArgmaxState,
-    pub(super) rope: RopeTable,
-    /// The host rope row `refresh` fills, reused every step.
-    cs_host: Vec<f32>,
     /// The flash pass this process runs ([`gqa_mma`]), read once at load.
     pub(super) mma: bool,
     /// The per-layer output copies an instrument asked for
@@ -355,8 +361,9 @@ impl ChainBody for Body {
         };
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
-            prefill: Prefill::new(stream, dims, ctx_max)?,
-            ub: Ubatch::new(stream, dims, ctx_max, ubatch_size()?, &rope)?,
+            prefill: Prefill::new(stream, dims)?,
+            ub: Ubatch::new(stream, dims, ubatch_size()?)?,
+            rope: RopeRows::new(stream, &rope, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
             hp,
@@ -364,8 +371,6 @@ impl ChainBody for Body {
             kv,
             k,
             head_state: HeadArgmaxState::new(stream)?,
-            rope,
-            cs_host: Vec::with_capacity(HEAD),
             mma: gqa_mma(),
             taps: None,
         })
@@ -375,20 +380,11 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// Token, landing row, live key count and the position's rope table in
-    /// one host-to-device copy.
+    /// The step's input record — its position and its token — in one
+    /// asynchronous copy ahead of the step's launches.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         let DecodeInput { token, pos } = *input;
-        let sp = &mut self.sp;
-        sp.host.truncate(SP_CS);
-        sp.host[SP_TOKEN] = token;
-        sp.host[SP_POS] = pos;
-        sp.host[SP_N_KEYS] = pos + 1;
-        self.cs_host.clear();
-        self.rope.push(pos, Direction::Forward, &mut self.cs_host);
-        sp.host.extend(self.cs_host.iter().map(|v| v.to_bits()));
-        sp.buf.copy_from_host(stream, &sp.host)?;
-        Ok(())
+        self.sp.write(stream, token, pos)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
@@ -444,11 +440,31 @@ impl ChainBody for Body {
 
     fn resident_bytes(&self) -> usize {
         self.kv.iter().map(KvPlanes::bytes).sum::<usize>()
+            + self.rope.table.num_bytes()
             + self.s.bytes()
-            + self.sp.buf.num_bytes()
+            + self.sp.bytes()
             + self.head_state.bytes()
             + self.prefill.bytes()
             + self.ub.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
+    }
+}
+
+impl GpuModel<Body> {
+    /// Rows `positions` of the rope table every path reads, [`HEAD`] f32 a
+    /// row. Synchronizes; gate use.
+    pub fn rope_rows(&self, positions: Range<usize>) -> Result<Vec<f32>, GpuError> {
+        const WHAT: &str = "qwen3moe::rope_rows";
+        let rope = &self.body(WHAT)?.rope;
+        if positions.is_empty() || positions.end > rope.rows() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("rope rows {positions:?} of a {}-row table", rope.rows()),
+            ));
+        }
+        // SAFETY: rows `positions` end at or below the table's rows, inside
+        // it; the window lives for this copy alone.
+        let rows = unsafe { f32_view(&rope.table, positions.start * HEAD, positions.len() * HEAD) };
+        Ok(rows.to_host_vec(self.stage_stream()?)?)
     }
 }

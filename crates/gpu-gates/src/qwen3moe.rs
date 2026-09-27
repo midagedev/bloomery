@@ -265,9 +265,10 @@ pub mod dev {
         pub cache_v: Vec<u16>,
     }
 
-    /// Run the kernel on `rows` with gains `gq`/`gk`, tables `cs` (`m ·
-    /// HEAD`), into planes of `ctx` rows per key head filled with
-    /// [`SENTINEL`], raising on `fault`.
+    /// Run the kernel on `rows` with gains `gq`/`gk` and the rope `table`
+    /// (a row of `HEAD` values for each of at least `ctx` positions, which
+    /// the kernel reads at each token's position), into planes of `ctx` rows
+    /// per key head filled with [`SENTINEL`], raising on `fault`.
     #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
     pub fn run(
         k: &RopeNeoxKernels,
@@ -276,11 +277,11 @@ pub mod dev {
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
-        cs: &[f32],
+        table: &[f32],
         eps: f32,
         ctx: usize,
     ) -> Result<NeoxOut, GateError> {
-        Ok(launch(k, stream, None, fault, rows, gq, gk, cs, eps, ctx)?.0)
+        Ok(launch(k, stream, None, fault, rows, gq, gk, table, eps, ctx)?.0)
     }
 
     /// [`run`] with the launch captured on `gpu`'s stream as a graph and
@@ -293,7 +294,7 @@ pub mod dev {
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
-        cs: &[f32],
+        table: &[f32],
         eps: f32,
         ctx: usize,
     ) -> Result<(NeoxOut, usize), GateError> {
@@ -305,7 +306,7 @@ pub mod dev {
             rows,
             gq,
             gk,
-            cs,
+            table,
             eps,
             ctx,
         )
@@ -320,7 +321,7 @@ pub mod dev {
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
-        cs: &[f32],
+        table: &[f32],
         eps: f32,
         ctx: usize,
     ) -> Result<(NeoxOut, usize), GateError> {
@@ -329,7 +330,7 @@ pub mod dev {
         let v = DeviceBuffer::from_host(stream, &rows.v)?;
         let gq = DeviceBuffer::from_host(stream, gq)?;
         let gk = DeviceBuffer::from_host(stream, gk)?;
-        let cs = DeviceBuffer::from_host(stream, cs)?;
+        let table = DeviceBuffer::from_host(stream, table)?;
         let pos = DeviceBuffer::from_host(stream, &rows.pos)?;
         let plane = vec![SENTINEL; rows.n_kv * ctx * HEAD];
         let mut cache_k = DeviceBuffer::from_host(stream, &plane)?;
@@ -343,7 +344,7 @@ pub mod dev {
                     v: &v,
                     gq: &gq,
                     gk: &gk,
-                    cs: &cs,
+                    table: &table,
                     pos: &pos,
                     eps,
                     n_head: rows.n_head,

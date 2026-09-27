@@ -4,11 +4,16 @@
 //! writes `cache_k_lL (view) (copy of Kcur_roped-L)` and `v_cache_view-L
 //! (copy of Vcur-L)`).
 //!
+//! The kernel reads its rope row from a table of every cache position, at the
+//! token's position; the gate hands it the engine's table (`RopeTable::push`
+//! for positions `0..ctx`).
+//!
 //! Three layers per (set, layer):
 //! 1. the kernel against this binary's transcription of our rule — the norm
 //!    (`qwen3moe::head_norm`), the turn (`qwen3moe::neox_rotate`) on the
-//!    engine's table, each plane row the f16 of its value, every other plane
-//!    slot untouched — bit-identical, and a rerun bit-identical;
+//!    table's row at each token's position, each plane row the f16 of its
+//!    value, every other plane slot untouched — bit-identical, and a rerun
+//!    bit-identical;
 //! 2. ik's rule against the dump: the table from `ggml_rope_cache` (ggml's
 //!    recipe at `ne0` = 128), the NEOX turn on ik's own normed rows in the
 //!    fused form its compiled loop takes (`fma(x0, c, −(x1·s))`,
@@ -26,8 +31,9 @@
 //!
 //! And once, a position at or past the cache: the prefill set's layer 0 with
 //! its last token's position moved to `ctx`, launched with layer 13's sink.
-//! That token is appended nowhere (its rows keep the sentinel) and the launch
-//! raises `FaultSite::CachePos` with that layer; the turned heads and every
+//! That token has no table row: its query and key heads are NaN, it is
+//! appended nowhere (its rows keep the sentinel), and the launch raises
+//! `FaultSite::CachePos` with that layer; every other token's heads and every
 //! other plane slot are the clean run's bit for bit; the word is clean before
 //! and after a clean run.
 
@@ -90,6 +96,7 @@ mod gate {
             .into());
         }
         let table = RopeTable::new(&spec)?;
+        let mut grown = Vec::new();
         let gpu = Gpu::new()?;
         let k = RopeNeoxKernels::load(gpu.context())?;
         let stream = gpu.stream();
@@ -109,16 +116,14 @@ mod gate {
                 pos_seen.clone_from(&rows.pos);
                 let gq = split_f32(&split, &rows.gq_name, HEAD)?;
                 let gk = split_f32(&split, &rows.gk_name, HEAD)?;
-                let mut cs = Vec::with_capacity(rows.m * HEAD);
-                for &p in &rows.pos {
-                    table.push(p, Direction::Forward, &mut cs);
-                }
                 let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+                let tab = table_rows(&table, &mut grown, ctx)?;
+                let cs = rows_at(tab, &rows.pos);
                 let (n_kv, m) = (rows.n_kv, rows.m);
 
                 // Layer 1: the kernel against our rule, and a rerun.
-                let a = run_neox(&k, stream, unl, &rows, &gq, &gk, &cs, hp.rms_eps, ctx)?;
-                let b = run_neox(&k, stream, unl, &rows, &gq, &gk, &cs, hp.rms_eps, ctx)?;
+                let a = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
+                let b = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
                 let norm = |x: &[f32], g: &[f32]| -> Vec<f32> {
                     x.chunks(HEAD)
                         .flat_map(|h| head_norm(h, g, hp.rms_eps))
@@ -230,13 +235,10 @@ mod gate {
         let rows = AttnRows::read(man, 0)?.ok_or_else(|| format!("{label}: no layer 0"))?;
         let gq = split_f32(&split, &rows.gq_name, HEAD)?;
         let gk = split_f32(&split, &rows.gk_name, HEAD)?;
-        let mut cs = Vec::new();
-        for &p in &rows.pos {
-            table.push(p, Direction::Forward, &mut cs);
-        }
         let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
-        let eager = run_neox(&k, stream, unl, &rows, &gq, &gk, &cs, hp.rms_eps, ctx)?;
-        let (replay, nodes) = run_graph(&gpu, &k, unl, &rows, &gq, &gk, &cs, hp.rms_eps, ctx)?;
+        let tab = table_rows(&table, &mut grown, ctx)?;
+        let eager = run_neox(&k, stream, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
+        let (replay, nodes) = run_graph(&gpu, &k, unl, &rows, &gq, &gk, tab, hp.rms_eps, ctx)?;
         let same = bits_equal(&eager.q, &replay.q)
             && bits_equal(&eager.k, &replay.k)
             && eager.cache_k == replay.cache_k
@@ -248,7 +250,9 @@ mod gate {
             verdict(graph_ok)
         );
         failed += u32::from(!graph_ok);
-        failed += u32::from(!cache_pos(&gpu, &k, &split, &table, hp.rms_eps)?);
+        failed += u32::from(!cache_pos(
+            &gpu, &k, &split, &table, &mut grown, hp.rms_eps,
+        )?);
 
         let pass = failed == 0;
         println!(
@@ -261,12 +265,35 @@ mod gate {
         Ok(())
     }
 
+    /// Rows `0..ctx` of `table` (`push` per position, in order), grown in
+    /// `grown` as far as a call asks and kept for the next.
+    fn table_rows<'a>(
+        table: &RopeTable,
+        grown: &'a mut Vec<f32>,
+        ctx: usize,
+    ) -> Result<&'a [f32], GateError> {
+        for p in grown.len() / HEAD..ctx {
+            table.push(u32::try_from(p)?, Direction::Forward, grown);
+        }
+        Ok(&grown[..ctx * HEAD])
+    }
+
+    /// The rows of `tab` at `pos`, token after token: what the kernel reads
+    /// for each token.
+    fn rows_at(tab: &[f32], pos: &[u32]) -> Vec<f32> {
+        pos.iter()
+            .flat_map(|&p| &tab[p as usize * HEAD..(p as usize + 1) * HEAD])
+            .copied()
+            .collect()
+    }
+
     /// The position clause (module doc): whether it held.
     fn cache_pos(
         gpu: &Gpu,
         k: &RopeNeoxKernels,
         split: &Split,
         table: &RopeTable,
+        grown: &mut Vec<f32>,
         eps: f32,
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
@@ -282,21 +309,18 @@ mod gate {
         }
         let gq = split_f32(split, &rows.gq_name, HEAD)?;
         let gk = split_f32(split, &rows.gk_name, HEAD)?;
-        let mut cs = Vec::new();
-        for &p in &rows.pos {
-            table.push(p, Direction::Forward, &mut cs);
-        }
         let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+        let tab = table_rows(table, grown, ctx)?;
         let layer = 13usize;
         let sink = gpu.layer_sink(layer)?;
         let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::CachePos));
         let before = gpu.fault()?;
-        let clean = run_neox(k, stream, sink, &rows, &gq, &gk, &cs, eps, ctx)?;
+        let clean = run_neox(k, stream, sink, &rows, &gq, &gk, tab, eps, ctx)?;
         let after_clean = gpu.fault()?;
         let bad_t = rows.m - 1;
         let bad_p = rows.pos[bad_t] as usize;
         rows.pos[bad_t] = u32::try_from(ctx)?;
-        let bad = run_neox(k, stream, sink, &rows, &gq, &gk, &cs, eps, ctx)?;
+        let bad = run_neox(k, stream, sink, &rows, &gq, &gk, tab, eps, ctx)?;
         let word = gpu.take_fault()?;
         rows.pos[bad_t] = u32::try_from(bad_p)?;
         let (mut want_k, mut want_v) = (clean.cache_k.clone(), clean.cache_v.clone());
@@ -308,8 +332,23 @@ mod gate {
             want_v[row].fill(SENTINEL);
         }
         let planes = bad.cache_k == want_k && bad.cache_v == want_v;
-        let heads = bits_equal(&bad.q, &clean.q) && bits_equal(&bad.k, &clean.k);
-        let again = run_neox(k, stream, sink, &rows, &gq, &gk, &cs, eps, ctx)?;
+        // Token by token: the bad token's heads all NaN, every other token's
+        // the clean run's bits.
+        let heads_of = |got: &[f32], want: &[f32], width: usize| {
+            got.chunks(width)
+                .zip(want.chunks(width))
+                .enumerate()
+                .all(|(t, (g, w))| {
+                    if t == bad_t {
+                        g.iter().all(|v| v.is_nan())
+                    } else {
+                        bits_equal(g, w)
+                    }
+                })
+        };
+        let heads = heads_of(&bad.q, &clean.q, rows.n_head * HEAD)
+            && heads_of(&bad.k, &clean.k, rows.n_kv * HEAD);
+        let again = run_neox(k, stream, sink, &rows, &gq, &gk, tab, eps, ctx)?;
         let clean_again = bits_equal(&again.q, &clean.q)
             && again.cache_k == clean.cache_k
             && again.cache_v == clean.cache_v
@@ -325,7 +364,8 @@ mod gate {
             "cache_pos set={label} layer=0 token {bad_t} at position {ctx} of a {ctx}-row cache: word \"{}\" \
              (want \"{}\", clean before {} and after the clean run {}) its rows appended nowhere and \
              every other plane slot the clean run's {planes} (the clean run wrote them {clean_wrote}), \
-             turned heads bit-identical {heads}, clean rerun bits and word clean {clean_again} {}",
+             its heads NaN and every other token's the clean run's bits {heads}, clean rerun bits and \
+             word clean {clean_again} {}",
             word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
             want.map_or_else(String::new, |f| f.to_string()),
             before.is_none(),

@@ -4,10 +4,13 @@
 //!
 //! 1. Embedding: `embed_rows_q4k` against `gguf::quant::dequant_row` on the
 //!    same rows, bit for bit, for ids 0, 1, the last row and 61 spread
-//!    between them; then every oracle set's `inp_embd` from its `inp_tokens`
-//!    (ik's GET_ROWS through the same dequantizer), bit for bit; an id past
-//!    the table raises `FaultSite::TokenId` and its row is NaN, every value,
-//!    the other rows unchanged.
+//!    between them, and each row's position `pos0 + first + t` and live key
+//!    count one more, from a position word and an offset; then every oracle
+//!    set's `inp_embd` from its `inp_tokens` (ik's GET_ROWS through the same
+//!    dequantizer), bit for bit; an id past the table raises
+//!    `FaultSite::TokenId` and its row is NaN, every value, the other rows
+//!    unchanged and every row's position written; a position past a u32
+//!    reads `u32::MAX`, a count too, never a wrapped value.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
@@ -57,6 +60,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
+    use bloomery_gpu::elem::EmbedRowsArgs;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
@@ -65,7 +69,7 @@ mod gate {
         q8_1_dequant, ref_ints, ref_tensor_logical_in, tensor_bytes_as, topk_ids_logical_within,
         verdict,
     };
-    use cuda_core::DeviceBuffer;
+    use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, dequant_row};
     use model::arch::qwen3moe::names;
 
@@ -86,6 +90,15 @@ mod gate {
     /// What an output buffer holds before a launch, so a slot the kernel
     /// leaves alone reads back as these bits.
     const SENT: f32 = 1.0e30;
+
+    /// The position word and the ids' offset clause 1 hands the gather: row
+    /// `t` is position `POS0 + FIRST + t`.
+    const POS0: u32 = 1_000;
+    const FIRST: usize = 7;
+
+    /// What a position or count slot holds before a launch: no value the
+    /// gather writes here.
+    const SENT_POS: u32 = 0xdead_beef;
 
     /// A stack on the card: its rows as the byte stream in words.
     fn upload(gpu: &Gpu, bytes: &[u8], rows: usize) -> Result<DeviceTensor<u32>, GateError> {
@@ -129,25 +142,91 @@ mod gate {
 
     // ------------------------------------------------------------ 1. embed
 
+    /// One gather's outputs, read back: the rows, each row's position and
+    /// its live key count.
+    struct Embedded {
+        y: Vec<f32>,
+        pos: Vec<u32>,
+        n_keys: Vec<u32>,
+    }
+
+    /// `ids` gathered from `table` (`k` values a row), the rows' positions
+    /// from `pos0` and offset `first`: eagerly, or captured as a graph and
+    /// replayed once, which also returns its node count.
+    #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+    fn gather(
+        gpu: &Gpu,
+        table: &DeviceTensor<u32>,
+        ids: &[u32],
+        pos0: u32,
+        first: usize,
+        k: usize,
+        graph: bool,
+    ) -> Result<(Embedded, usize), GateError> {
+        let stream = gpu.stream();
+        let idb = DeviceBuffer::from_host(stream, ids)?;
+        let p0 = DeviceBuffer::from_host(stream, &[pos0])?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; ids.len() * k])?;
+        let mut pos = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
+        let mut n_keys = DeviceBuffer::from_host(stream, &vec![SENT_POS; ids.len()])?;
+        let mut enqueue = |s: &CudaStream| {
+            gpu.elem().enqueue_embed_rows_q4k(
+                s,
+                EmbedRowsArgs {
+                    w: table,
+                    ids: &idb,
+                    pos0: &p0,
+                    first,
+                    y: &mut y,
+                    pos: &mut pos,
+                    n_keys: &mut n_keys,
+                },
+            )
+        };
+        let nodes = if graph {
+            let g = gpu.capture(&mut enqueue)?;
+            g.launch(stream)?;
+            g.node_count()
+        } else {
+            enqueue(stream)?;
+            0
+        };
+        stream.synchronize()?;
+        Ok((
+            Embedded {
+                y: y.to_host_vec(stream)?,
+                pos: pos.to_host_vec(stream)?,
+                n_keys: n_keys.to_host_vec(stream)?,
+            },
+            nodes,
+        ))
+    }
+
+    /// Whether `e` holds, for each of its `n` rows, position `pos0 + first +
+    /// t` and count one more, a value past a u32 as `u32::MAX`.
+    fn positions_ok(e: &Embedded, n: usize, pos0: u32, first: usize) -> bool {
+        let word = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        e.pos.len() == n
+            && e.n_keys.len() == n
+            && (0..n).all(|t| {
+                let p = u64::from(pos0) + first as u64 + t as u64;
+                e.pos[t] == word(p) && e.n_keys[t] == word(p + 1)
+            })
+    }
+
     fn embed(
         gpu: &Gpu,
         gguf: &gguf::Gguf,
         sets: &[(&'static str, bloomery_gpu_gates::RefManifest)],
     ) -> Result<bool, GateError> {
-        let stream = gpu.stream();
         let (info, bytes) = tensor_bytes_as(gguf, &names::token_embd(), GgmlType::Q4_K, None)?;
         let (k, n_rows) = (info.dims[0] as usize, info.dims[1] as usize);
         let rb = bytes.len() / n_rows;
         let table = upload(gpu, bytes, n_rows)?;
         let mut ids: Vec<u32> = vec![0, 1, (n_rows - 1) as u32];
         ids.extend((1..62u64).map(|i| ((i * 2_654_435_761) % n_rows as u64) as u32));
-        let run = |ids: &[u32]| -> Result<Vec<f32>, GateError> {
-            let idb = DeviceBuffer::from_host(stream, ids)?;
-            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; ids.len() * k])?;
-            gpu.elem()
-                .enqueue_embed_rows_q4k(stream, &table, &idb, &mut y)?;
-            stream.synchronize()?;
-            Ok(y.to_host_vec(stream)?)
+        let run = |ids: &[u32]| -> Result<Embedded, GateError> {
+            Ok(gather(gpu, &table, ids, POS0, FIRST, k, false)?.0)
         };
         let got = run(&ids)?;
         let mut want = vec![0.0f32; ids.len() * k];
@@ -155,13 +234,15 @@ mod gate {
             let row = &bytes[id as usize * rb..(id as usize + 1) * rb];
             dequant_row(info.ty, row, &mut want[t * k..(t + 1) * k])?;
         }
-        let host_ok = bits_equal(&got, &want) && bits_equal(&got, &run(&ids)?);
+        let host_ok = bits_equal(&got.y, &want) && bits_equal(&got.y, &run(&ids)?.y);
+        let pos_ok = positions_ok(&got, ids.len(), POS0, FIRST);
         println!(
-            "embed Q4_K K={k} rows={n_rows}: {} ids vs dequant_row bit_identical (and rerun)={host_ok} {}",
+            "embed Q4_K K={k} rows={n_rows}: {} ids vs dequant_row bit_identical (and rerun)={host_ok}, \
+             row t at position {POS0} + {FIRST} + t with count one more={pos_ok} {}",
             ids.len(),
-            verdict(host_ok)
+            verdict(host_ok && pos_ok)
         );
-        let mut ok = host_ok;
+        let mut ok = host_ok && pos_ok;
         for (label, man) in sets {
             let erow = man.tensor("inp_embd", 0)?;
             let toks = ref_ints(man, "inp_tokens", 0, RowKind::Input, Layout::Flat)?
@@ -170,7 +251,7 @@ mod gate {
                 .collect::<Result<Vec<u32>, _>>()?;
             let ik = ref_tensor_logical_in(&man.dir, erow)?;
             let ours = run(&toks)?;
-            let same = bits_equal(&ours, &ik);
+            let same = bits_equal(&ours.y, &ik);
             println!(
                 "embed {label}: {} tokens vs ik inp_embd bit_identical={same} {}",
                 toks.len(),
@@ -178,37 +259,47 @@ mod gate {
             );
             ok &= same;
         }
-        // The graph: one node, replay = eager.
-        let idb = DeviceBuffer::from_host(stream, &ids)?;
-        let mut yg = DeviceBuffer::from_host(stream, &vec![SENT; ids.len() * k])?;
-        let graph = gpu.capture(|s| gpu.elem().enqueue_embed_rows_q4k(s, &table, &idb, &mut yg))?;
-        graph.launch(stream)?;
-        stream.synchronize()?;
-        let g_same = bits_equal(&yg.to_host_vec(stream)?, &got);
-        let nodes = graph.node_count();
+        // The graph: one node, replay = eager, rows and positions.
+        let (replayed, nodes) = gather(gpu, &table, &ids, POS0, FIRST, k, true)?;
+        let g_same = bits_equal(&replayed.y, &got.y)
+            && replayed.pos == got.pos
+            && replayed.n_keys == got.n_keys;
         let pass = g_same && nodes == 1;
         println!(
-            "graph op=embed_rows_q4k eager_vs_graph_bit_identical={g_same} graph_nodes={nodes} {}",
+            "graph op=embed_rows_q4k eager_vs_graph_bit_identical={g_same} (rows, positions, counts) \
+             graph_nodes={nodes} {}",
             verdict(pass)
         );
-        // An id past the table: the named fault; the other rows unchanged.
+        // An id past the table: the named fault; the other rows unchanged,
+        // every row's position written.
         let clean = gpu.take_fault()?;
         let bad_ids = [ids[3], n_rows as u32 + 3, ids[4]];
         let y = run(&bad_ids)?;
         let fault = gpu.take_fault()?;
         let want_fault = Fault::at(LAYER_NONE, FaultSite::TokenId);
-        let others = bits_equal(&y[..k], &got[3 * k..4 * k])
-            && bits_equal(&y[2 * k..3 * k], &got[4 * k..5 * k]);
-        let nan = y[k..2 * k].iter().filter(|v| v.is_nan()).count();
-        let oor_ok = clean.is_none() && fault == Some(want_fault) && others && nan == k;
+        let others = bits_equal(&y.y[..k], &got.y[3 * k..4 * k])
+            && bits_equal(&y.y[2 * k..3 * k], &got.y[4 * k..5 * k]);
+        let nan = y.y[k..2 * k].iter().filter(|v| v.is_nan()).count();
+        let bad_pos = positions_ok(&y, bad_ids.len(), POS0, FIRST);
+        let oor_ok = clean.is_none() && fault == Some(want_fault) && others && nan == k && bad_pos;
         println!(
             "embed Q4_K id past the table ids={bad_ids:?}: word_before={clean:?} fault=\"{}\" \
              (want \"{want_fault}\") other_rows_bit_identical={others} bad_row_nan={nan}/{k} \
-             (want all) {}",
+             (want all) positions written={bad_pos} {}",
             fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
             verdict(oor_ok)
         );
-        Ok(ok && pass && oor_ok)
+        // Positions past a u32: u32::MAX, never a wrapped value.
+        let top = u32::MAX - 1;
+        let sat = gather(gpu, &table, &ids[..3], top, 0, k, false)?.0;
+        let sat_ok = positions_ok(&sat, 3, top, 0);
+        println!(
+            "embed positions from {top}: {:?} counts {:?} (want {top}, then u32::MAX past it) {}",
+            sat.pos,
+            sat.n_keys,
+            verdict(sat_ok)
+        );
+        Ok(ok && pass && oor_ok && sat_ok)
     }
 
     // ---------------------------------------------------- 2. gate·up body
