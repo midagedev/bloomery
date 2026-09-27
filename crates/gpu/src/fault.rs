@@ -110,10 +110,14 @@ pub enum FaultSite {
     /// that is not finite, or its selected flash a list entry at or past
     /// the cache.
     PoolSelect = 18,
+    /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
+    /// conv input whose sum of squares, dot or value is not finite, or a
+    /// token position other than `pos[0] + t`.
+    Ple = 19,
 }
 
 // A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::PoolSelect as u32) < 32);
+const _: () = assert!((FaultSite::Ple as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -135,6 +139,7 @@ impl FaultSite {
         FaultSite::DeltaLane,
         FaultSite::CacheValue,
         FaultSite::PoolSelect,
+        FaultSite::Ple,
     ];
 
     /// The site's name as an error prints it.
@@ -158,6 +163,7 @@ impl FaultSite {
             FaultSite::DeltaLane => "delta_lane",
             FaultSite::CacheValue => "cache_value",
             FaultSite::PoolSelect => "pool_select",
+            FaultSite::Ple => "ple",
         }
     }
 
@@ -194,6 +200,10 @@ impl FaultSite {
             FaultSite::PoolSelect => {
                 "a pooled key or a selector score not finite, or a selected token past the cache"
             }
+            FaultSite::Ple => {
+                "a PLE key, stream, gated value or conv input not finite (a value, its sum of \
+                 squares or the gate's dot), or a token position other than pos[0] + t"
+            }
         }
     }
 }
@@ -210,8 +220,8 @@ pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
         AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, ExpertId, HcQuant, KeyCount,
-        LinearConv, LinearDelta, LinearGate, NormQuant, PoolSelect, Q5Quant, QuantColumn, Router,
-        TokenId,
+        LinearConv, LinearDelta, LinearGate, NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn,
+        Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -237,6 +247,7 @@ pub mod step_order {
         DeltaLane,
         CacheValue,
         PoolSelect,
+        Ple,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -260,6 +271,7 @@ pub mod step_order {
         DeltaLane,
         CacheValue,
         PoolSelect,
+        Ple,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -284,17 +296,20 @@ pub mod step_order {
         DeltaLane,
         CacheValue,
         PoolSelect,
+        Ple,
     ];
 
     /// Qwen3.6-35B-A3B (`arch::qwen3moe`'s second body): the two layer
-    /// kinds' sites in one order. The fused norm and quantizer at the
-    /// layer's entry; an attention layer's cache append and flash key count;
+    /// kinds' sites in one order. A PLE site (Qwen3.8's) before its layer's
+    /// mix; the fused norm and quantizer at the layer's entry; an attention
+    /// layer's cache append and flash key count;
     /// a delta layer's conv, delta step (its lane word right after it) and
     /// gated norm; the output projection's quantizer either kind's; then the
     /// router's fused norm and the routed experts. A mask holds one layer's
     /// sites, so each kind reads in its own launch order.
     pub const QWEN35MOE: &[FaultSite] = &[
         TokenId,
+        Ple,
         NormQuant,
         CachePos,
         KeyCount,

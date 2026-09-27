@@ -897,6 +897,12 @@ gate-ds41-kld:
 gate-gpu-ds41-engram:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && bash tools/gpu-gate.sh gate_deepseek41_engram'
 
+# A PLE site's two kernels (Qwen3.8's layer 1, bloomery_gpu::ple) on synthetic inputs, no model: the gate bit for bit
+# against its host rule and within a derived per-value bound of the exact f64 values; the dilated conv bit for bit
+# against its host rule; then the m-column, ring-wrap, rollback, reset, fault and refusal clauses.
+gate-gpu-ple:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_ple && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ple'
+
 # The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
 # the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
 # the head end (hc_out bit for bit, the logits against their predicted gap, the argmax); one captured graph

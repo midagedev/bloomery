@@ -24,13 +24,14 @@
 //! multiply, a power of two times an int8 of magnitude at most 12, is exact
 //! (the subnormal scales included), so no fusion question arises.
 //!
-//! Q2_K, IQ2_XS, IQ3_XXS and IQ4_XS are ports of the same-named functions in
-//! that file, whose bodies are identical in mainline ggml. None has a product
+//! Q2_K, IQ2_XS, IQ3_XXS, IQ4_NL and IQ4_XS are ports of the same-named
+//! functions in that file, whose bodies are identical in mainline ggml. None has a product
 //! that rounds, so the order of their multiplies does not decide the bits:
 //! the scale factors (`d · (0.5 + s) · 0.25`, `d · (0.5 + s) · 0.5`,
 //! `d · (ls − 32)`, `d · sc`) are an f16 significand times at most five bits,
 //! and a codebook or code value adds at most seven more (IQ4_XS's
-//! `kvalues_iq4nl` reaches 127), 23 bits in the worst case. Q2_K's
+//! `kvalues_iq4nl` reaches 127), 23 bits in the worst case; IQ4_NL's
+//! `d · kvalues_iq4nl[code]` is 11 + 7 bits. Q2_K's
 //! `dl · q − ml` rounds once, at the subtraction, fused or not. The test
 //! `iq_products_are_exact` checks this over every finite f16 scale. The
 //! codebooks live in [`crate::iq_tables`], generated from ggml's header.
@@ -316,10 +317,10 @@ impl GgmlType {
             | GgmlType::MXFP4
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS
+            | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS => true,
             GgmlType::IQ2_XXS
             | GgmlType::IQ1_S
-            | GgmlType::IQ4_NL
             | GgmlType::IQ3_S
             | GgmlType::IQ2_S
             | GgmlType::I8
@@ -419,10 +420,10 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
         GgmlType::IQ2_XS => dequant_iq2_xs(&src[..need], dst),
         GgmlType::IQ3_XXS => dequant_iq3_xxs(&src[..need], dst),
+        GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
         GgmlType::IQ2_XXS
         | GgmlType::IQ1_S
-        | GgmlType::IQ4_NL
         | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::I8
@@ -976,6 +977,26 @@ fn dequant_iq3_xxs(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Port of `dequantize_row_iq4_nl` (ggml-quants.c:3931). Block geometry
+/// (block_iq4_nl, ggml-common.h:585-589, 18 bytes / 32 values): d f16 @0,
+/// qs[16] @2. Value j < 16 is `d·kvalues_iq4nl[qs[j] & 0xf]` and value j + 16
+/// is `d·kvalues_iq4nl[qs[j] >> 4]` ([`KVALUES_IQ4NL`]).
+fn dequant_iq4_nl(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<18>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<32>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let (lo, hi) = out.split_at_mut(16);
+        for (j, &byte) in blk[2..18].iter().enumerate() {
+            lo[j] = d * f32::from(KVALUES_IQ4NL[usize::from(byte & 0x0f)]);
+            hi[j] = d * f32::from(KVALUES_IQ4NL[usize::from(byte >> 4)]);
+        }
+    }
+}
+
 /// Port of `dequantize_row_iq4_xs` (ggml-quants.c:3949). Block geometry
 /// (block_iq4_xs, ggml-common.h:602-608, 136 bytes / 256 values): d f16 @0,
 /// scales_h u16 @2, scales_l[4] @4, qs[128] @8.
@@ -1300,7 +1321,7 @@ mod tests {
         }
     }
 
-    /// Every product the four i-quant/Q2_K ports form is exact in f32 — the
+    /// Every product the five i-quant/Q2_K ports form is exact in f32 — the
     /// module doc's claim that the multiply order cannot decide the bits —
     /// checked for every finite f16 scale `d` against every scale factor and
     /// code value the format can hold: the f32 product equals the f64 one.
@@ -1316,6 +1337,10 @@ mod tests {
         let exact = |a: f32, b: f32| f64::from(a * b) == f64::from(a) * f64::from(b);
         for bits in (0u16..0x7c00).chain(0x8000..0xfc00) {
             let d = super::half_to_f32(bits);
+            assert!(
+                KVALUES_IQ4NL.iter().all(|&k| exact(d, f32::from(k))),
+                "iq4_nl {bits:#06x}"
+            );
             for s in 0..16u8 {
                 let s = f32::from(s);
                 let db2 = d * (0.5 + s) * 0.25;
@@ -1374,6 +1399,63 @@ mod tests {
             assert_eq!(s >> 7, (i.count_ones() & 1) as u8, "entry {i}");
         }
         assert_eq!(KMASK_IQ2XS, core::array::from_fn(|j| 1u8 << j));
+    }
+
+    /// IQ4_NL over its block layout: every code in both nibbles of each byte
+    /// position, at scales that are a normal, a subnormal, a negative and a
+    /// zero f16, decodes to `d·kvalues_iq4nl[code]` computed in f64 (exact,
+    /// [`iq_products_are_exact`]), low nibble of byte j to value j and high
+    /// nibble to value j + 16. A 160-value row (a PLE table row, five blocks,
+    /// 90 bytes) decodes block by block; one byte short, or a row that is not
+    /// whole blocks, is refused by name.
+    #[test]
+    fn iq4_nl_decodes_every_code() {
+        use crate::iq_tables::KVALUES_IQ4NL;
+        let scales: [u16; 5] = [0x3c00, 0x0001, 0xb555, 0x0000, 0x7bff];
+        let mut src = Vec::new();
+        for (i, &d) in scales.iter().enumerate() {
+            src.extend(d.to_le_bytes());
+            // Byte j holds code (j + i) mod 16 low and (15 − j + 2i) mod 16 high.
+            src.extend(
+                (0..16u8).map(|j| ((j + i as u8) & 15) | (((15 - j + 2 * i as u8) & 15) << 4)),
+            );
+        }
+        assert_eq!(src.len(), 90);
+        let mut dst = vec![0.0f32; 160];
+        dequant_row(GgmlType::IQ4_NL, &src, &mut dst).unwrap();
+        for (i, (&d, out)) in scales.iter().zip(dst.as_chunks::<32>().0).enumerate() {
+            let d = f64::from(super::half_to_f32(d));
+            for j in 0..16usize {
+                let lo = (j + i) & 15;
+                let hi = (15 - j + 2 * i) & 15;
+                for (at, code) in [(j, lo), (j + 16, hi)] {
+                    let want = (d * f64::from(KVALUES_IQ4NL[code])) as f32;
+                    assert_eq!(
+                        out[at].to_bits(),
+                        want.to_bits(),
+                        "block {i} value {at} (code {code}): got {:e}, want {want:e}",
+                        out[at]
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            dequant_row(GgmlType::IQ4_NL, &src[..89], &mut dst),
+            Err(QuantError::ShortSrc {
+                ty: GgmlType::IQ4_NL,
+                src: 89,
+                need: 90,
+                n: 160
+            })
+        );
+        assert_eq!(
+            dequant_row(GgmlType::IQ4_NL, &src, &mut dst[..150]),
+            Err(QuantError::UnalignedDst {
+                ty: GgmlType::IQ4_NL,
+                dst: 150,
+                blck: 32
+            })
+        );
     }
 
     /// An E2M1 code (sign, two exponent bits, one mantissa bit) as the OCP

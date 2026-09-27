@@ -139,6 +139,10 @@ name = "gate_deepseek41_engram"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_ple"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_deepseek41_hc"
 required-features = ["deepseek41"]
 
