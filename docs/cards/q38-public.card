@@ -1,7 +1,7 @@
 # The public Qwen3.8-Flash-Next (qwen4exp) rows in one window: decode at depth 6 / 1024 / 3000 and
 # prompt processing at P = 512 / 4096, bloomery (generate_qwen3moe on the qwen4exp UD-Q4_K_XL file,
 # Body38, every routed expert on the host tier) against mainline llama.cpp (53ed051ce) at its best
-# placement on the A6000: the profile's hand-set `-ngl 99 -fa on -lzm off -ncmoe 26` and llama-bench's
+# placement on the A6000: the profile's hand-set `-ngl 99 -fa on -lzm off -ncmoe 26 -t 32` and llama-bench's
 # fit, each row publishing the faster (models/qwen4exp.sh). Runs only after proposal P8 gives
 # tools/ref/depth-qwen3moe.sh its qwen4exp profile.
 #
@@ -48,7 +48,9 @@ reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp be
   q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
   Qwen3.8 has no timed number yet
 decide-in: write the rows into rig-log first, then the README's Qwen3.8 section, ratios from this
-  window only; each llama.cpp row publishes the faster of its hand-set and fit arms; the pass pp row is written as the pass path's, the baseline q38ub is judged against
+  window only; each llama.cpp row publishes the faster of its hand-set and fit arms; the README's
+  table carries decode, and llama.cpp's pp beside it; our pp rows (8-position passes, kind=pass) go
+  to rig-log only, marked the pass path's — the baseline q38ub is judged against, as GLM's are
 decide-below: the host tier serves faster than the byte law says for 3 MB experts: name the term
   (the dispatch rate or the fixed cost) against V4.1's measured union, re-derive the card-expert
   and hot-list levers from the lower h before any lever round opens, then write the rows

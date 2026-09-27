@@ -36,7 +36,8 @@
 #                   the A6000's ~51 GB after ~4.9 GB of non-expert weights and ~10 GB left for the
 #                   -ub 4096 arm's compute and output buffers [derived]. The fit arms (lcppfit,
 #                   lcppppfit) let llama-bench place to the byte; each row publishes the faster.
-#                   The thread count is llama-bench's default; no flag sweep has been run
+#                   -t 32 is the host's cores, spelled out as deepseek41.sh does: the host layers'
+#                   experts run on them. No flag sweep has been run
 #
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
 # the page cache (unlike V4.1's), so a later dump of the same file reads nothing from the device.
@@ -58,7 +59,7 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_
 : "${REF_SET_CUDA:=ref_cuda_qwen4exp}"
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
-: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26}"
+: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26 -t 32}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints (it loads
 # the vocabulary only). Five ids and no BOS: the file sets tokenizer.ggml.add_bos_token to false.
