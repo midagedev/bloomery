@@ -131,6 +131,11 @@ pub enum FaultSite {
     /// first row stands at: a lane never written, or one a commit did not
     /// leave there.
     DeltaStamp = 23,
+    /// A two-level candidate selection (`cand`) met a visible count past its
+    /// score rows, a source or moved score that is not finite, a kept list
+    /// that is not strictly ascending or does not end at its pin, or a list
+    /// entry at or past the candidate rows.
+    CandMask = 26,
 }
 
 // A site is one bit of a u32 mask.
@@ -138,6 +143,7 @@ const _: () = assert!((FaultSite::HcMix as u32) < 32);
 const _: () = assert!((FaultSite::F32Product as u32) < 32);
 const _: () = assert!((FaultSite::Logit as u32) < 32);
 const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
+const _: () = assert!((FaultSite::CandMask as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -164,6 +170,7 @@ impl FaultSite {
         FaultSite::F32Product,
         FaultSite::Logit,
         FaultSite::DeltaStamp,
+        FaultSite::CandMask,
     ];
 
     /// The site's name as an error prints it.
@@ -192,6 +199,7 @@ impl FaultSite {
             FaultSite::F32Product => "f32_product",
             FaultSite::Logit => "logit",
             FaultSite::DeltaStamp => "delta_stamp",
+            FaultSite::CandMask => "cand_mask",
         }
     }
 
@@ -246,6 +254,11 @@ impl FaultSite {
                 "a delta-step lane whose stamp is not the position of the call's first row: a lane \
                  never written, or one a commit did not leave there"
             }
+            FaultSite::CandMask => {
+                "a candidate count past its score rows, a source or moved score not finite, a kept \
+                 list not strictly ascending or not ending at its pin, or a list entry past the \
+                 candidate rows"
+            }
         }
     }
 }
@@ -261,9 +274,9 @@ impl FaultSite {
 pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
-        AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, DeltaStamp, ExpertId, F32Product,
-        HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, Logit, NormQuant, Ple,
-        PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
+        AttnCount, AttnSel, CachePos, CacheValue, CandMask, DeltaLane, DeltaStamp, ExpertId,
+        F32Product, HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, Logit,
+        NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -294,6 +307,7 @@ pub mod step_order {
         F32Product,
         DeltaStamp,
         Logit,
+        CandMask,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -304,6 +318,7 @@ pub mod step_order {
         HcQuant,
         NormQuant,
         QuantColumn,
+        CandMask,
         AttnCount,
         AttnSel,
         Router,
@@ -351,6 +366,7 @@ pub mod step_order {
         F32Product,
         DeltaStamp,
         Logit,
+        CandMask,
     ];
 
     /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
@@ -393,6 +409,7 @@ pub mod step_order {
         HcQuant,
         PoolSelect,
         CacheValue,
+        CandMask,
     ];
 
     /// GLM-5.3-Flash (`gpu-glm5next`): a KDA layer's conv, delta step (its
@@ -425,6 +442,7 @@ pub mod step_order {
         HcMix,
         F32Product,
         DeltaStamp,
+        CandMask,
     ];
 
     /// The order of `arch`'s step.

@@ -21,10 +21,7 @@ use models::{
     Source, ToolFormat, Yarn,
 };
 
-use super::hparams::{
-    CANDIDATE_BLOCK_SIZE, CANDIDATE_SOURCE_LAYER, CANDIDATE_TOPK_BLOCKS, Collapse as HpCollapse,
-    Hparams, LayerKind, Model,
-};
+use super::hparams::{CandidateMask, Collapse as HpCollapse, Hparams, LayerKind, Model};
 use super::{names, roles};
 use crate::arch::dspark::DraftHparams;
 use crate::arch::{Read, chat_of, spec_u32};
@@ -154,7 +151,7 @@ fn layer_of(
                 k: spec_u32("attention.indexer.top_k", hp.indexer.top_k)?,
                 keys,
                 list,
-                candidates: candidates(hp.model, l)?,
+                candidates: candidates(hp.candidates, l)?,
             };
             (
                 Some(Compress {
@@ -278,17 +275,17 @@ fn from<T>(src: usize) -> Result<Source<T>, PlacementError> {
     spec_u32("layer", src).map(Source::From)
 }
 
-/// Layer `l`'s candidate pool: V4.1's reference pools every layer after
-/// [`CANDIDATE_SOURCE_LAYER`] among the blocks that layer's index scores rank
-/// first (the HF `config.json` carries it, the GGUF does not); V4 has none.
-fn candidates(model: Model, l: usize) -> Result<Option<Candidates>, PlacementError> {
-    Ok(match model {
-        Model::Deepseek41 if l > CANDIDATE_SOURCE_LAYER => Some(Candidates {
-            source: spec_u32("candidate source layer", CANDIDATE_SOURCE_LAYER)?,
-            blocks: spec_u32("candidate blocks", CANDIDATE_TOPK_BLOCKS)?,
-            block: spec_u32("candidate block size", CANDIDATE_BLOCK_SIZE)?,
+/// Layer `l`'s candidate pool: V4.1's reference pools every layer after the
+/// mask's source layer among the blocks that layer's index scores rank first
+/// ([`Hparams::candidates`]); V4 has none.
+fn candidates(mask: Option<CandidateMask>, l: usize) -> Result<Option<Candidates>, PlacementError> {
+    Ok(match mask {
+        Some(c) if l > c.source_layer => Some(Candidates {
+            source: spec_u32("attention.candidate_source_layer_id", c.source_layer)?,
+            blocks: spec_u32("attention.candidate_topk_blocks", c.topk_blocks)?,
+            block: spec_u32("attention.candidate_block_size", c.block_size)?,
         }),
-        Model::Deepseek41 | Model::Deepseek4 => None,
+        Some(_) | None => None,
     })
 }
 

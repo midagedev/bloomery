@@ -46,7 +46,9 @@ use std::fmt::{Debug, Write as _};
 use std::path::Path;
 
 use gguf::Split;
-use model::arch::deepseek41::hparams::{Collapse, Hparams, LayerKind, Model, Rope, Score};
+use model::arch::deepseek41::hparams::{
+    CandidateMask, Collapse, Hparams, LayerKind, Model, Rope, Score,
+};
 use model::arch::deepseek41::names;
 use model::placement::workstation;
 use refset::arch::deepseek41::IK;
@@ -270,6 +272,26 @@ fn hw_ds41_hparams_match_ik() {
         rest == hp,
         true,
         "with_indexer_top_k(64)",
+    );
+    row(
+        o,
+        b,
+        "candidates (no candidate key)",
+        hp.candidates,
+        Some(CandidateMask {
+            source_layer: 20,
+            block_size: 8,
+            topk_blocks: 2048,
+        }),
+        "ik's defaults when absent; llama-hparams.cpp:2318-2320 (81af2772)",
+    );
+    row(
+        o,
+        b,
+        "candidate_free_positions",
+        hp.candidate_free_positions(),
+        16_384,
+        "2048 blocks x 8 rows x layer 20's ratio 1",
     );
 
     let _ = writeln!(o, "hyper-connections");
