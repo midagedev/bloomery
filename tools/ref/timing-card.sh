@@ -13,6 +13,21 @@
 # Timed numbers are taken on the A6000 and this overrides the 3090 pin in the box env file.
 # The 3090 is the gate-and-build card. Numbers from the two cards never belong in one table,
 # which is why the first witness line names the card and its power limit.
+#
+# The two-card mode (AGENTS.md, user 2026-09-28): a model that does not fit one card may carry a
+# second table, "A6000+3090", its own and never the A6000's. BLOOMERY_TIMING_CARDS=a6000+3090 turns it
+# on for a runner that opts in (TIMING_CARDS_RUNNER=1 before it sources this file: depth-ds41.sh and
+# depth-qwen3moe.sh); for any other runner, or any other value, TIMING_GPU and CUDA_VISIBLE_DEVICES are
+# left empty and the reason printed, so lease_take refuses the run (64) instead of timing the A6000
+# alone. In the mode both cards are visible, the A6000 first (device 0, TIMING_GPU, the lease's
+# record) and the 3090 second (TIMING_GPU2); there is no other card (OTHER_GPU empty), so a compute
+# process on either is a co-tenant on a timed card: guard_other waits it out or ends the run (75).
+# Before the lease timing_cards_precheck refuses a card that does not answer or answers under another
+# name (69), a 3090 off its 250 W cap (78), a lease.sh that would record one card (64) and a kernel
+# journal it cannot read (69). After each arm timing_cards_arm fails the arm's row on an NVRM Xid
+# since the last arm, a card that stopped answering or left its cap, or an engine log that shows
+# other than the two cards. The witness's `card` field prints both cards and the Xid count since the
+# lease was taken.
 # shellcheck source=tools/ref/cards.sh
 source "${BASH_SOURCE[0]%/*}/cards.sh"
 # now(), the lease and the witness block. guard_other below prints a witness block on its abort path.
@@ -34,6 +49,45 @@ if [ "${BLOOMERY_DRAFT:-}" = dspark ]; then
   export BLOOMERY_DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}
 fi
 
+# The two-card mode's state, set in both modes so a runner under `set -u` can read every name:
+# TIMING_CARDS (a6000+3090, or empty: one card), TIMING_CARDS_NAME (the rows' card field),
+# TIMING_CARDS_WHY (why the value was refused), TIMING_GPU2 (the 3090 in the mode), the cards' PCI
+# addresses as the kernel's Xid lines print them (XID_BUS_A, XID_BUS_B, set by the precheck), the
+# lease's start instant the Xid count runs from (XID_T0) and the count the last arm ended at (XID_BASE).
+TIMING_CARDS='' TIMING_CARDS_NAME='' TIMING_CARDS_WHY='' TIMING_GPU2=''
+XID_BUS_A='' XID_BUS_B='' XID_T0='' XID_BASE=0 TWOCARD_WHY=''
+case ${BLOOMERY_TIMING_CARDS:-} in
+  '') ;;
+  a6000+3090)
+    if [ "${TIMING_CARDS_RUNNER:-}" != 1 ]; then
+      TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=a6000+3090, and ${0##*/} has no two-card mode (a runner opts in with TIMING_CARDS_RUNNER=1): it would time the A6000 alone"
+    elif [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "$GPU_A6000" ]; then
+      TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=a6000+3090 makes the A6000 device 0 and the timing card; BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU names another"
+    else
+      TIMING_CARDS=a6000+3090 TIMING_CARDS_NAME=A6000+3090
+    fi
+    ;;
+  *) TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS is a6000+3090 (the two-card mode) or unset (one card), got '$BLOOMERY_TIMING_CARDS'" ;;
+esac
+if [ -n "$TIMING_CARDS" ]; then
+  # shellcheck disable=SC2034 # TIMING_GPU2 is read by lease.sh's lease_take (the lease's record)
+  TIMING_GPU=$GPU_A6000 TIMING_GPU2=$GPU_3090 OTHER_GPU=
+  export CUDA_VISIBLE_DEVICES=$GPU_A6000,$GPU_3090
+elif [ -n "$TIMING_CARDS_WHY" ]; then
+  # A runner that opts in says it itself (timing_cards_mode); for any other this line is the reason.
+  [ "${TIMING_CARDS_RUNNER:-}" = 1 ] || echo "[timing-cards] refused: $TIMING_CARDS_WHY" >&2
+  TIMING_GPU='' OTHER_GPU=''
+  export CUDA_VISIBLE_DEVICES=
+fi
+# timing_cards_mode: 0 in one-card mode and in the two-card mode; 64 and the reason when
+# BLOOMERY_TIMING_CARDS was refused above. A runner that opts in calls it right after sourcing this file,
+# dry run or not.
+timing_cards_mode() {
+  [ -n "$TIMING_CARDS_WHY" ] || return 0
+  echo "${0##*/}: $TIMING_CARDS_WHY" >&2
+  return 64
+}
+
 # The timing card's witness lines: the `card` field of lease.sh's witness block. loadavg is not the
 # quiet-machine signal (see docs/quiet-machine.md in rig-log): IO pressure and the actual process
 # list are.
@@ -45,6 +99,10 @@ fi
 # reason bitmask at the instant (nvml.h: 0x1 idle, 0x4 sw power cap, 0x20 sw thermal, 0x40 hw thermal).
 # cpu-freq is lease.sh's field of that name.
 witness_card() {
+  if [ -n "$TIMING_CARDS" ]; then
+    witness_cards
+    return 0
+  fi
   echo "    timing-card: $(nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv,noheader -i "$TIMING_GPU")"
   echo "    timing-card clocks: $(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,clocks_event_reasons.active,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,temperature.gpu,power.draw --format=csv,noheader,nounits -i "$TIMING_GPU" | awk -F', ' '{ printf "sm=%s max=%s MHz event_reasons=%s capped_us sw_power=%s sw_thermal=%s hw_thermal=%s temp=%s C power=%s W", $1, $2, $3, $4, $5, $6, $7, $8 }')"
   echo "    cpu-freq: $(cpu_freq_summary)"
@@ -71,6 +129,10 @@ WITNESS=(head-open indent card model)
 OTHER_BUSY_TAG=
 guard_other() {
   local apps
+  if [ -n "$TIMING_CARDS" ]; then
+    guard_cards
+    return 0
+  fi
   apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
   # shellcheck disable=SC2034 # read by the runners that source this file
   OTHER_BUSY_TAG=${apps:+ [other-busy]}
@@ -80,6 +142,245 @@ guard_other() {
     witness abort-other >&2
     exit 75
   fi
+}
+
+# ---- The two-card mode ("A6000+3090"). Nothing below runs in one-card mode.
+
+# Each card's line in the two-card witness and checks: `<name>, <power.limit> W, <enforced.power.limit>
+# W, <bus>` from one nvidia-smi query, bounded as lease.sh's witness queries are (__witness_smi: a card
+# off the bus can hang it). __card_query <uuid>: into CARD_Q (the csv line, nounits) and CARD_RC.
+__card_query() {
+  __witness_smi --query-gpu=name,power.limit,enforced.power.limit,pci.bus_id --format=csv,noheader,nounits -i "$1"
+  CARD_Q=$__witness_out CARD_RC=$__witness_rc
+}
+# __xid_bus <nvidia-smi pci.bus_id>: the address as the kernel's Xid line prints it: 00000000:41:00.0 is
+# `PCI:0000:41:00` (the domain's low four digits, bus and device, no function), lower case.
+__xid_bus() { sed -E 's/^[0-9A-Fa-f]{4}([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})\.[0-9A-Fa-f]$/\1/' <<< "$1" | tr 'A-F' 'a-f'; }
+# __card_ok <label> <uuid> <want in name> <cap W or empty>: CARD_Q for the card, and 1 with TWOCARD_WHY
+# when it does not answer, answers under another name, or (a cap given) its power.limit or
+# enforced.power.limit is not the cap; the verdict line into CARD_LINE. The cap is compared as a number.
+__card_ok() {
+  local label=$1 uuid=$2 want=$3 cap=$4 name lim enf bus
+  __card_query "$uuid"
+  if [ "$CARD_RC" != 0 ] || [ -z "$CARD_Q" ]; then
+    TWOCARD_WHY="the $label ($uuid) does not answer nvidia-smi (rc $CARD_RC): a two-card run would load on the other card alone"
+    CARD_LINE="$label: unavailable (rc $CARD_RC)"
+    return 69
+  fi
+  IFS=, read -r name lim enf bus <<< "$CARD_Q"
+  name=${name# } lim=${lim# } enf=${enf# } bus=${bus# }
+  CARD_LINE="$label: $name, power.limit $lim W, enforced $enf W, bus $bus"
+  case $name in
+    *"$want"*) ;;
+    *)
+      TWOCARD_WHY="the $label's UUID ($uuid, tools/ref/cards.sh) answers as '$name': not the card the two-card table names"
+      return 69
+      ;;
+  esac
+  [ -n "$cap" ] || return 0
+  if ! awk -v l="$lim" -v e="$enf" -v c="$cap" 'BEGIN { exit !(l + 0 == c && e + 0 == c) }'; then
+    TWOCARD_WHY="the $label's power limit reads $lim W (enforced $enf W), not its $cap W cap (gpu-power-limit.service): the two-card rule keeps it capped"
+    return 78
+  fi
+  CARD_LINE="$CARD_LINE (the $cap W cap: ok)"
+}
+
+# timing_cards_arms <our binary> <arm> <kind> <engine> ...: in the two-card mode (0 at once without it),
+# before a dry run's lines or the lease: 64 and the reason when the profile has no two-card line
+# (TWO_CARD_PLACEMENT: the model fits one card, and the A6000+3090 table is for one that does not) or an
+# arm has none. Each arm is three words: the arm as given, its kind (ref for a reference engine; ours,
+# corpus or bin run <our binary>) and its engine. Only mainline llama.cpp's arms (lcpp..., the fit arms
+# too) have a two-card line: the profile's -ts split, or llama-bench's fit over both cards. Our binaries
+# load one card (--place a|gate); plan (b) is their expected two-card interface, `--place b`.
+timing_cards_arms() {
+  local bin=$1 a kind eng
+  [ -n "$TIMING_CARDS" ] || return 0
+  shift
+  if [ -z "${TWO_CARD_PLACEMENT:-}" ]; then
+    echo "${0##*/}: BLOOMERY_TIMING_CARDS=a6000+3090 and the profile ${MODEL_NAME:-?} has no two-card line (TWO_CARD_PLACEMENT): a model that fits one card has no A6000+3090 table (AGENTS.md)" >&2
+    return 64
+  fi
+  while [ $# -ge 3 ]; do
+    a=$1 kind=$2 eng=$3
+    shift 3
+    case $kind:$eng in
+      ref:lcpp*) ;;
+      ref:*)
+        echo "${0##*/}: arm '$a': the two-card table's reference is mainline llama.cpp (the profile's two-card line: $TWO_CARD_PLACEMENT); $eng has no two-card arm" >&2
+        return 64
+        ;;
+      *)
+        echo "${0##*/}: arm '$a': ${bin##*/} loads one card (--place a|gate); its two-card placement, plan (b) (workstation::plan_b), is expected as --place b and does not exist yet, so the A6000+3090 table has no row of ours" >&2
+        return 64
+        ;;
+    esac
+  done
+}
+
+# timing_cards_precheck: before the lease, in the two-card mode (0 at once without it). The static facts
+# only, each printed as a `[timing-cards]` line: both cards answer nvidia-smi by UUID under their names
+# (69 otherwise), the 3090's power.limit and enforced.power.limit read 250 W (78), lease.sh writes a
+# two-card record (64: an unpatched lease.sh would record the A6000 alone and let a forced 3090 gate
+# start beside the run), and the kernel journal answers (69: no Xid reader). A compute process on a card
+# is not checked here: guard_other waits it out after the lease. Sets XID_BUS_A and XID_BUS_B; the
+# refusal's reason is TWOCARD_WHY, and a dry run prints it and goes on. The optional argument prefixes
+# every line (a dry run's `[dry] `).
+timing_cards_precheck() {
+  local rc=0 out pre=${1:-}
+  [ -n "$TIMING_CARDS" ] || return 0
+  TWOCARD_WHY=''
+  __card_ok A6000 "$GPU_A6000" A6000 '' || rc=$?
+  echo "${pre}[timing-cards] $CARD_LINE"
+  [ "$rc" = 0 ] || return "$rc"
+  XID_BUS_A=$(__xid_bus "${CARD_Q##*, }")
+  __card_ok 3090 "$GPU_3090" 3090 250 || rc=$?
+  echo "${pre}[timing-cards] $CARD_LINE"
+  [ "$rc" = 0 ] || return "$rc"
+  XID_BUS_B=$(__xid_bus "${CARD_Q##*, }")
+  if [ "${LEASE_CARDS_RECORD:-}" != 1 ]; then
+    TWOCARD_WHY="tools/ref/lease.sh records one timing card (no LEASE_CARDS_RECORD): tools/gpu-gate.sh would read the lease as the A6000's and start a forced 3090 gate beside this run; the lease.sh two-card record lands first"
+    return 64
+  fi
+  if ! out=$(timeout --kill-after=5 30 journalctl -k -n 1 -o short-unix --no-pager -q 2>&1); then
+    TWOCARD_WHY="journalctl -k does not answer (${out##*$'\n'}): no Xid reader for the witness"
+    return 69
+  fi
+  echo "${pre}[timing-cards] Xid reader: journalctl -k, NVRM Xid lines on PCI:$XID_BUS_A (A6000) and PCI:$XID_BUS_B (3090)"
+}
+
+# timing_cards_start: right after lease_take, the lease's start instant, from which the witness counts
+# the kernel's Xid lines (XID_T0, whole seconds: a line in the second the lease was taken counts).
+timing_cards_start() {
+  [ -n "$TIMING_CARDS" ] || return 0
+  XID_T0=$(date +%s) XID_BASE=0
+  echo "[timing-cards] Xid count from @$XID_T0 ($(date -u -d "@$XID_T0" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null || echo ?)), the lease's start"
+}
+
+# xid_read: the kernel journal's `NVRM: Xid` lines since XID_T0 into XID_N (all), XID_NA (the A6000's
+# bus), XID_NB (the 3090's) and XID_LAST (the last line); 1 with XID_ERR when the journal does not answer
+# or the lease has no start instant yet.
+xid_read() {
+  local out rc=0 lines
+  XID_N=0 XID_NA=0 XID_NB=0 XID_LAST='' XID_ERR=''
+  if [ -z "$XID_T0" ]; then
+    XID_ERR="no lease start instant (timing_cards_start not run)"
+    return 1
+  fi
+  out=$(timeout --kill-after=5 30 journalctl -k --since "@$XID_T0" -o short-unix --no-pager -q 2>&1) || rc=$?
+  if [ "$rc" != 0 ]; then
+    XID_ERR="journalctl -k exited $rc: ${out##*$'\n'}"
+    return 1
+  fi
+  lines=$(grep -F 'NVRM: Xid' <<< "$out" || true)
+  [ -n "$lines" ] || return 0
+  XID_N=$(grep -c . <<< "$lines")
+  XID_NA=$(grep -cF "(PCI:$XID_BUS_A)" <<< "$lines" || true)
+  XID_NB=$(grep -cF "(PCI:$XID_BUS_B)" <<< "$lines" || true)
+  XID_LAST=$(tail -n 1 <<< "$lines")
+}
+
+# The two-card witness (witness_card's `card` field in the mode): the mode, each card's name, power limit
+# and clocks, the 3090's cap, the Xid count since the lease was taken, then the lines one card prints.
+witness_cards() {
+  local q lab uuid
+  echo "    timing-cards: $TIMING_CARDS_NAME, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (device 0 the A6000, device 1 the 3090)"
+  for lab in A6000 3090; do
+    if [ "$lab" = A6000 ]; then uuid=$GPU_A6000; else uuid=$GPU_3090; fi
+    __witness_smi --query-gpu=name,power.limit,enforced.power.limit,clocks.max.sm --format=csv,noheader -i "$uuid"
+    if [ "$__witness_rc" = 0 ]; then echo "    card $lab: $__witness_out"; else echo "    card $lab: unavailable (rc $__witness_rc)"; fi
+    __witness_smi --query-gpu=clocks.sm,clocks.max.sm,clocks_event_reasons.active,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,temperature.gpu,power.draw --format=csv,noheader,nounits -i "$uuid"
+    if [ "$__witness_rc" = 0 ]; then
+      q=$(awk -F', ' '{ printf "sm=%s max=%s MHz event_reasons=%s capped_us sw_power=%s sw_thermal=%s hw_thermal=%s temp=%s C power=%s W", $1, $2, $3, $4, $5, $6, $7, $8 }' <<< "$__witness_out")
+      echo "    card $lab clocks: $q"
+    else
+      echo "    card $lab clocks: unavailable (rc $__witness_rc)"
+    fi
+  done
+  TWOCARD_WHY=''
+  if __card_ok 3090 "$GPU_3090" 3090 250; then echo "    3090 cap: ok ($CARD_LINE)"; else echo "    3090 cap: NOT HELD: $TWOCARD_WHY"; fi
+  if xid_read; then
+    echo "    xid: $XID_N NVRM Xid line(s) since the lease was taken (@$XID_T0): A6000 $XID_NA, 3090 $XID_NB, other $((XID_N - XID_NA - XID_NB)); last: ${XID_LAST:-none}"
+  else
+    echo "    xid: unavailable ($XID_ERR)"
+  fi
+  echo "    cpu-freq: $(cpu_freq_summary)"
+  [ -z "${BIN_SHA:-}" ] || echo "    binary: ${BIN_PATH:-?} sha256=$BIN_SHA mtime=${BIN_MTIME:-?}"
+  echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
+  echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
+  echo "    gpu: $(nvidia-smi --query-gpu=index,utilization.gpu,power.draw,clocks.sm --format=csv,noheader | tr '\n' ';')"
+  echo "    load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) llm.service=$(systemctl is-active llm.service || true)"
+}
+
+# guard_cards: guard_other in the two-card mode. Both cards are timed, so a compute process on either as
+# an arm starts (another round's functional run or an `any` gate finishing: minutes) is waited out,
+# polling every 10 s, and after 10 minutes ends the run: a witness block and rc 75, contention, not a
+# result. Every two-card arm is a process of its own, so none of the runner's own is on a card here.
+# TIMING_CARDS_POLL (seconds, default 10) is the stub tests' (tools/ref/depth-*-stub.sh) short poll.
+guard_cards() {
+  local apps i uuid poll=${TIMING_CARDS_POLL:-10}
+  # shellcheck disable=SC2034 # read by the runners that source this file
+  OTHER_BUSY_TAG=
+  for ((i = 0; i < 60; i++)); do
+    # Bounded (__witness_smi): a card off the bus can hang the query, and this loop is inside the lease.
+    # A query that fails counts as busy, named, so the wait ends at 75 instead of timing a lost card.
+    apps=''
+    for uuid in "$GPU_A6000" "$GPU_3090"; do
+      __witness_smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader -i "$uuid"
+      if [ "$__witness_rc" != 0 ]; then
+        apps+="$uuid: nvidia-smi rc $__witness_rc"$'\n'
+      elif [ -n "$__witness_out" ]; then
+        apps+="$__witness_out"$'\n'
+      fi
+    done
+    apps=${apps%$'\n'}
+    if [ -z "$apps" ]; then
+      [ "$i" = 0 ] || echo "[cards-busy] $(now) both cards are free after $((i * poll)) s" >&2
+      return 0
+    fi
+    if [ "$i" = 0 ]; then
+      echo "[cards-busy] $(now) compute apps on a timed card: [$(echo "$apps" | tr '\n' ';')]; waiting up to 10 min" >&2
+      witness wait-cards >&2
+    fi
+    sleep "$poll"
+  done
+  echo "[cards-busy] $(now) still busy after $((60 * poll)) s: [$(echo "$apps" | tr '\n' ';')]" >&2
+  witness abort-cards >&2
+  exit 75
+}
+
+# timing_cards_arm <engine log>: after an arm's post witness in the two-card mode (0 at once without
+# it): 1 with TWOCARD_WHY when a kernel Xid line came since the last arm's check (between the arms, or
+# inside this one: the arm is charged either way, and the count moves on), when the Xid reader failed,
+# when a card stopped answering or the 3090 left its cap, or when the engine's log does not show exactly
+# the two cards as its devices 0 and 1 (ggml_cuda_init's `found N CUDA devices` and `Device i:` lines): a
+# llama-bench that sees one card spreads nothing and would be timed as if it were one card. TWOCARD_DEVS
+# is `<device 0> + <device 1>` for the row.
+timing_cards_arm() {
+  local n d0 d1
+  TWOCARD_WHY='' TWOCARD_DEVS=''
+  [ -n "$TIMING_CARDS" ] || return 0
+  if ! xid_read; then
+    TWOCARD_WHY="the Xid reader failed after the arm: $XID_ERR"
+    return 1
+  fi
+  if [ "$XID_N" -gt "$XID_BASE" ]; then
+    TWOCARD_WHY="$((XID_N - XID_BASE)) NVRM Xid line(s) since the last arm's check (A6000 $XID_NA, 3090 $XID_NB since the lease was taken); last: $XID_LAST"
+    XID_BASE=$XID_N
+    return 1
+  fi
+  __card_ok A6000 "$GPU_A6000" A6000 '' || return 1
+  __card_ok 3090 "$GPU_3090" 3090 250 || return 1
+  n=$(sed -nE 's/.*ggml_cuda_init: found ([0-9]+) CUDA devices.*/\1/p' <<< "$1" | head -n 1)
+  d0=$(sed -nE 's/^ *Device 0: ([^,]*),.*/\1/p' <<< "$1" | head -n 1)
+  d1=$(sed -nE 's/^ *Device 1: ([^,]*),.*/\1/p' <<< "$1" | head -n 1)
+  # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
+  case "$n|$d0|$d1" in
+    2\|*A6000*\|*3090*) TWOCARD_DEVS="$d0 + $d1" ;;
+    *)
+      TWOCARD_WHY="the engine saw ${n:-no} CUDA device(s) (device 0 '${d0:-?}', device 1 '${d1:-?}'), not the A6000 and the 3090: a one-card run in the two-card table"
+      return 1
+      ;;
+  esac
 }
 
 # Refuse to measure a binary that is older than the sources it was built from, and record what
