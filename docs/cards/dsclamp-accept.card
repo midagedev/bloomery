@@ -1,0 +1,36 @@
+# Round dsclamp (ik_llama.cpp upstream fix). ik main ed27bf7ed2's swiglu_limit() (src/llama-model.h:672)
+# returns 0 for LLM_ARCH_DFLASH, so a DSV4-signature DSpark draft runs its SwiGLUs unclamped although the
+# loader reads its limits (10.0 in both drafts) and the reference (model.py Expert, DSparkBlock) clamps.
+# The patch adds `!hparams.dflash_dsv4` to the arch test. A functional A/B, not timed: acceptance counts
+# do not depend on machine load; the lease is held so the 347 GB target mapping does not share the box.
+# Arms, one llama-server load each on the A6000, 20 prompts (the 09-25 sweep set), greedy, n_predict 200,
+# server dspark:n_max=5, per-request n_max 3 (judged) and 5 (reported):
+#   base (limit 0), patch (limit 10), control (patch + DSCLAMP_DRAFT_LIMIT=1e30: the patched code path
+#   with a limit that never binds; the shared expert's unary.cu kernels round differently for limit 0
+#   and limit > 0, so patch - control is the clamp alone and control - base is rounding alone).
+# Wall per arm: V4.1 8-10 min (load ~4 + 40 requests ~5), V4 4-6 min.
+# Ruler: the 09-25 mask-commit A/B on this prompt set read +2.3 pp, paired bootstrap 95 % [+0.4, +4.3],
+# about +-2 pp at 20 prompts; control - base re-measures it for this change. Sign test (ties dropped,
+# exact two-sided) p < 0.05 needs 13 of 17 or 15 of 20 prompts up.
+# The band is a prior, not a derivation: the direction is the reference's (the draft was trained with
+# the clamp); the magnitude is what the run fixes. The clamp is known to bind: ik's own dump of the tl37
+# draft (bloomery gate_dspark_graph, set code64_n32_w3) has 2-16 of 6,912 shared-expert values per layer
+# per block past 10.
+kind: profile
+question: does the one-line fix (the DSV4-signature dflash draft gets its SwiGLU limits) raise DSpark
+  draft acceptance in ik_llama.cpp, and is the change the clamp binding rather than kernel rounding?
+term: pooled draft acceptance (accepted / drafted) at n_max 3, patch minus base, in percentage points,
+  V4.1 public Q3_K_M + tl37 draft, 20 prompts, greedy, A6000; patch minus control and control minus
+  base beside it
+unit: pp
+predict: 1..6 pp
+condition: every arm is the same command on the same target bytes and prompts, one server load on the
+  A6000 alone, under the lease and the A6000 gate lock; ik is run-to-run deterministic per binary
+  (09-25: two passes byte-identical), so a difference between arms is the code, and its reach is bounded
+  by the prompt sample (paired bootstrap over prompts); each arm is its own lease-hold job under 30 min
+decide-in: if the paired bootstrap lower bound is above 0, draft the PR with the numbers and the
+  interval; run the V4 arms for the second file
+decide-below: if the interval spans 0, the PR stands on reference parity and the #2295 regression and
+  claims neither gain nor loss; if the upper bound is below 0, no PR, report the per-prompt tables
+decide-above: draft the PR with the numbers; check that patch minus control carries the gain (not the
+  rounding arm) before writing it, then run the V4 arms

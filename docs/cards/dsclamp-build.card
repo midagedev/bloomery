@@ -1,0 +1,9 @@
+# Round dsclamp (ik_llama.cpp upstream fix: the DSV4-signature DFlash draft never applies its SwiGLU
+# clamp). Builds of llama-server in three ik trees (base ed27bf7ed2, the one-line patch, the control
+# copy); measures nothing.
+kind: exclusive
+reason: cmake --build -j 24 of ik's CUDA llama-server (ccache) in /home/user/ik-dsclamp-base,
+  /home/user/ik-dsclamp and /home/user/dsclamp-scratch/ik-control; beside a timed run it would take
+  24 cores, so it holds the lease; why now: the lead's phase B sitting for dsclamp (user-approved
+  2026-09-27, about 45-60 min in all)
+minutes: 5..15
