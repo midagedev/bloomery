@@ -14,7 +14,9 @@
 //! stores, two arenas (the step's one row, an eager pass's
 //! [`PASS_ROWS`](super::scratch38::PASS_ROWS)), the input records, and the
 //! host tier over every layer's routed stacks (no routed expert on the
-//! card).
+//! card). [`Body38::open_placed_mtp`] also opens the MTP draft layer on the
+//! same card ([`Mtp38`]: its weights, its store, the reduced head's rows);
+//! no walk reads it.
 //!
 //! The walk is `program38`'s. The decode step is captured; a prompt runs
 //! either as captured steps, one a position ([`Prompt38::Step`]), or as
@@ -54,6 +56,7 @@
 //! recurrent stores one call on, so a call at that position is refused by
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
+use super::mtp38::Mtp38;
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
@@ -458,6 +461,8 @@ pub struct Body38 {
     staged: Option<Staged38>,
     /// A failure a gate planted for the next call.
     plant: Option<Plant>,
+    /// The MTP draft layer, when the load opened one ([`Body38::open_placed_mtp`]).
+    mtp: Option<Mtp38>,
 }
 
 impl Body38 {
@@ -473,6 +478,45 @@ impl Body38 {
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
         host: HostCfg,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(file, plan, inputs, card, host, None)
+    }
+
+    /// [`Body38::open_placed`] of `plan`'s target plan with the MTP draft
+    /// of `draft` (the draft file `mtp` was read from) opened on the same
+    /// card beside it ([`Mtp38::open`]); refused as either refuses.
+    pub fn open_placed_mtp(
+        file: Split,
+        plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        draft: &Split,
+        mtp: &model::arch::qwen35moe::place::MtpInputs,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file,
+            &plan.plan,
+            inputs,
+            card,
+            host,
+            Some((draft, mtp, plan)),
+        )
+    }
+
+    /// The load both constructors share; `mtp` the draft's file, inputs and
+    /// plan, when there is one.
+    fn open_with(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        mtp: Option<(
+            &Split,
+            &model::arch::qwen35moe::place::MtpInputs,
+            &model::arch::qwen35moe::place::MtpPlan<'_>,
+        )>,
     ) -> Result<Qwen38Model, GpuError> {
         let refused: Vec<String> = inputs
             .unimplemented()
@@ -517,7 +561,13 @@ impl Body38 {
             host,
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, residency| {
-                Body38::load_placed(gpu, file, w, plan, inputs, &shape, host, residency)
+                let draft = mtp
+                    .map(|(d, m, p)| Mtp38::open(gpu, &file, w, d, m, p, host.card_dontneed))
+                    .transpose()?;
+                let mut body =
+                    Body38::load_placed(gpu, file, w, plan, inputs, &shape, host, residency)?;
+                body.mtp = draft;
+                Ok(body)
             },
         )
     }
@@ -665,6 +715,7 @@ impl Body38 {
             held: 0,
             staged: None,
             plant: None,
+            mtp: None,
         };
         body.sp.write(stream, 0, 0)?;
         stream.synchronize()?;
@@ -694,6 +745,12 @@ impl Body38 {
     #[must_use]
     pub fn ctx(&self) -> usize {
         self.ctx
+    }
+
+    /// The MTP draft layer; `None` on a load without one.
+    #[must_use]
+    pub fn mtp(&self) -> Option<&Mtp38> {
+        self.mtp.as_ref()
     }
 
     /// Tokens of the vocabulary.
@@ -1290,6 +1347,7 @@ impl ChainBody for Body38 {
             + self.lane.bytes()
             + self.hybrid.boundary().device_bytes()
             + self.taps.as_ref().map_or(0, Taps38::bytes)
+            + self.mtp.as_ref().map_or(0, Mtp38::resident_bytes)
     }
 
     fn layers(&self) -> Range<usize> {

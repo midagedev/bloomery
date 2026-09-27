@@ -94,6 +94,14 @@ pub const fn kv_row_bytes(kv_heads: usize, head_dim: usize) -> u64 {
     2 * (kv_heads * head_dim) as u64 * F16_BYTES
 }
 
+/// A dense attention layer's bytes at `ctx` positions: each position's K and
+/// V ([`kv_row_bytes`]) and nothing else — the MTP draft layer's store, which
+/// attends to every position it holds.
+#[must_use]
+pub const fn dense_kv_bytes(kv_heads: usize, head_dim: usize, ctx: usize) -> u64 {
+    ctx as u64 * kv_row_bytes(kv_heads, head_dim)
+}
+
 /// A selecting attention layer's bytes at `ctx` positions: each position's
 /// K and V ([`kv_row_bytes`]) and raw index key of `idx_dim` f16, and one
 /// pooled key of `idx_dim` f16 a pool of `pool` positions
@@ -113,8 +121,8 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, conv_ring_rows, delta_lane_bytes, kv_row_bytes, ple_ring_bytes, ple_ring_rows,
-        pooled_rows, recurrent_bytes, selecting_bytes,
+        DELTA_LANES, conv_ring_rows, delta_lane_bytes, dense_kv_bytes, kv_row_bytes,
+        ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, selecting_bytes,
     };
 
     /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32 and
@@ -137,6 +145,16 @@ mod tests {
             selecting_bytes(2, 256, 128, 4, 4097),
             4097 * 2304 + 1025 * 256
         );
+    }
+
+    /// Qwen3.8's MTP layer: 2 × 2 × 256 f16 of K and V a position and no
+    /// index key, at every position to the context.
+    #[test]
+    fn qwen38_mtp_store() {
+        assert_eq!(dense_kv_bytes(2, 256, 4096), 8_388_608);
+        assert_eq!(dense_kv_bytes(2, 256, 32_768), 67_108_864);
+        assert_eq!(dense_kv_bytes(2, 256, 1), 2048);
+        assert_eq!(dense_kv_bytes(2, 256, 0), 0);
     }
 
     /// Qwen3.8's lanes: past the one lane `recurrent_bytes` counts, three
