@@ -8,8 +8,8 @@
 //! ([`placement::plan_host_routed`]: no card expert kernel serves the file's
 //! routed stacks yet) and the rest where its role says — the trunk, the
 //! hyper-connections, the PLE site's projections, the router, the shared
-//! expert and the head on the card, the PLE table in the file, its rows
-//! gathered by the host.
+//! expert and the head on the card, the PLE table on the host in its file
+//! bytes ([`ple_on_host`]), its rows gathered by the host.
 //!
 //! The attention layers select their positions by the mean-pool indexer at
 //! every position the program runs, so no count of positions is refused for
@@ -38,8 +38,8 @@ use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::workstation::{CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host};
 use crate::placement::{
-    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
-    Plan, PlanLevers, Unimplemented, Violation,
+    self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor, ModelTensors,
+    PlacementError, Plan, PlanLevers, Unimplemented, Violation,
 };
 
 use runtime::stores::{
@@ -138,9 +138,9 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`, every routed expert on the host; refused
-    /// past [`KERNEL_POSITIONS`], when it cannot be built, or when it breaks
-    /// an invariant.
+    /// the placement's `levers`, every routed expert and the PLE table on the
+    /// host; refused past [`KERNEL_POSITIONS`], when it cannot be built, or
+    /// when it breaks an invariant.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -150,7 +150,7 @@ impl PlanInputs {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
         }
-        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
+        let plan = self.target(machine, ctx_max, levers)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
@@ -183,7 +183,7 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
+        let plan = self.target(machine, ctx_max, levers)?;
         let draft = placement::plan_routed(
             &mtp.model,
             &mtp.machine,
@@ -236,6 +236,75 @@ impl PlanInputs {
             map_bytes: mtp.map_bytes,
         })
     }
+
+    /// The target's placement, before its invariants are checked: every
+    /// routed expert on the host ([`placement::plan_host_routed`]), then the
+    /// PLE table moved to the host ([`ple_on_host`]).
+    fn target<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlacementError> {
+        let mut plan =
+            placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
+        ple_on_host(&mut plan)?;
+        Ok(plan)
+    }
+}
+
+/// `plan` with the PLE table's one segment moved from the NVMe tier, where
+/// the placement's role rule puts a row-gathered table, to the host in its
+/// file bytes, and its bytes from `nvme_bytes` to the host's tables (and out
+/// of the host's headroom). Every step reads the table's hashed rows from
+/// host RAM before its launch, so its pages belong to the host set a load
+/// reads in and may lock ([`placement::host_lock::HostSet`]): a first touch
+/// in a step is a read from the drive. In this architecture the one
+/// [`Role::EngramTable`] is the PLE table; a file without one is left as it
+/// is. A PLE row of other than one NVMe file segment is refused by name.
+fn ple_on_host(plan: &mut Plan<'_>) -> Result<(), PlacementError> {
+    let model = plan.model;
+    for r in &mut plan.rows {
+        let Some(t) = model
+            .tensors
+            .get(r.tensor)
+            .filter(|t| t.role == Role::EngramTable)
+        else {
+            continue;
+        };
+        let refuse = |detail: String| PlacementError::Tensor {
+            name: t.name.clone(),
+            detail,
+        };
+        let n = r.segments.len();
+        let [s] = r.segments.as_mut_slice() else {
+            return Err(refuse(format!("the PLE table in {n} segments, not one")));
+        };
+        if (s.device, s.format) != (Device::Nvme, Format::NvmeFile) {
+            return Err(refuse(format!(
+                "the PLE table on {:?} as {}, not the NVMe tier's file bytes",
+                s.device, s.format
+            )));
+        }
+        let b = s.resident_bytes;
+        let nvme = plan.nvme_bytes.checked_sub(b).ok_or_else(|| {
+            refuse(format!(
+                "the PLE table's {b} bytes pass the NVMe tier's {}",
+                plan.nvme_bytes
+            ))
+        })?;
+        let tables = plan.host.table_bytes.checked_add(b).ok_or_else(|| {
+            refuse(format!(
+                "the host's {} table bytes and the PLE table's {b} pass u64",
+                plan.host.table_bytes
+            ))
+        })?;
+        plan.nvme_bytes = nvme;
+        plan.host.table_bytes = tables;
+        plan.host.headroom_bytes -= i128::from(b);
+        (s.device, s.format) = (Device::Host, Format::HostFile);
+    }
+    Ok(())
 }
 
 /// A draft plan's card terms: its granules (dense, experts, rounding), its
