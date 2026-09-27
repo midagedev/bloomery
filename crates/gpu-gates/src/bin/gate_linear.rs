@@ -9,27 +9,33 @@
 //! 1. `math`: [`expf_ik`] and [`logf_poly`] within [`MATH_ULPS`] of the f64
 //!    functions (exp on [−87, 88], log on [1, 1 + e²⁰], the range softplus
 //!    passes it).
-//! 2. `conv`: the conv and prep of 512, 2 and 1 tokens from a random
-//!    incoming conv state — output, β, decay and the new state — and 512
-//!    one-token launches chained through the state equal to the 512-token
-//!    launch.
-//! 3. `delta`: a 512-token prompt from a zero state (`o` and the state after
-//!    it), one decode step from that state, a one-token prompt from a zero
-//!    state, the grouped key-head map on 8 tokens, and 512 one-token
-//!    launches chained through the state equal to the 512-token launch.
+//! 2. `conv`: the conv and prep of 512, 2 and 1 tokens at position 1,000
+//!    over a random conv ring — output, β, decay and the ring after it; 512
+//!    one-token launches chained through the ring equal to the 512-token
+//!    launch; 8 tokens at the sequence start reading zeros over a random
+//!    ring; and a call resuming from the ring at position 20, then a
+//!    rollback into that pass, equal to the same tokens fed from position 0.
+//! 3. `delta`: on a one-lane state read and written in place, a 512-token
+//!    prompt from a zero state (`o` and the state after it), one decode step
+//!    from that state, a one-token prompt from a zero state, the grouped
+//!    key-head map on 8 tokens, and 512 one-token launches chained through
+//!    the state equal to the 512-token launch; and the launcher's refusal of
+//!    two lanes and of none.
 //! 4. `norm_gate`: 512 and 1 tokens.
-//! 5. `graph`: one decode token's conv, delta and norm captured as a graph:
-//!    three nodes, the replay equal to the eager launches.
+//! 5. `graph`: one decode token's conv, delta and norm captured once as a
+//!    graph of three nodes and replayed for three successive positions, only
+//!    the step's words rewritten between replays, equal to eager launches.
 //! 6. `depth`: 4,096 tokens through the conv and the delta step on the card
 //!    in launches of 6, 1,018 and 3,072 tokens, the state after the last
 //!    equal to the host rule over all 4,096 at once; then (reported, not
 //!    judged) how far the f32 state at depths 6, 1,024 and 4,096 sits from
 //!    an f64 run of the same recurrence on the same inputs.
 //! 7. `fault`: a NaN input and an overflow from finite inputs for each
-//!    kernel, each launched with a layer's sink: the word names that layer
-//!    and the kernel's site, the values the planted input reaches are not
-//!    finite, every other value is the clean launch's bit for bit, and the
-//!    word is clean before and after.
+//!    kernel, a position out of line for the conv and a lane word past the
+//!    lanes for the delta step, each launched with a layer's sink: the word
+//!    names that layer and the kernel's site, the values the planted input
+//!    reaches are not finite, every other value is the clean launch's bit
+//!    for bit, and the word is clean before and after.
 //! 8. `shape`: the three entries compile with no local depot.
 
 #[cfg(not(feature = "gpu"))]
@@ -49,8 +55,8 @@ mod gate {
     use bloomery_gpu::linear::delta::{DeltaArgs, DeltaOut, delta_host};
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::{
-        CONV_ROWS, CONV_TAPS, GATE_SILU, HEAD, KHeadMap, LinearKernels, LinearShape, expf_ik,
-        logf_poly,
+        CONV_TAPS, GATE_SILU, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS, RING_ROWS,
+        expf_ik, logf_poly,
     };
     use bloomery_gpu::{Fault, FaultSink, FaultSite, Gpu};
     use bloomery_gpu_gates::{
@@ -70,6 +76,11 @@ mod gate {
     const PROMPT: usize = 512;
     /// The depths of the drift report, and the launch lengths that reach them.
     const DEPTHS: [usize; 3] = [6, 1024, 4096];
+    /// The first position of the conv clauses past the sequence start.
+    const P0: usize = 1000;
+    /// The graph clause's first position and replays.
+    const GRAPH_P0: usize = 40;
+    const GRAPH_STEPS: usize = 3;
     /// Band for [`expf_ik`] and [`logf_poly`] against the f64 functions
     /// rounded to f32, in ulps: ik's `v_expf` is ARM's `v_expf` polynomial
     /// (documented 1.45 ulp), Cephes `logf` a relative 7.6e-8 (under one ulp)
@@ -175,6 +186,14 @@ mod gate {
         }
     }
 
+    /// Positions `p0 .. p0 + m`.
+    fn positions(p0: usize, m: usize) -> Vec<u32> {
+        (p0..p0 + m).map(|p| p as u32).collect()
+    }
+
+    /// The single lane of every delta clause.
+    const LANES: usize = 1;
+
     struct Ctx<'a> {
         gpu: &'a Gpu,
         k: &'a LinearKernels,
@@ -185,12 +204,15 @@ mod gate {
             self.gpu.stream()
         }
 
+        /// One conv launch of `m` tokens at `pos` over a ring holding
+        /// `ring`; the outputs and the ring after it.
         fn conv(
             &self,
             fault: FaultSink,
             l: &Layer,
             tk: &Tokens,
-            state_in: &[f32],
+            ring: &[f32],
+            pos: &[u32],
             m: usize,
         ) -> Result<ConvOut, GateError> {
             let s = self.stream();
@@ -201,11 +223,11 @@ mod gate {
             let w = DeviceBuffer::from_host(s, &l.w)?;
             let dt = DeviceBuffer::from_host(s, &l.dt)?;
             let sa = DeviceBuffer::from_host(s, &l.sa)?;
-            let si = DeviceBuffer::from_host(s, state_in)?;
+            let pd = DeviceBuffer::from_host(s, pos)?;
             let mut y = DeviceBuffer::from_host(s, &vec![0.0f32; m * ch])?;
             let mut beta = DeviceBuffer::from_host(s, &vec![0.0f32; m * nv])?;
             let mut decay = DeviceBuffer::from_host(s, &vec![0.0f32; m * nv])?;
-            let mut so = DeviceBuffer::from_host(s, &vec![0.0f32; CONV_ROWS * ch])?;
+            let mut rd = DeviceBuffer::from_host(s, ring)?;
             self.k.conv.enqueue_conv_prep(
                 s,
                 ConvArgs {
@@ -215,7 +237,7 @@ mod gate {
                     w: &w,
                     dt_bias: &dt,
                     ssm_a: &sa,
-                    state_in: &si,
+                    pos: &pd,
                     shape: SHAPE,
                     eps: EPS,
                     m,
@@ -223,7 +245,7 @@ mod gate {
                     y: &mut y,
                     beta: &mut beta,
                     decay: &mut decay,
-                    state_out: &mut so,
+                    ring: &mut rd,
                 },
             )?;
             s.synchronize()?;
@@ -231,15 +253,18 @@ mod gate {
                 y: y.to_host_vec(s)?,
                 beta: beta.to_host_vec(s)?,
                 decay: decay.to_host_vec(s)?,
-                state: so.to_host_vec(s)?,
+                ring: rd.to_host_vec(s)?,
             })
         }
 
+        /// One delta launch of `m` tokens on a one-lane state holding
+        /// `state`, with lane word `lane`; `o` and the state after it.
         fn delta(
             &self,
             fault: FaultSink,
             st: &Step,
-            state_in: &[f32],
+            state: &[f32],
+            lane: u32,
             shape: LinearShape,
             m: usize,
         ) -> Result<DeltaOut, GateError> {
@@ -247,27 +272,29 @@ mod gate {
             let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
             let beta = DeviceBuffer::from_host(s, &st.beta)?;
             let decay = DeviceBuffer::from_host(s, &st.decay)?;
-            let si = DeviceBuffer::from_host(s, state_in)?;
+            let lw = DeviceBuffer::from_host(s, &[0xdead_beef, lane])?;
             let mut o = DeviceBuffer::from_host(s, &vec![0.0f32; m * shape.n_v * HEAD])?;
-            let mut so = DeviceBuffer::from_host(s, &vec![0.0f32; shape.state_len()])?;
+            let mut sd = DeviceBuffer::from_host(s, state)?;
             self.k.delta.enqueue_delta(
                 s,
                 DeltaArgs {
                     qkv: &qkv,
                     beta: &beta,
                     decay: &decay,
-                    state_in: &si,
+                    lane: &lw,
+                    lane_at: 1,
+                    lanes: LANES,
                     shape,
                     m,
                     fault,
                     o: &mut o,
-                    state_out: &mut so,
+                    state: &mut sd,
                 },
             )?;
             s.synchronize()?;
             Ok(DeltaOut {
                 o: o.to_host_vec(s)?,
-                state: so.to_host_vec(s)?,
+                state: sd.to_host_vec(s)?,
             })
         }
 
@@ -317,7 +344,8 @@ mod gate {
         let k = LinearKernels::load(gpu.context())?;
         let cx = Ctx { gpu: &gpu, k: &k };
         println!(
-            "gate_linear: device {} — n_k={} n_v={} head={HEAD} channels={} map={:?}, synthetic",
+            "gate_linear: device {} — n_k={} n_v={} head={HEAD} channels={} map={:?} \
+             ring={RING_ROWS} rows, synthetic",
             gpu.device_name()?,
             SHAPE.n_k,
             SHAPE.n_v,
@@ -385,67 +413,150 @@ mod gate {
         pass
     }
 
-    /// Clause 2.
-    fn conv_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
-        let unl = cx.gpu.unlabelled_sink();
-        let l = Layer::new(0x636f_6e76);
-        let tk = Tokens::new(PROMPT, 0x746f_6b31);
-        let s0 = Lcg(0x7330).fill(SHAPE.conv_state_len(), -1.0, 1.0);
-        let mut out = Vec::new();
-        for m in [PROMPT, 2, 1] {
-            let t = tk.slice(0, m);
-            let d = cx.conv(unl, &l, &t, &s0, m)?;
-            let h = conv_prep_host(&t.x, &t.b, &t.a, &l.w, &l.dt, &l.sa, &s0, SHAPE, EPS, m);
-            let pass = bits_equal(&d.y, &h.y)
-                && bits_equal(&d.beta, &h.beta)
-                && bits_equal(&d.decay, &h.decay)
-                && bits_equal(&d.state, &h.state);
-            println!(
-                "conv m={m} y {} beta {} decay {} state {} {}",
+    /// The host rule's conv outputs for `tk` at `pos` over `ring`.
+    fn conv_host(l: &Layer, tk: &Tokens, ring: &[f32], pos: &[u32], m: usize) -> ConvOut {
+        conv_prep_host(
+            &tk.x, &tk.b, &tk.a, &l.w, &l.dt, &l.sa, pos, ring, SHAPE, EPS, m,
+        )
+    }
+
+    /// Whether every output of two conv runs is bit-identical, and the line
+    /// fragment that says so.
+    fn conv_same(d: &ConvOut, h: &ConvOut) -> (bool, String) {
+        let pass = bits_equal(&d.y, &h.y)
+            && bits_equal(&d.beta, &h.beta)
+            && bits_equal(&d.decay, &h.decay)
+            && bits_equal(&d.ring, &h.ring);
+        (
+            pass,
+            format!(
+                "y {} beta {} decay {} ring {}",
                 cmp(&d.y, &h.y),
                 cmp(&d.beta, &h.beta),
                 cmp(&d.decay, &h.decay),
-                cmp(&d.state, &h.state),
+                cmp(&d.ring, &h.ring)
+            ),
+        )
+    }
+
+    /// Clause 2.
+    fn conv_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        let unl = cx.gpu.unlabelled_sink();
+        let ch = SHAPE.channels();
+        let l = Layer::new(0x636f_6e76);
+        let tk = Tokens::new(PROMPT, 0x746f_6b31);
+        let dirty = Lcg(0x7330).fill(SHAPE.ring_len(), -1.0, 1.0);
+        let zero_ring = vec![0.0f32; SHAPE.ring_len()];
+        let mut out = Vec::new();
+
+        // Every token past the sequence start: the first three read the
+        // ring, and a 512-token call's last rows overwrite the slots they
+        // read.
+        for m in [PROMPT, 2, 1] {
+            let t = tk.slice(0, m);
+            let pos = positions(P0, m);
+            let d = cx.conv(unl, &l, &t, &dirty, &pos, m)?;
+            let h = conv_host(&l, &t, &dirty, &pos, m);
+            let (pass, line) = conv_same(&d, &h);
+            println!(
+                "conv m={m} at p0={P0} over a random ring: {line} {}",
                 verdict(pass)
             );
             out.push(pass);
         }
-        let whole = cx.conv(unl, &l, &tk, &s0, PROMPT)?;
-        let mut state = s0;
+
+        let pos = positions(P0, PROMPT);
+        let whole = cx.conv(unl, &l, &tk, &dirty, &pos, PROMPT)?;
+        let mut ring = dirty.clone();
         let (mut y, mut beta, mut decay) = (Vec::new(), Vec::new(), Vec::new());
         for t in 0..PROMPT {
-            let d = cx.conv(unl, &l, &tk.slice(t, 1), &state, 1)?;
+            let d = cx.conv(unl, &l, &tk.slice(t, 1), &ring, &pos[t..=t], 1)?;
             y.extend_from_slice(&d.y);
             beta.extend_from_slice(&d.beta);
             decay.extend_from_slice(&d.decay);
-            state = d.state;
+            ring = d.ring;
         }
-        let pass = bits_equal(&y, &whole.y)
-            && bits_equal(&beta, &whole.beta)
-            && bits_equal(&decay, &whole.decay)
-            && bits_equal(&state, &whole.state);
+        let (pass, line) = conv_same(
+            &ConvOut {
+                y,
+                beta,
+                decay,
+                ring,
+            },
+            &whole,
+        );
         println!(
-            "conv chain {PROMPT} one-token launches vs one {PROMPT}-token launch: y {} beta {} \
-             decay {} state {} {}",
-            cmp(&y, &whole.y),
-            cmp(&beta, &whole.beta),
-            cmp(&decay, &whole.decay),
-            cmp(&state, &whole.state),
+            "conv chain {PROMPT} one-token launches vs one {PROMPT}-token launch at p0={P0}: {line} {}",
+            verdict(pass)
+        );
+        out.push(pass);
+
+        // The sequence start reads zeros whatever the ring holds.
+        let m = PASS_ROWS;
+        let t = tk.slice(0, m);
+        let pos = positions(0, m);
+        let d = cx.conv(unl, &l, &t, &dirty, &pos, m)?;
+        let h = conv_host(&l, &t, &dirty, &pos, m);
+        let z = cx.conv(unl, &l, &t, &zero_ring, &pos, m)?;
+        let (same_h, line) = conv_same(&d, &h);
+        let pass = same_h && bits_equal(&d.y, &z.y);
+        println!(
+            "conv start m={m} at p0=0 over a random ring: {line}; y vs over a zero ring {} {}",
+            cmp(&d.y, &z.y),
+            verdict(pass)
+        );
+        out.push(pass);
+
+        // A call that resumes from the ring, then a rollback into a full
+        // pass: each equal to the same tokens fed from position 0 in one
+        // call. The pass writes PASS_ROWS slots; the rollback to its second
+        // position reads the slot of the position three before it, which
+        // the call before the pass wrote.
+        let (a, b, back) = (20usize, PASS_ROWS, 21usize);
+        let fresh = Tokens::new(4, 0x7472_6b32);
+        let ta = tk.slice(0, a);
+        let tb = tk.slice(a, b);
+        let da = cx.conv(unl, &l, &ta, &dirty, &positions(0, a), a)?;
+        let db = cx.conv(unl, &l, &tb, &da.ring, &positions(a, b), b)?;
+        let dc = cx.conv(unl, &l, &fresh, &db.ring, &positions(back, 4), 4)?;
+        let ref_ab = conv_host(
+            &l,
+            &tk.slice(0, a + b),
+            &zero_ring,
+            &positions(0, a + b),
+            a + b,
+        );
+        let joined = Tokens {
+            x: [&tk.x[..back * ch], &fresh.x[..]].concat(),
+            b: [&tk.b[..back * SHAPE.n_v], &fresh.b[..]].concat(),
+            a: [&tk.a[..back * SHAPE.n_v], &fresh.a[..]].concat(),
+        };
+        let ref_c = conv_host(&l, &joined, &zero_ring, &positions(0, back + 4), back + 4);
+        let (want_b, want_c) = (&ref_ab.y[a * ch..], &ref_c.y[back * ch..]);
+        let pass = bits_equal(&db.y, want_b) && bits_equal(&dc.y, want_c);
+        println!(
+            "conv resume at p0={a} (m={b}) after a {a}-token call: y vs the same tokens fed from 0 \
+             {}; rollback to p0={back} (m=4, new tokens) after it: y {} {}",
+            cmp(&db.y, want_b),
+            cmp(&dc.y, want_c),
             verdict(pass)
         );
         out.push(pass);
         Ok(out)
     }
 
-    /// `m` tokens of delta inputs from the host conv rule with a zero
-    /// incoming conv state.
+    /// `m` tokens of delta inputs from the host conv rule at the sequence
+    /// start.
     fn host_step(m: usize, seed: u64) -> Step {
         let l = Layer::new(seed);
         let tk = Tokens::new(m, seed ^ 0x5eed);
-        let zero = vec![0.0f32; SHAPE.conv_state_len()];
-        Step::of(&conv_prep_host(
-            &tk.x, &tk.b, &tk.a, &l.w, &l.dt, &l.sa, &zero, SHAPE, EPS, m,
-        ))
+        let zero = vec![0.0f32; SHAPE.ring_len()];
+        Step::of(&conv_host(&l, &tk, &zero, &positions(0, m), m))
+    }
+
+    /// The host rule of one delta call on the one-lane state `state`.
+    fn delta_ref(st: &Step, state: &[f32], shape: LinearShape, m: usize) -> DeltaOut {
+        delta_host(&st.qkv, &st.beta, &st.decay, state, LANES, 0, shape, m)
     }
 
     fn delta_line(what: &str, d: &DeltaOut, h: &DeltaOut) -> bool {
@@ -467,15 +578,8 @@ mod gate {
         let prompt = st.slice(0, PROMPT);
         let mut out = Vec::new();
 
-        let d = cx.delta(unl, &prompt, &zero, SHAPE, PROMPT)?;
-        let h = delta_host(
-            &prompt.qkv,
-            &prompt.beta,
-            &prompt.decay,
-            &zero,
-            SHAPE,
-            PROMPT,
-        );
+        let d = cx.delta(unl, &prompt, &zero, 0, SHAPE, PROMPT)?;
+        let h = delta_ref(&prompt, &zero, SHAPE, PROMPT);
         out.push(delta_line(
             &format!("prompt m={PROMPT} from a zero state"),
             &d,
@@ -483,8 +587,8 @@ mod gate {
         ));
 
         let step = st.slice(PROMPT, 1);
-        let ds = cx.delta(unl, &step, &h.state, SHAPE, 1)?;
-        let hs = delta_host(&step.qkv, &step.beta, &step.decay, &h.state, SHAPE, 1);
+        let ds = cx.delta(unl, &step, &h.state, 0, SHAPE, 1)?;
+        let hs = delta_ref(&step, &h.state, SHAPE, 1);
         out.push(delta_line(
             &format!("decode step at depth {PROMPT}"),
             &ds,
@@ -492,8 +596,8 @@ mod gate {
         ));
 
         let one = st.slice(0, 1);
-        let d1 = cx.delta(unl, &one, &zero, SHAPE, 1)?;
-        let h1 = delta_host(&one.qkv, &one.beta, &one.decay, &zero, SHAPE, 1);
+        let d1 = cx.delta(unl, &one, &zero, 0, SHAPE, 1)?;
+        let h1 = delta_ref(&one, &zero, SHAPE, 1);
         out.push(delta_line("prompt m=1 from a zero state", &d1, &h1));
 
         let grouped = LinearShape {
@@ -501,14 +605,14 @@ mod gate {
             ..SHAPE
         };
         let eight = st.slice(0, 8);
-        let dg = cx.delta(unl, &eight, &zero, grouped, 8)?;
-        let hg = delta_host(&eight.qkv, &eight.beta, &eight.decay, &zero, grouped, 8);
+        let dg = cx.delta(unl, &eight, &zero, 0, grouped, 8)?;
+        let hg = delta_ref(&eight, &zero, grouped, 8);
         out.push(delta_line("grouped key-head map m=8", &dg, &hg));
 
         let mut state = zero;
         let mut o = Vec::new();
         for t in 0..PROMPT {
-            let dt = cx.delta(unl, &st.slice(t, 1), &state, SHAPE, 1)?;
+            let dt = cx.delta(unl, &st.slice(t, 1), &state, 0, SHAPE, 1)?;
             o.extend_from_slice(&dt.o);
             state = dt.state;
         }
@@ -517,7 +621,57 @@ mod gate {
             &DeltaOut { o, state },
             &d,
         ));
+
+        out.push(lanes_refused(cx, &one)?);
         Ok(out)
+    }
+
+    /// The launcher refuses a state of more than one lane, and of none, by
+    /// name.
+    fn lanes_refused(cx: &Ctx<'_>, st: &Step) -> Result<bool, GateError> {
+        let s = cx.stream();
+        let unl = cx.gpu.unlabelled_sink();
+        let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
+        let beta = DeviceBuffer::from_host(s, &st.beta)?;
+        let decay = DeviceBuffer::from_host(s, &st.decay)?;
+        let lw = DeviceBuffer::from_host(s, &[0u32])?;
+        let mut o = DeviceBuffer::from_host(s, &vec![0.0f32; SHAPE.n_v * HEAD])?;
+        let mut state = DeviceBuffer::from_host(s, &vec![0.0f32; 2 * SHAPE.state_len()])?;
+        let mut said = Vec::new();
+        for lanes in [2usize, 0] {
+            let r = cx.k.delta.enqueue_delta(
+                s,
+                DeltaArgs {
+                    qkv: &qkv,
+                    beta: &beta,
+                    decay: &decay,
+                    lane: &lw,
+                    lane_at: 0,
+                    lanes,
+                    shape: SHAPE,
+                    m: 1,
+                    fault: unl,
+                    o: &mut o,
+                    state: &mut state,
+                },
+            );
+            said.push(match r {
+                Ok(()) => (false, format!("lanes={lanes}: launched")),
+                Err(e) => {
+                    let e = e.to_string();
+                    (e.contains(&format!("lanes={lanes}")), e)
+                }
+            });
+        }
+        s.synchronize()?;
+        let pass = said.iter().all(|(named, _)| *named);
+        println!(
+            "delta launcher refuses lanes=2: \"{}\" and lanes=0: \"{}\" {}",
+            said[0].1,
+            said[1].1,
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// Clause 4.
@@ -540,42 +694,45 @@ mod gate {
         Ok(out)
     }
 
-    /// One decode token's device inputs for the graph clause.
+    /// One decode token's device inputs for the graph clause: the step's
+    /// words (the token's projections and its position) are rewritten in
+    /// place before every launch; the lane word and the layer stay.
     struct TokenIns {
         x: DeviceBuffer<f32>,
         b: DeviceBuffer<f32>,
         a: DeviceBuffer<f32>,
+        pos: DeviceBuffer<u32>,
+        lane: DeviceBuffer<u32>,
         w: DeviceBuffer<f32>,
         dt: DeviceBuffer<f32>,
         sa: DeviceBuffer<f32>,
-        conv_state: DeviceBuffer<f32>,
-        state: DeviceBuffer<f32>,
         z: DeviceBuffer<f32>,
         gain: DeviceBuffer<f32>,
     }
 
-    /// What the token's three launches write.
+    /// One chain's state (read and written in place) and what the token's
+    /// three launches write.
     struct TokenOuts {
+        ring: DeviceBuffer<f32>,
+        state: DeviceBuffer<f32>,
         y: DeviceBuffer<f32>,
         beta: DeviceBuffer<f32>,
         decay: DeviceBuffer<f32>,
-        conv_state: DeviceBuffer<f32>,
         o: DeviceBuffer<f32>,
-        state: DeviceBuffer<f32>,
         out: DeviceBuffer<f32>,
     }
 
     impl TokenOuts {
-        fn new(s: &CudaStream) -> Result<TokenOuts, GateError> {
+        fn new(s: &CudaStream, ring: &[f32], state: &[f32]) -> Result<TokenOuts, GateError> {
             let (ch, nv) = (SHAPE.channels(), SHAPE.n_v);
             let z = |n: usize| DeviceBuffer::from_host(s, &vec![0.0f32; n]);
             Ok(TokenOuts {
+                ring: DeviceBuffer::from_host(s, ring)?,
+                state: DeviceBuffer::from_host(s, state)?,
                 y: z(ch)?,
                 beta: z(nv)?,
                 decay: z(nv)?,
-                conv_state: z(CONV_ROWS * ch)?,
                 o: z(nv * HEAD)?,
-                state: z(SHAPE.state_len())?,
                 out: z(nv * HEAD)?,
             })
         }
@@ -584,7 +741,7 @@ mod gate {
             Ok(vec![
                 self.out.to_host_vec(s)?,
                 self.state.to_host_vec(s)?,
-                self.conv_state.to_host_vec(s)?,
+                self.ring.to_host_vec(s)?,
             ])
         }
     }
@@ -606,7 +763,7 @@ mod gate {
                 w: &i.w,
                 dt_bias: &i.dt,
                 ssm_a: &i.sa,
-                state_in: &i.conv_state,
+                pos: &i.pos,
                 shape: SHAPE,
                 eps: EPS,
                 m: 1,
@@ -614,7 +771,7 @@ mod gate {
                 y: &mut o.y,
                 beta: &mut o.beta,
                 decay: &mut o.decay,
-                state_out: &mut o.conv_state,
+                ring: &mut o.ring,
             },
         )?;
         k.delta.enqueue_delta(
@@ -623,12 +780,14 @@ mod gate {
                 qkv: &o.y,
                 beta: &o.beta,
                 decay: &o.decay,
-                state_in: &i.state,
+                lane: &i.lane,
+                lane_at: 0,
+                lanes: LANES,
                 shape: SHAPE,
                 m: 1,
                 fault,
                 o: &mut o.o,
-                state_out: &mut o.state,
+                state: &mut o.state,
             },
         )?;
         k.norm_gate.enqueue_norm_gate(
@@ -646,41 +805,65 @@ mod gate {
         )
     }
 
-    /// Clause 5: conv, delta and norm of one token as a graph.
+    /// Clause 5: conv, delta and norm of one token captured once as a graph,
+    /// then replayed for [`GRAPH_STEPS`] successive tokens with only the
+    /// step's words rewritten between replays.
     fn graph(cx: &Ctx<'_>) -> Result<bool, GateError> {
         let s = cx.stream();
         let unl = cx.gpu.unlabelled_sink();
         let l = Layer::new(0x6772_6170);
-        let tk = Tokens::new(1, 0x6731);
+        let tk = Tokens::new(GRAPH_STEPS, 0x6731);
         let mut r = Lcg(0x6732);
+        let ring = r.fill(SHAPE.ring_len(), -1.0, 1.0);
+        let state = r.fill(SHAPE.state_len(), -0.1, 0.1);
         let up = |v: &[f32]| DeviceBuffer::from_host(s, v);
-        let ins = TokenIns {
-            x: up(&tk.x)?,
-            b: up(&tk.b)?,
-            a: up(&tk.a)?,
+        let one = tk.slice(0, 1);
+        let mut ins = TokenIns {
+            x: up(&one.x)?,
+            b: up(&one.b)?,
+            a: up(&one.a)?,
+            pos: DeviceBuffer::from_host(s, &[0u32])?,
+            lane: DeviceBuffer::from_host(s, &[0u32])?,
             w: up(&l.w)?,
             dt: up(&l.dt)?,
             sa: up(&l.sa)?,
-            conv_state: up(&r.fill(SHAPE.conv_state_len(), -1.0, 1.0))?,
-            state: up(&r.fill(SHAPE.state_len(), -0.1, 0.1))?,
             z: up(&r.fill(SHAPE.n_v * HEAD, -4.0, 4.0))?,
             gain: up(&l.gain)?,
         };
-        let mut eager = TokenOuts::new(s)?;
-        enqueue_token(cx.k, s, unl, &ins, &mut eager)?;
-        s.synchronize()?;
-        let mut replay = TokenOuts::new(s)?;
+        let step = |ins: &mut TokenIns, t: usize| -> Result<(), GateError> {
+            let tt = tk.slice(t, 1);
+            ins.x.copy_from_host(s, &tt.x)?;
+            ins.b.copy_from_host(s, &tt.b)?;
+            ins.a.copy_from_host(s, &tt.a)?;
+            ins.pos.copy_from_host(s, &[u32::try_from(GRAPH_P0 + t)?])?;
+            Ok(())
+        };
+        let mut eager = TokenOuts::new(s, &ring, &state)?;
+        let mut eager_rows = Vec::new();
+        for t in 0..GRAPH_STEPS {
+            step(&mut ins, t)?;
+            enqueue_token(cx.k, s, unl, &ins, &mut eager)?;
+            s.synchronize()?;
+            eager_rows.push(eager.read(s)?);
+        }
+        let mut replay = TokenOuts::new(s, &ring, &state)?;
         let g = cx
             .gpu
             .capture(|st| enqueue_token(cx.k, st, unl, &ins, &mut replay))?;
-        g.launch(s)?;
-        s.synchronize()?;
+        let mut same = true;
+        for (t, want) in eager_rows.iter().enumerate() {
+            step(&mut ins, t)?;
+            g.launch(s)?;
+            s.synchronize()?;
+            let got = replay.read(s)?;
+            same &= got.iter().zip(want).all(|(x, y)| bits_equal(x, y));
+        }
         let nodes = g.node_count();
-        let (a, b) = (eager.read(s)?, replay.read(s)?);
-        let same = a.iter().zip(&b).all(|(x, y)| bits_equal(x, y));
         let pass = same && nodes == 3;
         println!(
-            "graph conv+delta+norm_gate m=1: eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            "graph conv+delta+norm_gate m=1 captured once, replayed at positions {GRAPH_P0}..{}: \
+             eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            GRAPH_P0 + GRAPH_STEPS - 1,
             verdict(pass)
         );
         drop(g);
@@ -693,7 +876,7 @@ mod gate {
         let total = DEPTHS[DEPTHS.len() - 1];
         let l = Layer::new(0x6465_7074);
         let tk = Tokens::new(total, 0x6468);
-        let mut cstate = vec![0.0f32; SHAPE.conv_state_len()];
+        let mut ring = vec![0.0f32; SHAPE.ring_len()];
         let mut state = vec![0.0f32; SHAPE.state_len()];
         let mut steps = Step {
             qkv: Vec::new(),
@@ -704,10 +887,10 @@ mod gate {
         let mut t0 = 0;
         for &d in &DEPTHS {
             let m = d - t0;
-            let c = cx.conv(unl, &l, &tk.slice(t0, m), &cstate, m)?;
-            cstate = c.state.clone();
+            let c = cx.conv(unl, &l, &tk.slice(t0, m), &ring, &positions(t0, m), m)?;
+            ring = c.ring.clone();
             let st = Step::of(&c);
-            let dd = cx.delta(unl, &st, &state, SHAPE, m)?;
+            let dd = cx.delta(unl, &st, &state, 0, SHAPE, m)?;
             state = dd.state;
             at_depth.push(state.clone());
             steps.qkv.extend_from_slice(&st.qkv);
@@ -716,7 +899,7 @@ mod gate {
             t0 = d;
         }
         let zero = vec![0.0f32; SHAPE.state_len()];
-        let h = delta_host(&steps.qkv, &steps.beta, &steps.decay, &zero, SHAPE, total);
+        let h = delta_ref(&steps, &zero, SHAPE, total);
         let pass = bits_equal(&state, &h.state);
         println!(
             "depth {total} tokens in launches of {:?}: state vs the host rule over all {total} \
@@ -858,49 +1041,57 @@ mod gate {
         let m = 16;
         let mut out = Vec::new();
 
-        // Conv: a NaN in channel 100 (query head 0) of token 5, then 1e30 in
-        // every channel of key head 3 at token 7 — finite, but its squares
-        // overflow the norm.
+        // Conv, at p0 = 100 over a random ring: a NaN in channel 100 (query
+        // head 0) of token 2, then 1e30 in every channel of key head 3 at
+        // token 3 — finite, but its squares overflow the norm; both below
+        // the rows the call writes into the ring. Then token 1's position
+        // one past p0 + 1.
         let l = Layer::new(0x6661_756c);
         let tk = Tokens::new(m, 0x6674);
-        let cs = vec![0.0f32; SHAPE.conv_state_len()];
-        let clean = cx.conv(unl, &l, &tk, &cs, m)?;
-        let conv_outs = |c: &ConvOut| {
-            vec![
-                c.y.clone(),
-                c.beta.clone(),
-                c.decay.clone(),
-                c.state.clone(),
-            ]
-        };
+        let ring = Lcg(0x6672).fill(SHAPE.ring_len(), -1.0, 1.0);
+        let pos = positions(100, m);
+        let clean = cx.conv(unl, &l, &tk, &ring, &pos, m)?;
+        let conv_outs =
+            |c: &ConvOut| vec![c.y.clone(), c.beta.clone(), c.decay.clone(), c.ring.clone()];
         let head_rows = |hp: usize, t0: usize| -> Vec<usize> {
             (t0..t0 + CONV_TAPS)
                 .flat_map(|t| (0..HEAD).map(move |d| t * ch + hp * HEAD + d))
                 .collect()
         };
         for (layer, what, plant, hp, t0) in [
-            (21usize, "conv NaN input", 0usize, 0usize, 5usize),
+            (21usize, "conv NaN input", 0usize, 0usize, 2usize),
             (
                 22,
                 "conv norm overflow from finite inputs",
                 1,
                 SHAPE.n_k + 3,
-                7,
+                3,
             ),
+            (27, "conv position not p0 + t", 2, 0, 1),
         ] {
             let sink = cx.gpu.layer_sink(layer)?;
             let before = cx.gpu.fault()?;
             let mut bad_tk = tk.slice(0, m);
-            if plant == 0 {
-                bad_tk.x[t0 * ch + 100] = f32::NAN;
-            } else {
-                for d in 0..HEAD {
-                    bad_tk.x[t0 * ch + hp * HEAD + d] = 1e30;
+            let mut bad_pos = pos.clone();
+            let hit = match plant {
+                0 => {
+                    bad_tk.x[t0 * ch + 100] = f32::NAN;
+                    head_rows(hp, t0)
                 }
-            }
-            let bad = cx.conv(sink, &l, &bad_tk, &cs, m)?;
+                1 => {
+                    for d in 0..HEAD {
+                        bad_tk.x[t0 * ch + hp * HEAD + d] = 1e30;
+                    }
+                    head_rows(hp, t0)
+                }
+                _ => {
+                    bad_pos[t0] += 1;
+                    (t0 * ch..(t0 + 1) * ch).collect()
+                }
+            };
+            let bad = cx.conv(sink, &l, &bad_tk, &ring, &bad_pos, m)?;
             let word = cx.gpu.take_fault()?;
-            let _ = cx.conv(sink, &l, &tk, &cs, m)?;
+            let _ = cx.conv(sink, &l, &tk, &ring, &pos, m)?;
             let after = cx.gpu.fault()?;
             out.push(
                 Planted {
@@ -909,7 +1100,7 @@ mod gate {
                     before,
                     word,
                     after,
-                    hit: vec![head_rows(hp, t0), vec![], vec![], vec![]],
+                    hit: vec![hit, vec![], vec![], vec![]],
                     clean: conv_outs(&clean),
                     bad: conv_outs(&bad),
                 }
@@ -919,7 +1110,8 @@ mod gate {
 
         // Delta: a NaN value (head 4, column 17, token 9); then a state
         // column (head 2, column 5) of 3e38 whose S'ᵀk overflows at token 0
-        // (decay and β 1, the key all 1/√128).
+        // (decay and β 1, the key all 1/√128); then the lane word 1 of a
+        // one-lane state, which reads lane 0 and changes nothing else.
         let mut st = host_step(m, 0x6664);
         let zero = vec![0.0f32; SHAPE.state_len()];
         let (h_nan, c_nan, t_nan) = (4usize, 17usize, 9usize);
@@ -930,38 +1122,57 @@ mod gate {
         }
         st.decay[h_big] = 1.0;
         st.beta[h_big] = 1.0;
-        let clean = cx.delta(unl, &st, &zero, SHAPE, m)?;
+        let clean = cx.delta(unl, &st, &zero, 0, SHAPE, m)?;
         let column = |h: usize, c: usize, t0: usize| -> (Vec<usize>, Vec<usize>) {
             (
                 (t0..m).map(|t| (t * nv + h) * HEAD + c).collect(),
                 (0..HEAD).map(|i| (h * HEAD + c) * HEAD + i).collect(),
             )
         };
-        for (layer, what, big) in [
-            (23usize, "delta NaN value", false),
-            (24, "delta state overflow from finite inputs", true),
+        for (layer, what, plant, site) in [
+            (23usize, "delta NaN value", 0usize, FaultSite::LinearDelta),
+            (
+                24,
+                "delta state overflow from finite inputs",
+                1,
+                FaultSite::LinearDelta,
+            ),
+            (
+                28,
+                "delta lane word 1 of a one-lane state",
+                2,
+                FaultSite::DeltaLane,
+            ),
         ] {
             let sink = cx.gpu.layer_sink(layer)?;
             let before = cx.gpu.fault()?;
             let mut bst = st.slice(0, m);
             let mut si = zero.clone();
-            let (ho, hs) = if big {
-                for i in 0..HEAD {
-                    si[(h_big * HEAD + c_big) * HEAD + i] = 3e38;
+            let mut lane = 0;
+            let (ho, hs) = match plant {
+                0 => {
+                    bst.qkv[t_nan * ch + 2 * SHAPE.n_k * HEAD + h_nan * HEAD + c_nan] = f32::NAN;
+                    column(h_nan, c_nan, t_nan)
                 }
-                column(h_big, c_big, 0)
-            } else {
-                bst.qkv[t_nan * ch + 2 * SHAPE.n_k * HEAD + h_nan * HEAD + c_nan] = f32::NAN;
-                column(h_nan, c_nan, t_nan)
+                1 => {
+                    for i in 0..HEAD {
+                        si[(h_big * HEAD + c_big) * HEAD + i] = 3e38;
+                    }
+                    column(h_big, c_big, 0)
+                }
+                _ => {
+                    lane = 1;
+                    (vec![], vec![])
+                }
             };
-            let bad = cx.delta(sink, &bst, &si, SHAPE, m)?;
+            let bad = cx.delta(sink, &bst, &si, lane, SHAPE, m)?;
             let word = cx.gpu.take_fault()?;
-            let _ = cx.delta(sink, &st, &zero, SHAPE, m)?;
+            let _ = cx.delta(sink, &st, &zero, 0, SHAPE, m)?;
             let after = cx.gpu.fault()?;
             out.push(
                 Planted {
                     what,
-                    want: Fault::at(u32::try_from(layer)?, FaultSite::LinearDelta),
+                    want: Fault::at(u32::try_from(layer)?, site),
                     before,
                     word,
                     after,
