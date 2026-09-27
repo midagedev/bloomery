@@ -29,16 +29,18 @@ term: host service us a layer @ n=96, depth 6, A6000, all-host = (p50 step ms of
   terms at their band centres (9.25 and 1.1 ms)
 unit: us
 predict: 350..460
-condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 3000 lcpp:3000
-  4096 lcpppp:4096, the order rotated every round (each ours arm's row carries its prompt's pass
-  pp, so the 512 and 4096 arms give pp512 and pp4096); about 45 minutes of lease [derived: five
-  ours arms of a 20..80 s load, up to 56 s of passes and 3 s of steps, four llama.cpp arms of a
-  host-bound load and run, three rounds], past 30: the user's approval first; the qwen4exp host set (~111 GB) preheated
-  before the first timed arm of each engine and no arm reads the file cold (majflt printed per
-  row, [cold] rows void); no row carries [cpu-busy] or [other-busy]; the full runner output goes
-  to a file first. Command: BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
-  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card' just depth-gpu-qwen4exp
-  <the arms above> > <log> 2>&1
+condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 3000 lcpp:3000 4096
+  lcpppp:4096, the order rotated every round (each ours arm's row carries its prompt's pass pp, so
+  the 512 and 4096 arms give pp512 and pp4096); about 45 minutes of lease [derived: five ours arms
+  of a 20..80 s load, up to 56 s of passes and 3 s of steps, four llama.cpp arms of a host-bound
+  load and run, three rounds], past 30: the user's approval first; the qwen4exp host set (~111 GB)
+  stays in the page cache: the runner has no preheat, so the lead reads each row's witness, and a
+  row whose major-fault count rises by more than 10,000 across its arm (the host set paged in inside
+  the timed steps; a warm arm faults about 0) is void and its arm re-run after the window; no row
+  carries [cpu-busy] or [other-busy]; the full runner output goes to a file first. Command:
+  BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card' just depth-gpu-qwen4exp <the
+  arms above> > <log> 2>&1
 reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp beside ours) and
   the host service term every later Qwen3.8 lever is priced against (hot list, card experts, the
   q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
@@ -48,7 +50,7 @@ decide-in: write the rows into rig-log first, then the README's Qwen3.8 section,
 decide-below: the host tier serves faster than the byte law says for 3 MB experts: name the term
   (the dispatch rate or the fixed cost) against V4.1's measured union, re-derive the card-expert
   and hot-list levers from the lower h before any lever round opens, then write the rows
-decide-above: no Qwen3.8 row goes out: profile one depth-6 step (nsys-gpu.sh's qwen form) to split
-  h into the gate-up and down dispatches and the go/wait gaps, and name the term that missed
-  (dispatch rate, a serial host cost such as the PLE read, or the union's fixed term) before a
-  re-sit
+decide-above: no Qwen3.8 row goes out: nsys-gpu.sh has no qwen4exp form, so a round gives it one,
+  profiles one depth-6 step to split h into the gate-up and down dispatches and the go/wait gaps,
+  and names the term that missed (dispatch rate, a serial host cost such as the PLE read, or the
+  union's fixed term) before a re-sit

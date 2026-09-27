@@ -55,9 +55,9 @@ const WHAT: &str = "qwen4exp Body38";
 
 /// The coverage items the program opens a file with: the tokenizer's
 /// pre-tokenizer and the template's tool-call parser are the chat surface's,
-/// which the program does not use. The coverage check lists them until
-/// proposal P1 lands the program's rows, and every other item it lists is
-/// refused by name.
+/// which the program does not use. Every other item the check lists is
+/// refused by name; until proposal P1 lands the program's rows, that is every
+/// qwen4exp item.
 pub const ALLOWED: &[&str] = &[
     "pre-tokenizer qwen35",
     "a tool-call parser for this template",
@@ -648,6 +648,22 @@ impl Body38 {
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
         Ok((stores, self.ple_ring.to_host_vec(stream)?))
+    }
+
+    /// Every selecting store's K/V planes and raw and pooled keys set to
+    /// `bits`, an f16 pattern: a gate's stand-in for the rows `reset` leaves
+    /// as they were, so a path that reads a row it did not write reads the
+    /// pattern, not a previous run's value. Synchronizes; gate use.
+    pub fn fill_planes(&mut self, gpu: &Gpu, bits: u16) -> Result<(), GpuError> {
+        let stream = gpu.stream();
+        for s in &mut self.stores {
+            if let Store38::Qsa { kv, raw, pooled } = s {
+                for buf in [&mut kv.k, &mut kv.v, raw, pooled] {
+                    buf.copy_from_host(stream, &vec![bits; buf.len()])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The step's position `pos` is the next one and inside the stores, else

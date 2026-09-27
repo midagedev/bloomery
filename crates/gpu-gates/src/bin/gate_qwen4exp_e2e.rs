@@ -10,11 +10,12 @@
 //! through its family.
 //!
 //! The file opens through `PlanInputs::describe` and `Body38::open_placed`,
-//! which refuses every coverage item past the two the program allows
-//! (`bloomery_gpu::arch::qwen3moe::ALLOWED`): until the program's coverage
-//! rows land (proposal P1; `crates/model/src/arch/coverage.rs` is not this
-//! gate's to change), the coverage check lists every qwen4exp item, and the
-//! plain `PlanInputs::read` would refuse the file.
+//! which refuses by name every coverage item past the two the program
+//! allows (`bloomery_gpu::arch::qwen3moe::ALLOWED`, the chat surface's; the
+//! plain `PlanInputs::read` refuses those two as well). The coverage check
+//! holds qwen4exp to `Body38`'s own rows once they land (proposal P1;
+//! `crates/model/src/arch/coverage.rs` is not this gate's to change); until
+//! then it lists every qwen4exp item and the open stops with that list.
 //!
 //! What is asserted:
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
@@ -25,16 +26,19 @@
 //!   the header ([`store_bytes`]).
 //! - (p) one program: the batch set's five tokens as five graph steps, as
 //!   five eager steps (the taps armed) and as one eager pass of five rows
-//!   through the batch port (`Prompt38::Pass`), each from a reset, leave the
-//!   same last token, the same last logits and every store — the delta
-//!   states and conv rings, the K/V planes, the raw and pooled indexer keys,
-//!   the PLE ring — bit for bit; the graph and eager steps also every
-//!   position's token and logits. Then five graph steps from `reset` alone
-//!   after the eager run's state leave the first run's everything: `reset`
-//!   clears.
+//!   through the batch port (`Prompt38::Pass`), each from a reset with every
+//!   selecting store's planes set to [`PLANE_FILL`] (`reset` leaves them, so
+//!   a row a path reads without writing reads the pattern, not the previous
+//!   run's value), leave the same last token, the same last logits and every
+//!   store — the delta states and conv rings, the K/V planes, the raw and
+//!   pooled indexer keys, the PLE ring — bit for bit; the graph and eager
+//!   steps also every position's token and logits. Then five graph steps
+//!   from `reset` after the pass's state leave the first run's everything:
+//!   `reset` clears the recurrent state.
 //! - (c) free-running on the batch set, each layer's picks read from the
 //!   eager run's route taps (our own chain's routing, which is what a
-//!   layer-by-layer run would read, so this gate has no layered clause): a
+//!   layer-by-layer run would read, so this gate has no layered clause),
+//!   each tap's ids the top ten of its own logits ([`picks_its_top`]): a
 //!   token whose chosen set differs from ik's `ffn_moe_topk-L` is a flip,
 //!   allowed only when every exchanged pair's gap in ik's logits
 //!   (`ffn_moe_logits`, whose softmax order is the pick's) lies within our
@@ -56,7 +60,8 @@
 //!   its selection list is the identity; D3K's reads a selection (751 pools
 //!   past 512).
 //! - (q) the pass in the selector region: D3K's prefill as eager passes of
-//!   up to eight positions (`Prompt38::Pass`) from a reset, then the same
+//!   up to eight positions (`Prompt38::Pass`) from a reset with the planes
+//!   filled, then the same
 //!   step, leaves the step-fed run's step token, logits, layer outputs and
 //!   every store bit for bit.
 //! - (r) refusals: `Prompt38::parse` refuses `gemm` and `auto` by name,
@@ -136,6 +141,13 @@ mod gate {
     const PASS_ROWS: usize = 8;
     /// The image placeholder the file's PLE hash refuses as an input.
     const IMAGE_TOKEN: u32 = 248_056;
+
+    /// The f16 pattern every selecting store's planes hold before a run
+    /// (100.0): `reset` leaves those rows as they were, and a path that reads
+    /// a row it did not write must read this, not a previous run's value — a
+    /// finite value, so a correct path's masked reads stay finite, and far
+    /// from any key, value or indexer key the model writes.
+    const PLANE_FILL: u16 = 0x5640;
 
     /// PIN(2026-09-27): the captured decode step's node count, derived before
     /// the chain was built: the embedding row; each layer's two mixes, three
@@ -259,8 +271,8 @@ mod gate {
             return Err(format!("{MODEL} is {:?}, not qwen4exp", file.architecture()).into());
         }
         let t = Instant::now();
-        // `describe`, not `read`: the coverage check refuses the file until
-        // P1 lands; `open_placed` refuses what `ALLOWED` does not name.
+        // `describe`, not `read`: `read` refuses the chat surface's two
+        // items too; `open_placed` refuses what `ALLOWED` does not name.
         let inputs = PlanInputs::describe(&file)?;
         let machine = machine(RTX_3090, inputs.spec.layers.len());
         let plan = inputs.plan(&machine, CTX as u64, &PlanLevers::from_levers(&levers)?)?;
@@ -337,14 +349,22 @@ mod gate {
         Ok(())
     }
 
+    /// `reset`, then every selecting store's planes set to [`PLANE_FILL`].
+    fn fresh(m: &mut Qwen38Model) -> Result<(), GateError> {
+        m.reset()?;
+        let (gpu, _, b) = m.body_parts("fresh")?;
+        b.fill_planes(gpu, PLANE_FILL)?;
+        Ok(())
+    }
+
     /// Every store and the PLE ring, read back.
     fn stores(m: &mut Qwen38Model) -> Result<(Vec<Store38Host>, Vec<f32>), GateError> {
         let (gpu, _, b) = m.body_parts("stores")?;
         Ok(b.stores_host(gpu)?)
     }
 
-    /// `toks` as steps from a reset (without `reset`: from where the model
-    /// stands), eager steps with the taps armed.
+    /// `toks` as steps from [`fresh`] (without `reset`: from where the
+    /// model stands), eager steps with the taps armed.
     fn run_steps(
         m: &mut Qwen38Model,
         toks: &[u32],
@@ -352,7 +372,7 @@ mod gate {
         reset: bool,
     ) -> Result<Run, GateError> {
         if reset {
-            m.reset()?;
+            fresh(m)?;
         }
         m.set_mode(mode);
         let taps_on = mode == StepMode::Eager;
@@ -380,10 +400,10 @@ mod gate {
         Ok(r)
     }
 
-    /// `toks` as one prompt call by eager passes from a reset: the last
+    /// `toks` as one prompt call by eager passes from [`fresh`]: the last
     /// token and logits, and every store.
     fn run_pass(m: &mut Qwen38Model, toks: &[u32]) -> Result<Run, GateError> {
-        m.reset()?;
+        fresh(m)?;
         let last = m.prompt38(toks, Prompt38::Pass)?;
         let logits = m.logits()?;
         let (stores, ple_ring) = stores(m)?;
@@ -466,7 +486,7 @@ mod gate {
         // After the pass's state: `reset` must clear it.
         let again = run_steps(m, toks, StepMode::Graph, true)?;
         ok &= same_run(
-            "after reset alone, the same five steps",
+            "after the pass's state and a reset, the same five steps",
             &again,
             &graph,
             false,
@@ -656,6 +676,30 @@ mod gate {
         })
     }
 
+    /// Whether a route tap's ids are [`N_USED`] distinct experts under
+    /// [`N_EXPERT`] and the top of its own logits: none it left above the
+    /// lowest it kept (ties either way). A tap of another layer's logits
+    /// beside this layer's ids does not hold it.
+    fn picks_its_top(r: &RouteTap) -> bool {
+        let mut ids = r.ids.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != N_USED
+            || r.logits.len() != N_EXPERT
+            || ids.iter().any(|&e| e as usize >= N_EXPERT)
+        {
+            return false;
+        }
+        let kept = |e: usize| ids.binary_search(&(e as u32)).is_ok();
+        let min_in = ids
+            .iter()
+            .map(|&e| r.logits[e as usize])
+            .fold(f32::INFINITY, f32::min);
+        (0..N_EXPERT)
+            .filter(|&e| !kept(e))
+            .all(|e| r.logits[e] <= min_in)
+    }
+
     /// Whether a flip at `(l', t')` lies on the path of layer `l`'s output
     /// at position `t`: every layer from `l'` on reads it at `t'`, and every
     /// later position through the mixers' stores.
@@ -675,6 +719,21 @@ mod gate {
             println!("free table layer={l} l_out_rel by tap {}", cells.join(" "));
         }
         let mut flips = Vec::new();
+        let mut inconsistent = Vec::new();
+        for (t, routes) in eager.routes.iter().enumerate() {
+            for (l, r) in routes.iter().enumerate() {
+                if !picks_its_top(r) {
+                    inconsistent.push((l, t));
+                }
+            }
+        }
+        println!(
+            "free: route taps whose ids are not the top {N_USED} of their own logits (distinct, \
+             under {N_EXPERT}): {} {:?} {}",
+            inconsistent.len(),
+            &inconsistent[..inconsistent.len().min(8)],
+            verdict(inconsistent.is_empty())
+        );
         for l in 0..N_LAYER {
             let ik = IkRoute::read(man, l)?;
             if ik.tokens() != eager.routes.len() {
@@ -730,7 +789,7 @@ mod gate {
         let ik = ik_last(man, vocab)?;
         let ours = eager.logits.last().ok_or("no logits")?;
         let (top, ik_top) = (argmax(ours), argmax(&ik));
-        let ok = held <= FREE_BAND && flips_ok && top == ik_top;
+        let ok = held <= FREE_BAND && flips_ok && top == ik_top && inconsistent.is_empty();
         println!(
             "free: {} tokens, {} flips ({} allowed), worst l_out_rel off every flip's path \
              {held:.3e} at layer {hl} position {ht} (band {FREE_BAND:.2}); last position argmax \
@@ -781,7 +840,7 @@ mod gate {
             }
             None => 0,
         };
-        m.reset()?;
+        fresh(m)?;
         let t = Instant::now();
         if !prefill.is_empty() {
             m.prompt38(&prefill, path)?;
@@ -830,7 +889,7 @@ mod gate {
         let [tok] = step[..] else {
             return Err(format!("{D3K}: a step of {} tokens, not one", step.len()).into());
         };
-        m.reset()?;
+        fresh(m)?;
         let t = Instant::now();
         m.prompt38(&prefill, Prompt38::Pass)?;
         let fed = t.elapsed().as_secs_f64();
@@ -880,7 +939,8 @@ mod gate {
         ] {
             let before = m.pos();
             let got = m.prompt38(ids, path);
-            let named = matches!(&got, Err(e) if e.to_string().contains("PLE rows"));
+            let named =
+                matches!(&got, Err(e) if e.to_string().contains("is the image placeholder"));
             let kept = m.pos() == before && m.poisoned().is_none();
             ok &= named && kept;
             println!(
