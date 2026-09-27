@@ -158,14 +158,17 @@ fn hw_qwen4exp_spec() {
 // PIN(2026-09-27): the plan's card and host figures [derived from the header dump: every
 // non-routed tensor but the PLE table on the card in its CardFormat (q8_0 two planes of the file's
 // bytes, f32 as is, bf16 widened to f32), its buffers through a 2 MiB-granule heap in the file's
-// tensor order; the routed stacks, 1,224 − 1,080 = 144 of them, on the host in the file's bytes; the
-// PLE table in the file]. The cache at 4,096 and 32,768 positions: 36 GDN layers of 4 · 3,145,728 + 16 B of
+// tensor order; the routed stacks, 1,224 − 1,080 = 144 of them, and the PLE table on the host in the
+// file's bytes]. The cache at 4,096 and 32,768 positions: 36 GDN layers of 4 · 3,145,728 + 16 B of
 // state and 11 · 10,240 f32 of conv ring, the PLE ring 17 · 10,240 f32, 12 attention layers of
 // 2,304 B a position and 256 B a pool of four.
 const CARD_DENSE: u64 = 5_544_906_240;
 const CARD_ROUNDING: u64 = 398_422_528;
 const HOST_EXPERTS: u64 = 77_017_907_200;
-const NVME_TABLE: u64 = 28_800_138_240;
+// PIN(2026-09-28): the PLE table on the host, in the host set a load reads in, where the NVMe tier
+// held it [derived: 320,001,536 IQ4_NL rows of 160 values, 160 / 32 · 18 = 90 B a row; the bytes the
+// NVMe figure pinned, moved to the host's tables, the NVMe tier now 0].
+const HOST_TABLES: u64 = 28_800_138_240;
 // PIN(2026-09-28): KV_AT and CARD_MAX_CTX past the verify's delta lanes [derived: each GDN layer's
 // state keeps runtime::stores::DELTA_LANES = 4 lanes with a u32 stamp each, 3 · 3,145,728 + 16 =
 // 9,437,200 B past the one lane, 339,739,200 B over the 36 layers; KV_AT was 246,554,624 and
@@ -181,19 +184,24 @@ const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_508_356), ("3090", 607_383)]
 /// The plan of the Qwen3.8 file from its headers (`arch::qwen35moe::place`):
 /// `PlanInputs::read` refuses it with the coverage list; `describe` reads
 /// it, and on each card at 4,096 and 32,768 positions the plan places every
-/// tensor once — the routed stacks whole on the host, the PLE table in the
-/// file, everything else on the card — with the card, host and cache bytes
-/// predicted; every name the program reads is in the file on the layers that
-/// carry it; a context of 0 or past `u32` positions is refused by name, and
-/// one past what a card holds breaks the plan with `CardOver`.
+/// tensor once — the routed stacks whole and the PLE table on the host,
+/// everything else on the card — with the card, host and cache bytes
+/// predicted and the host's and the NVMe tier's totals those of its rows;
+/// the host set of the plan holds the PLE table's pages once, beside the
+/// routed stacks' (`HostSet::of`, headers only); every name the program
+/// reads is in the file on the layers that carry it; a context of 0 or past
+/// `u32` positions is refused by name, and one past what a card holds breaks
+/// the plan with `CardOver`.
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_plan() {
     use model::arch::qwen35moe::hparams::Kind;
     use model::arch::qwen35moe::names::{self, Sub};
     use model::arch::qwen35moe::place::{self, KERNEL_POSITIONS, PlaceError, PlanInputs};
+    use model::placement::host_lock::{HostFile, HostSet, page_bytes};
     use model::placement::workstation::{A6000, RTX_3090};
-    use model::placement::{Device, KvBytes, PlanLevers, Role, Violation};
+    use model::placement::{Device, KvBytes, ModelTensor, PlanLevers, Role, Violation};
+    use model::r8file::R8Source;
 
     let mut o = String::new();
     let mut b: Vec<String> = Vec::new();
@@ -331,8 +339,7 @@ fn hw_qwen4exp_plan() {
                 once[r.tensor] += 1;
                 let t = &inputs.model.tensors[r.tensor];
                 let want = match t.role {
-                    Role::RoutedExperts => Device::Host,
-                    Role::EngramTable => Device::Nvme,
+                    Role::RoutedExperts | Role::EngramTable => Device::Host,
                     _ => Device::Card(0),
                 };
                 if r.segments.len() != 1 || r.segments[0].device != want {
@@ -347,8 +354,8 @@ fn hw_qwen4exp_plan() {
                 ("card experts", c.expert_bytes, 0),
                 ("card kv", c.kv_bytes, kv),
                 ("host experts", plan.host.expert_bytes, HOST_EXPERTS),
-                ("host tables", plan.host.table_bytes, 0),
-                ("nvme", plan.nvme_bytes, NVME_TABLE),
+                ("host tables", plan.host.table_bytes, HOST_TABLES),
+                ("nvme", plan.nvme_bytes, 0),
             ];
             let bytes_ok = figures.iter().all(|&(_, got, want)| got == want);
             let shown: Vec<String> = figures
@@ -366,6 +373,33 @@ fn hw_qwen4exp_plan() {
                     c.headroom_bytes
                 ),
                 placed_once && misplaced.is_empty() && plan.n_l.iter().all(|&n| n == 0) && bytes_ok,
+            );
+            // The host's and the NVMe tier's totals re-derived from the rows, whichever step of
+            // the placement wrote them.
+            let (mut host_rows, mut nvme_rows) = (0u64, 0u64);
+            for seg in plan.rows.iter().flat_map(|r| &r.segments) {
+                match seg.device {
+                    Device::Host => host_rows += seg.resident_bytes,
+                    Device::Nvme => nvme_rows += seg.resident_bytes,
+                    Device::Card(_) | Device::Unused => {}
+                }
+            }
+            let h = &plan.host;
+            let terms = h.expert_bytes + h.table_bytes + h.shadow_bytes + h.reserve_bytes;
+            let headroom = i128::from(machine.host.usable_bytes) - i128::from(terms);
+            check(
+                &mut o,
+                format!(
+                    "{} ctx {ctx}: the host's rows {host_rows} = experts + tables {}; the NVMe \
+                     tier's rows {nvme_rows} = {}; host headroom {} = usable − its terms {headroom}",
+                    card.name,
+                    h.expert_bytes + h.table_bytes,
+                    plan.nvme_bytes,
+                    h.headroom_bytes
+                ),
+                host_rows == h.expert_bytes + h.table_bytes
+                    && nvme_rows == plan.nvme_bytes
+                    && h.headroom_bytes == headroom,
             );
         }
         let predicted = CARD_MAX_CTX
@@ -414,6 +448,61 @@ fn hw_qwen4exp_plan() {
         );
     }
     let machine = place::machine(A6000, hp.n_layer);
+    // The plan's host set, from the headers: the PLE table's pages once, beside the routed
+    // stacks', each run grown to whole pages and merged per shard.
+    match inputs.plan(&machine, KV_AT[0].0, &levers) {
+        Ok(plan) => {
+            let src = R8Source::rows(&split);
+            let set = |keep: &dyn Fn(&ModelTensor) -> bool| {
+                HostSet::of(src, &plan, keep).unwrap_or_else(|e| panic!("HostSet::of: {e}"))
+            };
+            let all = set(&|_| true);
+            let stacks = set(&|t| t.role != Role::EngramTable);
+            let page = page_bytes().unwrap_or_else(|e| panic!("page_bytes: {e}"));
+            let name = names::per_layer_token_embd();
+            let (s, info) = split
+                .find(&name)
+                .unwrap_or_else(|| panic!("{name} is not in the file"));
+            let at = split
+                .shard(s)
+                .unwrap_or_else(|| panic!("shard {s} of {name}"))
+                .data_base()
+                + info.offset;
+            let ple = at / page..(at + info.nbytes).div_ceil(page);
+            let runs = |set: &HostSet| -> Vec<std::ops::Range<u64>> {
+                set.runs()
+                    .into_iter()
+                    .find(|(f, _)| *f == HostFile::Shard(s))
+                    .map(|(_, r)| r.to_vec())
+                    .unwrap_or_default()
+            };
+            let held = runs(&all)
+                .iter()
+                .any(|r| r.start <= ple.start && ple.end <= r.end);
+            let shared: u64 = runs(&stacks)
+                .iter()
+                .map(|r| r.end.min(ple.end).saturating_sub(r.start.max(ple.start)))
+                .sum();
+            let want = stacks.pages() + (ple.end - ple.start) - shared;
+            check(
+                &mut o,
+                format!(
+                    "the host set holds the PLE table's pages {ple:?} of shard {s} ({held}), once: \
+                     {} pages = the routed stacks' {} + the table's {} − {shared} shared (want \
+                     {want})",
+                    all.pages(),
+                    stacks.pages(),
+                    ple.end - ple.start
+                ),
+                held && all.pages() == want,
+            );
+        }
+        Err(e) => check(
+            &mut o,
+            format!("no plan to build the host set from: {e}"),
+            false,
+        ),
+    }
     for ctx in [0, KERNEL_POSITIONS + 1] {
         let got = inputs.plan(&machine, ctx, &levers);
         let named = matches!(&got, Err(PlaceError::Positions { ctx_max }) if *ctx_max == ctx);
