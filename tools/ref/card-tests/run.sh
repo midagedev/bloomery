@@ -3,8 +3,8 @@
 # (tools/ref/lease.sh) and its holder naming, tools/ref/lease-hold.sh, the lease's probe (lease_free),
 # the holds and box.sh's guard (lease_guard), tools/box.sh's remote command and its read-only
 # refusals (stub ssh), tools/ref/card-precheck.sh, tools/gpu-ab.py's card check, the witness fields
-# with a failing nvidia-smi, the t table's four readers (tdump.sh) and tools/gate-batch.sh's script
-# walker (--classes on a stub tree).
+# with a failing nvidia-smi, the t table's four readers (tdump.sh), tools/gate-batch.sh's script
+# walker (--classes on a stub tree) and the cpu guard (cpu-guard.sh).
 #
 #   tools/ref/card-tests/run.sh
 #
@@ -597,6 +597,9 @@ if command -v just > /dev/null; then
 else
   echo "skip walker tests: no just on PATH (check-recipes runs them on the Mac)"
 fi
+
+# The cpu guard (guard_cpu, cpu_busy_reading) on a stub /proc tree, and live where /proc exists.
+run 'the cpu guard tests (cpu-guard.sh)' 0 '^cpu-guard: [0-9]+ tests, 0 failed$' bash "$HERE/cpu-guard.sh"
 
 echo "card-tests: $n tests, $failed failed"
 [ "$failed" = 0 ]
