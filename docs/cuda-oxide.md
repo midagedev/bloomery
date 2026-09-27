@@ -1,6 +1,6 @@
 # How bloomery uses cuda-oxide
 
-bloomery is an LLM inference engine for MoE models on one workstation. Its GPU kernels are Rust, compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide). This page shows how a larger project is put together on it: how the kernels are laid out, how the host launches them, how the build is pinned, and what we ran into. It is written for people who have finished a first cuda-oxide kernel and want to see the next step.
+bloomery is an LLM inference engine for MoE models on one workstation. Its GPU kernels are Rust, compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide). This page shows how a larger project is put together on it: how the kernels are laid out, how the host launches them and how the build is pinned. It is written for people who have finished a first cuda-oxide kernel and want to see the next step.
 
 bloomery is still in active development, and this page describes the tree as it is now. Everything here runs on Ampere (sm_86) only.
 
@@ -20,7 +20,7 @@ The device code lives in four crates: about 90 `#[cuda_module]` modules with abo
 Three rules came from experience:
 
 - **One `#[cuda_module]` per operation file.** For example, `rope_neox.rs` holds the module `rope_neox_kernels`, its launch arguments and its host launcher. Writing a new op touches its own file only.
-- **Model-specific kernels live in their own crate.** When a compiler defect hits one kernel, only the builds that depend on that crate break.
+- **Model-specific kernels live in their own crate.** A build that does not need them does not compile them.
 - **Every kernel name carries a model prefix** (`ds41_…`, `dflash_…`). cuda-oxide derives a kernel's host symbol from the entry name alone, not from its crate or module, so two crates that declare the same entry name fail to link.
 
 Arithmetic that several kernels share is written once, as `#[inline(always)] pub fn` in `crates/gpu/src/cores.rs` (for example `q3k_row_dot`). A kernel in another crate calls it as `bloomery_gpu::cores::q3k_row_dot`, and it inlines into the same instructions.
@@ -117,41 +117,31 @@ impl RopeNeoxKernels {
 }
 ```
 
-Modules are loaded once, when the model loads. The launchers allocate nothing, so a whole decode step can be captured into a CUDA graph and replayed. cuda-core had no safe graph API for the streams the generated launchers take, so `crates/gpu/src/graph.rs` calls the driver through `cuda_core::sys` for capture, instantiate and launch.
+Modules are loaded once, when the model loads. The launchers allocate nothing, so a whole decode step can be captured into a CUDA graph and replayed. `crates/gpu/src/graph.rs` does capture, instantiate and launch through the driver bindings in `cuda_core::sys`.
 
 ## When a kernel meets bad input
 
 A kernel cannot panic, and we do not want it to write a plausible value either. Every kernel that can meet undefined input (a NaN activation, a position past the cache) takes a `FaultSink` argument: a device address plus the layer number, passed by value. On bad input the kernel raises a fault code, keeps its memory accesses in bounds and writes NaN instead of a plausible result. The output head copies the fault word next to the token it writes, so the step's single readback carries it for free. The host then returns a named error. See `crates/gpu/src/fault.rs`.
 
-The raise itself is a few lines of `ptx_asm!` (`red.relaxed.gpu.global.min.u32`). With a plain atomic on a pointer inside a by-value struct, the compiler treated the address as generic and emitted a local-memory branch in every kernel that raises. Two of them gained registers, and one reached its 128-register cap.
+The raise itself is a few lines of `ptx_asm!` (`red.relaxed.gpu.global.min.u32`), which names the global address space directly.
 
 ## Build and pinning
 
 - **Only `cargo oxide` builds device crates.** A plain `cargo build` of such a crate compiles, but produces a binary without the device code.
-- **cuda-oxide is pinned by git revision.** `Cargo.toml` declares the NVlabs revision, and a `[patch]` section takes the source from [our fork](https://github.com/midagedev/cuda-oxide) (`bloomery` branch), which is that revision plus the fixes we have sent upstream. `THIRD_PARTY_NOTICES.md` lists each patch and its upstream PR. `just deny` fails if either revision floats. The Rust nightly moves only when this pin moves.
-- **One codegen backend per revision.** On the build machine each revision's backend sits in its own directory with a `source-rev.txt`. `tools/box.sh` sets `CUDA_OXIDE_BACKEND` to it and stops when the file is missing or names another revision. Before this, parallel builds rebuilt a shared cached backend in place.
-- **Host code gets the same CPU flags as a plain cargo build.** `cargo oxide` sets its own `CARGO_ENCODED_RUSTFLAGS`, which hides `.cargo/config.toml`. So `.cargo/cuda-oxide.toml` repeats `-C target-cpu=znver3` in `extra-rustflags`, and `just check-rustflags` fails when the two files disagree. Without it, the AVX2 host code in an oxide-built binary was compiled for baseline x86-64.
+- **cuda-oxide is pinned by git revision.** `Cargo.toml` declares the NVlabs revision, and a `[patch]` section takes the source from [our fork](https://github.com/midagedev/cuda-oxide) (`bloomery` branch), which is that revision plus a few small patches on their way upstream (`THIRD_PARTY_NOTICES.md` lists them). `just deny` fails if either revision floats. The Rust nightly moves only when this pin moves.
+- **One codegen backend per revision.** On the build machine each revision's backend sits in its own directory with a `source-rev.txt`. `tools/box.sh` sets `CUDA_OXIDE_BACKEND` to it and stops when the file is missing or names another revision.
+- **Host code gets the same CPU flags as a plain cargo build.** `cargo oxide` sets its own `CARGO_ENCODED_RUSTFLAGS`, which hides `.cargo/config.toml`. So `.cargo/cuda-oxide.toml` repeats `-C target-cpu=znver3` in `extra-rustflags`, and `just check-rustflags` fails when the two files disagree.
 
 ## Checking the compiled code
 
-Some compiler outcomes do not change any output bit and only make a kernel slower, so the bit-exact tests cannot see them. We check them at build time:
+Register use and spills do not change any output bit, only speed, so the bit-exact tests cannot see them. We check them at build time:
 
 - **`just ptx-scan <bin>`** prints, for every kernel entry, its registers, shared memory, ptxas spill bytes and the driver JIT's local bytes, with an md5 of its PTX. A change that should not touch device code (a rename, host-only work) must leave this table identical.
 - **`just gate-ptx-spill`** compares every entry's spill and local bytes with the pins in `tools/ref/ptx-shapes.tsv`. Any change, up or down, a new entry without a pin, or a pin whose entry disappeared is a failure. A non-zero pin carries a comment that gives its reason.
 
-This matters because the most expensive problem we hit was silent: per-lane accumulator arrays (`[f32; N]`) spilled to local memory under register pressure, without a warning. The outputs stayed bit-identical, and the kernel became 13–31× slower. Loops over such arrays need `#[unroll]` on a form the unroller recognizes.
+## Upstream
 
-## What we ran into
-
-We record each toolchain defect when we first meet it, before writing a workaround, in [`docs/upstream/nvlabs-ledger.md`](upstream/nvlabs-ledger.md) (Korean). Some of them:
-
-- **Merged upstream:** [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314), a constant-folder crash (`APInt::shl: bitwidth mismatch`) when unrolling a loop with a `usize` counter; [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321), unrolling loops whose exit test adds a constant to the counter.
-- **Open:** [#1346](https://github.com/NVlabs/cuda-oxide/pull/1346), unrolling range `for` loops; [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329), installing the cached backend by rename.
-- **In our fork, not yet proposed:** letting `requires` name unsigned integer constants; naming the macro call when a `#[cuda_module]` finds no kernels.
-- **Worked around:**
-  - `#[launch_contract(dynamic_shared = …)]` and the `block` size take literals only.
-  - FP contraction cannot be turned off per expression. `x0*c - x1*s` becomes an `fma`, so we use `mul_rn_f32`/`fma_rn_f32` where the reference's rounding matters.
-  - `f32::max` lowers to four instructions instead of one `max.f32`.
+A few small fixes found along the way went upstream: [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) and [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321) (merged), [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329) and [#1346](https://github.com/NVlabs/cuda-oxide/pull/1346) (open).
 
 ## Where to start reading
 

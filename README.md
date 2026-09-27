@@ -178,7 +178,7 @@ See [`docs/BUILD.md`](docs/BUILD.md). In short: Linux x86-64 with AVX2, CUDA 13.
 
 ## More
 
-- How bloomery uses cuda-oxide (layout, launch contracts, pinning, what we ran into): [`docs/cuda-oxide.md`](docs/cuda-oxide.md).
+- How bloomery uses cuda-oxide (layout, launch contracts, pinning): [`docs/cuda-oxide.md`](docs/cuda-oxide.md).
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
 - Plan and cost models: [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md); placement: [`docs/v41-placement.md`](docs/v41-placement.md) (Korean).
 - Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
