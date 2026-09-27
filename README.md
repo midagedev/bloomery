@@ -7,9 +7,16 @@
 
 # bloomery
 
-Hybrid GPU + CPU inference for mixture-of-experts models, written in Rust down to the CUDA kernels.
+MoE inference in Rust, from the HTTP server down to the CUDA kernels.
 
-bloomery runs MoE models that do not fit on one GPU. Each routed layer keeps as many experts on the card as fit; the rest run on the CPU in the same decode step. The host code is Rust, the GPU kernels are Rust compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide), and the CPU expert kernels are AVX2 Rust. How the kernels use cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). It is built for an Ampere GPU, an AVX2 CPU with eight memory channels, and 256 GB of RAM.
+DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s decode at depth 6 and 30.04 at depth 4096, 358.4 tok/s prompt at P = 4096; provisional until the warm re-measure ([conditions](#against-llamacpp-deepseek-v41-flash), [all numbers](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md)).
+
+- More than 200 CUDA kernels, all written in Rust with [cuda-oxide](https://github.com/NVlabs/cuda-oxide) ([how](docs/cuda-oxide.md)).
+- Experts on the GPU and the AVX2 CPU in one CUDA graph step.
+- DSpark speculative decoding with the draft on a second card; greedy output is unchanged.
+- V4.1's batched prompts leave the state of one step per token, bit for bit.
+- A llama-server-compatible HTTP API.
+- Every number comes from a runner and links its log.
 
 ## Models
 
@@ -28,10 +35,10 @@ The DSpark draft for V4.1 speculative decoding is not a public upload: it is con
 
 ## How it works
 
-- **Experts split between card and host.** Each routed layer keeps some experts on the GPU; the rest run on the AVX2 host tier inside the same captured CUDA graph step. A router-frequency list (`BLOOMERY_HOT_LIST`) can pick which experts stay on the card.
-- **V4.1's engram table stays on NVMe.** It does not fit in RAM beside the host experts. Each token reads 48 rows; a helper thread prefetches them.
-- **Speculative decoding.** A skewed two-row pass runs two positions one layer apart in one step and verifies a draft token: the DSpark draft on a second card (`BLOOMERY_DRAFT=dspark`) or an n-gram lookup (`BLOOMERY_DRAFT=lookup`). Greedy output is the same with and without a draft.
-- **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B runs ubatches of up to 4096 tokens through an int8 tensor-core GEMM. The result is bit for bit the state one step per token leaves.
+- **Hot list.** A router-frequency list (`BLOOMERY_HOT_LIST`) picks which experts stay on the card.
+- **Engram rows from NVMe.** V4.1's engram table is read from NVMe, 48 rows a token, prefetched by a helper thread.
+- **Skewed pass.** Speculative decoding runs two positions one layer apart in one step and verifies a draft token: the DSpark draft (`BLOOMERY_DRAFT=dspark`) or an n-gram lookup (`BLOOMERY_DRAFT=lookup`).
+- **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B runs ubatches of up to 4096 tokens through an int8 tensor-core GEMM.
 
 ## Status
 
@@ -86,7 +93,7 @@ The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels,
 ## How it is verified
 
 - **Against ik_llama.cpp.** Intermediate tensors are dumped from ik_llama.cpp's CPU backend and compared per layer. Integer outputs (router ids, engram rows, indexer top-k) must match exactly outside tie bands; float outputs stay inside bands derived from both engines' rounding.
-- **Bit gates.** Graph replay equals eager execution; the skewed pass equals two single steps; a rollback and a batched prompt leave the same state as one step per token.
+- **Bit gates.** Graph replay equals eager execution; the skewed pass equals two single steps; a rollback and a V4.1 batched prompt leave the same state as one step per token.
 - **PPL and KLD** on the public V4.1 file (wikitext-2, 2048 context, 4 chunks, RTX 3090): PPL 2.2401 against ik_llama.cpp's 2.2378; KLD 0.00987 ± 0.00049; same top token 97.46 % ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#sit10)).
 - **Each gate is shown to fail** on its defect before the fix lands. Bands are not relaxed to pass.
 
