@@ -121,6 +121,15 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### 출시 트랙이 남긴 것 (09-27, e1 — `relrunner`, `soak`, 창 1)
+
+- **V4.1 교차 엔진 표가 비어 있다**(rig-log 09-27#v41-xeng, #e21-3090). 참조 팔을 예열해도 llama.cpp 행이 모두 차가웠다(pp512 73–76 tok/s, 폴트 17–19만, `-r 2`의 둘째 반복까지 차가움). 공개 표에는 09-25 아침 값을 조건과 함께 둔다. 원인과 공정한 창의 설계는 조사 라운드 `memfit`(비행 중)이 낸다. 후보는 r8 사이드카 페이지, llama.cpp 적재의 WILLNEED 262.7 GB, 예열이 넣지 않은 engram 페이지다. r8 뒤 배치 (a)의 우리 pp512도 두 바퀴 다 차가웠다. 우리 호스트 작업 집합이 캐시를 넘는지가 같은 조사에 있다(03 영역과 닿는다).
+- **soak 30분**은 aa의 열차 2 뒤 틈에 돈다(`just soak-ds41 30`, 약 34분[유도]).
+
+- **서빙의 호스트 집합이 잠기지 않는다**(soak 보고). `bloomery-serve-ds41`는 배치 (a)에서 `BLOOMERY_HOST_LOCK`을 켜지 않는다. 3분 soak의 warm-up 동안 파일 기반 호스트 expert 페이지 약 34 GB가 회수됐다가 다시 폴트로 읽혔다(RssFile 209 → 175 → 195 GB). 호스트 집합 214 GB와 r8 사이드카 128.7 GB가 251 GiB 박스에 함께 올라 있다. 다른 트랙의 적재 때문인지, 서빙 작업 집합이 램을 넘어서인지는 이 자료로 가를 수 없다. 서빙 바이너리의 기본값을 잠금으로 둘지는 사용자 결정이다(S).
+- 서버가 연결마다 스레드를 상한 없이 만든다(`crates/serve/src/api.rs` 연결 수락 루프, S). temperature > 0에서 토큰마다 n_vocab 크기 `Vec`를 새로 잡는다(`crates/gpu-gates/src/bind.rs`의 `logits()`, 버퍼 재사용, S). 위치 상한을 넘는 요청이 엔진 오류가 되어 서버 전체가 exit 70으로 끝난다. 요청 검증에서 400으로 거절하면 클라이언트 실수 하나로 서버가 죽지 않는다(`body.rs`의 `check_defined`, S).
+- 러너(relrunner): 예열의 둘째 패스(캐시에서 4–7 s로 호스트 집합을 활성 목록에 올린다)는 MGLRU에서의 효과를 종이로 못 정해 넣지 않았다. 첫 시팅의 잔여 `majflt`가 판단 근거다(XS). `depth-ds41.sh` 머리의 "V4.1's ours is one decode step per token today"는 `43cd107` 뒤로 틀렸다(XS). `generate_ds41.rs` 머리의 `--place a` "the one the timing runners use"도 이제 gate가 있어 낡았다(XS). `majflt`는 기계 전체 카운터라고 행에 밝힌다(XS). `ref_cmd`가 빈 `REF_ENV`에서 공백 두 칸(XS). `tools/ref/depth-ds41-stub.sh`(러너의 박스 자체 시험)는 아무 검사도 부르지 않는다 — `check-recipes`에 박스 단계가 없으니, 러너를 바꾸는 라운드의 증명 목록에 넣는다(XS).
+
 ### 03 재구성이 남긴 것 (09-27, `q3prune`·`q3rope`)
 
 - **착륙 기록.** 묶음 1(09-27 새벽): `q3prune`(`fca8171`), `q3rope`(`ade3f76`), `sass_inflight.py`(`2997a58`, q3gemmd에서 도구만). 커널은 지운 `qwen3moe_router` 엔트리 말고 움직이지 않았다. q3prune의 ptx-scan 여섯 바이너리는 base `a229bfa`와 그 행·md5 줄만 다르고(번들 −16,152 B), q3rope의 두 바이너리는 base `e4c501a`와 같다. 두 base와 지금 main 사이 기기 코드 변경은 두 라운드의 diff와 파일이 겹치지 않아 합성으로 읽었다. 착륙 트리를 다시 스캔하지는 않았고, `gate-ptx-spill`은 generate_ds41·gate_e2e의 엔트리 집합과 spill만 본다. 묶음(`tools/gate-batch.sh` 두 레인, 벽시계 370 s)은 15개 모두 rc 0, lint 133 그대로였다. 묶음은 `2b461b3` 위 트리에서 돌았고, 그 뒤 main이 문서 한 줄(`56eaab6`)만큼 움직여 그 위로 리베이스했다(코드 diff 0). 돌린 것은 qwen3moe-meta·router·experts·flash·e2e(두 팔)·gpu-gemm·ptx-spill과 정적 여덟이다. 뺀 것은 V2-Lite p-게이트, V4.1·DSpark 게이트, qwen3moe-qknorm·rope·down, model 크레이트의 Qwen3 밖 게이트다. 이들의 코드는 바뀌지 않았고 `just check`가 모든 타깃을 컴파일한다.
