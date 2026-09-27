@@ -279,6 +279,16 @@ impl Store38Host {
     }
 }
 
+/// A layer's router at the step's row, read back
+/// ([`Body38::route_taps`]).
+#[derive(Clone, Debug)]
+pub struct RouteTap {
+    /// The routed experts' logits, the shared expert's gate left out.
+    pub logits: Vec<f32>,
+    /// The routed slots' expert ids, in slot order.
+    pub ids: Vec<u32>,
+}
+
 /// One step's host values: its token and position.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeInput38 {
@@ -588,7 +598,7 @@ impl Body38 {
     /// Every layer's router after the last step: its [`geo::EXPERTS`]
     /// logits and its [`geo::N_USED`] routed ids, in slot order. Blocking;
     /// refused when the taps are not armed.
-    pub fn route_taps(&self, gpu: &Gpu) -> Result<Vec<(Vec<f32>, Vec<u32>)>, GpuError> {
+    pub fn route_taps(&self, gpu: &Gpu) -> Result<Vec<RouteTap>, GpuError> {
         let taps = self
             .taps
             .as_ref()
@@ -607,7 +617,10 @@ impl Body38 {
                 }
                 lg.truncate(geo::EXPERTS);
                 id.truncate(geo::N_USED);
-                Ok((lg, id))
+                Ok(RouteTap {
+                    logits: lg,
+                    ids: id,
+                })
             })
             .collect()
     }
@@ -737,7 +750,8 @@ impl GpuModel<Body38> {
     /// greedy next token after the last one: captured steps, one a position,
     /// or eager passes of up to eight positions, the last one ending in its
     /// last row's head. Either leaves every position's state and logits bit
-    /// for bit. The layer taps must be off for passes.
+    /// for bit. A prompt past the stores is refused before any launch; the
+    /// layer taps must be off for passes.
     pub fn prompt38(&mut self, tokens: &[u32], path: Prompt38) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         if tokens.is_empty() {
@@ -748,6 +762,16 @@ impl GpuModel<Body38> {
                 what: WHAT_P,
                 fault,
             });
+        }
+        let (pos, ctx) = (self.pos() as usize, self.body(WHAT_P)?.ctx());
+        if pos + tokens.len() > ctx {
+            return Err(GpuError::shape(
+                WHAT_P,
+                format!(
+                    "a prompt of {} ids from position {pos} passes the stores' {ctx} positions",
+                    tokens.len()
+                ),
+            ));
         }
         match path {
             Prompt38::Step => self.step(tokens),

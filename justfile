@@ -602,6 +602,15 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
+# Qwen3.8-Flash-Next (qwen4exp) whole-program gate on the 3090 (its plan's card): the step's node count, graph = eager =
+# one pass (logits and every store bit for bit), reset clears, every layer's streams on the batch set within the borrowed
+# band with the router's flips named, the step after each set's prompt (4, 1,024 and 3,000 positions), D3K's prompt by
+# passes = by steps, and the refusals. Loads the whole host set: alone in a batch, under the big-load lock.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-qwen4exp-e2e:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && bash tools/gpu-gate.sh gate_qwen4exp_e2e'
+
 gate-gpu-qwen3moe-down:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
 

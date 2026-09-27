@@ -38,7 +38,9 @@ mod wide;
 
 pub use body::{Body, DecodeInput, FlashKind, OpenOpts};
 pub use body35::{Body35, DecodeInput35, LayerKind35, Open35};
-pub use body38::{ALLOWED, Body38, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, Store38Host};
+pub use body38::{
+    ALLOWED, Body38, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
+};
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 
 /// Qwen3.6-35B-A3B on one card.

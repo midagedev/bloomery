@@ -42,8 +42,7 @@ fn model() -> String {
     MODEL.to_string()
 }
 
-/// ik's node dumps: the batch set and the decode-step sets. No gate recipe
-/// in this tree reads them yet, so `consumers` is empty.
+/// ik's node dumps: the batch set and the decode-step sets.
 pub static IK: Family = Family {
     name: "ik-qwen4exp",
     sets: &[BATCH, STEP4, STEP4_EVERY_NODE, D1K, D3K],
@@ -54,7 +53,7 @@ pub static IK: Family = Family {
     build: Some(Build::Is(IK_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-qwen4exp-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
