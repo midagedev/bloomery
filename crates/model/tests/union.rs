@@ -74,6 +74,14 @@
 //! (each row's `dot_row`), under both deferral arms, in the calls'
 //! dispatches.
 //!
+//! The Q8_0 down lane — a routed layer whose down is Q8_0, as five of Qwen3.8's are — is held
+//! on a synthetic layer (Q4_K gate and up, a Q8_0 down of 480-value rows: three x4 groups and
+//! three q8_2 tail blocks) served for ten slots, one expert a column at weight 1.0, so each
+//! output column is its slot's down: every cell within the derived band of the f64 dot of the
+//! down's dequantized row with the combine (the combine from the same qdot calls the tier
+//! makes), and the union call at k = 1, 8 and 10 equal to `experts_into` of every column, bit
+//! for bit, under both deferral arms, in its dispatches.
+//!
 //! PIN(2026-09-26): the four-expert routing runs whole — the scratch's slabs
 //! are indexed by slot, so no expert's column count bounds a call.
 //!
@@ -95,7 +103,8 @@ use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{
-    HostLayer, HostScratch, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS, UnionScratch, union_batch_slots,
+    HostLayer, HostLayerSpec, HostScratch, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS, UnionScratch,
+    union_batch_slots,
 };
 use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
@@ -1215,5 +1224,280 @@ fn hw_union_r8_matches_file_rows() {
          file's rows column for column, bit for bit, through experts_into and the union call at \
          k = 1, 8, 9, 64, 512 under both deferral arms, in 2 / 4 pool dispatches a call up to \
          k = 8 and 5 past it"
+    );
+}
+
+/// The Q8_0 down lane's synthetic layer: `embd`, `ff` and experts. A down row of `ff` = 480
+/// values is 15 Q8_0 blocks — three x4 groups of its q8_2 column and three tail blocks, the
+/// most a column carries.
+const Q8_LAYER: (usize, usize, usize) = (512, 480, 4);
+
+/// The Q8_0 lane's ten columns, each listing one expert at weight 1.0: experts 0 to 3 carry 4,
+/// 3, 2 and 1 columns.
+const Q8_EXPERTS: [u32; 10] = [0, 1, 2, 3, 0, 1, 2, 0, 1, 0];
+
+/// The Q8_0 lane's column counts: one column, the widest call that claims, and all ten slots.
+const Q8_KS: [usize; 3] = [1, 8, 10];
+
+const Q8_GATE: &str = "blk.0.ffn_gate_exps.weight";
+const Q8_UP: &str = "blk.0.ffn_up_exps.weight";
+const Q8_DOWN: &str = "blk.0.ffn_down_exps.weight";
+
+/// f32's unit roundoff.
+const U: f64 = 1.0 / 16_777_216.0;
+
+/// One routed layer — Q4_K gate and up, a Q8_0 down — written with `gguf::write` into its own
+/// directory (removed on drop), and the stacks' bytes the file holds.
+struct Q8Layer {
+    dir: std::path::PathBuf,
+    source: std::path::PathBuf,
+    gate: Vec<u8>,
+    up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+impl Q8Layer {
+    fn write(embd: usize, ff: usize, n_expert: usize) -> Q8Layer {
+        use gguf::write::{Layout, TensorDecl, Writer};
+        let dir = std::env::temp_dir().join(format!("q8layer-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("layer.gguf");
+        let gate = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x6a7e);
+        let up = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x0b);
+        let down = q8_stack(GgmlType::Q8_0, [ff, embd, n_expert], 0xd0);
+        let stacks = [
+            (Q8_GATE, GgmlType::Q4_K, [embd, ff, n_expert], &gate),
+            (Q8_UP, GgmlType::Q4_K, [embd, ff, n_expert], &up),
+            (Q8_DOWN, GgmlType::Q8_0, [ff, embd, n_expert], &down),
+        ];
+        let decls: Vec<TensorDecl> = stacks
+            .iter()
+            .map(|&(name, ty, dims, b)| TensorDecl {
+                name: name.to_string(),
+                dims: dims.map(|d| d as u64).to_vec(),
+                type_id: ty.as_u32(),
+                nbytes: b.len() as u64,
+            })
+            .collect();
+        let layout = Layout::new(&[], decls).unwrap();
+        let file = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
+        let mut w = Writer::new(file, layout).unwrap();
+        for &(name, _, _, b) in &stacks {
+            w.tensor(name, b).unwrap();
+        }
+        w.finish().unwrap();
+        Q8Layer {
+            dir,
+            source,
+            gate,
+            up,
+            down,
+        }
+    }
+}
+
+impl Drop for Q8Layer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A stack `[k, n, n_expert]` of `ty` (Q4_K or Q8_0): xorshift bytes, each block's scales set
+/// finite — Q4_K's `d` 2^-7 and `dmin` 2^-8, Q8_0's `d` of either sign at 2^-7 .. 2^-3.
+fn q8_stack(ty: GgmlType, [k, n, n_expert]: [usize; 3], seed: u64) -> Vec<u8> {
+    let (bs, ts) = (
+        ty.blck_size().unwrap() as usize,
+        ty.type_size().unwrap() as usize,
+    );
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut b: Vec<u8> = (0..k / bs * n * n_expert * ts)
+        .map(|_| next() as u8)
+        .collect();
+    for blk in b.chunks_mut(ts) {
+        match ty {
+            GgmlType::Q4_K => {
+                blk[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
+                blk[2..4].copy_from_slice(&0x1C00u16.to_le_bytes());
+            }
+            GgmlType::Q8_0 => {
+                let r = next();
+                let (exp, mant, sign) = (
+                    (8 + r % 5) as u16,
+                    (r >> 8) as u16 & 0x3ff,
+                    (r >> 20) as u16 & 1,
+                );
+                let h = (sign << 15) | (exp << 10) | mant;
+                blk[0..2].copy_from_slice(&h.to_le_bytes());
+            }
+            _ => panic!("no synthetic stack of {ty}"),
+        }
+    }
+    b
+}
+
+/// `n·u / (1 − n·u)`: the relative bound of `n` roundings.
+fn gamma(n: f64) -> f64 {
+    n * U / (1.0 - n * U)
+}
+
+/// The Q8_0 down lane. Each column's output is its one slot's down (`0 + 1.0·d`, exact), held
+/// to the f64 dot `R` of the down row's dequantized values `w` (exact in f32: an f16 scale
+/// times an i8 code) with the combine `h` — `h` from the calls the tier makes, `quantize_col`,
+/// `dot_row` of the Q4_K gate and up, `swiglu_clamp` at the layer's limit. The band, derived
+/// before the run, per 32-value block `b` of the row, `W_b = Σ|w|` and `M_b = max|h|` over it:
+///
+/// 1. h's q8_2 quantization. `d_a = bf16(M_b/127)` is within 2^-8 of `M_b/127`; a code is
+///    `nearest_int(fl(h·fl(1/d_a)))`, at most `127/(1 − 2^-8) < 127.5` in magnitude, so none
+///    saturates, and `|d_a·q − h| ≤ d_a·(1/2 + 268u) ≤ (M_b/254)(1 + 2^-7)`. Summed:
+///    `Σ_b W_b·(M_b/254)(1 + 2^-7)`.
+/// 2. Float order. A leaf — one block's lane partial times `f16(d_w)·bf16(d_a)` — takes one
+///    product rounding, one FMA per term its lane accumulates (`nb/4` groups and `nb%4` tail
+///    blocks: 6 here), three hsum levels: `n = 1 + 6 + 3 = 10`, so `γ_10·Σ|leaves|`, with
+///    `|w·d_a·q| ≤ |w|·M_b·(128/127)(1 + 2^-7)`.
+/// 3. The f64 reference's own sum: `ff·2^-53·Σ|w·h|`.
+///
+/// Then the union call at k = 1, 8 and 10 against `experts_into` of every column, bit for bit.
+#[test]
+#[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
+fn hw_union_q8_0_down_matches_dequant() {
+    let (embd, ff, n_expert) = Q8_LAYER;
+    let layer = Q8Layer::write(embd, ff, n_expert);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let spec = HostLayerSpec {
+        gate: Q8_GATE,
+        up: Q8_UP,
+        down: Q8_DOWN,
+        n_expert,
+        embd,
+        ff,
+        swiglu_limit: 0.0,
+    };
+    let host_layer =
+        HostLayer::build(src, &spec).unwrap_or_else(|e| panic!("a Q8_0 down must build: {e}"));
+    let k = Q8_EXPERTS.len();
+    let x_all: Vec<f32> = (0..k)
+        .flat_map(|j| seeded(embd, 0x0800 + j as u64))
+        .collect();
+    let case = Case {
+        x: Tensor2::from_vec(embd, k, x_all),
+        lists: Q8_EXPERTS.iter().map(|&e| vec![(e, 1.0f32)]).collect(),
+    };
+    let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
+    let want = per_column(&host_layer, src, &case, &mut host);
+
+    let (row_gu, row_d) = (144 * embd / 256, 34 * ff / 32);
+    let nb = ff / 32;
+    let n = 1.0 + (nb / 4 + nb % 4) as f64 + 3.0;
+    let mut xq = vec![0u8; qdot::col_bytes(GgmlType::Q4_K, embd)];
+    let (mut g, mut u, mut h) = (vec![0.0f32; ff], vec![0.0f32; ff], vec![0.0f32; ff]);
+    let mut w = vec![0.0f32; ff];
+    let (mut outside, mut worst) = (0usize, 0.0f64);
+    for (j, &e) in Q8_EXPERTS.iter().enumerate() {
+        let e = e as usize;
+        qdot::quantize_col(GgmlType::Q4_K, case.x.col(j), &mut xq);
+        for r in 0..ff {
+            let at = (e * ff + r) * row_gu;
+            g[r] = qdot::dot_row(GgmlType::Q4_K, &layer.gate[at..at + row_gu], &xq, embd).unwrap();
+            u[r] = qdot::dot_row(GgmlType::Q4_K, &layer.up[at..at + row_gu], &xq, embd).unwrap();
+        }
+        qdot::swiglu_clamp(&g, &u, spec.swiglu_limit, &mut h);
+        let m: Vec<f64> = h
+            .chunks(32)
+            .map(|b| b.iter().fold(0.0f64, |a, &v| a.max(f64::from(v).abs())))
+            .collect();
+        for o in 0..embd {
+            let at = (e * embd + o) * row_d;
+            gguf::dequant_row(GgmlType::Q8_0, &layer.down[at..at + row_d], &mut w).unwrap();
+            let r: f64 = w
+                .iter()
+                .zip(&h)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            let (mut quant, mut leaves) = (0.0f64, 0.0f64);
+            for (bw, &mb) in w.chunks(32).zip(&m) {
+                let wb: f64 = bw.iter().map(|&v| f64::from(v).abs()).sum();
+                quant += wb * mb / 254.0 * (1.0 + 2f64.powi(-7));
+                leaves += wb * mb * (128.0 / 127.0) * (1.0 + 2f64.powi(-7));
+            }
+            let wh: f64 = w
+                .iter()
+                .zip(&h)
+                .map(|(&a, &b)| (f64::from(a) * f64::from(b)).abs())
+                .sum();
+            let band = quant + gamma(n) * leaves + ff as f64 * 2f64.powi(-53) * wh;
+            let err = (f64::from(want[j * embd + o]) - r).abs();
+            if err.is_nan() || err > band {
+                outside += 1;
+            }
+            worst = worst.max(err / band);
+        }
+    }
+    println!(
+        "q8_0 down: {k} slots x {embd} rows against the f64 dequant dot: {outside} cells outside \
+         the band, max err/band {worst:.3}"
+    );
+
+    let mut us = UnionScratch::new_routed(embd, ff, k, LIST).expect("a scratch of ten columns");
+    let mut failed: Vec<(usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, &str)> = Vec::new();
+    for kk in Q8_KS {
+        let sub = Case {
+            x: Tensor2::from_vec(embd, kk, case.x.data[..kk * embd].to_vec()),
+            lists: case.lists[..kk].to_vec(),
+        };
+        let lists = sub.slices();
+        let mut line = format!(
+            "q8_0 down k={kk} slots={} union={}",
+            sub.slots(),
+            sub.union()
+        );
+        for (arm, on) in ARMS {
+            ops::set_defer_quant(Some(on));
+            let mut got = vec![f32::NAN; embd * kk];
+            let (r, ds, dp) = dispatched(&mut us, |us| {
+                host_layer.experts_union_into(src, &sub.x, &lists, &mut got, us)
+            });
+            ops::set_defer_quant(None);
+            r.unwrap_or_else(|e| panic!("q8_0 down k {kk} {arm}: {e}"));
+            let d = diff_cells(&got, &want[..kk * embd]);
+            let want_d = call_dispatches(kk, sub.slots(), on);
+            line += &format!(" {arm}: diff_cells={d} {}", dispatch_note(ds, dp, want_d));
+            if d != 0 {
+                failed.push((kk, arm));
+            }
+            if !dispatches_ok(ds, dp, want_d) {
+                miscounted.push((kk, arm));
+            }
+        }
+        println!("{line}");
+    }
+    assert_eq!(
+        outside, 0,
+        "every Q8_0 down cell lies within the derived band of the f64 dequant dot"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} (k, arm) Q8_0 union calls differ from experts_into: {failed:?}",
+        failed.len()
+    );
+    assert!(
+        miscounted.is_empty(),
+        "{} (k, arm) Q8_0 union calls issued other than their dispatches: {miscounted:?}",
+        miscounted.len()
+    );
+    println!(
+        "PASSED: union q8_0 down — a Q8_0 down served for {k} slots within the derived band of the \
+         f64 dequant dot, and the union call at k = 1, 8, 10 equal to experts_into bit for bit \
+         under both deferral arms"
     );
 }

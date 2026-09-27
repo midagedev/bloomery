@@ -1130,12 +1130,14 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 ///
 /// MXFP4 takes Q8_2_X4 (ggml.c:1316 on this AVX2 IQK build; ik's
 /// `iqk_set_kernels_legacy_quants` pairs it with `mul_mat_qX_1_q8_2_T`) and IQ3_XXS takes
-/// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type).
+/// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type). Q8_0
+/// takes Q8_2_X4 too (ggml.c:831 on this AVX2 IQK build; the legacy-quants entry pairs it
+/// with `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, _, block_q8_2>`), the column qdot's Q8_0 kernel
+/// reads.
 ///
-/// A weight type no CPU matmul here takes is refused, not given a format: Q8_0 and BF16
-/// activations are Q8_2_X4 and BF16 in ggml (`vec_dot_type`, ggml.c:828-837 on this AVX2
-/// IQK build, ggml.c:1494), neither of which this engine encodes, and f32 would be a
-/// plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and the
+/// A weight type no CPU matmul here takes is refused, not given a format: BF16 activations
+/// are BF16 in ggml (`vec_dot_type`, ggml.c:1494), which this engine does not encode, and
+/// f32 would be a plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and the
 /// other i-quants take Q8_K in ggml (ggml.c:895, :1090, :1302) and have no CPU matmul here
 /// either.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
@@ -1146,10 +1148,10 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
         | GgmlType::Q6_K
         | GgmlType::Q5_0
         | GgmlType::Q5_1
+        | GgmlType::Q8_0
         | GgmlType::MXFP4 => Ok(Some(ActivationFormat::Q8_2X4)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
-        GgmlType::Q8_0
-        | GgmlType::BF16
+        GgmlType::BF16
         | GgmlType::Q2_K
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
@@ -1319,6 +1321,33 @@ mod tests {
                 Err(QuantError::NoActivationFormat(ty))
             );
         }
+    }
+
+    /// The activation format of every type a CPU matmul takes, as ggml's `vec_dot_type` on
+    /// this AVX2 IQK build names it, and BF16 refused by name.
+    // PIN(2026-09-27): Q8_0 takes Q8_2_X4, no longer refused — qdot fuses it (q8qdot).
+    #[test]
+    fn activation_formats_are_ggmls_vec_dot_types() {
+        use super::ActivationFormat::{Q8_2X4, Q8K};
+        for (ty, want) in [
+            (GgmlType::Q3_K, Some(Q8K)),
+            (GgmlType::IQ3_XXS, Some(Q8K)),
+            (GgmlType::Q4_K, Some(Q8_2X4)),
+            (GgmlType::Q5_K, Some(Q8_2X4)),
+            (GgmlType::Q6_K, Some(Q8_2X4)),
+            (GgmlType::Q5_0, Some(Q8_2X4)),
+            (GgmlType::Q5_1, Some(Q8_2X4)),
+            (GgmlType::Q8_0, Some(Q8_2X4)),
+            (GgmlType::MXFP4, Some(Q8_2X4)),
+            (GgmlType::F32, None),
+            (GgmlType::F16, None),
+        ] {
+            assert_eq!(activation_format(ty), Ok(want), "{ty}");
+        }
+        assert_eq!(
+            activation_format(GgmlType::BF16),
+            Err(QuantError::NoActivationFormat(GgmlType::BF16))
+        );
     }
 
     /// Every product the five i-quant/Q2_K ports form is exact in f32 — the
