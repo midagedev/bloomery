@@ -74,11 +74,9 @@ fn lane_dot(a: [f32; KEYS_PER_LANE], b: [f32; KEYS_PER_LANE]) -> f32 {
         mul_rn_f32(a[2], b[2]),
         mul_rn_f32(a[3], b[3]),
     ];
-    let mut i = 4usize;
-    while i < KEYS_PER_LANE {
+    for i in 4..KEYS_PER_LANE {
         cuda_device::thread::__unroll_config::<0>();
         p[i % 4] = fma_rn_f32(a[i], b[i], p[i % 4]);
-        i += 1;
     }
     (p[0] + p[1]) + (p[2] + p[3])
 }
@@ -148,8 +146,7 @@ unsafe fn ld4<const NC: bool>(g: u64) -> [f32; 4] {
 #[inline(always)]
 unsafe fn lane_keys<const NC: bool>(g: u64, j: usize) -> [f32; KEYS_PER_LANE] {
     let mut v = [0.0f32; KEYS_PER_LANE];
-    let mut r = 0usize;
-    while r < 4 {
+    for r in 0usize..4 {
         cuda_device::thread::__unroll_config::<0>();
         // SAFETY: 32·r + 4·j + 3 < HEAD and a multiple of four floats from
         // an aligned base, by the fn's contract.
@@ -158,7 +155,6 @@ unsafe fn lane_keys<const NC: bool>(g: u64, j: usize) -> [f32; KEYS_PER_LANE] {
         v[4 * r + 1] = w[1];
         v[4 * r + 2] = w[2];
         v[4 * r + 3] = w[3];
-        r += 1;
     }
     v
 }
@@ -190,6 +186,10 @@ fn column_sum(x: f32) -> f32 {
     reason = "the kernel entry's arguments, forwarded flat"
 )]
 #[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 unsafe fn delta_body<const DECAY: u32>(
     qkv: &[f32],
     beta: &[f32],
@@ -256,13 +256,11 @@ unsafe fn delta_body<const DECAY: u32>(
         };
         let mut dk = [0.0f32; KEYS_PER_LANE];
         if DECAY != DECAY_HEAD {
-            let mut i = 0usize;
-            while i < KEYS_PER_LANE {
+            for i in 0..KEYS_PER_LANE {
                 cuda_device::thread::__unroll_config::<0>();
                 // SAFETY: the per-key decay row (t·n_v + h)·HEAD + key is
                 // inside decay's m·n_v·HEAD values for DECAY_KEY.
                 dk[i] = unsafe { *decay.get_unchecked((t * n_v + h) * HEAD + key_of(j, i)) };
-                i += 1;
             }
         }
         // SAFETY: row + v_at < row + ch <= m·ch; t·n_v + h < m·n_v <= the
@@ -278,19 +276,15 @@ unsafe fn delta_body<const DECAY: u32>(
                 },
             )
         };
-        let mut i = 0usize;
-        while i < KEYS_PER_LANE {
+        for i in 0..KEYS_PER_LANE {
             cuda_device::thread::__unroll_config::<0>();
             s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
-            i += 1;
         }
         let kv = column_sum(lane_dot(s, k));
         let u = mul_rn_f32(vt - kv, bt);
-        let mut i = 0usize;
-        while i < KEYS_PER_LANE {
+        for i in 0..KEYS_PER_LANE {
             cuda_device::thread::__unroll_config::<0>();
             s[i] = fma_rn_f32(k[i], u, s[i]);
-            i += 1;
         }
         let y = column_sum(lane_dot(s, q));
         if !y.is_finite() && !raised {
@@ -304,13 +298,11 @@ unsafe fn delta_body<const DECAY: u32>(
         }
         t += 1;
     }
-    let mut i = 0usize;
-    while i < KEYS_PER_LANE {
+    for i in 0..KEYS_PER_LANE {
         cuda_device::thread::__unroll_config::<0>();
         // SAFETY: the sixteen keys this lane read from `state` above, inside
         // it by the fn's contract; each read and written by this one lane.
         unsafe { *state.add(s_at + key_of(j, i)) = s[i] };
-        i += 1;
     }
 }
 
