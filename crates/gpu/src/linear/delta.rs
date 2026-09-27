@@ -18,9 +18,15 @@
 //! barrier: a column's two dot products are a lane's own sums, then a
 //! butterfly over its eight lanes.
 //!
-//! Numeric contract (the host rule [`delta_host`] is this list), per token
-//! and column:
-//! - `S'ᵢ = decay·Sᵢ`, each rounded;
+//! Two entries share the body: `gdn_delta`, one decay per value head
+//! (Gated DeltaNet), and `kda_delta`, one per (value head, key channel)
+//! (Kimi Delta Attention), read `[m][n_v][HEAD]` by the lane's own sixteen
+//! keys.
+//!
+//! Numeric contract (the host rules [`delta_host`] and [`kda_delta_host`]
+//! are this list), per token and column:
+//! - `S'ᵢ = decayᵢ·Sᵢ`, each rounded (`decayᵢ` the head's one decay, or key
+//!   `i`'s);
 //! - a dot `Σᵢ Aᵢ·Bᵢ` (first `S'ᵀk`, then `Sᵀq`): lane `j` forms four
 //!   partials `p_c = A(0,c)·B(0,c)` rounded, then `p_c = fma(A(r,c), B(r,c),
 //!   p_c)` for `r = 1, 2, 3`, and its sum `(p₀ + p₁) + (p₂ + p₃)`; the eight
@@ -36,7 +42,7 @@
 //! whatever `qᵢ` is (`∞·0` is NaN). A non-finite `o` raises
 //! [`FaultSite::LinearDelta`] once per lane and is written as it is.
 
-use super::{BLOCK, DECAY_HEAD, HEAD, LinearShape};
+use super::{BLOCK, DECAY_HEAD, DECAY_KEY, HEAD, LinearShape};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -171,13 +177,13 @@ fn column_sum(x: f32) -> f32 {
 }
 
 /// The loop of one block, for either decay granularity (`DECAY` is
-/// [`DECAY_HEAD`] or [`super::DECAY_KEY`]; only the first has an entry).
+/// [`DECAY_HEAD`], `gdn_delta`, or [`DECAY_KEY`], `kda_delta`).
 ///
 /// # Safety
 ///
 /// The slices hold the lengths `gdn_delta`'s launch contract names, with
 /// `decay` `m·n_v` long for [`DECAY_HEAD`] and `m·n_v·HEAD` for
-/// [`super::DECAY_KEY`]; `o` and `state` address `m·n_v·HEAD` and
+/// [`DECAY_KEY`]; `o` and `state` address `m·n_v·HEAD` and
 /// `lanes·n_v·HEAD·HEAD` writable f32s that no other launch touches; `lane`
 /// holds word `lane_at`; `lanes >= 1`; `n_k >= 1` divides `n_v`; the block is
 /// 128 threads and the grid `8·n_v` blocks.
@@ -254,15 +260,20 @@ unsafe fn delta_body<const DECAY: u32>(
                 lane_keys::<true>(qkv_g + 4 * (row + q_at) as u64, j),
             )
         };
-        let mut dk = [0.0f32; KEYS_PER_LANE];
-        if DECAY != DECAY_HEAD {
-            for i in 0..KEYS_PER_LANE {
-                cuda_device::thread::__unroll_config::<0>();
-                // SAFETY: the per-key decay row (t·n_v + h)·HEAD + key is
-                // inside decay's m·n_v·HEAD values for DECAY_KEY.
-                dk[i] = unsafe { *decay.get_unchecked((t * n_v + h) * HEAD + key_of(j, i)) };
+        let dk = if DECAY == DECAY_HEAD {
+            [0.0f32; KEYS_PER_LANE]
+        } else {
+            // SAFETY: the per-key decay row (t·n_v + h)·HEAD .. + HEAD is
+            // inside decay's m·n_v·HEAD values for DECAY_KEY, a multiple of
+            // four floats from an aligned base, and no launch writes it
+            // while this one runs.
+            unsafe {
+                lane_keys::<true>(
+                    global_addr(decay.as_ptr()) + 4 * ((t * n_v + h) * HEAD) as u64,
+                    j,
+                )
             }
-        }
+        };
         // SAFETY: row + v_at < row + ch <= m·ch; t·n_v + h < m·n_v <= the
         // lengths of beta and (per head) decay.
         let (vt, bt, dh) = unsafe {
@@ -360,10 +371,59 @@ mod delta_kernels {
             );
         }
     }
+
+    /// The delta step of `m` tokens with one decay per (value head, key
+    /// channel), `decay` `[m][n_v][HEAD]` (module doc); otherwise
+    /// [`gdn_delta`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v * 128,
+            lane.len() >= lane_at + 1,
+            lanes >= 1,
+            o.len() >= m * n_v * 128,
+            state.len() >= lanes * n_v * 16384
+        )
+    )]
+    pub fn kda_delta(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        mut state: DisjointSlice<f32>,
+    ) {
+        let o = o.as_mut_ptr();
+        let state = state.as_mut_ptr();
+        // SAFETY: as gdn_delta's, with the contract's m·n_v·HEAD decay
+        // values the body reads for DECAY_KEY.
+        unsafe {
+            delta_body::<DECAY_KEY>(
+                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, fault, o, state,
+            );
+        }
+    }
 }
 
-/// [`DeltaKernels::enqueue_delta`]'s arguments: `m` tokens of the conv's
-/// output `qkv` (`[m][C]`), β and decay (`[m][n_v]`), the lane word
+/// [`DeltaKernels::enqueue_delta`]'s and [`DeltaKernels::enqueue_kda_delta`]'s
+/// arguments: `m` tokens of the conv's output `qkv` (`[m][C]`), β
+/// (`[m][n_v]`) and decay (`[m][n_v]`, or `[m][n_v][HEAD]` per key), the lane word
 /// `lane[lane_at]` (a word of the body's parameter image), the output `o`
 /// (`[m][n_v][HEAD]`), and the state (`[lanes][n_v][HEAD][HEAD]`,
 /// value-major), whose lane the call reads and overwrites with the state
@@ -397,11 +457,31 @@ impl DeltaKernels {
         Ok(DeltaKernels { module })
     }
 
-    /// Enqueue the delta step of `args.m` tokens: `8·n_v` blocks of 128
-    /// threads, the state read and written in place. Refuses `lanes` other
-    /// than 1 by name. Asynchronous, allocation-free, capturable.
+    /// Enqueue the delta step of `args.m` tokens with one decay per value
+    /// head (`decay` `[m][n_v]`): `8·n_v` blocks of 128 threads, the state
+    /// read and written in place. Refuses `lanes` other than 1 by name.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_delta(&self, stream: &CudaStream, args: DeltaArgs<'_>) -> Result<(), GpuError> {
-        let what = "enqueue_delta";
+        self.enqueue::<DECAY_HEAD>(stream, args, "enqueue_delta")
+    }
+
+    /// [`enqueue_delta`](Self::enqueue_delta) with one decay per (value
+    /// head, key channel): `decay` `[m][n_v][HEAD]`, refused by name when
+    /// shorter.
+    pub fn enqueue_kda_delta(
+        &self,
+        stream: &CudaStream,
+        args: DeltaArgs<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue::<DECAY_KEY>(stream, args, "enqueue_kda_delta")
+    }
+
+    fn enqueue<const DECAY: u32>(
+        &self,
+        stream: &CudaStream,
+        args: DeltaArgs<'_>,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
         let DeltaArgs {
             qkv,
             beta,
@@ -429,10 +509,15 @@ impl DeltaKernels {
             ));
         }
         let nv = shape.n_v;
+        let decay_len = if DECAY == DECAY_HEAD {
+            m * nv
+        } else {
+            m * nv * HEAD
+        };
         let lens = [
             ("qkv", qkv.len(), m * shape.channels()),
             ("beta", beta.len(), m * nv),
-            ("decay", decay.len(), m * nv),
+            ("decay", decay.len(), decay_len),
             ("lane", lane.len(), lane_at + 1),
             ("o", o.len(), m * nv * HEAD),
             ("state", state.len(), lanes * shape.state_len()),
@@ -449,26 +534,21 @@ impl DeltaKernels {
         let m = launch_u32(what, "m", m)?;
         let lane_at = launch_u32(what, "lane_at", lane_at)?;
         let lanes = launch_u32(what, "lanes", lanes)?;
-        let prep = self
-            .module
-            .prepare_gdn_delta(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.gdn_delta(
-            stream,
-            &prep,
-            qkv,
-            beta,
-            decay,
-            lane,
-            lane_at,
-            lanes,
-            n_k,
-            n_v,
-            shape.map.code(),
-            m,
-            fault,
-            o,
-            state,
-        )?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let map = shape.map.code();
+        if DECAY == DECAY_HEAD {
+            let prep = self.module.prepare_gdn_delta(cfg)?;
+            self.module.gdn_delta(
+                stream, &prep, qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, map, m, fault, o,
+                state,
+            )?;
+        } else {
+            let prep = self.module.prepare_kda_delta(cfg)?;
+            self.module.kda_delta(
+                stream, &prep, qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, map, m, fault, o,
+                state,
+            )?;
+        }
         Ok(())
     }
 }
@@ -502,7 +582,7 @@ pub struct DeltaOut {
 
 /// The host rule of [`DeltaKernels::enqueue_delta`]: the module doc's
 /// numeric contract, op for op, one thread per value head, on lane `lane
-/// mod lanes` of `state` (`lanes` lanes), in place.
+/// mod lanes` of `state` (`lanes` lanes), in place; `decay` `[m][n_v]`.
 ///
 /// # Panics
 ///
@@ -514,6 +594,47 @@ pub struct DeltaOut {
 )]
 #[must_use]
 pub fn delta_host(
+    qkv: &[f32],
+    beta: &[f32],
+    decay: &[f32],
+    state: &[f32],
+    lanes: usize,
+    lane: u32,
+    shape: LinearShape,
+    m: usize,
+) -> DeltaOut {
+    delta_rule_host::<DECAY_HEAD>(qkv, beta, decay, state, lanes, lane, shape, m)
+}
+
+/// The host rule of [`DeltaKernels::enqueue_kda_delta`]: [`delta_host`]
+/// with `decay` `[m][n_v][HEAD]`, key `i`'s decay scaling state key `i`.
+///
+/// # Panics
+///
+/// As [`delta_host`], `decay` shorter than `m·n_v·HEAD` included.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the host twin of one launch: its inputs, each named as the launch names them"
+)]
+#[must_use]
+pub fn kda_delta_host(
+    qkv: &[f32],
+    beta: &[f32],
+    decay: &[f32],
+    state: &[f32],
+    lanes: usize,
+    lane: u32,
+    shape: LinearShape,
+    m: usize,
+) -> DeltaOut {
+    delta_rule_host::<DECAY_KEY>(qkv, beta, decay, state, lanes, lane, shape, m)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the host twin of one launch: its inputs, each named as the launch names them"
+)]
+fn delta_rule_host<const DECAY: u32>(
     qkv: &[f32],
     beta: &[f32],
     decay: &[f32],
@@ -547,9 +668,17 @@ pub fn delta_host(
                             let q = &row[kh * HEAD..(kh + 1) * HEAD];
                             let k = &row[(n_k + kh) * HEAD..(n_k + kh + 1) * HEAD];
                             let v = row[2 * n_k * HEAD + h * HEAD + col];
-                            let (bt, dc) = (beta[t * n_v + h], decay[t * n_v + h]);
-                            for si in s.iter_mut() {
-                                *si *= dc;
+                            let bt = beta[t * n_v + h];
+                            if DECAY == DECAY_HEAD {
+                                let dc = decay[t * n_v + h];
+                                for si in s.iter_mut() {
+                                    *si *= dc;
+                                }
+                            } else {
+                                let dk = &decay[(t * n_v + h) * HEAD..(t * n_v + h + 1) * HEAD];
+                                for (si, &di) in s.iter_mut().zip(dk) {
+                                    *si *= di;
+                                }
                             }
                             let u = (v - column_dot_host(s, k)) * bt;
                             for (si, &ki) in s.iter_mut().zip(k) {
@@ -573,4 +702,74 @@ pub fn delta_host(
         }
     });
     DeltaOut { o, state }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{delta_host, kda_delta_host};
+    use crate::linear::{HEAD, KHeadMap, LinearShape};
+
+    /// Knuth's MMIX LCG, the high 24 bits as a float in `[lo, hi)`.
+    fn fill(seed: &mut u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                lo + (hi - lo) * ((*seed >> 40) as f32 / (1u64 << 24) as f32)
+            })
+            .collect()
+    }
+
+    /// The per-key rule with every key of a head given the head's decay is
+    /// the per-head rule, bit for bit: the body is one rule at two
+    /// granularities.
+    #[test]
+    fn per_key_decay_equal_per_head_is_the_head_rule() {
+        let shape = LinearShape {
+            n_k: 2,
+            n_v: 4,
+            map: KHeadMap::Tiled,
+        };
+        let m = 5;
+        let mut r = 0x6b64_6131;
+        let qkv = fill(&mut r, m * shape.channels(), -1.0, 1.0);
+        let beta = fill(&mut r, m * shape.n_v, 0.0, 1.0);
+        let decay = fill(&mut r, m * shape.n_v, 0.5, 1.0);
+        let state = fill(&mut r, shape.state_len(), -0.1, 0.1);
+        let per_key: Vec<f32> = decay
+            .iter()
+            .flat_map(|&d| std::iter::repeat_n(d, HEAD))
+            .collect();
+        let h = delta_host(&qkv, &beta, &decay, &state, 1, 0, shape, m);
+        let k = kda_delta_host(&qkv, &beta, &per_key, &state, 1, 0, shape, m);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&h.o), bits(&k.o));
+        assert_eq!(bits(&h.state), bits(&k.state));
+    }
+
+    /// A per-key decay moves only its own key of the state: a key whose
+    /// decay differs from the head's changes state values of that key alone.
+    #[test]
+    fn a_key_decay_scales_its_own_key() {
+        let shape = LinearShape {
+            n_k: 1,
+            n_v: 1,
+            map: KHeadMap::Tiled,
+        };
+        let mut r = 0x6b64_6132;
+        let qkv = fill(&mut r, shape.channels(), -1.0, 1.0);
+        let state = fill(&mut r, shape.state_len(), -0.1, 0.1);
+        // β = 0: the step is S = decay·S, the key's own column scaling.
+        let beta = vec![0.0f32];
+        let flat = vec![0.75f32; HEAD];
+        let mut moved = flat.clone();
+        moved[37] = 0.25;
+        let a = kda_delta_host(&qkv, &beta, &flat, &state, 1, 0, shape, 1);
+        let b = kda_delta_host(&qkv, &beta, &moved, &state, 1, 0, shape, 1);
+        for (i, (x, y)) in a.state.iter().zip(&b.state).enumerate() {
+            let key = i % HEAD;
+            assert_eq!(x.to_bits() == y.to_bits(), key != 37, "state value {i}");
+        }
+    }
 }

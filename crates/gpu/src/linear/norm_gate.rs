@@ -17,14 +17,15 @@
 //! - `mean = (sum / HEAD)` in f64, rounded once to f32; `scale = 1 /
 //!   √(mean + eps)` in f32;
 //! - `y = ((o·scale)·w)·act(z)`, each product rounded, `act` [`silu`] for
-//!   [`GATE_SILU`] and [`sigmoid`] for [`super::GATE_SIGMOID`].
+//!   [`GATE_SILU`] (`gdn_norm_gate`) and [`sigmoid`] for [`GATE_SIGMOID`]
+//!   (`gdn_norm_gate_sigmoid`).
 //!
 //! No silent failure: a non-finite `o`, `z` or gain, or a mean that is not
 //! finite (squares of finite values can overflow), raises
 //! [`FaultSite::LinearGate`], and the head's values are written non-finite
 //! (the scale is NaN) rather than as a zero head.
 
-use super::{BLOCK, GATE_SILU, HEAD, sigmoid, silu};
+use super::{BLOCK, GATE_SIGMOID, GATE_SILU, HEAD, sigmoid, silu};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -43,6 +44,81 @@ fn act<const ACT: u32>(z: f32) -> f32 {
         silu(z)
     } else {
         sigmoid(z)
+    }
+}
+
+/// One warp's gated norm (module doc) with the gate `ACT`: head `wi` of
+/// the `[m][n_v]` order.
+///
+/// # Safety
+///
+/// `wi < m·n_v`, `lane < 32`; `o` and `z` hold `m·n_v·HEAD` values, `w`
+/// `HEAD`, `y` `m·n_v·HEAD`; head `wi` of `y` is this warp's own. Called by
+/// all 32 lanes of the warp together.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one warp's coordinates and the entry's arguments, forwarded flat"
+)]
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn norm_gate_body<const ACT: u32>(
+    wi: usize,
+    lane: usize,
+    o: &[f32],
+    z: &[f32],
+    w: &[f32],
+    eps: f32,
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+) {
+    let base = wi * HEAD;
+    let mut ov = [0.0f32; 4];
+    let mut zv = [0.0f32; 4];
+    let mut wv = [0.0f32; 4];
+    let mut sumsq = 0.0f64;
+    for i in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let at = lane + 32 * i;
+        // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
+        // by the contract; at < 128 <= w.len().
+        unsafe {
+            ov[i] = *o.get_unchecked(base + at);
+            zv[i] = *z.get_unchecked(base + at);
+            wv[i] = *w.get_unchecked(at);
+        }
+        sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
+    }
+    let mut acc = sumsq;
+    acc += warp::shuffle_xor_f64(acc, 16);
+    acc += warp::shuffle_xor_f64(acc, 8);
+    acc += warp::shuffle_xor_f64(acc, 4);
+    acc += warp::shuffle_xor_f64(acc, 2);
+    acc += warp::shuffle_xor_f64(acc, 1);
+    let mean = (acc / HEAD as f64) as f32;
+    let fin = mean.is_finite();
+    let scale = if fin {
+        1.0 / (mean + eps).sqrt()
+    } else {
+        f32::NAN
+    };
+    let ok = fin
+        & crate::fault::quad_finite(ov)
+        & crate::fault::quad_finite(zv)
+        & crate::fault::quad_finite(wv);
+    for i in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let v = mul_rn_f32(
+            mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
+            act::<ACT>(zv[i]),
+        );
+        // SAFETY: as the reads above; one lane per value.
+        unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
+    }
+    if !ok {
+        fault.raise(FaultSite::LinearGate);
     }
 }
 
@@ -83,53 +159,47 @@ mod norm_gate_kernels {
         if wi >= m as usize * n_v as usize {
             return; // warp-uniform
         }
-        let lane = tid % 32;
-        let base = wi * HEAD;
-        let mut ov = [0.0f32; 4];
-        let mut zv = [0.0f32; 4];
-        let mut wv = [0.0f32; 4];
-        let mut sumsq = 0.0f64;
-        #[unroll]
-        for i in 0usize..4 {
-            let at = lane + 32 * i;
-            // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
-            // by the contract; at < 128 <= w.len().
-            unsafe {
-                ov[i] = *o.get_unchecked(base + at);
-                zv[i] = *z.get_unchecked(base + at);
-                wv[i] = *w.get_unchecked(at);
-            }
-            sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
+        // SAFETY: wi < m·n_v by the guard, lane < 32; the contract's
+        // lengths; head wi of y is this warp's.
+        unsafe { norm_gate_body::<GATE_SILU>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
+    }
+
+    /// [`gdn_norm_gate`] with the sigmoid gate: Qwen3.8's Gated DeltaNet and
+    /// GLM-5.3-Flash's KDA (`RMSNorm_w(o)·sigmoid(z)`, the same product in
+    /// either operand order).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            o.len() >= m * n_v * 128,
+            z.len() >= m * n_v * 128,
+            w.len() >= 128,
+            y.len() >= m * n_v * 128
+        )
+    )]
+    pub fn gdn_norm_gate_sigmoid(
+        o: &[f32],
+        z: &[f32],
+        w: &[f32],
+        eps: f32,
+        n_v: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
+        if wi >= m as usize * n_v as usize {
+            return; // warp-uniform
         }
-        let mut acc = sumsq;
-        acc += warp::shuffle_xor_f64(acc, 16);
-        acc += warp::shuffle_xor_f64(acc, 8);
-        acc += warp::shuffle_xor_f64(acc, 4);
-        acc += warp::shuffle_xor_f64(acc, 2);
-        acc += warp::shuffle_xor_f64(acc, 1);
-        let mean = (acc / HEAD as f64) as f32;
-        let fin = mean.is_finite();
-        let scale = if fin {
-            1.0 / (mean + eps).sqrt()
-        } else {
-            f32::NAN
-        };
-        let ok = fin
-            & crate::fault::quad_finite(ov)
-            & crate::fault::quad_finite(zv)
-            & crate::fault::quad_finite(wv);
-        #[unroll]
-        for i in 0usize..4 {
-            let v = mul_rn_f32(
-                mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
-                act::<GATE_SILU>(zv[i]),
-            );
-            // SAFETY: as the reads above; one lane per value.
-            unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
-        }
-        if !ok {
-            fault.raise(FaultSite::LinearGate);
-        }
+        // SAFETY: as gdn_norm_gate's.
+        unsafe { norm_gate_body::<GATE_SIGMOID>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
     }
 }
 
@@ -161,14 +231,32 @@ impl NormGateKernels {
         Ok(NormGateKernels { module })
     }
 
-    /// Enqueue the gated norm of `args.m · args.n_v` heads: `⌈m·n_v / 4⌉`
-    /// blocks of 128 threads. Asynchronous, allocation-free, capturable.
+    /// Enqueue the gated norm of `args.m · args.n_v` heads with the SiLU
+    /// gate: `⌈m·n_v / 4⌉` blocks of 128 threads. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_norm_gate(
         &self,
         stream: &CudaStream,
         args: NormGateArgs<'_>,
     ) -> Result<(), GpuError> {
-        let what = "enqueue_norm_gate";
+        self.enqueue::<GATE_SILU>(stream, args, "enqueue_norm_gate")
+    }
+
+    /// [`enqueue_norm_gate`](Self::enqueue_norm_gate) with the sigmoid gate.
+    pub fn enqueue_norm_gate_sigmoid(
+        &self,
+        stream: &CudaStream,
+        args: NormGateArgs<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue::<GATE_SIGMOID>(stream, args, "enqueue_norm_gate_sigmoid")
+    }
+
+    fn enqueue<const ACT: u32>(
+        &self,
+        stream: &CudaStream,
+        args: NormGateArgs<'_>,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
         let NormGateArgs {
             o,
             z,
@@ -200,17 +288,23 @@ impl NormGateKernels {
         let grid = launch_u32(what, "grid", (m * n_v).div_ceil(4))?;
         let n_v = launch_u32(what, "n_v", n_v)?;
         let m = launch_u32(what, "m", m)?;
-        let prep = self
-            .module
-            .prepare_gdn_norm_gate(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module
-            .gdn_norm_gate(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        if ACT == GATE_SILU {
+            let prep = self.module.prepare_gdn_norm_gate(cfg)?;
+            self.module
+                .gdn_norm_gate(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+        } else {
+            let prep = self.module.prepare_gdn_norm_gate_sigmoid(cfg)?;
+            self.module
+                .gdn_norm_gate_sigmoid(stream, &prep, o, z, w, eps, n_v, m, fault, y)?;
+        }
         Ok(())
     }
 }
 
-/// The host rule of [`NormGateKernels::enqueue_norm_gate`] for the gate
-/// `ACT`: the module doc's numeric contract, op for op, over `o.len() /
+/// The host rule of [`NormGateKernels::enqueue_norm_gate`] (`ACT`
+/// [`GATE_SILU`]) and [`NormGateKernels::enqueue_norm_gate_sigmoid`]
+/// ([`GATE_SIGMOID`]): the module doc's numeric contract, op for op, over `o.len() /
 /// HEAD` heads.
 ///
 /// # Panics

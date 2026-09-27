@@ -16,6 +16,11 @@
 //! o         = Sᵀ (q / √HEAD)               y = RMSNorm_w(o_h) ⊙ act(z_h)
 //! ```
 //!
+//! Kimi Delta Attention (GLM-5.3-Flash) takes the same steps with one decay
+//! per key channel, `decay_hk = exp(lb · sigmoid(−ssm_a_h · (f_hk + dt_hk)))`
+//! from the low-rank forget projection `f`, scaling state key `k`, and the
+//! sigmoid gate.
+//!
 //! Layouts, all f32 and token-major:
 //! - channels `[m][C]`: q heads, then k heads, then v heads, [`HEAD`] each —
 //!   the projection's output order, and the conv's output in the same order
@@ -27,8 +32,9 @@
 //! - recurrent state `[lanes][n_v][HEAD v][HEAD k]`: value column v of head
 //!   h in lane `l` is the HEAD keys at `((l·n_v + h)·HEAD + v)·HEAD`,
 //!   contiguous. ik stores the transpose (`[k][v]`, v contiguous);
-//! - β and decay `[m][n_v]`; the delta output `o` and the gate's `z` and `y`
-//!   `[m][n_v][HEAD]`.
+//! - β `[m][n_v]`; decay `[m][n_v]`, or `[m][n_v][HEAD]` per key channel
+//!   (KDA, with its `f` and `dt_bias` `[m][n_v·HEAD]` and `[n_v·HEAD]`); the
+//!   delta output `o` and the gate's `z` and `y` `[m][n_v][HEAD]`.
 //!
 //! The state is read and written in place: the conv finds a token's
 //! predecessors by its position (`pos[t]`, the words the embedding launch
@@ -104,17 +110,17 @@ impl KHeadMap {
 }
 
 /// The decay's granularity, the delta body's const parameter: one scalar
-/// per value head (Gated DeltaNet), or one per key channel (Kimi Delta
-/// Attention). Only [`DECAY_HEAD`] has a kernel entry.
+/// per value head (Gated DeltaNet, `gdn_conv_prep` and `gdn_delta`).
 pub const DECAY_HEAD: u32 = 0;
-/// One decay per (value head, key channel). No entry is built for it yet.
+/// One decay per (value head, key channel) (Kimi Delta Attention,
+/// `kda_conv_prep` and `kda_delta`).
 pub const DECAY_KEY: u32 = 1;
 
 /// The output gate's activation, the norm body's const parameter: SiLU
-/// (Qwen3.5/3.6, Qwen3-Next) or sigmoid (Qwen3.8-Flash-Next, Kimi Delta
-/// Attention). Only [`GATE_SILU`] has a kernel entry.
+/// (Qwen3.5/3.6, Qwen3-Next; `gdn_norm_gate`).
 pub const GATE_SILU: u32 = 0;
-/// `sigmoid(z)`. No entry is built for it yet.
+/// `sigmoid(z)` (Qwen3.8-Flash-Next, Kimi Delta Attention;
+/// `gdn_norm_gate_sigmoid`).
 pub const GATE_SIGMOID: u32 = 1;
 
 /// The head counts of one layer. `HEAD`, the conv width and the state layout
