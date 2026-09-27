@@ -107,6 +107,7 @@ dependencies = [
 name = "bloomery-gpu"
 version = "0.1.0"
 dependencies = [
+ "bloomery-engram",
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-model",

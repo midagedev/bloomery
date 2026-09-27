@@ -84,7 +84,7 @@ pub mod run;
 pub mod slots;
 pub mod step;
 
-pub use leg::StepLeg;
+pub use leg::{BatchLeg, StepLeg};
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
@@ -506,6 +506,21 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<(), GpuError> {
         self.port_mut("HostTier::enqueue_download")?
             .download(stream, xw, ids, key)
+    }
+
+    /// [`HostTier::enqueue_download`] from routing buffers of `pitch`
+    /// entries a token whose first `n_used` are the routed slots
+    /// ([`BatchPort::download_pitched`]).
+    pub fn enqueue_download_pitched(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        pitch: usize,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        self.port_mut("HostTier::enqueue_download_pitched")?
+            .download_pitched(stream, xw, ids, pitch, key)
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused

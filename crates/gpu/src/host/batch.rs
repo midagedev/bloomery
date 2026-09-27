@@ -174,6 +174,54 @@ impl BatchPort {
         Ok(())
     }
 
+    /// [`BatchPort::download`] from routing buffers of `pitch >= n_used`
+    /// entries a token whose first `n_used` are the routed slots — a router
+    /// that writes a shared expert's slot after them: token `t`'s ids and
+    /// weights are copied from entries `t·pitch .. t·pitch + n_used`, one
+    /// strided copy each, into the set's `n_used` a token. Refused while that
+    /// set holds a layer not uploaded yet, and for a pitch below `n_used`.
+    pub fn download_pitched(
+        &mut self,
+        stream: &CudaStream,
+        [x, w]: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        pitch: usize,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        let (n, s) = (self.n_embd, self.n_used);
+        let BatchKey { at, u, .. } = key;
+        if pitch < s {
+            return Err(GpuError::Shape {
+                what: PORT,
+                detail: format!("routing of {pitch} entries a token for {s} routed slots"),
+            });
+        }
+        let set = &mut self.sets[self.down];
+        if set.stage != Stage::Free {
+            return Err(GpuError::Shape {
+                what: PORT,
+                detail: format!(
+                    "a route of {key:?} into an exchange set that holds {:?}: both sets hold a \
+                     layer not uploaded yet",
+                    set.stage
+                ),
+            });
+        }
+        // SAFETY: as in `download`: the set is free, so neither the union nor
+        // an upload reads its buffers until this set's next serve, which
+        // waits on the event recorded below; each copy's extents are checked
+        // against both buffers inside the helpers.
+        unsafe {
+            dtoh(stream, &mut set.x, x, at * n..u * n)?;
+            dtoh_pitched(stream, &mut set.ids, ids, (at..u, s, pitch))?;
+            dtoh_pitched(stream, &mut set.w, w, (at..u, s, pitch))?;
+        }
+        set.routed.record(stream)?;
+        set.stage = Stage::Routed(key);
+        self.down ^= 1;
+        Ok(())
+    }
+
     /// Wait for the oldest unserved set's copies, which must be `key`'s,
     /// then have `serve` compute its layer's host sums for its tokens: the
     /// layer, the activations as a view, the routing, and the set's sums the
@@ -277,6 +325,64 @@ unsafe fn dtoh<T: cuda_core::DeviceCopy>(
         )
     };
     cu(rc, "cuMemcpyDtoHAsync_v2 (the batch's handoffs)")
+}
+
+/// Enqueue the copy of tokens `toks` of `src` — `width` values a token at
+/// a pitch of `pitch` values — to the same tokens of `dst` at a pitch of
+/// `width`: one strided copy.
+///
+/// SAFETY: `dst` is not read or freed until the copy completes.
+unsafe fn dtoh_pitched<T: cuda_core::DeviceCopy>(
+    stream: &CudaStream,
+    dst: &mut PinnedHostBuffer<T>,
+    src: &DeviceBuffer<T>,
+    (toks, width, pitch): (Range<usize>, usize, usize),
+) -> Result<(), GpuError> {
+    let src_end = (toks.end.saturating_sub(1)) * pitch + width;
+    if toks.is_empty()
+        || width == 0
+        || pitch < width
+        || src_end > src.len()
+        || toks.end * width > dst.len()
+    {
+        return Err(GpuError::Shape {
+            what: PORT,
+            detail: format!(
+                "tokens {toks:?} of {width} values at a pitch of {pitch} from {} into {}",
+                src.len(),
+                dst.len()
+            ),
+        });
+    }
+    let z = size_of::<T>();
+    let copy = sys::CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE,
+        srcHost: std::ptr::null(),
+        srcDevice: src.cu_deviceptr() + (toks.start * pitch * z) as u64,
+        srcArray: std::ptr::null_mut(),
+        srcPitch: pitch * z,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST,
+        // SAFETY: token `toks.start`'s first value lies inside `dst` (checked
+        // above).
+        dstHost: unsafe { dst.as_mut_ptr().add(toks.start * width) }.cast(),
+        dstDevice: 0,
+        dstArray: std::ptr::null_mut(),
+        dstPitch: width * z,
+        WidthInBytes: width * z,
+        Height: toks.len(),
+    };
+    // SAFETY: the copy reads `toks.len()` rows of `width` values at `pitch`
+    // from token `toks.start` of `src`, the last ending at `src_end <=
+    // src.len()`, and writes as many rows back to back into `dst` from token
+    // `toks.start`, ending at `toks.end · width <= dst.len()` (checked
+    // above); the descriptor is read at the call; `dst` stays untouched until
+    // the copy completes by this fn's contract.
+    let rc = unsafe { sys::cuMemcpy2DAsync_v2(&raw const copy, stream.cu_stream()) };
+    cu(rc, "cuMemcpy2DAsync_v2 (the batch's routing)")
 }
 
 /// Enqueue the copy of values `at` of `src` to the same values of `dst`.

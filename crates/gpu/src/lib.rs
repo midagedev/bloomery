@@ -53,6 +53,7 @@ pub mod moe_fused;
 pub mod mxfp4;
 pub mod ple;
 pub mod probe;
+pub mod q38;
 pub mod q4k_sel;
 pub mod q5;
 pub mod q5_1_sel;

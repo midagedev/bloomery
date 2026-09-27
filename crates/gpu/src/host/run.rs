@@ -1,6 +1,7 @@
 //! A host tier's computation over a run of routed layers ([`HostRun`]): each
-//! layer's stacks as [`HostLayer`] reads them from the file, and the scratch
-//! a step service writes, made at load. The architecture supplies only how
+//! layer's stacks as [`HostLayer`] reads them from the file, the scratch a
+//! step service writes, made at load, and the union scratch a batch service
+//! writes, made once a caller asks for batches ([`HostRun::prepare_union`]). The architecture supplies only how
 //! its layers' stacks are found (a closure over its names and widths, which
 //! refuses a layer by its own error); the protocol around a call is the
 //! tier's ([`super::HostTier`]).
@@ -8,9 +9,9 @@
 use std::sync::Arc;
 
 use gguf::Split;
-use model::Tensor2;
-use model::moe::{HostLayer, HostScratch};
+use model::moe::{HostLayer, HostScratch, UnionScratch};
 use model::r8file::{R8Pair, R8Source};
+use model::{Tensor2, Tensor2View};
 
 use super::HostExperts;
 use crate::GpuError;
@@ -24,8 +25,8 @@ pub struct HostWidths {
     pub n_used: usize,
 }
 
-/// Every layer of the host run with its routed stacks, and the one-column
-/// scratch a step service writes.
+/// Every layer of the host run with its routed stacks, the one-column
+/// scratch a step service writes, and a batch service's union scratch.
 pub struct HostRun {
     /// The file and the r8 reading its layers were built from; every call
     /// reads through this pair.
@@ -34,6 +35,9 @@ pub struct HostRun {
     layers: Vec<HostLayer>,
     first: usize,
     scratch: HostScratch,
+    widths: HostWidths,
+    /// The union's slabs, once [`HostRun::prepare_union`] made them.
+    union: Option<UnionScratch>,
 }
 
 impl HostRun {
@@ -62,7 +66,21 @@ impl HostRun {
             layers,
             first,
             scratch: HostScratch::new(widths.embd, widths.ff, widths.n_used)?,
+            widths,
+            union: None,
         })
+    }
+
+    /// The union's slabs for batch calls of up to `cols` columns of the
+    /// run's routed width, made once: a load that never serves a batch never
+    /// holds them. A width past what was made is refused by name at the call.
+    /// Load-time only.
+    pub fn prepare_union(&mut self, cols: usize) -> Result<(), GpuError> {
+        if self.union.is_none() {
+            let w = self.widths;
+            self.union = Some(UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?);
+        }
+        Ok(())
     }
 
     /// The first layer of the run.
@@ -108,6 +126,35 @@ impl HostExperts for HostRun {
                 missing: "the layer's routed stacks: it is outside the host run",
             })?;
         view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
+        Ok(())
+    }
+
+    fn experts_union_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let HostRun {
+            file,
+            layers,
+            first,
+            union,
+            ..
+        } = self;
+        let view = layer
+            .checked_sub(*first)
+            .and_then(|i| layers.get(i))
+            .ok_or(GpuError::State {
+                what: "HostRun::experts_union_into",
+                missing: "the layer's routed stacks: it is outside the host run",
+            })?;
+        let scratch = union.as_mut().ok_or(GpuError::State {
+            what: "HostRun::experts_union_into",
+            missing: "the union's slabs (HostRun::prepare_union)",
+        })?;
+        view.experts_union_into(file.source(), x, lists, out, scratch)?;
         Ok(())
     }
 }
