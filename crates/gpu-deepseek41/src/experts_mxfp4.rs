@@ -56,14 +56,27 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
 use std::sync::Arc;
 
-/// Experts the draft's router scores (`expert_count`): the width of the
-/// selecting block's shared arrays.
+/// Experts the draft's router scores: the width of the selecting block's
+/// shared arrays.
 pub const N_EXPERT: usize = 128;
 
-/// Experts each token routes to (`expert_used_count`).
+/// Experts each token routes to: compiled into the router, the expert
+/// kernels' route layout and the draft's buffers.
 pub const N_USED: usize = 3;
+
+/// The router's instance row: the width and the one pick count above, the
+/// rule √softplus with a selection bias, `norm` a launch argument. A draft's
+/// shape selects it through `models::shape::select_router`.
+pub const ROUTER_ROW: RouterInst = shape::router_row(RouterBody::Dflash, PER_LANE as u32);
+const _: () = assert!(shape::router_row_is(
+    ROUTER_ROW,
+    rules::BIASED_SQRT_SOFTPLUS,
+    true,
+    (N_USED as u32, N_USED as u32)
+));
 
 /// Token columns one expert launch carries.
 pub const MAX_TOKENS: usize = 8;

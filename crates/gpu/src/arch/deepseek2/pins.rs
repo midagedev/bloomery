@@ -6,8 +6,9 @@
 
 use crate::GpuError;
 use crate::flash::{LATENT, MMA_ROWS, MMA_WIDTH};
-use crate::router::{N_EXPERT, N_USED};
-use model::arch::deepseek2::hparams::Hparams;
+use crate::router::ROW;
+use model::arch::deepseek2::hparams::{Gating, Hparams};
+use model::arch::models::shape::{MoeShape, rules, select_router};
 
 /// The file's full metadata key for a suffix (`Gguf::arch_key`).
 pub(super) type Key<'a> = &'a dyn Fn(&str) -> String;
@@ -67,23 +68,40 @@ pub(super) fn attention(hp: &Hparams, kv_b_latent: usize, key: Key<'_>) -> Resul
     Ok(())
 }
 
-/// The routed half's pin: the router kernel ranks a compiled [`N_EXPERT`]
-/// experts into a compiled [`N_USED`] slots.
+/// The routed half's pin: the file's routed shape selects the router
+/// kernel's instance row ([`ROW`]); a shape no row serves, or one another
+/// body's row serves, is refused with its keys and values.
 pub(super) fn router(hp: &Hparams, key: Key<'_>) -> Result<(), GpuError> {
     let e = &hp.experts;
-    if e.n_expert == N_EXPERT && e.n_used == N_USED {
-        return Ok(());
+    let rule = match e.gating {
+        Gating::Softmax => rules::SOFTMAX_TOPK,
+    };
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let shape = MoeShape {
+        rule,
+        experts: count(e.n_expert),
+        top_k: count(e.n_used),
+    };
+    let refuse = |why: String| {
+        GpuError::shape(
+            WHAT,
+            format!(
+                "{} is {}, {} is {}; {why}",
+                key("expert_count"),
+                e.n_expert,
+                key("expert_used_count"),
+                e.n_used
+            ),
+        )
+    };
+    match select_router(shape) {
+        Ok(row) if row == ROW => Ok(()),
+        Ok(row) => Err(refuse(format!(
+            "that shape is {}'s, not the router kernel {}",
+            row.at, ROW.at
+        ))),
+        Err(r) => Err(refuse(r.to_string())),
     }
-    Err(GpuError::shape(
-        WHAT,
-        format!(
-            "{} is {}, {} is {}; the router kernel ranks {N_EXPERT} experts into {N_USED} slots",
-            key("expert_count"),
-            e.n_expert,
-            key("expert_used_count"),
-            e.n_used
-        ),
-    ))
 }
 
 #[cfg(test)]
@@ -167,12 +185,13 @@ mod tests {
         let router_cases: [(Edit, &str); 2] = [
             (
                 |h| h.experts.n_used = 4,
-                "deepseek2.expert_count is 64, deepseek2.expert_used_count is 4; the router \
-                 kernel ranks 64 experts into 6 slots",
+                "deepseek2.expert_count is 64, deepseek2.expert_used_count is 4; router Softmax, \
+                 64 experts, top 4: the instance keeps 6..=6 experts a token",
             ),
             (
                 |h| h.experts.n_expert = 160,
-                "deepseek2.expert_count is 160, deepseek2.expert_used_count is 6;",
+                "deepseek2.expert_count is 160, deepseek2.expert_used_count is 6; router Softmax, \
+                 160 experts, top 6: this rule's router bodies are built for [64] experts",
             ),
         ];
         for (i, (edit, want)) in router_cases.into_iter().enumerate() {

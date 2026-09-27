@@ -23,9 +23,10 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::names as target_names;
 use model::arch::dspark::{self, Borrow, DraftHparams, DraftTensor, Group, names};
+use model::arch::models::shape::{MoeShape, rules, select_router};
 use model::placement::CardFormat;
 
-use crate::experts_mxfp4::{MxStack, N_EXPERT, N_USED};
+use crate::experts_mxfp4::{MxStack, ROUTER_ROW};
 use crate::markov::MARKOV_ROW_WORDS;
 
 const WHAT: &str = "draft::load";
@@ -270,15 +271,28 @@ fn missing(name: String, need: &'static str) -> GpuError {
     }
 }
 
-/// The draft's shape against what its kernels take: the router's 128/3 and
-/// the Markov rank.
+/// The draft's shape against what its kernels take: the router's instance,
+/// selected from the file's shape, and the Markov rank.
 fn check_kernels(hp: &DraftHparams) -> Result<(), GpuError> {
-    if hp.experts.n_expert != N_EXPERT || hp.experts.n_used != N_USED {
+    let e = &hp.experts;
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let mut rule = rules::BIASED_SQRT_SOFTPLUS;
+    rule.norm = e.weights_norm;
+    let shape = MoeShape {
+        rule,
+        experts: count(e.n_expert),
+        top_k: count(e.n_used),
+    };
+    let row = select_router(shape).map_err(|r| GpuError::Shape {
+        what: WHAT,
+        detail: r.to_string(),
+    })?;
+    if row != ROUTER_ROW {
         return Err(GpuError::Shape {
             what: WHAT,
             detail: format!(
-                "the router is {}/{}; the draft kernels take {N_EXPERT}/{N_USED}",
-                hp.experts.n_expert, hp.experts.n_used
+                "the router is {}/{}, {}'s instance; the draft runs {}",
+                e.n_expert, e.n_used, row.at, ROUTER_ROW.at
             ),
         });
     }

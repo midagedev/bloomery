@@ -105,6 +105,8 @@ mod gate {
     };
     use cuda_core::sys;
     use gguf::Split;
+    use model::arch::models::Mixer;
+    use model::arch::models::shape::{AttnShape, MoeShape};
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use std::time::Instant;
 
@@ -121,9 +123,6 @@ mod gate {
     /// `attn_v` is (3, 7, 19, 31, 35, 39).
     const Q6_QKV: usize = 14;
     const Q6_V: usize = 6;
-    const N_EXPERT: usize = 256;
-    const N_USED: usize = 8;
-    const SLOTS: usize = N_USED + 1;
     const C: usize = 8192;
     const N_V: usize = 32;
     const HEAD_V: usize = 128;
@@ -381,6 +380,51 @@ mod gate {
         Ok(ok)
     }
 
+    /// The file's attention and delta shapes, from its spec, against the
+    /// constants the derivations above are written with: a file of another
+    /// shape fails here by name rather than under a slicing written for this
+    /// one.
+    fn file_shape() -> Result<bool, GateError> {
+        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let spec = model::arch::qwen35moe::spec::read(&split)
+            .map_err(|e| format!("{MODEL}: {e}"))?
+            .spec;
+        let c = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        let (mut ok, mut seen) = (true, Vec::new());
+        for (l, layer) in spec.layers.iter().enumerate() {
+            let (got, want) = match &layer.mixer {
+                Mixer::Gqa(g) => {
+                    let a = AttnShape::of(g);
+                    let got = [a.n_head, a.n_kv, a.head, g.rope.dims];
+                    (("gqa", got), [c(N_HEAD), c(N_KV), c(HEAD), c(ROT)])
+                }
+                Mixer::DeltaRule(d) => {
+                    let got = [d.v_heads, d.d, (2 * d.k_heads + d.v_heads) * d.d, 0];
+                    (("delta", got), [c(N_V), c(HEAD_V), c(C), 0])
+                }
+                Mixer::Latent(_) => (("latent", [0; 4]), [u32::MAX; 4]),
+            };
+            let pass = got.1 == want;
+            ok &= pass;
+            if !pass || !seen.contains(&got) {
+                println!(
+                    "shape layer={l} {} {:?} (the derivations' {want:?}) {}",
+                    got.0,
+                    got.1,
+                    verdict(pass)
+                );
+                seen.push(got);
+            }
+        }
+        let rows_ok = Q_ROWS == 2 * N_HEAD * HEAD && KV_ROW == N_KV * HEAD;
+        ok &= rows_ok;
+        println!(
+            "shape q rows {Q_ROWS} = 2·{N_HEAD}·{HEAD}, kv row {KV_ROW} = {N_KV}·{HEAD} {}",
+            verdict(rows_ok)
+        );
+        Ok(ok)
+    }
+
     // ------------------------------------------------- (p) one layer body
 
     /// Every layer's store, read back.
@@ -575,6 +619,9 @@ mod gate {
     struct Gains {
         attn_norm: Vec<Vec<f32>>,
         ffn_norm: Vec<Vec<f32>>,
+        /// Each layer's routed mixture as the file's spec states it: the
+        /// taps slice the router's rows and slots by it, the engine's source.
+        moe: Vec<MoeShape>,
     }
 
     impl Gains {
@@ -593,9 +640,27 @@ mod gate {
                     .map(|l| split_f32(&split, &format!("blk.{l}.{stem}"), HIDDEN))
                     .collect()
             };
+            let spec = model::arch::qwen35moe::spec::read(&split)
+                .map_err(|e| format!("{MODEL}: {e}"))?
+                .spec;
+            let moe = spec
+                .layers
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(l, s)| {
+                    s.moe()
+                        .map(MoeShape::of)
+                        .ok_or_else(|| format!("layer {l}: no routed FFN in the file's spec"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if moe.len() != n {
+                return Err(format!("the file's spec has {} layers, want {n}", moe.len()).into());
+            }
             Ok(Gains {
                 attn_norm: each("attn_norm.weight")?,
                 ffn_norm: each("post_attention_norm.weight")?,
+                moe,
             })
         }
     }
@@ -840,10 +905,16 @@ mod gate {
         gains: &Gains,
         w: &mut Worst,
     ) -> Result<(bool, usize), GateError> {
+        let shape = gains.moe[l];
+        if !shape.rule.gated {
+            return Err(format!("layer {l}: {shape:?} has no gated shared expert").into());
+        }
+        let (n_expert, n_used) = (shape.experts as usize, shape.top_k as usize);
+        let slots = n_used + 1;
         let logits = tap(man, &format!("ffn_moe_logits-{l}"))?;
         let gate = tap(man, &format!("shared_expert_gate-{l}"))?;
         let t_n = gate.len();
-        if t_n == 0 || logits.len() != t_n * N_EXPERT {
+        if t_n == 0 || logits.len() != t_n * n_expert {
             return Err(format!(
                 "layer {l}: {} router logits for {t_n} gate logits",
                 logits.len()
@@ -856,7 +927,7 @@ mod gate {
         let gap = quant_gap(&normed(ffn_in, &gains.ffn_norm[l], HIDDEN), HIDDEN);
         let ik_logits: Vec<f32> = (0..t_n)
             .flat_map(|t| {
-                let mut row = logits[t * N_EXPERT..(t + 1) * N_EXPERT].to_vec();
+                let mut row = logits[t * n_expert..(t + 1) * n_expert].to_vec();
                 row.push(gate[t]);
                 row
             })
@@ -867,9 +938,9 @@ mod gate {
             gap,
         );
         let trow = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
-        let ids = topk_ids_logical_within(man, trow, N_EXPERT as u32)?;
+        let ids = topk_ids_logical_within(man, trow, shape.experts)?;
         let wn = tap(man, &format!("ffn_moe_weights_norm-{l}"))?;
-        if ids.len() != t_n * N_USED || wn.len() != t_n * N_USED {
+        if ids.len() != t_n * n_used || wn.len() != t_n * n_used {
             return Err(format!(
                 "layer {l}: {} ids and {} weights for {t_n} tokens",
                 ids.len(),
@@ -886,21 +957,21 @@ mod gate {
         }
         let (mut ok, mut flipped) = (true, Vec::new());
         let (mut w_ours, mut w_ik) = (Vec::new(), Vec::new());
-        let row = N_EXPERT + 1;
+        let row = n_expert + 1;
         for (t, &sg) in ik_sg.iter().enumerate() {
-            let ours = &f.ids[t * SLOTS..t * SLOTS + N_USED];
-            let theirs = &ids[t * N_USED..(t + 1) * N_USED];
+            let ours = &f.ids[t * slots..t * slots + n_used];
+            let theirs = &ids[t * n_used..(t + 1) * n_used];
             if !ours.iter().all(|&e| theirs.contains(&(e as i32))) {
-                let lg = &ik_logits[t * row..t * row + N_EXPERT];
+                let lg = &ik_logits[t * row..t * row + n_expert];
                 let min_in = theirs
                     .iter()
                     .map(|&e| lg[e as usize])
                     .fold(f32::INFINITY, f32::min);
-                let max_out = (0..N_EXPERT)
+                let max_out = (0..n_expert)
                     .filter(|&e| !theirs.contains(&(e as i32)))
                     .map(|e| lg[e])
                     .fold(f32::NEG_INFINITY, f32::max);
-                let err = f.logits[t * row..t * row + N_EXPERT]
+                let err = f.logits[t * row..t * row + n_expert]
                     .iter()
                     .zip(lg)
                     .map(|(&a, &b)| (a - b).abs())
@@ -921,10 +992,10 @@ mod gate {
                     .iter()
                     .position(|&x| x == e as i32)
                     .ok_or("an id the set test found")?;
-                w_ours.push(f.weights[t * SLOTS + s]);
-                w_ik.push(wn[t * N_USED + j]);
+                w_ours.push(f.weights[t * slots + s]);
+                w_ik.push(wn[t * n_used + j]);
             }
-            w_ours.push(f.weights[t * SLOTS + N_USED]);
+            w_ours.push(f.weights[t * slots + n_used]);
             w_ik.push(sg);
         }
         if !w_ik.is_empty() {
@@ -1227,7 +1298,8 @@ mod gate {
         // set, is refused by name before anything loads.
         bloomery_levers::at_main(&[])?;
         let mut m = open(CTX)?;
-        let mut ok = structure(&mut m)?;
+        let mut ok = file_shape()?;
+        ok &= structure(&mut m)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let toks: Vec<u32> = ref_ints(&man, "inp_tokens", 0, RowKind::Input, Layout::Flat)?
             .iter()

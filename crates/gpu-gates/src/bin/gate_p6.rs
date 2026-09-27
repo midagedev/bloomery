@@ -61,13 +61,14 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
+    use bloomery_gpu::router::{N_EXPERT, N_USED, ROW, RouterKernels};
     use bloomery_gpu_gates::{
         RefManifest, max_rel_err, open_model, ref_dir, ref_tensor_of, route_ref, tensor_bytes_as,
         topk_ids_logical_in,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
+    use model::arch::models::shape::{MoeShape, rules, select_router};
 
     // Router weights band: device `exp` vs host libm differ by at most a few
     // ulp, and everything else in the chain is bit-mirrored, so a correct
@@ -81,16 +82,26 @@ fn run() -> Result<(), GateError> {
     let stream = gpu.stream();
     let man = RefManifest::read(&ref_dir())?;
 
-    // The kernels' fixed 64/top-6 geometry, cross-checked against the file.
+    // The file's router shape selects the kernel's instance row; the
+    // kernel's width and pick count are that row's, so the slicing below
+    // reads them.
     let n_expert = gguf
         .arch_get_u64("expert_count")
         .ok_or("gate_p6: metadata key expert_count missing")? as usize;
     let n_used = gguf
         .arch_get_u64("expert_used_count")
         .ok_or("gate_p6: metadata key expert_used_count missing")? as usize;
-    if n_expert != N_EXPERT || n_used != N_USED {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let row = select_router(MoeShape {
+        rule: rules::SOFTMAX_TOPK,
+        experts: count(n_expert),
+        top_k: count(n_used),
+    })
+    .map_err(|e| format!("gate_p6: {e}"))?;
+    if row != ROW {
         return Err(format!(
-            "gate_p6: model routes {n_used} of {n_expert} experts; the kernels are fixed 6 of 64"
+            "gate_p6: the file selects {}, the kernel is {}",
+            row.at, ROW.at
         )
         .into());
     }
