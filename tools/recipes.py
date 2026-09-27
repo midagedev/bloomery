@@ -2307,7 +2307,8 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #             card), the card that env forces
 #   mac-env   the Mac-side variables tools/box.sh carries or reads (BLOOMERY_REMOTE is not one: it
 #             names a track's directory, not an input), and the versions of just and python3
-#   box       every line of the box manifest (`box-manifest`, fetched once per batch)
+#   box       every line of the box manifest (`box-manifest`, fetched once per batch), its model rows
+#             only for the model directories the item can open (KeyContext.model_scope)
 # Not in it: the binary (its paths are per track) and the commit.
 
 KEY_VERSION = "bloomery-gate-key 1"
@@ -2356,7 +2357,29 @@ TREE_WALK = re.compile(
 ITEM_RE = re.compile(r"^([A-Za-z0-9_-]+)(?:@([^:]*))?(?::(.*))?$")
 ANY_CARD = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-MODEL_LITERAL = re.compile(r"/models/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+# A /models path as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
+# `${D}/models`, `$(pwd)/models`), but after a quote, `=`, a space, the `-` of a `${V:-/models/…}` default,
+# or a `\t`/`\n`/`\r` escape in a string.
+MODEL_LITERAL = re.compile(r"(?:(?<![A-Za-z0-9._+/~})])|(?<=\\[tnr]))/models/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+# The files both sides read for model literals: the box manifest's model_dirs() and an item's key.
+MODEL_SCAN_EXT = (".rs", ".sh", ".py", ".toml", ".tsv")
+
+
+def scans_for_models(rel: str) -> bool:
+    return rel == "justfile" or rel.endswith(MODEL_SCAN_EXT)
+
+
+def model_dir_of(path: str) -> str | None:
+    """The model directory /models/<name> a /models path lies in; None for /models itself or a path
+    outside it (a literal naming a file right under /models is its own entry)."""
+    f = path.split("/")
+    if len(f) < 3 or f[:2] != ["", "models"] or not f[2]:
+        return None
+    return "/".join(f[:3])
+
+
+def model_literal_dirs(text: str) -> set[str]:
+    return {d for d in map(model_dir_of, MODEL_LITERAL.findall(text)) if d}
 
 
 def sha256_file(path: str) -> str:
@@ -2544,6 +2567,7 @@ class KeyContext:
             self.manifest_error = f"the box manifest failed: {manifest_error}"
         self.settings = settings if settings is not None else justfile_settings(os.path.join(side.tree.root, "justfile"))
         self._sha: dict[str, str] = {}
+        self._lit: dict[str, set[str]] = {}
         self._tree: list[str] | None = None
 
     def tree_files(self) -> list[str]:
@@ -2558,6 +2582,48 @@ class KeyContext:
         if rel not in self._sha:
             self._sha[rel] = sha256_file(p)
         return f"file\t{rel}\t{self._sha[rel]}"
+
+    def literal_dirs(self, rel: str) -> set[str]:
+        if rel not in self._lit:
+            self._lit[rel] = model_literal_dirs(self.side.tree.read(rel)) if scans_for_models(rel) else set()
+        return self._lit[rel]
+
+    def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str]]:
+        """The model directories the item can open, each with the first input that names it, and those of
+        them the box manifest must have rows for. They are the /models literals in its key's files (its
+        profile and tools/box.sh's among them) and its recipes' text, the profile the Mac's BLOOMERY_MODEL
+        picks for a box recipe that names none, and the /models values of BLOOMERY_BOX_ENV, the forwarded
+        Mac environment, the item's env and its ARGS. The item's env and ARGS are outside the manifest's
+        reads (never-skip), so they need no rows."""
+        recipes, tree = self.side.recipes, self.side.tree
+        dirs: dict[str, str] = {}
+        for rel in sorted(files | {g for g in KEY_GLOBALS if tree.exists(g)}):
+            for d in self.literal_dirs(rel):
+                dirs.setdefault(d, rel)
+        for n in names:
+            for d in model_literal_dirs(recipes[n].text):
+                dirs.setdefault(d, f"recipe {n}")
+            rc = self.side.graph.inputs(n).commands
+            prof = f"tools/ref/models/{self.env.get('BLOOMERY_MODEL', '')}.sh"
+            if rc.box and "BLOOMERY_MODEL" not in rc.env and self.env.get("BLOOMERY_MODEL") and tree.exists(prof):
+                for d in self.literal_dirs(prof):
+                    dirs.setdefault(d, f"{prof} (the Mac's BLOOMERY_MODEL)")
+        for e in self.box_env.split():
+            k, _, v = e.partition("=")
+            d = model_dir_of(v)
+            if d:
+                dirs.setdefault(d, f"BLOOMERY_BOX_ENV {k}")
+        for k in MAC_ENV:
+            d = model_dir_of(self.env.get(k, ""))
+            if d:
+                dirs.setdefault(d, f"the Mac's {k}")
+        need = set(dirs)
+        for w in envs + argv:
+            for v in w.split(","):
+                d = model_dir_of(v.split("=", 1)[-1])
+                if d and d not in dirs:
+                    dirs[d] = "the item's env or ARGS"
+        return dirs, need
 
     def globals(self) -> list[str]:
         root = self.side.tree.root
@@ -2728,7 +2794,21 @@ class KeyContext:
                 card = v
         parts += [f"item\targs\t{json.dumps(argv)}", f"item\tboxenv\t{' '.join(eff)}", f"item\tcard\t{card}"]
         parts += self.mac
-        parts += [f"box\t{ln}" for ln in self.manifest]
+        # The manifest lists every model directory any item can open; this item's key holds the rows of
+        # its own only, so a directory another gate names (a fixture, a profile) does not move it.
+        dirs, need = self.model_scope(names, files, eff, envs, argv)
+        listed: set[str] = set()
+        for ln in self.manifest:
+            f = ln.split("\t")
+            if f[0] in ("model", "model-dir") and len(f) > 1:
+                d = model_dir_of(f[1])
+                if d is not None and d not in dirs:
+                    continue
+                listed.add(d)
+            parts.append(f"box\t{ln}")
+        missing = sorted(need - listed)
+        if missing:
+            return [], f"the box manifest has no row for {missing[0]}, which {dirs[missing[0]]} names: the manifest was read from another tree or environment", None, ""
         summary = f"scope=tree ({why})" if scope == "tree" else f"scope=closure ({why})"
         return parts, None, never, summary
 
@@ -3039,23 +3119,42 @@ def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple
 PROFILE_PATHS = 'unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in /models/*) printf "%s\\n" "${!v}" ;; esac; done'
 
 
-def model_dirs() -> set[str]:
+def profile_dirs(root: str, prof: str, env: dict[str, str]) -> set[str]:
+    """The model directories the profile `prof` (tools/ref/models/<x>.sh under `root`) defines when
+    sourced under `env` (BLOOMERY_REF_MODEL unset: the profile's own default). A directory it builds
+    that no literal in its text names, nor an environment value, is an error: an item's key reads the
+    profile's literals (model_literal_dirs), so such a directory would be in the manifest and in no key."""
+    out = _run(["bash", "-c", PROFILE_PATHS, "bash", os.path.join(root, prof)], env=env)
+    dirs = {d for d in map(model_dir_of, out.splitlines()) if d}
+    with open(os.path.join(root, prof), encoding="utf-8", errors="replace") as fh:
+        named = model_literal_dirs(fh.read())
+    named |= {d for d in map(model_dir_of, env.values()) if d}
+    if dirs - named:
+        raise RecipeError(f"{prof} defines {sorted(dirs - named)[0]}, which no /models literal in it names: an item's key could not select that directory's manifest rows — spell the path literally")
+    return dirs
+
+
+def tree_model_dirs(root: str) -> set[str]:
+    """The model directories the tree's files name literally (the files scans_for_models picks)."""
+    dirs: set[str] = set()
+    for rel in shipped_files(root):
+        if scans_for_models(rel):
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+                dirs |= model_literal_dirs(fh.read())
+    return dirs
+
+
+def model_dirs(root: str = ROOT) -> set[str]:
     """The model directories a gate can open: every /models path the profiles define (under their own
     defaults), the box command's environment names, or the tree names literally — the directory of each,
-    so a split set's shards all count."""
-    paths: set[str] = set()
+    so a split set's shards all count. Never /models itself, whose listing moves whenever any model is
+    fetched. An item's key selects its own rows out of these (KeyContext.model_scope)."""
     env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_REF_MODEL"}
-    for prof in sorted(glob.glob(os.path.join(ROOT, "tools/ref/models/*.sh"))):
-        out = _run(["bash", "-c", PROFILE_PATHS, "bash", prof], env=env)
-        paths |= {ln for ln in out.splitlines() if ln.startswith("/models/")}
-    paths |= {v for v in os.environ.values() if v.startswith("/models/")}
-    for rel in shipped_files(ROOT):
-        if rel == "justfile" or rel.endswith((".rs", ".sh", ".py", ".toml", ".tsv")):
-            with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as fh:
-                paths |= set(MODEL_LITERAL.findall(fh.read()))
-    # A model directory is /models/<name>: never /models itself, whose listing moves whenever any
-    # model is fetched (a literal naming a file right under /models is its own entry).
-    return {"/".join(p.split("/")[:3]) for p in paths if p.count("/") >= 2}
+    dirs: set[str] = set()
+    for prof in sorted(glob.glob(os.path.join(root, "tools/ref/models/*.sh"))):
+        dirs |= profile_dirs(root, os.path.relpath(prof, root), env)
+    dirs |= {d for d in map(model_dir_of, os.environ.values()) if d}
+    return dirs | tree_model_dirs(root)
 
 
 def cmd_box_manifest(args: argparse.Namespace) -> int:
@@ -3104,6 +3203,9 @@ def cmd_box_manifest(args: argparse.Namespace) -> int:
                 continue
             if not os.path.isdir(d):
                 rows.append(("model-dir", d, "absent"))
+                continue
+            if not os.listdir(d):
+                rows.append(("model-dir", d, "empty"))
                 continue
             for f in sorted(os.listdir(d)):
                 p = os.path.join(d, f)
@@ -3207,6 +3309,10 @@ def key_self_test(expect, real: Side) -> None:
             "model\t/models/small/x.gguf\t1\t2\t3\t4",
             "# end",
         ]
+        nfixed = len(manifest)
+        # Every other directory the tree names, as the box's model_dirs() lists it: an item whose
+        # closure names a directory with no row is an error, not a key.
+        manifest[-1:] = [f"model-dir\t{d}\tabsent" for d in sorted(tree_model_dirs(roots[0]) - {"/models/small"})] + ["# end"]
 
         def write_manifest(lines: list[str]) -> None:
             with open(mf, "w", encoding="utf-8") as fh:
@@ -3279,7 +3385,7 @@ def key_self_test(expect, real: Side) -> None:
         expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
         expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
         expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
-        for i in range(1, len(manifest) - 1):
+        for i in range(1, nfixed - 1):
             mut = list(manifest)
             mut[i] = mut[i] + "x"
             write_manifest(mut)
@@ -3335,6 +3441,95 @@ def key_self_test(expect, real: Side) -> None:
             expect(gone[which].startswith("error"), f"with {mods[0]} missing, {items[which]} was keyed: {gone[which]}")
         finally:
             os.rename(hold, victim)
+        model_scope_self_test(expect, roots[0], sa, settings, manifest, os.path.join(tmp, "scope-manifest.txt"))
+        # New-code clauses (no base to fail on): a directory the item names with no manifest row is an
+        # error; the manifest's union reaches a whole-tree item; every profile spells what it defines.
+        write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-Q3_K_M\t")])
+        miss = keys(sa, only={"gpu": items["gpu"]})["gpu"]
+        expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
+        write_manifest(manifest)
+        c = KeyContext(sa, mf, "", {}, settings=settings)
+        rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
+        expect(len(rows) == len([ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]), f"a whole-tree item holds {len(rows)} model rows, not the manifest's all")
+        penv = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL", "BLOOMERY_DSPARK_MODEL")}
+        for prof in sorted(glob.glob(os.path.join(roots[0], "tools/ref/models/*.sh"))):
+            rel = os.path.relpath(prof, roots[0])
+            try:
+                expect(bool(profile_dirs(roots[0], rel, penv)), f"{rel} defines no /models directory")
+            except RecipeError as err:
+                expect(False, f"profile_dirs: {err}")
+        dyn = os.path.join(roots[0], "tools/ref/models/zz-dynamic.sh")
+        with open(dyn, "w", encoding="utf-8") as fh:
+            fh.write("N=Dyn\nMODEL=/models/$N/x.gguf\n")
+        try:
+            profile_dirs(roots[0], "tools/ref/models/zz-dynamic.sh", penv)
+            expect(False, "a profile building a /models path no literal names was accepted")
+        except RecipeError as err:
+            expect("/mod" "els/Dyn" in str(err), f"the dynamic profile's error does not name the directory: {err}")
+        finally:
+            os.remove(dyn)
+
+
+def model_scope_self_test(expect, root: str, side: Side, settings: dict, manifest: list[str], mf: str) -> None:
+    """FAIL-first for the per-item model scope (each clause red on a key that carries every manifest row):
+    (a) a directory appearing in the manifest moves only the keys whose closure names it; (b) a fixture
+    literal in one crate reaches no gate that does not compile that crate; (c) a /models inside a longer
+    path (`tools/ref/models/x.sh`) is not a model path."""
+    gpu, cpu = "gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090", "gate-sampler"
+    # Spelled in two pieces, so that this file's own text names none of these directories: a literal
+    # here would put an `absent` row into every real box manifest.
+    M = "/mod" "els/"
+
+    def key_parts(lines: list[str], item: str) -> list[str]:
+        with open(mf, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        parts, err, _, _ = KeyContext(side, mf, "", {}, settings=settings).parts(item)
+        expect(err is None, f"model scope: {item}: {err}")
+        return parts
+
+    def with_rows(*rows: str) -> list[str]:
+        return manifest[:-1] + list(rows) + ["# end"]
+
+    def planted(rel: str, text: str, fn) -> None:
+        p = os.path.join(root, rel)
+        with open(p, encoding="utf-8") as fh:
+            old = fh.read()
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(old + text)
+        try:
+            fn()
+        finally:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(old)
+
+    # (a) PlantedA is named by gate_q4k_sel.rs only; the box fetches it (absent -> a file row).
+    def case_a() -> None:
+        before = with_rows(f"model-dir\t{M}PlantedA\tabsent")
+        after = with_rows(f"model\t{M}PlantedA/w.gguf\t1\t2\t3\t4")
+        expect(item_key(key_parts(before, gpu)) != item_key(key_parts(after, gpu)), "model scope (a): a directory the closure names appeared and its key did not move")
+        expect(item_key(key_parts(before, cpu)) == item_key(key_parts(after, cpu)), f"model scope (a): {M}PlantedA, which gate-sampler's closure does not name, appeared and moved its key")
+    planted("crates/gpu-gates/src/bin/gate_q4k_sel.rs", f'\n// "{M}PlantedA/w.gguf"\n', case_a)
+
+    # (b) a refusal-test fixture in crates/sampler's tests: gate-sampler compiles it, gate-gpu-q4k-sel does not.
+    clean = item_key(key_parts(manifest, gpu))
+
+    def case_b() -> None:
+        rows = with_rows(f"model-dir\t{M}FixtureB\tabsent")
+        expect(item_key(key_parts(rows, gpu)) == clean, "model scope (b): a fixture literal in crates/sampler's tests moved gate-gpu-q4k-sel's key")
+        expect(any(f"{M}FixtureB" in p for p in key_parts(rows, cpu)), "model scope (b): gate-sampler, which compiles the fixture, does not hold its row")
+    planted("crates/sampler/tests/sampler.rs", f'\n// "{M}FixtureB/other.gguf"\n', case_b)
+
+    # (c) the anchor: a path that only contains /models/ is not one.
+    for text in ("tools/ref/models/glm5next.sh", "source tools/ref/models/deepseek41.sh", "${BASH_SOURCE[0]%/*}/models/x.sh", "$HOME/models/a", "crates/x/models/y.rs", "~/models/z"):
+        expect(MODEL_LITERAL.findall(text) == [], f"model scope (c): {text!r} read as a /models path: {MODEL_LITERAL.findall(text)}")
+    for text, want in (('"' + M + 'X/a.gguf"', M + "X/a.gguf"), ("=" + M + "X", M + "X"), ("${V:-" + M + "X/a}", M + "X/a"), (" " + M + "X", M + "X"), ("# model\\t" + M + "X/a", M + "X/a")):
+        expect(MODEL_LITERAL.findall(text) == [want], f"model scope (c): {text!r} gave {MODEL_LITERAL.findall(text)}, not [{want!r}]")
+    profiles = {"/models/" + os.path.basename(p) for p in glob.glob(os.path.join(root, "tools/ref/models/*.sh"))}
+    for rel in shipped_files(root):
+        if rel == "justfile" or rel.endswith((".rs", ".sh", ".py", ".toml", ".tsv")):
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+                bad = profiles & set(MODEL_LITERAL.findall(fh.read()))
+            expect(not bad, f"model scope (c): {rel} names {sorted(bad)[0] if bad else ''}, a profile's path read as a model directory")
 
 
 

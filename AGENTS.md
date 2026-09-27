@@ -130,7 +130,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # or whose script takes the lease.
                       # `--ledger` (the lead's batches) and `--round-ledger` (a round's): an item whose input
                       # key (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env
-                      # and card, and a box manifest read once per batch) is green in a ledger it reads is not
+                      # and card, and a box manifest read once per batch, whose model rows enter it only for the
+                      # model directories that item can open) is green in a ledger it reads is not
                       # run and prints `rc=skip green-at=<commit> src=lead|round`; an item whose final rc is 0 is
                       # recorded — the lead's in ~/.cache/bloomery/gate-ledger.tsv, a round's only in
                       # gate-ledger-rounds.tsv beside it. A round reads both files. The lead reads the rounds'
