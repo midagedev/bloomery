@@ -31,6 +31,12 @@
 //! and the host touches it again only after the next go, which the stream
 //! orders behind that add and a system barrier.
 //!
+//! A boundary of several columns a row ([`step::Boundary::with_cols`])
+//! carries a chain of one row of `m` consecutive positions
+//! ([`Chain::Cols`]): one handoff image of `m` columns, one go, one union
+//! call over every column ([`HostExperts::experts_union_into`]) and one wait
+//! a layer.
+//!
 //! A boundary of two rows carries a pass whose two tokens run one layer
 //! apart, so a row's go can land while the other row's wait is pending: each
 //! row has its own layer word, counter, image and sum, and the rule above
@@ -176,6 +182,15 @@ pub struct HybridStats {
     /// The union of a layer's two host lists is `host_slots − overlap_slots`
     /// over any span of whole passes.
     pub pair_row1_slots: u64,
+    /// Calls into the host experts by step services, one a service: a
+    /// one-column service's `experts_into`, a `Cols` service's one
+    /// `experts_union_into` over all its columns.
+    pub host_calls: u64,
+    /// Services of a one-row chain of several columns ([`Chain::Cols`]),
+    /// each one go, one union call and one wait for every column, and the
+    /// columns they carried, summed. Both count in `served` too.
+    pub cols_served: u64,
+    pub cols_cols: u64,
     /// Batch services ([`HostTier::serve_batch`]): layers served, the columns
     /// they carried, the host slots those columns listed and the service
     /// computed, and the host wall time of the union calls (ns), summed. None
@@ -738,6 +753,9 @@ impl<H: HostExperts> HostTier<H> {
             straggle_max_ns: s.straggle_max_ns,
             overlap_slots: s.overlap_slots,
             pair_row1_slots: s.pair_row1_slots,
+            host_calls: s.host_calls,
+            cols_served: s.cols_served,
+            cols_cols: s.cols_cols,
             batch_served: b.batch_served,
             batch_cols: b.batch_cols,
             batch_host_slots: b.batch_host_slots,
@@ -776,7 +794,8 @@ impl<H: HostExperts> HostTier<H> {
 
     /// Open the chain of a step walk of `units` rows of `cols` columns
     /// ([`StepPort`]'s point): one row of one column is [`Chain::Step`], two
-    /// [`Chain::Pair`]; any other point is refused by name.
+    /// [`Chain::Pair`], one row of 2 up to the page's columns
+    /// [`Chain::Cols`]; any other point is refused by name.
     pub fn open_step(
         &mut self,
         stream: &CudaStream,

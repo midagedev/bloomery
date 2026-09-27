@@ -38,7 +38,7 @@
 //!    names that layer and the kernel's site, the values the planted input
 //!    reaches are not finite, every other value is the clean launch's bit
 //!    for bit, and the word is clean before and after.
-//! 8. `shape`: the six entries compile with no local depot.
+//! 8. `shape`: the seven entries compile with no local depot.
 //! 9. `kda` (Kimi Delta Attention at GLM-5.3-Flash's shape: 64 query/key and
 //!    64 value heads, ε 1e-5, bound −5): `kda_conv_prep` at 512 and 1 tokens
 //!    over a random ring against its host rule; its `y`, β and ring against
@@ -54,6 +54,17 @@
 //!     tokens, each against its host rule.
 //! 11. `kda fault`: a NaN forget value in the KDA conv, a NaN key decay in the
 //!     KDA delta, a NaN gate in the sigmoid norm, judged as clause 7.
+//! 12. `lanes` (`gdn_delta_lanes` at K1's shape over a state of
+//!     [`ROW_LANES`] random lanes, the lane word on lane 2): the final mode
+//!     of 8 and 1 tokens equal to the one-lane rule on lane 2 — `o`, lane 2
+//!     after it, every other lane untouched, lane 2's stamp moved to the
+//!     position after the call and the others kept; the row mode of 4 and 3
+//!     tokens equal to that many one-token calls chained — `o`, row `j`'s
+//!     state in lane `(2 + j) mod 4`, a lane no row wrote untouched, row
+//!     `j`'s stamp its position plus one; lane 2's stamp not the call's first
+//!     position raising `delta_stamp` with every value the clean launch's
+//!     (judged as clause 7); and the launcher's refusal of row mode over more
+//!     tokens than lanes.
 //!
 //! One case runs only when named, `--case kda_ik`, and alone: per KDA layer of
 //! the `ref_glm5next` set, the KDA delta on ik's own inputs against
@@ -78,7 +89,9 @@ mod gate {
     use bloomery_gpu::linear::conv::{
         ConvArgs, ConvOut, KdaConvArgs, conv_prep_host, kda_conv_prep_host,
     };
-    use bloomery_gpu::linear::delta::{DeltaArgs, DeltaOut, delta_host, kda_delta_host};
+    use bloomery_gpu::linear::delta::{
+        DeltaArgs, DeltaLanesArgs, DeltaOut, delta_host, kda_delta_host,
+    };
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::{
         CONV_TAPS, GATE_SIGMOID, GATE_SILU, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS,
@@ -278,6 +291,18 @@ mod gate {
     /// The single lane of every delta clause.
     const LANES: usize = 1;
 
+    /// Lanes of the lane clauses' states: any count past one, four here.
+    const ROW_LANES: usize = 4;
+
+    /// A lanes launch's word and mode: the lane word, the call's first
+    /// position, row mode.
+    #[derive(Clone, Copy)]
+    struct LaneCall {
+        lane: u32,
+        p0: u32,
+        each: bool,
+    }
+
     struct Ctx<'a> {
         gpu: &'a Gpu,
         k: &'a LinearKernels,
@@ -386,6 +411,57 @@ mod gate {
                 o: o.to_host_vec(s)?,
                 state: sd.to_host_vec(s)?,
             })
+        }
+
+        /// One `gdn_delta_lanes` launch of `m` tokens at K1's shape on a
+        /// [`ROW_LANES`]-lane state holding `state` with `stamp`; `o`, the
+        /// state and the stamps after it.
+        fn delta_lanes(
+            &self,
+            fault: FaultSink,
+            st: &Step,
+            (state, stamp): (&[f32], &[u32]),
+            call: LaneCall,
+            m: usize,
+        ) -> Result<(DeltaOut, Vec<u32>), GateError> {
+            let s = self.stream();
+            let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
+            let beta = DeviceBuffer::from_host(s, &st.beta)?;
+            let decay = DeviceBuffer::from_host(s, &st.decay)?;
+            let lw = DeviceBuffer::from_host(s, &[0xdead_beef, call.lane])?;
+            let pd = DeviceBuffer::from_host(s, &[call.p0])?;
+            let mut o = DeviceBuffer::from_host(s, &vec![0.0f32; m * K1_SHAPE.n_v * HEAD])?;
+            let mut sd = DeviceBuffer::from_host(s, state)?;
+            let mut sp = DeviceBuffer::from_host(s, stamp)?;
+            self.k.delta.enqueue_delta_lanes(
+                s,
+                DeltaLanesArgs {
+                    delta: DeltaArgs {
+                        qkv: &qkv,
+                        beta: &beta,
+                        decay: &decay,
+                        lane: &lw,
+                        lane_at: 1,
+                        lanes: ROW_LANES,
+                        shape: K1_SHAPE,
+                        m,
+                        fault,
+                        o: &mut o,
+                        state: &mut sd,
+                    },
+                    each: call.each,
+                    pos: &pd,
+                    stamp: &mut sp,
+                },
+            )?;
+            s.synchronize()?;
+            Ok((
+                DeltaOut {
+                    o: o.to_host_vec(s)?,
+                    state: sd.to_host_vec(s)?,
+                },
+                sp.to_host_vec(s)?,
+            ))
         }
 
         fn norm(
@@ -498,6 +574,7 @@ mod gate {
             "kda_conv_prep",
             "kda_delta",
             "gdn_norm_gate_sigmoid",
+            "gdn_delta_lanes",
         ])?);
         for pass in kda_clauses(&cx)? {
             tally(pass);
@@ -506,6 +583,9 @@ mod gate {
             tally(pass);
         }
         for pass in kda_fault_clauses(&cx)? {
+            tally(pass);
+        }
+        for pass in lanes_clauses(&cx)? {
             tally(pass);
         }
         let pass = failed == 0;
@@ -1905,6 +1985,139 @@ mod gate {
             }
             .judge(),
         );
+        Ok(out)
+    }
+
+    /// Clause 12: `gdn_delta_lanes` against the one-lane rule.
+    fn lanes_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        let unl = cx.gpu.unlabelled_sink();
+        let len = K1_SHAPE.state_len();
+        let rule = |st: &Step, state: &[f32], m: usize| {
+            delta_host(&st.qkv, &st.beta, &st.decay, state, LANES, 0, K1_SHAPE, m)
+        };
+        let l = Layer::with(0x006c_616e, K1_SHAPE);
+        let tk = Tokens::with(PASS_ROWS, 0x6c61_6e74, K1_SHAPE);
+        let zero_ring = vec![0.0f32; K1_SHAPE.ring_len()];
+        let st = Step::of(
+            &conv_host(&l, &tk, &zero_ring, &positions(0, PASS_ROWS), PASS_ROWS),
+            K1_SHAPE,
+        );
+        let lanes = Lcg(0x6c61_6e73).fill(ROW_LANES * len, -0.1, 0.1);
+        let (c, p0) = (2usize, 40u32);
+        let stamps = [7, 9, p0, 11];
+        let lane_of = |v: &[f32], i: usize| v[i * len..(i + 1) * len].to_vec();
+        let mut out = Vec::new();
+
+        for m in [PASS_ROWS, 1] {
+            let t = st.slice(0, m);
+            let call = LaneCall {
+                lane: c as u32,
+                p0,
+                each: false,
+            };
+            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+            let h = rule(&t, &lane_of(&lanes, c), m);
+            let lane_c = lane_of(&d.state, c);
+            let others = (0..ROW_LANES)
+                .filter(|&i| i != c)
+                .all(|i| bits_equal(&lane_of(&d.state, i), &lane_of(&lanes, i)));
+            let mut want = stamps;
+            want[c] = p0 + m as u32;
+            let pass =
+                bits_equal(&d.o, &h.o) && bits_equal(&lane_c, &h.state) && others && sp == want;
+            println!(
+                "lanes final m={m} on lane {c} of {ROW_LANES}: o {} lane {c} {} other lanes untouched \
+                 {others}, stamps {sp:?} (want {want:?}) {}",
+                cmp(&d.o, &h.o),
+                cmp(&lane_c, &h.state),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        for m in [ROW_LANES, ROW_LANES - 1] {
+            let t = st.slice(0, m);
+            let call = LaneCall {
+                lane: c as u32,
+                p0,
+                each: true,
+            };
+            let (d, sp) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+            let (mut state, mut o) = (lane_of(&lanes, c), Vec::new());
+            let (mut rows_same, mut want_state, mut want) = (true, lanes.clone(), stamps);
+            for j in 0..m {
+                let h = rule(&st.slice(j, 1), &state, 1);
+                let at = (c + j) % ROW_LANES;
+                rows_same &= bits_equal(&lane_of(&d.state, at), &h.state);
+                want_state[at * len..(at + 1) * len].copy_from_slice(&h.state);
+                want[at] = p0 + j as u32 + 1;
+                o.extend_from_slice(&h.o);
+                state = h.state;
+            }
+            let whole = bits_equal(&d.state, &want_state);
+            let pass = bits_equal(&d.o, &o) && rows_same && whole && sp == want;
+            println!(
+                "lanes rows m={m} from lane {c} of {ROW_LANES}: o vs {m} one-token calls {}; row j's \
+                 state in lane (c + j) mod {ROW_LANES} {rows_same}, the whole state (a lane no row \
+                 wrote untouched) {whole}; stamps {sp:?} (want {want:?}) {}",
+                cmp(&d.o, &o),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        // Lane 2's stamp one past the call's first position: the word names
+        // the layer and `delta_stamp`; every value is the clean launch's.
+        let m = 1;
+        let t = st.slice(0, m);
+        let call = LaneCall {
+            lane: c as u32,
+            p0,
+            each: false,
+        };
+        let (clean, _) = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, m)?;
+        let layer = 32usize;
+        let sink = cx.gpu.layer_sink(layer)?;
+        let before = cx.gpu.fault()?;
+        let mut stale = stamps;
+        stale[c] = p0 + 1;
+        let (bad, _) = cx.delta_lanes(sink, &t, (&lanes, &stale), call, m)?;
+        let word = cx.gpu.take_fault()?;
+        let _ = cx.delta_lanes(sink, &t, (&lanes, &stamps), call, m)?;
+        let after = cx.gpu.fault()?;
+        out.push(
+            Planted {
+                what: "lanes stamp of lane 2 one past the call's position",
+                want: Fault::at(u32::try_from(layer)?, FaultSite::DeltaStamp),
+                before,
+                word,
+                after,
+                hit: vec![vec![], vec![]],
+                clean: vec![clean.o, clean.state],
+                bad: vec![bad.o, bad.state],
+            }
+            .judge(),
+        );
+
+        // Row mode over more tokens than lanes is refused by name.
+        let t = st.slice(0, ROW_LANES + 1);
+        let call = LaneCall {
+            lane: c as u32,
+            p0,
+            each: true,
+        };
+        let got = cx.delta_lanes(unl, &t, (&lanes, &stamps), call, ROW_LANES + 1);
+        let named = matches!(&got, Err(e) if e.to_string().contains("row mode"));
+        println!(
+            "lanes launcher refuses row mode m={} over {ROW_LANES} lanes: \"{}\" {}",
+            ROW_LANES + 1,
+            match &got {
+                Ok(_) => "launched".to_owned(),
+                Err(e) => e.to_string(),
+            },
+            verdict(named)
+        );
+        out.push(named);
         Ok(out)
     }
 

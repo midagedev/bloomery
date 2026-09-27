@@ -123,11 +123,17 @@ pub enum FaultSite {
     /// under its sigmoid gate, the shared expert's gated sum) met an input or
     /// produced a value that is not finite.
     F32Product = 21,
+    /// A linear-attention delta step over lanes (`linear::delta`'s
+    /// `gdn_delta_lanes`) read a lane whose stamp is not the position its
+    /// first row stands at: a lane never written, or one a commit did not
+    /// leave there.
+    DeltaStamp = 23,
 }
 
 // A site is one bit of a u32 mask.
 const _: () = assert!((FaultSite::HcMix as u32) < 32);
 const _: () = assert!((FaultSite::F32Product as u32) < 32);
+const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -152,6 +158,7 @@ impl FaultSite {
         FaultSite::Ple,
         FaultSite::HcMix,
         FaultSite::F32Product,
+        FaultSite::DeltaStamp,
     ];
 
     /// The site's name as an error prints it.
@@ -178,6 +185,7 @@ impl FaultSite {
             FaultSite::Ple => "ple",
             FaultSite::HcMix => "hc_mix",
             FaultSite::F32Product => "f32_product",
+            FaultSite::DeltaStamp => "delta_stamp",
         }
     }
 
@@ -227,6 +235,10 @@ impl FaultSite {
                 "an attention output, its gate, a shared expert output, its weight or the host sum \
                  not finite, or a product or sum that is not"
             }
+            FaultSite::DeltaStamp => {
+                "a delta-step lane whose stamp is not the position of the call's first row: a lane \
+                 never written, or one a commit did not leave there"
+            }
         }
     }
 }
@@ -242,9 +254,9 @@ impl FaultSite {
 pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
-        AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, ExpertId, F32Product, HcMix, HcQuant,
-        KeyCount, LinearConv, LinearDelta, LinearGate, NormQuant, Ple, PoolSelect, Q5Quant,
-        QuantColumn, Router, TokenId,
+        AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, DeltaStamp, ExpertId, F32Product,
+        HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, NormQuant, Ple, PoolSelect,
+        Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -273,6 +285,7 @@ pub mod step_order {
         Ple,
         HcMix,
         F32Product,
+        DeltaStamp,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -299,6 +312,7 @@ pub mod step_order {
         Ple,
         HcMix,
         F32Product,
+        DeltaStamp,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -326,6 +340,7 @@ pub mod step_order {
         Ple,
         HcMix,
         F32Product,
+        DeltaStamp,
     ];
 
     /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
@@ -354,6 +369,7 @@ pub mod step_order {
         LinearConv,
         LinearDelta,
         DeltaLane,
+        DeltaStamp,
         LinearGate,
         F32Product,
         QuantColumn,
@@ -395,6 +411,7 @@ pub mod step_order {
         Ple,
         HcMix,
         F32Product,
+        DeltaStamp,
     ];
 
     /// The order of `arch`'s step.
