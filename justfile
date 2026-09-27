@@ -321,6 +321,10 @@ box-gc *ARGS='--kill':
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}
 
+# 정적 계층(check·lint·호스트 게이트)을 둘째 호스트(sihyung-gpu WSL)에서 돌린다. 박스 guard를 기다리지 않는다. 착륙 증거가 아니고 원장에 기록하지 않는다.
+h2 RECIPE:
+    @./tools/host2.sh {{RECIPE}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'

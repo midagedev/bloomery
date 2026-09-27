@@ -1096,6 +1096,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          command that names it passes that hold.",
     ),
     runner(
+        "BLOOMERY_HOST2",
+        Some("host2.sh"),
+        "Mac side: the second host's ssh name, `sihyung-gpu` when unset; `tools/host2.sh` \
+         runs the static tier there.",
+    ),
+    runner(
+        "BLOOMERY_HOST2_WAIT",
+        Some("host2.sh"),
+        "Seconds `tools/host2.sh` waits for the second host's lock before a run gives up \
+         (75); `0` does not wait.",
+    ),
+    runner(
         "BLOOMERY_HOST_BOUND",
         Some("ref/host-rate.sh"),
         "Seconds one thread count of `tools/ref/host-rate.sh` may run.",

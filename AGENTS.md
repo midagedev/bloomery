@@ -142,6 +142,10 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
     just box-tracks   # remote track dirs vs local worktrees; --remove NAME… deletes those, if stale
+    just h2 RECIPE    # the static tier on the second host (sihyung-gpu, WSL), tools/host2.sh:
+                      # check lint fmt-check gate-levers gate-sampler gate-serve gate-threads
+                      # gate-gpu-gates-lib gate-r8, the recipe's own box command; it does not
+                      # wait for the box's guard. Not landing evidence; recorded in no ledger
     just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
                       # selects it. Plan (b) — the tree's only two-card load — staged on both
                       # cards and checked byte for byte against the plan; solo. `-lock` also

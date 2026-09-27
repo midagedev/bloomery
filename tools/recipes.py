@@ -11,6 +11,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
+    python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/host2.sh runs it)
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -411,6 +412,44 @@ def recipe_commands(recipe: Recipe) -> RecipeCommands:
                     rc.paths.append(_norm(p))
                 _classify(cmd, rc, stripped)
     return rc
+
+
+class BoxCommandError(RecipeError):
+    """A recipe whose box command cannot be printed as it is: `box-command` exits 64 on it."""
+
+
+_BOX_LINE = re.compile(r"^(?:\./)?tools/box\.sh '([^']*)'$")
+
+
+def box_command(recipe: Recipe) -> str:
+    """The single-quoted argument of the recipe's one `tools/box.sh '…'` line, verbatim: tools/host2.sh
+    runs it as it is, so the recipe stays the one owner of its command. Refused by name: no box.sh line,
+    more than one, an environment prefix on the call (it would not reach the other host), an argument
+    that is not one single-quoted word ending the line, a `{{…}}` parameter left in it."""
+    found: list[str] = []
+    for line in recipe.lines:
+        stripped = line.lstrip("@-").strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for cmd in simple_commands(shell_words(stripped)):
+            env, rest = strip_wrappers(cmd)
+            if not rest or _norm(rest[0]) != "tools/box.sh":
+                continue
+            if env or rest[0] != cmd[0]:
+                raise BoxCommandError(f"{recipe.name}: its box.sh call carries a prefix ({' '.join(cmd[: len(cmd) - len(rest)])}) that would not reach the other host")
+            m = _BOX_LINE.match(stripped)
+            if m is None:
+                raise BoxCommandError(f"{recipe.name}: its box.sh line is not `./tools/box.sh '<command>'` alone on the line: {stripped[:120]}")
+            found.append(m.group(1))
+    if not found:
+        raise BoxCommandError(f"{recipe.name}: no tools/box.sh line")
+    if len(found) > 1:
+        raise BoxCommandError(f"{recipe.name}: {len(found)} tools/box.sh lines, not one")
+    if "{{" in found[0]:
+        raise BoxCommandError(f"{recipe.name}: its box command takes a parameter ({{{{…}}}}), which has no value outside just")
+    if not found[0].strip():
+        raise BoxCommandError(f"{recipe.name}: its box command is empty")
+    return found[0]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1347,6 +1386,19 @@ def cmd_why(args: argparse.Namespace) -> int:
             hint = orphan_hint(side, f)
             if hint:
                 print(f"  ({hint})")
+    return 0
+
+
+def cmd_box_command(args: argparse.Namespace) -> int:
+    recipes = load_justfile(os.path.join(ROOT, "justfile"))
+    if args.recipe not in recipes:
+        print(f"recipes.py box-command: no recipe {args.recipe}", file=sys.stderr)
+        return 64
+    try:
+        print(box_command(recipes[args.recipe]))
+    except BoxCommandError as err:
+        print(f"recipes.py box-command: {err}", file=sys.stderr)
+        return 64
     return 0
 
 
@@ -2472,6 +2524,38 @@ def self_test() -> int:
     rc = recipe_commands(Recipe("x", ["BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash -s -- {{ARGS}}' < tools/box-gc.sh"], [], ""))
     expect(rc.box and rc.scripts == ["tools/box-gc.sh"], f"a script over stdin: scripts {rc.scripts}")
 
+    # box-command: the recipe's one box.sh argument verbatim, and a named refusal of every other shape
+    def refused(lines: list[str], why: str = "") -> bool:
+        try:
+            box_command(Recipe("x", lines, [], ""))
+        except BoxCommandError as err:
+            return why in str(err)
+        return False
+
+    expect(box_command(Recipe("x", ["./tools/box.sh 'cargo check --workspace && echo \"$X\"'", "./tools/lock-back.sh"], [], "")) == 'cargo check --workspace && echo "$X"', "box-command: the argument is not printed verbatim")
+    expect(refused(["./tools/box.sh 'cargo check'", "./tools/box.sh 'cargo clippy'"]), "box-command: two box.sh lines accepted")
+    expect(refused(["./tools/lock-back.sh"]), "box-command: a recipe with no box.sh line accepted")
+    expect(refused(["BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo check'"], "prefix (BLOOMERY_MODEL=deepseek41)"), "box-command: an env prefix accepted or not named")
+    expect(refused(["./tools/box.sh 'cargo test {{ARGS}}'"]), "box-command: a {{…}} parameter accepted")
+    expect(refused(["./tools/box.sh 'cargo check' && echo done"]), "box-command: a line that goes on after the argument accepted")
+    lists = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--lists"], capture_output=True, text=True)
+    allow = [ln.split(" ", 1)[1] for ln in lists.stdout.splitlines() if ln.startswith("allow ")]
+    forbid = [ln.split(" ", 1)[1] for ln in lists.stdout.splitlines() if ln.startswith("forbid ")]
+    expect(lists.returncode == 0 and allow and forbid, f"tools/host2.sh --lists: rc {lists.returncode}, {len(allow)} recipes, {len(forbid)} tokens")
+    jf = load_justfile(os.path.join(ROOT, "justfile"))
+    for n in allow:
+        try:
+            got = box_command(jf[n]) if n in jf else ""
+        except BoxCommandError as err:
+            got = ""
+            fails.append(f"box-command {n}: {err}")
+        expect(bool(got.strip()), f"box-command {n}: no command")
+        refusal = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--check-command", got], capture_output=True, text=True)
+        expect(refusal.returncode == 0, f"box-command {n}: host2.sh refuses it (rc {refusal.returncode}): {refusal.stderr.strip()}")
+    for t in forbid[:1]:
+        probe = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--check-command", f"cd x && {t} y"], capture_output=True, text=True)
+        expect(probe.returncode == 64, f"host2.sh --check-command accepts a command naming '{t}' (rc {probe.returncode})")
+
     # the real tree
     side = make_side(ROOT)
     tree, recipes, graph = side.tree, side.recipes, side.graph
@@ -2653,6 +2737,8 @@ def main(argv: list[str]) -> int:
     k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
     k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
+    bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/host2.sh)")
+    bc.add_argument("recipe")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
@@ -2671,6 +2757,8 @@ def main(argv: list[str]) -> int:
             return cmd_why(args)
         if args.cmd == "key":
             return cmd_key(args)
+        if args.cmd == "box-command":
+            return cmd_box_command(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
         ap.print_help()
