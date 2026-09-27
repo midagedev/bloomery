@@ -82,6 +82,16 @@ int main() {
             for (int m = 0; m < 32; ++m) blk[2 + m] = (n % 17 == 3) ? 0x80 : (uint8_t)next_u64();
         }
     }
+    {
+        // A table ggml_init did not fill reads 0 for every scale: refuse by name before the
+        // kernel runs, instead of dumping rows of plausible zeros.
+        uint16_t d_tail;
+        memcpy(&d_tail, w.data() + 34 * (nb - 1), 2);
+        if ((d_tail & 0x7fff) != 0 && GGML_FP16_TO_FP32(d_tail) == 0.0f) {
+            fprintf(stderr, "q8f0_ref: the f16 table reads 0 for %04x — ggml_init did not fill it\n", d_tail);
+            return 1;
+        }
+    }
 
     std::vector<float> x(k);
     for (int b = 0; b < nb; ++b) {
