@@ -290,12 +290,17 @@ struct ModelInfo {
 
 #[derive(Default)]
 struct Stats {
+    /// Prompt tokens evaluated: the prompt less what the cache kept.
     n_prompt_total: u64,
+    /// Prompt tokens the cache kept instead (every request's `cache_n`).
+    n_prompt_cached_total: u64,
     t_prompt_ms_total: f64,
     n_predicted_total: u64,
     t_predicted_ms_total: f64,
     n_decode_total: u64,
     n_busy_slots_total: u64,
+    /// The longest a request's sequence grew (prompt and generation, `n_past`).
+    n_tokens_max: u64,
 }
 
 #[derive(Default)]
@@ -1013,12 +1018,18 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 12] = [
+        let rows: [(&str, &str, &str, String); 14] = [
             (
                 "counter",
                 "prompt_tokens_total",
-                "Number of prompt tokens processed.",
+                "Number of prompt tokens processed, excluding cached tokens",
                 s.n_prompt_total.to_string(),
+            ),
+            (
+                "counter",
+                "prompt_tokens_cached_total",
+                "Number of prompt tokens reused from the cache",
+                s.n_prompt_cached_total.to_string(),
             ),
             (
                 "counter",
@@ -1043,6 +1054,12 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "n_decode_total",
                 "Total number of llama_decode() calls",
                 s.n_decode_total.to_string(),
+            ),
+            (
+                "counter",
+                "n_tokens_max",
+                "Largest observed sequence length (prompt + generation)",
+                s.n_tokens_max.to_string(),
             ),
             (
                 "gauge",
@@ -1330,6 +1347,8 @@ impl<'a> Run<'a> {
         let mut s = relock(&self.state.stats);
         let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
         s.n_prompt_total += pn;
+        s.n_prompt_cached_total += t.cache_n as u64;
+        s.n_tokens_max = s.n_tokens_max.max(t.n_past as u64);
         s.t_prompt_ms_total += t.prompt_ms;
         s.n_predicted_total += dn;
         s.t_predicted_ms_total += t.predicted_ms;
@@ -1649,6 +1668,9 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
     })
 }
 
+/// The one `prompt_progress` this server sends, once the prompt is evaluated:
+/// `processed` is then what the cache holds of the prompt, all of it, as
+/// llama-server's last progress event counts it (`slot.prompt.tokens.size()`).
 fn progress(t: &Timings) -> Value {
     json!({ "total": t.n_prompt, "cache": t.cache_n, "processed": t.n_prompt, "time_ms": t.prompt_ms })
 }

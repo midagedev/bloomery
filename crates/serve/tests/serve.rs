@@ -1710,3 +1710,453 @@ fn hw_ignore_eos_bans_every_stop_id() {
         }
     }
 }
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_metrics_count_cached_prompt_tokens() {
+    let addr = start(4096);
+    let run = |body: Value| post(addr, "/completion", &body).json();
+    // A leaves "abcabc" and four generated ids; B keeps 8 of its 9; C keeps none
+    // and is the shortest, so the largest sequence is not the last one.
+    let a = run(json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}));
+    let b = run(json!({"prompt": "abcabcabb", "n_predict": 4, "temperature": 0}));
+    let c = run(json!({"prompt": "xyz", "n_predict": 1, "temperature": 0, "cache_prompt": false}));
+    let field = |v: &Value, k: &str| v["timings"][k].as_f64().expect(k);
+    let replies = [&a, &b, &c];
+    assert_eq!(field(&b, "cache_n"), 8.0, "{b}");
+    let body = get(addr, "/metrics").body;
+    let sum = |k: &str| replies.iter().map(|v| field(v, k)).sum::<f64>();
+    assert_eq!(metric(&body, "prompt_tokens_cached_total"), sum("cache_n"));
+    assert_eq!(metric(&body, "prompt_tokens_total"), sum("prompt_n"));
+    let longest = replies
+        .iter()
+        .map(|v| field(v, "n_past"))
+        .fold(0.0, f64::max);
+    assert!(field(&c, "n_past") < longest, "{c}");
+    assert_eq!(metric(&body, "n_tokens_max"), longest);
+    assert!(
+        body.contains("# TYPE llamacpp:prompt_tokens_cached_total counter"),
+        "{body}"
+    );
+}
+
+/// What a [`Spy`] engine saw: every `keepable` it answered, `(n, answer)`,
+/// oldest first, and the positions it holds.
+#[derive(Default)]
+struct Log {
+    asked: Vec<(usize, usize)>,
+    held: usize,
+}
+
+type Asked = std::sync::Arc<std::sync::Mutex<Log>>;
+
+/// The mock engine under a keep rule, logging every `keepable` it answers:
+/// the reuse tests ask the engine what it keeps instead of modelling its rule.
+/// With `tail`, a prompt call (one `prefill`) keeps only its start and its last
+/// `tail` positions, as V4.1's prompt-call hole does; without, any prefix.
+struct Spy {
+    inner: serve::MockEngine,
+    tail: Option<usize>,
+    /// Each prompt call's start and the end of its hole: a cut strictly
+    /// between them falls to the start.
+    holes: Vec<(usize, usize)>,
+    asked: Asked,
+}
+
+impl Spy {
+    fn held(&self) -> usize {
+        self.asked.lock().expect("log").held
+    }
+
+    fn hold(&self, n: usize) {
+        self.asked.lock().expect("log").held = n;
+    }
+
+    fn rule(&self, n: usize) -> usize {
+        let n = n.min(self.held());
+        self.holes
+            .iter()
+            .find(|&&(start, end)| start < n && n < end)
+            .map_or(n, |&(start, _)| start)
+    }
+}
+
+impl serve::Engine for Spy {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.inner.prefill(ids)?;
+        let start = self.held();
+        let end = start + ids.len();
+        if let Some(tail) = self.tail
+            && end > start + tail + 1
+        {
+            self.holes.push((start, end - tail));
+        }
+        self.hold(end);
+        Ok(())
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        let g = self.inner.next(last, out)?;
+        self.hold(self.held() + 1);
+        Ok(g)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        self.hold(0);
+        self.holes.clear();
+        self.inner.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        let k = self.rule(n);
+        self.asked.lock().expect("log").asked.push((n, k));
+        k
+    }
+    fn cut(&mut self, n: usize) -> Result<(), serve::EngineError> {
+        if self.rule(n) != n {
+            return Err(serve::EngineError(format!(
+                "cut to {n} of {}: not a kept point",
+                self.held()
+            )));
+        }
+        self.hold(n);
+        self.holes.retain(|&(start, _)| start < n);
+        self.inner.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn save_state(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<serve::SavedState, serve::StateError> {
+        self.inner.save_state(out)
+    }
+    /// A restored cache has no prompt call of this engine's life: no hole.
+    fn restore_state(
+        &mut self,
+        input: &mut dyn std::io::Read,
+    ) -> Result<serve::SavedState, serve::StateError> {
+        let s = self.inner.restore_state(input)?;
+        self.hold(s.n_tokens);
+        self.holes.clear();
+        Ok(s)
+    }
+}
+
+/// A server on a [`Spy`] with room for 4096 positions, and its log.
+fn spy(tail: Option<usize>) -> (std::net::SocketAddr, Asked) {
+    let asked = Asked::default();
+    let addr = common::start_with(Box::new(Spy {
+        inner: serve::MockEngine::new(4096),
+        tail,
+        holes: Vec::new(),
+        asked: asked.clone(),
+    }));
+    (addr, asked)
+}
+
+fn shared(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+fn ids(v: &Value) -> Vec<u32> {
+    v.as_array()
+        .unwrap_or_else(|| panic!("not an id array: {v}"))
+        .iter()
+        .map(|t| u32::try_from(t.as_u64().expect("an id")).expect("a u32 id"))
+        .collect()
+}
+
+/// What one warm request kept, against the engine it ran on.
+struct Kept {
+    /// The prefix it shared with what the most recent request left: the least
+    /// the server may ask the engine to keep.
+    last: usize,
+    /// The longest it shared with what any earlier request left: the most.
+    bound: usize,
+    /// The `n` of the request's last `keepable`, 0 when it asked none.
+    asked: usize,
+    cache_n: usize,
+}
+
+/// Every id sequence a request left in the server's cache (its prompt and all
+/// but its last generated id), and what the requests since the last check asked.
+struct Ledger {
+    helds: Vec<Vec<u32>>,
+    asked: Asked,
+}
+
+impl Ledger {
+    fn new(asked: Asked) -> Ledger {
+        asked.lock().expect("log").asked.clear();
+        Ledger {
+            helds: Vec::new(),
+            asked,
+        }
+    }
+
+    /// Checks the warm reply `v` to a prompt of `p` against the engine's answers
+    /// to the request's `keepable` calls and against the positions it holds
+    /// after it, and books what the request left: `p` and `generated` less its
+    /// last id.
+    fn check(&mut self, v: &Value, p: &[u32], generated: &[u32]) -> Kept {
+        let top = p.len() - 1;
+        let last = self.helds.last().map_or(0, |h| shared(h, p)).min(top);
+        let bound = self
+            .helds
+            .iter()
+            .map(|h| shared(h, p))
+            .max()
+            .unwrap_or(0)
+            .min(top);
+        let (asked, engine_held) = {
+            let mut log = self.asked.lock().expect("log");
+            (std::mem::take(&mut log.asked), log.held)
+        };
+        let t = &v["timings"];
+        let cache_n = usize::try_from(t["cache_n"].as_u64().expect("cache_n")).expect("usize");
+        let at = format!("asked {asked:?}, last {last}, bound {bound}: {v}");
+        let (n, answer) = asked.last().copied().unwrap_or((0, 0));
+        assert!(
+            last == 0 || !asked.is_empty(),
+            "a prompt sharing {last} ids never asked the engine: {at}"
+        );
+        assert_eq!(
+            cache_n,
+            answer.min(n),
+            "cache_n is the engine's answer: {at}"
+        );
+        assert!(last <= n && n <= bound, "the ask: {at}");
+        assert_eq!(
+            t["prompt_n"].as_u64().expect("prompt_n") + cache_n as u64,
+            p.len() as u64,
+            "{at}"
+        );
+        let mut held = p.to_vec();
+        held.extend(&generated[..generated.len().saturating_sub(1)]);
+        assert_eq!(
+            engine_held,
+            held.len(),
+            "the engine holds what the server booked: {at}"
+        );
+        self.helds.push(held);
+        Kept {
+            last,
+            bound,
+            asked: n,
+            cache_n,
+        }
+    }
+}
+
+/// Greedy `/completion` of `p` on a fresh server: the reference a warm
+/// request's continuation must equal, id for id.
+fn fresh(p: &[u32], extra: &Value) -> Value {
+    let mut b = json!({"prompt": p, "temperature": 0, "return_tokens": true});
+    if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
+        b.extend(e.clone());
+    }
+    post(start(4096), "/completion", &b).json()
+}
+
+/// A chat as a client drives it, turn by turn: each turn sends the earlier
+/// messages, the assistant's `content` as answered (its reasoning left out) and
+/// the next user message.
+struct Chat {
+    addr: std::net::SocketAddr,
+    ledger: Ledger,
+    convs: Vec<Vec<Value>>,
+    /// Request fields every turn carries besides `messages`.
+    extra: Value,
+}
+
+impl Chat {
+    fn new(addr: std::net::SocketAddr, asked: Asked, extra: Value) -> Chat {
+        Chat {
+            addr,
+            ledger: Ledger::new(asked),
+            convs: Vec::new(),
+            extra,
+        }
+    }
+
+    /// Opens a conversation with `system` (none when empty); returns its index.
+    fn open(&mut self, system: &str) -> usize {
+        let m = if system.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"role": "system", "content": system})]
+        };
+        self.convs.push(m);
+        self.convs.len() - 1
+    }
+
+    /// Sends conversation `c`'s next turn and checks it: the reuse against the
+    /// engine's answer ([`Ledger::check`]), and the reply against a fresh
+    /// server's greedy ids of the same rendered prompt. Returns the rendered ids
+    /// and what the turn kept.
+    fn turn(&mut self, c: usize, user: &str) -> (Vec<u32>, Kept) {
+        use serve::Tokenizer;
+        self.convs[c].push(json!({"role": "user", "content": user}));
+        let mut body = json!({"messages": self.convs[c], "temperature": 0});
+        if let (Value::Object(b), Value::Object(e)) = (&mut body, &self.extra) {
+            b.extend(e.clone());
+        }
+        let text = post(self.addr, "/apply-template", &body).json()["prompt"]
+            .as_str()
+            .expect("a rendered prompt")
+            .to_owned();
+        let p = serve::MockTokenizer.encode(&text);
+        let warm = post(self.addr, "/v1/chat/completions", &body).json();
+        let mut limits = json!({});
+        for k in ["ignore_eos", "max_tokens"] {
+            if let Some(v) = body.get(k) {
+                limits[if k == "max_tokens" { "n_predict" } else { k }] = v.clone();
+            }
+        }
+        let f = fresh(&p, &limits);
+        let g = ids(&f["tokens"]);
+        let kept = self.ledger.check(&warm, &p, &g);
+        let m = &warm["choices"][0]["message"];
+        let content = m["content"].as_str().expect("content").to_owned();
+        let reasoning = m["reasoning_content"].as_str().unwrap_or("");
+        let raw = f["content"].as_str().expect("fresh content");
+        let thinking = text.ends_with("<think>");
+        let same = if thinking {
+            raw == format!("{reasoning}</think>{content}")
+                || (content.is_empty() && raw == reasoning)
+        } else {
+            reasoning.is_empty() && raw == content
+        };
+        assert!(same, "warm {warm}\nfresh {f}");
+        assert_eq!(warm["usage"]["completion_tokens"], json!(g.len()), "{warm}");
+        assert_eq!(warm["usage"]["prompt_tokens"], json!(p.len()), "{warm}");
+        assert_eq!(
+            warm["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(kept.cache_n),
+            "{warm}"
+        );
+        self.convs[c].push(json!({"role": "assistant", "content": content}));
+        (p, kept)
+    }
+}
+
+/// The user message whose `</think>` the mock's reply follows, up to the end
+/// of generation: with `tag` the reply is `tag` (after the chat's `</think>`).
+fn reply_of(lead: &str, tag: &str) -> String {
+    format!("{lead} </think>{tag}<｜end▁of▁sentence｜>")
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_thinking_turn_keeps_the_prompt_to_its_think() {
+    let (addr, asked) = spy(None);
+    let mut chat = Chat::new(
+        addr,
+        asked,
+        json!({"chat_template_kwargs": {"thinking": true}, "max_tokens": 24}),
+    );
+    let c = chat.open("");
+    // The mock thinks "ok" and answers "fine": the prompt ends in `<think>`, and
+    // the user message's `<think>` is followed by that.
+    let (p1, _) = chat.turn(c, "<think>ok</think>fine<｜end▁of▁sentence｜>");
+    let (_, k2) = chat.turn(c, "more");
+    // The recorded turn opens `</think>` where the generation prompt had
+    // `<think>`: the two prompts share all of turn 1's but its last id.
+    assert_eq!(k2.last, p1.len() - 1);
+    assert_eq!(k2.cache_n, p1.len() - 1);
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_every_later_turn_keeps_the_earlier_turns() {
+    for tail in [None, Some(4)] {
+        let (addr, asked) = spy(tail);
+        let mut chat = Chat::new(addr, asked, json!({"max_tokens": 24}));
+        let c = chat.open("You answer with three letters.");
+        let mut prev = chat.turn(c, &reply_of("one", "xyz")).0;
+        for (lead, tag) in [("two", "uvw"), ("three", "rst"), ("four", "opq")] {
+            let (p, k) = chat.turn(c, &reply_of(lead, tag));
+            // Append-only: the turn shares the previous prompt and its reply,
+            // and every one of them is kept.
+            assert!(k.last > prev.len() + 2, "tail {tail:?} {lead}");
+            assert_eq!(k.cache_n, k.last, "tail {tail:?} {lead}");
+            prev = p;
+        }
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_reply_past_the_window_keeps_the_prompt_to_its_think() {
+    let (addr, asked) = spy(Some(4));
+    let mut chat = Chat::new(
+        addr,
+        asked,
+        json!({"chat_template_kwargs": {"thinking": true}, "max_tokens": 160, "ignore_eos": true}),
+    );
+    let c = chat.open("");
+    let (p1, _) = chat.turn(c, "<think>ok</think>fine<｜end▁of▁sentence｜>");
+    let (_, k2) = chat.turn(c, "more");
+    assert_eq!(k2.last, p1.len() - 1);
+    assert_eq!(k2.cache_n, p1.len() - 1, "the cut is at a decode position");
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_divergence_inside_a_long_prompt_call_keeps_what_the_engine_grants() {
+    use serve::Tokenizer;
+    let first: String = (0..40).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    let second = format!("{}{}", &first[..20], "zzzz");
+    // Inside a first call: the last request asks for the 20 ids it shares; a
+    // prompt call keeps only its start and its last four positions under the
+    // hole rule, all of it without. Inside a second call (from position 10,
+    // where the first request's cache ended): the start is 10.
+    let later = format!("{}{}", &first[..30], "zzzz");
+    let cases: [(&[&str], usize, [usize; 2]); 2] = [
+        (&[&first, &second], 20, [20, 0]),
+        (&[&first[..10], &first, &later], 30, [30, 10]),
+    ];
+    for (prompts, asks, want) in cases {
+        for (tail, want) in [(None, want[0]), (Some(4), want[1])] {
+            let (addr, asked) = spy(tail);
+            let mut ledger = Ledger::new(asked);
+            let mut k = None;
+            for prompt in prompts {
+                let p = serve::MockTokenizer.encode(prompt);
+                let body = json!({"prompt": prompt, "n_predict": 6, "temperature": 0, "return_tokens": true});
+                let warm = post(addr, "/completion", &body).json();
+                let f = fresh(&p, &json!({"n_predict": 6}));
+                assert_eq!(warm["tokens"], f["tokens"], "tail {tail:?}: {warm}\n{f}");
+                k = Some(ledger.check(&warm, &p, &ids(&warm["tokens"])));
+            }
+            let k = k.expect("a request");
+            assert_eq!(
+                (k.asked, k.cache_n),
+                (asks, want),
+                "tail {tail:?} {prompts:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_interleaved_conversation_keeps_what_the_engine_grants() {
+    let (addr, asked) = spy(None);
+    let mut chat = Chat::new(addr, asked, json!({"max_tokens": 24}));
+    let a = chat.open("Conversation A.");
+    let b = chat.open("Another conversation, B.");
+    let (pa, _) = chat.turn(a, &reply_of("a1", "xyz"));
+    chat.turn(b, &reply_of("b1", "uvw"));
+    let (_, k) = chat.turn(a, &reply_of("a2", "rst"));
+    // A's second turn shares all of A's first turn with what A left, and much
+    // less with what B left since; the server asks between the two.
+    assert!(k.bound > pa.len(), "bound {} of {}", k.bound, pa.len());
+    assert!(k.last < k.bound, "last {} bound {}", k.last, k.bound);
+    assert!(k.cache_n <= k.bound);
+}

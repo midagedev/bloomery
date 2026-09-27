@@ -30,19 +30,32 @@
 //! - `/tokenize` of `--prompt` is `--ids`;
 //! - the same `/completion` after those requests gives the same ids (the
 //!   engine's reset between requests leaves nothing behind), and once more
-//!   right after itself it keeps `n − 1` positions of its `n`, rounded down by
-//!   the body's cut rule (`Body::keep_point`: to a multiple of every
-//!   compression ratio), with the same ids;
+//!   right after itself it keeps at most `n − 1` positions of its `n` and at
+//!   least `n − 1` in whole compression groups (a multiple of every ratio),
+//!   with the same ids;
 //! - prefix reuse (`cache_prompt`, default true): `--ids` then `--ids` plus
 //!   its 8 greedy ids (`ignore_eos`) keeps every cached position (`timings.cache_n`), and a
 //!   prompt that leaves the last cached position out takes that one back;
 //!   each gives the greedy ids of the same prompt with `cache_prompt: false`,
 //!   and `timings.prompt_n` is the ids evaluated, the prompt less `cache_n`;
-//! - a two-turn chat: turn 2 (turn 1's message, its answer, a new message)
-//!   keeps the rendered prefix it shares with what turn 1 left in the cache,
-//!   rounded down by the same rule, answers as with `cache_prompt: false`, and
-//!   reports `usage.prompt_tokens` as the whole prompt and
-//!   `usage.prompt_tokens_details.cached_tokens` as `timings.cache_n`.
+//! - conversations at temperature 0, sent as a client sends them (each turn
+//!   the earlier messages, the assistant's `content` as answered, its reasoning
+//!   left out, and the next user message), each turn then run again from a
+//!   reset cache as a greedy `/completion` of its rendered ids: two turns;
+//!   two turns thinking on; four turns; two turns thinking on with a reply
+//!   longer than the raw window (`ignore_eos`); a second conversation on the
+//!   first's long system prompt, diverging inside the first's prompt call; and
+//!   one conversation's second turn after another conversation's first. What a
+//!   turn keeps is the engine's answer, which this gate does not model: every
+//!   turn's reply is the fresh run's text and length, its counts add up to the
+//!   prompt (`usage.prompt_tokens`, `cached_tokens` = `timings.cache_n`), and
+//!   `cache_n` is at most the longest prefix the prompt shares with what any
+//!   earlier request left. Where the template makes a turn share the previous
+//!   prompt (thinking off) or all of it but its `<think>` (thinking on), that
+//!   is checked, and the turn keeps at least that prefix — all of it when it
+//!   is everything the most recent request left (no cut), else in whole
+//!   compression groups: its cut lands in a reply or at a prompt call's end,
+//!   outside every prompt call's hole. The other two print what they kept.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -97,35 +110,52 @@ mod gate {
     const TURN1: &str = "Name three primary colors.";
     const TURN2: &str = "Which of them is the color of the sky?";
     const TURN_PREDICT: usize = 24;
+    /// A reply longer than the raw window (checked against the file's).
+    const WINDOW_PREDICT: usize = 160;
+    const TURN3: &str = "And the color of fresh grass?";
+    const TURN4: &str = "Name one color that is not primary.";
+    /// Another conversation's first message.
+    const OTHER: &str = "Name three farm animals.";
+    /// The long conversations' shared system prompt and first message: lines
+    /// enough that the prompt call runs more than two windows past the prefix
+    /// they share.
+    const LONG_RULES: usize = 20;
+    const LONG_LINES: usize = 30;
+    const LONG_PREDICT: usize = 8;
     /// The sampled requests' temperature and seed.
     const SAMPLED_TEMPERATURE: f64 = 0.8;
     const SAMPLED_SEED: u64 = 7;
 
-    /// The positions the engine keeps of at most `ask` when it holds `held`
-    /// after a plain run: all of them from `held − 1` on, else `ask` rounded
-    /// down to a multiple of every compression ratio (`Body::keep_point` on a
-    /// cache whose state slots hold the latest positions).
-    fn kept(ask: usize, held: usize, ratios: &[usize]) -> usize {
-        if ask + 1 >= held {
-            return ask.min(held);
-        }
+    /// `ask` in whole compression groups: rounded down to a multiple of every
+    /// ratio. The least a request keeps of `ask` shared positions when its cut
+    /// lands outside every prompt call's hole, since the compressor state rings
+    /// keep whole groups: a floor, not the engine's rule, which may keep more.
+    fn whole_groups(ask: usize, ratios: &[usize]) -> usize {
         (0..=ask)
             .rev()
             .find(|k| ratios.iter().all(|&r| r == 0 || k % r == 0))
             .unwrap_or(0)
     }
 
-    /// The file's compression ratios, from its headers.
-    fn file_ratios() -> Result<Vec<usize>, GateError> {
+    /// The file's compression ratios and raw window, from its headers.
+    struct Rules {
+        ratios: Vec<usize>,
+        window: usize,
+    }
+
+    fn file_rules() -> Result<Rules, GateError> {
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
         let planner = Planner::from_file(&split, &hp, workstation::CTX_MAX)?;
-        Ok(planner
-            .stream_ratios()
-            .iter()
-            .map(|&r| r as usize)
-            .collect())
+        Ok(Rules {
+            ratios: planner
+                .stream_ratios()
+                .iter()
+                .map(|&r| r as usize)
+                .collect(),
+            window: hp.window,
+        })
     }
 
     /// The positions the server serves at its default context: the lesser of
@@ -248,12 +278,16 @@ mod gate {
         parse_ids(line)
     }
 
-    /// The rendered ids of a chat's `messages`, through the server's own
-    /// template and tokenizer.
-    fn rendered(url: &dyn Fn(&str) -> String, messages: &Value) -> Result<Vec<u32>, GateError> {
+    /// The rendered ids of a chat's `messages` under the template's `kwargs`,
+    /// through the server's own template and tokenizer.
+    fn rendered(
+        url: &dyn Fn(&str) -> String,
+        messages: &Value,
+        kwargs: &Value,
+    ) -> Result<Vec<u32>, GateError> {
         let (st, body) = curl(
             &url("/apply-template"),
-            Some(&json!({"messages": messages})),
+            Some(&json!({"messages": messages, "chat_template_kwargs": kwargs})),
             false,
         )?;
         let text = json_of("/apply-template", st, &body)?["prompt"]
@@ -264,92 +298,355 @@ mod gate {
         Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
     }
 
-    /// A real two-turn chat at temperature 0: turn 2 keeps what it shares
-    /// with the cache turn 1 left, and answers as it does from a reset.
-    fn two_turns(url: &dyn Fn(&str) -> String, ratios: &[usize]) -> Result<bool, GateError> {
-        let chat = |messages: &Value, cache: bool| -> Result<Value, GateError> {
+    /// A JSON count as a `usize`; `None` when it is not one.
+    fn as_count(v: &Value) -> Option<usize> {
+        v.as_u64().and_then(|c| usize::try_from(c).ok())
+    }
+
+    /// Every id sequence a request of the conversations left in the server's
+    /// cache: its prompt and all its generated ids but the last. Whichever slot
+    /// or saved state the server keeps them in, a request can keep no more than
+    /// the longest prefix it shares with one of them.
+    #[derive(Clone)]
+    struct Ledger(Vec<Vec<u32>>);
+
+    impl Ledger {
+        fn book(&mut self, p: &[u32], generated: &[u32]) {
+            let mut held = p.to_vec();
+            held.extend(&generated[..generated.len().saturating_sub(1)]);
+            self.0.push(held);
+        }
+
+        /// The prefix `p` shares with what the most recent request left, and
+        /// the longest it shares with any; each at most `p.len() − 1`, since
+        /// the last id is always evaluated.
+        fn shares(&self, p: &[u32]) -> (usize, usize) {
+            let top = p.len().saturating_sub(1);
+            let last = self.0.last().map_or(0, |h| common(h, p));
+            let any = self.0.iter().map(|h| common(h, p)).max().unwrap_or(0);
+            (last.min(top), any.min(top))
+        }
+    }
+
+    /// What the template makes a turn share with the most recent request, the
+    /// previous turn of its conversation unless another conversation came between.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Shares {
+        /// Nothing checked: a conversation's first turn.
+        Any,
+        /// All of the previous prompt: thinking off, the recorded turn renders
+        /// as its reply was generated.
+        Prompt,
+        /// The previous prompt but its last id: thinking on, the generation
+        /// prompt ends in `<think>` and the recorded turn in `</think>`.
+        ToThink,
+        /// More than a window, ending more than two windows before the
+        /// previous step's prompt does: inside that prompt call.
+        InsideCall,
+        /// All of its conversation's previous prompt with some earlier request,
+        /// less with the most recent one: another conversation came between.
+        Elsewhere,
+    }
+
+    struct Step {
+        conv: usize,
+        user: String,
+        shares: Shares,
+        /// The cut lands in a reply or at a prompt call's end: the turn keeps
+        /// at least what it shares with the most recent request, all of it
+        /// when that is everything the request left, else in whole compression
+        /// groups.
+        floor: bool,
+    }
+
+    struct Script {
+        name: &'static str,
+        /// One system message per conversation.
+        systems: Vec<String>,
+        steps: Vec<Step>,
+        /// `chat_template_kwargs`.
+        kwargs: Value,
+        max_tokens: usize,
+        ignore_eos: bool,
+        /// Every reply must run past the raw window.
+        past_window: bool,
+    }
+
+    fn step(conv: usize, user: &str, shares: Shares, floor: bool) -> Step {
+        Step {
+            conv,
+            user: user.to_owned(),
+            shares,
+            floor,
+        }
+    }
+
+    /// The warm message is the fresh completion's `raw` text as the chat splits
+    /// it: with thinking on, its reasoning, `</think>` and its content (all of
+    /// it reasoning while the span is still open); with thinking off, its content.
+    fn same_text(m: &Value, raw: &str, thinking: bool) -> bool {
+        let content = m["content"].as_str().unwrap_or("");
+        let reasoning = m["reasoning_content"].as_str().unwrap_or("");
+        if thinking {
+            raw == format!("{reasoning}{}{content}", serve::reasoning::THINK_CLOSE)
+                || (content.is_empty() && raw == reasoning)
+        } else {
+            reasoning.is_empty() && raw == content
+        }
+    }
+
+    /// Runs `s` (see the module header): every turn warm, as a client sends it,
+    /// then every turn again as a greedy `/completion` of its rendered ids from
+    /// a reset cache. `ledger` holds what the requests before left and gains
+    /// what these leave.
+    fn converse(
+        url: &dyn Fn(&str) -> String,
+        rules: &Rules,
+        ledger: &mut Ledger,
+        s: &Script,
+    ) -> Result<bool, GateError> {
+        let mut convs: Vec<Vec<Value>> = s
+            .systems
+            .iter()
+            .map(|t| vec![json!({"role": "system", "content": t})])
+            .collect();
+        let mut warm: Vec<(Vec<u32>, Value)> = Vec::new();
+        for st in &s.steps {
+            let msgs = convs
+                .get_mut(st.conv)
+                .ok_or_else(|| format!("{}: no conversation {}", s.name, st.conv))?;
+            msgs.push(json!({"role": "user", "content": st.user}));
+            let messages = Value::Array(msgs.clone());
+            let p = rendered(url, &messages, &s.kwargs)?;
             let body = json!({
-                "messages": messages, "temperature": 0, "max_tokens": TURN_PREDICT,
-                "cache_prompt": cache,
+                "messages": messages, "temperature": 0, "max_tokens": s.max_tokens,
+                "ignore_eos": s.ignore_eos, "chat_template_kwargs": s.kwargs,
             });
-            let (st, body) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-            json_of("/v1/chat/completions", st, &body)
-        };
-        let turn1 = json!([{"role": "user", "content": TURN1}]);
-        let p1 = rendered(url, &turn1)?;
-        // Turn 1's greedy ids, as a completion of its rendered ids.
-        let (st, body) = curl(
-            &url("/completion"),
-            Some(&json!({
-                "prompt": p1, "n_predict": TURN_PREDICT, "temperature": 0,
-                "return_tokens": true, "cache_prompt": false,
-            })),
+            let (code, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+            let reply = json_of("/v1/chat/completions", code, &text)?;
+            let content = reply["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            msgs.push(json!({"role": "assistant", "content": content}));
+            warm.push((p, reply));
+        }
+        let mut fresh: Vec<(Vec<u32>, Value)> = Vec::new();
+        for (p, _) in &warm {
+            let body = json!({
+                "prompt": p, "n_predict": s.max_tokens, "temperature": 0,
+                "ignore_eos": s.ignore_eos, "return_tokens": true, "cache_prompt": false,
+            });
+            let (code, text) = curl(&url("/completion"), Some(&body), false)?;
+            let v = json_of("/completion", code, &text)?;
+            fresh.push((ids_of(&v["tokens"]), v));
+        }
+        let thinking = s.kwargs["thinking"] == json!(true);
+        let mut before = ledger.clone();
+        let mut prev: Vec<Option<usize>> = vec![None; convs.len()];
+        let mut recent: Option<usize> = None;
+        let mut ok = true;
+        for (i, (st, ((p, reply), (g, f)))) in
+            s.steps.iter().zip(warm.iter().zip(&fresh)).enumerate()
+        {
+            let name = format!("{}_turn{}", s.name, i + 1);
+            let (last, bound) = before.shares(p);
+            let (t, u) = (&reply["timings"], &reply["usage"]);
+            let m = &reply["choices"][0]["message"];
+            let cache_n = as_count(&t["cache_n"]);
+            let most_recent = before.0.last().map_or(0, Vec::len);
+            // All of what the most recent request left needs no cut.
+            let floor = if last == most_recent {
+                last
+            } else {
+                whole_groups(last, &rules.ratios)
+            };
+            println!(
+                "{} turn {}: {} rendered ids; the most recent request left {most_recent} ids and \
+                 shares {last} with it, {bound} at most with any earlier one{}; cache_n={} \
+                 prompt_n={} usage={}; fresh {} ids stop_type={}; message {m}",
+                s.name,
+                i + 1,
+                p.len(),
+                if st.floor {
+                    format!(", keeps at least {floor}")
+                } else {
+                    String::new()
+                },
+                t["cache_n"],
+                t["prompt_n"],
+                u,
+                g.len(),
+                f["stop_type"],
+            );
+            check(
+                &mut ok,
+                &format!("{name}_counts"),
+                cache_n
+                    .zip(as_count(&t["prompt_n"]))
+                    .is_some_and(|(c, n)| c + n == p.len())
+                    && u["prompt_tokens"] == json!(p.len())
+                    && u["prompt_tokens_details"]["cached_tokens"] == t["cache_n"],
+            );
+            check(
+                &mut ok,
+                &format!("{name}_is_fresh"),
+                f["timings"]["cache_n"] == json!(0)
+                    && u["completion_tokens"] == json!(g.len())
+                    && same_text(m, f["content"].as_str().unwrap_or(""), thinking),
+            );
+            let before_p = prev[st.conv];
+            let shares = match (st.shares, before_p) {
+                (Shares::Any, _) => true,
+                (Shares::Prompt, Some(n)) => last >= n,
+                (Shares::ToThink, Some(n)) => last + 1 == n,
+                (Shares::InsideCall, _) => recent.is_some_and(|n| {
+                    last > rules.window && n.saturating_sub(last) > 2 * rules.window
+                }),
+                (Shares::Elsewhere, Some(n)) => bound >= n && last < n,
+                (_, None) => false,
+            };
+            if st.shares != Shares::Any {
+                check(&mut ok, &format!("{name}_shares"), shares);
+            }
+            check(
+                &mut ok,
+                &format!("{name}_cache_n"),
+                cache_n.is_some_and(|c| c <= bound && (!st.floor || c >= floor)),
+            );
+            if s.past_window {
+                check(
+                    &mut ok,
+                    &format!("{name}_reply_passes_the_window"),
+                    g.len() > rules.window,
+                );
+            }
+            before.book(p, g);
+            prev[st.conv] = Some(p.len());
+            recent = Some(p.len());
+        }
+        // The warm turns, then their fresh runs, which left the same ids when
+        // the turns passed.
+        for _ in 0..2 {
+            for ((p, _), (g, _)) in warm.iter().zip(&fresh) {
+                ledger.book(p, g);
+            }
+        }
+        Ok(ok)
+    }
+
+    /// The conversations of the module header, in order, after whatever the
+    /// gate ran before them: each conversation opens with a system message of
+    /// its own, so an earlier request shares at most the first id,
+    /// `<｜begin▁of▁sentence｜>`, with any of them.
+    fn conversations(url: &dyn Fn(&str) -> String, rules: &Rules) -> Result<bool, GateError> {
+        let (code, body) = curl(&url("/props"), None, false)?;
+        let bos_text = json_of("/props", code, &body)?["bos_token"]
+            .as_str()
+            .ok_or("/props gave no bos_token")?
+            .to_owned();
+        let (code, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({"content": bos_text})),
             false,
         )?;
-        let g1 = ids_of(&json_of("/completion", st, &body)?["tokens"]);
-        let r1 = chat(&turn1, true)?;
-        let answer = r1["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        let same_turn1 = r1["usage"]["completion_tokens"] == json!(g1.len());
-        let mut turn2 = turn1.clone();
-        if let Value::Array(m) = &mut turn2 {
-            m.push(json!({"role": "assistant", "content": answer}));
-            m.push(json!({"role": "user", "content": TURN2}));
-        }
-        let p2 = rendered(url, &turn2)?;
-        let held: Vec<u32> = p1
-            .iter()
-            .chain(&g1[..g1.len().saturating_sub(1)])
-            .copied()
+        let bos = ids_of(&json_of("/tokenize", code, &body)?["tokens"]);
+        let mut ledger = Ledger(vec![bos]);
+        let rules_text: String = (1..=LONG_RULES)
+            .map(|i| {
+                format!("Rule {i}: reply in plain words and keep every answer under fifty words.\n")
+            })
             .collect();
-        let shared = common(&held, &p2);
-        let want = kept(shared.min(p2.len() - 1), held.len(), ratios);
-        let warm = chat(&turn2, true)?;
-        let fresh = chat(&turn2, false)?;
-        let (t, u) = (&warm["timings"], &warm["usage"]);
-        println!(
-            "chat turn 1: {} rendered ids, {} greedy ids {g1:?}, answer {answer:?}, cache_n={}",
-            p1.len(),
-            g1.len(),
-            r1["timings"]["cache_n"]
-        );
-        println!(
-            "chat turn 2: {} rendered ids; the cache held {} ids, {shared} of them shared \
-             (turn 1's prompt {}); kept {want}: cache_n={} prompt_n={} usage={}",
-            p2.len(),
-            held.len(),
-            p1.len(),
-            t["cache_n"],
-            t["prompt_n"],
-            u
-        );
-        println!(
-            "chat turn 2 cache_prompt=false: cache_n={} message {}",
-            fresh["timings"]["cache_n"], fresh["choices"][0]["message"]
-        );
+        let report: String = (1..=LONG_LINES)
+            .map(|i| format!("Line {i} of the report: the shipment arrived on time, complete and undamaged.\n"))
+            .collect();
+        let long_user = format!("{report}Summarize the report in one sentence.");
+        let off = json!({});
+        let on = json!({"thinking": true});
+        let scripts = [
+            Script {
+                name: "chat",
+                systems: vec!["Conversation one: answer plainly.".to_owned()],
+                steps: vec![
+                    step(0, TURN1, Shares::Any, false),
+                    step(0, TURN2, Shares::Prompt, true),
+                ],
+                kwargs: off.clone(),
+                max_tokens: TURN_PREDICT,
+                ignore_eos: false,
+                past_window: false,
+            },
+            Script {
+                name: "think",
+                systems: vec!["Conversation two: think first, then answer.".to_owned()],
+                steps: vec![
+                    step(0, TURN1, Shares::Any, false),
+                    step(0, TURN2, Shares::ToThink, true),
+                ],
+                kwargs: on.clone(),
+                max_tokens: TURN_PREDICT,
+                ignore_eos: false,
+                past_window: false,
+            },
+            Script {
+                name: "turns",
+                systems: vec!["Conversation three: one short sentence per answer.".to_owned()],
+                steps: vec![
+                    step(0, TURN1, Shares::Any, false),
+                    step(0, TURN2, Shares::Prompt, true),
+                    step(0, TURN3, Shares::Prompt, true),
+                    step(0, TURN4, Shares::Prompt, true),
+                ],
+                kwargs: off.clone(),
+                max_tokens: TURN_PREDICT,
+                ignore_eos: false,
+                past_window: false,
+            },
+            Script {
+                name: "window",
+                systems: vec!["Conversation four: think at length.".to_owned()],
+                steps: vec![
+                    step(0, TURN1, Shares::Any, false),
+                    step(0, TURN2, Shares::ToThink, true),
+                ],
+                kwargs: on,
+                max_tokens: WINDOW_PREDICT,
+                ignore_eos: true,
+                past_window: true,
+            },
+            Script {
+                name: "long",
+                systems: vec![rules_text.clone(), rules_text],
+                steps: vec![
+                    step(0, &long_user, Shares::Any, false),
+                    step(1, TURN1, Shares::InsideCall, false),
+                ],
+                kwargs: off.clone(),
+                max_tokens: LONG_PREDICT,
+                ignore_eos: false,
+                past_window: false,
+            },
+            Script {
+                name: "interleave",
+                systems: vec![
+                    "Conversation five: colors.".to_owned(),
+                    "Conversation six: animals.".to_owned(),
+                ],
+                steps: vec![
+                    step(0, TURN1, Shares::Any, false),
+                    step(1, OTHER, Shares::Any, false),
+                    step(0, TURN2, Shares::Elsewhere, false),
+                ],
+                kwargs: off,
+                max_tokens: TURN_PREDICT,
+                ignore_eos: false,
+                past_window: false,
+            },
+        ];
         let mut ok = true;
-        check(&mut ok, "chat_turn1_is_its_completion", same_turn1);
-        check(
-            &mut ok,
-            "chat_turn2_cache_n",
-            want > p1.len() && t["cache_n"] == json!(want),
-        );
-        check(
-            &mut ok,
-            "chat_turn2_counts",
-            t["prompt_n"] == json!(p2.len() - want)
-                && u["prompt_tokens"] == json!(p2.len())
-                && u["prompt_tokens_details"]["cached_tokens"] == json!(want),
-        );
-        check(
-            &mut ok,
-            "chat_turn2_answer_is_fresh",
-            warm["choices"][0]["message"] == fresh["choices"][0]["message"]
-                && warm["usage"]["completion_tokens"] == fresh["usage"]["completion_tokens"]
-                && fresh["timings"]["cache_n"] == json!(0),
-        );
+        for s in &scripts {
+            ok &= converse(url, rules, &mut ledger, s)?;
+        }
         Ok(ok)
     }
 
@@ -469,8 +766,11 @@ mod gate {
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
         let reference = gen_tokens(&a.gen_log)?;
-        let ratios = file_ratios()?;
-        println!("compression ratios {ratios:?}");
+        let rules = file_rules()?;
+        println!(
+            "compression ratios {:?}, raw window {}",
+            rules.ratios, rules.window
+        );
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served::exe()?;
         let err_log = a.dir.join("server.err");
@@ -588,24 +888,27 @@ mod gate {
             ids_of(&again["tokens"]) == first,
         );
         // Right after itself: the cache holds the prompt and all but the last
-        // generated id, and the prompt keeps n − 1 of its n ids at most.
-        let held = a.ids.len() + ids_of(&again["tokens"]).len() - 1;
+        // generated id, so the prompt shares all n of its ids and the last is
+        // evaluated again. The cut at n − 1 is at its prompt call's end, past
+        // any hole: at least n − 1 in whole compression groups is kept.
+        let n = a.ids.len();
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let repeat = json_of("/completion", st, &body)?;
-        let want = kept(a.ids.len() - 1, held, &ratios);
+        let floor = whole_groups(n - 1, &rules.ratios);
+        let t = &repeat["timings"];
         println!(
-            "completion repeated {:?} cache_n={} prompt_n={} (n {}, cache held {held}, kept {want})",
+            "completion repeated {:?} cache_n={} prompt_n={} (n {n}, at least {floor} kept)",
             ids_of(&repeat["tokens"]),
-            repeat["timings"]["cache_n"],
-            repeat["timings"]["prompt_n"],
-            a.ids.len()
+            t["cache_n"],
+            t["prompt_n"],
         );
+        let (cache_n, prompt_n) = (as_count(&t["cache_n"]), as_count(&t["prompt_n"]));
         check(
             &mut ok,
             "repeat_cache_n",
-            want > 0
-                && repeat["timings"]["cache_n"] == json!(want)
-                && repeat["timings"]["prompt_n"] == json!(a.ids.len() - want),
+            floor > 0
+                && cache_n.is_some_and(|c| (floor..n).contains(&c))
+                && cache_n.zip(prompt_n).is_some_and(|(c, p)| c + p == n),
         );
         check(
             &mut ok,
@@ -686,7 +989,7 @@ mod gate {
             );
         }
 
-        ok &= two_turns(&url, &ratios)?;
+        ok &= conversations(&url, &rules)?;
 
         println!("server stopped: {}", served.stop()?);
         if ok {
