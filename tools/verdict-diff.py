@@ -27,6 +27,14 @@ that prints its own timings shows them in neither text. A source location (`file
 in a panic message) is masked too — a change that moves code moves it. Two parallel tests that
 write at once can splice a line; such a step reads DIFFERS on the spliced line, and the masked
 texts beside the report show it.
+
+A `ptx-scan` output names how its md5 block was computed (`ptx-scan-md5: method=<m>`; a block with
+no method comes from an older rule set). Digests of two methods do not compare, so a step whose two
+sides carry different methods — one of them possibly no method (an old scan) — is REFUSED by name,
+with both methods printed, never read as DIFFERS; the exit code is then 2. Two sides of one method
+compare as any other step.
+
+  verdict-diff.py --self-test   the method refusal and the plain comparison against small cases
 """
 import difflib
 import os
@@ -97,7 +105,36 @@ def read(path):
         return None
 
 
+NO_METHOD = 'no method (an old scan)'
+
+
+def scan_methods(text):
+    """The digest methods of the `ptx-scan-md5:` blocks in a step's output, in order: a block's
+    `method=` value, or NO_METHOD for a block from before the method was named."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith('ptx-scan-md5:'):
+            m = re.fullmatch(r'ptx-scan-md5:(?: method=(\S+))?\s*', line)
+            out.append(m.group(1) or NO_METHOD if m else f'unreadable ({line.strip()})')
+    return out
+
+
+def method_refusal(a_text, b_text):
+    """Why two sides' md5 blocks do not compare, or None: both sides carry md5 blocks and their
+    methods differ."""
+    ma, mb = scan_methods(a_text), scan_methods(b_text)
+    if not ma or not mb or ma == mb:
+        return None
+    return (f'REFUSED: md5 blocks of two methods — A {", ".join(ma)}, B {", ".join(mb)}; rescan the older '
+            'binary with the newer tree\'s tools/ptx-scan.sh and extractor')
+
+
 def compare_pair(name, a_text, b_text, a_rc, b_rc, keep, ordered, width=12):
+    """Print one step's verdict: True identical, False differs, None refused (two digest methods)."""
+    why = method_refusal(a_text, b_text)
+    if why:
+        print(f'{name:28s} rc A={a_rc} B={b_rc}  {why}')
+        return None
     a, b = normalize(a_text, ordered), normalize(b_text, ordered)
     if keep:
         os.makedirs(keep, exist_ok=True)
@@ -135,12 +172,13 @@ def compare(args):
     if os.path.isfile(a) and os.path.isfile(b):
         name = os.path.basename(b)
         ok = compare_pair(name, read(a), read(b), '-', '-', os.path.join(os.path.dirname(b), '_compare'), ordered)
-        return 0 if ok else 1
+        return 2 if ok is None else 0 if ok else 1
     if not steps:
         have_a = {f[:-4] for f in os.listdir(a) if f.endswith('.out')}
         have_b = {f[:-4] for f in os.listdir(b) if f.endswith('.out')}
         steps = sorted(have_a | have_b)
     ok = True
+    refused = False
     for s in steps:
         s = s.replace(':', '-')
         ta, tb = read(os.path.join(a, f'{s}.out')), read(os.path.join(b, f'{s}.out'))
@@ -150,8 +188,10 @@ def compare(args):
             continue
         ra = (read(os.path.join(a, f'{s}.rc')) or '?').strip()
         rb = (read(os.path.join(b, f'{s}.rc')) or '?').strip()
-        ok &= compare_pair(s, ta, tb, ra, rb, os.path.join(b, '_compare'), ordered)
-    return 0 if ok else 1
+        verdict = compare_pair(s, ta, tb, ra, rb, os.path.join(b, '_compare'), ordered)
+        refused |= verdict is None
+        ok &= bool(verdict)
+    return 2 if refused else 0 if ok else 1
 
 
 def tree_path(t):
@@ -219,7 +259,43 @@ def run(args):
     return compare([os.path.join(out, 'A'), os.path.join(out, 'B')] + [s.replace(':', '-') for s in steps])
 
 
+def self_test():
+    """Two scans of one method compare; of two methods, or one with no method, are refused."""
+    import contextlib
+    import io
+    import tempfile
+    fails = []
+    head = 'ptx-scan bin=target/release/x modules=1\nentry reqntid\nalpha 256\n'
+    scan = lambda md5_line, digest: f'{head}{md5_line}\nalpha {digest} 9\n'
+    cases = [
+        ('one method, same digests', scan('ptx-scan-md5: method=decl1', 'a' * 32),
+         scan('ptx-scan-md5: method=decl1', 'a' * 32), 0, 'identical'),
+        ('one method, a moved digest', scan('ptx-scan-md5: method=decl1', 'a' * 32),
+         scan('ptx-scan-md5: method=decl1', 'b' * 32), 1, 'DIFFERS'),
+        ('two methods', scan('ptx-scan-md5: method=decl1', 'a' * 32),
+         scan('ptx-scan-md5: method=decl2', 'b' * 32), 2, 'REFUSED: md5 blocks of two methods — A decl1, B decl2'),
+        ('one side an old scan', scan('ptx-scan-md5:', 'a' * 32),
+         scan('ptx-scan-md5: method=decl1', 'b' * 32), 2, f'A {NO_METHOD}, B decl1'),
+        ('two old scans', scan('ptx-scan-md5:', 'a' * 32), scan('ptx-scan-md5:', 'a' * 32), 0, 'identical'),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        for what, ta, tb, want_rc, want_text in cases:
+            pa, pb = os.path.join(tmp, 'a.log'), os.path.join(tmp, 'b.log')
+            open(pa, 'w').write(ta)
+            open(pb, 'w').write(tb)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = compare([pa, pb])
+            if rc != want_rc or want_text not in out.getvalue():
+                fails.append(f'{what}: rc {rc} (want {want_rc}), output {out.getvalue()!r}')
+    for f in fails:
+        print(f'self-test FAIL: {f}', file=sys.stderr)
+    print(f'verdict-diff self-test: {"FAIL" if fails else "ok"} ({len(cases)} cases, {len(fails)} failures)')
+    return 1 if fails else 0
+
+
 def main(argv):
+    if argv == ['--self-test']:
+        return self_test()
     if argv[:1] == ['run']:
         return run(argv[1:])
     if argv[:1] == ['compare']:

@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """Are two builds of a PTX entry the same program? The canonical diff of an entry's body.
 
-`tools/ptx-scan.sh` prints, per entry, the md5 of its body with every register, label and generated
-symbol number deleted (`ptx::normalize` in crates/gpu-gates/src/ptx.rs). That digest is stable
-across the backend's free numbering, and blind to which register an operand names: a rewired
-operand or a retargeted branch keeps it. This script renumbers instead of deleting: each register
-class, the block labels and each generated-symbol stem are numbered in order of first appearance
-inside the entry, so two bodies compare equal only when they are the same instruction stream over
-the same dataflow, whatever absolute numbers the backend chose. When a deletion moves a live
-entry's md5, this says whether the program moved with it.
+`tools/ptx-scan.sh` prints, per entry, the md5 of its body with every register, label and local
+depot number deleted and every generated module symbol replaced by its declaration's signature
+(`ptx::normalize` in crates/gpu-gates/src/ptx.rs). That digest is stable across the backend's free
+numbering, and blind to which register an operand names: a rewired operand or a retargeted branch
+keeps it. This script renumbers instead of deleting: each register class, the block labels and the
+local depots are numbered in order of first appearance inside the entry, so two bodies compare equal
+only when they are the same instruction stream over the same dataflow, whatever absolute numbers the
+backend chose. When a deletion moves a live entry's md5, this says whether the program moved with it.
+
+A generated module symbol — a whole token starting with `__shared_mem_`, `__device_global_` or
+`__dynamic_smem_`, whatever the backend put after the stem (a crate hash, a number, a kernel name) —
+is written as `<stem><<signature>>#k`, the rule `ptx::normalize` applies: the signature is the
+symbol's declaration in its module with the name taken out (linkage, state space, alignment, type,
+dimensions, and `= #<FNV-1a 64 of the initializer>`), k its order of first appearance among the
+entry's generated symbols. So a renumbering or reordering of the module's declarations, or a new
+crate hash, compares identical, and a changed declaration of a symbol the entry names does not. A
+generated symbol its module does not declare, one declared twice, or a declaration line this reader
+does not parse is refused by name (exit 2). Every other symbol is kept by name.
 
   ptx-canon.py [-U N] BASE.ptx NEW.ptx ENTRY[:NEW_ENTRY]...
   ptx-canon.py [-U N] --all BASE.ptx NEW.ptx
+  ptx-canon.py --scans BASE.scan NEW.scan
+  ptx-canon.py --self-test
 
 For each entry it prints the unified diff of the two canonical bodies (N lines of context, default
 3) and one verdict line:
@@ -25,6 +37,13 @@ the ones only one file has (`only in base`, `only in new`: a deleted or an added
 count line. Exit 0 when every compared entry is identical or reordered-only with every swapped pair
 independent (below), 1 when one differs or its reorder is not shown independent, 2 on a usage error
 or a named entry that a file does not hold.
+
+--scans compares two saved `tools/ptx-scan.sh` outputs (stdout, or stdout and stderr together): the
+table rows by entry, column by column, and the md5 block by entry. Two md5 blocks compare only under
+one digest method — the `method=` of their `ptx-scan-md5:` line; a block with no method comes from an
+older rule set — and a pair whose methods differ is refused by name (exit 2): rescan the older binary
+with this tree's tools. A failed scan is refused too. Exit 0 when both scans hold the same entries,
+every row and every md5 equal, 1 otherwise, with the moved rows and digests listed.
 
 `reordered-only` is a same-multiset result, not by itself a proof. Its line therefore also checks
 every pair of lines whose relative order changed: the pair is independent when the two lines share
@@ -59,8 +78,13 @@ import sys
 
 # The register classes the backend numbers (`ptx::normalize`'s REG_CLASSES).
 REG_CLASSES = {"r", "rd", "rs", "f", "fd", "p", "h", "hh", "rq"}
-# Generated symbols whose number means nothing (`ptx::normalize`'s NUMBERED_STEMS).
-NUMBERED_STEMS = ("__shared_mem_", "__local_depot", "__device_global_")
+# Entry-local generated symbols whose number means nothing (`ptx::normalize`'s NUMBERED_STEMS).
+NUMBERED_STEMS = ("__local_depot",)
+# Generated module symbols, replaced by their declaration's signature (`ptx::GENERATED_STEMS`).
+GENERATED_STEMS = ("__shared_mem_", "__device_global_", "__dynamic_smem_")
+# What a module-scope declaration opens with (`ptx.rs`'s DECL_OPENERS).
+DECL_OPENERS = (".visible", ".extern", ".weak", ".common", ".shared", ".global", ".const")
+STATE_SPACES = {".shared", ".global", ".const"}
 # Opcodes whose only effect is their destination registers: a line of one of these may swap with
 # another such line that shares no register with it.
 PURE = {
@@ -94,14 +118,66 @@ def body(text, name):
     return lines
 
 
+def fnv1a64(data):
+    """FNV-1a, 64 bits, of a str's UTF-8 bytes: the initializer digest (`ptx.rs`'s fnv1a64)."""
+    h = 0xcbf29ce484222325
+    for b in data.encode():
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def declaration(raw):
+    """(name, signature) of the generated symbol a line declares, None for any other line. Refused
+    for a line that opens like a declaration and names a generated symbol but is not
+    `<directives> <name>[dims] [= init];` on one line (`ptx.rs`'s `declaration`)."""
+    code = raw.split("//", 1)[0].strip()
+    if not any(code.startswith(o) and code[len(o):len(o) + 1] in (" ", "\t") for o in DECL_OPENERS):
+        return None
+    m = next((m for m in IDENT.finditer(code) if m.group(0).startswith(GENERATED_STEMS)), None)
+    if m is None:
+        return None
+    name = m.group(0)
+    head, tail = code[:m.start()], code[m.end():]
+    words = head.split()
+    if not all(w.startswith(".") or w.isdigit() for w in words) or not STATE_SPACES & set(words):
+        raise Refused(f"declaration of {name} does not open with directives naming a state space: "
+                      f"{code}")
+    if not tail.endswith(";"):
+        raise Refused(f"declaration of {name} does not end on its line with `;`: {code}")
+    dims, eq, init = tail[:-1].partition("=")
+    dims = "".join(dims.split())
+    init = " ".join(init.split())
+    if not re.fullmatch(r"(\[\d*\])*", dims) or (eq and not init):
+        raise Refused(f"declaration of {name} has dimensions or an initializer this reader does not "
+                      f"parse: {code}")
+    sig = " ".join(words) + (f" {dims}" if dims else "") + (f" = #{fnv1a64(init):016x}" if eq else "")
+    return name, sig
+
+
+def declarations(text, path):
+    """{name: signature} of every generated symbol the module text declares; refused when one is
+    declared twice."""
+    out = {}
+    for line in text.split("\n"):
+        d = declaration(line)
+        if d is None:
+            continue
+        if d[0] in out:
+            raise Refused(f"{path} declares {d[0]} twice")
+        out[d[0]] = d[1]
+    return out
+
+
 def entries(text):
     """Every `.visible .entry` name in the text, in declaration order."""
     return re.findall(r"\.visible \.entry ([A-Za-z0-9_$]+)\(", text)
 
 
-def canon(lines, name):
-    """The body's lines with comments cut, whitespace runs collapsed, empty lines dropped, and every
-    numbered register, block label and generated symbol renumbered by first appearance."""
+def canon(lines, name, decls):
+    """The body's lines with comments cut, whitespace runs collapsed, empty lines dropped, every
+    numbered register, block label and local depot renumbered by first appearance, and every
+    generated module symbol written as its declaration's signature (`decls`, the module's
+    `declarations`) with its order of first appearance."""
     seen = {}
     count = {}
 
@@ -146,6 +222,12 @@ def canon(lines, name):
                 i = m.end()
                 if LABEL.match(tok):
                     res.append(f"$L#{number('$L', tok)}")
+                    continue
+                gen = next((s for s in GENERATED_STEMS if tok.startswith(s)), None)
+                if gen:
+                    if tok not in decls:
+                        raise Refused(f"entry {name} names {tok}, which its module does not declare")
+                    res.append(f"{gen}<{decls[tok]}>#{number('gen', tok)}")
                     continue
                 stem = next((s for s in NUMBERED_STEMS
                              if tok.startswith(s) and tok[len(s):].isdigit()), None)
@@ -212,15 +294,16 @@ def moved_pairs(a, b):
     return pairs, len(wa)
 
 
-def compare(base_text, new_text, base_name, new_name, base_path, new_path, context):
+def compare(base, new, base_name, new_name, context):
     """Print one entry's diff and verdict line; return the verdict word and whether it fails the
-    run (`differs`, or a reorder not shown independent)."""
+    run (`differs`, or a reorder not shown independent). `base` and `new` are (path, text, decls)."""
+    (base_path, base_text, base_decls), (new_path, new_text, new_decls) = base, new
     ba, bb = body(base_text, base_name), body(new_text, new_name)
     if ba is None:
         raise Refused(f"{base_path} holds no entry {base_name}")
     if bb is None:
         raise Refused(f"{new_path} holds no entry {new_name}")
-    a, b = canon(ba, base_name), canon(bb, new_name)
+    a, b = canon(ba, base_name, base_decls), canon(bb, new_name, new_decls)
     label = base_name if base_name == new_name else f"{base_name}:{new_name}"
     if a == b:
         print(f"ptx-canon: {label} identical ({len(a)} lines)")
@@ -257,8 +340,206 @@ def read(path):
         raise Refused(f"cannot read {path}: {e}") from e
 
 
+def parse_scan(path):
+    """A saved ptx-scan output: (method, {entry: row fields}, {entry: (md5, lines)}). `method` is
+    the md5 line's `method=` value, or `none` for a block from before the method was named."""
+    text = read(path)
+    banner = next((l for l in text.split("\n") if l.startswith("ptx-scan bin=")), None)
+    if banner is None:
+        raise Refused(f"{path} holds no ptx-scan banner line")
+    if banner.endswith("scan=failed"):
+        raise Refused(f"{path} is a failed scan: {banner}")
+    rows, md5, method, header, state = {}, {}, None, None, None
+    for line in text.split("\n"):
+        f = line.split()
+        if line.startswith("entry ") and header is None:
+            header, state = f, "rows"
+        elif line.startswith("ptx-scan-md5:"):
+            m = re.fullmatch(r"ptx-scan-md5:(?: method=(\S+))?", line.strip())
+            if m is None:
+                raise Refused(f"{path}: an md5 header this reader does not parse: {line}")
+            method, state = m.group(1) or "none", "md5"
+        elif state == "rows" and len(f) == len(header):
+            rows[f[0]] = f[1:]
+        elif state == "md5" and len(f) == 3 and re.fullmatch(r"[0-9a-f]{32}", f[1]):
+            md5[f[0]] = (f[1], f[2])
+        else:
+            state = None
+    if header is None or method is None:
+        raise Refused(f"{path} holds no table header or no md5 block")
+    return method, header, rows, md5
+
+
+def compare_scans(base_path, new_path):
+    """Print the entries, rows and digests two scans do not share; return whether any moved."""
+    bm, header, br, b5 = parse_scan(base_path)
+    nm, _, nr, n5 = parse_scan(new_path)
+    if bm != nm:
+        raise Refused(f"{base_path} digests are method {bm} and {new_path}'s are method {nm}: md5 "
+                      "blocks of two methods do not compare; rescan the older binary with this "
+                      "tree's tools/ptx-scan.sh and extractor")
+    only_b, only_n = sorted(set(br) - set(nr)), sorted(set(nr) - set(br))
+    common = sorted(set(br) & set(nr))
+    rows_moved = [e for e in common if br[e] != nr[e]]
+    md5_common = sorted(set(b5) & set(n5))
+    md5_moved = [e for e in md5_common if b5[e] != n5[e]]
+    print(f"ptx-canon: scans method={bm} entries base={len(br)} new={len(nr)} "
+          f"only-base={len(only_b)} only-new={len(only_n)}")
+    for e in only_b:
+        print(f"ptx-canon: {e} only in base")
+    for e in only_n:
+        print(f"ptx-canon: {e} only in new")
+    print(f"ptx-canon: table rows identical={len(common) - len(rows_moved)} moved={len(rows_moved)}")
+    for e in rows_moved:
+        cols = " ".join(f"{h}:{a}->{b}" for h, a, b in zip(header[1:], br[e], nr[e]) if a != b)
+        print(f"ptx-canon: row-moved {e} {cols}")
+    print(f"ptx-canon: md5 identical={len(md5_common) - len(md5_moved)} moved={len(md5_moved)}")
+    for e in md5_moved:
+        print(f"ptx-canon: md5-moved {e} lines {b5[e][1]} -> {n5[e][1]}")
+    return bool(only_b or only_n or rows_moved or md5_moved or set(b5) ^ set(n5))
+
+
+SELF_MODULE = """.version 8.7
+.target sm_86
+{decls}
+.global .align 1 .b8 _$_str[4] = {{97, 98, 99, 0}};
+
+.visible .entry alpha(
+\t.param .u64 alpha_param_0
+)
+{{
+\tld.global.nc.u32 \t%r1, [{g}+4];
+\tst.shared.b32 \t[{s2}], %r1;
+\tst.shared.b32 \t[{s3}+4], %r1;
+\tld.shared.b32 \t%r2, [{dy}];
+\tmov.u64 \t%rd1, _$_str;
+\tret;
+}}
+.visible .entry beta(
+)
+{{
+\tld.shared.b32 \t%r1, [{s5}];
+\tret;
+}}
+"""
+SELF_PLAIN = ("__device_global_4", "__shared_mem_2", "__shared_mem_3", "__shared_mem_5",
+              "__dynamic_smem_alpha")
+
+
+def self_module(names=SELF_PLAIN, order=(0, 1, 2, 3, 4), sizes=(8, 256, 256, 64)):
+    """The self-test's module, the twin of ptx.rs's test `module`."""
+    g, s2, s3, s5, dy = names
+    decls = [f".visible .global .align 4 .b8 {g}[{sizes[0]}] = {{1, 2, 3, 4, 5, 6, 7, 8}};",
+             f".visible .shared .align 4 .b8 {s2}[{sizes[1]}];",
+             f".visible .shared .align 4 .b8 {s3}[{sizes[2]}];",
+             f".visible .shared .align 4 .b8 {s5}[{sizes[3]}];",
+             f".extern .shared .align 16 .b8 {dy}[];"]
+    return SELF_MODULE.format(decls="\n".join(decls[i] for i in order), g=g, s2=s2, s3=s3, s5=s5,
+                              dy=dy)
+
+
+def self_test():
+    """The declaration rule and the scan comparison against small cases; prints one line."""
+    import contextlib
+    import io
+    import os
+    import tempfile
+    fails = []
+
+    def expect(ok, what):
+        if not ok:
+            fails.append(what)
+
+    def canons(text):
+        d = declarations(text, "self")
+        return [canon(body(text, e), e, d) for e in entries(text)]
+
+    def refused(fn):
+        try:
+            fn()
+        except Refused as e:
+            return str(e)
+        return None
+
+    plain = canons(self_module())
+    hashed = ("__device_global_0123456789abcdef_4", "__shared_mem_0123456789abcdef_2",
+              "__shared_mem_0123456789abcdef_3", "__shared_mem_0123456789abcdef_5",
+              "__dynamic_smem_0123456789abcdef_alpha")
+    expect(canons(self_module(hashed)) == plain, "a hashed name canonicalizes like the plain one")
+    expect(any(l == "st.shared.b32 [__shared_mem_<.visible .shared .align 4 .b8 [256]>#2], %r#1;"
+               for l in plain[0]), f"the signature form: {plain[0]}")
+    expect(any("[8] = #187158eaeba8f101>#1+4]" in l for l in plain[0]),
+           "the initializer digest is ptx.rs's FNV-1a 64")
+    renumbered = ("__device_global_0", "__shared_mem_9", "__shared_mem_1", "__shared_mem_2",
+                  "__dynamic_smem_alpha")
+    expect(canons(self_module(renumbered, (4, 3, 0, 2, 1))) == plain,
+           "renumbered and reordered declarations canonicalize alike")
+    resized = canons(self_module(sizes=(8, 256, 256, 128)))
+    expect(resized[0] == plain[0] and resized[1] != plain[1], "a resized declaration moves its user")
+    swapped = canons(self_module().replace("__shared_mem_3[256]", "__shared_mem_X[256]")
+                     .replace("__shared_mem_5[64]", "__shared_mem_3[64]")
+                     .replace("__shared_mem_X[256]", "__shared_mem_5[256]"))
+    expect(swapped[0] != plain[0] and swapped[1] != plain[1],
+           "declarations swapped under their references move both users")
+    merged = canons(self_module().replace("[__shared_mem_3+4]", "[__shared_mem_2+4]"))
+    expect(merged[0] != plain[0] and merged[1] == plain[1], "two references merged into one move")
+    expect(canons(self_module().replace("_$_str;", "_$_str_$_2;"))[0] != plain[0],
+           "a symbol that is not generated is kept by name")
+    msg = refused(lambda: canons(self_module().replace(".b8 __shared_mem_5[64]",
+                                                       ".b8 __shared_mem_6[64]")))
+    expect(msg is not None and "entry beta names __shared_mem_5" in msg, f"undeclared: {msg}")
+    msg = refused(lambda: canons(self_module() + ".visible .shared .align 4 .b8 __shared_mem_5[64];\n"))
+    expect(msg is not None and "declares __shared_mem_5 twice" in msg, f"twice: {msg}")
+    for bad in (".visible .global .align 4 .b8 __device_global_7[8] = {1, 2,",
+                ".visible .align 4 .b8 __shared_mem_7[8];",
+                ".visible .shared .align 4 .b8 __shared_mem_7[x];"):
+        msg = refused(lambda: canons(bad + "\n" + self_module()))
+        expect(msg is not None and "_7" in msg, f"unparsed declaration {bad!r}: {msg}")
+
+    row = "{e:<28} 256 no 0 0 1 0 12 0 0 16 12 0"
+    def scan(md5_line, rows):
+        lines = ["ptx-scan bin=target/release/x section=.oxart bytes=1 modules=1",
+                 "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill "
+                 "blk/SM(static) jit_regs jit_local"]
+        lines += [row.format(e=e) for e in rows]
+        lines += [md5_line] + [f"{e} {h} 9" for e, h in rows.items()]
+        return "\n".join(lines) + "\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        def put(name, text):
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return path
+        h1, h2 = "0" * 32, "1" * 32
+        a = put("a", scan("ptx-scan-md5: method=decl1", {"alpha": h1, "beta": h1}))
+        b = put("b", scan("ptx-scan-md5: method=decl1", {"alpha": h1, "beta": h2}))
+        old = put("old", scan("ptx-scan-md5:", {"alpha": h1, "beta": h1}))
+        other = put("other", scan("ptx-scan-md5: method=decl2", {"alpha": h1, "beta": h1}))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            same = compare_scans(a, a)
+            moved = compare_scans(a, b)
+        expect(not same and moved and "md5-moved beta" in out.getvalue(),
+               f"scans compare by entry: {out.getvalue()!r}")
+        for x in (old, other):
+            msg = refused(lambda: compare_scans(a, x))
+            expect(msg is not None and "do not compare" in msg, f"two methods refused: {msg}")
+        failed = put("failed", "ptx-scan bin=target/release/x missing scan=failed\n")
+        msg = refused(lambda: compare_scans(a, failed))
+        expect(msg is not None and "failed scan" in msg, f"a failed scan refused: {msg}")
+    for f in fails:
+        print(f"self-test FAIL: {f}", file=sys.stderr)
+    print(f"ptx-canon self-test: {'FAIL' if fails else 'ok'} ({len(fails)} failures)")
+    return 1 if fails else 0
+
+
 def main(argv):
     args = list(argv)
+    if args == ["--self-test"]:
+        return self_test()
+    if args[:1] == ["--scans"]:
+        if len(args) != 3:
+            raise Refused("usage: ptx-canon.py --scans BASE.scan NEW.scan")
+        return int(compare_scans(args[1], args[2]))
     context = 3
     if args[:1] == ["-U"]:
         if len(args) < 2 or not args[1].isdigit():
@@ -270,16 +551,19 @@ def main(argv):
         args = args[1:]
     if len(args) < 2 or (everything and len(args) != 2) or (not everything and len(args) < 3):
         raise Refused("usage: ptx-canon.py [-U N] BASE.ptx NEW.ptx ENTRY[:NEW_ENTRY]... | "
-                      "ptx-canon.py [-U N] --all BASE.ptx NEW.ptx")
+                      "ptx-canon.py [-U N] --all BASE.ptx NEW.ptx | "
+                      "ptx-canon.py --scans BASE.scan NEW.scan | ptx-canon.py --self-test")
     base_path, new_path = args[0], args[1]
     base_text, new_text = read(base_path), read(new_path)
+    base = (base_path, base_text, declarations(base_text, base_path))
+    new = (new_path, new_text, declarations(new_text, new_path))
     rc = 0
     if everything:
         in_base, in_new = entries(base_text), entries(new_text)
         shared = [n for n in in_base if n in set(in_new)]
         tally = {"identical": 0, "reordered-only": 0, "differs": 0}
         for name in shared:
-            verdict, fails = compare(base_text, new_text, name, name, base_path, new_path, context)
+            verdict, fails = compare(base, new, name, name, context)
             tally[verdict] += 1
             rc |= fails
         only_base = [n for n in in_base if n not in set(in_new)]
@@ -294,8 +578,7 @@ def main(argv):
         return rc
     for spec in args[2:]:
         base_name, _, new_name = spec.partition(":")
-        _, fails = compare(base_text, new_text, base_name, new_name or base_name, base_path,
-                           new_path, context)
+        _, fails = compare(base, new, base_name, new_name or base_name, context)
         rc |= fails
     return rc
 

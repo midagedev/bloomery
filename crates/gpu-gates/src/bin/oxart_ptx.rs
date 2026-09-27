@@ -7,24 +7,24 @@
 //! with the parser's reason. `tools/ptx-scan.sh` reads nothing else.
 //!
 //! `oxart_ptx --norm <section.bin> <dir>` does the same and also writes
-//! `<dir>/norm/<entry>` for every entry: its body through `ptx::normalize`,
-//! the text the scan's digest is the md5 of. What it prints is unchanged.
+//! `<dir>/norm/<entry>` for every entry: its body through `ptx::normalize`
+//! against its module's declarations, the text the scan's digest is the md5
+//! of, and `<dir>/norm-method`, the name of that rule set
+//! (`ptx::DIGEST_METHOD`). What it prints is unchanged.
 //!
-//! `oxart_ptx --norm-dump <entry> <file>` prints the normalized body of a
-//! saved single-entry dump: a file that opens with the entry's `.visible
-//! .entry <entry>(` line and ends where its body ends. The bytes after that
-//! opening line go through `ptx::normalize` as the entry's body.
+//! `oxart_ptx --norm-ptx <module.ptx> <dir>` writes the same `norm/<entry>`
+//! files and `norm-method` for a saved module (a `mod<N>.ptx` of the above,
+//! or an edited copy of one): the digest of a module that is not in a
+//! binary.
 //!
 //! Host-only: no device code, and the package's device dependency sits
 //! behind the `gpu` feature, so plain `cargo build --release -p
 //! bloomery-gpu-gates --bin oxart_ptx` builds it with no device crate.
 
 use bloomery_gpu_gates::{GateError, exit_with, ptx};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str =
-    "usage: oxart_ptx [--norm] <section.bin> <out-dir> | oxart_ptx --norm-dump <entry> <file>";
+const USAGE: &str = "usage: oxart_ptx [--norm] <section.bin> <out-dir> | oxart_ptx --norm-ptx <module.ptx> <out-dir>";
 
 fn main() -> std::process::ExitCode {
     exit_with("oxart_ptx", run())
@@ -35,7 +35,7 @@ fn run() -> Result<(), GateError> {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [section, dir] => extract(Path::new(section), Path::new(dir), false),
         ["--norm", section, dir] => extract(Path::new(section), Path::new(dir), true),
-        ["--norm-dump", entry, file] => norm_dump(entry, Path::new(file)),
+        ["--norm-ptx", module, dir] => norm_ptx(Path::new(module), Path::new(dir)),
         _ => Err(USAGE.into()),
     }
 }
@@ -52,28 +52,30 @@ fn extract(section: &Path, dir: &Path, norm: bool) -> Result<(), GateError> {
         println!("mod{n} bundle={} bytes={}", m.bundle(), m.text().len());
     }
     if norm {
-        let out = dir.join("norm");
-        std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
-        for name in ptx::entries(&modules) {
-            let body = ptx::body(&modules, &name).ok_or_else(|| format!("no body for {name}"))?;
-            let path: PathBuf = out.join(&name);
-            std::fs::write(&path, ptx::normalize(&name, body))
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-        }
+        write_norm(&modules, dir)?;
     }
     Ok(())
 }
 
-/// The normalized body of a saved single-entry dump, on stdout.
-fn norm_dump(entry: &str, file: &Path) -> Result<(), GateError> {
-    let text = std::fs::read(file).map_err(|e| format!("read {}: {e}", file.display()))?;
-    let head = format!(".visible .entry {entry}(");
-    let body = text
-        .trim_ascii_start()
-        .strip_prefix(head.as_bytes())
-        .ok_or_else(|| format!("{} does not open with `{head}`", file.display()))?;
-    std::io::stdout()
-        .write_all(&ptx::normalize(entry, body))
-        .map_err(|e| format!("write stdout: {e}"))?;
+/// `<dir>/norm/<entry>` for every entry of `modules`, and `<dir>/norm-method`.
+fn write_norm(modules: &[ptx::Module<'_>], dir: &Path) -> Result<(), GateError> {
+    let out = dir.join("norm");
+    std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
+    let decls = ptx::module_decls(modules)?;
+    for name in ptx::entries(modules) {
+        let path: PathBuf = out.join(&name);
+        std::fs::write(&path, ptx::normalized(modules, &decls, &name)?)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+    let method = dir.join("norm-method");
+    std::fs::write(&method, format!("{}\n", ptx::DIGEST_METHOD))
+        .map_err(|e| format!("write {}: {e}", method.display()))?;
     Ok(())
+}
+
+/// The normalized bodies of a saved module file.
+fn norm_ptx(file: &Path, dir: &Path) -> Result<(), GateError> {
+    let text = std::fs::read(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let name = file.display().to_string();
+    write_norm(&[ptx::Module::saved(&name, &text)], dir)
 }
