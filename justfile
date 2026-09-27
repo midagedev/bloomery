@@ -544,6 +544,12 @@ gate-gpu-gemm *ARGS:
 gate-gpu-linear:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear'
 
+# Qwen3.6-35B-A3B full-attention 카드 커널 — rope-256(q/k 노름 + 앞 64차원 NEOX), 디코드 flash 256(두 패스),
+# 프리필 flash 256, 게이트 접은 o-proj 양자화기 — 을 모델 없이 16/2×256, n_rot 64, θ 1e7 합성 입력으로 호스트 규칙에 맞추고,
+# ik 배치 세트의 층 3 탭 넷과 비교한다.
+gate-gpu-qwen35moe-attn:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_attn'
+
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
