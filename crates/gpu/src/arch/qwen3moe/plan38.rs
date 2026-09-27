@@ -16,10 +16,11 @@ use super::router::RouterDims;
 use crate::linear::{self, KHeadMap, LinearShape};
 use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, flash_gqa, ple, q38, qsa};
+use model::arch::coverage::turns_as_neox;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{
     Act, DeltaKind, Extra, Ffn, GdnGate, Gqa, HcKind, KHeadMap as SpecMap, Mixer, ModelSpec,
-    NgramRule, PoolRule, Residual, RopeMode, Score, Selector,
+    NgramRule, PoolRule, Residual, Score, Selector,
 };
 
 /// What the plan's refusals name.
@@ -202,10 +203,21 @@ pub(super) enum Kind38 {
     Qsa,
 }
 
-/// The chain's shape from `spec`: every layer's kind, the router's
-/// instance, the rope base, and the PLE site's layer. A layer, a width or a
-/// rule the kernels are not built for is refused by name with its layer.
-pub(super) fn read(spec: &ModelSpec) -> Result<(Vec<Kind38>, RouterDims, f32, usize), GpuError> {
+/// The chain's shape a description gives ([`read`]).
+pub(super) struct Shape38 {
+    /// Every layer's kind.
+    pub(super) kinds: Vec<Kind38>,
+    /// The router's instance.
+    pub(super) router: RouterDims,
+    /// The rope base.
+    pub(super) base: f32,
+    /// The PLE site's layer.
+    pub(super) ple: usize,
+}
+
+/// The chain's shape from `spec`. A layer, a width or a rule the kernels are
+/// not built for is refused by name with its layer.
+pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
     let hc_ok = spec.hc.is_some_and(|h| {
         h.streams as usize == geo::STREAMS
             && matches!(h.kind, HcKind::Gated { rank } if rank as usize == geo::RANK)
@@ -348,23 +360,18 @@ pub(super) fn read(spec: &ModelSpec) -> Result<(Vec<Kind38>, RouterDims, f32, us
     ))?;
     let ple = ple.ok_or(GpuError::shape(WHAT, "no PLE site on any layer"))?;
     let router = router.ok_or(GpuError::shape(WHAT, "no layer"))?;
-    Ok((kinds, router, base, ple))
+    Ok(Shape38 {
+        kinds,
+        router,
+        base,
+        ple,
+    })
 }
 
 /// Whether `g` is the selecting gated attention the kernels run.
 fn gqa_fits(g: &Gqa) -> bool {
     let rope_ok = |r: &model::arch::models::Rope| {
-        let pairs = match r.mode {
-            RopeMode::Neox => true,
-            // A text-only position gives every section the same position, so
-            // the sections' pairs turn as NEOX's when they cover the rotated
-            // values' pairs.
-            RopeMode::Imrope { sections } => {
-                sections.iter().map(|&s| u64::from(s)).sum::<u64>() == u64::from(r.dims / 2)
-            }
-            RopeMode::NormTail => false,
-        };
-        pairs && r.dims as usize == geo::ROPE && r.yarn.is_none()
+        turns_as_neox(r.mode, r.dims) && r.dims as usize == geo::ROPE && r.yarn.is_none()
     };
     let select_ok = match g.select {
         Some(Selector::TokenPool {
