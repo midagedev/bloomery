@@ -19,6 +19,8 @@ bloomery-model = { path = "../model" }
 bloomery-gguf = { path = "../gguf" }
 # The typed host-tier settings a binary's one lever reading makes (`HostCfg`).
 bloomery-levers = { path = "../levers" }
+# Host only: the qwen3moe chain and pass are walks of the schedules' overlap (`runtime::sched`).
+bloomery-runtime = { path = "../runtime" }
 # The pinned pool the hybrid host tier waits on and computes with (the CPU
 # engine dispatches its expert matmuls on the same pool).
 bloomery-threads = { path = "../threads" }

@@ -20,12 +20,13 @@
 //! would read the previous one's state.
 
 use super::body::{Kernels, TapRows, f32_site, kq_site};
-use super::dispatch::{self, Ctx};
+use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{
     DeltaPlan, GqaKind, GqaPlan, Kind35, Kq, LayerPlan, MixerPlan, MoePlan, SharedPlan, kinds35,
     moe_fits, q35,
 };
+use super::program::{Program, Tail};
 use super::scratch::{
     Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
     StepParams, param_view, put_input,
@@ -510,26 +511,48 @@ impl Body35 {
 
 /// Enqueue the decode chain at one row: layer 0 with the step's embedding,
 /// every later layer reading the previous layer's output, the last writing
-/// the head's input, then the head.
+/// the head's input, then the head — the walk `(1, 1, Step)`.
 fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let last = b.plans.len() - 1;
-    for l in 0..b.plans.len() {
-        let c = Ctx::new(gpu, w, (&b.plans[l], l), &b.k, b.mma, b.eps, &b.rope.table)?;
-        let out = (l == last).then(|| head.input_mut());
-        let io = b.sp.io();
-        dispatch::layer(&c, b.stores[l].as_mut(), &mut b.s, &io, 1, l == 0, out)?;
-        if let Some(t) = b.taps.as_mut() {
-            let src: &DeviceBuffer<f32> = if l == last { head.input_mut() } else { &b.s.x };
-            t.rows[l].copy_from_device_async(src, stream)?;
-        }
+    let Body35 {
+        eps,
+        plans,
+        stores,
+        rope,
+        s,
+        sp,
+        k,
+        head_state,
+        mma,
+        taps,
+        ..
+    } = b;
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: *eps,
+        table: &rope.table,
+    };
+    Program {
+        c: &c,
+        stores: stores.as_mut_slice(),
+        s,
+        io: &sp.io(),
+        m: 1,
+        tail: Tail::Step {
+            head,
+            state: head_state,
+            taps: taps.as_mut(),
+        },
     }
-    dispatch::enqueue_head(gpu, w, &b.k, &mut b.head_state, head)
+    .walk()
 }
 
 /// Enqueue a pass of `heads.len()` rows from the pass record: every layer
 /// at that many rows over the pass arena, then row `r`'s residual into
-/// `heads[r]`'s input and that head, row by row.
+/// `heads[r]`'s input and that head, row by row — the walk `(1, m, Step)`.
 fn enqueue_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -546,16 +569,39 @@ fn enqueue_rows(
             "a record planned for this pass's rows (plan_rows before the pass)",
         ));
     }
-    for l in 0..b.plans.len() {
-        let c = Ctx::new(gpu, w, (&b.plans[l], l), &b.k, b.mma, b.eps, &b.rope.table)?;
-        let io = b.rp.io(m)?;
-        dispatch::layer(&c, b.stores[l].as_mut(), &mut b.a, &io, m, l == 0, None)?;
+    let Body35 {
+        eps,
+        plans,
+        stores,
+        rope,
+        a,
+        rp,
+        k,
+        head_state,
+        mma,
+        ..
+    } = b;
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: *eps,
+        table: &rope.table,
+    };
+    Program {
+        c: &c,
+        stores: stores.as_mut_slice(),
+        s: a,
+        io: &rp.io(m)?,
+        m,
+        tail: Tail::Rows {
+            heads,
+            state: head_state,
+        },
     }
-    for (row, head) in b.a.x_rows.iter().zip(heads.iter_mut()) {
-        head.input_mut().copy_from_device_async(row, gpu.stream())?;
-        dispatch::enqueue_head(gpu, w, &b.k, &mut b.head_state, head)?;
-    }
-    Ok(())
+    .walk()
 }
 
 impl ChainBody for Body35 {

@@ -108,6 +108,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-runtime",
  "bloomery-threads",
  "cuda-core",
  "cuda-device",
