@@ -185,38 +185,154 @@ lease_card() {
 # CPU contention between arms. The lease serializes timed runs, not builds: another round's cargo
 # build, a CUDA C++ build (nvcc drives cicc and ptxas, which carry its long passes — build-ref, the
 # mistral.rs build), or a reference engine this runner did not start, shares the cores a timed arm
-# runs on, and the `busiest` witness field only shows it. guard_cpu sums `ps` %CPU over the
-# processes whose name is in CPU_BUSY_COMMS (BLOOMERY_CPU_BUSY_COMMS); above CPU_BUSY_PCT
-# (BLOOMERY_CPU_BUSY_PCT, percent of one cpu — a chosen threshold, not a measured one) it prints
-# `[cpu-busy]` on stderr and sets CPU_BUSY_TAG to ` [cpu-busy]` for the runner's row; with
-# BLOOMERY_OTHER_STRICT=1 it prints a witness block and exits 75 instead, as guard_other does for a
-# busy other card. `ps` %CPU is cpu time over elapsed time: a build started seconds ago reads its
-# real load, a long-lived process that only now turned busy reads low. Call it only between the
-# runner's own arms, when no matching process is the runner's own; the runner clears CPU_BUSY_TAG
-# when a row starts.
+# runs on, and the `busiest` witness field only shows it. guard_cpu reads the cpu time of the
+# processes whose name is in CPU_BUSY_COMMS (BLOOMERY_CPU_BUSY_COMMS) over the interval since its
+# last reading — utime + stime from /proc/<pid>/stat (BLOOMERY_LEASE_PROC names another tree, for the
+# stub tests), a process that started inside the interval counted whole — and leaves out the
+# runner's own: every process under the runner's pid ($$), such as the load process an arm list
+# keeps between its arms. Above CPU_BUSY_PCT (BLOOMERY_CPU_BUSY_PCT, percent of one cpu — a chosen
+# threshold, not a measured one) it prints `[cpu-busy]` on stderr and sets CPU_BUSY_TAG to
+# ` [cpu-busy]` for the runner's row; with BLOOMERY_OTHER_STRICT=1 it prints a witness block and
+# exits 75 instead, as guard_other does for a busy other card. A reading spans at least a second: a
+# call less than a second after the last reading only starts the next interval (a pre-arm guard right
+# after the previous arm's post guard: the arm's own interval is then the post guard's), and the
+# first call waits out a second when a named process is running. A process that exits inside an
+# interval is not counted. The runner clears CPU_BUSY_TAG when a row starts.
 CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41}
 CPU_BUSY_PCT=${BLOOMERY_CPU_BUSY_PCT:-50}
 CPU_BUSY_TAG=
+# The last reading: the uptime and every process's (pid, start, cpu ticks) then (CPU_BUSY_SNAP); the
+# named processes that are not the runner's, `<sum of %CPU> <name %CPU;...>` (CPU_BUSY_READING), the
+# runner's own it left out (CPU_BUSY_OWN), the interval in seconds (CPU_BUSY_SPAN, empty when the
+# call only started one), and why no reading was taken (CPU_BUSY_ERR).
+CPU_BUSY_SNAP='' CPU_BUSY_READING='' CPU_BUSY_OWN='' CPU_BUSY_SPAN='' CPU_BUSY_ERR=''
 
-# cpu_busy_reading: `<sum of %CPU> <name %CPU;...>` over the processes CPU_BUSY_COMMS names.
+# cpu_busy_sample: a reading over the interval since the last one, into the variables above; with no
+# earlier reading, over the next second (at once when no named process runs). Returns 1 with
+# CPU_BUSY_ERR set when the process tree cannot be read.
+cpu_busy_sample() {
+  local out
+  # The last reading goes in on stdin: a few hundred processes' lines can outgrow one argument.
+  out=$(python3 -c "$(cpu_busy_py)" "${BLOOMERY_LEASE_PROC:-/proc}" "$$" "$CPU_BUSY_COMMS" <<< "$CPU_BUSY_SNAP") \
+    || { CPU_BUSY_ERR="python3 failed reading ${BLOOMERY_LEASE_PROC:-/proc}"; return 1; }
+  eval "$out"
+  [ -z "$CPU_BUSY_ERR" ]
+}
+
+# cpu_busy_py: cpu_busy_sample's program — argv the tree, the runner's pid and the names, stdin the
+# last reading; out, the variables as shell assignments.
+cpu_busy_py() {
+  cat << 'PY'
+import os
+import shlex
+import sys
+import time
+
+proc, root, comms = sys.argv[1], int(sys.argv[2]), set(sys.argv[3].split())
+snap = sys.stdin.read().strip()
+MIN_SPAN = 1.0
+hz = os.sysconf('SC_CLK_TCK')
+
+
+def emit(**kv):
+    for k, v in kv.items():
+        print(f'CPU_BUSY_{k}={shlex.quote(v)}')
+    sys.exit(0)
+
+
+def now():
+    """The uptime, and pid -> (comm, ppid, start, ticks) of every process."""
+    try:
+        with open(os.path.join(proc, 'uptime')) as f:
+            up = float(f.read().split()[0])
+        pids = [d for d in os.listdir(proc) if d.isdigit()]
+    except (OSError, ValueError, IndexError) as e:
+        emit(ERR=f'{proc} cannot be read ({e})')
+    ps = {}
+    for d in pids:
+        try:
+            with open(os.path.join(proc, d, 'stat')) as f:
+                s = f.read()
+        except OSError:
+            continue
+        lo, hi = s.find('('), s.rfind(')')
+        f = s[hi + 2:].split()
+        if lo < 0 or hi < lo or len(f) < 20:
+            emit(ERR=f'{proc}/{d}/stat is not a stat line: {s[:80]!r}')
+        ps[int(d)] = (s[lo + 1:hi], int(f[1]), int(f[19]), int(f[11]) + int(f[12]))
+    return up, ps
+
+
+def text(up, ps):
+    return '\n'.join([repr(up)] + [f'{p} {v[2]} {v[3]}' for p, v in ps.items()])
+
+
+cur = now()
+if not snap:
+    if not any(v[0] in comms for v in cur[1].values()):
+        emit(SNAP=text(*cur), SPAN='', READING='0.0 ', OWN='', ERR='')
+    prev = cur
+    time.sleep(MIN_SPAN)
+    cur = now()
+else:
+    lines = snap.split('\n')
+    prev = (float(lines[0]), {int(p): (None, None, int(st), int(t))
+                              for p, st, t in (x.split() for x in lines[1:])})
+span = cur[0] - prev[0]
+if span < MIN_SPAN and snap:
+    emit(SNAP=text(*cur), SPAN='', READING='0.0 ', OWN='', ERR='')
+if span <= 0:
+    emit(ERR=f'an interval of {span:.2f} s: the uptime in {proc} did not move')
+
+
+def own(pid):
+    seen = 0
+    while pid in cur[1] and seen < 256:
+        if pid == root:
+            return True
+        pid, seen = cur[1][pid][1], seen + 1
+    return False
+
+
+mine, theirs, total = [], [], 0.0
+for pid, (comm, _, start, ticks) in sorted(cur[1].items()):
+    if comm not in comms:
+        continue
+    was = prev[1].get(pid)
+    base = was[3] if was is not None and was[2] == start else 0
+    if ticks < base:
+        emit(ERR=f'pid {pid} ({comm}): cpu time {ticks} ticks, {base} at the interval start')
+    pct = (ticks - base) / hz / span * 100
+    if own(pid):
+        mine.append(f'{comm} {pct:.1f}%;')
+    else:
+        theirs.append(f'{comm} {pct:.1f}%;')
+        total += pct
+emit(SNAP=text(*cur), SPAN=f'{span:.1f}', READING=f'{total:.1f} ' + ''.join(theirs), OWN=''.join(mine), ERR='')
+PY
+}
+
+# cpu_busy_reading: `<sum of %CPU> <name %CPU;...>` over the named processes that are not the
+# runner's (cpu_busy_sample), or `no reading: <why>`.
 cpu_busy_reading() {
-  ps -eo pcpu=,comm= | awk -v list=" $CPU_BUSY_COMMS " '
-    index(list, " " $2 " ") { s += $1; m = m sprintf("%s %s%%;", $2, $1) }
-    END { printf "%.1f %s\n", s, m }'
+  if cpu_busy_sample; then echo "$CPU_BUSY_READING"; else echo "no reading: $CPU_BUSY_ERR"; fi
 }
 
 guard_cpu() {
-  local tag=$1 reading sum
+  local tag=$1 sum
   case $CPU_BUSY_PCT in
     '' | *[!0-9.]* | *.*.*)
       echo "guard_cpu: BLOOMERY_CPU_BUSY_PCT is a percentage, got '$CPU_BUSY_PCT'" >&2
       exit 64
       ;;
   esac
-  reading=$(cpu_busy_reading)
-  sum=${reading%% *}
+  if ! cpu_busy_sample; then
+    echo "guard_cpu: $tag: no cpu reading: $CPU_BUSY_ERR" >&2
+    exit 70
+  fi
+  sum=${CPU_BUSY_READING%% *}
   awk -v s="$sum" -v t="$CPU_BUSY_PCT" 'BEGIN { exit !(s > t) }' || return 0
-  echo "[cpu-busy] $(now) $tag: ${sum}% > ${CPU_BUSY_PCT}% of one cpu over [${reading#* }]" >&2
+  echo "[cpu-busy] $(now) $tag: ${sum}% > ${CPU_BUSY_PCT}% of one cpu over ${CPU_BUSY_SPAN} s [${CPU_BUSY_READING#* }]${CPU_BUSY_OWN:+ (not counted, under the runner: $CPU_BUSY_OWN)}" >&2
   # shellcheck disable=SC2034 # the sourcing runner reads it into its row
   CPU_BUSY_TAG=' [cpu-busy]'
   if [ "${BLOOMERY_OTHER_STRICT:-}" = 1 ]; then

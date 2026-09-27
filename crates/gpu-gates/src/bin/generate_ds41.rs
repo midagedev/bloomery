@@ -107,7 +107,10 @@
 //! With `BLOOMERY_STEP_STATS=1`, after the loop, a `stat prefill front` line
 //! per batch and a `stat prefill lb` line per layer-batch: the queue entries
 //! each enqueued (`body::Body::prefill_counts`), whose sums the `split`
-//! line's `entries_route=`/`entries_shadow=` are.
+//! line's `entries_route=`/`entries_shadow=` are, and its card and serve
+//! times (`card_out_ms=`, `card_in_ms=` where it has a block, `union_ms=`,
+//! `wait_ms=`), whose sums the `split` line's are: the split's record is
+//! refused by name when they are not (`body::PromptCounts::check_split`).
 //!
 //! A batched feed prints the plan of its call before the load (`call plan`,
 //! then a `call batch` line per batch): `body::BodyLevers::call_plan`, the
@@ -1461,7 +1464,7 @@ mod drive {
                 .csv("part_from", need.layers.iter().map(|n| n.part))
                 .print();
         }
-        split::split(&stats).print();
+        split::split(&stats, b.prefill_counts())?.print();
         Ok(())
     }
 
@@ -1476,14 +1479,25 @@ mod drive {
                     .u("entries", f.entries)
                     .print();
             }
+            let ms = |ns: u64| ns as f64 / 1e6;
             for lb in &c.lbs {
-                Record::new(&record::STAT_PREFILL_LB)
+                let mut r = Record::new(&record::STAT_PREFILL_LB)
                     .u("b", lb.batch)
                     .u("layer", lb.layer)
                     .w("block", lb.block)
                     .u("entries_route", lb.route)
-                    .u("entries_shadow", lb.shadow)
-                    .print();
+                    .u("entries_shadow", lb.shadow);
+                // The times only under card timing, as the split line's.
+                if let Some(out) = lb.card_out_ms {
+                    r = r.f("card_out_ms", out);
+                    if let Some(shadow) = lb.card_in_ms {
+                        r = r.f("card_in_ms", shadow);
+                    }
+                    r = r
+                        .f("union_ms", ms(lb.union_ns))
+                        .f("wait_ms", ms(lb.wait_ns));
+                }
+                r.print();
             }
         }
         Ok(())

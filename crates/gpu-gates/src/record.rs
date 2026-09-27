@@ -834,13 +834,17 @@ pub static STAT_PREFILL_FRONT: Kind = Kind {
 pub static STAT_PREFILL_LB: Kind = Kind {
     name: "stat_prefill_lb",
     head: "stat prefill lb",
-    doc: "The queue entries one layer-batch enqueued: its route (with its upload, join and tap) and its shadow; block says whether it ran one.",
+    doc: "The queue entries one layer-batch enqueued: its route (with its upload, join and tap) and its shadow; block says whether it ran one. With card timing, its card time (card_out: its first launch to its route's copies; card_in: its shadow, where it has a block) and its serve's host time (union, and the wait on its route's copies), which the split line's are the sums of.",
     parts: &[
         key("b", U64, ""),
         key("layer", U64, ""),
         key("block", Bool, ""),
         key("entries_route", U64, "entries"),
         key("entries_shadow", U64, "entries"),
+        opt("card_out_ms", F64(2), "ms"),
+        opt("card_in_ms", F64(2), "ms"),
+        opt("union_ms", F64(2), "ms"),
+        opt("wait_ms", F64(2), "ms"),
     ],
 };
 

@@ -161,7 +161,9 @@
 //! `entries_shadow=`), the host tier's batch-excluded slots (`excluded_lb=`)
 //! and the batch-wide projections' card time (`card_proj_ms=`,
 //! `card_proj_lb=`): runtime values on the gate card, not measurements, and
-//! the events' reads add a wait per batch.
+//! the events' reads add a wait per batch. A case of one call is held to its
+//! per-layer-batch times first (`body::PromptCounts::check_split`: the split's
+//! union, wait and card times their sums, or a named error).
 //!
 //! `--seams P` is the locator, not a verdict: `P` eager steps with every
 //! seam's streams read back (the finite probe's `observed_step`), then a
@@ -219,7 +221,9 @@ mod gate {
         col_group_of,
     };
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
-    use bloomery_gpu_deepseek41::body::{self, Body, CedState, Deepseek41Model, Need};
+    use bloomery_gpu_deepseek41::body::{
+        self, Body, CedState, Deepseek41Model, Need, PromptCounts,
+    };
     use bloomery_gpu_deepseek41::chain::ffn::{
         CardAcc, CardGather, CardStacks, FfnBatchKernels, FfnKernels, Handoff, Places, TiledGateUp,
         card_sum_elem,
@@ -517,7 +521,11 @@ mod gate {
             let case = run_case(m, &hp, &ids, parts, *window, &rows)?;
             if stats {
                 let stats = m.body_parts(NAME)?.2.take_prefill_stats();
-                println!("{NAME}: {what} {}", split::split(&stats).line());
+                // A split case's stats span its two calls; the counts hold
+                // the last one's only.
+                let b = m.body(NAME)?;
+                let counts = (parts.len() == 1).then(|| b.prefill_counts()).flatten();
+                println!("{NAME}: {what} {}", split::split(&stats, counts)?.line());
             }
             let p: usize = parts.iter().sum();
             pass &= compare(what, &case, &oracle[&p], &rows, t);
@@ -546,7 +554,8 @@ mod gate {
         /// FNV-1a 64 of the last logits' bits.
         logits: u64,
         need: Option<Need>,
-        /// The call's queue counts per batch and layer-batch, as printed.
+        /// The call's queue counts per batch and layer-batch, without their
+        /// times.
         counts: String,
         /// `PrefillStats`' counts: group, batches, layer-batches, those of a
         /// group's first batch, route and shadow entries, excluded slots.
@@ -710,7 +719,7 @@ mod gate {
         let st = s.model_mut().body_parts(NAME)?.2.take_prefill_stats();
         let b = s.model().body(NAME)?;
         let need = b.prefill_need().cloned();
-        let counts = format!("{:?}", b.prefill_counts());
+        let counts = format!("{:?}", b.prefill_counts().map(PromptCounts::untimed));
         for _ in 0..steps {
             let last = *tokens.last().ok_or("no token")?;
             tokens.push(s.step(last, Want::Argmax)?.argmax());

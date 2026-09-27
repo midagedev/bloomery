@@ -269,18 +269,44 @@ fn lb_starts(need: &Need, i: usize, cuts: &[Range<usize>]) -> (usize, usize) {
 
 /// The queue entries one layer-batch of a prompt call enqueued — launches,
 /// copies, event records, stream waits — counted where they were enqueued
-/// ([`Body::prefill_counts`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// ([`Body::prefill_counts`]), and its times, which [`PrefillStats`]' are the
+/// sums of.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LbCount {
     /// The batch's index in its call, and the model layer.
     pub batch: usize,
     pub layer: usize,
     /// Whether the layer ran a block of the batch: a layer-batch
-    /// [`PrefillStats::layer_batches`] counts.
+    /// [`PrefillStats::layer_batches`] counts, whose shadow the card ran and
+    /// whose serve the host ran.
     pub block: bool,
     /// Its route with its upload, join and tap; its shadow.
     pub route: u64,
     pub shadow: u64,
+    /// Its serve's host time: the union call, and the wait on its route's
+    /// copies; 0 without a block.
+    pub union_ns: u64,
+    pub wait_ns: u64,
+    /// With card timing on ([`Body::set_prefill_card_timing`]), its event
+    /// pairs: its first launch to its route's copies (its attention alone
+    /// without a block), and its shadow where it has a block.
+    pub card_out_ms: Option<f64>,
+    pub card_in_ms: Option<f64>,
+}
+
+impl LbCount {
+    /// The count with its times left out.
+    #[must_use]
+    pub fn untimed(&self) -> LbCount {
+        LbCount {
+            batch: self.batch,
+            layer: self.layer,
+            block: self.block,
+            route: self.route,
+            shadow: self.shadow,
+            ..LbCount::default()
+        }
+    }
 }
 
 /// The queue entries one batch's first steps enqueued: its chunks' words
@@ -293,10 +319,96 @@ pub struct FrontCount {
 
 /// The last prompt call's counts, per batch and per layer-batch, in the order
 /// its groups ran them ([`Body::prefill_counts`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PromptCounts {
     pub front: Vec<FrontCount>,
     pub lbs: Vec<LbCount>,
+}
+
+/// How far a split's time may sit from the sum of its layer-batches' before
+/// [`PromptCounts::check_split`] refuses it: float sums in two orders.
+pub const SPLIT_SUM_MS: f64 = 0.1;
+
+impl PromptCounts {
+    /// The counts with every layer-batch's times left out: what two runs of
+    /// one call share.
+    #[must_use]
+    pub fn untimed(&self) -> PromptCounts {
+        PromptCounts {
+            front: self.front.clone(),
+            lbs: self.lbs.iter().map(LbCount::untimed).collect(),
+        }
+    }
+
+    /// Hold `s` to these counts when it was timed on the card: `s` covers
+    /// this call alone — its batches and layer-batches — and its union, wait
+    /// and card times are each the sum of the layer-batches' within
+    /// [`SPLIT_SUM_MS`], so a reader of the per-layer-batch records reads the
+    /// split's times. Refused by name otherwise; an untimed `s` is not held.
+    pub fn check_split(&self, s: &PrefillStats) -> Result<(), GpuError> {
+        const WHAT: &str = "PromptCounts::check_split";
+        if !s.card_timed {
+            return Ok(());
+        }
+        let blocks = self.lbs.iter().filter(|c| c.block).count();
+        if s.batches != self.front.len() as u64 || s.layer_batches != blocks as u64 {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the split covers {} batches and {} layer-batches, the counts the last \
+                     call's {} and {blocks}: take the stats once per call",
+                    s.batches,
+                    s.layer_batches,
+                    self.front.len()
+                ),
+            });
+        }
+        fn ms(ns: u64) -> f64 {
+            ns as f64 / 1e6
+        }
+        let sum = |f: fn(&LbCount) -> f64| self.lbs.iter().map(f).sum::<f64>();
+        let sums = [
+            ("union_ms", ms(s.union_ns), sum(|c| ms(c.union_ns))),
+            ("wait_ms", ms(s.wait_ns), sum(|c| ms(c.wait_ns))),
+            (
+                "card_out_ms",
+                s.card_out_ms,
+                sum(|c| c.card_out_ms.unwrap_or(0.0)),
+            ),
+            (
+                "card_in_ms",
+                s.card_in_ms,
+                sum(|c| c.card_in_ms.unwrap_or(0.0)),
+            ),
+        ];
+        for (name, split, lbs) in sums {
+            if (split - lbs).abs() > SPLIT_SUM_MS || !(split - lbs).is_finite() {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "the split's {name} is {split:.3}, its {} layer-batches' sum {lbs:.3}: \
+                         more than {SPLIT_SUM_MS} ms apart",
+                        self.lbs.len()
+                    ),
+                });
+            }
+        }
+        let untimed = self
+            .lbs
+            .iter()
+            .find(|c| c.card_out_ms.is_none() || c.card_in_ms.is_some() != c.block);
+        if let Some(c) = untimed {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {} of batch {} (block {}) was not timed as the split was: card_out \
+                     {:?}, card_in {:?}",
+                    c.layer, c.batch, c.block, c.card_out_ms, c.card_in_ms
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Which sub-layer a [`BatchSeam`] follows.
@@ -1296,10 +1408,7 @@ impl Body {
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];
         }
-        let (union0, excluded0) = {
-            let st = self.hybrid.stats();
-            (st.batch_ns, st.batch_excluded_slots)
-        };
+        let excluded0 = self.hybrid.stats().batch_excluded_slots;
         let t1 = Instant::now();
         let chained = self.enqueue_group_chain(gpu, w, head, &mut members, last, observe);
         let chain = nanos(t1.elapsed());
@@ -1313,9 +1422,11 @@ impl Body {
             return Err(GpuError::fault(WHAT, fault));
         }
         sums.chain_ns = chain;
-        let st = self.hybrid.stats();
-        sums.union_ns = st.batch_ns.saturating_sub(union0);
-        sums.excluded_slots = st.batch_excluded_slots.saturating_sub(excluded0);
+        sums.excluded_slots = self
+            .hybrid
+            .stats()
+            .batch_excluded_slots
+            .saturating_sub(excluded0);
         sums.prologue_ns = prologue;
         self.account_group(members.len(), sums, tally)?;
         Ok(last)
@@ -1324,12 +1435,13 @@ impl Body {
     /// Add one group's sums, its `g` batches, its queue entries and, with
     /// card timing on, its layer-batches' event pairs — read first, which
     /// waits for the last of them — to the stats all at once: a group that
-    /// fails adds nothing.
+    /// fails adds nothing. The group's union, wait and card times are the
+    /// sums of its layer-batches'.
     fn account_group(
         &mut self,
         g: usize,
         mut sums: PrefillStats,
-        tally: Tally,
+        mut tally: Tally,
     ) -> Result<(), GpuError> {
         let layers = self.layers.len();
         let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
@@ -1341,13 +1453,41 @@ impl Body {
             sums.card_timed = true;
             sums.card_proj_ms = batch.proj.take_card_ms()?;
             let (marks, _) = batch.card_marks.as_chunks::<CARD_MARKS>();
-            for ([e0, e1, e2, e3], &served) in marks.iter().zip(&batch.card_served).take(layers * g)
-            {
-                sums.card_out_ms += f64::from(e0.elapsed_ms(e1)?);
-                if served {
-                    sums.card_in_ms += f64::from(e2.elapsed_ms(e3)?);
+            // The tally runs layer by layer over the group's batches, the
+            // events batch by batch over the layers.
+            for (x, lb) in tally.lbs.iter_mut().enumerate() {
+                let at = (x % g) * layers + x / g;
+                let (Some([e0, e1, e2, e3]), Some(&served)) =
+                    (marks.get(at), batch.card_served.get(at))
+                else {
+                    return Err(GpuError::State {
+                        what: WHAT,
+                        missing: "a card event pair for each layer-batch of the group",
+                    });
+                };
+                if served != lb.block {
+                    return Err(GpuError::Shape {
+                        what: WHAT,
+                        detail: format!(
+                            "layer {} of batch {}: its events say block {served}, its count \
+                             block {}",
+                            lb.layer, lb.batch, lb.block
+                        ),
+                    });
                 }
+                lb.card_out_ms = Some(f64::from(e0.elapsed_ms(e1)?));
+                lb.card_in_ms = if served {
+                    Some(f64::from(e2.elapsed_ms(e3)?))
+                } else {
+                    None
+                };
             }
+        }
+        for lb in &tally.lbs {
+            sums.union_ns += lb.union_ns;
+            sums.wait_ns += lb.wait_ns;
+            sums.card_out_ms += lb.card_out_ms.unwrap_or(0.0);
+            sums.card_in_ms += lb.card_in_ms.unwrap_or(0.0);
         }
         (sums.entries_route, sums.entries_shadow) = tally.sums();
         batch.stats.add(&sums);
@@ -1820,15 +1960,20 @@ impl<'a> GroupCx<'a> {
     }
 
     /// Layer index `i`'s host experts for the batch `m`'s block, where it
-    /// has one: the wait on its route's copies and one union call.
+    /// has one: the wait on its route's copies and one union call, whose
+    /// times are its layer-batch's.
     fn serve(&mut self, m: &Member, i: usize, r: &Routed<'_>) -> Result<(), GpuError> {
         if r.block.is_none() {
             return Ok(());
         }
         let l = self.layers.start + i;
+        let union0 = self.hybrid.stats().batch_ns;
         let times = self.batch.ffn.serve(&mut *self.hybrid, m.key(l, r.at))?;
+        let union = self.hybrid.stats().batch_ns.saturating_sub(union0);
+        let lb = self.tally.lb(i, m.set)?;
+        lb.union_ns = union;
+        lb.wait_ns = times.wait_ns;
         let st = &mut self.sums;
-        st.wait_ns += times.wait_ns;
         st.copy_ns += times.copy_ns;
         if m.set == 0 {
             st.wait_first_ns += times.wait_ns;
@@ -1948,4 +2093,122 @@ fn set_of(sets: &mut [BatchSet], set: usize) -> Result<&mut BatchSet, GpuError> 
         what: WHAT,
         detail: format!("batch {set} of a group of at most {n}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timed call of two batches over three layers, the first layer
+    /// without a block, and its stats as the group's fold makes them.
+    fn call() -> (PromptCounts, PrefillStats) {
+        let mut lbs = Vec::new();
+        for layer in 0..3 {
+            for batch in 0..2 {
+                let block = layer > 0;
+                lbs.push(LbCount {
+                    batch,
+                    layer,
+                    block,
+                    route: 10,
+                    shadow: u64::from(block) * 5,
+                    union_ns: u64::from(block) * 30_000_000 + batch as u64,
+                    wait_ns: u64::from(block) * 1_500_000,
+                    card_out_ms: Some(20.0 + layer as f64 * 0.25),
+                    card_in_ms: block.then_some(12.5),
+                });
+            }
+        }
+        let front = (0..2)
+            .map(|batch| FrontCount { batch, entries: 3 })
+            .collect();
+        let counts = PromptCounts { front, lbs };
+        let mut s = PrefillStats {
+            batches: 2,
+            layer_batches: 4,
+            card_timed: true,
+            ..PrefillStats::default()
+        };
+        for c in &counts.lbs {
+            s.union_ns += c.union_ns;
+            s.wait_ns += c.wait_ns;
+            s.card_out_ms += c.card_out_ms.unwrap_or(0.0);
+            s.card_in_ms += c.card_in_ms.unwrap_or(0.0);
+        }
+        (counts, s)
+    }
+
+    fn refused(counts: &PromptCounts, s: &PrefillStats) -> String {
+        match counts.check_split(s) {
+            Err(GpuError::Shape { what, detail }) => format!("{what}: {detail}"),
+            other => panic!("expected a named refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_split_holds_the_fold() {
+        let (counts, s) = call();
+        counts.check_split(&s).expect("the fold's own sums");
+    }
+
+    #[test]
+    fn check_split_names_each_time_the_list_drops() {
+        for (name, drop) in [
+            (
+                "card_out_ms",
+                (|c: &mut LbCount| c.card_out_ms = None) as fn(&mut LbCount),
+            ),
+            ("union_ms", |c| c.union_ns = 0),
+            ("wait_ms", |c| c.wait_ns = 0),
+            ("card_in_ms", |c| c.card_in_ms = Some(0.0)),
+        ] {
+            let (mut counts, s) = call();
+            drop(&mut counts.lbs[5]);
+            let e = refused(&counts, &s);
+            assert!(e.contains(name), "{name}: {e}");
+        }
+    }
+
+    #[test]
+    fn check_split_refuses_another_window() {
+        let (counts, mut s) = call();
+        s.batches = 4;
+        let e = refused(&counts, &s);
+        assert!(e.contains("once per call"), "{e}");
+    }
+
+    #[test]
+    fn check_split_refuses_a_shadow_time_without_a_block() {
+        let (mut counts, s) = call();
+        counts.lbs[0].card_in_ms = Some(0.0);
+        let e = refused(&counts, &s);
+        assert!(e.contains("was not timed as the split was"), "{e}");
+    }
+
+    #[test]
+    fn check_split_leaves_an_untimed_split() {
+        let (counts, mut s) = call();
+        s.card_timed = false;
+        s.batches = 9;
+        counts
+            .check_split(&s)
+            .expect("an untimed split is not held");
+    }
+
+    #[test]
+    fn untimed_keeps_the_entries() {
+        let (counts, _) = call();
+        let u = counts.untimed();
+        assert_eq!(u.lbs.len(), counts.lbs.len());
+        for (a, b) in u.lbs.iter().zip(&counts.lbs) {
+            assert_eq!(
+                (a.batch, a.layer, a.block, a.route, a.shadow),
+                (b.batch, b.layer, b.block, b.route, b.shadow)
+            );
+            assert_eq!(
+                (a.union_ns, a.wait_ns, a.card_out_ms, a.card_in_ms),
+                (0, 0, None, None)
+            );
+        }
+    }
 }

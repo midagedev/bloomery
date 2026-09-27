@@ -1,0 +1,44 @@
+# Round ppgrow (read-only): the 09-27 depth sitting's +3.3 % per union column at P 15,872 splits into
+# the prologue's engram-row cache state (+0.55 s: arm order; the slot-1 pair reads 1.173), terms that
+# scale with P and not with union columns (+0.34 s), the card clock and routing (+0.22 s at the pair
+# means; the depth-free projections read -0.6..+1.6 % by reference arm) and a card-route excess of
+# 0.09..0.19 s over that composition (attention rows ~0.06, indexer ~0.08) [derived:
+# scratchpad/ppgrow/recon.py, band.py]. The largest piece this leaves unmeasured is not depth: the
+# chain holds 60-68 ms a batch of card time outside the four card marks, the upload and join and the
+# batch's front, and the flow model puts ~39 ms a batch of it on layers 0 and 1, which hold no card
+# expert under plan (a): their union serves all six slots of every token (~62 ms a layer-batch
+# [derived] against ~30 on layers 2-39) while the card holds only the shared expert and the next
+# route. That piece sizes the first rung of the 256k ladder (a skewed batch order, then the prologue
+# off the critical path) and every P's pp. The stat lines sum the marks over the call, so the run
+# first needs `stat prefill lb` to carry each layer-batch's card_out, card_in, union and wait (the
+# events and serve times the engine already records; a record-kind change, ptx-scan identical).
+kind: profile
+question: how much card time does a prose prompt batch lose per batch to the host-bound layers 0 and
+  1, and does the indexer layers' route grow with the batch index as the fit says?
+term: per batch, the sum over its layer-0 and layer-1 layer-batches of max(0, union_ms - card_in_ms
+  of that layer-batch - card_out_ms of the route enqueued ahead of its serve) (the card work queued
+  while the host serves: the shadow and the next route; the wait is not in it), P = 15,872,
+  prose (corpus-prose.ids), hot list 384, A6000 300 W, plan (a), CED on, G 2, mean over the 31
+  batches of both rounds
+unit: ms
+predict: 30..50 ms
+condition: after round pplbrec lands (`stat prefill lb` gains card_out_ms, card_in_ms where the
+  layer-batch has a block, union_ms and wait_ms under card timing; generate_ds41 refuses its split
+  record by name unless each of the split line's card_out_ms, card_in_ms, union_ms and wait_ms is the
+  sum of its layer-batches' to 0.1 ms, body::PromptCounts::check_split), the v41-ppdepth sitting again
+  at the lead's go: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1
+  BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt
+  BLOOMERY_LEASE_CARD=docs/cards/v41-pplb.card' just depth-gpu-ds41 prose:4096 prose:15872 (12-16
+  min, as 09-27); python3 tools/flow/pplb.py <the runner's log> reads the term per batch, names the
+  route it paired with each serve, and refuses an arm whose lb sums miss its split line. The same
+  rows give, unmeasured today: layer 2 minus layer 3 card_out at batch 30 against batch 2 (predicted
+  +1.2..1.9 ms by the fit, +0.7 by latency waves alone; pplb.py prints it) and the full, triangle and
+  layer-20-latent classes the composition rests on
+decide-in: the skewed batch order is the first prefill rung: batch b+1's layers 0-1 served while the
+  card runs batch b's layers 2+ inside a group of two (~20 ms a batch [derived]), then across groups
+  with the prologue on a helper thread and double-buffered images (a further ~48 ms a batch)
+decide-below: the card time outside the marks is mostly elsewhere (the fronts, the group ends, the
+  route's issue gaps): the first rung is the prologue off the critical path alone (~28 ms a batch),
+  and the skew is dropped
+decide-above: layers 0-1 cost more than the skew can hide inside a group: put card experts on
+  layers 0 and 1 in the placement (price the decode side first) ahead of the skew
