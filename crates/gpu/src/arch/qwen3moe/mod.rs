@@ -22,6 +22,7 @@ mod dispatch;
 pub mod experts;
 pub mod head_argmax;
 mod image;
+mod mtp38;
 mod plan;
 mod plan38;
 mod prefill;
@@ -41,6 +42,7 @@ pub use body35::{Body35, DecodeInput35, LayerKind35, Open35};
 pub use body38::{
     ALLOWED, Body38, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
 };
+pub use mtp38::{BorrowedPlanes, Mtp38};
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 
 /// Qwen3.6-35B-A3B on one card.

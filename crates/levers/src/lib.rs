@@ -30,7 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOT_LIST, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, SPIN, STEP_STATS, THREADS,
+    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, SPIN,
+    STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -689,6 +690,17 @@ impl Levers {
     #[must_use]
     pub fn draft(&self) -> Option<&'static str> {
         self.word(DRAFT)
+    }
+
+    /// `BLOOMERY_MTP_HEAD_ROWS`: the MTP draft head's row list; `None` unset
+    /// (the full head).
+    #[must_use]
+    pub fn mtp_head_rows(&self) -> Option<&Path> {
+        match &self.entry(MTP_HEAD_ROWS).value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{MTP_HEAD_ROWS} holds {v:?}, not a path"),
+        }
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.

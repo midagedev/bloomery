@@ -379,6 +379,10 @@ name = "gate_qwen4exp_e2e"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen4exp_mtp_load"
+required-features = ["gpu"]
+
+[[bin]]
 name = "generate"
 required-features = ["gpu"]
 

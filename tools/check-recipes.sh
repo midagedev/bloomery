@@ -202,6 +202,7 @@ selftests=(
   "tools/flow/pplb.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
   "tools/ref/draft-accept.py --self-test"
+  "tools/ref/draft-vocab.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"
   "tools/ref/ptx-canon.py --self-test"
   "tools/ref/ds41pp.py self-test"

@@ -151,3 +151,216 @@ fn hw_qwen4exp_mtp_spec() {
         b.join("\n  ")
     );
 }
+
+// PIN(2026-09-28): the shared draft's card terms [derived from the header dump's table: the Q8_0
+// tensors but the injects in two planes of their file bytes, the F32 ones but the indexer's norms,
+// the two injects widened to F32 [10240, 4]; 98,715,648 B dense, 2,673,868,800 B of routed experts,
+// 2,772,584,448 resident; the uploads in the file's order, then the injects, through a 2 MiB-granule
+// heap of their own: 2,785,017,856 B, rounding 12,433,408. The store 2 x 2 x 256 f16 = 2,048 B a
+// position. A list of 40,960 rows adds 40,960 x 2,720 = 111,411,200 B of rows (the heap then
+// 2,898,264,064 B, rounding 14,268,416) and 40,960 x 4 B of map].
+const DRAFT_DENSE: u64 = 98_715_648;
+const DRAFT_EXPERTS: u64 = 2_673_868_800;
+const DRAFT_ROUNDING: u64 = 12_433_408;
+const DRAFT_KV_ROW: u64 = 2048;
+const LIST_ROWS: u32 = 40_960;
+const LIST_HEAD: u64 = 111_411_200;
+const LIST_ROUNDING: u64 = 14_268_416;
+const LIST_MAP: u64 = 163_840;
+// The largest context each card holds with the draft (full head), as predicted [derived: the plan
+// test's CARD_MAX_CTX budget less 2,785,017,856 B of draft granules, over 28,416 + 2,048 B a
+// position, the last pool counted whole]. Printed beside the boundary the test finds; the clause
+// holds the plan to that boundary.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_315_534), ("3090", 475_131)];
+
+/// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
+/// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
+/// for field, the draft's holds its 512 experts on the card with the bytes
+/// derived above, and the headroom is the target's less the draft's; the
+/// boundary context with the draft breaks with `CardOver`; a list of 40,960
+/// rows over the target's tokenizer adds its rows and map; the unshared
+/// file and a list of another tokenizer are refused by name.
+#[test]
+#[ignore = "needs the Qwen3.8-Flash-Next shards and MTP files on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_mtp_plan() {
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{
+        self, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, vocab_sha256,
+    };
+    use model::placement::workstation::{A6000, RTX_3090};
+    use model::placement::{PlanLevers, Violation};
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let target = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
+    let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
+    let inputs = PlanInputs::describe(&target).unwrap_or_else(|e| panic!("describe: {e}"));
+    let full = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
+        .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
+    let digest = vocab_sha256(&target).unwrap_or_else(|e| panic!("vocab_sha256: {e}"));
+    let ids: Vec<u32> = (0..LIST_ROWS).map(|i| i * 6).collect();
+    let list = MtpInputs::read(
+        &draft,
+        &target,
+        &inputs,
+        HeadRows::List {
+            ids: ids.into(),
+            digest,
+        },
+    )
+    .unwrap_or_else(|e| panic!("MtpInputs::read with a list: {e}"));
+    let levers = PlanLevers::default();
+    let view = |p: &model::placement::Plan<'_>| {
+        format!(
+            "{:?}",
+            (&p.rows, &p.cards, &p.host, p.nvme_bytes, &p.n_l, p.ctx_max)
+        )
+    };
+    for card in [A6000, RTX_3090] {
+        let machine = place::machine(card, inputs.hp.n_layer);
+        for ctx in [4096u64, 32_768] {
+            let plain = inputs
+                .plan(&machine, ctx, &levers)
+                .unwrap_or_else(|e| panic!("{} ctx {ctx}: plan: {e}", card.name));
+            for (label, m, head, rounding, map) in [
+                ("full", &full, 0, DRAFT_ROUNDING, 0),
+                ("list", &list, LIST_HEAD, LIST_ROUNDING, LIST_MAP),
+            ] {
+                let with = match inputs.plan_mtp(&machine, ctx, &levers, m) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        check(
+                            &mut o,
+                            format!("{} ctx {ctx} {label}: plan_mtp refused: {e}", card.name),
+                            false,
+                        );
+                        continue;
+                    }
+                };
+                let d = &with.draft.cards[0];
+                let got = (
+                    d.dense_bytes,
+                    d.expert_bytes,
+                    d.rounding_bytes,
+                    d.kv_bytes,
+                    with.map_bytes,
+                );
+                let want = (
+                    DRAFT_DENSE + head,
+                    DRAFT_EXPERTS,
+                    rounding,
+                    ctx * DRAFT_KV_ROW,
+                    map,
+                );
+                let headroom = plain.cards[0].headroom_bytes - i128::from(with.draft_card_bytes());
+                check(
+                    &mut o,
+                    format!(
+                        "{} ctx {ctx} {label}: the target's plan is plan()'s ({}); draft \
+                         (dense, experts, rounding, kv, map) {got:?} (want {want:?}); n_l {:?}; \
+                         headroom {} = the target's {} less {}",
+                        card.name,
+                        view(&with.plan) == view(&plain),
+                        with.draft.n_l,
+                        with.headroom_bytes,
+                        plain.cards[0].headroom_bytes,
+                        with.draft_card_bytes()
+                    ),
+                    view(&with.plan) == view(&plain)
+                        && got == want
+                        && with.draft.n_l == [512]
+                        && with.headroom_bytes == headroom,
+                );
+            }
+        }
+        let predicted = CARD_MAX_CTX_MTP
+            .iter()
+            .find(|(n, _)| *n == card.name)
+            .map_or(0, |&(_, c)| c);
+        let Ok(at) = inputs.plan_mtp(&machine, 4096, &levers, &full) else {
+            check(
+                &mut o,
+                format!("{}: no draft plan to find the boundary from", card.name),
+                false,
+            );
+            continue;
+        };
+        let (c, spec) = (&at.plan.cards[0], &machine.cards[0]);
+        let fixed = c.dense_bytes
+            + c.expert_bytes
+            + c.rounding_bytes
+            + c.scratch_bytes
+            + c.context_bytes
+            + at.draft_card_bytes()
+            - at.draft.cards[0].kv_bytes;
+        let limit = at.plan.usable_bytes(spec) - spec.margin_bytes;
+        let kv = |ctx: u64| -> u64 {
+            (0..inputs.hp.n_layer)
+                .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
+                .sum::<u64>()
+                + ctx * DRAFT_KV_ROW
+        };
+        let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fixed + kv(mid) <= limit {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let at_max = inputs.plan_mtp(&machine, lo, &levers, &full).is_ok();
+        let past = matches!(
+            inputs.plan_mtp(&machine, lo + 1, &levers, &full),
+            Err(PlaceError::Broken(v)) if v.iter().any(|x| matches!(x, Violation::CardOver { .. }))
+        );
+        check(
+            &mut o,
+            format!(
+                "{} with the draft holds ctx {lo} ({at_max}; predicted {predicted}) and breaks \
+                 with CardOver at {} ({past})",
+                card.name,
+                lo + 1
+            ),
+            at_max && past,
+        );
+    }
+    let own = Split::open(OWN).unwrap_or_else(|e| panic!("open {OWN}: {e}"));
+    let refused = MtpInputs::read(&own, &target, &inputs, HeadRows::Full)
+        .err()
+        .map_or("read".to_string(), |e| e.to_string());
+    check(
+        &mut o,
+        format!("the unshared file is refused by name: {refused}"),
+        refused.contains("tensor token_embd.weight: is in the draft file"),
+    );
+    let other = MtpInputs::read(
+        &draft,
+        &target,
+        &inputs,
+        HeadRows::List {
+            ids: vec![0u32, 1].into(),
+            digest: [0; 32],
+        },
+    )
+    .err()
+    .map_or("read".to_string(), |e| e.to_string());
+    check(
+        &mut o,
+        format!("a list of another tokenizer is refused by name: {other}"),
+        other.contains("vocab_sha256 0000"),
+    );
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
