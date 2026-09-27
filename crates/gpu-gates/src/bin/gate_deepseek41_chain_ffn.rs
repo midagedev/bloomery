@@ -911,7 +911,7 @@ mod gate {
                 mixes: z(HC_MIX)?,
                 hc_out: z(HC_MIX)?,
                 hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n)?,
-                host: HostScratch::new(n, ff),
+                host: HostScratch::new(n, ff, N_USED)?,
             })
         }
     }

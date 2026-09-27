@@ -12,7 +12,6 @@ use super::{Health, HostExperts, Refusal, name_refusal, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::cu;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
-use model::moe::EXPERTS_INTO_MAX;
 use model::{Tensor2, Tensor2View};
 use std::mem::size_of;
 use std::ops::Range;
@@ -321,9 +320,9 @@ pub(super) struct BatchStats {
     pub(super) batch_excluded_slots: u64,
 }
 
-/// A batch service's scratch and counters: the host lists,
-/// [`EXPERTS_INTO_MAX`] entries a column, each column's length and the
-/// refused columns, grown to the widest batch served, once.
+/// A batch service's scratch and counters: the host lists, the boundary's
+/// `n_used` entries a column, each column's length and the refused columns,
+/// grown to the widest batch served, once.
 #[derive(Default)]
 pub(super) struct BatchService {
     lists: Vec<(u32, f32)>,
@@ -394,7 +393,7 @@ impl BatchService {
         check_exclude(exclude, map_row, layer)?;
         if self.lens.len() < cols {
             self.lens.resize(cols, 0);
-            self.lists.resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
+            self.lists.resize(cols * n_used, (0, 0.0f32));
             self.refused.reserve(cols);
         }
         self.refused.clear();
@@ -406,7 +405,7 @@ impl BatchService {
         // The first refused column and what the host saw in it.
         let mut refused: Option<(usize, String)> = None;
         for j in 0..cols {
-            let list = &mut self.lists[j * EXPERTS_INTO_MAX..][..EXPERTS_INTO_MAX];
+            let list = &mut self.lists[j * n_used..][..n_used];
             let (mut n, mut out_of_set) = (0usize, 0u64);
             let mut unknown = None;
             for s in 0..n_used {
@@ -440,7 +439,7 @@ impl BatchService {
             self.lens[..cols]
                 .iter()
                 .enumerate()
-                .map(|(j, &n)| &self.lists[j * EXPERTS_INTO_MAX..][..n]),
+                .map(|(j, &n)| &self.lists[j * n_used..][..n]),
         );
         let Some((first, saw)) = refused else {
             let r = t.experts.experts_union_into(layer, x, &lists, out);

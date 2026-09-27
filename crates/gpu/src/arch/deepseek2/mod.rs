@@ -111,16 +111,22 @@ pub(crate) struct PlanHost {
 }
 
 impl PlanHost {
-    /// The tier for experts that map `hidden -> ff -> hidden`. Load-time
-    /// only.
-    fn new(plans: Derived, file: Split, hidden: usize, ff: usize) -> Result<PlanHost, GpuError> {
+    /// The tier for lists of up to `n_used` experts that map
+    /// `hidden -> ff -> hidden`. Load-time only.
+    fn new(
+        plans: Derived,
+        file: Split,
+        hidden: usize,
+        ff: usize,
+        n_used: usize,
+    ) -> Result<PlanHost, GpuError> {
         if file.shard(0).is_none() {
             return Err(GpuError::state("PlanHost::new", "the file has no shard 0"));
         }
         Ok(PlanHost {
             plans,
             file,
-            scratch: HostScratch::new(hidden, ff),
+            scratch: HostScratch::new(hidden, ff, n_used)?,
         })
     }
 }
@@ -438,7 +444,7 @@ impl Body {
         let shape = BoundaryShape { hidden, n_used };
         let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
         let boundary = Boundary::new(gpu.context(), gpu.stream(), shape)?;
-        let host = PlanHost::new(derived, file, hidden, ff)?;
+        let host = PlanHost::new(derived, file, hidden, ff, n_used)?;
         body.hybrid = Some(Hybrid::new(boundary, slots, host, layers.len())?);
         Ok(body)
     }

@@ -31,7 +31,7 @@
 //! synthetic lists over 32, 128 and all of the layer's experts, a hot expert
 //! per column so some experts carry many columns (runs of the tile kernel,
 //! chunks whose downs are kept in the store), every list length from empty
-//! to `EXPERTS_INTO_MAX`, a repeat at a negative weight, and activation
+//! to `LIST`, a repeat at a negative weight, and activation
 //! columns that are the set's tokens rescaled. A routed case at k = 512 draws
 //! each column's `n_used` experts uniformly from the layer's: the binomial
 //! spread of columns per expert a prefill ubatch has, so one chunk mixes
@@ -46,7 +46,7 @@
 //! activation columns with lists overlapping by construction. Then every
 //! named refusal: more columns than the scratch was made for, a scratch past
 //! `UNION_MAX_COLS` (or of none), an expert id past the layer's, a list count
-//! other than `x`'s columns, a list past `EXPERTS_INTO_MAX`, an `out` of
+//! other than `x`'s columns, a list past the scratch's routed width, an `out` of
 //! another length and a scratch made for other widths.
 //!
 //! The group tail — one call over up to `UNION_TAIL_MAX_GROUPS` batches'
@@ -95,8 +95,7 @@ use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{
-    EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_BATCH_SLOTS, UNION_MAX_COLS,
-    UNION_TAIL_MAX_GROUPS, UnionScratch,
+    HostLayer, HostScratch, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS, UnionScratch, union_batch_slots,
 };
 use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
@@ -126,8 +125,13 @@ const ARMS: [(&str, bool); 2] = [("defer", true), ("prepass", false)];
 /// columns the last one lacks.
 const TAILS: [(usize, usize); 2] = [(UNION_TAIL_MAX_GROUPS, 0), (3, 300)];
 
+/// The routed width every scratch here is made for: the longest list the
+/// cases carry, past V4.1's six (the cases past the set's tokens add one to a
+/// routed list).
+const LIST: usize = 8;
+
 /// The tail scratch's slot budget here: two batches at their worst.
-const TAIL_SLOTS: usize = 2 * UNION_BATCH_SLOTS;
+const TAIL_SLOTS: usize = 2 * union_batch_slots(LIST);
 
 /// One case: `k` columns and their lists.
 struct Case {
@@ -285,7 +289,7 @@ fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &m
     for cols in [0, UNION_MAX_COLS + 1] {
         check(
             refusal(
-                UnionScratch::new(embd, ff, cols).map(|_| ()),
+                UnionScratch::new_routed(embd, ff, cols, LIST).map(|_| ()),
                 "scratch columns outside 1..=UNION_MAX_COLS",
             ),
             "1..=UNION_MAX_COLS columns",
@@ -294,19 +298,19 @@ fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &m
     for groups in [0, UNION_TAIL_MAX_GROUPS + 1] {
         check(
             refusal(
-                UnionScratch::new_tail(embd, ff, groups, UNION_BATCH_SLOTS).map(|_| ()),
+                UnionScratch::new_tail(embd, ff, groups, union_batch_slots(LIST), LIST).map(|_| ()),
                 "tail scratch batches outside 1..=UNION_TAIL_MAX_GROUPS",
             ),
             "1..=UNION_TAIL_MAX_GROUPS batches",
         );
     }
-    for slots in [UNION_BATCH_SLOTS - 1, 2 * UNION_BATCH_SLOTS + 1] {
+    for slots in [union_batch_slots(LIST) - 1, 2 * union_batch_slots(LIST) + 1] {
         check(
             refusal(
-                UnionScratch::new_tail(embd, ff, 2, slots).map(|_| ()),
-                "tail scratch slots outside UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns",
+                UnionScratch::new_tail(embd, ff, 2, slots, LIST).map(|_| ()),
+                "tail scratch slots outside one batch's worst ..= every column's",
             ),
-            "UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns slots",
+            "one batch's slots at worst ..= every column's slots",
         );
     }
 
@@ -332,15 +336,15 @@ fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &m
         "one column per list",
     );
 
-    let long: Vec<(u32, f32)> = (0..=EXPERTS_INTO_MAX as u32).map(|e| (e, 1.0)).collect();
+    let long: Vec<(u32, f32)> = (0..=LIST as u32).map(|e| (e, 1.0)).collect();
     let x = Tensor2::zeros(embd, 1);
     let mut out = vec![0.0f32; embd];
     check(
         refusal(
             layer.experts_union_into(src, &x, &[&long[..]], &mut out, us),
-            "list past EXPERTS_INTO_MAX",
+            "list past the scratch's routed width",
         ),
-        "at most EXPERTS_INTO_MAX experts per column",
+        "at most the scratch's routed width of experts per column",
     );
 
     let mut short = vec![0.0f32; embd - 1];
@@ -352,8 +356,8 @@ fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &m
         "every column's width",
     );
 
-    let mut other =
-        UnionScratch::new(embd, ff / 2, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
+    let mut other = UnionScratch::new_routed(embd, ff / 2, SMALL_COLS, LIST)
+        .expect("a scratch of SMALL_COLS columns");
     check(
         refusal(
             layer.experts_union_into(src, &x, &[&one[..]], &mut out, &mut other),
@@ -380,8 +384,9 @@ fn hw_union_matches_per_column_v41() {
         n_tokens >= 2,
         "{SET}: {n_tokens} tokens, the k = 6 column needs two"
     );
-    let mut host = HostScratch::new(embd, ff);
-    let mut us = UnionScratch::new(embd, ff, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
+    let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
+    let mut us = UnionScratch::new_routed(embd, ff, SMALL_COLS, LIST)
+        .expect("a scratch of SMALL_COLS columns");
     // Per k: layers, columns, slots, distinct experts, differing cells.
     let mut tally = [[0usize; 5]; KS.len()];
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
@@ -519,7 +524,7 @@ impl Stream {
 /// layer: column `j` is token `j % n_tokens` of `x_all` scaled by
 /// `1 + j/64`; its list opens with one of four hot experts, then walks the
 /// rest of the pool, with lengths cycling through 0, 1, 2, 3, 6, 7 and
-/// `EXPERTS_INTO_MAX`, and every 13th list (from column 2) repeats its first
+/// `LIST`, and every 13th list (from column 2) repeats its first
 /// expert at a negative weight.
 fn wide_case(x_all: &[f32], embd: usize, k: usize, pool: usize, n_expert: usize) -> Case {
     let n_tokens = x_all.len() / embd;
@@ -539,7 +544,7 @@ fn wide_case(x_all: &[f32], embd: usize, k: usize, pool: usize, n_expert: usize)
         let t = j % n_tokens;
         data.extend(x_all[t * embd..(t + 1) * embd].iter().map(|&v| v * scale));
         let len = match j % 10 {
-            3 => EXPERTS_INTO_MAX,
+            3 => LIST,
             4 => 0,
             5 => 1,
             6 => 3,
@@ -547,7 +552,7 @@ fn wide_case(x_all: &[f32], embd: usize, k: usize, pool: usize, n_expert: usize)
             9 => 2,
             _ => 6,
         };
-        let mut l: Vec<(u32, f32)> = Vec::with_capacity(EXPERTS_INTO_MAX);
+        let mut l: Vec<(u32, f32)> = Vec::with_capacity(LIST);
         if len > 0 {
             l.push((hot[j % hot.len()], 0.05 + 0.25 * rng.unit()));
         }
@@ -558,7 +563,7 @@ fn wide_case(x_all: &[f32], embd: usize, k: usize, pool: usize, n_expert: usize)
                 l.push((e, 0.05 + 0.25 * rng.unit()));
             }
         }
-        if j % 13 == 2 && !l.is_empty() && l.len() < EXPERTS_INTO_MAX {
+        if j % 13 == 2 && !l.is_empty() && l.len() < LIST {
             l.push((l[0].0, -0.5));
         }
         lists.push(l);
@@ -639,8 +644,9 @@ fn hw_union_wide_matches_per_column_v41() {
         .shapes
         .get("ffn_norm-0")
         .expect("the set has ffn_norm-0")[1];
-    let mut host = HostScratch::new(embd, ff);
-    let mut us = UnionScratch::new(embd, ff, UNION_MAX_COLS).expect("a scratch of UNION_MAX_COLS");
+    let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
+    let mut us = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, LIST)
+        .expect("a scratch of UNION_MAX_COLS");
     // One routed layer per down type the file carries for its routed experts.
     let mut picked: Vec<(usize, HostLayer)> = Vec::new();
     for l in 0..hp.n_layer {
@@ -801,7 +807,7 @@ fn tail_case(x_all: &[f32], embd: usize, cols: usize, n_expert: usize, n_used: u
         let t = j % n_tokens;
         data.extend(x_all[t * embd..(t + 1) * embd].iter().map(|&v| v * scale));
         let mut ranks: Vec<usize> = Vec::with_capacity(n_used);
-        let mut l: Vec<(u32, f32)> = Vec::with_capacity(EXPERTS_INTO_MAX);
+        let mut l: Vec<(u32, f32)> = Vec::with_capacity(LIST);
         while ranks.len() < n_used {
             let u = f64::from(rng.unit()) * acc;
             let r = cdf.partition_point(|&c| c <= u).min(n_expert - 1);
@@ -814,7 +820,7 @@ fn tail_case(x_all: &[f32], embd: usize, cols: usize, n_expert: usize, n_used: u
                 l.push((order[r], w));
             }
         }
-        if j % 13 == 2 && !l.is_empty() && l.len() < EXPERTS_INTO_MAX {
+        if j % 13 == 2 && !l.is_empty() && l.len() < LIST {
             l.push((l[0].0, -0.5));
         }
         lists.push(l);
@@ -875,8 +881,9 @@ fn hw_union_tail_matches_batches_v41() {
         .shapes
         .get("ffn_norm-0")
         .expect("the set has ffn_norm-0")[1];
-    let mut us = UnionScratch::new(embd, ff, UNION_MAX_COLS).expect("a scratch of UNION_MAX_COLS");
-    let mut tail = UnionScratch::new_tail(embd, ff, UNION_TAIL_MAX_GROUPS, TAIL_SLOTS)
+    let mut us = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, LIST)
+        .expect("a scratch of UNION_MAX_COLS");
+    let mut tail = UnionScratch::new_tail(embd, ff, UNION_TAIL_MAX_GROUPS, TAIL_SLOTS, LIST)
         .expect("a tail scratch of UNION_TAIL_MAX_GROUPS batches");
     let mut picked: Vec<(usize, HostLayer)> = Vec::new();
     for l in 0..hp.n_layer {
@@ -934,7 +941,7 @@ fn hw_union_tail_matches_batches_v41() {
                 max_cols_per_expert(case)
             );
             if *tail_lists {
-                spread &= across > 0 && case.union() > EXPERTS_INTO_MAX;
+                spread &= across > 0 && case.union() > LIST;
             }
             let mut diff = 0;
             let mut counted = true;
@@ -1061,7 +1068,8 @@ fn hw_union_file_matches_per_column_v2lite() {
         lists.push(l);
     }
     let x = Tensor2::from_vec(embd, k, data);
-    let mut host = model::moe::HostScratch::new(embd, plan.meta.ff);
+    let mut host =
+        model::moe::HostScratch::new(embd, plan.meta.ff, LIST).expect("a scratch of LIST experts");
     let mut want = vec![f32::NAN; embd * k];
     for (j, list) in lists.iter().enumerate() {
         let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
@@ -1076,8 +1084,8 @@ fn hw_union_file_matches_per_column_v2lite() {
         .unwrap();
     }
     let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
-    let mut us =
-        UnionScratch::new(embd, plan.meta.ff, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
+    let mut us = UnionScratch::new_routed(embd, plan.meta.ff, SMALL_COLS, LIST)
+        .expect("a scratch of SMALL_COLS columns");
     let mut total = 0;
     let mut counted = true;
     for (arm, on) in ARMS {
@@ -1138,8 +1146,9 @@ fn hw_union_r8_matches_file_rows() {
         "the gate and the up are the sidecar's"
     );
     let x_all: Vec<f32> = (0..4).flat_map(|t| seeded(embd, 0x7e8 + t)).collect();
-    let mut host = HostScratch::new(embd, ff);
-    let mut us = UnionScratch::new(embd, ff, UNION_MAX_COLS).expect("a scratch of UNION_MAX_COLS");
+    let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
+    let mut us = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, LIST)
+        .expect("a scratch of UNION_MAX_COLS");
     let mut failed: Vec<(usize, &str)> = Vec::new();
     let mut miscounted: Vec<(usize, &str)> = Vec::new();
     let mut spread = (usize::MAX, 0usize);
