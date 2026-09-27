@@ -20,5 +20,7 @@ workspace = true
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
 # event. JSON is the only third-party need.
 bloomery-gguf = { path = "../gguf" }
-serde_json = "=1.0.151"
+# `preserve_order`: an object keeps the key order it was parsed or built in, as a Python dict
+# does, so a chat template's `tojson` and `.items()` see a request's objects as jinja2 does.
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 thiserror.workspace = true

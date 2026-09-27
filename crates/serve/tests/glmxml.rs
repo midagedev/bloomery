@@ -412,8 +412,8 @@ fn hw_glm_fixtures_are_the_templates_markup() {
         };
         t.render(&vars).expect("render")
     };
-    // Argument keys in sorted order: the engine iterates an object's keys
-    // sorted, the model writes them in its own order.
+    // The arguments keep the model's key order through the parse and the
+    // template's `.items()`.
     for raw in [TWO_CALLS, NOTE] {
         let m = streamed(ON, ReasoningFormat::Deepseek, &[raw]).expect("parses");
         assert!(
@@ -454,7 +454,8 @@ fn hw_glm_fixtures_are_the_templates_markup() {
 }
 
 /// The server reads the markup from its template: GLM's for the GLM
-/// template, DSML for V4.1's and Qwen3's (neither spells `<arg_key>`).
+/// template, DSML for V4.1's, none for Qwen3's (its `<tool_call>` JSON has
+/// no parser here).
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_tool_format_follows_the_template() {
@@ -465,7 +466,7 @@ fn hw_tool_format_follows_the_template() {
     );
     assert_eq!(
         ToolFormat::of_template(include_str!("fixtures/qwen3-chat-template.jinja")),
-        ToolFormat::Dsml
+        ToolFormat::Unparsed
     );
 }
 

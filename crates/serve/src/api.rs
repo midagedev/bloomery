@@ -1566,12 +1566,27 @@ fn parses_tools(b: &Map<String, Value>) -> bool {
 }
 
 /// The scan a chat request's output gets: none, or the markup of the
-/// server's template.
-fn tool_scan(state: &State, b: &Map<String, Value>) -> Option<Tools> {
-    parses_tools(b).then(|| match state.tool_format {
+/// server's template; a request that asks for tool calls under a template
+/// whose markup no parser reads is refused, never answered with the calls
+/// left in `content`.
+fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, ApiError> {
+    if !parses_tools(b) {
+        return Ok(None);
+    }
+    Ok(Some(match state.tool_format {
         ToolFormat::Dsml => Tools::Dsml,
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
-    })
+        ToolFormat::Unparsed => {
+            return Err(ApiError {
+                code: 501,
+                kind: "not_supported_error",
+                message: "the chat template's tool-call markup has no parser in this server \
+                          (DSML and GLM's are parsed): send the request without tools or with \
+                          tool_choice \"none\""
+                    .to_owned(),
+            });
+        }
+    }))
 }
 
 /// A generation whose tool-call markup does not parse: the server's error,
@@ -1598,9 +1613,10 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         let p = gen_params(state, &b)?;
         let format = ReasoningFormat::from_request(b.get("reasoning_format")).map_err(invalid)?;
         let text = render_chat(state, &b)?;
-        Ok((b, p, format, text))
+        let tools = tool_scan(state, &b)?;
+        Ok((b, p, format, text, tools))
     });
-    let (b, p, format, text) = match parsed {
+    let (b, p, format, text, tools) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -1613,7 +1629,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
     let ids = state.tok.encode(&text);
-    let mut parser = ChatParser::with_tools(&text, format, tool_scan(state, &b));
+    let mut parser = ChatParser::with_tools(&text, format, tools);
     let mut run = match Run::begin(state) {
         Ok(r) => r,
         Err(e) => return send_error(w, req, &e),

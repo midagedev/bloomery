@@ -12,9 +12,9 @@ The variables are the ones bloomery-serve's render_chat (crates/serve/src/api.rs
 true), bos_token and eos_token (the mock engine's texts), tools and reasoning_effort when present and not null,
 and chat_template_kwargs merged on top.
 
-Every object in a body is written with its keys sorted, at every level: bloomery's template engine iterates
-object keys in sorted order (serde_json's map) where jinja2 keeps insertion order, so a body in sorted order is
-one on which the two agree.
+Every object in a body is written with its keys sorted, at every level, as the checked-in fixture was
+recorded. The key order does not decide the comparison: bloomery's template engine keeps a body's insertion
+order (serde_json's `preserve_order`), as jinja2 does.
 """
 import json
 import sys

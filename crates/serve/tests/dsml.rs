@@ -157,7 +157,7 @@ fn fixtures() -> Vec<(
                 vec![call(
                     0,
                     "note",
-                    r#"{"text":"He said \"hi\" — 서울 ☃\n\\n","filter":{"n":[1,2],"q":"a\"b"},"loose":"not json"}"#,
+                    r#"{"text":"He said \"hi\" — 서울 ☃\n\\n","filter":{"q":"a\"b","n":[1,2]},"loose":"not json"}"#,
                 )],
             ),
         ),
@@ -506,20 +506,22 @@ fn mask(body: &str) -> String {
     s
 }
 
-/// Recorded from the server before the split existed (base 6853f02), same request.
-const GOLDEN: &str = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"abc","role":"assistant"}}],"created":_,"id":"_","model":"m","object":"chat.completion","timings":{_},"usage":{"completion_tokens":4,"prompt_tokens":15,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":19}}"#;
+/// Recorded from the server before the split existed (base 6853f02), same request;
+/// the goldens' members re-serialized in the order the server builds them
+/// (serde_json's `preserve_order`), each value unchanged.
+const GOLDEN: &str = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"abc"}}],"created":_,"model":"m","object":"chat.completion","usage":{"completion_tokens":4,"prompt_tokens":15,"total_tokens":19,"prompt_tokens_details":{"cached_tokens":0}},"id":"_","timings":{_}}"#;
 const GOLDEN_STREAM: &str = concat!(
-    r#"data: {"choices":[{"delta":{"content":null,"role":"assistant"},"finish_reason":null,"index":0}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
+    r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
     "\n\n",
-    r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":null,"index":0}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
+    r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"a"}}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
     "\n\n",
-    r#"data: {"choices":[{"delta":{"content":"b"},"finish_reason":null,"index":0}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
+    r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"b"}}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
     "\n\n",
-    r#"data: {"choices":[{"delta":{"content":"c"},"finish_reason":null,"index":0}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
+    r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"c"}}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
     "\n\n",
-    r#"data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
+    r#"data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":_,"id":"_","model":"m","object":"chat.completion.chunk"}"#,
     "\n\n",
-    r#"data: {"choices":[],"created":_,"id":"_","model":"m","object":"chat.completion.chunk","timings":{_},"usage":{"completion_tokens":4,"prompt_tokens":15,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":19}}"#,
+    r#"data: {"choices":[],"created":_,"id":"_","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":4,"prompt_tokens":15,"total_tokens":19,"prompt_tokens_details":{"cached_tokens":0}},"timings":{_}}"#,
     "\n\n",
     "data: [DONE]\n\n",
 );

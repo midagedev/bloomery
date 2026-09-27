@@ -265,18 +265,24 @@ pub enum ToolFormat {
     Dsml,
     /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
     GlmXml,
+    /// Neither (Qwen3's `<tool_call>` JSON, say): no parser reads its calls, so
+    /// a chat request that asks for tool calls is refused.
+    Unparsed,
 }
 
 impl ToolFormat {
     /// The markup the template `source` writes for a call: GLM's when it
-    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, DSML otherwise.
+    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, DSML's when it
+    /// spells the DSML token, else [`ToolFormat::Unparsed`].
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
         let glm = [glmxml::CALL_OPEN, glmxml::KEY_OPEN, glmxml::VALUE_OPEN];
         if glm.iter().all(|tag| source.contains(tag)) {
             ToolFormat::GlmXml
-        } else {
+        } else if source.contains(DSML) {
             ToolFormat::Dsml
+        } else {
+            ToolFormat::Unparsed
         }
     }
 }
