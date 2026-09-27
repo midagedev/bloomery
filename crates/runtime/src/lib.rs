@@ -12,11 +12,13 @@
 //! and verification by sampling each verified row — needs the rows' logits.
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
-//! layer program's parts over its units ([`sched::walk`]), and [`state`], the
-//! stores a layer keeps and how later positions read them.
+//! layer program's parts over its units ([`sched::walk`]), [`state`], the
+//! stores a layer keeps and how later positions read them, and [`layer`], the
+//! sub-layer programs a layer's description names.
 
 pub mod combine;
 pub mod hc_gated;
+pub mod layer;
 mod lookup;
 pub mod qsa;
 pub mod sched;

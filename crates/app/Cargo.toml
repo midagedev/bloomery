@@ -21,7 +21,11 @@ bloomery-model = { path = "../model" }
 bloomery-runtime = { path = "../runtime" }
 # The V4.1 session and its DSpark draft on the other card (`arch::deepseek41`).
 bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
+# The GLM-5.3-Flash session (`arch::glm5next`).
+bloomery-gpu-glm5next = { path = "../gpu-glm5next", optional = true }
+bloomery-levers = { path = "../levers", optional = true }
 cuda-core = { workspace = true, optional = true }
 
 [features]
 deepseek41 = ["dep:bloomery-gpu-deepseek41", "dep:cuda-core"]
+glm5next = ["dep:bloomery-gpu-glm5next", "dep:bloomery-levers"]

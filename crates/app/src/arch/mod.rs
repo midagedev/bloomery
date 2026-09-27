@@ -4,3 +4,5 @@
 
 #[cfg(feature = "deepseek41")]
 pub mod deepseek41;
+#[cfg(feature = "glm5next")]
+pub mod glm5next;

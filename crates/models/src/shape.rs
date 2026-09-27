@@ -77,6 +77,9 @@ pub enum RouterBody {
     /// `gpu-deepseek41/src/experts_mxfp4.rs` `dflash_router`: `ds41_router`'s
     /// body with `norm` a launch argument.
     Dflash,
+    /// `gpu-deepseek41/src/router.rs` `glm5next_router*`: sigmoid scores, the
+    /// bias added for the pick only.
+    Glm5next,
 }
 
 /// One compiled router instance.
@@ -136,6 +139,12 @@ const SOFTMAX_NORM_GATED: RouterRule = RouterRule {
     bias: false,
     norm: true,
     gated: true,
+};
+const BIASED_SIGMOID: RouterRule = RouterRule {
+    score: Score::Sigmoid,
+    bias: true,
+    norm: true,
+    gated: false,
 };
 const BIASED_SQRT_SOFTPLUS: RouterRule = RouterRule {
     score: Score::SqrtSoftplus,
@@ -200,6 +209,15 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_min: 3,
         top_k_max: 3,
         at: "gpu-deepseek41/src/experts_mxfp4.rs dflash_router",
+    },
+    RouterInst {
+        body: RouterBody::Glm5next,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        per_lane: 9,
+        top_k_min: 8,
+        top_k_max: 8,
+        at: "gpu-deepseek41/src/router.rs glm5next_router*",
     },
 ];
 
@@ -565,27 +583,20 @@ mod tests {
     }
 
     /// GLM-5.3-Flash (model/tests/glm5next_meta.rs:83, "router: sigmoid, 288
-    /// experts, top 8, with a selection bias"): no router body scores with a
-    /// sigmoid, so it is refused by name, the rule and the count in the text.
+    /// experts, top 8, with a selection bias") is the `Glm5next` row, and a
+    /// sigmoid rule at another width is still refused by name.
     #[test]
-    fn glm_5_3_flash_router_is_refused_by_name() {
-        let glm = moe(
-            RouterRule {
-                score: Score::Sigmoid,
-                bias: true,
-                norm: true,
-                gated: false,
-            },
-            288,
-            8,
-        );
-        let e = select_router(glm).expect_err("GLM-5.3-Flash selected a router");
-        assert_eq!(e.why, Refusal::NoRouterRule);
-        let text = e.to_string();
-        assert!(
-            text.contains("Sigmoid") && text.contains("288 experts"),
-            "{text}"
-        );
+    fn glm_5_3_flash_router_is_its_row() {
+        let rule = RouterRule {
+            score: Score::Sigmoid,
+            bias: true,
+            norm: true,
+            gated: false,
+        };
+        let r = select_router(moe(rule, 288, 8)).expect("GLM-5.3-Flash has no router row");
+        assert_eq!(r.body, super::RouterBody::Glm5next);
+        let e = select_router(moe(rule, 320, 8)).expect_err("a sigmoid router at 320 was selected");
+        assert!(matches!(e.why, Refusal::RouterWidth { .. }), "{e}");
     }
 
     /// An expert count between two rows of a rule is refused, never taken by
