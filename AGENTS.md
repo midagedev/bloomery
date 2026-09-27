@@ -588,7 +588,9 @@ first suspect is a hung gate on the box, not the agent.
   cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
   `[workspace.dependencies]` (declared against NVlabs) and taken from our fork's
   `bloomery` branch through `[patch]` — that rev plus patches bound for upstream,
-  listed in `THIRD_PARTY_NOTICES.md`; `just deny` fails if either ever floats. The
+  listed in `THIRD_PARTY_NOTICES.md`; `just deny` fails if either ever floats. Before
+  the fork's `bloomery` branch moves, the old pin gets the tag `pin/<short rev>` on the
+  fork, and pin tags are never deleted: a rev a past commit pins must stay fetchable. The
   box never rebuilds the backend in place: `tools/box.sh` exports
   `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`
   and a `cargo oxide` command stops (rc 70) when that rev's backend is missing or
