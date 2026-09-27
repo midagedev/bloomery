@@ -33,6 +33,11 @@
 //! The feature tap of a batch's kept tokens is one launch here too
 //! ([`FfnBatch::enqueue_tap_means`], `ds41_tap_means`).
 //!
+//! The gather and the card sum have an 8-slot instance each (`_8`), which
+//! their launchers ([`FfnBatchKernels::enqueue_card_gather`],
+//! [`FfnBatchKernels::enqueue_card_acc`]) pick from the slot count; the
+//! piece's batch runs six.
+//!
 //! The launches that raise on input a batch's own route cannot produce — a
 //! place for an id past the stack, a tile that names no run of its table —
 //! are [`FfnBatchKernels`]'s, which a gate loads alone and drives with it.
@@ -600,6 +605,196 @@ mod ffn_batch_kernels {
         // width, launch contract); thread i is at's only writer.
         unsafe { *y.get_unchecked_mut(at) = hc_mean_elem(o) };
     }
+
+    /// [`ds41_card_gather`] of eight slots a token ([`gather_at`]): entry
+    /// `j`'s token column is `col0 + order[j] / 8`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            q_in.len() >= 64 * iters * cols,
+            d8_in.len() >= 2 * n_sb * cols,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            q_out.len() >= 64 * iters * n_slots,
+            d8_out.len() >= 2 * n_sb * n_slots
+        )
+    )]
+    pub fn ds41_card_gather_8(
+        q_in: &[u64],
+        d8_in: &[f32],
+        order: &[u32],
+        start: &[u32],
+        n_experts: u32,
+        n_slots: u32,
+        col0: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut q_out: DisjointSlice<u64>,
+        mut d8_out: DisjointSlice<f32>,
+    ) {
+        let a = GatherIn {
+            q_in,
+            d8_in,
+            order,
+            start,
+            n_experts,
+            n_slots,
+            col0,
+            cols,
+            n_sb,
+            iters,
+            fault,
+        };
+        // SAFETY: the launch contract is `gather_at`'s.
+        unsafe { gather_at::<SLOTS_8>(&a, &mut q_out, &mut d8_out) };
+    }
+
+    /// [`ds41_ffn_card_acc`] of eight slots a token ([`card_acc_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * n * m,
+            w.len() >= 8 * m,
+            sel.len() >= 8 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_8(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_8 slots.
+        let v = unsafe { card_acc_at::<SLOTS_8>(down, w, sel, n, n_card, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+}
+
+/// What a gather entry of `N` slots a token reads ([`gather_at`]): its
+/// arguments, as [`ffn_batch_kernels::ds41_card_gather`] names them.
+struct GatherIn<'a> {
+    q_in: &'a [u64],
+    d8_in: &'a [f32],
+    order: &'a [u32],
+    start: &'a [u32],
+    n_experts: u32,
+    n_slots: u32,
+    col0: u32,
+    cols: u32,
+    n_sb: u32,
+    iters: u32,
+    fault: FaultSink,
+}
+
+/// The gather of `N` slots a token, block `j` per table entry:
+/// `ds41_card_gather`'s rule with `N` in place of six — entry `j` below the
+/// count `start[n_experts]` copies token column `col0 + order[j] / N` of the
+/// q8_1 planes to column `j`; an entry that names no slot of the block raises
+/// [`FaultSite::ExpertId`] on `fault` and is skipped.
+///
+/// SAFETY: `q_in.len() >= 64 · iters · cols`, `d8_in.len() >= 2 · n_sb ·
+/// cols`, `order.len() >= n_slots`, `start.len() >= n_experts + 1`,
+/// `q_out.len() >= 64 · iters · n_slots`, `d8_out.len() >= 2 · n_sb ·
+/// n_slots`; one block per entry, [`THREADS`] threads a block, as the
+/// launch's index.
+#[inline(always)]
+unsafe fn gather_at<const N: usize>(
+    a: &GatherIn<'_>,
+    q_out: &mut DisjointSlice<u64>,
+    d8_out: &mut DisjointSlice<f32>,
+) {
+    let j = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    // SAFETY: n_experts < start.len() by this fn's contract.
+    let count = unsafe { *a.start.get_unchecked(a.n_experts as usize) } as usize;
+    // Block-uniform: j, the count and the entry are the block's.
+    if j >= a.n_slots as usize || j >= count {
+        return;
+    }
+    // SAFETY: j < n_slots <= order.len() by this fn's contract.
+    let slot = unsafe { *a.order.get_unchecked(j) } as usize;
+    let col = a.col0 as usize + slot / N;
+    if slot >= a.n_slots as usize || col >= a.cols as usize {
+        if tid == 0 {
+            a.fault.raise(FaultSite::ExpertId);
+        }
+        return;
+    }
+    let (qc, dc) = (64 * a.iters as usize, 2 * a.n_sb as usize);
+    let mut k = tid;
+    while k < qc {
+        // SAFETY: col < cols and j < n_slots with k < qc, inside both
+        // buffers by this fn's contract; thread tid of block j is the only
+        // writer of value k of column j.
+        unsafe { *q_out.get_unchecked_mut(j * qc + k) = *a.q_in.get_unchecked(col * qc + k) };
+        k += THREADS as usize;
+    }
+    let mut k = tid;
+    while k < dc {
+        // SAFETY: as above, with dc values a column.
+        unsafe { *d8_out.get_unchecked_mut(j * dc + k) = *a.d8_in.get_unchecked(col * dc + k) };
+        k += THREADS as usize;
+    }
+}
+
+/// The card slots' sum of value `i` (token `t = i / n`, value `d = i % n`)
+/// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[Nt + j], acc)`
+/// from zero for each slot `j` below `N` whose place `sel[Nt + j]` is below
+/// `n_card`, in ascending `j` — the order `runtime::combine::card_sum` pins (this
+/// order is the gate); no other slot's rows are read.
+///
+/// SAFETY: `i < n · m` for an `m` with `down.len() >= N · n · m`, `w.len()`
+/// and `sel.len() >= N · m`.
+#[inline(always)]
+unsafe fn card_acc_at<const N: usize>(
+    down: &[f32],
+    w: &[f32],
+    sel: &[u32],
+    n: usize,
+    n_card: u32,
+    i: usize,
+) -> f32 {
+    let (t, d) = (i / n, i % n);
+    let mut acc = 0.0f32;
+    for j in 0..N {
+        cuda_device::thread::__unroll_config::<0>();
+        let s = t * N + j;
+        // SAFETY: s < N·m <= sel.len() and w.len() by this fn's contract.
+        let (place, ws) = unsafe { (*sel.get_unchecked(s), *w.get_unchecked(s)) };
+        if place < n_card {
+            // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
+            let ds = unsafe { *down.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        }
+    }
+    acc
 }
 
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
@@ -642,17 +837,32 @@ pub struct TiledGateUp<'a> {
 /// What [`FfnBatchKernels::enqueue_card_gather`] reads: the block's q8_1
 /// planes by token (`q3`, `d8`, `cols` columns of `n_sb` super-blocks, the
 /// block's tokens from `col0`) and the table of its `n_slots` slots
-/// (`order`, runs `start` of `n_experts` experts).
-struct CardGather<'a> {
-    q3: &'a DeviceBuffer<u64>,
-    d8: &'a DeviceBuffer<f32>,
-    order: &'a DeviceBuffer<u32>,
-    start: &'a DeviceBuffer<u32>,
-    n_experts: usize,
-    n_slots: usize,
-    col0: usize,
-    cols: usize,
-    n_sb: usize,
+/// (`order`, runs `start` of `n_experts` experts), `n_used` slots a token.
+pub struct CardGather<'a> {
+    pub q3: &'a DeviceBuffer<u64>,
+    pub d8: &'a DeviceBuffer<f32>,
+    pub order: &'a DeviceBuffer<u32>,
+    pub start: &'a DeviceBuffer<u32>,
+    pub n_experts: usize,
+    pub n_slots: usize,
+    pub col0: usize,
+    pub cols: usize,
+    pub n_sb: usize,
+    pub n_used: usize,
+}
+
+/// What [`FfnBatchKernels::enqueue_card_acc`] reads, `m` tokens of `n_used`
+/// slots: `down` the slots' down outputs slot-major (`n` each, token `t`'s
+/// slots `n_used · t ..`), `w` their routing weights and `sel` their places
+/// (the card's below `n_card`; no other slot's rows are read).
+pub struct CardAcc<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_used: usize,
 }
 
 impl FfnBatchKernels {
@@ -727,10 +937,11 @@ impl FfnBatchKernels {
         Ok(())
     }
 
-    /// Enqueue `ds41_card_gather`: the q8_1 planes of `g`'s table entries
-    /// into columns `0 .. g.n_slots` of `q3` and `d8`. One launch.
-    /// Asynchronous, allocation-free.
-    fn enqueue_card_gather(
+    /// Enqueue the gather of `g.n_used` slots a token (`ds41_card_gather` for
+    /// 6, `ds41_card_gather_8` for 8; any other count is refused by name):
+    /// the q8_1 planes of `g`'s table entries into columns `0 .. g.n_slots`
+    /// of `q3` and `d8`. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_card_gather(
         &self,
         stream: &CudaStream,
         g: &CardGather<'_>,
@@ -738,29 +949,75 @@ impl FfnBatchKernels {
         q3: &mut DeviceBuffer<u64>,
         d8: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "ds41_card_gather";
-        let prep = self.module.prepare_ds41_card_gather(LaunchConfig1D::new(
-            launch_u32(what, "grid", g.n_slots)?,
-            THREADS,
-            0,
-        ))?;
-        self.module.ds41_card_gather(
-            stream,
-            &prep,
-            g.q3,
-            g.d8,
-            g.order,
-            g.start,
+        let slots = slots_of("ds41_card_gather", g.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_card_gather",
+            Slots::Eight => "ds41_card_gather_8",
+        };
+        let cfg = LaunchConfig1D::new(launch_u32(what, "grid", g.n_slots)?, THREADS, 0);
+        let v = [
             launch_u32(what, "n_experts", g.n_experts)?,
             launch_u32(what, "n_slots", g.n_slots)?,
             launch_u32(what, "col0", g.col0)?,
             launch_u32(what, "cols", g.cols)?,
             launch_u32(what, "n_sb", g.n_sb)?,
             launch_u32(what, "iters", g.n_sb.div_ceil(2))?,
-            fault,
-            q3,
-            d8,
-        )?;
+        ];
+        let m = &self.module;
+        match slots {
+            Slots::Six => {
+                let prep = m.prepare_ds41_card_gather(cfg)?;
+                m.ds41_card_gather(
+                    stream, &prep, g.q3, g.d8, g.order, g.start, v[0], v[1], v[2], v[3], v[4],
+                    v[5], fault, q3, d8,
+                )?;
+            }
+            Slots::Eight => {
+                let prep = m.prepare_ds41_card_gather_8(cfg)?;
+                m.ds41_card_gather_8(
+                    stream, &prep, g.q3, g.d8, g.order, g.start, v[0], v[1], v[2], v[3], v[4],
+                    v[5], fault, q3, d8,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue the card sums of `a.m` tokens of `a.n_used` slots
+    /// (`ds41_ffn_card_acc` for 6, `ds41_ffn_card_acc_8` for 8; any other
+    /// count is refused by name): value `i` of token `t = i / a.n` into
+    /// `acc[i]`, the card half of the combine. One launch. Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_card_acc(
+        &self,
+        stream: &CudaStream,
+        a: &CardAcc<'_>,
+        acc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let slots = slots_of("ds41_ffn_card_acc", a.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_ffn_card_acc",
+            Slots::Eight => "ds41_ffn_card_acc_8",
+        };
+        let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let (n, m, n_card) = (
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+        );
+        match slots {
+            Slots::Six => {
+                let prep = self.module.prepare_ds41_ffn_card_acc(cfg)?;
+                self.module
+                    .ds41_ffn_card_acc(stream, &prep, a.down, a.w, a.sel, n, m, n_card, acc)?;
+            }
+            Slots::Eight => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_8(cfg)?;
+                self.module
+                    .ds41_ffn_card_acc_8(stream, &prep, a.down, a.w, a.sel, n, m, n_card, acc)?;
+            }
+        }
         Ok(())
     }
 
@@ -1424,29 +1681,21 @@ impl FfnPiece {
         if let Some(s) = card {
             self.enqueue_tiled_experts(gpu, i, s, b, layer, at, u)?;
         }
-        let what = "ds41_ffn_card_acc";
         let m = u - at;
         let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
         let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
         let wts = span(WHAT, &b.weights, at * N_USED, slots_n)?;
         let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
-        let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
-        let prep = b
-            .kernels
-            .module
-            .prepare_ds41_ffn_card_acc(LaunchConfig1D::new(grid, THREADS, 0))?;
-        b.kernels.module.ds41_ffn_card_acc(
-            stream,
-            &prep,
-            &down,
-            &wts,
-            &sel,
-            launch_u32(what, "n", n)?,
-            launch_u32(what, "m", m)?,
-            launch_u32(what, "n_card", c.n_card)?,
-            &mut acc,
-        )?;
-        Ok(())
+        let a = CardAcc {
+            down: &down,
+            w: &wts,
+            sel: &sel,
+            n,
+            m,
+            n_card: c.n_card,
+            n_used: N_USED,
+        };
+        b.kernels.enqueue_card_acc(stream, &a, &mut acc)
     }
 
     /// The card's stack count for layer `layer`'s block, refused past the
@@ -1538,6 +1787,7 @@ impl FfnPiece {
                 col0: at,
                 cols: u,
                 n_sb,
+                n_used: N_USED,
             };
             let mut q3 = span_mut(WHAT, &mut b.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
             let mut d8 = span_mut(WHAT, &mut b.d8_ord, 0, slots_n * 2 * n_sb)?;

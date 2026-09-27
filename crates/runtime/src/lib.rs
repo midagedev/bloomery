@@ -15,6 +15,7 @@
 //! layer program's parts over its units ([`sched::walk`]), and [`state`], the
 //! stores a layer keeps and how later positions read them.
 
+pub mod combine;
 mod lookup;
 pub mod sched;
 mod speculative;
