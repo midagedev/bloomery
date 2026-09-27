@@ -1326,8 +1326,10 @@ gen-glm5next *ARGS:
 # qwen4exp(Qwen3.8-Flash-Next) 헤더 게이트: qwen35moe 리더의 변형 행이 합성 헤더에서 이름으로 거절하는 것들, 그다음 파일의
 # 서술·역할별 텐서·커버리지 검사의 목록과 헤더에서 세운 계획(카드·호스트·캐시 바이트). 헤더만, 초 단위. 마지막 호출은
 # 호스트 티어가 48층을 모두 서빙하는지와 네 층의 단계별 밴드다(네 층에서 expert 30개의 행을 읽는다, 초 단위). 샤드 넷이 다 있어야 한다.
+# 그 사이에 MTP 초안 파일 둘(shared와 아닌 것)을 타깃 헤더에 대어 읽은 서술을 고정한다. 앞 호출이 빨개도 뒤 호출은 모두 돌고,
+# 종료 코드는 넷 중 하나라도 0이 아니면 0이 아니다.
 gate-qwen4exp-meta:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture; lib=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture; meta=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_mtp_meta -- --ignored --nocapture; mtp=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture; host=$?; echo "gate-qwen4exp-meta rc: lib $lib meta $meta mtp $mtp host $host"; [ "$lib" = 0 ] && [ "$meta" = 0 ] && [ "$mtp" = 0 ] && [ "$host" = 0 ]'
 
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
