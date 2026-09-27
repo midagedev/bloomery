@@ -9,7 +9,7 @@
 
 Hybrid GPU + CPU inference for mixture-of-experts models, written in Rust down to the CUDA kernels.
 
-bloomery runs MoE models that do not fit on one GPU. Each routed layer keeps as many experts on the card as fit; the rest run on the CPU in the same decode step. The host code is Rust, the GPU kernels are Rust compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide), and the CPU expert kernels are AVX2 Rust. It targets one workstation: an Ampere GPU, an eight-channel AVX2 CPU and 256 GB of RAM.
+bloomery runs MoE models that do not fit on one GPU. Each routed layer keeps as many experts on the card as fit; the rest run on the CPU in the same decode step. The host code is Rust, the GPU kernels are Rust compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide), and the CPU expert kernels are AVX2 Rust. How the kernels use cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). It targets one workstation: an Ampere GPU, an eight-channel AVX2 CPU and 256 GB of RAM.
 
 ## Models
 
@@ -178,6 +178,7 @@ See [`docs/BUILD.md`](docs/BUILD.md). In short: Linux x86-64 with AVX2, CUDA 13.
 
 ## More
 
+- How bloomery uses cuda-oxide (layout, launch contracts, pinning, what we ran into): [`docs/cuda-oxide.md`](docs/cuda-oxide.md).
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
 - Plan and cost models: [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md); placement: [`docs/v41-placement.md`](docs/v41-placement.md) (Korean).
 - Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
