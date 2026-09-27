@@ -1156,6 +1156,11 @@ gate-gpu-vision:
 gate-deepseek4-meta:
     BLOOMERY_MODEL=deepseek4 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 --nocapture && bash tools/gate.sh --release -p bloomery-model --test deepseek4_meta -- --ignored --nocapture'
 
+# glm5next (GLM-5.3-Flash) header gate: the reader's refusals on synthetic headers, then its description of the
+# file and the coverage check's list. Headers only, seconds; needs all six shards.
+gate-glm5next-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
+
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
 [group('solo')]
