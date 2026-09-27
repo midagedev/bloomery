@@ -6,3 +6,4 @@
 pub mod hparams;
 pub mod names;
 pub mod roles;
+pub mod spec;

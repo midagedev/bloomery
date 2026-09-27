@@ -977,3 +977,133 @@ fn hw_ds41_names_in_file() {
         bad.join("\n  ")
     );
 }
+
+#[path = "common/spec_view.rs"]
+mod spec_view;
+
+#[path = "common/spec_fail_first.rs"]
+mod spec_fail_first;
+
+// PIN(2026-09-27): the served file's description as `arch::deepseek41::spec` reads it, line by line
+// (model-wide fields, then each run of layers that read alike) — docs/research/modelspec-design.md
+// §3 and §4 are the table these lines were checked against.
+const V41_VIEW: &[&str] = &[
+    "arch Deepseek41",
+    "hidden 5120 vocab 129280 ctx_train 1048576",
+    "rms_eps bits 0x1e3ce508",
+    "layers 40 mtp 0",
+    "hc Some(HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix })",
+    "engram Some(EngramSpec { heads: 8, max_ngram: 4, key_length: 256 })",
+    "chat pre joyai-llm template bytes 6945 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    "[0] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[1] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc [Engram]",
+    "[2,8] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 Own{g1 a0 o0} | sel 32x128 k512 keys Own list Own cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[3-7] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 From2 | sel 32x128 k512 keys From2 list From2 cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[9-13] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 From8 | sel 32x128 k512 keys From8 list From8 cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[14] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 Own{g1 a0 o0} | sel 32x128 k512 keys Own list Own cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc [Engram]",
+    "[15-19] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 From14 | sel 32x128 k512 keys From14 list From14 cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[20] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 Own{g0 a0 o0} | sel 32x128 k512 keys Own list Own cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[21-23] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list From20 cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[24,28,32,36] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list Own cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[25-27] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list From24 cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[29-31] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list From28 cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[33-35] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list From32 cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+    "[37-39] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r1 From20 | sel 32x128 k512 keys From20 list From36 cand Some(Candidates { source: 20, blocks: 2048, block: 8 }) || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+];
+
+// PIN(2026-09-27): the DSpark draft's description (`spec::draft_of`), same form; §3's DraftSpec row.
+const DSPARK_VIEW: &[&str] = &[
+    "hidden 5120 vocab 129280 rms_eps bits 0x1e3ce508",
+    "hc HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix }",
+    "width 5 target_layers [37, 38, 39] mask_token 128799 markov_rank 256",
+    "[0-2] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 128/3 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
+];
+
+/// 4. `hw_ds41_spec` — the typed description of the served file and of the
+///    DSpark draft: (a) every field pinned; (b) the three facts the prompt
+///    call's triangle reads (owns rows, owns keys, sources) equal the layer
+///    table's on every layer; (c) the coverage check lists nothing, and with
+///    the router's row taken out of its table it lists that router on every
+///    layer.
+#[test]
+#[ignore = "hw: needs the V4.1 shards and the DSpark draft on the box"]
+fn hw_ds41_spec() {
+    use model::arch::deepseek41::{roles, spec};
+    use model::arch::dspark::DraftHparams;
+    use model::arch::models::DraftSpec;
+    let (split, hp) = open();
+    let mut o = String::new();
+    let mut b = Vec::new();
+    let read = spec::read(&split).unwrap_or_else(|e| panic!("spec: {e}"));
+    let s = &read.spec;
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "V4.1 description",
+        &spec_view::view(s),
+        V41_VIEW,
+    );
+    let tensors = roles::classify(&split, &hp).unwrap_or_else(|e| panic!("classify: {e}"));
+    let _ = writeln!(o, "the triangle's facts, layer by layer");
+    for (l, (k, ls)) in hp.layers.iter().zip(&s.layers).enumerate() {
+        let at = l as u32;
+        let kind = (
+            k.compressor.is_some(),
+            k.index_keys,
+            k.stream
+                .map(|st| [st.kv_source, st.index_key_source, st.topk_source]),
+        );
+        let from_spec = (
+            ls.owns_rows(),
+            ls.owns_keys(),
+            ls.sources(at).map(|x| x.map(|v| v as usize)),
+        );
+        layer_row(
+            &mut o,
+            &mut b,
+            &format!("layer {l} ced facts"),
+            from_spec,
+            kind,
+            "LayerKind",
+        );
+    }
+    let items = spec_view::items(&model::arch::coverage::check(s, &tensors));
+    row(
+        &mut o,
+        &mut b,
+        "coverage items",
+        items,
+        Vec::new(),
+        "none: the chain runs it",
+    );
+    spec_fail_first::fail_first(
+        &mut o,
+        &mut b,
+        s,
+        &tensors,
+        "gpu-deepseek41/src/router.rs N_EXPERT, N_USED",
+        "router: sqrt-softplus, 384 experts, top 6, with a selection bias: 0-39",
+    );
+    let dpath = std::env::var("BLOOMERY_DSPARK_MODEL").unwrap_or_else(|_| {
+        panic!("BLOOMERY_DSPARK_MODEL is unset: run through `just gate-ds41-meta`")
+    });
+    let dsplit = Split::open(&dpath).unwrap_or_else(|e| panic!("open {dpath}: {e}"));
+    let dhp = DraftHparams::read(&dsplit).unwrap_or_else(|e| panic!("draft hparams: {e}"));
+    let DraftSpec::Block(d) = spec::draft_of(&dhp).unwrap_or_else(|e| panic!("draft spec: {e}"));
+    let mut dview = vec![
+        format!(
+            "hidden {} vocab {} rms_eps bits {:#010x}",
+            d.hidden,
+            d.vocab,
+            d.rms_eps.to_bits()
+        ),
+        format!("hc {:?}", d.hc),
+        format!(
+            "width {} target_layers {:?} mask_token {} markov_rank {}",
+            d.width, d.target_layers, d.mask_token, d.markov_rank
+        ),
+    ];
+    dview.extend(spec_view::layer_lines(&d.layers));
+    spec_view::compare(&mut o, &mut b, "DSpark description", &dview, DSPARK_VIEW);
+    fail_if_bad(&o, &b);
+}

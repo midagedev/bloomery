@@ -202,3 +202,24 @@ pub const UNIMPLEMENTED: &[(&str, Option<&[usize]>)] = &[
     ("the hyper-connection head output_hc_*", None),
     ("a model without engram sites", None),
 ];
+
+// PIN(2026-09-27): what the engine refuses the file for beyond `UNIMPLEMENTED` since the refusal is
+// the coverage check (arch::coverage), which also reads the instances the V4.1 chain's kernels are
+// built for: its router takes 384 experts, top 6 (the file's 256 split by the selection bias, which
+// the hash-routed layers 0-2 lack), and its indexer 32 heads (the file's 64). FAIL-first: the base
+// tree's `PlanInputs::read` listed `UNIMPLEMENTED` alone (gate-deepseek4-meta green on b8df15f).
+pub const INSTANCES: &[(&str, Option<&[usize]>)] = &[
+    (
+        "router: sqrt-softplus, 256 experts, top 6",
+        Some(HASH_ROUTED.layers),
+    ),
+    (
+        "router: sqrt-softplus, 256 experts, top 6, with a selection bias",
+        Some(BIASED_LAYERS),
+    ),
+    ("stream indexer: 64 heads x 128", Some(SELECTED.layers)),
+];
+const BIASED_LAYERS: &[usize] = &[
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+];

@@ -161,12 +161,20 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
+ "bloomery-models",
  "bloomery-qdot",
  "bloomery-refset",
  "bloomery-threads",
  "libc",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "bloomery-models"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
 ]
 
 [[package]]

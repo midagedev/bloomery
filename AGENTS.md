@@ -161,6 +161,9 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # path, as the set states it), of the family's ik build; host only
     just refset-check [FAMILY PATH...]  # which reference sets are stale, one line a set; with
                       # no arguments every family's sets in place; reads only
+    just gate-qwen35moe-meta  # the Qwen3.6 (qwen35moe) header-only reader: its ModelSpec pins over the
+                      # Q4_K_M and UD-Q4_K_XL files and the coverage check's list (what the tree cannot
+                      # run yet, per instance with its layers); host only, like the other *-meta gates
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -226,6 +229,7 @@ could not win on a kernel already at ~700 GB/s.
 |---|---|---|---|
 | move, split, rename (semantics kept) | `just ptx-scan` table identical — that proves the kernels only; host dispatch code also needs its structural lines unchanged (graph node count, eager = replay, e2e set identical) | none beyond those structural lines | none |
 | delete (a settled arm, a dead entry, a museum bin; rebuild wave 1, 2026-09-26) | `just ptx-scan` of `generate_ds41` and `gate_e2e` equals the base minus exactly the deleted entries — every remaining row and md5 identical — and `just gate-ptx-spill` is red on exactly those rows before `ptx-shapes.tsv` loses them and green after; per deleted entry, the grep that shows no caller left. A remaining entry whose md5 moves makes the change more than a deletion: it lands only when `tools/ref/ptx-canon.py` prints `reordered-only` for it (the same canonical lines, independent instructions in another order) and its resource columns are equal (wave 1: `flash_latent`, `flash_latent_q8` after the `TWICE` scaffolding left `latent_range` — one loop-counter init moved above two constants) | the owning gates of what the deletion touched — for an entry whose md5 moved, its owning gates bit-identical to the base; a removed gate, case or arm is a coverage change and its commit carries the dated reason (the verdict or the grep that retires it) | none |
+| add (a new kernel family or entry with no caller in the engine yet; rebuild wave 3, 2026-09-27: the k-quant expert family's Q5_K entries) | `just ptx-scan` of `generate_ds41` and `gate_e2e` equals the base **plus exactly the new entries** — every existing row and md5 identical; `just gate-ptx-spill` red on exactly the new rows before `ptx-shapes.tsv` gains them and green after; the family's own gate green with FAIL-first shown per clause (a mutant per rule the clause pins) | the new family gate, and the owning gates of any entry the engine bins gained | none — an added kernel with no engine caller moves no step |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
 | fold a launch's work into a neighbour kernel | Δt = −ΔN × c_node − the removed kernel's time + the work every block of the host grid now repeats or waits on × its blocks; a grid already near ~700 GB/s pays that last term in full | the owning gate | once (qwen3fuse set that term to 0: two folds predicted faster, each measured +0.13 ms) |

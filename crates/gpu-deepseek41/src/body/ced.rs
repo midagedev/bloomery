@@ -36,6 +36,7 @@
 use std::ops::Range;
 
 use model::arch::deepseek41::hparams::LayerKind;
+use model::arch::models::LayerSpec;
 
 use super::prefill::CHUNK;
 
@@ -159,17 +160,42 @@ pub struct CedLayer {
     pub sources: Option<[usize; 3]>,
 }
 
-impl CedLayer {
-    /// Layer `kind`'s facts.
-    #[must_use]
-    pub fn of(kind: &LayerKind) -> CedLayer {
+/// A layer as the walk can read it: the model's description ([`LayerSpec`])
+/// or the programs' layer table ([`LayerKind`]), which say the same three
+/// facts.
+pub trait CedSource {
+    /// Layer `l`'s facts, `l` being this layer's index.
+    fn ced(&self, l: usize) -> CedLayer;
+}
+
+impl CedSource for LayerKind {
+    fn ced(&self, _l: usize) -> CedLayer {
         CedLayer {
-            compressor: kind.compressor.is_some(),
-            index_keys: kind.index_keys,
-            sources: kind
+            compressor: self.compressor.is_some(),
+            index_keys: self.index_keys,
+            sources: self
                 .stream
                 .map(|s| [s.kv_source, s.index_key_source, s.topk_source]),
         }
+    }
+}
+
+impl CedSource for LayerSpec {
+    fn ced(&self, l: usize) -> CedLayer {
+        let at = u32::try_from(l).expect("a layer index of a u32 layer count");
+        CedLayer {
+            compressor: self.owns_rows(),
+            index_keys: self.owns_keys(),
+            sources: self.sources(at).map(|s| s.map(|x| x as usize)),
+        }
+    }
+}
+
+impl CedLayer {
+    /// Layer `l`'s facts, from its `kind`.
+    #[must_use]
+    pub fn of(kind: &impl CedSource, l: usize) -> CedLayer {
+        kind.ced(l)
     }
 }
 
@@ -217,8 +243,12 @@ impl Ced {
     /// over rings of `slots` rows, `on` the `BLOOMERY_CED` lever: unset or
     /// `on` runs the triangle where the file allows it, `off` runs every layer
     /// at every position — the same-binary arm the triangle is timed against.
-    pub(super) fn new(kinds: &[LayerKind], slots: usize, on: bool) -> Ced {
-        let facts: Vec<CedLayer> = kinds.iter().map(CedLayer::of).collect();
+    pub(super) fn new(kinds: &[impl CedSource], slots: usize, on: bool) -> Ced {
+        let facts: Vec<CedLayer> = kinds
+            .iter()
+            .enumerate()
+            .map(|(l, k)| CedLayer::of(k, l))
+            .collect();
         let state = match (on, exact(&facts)) {
             (false, _) => CedState::Off("BLOOMERY_CED=off"),
             (true, Err(why)) => CedState::Off(why),

@@ -389,3 +389,59 @@ fn hw_qwen3moe_tensor_inventory() {
     }
     fail_if_bad(&out, &bad);
 }
+
+#[path = "common/spec_view.rs"]
+mod spec_view;
+
+#[path = "common/spec_fail_first.rs"]
+mod spec_fail_first;
+
+// PIN(2026-09-27): the file's description as `arch::qwen3moe::spec` reads it, line by line —
+// docs/research/modelspec-design.md §3 is the table these lines were checked against.
+const Q3_VIEW: &[&str] = &[
+    "arch Qwen3Moe",
+    "hidden 2048 vocab 151936 ctx_train 262144",
+    "rms_eps bits 0x358637bd",
+    "layers 48 mtp 0",
+    "hc None",
+    "engram None",
+    "chat pre qwen2 template bytes 4040 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    "[0-47] gqa 32/4 x 128 rope Neox 128 base 10000000 yarn - qk_norm true out_gate false || moe 128/8 ff 768 swiglu None Softmax bias false norm true x1 hash false || plain",
+];
+
+/// 3. `hw_qwen3moe_spec` — the typed description: (a) every field pinned;
+///    (c) the coverage check lists nothing, and with the flash row taken out
+///    of its table it lists that flash on every layer.
+#[test]
+#[ignore = "needs the qwen3moe file on the box"]
+fn hw_qwen3moe_spec() {
+    let (split, _) = open();
+    let mut o = String::new();
+    let mut b = Vec::new();
+    let read = model::arch::qwen3moe::spec::read(&split).unwrap_or_else(|e| panic!("spec: {e}"));
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "Qwen3 description",
+        &spec_view::view(&read.spec),
+        Q3_VIEW,
+    );
+    let items = spec_view::items(&model::arch::coverage::check(&read.spec, &read.tensors));
+    row(
+        &mut o,
+        &mut b,
+        "coverage items",
+        items,
+        Vec::new(),
+        "none: the body runs it",
+    );
+    spec_fail_first::fail_first(
+        &mut o,
+        &mut b,
+        &read.spec,
+        &read.tensors,
+        "gpu/src/flash_gqa.rs HEAD, GROUP",
+        "GQA flash, head 128, pack 8: 0-47",
+    );
+    fail_if_bad(&o, &b);
+}

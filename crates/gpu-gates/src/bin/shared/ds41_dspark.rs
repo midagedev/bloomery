@@ -38,7 +38,9 @@ use bloomery_gpu_deepseek41::draft::load::DraftWeights;
 use bloomery_gpu_gates::GateError;
 use cuda_core::CudaContext;
 use gguf::Split;
+use model::arch::deepseek41::spec::draft_of;
 use model::arch::dspark::DraftHparams;
+use model::arch::models::DraftSpec;
 use model::placement::workstation;
 
 /// The block width every proposal is pinned to.
@@ -104,7 +106,13 @@ impl Dspark {
         target_file: Arc<Split>,
         card: &'static str,
     ) -> Result<Dspark, GateError> {
-        body::attach_features(m, &hp.target_layers)?;
+        let DraftSpec::Block(draft_spec) = draft_of(hp)?;
+        let taps: Vec<usize> = draft_spec
+            .target_layers
+            .iter()
+            .map(|&l| l as usize)
+            .collect();
+        body::attach_features(m, &taps)?;
         let target = target_ctx(m)?;
         let width = m.body(WHAT)?.feature_width();
         let gpu = Gpu::for_card(card)?;

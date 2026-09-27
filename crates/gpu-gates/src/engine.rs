@@ -15,7 +15,8 @@
 use bloomery_gpu::model::Engine;
 use bloomery_gpu::{Deepseek2Model, Gpu, GpuError, Qwen3moeModel};
 use gguf::Split;
-use model::arch::Arch;
+use model::arch::{self, Arch, coverage, models};
+use model::placement::PlacementError;
 
 /// The engine for whichever architecture a file declares, one arm per
 /// architecture this build can run. An architecture the model crate knows but
@@ -31,23 +32,41 @@ impl AnyEngine {
     /// Detect `file`'s architecture, then load that architecture's whole
     /// chain and output head with a `ctx`-row cache: deepseek2 through its
     /// `open` (every weight on the card, or the hybrid load its levers ask
-    /// for), qwen3moe through its `open` (the whole model on one card, with
-    /// the ubatch size and the flash pass its levers name, read here).
+    /// for); any other architecture by its description
+    /// ([`model::arch::spec`]) — qwen3moe through its `open` (the whole model
+    /// on one card, with the ubatch size and the flash pass its levers name,
+    /// read here) once the coverage check finds nothing it cannot run.
     /// A deepseek41 file is [`GpuError::UnsupportedArch`] here, before any
-    /// load. The engine takes the file.
+    /// load; a file whose description has parts no program runs is refused
+    /// with every such part listed. deepseek2 has no description reader and
+    /// dispatches on the architecture string. The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
+        const WHAT: &str = "AnyEngine::open";
         let head = file.shard(0).ok_or(GpuError::State {
-            what: "AnyEngine::open",
+            what: WHAT,
             missing: "the file's first shard",
         })?;
-        match Arch::detect(head)? {
-            Arch::Deepseek2 => Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?)),
-            a @ Arch::Deepseek41 => Err(GpuError::UnsupportedArch(a.name().to_string())),
-            Arch::Qwen3moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
+        match Arch::detect(head) {
+            Ok(Arch::Deepseek2) => {
+                return Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?));
+            }
+            Ok(a @ Arch::Deepseek41) => {
+                return Err(GpuError::UnsupportedArch(a.name().to_string()));
+            }
+            Ok(Arch::Qwen3moe) | Err(_) => {}
+        }
+        let read = arch::spec(&file)?;
+        let missing = coverage::check(&read.spec, &read.tensors);
+        if !missing.is_empty() {
+            return Err(GpuError::plan(WHAT, PlacementError::Unimplemented(missing)));
+        }
+        match read.spec.arch {
+            models::Arch::Qwen3Moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
                 Gpu::new()?,
                 file,
                 Qwen3moeModel::lever_opts(ctx)?,
             )?)),
+            a => Err(GpuError::UnsupportedArch(a.name().to_string())),
         }
     }
 }

@@ -790,6 +790,7 @@ Not items:
 4. **Call sites that read the spec first:**
    - `PlanInputs::read` (deepseek41/place.rs:55-63): `unimplemented()` (:77-124) becomes the coverage check, with the same error and the same strings.
    - qwen3moe `PlanInputs::read` (qwen3moe/place.rs:72-77): the check is added; it finds nothing today.
+     (Lead, 2026-09-27: `qwen3moe/place.rs` was deleted by `q3prune` (`fca8171`) before this landed; the qwen3moe arm has no `place.rs`, and the check runs from `AnyEngine::open`'s dispatch instead.)
    - `Ced::new` and `CedLayer::of` (ced.rs:166-174, :230) take `&[LayerSpec]`.
    - `AnyEngine::open` (engine.rs:39-58) dispatches on `ModelSpec.arch`.
    - `attach_features` (shared/ds41_dspark.rs:107) takes `BlockDraft.target_layers`.
@@ -812,6 +813,7 @@ Not items:
 - **(c) The check's specimens:**
   - V4.1 and Qwen3 produce no items.
   - V4-Flash produces exactly `deepseek4_pins::UNIMPLEMENTED` (:184-204).
+    (Lead, 2026-09-27: as landed, V4-Flash's list is `UNIMPLEMENTED` plus three instance items the coverage check names — a behaviour change the round's report lists by name; the pins were re-pinned with `PIN(2026-09-27)`.)
   - FAIL-first: with one instance removed from the available table, the check must list that instance's layers.
 - **(d) Synthetic headers** (arch/mod.rs:172-239) must each give a named refusal:
   - a compressor at ratio 0;
