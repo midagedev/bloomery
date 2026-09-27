@@ -2,14 +2,27 @@
 //! `m` tokens: the depthwise causal conv of every channel over its last
 //! [`CONV_TAPS`] inputs, SiLU, the L2 norm of each query and key head (the
 //! query also scaled by [`Q_SCALE`]), β and the decay of each value head, and
-//! the conv state after the call's last token.
+//! the conv ring's new slots.
 //!
-//! Geometry: one warp per (token, conv head), four warps per block, no
-//! shared memory and no barrier. Lane `l` owns channels `l + 32·i`
-//! (`i = 0..4`) of its head. The tokens are independent: a token's window is
-//! the call's input where it has one and the incoming state before it. The
-//! warps of the call's last token write the new state; a value head's lane 0
-//! computes that head's β and decay for its token.
+//! Positions: token `t` is position `pos[t]`, the words the embedding launch
+//! writes, `pos[t] = pos[0] + t`. Its predecessor at distance `d` (1 to
+//! [`CONV_ROWS`]) is the call's row `t − d` when `d <= t`; otherwise it lies
+//! before the call: zero when `pos[t] < d` (the sequence start, whatever the
+//! ring holds), else ring slot `(pos[t] − d) mod RING_ROWS`. The call writes
+//! the input of each of its last `min(m, RING_ROWS)` tokens into slot
+//! `pos[t] mod RING_ROWS`, so the ring holds the inputs of the last
+//! [`RING_ROWS`] positions and a later call from any of the last
+//! [`super::PASS_ROWS`] + 1 positions reads its predecessors without a copy.
+//! A token whose position is not `pos[0] + t` has no defined predecessors: it
+//! raises [`FaultSite::LinearConv`] and its output is NaN.
+//!
+//! Geometry: one warp per (unit, conv head), four warps per block, no shared
+//! memory and no barrier. Lane `l` owns channels `l + 32·i` (`i = 0..4`) of
+//! its head. Unit 0 is tokens `0 .. min(m, 3)` — every token that reads the
+//! ring — and afterwards writes the ring; unit `u >= 1` is token `u + 2`,
+//! whose predecessors are all the call's rows. The ring is touched by unit 0
+//! alone, each channel by one lane, its reads before its writes. A value
+//! head's lane 0 computes that head's β and decay for its token.
 //!
 //! Numeric contract (the host rule [`conv_prep_host`] is this list):
 //! - conv: `acc = x₀·w₀` rounded, then `acc = fma(xⱼ, wⱼ, acc)` for taps
@@ -23,12 +36,13 @@
 //! - β = [`sigmoid`]`(b)`; decay = [`expf_ik`]`(`[`softplus`]`(a + dt)·ssm_a)`.
 //!
 //! No silent failure: a non-finite input, a conv sum that overflows, a norm
-//! sum that is not finite as f32 (the square of a finite value can be), or a
-//! β or decay that is not finite raises [`FaultSite::LinearConv`], and the
-//! value written there is not finite. `max(NaN, eps)` would otherwise turn
-//! an overflowed norm into a zero head.
+//! sum that is not finite as f32 (the square of a finite value can be), a β
+//! or decay that is not finite, or a position that is not `pos[0] + t`
+//! raises [`FaultSite::LinearConv`], and the value written there is not
+//! finite. `max(NaN, eps)` would otherwise turn an overflowed norm into a
+//! zero head.
 
-use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE};
+use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE, RING_ROWS};
 use super::{expf_ik, sigmoid, silu, softplus};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -39,15 +53,182 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread,
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-const _: () = assert!(HEAD == 128 && CONV_TAPS == 4 && BLOCK == 128);
+const _: () = assert!(HEAD == 128 && CONV_TAPS == 4 && BLOCK == 128 && RING_ROWS == 11);
+
+/// The warps of a call of `m` tokens per conv head: unit 0 takes the first
+/// `min(m, CONV_ROWS)` tokens, every later token a unit of its own.
+#[inline(always)]
+#[must_use]
+pub fn units(m: usize) -> usize {
+    m.max(CONV_ROWS) - (CONV_ROWS - 1)
+}
+
+/// The inputs one warp reads.
+#[derive(Clone, Copy)]
+struct Inputs<'a> {
+    x: &'a [f32],
+    w: &'a [f32],
+    b_raw: &'a [f32],
+    a_raw: &'a [f32],
+    dt_bias: &'a [f32],
+    ssm_a: &'a [f32],
+    eps: f32,
+    n_k: usize,
+    n_v: usize,
+}
+
+/// Where one warp writes: the call's outputs.
+#[derive(Clone, Copy)]
+struct Outputs {
+    y: *mut f32,
+    beta: *mut f32,
+    decay: *mut f32,
+}
+
+/// Token `t` (position `p`, `contiguous` whether `p = pos[0] + t`) of conv
+/// head `hp` on this lane's four channels: the conv, the norm, `y`, and for
+/// a value head's lane 0 β and decay. Whether every value stayed finite.
+///
+/// # Safety
+///
+/// `t < m`, `hp < 2·n_k + n_v`, `lane < 32`; the slices and `out` hold the
+/// lengths `gdn_conv_prep`'s launch contract names; `ring` addresses
+/// `RING_ROWS·C` f32s that no other warp touches while this one runs (it is
+/// read only when `t < CONV_ROWS`, unit 0's tokens); the (t, hp) outputs are
+/// this warp's own. Called by all 32 lanes of the warp together.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one token's coordinates and the warp's inputs and outputs, forwarded from the entry"
+)]
+#[inline(always)]
+unsafe fn conv_token(
+    t: usize,
+    p: usize,
+    contiguous: bool,
+    hp: usize,
+    lane: usize,
+    inp: Inputs<'_>,
+    ring: *const f32,
+    out: Outputs,
+) -> bool {
+    let heads = 2 * inp.n_k + inp.n_v;
+    let ch = heads * HEAD;
+    let mut vals = [0.0f32; 4];
+    let mut sumsq = 0.0f64;
+    let mut ok = contiguous;
+    let mut i = 0usize;
+    while i < 4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let c = hp * HEAD + lane + 32 * i;
+        // Tap j reads the predecessor at distance d = CONV_ROWS − j.
+        let mut xs = [0.0f32; 4];
+        let mut j = 0usize;
+        while j < CONV_TAPS {
+            cuda_device::thread::__unroll_config::<0>();
+            let d = CONV_ROWS - j;
+            // SAFETY: c < ch; for d <= t the row t − d < m, inside x (m·ch
+            // values by the contract); else the slot (p − d) mod RING_ROWS
+            // (p >= d) is a row of the ring (RING_ROWS·ch values).
+            xs[j] = unsafe {
+                if d <= t {
+                    *inp.x.get_unchecked((t - d) * ch + c)
+                } else if p < d {
+                    0.0
+                } else {
+                    *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c)
+                }
+            };
+            j += 1;
+        }
+        // SAFETY: 4c + 3 < 4·ch <= w.len() by the contract.
+        let wv = unsafe {
+            [
+                *inp.w.get_unchecked(4 * c),
+                *inp.w.get_unchecked(4 * c + 1),
+                *inp.w.get_unchecked(4 * c + 2),
+                *inp.w.get_unchecked(4 * c + 3),
+            ]
+        };
+        let mut acc = mul_rn_f32(xs[0], wv[0]);
+        acc = fma_rn_f32(xs[1], wv[1], acc);
+        acc = fma_rn_f32(xs[2], wv[2], acc);
+        acc = fma_rn_f32(xs[3], wv[3], acc);
+        ok &= crate::fault::quad_finite(xs) & acc.is_finite();
+        let s = silu(acc);
+        vals[i] = s;
+        sumsq += f64::from(mul_rn_f32(s, s));
+        i += 1;
+    }
+
+    if hp < 2 * inp.n_k {
+        let mut acc = sumsq;
+        acc += warp::shuffle_xor_f64(acc, 16);
+        acc += warp::shuffle_xor_f64(acc, 8);
+        acc += warp::shuffle_xor_f64(acc, 4);
+        acc += warp::shuffle_xor_f64(acc, 2);
+        acc += warp::shuffle_xor_f64(acc, 1);
+        let sum = acc as f32;
+        let fin = sum.is_finite();
+        ok &= fin;
+        let scale = if fin {
+            1.0 / sum.sqrt().max(inp.eps)
+        } else {
+            f32::NAN
+        };
+        let mut i = 0usize;
+        while i < 4 {
+            cuda_device::thread::__unroll_config::<0>();
+            vals[i] = mul_rn_f32(vals[i], scale);
+            if hp < inp.n_k {
+                vals[i] = mul_rn_f32(vals[i], Q_SCALE);
+            }
+            i += 1;
+        }
+    }
+    let mut i = 0usize;
+    while i < 4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let v = if contiguous { vals[i] } else { f32::NAN };
+        // SAFETY: t < m and c < ch, inside y (m·ch values by the contract);
+        // one lane per channel.
+        unsafe { *out.y.add(t * ch + hp * HEAD + lane + 32 * i) = v };
+        i += 1;
+    }
+
+    if hp >= 2 * inp.n_k && lane == 0 {
+        let h = hp - 2 * inp.n_k;
+        let at = t * inp.n_v + h;
+        // SAFETY: h < n_v and t < m: `at` < m·n_v <= b_raw, a_raw, beta,
+        // decay lengths; h < n_v <= dt_bias, ssm_a lengths.
+        let (b, a, dt, sa) = unsafe {
+            (
+                *inp.b_raw.get_unchecked(at),
+                *inp.a_raw.get_unchecked(at),
+                *inp.dt_bias.get_unchecked(h),
+                *inp.ssm_a.get_unchecked(h),
+            )
+        };
+        let bt = sigmoid(b);
+        let dc = expf_ik(mul_rn_f32(softplus(a + dt), sa));
+        let fin = crate::fault::quad_finite([b, a, dt, sa]) & bt.is_finite() & dc.is_finite();
+        ok &= fin;
+        // SAFETY: as the reads above; one lane per (token, head).
+        unsafe {
+            *out.beta.add(at) = if fin { bt } else { f32::NAN };
+            *out.decay.add(at) = if fin { dc } else { f32::NAN };
+        }
+    }
+    ok
+}
 
 #[cuda_module]
 mod conv_kernels {
     use super::*;
 
     /// The conv and prep of `m` tokens (module doc). Warp `w = 4·block +
-    /// warp` is token `w / H` and conv head `w % H`, `H = 2·n_k + n_v`: heads
-    /// below `n_k` are queries, below `2·n_k` keys, the rest values.
+    /// warp` is unit `w / H` ([`units`]) and conv head `w % H`, `H = 2·n_k +
+    /// n_v`: heads below `n_k` are queries, below `2·n_k` keys, the rest
+    /// values.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -59,159 +240,113 @@ mod conv_kernels {
         block = (128, 1, 1),
         requires = (
             x.len() >= m * (2 * n_k + n_v) * 128,
-            state_in.len() >= 3 * (2 * n_k + n_v) * 128,
             w.len() >= 4 * (2 * n_k + n_v) * 128,
             b_raw.len() >= m * n_v,
             a_raw.len() >= m * n_v,
             dt_bias.len() >= n_v,
             ssm_a.len() >= n_v,
+            pos.len() >= m,
+            m >= 1,
             y.len() >= m * (2 * n_k + n_v) * 128,
-            state_out.len() >= 3 * (2 * n_k + n_v) * 128,
             beta.len() >= m * n_v,
-            decay.len() >= m * n_v
+            decay.len() >= m * n_v,
+            ring.len() >= 11 * (2 * n_k + n_v) * 128
         )
     )]
     pub fn gdn_conv_prep(
         x: &[f32],
-        state_in: &[f32],
         w: &[f32],
         b_raw: &[f32],
         a_raw: &[f32],
         dt_bias: &[f32],
         ssm_a: &[f32],
+        pos: &[u32],
         eps: f32,
         n_k: u32,
         n_v: u32,
         m: u32,
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
-        mut state_out: DisjointSlice<f32>,
         mut beta: DisjointSlice<f32>,
         mut decay: DisjointSlice<f32>,
+        mut ring: DisjointSlice<f32>,
     ) {
         let heads = (2 * n_k + n_v) as usize;
         let ch = heads * HEAD;
         let tid = thread::threadIdx_x() as usize;
         let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
         let m = m as usize;
-        if wi >= m * heads {
+        if wi >= units(m) * heads {
             return; // warp-uniform
         }
         let lane = tid % 32;
-        let t = wi / heads;
-        let hp = wi - t * heads;
-        let n_k = n_k as usize;
-        let last = t + 1 == m;
-
-        let mut out = [0.0f32; 4];
-        let mut sumsq = 0.0f64;
+        let u = wi / heads;
+        let hp = wi - u * heads;
+        let inp = Inputs {
+            x,
+            w,
+            b_raw,
+            a_raw,
+            dt_bias,
+            ssm_a,
+            eps,
+            n_k: n_k as usize,
+            n_v: n_v as usize,
+        };
+        let out = Outputs {
+            y: y.as_mut_ptr(),
+            beta: beta.as_mut_ptr(),
+            decay: decay.as_mut_ptr(),
+        };
+        let ring = ring.as_mut_ptr();
+        let (t0, t1) = if u == 0 {
+            (0, m.min(CONV_ROWS))
+        } else {
+            (u + CONV_ROWS - 1, u + CONV_ROWS)
+        };
+        // SAFETY: pos holds m >= 1 words by the contract.
+        let p0 = unsafe { *pos.get_unchecked(0) } as u64;
         let mut ok = true;
-        let mut i = 0usize;
-        #[unroll]
-        while i < 4 {
-            let c = hp * HEAD + lane + 32 * i;
-            // Tap j is input t − 3 + j: the call's row where it has one, else
-            // row t + j of the incoming state.
-            let mut xs = [0.0f32; 4];
-            let mut j = 0usize;
-            #[unroll]
-            while j < CONV_TAPS {
-                // SAFETY: c < ch; for t + j >= 3 the row t + j − 3 < m, inside
-                // x (m·ch values by the contract); else t + j < 3, a row of
-                // state_in (3·ch values).
-                xs[j] = unsafe {
-                    if t + j >= CONV_ROWS {
-                        *x.get_unchecked((t + j - CONV_ROWS) * ch + c)
-                    } else {
-                        *state_in.get_unchecked((t + j) * ch + c)
-                    }
-                };
-                j += 1;
-            }
-            // SAFETY: 4c + 3 < 4·ch <= w.len() by the contract.
-            let wv = unsafe {
-                [
-                    *w.get_unchecked(4 * c),
-                    *w.get_unchecked(4 * c + 1),
-                    *w.get_unchecked(4 * c + 2),
-                    *w.get_unchecked(4 * c + 3),
-                ]
-            };
-            let mut acc = mul_rn_f32(xs[0], wv[0]);
-            acc = fma_rn_f32(xs[1], wv[1], acc);
-            acc = fma_rn_f32(xs[2], wv[2], acc);
-            acc = fma_rn_f32(xs[3], wv[3], acc);
-            ok &= crate::fault::quad_finite(xs) & acc.is_finite();
-            let s = silu(acc);
-            out[i] = s;
-            sumsq += f64::from(mul_rn_f32(s, s));
-            if last {
-                // SAFETY: rows 0..3 of state_out hold 3·ch values; c < ch.
-                // Each channel's rows are written by this one lane.
-                unsafe {
-                    *state_out.get_unchecked_mut(c) = xs[1];
-                    *state_out.get_unchecked_mut(ch + c) = xs[2];
-                    *state_out.get_unchecked_mut(2 * ch + c) = xs[3];
-                }
-            }
-            i += 1;
-        }
-
-        if hp < 2 * n_k {
-            let mut acc = sumsq;
-            acc += warp::shuffle_xor_f64(acc, 16);
-            acc += warp::shuffle_xor_f64(acc, 8);
-            acc += warp::shuffle_xor_f64(acc, 4);
-            acc += warp::shuffle_xor_f64(acc, 2);
-            acc += warp::shuffle_xor_f64(acc, 1);
-            let sum = acc as f32;
-            let fin = sum.is_finite();
-            ok &= fin;
-            let scale = if fin {
-                1.0 / sum.sqrt().max(eps)
-            } else {
-                f32::NAN
-            };
-            let mut i = 0usize;
-            #[unroll]
-            while i < 4 {
-                out[i] = mul_rn_f32(out[i], scale);
-                if hp < n_k {
-                    out[i] = mul_rn_f32(out[i], Q_SCALE);
-                }
-                i += 1;
-            }
-        }
-        let mut i = 0usize;
-        #[unroll]
-        while i < 4 {
-            // SAFETY: t < m and c < ch, inside y (m·ch values by the
-            // contract); one lane per channel.
-            unsafe { *y.get_unchecked_mut(t * ch + hp * HEAD + lane + 32 * i) = out[i] };
-            i += 1;
-        }
-
-        if hp >= 2 * n_k && lane == 0 {
-            let h = hp - 2 * n_k;
-            let at = t * n_v as usize + h;
-            // SAFETY: h < n_v and t < m: `at` < m·n_v <= b_raw, a_raw, beta,
-            // decay lengths; h < n_v <= dt_bias, ssm_a lengths.
-            let (b, a, dt, sa) = unsafe {
-                (
-                    *b_raw.get_unchecked(at),
-                    *a_raw.get_unchecked(at),
-                    *dt_bias.get_unchecked(h),
-                    *ssm_a.get_unchecked(h),
+        let mut t = t0;
+        while t < t1 {
+            // SAFETY: t < m <= pos.len().
+            let p = unsafe { *pos.get_unchecked(t) };
+            // SAFETY: t < m and hp < heads by the guard, lane < 32; the
+            // contract's lengths; the ring is read only by unit 0, whose
+            // tokens these are when t < CONV_ROWS, and written below by the
+            // same lanes after these reads; (t, hp) is this warp's own.
+            ok &= unsafe {
+                conv_token(
+                    t,
+                    p as usize,
+                    u64::from(p) == p0 + t as u64,
+                    hp,
+                    lane,
+                    inp,
+                    ring,
+                    out,
                 )
             };
-            let bt = sigmoid(b);
-            let dc = expf_ik(mul_rn_f32(softplus(a + dt), sa));
-            let fin = crate::fault::quad_finite([b, a, dt, sa]) & bt.is_finite() & dc.is_finite();
-            ok &= fin;
-            // SAFETY: as the reads above; one lane per (token, head).
-            unsafe {
-                *beta.get_unchecked_mut(at) = if fin { bt } else { f32::NAN };
-                *decay.get_unchecked_mut(at) = if fin { dc } else { f32::NAN };
+            t += 1;
+        }
+        if u == 0 {
+            // The inputs of the last min(m, RING_ROWS) tokens into their
+            // slots, after every read of the ring above.
+            let mut t = m.saturating_sub(RING_ROWS);
+            while t < m {
+                // SAFETY: t < m <= pos.len().
+                let slot = unsafe { *pos.get_unchecked(t) } as usize % RING_ROWS;
+                let mut i = 0usize;
+                #[unroll]
+                while i < 4 {
+                    let c = hp * HEAD + lane + 32 * i;
+                    // SAFETY: slot < RING_ROWS and c < ch: inside the ring
+                    // (RING_ROWS·ch values) and row t of x (m·ch values);
+                    // channel c of the ring is this lane's alone.
+                    unsafe { *ring.add(slot * ch + c) = *x.get_unchecked(t * ch + c) };
+                    i += 1;
+                }
+                t += 1;
             }
         }
         if !ok {
@@ -223,9 +358,10 @@ mod conv_kernels {
 /// [`ConvKernels::enqueue_conv_prep`]'s arguments: `m` tokens of the
 /// projected channels `x` (`[m][C]`), `b_raw` and `a_raw` (`[m][n_v]`, the β
 /// and α projections), the layer's conv taps `w` (`[C][CONV_TAPS]`, oldest
-/// first), `dt_bias` and `ssm_a` (`[n_v]`), the incoming conv state, and the
-/// buffers the call writes: the conv output `y` (`[m][C]`), β and decay
-/// (`[m][n_v]`), the conv state after the last token.
+/// first), `dt_bias` and `ssm_a` (`[n_v]`), the tokens' positions `pos`
+/// (`[m]`, the words the rope reads), the buffers the call writes: the conv
+/// output `y` (`[m][C]`), β and decay (`[m][n_v]`), and the layer's conv ring
+/// (`[RING_ROWS][C]`), read and written in place.
 pub struct ConvArgs<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub b_raw: &'a DeviceBuffer<f32>,
@@ -233,7 +369,7 @@ pub struct ConvArgs<'a> {
     pub w: &'a DeviceBuffer<f32>,
     pub dt_bias: &'a DeviceBuffer<f32>,
     pub ssm_a: &'a DeviceBuffer<f32>,
-    pub state_in: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
     pub shape: LinearShape,
     pub eps: f32,
     pub m: usize,
@@ -241,7 +377,7 @@ pub struct ConvArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
     pub beta: &'a mut DeviceBuffer<f32>,
     pub decay: &'a mut DeviceBuffer<f32>,
-    pub state_out: &'a mut DeviceBuffer<f32>,
+    pub ring: &'a mut DeviceBuffer<f32>,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -258,9 +394,9 @@ impl ConvKernels {
         Ok(ConvKernels { module })
     }
 
-    /// Enqueue the conv and prep of `args.m` tokens: `⌈m·H / 4⌉` blocks of
-    /// 128 threads, `H = 2·n_k + n_v`. The incoming and outgoing conv states
-    /// are distinct buffers. Asynchronous, allocation-free, capturable.
+    /// Enqueue the conv and prep of `args.m` tokens: `⌈units(m)·H / 4⌉`
+    /// blocks of 128 threads, `H = 2·n_k + n_v`, the ring read and written
+    /// in place. Asynchronous, allocation-free, capturable.
     pub fn enqueue_conv_prep(
         &self,
         stream: &CudaStream,
@@ -274,7 +410,7 @@ impl ConvKernels {
             w,
             dt_bias,
             ssm_a,
-            state_in,
+            pos,
             shape,
             eps,
             m,
@@ -282,7 +418,7 @@ impl ConvKernels {
             y,
             beta,
             decay,
-            state_out,
+            ring,
         } = args;
         shape.check(what)?;
         if m == 0 {
@@ -297,11 +433,11 @@ impl ConvKernels {
             ("w", w.len(), CONV_TAPS * ch),
             ("dt_bias", dt_bias.len(), nv),
             ("ssm_a", ssm_a.len(), nv),
-            ("state_in", state_in.len(), CONV_ROWS * ch),
+            ("pos", pos.len(), m),
             ("y", y.len(), m * ch),
             ("beta", beta.len(), m * nv),
             ("decay", decay.len(), m * nv),
-            ("state_out", state_out.len(), CONV_ROWS * ch),
+            ("ring", ring.len(), shape.ring_len()),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
             return Err(GpuError::shape(
@@ -309,7 +445,7 @@ impl ConvKernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let grid = launch_u32(what, "grid", (m * shape.conv_heads()).div_ceil(4))?;
+        let grid = launch_u32(what, "grid", (units(m) * shape.conv_heads()).div_ceil(4))?;
         let n_k = launch_u32(what, "n_k", shape.n_k)?;
         let n_v = launch_u32(what, "n_v", nv)?;
         let m = launch_u32(what, "m", m)?;
@@ -317,25 +453,26 @@ impl ConvKernels {
             .module
             .prepare_gdn_conv_prep(LaunchConfig1D::new(grid, BLOCK, 0))?;
         self.module.gdn_conv_prep(
-            stream, &prep, x, state_in, w, b_raw, a_raw, dt_bias, ssm_a, eps, n_k, n_v, m, fault,
-            y, state_out, beta, decay,
+            stream, &prep, x, w, b_raw, a_raw, dt_bias, ssm_a, pos, eps, n_k, n_v, m, fault, y,
+            beta, decay, ring,
         )?;
         Ok(())
     }
 }
 
-/// What [`conv_prep_host`] computes: the conv output, β, decay and the conv
-/// state after the last token, in the kernel's layouts.
+/// What [`conv_prep_host`] computes: the conv output, β, decay and the ring
+/// after the call, in the kernel's layouts.
 pub struct ConvOut {
     pub y: Vec<f32>,
     pub beta: Vec<f32>,
     pub decay: Vec<f32>,
-    pub state: Vec<f32>,
+    pub ring: Vec<f32>,
 }
 
 /// The host rule of [`ConvKernels::enqueue_conv_prep`]: the module doc's
-/// numeric contract, op for op. Inputs as [`ConvArgs`] names them, host
-/// slices of the same lengths.
+/// numeric contract and position rule, op for op. Inputs as [`ConvArgs`]
+/// names them, host slices of the same lengths; `ring` is the ring before
+/// the call.
 ///
 /// # Panics
 ///
@@ -352,7 +489,8 @@ pub fn conv_prep_host(
     w: &[f32],
     dt_bias: &[f32],
     ssm_a: &[f32],
-    state_in: &[f32],
+    pos: &[u32],
+    ring: &[f32],
     shape: LinearShape,
     eps: f32,
     m: usize,
@@ -361,10 +499,11 @@ pub fn conv_prep_host(
     let heads = shape.conv_heads();
     let nv = shape.n_v;
     let mut y = vec![0.0f32; m * ch];
-    let mut state = vec![0.0f32; CONV_ROWS * ch];
     let mut beta = vec![0.0f32; m * nv];
     let mut decay = vec![0.0f32; m * nv];
     for t in 0..m {
+        let p = pos[t] as usize;
+        let contiguous = u64::from(pos[t]) == u64::from(pos[0]) + t as u64;
         for hp in 0..heads {
             let mut vals = [0.0f32; HEAD];
             let mut lanes = [0.0f64; 32];
@@ -372,10 +511,13 @@ pub fn conv_prep_host(
                 for i in 0..4 {
                     let c = hp * HEAD + lane + 32 * i;
                     let xs: [f32; 4] = std::array::from_fn(|j| {
-                        if t + j >= CONV_ROWS {
-                            x[(t + j - CONV_ROWS) * ch + c]
+                        let d = CONV_ROWS - j;
+                        if d <= t {
+                            x[(t - d) * ch + c]
+                        } else if p < d {
+                            0.0
                         } else {
-                            state_in[(t + j) * ch + c]
+                            ring[(p + RING_ROWS - d) % RING_ROWS * ch + c]
                         }
                     });
                     let mut acc = xs[0] * w[4 * c];
@@ -385,11 +527,6 @@ pub fn conv_prep_host(
                     let s = silu(acc);
                     vals[lane + 32 * i] = s;
                     *sum += f64::from(s * s);
-                    if t + 1 == m {
-                        for r in 0..CONV_ROWS {
-                            state[r * ch + c] = xs[r + 1];
-                        }
-                    }
                 }
             }
             if hp < 2 * shape.n_k {
@@ -406,6 +543,9 @@ pub fn conv_prep_host(
                     }
                 }
             }
+            if !contiguous {
+                vals.fill(f32::NAN);
+            }
             y[t * ch + hp * HEAD..t * ch + (hp + 1) * HEAD].copy_from_slice(&vals);
         }
         for h in 0..nv {
@@ -418,10 +558,15 @@ pub fn conv_prep_host(
             decay[at] = if fin { dc } else { f32::NAN };
         }
     }
+    let mut ring = ring[..shape.ring_len()].to_vec();
+    for t in m.saturating_sub(RING_ROWS)..m {
+        let slot = pos[t] as usize % RING_ROWS;
+        ring[slot * ch..(slot + 1) * ch].copy_from_slice(&x[t * ch..(t + 1) * ch]);
+    }
     ConvOut {
         y,
         beta,
         decay,
-        state,
+        ring,
     }
 }

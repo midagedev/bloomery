@@ -21,15 +21,19 @@
 //!   the projection's output order, and the conv's output in the same order
 //!   (q already L2-normed and scaled by [`Q_SCALE`], k L2-normed, v as the
 //!   conv left it);
-//! - conv state `[CONV_ROWS][C]`: row 0 the oldest input, row 2 the newest;
-//! - recurrent state `[n_v][HEAD v][HEAD k]`: value column v of head h is the
-//!   HEAD keys at `(h·HEAD + v)·HEAD`, contiguous. ik stores the transpose
-//!   (`[k][v]`, v contiguous);
+//! - conv ring `[RING_ROWS][C]`: the conv input of position `p` in slot
+//!   `p mod RING_ROWS`, so the ring holds the inputs of the last
+//!   [`RING_ROWS`] positions a call wrote;
+//! - recurrent state `[lanes][n_v][HEAD v][HEAD k]`: value column v of head
+//!   h in lane `l` is the HEAD keys at `((l·n_v + h)·HEAD + v)·HEAD`,
+//!   contiguous. ik stores the transpose (`[k][v]`, v contiguous);
 //! - β and decay `[m][n_v]`; the delta output `o` and the gate's `z` and `y`
 //!   `[m][n_v][HEAD]`.
 //!
-//! Every kernel reads its state from one buffer and writes the new state to
-//! another. Every exponential is [`expf_ik`] and the one logarithm is
+//! The state is read and written in place: the conv finds a token's
+//! predecessors by its position (`pos[t]`, the words the embedding launch
+//! writes), the delta step its lane through a device word, so one captured
+//! graph serves every step. Every exponential is [`expf_ik`] and the one logarithm is
 //! [`logf_poly`]: both are fused multiply-adds and bit operations only, so a
 //! host transcription rounds as the card does. Each kernel raises a site of
 //! its own on the fault word for a non-finite input or a result that stops
@@ -49,8 +53,19 @@ pub const HEAD: usize = 128;
 /// Taps of the causal conv.
 pub const CONV_TAPS: usize = 4;
 
-/// Rows of the conv state: the inputs before the call's first token.
+/// A token's predecessors the conv reads: the inputs of its last
+/// `CONV_TAPS − 1` positions.
 pub const CONV_ROWS: usize = CONV_TAPS - 1;
+
+/// The widest call a later call may roll back into: the pass of up to eight
+/// positions (a verify of up to seven drafted tokens).
+pub const PASS_ROWS: usize = 8;
+
+/// Slots of the conv ring. A rollback to position `n` inside a call of `m <=
+/// PASS_ROWS` positions from `p` reads the inputs of `n − 3 .. n − 1 >= p −
+/// 2`, which the ring holds while it keeps `m + 2` positions; with `m + 3`
+/// the call's writes also never land on the slots of `p − 3 .. p − 1`.
+pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
 
 /// `1 / √HEAD` rounded to f32: the query scale the conv applies after the
 /// L2 norm.
@@ -127,16 +142,16 @@ impl LinearShape {
         2 * self.n_k + self.n_v
     }
 
-    /// f32s of one recurrent state: `n_v·HEAD·HEAD`.
+    /// f32s of one lane of the recurrent state: `n_v·HEAD·HEAD`.
     #[must_use]
     pub fn state_len(&self) -> usize {
         self.n_v * HEAD * HEAD
     }
 
-    /// f32s of one conv state: `CONV_ROWS·C`.
+    /// f32s of the conv ring: `RING_ROWS·C`.
     #[must_use]
-    pub fn conv_state_len(&self) -> usize {
-        CONV_ROWS * self.channels()
+    pub fn ring_len(&self) -> usize {
+        RING_ROWS * self.channels()
     }
 
     /// Refuse by name a shape the kernels have no geometry for.
