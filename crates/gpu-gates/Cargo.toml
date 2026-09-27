@@ -302,6 +302,10 @@ name = "gate_qwen3moe_router"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen35moe_moe"
+required-features = ["gpu"]
+
+[[bin]]
 name = "generate"
 required-features = ["gpu"]
 
