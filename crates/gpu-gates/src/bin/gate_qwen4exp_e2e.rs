@@ -144,6 +144,7 @@ mod gate {
     };
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Fault, FaultSite, GpuError};
+    use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
@@ -680,102 +681,14 @@ mod gate {
         /// best it left.
         fn margin(&self, t: usize) -> f64 {
             let (v, ids) = self.at(t);
-            let min_in = ids
-                .iter()
-                .map(|&e| f64::from(v[e as usize]))
-                .fold(f64::INFINITY, f64::min);
-            let max_out = (0..N_EXPERT)
-                .filter(|&e| !ids.contains(&(e as i32)))
-                .map(|e| f64::from(v[e]))
-                .fold(f64::NEG_INFINITY, f64::max);
-            min_in - max_out
-        }
-    }
-
-    /// A token whose chosen set differs from ik's: every exchanged pair —
-    /// `a` ours only, `b` ik's only — with ik's gap `ik[b] − ik[a]` and our
-    /// two logits' error `|ours[a] − ik[a]| + |ours[b] − ik[b]|`.
-    struct Flip {
-        layer: usize,
-        token: usize,
-        margin: f64,
-        pairs: Vec<(u32, u32, f64, f64)>,
-    }
-
-    impl Flip {
-        /// Allowed only when every pair's gap lies within its error and the
-        /// error within [`FLIP_ERR_CAP`]: our ranking then differs from ik's
-        /// by no more than our logits' distance from ik's, a distance a
-        /// correct chain has been measured to stay under. Past either the
-        /// pick is wrong, named.
-        fn allowed(&self) -> bool {
-            !self.pairs.is_empty()
-                && self
-                    .pairs
-                    .iter()
-                    .all(|&(_, _, gap, err)| gap <= err && err <= FLIP_ERR_CAP)
-        }
-
-        fn line(&self) -> String {
-            let pairs: Vec<String> = self
-                .pairs
-                .iter()
-                .map(|(a, b, gap, err)| format!("{a}<-{b} gap {gap:.3e} err {err:.3e}"))
-                .collect();
-            let verdict = if self.allowed() {
-                "allowed (counted)"
-            } else if self
-                .pairs
-                .iter()
-                .any(|&(_, _, _, err)| err > FLIP_ERR_CAP || err.is_nan())
-            {
-                "FAIL: our router error past the pinned frontier"
-            } else {
-                "FAIL: a pair's gap past our error"
-            };
-            format!(
-                "free flip layer={} token={}: ik margin {:.3e}; {} (cap {FLIP_ERR_CAP:.1}): \
-                 {verdict}",
-                self.layer,
-                self.token,
-                self.margin,
-                pairs.join(", "),
-            )
+            flip::margin(v, ids)
         }
     }
 
     /// The flip at layer `l`, token `t`, if our chosen set is not ik's.
     fn flip_at(l: usize, t: usize, ours: &RouteTap, ik: &IkRoute) -> Option<Flip> {
         let (iv, ids) = ik.at(t);
-        let (ov, oids) = (&ours.logits, &ours.ids);
-        let only_ours: Vec<u32> = oids
-            .iter()
-            .copied()
-            .filter(|&e| !ids.contains(&(e as i32)))
-            .collect();
-        let only_ik: Vec<u32> = ids
-            .iter()
-            .map(|&e| e as u32)
-            .filter(|e| !oids.contains(e))
-            .collect();
-        if only_ours.is_empty() && only_ik.is_empty() {
-            return None;
-        }
-        let v = |x: &[f32], e: u32| x.get(e as usize).map_or(f64::NAN, |&y| f64::from(y));
-        let mut pairs = Vec::new();
-        for &a in &only_ours {
-            for &b in &only_ik {
-                let gap = v(iv, b) - v(iv, a);
-                let err = (v(ov, a) - v(iv, a)).abs() + (v(ov, b) - v(iv, b)).abs();
-                pairs.push((a, b, gap, err));
-            }
-        }
-        Some(Flip {
-            layer: l,
-            token: t,
-            margin: ik.margin(t),
-            pairs,
-        })
+        Flip::between((l, t), (&ours.ids, &ours.logits), (ids, iv), ik.margin(t))
     }
 
     /// Whether a route tap's ids are [`N_USED`] distinct experts under
@@ -858,9 +771,9 @@ mod gate {
             }
         }
         for f in &flips {
-            println!("{}", f.line());
+            println!("{}", f.line("free", FLIP_ERR_CAP));
         }
-        let flips_ok = flips.iter().all(Flip::allowed);
+        let flips_ok = flips.iter().all(|f| f.allowed(FLIP_ERR_CAP));
         let (mut held, mut hl, mut ht, mut exempt) = (0.0f64, 0usize, 0usize, 0usize);
         for (l, row) in table.iter().enumerate() {
             for (t, e) in row.iter().enumerate() {
@@ -898,7 +811,7 @@ mod gate {
              ours={top} ik={ik_top} logits_rel={:.3e} (printed) {}",
             eager.tokens.len(),
             flips.len(),
-            flips.iter().filter(|f| f.allowed()).count(),
+            flips.iter().filter(|f| f.allowed(FLIP_ERR_CAP)).count(),
             rel(ours, &ik),
             verdict(ok)
         );
