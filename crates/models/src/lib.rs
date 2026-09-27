@@ -14,6 +14,7 @@
 
 mod need;
 mod role;
+pub mod shape;
 
 pub use need::{Need, Unimplemented, needs};
 pub use role::Role;
