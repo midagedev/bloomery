@@ -208,6 +208,7 @@ selftests=(
   "tools/ref/ds41pp.py self-test"
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-hotlist.py --self-test"
+  "tools/ref/router-residency.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
   "tools/check-comment-only.py --self-test"
