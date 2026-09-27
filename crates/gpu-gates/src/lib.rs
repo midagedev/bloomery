@@ -33,6 +33,8 @@ pub mod ptx;
 pub mod qwen3moe;
 pub mod record;
 pub mod rounding;
+#[cfg(feature = "deepseek41")]
+pub mod serve_client;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
