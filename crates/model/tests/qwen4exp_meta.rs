@@ -73,6 +73,10 @@ const TENSORS: &[&str] = &[
 // needs of their own, which no row for mHC, the token pool or the engram covers.
 // PIN(2026-09-27): the router and the GQA flash rows left the list when the shape registry gained
 // their serving rows (shapes p1-4: the `_512` router and the `_256_p4` flash entries serve them).
+// PIN(2026-09-27): five items left the list with GLM-5.3-Flash's first program, whose rows and type
+// pins the whole-tree listing now counts: the q8_0 output head, token embedding and hyper-connection
+// fn (its pins read q8_0), the recurrent-state slot (`gpu-glm5next/src/kda.rs`) and the program that
+// runs delta-rule and attention layers in one trunk (`gpu-glm5next/src/program.rs`).
 const COVERAGE: &[&str] = &[
     "delta rule GDN: d 128, 16 k-heads and 48 v-heads (tiled), conv 4, sigmoid output gate: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44-46",
     "shared expert, ff 640, with a sigmoid gate: 0-47",
@@ -81,14 +85,9 @@ const COVERAGE: &[&str] = &[
     "per-head QK norm plus rope: head 256, IMROPE [11, 11, 10, 0], 64 of 256 dims: 3,7,11,15,19,23,27,31,35,39,43,47",
     "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39,43,47",
     "mean-pool indexer: 4 heads x 128, pool 4, RMS-normed keys roped (64 dims) at the pool start, heads summed: 3,7,11,15,19,23,27,31,35,39,43,47",
-    "q8_0 output head (the head reads q6_K)",
-    "q8_0 token embedding (the card reads q4_K rows)",
-    "q8_0 hyper-connection fn (the chain reads q3_K and f32): 0-47",
     "q5_K routed experts on a card: 2",
     "bf16 attention matrices (the body reads q4_K and q6_K): 3,7,11,15,19,23,27,31,35,39,43,47",
     "the gated-residual hyper-connection head output_hc_*, rank 320",
-    "a recurrent-state slot per sequence (delta-rule state and conv inputs)",
-    "a program that runs delta-rule and attention layers in one trunk",
     "a text prompt carrying the image token 248056 refused by name",
     "a layer program for qwen4exp",
     "pre-tokenizer qwen35",
