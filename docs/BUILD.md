@@ -7,7 +7,7 @@ This page is for building on your own Linux host. The maintainers build on one w
 | Piece | Version | Where it is pinned |
 |---|---|---|
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
-| cuda-oxide (`cuda-device`, `cuda-host`) | git rev `b9847e9515ed3a23096f22567d3eaf0a6e3e440c` | `[workspace.dependencies]` in `Cargo.toml` (NVlabs), source from the `[patch]` fork `midagedev/cuda-oxide` branch `bloomery`; `just deny` fails if either floats. `cargo oxide` builds its backend from that checkout |
+| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `ec4aa4797956534578a1af010f86252a0b6d8626` (NVlabs), source rev `c76f1e173b0e9468bc0b05d49d99560844a06fec` | `[workspace.dependencies]` in `Cargo.toml` (NVlabs), source from the `[patch]` fork `midagedev/cuda-oxide` branch `bloomery` (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats. `cargo oxide` builds its backend from that checkout |
 | `cargo-oxide` | 0.2.1 | install it as cuda-oxide's README says; `cargo oxide doctor` must pass |
 | LLVM | 21.1.8 (`llc`), from the LLVM release tarball | on `PATH` |
 | Clang | 21, for bindgen | on `PATH` |
