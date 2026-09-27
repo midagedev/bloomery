@@ -31,7 +31,6 @@ use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::body::{Deepseek41Model, Seam};
 use bloomery_gpu_deepseek41::chain::ffn::FfnTaps;
-use bloomery_gpu_deepseek41::router::N_USED;
 use bloomery_gpu_gates::GateError;
 use cuda_core::DeviceBuffer;
 
@@ -150,10 +149,12 @@ impl Buf {
 /// is the one left.
 pub struct MoeFault {
     pub layer: usize,
-    pub ids: [u32; N_USED],
-    pub weights: [f32; N_USED],
+    /// The slots' expert ids and weights, as many as the step's router
+    /// writes a token.
+    pub ids: Vec<u32>,
+    pub weights: Vec<f32>,
     /// Each slot's place in the card's stacks, or [`HOST`].
-    pub places: [u32; N_USED],
+    pub places: Vec<u32>,
     /// The sub-layer's input before its norm.
     pub fold_in: Vec<f32>,
     pub buffers: Vec<Buf>,
@@ -175,7 +176,7 @@ impl MoeFault {
 impl fmt::Display for MoeFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "layer {} moe: routing", self.layer)?;
-        for s in 0..N_USED {
+        for s in 0..self.ids.len() {
             let place = if self.places[s] == HOST {
                 "host".to_string()
             } else {
@@ -228,22 +229,43 @@ fn moe_fault(
     fold_in: &[f32],
 ) -> Result<MoeFault, GpuError> {
     let stream = gpu.stream();
-    let six = |v: Vec<u32>| -> [u32; N_USED] { std::array::from_fn(|s| v[s]) };
-    let ids = six(taps.router.ids.to_host_vec(stream)?);
-    let places = six(taps.sel.to_host_vec(stream)?);
-    let w = host_f32(gpu, &taps.router.weights)?;
-    let weights: [f32; N_USED] = std::array::from_fn(|s| w[s]);
+    let ids = taps.router.ids.to_host_vec(stream)?;
+    let n_used = ids.len();
+    let places = taps.sel.to_host_vec(stream)?;
+    let weights = host_f32(gpu, &taps.router.weights)?;
+    // The step's router buffers hold one token: every slot vector is its
+    // slots exactly.
+    if n_used == 0 || places.len() != n_used || weights.len() != n_used {
+        return Err(GpuError::Shape {
+            what: "ds41_finite::moe_fault",
+            detail: format!(
+                "{n_used} router slots, {} places, {} weights",
+                places.len(),
+                weights.len()
+            ),
+        });
+    }
     let mut buffers = vec![
         Buf::of("fold_in".into(), fold_in),
         Buf::of("router.logits".into(), &host_f32(gpu, &taps.router.logits)?),
         Buf::of("router.probs".into(), &host_f32(gpu, &taps.router.probs)?),
-        Buf::of("router.weights".into(), &w),
+        Buf::of("router.weights".into(), &weights),
         Buf::of("hc_pre".into(), &host_f32(gpu, taps.hc)?),
     ];
     let h = host_f32(gpu, taps.h)?;
     let down = host_f32(gpu, taps.down)?;
-    let (ff, n) = (h.len() / N_USED, down.len() / N_USED);
-    for s in (0..N_USED).filter(|&s| places[s] != HOST) {
+    if !h.len().is_multiple_of(n_used) || !down.len().is_multiple_of(n_used) {
+        return Err(GpuError::Shape {
+            what: "ds41_finite::moe_fault",
+            detail: format!(
+                "h {} and down {} values for {n_used} slots",
+                h.len(),
+                down.len()
+            ),
+        });
+    }
+    let (ff, n) = (h.len() / n_used, down.len() / n_used);
+    for s in (0..n_used).filter(|&s| places[s] != HOST) {
         let tag = format!("[slot {s} id {}]", ids[s]);
         buffers.push(Buf::of(format!("h{tag}"), &h[s * ff..(s + 1) * ff]));
         buffers.push(Buf::of(format!("down{tag}"), &down[s * n..(s + 1) * n]));

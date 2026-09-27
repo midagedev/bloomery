@@ -25,6 +25,7 @@ use crate::{
     GateError, RefRow, find_ref_row_in, max_rel_err, ref_tensor_logical_in, ref_tensor_of_in,
     view_flat,
 };
+use model::arch::models::shape::{self, RouterBody, RouterInst};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -35,9 +36,10 @@ pub const M_TOKENS: usize = 6;
 
 // Architecture constants of the model the dump sets were made for
 // (DeepSeek-V2-Lite): hidden 2048, MLA latent 512 + rope 64, 16 heads,
-// q rows 16*192 with a 128-wide nope head, router 64 experts / top-6,
-// vocab 102400. Hardcoded like the kernel gates' shape checks — the
-// manifest verification pins them against the dump.
+// q rows 16*192 with a 128-wide nope head, vocab 102400. Hardcoded like the
+// kernel gates' shape checks — the manifest verification pins them against
+// the dump. The router's 64 experts / top-6 are the router kernel's instance
+// row, read from the table that owns it.
 const HIDDEN: u64 = 2048;
 const LATENT: u64 = 512;
 const ROPE: u64 = 64;
@@ -46,7 +48,12 @@ const Q_ROWS: u64 = 16 * 192;
 const NOPE: u64 = 128;
 const KQ_HEAD: u64 = 192;
 const KV_WIDTH: u64 = LATENT + ROPE;
-const N_USED: u64 = 6;
+const ROUTER: RouterInst = shape::router_row(RouterBody::Topk, 2);
+const N_EXPERT: u64 = ROUTER.experts() as u64;
+const N_USED: u64 = ROUTER.top_k_max as u64;
+// The row compiles one pick count, which is then the dump's; a row that
+// served a range would not say which count the dump ran.
+const _: () = assert!(ROUTER.top_k_min == ROUTER.top_k_max);
 const VOCAB: u64 = 102400;
 
 /// One observable in the forward order of a block. `rank` (declaration
@@ -174,7 +181,7 @@ impl TapKind {
                 occurrence: 0,
             },
             FfnMoeLogits => TapShape {
-                base: [64, 1, 1, 1],
+                base: [N_EXPERT, 1, 1, 1],
                 token_axis: 1,
                 op: "MUL_MAT",
                 occurrence: 0,

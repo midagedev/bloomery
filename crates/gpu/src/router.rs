@@ -31,14 +31,27 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
+use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
 use std::sync::Arc;
 
-/// Experts the router softmaxes over (this model's `expert_count`); the
-/// kernels' block structure, a launch-time constant.
+/// Experts the router softmaxes over: the width its body is written for
+/// (two per lane of the decode path's warp, one `u64` of taken bits).
 pub const N_EXPERT: usize = 64;
 
-/// Experts each token routes to (this model's `expert_used_count`).
+/// Experts each token routes to: compiled into the body and its launch
+/// contracts.
 pub const N_USED: usize = 6;
+
+/// This body's instance row: the width and the one pick count above, the
+/// rule softmax, top k, the kept probabilities times the file's scale. A
+/// file's shape selects it through `models::shape::select_router`.
+pub const ROW: RouterInst = shape::router_row(RouterBody::Topk, (N_EXPERT / 32) as u32);
+const _: () = assert!(shape::router_row_is(
+    ROW,
+    rules::SOFTMAX_TOPK,
+    false,
+    (N_USED as u32, N_USED as u32)
+));
 
 /// Threads both router kernels launch with, and the width their device code
 /// is compiled for. One thread owns one token whole — the f64 sum of the 64
