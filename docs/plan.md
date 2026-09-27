@@ -146,9 +146,9 @@ e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 
 
 | 청크 | 크기 | 파일 경계 | 선행 | 박스 | 열차 | 상태 |
 |---|---|---|---|---|---|---|
-| `gpumodel` | M | `gpu/src/model.rs`, `arch/deepseek2/**`, `gpu-deepseek41/src/body.rs`, gate bin 호출 자리; 03 파일 훙크 셋(qwen3moe body·mod, hybrid replay-watch) | del2 | 묶음(라운드가 돌림, 원장) | 2 | 보고 10:54, WIP `530c98c` |
-| `modelspec` | M | `crates/models`, `arch/*/spec.rs`, `arch/qwen35moe`, `arch/coverage.rs`, `ced.rs` 서명, `engine.rs` dispatch | del2 | 묶음 | 2 | 보고 10:17, WIP `8641b17` |
-| `levers2` | S | `crates/levers`, 각 bin `main` 첫 줄 | — | 묶음 | 2 | 보고 09:13, WIP `02d9b21`; 리드 픽스업 `BLOOMERY_BOX_CARD` 행 |
+| `gpumodel` | M | `gpu/src/model.rs`, `arch/deepseek2/**`, `gpu-deepseek41/src/body.rs`, gate bin 호출 자리; 03 파일 훙크 셋(qwen3moe body·mod, hybrid replay-watch) | del2 | 묶음 | 2 | 착륙 `ed9c368` |
+| `modelspec` | M | `crates/models`, `arch/*/spec.rs`, `arch/qwen35moe`, `arch/coverage.rs`, `ced.rs` 서명, `engine.rs` dispatch | del2 | 묶음 | 2 | 착륙 `2a35555` |
+| `levers2` | S | `crates/levers`, 각 bin `main` 첫 줄 | — | 묶음 | 2 | 착륙 `6abaa16` |
 | `session` | M | 새 `crates/runtime`·`crates/app`; `generate_ds41.rs`, `bind.rs`, `generate.rs`, `draft.rs`, `shared/ds41_dspark.rs` | gpumodel WIP(10번) | 디바이스 빌드 + 좁힌 호스트 묶음 | 3 | 발사 11:xx |
 | `launchlog` | S | `gpu/src/graph.rs`(`NodeInfo.kernel`), 런치 진입점 하나, `record.rs` kind, 레버 행 | gpumodel WIP; `graph.rs`는 03 hostone A와 순서(A가 먼저면 그 위) | 850 s[유도] | 3 | 발사 11:xx |
 | `q5kexp` | M | 새 `gpu/src/kquant/**`, 새 bin `gate_kquant`, 등록 파일(12번) | 없음(증명 급 "add" — AGENTS 행은 리드가 열차 2에) | 디바이스 빌드, 모델 파일 없는 게이트 | 3 | 발사 11:xx; 첫 소비자 GLM |
@@ -162,7 +162,7 @@ e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 
 | `oneloop` → `draftserve` ∥ `cli`; `seqstate` | M·M·S·M | `session-design.md` Q8 | session | 묶음 | 4+ | 대기 |
 | `progshape`(R1) → `progprompt`(R2) → `rowsm` ∥ `candwire` → `q36prog`(S) → `lanes`; `batchwide` | `layerprog-design.md` §6 | session·hostone B / hostone C–E·act-planes B / opslib R1 / 03 q35body / seqstate | 묶음 | 5+ | 대기 |
 | `gatesproc`·`gatestoml` | M·S | 하니스·`tools/` | — | 묶음 | 4 | e1 또는 aa, 4파동 |
-| 리드 픽스업(열차 2) | — | `registry.rs` `BLOOMERY_BOX_CARD` 행; AGENTS Commands `gate-qwen35moe-meta` + 변경 클래스 표의 "add" 행; `undocumented_unsafe_blocks = "deny"`(del2 뒤 0/48, MUL-11 닫음); justfile 주석 한국어; modelspec-design §3·§6(c) 주석; `weights.rs` `ChainBody::derive` 문서 링크; `gate-ds41-load` (iv) 커버리지 사유 | — | 열차 2의 묶음이 잰다 | 2 | — |
+| ~~리드 픽스업(열차 2)~~ 착륙(`2a35555`·`ed9c368`·`6abaa16`에 나눠) | — | `registry.rs` `BLOOMERY_BOX_CARD` 행; AGENTS Commands `gate-qwen35moe-meta` + 변경 클래스 표의 "add" 행; `undocumented_unsafe_blocks = "deny"`(del2 뒤 0/48, MUL-11 닫음); justfile 주석 한국어; modelspec-design §3·§6(c) 주석; `weights.rs` `ChainBody::derive` 문서 링크; `gate-ds41-load` (iv) 커버리지 사유 | — | 열차 2의 묶음이 잰다 | 2 | — |
 
 **박스 시간표 (09-27, 전부 [유도]).** 03 묶음 A 95항목 10:50~(예측 3,070 s, stop 4,605) + 작은 묶음 B(V4.1 적재 셋, 레인 겹침 회피) → ~12:00 → e1 창 1–4(착륙 묶음·Qwen3 표·V4.1 표·E21, ≈ 70분; soak 34분은 다음 틈) → ~13:15 → **aa 열차 2**(gpumodel + modelspec + levers2 + 픽스업; 리베이스로 키가 전부 옮겨 전 묶음 ≈ 85항목, V4.1 적재 게이트는 한 레인에, ≈ 50분) → ~14:15 → 03 `q35moe` 묶음 → **aa 열차 3**(session·launchlog·q5kexp·glm5next, 필요하면 candmask; ≈ 60분) → e1 soak 틈. 함대의 보고는 12:00–13:30에 대여섯 개가 몰린다 — 리드는 설계 메모 셋(다음 발사를 여는 처분, 박스 없음)을 먼저 읽고, 구현 diff 넷은 열차 3의 리베이스 때 검수한다. 이것이 함대의 폭을 일곱으로 두는 이유다: 여덟째부터는 검수 대기열에 서서 토큰만 쓴다.
 
