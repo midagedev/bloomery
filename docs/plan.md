@@ -131,6 +131,42 @@ e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 
 
 라운드가 끝나면 카드에 실제 소요를 적고 파동 표에 머지 커밋을 적는다. 순서를 바꾸면 이유를 날짜와 함께 남기고 옛 줄은 선을 긋는다.
 
+### 함대 — 청크와 의존성 (09-27 11:00, aa; 사용자 "토큰은 퍼부어도 좋으니 더 공격적으로")
+
+토큰은 상한이 아니다. 상한은 셋이다 — **박스 하나**(게이트 레인 둘, 임대 하나), **파일 경계**, **리드의 검수 대역**(보고 하나를 읽고 diff를 검수하는 시간). 그래서 함대는 "라운드를 많이"가 아니라 "박스를 안 쓰는 라운드는 전부 병렬로, 박스를 쓰는 라운드는 열차로 묶어서"다. 원칙 넷을 파동 규칙 0–9에 더한다.
+
+10. **선행 라운드가 보고를 냈으면 후행 라운드는 그 WIP 커밋 위에서 시작한다.** 착륙을 기다리지 않는다. 리드가 착륙 때 `git rebase --onto <main> <옛 base>`로 옮기고, 라운드는 리베이스하지 않는다. 보고가 없는 라운드의 트리는 base가 아니다(편집 중이다).
+11. **설계·조사 라운드는 항상 앞서 병렬로 돈다**(박스 없음). 구현 라운드는 확정된 메모 위에서만 연다 — 메모의 처분(리드)이 스펙이다.
+12. **등록 파일은 마지막에, 재독 뒤 최소 diff로** — `tools/ref/ptx-shapes.tsv`, `crates/gpu/src/lib.rs`의 `pub mod`, `crates/gpu-gates/Cargo.toml`의 bin, `justfile`. 두 라운드가 같이 만지면 리드가 착륙 때 합친다. 그 밖의 파일은 겹치지 않는다.
+13. **착륙은 열차다.** 라운드 하나에 묶음 하나가 아니라, 같은 base에서 자란 2–4 라운드를 리베이스해 묶음 한 번으로 착륙한다(리베이스가 키를 전부 옮기므로 어차피 전 묶음이다). 열차 사이에 03의 묶음과 e1의 시팅 창이 끼고, 순서는 한 줄 메시지로 맞춘다.
+
+지금 띄운 라운드의 첫 빌드는 03의 묶음이나 e1의 홀드 안에 떨어진다. `tools/box.sh`는 홀드를 기다리다 `BLOOMERY_BOX_WAIT`(기본 1,800 s) 뒤 rc 75로 끝나므로, 함대 스펙은 `BLOOMERY_BOX_WAIT=7200`을 박스 명령에 붙이고 "rc 75 = 시팅이 박스를 쥔 것, 실패가 아니다 — 같은 명령을 다시"를 싣는다. 시각으로 박스를 막는 문장은 쓰지 않는다(라운드는 시각을 못 본다).
+
+**청크 표 (aa).** 크기는 카드 단위(S ½·M 1·L 2). 열차는 아래 시간표의 것. 03의 사슬(`q3input → q35oracle → q35gdn → r8fix` 착륙 중 → `q35moe` → `q35attn` → `q35body` → Qwen3.6 e2e)과 e1의 사슬(relrunner·soak 착륙 → 시팅 넷)은 각자의 계획에 있고, 여기에는 이음매만 적는다.
+
+| 청크 | 크기 | 파일 경계 | 선행 | 박스 | 열차 | 상태 |
+|---|---|---|---|---|---|---|
+| `gpumodel` | M | `gpu/src/model.rs`, `arch/deepseek2/**`, `gpu-deepseek41/src/body.rs`, gate bin 호출 자리; 03 파일 훙크 셋(qwen3moe body·mod, hybrid replay-watch) | del2 | 묶음(라운드가 돌림, 원장) | 2 | 보고 10:54, WIP `530c98c` |
+| `modelspec` | M | `crates/models`, `arch/*/spec.rs`, `arch/qwen35moe`, `arch/coverage.rs`, `ced.rs` 서명, `engine.rs` dispatch | del2 | 묶음 | 2 | 보고 10:17, WIP `8641b17` |
+| `levers2` | S | `crates/levers`, 각 bin `main` 첫 줄 | — | 묶음 | 2 | 보고 09:13, WIP `02d9b21`; 리드 픽스업 `BLOOMERY_BOX_CARD` 행 |
+| `session` | M | 새 `crates/runtime`·`crates/app`; `generate_ds41.rs`, `bind.rs`, `generate.rs`, `draft.rs`, `shared/ds41_dspark.rs` | gpumodel WIP(10번) | 디바이스 빌드 + 좁힌 호스트 묶음 | 3 | 발사 11:xx |
+| `launchlog` | S | `gpu/src/graph.rs`(`NodeInfo.kernel`), 런치 진입점 하나, `record.rs` kind, 레버 행 | gpumodel WIP; `graph.rs`는 03 hostone A와 순서(A가 먼저면 그 위) | 850 s[유도] | 3 | 발사 11:xx |
+| `q5kexp` | M | 새 `gpu/src/kquant/**`, 새 bin `gate_kquant`, 등록 파일(12번) | 없음(증명 급 "add" — AGENTS 행은 리드가 열차 2에) | 디바이스 빌드, 모델 파일 없는 게이트 | 3 | 발사 11:xx; 첫 소비자 GLM |
+| `glm5next` | S–M | 새 `arch/glm5next/**`, `crates/models`의 새 층 종류·연산(KDA, MLA+k-pool 인덱서, LayerNorm, mHC 평균 합류, 288/8 sigmoid 라우터), `gate-glm5next-meta` | modelspec WIP(10번); 헤더 핀은 샤드 1(검증됨), 텐서 커버리지는 `/root/glmdl.rc` ok 뒤 | 호스트 전용 | 3 | 발사 11:xx |
+| `glmops` (설계) | M | 없음 | — | 없음 | — | 발사 11:xx → 메모 `research/glmops-design.md` → 라운드 `kda`·`kpool`·`hcmean`·`router288`·`ln` |
+| `qwen4arch` (설계) | S–M | 없음 | — | 없음 | — | 발사 11:xx → 메모 → `qwen4exp` 리더 팔의 변형 표 |
+| `machineaxes` (설계) | S | 없음 | — | 없음 | — | 발사 11:xx → `rebuild.md` §2-3의 "먼저 볼 둘" 답 + DGX Spark 기계 서술 초안 |
+| `candmask` R1 | M | 새 커널 계열 + 비트 단위 게이트(`research/candmask-design.md`) | q5kexp와 등록 파일만 공유 | 디바이스 | 3–4 | 열차 2 뒤 발사 |
+| `v2host` → `v2fence-cpu` → `v2fence-gpu` ∥ `v2fence-gates` | S·M·M·S | `research/v2fence-design.md` | 03 `hostcfg`·`hybridgate` | 묶음 | 4+ | 대기 |
+| `oneloop` → `draftserve` ∥ `cli`; `seqstate` | M·M·S·M | `session-design.md` Q8 | session | 묶음 | 4+ | 대기 |
+| `progshape`(R1) → `progprompt`(R2) → `rowsm` ∥ `candwire` → `q36prog`(S) → `lanes`; `batchwide` | `layerprog-design.md` §6 | session·hostone B / hostone C–E·act-planes B / opslib R1 / 03 q35body / seqstate | 묶음 | 5+ | 대기 |
+| `gatesproc`·`gatestoml` | M·S | 하니스·`tools/` | — | 묶음 | 4 | e1 또는 aa, 4파동 |
+| 리드 픽스업(열차 2) | — | `registry.rs` `BLOOMERY_BOX_CARD` 행; AGENTS Commands `gate-qwen35moe-meta` + 변경 클래스 표의 "add" 행; `undocumented_unsafe_blocks = "deny"`(del2 뒤 0/48, MUL-11 닫음); justfile 주석 한국어; modelspec-design §3·§6(c) 주석; `weights.rs` `ChainBody::derive` 문서 링크; `gate-ds41-load` (iv) 커버리지 사유 | — | 열차 2의 묶음이 잰다 | 2 | — |
+
+**박스 시간표 (09-27, 전부 [유도]).** 03 묶음 A 95항목 10:50~(예측 3,070 s, stop 4,605) + 작은 묶음 B(V4.1 적재 셋, 레인 겹침 회피) → ~12:00 → e1 창 1–4(착륙 묶음·Qwen3 표·V4.1 표·E21, ≈ 70분; soak 34분은 다음 틈) → ~13:15 → **aa 열차 2**(gpumodel + modelspec + levers2 + 픽스업; 리베이스로 키가 전부 옮겨 전 묶음 ≈ 85항목, V4.1 적재 게이트는 한 레인에, ≈ 50분) → ~14:15 → 03 `q35moe` 묶음 → **aa 열차 3**(session·launchlog·q5kexp·glm5next, 필요하면 candmask; ≈ 60분) → e1 soak 틈. 함대의 보고는 12:00–13:30에 대여섯 개가 몰린다 — 리드는 설계 메모 셋(다음 발사를 여는 처분, 박스 없음)을 먼저 읽고, 구현 diff 넷은 열차 3의 리베이스 때 검수한다. 이것이 함대의 폭을 일곱으로 두는 이유다: 여덟째부터는 검수 대기열에 서서 토큰만 쓴다.
+
+**Qwen3.6의 임계 경로는 03의 사슬이다.** aa 함대는 그 뒤를 받치는 것(모델 서술·세션·층 프로그램)과 GLM의 선행(파일·Q5_K 커널·리더·연산 설계)이며, 03의 사슬에 박스 시간을 양보한다 — 03의 묶음이 도는 동안 aa 라운드는 자기 트랙 디렉터리에서 빌드만 하고 게이트 락을 오래 잡지 않는다.
+
 ## 공개
 
 - **참고한 엔진에 대한 예의(사용자 09-24)**: README 크레딧(ik_llama.cpp는 오라클이자 설계 참조, exllamav3·mistral.rs도 설계 참조; ik에서 옮긴 코드는 저작권 표기), 공정한 비교(ik는 가장 빠른 플래그 + DSpark로 같은 창, 재현 스크립트 동봉), 숫자가 나가기 전에 ikawrakow에게 두세 줄. PR 본문에는 bloomery 이야기를 섞지 않는다.
