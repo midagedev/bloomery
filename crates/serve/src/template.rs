@@ -1,30 +1,38 @@
 //! A Jinja subset, enough for the chat templates GGUF files carry.
 //!
 //! Environment semantics are Hugging Face's (`trim_blocks`, `lstrip_blocks`, the
-//! `loopcontrols` extension), and `-` whitespace control, `set` (plain and
-//! `ns.attr`), `namespace(...)`, `for` with tuple unpacking and `loop.*`,
-//! `break`/`continue`, `if`/`elif`/`else`, `macro` outside any `for` and macro
-//! (called by name with positional and keyword arguments; an argument not
-//! given is its default, else undefined; the body sees its arguments and the
-//! template's top-level names as they are at the call, never the caller's loop
-//! names; the call's value is the body's output as a string), the conditional
-//! expression, `and`/`or`/`not`/`in`, comparisons, `+`/`-`/`~`, subscripts
-//! (a string's by character) and slices `[start:stop:step]` (Python's rules:
-//! any part omitted, negative bounds from the end), `.items()`/`.keys()`/
-//! `.values()`/`.get()`/`.strip()`/`.lstrip()`/`.rstrip()` (whitespace, or the
-//! characters given)/`.split()`/`.startswith()`/`.endswith()`, filters
-//! `tojson` (and its `ensure_ascii`)/`from_json`/`length`/`trim`/`string`/
+//! `loopcontrols` extension, `tojson` as `json.dumps` with its `ensure_ascii`,
+//! `indent`, `separators` and `sort_keys`), with the lexer's newline rules
+//! (`\r\n` and `\r` read as `\n`, one trailing newline dropped), and `-`
+//! whitespace control, `set` (plain and `ns.attr`), `namespace(...)` (a
+//! mapping or pairs, then keywords), `for` with tuple unpacking, an `if`
+//! filter and `loop.*`, `break`/`continue`, `if`/`elif`/`else`, `macro`
+//! outside any `for` and macro (called by name with positional and keyword
+//! arguments; an argument not given is its default, else undefined; the body
+//! sees its arguments and the template's top-level names as they are at the
+//! call, never the caller's loop names; the call's value is the body's output
+//! as a string), the conditional expression, `and`/`or`/`not`/`in`,
+//! comparisons, `+`/`-`/`*`/`/`/`//`/`%`/`~` (Python's rounding of `//` and
+//! `%`), subscripts (a string's by character) and slices `[start:stop:step]`
+//! (Python's rules), string literals with Python's escapes,
+//! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
+//! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()` with Python's
+//! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
 //! `lower`/`upper`/`capitalize`, tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
-//! `raise_exception`/`range`. Anything else is a parse or render error, never
-//! silent output: a filter argument the filter does not take, a macro defined
+//! `raise_exception`/`range`. Whitespace is Python's `str.isspace`, and
+//! `{{ value }}` is Python's `str()`: a list or dict as its `repr`, a float in
+//! `repr`'s shortest form. Anything else is a parse or render error, never
+//! silent output: an argument the callee does not take, a macro defined
 //! inside a `for` or a macro, a macro body that names `varargs`, `kwargs` or
-//! `caller`, a macro used as a value, `capitalize` on a first character whose
-//! title case is not its upper case.
+//! `caller`, a macro used as a value, an undefined value, a namespace or a
+//! range inside a list or dict literal, `capitalize` on a first character
+//! whose title case is not its upper case, a `\N{...}` escape, a division by
+//! zero, an arithmetic result that is not a finite number.
 //!
-//! Values are `serde_json` values plus `Undefined` and mutable namespaces. Object
-//! keys iterate in sorted order (serde_json's map), not insertion order: a
-//! template that `tojson`s a tool schema prints its keys sorted.
+//! Values are `serde_json` values plus `Undefined`, ranges and mutable
+//! namespaces. Object keys keep the order they were parsed or built in, as a
+//! Python dict's (serde_json's `preserve_order`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -52,7 +60,10 @@ pub struct ChatTemplate {
 impl ChatTemplate {
     /// Parses `source`; every branch is parsed, executed or not.
     pub fn parse(source: &str) -> Result<Self, TemplateError> {
-        let segs = segment(source)?;
+        // jinja2's lexer: every newline is `\n`, and one trailing newline is
+        // not output (`keep_trailing_newline` off).
+        let text = source.replace("\r\n", "\n").replace('\r', "\n");
+        let segs = segment(text.strip_suffix('\n').unwrap_or(&text))?;
         let mut p = NodeParser {
             segs,
             at: 0,
@@ -150,7 +161,7 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
         let marked = close > j && matches!(b[close - 1], b'-' | b'+');
         let trim_right = marked && b[close - 1] == b'-';
         let inner = src[j..if marked { close - 1 } else { close }]
-            .trim()
+            .trim_matches(py_space)
             .to_owned();
         let block = o != "{{";
         let seg = match o {
@@ -183,7 +194,7 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
             && let Seg::Text(t) = &mut raw[k - 1].seg
         {
             if tl {
-                t.truncate(t.trim_end().len());
+                t.truncate(t.trim_end_matches(py_space).len());
             } else if ls {
                 let kept = t.trim_end_matches([' ', '\t']).len();
                 if (kept == 0 && k == 1) || t[..kept].ends_with('\n') {
@@ -196,7 +207,7 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
             && let Seg::Text(t) = &mut raw[k + 1].seg
         {
             if tr {
-                *t = t.trim_start().to_owned();
+                *t = t.trim_start_matches(py_space).to_owned();
             } else if block
                 && let Some(rest) = t.strip_prefix("\r\n").or_else(|| t.strip_prefix('\n'))
             {
@@ -205,6 +216,12 @@ fn segment(src: &str) -> Result<Vec<Seg>, TemplateError> {
         }
     }
     Ok(raw.into_iter().map(|p| p.seg).collect())
+}
+
+/// Python's `str.isspace`: Rust's `White_Space` and the four separators
+/// U+001C–U+001F, which Python counts and Rust does not.
+fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 fn find_close(src: &str, from: usize, close: &str) -> Option<usize> {
@@ -244,6 +261,8 @@ enum Node {
     For {
         targets: Vec<String>,
         iter: Expr,
+        /// `for … in … if cond`: the items the loop runs over.
+        filter: Option<Expr>,
         body: Vec<Node>,
     },
     Set {
@@ -335,7 +354,7 @@ impl NodeParser {
                 }
                 Seg::Out(src) => nodes.push(Node::Out(parse_expr_all(&src)?)),
                 Seg::Stmt(src) => {
-                    let kw = src.split_whitespace().next().unwrap_or("").to_owned();
+                    let kw = src.split(py_space).next().unwrap_or("").to_owned();
                     if ends.contains(&kw.as_str()) {
                         // The caller reads the rest of the tag (elif's condition).
                         self.segs[self.at - 1] = Seg::Stmt(src);
@@ -349,7 +368,7 @@ impl NodeParser {
     }
 
     fn statement(&mut self, kw: &str, src: &str) -> Result<Node, TemplateError> {
-        let rest = src[kw.len()..].trim();
+        let rest = src[kw.len()..].trim_matches(py_space);
         match kw {
             "if" => self.if_chain(rest),
             "for" => {
@@ -361,7 +380,14 @@ impl NodeParser {
                 if !t.eat_name("in") {
                     return err(format!("for without `in`: {src}"));
                 }
-                let iter = t.expr()?;
+                // jinja2 reads the iterable without a conditional expression:
+                // an `if` after it filters the items.
+                let iter = t.or()?;
+                let filter = if t.eat_name("if") {
+                    Some(t.expr()?)
+                } else {
+                    None
+                };
                 t.end(src)?;
                 self.loops += 1;
                 let (body, end) = self.block(&["endfor"])?;
@@ -370,6 +396,7 @@ impl NodeParser {
                 Ok(Node::For {
                     targets,
                     iter,
+                    filter,
                     body,
                 })
             }
@@ -448,7 +475,7 @@ impl NodeParser {
                 return err("internal: lost the closing tag");
             };
             match end.as_str() {
-                "elif" => cond = parse_expr_all(src["elif".len()..].trim())?,
+                "elif" => cond = parse_expr_all(src["elif".len()..].trim_matches(py_space))?,
                 "else" => {
                     let (els, end) = self.block(&["endif"])?;
                     self.expect_end(end, "endif", &src)?;
@@ -502,6 +529,85 @@ struct Lexer {
     at: usize,
 }
 
+/// One escape of a string literal after its backslash (`cs[at]` onwards), as
+/// jinja2 reads it: the literal's non-ASCII characters in Python's
+/// `backslashreplace` form, then `unicode-escape`. Returns where the literal
+/// goes on.
+fn string_escape(cs: &[char], at: usize, s: &mut String) -> Result<usize, String> {
+    let Some(&e) = cs.get(at) else {
+        return Err("a dangling escape".into());
+    };
+    let hex = |n: usize, name: &str| -> Result<u32, String> {
+        let digits: String = cs.get(at + 1..at + 1 + n).unwrap_or(&[]).iter().collect();
+        if digits.len() != n || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("truncated \\{name} escape"));
+        }
+        u32::from_str_radix(&digits, 16).map_err(|e| e.to_string())
+    };
+    let code = |u: u32| {
+        char::from_u32(u).ok_or_else(|| {
+            if (0xD800..0xE000).contains(&u) {
+                format!("a surrogate escape U+{u:04X} (not a character)")
+            } else {
+                format!("an escape past U+10FFFF: {u:X}")
+            }
+        })
+    };
+    let simple = match e {
+        '\n' => Some(None),
+        '\\' | '\'' | '"' => Some(Some(e)),
+        'a' => Some(Some('\u{7}')),
+        'b' => Some(Some('\u{8}')),
+        'f' => Some(Some('\u{c}')),
+        'n' => Some(Some('\n')),
+        'r' => Some(Some('\r')),
+        't' => Some(Some('\t')),
+        'v' => Some(Some('\u{b}')),
+        _ => None,
+    };
+    if let Some(c) = simple {
+        s.extend(c);
+        return Ok(at + 1);
+    }
+    match e {
+        '0'..='7' => {
+            let n = cs[at..]
+                .iter()
+                .take(3)
+                .take_while(|c| ('0'..='7').contains(*c))
+                .count();
+            let digits: String = cs[at..at + n].iter().collect();
+            let u = u32::from_str_radix(&digits, 8).map_err(|e| e.to_string())?;
+            s.push(code(u)?);
+            Ok(at + n)
+        }
+        'x' => {
+            s.push(code(hex(2, "x")?)?);
+            Ok(at + 3)
+        }
+        'u' => {
+            s.push(code(hex(4, "u")?)?);
+            Ok(at + 5)
+        }
+        'U' => {
+            s.push(code(hex(8, "U")?)?);
+            Ok(at + 9)
+        }
+        'N' => Err("\\N{...} escapes are not supported".into()),
+        // `backslashreplace` turned the character into an escape whose own
+        // backslash this one escapes: the escape's text is the output.
+        c if !c.is_ascii() => {
+            py_hex_escape(c, s);
+            Ok(at + 1)
+        }
+        other => {
+            s.push('\\');
+            s.push(other);
+            Ok(at + 1)
+        }
+    }
+}
+
 impl Lexer {
     fn new(src: &str) -> Result<Self, TemplateError> {
         let mut toks = Vec::new();
@@ -509,7 +615,7 @@ impl Lexer {
         let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
-            if c.is_whitespace() {
+            if py_space(c) {
                 i += 1;
             } else if c == '\'' || c == '"' {
                 let mut s = String::new();
@@ -523,20 +629,8 @@ impl Lexer {
                         break;
                     }
                     if ch == '\\' {
-                        let Some(&e) = cs.get(i) else {
-                            return err(format!("dangling escape in `{src}`"));
-                        };
-                        i += 1;
-                        match e {
-                            'n' => s.push('\n'),
-                            't' => s.push('\t'),
-                            'r' => s.push('\r'),
-                            '\\' | '\'' | '"' => s.push(e),
-                            other => {
-                                s.push('\\');
-                                s.push(other);
-                            }
-                        }
+                        i = string_escape(&cs, i, &mut s)
+                            .map_err(|e| TemplateError(format!("{e} in `{src}`")))?;
                     } else {
                         s.push(ch);
                     }
@@ -881,14 +975,69 @@ impl Lexer {
 
 // ---------------------------------------------------------------- values
 
-type Ns = Rc<RefCell<Map<String, Value>>>;
+/// A namespace's attributes, in the order they were first set.
+type Ns = Rc<RefCell<Vec<(String, V)>>>;
+
+/// Python's `range(start, stop, step)`; `step` is never 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PyRange {
+    start: i64,
+    stop: i64,
+    step: i64,
+}
+
+impl PyRange {
+    fn len(self) -> usize {
+        let (a, b, s) = (
+            i128::from(self.start),
+            i128::from(self.stop),
+            i128::from(self.step),
+        );
+        let n = if s > 0 {
+            if b > a { (b - a + s - 1) / s } else { 0 }
+        } else if a > b {
+            (a - b - s - 1) / -s
+        } else {
+            0
+        };
+        usize::try_from(n).unwrap_or(usize::MAX)
+    }
+
+    /// Item `i`, which must be under [`PyRange::len`].
+    fn item(self, i: usize) -> i64 {
+        let i = i64::try_from(i).expect("a range item index fits i64");
+        self.start + i * self.step
+    }
+
+    fn items(self) -> Vec<Value> {
+        (0..self.len()).map(|i| Value::from(self.item(i))).collect()
+    }
+
+    /// Python's `repr`.
+    fn repr(self) -> String {
+        if self.step == 1 {
+            format!("range({}, {})", self.start, self.stop)
+        } else {
+            format!("range({}, {}, {})", self.start, self.stop, self.step)
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum V {
     Undef,
     J(Value),
     Ns(Ns),
+    Range(PyRange),
     Macro(Arc<Macro>),
+}
+
+/// Where a value must be plain JSON: an element of a list or dict literal,
+/// or `tojson`'s input.
+#[derive(Clone, Copy)]
+enum JsonUse {
+    Element,
+    ToJson,
 }
 
 impl V {
@@ -896,6 +1045,7 @@ impl V {
         match self {
             V::Undef => false,
             V::Ns(_) | V::Macro(_) => true,
+            V::Range(r) => r.len() > 0,
             V::J(v) => match v {
                 Value::Null => false,
                 Value::Bool(b) => *b,
@@ -907,81 +1057,388 @@ impl V {
         }
     }
 
-    fn into_json(self) -> Result<Value, TemplateError> {
-        Ok(match self {
-            V::Undef => Value::Null,
-            V::J(v) => v,
-            V::Ns(ns) => Value::Object(ns.borrow().clone()),
+    /// The JSON value, where only a JSON value can go: jinja2 keeps an
+    /// undefined value, a namespace or a range in a list or dict (this
+    /// engine refuses them by name), and `tojson` refuses them as
+    /// `json.dumps` does.
+    fn into_json(self, at: JsonUse) -> Result<Value, TemplateError> {
+        let kind = match self {
+            V::J(v) => return Ok(v),
             V::Macro(m) => return err(format!("macro {} used as a value", m.name)),
+            V::Undef => "an undefined value",
+            V::Ns(_) => "a namespace",
+            V::Range(_) => "a range",
+        };
+        err(match at {
+            JsonUse::Element => format!("{kind} inside a list or dict is not supported"),
+            JsonUse::ToJson => format!("tojson of {kind}: not JSON serializable"),
         })
     }
 
+    /// Python's `str()`.
     fn render(&self, out: &mut String) -> Result<(), TemplateError> {
         match self {
             V::Undef => {}
-            V::Ns(_) => out.push_str("<Namespace>"),
-            V::J(v) => render_py(v, out),
+            V::J(Value::String(s)) => out.push_str(s),
+            other => other.repr(out)?,
+        }
+        Ok(())
+    }
+
+    /// Python's `repr()` (jinja2's `Undefined` for an undefined value).
+    fn repr(&self, out: &mut String) -> Result<(), TemplateError> {
+        self.repr_in(out, &mut Vec::new())
+    }
+
+    /// `repr()` inside the namespaces in `open`: a namespace that holds
+    /// itself prints its attributes as `{...}` there, as Python's recursion
+    /// guard on a dict's `repr` does.
+    fn repr_in(
+        &self,
+        out: &mut String,
+        open: &mut Vec<*const RefCell<Vec<(String, V)>>>,
+    ) -> Result<(), TemplateError> {
+        match self {
+            V::Undef => out.push_str("Undefined"),
+            V::J(v) => py_repr(v, out),
+            V::Range(r) => out.push_str(&r.repr()),
+            V::Ns(ns) if open.contains(&Rc::as_ptr(ns)) => out.push_str("<Namespace {...}>"),
+            V::Ns(ns) => {
+                open.push(Rc::as_ptr(ns));
+                out.push_str("<Namespace {");
+                for (i, (k, v)) in ns.borrow().iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    py_str_repr(k, out);
+                    out.push_str(": ");
+                    v.repr_in(out, open)?;
+                }
+                out.push_str("}>");
+                open.pop();
+            }
             V::Macro(m) => return err(format!("macro {} rendered as a value", m.name)),
         }
         Ok(())
     }
 }
 
-/// Python `str()` of a JSON value.
-fn render_py(v: &Value, out: &mut String) {
+/// Python's `repr()` of a JSON value.
+fn py_repr(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("None"),
         Value::Bool(true) => out.push_str("True"),
         Value::Bool(false) => out.push_str("False"),
-        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
-            (Some(i), _) => {
-                let _ = write!(out, "{i}");
-            }
-            (None, Some(f)) if f.fract() == 0.0 && f.abs() < 1e16 => {
-                let _ = write!(out, "{f:.1}");
-            }
-            _ => {
-                let _ = write!(out, "{n}");
-            }
-        },
-        Value::String(s) => out.push_str(s),
-        other => out.push_str(&py_json(other)),
-    }
-}
-
-/// `json.dumps(v, ensure_ascii=False)`: `", "` and `": "` separators.
-fn py_json(v: &Value) -> String {
-    let mut s = String::new();
-    py_json_into(v, &mut s);
-    s
-}
-
-fn py_json_into(v: &Value, s: &mut String) {
-    match v {
+        Value::Number(n) => py_number(n, out),
+        Value::String(s) => py_str_repr(s, out),
         Value::Array(a) => {
-            s.push('[');
+            out.push('[');
             for (i, x) in a.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    out.push_str(", ");
                 }
-                py_json_into(x, s);
+                py_repr(x, out);
             }
-            s.push(']');
+            out.push(']');
         }
         Value::Object(o) => {
-            s.push('{');
+            out.push('{');
             for (i, (k, x)) in o.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    out.push_str(", ");
                 }
-                s.push_str(&Value::String(k.clone()).to_string());
-                s.push_str(": ");
-                py_json_into(x, s);
+                py_str_repr(k, out);
+                out.push_str(": ");
+                py_repr(x, out);
             }
-            s.push('}');
+            out.push('}');
         }
-        scalar => s.push_str(&scalar.to_string()),
     }
+}
+
+/// An integer as Python prints it, a float as `float.__repr__` (which
+/// `json.dumps` uses too).
+fn py_number(n: &serde_json::Number, out: &mut String) {
+    if let Some(i) = n.as_i64() {
+        let _ = write!(out, "{i}");
+    } else if let Some(u) = n.as_u64() {
+        let _ = write!(out, "{u}");
+    } else if let Some(f) = n.as_f64() {
+        py_float(f, out);
+    }
+}
+
+/// `float.__repr__` of a finite float: the shortest digits that read back
+/// to it, in positional notation when the decimal exponent is in -4..16,
+/// else as `d.ddde±XX`.
+fn py_float(f: f64, out: &mut String) {
+    // `{:e}` prints the same shortest digits, as `d.ddde<exp>`.
+    let sci = format!("{:e}", f.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("{:e} prints an exponent");
+    let exp: i32 = exp.parse().expect("{:e} prints an integer exponent");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if f.is_sign_negative() {
+        out.push('-');
+    }
+    if (-4..16).contains(&exp) {
+        if exp >= 0 {
+            let int_len = usize::try_from(exp).expect("non-negative") + 1;
+            let (int, frac) = if digits.len() > int_len {
+                digits.split_at(int_len)
+            } else {
+                (digits.as_str(), "")
+            };
+            out.push_str(int);
+            out.extend(std::iter::repeat_n('0', int_len.saturating_sub(int.len())));
+            out.push('.');
+            out.push_str(if frac.is_empty() { "0" } else { frac });
+        } else {
+            out.push_str("0.");
+            let zeros = usize::try_from(-exp - 1).expect("positive");
+            out.extend(std::iter::repeat_n('0', zeros));
+            out.push_str(&digits);
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        out.push_str(first);
+        if !rest.is_empty() {
+            out.push('.');
+            out.push_str(rest);
+        }
+        let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
+    }
+}
+
+/// Python's `str.isprintable` past ASCII. The standard library's debug
+/// escape leaves a character alone exactly when it is printable by that
+/// definition (general category not Other or Separator), except these
+/// ranges, which it escapes as default-ignorable while Python prints them.
+fn py_printable(c: char) -> bool {
+    const PRINTED: [(u32, u32); 9] = [
+        (0x034F, 0x034F),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180D),
+        (0x180F, 0x180F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFFA0, 0xFFA0),
+        (0xE0100, 0xE01EF),
+    ];
+    if c.is_ascii() {
+        return (' '..='~').contains(&c);
+    }
+    let u = u32::from(c);
+    if PRINTED.iter().any(|&(lo, hi)| (lo..=hi).contains(&u)) {
+        return true;
+    }
+    // Not the first character: the escape then looks at printability only.
+    let s = format!("a{c}");
+    s.escape_debug().eq(s.chars())
+}
+
+/// Python's `repr()` of a string: single quotes unless the string holds a
+/// `'` and no `"`; `\\`, the quote, `\n`, `\r`, `\t` escaped, and every
+/// other character that is not printable as `\xhh`, `\uhhhh` or
+/// `\Uhhhhhhhh`.
+fn py_str_repr(s: &str, out: &mut String) {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if py_printable(c) => out.push(c),
+            c => py_hex_escape(c, out),
+        }
+    }
+    out.push(quote);
+}
+
+/// Python's escape of a character by its code point: `\xhh`, `\uhhhh` or
+/// `\Uhhhhhhhh`, lower-case hex.
+fn py_hex_escape(c: char, out: &mut String) {
+    let u = u32::from(c);
+    let _ = if u < 0x100 {
+        write!(out, "\\x{u:02x}")
+    } else if u < 0x1_0000 {
+        write!(out, "\\u{u:04x}")
+    } else {
+        write!(out, "\\U{u:08x}")
+    };
+}
+
+/// `json.dumps` options, as the HF environment's `tojson` passes them.
+struct JsonStyle {
+    ensure_ascii: bool,
+    /// The text of one indent level; `None` is the one-line form.
+    indent: Option<String>,
+    item_sep: String,
+    key_sep: String,
+    sort_keys: bool,
+}
+
+impl JsonStyle {
+    /// `json.dumps`'s defaults as `tojson` sets them (`ensure_ascii` off).
+    fn plain() -> Self {
+        JsonStyle {
+            ensure_ascii: false,
+            indent: None,
+            item_sep: ", ".into(),
+            key_sep: ": ".into(),
+            sort_keys: false,
+        }
+    }
+
+    fn dumps(&self, v: &Value) -> String {
+        let mut s = String::new();
+        self.value(v, 0, &mut s);
+        s
+    }
+
+    fn newline(&self, level: usize, s: &mut String) {
+        if let Some(ind) = &self.indent {
+            s.push('\n');
+            for _ in 0..level {
+                s.push_str(ind);
+            }
+        }
+    }
+
+    fn value(&self, v: &Value, level: usize, s: &mut String) {
+        match v {
+            Value::Null => s.push_str("null"),
+            Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+            Value::Number(n) => py_number(n, s),
+            Value::String(x) => self.string(x, s),
+            Value::Array(a) if a.is_empty() => s.push_str("[]"),
+            Value::Object(o) if o.is_empty() => s.push_str("{}"),
+            Value::Array(a) => {
+                s.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(&self.item_sep);
+                    }
+                    self.newline(level + 1, s);
+                    self.value(x, level + 1, s);
+                }
+                self.newline(level, s);
+                s.push(']');
+            }
+            Value::Object(o) => {
+                let mut items: Vec<(&String, &Value)> = o.iter().collect();
+                if self.sort_keys {
+                    items.sort_by(|a, b| a.0.cmp(b.0));
+                }
+                s.push('{');
+                for (i, (k, x)) in items.into_iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(&self.item_sep);
+                    }
+                    self.newline(level + 1, s);
+                    self.string(k, s);
+                    s.push_str(&self.key_sep);
+                    self.value(x, level + 1, s);
+                }
+                self.newline(level, s);
+                s.push('}');
+            }
+        }
+    }
+
+    /// A JSON string as `json.dumps` writes it: `"`, `\\` and the control
+    /// characters escaped (`\b`, `\f`, `\n`, `\r`, `\t` by name), and under
+    /// `ensure_ascii` everything past `~` as `\uhhhh` (UTF-16 pairs).
+    fn string(&self, x: &str, s: &mut String) {
+        s.push('"');
+        let mut units = [0u16; 2];
+        for c in x.chars() {
+            match c {
+                '"' => s.push_str("\\\""),
+                '\\' => s.push_str("\\\\"),
+                '\u{8}' => s.push_str("\\b"),
+                '\u{c}' => s.push_str("\\f"),
+                '\n' => s.push_str("\\n"),
+                '\r' => s.push_str("\\r"),
+                '\t' => s.push_str("\\t"),
+                c if c < ' ' || (self.ensure_ascii && c > '~') => {
+                    for u in c.encode_utf16(&mut units) {
+                        let _ = write!(s, "\\u{u:04x}");
+                    }
+                }
+                c => s.push(c),
+            }
+        }
+        s.push('"');
+    }
+}
+
+/// `tojson`'s arguments: `ensure_ascii`, `indent`, `separators`, `sort_keys`,
+/// in that order or by name.
+fn tojson_style(args: &[V], kwargs: &[(&str, V)]) -> Result<JsonStyle, TemplateError> {
+    const NAMES: [&str; 4] = ["ensure_ascii", "indent", "separators", "sort_keys"];
+    if args.len() > NAMES.len() {
+        return err("tojson takes at most 4 positional arguments");
+    }
+    let mut given: [Option<&V>; 4] = [None; 4];
+    for (i, a) in args.iter().enumerate() {
+        given[i] = Some(a);
+    }
+    for (k, a) in kwargs {
+        let Some(i) = NAMES.iter().position(|n| n == k) else {
+            return err(format!("tojson({k}=...) is not supported"));
+        };
+        if given[i].is_some() {
+            return err(format!("tojson: {k} given twice"));
+        }
+        given[i] = Some(a);
+    }
+    let [ascii, indent, separators, sort_keys] = given;
+    let mut style = JsonStyle::plain();
+    style.ensure_ascii = ascii.is_some_and(V::truthy);
+    style.sort_keys = sort_keys.is_some_and(V::truthy);
+    style.indent = match indent {
+        None | Some(V::J(Value::Null)) => None,
+        Some(V::J(Value::String(s))) => Some(s.clone()),
+        Some(V::J(Value::Bool(b))) => Some(" ".repeat(usize::from(*b))),
+        Some(V::J(Value::Number(n))) if n.is_i64() => Some(
+            " ".repeat(
+                n.as_i64()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .unwrap_or(0),
+            ),
+        ),
+        Some(other) => {
+            return err(format!(
+                "tojson indent must be a count or a string, not {other:?}"
+            ));
+        }
+    };
+    if style.indent.is_some() {
+        style.item_sep = ",".into();
+    }
+    match separators {
+        None | Some(V::J(Value::Null)) => {}
+        Some(V::J(Value::Array(p))) => match p.as_slice() {
+            [Value::String(item), Value::String(key)] => {
+                style.item_sep.clone_from(item);
+                style.key_sep.clone_from(key);
+            }
+            _ => return err("tojson separators must be a pair of strings"),
+        },
+        Some(_) => return err("tojson separators must be a pair of strings"),
+    }
+    Ok(style)
 }
 
 // ---------------------------------------------------------------- render
@@ -1061,10 +1518,11 @@ impl Renderer {
                 let v = self.eval(value)?;
                 match attr {
                     None => self.assign(name.clone(), v),
-                    Some(a) => match self.lookup(name) {
-                        V::Ns(ns) => {
-                            ns.borrow_mut().insert(a.clone(), v.into_json()?);
+                    Some(a) => match (self.lookup(name), v) {
+                        (_, V::Macro(m)) => {
+                            return err(format!("macro {} used as a value", m.name));
                         }
+                        (V::Ns(ns), v) => ns_set(&ns, a, v),
                         _ => return err(format!("set {name}.{a}: {name} is not a namespace")),
                     },
                 }
@@ -1072,9 +1530,10 @@ impl Renderer {
             Node::For {
                 targets,
                 iter,
+                filter,
                 body,
             } => {
-                let items: Vec<Value> = match self.eval(iter)? {
+                let mut items: Vec<Value> = match self.eval(iter)? {
                     V::Undef => Vec::new(),
                     V::J(Value::Array(a)) => a,
                     V::J(Value::Object(o)) => o.keys().map(|k| Value::String(k.clone())).collect(),
@@ -1082,32 +1541,36 @@ impl Renderer {
                         s.chars().map(|c| Value::String(c.to_string())).collect()
                     }
                     V::J(Value::Null) => Vec::new(),
+                    V::Range(r) => r.items(),
                     other => return err(format!("cannot iterate {other:?}")),
                 };
-                let len = items.len();
-                for (i, item) in items.into_iter().enumerate() {
-                    let mut frame = HashMap::new();
-                    let lp = serde_json::json!({
-                        "index0": i, "index": i + 1, "first": i == 0, "last": i + 1 == len,
-                        "length": len, "revindex": len - i, "revindex0": len - i - 1,
-                    });
-                    frame.insert("loop".to_owned(), V::J(lp));
-                    if targets.len() == 1 {
-                        frame.insert(targets[0].clone(), V::J(item));
-                    } else {
-                        let Value::Array(parts) = item else {
-                            return err(format!("cannot unpack a non-sequence into {targets:?}"));
-                        };
-                        if parts.len() != targets.len() {
-                            return err(format!(
-                                "cannot unpack {} values into {targets:?}",
-                                parts.len()
-                            ));
-                        }
-                        for (t, p) in targets.iter().zip(parts) {
-                            frame.insert(t.clone(), V::J(p));
+                if let Some(cond) = filter {
+                    let mut kept = Vec::with_capacity(items.len());
+                    for item in items {
+                        self.frames.push(bind_targets(targets, item.clone())?);
+                        let keep = self.eval(cond).map(|v| v.truthy());
+                        self.frames.pop();
+                        if keep? {
+                            kept.push(item);
                         }
                     }
+                    items = kept;
+                }
+                let len = items.len();
+                for i in 0..len {
+                    let mut lp = serde_json::json!({
+                        "index0": i, "index": i + 1, "first": i == 0, "last": i + 1 == len,
+                        "length": len, "revindex": len - i, "revindex0": len - i - 1,
+                        "depth": 1, "depth0": 0,
+                    });
+                    if i > 0 {
+                        lp["previtem"] = items[i - 1].clone();
+                    }
+                    if i + 1 < len {
+                        lp["nextitem"] = items[i + 1].clone();
+                    }
+                    let mut frame = bind_targets(targets, items[i].clone())?;
+                    frame.entry("loop".to_owned()).or_insert(V::J(lp));
                     self.frames.push(frame);
                     let r = self.nodes(body);
                     self.frames.pop();
@@ -1136,7 +1599,7 @@ impl Renderer {
             Expr::List(items) => V::J(Value::Array(
                 items
                     .iter()
-                    .map(|x| self.eval(x)?.into_json())
+                    .map(|x| self.eval(x)?.into_json(JsonUse::Element))
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Dict(items) => {
@@ -1146,7 +1609,7 @@ impl Renderer {
                         V::J(Value::String(s)) => s,
                         other => return err(format!("dict key must be a string, got {other:?}")),
                     };
-                    m.insert(key, self.eval(v)?.into_json()?);
+                    m.insert(key, self.eval(v)?.into_json(JsonUse::Element)?);
                 }
                 V::J(Value::Object(m))
             }
@@ -1172,10 +1635,7 @@ impl Renderer {
                     .iter()
                     .map(|a| self.eval(a))
                     .collect::<Result<_, _>>()?;
-                let kwargs: Vec<(&str, V)> = kwargs
-                    .iter()
-                    .map(|(k, a)| Ok((k.as_str(), self.eval(a)?)))
-                    .collect::<Result<_, TemplateError>>()?;
+                let kwargs = self.eval_kwargs(kwargs)?;
                 filter(v, name, &args, &kwargs)?
             }
             Expr::Test(x, name, negate) => {
@@ -1185,7 +1645,10 @@ impl Renderer {
             Expr::Not(x) => V::J(Value::Bool(!self.eval(x)?.truthy())),
             Expr::Neg(x) => match self.eval(x)? {
                 V::J(Value::Number(n)) => match n.as_i64() {
-                    Some(i) => V::J(Value::from(-i)),
+                    Some(i) => V::J(Value::from(
+                        i.checked_neg()
+                            .ok_or_else(|| TemplateError("integer overflow".into()))?,
+                    )),
                     None => V::J(Value::from(-n.as_f64().unwrap_or(0.0))),
                 },
                 other => return err(format!("cannot negate {other:?}")),
@@ -1216,6 +1679,16 @@ impl Renderer {
         })
     }
 
+    fn eval_kwargs<'k>(
+        &mut self,
+        kwargs: &'k [(String, Expr)],
+    ) -> Result<Vec<(&'k str, V)>, TemplateError> {
+        kwargs
+            .iter()
+            .map(|(k, a)| Ok((k.as_str(), self.eval(a)?)))
+            .collect()
+    }
+
     fn call(
         &mut self,
         callee: &Expr,
@@ -1231,33 +1704,20 @@ impl Renderer {
         {
             return self.call_macro(&m, args, kwargs);
         }
+        let kwargs = self.eval_kwargs(kwargs)?;
         match callee {
-            Expr::Name(n) if n == "namespace" => {
-                let mut m = Map::new();
-                for (k, v) in kwargs {
-                    m.insert(k.clone(), self.eval(v)?.into_json()?);
-                }
-                Ok(V::Ns(Rc::new(RefCell::new(m))))
-            }
+            Expr::Name(n) if n == "namespace" => namespace(args, kwargs),
             Expr::Name(n) if n == "raise_exception" => {
-                let mut msg = String::new();
-                if let Some(a) = args.first() {
-                    a.render(&mut msg)?;
-                }
+                let msg = match (args.as_slice(), kwargs.as_slice()) {
+                    ([m], []) | ([], [("message", m)]) => to_str(m)?,
+                    _ => return err("raise_exception() takes 1 argument (message)"),
+                };
                 err(format!("raise_exception: {msg}"))
             }
-            Expr::Name(n) if n == "range" => {
-                let ints: Vec<i64> = args.iter().filter_map(as_i64).collect();
-                let (lo, hi) = match ints.as_slice() {
-                    [hi] => (0, *hi),
-                    [lo, hi, ..] => (*lo, *hi),
-                    _ => return err("range needs integer bounds"),
-                };
-                Ok(V::J(Value::Array((lo..hi).map(Value::from).collect())))
-            }
+            Expr::Name(n) if n == "range" => range(&args, &kwargs),
             Expr::Attr(obj, method) => {
                 let o = self.eval(obj)?;
-                call_method(&o, method, &args)
+                call_method(&o, method, &args, &kwargs)
             }
             other => err(format!("unsupported call {other:?}")),
         }
@@ -1324,6 +1784,98 @@ impl Renderer {
     }
 }
 
+/// A loop item bound to the loop's target names (unpacked when there are
+/// several).
+fn bind_targets(targets: &[String], item: Value) -> Result<HashMap<String, V>, TemplateError> {
+    let mut frame = HashMap::new();
+    if targets.len() == 1 {
+        frame.insert(targets[0].clone(), V::J(item));
+        return Ok(frame);
+    }
+    let Value::Array(parts) = item else {
+        return err(format!("cannot unpack a non-sequence into {targets:?}"));
+    };
+    if parts.len() != targets.len() {
+        return err(format!(
+            "cannot unpack {} values into {targets:?}",
+            parts.len()
+        ));
+    }
+    for (t, p) in targets.iter().zip(parts) {
+        frame.insert(t.clone(), V::J(p));
+    }
+    Ok(frame)
+}
+
+/// Sets `ns.name`, in place when it is already set (a dict keeps a key's
+/// position).
+fn ns_set(ns: &Ns, name: &str, v: V) {
+    let mut attrs = ns.borrow_mut();
+    match attrs.iter_mut().find(|(k, _)| k == name) {
+        Some(slot) => slot.1 = v,
+        None => attrs.push((name.to_owned(), v)),
+    }
+}
+
+/// `namespace(mapping_or_pairs, **kwargs)`: jinja2's `dict(*args, **kwargs)`.
+fn namespace(args: Vec<V>, kwargs: Vec<(&str, V)>) -> Result<V, TemplateError> {
+    let ns: Ns = Rc::new(RefCell::new(Vec::new()));
+    match args.as_slice() {
+        [] => {}
+        [V::J(Value::Object(m))] => {
+            for (k, v) in m {
+                ns_set(&ns, k, V::J(v.clone()));
+            }
+        }
+        [V::J(Value::Array(pairs))] => {
+            for p in pairs {
+                let Some([Value::String(k), v]) = p.as_array().map(Vec::as_slice) else {
+                    return err(format!(
+                        "namespace() takes a mapping or a list of (string, value) pairs, got {p}"
+                    ));
+                };
+                ns_set(&ns, k, V::J(v.clone()));
+            }
+        }
+        [other] => {
+            return err(format!(
+                "namespace() takes a mapping or a list of pairs, not {other:?}"
+            ));
+        }
+        _ => return err("namespace() takes at most 1 positional argument"),
+    }
+    for (k, v) in kwargs {
+        if let V::Macro(m) = v {
+            return err(format!("macro {} used as a value", m.name));
+        }
+        ns_set(&ns, k, v);
+    }
+    Ok(V::Ns(ns))
+}
+
+/// `range(stop)`, `range(start, stop[, step])`: integers, step not 0.
+fn range(args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    if !kwargs.is_empty() {
+        return err("range() takes no keyword arguments");
+    }
+    let ints: Vec<i64> = args
+        .iter()
+        .map(|a| {
+            as_i64(a).ok_or_else(|| TemplateError(format!("range() takes integers, not {a:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let (start, stop, step) = match ints.as_slice() {
+        [stop] => (0, *stop, 1),
+        [start, stop] => (*start, *stop, 1),
+        [start, stop, step] => (*start, *stop, *step),
+        _ => return err("range() takes 1 to 3 arguments"),
+    };
+    if step == 0 {
+        return err("range() step must not be zero");
+    }
+    Ok(V::Range(PyRange { start, stop, step }))
+}
+
 fn as_i64(v: &V) -> Option<i64> {
     match v {
         V::J(Value::Number(n)) => n.as_i64(),
@@ -1333,10 +1885,27 @@ fn as_i64(v: &V) -> Option<i64> {
 
 fn get_attr(o: &V, name: &str) -> V {
     match o {
-        V::Ns(ns) => ns.borrow().get(name).cloned().map_or(V::Undef, V::J),
+        V::Ns(ns) => ns
+            .borrow()
+            .iter()
+            .find(|(k, _)| k == name)
+            .map_or(V::Undef, |(_, v)| v.clone()),
         V::J(Value::Object(m)) => m.get(name).cloned().map_or(V::Undef, V::J),
+        V::Range(r) => match name {
+            "start" => V::J(Value::from(r.start)),
+            "stop" => V::J(Value::from(r.stop)),
+            "step" => V::J(Value::from(r.step)),
+            _ => V::Undef,
+        },
         _ => V::Undef,
     }
+}
+
+/// Position `i` (negative from the end) of `len` items, if there is one.
+fn position(i: i64, len: usize) -> Option<usize> {
+    let n = i64::try_from(len).unwrap_or(i64::MAX);
+    let i = if i < 0 { i + n } else { i };
+    usize::try_from(i).ok().filter(|&i| i < len)
 }
 
 fn index(o: &V, i: &V) -> V {
@@ -1347,22 +1916,19 @@ fn index(o: &V, i: &V) -> V {
         (V::Ns(_), V::J(Value::String(k))) => get_attr(o, k),
         (V::J(Value::String(s)), V::J(Value::Number(n))) => {
             let Some(i) = n.as_i64() else { return V::Undef };
-            let len = i64::try_from(s.chars().count()).unwrap_or(i64::MAX);
-            let i = if i < 0 { i + len } else { i };
-            usize::try_from(i)
-                .ok()
+            position(i, s.chars().count())
                 .and_then(|i| s.chars().nth(i))
                 .map_or(V::Undef, |c| V::J(Value::String(c.to_string())))
         }
         (V::J(Value::Array(a)), V::J(Value::Number(n))) => {
             let Some(i) = n.as_i64() else { return V::Undef };
-            let len = i64::try_from(a.len()).unwrap_or(i64::MAX);
-            let i = if i < 0 { i + len } else { i };
-            usize::try_from(i)
-                .ok()
-                .and_then(|i| a.get(i))
-                .cloned()
+            position(i, a.len())
+                .map(|i| a[i].clone())
                 .map_or(V::Undef, V::J)
+        }
+        (V::Range(r), V::J(Value::Number(n))) => {
+            let Some(i) = n.as_i64() else { return V::Undef };
+            position(i, r.len()).map_or(V::Undef, |i| V::J(Value::from(r.item(i))))
         }
         _ => V::Undef,
     }
@@ -1431,109 +1997,6 @@ fn slice(o: &V, lo: Option<i64>, hi: Option<i64>, step: Option<i64>) -> Result<V
     }
 }
 
-fn call_method(o: &V, method: &str, args: &[V]) -> Result<V, TemplateError> {
-    let str_arg = |i: usize| match args.get(i) {
-        Some(V::J(Value::String(s))) => Some(s.clone()),
-        _ => None,
-    };
-    Ok(match (o, method) {
-        (V::J(Value::Object(m)), "items") => V::J(Value::Array(
-            m.iter()
-                .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), v.clone()]))
-                .collect(),
-        )),
-        (V::J(Value::Object(m)), "keys") => V::J(Value::Array(
-            m.keys().map(|k| Value::String(k.clone())).collect(),
-        )),
-        (V::J(Value::Object(m)), "values") => V::J(Value::Array(m.values().cloned().collect())),
-        (V::J(Value::Object(m)), "get") => {
-            let k = str_arg(0).ok_or_else(|| TemplateError("get() needs a string key".into()))?;
-            match m.get(&k) {
-                Some(v) => V::J(v.clone()),
-                None => args.get(1).cloned().unwrap_or(V::J(Value::Null)),
-            }
-        }
-        (V::J(Value::String(s)), "strip" | "lstrip" | "rstrip") => {
-            // Python's rule: no argument (or `none`) strips whitespace, a string
-            // strips any of its characters.
-            let set: Option<Vec<char>> = match args.first() {
-                None | Some(V::J(Value::Null)) => None,
-                Some(V::J(Value::String(c))) => Some(c.chars().collect()),
-                Some(other) => return err(format!("{method}() takes a string, not {other:?}")),
-            };
-            let strips = |c: char| set.as_ref().map_or(c.is_whitespace(), |s| s.contains(&c));
-            V::J(Value::String(
-                match method {
-                    "strip" => s.trim_matches(strips),
-                    "lstrip" => s.trim_start_matches(strips),
-                    _ => s.trim_end_matches(strips),
-                }
-                .to_owned(),
-            ))
-        }
-        (V::J(Value::String(s)), "split") => V::J(Value::Array(
-            split(s, args.first(), args.get(1))?
-                .into_iter()
-                .map(Value::String)
-                .collect(),
-        )),
-        (V::J(Value::String(s)), "startswith") => {
-            V::J(Value::Bool(str_arg(0).is_some_and(|p| s.starts_with(&p))))
-        }
-        (V::J(Value::String(s)), "endswith") => {
-            V::J(Value::Bool(str_arg(0).is_some_and(|p| s.ends_with(&p))))
-        }
-        (other, m) => return err(format!("no method {m}() on {other:?}")),
-    })
-}
-
-/// Python's `str.split(sep, maxsplit)`: on `sep` (a non-empty string), or on
-/// runs of whitespace with the ends' whitespace dropped when `sep` is absent
-/// or `none`; at most `maxsplit` splits when it is given and not negative.
-fn split(s: &str, sep: Option<&V>, maxsplit: Option<&V>) -> Result<Vec<String>, TemplateError> {
-    let max = match maxsplit {
-        None => None,
-        Some(V::J(Value::Number(n))) if n.is_i64() => {
-            n.as_i64().and_then(|m| usize::try_from(m).ok())
-        }
-        Some(other) => {
-            return err(format!(
-                "split() maxsplit must be an integer, not {other:?}"
-            ));
-        }
-    };
-    match sep {
-        None | Some(V::J(Value::Null)) => Ok(split_whitespace(s, max)),
-        Some(V::J(Value::String(sep))) if sep.is_empty() => err("split(): empty separator"),
-        Some(V::J(Value::String(sep))) => Ok(match max {
-            Some(m) => s
-                .splitn(m.saturating_add(1), sep.as_str())
-                .map(str::to_owned)
-                .collect(),
-            None => s.split(sep.as_str()).map(str::to_owned).collect(),
-        }),
-        Some(other) => err(format!("split() takes a string separator, not {other:?}")),
-    }
-}
-
-/// `str.split()` with no separator: the words between runs of whitespace; past
-/// `max` splits, the rest of the string (its leading whitespace dropped) is
-/// the last word.
-fn split_whitespace(s: &str, max: Option<usize>) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = s.trim_start();
-    while !rest.is_empty() {
-        if max.is_some_and(|m| out.len() == m) {
-            out.push(rest.to_owned());
-            break;
-        }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        out.push(rest[..end].to_owned());
-        rest = rest[end..].trim_start();
-    }
-    out
-}
-
 /// Codepoints whose title case (Python's `str.capitalize` on a first
 /// character) is not their upper case: Python 3.12's tables, `chr(c).title()
 /// != chr(c).upper()`, 135 codepoints.
@@ -1581,49 +2044,191 @@ fn capitalize(s: &str) -> Result<String, TemplateError> {
     Ok(first.to_uppercase().chain(lower[skip..].chars()).collect())
 }
 
-/// `json.dumps(..., ensure_ascii=True)` from its `False` form: every
-/// non-ASCII character as `\uXXXX` (lower-case hex, UTF-16 surrogate pairs).
-fn ascii_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut units = [0u16; 2];
-    for c in s.chars() {
-        if c.is_ascii() {
-            out.push(c);
-        } else {
-            for u in c.encode_utf16(&mut units) {
-                let _ = write!(out, "\\u{u:04x}");
+/// Checks a method's arguments: at most `max` positional ones, no keywords.
+fn positional(
+    method: &str,
+    args: &[V],
+    kwargs: &[(&str, V)],
+    max: usize,
+) -> Result<(), TemplateError> {
+    if !kwargs.is_empty() {
+        return err(format!("{method}() takes no keyword arguments"));
+    }
+    if args.len() > max {
+        return err(match max {
+            0 => format!("{method}() takes no arguments"),
+            1 => format!("{method}() takes at most 1 argument"),
+            2 if method == "get" => "get() takes 1 or 2 arguments".to_owned(),
+            _ => format!("{method}() takes at most {max} arguments"),
+        });
+    }
+    Ok(())
+}
+
+fn call_method(o: &V, method: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    Ok(match (o, method) {
+        (V::J(Value::Object(m)), "items" | "keys" | "values") => {
+            positional(method, args, kwargs, 0)?;
+            V::J(Value::Array(match method {
+                "items" => m
+                    .iter()
+                    .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), v.clone()]))
+                    .collect(),
+                "keys" => m.keys().map(|k| Value::String(k.clone())).collect(),
+                _ => m.values().cloned().collect(),
+            }))
+        }
+        (V::J(Value::Object(m)), "get") => {
+            positional(method, args, kwargs, 2)?;
+            let k = match args {
+                [V::J(Value::String(k))] | [V::J(Value::String(k)), _] => k,
+                [other] | [other, _] => {
+                    return err(format!("get() needs a string key, not {other:?}"));
+                }
+                _ => return err("get() takes 1 or 2 arguments"),
+            };
+            match m.get(k) {
+                Some(v) => V::J(v.clone()),
+                None => args.get(1).cloned().unwrap_or(V::J(Value::Null)),
             }
         }
+        (V::J(Value::String(s)), "strip" | "lstrip" | "rstrip") => {
+            positional(method, args, kwargs, 1)?;
+            // Python's rule: no argument (or `none`) strips whitespace, a string
+            // strips any of its characters.
+            let set: Option<Vec<char>> = match args.first() {
+                None | Some(V::J(Value::Null)) => None,
+                Some(V::J(Value::String(c))) => Some(c.chars().collect()),
+                Some(other) => return err(format!("{method}() takes a string, not {other:?}")),
+            };
+            let strips = |c: char| set.as_ref().map_or(py_space(c), |s| s.contains(&c));
+            V::J(Value::String(
+                match method {
+                    "strip" => s.trim_matches(strips),
+                    "lstrip" => s.trim_start_matches(strips),
+                    _ => s.trim_end_matches(strips),
+                }
+                .to_owned(),
+            ))
+        }
+        (V::J(Value::String(s)), "split") => {
+            if args.len() > 2 {
+                return err("split() takes at most 2 arguments");
+            }
+            let mut given = [args.first(), args.get(1)];
+            for (k, a) in kwargs {
+                let i = match *k {
+                    "sep" => 0,
+                    "maxsplit" => 1,
+                    other => return err(format!("split() takes no argument {other}")),
+                };
+                if given[i].is_some() {
+                    return err(format!("split(): {k} given twice"));
+                }
+                given[i] = Some(a);
+            }
+            V::J(Value::Array(
+                split(s, given[0], given[1])?
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ))
+        }
+        (V::J(Value::String(s)), "startswith" | "endswith") => {
+            positional(method, args, kwargs, 3)?;
+            let Some(V::J(Value::String(affix))) = args.first() else {
+                return err(format!("{method}() takes a string, not {:?}", args.first()));
+            };
+            let bound = |i: usize| {
+                args.get(i)
+                    .map(slice_bound)
+                    .transpose()
+                    .map(Option::flatten)
+            };
+            V::J(Value::Bool(tail_match(
+                s,
+                affix,
+                bound(1)?,
+                bound(2)?,
+                method == "endswith",
+            )))
+        }
+        (other, m) => return err(format!("no method {m}() on {other:?}")),
+    })
+}
+
+/// CPython's `tailmatch`: whether `s[start:end]` starts (or ends) with
+/// `affix`, by character, where a start past the end matches nothing, not
+/// even an empty affix.
+fn tail_match(s: &str, affix: &str, start: Option<i64>, end: Option<i64>, at_end: bool) -> bool {
+    let cs: Vec<char> = s.chars().collect();
+    let a: Vec<char> = affix.chars().collect();
+    let len = i64::try_from(cs.len()).unwrap_or(i64::MAX);
+    let alen = i64::try_from(a.len()).unwrap_or(i64::MAX);
+    let from_end = |i: i64| if i < 0 { (i + len).max(0) } else { i };
+    let end = end.map_or(len, from_end).min(len);
+    let start = start.map_or(0, from_end);
+    if end - alen < start {
+        return false;
+    }
+    let at = if at_end { end - alen } else { start };
+    let at = usize::try_from(at).expect("a position inside the string");
+    cs[at..at + a.len()] == a[..]
+}
+
+/// Python's `str.split(sep, maxsplit)`: on `sep` (a non-empty string), or on
+/// runs of whitespace with the ends' whitespace dropped when `sep` is absent
+/// or `none`; at most `maxsplit` splits when it is given and not negative.
+fn split(s: &str, sep: Option<&V>, maxsplit: Option<&V>) -> Result<Vec<String>, TemplateError> {
+    let max = match maxsplit {
+        None => None,
+        Some(V::J(Value::Number(n))) if n.is_i64() => {
+            n.as_i64().and_then(|m| usize::try_from(m).ok())
+        }
+        Some(other) => {
+            return err(format!(
+                "split() maxsplit must be an integer, not {other:?}"
+            ));
+        }
+    };
+    match sep {
+        None | Some(V::J(Value::Null)) => Ok(split_whitespace(s, max)),
+        Some(V::J(Value::String(sep))) if sep.is_empty() => err("split(): empty separator"),
+        Some(V::J(Value::String(sep))) => Ok(match max {
+            Some(m) => s
+                .splitn(m.saturating_add(1), sep.as_str())
+                .map(str::to_owned)
+                .collect(),
+            None => s.split(sep.as_str()).map(str::to_owned).collect(),
+        }),
+        Some(other) => err(format!("split() takes a string separator, not {other:?}")),
+    }
+}
+
+/// `str.split()` with no separator: the words between runs of whitespace; past
+/// `max` splits, the rest of the string (its leading whitespace dropped) is
+/// the last word.
+fn split_whitespace(s: &str, max: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s.trim_start_matches(py_space);
+    while !rest.is_empty() {
+        if max.is_some_and(|m| out.len() == m) {
+            out.push(rest.to_owned());
+            break;
+        }
+        let end = rest.find(py_space).unwrap_or(rest.len());
+        out.push(rest[..end].to_owned());
+        rest = rest[end..].trim_start_matches(py_space);
     }
     out
 }
 
-/// `tojson`'s arguments: `ensure_ascii`, positionally or by name.
-fn tojson_ascii(args: &[V], kwargs: &[(&str, V)]) -> Result<bool, TemplateError> {
-    let mut ascii = match args {
-        [] => None,
-        [a] => Some(a.truthy()),
-        _ => return err("tojson takes at most one positional argument (ensure_ascii)"),
-    };
-    for (k, a) in kwargs {
-        match *k {
-            "ensure_ascii" if ascii.is_none() => ascii = Some(a.truthy()),
-            "ensure_ascii" => return err("tojson: ensure_ascii given twice"),
-            other => return err(format!("tojson({other}=...) is not supported")),
-        }
-    }
-    Ok(ascii.unwrap_or(false))
-}
-
 fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
     if name == "tojson" {
-        let ascii = tojson_ascii(args, kwargs)?;
-        let s = py_json(&v.into_json()?);
-        return Ok(V::J(Value::String(if ascii {
-            ascii_escape(&s)
-        } else {
-            s
-        })));
+        let style = tojson_style(args, kwargs)?;
+        return Ok(V::J(Value::String(
+            style.dumps(&v.into_json(JsonUse::ToJson)?),
+        )));
     }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
@@ -1639,9 +2244,22 @@ fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, Templ
             V::J(Value::Array(a)) => a.len(),
             V::J(Value::Object(o)) => o.len(),
             V::J(Value::String(s)) => s.chars().count(),
-            _ => 0,
+            V::Range(r) => r.len(),
+            // jinja2's Undefined has length 0.
+            V::Undef => 0,
+            other => {
+                let kind = match other {
+                    V::J(Value::Null) => "none",
+                    V::J(Value::Bool(_)) => "bool",
+                    V::J(Value::Number(n)) if n.is_f64() => "float",
+                    V::J(_) => "int",
+                    V::Ns(_) => "namespace",
+                    _ => "macro",
+                };
+                return err(format!("|{name}: {kind} has no length"));
+            }
         })),
-        "trim" => V::J(Value::String(to_str(&v)?.trim().to_owned())),
+        "trim" => V::J(Value::String(to_str(&v)?.trim_matches(py_space).to_owned())),
         "string" => V::J(Value::String(to_str(&v)?)),
         "lower" => V::J(Value::String(to_str(&v)?.to_lowercase())),
         "upper" => V::J(Value::String(to_str(&v)?.to_uppercase())),
@@ -1665,15 +2283,26 @@ fn test(v: &V, name: &str) -> Result<bool, TemplateError> {
         "true" => matches!(v, V::J(Value::Bool(true))),
         "false" => matches!(v, V::J(Value::Bool(false))),
         "string" => matches!(v, V::J(Value::String(_))),
-        "number" => matches!(v, V::J(Value::Number(_))),
+        // Python's `bool` is a `Number`.
+        "number" => matches!(v, V::J(Value::Number(_) | Value::Bool(_))),
         "boolean" => matches!(v, V::J(Value::Bool(_))),
-        "mapping" => matches!(v, V::J(Value::Object(_)) | V::Ns(_)),
+        "mapping" => matches!(v, V::J(Value::Object(_))),
+        // jinja2's Undefined has a length and items; a namespace has neither.
         "sequence" | "iterable" => matches!(
             v,
-            V::J(Value::Array(_) | Value::String(_) | Value::Object(_))
+            V::J(Value::Array(_) | Value::String(_) | Value::Object(_)) | V::Range(_) | V::Undef
         ),
         other => return err(format!("unsupported test `is {other}`")),
     })
+}
+
+/// A number or a boolean as Python's `int`, when it is one.
+fn py_int(v: &V) -> Option<i64> {
+    match v {
+        V::J(Value::Number(n)) => n.as_i64(),
+        V::J(Value::Bool(b)) => Some(i64::from(*b)),
+        _ => None,
+    }
 }
 
 fn num(v: &V) -> Option<f64> {
@@ -1684,23 +2313,78 @@ fn num(v: &V) -> Option<f64> {
     }
 }
 
+/// Python's `==` on JSON values: booleans are the integers 0 and 1, an int
+/// equals a float of the same value, and lists and dicts compare by item
+/// (a dict regardless of key order).
+fn json_eq(a: &Value, b: &Value) -> bool {
+    let (x, y) = (V::J(a.clone()), V::J(b.clone()));
+    match (a, b) {
+        (Value::Number(_) | Value::Bool(_), Value::Number(_) | Value::Bool(_)) => {
+            match (py_int(&x), py_int(&y)) {
+                (Some(p), Some(q)) => p == q,
+                _ => num(&x) == num(&y),
+            }
+        }
+        (Value::Array(p), Value::Array(q)) => {
+            p.len() == q.len() && p.iter().zip(q).all(|(p, q)| json_eq(p, q))
+        }
+        (Value::Object(p), Value::Object(q)) => {
+            p.len() == q.len()
+                && p.iter()
+                    .all(|(k, v)| q.get(k).is_some_and(|w| json_eq(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
 fn eq(a: &V, b: &V) -> bool {
     match (a, b) {
         (V::Undef, V::Undef) => true,
-        (V::J(x), V::J(y)) => match (num(a), num(b)) {
-            (Some(p), Some(q)) if x.is_number() && y.is_number() => p == q,
-            _ => x == y,
-        },
+        (V::J(x), V::J(y)) => json_eq(x, y),
+        // Two ranges are equal when they hold the same items.
+        (V::Range(p), V::Range(q)) => {
+            let n = p.len();
+            n == q.len() && (n == 0 || p.start == q.start && (n == 1 || p.step == q.step))
+        }
+        (V::Ns(p), V::Ns(q)) => Rc::ptr_eq(p, q),
         _ => false,
     }
 }
 
+/// A float result, or the error Python raises where it has no float: a
+/// result that is not finite is refused by name (JSON holds no infinity).
+fn finite(f: f64) -> Result<Value, TemplateError> {
+    if f.is_finite() {
+        Ok(Value::from(f))
+    } else {
+        err(format!("arithmetic result {f} is not a finite number"))
+    }
+}
+
+/// Python's float `divmod`: the floor quotient and the remainder with the
+/// divisor's sign (CPython's `_float_div_mod`).
+fn float_div_mod(a: f64, b: f64) -> (f64, f64) {
+    let mut m = a % b;
+    let mut d = (a - m) / b;
+    if m == 0.0 {
+        m = 0.0f64.copysign(b);
+    } else if (b < 0.0) != (m < 0.0) {
+        m += b;
+        d -= 1.0;
+    }
+    let q = if d == 0.0 {
+        0.0f64.copysign(a / b)
+    } else {
+        let f = d.floor();
+        if d - f > 0.5 { f + 1.0 } else { f }
+    };
+    (q, m)
+}
+
 fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
     use BinOp::*;
-    let int_pair = match (l, r) {
-        (V::J(Value::Number(a)), V::J(Value::Number(b))) => a.as_i64().zip(b.as_i64()),
-        _ => None,
-    };
+    let int_pair = py_int(l).zip(py_int(r));
+    let overflow = || TemplateError("integer overflow".into());
     Ok(V::J(match op {
         Eq => Value::Bool(eq(l, r)),
         Ne => Value::Bool(!eq(l, r)),
@@ -1723,9 +2407,20 @@ fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
             let found = match r {
                 V::J(Value::Array(a)) => a.iter().any(|x| eq(l, &V::J(x.clone()))),
                 V::J(Value::Object(o)) => matches!(l, V::J(Value::String(k)) if o.contains_key(k)),
-                V::J(Value::String(s)) => {
-                    matches!(l, V::J(Value::String(k)) if s.contains(k.as_str()))
-                }
+                V::J(Value::String(s)) => match l {
+                    V::J(Value::String(k)) => s.contains(k.as_str()),
+                    other => {
+                        return err(format!("`in` a string needs a string, not {other:?}"));
+                    }
+                },
+                V::Range(g) => match py_int(l) {
+                    Some(x) => {
+                        let off = i128::from(x) - i128::from(g.start);
+                        let step = i128::from(g.step);
+                        off % step == 0 && usize::try_from(off / step).is_ok_and(|i| i < g.len())
+                    }
+                    None => g.items().into_iter().any(|x| eq(l, &V::J(x))),
+                },
                 V::Undef => false,
                 other => return err(format!("`in` on {other:?}")),
             };
@@ -1738,36 +2433,49 @@ fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
                 Value::Array(a.iter().chain(b).cloned().collect())
             }
             _ => match (int_pair, num(l), num(r)) {
-                (Some((a, b)), _, _) => Value::from(
-                    a.checked_add(b)
-                        .ok_or_else(|| TemplateError("overflow".into()))?,
-                ),
-                (None, Some(a), Some(b)) => Value::from(a + b),
+                (Some((a, b)), _, _) => Value::from(a.checked_add(b).ok_or_else(overflow)?),
+                (None, Some(a), Some(b)) => finite(a + b)?,
                 _ => return err(format!("cannot add {l:?} and {r:?}")),
             },
         },
         Sub | Mul | Div | FloorDiv | Mod => {
-            if let (Some((a, b)), true) = (int_pair, op != Div) {
-                let v = match op {
-                    Sub => a.checked_sub(b),
-                    Mul => a.checked_mul(b),
-                    FloorDiv => (b != 0).then(|| a.div_euclid(b)),
-                    _ => (b != 0).then(|| a.rem_euclid(b)),
-                };
-                Value::from(
-                    v.ok_or_else(|| TemplateError("integer overflow or division by zero".into()))?,
-                )
-            } else {
-                let (Some(a), Some(b)) = (num(l), num(r)) else {
-                    return err(format!("arithmetic on {l:?} and {r:?}"));
-                };
-                Value::from(match op {
-                    Sub => a - b,
-                    Mul => a * b,
-                    Div => a / b,
-                    FloorDiv => (a / b).floor(),
-                    _ => a.rem_euclid(b),
-                })
+            let zero = || TemplateError("division by zero".into());
+            match (int_pair, op) {
+                (Some((a, b)), Sub) => Value::from(a.checked_sub(b).ok_or_else(overflow)?),
+                (Some((a, b)), Mul) => Value::from(a.checked_mul(b).ok_or_else(overflow)?),
+                (Some((a, b)), FloorDiv | Mod) => {
+                    if b == 0 {
+                        return Err(zero());
+                    }
+                    // Truncating division, then Python's floor rounding: the
+                    // remainder takes the divisor's sign.
+                    let (q, m) = (
+                        a.checked_div(b).ok_or_else(overflow)?,
+                        a.checked_rem(b).ok_or_else(overflow)?,
+                    );
+                    let floor = m != 0 && (m < 0) != (b < 0);
+                    Value::from(match (op, floor) {
+                        (FloorDiv, true) => q - 1,
+                        (FloorDiv, false) => q,
+                        (_, true) => m + b,
+                        _ => m,
+                    })
+                }
+                _ => {
+                    let (Some(a), Some(b)) = (num(l), num(r)) else {
+                        return err(format!("arithmetic on {l:?} and {r:?}"));
+                    };
+                    if b == 0.0 && matches!(op, Div | FloorDiv | Mod) {
+                        return Err(zero());
+                    }
+                    finite(match op {
+                        Sub => a - b,
+                        Mul => a * b,
+                        Div => a / b,
+                        FloorDiv => float_div_mod(a, b).0,
+                        _ => float_div_mod(a, b).1,
+                    })?
+                }
             }
         }
     }))
@@ -1858,7 +2566,8 @@ mod tests {
     }
 
     /// The tool branches: schemas through `tojson`, call arguments through
-    /// `from_json` and `.items()` (keys sorted), results as `<tool_result>`.
+    /// `from_json` and `.items()` (keys in the arguments' order, as jinja2 with
+    /// `from_json` as `json.loads`), results as `<tool_result>`.
     #[test]
     fn v41_tools_by_hand() {
         let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
@@ -1878,8 +2587,8 @@ mod tests {
         assert!(
             out.ends_with(
                 "<｜User｜>q<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n\
-                 <｜DSML｜parameter name=\"s\" string=\"true\">v</｜DSML｜parameter>\n\
                  <｜DSML｜parameter name=\"x\" string=\"false\">1</｜DSML｜parameter>\n\
+                 <｜DSML｜parameter name=\"s\" string=\"true\">v</｜DSML｜parameter>\n\
                  </｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>\
                  <｜User｜><tool_result>42</tool_result><｜Assistant｜></think>"
             ),
@@ -2103,7 +2812,7 @@ mod tests {
                 "|capitalize takes no arguments",
             ),
             ("{{ 'x' | length(1) }}", "|length takes no arguments"),
-            ("{{ 'x' | tojson(indent=2) }}", "tojson(indent=...)"),
+            ("{{ 'x' | tojson(foo=2) }}", "tojson(foo=...)"),
             ("{{ 'ǆa' | capitalize }}", "U+01C6"),
         ] {
             let e = render_err(src, json!({}));
@@ -2135,5 +2844,500 @@ mod tests {
         ] {
             assert_eq!(render(src, json!({})), want, "{src}");
         }
+    }
+
+    fn v(json: &str) -> Value {
+        serde_json::from_str(json).expect("vars")
+    }
+
+    /// Every case that does not render as jinja2 does: `Ok` is jinja2's output,
+    /// `Err` a text this engine's error must contain (where jinja2 fails too,
+    /// or renders what this engine refuses by name, marked at the case).
+    fn mismatches(cases: &[(&str, Value, Result<&str, &str>)]) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (src, vars, want) in cases {
+            let Value::Object(m) = vars else {
+                panic!("vars")
+            };
+            let got = ChatTemplate::parse(src).and_then(|t| t.render(m));
+            match (want, &got) {
+                (Ok(w), Ok(g)) if w == g => {}
+                (Err(part), Err(e)) if e.to_string().contains(part) => {}
+                _ => bad.push(format!("{src}: want {want:?}, got {got:?}")),
+            }
+        }
+        bad
+    }
+
+    /// A call's positional and keyword arguments as Python takes them: `split`'s
+    /// `sep` and `maxsplit` by name, `range`'s step, `namespace`'s mapping, the
+    /// `start`/`end` of `startswith`/`endswith`; an argument Python refuses is
+    /// refused by name, never dropped.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn call_arguments_follow_python() {
+        let bad = mismatches(&[
+            (
+                "{{ 'a,b,c'.split(',', maxsplit=1) | tojson }}",
+                v(r#"{}"#),
+                Ok("[\"a\", \"b,c\"]"),
+            ),
+            (
+                "{{ 'a b c'.split(maxsplit=1) | tojson }}",
+                v(r#"{}"#),
+                Ok("[\"a\", \"b c\"]"),
+            ),
+            (
+                "{{ 'a,b'.split(sep=',') | tojson }}",
+                v(r#"{}"#),
+                Ok("[\"a\", \"b\"]"),
+            ),
+            (
+                "{{ 'a,b'.split(',', sep=',') }}",
+                v(r#"{}"#),
+                Err("split(): sep given twice"),
+            ),
+            (
+                "{{ 'a'.split(foo=1) }}",
+                v(r#"{}"#),
+                Err("split() takes no argument foo"),
+            ),
+            (
+                "{% for i in range(0, 10, 3) %}{{ i }}{% endfor %}",
+                v(r#"{}"#),
+                Ok("0369"),
+            ),
+            (
+                "{% for i in range(5, 0, -2) %}{{ i }}{% endfor %}",
+                v(r#"{}"#),
+                Ok("531"),
+            ),
+            (
+                "{{ range(1, 2, 0) }}",
+                v(r#"{}"#),
+                Err("range() step must not be zero"),
+            ),
+            (
+                "{{ range(1, 2, 3, 4) }}",
+                v(r#"{}"#),
+                Err("range() takes 1 to 3 arguments"),
+            ),
+            (
+                "{{ range(stop=3) }}",
+                v(r#"{}"#),
+                Err("range() takes no keyword arguments"),
+            ),
+            (
+                "{% set ns = namespace({'a': 1}, b=2) %}{{ ns.a }}{{ ns.b }}",
+                v(r#"{}"#),
+                Ok("12"),
+            ),
+            (
+                "{{ namespace(1) }}",
+                v(r#"{}"#),
+                Err("namespace() takes a mapping"),
+            ),
+            (
+                "{{ 'x'.startswith(['x']) }}",
+                v(r#"{}"#),
+                Err("startswith() takes a string"),
+            ),
+            (
+                "{{ 'xy'.startswith('y', 1) }}{{ 'xy'.endswith('x', 0, 1) }}{{ 'xy'.startswith('x', -1) }}{{ 'xy'.endswith('y', none, -1) }}",
+                v(r#"{}"#),
+                Ok("TrueTrueFalseFalse"),
+            ),
+            (
+                "{{ d.get('a', 1, 2) }}",
+                v(r#"{"d": {}}"#),
+                Err("get() takes 1 or 2 arguments"),
+            ),
+            (
+                "{{ d.get('a', default=1) }}",
+                v(r#"{"d": {}}"#),
+                Err("get() takes no keyword arguments"),
+            ),
+            (
+                "{{ d.items(1) }}",
+                v(r#"{"d": {}}"#),
+                Err("items() takes no arguments"),
+            ),
+            (
+                "{{ 'a'.strip('a', 'b') }}",
+                v(r#"{}"#),
+                Err("strip() takes at most 1 argument"),
+            ),
+            (
+                "{{ 'a'.strip(chars='a') }}",
+                v(r#"{}"#),
+                Err("strip() takes no keyword arguments"),
+            ),
+            (
+                "{{ raise_exception('a', 'b') }}",
+                v(r#"{}"#),
+                Err("raise_exception() takes 1 argument"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `{{ value }}` is Python's `str()`: lists and dicts as their `repr` (strings
+    /// quoted and escaped as `repr` does, floats in `repr`'s shortest form), a
+    /// namespace as `<Namespace {...}>`, a range as `range(start, stop)`, dict keys
+    /// in insertion order; an undefined value a namespace keeps stays undefined.
+    /// What `tojson` cannot serialize is refused as jinja2 refuses it, and an
+    /// undefined value or a namespace inside a list or dict literal by name.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn values_render_as_python_str() {
+        let bad = mismatches(&[
+            (
+                "{{ [1, 'a', \"b'c\", none, true, 1.5, {'k': [2]}] }}",
+                v(r#"{}"#),
+                Ok("[1, 'a', \"b'c\", None, True, 1.5, {'k': [2]}]"),
+            ),
+            (
+                "{% set ns = namespace(a=1, b='x') %}{{ ns }}",
+                v(r#"{}"#),
+                Ok("<Namespace {'a': 1, 'b': 'x'}>"),
+            ),
+            (
+                "{{ s }}",
+                v(
+                    r#"{"s": ["\u0301", "\u007f", "\u200b", "\u00a0", "\u00e9", "\ud55c", "\n\t\\", "'", "'\"", "\ufe0f", "\udb40\udc01", "\u0085", "\ud83d\ude00", "\u00ad"]}"#,
+                ),
+                Ok(
+                    "['\u{301}', '\\x7f', '\\u200b', '\\xa0', 'é', '한', '\\n\\t\\\\', \"'\", '\\'\"', '\u{fe0f}', '\\U000e0001', '\\x85', '😀', '\\xad']",
+                ),
+            ),
+            (
+                "{{ f }}|{{ f[0] }}|{{ f[2] }}|{{ f[5] }}|{{ f | tojson }}",
+                v(
+                    r#"{"f": [1e+16, 0.1, 1e-05, 2.0, 123456789.123, -0.0, 1e+22, 5e-324, 1000000000000000.0, 0.0001]}"#,
+                ),
+                Ok(
+                    "[1e+16, 0.1, 1e-05, 2.0, 123456789.123, -0.0, 1e+22, 5e-324, 1000000000000000.0, 0.0001]|1e+16|1e-05|-0.0|[1e+16, 0.1, 1e-05, 2.0, 123456789.123, -0.0, 1e+22, 5e-324, 1000000000000000.0, 0.0001]",
+                ),
+            ),
+            (
+                "{{ [x] }}",
+                v(r#"{}"#),
+                Err("an undefined value inside a list or dict"),
+            ), // jinja2 renders '[Undefined]': refused by name
+            (
+                "{{ {'a': x} }}",
+                v(r#"{}"#),
+                Err("an undefined value inside a list or dict"),
+            ), // jinja2 renders "{'a': Undefined}": refused by name
+            (
+                "{{ x | tojson }}",
+                v(r#"{}"#),
+                Err("tojson of an undefined value"),
+            ),
+            (
+                "{% set ns = namespace(a=1) %}{{ ns | tojson }}",
+                v(r#"{}"#),
+                Err("tojson of a namespace"),
+            ),
+            (
+                "{% set ns = namespace(a=1) %}{{ [ns] }}",
+                v(r#"{}"#),
+                Err("a namespace inside a list or dict"),
+            ), // jinja2 renders "[<Namespace {'a': 1}>]": refused by name
+            (
+                "{% set ns = namespace(t=none) %}{% set ns.t = m.missing %}{{ ns.t is defined }}|{{ ns.t }}|",
+                v(r#"{"m": {}}"#),
+                Ok("False||"),
+            ),
+            (
+                "{{ {'b': 1, 'a': 2} }}|{{ {'b': 1, 'a': 2} | tojson }}|{% for k, v in {'b': 1, 'a': 2}.items() %}{{ k }}{% endfor %}",
+                v(r#"{}"#),
+                Ok("{'b': 1, 'a': 2}|{\"b\": 1, \"a\": 2}|ba"),
+            ),
+            (
+                "{{ range(3) }}|{{ range(1, 5, 2) }}|{{ range(3) | length }}|{{ range(0) }}|{{ range(-2) | length }}",
+                v(r#"{}"#),
+                Ok("range(0, 3)|range(1, 5, 2)|3|range(0, 0)|0"),
+            ),
+            (
+                "{{ range(3) | tojson }}",
+                v(r#"{}"#),
+                Err("tojson of a range"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `tojson` is the HF environment's `json.dumps` filter: `ensure_ascii`,
+    /// `indent` (a count or a string), `separators` and `sort_keys`, by name or
+    /// in that order.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn tojson_takes_hf_options() {
+        let bad = mismatches(&[
+            (
+                "{{ d | tojson(indent=2) }}",
+                v(r#"{"d": {"b": [1, {"c": []}], "a": {}}}"#),
+                Ok("{\n  \"b\": [\n    1,\n    {\n      \"c\": []\n    }\n  ],\n  \"a\": {}\n}"),
+            ),
+            (
+                "{{ d | tojson(indent='\\t', sort_keys=true) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Ok("{\n\t\"a\": 1,\n\t\"b\": [\n\t\t1,\n\t\t2\n\t]\n}"),
+            ),
+            (
+                "{{ d | tojson(separators=[',', ':']) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Ok("{\"b\":[1,2],\"a\":1}"),
+            ),
+            (
+                "{{ d | tojson(False, 0) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Ok("{\n\"b\": [\n1,\n2\n],\n\"a\": 1\n}"),
+            ),
+            (
+                "{{ e | tojson(ensure_ascii=true, indent='é') }}",
+                v(r#"{"e": {"\u00e9": ["\u00fc"]}}"#),
+                Ok("{\né\"\\u00e9\": [\néé\"\\u00fc\"\né]\n}"),
+            ),
+            (
+                "{{ d | tojson(indent=none) }}|{{ d | tojson(indent=-1) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Ok("{\"b\": [1, 2], \"a\": 1}|{\n\"b\": [\n1,\n2\n],\n\"a\": 1\n}"),
+            ),
+            (
+                "{{ d | tojson(foo=1) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Err("tojson(foo=...) is not supported"),
+            ),
+            (
+                "{{ d | tojson(1, 2, 3, 4, 5) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Err("tojson takes at most 4 positional arguments"),
+            ),
+            (
+                "{{ d | tojson(separators=[',']) }}",
+                v(r#"{"d": {"b": [1, 2], "a": 1}}"#),
+                Err("tojson separators must be a pair of strings"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// Whitespace is Python's `str.isspace`, U+001C–U+001F included: for `strip`,
+    /// `split`, `| trim` and `-` whitespace control.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn whitespace_is_python_isspace() {
+        let bad = mismatches(&[
+            (
+                "[{{ w.strip() }}]{{ w2.split() | tojson }}[{{ w3 | trim }}]",
+                v(r#"{"w": "\u001c a \u001f", "w2": "a\u001db", "w3": "\u001e x"}"#),
+                Ok("[a][\"a\", \"b\"][x]"),
+            ),
+            (
+                "a\u{1c}{{- 'b' }}|{{ 'c' -}}\u{1f}d",
+                v(r#"{}"#),
+                Ok("ab|cd"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `| length` of a value with no length is an error (of an undefined one, 0),
+    /// and a string literal's escapes are Python's `unicode-escape` (`\N{...}`
+    /// refused by name).
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn length_and_string_escapes_follow_jinja2() {
+        let bad = mismatches(&[
+            ("{{ 3 | length }}", v(r#"{}"#), Err("int has no length")),
+            ("{{ x | length }}", v(r#"{}"#), Ok("0")),
+            ("{{ none | length }}", v(r#"{}"#), Err("none has no length")),
+            ("{{ true | length }}", v(r#"{}"#), Err("bool has no length")),
+            (
+                "{% set ns = namespace() %}{{ ns | length }}",
+                v(r#"{}"#),
+                Err("namespace has no length"),
+            ),
+            (
+                "{{ '\\u00e9\\x41\\q\\a\\101\\b\\f\\v\\0' | tojson }}",
+                v(r#"{}"#),
+                Ok("\"éA\\\\q\\u0007A\\b\\f\\u000b\\u0000\""),
+            ),
+            ("{{ '\\U0001F600' }}", v(r#"{}"#), Ok("😀")),
+            (
+                "{{ '\\N{BULLET}' }}",
+                v(r#"{}"#),
+                Err("\\N{...} escapes are not supported"),
+            ), // jinja2 renders '•': refused by name
+            ("{{ 'a\\\nb' }}", v(r#"{}"#), Ok("ab")),
+            ("{{ '\\x4' }}", v(r#"{}"#), Err("truncated \\x escape")),
+            ("{{ '\\ud800' | tojson }}", v(r#"{}"#), Err("surrogate")),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `for … in … if cond` filters the items before the loop counts them;
+    /// `loop.previtem`/`nextitem`/`depth`/`depth0`; `//` and `%` round toward
+    /// negative infinity; division by zero and a non-finite result are errors;
+    /// `==` and `in` compare booleans with numbers as Python does.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn loop_filters_and_arithmetic_follow_python() {
+        let bad = mismatches(&[
+            (
+                "{% for x in [1, 0, 2] if x %}{{ x }}{{ loop.length }}{{ loop.index }}{% endfor %}",
+                v(r#"{}"#),
+                Ok("121222"),
+            ),
+            (
+                "{% for k, v in d.items() if v %}{{ k }}{% endfor %}",
+                v(r#"{"d": {"b": 1, "a": 0, "c": 2}}"#),
+                Ok("bc"),
+            ),
+            (
+                "{% for x in [1, 2, 3] %}{{ loop.previtem }}/{{ loop.nextitem }}/{{ loop.depth }}{{ loop.depth0 }};{% endfor %}",
+                v(r#"{}"#),
+                Ok("/2/10;1/3/10;2//10;"),
+            ),
+            (
+                "{% for x in [1, 2] %}{{ loop.previtem is defined }}{{ loop.nextitem is defined }}{% endfor %}",
+                v(r#"{}"#),
+                Ok("FalseTrueTrueFalse"),
+            ),
+            (
+                "{{ 7 // -3 }} {{ 7 % -3 }} {{ -7 // 2 }} {{ -1.5 % 1 }} {{ 1.5 % -1 }} {{ 7.5 // -2 }} {{ -7 % 3 }} {{ 7 % 3 }} {{ -7.5 // 2 }} {{ 2.5 % 1 }}",
+                v(r#"{}"#),
+                Ok("-3 -2 -4 0.5 -0.5 -4.0 2 1 -4.0 0.5"),
+            ),
+            ("{{ 1 / 0 }}", v(r#"{}"#), Err("division by zero")),
+            ("{{ 1 // 0 }}", v(r#"{}"#), Err("division by zero")),
+            ("{{ 1.5 % 0 }}", v(r#"{}"#), Err("division by zero")),
+            (
+                "{{ f * 10 }}",
+                v(r#"{"f": 1e+308}"#),
+                Err("not a finite number"),
+            ), // jinja2 renders 'inf': refused by name
+            (
+                "{{ 1 == true }}{{ [1] == [true] }}{{ 1 in [true] }}{{ 0 == false }}{{ 1.0 == true }}{{ {'a': 1} == {'a': true} }}{{ 'a' == 'a' }}{{ none == false }}{{ 2 == true }}",
+                v(r#"{}"#),
+                Ok("TrueTrueTrueTrueTrueTrueTrueFalseFalse"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// jinja2's lexer newlines (`\r\n` and `\r` as `\n`, one trailing
+    /// newline dropped) and its escape of a non-ASCII character after a
+    /// backslash; the tests on a namespace, an undefined value and a range;
+    /// a range's items, attributes, truth, membership and equality; booleans
+    /// as integers in arithmetic; `in` a string with a non-string refused.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn newlines_tests_ranges_and_bools_follow_jinja2() {
+        let bad = mismatches(&[
+            ("a\n", v(r#"{}"#), Ok("a")),
+            ("a\u{d}\nb\u{d}c\n\n", v(r#"{}"#), Ok("a\nb\nc\n")),
+            ("{{ 'x\u{d}\ny' | tojson }}", v(r#"{}"#), Ok("\"x\\ny\"")),
+            (
+                "{{ '\\é' }}|{{ '\\😀' }}",
+                v(r#"{}"#),
+                Ok("\\xe9|\\U0001f600"),
+            ),
+            (
+                "{% set ns = namespace() %}{{ ns is mapping }}{{ ns is iterable }}{{ ns is sequence }}",
+                v(r#"{}"#),
+                Ok("FalseFalseFalse"),
+            ),
+            (
+                "{{ x is iterable }}{{ x is sequence }}{{ x is mapping }}{{ x is string }}",
+                v(r#"{}"#),
+                Ok("TrueTrueFalseFalse"),
+            ),
+            (
+                "{{ range(3) is iterable }}{{ range(3) is sequence }}{{ range(3) is mapping }}{{ true is number }}{{ 1.5 is number }}",
+                v(r#"{}"#),
+                Ok("TrueTrueFalseTrueTrue"),
+            ),
+            (
+                "{{ range(5)[1] }}{{ range(5)[-1] }}{{ range(1, 9, 3)[2] }}|{{ range(5)[7] }}|{{ range(1, 9, 3).step }}",
+                v(r#"{}"#),
+                Ok("147||3"),
+            ),
+            (
+                "{% if range(0) %}a{% else %}b{% endif %}{% if range(1) %}c{% endif %}",
+                v(r#"{}"#),
+                Ok("bc"),
+            ),
+            (
+                "{{ 2 in range(3) }}{{ 5 in range(3) }}{{ 4 in range(0, 9, 2) }}{{ 3 in range(0, 9, 2) }}{{ 2.0 in range(3) }}{{ -1 in range(5, -3, -3) }}",
+                v(r#"{}"#),
+                Ok("TrueFalseTrueFalseTrueTrue"),
+            ),
+            (
+                "{{ range(3) == range(3) }}{{ range(3) == [0, 1, 2] }}{{ range(0) == range(2, 1) }}",
+                v(r#"{}"#),
+                Ok("TrueFalseTrue"),
+            ),
+            ("{{ range(3)[0:2] }}", v(r#"{}"#), Err("cannot slice")), // jinja2 renders 'range(0, 2)': refused by name
+            ("{{ 'a' ~ range(2) }}", v(r#"{}"#), Ok("arange(0, 2)")),
+            (
+                "{% set ns = namespace(a=1) %}{% set ns.b = ns %}{{ ns.b.a }}|{{ ns }}",
+                v(r#"{}"#),
+                Ok("1|<Namespace {'a': 1, 'b': <Namespace {...}>}>"),
+            ),
+            (
+                "{% set ns = namespace(a=1) %}{% set m = namespace(n=ns) %}{% set ns.m = m %}{{ ns }}",
+                v(r#"{}"#),
+                Ok("<Namespace {'a': 1, 'm': <Namespace {'n': <Namespace {...}>}>}>"),
+            ),
+            (
+                "{{ true + 1 }}|{{ true * 2.5 }}|{{ 7 / 2 }}|{{ -(3) }}",
+                v(r#"{}"#),
+                Ok("2|2.5|3.5|-3"),
+            ),
+            (
+                "{{ 1 in 'abc' }}",
+                v(r#"{}"#),
+                Err("`in` a string needs a string"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 }

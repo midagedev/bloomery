@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::engine::{
     Engine, EngineError, Sampler, SamplerFactory, SamplingParams, StateError, Tokenizer,
 };
+use crate::sampling;
 use crate::slotfile::{self, Counting};
 use crate::stop::StopScan;
 
@@ -129,6 +130,10 @@ pub(crate) enum GenError {
     /// The sink failed: the client went away.
     #[error("client: {0}")]
     Client(#[from] io::Error),
+    /// Under `ignore_eos` the sampler chose an end-of-generation id, whose
+    /// logit the loop had set to -inf: a sampler defect, not the engine's.
+    #[error("ignore_eos: the sampler chose end-of-generation id {0}, whose logit is -inf")]
+    Banned(u32),
 }
 
 pub(crate) fn ms_since(t: Instant) -> f64 {
@@ -140,9 +145,25 @@ fn out(logits: &mut [f32]) -> Option<&mut [f32]> {
     (!logits.is_empty()).then_some(logits)
 }
 
-fn choose(sampler: &mut Option<Sampler>, greedy: u32, logits: &[f32], history: &[u32]) -> u32 {
+/// The next id: the engine's argmax, or the sampler's draw. `banned` (the
+/// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`) get a
+/// -inf logit first, and a greedy request whose argmax is banned takes the
+/// largest other logit (first of equals).
+fn choose(
+    sampler: &mut Option<Sampler>,
+    greedy: u32,
+    logits: &mut [f32],
+    history: &[u32],
+    banned: &[u32],
+) -> u32 {
+    for &b in banned {
+        if let Some(l) = usize::try_from(b).ok().and_then(|i| logits.get_mut(i)) {
+            *l = f32::NEG_INFINITY;
+        }
+    }
     match sampler {
         Some(s) => s(logits, history),
+        None if banned.contains(&greedy) => sampling::argmax(logits),
         None => greedy,
     }
 }
@@ -341,9 +362,12 @@ pub(crate) fn generate(
     let ctx_max = slot.engine.ctx_max();
     let vocab = Arc::clone(&slot.vocab);
     let mut sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
+    let stops = vocab.stops();
+    let banned: &[u32] = if p.ignore_eos { &stops } else { &[] };
+    // A greedy request reads the logits only to step past a banned argmax.
     let mut logits = vec![
         0.0f32;
-        if sampler.is_some() {
+        if sampler.is_some() || !banned.is_empty() {
             vocab.n_vocab()
         } else {
             0
@@ -368,7 +392,6 @@ pub(crate) fn generate(
         sink(Event::Prompt(tim))?;
     }
     let budget = usize::try_from(p.n_predict).unwrap_or(usize::MAX);
-    let stops = vocab.stops();
     let mut scan = StopScan::new(p.stop.clone());
     let mut dec = vocab.decoder();
     let mut generated: Vec<u32> = Vec::new();
@@ -376,13 +399,16 @@ pub(crate) fn generate(
     let mut stopping_word = String::new();
     let mut truncated = false;
     if budget > 0 {
-        let mut tok = choose(&mut sampler, greedy, &logits, &generated);
+        let mut tok = choose(&mut sampler, greedy, &mut logits, &generated, banned);
         loop {
+            if banned.contains(&tok) {
+                return Err(GenError::Banned(tok));
+            }
             generated.push(tok);
             tim.predicted_n = generated.len();
             tim.predicted_ms = ms_since(t1);
             tick(tim);
-            if stops.contains(&tok) && !p.ignore_eos {
+            if stops.contains(&tok) {
                 stop = StopKind::Eos;
                 break;
             }
@@ -407,7 +433,7 @@ pub(crate) fn generate(
             }
             let g = slot.next(tok, out(&mut logits))?;
             tim.n_past = n + generated.len();
-            tok = choose(&mut sampler, g, &logits, &generated);
+            tok = choose(&mut sampler, g, &mut logits, &generated, banned);
         }
     }
     if stop != StopKind::Word {

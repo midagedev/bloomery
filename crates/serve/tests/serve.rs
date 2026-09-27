@@ -1603,3 +1603,110 @@ fn hw_slot_action_on_a_busy_slot_is_503() {
     assert_eq!(r.json()["n_saved"], 10);
     common::drop_dir(&dir);
 }
+
+/// A tool schema reaches the template with its keys in the request's order:
+/// Qwen3's template prints each tool with `tojson`, and jinja2 3.1.6 (the HF
+/// environment) keeps the order the client sent, `properties` `z` before `a`
+/// included. The body is sent as written, not re-serialized.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_tool_schema_keys_keep_the_request_order() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/qwen3-chat-template.jinja"),
+    );
+    let body = r#"{"messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"integer"}},"required":["z"]}}}]}"#;
+    let r = call(addr, "POST", "/apply-template", Some(body));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["prompt"],
+        "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"d\", \"parameters\": {\"type\": \"object\", \"properties\": {\"z\": {\"type\": \"string\"}, \"a\": {\"type\": \"integer\"}}, \"required\": [\"z\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n"
+    );
+}
+
+/// A template whose tool-call markup the server does not parse (Qwen3's
+/// `<tool_call>` JSON) refuses a chat request that asks for tool calls, by
+/// name, instead of returning the calls as `content`; with `tool_choice`
+/// `"none"` or no tools the request runs, and `/apply-template` still renders
+/// the tools.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_tools_under_an_unparsed_markup_are_refused() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/qwen3-chat-template.jinja"),
+    );
+    let tools =
+        json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &chat_body(json!({ "tools": tools })),
+    );
+    assert_error(&r, 501, "not_supported_error", "tool-call markup");
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &chat_body(json!({ "tools": tools, "stream": true })),
+    );
+    assert_error(&r, 501, "not_supported_error", "tool-call markup");
+    for extra in [json!({ "tools": tools, "tool_choice": "none" }), json!({})] {
+        let r = post(addr, "/v1/chat/completions", &chat_body(extra.clone()));
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+    }
+    let r = post(
+        addr,
+        "/apply-template",
+        &chat_body(json!({ "tools": tools })),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+/// `ignore_eos` bans every end-of-generation id, as llama-server's
+/// `logit_bias_eog`: a script that emits one of GLM's three stops gets the
+/// best other id instead (the scripted logits leave every other id tied at
+/// the floor, so greedy takes id 0), greedy and sampled alike, and the
+/// generation runs to `n_predict`.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_ignore_eos_bans_every_stop_id() {
+    use serve::{MockTokenizer, ScriptedEngine, Tokenizer};
+    const STOPS: [u32; 3] = [154_820, 154_827, 154_829];
+    let (a, b) = (MockTokenizer.encode("a")[0], MockTokenizer.encode("b")[0]);
+    for stop in STOPS {
+        for temperature in [0.0, 1.0] {
+            let script = vec![a, stop, b, b, b, b];
+            let engine = ScriptedEngine::from_ids(4096, script).with_stops(&STOPS);
+            let addr = common::start_with(Box::new(engine));
+            let r = post(
+                addr,
+                "/completion",
+                &json!({"prompt": "hi", "n_predict": 4, "temperature": temperature,
+                        "seed": 7, "ignore_eos": true, "return_tokens": true}),
+            )
+            .json();
+            let tokens: Vec<u64> = r["tokens"]
+                .as_array()
+                .expect("tokens")
+                .iter()
+                .map(|t| t.as_u64().expect("id"))
+                .collect();
+            let at = format!("stop {stop}, temperature {temperature}: {r}");
+            assert_eq!(tokens.len(), 4, "{at}");
+            assert!(
+                tokens
+                    .iter()
+                    .all(|t| !STOPS.iter().any(|&s| u64::from(s) == *t)),
+                "{at}"
+            );
+            assert_eq!(r["stopped_limit"], true, "{at}");
+            if temperature == 0.0 {
+                assert_eq!(
+                    tokens,
+                    [u64::from(a), 0, u64::from(b), u64::from(b)],
+                    "{at}"
+                );
+            }
+        }
+    }
+}
