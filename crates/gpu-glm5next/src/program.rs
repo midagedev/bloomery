@@ -131,63 +131,14 @@ struct StepProgram<'s, 'w> {
 }
 
 impl StepProgram<'_, '_> {
-    /// Sub-layer `sub` of layer `l`'s input: its own mix of the streams
-    /// (`hc_pre_q8_0`) and their fold by it, into `x`.
+    /// Sub-layer `sub` of layer `l`'s input into `x` ([`hc_in`]).
     fn hc_in(&mut self, l: usize, sub: Sub) -> Result<(), GpuError> {
-        let (gpu, w) = (self.gpu, self.w);
-        let stream = gpu.stream();
-        let d = *self.parts.d;
-        let (qs, dd) = q8(w, &names::hc_fn(l, sub))?;
-        let params = HcQ8Params {
-            qs,
-            d: dd,
-            scale: f32v(w, &names::hc_scale(l, sub))?,
-            base: f32v(w, &names::hc_base(l, sub))?,
-            eps: d.hc_eps,
-            iters: d.hc_iters,
-        };
-        let hc = &self.parts.k.hc;
-        let s = &mut *self.parts.s;
-        let streams = &s.streams[self.cur];
-        hc.enqueue_pre_q8_0(
-            stream,
-            &HcQ8PreArgs {
-                params: &params,
-                x: streams,
-                tokens: 1,
-                rms_eps: d.rms_eps,
-            },
-            1,
-            &mut s.hc_scratch,
-            &mut s.mixes,
-            &mut s.hc,
-        )?;
-        hc.enqueue_fold(stream, streams, &s.hc, d.embd, 1, &mut s.x)
+        hc_in(self.gpu, self.w, &mut self.parts, self.cur, l, sub)
     }
 
-    /// The sub-layer's output `out` into the next streams by its mix
-    /// (`hc_post`); the fold it writes beside them is never read.
+    /// The sub-layer's output into the next streams ([`hc_out`]).
     fn hc_out(&mut self) -> Result<(), GpuError> {
-        let stream = self.gpu.stream();
-        let n = self.parts.d.embd;
-        let hc = &self.parts.k.hc;
-        let cur = self.cur;
-        let s = &mut *self.parts.s;
-        let [a, b] = &mut s.streams;
-        let (res, next) = if cur == 0 { (&*a, b) } else { (&*b, a) };
-        hc.enqueue_post(
-            stream,
-            &HcPostArgs {
-                x: &s.out,
-                res,
-                hc: &s.hc,
-                n_embd: n,
-                tokens: 1,
-            },
-            next,
-            &mut s.fold,
-        )?;
-        self.cur ^= 1;
+        self.cur = hc_out(self.gpu, &mut self.parts, self.cur)?;
         Ok(())
     }
 }
@@ -262,4 +213,69 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
             .enqueue_mean(gpu.stream(), s, n, 0, self.head.input_mut())?;
         self.head.enqueue(gpu, w)
     }
+}
+
+/// Sub-layer `sub` of layer `l`'s input from stream buffer `cur`: its own
+/// mix of the streams (`hc_pre_q8_0`) and their fold by it, into `x` — the
+/// step program's launches.
+pub(crate) fn hc_in(
+    gpu: &Gpu,
+    w: &Weights,
+    p: &mut Parts<'_>,
+    cur: usize,
+    l: usize,
+    sub: Sub,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let d = *p.d;
+    let (qs, dd) = q8(w, &names::hc_fn(l, sub))?;
+    let params = HcQ8Params {
+        qs,
+        d: dd,
+        scale: f32v(w, &names::hc_scale(l, sub))?,
+        base: f32v(w, &names::hc_base(l, sub))?,
+        eps: d.hc_eps,
+        iters: d.hc_iters,
+    };
+    let hc = &p.k.hc;
+    let s = &mut *p.s;
+    let streams = &s.streams[cur];
+    hc.enqueue_pre_q8_0(
+        stream,
+        &HcQ8PreArgs {
+            params: &params,
+            x: streams,
+            tokens: 1,
+            rms_eps: d.rms_eps,
+        },
+        1,
+        &mut s.hc_scratch,
+        &mut s.mixes,
+        &mut s.hc,
+    )?;
+    hc.enqueue_fold(stream, streams, &s.hc, d.embd, 1, &mut s.x)
+}
+
+/// The sub-layer's output into the other stream buffer by its mix
+/// (`hc_post`), residual from `cur`; returns the buffer written — the step
+/// program's launch.
+pub(crate) fn hc_out(gpu: &Gpu, p: &mut Parts<'_>, cur: usize) -> Result<usize, GpuError> {
+    let n = p.d.embd;
+    let hc = &p.k.hc;
+    let s = &mut *p.s;
+    let [a, b] = &mut s.streams;
+    let (res, next) = if cur == 0 { (&*a, b) } else { (&*b, a) };
+    hc.enqueue_post(
+        gpu.stream(),
+        &HcPostArgs {
+            x: &s.out,
+            res,
+            hc: &s.hc,
+            n_embd: n,
+            tokens: 1,
+        },
+        next,
+        &mut s.fold,
+    )?;
+    Ok(cur ^ 1)
 }

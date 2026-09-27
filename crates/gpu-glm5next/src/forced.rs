@@ -14,11 +14,12 @@
 
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
-use bloomery_gpu_deepseek41::hc::{HC_STREAMS, HcPostArgs, HcQ8Params, HcQ8PreArgs};
+use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use model::arch::glm5next::names::{self, Sub};
 use runtime::layer::{FfnKind, MixerKind};
 
-use crate::body::{Body, Parts, f32v, q8};
+use crate::body::{Body, f32v};
+use crate::program::{hc_in, hc_out};
 use crate::{ffn, kda, mla};
 
 /// What the errors name.
@@ -166,69 +167,4 @@ impl Body {
 /// A shape the forced row refuses, by name.
 fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
-}
-
-/// Sub-layer `sub` of layer `l`'s input from stream buffer `cur`: its own
-/// mix of the streams (`hc_pre_q8_0`) and their fold by it, into `x` — the
-/// step program's launches.
-fn hc_in(
-    gpu: &Gpu,
-    w: &Weights,
-    p: &mut Parts<'_>,
-    cur: usize,
-    l: usize,
-    sub: Sub,
-) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let d = *p.d;
-    let (qs, dd) = q8(w, &names::hc_fn(l, sub))?;
-    let params = HcQ8Params {
-        qs,
-        d: dd,
-        scale: f32v(w, &names::hc_scale(l, sub))?,
-        base: f32v(w, &names::hc_base(l, sub))?,
-        eps: d.hc_eps,
-        iters: d.hc_iters,
-    };
-    let hc = &p.k.hc;
-    let s = &mut *p.s;
-    let streams = &s.streams[cur];
-    hc.enqueue_pre_q8_0(
-        stream,
-        &HcQ8PreArgs {
-            params: &params,
-            x: streams,
-            tokens: 1,
-            rms_eps: d.rms_eps,
-        },
-        1,
-        &mut s.hc_scratch,
-        &mut s.mixes,
-        &mut s.hc,
-    )?;
-    hc.enqueue_fold(stream, streams, &s.hc, d.embd, 1, &mut s.x)
-}
-
-/// The sub-layer's output into the other stream buffer by its mix
-/// (`hc_post`), residual from `cur`; returns the buffer written — the step
-/// program's launch.
-fn hc_out(gpu: &Gpu, p: &mut Parts<'_>, cur: usize) -> Result<usize, GpuError> {
-    let n = p.d.embd;
-    let hc = &p.k.hc;
-    let s = &mut *p.s;
-    let [a, b] = &mut s.streams;
-    let (res, next) = if cur == 0 { (&*a, b) } else { (&*b, a) };
-    hc.enqueue_post(
-        gpu.stream(),
-        &HcPostArgs {
-            x: &s.out,
-            res,
-            hc: &s.hc,
-            n_embd: n,
-            tokens: 1,
-        },
-        next,
-        &mut s.fold,
-    )?;
-    Ok(cur ^ 1)
 }
