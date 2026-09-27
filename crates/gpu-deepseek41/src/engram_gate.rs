@@ -306,7 +306,7 @@ mod engram_gate_kernels {
     /// = x[b·ROW + d] + value[d]·gate`, the value at `kv[t·(hc+1)·ROW +
     /// hc·ROW ..]`. The block guard is uniform, so no barrier and no warp
     /// collective is skipped.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

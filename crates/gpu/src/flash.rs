@@ -840,6 +840,10 @@ mod flash_kernels {
             y.len() >= q_rows * latent
         )
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn flash_latent(
         q: &[f32],
         kv: &[u16],
@@ -937,7 +941,10 @@ mod flash_kernels {
             d8b.len() >= (q_rows - m_lo) * 2 * n_sb
         )
     )]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn flash_latent_q8(
         q: &[f32],
         kv: &[u16],
@@ -1084,7 +1091,10 @@ mod flash_kernels {
             part_ms.len() >= q_rows * segs * 2
         )
     )]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn flash_latent_mma(
         q: &[f32],
         kv: &[u16],
@@ -1219,7 +1229,10 @@ mod flash_kernels {
             y.len() >= q_rows * latent
         )
     )]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn flash_merge(
         n_keys_buf: &[u32],
         m: u32,
@@ -1290,7 +1303,10 @@ mod flash_kernels {
             d8b.len() >= (q_rows - m_lo) * 2 * n_sb
         )
     )]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn flash_merge_q8(
         n_keys_buf: &[u32],
         m: u32,
@@ -1362,7 +1378,10 @@ mod flash_kernels {
     ///
     /// SAFETY: `row < q_rows`, `tid < latent`, and the partial buffers hold
     /// `q_rows * segs * latent` / `q_rows * segs * 2` elements.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core of both merge kernels: their flat arguments plus the row and lane it folds (rust-quality R8)"
+    )]
     #[inline(always)]
     unsafe fn merge_row(
         n_keys_buf: &[u32],
@@ -1436,7 +1455,10 @@ mod flash_kernels {
     /// array, `tid < lat <= LATENT`, `lat` is a multiple of 128, `col` is a
     /// column of the half `row` selects, and the launch contract bounds both
     /// output sets.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core of the q8 kernels: the row's value, its lane and the kernel's output sets (rust-quality R8)"
+    )]
     #[inline(always)]
     unsafe fn quant_row(
         v: f32,
@@ -1535,7 +1557,10 @@ mod flash_kernels {
     /// only the final tile can reach past `hi` and it takes the guarded path
     /// whose `wl == 0.0` test skips those loads.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core of the latent kernels: their inputs, shared arrays and the key range it walks (rust-quality R8)"
+    )]
     unsafe fn latent_range(
         q: &[f32],
         kv: &[u16],

@@ -859,7 +859,7 @@ mod flash_gqa_kernels {
     /// seg`. `n_keys` is [`live_keys`] of `n_keys_buf[t]`: a refused row's
     /// segments are all neutral. The rows of one segment are neighbouring
     /// blocks, so they read its key rows while they are in L2.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1057,7 +1057,7 @@ mod flash_gqa_kernels {
     ///
     /// The query rows and the products are f16, a different arithmetic
     /// class from the f32 scalar pass, with its own band.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1304,7 +1304,7 @@ mod flash_gqa_kernels {
     /// their folds; the folds and their order are the one-at-a-time walk's.
     /// A segment past the row's last live one holds the neutral partial and
     /// is never read.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1395,7 +1395,7 @@ mod flash_gqa_kernels {
 
     /// [`gqa_flash_seg`] at [`HEAD_256`]: lane `l` owns dims `4l .. +3` and
     /// `128 + 4l .. +3` (`seg_scalar`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1460,7 +1460,7 @@ mod flash_gqa_kernels {
 
     /// [`gqa_flash_seg_mma`] at [`HEAD_256`] (`seg_mma`): each score is the
     /// two 128-value slices' accumulators added, low slice first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1524,7 +1524,7 @@ mod flash_gqa_kernels {
     }
 
     /// [`gqa_flash_merge`] at [`HEAD_256`]: 256 threads, one per dim.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

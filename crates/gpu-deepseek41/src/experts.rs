@@ -121,7 +121,7 @@ mod experts_kernels {
     /// down projection's q8_1 quantization reads. An id `>= n_experts` (an
     /// expert not resident on this card) returns before any load — the test
     /// is warp-uniform — and leaves its slot of `h` as it was.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -185,7 +185,7 @@ mod experts_kernels {
     /// the q8f32 two-plane layout, `k` values each — against the `k` f32
     /// activations `x`, reduces each with the warp tree and stores `h[r] =
     /// swiglu_clamp(g, u, limit)` from lane 0.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -386,7 +386,7 @@ mod flash_gqa_prefill_kernels {
     /// are read at `q[(t·n_head + kh·GROUP + g)·HEAD ..]` and its output
     /// written at the same index of `y`. Every guard below is block- or
     /// warp-uniform.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -898,7 +898,7 @@ mod flash_gqa_prefill_kernels {
     /// written at the same index of `y`. The key tile, the value tile and
     /// the score exchange live in the block's dynamic shared memory. Every
     /// guard below is block- or warp-pair-uniform.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

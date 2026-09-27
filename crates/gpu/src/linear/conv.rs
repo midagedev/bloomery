@@ -229,7 +229,7 @@ mod conv_kernels {
     /// warp` is unit `w / H` ([`units`]) and conv head `w % H`, `H = 2·n_k +
     /// n_v`: heads below `n_k` are queries, below `2·n_k` keys, the rest
     /// values.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

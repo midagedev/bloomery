@@ -1200,7 +1200,7 @@ mod q8f32_kernels {
             y.len() >= (n_rows - 1) * y_row + (m_cols - 1) * y_col + 1
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
@@ -1267,7 +1267,7 @@ mod q8f32_kernels {
             y.len() >= (m_cols - 1) * y_col_stride + (n_heads - 1) * y_head_stride + y_off + rows_per_head
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]

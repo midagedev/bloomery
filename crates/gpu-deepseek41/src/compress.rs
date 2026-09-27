@@ -428,7 +428,7 @@ mod comp_kernels {
     /// reads the ring, each thread its own four columns, so every read of a
     /// slot precedes its overwrite in program order. The group guard is
     /// block-uniform, so no barrier is skipped.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -601,7 +601,7 @@ mod comp_kernels {
     /// of one row is the identity), then `finish_row`. A group whose
     /// integers leave their buffers writes nothing; the kept tokens of the
     /// step buffer are not read — this stream has no ring.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

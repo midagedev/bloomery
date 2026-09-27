@@ -378,7 +378,7 @@ mod attn_kernels {
             part_ms.len() >= tokens * n_heads * segs * 2
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "a kernel entry takes its launch arguments as the device ABI does"
     )]
@@ -446,7 +446,7 @@ mod attn_kernels {
             part_ms.len() >= tokens * n_heads * segs * 2
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "a kernel entry takes its launch arguments as the device ABI does"
     )]
@@ -525,7 +525,7 @@ mod attn_kernels {
             part_ms.len() >= tokens * n_heads * segs * 2
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "a kernel entry takes its launch arguments as the device ABI does"
     )]
@@ -597,7 +597,7 @@ mod attn_kernels {
             part_ms.len() >= tokens * n_heads * segs * 2
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "a kernel entry takes its launch arguments as the device ABI does"
     )]

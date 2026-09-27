@@ -92,7 +92,7 @@ mod fused_kernels {
     /// [`FaultSite::NormQuant`] on `fault` and lands every value of the
     /// block in `y` as NaN, so every consumer's dot over it is NaN. A finite
     /// block is stored as always.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -268,7 +268,7 @@ mod fused_kernels {
     /// position at or past the cache's height has no row: it raises
     /// [`FaultSite::CachePos`] on `fault` and appends nothing, as
     /// `kv_append_pos_buf` does.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -408,7 +408,7 @@ mod fused_kernels {
     /// row dots the ONE quantized column of `q`/`d8` (gate and up read the
     /// same input). Weights as `enqueue_gemv_q3k` (rows of `110 * n_sb / 4`
     /// u32 words, even n_sb), gate and up of the same row count.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -462,7 +462,7 @@ mod fused_kernels {
     /// a = the down dot (the op path's ffn_out operand), b = `resid` (its
     /// ffn_inp operand). Weight layout as `enqueue_gemv_q5_1`
     /// (`q_stride + 2*k_blocks` words per row). m = 1.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

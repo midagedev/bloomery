@@ -55,9 +55,10 @@ use crate::iq_tables::{IQ2XS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALU
 /// slots ggml removed (4, 5, 31-33, 36-38) and the ids past the table. The
 /// loader accepts such tensors only far enough to name them, and every
 /// size/dequant entry point rejects them with an error.
-// Variant names mirror ggml's type names verbatim (Q3_K, not Q3K), the way
-// libc-style bindings keep the C spelling.
-#[allow(non_camel_case_types)]
+#[allow(
+    non_camel_case_types,
+    reason = "variant names mirror ggml's type names verbatim (Q3_K, not Q3K), the way libc-style bindings keep the C spelling"
+)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum GgmlType {
     F32,

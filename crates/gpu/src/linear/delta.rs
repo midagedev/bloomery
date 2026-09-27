@@ -321,7 +321,7 @@ mod delta_kernels {
     /// The delta step of `m` tokens with one decay per value head (module
     /// doc), on lane `lane[lane_at] mod lanes` of `state`, in place. Block
     /// `b` is head `b / 8`, columns `16·(b % 8) ..`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

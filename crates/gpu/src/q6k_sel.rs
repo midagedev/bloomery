@@ -38,7 +38,7 @@ mod q6k_sel_kernels {
     /// load (warp-uniform), leaving that slot of `y` untouched; one that is
     /// not [`HOST`] (a slot the host tier serves, skipped by contract)
     /// raises [`FaultSite::ExpertId`] on `fault` first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

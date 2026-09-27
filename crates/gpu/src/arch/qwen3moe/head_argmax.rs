@@ -70,7 +70,7 @@ mod qwen3moe_head_kernels {
     /// (module doc). `key[0]` and `done[0]` are the block reduction's key and
     /// ticket count: [`KEY_SEED`] and zero before the launch, the same again
     /// after it.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -56,7 +56,7 @@ mod hc_f32_kernels {
 
     /// RMS + F32 gemv + HC_PRE (the module doc's rule), block `t` for token
     /// `t` of `m`. `k` is a positive multiple of 32.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

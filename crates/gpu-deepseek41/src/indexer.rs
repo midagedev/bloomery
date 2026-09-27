@@ -263,7 +263,7 @@ mod indexer_kernels {
             hist.len() >= tokens * 1024
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -590,7 +590,7 @@ mod indexer_kernels {
             list.len() >= tokens * stride
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

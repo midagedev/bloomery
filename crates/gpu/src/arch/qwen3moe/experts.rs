@@ -118,7 +118,7 @@ mod qwen3moe_expert_kernels {
     /// lives in device memory): the slot's warps raise
     /// [`FaultSite::ExpertId`] on `fault`, write NaN into the slot's rows of
     /// `h` and return before their first weight load — warp-uniform.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

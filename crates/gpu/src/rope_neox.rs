@@ -281,7 +281,7 @@ mod rope_neox_kernels {
     /// buffers, and no stale row passes for the token's. The position is
     /// loaded first and checked after the norm, so its load overlaps the
     /// head's.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -440,7 +440,7 @@ mod rope_neox_kernels {
     /// `qg` (`2·256` values a head, the query first) and written to `q`,
     /// the key heads normalized and turned in place in `k` and appended with
     /// `v`. The rope table holds [`ROT_256`] f32 per position.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

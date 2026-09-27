@@ -102,7 +102,7 @@ mod gemm_kernels {
     /// the epilogues (the launcher passes at most one). Block `b` computes tile row
     /// `b / (n / TILE_N)`, tile column `b % (n / TILE_N)`. `n` a multiple of [`TILE_N`] and `k`
     /// even and non-zero (host-checked).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

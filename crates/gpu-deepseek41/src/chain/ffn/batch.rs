@@ -221,7 +221,7 @@ mod ffn_batch_kernels {
     /// activation as the step's gate·up reads it. Entries from the count on
     /// are left as they were; an entry that names no slot of the block raises
     /// [`FaultSite::ExpertId`] on `fault` and is skipped.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -303,7 +303,7 @@ mod ffn_batch_kernels {
     /// expert's tiles run side by side on the same weight rows, each read
     /// once for up to eight slots. A block past the table's count returns; a
     /// tile word `tile_at` refuses raises [`FaultSite::ExpertId`].
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -397,10 +397,6 @@ mod ffn_batch_kernels {
     /// down outputs `down[(6t + j)·n + d]`, weights `w[6t + j]` and places
     /// `sel[6t + j]` (the card's below `n_card`; no other slot's rows are
     /// read) to `acc[i]`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -453,7 +449,7 @@ mod ffn_batch_kernels {
     /// HC_POST of it (`hc_post_elem`) by token `t`'s HC_PRE result
     /// `hc[24t ..]` and its four streams `res[4nt + kn + d]`, into `out` in
     /// the same layout, and their fold by the result's `pre` into `fold[i]`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -510,7 +506,7 @@ mod ffn_batch_kernels {
 
     /// [`ds41_ffn_post_batch`] without the fold: into an engram layer and
     /// after the last layer.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

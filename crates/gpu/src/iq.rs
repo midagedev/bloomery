@@ -862,7 +862,7 @@ mod iq_kernels {
     // each core's registers from.
 
     /// IQ2_XS rows (`iq2_xs_lane_partials`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -923,7 +923,7 @@ mod iq_kernels {
     }
 
     /// IQ3_XXS rows (`iq3_xxs_lane_partials`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -982,7 +982,7 @@ mod iq_kernels {
     }
 
     /// IQ4_XS rows (`iq4_xs_lane_partials`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1036,7 +1036,7 @@ mod iq_kernels {
     }
 
     /// Q2_K rows (`q2_k_lane_partials`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

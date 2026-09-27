@@ -671,7 +671,7 @@ mod hc_kernels {
     /// has exactly `n_pieces` blocks. A lane whose sixteen values are not
     /// all finite raises [`FaultSite::HcQuant`] on `fault`: its q8_1 form
     /// would be code 0 where the NaN was.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -924,7 +924,7 @@ mod hc_kernels {
     /// [`bloomery_gpu::col_group_count`]`(lead, tokens)`, the launch has
     /// exactly `n_pieces · n_groups` blocks, and every `ctr[g]` holds 0 when
     /// it starts (each group's finish leaves it 0).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1014,10 +1014,6 @@ mod hc_kernels {
     /// `t`: `x` the sub-layer output (`n` per token), `res` the streams it
     /// read (`4n` per token), `hc` the sub-layer's HC_PRE result; writes the
     /// new streams to `out` and their fold by the same `pre` to `fold`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(

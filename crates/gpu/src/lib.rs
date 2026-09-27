@@ -722,6 +722,10 @@ mod kernels {
             d8.len() >= m_cols * 2 * n_sb
         )
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn q3k_quantize_q8_1(
         x: &[f32],
         x0: u32,
@@ -801,7 +805,7 @@ mod kernels {
     /// entry, and an entry holding both walks is given more than either
     /// needs alone, so the decode shape would run below the occupancy its
     /// own walk allows.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -850,7 +854,7 @@ mod kernels {
     /// is `cores::q4k_row_dot`, whose column c is `q4k_row_dot_1col` on that
     /// column bit for bit — so column c here is the `q4k_gemv` launch of
     /// column c.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1001,6 +1005,10 @@ mod kernels {
             d8.len() >= m_cols * 2 * n_sb,
             y.len() >= n_rows * m_cols
         )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     pub fn q6k_gemv(
         w: &[u32],
@@ -1375,6 +1383,10 @@ mod kernels {
             y.len() >= n_rows * m_cols
         )
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn q3k_gemv(
         w: &[u32],
         q: &[u64],
@@ -1502,7 +1514,7 @@ mod kernels {
     /// c]`: the groups' own row-major outputs laid end to end. A row
     /// stretch's blocks are consecutive, so its groups run side by side on
     /// the same weight words.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes its arguments flat (rust-quality R8)"
     )]
@@ -1588,7 +1600,7 @@ mod kernels {
     /// untouched and every other slot unaffected. [`hybrid::HOST`] is a slot
     /// the host tier serves, skipped by contract; any other id past the stack
     /// raises [`FaultSite::ExpertId`] on `fault` first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -52,7 +52,7 @@ mod norm_gate_kernels {
 
     /// The gated norm of `m·n_v` heads with the SiLU gate (module doc). Warp
     /// `w = 4·block + warp` is head `w` of the `[m][n_v]` order.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

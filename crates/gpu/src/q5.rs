@@ -395,6 +395,10 @@ mod q5_kernels {
             d8.len() >= m_cols * k_blocks
         )
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     pub fn q5_quantize_q8(
         x: &[f32],
         m_cols: u32,
@@ -438,7 +442,7 @@ mod q5_kernels {
     /// written. The two geometries differ (a q5 group is four 32-value
     /// blocks, a q8_1 block is 128 values) and stay separate: nothing is
     /// reduced across the arm.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -529,7 +533,7 @@ mod q5_kernels {
     /// scratch, writing `y[y0 + r*m_cols + c]` (r the local row). Layouts and
     /// bounds: `q5_row_dot`, whose contract this kernel's launch contract
     /// states over its own parameters (`row_words = q_stride + k_blocks`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -615,7 +619,7 @@ mod q5_kernels {
     /// Q5_1 gemv: same geometry as `q5_0_gemv` over the Q5_1 layout
     /// (`row_words = q_stride + 2*k_blocks`; unsigned codes plus the
     /// `m·(block sum)` offset term). See `q5_row_dot`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -716,7 +720,7 @@ mod q5_kernels {
     /// untouched and every other slot unaffected. [`HOST`] is a slot the
     /// host tier serves and raises nothing; any other id past the stack
     /// raises [`FaultSite::ExpertId`] on `fault` first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

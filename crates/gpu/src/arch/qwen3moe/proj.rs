@@ -35,7 +35,7 @@ mod qwen3moe_proj_kernels {
     /// of `wv`, stored token-major into the blocks of `y` at 0, `off_k` and
     /// `off_v`. `rows_v` 0 leaves `wv` and the value block untouched (a Q6_K
     /// value projection).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -113,7 +113,7 @@ mod qwen3moe_proj_kernels {
     /// The output projection of `m_cols` activation columns with the
     /// residual: `y[c · rows + r] = (w · act_c)[r] + x[c · rows + r]`, the
     /// dot as `q4k_gemv` computes it and one add (module doc).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

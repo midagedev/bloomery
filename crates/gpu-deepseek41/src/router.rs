@@ -113,7 +113,7 @@ mod router_kernels {
     /// then the weights from the six scores, and puts `done[0]` back to zero.
     /// A selection value that is not finite, or a weight that is not, raises
     /// [`FaultSite::Router`] on `fault` ([`publish`], [`select`]).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -247,10 +247,6 @@ mod router_kernels {
     /// token) and folds `fma(w[row · k + 32 i + lane], x[token · k + 32 i +
     /// lane])` into it in increasing `i` — `f32_lane_partial_1col_w32`'s sum —
     /// and the warp tree is the one-token launch's.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(
@@ -352,7 +348,7 @@ mod router_kernels {
     /// and `bias`: [`ds41_router`]'s last block on those scores — the same
     /// shared arrays, the same six rounds and weights — into `ids` and
     /// `weights` at `N_USED · token`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

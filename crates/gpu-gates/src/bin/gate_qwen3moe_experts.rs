@@ -156,7 +156,6 @@ mod gate {
     /// `ids` gathered from `table` (`k` values a row), the rows' positions
     /// from `pos0` and offset `first`: eagerly, or captured as a graph and
     /// replayed once, which also returns its node count.
-    #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
     fn gather(
         gpu: &Gpu,
         table: &DeviceTensor<u32>,

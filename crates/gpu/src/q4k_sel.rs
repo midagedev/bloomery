@@ -90,10 +90,6 @@ pub fn tile_cap(n_slots: usize, n_experts: usize) -> usize {
 ///
 /// `1 + g < tiles.len()`, `n_experts < start.len()`, and the 32 lanes of the
 /// warp call it with the same `g`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "device helper: the tile table, the runs and their bounds (rust-quality R8)"
-)]
 #[inline(always)]
 pub unsafe fn tile_at(
     tiles: &[u32],
@@ -189,7 +185,7 @@ mod q4k_sel_kernels {
     /// of `y` untouched and every other slot unaffected. [`HOST`] is a slot
     /// the host tier serves, skipped by contract; any other id past the
     /// stack raises [`FaultSite::ExpertId`] on `fault` first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -380,7 +376,7 @@ mod q4k_sel_kernels {
     /// once for up to [`TILE_COLS`] slots. A block past the table's count
     /// returns; a tile word [`tile_at`] refuses and an entry that names no slot
     /// raise [`FaultSite::ExpertId`].
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -491,7 +487,7 @@ mod q4k_sel_kernels {
     /// plain quantizer writes for it. Columns from the count on return before
     /// any load and keep what they held. A non-finite value raises
     /// [`FaultSite::QuantColumn`] on `fault`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -569,7 +565,7 @@ mod q4k_sel_kernels {
     /// slot the host serves has no activation here, and its column keeps
     /// what it held. A non-finite value raises [`FaultSite::QuantColumn`] on
     /// `fault`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

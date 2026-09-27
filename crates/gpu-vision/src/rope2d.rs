@@ -109,10 +109,6 @@ mod rope2d_kernels {
     /// heads at columns `q0 + h·64` and those at `k0 + h·64` of every row, pair `j` of patch `p`
     /// by table entry `cs[2·(p·32 + j) ..]`. One thread per (patch, q-or-k, head, pair); the
     /// two halves of a head are the pair's two values, so each thread owns its two positions.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(

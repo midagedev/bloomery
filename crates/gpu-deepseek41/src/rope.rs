@@ -113,7 +113,7 @@ mod rope_kernels {
     /// distinct slots (host-checked as `m <= window` — the caller's
     /// positions are consecutive). The token guard and the shadow guard are
     /// block-uniform, so no barrier and no warp collective is skipped.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

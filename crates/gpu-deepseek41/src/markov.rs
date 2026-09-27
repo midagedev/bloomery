@@ -101,7 +101,7 @@ mod markov_kernels {
     /// thread `v` adds `w2[v] · e` into `logits[v * m + row]`. A previous
     /// token past the vocabulary raises [`FaultSite::TokenId`] on `fault`
     /// (thread 0 of the grid) and gathers NaN instead of a row.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

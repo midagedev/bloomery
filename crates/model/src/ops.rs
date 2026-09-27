@@ -2772,7 +2772,10 @@ struct Arm {
 /// the caller's profiler wall can hand them to the `swiglu` site instead of
 /// counting them twice) and the activation stage's share of the wall (the
 /// pre-pass, or the longest claim pass).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one group dispatch's slots, pair map and bytes, its outputs and the profiler's accumulators"
+)]
 fn run_group(
     slots: &Flex<QuantSlot<'_>>,
     map: &PairMap<'_, '_>,

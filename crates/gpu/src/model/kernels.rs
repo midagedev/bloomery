@@ -90,7 +90,7 @@ mod step_kernels {
             y.len() >= (n_heads - 1) * y_head_stride + y_off + rows_per_head
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
@@ -171,7 +171,7 @@ mod step_kernels {
             y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
         )
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]

@@ -541,7 +541,10 @@ fn gate_up_batch(
 /// of adds regardless of the dispatch shape. The rank search and the
 /// `gate_par`/`down_all` copies exist only for the trace layout (keyed by
 /// `(token, rank)`) and run only when the trace is switched on.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the scatter's buckets, selection, expert outputs and sums, plus the trace switch"
+)]
 fn scatter_experts(
     buckets: &Buckets,
     sel: &Selection,

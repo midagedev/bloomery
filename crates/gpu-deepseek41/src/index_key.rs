@@ -142,7 +142,7 @@ mod index_key_kernels {
     /// f16 into cache row `row` of the step buffer. A group past the count,
     /// or whose row leaves the cache, writes nothing. The guards read only
     /// warp-uniform values, so every lane reaches the collectives.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

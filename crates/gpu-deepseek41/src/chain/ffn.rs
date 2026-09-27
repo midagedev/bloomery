@@ -170,7 +170,7 @@ mod ffn_kernels {
     /// the image as it came. Thread 0 copies the region's sequence word to
     /// `seq_at`.
     /// The go that follows orders every write here before its generation.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -254,7 +254,7 @@ mod ffn_kernels {
     /// ([`combine_post_at`]): writes the combine's `y[d]`, the four new
     /// streams at `d` to `out` and their fold by the HC_PRE result's `pre` to
     /// `fold`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -319,7 +319,7 @@ mod ffn_kernels {
 
     /// [`ds41_ffn_post`] without the fold: into an engram layer and after the
     /// last layer.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

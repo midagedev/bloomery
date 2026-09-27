@@ -577,10 +577,6 @@ impl Encoder {
 
     /// A branch GEMM without its fused epilogue, for a tap only: `a · bᵀ (+ bias)` of shape
     /// `(m, n, k)` into a buffer of its own, handed to `taps` under `name`.
-    #[allow(
-        clippy::type_complexity,
-        reason = "the operand triple and the shape triple of one GEMM, named at the call"
-    )]
     fn side(
         &self,
         stream: &CudaStream,

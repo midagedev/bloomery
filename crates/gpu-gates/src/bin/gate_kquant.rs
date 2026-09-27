@@ -79,7 +79,7 @@ mod gate {
 
         /// Walk A over Q4_K through the family's `_sel` body: `q4k_gemv_sel`'s
         /// launch contract, block and bounds, so the two are the same code.
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
         )]
@@ -139,7 +139,7 @@ mod gate {
 
         /// `rows` Q5_K rows against `m_cols` (1..=8) columns through the
         /// m-column walk: `y[c · rows + r]` is row `r` against column `c`.
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
         )]
@@ -217,7 +217,7 @@ mod gate {
         /// partials at `out[0..32]`, their warp sum at `out[32]`, and per
         /// sub-block `(sb, s)` at `out[33 + 11·(8·sb + s)..]` the decoder's
         /// eight code words, `cda`, `cdb` and the walk's term for it.
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
         )]

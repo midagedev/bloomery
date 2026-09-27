@@ -354,7 +354,7 @@ mod dense_kernels {
     /// group `r / rows_per_head` and dots that column of the q8_1 activation
     /// (`groups` columns of `n_sb` super-blocks), `cores::q3k_row_dot` at
     /// one column; `y[r]` from lane 0.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -408,7 +408,7 @@ mod dense_kernels {
     /// token (`cores::q3k_row_dot_cols`, stride `groups`). Token-major
     /// output, `y[t·n_rows + r]`; token t bit for bit the one-token launch
     /// on that token's `groups` columns.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -480,7 +480,7 @@ mod dense_kernels {
     /// `ds41_q3k_gemv_heads`'s) — into the token-major `y[(t0 + c)·n_rows +
     /// r]`: token t bit for bit the one-token launch on its `groups` columns,
     /// the groups' outputs end to end.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -601,7 +601,7 @@ mod dense_kernels {
     /// `r` (a warp per row) dots gate row `r` and up row `r` against the one
     /// q8_1 column, reduces each with the warp tree and stores
     /// `h[r] = swiglu_clamp(g, u, limit)` from lane 0.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -651,7 +651,7 @@ mod dense_kernels {
     /// against each of the m q8_1 columns, token-major output
     /// `h[t·n_rows + r]`; token t bit for bit the one-token launch on its
     /// column.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

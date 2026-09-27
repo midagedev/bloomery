@@ -189,7 +189,7 @@ mod kquant_kernels {
     /// The Q5_K down `_sel` ([`gemv_sel_body`] over [`Q5k`]). Four blocks an
     /// SM are pinned: a register count past 64 spills (the spill ratchet's
     /// red) instead of dropping a resident block.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -249,7 +249,7 @@ mod kquant_kernels {
 
     /// The Q5_K gate·up with its rule as an argument ([`gate_up_act_body`]
     /// over [`Q5k`]), four blocks an SM pinned as [`q5k_gemv_sel`].
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -349,10 +349,6 @@ mod gate {
     }
 
     /// The checks at position `p` (module doc).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the model, the probe's head and the run's record"
-    )]
     fn check_at(
         m: &mut Deepseek41Model,
         head: &mut Head,

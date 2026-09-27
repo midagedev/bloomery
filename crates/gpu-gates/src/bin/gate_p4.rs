@@ -949,7 +949,6 @@ fn argmax_geometry() -> Result<bool, GateError> {
 /// reference and the bit-identical rerun, print the shape line. Returns
 /// (pass, printed line).
 #[cfg(feature = "gpu")]
-#[allow(clippy::type_complexity)]
 fn rms_case(
     elem: &bloomery_gpu::elem::ElemKernels,
     stream: &cuda_core::CudaStream,

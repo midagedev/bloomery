@@ -1729,10 +1729,6 @@ pub unsafe fn flash_v_accum_avx2(
 /// softmax always run over the whole `d_head` row; `r` holds the latent range
 /// `d_off..d_off + r.len()` and only that range is accumulated. Returns the
 /// segment's `(m, S)`; `r` is left unnormalized for [`combine_segments`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the segment kernel's operands, mirrored by its AVX2 twin"
-)]
 fn flash_seg_scalar(
     qrow: &[f32],
     rk: &RowKeys<'_>,
@@ -2761,10 +2757,6 @@ fn last_arrival(marks: &[RowMark], row: usize, parts: usize) -> bool {
 /// # Safety
 /// `kv2` points at `kqv_2d`, the span `t·ne0 + h·v_head .. +v_head` is this
 /// row's own and no other thread touches it during the call.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the leg's inputs and its output cell span"
-)]
 unsafe fn wv_b_leg(
     io: &HeadsIo<'_>,
     kqv_row: &[f32],

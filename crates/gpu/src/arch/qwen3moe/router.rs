@@ -1269,7 +1269,7 @@ mod qwen3moe_router_kernels {
     /// block's L1 never held other blocks' rows, and a volatile load does not
     /// ask it) and runs [`route_warp`]; a token with a non-finite logit
     /// raises [`FaultSite::Router`] on `fault`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -1381,7 +1381,7 @@ mod qwen3moe_router_kernels {
     /// ([`publish_route`]), a non-finite logit raising [`FaultSite::Router`]
     /// on the same `fault`. `k` a multiple of 128 and at most [`NORM_K`]
     /// (host-checked).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -2208,7 +2208,7 @@ pub mod gated {
         /// blocks of 256; warp 0 of block `r` owns row `r` with `f32_gemv`'s
         /// row body, and the block that draws the last ticket routes every
         /// token, warp `t` token `t`.
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
         )]
@@ -2275,7 +2275,7 @@ pub mod gated {
         /// the normed row into `q3 … d8`, `norm_quant`'s bytes, and the
         /// router's outputs as `qwen35moe_router_fused` at one token. `k` a
         /// multiple of 128 up to [`NORM_K`] (host-checked).
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
         )]

@@ -35,7 +35,10 @@ use model::arch::deepseek2::attn::MlaParams;
 /// On a hybrid load every routed layer runs the hybrid MoE half, and
 /// `hybrid` hears of each once it is enqueued: a capture records the layer
 /// for its replays to serve, an eager chain has it served on the spot.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the step's dispatch context, threaded flat; the context struct is its own round (rust-quality R8)"
+)]
 pub(super) fn enqueue_chain<H: HostExperts>(
     gpu: &Gpu,
     step: &StepKernels,
@@ -94,7 +97,10 @@ pub(super) fn enqueue_chain<H: HostExperts>(
 /// capturable as a body. A layer that does not embed reads its input
 /// residual from the resident input buffer. A routed layer takes the hybrid
 /// MoE half when `hybrid` carries a boundary.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a layer's dispatch context from `enqueue_chain`; the context struct is its own round (rust-quality R8)"
+)]
 pub(super) fn enqueue_layer(
     gpu: &Gpu,
     step: &StepKernels,
@@ -151,7 +157,10 @@ pub(super) fn enqueue_layer(
 /// out, appending the step's key row to `kv_l` and attending over the live
 /// rows. Every layer runs this same chain against its own weights and its
 /// own cache.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the attention half of `enqueue_layer`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
 fn enqueue_attn(
     gpu: &Gpu,
     step: &StepKernels,
@@ -648,7 +657,6 @@ fn attn_out(
 /// Enqueue the dense FFN half: norm+quantize, gate·up·swiglu, 32-value
 /// quantize, down+residual — bit-identical to the op path (the P0b
 /// contract). `s.ffn_inp` in, `s.l_out` out.
-#[allow(clippy::too_many_arguments)]
 fn enqueue_ffn_dense(
     gpu: &Gpu,
     w: &Weights,
@@ -759,7 +767,10 @@ fn enqueue_ffn_dense(
 /// captured graph follows the routing; the shared expert runs the dense
 /// fused kernels at its own width on the same quantized input. The combine
 /// keeps the dump's grouping — `(Σ w·down + shexp) + resid`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the MoE half of `enqueue_layer`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
 fn enqueue_ffn_moe(
     gpu: &Gpu,
     w: &Weights,

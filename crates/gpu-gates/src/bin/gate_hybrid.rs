@@ -380,7 +380,6 @@ mod gate {
     }
 
     /// Run every routed layer of `chain` on `h` and fold the checks into `arm`.
-    #[allow(clippy::too_many_arguments, reason = "one gate arm's inputs")]
     fn layer_arm(
         h: &mut Deepseek2Model,
         chain: &Chain,

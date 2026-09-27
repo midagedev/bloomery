@@ -145,7 +145,7 @@ mod dflash_kernels {
     /// `x0`: `q3k_quantize_q8_1`'s body — one warp per 128-value block, the
     /// engine's rule and its five buffers, a non-finite value raising
     /// [`FaultSite::QuantColumn`] on `fault` — without `Q8Act`'s column cap.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -214,7 +214,7 @@ mod dflash_kernels {
     /// m_cols` (0.0 for a column outside the mask). An id `>= n_experts`
     /// returns before any load — warp-uniform — and leaves its slot of `h`
     /// as it was.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -330,7 +330,7 @@ mod dflash_kernels {
     /// is dotted with q8_1 column `j · m_cols + c` for each token `c` in the
     /// mask, and token `c`'s sum takes `fma(dot, w_jc, acc)`. Lane 0 stores
     /// `out[c · rows_per_expert + d]` for every `c < m_cols`.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -465,7 +465,7 @@ mod dflash_kernels {
     /// `done[0]` is the block ticket count: zero before the
     /// launch, zero again after it. The body is `ds41_router`'s (its doc
     /// states the ticket protocol and the selection).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -408,7 +408,7 @@ mod elem_kernels {
     /// An id past the table's `n_rows` rows raises [`FaultSite::TokenId`]
     /// and writes a NaN row, as `embed_rows` does; the positions do not
     /// depend on the ids.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

@@ -55,7 +55,7 @@ mod gated_quant_kernels {
     /// rows at `m_cols` whole columns; the host checks that the heads of a
     /// column fit in one (`(k/head − 1)·head_stride + offset + head <=
     /// col_stride`).
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

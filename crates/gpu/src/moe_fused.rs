@@ -59,7 +59,7 @@ mod moe_fused_kernels {
     /// leaves its `y`. [`HOST`] is a slot the host tier serves and raises
     /// nothing; any other id past the stack raises [`FaultSite::ExpertId`]
     /// on `fault` first.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

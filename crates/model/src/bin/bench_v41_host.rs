@@ -655,7 +655,10 @@ fn fill_lists(
 /// The `union5` shape: one `HostLayer::experts_union_into` over the token's
 /// rows, row `i` listing its `n_host` slots' experts at weight `1 / n_host`.
 /// Tallied whole, under the bytes of the layer's distinct experts.
-#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its lists' parts, the blocks and the tally
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call's whole input: the layer three ways, its lists' parts, the blocks and the tally"
+)]
 fn union5_layer(
     host: &HostLayer,
     split: &Split,
@@ -678,7 +681,10 @@ fn union5_layer(
 /// The `union` shape: [`union_chunks_call`] over the token's rows, row `i`
 /// listing its `n_host` slots' experts at weight `1 / n_host`. Tallied whole,
 /// under the bytes of the layer's distinct experts.
-#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its lists' parts, the blocks and the tally
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call's whole input: the layer three ways, its lists' parts, the blocks and the tally"
+)]
 fn union_layer(
     host: &HostLayer,
     split: &Split,
@@ -1184,7 +1190,10 @@ enum GateUpTile<'a> {
 /// rows, row `i` listing its `n_host` slots' experts at weight `1 / n_host`
 /// (see [`union_r8_call`]). Tallied whole, under the bytes of the layer's
 /// distinct experts.
-#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its tile, its lists' parts, the blocks and the tally
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call's whole input: the layer three ways, its tile, its lists' parts, the blocks and the tally"
+)]
 fn union_r8_layer(
     host: &HostLayer,
     split: &Split,
@@ -1391,7 +1400,10 @@ fn union_r8_call(
 /// `xq`; without, `xq` already holds it. A chunk of no expert, rows that are
 /// not whole groups of eight and a matrix of other bytes than its rows are
 /// named errors; a kernel error stops the unit walk and is returned.
-#[allow(clippy::too_many_arguments)] // one chunk's whole dispatch: plan and offset, the weights and their layout, x and its bytes, the claims and their block, the outputs
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one chunk's whole dispatch: plan and offset, the weights and their layout, x and its bytes, the claims and their block, the outputs"
+)]
 fn r8_gate_up(
     plan: &R8Plan,
     mats: &[[&[u8]; 2]],

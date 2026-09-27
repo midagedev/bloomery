@@ -133,7 +133,7 @@ mod attn_kernels {
     /// key and value heads at columns `q0`, `k0`, `v0` plus `h·64`), `n_heads` heads, writing
     /// head `h` of row `i` at `out[i·out_width + h·64 ..]`. Block `b` is head `b % n_heads`,
     /// query rows `64·(b / n_heads) ..`; the row guard is block-uniform.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]

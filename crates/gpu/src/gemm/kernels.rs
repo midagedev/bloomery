@@ -63,7 +63,7 @@ mod gemm_kernels {
     /// after every lower chunk's and before every higher one's, and the
     /// table is the one a single walk over all slots in order builds, the
     /// same bits on every run.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -346,7 +346,7 @@ mod gemm_kernels {
     /// `y[s · rows + r]` for its tile's slots and its slab's rows, and the
     /// blocks of tile 0 write NaN over their slab's rows of every slot the
     /// route refused.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -396,7 +396,7 @@ mod gemm_kernels {
     }
 
     /// [`gemm_q4k`] for a Q5_K stack: rows of `44 · n_sb` words.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -448,7 +448,7 @@ mod gemm_kernels {
     /// [`gemm_q4k`] for a Q6_K stack: the stack is the file's byte stream,
     /// `210 · n_sb` bytes a row, as u32 words padded at the end to a whole
     /// word; a super-block may start at 2 mod 4.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -498,7 +498,7 @@ mod gemm_kernels {
     }
 
     /// [`gemm_q6k`] for a Q3_K stack: `110 · n_sb` bytes a row.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
@@ -556,7 +556,7 @@ mod gemm_kernels {
     /// on the same geometry. A block holding a non-finite value is refused
     /// as the quantizer refuses it (NaN scale, zero codes) and raises
     /// [`FaultSite::QuantColumn`].
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
