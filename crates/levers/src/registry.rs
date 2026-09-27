@@ -905,6 +905,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "`tools/ref/depth-gpu.sh`: the inner rounds of an `ab:` arm.",
     ),
     runner(
+        "BLOOMERY_AB_ORDER",
+        Some("ref/depth-ds41.sh"),
+        "`tools/ref/depth-ds41.sh`: `rotate` (unset) runs every arm once a round in rotated \
+         order; `blocks` runs each engine's arms together after one discarded process.",
+    ),
+    runner(
         "BLOOMERY_AB_ROUNDS",
         Some("ref/ab-decode.sh"),
         "The A/B and depth runners: the rounds each arm runs.",
