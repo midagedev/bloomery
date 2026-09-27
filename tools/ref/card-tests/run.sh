@@ -286,6 +286,12 @@ else
     bash -c 'source "$1" && witness_card() { :; } && TIMING_GPU=GPU-test && lease_take > /dev/null &&
       r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-test" ] && echo "record matches"' \
     _ "$T/tools/ref/lease.sh"
+  # timing-card.sh's two-card mode: both cards, the A6000 (TIMING_GPU) first; gpu-gate.sh reads it as a doubt.
+  run "lease_take records both cards of a two-card run" 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
+    BLOOMERY_LEASE_LOCK="$tmp/g3.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+    bash -c 'source "$1" && [ "$LEASE_CARDS_RECORD" = 1 ] && witness_card() { :; } && TIMING_GPU=GPU-a && TIMING_GPU2=GPU-b &&
+      lease_take > /dev/null && r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-a,GPU-b" ] &&
+      echo "record matches"' _ "$T/tools/ref/lease.sh"
 
   # lease-hold.sh: the card, the lease for the command's life, both witnesses, the command's rc, and a
   # lease that ends with this process whatever the command did.
