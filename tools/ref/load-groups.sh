@@ -29,8 +29,8 @@
 # line per arm and waits for a line on stdin (--arm-sync), so the runner's witness blocks and guards
 # stand between two arms of one load as they stand between two processes. An arm's output is its lines
 # from its `arm` line to the next arm's (or the process's end); its wall runs from the go to there, its
-# majflt from the go (whole) and from its `fed` line (timed) to there. The load's lines before arm 0
-# are echoed once, under a `[load]` line. A process that fails ends its arm in flight as a failed arm
+# majflt from the go (whole) and from its `fed` line (LG_FED_RE; timed) to there. The load's lines
+# before arm 0 are echoed once, under a `[load]` line. A process that fails ends its arm in flight as a failed arm
 # and the arms after it re-run in a fresh process — a fault is never cleared into the next arm; a
 # process that fails before its first arm fails every arm of the unit (the load is theirs). A process
 # that prints nothing for BOUND seconds is killed (its timeout's pid, the one this driver started).
@@ -44,7 +44,10 @@
 #   lg_post <i> <round> <rc> <output> <wall s>   the arm's witness block after it and its row (or its
 #                           FAIL row); MAJ_WHOLE and MAJ_TIMED are set for it
 # and LG_HEADER_RE, the ERE of the load lines echoed under `[load]`. LG_HEADER holds the running load's
-# lines before its arm 0, for a row that reads one of them.
+# lines before its arm 0, for a row that reads one of them. LG_FED_RE, the ERE of the arm's line that
+# opens its measured window (MAJ_TIMED counts from it), defaults to generate_ds41's `fed` record;
+# a runner sets its own after sourcing this file (depth-qwen3moe.sh).
+LG_FED_RE='^fed '
 LG_MODE=${BLOOMERY_AB_LOAD:-key}
 case $LG_MODE in
   key | arm) ;;
@@ -187,7 +190,7 @@ lg_process() {
       header+="$line"$'\n'
     else
       out+="$line"$'\n'
-      if [ -z "$fed" ] && [[ $line == 'fed '* ]]; then fed=$(lg_majflt); fi
+      if [ -z "$fed" ] && [[ $line =~ $LG_FED_RE ]]; then fed=$(lg_majflt); fi
     fi
   done
   wait "$pid"

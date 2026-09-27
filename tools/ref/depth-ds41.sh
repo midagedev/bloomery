@@ -300,8 +300,8 @@
 # mean, ratio or row count; a warm-up that fails is a FAIL row as a round's arm is. It costs one
 # row's wall, 73-128 s for the V4.1 rows at P = 512 and 4096 (lcg and prose) [derived: those rows'
 # `wall` column], so the lease is that much longer. BLOOMERY_AB_WARMUP=0 skips it; any value but 0 or
-# 1 is refused. depth-qwen3moe.sh has none: its model sits on the card, so no timed window reads the
-# file.
+# 1 is refused. depth-qwen3moe.sh takes the same variable with 0 as its default under rotate: its
+# Qwen3 and Qwen3.6 models sit on the card, so no timed window of theirs reads the file.
 #
 # Contention. Before every arm the runner checks both the other card (guard_other, timing-card.sh:
 # `[other-busy]`) and the CPU (guard_cpu, lease.sh: `[cpu-busy]` when builds or reference engines it
@@ -378,19 +378,10 @@ ours_row() {
   fi
   echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
-# The cold tag's constants (the header's Cold tag): microseconds one serial engram fault costs
-# [measured, rig-log 2026-09-23], and the percent of a row's timed window at which the faults' price
-# tags it.
-COLD_US=75 COLD_PCT=1
-# cold_check <faults> <window s>: MAJ_BOUND, faults × COLD_US as a percent of the window, and COLD_TAG
-# (` [cold]` at COLD_PCT or more).
-cold_check() {
-  local c
-  read -r MAJ_BOUND c < <(awk -v f="$1" -v w="$2" -v us="$COLD_US" -v t="$COLD_PCT" \
-    'BEGIN { b = (w > 0) ? f * us / 1e4 / w : 1e9; printf "%.1f %d\n", b, (b >= t) }')
-  COLD_TAG=
-  [ "$c" = 0 ] || COLD_TAG=' [cold]'
-}
+# The cold tag's constants and cold_check, the fault counter and majflt_mark, ROW_TAG and counted, the
+# order and the blocks' planner and loops: shared with depth-qwen3moe.sh.
+# shellcheck source=tools/ref/cold-blocks.sh
+source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
 # `--parse FILE`: ours_row over a saved output (`-` for stdin) — its depth and N the SMOKE footer's,
 # the runner's context (round, card, contention) `-` — and nothing loaded, timed or leased.
 if [ "${1:-}" = --parse ]; then
@@ -424,11 +415,7 @@ case $AB_WARMUP in
   0 | 1) ;;
   *) echo "depth-ds41.sh: BLOOMERY_AB_WARMUP is 1 (the default: one discarded run of the first arm) or 0, got '$AB_WARMUP'" >&2; exit 64 ;;
 esac
-ORDER=${BLOOMERY_AB_ORDER:-rotate}
-case $ORDER in
-  rotate | blocks) ;;
-  *) echo "depth-ds41.sh: BLOOMERY_AB_ORDER is rotate (the default: every arm once a round, the order rotated) or blocks (the arms by engine, a discard process before each block), got '$ORDER'" >&2; exit 64 ;;
-esac
+ab_order depth-ds41.sh
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 case $PLACE in
   a | gate) ;;
@@ -443,10 +430,6 @@ case $PREHEAT in
   *) echo "depth-ds41.sh: BLOOMERY_PREHEAT is 1 (read each reference arm's host set before it; the default under BLOOMERY_AB_ORDER=rotate) or 0 (the default under blocks), got '$PREHEAT'" >&2; exit 64 ;;
 esac
 GGUF_RANGES="${BASH_SOURCE[0]%/*}/gguf-ranges.py"
-# The word an arm's row starts with: ROW, a row of the tables, or WARMUP, the discarded warm-up run.
-# counted: whether the row goes into the sums and the row counts (only a ROW row does).
-ROW_TAG=ROW
-counted() { [ "$ROW_TAG" = ROW ]; }
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
 # ours: an arm runs this tree's generate_ds41; gen: an arm runs a generate_ds41 (ours, corpus or bin).
@@ -652,12 +635,6 @@ WITNESS=(head-open indent card busiest model mem pgmajfault)
 # fit arm's flags are lcpp_fit_flags' rewrite, taken after REF_K (which would add --n-cpu-moe back), and
 # REF_FIT says so for the dry run.
 REF_K=
-# with_ncmoe <flags> <K>: the flags with their --n-cpu-moe value replaced by K.
-with_ncmoe() {
-  local f
-  f=$(echo " $1 " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
-  echo "${f# }--n-cpu-moe $2"
-}
 ref_cmd() {
   local eng=$1 dep=$2 flags ub reps=(-r 1)
   REF_ENV=() REF_BATCH='' REF_MARK='' REF_FIT=''
@@ -782,59 +759,7 @@ arm_draws() {
     *) echo $((d + N + 3)) ;;
   esac
 }
-# arm_k <i>: a reference arm's --n-cpu-moe when its flags carry one integer, else nothing.
-arm_k() {
-  local w prev='' k=''
-  ref_cmd "${A_ENG[$1]}" "${A_DEP[$1]}"
-  for w in "${REF_ARGS[@]}"; do
-    case $prev in --n-cpu-moe | -ncmoe) k=$w ;; esac
-    prev=$w
-  done
-  case $k in '' | *[!0-9]*) ;; *) echo "$k" ;; esac
-}
-BLK_KEY=() BLK_ARMS=() BLK_DISC=() BLK_K=() BLK_WHY=()
-if [ "$ORDER" = blocks ]; then
-  for i in "${!ARMS[@]}"; do
-    key=$(arm_block "$i") b=
-    for j in "${!BLK_KEY[@]}"; do [ "${BLK_KEY[$j]}" != "$key" ] || b=$j; done
-    if [ -z "$b" ]; then
-      b=${#BLK_KEY[@]}
-      BLK_KEY+=("$key") BLK_ARMS+=("")
-    fi
-    BLK_ARMS[b]="${BLK_ARMS[$b]:+${BLK_ARMS[$b]} }$i"
-  done
-  for b in "${!BLK_KEY[@]}"; do
-    best='' bestd=-1 kmax='' kall=1 list=''
-    for i in ${BLK_ARMS[$b]}; do
-      d=$(arm_draws "$i")
-      list="${list:+$list, }${ARMS[$i]} $d"
-      if [ "$d" -gt "$bestd" ]; then best=$i bestd=$d; fi
-      [ "${A_KIND[$i]}" = ref ] || continue
-      k=$(arm_k "$i")
-      if [ -z "$k" ]; then
-        kall=0
-      elif [ -z "$kmax" ] || [ "$k" -gt "$kmax" ]; then
-        kmax=$k
-      fi
-    done
-    BLK_DISC[b]=$best BLK_K[b]=''
-    if [ "${A_KIND[$best]}" = ref ]; then
-      BLK_WHY[b]="the most token draws of the block's arms ($list)"
-      if [ "$kall" = 1 ] && [ "$kmax" != "$(arm_k "$best")" ]; then
-        BLK_K[b]=$kmax
-        BLK_WHY[b]="${BLK_WHY[$b]}, at the block's largest --n-cpu-moe"
-      fi
-    else
-      BLK_WHY[b]="the longest prompt of the block's arms, $bestd ids"
-    fi
-  done
-fi
-# block_line <b>: `<b>/<blocks> <name>: <arms>; discard <arm>…`, the block's plan in one line.
-block_line() {
-  local i arms=''
-  for i in ${BLK_ARMS[$1]}; do arms="${arms:+$arms }${ARMS[$i]}"; done
-  echo "$(($1 + 1))/${#BLK_KEY[@]} ${BLK_KEY[$1]}: $arms; discard ${ARMS[${BLK_DISC[$1]}]}${BLK_K[$1]:+ at --n-cpu-moe ${BLK_K[$1]}}, ${BLK_WHY[$1]}"
-}
+[ "$ORDER" = rotate ] || blocks_plan
 # preheat_off: why the preheat is off, for the dry run and the [config] line.
 preheat_off() {
   if [ "$ik$lcpp" = 00 ]; then
@@ -846,17 +771,9 @@ preheat_off() {
   fi
 }
 
-majflt_now() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
-# majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into <file>
-# at the first line matching <ERE> (at none when <ERE> is empty): generate_ds41's `fed` record, printed
-# just before its prompt timer starts, or an lcpp arm's progress line of its measured repetition,
-# printed just after that repetition's clock starts.
-majflt_mark() {
-  awk -v f="$1" -v re="$2" '!s && re != "" && $0 ~ re {
-    while ((getline l < "/proc/vmstat") > 0) if (l ~ /^pgmajfault /) { sub(/^pgmajfault /, "", l); print l > f; close(f) }
-    close("/proc/vmstat"); s = 1
-  } { print; fflush() }'
-}
+# majflt_mark's marks (cold-blocks.sh): generate_ds41's `fed` record, printed just before its prompt
+# timer starts, or an lcpp arm's progress line of its measured repetition, printed just after that
+# repetition's clock starts.
 
 # The arms that failed: FAILED, one `r<r> <label> <d|p>=<key> rc=<rc>` each, and FAILED_KEYS, the
 # `label|key` pairs of the counted ones, which the tables drop.
@@ -1248,28 +1165,11 @@ if [ -n "$DRY" ]; then
     done
     exit 0
   fi
-  if [ "$AB_WARMUP" = 1 ]; then
-    echo "[dry] warmup: the blocks' discards below, each row DISCARD r0 and in no mean, ratio or row count; the first block's discard is the lease's first process (BLOOMERY_AB_WARMUP=0 skips them)"
-  else
-    echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): no discard; each block's round 1 first row follows the block before it, the first one the lease's first process"
-  fi
-  for b in "${!BLK_KEY[@]}"; do
-    echo "[dry] block $(block_line "$b")"
-    if [ "$AB_WARMUP" = 1 ]; then
-      REF_K=${BLK_K[$b]}
-      echo "[dry] block $((b + 1)) discard ${ARMS[${BLK_DISC[$b]}]}: $(dry_cmd "${BLK_DISC[$b]}")"
-      REF_K=
-    fi
-    for r in $(seq "$ROUNDS"); do
-      # shellcheck disable=SC2086 # the block's indices, one word each
-      round_order "$r" ${BLK_ARMS[$b]}
-      echo "[dry] block $((b + 1)) round $r order: $ORDER_ARMS"
-      echo "[dry] block $((b + 1)) round $r loads: $ORDER_LOADS"
-    done
-  done
+  blocks_dry
   exit 0
 fi
 
+majflt_require depth-ds41.sh
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s warmup=$AB_WARMUP"
 echo "[config] ours: $BIN (--place $PLACE, default ctx)"
@@ -1282,8 +1182,7 @@ if [ -n "$PH_DIR" ]; then
 else
   echo "[config] preheat: $(preheat_off)"
 fi
-echo "[config] order: $ORDER$([ "$ORDER" = rotate ] || echo ", a discard before each block: $([ "$AB_WARMUP" = 1 ] && echo on || echo 'off (BLOOMERY_AB_WARMUP=0)')")"
-for b in "${!BLK_KEY[@]}"; do echo "[config] block $(block_line "$b")"; done
+blocks_config
 echo "[config] cold tag: majflt in the row's measured window (ours: from its fed line; lcpp: from its --progress line; ik: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
@@ -1310,19 +1209,7 @@ if [ "$ORDER" = rotate ]; then
   fi
   for r in $(seq "$ROUNDS"); do run_round "$r" "${!ARMS[@]}"; done
 else
-  for b in "${!BLK_KEY[@]}"; do
-    echo "[block] $(block_line "$b")"
-    if [ "$AB_WARMUP" = 1 ]; then
-      ROW_TAG=DISCARD REF_K=${BLK_K[$b]}
-      run_unit 0 "${BLK_DISC[$b]}"
-      ROW_TAG=ROW REF_K=
-      echo "[discard] ${ARMS[${BLK_DISC[$b]}]}${BLK_K[$b]:+ at --n-cpu-moe ${BLK_K[$b]}} ran once before block $((b + 1))'s rounds and is discarded (the DISCARD or FAIL r0 row above)"
-    fi
-    for r in $(seq "$ROUNDS"); do
-      # shellcheck disable=SC2086 # the block's indices, one word each
-      run_round "$r" ${BLK_ARMS[$b]}
-    done
-  done
+  blocks_run
 fi
 echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
