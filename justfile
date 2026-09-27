@@ -535,6 +535,11 @@ gate-gpu-qwen3moe-down:
 gate-gpu-gemm *ARGS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
+# 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
+# 모델 없이 Qwen3.6-35B-A3B 형상의 합성 입력으로 돌고, fault 사이트, 한 토큰의 그래프, 깊이 4,096의 f64 drift 보고를 함께 찍는다.
+gate-gpu-linear:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear'
+
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 

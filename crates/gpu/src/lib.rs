@@ -41,6 +41,7 @@ pub(crate) mod graph;
 pub mod head;
 pub mod hybrid;
 pub mod iq;
+pub mod linear;
 pub mod model;
 pub mod moe_fused;
 pub mod mxfp4;
