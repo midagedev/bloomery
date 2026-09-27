@@ -40,79 +40,82 @@
 - **억지로 하지 않는 것**: `DEFER_MAX_COLS`(8)와 `Q8Blocks32`의 m ≤ 8은 모델 모양이 아니라 엔진이 고른 묶음 기하다.
   모델이 바뀌어도 이 값을 바꿀 이유가 없으므로 상수로 둔다. 이름을 `…_CAP`처럼 "용량"으로 읽히게 하는 것만 검토한다.
 
-### (b) 기기 커널에서 루프 경계나 오프셋만 정하는 값 — 런처 인자로
+### (b)와 (c) 기기 커널의 값 — 첫걸음은 언제나 인스턴스 행이다
 
-handoff 커널의 `if d < N_USED`(`chain/ffn.rs:221`). 이 값은 레지스터 배열 크기를 정하지 않는다.
+이 부류에서는 **순서**가 설계의 절반이다(aa 검토, 2026-09-27). 같은 날 K 라운드 둘(glmkda, q38gqa)이 새 모델을 받으려고
+기존 몸체를 제네릭으로 바꿨다. 그 결과 기존 Qwen3.6 엔트리 다섯의 md5와 명령 수가 움직였고, "추가" 부류였어야 할 커밋이
+착륙 묶음에서 멈췄다. 되돌린 방법(kfix)이 이 부류의 규칙이 되었다.
 
-- **결정**: `n_used`를 런치 인자로 넘긴다. 런처는 페이지(`PageLayout`)가 담을 수 있는지 확인하고, 넘으면 이름 붙여 거부한다.
-- **비용 [유도]**: 스레드당 비교 하나가 상수에서 레지스터로 바뀐다. 커널은 hidden(4,096) 스레드로 한 번 돌고, 어차피
-  그 비교를 한다. 명령 수 변화는 0~1이고 시간 효과는 잣대 안이다.
-- **증명 부류**: 기존 엔트리의 PTX가 바뀌므로 이동이 아니다. 소유 게이트(ds41-step, -prefill, -chain-ffn, e2e) 비트
-  동일, 자원 열 보고, 타이밍 A/B 없음.
+1. **새 모양의 첫걸음은 인스턴스 행이다(add 부류).** 새 모양은 기존 엔트리 옆에 새 이름의 엔트리로 들어간다. 기존 엔트리가
+   닿는 소스는 글자 그대로 둔다. 새 엔트리의 몸체가 제네릭이어야 하면 새 이름의 사본을 만든다. launcher 하나가
+   스펙 값으로 인스턴스를 고르고, 없는 값은 이름을 대고 거부한다. 부르는 쪽은 인스턴스 이름을 모른다.
+   - 증명: ptx-scan이 base에 새 엔트리만 더한 것과 같다. 기존 엔트리가 닿는 항목의 텍스트가 base와 같다는 호출 그래프
+     검사(`callgraph.py`)가 Mac 쪽 증명이다.
+   - 예: slot8의 `ds41_ffn_handoff_8`, `ds41_ffn_post_8`, `_streams_8`, `ds41_ffn_card_acc_8`, `ds41_card_gather_8`.
+     launcher는 `PageLayout.n_used`로 6과 8 중에서 고른다. q38gqa의 `_p4`, q38router의 `_512`도 같은 모양이다.
+2. **여러 행을 한 엔트리로 합치는 일은 나중의 별도 변경이다.** 런타임 `n_used`로 바꾸거나 배열을 없애는 것이 그런 합치기다.
+   기존 엔트리의 명령이 바뀌므로 (b) 증명이 필요하다: 소유 게이트 비트 동일, 자원 열 보고, 움직이면 같은 lease의 A/B.
+   예: 사본이 된 GQA·GDN 몸체의 합치기는 train 5 항목이다.
+   이미 이렇게 한 곳이 하나 있다. Qwen 라우터의 픽 수 `used`는 shapes 1단계에서 런치 인자가 되었다(선택을 lane이 하나씩
+   들어 배열이 없어졌고, 비트 동일로 예측). 이것도 이 부류의 합치기라, 소유 게이트 비트 동일로 증명한다.
 
-### (c) 레지스터 배열 크기·unroll·lane 배치를 정하는 값 — 커널마다 따져서
+같은 값이라도 무엇을 정하느냐에 따라 합칠 수 있는 형태가 갈린다.
 
-여기가 트레이드오프의 중심이다. 선택지는 셋이다.
+| 값이 정하는 것 | 예 | 합칠 때의 형태 |
+|---|---|---|
+| 루프 경계나 오프셋만 | handoff의 `if d < N_USED` | 런치 인자 |
+| 순서만 보관하는 배열 | V4.1 combine의 `[f32; N_USED]` 셋 | 같은 순서로 흘려 계산해 배열 제거(fma를 j 오름차순). slot8의 `_8` 몸체가 이미 이 형태다 |
+| lane이 든 레지스터 배열 | 라우터 `PER_LANE`(logit), GQA `HEAD` | 인스턴스로 남는다. 런타임 크기의 배열은 로컬 메모리로 가고 `no_local_depot`이 금한다 |
+| 선택 횟수 | 라우터 `USED` | 런타임(lane이 픽을 든다) |
 
-1. **상수 인스턴스 표**: 몸체 하나를 const generic으로 두고, 지원하는 모양마다 엔트리를 하나씩 둔다. 로드 때 스펙이
-   인스턴스를 고른다. 비용은 0이다. 모양이 새로 오면 표에 한 줄을 더한다.
-2. **컴파일 상한 + 런타임 n**: 배열은 MAX 크기로 잡고 루프를 `i < n`으로 가린다. 엔트리 하나가 MAX 이하의 모든 모델을
-   받는다. 대가로 레지스터를 MAX 기준으로 쓰므로 점유율이 떨어질 수 있다.
-3. **배열을 없애는 재구성**: 배열이 순서를 보관하기 위해서만 있으면, 같은 순서로 흘려 계산해 배열을 없앤다. 이것이
-   가능하면 가장 낫다. 상수도 인스턴스도 필요 없다.
-
-커널별 판단:
-
-| 커널 | 배열이 하는 일 | 결정 | 근거 |
-|---|---|---|---|
-| V4.1 combine (`card_sum_elem`, `combine_post_at`의 `[f32; N_USED]` 셋) | 슬롯 순서대로 fma하려고 모아 둔다 | **3. 배열 제거** | `acc = fma(down_j, w_j, acc)`를 j 오름차순으로 바로 흘리면 순서가 같다. 결과가 비트 동일하고 배열도 없다. `n_used`는 런치 인자가 된다 |
-| Qwen 게이트 라우터 `route_warp_gated<PER_LANE, USED>` | `PER_LANE`: lane이 들고 있는 logit 배열. `USED`: top-k 선택 횟수 | **`PER_LANE`은 1(인스턴스), `USED`는 런타임** | logit 배열을 런타임 크기로 두면 로컬 메모리로 가고, 트리의 `no_local_depot` 계약이 이를 금한다. 선택 횟수는 배열을 키우지 않는 루프 횟수라 런타임으로 둬도 된다. 선택 결과를 lane j가 j번째 픽으로 들고 있으면 배열이 없다(라운드가 코드로 확인) |
-| V4.1 라우터(384/6), V2-Lite(64/6), DSpark 초안(128/3) | 위와 같은 구조 | 같은 규칙 | `PER_LANE` = n_expert/32로 인스턴스 {2, 4, 8, 12, 16}이면 알려진 모델이 다 들어간다 |
-| GQA flash `HEAD` | smem 타일과 레지스터 벡터의 폭 | **1. 인스턴스(128, 256)** | 헤드 폭은 타일 기하 자체다. q38gqa가 이미 이 모양이다 |
-| GQA group | 블록당 쿼리 헤드 수 | **이미 동적** | q38gqa에서 `PACK`은 상수, 키 헤드당 `packs`는 런타임이 됐다. group이 PACK의 배수이기만 하면 모두 받는다 |
-| 인덱서 `PER_LANE` (V4.1) | lane당 값 | 그대로 | V4.1 한 모델의 기하다. 다른 모델이 쓰지 않는 동안에는 바꿀 이유가 없다 |
-
-상한+런타임(2)을 기본으로 삼지 않는 이유가 있다. 라우터·어텐션처럼 레지스터가 빡빡한 커널은 MAX 기준 레지스터가
-점유율을 깎는다. 이런 비용은 ptxas를 돌려 봐야 안다. 그래서 2는 "ptxas가 MAX에서도 점유율이 같다고 말할 때만" 쓴다.
+**cuda-oxide 제약(nvlabs-ledger §12, kfixgqa가 찾음).** 인스턴스 몸체 안에서 unroll할 루프의 상한은 상수 하나나 const
+파라미터 하나여야 하고, 그 위의 산술(`CONST / PARAM`)이면 안 된다. 제네릭 몸체의 MIR에서 그 산술은 상수로 접히지 않고,
+unroll 패스는 상수 op에서만 trip count를 읽는다. 그러면 루프가 펼쳐지지 않고, 루프 카운터로 인덱싱한 배열이 로컬 depot으로
+간다. `gqa_prefill_flash_256_p4`가 jit_local 24로 이 경우를 밟았다. 필요한 몫은 엔트리 쪽에서 const 파라미터로 계산해
+넘긴다(`{ MMA_ROWS / PACK_4 }`). `callgraph-bounds.py --unroll`이 Mac에서 이 경우를 잡는다. 포크에서 이 결함을 고치면
+이 제약은 풀린다.
 
 ### (d) 게이트 파일의 모양 — 무엇을 재는지에 따라
 
 - **모델 파일을 여는 게이트**(`gate_qwen35moe_e2e`의 256/8 같은 것)는 자기가 연 파일의 스펙에서 모양을 읽는다. 엔진과
   같은 출처다. 그러면 게이트와 엔진이 다른 값을 가정해 조용히 맞는 일이 없다.
 - **모델 없는 합성 게이트**(`gate_linear`, `gate_kquant`, `block.rs`)의 모양은 시험 입력으로 고른 점이라 상수로 둔다. 억지로
-  바꾸지 않는다. 다만 "어느 모델의 모양"이라고 주장하는 상수는 1절의 인스턴스 표를 읽게 한다.
+  바꾸지 않는다. 다만 "어느 모델의 모양"이라고 주장하는 상수는 선택기의 표를 읽게 한다.
 
 ## 3. 선택기 — 한 곳에서 고르고, 없으면 이름 붙여 거부
 
-- `crates/models`에 `shape.rs`를 둔다. 스펙에서 뽑은 모양 두 개와 선택 함수 하나다.
-  - 모양: `MoeShape { experts, top_k }`, `AttnShape { n_head, n_kv, head }`.
-  - 선택: `MoeShape → RouterInst`(`PER_LANE`), `AttnShape → GqaInst`(`HEAD`, `PACK`).
-- 표에 없는 모양은 `ShapeRefused { what, shape }`로 이름 붙여 거부한다. 가장 가까운 인스턴스로 떨어지는 폴백은 없다(조용한
-  실패 금지).
-- 기기 crate는 인스턴스 id를 받아 엔트리를 고른다. crate마다 있던 `N_EXPERT`/`N_USED` 상수는 없어진다. 커널 상수는 인스턴스
-  표의 한 줄이 되고, 그 줄은 자기가 받는 모양을 선언한다. 로드 때 스펙 → 인스턴스를 확인한다.
-- **Mac에서 증명한다**: 네이티브 테스트 하나가 "트리가 돌리는 모델마다 인스턴스가 있다"를 확인한다. 알려진 모양은
-  V2-Lite 64/6, V4.1 384/6, Qwen3 128/8, Qwen3.6 256/8, Qwen3.8 512/10, GLM-5.3-Flash는 헤더 값이다. 박스의 `*-meta`
-  게이트는 실제 헤더로 같은 선택을 한 번 더 확인한다.
+선택기는 `crates/models/src/shape.rs`다(shapes 1단계, 커밋 d85a14f). `ModelSpec`이 `models`에 있고, runtime은 이미 models에
+의존하므로 이 자리가 맞다.
+
+- **라우터의 키는 모양만이 아니라 규칙까지다.** `MoeShape { experts, top_k, rule }`이고, `rule`은
+  `RouterRule { score, bias, norm, gated }`로 층의 `Moe`에서 읽는다. 폭만으로는 몸체를 고를 수 없다. 전문가 128개는 Qwen3의
+  softmax 재정규화 몸체이기도 하고 DSpark의 편향 √softplus 몸체이기도 하다. 표의 행은 규칙 하나만 받는다.
+- **표**: `ROUTERS`(행 6개: V2-Lite, V4.1, DSpark, Qwen3, gated 256·512)와 `GQA`(행 3개). 각 행은 몸체, `per_lane`,
+  top-k 범위, 코드 위치를 가진다. `select_router`와 `select_gqa`는 행을 돌려주거나 `ShapeRefused { shape, why }`로 거부한다.
+  가장 가까운 행으로 떨어지는 폴백은 없다(조용한 실패 금지).
+- **GLM-5.3-Flash**(sigmoid + bias, 288/8): 지금은 `NoRouterRule`로 이름 붙여 거부한다. aa의 glmprog가 부르는
+  `gpu-deepseek41`의 GLM 라우터 엔트리(`glm5next_router`, `_scores`, `_pick`)에 호출자가 생기면 그 엔트리를 가리키는 행이
+  된다.
+- 기기 쪽 상수는 const fn(`router_row`, `router_row_is`, `gqa_row`)으로 표의 행에 묶인다. 모델 coverage 표(`coverage.rs`)도
+  같은 표를 읽는다(커밋 a38b710). 사본이 하나 줄었다.
+- **Mac에서 증명한다**: `cargo test -p bloomery-models --lib` 10개(트리가 돌리는 모델마다 행이 있다, 행 사이의 모양은 거부된다,
+  GLM은 이름으로 거부된다), 뮤턴트 7개가 빨강이다. 박스의 `*-meta` 게이트는 실제 헤더로 같은 선택을 한 번 더 확인한다.
 
 ## 4. 라운드 순서
 
-| 순서 | 라운드 | 부류 | 증명 | 크기 |
+| 순서 | 라운드 | 부류 | 증명 | 상태 |
 |---|---|---|---|---|
-| 1 | 호스트 목록을 로드 때 크기로 | (a) | 호스트 게이트, `gate-alloc` 래칫, V4.1 비트 동일(`ptx-scan` 불변) | M |
-| 2 | `shape.rs` + 네이티브 커버리지 테스트, crate 상수 사본 제거 | 소유자 | Mac 네이티브 테스트, `ptx-scan` 불변(값이 같으므로) | S–M |
-| 3 | handoff `n_used` 인자, combine 배열 제거 | (b), (c)-3 | 소유 게이트 비트 동일, 자원 열 | S |
-| 4 | 라우터 `USED` 런타임화(`PER_LANE` 인스턴스 유지) | (c) | 라우터 게이트 비트 동일, ptxas 레지스터·점유율 | M |
-| 5 | 모델을 여는 게이트가 스펙을 읽게 | (d) | 해당 게이트 녹색 | S |
+| 1 | 호스트 목록을 로드 때 크기로(`EXPERTS_INTO_MAX` 배열, `PageLayout`의 상한) | (a) | 호스트 게이트, `gate-alloc` 래칫, V4.1 비트 동일, ptx-scan 불변 | **먼저, 곧.** Qwen3.8(`n_used` 10)을 막는 유일한 항목이고 q38prog의 첫 부팅 전에 필요하다 |
+| 2 | 선택기와 네이티브 테스트, crate 상수 사본을 표에 묶기, coverage | 소유자 | Mac 네이티브 테스트, ptx-scan 불변 | shapes 1단계, 브랜치 `shapesc`(train 5) |
+| 3 | 새 모양의 인스턴스 행(`_8`, `_p4`, `_512`) | (b)/(c)의 첫걸음, add | ptx-scan = base + 새 엔트리, 호출 그래프 검사 | slot8, q38gqa, q38router |
+| 4 | Qwen 라우터 `used` 런타임화 | 합치기 | 소유 게이트 비트 동일, 자원 열 | shapes 1단계(9a9ac3e) |
+| 5 | 모델을 여는 게이트가 스펙을 읽게 | (d) | 해당 게이트 녹색 | shapes 1단계 |
+| 6 | 사본이 된 몸체를 합치기(GQA 256/p4, GDN/KDA, handoff/combine 6·8) | 합치기 | 소유 게이트 비트 동일, 자원 열, 움직이면 A/B | train 5 이후 |
+| 7 | V4.1 라우터를 선택기에 연결 | 소유자 | ptx-scan 불변 | shapes 2단계 |
 
-1과 2는 V4.1의 기기 코드를 바꾸지 않는다. 3과 4는 기존 엔트리의 명령을 바꾸므로 소유 게이트 비트 동일이 증명이다.
-커널 시간은 유도상 잣대 안이라 타이밍 A/B는 열지 않는다. 다만 예측이 빗나가면(자원 열이 움직이면) 그때 연다.
-
-hostab(지금 진행 중인 호스트 티어 이동)에는 넣지 않는다. hostab은 이동 부류라 V4.1 명령이 그대로여야 한다. 이 설계의
-라운드들은 hostab이 착륙한 뒤에 그 위에서 연다.
-
-## 5. AGENTS.md에 들어갈 한 줄 (제안, aa 착륙)
+## 5. AGENTS.md에 들어갈 문장 (aa 수락, train 5에 문서와 함께 착륙)
 
 > **A model's shape is a value from its spec, never a crate constant.** Expert count, top-k, heads and head width come
 > from `ModelSpec`. A compile-time bound is either a row of an instance table the spec selects at load, or a capacity
-> the engine chose for itself; a shape no row serves is refused by name, never mapped to the nearest one.
+> the engine chose for itself; a shape no row serves is refused by name, never mapped to the nearest one. A new shape is
+> a new instance row whose existing entries keep their bytes; merging rows is a separate change proven bit-identical.
