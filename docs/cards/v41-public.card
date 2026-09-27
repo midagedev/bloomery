@@ -1,0 +1,42 @@
+# The public V4.1-Flash table in one window on the A6000: ours (placement (a), r8 sidecar, lcg ids, no hot
+# list) against llama.cpp's V4.1 PR branch (#28696 at 5210c7c; the PR carries three commits by this
+# repository's author, which the table's caption says). llama.cpp runs at its fastest flags we can name:
+# the hand-set placement (--n-cpu-moe 33, the profile's LCPP_GPU_FLAGS) and llama-bench's own fit
+# (-fitt 1024, fitarm), each with the -ub/-b 4096 lever on the P = 4096 prompt; the table publishes the
+# faster of the two per row. Three engine blocks, each opened by a discarded process (relrunner2,
+# fitarm): ours, lcpp, lcppfit (the fit's host set is the trailing layers' experts, not the leading).
+#
+# Every row's prediction:
+#   ours decode d6 / d4096        29.3..30.2 tok/s  [measured 09-27 window 2, same arms: 29.83..29.90 /
+#                                                   29.48..29.78; the tree since moved no decode path]
+#   ours pp512 / pp4096           188..196 / 348..358 [same window: 191.27..192.24 / 352.46..354.08]
+#   llama.cpp pp512 (hand-set)    104.6..119       [memfit, warm engram rows; the term below]
+#   llama.cpp pp4096 at -ub 4096  no derivation: at -ub >= 2048 the CUDA backend copies host
+#                                 MUL_MAT_ID weights to the card per ubatch (depth-ds41.sh's Prefill
+#                                 note), a trade the window measures; the row is sat because the
+#                                 survey's fairest-baseline rule names it
+#   llama.cpp decode d6 / d4096   memfit's warm rows [derived there]
+#   lcppfit rows                  0..-1 % against the hand-set rows [fitarm: 41,648 MiB of experts on
+#                                 the card against 42,997.5, and one partial layer's shared down on the
+#                                 host], inside two rounds' ruler, so the faster-of-two choice is a coin
+#                                 toss unless it separates
+kind: baseline
+question: where do ours and llama.cpp's V4.1 decode and prompt rows sit in one window, llama.cpp at its
+  hand-set and its fitted placement, for the public V4.1 table?
+term: pp tok/s @ P = 512, llama.cpp PR #28696 (llama-bench -p 512 -n 0 -r 2, second sample, -ngl 999
+  --n-cpu-moe 33 -fa on -t 32 -nopo 1), A6000, engine blocks with the discard
+unit: tok/s
+predict: 104.6..119
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, arms 6 512 4096 lcpp:6 lcpp:4096 lcpppp:512
+  lcpppp4096:4096 lcppfit:6 lcppfit:4096 lcppppfit:512 lcppppfit4096:4096; each block's DISCARD r0 row
+  present; every lcpp and lcppfit row's `timed` count printed; every lcppfit row carries its fit column
+  (a fit that failed is a FAIL row, not a number); no row carries [cpu-busy] or [other-busy]; the full
+  output to a file first
+reason: sets the V4.1 rows of the public release table, llama.cpp at the faster of its hand-set and
+  fitted placements and at the -ub 4096 prompt lever; why now: the release sitting takes every model's
+  table in one window (approval recorded in the rig-log header)
+decide-in: write the table (rig-log first, then README): per llama.cpp row the faster of hand-set and fit,
+  both shown in rig-log with each row's timed-window fault bound
+decide-below: read each lcpp row's timed count; about 25k faults per 512 tokens means a load evicted the
+  discard's engram pages: the next runner change is a discard before every lcpp arm
+decide-above: the morning's 104.6 was itself fault-limited: restate the README row from this window
