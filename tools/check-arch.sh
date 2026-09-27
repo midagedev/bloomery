@@ -123,6 +123,8 @@ dispatch=(
   'crates/model/src/bin/r8conv.rs use'
   # V4.1 게이트 fixture 도구: 원본 헤더를 Hparams::read 로 읽어 deepseek41 이 아닌 파일은 이름 붙여 거절한 뒤 V4.1 층 맵으로 fixture 를 만든다.
   'crates/model/src/bin/v41fixture.rs use'
+  # 호스트 union 벤치: 파일의 아키텍처가 qwen4exp 일 때만 qwen35moe 의 Hparams·텐서 이름·host::layers 로 routed 층을 연다.
+  'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
   'crates/gpu-gates/src/oracle/mod.rs fn for_arch'
   # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.

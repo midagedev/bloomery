@@ -1,4 +1,5 @@
-//! Bench for the host leg of a DeepSeek-V4.1 decode token.
+//! Bench for the host leg of a DeepSeek-V4.1 decode token, and of the
+//! Qwen3.8-Flash-Next (`qwen4exp`) routed experts the host union serves.
 //!
 //! The leg is the routed experts the CPU pool computes, at the file's own
 //! shapes, read in place from the file's own page-cache pages. It is not a
@@ -33,10 +34,13 @@
 //! the mapping costs from what the dispatch costs.
 //!
 //! Weights: `gguf::Split` over `$BLOOMERY_REF_MODEL`, mapped lazily, never
-//! copied — file-backed page-cache pages, as serving reads them. A layer's
-//! routed stacks are its three-dimensional tensors whose last dim is the
-//! file's `expert_count`: down by its per-expert shape `[ff, embd]`, gate and
-//! up (both `[embd, ff]`) by the word their names carry. Each layer's working
+//! copied — file-backed page-cache pages, as serving reads them. The file's
+//! `general.architecture` picks the family ([`Family`]). A `qwen4exp` file
+//! reads its hyperparameters, its routed stacks' names and its host layers
+//! from `arch::qwen35moe` (`Hparams`, `names`, `host::layers`); any other
+//! file's routed stacks are its three-dimensional tensors whose last dim is
+//! the file's `expert_count`: down by its per-expert shape `[ff, embd]`, gate
+//! and up (both `[embd, ff]`) by the word their names carry. Each layer's working
 //! set is [`WORKING_SET`] experts drawn once by a seeded generator, and a
 //! token draws its `n_host` experts from that set, distinct within the
 //! layer. The working set is paged in before anything runs
@@ -46,13 +50,17 @@
 //! measurement, and such an arm prints `admissible=no`.
 //!
 //! `--check [--arms A,B,...]`: for layers 0, 1, 2, the last layer and every layer whose
-//! stacks span more than one shard, one token and every one of its
-//! `expert_used_count` experts. Six output rows of gate, up and down are
-//! compared with an f64 reference over the same bytes: `gguf::dequant_row`
-//! for the weight rows, and for the activation the bytes `qdot::quantize_col`
-//! makes of the kernel's own input (block_q8_K for q3_K, block_q8_2_x4 for
-//! q4_K and q5_K), decoded exactly — the float sum order is the only
-//! difference. The band is [`BAND`]. The SwiGLU combine the down dispatch
+//! stacks span more than one shard — and, for a `qwen4exp` file, the first
+//! layer of every routed type triple (gate, up, down) those lack — one token
+//! and every one of its `expert_used_count` experts. Six output rows of gate,
+//! up and down are compared with an f64 reference over the same bytes:
+//! `gguf::dequant_row` for the weight rows, and for the activation the bytes
+//! `qdot::quantize_col` makes of the kernel's own input (block_q8_K for q3_K,
+//! block_q8_2_x4 for q4_K and q5_K, block_q8_2_x4 then block_q8_2 tails for
+//! q5_1 and q8_0), decoded exactly — the float sum order is the only
+//! difference. A q5_1 kernel adds each block's min times the activation
+//! block's stored sum; the reference adds that term from the stored sum too.
+//! The band is [`BAND`]. The SwiGLU combine the down dispatch
 //! produced must equal `qdot::swiglu` over the gate and up outputs bit for
 //! bit and sit within the band of an f64 SiLU, and the per-matrix shape must
 //! reproduce the engine shape's outputs bit for bit. A miss names the layer,
@@ -68,6 +76,9 @@
 //! runs the pre-timing arm check below for the arms of [`R8_CHECK_ARMS`] on
 //! the checked layers — or, given `--arms`, for those arms on every layer,
 //! the check a `--time` run makes before it times them, without the timing.
+//! The `unionr8` and `unionq` shapes take Q3_K gates and ups, which a
+//! `qwen4exp` file has none of: its `--check` runs neither and says so, and
+//! its default arm check is [`Q38_CHECK_ARMS`].
 //!
 //! `--time` (lead-only, under `tools/ref/host-rate.sh`, which owns the lease,
 //! the witnesses and the thread sweep): the check first, refusing to time if
@@ -76,7 +87,10 @@
 //! tokens as fill the arm's share of `--seconds` at the first warm-up's pace;
 //! later rounds keep that count. Every dispatch is timed on its own too, by
 //! kind and weight bytes: bytes per dispatch is the variable this bench is
-//! for.
+//! for. A union arm's lines also carry its columns per distinct expert
+//! (`cols_per_expert`) and the time per distinct expert of one layer call
+//! (`us_per_expert`: a dispatch line's mean call over the arm's distinct
+//! experts; a summary line's mean token over its layers and distinct experts).
 //!
 //! A multi-row arm's rows read disjoint experts unless the arm names a union
 //! ratio (`u<r>` on the arm, or `--union r` for every multi-row arm without
@@ -130,8 +144,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use gguf::quant::half_to_f32;
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
 use model::ModelError;
+use model::arch::qwen35moe::hparams::Hparams;
+use model::arch::qwen35moe::{host as qwen4exp_host, names as qwen4exp_names};
 use model::moe::{HostLayer, HostLayerSpec, UNION_MAX_COLS, UnionScratch, expert_view};
 use model::ops::{
     DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
@@ -181,6 +198,9 @@ const UNION_CHUNK: usize = 8;
 /// layers: the union sitting's shapes.
 const R8_CHECK_ARMS: &str = "union5:4x8u0.125,unionr8:4x8u0.125,unionq:4x8u0.125,\
                              union5:4x16u0.0625,unionr8:4x16u0.0625,unionq:4x16u0.0625";
+/// The arms a `qwen4exp` file's `--check` runs the pre-timing arm check for:
+/// [`R8_CHECK_ARMS`]' `union5` arms (its gates and ups are not Q3_K).
+const Q38_CHECK_ARMS: &str = "union5:4x8u0.125,union5:4x16u0.0625";
 /// The `(rows, n_host, distinct)` tokens the `unionr8` check runs on every
 /// checked layer: columns per expert 1–2, 3, 3–4 over three chunks, 6, 7–8,
 /// 8, 10 (a run of 8 and one of 2) and 16 (two runs of 8).
@@ -210,7 +230,7 @@ const USAGE: &str = "usage: bench_v41_host --check [--arms A,B,...]
   are round(r x n_host x rows), 1/rows <= r <= 1
   b<B> (unionr8 and unionq only): the gate/up dispatch hands out B units a claim, default 1
   --check --arms: the pre-timing check of those arms on every layer, no timing
-  the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
+  the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the BLOOMERY_MODEL profile: deepseek41 or qwen4exp)";
 
 // The page bookkeeping's libc calls; `std` already links libc on this target.
 unsafe extern "C" {
@@ -253,28 +273,109 @@ struct Meta {
 }
 
 impl Meta {
-    fn read(split: &Split) -> Result<Meta, BenchError> {
+    /// The values `family` reads: a `qwen4exp` file's from its [`Hparams`],
+    /// any other's from the five keys.
+    fn read(split: &Split, family: &Family) -> Result<Meta, BenchError> {
+        if let Family::Qwen4exp(hp) = family {
+            return Meta {
+                blocks: hp.n_layer,
+                embd: hp.n_embd,
+                ff: hp.expert_ff,
+                n_expert: hp.n_expert,
+                n_used: hp.n_used,
+            }
+            .fits();
+        }
         let get = |suffix: &str| -> Result<usize, BenchError> {
             let v = split
                 .arch_get_u64(suffix)
                 .ok_or_else(|| format!("metadata key {} is absent", split.arch_key(suffix)))?;
             Ok(usize::try_from(v)?)
         };
-        let meta = Meta {
+        Meta {
             blocks: get("block_count")?,
             embd: get("embedding_length")?,
             ff: get("expert_feed_forward_length")?,
             n_expert: get("expert_count")?,
             n_used: get("expert_used_count")?,
-        };
-        if meta.n_expert < WORKING_SET || meta.n_used == 0 || meta.n_used > WORKING_SET {
+        }
+        .fits()
+    }
+
+    /// `self` when the working set holds a token's experts, else the named error.
+    fn fits(self) -> Result<Meta, BenchError> {
+        if self.n_expert < WORKING_SET || self.n_used == 0 || self.n_used > WORKING_SET {
             return Err(format!(
                 "{} experts, {} used per token: a working set of {WORKING_SET} does not fit",
-                meta.n_expert, meta.n_used
+                self.n_expert, self.n_used
             )
             .into());
         }
-        Ok(meta)
+        Ok(self)
+    }
+}
+
+/// How the bench finds a file's routed stacks and builds its host layers,
+/// picked by the file's `general.architecture`.
+enum Family {
+    /// Any architecture but `qwen4exp` (DeepSeek-V4.1): the stacks found by
+    /// their shapes ([`find_stacks`]), the host layers built from them.
+    Discovered,
+    /// Qwen3.8-Flash-Next: the hyperparameters, stack names and host layers
+    /// `arch::qwen35moe` reads and builds.
+    Qwen4exp(Box<Hparams>),
+}
+
+impl Family {
+    fn of(split: &Split) -> Result<Family, BenchError> {
+        match split.architecture() {
+            Some("qwen4exp") => Ok(Family::Qwen4exp(Box::new(Hparams::read(split)?))),
+            _ => Ok(Family::Discovered),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Family::Discovered => "discovered",
+            Family::Qwen4exp(_) => "qwen4exp",
+        }
+    }
+
+    /// Every layer's routed stacks, `[gate, up, down]`.
+    fn stacks<'a>(&self, split: &'a Split, meta: &Meta) -> Result<Vec<[Stack<'a>; 3]>, BenchError> {
+        match self {
+            Family::Discovered => find_stacks(split, meta),
+            Family::Qwen4exp(_) => (0..meta.blocks)
+                .map(|l| {
+                    let stack = |m: usize, name: String| -> Result<Stack<'a>, BenchError> {
+                        let (shard, info) = split
+                            .find(&name)
+                            .ok_or_else(|| format!("{name}: not in the file"))?;
+                        let rest = layer_part(&name).map_or("", |(_, rest)| rest);
+                        if info.dims.len() != 3 || info.dims[2] != meta.n_expert as u64 {
+                            return Err(format!(
+                                "{name}: dims {:?}, not a stack of {} experts",
+                                info.dims, meta.n_expert
+                            )
+                            .into());
+                        }
+                        if matrix_of(info, rest, meta)? != m {
+                            return Err(format!(
+                                "{name}: not the {} stack its name says",
+                                MATRIX[m]
+                            )
+                            .into());
+                        }
+                        Ok(Stack { shard, info })
+                    };
+                    Ok([
+                        stack(GATE, qwen4exp_names::ffn_gate_exps(l))?,
+                        stack(UP, qwen4exp_names::ffn_up_exps(l))?,
+                        stack(DOWN, qwen4exp_names::ffn_down_exps(l))?,
+                    ])
+                })
+                .collect(),
+        }
     }
 }
 
@@ -405,9 +506,13 @@ impl<'a> Layer<'a> {
 }
 
 /// Every layer with its readers and its working set's views, built once.
-fn build_layers<'a>(split: &'a Split, meta: &Meta) -> Result<Vec<Layer<'a>>, BenchError> {
+fn build_layers<'a>(
+    split: &'a Split,
+    meta: &Meta,
+    family: &Family,
+) -> Result<Vec<Layer<'a>>, BenchError> {
     let mut layers = Vec::with_capacity(meta.blocks);
-    for (index, stacks) in find_stacks(split, meta)?.into_iter().enumerate() {
+    for (index, stacks) in family.stacks(split, meta)?.into_iter().enumerate() {
         let reader = |m: usize| -> Result<&'a Gguf, BenchError> {
             let s = stacks[m].shard;
             split
@@ -2186,9 +2291,10 @@ fn print_mem() -> Result<(), BenchError> {
 
 /// The start-up table: the file's shape, each layer's shards and types, and
 /// the layers whose stacks span shards.
-fn print_table(path: &str, split: &Split, meta: &Meta, layers: &[Layer<'_>]) {
+fn print_table(path: &str, split: &Split, meta: &Meta, family: &Family, layers: &[Layer<'_>]) {
     println!(
-        "v41host model={path} shards={} blocks={} embd={} ff={} experts={} used={} working_set={WORKING_SET}",
+        "v41host model={path} family={} shards={} blocks={} embd={} ff={} experts={} used={} working_set={WORKING_SET}",
+        family.name(),
         split.shard_count(),
         meta.blocks,
         meta.embd,
@@ -2259,20 +2365,32 @@ fn bits_equal(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-/// The activation values a fused kernel for weight type `ty` reads: `x`
-/// through `qdot::quantize_col`, the bytes decoded exactly in f64.
-fn kernel_activation(ty: GgmlType, x: &[f32]) -> Result<Vec<f64>, BenchError> {
+/// The activation a fused kernel for one weight type reads, decoded exactly.
+struct KernelAct {
+    values: Vec<f64>,
+    /// For q5_1, each 32-value block's stored `d · Σq`, the factor the
+    /// kernel's min term multiplies the weight block's min by; empty for
+    /// every other type.
+    block_sums: Vec<f64>,
+}
+
+/// The activation a fused kernel for weight type `ty` reads: `x` through
+/// `qdot::quantize_col`, the bytes decoded exactly in f64. A type with no
+/// decoder here is the named error.
+fn kernel_activation(ty: GgmlType, x: &[f32]) -> Result<KernelAct, BenchError> {
     let mut col = vec![0u8; qdot::col_bytes(ty, x.len())];
     qdot::quantize_col(ty, x, &mut col);
-    let values = match ty {
-        GgmlType::Q3_K => decode_q8k(&col),
-        GgmlType::Q4_K | GgmlType::Q5_K => decode_q82x4(&col),
+    let (values, block_sums) = match ty {
+        GgmlType::Q3_K => (decode_q8k(&col), Vec::new()),
+        GgmlType::Q4_K | GgmlType::Q5_K => (decode_q82x4(&col), Vec::new()),
+        GgmlType::Q5_1 => decode_q5_1(&col, x.len())?,
+        GgmlType::Q8_0 => (decode_q8_0(&col, x.len())?, Vec::new()),
         other => return Err(format!("no activation decoder for {other}").into()),
     };
     if values.len() != x.len() {
         return Err(format!("{ty}: decoded {} values of {}", values.len(), x.len()).into());
     }
-    Ok(values)
+    Ok(KernelAct { values, block_sums })
 }
 
 /// block_q8_K as `qdot::quantize_col` writes it: 296 bytes per 256 values —
@@ -2309,25 +2427,226 @@ fn decode_q82x4(col: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+/// One 32-value block of the q8_2 family as `qdot::quantize_col` writes it:
+/// its bf16 scale, its stored code sum and its codes.
+struct Q82Block {
+    d: f64,
+    sum: i16,
+    codes: [i8; 32],
+}
+
+/// The blocks of a q8_2-family column of `k` values (q5_1 and q8_0 weights):
+/// `k / 128` block_q8_2_x4 groups of 144 bytes — four bf16 scales at 0, four
+/// i16 code sums at 8, four runs of 32 codes from 16 — then one 36-byte
+/// block_q8_2 per 32 values left: the bf16 scale at 0, the i16 code sum at 2,
+/// the codes from 4.
+fn q82_blocks(col: &[u8], k: usize) -> Result<Vec<Q82Block>, BenchError> {
+    let (groups, tails) = (k / 128, (k % 128) / 32);
+    if !k.is_multiple_of(32) || col.len() != groups * 144 + tails * 36 {
+        return Err(format!(
+            "a q8_2 column of {} bytes is not {k} values in x4 groups and tails",
+            col.len()
+        )
+        .into());
+    }
+    let bf16 = |b: &[u8]| {
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([b[0], b[1]])) << 16,
+        ))
+    };
+    let sum = |b: &[u8]| i16::from_le_bytes([b[0], b[1]]);
+    let codes = |b: &[u8]| -> [i8; 32] { std::array::from_fn(|i| i8::from_le_bytes([b[i]])) };
+    let (x4, tail) = col.split_at(groups * 144);
+    let mut out = Vec::with_capacity(k / 32);
+    for g in x4.as_chunks::<144>().0 {
+        for ir in 0..4 {
+            out.push(Q82Block {
+                d: bf16(&g[2 * ir..]),
+                sum: sum(&g[8 + 2 * ir..]),
+                codes: codes(&g[16 + 32 * ir..]),
+            });
+        }
+    }
+    for t in tail.as_chunks::<36>().0 {
+        out.push(Q82Block {
+            d: bf16(&t[..]),
+            sum: sum(&t[2..]),
+            codes: codes(&t[4..]),
+        });
+    }
+    Ok(out)
+}
+
+/// A q8_0 kernel's activation: every value `d · q` of its q8_2 blocks.
+fn decode_q8_0(col: &[u8], k: usize) -> Result<Vec<f64>, BenchError> {
+    Ok(q82_blocks(col, k)?
+        .iter()
+        .flat_map(|b| b.codes.iter().map(move |&q| b.d * f64::from(q)))
+        .collect())
+}
+
+/// A q5_1 kernel's activation: every value `d · q` of its q8_2 blocks, and
+/// each block's stored sum `d · Σq`, the min term's factor.
+fn decode_q5_1(col: &[u8], k: usize) -> Result<(Vec<f64>, Vec<f64>), BenchError> {
+    let blocks = q82_blocks(col, k)?;
+    let values = blocks
+        .iter()
+        .flat_map(|b| b.codes.iter().map(move |&q| b.d * f64::from(q)))
+        .collect();
+    let sums = blocks.iter().map(|b| b.d * f64::from(b.sum)).collect();
+    Ok((values, sums))
+}
+
+/// The part of a q5_1 row's dot its kernel takes from the activation's stored
+/// block sums: `Σ_b m_b · (s_b − Σ_{i∈b} a_i)`, `m_b` the weight block's min
+/// (the f16 at bytes 2..4 of its 24), `s_b` the stored sum. Zero when every
+/// stored sum is its block's values' sum; a missing sum is the named error.
+fn q5_1_min_term(row: &[u8], act: &KernelAct) -> Result<f64, BenchError> {
+    let blocks = act.values.len() / 32;
+    if act.block_sums.len() != blocks || row.len() != blocks * 24 {
+        return Err(format!(
+            "q5_1: {} activation block sums and {} row bytes for {} values",
+            act.block_sums.len(),
+            row.len(),
+            act.values.len()
+        )
+        .into());
+    }
+    Ok(row
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .zip(act.values.as_chunks::<32>().0.iter().zip(&act.block_sums))
+        .map(|(w, (a, &s))| {
+            let m = f64::from(half_to_f32(u16::from_le_bytes([w[2], w[3]])));
+            m * (s - a.iter().sum::<f64>())
+        })
+        .sum())
+}
+
+/// A column of `k` values for the decoders' round trip: [`activations`]'
+/// draw, the second 32-value block all zeros, the others scaled by 1 to 16
+/// so neighbouring blocks' scales differ.
+fn decoder_column(k: usize) -> Vec<f32> {
+    let mut rng = Rng::new(&[KEY_X, k as u64]);
+    (0..k)
+        .map(|i| {
+            let u = (rng.next_u64() >> 40) as f32 / 8_388_608.0 - 1.0;
+            let block = i / 32;
+            let scale = (1u32 << (block % 5)) as f32;
+            let outlier = if i.is_multiple_of(61) { 8.0 } else { 1.0 };
+            if block == 1 { 0.0 } else { u * scale * outlier }
+        })
+        .collect()
+}
+
+/// Width of the decoders' round trip besides a stack's own `k`: one x4
+/// group and three block_q8_2 tails.
+const DECODER_TAIL_K: usize = 224;
+
+/// The q8_2-family decoders ([`decode_q5_1`], [`decode_q8_0`]) against the
+/// input `qdot::quantize_col` encoded, for every such type a checked layer's
+/// stack has, at the stack's `k` and at [`DECODER_TAIL_K`]: every decoded
+/// value within half a step of its input (the block's scale over two, plus
+/// the f32 rounding of `x · (1/d)` at a code of at most 127.5, under
+/// `1e-4 · d`); q5_1's stored block sums equal to its values' sums exactly
+/// (both are `d` times an integer under 2^13, exact in f64), and q8_0 with
+/// none.
+fn check_decoders(
+    c: &mut Checks,
+    layers: &[Layer<'_>],
+    covered: &[usize],
+) -> Result<(), BenchError> {
+    let mut runs: Vec<(GgmlType, usize)> = Vec::new();
+    for &li in covered {
+        for m in [GATE, UP, DOWN] {
+            let v = layers[li].view(0, m);
+            if matches!(v.ty, GgmlType::Q5_1 | GgmlType::Q8_0) {
+                for k in [usize::try_from(v.dims[0])?, DECODER_TAIL_K] {
+                    if !runs.contains(&(v.ty, k)) {
+                        runs.push((v.ty, k));
+                    }
+                }
+            }
+        }
+    }
+    for (ty, k) in runs {
+        let x = decoder_column(k);
+        let act = kernel_activation(ty, &x)?;
+        let mut col = vec![0u8; qdot::col_bytes(ty, k)];
+        qdot::quantize_col(ty, &x, &mut col);
+        let blocks = q82_blocks(&col, k)?;
+        let (mut within, mut worst) = (true, 0.0f64);
+        for (i, (&v, &xi)) in act.values.iter().zip(&x).enumerate() {
+            let d = blocks[i / 32].d;
+            let err = (v - f64::from(xi)).abs();
+            within &= err <= 0.5 * d + 1e-4 * d;
+            if d > 0.0 {
+                worst = worst.max(err / d);
+            }
+        }
+        let sums_exact = if ty == GgmlType::Q5_1 {
+            act.block_sums.len() == k / 32
+                && act
+                    .values
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
+                    .zip(&act.block_sums)
+                    .all(|(vals, &s)| s == vals.iter().sum::<f64>())
+        } else {
+            act.block_sums.is_empty()
+        };
+        let line = format!(
+            "check decoder={ty} k={k} blocks={} values={} max_err_steps={worst:.4} step_band=0.5001 \
+             block_sums_exact={sums_exact}",
+            blocks.len(),
+            act.values.len()
+        );
+        c.record(
+            format!("decoder {ty} k {k}"),
+            &line,
+            within && sums_exact && act.values.len() == k,
+        );
+    }
+    Ok(())
+}
+
 /// f64 dot products of rows `rows` of `w` (read from its shard `g`) with `act`.
 fn reference(
     g: &Gguf,
     w: &TensorInfo,
-    act: &[f64],
+    act: &KernelAct,
     rows: &[usize],
 ) -> Result<Vec<f64>, BenchError> {
     let k = usize::try_from(w.dims[0])?;
     let n = usize::try_from(w.dims[1])?;
-    if act.len() != k {
-        return Err(format!("{}: {} activation values for k = {k}", w.name, act.len()).into());
+    if act.values.len() != k {
+        return Err(format!(
+            "{}: {} activation values for k = {k}",
+            w.name,
+            act.values.len()
+        )
+        .into());
     }
     let bytes = g.data(w)?;
     let rb = bytes.len() / n;
     let mut vals = vec![0.0f32; k];
     rows.iter()
         .map(|&r| -> Result<f64, BenchError> {
-            dequant_row(w.ty, &bytes[r * rb..(r + 1) * rb], &mut vals)?;
-            Ok(vals.iter().zip(act).map(|(&v, &a)| f64::from(v) * a).sum())
+            let row = &bytes[r * rb..(r + 1) * rb];
+            dequant_row(w.ty, row, &mut vals)?;
+            let dot: f64 = vals
+                .iter()
+                .zip(&act.values)
+                .map(|(&v, &a)| f64::from(v) * a)
+                .sum();
+            let min = if w.ty == GgmlType::Q5_1 {
+                q5_1_min_term(row, act)?
+            } else {
+                0.0
+            };
+            Ok(dot + min)
         })
         .collect()
 }
@@ -2373,7 +2692,7 @@ fn check_weight(
     s: usize,
     m: usize,
     got: &Tensor2,
-    act: &[f64],
+    act: &KernelAct,
 ) -> Result<(), BenchError> {
     let w = l.view(s, m);
     let rows = check_rows(got.data.len());
@@ -2612,6 +2931,24 @@ fn check_union_r8(
     Ok(())
 }
 
+/// The fewest and the most columns one distinct expert serves in the draw
+/// `ids` over `layers`: the arm's columns per expert as its tokens read them,
+/// counted from the draw rather than from the arm's arithmetic.
+fn drawn_cols(ids: &[Vec<usize>], layers: &[usize]) -> (usize, usize) {
+    let mut counts = [0usize; WORKING_SET];
+    let (mut lo, mut hi) = (usize::MAX, 0);
+    for &l in layers {
+        counts.fill(0);
+        for &s in &ids[l] {
+            counts[s] += 1;
+        }
+        for &n in counts.iter().filter(|&&n| n > 0) {
+            (lo, hi) = (lo.min(n), hi.max(n));
+        }
+    }
+    (lo.min(hi), hi)
+}
+
 /// Before any timing (every layer), and under `--check` (the checked layers,
 /// or every layer for `--arms`): one token of every `union5`, `unionr8` and
 /// `unionq` arm through its shape and the union shape, layer by layer over
@@ -2687,10 +3024,14 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
                 differ.push(layer.index);
             }
         }
+        let (lo, hi) = drawn_cols(&ids, layers);
         println!(
-            "check arm={} layers={} outputs_bits_equal_union={}",
+            "check arm={} layers={} distinct={} cols_per_expert={:.2} cols_drawn={lo}..{hi} \
+             outputs_bits_equal_union={}",
             arm.label(),
             layers.len(),
+            arm.union,
+            arm.cols_per_expert(),
             differ.is_empty()
         );
         if !differ.is_empty() {
@@ -2705,26 +3046,40 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
 }
 
 /// The layers the check covers: 0, 1, 2, the last and every layer whose
-/// stacks span more than one shard.
-fn covered_layers(layers: &[Layer<'_>]) -> Vec<usize> {
+/// stacks span more than one shard; for a `qwen4exp` file also the first
+/// layer of every routed type triple (gate, up, down) those lack.
+fn covered_layers(layers: &[Layer<'_>], family: &Family) -> Vec<usize> {
     let last = layers.len().saturating_sub(1);
-    layers
+    let mut covered: Vec<usize> = layers
         .iter()
         .filter(|l| l.index < 3 || l.index == last || l.spans_shards())
         .map(|l| l.index)
-        .collect()
+        .collect();
+    if let Family::Qwen4exp(_) = family {
+        let triple = |l: &Layer<'_>| l.stacks.map(|s| s.info.ty);
+        let mut seen: Vec<[GgmlType; 3]> = covered.iter().map(|&i| triple(&layers[i])).collect();
+        for l in layers {
+            if !seen.contains(&triple(l)) {
+                seen.push(triple(l));
+                covered.push(l.index);
+            }
+        }
+        covered.sort_unstable();
+    }
+    covered
 }
 
 /// The whole check (see the module doc); `Ok` only when every site passed.
 fn check(bench: &Bench<'_>, n_host: usize, verbose: bool) -> Result<(), BenchError> {
     let (layers, xs) = (&bench.layers, &bench.xs);
-    let covered = covered_layers(layers);
+    let covered = covered_layers(layers, bench.family);
     let mut c = Checks {
         verbose,
         sites: 0,
         failed: Vec::new(),
         worst: 0.0,
     };
+    check_decoders(&mut c, layers, &covered)?;
     for &li in &covered {
         let slots = distinct(&mut Rng::new(&[KEY_CHECK, li as u64]), n_host, WORKING_SET);
         check_layer(&mut c, &layers[li], &slots, &xs[li % N_X])?;
@@ -2957,6 +3312,12 @@ impl Arm {
         }
     }
 
+    /// Columns each distinct expert of a layer serves: the arm's slots over
+    /// its distinct experts.
+    fn cols_per_expert(self) -> f64 {
+        (self.n_host * self.rows) as f64 / self.union as f64
+    }
+
     /// File bytes one token of this arm's dispatches stream: every row's
     /// slots, a shared expert once per row that reads it — except the union
     /// shapes, which stream each distinct expert once.
@@ -3064,6 +3425,7 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 /// they fold into.
 struct Bench<'a> {
     split: &'a Split,
+    family: &'a Family,
     layers: Vec<Layer<'a>>,
     /// Every layer as the host tier's `HostLayer`, SwiGLU limit 0.
     hosts: Vec<HostLayer>,
@@ -3309,8 +3671,17 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
             );
             for d in &r.tally.rows {
                 let us = d.ns as f64 / d.count as f64 / 1e3;
+                let per_expert = if arm.shape.is_union() {
+                    format!(
+                        " cols_per_expert={:.2} us_per_expert={:.2}",
+                        arm.cols_per_expert(),
+                        us / arm.union as f64
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "dispatch threads={threads} round={}/{} arm={} kind={} bytes={} count={} us_mean={us:.2} gbps={:.2}",
+                    "dispatch threads={threads} round={}/{} arm={} kind={} bytes={} count={} us_mean={us:.2} gbps={:.2}{per_expert}",
                     round + 1,
                     opts.rounds,
                     arm.label(),
@@ -3344,9 +3715,20 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
         } else {
             String::new()
         };
+        let per_expert = if arm.shape.is_union() {
+            let calls = (bench.layers.len() * arm.union) as f64;
+            format!(
+                " cols_per_expert={:.2} us_per_expert={:.2} us_per_expert_min={:.2}",
+                arm.cols_per_expert(),
+                mean * 1e3 / calls,
+                min * 1e3 / calls
+            )
+        } else {
+            String::new()
+        };
         println!(
             "summary threads={threads} arm={} rounds={} tokens={} ms_min={min:.3} ms_mean={mean:.3} round_means=[{}] \
-             gbps_mean={:.2} gbps_best={:.2} admissible={}{thp}",
+             gbps_mean={:.2} gbps_best={:.2} admissible={}{per_expert}{thp}",
             arm.label(),
             rs.len(),
             all.len(),
@@ -3370,12 +3752,22 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
 }
 
 /// Every layer as a `HostLayer` over the same stacks, SwiGLU limit 0 (the
-/// plain combine the other shapes run).
+/// plain combine the other shapes run); a `qwen4exp` file's as
+/// `arch::qwen35moe::host::layers` builds them (its routed SwiGLU has no
+/// limit), every refused layer named.
 fn host_layers(
     split: &Split,
     meta: &Meta,
+    family: &Family,
     layers: &[Layer<'_>],
 ) -> Result<Vec<HostLayer>, BenchError> {
+    if let Family::Qwen4exp(hp) = family {
+        return Ok(qwen4exp_host::layers(
+            R8Source::rows(split),
+            hp,
+            0..layers.len(),
+        )?);
+    }
     layers
         .iter()
         .map(|l| {
@@ -3400,8 +3792,8 @@ fn model_path() -> Result<String, BenchError> {
         .ok()
         .filter(|p| !p.is_empty())
         .ok_or_else(|| {
-            "BLOOMERY_REF_MODEL unset — run through tools/box.sh with BLOOMERY_MODEL=deepseek41, \
-             or the just recipes"
+            "BLOOMERY_REF_MODEL unset — run through tools/box.sh with BLOOMERY_MODEL=deepseek41 \
+             or qwen4exp, or the just recipes"
                 .into()
         })
 }
@@ -3409,9 +3801,10 @@ fn model_path() -> Result<String, BenchError> {
 fn run(mode: Mode) -> Result<(), BenchError> {
     let path = model_path()?;
     let split = Split::open(&path)?;
-    let meta = Meta::read(&split)?;
-    let layers = build_layers(&split, &meta)?;
-    print_table(&path, &split, &meta, &layers);
+    let family = Family::of(&split)?;
+    let meta = Meta::read(&split, &family)?;
+    let layers = build_layers(&split, &meta, &family)?;
+    print_table(&path, &split, &meta, &family, &layers);
     let arms: &[Arm] = match &mode {
         Mode::Time(opts) => &opts.arms,
         Mode::Check(arms) => arms,
@@ -3449,11 +3842,18 @@ fn run(mode: Mode) -> Result<(), BenchError> {
     // anonymous memory it fills can evict page-cache pages.
     let r8_layers = if arms.iter().any(|a| a.shape == Shape::UnionR8) {
         (0..layers.len()).collect()
-    } else if matches!(mode, Mode::Check(_)) {
-        covered_layers(&layers)
+    } else if matches!(mode, Mode::Check(_)) && matches!(family, Family::Discovered) {
+        covered_layers(&layers, &family)
     } else {
         Vec::new()
     };
+    if matches!(mode, Mode::Check(_)) && !matches!(family, Family::Discovered) {
+        println!(
+            "v41host unionr8_unionq_check=none family={}: its routed gates and ups are not Q3_K, the \
+             row-lane and column tiles' type",
+            family.name()
+        );
+    }
     let t0 = Instant::now();
     let r8 = repack_r8(&layers, &r8_layers)?;
     if !r8_layers.is_empty() {
@@ -3483,9 +3883,10 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         after as f64 * 100.0 / total as f64
     );
     print_mem()?;
-    let hosts = host_layers(&split, &meta, &layers)?;
+    let hosts = host_layers(&split, &meta, &family, &layers)?;
     let bench = Bench {
         split: &split,
+        family: &family,
         layers,
         hosts,
         r8,
@@ -3499,11 +3900,15 @@ fn run(mode: Mode) -> Result<(), BenchError> {
     match mode {
         Mode::Check(arms) if arms.is_empty() => {
             check(&bench, meta.n_used, true)?;
-            let arms = R8_CHECK_ARMS
+            let default_arms = match &family {
+                Family::Discovered => R8_CHECK_ARMS,
+                Family::Qwen4exp(_) => Q38_CHECK_ARMS,
+            };
+            let arms = default_arms
                 .split(',')
                 .map(|a| Arm::parse(a, None))
                 .collect::<Result<Vec<_>, _>>()?;
-            check_r8_arms(&bench, &arms, &covered_layers(&bench.layers))
+            check_r8_arms(&bench, &arms, &covered_layers(&bench.layers, &family))
         }
         Mode::Check(arms) => {
             check(&bench, meta.n_used, true)?;
