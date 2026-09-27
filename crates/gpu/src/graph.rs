@@ -160,7 +160,8 @@ impl Graph {
 
     /// Every node the capture recorded, in the order `cuGraphGetNodes`
     /// returns them: what an enqueue with more than one graph form (a host
-    /// function with a sync mode, a stream memory operation) became.
+    /// function with a sync mode, a stream memory operation) became, and for
+    /// a kernel node the entry it launches and its geometry.
     pub fn nodes(&self) -> Result<Vec<NodeInfo>, GpuError> {
         let mut handles: Vec<sys::CUgraphNode> = vec![ptr::null_mut(); self.nodes];
         let mut n = self.nodes;
@@ -171,30 +172,101 @@ impl Graph {
         handles.truncate(n);
         handles
             .into_iter()
-            .map(|node| {
-                let mut kind: sys::CUgraphNodeType = 0;
-                // SAFETY: `node` is a handle of this live template.
-                let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
-                cu(rc, "cuGraphNodeGetType")?;
-                let host_sync = if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST {
-                    // SAFETY: all-zero is a valid value of this plain C
-                    // struct (integers, pointers, a nullable function
-                    // pointer), which the driver then fills for `node`.
-                    let mut params: sys::CUgraphNodeParams = unsafe { std::mem::zeroed() };
-                    // SAFETY: `node` is a live host node of this template and
-                    // `params` is a writable struct of the type the call fills.
-                    let rc = unsafe { sys::cuGraphNodeGetParams(node, &mut params) };
-                    cu(rc, "cuGraphNodeGetParams")?;
-                    // SAFETY: for a host node the driver fills the `host`
-                    // member of the union.
-                    Some(unsafe { params.__bindgen_anon_1.host.syncMode })
-                } else {
-                    None
-                };
-                Ok(NodeInfo { kind, host_sync })
-            })
+            // SAFETY: every handle is a node of this template, which lives
+            // as long as `self`.
+            .map(|node| unsafe { node_info(node) })
             .collect()
     }
+}
+
+/// What the driver reports of `node`: its type, a host node's sync mode, and
+/// a kernel node's entry name and geometry. The one reader of these facts:
+/// [`Graph::nodes`] and the gates' template walk both call it.
+///
+/// # Safety
+///
+/// `node` is a node of a live graph template.
+pub unsafe fn node_info(node: sys::CUgraphNode) -> Result<NodeInfo, GpuError> {
+    let mut kind: sys::CUgraphNodeType = 0;
+    // SAFETY: `node` is a node of a live template (the caller's contract).
+    let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
+    cu(rc, "cuGraphNodeGetType")?;
+    let host_sync = if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST {
+        // SAFETY: all-zero is a valid value of this plain C struct
+        // (integers, pointers, a nullable function pointer), which the
+        // driver then fills for `node`.
+        let mut params: sys::CUgraphNodeParams = unsafe { std::mem::zeroed() };
+        // SAFETY: `node` is a live host node and `params` is a writable
+        // struct of the type the call fills.
+        let rc = unsafe { sys::cuGraphNodeGetParams(node, &mut params) };
+        cu(rc, "cuGraphNodeGetParams")?;
+        // SAFETY: for a host node the driver fills the `host` member of the
+        // union.
+        Some(unsafe { params.__bindgen_anon_1.host.syncMode })
+    } else {
+        None
+    };
+    let kernel = if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL {
+        // SAFETY: `node` is a live kernel node (the caller's contract and
+        // the type just read).
+        Some(unsafe { kernel_node(node) }?)
+    } else {
+        None
+    };
+    Ok(NodeInfo {
+        kind,
+        host_sync,
+        kernel,
+    })
+}
+
+/// A kernel node's entry name and geometry. A node whose function the driver
+/// cannot name, or names in bytes that are not UTF-8, is an error by name,
+/// never an empty or lossy name.
+///
+/// # Safety
+///
+/// `node` is a kernel node of a live graph template.
+unsafe fn kernel_node(node: sys::CUgraphNode) -> Result<KernelNode, GpuError> {
+    const WHAT: &str = "Graph::nodes";
+    // SAFETY: all-zero is a valid value of this plain C struct (integers and
+    // nullable pointers), which the call then fills.
+    let mut p: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
+    // SAFETY: `node` is a live kernel node and `p` the struct the call fills.
+    let rc = unsafe { sys::cuGraphKernelNodeGetParams_v2(node, &mut p) };
+    cu(rc, "cuGraphKernelNodeGetParams_v2")?;
+    let mut name: *const std::ffi::c_char = ptr::null();
+    if p.func.is_null() {
+        if p.kern.is_null() {
+            return Err(GpuError::state(WHAT, "a kernel node with no function"));
+        }
+        // SAFETY: the node launches the library kernel `p.kern`, a live
+        // handle; `name` is a local the call writes.
+        let rc = unsafe { sys::cuKernelGetName(&mut name, p.kern) };
+        cu(rc, "cuKernelGetName")?;
+    } else {
+        // SAFETY: the node launches the module function `p.func`, a live
+        // handle; `name` is a local the call writes.
+        let rc = unsafe { sys::cuFuncGetName(&mut name, p.func) };
+        cu(rc, "cuFuncGetName")?;
+    }
+    if name.is_null() {
+        return Err(GpuError::state(
+            WHAT,
+            "a kernel node whose function has no name",
+        ));
+    }
+    // SAFETY: the driver hands back a NUL-terminated name it owns for the
+    // function's lifetime; it is copied out at once.
+    let name = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_str()
+        .map_err(|_| GpuError::state(WHAT, "a kernel entry name that is not UTF-8"))?
+        .to_owned();
+    Ok(KernelNode {
+        name,
+        grid: [p.gridDimX, p.gridDimY, p.gridDimZ],
+        block: [p.blockDimX, p.blockDimY, p.blockDimZ],
+    })
 }
 
 /// `cuGraphLaunch` of `exec` on `stream`, mapped to [`GpuError`].
@@ -458,12 +530,25 @@ impl Drop for HostFlags {
 }
 
 /// One node of a captured graph as the driver reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
     /// The node's `CUgraphNodeType` (kernel, memcpy, host, batch memop, …).
     pub kind: sys::CUgraphNodeType,
     /// For a host node, the `CUhostTaskSyncMode` it carries.
     pub host_sync: Option<u32>,
+    /// For a kernel node, the entry it launches and its geometry.
+    pub kernel: Option<KernelNode>,
+}
+
+/// A kernel node's launch as the driver reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelNode {
+    /// The entry's name (`cuFuncGetName`): the PTX `.entry` the node runs.
+    pub name: String,
+    /// The grid, in blocks: x, y, z.
+    pub grid: [u32; 3],
+    /// The block, in threads: x, y, z.
+    pub block: [u32; 3],
 }
 
 impl Drop for Graph {
@@ -586,6 +671,7 @@ mod tests {
         assert_eq!(nodes.len(), 2, "{nodes:?}");
         assert_eq!(host.len(), 1, "{nodes:?}");
         assert!(host[0].host_sync.is_some(), "{nodes:?}");
+        assert!(nodes.iter().all(|n| n.kernel.is_none()), "{nodes:?}");
         assert!(
             nodes
                 .iter()
@@ -708,6 +794,45 @@ mod tests {
         let mut step = Step::new(&gpu);
         let eager = step.eager(&gpu);
         step.assert_replays(&gpu, &eager, "an eager run");
+    }
+
+    /// `nodes` names each kernel node's entry and geometry in the order the
+    /// launches were enqueued: the two-kernel sequence comes back as the
+    /// quantizer (one block of 32 threads per half super-block of the one
+    /// column) and then the Q4_K gemv (eight rows per block of 256 threads).
+    /// A structure gate that compares launch lists by name reads this order.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_nodes_name_each_kernel_in_enqueue_order() {
+        let gpu = Gpu::new().expect("a Gpu on device 0");
+        let mut step = Step::new(&gpu);
+        let graph = gpu.capture(|_| step.enqueue(&gpu)).expect("the capture");
+        let got: Vec<(String, [u32; 3], [u32; 3])> = graph
+            .nodes()
+            .expect("the node list")
+            .into_iter()
+            .map(|n| {
+                let k = n.kernel.expect("every node of the sequence is a kernel");
+                (k.name, k.grid, k.block)
+            })
+            .collect();
+        let quant_grid = u32::try_from(2 * (K / 256)).expect("fits");
+        let gemv_grid = u32::try_from(ROWS / 8).expect("fits");
+        let want = [
+            (
+                "q3k_quantize_q8_1".to_owned(),
+                [quant_grid, 1, 1],
+                [32, 1, 1],
+            ),
+            ("q4k_gemv".to_owned(), [gemv_grid, 1, 1], [256, 1, 1]),
+        ];
+        assert_eq!(got.len(), want.len(), "node list {got:?}");
+        if let Some(i) = (0..want.len()).find(|&i| got[i] != want[i]) {
+            panic!(
+                "node {i}: expected {:?}, got {:?} (whole list {got:?})",
+                want[i], got[i]
+            );
+        }
     }
 
     /// A capture body that returns `Err` or panics ends the capture it ran
