@@ -76,10 +76,13 @@
 //! ([`HostTier::reset`]), and any other stays until a reload.
 
 pub mod batch;
+pub mod leg;
 pub mod page;
 pub mod residency;
 pub mod slots;
 pub mod step;
+
+pub use leg::StepLeg;
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
