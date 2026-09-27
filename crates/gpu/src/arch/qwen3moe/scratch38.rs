@@ -38,11 +38,37 @@ const _: () = assert!(
         && PASS_ROWS <= stores::PASS_ROWS
 );
 
-/// A layer's store: the delta rule's recurrent state and conv ring, or a
+/// Lanes of a delta store's state: a verify of up to this many rows keeps
+/// the state after each of its rows in a lane of its own
+/// (`linear::delta`'s `gdn_delta_lanes`). `runtime::stores` owns the count.
+pub(super) const LANES: usize = stores::DELTA_LANES;
+
+/// The most rows a verify runs: a row a lane.
+pub(super) const VERIFY_ROWS: usize = LANES;
+
+/// The lane row `j` of a call that reads lane `c` writes in row mode: `(c +
+/// j) mod LANES`.
+#[must_use]
+pub(super) const fn row_lane(c: u32, j: usize) -> u32 {
+    ((c as usize + j) % LANES) as u32
+}
+
+/// The lane word after a verify from lane `c` keeps its first `k` rows
+/// (`k >= 1`): the lane row `k − 1` wrote.
+#[must_use]
+pub(super) const fn kept_lane(c: u32, k: usize) -> u32 {
+    row_lane(c, k - 1)
+}
+
+/// A layer's store: the delta rule's recurrent state ([`LANES`] lanes), its
+/// lanes' stamps (`linear::delta`'s module doc) and conv ring, or a
 /// selecting attention layer's K/V planes with its raw and pooled indexer
 /// keys (`[ctx][IDX_DIM]` and `[pools][IDX_DIM]` f16).
 pub(super) enum Store38 {
-    Rec(RecStore),
+    Rec {
+        rec: RecStore,
+        stamp: DeviceBuffer<u32>,
+    },
     Qsa {
         kv: KvPlanes,
         raw: DeviceBuffer<u16>,
@@ -51,9 +77,22 @@ pub(super) enum Store38 {
 }
 
 impl Store38 {
-    /// A zeroed delta store (one lane).
+    /// A zeroed delta store of [`LANES`] lanes, lane 0 stamped at position
+    /// 0 and every other never written.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
-        Ok(Store38::Rec(RecStore::new(stream, GDN, 1)?))
+        Ok(Store38::Rec {
+            rec: RecStore::new(stream, GDN, LANES)?,
+            stamp: DeviceBuffer::from_host(stream, &fresh_stamps())?,
+        })
+    }
+
+    /// A delta store's stamps back to a fresh store's: lane 0 at position
+    /// 0, every other never written. Never inside a capture.
+    pub(super) fn restamp(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if let Store38::Rec { stamp, .. } = self {
+            stamp.copy_from_host(stream, &fresh_stamps())?;
+        }
+        Ok(())
     }
 
     /// A zeroed selecting store of `ctx` positions over the planes `d` cuts.
@@ -68,19 +107,85 @@ impl Store38 {
     /// Device bytes.
     pub(super) fn bytes(&self) -> usize {
         match self {
-            Store38::Rec(r) => r.bytes(),
+            Store38::Rec { rec, stamp } => rec.bytes() + stamp.num_bytes(),
             Store38::Qsa { kv, raw, pooled } => kv.bytes() + raw.num_bytes() + pooled.num_bytes(),
         }
     }
 }
 
-/// The bytes `runtime::stores` counts for a delta store and for a selecting
-/// store at `ctx` positions: what the load's allocations must equal.
+/// A fresh delta store's stamps: lane 0 holds the zero state of position
+/// 0, every other lane was never written.
+fn fresh_stamps() -> [u32; LANES] {
+    let mut st = [linear::delta::NEVER; LANES];
+    st[0] = 0;
+    st
+}
+
+/// The bytes `runtime::stores` counts for a delta store of [`LANES`] lanes
+/// and for a selecting store at `ctx` positions: what the load's
+/// allocations must equal.
 pub(super) fn store_rule_bytes(ctx: usize) -> (u64, u64) {
     (
-        stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS),
+        stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS)
+            + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES),
         stores::selecting_bytes(geo::N_KV, geo::HEAD, geo::IDX_DIM, geo::POOL, ctx),
     )
+}
+
+/// The lane word every delta launch of a Qwen3.8 walk reads: the lane that
+/// holds the committed state, which only a verify's commit moves
+/// ([`kept_lane`]) and a reset sets back to 0. One device word written by
+/// an asynchronous copy ahead of the launches that read it.
+pub(super) struct LaneWord {
+    word: ManuallyDrop<DeviceBuffer<u32>>,
+    inbox: Inbox,
+    lane: u32,
+}
+
+impl LaneWord {
+    /// Lane 0. Load-time only.
+    pub(super) fn new(stream: &CudaStream) -> Result<LaneWord, GpuError> {
+        let inbox = Inbox::new(stream, 1)?;
+        // SAFETY: word 0 of the inbox's one device word, and the inbox moves
+        // into the struct beside it (a move of the handle, not of the
+        // allocation), where it outlives it.
+        let word = unsafe { param_view::<u32>(inbox.dev(), 0, 1) };
+        Ok(LaneWord {
+            word,
+            inbox,
+            lane: 0,
+        })
+    }
+
+    /// Set the word to `lane` (below [`LANES`], else refused by name) and
+    /// enqueue its copy. Never inside a capture.
+    pub(super) fn set(&mut self, stream: &CudaStream, lane: u32) -> Result<(), GpuError> {
+        if lane as usize >= LANES {
+            return Err(GpuError::shape(
+                "qwen4exp::LaneWord::set",
+                format!("lane {lane} of {LANES}"),
+            ));
+        }
+        self.inbox.host_mut()?[0] = lane;
+        self.inbox.upload(stream, 1)?;
+        self.lane = lane;
+        Ok(())
+    }
+
+    /// The lane the word holds.
+    pub(super) fn lane(&self) -> u32 {
+        self.lane
+    }
+
+    /// The device word.
+    pub(super) fn word(&self) -> &DeviceBuffer<u32> {
+        &self.word
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.inbox.bytes()
+    }
 }
 
 /// The dims the shared scratch types take ([`KvPlanes`]): the planes' heads
@@ -457,5 +562,33 @@ impl PassRecord {
     /// Device bytes.
     pub(super) fn bytes(&self) -> usize {
         self.inbox.bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LANES, kept_lane, row_lane};
+
+    /// A verify from lane `c` writes its rows into `c, c + 1, …` mod
+    /// [`LANES`], every row a lane of its own; keeping `k` rows moves the
+    /// word to the lane row `k − 1` wrote, `(c + k − 1) mod LANES`, and
+    /// keeping them all leaves it on the last row's.
+    #[test]
+    fn a_commit_moves_the_word_to_the_last_kept_row() {
+        for c in 0..LANES as u32 {
+            let lanes: Vec<u32> = (0..LANES).map(|j| row_lane(c, j)).collect();
+            let mut sorted = lanes.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..LANES as u32).collect::<Vec<_>>(), "c {c}");
+            assert_eq!(lanes[0], c, "row 0 overwrites the lane it read");
+            for k in 1..=LANES {
+                assert_eq!(
+                    kept_lane(c, k),
+                    (c + k as u32 - 1) % LANES as u32,
+                    "c {c} k {k}"
+                );
+                assert_eq!(kept_lane(c, k), lanes[k - 1]);
+            }
+        }
     }
 }

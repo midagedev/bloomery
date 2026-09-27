@@ -30,8 +30,10 @@ use crate::placement::{
     Violation,
 };
 
+use runtime::stores::{
+    DELTA_LANES, delta_lane_bytes, kv_row_bytes, ple_ring_bytes, recurrent_bytes, selecting_bytes,
+};
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
-use runtime::stores::{kv_row_bytes, ple_ring_bytes, recurrent_bytes, selecting_bytes};
 
 /// The positions the selector's kernels take: the QSA passes take the
 /// context as a `u32` launch argument and the selected flash reads `u32`
@@ -159,7 +161,9 @@ pub fn machine(card: CardSpec, layers: usize) -> Machine {
 /// - a GDN layer: its recurrent state (`v_heads` heads of `state × state`
 ///   f32) and its conv ring (`conv − 1 + PASS_ROWS` rows of the conv's
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
-///   file;
+///   file; on a qwen4exp file its state keeps
+///   `runtime::stores::DELTA_LANES` lanes, each stamped
+///   (`runtime::stores::delta_lane_bytes`);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim` f16);
@@ -189,7 +193,8 @@ impl KvLayout {
         let exp = hp.exp.as_ref();
         KvLayout {
             kinds: hp.kinds.clone(),
-            recurrent: recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv),
+            recurrent: recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv)
+                + exp.map_or(0, |_| delta_lane_bytes(hp.v_heads, hp.state, DELTA_LANES)),
             ple: exp.and_then(|e| e.ple).map(|p| {
                 (
                     p.layer,
@@ -234,24 +239,26 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, KvBytes, KvLayout, ple_ring_bytes, recurrent_bytes};
+    use super::{
+        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, ple_ring_bytes, recurrent_bytes,
+    };
 
     /// Qwen3.8's layers by kind (the sizes themselves are
-    /// `runtime::stores`'s, pinned there): a GDN layer's state and conv ring,
+    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes and conv ring,
     /// the PLE ring beside it on its layer, an attention layer's K/V, raw and
     /// pooled keys at a context of whole pools and one past.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
-            recurrent: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
             select: Some((128, vec![0, 0, 4])),
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288);
-        assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 696_320);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
+        assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);

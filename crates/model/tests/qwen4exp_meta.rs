@@ -159,19 +159,24 @@ fn hw_qwen4exp_spec() {
 // non-routed tensor but the PLE table on the card in its CardFormat (q8_0 two planes of the file's
 // bytes, f32 as is, bf16 widened to f32), its buffers through a 2 MiB-granule heap in the file's
 // tensor order; the routed stacks, 1,224 − 1,080 = 144 of them, on the host in the file's bytes; the
-// PLE table in the file]. The cache at 4,096 and 32,768 positions: 36 GDN layers of 3,145,728 B of
+// PLE table in the file]. The cache at 4,096 and 32,768 positions: 36 GDN layers of 4 · 3,145,728 + 16 B of
 // state and 11 · 10,240 f32 of conv ring, the PLE ring 17 · 10,240 f32, 12 attention layers of
 // 2,304 B a position and 256 B a pool of four.
 const CARD_DENSE: u64 = 5_544_906_240;
 const CARD_ROUNDING: u64 = 398_422_528;
 const HOST_EXPERTS: u64 = 77_017_907_200;
 const NVME_TABLE: u64 = 28_800_138_240;
-const KV_AT: [(u64, u64); 2] = [(4096, 246_554_624), (32_768, 1_061_298_176)];
+// PIN(2026-09-28): KV_AT and CARD_MAX_CTX past the verify's delta lanes [derived: each GDN layer's
+// state keeps runtime::stores::DELTA_LANES = 4 lanes with a u32 stamp each, 3 · 3,145,728 + 16 =
+// 9,437,200 B past the one lane, 339,739,200 B over the 36 layers; KV_AT was 246,554,624 and
+// 1,061,298,176, CARD_MAX_CTX 1,520,312 and 619,339, each now 339,739,200 / 28,416 = 11,955.9
+// positions lower, rounded to 11,956 (one fewer when the old boundary's slack passed 26,000 B)].
+const KV_AT: [(u64, u64); 2] = [(4096, 586_293_824), (32_768, 1_401_037_376)];
 // The largest context each card holds, as predicted [derived: (usable − margin − the dense
-// granules − context − scratch − 130,162,688 B of recurrent bytes) over 28,416 B a position, the
+// granules − context − scratch − 469,901,888 B of recurrent bytes) over 28,416 B a position, the
 // last pool counted whole]. Printed beside the boundary the test finds from the plan's own totals;
 // the clause holds the placement to that boundary, not to this figure.
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_520_312), ("3090", 619_339)];
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_508_356), ("3090", 607_383)];
 
 /// The plan of the Qwen3.8 file from its headers (`arch::qwen35moe::place`):
 /// `PlanInputs::read` refuses it with the coverage list; `describe` reads

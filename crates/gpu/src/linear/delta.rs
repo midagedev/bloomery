@@ -8,8 +8,21 @@
 //! launch argument, so one captured graph serves every step. With one lane
 //! the call writes the state after its last token back into the lane it
 //! read. A word at or past `lanes` raises [`FaultSite::DeltaLane`] and the
-//! call reads and writes lane `word mod lanes`. More than one lane — a
-//! state per verified token — is not built: the launcher refuses it by name.
+//! call reads and writes lane `word mod lanes`. `gdn_delta` and `kda_delta`
+//! take one lane; the launcher refuses more by name.
+//!
+//! `gdn_delta_lanes` is `gdn_delta` over `lanes` lanes with a stamp a lane —
+//! the position the lane's state stands at, the count of tokens it has
+//! absorbed. It reads lane `c = word mod lanes`; block 0's thread 0 raises
+//! [`FaultSite::DeltaStamp`] when `stamp[c]` is not the call's first
+//! position `pos[0]`, so a lane never written (its stamp [`NEVER`]) or one a
+//! commit did not leave there is never read as a state. In place mode it
+//! writes the state after its last token back into lane `c`, stamped
+//! `pos[0] + m`; in row mode (a verify, `m <= lanes`) it writes the state
+//! after token `j` into lane `(c + j) mod lanes`, stamped `pos[0] + j + 1`,
+//! so a host that keeps `k` of the rows moves the word to `(c + k − 1) mod
+//! lanes` and copies nothing. Each token's `o` and each state are the bits
+//! `gdn_delta` writes: the loop is its loop, the stores placed per row.
 //!
 //! Geometry: a warp owns four value columns of one head, eight lanes per
 //! column; lane `j` of a column holds its [`KEYS_PER_LANE`] keys
@@ -419,6 +432,66 @@ mod delta_kernels {
             );
         }
     }
+
+    /// [`gdn_delta`] over `lanes` lanes with their stamps (module doc): lane
+    /// `lane[lane_at] mod lanes` read, checked against `pos[0]`, and written
+    /// in place (`each == 0`) or token `j` into lane `(c + j) mod lanes`
+    /// (`each != 0`, `m <= lanes`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v,
+            lane.len() >= lane_at + 1,
+            lanes >= 1,
+            pos.len() >= 1,
+            o.len() >= m * n_v * 128,
+            state.len() >= lanes * n_v * 16384,
+            stamp.len() >= lanes
+        )
+    )]
+    pub fn gdn_delta_lanes(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        each: u32,
+        pos: &[u32],
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        mut state: DisjointSlice<f32>,
+        mut stamp: DisjointSlice<u32>,
+    ) {
+        let o = o.as_mut_ptr();
+        let state = state.as_mut_ptr();
+        let stamp = stamp.as_mut_ptr();
+        // SAFETY: the launch contract holds the lengths the body names, the
+        // lane word, `lanes >= 1`, `pos[0]` and `lanes` stamps; `o`, `state`
+        // and `stamp` are this launch's own outputs, the state read and
+        // written by the thread that owns each key and the stamps by block
+        // 0's thread 0 alone (the body's doc); the launcher checks n_k
+        // divides n_v, `m <= lanes` in row mode, the block width and the grid.
+        unsafe {
+            delta_lanes_body(
+                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, pos, fault, o,
+                state, stamp,
+            );
+        }
+    }
 }
 
 /// [`DeltaKernels::enqueue_delta`]'s and [`DeltaKernels::enqueue_kda_delta`]'s
@@ -702,6 +775,267 @@ fn delta_rule_host<const DECAY: u32>(
         }
     });
     DeltaOut { o, state }
+}
+
+/// The stamp of a lane no call has written: no position a call starts at,
+/// so reading the lane raises [`FaultSite::DeltaStamp`].
+pub const NEVER: u32 = u32::MAX;
+
+/// The loop of one block of `gdn_delta_lanes` (module doc): [`delta_body`]'s
+/// loop for [`DECAY_HEAD`] over lane `c = lane[lane_at] mod lanes`, with the
+/// stamp check and writes on block 0's thread 0 and the state stored per
+/// row (`each != 0`) or once after the last token.
+///
+/// # Safety
+///
+/// [`delta_body`]'s contract for [`DECAY_HEAD`], and `pos` holds a word,
+/// `stamp` addresses `lanes` writable u32s no other launch touches, and
+/// `m <= lanes` when `each != 0`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the kernel entry's arguments, forwarded flat"
+)]
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn delta_lanes_body(
+    qkv: &[f32],
+    beta: &[f32],
+    decay: &[f32],
+    lane_word: &[u32],
+    lane_at: u32,
+    lanes: u32,
+    n_k: u32,
+    n_v: u32,
+    grouped: u32,
+    m: u32,
+    each: u32,
+    pos: &[u32],
+    fault: FaultSink,
+    o: *mut f32,
+    state: *mut f32,
+    stamp: *mut u32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let lane = tid % 32;
+    let j = lane % LANES_PER_COLUMN;
+    let b = thread::blockIdx_x() as usize;
+    let blocks_per_head = HEAD / COLUMNS_PER_BLOCK;
+    let h = b / blocks_per_head;
+    let (n_k, n_v, m) = (n_k as usize, n_v as usize, m as usize);
+    // SAFETY: lane_at < lane_word.len() and pos holds a word, by the
+    // contract.
+    let (word, p0) = unsafe {
+        (
+            *lane_word.get_unchecked(lane_at as usize),
+            *pos.get_unchecked(0),
+        )
+    };
+    if word >= lanes && tid == 0 {
+        fault.raise(FaultSite::DeltaLane);
+    }
+    let c = word % lanes;
+    if b == 0 && tid == 0 {
+        // SAFETY: c < lanes and every (c + t) mod lanes < lanes: inside the
+        // `lanes` stamps; block 0's thread 0 is their only reader and writer
+        // in the launch, and it reads stamp c before it writes any.
+        unsafe {
+            if *stamp.add(c as usize) != p0 {
+                fault.raise(FaultSite::DeltaStamp);
+            }
+            if each != 0 {
+                let mut t = 0u32;
+                while (t as usize) < m {
+                    *stamp.add(((c + t) % lanes) as usize) = p0.wrapping_add(t + 1);
+                    t += 1;
+                }
+            } else {
+                *stamp.add(c as usize) = p0.wrapping_add(m as u32);
+            }
+        }
+    }
+    if h >= n_v {
+        return; // block-uniform
+    }
+    let col = (b % blocks_per_head) * COLUMNS_PER_BLOCK + (tid / 32) * 4 + lane / LANES_PER_COLUMN;
+    let kh = if grouped != 0 {
+        h / (n_v / n_k)
+    } else {
+        h % n_k
+    };
+    let ch = (2 * n_k + n_v) * HEAD;
+    let q_at = kh * HEAD;
+    let k_at = (n_k + kh) * HEAD;
+    let v_at = 2 * n_k * HEAD + h * HEAD + col;
+    let lane_len = n_v * HEAD * HEAD;
+    let col_at = (h * HEAD + col) * HEAD;
+    let s_at = c as usize * lane_len + col_at;
+
+    // SAFETY: as in `delta_body`: the rows read are inside qkv and the
+    // column inside lane c of the state (`c < lanes`), 16-byte aligned; the
+    // state is read before this thread writes its keys of any lane, and no
+    // other thread touches them.
+    let (qkv_g, state_g) = (global_addr(qkv.as_ptr()), global_addr(state.cast_const()));
+    // SAFETY: s_at + HEAD <= lanes·n_v·HEAD·HEAD, the column inside state.
+    let mut s = unsafe { lane_keys::<false>(state_g + 4 * s_at as u64, j) };
+    let mut raised = false;
+    let mut t = 0usize;
+    while t < m {
+        let row = t * ch;
+        // SAFETY: whole heads inside qkv, as in `delta_body`.
+        let (k, q) = unsafe {
+            (
+                lane_keys::<true>(qkv_g + 4 * (row + k_at) as u64, j),
+                lane_keys::<true>(qkv_g + 4 * (row + q_at) as u64, j),
+            )
+        };
+        // SAFETY: row + v_at < m·ch; t·n_v + h < m·n_v <= the lengths of
+        // beta and decay.
+        let (vt, bt, dh) = unsafe {
+            (
+                *qkv.get_unchecked(row + v_at),
+                *beta.get_unchecked(t * n_v + h),
+                *decay.get_unchecked(t * n_v + h),
+            )
+        };
+        for i in 0..KEYS_PER_LANE {
+            cuda_device::thread::__unroll_config::<0>();
+            s[i] = mul_rn_f32(s[i], dh);
+        }
+        let kv = column_sum(lane_dot(s, k));
+        let u = mul_rn_f32(vt - kv, bt);
+        for i in 0..KEYS_PER_LANE {
+            cuda_device::thread::__unroll_config::<0>();
+            s[i] = fma_rn_f32(k[i], u, s[i]);
+        }
+        let y = column_sum(lane_dot(s, q));
+        if !y.is_finite() && !raised {
+            fault.raise(FaultSite::LinearDelta);
+            raised = true;
+        }
+        if j == 0 {
+            // SAFETY: (t·n_v + h)·HEAD + col < m·n_v·HEAD, inside `o`; one
+            // lane per (token, column).
+            unsafe { *o.add((t * n_v + h) * HEAD + col) = y };
+        }
+        if each != 0 {
+            let at = ((c as usize + t) % lanes as usize) * lane_len + col_at;
+            for i in 0..KEYS_PER_LANE {
+                cuda_device::thread::__unroll_config::<0>();
+                // SAFETY: lane (c + t) mod lanes < lanes, so this lane's
+                // sixteen keys of the column are inside state; this thread
+                // is their only writer.
+                unsafe { *state.add(at + key_of(j, i)) = s[i] };
+            }
+        }
+        t += 1;
+    }
+    if each == 0 {
+        for i in 0..KEYS_PER_LANE {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: the sixteen keys this lane read from lane c above.
+            unsafe { *state.add(s_at + key_of(j, i)) = s[i] };
+        }
+    }
+}
+
+/// [`DeltaKernels::enqueue_delta_lanes`]'s arguments: [`DeltaArgs`] over
+/// `lanes` lanes (one decay per value head), the row mode, the call's
+/// positions (`pos[0]` its first) and the store's `lanes` stamps.
+pub struct DeltaLanesArgs<'a> {
+    pub delta: DeltaArgs<'a>,
+    /// Row mode: the state after token `j` into lane `(c + j) mod lanes`;
+    /// else the last token's back into lane `c`.
+    pub each: bool,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub stamp: &'a mut DeviceBuffer<u32>,
+}
+
+impl DeltaKernels {
+    /// Enqueue `gdn_delta_lanes` (module doc): `8·n_v` blocks of 128
+    /// threads. Refused by name: no lane, row mode over more tokens than
+    /// lanes, a slice shorter than the launch reads. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_delta_lanes(
+        &self,
+        stream: &CudaStream,
+        args: DeltaLanesArgs<'_>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_delta_lanes";
+        let DeltaLanesArgs {
+            delta:
+                DeltaArgs {
+                    qkv,
+                    beta,
+                    decay,
+                    lane,
+                    lane_at,
+                    lanes,
+                    shape,
+                    m,
+                    fault,
+                    o,
+                    state,
+                },
+            each,
+            pos,
+            stamp,
+        } = args;
+        shape.check(WHAT)?;
+        if m == 0 || lanes == 0 || (each && m > lanes) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "m={m} over {lanes} lanes{}: a call takes one token or more and a lane or \
+                     more, and row mode at most a token a lane",
+                    if each { " in row mode" } else { "" }
+                ),
+            ));
+        }
+        let nv = shape.n_v;
+        let lens = [
+            ("qkv", qkv.len(), m * shape.channels()),
+            ("beta", beta.len(), m * nv),
+            ("decay", decay.len(), m * nv),
+            ("lane", lane.len(), lane_at + 1),
+            ("pos", pos.len(), 1),
+            ("o", o.len(), m * nv * HEAD),
+            ("state", state.len(), lanes * shape.state_len()),
+            ("stamp", stamp.len(), lanes),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(WHAT, "grid", nv * (HEAD / COLUMNS_PER_BLOCK))?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let prep = self.module.prepare_gdn_delta_lanes(cfg)?;
+        self.module.gdn_delta_lanes(
+            stream,
+            &prep,
+            qkv,
+            beta,
+            decay,
+            lane,
+            launch_u32(WHAT, "lane_at", lane_at)?,
+            launch_u32(WHAT, "lanes", lanes)?,
+            launch_u32(WHAT, "n_k", shape.n_k)?,
+            launch_u32(WHAT, "n_v", nv)?,
+            shape.map.code(),
+            launch_u32(WHAT, "m", m)?,
+            u32::from(each),
+            pos,
+            fault,
+            o,
+            state,
+            stamp,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

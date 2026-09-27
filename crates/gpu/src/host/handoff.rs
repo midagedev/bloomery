@@ -13,6 +13,8 @@
 //! for 6 (DeepSeek-V4.1), `_8` (GLM-5.3-Flash) and `_10` (Qwen3.8), the last
 //! two over one body ([`handoff_at`]) — and the launcher picks the entry from
 //! the page's slot count ([`HandoffSlots::of`]), refusing any other by name.
+//! `ds41_ffn_handoff_10_cols` writes a row of several columns of ten slots in
+//! one launch ([`HandoffKernels::enqueue_handoff_cols`]).
 
 use std::fmt;
 use std::sync::Arc;
@@ -318,6 +320,107 @@ mod handoff_kernels {
         // SLOTS_10 slots; thread d is the launch's only thread at d.
         unsafe { handoff_at::<SLOTS_10>(&a, d, &mut image, &mut sel) };
     }
+
+    /// The handoff of `m` columns of ten slots in one launch: one thread per
+    /// value `d < m·n` of the columns' activations, which copies `x[d]` to
+    /// the image's word `x_at + d`; thread `d` of column `c = d / n` whose
+    /// value `e = d % n` is below ten also copies column `c`'s slot `e` —
+    /// the router's word `c·pitch + e` — to words `ids_at + 10·c + e` and
+    /// `wts_at + 10·c + e` and writes `sel[10·c + e]`, the id's place or
+    /// [`HOST`] with [`FaultSite::ExpertId`] raised for an id not below
+    /// `n_expert`. Thread 0 copies the region's sequence word to `seq_at`.
+    /// Each column's words are what [`ds41_ffn_handoff_10`] writes for it
+    /// alone at those offsets. The go that follows orders every write here
+    /// before its generation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            m >= 1,
+            pitch >= 10,
+            ids_in.len() >= m * pitch,
+            w_in.len() >= m * pitch,
+            map.len() >= row_off + n_expert,
+            x.len() >= m * n,
+            seq.len() >= 1,
+            n >= 10,
+            ids_at >= seq_at + 1,
+            wts_at >= ids_at + m * 10,
+            x_at >= wts_at + m * 10,
+            image.len() >= x_at + m * n,
+            sel.len() >= m * 10
+        )
+    )]
+    pub fn ds41_ffn_handoff_10_cols(
+        ids_in: &[u32],
+        w_in: &[f32],
+        pitch: u32,
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        x: &[f32],
+        seq: &[u32],
+        n: u32,
+        m: u32,
+        seq_at: u32,
+        ids_at: u32,
+        wts_at: u32,
+        x_at: u32,
+        fault: FaultSink,
+        mut image: DisjointSlice<u32>,
+        mut sel: DisjointSlice<u32>,
+    ) {
+        let d = thread::index_1d().get();
+        let (n, m) = (n as usize, m as usize);
+        if d >= m * n {
+            return;
+        }
+        // SAFETY: d < m·n <= x.len(), and x_at + d < x_at + m·n <=
+        // image.len(), by the launch contract; the image's words past x_at
+        // are the activations' alone, and thread d is word x_at + d's only
+        // writer.
+        unsafe {
+            *image.get_unchecked_mut(x_at as usize + d) = (*x.get_unchecked(d)).to_bits();
+        }
+        let (c, e) = (d / n, d % n);
+        if e < SLOTS_10 {
+            let at = c * pitch as usize + e;
+            // SAFETY: c < m and e < 10 <= pitch, so at < m·pitch <=
+            // ids_in.len() and w_in.len() by the launch contract.
+            let (id, w) = unsafe { (*ids_in.get_unchecked(at), *w_in.get_unchecked(at)) };
+            let place = if id < n_expert {
+                // SAFETY: id < n_expert, so row_off + id < map.len() by the
+                // launch contract.
+                unsafe { *map.get_unchecked(row_off as usize + id as usize) }
+            } else {
+                fault.raise(FaultSite::ExpertId);
+                HOST
+            };
+            let k = SLOTS_10 * c + e;
+            // SAFETY: k < 10·m <= sel.len(); ids_at + k and wts_at + k lie
+            // in the routing's two spans of 10·m words, which the contract
+            // keeps apart from each other, from seq_at and from the
+            // activations, all inside the image; thread d is the only one
+            // at (c, e), so each word's only writer.
+            unsafe {
+                *image.get_unchecked_mut(ids_at as usize + k) = id;
+                *image.get_unchecked_mut(wts_at as usize + k) = w.to_bits();
+                *sel.get_unchecked_mut(k) = place;
+            }
+        }
+        if d == 0 {
+            // SAFETY: seq.len() >= 1, and seq_at < ids_at is inside the image
+            // and no other span's word, by the launch contract; thread 0 alone
+            // writes it.
+            unsafe { *image.get_unchecked_mut(seq_at as usize) = *seq.get_unchecked(0) };
+        }
+    }
 }
 
 /// What a handoff entry of `N` slots reads ([`handoff_at`]): its arguments
@@ -525,6 +628,70 @@ impl HandoffKernels {
                 )?;
             }
         }
+        Ok(())
+    }
+}
+
+impl HandoffKernels {
+    /// Enqueue the handoff of `m` columns of ten slots in one launch
+    /// (`ds41_ffn_handoff_10_cols`): column `c`'s routing — `h`'s ids and
+    /// weights from word `c·pitch`, `pitch` words a column — and its
+    /// activation, `target.x`'s values `c·hidden ..`, into `target`'s image
+    /// at the layout's offsets plus `c·n_used` and `c·hidden`, the region's
+    /// sequence word, and each slot's place into `sel` (`10·m`). A layout of
+    /// another slot count, `m` of 0, and a pitch under ten are refused by
+    /// name. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's routing, its pitch and width, the target, the sink and the places"
+    )]
+    pub fn enqueue_handoff_cols(
+        &self,
+        stream: &CudaStream,
+        h: &Handoff<'_>,
+        pitch: usize,
+        m: usize,
+        target: HandoffTarget<'_>,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "ds41_ffn_handoff_10_cols";
+        let lay = target.layout;
+        if HandoffSlots::of(lay.n_used) != Ok(HandoffSlots::Ten) || m == 0 || pitch < SLOTS_10 {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "{} slots a column, {m} columns, a pitch of {pitch}: the entry is built for \
+                     ten slots, one column or more, a pitch of at least ten",
+                    lay.n_used
+                ),
+            });
+        }
+        let n = lay.hidden;
+        let grid = launch_u32(WHAT, "grid", (m * n).div_ceil(HANDOFF_THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
+        let prep = self.module.prepare_ds41_ffn_handoff_10_cols(cfg)?;
+        self.module.ds41_ffn_handoff_10_cols(
+            stream,
+            &prep,
+            h.ids,
+            h.weights,
+            launch_u32(WHAT, "pitch", pitch)?,
+            h.map,
+            launch_u32(WHAT, "row_off", h.row_off)?,
+            launch_u32(WHAT, "n_expert", h.n_expert)?,
+            target.x,
+            target.seq,
+            launch_u32(WHAT, "n", n)?,
+            launch_u32(WHAT, "m", m)?,
+            launch_u32(WHAT, "seq_at", lay.seq)?,
+            launch_u32(WHAT, "ids_at", lay.ids)?,
+            launch_u32(WHAT, "wts_at", lay.weights)?,
+            launch_u32(WHAT, "x_at", lay.x)?,
+            fault,
+            target.image,
+            sel,
+        )?;
         Ok(())
     }
 }

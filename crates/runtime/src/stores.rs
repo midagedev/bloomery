@@ -9,6 +9,8 @@
 pub const F16_BYTES: u64 = 2;
 /// Bytes of an f32 value.
 pub const F32_BYTES: u64 = 4;
+/// Bytes of a u32 word.
+pub const U32_BYTES: u64 = 4;
 
 /// The widest call a later call may roll back into, in positions: a ring
 /// keeps its conv's reach plus this many inputs, so a cut anywhere inside a
@@ -58,6 +60,27 @@ pub const fn recurrent_bytes(v_heads: usize, k_heads: usize, state: usize, conv:
     v * d * d * F32_BYTES + conv_ring_rows(conv) as u64 * channels * F32_BYTES
 }
 
+/// Lanes of a gated-delta-rule layer's state on a model that verifies
+/// drafted rows (Qwen3.8's `Body38`): a verify of up to this many rows keeps
+/// the state after each of its rows in a lane of its own, and a commit moves
+/// the lane word instead of copying.
+pub const DELTA_LANES: usize = 4;
+
+/// Bytes a gated-delta-rule layer holds past [`recurrent_bytes`]' one state
+/// lane when it keeps `lanes` lanes (at least one) over `v_heads` value
+/// heads of `state × state` f32: the other `lanes − 1` lanes and a u32
+/// stamp a lane (the position the lane's state stands at).
+///
+/// # Panics
+///
+/// On no lane, by name.
+#[must_use]
+pub const fn delta_lane_bytes(v_heads: usize, state: usize, lanes: usize) -> u64 {
+    assert!(lanes >= 1, "delta_lane_bytes: a state of at least one lane");
+    let (v, d, l) = (v_heads as u64, state as u64, lanes as u64);
+    (l - 1) * v * d * d * F32_BYTES + l * U32_BYTES
+}
+
 /// A PLE conv ring of `taps` taps `dilation` apart over `streams` streams
 /// of `n_embd` values, in bytes (f32).
 #[must_use]
@@ -90,8 +113,8 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        conv_ring_rows, kv_row_bytes, ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes,
-        selecting_bytes,
+        DELTA_LANES, conv_ring_rows, delta_lane_bytes, kv_row_bytes, ple_ring_bytes, ple_ring_rows,
+        pooled_rows, recurrent_bytes, selecting_bytes,
     };
 
     /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32 and
@@ -114,6 +137,25 @@ mod tests {
             selecting_bytes(2, 256, 128, 4, 4097),
             4097 * 2304 + 1025 * 256
         );
+    }
+
+    /// Qwen3.8's lanes: past the one lane `recurrent_bytes` counts, three
+    /// more lanes of 48 heads of 128 × 128 f32 and four u32 stamps; one lane
+    /// adds only its stamp.
+    #[test]
+    fn qwen38_lanes() {
+        assert_eq!(DELTA_LANES, 4);
+        assert_eq!(
+            delta_lane_bytes(48, 128, DELTA_LANES),
+            3 * 3_145_728 + 4 * 4
+        );
+        assert_eq!(delta_lane_bytes(48, 128, 1), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "delta_lane_bytes: a state of at least one lane")]
+    fn a_state_of_no_lane_is_refused() {
+        let _ = delta_lane_bytes(48, 128, std::hint::black_box(0));
     }
 
     /// A conv of no tap has no reach: both ring sizes refuse it by name

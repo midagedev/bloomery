@@ -21,6 +21,20 @@
 //! eager passes of up to eight positions through the batch port
 //! ([`Prompt38::Pass`]) — each row bit for bit its step.
 //!
+//! A verify ([`Rows`]) runs 2 to [`VERIFY_ROWS`] consecutive positions as
+//! one captured pass through the step port's `Cols` chain into one head of
+//! its rows, each row bit for bit its step, and stands the model that many
+//! positions on until its commit ([`Rollback`], `GpuModel::rollback` to the
+//! first position not kept) keeps the first `k`: every delta layer's state
+//! after each row is in a lane of its own, so the commit moves the lane
+//! word to row `k − 1`'s ([`kept_lane`]) and copies nothing; the PLE hash's
+//! history is replayed over the kept rows. Every other store is by
+//! position, and nothing reads a row past the count: a pooled key a
+//! rejected row completed is read only at a count that completes it again,
+//! and the row at that count writes it before its select reads it. A step,
+//! a pass or a verify is refused by name while a verify waits for its
+//! commit.
+//!
 //! The PLE rows are the host's: each position's n-gram hash
 //! (`engram::Hash::ple_rows_into`) names 16 rows of the IQ4_NL table, which
 //! stays in the file; they are decoded (`gguf::quant::dequant_row`) into the
@@ -29,14 +43,20 @@
 //! next is refused by name, and `reset` starts a new one.
 
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
-use super::program38::{Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, step_launches};
-use super::scratch::{LANE, RopeRows, StepParams, f32_view};
-use super::scratch38::{Arena38, PASS_ROWS, PassRecord, Store38, Taps38, dims, store_rule_bytes};
+use super::program38::{
+    Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
+    verify_launches,
+};
+use super::scratch::{Io, LANE, RopeRows, StepParams, f32_view};
+use super::scratch38::{
+    Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, dims, kept_lane,
+    store_rule_bytes,
+};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
-use crate::model::{ChainBody, GpuModel, HostServed};
+use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
@@ -229,6 +249,23 @@ impl PleHost {
         Ok(())
     }
 
+    /// The history a verify's `fill` moved past its rows, moved instead
+    /// from `before` (the history as it stood before that fill) past the
+    /// `kept` rows from position `pos`: the history a fill of those rows
+    /// alone leaves.
+    fn keep(&mut self, before: History, pos: u32, kept: &[u32]) -> Result<(), GpuError> {
+        let per_token = geo::HIDDEN / self.width;
+        let ids = self.ids.get_mut(..kept.len() * per_token).ok_or_else(|| {
+            GpuError::shape(WHAT, format!("{} PLE positions at once", kept.len()))
+        })?;
+        let mut hist = before;
+        self.hash
+            .ple_rows_into(&mut hist, u64::from(pos), kept, ids)
+            .map_err(|e| GpuError::shape(WHAT, format!("PLE rows at position {pos}: {e}")))?;
+        self.hist = hist;
+        Ok(())
+    }
+
     /// A new sequence's history.
     fn restart(&mut self) -> Result<(), GpuError> {
         self.hist = self
@@ -304,6 +341,14 @@ pub struct RouteTap {
     pub ids: Vec<u32>,
 }
 
+/// A verify that waits for its commit: its first position, its tokens, and
+/// the PLE history as it stood before them.
+struct Pending38 {
+    pos0: u32,
+    tokens: Vec<u32>,
+    hist: History,
+}
+
 /// One step's host values: its token and position.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeInput38 {
@@ -330,6 +375,10 @@ pub struct Body38 {
     k: Kernels38,
     /// The slot map's card copy: every place the host's.
     slots: DeviceTensor<u32>,
+    /// The lane word every delta launch reads, and the verify waiting for
+    /// its commit.
+    lane: LaneWord,
+    pending: Option<Pending38>,
     /// Each layer's streams after it and its route, when a gate armed them.
     taps: Option<Taps38>,
     eps: f32,
@@ -496,7 +545,7 @@ impl Body38 {
         let run = 0..n;
         let map = SlotMap::prefix(run.clone(), geo::EXPERTS, 0)?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), n, geo::EXPERTS)?;
-        let boundary = Boundary::with_rows(
+        let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
             BoundaryShape {
@@ -504,6 +553,7 @@ impl Body38 {
                 n_used: geo::N_USED,
             },
             1,
+            VERIFY_ROWS,
         )?;
         let file = Arc::new(file);
         let widths = HostWidths {
@@ -534,6 +584,8 @@ impl Body38 {
             pass_hsum,
             k: Kernels38::load(gpu)?,
             slots,
+            lane: LaneWord::new(stream)?,
+            pending: None,
             taps: None,
             eps: spec.rms_eps,
             vocab: spec.vocab as usize,
@@ -645,7 +697,8 @@ impl Body38 {
     }
 
     /// Every layer's store and the PLE ring, read back: what a run leaves
-    /// behind, for a gate to compare bit for bit. Blocking.
+    /// behind, for a gate to compare bit for bit — a delta store's state as
+    /// the committed lane holds it. Blocking.
     pub fn stores_host(&self, gpu: &Gpu) -> Result<(Vec<Store38Host>, Vec<f32>), GpuError> {
         let stream = gpu.stream();
         let stores = self
@@ -653,9 +706,9 @@ impl Body38 {
             .iter()
             .map(|s| {
                 Ok(match s {
-                    Store38::Rec(r) => Store38Host::Rec {
-                        state: r.state.to_host_vec(stream)?,
-                        ring: r.ring.to_host_vec(stream)?,
+                    Store38::Rec { rec, .. } => Store38Host::Rec {
+                        state: lane_of(rec.state.to_host_vec(stream)?, self.lane.lane())?,
+                        ring: rec.ring.to_host_vec(stream)?,
                     },
                     Store38::Qsa { kv, raw, pooled } => Store38Host::Qsa {
                         k: kv.k.to_host_vec(stream)?,
@@ -685,9 +738,57 @@ impl Body38 {
         Ok(())
     }
 
-    /// The step's position `pos` is the next one and inside the stores, else
-    /// refused by name.
+    /// Every selecting store's pooled keys from pool `from` on set to
+    /// `bits`, an f16 pattern: a gate's stand-in for pools a rejected row
+    /// left past the count, which no select may read before the row that
+    /// completes them writes them again. Synchronizes; gate use.
+    pub fn poison_pools_from(&mut self, gpu: &Gpu, from: usize, bits: u16) -> Result<(), GpuError> {
+        let stream = gpu.stream();
+        for s in &mut self.stores {
+            if let Store38::Qsa { pooled, .. } = s {
+                let mut rows = pooled.to_host_vec(stream)?;
+                let at = (from * crate::qsa::DIM).min(rows.len());
+                rows[at..].fill(bits);
+                pooled.copy_from_host(stream, &rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The lane the lane word holds: the committed delta state's.
+    #[must_use]
+    pub fn lane(&self) -> u32 {
+        self.lane.lane()
+    }
+
+    /// The lane word set to `lane` with no verify behind it — a gate's
+    /// stand-in for a commit that moved the word to a lane no call wrote:
+    /// the next launch that reads it raises the stamp's fault. Gate use.
+    pub fn plant_lane(&mut self, gpu: &Gpu, lane: u32) -> Result<(), GpuError> {
+        self.lane.set(gpu.stream(), lane)
+    }
+
+    /// The captured verify's launches at `m` rows ([`super::program38`]'s
+    /// count).
+    #[must_use]
+    pub fn verify_launches(&self, m: usize) -> usize {
+        verify_launches(&self.plans, m)
+    }
+
+    /// The step's position `pos` is the next one and inside the stores, and
+    /// no verify waits for its commit, else refused by name.
     fn check_next(&self, pos: u32, n: usize) -> Result<(), GpuError> {
+        if let Some(p) = &self.pending {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{n} positions from {pos} while the verify of {} rows at {} waits for its \
+                     commit (GpuModel::rollback to the first position not kept)",
+                    p.tokens.len(),
+                    p.pos0
+                ),
+            ));
+        }
         let end = pos as usize + n;
         if pos != self.fed || end > self.ctx {
             return Err(GpuError::shape(
@@ -735,7 +836,10 @@ impl Body38 {
                 format!("a pass of {m} rows on an arena of {}", self.a.rows),
             ));
         }
-        let io = self.rp.io(m)?;
+        let io = Io {
+            lane: Some(self.lane.word()),
+            ..self.rp.io(m)?
+        };
         let Body38 {
             hybrid,
             plans,
@@ -769,6 +873,7 @@ impl Body38 {
                 cur: 0,
                 taps: None,
                 slots,
+                each: false,
             },
         };
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, PASS_ROWS);
@@ -877,7 +982,10 @@ impl ChainBody for Body38 {
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        let io = self.sp.io();
+        let io = Io {
+            lane: Some(self.lane.word()),
+            ..self.sp.io()
+        };
         let Body38 {
             hybrid,
             plans,
@@ -911,6 +1019,7 @@ impl ChainBody for Body38 {
                 cur: 0,
                 taps: taps.as_mut(),
                 slots,
+                each: false,
             },
             head,
         };
@@ -918,11 +1027,12 @@ impl ChainBody for Body38 {
         prog.walk(&mut leg)
     }
 
-    /// Every delta store and the PLE ring back to zero, a new PLE history,
-    /// the record's lane word to [`LANE`], after the host tier's reset. The
-    /// K/V planes and the raw and pooled keys need nothing: nothing reads a
-    /// row at or past a live count, and every row below it is written by its
-    /// own step first. Synchronizes.
+    /// Every delta store's lanes and the PLE ring back to zero, every lane's
+    /// stamp to a fresh store's, the lane word to 0, a new PLE history, no
+    /// verify waiting, after the host tier's reset. The K/V planes and the
+    /// raw and pooled keys need nothing: nothing reads a row at or past a
+    /// live count, and every row below it is written by its own step first.
+    /// Synchronizes.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         self.hybrid.reset(stream)?;
@@ -930,17 +1040,20 @@ impl ChainBody for Body38 {
             .stores
             .iter()
             .map(|s| match s {
-                Store38::Rec(r) => r.state.len().max(r.ring.len()),
+                Store38::Rec { rec, .. } => rec.state.len().max(rec.ring.len()),
                 Store38::Qsa { .. } => 0,
             })
             .max()
             .unwrap_or(0);
         let zeros = vec![0.0f32; most];
         for s in &mut self.stores {
-            if let Store38::Rec(r) = s {
-                r.clear(stream, &zeros)?;
+            if let Store38::Rec { rec, .. } = s {
+                rec.clear(stream, &zeros)?;
             }
+            s.restamp(stream)?;
         }
+        self.lane.set(stream, 0)?;
+        self.pending = None;
         self.k
             .ple
             .reset_ring(stream, &mut self.ple_ring, geo::STREAMS)?;
@@ -970,6 +1083,7 @@ impl ChainBody for Body38 {
             + self.rp.bytes()
             + self.pass_hsum.num_bytes()
             + self.slots.buf().num_bytes()
+            + self.lane.bytes()
             + self.hybrid.boundary().device_bytes()
             + self.taps.as_ref().map_or(0, Taps38::bytes)
     }
@@ -997,7 +1111,221 @@ impl HostServed for Body38 {
     }
 }
 
+impl Body38 {
+    /// Plan a verify of `tokens` (2..=[`VERIFY_ROWS`]) at `pos`, the next
+    /// position: the ids checked as a prompt's are, the PLE rows, the record
+    /// and the rows' copy to the pass arena, and the verify left waiting for
+    /// its commit. Refused by name before anything moves: another row count, the
+    /// taps armed, a verify already waiting, a position other than the next
+    /// or past the stores, an id the embedding or the PLE hash does not take.
+    fn plan_verify(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        const WHAT_V: &str = "qwen4exp verify";
+        let n = tokens.len();
+        if !(2..=VERIFY_ROWS).contains(&n) {
+            return Err(GpuError::shape(
+                WHAT_V,
+                format!("a verify of {n} rows; the lanes hold 2..={VERIFY_ROWS}"),
+            ));
+        }
+        if self.taps.is_some() {
+            return Err(GpuError::state(
+                WHAT_V,
+                "layer taps off (a verify writes none)",
+            ));
+        }
+        self.check_next(pos, n)?;
+        super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
+        ple_takes(WHAT_V, self.ple.hash.window(), tokens)?;
+        let before = self.ple.hist.clone();
+        self.ple.fill(pos, tokens)?;
+        self.rp.write(stream, tokens, pos)?;
+        // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
+        // `n <= VERIFY_ROWS <= PASS_ROWS`, and `e` stays in place while the
+        // window lives (one synchronous copy).
+        let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
+        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.fed += launch_u32(WHAT_V, "positions", n)?;
+        self.pending = Some(Pending38 {
+            pos0: pos,
+            tokens: tokens.to_vec(),
+            hist: before,
+        });
+        Ok(())
+    }
+
+    /// Enqueue the planned verify of `head.m()` rows through the step port
+    /// into `head`, one head of the verify's rows. An eager verify needs its
+    /// plan; a capture records the launches only.
+    fn walk_verify(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        const WHAT_V: &str = "qwen4exp verify";
+        let m = head.m();
+        let planned = self.pending.as_ref().map(|p| p.tokens.len());
+        if planned != Some(m) && !crate::capturing(gpu.stream())? {
+            return Err(GpuError::state(
+                WHAT_V,
+                "a verify planned for this head's rows (plan_rows before the pass)",
+            ));
+        }
+        let io = Io {
+            lane: Some(self.lane.word()),
+            ..self.rp.io(m)?
+        };
+        let Body38 {
+            hybrid,
+            plans,
+            stores,
+            ple_ring,
+            rope,
+            a,
+            k,
+            slots,
+            eps,
+            ctx,
+            ..
+        } = self;
+        let prog = Verify38 {
+            p: Parts38 {
+                c: Ctx38 {
+                    gpu,
+                    w,
+                    k,
+                    eps: *eps,
+                    table: &rope.table,
+                    ctx: *ctx,
+                },
+                plans,
+                stores,
+                ple_ring,
+                s: a,
+                io: &io,
+                m,
+                cur: 0,
+                taps: None,
+                slots,
+                each: true,
+            },
+            head,
+        };
+        let mut leg = StepLeg::new(gpu.stream(), hybrid);
+        prog.walk(&mut leg)
+    }
+
+    /// Keep the first `pos − pos0` rows of the verify waiting for its commit
+    /// and take the rest back: the lane word to the last kept row's lane
+    /// ([`kept_lane`]), the PLE history over the kept rows. With no
+    /// verify waiting only the position the body stands at is taken; any
+    /// other, and a count outside the verify's rows, is refused by name.
+    fn commit(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
+        const WHAT_C: &str = "qwen4exp commit";
+        let Some(p) = self.pending.take() else {
+            if pos == self.fed {
+                return Ok(());
+            }
+            return Err(GpuError::shape(
+                WHAT_C,
+                format!(
+                    "back to position {pos} from {} with no verify waiting: a delta layer keeps \
+                     no state for an earlier position",
+                    self.fed
+                ),
+            ));
+        };
+        let rows = p.tokens.len();
+        let kept = pos
+            .checked_sub(p.pos0)
+            .map(|k| k as usize)
+            .filter(|k| (1..=rows).contains(k));
+        let Some(kept) = kept else {
+            let e = GpuError::shape(
+                WHAT_C,
+                format!(
+                    "back to position {pos}: the verify of {rows} rows at {} keeps 1..={rows} \
+                     (row 0 always)",
+                    p.pos0
+                ),
+            );
+            self.pending = Some(p);
+            return Err(e);
+        };
+        let stream = gpu.stream();
+        self.lane.set(stream, kept_lane(self.lane.lane(), kept))?;
+        if kept < rows {
+            self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;
+        }
+        self.fed = pos;
+        Ok(())
+    }
+}
+
+/// Lane `lane` of a delta state read back whole (`LANES` lanes of
+/// `GDN.state_len()`).
+fn lane_of(mut state: Vec<f32>, lane: u32) -> Result<Vec<f32>, GpuError> {
+    let len = GDN.state_len();
+    let at = lane as usize * len;
+    if state.len() != LANES * len || at + len > state.len() {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("lane {lane} of a state of {} values", state.len()),
+        ));
+    }
+    state.truncate(at + len);
+    Ok(state.split_off(at))
+}
+
+impl Rows for Body38 {
+    const MAX_ROWS: usize = VERIFY_ROWS;
+    /// Unread: the verify's chain is its rows' ([`Rows::chain_of`]).
+    const CHAIN: Chain = Chain::Step;
+    const HEADS: RowHeads = RowHeads::One;
+
+    /// One row of `m` columns through the step port.
+    fn chain_of(m: usize) -> Chain {
+        Chain::Cols(m)
+    }
+
+    fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        self.plan_verify(stream, tokens, pos)
+    }
+
+    /// The verify into `heads[0]`, a head of its rows; any other heads are
+    /// refused by name.
+    fn enqueue_rows(&mut self, gpu: &Gpu, w: &Weights, heads: &mut [Head]) -> Result<(), GpuError> {
+        match heads {
+            [head] => self.walk_verify(gpu, w, head),
+            _ => Err(GpuError::shape(
+                "qwen4exp verify",
+                format!(
+                    "{} heads; a verify runs into one head of its rows",
+                    heads.len()
+                ),
+            )),
+        }
+    }
+}
+
+impl Rollback for Body38 {
+    /// Refused by name: the commit enqueues copies, so it runs with the
+    /// card at hand ([`Rollback::rollback_on`], what `GpuModel::rollback`
+    /// calls).
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        Err(GpuError::shape(
+            "qwen4exp commit",
+            format!("back to position {pos} without the card: GpuModel::rollback commits"),
+        ))
+    }
+
+    fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
+        self.commit(gpu, pos)
+    }
+}
+
 const _: () = assert!(GDN.n_v == geo::V_HEADS);
+const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 
 #[cfg(test)]
 mod tests {
