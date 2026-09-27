@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# bloomery — the V4.1 host-expert leg runner (lead-only: `just time-cpu-v41-host`). Runs on the box
-# through tools/box.sh, with the deepseek41 profile picked on the Mac side (BLOOMERY_MODEL=deepseek41).
+# bloomery — the host-expert leg runner (lead-only: `just time-cpu-v41-host`). Runs on the box through
+# tools/box.sh, with the profile the recipe picks on the Mac side: BLOOMERY_MODEL, deepseek41 when unset,
+# qwen4exp for Qwen3.8's routed experts. The bench reads the file the profile names ($BLOOMERY_REF_MODEL)
+# and the witness's `model` field names the profile.
 #
 # `bench_v41_host --time` once per thread count, all inside the machine-wide CPU lease, with witness
 # blocks before and after. BLOOMERY_THREADS is read once per process when the pool is built, so each

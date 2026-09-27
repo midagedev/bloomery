@@ -329,15 +329,16 @@ measure-qdot-rate *ARGS:
 
 # V4.1 호스트 expert 다리의 벤치(bench_v41_host) — 정확성 실행이다. 실제 V4.1 파일을 mmap해 층마다 엔진의 디스패치
 # (gate+up 묶음 하나, swiglu를 품은 down 하나)를 돌리고, 층 여덟의 expert마다 gate·up·swiglu·down 여섯 행을 같은 바이트의
-# f64 참조와 대조한다(밴드 1e-5). 층마다 샤드 지도와 작업 집합의 상주율도 찍는다.
+# f64 참조와 대조한다(밴드 1e-5). 층마다 샤드 지도와 작업 집합의 상주율도 찍는다. 모델은 Mac 쪽 BLOOMERY_MODEL이고
+# 없으면 deepseek41이다. BLOOMERY_MODEL=qwen4exp면 Qwen3.8의 routed expert를 같은 벤치로 연다.
 bench-cpu-v41-host-check:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/host-gate.sh bench_v41_host --check'
+    BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh 'cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/host-gate.sh bench_v41_host --check'
 
 # 같은 벤치의 시간(리드 전용): 스레드 8·16·24·30·32마다 팔 넷(엔진 모양 n_host 6·5·3, 행렬별 디스패치 6)의 토큰당 ms·GB/s,
 # 디스패치 수, 상주율. CPU 임대·증인·낡은 바이너리 거부는 host-rate.sh가 쥔다. 조용한 틈에 돈다 — 빌드가 도는 동안 잰
-# 수는 증인이 받지 않는다.
+# 수는 증인이 받지 않는다. 모델은 위 레시피와 같이 BLOOMERY_MODEL이고 없으면 deepseek41이다.
 time-cpu-v41-host *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/ref/host-rate.sh {{ARGS}}'
+    BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/ref/host-rate.sh {{ARGS}}'
 
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
 # 보강. 이 트랙 원격 디렉터리 아래 실행 파일을 물고 있는 고아 프로세스를 찾아 죽인다.
