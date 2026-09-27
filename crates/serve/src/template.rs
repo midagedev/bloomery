@@ -1,17 +1,26 @@
 //! A Jinja subset, enough for the chat templates GGUF files carry.
 //!
-//! Environment semantics are Hugging Face's (`trim_blocks`, `lstrip_blocks`), and
-//! `-` whitespace control, `set` (plain and `ns.attr`), `namespace(...)`, `for`
-//! with tuple unpacking and `loop.*`, `if`/`elif`/`else`, the conditional
-//! expression, `and`/`or`/`not`/`in`, comparisons, `+`/`-`/`~`, subscripts and
-//! slices `[start:stop:step]` (Python's rules: any part omitted, negative
-//! bounds from the end), `.items()`/`.keys()`/`.values()`/`.get()`/
-//! `.strip()`/`.lstrip()`/`.rstrip()` (whitespace, or the characters given)/
-//! `.split()`/`.startswith()`/`.endswith()`, filters `tojson`/`from_json`/
-//! `length`/`trim`/`string`/`lower`/`upper`, tests `defined`/`undefined`/`none`/
-//! `true`/`false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`,
-//! and `raise_exception`/`range`. Anything else is a parse or render error,
-//! never silent output.
+//! Environment semantics are Hugging Face's (`trim_blocks`, `lstrip_blocks`, the
+//! `loopcontrols` extension), and `-` whitespace control, `set` (plain and
+//! `ns.attr`), `namespace(...)`, `for` with tuple unpacking and `loop.*`,
+//! `break`/`continue`, `if`/`elif`/`else`, `macro` outside any `for` and macro
+//! (called by name with positional and keyword arguments; an argument not
+//! given is its default, else undefined; the body sees its arguments and the
+//! template's top-level names as they are at the call, never the caller's loop
+//! names; the call's value is the body's output as a string), the conditional
+//! expression, `and`/`or`/`not`/`in`, comparisons, `+`/`-`/`~`, subscripts
+//! (a string's by character) and slices `[start:stop:step]` (Python's rules:
+//! any part omitted, negative bounds from the end), `.items()`/`.keys()`/
+//! `.values()`/`.get()`/`.strip()`/`.lstrip()`/`.rstrip()` (whitespace, or the
+//! characters given)/`.split()`/`.startswith()`/`.endswith()`, filters
+//! `tojson` (and its `ensure_ascii`)/`from_json`/`length`/`trim`/`string`/
+//! `lower`/`upper`/`capitalize`, tests `defined`/`undefined`/`none`/`true`/
+//! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
+//! `raise_exception`/`range`. Anything else is a parse or render error, never
+//! silent output: a filter argument the filter does not take, a macro defined
+//! inside a `for` or a macro, a macro body that names `varargs`, `kwargs` or
+//! `caller`, a macro used as a value, `capitalize` on a first character whose
+//! title case is not its upper case.
 //!
 //! Values are `serde_json` values plus `Undefined` and mutable namespaces. Object
 //! keys iterate in sorted order (serde_json's map), not insertion order: a
@@ -21,6 +30,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -43,7 +53,12 @@ impl ChatTemplate {
     /// Parses `source`; every branch is parsed, executed or not.
     pub fn parse(source: &str) -> Result<Self, TemplateError> {
         let segs = segment(source)?;
-        let mut p = NodeParser { segs, at: 0 };
+        let mut p = NodeParser {
+            segs,
+            at: 0,
+            loops: 0,
+            in_macro: false,
+        };
         let (body, end) = p.block(&[])?;
         if let Some(tag) = end {
             return err(format!("unexpected {{% {tag} %}}"));
@@ -68,6 +83,8 @@ impl ChatTemplate {
             .collect();
         let mut r = Renderer {
             frames: vec![globals],
+            floor: 0,
+            calls: 0,
             out: String::new(),
         };
         r.nodes(&self.body)?;
@@ -234,6 +251,18 @@ enum Node {
         attr: Option<String>,
         value: Expr,
     },
+    Macro(Arc<Macro>),
+    Break,
+    Continue,
+}
+
+/// A `{% macro name(params) %}` definition.
+#[derive(Debug)]
+struct Macro {
+    name: String,
+    /// Each parameter and its default.
+    params: Vec<(String, Option<Expr>)>,
+    body: Vec<Node>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +281,7 @@ enum Expr {
         Option<Box<Expr>>,
     ),
     Call(Box<Expr>, Vec<Expr>, Vec<(String, Expr)>),
-    Filter(Box<Expr>, String, Vec<Expr>),
+    Filter(Box<Expr>, String, Vec<Expr>, Vec<(String, Expr)>),
     Test(Box<Expr>, String, bool),
     Not(Box<Expr>),
     Neg(Box<Expr>),
@@ -284,6 +313,11 @@ enum BinOp {
 struct NodeParser {
     segs: Vec<Seg>,
     at: usize,
+    /// `for` bodies around the tag being parsed, counted inside the
+    /// innermost macro body (a `break` there cannot leave the macro).
+    loops: usize,
+    /// Inside a macro body.
+    in_macro: bool,
 }
 
 impl NodeParser {
@@ -329,7 +363,9 @@ impl NodeParser {
                 }
                 let iter = t.expr()?;
                 t.end(src)?;
+                self.loops += 1;
                 let (body, end) = self.block(&["endfor"])?;
+                self.loops -= 1;
                 self.expect_end(end, "endfor", src)?;
                 Ok(Node::For {
                     targets,
@@ -348,8 +384,53 @@ impl NodeParser {
                 t.end(src)?;
                 Ok(Node::Set { name, attr, value })
             }
+            "break" | "continue" => {
+                if !rest.is_empty() {
+                    return err(format!("{{% {kw} %}} takes nothing: {{% {src} %}}"));
+                }
+                if self.loops == 0 {
+                    return err(format!("{{% {kw} %}} outside a for loop"));
+                }
+                Ok(if kw == "break" {
+                    Node::Break
+                } else {
+                    Node::Continue
+                })
+            }
+            "macro" => self.macro_def(rest, src),
             _ => err(format!("unsupported tag {{% {src} %}}")),
         }
+    }
+
+    /// `{% macro name(a, b=default) %}…{% endmacro %}`.
+    fn macro_def(&mut self, rest: &str, src: &str) -> Result<Node, TemplateError> {
+        if self.loops > 0 || self.in_macro {
+            return err(format!(
+                "{{% {src} %}}: a macro inside a for loop or a macro is not supported"
+            ));
+        }
+        let mut t = Lexer::new(rest)?;
+        let name = t.name()?;
+        t.expect_op("(")?;
+        let mut params: Vec<(String, Option<Expr>)> = Vec::new();
+        while !t.eat_op(")") {
+            let p = t.name()?;
+            if params.iter().any(|(q, _)| *q == p) {
+                return err(format!("{{% {src} %}}: parameter {p} given twice"));
+            }
+            let default = if t.eat_op("=") { Some(t.expr()?) } else { None };
+            params.push((p, default));
+            if !t.eat_op(",") {
+                t.expect_op(")")?;
+                break;
+            }
+        }
+        t.end(src)?;
+        self.in_macro = true;
+        let (body, end) = self.block(&["endmacro"])?;
+        self.in_macro = false;
+        self.expect_end(end, "endmacro", src)?;
+        Ok(Node::Macro(Arc::new(Macro { name, params, body })))
     }
 
     fn if_chain(&mut self, first_cond: &str) -> Result<Node, TemplateError> {
@@ -664,12 +745,12 @@ impl Lexer {
         loop {
             if self.eat_op("|") {
                 let name = self.name()?;
-                let args = if self.eat_op("(") {
-                    self.args()?.0
+                let (args, kwargs) = if self.eat_op("(") {
+                    self.args()?
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
-                e = Expr::Filter(Box::new(e), name, args);
+                e = Expr::Filter(Box::new(e), name, args, kwargs);
             } else if self.eat_name("is") {
                 let negate = self.eat_name("not");
                 let name = self.name()?;
@@ -807,13 +888,14 @@ enum V {
     Undef,
     J(Value),
     Ns(Ns),
+    Macro(Arc<Macro>),
 }
 
 impl V {
     fn truthy(&self) -> bool {
         match self {
             V::Undef => false,
-            V::Ns(_) => true,
+            V::Ns(_) | V::Macro(_) => true,
             V::J(v) => match v {
                 Value::Null => false,
                 Value::Bool(b) => *b,
@@ -825,20 +907,23 @@ impl V {
         }
     }
 
-    fn into_json(self) -> Value {
-        match self {
+    fn into_json(self) -> Result<Value, TemplateError> {
+        Ok(match self {
             V::Undef => Value::Null,
             V::J(v) => v,
             V::Ns(ns) => Value::Object(ns.borrow().clone()),
-        }
+            V::Macro(m) => return err(format!("macro {} used as a value", m.name)),
+        })
     }
 
-    fn render(&self, out: &mut String) {
+    fn render(&self, out: &mut String) -> Result<(), TemplateError> {
         match self {
             V::Undef => {}
             V::Ns(_) => out.push_str("<Namespace>"),
             V::J(v) => render_py(v, out),
+            V::Macro(m) => return err(format!("macro {} rendered as a value", m.name)),
         }
+        Ok(())
     }
 }
 
@@ -901,17 +986,39 @@ fn py_json_into(v: &Value, s: &mut String) {
 
 // ---------------------------------------------------------------- render
 
+/// What a node asks of the loop around it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Next,
+    Break,
+    Continue,
+}
+
+/// Macro calls nested deeper than this are an error, not a stack overflow.
+const MAX_MACRO_DEPTH: usize = 64;
+
 struct Renderer {
     frames: Vec<HashMap<String, V>>,
+    /// The lowest frame a lookup reads besides the globals (frame 0): a macro
+    /// body sees its own frames and the template's top level, never its
+    /// caller's.
+    floor: usize,
+    /// Macro calls in progress.
+    calls: usize,
     out: String,
 }
 
 impl Renderer {
     fn lookup(&self, name: &str) -> V {
-        self.frames
+        self.frames[self.floor..]
             .iter()
             .rev()
             .find_map(|f| f.get(name).cloned())
+            .or_else(|| {
+                (self.floor > 0)
+                    .then(|| self.frames[0].get(name).cloned())
+                    .flatten()
+            })
             .unwrap_or(V::Undef)
     }
 
@@ -921,27 +1028,34 @@ impl Renderer {
         }
     }
 
-    fn nodes(&mut self, nodes: &[Node]) -> Result<(), TemplateError> {
+    /// Renders `nodes` until one asks its loop to break or continue.
+    fn nodes(&mut self, nodes: &[Node]) -> Result<Flow, TemplateError> {
         for n in nodes {
-            self.node(n)?;
+            let flow = self.node(n)?;
+            if flow != Flow::Next {
+                return Ok(flow);
+            }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
-    fn node(&mut self, n: &Node) -> Result<(), TemplateError> {
+    fn node(&mut self, n: &Node) -> Result<Flow, TemplateError> {
         match n {
             Node::Text(t) => self.out.push_str(t),
             Node::Out(e) => {
                 let v = self.eval(e)?;
-                v.render(&mut self.out);
+                v.render(&mut self.out)?;
             }
+            Node::Macro(m) => self.assign(m.name.clone(), V::Macro(Arc::clone(m))),
+            Node::Break => return Ok(Flow::Break),
+            Node::Continue => return Ok(Flow::Continue),
             Node::If(arms, els) => {
                 for (cond, body) in arms {
                     if self.eval(cond)?.truthy() {
                         return self.nodes(body);
                     }
                 }
-                self.nodes(els)?;
+                return self.nodes(els);
             }
             Node::Set { name, attr, value } => {
                 let v = self.eval(value)?;
@@ -949,7 +1063,7 @@ impl Renderer {
                     None => self.assign(name.clone(), v),
                     Some(a) => match self.lookup(name) {
                         V::Ns(ns) => {
-                            ns.borrow_mut().insert(a.clone(), v.into_json());
+                            ns.borrow_mut().insert(a.clone(), v.into_json()?);
                         }
                         _ => return err(format!("set {name}.{a}: {name} is not a namespace")),
                     },
@@ -997,21 +1111,32 @@ impl Renderer {
                     self.frames.push(frame);
                     let r = self.nodes(body);
                     self.frames.pop();
-                    r?;
+                    if r? == Flow::Break {
+                        break;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(Flow::Next)
     }
 
     fn eval(&mut self, e: &Expr) -> Result<V, TemplateError> {
         Ok(match e {
             Expr::Lit(v) => V::J(v.clone()),
-            Expr::Name(n) => self.lookup(n),
+            Expr::Name(n) => {
+                let v = self.lookup(n);
+                if self.floor > 0
+                    && matches!(v, V::Undef)
+                    && matches!(n.as_str(), "varargs" | "kwargs" | "caller")
+                {
+                    return err(format!("a macro body naming {n} is not supported"));
+                }
+                v
+            }
             Expr::List(items) => V::J(Value::Array(
                 items
                     .iter()
-                    .map(|x| self.eval(x).map(V::into_json))
+                    .map(|x| self.eval(x)?.into_json())
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Dict(items) => {
@@ -1021,7 +1146,7 @@ impl Renderer {
                         V::J(Value::String(s)) => s,
                         other => return err(format!("dict key must be a string, got {other:?}")),
                     };
-                    m.insert(key, self.eval(v)?.into_json());
+                    m.insert(key, self.eval(v)?.into_json()?);
                 }
                 V::J(Value::Object(m))
             }
@@ -1041,13 +1166,17 @@ impl Renderer {
                 slice(&o, lo, hi, step)?
             }
             Expr::Call(callee, args, kwargs) => self.call(callee, args, kwargs)?,
-            Expr::Filter(x, name, args) => {
+            Expr::Filter(x, name, args, kwargs) => {
                 let v = self.eval(x)?;
                 let args: Vec<V> = args
                     .iter()
                     .map(|a| self.eval(a))
                     .collect::<Result<_, _>>()?;
-                filter(v, name, &args)?
+                let kwargs: Vec<(&str, V)> = kwargs
+                    .iter()
+                    .map(|(k, a)| Ok((k.as_str(), self.eval(a)?)))
+                    .collect::<Result<_, TemplateError>>()?;
+                filter(v, name, &args, &kwargs)?
             }
             Expr::Test(x, name, negate) => {
                 let v = self.eval(x)?;
@@ -1097,18 +1226,23 @@ impl Renderer {
             .iter()
             .map(|a| self.eval(a))
             .collect::<Result<_, _>>()?;
+        if let Expr::Name(n) = callee
+            && let V::Macro(m) = self.lookup(n)
+        {
+            return self.call_macro(&m, args, kwargs);
+        }
         match callee {
             Expr::Name(n) if n == "namespace" => {
                 let mut m = Map::new();
                 for (k, v) in kwargs {
-                    m.insert(k.clone(), self.eval(v)?.into_json());
+                    m.insert(k.clone(), self.eval(v)?.into_json()?);
                 }
                 Ok(V::Ns(Rc::new(RefCell::new(m))))
             }
             Expr::Name(n) if n == "raise_exception" => {
                 let mut msg = String::new();
                 if let Some(a) = args.first() {
-                    a.render(&mut msg);
+                    a.render(&mut msg)?;
                 }
                 err(format!("raise_exception: {msg}"))
             }
@@ -1127,6 +1261,66 @@ impl Renderer {
             }
             other => err(format!("unsupported call {other:?}")),
         }
+    }
+
+    /// Runs macro `m` on `args` and `kwargs` (evaluated here, in the caller's
+    /// scope); its value is the body's output.
+    fn call_macro(
+        &mut self,
+        m: &Arc<Macro>,
+        args: Vec<V>,
+        kwargs: &[(String, Expr)],
+    ) -> Result<V, TemplateError> {
+        let name = &m.name;
+        if args.len() > m.params.len() {
+            return err(format!(
+                "macro {name} takes at most {} argument(s), {} given",
+                m.params.len(),
+                args.len()
+            ));
+        }
+        let mut given: Vec<Option<V>> = args.into_iter().map(Some).collect();
+        given.resize(m.params.len(), None);
+        for (k, e) in kwargs {
+            let Some(i) = m.params.iter().position(|(p, _)| p == k) else {
+                return err(format!("macro {name} takes no argument {k}"));
+            };
+            if given[i].is_some() {
+                return err(format!("macro {name}: argument {k} given twice"));
+            }
+            given[i] = Some(self.eval(e)?);
+        }
+        if self.calls >= MAX_MACRO_DEPTH {
+            return err(format!(
+                "macro {name}: calls nested deeper than {MAX_MACRO_DEPTH}"
+            ));
+        }
+        let floor = self.floor;
+        let out = std::mem::take(&mut self.out);
+        self.frames.push(HashMap::new());
+        self.floor = self.frames.len() - 1;
+        self.calls += 1;
+        let r = self.macro_body(m, given);
+        self.calls -= 1;
+        self.frames.pop();
+        self.floor = floor;
+        let body = std::mem::replace(&mut self.out, out);
+        r.map(|_| V::J(Value::String(body)))
+    }
+
+    /// Binds the parameters in the frame [`Renderer::call_macro`] pushed (a
+    /// default is evaluated there, after the parameters before it) and
+    /// renders the body.
+    fn macro_body(&mut self, m: &Macro, given: Vec<Option<V>>) -> Result<Flow, TemplateError> {
+        for ((p, default), v) in m.params.iter().zip(given) {
+            let v = match (v, default) {
+                (Some(v), _) => v,
+                (None, Some(d)) => self.eval(d)?,
+                (None, None) => V::Undef,
+            };
+            self.assign(p.clone(), v);
+        }
+        self.nodes(&m.body)
     }
 }
 
@@ -1151,6 +1345,15 @@ fn index(o: &V, i: &V) -> V {
             m.get(k).cloned().map_or(V::Undef, V::J)
         }
         (V::Ns(_), V::J(Value::String(k))) => get_attr(o, k),
+        (V::J(Value::String(s)), V::J(Value::Number(n))) => {
+            let Some(i) = n.as_i64() else { return V::Undef };
+            let len = i64::try_from(s.chars().count()).unwrap_or(i64::MAX);
+            let i = if i < 0 { i + len } else { i };
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| s.chars().nth(i))
+                .map_or(V::Undef, |c| V::J(Value::String(c.to_string())))
+        }
         (V::J(Value::Array(a)), V::J(Value::Number(n))) => {
             let Some(i) = n.as_i64() else { return V::Undef };
             let len = i64::try_from(a.len()).unwrap_or(i64::MAX);
@@ -1331,9 +1534,101 @@ fn split_whitespace(s: &str, max: Option<usize>) -> Vec<String> {
     out
 }
 
-fn filter(v: V, name: &str, _args: &[V]) -> Result<V, TemplateError> {
+/// Codepoints whose title case (Python's `str.capitalize` on a first
+/// character) is not their upper case: Python 3.12's tables, `chr(c).title()
+/// != chr(c).upper()`, 135 codepoints.
+fn title_is_not_upper(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00DF
+            | 0x01C4..=0x01CC
+            | 0x01F1..=0x01F3
+            | 0x0587
+            | 0x10D0..=0x10FA
+            | 0x10FD..=0x10FF
+            | 0x1F80..=0x1FAF
+            | 0x1FB2..=0x1FB4
+            | 0x1FB7
+            | 0x1FBC
+            | 0x1FC2..=0x1FC4
+            | 0x1FC7
+            | 0x1FCC
+            | 0x1FF2..=0x1FF4
+            | 0x1FF7
+            | 0x1FFC
+            | 0xFB00..=0xFB06
+            | 0xFB13..=0xFB17
+    )
+}
+
+/// Python's `str.capitalize`: the first character in title case, the rest
+/// lowered in the context of the whole string (a final sigma after the first
+/// character is still final).
+fn capitalize(s: &str) -> Result<String, TemplateError> {
+    let Some(first) = s.chars().next() else {
+        return Ok(String::new());
+    };
+    if title_is_not_upper(first) {
+        return err(format!(
+            "capitalize: the title case of U+{:04X} is not its upper case",
+            u32::from(first)
+        ));
+    }
+    // A first character has nothing before it, so its lower case in context
+    // is its plain lower case: drop that many bytes of the lowered string.
+    let lower = s.to_lowercase();
+    let skip: usize = first.to_lowercase().map(char::len_utf8).sum();
+    Ok(first.to_uppercase().chain(lower[skip..].chars()).collect())
+}
+
+/// `json.dumps(..., ensure_ascii=True)` from its `False` form: every
+/// non-ASCII character as `\uXXXX` (lower-case hex, UTF-16 surrogate pairs).
+fn ascii_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut units = [0u16; 2];
+    for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            for u in c.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{u:04x}");
+            }
+        }
+    }
+    out
+}
+
+/// `tojson`'s arguments: `ensure_ascii`, positionally or by name.
+fn tojson_ascii(args: &[V], kwargs: &[(&str, V)]) -> Result<bool, TemplateError> {
+    let mut ascii = match args {
+        [] => None,
+        [a] => Some(a.truthy()),
+        _ => return err("tojson takes at most one positional argument (ensure_ascii)"),
+    };
+    for (k, a) in kwargs {
+        match *k {
+            "ensure_ascii" if ascii.is_none() => ascii = Some(a.truthy()),
+            "ensure_ascii" => return err("tojson: ensure_ascii given twice"),
+            other => return err(format!("tojson({other}=...) is not supported")),
+        }
+    }
+    Ok(ascii.unwrap_or(false))
+}
+
+fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    if name == "tojson" {
+        let ascii = tojson_ascii(args, kwargs)?;
+        let s = py_json(&v.into_json()?);
+        return Ok(V::J(Value::String(if ascii {
+            ascii_escape(&s)
+        } else {
+            s
+        })));
+    }
+    if !args.is_empty() || !kwargs.is_empty() {
+        return err(format!("|{name} takes no arguments"));
+    }
     Ok(match name {
-        "tojson" => V::J(Value::String(py_json(&v.into_json()))),
         "from_json" => match v {
             V::J(Value::String(s)) => V::J(
                 serde_json::from_str(&s).map_err(|e| TemplateError(format!("from_json: {e}")))?,
@@ -1346,18 +1641,19 @@ fn filter(v: V, name: &str, _args: &[V]) -> Result<V, TemplateError> {
             V::J(Value::String(s)) => s.chars().count(),
             _ => 0,
         })),
-        "trim" => V::J(Value::String(to_str(&v).trim().to_owned())),
-        "string" => V::J(Value::String(to_str(&v))),
-        "lower" => V::J(Value::String(to_str(&v).to_lowercase())),
-        "upper" => V::J(Value::String(to_str(&v).to_uppercase())),
+        "trim" => V::J(Value::String(to_str(&v)?.trim().to_owned())),
+        "string" => V::J(Value::String(to_str(&v)?)),
+        "lower" => V::J(Value::String(to_str(&v)?.to_lowercase())),
+        "upper" => V::J(Value::String(to_str(&v)?.to_uppercase())),
+        "capitalize" => V::J(Value::String(capitalize(&to_str(&v)?)?)),
         other => return err(format!("unsupported filter |{other}")),
     })
 }
 
-fn to_str(v: &V) -> String {
+fn to_str(v: &V) -> Result<String, TemplateError> {
     let mut s = String::new();
-    v.render(&mut s);
-    s
+    v.render(&mut s)?;
+    Ok(s)
 }
 
 fn test(v: &V, name: &str) -> Result<bool, TemplateError> {
@@ -1435,7 +1731,7 @@ fn binop(l: &V, op: BinOp, r: &V) -> Result<V, TemplateError> {
             };
             Value::Bool(found == (op == In))
         }
-        Concat => Value::String(to_str(l) + &to_str(r)),
+        Concat => Value::String(to_str(l)? + &to_str(r)?),
         Add => match (l, r) {
             (V::J(Value::String(a)), V::J(Value::String(b))) => Value::String(format!("{a}{b}")),
             (V::J(Value::Array(a)), V::J(Value::Array(b))) => {
@@ -1681,5 +1977,163 @@ mod tests {
         }
         let e = render_err("{{ 'a'.split('') }}", vars);
         assert!(e.contains("empty separator"), "{e}");
+    }
+
+    /// Macros as jinja2 runs them: the body sees its arguments and the top
+    /// level as it is at the call (a later `set` included), never the
+    /// caller's loop names; an argument not given is its default or
+    /// undefined; the value is the body's output, usable with `+`, `==` and
+    /// as a condition; `break` and `continue` leave only their own loop. Each
+    /// expected string is jinja2 3.1.2's render in the HF environment.
+    #[test]
+    fn macros_and_loop_controls_follow_jinja2() {
+        for (src, want) in [
+            (
+                "{% set y = 1 %}{% macro m() %}{{ y }}{% endmacro %}{% set y = 2 %}{{ m() }}",
+                "2",
+            ),
+            (
+                "{% macro m(a, b) %}[{{ a }}|{{ b }}|{{ b is defined }}]{% endmacro %}{{ m(1) }}",
+                "[1||False]",
+            ),
+            (
+                "{% macro m(a, b='d') %}{{ a }}{{ b }}{% endmacro %}{{ m(b=2, a=1) }}{{ m(1) }}",
+                "121d",
+            ),
+            (
+                "{% macro m() %}[{{ i }}]{% endmacro %}{% for i in [1] %}{{ m() }}{% endfor %}",
+                "[]",
+            ),
+            (
+                "{% macro m() %}x{% endmacro %}{{ (m() + '\\n') | tojson }}{{ m() == 'x' }}",
+                "\"x\\n\"True",
+            ),
+            (
+                "{% macro m() %}{% set q = 1 %}{% endmacro %}{{ m() }}[{{ q is defined }}]",
+                "[False]",
+            ),
+            (
+                "{% macro m() %}{{ m2() }}{% endmacro %}{% macro m2() %}two{% endmacro %}{{ m() }}",
+                "two",
+            ),
+            (
+                "{% if true %}{% set z = 3 %}{% endif %}{% macro m() %}{{ z }}{% endmacro %}{{ m() }}",
+                "3",
+            ),
+            (
+                "{% macro e(x) %}{% if x %}1{% endif %}{% endmacro %}\
+                 {% if e(0) %}a{% endif %}{% if e(1) %}b{% endif %}",
+                "b",
+            ),
+            (
+                "{% for i in [1, 2, 3] %}{% if i == 2 %}{% break %}{% endif %}{{ i }}{% endfor %}",
+                "1",
+            ),
+            (
+                "{% for i in [1, 2, 3] %}{% if i == 2 %}{% continue %}{% endif %}{{ i }}{% endfor %}",
+                "13",
+            ),
+            (
+                "{% for i in [1, 2] %}{% for j in [1, 2] %}{% break %}{% endfor %}{{ i }}{% endfor %}",
+                "12",
+            ),
+            (
+                "{% macro m() %}{% for j in [1, 2] %}{% if j == 1 %}{% break %}{% endif %}\
+                 {% endfor %}ok{% endmacro %}{{ m() }}",
+                "ok",
+            ),
+            (
+                "{% for m in [1, 2] %}{% if m == 1 %}{% set r = 'R' %}{% endif %}\
+                 {{ r is defined }}{% endfor %}",
+                "TrueFalse",
+            ),
+        ] {
+            assert_eq!(render(src, json!({})), want, "{src}");
+        }
+    }
+
+    /// What jinja2 runs and this engine cannot match is refused by name.
+    #[test]
+    fn unsupported_macro_uses_are_named_errors() {
+        for (src, want) in [
+            (
+                "{% for i in [1] %}{% macro m() %}{% endmacro %}{% endfor %}",
+                "a macro inside a for loop or a macro",
+            ),
+            ("{% break %}", "outside a for loop"),
+            (
+                "{% macro m() %}{% break %}{% endmacro %}",
+                "outside a for loop",
+            ),
+        ] {
+            let e = ChatTemplate::parse(src).err().map(|e| e.to_string());
+            assert!(
+                e.as_deref().is_some_and(|e| e.contains(want)),
+                "{src}: {e:?}"
+            );
+        }
+        for (src, want) in [
+            (
+                "{% macro m(a) %}{% endmacro %}{{ m(1, 2) }}",
+                "at most 1 argument",
+            ),
+            (
+                "{% macro m(a) %}{% endmacro %}{{ m(c=1) }}",
+                "takes no argument c",
+            ),
+            (
+                "{% macro m(a) %}{% endmacro %}{{ m(1, a=2) }}",
+                "given twice",
+            ),
+            ("{% macro m() %}x{% endmacro %}{{ m }}", "macro m rendered"),
+            (
+                "{% macro m() %}x{% endmacro %}{{ [m] }}",
+                "macro m used as a value",
+            ),
+            (
+                "{% macro m() %}{{ varargs }}{% endmacro %}{{ m() }}",
+                "naming varargs",
+            ),
+            (
+                "{% macro m() %}{{ m() }}{% endmacro %}{{ m() }}",
+                "nested deeper",
+            ),
+            (
+                "{{ 'x' | capitalize(1) }}",
+                "|capitalize takes no arguments",
+            ),
+            ("{{ 'x' | length(1) }}", "|length takes no arguments"),
+            ("{{ 'x' | tojson(indent=2) }}", "tojson(indent=...)"),
+            ("{{ 'ǆa' | capitalize }}", "U+01C6"),
+        ] {
+            let e = render_err(src, json!({}));
+            assert!(e.contains(want), "{src}: {e}");
+        }
+    }
+
+    /// `capitalize`, `tojson(ensure_ascii=...)` and string subscripts as
+    /// jinja2 renders them.
+    #[test]
+    fn capitalize_ascii_json_and_string_subscripts_follow_jinja2() {
+        for (src, want) in [
+            ("{{ 'hELLO wORLD' | capitalize }}", "Hello world"),
+            ("{{ 'max' | capitalize }}", "Max"),
+            ("{{ 'ΑΣ' | capitalize }}", "Ας"),
+            ("{{ '' | capitalize }}", ""),
+            ("{{ 3 | capitalize }}", "3"),
+            ("{{ 'é' | tojson }}", "\"é\""),
+            (
+                "{{ 'é😀' | tojson(ensure_ascii=True) }}",
+                "\"\\u00e9\\ud83d\\ude00\"",
+            ),
+            ("{{ 'é' | tojson(ensure_ascii=False) }}", "\"é\""),
+            ("{{ 'é' | tojson(1) }}", "\"\\u00e9\""),
+            (
+                "{{ 'abc'[0] }}|{{ 'abc'[5] is defined }}|{{ 'abc'[-1] }}",
+                "a|False|c",
+            ),
+        ] {
+            assert_eq!(render(src, json!({})), want, "{src}");
+        }
     }
 }

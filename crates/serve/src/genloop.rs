@@ -368,7 +368,7 @@ pub(crate) fn generate(
         sink(Event::Prompt(tim))?;
     }
     let budget = usize::try_from(p.n_predict).unwrap_or(usize::MAX);
-    let eos = vocab.eos();
+    let stops = vocab.stops();
     let mut scan = StopScan::new(p.stop.clone());
     let mut dec = vocab.decoder();
     let mut generated: Vec<u32> = Vec::new();
@@ -382,7 +382,7 @@ pub(crate) fn generate(
             tim.predicted_n = generated.len();
             tim.predicted_ms = ms_since(t1);
             tick(tim);
-            if tok == eos && !p.ignore_eos {
+            if stops.contains(&tok) && !p.ignore_eos {
                 stop = StopKind::Eos;
                 break;
             }

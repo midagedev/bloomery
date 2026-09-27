@@ -28,12 +28,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use crate::dsml::{ChatParser, Message, ToolCall};
+use crate::dsml::{ChatParser, Message, ToolCall, ToolFormat, Tools};
 use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
     SamplingParams, StateError, Tokenizer,
 };
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
+use crate::glmxml::{ArgTypes, GlmXmlError};
 use crate::http::{self, EventStream, Request};
 use crate::reasoning::ReasoningFormat;
 use crate::sampling;
@@ -94,6 +95,9 @@ pub enum ServeError {
     Engine(EngineFailure),
     #[error("--slot-save-path {}: not a directory", .0.display())]
     SlotSavePath(PathBuf),
+    /// The engine's vocabulary names no id that ends a generation.
+    #[error("the engine's vocabulary names no stop id")]
+    NoStops,
 }
 
 /// Why the accept loop ended.
@@ -122,6 +126,9 @@ impl Server {
         }
         let listener = TcpListener::bind(addr)?;
         let tok = engine.tokenizer();
+        if tok.stops().is_empty() {
+            return Err(ServeError::NoStops);
+        }
         let engine_props = engine_object(&engine.props_engine());
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
@@ -136,6 +143,7 @@ impl Server {
             fatal: Mutex::new(None),
             end: end_tx,
             fatal_linger: config.fatal_linger,
+            tool_format: ToolFormat::of_template(template.source()),
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -246,6 +254,8 @@ struct State {
     end: mpsc::Sender<End>,
     fatal_linger: Duration,
     template: ChatTemplate,
+    /// The tool-call markup the template teaches, read from its source once.
+    tool_format: ToolFormat,
     alias: String,
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
@@ -1545,13 +1555,33 @@ fn chat_finish_reason(o: &Outcome, m: &Message) -> &'static str {
     }
 }
 
-/// Whether the output is scanned for DSML: non-empty `tools` and a `tool_choice`
-/// other than `"none"` (the template still sees the tools with `"none"`).
+/// Whether the output is scanned for tool calls: non-empty `tools` and a
+/// `tool_choice` other than `"none"` (the template still sees the tools with
+/// `"none"`).
 fn parses_tools(b: &Map<String, Value>) -> bool {
     b.get("tools")
         .and_then(Value::as_array)
         .is_some_and(|a| !a.is_empty())
         && b.get("tool_choice").and_then(Value::as_str) != Some("none")
+}
+
+/// The scan a chat request's output gets: none, or the markup of the
+/// server's template.
+fn tool_scan(state: &State, b: &Map<String, Value>) -> Option<Tools> {
+    parses_tools(b).then(|| match state.tool_format {
+        ToolFormat::Dsml => Tools::Dsml,
+        ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
+    })
+}
+
+/// A generation whose tool-call markup does not parse: the server's error,
+/// as llama-server answers output its chat parser refuses.
+fn tool_markup_error(e: &GlmXmlError) -> ApiError {
+    ApiError {
+        code: 500,
+        kind: "server_error",
+        message: format!("tool-call markup: {e}"),
+    }
 }
 
 fn usage(o: &Outcome) -> Value {
@@ -1583,7 +1613,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
     let ids = state.tok.encode(&text);
-    let mut parser = ChatParser::new(&text, format, parses_tools(&b));
+    let mut parser = ChatParser::with_tools(&text, format, tool_scan(state, &b));
     let mut run = match Run::begin(state) {
         Ok(r) => r,
         Err(e) => return send_error(w, req, &e),
@@ -1593,16 +1623,21 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         return match run.go(&ids, prompt, &p, &mut |_| Ok(())) {
             Err(e) => send_error(w, req, &e),
             Ok(Err(e)) => send_error(w, req, &engine_error(&e)),
-            Ok(Ok(o)) => {
-                let _ = parser.push(&o.content);
-                let _ = parser.finish();
-                send_json(w, req, 200, &chat_final(&ids_meta, &o, parser.message()))
-            }
+            Ok(Ok(o)) => match parser
+                .try_push(&o.content)
+                .and_then(|_| parser.try_finish())
+            {
+                Ok(_) => send_json(w, req, 200, &chat_final(&ids_meta, &o, parser.message())),
+                Err(e) => send_error(w, req, &tool_markup_error(&e)),
+            },
         };
     }
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
+    // Markup that does not parse stops the generation (the sink fails) and
+    // ends the stream with an error event instead of a dropped connection.
+    let mut markup: Option<GlmXmlError> = None;
     let r = {
         let meta = &ids_meta;
         let mut sink = |ev: Event<'_>| -> io::Result<()> {
@@ -1631,7 +1666,14 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                     sse(s, &v)
                 }
                 Event::Text(text, t) => {
-                    for delta in meta.deltas(&parser.push(text)) {
+                    let d = match parser.try_push(text) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            markup = Some(e);
+                            return Err(io::Error::other("tool-call markup does not parse"));
+                        }
+                    };
+                    for delta in meta.deltas(&d) {
                         let mut v = meta.chunk(json!([{
                             "finish_reason": null, "index": 0, "delta": delta,
                         }]));
@@ -1646,6 +1688,10 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         };
         run.go(&ids, prompt, &p, &mut sink)
     };
+    let r = match markup {
+        Some(e) => Err(tool_markup_error(&e)),
+        None => r,
+    };
     let include_usage = p.include_usage;
     let opened = stream.is_some();
     finish_stream(req, stream, w_opt, r, |s, o| {
@@ -1658,7 +1704,17 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }])),
             )?;
         }
-        for delta in ids_meta.deltas(&parser.finish()) {
+        let d = match parser.try_finish() {
+            Ok(d) => d,
+            Err(e) => {
+                let e = tool_markup_error(&e);
+                return sse(
+                    s,
+                    &json!({ "error": error_body(e.code, e.kind, &e.message)["error"] }),
+                );
+            }
+        };
+        for delta in ids_meta.deltas(&d) {
             sse(
                 s,
                 &ids_meta.chunk(json!([{ "finish_reason": null, "index": 0, "delta": delta }])),

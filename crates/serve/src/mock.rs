@@ -286,30 +286,108 @@ impl Engine for MockEngine {
 
 /// An engine that answers every prompt with the same text, then EOS: the model
 /// output a parser gate scripts. Tokens are [`MockTokenizer`]'s, so the special
-/// strings are single ids and everything else goes byte by byte.
+/// strings are single ids and everything else goes byte by byte;
+/// [`ScriptedEngine::with_stops`] gives it a vocabulary with other stop ids.
 pub struct ScriptedEngine {
     script: Vec<u32>,
     at: usize,
     pos: usize,
     ctx_max: usize,
+    tok: Arc<dyn Tokenizer>,
 }
 
 impl ScriptedEngine {
     /// An engine whose every generation is `text` followed by EOS.
     #[must_use]
     pub fn new(ctx_max: usize, text: &str) -> Self {
+        ScriptedEngine::from_ids(ctx_max, MockTokenizer.encode(text))
+    }
+
+    /// An engine whose every generation is the ids `script` followed by EOS.
+    #[must_use]
+    pub fn from_ids(ctx_max: usize, script: Vec<u32>) -> Self {
         ScriptedEngine {
-            script: MockTokenizer.encode(text),
+            script,
             at: 0,
             pos: 0,
             ctx_max,
+            tok: Arc::new(MockTokenizer),
         }
+    }
+
+    /// The same engine over a vocabulary whose stop ids are `stops`, the
+    /// first of them its EOS (see `StopsTokenizer`).
+    ///
+    /// # Panics
+    ///
+    /// When `stops` is empty.
+    #[must_use]
+    pub fn with_stops(self, stops: &[u32]) -> Self {
+        ScriptedEngine {
+            tok: Arc::new(StopsTokenizer::new(stops)),
+            ..self
+        }
+    }
+}
+
+/// [`MockTokenizer`] with its own stop ids. Its vocabulary reaches past the
+/// largest of them; an id past the mock's own decodes to nothing, as a
+/// control token does.
+pub(crate) struct StopsTokenizer {
+    stops: Vec<u32>,
+}
+
+impl StopsTokenizer {
+    /// # Panics
+    ///
+    /// When `stops` is empty: a vocabulary names at least its EOS.
+    #[must_use]
+    pub(crate) fn new(stops: &[u32]) -> Self {
+        assert!(!stops.is_empty(), "StopsTokenizer: no stop id");
+        StopsTokenizer {
+            stops: stops.to_vec(),
+        }
+    }
+}
+
+impl Tokenizer for StopsTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        MockTokenizer.encode(text)
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        MockTokenizer.decode(ids)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        MockTokenizer.decoder()
+    }
+
+    fn bos(&self) -> u32 {
+        MockTokenizer.bos()
+    }
+
+    fn eos(&self) -> u32 {
+        self.stops[0]
+    }
+
+    fn stops(&self) -> Vec<u32> {
+        self.stops.clone()
+    }
+
+    fn add_bos(&self) -> bool {
+        false
+    }
+
+    fn n_vocab(&self) -> usize {
+        let past = self.stops.iter().max().map_or(0, |&m| m as usize + 1);
+        MockTokenizer.n_vocab().max(past)
     }
 }
 
 impl Engine for ScriptedEngine {
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
-        Arc::new(MockTokenizer)
+        Arc::clone(&self.tok)
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
@@ -329,7 +407,7 @@ impl Engine for ScriptedEngine {
             .script
             .get(self.at)
             .copied()
-            .unwrap_or(MockTokenizer.eos());
+            .unwrap_or_else(|| self.tok.eos());
         self.at += 1;
         if let Some(l) = logits_out {
             l.fill(FLOOR);

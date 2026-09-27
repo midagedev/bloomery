@@ -1,11 +1,12 @@
 //! Tokenizer gates: our ids equal the reference's `llama-tokenize` ids, id for
 //! id, and the reference's ids decode back to the source bytes — for each
-//! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer) and
-//! Qwen3-MoE's (`qwen2`).
+//! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
+//! Qwen3-MoE's (`qwen2`) and GLM-5.3-Flash's (`glm4`).
 //!
 //! The oracle files come from `crates/tokenizer/tools/oracle.sh` (the
 //! `gate-tokenizer` recipe runs it first, once per vocabulary) under
-//! `$BLOOMERY_DATA/tokenizer/` and `$BLOOMERY_DATA/tokenizer-qwen3moe/`.
+//! `$BLOOMERY_DATA/tokenizer/`, `$BLOOMERY_DATA/tokenizer-qwen3moe/` and
+//! `$BLOOMERY_DATA/tokenizer-glm5next/`.
 //! Every text is checked in both of the reference's parse modes: special
 //! tokens parsed (its default) and `--no-parse-special`. Neither adds a BOS
 //! for these vocabularies (`tokenizer.ggml.add_bos_token` is false), so there
@@ -57,6 +58,19 @@ fn qwen3moe() -> Vocabulary {
         // end-of-generation set either way (every EOG text is).
         ambiguous: &["eot"],
         eog: &["<|im_end|>", "<|endoftext|>"],
+    }
+}
+
+/// GLM-5.3-Flash's first shard on the box, the file's identity.
+fn glm5next() -> Vocabulary {
+    Vocabulary {
+        file: PathBuf::from(
+            "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
+        ),
+        set: "tokenizer-glm5next",
+        ambiguous: &[],
+        // The header's eos, eot and eom: a generation ends on any of the three.
+        eog: &["<|endoftext|>", "<|user|>", "<|observation|>"],
     }
 }
 
@@ -211,6 +225,12 @@ fn hw_qwen3moe_corpus_ids_equal_reference() {
     corpus_ids_equal_reference(&qwen3moe());
 }
 
+#[test]
+#[ignore = "needs the glm5next vocabulary and the oracle files on the box"]
+fn hw_glm5next_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&glm5next());
+}
+
 /// The hand-picked strings of `tests/cases.txt`, and the conditions under
 /// which "equal to the reference" is well defined: the partition order among
 /// equal-length special tokens cannot matter, and the roles picked from
@@ -283,4 +303,10 @@ fn hw_cases_equal_reference() {
 #[ignore = "needs the qwen3moe vocabulary and the oracle files on the box"]
 fn hw_qwen3moe_cases_equal_reference() {
     cases_equal_reference(&qwen3moe());
+}
+
+#[test]
+#[ignore = "needs the glm5next vocabulary and the oracle files on the box"]
+fn hw_glm5next_cases_equal_reference() {
+    cases_equal_reference(&glm5next());
 }

@@ -149,8 +149,9 @@ fn main() -> ExitCode {
     match e {
         // EX_SOFTWARE: the engine, not the listener, ended the run.
         ServeError::Engine(_) => ExitCode::from(70),
-        ServeError::Io(_) | ServeError::Template(_) | ServeError::SlotSavePath(_) => {
-            ExitCode::from(1)
-        }
+        ServeError::Io(_)
+        | ServeError::Template(_)
+        | ServeError::SlotSavePath(_)
+        | ServeError::NoStops => ExitCode::from(1),
     }
 }
