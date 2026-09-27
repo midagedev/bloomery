@@ -170,8 +170,8 @@ pub enum Cut {
     Stay,
     /// Every copied store back to zero.
     Empty,
-    /// Every copied store from slot `slot`.
-    Restore { slot: usize },
+    /// Every copied store from slot `slot`, which holds position `at`.
+    Restore { slot: usize, at: u32 },
 }
 
 /// Where a checkpoint at the held position goes.
@@ -205,6 +205,13 @@ pub enum CheckpointError {
     /// A take at `at` while a point stands past it: the model was cut
     /// without the ledger.
     Behind { at: u32, point: u32 },
+    /// A restore of position `at` from slot `slot`, whose last finished copy
+    /// holds `holds` (none: never copied, or a copy that failed).
+    Unwritten {
+        slot: usize,
+        at: u32,
+        holds: Option<u32>,
+    },
 }
 
 impl fmt::Display for CheckpointError {
@@ -231,11 +238,34 @@ impl fmt::Display for CheckpointError {
                 "a checkpoint at {at} while one stands at {point}: the model was cut without \
                  the ledger"
             ),
+            CheckpointError::Unwritten { slot, at, holds } => match holds {
+                Some(h) => write!(
+                    f,
+                    "a restore of position {at} from slot {slot}, whose last finished copy holds \
+                     position {h}"
+                ),
+                None => write!(
+                    f,
+                    "a restore of position {at} from slot {slot}, which no copy has finished"
+                ),
+            },
         }
     }
 }
 
 impl std::error::Error for CheckpointError {}
+
+/// Whether slot `slot`, whose last finished copy holds `holds`, may be read
+/// back as position `at`: only when it holds exactly that. The slot's own
+/// record, apart from the ledger's point, so a point that names a slot no
+/// copy filled is refused by name instead of restoring its zeros.
+pub fn restorable(slot: usize, holds: Option<u32>, at: u32) -> Result<(), CheckpointError> {
+    if holds == Some(at) {
+        Ok(())
+    } else {
+        Err(CheckpointError::Unwritten { slot, at, holds })
+    }
+}
 
 /// What the ledger has done since its model's load.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -381,6 +411,7 @@ impl Ledger {
             self.stats.restored += 1;
             Cut::Restore {
                 slot: self.points[i].slot,
+                at: n,
             }
         };
         self.drop_past(n);
@@ -1162,7 +1193,7 @@ mod tests {
         let mut l = Ledger::new(3).unwrap();
         copy(l.take(100).unwrap());
         copy(l.take(200).unwrap());
-        assert_eq!(l.cut(100, 250), Ok(Cut::Restore { slot: 0 }));
+        assert_eq!(l.cut(100, 250), Ok(Cut::Restore { slot: 0, at: 100 }));
         l.applied();
         assert_eq!(
             l.take(180),
@@ -1189,7 +1220,7 @@ mod tests {
         let mut l = Ledger::new(8).unwrap();
         copy(l.take(512).unwrap());
         copy(l.take(640).unwrap());
-        assert_eq!(l.cut(512, 643), Ok(Cut::Restore { slot: 0 }));
+        assert_eq!(l.cut(512, 643), Ok(Cut::Restore { slot: 0, at: 512 }));
         l.applied();
         assert_eq!(l.positions(), [512]);
         assert_eq!(l.take(512), Ok(Take::Held));
@@ -1235,12 +1266,12 @@ mod tests {
         let mut l = Ledger::new(4).unwrap();
         copy(l.take(100).unwrap());
         copy(l.take(200).unwrap());
-        assert_eq!(l.cut(200, 300), Ok(Cut::Restore { slot: 1 }));
+        assert_eq!(l.cut(200, 300), Ok(Cut::Restore { slot: 1, at: 200 }));
         assert_eq!(l.take(200), Err(CheckpointError::Pending { at: 200 }));
         assert_eq!(l.cut(200, 200), Ok(Cut::Stay));
-        assert_eq!(l.pending(), Some(Cut::Restore { slot: 1 }));
-        assert_eq!(l.cut(100, 200), Ok(Cut::Restore { slot: 0 }));
-        assert_eq!(l.pending(), Some(Cut::Restore { slot: 0 }));
+        assert_eq!(l.pending(), Some(Cut::Restore { slot: 1, at: 200 }));
+        assert_eq!(l.cut(100, 200), Ok(Cut::Restore { slot: 0, at: 100 }));
+        assert_eq!(l.pending(), Some(Cut::Restore { slot: 0, at: 100 }));
         l.clear();
         assert_eq!(l.pending(), None);
         assert!(l.positions().is_empty());
@@ -1249,6 +1280,27 @@ mod tests {
 
     /// A take behind a standing point is refused: the model was cut without
     /// the ledger.
+    /// A slot is read back only as the position its last finished copy
+    /// holds: never copied, another position, or that position.
+    #[test]
+    fn restore_reads_only_the_copied_position() {
+        assert_eq!(
+            restorable(0, None, 512),
+            Err(CheckpointError::Unwritten {
+                slot: 0,
+                at: 512,
+                holds: None
+            })
+        );
+        assert!(
+            restorable(1, Some(100), 512)
+                .unwrap_err()
+                .to_string()
+                .contains("holds position 100")
+        );
+        assert_eq!(restorable(1, Some(512), 512), Ok(()));
+    }
+
     #[test]
     fn take_behind_refused() {
         let mut l = Ledger::new(4).unwrap();
@@ -1289,7 +1341,7 @@ mod tests {
 
         fn apply(&mut self) {
             match self.ledger.pending() {
-                Some(Cut::Restore { slot }) => (self.state, self.ring) = self.slots[slot],
+                Some(Cut::Restore { slot, .. }) => (self.state, self.ring) = self.slots[slot],
                 Some(Cut::Empty) => (self.state, self.ring) = (0, [0; 11]),
                 Some(Cut::Stay) | None => {}
             }

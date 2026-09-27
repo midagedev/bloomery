@@ -30,9 +30,9 @@ use bloomery_gpu::model::Q8_0GemvHeadsArgs;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::AttnArgs;
-use model::arch::glm5next::names;
 
 use crate::body::{Parts, Store, f32v, gemv, q8};
+use crate::tensors::{MixerNames, other_kind};
 
 /// The launches [`mla`] makes.
 pub(crate) const LAUNCHES: usize = 11;
@@ -42,6 +42,9 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     let stream = gpu.stream();
     let d = *p.d;
     let fault = gpu.layer_sink(l)?;
+    let Some(MixerNames::Latent(n)) = p.names.get(l).map(|n| &n.mixer) else {
+        return Err(other_kind("glm5next mla", l));
+    };
     let s = &mut *p.s;
     let Some(Store::Latent { latent, index }) = p.stores.get_mut(l) else {
         return Err(GpuError::State {
@@ -53,17 +56,17 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
-        f32v(w, &names::attn_norm(l))?,
+        f32v(w, &n.norm)?,
         d.rms_eps,
         d.embd,
         1,
         &mut s.xn,
     )?;
-    gemv(gpu, w, &names::attn_a_stack(l), &s.xn, &mut s.stack)?;
+    gemv(gpu, w, &n.stack, &s.xn, &mut s.stack)?;
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.stack,
-        f32v(w, &names::attn_q_a_norm(l))?,
+        f32v(w, &n.q_a_norm)?,
         d.rms_eps,
         d.q_lora,
         1,
@@ -79,7 +82,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
                 m: 1,
             },
             off: d.q_lora,
-            gain: f32v(w, &names::attn_kv_a_norm(l))?,
+            gain: f32v(w, &n.kv_a_norm)?,
             pos: &s.pos,
             eps: d.rms_eps,
             fault,
@@ -96,16 +99,16 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             },
             k_off: d.q_lora + LATENT,
             g_off: d.q_lora + LATENT + d.index_d,
-            w: f32v(w, &names::indexer_k_norm(l))?,
-            b: f32v(w, &names::indexer_k_norm_bias(l))?,
+            w: f32v(w, &n.index_norm)?,
+            b: f32v(w, &n.index_norm_bias)?,
             pos: &s.pos,
             eps: d.norm_eps,
             fault,
             cache: index,
         },
     )?;
-    gemv(gpu, w, &names::attn_q_b(l), &s.qr, &mut s.q)?;
-    let (qs, dd) = q8(w, &names::attn_k_b(l))?;
+    gemv(gpu, w, &n.q_b, &s.qr, &mut s.q)?;
+    let (qs, dd) = q8(w, &n.k_b)?;
     p.k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
@@ -146,7 +149,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     );
     DeviceTensor::release(window);
     r?;
-    let (qs, dd) = q8(w, &names::attn_v_b(l))?;
+    let (qs, dd) = q8(w, &n.v_b)?;
     p.k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
@@ -160,5 +163,5 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             y: &mut s.av,
         },
     )?;
-    gemv(gpu, w, &names::attn_output(l), &s.av, &mut s.out)
+    gemv(gpu, w, &n.out, &s.av, &mut s.out)
 }

@@ -14,6 +14,7 @@
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
+//! - `tensors`: each layer's tensor names, made at load;
 //! - [`forced`]: one layer alone on given streams, for the gates.
 //!
 //! Built with `cargo oxide`, as the device crates it links are.
@@ -25,7 +26,8 @@ mod host;
 mod kda;
 mod mla;
 mod program;
+mod tensors;
 
-pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, prompt};
+pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, Plant, prompt, set_taps};
 pub use host::GlmHost;
 pub use program::{layer_launches, step_launches};

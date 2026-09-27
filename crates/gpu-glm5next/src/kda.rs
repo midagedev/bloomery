@@ -11,7 +11,7 @@
 //!    `ssm_g_b` on the halves' outputs;
 //! 4. the conv and prep with one decay per key channel
 //!    (`kda_conv_prep`: the conv over the ring by the token's position, SiLU,
-//!    the q and k L2 norms, σ(β), `exp(lb · σ(−a · (f + dt)))`);
+//!    the q and k L2 norms, σ(β), `exp(lb · σ(−ssm_a · (f + dt)))`);
 //! 5. the delta step (`kda_delta`) over the state's one lane;
 //! 6. the gated per-head RMS norm with the sigmoid gate;
 //! 7. the output projection.
@@ -26,9 +26,9 @@ use bloomery_gpu::linear::delta::DeltaArgs;
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
-use model::arch::glm5next::names;
 
 use crate::body::{Parts, Store, f32v, gemv};
+use crate::tensors::{MixerNames, other_kind};
 
 /// The launches [`kda`] makes.
 pub(crate) const LAUNCHES: usize = 11;
@@ -38,6 +38,9 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     let stream = gpu.stream();
     let d = *p.d;
     let fault = gpu.layer_sink(l)?;
+    let Some(MixerNames::Kda(n)) = p.names.get(l).map(|n| &n.mixer) else {
+        return Err(other_kind("glm5next kda", l));
+    };
     let s = &mut *p.s;
     let Some(Store::Kda { state, ring }) = p.stores.get_mut(l) else {
         return Err(GpuError::State {
@@ -48,18 +51,18 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
-        f32v(w, &names::attn_norm(l))?,
+        f32v(w, &n.norm)?,
         d.rms_eps,
         d.embd,
         1,
         &mut s.xn,
     )?;
-    gemv(gpu, w, &names::attn_qkv(l), &s.xn, &mut s.qkv)?;
-    gemv(gpu, w, &names::ssm_f_a(l), &s.xn, &mut s.fa)?;
-    gemv(gpu, w, &names::ssm_g_a(l), &s.xn, &mut s.ga)?;
-    gemv(gpu, w, &names::ssm_beta(l), &s.xn, &mut s.beta_raw)?;
-    gemv(gpu, w, &names::ssm_f_b(l), &s.fa, &mut s.f)?;
-    gemv(gpu, w, &names::ssm_g_b(l), &s.ga, &mut s.z)?;
+    gemv(gpu, w, &n.qkv, &s.xn, &mut s.qkv)?;
+    gemv(gpu, w, &n.f_a, &s.xn, &mut s.fa)?;
+    gemv(gpu, w, &n.g_a, &s.xn, &mut s.ga)?;
+    gemv(gpu, w, &n.beta, &s.xn, &mut s.beta_raw)?;
+    gemv(gpu, w, &n.f_b, &s.fa, &mut s.f)?;
+    gemv(gpu, w, &n.g_b, &s.ga, &mut s.z)?;
     let lin = &p.k.linear;
     lin.conv.enqueue_kda_conv_prep(
         stream,
@@ -67,9 +70,9 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             x: &s.qkv,
             b_raw: &s.beta_raw,
             f: &s.f,
-            w: f32v(w, &names::ssm_conv1d_qkv(l))?,
-            dt_bias: f32v(w, &names::ssm_dt_bias(l))?,
-            ssm_a: f32v(w, &names::ssm_a(l))?,
+            w: f32v(w, &n.conv)?,
+            dt_bias: f32v(w, &n.dt_bias)?,
+            ssm_a: f32v(w, &n.a)?,
             pos: &s.pos,
             shape: d.kda,
             lb: d.lb,
@@ -103,7 +106,7 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         NormGateArgs {
             o: &s.o,
             z: &s.z,
-            w: f32v(w, &names::ssm_norm(l))?,
+            w: f32v(w, &n.gate_norm)?,
             eps: d.rms_eps,
             n_v: d.kda.n_v,
             m: 1,
@@ -111,5 +114,5 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             y: &mut s.gated,
         },
     )?;
-    gemv(gpu, w, &names::attn_output(l), &s.gated, &mut s.out)
+    gemv(gpu, w, &n.out, &s.gated, &mut s.out)
 }

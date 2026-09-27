@@ -67,10 +67,11 @@
 //!     tokens than lanes.
 //!
 //! One case runs only when named, `--case kda_ik`, and alone: per KDA layer of
-//! the `ref_glm5next` set, the KDA delta on ik's own inputs against
-//! `attn_output` and `new_state`, and the sigmoid norm on ik's `attn_output`
-//! against `final_output`, in bands (its doc names the three known
-//! differences). Without the glm5next reference family, or with it and a set,
+//! the `ref_glm5next` set, the KDA conv and prep on ik's own inputs against
+//! ik's convolved, normed q·k·v, β and decay, the KDA delta on ik's own
+//! inputs against `attn_output` and `new_state`, and the sigmoid norm on ik's
+//! `attn_output` against `final_output`, in bands (its doc names the three
+//! known differences). Without the glm5next reference family, or with it and a set,
 //! tap or tensor missing, it fails by name.
 
 #[cfg(not(feature = "gpu"))]
@@ -1453,15 +1454,16 @@ mod gate {
         map: KHeadMap::Tiled,
     };
     /// The ik band's bounds, `‖ours − ik‖ / ‖ik‖` over a tap, teacher-forced
-    /// on ik's own inputs of one layer over the batch set's 32 tokens from a
+    /// on ik's own inputs of one layer over the batch set's 5 tokens from a
     /// zero state.
     // PIN(2026-09-27): per token the known differences (a 128-term dot in two
     // orders, ~√128·2⁻²⁴ ≈ 7e-7 relative; libm expf against expf_ik, ≤ 2 ulp
     // on β and each decay; q scaled before against the output after) are
-    // ~1e-6; the recurrence contracts (decay ≤ 1, ‖k‖ = 1, β < 1), so over 32
-    // tokens the error adds at most linearly, ≤ 32 × 1e-6 ≈ 3e-5 [derived];
-    // 1e-4 is that bound with a 3× margin. The gated norm takes ik's own
-    // attn_output: one f64 mean and one sigmoid apart, ~3e-7 [derived], 1e-5.
+    // ~1e-6; the recurrence contracts (decay ≤ 1, ‖k‖ = 1, β < 1), so over the
+    // set's 5 tokens the error adds at most linearly, ≤ 5 × 1e-6 = 5e-6
+    // [derived]; 1e-4 is 20× that, a loose band. The gated norm takes ik's
+    // own attn_output: one f64 mean and one sigmoid apart, ~3e-7 [derived],
+    // 1e-5.
     const IK_BAND_DELTA: f64 = 1e-4;
     const IK_BAND_NORM: f64 = 1e-5;
 
@@ -2202,8 +2204,112 @@ mod gate {
     /// The batch set every KDA ik clause reads.
     const IK_KDA_SET: &str = "ref_glm5next";
 
+    /// PIN(2026-09-28): the band of `kda_conv_prep` on ik's inputs, each
+    /// output's `‖ours − ik‖ / ‖ik‖`. No recurrence carries an error from one
+    /// token to the next; per value the known differences are the 4-tap
+    /// conv's FMA chain against ik's products and sums (≤ 2 ulp), the q and
+    /// k L2 norms' f64 sums in two orders (~√128·2⁻²⁴ ≈ 7e-7), our sigmoid
+    /// and `expf_ik` against ik's graph ops, the decay's argument up to 5 in
+    /// magnitude so its exp carries ≤ 5 × its rounding (≈ 6e-7): ~1e-6
+    /// [derived]; 1e-5 is that with a 10× margin.
+    const IK_BAND_PREP: f64 = 1e-5;
+
+    /// `kda_conv_prep` for layer `l` on ik's own inputs of the batch set from
+    /// a zero ring — the mixed q·k·v (`qkv_mixed`), β's raw projection
+    /// (`beta_in`), the forget projection (`decay_raw`) and the file's conv
+    /// taps, `dt_bias` and `ssm_a` — against ik: the v channels against
+    /// `conv_output_silu`'s, q and k against `q_fused` and `k_fused` (ours ×
+    /// `Q_SCALE` on q, as `ik_q` holds it), β against `sigmoid(beta_in)` and
+    /// the decay against `expf_ik(g_in)`, each within [`IK_BAND_PREP`]. ik's
+    /// `conv_states` of the set must be zero, as the set starts a sequence;
+    /// another ring is refused by name.
+    fn kda_prep_ik(
+        cx: &Ctx<'_>,
+        (man, split, l): (&RefManifest, &Split, usize),
+        (ik_q, ik_k, ik_silu): (&[f32], &[f32], &[f32]),
+        (ik_beta, ik_decay): (&[f32], &[f32]),
+    ) -> Result<bool, GateError> {
+        let (nk, nv) = (KDA_SHAPE.n_k, KDA_SHAPE.n_v);
+        let ch = KDA_SHAPE.channels();
+        let x = tap(man, &format!("qkv_mixed-{l}"))?;
+        let t_n = x.len() / ch;
+        let conv_states = tap(man, &format!("conv_states-{l}"))?;
+        if conv_states.iter().any(|&v| v != 0.0) {
+            return Err(format!(
+                "layer {l}: {IK_KDA_SET}'s conv_states are not zero; the prep clause starts a \
+                 sequence from a zero ring"
+            )
+            .into());
+        }
+        let tk = KdaTokens {
+            x,
+            b: tap(man, &format!("beta_in-{l}"))?,
+            f: tap(man, &format!("decay_raw-{l}"))?,
+        };
+        let mut w = Vec::with_capacity(CONV_TAPS * ch);
+        for part in ['q', 'k', 'v'] {
+            let name = format!("blk.{l}.ssm_conv1d_{part}.weight");
+            w.extend(split_f32(split, &name, CONV_TAPS * nk * HEAD)?);
+        }
+        let layer = KdaLayer {
+            w,
+            dt: split_f32(split, &format!("blk.{l}.ssm_dt.bias"), nv * HEAD)?,
+            sa: split_f32(split, &format!("blk.{l}.ssm_a"), nv)?,
+            gain: Vec::new(),
+        };
+        if tk.x.len() != t_n * ch || tk.b.len() != t_n * nv || tk.f.len() != t_n * nv * HEAD {
+            return Err(format!(
+                "layer {l}: qkv_mixed {}, beta_in {} and decay_raw {} values, want {t_n} x {ch}, \
+                 {nv} and {}",
+                tk.x.len(),
+                tk.b.len(),
+                tk.f.len(),
+                nv * HEAD
+            )
+            .into());
+        }
+        let zero = vec![0.0f32; KDA_SHAPE.ring_len()];
+        let pos = positions(0, t_n);
+        let d = cx.kda_conv(
+            cx.gpu.unlabelled_sink(),
+            &layer,
+            &tk,
+            &zero,
+            &pos,
+            KDA_LB,
+            t_n,
+        )?;
+        let part = |y: &[f32], from: usize, to: usize| -> Vec<f32> {
+            (0..t_n)
+                .flat_map(|t| y[t * ch + from..t * ch + to].to_vec())
+                .collect()
+        };
+        let q_end = nk * HEAD;
+        let k_end = 2 * nk * HEAD;
+        let rels = [
+            ("q", rel_l2(&part(&d.y, 0, q_end), ik_q)),
+            ("k", rel_l2(&part(&d.y, q_end, k_end), ik_k)),
+            (
+                "v",
+                rel_l2(&part(&d.y, k_end, ch), &part(ik_silu, k_end, ch)),
+            ),
+            ("beta", rel_l2(&d.beta, ik_beta)),
+            ("decay", rel_l2(&d.decay, ik_decay)),
+        ];
+        let ok = rels.iter().all(|&(_, e)| e <= IK_BAND_PREP);
+        println!(
+            "kda ik prep layer {l} ({t_n} tokens of {IK_KDA_SET}): {} (band {IK_BAND_PREP:.0e}) {}",
+            rels.iter()
+                .map(|(n, e)| format!("{n} rel={e:.3e}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// The `kda_ik` case (KDA against ik): per KDA layer of the `ref_glm5next` set,
-    /// `kda_delta` on ik's own inputs (`q_fused` ×[`Q_SCALE`], `k_fused`, the
+    /// `kda_conv_prep` on ik's own inputs ([`kda_prep_ik`]), `kda_delta` on ik's own inputs (`q_fused` ×[`Q_SCALE`], `k_fused`, the
     /// v channels of `conv_output_silu`, `sigmoid(beta_in)`, `expf_ik(g_in)`,
     /// `state_in` transposed) against `attn_output` and `new_state`
     /// (transposed) within [`IK_BAND_DELTA`], and the sigmoid-gated norm on
@@ -2290,6 +2396,7 @@ mod gate {
                 )
                 .into());
             }
+            let prep_ok = kda_prep_ik(cx, (&man, &split, l), (&q, &k, &silu), (&beta, &decay))?;
             let st = Step {
                 qkv,
                 beta,
@@ -2316,8 +2423,11 @@ mod gate {
             let gain = split_f32(&split, &format!("blk.{l}.ssm_norm.weight"), HEAD)?;
             let y = cx.norm_act(unl, (&ik_o, &z, &gain), KDA_EPS, nv, GATE_SIGMOID, t_n)?;
             let e_y = rel_l2(&y, &tap(&man, &format!("final_output-{l}"))?);
-            let ok =
-                clamped == 0 && e_o <= IK_BAND_DELTA && e_s <= IK_BAND_DELTA && e_y <= IK_BAND_NORM;
+            let ok = prep_ok
+                && clamped == 0
+                && e_o <= IK_BAND_DELTA
+                && e_s <= IK_BAND_DELTA
+                && e_y <= IK_BAND_NORM;
             pass &= ok;
             println!(
                 "kda ik band layer {l} ({t_n} tokens of {IK_KDA_SET}): attn_output rel={e_o:.3e} \

@@ -823,6 +823,57 @@ mod elem_kernels {
         }
     }
 
+    /// [`argmax_fault`] for a head whose logits no quantizer checked before
+    /// them (a Q8_0 lm_head over f32 rows): every thread first walks its
+    /// share for a value that is not finite and raises
+    /// [`FaultSite::Logit`] on `fault`, then the same walk, butterfly and
+    /// tie rule pick the index, and thread 0 copies the word as it stands
+    /// past the block barrier, this launch's raise in it. A NaN never wins
+    /// the walk, so without the raise a row of NaNs would answer index 0.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 3))]
+    pub fn argmax_finite_fault(x: &[f32], n: u32, fault: FaultSink, mut out: DisjointSlice<u32>) {
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        let mut finite = true;
+        let mut i = thread::threadIdx_x();
+        while i < n {
+            // SAFETY: i < n <= x.len() by the launch contract.
+            let v = unsafe { *x.get_unchecked(i as usize) };
+            finite &= v.is_finite();
+            i += ARGMAX_THREADS as u32;
+        }
+        if !finite {
+            fault.raise(FaultSite::Logit);
+        }
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        // SAFETY: bv and bi are this block's ARGMAX_WARPS-slot shared arrays,
+        // and x.len() >= n by the launch contract, so element i*1 + 0 of
+        // every i < n is inside x.
+        let fi = unsafe { argmax_block(x, n, 1, 0, bv, bi) };
+        if thread::threadIdx_x() == 0 {
+            let word = fault.read();
+            let sites = fault.read_sites(word);
+            // SAFETY: out.len() >= 3 by the launch contract; only thread 0
+            // writes.
+            unsafe {
+                *out.get_unchecked_mut(0) = fi;
+                *out.get_unchecked_mut(1) = word;
+                *out.get_unchecked_mut(2) = sites;
+            }
+        }
+    }
+
     /// [`argmax_fault`]'s walk over each of `m` interleaved rows: block c
     /// takes row c's `n` values `x[i·m + c]` and writes their argmax to
     /// `out[c]`, with the same walk, butterfly, slot order and tie rule — each
@@ -1450,6 +1501,39 @@ impl ElemKernels {
             self.module
                 .prepare_argmax_fault(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
         self.module.argmax_fault(stream, &prep, x, n, fault, out)?;
+        Ok(())
+    }
+
+    /// [`Self::enqueue_argmax_fault`] that also raises
+    /// [`FaultSite::Logit`] on `fault` when a value of the `n` is not finite,
+    /// its readback carrying the raise ([`argmax_finite_fault`]): the head of
+    /// a projection no quantizer checks the input of. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_argmax_finite_fault(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        fault: FaultSink,
+        out: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_argmax_finite_fault";
+        if n == 0 || x.len() < n || out.len() < 3 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "n={n}, x.len() {}, out.len() {} (need 3)",
+                    x.len(),
+                    out.len()
+                ),
+            ));
+        }
+        let n = launch_u32(WHAT, "n", n)?;
+        let prep = self
+            .module
+            .prepare_argmax_finite_fault(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
+        self.module
+            .argmax_finite_fault(stream, &prep, x, n, fault, out)?;
         Ok(())
     }
 

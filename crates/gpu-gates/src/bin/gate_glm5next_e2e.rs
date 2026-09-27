@@ -34,7 +34,9 @@
 //!   the layered run: a token whose chosen set differs from ik's
 //!   `ffn_moe_topk-L` is a flip, allowed only when every exchanged pair's
 //!   gap in ik's ranked values (`ffn_moe_probs_biased`) lies within our two
-//!   values' error there ([`Flip::allowed`]), named and counted. A flip at
+//!   values' error there and that error within [`FLIP_ERR_CAP`], a measured
+//!   frontier ([`Flip::allowed`]), named and counted; void — a named FAIL —
+//!   when (l) is red, since the picks are the layered run's. A flip at
 //!   layer `L'` and position `t'` lies on the path of every layer output from
 //!   `L'` on at `t'` and at every later position (the mixers' stores carry
 //!   it), and no band here derives how far it moves them: each layer output
@@ -55,8 +57,9 @@
 //!   the step; its argmax equal to ik's, or — named and counted, never
 //!   silently — our argmax ik's runner-up, ik's own margin between the two
 //!   inside twice the distance between our logits and ik's at those ids,
-//!   and our whole logits row within [`FREE_BAND`] of ik's (the head is a
-//!   linear map of the last layer's streams, so it carries their bound). The step's layer
+//!   and our whole logits row within [`HEAD_RATIO`] times the last layer's
+//!   own distance from ik's ([`tie_allowed`]: the head carries its input's
+//!   distance). The step's layer
 //!   outputs against ik's `l_out-L` are printed, and held to [`FREE_BAND`]
 //!   on the two 4-token sets only, below the first layer a flip lies on the
 //!   path of the batch set's last position as (c) names them (those sets'
@@ -65,6 +68,18 @@
 //!   after 1,024 positions the two states have drifted by an amount no band
 //!   here derives.
 //!
+//! - (h) the q8_0 head's fault: `output_norm.weight[0]` set to NaN, a step
+//!   is the fault [`FaultSite::Logit`] at the head, not a token; the weight
+//!   put back, a reset steps clean.
+//! - (a) taps armed after a capture ([`set_taps`]): a graph step, then the
+//!   taps armed, then a step, whose taps are the eager run's bit for bit —
+//!   arming drops the capture, whose replays would copy nothing.
+//! - (o) one owner of the position: a failure planted before a step's launch
+//!   ([`Plant::BeforeLaunch`]) leaves the model at that position and the
+//!   step then runs it, its logits the plain run's bit for bit; one planted
+//!   after the launch leaves the model there too, the next step there
+//!   refused by name (the recurrent stores hold it already) and nothing a
+//!   cut keeps past the model's position.
 //! - (k) checkpoints, on the prose set's ids through the session: a prompt
 //!   of [`A`] ids takes its checkpoints at 512 and [`A`]; a cut keeps 512 for
 //!   600 and nothing for 500, each with its reason's code, and a cut to 600
@@ -102,14 +117,18 @@ mod gate {
 
     use app::arch::glm5next::GlmCfg;
     use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
+    use bloomery_gpu::GpuError;
+    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::weights::DevWeight;
+    use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, ik_q8_2, ref_tensor_logical_in, split_f32,
-        topk_ids_logical_within, verdict,
+        GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
+        ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, step_launches};
+    use bloomery_gpu_glm5next::{Body, Glm5nextModel, Plant, set_taps, step_launches};
     use bloomery_levers::{CARD_BUDGET, HOT_LIST};
     use cuda_core::sys;
     use gguf::quant::dequant_row;
@@ -142,9 +161,9 @@ mod gate {
     /// PIN(2026-09-27): the captured decode step's node count, derived before
     /// the chain was built: every layer's two sub-layers take three launches
     /// each for the streams (`hc_pre_q8_0`, the fold, `hc_post`); a mixer 11
-    /// (KDA: the norm, five q8_0 projections of the normed row and two of
-    /// the low-rank halves, the conv and prep, the delta step, the gated
-    /// norm, the output projection — the q·k·v counted once, joined; latent:
+    /// (KDA: the norm, four q8_0 projections of the normed row — the q·k·v
+    /// joined, the two low-rank halves, β — and two of the halves, the conv
+    /// and prep, the delta step, the gated norm, the output projection; latent:
     /// the norm, the joined projection, the q_a norm, two appends, q_b,
     /// k_b, the attention's two launches, v_b, the output projection); a
     /// dense block 3 (norm, gate·up, down); a routed block 8 (norm, router,
@@ -199,6 +218,27 @@ mod gate {
     /// is the bare embedding), added in quadrature over 45 layers,
     /// independent: √45 · 1.415e-2 ≈ 0.095, rounded up.
     const FREE_BAND: f64 = 0.10;
+
+    /// PIN(2026-09-28): [잠정 — 백로그] the most error our two ranked values
+    /// (a sigmoid score plus the selection bias, so a pair's error is below
+    /// about 2) may carry at an excused flip — a measured frontier, not a
+    /// derivation, in the rule the Qwen3.8 gate's cap takes. The clean
+    /// chain's largest, over the batch set's 56 free flips, is 0.157 (layer
+    /// 27, position 0; 0.140 over 42 under the hot list); with one layer's delta-rule mixer skipped (layer 5,
+    /// its output zeroed) the largest is 0.301 (layer 5, position 4) and the
+    /// next 0.170. 0.2 is their geometric mean rounded, 1.27x above clean,
+    /// and only that one flip past it: a thin frontier. The forced arm's
+    /// ratio and the node count are what catch a skipped sub-layer; a
+    /// flip-aware bound replaces this cap.
+    const FLIP_ERR_CAP: f64 = 0.2;
+
+    /// PIN(2026-09-28): a named tie's logits row against the head input's
+    /// own distance: the row's relative distance from ik's within this many
+    /// times the last layer's. The head is the streams' mean, a norm and a
+    /// linear map, which carries its input's relative perturbation about
+    /// unchanged (the heuristic [`RATIO_BAND`] takes for a linear map, not a
+    /// bound); the three step sets read 0.75, 0.67 and 0.83 of it.
+    const HEAD_RATIO: f64 = 1.5;
 
     /// The stores' bytes at [`CTX`] rows, derived from the header: each KDA
     /// layer's state, 64 heads of 128 × 128 f32, and conv ring, 11 rows of
@@ -421,12 +461,9 @@ mod gate {
 
     fn run_steps(m: &mut Glm5nextModel, toks: &[u32], mode: StepMode) -> Result<Run, GateError> {
         m.reset()?;
-        m.set_mode(mode);
         let taps_on = mode == StepMode::Eager;
-        {
-            let (gpu, _, b) = m.body_parts("run_steps")?;
-            b.set_taps(gpu, taps_on)?;
-        }
+        set_taps(m, taps_on)?;
+        m.set_mode(mode);
         let mut r = Run {
             tokens: Vec::new(),
             logits: Vec::new(),
@@ -440,10 +477,7 @@ mod gate {
                 r.taps.push(b.taps(gpu)?);
             }
         }
-        {
-            let (gpu, _, b) = m.body_parts("run_steps")?;
-            b.set_taps(gpu, false)?;
-        }
+        set_taps(m, false)?;
         m.set_mode(StepMode::Graph);
         Ok(r)
     }
@@ -578,15 +612,7 @@ mod gate {
         /// the best it left.
         fn margin(&self, t: usize) -> f64 {
             let (v, ids) = self.at(t);
-            let min_in = ids
-                .iter()
-                .map(|&e| f64::from(v[e as usize]))
-                .fold(f64::INFINITY, f64::min);
-            let max_out = (0..N_EXPERT)
-                .filter(|&e| !ids.contains(&(e as i32)))
-                .map(|e| f64::from(v[e]))
-                .fold(f64::NEG_INFINITY, f64::max);
-            min_in - max_out
+            flip::margin(v, ids)
         }
     }
 
@@ -596,79 +622,12 @@ mod gate {
         r.probs.iter().zip(&r.bias).map(|(&p, &b)| p + b).collect()
     }
 
-    /// A token whose chosen set differs from ik's: every exchanged pair —
-    /// `a` ours only, `b` ik's only — with ik's gap `ik[b] − ik[a]` and our
-    /// two ranked values' error `|ours[a] − ik[a]| + |ours[b] − ik[b]|`.
-    struct Flip {
-        layer: usize,
-        token: usize,
-        margin: f64,
-        pairs: Vec<(u32, u32, f64, f64)>,
-    }
-
-    impl Flip {
-        /// Allowed only when every pair's gap lies within its error: our
-        /// ranking then differs from ik's by no more than our values'
-        /// distance from ik's. Past it the pick itself is wrong (a router
-        /// defect), named.
-        fn allowed(&self) -> bool {
-            !self.pairs.is_empty() && self.pairs.iter().all(|&(_, _, gap, err)| gap <= err)
-        }
-
-        fn line(&self, arm: &str) -> String {
-            let pairs: Vec<String> = self
-                .pairs
-                .iter()
-                .map(|(a, b, gap, err)| format!("{a}<-{b} gap {gap:.3e} err {err:.3e}"))
-                .collect();
-            format!(
-                "{arm} flip layer={} token={}: ik margin {:.3e}; {}: {}",
-                self.layer,
-                self.token,
-                self.margin,
-                pairs.join(", "),
-                if self.allowed() {
-                    "allowed (counted)"
-                } else {
-                    "FAIL: a pair's gap past our error"
-                }
-            )
-        }
-    }
-
-    /// The flip at layer `l`, token `t`, if our chosen set is not ik's.
+    /// The flip at layer `l`, token `t`, if our chosen set is not ik's, in
+    /// the ranked values ([`Flip::between`]).
     fn flip_at(l: usize, t: usize, ours: &ForcedRoute, ik: &IkRoute) -> Option<Flip> {
         let (iv, ids) = ik.at(t);
         let ov = ours_ranked(ours);
-        let only_ours: Vec<u32> = ours
-            .ids
-            .iter()
-            .copied()
-            .filter(|&e| !ids.contains(&(e as i32)))
-            .collect();
-        let only_ik: Vec<u32> = ids
-            .iter()
-            .map(|&e| e as u32)
-            .filter(|e| !ours.ids.contains(e))
-            .collect();
-        if only_ours.is_empty() && only_ik.is_empty() {
-            return None;
-        }
-        let v = |x: &[f32], e: u32| x.get(e as usize).map_or(f64::NAN, |&y| f64::from(y));
-        let mut pairs = Vec::new();
-        for &a in &only_ours {
-            for &b in &only_ik {
-                let gap = v(iv, b) - v(iv, a);
-                let err = (v(&ov, a) - v(iv, a)).abs() + (v(&ov, b) - v(iv, b)).abs();
-                pairs.push((a, b, gap, err));
-            }
-        }
-        Some(Flip {
-            layer: l,
-            token: t,
-            margin: ik.margin(t),
-            pairs,
-        })
+        Flip::between((l, t), (&ours.ids, &ov), (ids, iv), ik.margin(t))
     }
 
     /// Every routed layer's ik routing, by layer (`None` for a dense one).
@@ -808,11 +767,14 @@ mod gate {
     }
 
     /// The free clause's verdict, and by position the first layer a flip
-    /// lies on the path of ([`N_LAYER`] where none does).
+    /// lies on the path of ([`N_LAYER`] where none does). The picks come
+    /// from the layered run, so the clause is void — a named FAIL — when
+    /// `layered_ok` says that run is not the chain's: its flips would excuse
+    /// what another chain did.
     fn free(
         man: &RefManifest,
         eager: &Run,
-        layered: &[Vec<ForcedRow>],
+        (layered, layered_ok): (&[Vec<ForcedRow>], bool),
         routes: &[Option<IkRoute>],
     ) -> Result<(bool, Vec<usize>), GateError> {
         let table = layer_table(man, &eager.taps)?;
@@ -836,9 +798,9 @@ mod gate {
             }
         }
         for f in &flips {
-            println!("{}", f.line("free"));
+            println!("{}", f.line("free", FLIP_ERR_CAP));
         }
-        let flips_ok = flips.iter().all(Flip::allowed);
+        let flips_ok = flips.iter().all(|f| f.allowed(FLIP_ERR_CAP));
         let worst_held = |same: bool| -> (f64, usize, usize, usize) {
             let mut w = (0.0f64, 0usize, 0usize, 0usize);
             for (l, row) in table.iter().enumerate() {
@@ -883,14 +845,20 @@ mod gate {
             .ok_or("result_output holds no row")?..];
         let ours = eager.logits.last().ok_or("no logits")?;
         let (top, ik_top) = (argmax(ours), argmax(ik_last));
-        let ok = held <= FREE_BAND && flips_ok && top == ik_top;
+        if !layered_ok {
+            println!(
+                "free: FAIL: void — the layered run is not the chain's ((l) is red), so the \
+                 picks it read and the flips they excuse are another chain's"
+            );
+        }
+        let ok = layered_ok && held <= FREE_BAND && flips_ok && top == ik_top;
         println!(
             "free: {} tokens, {} flips ({} allowed), worst l_out_rel off every flip's path \
              {held:.3e} at layer {hl} position {ht} (band {FREE_BAND:.2}); last position argmax \
              ours={top} ik={ik_top} logits_rel={:.3e} (printed) {}",
             eager.tokens.len(),
             flips.len(),
-            flips.iter().filter(|f| f.allowed()).count(),
+            flips.iter().filter(|f| f.allowed(FLIP_ERR_CAP)).count(),
             rel(ours, ik_last),
             verdict(ok)
         );
@@ -1068,8 +1036,8 @@ mod gate {
                 let (mut w_ours, mut w_ik) = (Vec::new(), Vec::new());
                 for (t, r) in rs.iter().enumerate() {
                     if let Some(fl) = flip_at(l, t, r, ik) {
-                        println!("{}", fl.line("forced"));
-                        flips_ok &= fl.allowed();
+                        println!("{}", fl.line("forced", FLIP_ERR_CAP));
+                        flips_ok &= fl.allowed(FLIP_ERR_CAP);
                         flips_all += 1;
                         kept.retain(|&k| k != t);
                         continue;
@@ -1199,16 +1167,23 @@ mod gate {
             .map(|&i| (f64::from(r.1[i as usize]) - f64::from(ik_last[i as usize])).abs())
             .fold(0.0, f64::max);
         let logits_rel = rel(&r.1, ik_last);
-        let tie = top != ik_top && top == ik_2 && margin <= 2.0 * dist && logits_rel <= FREE_BAND;
-        *ties += usize::from(tie);
         let rels = layer_rels(&man, std::slice::from_ref(&r.0))?;
+        let input_rel = rels.last().map_or(f64::INFINITY, |r| r.0);
+        let tie = tie_allowed(
+            (top, ik_top, ik_2),
+            (margin, dist),
+            (logits_rel, input_rel),
+            HEAD_RATIO,
+        );
+        *ties += usize::from(tie);
         let inside = print_layers(name, &rels, held);
         let ok = (top == ik_top || tie) && inside;
         println!(
             "step {name}: position {pos} after {} fed ({:.1} s, runtime value); argmax ours={top} \
              ik={ik_top} (ik's runner-up {ik_2}, margin {margin:.4}, our distance at the two \
-             {dist:.4}, logits_rel {logits_rel:.3e}{}); worst l_out_rel={:.3e} (band on layers \
-             0..{held}, off every flip's path; the rest printed) {}",
+             {dist:.4}, logits_rel {logits_rel:.3e} against the last layer's {input_rel:.3e}, a \
+             tie's bound {HEAD_RATIO:.1}x it{}); worst l_out_rel={:.3e} (band on layers 0..{held}, \
+             off every flip's path; the rest printed) {}",
             prefill.len(),
             t.elapsed().as_secs_f64(),
             if tie { ", a named tie" } else { "" },
@@ -1221,21 +1196,154 @@ mod gate {
     /// The last token eagerly with the taps armed: its layer outputs and
     /// its logits.
     fn run_last(m: &mut Glm5nextModel, tok: u32) -> Result<(Vec<f32>, Vec<f32>), GateError> {
-        m.set_mode(StepMode::Eager);
-        {
-            let (gpu, _, b) = m.body_parts("run_last")?;
-            b.set_taps(gpu, true)?;
-        }
+        set_taps(m, true)?;
         m.step(&[tok])?;
         let logits = m.logits()?;
         let taps = {
             let (gpu, _, b) = m.body_parts("run_last")?;
-            let t = b.taps(gpu)?;
-            b.set_taps(gpu, false)?;
-            t
+            b.taps(gpu)?
         };
+        set_taps(m, false)?;
         m.set_mode(StepMode::Graph);
         Ok((taps, logits))
+    }
+
+    // ------------------------------------- (h) head fault, (a) taps, (o) owner
+
+    /// The final norm's gain, whose first value the head clause sets to NaN
+    /// and puts back.
+    const HEAD_GAIN: &str = "output_norm.weight";
+
+    /// Write `bytes` over the first value of [`HEAD_GAIN`] and return the
+    /// bytes it replaced.
+    fn patch_head_gain(m: &mut Glm5nextModel, bytes: [u8; 4]) -> Result<[u8; 4], GateError> {
+        let (gpu, w, _) = m.body_parts("gate_glm5next_e2e patch_head_gain")?;
+        let Some(DevWeight::F32 { w: gain, .. }) = w.get(HEAD_GAIN) else {
+            return Err(format!("{HEAD_GAIN} is not resident as F32").into());
+        };
+        patch_bytes(gpu.stream(), gain.buf(), 0, bytes)
+    }
+
+    /// (h): a NaN gain makes every logit NaN; the step is the head's
+    /// [`FaultSite::Logit`], the model poisoned, and with the gain put back a
+    /// reset steps to the clean token.
+    fn head_fault(m: &mut Glm5nextModel, tok: u32, clean: u32) -> Result<bool, GateError> {
+        let want = Fault::at(LAYER_HEAD, FaultSite::Logit);
+        m.reset()?;
+        let old = patch_head_gain(m, f32::NAN.to_le_bytes())?;
+        let first = m.step(&[tok]);
+        let poisoned = m.poisoned();
+        patch_head_gain(m, old)?;
+        m.reset()?;
+        let again = m.step(&[tok]);
+        m.reset()?;
+        let named = matches!(&first, Err(GpuError::Fault { fault, .. }) if *fault == want);
+        let ok = named && poisoned == Some(want) && matches!(again, Ok(t) if t == clean);
+        println!(
+            "head fault: NaN in {HEAD_GAIN}[0], a step: {} (want the output head's fault at site {}), poisoned {}; \
+             the gain put back and a reset: {} (want token {clean}) {}",
+            match &first {
+                Ok(t) => format!("token {t}"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            FaultSite::Logit.name(),
+            poisoned.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            match &again {
+                Ok(t) => format!("token {t}"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (a): a graph step captures the chain; taps armed after it, the next
+    /// step's taps are the eager run's at that position, bit for bit.
+    fn taps_after_capture(
+        m: &mut Glm5nextModel,
+        toks: &[u32],
+        eager: &Run,
+    ) -> Result<bool, GateError> {
+        m.reset()?;
+        set_taps(m, false)?;
+        m.set_mode(StepMode::Graph);
+        m.step(&toks[..1])?;
+        let captured = m.has_capture();
+        set_taps(m, true)?;
+        let mode = m.mode();
+        m.step(&toks[1..2])?;
+        let taps = {
+            let (gpu, _, b) = m.body_parts("taps_after_capture")?;
+            b.taps(gpu)?
+        };
+        set_taps(m, false)?;
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let same = eager.taps.get(1).is_some_and(|e| same_bits(&taps, e));
+        let ok = captured && mode == StepMode::Eager && same;
+        println!(
+            "taps after a capture: captured {captured}, then armed: mode {mode:?} (want Eager); the \
+             next step's taps are the eager run's bit for bit: {same} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (o): a failure planted on either side of a step's launch, graph
+    /// mode, against the plain graph run's logits.
+    fn position_owner(m: &mut Glm5nextModel, toks: &[u32], graph: &Run) -> Result<bool, GateError> {
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        m.step(&toks[..2])?;
+        let plant = |m: &mut Glm5nextModel, p: Plant| -> Result<(), GateError> {
+            m.body_parts("position_owner")?.2.plant(p);
+            Ok(())
+        };
+        let text = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        plant(m, Plant::BeforeLaunch)?;
+        let before = m.step(&toks[2..3]);
+        let at_before = m.pos();
+        let rerun = m.step(&toks[2..3]);
+        let rerun_bits = rerun.is_ok()
+            && graph
+                .logits
+                .get(2)
+                .is_some_and(|g| m.logits().is_ok_and(|l| same_bits(&l, g)));
+        let before_ok = matches!(&before, Err(GpuError::State { .. }))
+            && m.poisoned().is_none()
+            && at_before == 2
+            && rerun_bits;
+        println!(
+            "position owner: a failure before the launch at 2: {} at position {at_before} (want \
+             2); the step again: {}, its logits the plain run's bit for bit: {rerun_bits} {}",
+            text(&before),
+            text(&rerun),
+            verdict(before_ok)
+        );
+        plant(m, Plant::AfterLaunch)?;
+        let after = m.step(&toks[3..4]);
+        let at_after = m.pos();
+        let kept = m.body("position_owner")?.kept(u32::MAX, at_after);
+        let again = m.step(&toks[3..4]);
+        let refused = matches!(&again, Err(e)
+            if e.to_string().contains("failed after its chain was launched"));
+        let after_ok = matches!(&after, Err(GpuError::State { .. }))
+            && m.poisoned().is_none()
+            && at_after == 3
+            && kept.at <= at_after
+            && refused;
+        println!(
+            "position owner: a failure after the launch at 3: {} at position {at_after} (want 3); \
+             a cut keeps {kept} (want at most 3); the step again: {} (want refused by name) {}",
+            text(&after),
+            text(&again),
+            verdict(after_ok)
+        );
+        m.reset()?;
+        Ok(before_ok && after_ok)
     }
 
     // ------------------------------------------------ (k) checkpoints
@@ -1270,9 +1378,10 @@ mod gate {
         for ms in &mut take_ms {
             s.reset()?;
             s.step(ids[0], Want::Argmax)?;
+            let pos = s.model().pos();
             let (gpu, _, b) = s.model_mut().body_parts("keep")?;
             let t = Instant::now();
-            b.checkpoint(gpu)?;
+            b.checkpoint(gpu, pos)?;
             *ms = t.elapsed().as_secs_f64() * 1e3;
         }
         println!(
@@ -1377,10 +1486,14 @@ mod gate {
         let graph = run_steps(m, &toks, StepMode::Graph)?;
         let eager = run_steps(m, &toks, StepMode::Eager)?;
         ok &= one_chain(&graph, &eager);
+        ok &= taps_after_capture(m, &toks, &eager)?;
+        ok &= position_owner(m, &toks, &graph)?;
+        ok &= head_fault(m, toks[0], graph.tokens[0])?;
         let routes = ik_routes(&man)?;
         let layered = layered(m, &toks)?;
-        ok &= layered_is_chain(&layered, &eager);
-        let (free_ok, firsts) = free(&man, &eager, &layered, &routes)?;
+        let layered_ok = layered_is_chain(&layered, &eager);
+        ok &= layered_ok;
+        let (free_ok, firsts) = free(&man, &eager, (&layered, layered_ok), &routes)?;
         ok &= free_ok;
         drop(layered);
         let last = *firsts.last().ok_or("no positions")?;

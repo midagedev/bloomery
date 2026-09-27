@@ -11,7 +11,10 @@
 //! a waiting cut first.
 //!
 //! A slot is made (pinned and zeroed) the first time a checkpoint needs it,
-//! and kept for the load.
+//! and kept for the load. Each slot records the position its last finished
+//! copy holds, apart from the ledger: a restore reads a slot only as that
+//! position ([`seqstate::restorable`]), so no ledger point can hand back a
+//! slot no copy filled.
 
 use std::sync::Arc;
 
@@ -22,13 +25,19 @@ use crate::GpuError;
 
 const WHAT: &str = "checkpoint";
 
+/// One slot: a pinned buffer per store, and the position its last finished
+/// copy holds — none when made, and none again after a copy that failed.
+struct Slot {
+    bufs: Vec<PinnedHostBuffer<f32>>,
+    holds: Option<u32>,
+}
+
 /// One model's checkpoints: the ledger, the stores' lengths, the slots.
 pub struct Checkpoints {
     ledger: Ledger,
     /// f32s of each copied store, in the body's order.
     lens: Vec<usize>,
-    /// Per slot, one pinned buffer per store.
-    slots: Vec<Vec<PinnedHostBuffer<f32>>>,
+    slots: Vec<Slot>,
     /// The spacing of a prompt call's inner checkpoints (`seqstate::marks`).
     every: u32,
     ctx: Arc<CudaContext>,
@@ -129,13 +138,14 @@ impl Checkpoints {
                     s.zero_async(stream)?;
                 }
             }
-            Cut::Restore { slot } => {
+            Cut::Restore { slot, at } => {
                 let src = self.slots.get(slot).ok_or(GpuError::State {
                     what: WHAT,
                     missing: "the restored checkpoint's slot",
                 })?;
+                seqstate::restorable(slot, src.holds, at).map_err(refused)?;
                 let mut sent = Ok(());
-                for (s, h) in stores.iter_mut().zip(src) {
+                for (s, h) in stores.iter_mut().zip(&src.bufs) {
                     // SAFETY: the stream is synchronized below before this
                     // returns, whether or not every copy was enqueued, and
                     // `h` is neither written nor freed before then: the
@@ -180,9 +190,9 @@ impl Checkpoints {
                     .iter()
                     .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.slots.push(bufs);
+                self.slots.push(Slot { bufs, holds: None });
             }
-            if let Err(e) = self.copy_into(stream, slot, stores) {
+            if let Err(e) = self.copy_into(stream, slot, at, stores) {
                 // The slot holds part of a copy: no point may name it.
                 self.ledger.clear();
                 return Err(e);
@@ -191,19 +201,23 @@ impl Checkpoints {
         Ok(take)
     }
 
-    /// `stores` into slot `slot`'s buffers; waits for the copies.
+    /// `stores`, which hold position `at`, into slot `slot`'s buffers; waits
+    /// for the copies. The slot holds `at` once every copy has finished, and
+    /// nothing from the first enqueue on until then.
     fn copy_into(
         &mut self,
         stream: &CudaStream,
         slot: usize,
+        at: u32,
         stores: &[&mut DeviceBuffer<f32>],
     ) -> Result<(), GpuError> {
         let dst = self.slots.get_mut(slot).ok_or(GpuError::State {
             what: WHAT,
             missing: "the checkpoint's slot",
         })?;
+        dst.holds = None;
         let mut sent = Ok(());
-        for (s, h) in stores.iter().zip(dst.iter_mut()) {
+        for (s, h) in stores.iter().zip(dst.bufs.iter_mut()) {
             // SAFETY: the stream is synchronized below before this returns,
             // whether or not every copy was enqueued, and `h` is neither
             // read nor freed before then: the slots are only touched through
@@ -215,7 +229,9 @@ impl Checkpoints {
         }
         let synced = stream.synchronize();
         sent?;
-        Ok(synced?)
+        synced?;
+        dst.holds = Some(at);
+        Ok(())
     }
 
     /// Every checkpoint dropped and no cut waiting: the model is empty. The
@@ -247,5 +263,70 @@ fn refused(e: seqstate::CheckpointError) -> GpuError {
     GpuError::Shape {
         what: WHAT,
         detail: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A restore reads a slot only as the position its last finished copy
+    /// holds: a ledger point planted on a slot made and never copied is
+    /// refused by name, and the stores keep what they held; a slot a take
+    /// filled restores.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_restore_refuses_a_slot_no_copy_filled() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
+        let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
+        let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");
+        let take = c
+            .take(&stream, 5, &mut [&mut a, &mut b])
+            .expect("a take at 5");
+        assert!(matches!(take, Take::Copy { slot: 0, .. }), "{take:?}");
+        // The plant: the ledger names a new slot at 9, the slot is made as a
+        // take makes it, and no copy runs.
+        let planted = c.ledger.take(9).expect("the ledger's point at 9");
+        assert!(
+            matches!(
+                planted,
+                Take::Copy {
+                    slot: 1,
+                    new: true,
+                    ..
+                }
+            ),
+            "{planted:?}"
+        );
+        let bufs = c
+            .lens
+            .iter()
+            .map(|&n| PinnedHostBuffer::<f32>::zeroed(&ctx, n))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the slot's buffers");
+        c.slots.push(Slot { bufs, holds: None });
+        c.cut(9, 10).expect("a cut to the planted point");
+        let err = c
+            .apply(&stream, &mut [&mut a, &mut b])
+            .expect_err("a restore of a slot no copy filled");
+        assert!(
+            err.to_string()
+                .contains("a restore of position 9 from slot 1, which no copy has finished"),
+            "{err}"
+        );
+        assert_eq!(a.to_host_vec(&stream).expect("a"), [1.0; 4]);
+        c.clear();
+        a.copy_from_host(&stream, &[0.0; 4]).expect("a");
+        let take = c
+            .take(&stream, 5, &mut [&mut a, &mut b])
+            .expect("a take at 5");
+        assert!(matches!(take, Take::Copy { .. }), "{take:?}");
+        a.copy_from_host(&stream, &[3.0; 4]).expect("a");
+        c.cut(5, 6).expect("a cut to 5");
+        c.apply(&stream, &mut [&mut a, &mut b])
+            .expect("a restore of the copied slot");
+        assert_eq!(a.to_host_vec(&stream).expect("a"), [0.0; 4]);
     }
 }

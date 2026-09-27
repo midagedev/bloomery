@@ -123,6 +123,9 @@ pub enum FaultSite {
     /// under its sigmoid gate, the shared expert's gated sum) met an input or
     /// produced a value that is not finite.
     F32Product = 21,
+    /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
+    /// over f32 rows) met a logit that is not finite in its argmax.
+    Logit = 22,
     /// A linear-attention delta step over lanes (`linear::delta`'s
     /// `gdn_delta_lanes`) read a lane whose stamp is not the position its
     /// first row stands at: a lane never written, or one a commit did not
@@ -133,6 +136,7 @@ pub enum FaultSite {
 // A site is one bit of a u32 mask.
 const _: () = assert!((FaultSite::HcMix as u32) < 32);
 const _: () = assert!((FaultSite::F32Product as u32) < 32);
+const _: () = assert!((FaultSite::Logit as u32) < 32);
 const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
 
 impl FaultSite {
@@ -158,6 +162,7 @@ impl FaultSite {
         FaultSite::Ple,
         FaultSite::HcMix,
         FaultSite::F32Product,
+        FaultSite::Logit,
         FaultSite::DeltaStamp,
     ];
 
@@ -185,6 +190,7 @@ impl FaultSite {
             FaultSite::Ple => "ple",
             FaultSite::HcMix => "hc_mix",
             FaultSite::F32Product => "f32_product",
+            FaultSite::Logit => "logit",
             FaultSite::DeltaStamp => "delta_stamp",
         }
     }
@@ -235,6 +241,7 @@ impl FaultSite {
                 "an attention output, its gate, a shared expert output, its weight or the host sum \
                  not finite, or a product or sum that is not"
             }
+            FaultSite::Logit => "a head logit not finite",
             FaultSite::DeltaStamp => {
                 "a delta-step lane whose stamp is not the position of the call's first row: a lane \
                  never written, or one a commit did not leave there"
@@ -255,8 +262,8 @@ pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
         AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, DeltaStamp, ExpertId, F32Product,
-        HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, NormQuant, Ple, PoolSelect,
-        Q5Quant, QuantColumn, Router, TokenId,
+        HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, Logit, NormQuant, Ple,
+        PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -286,6 +293,7 @@ pub mod step_order {
         HcMix,
         F32Product,
         DeltaStamp,
+        Logit,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -313,6 +321,7 @@ pub mod step_order {
         HcMix,
         F32Product,
         DeltaStamp,
+        Logit,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -341,6 +350,7 @@ pub mod step_order {
         HcMix,
         F32Product,
         DeltaStamp,
+        Logit,
     ];
 
     /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
@@ -359,6 +369,7 @@ pub mod step_order {
     /// [`PoolSelect`] (its raw key append first) before its out gate's
     /// [`F32Product`]. The mask names every site raised either way; only the
     /// order it prints them in differs.
+    /// A q8_0 head's logits read after every layer's sites.
     pub const QWEN35MOE: &[FaultSite] = &[
         TokenId,
         Ple,
@@ -375,6 +386,7 @@ pub mod step_order {
         QuantColumn,
         Router,
         ExpertId,
+        Logit,
         AttnCount,
         AttnSel,
         Q5Quant,
@@ -386,7 +398,7 @@ pub mod step_order {
     /// GLM-5.3-Flash (`gpu-glm5next`): a KDA layer's conv, delta step (its
     /// lane word right after it) and gated norm; a latent layer's two cache
     /// appends and its attention's visible count; then the router and the
-    /// handoff's id check. The token id is checked on the host before the
+    /// handoff's id check; the q8_0 head's logits last. The token id is checked on the host before the
     /// step (the embedding is a host row), and the hyper-connection and
     /// projection launches read f32 rows with nothing to raise; those sites
     /// follow the ones the step raises.
@@ -401,6 +413,7 @@ pub mod step_order {
         AttnCount,
         Router,
         ExpertId,
+        Logit,
         HcQuant,
         NormQuant,
         QuantColumn,

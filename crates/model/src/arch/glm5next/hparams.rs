@@ -242,11 +242,11 @@ impl Hparams {
             ":2375-2378",
             &mut defaults,
         );
-        if gate_lower_bound.is_nan() || gate_lower_bound >= 0.0 {
+        if !gate_lower_bound.is_finite() || gate_lower_bound >= 0.0 {
             return Err(metadata(
                 split,
                 "kda.gate_lower_bound",
-                format!("is {gate_lower_bound}; the bounded decay needs a bound below 0"),
+                format!("is {gate_lower_bound}; the bounded decay needs a finite bound below 0"),
             ));
         }
         let indexer = indexer(split)?;
@@ -293,6 +293,16 @@ impl Hparams {
                 split,
                 "expert_gating_func",
                 format!("is {gating}; this reader reads the sigmoid router ({SIGMOID})"),
+            ));
+        }
+        // ik divides the picks' weights by their sum only `if (norm_w)`
+        // (llm_build_context :1548); the body runs that rule alone.
+        let weights_norm = meta_bool(split, "expert_weights_norm")?;
+        if !weights_norm {
+            return Err(metadata(
+                split,
+                "expert_weights_norm",
+                "is false; the glm5next body runs only the router that renormalizes its picks",
             ));
         }
         let expert_ff = positive(split, "expert_feed_forward_length")?;
@@ -362,7 +372,7 @@ impl Hparams {
             shared_ff,
             dense_lead,
             dense_ff,
-            weights_norm: meta_bool(split, "expert_weights_norm")?,
+            weights_norm,
             weights_scale: meta_f32(split, "expert_weights_scale")?,
             limit_exp,
             limit_shexp,
@@ -370,6 +380,7 @@ impl Hparams {
             defaults,
         };
         hp.tensors_agree(split)?;
+        hp.kda_dims_agree(split)?;
         Ok(hp)
     }
 
@@ -437,6 +448,81 @@ impl Hparams {
             });
         }
         Ok(())
+    }
+
+    /// A KDA layer's tensors by stem and the dims ik creates them with
+    /// (`create_glm5next_tensors`), ggml order: `d_state` is `kda.head_dim`,
+    /// `d_inner` that times the heads.
+    pub(super) fn kda_dims(&self) -> [(&'static str, Vec<u64>); 16] {
+        let (e, h, st) = (
+            self.n_embd as u64,
+            self.n_head as u64,
+            self.kda_head_dim as u64,
+        );
+        let inner = st * h;
+        let conv = self.conv as u64;
+        [
+            ("attn_norm.weight", vec![e]),
+            ("attn_q.weight", vec![e, inner]),
+            ("attn_k.weight", vec![e, inner]),
+            ("attn_v.weight", vec![e, inner]),
+            ("ssm_conv1d_q.weight", vec![conv, 1, inner]),
+            ("ssm_conv1d_k.weight", vec![conv, 1, inner]),
+            ("ssm_conv1d_v.weight", vec![conv, 1, inner]),
+            ("ssm_f_a.weight", vec![e, st]),
+            ("ssm_f_b.weight", vec![st, inner]),
+            ("ssm_g_a.weight", vec![e, st]),
+            ("ssm_g_b.weight", vec![st, inner]),
+            ("ssm_beta.weight", vec![e, h]),
+            ("ssm_a", vec![h]),
+            ("ssm_dt.bias", vec![inner]),
+            ("ssm_norm.weight", vec![st]),
+            ("attn_output.weight", vec![inner, e]),
+        ]
+    }
+
+    /// Every trunk KDA layer's tensors hold exactly [`Hparams::kda_dims`], as
+    /// ik requires: the kernels check their buffers' lengths only from below,
+    /// so a short tensor would leave the shared scratch's tail to the last
+    /// layer and a long one would be read in part. The first tensor of other
+    /// dims, by name, with how many more there are.
+    fn kda_dims_agree(&self, split: &Split) -> Result<(), PlacementError> {
+        let pad = |d: &[u64]| {
+            let mut d = d.to_vec();
+            while d.last() == Some(&1) {
+                d.pop();
+            }
+            d
+        };
+        let want = self.kda_dims();
+        let mut off = Vec::new();
+        for (l, &kind) in self.kinds.iter().enumerate().take(self.n_trunk) {
+            if kind != Kind::Kda {
+                continue;
+            }
+            for (stem, dims) in &want {
+                let name = format!("blk.{l}.{stem}");
+                if let Some((_, info)) = split.find(&name)
+                    && pad(&info.dims) != pad(dims)
+                {
+                    off.push((name, format!("{:?} (want {dims:?})", info.dims)));
+                }
+            }
+        }
+        match off.first() {
+            None => Ok(()),
+            Some((name, _)) => Err(PlacementError::Tensor {
+                name: name.clone(),
+                detail: format!(
+                    "has other dims than ik creates the KDA tensor with ({} such: {})",
+                    off.len(),
+                    off.iter()
+                        .map(|(n, d)| format!("{n} {d}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+        }
     }
 }
 
@@ -618,7 +704,7 @@ fn or_default<T: std::fmt::Display>(
 pub(super) mod tests {
     use super::super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, Stem};
     use super::{Hparams, Kind};
-    use crate::arch::synthetic::{V, header};
+    use crate::arch::synthetic::{V, header_shaped};
 
     /// Five layers: 0 KDA and dense, 1 and 3 latent, 2 KDA, then the
     /// next-token layer 4 (latent).
@@ -693,9 +779,54 @@ pub(super) mod tests {
         out
     }
 
+    /// A KDA tensor's dims in the header of [`keys`] (64 wide, 4 heads of
+    /// 8, conv 4: 32 inner values), ggml order; `None` for another stem.
+    fn kda_dims(stem: &str) -> Option<Vec<u64>> {
+        Some(match stem {
+            "attn_norm.weight" => vec![64],
+            "attn_q.weight" | "attn_k.weight" | "attn_v.weight" => vec![64, 32],
+            "ssm_conv1d_q.weight" | "ssm_conv1d_k.weight" | "ssm_conv1d_v.weight" => {
+                vec![4, 1, 32]
+            }
+            "ssm_f_a.weight" | "ssm_g_a.weight" => vec![64, 8],
+            "ssm_f_b.weight" | "ssm_g_b.weight" => vec![8, 32],
+            "ssm_beta.weight" => vec![64, 4],
+            "ssm_a" => vec![4],
+            "ssm_dt.bias" => vec![32],
+            "ssm_norm.weight" => vec![8],
+            "attn_output.weight" => vec![32, 64],
+            _ => return None,
+        })
+    }
+
+    /// `tensors` with their dims: a KDA layer's (layers 0 and 2) as ik
+    /// creates them, every other one value.
+    pub(in crate::arch::glm5next) fn shaped(tensors: &[String]) -> Vec<(String, Vec<u64>)> {
+        tensors
+            .iter()
+            .map(|n| {
+                let dims = ["blk.0.", "blk.2."]
+                    .iter()
+                    .find_map(|p| n.strip_prefix(p))
+                    .and_then(kda_dims)
+                    .unwrap_or_else(|| vec![1]);
+                (n.clone(), dims)
+            })
+            .collect()
+    }
+
     /// The read of a header of `kv` and `tensors`, or its error's text.
     fn read(tag: &str, kv: &[(&str, V)], tensors: &[String]) -> Result<Hparams, String> {
-        let path = header(tag, "glm5next", kv, tensors);
+        read_shaped(tag, kv, &shaped(tensors))
+    }
+
+    /// [`read`] with each tensor's dims.
+    fn read_shaped(
+        tag: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> Result<Hparams, String> {
+        let path = header_shaped(tag, "glm5next", kv, &[], tensors);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let hp = Hparams::read(&split).map_err(|e| e.to_string());
         let _ = std::fs::remove_file(&path);
@@ -788,5 +919,69 @@ pub(super) mod tests {
             &tensors(),
             "not a whole number of pools of 4",
         );
+    }
+
+    /// A bound of −∞ would make every decay 0 and erase the state each
+    /// token: refused by name, as a bound at or above 0 is.
+    #[test]
+    fn a_decay_bound_not_finite_is_refused() {
+        for lb in [f32::NEG_INFINITY, f32::NAN, 0.0] {
+            let kv: Vec<_> = keys()
+                .into_iter()
+                .map(|(k, v)| match k {
+                    "kda.gate_lower_bound" => (k, V::F32(lb)),
+                    _ => (k, v),
+                })
+                .collect();
+            refused(
+                "glm5next-lb",
+                &kv,
+                &tensors(),
+                "glm5next.kda.gate_lower_bound: is",
+            );
+        }
+    }
+
+    /// A router that does not renormalize its picks is one the body does
+    /// not run: refused by name.
+    #[test]
+    fn unnormalized_expert_weights_are_refused() {
+        let kv: Vec<_> = keys()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "expert_weights_norm" => (k, V::Bool(false)),
+                _ => (k, v),
+            })
+            .collect();
+        refused(
+            "glm5next-norm",
+            &kv,
+            &tensors(),
+            "glm5next.expert_weights_norm: is false",
+        );
+    }
+
+    /// A KDA tensor of other dims than ik creates it with is refused by
+    /// name, a short one and a long one alike, and only in a trunk layer.
+    #[test]
+    fn a_kda_tensor_of_other_dims_is_refused() {
+        let with = |name: &str, dims: Vec<u64>| -> Vec<(String, Vec<u64>)> {
+            shaped(&tensors())
+                .into_iter()
+                .map(|(n, d)| if n == name { (n, dims.clone()) } else { (n, d) })
+                .collect()
+        };
+        for (name, dims) in [
+            ("blk.2.ssm_f_a.weight", vec![64, 7]),
+            ("blk.0.ssm_norm.weight", vec![32]),
+            ("blk.0.ssm_conv1d_k.weight", vec![4, 32]),
+        ] {
+            let err = read_shaped("glm5next-dims", &keys(), &with(name, dims))
+                .expect_err("the header is refused");
+            assert!(
+                err.contains(&format!("tensor {name}: has other dims")),
+                "want {name} in: {err}"
+            );
+        }
     }
 }

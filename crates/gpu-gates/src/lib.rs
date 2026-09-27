@@ -18,6 +18,7 @@ pub mod bind;
 pub mod block;
 pub mod ds41_meta;
 pub mod engine;
+pub mod flip;
 #[cfg(feature = "deepseek41")]
 pub mod generate;
 pub mod hc_host;

@@ -94,7 +94,7 @@ impl Prompt for Body {
 }
 
 impl Keep for Body {
-    /// [`Body::keep_point`]: every fed position, the empty model, or the
+    /// [`Body::keep_point`]: every position, the empty model, or the
     /// nearest checkpoint at or below `n`.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
         <Body as Keep>::kept(m, n).at
@@ -103,7 +103,7 @@ impl Keep for Body {
     /// [`Body::kept`].
     fn kept(m: &GpuModel<Body>, n: u32) -> Kept {
         m.body(WHAT)
-            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n))
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
     }
 
     /// Nothing to take back at the model's position; back to empty at 0;
