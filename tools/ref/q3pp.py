@@ -33,7 +33,7 @@ gone is a named refusal, not a guess:
     the gqa_flash_seg kernels), never this one.
   - in the prompt: PrefillPlan::new(P, Auto, U) (arch/qwen3moe/prefill.rs): ubatches of U, a tail of
     at most MAX_TOKENS as one pass (decode flash again), a longer tail as one more ubatch. U is
-    BLOOMERY_QWEN3_UBATCH, else UBATCH = GEMM_MAX_SLOTS / N_USED (arch/qwen3moe/ubatch.rs).
+    BLOOMERY_QWEN3_UBATCH, else UBATCH = 4096 (arch/qwen3moe/ubatch.rs).
   - per ubatch: one launch per layer, layers in order (ubatch.rs `Ubatch::enqueue` -> `attention` ->
     `flash.enqueue`, the only call).
   so skip = K x n_layer + layer, count 1.
@@ -129,6 +129,8 @@ def flash_consts(tree):
                          r"^pub const N_USED: usize = ([\d_]+);", "N_USED"),
         gemm_max_slots=src_const(tree, "crates/gpu/src/gemm/mod.rs",
                                  r"^pub const GEMM_MAX_SLOTS: usize = ([\d_]+);", "GEMM_MAX_SLOTS"),
+        ubatch_max=src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
+                             r"^pub const UBATCH: usize = ([\d_]+);", "UBATCH"),
     )
     # The shapes the grid, the block, the tile walk and the order are written in.
     src_const(tree, fp, r"^const WARPS: usize = POSITIONS / 2;", "WARPS = POSITIONS / 2")
@@ -137,8 +139,6 @@ def flash_consts(tree):
     src_const(tree, fp, r"let qt = n_tiles - 1 - b / nkv;", "the deepest-first block order")
     src_const(tree, fp, r"let live = KEY_TILE(?:_U32)? \* kb < warp_hi;", "a warp's live tiles")
     src_const(tree, fp, r"let warp_hi = cnt\[0\]\.max\(cnt\[1\]\);", "warp_hi, its two rows' larger count")
-    src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
-              r"^pub const UBATCH: usize = GEMM_MAX_SLOTS / N_USED;", "UBATCH = GEMM_MAX_SLOTS / N_USED")
     src_const(tree, "crates/gpu/src/elem.rs",
               r"\*n_keys\.get_unchecked_mut\(i\) = position_word\(p \+ 1\);",
               "a row's live key count, its position + 1 (written by the embedding gather)")
@@ -146,7 +146,9 @@ def flash_consts(tree):
               "prefill-flash enqueues a layer")
     # The two mma loops: QK_STEPS x KEY_NT/2 pairs, PV_STEPS x DIM_PAIRS pairs, two mma each.
     src_count(tree, fp, r"wmma::mma_m16n8k16_f32_f16\(", 4, "mma call sites (two per loop)")
-    c["ubatch_max"] = c["gemm_max_slots"] // c["n_used"]
+    if c["ubatch_max"] * c["n_used"] > c["gemm_max_slots"]:
+        refuse(f"[derive] UBATCH {c['ubatch_max']} x N_USED {c['n_used']} exceeds GEMM_MAX_SLOTS "
+               f"{c['gemm_max_slots']}: the derivation must be re-read")
     c["warps"] = c["positions"] // 2
     c["threads"] = c["warps"] * 32
     c["hmma_per_tile"] = (c["head"] // 16) * (c["key_tile"] // 8) + (c["key_tile"] // 16) * (c["head"] // 8)
@@ -309,7 +311,7 @@ def cmd_plan(argv):
             f.write(f"{key}={v}\n")
     print(f"[derive] source {tree}: KEY_TILE {c['key_tile']}, POSITIONS {c['positions']} (warps {c['warps']}, "
           f"threads {c['threads']}), HEAD {c['head']}, GROUP {c['group']}, MAX_TOKENS {c['max_tokens']}, "
-          f"UBATCH {c['ubatch_max']} = GEMM_MAX_SLOTS {c['gemm_max_slots']} / N_USED {c['n_used']}")
+          f"UBATCH {c['ubatch_max']} (x N_USED {c['n_used']} <= GEMM_MAX_SLOTS {c['gemm_max_slots']})")
     print(f"[derive] file: {n_layer} layers, {n_head} query heads over {n_kv} key heads of {c['head']}")
     print(f"[derive] P = {P}, ubatch {U}: plan={plan_str(steps)}; the profiled unit is ubatch {k} of {len(ubs)} "
           f"(t = {t} rows at positions {p0}..{p0 + t - 1})")
