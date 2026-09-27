@@ -223,38 +223,13 @@ fn read_template(graph: sys::CUgraph) -> Result<Captured, GateError> {
 }
 
 /// A node's kind, with its kernel's entry name or its batch's operation
-/// count.
+/// count. The kind and the kernel's name come from [`bloomery_gpu::node_info`].
 fn describe(node: sys::CUgraphNode) -> Result<StepNode, GateError> {
-    let mut kind: sys::CUgraphNodeType = 0;
-    // SAFETY: `node` is a node of a live template.
-    let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
-    drv(rc, "cuGraphNodeGetType")?;
-    if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL {
-        // SAFETY: all-zero is a valid value of this plain C struct (integers
-        // and nullable pointers), which the call then fills.
-        let mut p: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
-        // SAFETY: `node` is a kernel node and `p` the struct the call fills.
-        let rc = unsafe { sys::cuGraphKernelNodeGetParams_v2(node, &mut p) };
-        drv(rc, "cuGraphKernelNodeGetParams_v2")?;
-        let mut name: *const std::ffi::c_char = std::ptr::null();
-        if p.func.is_null() {
-            // SAFETY: the node launches the library kernel `p.kern`, a live
-            // handle; `name` is a local the call writes.
-            let rc = unsafe { sys::cuKernelGetName(&mut name, p.kern) };
-            drv(rc, "cuKernelGetName")?;
-        } else {
-            // SAFETY: the node launches the module function `p.func`, a live
-            // handle; `name` is a local the call writes.
-            let rc = unsafe { sys::cuFuncGetName(&mut name, p.func) };
-            drv(rc, "cuFuncGetName")?;
-        }
-        if name.is_null() {
-            return Err("a kernel node whose function has no name".into());
-        }
-        // SAFETY: the driver hands back a NUL-terminated name it owns for the
-        // function's lifetime; it is copied out at once.
-        let name = unsafe { std::ffi::CStr::from_ptr(name) };
-        Ok(StepNode::Kernel(name.to_string_lossy().into_owned()))
+    // SAFETY: `node` is a node of the live template `read_template` walks.
+    let info = unsafe { bloomery_gpu::node_info(node) }?;
+    let kind = info.kind;
+    if let Some(k) = info.kernel {
+        Ok(StepNode::Kernel(k.name))
     } else if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP {
         // SAFETY: all-zero is a valid value of this plain C struct (a
         // context, a count, a nullable array pointer, flags), which the call

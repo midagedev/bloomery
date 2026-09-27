@@ -180,12 +180,13 @@ impl Graph {
 }
 
 /// What the driver reports of `node`: its type, a host node's sync mode, and
-/// a kernel node's entry name and geometry.
+/// a kernel node's entry name and geometry. The one reader of these facts:
+/// [`Graph::nodes`] and the gates' template walk both call it.
 ///
 /// # Safety
 ///
 /// `node` is a node of a live graph template.
-unsafe fn node_info(node: sys::CUgraphNode) -> Result<NodeInfo, GpuError> {
+pub unsafe fn node_info(node: sys::CUgraphNode) -> Result<NodeInfo, GpuError> {
     let mut kind: sys::CUgraphNodeType = 0;
     // SAFETY: `node` is a node of a live template (the caller's contract).
     let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
