@@ -1398,6 +1398,12 @@ DATA_UNREAD = {
     "ncu": "profiler reports of a timing runner (tools/ref/ncu-gpu.sh); no gate reads them",
 }
 DATA_UNREAD_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/(?:nsys|ncu)\b|join\(\"(?:nsys|ncu)\"\)|\"(?:nsys|ncu)/")
+# $BLOOMERY_DATA entries left out of the manifest because only never-skip items read them: gate-tokenizer
+# rewrites tokenizer*/ on every run (crates/tokenizer/tools/oracle.sh), part of it from the tree's docs/*.md,
+# and is never-skip itself (it reads a reference tree). In the manifest they moved every item's key whenever
+# that gate ran after a docs commit. The self-test fails when a skippable gate-* recipe's inputs name one.
+DATA_NEVER_ONLY = re.compile(r"tokenizer(?:-[a-z0-9_]+)?")
+DATA_NEVER_ONLY_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/tokenizer|TOKENIZER_SET|set:\s*\"tokenizer")
 # A cargo selector whose value is a recipe parameter (`--features {{FEATURES}}`, `--bin {{BIN}}`): just
 # resolves it when the recipe runs, the closure never sees it (Graph.inputs skips it), so a ledger key
 # cannot name the crates the build pulls in.
@@ -2052,6 +2058,9 @@ def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple
         if top in DATA_UNREAD:
             lines.append(("data-skip", top + "/", DATA_UNREAD[top]))
             continue
+        if DATA_NEVER_ONLY.fullmatch(top):
+            lines.append(("data-skip", top + "/", "read only by never-skip items (gate-tokenizer rewrites it every run)"))
+            continue
         tp = os.path.join(root, top)
         rows[top], files[top], size[top] = [], 0, 0
         is_dir = os.path.isdir(tp) and not os.path.islink(tp)
@@ -2210,6 +2219,7 @@ def key_self_test(expect, real: Side) -> None:
     ctx = KeyContext(real, None, settings=settings)
     gates = [n for n in real.recipes if n.startswith(GATE_PREFIX)]
     never, tree_scoped = set(), set()
+    never_only_readers: list[tuple[str, str]] = []
     for n in gates:
         ri = real.graph.inputs(n)
         names = recipe_closure(real.recipes, n)
@@ -2221,6 +2231,12 @@ def key_self_test(expect, real: Side) -> None:
             if real.tree.exists(f) and not f.startswith("tools/ref/models/"):
                 hit = scan_file(real.tree.root, f, DATA_UNREAD_NAMED)
                 expect(hit is None, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_UNREAD) — take it out of DATA_UNREAD")
+                hit = scan_file(real.tree.root, f, DATA_NEVER_ONLY_NAMED)
+                if hit is not None:
+                    never_only_readers.append((n, hit))
+    for n, hit in never_only_readers:
+        expect(n in never, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_NEVER_ONLY), and {n} can skip — take it out of DATA_NEVER_ONLY")
+    expect(any(n == "gate-tokenizer" for n, _ in never_only_readers), "no gate-* recipe names the tokenizer data: DATA_NEVER_ONLY_NAMED no longer sees gate-tokenizer's reads")
     expect(never == {"gate-1-1", "gate-tokenizer"}, f"never-skip gate recipes: {sorted(never)}")
     expect(
         tree_scoped <= never,
