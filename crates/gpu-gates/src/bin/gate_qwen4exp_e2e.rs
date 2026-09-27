@@ -42,7 +42,8 @@
 //!   token whose chosen set differs from ik's `ffn_moe_topk-L` is a flip,
 //!   allowed only when every exchanged pair's gap in ik's logits
 //!   (`ffn_moe_logits`, whose softmax order is the pick's) lies within our
-//!   two logits' error there ([`Flip::allowed`]), named and counted. A flip
+//!   two logits' error there and that error within [`FLIP_ERR_CAP`], a
+//!   measured frontier ([`Flip::allowed`]), named and counted. A flip
 //!   at layer `L'` and position `t'` lies on the path of every layer output
 //!   from `L'` on at `t'` and at every later position; each layer output off
 //!   every flip's path against ik's `l_out-L` within [`FREE_BAND`], the
@@ -187,6 +188,15 @@ mod gate {
     /// re-derive it on Qwen3.8; (c) prints every layer's distance, the input
     /// a forced arm would take.
     const FREE_BAND: f64 = 0.10;
+
+    /// PIN(2026-09-28): [잠정 — 백로그] the most error, in router logit units, our
+    /// two logits may carry at an excused flip — a measured frontier, not a derivation.
+    /// In the batch set's free run the clean chain's largest pair error
+    /// was 0.942 (gap 0.483); the PLE site skipped (m06) reached 4.69, the other broken
+    /// chains 20.15 and 20.66; 2.0 sits 2.1x above clean and 2.3x below m06. The route tap
+    /// reading the next layer's logits (m14, 6.99) is left out: that error is the tap's,
+    /// not the router's. A flip-aware bound from a Qwen3.8 forced arm replaces it.
+    const FLIP_ERR_CAP: f64 = 2.0;
 
     /// The selecting layers: every fourth, as the header's interval states.
     fn qsa_layers() -> Vec<usize> {
@@ -618,11 +628,17 @@ mod gate {
     }
 
     impl Flip {
-        /// Allowed only when every pair's gap lies within its error: our
-        /// ranking then differs from ik's by no more than our logits'
-        /// distance from ik's. Past it the pick itself is wrong, named.
+        /// Allowed only when every pair's gap lies within its error and the
+        /// error within [`FLIP_ERR_CAP`]: our ranking then differs from ik's
+        /// by no more than our logits' distance from ik's, a distance a
+        /// correct chain has been measured to stay under. Past either the
+        /// pick is wrong, named.
         fn allowed(&self) -> bool {
-            !self.pairs.is_empty() && self.pairs.iter().all(|&(_, _, gap, err)| gap <= err)
+            !self.pairs.is_empty()
+                && self
+                    .pairs
+                    .iter()
+                    .all(|&(_, _, gap, err)| gap <= err && err <= FLIP_ERR_CAP)
         }
 
         fn line(&self) -> String {
@@ -631,17 +647,24 @@ mod gate {
                 .iter()
                 .map(|(a, b, gap, err)| format!("{a}<-{b} gap {gap:.3e} err {err:.3e}"))
                 .collect();
+            let verdict = if self.allowed() {
+                "allowed (counted)"
+            } else if self
+                .pairs
+                .iter()
+                .any(|&(_, _, _, err)| err > FLIP_ERR_CAP || err.is_nan())
+            {
+                "FAIL: our router error past the pinned frontier"
+            } else {
+                "FAIL: a pair's gap past our error"
+            };
             format!(
-                "free flip layer={} token={}: ik margin {:.3e}; {}: {}",
+                "free flip layer={} token={}: ik margin {:.3e}; {} (cap {FLIP_ERR_CAP:.1}): \
+                 {verdict}",
                 self.layer,
                 self.token,
                 self.margin,
                 pairs.join(", "),
-                if self.allowed() {
-                    "allowed (counted)"
-                } else {
-                    "FAIL: a pair's gap past our error"
-                }
             )
         }
     }
