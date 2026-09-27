@@ -857,16 +857,42 @@ pub struct Q8Blocks32 {
 impl Q8Blocks32 {
     /// Allocate for `m` (1..=8) columns of `k` values. Load-time only.
     pub fn new(stream: &CudaStream, k: usize, m: usize) -> Result<Self, GpuError> {
-        if k == 0 || !k.is_multiple_of(32) {
-            return Err(GpuError::shape(
-                "Q8Blocks32::new",
-                format!("k must be a positive multiple of 32, got {k}"),
-            ));
-        }
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(
                 "Q8Blocks32::new",
                 format!("1 <= m <= 8, got {m}"),
+            ));
+        }
+        Q8Blocks32::alloc("Q8Blocks32::new", stream, k, m)
+    }
+
+    /// Allocate for `cols` (1..=[`crate::tensor::Q8ACT_MAX_SLOTS`]) columns
+    /// of `k` values, one per expert slot: the input of a `_sel` down, which
+    /// reads column `s` for slot `s`, and of the quantizer that writes it. The
+    /// multi-column gemvs refuse more than eight columns by their own check.
+    /// Load-time only.
+    pub fn with_slots(stream: &CudaStream, k: usize, cols: usize) -> Result<Self, GpuError> {
+        let max = crate::tensor::Q8ACT_MAX_SLOTS;
+        if !(1..=max).contains(&cols) {
+            return Err(GpuError::shape(
+                "Q8Blocks32::with_slots",
+                format!("1 <= cols <= {max}, got {cols}"),
+            ));
+        }
+        Q8Blocks32::alloc("Q8Blocks32::with_slots", stream, k, cols)
+    }
+
+    /// The three buffers for `m` columns of `k` values, `k` checked here.
+    fn alloc(
+        what: &'static str,
+        stream: &CudaStream,
+        k: usize,
+        m: usize,
+    ) -> Result<Self, GpuError> {
+        if k == 0 || !k.is_multiple_of(32) {
+            return Err(GpuError::shape(
+                what,
+                format!("k must be a positive multiple of 32, got {k}"),
             ));
         }
         let k_blocks = k / 32;

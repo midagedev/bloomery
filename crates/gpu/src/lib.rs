@@ -50,6 +50,7 @@ pub mod mxfp4;
 pub mod probe;
 pub mod q4k_sel;
 pub mod q5;
+pub mod q5_1_sel;
 pub mod q6k_sel;
 pub mod q8f32;
 pub mod rope_neox;
