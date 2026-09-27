@@ -729,8 +729,10 @@ mod tests {
         assert_eq!(qwen, f, "the step order is not part of equality");
         let shown = qwen.to_string();
         assert!(shown.contains("key_count, quant_column"), "{shown}");
-        let odd = Fault::from_words((3 << 8) | 1, (1 << 1) | (1 << 20)).unwrap();
-        assert!(odd.to_string().contains("code 20"), "{odd}");
+        // A mask bit past every site prints as its code: the bit after the highest site's.
+        let past = FaultSite::ALL.iter().map(|&s| s as u32).max().unwrap_or(0) + 1;
+        let odd = Fault::from_words((3 << 8) | 1, (1 << 1) | (1 << past)).unwrap();
+        assert!(odd.to_string().contains(&format!("code {past}")), "{odd}");
     }
 
     #[test]

@@ -118,6 +118,11 @@ generate_ds41   gqa_prefill_flash_256_p4                0          0
 generate_ds41   grouped_tiles                           0          0
 generate_ds41   half_decode                             0          0
 generate_ds41   half_encode_check                       0          0
+generate_ds41   hc_gated_combine_4                      0          0
+generate_ds41   hc_gated_down_4x320                     0          0
+generate_ds41   hc_gated_norm_4                         0          0
+# PIN(2026-09-27): hc_gated_up_mix_4x320 (Qwen3.8's gated HC up with the sigmoid mix, q38hc) spills 80 bytes, jit_local 40, on its first scan where its round predicted 0; pinned at the measured value so it cannot grow while round hcspill finds the cause (the lane-0 gate array g[4][M] across the unrolled column instances is the first suspect) and brings it to 0.
+generate_ds41   hc_gated_up_mix_4x320                  80         40
 generate_ds41   hc_pre_q8_0                             0          0
 generate_ds41   head_norm_neox_append                   0          0
 generate_ds41   head_norm_neox_append_256                   0          0
@@ -135,6 +140,8 @@ generate_ds41   kv_norm_rope_append                     0          0
 generate_ds41   latent_rms_append                       0          0
 generate_ds41   moe_combine                             0          0
 generate_ds41   norm_quant                              0          0
+generate_ds41   ple_conv                                0          0
+generate_ds41   ple_gate                                0          0
 generate_ds41   q2_k_rows                               0          0
 generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
@@ -236,6 +243,11 @@ gate_e2e        gqa_prefill_flash_256_p4                0          0
 gate_e2e        grouped_tiles                           0          0
 gate_e2e        half_decode                             0          0
 gate_e2e        half_encode_check                       0          0
+gate_e2e        hc_gated_combine_4                      0          0
+gate_e2e        hc_gated_down_4x320                     0          0
+gate_e2e        hc_gated_norm_4                         0          0
+# PIN(2026-09-27): hc_gated_up_mix_4x320 (Qwen3.8's gated HC up with the sigmoid mix, q38hc) spills 80 bytes, jit_local 40, on its first scan where its round predicted 0; pinned at the measured value so it cannot grow while round hcspill finds the cause (the lane-0 gate array g[4][M] across the unrolled column instances is the first suspect) and brings it to 0.
+gate_e2e        hc_gated_up_mix_4x320                  80         40
 gate_e2e        head_norm_neox_append                   0          0
 gate_e2e        head_norm_neox_append_256                   0          0
 gate_e2e        index_key_ln_append                     0          0
@@ -252,6 +264,8 @@ gate_e2e        kv_norm_rope_append                     0          0
 gate_e2e        latent_rms_append                       0          0
 gate_e2e        moe_combine                             0          0
 gate_e2e        norm_quant                              0          0
+gate_e2e        ple_conv                                0          0
+gate_e2e        ple_gate                                0          0
 gate_e2e        q2_k_rows                               0          0
 gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0
