@@ -6,8 +6,8 @@ exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_s
 
 [workspace.dependencies]
 # cuda-oxide는 rev로 고정한다. 떠 있으면 어제의 수치와 오늘의 수치가 다른 컴파일러에서 나온다.
-cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
-cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
 # .oxart 컨테이너 파서는 cuda-core의 모듈 로더가 링크하는 그 사본이다(crates.io). 같은 semver 줄의 요구는
 # 한 버전으로 합쳐지므로, 게이트는 드라이버에 넘어가는 텍스트를 로더 자신의 코드로 자른다.
 oxide-artifacts = "0.2.1"
@@ -21,8 +21,8 @@ thiserror = "2"
 # 브랜치에서 받는다. 포크 = 위 rev + 업스트림에 낼 패치들이다(THIRD_PARTY_NOTICES.md에 목록). 패치가 0개가 되면 이 절을
 # 지운다. rev를 옮기면 박스의 백엔드도 그 rev로 새로 지어야 한다(tools/box.sh의 CUDA_OXIDE_BACKEND 참조).
 [patch."https://github.com/NVlabs/cuda-oxide.git"]
-cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "e589793a031b7f704b1f2647b429c91579e89834" }
-cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "e589793a031b7f704b1f2647b429c91579e89834" }
+cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "c76f1e173b0e9468bc0b05d49d99560844a06fec" }
+cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "c76f1e173b0e9468bc0b05d49d99560844a06fec" }
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]
