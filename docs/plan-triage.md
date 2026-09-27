@@ -183,7 +183,7 @@
   - `body38.rs` `refresh`: `copy_from_host`가 스텝마다 스트림을 동기화한다(S, 토큰당 0.1 ms 미만 [유도]). 비동기 pinned 복사로 바꾼다.
   - `PleHost::fill`: IQ4_NL 16행을 직렬로 읽는다. 캐시가 차가우면 0.1–1.6 ms/토큰이다(M). 한 스텝 앞서 읽거나 WILLNEED를 쓴다.
   - m02 경로가 날것의 `DriverError(900, capturing)`로 올라온다(S). 캡처 중 호스트 복사를 이름으로 거부한다.
-  - `crates/gpu/src/gemm/mod.rs:53` `GEMM_MAX_SLOTS` = 4096 × 9는 Qwen3.6 기준이다. Qwen3.8(토큰당 11슬롯)은 U ≤ 3,351에서 막힌다. q38ub의 입력이다(XS).
+  - `crates/gpu/src/gemm/mod.rs:53` `GEMM_MAX_SLOTS` = 4096 × 9는 Qwen3.6 기준이다. ~~Qwen3.8(토큰당 11슬롯)은 U ≤ 3,351에서 막힌다.~~ Qwen3.8의 공유 expert는 Q8_0이라 routed 스택에 합칠 수 없으므로 카드 GEMM은 토큰당 10슬롯이고 U ≤ 3,686에서 막힌다(q38pfd). U = 4096은 route 표를 2,048토큰 반쪽 둘로 나눠 지난다. 상수가 `gemm_route` 장치 코드 안에 있어 올리면 Qwen3.6 PTX가 움직이므로, 런치 인자로 옮기는 것이 따로 남는다(S). q38ub의 입력이다(XS).
 - **`q38fix` 착륙** (커밋 `0ea39a9`, 브랜치 `q38fix`, base `49b350e`; Mac 단계 녹색, clippy 48; 시팅 뒤 aa의 묶음에 넣는다. 게이트 목록은 `reports/q38fix.md` §5)
   - 남은 것:
     - `engram/src/hash/ngram.rs:141` `History`에 손으로 쓴 `clone_from`을 둔다. derive는 할당을 없애지 못한다(XS).
