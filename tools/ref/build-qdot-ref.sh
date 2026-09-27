@@ -20,7 +20,8 @@
 # mxfp4_x4_ref read the file named by BLOOMERY_V4_MODEL (default: the V4-Flash
 # first data shard, whose first IQ3_XXS and MXFP4 tensors are
 # blk.0.ffn_gate_exps.weight and blk.0.ffn_down_exps.weight; gate-qdot reads the
-# same variable with the same default).
+# same variable with the same default). q8f0_ref reads no model: its synthetic
+# block set is written into its own dump.
 #
 # mxfp4_ref links libggml alone and dumps ggml's to_float of the first rows of one MXFP4 expert
 # tensor of the DSpark draft (BLOOMERY_DSPARK_MODEL, default the tl37 file) to
