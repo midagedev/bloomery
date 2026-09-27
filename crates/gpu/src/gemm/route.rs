@@ -109,7 +109,7 @@ pub struct GemmRoute {
     pub(super) n_tiles: DeviceBuffer<u32>,
     /// All-zero ids for the dense table (a one-expert route).
     zeros: Option<DeviceBuffer<u32>>,
-    max_slots: usize,
+    pub(super) max_slots: usize,
     pub(super) n_experts: usize,
     /// The slot count of the last enqueued fill.
     pub(super) filled: Option<usize>,
