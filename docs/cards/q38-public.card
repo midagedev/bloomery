@@ -32,17 +32,16 @@ term: host service us a layer @ n=96, depth 6, A6000, all-host = (p50 step ms of
 unit: us
 predict: 350..460
 condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 3000 lcpp:3000 4096
-  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096, the order rotated every round (each ours arm's row carries its prompt's pass pp, so
-  the 512 and 4096 arms give pp512 and pp4096); about 60 minutes of lease [derived: five ours arms
-  of a 20..80 s load, up to 56 s of passes and 3 s of steps, seven llama.cpp arms of a host-bound
-  load and run, three rounds], past 30: the user's approval first; the qwen4exp host set (~111 GB)
-  stays in the page cache: the runner has no preheat, so the lead reads each row's witness, and a
-  row whose major-fault count rises by more than 10,000 across its arm (the host set paged in inside
-  the timed steps; a warm arm faults about 0) is void and its arm re-run after the window; no row
-  carries [cpu-busy] or [other-busy]; the full runner output goes to a file first. Command:
-  BLOOMERY_AB_ROUNDS=3
-  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card' just depth-gpu-qwen4exp <the
-  arms above> > <log> 2>&1
+  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096 in engine blocks (BLOOMERY_AB_ORDER=blocks:
+  ours, lcpp and lcppfit blocks, each opened by a discarded process that pages that engine's host set
+  in); each ours arm's row carries its prompt's pass pp, so the 512 and 4096 arms give pp512 and
+  pp4096; about 65 minutes of lease [derived: five ours arms of a 20..80 s load, up to 56 s of passes
+  and 3 s of steps, seven llama.cpp arms of a host-bound load and run, three rounds, and ~5 minutes
+  for the three discards], past 30: the user's approval first; every row carries its majflt field,
+  and no row tagged [cold] (major faults at 75 us each over 1 % of its timed window) is admitted;
+  no row carries [cpu-busy] or [other-busy]; the full runner output goes to a file first. Command:
+  BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card
+  BLOOMERY_AB_ORDER=blocks' just depth-gpu-qwen4exp <the arms above> > <log> 2>&1
 reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp beside ours) and
   the host service term every later Qwen3.8 lever is priced against (hot list, card experts, the
   q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
