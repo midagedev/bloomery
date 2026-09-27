@@ -4,24 +4,30 @@
 # `--target x86_64-unknown-linux-gnu` after the cargo subcommand: a cross check that type-checks and
 # lints the Linux build and links no target code, so no x86_64 linker is needed. `fmt-check` runs
 # `fmt-check`'s command and `fmt` the same command without its `-- --check` (it writes the tree), both
-# with the pinned toolchain's rustfmt. Tests and gates never run here: their binaries are Linux ones,
-# and the box judges them.
+# with the pinned toolchain's rustfmt. `test` runs `cargo test -p <crate>` natively (no --target: the
+# host is aarch64-apple-darwin) for each pure crate, the list `tools/recipes.py pure-crates` derives
+# from the crate graph and the sources (its one owner; the rule is in its docstring): a crate with no
+# device root in its closure and no x86_64 or Linux-only code the Mac would build. Every other crate's
+# tests and every gate never run here: their binaries are Linux ones, and the box judges them. A Mac
+# result is development-loop evidence; landing evidence is the box's record.
 #
-#   tools/mac-check.sh check|lint|fmt|fmt-check
-#   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory and
-#                                    the toolchain and prerequisite checks against a fake HOME; runs no
-#                                    cargo (check-recipes runs it)
+#   tools/mac-check.sh check|lint|fmt|fmt-check|test
+#   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory,
+#                                    the test totals and the toolchain and prerequisite checks against a
+#                                    fake HOME; runs no cargo (check-recipes runs it)
 #
-# Exit: cargo's own code. `lint` also ends 1 when its `^warning:` count (the box's ruler, one per
-# target a warning appears in) is above the ratchet, the last `**N on main` of AGENTS.md's Known
-# state. 64: a mode or a box command this script does not run, or not on macOS. 69: a prerequisite
-# is missing (named, with how it is made). 70: no ratchet in AGENTS.md.
+# Exit: cargo's own code (`test`: the first crate's that is not 0). `lint` also ends 1 when its
+# `^warning:` count (the box's ruler, one per target a warning appears in) is above the ratchet, the
+# last `**N on main` of AGENTS.md's Known state. 64: a mode or a box command this script does not run,
+# or not on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
+# AGENTS.md, or no pure crate to test.
 #
 # The toolchain is this script's: the channel rust-toolchain.toml pins, at
 # $HOME/.rustup/toolchains/<channel>-<host>/bin, goes first on PATH, and cargo, cargo-clippy,
 # clippy-driver, cargo-fmt and rustfmt must each resolve there — a missing one is named, never taken
 # from Homebrew (whose cargo and rustfmt are other versions). RUSTC, when set, must be that rustc.
-# `fmt` and `fmt-check` need nothing else. `check` and `lint` first source one file outside the
+# `fmt`, `fmt-check` and `test` need nothing else (`test`: the host std, which comes with the
+# toolchain). `check` and `lint` first source one file outside the
 # repository, $HOME/opt/bloomery-mac-env.sh (a fake HOME moves it; the self-test does), which sets
 #   CUDA_TOOLKIT_PATH   a directory whose include/cuda.h bindgen reads (headers only)
 #   BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu   `--sysroot=<dir>` with <dir>/usr/include/stdlib.h
@@ -50,7 +56,7 @@ recipe_of() {
     check) echo check ;;
     lint) echo lint ;;
     fmt | fmt-check) echo fmt-check ;;
-    *) say "mac-check.sh: no mode '$1' (check, lint, fmt, fmt-check)"; return 64 ;;
+    *) say "mac-check.sh: no mode '$1' (check, lint, fmt, fmt-check; test has no recipe)"; return 64 ;;
   esac
 }
 verb_of() {
@@ -60,6 +66,23 @@ verb_of() {
     fmt | fmt-check) echo fmt ;;
     *) say "mac-check.sh: no mode '$1' (check, lint, fmt, fmt-check)"; return 64 ;;
   esac
+}
+
+# test_argv CRATE: the native test of one pure crate, one word a line — what the box's gate runner
+# gives cargo for a whole package, without its bound and filters.
+test_argv() {
+  if [[ ! $1 =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    say "mac-check.sh: '$1' is not a crate name"
+    return 64
+  fi
+  printf '%s\n' cargo test -p "$1"
+}
+
+# totals LOG: the sum of the log's `test result:` lines — "P passed, F failed, I ignored in N test
+# binaries" — or 1 when it has none.
+totals() {
+  awk '/^test result: /{ for (i = 1; i <= NF; i++) { if ($(i+1) ~ /^passed/) p += $i; if ($(i+1) ~ /^failed/) f += $i; if ($(i+1) ~ /^ignored/) g += $i }; n++ }
+       END { if (!n) exit 1; printf "%d passed, %d failed, %d ignored in %d test binaries\n", p, f, g, n }' "$1"
 }
 
 # derive MODE CMD: the cargo argv this script runs for the box command CMD, one word a line. CMD
@@ -166,6 +189,15 @@ prereqs() {
     say "mac-check.sh: RUSTC is $RUSTC, not $tc/rustc, the toolchain rust-toolchain.toml pins: unset it or point it there"
     miss=1
   fi
+  if [ "$mode" = test ]; then
+    local host
+    host=$(printf '%s\n' "$tcname" | awk -F- '{ print $(NF-2) "-" $(NF-1) "-" $NF }')
+    rlib=$(ls "$tc/../lib/rustlib/$host/lib"/libstd-*.rlib 2> /dev/null | head -1 || true)
+    if [ -z "$rlib" ]; then
+      say "mac-check.sh: missing the $host std in $tcname (it comes with the toolchain): rustup toolchain install ${tcname%-*-*-*} --profile minimal -c clippy,rustfmt -t $TARGET"
+      miss=1
+    fi
+  fi
   case $mode in check | lint) ;; *) [ "$miss" = 0 ] || return 69; return 0 ;; esac
   rlib=$(ls "$tc/../lib/rustlib/$TARGET/lib"/libstd-*.rlib 2> /dev/null | head -1 || true)
   if [ -z "$rlib" ]; then
@@ -189,14 +221,14 @@ prereqs() {
 }
 
 # setup MODE TOOLCHAIN_BIN ROOT: the environment a run of MODE gets — the env file for check and lint,
-# the pinned toolchain first on PATH, the prerequisites, and for check and lint the tree's own
+# the pinned toolchain first on PATH, the prerequisites, and for check, lint and test the tree's own
 # CARGO_TARGET_DIR, whatever the environment held (a line names what it replaces). Runs in the caller's shell.
 setup() {
   case $1 in check | lint) load_env || return $? ;; esac
   export PATH="$2:$PATH"
   prereqs "$1" "$2" || return $?
   case $1 in
-    check | lint)
+    check | lint | test)
       local own
       own=$(target_dir "$3")
       [ -z "${CARGO_TARGET_DIR:-}" ] || [ "$CARGO_TARGET_DIR" = "$own" ] ||
@@ -275,6 +307,25 @@ self_test() {
     }
   done
 
+  # test: one plain `cargo test -p <crate>` a crate, a name that is not one refused; the totals of a log
+  out=$(test_argv bloomery-sampler | tr '\n' ' ')
+  [ "$out" = "cargo test -p bloomery-sampler " ] || fail "test derives '$out' for bloomery-sampler"
+  for t in "a b" "--workspace" "" "x;y" "-p"; do
+    test_argv "$t" > /dev/null 2>&1 && fail "test accepted the crate name '$t'" || { [ $? = 64 ] || fail "test refused '$t' with another rc"; }
+  done
+  t=$(mktemp -d)
+  printf '%s\n' '     Running unittests src/lib.rs' 'test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s' \
+    'test a ... FAILED' 'test result: FAILED. 3 passed; 2 failed; 39 ignored; 0 measured; 0 filtered out; finished in 0.20s' > "$t/log"
+  out=$(totals "$t/log") || fail "totals of a log with two result lines failed"
+  [ "$out" = "22 passed, 2 failed, 40 ignored in 2 test binaries" ] || fail "totals read '$out'"
+  printf '%s\n' 'error[E0425]: cannot find value `RUSAGE_THREAD` in crate `libc`' > "$t/log"
+  totals "$t/log" > /dev/null && fail "a log with no result line gave totals"
+  rm -rf "$t"
+  # the crates test runs: the pure list recipes.py derives, each one a name test_argv takes
+  out=$(python3 "$HERE/tools/recipes.py" pure-crates --names 2> /dev/null) || fail "recipes.py pure-crates --names failed"
+  [ -n "$out" ] || fail "recipes.py pure-crates --names lists no crate"
+  for t in $out; do test_argv "$t" > /dev/null || fail "pure crate '$t' is not a name test takes"; done
+
   # the host triple and the channel
   [ "$(host_triple Darwin arm64)" = aarch64-apple-darwin ] || fail "Darwin arm64 is not aarch64-apple-darwin"
   host_triple Linux x86_64 > /dev/null 2>&1 && fail "Linux accepted as the Mac" || { [ $? = 64 ] || fail "Linux refused with another rc"; }
@@ -302,14 +353,14 @@ self_test() {
   host=$(host_triple "$(uname -s)" "$(uname -m)" 2> /dev/null || echo aarch64-apple-darwin)
   fake=$(mktemp -d)
   tc=$fake/.rustup/toolchains/$ch-$host/bin
-  mkdir -p "$tc" "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$TARGET/lib" "$fake/opt/cuda-13.3/include" \
+  mkdir -p "$tc" "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$TARGET/lib" "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$host/lib" "$fake/opt/cuda-13.3/include" \
     "$fake/opt/linux-sysroot/usr/include" "$fake/clt/lib" "$fake/brew/bin"
   for t in cargo rustc cargo-clippy clippy-driver cargo-fmt rustfmt; do
     printf '#!/bin/sh\nexit 0\n' > "$tc/$t"
     printf '#!/bin/sh\nexit 0\n' > "$fake/brew/bin/$t"
   done
   chmod +x "$tc"/* "$fake/brew/bin"/*
-  touch "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$TARGET/lib/libstd-0.rlib" "$fake/opt/cuda-13.3/include/cuda.h" \
+  touch "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$TARGET/lib/libstd-0.rlib" "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$host/lib/libstd-0.rlib" "$fake/opt/cuda-13.3/include/cuda.h" \
     "$fake/opt/linux-sysroot/usr/include/stdlib.h" "$fake/clt/lib/libclang.dylib"
   write_env() { # RUSTC
     cat > "$fake/opt/bloomery-mac-env.sh" << EOF
@@ -324,7 +375,7 @@ EOF
       for t in cargo cargo-clippy rustfmt; do echo "resolved $t $(command -v "$t")"; done && echo "target ${CARGO_TARGET_DIR:-none}") 2>&1
   }
   write_env
-  for m in check lint fmt fmt-check; do
+  for m in check lint fmt fmt-check test; do
     out=$(probe "$m") || fail "the complete fake HOME fails $m: $out"
     for t in cargo cargo-clippy rustfmt; do
       case $out in *"resolved $t $tc/$t"*) ;; *) fail "$m with Homebrew first on PATH resolves $t elsewhere: $out" ;; esac
@@ -336,6 +387,8 @@ EOF
   case $out in *"CARGO_TARGET_DIR=$fake/tgt from the environment is overridden"*) ;; *) fail "the override of an inherited CARGO_TARGET_DIR is not named: $out" ;; esac
   out=$(probe fmt) || true
   case $out in *"target none"*) ;; *) fail "fmt sets a target directory: $out" ;; esac
+  out=$(probe test) || true
+  case $out in *"target /x/bloomery-foo/target"*) ;; *) fail "test does not build in the tree's own target directory: $out" ;; esac
   # each piece removed in turn: MODE|path|what the line names
   for t in "check|$fake/opt/cuda-13.3/include/cuda.h|missing cuda.h" \
     "check|$fake/opt/linux-sysroot/usr/include/stdlib.h|stdlib.h" \
@@ -345,6 +398,8 @@ EOF
     "fmt|$tc/rustfmt|rustfmt resolves to '$fake/brew/bin/rustfmt'" \
     "fmt-check|$tc/cargo-fmt|cargo-fmt resolves to '$fake/brew/bin/cargo-fmt'" \
     "fmt|$tc/cargo|rustup toolchain install $ch" \
+    "test|$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$host/lib/libstd-0.rlib|missing the $host std" \
+    "test|$tc/cargo|rustup toolchain install $ch" \
     "check|$fake/opt/bloomery-mac-env.sh|missing $fake/opt/bloomery-mac-env.sh"; do
     IFS='|' read -r m cmd why <<< "$t"
     mv "$cmd" "$cmd.away"
@@ -354,10 +409,10 @@ EOF
     }
     mv "$cmd.away" "$cmd"
   done
-  # fmt needs no env file, CUDA, sysroot or libclang
+  # fmt and test need no env file, CUDA, sysroot or libclang
   mv "$fake/opt/bloomery-mac-env.sh" "$fake/env.away"
   mv "$fake/opt/cuda-13.3/include/cuda.h" "$fake/cuda.h.away"
-  for m in fmt fmt-check; do
+  for m in fmt fmt-check test; do
     out=$(probe "$m") || fail "$m asks for the env file or cuda.h: $out"
   done
   mv "$fake/env.away" "$fake/opt/bloomery-mac-env.sh"
@@ -377,13 +432,44 @@ EOF
 
 case ${1:-} in
   --self-test) [ $# = 1 ] || { say "mac-check.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
-  check | lint | fmt | fmt-check) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
-  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check | --self-test"; exit 64 ;;
+  check | lint | fmt | fmt-check | test) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
+  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test | --self-test"; exit 64 ;;
 esac
 MODE=$1
 HOST=$(host_triple "$(uname -s)" "$(uname -m)") || exit $?
 CHANNEL=$(channel) || exit $?
 TC=$HOME/.rustup/toolchains/$CHANNEL-$HOST/bin
+
+if [ "$MODE" = test ]; then
+  CRATES=$(python3 "$HERE/tools/recipes.py" pure-crates --names) || exit $?
+  if [ -z "$CRATES" ]; then
+    say "mac-check.sh: tools/recipes.py pure-crates selects no crate; nothing to test natively"
+    exit 70
+  fi
+  setup test "$TC" "$HERE" || exit $?
+  mkdir -p "$HERE/target"
+  LOG=$HERE/target/mac-check-test.log
+  LOCK0=$(md5 -q "$HERE/Cargo.lock")
+  HEAD="mac-check: cargo test -p <crate>, natively on $HOST, for the pure crates of tools/recipes.py pure-crates ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
+  say "$HEAD; log $LOG"
+  echo "$HEAD" > "$LOG"
+  rc=0
+  ran=()
+  for c in $CRATES; do
+    A=$(test_argv "$c") || exit 64
+    ARGV=()
+    while IFS= read -r w; do ARGV+=("$w"); done <<< "$A"
+    echo "mac-check: ${ARGV[*]}" >> "$LOG"
+    crc=0
+    (cd "$HERE" && "$TC/cargo" "${ARGV[@]:1}") >> "$LOG" 2>&1 || crc=$?
+    ran+=("$c=$crc")
+    [ "$rc" != 0 ] || rc=$crc
+  done
+  cat "$LOG"
+  [ "$(md5 -q "$HERE/Cargo.lock")" = "$LOCK0" ] || say "mac-check: cargo rewrote Cargo.lock in this tree (a dependency edit's lock refresh): commit it with the edit"
+  echo "mac-check: test rc $rc; ${#ran[@]} crates (crate=rc): ${ran[*]}; $(totals "$LOG" || echo "no test result line")"
+  exit "$rc"
+fi
 RECIPE=$(recipe_of "$MODE")
 CMD=$(python3 "$HERE/tools/recipes.py" box-command "$RECIPE") || exit $?
 DERIVED=$(derive "$MODE" "$CMD") || exit $?
