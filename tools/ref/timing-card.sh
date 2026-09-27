@@ -205,6 +205,10 @@ timing_cards_arms() {
     shift 3
     case $kind:$eng in
       ref:lcpp*) ;;
+      srv:*)
+        echo "${0##*/}: arm '$a': a llama-server arm has no two-card checks yet (the Xid, cap and device checks run in the bench arms' path only); the A6000+3090 table takes llama-bench arms until they do" >&2
+        return 64
+        ;;
       ref:*)
         echo "${0##*/}: arm '$a': the two-card table's reference is mainline llama.cpp (the profile's two-card line: $TWO_CARD_PLACEMENT); $eng has no two-card arm" >&2
         return 64
