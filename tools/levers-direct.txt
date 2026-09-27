@@ -7,10 +7,10 @@
 # A line: file<TAB>variables, comma-separated<TAB>round.
 #
 # Levers the registry names, read in place until their round converts them.
-crates/model/src/ops.rs	BLOOMERY_POISON,BLOOMERY_DEFER_QUANT,BLOOMERY_STEAL,BLOOMERY_STEAL_BLOCKS	[03]
+crates/model/src/ops.rs	BLOOMERY_POISON,BLOOMERY_STEAL	[03]
 crates/model/src/moe.rs	BLOOMERY_EXPERT_LOG	[03]
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_PIN_MAIN	[03]
-crates/gpu/src/hybrid.rs	BLOOMERY_HYBRID_NL,BLOOMERY_HYBRID_OVERLAP,BLOOMERY_HOST_POPULATE,BLOOMERY_HOST_LOCK,BLOOMERY_CARD_DONTNEED,BLOOMERY_R8	[03]
+crates/gpu/src/hybrid.rs	BLOOMERY_HYBRID_NL	v2fence
 crates/gpu/src/arch/qwen3moe/ubatch.rs	BLOOMERY_QWEN3_UBATCH	[03]
 crates/model/src/arch/deepseek2/attn.rs	BLOOMERY_FLASH_SIMD,BLOOMERY_KV_PREFETCH,BLOOMERY_KV_PREFETCH_ROWS,BLOOMERY_FLASH_SEGMENTS,BLOOMERY_ATTN_BUNDLE,BLOOMERY_ATTN_HALVES	v2fence
 crates/model/src/profile.rs	BLOOMERY_PROFILE	v2fence
@@ -47,7 +47,6 @@ crates/model/tests/attn.rs	BLOOMERY_FLASH_SIMD_CHILD_DUMP,BLOOMERY_KV_PREFETCH_C
 crates/model/tests/common/model_path.rs	BLOOMERY_MODEL	stays: the model file the harnesses open
 crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
 crates/model/tests/ds41_meta.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
-crates/model/tests/ds41_host.rs	BLOOMERY_R8	stays: the host gate reads the on/off flag as hybrid.rs does
 crates/model/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/mt.rs	BLOOMERY_MT_CHILD_DUMP	stays: the gate's handshake with the child it runs
 crates/model/tests/placement.rs	BLOOMERY_PLACEMENT_TABLE	stays: the gate's own print switch

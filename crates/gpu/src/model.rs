@@ -35,9 +35,10 @@ pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
 use crate::head::Head;
-use crate::hybrid::{Chain, HostResidency, Refusal, host_levers, name_refusal};
+use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
+use bloomery_levers::HostCfg;
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
@@ -380,16 +381,17 @@ impl<B: ChainBody> GpuModel<B> {
     /// ranked ids), the weights `derive` files for the card's layers, and the
     /// body `body` builds over them, which keeps `file` for what the plan
     /// leaves on the host; plus the output head when the card carries it.
-    /// Between the uploads and the body the plan's host set is read in and,
-    /// when asked, locked ([`HostResidency::at_load`],
-    /// [`crate::hybrid::HostLevers`]), so that no step takes the first touch
-    /// of a host expert page. The caches hold the plan's `ctx_max` rows, the
+    /// Between the uploads and the body the plan's host set is read in and
+    /// locked as `host` asks ([`HostResidency::at_load`]), so that no step
+    /// takes the first touch of a host expert page; `host` also says whether
+    /// the card segments' file pages are released once uploaded. The caches hold the plan's `ctx_max` rows, the
     /// context its budget was made for. The card is found by its name in the
     /// plan ([`Gpu::for_card`]), never by ordinal.
     pub fn load_placed(
         file: Split,
         plan: &Plan<'_>,
         card: usize,
+        host: HostCfg,
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
@@ -405,12 +407,13 @@ impl<B: ChainBody> GpuModel<B> {
             .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
         let layers = spec.layers.clone();
         let gpu = Gpu::for_card(&spec.name)?;
-        let mut weights = Weights::load_placed(gpu.stream(), &file, plan, card)?;
+        let mut weights =
+            Weights::load_placed(gpu.stream(), &file, plan, card, host.card_dontneed)?;
         derive(gpu.stream(), &file, layers, &mut weights)?;
         // After the uploads, so the card's file bytes have left the page
         // cache before the host set is read in; before the body, which
         // takes `file`.
-        let host = HostResidency::at_load(&file, plan, |_| true, host_levers()?)?;
+        let host = HostResidency::at_load(&file, plan, |_| true, host)?;
         let body = body(&gpu, file, &weights)?;
         let head = if spec.head {
             Some(Head::new(&gpu, &weights, body.head_eps())?)

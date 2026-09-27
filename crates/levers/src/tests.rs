@@ -225,6 +225,15 @@ fn accessors_read_their_rows() {
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
     assert!(!unset.check_finite());
+    assert_eq!(
+        unset.host(),
+        HostCfg {
+            populate: true,
+            lock: false,
+            card_dontneed: true,
+            r8: true
+        }
+    );
 
     let set = read(
         &env(&[
@@ -240,6 +249,10 @@ fn accessors_read_their_rows() {
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (CHECK_FINITE, "1"),
+            (HOST_POPULATE, "0"),
+            (HOST_LOCK, "1"),
+            (CARD_DONTNEED, "0"),
+            (R8, "off"),
             (PREFILL_GROUP, "8"),
         ]),
         Scope::Every,
@@ -257,6 +270,15 @@ fn accessors_read_their_rows() {
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
     assert!(set.check_finite());
+    assert_eq!(
+        set.host(),
+        HostCfg {
+            populate: false,
+            lock: true,
+            card_dontneed: false,
+            r8: false
+        }
+    );
 
     let names: Vec<&str> = parsed().map(|r| r.name).collect();
     assert_eq!(
@@ -273,7 +295,11 @@ fn accessors_read_their_rows() {
             CARD_BUDGET,
             PIN_MAIN,
             DRAFT,
-            CHECK_FINITE
+            CHECK_FINITE,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8
         ]
     );
 }

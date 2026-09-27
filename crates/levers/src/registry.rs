@@ -22,6 +22,10 @@ pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
+pub const HOST_POPULATE: &str = "BLOOMERY_HOST_POPULATE";
+pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
+pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
+pub const R8: &str = "BLOOMERY_R8";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -219,6 +223,49 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
+        name: HOST_POPULATE,
+        class: Class::C,
+        kind: Kind::Flag,
+        default: Unset::Is("1"),
+        doc: "Placed load: the plan's host set is read in with `MADV_POPULATE_READ`; `0` \
+              leaves it to fault in, the fresh-fault arm.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: HOST_LOCK,
+        class: Class::C,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "Placed load: after populating, `mlock` the host set for the model's life; an \
+              `RLIMIT_MEMLOCK` refusal is an error that names the limit.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: CARD_DONTNEED,
+        class: Class::C,
+        kind: Kind::Flag,
+        default: Unset::Is("1"),
+        doc: "Placed load: each uploaded card segment's file pages are dropped right after \
+              its upload (`token_embd` and the engram table excepted); `0` keeps them in \
+              the page cache.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: R8,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "V4.1 host tier: its routed gates and ups are read from the r8 sidecar at \
+              `r8file::sidecar_path` of the first shard (`just r8-sidecar` writes it) through \
+              the row-lane tile, and the load's host set populates and locks those stacks' \
+              pages in the sidecar instead of the source; no file there reads the source; a \
+              file that does not match the source is its named `R8Error`, never a fall-back. \
+              `off` reads the source, the same-binary arm; both write the same bits. The load \
+              prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
+              (no sidecar at <path>: just r8-sidecar)`.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
         name: "BLOOMERY_POISON",
         class: Class::D,
         kind: Kind::Flag,
@@ -236,14 +283,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: "BLOOMERY_DEFER_QUANT",
         class: Class::T,
         kind: Kind::Flag,
-        default: Unset::Is("1"),
-        doc: "Host tier: the row dispatch quantizes its activations itself; `0` is the \
-              caller-side pre-pass, the twin the union tests compare against.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: OPS,
-                round: R03,
-            }],
+        default: Unset::Means("the only path"),
+        doc: "Was the host tier's caller-side quantization pre-pass, the twin the union \
+              tests compare against.",
+        site: Site::Retired {
+            why: "the row dispatch quantizes its activations itself; the caller-side pre-pass \
+                  is a test's oracle, picked by `ops::set_defer_quant`",
+            left: &[],
         },
     },
     LeverSpec {
@@ -268,14 +314,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             max: u64::MAX,
             trim: true,
         },
-        default: Unset::Is("4"),
-        doc: "Host tier: blocks a lane is cut into for stealing; a host-union block is at \
-              most `UNION_BLOCK_ROWS` rows (`crates/model/src/ops.rs`).",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: OPS,
-                round: R03,
-            }],
+        default: Unset::Means("the only path"),
+        doc: "Was the blocks a host-tier lane is cut into for stealing.",
+        site: Site::Retired {
+            why: "a lane is cut into four blocks, the const `STEAL_BLOCKS` of \
+                  `crates/model/src/ops.rs`",
+            left: &[],
         },
     },
     LeverSpec {
@@ -460,26 +504,6 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: "BLOOMERY_R8",
-        class: Class::A,
-        kind: Kind::OnOff,
-        default: Unset::Is("on"),
-        doc: "V4.1 host tier: its routed gates and ups are read from the r8 sidecar at \
-              `r8file::sidecar_path` of the first shard (`just r8-sidecar` writes it) through \
-              the row-lane tile, and the load's host set populates and locks those stacks' \
-              pages in the sidecar instead of the source; no file there reads the source; a \
-              file that does not match the source is its named `R8Error`, never a fall-back. \
-              `off` reads the source, the same-binary arm; both write the same bits. The load \
-              prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
-              (no sidecar at <path>: just r8-sidecar)`.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
-        },
-    },
-    LeverSpec {
         name: "BLOOMERY_HYBRID_NL",
         class: Class::C,
         kind: Kind::Count {
@@ -493,7 +517,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         site: Site::Direct {
             at: &[InPlace {
                 file: HYBRID,
-                round: R03,
+                round: V2FENCE,
             }],
         },
     },
@@ -501,57 +525,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: "BLOOMERY_HYBRID_OVERLAP",
         class: Class::T,
         kind: Kind::Flag,
-        default: Unset::Is("1"),
-        doc: "V2-Lite hybrid MoE: `0` puts each layer's wait right after its go instead of \
-              after the card's experts and the shared expert.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
-        },
-    },
-    LeverSpec {
-        name: "BLOOMERY_HOST_POPULATE",
-        class: Class::C,
-        kind: Kind::Flag,
-        default: Unset::Is("1"),
-        doc: "Placed load: the plan's host set is read in with `MADV_POPULATE_READ`; `0` \
-              leaves it to fault in, the fresh-fault arm.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
-        },
-    },
-    LeverSpec {
-        name: "BLOOMERY_HOST_LOCK",
-        class: Class::C,
-        kind: Kind::Flag,
-        default: Unset::Is("0"),
-        doc: "Placed load: after populating, `mlock` the host set for the model's life; an \
-              `RLIMIT_MEMLOCK` refusal is an error that names the limit.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
-        },
-    },
-    LeverSpec {
-        name: "BLOOMERY_CARD_DONTNEED",
-        class: Class::C,
-        kind: Kind::Flag,
-        default: Unset::Is("1"),
-        doc: "Placed load: each uploaded card segment's file pages are dropped right after \
-              its upload (`token_embd` and the engram table excepted); `0` keeps them in \
-              the page cache.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
+        default: Unset::Means("the only path"),
+        doc: "Was the hybrid MoE's wait right after each layer's go instead of after the \
+              card's experts and the shared expert.",
+        site: Site::Retired {
+            why: "each hybrid layer's wait sits after the card's experts and the shared expert",
+            left: &[],
         },
     },
     LeverSpec {

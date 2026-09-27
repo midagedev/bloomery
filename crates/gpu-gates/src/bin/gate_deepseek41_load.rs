@@ -75,7 +75,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
-    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
+    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -102,7 +102,14 @@ mod gate {
     const PINNED_GRANULE: i128 = 2 << 20;
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[
+            HOT_LIST,
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         let cfg = OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;

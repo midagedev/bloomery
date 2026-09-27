@@ -71,12 +71,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HOST, Hybrid, Refusal, SlotMap, levers,
-};
+use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, Refusal, SlotMap};
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
@@ -130,6 +129,10 @@ pub struct BodyLevers {
     pub group: usize,
     /// The step rows' levers.
     pub rows: RowsLevers,
+    /// The host tier's load settings: what the placed load does to the host
+    /// set and the card segments' pages, and whether the host tier reads the
+    /// r8 sidecar.
+    pub host: HostCfg,
 }
 
 /// What [`open`] takes besides the file, the placement and the context: the
@@ -157,6 +160,7 @@ impl OpenCfg {
                 prefill,
                 group: levers.prefill_group(),
                 rows: RowsLevers::from_levers(levers),
+                host: levers.host(),
             },
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })
@@ -1961,9 +1965,14 @@ impl Body {
         card: usize,
         meta: &BodyMeta,
     ) -> Result<Deepseek41Model, GpuError> {
-        GpuModel::load_placed(file, plan, card, Body::derive, |gpu, file, _| {
-            Body::load_placed(gpu, file, plan, card, meta)
-        })
+        GpuModel::load_placed(
+            file,
+            plan,
+            card,
+            meta.levers.host,
+            Body::derive,
+            |gpu, file, _| Body::load_placed(gpu, file, plan, card, meta),
+        )
     }
 
     /// V4.1 derives no new values at load: it moves the attention's Q3_K
@@ -2068,11 +2077,10 @@ impl Body {
                 n_used: hp.experts.n_used,
             },
             map,
-            levers()?.overlap,
             PAIR_ROWS,
         )?;
         let file = Arc::new(file);
-        let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone())?;
+        let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
         let mut hybrid = Hybrid::new(boundary, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());

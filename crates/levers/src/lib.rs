@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    CARD_BUDGET, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOT_LIST, PIN_MAIN, PREFILL,
-    PREFILL_GROUP, PREFILL_GROUP_MAX, SPIN, STEP_STATS, THREADS,
+    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
+    HOT_LIST, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -697,6 +697,18 @@ impl Levers {
         self.flag(CHECK_FINITE)
     }
 
+    /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
+    /// [`CARD_DONTNEED`] and [`R8`].
+    #[must_use]
+    pub fn host(&self) -> HostCfg {
+        HostCfg {
+            populate: self.flag(HOST_POPULATE),
+            lock: self.flag(HOST_LOCK),
+            card_dontneed: self.flag(CARD_DONTNEED),
+            r8: self.flag(R8),
+        }
+    }
+
     /// Every lever row of [`REGISTRY`], one line each: the value this
     /// reading has — as set, or the default — or `-` for a lever it does not
     /// parse or its binary does not act on, and who reads it. What `--levers`
@@ -725,6 +737,27 @@ impl Levers {
         }
         out
     }
+}
+
+/// The host tier's load settings, from a binary's one reading
+/// ([`Levers::host`]): what a placed load does to its plan's host set and to
+/// the card segments' file pages, and where the host tier reads a V4.1 file's
+/// routed gates and ups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCfg {
+    /// [`HOST_POPULATE`]: the plan's host set is read into the page cache
+    /// and mapped at load; `false` leaves it to the steps' first touches.
+    pub populate: bool,
+    /// [`HOST_LOCK`]: the host set is locked in RAM for the model's
+    /// lifetime.
+    pub lock: bool,
+    /// [`CARD_DONTNEED`]: each card segment's file pages leave the page cache
+    /// once uploaded.
+    pub card_dontneed: bool,
+    /// [`R8`]: a V4.1 host tier reads its routed gates and ups from the r8
+    /// sidecar when there is one; `false` reads the source's, the
+    /// same-binary arm.
+    pub r8: bool,
 }
 
 /// A binary's one reading of the levers, first thing in `main`. `acts_on`

@@ -160,7 +160,9 @@ mod gate {
         patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
-    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
+    };
     use cuda_core::sys;
     use gguf::quant::half_to_f32;
     use gguf::{GgmlType, Split};
@@ -254,7 +256,15 @@ mod gate {
     // ------------------------------------------------------------------ run
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[
+            ENGRAM_HELPER,
+            HOT_LIST,
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
@@ -301,10 +311,17 @@ mod gate {
             pass &= fault_behind_error_case(&mut m, &hp)?;
         }
         if args.sets {
-            pass &= sets(&mut m, &mut head, &split, &hp, &SETS)?;
+            pass &= sets(&mut m, &mut head, &split, &hp, cfg.body.host.r8, &SETS)?;
         }
         if args.select {
-            pass &= sets(&mut m, &mut head, &split, &hp, &SELECT_SETS)?;
+            pass &= sets(
+                &mut m,
+                &mut head,
+                &split,
+                &hp,
+                cfg.body.host.r8,
+                &SELECT_SETS,
+            )?;
         }
         if let Some(tag) = &args.ppl {
             pass &= ppl(&mut m, &hp, tag)?;
@@ -1314,21 +1331,13 @@ mod gate {
     /// the layer before each engram site, that site's token-only work
     /// ([`shadow::engram_kv_kernels`]), which reads the step image alone and is first read
     /// by the site layer's engram step. Also: no engram site's token-only
-    /// work runs outside a shadow. Needs the overlap lever on (the default):
-    /// off, each wait sits right after its go and every shadow is empty.
+    /// work runs outside a shadow.
     fn shadow_sets(
         nodes: &[StepNode],
         body: &Body,
         split: &Split,
         hp: &Hparams,
     ) -> Result<bool, GateError> {
-        if !bloomery_gpu::hybrid::levers()?.overlap {
-            return Err(
-                "the shadow-set check needs BLOOMERY_HYBRID_OVERLAP unset or 1: with the \
-                        lever off each wait sits right after its go and no layer has a shadow"
-                    .into(),
-            );
-        }
         let layers = body.layers();
         let at = regions(nodes, &layers);
         let memops: Vec<u32> = nodes
@@ -1614,6 +1623,7 @@ mod gate {
         head: &mut Head,
         split: &Split,
         hp: &Hparams,
+        r8: bool,
         names: &[&'static str],
     ) -> Result<bool, GateError> {
         let mut pass = true;
@@ -1629,7 +1639,7 @@ mod gate {
             run_step(gpu, w, body, head, &set, &mut collect(&mut seams, &indexer))?;
             body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
             pass &= check_ids(&set, hp, body)?;
-            let (ok, ratio, acc) = check_seams(&set, split, hp, &seams)?;
+            let (ok, ratio, acc) = check_seams(&set, split, hp, r8, &seams)?;
             pass &= ok;
             worst = worst.max(ratio);
             pass &= check_head(&set, &head.logits_to_host(gpu)?, acc)?;
@@ -1855,6 +1865,7 @@ mod gate {
         set: &Set,
         split: &Split,
         hp: &Hparams,
+        r8: bool,
         seams: &[SeamOut],
     ) -> Result<(bool, f64, Option<f64>), GateError> {
         let want = hp.n_layer * 2 + hp.engram()?.layer_ids.len();
@@ -1900,7 +1911,8 @@ mod gate {
             };
             let flip = match &o.router {
                 Some(rt) if diverged.is_none() => {
-                    let (ok, set_differs) = check_router(set, split, hp, o.layer, rt, input_ok)?;
+                    let (ok, set_differs) =
+                        check_router(set, split, hp, r8, o.layer, rt, input_ok)?;
                     pass &= ok;
                     set_differs
                 }
@@ -2381,6 +2393,7 @@ mod gate {
         set: &Set,
         split: &Split,
         hp: &Hparams,
+        r8: bool,
         l: usize,
         rt: &RouterHost,
         input_ok: bool,
@@ -2404,7 +2417,7 @@ mod gate {
         let margin = tie_margin(&ik_logits, &ik_sel, &rt.logits, &rt.probs, &bias);
         let waived = margin <= 1.0 && input_ok;
         let swap = if set_differs {
-            format!("{:.3e}", swap_effect(set, split, hp, l, rt, &ik)?)
+            format!("{:.3e}", swap_effect(set, split, hp, r8, l, rt, &ik)?)
         } else {
             "-".to_string()
         };
@@ -2425,6 +2438,7 @@ mod gate {
         set: &Set,
         split: &Split,
         hp: &Hparams,
+        r8: bool,
         l: usize,
         rt: &RouterHost,
         ik: &[u32],
@@ -2435,7 +2449,7 @@ mod gate {
         let (hc, _) = hc_pre(man, &names::hc_ffn_scale(l))?;
         let s = named(man, &format!("l_out-{l}"))?;
         let first = split.shard_path(0).ok_or("the file has no shard 0")?;
-        let mut host = Ds41Host::build(Split::open(first)?, hp, l..l + 1)?;
+        let mut host = Ds41Host::build(Split::open(first)?, hp, l..l + 1, r8)?;
         let xt = Tensor2 {
             ne0: x.len(),
             ne1: 1,

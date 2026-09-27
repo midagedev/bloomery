@@ -84,7 +84,9 @@ mod gate {
         GateError, NAN_F16, RefManifest, checks_failed, ref_tensor_of_in, verdict,
         widened_f16_rows_in,
     };
-    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
+    };
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -136,7 +138,15 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[
+            ENGRAM_HELPER,
+            HOT_LIST,
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
@@ -797,9 +807,6 @@ mod gate {
         split: &Split,
         hp: &Hparams,
     ) -> Result<bool, GateError> {
-        if !bloomery_gpu::hybrid::levers()?.overlap {
-            return Err("the shadow check needs BLOOMERY_HYBRID_OVERLAP unset or 1".into());
-        }
         let (gpu, w, body) = m.body_parts("structure")?;
         let layers = body.layers();
         let [ha, hb] = heads;

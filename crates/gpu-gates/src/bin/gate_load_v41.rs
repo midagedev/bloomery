@@ -86,10 +86,12 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::hybrid::{HostLevers, HostResidency, host_levers};
+    use bloomery_gpu::hybrid::HostResidency;
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
-    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, HostCfg, R8,
+    };
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -176,10 +178,17 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let parsed = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+        let parsed = bloomery_levers::at_main(&[
+            HOT_LIST,
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         let args = parse_args()?;
         let place = PlanLevers::from_levers(&parsed)?;
-        let levers = host_levers()?;
+        let levers = parsed.host();
         if args.lock.is_some() && !levers.lock {
             return Err(
                 "--lock and --lock-layers go through the engine's lever: set BLOOMERY_HOST_LOCK=1"
@@ -245,7 +254,7 @@ mod gate {
         let cached_before = meminfo_cached()?;
         let mut ok = true;
         for (c, on) in cards.iter().enumerate() {
-            ok &= check_card(&split, &plan, c, on)?;
+            ok &= check_card(&split, &plan, c, on, levers.card_dontneed)?;
         }
         let cached_cards = meminfo_cached()?;
         let host = Host {
@@ -320,16 +329,18 @@ mod gate {
         Ok(out)
     }
 
-    /// Load card `c`'s segments and run checks 1–3 on them.
+    /// Load card `c`'s segments — releasing their file pages when
+    /// `card_dontneed` — and run checks 1–3 on them.
     fn check_card(
         split: &Split,
         plan: &Plan<'_>,
         c: usize,
         on: &OnCard,
+        card_dontneed: bool,
     ) -> Result<bool, GateError> {
         let card = &plan.machine.cards[c];
         let start = Instant::now();
-        let w = Weights::load_placed(on.gpu.stream(), split, plan, c)?;
+        let w = Weights::load_placed(on.gpu.stream(), split, plan, c, card_dontneed)?;
         let wall = start.elapsed();
         let (free_load, _) = on.gpu.mem_info()?;
         let resident = w.resident_bytes() as u64;
@@ -798,7 +809,7 @@ mod gate {
         /// The file and `r8`, checked as a pair before the eviction.
         src: R8Source<'a>,
         lock: Option<&'a Lock>,
-        levers: HostLevers,
+        levers: HostCfg,
     }
 
     /// The host half: the engine's host step over the host segments the

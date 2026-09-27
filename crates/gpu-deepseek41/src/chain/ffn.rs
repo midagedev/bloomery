@@ -31,8 +31,7 @@
 //!   a reset does not clear it, so after a fault it can hold a NaN — and no
 //!   card launch reads that column.
 //! - The go signals the host tier; the wait takes its answer back
-//!   ([`bloomery_gpu::hybrid`]). With the overlap lever off the wait sits
-//!   right after the go.
+//!   ([`bloomery_gpu::hybrid`]); the wait sits after the shadow work.
 //! - HC_PRE sits after the go: its result feeds only this sub-layer's HC_POST
 //!   and the next sub-layer's fold (the lag), so it runs while the host
 //!   computes. So do the card's routed experts and the shared expert.
@@ -104,8 +103,7 @@ const ENQUEUE: &str = "FfnPiece::enqueue";
 
 /// Work a caller puts in a layer's host-leg shadow besides the piece's own:
 /// enqueued on the step's stream after the layer's go and the piece's own
-/// shadow work, and before the wait when the overlap lever is on (the
-/// default; off, the wait already follows the go). It must read nothing the
+/// shadow work, and before the wait. It must read nothing the
 /// host tier writes for the layer and write nothing the layer's join reads.
 pub trait ShadowWork {
     /// Enqueue the work. Asynchronous, allocation-free, capturable.
@@ -1086,9 +1084,8 @@ impl FfnPiece {
     }
 
     /// The layer's front on row `row`'s buffers: the norm, the router, the
-    /// handoff into the row's image and the go — with the overlap lever off,
-    /// the wait right after it. What the shadow reads of it comes back as a
-    /// [`GoFront`], for [`FfnPiece::enqueue_go_shadow`].
+    /// handoff into the row's image and the go. What the shadow reads of it
+    /// comes back as a [`GoFront`], for [`FfnPiece::enqueue_go_shadow`].
     #[allow(
         clippy::too_many_arguments,
         reason = "enqueue's arguments and the row; the pieces take the shared buffers flat (rust-quality R8)"
@@ -1144,8 +1141,7 @@ impl FfnPiece {
     }
 
     /// The layer's rest on row `row`'s buffers, after its
-    /// [`FfnPiece::enqueue_go_half`]: the wait (with the overlap lever on),
-    /// the join, and the host tier told the row's layer is enqueued.
+    /// [`FfnPiece::enqueue_go_half`]: the wait, the join, and the host tier told the row's layer is enqueued.
     pub fn enqueue_join_half<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
@@ -1156,9 +1152,7 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.boundary().slots(), &io, row)?;
         let boundary = hybrid.boundary();
-        if boundary.overlap() {
-            boundary.enqueue_back_of(gpu.stream(), row)?;
-        }
+        boundary.enqueue_back_of(gpu.stream(), row)?;
         self.enqueue_join(gpu, i, row, io, boundary)?;
         hybrid.row_enqueued(layer, row)
     }
@@ -1270,8 +1264,7 @@ impl FfnPiece {
         }
     }
 
-    /// The norm, the router, the handoff into row `row`'s image and the go
-    /// — and, with the overlap lever off, the wait right after it.
+    /// The norm, the router, the handoff into row `row`'s image and the go.
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer, its row and weights, the shared buffers and the host tier (rust-quality R8)"
@@ -1329,18 +1322,12 @@ impl FfnPiece {
         };
         self.kernels
             .enqueue_handoff(stream, &h, target, fault, &mut r.sel)?;
-        let boundary = hybrid.boundary();
-        boundary.enqueue_go_of(stream, layer, row)?;
-        if !boundary.overlap() {
-            boundary.enqueue_back_of(stream, row)?;
-        }
-        Ok(())
+        hybrid.boundary().enqueue_go_of(stream, layer, row)
     }
 
     /// The piece's own work in the shadow of the host's leg, on row `row`'s
     /// buffers: HC_PRE, the card's routed experts, the shared expert. The
-    /// caller's shadow work and, with the overlap lever on, the wait follow
-    /// it.
+    /// caller's shadow work and the wait follow it.
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer, its row, weights and stacks, and the shared buffers (rust-quality R8)"
@@ -1586,14 +1573,16 @@ impl Ds41Host {
     /// `hp`. Load-time only: every stack is found and checked here. A body
     /// passes its own mapping, so the pages its load populated are the ones
     /// the step reads; the routed gates and ups come from `file`'s r8 sidecar
-    /// when the load reads one ([`R8Pair::at_load`] under the load's host
-    /// levers: the reading and the mapping the load's host set took).
+    /// when `r8` asks for it and there is one ([`R8Pair::at_load`] under the
+    /// load's `HostCfg::r8`: the reading and the mapping the load's host set
+    /// took).
     pub fn build(
         file: impl Into<Arc<Split>>,
         hp: &Hparams,
         layers: Range<usize>,
+        r8: bool,
     ) -> Result<Ds41Host, GpuError> {
-        let file = R8Pair::at_load(file.into(), bloomery_gpu::hybrid::host_levers()?.r8)?;
+        let file = R8Pair::at_load(file.into(), r8)?;
         let first = layers.start;
         let views = layers
             .map(|l| host::layer(file.source(), hp, l))

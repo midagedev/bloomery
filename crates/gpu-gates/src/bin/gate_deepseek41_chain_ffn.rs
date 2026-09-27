@@ -84,9 +84,7 @@
 //! set with the host serving each replay, every buffer bit-identical to the
 //! eager run; the captured nodes by kind (kernels, copies — none: the handoff
 //! launch writes the page —, the two memory-operation batches) equal to the
-//! piece's own count. At the first
-//! layer with card experts and a fold, the overlap lever off (the wait right
-//! after the go) must leave every buffer as it is.
+//! piece's own count.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -1600,12 +1598,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&[bloomery_levers::R8])?;
+        let r8 = levers.host().r8;
         let path = ref_model_path()?;
         let split = Split::open(&path)?;
         // Check 1 is the one real-model clause that holds the r8 path to the
         // source bit for bit: with BLOOMERY_R8 on, no sidecar refuses the run
         // by name. Held here, so the tiers below read this open of it.
-        let _r8 = model::r8file::HostR8::at_gate(&split, bloomery_gpu::hybrid::host_levers()?.r8)?;
+        let _r8 = model::r8file::HostR8::at_gate(&split, r8)?;
         let hp = Hparams::read(&split)?;
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
@@ -1651,12 +1651,9 @@ mod gate {
             hidden: n,
             n_used: N_USED,
         };
-        let boundary = Boundary::new(gpu.context(), stream, shape, map.clone(), true)?;
-        let tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer)?;
+        let boundary = Boundary::new(gpu.context(), stream, shape, map.clone())?;
+        let tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer, r8)?;
         let mut hybrid = Hybrid::new(boundary, tier, hp.n_layer)?;
-        let off_boundary = Boundary::new(gpu.context(), stream, shape, map.clone(), false)?;
-        let off_tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer)?;
-        let mut hybrid_off = Hybrid::new(off_boundary, off_tier, hp.n_layer)?;
         let mut piece = FfnPiece::new(&gpu, &hp, &map)?;
         let mut op = Op::new(&gpu, &hp)?;
         let mut io = Io {
@@ -1680,7 +1677,6 @@ mod gate {
             "ds41_ffn_post",
             "ds41_ffn_post_streams",
         ])?);
-        let mut overlap_done = false;
         for l in 0..hp.n_layer {
             let w = layer_weights(stream, &split, l)?;
             let stacks = if cards[l].is_empty() {
@@ -1838,7 +1834,7 @@ mod gate {
             }
             drop(g);
             let nodes_ok = k == want;
-            let mut line = format!(
+            let line = format!(
                 "graph L={l} nodes={} kernels={} memcpy={} memops={} other={} (want {}/{}/{}/{}) \
                  replays_eq_eager={replay_eq}",
                 k.iter().sum::<usize>(),
@@ -1851,18 +1847,7 @@ mod gate {
                 want[2],
                 want[3]
             );
-            let mut pass = nodes_ok && replay_eq;
-            if !overlap_done && lc.n_card > 0 && fold {
-                overlap_done = true;
-                let mut off_eq = true;
-                for (si, d) in dumps.iter().enumerate() {
-                    inject(stream, &mut io, d)?;
-                    let r = run_piece(&gpu, &mut piece, &mut hybrid_off, &mut io, &lc)?;
-                    off_eq &= first_diff(&r, &eager[si]) == "-";
-                }
-                line.push_str(&format!(" overlap_off_eq={off_eq}"));
-                pass &= off_eq;
-            }
+            let pass = nodes_ok && replay_eq;
             println!("{line} {}", verdict(pass));
             tally.add(pass);
         }
