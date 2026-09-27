@@ -367,6 +367,9 @@ pub mod step_order {
         AttnSel,
         KeyCount,
         Q5Quant,
+        PoolSelect,
+        Ple,
+        HcMix,
     ];
 
     /// The order of `arch`'s step.
