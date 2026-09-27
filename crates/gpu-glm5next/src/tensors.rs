@@ -51,6 +51,16 @@ pub(crate) struct LatentNames {
     pub k_b: String,
     pub v_b: String,
     pub out: String,
+    pub sel: SelNames,
+}
+
+/// The k-pool selector's own tensors: the indexer query's projection of the
+/// low-rank query, the head weights' projection of the normed input, and
+/// the pool gate's position bias.
+pub(crate) struct SelNames {
+    pub q_b: String,
+    pub proj: String,
+    pub ape: String,
 }
 
 /// A layer's mixer's tensors, by its kind.
@@ -117,6 +127,11 @@ impl LayerNames {
                 k_b: names::attn_k_b(l),
                 v_b: names::attn_v_b(l),
                 out: names::attn_output(l),
+                sel: SelNames {
+                    q_b: names::indexer_attn_q_b(l),
+                    proj: names::indexer_proj(l),
+                    ape: names::indexer_compressor_ape(l),
+                },
             }),
             MixerKind::Gqa => {
                 return Err(GpuError::Shape {

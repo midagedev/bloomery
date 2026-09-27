@@ -35,6 +35,16 @@ pub const D1K: &str = "ref_glm5next_d1k";
 /// position.
 pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K];
 
+/// Step 3,070 of the prose after a fused prefill, ik's k-pool indexer on
+/// (`--dsa`): past the 2,051 positions a latent layer keeps whole.
+pub const D3K_DSA: &str = "ref_glm5next_d3kdsa";
+/// Step 16,382 of the prose after a fused prefill, `--dsa`: the deepest
+/// context the program serves (`place::ORACLE_POSITIONS`).
+pub const D16K_DSA: &str = "ref_glm5next_d16kdsa";
+
+/// The `--dsa` decode-step sets, by position.
+pub const DSA_SETS: &[&str] = &[D3K_DSA, D16K_DSA];
+
 /// [`MODEL`], as a family's `runs`.
 fn model() -> String {
     MODEL.to_string()
@@ -81,8 +91,25 @@ pub static MTP: Family = Family {
     consumers: &[],
 };
 
+/// ik's node dumps with its k-pool indexer on (`--dsa`): the selector's
+/// sets past the dense limit, which the selector gate reads. The same file
+/// and build as [`IK`]; the gate refuses a set of this family whose
+/// dumper's command line lacks `--dsa` or which holds no indexer node.
+pub static IK_DSA: Family = Family {
+    name: "ik-glm5next-dsa",
+    sets: DSA_SETS,
+    resolve: None,
+    recipe: "just dump-ref-glm5next [VARIANT]",
+    identity: Identity::Manifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(IK_BUILD)),
+    runs: Some(model),
+    draft_runs: None,
+    consumers: &["gate-gpu-glm-sel", "gate-gpu-glm5next-e2e"],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &MTP];
+pub static FAMILIES: &[&Family] = &[&IK, &MTP, &IK_DSA];
 
 #[cfg(test)]
 mod tests;

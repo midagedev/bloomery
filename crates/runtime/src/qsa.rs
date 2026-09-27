@@ -1,8 +1,9 @@
-//! The token-pool selector of Qwen3.8's full-attention layers (QSA), as the
-//! integer and ordering rules the card's kernels (`bloomery_gpu::qsa`) and
-//! their gate both follow: which pools a query row may keep, which tokens a
-//! kept pool and the tail stand for, the tie order at the cut, and the one
-//! predicate that says whether a row is scored at all.
+//! The token-pool selector of Qwen3.8's full-attention layers (QSA) and of
+//! GLM-5.3-Flash's latent layers (the k-pool indexer), as the integer and
+//! ordering rules the card's kernels (`bloomery_gpu::qsa`) and their gates
+//! follow: which pools a query row may keep, which tokens a kept pool and the
+//! tail stand for, the tie order at the cut, and the one predicate that says
+//! whether a row is scored at all.
 //!
 //! A row is named by its live count `c` — its position plus one, the keys it
 //! sees. Every `pool` consecutive tokens `[pool·j, pool·j + pool)` form pool
@@ -13,10 +14,11 @@
 //! below that many live keys the list is every token: the selection equals
 //! dense attention there.
 //!
-//! Order at the cut: score descending, then pool index ascending — the lower
-//! pool wins a tie. Scores are compared through [`order_key`], which ties
-//! `−0.0` with `+0.0` and orders every bit pattern, NaN included (the card
-//! raises a fault on a non-finite score and still writes a defined list).
+//! Order at the cut: score descending, then the [`Tie`] rule — Qwen3.8's
+//! selector keeps the lower pools of a tie, GLM's the higher ones. Scores are
+//! compared through [`order_key`], which ties `−0.0` with `+0.0` and orders
+//! every bit pattern, NaN included (the card raises a fault on a non-finite
+//! score and still writes a defined list).
 
 use std::fmt;
 
@@ -146,13 +148,32 @@ pub fn order_key(v: f32) -> u32 {
     }
 }
 
+/// Which of the pools tied at the cut a row keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tie {
+    /// The lower pools: Qwen3.8's selector.
+    Lower,
+    /// The higher pools: ik's CPU `top_k`, a descending sort of `(score,
+    /// index)` pairs, which GLM's k-pool selector follows.
+    Higher,
+}
+
 /// The `k` best of `scores` (pool `j` scored `scores[j]`) by [`order_key`]
 /// descending, a tie to the lower pool; all of them when there are at most
 /// `k`. Ascending pool indices.
 #[must_use]
 pub fn select_pools(scores: &[f32], k: usize) -> Vec<u32> {
+    select_pools_by(scores, k, Tie::Lower)
+}
+
+/// [`select_pools`] with the tie rule `tie`.
+#[must_use]
+pub fn select_pools_by(scores: &[f32], k: usize, tie: Tie) -> Vec<u32> {
     let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.sort_by_key(|&j| (std::cmp::Reverse(order_key(scores[j])), j));
+    match tie {
+        Tie::Lower => order.sort_by_key(|&j| (std::cmp::Reverse(order_key(scores[j])), j)),
+        Tie::Higher => order.sort_by_key(|&j| std::cmp::Reverse((order_key(scores[j]), j))),
+    }
     let mut kept: Vec<u32> = order
         .into_iter()
         .take(k)
@@ -198,6 +219,15 @@ pub fn token_list(q: Qsa, count: usize, pools: &[u32]) -> Vec<u32> {
 /// When the row selects and `scores` holds fewer than its complete pools.
 #[must_use]
 pub fn select(q: Qsa, count: usize, scores: &[f32]) -> Vec<u32> {
+    select_by(q, count, scores, Tie::Lower)
+}
+
+/// [`select`] with the tie rule `tie`.
+///
+/// # Panics
+/// As [`select`].
+#[must_use]
+pub fn select_by(q: Qsa, count: usize, scores: &[f32], tie: Tie) -> Vec<u32> {
     if !q.selects(count) {
         return (0..count)
             .map(|t| u32::try_from(t).expect("a token index fits u32"))
@@ -209,7 +239,11 @@ pub fn select(q: Qsa, count: usize, scores: &[f32]) -> Vec<u32> {
         "{} scores for {complete} complete pools",
         scores.len()
     );
-    token_list(q, count, &select_pools(&scores[..complete], q.kept()))
+    token_list(
+        q,
+        count,
+        &select_pools_by(&scores[..complete], q.kept(), tie),
+    )
 }
 
 #[cfg(test)]
@@ -350,6 +384,34 @@ mod tests {
             let tail = count - count % 4;
             assert!((tail..count).all(|t| list.contains(&(t as u32))));
         }
+    }
+
+    #[test]
+    fn the_higher_tie_takes_the_best_and_the_higher_pool_of_a_tie() {
+        // Pools 1, 4 and 6 tie at the cut; two of them fit: 4 and 6.
+        let s = [0.5, 2.0, 9.0, 0.25, 2.0, 7.0, 2.0, 0.0];
+        assert_eq!(select_pools_by(&s, 4, Tie::Higher), vec![2, 4, 5, 6]);
+        // relu zeros of either sign tie: the highest two win, whatever sign
+        // each zero carries.
+        let z = [-0.0, 0.0, -0.0, 0.0, -0.0];
+        assert_eq!(select_pools_by(&z, 2, Tie::Higher), vec![3, 4]);
+        assert_eq!(select_pools_by(&z, 2, Tie::Lower), vec![0, 1]);
+        // k at or past the pools keeps them all.
+        assert_eq!(
+            select_pools_by(&s, 8, Tie::Higher),
+            (0..8).collect::<Vec<_>>()
+        );
+        // A row keeps its higher tied pools and then its tail.
+        let q = Qsa::new(8, 4).expect("two pools of four");
+        assert_eq!(
+            select_by(q, 14, &[1.0, 1.0, 1.0], Tie::Higher),
+            vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
+        // Below the cut the tie rule changes nothing: every token.
+        assert_eq!(
+            select_by(q, 11, &[], Tie::Higher),
+            (0..11).collect::<Vec<_>>()
+        );
     }
 
     /// The cut ik and mainline make (ik `build_qwen4exp.cpp:387,445`, mainline

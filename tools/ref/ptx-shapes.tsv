@@ -150,11 +150,13 @@ generate_ds41   hc_pre_q8_0                             0          0
 generate_ds41   head_norm_neox_append                   0          0
 generate_ds41   head_norm_neox_append_256                   0          0
 generate_ds41   index_key_ln_append                     0          0
+generate_ds41   index_pool                              0          0
 generate_ds41   iq2_xs_rows                             0          0
 generate_ds41   iq3_xxs_rows                            0          0
 generate_ds41   iq4_xs_rows                             0          0
 generate_ds41   kda_conv_prep                           0          0
 generate_ds41   kda_delta                               0          0
+generate_ds41   kpool_score                             0          0
 generate_ds41   kq_gate_up_act_q4k                      0          0
 generate_ds41   kq_gate_up_act_q5k                      0          0
 generate_ds41   kq_gate_up_act_q8_0                     0          0
@@ -198,6 +200,7 @@ generate_ds41   qsa_key_append                          0          0
 generate_ds41   qsa_pool                                0          0
 generate_ds41   qsa_score                               0          0
 generate_ds41   qsa_topk                                0          0
+generate_ds41   qsa_topk_high                           0          0
 generate_ds41   quantize_gemm32                         0          0
 generate_ds41   qwen3moe_combine                        0          0
 generate_ds41   qwen3moe_gate_up_swiglu_q4k             0          0
@@ -301,11 +304,13 @@ gate_e2e        hc_gated_up_mix_4x320                   0          0
 gate_e2e        head_norm_neox_append                   0          0
 gate_e2e        head_norm_neox_append_256                   0          0
 gate_e2e        index_key_ln_append                     0          0
+gate_e2e        index_pool                              0          0
 gate_e2e        iq2_xs_rows                             0          0
 gate_e2e        iq3_xxs_rows                            0          0
 gate_e2e        iq4_xs_rows                             0          0
 gate_e2e        kda_conv_prep                           0          0
 gate_e2e        kda_delta                               0          0
+gate_e2e        kpool_score                             0          0
 gate_e2e        kq_gate_up_act_q4k                      0          0
 gate_e2e        kq_gate_up_act_q5k                      0          0
 gate_e2e        kq_gate_up_act_q8_0                     0          0
@@ -349,6 +354,7 @@ gate_e2e        qsa_key_append                          0          0
 gate_e2e        qsa_pool                                0          0
 gate_e2e        qsa_score                               0          0
 gate_e2e        qsa_topk                                0          0
+gate_e2e        qsa_topk_high                           0          0
 gate_e2e        quantize_gemm32                         0          0
 gate_e2e        qwen3moe_combine                        0          0
 gate_e2e        qwen3moe_gate_up_swiglu_q4k             0          0

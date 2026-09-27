@@ -21,10 +21,13 @@
 //! The token's embedding row is read from the file on the host and written
 //! into the first stream buffer four times, one copy before the chain; its
 //! position and the attention's visible counts are two more words the
-//! captured chain reads. Each latent layer caches every position it has
-//! seen and attends all of them: the plan refuses a context past the
-//! positions the indexer keeps whole (`place::dense_positions`), so the
-//! selector never has to run. The next-token (MTP) layer is carried by the
+//! captured chain reads, and the step's live count (its position plus one)
+//! a third, which the k-pool selector reads. Each latent layer caches every
+//! position it has seen, its index rows and the key of every pool of four
+//! they complete, and attends the positions its selector lists (every one
+//! while it sees at most `top_k / kpool` pools, [`crate::mla`]); the plan
+//! serves a context up to the deepest one a reference set checks the
+//! selector at (`place::ORACLE_POSITIONS`). The next-token (MTP) layer is carried by the
 //! file and not loaded: its tensors are `Role::Unused`, as ik loads and does
 //! not run it.
 //!
@@ -42,11 +45,13 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
-use bloomery_gpu::latent::{INDEX_ROW, LATENT, LatentKernels};
+use bloomery_gpu::kpool::{self, KpoolKernels};
+use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
 use bloomery_gpu::linear::{HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels, StepMode};
+use bloomery_gpu::qsa::{QsaKernels, list_width};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
 use bloomery_gpu_deepseek41::chain::ffn::FfnKernels;
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
@@ -78,8 +83,8 @@ const _: () = assert!(place::PASS_ROWS == PASS_ROWS);
 /// The GLM model: one card, the skeleton over this body.
 pub type Glm5nextModel = GpuModel<Body>;
 
-/// The spacing of a prompt call's inner checkpoints: a context the plan
-/// caps near two thousand positions takes at most three inside a call.
+/// The spacing of a prompt call's inner checkpoints; past the host budget's
+/// slots the oldest is evicted (`runtime::seqstate`).
 pub const CHECKPOINT_EVERY: u32 = 512;
 
 /// The kernels the step launches, loaded once.
@@ -92,6 +97,11 @@ pub(crate) struct Kernels {
     pub router: RouterKernels,
     pub experts: ExpertKernels,
     pub ffn: FfnKernels,
+    /// The k-pool selector's score and top-k passes, and the stream its
+    /// launches run on beside the latent mixer's query ([`crate::mla`]).
+    pub kpool: KpoolKernels,
+    pub qsa: QsaKernels,
+    pub branch: Branch,
 }
 
 impl Kernels {
@@ -106,6 +116,9 @@ impl Kernels {
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             ffn: FfnKernels::load(ctx)?,
+            kpool: KpoolKernels::load(ctx)?,
+            qsa: QsaKernels::load(ctx)?,
+            branch: Branch::new(ctx)?,
         })
     }
 }
@@ -128,6 +141,8 @@ pub(crate) struct Dims {
     pub rms_eps: f32,
     /// The index keys' LayerNorm.
     pub norm_eps: f32,
+    /// Pools the k-pool selector keeps: `top_k / kpool`.
+    pub kept: usize,
     pub hc_eps: f32,
     pub hc_iters: u32,
     /// The KDA decay's lower bound.
@@ -160,7 +175,8 @@ pub(crate) struct LayerCfg {
 }
 
 /// A layer's store: a KDA layer's recurrent state and conv ring, a latent
-/// layer's latent rows and index rows, one row a position.
+/// layer's latent rows and index rows, one row a position, and its pool
+/// plane, one key a pool of [`POOL`] positions.
 pub(crate) enum Store {
     Kda {
         state: DeviceBuffer<f32>,
@@ -169,6 +185,7 @@ pub(crate) enum Store {
     Latent {
         latent: DeviceTensor<u16>,
         index: DeviceTensor<u16>,
+        pooled: DeviceTensor<u16>,
     },
 }
 
@@ -176,7 +193,11 @@ impl Store {
     fn bytes(&self) -> usize {
         match self {
             Store::Kda { state, ring } => state.num_bytes() + ring.num_bytes(),
-            Store::Latent { latent, index } => latent.buf().num_bytes() + index.buf().num_bytes(),
+            Store::Latent {
+                latent,
+                index,
+                pooled,
+            } => latent.buf().num_bytes() + index.buf().num_bytes() + pooled.buf().num_bytes(),
         }
     }
 
@@ -194,9 +215,14 @@ impl Store {
                 state.zero_async(stream)?;
                 ring.zero_async(stream)?;
             }
-            Store::Latent { latent, index } => {
+            Store::Latent {
+                latent,
+                index,
+                pooled,
+            } => {
                 latent.buf_mut().zero_async(stream)?;
                 index.buf_mut().zero_async(stream)?;
+                pooled.buf_mut().zero_async(stream)?;
             }
         }
         Ok(())
@@ -242,6 +268,14 @@ pub(crate) struct Scratch {
     pub part_ms: DeviceBuffer<f32>,
     /// Each head's sink logit: −∞, a fold of nothing.
     pub sinks: DeviceBuffer<f32>,
+    // The k-pool selector's: the step's live count, the indexer query and
+    // head weights, the scores of the pools, and the list the attention
+    // reads (its length the second word of `vis`).
+    pub cnt: DeviceBuffer<u32>,
+    pub qi: DeviceBuffer<f32>,
+    pub wi: DeviceBuffer<f32>,
+    pub scores: DeviceBuffer<f32>,
+    pub list: DeviceBuffer<u32>,
     // The feed-forward blocks'.
     pub h: DeviceBuffer<f32>,
     pub sh_y: DeviceBuffer<f32>,
@@ -250,7 +284,7 @@ pub(crate) struct Scratch {
     /// A layer without a selection bias in the file selects with none.
     pub no_bias: DeviceBuffer<f32>,
     // The step's words: its position; the attention's visible counts (no
-    // window row, then every cached position); the delta rule's lane, 0.
+    // window row, then the selector's list length); the delta rule's lane, 0.
     pub pos: DeviceBuffer<u32>,
     pub vis: DeviceBuffer<u32>,
     pub lane: DeviceBuffer<u32>,
@@ -263,7 +297,7 @@ impl Scratch {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (n, c, v) = (d.embd, d.kda.channels(), d.kda.n_v * HEAD);
         let rows = d.heads;
-        let segs = attn::segments(0, ctx);
+        let segs = attn::segments(0, list_width(d.kept));
         Ok(Scratch {
             streams: [z(HC_STREAMS * n)?, z(HC_STREAMS * n)?],
             x: z(n)?,
@@ -293,6 +327,11 @@ impl Scratch {
             part_v: z(attn::partials_v_len(rows, segs))?,
             part_ms: z(attn::partials_ms_len(rows, segs))?,
             sinks: DeviceBuffer::from_host(stream, &vec![f32::NEG_INFINITY; d.heads])?,
+            cnt: DeviceBuffer::zeroed(stream, 1)?,
+            qi: z(kpool::HEADS * kpool::DIM)?,
+            wi: z(kpool::HEADS)?,
+            scores: z(pools_for(ctx))?,
+            list: DeviceBuffer::zeroed(stream, list_width(d.kept))?,
             h: z(ff)?,
             sh_y: z(n)?,
             rout: RouterOut::new(stream)?,
@@ -334,6 +373,9 @@ impl Scratch {
             &self.part_v,
             &self.part_ms,
             &self.sinks,
+            &self.qi,
+            &self.wi,
+            &self.scores,
             &self.h,
             &self.sh_y,
             &self.no_bias,
@@ -347,6 +389,8 @@ impl Scratch {
             + self.sel.num_bytes()
             + self.pos.num_bytes()
             + self.vis.num_bytes()
+            + self.cnt.num_bytes()
+            + self.list.num_bytes()
             + self.lane.num_bytes()
     }
 }
@@ -667,13 +711,13 @@ impl Body {
         }
         let ctx = usize::try_from(plan.ctx_max)
             .ok()
-            .filter(|&c| c > 0 && c as u64 <= place::dense_positions(hp))
+            .filter(|&c| c > 0 && c as u64 <= place::ORACLE_POSITIONS)
             .ok_or_else(|| {
                 shape(format!(
-                    "ctx_max {}: at least 1 and at most the {} positions the latent layers \
-                     attend whole",
+                    "ctx_max {}: at least 1 and at most the {} positions a reference set \
+                     checks the selector at",
                     plan.ctx_max,
-                    place::dense_positions(hp)
+                    place::ORACLE_POSITIONS
                 ))
             })?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
@@ -989,6 +1033,17 @@ fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
             2 * hp.indexer.head_dim,
             INDEX_ROW,
         ),
+        (
+            "attention.indexer.key_length (the pool key's)",
+            hp.indexer.head_dim,
+            INDEX_HEAD,
+        ),
+        (
+            "attention.indexer.head_count",
+            hp.indexer.n_head,
+            kpool::HEADS,
+        ),
+        ("attention.indexer.kpool", hp.indexer.kpool, POOL),
         ("expert_count", hp.n_expert, N_EXPERT),
         ("expert_used_count", hp.n_used, N_USED),
         ("ssm.conv_kernel", hp.conv, bloomery_gpu::linear::CONV_TAPS),
@@ -1020,6 +1075,7 @@ fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
         index_d: hp.indexer.head_dim,
         rms_eps: hp.rms_eps,
         norm_eps: hp.norm_eps,
+        kept: hp.indexer.top_k / hp.indexer.kpool,
         hc_eps: hp.hc.eps,
         hc_iters: u32::try_from(hp.hc.sinkhorn)
             .map_err(|_| shape(format!("sinkhorn_iterations {}", hp.hc.sinkhorn)))?,
@@ -1078,7 +1134,7 @@ fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuErro
 }
 
 /// Layer `kind`'s store at `ctx` positions: a KDA layer's one-lane state and
-/// its conv ring, a latent layer's latent and index rows.
+/// its conv ring, a latent layer's latent and index rows and its pool plane.
 fn store(stream: &CudaStream, kind: Layer, d: &Dims, ctx: usize) -> Result<Store, GpuError> {
     Ok(match kind.mixer {
         MixerKind::DeltaRule => Store::Kda {
@@ -1088,6 +1144,7 @@ fn store(stream: &CudaStream, kind: Layer, d: &Dims, ctx: usize) -> Result<Store
         MixerKind::Latent => Store::Latent {
             latent: DeviceTensor::zeroed(stream, ctx, LATENT)?,
             index: DeviceTensor::zeroed(stream, ctx, INDEX_ROW)?,
+            pooled: DeviceTensor::zeroed(stream, pools_for(ctx), INDEX_HEAD)?,
         },
         MixerKind::Gqa => return Err(shape("a GQA store, which glm5next has none of".into())),
     })
@@ -1117,7 +1174,8 @@ impl ChainBody for Body {
     }
 
     /// The four stream copies of the row into the first stream buffer, the
-    /// position and the visible counts: three host-to-device copies. Once
+    /// position, the visible counts and the live count: four host-to-device
+    /// copies. Once
     /// they are sent the stores count the position: what follows launches.
     fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
         self.planted(Plant::BeforeLaunch)?;
@@ -1128,6 +1186,7 @@ impl ChainBody for Body {
         self.s.streams[0].copy_from_host(stream, &self.embd.streams)?;
         self.s.pos.copy_from_host(stream, &[p])?;
         self.s.vis.copy_from_host(stream, &[0, p + 1])?;
+        self.s.cnt.copy_from_host(stream, &[p + 1])?;
         self.held = p + 1;
         Ok(())
     }

@@ -1,0 +1,19 @@
+# Round glmsel's S0 (the oracle of GLM-5.3-Flash's k-pool selector): ik's CPU node dumps with the indexer on
+# (--dsa), past the 2,051 positions a latent layer keeps whole — d3kdsa (a quiet prefill of 3,070 prose ids,
+# the step at position 3,070, -c 4096), then d16kdsa (a quiet prefill of 16,382, the step
+# at 16,382, -c 16384), each through `just dump-ref-glm5next <variant>` (tools/ref/models/glm5next.sh). Both step
+# positions q have (q + 1) % 4 == 3, so the step's tail is three real cells and ik's zero-filled tail slots
+# name no cell there. Nothing is timed.
+# Minutes per dump [derived, from glmref's d1k: 1,024 ids in 29 s warm, ~36 GFLOP a token at ~1.25 TFLOP/s]:
+#   populate  warm <= 0.5 min; cold 1.5-3.1 min (glmref's batch dump: 133 s for 199.7 GB)
+#   prefill   d3k: 3,070 x 29 ms = 1.5 min, plus attention over every key (ik's CPU flash runs the sparse mask
+#             over all cells: 11 layers x P^2/2 x 65,536 MAC) and the indexer's per-ubatch re-pooling: 1.5-3 min;
+#             d16k: 16,382 x 29 ms = 7.9 min plus 3-6 min of attention: 11-14 min
+#   dump      3.3-3.8 GB a set at 0.5 GB/s: 0.1-0.2 min
+#   d3kdsa 1.7-3.5, d16kdsa 11.5-17 min; 13-21 min warm, up to 24 min cold
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and populates the 199.7 GB split set into the page cache; beside a
+  timed run or a gate batch it would take their cores, memory bandwidth and cache, so it holds the lease; why
+  now: no oracle set has any dsa_* node (every glm5next set was dumped without --dsa), so the selector the
+  program now runs past 2,051 positions has no reference
+minutes: 13..24

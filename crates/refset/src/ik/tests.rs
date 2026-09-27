@@ -1,5 +1,5 @@
 use super::{
-    Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in,
+    Admit, Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in, refused,
     topk_ids_logical_within, widened_f16_bits_in, widened_f16_rows_in,
 };
 use crate::RefError;
@@ -482,4 +482,22 @@ fn widened_f16_bits_read_only_the_rows_asked_for() -> Result<(), RefError> {
     assert!(widened_f16_bits_in(&dir, &view.tensors[0], &[0]).is_err());
     std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
     Ok(())
+}
+
+#[test]
+fn a_masked_row_admits_minus_inf_past_its_finite_slots_only() {
+    let inf = f32::NEG_INFINITY;
+    let rows = [1.0, 2.0, inf, 3.0, 4.0, inf];
+    assert_eq!(refused(&rows, 3, Admit::MaskedPast(2)), None);
+    assert_eq!(refused(&rows, 3, Admit::Finite), Some(2));
+    assert_eq!(refused(&[1.0, inf, inf], 3, Admit::MaskedPast(2)), Some(1));
+    assert_eq!(refused(&[1.0, 2.0, 0.0], 3, Admit::MaskedPast(2)), Some(2));
+    assert_eq!(
+        refused(&[1.0, 2.0, f32::NAN], 3, Admit::MaskedPast(2)),
+        Some(2)
+    );
+    assert_eq!(
+        refused(&[f32::NAN, 2.0, inf], 3, Admit::MaskedPast(2)),
+        Some(0)
+    );
 }

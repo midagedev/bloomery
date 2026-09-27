@@ -227,6 +227,10 @@ name = "gate_glm_mla"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_glm_sel"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "generate_ds41"
 required-features = ["deepseek41"]
 

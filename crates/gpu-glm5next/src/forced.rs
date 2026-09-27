@@ -102,6 +102,7 @@ impl Body {
         p.s.streams[0].copy_from_host(stream, x)?;
         p.s.pos.copy_from_host(stream, &[pos])?;
         p.s.vis.copy_from_host(stream, &[0, pos + 1])?;
+        p.s.cnt.copy_from_host(stream, &[pos + 1])?;
         let mut cur = 0;
         hc_in(gpu, w, &mut p, cur, l, Sub::Attn)?;
         let mix_in = p.s.x.to_host_vec(stream)?;

@@ -1,4 +1,4 @@
-use super::{ARCH, IK, IK_BUILD, MODEL, MTP, MTP_BUILD, MTP_SET};
+use super::{ARCH, IK, IK_BUILD, IK_DSA, MODEL, MTP, MTP_BUILD, MTP_SET};
 use crate::RefError;
 use std::path::{Path, PathBuf};
 
@@ -182,5 +182,19 @@ fn the_mtp_family_takes_its_file_and_the_mtp_build() -> Result<(), RefError> {
         }) if got == IK_BUILD && want == MTP_BUILD => {}
         r => panic!("an MTP set of the node dumps' build: {r:?}"),
     }
+    remove(&dir)
+}
+
+/// The `--dsa` family takes a complete set of the same file, build and
+/// architecture, and the architecture's node-dump family stays [`IK`]: the
+/// shared readers that open "the" node dumps of glm5next open that one.
+#[test]
+fn the_dsa_family_takes_a_set_and_the_node_dumps_stay_ik() -> Result<(), RefError> {
+    let dir = set_dir("dsa")?;
+    check(&dir, MODEL, IK_BUILD, ARCH, true)?;
+    let p = IK_DSA.check_set(&dir)?;
+    assert_eq!(p.dumped_from, MODEL);
+    assert_eq!(p.build.as_deref(), Some(IK_BUILD));
+    assert_eq!(crate::arch::node_dumps(ARCH).map(|f| f.name), Some(IK.name));
     remove(&dir)
 }

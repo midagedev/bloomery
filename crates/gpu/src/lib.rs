@@ -46,6 +46,7 @@ pub mod head;
 pub mod host;
 pub mod hybrid;
 pub mod iq;
+pub mod kpool;
 pub mod kquant;
 pub mod latent;
 pub mod linear;

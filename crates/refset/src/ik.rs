@@ -904,6 +904,46 @@ pub fn find_ref_row_in<'a>(
 /// 4·ne0·ne1·ne2·ne3 and the file's length, and every value must be finite.
 /// Every error names the offending path.
 pub fn ref_tensor_of_in(dir: &Path, row: &RefRow) -> Result<Vec<f32>, RefError> {
+    of_in(dir, row, Admit::Finite)
+}
+
+/// Which values a tensor read admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admit {
+    /// Every value finite.
+    Finite,
+    /// In each row of `ne[0]` values, the first `n` finite and the rest
+    /// `-inf`: a score row whose slots past `n` the graph masked.
+    MaskedPast(usize),
+}
+
+/// The first index of `vals` that `admit` refuses, as rows of `ne0`.
+fn refused(vals: &[f32], ne0: usize, admit: Admit) -> Option<usize> {
+    match admit {
+        Admit::Finite => vals.iter().position(|v| !v.is_finite()),
+        Admit::MaskedPast(n) => vals.iter().enumerate().position(|(i, &v)| {
+            if i % ne0.max(1) < n {
+                !v.is_finite()
+            } else {
+                v != f32::NEG_INFINITY
+            }
+        }),
+    }
+}
+
+/// The refusal message for index `i` of `path` under `admit`.
+fn refused_text(i: usize, path: &Path, ne0: u64, admit: Admit) -> String {
+    match admit {
+        Admit::Finite => format!("non-finite value at index {i} of {}", path.display()),
+        Admit::MaskedPast(n) => format!(
+            "value at index {i} of {} breaks the mask (finite before {n} in each row of {ne0}, \
+             -inf from there)",
+            path.display()
+        ),
+    }
+}
+
+fn of_in(dir: &Path, row: &RefRow, admit: Admit) -> Result<Vec<f32>, RefError> {
     let path = dir.join(row.file_name());
     let bad = |what: String| RefError::malformed("ref_tensor_of", what);
     if row.ty != "f32" {
@@ -944,11 +984,8 @@ pub fn ref_tensor_of_in(dir: &Path, row: &RefRow) -> Result<Vec<f32>, RefError> 
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect();
-    if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
-        return Err(bad(format!(
-            "non-finite value at index {i} of {}",
-            path.display()
-        )));
+    if let Some(i) = refused(&vals, row.ne[0] as usize, admit) {
+        return Err(bad(refused_text(i, &path, row.ne[0], admit)));
     }
     Ok(vals)
 }
@@ -983,6 +1020,21 @@ pub fn load_ref_logical_in(
 /// twin is an error, never a silent flat read — that flat read is a
 /// different tensor than the one being asked for.
 pub fn ref_tensor_logical_in(dir: &Path, row: &RefRow) -> Result<Vec<f32>, RefError> {
+    logical_in(dir, row, Admit::Finite)
+}
+
+/// [`ref_tensor_logical_in`] of a masked score row: in each row of `ne[0]`
+/// values the first `finite` are finite and the rest exactly `-inf` (the
+/// graph's mask), any other value refused by name.
+pub fn ref_tensor_logical_masked_in(
+    dir: &Path,
+    row: &RefRow,
+    finite: usize,
+) -> Result<Vec<f32>, RefError> {
+    logical_in(dir, row, Admit::MaskedPast(finite))
+}
+
+fn logical_in(dir: &Path, row: &RefRow, admit: Admit) -> Result<Vec<f32>, RefError> {
     let bad = |what: String| RefError::malformed("ref_tensor_logical_in", what);
     if row.logical == Some(1) {
         if row.ty != "f32" {
@@ -1012,11 +1064,8 @@ pub fn ref_tensor_logical_in(dir: &Path, row: &RefRow) -> Result<Vec<f32>, RefEr
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
-            return Err(bad(format!(
-                "non-finite value at index {i} of {}",
-                path.display()
-            )));
+        if let Some(i) = refused(&vals, row.ne[0] as usize, admit) {
+            return Err(bad(refused_text(i, &path, row.ne[0], admit)));
         }
         return Ok(vals);
     }
@@ -1028,7 +1077,7 @@ pub fn ref_tensor_logical_in(dir: &Path, row: &RefRow) -> Result<Vec<f32>, RefEr
             dir.display()
         )));
     }
-    ref_tensor_of_in(dir, row)
+    of_in(dir, row, admit)
 }
 
 /// Whether a row's plain file is its logical order, so a whole-tensor read

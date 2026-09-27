@@ -106,10 +106,11 @@ pub enum FaultSite {
     /// non-finite input, a norm whose mean square or variance is not
     /// finite, or a value past f16's range.
     CacheValue = 16,
-    /// A token-pool selector met an indexer key that is not finite after its
-    /// f16 rounding (`q38::qsa_key_append`, the raw key), a pooled key or a
-    /// head's score that is not finite (`qsa`), or its selected flash a list
-    /// entry at or past the cache.
+    /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
+    /// met an indexer key that is not finite after its f16 rounding
+    /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
+    /// that is not finite, its top-k a refused live count, or its selected
+    /// flash a list entry at or past the cache.
     PoolSelect = 18,
     /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
     /// conv input whose sum of squares, dot or value is not finite, or a

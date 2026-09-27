@@ -15,6 +15,12 @@
 //! counts its histograms from the scores itself, so no count is carried from
 //! one launch to the next.
 //!
+//! GLM-5.3-Flash's k-pool selector takes the same shape, whole pools and
+//! the tail, from its own pool and score passes (`latent::index_pool`,
+//! `kpool`) through [`qsa_kernels::qsa_topk_high`]: the higher pools of a
+//! tie at the cut (`runtime::qsa::Tie::Higher`, ik's CPU `top_k`), and each
+//! row's list length written as its attention's visible count.
+//!
 //! Three launches:
 //! - [`qsa_kernels::qsa_pool`] — the key of every pool some row completes
 //!   (`c % 4 == 0` completes pool `c/4 − 1`) from the raw indexer keys: the
@@ -992,6 +998,212 @@ mod qsa_kernels {
             unsafe { *n_sel.get_unchecked_mut(t) = (kept_tokens + tail) as u32 };
         }
     }
+
+    /// [`qsa_topk`] with the higher pools of a tie at the cut: block `t`
+    /// writes row `t`'s list into `list[t·width ..]` and its length into
+    /// `vis[2t + 1]`, the visible count the selected attention reads
+    /// (`vis[2t]` is not written). A [`scored`] row keeps every pool above
+    /// the `kept`-th order key and the last pools equal to it in pool order,
+    /// then its tail; a row that sees at most `kept` pools gets `0 .. c`; a
+    /// refused count (0, or past the cache) gets length 0 and raises
+    /// [`FaultSite::PoolSelect`].
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys.len() >= m,
+            pools * 4 >= ctx,
+            scores.len() >= m * pools,
+            width >= kept * 4 + 3,
+            list.len() >= m * width,
+            vis.len() >= 2 * m
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    pub fn qsa_topk_high(
+        n_keys: &[u32],
+        scores: &[f32],
+        ctx: u32,
+        pools: u32,
+        kept: u32,
+        width: u32,
+        m: u32,
+        fault: FaultSink,
+        mut list: DisjointSlice<u32>,
+        mut vis: DisjointSlice<u32>,
+    ) {
+        static mut FINE: SharedArray<u32, FINE_BINS> = SharedArray::UNINIT;
+        static mut WSUM: SharedArray<u32, TOPK_WARPS> = SharedArray::UNINIT;
+        static mut WTOT: SharedArray<u32, { 2 * TOPK_WARPS }> = SharedArray::UNINIT;
+        static mut PICK: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id();
+        let wid = tid / 32;
+        let lbase = t * width as usize;
+        // SAFETY: t < m <= n_keys.len() by the launch contract.
+        let c = unsafe { *n_keys.get_unchecked(t) };
+        if !scored(c, ctx, kept) {
+            let accepted = c >= 1 && c <= ctx;
+            let len = if accepted { c as usize } else { 0 };
+            let mut i = tid;
+            while i < len {
+                // SAFETY: a row that does not select has c/4 <= kept, so c <=
+                // 4·kept + 3 <= width and lbase + i < m·width <= list.len();
+                // thread tid alone writes entries tid + 512·r.
+                unsafe { *list.get_unchecked_mut(lbase + i) = i as u32 };
+                i += TOPK_THREADS as usize;
+            }
+            if tid == 0 {
+                if !accepted {
+                    fault.raise(FaultSite::PoolSelect);
+                }
+                // SAFETY: 2t + 1 < 2m <= vis.len() (launch contract).
+                unsafe { *vis.get_unchecked_mut(2 * t + 1) = len as u32 };
+            }
+            return; // block-uniform
+        }
+        // SAFETY: block-shared statics; the raw forms reach them without a
+        // reference, and every access below is bounded and barrier-ordered.
+        let (fine, wsum, wtot, pick) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut FINE),
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                SharedArray::as_raw_mut_ptr(&raw mut WTOT),
+                SharedArray::as_raw_mut_ptr(&raw mut PICK),
+            )
+        };
+        let n = c as usize / POOL;
+        let sbase = t * pools as usize;
+        let need = kept;
+
+        // ---- the exact `kept`-th order key, as `qsa_topk` finds it.
+        // SAFETY: n <= ctx/4 <= pools, so sbase + n <= m·pools <= scores.len();
+        // FINE is this pass's alone.
+        let hc = unsafe { coarse(scores, sbase, n, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b1, above1) = unsafe {
+            pick_bin::<COARSE_PER>(hc, HIST_BINS as u32 - 1, need, lane, tid, wsum, pick)
+        };
+        let need2 = need - above1;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, b1, 11, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b2, above2) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick) };
+        let need3 = need2 - above2;
+        let prefix = (b1 << 11) | b2;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, prefix, 0, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b3, above3) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick) };
+        let thr = (prefix << 11) | b3;
+        let take_eq = need - (above1 + above2 + above3);
+
+        // ---- the list, in pool order: warp `wid` owns pools `c0 .. c1` and
+        // counts the pools above the key and equal to it; the block's total
+        // of equal pools says how many of the first ones in pool order are
+        // left out, and the warp walks its pools again, writing each kept
+        // pool's tokens at its place.
+        let chunk = n.div_ceil(32 * TOPK_WARPS) * 32;
+        let c0 = (wid * chunk).min(n);
+        let c1 = (c0 + chunk).min(n);
+        let l = lane as usize;
+        let (mut tg, mut te) = (0u32, 0u32);
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let live = base + 32 * r + l < c1;
+                tg += warp::ballot(live && kk[r] > thr).count_ones();
+                te += warp::ballot(live && kk[r] == thr).count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        if lane == 0 {
+            // SAFETY: wid < TOPK_WARPS bounds both slots; lane 0 of warp wid is
+            // their only writer, before the barrier.
+            unsafe {
+                *wtot.add(wid) = tg;
+                *wtot.add(TOPK_WARPS + wid) = te;
+            }
+        }
+        thread::sync_threads();
+        let (mut og, mut oe, mut te_all) = (0u32, 0u32, 0u32);
+        for w in 0..TOPK_WARPS {
+            thread::__unroll_config::<0>();
+            // SAFETY: w < TOPK_WARPS; published by the barrier above.
+            let (g, e) = unsafe { (*wtot.add(w), *wtot.add(TOPK_WARPS + w)) };
+            if w < wid {
+                og += g;
+                oe += e;
+            }
+            te_all += e;
+        }
+        // The equal pools left out: the first `skip` of them in pool order.
+        let skip = te_all - take_eq;
+        let lt = warp::lanemask_lt();
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let i = base + 32 * r + l;
+                let live = i < c1;
+                let mg = warp::ballot(live && kk[r] > thr);
+                let me = warp::ballot(live && kk[r] == thr);
+                let gt_before = og + (mg & lt).count_ones();
+                let eq_before = oe + (me & lt).count_ones();
+                let is_gt = (mg >> lane) & 1 != 0;
+                let is_eq = (me >> lane) & 1 != 0;
+                if is_gt || (is_eq && eq_before >= skip) {
+                    let at = lbase + POOL * (gt_before + eq_before.saturating_sub(skip)) as usize;
+                    // SAFETY: the pools kept number `kept`, and this one's
+                    // place counts the kept ones before it, so it is below
+                    // kept and at + 3 < lbase + 4·kept <= t·width + width <=
+                    // list.len(); each place has one pool.
+                    unsafe {
+                        for q in 0..POOL {
+                            thread::__unroll_config::<0>();
+                            *list.get_unchecked_mut(at + q) = (POOL * i + q) as u32;
+                        }
+                    }
+                }
+                og += mg.count_ones();
+                oe += me.count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        // ---- the tail and the length.
+        let tail = c as usize - POOL * n;
+        let kept_tokens = POOL * kept as usize;
+        if tid < tail {
+            // SAFETY: tid < tail < POOL, so the entry is below 4·kept + 3 <=
+            // width.
+            unsafe { *list.get_unchecked_mut(lbase + kept_tokens + tid) = (POOL * n + tid) as u32 };
+        }
+        if tid == 0 {
+            // SAFETY: 2t + 1 < 2m <= vis.len() (launch contract).
+            unsafe { *vis.get_unchecked_mut(2 * t + 1) = (kept_tokens + tail) as u32 };
+        }
+    }
 }
 
 // -------------------------------------------------------------- launchers
@@ -1094,6 +1306,22 @@ pub struct SelectArgs<'a> {
     pub m: usize,
     pub fault: FaultSink,
     pub scratch: &'a mut QsaScratch,
+}
+
+/// [`QsaKernels::enqueue_topk_high`]'s arguments: the `m` rows' live counts,
+/// their scores (`[m][pools_for(ctx)]`, a scored row's first `count / 4`
+/// written by its score pass), the cache height, the pools kept, and where
+/// the lists (`[m][list_width(kept)]`) and the visible counts (`[m][2]`, the
+/// second word of each) land.
+pub struct TopkHighArgs<'a> {
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub scores: &'a DeviceBuffer<f32>,
+    pub ctx: usize,
+    pub kept: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub list: &'a mut DeviceBuffer<u32>,
+    pub vis: &'a mut DeviceBuffer<u32>,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -1243,6 +1471,61 @@ impl QsaKernels {
             m,
             &mut s.list,
             &mut s.n_sel,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the top-k pass with the higher pools of a tie
+    /// ([`qsa_kernels::qsa_topk_high`]): `m` blocks of 512, each row's list
+    /// and its length as the attention's visible count. Refused by name: no
+    /// row, `kept` zero, scores, lists or counts shorter than `m` rows need.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_topk_high(
+        &self,
+        stream: &CudaStream,
+        a: TopkHighArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_topk_high";
+        let pools = pools_for(a.ctx);
+        let width = list_width(a.kept);
+        if a.m == 0 || a.kept == 0 || a.ctx == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need m, kept and ctx >= 1, got m={} kept={} ctx={}",
+                    a.m, a.kept, a.ctx
+                ),
+            ));
+        }
+        let lens = [
+            ("n_keys", a.n_keys.len(), a.m),
+            ("scores", a.scores.len(), a.m * pools),
+            ("list", a.list.len(), a.m * width),
+            ("vis", a.vis.len(), 2 * a.m),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let m = launch_u32(what, "m", a.m)?;
+        let prep = self
+            .module
+            .prepare_qsa_topk_high(LaunchConfig1D::new(m, TOPK_THREADS, 0))?;
+        self.module.qsa_topk_high(
+            stream,
+            &prep,
+            a.n_keys,
+            a.scores,
+            launch_u32(what, "ctx", a.ctx)?,
+            launch_u32(what, "pools", pools)?,
+            launch_u32(what, "kept", a.kept)?,
+            launch_u32(what, "width", width)?,
+            m,
+            a.fault,
+            a.list,
+            a.vis,
         )?;
         Ok(())
     }

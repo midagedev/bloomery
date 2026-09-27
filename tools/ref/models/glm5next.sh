@@ -204,6 +204,15 @@ GLM_MTP_SHA=425a2c1d
 # prefill's arithmetic.
 #   step4  the oracle's five ids: a quiet prefill of 4, the step at position 4, -c 512
 #   d1k    a quiet prefill of 1,024 ids of prose, the step at position 1,024, -c 2048
+#   d3kdsa   ik's k-pool indexer on (--dsa): a quiet prefill of 3,070 ids of prose, the step at
+#            position 3,070, -c 4096 — past the 2,051 positions a latent layer keeps whole, so the
+#            step's latent layers attend the 512 pools the indexer picks and their tail
+#   d16kdsa  the same at a quiet prefill of 16,382, the step at position 16,382, -c 16384: the
+#            deepest context the program serves (place::ORACLE_POSITIONS)
+#   Both --dsa steps sit at (q + 1) % 4 == 3, so the step's tail is three real cells and ik's
+#   zero-filled tail slots (src/llama.cpp, inp_kpool_tail) name no cell at the step; its prefill
+#   rows past 2,051 with a shorter tail still list cell 0 there, which the model and mainline do
+#   not (build_glm5next.cpp; llama.cpp #27752 pads with a masked cell).
 # The prose is $BLOOMERY_DATA/glm5next/corpus-prose.ids: the tokenizer oracle's `prose.nps.ids` under
 # this vocabulary (set tokenizer-glm5next, written by crates/tokenizer/tools/oracle.sh with
 # TOKENIZER_VOCAB = MODEL and ik-idxkey's llama-tokenize; the text is ik's docs/**/*.md and
@@ -220,11 +229,13 @@ ref_step_variant() {
   case $name in
     step4) STEP_SET=ref_glm5next_step4; STEP_CTX=512;  STEP_PREFILL=4; STEP_TOKENS=$REF_TOKENS ;;
     d1k)   STEP_SET=ref_glm5next_d1k;   STEP_CTX=2048; STEP_PREFILL=1024 ;;
+    d3kdsa)  STEP_SET=ref_glm5next_d3kdsa;  STEP_CTX=4096;  STEP_PREFILL=3070;  STEP_ARGS+=(--dsa) ;;
+    d16kdsa) STEP_SET=ref_glm5next_d16kdsa; STEP_CTX=16384; STEP_PREFILL=16382; STEP_ARGS+=(--dsa) ;;
     *)     return 1 ;;
   esac
   case $name in
-    d1k) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
-         STEP_TOKENS_SHA256=$GLM_PROSE_SHA256 ;;
+    d1k|d3kdsa|d16kdsa) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
+                        STEP_TOKENS_SHA256=$GLM_PROSE_SHA256 ;;
   esac
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node

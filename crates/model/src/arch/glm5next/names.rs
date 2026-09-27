@@ -139,6 +139,18 @@ pub fn indexer_compressor_gate(l: usize) -> String {
     blk(l, "indexer_compressor_gate.weight")
 }
 
+pub fn indexer_attn_q_b(l: usize) -> String {
+    blk(l, "indexer.attn_q_b.weight")
+}
+
+pub fn indexer_proj(l: usize) -> String {
+    blk(l, "indexer.proj.weight")
+}
+
+pub fn indexer_compressor_ape(l: usize) -> String {
+    blk(l, "indexer_compressor_ape.weight")
+}
+
 /// The four projections of the normed input joined at load into one row
 /// stream: `[q_a; latent; index key; pool gate]` per token.
 pub fn attn_a_stack(l: usize) -> String {

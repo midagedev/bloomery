@@ -7,8 +7,9 @@
 //! once by its placement on the gate card (`workstation::plan_gate`), against
 //! ik's CPU oracle sets (`refset::arch::glm5next`: the 5-token batch set, the
 //! step after a fused 4-token prefill, the same after a prefill run node by
-//! node, the step after a fused 1,024-token prefill of the prose), every set
-//! read through its family.
+//! node, the step after a fused 1,024-token prefill of the prose, and the
+//! step after 3,070 of it with ik's k-pool indexer on, past the 2,051
+//! positions a latent layer keeps whole), every set read through its family.
 //!
 //! What is asserted:
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
@@ -66,7 +67,14 @@
 //!   prefill and step are the batch set's tokens, and our steps route them
 //!   as (c)'s): ik's prefill is its own fused graph, not our steps, and
 //!   after 1,024 positions the two states have drifted by an amount no band
-//!   here derives.
+//!   here derives. Each step set's logits print their FNV-1a digest: below
+//!   2,051 positions the selector lists every position in order, so a tree
+//!   that changes only the selector leaves the three short sets' digests
+//!   where its base left them. The 3,070-position set (`--dsa`) is the only
+//!   end-to-end run past the dense limit; ik's prefill lists position 0 in
+//!   the empty tail slots of its rows past 2,051 whose tail is short, and
+//!   ours does not (a named difference, `crate::mla`'s cut), so that set's
+//!   drift carries it.
 //!
 //! - (h) the q8_0 head's fault: `output_norm.weight[0]` set to NaN, a step
 //!   is the fault [`FaultSite::Logit`] at the head, not a token; the weight
@@ -124,7 +132,7 @@ mod gate {
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
         ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
@@ -136,7 +144,8 @@ mod gate {
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
-    use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
+    use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
+    use refset::family::Family;
     use runtime::layer::{FfnKind, MixerKind};
     use runtime::{Out, Target, Want};
 
@@ -144,8 +153,8 @@ mod gate {
     const N_EXPERT: usize = 288;
     const N_USED: usize = 8;
 
-    /// Cache rows: the 1,024-token set's step at position 1,024, with room.
-    const CTX: usize = 1088;
+    /// Cache rows: the `--dsa` set's step at position 3,070, with room.
+    const CTX: usize = 3136;
 
     /// The file's shape, as the header states it (glmops-design §1): what
     /// the derivations below are written against.
@@ -158,19 +167,20 @@ mod gate {
     const N_ROUTED: usize = 42;
     const N_VOCAB: usize = 154_880;
 
-    /// PIN(2026-09-27): the captured decode step's node count, derived before
+    /// PIN(2026-09-28): the captured decode step's node count, derived before
     /// the chain was built: every layer's two sub-layers take three launches
-    /// each for the streams (`hc_pre_q8_0`, the fold, `hc_post`); a mixer 11
-    /// (KDA: the norm, four q8_0 projections of the normed row — the q·k·v
+    /// each for the streams (`hc_pre_q8_0`, the fold, `hc_post`); a KDA mixer
+    /// 11 (the norm, four q8_0 projections of the normed row — the q·k·v
     /// joined, the two low-rank halves, β — and two of the halves, the conv
-    /// and prep, the delta step, the gated norm, the output projection; latent:
-    /// the norm, the joined projection, the q_a norm, two appends, q_b,
-    /// k_b, the attention's two launches, v_b, the output projection); a
-    /// dense block 3 (norm, gate·up, down); a routed block 8 (norm, router,
-    /// handoff, the go, the shared gate·up and down, the wait, the sum); the
-    /// head 4 (the mean, the norm, the q8_0 gemv, the argmax):
-    /// 45·6 + 45·11 + 3·3 + 42·8 + 4.
-    const NODES_DECODE: usize = 1114;
+    /// and prep, the delta step, the gated norm, the output projection); a
+    /// latent mixer 16 (the norm, the joined projection, the q_a norm, two
+    /// appends; the selector's pool, head weights, indexer query, scores and
+    /// top-k on the branch, which adds no node; q_b, k_b, the attention's two
+    /// launches, v_b, the output projection); a dense block 3 (norm,
+    /// gate·up, down); a routed block 8 (norm, router, handoff, the go, the
+    /// shared gate·up and down, the wait, the sum); the head 4 (the mean, the
+    /// norm, the q8_0 gemv, the argmax): 45·6 + 34·11 + 11·16 + 3·3 + 42·8 + 4.
+    const NODES_DECODE: usize = 1169;
 
     /// PIN(2026-09-27): each routed layer's go and wait.
     const MEMOPS: usize = 2 * N_ROUTED;
@@ -186,7 +196,7 @@ mod gate {
     const Q6K_DOWN: [usize; 3] = [11, 12, 44];
 
     const _: () = assert!(
-        NODES_DECODE == N_LAYER * 6 + N_LAYER * 11 + N_DENSE * 3 + N_ROUTED * 8 + 4
+        NODES_DECODE == N_LAYER * 6 + N_KDA * 11 + N_LATENT * 16 + N_DENSE * 3 + N_ROUTED * 8 + 4
             && N_KDA + N_LATENT == N_LAYER
             && N_DENSE + N_ROUTED == N_LAYER
     );
@@ -243,9 +253,10 @@ mod gate {
     /// The stores' bytes at [`CTX`] rows, derived from the header: each KDA
     /// layer's state, 64 heads of 128 × 128 f32, and conv ring, 11 rows of
     /// 3 · 64 · 128 f32; each latent layer's latent and index rows, 512 +
-    /// 256 f16 a position.
+    /// 256 f16 a position, and its pool plane, 128 f16 a pool of four.
     fn store_bytes() -> usize {
-        N_KDA * (64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + N_LATENT * CTX * (512 + 256) * 2
+        N_KDA * (64 * 128 * 128 + 11 * 3 * 64 * 128) * 4
+            + N_LATENT * (CTX * (512 + 256) + CTX.div_ceil(4) * 128) * 2
     }
 
     /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
@@ -1127,11 +1138,11 @@ mod gate {
     /// route as the batch set's free arm did.
     fn step_set(
         m: &mut Glm5nextModel,
-        name: &str,
+        (name, family): (&str, &Family),
         band: Option<(&[u32], usize)>,
         ties: &mut usize,
     ) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(name), &IK)?;
+        let man = RefManifest::open(&data_dir().join(name), family)?;
         let (pos, step, prefill) = man.step()?;
         let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
         let [tok] = step[..] else {
@@ -1179,6 +1190,10 @@ mod gate {
         *ties += usize::from(tie);
         let inside = print_layers(name, &rels, held);
         let ok = (top == ik_top || tie) && inside;
+        println!(
+            "step {name}: logits digest {:016x} (FNV-1a over the f32 bits)",
+            Fnv1a64::default().f32s(&r.1).value()
+        );
         println!(
             "step {name}: position {pos} after {} fed ({:.1} s, runtime value); argmax ours={top} \
              ik={ik_top} (ik's runner-up {ik_2}, margin {margin:.4}, our distance at the two \
@@ -1502,8 +1517,13 @@ mod gate {
         ok &= forced_ok;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
-        for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band), (D1K, None)] {
-            ok &= step_set(m, name, band, &mut ties)?;
+        for (set, band) in [
+            ((STEP4, &IK), band),
+            ((STEP4_EVERY_NODE, &IK), band),
+            ((D1K, &IK), None),
+            ((D3K_DSA, &IK_DSA), None),
+        ] {
+            ok &= step_set(m, set, band, &mut ties)?;
         }
         println!("step sets: {ties} named tie(s)");
         ok &= keep(&mut s)?;
