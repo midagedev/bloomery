@@ -29,6 +29,24 @@
 # with the list and exit 1 (failed_end). A warm-up's or a discard's failure is `FAIL r0 …`, in the list and
 # dropping nothing. depth-ds41.sh's header has the contract (Failures).
 #
+# The warm rows. Under BLOOMERY_WARM_ROWS=1 (warm_rows_init) every counted row is taken warm, and a row
+# that is not is a named failure. Two halves of one rule — a row's timed window reads only what the same
+# ids read just before it — so one switch:
+#   the prime   each of our engine's arms (ours, a corpus arm, bin:) runs once more right before its row,
+#               on the same ids, discarded: `PRIME r<r> …`, in no mean, its failure `FAIL r0 …`. In the
+#               same load as the row when the arm has a load key (the arm twice in the --arm list; the
+#               engine is cleared between them, and greedy decoding makes the prime's continuation the
+#               row's, so the prime reads every row of the table the timed arm will), else in a process of
+#               its own. The server arms' warm-up request is the same thing on the reference side, and it
+#               is part of those arms with or without the switch (lcpp-warm.sh).
+#   the retry   a counted row that cold_check tags [cold] prints as `COLD r<r> …`, in no mean, and its arm
+#               runs once more (cold_verdict). A clean row then counts; tagged again it is `FAIL r<r>
+#               <label> <d|p>=<key> rc=cold | cold after warm-up and one retry (timed <n>; ≤ <x> % of W <w>
+#               s)`, in the failed list and dropped from the tables like any failed arm. The runner owns
+#               how an arm runs once more: a reference process again, a fresh load of the arm's prime and
+#               the arm, one more timed request to the same server.
+# Off (0, the default) nothing runs or prints differently: no prime, no retry, no line of its own.
+#
 # The runner defines, before arm_fail: ARM_FAIL_STEM, and CPU_BUSY_TAG and OTHER_BUSY_TAG (lease.sh,
 # timing-card.sh). Before failed_tally: sums and pp_sums, its decode and prefill records `label|key|…`.
 # Before blocks_plan: ARMS, A_KIND (ref for a reference arm), A_ENG, A_DEP, N,
@@ -119,6 +137,69 @@ with_ncmoe() {
   local f
   f=$(echo " $1 " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
   echo "${f# }--n-cpu-moe $2"
+}
+
+# The warm rows (the header's): WARM_ROWS the switch, COLD_TRY 1 while an arm runs once more, COLD_QUEUED
+# 1 after cold_verdict turned a row into a COLD row, and the counts warm_rows_summary prints. PRIMING is 1
+# while a unit's list holds each arm twice (prime_list), PRIMED the arms whose prime has run in it.
+WARM_ROWS=0 COLD_TRY=0 COLD_QUEUED=0 COLD_RETRIES=0 COLD_CLEAN=0 COLD_FAILS=0 PRIMING=0
+PRIMED=() PRIME_LIST=()
+# warm_rows_init <runner>: BLOOMERY_WARM_ROWS into WARM_ROWS, 0 (the default) or 1; anything else exits 64.
+warm_rows_init() {
+  WARM_ROWS=${BLOOMERY_WARM_ROWS:-0}
+  case $WARM_ROWS in
+    0 | 1) ;;
+    *) echo "$1: BLOOMERY_WARM_ROWS is 0 (the default: rows as measured) or 1 (a same-id prime before each of our arms, and one retry of a counted row the cold tag marks), got '$WARM_ROWS'" >&2; exit 64 ;;
+  esac
+}
+# cold_verdict <round> <label> <d=|p=key> <timed faults> <window s>: what a row becomes, called after
+# cold_check (COLD_TAG, MAJ_BOUND) and before the row prints. 0: print it under ROW_TAG, which is COLD
+# (COLD_QUEUED=1: count nothing, run the arm once more) for a counted row tagged on its first run. 1: the
+# retry was tagged again, and its FAIL row is printed here; the runner prints no row.
+cold_verdict() {
+  COLD_QUEUED=0
+  [ "$WARM_ROWS" = 1 ] && counted || return 0
+  if [ -z "$COLD_TAG" ]; then
+    [ "$COLD_TRY" = 0 ] || COLD_CLEAN=$((COLD_CLEAN + 1))
+    return 0
+  fi
+  if [ "$COLD_TRY" = 0 ]; then
+    ROW_TAG=COLD COLD_QUEUED=1 COLD_RETRIES=$((COLD_RETRIES + 1))
+    return 0
+  fi
+  COLD_FAILS=$((COLD_FAILS + 1))
+  arm_fail "$1" "$2" "$3" cold "cold after warm-up and one retry (timed $4; ≤ $MAJ_BOUND % of W $5 s)"
+  return 1
+}
+# prime_list <indices...>: the unit's arms for one load under the warm rows, each twice (its prime, then
+# the arm), into PRIME_LIST; PRIMING=1, PRIMED emptied.
+prime_list() {
+  local i
+  PRIME_LIST=() PRIMED=() PRIMING=1
+  for i in "$@"; do PRIME_LIST+=("$i" "$i"); done
+}
+# prime_tag <i>: in an arm's pre hook while PRIMING: ROW_TAG=PRIME the first time arm <i> starts, ROW the
+# second. A prime that failed ends its load, and the arm then runs in the fresh one as its row, without a
+# second prime: its FAIL r0 row names what happened.
+prime_tag() {
+  [ "$PRIMING" = 1 ] || return 0
+  if [ -z "${PRIMED[$1]:-}" ]; then
+    PRIMED[$1]=1
+    ROW_TAG=PRIME
+  else
+    ROW_TAG=ROW
+  fi
+}
+# fail_round <round>: the round a FAIL row names: 0 for a prime's (a warm-up's), else <round>.
+fail_round() { if [ "$ROW_TAG" = PRIME ]; then echo 0; else echo "$1"; fi; }
+# warm_rows_config, warm_rows_summary: the [config] line and the closing count, only under the switch.
+warm_rows_config() {
+  [ "$WARM_ROWS" = 1 ] || return 0
+  echo "[config] warm rows: BLOOMERY_WARM_ROWS=1 — each of our arms after a same-id PRIME run in its load (or process), each server arm after its warm-up request; a counted row tagged [cold] prints as COLD and runs once more, cold again it is FAIL rc=cold"
+}
+warm_rows_summary() {
+  [ "$WARM_ROWS" = 1 ] || return 0
+  echo "warm rows: $COLD_RETRIES COLD row(s) ran once more: $COLD_CLEAN clean on the retry, $COLD_FAILS FAIL rc=cold"
 }
 
 # ab_order <runner>: BLOOMERY_AB_ORDER into ORDER, rotate (the default) or blocks; anything else exits 64.
@@ -306,6 +387,41 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check blk-line-ours "$(block_line 0)" "1/3 ours: 6 512; discard 512, the longest prompt of the block's arms, 512 ids"
   check blk-line-x "$(block_line 1)" "2/3 x: x:6 xpp:512 xk:6; discard xpp:512 at --n-cpu-moe 30, the most token draws of the block's arms (x:6 105, xpp:512 1024, xk:6 105), at the block's largest --n-cpu-moe"
   check blk-line-y "$(block_line 2)" "3/3 y: y:4; discard y:4, the most token draws of the block's arms (y:4 8)"
+  # The warm rows: the switch's values, the verdict off (nothing changes), on a first try (COLD, queued),
+  # on the retry (clean counts; tagged is the FAIL row rc=cold, dropped), a discard (never retried), and
+  # the prime list and tags.
+  out=$(BLOOMERY_WARM_ROWS=2 warm_rows_init runner.sh 2>&1) && r=0 || r=$?
+  check warm-bad "$r ${out%%(*}" "64 runner.sh: BLOOMERY_WARM_ROWS is 0 "
+  warm_rows_init runner.sh
+  check warm-default "$WARM_ROWS|$(warm_rows_config)|$(warm_rows_summary)" "0||"
+  COLD_TAG=' [cold]' MAJ_BOUND=3.1
+  cold_verdict 1 lcppsrv d=6 40 4.5 && r=0 || r=1
+  check verdict-off "$r|$ROW_TAG|$COLD_QUEUED" "0|ROW|0"
+  BLOOMERY_WARM_ROWS=1 warm_rows_init runner.sh
+  cold_verdict 1 lcppsrv d=6 40 4.5 && r=0 || r=1
+  check verdict-first "$r|$ROW_TAG|$COLD_QUEUED|$COLD_RETRIES" "0|COLD|1|1"
+  ROW_TAG=ROW COLD_TRY=1 TMPDIR=$(mktemp -d) ARM_FAIL_STEM=runner CPU_BUSY_TAG='' OTHER_BUSY_TAG=''
+  row=$(cold_verdict 1 lcppsrv d=6 40 4.5)
+  cold_verdict 1 lcppsrv d=6 40 4.5 > /dev/null && r=0 || r=1
+  check verdict-fail "$r|$row" "1|FAIL r1 lcppsrv d=6 rc=cold | cold after warm-up and one retry (timed 40; ≤ 3.1 % of W 4.5 s)"
+  check verdict-fail-list "${FAILED[*]}|${FAILED_KEYS[*]}|$COLD_FAILS" "r1 lcppsrv d=6 rc=cold|lcppsrv|6|1"
+  COLD_TAG=''
+  cold_verdict 1 lcppsrv d=6 0 4.5 && r=0 || r=1
+  check verdict-clean "$r|$ROW_TAG|$COLD_CLEAN" "0|ROW|1"
+  COLD_TRY=0 COLD_TAG=' [cold]' ROW_TAG=DISCARD
+  cold_verdict 0 lcppsrv d=6 40 4.5 && r=0 || r=1
+  check verdict-discard "$r|$ROW_TAG|$COLD_QUEUED" "0|DISCARD|0"
+  ROW_TAG=ROW
+  check warm-summary "$(warm_rows_summary)" "warm rows: 1 COLD row(s) ran once more: 1 clean on the retry, 1 FAIL rc=cold"
+  prime_list 4 2
+  tags=''
+  for i in "${PRIME_LIST[@]}"; do prime_tag "$i"; tags+="$i:$ROW_TAG:$(fail_round 3) "; done
+  check prime "${PRIME_LIST[*]}|$tags" "4 4 2 2|4:PRIME:0 4:ROW:3 2:PRIME:0 2:ROW:3 "
+  PRIMING=0 ROW_TAG=ROW
+  prime_tag 4
+  check prime-off "$ROW_TAG" ROW
+  rm -rf "$TMPDIR"
+  FAILED=() FAILED_KEYS=() WARM_ROWS=0
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit
