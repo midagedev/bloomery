@@ -1,5 +1,15 @@
 //! Drafts: a proposal of the next ids, verified by one pass of the target.
+//!
+//! A proposal holds 0 to [`Draft::WIDTH`] ids. None is one step of the
+//! target, the plain pass's own call; `n` ids are one verify of `n + 1` rows,
+//! dispatched by width ([`Window`]) so that a target's `verify::<R>` is
+//! instantiated only for the widths its draft can ask.
 
+use std::fmt;
+
+use models::{BlockDraft, DraftSpec};
+
+use crate::stores::PASS_ROWS;
 use crate::{Advance, Committed, Verify, Want};
 
 /// Which hidden rows of the target a draft reads. The rows themselves — which
@@ -28,8 +38,8 @@ pub trait Tapped: Verify {
 
 /// A source of proposals for a target `T`.
 pub trait Draft<T: Verify> {
-    /// Ids a proposal holds; the verify runs `WIDTH + 1` rows, the token at
-    /// the target's position first.
+    /// The most ids a proposal holds; a verify of `n` of them runs `n + 1`
+    /// rows, the token at the target's position first.
     const WIDTH: usize;
 
     /// What the draft reads of the target besides the tokens.
@@ -58,14 +68,20 @@ pub trait Draft<T: Verify> {
     /// changes how many rows a pass keeps and never a token.
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error>;
 
-    /// Write the [`Draft::WIDTH`] ids to follow `last`, the token at the
-    /// target's position, into `out`; `false` is no proposal, and the pass is
-    /// then one step.
-    fn propose(&mut self, t: &T, last: u32, out: &mut [u32]) -> Result<bool, T::Error>;
+    /// Write up to [`Draft::WIDTH`] ids to follow `last`, the token at the
+    /// target's position, into the front of `out` (`WIDTH` long) and return
+    /// how many: 0 is no proposal, and the pass is then one step; `n` is a
+    /// verify of `n + 1` rows. A draft may run its own program on the
+    /// target's buffers, and leaves the target at the position it found it:
+    /// a draft that moves it, or proposes more than `WIDTH` ids, is broken,
+    /// and the pass panics by name.
+    fn propose(&mut self, t: &mut T, last: u32, out: &mut [u32]) -> Result<usize, T::Error>;
 
     /// The verify of `rows` read back `out`, one argmax a row, and keeps its
     /// first `accepted` rows; runs before [`Verify::commit`] takes the rest
-    /// back, so the target's taps still hold every row.
+    /// back, so the target's taps still hold every row. `rows` is the
+    /// proposal's `n + 1`, fewer than `WIDTH + 1` when the draft proposed
+    /// fewer.
     fn accept(
         &mut self,
         t: &mut T,
@@ -78,8 +94,76 @@ pub trait Draft<T: Verify> {
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error>;
 }
 
-/// A draft's proposals, verified `M` rows at a time: `M` is the draft's
-/// [`Draft::WIDTH`] + 1, which its pass checks at compile time.
+/// The verify widths of a pass of at most `M` rows: 2 to `M`, the rows of a
+/// proposal of 1 to `M − 1` ids. [`Widths`] is implemented for `M` of 2 to
+/// [`PASS_ROWS`] and no other, so a wider window does not compile.
+#[derive(Clone, Copy, Debug)]
+pub struct Window<const M: usize>;
+
+/// What a caller does with a verify of `R` rows, `R` one width of a
+/// [`Window`]: run it, or capture it.
+pub trait Width {
+    type Error;
+
+    /// Act on the width `R`.
+    fn run<const R: usize>(&mut self) -> Result<(), Self::Error>;
+}
+
+/// A window's widths, each an instance of [`Width::run`] of its own.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}`: a verify window keys 2 to `runtime::stores::PASS_ROWS` rows",
+    label = "no pass of this many rows"
+)]
+pub trait Widths {
+    /// The window's widest pass.
+    const ROWS: usize;
+
+    /// `w` of every width, 2 to [`Widths::ROWS`], ascending.
+    fn each<W: Width>(w: &mut W) -> Result<(), W::Error>;
+
+    /// `w` of the width `rows`; `None` when `rows` is not one of the window's.
+    fn one<W: Width>(rows: usize, w: &mut W) -> Option<Result<(), W::Error>>;
+}
+
+/// `Widths` for each window, its widths listed in full: an arm names only
+/// widths up to its own `M`, which a target of `MAX_ROWS` ≥ `M` compiles.
+macro_rules! widths {
+    ($($m:literal: $($r:literal)+;)+) => {$(
+        const _: () = assert!($m <= PASS_ROWS, "a window wider than a pass");
+
+        impl Widths for Window<$m> {
+            const ROWS: usize = $m;
+
+            fn each<W: Width>(w: &mut W) -> Result<(), W::Error> {
+                $(w.run::<$r>()?;)+
+                Ok(())
+            }
+
+            fn one<W: Width>(rows: usize, w: &mut W) -> Option<Result<(), W::Error>> {
+                match rows {
+                    $($r => Some(w.run::<$r>()),)+
+                    _ => None,
+                }
+            }
+        }
+    )+};
+}
+
+widths! {
+    2: 2;
+    3: 2 3;
+    4: 2 3 4;
+    5: 2 3 4 5;
+    6: 2 3 4 5 6;
+    7: 2 3 4 5 6 7;
+    8: 2 3 4 5 6 7 8;
+}
+
+/// The widest window is a pass's own width.
+const _: () = assert!(<Window<{ PASS_ROWS }> as Widths>::ROWS == PASS_ROWS);
+
+/// A draft's proposals, verified in passes of at most `M` rows: `M` is the
+/// draft's [`Draft::WIDTH`] + 1, which its pass checks at compile time.
 #[derive(Debug)]
 pub struct Speculative<D, const M: usize> {
     draft: D,
@@ -113,7 +197,40 @@ pub(crate) fn accepted_rows(rows: &[u32], out: &[u32]) -> usize {
         .count()
 }
 
-impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
+/// One verify of the proposal in `rows`, [`Width::run`] at the proposal's
+/// width: the rows the target agrees with kept, the draft hearing of them
+/// before the rest is taken back.
+struct VerifyRows<'a, T, D> {
+    t: &'a mut T,
+    draft: &'a mut D,
+    /// The token at the target's position, then the proposal; at least the
+    /// width's rows.
+    rows: &'a [u32],
+    out: &'a mut Vec<u32>,
+    kept: usize,
+}
+
+impl<T: Verify, D: Draft<T>> Width for VerifyRows<'_, T, D> {
+    type Error = T::Error;
+
+    fn run<const R: usize>(&mut self) -> Result<(), T::Error> {
+        let rows: [u32; R] = self.rows[..R]
+            .try_into()
+            .expect("a slice of R ids is an array of R");
+        let argmax = self.t.verify(rows)?;
+        let kept = accepted_rows(&rows, &argmax);
+        self.draft.accept(self.t, &rows, &argmax, kept)?;
+        self.t.commit(kept)?;
+        self.out.extend_from_slice(&argmax[..kept]);
+        self.kept = kept;
+        Ok(())
+    }
+}
+
+impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M>
+where
+    Window<M>: Widths,
+{
     const ROWS: usize = M;
 
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
@@ -124,9 +241,14 @@ impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
         self.draft.begin(t, prompt, first)
     }
 
-    /// Propose, verify the proposal behind `last` in one pass, keep the rows
-    /// the target agrees with, the draft hearing of them before the rest is
-    /// taken back; with no proposal, one step.
+    /// Propose, verify the `n` ids behind `last` in one pass of `n + 1`
+    /// rows, keep the rows the target agrees with, the draft hearing of them
+    /// before the rest is taken back; with no proposal, one step.
+    ///
+    /// # Panics
+    ///
+    /// When the draft proposes more than its [`Draft::WIDTH`] ids, or moves
+    /// the target's position.
     fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
         let () = D::FITS;
         const {
@@ -138,7 +260,13 @@ impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
         let pos = t.pos();
         let mut rows = [0u32; M];
         rows[0] = last;
-        if !self.draft.propose(t, last, &mut rows[1..])? {
+        let n = self.draft.propose(t, last, &mut rows[1..])?;
+        let now = t.pos();
+        assert!(
+            now == pos,
+            "a draft's proposal moved the target from position {pos} to {now}"
+        );
+        if n == 0 {
             let next = t.step(last, Want::Argmax)?.argmax();
             self.draft.stepped(t, last, next)?;
             out.push(next);
@@ -149,25 +277,68 @@ impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
                 proposed: false,
             });
         }
-        let argmax = t.verify(rows)?;
-        let accepted = accepted_rows(&rows, &argmax);
-        self.draft.accept(t, &rows, &argmax, accepted)?;
-        t.commit(accepted)?;
-        out.extend_from_slice(&argmax[..accepted]);
+        let mut v = VerifyRows {
+            t,
+            draft: &mut self.draft,
+            rows: &rows,
+            out,
+            kept: 0,
+        };
+        let Some(ran) = Window::<M>::one(n + 1, &mut v) else {
+            panic!(
+                "a draft of width {} proposed {n} ids: a pass verifies at most {M} rows",
+                D::WIDTH
+            );
+        };
+        ran?;
         Ok(Committed {
             pos,
-            kept: accepted,
-            rows: M,
+            kept: v.kept,
+            rows: n + 1,
             proposed: true,
         })
     }
 }
 
+/// The program a draft's description is driven by, by its kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Program<'a> {
+    /// A block draft on a card of its own, fed the target's layer taps.
+    Block(&'a BlockDraft),
+}
+
+/// A draft kind whose program is not built: refused by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotBuilt {
+    /// The kind, as the description names it.
+    pub kind: &'static str,
+}
+
+impl fmt::Display for NotBuilt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the {} draft program is not built yet", self.kind)
+    }
+}
+
+impl std::error::Error for NotBuilt {}
+
+/// The program `spec` is driven by: a block draft's, and a next-token
+/// (MTP) draft refused by name.
+pub fn program(spec: &DraftSpec) -> Result<Program<'_>, NotBuilt> {
+    match spec {
+        DraftSpec::Block(b) => Ok(Program::Block(b)),
+        DraftSpec::Mtp(_) => Err(NotBuilt { kind: "MTP" }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::accepted_rows;
+    use super::{NotBuilt, Program, Width, Widths, Window, accepted_rows, program};
     use crate::mock::{Call, Mock, MockError, Quiet};
-    use crate::{Advance, Draft, Lookup, Plain, Speculative, Stop, StopReason, TapNeed, generate};
+    use crate::{
+        Advance, Committed, Draft, Lookup, Out, PassSink, Plain, Speculative, Stop, StopReason,
+        TapNeed, Verify, Want, generate,
+    };
 
     /// Row 0 always; then while the argmax of row r is row r + 1's id.
     #[test]
@@ -349,9 +520,14 @@ mod tests {
             Ok(())
         }
 
-        fn propose(&mut self, t: &Mock, last: u32, out: &mut [u32]) -> Result<bool, MockError> {
+        fn propose(
+            &mut self,
+            t: &mut Mock,
+            last: u32,
+            out: &mut [u32],
+        ) -> Result<usize, MockError> {
             out[0] = t.next_after(last);
-            Ok(true)
+            Ok(1)
         }
 
         fn accept(
@@ -367,6 +543,358 @@ mod tests {
         fn stepped(&mut self, _t: &mut Mock, _last: u32, _next: u32) -> Result<(), MockError> {
             Ok(())
         }
+    }
+
+    /// A draft of width 3 whose proposals hold, pass by pass, the counts of
+    /// `plan` in turn: the target's own next token first, then ids the
+    /// target may or may not agree with.
+    struct Scripted {
+        plan: Vec<usize>,
+        next: usize,
+        stepped: usize,
+    }
+
+    impl Scripted {
+        fn new(plan: &[usize]) -> Scripted {
+            Scripted {
+                plan: plan.to_vec(),
+                next: 0,
+                stepped: 0,
+            }
+        }
+    }
+
+    impl Draft<Mock> for Scripted {
+        const WIDTH: usize = 3;
+        const TAPS: TapNeed = TapNeed::None;
+
+        fn begin(&mut self, _t: &Mock, _prompt: &[u32], _first: u32) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn propose(
+            &mut self,
+            t: &mut Mock,
+            last: u32,
+            out: &mut [u32],
+        ) -> Result<usize, MockError> {
+            let n = self.plan[self.next % self.plan.len()];
+            self.next += 1;
+            let first = t.next_after(last);
+            for (i, o) in out.iter_mut().enumerate().take(n) {
+                *o = (first + u32::try_from(i).unwrap()) % 5;
+            }
+            Ok(n)
+        }
+
+        fn accept(
+            &mut self,
+            _t: &mut Mock,
+            _rows: &[u32],
+            _out: &[u32],
+            _accepted: usize,
+        ) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn stepped(&mut self, _t: &mut Mock, _last: u32, _next: u32) -> Result<(), MockError> {
+            self.stepped += 1;
+            Ok(())
+        }
+    }
+
+    /// A sink that keeps every pass's [`Committed`].
+    #[derive(Default)]
+    struct Kept(Vec<Committed>);
+
+    impl PassSink<Mock> for Kept {
+        type Error = MockError;
+
+        fn begin(&mut self, _t: &Mock) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _t: &Mock,
+            c: &Committed,
+            _tokens: &[u32],
+            _wall: std::time::Duration,
+        ) -> Result<(), MockError> {
+            self.0.push(*c);
+            Ok(())
+        }
+    }
+
+    /// The rows each pass ran, read off the target's calls: a step's 1, a
+    /// verify's `M`.
+    fn pass_rows(calls: &[Call]) -> Vec<usize> {
+        calls
+            .iter()
+            .filter_map(|c| match *c {
+                Call::Step(_) => Some(1),
+                Call::Verify(_, m) => Some(m),
+                Call::Prompt(..) | Call::Commit(_) => None,
+            })
+            .collect()
+    }
+
+    /// A proposal of n ids is one verify of n + 1 rows, whatever the
+    /// window's widest: n = 3, 1, 0, 2 in turn run 4, 2, 1 and 3 rows, each
+    /// pass's `Committed` says so, and the tokens are the plain run's.
+    #[test]
+    fn a_proposal_of_n_verifies_n_plus_one_rows() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stop = Stop::new(40, 1000).unwrap();
+        let (plain, _) = run(&mut Plain, &prompt, &stop);
+        let plan = [3, 1, 0, 2];
+        let mut spec = Speculative::<Scripted, 4>::new(Scripted::new(&plan));
+        let mut t = Mock::new();
+        let first = spec.prompt(&mut t, &prompt).unwrap();
+        let mut sink = Kept::default();
+        let out = generate(&mut t, &mut spec, &prompt, first, &stop, &mut sink).unwrap();
+        assert_eq!(out.tokens[..40], plain.tokens[..]);
+        let want: Vec<usize> = (0..sink.0.len()).map(|i| plan[i % 4] + 1).collect();
+        assert_eq!(pass_rows(t.calls()), want);
+        let rows: Vec<usize> = sink.0.iter().map(|c| c.rows).collect();
+        assert_eq!(rows, want);
+        assert!(sink.0.iter().all(|c| c.proposed == (c.rows > 1)));
+        assert!(sink.0.iter().all(|c| (1..=c.rows).contains(&c.kept)));
+    }
+
+    /// No proposal is the plain pass itself: the same calls in the same
+    /// order and the same tokens as [`Plain`], every token heard by
+    /// [`Draft::stepped`], and no verify of one row.
+    #[test]
+    fn no_proposal_is_the_plain_pass() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stop = Stop::new(30, 1000).unwrap();
+        let (plain, plain_calls) = run(&mut Plain, &prompt, &stop);
+        let mut spec = Speculative::<Scripted, 4>::new(Scripted::new(&[0]));
+        let (got, calls) = run(&mut spec, &prompt, &stop);
+        assert_eq!(calls, plain_calls);
+        assert_eq!(got, plain);
+        assert_eq!(spec.draft().stepped, plain.tokens.len() - 1);
+    }
+
+    /// A draft that proposes past its width is broken, and the pass says so
+    /// by name instead of verifying some other number of rows.
+    #[test]
+    #[should_panic(expected = "a draft of width 3 proposed 4 ids")]
+    fn a_proposal_past_the_width_panics() {
+        let prompt = [1, 2, 3, 1, 2];
+        let mut spec = Speculative::<Scripted, 4>::new(Scripted::new(&[4]));
+        run(&mut spec, &prompt, &Stop::new(10, 1000).unwrap());
+    }
+
+    /// A draft that runs the target's step while proposing leaves it a
+    /// position on: the pass says so by name instead of verifying from there.
+    #[test]
+    #[should_panic(expected = "a draft's proposal moved the target from position 5 to 6")]
+    fn a_proposal_that_moves_the_target_panics() {
+        struct Mover;
+        impl Draft<Mock> for Mover {
+            const WIDTH: usize = 1;
+            const TAPS: TapNeed = TapNeed::None;
+            fn begin(&mut self, _t: &Mock, _p: &[u32], _f: u32) -> Result<(), MockError> {
+                Ok(())
+            }
+            fn propose(
+                &mut self,
+                t: &mut Mock,
+                last: u32,
+                out: &mut [u32],
+            ) -> Result<usize, MockError> {
+                out[0] = t.step(last, Want::Argmax)?.argmax();
+                Ok(1)
+            }
+            fn accept(
+                &mut self,
+                _t: &mut Mock,
+                _rows: &[u32],
+                _out: &[u32],
+                _accepted: usize,
+            ) -> Result<(), MockError> {
+                Ok(())
+            }
+            fn stepped(&mut self, _t: &mut Mock, _l: u32, _n: u32) -> Result<(), MockError> {
+                Ok(())
+            }
+        }
+        let mut spec = Speculative::<Mover, 2>::new(Mover);
+        run(&mut spec, &[1, 2, 3, 1, 2], &Stop::new(10, 1000).unwrap());
+    }
+
+    /// The widths a window visits: every one from 2 to its widest for a
+    /// capture, the one asked for a pass, none outside it.
+    #[test]
+    fn a_window_visits_its_widths() {
+        struct Seen(Vec<usize>);
+        impl Width for Seen {
+            type Error = ();
+            fn run<const R: usize>(&mut self) -> Result<(), ()> {
+                self.0.push(R);
+                Ok(())
+            }
+        }
+        let mut s = Seen(Vec::new());
+        Window::<4>::each(&mut s).unwrap();
+        assert_eq!(s.0, [2, 3, 4]);
+        let mut s = Seen(Vec::new());
+        Window::<2>::each(&mut s).unwrap();
+        assert_eq!(s.0, [2]);
+        let mut s = Seen(Vec::new());
+        assert_eq!(Window::<4>::one(3, &mut s), Some(Ok(())));
+        assert_eq!(s.0, [3]);
+        assert!(Window::<4>::one(1, &mut s).is_none());
+        assert!(Window::<4>::one(5, &mut s).is_none());
+        assert_eq!(s.0, [3]);
+    }
+
+    /// A target whose passes hold two rows at most, refusing a wider one at
+    /// compile time as the card's bodies do: a draft of width 1 drives it,
+    /// which compiles only when the pass instantiates no verify wider than
+    /// the draft's own.
+    struct Pair(Mock);
+
+    impl Target for Pair {
+        type Error = MockError;
+
+        fn pos(&self) -> u32 {
+            self.0.pos()
+        }
+
+        fn ctx(&self) -> u32 {
+            self.0.ctx()
+        }
+
+        fn prompt(&mut self, ids: &[u32], want: Want) -> Result<Out<'_>, MockError> {
+            self.0.prompt(ids, want)
+        }
+
+        fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, MockError> {
+            self.0.step(id, want)
+        }
+
+        fn keepable(&self, n: u32) -> u32 {
+            self.0.keepable(n)
+        }
+
+        fn cut(&mut self, n: u32) -> Result<(), MockError> {
+            self.0.cut(n)
+        }
+
+        fn reset(&mut self) -> Result<(), MockError> {
+            self.0.reset()
+        }
+    }
+
+    impl Verify for Pair {
+        const MAX_ROWS: usize = 2;
+
+        fn verify<const M: usize>(&mut self, rows: [u32; M]) -> Result<[u32; M], MockError> {
+            const { assert!(M <= 2, "a pair target verifies two rows at most") };
+            self.0.verify(rows)
+        }
+
+        fn commit(&mut self, accepted: usize) -> Result<(), MockError> {
+            self.0.commit(accepted)
+        }
+    }
+
+    impl PassSink<Pair> for Quiet {
+        type Error = MockError;
+
+        fn begin(&mut self, _t: &Pair) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _t: &Pair,
+            _c: &Committed,
+            _tokens: &[u32],
+            _wall: std::time::Duration,
+        ) -> Result<(), MockError> {
+            Ok(())
+        }
+    }
+
+    /// A pair target runs a lookup: the pass instantiates the widths of its
+    /// draft's window alone, so the build of this test is the proof.
+    #[test]
+    fn a_pair_target_compiles_only_its_width() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stop = Stop::new(20, 1000).unwrap();
+        let (plain, _) = run(&mut Plain, &prompt, &stop);
+        let mut t = Pair(Mock::new());
+        let mut spec = Speculative::<Lookup, 2>::new(Lookup::new());
+        let first = spec.prompt(&mut t, &prompt).unwrap();
+        let out = generate(&mut t, &mut spec, &prompt, first, &stop, &mut Quiet).unwrap();
+        assert_eq!(out.tokens[..20], plain.tokens[..]);
+    }
+
+    /// A block draft is driven by its program; an MTP draft is refused by
+    /// name, not taken for a block draft.
+    #[test]
+    fn a_draft_program_by_kind() {
+        use models::{
+            Act, BlockDraft, DraftSpec, Ffn, Gqa, HcKind, HcSpec, HeadRows, LayerSpec, Mixer,
+            MtpDraft, MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode,
+        };
+        let block = BlockDraft {
+            hidden: 64,
+            vocab: 100,
+            rms_eps: 1e-6,
+            hc: HcSpec {
+                streams: 4,
+                kind: HcKind::Gated { rank: 8 },
+            },
+            layers: Vec::new(),
+            width: 2,
+            target_layers: vec![1],
+            mask_token: 99,
+            markov_rank: 4,
+        };
+        let spec = DraftSpec::Block(block.clone());
+        assert_eq!(program(&spec), Ok(Program::Block(&block)));
+        let layer = LayerSpec {
+            mixer: Mixer::Gqa(Gqa {
+                heads: 4,
+                kv_heads: 2,
+                head_dim: 16,
+                rope: Rope {
+                    mode: RopeMode::Neox,
+                    dims: 16,
+                    base: 10_000.0,
+                    yarn: None,
+                },
+                qk_norm: true,
+                out_gate: true,
+                select: None,
+            }),
+            ffn: Ffn::Dense {
+                ff: 128,
+                act: Act::SwiGlu { limit: None },
+            },
+            residual: Residual::Plain,
+            extras: Vec::new(),
+        };
+        let mtp = DraftSpec::Mtp(Box::new(MtpDraft {
+            source: MtpSource::InFile { layer: 2 },
+            layer,
+            index: 2,
+            hidden: 64,
+            vocab: 100,
+            rms_eps: 1e-6,
+            hc: None,
+            input: MtpInput::HeadRow,
+            head_norm: MtpHeadNorm::Rms,
+            head_rows: HeadRows::Full,
+        }));
+        let e = program(&mtp).unwrap_err();
+        assert_eq!(e, NotBuilt { kind: "MTP" });
+        assert_eq!(e.to_string(), "the MTP draft program is not built yet");
     }
 
     use crate::Target;

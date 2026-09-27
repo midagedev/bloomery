@@ -31,7 +31,9 @@ mod stop;
 pub mod stores;
 
 pub use lookup::Lookup;
-pub use speculative::{Draft, Speculative, TapNeed, Tapped};
+pub use speculative::{
+    Draft, NotBuilt, Program, Speculative, TapNeed, Tapped, Width, Widths, Window, program,
+};
 pub use stop::{NoTokens, Stop, StopReason};
 
 use std::time::{Duration, Instant};
