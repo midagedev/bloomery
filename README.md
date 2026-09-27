@@ -114,11 +114,11 @@ llama.cpp is ahead on this model. Mainline llama.cpp (`53ed051ce`, `-ngl 99 -fa 
 
 | A6000, tok/s | decode, depth 6 | 1024 | 3000 | prompt, P = 512 | P = 4096 |
 |---|---:|---:|---:|---:|---:|
-| bloomery | 40.46 | 39.45 | 38.76 | 105.7 | 104.0 |
+| bloomery | 40.46 | ~~39.45~~ 40.90 | ~~38.76~~ 40.1 | 105.7 | 104.0 |
 | llama.cpp | **44.68** | **44.03** | **43.21** | **340.4** | **356.6** |
 | llama.cpp `-ub 4096 -b 4096` | — | — | — | — | **776.3** |
 
-bloomery runs every routed expert of this model on the CPU and has no batched prompt path for it yet (it feeds the prompt eight positions at a time). Batched prompts come next, then experts on the card. Our first decode round read about 10 % below the others for a reason not yet found; the depth-6 value is the two rounds without it.
+bloomery runs every routed expert of this model on the CPU and has no batched prompt path for it yet (it feeds the prompt eight positions at a time). Batched prompts come next, then experts on the card. Our decode values leave out the first round. ~~Our first decode round read about 10 % below the others for a reason not yet found; the depth-6 value is the two rounds without it.~~ Corrected 2026-09-28: the first round read cold rows of the model's PLE table, about 16 page faults a token, and the depth 1024 and 3000 cells had averaged it in. Without it, decode is 0.906×, 0.929× and 0.928× llama.cpp at depth 6, 1024 and 3000 (rig-log [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release)).
 
 ### GLM-5.3-Flash, `UD-Q4_K_XL` — GPU + CPU experts
 
