@@ -1,0 +1,36 @@
+# Round probes38, P1: how the two cards attach and what their host-to-card links give together.
+# Measured on one link (rig-log 09-25#m2-h2d-a6000, 1 GiB x 8 on the A6000): pinned 26.28, pageable
+# 21.16 GB/s; READ_ONLY registration of the file map refused (801). facts.md's sysfs line puts the 3090
+# at 41:00.0 under 40:01.1 and the A6000 at 61:00.0 under 60:01.1, both PCIe 4.0 x16; a peer's reading
+# of that as two root ports was retracted, so this run prints nvidia-smi topo -m, each card's sysfs path
+# (which names the port above it) and each link read while the copies run.
+# Paper: two x16 Gen4 links with no shared hop give two single-link rates, 26.28 + 23.5..26.3 (the 3090's
+# own link is unmeasured; the low edge allows it 10 % under the A6000's). The two pinned sources are two
+# buffers read by DMA once each: 2 x 26.3 = 52.6 GB/s of DRAM read against 147.7, so DRAM does not bind.
+# A shared upstream hop would cap the pair near one link, ~26 [derived].
+# Wall [derived]: the build of h2d_probe in a warm target 2-5 min; the run 1-2 min (five steps, each a
+# context and at most 48 x 1.6 GB at ~26 GB/s = 2.9 s of copies, plus the 1 GiB calibration pair);
+# 3-7 min in all, under 30.
+kind: calibration
+question: what does a pinned host-to-card copy stream give on both cards at once, and how are the
+  cards attached?
+term: sum_GB/s of `h2d arm=both` (tools/ref/h2d-pcie.sh step 4): each card's rate between its first and
+  last completed copy inside the window where both loops ran, 48 back-to-back pinned copies of
+  1,600,000,000 bytes per card, the A6000 and the 3090 (250 W cap) at once, summed
+unit: GB/s
+predict: 48..53
+condition: BLOOMERY_CARD=both BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pcie-a6000.card'
+  just time-gpu-h2d, one lease (lease_take, witness pre and post with every card and the Xid count);
+  the runner skips step 4 with rc 75 when the 3090 has a compute process (guard_other) and voids the
+  run when the kernel logs a new NVRM Xid line; the calibration step's pinned line must read 26.28 +- 1
+  GB/s on the A6000, and each card's `h2d link` line during its copies must read 16.0 GT/s x16 on most
+  samples, or the sum is not read
+reason: the two-card plan (b), a two-card streaming lever and the two-card public table price the link
+  sum, and nothing has measured it; facts.md has no topo -m line and a retracted root-port reading
+decide-in: price two-card fills and streams at the measured sum; write topo -m, both sysfs paths and
+  the sum into docs/facts.md beside the single-link row
+decide-below: a shared hop or DRAM-side contention caps the pair: read topo -m and the two sysfs paths
+  for the shared hop, price every two-card stream at the measured sum, and re-run dma-dram-share with
+  both copies before any two-card streaming design
+decide-above: the single link was measured low: re-take the A6000's single-link row from this run's
+  sustained step and price both cards at the new values

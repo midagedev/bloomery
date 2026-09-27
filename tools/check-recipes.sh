@@ -201,6 +201,7 @@ selftests=(
   "tools/flow/ds41_prefill.py --self-test"
   "tools/flow/pplb.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
+  "tools/ref/dma-dram-share.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/draft-vocab.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"
@@ -208,6 +209,7 @@ selftests=(
   "tools/ref/ds41pp.py self-test"
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-hotlist.py --self-test"
+  "tools/ref/router-residency.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
 )
