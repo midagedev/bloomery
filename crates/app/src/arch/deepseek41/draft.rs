@@ -33,8 +33,7 @@ use cuda_core::CudaContext;
 use gguf::Split;
 use model::arch::deepseek41::spec::draft_of;
 use model::arch::dspark::DraftHparams;
-use model::arch::models::DraftSpec;
-use runtime::{Draft, TapNeed, Tapped, Target};
+use runtime::{Draft, Program, TapNeed, Tapped, Target};
 
 use crate::{Loaded, Session, SessionError};
 
@@ -65,13 +64,10 @@ impl CardDraft<DraftBody> {
         card: &'static str,
     ) -> Result<CardDraft<DraftBody>, SessionError> {
         let m = target.model_mut();
-        let DraftSpec::Block(spec) = draft_of(hp)
-            .map_err(|e| SessionError::Refused(format!("the draft's description: {e}")))?
-        else {
-            return Err(SessionError::Refused(
-                "the draft's description is not a block draft".to_string(),
-            ));
-        };
+        let desc = draft_of(hp)
+            .map_err(|e| SessionError::Refused(format!("the draft's description: {e}")))?;
+        let Program::Block(spec) = runtime::program(&desc)
+            .map_err(|e| SessionError::Refused(format!("the draft's description: {e}")))?;
         let taps: Vec<usize> = spec.target_layers.iter().map(|&l| l as usize).collect();
         body::attach_features(m, &taps)?;
         let ctx = m.gpu().context().clone();
@@ -220,10 +216,10 @@ impl Draft<Session<Body>> for CardDraft<DraftBody> {
     /// which must be the target's.
     fn propose(
         &mut self,
-        t: &Session<Body>,
+        t: &mut Session<Body>,
         last: u32,
         out: &mut [u32],
-    ) -> Result<bool, SessionError> {
+    ) -> Result<usize, SessionError> {
         let pos = t.pos();
         if self.committed() != pos {
             return Err(SessionError::Refused(format!(
@@ -236,7 +232,7 @@ impl Draft<Session<Body>> for CardDraft<DraftBody> {
         match ids.as_slice() {
             &[d] => {
                 out[0] = d;
-                Ok(true)
+                Ok(1)
             }
             other => Err(SessionError::Gpu(GpuError::Shape {
                 what: WHAT,
