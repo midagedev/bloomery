@@ -13,6 +13,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
+    python3 tools/recipes.py x86-crates [--names] [CRATE...]  # ok or device per crate, every crate with none (tools/x86-host.sh test)
+    python3 tools/recipes.py x86-allowed --classes F RECIPE...  # tools/x86-host.sh's allowlist rule (check-recipes)
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -3185,7 +3187,7 @@ def self_test() -> int:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-levers", "bloomery-models", "bloomery-refset", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
+        pure_now == ["bloomery-levers", "bloomery-models", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
@@ -3256,6 +3258,107 @@ def self_test() -> int:
     return 1 if fails else 0
 
 
+# ----------------------------------------------------------------------------------------------
+# the second host's x86 runs (tools/x86-host.sh): which crates and recipes may go there
+# ----------------------------------------------------------------------------------------------
+
+# What a data-free host gate's command and the scripts it runs may not name: the data directory, a
+# model file, the box's reference paths or a model profile, a reference tree.
+X86_DATA = [
+    (re.compile(r"\bBLOOMERY_DATA\b"), "the data directory (BLOOMERY_DATA)"),
+    (MODEL_LITERAL, "a model file"),
+    (re.compile(r"tools/ref/(?:ref-paths|models/)"), "the box's reference paths or a model profile"),
+    (IK_READ, "a reference tree"),
+]
+
+
+def x86_crates(tree: Tree, lock: Lock, names: list[str]) -> list[str]:
+    """`ok <crate>`, or `device <crate> <chain>` for a crate `cargo test -p` cannot build without the CUDA
+    backend (a device root in its closure, every feature on); an unknown name raises. No names: every
+    workspace crate. The x86 host runs what the Mac rejects only for x86_64 or Linux code, so this device
+    rule alone decides its list."""
+    out = []
+    for n in names or sorted(tree.packages):
+        if n not in tree.packages:
+            raise RecipeError(f"x86-crates: no workspace crate {n!r}")
+        chain = device_chain(tree, lock, n)
+        out.append(f"ok {n}" if chain is None else f"device {n} {chain}")
+    return out
+
+
+def x86_allowed(recipes: dict[str, Recipe], classes: dict[str, list[str]], names: list[str]) -> list[str]:
+    """Why each of `names` cannot run on the second host, one line a reason; empty when all can. The host
+    runs a recipe's box command and nothing else, so a recipe can when it has one plain box command and
+    no just dependency, gate-batch.sh's classifier finds no device code or gate lock in it (class F, no
+    card, "no device code"), the command runs no `cargo oxide`, and neither the command nor a script it
+    runs names data. A test that reads data from its own source is outside this rule: on the host nothing
+    exports BLOOMERY_DATA and /models is absent, so it fails by name."""
+    tree = Tree(ROOT)
+    out = []
+    for n in names:
+        if n not in recipes:
+            out.append(f"{n}: not a recipe in the justfile")
+            continue
+        row = classes.get(n)
+        if row is None:
+            out.append(f"{n}: gate-batch.sh --classes printed no row for it")
+        elif row[0] != "F" or row[2] != "-" or not row[3].startswith("no device code"):
+            out.append(f"{n}: gate-batch.sh --classes: class {row[0]} ({row[1]}), cards {row[2]}: {row[3]} — device code or a gate lock")
+        if recipes[n].deps:
+            out.append(f"{n}: depends on {', '.join(recipes[n].deps)}, which the host would not run")
+        try:
+            cmd = box_command(recipes[n])
+        except BoxCommandError as err:
+            out.append(f"{n}: {err}")
+            continue
+        rc = RecipeCommands()
+        for rcmd in simple_commands(shell_words(cmd)):
+            _classify(rcmd, rc, cmd)
+        if any(inv.oxide for inv in rc.invocations):
+            out.append(f"{n}: its box command runs cargo oxide — device code")
+        for pat, what in X86_DATA:
+            hit = pat.search(cmd)
+            if hit:
+                out.append(f"{n}: its box command names {what} ({hit.group(0)})")
+        for s in exec_closure(tree, rc.scripts):
+            body = tree.read(s)
+            for pat, what in X86_DATA:
+                hit = pat.search(body)
+                if hit:
+                    out.append(f"{n}: its box command runs {s}, which names {what} ({hit.group(0)})")
+    return out
+
+
+def cmd_x86_crates(args: argparse.Namespace) -> int:
+    tree = Tree(ROOT)
+    rows = x86_crates(tree, load_lock(tree.root), args.crates)
+    if args.names:
+        ok = [r.split(" ", 1)[1] for r in rows if r.startswith("ok ")]
+        if not ok:
+            raise RecipeError("x86-crates --names: no crate the host can build")
+        print("\n".join(ok))
+        return 0
+    print("\n".join(rows))
+    return 1 if any(not r.startswith("ok ") for r in rows) else 0
+
+
+def cmd_x86_allowed(args: argparse.Namespace) -> int:
+    recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
+    classes: dict[str, list[str]] = {}
+    with open(args.classes, encoding="utf-8") as fh:
+        for row in fh:
+            f = row.rstrip("\n").split("\t")
+            if len(f) != 5:
+                raise RecipeError(f"x86-allowed: {args.classes}: a row that is not gate-batch.sh --classes' five columns: {row!r}")
+            classes[f[0]] = f[1:]
+    bad = x86_allowed(recipes, classes, args.recipes)
+    for b in bad:
+        print(f"x86-allowed: {b}", file=sys.stderr)
+    if not bad:
+        print(f"x86-allowed: {len(args.recipes)} recipes, no device code, gate lock or data path")
+    return 1 if bad else 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--self-test", action="store_true")
@@ -3292,6 +3395,13 @@ def main(argv: list[str]) -> int:
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
     b.add_argument("--workers", type=int, default=8)
+    xc = sub.add_parser("x86-crates", help="ok or device, per crate: may tools/x86-host.sh test run it")
+    xc.add_argument("crates", nargs="*", help="none: every workspace crate")
+    xc.add_argument("--names", action="store_true", help="only the names of the crates the host can build (tools/x86-host.sh test's default)")
+    xa = sub.add_parser("x86-allowed", help="tools/x86-host.sh's allowlist against gate-batch.sh --classes and the data rule")
+    xa.add_argument("--classes", required=True, help="gate-batch.sh --classes output")
+    xa.add_argument("--justfile")
+    xa.add_argument("recipes", nargs="+")
     args = ap.parse_args(argv)
     try:
         if args.self_test:
@@ -3310,6 +3420,10 @@ def main(argv: list[str]) -> int:
             return cmd_box_command(args)
         if args.cmd == "pure-crates":
             return cmd_pure_crates(args)
+        if args.cmd == "x86-crates":
+            return cmd_x86_crates(args)
+        if args.cmd == "x86-allowed":
+            return cmd_x86_allowed(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
         ap.print_help()

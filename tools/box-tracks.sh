@@ -80,6 +80,9 @@ self_test() {
   [ "$fails" = 0 ] && echo "box-tracks: self-test ok" || { echo "box-tracks: self-test $fails failed" >&2; return 1; }
 }
 
+# source로 읽힐 때(tools/x86-host.sh가 classify와 select_removals를 쓴다)는 함수 정의에서 멈춘다.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "${1:-}" in
   --self-test) self_test; exit $? ;;
   --remove)

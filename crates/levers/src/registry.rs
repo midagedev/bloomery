@@ -1427,4 +1427,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("ref/vision/dump-vision.sh"),
         "Seconds each vision dump run may take.",
     ),
+    runner(
+        "BLOOMERY_X86_HOST",
+        Some("x86-host.sh"),
+        "Mac side: the second host's ssh name, `sihyung-gpu` when unset; `tools/x86-host.sh` \
+         runs the x86 host tests there.",
+    ),
+    runner(
+        "BLOOMERY_X86_WAIT",
+        Some("x86-host.sh"),
+        "Seconds `tools/x86-host.sh` waits for the second host's lock before a run gives up \
+         (75); `0` does not wait.",
+    ),
 ];

@@ -175,4 +175,20 @@ for t in "${selftests[@]}"; do
   fi
 done
 echo "check-recipes: ${#selftests[@]} tool self-tests ok"
+# x86-host.sh runs a host gate's box command on the second host: its refusals, the disk guard, the target
+# cap and the remote script are tested here, no ssh; and its allowlist is held to the classifier above
+# (no device code, no gate lock) and the data rule (recipes.py x86-allowed), so a gate that gains either
+# leaves the list here, not on the host.
+if ! x86=$(bash "$(dirname "$0")/x86-host.sh" --self-test 2>&1); then
+  echo "$x86" >&2
+  echo "check-recipes: the x86-host self-test failed" >&2
+  exit 1
+fi
+echo "${x86##*$'\n'}"
+if ! x86=$(bash "$(dirname "$0")/x86-host.sh" --check-allowlist "$classes" 2>&1); then
+  echo "$x86" >&2
+  echo "check-recipes: an x86-host.sh recipe has device code, a gate lock or a data path" >&2
+  exit 1
+fi
+echo "$x86"
 echo "check-recipes: ok"

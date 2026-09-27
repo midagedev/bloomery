@@ -347,6 +347,17 @@ box-gc *ARGS='--kill':
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}
 
+# x86 호스트 시험을 둘째 호스트(sihyung-gpu WSL)에서 돈다: 데이터 없는 호스트 게이트 여섯(tools/x86-host.sh의 ALLOW)의 박스
+# 명령 그대로. 정적 계층(check·lint·fmt)은 맥의 mac-* 레시피다. 실행마다 디스크 가드가 먼저 돌고, 끝나면 최근 여섯 트랙 밖의
+# target/을 지운다. 착륙 증거가 아니고 원장에 기록하지 않는다. 트랙 디렉터리 대조·삭제는 `tools/x86-host.sh --tracks`.
+x86 RECIPE:
+    @./tools/x86-host.sh {{RECIPE}}
+
+# 이름을 준 크레이트를 둘째 호스트에서 `cargo test --release -p …`로 돈다(tools/gate.sh 상한). 디바이스 크레이트는 거절한다.
+# 크레이트를 안 주면 클로저가 디바이스 루트에 닿지 않는 크레이트 전부다(recipes.py x86-crates --names).
+x86-test *CRATES:
+    @./tools/x86-host.sh test {{CRATES}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
