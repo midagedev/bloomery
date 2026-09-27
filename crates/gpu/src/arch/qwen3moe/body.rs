@@ -6,14 +6,17 @@
 use super::dispatch;
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
+use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
-use super::router::{N_EXPERT, N_USED, RouterKernels};
+use super::router::{N_EXPERT, N_USED, RouterKernels, gated};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
 use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
+use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::GemmKernels;
 use crate::head::Head;
+use crate::linear::LinearKernels;
 use crate::model::{ChainBody, GpuModel, Instrumented, NoHost, block_count};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::rope_neox::RopeNeoxKernels;
@@ -36,32 +39,16 @@ use std::ops::Range;
 pub(super) const ATTN_SCALE: f32 = 0.088_388_346;
 const _: () = assert!(HEAD == 128 && ATTN_SCALE.to_bits() == 0x3db5_04f3);
 
-/// The two K-quants a qwen3moe projection comes in: the attention value
-/// projection and the experts' down stack are Q4_K on some layers and Q6_K
-/// on the rest; every other projection is Q4_K.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kq {
-    Q4K,
-    Q6K,
-}
+/// The attention's score scale `1/√256` at Qwen3.6's head of 256: exact.
+pub(super) const ATTN_SCALE_256: f32 = 0.0625;
+const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
-/// One layer's weight names and the quantization of its two mixed sites,
-/// resolved at load.
-pub(super) struct LayerNames {
-    pub(super) attn_norm: String,
-    pub(super) attn_q: String,
-    pub(super) attn_k: String,
-    pub(super) attn_v: String,
-    pub(super) attn_q_norm: String,
-    pub(super) attn_k_norm: String,
-    pub(super) attn_output: String,
-    pub(super) ffn_norm: String,
-    pub(super) ffn_gate_inp: String,
-    pub(super) ffn_gate_exps: String,
-    pub(super) ffn_up_exps: String,
-    pub(super) ffn_down_exps: String,
-    pub(super) v_ty: Kq,
-    pub(super) down_ty: Kq,
+/// The kernels only Qwen3.6's layers launch: the delta rule's three, the
+/// gated router and the gated output projection's quantizer.
+pub(super) struct Q35Kernels {
+    pub(super) linear: LinearKernels,
+    pub(super) router: gated::RouterKernels,
+    pub(super) gated: GatedQuantKernels,
 }
 
 /// The kernels the chain launches beyond the crate's shared modules.
@@ -76,6 +63,43 @@ pub(super) struct Kernels {
     pub(super) head: HeadArgmaxKernels,
     /// The grouped GEMM of the ubatch prefill.
     pub(super) gemm: GemmKernels,
+    /// Qwen3.6's kernels; `None` on a qwen3moe load.
+    pub(super) q35: Option<Q35Kernels>,
+}
+
+impl Kernels {
+    /// Every module a chain of this family launches, loaded into `gpu`'s
+    /// context; Qwen3.6's own when `q35`. Load-time only.
+    pub(super) fn load(gpu: &Gpu, q35: bool) -> Result<Kernels, GpuError> {
+        let ctx = gpu.context();
+        Ok(Kernels {
+            proj: ProjKernels::load(ctx)?,
+            neox: RopeNeoxKernels::load(ctx)?,
+            flash: FlashGqaKernels::load(ctx)?,
+            router: RouterKernels::load(ctx)?,
+            experts: ExpertKernels::load(ctx)?,
+            q6_sel: Q6kSelKernels::load(ctx, gpu.fault_word())?,
+            head: HeadArgmaxKernels::load(ctx)?,
+            gemm: GemmKernels::load(ctx)?,
+            q35: if q35 {
+                Some(Q35Kernels {
+                    linear: LinearKernels::load(ctx)?,
+                    router: gated::RouterKernels::load(ctx)?,
+                    gated: GatedQuantKernels::load(ctx)?,
+                })
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Qwen3.6's kernels, or a named refusal on a qwen3moe load.
+    pub(super) fn q35(&self, what: &'static str) -> Result<&Q35Kernels, GpuError> {
+        self.q35.as_ref().ok_or(GpuError::state(
+            what,
+            "Qwen3.6's kernels (a qwen3moe load has none)",
+        ))
+    }
 }
 
 /// qwen3moe's per-replay host values: the token the chain embeds and the
@@ -95,7 +119,7 @@ pub struct Body {
     /// The GEMM prefill's arena and prompt image.
     pub(super) ub: Ubatch,
     pub(super) hp: Hparams,
-    pub(super) names: Vec<LayerNames>,
+    pub(super) plans: Vec<LayerPlan>,
     pub(super) kv: Vec<KvPlanes>,
     /// The rope table every path reads by position.
     pub(super) rope: RopeRows,
@@ -164,7 +188,13 @@ fn pins(hp: &Hparams) -> Result<(), GpuError> {
 
 /// Weight `name` as a K-quant word plane of `rows` rows of `k` values, and
 /// which of the two K-quants it is; `allowed` says which it may be.
-fn kq_site(w: &Weights, name: &str, rows: usize, k: usize, allowed: &[Kq]) -> Result<Kq, GpuError> {
+pub(super) fn kq_site(
+    w: &Weights,
+    name: &str,
+    rows: usize,
+    k: usize,
+    allowed: &[Kq],
+) -> Result<Kq, GpuError> {
     let what = "qwen3moe::Body::load";
     let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
         return Err(GpuError::tensor(
@@ -196,7 +226,7 @@ fn kq_site(w: &Weights, name: &str, rows: usize, k: usize, allowed: &[Kq]) -> Re
 }
 
 /// Weight `name` as a resident F32 plane of `rows` rows of `k`.
-fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+pub(super) fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
     let what = "qwen3moe::Body::load";
     match w.get(name) {
         Some(DevWeight::F32 { w: t, k: wk }) if t.rows() == rows && *wk == k => Ok(()),
@@ -211,51 +241,56 @@ fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuErr
     }
 }
 
-impl LayerNames {
-    /// Layer `l`'s names, every weight checked against the shape and type
-    /// its launch takes.
-    fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerNames, GpuError> {
-        let (h, q, kv, ff) = (
-            hp.n_embd,
-            hp.n_head * hp.head_dim,
-            hp.n_head_kv * hp.head_dim,
-            hp.experts.ff,
-        );
-        let e = hp.experts.n_expert;
-        let n = LayerNames {
-            attn_norm: names::attn_norm(l),
-            attn_q: names::attn_q(l),
-            attn_k: names::attn_k(l),
-            attn_v: names::attn_v(l),
-            attn_q_norm: names::attn_q_norm(l),
-            attn_k_norm: names::attn_k_norm(l),
-            attn_output: names::attn_output(l),
-            ffn_norm: names::ffn_norm(l),
-            ffn_gate_inp: names::ffn_gate_inp(l),
-            ffn_gate_exps: names::ffn_gate_exps(l),
-            ffn_up_exps: names::ffn_up_exps(l),
-            ffn_down_exps: names::ffn_down_exps(l),
-            v_ty: Kq::Q4K,
-            down_ty: Kq::Q4K,
-        };
-        for (name, len) in [
-            (&n.attn_norm, h),
-            (&n.ffn_norm, h),
-            (&n.attn_q_norm, hp.head_dim),
-            (&n.attn_k_norm, hp.head_dim),
-        ] {
-            f32_site(w, name, 1, len)?;
-        }
-        f32_site(w, &n.ffn_gate_inp, e, h)?;
-        kq_site(w, &n.attn_q, q, h, &[Kq::Q4K])?;
-        kq_site(w, &n.attn_k, kv, h, &[Kq::Q4K])?;
-        let v_ty = kq_site(w, &n.attn_v, kv, h, &[Kq::Q4K, Kq::Q6K])?;
-        kq_site(w, &n.attn_output, h, q, &[Kq::Q4K])?;
-        kq_site(w, &n.ffn_gate_exps, e * ff, h, &[Kq::Q4K])?;
-        kq_site(w, &n.ffn_up_exps, e * ff, h, &[Kq::Q4K])?;
-        let down_ty = kq_site(w, &n.ffn_down_exps, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
-        Ok(LayerNames { v_ty, down_ty, ..n })
+/// Layer `l`'s plan: attention at head 128, eight routed experts, every
+/// weight checked against the shape and type its launch takes.
+fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
+    let (h, q, kv, ff) = (
+        hp.n_embd,
+        hp.n_head * hp.head_dim,
+        hp.n_head_kv * hp.head_dim,
+        hp.experts.ff,
+    );
+    let e = hp.experts.n_expert;
+    let mut g = GqaPlan {
+        kind: GqaKind::Neox128,
+        attn_norm: names::attn_norm(l),
+        attn_q: names::attn_q(l),
+        attn_k: names::attn_k(l),
+        attn_v: names::attn_v(l),
+        attn_q_norm: names::attn_q_norm(l),
+        attn_k_norm: names::attn_k_norm(l),
+        attn_output: names::attn_output(l),
+        v_ty: Kq::Q4K,
+    };
+    let mut f = MoePlan {
+        ffn_norm: names::ffn_norm(l),
+        ffn_gate_inp: names::ffn_gate_inp(l),
+        ffn_gate_exps: names::ffn_gate_exps(l),
+        ffn_up_exps: names::ffn_up_exps(l),
+        ffn_down_exps: names::ffn_down_exps(l),
+        down_ty: Kq::Q4K,
+        shared: None,
+    };
+    for (name, len) in [
+        (&g.attn_norm, h),
+        (&f.ffn_norm, h),
+        (&g.attn_q_norm, hp.head_dim),
+        (&g.attn_k_norm, hp.head_dim),
+    ] {
+        f32_site(w, name, 1, len)?;
     }
+    f32_site(w, &f.ffn_gate_inp, e, h)?;
+    kq_site(w, &g.attn_q, q, h, &[Kq::Q4K])?;
+    kq_site(w, &g.attn_k, kv, h, &[Kq::Q4K])?;
+    g.v_ty = kq_site(w, &g.attn_v, kv, h, &[Kq::Q4K, Kq::Q6K])?;
+    kq_site(w, &g.attn_output, h, q, &[Kq::Q4K])?;
+    kq_site(w, &f.ffn_gate_exps, e * ff, h, &[Kq::Q4K])?;
+    kq_site(w, &f.ffn_up_exps, e * ff, h, &[Kq::Q4K])?;
+    f.down_ty = kq_site(w, &f.ffn_down_exps, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
+    Ok(LayerPlan {
+        mixer: MixerPlan::Gqa(g),
+        ffn: f,
+    })
 }
 
 impl Body {
@@ -266,8 +301,8 @@ impl Body {
         self.taps = None;
         if on {
             let hidden = self.s.dims.hidden;
-            let buf = DeviceBuffer::<f32>::zeroed(stream, self.names.len() * hidden)?;
-            let rows = (0..self.names.len())
+            let buf = DeviceBuffer::<f32>::zeroed(stream, self.plans.len() * hidden)?;
+            let rows = (0..self.plans.len())
                 .map(|l| {
                     let ptr = buf.cu_deviceptr() + (l * hidden * size_of::<f32>()) as u64;
                     // SAFETY: row `l` spans elements `l·hidden ..
@@ -380,41 +415,32 @@ impl Body {
         if ctx_max == 0 {
             return Err(GpuError::shape(what, "a cache of 0 rows"));
         }
-        let names = layers
+        let plans = layers
             .clone()
-            .map(|l| LayerNames::resolve(w, &hp, l))
+            .map(|l| resolve(w, &hp, l))
             .collect::<Result<Vec<_>, _>>()?;
-        let dims = Dims {
-            hidden: hp.n_embd,
-            n_head: hp.n_head,
-            n_kv: hp.n_head_kv,
-            ff: hp.experts.ff,
-            ctx: ctx_max,
-        };
+        let dims = Dims::qwen3(
+            hp.n_embd,
+            hp.n_head,
+            hp.n_head_kv,
+            hp.experts.ff,
+            N_USED,
+            ctx_max,
+        );
         let stream = gpu.stream();
         let kv = layers
             .map(|_| KvPlanes::new(stream, &dims))
             .collect::<Result<Vec<_>, _>>()?;
-        let ctx = gpu.context();
-        let k = Kernels {
-            proj: ProjKernels::load(ctx)?,
-            neox: RopeNeoxKernels::load(ctx)?,
-            flash: FlashGqaKernels::load(ctx)?,
-            router: RouterKernels::load(ctx)?,
-            experts: ExpertKernels::load(ctx)?,
-            q6_sel: Q6kSelKernels::load(ctx, gpu.fault_word())?,
-            head: HeadArgmaxKernels::load(ctx)?,
-            gemm: GemmKernels::load(ctx)?,
-        };
+        let k = Kernels::load(gpu, false)?;
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
             prefill: Prefill::new(stream, dims)?,
             ub: Ubatch::new(stream, dims, ubatch)?,
-            rope: RopeRows::new(stream, &rope, dims.ctx)?,
+            rope: RopeRows::new(stream, &rope, HEAD, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
-            sp: StepParams::new(stream)?,
+            sp: StepParams::new(stream, false)?,
             hp,
-            names,
+            plans,
             kv,
             k,
             head_state: HeadArgmaxState::new(stream)?,
@@ -469,7 +495,7 @@ impl ChainBody for Body {
     }
 
     fn layers(&self) -> Range<usize> {
-        0..self.names.len()
+        0..self.plans.len()
     }
 
     fn host(&mut self) -> Option<&mut NoHost> {
@@ -506,7 +532,7 @@ impl Instrumented for Body {
 
 impl GpuModel<Body> {
     /// Rows `positions` of the rope table every path reads, [`HEAD`] f32 a
-    /// row. Synchronizes; gate use.
+    /// row (the table's width). Synchronizes; gate use.
     pub fn rope_rows(&self, positions: Range<usize>) -> Result<Vec<f32>, GpuError> {
         const WHAT: &str = "qwen3moe::rope_rows";
         let rope = &self.body(WHAT)?.rope;
@@ -518,7 +544,13 @@ impl GpuModel<Body> {
         }
         // SAFETY: rows `positions` end at or below the table's rows, inside
         // it; the window lives for this copy alone.
-        let rows = unsafe { f32_view(&rope.table, positions.start * HEAD, positions.len() * HEAD) };
+        let rows = unsafe {
+            f32_view(
+                &rope.table,
+                positions.start * rope.width,
+                positions.len() * rope.width,
+            )
+        };
         Ok(rows.to_host_vec(self.stage_stream()?)?)
     }
 }

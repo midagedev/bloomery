@@ -48,7 +48,7 @@ impl GpuModel<Body> {
         let s = &body.s;
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
-            ids: s.route.ids.to_host_vec(stream)?,
+            ids: s.route.ids().to_host_vec(stream)?,
             l_out: s.x.to_host_vec(stream)?,
         })
     }
@@ -76,7 +76,7 @@ impl GpuModel<Body> {
         let s = &body.s;
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
-            ids: s.route.ids.to_host_vec(stream)?,
+            ids: s.route.ids().to_host_vec(stream)?,
             l_out: s.x.to_host_vec(stream)?,
         })
     }

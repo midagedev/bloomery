@@ -14,9 +14,10 @@
 //! position ([`RopeRows`]) and appends it there, and the flash reads its
 //! live key count.
 
-use super::router::{N_USED, RouterOut};
+use super::router::{RouterOut, gated};
 use crate::GpuError;
-use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
+use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+use crate::linear::{self, LinearShape};
 use crate::rope_table::{Direction, RopeTable};
 use crate::tensor::{Q8Act, window};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
@@ -121,22 +122,26 @@ impl Drop for Inbox {
 }
 
 /// Every cache position's rope row on the card, the table every path's rope
-/// launch reads by position: row `p`, [`HEAD`] f32 at `p · HEAD`, holds
+/// launch reads by position: row `p`, `width` f32 at `p · width` (the values
+/// a head turns: [`HEAD`] for qwen3moe, 64 of Qwen3.6's 256), holds
 /// `RopeTable::push`'s bits for position `p`, for each `p` below the cache's
 /// rows — so the one check a position gets, below the cache's rows, keeps
 /// the read inside the table. Built once at load.
 pub(super) struct RopeRows {
     pub(super) table: DeviceBuffer<f32>,
+    /// f32 a row: the turned values of a head.
+    pub(super) width: usize,
     /// The host time the rows took at load.
     pub(super) build: Duration,
 }
 
 impl RopeRows {
-    /// Rows `0..ctx` of `rope` (a [`HEAD`]-wide spec), one `push` per
-    /// position in order, copied to the card. Load-time only.
+    /// Rows `0..ctx` of `rope` (a `width`-wide spec, else refused), one
+    /// `push` per position in order, copied to the card. Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
         rope: &RopeTable,
+        width: usize,
         ctx: usize,
     ) -> Result<RopeRows, GpuError> {
         const WHAT: &str = "qwen3moe::RopeRows::new";
@@ -146,30 +151,31 @@ impl RopeRows {
                 format!("a cache of {ctx} rows: positions and live key counts are u32"),
             )
         })?;
-        if rope.n_dims() != HEAD {
+        if rope.n_dims() != width || width == 0 {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "a rope table of {} values a position; a row is {HEAD}",
+                    "a rope table of {} values a position; a row is {width}",
                     rope.n_dims()
                 ),
             ));
         }
         let t0 = Instant::now();
-        let mut host = Vec::with_capacity(ctx * HEAD);
+        let mut host = Vec::with_capacity(ctx * width);
         for pos in 0..positions {
             rope.push(pos, Direction::Forward, &mut host);
         }
         let build = t0.elapsed();
         Ok(RopeRows {
             table: DeviceBuffer::from_host(stream, &host)?,
+            width,
             build,
         })
     }
 
     /// The positions the table holds: the cache's rows.
     pub(super) fn rows(&self) -> usize {
-        self.table.len() / HEAD
+        self.table.len() / self.width
     }
 }
 
@@ -179,11 +185,56 @@ pub(super) struct Dims {
     pub(super) hidden: usize,
     pub(super) n_head: usize,
     pub(super) n_kv: usize,
+    /// Values of an attention head: [`HEAD`] or [`HEAD_256`].
+    pub(super) head: usize,
+    /// Rows the query projection writes a token: `n_head · head`, twice that
+    /// when it writes a gate beside each head's query.
+    pub(super) q_rows: usize,
     pub(super) ff: usize,
+    /// Expert slots a token takes: the routed ones, plus a folded shared
+    /// expert's.
+    pub(super) slots: usize,
+    /// The delta layers' head counts; `None` when the chain has none.
+    pub(super) lin: Option<LinearShape>,
     pub(super) ctx: usize,
 }
 
-/// One layer's K and V planes, `[n_kv][ctx][HEAD]` f16 each.
+impl Dims {
+    /// qwen3moe's: heads of [`HEAD`], a query projection of `n_head · HEAD`
+    /// rows, `slots` routed slots, no delta layer.
+    pub(super) fn qwen3(
+        hidden: usize,
+        n_head: usize,
+        n_kv: usize,
+        ff: usize,
+        slots: usize,
+        ctx: usize,
+    ) -> Dims {
+        Dims {
+            hidden,
+            n_head,
+            n_kv,
+            head: HEAD,
+            q_rows: n_head * HEAD,
+            ff,
+            slots,
+            lin: None,
+            ctx,
+        }
+    }
+
+    /// Values of a token's attention rows: `n_head · head`.
+    pub(super) fn attn_len(&self) -> usize {
+        self.n_head * self.head
+    }
+
+    /// Values of a token's key (or value) rows: `n_kv · head`.
+    pub(super) fn kv_len(&self) -> usize {
+        self.n_kv * self.head
+    }
+}
+
+/// One layer's K and V planes, `[n_kv][ctx][head]` f16 each.
 pub(super) struct KvPlanes {
     pub(super) k: DeviceBuffer<u16>,
     pub(super) v: DeviceBuffer<u16>,
@@ -191,7 +242,7 @@ pub(super) struct KvPlanes {
 
 impl KvPlanes {
     pub(super) fn new(stream: &CudaStream, d: &Dims) -> Result<KvPlanes, GpuError> {
-        let n = d.n_kv * d.ctx * HEAD;
+        let n = d.n_kv * d.ctx * d.head;
         Ok(KvPlanes {
             k: DeviceBuffer::zeroed(stream, n)?,
             v: DeviceBuffer::zeroed(stream, n)?,
@@ -227,17 +278,24 @@ pub(super) struct Arena {
     pub(super) act_x: Vec<Q8Act>,
     /// The q, k and v rows in one allocation — the one output of the q·k·v
     /// launch — and a non-owning window onto each block of `rows` tokens.
+    /// With an output gate the query block holds each head's `[q | gate]`.
     pub(super) qkv: DeviceBuffer<f32>,
     pub(super) q: ManuallyDrop<DeviceBuffer<f32>>,
     pub(super) k: ManuallyDrop<DeviceBuffer<f32>>,
     pub(super) v: ManuallyDrop<DeviceBuffer<f32>>,
+    /// The normed and turned queries, `[rows][n_head][head]`, when the query
+    /// block holds gates beside them (the rope writes them out of place);
+    /// `None` when the rope turns `q` in place.
+    pub(super) q_out: Option<DeviceBuffer<f32>>,
     /// A Q6_K value projection's output at more than one token: `q6k_gemv`
     /// writes it row-major, and a copy puts it into `v` token-major. `None`
     /// on a one-row arena, where the gemv writes `v` itself.
     pub(super) v_cols: Option<DeviceBuffer<f32>>,
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
-    /// The attention rows, `n_head · HEAD` per token.
+    /// The attention rows, `n_head · head` per token; a delta layer's gated
+    /// norm writes its `n_v · 128` values a token here too, the output
+    /// projection's input either way.
     pub(super) attn: DeviceBuffer<f32>,
     pub(super) act_attn: Vec<Q8Act>,
     /// The FFN's input residual: `x` plus the attention output.
@@ -246,69 +304,302 @@ pub(super) struct Arena {
     /// than one row the router reads their f32 twin `normed`; at one row the
     /// router's launch writes these and keeps the normed row to itself.
     pub(super) act_ffn: Vec<Q8Act>,
-    /// The router's ids, token-major `N_USED` per token, are the down's
-    /// selector: slot `t · N_USED + j` of a pass is token `t`'s slot `j`.
-    pub(super) route: RouterOut,
-    /// The selected experts' SwiGLU rows, per token slot-major `N_USED · ff`.
+    /// The router's ids, token-major `slots` per token, are the down's
+    /// selector: slot `t · slots + j` of a pass is token `t`'s slot `j`.
+    pub(super) route: Route,
+    /// The selected experts' SwiGLU rows, per token slot-major `slots · ff`.
     pub(super) h: DeviceBuffer<f32>,
     /// q8_1 of `h`, one column per slot: `act_h[m − 1]` holds the `m ·
-    /// N_USED` columns of `m` tokens, the down's input.
+    /// slots` columns of `m` tokens, the down's input.
     pub(super) act_h: Vec<Q8Act>,
-    /// The down outputs, per token slot-major `N_USED · hidden`.
+    /// The down outputs, per token slot-major `slots · hidden`.
     pub(super) down: DeviceBuffer<f32>,
+    /// A delta layer's intermediates; `None` when the chain has none.
+    pub(super) gdn: Option<GdnArena>,
 }
 
-/// The decode step's input record — its position and its token — in one
+/// Where a router launch leaves its results: qwen3moe's eight slots a
+/// token, or the gated router's nine (the shared expert's last).
+pub(super) enum Route {
+    Plain(RouterOut),
+    Gated(gated::RouterOut),
+}
+
+impl Route {
+    /// The slots' expert ids, token-major.
+    pub(super) fn ids(&self) -> &DeviceBuffer<u32> {
+        match self {
+            Route::Plain(r) => &r.ids,
+            Route::Gated(r) => &r.ids,
+        }
+    }
+
+    /// The slots' weights, token-major.
+    pub(super) fn weights(&self) -> &DeviceBuffer<f32> {
+        match self {
+            Route::Plain(r) => &r.weights,
+            Route::Gated(r) => &r.weights,
+        }
+    }
+
+    /// The eight-slot router's buffers, or a named refusal.
+    pub(super) fn plain(&mut self, what: &'static str) -> Result<&mut RouterOut, GpuError> {
+        match self {
+            Route::Plain(r) => Ok(r),
+            Route::Gated(_) => Err(GpuError::state(what, "the eight-slot router's buffers")),
+        }
+    }
+
+    /// The gated router's buffers, or a named refusal.
+    pub(super) fn gated(&mut self, what: &'static str) -> Result<&mut gated::RouterOut, GpuError> {
+        match self {
+            Route::Gated(r) => Ok(r),
+            Route::Plain(_) => Err(GpuError::state(what, "the gated router's buffers")),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Route::Plain(r) => r.bytes(),
+            Route::Gated(r) => r.bytes(),
+        }
+    }
+}
+
+/// A delta layer's intermediates for up to `rows` tokens, token-major. The
+/// four input projections land in one allocation, `[x | z | b | a]` in
+/// blocks of `rows` tokens: the q·k·v channels `x` (`C` a token), the output
+/// gate `z` (`n_v · 128`), β's and α's raw projections (`n_v` each) — so
+/// one three-matrix launch writes three neighbouring blocks.
+pub(super) struct GdnArena {
+    pub(super) shape: LinearShape,
+    pub(super) proj: DeviceBuffer<f32>,
+    /// The four blocks, and the tails from `z` and from `b` a three- or
+    /// two-matrix launch writes.
+    pub(super) x: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) z: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) b: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) a: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) from_z: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) from_b: ManuallyDrop<DeviceBuffer<f32>>,
+    /// A Q6_K q·k·v projection's output at more than one token, row-major
+    /// as `q6k_gemv` writes it; a copy puts it into `x` token-major. `None`
+    /// on a one-row arena.
+    pub(super) x_cols: Option<DeviceBuffer<f32>>,
+    /// The conv's output `[rows][C]` (q normed and scaled, k normed, v),
+    /// β and decay `[rows][n_v]`, the delta output `[rows][n_v][128]`.
+    pub(super) conv: DeviceBuffer<f32>,
+    pub(super) beta: DeviceBuffer<f32>,
+    pub(super) decay: DeviceBuffer<f32>,
+    pub(super) o: DeviceBuffer<f32>,
+}
+
+impl GdnArena {
+    fn new(stream: &CudaStream, shape: LinearShape, rows: usize) -> Result<GdnArena, GpuError> {
+        let (c, zl, nv) = (shape.channels(), shape.n_v * linear::HEAD, shape.n_v);
+        let at_z = rows * c;
+        let at_b = at_z + rows * zl;
+        let at_a = at_b + rows * nv;
+        let end = at_a + rows * nv;
+        let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let proj = f(end)?;
+        // SAFETY: each window lies inside `proj` (`end` values): the blocks
+        // tile it and the two tails run from their block to its end; `proj`
+        // moves into the struct beside them (a move of the handle, not of the
+        // allocation), where it outlives them.
+        let (x, z, b, a, from_z, from_b) = unsafe {
+            (
+                f32_view(&proj, 0, at_z),
+                f32_view(&proj, at_z, rows * zl),
+                f32_view(&proj, at_b, rows * nv),
+                f32_view(&proj, at_a, rows * nv),
+                f32_view(&proj, at_z, end - at_z),
+                f32_view(&proj, at_b, end - at_b),
+            )
+        };
+        Ok(GdnArena {
+            shape,
+            proj,
+            x,
+            z,
+            b,
+            a,
+            from_z,
+            from_b,
+            x_cols: (rows > 1).then(|| f(rows * c)).transpose()?,
+            conv: f(rows * c)?,
+            beta: f(rows * nv)?,
+            decay: f(rows * nv)?,
+            o: f(rows * zl)?,
+        })
+    }
+
+    /// Where the `b` and `a` blocks start in the tail from `z`, and the `a`
+    /// block in the tail from `b`: `(b − z, a − z, a − b)`.
+    pub(super) fn tail_offsets(&self) -> (usize, usize, usize) {
+        let (z, b) = (self.z.len(), self.b.len());
+        (z, z + b, b)
+    }
+
+    fn bytes(&self) -> usize {
+        [&self.proj, &self.conv, &self.beta, &self.decay, &self.o]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
+            + self.x_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
+    }
+}
+
+/// One delta layer's recurrent store: the state `[lanes][n_v][128][128]`
+/// (value-major, `linear`'s layout), read and written in place through the
+/// lane word, and the conv ring `[RING_ROWS][C]`, indexed by position.
+pub(super) struct RecStore {
+    pub(super) state: DeviceBuffer<f32>,
+    pub(super) ring: DeviceBuffer<f32>,
+    pub(super) lanes: usize,
+}
+
+impl RecStore {
+    /// A zeroed store of `lanes` lanes for `shape`. Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        shape: LinearShape,
+        lanes: usize,
+    ) -> Result<RecStore, GpuError> {
+        Ok(RecStore {
+            state: DeviceBuffer::zeroed(stream, lanes * shape.state_len())?,
+            ring: DeviceBuffer::zeroed(stream, shape.ring_len())?,
+            lanes,
+        })
+    }
+
+    /// Every lane of the state and the whole ring back to zero, in stream
+    /// order through `zeros` (host zeros at least as long as the longer of
+    /// the two). Never inside a capture.
+    pub(super) fn clear(&mut self, stream: &CudaStream, zeros: &[f32]) -> Result<(), GpuError> {
+        for buf in [&mut self.state, &mut self.ring] {
+            let n = buf.len();
+            let src = zeros.get(..n).ok_or_else(|| {
+                GpuError::shape(
+                    "qwen3moe::RecStore::clear",
+                    format!("{} host zeros for a {n}-value buffer", zeros.len()),
+                )
+            })?;
+            buf.copy_from_host(stream, src)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.state.num_bytes() + self.ring.num_bytes()
+    }
+}
+
+/// A layer's state store: K/V planes by position, or a recurrent store.
+pub(super) enum LayerStore {
+    Kv(KvPlanes),
+    Rec(RecStore),
+}
+
+impl LayerStore {
+    pub(super) fn as_mut(&mut self) -> StoreMut<'_> {
+        match self {
+            LayerStore::Kv(k) => StoreMut::Kv(k),
+            LayerStore::Rec(r) => StoreMut::Rec(r),
+        }
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        match self {
+            LayerStore::Kv(k) => k.bytes(),
+            LayerStore::Rec(r) => r.bytes(),
+        }
+    }
+}
+
+/// A layer's store as one layer's enqueue borrows it.
+pub(super) enum StoreMut<'a> {
+    Kv(&'a mut KvPlanes),
+    Rec(&'a mut RecStore),
+}
+
+/// The committed lane of a recurrent store of one lane: the lane word every
+/// record carries while a load holds one lane.
+pub(super) const LANE: u32 = 0;
+
+/// The decode step's input record — its position and its token, and on a
+/// chain with recurrent layers the lane word ([`SP_LANE`]) — in one
 /// [`Inbox`], so a step's refresh is one fill and one copy, and the windows
 /// the captured graph reads.
 pub(super) struct StepParams {
     /// Non-owning windows into the inbox's device words: the token (the
-    /// embedding's one id) and the position word.
+    /// embedding's one id), the position word and the lane word.
     token: ManuallyDrop<DeviceBuffer<u32>>,
     pos0: ManuallyDrop<DeviceBuffer<u32>>,
+    lane: Option<ManuallyDrop<DeviceBuffer<u32>>>,
+    words: usize,
     inbox: Inbox,
 }
+
+/// The lane word's offset in the decode step's record, after its token.
+pub(super) const SP_LANE: usize = IN_IDS + 1;
 
 /// What a unit's first launch reads: its ids (the unit's row count is their
 /// length), the word holding the first position of the input record they
 /// are a window of, and where the window starts in that record — row `t` of
-/// the unit is position `pos0 + first + t`.
+/// the unit is position `pos0 + first + t`; and on a chain with recurrent
+/// layers the record's lane word, the state lane a delta launch reads and
+/// writes.
 pub(super) struct Io<'a> {
     pub(super) ids: &'a DeviceBuffer<u32>,
     pub(super) pos0: &'a DeviceBuffer<u32>,
     pub(super) first: usize,
+    pub(super) lane: Option<&'a DeviceBuffer<u32>>,
 }
 
 impl StepParams {
-    /// Words of the record: the position, then the token.
-    const WORDS: usize = IN_IDS + 1;
-
-    /// A zeroed record (token 0 at position 0). Load-time only.
-    pub(super) fn new(stream: &CudaStream) -> Result<StepParams, GpuError> {
-        let inbox = Inbox::new(stream, Self::WORDS)?;
-        // SAFETY: each window is one word of the inbox's `WORDS` device words
-        // (`IN_POS0`, `IN_IDS` < `WORDS`), and the inbox moves into the struct
-        // beside them (a move of the handle, not of the allocation), where it
+    /// A zeroed record (token 0 at position 0), with the lane word when
+    /// `lane`. Load-time only.
+    pub(super) fn new(stream: &CudaStream, lane: bool) -> Result<StepParams, GpuError> {
+        let words = IN_IDS + 1 + usize::from(lane);
+        let inbox = Inbox::new(stream, words)?;
+        // SAFETY: each window is one word of the inbox's `words` device words
+        // (`IN_POS0`, `IN_IDS` < `words`, and `SP_LANE` < `words` when the
+        // lane word is asked for), and the inbox moves into the struct beside
+        // them (a move of the handle, not of the allocation), where it
         // outlives them.
-        let (token, pos0) = unsafe {
+        let (token, pos0, lane) = unsafe {
             (
                 param_view::<u32>(inbox.dev(), IN_IDS, 1),
                 param_view::<u32>(inbox.dev(), IN_POS0, 1),
+                lane.then(|| param_view::<u32>(inbox.dev(), SP_LANE, 1)),
             )
         };
-        Ok(StepParams { token, pos0, inbox })
+        Ok(StepParams {
+            token,
+            pos0,
+            lane,
+            words,
+            inbox,
+        })
     }
 
-    /// Write `token` at position `pos` and enqueue its copy — the step's
-    /// refresh. Asynchronous: the step's launches behind it read it.
+    /// Write `token` at position `pos` (and the lane word [`LANE`]) and
+    /// enqueue its copy — the step's refresh. Asynchronous: the step's
+    /// launches behind it read it.
     pub(super) fn write(
         &mut self,
         stream: &CudaStream,
         token: u32,
         pos: u32,
     ) -> Result<(), GpuError> {
-        put_input(self.inbox.host_mut()?, &[token], pos)?;
-        self.inbox.upload(stream, Self::WORDS)
+        let has_lane = self.lane.is_some();
+        let host = self.inbox.host_mut()?;
+        put_input(host, &[token], pos)?;
+        if has_lane {
+            host[SP_LANE] = LANE;
+        }
+        self.inbox.upload(stream, self.words)
     }
 
     /// The step's input, as its first launch reads it.
@@ -317,6 +608,7 @@ impl StepParams {
             ids: &self.token,
             pos0: &self.pos0,
             first: 0,
+            lane: self.lane.as_deref(),
         }
     }
 
@@ -363,8 +655,8 @@ pub(super) unsafe fn f32_view(
 impl Arena {
     /// Allocate the arena for `d` and up to `rows` tokens. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: Dims, rows: usize) -> Result<Arena, GpuError> {
-        let q_len = d.n_head * HEAD;
-        let kv_len = d.n_kv * HEAD;
+        let (q_len, kv_len, attn_len) = (d.q_rows, d.kv_len(), d.attn_len());
+        let gated = q_len != attn_len;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let acts = |k: usize| {
             (1..=rows)
@@ -373,7 +665,16 @@ impl Arena {
         };
         let x = f(rows * d.hidden)?;
         let qkv = f(rows * (q_len + 2 * kv_len))?;
-        let route = RouterOut::with_tokens(stream, rows)?;
+        let route = if d.slots == gated::N_SLOTS {
+            Route::Gated(gated::RouterOut::with_tokens(stream, rows)?)
+        } else {
+            Route::Plain(RouterOut::with_tokens(stream, rows)?)
+        };
+        let part_v = if d.head == HEAD_256 {
+            partials_v_len_256(rows, d.n_head, d.ctx)
+        } else {
+            partials_v_len(rows, d.n_head, d.ctx)
+        };
         // SAFETY: every window below lies inside its parent — row `t < rows`
         // of `x` (`hidden` values), and the three blocks that tile `qkv`
         // (`rows · (q_len + 2·kv_len)`) — and each parent moves into the
@@ -400,19 +701,24 @@ impl Arena {
             q,
             k,
             v,
+            q_out: gated.then(|| f(rows * attn_len)).transpose()?,
             v_cols: (rows > 1).then(|| f(rows * kv_len)).transpose()?,
-            part_v: f(partials_v_len(rows, d.n_head, d.ctx))?,
+            part_v: f(part_v)?,
             part_ms: f(partials_ms_len(rows, d.n_head, d.ctx))?,
-            attn: f(rows * q_len)?,
-            act_attn: acts(q_len)?,
+            attn: f(rows * attn_len)?,
+            act_attn: acts(attn_len)?,
             ffn_inp: f(rows * d.hidden)?,
             act_ffn: acts(d.hidden)?,
             route,
-            h: f(rows * N_USED * d.ff)?,
+            h: f(rows * d.slots * d.ff)?,
             act_h: (1..=rows)
-                .map(|m| Q8Act::with_slots(stream, m * N_USED, d.ff))
+                .map(|m| Q8Act::with_slots(stream, m * d.slots, d.ff))
                 .collect::<Result<Vec<_>, _>>()?,
-            down: f(rows * N_USED * d.hidden)?,
+            down: f(rows * d.slots * d.hidden)?,
+            gdn: d
+                .lin
+                .map(|shape| GdnArena::new(stream, shape, rows))
+                .transpose()?,
             dims: d,
             rows,
         })
@@ -420,7 +726,7 @@ impl Arena {
 
     /// Where the key and value blocks start in `qkv`.
     pub(super) fn qkv_offsets(&self) -> (usize, usize) {
-        let (q_len, kv_len) = (self.dims.n_head * HEAD, self.dims.n_kv * HEAD);
+        let (q_len, kv_len) = (self.dims.q_rows, self.dims.kv_len());
         (self.rows * q_len, self.rows * (q_len + kv_len))
     }
 
@@ -448,6 +754,8 @@ impl Arena {
             + self.pos.num_bytes()
             + self.n_keys.num_bytes()
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.q_out.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.gdn.as_ref().map_or(0, GdnArena::bytes)
             + self.route.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }

@@ -43,8 +43,9 @@
 //! groups of eight, each guarding the last, and every other launch works per
 //! token or per slot.
 
-use super::body::{ATTN_SCALE, Body, Kernels, Kq, LayerNames};
+use super::body::{ATTN_SCALE, Body, Kernels};
 use super::experts::CombineArgs;
+use super::plan::{GqaPlan, Kq, LayerPlan, MoePlan};
 use super::router::{N_EXPERT, N_USED, RouterOut};
 use super::scratch::{Dims, IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use crate::elem::EmbedRowsArgs;
@@ -439,10 +440,19 @@ impl Ubatch {
         )?;
         c.k.gemm
             .enqueue_route_dense(stream, t, &mut a.dense, gpu.unlabelled_sink())?;
-        for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
+        for (slot, (p, kv)) in c.plans.iter().zip(kv.iter_mut()).enumerate() {
             let sink = gpu.layer_sink(slot)?;
-            attention(c, n, kv, a, &self.flash, t, pos as usize, sink)?;
-            ffn(c, n, a, t, sink)?;
+            attention(
+                c,
+                p.gqa(WHAT, slot)?,
+                kv,
+                a,
+                &self.flash,
+                t,
+                pos as usize,
+                sink,
+            )?;
+            ffn(c, &p.ffn, a, t, sink)?;
         }
         Ok(())
     }
@@ -481,7 +491,7 @@ impl GpuModel<Body> {
 pub(super) struct UbCtx<'a> {
     pub(super) gpu: &'a Gpu,
     pub(super) w: &'a Weights,
-    pub(super) names: &'a [LayerNames],
+    pub(super) plans: &'a [LayerPlan],
     pub(super) k: &'a Kernels,
     pub(super) eps: f32,
     /// The rope table the rope launches read by position.
@@ -497,7 +507,7 @@ pub(super) struct UbCtx<'a> {
 )]
 fn attention(
     c: &UbCtx<'_>,
-    n: &LayerNames,
+    n: &GqaPlan,
     kv: &mut KvPlanes,
     a: &mut UbArena,
     flash: &FlashGqaPrefill,
@@ -601,7 +611,7 @@ fn attention(
 /// `x`.
 fn ffn(
     c: &UbCtx<'_>,
-    n: &LayerNames,
+    n: &MoePlan,
     a: &mut UbArena,
     t: usize,
     sink: FaultSink,

@@ -260,6 +260,31 @@ pub mod step_order {
         DeltaLane,
     ];
 
+    /// Qwen3.6-35B-A3B (`arch::qwen3moe`'s second body): the two layer
+    /// kinds' sites in one order. The fused norm and quantizer at the
+    /// layer's entry; an attention layer's cache append and flash key count;
+    /// a delta layer's conv, delta step (its lane word right after it) and
+    /// gated norm; the output projection's quantizer either kind's; then the
+    /// router's fused norm and the routed experts. A mask holds one layer's
+    /// sites, so each kind reads in its own launch order.
+    pub const QWEN35MOE: &[FaultSite] = &[
+        TokenId,
+        NormQuant,
+        CachePos,
+        KeyCount,
+        LinearConv,
+        LinearDelta,
+        DeltaLane,
+        LinearGate,
+        QuantColumn,
+        Router,
+        ExpertId,
+        AttnCount,
+        AttnSel,
+        Q5Quant,
+        HcQuant,
+    ];
+
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -267,6 +292,7 @@ pub mod step_order {
             model::arch::Arch::Deepseek2 => DEEPSEEK2,
             model::arch::Arch::Deepseek41 => DEEPSEEK41,
             model::arch::Arch::Qwen3moe => QWEN3MOE,
+            model::arch::Arch::Qwen35moe => QWEN35MOE,
         }
     }
 }
@@ -522,11 +548,16 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 3] {
-        let all = [Arch::Deepseek2, Arch::Deepseek41, Arch::Qwen3moe];
+    fn every_arch() -> [Arch; 4] {
+        let all = [
+            Arch::Deepseek2,
+            Arch::Deepseek41,
+            Arch::Qwen3moe,
+            Arch::Qwen35moe,
+        ];
         for a in all {
             match a {
-                Arch::Deepseek2 | Arch::Deepseek41 | Arch::Qwen3moe => {}
+                Arch::Deepseek2 | Arch::Deepseek41 | Arch::Qwen3moe | Arch::Qwen35moe => {}
             }
         }
         all

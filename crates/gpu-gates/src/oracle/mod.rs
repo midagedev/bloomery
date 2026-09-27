@@ -119,6 +119,9 @@ pub fn for_arch(a: Arch) -> Result<&'static Oracle, GateError> {
         Arch::Deepseek2 => Ok(&deepseek2::ORACLE),
         Arch::Deepseek41 => Ok(&deepseek41::ORACLE),
         Arch::Qwen3moe => Ok(&qwen3moe::ORACLE),
+        Arch::Qwen35moe => Err(
+            "qwen35moe has no oracle row: its gate reads the sets through refset's family".into(),
+        ),
     }
 }
 
