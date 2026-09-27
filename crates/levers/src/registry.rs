@@ -1413,6 +1413,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          binary: the file the split-K child writes.",
     ),
     runner(
+        "BLOOMERY_TIMING_CARDS",
+        Some("ref/timing-card.sh"),
+        "`a6000+3090`: a depth runner times both cards for the separate A6000+3090 table \
+         (`tools/ref/timing-card.sh`); unset, one card.",
+    ),
+    runner(
         "BLOOMERY_TIMING_GPU",
         Some("ref/timing-card.sh"),
         "The card a timed run takes, the A6000 when unset (`tools/ref/timing-card.sh`).",
