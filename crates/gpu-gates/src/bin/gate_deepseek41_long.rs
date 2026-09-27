@@ -136,6 +136,7 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
+    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
@@ -236,7 +237,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {

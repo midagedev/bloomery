@@ -39,6 +39,10 @@
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
+//!
+//! The server inherits this binary's environment, so the levers it acts on
+//! are the server's (`serve_levers::ACTS_ON`): one the server would refuse is
+//! refused here, at `main`, before the server starts.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -52,6 +56,10 @@ fn main() {
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_ds41_serve", gate::run())
 }
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_serve_levers.rs"]
+mod serve_levers;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
@@ -375,7 +383,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
         let reference = gen_tokens(&a.gen_log)?;

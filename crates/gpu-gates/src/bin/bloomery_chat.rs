@@ -26,8 +26,11 @@
 //! line (the streamed text against the vocabulary's one-shot decode of the
 //! same ids), and the `chat:` summary line.
 //!
-//! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
-//! `--levers` prints them with this process's values and exits. The stderr
+//! The levers it acts on are parsed once, at `main`
+//! (`bloomery_levers::at_main`), which refuses by name a lever set outside
+//! them — the prompt feed's among them: a prompt is fed one step per id — and
+//! a `BLOOMERY_*` name no registry row names; `--levers` prints them with this
+//! process's values and exits. The stderr
 //! lines are records of the kinds `bloomery_gpu_gates::record` declares;
 //! `--records-schema` prints those kinds and exits.
 
@@ -53,6 +56,7 @@ mod drive {
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
+    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST, PIN_MAIN};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, PlanLevers, workstation};
@@ -214,7 +218,7 @@ mod drive {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET, PIN_MAIN])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;

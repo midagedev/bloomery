@@ -75,6 +75,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
+    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -101,7 +102,7 @@ mod gate {
     const PINNED_GRANULE: i128 = 2 << 20;
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
         let cfg = OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -197,7 +198,7 @@ mod gate {
     fn load(path: &str, n: usize, cfg: &OpenCfg) -> Result<Deepseek41Model, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         let start = Instant::now();
-        let m = body::open(file, workstation::plan_gate, CTX_MAX as usize, cfg)?;
+        let m = body::open(file, workstation::plan_gate, usize::try_from(CTX_MAX)?, cfg)?;
         println!(
             "load {n}: {} B resident in {:.1} s (runtime value)",
             m.resident_bytes(),

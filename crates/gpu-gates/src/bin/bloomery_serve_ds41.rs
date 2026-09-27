@@ -21,9 +21,11 @@
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
 //!
-//! Every lever is parsed once, at `main` (`bloomery_levers::at_main`);
-//! `--levers` prints them with this process's values and exits. A prompt is
-//! fed the way the engine holds `BLOOMERY_PREFILL`. The stderr lines named
+//! The levers it acts on (`serve_levers::ACTS_ON`) are parsed once, at
+//! `main` (`bloomery_levers::at_main`), which refuses by name a lever set
+//! outside them and a `BLOOMERY_*` name no registry row names; `--levers`
+//! prints them with this process's values and exits. A prompt is fed the way
+//! the engine holds `BLOOMERY_PREFILL`. The stderr lines named
 //! above are records of the kinds `bloomery_gpu_gates::record` declares;
 //! `--records-schema` prints those kinds and exits.
 
@@ -47,6 +49,10 @@ fn main() -> std::process::ExitCode {
         Err(e) => bloomery_gpu_gates::exit_with("bloomery-serve-ds41", Err(e)),
     }
 }
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_serve_levers.rs"]
+mod serve_levers;
 
 #[cfg(feature = "deepseek41")]
 mod drive {
@@ -108,7 +114,7 @@ mod drive {
     /// Loads the model and serves until the listener or the engine fails;
     /// `Ok` carries why the server ended.
     pub fn run() -> Result<ServeError, GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;

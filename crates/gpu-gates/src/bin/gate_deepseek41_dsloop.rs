@@ -55,6 +55,7 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
+    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
@@ -121,7 +122,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let (_, dhp) = dspark::draft_hparams()?;
@@ -132,7 +133,7 @@ mod gate {
         let mut m = body::open(
             file,
             workstation::plan_gate,
-            workstation::CTX_MAX as usize,
+            usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
         m.set_mode(StepMode::Graph);

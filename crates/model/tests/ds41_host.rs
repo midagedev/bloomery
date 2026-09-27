@@ -223,16 +223,15 @@ impl Layer {
     }
 }
 
-/// `BLOOMERY_R8` as the engine takes it, by the lever registry's kind: unset
-/// is on.
+/// `BLOOMERY_R8` as the engine takes it (`crates/gpu/src/hybrid.rs`, an
+/// in-place read of the registry's on/off row): unset is on.
 fn r8_lever() -> bool {
     const R8: &str = "BLOOMERY_R8";
     match std::env::var(R8) {
         Err(std::env::VarError::NotPresent) => true,
-        Ok(v) => match bloomery_levers::spec(R8).and_then(|s| s.kind.parse(&v)) {
-            Some(bloomery_levers::Value::Flag(on)) => on,
-            _ => panic!("{R8}={v:?}: want on or off"),
-        },
+        Ok(v) if v == "on" => true,
+        Ok(v) if v == "off" => false,
+        Ok(v) => panic!("{R8}={v:?}: want on or off"),
         Err(e) => panic!("{R8}: {e}"),
     }
 }

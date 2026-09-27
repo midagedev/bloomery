@@ -88,6 +88,7 @@ mod gate {
     use bloomery_gpu::hybrid::{HostLevers, HostResidency, host_levers};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
+    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -174,7 +175,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let parsed = bloomery_levers::at_main()?;
+        let parsed = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
         let args = parse_args()?;
         let place = PlanLevers::from_levers(&parsed)?;
         let levers = host_levers()?;

@@ -122,7 +122,8 @@ pub struct BodyLevers {
     pub ced: bool,
     /// How a binary feeds a prompt (`BLOOMERY_PREFILL`).
     pub prefill: PrefillMode,
-    /// Batches a prompt group holds, 1 to 8 (`BLOOMERY_PREFILL_GROUP`).
+    /// Batches a prompt group holds, 1 to `bloomery_levers::PREFILL_GROUP_MAX`
+    /// (`BLOOMERY_PREFILL_GROUP`); the load refuses any other.
     pub group: usize,
     /// The step rows' levers.
     pub rows: RowsLevers,
@@ -132,7 +133,9 @@ pub struct BodyLevers {
 /// body's levers and the placement's.
 #[derive(Clone, Debug)]
 pub struct OpenCfg {
+    /// The body's levers, which it holds from its load.
     pub body: BodyLevers,
+    /// The placement's levers the plan is made under.
     pub place: PlanLevers,
 }
 

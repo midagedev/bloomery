@@ -15,11 +15,13 @@
 //! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
 //! state); `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
 //! the same binary's timing arm, and the `load` line prints which one ran
-//! (`prefill=`, the mode the engine holds). Every lever is parsed once, at
-//! `main` (`bloomery_levers::at_main`); `--levers` prints them with this
-//! process's values and exits. Every line the binary writes is a record of a
-//! kind `bloomery_gpu_gates::record` declares; `--records-schema` prints
-//! those kinds (fields, types, units) and exits. Prompt ids are
+//! (`prefill=`, the mode the engine holds). The levers it acts on (`ACTS_ON`)
+//! are parsed once, at `main` (`bloomery_levers::at_main`), which refuses by
+//! name a lever set outside them and a `BLOOMERY_*` name no registry row
+//! names; `--levers` prints them with this process's values and exits.
+//! Every line the binary writes is a record of a kind
+//! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
+//! kinds (fields, types, units) and exits. Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
 //! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the long gate's
@@ -207,7 +209,10 @@ mod drive {
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
-    use bloomery_levers::Levers;
+    use bloomery_levers::{
+        CARD_BUDGET, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOT_LIST, Levers, PIN_MAIN, PREFILL,
+        PREFILL_GROUP, STEP_STATS,
+    };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
@@ -431,8 +436,22 @@ mod drive {
         Ok((ids, prompt_len))
     }
 
+    /// The Parsed levers the run acts on besides the pool's two.
+    const ACTS_ON: &[&str] = &[
+        CED,
+        PREFILL,
+        PREFILL_GROUP,
+        ENGRAM_HELPER,
+        STEP_STATS,
+        HOT_LIST,
+        CARD_BUDGET,
+        PIN_MAIN,
+        DRAFT,
+        CHECK_FINITE,
+    ];
+
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(ACTS_ON)?;
         record::at_main("generate_ds41", record::GENERATE_DS41);
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;

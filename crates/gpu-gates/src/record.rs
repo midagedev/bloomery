@@ -10,7 +10,9 @@
 //! kind's is never printed. Each binary answers `--records-schema` right after
 //! its levers ([`at_main`]) with every kind it prints, one JSON object a line;
 //! `tools/bloomery/records.py` parses a log by that schema, so a reader names a
-//! kind and its fields, never a column or a pattern.
+//! kind and its fields, never a column or a pattern. The same call registers
+//! those kinds, and a line of any other kind is refused by name: the schema
+//! is every line the binary can print.
 //!
 //! The text is the one the lines' readers know: `<head> name=value …`, the
 //! head a fixed run of words and the pairs in a fixed order, so a reader that
@@ -20,6 +22,7 @@
 //! (`load_s`, `card_expert_bytes`).
 
 use std::fmt::{Debug, Display, Write as _};
+use std::sync::OnceLock;
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
@@ -203,14 +206,39 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// A binary and the kinds it prints, as its [`at_main`] registered them.
+#[derive(Clone, Copy, Debug)]
+struct Prints {
+    bin: &'static str,
+    kinds: &'static [&'static Kind],
+}
+
+impl Prints {
+    fn holds(&self, kind: &Kind) -> bool {
+        self.kinds.iter().any(|k| std::ptr::eq(*k, kind))
+    }
+}
+
+/// The process's [`Prints`], set once by [`at_main`]; unset, a line of any
+/// kind renders.
+static PRINTS: OnceLock<Prints> = OnceLock::new();
+
 /// With `--records-schema` among the process's arguments, print `bin`'s
-/// kinds ([`print_schema`]) and exit 0; otherwise nothing. Called right after
-/// `bloomery_levers::at_main`, before any argument parse or load.
-pub fn at_main(bin: &str, kinds: &[&Kind]) {
+/// kinds ([`print_schema`]) and exit 0; otherwise register them, after which
+/// [`Record::line`] refuses a line of any other kind. Called right after
+/// `bloomery_levers::at_main`, before any argument parse or load; a second
+/// call with another binary or list panics by name.
+pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
     if std::env::args_os().skip(1).any(|a| a == "--records-schema") {
         print_schema(bin, kinds);
         std::process::exit(0);
     }
+    let held = PRINTS.get_or_init(|| Prints { bin, kinds });
+    assert!(
+        held.bin == bin && std::ptr::eq(held.kinds, kinds),
+        "record::at_main({bin}): the process registered {}'s kinds already",
+        held.bin
+    );
 }
 
 /// The schema of `bin`'s lines on stdout ([`schema`]).
@@ -366,9 +394,25 @@ impl Record {
     }
 
     /// The line, with the literals after the last value written; refused
-    /// while a part the kind requires is missing.
+    /// while a part the kind requires is missing, and when the process
+    /// registered its binary's kinds ([`at_main`]) and this one is not among
+    /// them.
     #[must_use]
-    pub fn line(mut self) -> String {
+    pub fn line(self) -> String {
+        self.line_under(PRINTS.get())
+    }
+
+    /// [`Record::line`] under the registration `prints`.
+    fn line_under(mut self, prints: Option<&Prints>) -> String {
+        if let Some(held) = prints
+            && !held.holds(self.kind)
+        {
+            self.refuse(&format!(
+                "{} does not print this kind: it is not among the kinds its \
+                 record::at_main registered",
+                held.bin
+            ));
+        }
         while let Some(p) = self.kind.parts.get(self.at) {
             self.at += 1;
             match p {
@@ -1279,5 +1323,26 @@ mod tests {
             .u("ids", 4)
             .list("first", &[1u32, 2])
             .line();
+    }
+
+    /// Under a binary's registered kinds, one of them renders and a line of
+    /// another kind is refused, naming the kind and the binary.
+    #[test]
+    #[should_panic(expected = "record listening: generate_ds41 does not print this kind")]
+    fn refuses_a_kind_its_binary_does_not_print() {
+        let generate = Prints {
+            bin: "generate_ds41",
+            kinds: GENERATE_DS41,
+        };
+        let lock = Record::new(&HOST_LOCK)
+            .u("host_lock_bytes", 4096)
+            .u("sidecar_bytes", 0)
+            .line_under(Some(&generate));
+        assert_eq!(lock, "host_lock=4096 B sidecar_bytes=0");
+        let _ = Record::new(&LISTENING)
+            .w("place", "a")
+            .u("ctx", 4096)
+            .w("addr", "127.0.0.1:8080")
+            .line_under(Some(&generate));
     }
 }

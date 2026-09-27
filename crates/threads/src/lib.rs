@@ -325,20 +325,18 @@ impl Pool {
             full.extend_from_slice(siblings);
             topo.push(full);
         }
-        // The pool is process-wide, so it reads its own two levers, through
-        // the registry's parse (a binary that parses at `main` refused a bad
-        // value there first). BLOOMERY_THREADS overrides the count, unset is
-        // the physical core count; a value the lever does not take — zero, a
-        // word — panics by name. SMT siblings are a deliberate opt-in, not
-        // the default: this tier is bandwidth-bound. BLOOMERY_SPIN is the
-        // spin before a waiting thread parks.
-        let levers = bloomery_levers::Levers::from_env_named(&[
-            bloomery_levers::THREADS,
-            bloomery_levers::SPIN,
-        ])
-        .unwrap_or_else(|e| panic!("the worker pool: {e}"));
-        let nthreads = levers.threads().unwrap_or(physical);
-        let spin = levers.spin();
+        // The pool is process-wide, so it reads its own two levers
+        // (`bloomery_levers::pool_levers`: a binary that parses at `main`
+        // refused a bad value there first). BLOOMERY_THREADS overrides the
+        // count, unset is the physical core count; a value the lever does not
+        // take — zero, a word — or a retired lever that is set panics by name.
+        // SMT siblings are a deliberate opt-in, not the default: this tier is
+        // bandwidth-bound. BLOOMERY_SPIN is the spin before a waiting thread
+        // parks.
+        let levers =
+            bloomery_levers::pool_levers().unwrap_or_else(|e| panic!("the worker pool: {e}"));
+        let nthreads = levers.threads.unwrap_or(physical);
+        let spin = levers.spin;
         Pool {
             nthreads: nthreads.max(1),
             spin,

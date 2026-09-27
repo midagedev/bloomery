@@ -84,6 +84,7 @@ mod gate {
         GateError, NAN_F16, RefManifest, checks_failed, ref_tensor_of_in, verdict,
         widened_f16_rows_in,
     };
+    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -135,14 +136,19 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let mut m = body::open(file, workstation::plan_gate, CTX_MAX as usize, &cfg)?;
+        let mut m = body::open(
+            file,
+            workstation::plan_gate,
+            usize::try_from(CTX_MAX)?,
+            &cfg,
+        )?;
         let mut heads = {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_skew")?;
             println!(
@@ -311,7 +317,8 @@ mod gate {
         let width = hp.head_dim;
         let pos = set.pos as usize;
         let len = (set.plan.pos[0] - set.plan.raw_first[0] + 1) as usize;
-        let ring_rows = hp.window.min(CTX_MAX as usize);
+        let ctx_max = usize::try_from(CTX_MAX)?;
+        let ring_rows = hp.window.min(ctx_max);
         let first = pos + 1 - len;
         let mut out = Vec::with_capacity(hp.n_layer);
         for (l, kind) in hp.layers.iter().enumerate() {
@@ -337,7 +344,7 @@ mod gate {
                     };
                     let n_vis = pst.n_visible[0] as usize;
                     let written = pst.state_write.first().map(|&w| w as usize);
-                    let cap = (CTX_MAX as usize).div_ceil(st.ratio as usize);
+                    let cap = ctx_max.div_ceil(st.ratio as usize);
                     let rows = seat_rows(&pre, width, cap, n_vis, written);
                     let keys = if kind.index_keys {
                         cache_rows(man, &format!("lid_k_write-{l}"), &format!("lid_k-{l}"))?

@@ -1,9 +1,12 @@
-//! The rows: every `BLOOMERY_*` lever a crate reads, and the runner variables
-//! the repository's lever documentation names — each name once. A row with a
-//! file to read it in place (`Site::Direct`, or a non-empty `left`) is also a
-//! line of `tools/levers-direct.txt`, the list `tools/check-levers.sh` holds
-//! every in-place environment read of the crates' sources to; the test
-//! `registry_and_allow_list_agree` holds the two to each other.
+//! The rows: every `BLOOMERY_*` name the repository sets or reads — the
+//! levers, the retired names, and the names that are no lever — each once.
+//! A lever row with a file that reads it in place (`Site::Direct`, or a
+//! non-empty `left`) is also a line of `tools/levers-direct.txt`, the list
+//! `tools/check-levers.sh` holds every in-place environment read to; the test
+//! `registry_and_allow_list_agree` holds the two to each other. A name that is
+//! no lever names its owner (`Site::Env`), and `tools/check-levers.sh` holds
+//! every `BLOOMERY_*` name under `tools/`, in the justfile and in `.cargo/` to
+//! a row.
 
 use crate::{Class, InPlace, Kind, LeverSpec, Site, Unset};
 
@@ -19,25 +22,54 @@ pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
-pub const CARD_EXPERTS: &str = "BLOOMERY_CARD_EXPERTS";
-pub const STEP_PAIR: &str = "BLOOMERY_STEP_PAIR";
-pub const FLASH_MMA: &str = "BLOOMERY_FLASH_MMA";
-pub const Q3K_SPLIT: &str = "BLOOMERY_Q3K_SPLIT";
-pub const Q3K_SPLIT_ITERS: &str = "BLOOMERY_Q3K_SPLIT_ITERS";
-pub const LAUNCH_THREAD: &str = "BLOOMERY_LAUNCH_THREAD";
+
+/// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
+/// holds at most, which the body's buffers are sized for.
+pub const PREFILL_GROUP_MAX: u64 = 8;
 
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
+const SESSION: &str = "session";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
 
-/// Every lever, in the order the tables print them: the parsed ones, the
-/// ones still read in place, the retired names, the runner variables.
-pub static REGISTRY: &[LeverSpec] = &[
+/// What an unset name that is no lever means.
+const OWNERS: Unset = Unset::Means("its owner's default");
+
+/// The row of a path: a name that is no lever and says where a file or a
+/// directory is, owned by `script` under `tools/`, or by a harness.
+const fn path(name: &'static str, script: Option<&'static str>, doc: &'static str) -> LeverSpec {
+    LeverSpec {
+        name,
+        class: Class::P,
+        kind: Kind::Path,
+        default: OWNERS,
+        doc,
+        site: Site::Env { script },
+    }
+}
+
+/// The row of a runner's or a harness's own variable: a name that is no
+/// lever, owned by `script` under `tools/`, or by a harness.
+const fn runner(name: &'static str, script: Option<&'static str>, doc: &'static str) -> LeverSpec {
+    LeverSpec {
+        name,
+        class: Class::R,
+        kind: Kind::Text,
+        default: OWNERS,
+        doc,
+        site: Site::Env { script },
+    }
+}
+
+/// Every name, in the order the tables print them: the parsed levers, the
+/// ones still read in place, the retired names, the paths, the runners'
+/// variables.
+pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: THREADS,
         class: Class::C,
@@ -90,7 +122,7 @@ pub static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Count {
             min: 1,
-            max: 8,
+            max: PREFILL_GROUP_MAX,
             trim: false,
         },
         default: Unset::Is("2"),
@@ -238,7 +270,7 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
         default: Unset::Is("4"),
         doc: "Host tier: blocks a lane is cut into for stealing; a host-union block is at \
-              most 144 rows.",
+              most `UNION_BLOCK_ROWS` rows (`crates/model/src/ops.rs`).",
         site: Site::Direct {
             at: &[InPlace {
                 file: OPS,
@@ -404,6 +436,52 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: "BLOOMERY_Q3K_SPLIT",
+        class: Class::A,
+        kind: Kind::Words(&["1", "2", "4", "8"]),
+        default: Unset::Means("the only path"),
+        doc: "Was the GPU Q3_K gemv's split-K width.",
+        site: Site::Retired {
+            why: "a Q3_K row runs the one-warp gemv only",
+            left: &[],
+        },
+    },
+    LeverSpec {
+        name: "BLOOMERY_Q3K_SPLIT_ITERS",
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: u64::MAX,
+            trim: false,
+        },
+        default: Unset::Means("the only path"),
+        doc: "Was the walk length from which the GPU Q3_K gemv split a row.",
+        site: Site::Retired {
+            why: "a Q3_K row runs the one-warp gemv only",
+            left: &[],
+        },
+    },
+    LeverSpec {
+        name: "BLOOMERY_R8",
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "V4.1 host tier: its routed gates and ups are read from the r8 sidecar at \
+              `r8file::sidecar_path` of the first shard (`just r8-sidecar` writes it) through \
+              the row-lane tile, and the load's host set populates and locks those stacks' \
+              pages in the sidecar instead of the source; no file there reads the source; a \
+              file that does not match the source is its named `R8Error`, never a fall-back. \
+              `off` reads the source, the same-binary arm; both write the same bits. The load \
+              prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
+              (no sidecar at <path>: just r8-sidecar)`.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: HYBRID,
+                round: R03,
+            }],
+        },
+    },
+    LeverSpec {
         name: "BLOOMERY_HYBRID_NL",
         class: Class::C,
         kind: Kind::Count {
@@ -479,23 +557,14 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: "BLOOMERY_R8",
+        name: "BLOOMERY_LAUNCH_THREAD",
         class: Class::A,
-        kind: Kind::OnOff,
-        default: Unset::Is("on"),
-        doc: "V4.1 host tier: its routed gates and ups are read from the r8 sidecar at \
-              `r8file::sidecar_path` of the first shard (`just r8-sidecar` writes it) through \
-              the row-lane tile, and the load's host set populates and locks those stacks' \
-              pages in the sidecar instead of the source; no file there reads the source; a \
-              file that does not match the source is its named `R8Error`, never a fall-back. \
-              `off` reads the source, the same-binary arm; both write the same bits. The load \
-              prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
-              (no sidecar at <path>: just r8-sidecar)`.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: HYBRID,
-                round: R03,
-            }],
+        kind: Kind::Flag,
+        default: Unset::Means("the only path"),
+        doc: "Was `GpuModel`'s launch thread for each replay's `cuGraphLaunch`.",
+        site: Site::Retired {
+            why: "the decode thread issues every replay's launch",
+            left: &[],
         },
     },
     LeverSpec {
@@ -546,7 +615,22 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: CARD_EXPERTS,
+        name: "BLOOMERY_DSPARK_CARD",
+        class: Class::C,
+        kind: Kind::Text,
+        default: Unset::Means("the 3090"),
+        doc: "`generate_ds41` under `BLOOMERY_DRAFT=dspark`: the placement card the DSpark \
+              draft loads on, by its name; it may be the target's own card. Any other name \
+              is refused by name.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",
+                round: SESSION,
+            }],
+        },
+    },
+    LeverSpec {
+        name: "BLOOMERY_CARD_EXPERTS",
         class: Class::A,
         kind: Kind::Words(&["tile", "expert", "slot"]),
         default: Unset::Means("the only path"),
@@ -557,7 +641,7 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: STEP_PAIR,
+        name: "BLOOMERY_STEP_PAIR",
         class: Class::A,
         kind: Kind::Flag,
         default: Unset::Means("the only path"),
@@ -568,7 +652,7 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: FLASH_MMA,
+        name: "BLOOMERY_FLASH_MMA",
         class: Class::T,
         kind: Kind::Flag,
         default: Unset::Means("the only path"),
@@ -582,45 +666,365 @@ pub static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
-        name: Q3K_SPLIT,
+        name: "BLOOMERY_AB_SET",
         class: Class::A,
-        kind: Kind::Words(&["1", "2", "4", "8"]),
+        kind: Kind::Text,
         default: Unset::Means("the only path"),
-        doc: "Was the GPU Q3_K gemv's split-K width.",
+        doc: "Was a lever set for `tools/ref/depth-gpu.sh`'s `ab:` arms, which refuses it \
+              too.",
         site: Site::Retired {
-            why: "a Q3_K row runs the one-warp gemv only",
+            why: "`generate --ab` runs the shipped path alone",
             left: &[],
         },
     },
-    LeverSpec {
-        name: Q3K_SPLIT_ITERS,
-        class: Class::A,
-        kind: Kind::Count {
-            min: 1,
-            max: u64::MAX,
-            trim: false,
-        },
-        default: Unset::Means("the only path"),
-        doc: "Was the walk length from which the GPU Q3_K gemv split a row.",
-        site: Site::Retired {
-            why: "a Q3_K row runs the one-warp gemv only",
-            left: &[],
-        },
-    },
-    LeverSpec {
-        name: LAUNCH_THREAD,
-        class: Class::A,
-        kind: Kind::Flag,
-        default: Unset::Means("the only path"),
-        doc: "Was `GpuModel`'s launch thread for each replay's `cuGraphLaunch`.",
-        site: Site::Retired {
-            why: "the decode thread issues every replay's launch",
-            left: &[],
-        },
-    },
+    // ------------------------------------------------------------ the paths
+    path(
+        "BLOOMERY_ARGMAX_OUT",
+        Some("ref/argmax.sh"),
+        "The token reference file `tools/ref/argmax.sh` writes, a file under the data \
+         directory named by the profile when unset.",
+    ),
+    path(
+        "BLOOMERY_DATA",
+        Some("ref/ref-paths.sh"),
+        "The data directory: reference sets, dumps, corpora and the reference binaries. \
+         `tools/box.sh` exports `tools/ref/ref-paths.sh`'s into every box command; a \
+         caller's own wins.",
+    ),
+    path(
+        "BLOOMERY_DECODE_BIN",
+        Some("ref/decode-measure.sh"),
+        "The `bloomery-decode` binary the CPU runners (`decode-measure.sh`, \
+         `perf-decode.sh`, `profile-measure.sh`) time.",
+    ),
+    path(
+        "BLOOMERY_DEPINFO_REMOTE",
+        Some("recipes.py"),
+        "Mac side: the box directory whose dep-info `tools/recipes.py affected` reads.",
+    ),
+    path(
+        "BLOOMERY_DSPARK_MODEL",
+        Some("ref/timing-card.sh"),
+        "The DSpark draft file: the V4.1 profile's `DSPARK_MODEL` \
+         (`tools/ref/models/deepseek41.sh`), which the DSpark recipes and \
+         `tools/ref/timing-card.sh` export; a binary that needs it and finds it unset \
+         says so.",
+    ),
+    path(
+        "BLOOMERY_ENGRAM_BIN",
+        Some("ref/engram-rate.sh"),
+        "The `engram-rate` binary `tools/ref/engram-rate.sh` runs.",
+    ),
+    path(
+        "BLOOMERY_GATE_LEDGER",
+        Some("gate-batch.sh"),
+        "Mac side: the green ledger `tools/gate-batch.sh --ledger` reads and writes.",
+    ),
+    path(
+        "BLOOMERY_GATE_ROUND_LEDGER",
+        Some("gate-batch.sh"),
+        "Mac side: the rounds' green ledger `tools/gate-batch.sh --round-ledger` writes; every \
+         batch reads it, the lead's only under `--trust-rounds`.",
+    ),
+    path(
+        "BLOOMERY_GATE_TIMES",
+        Some("gate-batch.sh"),
+        "Mac side: the gate wall-time file `tools/gate-batch.sh` balances its lanes by.",
+    ),
+    path(
+        "BLOOMERY_GEN_BIN",
+        Some("ref/depth-ds41.sh"),
+        "The generator binary a GPU runner (the depth, nsys and ncu runners) times, each \
+         runner's own when unset.",
+    ),
+    path(
+        "BLOOMERY_KLD_FILE",
+        None,
+        "A KLD base file the KLD gate judges instead of its set's \
+         (`crates/gpu-gates/src/kld.rs`); the gate's FAIL-first points it at a copy.",
+    ),
+    path(
+        "BLOOMERY_LEASE_CARD",
+        Some("ref/lease.sh"),
+        "The prediction card (`docs/cards/<slug>.card`, format in `tools/ref/card.py`) a \
+         run that takes the timing lease carries; `lease_take` refuses a run without one.",
+    ),
+    path(
+        "BLOOMERY_LEASE_HOLDS",
+        Some("ref/lease-probe.sh"),
+        "The hold files the box guard reads, a glob; the tools' stub tests point it at \
+         their own.",
+    ),
+    path(
+        "BLOOMERY_LEASE_LOCK",
+        Some("ref/lease-probe.sh"),
+        "The timing lease's lock file; the tools' stub tests point it at their own, and \
+         `lease_take` refuses another on the box.",
+    ),
+    path(
+        "BLOOMERY_LEASE_PROC",
+        Some("ref/lease-probe.sh"),
+        "The process tree the lease's holders are read from, `/proc` when unset; the \
+         tools' stub tests point it at their own.",
+    ),
+    path(
+        "BLOOMERY_MODEL",
+        Some("box.sh"),
+        "Mac side, the tool profile a box command runs under (`tools/ref/models/`), which \
+         `tools/box.sh` reads and does not export; on the box, the model crate's test \
+         harnesses read it as a model file's path.",
+    ),
+    path(
+        "BLOOMERY_NCU_BIN",
+        Some("ref/ncu-gpu.sh"),
+        "Another tree's `generate_qwen3moe` (an absolute path under its `target/`) the ncu \
+         runner's q3pp form profiles.",
+    ),
+    path(
+        "BLOOMERY_NCU_GEMM_BIN",
+        Some("ref/ncu-gpu.sh"),
+        "The `gate_p8` binary the ncu runner's gemm form profiles.",
+    ),
+    path(
+        "BLOOMERY_NCU_OUT",
+        Some("ref/ncu-gpu.sh"),
+        "The directory the ncu runner writes its reports into.",
+    ),
+    path(
+        "BLOOMERY_NCU_TRACE",
+        Some("ref/ncu-gpu.sh"),
+        "The nsys prefill trace the ncu runner's ds41pp form reads its launch skip from, \
+         the newest of its prompt length when unset.",
+    ),
+    path(
+        "BLOOMERY_NSYS_OUT",
+        Some("ref/nsys-gpu.sh"),
+        "The directory the nsys runners write their traces into.",
+    ),
+    path(
+        "BLOOMERY_PROMPTS",
+        Some("ref/argmax.sh"),
+        "The prompt file `tools/ref/argmax.sh` takes its prompts from, the profile's when \
+         unset.",
+    ),
+    path(
+        "BLOOMERY_Q5K_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The file q5_K's qdot harness and gate read, the V4.1 first shard when unset.",
+    ),
+    path(
+        "BLOOMERY_QWEN3MOE_VOCAB",
+        None,
+        "The Qwen3-MoE file the tokenizer gate reads its vocabulary from, the box's when \
+         unset.",
+    ),
+    path(
+        "BLOOMERY_REF_CPU_SET",
+        None,
+        "The CPU reference set `gate_block` compares against instead of its oracle \
+         table's.",
+    ),
+    path(
+        "BLOOMERY_REF_CUDA",
+        None,
+        "An absolute path to the CUDA reference set the gates read instead of the one \
+         `BLOOMERY_REF_SET` or the oracle table names.",
+    ),
+    path(
+        "BLOOMERY_REF_DIR",
+        Some("ref/dump.sh"),
+        "The directory the C++ dumpers write a reference set into: the staging directory \
+         `tools/ref/dump.sh` and `dump-draft.sh` hand them.",
+    ),
+    path(
+        "BLOOMERY_REF_MODEL",
+        Some("box.sh"),
+        "The model file the gates and the GPU binaries open: `tools/box.sh` exports the \
+         tool profile's `MODEL` (`tools/ref/ref-paths.sh`) into every box command; a \
+         caller's own wins.",
+    ),
+    path(
+        "BLOOMERY_REF_SET",
+        Some("ref/dump.sh"),
+        "The reference set a gate reads instead of its oracle table's, and the one \
+         `tools/ref/dump.sh` writes.",
+    ),
+    path(
+        "BLOOMERY_REMOTE",
+        Some("box.sh"),
+        "Mac side: the box directory `tools/box.sh` syncs a tree into and runs in, a \
+         track's own in a parallel round.",
+    ),
+    path(
+        "BLOOMERY_TOKENIZE_BIN",
+        Some("ref/ik-draft.sh"),
+        "The `bloomery-tokenize` binary `tools/ref/ik-draft.sh` runs.",
+    ),
+    path(
+        "BLOOMERY_V41_DIR",
+        Some("box.sh"),
+        "The V4.1 file's directory, exported beside `BLOOMERY_V41_MODEL`.",
+    ),
+    path(
+        "BLOOMERY_V41_MODEL",
+        Some("box.sh"),
+        "The V4.1 first shard: `tools/box.sh` exports the deepseek41 profile's \
+         `V41_MODEL` into every box command whatever profile it picked; a caller's own \
+         wins.",
+    ),
+    path(
+        "BLOOMERY_V4_MODEL",
+        Some("ref/build-qdot-ref.sh"),
+        "The V4-Flash shard the MXFP4 qdot harnesses and gates read.",
+    ),
+    path(
+        "BLOOMERY_VISION_SET",
+        Some("ref/vision/dump-vision.sh"),
+        "The vision reference set (a directory under `ref-vision`) the vision gates read, \
+         and the one `tools/ref/vision/dump-vision.sh` writes.",
+    ),
+    // ---------------------------------------------- the runners' variables
+    runner(
+        "BLOOMERY_AB_DEPTH",
+        Some("ref/ab-decode.sh"),
+        "`tools/ref/ab-decode.sh`: the depth whose prompt is prefilled before each arm is \
+         timed.",
+    ),
+    runner(
+        "BLOOMERY_AB_ENVS",
+        Some("ref/ab-decode.sh"),
+        "The A/B runners: same-binary arms that differ by levers alone, `K=V;K=V`.",
+    ),
+    runner(
+        "BLOOMERY_AB_IK",
+        Some("ref/ab-decode.sh"),
+        "`tools/ref/ab-decode.sh`: `1` adds the reference engine at its fastest flags as \
+         an arm of every round.",
+    ),
+    runner(
+        "BLOOMERY_AB_INNER",
+        Some("ref/depth-gpu.sh"),
+        "`tools/ref/depth-gpu.sh`: the inner rounds of an `ab:` arm.",
+    ),
+    runner(
+        "BLOOMERY_AB_ROUNDS",
+        Some("ref/ab-decode.sh"),
+        "The A/B and depth runners: the rounds each arm runs.",
+    ),
+    runner(
+        "BLOOMERY_AB_WARMUP",
+        Some("ref/depth-ds41.sh"),
+        "`tools/ref/depth-ds41.sh`: `0` skips the discarded run of the first arm before \
+         round 1.",
+    ),
+    runner(
+        "BLOOMERY_ARM_BOUND",
+        Some("ref/lease.sh"),
+        "Seconds one arm of a timed runner may run under the lease before `timeout` ends \
+         it.",
+    ),
+    runner(
+        "BLOOMERY_BOX",
+        Some("box.sh"),
+        "Mac side: the box's ssh host.",
+    ),
+    runner(
+        "BLOOMERY_BOX_ENV",
+        Some("box.sh"),
+        "Mac side: `NAME=value` pairs `tools/box.sh` exports into the box command, so a \
+         lever reaches a binary through an unchanged recipe.",
+    ),
+    runner(
+        "BLOOMERY_BOX_READONLY",
+        Some("box.sh"),
+        "Mac side: `1` runs a read on the box beside a sitting, with no guard and no sync.",
+    ),
+    runner(
+        "BLOOMERY_BOX_WAIT",
+        Some("box.sh"),
+        "Seconds the box guard waits for the timing lease and the holds before a command \
+         gives up; `0` does not wait.",
+    ),
+    runner(
+        "BLOOMERY_BUILD_BOUND",
+        Some("ref/build-dump-draft.sh"),
+        "Seconds `tools/ref/build-dump-draft.sh` lets the reference build run.",
+    ),
+    runner(
+        "BLOOMERY_BUNDLE_BAND_DUMP",
+        None,
+        "The model attention gate's handshake with the child it runs of its own test \
+         binary: the file the bundle-band child writes.",
+    ),
+    runner(
+        "BLOOMERY_CARD",
+        Some("box.sh"),
+        "Mac side: the card a box command runs on, `3090`, `a6000` or `both`; \
+         `tools/box.sh` sets `CUDA_VISIBLE_DEVICES` from it.",
+    ),
+    runner(
+        "BLOOMERY_CHAIN_ATTN_LAYERS",
+        None,
+        "`gate_deepseek41_chain_attn`: the layers it checks, all of them when unset.",
+    ),
+    runner(
+        "BLOOMERY_CHAIN_ATTN_MUTATE",
+        None,
+        "`gate_deepseek41_chain_attn`'s FAIL-first tool: the one thing a pin covers that it \
+         breaks.",
+    ),
+    runner(
+        "BLOOMERY_CPU_BUSY_COMMS",
+        Some("ref/lease.sh"),
+        "The process names the lease's cpu guard counts as another tenant's work.",
+    ),
+    runner(
+        "BLOOMERY_CPU_BUSY_PCT",
+        Some("ref/lease.sh"),
+        "The percent of one cpu past which the lease's cpu guard marks a row \
+         `[cpu-busy]`.",
+    ),
+    runner(
+        "BLOOMERY_DECODE_N",
+        Some("ref/decode-measure.sh"),
+        "The CPU and GPU runners: the decode steps each timed run generates.",
+    ),
+    runner(
+        "BLOOMERY_DECODE_TOKENS",
+        Some("ref/decode-measure.sh"),
+        "The CPU runners: the prompt ids, the profile's `REF_TOKENS` when unset.",
+    ),
+    runner(
+        "BLOOMERY_DEPTHS",
+        Some("ref/depth-decode.sh"),
+        "`tools/ref/depth-decode.sh`: the depths both engines run at.",
+    ),
+    runner(
+        "BLOOMERY_DRY",
+        Some("ref/depth-ds41.sh"),
+        "The timing runners: `1` prints each command line (and a derivation) and exits \
+         before the lease; the recipes then build nothing.",
+    ),
+    runner(
+        "BLOOMERY_DUMP_BOUND",
+        Some("ref/dump.sh"),
+        "Seconds the reference dumpers (`tools/ref/dump.sh`, `dump-draft.sh`) may run.",
+    ),
+    runner(
+        "BLOOMERY_ENGRAM_LEASE",
+        Some("ref/engram-rate.sh"),
+        "`tools/ref/engram-rate.sh`'s handshake with `engram-rate`: `1` says the run holds \
+         the lease; without it every line is stamped outside one.",
+    ),
+    runner(
+        "BLOOMERY_FLASH_SIMD_CHILD_DUMP",
+        None,
+        "The model attention gate's handshake with the child it runs of its own test \
+         binary: the file the lever child writes.",
+    ),
     LeverSpec {
         name: "BLOOMERY_GATE_BOUND",
-        class: Class::C,
+        class: Class::R,
         kind: Kind::Count {
             min: 1,
             max: u64::MAX,
@@ -629,14 +1033,283 @@ pub static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("900"),
         doc: "Seconds a gate runner (`tools/gate.sh`, `tools/gpu-gate.sh`, \
               `tools/host-gate.sh`) lets its binary run before it kills it: a hung gate \
-              ends red.",
-        site: Site::Runner {
-            file: "tools/gate.sh",
+              ends red. The runners' one parser is `tools/gate-bound.sh`; this row takes \
+              what it takes and unset means what it means.",
+        site: Site::Env {
+            script: Some("gate-bound.sh"),
         },
     },
+    runner(
+        "BLOOMERY_GATE_CARD",
+        Some("gpu-gate.sh"),
+        "The card a GPU gate runs on and whose gate lock it takes: `3090`, `a6000` or \
+         `any`.",
+    ),
+    runner(
+        "BLOOMERY_BOX_CARD",
+        Some("box.sh"),
+        "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000` or \
+         `both`; `tools/gpu-gate.sh` takes that card's gate lock (both locks for `both`).",
+    ),
+    runner(
+        "BLOOMERY_GEN_CTX",
+        Some("ref/depth-qwen3moe.sh"),
+        "The Qwen3 depth, ncu and nsys runners: the context every arm of ours runs at.",
+    ),
+    runner(
+        "BLOOMERY_GEN_WARM",
+        Some("ref/depth-ds41.sh"),
+        "The depth runners: steps our arm runs before its statistics (`--warm`).",
+    ),
+    runner(
+        "BLOOMERY_GEN_PLACE",
+        Some("ref/depth-ds41.sh"),
+        "The depth runners: our arms' `--place` — `a` (plan (a), the A6000; the \
+         default) or `gate` (the gate plan, the 3090); anything else is refused.",
+    ),
+    runner(
+        "BLOOMERY_PREHEAT",
+        Some("ref/depth-ds41.sh"),
+        "The depth runners: `0` turns off the preheat of each reference arm's host \
+         set (its same-lease A/B); `1` is the default; anything else is refused.",
+    ),
+    runner(
+        "BLOOMERY_GIT_COMMIT",
+        Some("box.sh"),
+        "The commit of the synced tree (`-dirty` when the Mac tree held changes): \
+         `tools/box.sh` exports it into every box command; `bloomery-serve`'s build \
+         script and `tools/ref/depth-ds41.sh` read it.",
+    ),
+    runner(
+        "BLOOMERY_GPU_ARMS",
+        Some("ref/depth-gpu.sh"),
+        "`tools/ref/depth-gpu.sh`: its arms, in the order a lease runs them.",
+    ),
+    runner(
+        "BLOOMERY_HOLD_OWNER",
+        Some("box.sh"),
+        "The owner of the hold a sitting put up (`/root/bloomery-<owner>-hold`); a box \
+         command that names it passes that hold.",
+    ),
+    runner(
+        "BLOOMERY_HOST_BOUND",
+        Some("ref/host-rate.sh"),
+        "Seconds one thread count of `tools/ref/host-rate.sh` may run.",
+    ),
+    runner(
+        "BLOOMERY_HOST_LEASE",
+        Some("ref/host-rate.sh"),
+        "`tools/ref/host-rate.sh`'s handshake with `bench_v41_host`: `1` says the run \
+         holds the lease.",
+    ),
+    runner(
+        "BLOOMERY_IK_CTX",
+        Some("ref/ik-draft.sh"),
+        "`tools/ref/ik-draft.sh`: both engines' context.",
+    ),
+    runner(
+        "BLOOMERY_IK_DRAFT_PARAMS",
+        Some("ref/ik-draft.sh"),
+        "`tools/ref/ik-draft.sh`: the reference engine's `--draft-params`.",
+    ),
+    runner(
+        "BLOOMERY_IK_NCMOE",
+        Some("ref/ik-draft.sh"),
+        "`tools/ref/ik-draft.sh`: replaces `--n-cpu-moe` in the reference engine's GPU \
+         flags for one run.",
+    ),
+    runner(
+        "BLOOMERY_IK_SPEC",
+        Some("ref/ik-draft.sh"),
+        "`tools/ref/ik-draft.sh`: the reference engine's DSpark stage, `dspark[:k=v,...]`.",
+    ),
+    runner(
+        "BLOOMERY_KV_PREFETCH_CHILD",
+        None,
+        "The model attention gate's handshake with the child it runs of its own test \
+         binary: set, the process is the prefetch child.",
+    ),
+    runner(
+        "BLOOMERY_LCPP_NCMOE",
+        Some("ref/ik-draft.sh"),
+        "`tools/ref/ik-draft.sh`: replaces `--n-cpu-moe` in llama.cpp's flags for one run.",
+    ),
+    runner(
+        "BLOOMERY_LEASE_HELD",
+        Some("ref/lease-hold.sh"),
+        "The pid of the `tools/ref/lease-hold.sh` a command runs under: `lease_take` \
+         refuses a second lease inside it.",
+    ),
+    runner(
+        "BLOOMERY_LEASE_POLL",
+        Some("ref/lease-probe.sh"),
+        "Seconds between the box guard's polls; the tools' stub tests shorten it.",
+    ),
+    runner(
+        "BLOOMERY_MT_CHILD_DUMP",
+        None,
+        "The model threading gate's handshake with the child it runs of its own test \
+         binary: the file the child writes.",
+    ),
+    runner(
+        "BLOOMERY_NCU_COUNT",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: launches of each kernel it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_DEPTHS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's depth form: the depths it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_FORM",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's form: `generate`, `gemm`, `ds41pp` or `q3pp`.",
+    ),
+    runner(
+        "BLOOMERY_NCU_GEMM_ARM",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's gemm form: the `gate_p8` grouped-GEMM arm it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_KERNEL",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's q3pp form: the kernel entry it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_KERNELS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: the kernel names it profiles, a regular expression.",
+    ),
+    runner(
+        "BLOOMERY_NCU_LAYER",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's prompt forms: the layer whose launch it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_METRICS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: metrics asked for by name instead of the stall reasons.",
+    ),
+    runner(
+        "BLOOMERY_NCU_MODE",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's depth form: `graph` or `eager`.",
+    ),
+    runner(
+        "BLOOMERY_NCU_PER_STEP",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's depth form: launches its filter takes per step, which the \
+         launch skip is counted in.",
+    ),
+    runner(
+        "BLOOMERY_NCU_PROMPT",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's prompt forms: the prompt length.",
+    ),
+    runner(
+        "BLOOMERY_NCU_SECTIONS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: the report sections it asks for.",
+    ),
+    runner(
+        "BLOOMERY_NCU_SKIP",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: launches it skips before the first it profiles, instead of the \
+         skip it derives.",
+    ),
+    runner(
+        "BLOOMERY_NCU_SKIP_STEPS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's depth form: steps past the depth it skips before it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NCU_SOURCE",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's gemm and q3pp forms: `1` adds the per-instruction source page.",
+    ),
+    runner(
+        "BLOOMERY_NCU_STALLS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner: the stall reasons it asks for.",
+    ),
+    runner(
+        "BLOOMERY_NCU_TOTALS",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's summary: set, the kernels' total time, largest first, instead \
+         of each kernel's medians.",
+    ),
+    runner(
+        "BLOOMERY_NCU_UNIT",
+        Some("ref/ncu-gpu.sh"),
+        "The ncu runner's q3pp form: the ubatch it profiles.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_BLOCKED_US",
+        Some("ref/nsys-ds41.sh"),
+        "`tools/ref/nsys-ds41.sh`: the microseconds past which a host call is tabled as \
+         blocked.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_DEPTHS",
+        Some("ref/nsys-gpu.sh"),
+        "The nsys runner: the depths, or prompt lengths in its prefill form, it traces.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_FORM",
+        Some("ref/nsys-gpu.sh"),
+        "The nsys runners: `prefill` traces a prompt instead of decode steps.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_LAST",
+        Some("ref/nsys-ds41.sh"),
+        "`tools/ref/nsys-ds41.sh`: the replays it tables.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_LAYER",
+        Some("ref/nsys-ds41.sh"),
+        "`tools/ref/nsys-ds41.sh`'s prefill form: the layer-batch it tables alone.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_MARKER",
+        Some("ref/nsys-gpu.sh"),
+        "`tools/ref/nsys-gpu.sh`: the kernel whose launches cut the trace into steps.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_MODE",
+        Some("ref/nsys-gpu.sh"),
+        "`tools/ref/nsys-gpu.sh`: `graph` or `eager`.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_N",
+        Some("ref/nsys-gpu.sh"),
+        "The nsys runners: the steps each traced run generates.",
+    ),
+    runner(
+        "BLOOMERY_NSYS_TOP",
+        Some("ref/nsys-gpu.sh"),
+        "The nsys runners: the kernel rows they table.",
+    ),
+    runner(
+        "BLOOMERY_OTHER_STRICT",
+        Some("ref/lease.sh"),
+        "The lease's guards: `1` ends a timed run (75) where another tenant's work would \
+         only mark its row.",
+    ),
+    runner(
+        "BLOOMERY_PLACEMENT_TABLE",
+        None,
+        "The placement gate: `1` prints the per-tensor table too.",
+    ),
+    runner(
+        "BLOOMERY_PROFILE_CHILD_DUMP",
+        None,
+        "The model profile gate's handshake with the child it runs of its own test \
+         binary: the file the child writes.",
+    ),
     LeverSpec {
         name: "BLOOMERY_PROFILE_DEPTH",
-        class: Class::D,
+        class: Class::R,
         kind: Kind::Count {
             min: 0,
             max: u64::MAX,
@@ -645,8 +1318,109 @@ pub static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("no prompt first"),
         doc: "`tools/ref/profile-measure.sh`: the profiled run first prefills depth-decode's \
               prompt of this depth.",
-        site: Site::Runner {
-            file: "tools/ref/profile-measure.sh",
+        site: Site::Env {
+            script: Some("ref/profile-measure.sh"),
         },
     },
+    runner(
+        "BLOOMERY_PROFILE_LEVELS",
+        Some("ref/profile-measure.sh"),
+        "`tools/ref/profile-measure.sh`: the `BLOOMERY_PROFILE` levels it runs.",
+    ),
+    runner(
+        "BLOOMERY_RATE_CORE",
+        Some("ref/qdot-rate.sh"),
+        "`tools/ref/qdot-rate.sh`: the core its bench runs on.",
+    ),
+    runner(
+        "BLOOMERY_REF_BACKEND",
+        Some("ref/argmax.sh"),
+        "The reference dumpers: `cuda` runs the reference engine's GPU build instead of \
+         its CPU one.",
+    ),
+    runner(
+        "BLOOMERY_REF_BATCH_PREFILL",
+        Some("ref/argmax.sh"),
+        "`tools/ref/argmax.sh`: `1` lets the reference engine prefill in a batch instead \
+         of a step per id.",
+    ),
+    runner(
+        "BLOOMERY_REF_BUILD",
+        Some("ref/dump.sh"),
+        "The reference build a dumper's set records in its manifest; the dump runners \
+         hand it to the C++ dumpers.",
+    ),
+    runner(
+        "BLOOMERY_REF_CTX",
+        Some("ref/argmax.sh"),
+        "`tools/ref/argmax.sh`: the reference engine's context, the profile's when unset.",
+    ),
+    runner(
+        "BLOOMERY_REF_GEN",
+        Some("ref/argmax.sh"),
+        "`tools/ref/argmax.sh`: greedy steps appended after the prompt's.",
+    ),
+    runner(
+        "BLOOMERY_REF_MODEL_PROFILE",
+        Some("box.sh"),
+        "The profile `BLOOMERY_REF_MODEL` was exported under: `tools/box.sh` exports it, \
+         and `tools/ref/ref-paths.sh` refuses a script that picks another.",
+    ),
+    runner(
+        "BLOOMERY_REF_TOKENS",
+        Some("ref/dump.sh"),
+        "The token ids `tools/ref/dump.sh` dumps a reference set of, instead of the \
+         profile's.",
+    ),
+    runner(
+        "BLOOMERY_REF_TOKENS_SHA256",
+        Some("ref/dump.sh"),
+        "The sha256 of the ids file a dumper's set names, which the dump runners hand the \
+         C++ dumpers.",
+    ),
+    runner(
+        "BLOOMERY_REF_WRITE",
+        Some("ref/dump.sh"),
+        "The C++ dumpers' write guard: `1` writes the set, `0` or unset refuses; the dump \
+         runners set it.",
+    ),
+    runner(
+        "BLOOMERY_ROUTER_BOUND",
+        Some("ref/router-trace.sh"),
+        "Seconds `tools/ref/router-trace.sh` lets its harness run.",
+    ),
+    runner(
+        "BLOOMERY_ROUTER_IDS_MD5",
+        Some("ref/router-trace.sh"),
+        "The md5 of the ids a router trace ran over, which `tools/ref/router-trace.sh` \
+         hands its harness.",
+    ),
+    runner(
+        "BLOOMERY_ROUTER_WRITE",
+        Some("ref/router-trace.sh"),
+        "The router trace harness's write guard: `1` writes the set, `0` or unset \
+         refuses.",
+    ),
+    runner(
+        "BLOOMERY_SPLITK_BAND_DUMP",
+        None,
+        "The model attention gate's handshake with the child it runs of its own test \
+         binary: the file the split-K band child writes.",
+    ),
+    runner(
+        "BLOOMERY_SPLITK_CHILD_DUMP",
+        None,
+        "The model attention gate's handshake with the child it runs of its own test \
+         binary: the file the split-K child writes.",
+    ),
+    runner(
+        "BLOOMERY_TIMING_GPU",
+        Some("ref/timing-card.sh"),
+        "The card a timed run takes, the A6000 when unset (`tools/ref/timing-card.sh`).",
+    ),
+    runner(
+        "BLOOMERY_VISION_BOUND",
+        Some("ref/vision/dump-vision.sh"),
+        "Seconds each vision dump run may take.",
+    ),
 ];

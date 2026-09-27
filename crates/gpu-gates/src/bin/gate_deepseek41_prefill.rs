@@ -107,8 +107,10 @@
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
 //! short subset.
 //!
-//! The levers are parsed once, at `main` (`bloomery_levers::at_main`), and
-//! the model opens under them. `BLOOMERY_PREFILL_GROUP=n` picks how many
+//! The levers it acts on are parsed once, at `main`
+//! (`bloomery_levers::at_main`), and the model opens under them; a lever set
+//! outside them is refused by name — `BLOOMERY_PREFILL` among them: the gate
+//! runs the batched call whatever that lever says. `BLOOMERY_PREFILL_GROUP=n` picks how many
 //! batches a group runs layer by layer (default 2; the `loaded` line names
 //! it, with the bytes the batches past a group's first hold); 1 and 2 must
 //! pass. The cases hold calls of
@@ -194,6 +196,7 @@ mod gate {
         GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         patch_bytes, record, row_bytes, verdict,
     };
+    use bloomery_levers::{CARD_BUDGET, CED, ENGRAM_HELPER, HOT_LIST, PREFILL_GROUP, STEP_STATS};
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -327,7 +330,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[
+            CED,
+            PREFILL_GROUP,
+            ENGRAM_HELPER,
+            STEP_STATS,
+            HOT_LIST,
+            CARD_BUDGET,
+        ])?;
         record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
@@ -340,7 +350,7 @@ mod gate {
         let mut m = body::open(
             file,
             workstation::plan_gate,
-            workstation::CTX_MAX as usize,
+            usize::try_from(workstation::CTX_MAX)?,
             &cfg,
         )?;
         body::attach_features(&mut m, &layers)?;
@@ -1776,7 +1786,7 @@ mod gate {
         written: &[Vec<Range<usize>>],
     ) -> Result<Option<usize>, GateError> {
         let b = m.body(NAME)?;
-        let w = hp.window.min(workstation::CTX_MAX as usize);
+        let w = hp.window.min(usize::try_from(workstation::CTX_MAX)?);
         let mut granted = Vec::new();
         for k in 1..=p {
             if b.keep_point(k) != k {

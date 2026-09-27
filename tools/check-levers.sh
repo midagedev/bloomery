@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
-# Lever check — runs on the Mac (text only, no build).
-# Blocks: an environment read in crates/*/src outside the lever registry (crates/levers/src) that
-# tools/levers-direct.txt does not name — a lever parsed where it is used, which is how a value the
-# code does not understand became its default without a word. A read is a call of env::var or
-# env::var_os (std::env::… too), or an import that brings var/var_os in bare; its variable is the
-# string literal, or a same-file `const NAME: &str = "…"`. A read through a helper that takes the
-# name as an argument (`flag(name)`) cannot be resolved: its file must still be listed, and each
-# variable the list gives it must appear in that file as a string literal.
-# Also red: a list line whose file has no read left, or whose variable the file no longer names —
-# the list only shrinks, so a converted read takes its line with it.
+# Lever check — runs on the Mac (text only, no build). Three holds:
+#
+# 1. Every environment read in the crates — crates/*/src outside the lever registry
+#    (crates/levers/src), crates/*/tests and crates/*/build.rs — is a line of
+#    tools/levers-direct.txt: a lever parsed where it is used is how a value the code does not
+#    understand became its default without a word. A read is a call of env::var or env::var_os
+#    (std::env::… too), or an import that brings var/var_os in bare. Its variable is the string
+#    literal, or a same-file `const NAME: &str = "…"`; or, when the argument is a parameter of the
+#    function the call sits in, that function is a helper that takes the name, and each of its calls
+#    in the file is the read, its argument there the variable. A helper must be private to its file
+#    (its calls elsewhere are not read), and a read or a helper call whose variable is none of these
+#    is red. A list line holds only while its file reads each variable it gives — a string anywhere
+#    else in the file (a message) does not count — so a converted read takes its line with it.
+# 2. Every BLOOMERY_* name under tools/, in the justfile and under .cargo/ is a row of the registry
+#    (crates/levers/src/registry.rs): a binary's `at_main` refuses a name no row names, so a runner's
+#    new variable is red here, on the Mac, before a sitting meets it. A name ending in `_` is a glob
+#    or a prefix, not a name.
+# 3. A registry row that is no lever names its owner: a script under tools/ that names the variable,
+#    or, with no script, a harness whose read is a line of the list.
 # The registry's in-place rows and the list are held to each other by the levers crate's test
 # registry_and_allow_list_agree (just gate-levers), which reads this list at build time.
 set -euo pipefail
@@ -18,6 +27,7 @@ import os, re, sys
 
 root = sys.argv[1]
 allow_path = os.path.join(root, 'tools', 'levers-direct.txt')
+registry_path = os.path.join(root, 'crates', 'levers', 'src', 'registry.rs')
 bad = []
 
 allow = {}
@@ -36,65 +46,223 @@ CALL = re.compile(r'\benv::var(?:_os)?\s*\(\s*([^()]*?)\s*\)')
 IMPORT = re.compile(r'\buse\s+std::env::(?:\{[^}]*\bvar(?:_os)?\b[^}]*\}|var(?:_os)?\b)')
 CONST = re.compile(r'\bconst\s+([A-Z_][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"]*)"')
 LITERAL = re.compile(r'^"([^"]*)"$')
+IDENT = re.compile(r'^[a-z_][a-z0-9_]*$')
+FN = re.compile(r'\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<(?:[^<>{]|<[^<>]*>)*>)?\s*\(')
+
+
+def balanced(text, open_at):
+    """The text between the parenthesis at open_at and the one that closes it; string literals
+    are skipped whole."""
+    depth, i = 0, open_at
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1:i]
+        i += 1
+    return None
+
+
+def split_args(inner):
+    """Top-level comma-separated items of an argument or parameter list."""
+    out, depth, cur, i = [], 0, '', 0
+    while i < len(inner):
+        c = inner[i]
+        if c == '"':
+            j = i + 1
+            while j < len(inner) and inner[j] != '"':
+                j += 2 if inner[j] == '\\' else 1
+            cur += inner[i:j + 1]
+            i = j + 1
+            continue
+        if c in '([{<':
+            depth += 1
+        elif c in ')]}>':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            out.append(cur.strip())
+            cur, i = '', i + 1
+            continue
+        cur += c
+        i += 1
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def line_of(text, at):
+    return text.count('\n', 0, at) + 1
+
+
+def commented(lines, n):
+    return lines[n - 1].lstrip().startswith('//')
+
+
+def name_of(arg, consts):
+    lit = LITERAL.match(arg)
+    if lit:
+        return lit.group(1)
+    return consts.get(arg)
+
+
+def scan(rel, text):
+    """(reads, problems): reads is [(line, variable, code)] of every resolved read."""
+    lines = text.split('\n')
+    consts = dict(CONST.findall(text))
+    fns = [(m.start(), m.group(1), m.end() - 1) for m in FN.finditer(text)]
+    reads, problems, helpers = [], [], {}
+    for m in CALL.finditer(text):
+        n = line_of(text, m.start())
+        if commented(lines, n):
+            continue
+        arg = m.group(1)
+        var = name_of(arg, consts)
+        if var is not None:
+            reads.append((n, var, lines[n - 1].strip()))
+            continue
+        encl = [f for f in fns if f[0] < m.start()]
+        params = []
+        if encl:
+            start, fname, paren = encl[-1]
+            params = [p.split(':')[0].strip() for p in split_args(balanced(text, paren) or '')]
+        if IDENT.match(arg) and arg in params:
+            sig_line = lines[line_of(text, start) - 1]
+            head = sig_line[:sig_line.find('fn ')]
+            if re.search(r'\bpub\b', head):
+                problems.append(f'{rel}:{line_of(text, start)}: {fname} takes the variable\'s name '
+                                'and is not private to its file: its calls elsewhere are not read')
+            helpers[fname] = params.index(arg)
+            continue
+        problems.append(f'{rel}:{n}: reads a variable whose name is not a literal, a same-file '
+                        f'const or the parameter of a helper: {lines[n - 1].strip()}')
+    for fname, index in helpers.items():
+        for m in re.finditer(r'(?<![\w.:])' + fname + r'\s*\(', text):
+            n = line_of(text, m.start())
+            if commented(lines, n) or re.search(r'\bfn\s+$', text[:m.start()][-8:]):
+                continue
+            args = split_args(balanced(text, m.end() - 1) or '')
+            var = name_of(args[index], consts) if index < len(args) else None
+            if var is None:
+                problems.append(f'{rel}:{n}: calls {fname}, which reads the variable its argument '
+                                f'names, with no literal or same-file const: {lines[n - 1].strip()}')
+                continue
+            reads.append((n, var, lines[n - 1].strip()))
+    for n, line in enumerate(lines, 1):
+        if not line.lstrip().startswith('//') and IMPORT.search(line):
+            problems.append(f'{rel}:{n}: imports var/var_os bare, whose reads this check does not '
+                            f'see; call env::var: {line.strip()}')
+    return reads, problems
+
+
+def sources():
+    crates = os.path.join(root, 'crates')
+    for crate in sorted(os.listdir(crates)):
+        base = os.path.join(crates, crate)
+        if not os.path.isdir(base):
+            continue
+        dirs = [d for d in ('src', 'tests') if not (crate == 'levers' and d == 'src')]
+        for d in dirs:
+            for dirpath, _, files in os.walk(os.path.join(base, d)):
+                for name in sorted(files):
+                    if name.endswith('.rs'):
+                        yield os.path.join(dirpath, name)
+        build = os.path.join(base, 'build.rs')
+        if os.path.isfile(build):
+            yield build
+
 
 reads = {}
-crates = os.path.join(root, 'crates')
-for crate in sorted(os.listdir(crates)):
-    src = os.path.join(crates, crate, 'src')
-    if crate == 'levers' or not os.path.isdir(src):
-        continue
-    for dirpath, _, files in os.walk(src):
-        for name in sorted(files):
-            if not name.endswith('.rs'):
-                continue
-            path = os.path.join(dirpath, name)
-            rel = os.path.relpath(path, root)
-            text = open(path, encoding='utf-8').read()
-            consts = dict(CONST.findall(text))
-            for n, line in enumerate(text.split('\n'), 1):
-                if line.lstrip().startswith('//'):
-                    continue
-                for m in CALL.finditer(line):
-                    arg = m.group(1)
-                    lit = LITERAL.match(arg)
-                    var = lit.group(1) if lit else consts.get(arg)
-                    reads.setdefault(rel, []).append((n, var, line.strip()))
-                if IMPORT.search(line):
-                    reads.setdefault(rel, []).append((n, None, line.strip()))
+for path in sources():
+    rel = os.path.relpath(path, root)
+    got, problems = scan(rel, open(path, encoding='utf-8').read())
+    bad.extend(problems)
+    if got:
+        reads[rel] = got
 
 for rel in sorted(reads):
     lines = allow.get(rel)
     if lines is None:
         for n, var, code in reads[rel]:
-            bad.append(f'{rel}:{n}: reads {var or "a variable"} in place and tools/levers-direct.txt '
-                       f'does not list the file: {code}')
+            bad.append(f'{rel}:{n}: reads {var} in place and tools/levers-direct.txt does not list '
+                       f'the file: {code}')
         continue
     listed = set().union(*(v for _, v in lines))
     for n, var, code in reads[rel]:
-        if var is not None and var not in listed:
+        if var not in listed:
             bad.append(f'{rel}:{n}: reads {var} in place, which the file\'s lines of '
                        f'tools/levers-direct.txt do not list: {code}')
 
 for rel in sorted(allow):
-    path = os.path.join(root, rel)
+    read_vars = {var for _, var, _ in reads.get(rel, [])}
     for n, vars_ in allow[rel]:
-        if rel not in reads:
+        if not read_vars:
             bad.append(f'tools/levers-direct.txt:{n}: {rel} reads nothing in place any more: '
                        'remove the line')
             continue
-        text = open(path, encoding='utf-8').read()
-        for var in sorted(vars_):
-            if f'"{var}"' not in text:
-                bad.append(f'tools/levers-direct.txt:{n}: {rel} no longer names {var}: '
-                           'take it off the line')
+        for var in sorted(vars_ - read_vars):
+            bad.append(f'tools/levers-direct.txt:{n}: {rel} no longer reads {var}: '
+                       'take it off the line')
+
+# 2. Every BLOOMERY_* name the tools, the justfile and .cargo/ give is a row.
+registry = open(registry_path, encoding='utf-8').read()
+rows = set(re.findall(r'"(BLOOMERY_[A-Z0-9_]+)"', registry))
+# Self-test fixtures: each tool's test hands a made-up name to the code under test (spelled in two
+# pieces here, or this file would give it too).
+FIXTURE = 'BLOOMERY' + '_X'
+FIXTURES = {('tools/recipes.py', FIXTURE), ('tools/ref/card-tests/run.sh', FIXTURE)}
+NAME = re.compile(rb'BLOOMERY_[A-Z0-9_]+')
+given = [os.path.join(root, 'justfile')]
+for top in ('tools', '.cargo'):
+    for dirpath, _, files in os.walk(os.path.join(root, top)):
+        given += [os.path.join(dirpath, name) for name in sorted(files)]
+names = set()
+for path in given:
+    rel = os.path.relpath(path, root)
+    data = open(path, 'rb').read()
+    for m in NAME.finditer(data):
+        name = m.group(0).decode()
+        if name.endswith('_') or (rel, name) in FIXTURES:
+            continue
+        names.add(name)
+        if name not in rows:
+            n = data.count(b'\n', 0, m.start()) + 1
+            bad.append(f'{rel}:{n}: {name} is no row of the lever registry, and a binary refuses a '
+                       'name no row names: add its row (crates/levers/src/registry.rs) or fix the name')
+
+# 3. A row that is no lever names its owner, and the owner names it.
+ENV_SHORT = re.compile(r'\b(?:path|runner)\(\s*"(BLOOMERY_[A-Z0-9_]+)",\s*(?:Some\("([^"]+)"\)|None)')
+ENV_FULL = re.compile(r'name:\s*"(BLOOMERY_[A-Z0-9_]+)",(?:(?!LeverSpec \{).)*?'
+                      r'site:\s*Site::Env\s*\{\s*script:\s*(?:Some\("([^"]+)"\)|None)', re.S)
+listed_anywhere = set().union(*(v for lines in allow.values() for _, v in lines)) if allow else set()
+env_rows = ENV_SHORT.findall(registry) + ENV_FULL.findall(registry)
+for name, script in env_rows:
+    if not script:
+        if name not in listed_anywhere:
+            bad.append(f'{registry_path[len(root) + 1:]}: {name} names a harness as its owner, and no '
+                       'line of tools/levers-direct.txt reads it')
+        continue
+    path = os.path.join(root, 'tools', script)
+    if not os.path.isfile(path) or name.encode() not in open(path, 'rb').read():
+        bad.append(f'{registry_path[len(root) + 1:]}: {name} names tools/{script} as its owner, '
+                   'which does not name it')
 
 if bad:
     for b in bad:
         print(b, file=sys.stderr)
     print(f'check-levers: {len(bad)} problem(s) — a lever is parsed by the registry '
           '(crates/levers) at a binary\'s main; a read left in place is a line of '
-          'tools/levers-direct.txt with the round that converts it', file=sys.stderr)
+          'tools/levers-direct.txt with the round that converts it; every BLOOMERY_* name is a '
+          'registry row', file=sys.stderr)
     sys.exit(1)
 count = sum(len(v) for v in reads.values())
-print(f'check-levers: ok ({count} reads in place in {len(reads)} files, all listed)')
+print(f'check-levers: ok ({count} reads in place in {len(reads)} files, all listed; '
+      f'{len(names)} BLOOMERY_* names in tools/, the justfile and .cargo/, all rows; '
+      f'{len(env_rows)} rows that are no lever, each named by its owner)')
 PY

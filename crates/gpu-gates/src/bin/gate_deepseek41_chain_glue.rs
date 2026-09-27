@@ -74,6 +74,7 @@ mod gate {
         GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
         max_rel_err, ref_ints, ref_model_path, ref_tensor_logical_in, ref_tensor_of_in, verdict,
     };
+    use bloomery_levers::ENGRAM_HELPER;
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
@@ -121,7 +122,7 @@ mod gate {
     // --------------------------------------------------------------- the run
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER])?;
         let split = Split::open(ref_model_path()?)?;
         let hp = Hparams::read(&split)?;
         if hp.n_embd != ROW || hp.hc.streams != HC_STREAMS {

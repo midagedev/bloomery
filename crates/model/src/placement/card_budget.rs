@@ -11,3 +11,6 @@
 /// `BLOOMERY_CARD_BUDGET` lever's kind runs, and the fixture builder's byte
 /// flags.
 pub use bloomery_levers::parse_bytes as parse;
+
+/// Why [`parse`] refused a value: not a byte count, or one past `u64`.
+pub use bloomery_levers::BytesError;

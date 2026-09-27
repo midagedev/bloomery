@@ -468,23 +468,22 @@ fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
 
 /// `group`, `BLOOMERY_PREFILL_GROUP` — the batches a group holds; 1 runs each
 /// batch alone, every layer of it before the next batch's first — refused by
-/// name unless it is from 1 to [`GROUP_MAX`], the range the lever's kind in the
-/// registry takes too.
-pub(super) fn check_group(group: usize) -> Result<usize, GpuError> {
+/// name, with its value, unless it is from 1 to [`GROUP_MAX`].
+pub(super) fn check_group(group: usize) -> Result<(), GpuError> {
     if (1..=GROUP_MAX).contains(&group) {
-        Ok(group)
+        Ok(())
     } else {
-        Err(GpuError::State {
+        Err(GpuError::Shape {
             what: "BLOOMERY_PREFILL_GROUP",
-            missing: "a whole number of batches from 1 to 8",
+            detail: format!("{group} batches, where a group holds 1 to {GROUP_MAX}"),
         })
     }
 }
 
-/// The largest `BLOOMERY_PREFILL_GROUP`.
-const GROUP_MAX: usize = 8;
-// The refusal names the range.
-const _: () = assert!(GROUP_MAX == 8);
+/// The largest `BLOOMERY_PREFILL_GROUP`: the lever registry's, the most its
+/// row's kind takes.
+const GROUP_MAX: usize = bloomery_levers::PREFILL_GROUP_MAX as usize;
+const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
 
 /// Batches a group holds at most under a lever of `g`: `g`, and one more
 /// from 2 on — a call's lone last batch joins the group before it

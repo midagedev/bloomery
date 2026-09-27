@@ -50,6 +50,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_serve_levers.rs"]
+mod serve_levers;
+
+#[cfg(feature = "deepseek41")]
 mod soak {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Write};
@@ -1286,7 +1290,9 @@ mod soak {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main()?;
+        // The server starts with this process's environment: a lever it
+        // would refuse is refused here first.
+        let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
         let hot = place.hot.as_ref().map(HotList::path);

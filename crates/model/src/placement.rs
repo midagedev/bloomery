@@ -1238,8 +1238,13 @@ fn footprint(
 /// is neither: the id prefix, and each card's own usable bytes.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
+    /// The hot list `BLOOMERY_HOT_LIST` names, read and checked; `None`
+    /// unset: each routed layer's card keeps the id prefix `[0, n_l)`.
     pub hot: Option<HotList>,
-    pub card_budget: Option<u64>,
+    /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: every card of
+    /// the plan plans with `min(usable, budget)`; `None` unset, each card's
+    /// own usable bytes.
+    pub card_budget_bytes: Option<u64>,
 }
 
 impl PlanLevers {
@@ -1248,7 +1253,7 @@ impl PlanLevers {
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
         Ok(PlanLevers {
             hot: levers.hot_list().map(HotList::read).transpose()?,
-            card_budget: levers.card_budget(),
+            card_budget_bytes: levers.card_budget_bytes(),
         })
     }
 }
@@ -1268,7 +1273,7 @@ pub fn plan<'a>(
         ctx_max,
         kv,
         levers.hot.as_ref(),
-        levers.card_budget,
+        levers.card_budget_bytes,
     )
 }
 
