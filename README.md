@@ -9,7 +9,7 @@
 
 Hybrid GPU + CPU inference for mixture-of-experts models, written in Rust down to the CUDA kernels.
 
-bloomery runs MoE models that do not fit on one GPU. Each routed layer keeps as many experts on the card as fit; the rest run on the CPU in the same decode step. The host code is Rust, the GPU kernels are Rust compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide), and the CPU expert kernels are AVX2 Rust. How the kernels use cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). It targets one workstation: an Ampere GPU, an eight-channel AVX2 CPU and 256 GB of RAM.
+bloomery runs MoE models that do not fit on one GPU. Each routed layer keeps as many experts on the card as fit; the rest run on the CPU in the same decode step. The host code is Rust, the GPU kernels are Rust compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide), and the CPU expert kernels are AVX2 Rust. How the kernels use cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). It is built for an Ampere GPU, an AVX2 CPU with eight memory channels, and 256 GB of RAM.
 
 ## Models
 
@@ -41,7 +41,7 @@ In progress: batched prompts for GLM-5.3 and Qwen3.8; GLM-5.3's sparse-attention
 
 ## Measured numbers
 
-Single stream, on one RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), in a 32-core AVX2 workstation. Decode rows generate `n = 96` tokens. Arms are alternated in one window and ratios are taken only within a window. Every row comes from the runners in `tools/ref/` under the quiet-machine protocol; the command lines are in [rig-log](https://github.com/midagedev/rig-log).
+Single stream, on one RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), with a 32-core AVX2 CPU. Decode rows generate `n = 96` tokens. Arms are alternated in one window and ratios are taken only within a window. Every row comes from the runners in `tools/ref/` under the quiet-machine protocol; the command lines are in [rig-log](https://github.com/midagedev/rig-log).
 
 **The llama.cpp rows from 2026-09-28 are provisional.** In that sitting llama.cpp ran through `llama-bench`, which feeds new random ids each repetition, so several of its rows read weights or n-gram rows cold (the captions say which). Its V4.1 prompt rows ran with op offload off (`-nopo 1`) only, and its Qwen3.8 rows at the default only, so they may not be its fastest setting. Our rows from that sitting carry a `[cpu-busy]` tag that counted our own process, a runner defect. All of these are re-measured warm, with both engines on the same token ids and llama.cpp at its fastest flags; the conditions are in [`docs/fair-measure.md`](docs/fair-measure.md).
 
@@ -161,7 +161,7 @@ The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels,
 
 ## Limits
 
-- **sm_86 only**, and one machine: the tooling (`tools/box.sh`) assumes a Mac editor and that workstation.
+- **sm_86 only.** The tooling (`tools/box.sh`) assumes our development setup; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
 - **V4.1 prompts are bound by the CPU expert tier**: about 69 of 74 ms per layer-batch at 4096 tokens is host experts. The server reuses a cached prompt prefix.
 - **GLM-5.3** stops at 2,051 positions and has no batched prompt; **Qwen3.8** runs all routed experts on the CPU.
