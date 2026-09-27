@@ -10,6 +10,7 @@
 #   just depth-gpu-ds41 512 ikpp:512 lcpppp:512 4096 ikpp:4096 lcpppp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512   # engine blocks
+#   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512 lcppfit:6 lcppppfit:512
 #   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines and row from a saved generate_ds41 output
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
@@ -47,6 +48,11 @@
 #   lcpppp:<P>  mainline's prefill, the same at $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
 #   ikpp<U>:<P>, lcpppp<U>:<P>  the same with -ub U -b max(U, 2048): the ubatch lever, not a default
 #            (Prefill below). Refused when the profile's flags already name -ub or -b.
+#   lcppfit:<D>, lcppppfit[<U>]:<P>  mainline at its own placement: the lcpp:<D> and lcpppp[<U>]:<P>
+#            arms' command lines with the profile's placement options (-ngl, --n-cpu-moe, -ts, -ot)
+#            removed and `-fitt 1024 -v` added, so llama-bench's fit chooses the layers and the
+#            overrides (Fit below). The row carries `fit <what it chose>`; refused before the lease when
+#            the tree's llama-bench has no --fit-target, or when the profile's flags carry a fit option.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`.
@@ -97,6 +103,24 @@
 # Mainline places by the same rule (--n-cpu-moe), so an lcpp row has ik's shape; the profile sizes
 # both counts for MODEL (IK_NCMOE and LCPP_NCMOE, one arithmetic — the two engines place
 # the same tensors on the card), so the two references hold the same layers on the card.
+# Fit. The lcppfit arms leave the placement to llama-bench's fit (tools/ref/lcpp-fit.sh has what it
+# does and where): every layer's dense part on the card, then whole layers' experts front to back, then
+# part of one more layer (its up, then its gate projection), the rest of the experts on the host — the
+# last layers', where --n-cpu-moe K's are the first K. -fitt 1024 is the margin llama.cpp's `-fit on`
+# leaves (common/common.h:481). Predicted on this file and the A6000 [derived, from the profile's
+# LCPP_NCMOE bytes and the fit's rule, up and gate taken as Q3_K beside the Q4_K down; the card's free
+# memory and the compute buffer not measured]: 47,568 MiB to fill (49,140 less the driver's 548 and the
+# 1,024 margin), less 3,429 MiB of card dense and a compute buffer the hand-set load leaves at most
+# ~2,000 MiB for, leaves 42,100-43,700 MiB for experts. Layers 0-1 (6,682.5 MiB each) and 2-5 (6,142.5)
+# whole are 37,935 MiB; a seventh whole layer (44,077.5) does not fit, its up and gate (about 3,713)
+# do: layers 0-5 whole, layer 6's down and layers 7-39 on the host, 41,648 MiB of experts on the card
+# against --n-cpu-moe 33's 42,997.5. The host then reads 205,133 MiB of experts against 203,783 (+0.7 %),
+# so a lcppfit row predicts at or up to about 1 % below its lcpp twin, inside the ruler at three rounds.
+# Not in that figure: the partial layer's pattern is by name (blk.6.ffn_down.* for the gate fraction),
+# so it also moves that layer's shared-expert down, a dense tensor every token uses, to the host — a
+# host op and a split in layer 6 that --n-cpu-moe never makes (the `fit` column's `(blk 6: <k>)`).
+# The row's `fit` column is the measured placement (predicted `overridden CPU:<n> in blk 6-39 (blk 6:
+# <k>)`), and every arm records its own: n_ctx (the KV cache) and -ub (the compute buffer) enter the fit.
 #
 # Paging. The file (about 347 GB) is larger than the page cache can grow (Cached peaks near 262 GB
 # in the witness blocks), and the engines' host expert sets differ: ours is experts n_l.. of every
@@ -121,9 +145,10 @@
 # load, before its timer; preheating that too would evict the host set it is meant to keep: at
 # K = 33 the host set and the card set are 262.8 GB together [derived], more than the file cache holds.
 # Flags whose host set this rule does not model (-ot, --override-tensor,
-# -cmoe, --cpu-moe, a list for --n-cpu-moe, -ngl below the block count + 1) are refused before the
-# lease. BLOOMERY_PREHEAT=0 turns the preheat off (the same-lease A/B of it); any value but 0 or 1 is
-# refused. Its default follows the order: 1 under rotate, 0 under blocks. Under blocks the block's
+# -cmoe, --cpu-moe, -fitt, --fit-target, a list for --n-cpu-moe, -ngl below the block count + 1) are
+# refused before the lease — so a fit arm runs under BLOOMERY_AB_ORDER=blocks (its block's discard reads
+# its set) or with BLOOMERY_PREHEAT=0. BLOOMERY_PREHEAT=0 turns the preheat off (the same-lease A/B of
+# it); any value but 0 or 1 is refused. Its default follows the order: 1 under rotate, 0 under blocks. Under blocks the block's
 # discard process has just read the host set through the same mapping, with no other engine between it
 # and the block's arms: at -nopo 1 a prompt runs the host layers' experts on the host, and a 4096-token
 # prompt leaves a host layer's expert unread with probability (1 - 6/384)^4096 < e^-64 [derived]. The
@@ -226,6 +251,13 @@
 #   lcpp         every mainline arm, lcpp, lcpp<K>, lcpppp and lcpppp<U>: one binary and one token
 #                stream; a sweep value only moves whole layers between the card and the host, and
 #                every K reads the same non-lazy bytes of the file
+#   lcppfit      every fit arm, lcppfit, lcppppfit and lcppppfit<U>: the same binary, but the fit's
+#                host set is the last layers' experts and --n-cpu-moe K's the first K layers', so in
+#                one block with the lcpp arms the discard would read neither and their union is nearly
+#                every expert [derived]. The fit arms of a block place alike but for the partial layer
+#                (n_ctx moves the KV cache by 40 KiB a position, a layer's experts are 6,142.5 MiB;
+#                -ub moves the compute buffer), so the discard's set covers the others' but for that
+#                layer, and a row's `timed` count shows what it missed
 #   ik           every ik arm, ik, ikpp and ikpp<U>
 # Same-binary lever arms stay interleaved inside their block. Rotation across engines is dropped here:
 # what it guards is the position bias inside a round, 0.3-0.8 % for a round's first arm (AGENTS.md,
@@ -374,6 +406,9 @@ fi
 # engines open one file.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# The fit arms' flags, probe and column (lcppfit, lcppppfit[<U>]).
+# shellcheck source=tools/ref/lcpp-fit.sh
+source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 [ "$MODEL_NAME" = deepseek41 ] || {
   echo "depth-ds41.sh: the profile is $MODEL_NAME — pick deepseek41 on the Mac side (BLOOMERY_MODEL=deepseek41)" >&2
   exit 64
@@ -415,7 +450,7 @@ counted() { [ "$ROW_TAG" = ROW ]; }
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
 # ours: an arm runs this tree's generate_ds41; gen: an arm runs a generate_ds41 (ours, corpus or bin).
-ours=0 gen=0 ik=0 lcpp=0
+ours=0 gen=0 ik=0 lcpp=0 lcppfit=0
 # Per arm, by its index in ARMS: the kind (ours, corpus, ref or bin), the depth, the row label, the
 # reference engine (ref; the corpus name for a corpus arm), the binary (ours, corpus and bin) and the
 # NAME=VALUE list (comma-separated).
@@ -426,11 +461,12 @@ A_TOK=()
 # id count is read once, into CORPUS_N_<name>, when an arm names it.
 CORPORA="prose code"
 corpus_file() { echo "${BLOOMERY_DATA:-}/engram/corpus-$1.ids"; }
-# A prefill arm's engine (ikpp[<U>], lcpppp[<U>]), and its ubatch lever U (empty: the default).
+# A prefill arm's engine (ikpp[<U>], lcpppp[<U>], lcppppfit[<U>]), and its ubatch lever U (empty: the
+# default).
 pp_eng() { case $1 in ikpp* | lcpppp*) return 0 ;; *) return 1 ;; esac; }
-pp_ub() { local u=${1#ikpp}; echo "${u#lcpppp}"; }
+pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; echo "${u#fit}"; }
 arm_usage() {
-  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
 }
 # arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
@@ -486,6 +522,10 @@ for a in "${ARMS[@]}"; do
         lcpp | lcpp[0-9] | lcpp[0-9][0-9]) lcpp=1 ;;
         ikpp | ikpp[1-9]*) ik=1 ;;
         lcpppp | lcpppp[1-9]*) lcpp=1 ;;
+        lcppfit | lcppppfit | lcppppfit[1-9]*)
+          lcpp=1 lcppfit=1
+          lcpp_fit_flags "$LCPP_GPU_FLAGS" || { echo "depth-ds41.sh: arm '$a': $FIT_WHY" >&2; exit 64; }
+          ;;
         *) arm_usage "$a" ;;
       esac
       label=$eng
@@ -556,6 +596,10 @@ if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?;
 # A bin:<path> arm's binary is checked where its tree line is taken, below.
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-ds41.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-ds41.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
+if [ "$lcppfit" = 1 ]; then
+  # shellcheck disable=SC2153 # LCPP is the profile's, as below
+  lcpp_fit_probe "$LCPPBIN" || { echo "depth-ds41.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
+fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
 # status` from rewriting the index of a tree this root process does not own. A tree box.sh synced
@@ -604,7 +648,9 @@ WITNESS=(head-open indent card busiest model mem pgmajfault)
 # decode twin's binary, flags and environment with -p P -n 0 in place of the decode test. REF_K, when
 # set, is the --n-cpu-moe every engine runs at instead (a block's discard, the header's Discard). An
 # lcpp arm also gets --progress, and REF_MARK is the ERE of the progress line its measured window
-# starts at (the header's Cold tag); REF_MARK is empty for ik, whose llama-bench has no --progress.
+# starts at (the header's Cold tag); REF_MARK is empty for ik, whose llama-bench has no --progress. A
+# fit arm's flags are lcpp_fit_flags' rewrite, taken after REF_K (which would add --n-cpu-moe back), and
+# REF_FIT says so for the dry run.
 REF_K=
 # with_ncmoe <flags> <K>: the flags with their --n-cpu-moe value replaced by K.
 with_ncmoe() {
@@ -614,7 +660,7 @@ with_ncmoe() {
 }
 ref_cmd() {
   local eng=$1 dep=$2 flags ub reps=(-r 1)
-  REF_ENV=() REF_BATCH='' REF_MARK=''
+  REF_ENV=() REF_BATCH='' REF_MARK='' REF_FIT=''
   case $eng in
     ik | ikpp*)
       # shellcheck disable=SC2206
@@ -629,6 +675,11 @@ ref_cmd() {
       ;;
   esac
   [ -z "$REF_K" ] || flags=$(with_ncmoe "$flags" "$REF_K")
+  if lcpp_fit_eng "$eng"; then
+    lcpp_fit_flags "$flags"
+    flags=$FIT_FLAGS
+    REF_FIT="placement: llama-bench's fit at -fitt $LCPP_FIT_TARGET MiB (dropped: $FIT_DROPPED), -v for the fit column"
+  fi
   case $eng in
     ikpp* | lcpppp*)
       ub=$(pp_ub "$eng")
@@ -665,7 +716,7 @@ ph_k() {
   local w prev='' k=0 ngl=''
   for w in "${REF_ARGS[@]}"; do
     case $w in
-      -ot | --override-tensor | --override-tensor=* | -cmoe | --cpu-moe)
+      -ot | --override-tensor | --override-tensor=* | -cmoe | --cpu-moe | -fitt | --fit-target)
         echo "depth-ds41.sh: arm '$1': its flags carry $w, a host set the preheat does not model; set BLOOMERY_PREHEAT=0 to run it unpreheated" >&2
         exit 64
         ;;
@@ -710,7 +761,7 @@ ph_bytes() {
 # arm_block <i>: the block arm <i> belongs to.
 arm_block() {
   case ${A_KIND[$1]} in
-    ref) case ${A_ENG[$1]} in ik | ikpp*) echo ik ;; *) echo lcpp ;; esac ;;
+    ref) case ${A_ENG[$1]} in ik | ikpp*) echo ik ;; lcppfit | lcppppfit*) echo lcppfit ;; *) echo lcpp ;; esac ;;
     ours) echo ours ;;
     corpus) echo "${A_ENG[$1]}" ;;
     *) echo "${A_LABEL[$1]}" ;;
@@ -844,7 +895,8 @@ preheat_arm() {
 # start is known.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags markf mark whole
+  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags markf mark whole fitsrc
+  FIT_COL=''
   ref_cmd "$eng" "$dep"
   if pp_eng "$eng"; then key=p=$dep; else key=d=$dep; fi
   if [ -n "$PH_DIR" ]; then
@@ -880,6 +932,12 @@ $(tail -n 40 "$errf" 2>/dev/null)"
   else
     val=$(echo "$raw" | grep -F "$REF_LABEL" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
   fi
+  # A fit arm's loader lines (stderr: the errf file for a pp arm) say what the fit chose; a fit that
+  # failed or never ran is a FAIL row, whatever llama-bench measured after it.
+  if lcpp_fit_eng "$eng"; then
+    if pp_eng "$eng"; then fitsrc=$(cat "$errf" 2> /dev/null); else fitsrc=$raw; fi
+    lcpp_fit_col "$fitsrc" || { arm_fail "$r" "$eng" "$key" "$rc" "$FIT_WHY" "$fitsrc"; return 0; }
+  fi
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
     arm_fail "$r" "$eng" "$key" "$rc" "no '${REF_LABEL% |}' row" "$raw"
     return 0
@@ -903,19 +961,21 @@ $(tail -n 40 "$errf" 2>/dev/null)"
   if pp_eng "$eng"; then
     # The json's settings, samples dropped: the same "which flags took" as the md table.
     echo "$raw" | jq -c '.[0] | del(.samples_ns, .samples_ts)' | sed "s/^/    $eng params /"
+    [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $eng fit /"
     build=$(echo "$raw" | jq -r '.[0] | "\(.build_commit) (\(.build_number))"')
     dev=$(echo "$raw" | jq -r '.[0].gpu_info')
   else
     echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
+    [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $eng fit /"
     build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
     dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
   fi
   if pp_eng "$eng"; then
-    echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$tags"
+    echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$tags"
     counted || return 0
     pp_sums+=("$eng|$dep|$r|$val|$tags")
   else
-    echo "$ROW_TAG r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$tags"
+    echo "$ROW_TAG r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$tags"
     counted || return 0
     sums+=("$eng|$dep|$r|$val||$tags")
   fi
@@ -1087,7 +1147,7 @@ dry_cmd() {
   local i=$1 dep=${A_DEP[$1]} note='' feedline var
   if [ "${A_KIND[$i]}" = ref ]; then
     ref_cmd "${A_ENG[$i]}" "$dep"
-    echo "timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_MARK:+, measured window from /${REF_MARK}/}"
+    echo "timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_MARK:+, measured window from /${REF_MARK}/}${REF_FIT:+, $REF_FIT}"
     return
   fi
   if lg_grouped "$i"; then
@@ -1227,6 +1287,10 @@ for b in "${!BLK_KEY[@]}"; do echo "[config] block $(block_line "$b")"; done
 echo "[config] cold tag: majflt in the row's measured window (ours: from its fed line; lcpp: from its --progress line; ik: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
+if [ "$lcppfit" = 1 ]; then
+  lcpp_fit_flags "$LCPP_GPU_FLAGS"
+  echo "[config] lcppfit: $LCPPBIN flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcppfit and lcppppfit get --progress as lcpp and lcpppp do)"
+fi
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"

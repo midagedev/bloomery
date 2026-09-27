@@ -145,6 +145,14 @@ if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${lg##*$'\n'}"
+# lcpp-fit.sh builds the depth runners' llama.cpp fit arms and reads what the fit chose: its flag
+# rewrite, its --help probe (stub binaries) and its column (fixture output) are tested here, no box.
+if ! lf=$(bash "$(dirname "$0")/ref/lcpp-fit.sh" --self-test 2>&1); then
+  echo "$lf" >&2
+  echo "check-recipes: the lcpp-fit self-test failed" >&2
+  exit 1
+fi
+echo "${lf##*$'\n'}"
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then

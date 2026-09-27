@@ -71,6 +71,13 @@
 #   lcpppp:<P> mainline's prefill: llama-bench -p P -n 0 -r 1 $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
 #   ikpp<U>:<P>, lcpppp<U>:<P>  the same with -ub U -b max(U, 2048): the ubatch lever, not a default
 #             (Prefill below). Refused when the profile's flags already name -ub or -b.
+#   lcppfit:<D>, lcppppfit[<U>]:<P>  mainline at its own placement: the lcpp:<D> and lcpppp[<U>]:<P>
+#             arms' command lines with the profile's placement options (-ngl, --n-cpu-moe, -ts, -ot)
+#             removed and `-fitt 1024 -v` added, so llama-bench's fit chooses the layers and the
+#             overrides (tools/ref/lcpp-fit.sh has what the fit does and where). The row carries `fit
+#             <what it chose>` from -v's loader lines, which are echoed as `lcppfit fit …`; a fit that
+#             failed or never ran ends the runner as a failed arm does. Refused before the lease when
+#             the tree's llama-bench has no --fit-target, or when the profile's flags carry a fit option.
 #   mrspp:<P> mistral.rs's prefill: mistralrs bench -f <MODEL> --prompt-len P --gen-len 1
 #             --iterations 1 --warmup 1 --max-seq-len C --pa-context-len C+32 $MRS_FLAGS, C = P + 1
 #             rounded up to 256 (or BLOOMERY_GEN_CTX): a gen length below 2 skips the decode case,
@@ -122,6 +129,11 @@
 #         threads, as above); -b, -ub (the untimed prefill); -ctk/-ctv (as above). Mainline has
 #         no fused-MoE or merge flag: CUDA graphs and op fusion are build options, on in this
 #         build (GGML_CUDA_GRAPHS=ON in the tree's CMakeCache.txt).
+#   lcppfit  the lcpp flags less -ngl, then -fitt 1024 (the margin llama.cpp's `-fit on` leaves) and
+#         -v. The file is well under the card's free memory, so the fit returns at its first check
+#         with every layer on the card (common/fit.cpp:354, n_gpu_layers -1 = all, src/llama-model.cpp:1926):
+#         the lcpp placement, and a lcppfit row predicts the lcpp row's value within the ruler [derived];
+#         its `fit` column is the check (`overridden none`, every layer offloaded).
 #   mrs   --format gguf  the file's format, spelled out (the suffix would pick it)
 #         left out: a subcommand (bench's own options take the model; `auto` is the default path);
 #         -n/--device-layers and --topology (one visible card, automatic mapping puts every layer
@@ -208,17 +220,21 @@ case $GEN_CTX in
 esac
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6 lcpp:6)
-ours=0 ik=0 lcpp=0 mrs=0
+ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0
 # Per arm, by its index in ARMS: the kind (ours, ref or bin), the depth, the row label and the binary
 # (ours and bin).
 A_KIND=() A_DEP=() A_LABEL=() A_BIN=()
 arm_usage() {
-  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, mrspp:<P> or bin:<path>:<D>" >&2
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P> or bin:<path>:<D>" >&2
   exit 64
 }
-# A prefill arm's engine (ikpp[<U>], lcpppp[<U>], mrspp), and its ubatch lever U (empty: the default).
+# A prefill arm's engine (ikpp[<U>], lcpppp[<U>], lcppppfit[<U>], mrspp), and its ubatch lever U (empty:
+# the default).
 pp_eng() { case $1 in ikpp* | lcpppp* | mrspp) return 0 ;; *) return 1 ;; esac; }
-pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; echo "${u#mrspp}"; }
+pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; u=${u#fit}; echo "${u#mrspp}"; }
+# The fit arms' flags, probe and column (lcppfit, lcppppfit[<U>]).
+# shellcheck source=tools/ref/lcpp-fit.sh
+source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 for a in "${ARMS[@]}"; do
   kind=ref eng=${a%%:*} dep=${a#*:} label='' bin=''
   case $a in
@@ -234,6 +250,10 @@ for a in "${ARMS[@]}"; do
       case $eng in
         ik | ikdef | ikpp | ikpp[1-9]*) ik=1 ;;
         lcpp | lcpppp | lcpppp[1-9]*) lcpp=1 ;;
+        lcppfit | lcppppfit | lcppppfit[1-9]*)
+          lcpp=1 lcppfit=1
+          lcpp_fit_flags "$LCPP_GPU_FLAGS" || { echo "depth-qwen3moe.sh: arm '$a': $FIT_WHY" >&2; exit 64; }
+          ;;
         mrs | mrspa0 | mrspp) mrs=1 ;;
         *) arm_usage "$a" ;;
       esac
@@ -296,6 +316,10 @@ if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?;
 # A bin:<path> arm's binary is checked where its tree line is taken, below.
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
+if [ "$lcppfit" = 1 ]; then
+  # shellcheck disable=SC2153 # LCPP is the profile's, as below
+  lcpp_fit_probe "$LCPPBIN" || { echo "depth-qwen3moe.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
+fi
 if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
@@ -363,10 +387,11 @@ guard_timing() {
 # ref_cmd <engine> <depth or prompt length>: the reference arm's binary, arguments and row label,
 # into REF_BIN, REF_ARGS and REF_LABEL, and for a prefill arm the batch sizes its row names into
 # REF_BATCH. The flags are word-split on purpose: the profile keeps them as one string. A prefill
-# arm is its decode twin's binary and flags with the prompt test in place of the decode test.
+# arm is its decode twin's binary and flags with the prompt test in place of the decode test. A fit
+# arm's flags are lcpp_fit_flags' rewrite of LCPP_GPU_FLAGS, and REF_FIT says so for the dry run.
 ref_cmd() {
   local eng=$1 dep=$2 flags ctx ub
-  REF_BATCH=
+  REF_BATCH='' REF_FIT=''
   case $eng in
     ik | ikdef)
       REF_BIN=$IKBIN flags=$IK_GPU_FLAGS
@@ -375,9 +400,14 @@ ref_cmd() {
       # shellcheck disable=SC2206
       REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
       ;;
-    lcpp)
+    lcpp | lcppfit)
       REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS
       if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi
+      if [ "$eng" = lcppfit ]; then
+        lcpp_fit_flags "$flags"
+        flags=$FIT_FLAGS
+        REF_FIT="placement: llama-bench's fit at -fitt $LCPP_FIT_TARGET MiB (dropped: $FIT_DROPPED), -v for the fit column"
+      fi
       # shellcheck disable=SC2206
       REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
       ;;
@@ -386,6 +416,11 @@ ref_cmd() {
         ikpp*) REF_BIN=$IKBIN flags=$IK_GPU_FLAGS ;;
         *) REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS ;;
       esac
+      if lcpp_fit_eng "$eng"; then
+        lcpp_fit_flags "$flags"
+        flags=$FIT_FLAGS
+        REF_FIT="placement: llama-bench's fit at -fitt $LCPP_FIT_TARGET MiB (dropped: $FIT_DROPPED), -v for the fit column"
+      fi
       ub=$(pp_ub "$eng")
       REF_ARGS=(-p "$dep" -n 0) REF_LABEL="pp$dep |" REF_BATCH="ub 512 b 2048 (llama-bench defaults)"
       if [ -n "$ub" ]; then
@@ -430,6 +465,7 @@ ref_val() {
 # ref_arm <engine> <depth> <round>
 ref_arm() {
   local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 fail
+  FIT_COL=''
   ref_cmd "$eng" "$dep"
   witness "pre r$r $eng d=$dep"
   ref_witness
@@ -439,6 +475,14 @@ ref_arm() {
   t1=$(date +%s)
   witness "post r$r $eng d=$dep"
   val=$(echo "$raw" | ref_val "$eng" "$REF_LABEL")
+  # A fit arm's loader lines say what the fit chose; a fit that failed or never ran is a failed arm,
+  # whatever llama-bench measured after it.
+  if lcpp_fit_eng "$eng" && ! lcpp_fit_col "$raw"; then
+    fail=${TMPDIR:-/tmp}/depth-qwen3moe-$eng-d$dep-r$r.log
+    echo "$raw" > "$fail"
+    echo "r$r $eng d=$dep: $FIT_WHY (rc $rc); full output: $fail" >&2
+    exit 1
+  fi
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
     # The whole output goes to a file: the loader's reason for a failed load is many lines
     # above the tail.
@@ -462,15 +506,16 @@ ref_arm() {
       # The reference's own table, header and row: its columns name every setting it ran with that
       # differs from its defaults, so the log shows which flags took.
       echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
+      [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $eng fit /"
       build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
       dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
       ;;
   esac
   if pp_eng "$eng"; then
-    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
     pp_sums+=("$eng|$dep|$r|$val|$OTHER_BUSY_TAG")
   else
-    echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+    echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
     sums+=("$eng|$dep|$r|$val|")
   fi
   count_row
@@ -654,7 +699,7 @@ if [ -n "$DRY" ]; then
     dep=${A_DEP[$i]}
     if [ "${A_KIND[$i]}" = ref ]; then
       ref_cmd "${a%%:*}" "$dep"
-      echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
+      echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_FIT:+, $REF_FIT}"
     else
       ctx=$(arm_ctx "$i")
       note=''
@@ -680,6 +725,10 @@ echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
 # Each engine's line only when it has arms: a profile names only the engines it runs (qwen35moe.sh).
 [ "$ik" = 0 ] || echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
 [ "$lcpp" = 0 ] || echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS"
+if [ "$lcppfit" = 1 ]; then
+  lcpp_fit_flags "$LCPP_GPU_FLAGS"
+  echo "[config] lcppfit: $LCPPBIN flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcppppfit<U>: -ub U -b max(U, 2048))"
+fi
 [ "$mrs" = 0 ] || echo "[config] mrs: $MRSBIN flags=$MRS_FLAGS (mrs: --pa-context-len C, mrspa0: --paged-attn off)"
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
