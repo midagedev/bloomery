@@ -2185,6 +2185,17 @@ impl RouterKernels {
 /// non-finite value among its `ROWS` logits raises [`FaultSite::Router`],
 /// gets NaN probabilities and NaN weights in all `N_SLOTS` slots, and keeps
 /// its ids.
+///
+/// A second instance of the same bodies serves Qwen3.8, whose router reads
+/// the hyper-connection mix with no norm in front of it:
+/// [`N_EXPERT_512`](gated::N_EXPERT_512) experts, the top
+/// [`N_USED_512`](gated::N_USED_512), the shared expert as row
+/// [`SHARED_512`](gated::SHARED_512). Its entries are
+/// `qwen35moe_router_fused_512`, `qwen35moe_router_logits_512` and
+/// `qwen35moe_router_route_512` — the unsuffixed entries' contracts at
+/// [`ROWS_512`](gated::ROWS_512) rows and [`N_SLOTS_512`](gated::N_SLOTS_512)
+/// slots, into a [`RouterOut512`](gated::RouterOut512) — with no norm-fused
+/// entry at that width.
 pub mod gated {
     use super::{
         FUSED_THREADS_U32, FUSED_WARPS, LINE, LOGITS_THREADS_U32, LOGITS_TOKENS, MAX_TOKENS,
@@ -2223,6 +2234,35 @@ pub mod gated {
     const _: () = assert!(NORM_K / 128 <= ROWS);
     // A slot id is a u32 and every slot of a ubatch fits one route table.
     const _: () = assert!(ROWS <= u32::MAX as usize && UBATCH_TOKENS * N_SLOTS <= GEMM_MAX_SLOTS);
+
+    /// Experts the wide instance softmaxes over (Qwen3.8's `expert_count`).
+    pub const N_EXPERT_512: usize = 512;
+    /// The wide instance's routed slots per token (`expert_used_count`).
+    pub const N_USED_512: usize = 10;
+    /// The wide instance's slots per token: the routed ones, then the shared
+    /// expert's.
+    pub const N_SLOTS_512: usize = N_USED_512 + 1;
+    /// The wide instance's shared expert id and gate row.
+    pub const SHARED_512: usize = N_EXPERT_512;
+    /// Rows of the wide instance's joined router weight, and logits per
+    /// token.
+    pub const ROWS_512: usize = N_EXPERT_512 + 1;
+    /// Tokens a wide ubatch routing may hold: every slot of them fits one
+    /// GEMM route table.
+    pub const UBATCH_TOKENS_512: usize = GEMM_MAX_SLOTS / N_SLOTS_512;
+    /// Experts each lane of a wide routing warp owns: `lane + 32 j`.
+    const PER_LANE_512: usize = N_EXPERT_512 / 32;
+
+    // Each lane's taken experts are the bits of one u32, one per `j`.
+    const _: () = assert!(PER_LANE_512 * 32 == N_EXPERT_512 && PER_LANE_512 <= 32);
+    // Every routed slot has an expert to take.
+    const _: () = assert!(N_USED_512 >= 1 && N_USED_512 <= 32 * PER_LANE_512);
+    const _: () =
+        assert!(ROWS_512 <= u32::MAX as usize && UBATCH_TOKENS_512 * N_SLOTS_512 <= GEMM_MAX_SLOTS);
+    // The fused and routing entries' static shared memory fits the 48 KiB a
+    // block may declare: `P` and `SLOT_P` for eight tokens, and the ticket.
+    const _: () = assert!((MAX_TOKENS * (N_EXPERT_512 + N_USED_512) + 1) * 4 <= 48 * 1024);
+    const _: () = assert!(FUSED_WARPS * (N_EXPERT_512 + N_USED_512) * 4 <= 48 * 1024);
 
     #[cuda_module]
     mod qwen35moe_router_kernels {
@@ -2480,6 +2520,158 @@ pub mod gated {
                 );
             }
         }
+
+        /// `qwen35moe_router_fused` at the wide instance: `w` [`ROWS_512`]
+        /// rows of `k` f32; writes `logits[t·ROWS_512 + r]`,
+        /// `probs[t·N_EXPERT_512 + e]`, `ids[t·N_SLOTS_512 + s]` and
+        /// `weights[t·N_SLOTS_512 + s]`. Grid [`ROWS_512`] blocks of 256.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                m_cols >= 1,
+                m_cols <= 8,
+                w.len() >= ROWS_512 * k,
+                x.len() >= m_cols * k,
+                logits.len() >= ROWS_512 * m_cols,
+                probs.len() >= N_EXPERT_512 * m_cols,
+                ids.len() >= N_SLOTS_512 * m_cols,
+                weights.len() >= N_SLOTS_512 * m_cols,
+                done.len() >= 1
+            )
+        )]
+        pub fn qwen35moe_router_fused_512(
+            w: &[f32],
+            x: &[f32],
+            k: u32,
+            m_cols: u32,
+            mut logits: DisjointSlice<f32>,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            mut done: DisjointSlice<u32>,
+            fault: FaultSink,
+        ) {
+            static mut P: SharedArray<f32, { MAX_TOKENS * N_EXPERT_512 }> = SharedArray::UNINIT;
+            static mut SLOT_P: SharedArray<f32, { MAX_TOKENS * N_USED_512 }> = SharedArray::UNINIT;
+            static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+            // SAFETY: LAST, P and SLOT_P are this block's own shared
+            // allocations (the raw form reaches each `static mut` without a
+            // reference), touched by nothing else; the grid is ROWS_512
+            // blocks of 256 (the launcher's), every thread arrives
+            // converged; 1 <= m_cols <= 8, the input and output lengths are
+            // the launch contract's, the launcher passes k a positive
+            // multiple of 32, and `done[0]` is zero before the launch.
+            unsafe {
+                gated_fused_body::<PER_LANE_512, N_USED_512>(
+                    w,
+                    x,
+                    k,
+                    m_cols,
+                    SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                    SharedArray::as_raw_mut_ptr(&raw mut P),
+                    SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
+                );
+            }
+        }
+
+        /// `qwen35moe_router_logits` at the wide instance: [`ROWS_512`]
+        /// rows, `⌈ROWS_512 / 32⌉` row blocks per 32 tokens. Writes
+        /// `logits[t·ROWS_512 + r]`. `k` a positive multiple of 64, `w` and
+        /// `x` 16-byte aligned (host-checked).
+        #[kernel]
+        #[launch_bounds(512)]
+        #[launch_contract(
+            domain = 1,
+            block = (512, 1, 1),
+            requires = (
+                n_tok >= 1,
+                w.len() >= ROWS_512 * k,
+                x.len() >= n_tok * k,
+                logits.len() >= ROWS_512 * n_tok
+            )
+        )]
+        pub fn qwen35moe_router_logits_512(
+            w: &[f32],
+            x: &[f32],
+            k: u32,
+            n_tok: u32,
+            mut logits: DisjointSlice<f32>,
+        ) {
+            static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+            // SAFETY: STAGE is this block's own 16-byte aligned shared
+            // allocation of STAGES · STAGE_FLOATS values (the raw form
+            // reaches the `static mut` without a reference); the block is 512
+            // wide and the grid the launcher's ⌈n_tok / 32⌉ · ⌈ROWS_512 /
+            // 32⌉; the launcher checks k and both alignments, and the lengths
+            // are the launch contract's.
+            unsafe {
+                logits_body::<ROWS_512>(
+                    w,
+                    x,
+                    k,
+                    n_tok,
+                    &mut logits,
+                    SharedArray::as_raw_mut_ptr(&raw mut STAGE),
+                );
+            }
+        }
+
+        /// `qwen35moe_router_route` at the wide instance: warp `w` of block
+        /// `b` routes token `8·b + w` from its [`ROWS_512`] logits and writes
+        /// its probabilities, ids and weights where
+        /// `qwen35moe_router_fused_512` writes a token's.
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                logits.len() >= ROWS_512 * n_tok,
+                probs.len() >= N_EXPERT_512 * n_tok,
+                ids.len() >= N_SLOTS_512 * n_tok,
+                weights.len() >= N_SLOTS_512 * n_tok
+            )
+        )]
+        pub fn qwen35moe_router_route_512(
+            logits: &[f32],
+            n_tok: u32,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            fault: FaultSink,
+        ) {
+            static mut P: SharedArray<f32, { FUSED_WARPS * N_EXPERT_512 }> = SharedArray::UNINIT;
+            static mut SLOT_P: SharedArray<f32, { FUSED_WARPS * N_USED_512 }> = SharedArray::UNINIT;
+            // SAFETY: P and SLOT_P are this block's own shared allocations of
+            // FUSED_WARPS tokens' entries (the raw form reaches each `static
+            // mut` without a reference); the block is 256 wide; the lengths
+            // are the launch contract's.
+            unsafe {
+                gated_route_body::<PER_LANE_512, N_USED_512>(
+                    logits,
+                    n_tok,
+                    SharedArray::as_raw_mut_ptr(&raw mut P),
+                    SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    fault,
+                );
+            }
+        }
     }
 
     /// The gated router's shape: [`ROWS`] logits and [`N_EXPERT`]
@@ -2499,21 +2691,39 @@ pub mod gated {
     /// The gated router's buffers ([`RouterKernels`]).
     pub type RouterOut = RouterBufs<Gated>;
 
-    /// Err unless `w` is a joined router weight of [`ROWS`] rows whose
-    /// width is a positive multiple of `unit` (and at most `most`): its
-    /// width.
+    /// The wide instance's shape: [`ROWS_512`] logits and [`N_EXPERT_512`]
+    /// probabilities a token, [`N_SLOTS_512`] slots a token, ubatches of up
+    /// to [`UBATCH_TOKENS_512`] tokens.
+    pub struct Gated512;
+
+    impl RouterShape for Gated512 {
+        const LOGITS: usize = ROWS_512;
+        const PROBS: usize = N_EXPERT_512;
+        const SLOTS: usize = N_SLOTS_512;
+        const UBATCH: usize = UBATCH_TOKENS_512;
+        const WITH_TOKENS: &'static str = "qwen3moe::router::gated::RouterOut512::with_tokens";
+        const FOR_UBATCH: &'static str = "qwen3moe::router::gated::RouterOut512::for_ubatch";
+    }
+
+    /// The wide instance's buffers (the `_512` launchers of
+    /// [`RouterKernels`]).
+    pub type RouterOut512 = RouterBufs<Gated512>;
+
+    /// Err unless `w` is a joined router weight of `rows` rows whose width
+    /// is a positive multiple of `unit` (and at most `most`): its width.
     fn router_width(
         what: &'static str,
         w: &DeviceTensor<f32>,
+        rows: usize,
         unit: usize,
         most: usize,
     ) -> Result<usize, GpuError> {
         let k = w.cols();
-        if w.rows() != ROWS || k == 0 || !k.is_multiple_of(unit) || k > most {
+        if w.rows() != rows || k == 0 || !k.is_multiple_of(unit) || k > most {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "router weight is {} x {k}, want {ROWS} rows of a positive multiple of {unit} \
+                    "router weight is {} x {k}, want {rows} rows of a positive multiple of {unit} \
                      up to {most}",
                     w.rows()
                 ),
@@ -2522,8 +2732,94 @@ pub mod gated {
         Ok(k)
     }
 
-    /// The loaded gated router module. Owns no stream: each enqueue takes
-    /// the engine stream.
+    /// A fused launch's `(k, m, grid)` for `m` tokens of `x` through `w`
+    /// into `out`, the router of shape `S`; its refusal named `what`.
+    fn fused_dims<S: RouterShape>(
+        what: &'static str,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        out: &RouterBufs<S>,
+    ) -> Result<(u32, u32, u32), GpuError> {
+        let k = router_width(what, w, S::LOGITS, 32, usize::MAX)?;
+        if !(1..=MAX_TOKENS.min(out.tokens)).contains(&m) || x.len() < m * k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{m} tokens: one launch routes 1..={MAX_TOKENS}, into buffers for {}; \
+                     x.len() {} for {m} x {k}",
+                    out.tokens,
+                    x.len()
+                ),
+            ));
+        }
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let grid = launch_u32(what, "grid", S::LOGITS)?;
+        Ok((k, m, grid))
+    }
+
+    /// A ubatch logits launch's `(k, n_tok, grid)` for `n` tokens of `x`
+    /// through `w` into `out`, the router of shape `S`; its refusal named
+    /// `what`.
+    fn ubatch_dims<S: RouterShape>(
+        what: &'static str,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        out: &RouterBufs<S>,
+    ) -> Result<(u32, u32, u32), GpuError> {
+        let k = router_width(what, w, S::LOGITS, LINE, usize::MAX)?;
+        if !(1..=out.tokens).contains(&n) || x.len() < n * k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n} tokens into buffers for {}, x.len() {} for {n} x {k}",
+                    out.tokens,
+                    x.len()
+                ),
+            ));
+        }
+        let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
+        if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "router weight at {w_at:#x}, input at {x_at:#x}: both must be 16-byte \
+                     aligned"
+                ),
+            ));
+        }
+        let k = launch_u32(what, "k", k)?;
+        let n_tok = launch_u32(what, "n", n)?;
+        let grid = launch_u32(
+            what,
+            "logits grid",
+            n.div_ceil(LOGITS_TOKENS) * S::LOGITS.div_ceil(32),
+        )?;
+        Ok((k, n_tok, grid))
+    }
+
+    /// A routing launch's `(n_tok, grid)` for the first `n` tokens of `out`;
+    /// its refusal named `what`.
+    fn route_dims<S: RouterShape>(
+        what: &'static str,
+        n: usize,
+        out: &RouterBufs<S>,
+    ) -> Result<(u32, u32), GpuError> {
+        if !(1..=out.tokens).contains(&n) {
+            return Err(GpuError::shape(
+                what,
+                format!("{n} tokens into buffers for {}", out.tokens),
+            ));
+        }
+        let n_tok = launch_u32(what, "n", n)?;
+        let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
+        Ok((n_tok, grid))
+    }
+
+    /// The loaded gated router module, both instances. Owns no stream: each
+    /// enqueue takes the engine stream.
     pub struct RouterKernels {
         module: qwen35moe_router_kernels::LoadedModule,
     }
@@ -2553,21 +2849,7 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_fused";
-            let k = router_width(what, w, 32, usize::MAX)?;
-            if !(1..=MAX_TOKENS.min(out.tokens)).contains(&m) || x.len() < m * k {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "{m} tokens: one launch routes 1..={MAX_TOKENS}, into buffers for {}; \
-                         x.len() {} for {m} x {k}",
-                        out.tokens,
-                        x.len()
-                    ),
-                ));
-            }
-            let k = launch_u32(what, "k", k)?;
-            let m = launch_u32(what, "m", m)?;
-            let grid = launch_u32(what, "grid", ROWS)?;
+            let (k, m, grid) = fused_dims(what, w, x, m, out)?;
             let prep = self
                 .module
                 .prepare_qwen35moe_router_fused(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
@@ -2606,34 +2888,7 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_ubatch";
-            let k = router_width(what, w, LINE, usize::MAX)?;
-            if !(1..=out.tokens).contains(&n) || x.len() < n * k {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "{n} tokens into buffers for {}, x.len() {} for {n} x {k}",
-                        out.tokens,
-                        x.len()
-                    ),
-                ));
-            }
-            let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
-            if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "router weight at {w_at:#x}, input at {x_at:#x}: both must be 16-byte \
-                         aligned"
-                    ),
-                ));
-            }
-            let k = launch_u32(what, "k", k)?;
-            let n_tok = launch_u32(what, "n", n)?;
-            let grid = launch_u32(
-                what,
-                "logits grid",
-                n.div_ceil(LOGITS_TOKENS) * ROWS.div_ceil(32),
-            )?;
+            let (k, n_tok, grid) = ubatch_dims(what, w, x, n, out)?;
             let prep = self
                 .module
                 .prepare_qwen35moe_router_logits(LaunchConfig1D::new(
@@ -2668,18 +2923,119 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_route";
-            if !(1..=out.tokens).contains(&n) {
-                return Err(GpuError::shape(
-                    what,
-                    format!("{n} tokens into buffers for {}", out.tokens),
-                ));
-            }
-            let n_tok = launch_u32(what, "n", n)?;
-            let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
+            let (n_tok, grid) = route_dims(what, n, out)?;
             let prep = self
                 .module
                 .prepare_qwen35moe_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
             self.module.qwen35moe_router_route(
+                stream,
+                &prep,
+                &out.logits,
+                n_tok,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                fault,
+            )?;
+            Ok(())
+        }
+
+        /// [`RouterKernels::enqueue_fused`] at the wide instance
+        /// (`qwen35moe_router_fused_512`): `w` [`ROWS_512`] rows of `k`, the
+        /// results into `out` at [`N_SLOTS_512`] slots a token.
+        /// Asynchronous, allocation-free, capturable.
+        pub fn enqueue_fused_512(
+            &self,
+            stream: &CudaStream,
+            w: &DeviceTensor<f32>,
+            x: &DeviceBuffer<f32>,
+            m: usize,
+            fault: FaultSink,
+            out: &mut RouterOut512,
+        ) -> Result<(), GpuError> {
+            let what = "qwen3moe::router::gated::enqueue_fused_512";
+            let (k, m, grid) = fused_dims(what, w, x, m, out)?;
+            let prep = self
+                .module
+                .prepare_qwen35moe_router_fused_512(LaunchConfig1D::new(
+                    grid,
+                    FUSED_THREADS_U32,
+                    0,
+                ))?;
+            self.module.qwen35moe_router_fused_512(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                k,
+                m,
+                &mut out.logits,
+                &mut out.probs,
+                &mut out.ids,
+                &mut out.weights,
+                &mut out.done,
+                fault,
+            )?;
+            Ok(())
+        }
+
+        /// [`RouterKernels::enqueue_ubatch`] at the wide instance:
+        /// `qwen35moe_router_logits_512` then `qwen35moe_router_route_512`
+        /// ([`RouterKernels::enqueue_route_512`]), `w` [`ROWS_512`] rows of
+        /// `k`; each token's results the bits
+        /// [`RouterKernels::enqueue_fused_512`] leaves for it.
+        /// Asynchronous, allocation-free, capturable.
+        pub fn enqueue_ubatch_512(
+            &self,
+            stream: &CudaStream,
+            w: &DeviceTensor<f32>,
+            x: &DeviceBuffer<f32>,
+            n: usize,
+            fault: FaultSink,
+            out: &mut RouterOut512,
+        ) -> Result<(), GpuError> {
+            let what = "qwen3moe::router::gated::enqueue_ubatch_512";
+            let (k, n_tok, grid) = ubatch_dims(what, w, x, n, out)?;
+            let prep = self
+                .module
+                .prepare_qwen35moe_router_logits_512(LaunchConfig1D::new(
+                    grid,
+                    LOGITS_THREADS_U32,
+                    0,
+                ))?;
+            self.module.qwen35moe_router_logits_512(
+                stream,
+                &prep,
+                w.buf(),
+                x,
+                k,
+                n_tok,
+                &mut out.logits,
+            )?;
+            self.enqueue_route_512(stream, n, fault, out)
+        }
+
+        /// [`RouterKernels::enqueue_route`] at the wide instance
+        /// (`qwen35moe_router_route_512`): the first `n` tokens' logits in
+        /// `out.logits`, [`ROWS_512`] a token. Asynchronous,
+        /// allocation-free, capturable.
+        pub fn enqueue_route_512(
+            &self,
+            stream: &CudaStream,
+            n: usize,
+            fault: FaultSink,
+            out: &mut RouterOut512,
+        ) -> Result<(), GpuError> {
+            let what = "qwen3moe::router::gated::enqueue_route_512";
+            let (n_tok, grid) = route_dims(what, n, out)?;
+            let prep = self
+                .module
+                .prepare_qwen35moe_router_route_512(LaunchConfig1D::new(
+                    grid,
+                    FUSED_THREADS_U32,
+                    0,
+                ))?;
+            self.module.qwen35moe_router_route_512(
                 stream,
                 &prep,
                 &out.logits,
@@ -2717,7 +3073,7 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_norm_fused";
-            let k = router_width(what, w, 128, NORM_K)?;
+            let k = router_width(what, w, ROWS, 128, NORM_K)?;
             if act.m() != 1 || act.k() != k || x.len() < k || gain.len() < k {
                 return Err(GpuError::shape(
                     what,
