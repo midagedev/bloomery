@@ -123,10 +123,10 @@ fn run() -> Result<(), GateError> {
         .shard(0)
         .ok_or("gate_p8b: the model file has no shard 0")?;
     let man = RefManifest::read(&ref_dir())?;
-    let mut model = Deepseek2Model::load_blocks(&file, CTX_MAX, LAYER..LAYER + 1)?;
+    let mut model = Deepseek2Model::open_blocks(&file, CTX_MAX, LAYER..LAYER + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={CTX_MAX} m=1 layer={LAYER}",
-        model.stages()[0].resident_bytes()
+        model.resident_bytes()
     );
 
     // The layer's input residual is the previous block's output: the dump's

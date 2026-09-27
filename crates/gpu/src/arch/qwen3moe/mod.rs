@@ -19,6 +19,6 @@ mod scratch;
 mod taps;
 pub mod ubatch;
 
-pub use body::{Body, DecodeInput};
+pub use body::{Body, DecodeInput, FlashKind, OpenOpts};
 pub use prefill::{PrefillPath, PrefillPlan, PrefillStep};
 pub use taps::LayerRun;

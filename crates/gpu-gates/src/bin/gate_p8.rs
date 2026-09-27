@@ -203,10 +203,10 @@ fn run() -> Result<(), GateError> {
     .max(profile_ctx.unwrap_or(0) as usize);
     let file = Split::open(ref_model_path()?)?;
     let man = ref_manifest()?;
-    let mut model = Deepseek2Model::load_blocks(&file, ctx_max, 0..profile_layer + 1)?;
+    let mut model = Deepseek2Model::open_blocks(&file, ctx_max, 0..profile_layer + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={ctx_max} m=1 layers=0..{}",
-        model.stages()[0].resident_bytes(),
+        model.resident_bytes(),
         profile_layer + 1
     );
 
@@ -392,10 +392,10 @@ fn run() -> Result<(), GateError> {
     // reach this.
     if std::env::args().any(|a| a == "--time") {
         const N: u32 = 2000;
-        let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
-        let stream = model.stages()[0].gpu().stream();
+        let probe = bloomery_gpu::probe::Probe::load(model.gpu().context())?;
+        let stream = model.gpu().stream();
         let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
-        let empty = model.stages()[0]
+        let empty = model
             .gpu()
             .capture(|_| (0..4).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
         let time_replays = |launch: &dyn Fn() -> Result<(), GateError>| -> Result<f64, GateError> {
@@ -450,8 +450,8 @@ fn run() -> Result<(), GateError> {
         // Scoped: the stream borrow taken here must end before the layer
         // capture below, which needs `&mut model`.
         let (floor_min, floor_sum, graph_us) = {
-            let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
-            let stream = model.stages()[0].gpu().stream();
+            let probe = bloomery_gpu::probe::Probe::load(model.gpu().context())?;
+            let stream = model.gpu().stream();
             let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
             for _ in 0..20 {
                 probe.enqueue_touch(stream, &mut tbuf)?;
@@ -612,7 +612,7 @@ fn run() -> Result<(), GateError> {
         // shorter chain than the table it is printed beside.
         if profile_layer > 0 {
             let layer_nodes = model.capture_layer(profile_layer)?;
-            let stream = model.stages()[0].gpu().stream();
+            let stream = model.gpu().stream();
             for _ in 0..2 {
                 model.launch_layer_graph(profile_layer)?;
             }
@@ -745,7 +745,7 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
         Ok((lo, sum / f64::from(ROUNDS), hi))
     }
 
-    let gpu = model.stages()[0].gpu();
+    let gpu = model.gpu();
     let stream = gpu.stream();
     let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
 

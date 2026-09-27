@@ -140,8 +140,8 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::hybrid::{HostExperts, PoisonKind, RELEASE};
-    use bloomery_gpu::model::ChainBody;
+    use bloomery_gpu::hybrid::{Chain, HostExperts, PoisonKind, RELEASE};
+    use bloomery_gpu::model::{ChainBody, HostServed};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, Seam};
@@ -1037,7 +1037,7 @@ mod gate {
             let input = body.decode_input(set.token, set.pos)?;
             body.refresh(gpu.stream(), &input)?;
             graph.launch(gpu.stream())?;
-            body.serve_replay()?;
+            body.serve_captured(Chain::Step)?;
             gpu.stream().synchronize()?;
             let replay = outputs(gpu, body, head, hp.n_layer)?;
             let same = replay == eager;

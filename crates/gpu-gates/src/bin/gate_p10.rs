@@ -46,7 +46,6 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::arch::deepseek2::Body;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::ChainBody;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
 #[cfg(feature = "gpu")]

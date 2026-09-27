@@ -306,7 +306,7 @@ fn run() -> Result<(), GateError> {
     println!(
         "load resident_bytes={} ctx={ctx} layers={} mode={} seg_keys={}",
         model.resident_bytes(),
-        model.stages()[0].layers().len(),
+        model.layers().len(),
         if mode == StepMode::Graph {
             "graph"
         } else {

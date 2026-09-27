@@ -13,7 +13,7 @@
 #![cfg(feature = "gpu")]
 
 use bloomery_gpu::model::Engine;
-use bloomery_gpu::{Deepseek2Model, GpuError, Qwen3moeModel};
+use bloomery_gpu::{Deepseek2Model, Gpu, GpuError, Qwen3moeModel};
 use gguf::Split;
 use model::arch::Arch;
 
@@ -29,9 +29,10 @@ pub enum AnyEngine {
 
 impl AnyEngine {
     /// Detect `file`'s architecture, then load that architecture's whole
-    /// chain and output head with a `ctx`-row cache: deepseek2 through
-    /// `load_full` (every weight on the card, or the hybrid load its levers
-    /// ask for), qwen3moe through `load_full` (the whole model on one card).
+    /// chain and output head with a `ctx`-row cache: deepseek2 through its
+    /// `open` (every weight on the card, or the hybrid load its levers ask
+    /// for), qwen3moe through its `open` (the whole model on one card, with
+    /// the ubatch size and the flash pass its levers name, read here).
     /// A deepseek41 file is [`GpuError::UnsupportedArch`] here, before any
     /// load. The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
@@ -40,9 +41,13 @@ impl AnyEngine {
             missing: "the file's first shard",
         })?;
         match Arch::detect(head)? {
-            Arch::Deepseek2 => Ok(AnyEngine::Deepseek2(Deepseek2Model::load_full(file, ctx)?)),
+            Arch::Deepseek2 => Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?)),
             a @ Arch::Deepseek41 => Err(GpuError::UnsupportedArch(a.name().to_string())),
-            Arch::Qwen3moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::load_full(file, ctx)?)),
+            Arch::Qwen3moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
+                Gpu::new()?,
+                file,
+                Qwen3moeModel::lever_opts(ctx)?,
+            )?)),
         }
     }
 }

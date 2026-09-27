@@ -28,8 +28,9 @@
 //!   made here from the file's keys as the rope gate makes them, and a row
 //!   table of a group the step does not complete is zero; the rows come back
 //!   in the layout's packing.
-//! - (iv) the chain captures (its node count is the step gate's), and
-//!   seeding a depth refuses.
+//! - (iv) the chain captures (its node count is the step gate's). A
+//!   synthetic depth is no method of this model: the body is not
+//!   `Instrumented`, so a seed is a compile error, not a refusal to check.
 //! - (v) reload: a probe context holds the card across two loads; the first
 //!   model's drop gives back everything but what its chain capture took from
 //!   the context (iv) and, when the body held page-locked shadows, the one
@@ -145,9 +146,7 @@ mod gate {
         let mut ok = true;
         let shadow_host;
         {
-            let w = m.stages()[0]
-                .weights()
-                .ok_or("the loaded stage carries no weights")?;
+            let w = m.weights();
             ok &= check_segments(&plan, w, &inputs.hp);
             ok &= check_expert_bytes(&plan, w);
         }
@@ -159,8 +158,8 @@ mod gate {
             shadow_host = body.shadow_host().bytes;
             ok &= check_image(&planner, &specs, body, gpu.stream())?;
         }
-        let (refusals_ok, captured) = check_refusals(&mut m, &probe)?;
-        ok &= refusals_ok;
+        let (capture_ok, captured) = check_capture(&mut m, &probe)?;
+        ok &= capture_ok;
         drop(m);
         let free2 = free(&probe)?;
         let m = load(&path, 2, &cfg)?;
@@ -937,10 +936,10 @@ mod gate {
         )
     }
 
-    /// Check (iv): the chain captures and a synthetic depth refuses. Returns
-    /// the device bytes the context's first capture took: the driver keeps
-    /// them for the context, not the model, and check (v) counts them out.
-    fn check_refusals(m: &mut Deepseek41Model, probe: &Gpu) -> Result<(bool, u64), GateError> {
+    /// Check (iv): the chain captures. Returns the device bytes the context's
+    /// first capture took: the driver keeps them for the context, not the
+    /// model, and check (v) counts them out.
+    fn check_capture(m: &mut Deepseek41Model, probe: &Gpu) -> Result<(bool, u64), GateError> {
         let describe = |r: &Result<String, String>| match r {
             Ok(v) => format!("accepted ({v})"),
             Err(e) => format!("refused: {e}"),
@@ -957,17 +956,7 @@ mod gate {
             describe(&chain),
             verdict(chain_ok)
         );
-        let seed = m
-            .seed_depth(1)
-            .map(|()| "depth 1".to_string())
-            .map_err(|e| e.to_string());
-        let seed_ok = matches!(&seed, Err(e) if e.contains("Body::seed_depth"));
-        println!(
-            "check iv: seeding a depth of 1 — {}: {}",
-            describe(&seed),
-            verdict(seed_ok)
-        );
-        Ok((chain_ok && seed_ok, captured))
+        Ok((chain_ok, captured))
     }
 
     /// Check (v): the card's free bytes before the first load, after it,

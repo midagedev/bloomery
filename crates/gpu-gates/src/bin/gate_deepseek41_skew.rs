@@ -72,7 +72,8 @@ mod gate {
     use std::collections::BTreeMap;
 
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::model::{ChainBody, StepMode};
+    use bloomery_gpu::hybrid::Chain;
+    use bloomery_gpu::model::{ChainBody, HostServed, StepMode};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, Seam};
@@ -665,7 +666,7 @@ mod gate {
         inject(gpu, body, &set, &state)?;
         body.decode_pair(gpu.stream(), [t, t1], p)?;
         graph.launch(gpu.stream())?;
-        body.serve_replay_pair()?;
+        body.serve_captured(Chain::Pair)?;
         gpu.stream().synchronize()?;
         let replay = (
             row_out(gpu, body, 0, ha)?,
@@ -1015,8 +1016,8 @@ mod gate {
             // The pair.
             m.reset()?;
             m.step(prompt)?;
-            let toks = m.step_pair(t, t1)?;
-            let [pa, pb] = m.pair_logits()?;
+            let toks = m.step_rows([t, t1])?;
+            let [pa, pb] = m.rows_logits::<PAIR_ROWS>()?;
             let at = m.pos();
             let ok_pair = toks == [a_tok, b_tok] && bits(pa) == a && bits(pb) == b && at == p + 2;
             // Pair, rollback, t2 against t, t2.
@@ -1027,7 +1028,7 @@ mod gate {
             let c = lbits(m)?;
             m.reset()?;
             m.step(prompt)?;
-            m.step_pair(t, t1)?;
+            m.step_rows([t, t1])?;
             m.rollback(p + 1)?;
             let r_tok = m.step(&[t2])?;
             let r = lbits(m)?;

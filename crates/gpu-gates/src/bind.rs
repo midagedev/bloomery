@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use bloomery_gpu::model::ChainBody;
+use bloomery_gpu::model::Rollback;
 use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Device, ModelTensors, Plan, Role};
@@ -388,7 +388,7 @@ impl Ds41Engine {
         props: EngineProps,
     ) -> Result<Ds41Engine, GateError>
     where
-        B: ChainBody + 'static,
+        B: Rollback + 'static,
         F: FnOnce() -> Result<Generator<B>, GateError> + Send + 'static,
         K: Fn(&GpuModel<B>, usize) -> usize + Send + 'static,
         P: Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError> + Send + 'static,
@@ -470,7 +470,7 @@ type PrefillFn<B> = dyn Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>;
 /// One command on the engine thread. A logits read is checked here: a row of
 /// the wrong length or one holding a NaN is the step's error, not the
 /// sampler's to absorb.
-fn serve_cmd<B: ChainBody>(
+fn serve_cmd<B: Rollback>(
     g: &mut Generator<B>,
     cmd: Cmd,
     n_vocab: usize,
