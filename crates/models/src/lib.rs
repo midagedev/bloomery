@@ -572,7 +572,10 @@ pub struct ChatSpec {
 /// A tool-call syntax.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolFormat {
+    /// V4.1's `<｜DSML｜tool_calls>` blocks.
     Dsml,
+    /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
+    GlmXml,
 }
 
 /// A reasoning span syntax.

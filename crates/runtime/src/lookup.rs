@@ -7,6 +7,7 @@
 //! only when its follower is pushed, so a proposal never sees itself. As a
 //! [`Draft`] it is fed the prompt, then only the tokens the passes keep: a
 //! rejected proposal never enters the context, so it has nothing to take back.
+//! Each generation starts it over ([`Draft::begin`]).
 
 use std::collections::HashMap;
 
@@ -69,6 +70,14 @@ impl Lookup {
     pub fn context(&self) -> &[u32] {
         &self.ctx
     }
+
+    /// An empty context again, the tables' memory kept.
+    pub fn reset(&mut self) {
+        self.idx3.clear();
+        self.idx2.clear();
+        self.idx1.clear();
+        self.ctx.clear();
+    }
 }
 
 /// One id a proposal, from the token history alone.
@@ -76,7 +85,9 @@ impl<T: Verify> Draft<T> for Lookup {
     const WIDTH: usize = 1;
     const TAPS: TapNeed = TapNeed::None;
 
+    /// The context starts over: this prompt, then `first`.
     fn begin(&mut self, _t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
+        self.reset();
         for &id in prompt {
             self.push(id);
         }

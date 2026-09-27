@@ -293,24 +293,37 @@ pub(crate) mod synthetic {
     /// keys `kv` under the `<arch>.` prefix, and one 1-value F32 tensor per
     /// name of `tensors`; written to a temp path named after `tag`.
     pub(crate) fn header(tag: &str, arch: &str, kv: &[(&str, V)], tensors: &[String]) -> PathBuf {
-        let shaped: Vec<(String, Vec<u64>)> =
-            tensors.iter().map(|n| (n.clone(), vec![1])).collect();
-        header_shaped(tag, arch, kv, &shaped)
+        header_with(tag, arch, kv, &[], tensors)
     }
 
-    /// [`header`] with each tensor's dims: zero-filled F32 data, each
+    /// [`header`] with the keys `global` as well, written as they are named
+    /// (`tokenizer.ggml.pre`, `tokenizer.chat_template`).
+    pub(crate) fn header_with(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        global: &[(&str, V)],
+        tensors: &[String],
+    ) -> PathBuf {
+        let shaped: Vec<(String, Vec<u64>)> =
+            tensors.iter().map(|n| (n.clone(), vec![1])).collect();
+        header_shaped(tag, arch, kv, global, &shaped)
+    }
+
+    /// [`header_with`] with each tensor's dims: zero-filled F32 data, each
     /// tensor's start aligned to 32 bytes.
     pub(crate) fn header_shaped(
         tag: &str,
         arch: &str,
         kv: &[(&str, V)],
+        global: &[(&str, V)],
         tensors: &[(String, Vec<u64>)],
     ) -> PathBuf {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        b.extend_from_slice(&(kv.len() as u64 + 2).to_le_bytes());
+        b.extend_from_slice(&((kv.len() + global.len()) as u64 + 2).to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend_from_slice(&8u32.to_le_bytes());
         string(&mut b, arch);
@@ -320,8 +333,12 @@ pub(crate) mod synthetic {
         b.extend_from_slice(&2u64.to_le_bytes());
         string(&mut b, "a");
         string(&mut b, "b");
-        for (k, v) in kv {
-            string(&mut b, &format!("{arch}.{k}"));
+        let keys = kv
+            .iter()
+            .map(|(k, v)| (format!("{arch}.{k}"), v))
+            .chain(global.iter().map(|(k, v)| ((*k).to_string(), v)));
+        for (k, v) in keys {
+            string(&mut b, &k);
             match v {
                 V::U32(x) => {
                     b.extend_from_slice(&4u32.to_le_bytes());

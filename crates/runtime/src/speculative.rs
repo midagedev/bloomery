@@ -51,7 +51,11 @@ pub trait Draft<T: Verify> {
     }
 
     /// Generation begins after `prompt`, whose argmax `first` is generated
-    /// token 0.
+    /// token 0. A generation is its own: `prompt` then `begin` start the draft
+    /// over, and after `begin` it holds what this prompt call and `first` gave
+    /// it and nothing of the positions before the call — a target that
+    /// continues from earlier turns is drafted from this turn alone, which
+    /// changes how many rows a pass keeps and never a token.
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error>;
 
     /// Write the [`Draft::WIDTH`] ids to follow `last`, the token at the
@@ -110,6 +114,8 @@ pub(crate) fn accepted_rows(rows: &[u32], out: &[u32]) -> usize {
 }
 
 impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
+    const ROWS: usize = M;
+
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
         self.draft.prompt(t, ids)
     }
@@ -160,8 +166,8 @@ impl<T: Verify, D: Draft<T>, const M: usize> Advance<T> for Speculative<D, M> {
 #[cfg(test)]
 mod tests {
     use super::accepted_rows;
-    use crate::mock::{Call, Mock};
-    use crate::{Advance, Lookup, Plain, Speculative, Stop, StopReason, generate};
+    use crate::mock::{Call, Mock, MockError, Quiet};
+    use crate::{Advance, Draft, Lookup, Plain, Speculative, Stop, StopReason, TapNeed, generate};
 
     /// Row 0 always; then while the argmax of row r is row r + 1's id.
     #[test]
@@ -266,17 +272,101 @@ mod tests {
         let mut t = Mock::new().fail_at(9);
         let first = Plain.prompt(&mut t, &[1, 2, 3]).unwrap();
         let stop = Stop::new(50, 1000).unwrap();
-        let r = generate(
-            &mut t,
-            &mut Plain,
-            &[1, 2, 3],
-            first,
-            &stop,
-            &mut crate::mock::Quiet,
-        );
+        let r = generate(&mut t, &mut Plain, &[1, 2, 3], first, &stop, &mut Quiet);
         assert!(r.is_err());
         assert_eq!(t.calls().last(), Some(&Call::Step(9)));
         assert_eq!(t.pos(), 9);
+    }
+
+    /// An end-of-generation id kept at a pass's first row ends the
+    /// generation there: the tokens stop at it, as the plain run's do.
+    #[test]
+    fn eog_inside_a_pass_ends_it() {
+        let prompt = [1, 2, 3, 1, 2];
+        let (plain, _) = run(&mut Plain, &prompt, &Stop::new(60, 1000).unwrap());
+        // Every oracle pass keeps two rows, tokens 2k + 1 and 2k + 2: an id
+        // first seen at an odd index is kept one row before its pass's end.
+        let t = &plain.tokens;
+        let (j, eog) = (1..t.len())
+            .step_by(2)
+            .map(|j| (j, t[j]))
+            .find(|&(j, id)| !t[..j].contains(&id))
+            .expect("an id first seen at an odd index");
+        let stop = Stop::new(60, 1000).unwrap().with_eog(&[eog]);
+        let (want, _) = run(&mut Plain, &prompt, &stop);
+        assert_eq!((want.stop, want.tokens.len()), (StopReason::Eog, j + 1));
+        let mut spec = Speculative::<Oracle, 2>::new(Oracle);
+        let (got, calls) = run(&mut spec, &prompt, &stop);
+        assert!(calls.contains(&Call::Commit(2)), "{calls:?}");
+        assert_eq!(got.stop, StopReason::Eog);
+        assert_eq!(got.tokens, want.tokens);
+    }
+
+    /// A pass whose rows would pass the caches' end is not run: the
+    /// generation stops at the context, where the plain loop stops one
+    /// position later.
+    #[test]
+    fn a_pass_past_the_context_is_not_run() {
+        let prompt = [1, 2, 3, 1, 2];
+        let stop = Stop::new(1000, 20).unwrap();
+        let mut t = Mock::new().with_ctx(20);
+        let mut spec = Speculative::<Oracle, 2>::new(Oracle);
+        let first = spec.prompt(&mut t, &prompt).unwrap();
+        let out = generate(&mut t, &mut spec, &prompt, first, &stop, &mut Quiet)
+            .expect("the loop stops before the target refuses");
+        assert_eq!((out.stop, t.pos()), (StopReason::Ctx, 19));
+        let mut t = Mock::new().with_ctx(20);
+        let first = Plain.prompt(&mut t, &prompt).unwrap();
+        let out = generate(&mut t, &mut Plain, &prompt, first, &stop, &mut Quiet).unwrap();
+        assert_eq!((out.stop, t.pos()), (StopReason::Ctx, 20));
+    }
+
+    /// A new prompt starts the lookup over: after a reset target's second
+    /// generation its context is that generation's prompt and kept tokens.
+    #[test]
+    fn a_new_prompt_starts_the_lookup_over() {
+        let stop = Stop::new(30, 1000).unwrap();
+        let mut t = Mock::new();
+        let mut spec = Speculative::<Lookup, 2>::new(Lookup::new());
+        for prompt in [[4, 4, 1, 2, 4], [3, 0, 3, 1, 1]] {
+            t.reset().unwrap();
+            let first = spec.prompt(&mut t, &prompt).unwrap();
+            let out = generate(&mut t, &mut spec, &prompt, first, &stop, &mut Quiet).unwrap();
+            let want: Vec<u32> = prompt.iter().copied().chain(out.tokens).collect();
+            assert_eq!(spec.draft().context(), &want[..]);
+        }
+    }
+
+    /// A draft that proposes the mock's own next token: every pass verifies
+    /// two rows and keeps both.
+    struct Oracle;
+
+    impl Draft<Mock> for Oracle {
+        const WIDTH: usize = 1;
+        const TAPS: TapNeed = TapNeed::None;
+
+        fn begin(&mut self, _t: &Mock, _prompt: &[u32], _first: u32) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn propose(&mut self, t: &Mock, last: u32, out: &mut [u32]) -> Result<bool, MockError> {
+            out[0] = t.next_after(last);
+            Ok(true)
+        }
+
+        fn accept(
+            &mut self,
+            _t: &mut Mock,
+            _rows: &[u32],
+            _out: &[u32],
+            _accepted: usize,
+        ) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn stepped(&mut self, _t: &mut Mock, _last: u32, _next: u32) -> Result<(), MockError> {
+            Ok(())
+        }
     }
 
     use crate::Target;
@@ -288,7 +378,7 @@ mod tests {
     ) -> (crate::GenOutcome, Vec<Call>) {
         let mut t = Mock::new();
         let first = a.prompt(&mut t, prompt).unwrap();
-        let out = generate(&mut t, a, prompt, first, stop, &mut crate::mock::Quiet).unwrap();
+        let out = generate(&mut t, a, prompt, first, stop, &mut Quiet).unwrap();
         (out, t.calls().to_vec())
     }
 }

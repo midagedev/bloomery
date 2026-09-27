@@ -184,6 +184,7 @@ dependencies = [
  "bloomery-refset",
  "bloomery-runtime",
  "bloomery-threads",
+ "bloomery-tokenizer",
  "libc",
  "sha2",
  "thiserror",

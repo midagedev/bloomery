@@ -29,6 +29,7 @@ pub(crate) struct Mock {
     fail_prompt: bool,
     fail_at: Option<u32>,
     rows: Option<(usize, usize)>,
+    ctx: u32,
 }
 
 impl Mock {
@@ -39,7 +40,15 @@ impl Mock {
             fail_prompt: false,
             fail_at: None,
             rows: None,
+            ctx: 1000,
         }
+    }
+
+    /// Caches of `ctx` positions: a step at `ctx` and a verify whose rows
+    /// pass it are refused, as the engine's model refuses them.
+    pub(crate) fn with_ctx(mut self, ctx: u32) -> Mock {
+        self.ctx = ctx;
+        self
     }
 
     /// Every prompt call fails.
@@ -63,9 +72,22 @@ impl Mock {
     /// misses.
     fn argmax(&self) -> u32 {
         let n = self.history.len();
-        let a = self.history[n - 1];
         let b = if n >= 2 { self.history[n - 2] } else { 0 };
-        (a * 3 + b + u32::from((n / 7) % 2 == 1)) % 5
+        rule(n, self.history[n - 1], b)
+    }
+
+    /// The token a step of `id` would return, the history left as it is.
+    pub(crate) fn next_after(&self, id: u32) -> u32 {
+        let b = self.history.last().copied().unwrap_or(0);
+        rule(self.history.len() + 1, id, b)
+    }
+
+    /// Refused unless positions `at()` to `at() + rows − 1` fit the caches.
+    fn fits(&self, rows: usize) -> Result<(), MockError> {
+        if self.history.len() + rows > self.ctx as usize {
+            return Err(MockError("rows past the caches' ctx"));
+        }
+        Ok(())
     }
 
     fn at(&self) -> u32 {
@@ -80,6 +102,11 @@ impl Mock {
     }
 }
 
+/// [`Mock`]'s next token after a history of `n` ids ending `b`, `a`.
+fn rule(n: usize, a: u32, b: u32) -> u32 {
+    (a * 3 + b + u32::from((n / 7) % 2 == 1)) % 5
+}
+
 impl Target for Mock {
     type Error = MockError;
 
@@ -88,7 +115,7 @@ impl Target for Mock {
     }
 
     fn ctx(&self) -> u32 {
-        1000
+        self.ctx
     }
 
     fn prompt(&mut self, ids: &[u32], _want: Want) -> Result<Out<'_>, MockError> {
@@ -97,6 +124,7 @@ impl Target for Mock {
         if self.fail_prompt {
             return Err(MockError("the prompt call failed"));
         }
+        self.fits(ids.len())?;
         self.history.extend_from_slice(ids);
         Ok(Out::Argmax(self.argmax()))
     }
@@ -107,6 +135,7 @@ impl Target for Mock {
         if self.fail_at == Some(self.at()) {
             return Err(MockError("the step failed"));
         }
+        self.fits(1)?;
         self.history.push(id);
         Ok(Out::Argmax(self.argmax()))
     }
@@ -133,6 +162,7 @@ impl Verify for Mock {
     fn verify<const M: usize>(&mut self, rows: [u32; M]) -> Result<[u32; M], MockError> {
         self.calls.push(Call::Verify(self.at(), M));
         self.idle()?;
+        self.fits(M)?;
         let first = self.history.len();
         let mut out = [0u32; M];
         for (o, &id) in out.iter_mut().zip(&rows) {

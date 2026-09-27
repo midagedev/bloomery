@@ -928,7 +928,7 @@ mod tests {
         kv: &[(&str, V)],
         tensors: &[(String, Vec<u64>)],
     ) -> Result<Hparams, String> {
-        let path = header_shaped(tag, arch, kv, tensors);
+        let path = header_shaped(tag, arch, kv, &[], tensors);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let hp = Hparams::read(&split).map_err(|e| e.to_string());
         let _ = std::fs::remove_file(&path);
@@ -1088,7 +1088,7 @@ mod tests {
             t.push((format!("blk.{l}.{marker}"), vec![1]));
         }
         t.push(("blk.0.hc_attn_norm.weight".to_string(), vec![1]));
-        let path = header_shaped("q35-hc", "qwen35moe", &kv, &t);
+        let path = header_shaped("q35-hc", "qwen35moe", &kv, &[], &t);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let err = crate::arch::spec(&split)
             .expect_err("the stem is not qwen35moe's")

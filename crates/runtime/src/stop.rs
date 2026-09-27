@@ -8,7 +8,7 @@ pub enum StopReason {
     Eog,
     /// The tokens reached the asked count.
     Length,
-    /// The target stands at the end of its caches.
+    /// The target's caches have no room for the next pass's rows.
     Ctx,
 }
 
@@ -47,8 +47,8 @@ pub struct Stop {
 
 impl Stop {
     /// Stop after `max_tokens` tokens, generated token 0 counted, or when the
-    /// target stands at `ctx`; no end-of-generation id until
-    /// [`Stop::with_eog`].
+    /// next pass's rows do not fit caches of `ctx` positions; no
+    /// end-of-generation id until [`Stop::with_eog`].
     pub fn new(max_tokens: usize, ctx: u32) -> Result<Stop, NoTokens> {
         if max_tokens == 0 {
             return Err(NoTokens);
@@ -74,19 +74,28 @@ impl Stop {
     }
 
     /// Why the generation ends after `emitted` tokens whose last is `last`,
-    /// the target standing at `pos` — or `None` to run another pass. An
-    /// end-of-generation id ends it first, then the count, then the context.
+    /// the target standing at `pos` and the next pass running up to `rows`
+    /// positions from it — or `None` to run that pass. An end-of-generation
+    /// id ends it first, then the count, then the context.
     #[must_use]
-    pub fn check(&self, emitted: usize, last: u32, pos: u32) -> Option<StopReason> {
+    pub fn check(&self, emitted: usize, last: u32, pos: u32, rows: usize) -> Option<StopReason> {
+        let room = self.ctx.saturating_sub(pos);
         if self.eog.contains(&last) {
             Some(StopReason::Eog)
         } else if emitted >= self.max_tokens {
             Some(StopReason::Length)
-        } else if pos >= self.ctx {
+        } else if u32::try_from(rows).map_or(true, |r| r > room) {
             Some(StopReason::Ctx)
         } else {
             None
         }
+    }
+
+    /// The index of the first end-of-generation id in `tokens`, a pass's kept
+    /// tokens: where the generation's tokens end.
+    #[must_use]
+    pub fn first_eog(&self, tokens: &[u32]) -> Option<usize> {
+        tokens.iter().position(|t| self.eog.contains(t))
     }
 }
 
@@ -99,9 +108,9 @@ mod tests {
     #[test]
     fn length_at_the_count() {
         let s = Stop::new(4, 100).unwrap();
-        assert_eq!(s.check(3, 7, 10), None);
-        assert_eq!(s.check(4, 7, 10), Some(StopReason::Length));
-        assert_eq!(s.check(5, 7, 10), Some(StopReason::Length));
+        assert_eq!(s.check(3, 7, 10, 1), None);
+        assert_eq!(s.check(4, 7, 10, 1), Some(StopReason::Length));
+        assert_eq!(s.check(5, 7, 10, 1), Some(StopReason::Length));
     }
 
     /// An end-of-generation id wins over the count and the context: the
@@ -109,11 +118,25 @@ mod tests {
     #[test]
     fn eog_first() {
         let s = Stop::new(4, 10).unwrap().with_eog(&[2, 9]);
-        assert_eq!(s.check(1, 9, 3), Some(StopReason::Eog));
-        assert_eq!(s.check(4, 2, 10), Some(StopReason::Eog));
-        assert_eq!(s.check(4, 3, 10), Some(StopReason::Length));
-        assert_eq!(s.check(2, 3, 10), Some(StopReason::Ctx));
-        assert_eq!(s.check(2, 3, 9), None);
+        assert_eq!(s.check(1, 9, 3, 1), Some(StopReason::Eog));
+        assert_eq!(s.check(4, 2, 10, 1), Some(StopReason::Eog));
+        assert_eq!(s.check(4, 3, 10, 1), Some(StopReason::Length));
+        assert_eq!(s.check(2, 3, 10, 1), Some(StopReason::Ctx));
+        assert_eq!(s.check(2, 3, 9, 1), None);
+        assert_eq!(s.first_eog(&[5, 9, 2]), Some(1));
+        assert_eq!(s.first_eog(&[5, 3]), None);
+    }
+
+    /// The context stops the loop when the next pass's rows do not all fit:
+    /// a pass of `rows` at `pos` needs positions up to `pos + rows − 1`.
+    #[test]
+    fn ctx_counts_the_pass_rows() {
+        let s = Stop::new(100, 10).unwrap();
+        assert_eq!(s.check(2, 3, 8, 2), None);
+        assert_eq!(s.check(2, 3, 9, 2), Some(StopReason::Ctx));
+        assert_eq!(s.check(2, 3, 9, 1), None);
+        assert_eq!(s.check(2, 3, 7, 4), Some(StopReason::Ctx));
+        assert_eq!(s.check(2, 3, 12, 1), Some(StopReason::Ctx));
     }
 
     /// No count below one exists.

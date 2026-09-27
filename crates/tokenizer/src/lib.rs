@@ -37,9 +37,7 @@ pub enum Error {
     WrongType(&'static str),
     #[error("tokenizer model {0:?} is not supported (only gpt2)")]
     UnsupportedModel(String),
-    #[error(
-        "pre-tokenizer {0:?} is not supported (deepseek-v3, hunyuan-dense, joyai-llm, qwen2, glm4)"
-    )]
+    #[error("pre-tokenizer {0:?} is not supported ({known})", known = pretok::Pre::names())]
     UnsupportedPre(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
@@ -47,6 +45,13 @@ pub enum Error {
     TooManyTokens(usize),
     #[error("token text {0:?} appears twice in the vocabulary")]
     DuplicateToken(String),
+}
+
+/// Whether this crate runs the pre-tokenizer `tokenizer.ggml.pre` names
+/// `name`.
+#[must_use]
+pub fn runs_pre_tokenizer(name: &str) -> bool {
+    pretok::Pre::of(name).is_some()
 }
 
 /// A loaded vocabulary with its encoder and decoder tables.

@@ -17,6 +17,8 @@ bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
 bloomery-qdot = { path = "../qdot" }
 bloomery-threads = { path = "../threads" }
+# The coverage check asks the tokenizer which pre-tokenizers it runs.
+bloomery-tokenizer = { path = "../tokenizer" }
 libc = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

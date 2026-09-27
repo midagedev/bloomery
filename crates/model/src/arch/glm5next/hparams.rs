@@ -6,6 +6,7 @@
 
 use gguf::{Split, Value};
 
+use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{meta_arr, meta_bool, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
 use crate::placement::PlacementError;
 
@@ -21,82 +22,6 @@ pub enum Kind {
     /// `attn_q_a`, `attn_kv_a_mqa`, the indexer: a latent attention layer.
     Latent,
 }
-
-/// The tensors every layer of a kind carries, by stem; `ssm_f_b` and
-/// `ssm_g_b` are required because without them ik takes another decay rule
-/// (`src/llama-kda.cpp`, `build_kda_beta_gate`), and the indexer set because
-/// without it ik runs dense attention (`src/llama-load-tensors.cpp`,
-/// `create_glm5next_tensors`).
-const KDA_STEMS: &[&str] = &[
-    "attn_norm.weight",
-    "attn_q.weight",
-    "attn_k.weight",
-    "attn_v.weight",
-    "ssm_conv1d_q.weight",
-    "ssm_conv1d_k.weight",
-    "ssm_conv1d_v.weight",
-    "ssm_f_a.weight",
-    "ssm_f_b.weight",
-    "ssm_g_a.weight",
-    "ssm_g_b.weight",
-    "ssm_beta.weight",
-    "ssm_a",
-    "ssm_dt.bias",
-    "ssm_norm.weight",
-    "attn_output.weight",
-];
-const LATENT_STEMS: &[&str] = &[
-    "attn_norm.weight",
-    "attn_q_a.weight",
-    "attn_q_a_norm.weight",
-    "attn_q_b.weight",
-    "attn_kv_a_mqa.weight",
-    "attn_kv_a_norm.weight",
-    "attn_k_b.weight",
-    "attn_v_b.weight",
-    "attn_output.weight",
-    "indexer.attn_k.weight",
-    "indexer.attn_q_b.weight",
-    "indexer.k_norm.weight",
-    "indexer.k_norm.bias",
-    "indexer.proj.weight",
-    "indexer_compressor_gate.weight",
-    "indexer_compressor_ape.weight",
-];
-const DENSE_STEMS: &[&str] = &[
-    "ffn_norm.weight",
-    "ffn_gate.weight",
-    "ffn_up.weight",
-    "ffn_down.weight",
-];
-const MOE_STEMS: &[&str] = &[
-    "ffn_norm.weight",
-    "ffn_gate_inp.weight",
-    "ffn_gate_exps.weight",
-    "ffn_up_exps.weight",
-    "ffn_down_exps.weight",
-];
-const SHARED_STEMS: &[&str] = &[
-    "ffn_gate_shexp.weight",
-    "ffn_up_shexp.weight",
-    "ffn_down_shexp.weight",
-];
-/// The hyper-connection tensors: every trunk layer's, no next-token layer's.
-pub const HC_STEMS: &[&str] = &[
-    "hc_attn_fn.weight",
-    "hc_attn_base.weight",
-    "hc_attn_scale.weight",
-    "hc_ffn_fn.weight",
-    "hc_ffn_base.weight",
-    "hc_ffn_scale.weight",
-];
-/// The next-token block's own tensors; `nextn.shared_head_norm` is optional
-/// (the block shares the trunk's embedding and head).
-const NEXTN_STEMS: &[&str] = &[
-    "nextn.eh_proj.weight",
-    "nextn.enorm.weight",
-    "nextn.hnorm.weight",
-];
 
 /// The token-pool indexer's keys.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -448,9 +373,10 @@ impl Hparams {
         Ok(hp)
     }
 
-    /// Every layer carries its kind's tensors, its feed-forward block's and
-    /// its residual's, and nothing of the other kinds': the first missing or
-    /// misplaced name, with how many more there are.
+    /// Every layer carries its kind's required tensors (the stem table in
+    /// `roles`), its feed-forward block's and its residual's, and nothing of
+    /// the other kinds': the first missing or misplaced name, with how many
+    /// more there are.
     fn tensors_agree(&self, split: &Split) -> Result<(), PlacementError> {
         let has = |l: usize, stem: &str| split.find(&format!("blk.{l}.{stem}")).is_some();
         let mut missing = Vec::new();
@@ -458,35 +384,31 @@ impl Hparams {
         for (l, &kind) in self.kinds.iter().enumerate() {
             let trunk = l < self.n_trunk;
             let dense = l < self.dense_lead;
-            let mut need: Vec<&str> = match kind {
-                Kind::Kda => KDA_STEMS.to_vec(),
-                Kind::Latent => LATENT_STEMS.to_vec(),
+            let (mixer, other) = match kind {
+                Kind::Kda => (KDA, LATENT),
+                Kind::Latent => (LATENT, KDA),
             };
-            need.extend(if dense { DENSE_STEMS } else { MOE_STEMS });
+            let mut need: Vec<&str> = required(mixer).collect();
+            need.extend(required(if dense { DENSE } else { MOE }));
             if !dense && self.n_shared > 0 {
-                need.extend(SHARED_STEMS);
+                need.extend(required(SHARED));
             }
-            need.extend(if trunk { HC_STEMS } else { NEXTN_STEMS });
+            need.extend(required(if trunk { HC } else { NEXTN }));
             missing.extend(
                 need.iter()
                     .filter(|s| !has(l, s))
                     .map(|s| format!("blk.{l}.{s}")),
             );
-            let other: &[&str] = match kind {
-                Kind::Kda => LATENT_STEMS,
-                Kind::Latent => KDA_STEMS,
-            };
             let mut banned: Vec<&str> = other
                 .iter()
+                .map(|s| s.name)
                 .filter(|s| !need.contains(s))
-                .copied()
                 .collect();
-            let ffn_or_hc: &[&str] = match (trunk, dense) {
-                (true, true) => &["ffn_gate_inp.weight"],
-                (true, false) => &["ffn_gate.weight"],
-                (false, _) => HC_STEMS,
-            };
-            banned.extend(ffn_or_hc);
+            match (trunk, dense) {
+                (true, true) => banned.push("ffn_gate_inp.weight"),
+                (true, false) => banned.push("ffn_gate.weight"),
+                (false, _) => banned.extend(HC.iter().map(|s| s.name)),
+            }
             misplaced.extend(
                 banned
                     .iter()
@@ -693,11 +615,9 @@ fn or_default<T: std::fmt::Display>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        DENSE_STEMS, HC_STEMS, Hparams, KDA_STEMS, Kind, LATENT_STEMS, MOE_STEMS, NEXTN_STEMS,
-        SHARED_STEMS,
-    };
+pub(super) mod tests {
+    use super::super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, Stem};
+    use super::{Hparams, Kind};
     use crate::arch::synthetic::{V, header};
 
     /// Five layers: 0 KDA and dense, 1 and 3 latent, 2 KDA, then the
@@ -710,7 +630,7 @@ mod tests {
         Kind::Latent,
     ];
 
-    fn keys() -> Vec<(&'static str, V)> {
+    pub(in crate::arch::glm5next) fn keys() -> Vec<(&'static str, V)> {
         vec![
             ("block_count", V::U32(5)),
             ("nextn_predict_layers", V::U32(1)),
@@ -754,22 +674,21 @@ mod tests {
         ]
     }
 
-    fn tensors() -> Vec<String> {
+    pub(in crate::arch::glm5next) fn tensors() -> Vec<String> {
         let mut out: Vec<String> = ["token_embd.weight", "output_norm.weight", "output.weight"]
             .map(str::to_string)
             .to_vec();
         for (l, kind) in KINDS.iter().enumerate() {
-            let mut stems: Vec<&str> = match kind {
-                Kind::Kda => KDA_STEMS.to_vec(),
-                Kind::Latent => LATENT_STEMS.to_vec(),
+            let mut stems: Vec<&Stem> = match kind {
+                Kind::Kda => KDA.iter().collect(),
+                Kind::Latent => LATENT.iter().collect(),
             };
-            stems.extend(if l == 0 { DENSE_STEMS } else { MOE_STEMS });
+            stems.extend(if l == 0 { DENSE } else { MOE });
             if l > 0 {
-                stems.extend(SHARED_STEMS);
-                stems.push("exp_probs_b.bias");
+                stems.extend(SHARED);
             }
-            stems.extend(if l < 4 { HC_STEMS } else { NEXTN_STEMS });
-            out.extend(stems.iter().map(|s| format!("blk.{l}.{s}")));
+            stems.extend(if l < 4 { HC } else { NEXTN });
+            out.extend(stems.iter().map(|s| format!("blk.{l}.{}", s.name)));
         }
         out
     }

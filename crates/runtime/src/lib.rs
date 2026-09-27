@@ -116,7 +116,7 @@ pub struct Committed {
     /// The target's position before the pass: kept token `r` is the argmax
     /// after position `pos + r`.
     pub pos: u32,
-    /// The tokens the pass kept, 1 to `rows`.
+    /// The rows the pass kept on the target, 1 to `rows`.
     pub kept: usize,
     /// The rows the pass ran: 1 for a step, the verify's `M` for a proposal.
     pub rows: usize,
@@ -126,6 +126,12 @@ pub struct Committed {
 
 /// How a generation moves on from the prompt.
 pub trait Advance<T: Target> {
+    /// The most rows one pass runs: the loop stops at the context when that
+    /// many positions do not fit the caches. A one-step advance keeps 1; one
+    /// that runs more and does not say so ends its last pass in the target's
+    /// refusal at the caches' end.
+    const ROWS: usize = 1;
+
     /// Feed the prompt `ids` through `t` from where it stands, with whatever
     /// this advance takes of it; the argmax after the last id.
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error>;
@@ -173,7 +179,8 @@ pub trait PassSink<T: Target> {
     fn begin(&mut self, t: &T) -> Result<(), Self::Error>;
 
     /// After each pass: what it kept, its `tokens` in position order, and the
-    /// wall time around the advance.
+    /// wall time around the advance. The tokens end at an end-of-generation
+    /// id: fewer than `c.kept` when one came before the pass's last row.
     fn pass(
         &mut self,
         t: &T,
@@ -186,8 +193,10 @@ pub trait PassSink<T: Target> {
 /// What a generation ended with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenOutcome {
-    /// Every token the passes kept, generated token 0 first. A pass keeps
-    /// whole rows, so the last may carry the count past the stop's length.
+    /// Every token the passes kept, generated token 0 first, up to the first
+    /// end-of-generation id. A pass keeps whole rows, so the last may carry
+    /// the count past the stop's length, and the target may stand past an
+    /// end-of-generation id its pass kept before its last row.
     pub tokens: Vec<u32>,
     pub stop: StopReason,
     pub passes: usize,
@@ -195,9 +204,11 @@ pub struct GenOutcome {
 
 /// The one generation loop, after the prompt: `first` is the prompt call's
 /// argmax, generated token 0. Before each pass the [`Stop`] rule reads the
-/// tokens so far, the last of them and the target's position; each pass is
-/// timed around the advance alone, and `sink` hears of it after the wall is
-/// taken. An error of the target, the advance or the sink ends the loop at
+/// tokens so far, the last of them, the target's position and the advance's
+/// [`Advance::ROWS`]; after it, the pass's tokens end at the first
+/// end-of-generation id among them, which the next check stops at. Each pass
+/// is timed around the advance alone, and `sink` hears of it after the wall
+/// is taken. An error of the target, the advance or the sink ends the loop at
 /// once.
 pub fn generate<T, A, S>(
     t: &mut T,
@@ -219,7 +230,7 @@ where
     let mut passes = 0;
     let reason = loop {
         let last = tokens[tokens.len() - 1];
-        if let Some(r) = stop.check(tokens.len(), last, t.pos()) {
+        if let Some(r) = stop.check(tokens.len(), last, t.pos(), A::ROWS) {
             break r;
         }
         let from = tokens.len();
@@ -227,6 +238,9 @@ where
         let c = a.pass(t, last, &mut tokens)?;
         let wall = t0.elapsed();
         passes += 1;
+        if let Some(k) = stop.first_eog(&tokens[from..]) {
+            tokens.truncate(from + k + 1);
+        }
         sink.pass(t, &c, &tokens[from..], wall)?;
     };
     Ok(GenOutcome {

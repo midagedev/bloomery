@@ -4,7 +4,8 @@
 //! instance or program step, each citing the constant or the function that
 //! owns it), the card formats of the tensors' types ([`CardFormat`], the
 //! format owner), the program's per-tensor type pins, the pre-tokenizers the
-//! tokenizer knows and the chat parsers.
+//! tokenizer runs (`tokenizer::runs_pre_tokenizer`, the tokenizer's own
+//! table) and the chat parsers.
 //!
 //! The kernels' own file-against-constant checks stay behind it as a second
 //! line: a file this check passes cannot trip them.
@@ -150,10 +151,6 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
 ];
-
-/// The pre-tokenizers the tokenizer knows (`tokenizer::pretok::Pre::NAMES`,
-/// which is crate-private there).
-pub const PRE_TOKENIZERS: &[&str] = &["deepseek-v3", "hunyuan-dense", "joyai-llm", "qwen2"];
 
 /// A tensor family whose type a program pins, and the types it reads.
 struct TypePin {
@@ -313,7 +310,7 @@ pub fn check_with(
         }
         Some(_) => {}
     }
-    if !PRE_TOKENIZERS.contains(&spec.chat.pre.as_str()) {
+    if !tokenizer::runs_pre_tokenizer(&spec.chat.pre) {
         at(None, Need::PreTokenizer(spec.chat.pre.clone()));
     }
     if spec.chat.template.is_some() && spec.chat.tools.is_none() {

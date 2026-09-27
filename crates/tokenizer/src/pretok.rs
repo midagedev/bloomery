@@ -237,6 +237,12 @@ impl Pre {
     pub(crate) fn of(name: &str) -> Option<Pre> {
         Pre::NAMES.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
     }
+
+    /// [`Pre::NAMES`]' names, comma-separated.
+    pub(crate) fn names() -> String {
+        let names: Vec<&str> = Pre::NAMES.iter().map(|&(n, _)| n).collect();
+        names.join(", ")
+    }
 }
 
 /// Split one text fragment, given as codepoints, into pre-tokenizer words
@@ -390,6 +396,18 @@ fn split_custom(cpts: &[u32], c: &[u8], digits: usize, out: &mut Vec<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{Pre, Scratch, split};
+
+    /// Every name the table runs is one the crate says it runs and the
+    /// refusal of another lists.
+    #[test]
+    fn names_have_one_table() {
+        let refusal = crate::Error::UnsupportedPre("gpt-4o".to_string()).to_string();
+        for (name, _) in Pre::NAMES {
+            assert!(crate::runs_pre_tokenizer(name), "{name}");
+            assert!(refusal.contains(name), "{name} not in: {refusal}");
+        }
+        assert!(!crate::runs_pre_tokenizer("gpt-4o"));
+    }
 
     fn words(pre: Pre, text: &str) -> Vec<String> {
         let cpts: Vec<u32> = text.chars().map(u32::from).collect();

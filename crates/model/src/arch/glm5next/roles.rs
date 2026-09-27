@@ -1,76 +1,153 @@
 //! The role of every tensor in a glm5next file, by exact name: the three
-//! model-level names, then the per-layer stems. Every tensor of a
-//! next-token layer is [`Role::Unused`]: carried, never loaded. A name the
-//! table does not hold fails the file with every such name listed.
+//! model-level names, then the per-layer stems — one table, by the group a
+//! layer's kind carries ([`KDA`] … [`NEXTN`]), which the header reader's
+//! tensor check reads too. Every tensor of a next-token layer is
+//! [`Role::Unused`]: carried, never loaded. A name the table does not hold
+//! fails the file with every such name listed.
 
 use gguf::Split;
 
 use super::hparams::Hparams;
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
-/// The role of a trunk layer's stem: the KDA and latent mixers with the
-/// indexer, the hyper-connections, the pre-FFN norm, a dense layer's FFN,
-/// the router with its selection bias, the shared expert, the routed stacks.
-fn layer_role(stem: &str) -> Option<Role> {
-    match stem {
-        "attn_norm.weight"
-        | "attn_q.weight"
-        | "attn_k.weight"
-        | "attn_v.weight"
-        | "ssm_conv1d_q.weight"
-        | "ssm_conv1d_k.weight"
-        | "ssm_conv1d_v.weight"
-        | "ssm_f_a.weight"
-        | "ssm_f_b.weight"
-        | "ssm_g_a.weight"
-        | "ssm_g_b.weight"
-        | "ssm_beta.weight"
-        | "ssm_a"
-        | "ssm_dt.bias"
-        | "ssm_norm.weight"
-        | "attn_q_a.weight"
-        | "attn_q_a_norm.weight"
-        | "attn_q_b.weight"
-        | "attn_kv_a_mqa.weight"
-        | "attn_kv_a_norm.weight"
-        | "attn_k_b.weight"
-        | "attn_v_b.weight"
-        | "attn_output.weight"
-        | "indexer.attn_k.weight"
-        | "indexer.attn_q_b.weight"
-        | "indexer.k_norm.weight"
-        | "indexer.k_norm.bias"
-        | "indexer.proj.weight"
-        | "indexer_compressor_gate.weight"
-        | "indexer_compressor_ape.weight" => Some(Role::Attention),
-        "hc_attn_fn.weight"
-        | "hc_attn_base.weight"
-        | "hc_attn_scale.weight"
-        | "hc_ffn_fn.weight"
-        | "hc_ffn_base.weight"
-        | "hc_ffn_scale.weight" => Some(Role::HyperConnection),
-        "ffn_norm.weight" => Some(Role::FfnNorm),
-        "ffn_gate.weight" | "ffn_up.weight" | "ffn_down.weight" => Some(Role::DenseFfn),
-        "ffn_gate_inp.weight" | "exp_probs_b.bias" => Some(Role::Router),
-        "ffn_gate_shexp.weight" | "ffn_up_shexp.weight" | "ffn_down_shexp.weight" => {
-            Some(Role::SharedExpert)
-        }
-        "ffn_gate_exps.weight" | "ffn_up_exps.weight" | "ffn_down_exps.weight" => {
-            Some(Role::RoutedExperts)
-        }
-        _ => None,
+/// A tensor a layer of some kind carries, by stem: its role, and whether
+/// the file must carry it (ik creates it without `TENSOR_NOT_REQUIRED`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Stem {
+    pub(super) name: &'static str,
+    pub(super) role: Role,
+    pub(super) required: bool,
+}
+
+const fn req(name: &'static str, role: Role) -> Stem {
+    Stem {
+        name,
+        role,
+        required: true,
     }
+}
+
+const fn opt(name: &'static str, role: Role) -> Stem {
+    Stem {
+        name,
+        role,
+        required: false,
+    }
+}
+
+/// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
+/// because without them ik takes another decay rule (`src/llama-kda.cpp`,
+/// `build_kda_beta_gate`).
+pub(super) const KDA: &[Stem] = &[
+    req("attn_norm.weight", Role::Attention),
+    req("attn_q.weight", Role::Attention),
+    req("attn_k.weight", Role::Attention),
+    req("attn_v.weight", Role::Attention),
+    req("ssm_conv1d_q.weight", Role::Attention),
+    req("ssm_conv1d_k.weight", Role::Attention),
+    req("ssm_conv1d_v.weight", Role::Attention),
+    req("ssm_f_a.weight", Role::Attention),
+    req("ssm_f_b.weight", Role::Attention),
+    req("ssm_g_a.weight", Role::Attention),
+    req("ssm_g_b.weight", Role::Attention),
+    req("ssm_beta.weight", Role::Attention),
+    req("ssm_a", Role::Attention),
+    req("ssm_dt.bias", Role::Attention),
+    req("ssm_norm.weight", Role::Attention),
+    req("attn_output.weight", Role::Attention),
+];
+
+/// A latent attention layer's mixer with its indexer, which is required
+/// because without it ik runs dense attention (`src/llama-load-tensors.cpp`,
+/// `create_glm5next_tensors`).
+pub(super) const LATENT: &[Stem] = &[
+    req("attn_norm.weight", Role::Attention),
+    req("attn_q_a.weight", Role::Attention),
+    req("attn_q_a_norm.weight", Role::Attention),
+    req("attn_q_b.weight", Role::Attention),
+    req("attn_kv_a_mqa.weight", Role::Attention),
+    req("attn_kv_a_norm.weight", Role::Attention),
+    req("attn_k_b.weight", Role::Attention),
+    req("attn_v_b.weight", Role::Attention),
+    req("attn_output.weight", Role::Attention),
+    req("indexer.attn_k.weight", Role::Attention),
+    req("indexer.attn_q_b.weight", Role::Attention),
+    req("indexer.k_norm.weight", Role::Attention),
+    req("indexer.k_norm.bias", Role::Attention),
+    req("indexer.proj.weight", Role::Attention),
+    req("indexer_compressor_gate.weight", Role::Attention),
+    req("indexer_compressor_ape.weight", Role::Attention),
+];
+
+/// A dense layer's feed-forward block.
+pub(super) const DENSE: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate.weight", Role::DenseFfn),
+    req("ffn_up.weight", Role::DenseFfn),
+    req("ffn_down.weight", Role::DenseFfn),
+];
+
+/// The router's selection bias, which ik loads when present: the spec's
+/// `Router::bias` is its presence.
+pub(super) const SELECTION_BIAS: &str = "exp_probs_b.bias";
+
+/// A routed layer's feed-forward block: the router with its selection bias,
+/// and the routed stacks.
+pub(super) const MOE: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate_inp.weight", Role::Router),
+    opt(SELECTION_BIAS, Role::Router),
+    req("ffn_gate_exps.weight", Role::RoutedExperts),
+    req("ffn_up_exps.weight", Role::RoutedExperts),
+    req("ffn_down_exps.weight", Role::RoutedExperts),
+];
+
+/// A routed layer's shared expert, when the file has one.
+pub(super) const SHARED: &[Stem] = &[
+    req("ffn_gate_shexp.weight", Role::SharedExpert),
+    req("ffn_up_shexp.weight", Role::SharedExpert),
+    req("ffn_down_shexp.weight", Role::SharedExpert),
+];
+
+/// The hyper-connection tensors: every trunk layer's, no next-token layer's.
+pub(super) const HC: &[Stem] = &[
+    req("hc_attn_fn.weight", Role::HyperConnection),
+    req("hc_attn_base.weight", Role::HyperConnection),
+    req("hc_attn_scale.weight", Role::HyperConnection),
+    req("hc_ffn_fn.weight", Role::HyperConnection),
+    req("hc_ffn_base.weight", Role::HyperConnection),
+    req("hc_ffn_scale.weight", Role::HyperConnection),
+];
+
+/// A next-token layer's own stems, beside the trunk's; `shared_head_norm` is
+/// optional (the block shares the trunk's embedding and head).
+pub(super) const NEXTN: &[Stem] = &[
+    req("nextn.eh_proj.weight", Role::Unused),
+    req("nextn.enorm.weight", Role::Unused),
+    req("nextn.hnorm.weight", Role::Unused),
+    opt("nextn.shared_head_norm.weight", Role::Unused),
+];
+
+/// Every stem a trunk layer may carry, by group.
+const TRUNK: [&[Stem]; 6] = [KDA, LATENT, DENSE, MOE, SHARED, HC];
+
+/// The names of `stems` the file must carry.
+pub(super) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
+    stems.iter().filter(|s| s.required).map(|s| s.name)
+}
+
+/// The role of a trunk layer's stem.
+fn layer_role(stem: &str) -> Option<Role> {
+    TRUNK
+        .iter()
+        .flat_map(|g| g.iter())
+        .find(|s| s.name == stem)
+        .map(|s| s.role)
 }
 
 /// A next-token layer's own stems, beside the trunk's.
 fn nextn_stem(stem: &str) -> bool {
-    matches!(
-        stem,
-        "nextn.eh_proj.weight"
-            | "nextn.enorm.weight"
-            | "nextn.hnorm.weight"
-            | "nextn.shared_head_norm.weight"
-    )
+    NEXTN.iter().any(|s| s.name == stem)
 }
 
 /// A tensor's role and layer by its name; `None` when the table does not
@@ -122,4 +199,28 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
         experts: hp.n_expert as u64,
         experts_used: hp.n_used as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KDA, LATENT, NEXTN, Stem, TRUNK, layer_role};
+
+    /// A stem in two groups (the norm and output every mixer carries, the
+    /// pre-FFN norm) names one role, and no group lists a stem twice.
+    #[test]
+    fn a_stem_has_one_role() {
+        let all: Vec<&Stem> = TRUNK.iter().flat_map(|g| g.iter()).collect();
+        for s in &all {
+            assert_eq!(layer_role(s.name), Some(s.role), "{}", s.name);
+        }
+        for g in TRUNK.iter().chain([&NEXTN]) {
+            for (i, s) in g.iter().enumerate() {
+                assert!(!g[..i].iter().any(|t| t.name == s.name), "{} twice", s.name);
+            }
+        }
+        assert!(NEXTN.iter().all(|s| layer_role(s.name).is_none()));
+        // The header check refuses the other mixer's stems by name: each is
+        // one the file must carry where its kind is.
+        assert!(KDA.iter().chain(LATENT).all(|s| s.required));
+    }
 }

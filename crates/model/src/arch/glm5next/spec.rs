@@ -8,14 +8,13 @@
 //! hyper-connection mix; the streams collapse to their mean before the head.
 //! A dense layer and a shared expert take the shared SwiGLU limit
 //! (`llm_build_ffn` in `src/llama-build-context.cpp`), the routed experts the
-//! routed one. The tool-call syntax (`<tool_call>` with `<arg_key>` and
-//! `<arg_value>`) has no parser here; the `<think>` span is read.
+//! routed one. The tool calls are [`TOOLS`], the `<think>` span is read.
 
 use gguf::Split;
 use models::{
     Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcMix, HcSpec, Latent, LatentOut,
     LatentUp, LayerSpec, Mixer, ModelSpec, Moe, PoolRule, ReasoningFormat, Residual, Router, Score,
-    Selector, Shared,
+    Selector, Shared, ToolFormat,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -23,11 +22,15 @@ use super::roles;
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::{ModelTensors, PlacementError};
 
+/// The tool-call markup the family's template teaches: `<tool_call>` with
+/// `<arg_key>` and `<arg_value>`.
+pub const TOOLS: Option<ToolFormat> = Some(ToolFormat::GlmXml);
+
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
     let hp = Hparams::read(split)?;
     let tensors = roles::classify(split, &hp)?;
-    let chat = chat_of(split, None, Some(ReasoningFormat::ThinkSpan))?;
+    let chat = chat_of(split, TOOLS, Some(ReasoningFormat::ThinkSpan))?;
     let spec = spec_of(&hp, &tensors, chat)?;
     Ok(Read {
         spec,
@@ -43,7 +46,7 @@ pub fn spec_of(
     chat: models::ChatSpec,
 ) -> Result<ModelSpec, PlacementError> {
     let bias = |l: usize| {
-        let name = format!("blk.{l}.exp_probs_b.bias");
+        let name = format!("blk.{l}.{}", roles::SELECTION_BIAS);
         tensors.tensors.iter().any(|t| t.name == name)
     };
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
@@ -158,4 +161,71 @@ pub fn spec_of(
         engram: None,
         chat,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use models::Ffn;
+
+    use super::super::hparams::tests::{keys, tensors};
+    use super::super::roles::SELECTION_BIAS;
+    use crate::arch::coverage;
+    use crate::arch::synthetic::{V, header_with};
+
+    /// The small header of the `hparams` tests, with `tokenizer.ggml.pre`
+    /// `glm4` and a chat template, and the tensors `keep` keeps; its read
+    /// and the coverage check's items.
+    fn read(tag: &str, keep: impl Fn(&str) -> bool) -> (super::Read, Vec<String>) {
+        let tensors: Vec<String> = tensors().into_iter().filter(|t| keep(t)).collect();
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("glm4")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let path = header_with(tag, "glm5next", &keys(), &global, &tensors);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = super::read(&split).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&path);
+        let read = read.expect("the header reads");
+        let items = coverage::check(&read.spec, &read.tensors)
+            .into_iter()
+            .map(|u| u.feature)
+            .collect();
+        (read, items)
+    }
+
+    /// A GLM file's chat surface is one the tree runs: the tokenizer's
+    /// `glm4` pre-tokenizer and the `<tool_call>` parser the family declares
+    /// are not coverage items.
+    #[test]
+    fn the_chat_surface_is_covered() {
+        let (read, items) = read("glm5next-chat", |_| true);
+        assert_eq!(read.spec.chat.tools, super::TOOLS);
+        for covered in ["pre-tokenizer glm4", "a tool-call parser for this template"] {
+            assert!(
+                !items.iter().any(|f| f == covered),
+                "{covered:?} listed: {items:?}"
+            );
+        }
+    }
+
+    /// The selection bias is optional, as ik loads it: a file without it
+    /// reads, and its routers run with none.
+    #[test]
+    fn the_selection_bias_is_optional() {
+        let bias = |r: &super::Read| -> Vec<bool> {
+            r.spec
+                .layers
+                .iter()
+                .chain(&r.spec.mtp)
+                .filter_map(|l| match &l.ffn {
+                    Ffn::Moe(m) => Some(m.router.bias),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (with, _) = read("glm5next-bias", |_| true);
+        let (without, _) = read("glm5next-nobias", |t| !t.ends_with(SELECTION_BIAS));
+        assert_eq!(bias(&with), [true; 4]);
+        assert_eq!(bias(&without), [false; 4]);
+    }
 }
