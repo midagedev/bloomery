@@ -20,6 +20,9 @@ pub enum Identity {
     Manifest,
     /// `# model\t<path>` and `# draft_model\t<path>` (`dump_draft`).
     ManifestAndDraft,
+    /// `# model\t<path>` in an MTP draft set's `MANIFEST.tsv` (`dump_mtp`):
+    /// the target file, which carries the NextN block.
+    MtpManifest,
     /// `model=<path>` in the `# argmax_ref` line heading the tsv (`argmax_ref`).
     ArgmaxHeader,
     /// `  model <path>` in the run's log, `<tag>.log` beside `<tag>.kld`
@@ -226,6 +229,14 @@ impl Family {
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),
                     draft: set.draft_model,
+                    build: set.build,
+                })
+            }
+            Identity::MtpManifest => {
+                let set = crate::mtpref::MtpSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
                     build: set.build,
                 })
             }
