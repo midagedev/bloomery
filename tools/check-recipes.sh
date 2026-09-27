@@ -153,6 +153,22 @@ if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${mc##*$'\n'}"
+# gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
+# build's times row) on a fixture justfile and fixture times rows, no box.
+if ! gbt=$(bash "$(dirname "$0")/gate-batch.sh" --self-test 2>&1); then
+  echo "$gbt" >&2
+  echo "check-recipes: the gate-batch self-test failed" >&2
+  exit 1
+fi
+echo "${gbt##*$'\n'}"
+# gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
+# a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
+if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
+  echo "$ggt" >&2
+  echo "check-recipes: the gpu-gate self-test failed" >&2
+  exit 1
+fi
+echo "${ggt##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(

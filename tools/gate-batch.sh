@@ -5,6 +5,7 @@
 # second bound.
 #   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
+#   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile (check-recipes runs it)
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
@@ -40,12 +41,25 @@
 #      a6000 for an `any` one); a BLOOMERY_CARD recipe gets none (box.sh picks). Alone means within
 #      this batch: another track's box jobs still run. The attribute is read from `just --dump --dump-format json`, where a recipe's
 #      "attributes" list holds {"group": "solo"}; a `[group('…')]` value anywhere in the justfile other
-#      than solo is a named error — a group is a scheduling class here, and a typo must not drop a gate
-#      out of its class.
+#      than solo and v41-load is a named error — a group is a scheduling class here, and a typo must not
+#      drop a gate out of its class.
+#   v41-load: a recipe (or a dependency) that carries `[group('v41-load')]` — one whose binary loads the
+#      whole V4.1 model (body::open, HostResidency::at_load: the host set, ~190 GB, populated) — runs
+#      in lane A even when its gpu-gate.sh call takes `any` (then on the 3090). Not alone: lane B keeps
+#      running. solo wins. What keeps two V4.1 loads apart on the box, across trees and batches, is
+#      tools/gpu-gate.sh's V4.1 load lock, which a member asks for by exporting
+#      BLOOMERY_GATE_V41_LOAD=1 in its box command (group and export must name the same recipes, a named
+#      error otherwise). The lane is for the plan: members in two lanes would serialize on that lock
+#      anyway, so lane sums that ran them in parallel would be wrong, and the waiting one would hold its
+#      lane's card lock through the wait.
 # A recipe that runs a timing runner or takes the timing lease is refused, because a batch's builds
-# contaminate a timed run. Two tests: the runner names in TIMED below, and what a script the recipe
-# runs does, followed transitively — a tools/…sh that calls lease_take (tools/ref/lease.sh), or that
-# opens the lease lock for a descriptor and waits on it with flock -w. Each lane runs its items in list order; A and B run
+# contaminate a timed run. Two tests: what a script the recipe runs does, followed transitively — a
+# tools/…sh that calls lease_take (tools/ref/lease.sh), or that opens the lease lock for a descriptor
+# and waits on it with flock -w — and, for what that walk cannot see, the names in TIMED below. Also
+# refused: a recipe whose text runs this script (`just smoke`: a batch inside a batch runs lanes of its
+# own on the same cards), and an item whose ARGS hand a `[group('solo')]` recipe's gpu-gate.sh binary
+# one of the --flags that recipe passes it (`gate-gpu-ds41-long:--faults` is gate-gpu-ds41-faults' arm,
+# which runs alone and with BLOOMERY_HOST_LOCK=1) — the error names the solo recipe to list instead. Each lane runs its items in list order; A and B run
 # concurrently (cargo serializes their builds by its own lock). --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
@@ -58,6 +72,11 @@
 # it ran on (3090 or a6000; both or a6000 for box.sh's own pick; none for no device code; any under
 # --lanes 1, where the recipe picks at run time), the seconds of its final try (an rc 75 try before it
 # waited on a lock and ran nothing; an item whose last try is still rc 75 writes no row), and the date.
+# A final try that built cold — its log shows cargo compiling a crate from outside the tree, a registry
+# or git dependency: a new remote directory, a toolchain, flag or pin move — writes its row to the
+# sibling file <times file without .tsv>-cold.tsv, same format, which no plan reads, and its item line
+# gains `cold=1`: one build must not drag the item's median. The row format stays five fields — every
+# tree's copy of this script reads the one shared file.
 # Only this script appends, each row with one write(2) on an O_APPEND descriptor under an exclusive
 # flock; the plan reads the file under a shared one. A malformed row is a named error before anything
 # runs. An item with no row expects DEFAULT_S (45 s, derived: the fixup5 batch's mean item, 2,167 s
@@ -70,8 +89,8 @@
 # appends under a `=== try` header). rc 75 (lock contention) retries after 30 s, up to 10 times; any
 # other rc is final. DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
-# <s>s try=<t> lane=<A|B|X>` per item (plus `times=append-failed` when its times row could not be
-# written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
+# <s>s try=<t> lane=<A|B|X>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
+# times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
 # (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). Exit 0
 # iff every rc is 0. DIR defaults to target/gate-batch/<stamp> of this tree: under target/ it is
 # gitignored and outside box.sh's rsync, so the logs neither ship to the box nor mark the tree dirty.
@@ -84,8 +103,8 @@
 # call passes that guard with its default wait: a sitting that takes the lease mid-batch gets a quiet
 # box — the item waits (up to 30 min, then rc 75, which retries below) and starts after the sitting.
 # The wait comes before the item's command, so the runners' 900 s bound does not count it; nor does the
-# item's times row: the final try's seconds less the waits its log names (box.sh's guard, gpu-gate.sh's lock),
-# which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
+# item's times row: the final try's seconds less the waits its log names (box.sh's guard, gpu-gate.sh's card
+# lock and V4.1 load lock), which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
 #
@@ -126,7 +145,7 @@
 # why: `skip` with the green run's commit, date and tree; `run` with what moved since the item's last
 # green (the parts of each green key are kept in <ledger>.parts/<key>.parts).
 #   Never skipped: a recipe that runs a reference tree's files (ik, llama.cpp, mistral.rs — today
-# gate-1-1 and gate-tokenizer), a batch runner inside a batch (smoke), an item whose env or ARGS name an
+# gate-1-1 and gate-tokenizer), an item whose env or ARGS name an
 # absolute path the manifest does not read, and — with --lanes 1, where no card is forced — a recipe
 # whose gpu-gate.sh call takes the `any` card, which it picks at run time. A key that cannot be computed
 # (a missing file, a failed manifest) is a named error: the item runs and is not recorded.
@@ -169,10 +188,170 @@ TRIES_MAX=11
 RETRY_WAIT=30
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
+COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
+# The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
+# once the record does), then the line, one write(2) on an O_APPEND descriptor under an exclusive flock.
+IFS= read -r -d '' PYAPPEND << 'PY' || true
+import fcntl, os, shutil, sys
+
+path, line = sys.argv[1:3]
+if len(sys.argv) == 5:
+    parts_src, parts_dst = sys.argv[3:5]
+    if not os.path.exists(parts_dst):
+        os.makedirs(os.path.dirname(parts_dst), exist_ok=True)
+        tmp = f"{parts_dst}.{os.getpid()}.tmp"
+        shutil.copyfile(parts_src, tmp)
+        os.replace(tmp, parts_dst)
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+data = (line.replace("\n", " ") + "\n").encode()
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    if os.write(fd, data) != len(data):
+        sys.exit(f"gate-batch: a short write to {path}")
+finally:
+    os.close(fd)
+PY
+
+times_record() { # $1 = plan index, $2 = lane, $3 = the final try's seconds, $4 = 1 for a cold build
+  local f=$TIMES_FILE
+  [ "${4:-0}" = 0 ] || f=$COLD_FILE
+  python3 -c "$PYAPPEND" "$f" "$(printf '%s\t%s\t%s\t%s\t%s' "${P_TKEY[$1]}" "$2" "${P_TCARD[$1]}" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')")"
+}
+
+# cold_of <log> <try>: 1 when the try's section of the item's log compiled a crate from outside the tree
+# (cargo's `Compiling <name> v<ver>` with no local ` (/path)`: a registry or git dependency), which a
+# build does only in a new remote directory or after the toolchain, the flags or a pinned dependency
+# moved; else 0. Such a try's seconds are a one-off build, not the item's.
+cold_of() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && /^ *Compiling [A-Za-z0-9_-]+ v[0-9]/ && !/ \(\// { c = 1 }
+    END { print c + 0 }' "$1"
+}
+
+# try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
+# (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock and for the V4.1 load
+# lock (`gpu-gate.sh: waited N s for the …`),
+# summed over the try's section of the item's log. A times row holds the rest: a lock queue is not a gate's cost.
+try_waits() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
+    END { print w + 0 }' "$1"
+}
+
+# --self-test: the rules of items 1 and 4 on a fixture justfile and fixture times rows, in a temporary
+# tree holding a copy of this script (no box, no ssh; `just` and python3 only). One line per case,
+# `ok <name>` or `FAIL <name>: <why>` with the output; exit 0 iff none failed. check-recipes runs it.
+self_test() {
+  local self t n=0 bad=0 out rc
+  self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
+  # shellcheck disable=SC2064 # the path is fixed now
+  trap "rm -rf '$t'" EXIT
+  mkdir -p "$t/tools"
+  cp "$self" "$t/tools/gate-batch.sh"
+  cat > "$t/justfile" << 'JF'
+[group('v41-load')]
+v41-any:
+    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_x'
+
+[group('v41-load')]
+v41-a *ARGS:
+    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh gen_y {{ARGS}}'
+
+[group('solo')]
+[group('v41-load')]
+v41-solo:
+    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh gen_y --faults'
+
+plain-any:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other'
+
+host:
+    ./tools/box.sh 'bash tools/gate.sh -p x'
+
+nested *ARGS:
+    ./tools/gate-batch.sh --smoke {{ARGS}}
+JF
+  # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
+  printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
+    plain-any B a6000 10 2026-09-27T10:00:00+0900 host B none 5 2026-09-27T10:00:00+0900 > "$t/times.tsv"
+  pass() { n=$((n + 1)); echo "ok $1"; }
+  fail() {
+    n=$((n + 1)) bad=$((bad + 1))
+    echo "FAIL $1: $2"
+    printf '%s\n' "$out" | sed 's/^/    | /'
+  }
+  # check <name> <want rc> <ERE the output must hold> <command…>
+  check() {
+    local name=$1 want=$2 pat=$3
+    shift 3
+    rc=0
+    out=$("$@" 2>&1) || rc=$?
+    if [ "$rc" != "$want" ]; then fail "$name" "rc $rc, want $want"
+    elif ! printf '%s\n' "$out" | grep -Eq -- "$pat"; then fail "$name" "no line matches /$pat/"
+    else pass "$name"; fi
+  }
+  local gb=(bash "$t/tools/gate-batch.sh")
+  export BLOOMERY_GATE_TIMES=$t/times.tsv
+  check 'classes: an any-form v41-load recipe is lane A on the 3090' 0 \
+    "^v41-any	A	fixed	3090	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
+  check 'classes: an any-form recipe outside the group stays balanced' 0 '^plain-any	F	balanced	3090,a6000	' "${gb[@]}" --classes
+  check 'classes: solo wins over v41-load' 0 '^v41-solo	X	solo	3090	' "${gb[@]}" --classes
+  check 'classes: a recipe that runs a batch is refused' 0 '^nested	R	refused	-	nested runs tools/gate-batch\.sh' "${gb[@]}" --classes
+  check 'dry run: the v41-load member runs in lane A with the 3090 forced' 0 \
+    "^lane A  v41-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just v41-any$" "${gb[@]}" --dry-run v41-a v41-any plain-any host
+  check 'dry run: lane A holds both V4.1 loads' 0 'predicted laneA=150s laneB=15s laneX=0s wall=150s' \
+    "${gb[@]}" --dry-run v41-a v41-any plain-any host
+  check 'items: a batch as an item is refused by name' 65 'nested runs tools/gate-batch\.sh' "${gb[@]}" --dry-run host nested
+  check "items: a solo recipe's arm through another recipe is refused, naming the solo recipe" 65 \
+    "'v41-a:--faults' hands gen_y --faults, the arm of the solo recipe v41-solo" "${gb[@]}" --dry-run 'v41-a:--faults'
+  check 'items: other ARGS of the same binary pass' 0 "^lane A  v41-a-2 " "${gb[@]}" --dry-run v41-a 'v41-a:--sets'
+  # Cold builds: the final try's section only; a local crate is the tree's, a registry or git one is not.
+  printf '%s\n' '=== try 1 x' '   Compiling libc v0.2.155' '=== try 2 x' '   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery/crates/gpu)' > "$t/warm.log"
+  printf '%s\n' '=== try 1 x' '   Compiling cuda-core v0.1.0 (https://github.com/x/cuda-oxide?branch=b#abc)' '    Finished `release`' > "$t/cold.log"
+  out=$(cold_of "$t/warm.log" 2)/$(cold_of "$t/warm.log" 1)/$(cold_of "$t/cold.log" 1)
+  if [ "$out" = 0/1/1 ]; then pass 'cold: a registry or git crate compiled in the final try, and only there'
+  else fail 'cold: a registry or git crate compiled in the final try, and only there' "got $out, want 0/1/1"; fi
+  local TIMES_FILE=$t/rows.tsv COLD_FILE=$t/rows-cold.tsv P_TKEY=(k-warm k-cold) P_TCARD=(3090 3090)
+  times_record 0 A 12 0 && times_record 1 A 900 1
+  out="$(cut -f1,4 "$TIMES_FILE" 2>&1 || true) | $(cut -f1,4 "$COLD_FILE" 2>&1 || true)"
+  if [ "$out" = "k-warm	12 | k-cold	900" ]; then pass 'cold: its row goes to the cold file, never into the median'
+  else fail 'cold: its row goes to the cold file, never into the median' "got '$out'"; fi
+  # The waits a times row leaves out: box.sh's guard, the card lock and the V4.1 load lock, final try only.
+  printf '%s\n' '=== try 1 x' 'gpu-gate.sh: waited 99 s for the gate lock (3090)' '=== try 2 x' \
+    '[guard] 2026-09-27T00:00:00Z quiet on two polls in a row after 60 s: the command starts' \
+    'gpu-gate.sh: waited 15 s for the gate lock (3090)' 'gpu-gate.sh: waited 40 s for the V4.1 load lock' > "$t/waits.log"
+  out=$(try_waits "$t/waits.log" 2)
+  if [ "$out" = 115 ]; then pass 'waits: the guard, the card lock and the V4.1 load lock of the final try'
+  else fail 'waits: the guard, the card lock and the V4.1 load lock of the final try' "got $out, want 115"; fi
+  # The group and gpu-gate.sh's lock request must name the same recipes.
+  cp "$t/justfile" "$t/justfile.good"
+  sed 's/export BLOOMERY_GATE_V41_LOAD=1 \&\& BLOOMERY_GATE_CARD/BLOOMERY_GATE_CARD/' "$t/justfile.good" > "$t/justfile"
+  check 'group without the export: a named error' 65 "recipe v41-any: \[group\('v41-load'\)\] without .export BLOOMERY_GATE_V41_LOAD=1." "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'plain-v41:' "    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'export without the group: a named error' 65 'recipe plain-v41: names BLOOMERY_GATE_V41_LOAD without' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  echo "gate-batch self-test: $((n - bad)) of $n ok"
+  [ "$bad" = 0 ]
+}
+
+
+if [ "${1:-}" = --self-test ]; then
+  [ $# = 1 ] || die "--self-test takes nothing else; $USAGE"
+  self_test
+  exit $?
+fi
 OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -272,10 +451,11 @@ def closure(name, seen):
 
 GPU_GATE = "tools/gpu-gate.sh"
 ANY = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
-TIMED = re.compile(
-    r"tools/ref/(time-gate|timing-card|measure|cpu-measure|depth-[a-z0-9]+|nsys-gpu|nsys-ds41|ncu-gpu)\.sh"
-    r"|gpu-ab\.py|/root/bloomery-(cpu|lease)\.lock"
-)
+# The names the structural rule (walk() and takes_lease below) cannot see: timing-card.sh, a library a
+# timing runner sources, which takes no lease itself; gpu-ab.py, a Python runner walk() does not read;
+# the lease lock named in a recipe's own text, which walk() does not read either. Every runner that calls
+# lease_take is found by the walk.
+TIMED = re.compile(r"tools/ref/timing-card\.sh|gpu-ab\.py|/root/bloomery-(cpu|lease)\.lock")
 BOX_CARD = re.compile(r"\bBLOOMERY_CARD=(both|a6000)\b")
 UNLOCKED = re.compile(r"tools/gate\.sh --oxide|cargo oxide (test|run)\b")
 SEGMENT = re.compile(r"&&|\|\||;|\||\n")
@@ -332,7 +512,8 @@ def takes_lease(path):
 WALK_DEPTH = 6
 BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
 GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b", re.M)
-RUNNER_SELF = {GPU_GATE, "tools/gate-batch.sh"}
+BATCH = "tools/gate-batch.sh"
+RUNNER_SELF = {GPU_GATE, BATCH}
 MESSAGE = re.compile(r"^[\s{(!]*(?:echo|printf|die|fail|say)\b")
 
 
@@ -416,6 +597,9 @@ def classify(name):
     lanes_seen, reasons, forms = set(), [], set()
     for n in closure(name, set()):
         text = body(n)
+        if BATCH in SCRIPT.findall(text):
+            return "R", (f"{n} runs {BATCH}: a batch inside a batch runs lanes of its own beside this batch's, "
+                         "on the same cards; list its items instead")
         m = TIMED.search(text)
         if m:
             return "T", f"{n} names {m.group(0)}: a timed recipe does not run in a gate batch"
@@ -471,7 +655,10 @@ def classify(name):
 # The groups this runner reads from the just attribute `[group('…')]`. A value it does not know is a
 # named error wherever it sits in the justfile (check-recipes runs `--smoke --dry-run`, so it fails
 # there too): a group is a scheduling class here, and a typo must not drop a gate out of its class.
-GROUPS = {"solo": "alone in lane X, after both lanes"}
+GROUPS = {
+    "solo": "alone in lane X, after both lanes",
+    "v41-load": "lane A, one after another (solo wins)",
+}
 unknown = [
     f"recipe {n}: [group({a['group']!r})] is not a group this runner knows ({', '.join(GROUPS)}) — "
     "a group is a scheduling class here: add it to GROUPS in tools/gate-batch.sh with its lane rule, or remove it"
@@ -484,10 +671,67 @@ if unknown:
         print("gate-batch: " + e, file=sys.stderr)
     fail(f"{len(unknown)} unknown group attribute(s) in the justfile; nothing ran")
 
+# The v41-load group has two readers: this runner's lane, and tools/gpu-gate.sh's box-wide V4.1 load lock,
+# which a recipe asks for by exporting BLOOMERY_GATE_V41_LOAD=1 in its box command. The two must name the
+# same recipes: a member without the export loads V4.1 beside another tree's load; an export without the
+# group is a load this runner would balance onto lane B.
+V41_EXPORT = "export BLOOMERY_GATE_V41_LOAD=1 && "
+mismatch = []
+for n in sorted(recipes):
+    member = {"group": "v41-load"} in recipes[n]["attributes"]
+    text = body(n)
+    if member and V41_EXPORT not in text:
+        mismatch.append(f"recipe {n}: [group('v41-load')] without `{V41_EXPORT.strip(' &')}` in its box command "
+                        "— tools/gpu-gate.sh would not take the V4.1 load lock")
+    elif not member and "BLOOMERY_GATE_V41_LOAD" in text:
+        mismatch.append(f"recipe {n}: names BLOOMERY_GATE_V41_LOAD without [group('v41-load')]")
+if mismatch:
+    for e in mismatch:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(mismatch)} v41-load recipe(s) whose group and export disagree; nothing ran")
+
+
+def group_of(name, group):
+    """The recipes of name's closure that carry [group('<group>')]."""
+    return [n for n in closure(name, set()) if {"group": group} in recipes[n]["attributes"]]
+
 
 def solo_of(name):
-    """The recipes of name's closure that carry [group('solo')]."""
-    return [n for n in closure(name, set()) if {"group": "solo"} in recipes[n]["attributes"]]
+    return group_of(name, "solo")
+
+
+# A solo recipe's arm run through another recipe: a non-solo item whose ARGS hand a solo recipe's
+# gpu-gate.sh binary one of the flags that solo recipe passes it (gate-gpu-ds41-long:--faults runs
+# gate-gpu-ds41-faults' arm) would run that arm in a lane beside other loads, and without whatever
+# else the solo recipe sets around it. Read from the justfile: per solo recipe, the binary of each
+# gpu-gate.sh call and the literal --flags after it.
+CALL_ARGS = re.compile(r"gpu-gate\.sh\s+([A-Za-z0-9_-]+)((?:\s+[^\s;&|]+)*)")
+
+
+def gate_calls(name):
+    """[(binary, {literal --flags})] of the gpu-gate.sh calls in name's own text."""
+    return [(m.group(1), set(re.findall(r"(?<!\S)(--[A-Za-z0-9][A-Za-z0-9-]*)", m.group(2))))
+            for m in CALL_ARGS.finditer(body(name))]
+
+
+SOLO_ARMS = {}
+for _n in recipes:
+    if {"group": "solo"} in recipes[_n]["attributes"]:
+        for _bin, _flags in gate_calls(_n):
+            for _f in _flags:
+                SOLO_ARMS.setdefault((_bin, _f), _n)
+
+
+def solo_arm(name, argv):
+    """The (flag, solo recipe) whose arm the item's ARGS select, or None."""
+    if solo_of(name):
+        return None
+    for n in closure(name, set()):
+        for b, _ in gate_calls(n):
+            for a in argv:
+                if (b, a) in SOLO_ARMS:
+                    return a, b, SOLO_ARMS[(b, a)]
+    return None
 
 
 ITEM = re.compile(r"^([A-Za-z0-9_-]+)(?:@([^:]*))?(?::(.*))?$")
@@ -582,6 +826,10 @@ def placement(name, lane, lanes):
         if uses_gpu_gate:
             return "X", kind, ["3090" if lane == "A" else "a6000"], ["3090" if lane == "A" else "a6000"]
         return "X", kind, ["-"], ["3090" if lane == "A" else "none"]
+    if group_of(name, "v41-load"):
+        # One lane: two V4.1 loads at once evict each other's host set from the page cache. Lane A,
+        # where the 3090-only (`--place gate`) loads already are; an `any` member runs on the 3090.
+        return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
     if lane == "A":
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
     if uses_gpu_gate:
@@ -600,7 +848,8 @@ if src == "classes":
             print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
         else:
             cls, kind, cards, _ = placement(name, lane, "2")
-            print("\t".join([name, cls, kind, ",".join(cards), reason]))
+            tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load") for n in group_of(name, g)]
+            print("\t".join([name, cls, kind, ",".join(cards), "; ".join(tags + [reason])]))
     sys.exit(0)
 
 counts, errors, out = {}, [], []
@@ -646,9 +895,15 @@ for item, at in zip(raw_items, where):
     if lane in ("T", "R"):
         errors.append(f"{at}: {reason}")
         continue
-    solo = solo_of(name)
-    if solo:
-        reason = "; ".join([f"{n}: [group('solo')]" for n in solo] + [reason])
+    arm = solo_arm(name, argv)
+    if arm:
+        flag, b, solo_n = arm
+        errors.append(f"{at}: {item!r} hands {b} {flag}, the arm of the solo recipe {solo_n} — it runs alone in "
+                      f"lane X with what that recipe sets around it; list {solo_n} instead")
+        continue
+    tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load") for n in group_of(name, g)]
+    if tags:
+        reason = "; ".join(tags + [reason])
     qargs = " ".join(shlex.quote(a) for a in argv)
     tkey = name + ("@" + ",".join(envs) if envs else "") + (":" + qargs if argv else "")
     if re.search(r"[\t\n]", tkey):
@@ -822,29 +1077,6 @@ if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; else LEDGER_FILE=$LEAD_
 ALSO_READ=''
 if [ "$LMODE" = round ] || [ "$TRUST" = 1 ]; then ALSO_READ=$ROUND_LEDGER; fi
 LEDGER_PARTS=$LEDGER_FILE.parts
-# The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
-# once the record does), then the line, one write(2) on an O_APPEND descriptor under an exclusive flock.
-IFS= read -r -d '' PYAPPEND << 'PY' || true
-import fcntl, os, shutil, sys
-
-path, line = sys.argv[1:3]
-if len(sys.argv) == 5:
-    parts_src, parts_dst = sys.argv[3:5]
-    if not os.path.exists(parts_dst):
-        os.makedirs(os.path.dirname(parts_dst), exist_ok=True)
-        tmp = f"{parts_dst}.{os.getpid()}.tmp"
-        shutil.copyfile(parts_src, tmp)
-        os.replace(tmp, parts_dst)
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-data = (line.replace("\n", " ") + "\n").encode()
-fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    if os.write(fd, data) != len(data):
-        sys.exit(f"gate-batch: a short write to {path}")
-finally:
-    os.close(fd)
-PY
 
 ledger_plan() { # the box manifest, then every candidate's key and status (C_*), before the lease check
   local m=$1/box-manifest.txt merr='' rc=0 try i key item status detail kargs=()
@@ -909,10 +1141,6 @@ ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose ke
   else
     echo append-failed
   fi
-}
-
-times_record() { # $1 = plan index, $2 = lane, $3 = the final try's seconds: the item's row in the times file
-  python3 -c "$PYAPPEND" "$TIMES_FILE" "$(printf '%s\t%s\t%s\t%s\t%s' "${P_TKEY[$1]}" "$2" "${P_TCARD[$1]}" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')")"
 }
 
 if [ -z "$OUT" ]; then
@@ -994,20 +1222,9 @@ echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" 
 echo "gate-batch: $N items, lanes $LANES, logs in $OUT"
 predicted
 
-# try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
-# (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock (`gpu-gate.sh: waited N s`),
-# summed over the try's section of the item's log. A times row holds the rest: a lock queue is not a gate's cost.
-try_waits() {
-  awk -v t="=== try $2 " '
-    index($0, t) == 1 { on = 1; next }
-    /^=== try / { on = 0 }
-    on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
-    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the gate lock/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
-    END { print w + 0 }' "$1"
-}
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0 cold=0
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
@@ -1033,11 +1250,14 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
   ran=$((ran > waits ? ran - waits : 0))
+  cold=$(cold_of "$log" "$try")
+  [ "$cold" = 0 ] || line="$line cold=1"
   [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
-  # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing.
-  if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran"; then
+  # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
+  # build's row goes to COLD_FILE, which no plan reads.
+  if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
     line="$line times=append-failed"
-    echo "gate-batch: ${P_STEM[$i]}: its row did not reach $TIMES_FILE (above)" >&2
+    echo "gate-batch: ${P_STEM[$i]}: its row did not reach $([ "$cold" = 0 ] && echo "$TIMES_FILE" || echo "$COLD_FILE") (above)" >&2
   fi
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"

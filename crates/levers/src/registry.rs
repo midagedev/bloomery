@@ -1036,6 +1036,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          `any`.",
     ),
     runner(
+        "BLOOMERY_GATE_V41_LOAD",
+        Some("gpu-gate.sh"),
+        "`1`: the run loads the whole V4.1 model, so it also takes the box-wide V4.1 load lock \
+         after its card lock(s); a recipe in the justfile's `v41-load` group exports it.",
+    ),
+    runner(
         "BLOOMERY_BOX_CARD",
         Some("box.sh"),
         "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000` or \

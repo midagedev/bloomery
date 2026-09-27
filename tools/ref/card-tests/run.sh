@@ -227,6 +227,14 @@ hold "$T" 'lease-hold without a command' 64 'no command after --' "$tmp/h2.lock"
 run 'lease-hold with two cards' 64 'name two cards' env BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_LEASE_LOCK="$tmp/h2.lock" \
   "$T/tools/ref/lease-hold.sh" --card docs/cards/exclusive.card -- true
 
+# A GPU timing runner (timing-card.sh sourced: witness_card defined) with TIMING_GPU empty is refused
+# before the card or the lease file: its record would say `none`, and tools/gpu-gate.sh would let a
+# forced gate onto the card it times. First on the box too.
+run 'lease_take refuses a GPU runner with no TIMING_GPU' 64 'refused: a GPU timing runner \(timing-card\.sh sourced\) with TIMING_GPU empty' \
+  env -u BLOOMERY_LEASE_HELD BLOOMERY_LEASE_LOCK="$tmp/g0.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+  bash -c 'source "$1" && witness_card() { :; } && TIMING_GPU= && lease_take' _ "$T/tools/ref/lease.sh"
+absent 'the refused GPU runner opens no lease file' "$tmp/g0.lock"
+
 if [ -e /root/bloomery-cpu.lock ]; then
   # The box: another lock file is refused before anything is opened.
   take "$ROOT" 'lease_take refuses BLOOMERY_LEASE_LOCK on the box' 64 \
@@ -267,6 +275,17 @@ else
   if [ "$card_lines" = "$body_lines" ]; then pass "lease_take prints the whole body ($body_lines lines)"; else
     fail 'lease_take prints the whole body' "$card_lines [lease] card | lines for a $body_lines-line card" "$tmp/out"; fi
   free 'the lease ends with the shell that took it' "$tmp/l2.lock"
+  # The timing-card record beside the lock (tools/gpu-gate.sh reads it while the lease is held): the
+  # runner's pid and its TIMING_GPU, `none` for a runner that times no GPU.
+  run 'lease_take records a CPU runner as timing no GPU' 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
+    BLOOMERY_LEASE_LOCK="$tmp/g1.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+    bash -c 'source "$1" && lease_take > /dev/null && r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" &&
+      [ "$r" = "pid=$$ timing_gpu=none" ] && echo "record matches"' _ "$T/tools/ref/lease.sh"
+  run "lease_take records a GPU runner's timing card" 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
+    BLOOMERY_LEASE_LOCK="$tmp/g2.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+    bash -c 'source "$1" && witness_card() { :; } && TIMING_GPU=GPU-test && lease_take > /dev/null &&
+      r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-test" ] && echo "record matches"' \
+    _ "$T/tools/ref/lease.sh"
 
   # lease-hold.sh: the card, the lease for the command's life, both witnesses, the command's rc, and a
   # lease that ends with this process whatever the command did.
