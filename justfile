@@ -634,8 +634,9 @@ gate-gpu-gemm *ARGS:
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
 # 모델 없이 Qwen3.6-35B-A3B 형상의 합성 입력으로 돌고, fault 사이트, 한 토큰의 그래프, 깊이 4,096의 f64 drift 보고를 함께 찍는다.
-gate-gpu-linear:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear'
+# ARGS `--case kda_ik`는 그 대신 KDA 층마다 conv·준비·delta·게이트 노름을 ik GLM 배치 세트(ref_glm5next)의 입력에 대 본다.
+gate-gpu-linear *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_linear && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_linear {{ARGS}}'
 
 # Qwen3.6-35B-A3B full-attention 카드 커널 — rope-256(q/k 노름 + 앞 64차원 NEOX), 디코드 flash 256(두 패스),
 # 프리필 flash 256, 게이트 접은 o-proj 양자화기 — 을 모델 없이 16/2×256, n_rot 64, θ 1e7 합성 입력으로 호스트 규칙에 맞추고,

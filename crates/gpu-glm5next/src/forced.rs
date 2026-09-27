@@ -15,7 +15,7 @@
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
-use model::arch::glm5next::names::{self, Sub};
+use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 
 use crate::body::{Body, f32v};
@@ -130,7 +130,7 @@ impl Body {
                 ffn::back(gpu, &mut p, hybrid.boundary(), l)?;
                 hybrid.row_enqueued(l, 0)?;
                 let bias = if p.cfg[l].bias {
-                    f32v(w, &names::exp_probs_b(l))?
+                    f32v(w, ffn::moe_names(&p, l)?.bias)?
                 } else {
                     &p.s.no_bias
                 };

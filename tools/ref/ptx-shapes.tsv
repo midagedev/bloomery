@@ -10,6 +10,7 @@
 # generate_ds41 (--features gpu,deepseek41)
 generate_ds41   add                                     0          0
 generate_ds41   argmax_fault                            0          0
+generate_ds41   argmax_finite_fault                     0          0
 generate_ds41   argmax_rows_fault                       0          0
 generate_ds41   card_sel                                0          0
 generate_ds41   dflash_expert_down                      0          0
@@ -206,6 +207,7 @@ generate_ds41   weighted_sum                            0          0
 # gate_e2e (--features gpu)
 gate_e2e        add                                     0          0
 gate_e2e        argmax_fault                            0          0
+gate_e2e        argmax_finite_fault                     0          0
 gate_e2e        argmax_rows_fault                       0          0
 gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
