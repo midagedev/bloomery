@@ -1102,7 +1102,10 @@ fn hw_ds41_spec() {
     });
     let dsplit = Split::open(&dpath).unwrap_or_else(|e| panic!("open {dpath}: {e}"));
     let dhp = DraftHparams::read(&dsplit).unwrap_or_else(|e| panic!("draft hparams: {e}"));
-    let DraftSpec::Block(d) = spec::draft_of(&dhp).unwrap_or_else(|e| panic!("draft spec: {e}"));
+    let DraftSpec::Block(d) = spec::draft_of(&dhp).unwrap_or_else(|e| panic!("draft spec: {e}"))
+    else {
+        panic!("draft spec: not a block draft")
+    };
     let mut dview = vec![
         format!(
             "hidden {} vocab {} rms_eps bits {:#010x}",

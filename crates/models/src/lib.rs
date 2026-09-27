@@ -586,10 +586,103 @@ pub enum ReasoningFormat {
     ThinkSpan,
 }
 
-/// A draft file, read to be paired with a target.
+/// A draft, read to be paired with a target.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DraftSpec {
     Block(BlockDraft),
+    /// Boxed: the layer's description is several times a block draft's size.
+    Mtp(Box<MtpDraft>),
+}
+
+/// A next-token (MTP) draft: one layer that reads the target's last hidden
+/// state and the embedding of the token the target just emitted, and
+/// proposes the token after it through the output matrix; its own output
+/// state is the next step's hidden input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpDraft {
+    pub source: MtpSource,
+    /// The layer, described as a trunk layer is.
+    pub layer: LayerSpec,
+    /// The layer's `blk.` index in its file: `block_count` less
+    /// `nextn_predict_layers`, the target trunk's length.
+    pub index: LayerIdx,
+    /// `embedding_length`; the target's too.
+    pub hidden: u32,
+    /// The target's too.
+    pub vocab: u32,
+    pub rms_eps: f32,
+    /// The layer's hyper-connections; `None`: the layer is
+    /// [`Residual::Plain`].
+    pub hc: Option<HcSpec>,
+    pub input: MtpInput,
+    pub head_norm: MtpHeadNorm,
+    pub head_rows: HeadRows,
+}
+
+/// Where an MTP layer's tensors are.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MtpSource {
+    /// In the target's own file.
+    InFile {
+        /// Its `blk.` index there.
+        layer: LayerIdx,
+    },
+    /// In a draft file of its own.
+    File {
+        /// The first shard's full path: the file's identity.
+        first_shard: std::path::PathBuf,
+        /// The file's tensor bytes, the header excluded.
+        bytes: u64,
+        borrows: Borrows,
+    },
+}
+
+/// Which of the target's tensors a draft file uses in place of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Borrows {
+    /// `token_embd`.
+    pub embedding: bool,
+    /// `output`.
+    pub head: bool,
+}
+
+/// How an MTP layer's input is made. Both forms norm the token's embedding
+/// by `nextn.enorm` and the target's row by `nextn.hnorm`, join them with the
+/// embedding's half first, and project the join by `nextn.eh_proj`
+/// (`2 × hidden` values to `hidden`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpInput {
+    /// The target's hyper-connection streams entering its output head, not
+    /// collapsed: `hnorm` over all `streams × hidden` values as one row, then
+    /// each stream joined and projected, one input stream per stream.
+    Streams,
+    /// The row the target's head reads, its streams collapsed and normed by
+    /// the output norm: one row joined and projected.
+    HeadRow,
+}
+
+/// What the MTP layer's row goes through before the output matrix, in place
+/// of the target's own head norm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpHeadNorm {
+    /// The layer's own gated-residual head (`nextn.hc_head_*`), of the
+    /// target's `output_hc_*` form: it norms and collapses the streams.
+    HcHead,
+    /// The layer's own RMS gain (`nextn.shared_head_norm`).
+    Rms,
+}
+
+/// The output rows an MTP head scores.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeadRows {
+    /// Every token of the vocabulary.
+    Full,
+    /// Only these tokens: ids ascending, distinct, each below the vocabulary.
+    List {
+        ids: std::sync::Arc<[u32]>,
+        /// The SHA-256 of the tokenizer the ids index.
+        digest: [u8; 32],
+    },
 }
 
 /// A block draft: blocks of positions proposed in one pass from the

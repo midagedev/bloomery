@@ -96,6 +96,15 @@ pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, P
     }
 }
 
+/// The error naming `general.architecture`, which `is` completes: its value
+/// and why a reader refuses it there.
+fn architecture_is(is: &str) -> PlacementError {
+    PlacementError::Metadata {
+        key: "general.architecture".to_string(),
+        detail: format!("is {is}"),
+    }
+}
+
 /// The architectures this engine can run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
@@ -322,6 +331,42 @@ pub(crate) mod synthetic {
         global: &[(&str, V)],
         tensors: &[(String, Vec<u64>)],
     ) -> PathBuf {
+        let typed: Vec<(String, Vec<u64>, Ty)> = tensors
+            .iter()
+            .map(|(n, d)| (n.clone(), d.clone(), Ty::F32))
+            .collect();
+        header_typed(tag, arch, kv, global, &typed)
+    }
+
+    /// A tensor type the synthetic headers write.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Ty {
+        F32,
+        /// Blocks of 32 values in 34 bytes; the first dim a multiple of 32.
+        Q8_0,
+    }
+
+    impl Ty {
+        /// The ggml type id and the bytes of `n` values.
+        fn id_and_bytes(self, n: u64) -> (u32, u64) {
+            match self {
+                Ty::F32 => (0, 4 * n),
+                Ty::Q8_0 => {
+                    assert!(n.is_multiple_of(32), "{n} values are not whole Q8_0 blocks");
+                    (8, n / 32 * 34)
+                }
+            }
+        }
+    }
+
+    /// [`header_shaped`] with each tensor's type.
+    pub(crate) fn header_typed(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        global: &[(&str, V)],
+        tensors: &[(String, Vec<u64>, Ty)],
+    ) -> PathBuf {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -383,14 +428,15 @@ pub(crate) mod synthetic {
             }
         }
         let mut offset = 0u64;
-        for (name, dims) in tensors {
+        for (name, dims, ty) in tensors {
+            let (id, bytes) = ty.id_and_bytes(dims.iter().product::<u64>());
             string(&mut b, name);
             b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
             dims.iter()
                 .for_each(|d| b.extend_from_slice(&d.to_le_bytes()));
-            b.extend_from_slice(&0u32.to_le_bytes()); // F32
+            b.extend_from_slice(&id.to_le_bytes());
             b.extend_from_slice(&offset.to_le_bytes());
-            offset += (4 * dims.iter().product::<u64>()).div_ceil(32) * 32;
+            offset += bytes.div_ceil(32) * 32;
         }
         b.resize(b.len().div_ceil(32) * 32 + offset as usize, 0);
         let path = std::env::temp_dir().join(format!("bloomery-{}-{tag}.gguf", std::process::id()));

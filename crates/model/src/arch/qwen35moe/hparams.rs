@@ -323,7 +323,7 @@ impl Hparams {
 /// `expert_feed_forward_length`, one width for every layer: the per-layer
 /// array llama.cpp's qwen4exp loader also takes (`get_key_or_arr`,
 /// qwen4exp.cpp:27) is refused by name.
-fn expert_ff(split: &Split) -> Result<usize, PlacementError> {
+pub(super) fn expert_ff(split: &Split) -> Result<usize, PlacementError> {
     let key = "expert_feed_forward_length";
     if let Some(Value::Array(items)) = split.value(&split.arch_key(key)) {
         return Err(metadata(
@@ -572,7 +572,7 @@ fn u64s(split: &Split, suffix: &str, n: usize) -> Result<Vec<u64>, PlacementErro
 }
 
 /// A qwen4exp layer's tensors by kind (qwen4exp.cpp `load_arch_tensors`).
-const GDN_STEMS: &[&str] = &[
+pub(super) const GDN_STEMS: &[&str] = &[
     "attn_qkv.weight",
     "attn_gate.weight",
     "ssm_conv1d.weight",
@@ -583,7 +583,7 @@ const GDN_STEMS: &[&str] = &[
     "ssm_norm.weight",
     "ssm_out.weight",
 ];
-const ATTN_STEMS: &[&str] = &[
+pub(super) const ATTN_STEMS: &[&str] = &[
     "attn_q.weight",
     "attn_k.weight",
     "attn_v.weight",
@@ -597,7 +597,7 @@ const ATTN_STEMS: &[&str] = &[
 ];
 /// Every qwen4exp layer's: the two hyper-connection modules and the MoE with
 /// its gated shared expert.
-const EXP_LAYER_STEMS: &[&str] = &[
+pub(super) const EXP_LAYER_STEMS: &[&str] = &[
     "hc_attn_norm.weight",
     "hc_attn_down.weight",
     "hc_attn_up.weight",
@@ -616,7 +616,7 @@ const EXP_LAYER_STEMS: &[&str] = &[
     "ffn_down_shexp.weight",
 ];
 /// The PLE site's layer tensors.
-const PLE_STEMS: &[&str] = &[
+pub(super) const PLE_STEMS: &[&str] = &[
     "ple_key.weight",
     "ple_value.weight",
     "ple_norm_key.weight",
@@ -626,7 +626,7 @@ const PLE_STEMS: &[&str] = &[
 ];
 /// The block norms qwen35moe carries and qwen4exp does not: its
 /// hyper-connection modules' grouped norms and head replace them.
-const NORM_STEMS: &[&str] = &["attn_norm.weight", "post_attention_norm.weight"];
+pub(super) const NORM_STEMS: &[&str] = &["attn_norm.weight", "post_attention_norm.weight"];
 /// The model-level tensors a qwen4exp file carries, the PLE table aside.
 const EXP_MODEL_TENSORS: &[&str] = &[
     "token_embd.weight",
@@ -713,7 +713,7 @@ fn positive(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
 }
 
 /// `rope.dimension_sections`, required (qwen35moe.cpp:8): four counts.
-fn sections(split: &Split) -> Result<[u32; 4], PlacementError> {
+pub(super) fn sections(split: &Split) -> Result<[u32; 4], PlacementError> {
     let key = "rope.dimension_sections";
     let items = meta_arr(split, key)?;
     if items.len() != 4 {
@@ -813,7 +813,7 @@ fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize>, Placemen
 /// Err naming `suffix` when the file carries it with a value `ok` refuses:
 /// llama.cpp's builder passes the router's softmax, renormalization and
 /// scale 1 as constants (qwen35moe.cpp:499-508).
-fn refuse_unless(
+pub(super) fn refuse_unless(
     split: &Split,
     suffix: &str,
     ok: impl Fn(&gguf::Value) -> bool,
@@ -829,7 +829,7 @@ fn refuse_unless(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         ATTN_STEMS, EXP_LAYER_STEMS, EXP_MODEL_TENSORS, GDN_STEMS, Hparams, Kind, PLE_STEMS, Ple,
         Variant,
@@ -844,7 +844,7 @@ mod tests {
         Kind::Attention,
     ];
 
-    fn keys() -> Vec<(&'static str, V)> {
+    pub(crate) fn keys() -> Vec<(&'static str, V)> {
         vec![
             ("block_count", V::U32(4)),
             ("embedding_length", V::U32(64)),
@@ -886,7 +886,7 @@ mod tests {
         ]
     }
 
-    fn tensors() -> Vec<(String, Vec<u64>)> {
+    pub(crate) fn tensors() -> Vec<(String, Vec<u64>)> {
         let mut out: Vec<(String, Vec<u64>)> = EXP_MODEL_TENSORS
             .iter()
             .map(|n| ((*n).to_string(), vec![1]))

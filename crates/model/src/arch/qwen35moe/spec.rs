@@ -86,19 +86,7 @@ pub fn spec_of(
                 Kind::Attention => {
                     let q = format!("blk.{l}.attn_q.weight");
                     let rows = by_name.get(q.as_str()).and_then(|d| d.get(1)).copied();
-                    let width = u64::from(heads) * u64::from(head_dim);
-                    let out_gate = match rows {
-                        Some(r) if r == 2 * width => true,
-                        Some(r) if r == width => false,
-                        _ => {
-                            return Err(PlacementError::Tensor {
-                                name: q,
-                                detail: format!(
-                                    "writes {rows:?} rows, not the query's {width} or twice it with the gate"
-                                ),
-                            });
-                        }
-                    };
+                    let out_gate = out_gate(q, rows, heads, head_dim)?;
                     Mixer::Gqa(Gqa {
                         heads,
                         kv_heads: spec_u32("attention.head_count_kv", hp.n_head_kv)?,
@@ -202,4 +190,26 @@ pub fn spec_of(
         engram,
         chat,
     })
+}
+
+/// Whether an attention layer's `attn_q` (`q`, writing `rows`) writes a
+/// per-head gate beside the query: twice the query's width with it, once
+/// without, any other width refused.
+pub(super) fn out_gate(
+    q: String,
+    rows: Option<u64>,
+    heads: u32,
+    head_dim: u32,
+) -> Result<bool, PlacementError> {
+    let width = u64::from(heads) * u64::from(head_dim);
+    match rows {
+        Some(r) if r == 2 * width => Ok(true),
+        Some(r) if r == width => Ok(false),
+        _ => Err(PlacementError::Tensor {
+            name: q,
+            detail: format!(
+                "writes {rows:?} rows, not the query's {width} or twice it with the gate"
+            ),
+        }),
+    }
 }

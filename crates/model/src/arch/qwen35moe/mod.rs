@@ -9,12 +9,14 @@
 //! every layer routes to experts and runs a sigmoid-gated shared expert.
 //! qwen4exp wraps every layer in gated-residual hyper-connections, selects an
 //! attention layer's positions by a mean-pool top-k, and adds a per-layer
-//! n-gram embedding (PLE) on one GDN layer. The line numbers cited are
+//! n-gram embedding (PLE) on one GDN layer. A qwen4exp MTP draft file is read
+//! against its target by `mtp`. The line numbers cited are
 //! llama.cpp's `src/models/qwen35moe.cpp`, `src/models/qwen4exp.cpp` and
 //! `src/llama-hparams.cpp` unless another file is named.
 
 pub mod host;
 pub mod hparams;
+pub mod mtp;
 pub mod names;
 pub mod place;
 pub mod roles;
