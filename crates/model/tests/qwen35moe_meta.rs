@@ -53,35 +53,30 @@ const DEFAULTS: &[&str] = &[
 // is Q4_K, Q6_K or F32, so no format item. The router (256/8 with the shared expert's gate row)
 // and the GQA flash (head 256, group 8) are not items: the shape table's rows serve them
 // (`FAIL_FIRST` shows each come back without its row).
+// PIN(2026-09-27): six items left both lists with the rows of what Body35 runs, keyed to its
+// program: the SiLU-gated GDN (`plan.rs` delta_shape), the sigmoid-gated shared expert of 512
+// (`moe_fits`), the QK norm and rope of head 256 (IMROPE sections covering the 64 turned values),
+// the output gate, the recurrent-state slot and the mixed trunk; gate-gpu-qwen35moe-e2e runs each.
+// The chat surface's two items stay: the program does not run them.
 const COVERAGE_Q4KM: &[&str] = &[
-    "delta rule GDN: d 128, 16 k-heads and 32 v-heads (tiled), conv 4: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38",
-    "shared expert, ff 512, with a sigmoid gate: 0-39",
-    "per-head QK norm plus rope: head 256, IMROPE [11, 11, 10, 0], 64 of 256 dims: 3,7,11,15,19,23,27,31,35,39",
-    "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39",
-    "a recurrent-state slot per sequence (delta-rule state and conv inputs)",
-    "a program that runs delta-rule and attention layers in one trunk",
     "pre-tokenizer qwen35",
     "a tool-call parser for this template",
 ];
 
-// PIN(2026-09-27): the same for the UD-Q4_K_XL file, with its Q8_0 and Q5_K format items.
+// PIN(2026-09-27): the same for the UD-Q4_K_XL file, with its Q8_0 and Q5_K format items, which
+// Body35 does not read.
 const COVERAGE_UD: &[&str] = &[
-    "delta rule GDN: d 128, 16 k-heads and 32 v-heads (tiled), conv 4: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38",
-    "shared expert, ff 512, with a sigmoid gate: 0-39",
-    "per-head QK norm plus rope: head 256, IMROPE [11, 11, 10, 0], 64 of 256 dims: 3,7,11,15,19,23,27,31,35,39",
-    "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39",
     "q8_0 output head (the head reads q6_K)",
     "q8_0 token embedding (the card reads q4_K rows)",
     "q8_0 attention matrices (the body reads q4_K and q6_K): 0-39",
     "q5_K routed experts on a card: 0-33,35-37",
-    "a recurrent-state slot per sequence (delta-rule state and conv inputs)",
-    "a program that runs delta-rule and attention layers in one trunk",
     "pre-tokenizer qwen35",
     "a tool-call parser for this template",
 ];
 
 // PIN(2026-09-27): each shape-table row of AVAILABLE the files use, and the item it covers on
-// them — the coverage change's FAIL-first, on the Q4_K_M file.
+// them — the coverage change's FAIL-first, on the Q4_K_M file; with them two of Body35's own rows.
+// PIN(2026-09-27): the delta-rule and output-gate rows joined when Body35's rows were keyed.
 const FAIL_FIRST: &[(&str, &str)] = &[
     (
         "models/src/shape.rs ROUTERS, the Qwen3moe and Qwen35moe bodies",
@@ -90,6 +85,14 @@ const FAIL_FIRST: &[(&str, &str)] = &[
     (
         "models/src/shape.rs GQA",
         "GQA flash, head 256, group 8: 3,7,11,15,19,23,27,31,35,39",
+    ),
+    (
+        "gpu/src/arch/qwen3moe/plan.rs delta_shape (Body35's delta layers)",
+        "delta rule GDN: d 128, 16 k-heads and 32 v-heads (tiled), conv 4: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38",
+    ),
+    (
+        "gpu/src/arch/qwen3moe/dispatch.rs gated_256 (Body35's output gate)",
+        "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39",
     ),
 ];
 

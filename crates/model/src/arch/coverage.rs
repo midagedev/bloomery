@@ -142,6 +142,68 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| routes(n, &[RouterBody::Qwen3moe, RouterBody::Qwen35moe]),
     },
     Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/plan.rs delta_shape (Body35's delta layers)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Gdn {
+                        khead_map: models::KHeadMap::Tiled,
+                        gate: models::GdnGate::Silu
+                    },
+                    k_heads,
+                    v_heads,
+                    d: 128,
+                    conv: 4,
+                } if *k_heads > 0 && v_heads.is_multiple_of(*k_heads)
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/plan.rs moe_fits (Body35's shared expert, one more slot)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    ff: 512,
+                    sigmoid_gate: true
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/rope_neox.rs head_norm_neox_append_256 (Body35: 64 of 256 dims)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: 256,
+                    mode: RopeMode::Imrope { sections },
+                    dims: 64
+                } if sections.iter().sum::<u32>() == 32
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/dispatch.rs gated_256 (Body35's output gate)",
+        runs: |n| matches!(n, Need::OutGate),
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/scratch.rs RecStore (Body35's delta stores)",
+        runs: |n| matches!(n, Need::RecurrentState),
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/program.rs (Body35: a mixer per layer's plan)",
+        runs: |n| matches!(n, Need::MixedTrunk),
+    },
+    Available {
         program: Program::Glm5nextBody,
         at: "gpu-glm5next/src/mla.rs (the absorbed heads over gpu-deepseek41 attn.rs LATENT)",
         runs: |n| {
