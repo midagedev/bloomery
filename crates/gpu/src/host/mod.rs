@@ -79,6 +79,7 @@ pub mod batch;
 pub mod leg;
 pub mod page;
 pub mod residency;
+pub mod run;
 pub mod slots;
 pub mod step;
 
