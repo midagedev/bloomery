@@ -133,6 +133,7 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::{host, names};
     use model::moe::{HostLayer, HostScratch};
+    use model::r8file::R8Source;
 
     /// The sets, T = 1 each: a decode step at position 4, and one at 301 with
     /// the file's top-k.
@@ -1169,7 +1170,7 @@ mod gate {
             .host
             .ok_or_else(|| format!("layer {l}: no host view of a routed layer"))?;
         let xt = Tensor2::from_vec(n, 1, x.clone());
-        hl.experts_into(split, &xt, &list, &mut hsum, &mut op.host)?;
+        hl.experts_into(R8Source::rows(split), &xt, &list, &mut hsum, &mut op.host)?;
         for (i, &slot) in slots.iter().enumerate() {
             host_slots.push(HostSlot {
                 slot,
@@ -1643,7 +1644,7 @@ mod gate {
         }
         let (map, cards) = synthetic_map(&split, &hp, &ids_per_layer)?;
         let host_layers: Vec<Option<HostLayer>> = (0..hp.n_layer)
-            .map(|l| host::layer(&split, &hp, l))
+            .map(|l| host::layer(R8Source::rows(&split), &hp, l))
             .collect::<Result<_, _>>()?;
 
         let shape = BoundaryShape {

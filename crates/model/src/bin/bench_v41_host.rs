@@ -140,6 +140,7 @@ use model::ops::{
     matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
     matmul_q_group_swiglu_into,
 };
+use model::r8file::R8Source;
 
 type BenchError = Box<dyn std::error::Error>;
 
@@ -670,7 +671,13 @@ fn union5_layer(
     fill_lists(&mut u.lists, l, slots, n_host)?;
     let lists: Vec<&[(u32, f32)]> = u.lists.iter().map(|r| &r[..n_host]).collect();
     let t0 = Instant::now();
-    host.experts_union_into(split, &u.xs[x], &lists, &mut u.out, &mut u.scratch)?;
+    host.experts_union_into(
+        R8Source::rows(split),
+        &u.xs[x],
+        &lists,
+        &mut u.out,
+        &mut u.scratch,
+    )?;
     tally.add("union5", distinct as u64 * l.expert_bytes(), t0);
     Ok(())
 }
@@ -3373,7 +3380,7 @@ fn host_layers(
                 ff: meta.ff,
                 swiglu_limit: 0.0,
             };
-            Ok(HostLayer::build(split, &spec)?)
+            Ok(HostLayer::build(R8Source::rows(split), &spec)?)
         })
         .collect()
 }

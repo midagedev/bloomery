@@ -30,7 +30,7 @@ use model::moe::HostLayer;
 use model::ops::RowLayout;
 use model::placement::PlacementError;
 use model::placement::host_lock::PageDrop;
-use model::r8file::{self, HostR8, Progress, R8Error, Sidecar};
+use model::r8file::{self, HostR8, Progress, R8Error, R8Source, Sidecar};
 
 const G0: &str = "blk.0.ffn_gate_exps.weight";
 const U0: &str = "blk.0.ffn_up_exps.weight";
@@ -575,7 +575,11 @@ fn convert_refuses_by_name() {
 
 /// A `.part` whose lock a live run holds refuses the conversion and stays; one
 /// left by a run that died is removed, reported, and replaced by a finished
-/// sidecar at `out`.
+/// sidecar at `out`. The live run releases its lock by unlocking, not by
+/// closing: a child spawned while the lock is held keeps a copy of the
+/// descriptor — here past its exec, which stands for the fork-to-exec window
+/// of any concurrent spawn — and a lock left to the close would stay with
+/// that copy.
 #[test]
 fn a_leftover_part_is_removed_and_a_live_one_is_not() {
     let d = dir("part");
@@ -586,12 +590,14 @@ fn a_leftover_part_is_removed_and_a_live_one_is_not() {
     std::fs::write(&part, b"live").unwrap();
     let live = File::open(&part).unwrap();
     live.try_lock().unwrap();
+    let mut child = spawn_holding(&live);
     match r8_err(r8file::convert(&split, &names(), &out, &mut |_| {})) {
         R8Error::Busy { path } => assert_eq!(path, part),
         other => panic!("wrong refusal: {other}"),
     }
     assert_eq!(std::fs::read(&part).unwrap(), b"live");
     assert!(!out.exists());
+    live.unlock().unwrap();
     drop(live);
     let mut removed = Vec::new();
     r8file::convert(&split, &names(), &out, &mut |p| {
@@ -603,7 +609,28 @@ fn a_leftover_part_is_removed_and_a_live_one_is_not() {
     assert_eq!(removed, std::slice::from_ref(&part));
     assert!(!part.exists());
     Sidecar::open(&out, &split, LAZY).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
     std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A child that holds a copy of `file`'s descriptor — the same open file
+/// description, so the same `flock` — until it is killed: `sleep` spawned
+/// with that copy kept across its exec.
+fn spawn_holding(file: &File) -> std::process::Child {
+    use std::os::fd::AsRawFd;
+    let copy = file.try_clone().unwrap();
+    let fd = copy.as_raw_fd();
+    // SAFETY: fcntl reads the descriptor flags of `copy`, a descriptor this
+    // function owns; no memory is passed.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+    // SAFETY: as above; it sets them.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    assert_eq!(rc, 0, "F_SETFD: {}", std::io::Error::last_os_error());
+    let child = Command::new("sleep").arg("120").spawn().unwrap();
+    drop(copy);
+    child
 }
 
 /// A flipped sidecar byte passes the identity check — it reads no stack — and
@@ -777,7 +804,7 @@ fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
         r8.to_string(),
         format!("r8=on ({})", layer.sidecar.display())
     );
-    let held = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
+    let held = HostLayer::build(R8Source::of(&split, &r8).unwrap(), &spec).unwrap();
     assert_eq!(
         held.layouts(),
         [RowLayout::R8, RowLayout::R8, RowLayout::Rows]
@@ -785,7 +812,7 @@ fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
     let off = HostR8::at_load(&split, false).unwrap();
     assert!(off.sidecar().is_none(), "the lever off reads the source");
     assert_eq!(off.to_string(), "r8=off (BLOOMERY_R8=off)");
-    let rows = HostLayer::build_r8(&split, &spec, off.sidecar()).unwrap();
+    let rows = HostLayer::build(R8Source::of(&split, &off).unwrap(), &spec).unwrap();
     assert_eq!(rows.layouts(), [RowLayout::Rows; 3]);
     let again = Split::open(&layer.source).unwrap();
     let reuse = HostR8::at_load(&again, true).unwrap();
@@ -838,7 +865,7 @@ fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
             layer.sidecar.display()
         )
     );
-    let rows = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
+    let rows = HostLayer::build(R8Source::of(&split, &r8).unwrap(), &spec).unwrap();
     assert_eq!(rows.layouts(), [RowLayout::Rows; 3]);
     match HostR8::at_gate(&split, true) {
         Err(ModelError::R8(R8Error::NoSidecar { path })) => assert_eq!(path, layer.sidecar),
@@ -856,11 +883,16 @@ fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
 }
 
 /// A sidecar opened for one source, beside another source's split of the
-/// same tensor names, shapes and header — other stack bytes — is refused by
-/// name wherever a reader takes the two together: a host layer's build and a
-/// page release, each by `R8Error::Head` naming the gate (the first stack
-/// whose identity differs). Before the pairing, the build took the other
-/// source's gate and up bytes from the sidecar with its own down.
+/// same tensor names, shapes and header — other stack bytes — cannot be made
+/// its pair: `R8Source::of` refuses it by `R8Error::Head` naming the gate
+/// (the first stack whose identity differs), and a reader takes a sidecar
+/// only through a pair. A layer built beside one open of the sidecar is
+/// refused by name (`R8Error::OtherSidecar`) when called with a pair that
+/// reads none or another open of the same file — each open checked against
+/// the same split — and reads bit for bit what it read beside its own. A
+/// page release takes the pair's own sidecar, and a call with a split in
+/// place of a pair is a compile error (`R8Source`'s `compile_fail`
+/// doctests).
 #[test]
 #[ignore = "hw: the box's CPU (a host layer's r8 stack needs qdot's fused Q3_K); reads no model file"]
 fn hw_a_sidecar_of_another_source_is_refused_beside_its_split() {
@@ -870,22 +902,62 @@ fn hw_a_sidecar_of_another_source_is_refused_beside_its_split() {
         Split::open(&a.source).unwrap(),
         Split::open(&b.source).unwrap(),
     );
-    let side_a = std::sync::Arc::new(Sidecar::open(&a.sidecar, &split_a, LAZY).unwrap());
-    HostLayer::build_r8(&split_a, &a.spec(), Some(&side_a)).unwrap();
+    let side_a = HostR8::On(std::sync::Arc::new(
+        Sidecar::open(&a.sidecar, &split_a, LAZY).unwrap(),
+    ));
+    let src_a = R8Source::of(&split_a, &side_a).unwrap();
+    let layer = HostLayer::build(src_a, &a.spec()).unwrap();
     let head = |e: &R8Error| matches!(e, R8Error::Head { tensor, .. } if tensor == r8layer::GATE);
-    match HostLayer::build_r8(&split_b, &b.spec(), Some(&side_a)) {
-        Err(ModelError::R8(e)) if head(&e) => println!("build beside another source: {e}"),
-        Err(other) => panic!("build beside another source: refused, but not by its head: {other}"),
-        Ok(_) => panic!("a host layer built its gate and up from another source's sidecar"),
+    match R8Source::of(&split_b, &side_a) {
+        Err(ModelError::R8(e)) if head(&e) => println!("pair beside another source: {e}"),
+        Err(other) => panic!("pair beside another source: refused, but not by its head: {other}"),
+        Ok(_) => panic!("another source's sidecar was made this split's pair"),
     }
-    let mut drop = PageDrop::new(&split_b);
-    match drop.release_sidecar(&side_a) {
-        Err(PlacementError::Host(msg)) if msg.contains("is not this split's") => {
-            println!("release beside another source: {msg}");
+
+    let embd = 512;
+    let x = model::ops::Tensor2::from_vec(
+        embd,
+        1,
+        (0..embd).map(|i| (i % 13) as f32 / 13.0 - 0.5).collect(),
+    );
+    let list = [(1u32, 0.75f32), (3, 0.25)];
+    let mut scratch = model::moe::HostScratch::new(embd, 256);
+    let mut want = vec![f32::NAN; embd];
+    layer
+        .experts_into(src_a, &x, &list, &mut want, &mut scratch)
+        .unwrap();
+    let other_open = HostR8::On(std::sync::Arc::new(
+        Sidecar::open(&a.sidecar, &split_a, LAZY).unwrap(),
+    ));
+    let src_other = R8Source::of(&split_a, &other_open).unwrap();
+    for (what, src, read) in [
+        ("a pair that reads none", R8Source::rows(&split_a), false),
+        ("a pair that reads another open", src_other, true),
+    ] {
+        let mut out = vec![f32::NAN; embd];
+        match layer.experts_into(src, &x, &list, &mut out, &mut scratch) {
+            Err(ModelError::R8(e @ R8Error::OtherSidecar { .. })) => {
+                let R8Error::OtherSidecar { read: got, .. } = &e else {
+                    unreachable!()
+                };
+                assert_eq!(got.is_some(), read, "{what}: {e}");
+                println!("layer called with {what}: {e}");
+            }
+            Err(other) => panic!("{what}: refused, but not by name: {other}"),
+            Ok(()) => panic!("{what}: a layer built beside one open read beside another"),
         }
-        other => panic!("release beside another source must be refused by name, got {other:?}"),
+        assert!(out.iter().all(|v| v.is_nan()), "{what}: nothing is written");
     }
-    assert_eq!(drop.bytes(), 0, "nothing is released");
+    let mut again = vec![f32::NAN; embd];
+    layer
+        .experts_into(src_a, &x, &list, &mut again, &mut scratch)
+        .unwrap();
+    assert!(
+        want.iter()
+            .zip(&again)
+            .all(|(w, a)| w.to_bits() == a.to_bits()),
+        "the layer's own pair reads what it read"
+    );
 }
 
 /// A long-lived process holds a sidecar open while the file at its path is
@@ -932,7 +1004,7 @@ fn hw_a_host_layer_refuses_a_sidecar_that_holds_its_down() {
         r8.sidecar().is_some(),
         "the sidecar passes its identity check"
     );
-    match HostLayer::build_r8(&split, &layer.spec(), r8.sidecar()) {
+    match HostLayer::build(R8Source::of(&split, &r8).unwrap(), &layer.spec()) {
         Err(ModelError::R8(R8Error::HoldsDown { tensor, .. })) => {
             assert_eq!(tensor, r8layer::DOWN);
         }
@@ -943,34 +1015,45 @@ fn hw_a_host_layer_refuses_a_sidecar_that_holds_its_down() {
 }
 
 /// A resident sidecar is an anonymous copy of its file: `PageDrop` refuses to
-/// release its pages by name, releases nothing, and the copy keeps its bytes;
-/// the mapped sidecar of the same file is released as a shard is.
+/// release its pages by name (`R8Error::ResidentCopy`), releases nothing, and
+/// the copy keeps its bytes; the mapped sidecar of the same file is released
+/// as a shard is. A pair that reads no sidecar has none to release
+/// (`R8Error::PairReadsNone`).
 #[test]
 fn a_resident_sidecar_is_not_released() {
     let layer = r8layer::Layer::write("resident", 512, 256, 4, GgmlType::Q4_K);
     let split = Split::open(&layer.source).unwrap();
-    let mapped = Sidecar::open(&layer.sidecar, &split, LAZY).unwrap();
-    let resident =
-        Sidecar::open(&layer.sidecar, &split, Weights::Resident { huge: false }).unwrap();
-    let want = mapped.data(r8layer::GATE).unwrap().to_vec();
+    let mapped = HostR8::On(std::sync::Arc::new(
+        Sidecar::open(&layer.sidecar, &split, LAZY).unwrap(),
+    ));
+    let resident = HostR8::On(std::sync::Arc::new(
+        Sidecar::open(&layer.sidecar, &split, Weights::Resident { huge: false }).unwrap(),
+    ));
+    let gate = |r8: &HostR8| r8.sidecar().unwrap().data(r8layer::GATE).unwrap().to_vec();
+    let want = gate(&mapped);
     assert!(
         want.iter().any(|&b| b != 0),
         "the gate's sidecar bytes are not all zero"
     );
-    let mut drop = PageDrop::new(&split);
-    match drop.release_sidecar(&resident) {
-        Err(PlacementError::Host(msg)) => assert!(msg.contains("resident"), "{msg}"),
+    let mut drop = PageDrop::of(R8Source::of(&split, &resident).unwrap());
+    match drop.release_sidecar() {
+        Err(PlacementError::R8(R8Error::ResidentCopy { path })) => {
+            assert_eq!(path, layer.sidecar);
+        }
         other => panic!("a resident sidecar must be refused by name, got {other:?}"),
     }
     assert_eq!(drop.bytes(), 0, "nothing is released");
-    assert!(
-        resident.data(r8layer::GATE).unwrap() == want.as_slice(),
-        "the resident copy keeps its bytes"
-    );
-    drop.release_sidecar(&mapped).unwrap();
+    assert!(gate(&resident) == want, "the resident copy keeps its bytes");
+    let mut none = PageDrop::new(&split);
+    match none.release_sidecar() {
+        Err(PlacementError::R8(R8Error::PairReadsNone { .. })) => {}
+        other => panic!("a pair with no sidecar has none to release, got {other:?}"),
+    }
+    let mut drop = PageDrop::of(R8Source::of(&split, &mapped).unwrap());
+    drop.release_sidecar().unwrap();
     assert!(drop.bytes() > 0, "the mapped sidecar's pages are released");
     assert!(
-        mapped.data(r8layer::GATE).unwrap() == want.as_slice(),
+        gate(&mapped) == want,
         "a released mapping reads its file's bytes again"
     );
     println!(

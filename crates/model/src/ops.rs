@@ -5,7 +5,7 @@
 
 use crate::ffn::swiglu_timed;
 use crate::profile;
-use crate::r8file::Sidecar;
+use crate::r8file::{R8Error, R8Source, Sidecar};
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
 use std::ops::Range;
@@ -1054,8 +1054,9 @@ impl RowLayout {
 /// A routed Q3_K stack of a split model read from its r8 sidecar
 /// ([`crate::r8file`]): the same experts in the same byte ranges, each 8-row
 /// group's super-blocks interleaved for [`qdot::dot_q3k_r8_cols`]. Made only
-/// by [`R8Stack::of`], once the sidecar has paired with the split; its
-/// matrices carry [`RowLayout::R8`], so no dispatch reads them as Q3_K rows.
+/// by [`R8Stack::of`], from a sidecar paired with the split ([`R8Source`]);
+/// its matrices carry [`RowLayout::R8`], so no dispatch reads them as Q3_K
+/// rows.
 #[derive(Clone)]
 pub(crate) struct R8Stack {
     /// The source's stack, the header the sidecar's tensor was checked
@@ -1067,22 +1068,20 @@ pub(crate) struct R8Stack {
 }
 
 impl R8Stack {
-    /// Stack `name` of `split` as `sidecar` holds it. The sidecar must be
-    /// `split`'s ([`Sidecar::pairs`], refused by name otherwise); its check
-    /// is what makes the sidecar's tensor the private type with its source
-    /// stack's dims and bytes, and that stack Q3_K `{k, n, n_expert}` on the
-    /// tile's grids (`k` whole super-blocks, `n` whole groups — so every
-    /// expert's range holds whole groups and is the same range in both
-    /// files). Refused by name here besides: a name the split or the sidecar
-    /// lacks, a stack its experts do not cut evenly, and a machine where qdot
-    /// does not fuse Q3_K at `k`, whose columns the tile reads.
-    pub(crate) fn of(
-        split: &Split,
-        sidecar: &Arc<Sidecar>,
-        name: &str,
-    ) -> Result<R8Stack, crate::ModelError> {
-        sidecar.pairs(split)?;
-        let source = ShardTensor::find(split, name)?;
+    /// Stack `name` of `src`'s split as the sidecar `src` reads holds it. The
+    /// pair's check is what makes the sidecar's tensor the private type with
+    /// its source stack's dims and bytes, and that stack Q3_K `{k, n,
+    /// n_expert}` on the tile's grids (`k` whole super-blocks, `n` whole
+    /// groups — so every expert's range holds whole groups and is the same
+    /// range in both files). Refused by name here besides: a pair that reads
+    /// no sidecar, a name the split or the sidecar lacks, a stack its experts
+    /// do not cut evenly, and a machine where qdot does not fuse Q3_K at `k`,
+    /// whose columns the tile reads.
+    pub(crate) fn of(src: R8Source<'_>, name: &str) -> Result<R8Stack, crate::ModelError> {
+        let sidecar = src.sidecar().ok_or(R8Error::PairReadsNone {
+            what: "an r8 stack",
+        })?;
+        let source = ShardTensor::find(src.split(), name)?;
         let info = sidecar.tensor(name)?.clone();
         let src = &source.info;
         stack_cut(src)?;
@@ -1106,6 +1105,11 @@ impl R8Stack {
     /// The source's stack this copy was checked against.
     pub(crate) fn source(&self) -> &ShardTensor {
         &self.source
+    }
+
+    /// The open of the sidecar the stack reads.
+    pub(crate) fn sidecar(&self) -> &Arc<Sidecar> {
+        &self.sidecar
     }
 
     /// Matrix `e` as a dispatch weight: its rows in [`RowLayout::R8`].

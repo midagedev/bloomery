@@ -40,7 +40,7 @@ use qdot::{Q3K_R8_LAYOUT, Q3K_R8_ROWS};
 
 use crate::ModelError;
 use crate::fileio::{self, sha256_hex};
-use crate::placement::host_lock::{HostFile, drop_pages};
+use crate::placement::host_lock::{FileMapping, HostFile, drop_pages};
 
 /// The sidecar's architecture string: a file with any other is not a sidecar.
 pub const R8_ARCH: &str = "bloomery-r8";
@@ -206,6 +206,28 @@ pub enum R8Error {
         .path.display()
     )]
     NoSidecar { path: PathBuf },
+    /// A value built beside one open sidecar, called with a pair that reads
+    /// another open — of the same path or not — or none ([`R8Source`]).
+    #[error(
+        "{what}: built beside the sidecar {} open, called with a pair that reads {}",
+        .held.display(),
+        .read.as_ref().map_or_else(|| "none".to_string(), |p| format!("another open, {}", p.display()))
+    )]
+    OtherSidecar {
+        what: &'static str,
+        held: PathBuf,
+        read: Option<PathBuf>,
+    },
+    /// A call that acts on the pair's sidecar, with a pair that reads none.
+    #[error("{what}: the pair reads no sidecar")]
+    PairReadsNone { what: &'static str },
+    /// A page release of a resident copy, whose bytes are anonymous pages
+    /// `MADV_DONTNEED` would zero.
+    #[error(
+        "{}: a resident copy, not its file's mapping: it has no file pages to release",
+        .path.display()
+    )]
+    ResidentCopy { path: PathBuf },
 }
 
 fn io_err(path: &Path, op: &'static str, source: io::Error) -> ModelError {
@@ -436,7 +458,7 @@ pub fn convert(
     }
     let file_bytes = layout.file_len();
     let file = create_part(&part)?;
-    let tensors = match write_stacks(&stacks, layout, &file, &part, progress) {
+    let tensors = match write_stacks(&stacks, layout, file.file(), &part, progress) {
         Ok(t) => t,
         Err(e) => {
             // The error is what the caller acts on; a .part this removal
@@ -519,36 +541,55 @@ fn remove_leftover(part: &Path, progress: &mut dyn FnMut(Progress<'_>)) -> Resul
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_err(part, "open", e)),
     };
-    match held.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(R8Error::Busy {
-                path: part.to_path_buf(),
-            }
-            .into());
-        }
-        Err(TryLockError::Error(e)) => return Err(io_err(part, "lock", e)),
-    }
+    let _held = PartLock::take(held, part)?;
     std::fs::remove_file(part).map_err(|e| io_err(part, "remove", e))?;
     progress(Progress::RemovedPart(part));
     Ok(())
 }
 
+/// A `.part` file under this run's lock (`flock`, which belongs to the open
+/// file description). Its drop unlocks before the descriptor closes: a child
+/// another thread forks holds a copy of every descriptor until its exec, so a
+/// lock left to the close would outlive this value by that window and refuse
+/// the next run as [`R8Error::Busy`]; an unlock releases the description's
+/// lock whatever copies of it exist.
+struct PartLock(File);
+
+impl PartLock {
+    /// `file`, the `.part` at `part`, locked; a live run's lock is
+    /// [`R8Error::Busy`].
+    fn take(file: File, part: &Path) -> Result<PartLock, ModelError> {
+        match file.try_lock() {
+            Ok(()) => Ok(PartLock(file)),
+            Err(TryLockError::WouldBlock) => Err(R8Error::Busy {
+                path: part.to_path_buf(),
+            }
+            .into()),
+            Err(TryLockError::Error(e)) => Err(io_err(part, "lock", e)),
+        }
+    }
+
+    fn file(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for PartLock {
+    fn drop(&mut self) {
+        // A failed unlock leaves the release to the close, as before the
+        // unlock existed; a drop has no one to report it to.
+        let _ = self.0.unlock();
+    }
+}
+
 /// `<out>.part`, created fresh and locked for this run.
-fn create_part(part: &Path) -> Result<File, ModelError> {
+fn create_part(part: &Path) -> Result<PartLock, ModelError> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(part)
         .map_err(|e| io_err(part, "create", e))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(R8Error::Busy {
-            path: part.to_path_buf(),
-        }
-        .into()),
-        Err(TryLockError::Error(e)) => Err(io_err(part, "lock", e)),
-    }
+    PartLock::take(file, part)
 }
 
 /// Every stack repacked, written, synced and dropped from the page cache,
@@ -664,8 +705,9 @@ fn drop_cached(file: &File, path: &Path, range: Range<u64>) -> Result<(), ModelE
 /// The finished `.part` becomes `out`: synced, still the file this run wrote
 /// (a run that removed it in the moment before this one locked it would
 /// otherwise be linked in), linked without replacing anything, unlinked, and
-/// the directory synced. The lock goes with `file`, after the link.
-fn publish(file: File, part: &Path, out: &Path, dir: &Path) -> Result<(), ModelError> {
+/// the directory synced. The lock goes with `lock`, after the link.
+fn publish(lock: PartLock, part: &Path, out: &Path, dir: &Path) -> Result<(), ModelError> {
+    let file = lock.file();
     file.sync_all().map_err(|e| io_err(part, "fsync", e))?;
     let ours = file.metadata().map_err(|e| io_err(part, "stat", e))?;
     let named = std::fs::metadata(part).map_err(|e| io_err(part, "stat", e))?;
@@ -686,7 +728,7 @@ fn publish(file: File, part: &Path, out: &Path, dir: &Path) -> Result<(), ModelE
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err(dir, "fsync", e))?;
-    drop(file);
+    drop(lock);
     Ok(())
 }
 
@@ -744,9 +786,10 @@ impl Sidecar {
     /// Whether this is `source`'s sidecar, as its open found it: what
     /// `source` gives the identity check ([`Inputs`]) is compared with what
     /// the check this sidecar passed read; on any difference the check runs
-    /// again against `source`, and its refusal names the difference. Every
-    /// reader that takes a sidecar beside a split asks here first, so a
-    /// sidecar opened for one model never serves another's split.
+    /// again against `source`, and its refusal names the difference. A
+    /// reader takes a sidecar beside a split only as an [`R8Source`], which
+    /// this check makes, so a sidecar opened for one model never serves
+    /// another's split.
     pub(crate) fn pairs(&self, source: &Split) -> Result<(), ModelError> {
         let now = Inputs::of(source, tensor_names(&self.gguf))?;
         if !self.seen.gives(&now) {
@@ -765,11 +808,15 @@ impl Sidecar {
         &self.path
     }
 
-    /// The sidecar's bytes as its file's own read-only mapping, file offset
-    /// `o` at index `o`; `None` for a resident copy, whose pages are
-    /// anonymous — `MADV_DONTNEED` would zero them.
-    pub(crate) fn file_pages(&self) -> Option<&[u8]> {
-        self.mapped.then(|| self.gguf.mapping())
+    /// The sidecar's bytes as its file's own read-only mapping; `None` for a
+    /// resident copy, whose pages are anonymous — `MADV_DONTNEED` would zero
+    /// them.
+    pub(crate) fn file_pages(&self) -> Option<FileMapping<'_>> {
+        // SAFETY: `mapped` is set only for a `Weights::Mapped` open, whose
+        // `Gguf` keeps the file's own read-only shared mapping for as long as
+        // this sidecar lives.
+        self.mapped
+            .then(|| unsafe { FileMapping::new(self.gguf.mapping()) })
     }
 
     /// Tensor `name`'s header entry, `None` for a name the sidecar lacks.
@@ -903,6 +950,147 @@ impl fmt::Display for HostR8 {
                 write!(f, "r8=off (no sidecar at {}: just r8-sidecar)", p.display())
             }
         }
+    }
+}
+
+/// A split and the r8 sidecar a host tier reads beside it, as one value:
+/// made only by the pairing check ([`R8Source::of`], [`R8Pair::at_load`]) or
+/// with no sidecar ([`R8Source::rows`]), so every sidecar that reaches a
+/// host reader — a layer's call, a host set's walk and lock, a page release
+/// — is the checked partner of the split beside it. The readers take this,
+/// never a `&Split`:
+///
+/// ```compile_fail,E0308
+/// # fn call(
+/// #     layer: &model::moe::HostLayer,
+/// #     split: &gguf::Split,
+/// #     x: &model::ops::Tensor2,
+/// #     out: &mut [f32],
+/// #     scratch: &mut model::moe::HostScratch,
+/// # ) {
+/// // A split with no pairing check behind it.
+/// let _ = layer.experts_into(split, x, &[], out, scratch);
+/// # }
+/// ```
+///
+/// ```compile_fail,E0308
+/// # fn walk(set: &model::placement::host_lock::HostSet, split: &gguf::Split) {
+/// let _ = set.populate(split);
+/// # }
+/// ```
+///
+/// A value built beside one open sidecar (a layer's r8 stacks, a host set's
+/// sidecar pages) is refused by name, one pointer compare a call, when the
+/// pair reads another open or none ([`R8Error::OtherSidecar`]).
+#[derive(Clone, Copy)]
+pub struct R8Source<'a> {
+    split: &'a Split,
+    sidecar: Option<&'a Arc<Sidecar>>,
+}
+
+impl<'a> R8Source<'a> {
+    /// `split` alone: a host tier that reads every stack from the source.
+    #[must_use]
+    pub fn rows(split: &'a Split) -> R8Source<'a> {
+        R8Source {
+            split,
+            sidecar: None,
+        }
+    }
+
+    /// `split` beside the sidecar `r8` reads, when it reads one, checked
+    /// once here ([`Sidecar::pairs`]): a sidecar that is not `split`'s is
+    /// its named [`R8Error`].
+    pub fn of(split: &'a Split, r8: &'a HostR8) -> Result<R8Source<'a>, ModelError> {
+        let sidecar = r8.sidecar();
+        if let Some(side) = sidecar {
+            side.pairs(split)?;
+        }
+        Ok(R8Source { split, sidecar })
+    }
+
+    /// The source split.
+    #[must_use]
+    pub fn split(&self) -> &'a Split {
+        self.split
+    }
+
+    /// The sidecar the pair reads, when it reads one.
+    #[must_use]
+    pub fn sidecar(&self) -> Option<&'a Arc<Sidecar>> {
+        self.sidecar
+    }
+
+    /// `held`, the sidecar a value was built beside, is this pair's own open
+    /// of it; `what` names the value in the refusal.
+    pub(crate) fn reads(&self, held: &Arc<Sidecar>, what: &'static str) -> Result<(), R8Error> {
+        match self.sidecar {
+            Some(side) if Arc::ptr_eq(side, held) => Ok(()),
+            read => Err(R8Error::OtherSidecar {
+                what,
+                held: held.path.clone(),
+                read: read.map(|s| s.path.clone()),
+            }),
+        }
+    }
+}
+
+/// The split by its first shard, and the sidecar by its path.
+impl fmt::Debug for R8Source<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R8Source")
+            .field("split", &self.split.shard_path(0))
+            .field("sidecar", &self.sidecar.map(|s| s.path()))
+            .finish()
+    }
+}
+
+/// An [`R8Source`] a holder keeps beside the split it owns: the split and
+/// its host reading, checked against each other once, when the reading is
+/// made ([`R8Pair::at_load`]); [`R8Pair::source`] lends the pair with no
+/// check, so a step reads through it at no cost.
+#[derive(Clone)]
+pub struct R8Pair {
+    split: Arc<Split>,
+    r8: HostR8,
+}
+
+impl R8Pair {
+    /// `split` and its host reading under `r8` ([`HostR8::at_load`], which
+    /// checks the sidecar it hands back against this split).
+    pub fn at_load(split: Arc<Split>, r8: bool) -> Result<R8Pair, ModelError> {
+        let r8 = HostR8::at_load(&split, r8)?;
+        Ok(R8Pair { split, r8 })
+    }
+
+    /// The pair, checked when it was made.
+    #[must_use]
+    pub fn source(&self) -> R8Source<'_> {
+        R8Source {
+            split: &self.split,
+            sidecar: self.r8.sidecar(),
+        }
+    }
+
+    /// The split.
+    #[must_use]
+    pub fn split(&self) -> &Arc<Split> {
+        &self.split
+    }
+
+    /// The host reading.
+    #[must_use]
+    pub fn r8(&self) -> &HostR8 {
+        &self.r8
+    }
+}
+
+impl fmt::Debug for R8Pair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R8Pair")
+            .field("split", &self.split.shard_path(0))
+            .field("r8", &self.r8)
+            .finish()
     }
 }
 

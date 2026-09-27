@@ -6,9 +6,9 @@
 //! other reader of the page cache can evict an expert page from under a step.
 //! Both walk the same set, so the populated bytes and the locked bytes are
 //! the same bytes by construction. A host tier that reads its routed gates
-//! and ups from the r8 sidecar has a set of both files ([`HostSet::of_r8`]):
-//! those stacks' runs in the sidecar's mapping, everything else in the
-//! shards'.
+//! and ups from the r8 sidecar has a set of both files ([`HostSet::of`] over
+//! an [`R8Source`] that reads one): those stacks' runs in the sidecar's
+//! mapping, everything else in the shards'.
 //!
 //! Every walk over a set — the populate, the lock and the residency count —
 //! cuts the set's files into the same chunks of about equal pages, a thread
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use gguf::{Gguf, Split};
 
 use super::{Device, Format, ModelTensor, PlacementError, Plan};
-use crate::r8file::Sidecar;
+use crate::r8file::{R8Error, R8Source, Sidecar};
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
 /// taken and counted in; a host that does not answer is refused by name.
@@ -79,7 +79,8 @@ pub struct HostSet {
     page: u64,
     /// Only shards with at least one range, in shard order.
     shards: Vec<(usize, Vec<Range<u64>>)>,
-    /// The sidecar and its ranges ([`HostSet::of_r8`]).
+    /// The sidecar the set was built beside and its ranges: every walk's
+    /// pair must read this open of it ([`R8Source::reads`]).
     side: Option<(Arc<Sidecar>, Vec<Range<u64>>)>,
 }
 
@@ -186,37 +187,17 @@ impl HostSet {
     /// format whose tensor `keep` selects: each run of consecutive experts of
     /// an expert stack's list, or the whole tensor. Each run grows outward to
     /// whole pages and the pages merge per shard. `plan` must be a plan of
-    /// `split`'s tensors.
+    /// `src`'s split's tensors. When `src` reads the r8 sidecar, every tensor
+    /// the sidecar holds is read from it: those tensors' runs are pages of
+    /// the sidecar's mapping, at its offsets — the sidecar keeps each
+    /// expert's byte range of the stack — and pages of no shard; every other
+    /// tensor's are the shards'.
     pub fn of(
-        split: &Split,
+        src: R8Source<'_>,
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
     ) -> Result<HostSet, PlacementError> {
-        HostSet::build(split, None, plan, keep)
-    }
-
-    /// [`HostSet::of`] for a host tier that reads every tensor `sidecar`
-    /// holds from it: those tensors' runs are pages of the sidecar's mapping,
-    /// at its offsets — the sidecar keeps each expert's byte range of the
-    /// stack — and pages of no shard; every other tensor's are the shards'.
-    pub fn of_r8(
-        split: &Split,
-        sidecar: &Arc<Sidecar>,
-        plan: &Plan<'_>,
-        keep: impl Fn(&ModelTensor) -> bool,
-    ) -> Result<HostSet, PlacementError> {
-        HostSet::build(split, Some(sidecar), plan, keep)
-    }
-
-    fn build(
-        split: &Split,
-        sidecar: Option<&Arc<Sidecar>>,
-        plan: &Plan<'_>,
-        keep: impl Fn(&ModelTensor) -> bool,
-    ) -> Result<HostSet, PlacementError> {
-        if let Some(side) = sidecar {
-            paired(side, split)?;
-        }
+        let (split, sidecar) = (src.split(), src.sidecar());
         let page = page_bytes()?;
         let (pages, side) = host_pages(split, sidecar.map(Arc::as_ref), plan, keep, page)?;
         let shards = pages
@@ -282,11 +263,11 @@ impl HostSet {
         self.side.as_ref().map(|(s, _)| s)
     }
 
-    /// Read every page of the set into the page cache and map it in `split`'s
+    /// Read every page of the set into the page cache and map it in `src`'s
     /// mappings (`MADV_POPULATE_READ`), one thread per chunk. A page already
     /// cached costs its page-table entry only.
-    pub fn populate(&self, split: &Split) -> Result<Walk, PlacementError> {
-        walk(split, self, |span| {
+    pub fn populate(&self, src: R8Source<'_>) -> Result<Walk, PlacementError> {
+        walk(src, self, |span| {
             // SAFETY: `span` is a live sub-slice of one of the set's mappings:
             // a shard's read-only file mapping, or the sidecar's, which is its
             // file's mapping or a resident anonymous copy. MADV_POPULATE_READ
@@ -313,10 +294,10 @@ impl HostSet {
 
     /// Per file, the pages of the set `mincore` reports resident in the page
     /// cache, and all of them, over the same chunks as a populate, a thread
-    /// each. `split` must be the split the set was made from.
-    pub fn resident(&self, split: &Split) -> Result<Vec<FileResidency>, PlacementError> {
+    /// each. `src`'s split must be the split the set was made from.
+    pub fn resident(&self, src: R8Source<'_>) -> Result<Vec<FileResidency>, PlacementError> {
         let page = self.page;
-        let (walked, counts) = walk(split, self, |span| {
+        let (walked, counts) = walk(src, self, |span| {
             resident_pages(span, page)
                 .map(|(n_in, _)| n_in)
                 .map_err(|e| format!("mincore: {e}"))
@@ -348,13 +329,19 @@ type Runs = Vec<Range<u64>>;
 type FileRuns<'a> = (HostFile, &'a Gguf, &'a [Range<u64>]);
 
 /// The files of `set` in file order — each shard with ranges, then the
-/// sidecar — with their mappings and ranges.
-fn file_runs<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<FileRuns<'a>>, PlacementError> {
+/// sidecar — with their mappings and ranges; a set built beside a sidecar is
+/// walked only beside a pair that reads that open of it.
+fn file_runs<'a>(src: R8Source<'a>, set: &'a HostSet) -> Result<Vec<FileRuns<'a>>, PlacementError> {
     let mut out = Vec::with_capacity(set.shards.len() + 1);
     for (s, runs) in &set.shards {
-        out.push((HostFile::Shard(*s), shard_of(split, *s)?, runs.as_slice()));
+        out.push((
+            HostFile::Shard(*s),
+            shard_of(src.split(), *s)?,
+            runs.as_slice(),
+        ));
     }
     if let Some((side, runs)) = &set.side {
+        src.reads(side, "a host set's walk")?;
         let file = HostFile::Sidecar(side.path().to_path_buf());
         out.push((file, side.gguf(), runs.as_slice()));
     }
@@ -372,10 +359,10 @@ struct Chunk<'a> {
 /// `set`'s files cut into chunks, in file order and in page order within a
 /// file: each file's pages into `⌈pages / per⌉` chunks ([`cut`]), `per`
 /// being the set's pages over [`WALK_CHUNKS`]. The set alone fixes the cut.
-fn chunks<'a>(split: &'a Split, set: &'a HostSet) -> Result<Vec<Chunk<'a>>, PlacementError> {
+fn chunks<'a>(src: R8Source<'a>, set: &'a HostSet) -> Result<Vec<Chunk<'a>>, PlacementError> {
     let per = set.pages().div_ceil(WALK_CHUNKS).max(1);
     let mut out = Vec::new();
-    for (file, g, runs) in file_runs(split, set)? {
+    for (file, g, runs) in file_runs(src, set)? {
         let pages: u64 = runs.iter().map(|r| r.end - r.start).sum();
         for piece in cut(runs, pages.div_ceil(per)) {
             out.push(Chunk {
@@ -436,12 +423,12 @@ pub struct HostLock {
 }
 
 impl HostLock {
-    /// Lock every page of `set` in `split`'s mappings, one thread per chunk.
+    /// Lock every page of `set` in `src`'s mappings, one thread per chunk.
     /// A page not yet in the page cache is read first, so a set populated
     /// just before locks at page-table speed. A refusal — `RLIMIT_MEMLOCK`,
     /// most often — unlocks what was taken and names the limit.
-    pub fn lock(split: &Split, set: &HostSet) -> Result<HostLock, PlacementError> {
-        let (spans, walked) = walk(split, set, |span| {
+    pub fn lock(src: R8Source<'_>, set: &HostSet) -> Result<HostLock, PlacementError> {
+        let (spans, walked) = walk(src, set, |span| {
             // SAFETY: `span` is a live sub-slice of one of the set's mappings:
             // a shard's read-only file mapping, or the sidecar's, which is its
             // file's mapping or a resident anonymous copy. mlock faults its
@@ -537,23 +524,31 @@ fn memlock_limit() -> String {
     )
 }
 
-/// Releases file bytes of a split from this process's mappings and from the
-/// page cache: whole pages inside each range only, so a page that also holds
-/// bytes outside it stays. For bytes already on a card that no later reader
-/// takes from the file.
+/// Releases file bytes of a split — and of the r8 sidecar its pair reads —
+/// from this process's mappings and from the page cache: whole pages inside
+/// each range only, so a page that also holds bytes outside it stays. For
+/// bytes already on a card that no later reader takes from the file.
 pub struct PageDrop<'s> {
-    split: &'s Split,
+    src: R8Source<'s>,
     /// Each shard's descriptor, opened at its first release.
     files: Vec<Option<File>>,
     bytes: u64,
 }
 
 impl<'s> PageDrop<'s> {
+    /// A release of `split`'s shards.
     #[must_use]
     pub fn new(split: &'s Split) -> PageDrop<'s> {
+        PageDrop::of(R8Source::rows(split))
+    }
+
+    /// A release of `src`'s shards and of the sidecar it reads
+    /// ([`PageDrop::release_sidecar`]).
+    #[must_use]
+    pub fn of(src: R8Source<'s>) -> PageDrop<'s> {
         PageDrop {
-            split,
-            files: (0..split.shard_count()).map(|_| None).collect(),
+            src,
+            files: (0..src.split().shard_count()).map(|_| None).collect(),
             bytes: 0,
         }
     }
@@ -563,29 +558,28 @@ impl<'s> PageDrop<'s> {
     /// mapped, so this process's page-table entries go first
     /// (`MADV_DONTNEED`); a page another process maps stays cached.
     pub fn release(&mut self, shard: usize, at: Range<u64>) -> Result<(), PlacementError> {
-        let g = shard_of(self.split, shard)?;
+        let map = FileMapping::shard(self.src.split(), shard)?;
         let file = self.file(shard)?;
-        // A split's shard is always its file's own mapping (`Split::open`).
-        let dropped = drop_pages(&HostFile::Shard(shard), file, Some(g.mapping()), at)?;
+        let dropped = drop_pages(&HostFile::Shard(shard), file, Some(map), at)?;
         self.bytes += dropped;
         Ok(())
     }
 
-    /// Release every whole page of the r8 sidecar `side`, as
-    /// [`PageDrop::release`] does a shard's. Refused by name: a sidecar that
-    /// is not this split's ([`Sidecar::pairs`]), and a resident one, whose
-    /// bytes are an anonymous copy, which `MADV_DONTNEED` would zero.
-    pub fn release_sidecar(&mut self, side: &Sidecar) -> Result<(), PlacementError> {
-        paired(side, self.split)?;
+    /// Release every whole page of the r8 sidecar the pair reads, as
+    /// [`PageDrop::release`] does a shard's. Refused by name: a pair that
+    /// reads none, and a resident sidecar, whose bytes are an anonymous copy,
+    /// which `MADV_DONTNEED` would zero.
+    pub fn release_sidecar(&mut self) -> Result<(), PlacementError> {
+        let side = self.src.sidecar().ok_or(R8Error::PairReadsNone {
+            what: "a sidecar page release",
+        })?;
+        let map = side.file_pages().ok_or_else(|| R8Error::ResidentCopy {
+            path: side.path().to_path_buf(),
+        })?;
         let name = HostFile::Sidecar(side.path().to_path_buf());
-        let Some(map) = side.file_pages() else {
-            return Err(PlacementError::Host(format!(
-                "{name} is a resident copy, not its file's mapping: it has no file pages to release"
-            )));
-        };
         let file = File::open(side.path())
             .map_err(|e| PlacementError::Host(format!("open {name} to release pages: {e}")))?;
-        self.bytes += drop_pages(&name, &file, Some(map), 0..map.len() as u64)?;
+        self.bytes += drop_pages(&name, &file, Some(map), 0..map.len())?;
         Ok(())
     }
 
@@ -596,10 +590,10 @@ impl<'s> PageDrop<'s> {
     }
 
     fn file(&mut self, shard: usize) -> Result<&File, PlacementError> {
-        let path = self
-            .split
-            .shard_path(shard)
-            .ok_or_else(|| PlacementError::Host(format!("shard {shard} is not in the split")))?;
+        let path =
+            self.src.split().shard_path(shard).ok_or_else(|| {
+                PlacementError::Host(format!("shard {shard} is not in the split"))
+            })?;
         let slot = self
             .files
             .get_mut(shard)
@@ -615,30 +609,51 @@ impl<'s> PageDrop<'s> {
     }
 }
 
-/// `side` checked against `split` ([`Sidecar::pairs`]), its refusal named
-/// as a host-set one.
-fn paired(side: &Sidecar, split: &Split) -> Result<(), PlacementError> {
-    side.pairs(split).map_err(|e| {
-        PlacementError::Host(format!(
-            "sidecar {} is not this split's: {e}",
-            side.path().display()
-        ))
-    })
+/// A file's own read-only `MAP_SHARED` mapping, file offset `o` at index `o`:
+/// the one kind of mapping [`drop_pages`] drops page-table entries of, where
+/// the next touch re-faults the same file bytes. Made by
+/// [`FileMapping::shard`] (a split's shard) and `Sidecar::file_pages` (a
+/// sidecar opened as its file's mapping); an anonymous copy never becomes
+/// one, since `MADV_DONTNEED` would zero it under a live borrow.
+#[derive(Clone, Copy)]
+pub(crate) struct FileMapping<'a>(&'a [u8]);
+
+impl<'a> FileMapping<'a> {
+    /// # Safety
+    ///
+    /// `map` is the whole of a file's own read-only `MAP_SHARED` mapping,
+    /// file offset `o` at index `o`, and no private or anonymous page lies
+    /// in it.
+    pub(crate) unsafe fn new(map: &'a [u8]) -> FileMapping<'a> {
+        FileMapping(map)
+    }
+
+    /// Shard `s` of `split`'s mapping.
+    pub(crate) fn shard(split: &'a Split, s: usize) -> Result<FileMapping<'a>, PlacementError> {
+        let g = shard_of(split, s)?;
+        // SAFETY: `Split::open` opens every shard with `Gguf::open`, a
+        // read-only file mapping (`Weights::Mapped`), and a split has no
+        // other constructor.
+        Ok(unsafe { FileMapping::new(g.mapping()) })
+    }
+
+    /// Its length in bytes.
+    pub(crate) fn len(self) -> u64 {
+        self.0.len() as u64
+    }
 }
 
 /// Drop the whole pages inside bytes `at` (file offsets) of `name`'s file
 /// `file`: from this process's page tables first when `map` is given, then
 /// from the page cache, which skips a page still mapped; the bytes dropped.
-/// `map` is the file's own read-only MAP_SHARED mapping, file offset `o` at
-/// index `o` — a shard's, or a sidecar's through [`Sidecar::file_pages`];
-/// `None` is a file this process maps no page of there (a resident sidecar,
-/// whose anonymous copy `MADV_DONTNEED` would zero), and only the page
+/// `map` is the file's own mapping ([`FileMapping`]); `None` is a file this
+/// process maps no page of there (a resident sidecar), and only the page
 /// cache's copy goes. The one owner of page release: [`PageDrop`] and
 /// `r8file::verify` call it.
 pub(crate) fn drop_pages(
     name: &HostFile,
     file: &File,
-    map: Option<&[u8]>,
+    map: Option<FileMapping<'_>>,
     at: Range<u64>,
 ) -> Result<u64, PlacementError> {
     let page = page_bytes()?;
@@ -647,7 +662,7 @@ pub(crate) fn drop_pages(
     if end <= first {
         return Ok(0);
     }
-    if let Some(map) = map {
+    if let Some(FileMapping(map)) = map {
         let span = usize::try_from(first)
             .ok()
             .zip(usize::try_from(end).ok())
@@ -659,11 +674,10 @@ pub(crate) fn drop_pages(
                 ))
             })?;
         // SAFETY: `span` is a live sub-slice of a read-only MAP_SHARED file
-        // mapping (`map`'s contract above: a shard's, or a sidecar's that
-        // `Sidecar::file_pages` gives only for its file mapping).
-        // MADV_DONTNEED on it drops this process's page-table entries only;
-        // the next touch re-faults the same file bytes, so no borrow of the
-        // mapping ever sees other contents.
+        // mapping (`FileMapping`'s one invariant). MADV_DONTNEED on it drops
+        // this process's page-table entries only; the next touch re-faults
+        // the same file bytes, so no borrow of the mapping ever sees other
+        // contents.
         if unsafe {
             libc::madvise(
                 span.as_ptr().cast_mut().cast(),
@@ -712,17 +726,17 @@ type ChunkResult = (
 /// A walk and each chunk's count, in chunk order.
 type Walked = (Walk, Vec<u64>);
 
-/// Run `op` over every page run of `set` in `split`'s mappings and the
-/// sidecar's, one thread per chunk ([`chunks`]), a chunk's runs in order.
-/// `op` returns a count each chunk sums (the resident pages of a residency
+/// Run `op` over every page run of `set` in `src`'s mappings — the split's
+/// and the sidecar's — one thread per chunk ([`chunks`]), a chunk's runs in
+/// order. `op` returns a count each chunk sums (the resident pages of a residency
 /// count; 0 for a populate or a lock). Returns the spans `op` succeeded on
 /// and the walk, or the first refusal in chunk order.
 fn walk(
-    split: &Split,
+    src: R8Source<'_>,
     set: &HostSet,
     op: impl Fn(&[u8]) -> Result<u64, String> + Sync,
 ) -> (Vec<(usize, usize)>, Result<Walked, PlacementError>) {
-    let work = match chunks(split, set) {
+    let work = match chunks(src, set) {
         Ok(work) => work,
         Err(e) => return (Vec::new(), Err(e)),
     };
@@ -968,12 +982,72 @@ fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{HostSet, cut, walk};
+    use crate::placement::PlacementError;
+    use crate::r8file::{self, HostR8, R8Error, R8Source, Sidecar};
     use std::fs::File;
     use std::io::BufWriter;
     use std::ops::Range;
+    use std::sync::Arc;
 
-    use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
+    use gguf::{Split, Weights};
+
+    /// A host set built beside one open of a sidecar walks only beside a pair
+    /// that reads that open: a pair that reads none, or another open of the
+    /// same file checked against the same split, is refused by name
+    /// (`R8Error::OtherSidecar`) before a page is walked. One Q3_K stack of
+    /// two experts of 8 rows of 256, its sidecar converted beside it.
+    #[test]
+    fn a_set_walks_only_beside_its_own_sidecar() {
+        let page = super::page_bytes().unwrap();
+        let dir = std::env::temp_dir().join(format!("host-lock-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.gguf");
+        let nbytes = 2 * 8 * 110;
+        let decl = TensorDecl {
+            name: "s".to_string(),
+            dims: vec![256, 8, 2],
+            type_id: 11,
+            nbytes,
+        };
+        let layout = Layout::new(&[], vec![decl]).unwrap();
+        let mut w = Writer::new(BufWriter::new(File::create(&path).unwrap()), layout).unwrap();
+        let bytes: Vec<u8> = (0..nbytes).map(|i| (i * 7 % 251) as u8).collect();
+        w.tensor("s", &bytes).unwrap();
+        w.finish().unwrap();
+        let split = Split::open(&path).unwrap();
+        let side_path = dir.join("m-r8.gguf");
+        r8file::convert(&split, &["s".to_string()], &side_path, &mut |_| {}).unwrap();
+        let open = || {
+            let lazy = Weights::Mapped { populate: false };
+            HostR8::On(Arc::new(Sidecar::open(&side_path, &split, lazy).unwrap()))
+        };
+        let (held, other) = (open(), open());
+        let side = held.sidecar().unwrap();
+        let set = HostSet {
+            page,
+            shards: Vec::new(),
+            side: Some((Arc::clone(side), std::iter::once(0..1).collect())),
+        };
+        for (what, src) in [
+            ("a pair that reads none", R8Source::rows(&split)),
+            (
+                "a pair that reads another open",
+                R8Source::of(&split, &other).unwrap(),
+            ),
+        ] {
+            match set.resident(src) {
+                Err(PlacementError::R8(e @ R8Error::OtherSidecar { .. })) => {
+                    println!("walk beside {what}: {e}");
+                }
+                other => panic!("walk beside {what} must be refused by name, got {other:?}"),
+            }
+        }
+        let files = set.resident(R8Source::of(&split, &held).unwrap()).unwrap();
+        assert_eq!(files.len(), 1, "the set's one file");
+        assert_eq!(files[0].pages, 1, "the set's one page");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// A walk whose `op` panics in a chunk hands back the span that chunk
     /// took before the panic — so a lock's drop unlocks it — and refuses by
@@ -1006,7 +1080,7 @@ mod tests {
         let map = split.shard(0).unwrap().mapping().as_ptr() as usize;
         let page_len = usize::try_from(page).unwrap();
         let second = map + 2 * page_len;
-        let (spans, walked) = walk(&split, &set, |span| {
+        let (spans, walked) = walk(R8Source::rows(&split), &set, |span| {
             assert!(
                 span.as_ptr() as usize != second,
                 "the op refuses page 2 by panicking"
