@@ -40,6 +40,7 @@ pub mod gated_quant;
 pub mod gemm;
 pub(crate) mod graph;
 pub mod head;
+pub mod host;
 pub mod hybrid;
 pub mod iq;
 pub mod kquant;
