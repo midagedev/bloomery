@@ -1375,8 +1375,10 @@ fn hw_mxfp4_kernel_predicts_ik() {
 // tail blocks. The set carries -128 weight codes, zero, subnormal and negative f16 scales, a
 // zero activation block, and block 9, whose bf16 scale is the subnormal 2^-127 and whose first
 // code is -128: under a negative weight code that product takes the sign trick's wrap, in ik's
-// kernel and in ours alike. Gate B is bit identity: ours is ik's instruction graph, with the
-// same operand order at every float operation, so no rounding can differ.
+// kernel and in ours alike. At d = 2^-127 the wrap's term sits below every row sum's f32
+// resolution, so block 9 cannot tell a wrap from a saturation; gate A pins the wrap on crafted
+// columns at a unit scale instead. Gate B is bit identity: ours is ik's instruction graph, with
+// the same operand order at every float operation, so no rounding can differ.
 
 /// The synthetic Q8_0 dump: `k`, the column's f32 values, ik's q8_2_x4 bytes of the column,
 /// the weight rows and ik's result bits per row.
@@ -1527,9 +1529,49 @@ fn hw_q8f0_kernel_matches_mirror() {
             n += 1;
         }
     }
+    // The encoder emits -128 only where its scale underflows, so no encoded column shows the
+    // sign trick's wrap in an f32 sum. Crafted columns pin it: activation code -128 under a unit
+    // bf16 scale, met by weight code -127 under a unit f16 scale, in an x4 group and in a tail
+    // block. There the wrap (+128 -> -128) and a saturation (127) differ by 255 · 127.
+    let mut wraps = 0;
+    for (k, blk) in [(32usize, 0usize), (160, 0), (160, 4), (2144, 9)] {
+        let x: Vec<f32> = (0..k).map(|_| rng.unit()).collect();
+        let mut a = vec![0u8; col_bytes(GgmlType::Q8_0, k)];
+        quantize_col(GgmlType::Q8_0, &x, &mut a);
+        let nb4 = k / 32 / 4 * 4;
+        let (d_at, q_at) = if blk < nb4 {
+            let g = blk / 4 * 144;
+            (g + 2 * (blk % 4), g + 16 + 32 * (blk % 4))
+        } else {
+            let t = nb4 / 4 * 144 + (blk - nb4) * 36;
+            (t, t + 4)
+        };
+        a[d_at..d_at + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
+        a[q_at] = 0x80;
+        let mut w: Vec<u8> = (0..34 * k / 32).map(|_| rng.next_u32() as u8).collect();
+        for b in w.as_chunks_mut::<34>().0 {
+            let h = u16::from_le_bytes([b[0], b[1]]);
+            let h = (h & 0x83ff) | ((h % 0x1f) << 10);
+            b[0..2].copy_from_slice(&h.to_le_bytes());
+        }
+        w[34 * blk..34 * blk + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        w[34 * blk + 2] = 0x81;
+        let what = format!("crafted wrap k = {k} block {blk}");
+        same(&w, &a, k, &what);
+        // The site shows in the sum: -127 in the code's place moves the result.
+        let mut b = a.clone();
+        b[q_at] = 0x81;
+        let wrapped = dot_row_scalar(GgmlType::Q8_0, &w, &a, k).unwrap();
+        let unwrapped = dot_row_scalar(GgmlType::Q8_0, &w, &b, k).unwrap();
+        assert!(
+            wrapped.to_bits() != unwrapped.to_bits(),
+            "{what}: codes -128 and -127 give the same sum {wrapped:e}; the site is invisible"
+        );
+        wraps += 1;
+    }
     eprintln!(
-        "Q8_0 gate A: 64 dump rows and {n} generated rows bit-identical (kernel vs mirror, \
-         tails of 0 to 3 blocks)"
+        "Q8_0 gate A: 64 dump rows, {n} generated rows and {wraps} crafted -128 wrap rows \
+         bit-identical (kernel vs mirror, tails of 0 to 3 blocks)"
     );
 }
 
@@ -1561,7 +1603,7 @@ fn hw_q8f0_kernel_predicts_ik() {
     }
     eprintln!(
         "Q8_0 gate B: 64 rows bit-identical to ik's mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, \
-         block_q8_2> (on ik's own column, {wraps} rows through the -128 wrap)"
+         block_q8_2> (on ik's own column, {wraps} rows meet the -128 code at d = 2^-127)"
     );
 }
 
