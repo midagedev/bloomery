@@ -39,6 +39,18 @@
 #   warmup-bad   BLOOMERY_AB_WARMUP=2 is refused by name (rc 64).
 #   blocks-dry   the blocks run's arms under BLOOMERY_DRY=1: the block plan, the ik discard's command line
 #                at --n-cpu-moe 2, each block's rotation, and no plain round lines.
+# The failures, red on the runner before FAIL rows (it stopped at the first failed arm, rc 1):
+#   ref-fail     6 lcpp:6 lcpppp:4 lcppfit:6 ik:6 mrs:6 mrspp:4, two rounds; in round 1 lcpppp:4 aborts (rc
+#                134), lcppfit:6's fit never runs and mrs:6 prints no row: three FAIL rows naming why, the
+#                last line and the full output's file (which holds the abort), every other arm's row after
+#                them, the three labels dropped from the means and ratios by name, `failed arms: …`, rc 1.
+#   discard-fail BLOOMERY_AB_ORDER=blocks, lcpp:6 lcppfit:6 lcppppfit8:8 mrs:6, one round: each block's
+#                discard fails (lcpp:6 no row, lcppppfit8:8 aborts — the 2026-09-28 sitting's shape — mrs:6
+#                no row) as `FAIL r0 …`, and every block's round still runs; nothing drops; rc 1.
+#   discard-nofit  the fit block's discard lcppfit:6 with no fit: `FAIL r0 lcppfit`, the block's rows after it.
+#   warmup-fail  BLOOMERY_AB_WARMUP=1 under rotate, the warm-up lcpp:6 aborts: `FAIL r0 lcpp`, the rows after.
+#   group-fail   6 4 5 in one load, depth 4 ending the process once: 6's row, 4's FAIL row, the driver's
+#                `[load]` line, and 5 in a fresh load (the processes' --arm lists 6 4 5, then 5); rc 1.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -75,7 +87,11 @@ EOF
 # test at 20.00), its model column naming the --n-cpu-moe (or -ncmoe) it ran at. Under --progress it
 # prints mainline's progress lines on stderr (the ik copy refuses the flag, as ik's llama-bench does).
 # --help lists --fit-target; under -fitt -v it prints two model loads on stderr, the fit's measuring
-# one and the real one with two expert tensors of blk 1 overridden to the host.
+# one and the real one with two expert tensors of blk 1 overridden to the host. The failures, each the
+# first time only a test of that label runs (a marker file per failure and label): the label
+# STUB_BENCH_ABORT names aborts after its progress lines as ggml's CUDA error does (rc 134, no table
+# row), STUB_BENCH_NOVAL's prints its table without its row (rc 0), and under -fitt STUB_BENCH_NOFIT's
+# prints no model load (the fit never ran).
 cat > "$T/bin/bench" << 'EOF'
 #!/usr/bin/env bash
 eng=${0##*/} k='' p=0 n=0 d='' gp='' prog='' fitt='' verb=''
@@ -91,7 +107,22 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-if [ -n "$fitt" ] && [ -n "$verb" ]; then
+if [ "$p" != 0 ]; then
+  label="pp$p" val=400.00
+elif [ "$eng" = ik-bench ]; then
+  label="tg${gp#*,}@pp${gp%,*}" val=20.00
+else
+  label="tg$n @ d$d" val=20.00
+fi
+# once <failure>: true the first time a test of this label meets <failure> (named by STUB_BENCH_<failure>).
+once() {
+  local var=STUB_BENCH_$1 m
+  [ "${!var:-}" = "$label" ] || return 1
+  m=${TMPDIR:-/tmp}/stub-once-bench-$1-${label//[^A-Za-z0-9]/_}
+  [ ! -e "$m" ] || return 1
+  touch "$m"
+}
+if [ -n "$fitt" ] && [ -n "$verb" ] && ! once NOFIT; then
   for l in "llama_model_loader: loaded meta data with 3 key-value pairs and 6 tensors from stub" \
     "load_tensors: offloaded 3/3 layers to GPU" "load_tensors:        CUDA0 model buffer size =    12.00 MiB" \
     "llama_model_loader: loaded meta data with 3 key-value pairs and 6 tensors from stub" \
@@ -116,22 +147,21 @@ if [ -n "$prog" ]; then
     echo "llama-bench: benchmark 1/1: generation run 1/1" >&2
   fi
 fi
-if [ "$p" != 0 ]; then
-  label="pp$p" val=400.00
-elif [ "$eng" = ik-bench ]; then
-  label="tg${gp#*,}@pp${gp%,*}" val=20.00
-else
-  label="tg$n @ d$d" val=20.00
+if once ABORT; then
+  echo "CUDA error: an illegal memory access was encountered (stub)" >&2
+  echo "ggml_cuda_error: in function ggml_backend_cuda_graph_compute (stub)" >&2
+  exit 134
 fi
 echo "| model | size | test | t/s |"
 echo "| --- | ---: | ---: | ---: |"
-echo "| stub k=$k | 1 | $label | $val ± 0.01 |"
+once NOVAL || echo "| stub k=$k | 1 | $label | $val ± 0.01 |"
 echo "build: stub (0)"
 EOF
 cp "$T/bin/bench" "$T/bin/ik-bench"
 mv "$T/bin/bench" "$T/bin/lcpp-bench"
 # The stub mistralrs: --version, and `bench` printing its timed iteration's log line (not under
 # STUB_MRS_NO_ITER) and a box-drawn row: TTFT for --gen-len 1 (400.0 T/s), else the decode row (50.0).
+# Under STUB_MRS_NOVAL its first bench prints no row (a marker file) and exits 0.
 cat > "$T/bin/mistralrs" << 'EOF'
 #!/usr/bin/env bash
 [ "${1:-}" != --version ] || { echo "mistralrs 0.0.0-stub"; exit 0; }
@@ -143,7 +173,11 @@ done
 echo "2026-01-01T00:00:00Z  INFO mistralrs_cli: Layers 0-1: cuda[0]"
 echo "2026-01-01T00:00:00Z  INFO mistralrs_cli: Warmup complete."
 [ -n "${STUB_MRS_NO_ITER:-}" ] || echo "2026-01-01T00:00:00Z  INFO mistralrs_cli: Iteration 1/1..."
-if [ "$g" = 1 ]; then
+m=${TMPDIR:-/tmp}/stub-once-mrs-noval
+if [ -n "${STUB_MRS_NOVAL:-}" ] && [ ! -e "$m" ]; then
+  touch "$m"
+  echo "2026-01-01T00:00:00Z  WARN mistralrs_cli: the stub prints no row once"
+elif [ "$g" = 1 ]; then
   echo "│ TTFT ($p input tokens) ┆ 400.0 ± 0.0 ┆ 10.00 ms │"
 else
   echo "│ Decode ($g tokens @ d$d) ┆ 50.0 ± 0.1 ┆ 20.00 ms TPOT │"
@@ -153,7 +187,8 @@ touch "$T/Cargo.toml"
 # The stub generate_qwen3moe: a one-arm run (--tokens) prints its prompt ids before its load lines; an
 # --arm list prints each arm's `arm` line, waits for a line on stdin under --arm-sync, then its prompt ids.
 # Each arm: the step-0, time prompt (P x 10 tok/s, kind=gemm) and step lines, and a SMOKE footer at 5 ms
-# a step. Every process appends its arm list to $TMPDIR/stub-gen-loads.
+# a step. Every process appends its arm list to $TMPDIR/stub-gen-loads. An arm of depth
+# STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids.
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
 tokens='' n=32 ctx=0 sync='' arms=()
@@ -176,6 +211,12 @@ for k in "${!arms[@]}"; do
     echo "arm i=$k arms=${#arms[@]} ids=$depth n=$n"
     if [ -n "$sync" ]; then read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }; fi
     echo "prompt_ids [${arms[$k]}]"
+  fi
+  mark=${TMPDIR:-/tmp}/stub-once-gen-$depth
+  if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
+    touch "$mark"
+    echo "error: the stub refuses depth $depth once" >&2
+    exit 3
   fi
   echo "step 0 $depth 1000 (stub)"
   echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=gemm"
@@ -201,7 +242,7 @@ stub_run() {
   shift
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
-  rm -f "$tmp/tmp/stub-gen-loads"
+  rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-*
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
   RC=$?
@@ -392,9 +433,126 @@ elif want blocks-dry "$L" 1 '^\[dry\] block 3/5 ik: ik:6 ikdef:6; discard ik:6 a
   pass blocks-dry
 fi
 
+# The failures (red on the runner before FAIL rows: it exits 1 at the first one).
+L=$tmp/ref-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 STUB_BENCH_ABORT=pp4 'STUB_BENCH_NOFIT=tg4 @ d6' STUB_MRS_NOVAL=1 -- \
+  6 lcpp:6 lcpppp:4 lcppfit:6 ik:6 mrs:6 mrspp:4
+want_seq="ROW r1 ours d=6
+ROW r1 lcpp d=6
+FAIL r1 lcpppp p=4
+FAIL r1 lcppfit d=6
+ROW r1 ik d=6
+FAIL r1 mrs d=6
+ROW r1 mrspp p=4
+ROW r2 lcpp d=6
+ROW r2 lcpppp p=4
+ROW r2 lcppfit d=6
+ROW r2 ik d=6
+ROW r2 mrs d=6
+ROW r2 mrspp p=4
+ROW r2 ours d=6"
+seq=$(heads "$L")
+FULL="\| full output: [^ ]*/depth-qwen3moe-"
+if [ "$RC" != 1 ]; then
+  fail ref-fail "rc $RC, want 1" "$L"
+elif [ "$seq" != "$want_seq" ]; then
+  fail ref-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
+elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line: ggml_cuda_error: in function ggml_backend_cuda_graph_compute \(stub\) ${FULL}lcpppp-p4-r1\.log$" &&
+  want ref-fail "$L" 1 "^FAIL r1 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) in its -v output, want the fit.s measuring load and the real one; last line: build: stub \(0\) ${FULL}lcppfit-d6-r1\.log$" &&
+  want ref-fail "$L" 1 "^FAIL r1 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; last line: .*WARN mistralrs_cli: the stub prints no row once ${FULL}mrs-d6-r1\.log$" &&
+  want ref-fail "$L" 11 '^ROW ' &&
+  want ref-fail "$L" 1 '^=== dropped from the means and the ratios below' &&
+  want ref-fail "$L" 3 '^    dropped: (lcpppp at 4|lcppfit at 6|mrs at 6)$' &&
+  want ref-fail "$L" 0 '^mean (pp )?(lcpppp|lcppfit|mrs) ' &&
+  want ref-fail "$L" 1 '^mean lcpp d=6 .*\(n=2\)' &&
+  want ref-fail "$L" 1 '^mean pp mrspp p=4 .*\(n=2\)' &&
+  want ref-fail "$L" 1 '^ratio d=6 +ours/ik ' &&
+  want ref-fail "$L" 0 '^ratio d=6 +ours/(lcppfit|mrs) ' &&
+  want ref-fail "$L" 1 '^cold rows: [0-9]+ of 11 ' &&
+  want ref-fail "$L" 1 '^failed arms: 3 \(FAIL rows, ' &&
+  want ref-fail "$L" 1 '^failed arms: r1 lcpppp p=4 rc=134; r1 lcppfit d=6 rc=0; r1 mrs d=6 rc=0; $'; then
+  if grep -q '^ggml_cuda_error: ' "$tmp/tmp/depth-qwen3moe-lcpppp-p4-r1.log" 2> /dev/null; then
+    pass ref-fail
+  else
+    fail ref-fail "the FAIL row's full output file does not hold the abort" "$L"
+  fi
+fi
+
+L=$tmp/discard-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks STUB_BENCH_ABORT=pp8 'STUB_BENCH_NOVAL=tg4 @ d6' STUB_MRS_NOVAL=1 -- \
+  lcpp:6 lcppfit:6 lcppppfit8:8 mrs:6
+want_seq="FAIL r0 lcpp d=6
+ROW r1 lcpp d=6
+FAIL r0 lcppppfit8 p=8
+ROW r1 lcppfit d=6
+ROW r1 lcppppfit8 p=8
+FAIL r0 mrs d=6
+ROW r1 mrs d=6"
+seq=$(heads "$L")
+if [ "$RC" != 1 ]; then
+  fail discard-fail "rc $RC, want 1" "$L"
+elif [ "$seq" != "$want_seq" ]; then
+  fail discard-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
+elif want discard-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=0 \| no 'tg4 @ d6' row; last line: build: stub \(0\) ${FULL}lcpp-d6-r0\.log$" &&
+  want discard-fail "$L" 1 "^FAIL r0 lcppppfit8 p=8 rc=134 \| no 'pp8' row; last line: ggml_cuda_error: .* ${FULL}lcppppfit8-p8-r0\.log$" &&
+  want discard-fail "$L" 1 "^FAIL r0 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; " &&
+  want discard-fail "$L" 3 '^\[discard\] ' &&
+  want discard-fail "$L" 0 '^=== dropped|^    dropped: ' &&
+  want discard-fail "$L" 1 '^mean lcpp d=6 .*\(n=1\)' &&
+  want discard-fail "$L" 1 '^mean pp lcppppfit8 p=8 .*\(n=1\)' &&
+  want discard-fail "$L" 1 '^failed arms: 3 \(FAIL rows, ' &&
+  want discard-fail "$L" 1 '^failed arms: r0 lcpp d=6 rc=0; r0 lcppppfit8 p=8 rc=134; r0 mrs d=6 rc=0; $'; then
+  pass discard-fail
+fi
+
+L=$tmp/discard-nofit.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks 'STUB_BENCH_NOFIT=tg4 @ d6' -- lcppfit:6 lcppppfit:4
+if [ "$RC" != 1 ]; then
+  fail discard-nofit "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r0 lcppfit d=6|ROW r1 lcppfit d=6|ROW r1 lcppppfit p=4" ]; then
+  fail discard-nofit "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want discard-nofit "$L" 1 "^FAIL r0 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) " &&
+  want discard-nofit "$L" 1 '^ROW r1 lcppfit d=6 .*\| fit offloaded 3/3, ' &&
+  want discard-nofit "$L" 1 '^failed arms: r0 lcppfit d=6 rc=0; $'; then
+  pass discard-nofit
+fi
+
+L=$tmp/warmup-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=1 'STUB_BENCH_ABORT=tg4 @ d6' -- lcpp:6 6
+if [ "$RC" != 1 ]; then
+  fail warmup-fail "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "FAIL r0 lcpp d=6|ROW r1 lcpp d=6|ROW r1 ours d=6" ]; then
+  fail warmup-fail "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want warmup-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=134 \| no 'tg4 @ d6' row; " &&
+  want warmup-fail "$L" 1 '^\[warmup\] lcpp:6 ran once before round 1 and is discarded \(the WARMUP or FAIL r0 row above\)$' &&
+  want warmup-fail "$L" 1 '^mean lcpp d=6 .*\(n=1\)' &&
+  want warmup-fail "$L" 1 '^failed arms: r0 lcpp d=6 rc=134; $'; then
+  pass warmup-fail
+fi
+
+L=$tmp/group-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_FAIL_DEPTH=4 -- 6 4 5
+loads=$(sed 's/ *$//' "$tmp/tmp/stub-gen-loads" 2> /dev/null | paste -sd'|' -)
+if [ "$RC" != 1 ]; then
+  fail group-fail "rc $RC, want 1" "$L"
+elif [ "$loads" != "6 4 5|5" ]; then
+  fail group-fail "the processes' --arm lists: $loads, want 6 4 5|5" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|FAIL r1 ours d=4|ROW r1 ours d=5" ]; then
+  fail group-fail "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want group-fail "$L" 1 '^ROW r1 ours d=6 .*\| slot 1/3 \|' &&
+  want group-fail "$L" 1 "^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once ${FULL}ours-d4-r1\.log$" &&
+  want group-fail "$L" 1 '^\[load\] r1: arm 4 failed \(rc 3\); the 1 arm\(s\) after it run in a fresh load$' &&
+  want group-fail "$L" 1 '^ROW r1 ours d=5 .*\| slot 1/1 \|' &&
+  want group-fail "$L" 1 '^    dropped: ours at 4$' &&
+  want group-fail "$L" 0 '^mean ours d=4 ' &&
+  want group-fail "$L" 1 '^failed arms: r1 ours d=4 rc=3; $'; then
+  pass group-fail
+fi
+
 if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
-    "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log; do
+    "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
+    "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done
