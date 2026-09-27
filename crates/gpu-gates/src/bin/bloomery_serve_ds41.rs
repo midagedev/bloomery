@@ -17,6 +17,11 @@
 //! nvidia-smi index; when that index cannot be found the placement is left
 //! out, with the reason on stderr.
 //!
+//! The server serves the lesser of `--ctx` and the positions V4.1 is computed
+//! at (`Hparams::candidate_free_positions`): `/props`' `n_ctx` is that number,
+//! a prompt that long is a 400 before it reaches the engine, and generation
+//! stops there with `truncated`.
+//!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
@@ -144,6 +149,7 @@ mod drive {
             ..EngineProps::default()
         };
         let want_top_k = inputs.hp.indexer.top_k;
+        let defined = inputs.hp.candidate_free_positions();
         let n_layer = inputs.hp.n_layer;
         let open = OpenArgs {
             place: a.place,
@@ -192,6 +198,7 @@ mod drive {
                     body::PrefillMode::Steps => m.step(ids),
                 }
             },
+            defined,
             vocab,
             card,
             props,

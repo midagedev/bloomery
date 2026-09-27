@@ -17,6 +17,13 @@
 //!   ids are `generate_ds41 --tokens <--ids> -n 16`'s `tokens` line — all 16,
 //!   or a prefix ending in the end-of-generation id when the server stopped
 //!   there (`generate_ds41` does not stop at it);
+//! - the same `/completion` sampled (temperature above 0), which reads the
+//!   logits row every token: one seed twice gives the same ids, and `top_k` 1
+//!   gives the greedy ids;
+//! - the positions the server serves: `/props`' `n_ctx` is the lesser of the
+//!   server's default context and the positions V4.1 is computed at
+//!   (`Hparams::candidate_free_positions`); a prompt of that many ids is a 400
+//!   (`exceed_context_size_error`, naming it) and the server stays up;
 //! - `/v1/chat/completions` of one user turn at temperature 0: the streamed
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
@@ -90,6 +97,9 @@ mod gate {
     const TURN1: &str = "Name three primary colors.";
     const TURN2: &str = "Which of them is the color of the sky?";
     const TURN_PREDICT: usize = 24;
+    /// The sampled requests' temperature and seed.
+    const SAMPLED_TEMPERATURE: f64 = 0.8;
+    const SAMPLED_SEED: u64 = 7;
 
     /// The positions the engine keeps of at most `ask` when it holds `held`
     /// after a plain run: all of them from `held − 1` on, else `ask` rounded
@@ -116,6 +126,78 @@ mod gate {
             .iter()
             .map(|&r| r as usize)
             .collect())
+    }
+
+    /// The positions the server serves at its default context: the lesser of
+    /// that context and the positions the file's model is computed at.
+    fn served_positions() -> Result<usize, GateError> {
+        let path = workstation::model_v41();
+        let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let defined = Hparams::read(&split)?.candidate_free_positions();
+        Ok(usize::try_from(workstation::CTX_MAX)?.min(defined))
+    }
+
+    /// `/completion` of `prompt` sampled at [`SAMPLED_TEMPERATURE`] with
+    /// `seed` and `top_k`, from a reset cache: its ids.
+    fn sampled(
+        url: &dyn Fn(&str) -> String,
+        prompt: &str,
+        seed: u64,
+        top_k: u32,
+    ) -> Result<Vec<u32>, GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
+            "top_k": top_k, "seed": seed, "return_tokens": true, "cache_prompt": false,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&body), false)?;
+        let v = json_of("/completion", st, &body)?;
+        let ids = ids_of(&v["tokens"]);
+        println!(
+            "sampled seed {seed} top_k {top_k}: {ids:?} stop_type={}",
+            v["stop_type"]
+        );
+        Ok(ids)
+    }
+
+    /// `/props`' `n_ctx` is [`served_positions`], a prompt of that many ids is
+    /// a 400 naming it, and the server answers `/health` after it.
+    fn position_limit(url: &dyn Fn(&str) -> String, id: u32) -> Result<bool, GateError> {
+        let served = served_positions()?;
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let n_ctx = json_of("/props", st, &body)?["default_generation_settings"]["n_ctx"].clone();
+        let long = vec![id; served];
+        let (st, body) = curl(
+            &url("/completion"),
+            Some(&json!({"prompt": long, "n_predict": 1, "temperature": 0})),
+            false,
+        )?;
+        let refused: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let e = &refused["error"];
+        println!(
+            "positions served {served}: /props n_ctx {n_ctx}; a prompt of {served} ids: HTTP {st} {e}"
+        );
+        let (hst, hbody) = curl(&url("/health"), None, false)?;
+        let mut ok = true;
+        check(
+            &mut ok,
+            "props_n_ctx_is_the_served_positions",
+            n_ctx == json!(served),
+        );
+        check(
+            &mut ok,
+            "prompt_of_the_served_positions_is_a_400",
+            st == 400
+                && e["type"] == "exceed_context_size_error"
+                && e["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(&served.to_string())),
+        );
+        check(
+            &mut ok,
+            "health_after_the_400",
+            hst == 200 && hbody.contains("\"ok\""),
+        );
+        Ok(ok)
     }
 
     /// The length of the common prefix of `a` and `b`.
@@ -425,6 +507,18 @@ mod gate {
             _ => first == reference,
         };
         check(&mut ok, "completion_ids_are_generate_ds41", matches);
+
+        let s1 = sampled(&url, &a.prompt, SAMPLED_SEED, 40)?;
+        let s2 = sampled(&url, &a.prompt, SAMPLED_SEED, 40)?;
+        let k1 = sampled(&url, &a.prompt, SAMPLED_SEED, 1)?;
+        check(
+            &mut ok,
+            "sampled_same_seed_identical",
+            !s1.is_empty() && s1 == s2,
+        );
+        check(&mut ok, "sampled_top_k_1_is_greedy", k1 == first);
+        let id = a.ids.iter().copied().min().ok_or("--ids is empty")?;
+        ok &= position_limit(&url, id)?;
 
         let chat = json!({
             "messages": [{"role": "user", "content": CHAT}],
