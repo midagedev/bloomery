@@ -20,6 +20,15 @@
 #                                 the card against 42,997.5, and one partial layer's shared down on the
 #                                 host], inside two rounds' ruler, so the faster-of-two choice is a coin
 #                                 toss unless it separates
+#
+# Re-sit of the llama.cpp side (2026-09-28, after the release sitting's v41 segment): that segment's
+# lcpppp4096 arm (-ub 4096 -b 4096 beside --n-cpu-moe 33) was a FAIL row in every round, "failed to
+# create context": the ubatch-4096 compute buffer does not fit on the card beside 33 layers of card
+# experts, so the hand-set placement has no -ub 4096 row and the arm is dropped. The segment also had no
+# llama.cpp pp4096 at the default ubatch; lcpppp:4096 and lcppppfit:4096 add it. The fit arms map
+# 292-298 GB CPU_Mapped against a ~261 GB page cache and fault in their timed windows in every round
+# ([cold] by design of the fit on this box, not noise): their rows are shown, captioned so, never as
+# llama.cpp's best. Our arms are not re-sat (that segment's rows stand).
 kind: baseline
 question: where do ours and llama.cpp's V4.1 decode and prompt rows sit in one window, llama.cpp at its
   hand-set and its fitted placement, for the public V4.1 table?
@@ -27,10 +36,10 @@ term: pp tok/s @ P = 512, llama.cpp PR #28696 (llama-bench -p 512 -n 0 -r 2, sec
   --n-cpu-moe 33 -fa on -t 32 -nopo 1), A6000, engine blocks with the discard
 unit: tok/s
 predict: 104.6..119
-condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, arms 6 512 4096 lcpp:6 lcpp:4096 lcpppp:512
-  lcpppp4096:4096 lcppfit:6 lcppfit:4096 lcppppfit:512 lcppppfit4096:4096; each block's DISCARD r0 row
-  present; every lcpp and lcppfit row's `timed` count printed; every lcppfit row carries its fit column
-  (a fit that failed is a FAIL row, not a number); no row carries [cpu-busy] or [other-busy]; the full
+condition: one lease, three rounds, BLOOMERY_AB_ORDER=blocks, arms lcpp:6 lcpp:4096 lcpppp:512
+  lcpppp:4096 lcppfit:6 lcppfit:4096 lcppppfit:512 lcppppfit:4096 (the re-sit; lcpppp4096 dropped, see
+  above); each block's DISCARD r0 row present; every lcpp and lcppfit row's `timed` count printed; every
+  lcppfit row carries its fit column (a fit that failed is a FAIL row, not a number); no row carries [cpu-busy] or [other-busy]; the full
   output to a file first
 reason: sets the V4.1 rows of the public release table, llama.cpp at the faster of its hand-set and
   fitted placements and at the -ub 4096 prompt lever; why now: the release sitting takes every model's
