@@ -1,0 +1,30 @@
+# Round q38ref: ik's CPU node dumps of the Qwen3.8-Flash-Next UD-Q4_K_XL split set (four shards,
+# 111,334,654,784 B), each one `just dump-ref-qwen4exp [VARIANT]` under this card: the batch set, then
+# step4, step4-every-node, d1k and d3k, one lease each, back to back. dump_ref loads without
+# --defer-experts, so ik's loader populates every shard in turn (one stream), then computes on 32
+# threads, then writes the nodes to /root/bloomery-data. The three phases run one after the other: the
+# wall is their sum. The one term the batch dump fixes: this file's cold-read rate through the loader's
+# populate, read from the witness block's read-sectors and wall; the step dumps then read nothing
+# from the device unless a run between two dumps evicted the file.
+# Seconds per dump [derived], scaled from glmref's measured GLM dumps (199.7 GB: batch cold 133 s,
+# step4-every-node warm 17 s, d1k warm 29 s; commit 0b5d1c9):
+#   populate  cold: 111.3 GB at 1.5-1.72 GB/s (GLM's whole-window and populate-only rates) 65-74 s; at
+#             the single-stream priors 1.07-1.33 GB/s 84-104 s. Warm: GLM's 17 s scaled by size <= 10 s
+#   fixed     lease, witnesses, metadata over four shards, context: 3-15 s
+#   compute   ~13 GFLOP a token (6.6 B active: 36 GDN layers 57.7 M, 12 GQA layers 49.8 M, 48 MoE
+#             layers of 11 experts at ff 640 plus the router 55 M, HC ~13 M a layer, output 636 M) at
+#             1.25 TFLOP/s (qwen35moe's measured 1,024-token prefill, the same GDN + MoE shape) to
+#             3 TFLOP/s (GLM's d1k): batch and step4 < 1 s; d1k 13.5 TFLOP 4.5-10.8 s; d3k 3,000
+#             tokens ~41 TFLOP (attention over up to 3,000 cells adds ~1.3) 14-33 s
+#   dump      2-4 GB a set (qwen35moe's sets 1.5-1.6 GB at 40 layers, hidden 2048; this model 48 layers,
+#             hidden 2560, a 4-stream residual) at 0.5 GB/s: 4-8 s
+#   batch cold 72-128 s (1.2-2.1 min); step4, step4-every-node warm 10-20 s; d1k 15-31 s; d3k 24-53 s;
+#   the sitting 2.2-4.2 min. A step dump that reads the file from the device again costs the populate
+#   term again (65-104 s); all five cold is at most 11 min.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and populates the whole 111.3 GB split set into the page
+  cache, evicting that much of what else is cached (the V4.1 host set or the GLM set among it); beside
+  a timed run or a gate batch it would take their cores, their memory bandwidth and their cache, so it
+  holds the lease; why now: the qwen4exp oracle the Qwen3.8 program's e2e gate is judged against
+  (round q38ref)
+minutes: 0.2..2.2

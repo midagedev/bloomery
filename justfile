@@ -468,6 +468,15 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# Qwen3.8-Flash-Next(qwen4exp) 오라클: 같은 덤프 도구를 qwen4exp 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
+# $BLOOMERY_DATA/ref_qwen4exp/에 뜬다. VARIANT(step4, d1k, d3k와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
+# 제 세트로 뜬다 — models/qwen4exp.sh. d1k와 d3k는 $BLOOMERY_DATA/qwen4exp/corpus-prose.ids의 첫 1,025개와 3,001개 id를
+# 읽는다(sha256 핀). d3k의 스텝은 위치 3,000이라 QSA 층이 인덱서가 고른 셀만 본다.
+# 덤프마다 111.3 GB 샤드 집합 전체를 CPU 임대 아래서 올리므로 카드가 있어야 한다
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38ref-dump.card').
+dump-ref-qwen4exp *VARIANT:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:

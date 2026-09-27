@@ -10,6 +10,7 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod glm5next;
 pub mod qwen35moe;
+pub mod qwen4exp;
 
 /// Each architecture's families, by the architecture's name.
 static BY_ARCH: &[(&str, &[&Family])] = &[
@@ -17,6 +18,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (deepseek41v::ARCH, deepseek41v::FAMILIES),
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
+    (qwen4exp::ARCH, qwen4exp::FAMILIES),
 ];
 
 /// The families of architecture `arch`; none for one the table does not hold.
