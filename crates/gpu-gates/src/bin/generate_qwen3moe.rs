@@ -1,6 +1,8 @@
-//! `generate_qwen3moe` — the decode CLI of the qwen3moe engine: the whole
-//! model on one card, greedy, one token per step, and the timing runner's
-//! ruler.
+//! `generate_qwen3moe` — the decode CLI of the qwen3moe family's engines: a
+//! qwen3moe (Qwen3-30B-A3B) or a qwen35moe (Qwen3.6-35B-A3B) file, the
+//! architecture read from the file's header (any other is refused by name),
+//! the whole model on one card, greedy, one token per step, and the timing
+//! runner's ruler.
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph] [--prefill auto|pass|gemm]
@@ -21,15 +23,29 @@
 //! its last token is generated token 0, and `N − 1` feedback steps follow.
 //! The ubatch size is `BLOOMERY_QWEN3_UBATCH` (1..=4096, default 4096), read
 //! at load.
-//! Lines: `prompt_ids`, `load` (with the decode flash pass: `flash_mma=`; the
-//! ubatches' attention, `ubatch_attn=gqa_prefill_flash`; and their size,
+//!
+//! A qwen35moe file has the pass path only (`Body35` has no GEMM ubatch):
+//! `auto` and `pass` run passes of up to eight positions, each a
+//! `step_rows` of its size — bit for bit its one-token steps — and a pass of
+//! one id a step; `gemm` is refused by name before the load, and so is a
+//! `BLOOMERY_QWEN3_UBATCH` other than its default (it sizes Qwen3's ubatch,
+//! and this file has none). Its `load` line names no `ubatch=`, and its
+//! `stat prompt` line is always `ubatch_tokens=0`. `--prompt` is refused by
+//! the tokenizer (its pre-tokenizer `qwen35` is not one the crate runs).
+//!
+//! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
+//! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
+//! `ubatch_attn=gqa_prefill_flash`, and their size,
 //! `ubatch=`, on the `load` line because the `time prompt` row's shape is
 //! parsed to its end; and `rope_table_us=`, the host time that computed the
 //! rope table every path reads at load, one `RopeTable::push` for each of
-//! the `ctx` positions — a runtime value), in graph
+//! the `ctx` positions — a runtime value; for qwen35moe `store_bytes=`, the
+//! attention layers' K/V planes and the delta layers' states), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
-//! and the card's free bytes it took, runtime values), `step 0 pos tok`
+//! and the card's free bytes it took, runtime values; for qwen35moe the
+//! `m = 1` entry is the decode step's graph, which a pass of one id
+//! replays), `step 0 pos tok`
 //! (with the units the prompt took: `prefill_steps=`, and their shapes:
 //! `plan=ubatch:512x2 pass:1`, a run of equal sizes as `<size>x<k>`), then,
 //! all written after the loop,
@@ -52,10 +68,12 @@
 //! `tok/s(p50)=`).
 //!
 //! `--seed-depth D` stands the model at depth D: `seed_depth(D − 1)` fills
-//! the caches with a pattern, and one literal token (id 0) is prefilled
-//! after them, so the timed steps run at the positions a D-token prompt
-//! leaves. The tokens it prints are meaningless; only the timing is. Its
-//! `time prompt` row is that one token's prefill, `n=1`.
+//! the caches with a pattern (for qwen35moe the attention layers' K/V
+//! planes; the delta layers' states stay as they stand), and one literal
+//! token (id 0) is prefilled after them, so the timed steps run at the
+//! positions a D-token prompt leaves. The tokens it prints are
+//! meaningless; only the timing is. Its `time prompt` row is that one
+//! token's prefill, `n=1`.
 //!
 //! `--arm a,b,c[/N]` runs several arms after one load (`app::Session::arms`),
 //! in the order given: each prefills its ids and generates its `N` (`-n`
@@ -90,13 +108,24 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod cli {
     use app::Session;
-    use bloomery_gpu::arch::qwen3moe::PrefillPath;
-    use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, Qwen3moeModel};
-    use bloomery_gpu_gates::{GateError, open_split, ref_model_path};
+    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
+    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, UBATCH, UBATCH_ENV, ubatch_size};
+    use bloomery_gpu::arch::qwen3moe::{
+        Body, Body35, PrefillPath, PrefillPlan, PrefillStep, Qwen35moeModel,
+    };
+    use bloomery_gpu::model::{Instrumented, MAX_PASS_ROWS, StepMode};
+    use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
+    use bloomery_gpu_gates::{GateError, ref_model_path};
+    use gguf::Split;
     use model::arch::Arch;
+    use std::num::NonZeroUsize;
     use std::time::Instant;
     use tokenizer::Tokenizer;
+
+    // A Qwen3.6 prompt is cut by the qwen3moe pass plan (`PrefillPlan`),
+    // whose passes are `MAX_TOKENS` long; each must be a pass `step_rows`
+    // takes.
+    const _: () = assert!(MAX_TOKENS == MAX_PASS_ROWS);
 
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
@@ -124,6 +153,130 @@ mod cli {
         Ok(s.split(',')
             .map(|v| v.trim().parse::<u32>())
             .collect::<Result<_, _>>()?)
+    }
+
+    /// The model file ([`ref_model_path`]) and its architecture, read from
+    /// its first shard's header (`Arch::detect`): qwen3moe or qwen35moe; any
+    /// other file is refused by name.
+    fn open_file() -> Result<(Split, Arch), GateError> {
+        let path = ref_model_path()?;
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let first = file
+            .shard(0)
+            .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
+        match Arch::detect(first)? {
+            arch @ (Arch::Qwen3moe | Arch::Qwen35moe) => Ok((file, arch)),
+            other => Err(format!(
+                "{} is a {} file; generate_qwen3moe runs qwen3moe and qwen35moe files",
+                path.display(),
+                file.architecture().unwrap_or(other.name())
+            )
+            .into()),
+        }
+    }
+
+    /// A body's prompt schedule as this CLI drives it, beside the
+    /// skeleton's own step.
+    trait Prompted: Instrumented {
+        /// The path the body runs for `--prefill <path>`; a path it has not
+        /// is refused by name, before the load.
+        fn path(path: PrefillPath) -> Result<PrefillPath, GateError>;
+        /// The units a prompt of `n` ids runs as by `path` (a
+        /// [`Prompted::path`] answer).
+        fn plan(m: &GpuModel<Self>, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError>;
+        /// Run `ids` by that plan from the model's position; the argmax
+        /// after the last.
+        fn prefill(
+            m: &mut GpuModel<Self>,
+            ids: &[u32],
+            path: PrefillPath,
+        ) -> Result<u32, GateError>;
+        /// The last prompt image a ubatch wrote; `None` when none did.
+        fn image(m: &GpuModel<Self>) -> Result<Option<ImageWrite>, GateError>;
+    }
+
+    impl Prompted for Body {
+        fn path(path: PrefillPath) -> Result<PrefillPath, GateError> {
+            Ok(path)
+        }
+
+        fn plan(m: &Qwen3moeModel, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError> {
+            Ok(m.prefill_plan(n, path)?)
+        }
+
+        fn prefill(
+            m: &mut Qwen3moeModel,
+            ids: &[u32],
+            path: PrefillPath,
+        ) -> Result<u32, GateError> {
+            Ok(m.prefill_with(ids, path)?)
+        }
+
+        fn image(m: &Qwen3moeModel) -> Result<Option<ImageWrite>, GateError> {
+            Ok(m.ubatch_prologue()?.last)
+        }
+    }
+
+    impl Prompted for Body35 {
+        /// Passes only: `auto` and `pass` are the pass path, `gemm` has no
+        /// body behind it.
+        fn path(path: PrefillPath) -> Result<PrefillPath, GateError> {
+            match path {
+                PrefillPath::Auto | PrefillPath::Pass => Ok(PrefillPath::Pass),
+                PrefillPath::Gemm => Err("--prefill gemm: a qwen35moe file has no GEMM \
+                                          ubatch prefill (the pass path only: auto or pass)"
+                    .into()),
+            }
+        }
+
+        fn plan(_: &Qwen35moeModel, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError> {
+            Ok(PrefillPlan::new(n, Self::path(path)?, NonZeroUsize::MIN))
+        }
+
+        /// Each pass of the plan as one `step_rows` of its size, a pass of
+        /// one id as a step: bit for bit one step per token.
+        fn prefill(
+            m: &mut Qwen35moeModel,
+            ids: &[u32],
+            path: PrefillPath,
+        ) -> Result<u32, GateError> {
+            let plan = Self::plan(m, ids.len(), path)?;
+            let (mut at, mut next) = (0usize, None);
+            for step in &plan.steps {
+                let PrefillStep::Pass(k) = *step else {
+                    return Err(format!("a qwen35moe prompt plan holds a ubatch ({plan})").into());
+                };
+                let rows = ids
+                    .get(at..at + k)
+                    .ok_or_else(|| format!("the plan {plan} runs past {} ids", ids.len()))?;
+                at += k;
+                next = Some(pass35(m, rows)?);
+            }
+            next.ok_or_else(|| "the prompt has no ids".into())
+        }
+
+        fn image(_: &Qwen35moeModel) -> Result<Option<ImageWrite>, GateError> {
+            Ok(None)
+        }
+    }
+
+    /// One pass of `rows` ids on the Qwen3.6 model: the argmax after the last.
+    fn pass35(m: &mut Qwen35moeModel, rows: &[u32]) -> Result<u32, GateError> {
+        fn last<const M: usize>(m: &mut Qwen35moeModel, rows: &[u32]) -> Result<u32, GateError> {
+            let rows: [u32; M] = rows.try_into()?;
+            Ok(m.step_rows::<M>(rows)?[M - 1])
+        }
+        match rows.len() {
+            1 => Ok(m.step(rows)?),
+            2 => last::<2>(m, rows),
+            3 => last::<3>(m, rows),
+            4 => last::<4>(m, rows),
+            5 => last::<5>(m, rows),
+            6 => last::<6>(m, rows),
+            7 => last::<7>(m, rows),
+            8 => last::<8>(m, rows),
+            k => Err(format!("a pass of {k} ids; a Qwen3.6 pass takes 1..={MAX_PASS_ROWS}").into()),
+        }
     }
 
     /// What every arm of the run shares.
@@ -184,6 +337,21 @@ mod cli {
             Some(_) => Some(Tokenizer::from_gguf(ref_model_path()?)?),
             None => None,
         };
+        let t = Instant::now();
+        let (file, arch) = open_file()?;
+        let path = match arch {
+            Arch::Qwen35moe => {
+                let u = ubatch_size()?;
+                if u != UBATCH {
+                    return Err(format!(
+                        "{UBATCH_ENV}={u} sizes Qwen3's GEMM ubatch; a qwen35moe file has none"
+                    )
+                    .into());
+                }
+                Body35::path(path)?
+            }
+            _ => Body::path(path)?,
+        };
         let arms: Vec<Arm> = if arm_specs.is_empty() {
             let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
                 (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
@@ -223,40 +391,16 @@ mod cli {
                 );
             }
         }
+        if arch == Arch::Qwen35moe && logits && arms.iter().any(|a| a.n_gen == 1) {
+            return Err(
+                "--logits with -n 1 on a qwen35moe file: the prompt's last pass leaves \
+                        its logits in its last row's head, and --logits reads row 0's"
+                    .into(),
+            );
+        }
         let listed = !arm_specs.is_empty();
         if !listed {
             println!("prompt_ids {:?}", arms[0].ids);
-        }
-        let t = Instant::now();
-        let file = open_split(Arch::Qwen3moe, "gen-qwen3moe")?;
-        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
-        m.set_mode(mode);
-        println!(
-            "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
-            m.resident_bytes(),
-            m.layers().len(),
-            mode_name(mode),
-            m.body("generate_qwen3moe")?.flash_mma(),
-            m.ubatch()?,
-            m.ubatch_prologue()?.table_build.as_secs_f64() * 1e6,
-            t.elapsed().as_secs_f64()
-        );
-        if mode == StepMode::Graph {
-            println!("capture graph_nodes={}", m.capture_step()?);
-            let gpu = m.gpu();
-            let (free0, _) = gpu.mem_info()?;
-            let t = Instant::now();
-            let nodes = m.capture_prefill()?;
-            let ms = t.elapsed().as_secs_f64() * 1e3;
-            let (free1, _) = m.gpu().mem_info()?;
-            let list: Vec<String> = nodes.iter().map(usize::to_string).collect();
-            println!(
-                "capture prefill_graphs={} nodes={} ms={ms:.1} vram_bytes={} (runtime values)",
-                nodes.len(),
-                list.join(","),
-                free0.saturating_sub(free1)
-            );
         }
         let run = Run {
             timed,
@@ -268,9 +412,113 @@ mod cli {
             tok,
             ctx,
         };
-        let mut s = Session::from_model(m, u32::try_from(ctx)?);
+        match arch {
+            Arch::Qwen35moe => drive(open_qwen35(file, ctx, mode, t)?, &run, &arms, listed, sync),
+            _ => drive(open_qwen3(file, ctx, mode, t)?, &run, &arms, listed, sync),
+        }
+    }
+
+    /// The Qwen3-30B-A3B model of `file`, its `load` line, and in graph mode
+    /// the step and every prefill pass captured and their `capture` lines.
+    fn open_qwen3(
+        file: Split,
+        ctx: usize,
+        mode: StepMode,
+        t: Instant,
+    ) -> Result<Qwen3moeModel, GateError> {
+        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
+        m.set_mode(mode);
+        println!(
+            "load arch=qwen3moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
+             ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
+            m.resident_bytes(),
+            m.layers().len(),
+            mode_name(mode),
+            m.body("generate_qwen3moe")?.flash_mma(),
+            m.ubatch()?,
+            m.ubatch_prologue()?.table_build.as_secs_f64() * 1e6,
+            t.elapsed().as_secs_f64()
+        );
+        if mode == StepMode::Graph {
+            println!("capture graph_nodes={}", m.capture_step()?);
+            let (free0, _) = m.gpu().mem_info()?;
+            let t = Instant::now();
+            let nodes = m.capture_prefill()?;
+            capture_line(&nodes, t, free0, m.gpu())?;
+        }
+        Ok(m)
+    }
+
+    /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
+    /// flash (the engine's), its `load` line, and in graph mode the step and
+    /// the passes of 2 to [`MAX_PASS_ROWS`] rows captured and their
+    /// `capture` lines.
+    fn open_qwen35(
+        file: Split,
+        ctx: usize,
+        mode: StepMode,
+        t: Instant,
+    ) -> Result<Qwen35moeModel, GateError> {
+        let mut m = Qwen35moeModel::open(Gpu::new()?, file, ctx, true)?;
+        m.set_mode(mode);
+        let body = m.body("generate_qwen3moe")?;
+        println!(
+            "load arch=qwen35moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
+             store_bytes={} in {:.1} s (runtime value)",
+            m.resident_bytes(),
+            m.layers().len(),
+            mode_name(mode),
+            body.flash_mma(),
+            body.store_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        if mode == StepMode::Graph {
+            let step = m.capture_step()?;
+            println!("capture graph_nodes={step}");
+            let (free0, _) = m.gpu().mem_info()?;
+            let t = Instant::now();
+            let nodes = vec![
+                step,
+                m.capture_rows::<2>()?,
+                m.capture_rows::<3>()?,
+                m.capture_rows::<4>()?,
+                m.capture_rows::<5>()?,
+                m.capture_rows::<6>()?,
+                m.capture_rows::<7>()?,
+                m.capture_rows::<8>()?,
+            ];
+            capture_line(&nodes, t, free0, m.gpu())?;
+        }
+        Ok(m)
+    }
+
+    /// The `capture prefill_graphs=` line: each pass size's node count, the
+    /// captures' wall since `t` and the card bytes they took since `free0`.
+    fn capture_line(nodes: &[usize], t: Instant, free0: usize, gpu: &Gpu) -> Result<(), GateError> {
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let (free1, _) = gpu.mem_info()?;
+        let list: Vec<String> = nodes.iter().map(usize::to_string).collect();
+        println!(
+            "capture prefill_graphs={} nodes={} ms={ms:.1} vram_bytes={} (runtime values)",
+            nodes.len(),
+            list.join(","),
+            free0.saturating_sub(free1)
+        );
+        Ok(())
+    }
+
+    /// Every arm of the run on the loaded model `m`, in a session over it;
+    /// `listed` for an `--arm` list, whose arms open with their `arm` lines.
+    fn drive<B: Prompted>(
+        m: GpuModel<B>,
+        run: &Run,
+        arms: &[Arm],
+        listed: bool,
+        sync: bool,
+    ) -> Result<(), GateError> {
+        let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let count = arms.len();
-        s.arms(&arms, |s, i, arm| {
+        s.arms(arms, |s, i, arm| {
             if listed {
                 println!(
                     "arm i={i} arms={count} ids={} n={}",
@@ -287,7 +535,7 @@ mod cli {
                 }
                 println!("prompt_ids {:?}", arm.ids);
             }
-            run_arm(s.model_mut(), &run, arm)
+            run_arm(s.model_mut(), run, arm)
         })
         .map_err(|f| Box::new(f) as GateError)
     }
@@ -302,18 +550,18 @@ mod cli {
 
     /// One arm on the loaded model: its prefill, its steps, and every line
     /// from `step 0` on.
-    fn run_arm(m: &mut Qwen3moeModel, run: &Run, arm: &Arm) -> Result<(), GateError> {
+    fn run_arm<B: Prompted>(m: &mut GpuModel<B>, run: &Run, arm: &Arm) -> Result<(), GateError> {
         let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
         if let Some(d) = run.seed_depth.filter(|&d| d > 1) {
             m.seed_depth(d - 1)?;
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
         let depth = run.seed_depth.unwrap_or(ids.len());
-        let plan = m.prefill_plan(ids.len(), run.path)?;
+        let plan = B::plan(m, ids.len(), run.path)?;
         let t = Instant::now();
-        let mut next = m.prefill_with(ids, run.path)?;
+        let mut next = B::prefill(m, ids, run.path)?;
         let prefill_wall = t.elapsed();
-        let image = m.ubatch_prologue()?.last;
+        let image = B::image(m)?;
         println!(
             "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={plan}, {:.2} s, \
              runtime value)",

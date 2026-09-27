@@ -176,16 +176,25 @@
 # may run, default 900: a hung arm fails the runner with rc 124/137 instead of holding the lease),
 # BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines and the rotation, then
 # exit 0 before the lease: nothing is loaded and nothing is timed).
+#
+# Qwen3.6-35B-A3B runs under the qwen35moe profile (`just depth-gpu-qwen35moe`, BLOOMERY_MODEL=qwen35moe)
+# with the same arms, command lines and tables: generate_qwen3moe reads the architecture from the file's
+# header. What differs is the ours arm's prefill: Qwen3.6 has no ubatch path, so its D fed ids run in
+# passes of up to 8 positions (`kind=prefill`, `plan=pass:8x<k>`), and its pp_tok/s is that path's. The
+# profile's reference trees and flags are its own (models/qwen35moe.sh).
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # MRS, MRSBIN, MRS_FLAGS); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so
 # the four engines open one file.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-[ "$MODEL_NAME" = qwen3moe ] || {
-  echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe on the Mac side (BLOOMERY_MODEL=qwen3moe)" >&2
-  exit 64
-}
+case $MODEL_NAME in
+  qwen3moe | qwen35moe) ;;
+  *)
+    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe or qwen35moe on the Mac side (BLOOMERY_MODEL=…)" >&2
+    exit 64
+    ;;
+esac
 N=${BLOOMERY_DECODE_N:-96}
 WARM=${BLOOMERY_GEN_WARM:-}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
@@ -667,9 +676,10 @@ fi
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
-echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
-echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS"
-echo "[config] mrs: $MRSBIN flags=$MRS_FLAGS (mrs: --pa-context-len C, mrspa0: --paged-attn off)"
+# Each engine's line only when it has arms: a profile names only the engines it runs (qwen35moe.sh).
+[ "$ik" = 0 ] || echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
+[ "$lcpp" = 0 ] || echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS"
+[ "$mrs" = 0 ] || echo "[config] mrs: $MRSBIN flags=$MRS_FLAGS (mrs: --pa-context-len C, mrspa0: --paged-attn off)"
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
