@@ -2,28 +2,18 @@
 //! limit a [`HostLayer`] serves by, read from the hyperparameters and the
 //! tensor names — the one place that wires them into a [`HostLayerSpec`].
 
-use std::sync::Arc;
-
-use gguf::Split;
-
 use super::hparams::Hparams;
 use super::names;
 use crate::ModelError;
 use crate::moe::{HostLayer, HostLayerSpec};
-use crate::r8file::Sidecar;
+use crate::r8file::R8Source;
 
 /// Layer `layer`'s routed experts as the host tier serves them, built from
-/// `split`; `None` for a layer that does not route, an error for a layer past
-/// the model. Load-time only: [`HostLayer::build`] checks the stacks here.
-pub fn layer(split: &Split, hp: &Hparams, layer: usize) -> Result<Option<HostLayer>, ModelError> {
-    layer_r8(split, None, hp, layer)
-}
-
-/// [`layer`] with the routed gate and up read from `r8`, `split`'s r8
-/// sidecar, when given ([`HostLayer::build_r8`]).
-pub fn layer_r8(
-    split: &Split,
-    r8: Option<&Arc<Sidecar>>,
+/// `src` — the gate and the up from its r8 sidecar when it reads one
+/// ([`HostLayer::build`]); `None` for a layer that does not route, an error
+/// for a layer past the model. Load-time only: the stacks are checked here.
+pub fn layer(
+    src: R8Source<'_>,
     hp: &Hparams,
     layer: usize,
 ) -> Result<Option<HostLayer>, ModelError> {
@@ -42,8 +32,8 @@ pub fn layer_r8(
         names::ffn_up_exps(layer),
         names::ffn_down_exps(layer),
     );
-    HostLayer::build_r8(
-        split,
+    HostLayer::build(
+        src,
         &HostLayerSpec {
             gate: &gate,
             up: &up,
@@ -53,7 +43,6 @@ pub fn layer_r8(
             ff: hp.experts.ff,
             swiglu_limit: kind.swiglu_limit,
         },
-        r8,
     )
     .map(Some)
 }

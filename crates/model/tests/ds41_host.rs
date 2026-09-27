@@ -18,7 +18,7 @@
 //!
 //! The r8 arm: with `BLOOMERY_R8` on (unset), every layer is built a second
 //! time with its routed gate and up read from the file's r8 sidecar
-//! (`host::layer_r8`) and must give every token's partial sum bit for bit as
+//! (`host::layer` over the file's r8 pair) and must give every token's partial sum bit for bit as
 //! the file's layer does, so the band above holds it too; no sidecar at its
 //! path refuses the run by name (`HostR8::at_gate`). `BLOOMERY_R8=off` runs
 //! the file's layer alone.
@@ -70,7 +70,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{HostLayer, HostScratch};
 use model::ops::{Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
-use model::r8file::HostR8;
+use model::r8file::{HostR8, R8Source};
 
 /// The oracle set: the V4.1 node dumps' 5-token batch set.
 const SET: &str = refset::arch::deepseek41::BATCH;
@@ -282,7 +282,7 @@ fn slot_dots(scratch: &HostScratch, n: usize) -> (Vec<f32>, Vec<f32>) {
 /// crossings must occur. Prints its line and returns the verdict.
 fn synthetic_clamp(
     layer: &HostLayer,
-    split: &Split,
+    src: R8Source<'_>,
     l: usize,
     x: &[f32],
     list: &[(u32, f32)],
@@ -294,7 +294,7 @@ fn synthetic_clamp(
     let mut run = |xs: Vec<f32>, scratch: &mut HostScratch| {
         let t = Tensor2::from_vec(xs.len(), 1, xs);
         layer
-            .experts_into(split, &t, list, &mut out, scratch)
+            .experts_into(src, &t, list, &mut out, scratch)
             .unwrap_or_else(|e| panic!("layer {l} synthetic clamp: {e}"));
     };
     run(x.to_vec(), scratch);
@@ -370,6 +370,8 @@ fn hw_ds41_host_matches_ik_routed_sum() {
     let mut scratch = HostScratch::new(embd, ff);
     let r8 = HostR8::at_gate(&split, r8_lever())
         .unwrap_or_else(|e| panic!("the r8 reading of {path}: {e}"));
+    let rows = R8Source::rows(&split);
+    let pair = R8Source::of(&split, &r8).unwrap_or_else(|e| panic!("the r8 pair of {path}: {e}"));
     let mut scratch_r8 = HostScratch::new(embd, ff);
     let (e_gu, e_down) = (gamma(n_dot(embd)), gamma(n_dot(ff)));
     let g3 = gamma(3.0);
@@ -379,14 +381,14 @@ fn hw_ds41_host_matches_ik_routed_sum() {
     let mut worst = Layer::default();
     let mut routed = 0;
     for l in 0..hp.n_layer {
-        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        let Some(layer) = host::layer(rows, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
         else {
             println!("layer={l} no routed experts");
             continue;
         };
         routed += 1;
-        let r8_layer = r8.sidecar().map(|side| {
-            host::layer_r8(&split, Some(side), &hp, l)
+        let r8_layer = r8.sidecar().map(|_| {
+            host::layer(pair, &hp, l)
                 .unwrap_or_else(|e| panic!("layer {l} from the r8 sidecar: {e}"))
                 .unwrap_or_else(|| panic!("layer {l} routes in the file and not from the sidecar"))
         });
@@ -416,12 +418,12 @@ fn hw_ds41_host_matches_ik_routed_sum() {
                 .collect();
             let mut out = vec![0.0f32; embd];
             layer
-                .experts_into(&split, &x, &list, &mut out, &mut scratch)
+                .experts_into(rows, &x, &list, &mut out, &mut scratch)
                 .unwrap_or_else(|e| panic!("layer {l} token {t}: {e}"));
             if let Some(r8_layer) = &r8_layer {
                 let mut out_r8 = vec![0.0f32; embd];
                 r8_layer
-                    .experts_into(&split, &x, &list, &mut out_r8, &mut scratch_r8)
+                    .experts_into(pair, &x, &list, &mut out_r8, &mut scratch_r8)
                     .unwrap_or_else(|e| panic!("layer {l} token {t} r8: {e}"));
                 st.r8_cells += out_r8
                     .iter()
@@ -577,7 +579,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
                     (e, ws[s])
                 })
                 .collect();
-            if !synthetic_clamp(&layer, &split, l, &x_all[..embd], &list, &mut scratch) {
+            if !synthetic_clamp(&layer, rows, l, &x_all[..embd], &list, &mut scratch) {
                 clamp_failed.push(l);
             }
         } else {

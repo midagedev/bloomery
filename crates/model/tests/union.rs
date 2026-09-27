@@ -100,7 +100,7 @@ use model::moe::{
 };
 use model::ops::{self, RowLayout, Tensor2, Tensor2View};
 use model::placement::workstation;
-use model::r8file::Sidecar;
+use model::r8file::{HostR8, R8Source, Sidecar};
 
 /// The oracle set: the V4.1 node dumps' 5-token batch set.
 const SET: &str = refset::arch::deepseek41::BATCH;
@@ -236,7 +236,7 @@ fn v41_cases(x_all: &[f32], lists: &[Vec<(u32, f32)>], embd: usize) -> Vec<Case>
 /// Each column of `case` through the one-column entry, concatenated.
 fn per_column(
     layer: &HostLayer,
-    split: &Split,
+    src: R8Source<'_>,
     case: &Case,
     scratch: &mut HostScratch,
 ) -> Vec<f32> {
@@ -245,13 +245,7 @@ fn per_column(
     for (j, list) in case.lists.iter().enumerate() {
         let xj = Tensor2::from_vec(embd, 1, case.x.col(j).to_vec());
         layer
-            .experts_into(
-                split,
-                &xj,
-                list,
-                &mut want[j * embd..(j + 1) * embd],
-                scratch,
-            )
+            .experts_into(src, &xj, list, &mut want[j * embd..(j + 1) * embd], scratch)
             .unwrap_or_else(|e| panic!("experts_into column {j}: {e}"));
     }
     want
@@ -266,7 +260,7 @@ fn refusal(r: Result<(), model::ModelError>, what: &str) -> String {
 }
 
 /// Every named refusal of the union entry, on one V4.1 layer.
-fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut UnionScratch) {
+fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &mut UnionScratch) {
     let one = [(0u32, 1.0f32)];
     let check = |got: String, want: &str| {
         assert!(
@@ -282,7 +276,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
     let mut out = vec![0.0f32; embd * k];
     check(
         refusal(
-            layer.experts_union_into(split, &x, &lists, &mut out, us),
+            layer.experts_union_into(src, &x, &lists, &mut out, us),
             "k past the scratch's columns",
         ),
         "at most the columns the scratch was made for",
@@ -321,7 +315,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
     let mut out = vec![0.0f32; embd * 2];
     check(
         refusal(
-            layer.experts_union_into(split, &x, &[&one[..], &past[..]], &mut out, us),
+            layer.experts_union_into(src, &x, &[&one[..], &past[..]], &mut out, us),
             "expert id past the layer's",
         ),
         &format!("expert {}", layer.n_expert()),
@@ -332,7 +326,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
     let mut out = vec![0.0f32; embd * 3];
     check(
         refusal(
-            layer.experts_union_into(split, &x, &lists, &mut out, us),
+            layer.experts_union_into(src, &x, &lists, &mut out, us),
             "ne1 != k",
         ),
         "one column per list",
@@ -343,7 +337,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
     let mut out = vec![0.0f32; embd];
     check(
         refusal(
-            layer.experts_union_into(split, &x, &[&long[..]], &mut out, us),
+            layer.experts_union_into(src, &x, &[&long[..]], &mut out, us),
             "list past EXPERTS_INTO_MAX",
         ),
         "at most EXPERTS_INTO_MAX experts per column",
@@ -352,7 +346,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
     let mut short = vec![0.0f32; embd - 1];
     check(
         refusal(
-            layer.experts_union_into(split, &x, &[&one[..]], &mut short, us),
+            layer.experts_union_into(src, &x, &[&one[..]], &mut short, us),
             "short out",
         ),
         "every column's width",
@@ -362,7 +356,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
         UnionScratch::new(embd, ff / 2, SMALL_COLS).expect("a scratch of SMALL_COLS columns");
     check(
         refusal(
-            layer.experts_union_into(split, &x, &[&one[..]], &mut out, &mut other),
+            layer.experts_union_into(src, &x, &[&one[..]], &mut out, &mut other),
             "scratch of other widths",
         ),
         "scratch must be made for the block's widths",
@@ -374,6 +368,7 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
 fn hw_union_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
     let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
@@ -393,7 +388,7 @@ fn hw_union_matches_per_column_v41() {
     let mut miscounted: Vec<(usize, usize, &str)> = Vec::new();
     let mut first_layer = None;
     for l in 0..hp.n_layer {
-        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        let Some(layer) = host::layer(src, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
         else {
             println!("layer={l} no routed experts");
             continue;
@@ -418,7 +413,7 @@ fn hw_union_matches_per_column_v41() {
             .collect();
         for (ki, case) in v41_cases(&x_all, &lists, embd).iter().enumerate() {
             let k = case.x.ne1;
-            let want = per_column(&layer, &split, case, &mut host);
+            let want = per_column(&layer, src, case, &mut host);
             let lists = case.slices();
             let mut line = format!(
                 "layer={l} k={k} slots={} union={}",
@@ -431,7 +426,7 @@ fn hw_union_matches_per_column_v41() {
                 ops::set_defer_quant(Some(on));
                 let mut got = vec![f32::NAN; embd * k];
                 let (r, ds, dp) = dispatched(&mut us, |us| {
-                    layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                    layer.experts_union_into(src, &case.x, &lists, &mut got, us)
                 });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} k {k} {arm}: {e}"));
@@ -481,7 +476,7 @@ fn hw_union_matches_per_column_v41() {
         );
     }
     let layer = first_layer.expect("the file has a routed layer");
-    refusals(&layer, &split, embd, ff, &mut us);
+    refusals(&layer, src, embd, ff, &mut us);
     assert!(
         failed.is_empty(),
         "{} (layer, k, arm) cases differ from their one-column calls, the first {:?}",
@@ -636,6 +631,7 @@ fn max_cols_per_expert(case: &Case) -> usize {
 fn hw_union_wide_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
     let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
@@ -648,7 +644,7 @@ fn hw_union_wide_matches_per_column_v41() {
     // One routed layer per down type the file carries for its routed experts.
     let mut picked: Vec<(usize, HostLayer)> = Vec::new();
     for l in 0..hp.n_layer {
-        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        let Some(layer) = host::layer(src, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
         else {
             continue;
         };
@@ -673,7 +669,7 @@ fn hw_union_wide_matches_per_column_v41() {
         for (k, pool) in WIDE {
             let pool = pool.unwrap_or(n_expert).min(n_expert);
             let case = wide_case(&x_all, embd, k, pool, n_expert);
-            let want = per_column(layer, &split, &case, &mut host);
+            let want = per_column(layer, src, &case, &mut host);
             let lists = case.slices();
             let mut line = format!(
                 "layer={l} down={:?} k={k} pool={pool} slots={} union={} max_cols_per_expert={}",
@@ -691,7 +687,7 @@ fn hw_union_wide_matches_per_column_v41() {
                 ops::set_defer_quant(Some(on));
                 let mut got = vec![f32::NAN; embd * k];
                 let (r, ds, dp) = dispatched(&mut us, |us| {
-                    layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                    layer.experts_union_into(src, &case.x, &lists, &mut got, us)
                 });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} k {k} {arm}: {e}"));
@@ -713,7 +709,7 @@ fn hw_union_wide_matches_per_column_v41() {
             );
         }
         let case = routed_case(&x_all, embd, ROUTED_K, n_expert, n_used);
-        let want = per_column(layer, &split, &case, &mut host);
+        let want = per_column(layer, src, &case, &mut host);
         let lists = case.slices();
         let (lo, hi, past) = cols_per_expert(&case);
         let mut line = format!(
@@ -730,7 +726,7 @@ fn hw_union_wide_matches_per_column_v41() {
             ops::set_defer_quant(Some(on));
             let mut got = vec![f32::NAN; embd * ROUTED_K];
             let (r, ds, dp) = dispatched(&mut us, |us| {
-                layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                layer.experts_union_into(src, &case.x, &lists, &mut got, us)
             });
             ops::set_defer_quant(None);
             r.unwrap_or_else(|e| panic!("layer {l} routed {arm}: {e}"));
@@ -831,7 +827,12 @@ fn tail_case(x_all: &[f32], embd: usize, cols: usize, n_expert: usize, n_used: u
 
 /// `case` through the calls one batch at a time: `UNION_MAX_COLS` columns a
 /// call, each a view of `case.x` at its offset, through `us`, concatenated.
-fn batch_calls(layer: &HostLayer, split: &Split, case: &Case, us: &mut UnionScratch) -> Vec<f32> {
+fn batch_calls(
+    layer: &HostLayer,
+    src: R8Source<'_>,
+    case: &Case,
+    us: &mut UnionScratch,
+) -> Vec<f32> {
     let (embd, k) = (case.x.ne0, case.x.ne1);
     let lists = case.slices();
     let mut want = vec![f32::NAN; embd * k];
@@ -840,13 +841,7 @@ fn batch_calls(layer: &HostLayer, split: &Split, case: &Case, us: &mut UnionScra
         let x = Tensor2View::new(&case.x.data[c0 * embd..c1 * embd], embd, c1 - c0)
             .unwrap_or_else(|e| panic!("view of columns {c0}..{c1}: {e}"));
         layer
-            .experts_union_into(
-                split,
-                x,
-                &lists[c0..c1],
-                &mut want[c0 * embd..c1 * embd],
-                us,
-            )
+            .experts_union_into(src, x, &lists[c0..c1], &mut want[c0 * embd..c1 * embd], us)
             .unwrap_or_else(|e| panic!("batch call of columns {c0}..{c1}: {e}"));
     }
     want
@@ -872,6 +867,7 @@ fn experts_across_batches(case: &Case) -> usize {
 fn hw_union_tail_matches_batches_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
     let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
@@ -884,7 +880,7 @@ fn hw_union_tail_matches_batches_v41() {
         .expect("a tail scratch of UNION_TAIL_MAX_GROUPS batches");
     let mut picked: Vec<(usize, HostLayer)> = Vec::new();
     for l in 0..hp.n_layer {
-        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        let Some(layer) = host::layer(src, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
         else {
             continue;
         };
@@ -944,11 +940,11 @@ fn hw_union_tail_matches_batches_v41() {
             let mut counted = true;
             for (arm, on) in ARMS {
                 ops::set_defer_quant(Some(on));
-                let want = batch_calls(layer, &split, case, &mut us);
+                let want = batch_calls(layer, src, case, &mut us);
                 let cuts = tail.cut_calls();
                 let mut got = vec![f32::NAN; embd * k];
                 let (r, ds, dp) = dispatched(&mut tail, |tail| {
-                    layer.experts_union_into(&split, &case.x, &lists, &mut got, tail)
+                    layer.experts_union_into(src, &case.x, &lists, &mut got, tail)
                 });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} tail k {k} {arm}: {e}"));
@@ -1128,13 +1124,14 @@ fn hw_union_r8_matches_file_rows() {
     let layer = r8layer::Layer::write("union", R8_LAYER.0, R8_LAYER.1, R8_LAYER.2, GgmlType::Q4_K);
     let (embd, ff, n_expert) = (layer.embd, layer.ff, layer.n_expert);
     let split = Split::open(&layer.source).unwrap();
-    let side = Arc::new(
+    let side = HostR8::On(Arc::new(
         Sidecar::open(&layer.sidecar, &split, Weights::Mapped { populate: false })
             .unwrap_or_else(|e| panic!("open {}: {e}", layer.sidecar.display())),
-    );
+    ));
+    let src = R8Source::of(&split, &side).unwrap();
     let spec = layer.spec();
-    let rows = HostLayer::build(&split, &spec).unwrap();
-    let r8 = HostLayer::build_r8(&split, &spec, Some(&side)).unwrap();
+    let rows = HostLayer::build(R8Source::rows(&split), &spec).unwrap();
+    let r8 = HostLayer::build(src, &spec).unwrap();
     assert_eq!(
         r8.layouts(),
         [RowLayout::R8, RowLayout::R8, RowLayout::Rows],
@@ -1148,12 +1145,12 @@ fn hw_union_r8_matches_file_rows() {
     let mut spread = (usize::MAX, 0usize);
     for k in R8_KS {
         let case = wide_case(&x_all, embd, k, n_expert, n_expert);
-        let want = per_column(&rows, &split, &case, &mut host);
+        let want = per_column(&rows, R8Source::rows(&split), &case, &mut host);
         assert!(
             want.iter().all(|v| v.is_finite()),
             "k {k}: the file's rows give finite values"
         );
-        let decode = per_column(&r8, &split, &case, &mut host);
+        let decode = per_column(&r8, src, &case, &mut host);
         let dd = diff_cells(&decode, &want);
         if dd != 0 {
             failed.push((k, "experts_into"));
@@ -1172,7 +1169,7 @@ fn hw_union_r8_matches_file_rows() {
             ops::set_defer_quant(Some(on));
             let mut got = vec![f32::NAN; embd * k];
             let (r, ds, dp) = dispatched(&mut us, |us| {
-                r8.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                r8.experts_union_into(src, &case.x, &lists, &mut got, us)
             });
             ops::set_defer_quant(None);
             r.unwrap_or_else(|e| panic!("r8 k {k} {arm}: {e}"));
