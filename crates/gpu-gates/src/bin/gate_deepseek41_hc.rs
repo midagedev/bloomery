@@ -47,6 +47,18 @@
 //! the streams has no form for a non-finite value, so a planted NaN in one
 //! stream value must raise `FaultSite::HcQuant` rather than round to code 0.
 //!
+//! The Q8_0 chain (`hc_pre_q8_0`, GLM-5.3-Flash's `hc_{attn,ffn}_fn`), model
+//! free: seeded Q8_0 weights and streams (`hc_host::q8_0_fixture`, `lcg`) at
+//! K = 512 (one piece) and 16384 (the GLM width), token groups of 1, 8,
+//! 5 + 8 and 4 + 8 + 8, at the GLM header's epsilon, iterations and RMS
+//! epsilon. The mixes are bit-identical to the host transcription
+//! (`hc_host::hc_chain_q8_0`), the HC_PRE rows to `hc_pre_f32` over them, a
+//! rerun into NaN-filled outputs to the first launch (the tickets are back
+//! at 0), a captured graph of one node replayed twice to the eager launch,
+//! and a NaN in one token's streams makes all 48 of that token's outputs NaN
+//! and leaves every other token's bits. It runs before the model file opens,
+//! so it judges on a box without the V4.1 sets too.
+//!
 //! Holes, named: the T = 1 paths (ik's own HC_POST branch for one token)
 //! come only from the decode-step sets, read when they are on the box and
 //! named when they are not; `ds41_hc_pre` takes at most 8 tokens a launch,
@@ -68,11 +80,16 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::fused::readback_q8act;
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
+    use bloomery_gpu::{
+        DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group_count,
+    };
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
+        HcQ8Params, HcQ8PreArgs,
     };
-    use bloomery_gpu_gates::hc_host::{self, exp_ik, exp_ours, hc_pre_f32};
+    use bloomery_gpu_gates::hc_host::{
+        self, exp_ik, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture,
+    };
     use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D2, D2_UNFUSED, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -92,7 +109,11 @@ mod gate {
     /// Bytes of one q3_K super-block.
     const Q3K_SB: usize = 110;
     // The host rule's layout is the kernels'.
-    const _: () = assert!(hc_host::HC_STREAMS == HC_STREAMS && hc_host::HC_MIX == HC_MIX);
+    const _: () = assert!(
+        hc_host::HC_STREAMS == HC_STREAMS
+            && hc_host::HC_MIX == HC_MIX
+            && hc_host::HC_PIECE == HC_PIECE
+    );
 
     /// The file's hyper-connection hyperparameters.
     struct Hp {
@@ -1263,7 +1284,226 @@ mod gate {
         Ok(())
     }
 
+    // ------------------------------------------------------ the Q8_0 chain
+
+    /// The GLM-5.3-Flash header's values the Q8_0 clause runs at:
+    /// `hyper_connection.epsilon`, `.sinkhorn_iterations` and
+    /// `attention.layer_norm_rms_epsilon`.
+    const Q8_EPS: f32 = 1e-6;
+    const Q8_ITERS: u32 = 20;
+    const Q8_RMS_EPS: f32 = 1e-5;
+    /// The GLM width: four streams of 4096.
+    const Q8_K: usize = 16_384;
+    /// `(K, tokens, lead)` of the Q8_0 clause.
+    const Q8_CASES: [(usize, usize, usize); 7] = [
+        (HC_PIECE, 1, 1),
+        (HC_PIECE, 8, 8),
+        (HC_PIECE, 13, 5),
+        (Q8_K, 1, 1),
+        (Q8_K, 8, 8),
+        (Q8_K, 13, 5),
+        (Q8_K, 20, 4),
+    ];
+
+    /// One seeded Q8_0 site on the device and its host copy.
+    struct Q8Site {
+        qs: DeviceTensor<u32>,
+        d: DeviceTensor<u16>,
+        scale: DeviceBuffer<f32>,
+        base: DeviceBuffer<f32>,
+        qs_h: Vec<u32>,
+        d_h: Vec<u16>,
+        sc: [f32; 3],
+        base_h: Vec<f32>,
+    }
+
+    impl Q8Site {
+        fn new(stream: &CudaStream, k: usize, seed: u32) -> Result<Q8Site, GateError> {
+            let (qs_h, d_h) = q8_0_fixture(k, seed);
+            let affine = lcg(3 + HC_MIX, seed ^ 0x5a5a);
+            let (sc, base_h) = ([affine[0], affine[1], affine[2]], affine[3..].to_vec());
+            Ok(Q8Site {
+                qs: DeviceTensor::upload(stream, &qs_h, HC_MIX, k / 4)?,
+                d: DeviceTensor::upload(stream, &d_h, HC_MIX, k / 32)?,
+                scale: DeviceBuffer::from_host(stream, &sc)?,
+                base: DeviceBuffer::from_host(stream, &base_h)?,
+                qs_h,
+                d_h,
+                sc,
+                base_h,
+            })
+        }
+
+        fn params(&self) -> HcQ8Params<'_> {
+            HcQ8Params {
+                qs: &self.qs,
+                d: &self.d,
+                scale: &self.scale,
+                base: &self.base,
+                eps: Q8_EPS,
+                iters: Q8_ITERS,
+            }
+        }
+
+        /// The host rule's mixes and HC_PRE rows for `t` tokens of `x`.
+        fn host(&self, x: &[f32], k: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
+            let mixes = hc_chain_q8_0(&self.qs_h, &self.d_h, x, k, t, Q8_RMS_EPS);
+            let hc = mixes
+                .as_chunks::<HC_MIX>()
+                .0
+                .iter()
+                .flat_map(|m| hc_pre_f32(m, self.sc, &self.base_h, Q8_EPS, Q8_ITERS, exp_ours))
+                .collect();
+            (mixes, hc)
+        }
+    }
+
+    /// The outputs of a Q8_0 launch.
+    struct Q8Out {
+        mixes: DeviceBuffer<f32>,
+        hc: DeviceBuffer<f32>,
+    }
+
+    impl Q8Out {
+        /// Both filled with NaN, so a slot no launch writes cannot read as
+        /// a result.
+        fn clear(&mut self, stream: &CudaStream) -> Result<(), GateError> {
+            for b in [&mut self.mixes, &mut self.hc] {
+                let nan = vec![f32::NAN; b.len()];
+                b.copy_from_host(stream, &nan)?;
+            }
+            Ok(())
+        }
+
+        fn read(&self, stream: &CudaStream) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+            Ok((
+                self.mixes.to_host_vec(stream)?,
+                self.hc.to_host_vec(stream)?,
+            ))
+        }
+    }
+
+    /// One eager launch into cleared outputs, read back.
+    fn q8_launch(
+        hck: &HcKernels,
+        stream: &CudaStream,
+        a: &HcQ8PreArgs<'_>,
+        lead: usize,
+        scratch: &mut HcPreScratch,
+        out: &mut Q8Out,
+    ) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+        out.clear(stream)?;
+        hck.enqueue_pre_q8_0(stream, a, lead, scratch, &mut out.mixes, &mut out.hc)?;
+        stream.synchronize()?;
+        out.read(stream)
+    }
+
+    /// Every check of the Q8_0 chain (the module doc's Q8_0 paragraph);
+    /// prints one line per case, one for the graph and one for the NaN.
+    fn check_q8_0(gpu: &Gpu, hck: &HcKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut ok = true;
+        for (i, &(k, t, lead)) in Q8_CASES.iter().enumerate() {
+            let seed = 1000 + u32::try_from(i)?;
+            let site = Q8Site::new(stream, k, seed)?;
+            let xs = lcg(k * t, seed + 7);
+            let x = DeviceBuffer::from_host(stream, &xs)?;
+            let groups = col_group_count(lead, t);
+            let mut scratch = HcPreScratch::with_groups(stream, k, groups)?;
+            let p = site.params();
+            let a = HcQ8PreArgs {
+                params: &p,
+                x: &x,
+                tokens: t,
+                rms_eps: Q8_RMS_EPS,
+            };
+            let mut out = Q8Out {
+                mixes: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
+                hc: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
+            };
+            let (mix_k, hc_k) = q8_launch(hck, stream, &a, lead, &mut scratch, &mut out)?;
+            let (mix_r, hc_r) = q8_launch(hck, stream, &a, lead, &mut scratch, &mut out)?;
+            let (mix_h, hc_h) = site.host(&xs, k, t);
+            let mix_bit = bits_equal(&mix_k, &mix_h);
+            let hc_bit = bits_equal(&hc_k, &hc_h);
+            let rerun = bits_equal(&mix_r, &mix_k) && bits_equal(&hc_r, &hc_k);
+            let finite = mix_h.iter().chain(&hc_h).all(|v| v.is_finite());
+            let pass = mix_bit && hc_bit && rerun && finite;
+            println!(
+                "hc_pre_q8_0 K={k} T={t} lead={lead} groups={groups} kernel_mix_bit={mix_bit} \
+                 kernel_hc_bit={hc_bit} rerun_bit={rerun} host_finite={finite} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // The GLM width at 13 tokens (lead 5): a captured graph, and a NaN.
+        let (k, t, lead) = (Q8_K, 13, 5);
+        let site = Q8Site::new(stream, k, 2000)?;
+        let xs = lcg(k * t, 2007);
+        let x = DeviceBuffer::from_host(stream, &xs)?;
+        let mut scratch = HcPreScratch::with_groups(stream, k, col_group_count(lead, t))?;
+        let p = site.params();
+        let a = HcQ8PreArgs {
+            params: &p,
+            x: &x,
+            tokens: t,
+            rms_eps: Q8_RMS_EPS,
+        };
+        let mut out = Q8Out {
+            mixes: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
+            hc: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
+        };
+        let eager = q8_launch(hck, stream, &a, lead, &mut scratch, &mut out)?;
+        let g = gpu.capture(|s| {
+            hck.enqueue_pre_q8_0(s, &a, lead, &mut scratch, &mut out.mixes, &mut out.hc)
+        })?;
+        let mut replays_bit = true;
+        for _ in 0..2 {
+            out.clear(stream)?;
+            g.launch(stream)?;
+            stream.synchronize()?;
+            let got = out.read(stream)?;
+            replays_bit &= bits_equal(&got.0, &eager.0) && bits_equal(&got.1, &eager.1);
+        }
+        let nodes = g.node_count();
+        let pass = replays_bit && nodes == 1;
+        println!(
+            "hc_pre_q8_0 graph K={k} T={t} lead={lead} nodes={nodes} \
+             replay_x2_bit_identical_to_eager={replays_bit} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        let bad = 6usize;
+        let mut xn = xs.clone();
+        xn[bad * k + 777] = f32::NAN;
+        let x_nan = DeviceBuffer::from_host(stream, &xn)?;
+        let a_nan = HcQ8PreArgs { x: &x_nan, ..a };
+        let (mix_n, hc_n) = q8_launch(hck, stream, &a_nan, lead, &mut scratch, &mut out)?;
+        let row = |v: &[f32], tt: usize| v[tt * HC_MIX..(tt + 1) * HC_MIX].to_vec();
+        let bad_nan = row(&mix_n, bad)
+            .iter()
+            .chain(&row(&hc_n, bad))
+            .all(|v| v.is_nan());
+        let others_bit = (0..t).filter(|&tt| tt != bad).all(|tt| {
+            bits_equal(&row(&mix_n, tt), &row(&eager.0, tt))
+                && bits_equal(&row(&hc_n, tt), &row(&eager.1, tt))
+        });
+        let pass = bad_nan && others_bit;
+        println!(
+            "hc_pre_q8_0 nan K={k} T={t} token {bad} value 777 NaN: its_48_outputs_nan={bad_nan} \
+             other_tokens_bit={others_bit} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let gpu = Gpu::new()?;
+        let hck = HcKernels::load(gpu.context())?;
+        let q8_ok = check_q8_0(&gpu, &hck)?;
         let split = Split::open(ref_model_path()?)?;
         let hp = Hp::read(&split)?;
         println!(
@@ -1275,8 +1515,6 @@ mod gate {
             hp.eps,
             hp.rms_eps
         );
-        let gpu = Gpu::new()?;
-        let hck = HcKernels::load(gpu.context())?;
         let scratch = HcPreScratch::new(gpu.stream(), hp.k())?;
         let mut cx = Ctx {
             split: &split,
@@ -1284,7 +1522,7 @@ mod gate {
             gpu: &gpu,
             hck: &hck,
             scratch,
-            ok: true,
+            ok: q8_ok,
         };
         let table = oracle::for_arch(Arch::Deepseek41)?;
         let prefill = table.open(Set::Cpu)?;
@@ -1303,7 +1541,7 @@ mod gate {
             println!(
                 "PASSED: gate_deepseek41_hc — chain, HC_PRE, HC_POST and folds bit-identical to \
                  our rule; HC_POST and folds bit-identical to ik's dump; the chain inside its \
-                 predicted gap"
+                 predicted gap; the Q8_0 chain bit-identical to our rule"
             );
             Ok(())
         } else {

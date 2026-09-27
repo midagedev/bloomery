@@ -21,6 +21,9 @@ bloomery-levers = { path = "../levers" }
 # Host-only edge, live with the `gpu` feature off: the oracle table's `Arch`, and the
 # CPU model's deepseek2 names and MLA parameters for the host bin `exact_ref`.
 bloomery-model = { path = "../model" }
+# Host only: the CPU tier's ik-verified activation rules (`swiglu_clamp`), which `gate_kquant`
+# holds the card's gate·up to.
+bloomery-qdot = { path = "../qdot" }
 # The `.oxart` container's own reader, host-only. `ptx` takes PTX text only as the payloads
 # it cuts; `object-read` is the ELF path cuda-core's module loader takes on the same file.
 oxide-artifacts = { workspace = true, features = ["object-read"] }
@@ -195,7 +198,15 @@ name = "gate_dspark_kv"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_glm5next_router"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_mcol"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_glm_mla"
 required-features = ["deepseek41"]
 
 [[bin]]

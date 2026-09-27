@@ -13,7 +13,8 @@
 //!
 //! [`Score`] names the element-wise score functions. Softmax is not one — it
 //! needs all of a token's logits — and stays in its wrapper's own pass.
-//! [`Sigmoid`] is compiled but no kernel routes with it yet.
+//! A router body generic over its score takes one of them as a type
+//! parameter (`gpu-deepseek41`'s `router::glm5next` routes with [`Sigmoid`]).
 //!
 //! A weight stage that renormalizes its selected scores divides by
 //! [`renorm_divisor`] of their sum: the one guard every such stage and its
@@ -54,11 +55,12 @@ pub fn renorm_divisor(sum: f32) -> f32 {
 }
 
 /// `1 / (1 + e^-x)` in f32, the scalar form of ggml's `ggml_vec_sigmoid_f32`.
-/// The gated router (`arch::qwen3moe::router::gated`) weighs its shared
+/// The GLM router ranks its experts by it ([`Sigmoid`], `gate-gpu-glm-router`);
+/// the gated router (`arch::qwen3moe::router::gated`) weighs its shared
 /// expert's slot with it, and `gated_quant` gates the attention output with
-/// it; `gate-gpu-qwen35moe-moe` holds the slot's weight within its band of
-/// this function run on the host. No kernel takes it as a top-k score
-/// ([`Sigmoid`]).
+/// it (`gate-gpu-qwen35moe-moe` holds the slot's weight within its band of
+/// this function run on the host). On the device `exp` is CUDA's libdevice,
+/// on the host the system libm.
 #[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())

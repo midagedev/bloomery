@@ -141,6 +141,7 @@ dependencies = [
  "bloomery-gpu-vision",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-qdot",
  "bloomery-refset",
  "bloomery-runtime",
  "bloomery-sampler",

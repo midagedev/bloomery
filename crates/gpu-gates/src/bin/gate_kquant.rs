@@ -1,7 +1,8 @@
 //! GPU gate for the model-free K-quant expert family (`bloomery_gpu::kquant`):
-//! the Q5_K down `_sel`, the Q5_K gate·up with its activation rule as a launch
-//! argument, and Walk A under both. Synthetic stacks only, no model file: every
-//! super-block is random words with a positive normal `d` and `dmin`.
+//! the Q5_K and Q8_0 down `_sel`s, their gate·ups with the activation rule as a
+//! launch argument, and Walk A under them. Synthetic stacks only, no model file:
+//! every K-quant super-block is random words with a positive normal `d` and
+//! `dmin`, every Q8_0 block random codes with a positive normal `d`.
 //!
 //! 1. band: `q5k_gemv_sel` against the f64 dot of `gguf::quant::dequant_row`'s
 //!    rows with the q8_1-dequantized columns (`ref_gemv`), `max_rel_err` within
@@ -31,8 +32,8 @@
 //!    quantizer, and every row that reads that column is NaN in both entries.
 //! 5. act: the gate·up's rows are the rule on the down `_sel`'s sums of the same
 //!    rows and column, bit for bit: `silu_mul` against the engine's elementwise
-//!    swiglu (the same core), `swiglu_clamp` at two limits against
-//!    `kquant::act::swiglu_clamp` run on the host. The clamped rows are counted.
+//!    swiglu (the same core), `swiglu_clamp` at two limits against the CPU
+//!    tier's ik-verified rule `qdot::swiglu_clamp`. The clamped rows are counted.
 //! 6. q4k_sibling: the gate binary's Walk A instance over `Q4k` is
 //!    `q4k_gemv_sel` bit for bit, `HOST` slot included, at K = 256, 768, 1280,
 //!    2048, 2304, 4096.
@@ -52,6 +53,15 @@
 //!    `Q5Quant` from the quantizer and the down adds no fault; the launcher
 //!    refuses an activation of another K, a column count other than the slots
 //!    and a non-dividing expert size.
+//! 8. q8_0: the Q8_0 entries (`q8_0_gemv_sel`, `kq_gate_up_act_q8_0`) over rows
+//!    in the file's 34-byte block layout, synthetic codes over all 256 byte
+//!    values. Clause 1 against `dequant_row(Q8_0)` at K = 256, 768, 1280, 2304
+//!    on four experts and at GLM-5.3-Flash's non-routed shapes as one-expert
+//!    stacks with every id 0 (shared gate·up 2048 × 4096 and down 4096 × 2048,
+//!    dense gate·up 12288 × 4096 and down 4096 × 12288), the probe's decode
+//!    (codes, `d`, 0) as the host's reading of the block bytes; clauses 5 and 4
+//!    on the Q8_0 entries; and each launcher refusing a stack of the other
+//!    format's row width.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -70,7 +80,7 @@ mod gate {
     use bloomery_gpu::kquant::sel::{ROWS_PER_BLOCK, THREADS, gemv_sel_body};
     use bloomery_gpu::kquant::walk::{iter_term, row_dot, row_dot_1col};
     use bloomery_gpu::kquant::{
-        Act, GateUpAct, KquantKernels, Q4k, Q5k, SbDecode, SelDown, act, walk_a_planes,
+        Act, GateUpAct, KquantKernels, Q4k, Q5k, Q8_0, SbDecode, SelDown, act, walk_a_planes,
     };
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
@@ -230,11 +240,7 @@ mod gate {
             }
         }
 
-        /// The row probe: one warp walks Q5_K row `row_abs` against column
-        /// `col` as the `_sel` entries do and writes, as bits, its 32 lane
-        /// partials at `out[0..32]`, their warp sum at `out[32]`, and per
-        /// sub-block `(sb, s)` at `out[33 + 11·(8·sb + s)..]` the decoder's
-        /// eight code words, `cda`, `cdb` and the walk's term for it.
+        /// The row probe over Q5_K ([`probe_walk`]).
         #[allow(
             clippy::too_many_arguments,
             reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -266,72 +272,140 @@ mod gate {
             if thread::index_1d().get() >= 32 {
                 return;
             }
-            let lane = warp::lane_id() as usize;
-            let (n_sb, row, col) = (n_sb as usize, row_abs as usize, col as usize);
-            // SAFETY: the launch contract bounds row `row_abs` of `w` and column
-            // `col` of the planes; iters = ceil(n_sb/4) from the host; the one
-            // block is the one warp.
-            let f = unsafe { row_dot_1col::<Q5k>(w, q, s8, d8, n_sb, iters, row, col, lane) };
-            let sum = warp::reduce_sum_f32(f);
-            // SAFETY: lane < 32 < out.len(); each lane writes its own word, lane
-            // 0 also word 32.
-            unsafe {
-                *out.get_unchecked_mut(lane) = f.to_bits();
-                if lane == 0 {
-                    *out.get_unchecked_mut(32) = sum.to_bits();
-                }
+            // SAFETY: the launch contract is the walk's (44 = Q5k::WORDS);
+            // iters = ceil(n_sb/4) from the host; the one block is the one warp.
+            unsafe { probe_walk::<Q5k>(w, q, s8, d8, row_abs, col, n_sb, iters, &mut out) };
+        }
+
+        /// The row probe over Q8_0 ([`probe_walk`]).
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(32)]
+        #[launch_contract(
+            domain = 1,
+            block = (32, 1, 1),
+            requires = (
+                w.len() >= (row_abs + 1) * 68 * n_sb,
+                q.len() >= (col + 1) * 256 * iters,
+                s8.len() >= (col + 1) * 8 * n_sb,
+                d8.len() >= (col + 1) * 2 * n_sb,
+                out.len() >= 33 + 88 * n_sb
+            )
+        )]
+        pub fn kq_probe_q8_0(
+            w: &[u32],
+            q: &[u32],
+            s8: &[i32],
+            d8: &[f32],
+            row_abs: u32,
+            col: u32,
+            n_sb: u32,
+            iters: u32,
+            mut out: DisjointSlice<u32>,
+        ) {
+            if thread::index_1d().get() >= 32 {
+                return;
             }
-            let (s, grp) = (lane & 7, lane >> 3);
-            let mut it = 0u32;
-            while it < iters {
-                let sbp = 4 * it as usize + grp;
-                if sbp < n_sb {
-                    // SAFETY: sbp < n_sb keeps the super-block inside row
-                    // `row_abs` and the term's plane reads inside column `col`.
-                    let ((vi, cda, cdb), term) = unsafe {
-                        (
-                            Q5k::decode(w, row * 44 * n_sb + 44 * sbp, s),
-                            iter_term::<Q5k>(
-                                w,
-                                q,
-                                s8,
-                                d8,
-                                n_sb,
-                                it,
-                                row,
-                                col * 256 * iters as usize,
-                                col * 8 * n_sb,
-                                col * 2 * n_sb,
-                                s,
-                                grp,
-                                lane,
-                            ),
-                        )
-                    };
-                    let b = 33 + 11 * (8 * sbp + s);
-                    // SAFETY: b + 10 < 33 + 88·n_sb <= out.len() because sbp <
-                    // n_sb and s < 8; (sbp, s) is this lane's alone.
-                    unsafe {
-                        *out.get_unchecked_mut(b) = vi[0];
-                        *out.get_unchecked_mut(b + 1) = vi[1];
-                        *out.get_unchecked_mut(b + 2) = vi[2];
-                        *out.get_unchecked_mut(b + 3) = vi[3];
-                        *out.get_unchecked_mut(b + 4) = vi[4];
-                        *out.get_unchecked_mut(b + 5) = vi[5];
-                        *out.get_unchecked_mut(b + 6) = vi[6];
-                        *out.get_unchecked_mut(b + 7) = vi[7];
-                        *out.get_unchecked_mut(b + 8) = cda.to_bits();
-                        *out.get_unchecked_mut(b + 9) = cdb.to_bits();
-                        *out.get_unchecked_mut(b + 10) = term.to_bits();
-                    }
-                }
-                it += 1;
-            }
+            // SAFETY: the launch contract is the walk's (68 = Q8_0::WORDS);
+            // iters = ceil(n_sb/4) from the host; the one block is the one warp.
+            unsafe { probe_walk::<Q8_0>(w, q, s8, d8, row_abs, col, n_sb, iters, &mut out) };
         }
     }
 
-    // The gate module spells the two formats' super-block words.
-    const _: () = assert!(Q4k::WORDS == 36 && Q5k::WORDS == 44);
+    /// The row probe's body: one warp walks row `row_abs` of format `D`
+    /// against column `col` as the `_sel` entries do and writes, as bits, its
+    /// 32 lane partials at `out[0..32]`, their warp sum at `out[32]`, and per
+    /// sub-block `(sb, s)` at `out[33 + 11·(8·sb + s)..]` the decoder's eight
+    /// code words, `cda`, `cdb` and the walk's term for it.
+    ///
+    /// # Safety
+    ///
+    /// `w.len() >= (row_abs + 1) · D::WORDS · n_sb`, column `col` inside the
+    /// three planes, `iters = ceil(n_sb / 4)`, `out.len() >= 33 + 88 · n_sb`,
+    /// and the 32 lanes of one warp call it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
+    #[inline(always)]
+    unsafe fn probe_walk<D: SbDecode>(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        row_abs: u32,
+        col: u32,
+        n_sb: u32,
+        iters: u32,
+        out: &mut DisjointSlice<u32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let (n_sb, row, col) = (n_sb as usize, row_abs as usize, col as usize);
+        // SAFETY: this fn's contract bounds row `row_abs` of `w` and column
+        // `col` of the planes, iters = ceil(n_sb/4), one warp.
+        let f = unsafe { row_dot_1col::<D>(w, q, s8, d8, n_sb, iters, row, col, lane) };
+        let sum = warp::reduce_sum_f32(f);
+        // SAFETY: lane < 32 < out.len(); each lane writes its own word, lane
+        // 0 also word 32.
+        unsafe {
+            *out.get_unchecked_mut(lane) = f.to_bits();
+            if lane == 0 {
+                *out.get_unchecked_mut(32) = sum.to_bits();
+            }
+        }
+        let (s, grp) = (lane & 7, lane >> 3);
+        let mut it = 0u32;
+        while it < iters {
+            let sbp = 4 * it as usize + grp;
+            if sbp < n_sb {
+                // SAFETY: sbp < n_sb keeps the super-block inside row
+                // `row_abs` and the term's plane reads inside column `col`.
+                let ((vi, cda, cdb), term) = unsafe {
+                    (
+                        D::decode(w, row * D::WORDS * n_sb + D::WORDS * sbp, s),
+                        iter_term::<D>(
+                            w,
+                            q,
+                            s8,
+                            d8,
+                            n_sb,
+                            it,
+                            row,
+                            col * 256 * iters as usize,
+                            col * 8 * n_sb,
+                            col * 2 * n_sb,
+                            s,
+                            grp,
+                            lane,
+                        ),
+                    )
+                };
+                let b = 33 + 11 * (8 * sbp + s);
+                // SAFETY: b + 10 < 33 + 88·n_sb <= out.len() because sbp <
+                // n_sb and s < 8; (sbp, s) is this lane's alone.
+                unsafe {
+                    *out.get_unchecked_mut(b) = vi[0];
+                    *out.get_unchecked_mut(b + 1) = vi[1];
+                    *out.get_unchecked_mut(b + 2) = vi[2];
+                    *out.get_unchecked_mut(b + 3) = vi[3];
+                    *out.get_unchecked_mut(b + 4) = vi[4];
+                    *out.get_unchecked_mut(b + 5) = vi[5];
+                    *out.get_unchecked_mut(b + 6) = vi[6];
+                    *out.get_unchecked_mut(b + 7) = vi[7];
+                    *out.get_unchecked_mut(b + 8) = cda.to_bits();
+                    *out.get_unchecked_mut(b + 9) = cdb.to_bits();
+                    *out.get_unchecked_mut(b + 10) = term.to_bits();
+                }
+            }
+            it += 1;
+        }
+    }
+
+    // The gate module spells the three formats' super-block words.
+    const _: () = assert!(Q4k::WORDS == 36 && Q5k::WORDS == 44 && Q8_0::WORDS == 68);
 
     /// Experts of every stack here.
     const E: usize = 4;
@@ -347,7 +421,8 @@ mod gate {
         gm: gate_kernels::LoadedModule,
     }
 
-    /// One synthetic stack of `E` experts of `rpe` rows of `k` values.
+    /// One synthetic stack of experts (`E` unless built one-expert) of `rpe`
+    /// rows of `k` values.
     struct Stack {
         tag: &'static str,
         ty: GgmlType,
@@ -366,10 +441,23 @@ mod gate {
             k: usize,
             seed: u64,
         ) -> Result<Stack, GateError> {
+            Stack::with_experts(c, tag, ty, E, rpe, k, seed)
+        }
+
+        /// A stack of `experts` experts: one is a non-routed FFN's matrix.
+        fn with_experts(
+            c: &Ctx,
+            tag: &'static str,
+            ty: GgmlType,
+            experts: usize,
+            rpe: usize,
+            k: usize,
+            seed: u64,
+        ) -> Result<Stack, GateError> {
             let n_sb = k / 256;
-            let words = synthetic(ty, E * rpe, n_sb, seed)?;
-            let wpr = words.len() / (E * rpe);
-            let w = DeviceTensor::upload(c.gpu.stream(), &words, E * rpe, wpr)?;
+            let words = synthetic(ty, experts * rpe, n_sb, seed)?;
+            let wpr = words.len() / (experts * rpe);
+            let w = DeviceTensor::upload(c.gpu.stream(), &words, experts * rpe, wpr)?;
             Ok(Stack {
                 tag,
                 ty,
@@ -391,15 +479,18 @@ mod gate {
         }
     }
 
-    /// `rows` synthetic super-block rows of `ty` (Q4_K or Q5_K), `n_sb`
+    /// `rows` synthetic super-block rows of `ty` (Q4_K, Q5_K or Q8_0), `n_sb`
     /// super-blocks each, as words from a fixed-seed xorshift64: every word
-    /// random except the first of each super-block, whose halves are `d` and
-    /// `dmin` — positive normal f16 (exponent field 1..=9), so no NaN or
-    /// infinity enters. Every other word pattern is a valid super-block.
+    /// random except the first of each K-quant super-block, whose halves are
+    /// `d` and `dmin`, and each Q8_0 block's first two bytes, its `d` — each a
+    /// positive normal f16 (exponent field 1..=9), so no NaN or infinity
+    /// enters. Every other pattern is a valid block, Q8_0's code −128
+    /// included.
     fn synthetic(ty: GgmlType, rows: usize, n_sb: usize, seed: u64) -> Result<Vec<u32>, GateError> {
         let words = match ty {
             GgmlType::Q4_K => Q4k::WORDS,
             GgmlType::Q5_K => Q5k::WORDS,
+            GgmlType::Q8_0 => Q8_0::WORDS,
             other => return Err(format!("gate_kquant: no synthetic {other:?}").into()),
         };
         let mut s = seed;
@@ -410,6 +501,22 @@ mod gate {
             s
         };
         let half = |r: u64| -> u32 { ((1 + (r % 9) as u32) << 10) | ((r >> 32) as u32 & 0x3ff) };
+        if ty == GgmlType::Q8_0 {
+            // Eight 34-byte blocks a super-block: `d`, then 32 codes.
+            let mut bytes = Vec::with_capacity(rows * n_sb * 4 * words);
+            for _ in 0..rows * n_sb * 8 {
+                bytes.extend_from_slice(&(half(next()) as u16).to_le_bytes());
+                for _ in 0..8 {
+                    bytes.extend_from_slice(&((next() >> 32) as u32).to_le_bytes());
+                }
+            }
+            return Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect());
+        }
         let mut out = Vec::with_capacity(rows * n_sb * words);
         for _ in 0..rows * n_sb {
             let (d, dmin) = (half(next()), half(next()));
@@ -436,7 +543,8 @@ mod gate {
     }
 
     /// The down `_sel` of stack `st` for `sel` (one id a column of `act`) into a
-    /// `SENT`-filled output, synchronized; the output and the fault word.
+    /// `SENT`-filled output, synchronized; the output and the fault word. The
+    /// stack's type picks the entry: Q8_0's, else Q5_K's.
     fn down(
         c: &Ctx,
         st: &Stack,
@@ -453,14 +561,21 @@ mod gate {
             n_slots: sel.len(),
             rows_per_expert: st.rpe,
         };
-        c.kq.enqueue_gemv_q5k_sel(stream, &a, c.gpu.unlabelled_sink(), &mut y)?;
+        match st.ty {
+            GgmlType::Q8_0 => {
+                c.kq.enqueue_gemv_q8_0_sel(stream, &a, c.gpu.unlabelled_sink(), &mut y)?;
+            }
+            _ => {
+                c.kq.enqueue_gemv_q5k_sel(stream, &a, c.gpu.unlabelled_sink(), &mut y)?
+            }
+        }
         stream.synchronize()?;
         Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
     }
 
     /// The gate·up of stacks `g`/`u` for `sel` at `spc` slots a column of
     /// `act` under `rule`, into a `SENT`-filled output; the output and the
-    /// fault word.
+    /// fault word. The gate stack's type picks the entry, as [`down`].
     fn gate_up(
         c: &Ctx,
         g: &Stack,
@@ -483,12 +598,20 @@ mod gate {
             slots_per_col: spc,
             rule,
         };
-        c.kq.enqueue_gate_up_q5k(stream, &a, c.gpu.unlabelled_sink(), &mut h)?;
+        match g.ty {
+            GgmlType::Q8_0 => {
+                c.kq.enqueue_gate_up_q8_0(stream, &a, c.gpu.unlabelled_sink(), &mut h)?
+            }
+            _ => {
+                c.kq.enqueue_gate_up_q5k(stream, &a, c.gpu.unlabelled_sink(), &mut h)?
+            }
+        }
         stream.synchronize()?;
         Ok((h.to_host_vec(stream)?, c.gpu.take_fault()?))
     }
 
-    /// The probe of Q5_K row `row_abs` of `st` against column `col` of `act`.
+    /// The probe of row `row_abs` of `st` (Q5_K or Q8_0) against column `col`
+    /// of `act`.
     fn probe(
         c: &Ctx,
         st: &Stack,
@@ -500,20 +623,40 @@ mod gate {
         let n_sb = st.n_sb();
         let mut out = DeviceBuffer::<u32>::zeroed(stream, PROBE_HEAD + 8 * PROBE_SUB * n_sb)?;
         let (q, s8, d8) = walk_a_planes(act);
-        let prep = c.gm.prepare_kq_probe_q5k(LaunchConfig1D::new(1, 32, 0))?;
-        c.gm.kq_probe_q5k(
-            stream,
-            &prep,
-            st.w.buf(),
-            q,
-            s8,
-            d8,
-            u32::try_from(row_abs)?,
-            u32::try_from(col)?,
-            u32::try_from(n_sb)?,
-            u32::try_from(n_sb.div_ceil(4))?,
-            &mut out,
-        )?;
+        let cfg = LaunchConfig1D::new(1, 32, 0);
+        let (row_abs, col) = (u32::try_from(row_abs)?, u32::try_from(col)?);
+        let (n_sb, iters) = (u32::try_from(n_sb)?, u32::try_from(n_sb.div_ceil(4))?);
+        if st.ty == GgmlType::Q8_0 {
+            let prep = c.gm.prepare_kq_probe_q8_0(cfg)?;
+            c.gm.kq_probe_q8_0(
+                stream,
+                &prep,
+                st.w.buf(),
+                q,
+                s8,
+                d8,
+                row_abs,
+                col,
+                n_sb,
+                iters,
+                &mut out,
+            )?;
+        } else {
+            let prep = c.gm.prepare_kq_probe_q5k(cfg)?;
+            c.gm.kq_probe_q5k(
+                stream,
+                &prep,
+                st.w.buf(),
+                q,
+                s8,
+                d8,
+                row_abs,
+                col,
+                n_sb,
+                iters,
+                &mut out,
+            )?;
+        }
         stream.synchronize()?;
         Ok(out.to_host_vec(stream)?)
     }
@@ -550,14 +693,42 @@ mod gate {
         (words, d * f32::from(sc), -(dmin * f32::from(m)))
     }
 
+    /// The host's reading of sub-block `s` of a Q8_0 super-block (eight
+    /// 34-byte blocks): block `s`'s 32 codes as eight words (values `4·i ..`
+    /// in word `i`, byte order), `d` and 0.
+    fn host_decode_q8_0(sb: &[u8], s: usize) -> ([u32; 8], f32, f32) {
+        let blk = &sb[34 * s..34 * (s + 1)];
+        let mut words = [0u32; 8];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = u32::from_le_bytes([
+                blk[2 + 4 * i],
+                blk[3 + 4 * i],
+                blk[4 + 4 * i],
+                blk[5 + 4 * i],
+            ]);
+        }
+        (
+            words,
+            half_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            0.0,
+        )
+    }
+
     /// The probe's decode of row `row_abs` of `st` against the host's, word for
     /// word; the first sub-block that differs, or `None`.
     fn probe_decode_diff(st: &Stack, row_abs: usize, out: &[u32]) -> Option<String> {
         let n_sb = st.n_sb();
-        let row = &words_bytes(&st.words[row_abs * 44 * n_sb..(row_abs + 1) * 44 * n_sb]);
+        let wpr = st.w.cols();
+        let sbb = 4 * wpr / n_sb; // bytes a super-block
+        let row = &words_bytes(&st.words[row_abs * wpr..(row_abs + 1) * wpr]);
         for sb in 0..n_sb {
             for s in 0..8 {
-                let (codes, cda, cdb) = host_decode(&row[176 * sb..176 * (sb + 1)], s);
+                let bytes = &row[sbb * sb..sbb * (sb + 1)];
+                let (codes, cda, cdb) = if st.ty == GgmlType::Q8_0 {
+                    host_decode_q8_0(bytes, s)
+                } else {
+                    host_decode(bytes, s)
+                };
                 let b = PROBE_HEAD + PROBE_SUB * (8 * sb + s);
                 let dev = &out[b..b + 10];
                 let host: Vec<u32> = codes
@@ -648,6 +819,7 @@ mod gate {
         ok &= check_act(&c)?;
         ok &= check_q4k_sibling(&c)?;
         ok &= check_q5_1(&c)?;
+        ok &= check_q8_0(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -660,7 +832,11 @@ mod gate {
              swiglu_clamp on the down's sums bit for bit; Walk A over Q4_K is q4k_gemv_sel bit \
              for bit on 6 K; q5_1_gemv_sel within {KERNEL_BAND:e} of the f64 dequant_row \
              reference and q5_1_gemv of the packed expert bit for bit at 4 shapes, HOST \
-             untouched, graph replay, expert_id past the stack, q5_quant on a NaN column"
+             untouched, graph replay, expert_id past the stack, q5_quant on a NaN column; \
+             the Q8_0 entries within the band at 8 shapes (GLM's dense and shared \
+             FFN among them) with their probe decoding as the host, their gate·up the rule on \
+             their down's sums, their faults as Q5_K's, and each launcher refusing the other \
+             format's rows"
         );
         Ok(())
     }
@@ -682,68 +858,82 @@ mod gate {
         let mut ok = true;
         for (i, &(tag, rpe, k)) in SHAPES.iter().enumerate() {
             let st = Stack::new(c, tag, GgmlType::Q5_K, rpe, k, 0x51a7_0001 + i as u64)?;
-            let x = activations(k, SEL.len(), 7001 + i as u32);
-            let act = quantize(c, &x, SEL.len(), k)?;
-            let (y, fault) = down(c, &st, &act, &SEL)?;
-            let xq = q8_1_dequant(&x, k, SEL.len());
-            let mut want = Vec::with_capacity(y.len());
-            for (s, &e) in SEL.iter().enumerate() {
-                want.extend(ref_gemv(
-                    GgmlType::Q5_K,
-                    &st.expert_bytes(e as usize),
-                    k,
-                    rpe,
-                    &xq[s * k..(s + 1) * k],
-                    1,
-                )?);
-            }
-            let rel = max_rel_err(&y, &want)?;
-            let in_band = rel <= KERNEL_BAND;
-            // The probe on a row off the block and warp boundaries, in slot 1.
-            let (slot, r) = (1usize, rpe / 2 + 3);
-            let row_abs = SEL[slot] as usize * rpe + r;
-            let out = probe(c, &st, &act, row_abs, slot)?;
-            let decode_diff = probe_decode_diff(&st, row_abs, &out);
-            let sum_same = out[32] == y[slot * rpe + r].to_bits();
-            let pass = fault.is_none() && in_band && decode_diff.is_none() && sum_same;
-            // Out of band: the worst row's first sub-block out of band.
-            let detail = if in_band {
-                String::new()
-            } else {
-                let worst = (0..y.len())
-                    .max_by(|&a, &b| (y[a] - want[a]).abs().total_cmp(&(y[b] - want[b]).abs()))
-                    .unwrap_or(0);
-                let (ws, wr) = (worst / rpe, worst % rpe);
-                let w_abs = SEL[ws] as usize * rpe + wr;
-                let wout = probe(c, &st, &act, w_abs, ws)?;
-                let denom = want.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                format!(
-                    " worst=slot {ws} row {wr} got {:e} want {:e}{}",
-                    y[worst],
-                    want[worst],
-                    first_sub_out(
-                        &st,
-                        w_abs,
-                        &xq[ws * k..(ws + 1) * k],
-                        &wout,
-                        f64::from(KERNEL_BAND * denom)
-                    )
-                )
-            };
-            ok &= pass;
-            println!(
-                "band[{}] rows={rpe} K={k} n_sb={} max_rel={rel:.3e} band={KERNEL_BAND:e} \
-                 fault=\"{}\" probe_decode_as_host={} probe_sum_is_launch={sum_same} {}{}{}",
-                st.tag,
-                st.n_sb(),
-                shown(fault),
-                decode_diff.is_none(),
-                verdict(pass),
-                decode_diff.map_or_else(String::new, |d| format!(" first_decode_diff={d}")),
-                detail,
-            );
+            ok &= band_case(c, "band", &st, &SEL, 7001 + i as u32)?;
         }
         Ok(ok)
+    }
+
+    /// One band case (clause 1's, clause 8's): the down `_sel` of `st` for
+    /// `sel` on columns from `xseed` against the f64 reference, the probe on a
+    /// row of slot 1, one line under `label`.
+    fn band_case(
+        c: &Ctx,
+        label: &str,
+        st: &Stack,
+        sel: &[u32],
+        xseed: u32,
+    ) -> Result<bool, GateError> {
+        let (rpe, k, n) = (st.rpe, st.k, sel.len());
+        let x = activations(k, n, xseed);
+        let act = quantize(c, &x, n, k)?;
+        let (y, fault) = down(c, st, &act, sel)?;
+        let xq = q8_1_dequant(&x, k, n);
+        let mut want = Vec::with_capacity(y.len());
+        for (s, &e) in sel.iter().enumerate() {
+            want.extend(ref_gemv(
+                st.ty,
+                &st.expert_bytes(e as usize),
+                k,
+                rpe,
+                &xq[s * k..(s + 1) * k],
+                1,
+            )?);
+        }
+        let rel = max_rel_err(&y, &want)?;
+        let in_band = rel <= KERNEL_BAND;
+        // The probe on a row off the block and warp boundaries, in slot 1.
+        let (slot, r) = (1usize, rpe / 2 + 3);
+        let row_abs = sel[slot] as usize * rpe + r;
+        let out = probe(c, st, &act, row_abs, slot)?;
+        let decode_diff = probe_decode_diff(st, row_abs, &out);
+        let sum_same = out[32] == y[slot * rpe + r].to_bits();
+        let pass = fault.is_none() && in_band && decode_diff.is_none() && sum_same;
+        // Out of band: the worst row's first sub-block out of band.
+        let detail = if in_band {
+            String::new()
+        } else {
+            let worst = (0..y.len())
+                .max_by(|&a, &b| (y[a] - want[a]).abs().total_cmp(&(y[b] - want[b]).abs()))
+                .unwrap_or(0);
+            let (ws, wr) = (worst / rpe, worst % rpe);
+            let w_abs = sel[ws] as usize * rpe + wr;
+            let wout = probe(c, st, &act, w_abs, ws)?;
+            let denom = want.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            format!(
+                " worst=slot {ws} row {wr} got {:e} want {:e}{}",
+                y[worst],
+                want[worst],
+                first_sub_out(
+                    st,
+                    w_abs,
+                    &xq[ws * k..(ws + 1) * k],
+                    &wout,
+                    f64::from(KERNEL_BAND * denom)
+                )
+            )
+        };
+        println!(
+            "{label}[{}] rows={rpe} K={k} n_sb={} max_rel={rel:.3e} band={KERNEL_BAND:e} \
+             fault=\"{}\" probe_decode_as_host={} probe_sum_is_launch={sum_same} {}{}{}",
+            st.tag,
+            st.n_sb(),
+            shown(fault),
+            decode_diff.is_none(),
+            verdict(pass),
+            decode_diff.map_or_else(String::new, |d| format!(" first_decode_diff={d}")),
+            detail,
+        );
+        Ok(pass)
     }
 
     /// Clause 2 (module doc).
@@ -1011,12 +1201,17 @@ mod gate {
 
     /// Clause 4 (module doc).
     fn check_fault(c: &Ctx) -> Result<bool, GateError> {
+        fault_cases(c, GgmlType::Q5_K, "fault")
+    }
+
+    /// Clause 4's cases on the entries of `ty`, each line under `label`.
+    fn fault_cases(c: &Ctx, ty: GgmlType, label: &str) -> Result<bool, GateError> {
         const CLEAN: [u32; 4] = [1, 3, 0, 2];
         let past = E as u32 + 3;
         let (rpe, k) = (256, 2304);
-        let st = Stack::new(c, "down", GgmlType::Q5_K, rpe, k, 0xfa17_0001)?;
-        let g = Stack::new(c, "gate", GgmlType::Q5_K, rpe, k, 0xfa17_0002)?;
-        let u = Stack::new(c, "up", GgmlType::Q5_K, rpe, k, 0xfa17_0003)?;
+        let st = Stack::new(c, "down", ty, rpe, k, 0xfa17_0001)?;
+        let g = Stack::new(c, "gate", ty, rpe, k, 0xfa17_0002)?;
+        let u = Stack::new(c, "up", ty, rpe, k, 0xfa17_0003)?;
         let x = activations(k, 4, 7401);
         let act = quantize(c, &x, 4, k)?;
         let act1 = quantize(c, &x, 1, k)?;
@@ -1047,7 +1242,7 @@ mod gate {
             let pass = values_ok && fault == want_fault;
             ok &= pass;
             println!(
-                "fault[{entry}:{case}] sel={sel:?} fault=\"{}\" want=\"{}\" slot1_{}_others_clean={values_ok} {}{}",
+                "{label}[{entry}:{case}] sel={sel:?} fault=\"{}\" want=\"{}\" slot1_{}_others_clean={values_ok} {}{}",
                 shown(fault),
                 shown(want_fault),
                 if fill.is_nan() { "nan" } else { "untouched" },
@@ -1068,7 +1263,7 @@ mod gate {
         let pass = qf == quant_column && fd.is_none() && slot2_nan && others;
         ok &= pass;
         println!(
-            "fault[down:nan_column] quantizer_fault=\"{}\" want=\"{}\" down_fault=\"{}\" \
+            "{label}[down:nan_column] quantizer_fault=\"{}\" want=\"{}\" down_fault=\"{}\" \
              column2_slot_all_nan={slot2_nan} other_slots_clean={others} {}",
             shown(qf),
             shown(quant_column),
@@ -1093,7 +1288,7 @@ mod gate {
         let pass = qf == quant_column && fg.is_none() && fc.is_none() && all_nan;
         ok &= pass;
         println!(
-            "fault[gate_up:nan_column] quantizer_fault=\"{}\" want=\"{}\" gate_up_faults=\"{}\",\"{}\" \
+            "{label}[gate_up:nan_column] quantizer_fault=\"{}\" want=\"{}\" gate_up_faults=\"{}\",\"{}\" \
              every_row_nan_both_rules={all_nan} {}",
             shown(qf),
             shown(quant_column),
@@ -1106,11 +1301,16 @@ mod gate {
 
     /// Clause 5 (module doc).
     fn check_act(c: &Ctx) -> Result<bool, GateError> {
+        act_cases(c, GgmlType::Q5_K, "act")
+    }
+
+    /// Clause 5's cases on the entries of `ty`, each line under `label`.
+    fn act_cases(c: &Ctx, ty: GgmlType, label: &str) -> Result<bool, GateError> {
         const SEL: [u32; 4] = [3, 0, 2, 1];
         let stream = c.gpu.stream();
         let (rpe, k) = (512, 2048);
-        let g = Stack::new(c, "gate", GgmlType::Q5_K, rpe, k, 0xac70_0001)?;
-        let u = Stack::new(c, "up", GgmlType::Q5_K, rpe, k, 0xac70_0002)?;
+        let g = Stack::new(c, "gate", ty, rpe, k, 0xac70_0001)?;
+        let u = Stack::new(c, "up", ty, rpe, k, 0xac70_0002)?;
         let x = activations(k, 1, 7501);
         let act1 = quantize(c, &x, 1, k)?;
         // The down `_sel` of the same rows: every slot on the token's column.
@@ -1139,11 +1339,8 @@ mod gate {
             let (want, clamped) = match rule {
                 Act::SiluMul => (want_silu.clone(), 0),
                 Act::SwigluClamp { limit } => {
-                    let want: Vec<f32> = gs
-                        .iter()
-                        .zip(&us)
-                        .map(|(&g, &u)| act::swiglu_clamp(g, u, limit))
-                        .collect();
+                    let mut want = vec![0.0f32; n];
+                    qdot::swiglu_clamp(&gs, &us, limit, &mut want);
                     let clamped = gs
                         .iter()
                         .zip(&us)
@@ -1158,7 +1355,7 @@ mod gate {
             let pass = same && spread && f.is_none();
             ok &= pass;
             println!(
-                "act[{name}] rows={n} rule_on_down_sums_bit_identical={same} clamped_rows={clamped} \
+                "{label}[{name}] rows={n} rule_on_down_sums_bit_identical={same} clamped_rows={clamped} \
                  fault=\"{}\" {}{}",
                 shown(f),
                 verdict(pass),
@@ -1571,6 +1768,111 @@ mod gate {
             };
             println!(
                 "q5_1_host[{case}] want=Err(Shape {what}) got={seen} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        stream.synchronize()?;
+        Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
+    /// Clause 8 (module doc).
+    fn check_q8_0(c: &Ctx) -> Result<bool, GateError> {
+        // (tag, experts, rows an expert, K); one expert is the non-routed form.
+        const SHAPES: [(&str, usize, usize, usize); 8] = [
+            ("k256", E, 512, 256),
+            ("k768", E, 512, 768),
+            ("k1280", E, 512, 1280),
+            ("k2304", E, 512, 2304),
+            ("shexp_gate_up_2048x4096", 1, 2048, 4096),
+            ("shexp_down_4096x2048", 1, 4096, 2048),
+            ("dense_gate_up_12288x4096", 1, 12288, 4096),
+            ("dense_down_4096x12288", 1, 4096, 12288),
+        ];
+        const SEL: [u32; 4] = [3, 0, 2, 1];
+        let mut ok = true;
+        for (i, &(tag, experts, rpe, k)) in SHAPES.iter().enumerate() {
+            let st = Stack::with_experts(
+                c,
+                tag,
+                GgmlType::Q8_0,
+                experts,
+                rpe,
+                k,
+                0x8a00_0001 + i as u64,
+            )?;
+            let sel = if experts == 1 { [0; 4] } else { SEL };
+            ok &= band_case(c, "q8_0_band", &st, &sel, 7701 + i as u32)?;
+        }
+        ok &= act_cases(c, GgmlType::Q8_0, "q8_0_act")?;
+        ok &= fault_cases(c, GgmlType::Q8_0, "q8_0_fault")?;
+        ok &= check_q8_0_host(c)?;
+        Ok(ok)
+    }
+
+    /// Clause 8's refusals: each launcher refuses a stack of the other
+    /// format's row width, a `Shape` error of its own.
+    fn check_q8_0_host(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let (rpe, k) = (64, 512);
+        let q5 = Stack::new(c, "q5k", GgmlType::Q5_K, rpe, k, 0x8a0f_0001)?;
+        let q8 = Stack::new(c, "q8_0", GgmlType::Q8_0, rpe, k, 0x8a0f_0002)?;
+        let act2 = quantize(c, &activations(k, 2, 7801), 2, k)?;
+        let sel = DeviceBuffer::from_host(stream, &[0u32; 2])?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; 2 * rpe])?;
+        let sink = c.gpu.unlabelled_sink();
+        let (down_q5, down_q8) = (
+            SelDown {
+                w: &q5.w,
+                act: &act2,
+                sel: &sel,
+                n_slots: 2,
+                rows_per_expert: rpe,
+            },
+            SelDown {
+                w: &q8.w,
+                act: &act2,
+                sel: &sel,
+                n_slots: 2,
+                rows_per_expert: rpe,
+            },
+        );
+        let gate_up_q5 = GateUpAct {
+            wg: &q5.w,
+            wu: &q5.w,
+            act: &act2,
+            sel: &sel,
+            n_slots: 2,
+            rows_per_expert: rpe,
+            slots_per_col: 1,
+            rule: Act::SwigluClamp { limit: 10.0 },
+        };
+        let cases: [(&str, &str, Result<(), GpuError>); 3] = [
+            (
+                "enqueue_gemv_q8_0_sel",
+                "q5k_rows",
+                c.kq.enqueue_gemv_q8_0_sel(stream, &down_q5, sink, &mut y),
+            ),
+            (
+                "enqueue_gate_up_q8_0",
+                "q5k_rows",
+                c.kq.enqueue_gate_up_q8_0(stream, &gate_up_q5, sink, &mut y),
+            ),
+            (
+                "enqueue_gemv_q5k_sel",
+                "q8_0_rows",
+                c.kq.enqueue_gemv_q5k_sel(stream, &down_q8, sink, &mut y),
+            ),
+        ];
+        let mut ok = true;
+        for (what, case, r) in cases {
+            let pass = matches!(&r, Err(GpuError::Shape { what: w, .. }) if *w == what);
+            let seen = match &r {
+                Ok(()) => "Ok (accepted)".to_string(),
+                Err(e) => format!("Err: {e}"),
+            };
+            println!(
+                "q8_0_host[{what}:{case}] want=Err(Shape {what}) got={seen} {}",
                 verdict(pass)
             );
             ok &= pass;

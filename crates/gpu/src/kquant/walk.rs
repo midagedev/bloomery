@@ -1,4 +1,5 @@
-//! Walk A: the row walk the K-quants with a 4-bit plane share (Q4_K, Q5_K).
+//! Walk A: the row walk the K-quants with a 4-bit plane share (Q4_K, Q5_K),
+//! and Q8_0 read eight blocks to a super-block.
 //!
 //! A row is `n_sb` super-blocks of `D::WORDS` u32 words. Lane `lane` of the
 //! row's warp owns sub-block `s = lane & 7` of super-block `4·it + (lane >>

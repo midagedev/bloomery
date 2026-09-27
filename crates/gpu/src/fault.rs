@@ -102,10 +102,14 @@ pub enum FaultSite {
     /// A linear-attention delta step (`linear::delta`) read a lane word at
     /// or past the state's lanes.
     DeltaLane = 15,
+    /// A cache append (`latent`) stored a value that is not finite: a
+    /// non-finite input, a norm whose mean square or variance is not
+    /// finite, or a value past f16's range.
+    CacheValue = 16,
 }
 
 // A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::DeltaLane as u32) < 32);
+const _: () = assert!((FaultSite::CacheValue as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -125,6 +129,7 @@ impl FaultSite {
         FaultSite::LinearDelta,
         FaultSite::LinearGate,
         FaultSite::DeltaLane,
+        FaultSite::CacheValue,
     ];
 
     /// The site's name as an error prints it.
@@ -146,6 +151,7 @@ impl FaultSite {
             FaultSite::LinearDelta => "linear_delta",
             FaultSite::LinearGate => "linear_gate",
             FaultSite::DeltaLane => "delta_lane",
+            FaultSite::CacheValue => "cache_value",
         }
     }
 
@@ -175,6 +181,10 @@ impl FaultSite {
             }
             FaultSite::LinearGate => "a non-finite gated-norm input or mean square",
             FaultSite::DeltaLane => "a delta-step lane word at or past the state's lanes",
+            FaultSite::CacheValue => {
+                "a cache row value not finite: a non-finite input, a non-finite mean square or \
+                 variance, or a value past f16's range"
+            }
         }
     }
 }
@@ -190,8 +200,8 @@ impl FaultSite {
 pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
-        AttnCount, AttnSel, CachePos, DeltaLane, ExpertId, HcQuant, KeyCount, LinearConv,
-        LinearDelta, LinearGate, NormQuant, Q5Quant, QuantColumn, Router, TokenId,
+        AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, ExpertId, HcQuant, KeyCount,
+        LinearConv, LinearDelta, LinearGate, NormQuant, Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -215,6 +225,7 @@ pub mod step_order {
         LinearDelta,
         LinearGate,
         DeltaLane,
+        CacheValue,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -236,6 +247,7 @@ pub mod step_order {
         LinearDelta,
         LinearGate,
         DeltaLane,
+        CacheValue,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -258,6 +270,7 @@ pub mod step_order {
         LinearDelta,
         LinearGate,
         DeltaLane,
+        CacheValue,
     ];
 
     /// Qwen3.6-35B-A3B (`arch::qwen3moe`'s second body): the two layer

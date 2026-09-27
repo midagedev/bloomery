@@ -98,6 +98,11 @@ gate-gpu-q4k-sel:
 gate-gpu-kquant:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
 
+# GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
+# 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
+gate-gpu-glm-router:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm5next_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_router'
+
 # IQ2_XS·IQ3_XXS·IQ4_XS·Q2_K 행 코어(bloomery_gpu::iq): ref-synth 합성 행(gate-1-1이 덤프)을 q8_1 8열과 곱해 호스트 규칙과
 # 비트 동일한지, ggml 디퀀트 × f32 기준 대비 유도 한계와 핀 안인지 본다. K = 4096과 꼬리가 남는 K = 2304 두 형상.
 gate-gpu-iq:
@@ -570,6 +575,12 @@ gate-gpu-linear:
 # ik 배치 세트의 층 3 탭 넷과 비교한다.
 gate-gpu-qwen35moe-attn:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_attn'
+
+# GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
+# 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.
+# 추가는 캐시 비트, 어텐션은 오차 모형에서 끌어낸 밴드, 싱크 −∞는 분할 부분합의 무싱크 접기와 비트로 본다.
+gate-gpu-glm-mla:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_mla'
 
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'

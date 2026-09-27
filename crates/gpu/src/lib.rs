@@ -44,6 +44,7 @@ pub mod host;
 pub mod hybrid;
 pub mod iq;
 pub mod kquant;
+pub mod latent;
 pub mod linear;
 pub mod model;
 pub mod moe_fused;
