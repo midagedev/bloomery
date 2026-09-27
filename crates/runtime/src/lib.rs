@@ -16,6 +16,7 @@
 //! stores a layer keeps and how later positions read them.
 
 pub mod combine;
+pub mod hc_gated;
 mod lookup;
 pub mod qsa;
 pub mod sched;
