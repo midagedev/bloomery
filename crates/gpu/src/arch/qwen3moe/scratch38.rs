@@ -331,6 +331,51 @@ impl Arena38 {
     }
 }
 
+/// A gate's per-layer taps of the decode step: each layer's streams after
+/// its combine (`STREAMS · HIDDEN`), and its router's logits and slot ids as
+/// the step's arena holds them (its first `EXPERTS` logits and `N_USED` ids
+/// are the step's row). Allocated when armed, never on the step's path
+/// otherwise; a pass writes none.
+pub(super) struct Taps38 {
+    pub(super) out: Vec<DeviceBuffer<f32>>,
+    pub(super) logits: Vec<DeviceBuffer<f32>>,
+    pub(super) ids: Vec<DeviceBuffer<u32>>,
+}
+
+impl Taps38 {
+    /// Zeroed taps for `layers` layers, the route taps as wide as `route`'s
+    /// buffers.
+    pub(super) fn new(
+        stream: &CudaStream,
+        layers: usize,
+        route: &RouterOut,
+    ) -> Result<Taps38, GpuError> {
+        let each = |n: usize| {
+            (0..layers)
+                .map(|_| DeviceBuffer::zeroed(stream, n))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(Taps38 {
+            out: each(geo::STREAMS * geo::HIDDEN)?,
+            logits: each(route.logits.len())?,
+            ids: (0..layers)
+                .map(|_| DeviceBuffer::zeroed(stream, route.ids.len()))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.out.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+            + self
+                .logits
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self.ids.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+    }
+}
+
 /// An eager pass's input record — its first position, up to [`PASS_ROWS`]
 /// ids and the lane word — and the windows a pass of `m` rows reads.
 pub(super) struct PassRecord {

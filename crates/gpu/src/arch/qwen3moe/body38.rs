@@ -31,7 +31,7 @@
 use super::plan38::{self, GDN, Kind38, Layer38, beta_alpha, geo, router};
 use super::program38::{Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, step_launches};
 use super::scratch::{LANE, RopeRows, StepParams, f32_view};
-use super::scratch38::{Arena38, PASS_ROWS, PassRecord, Store38, dims, store_rule_bytes};
+use super::scratch38::{Arena38, PASS_ROWS, PassRecord, Store38, Taps38, dims, store_rule_bytes};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
@@ -76,6 +76,9 @@ pub enum Prompt38 {
 }
 
 impl Prompt38 {
+    /// Positions an eager pass takes at most.
+    pub const PASS_ROWS: usize = PASS_ROWS;
+
     /// The path a command line names: `step` or `pass`. The ubatch GEMM
     /// paths (`gemm`, `auto`) are refused by name with what they lack here,
     /// as is anything else.
@@ -237,6 +240,45 @@ impl PleHost {
     }
 }
 
+/// A layer's store read back ([`Body38::stores_host`]): a delta layer's
+/// state and conv ring, or a selecting layer's K/V planes (f16 bits) and its
+/// raw and pooled indexer keys.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Store38Host {
+    Rec {
+        state: Vec<f32>,
+        ring: Vec<f32>,
+    },
+    Qsa {
+        k: Vec<u16>,
+        v: Vec<u16>,
+        raw: Vec<u16>,
+        pooled: Vec<u16>,
+    },
+}
+
+impl Store38Host {
+    /// Bit equality: the f32 values by their bits, so a NaN equals itself
+    /// and `-0.0` differs from `0.0`.
+    #[must_use]
+    pub fn same_bits(&self, other: &Store38Host) -> bool {
+        let bits = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        };
+        match (self, other) {
+            (
+                Store38Host::Rec { state: s, ring: r },
+                Store38Host::Rec {
+                    state: s2,
+                    ring: r2,
+                },
+            ) => bits(s, s2) && bits(r, r2),
+            (Store38Host::Qsa { .. }, Store38Host::Qsa { .. }) => self == other,
+            _ => false,
+        }
+    }
+}
+
 /// One step's host values: its token and position.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeInput38 {
@@ -263,8 +305,8 @@ pub struct Body38 {
     k: Kernels38,
     /// The slot map's card copy: every place the host's.
     slots: DeviceTensor<u32>,
-    /// Each layer's streams after it, when a gate armed them.
-    taps: Option<Vec<DeviceBuffer<f32>>>,
+    /// Each layer's streams after it and its route, when a gate armed them.
+    taps: Option<Taps38>,
     eps: f32,
     vocab: usize,
     ctx: usize,
@@ -515,18 +557,13 @@ impl Body38 {
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the step copies
-    /// its streams into the layer's tap, which [`Body38::taps`] reads back.
+    /// its streams into the layer's tap, which [`Body38::taps`] reads back,
+    /// and after each router its logits and ids ([`Body38::route_taps`]).
     /// For an eager step: a capture taken while they are armed records the
     /// copies. Load-time allocation.
     pub fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
         self.taps = if on {
-            let n = geo::STREAMS * geo::HIDDEN;
-            Some(
-                self.plans
-                    .iter()
-                    .map(|_| DeviceBuffer::zeroed(gpu.stream(), n))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            Some(Taps38::new(gpu.stream(), self.plans.len(), &self.s.route)?)
         } else {
             None
         };
@@ -541,11 +578,63 @@ impl Body38 {
             .taps
             .as_ref()
             .ok_or(GpuError::state(WHAT, "armed taps (Body38::set_taps)"))?;
-        let mut out = Vec::with_capacity(taps.len() * geo::STREAMS * geo::HIDDEN);
-        for t in taps {
+        let mut out = Vec::with_capacity(taps.out.len() * geo::STREAMS * geo::HIDDEN);
+        for t in &taps.out {
             out.extend(t.to_host_vec(gpu.stream())?);
         }
         Ok(out)
+    }
+
+    /// Every layer's router after the last step: its [`geo::EXPERTS`]
+    /// logits and its [`geo::N_USED`] routed ids, in slot order. Blocking;
+    /// refused when the taps are not armed.
+    pub fn route_taps(&self, gpu: &Gpu) -> Result<Vec<(Vec<f32>, Vec<u32>)>, GpuError> {
+        let taps = self
+            .taps
+            .as_ref()
+            .ok_or(GpuError::state(WHAT, "armed taps (Body38::set_taps)"))?;
+        taps.logits
+            .iter()
+            .zip(&taps.ids)
+            .map(|(lg, id)| {
+                let (mut lg, mut id) =
+                    (lg.to_host_vec(gpu.stream())?, id.to_host_vec(gpu.stream())?);
+                if lg.len() < geo::EXPERTS || id.len() < geo::N_USED {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("route taps of {} logits and {} ids", lg.len(), id.len()),
+                    ));
+                }
+                lg.truncate(geo::EXPERTS);
+                id.truncate(geo::N_USED);
+                Ok((lg, id))
+            })
+            .collect()
+    }
+
+    /// Every layer's store and the PLE ring, read back: what a run leaves
+    /// behind, for a gate to compare bit for bit. Blocking.
+    pub fn stores_host(&self, gpu: &Gpu) -> Result<(Vec<Store38Host>, Vec<f32>), GpuError> {
+        let stream = gpu.stream();
+        let stores = self
+            .stores
+            .iter()
+            .map(|s| {
+                Ok(match s {
+                    Store38::Rec(r) => Store38Host::Rec {
+                        state: r.state.to_host_vec(stream)?,
+                        ring: r.ring.to_host_vec(stream)?,
+                    },
+                    Store38::Qsa { kv, raw, pooled } => Store38Host::Qsa {
+                        k: kv.k.to_host_vec(stream)?,
+                        v: kv.v.to_host_vec(stream)?,
+                        raw: raw.to_host_vec(stream)?,
+                        pooled: pooled.to_host_vec(stream)?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        Ok((stores, self.ple_ring.to_host_vec(stream)?))
     }
 
     /// The step's position `pos` is the next one and inside the stores, else
@@ -743,7 +832,7 @@ impl ChainBody for Body38 {
                 io: &io,
                 m: 1,
                 cur: 0,
-                taps: taps.as_deref_mut(),
+                taps: taps.as_mut(),
                 slots,
             },
             head,
@@ -805,10 +894,7 @@ impl ChainBody for Body38 {
             + self.pass_hsum.num_bytes()
             + self.slots.buf().num_bytes()
             + self.hybrid.boundary().device_bytes()
-            + self
-                .taps
-                .as_ref()
-                .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
+            + self.taps.as_ref().map_or(0, Taps38::bytes)
     }
 
     fn layers(&self) -> Range<usize> {

@@ -32,7 +32,7 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::proj::ProjKernels;
 use super::router::gated;
 use super::scratch::{Io, f32_view};
-use super::scratch38::{Arena38, Store38};
+use super::scratch38::{Arena38, Store38, Taps38};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
 use crate::hc_gated::{Before, HcGatedKernels, HcScratch, MixArgs, SiteWeights};
@@ -259,7 +259,7 @@ pub(super) struct Parts38<'a> {
     pub(super) io: &'a Io<'a>,
     pub(super) m: usize,
     pub(super) cur: usize,
-    pub(super) taps: Option<&'a mut [DeviceBuffer<f32>]>,
+    pub(super) taps: Option<&'a mut Taps38>,
     pub(super) slots: &'a DeviceTensor<u32>,
 }
 
@@ -272,13 +272,14 @@ fn plan_of(plans: &[Layer38], l: usize) -> Result<&Layer38, GpuError> {
 
 /// The streams `res` into layer `l`'s tap, when a gate armed the taps.
 fn tap(
-    taps: &mut Option<&mut [DeviceBuffer<f32>]>,
+    taps: &mut Option<&mut Taps38>,
     res: &DeviceBuffer<f32>,
     l: usize,
     gpu: &Gpu,
 ) -> Result<(), GpuError> {
     if let Some(t) = taps.as_deref_mut() {
         let tap = t
+            .out
             .get_mut(l)
             .ok_or(GpuError::state(WHAT, "a tap for every layer"))?;
         tap.copy_from_device_async(res, gpu.stream())?;
@@ -438,20 +439,34 @@ impl Parts38<'_> {
     }
 
     /// Layer `l`'s router over `x` (`None`: the arena's `ffn_x`): the routed
-    /// slots, then the shared expert's with the sigmoid of its gate.
+    /// slots, then the shared expert's with the sigmoid of its gate; its
+    /// logits and ids into layer `l`'s route taps when a gate armed them.
     fn route(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
         let sink = self.c.gpu.layer_sink(l)?;
+        let stream = self.c.gpu.stream();
         let s = &mut *self.s;
         let x = x.unwrap_or(&s.ffn_x);
         self.c.k.router.enqueue_fused(
-            self.c.gpu.stream(),
+            stream,
             f32_tensor(self.c.w, &p.ffn.router)?,
             x,
             self.m,
             sink,
             &mut s.route,
-        )
+        )?;
+        if let Some(t) = self.taps.as_deref_mut() {
+            let missing = || GpuError::state(WHAT, "a route tap for every layer");
+            t.logits
+                .get_mut(l)
+                .ok_or_else(missing)?
+                .copy_from_device_async(&s.route.logits, stream)?;
+            t.ids
+                .get_mut(l)
+                .ok_or_else(missing)?
+                .copy_from_device_async(&s.route.ids, stream)?;
+        }
+        Ok(())
     }
 
     /// Layer `l`'s shared expert over `x` (`None`: the arena's `ffn_x`) into
