@@ -16,9 +16,9 @@ use std::collections::HashSet;
 use gguf::Split;
 use models::{
     Act, Arch, BlockDraft, Candidates, Collapse, Compress, Compressor, DraftSpec, Extra, Ffn,
-    HcMix, HcSpec, IndexKeys, Latent, LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec, Moe,
-    ReasoningFormat, Residual, Rope, RopeMode, Router, Score, Selector, Shared, Source, ToolFormat,
-    Yarn,
+    HcKind, HcMix, HcSpec, IndexKeys, Latent, LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec,
+    Moe, NgramRule, ReasoningFormat, Residual, Rope, RopeMode, Router, Score, Selector, Shared,
+    Source, ToolFormat, Yarn,
 };
 
 use super::hparams::{
@@ -84,16 +84,19 @@ pub fn spec_of(
         mtp: Vec::new(),
         hc: Some(HcSpec {
             streams: spec_u32("hyper_connection.count", hp.hc.streams)?,
-            sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn_iters)?,
-            eps: hp.hc.eps,
-            mix,
-            collapse,
+            kind: HcKind::Mhc {
+                sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn_iters)?,
+                eps: hp.hc.eps,
+                mix,
+                collapse,
+            },
         }),
         engram: match &hp.engram {
             Some(e) => Some(models::EngramSpec {
                 heads: spec_u32("engram.head_count", e.n_head)?,
                 max_ngram: spec_u32("engram.max_ngram_size", e.max_ngram)?,
                 key_length: spec_u32("engram.key_length", e.key_length)?,
+                rule: NgramRule::Engram,
             }),
             None => None,
         },
@@ -355,10 +358,12 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
         rms_eps: hp.rms_eps,
         hc: HcSpec {
             streams: spec_u32("hyper_connection.count", hp.hc.streams)?,
-            sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn_iters)?,
-            eps: hp.hc.eps,
-            mix: HcMix::Lagged,
-            collapse: Collapse::LastMix,
+            kind: HcKind::Mhc {
+                sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn_iters)?,
+                eps: hp.hc.eps,
+                mix: HcMix::Lagged,
+                collapse: Collapse::LastMix,
+            },
         },
         layers,
         width: spec_u32("block_size", hp.block_size)?,

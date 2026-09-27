@@ -33,6 +33,34 @@ fn act(a: &Act) -> String {
     }
 }
 
+/// A layer's position selector, appended to its mixer's part of the line.
+fn select(o: &mut String, select: Option<&Selector>) {
+    match select {
+        Some(Selector::StreamTopK {
+            heads,
+            d,
+            k,
+            keys,
+            list,
+            candidates,
+        }) => {
+            let _ = write!(
+                o,
+                " | sel {heads}x{d} k{k} keys {} list {} cand {candidates:?}",
+                src(keys, |k| match k {
+                    IndexKeys::FromRows => String::new(),
+                    IndexKeys::Compressor(c) => format!("{{icmp {c:?}}}"),
+                }),
+                src(list, |()| String::new())
+            );
+        }
+        Some(t @ Selector::TokenPool { .. }) => {
+            let _ = write!(o, " | {t:?}");
+        }
+        None => {}
+    }
+}
+
 /// One layer as one line.
 pub fn layer_line(layer: &LayerSpec) -> String {
     let mut o = String::new();
@@ -48,6 +76,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                 g.qk_norm,
                 g.out_gate
             );
+            select(&mut o, g.select.as_ref());
         }
         Mixer::Latent(a) => {
             let _ = write!(
@@ -75,30 +104,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
                     ))
                 );
             }
-            match &a.select {
-                Some(Selector::StreamTopK {
-                    heads,
-                    d,
-                    k,
-                    keys,
-                    list,
-                    candidates,
-                }) => {
-                    let _ = write!(
-                        o,
-                        " | sel {heads}x{d} k{k} keys {} list {} cand {candidates:?}",
-                        src(keys, |k| match k {
-                            IndexKeys::FromRows => String::new(),
-                            IndexKeys::Compressor(c) => format!("{{icmp {c:?}}}"),
-                        }),
-                        src(list, |()| String::new())
-                    );
-                }
-                Some(t @ Selector::TokenPool { .. }) => {
-                    let _ = write!(o, " | {t:?}");
-                }
-                None => {}
-            }
+            select(&mut o, a.select.as_ref());
         }
         Mixer::DeltaRule(r) => {
             let _ = write!(

@@ -65,6 +65,7 @@ pub fn spec_of(
                     qk_norm: has.contains(names::attn_q_norm(l).as_str())
                         && has.contains(names::attn_k_norm(l).as_str()),
                     out_gate: false,
+                    select: None,
                 }),
                 ffn: Ffn::Moe(Moe {
                     experts: spec_u32("expert_count", e.n_expert)?,

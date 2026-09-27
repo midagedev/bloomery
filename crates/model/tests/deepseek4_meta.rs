@@ -517,12 +517,14 @@ mod spec_fail_first;
 
 // PIN(2026-09-27): the V4-Flash file's description as `arch::deepseek41::spec` reads it, line by
 // line — docs/research/modelspec-design.md §3 and the pins above are what these were checked against.
+// PIN(2026-09-27): the `hc` line re-pinned when `HcSpec` gained its kind (mHC or gated-residual);
+// the values are the same.
 const V4_VIEW: &[&str] = &[
     "arch Deepseek4",
     "hidden 4096 vocab 129280 ctx_train 1048576",
     "rms_eps bits 0x358637bd",
     "layers 43 mtp 0",
-    "hc Some(HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Head })",
+    "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Head } })",
     "engram None",
     "chat pre joyai-llm template bytes 13772 tools Some(Dsml) reasoning Some(ThinkSpan)",
     "[0-1] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias false norm true x1.5 hash true shared 2048 swiglu Some(10.0) gate false || hc",

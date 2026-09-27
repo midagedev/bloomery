@@ -33,7 +33,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
     match arch {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(Program::Deepseek41Chain),
         Arch::Qwen3Moe | Arch::Qwen35Moe => Some(Program::Qwen3moeBody),
-        Arch::Glm5Next => None,
+        Arch::Glm5Next | Arch::Qwen4Exp => None,
     }
 }
 

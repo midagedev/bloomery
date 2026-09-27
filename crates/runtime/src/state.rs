@@ -125,8 +125,8 @@ pub fn every_position(layer: &LayerSpec) -> bool {
 mod tests {
     use super::*;
     use models::{
-        Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, Gqa, KHeadMap, Latent,
-        LatentOut, LatentUp, Moe, Residual, Rope, RopeMode, Router, Score,
+        Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
+        Latent, LatentOut, LatentUp, Moe, Residual, Rope, RopeMode, Router, Score,
     };
 
     fn moe() -> Ffn {
@@ -275,11 +275,13 @@ mod tests {
                         ),
                         qk_norm: true,
                         out_gate: true,
+                        select: None,
                     })
                 } else {
                     Mixer::DeltaRule(DeltaRule {
                         kind: DeltaKind::Gdn {
                             khead_map: KHeadMap::Tiled,
+                            gate: GdnGate::Silu,
                         },
                         k_heads: 16,
                         v_heads: 32,

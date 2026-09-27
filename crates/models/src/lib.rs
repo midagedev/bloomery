@@ -40,7 +40,8 @@ pub struct ModelSpec {
     pub mtp: Vec<LayerSpec>,
     /// The hyper-connections; `None`: no layer is [`Residual::Hc`].
     pub hc: Option<HcSpec>,
-    /// The engram dimensions; `None`: no layer carries [`Extra::Engram`].
+    /// The n-gram embedding dimensions; `None`: no layer carries an
+    /// [`Extra::Engram`] or [`Extra::Ple`] site.
     pub engram: Option<EngramSpec>,
     pub chat: ChatSpec,
 }
@@ -52,6 +53,7 @@ pub enum Arch {
     Deepseek4,
     Qwen3Moe,
     Qwen35Moe,
+    Qwen4Exp,
     Glm5Next,
 }
 
@@ -64,6 +66,7 @@ impl Arch {
             Arch::Deepseek4 => "deepseek4",
             Arch::Qwen3Moe => "qwen3moe",
             Arch::Qwen35Moe => "qwen35moe",
+            Arch::Qwen4Exp => "qwen4exp",
             Arch::Glm5Next => "glm5next",
         }
     }
@@ -155,6 +158,8 @@ pub struct Gqa {
     pub qk_norm: bool,
     /// `attn_q` also writes a per-head gate; the output is multiplied by its sigmoid.
     pub out_gate: bool,
+    /// `None`: every position is attended.
+    pub select: Option<Selector>,
 }
 
 impl Gqa {
@@ -274,9 +279,21 @@ pub enum Selector {
         top_k: u32,
         /// Tokens per pooled key.
         pool: u32,
-        /// The key LayerNorm's epsilon.
-        key_eps: f32,
+        rule: PoolRule,
     },
+}
+
+/// How a token-pool selector makes a pool's key and scores it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PoolRule {
+    /// The pool's key a learned convex mix of its members' keys, a LayerNorm
+    /// with a gain and a bias (epsilon `key_eps`) on it, no rope, the heads'
+    /// scores weighed by a learned projection.
+    Learned { key_eps: f32 },
+    /// The pool's key the mean of its members' raw keys, an RMS gain norm on
+    /// it and on each query, both rotated by `rope` (the key at its pool's
+    /// first position), the heads' rectified scores summed.
+    Mean { rope: Rope },
 }
 
 /// Where a layer's index keys come from.
@@ -315,9 +332,16 @@ pub struct DeltaRule {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DeltaKind {
     /// A scalar decay per value head, one conv over q|k|v, the output gated by z.
-    Gdn { khead_map: KHeadMap },
+    Gdn { khead_map: KHeadMap, gate: GdnGate },
     /// A per-channel decay bounded below, a conv per q, k and v, the output gated.
     Kda { gate_lower_bound: f32 },
+}
+
+/// The activation of z that gates a GDN layer's normed output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnGate {
+    Silu,
+    Sigmoid,
 }
 
 /// Which key head a value head reads.
@@ -440,12 +464,31 @@ pub enum Residual {
 pub struct HcSpec {
     /// `hyper_connection.count`.
     pub streams: u32,
-    /// `hyper_connection.sinkhorn_iterations`.
-    pub sinkhorn: u32,
-    /// `hyper_connection.epsilon`: the floor on the mixes.
-    pub eps: f32,
-    pub mix: HcMix,
-    pub collapse: Collapse,
+    pub kind: HcKind,
+}
+
+/// How a sublayer reads the streams and writes its output back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HcKind {
+    /// Manifold-constrained: pre, post and comb mixes from one projection of
+    /// the streams, the comb made doubly stochastic by Sinkhorn rounds.
+    Mhc {
+        /// `hyper_connection.sinkhorn_iterations`.
+        sinkhorn: u32,
+        /// `hyper_connection.epsilon`: the floor on the mixes.
+        eps: f32,
+        mix: HcMix,
+        collapse: Collapse,
+    },
+    /// Gated-residual: the sublayer's input the mean of the normed streams,
+    /// each gated elementwise by a sigmoid through a `rank`-value bottleneck,
+    /// its output added to each stream by a scalar sigmoid gate; no mix
+    /// between streams. A trained head of the same form (`output_hc_*`)
+    /// collapses them.
+    Gated {
+        /// `hyper_connection.low_rank`.
+        rank: u32,
+    },
 }
 
 /// Which mix a sublayer folds its input by.
@@ -472,17 +515,45 @@ pub enum Collapse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Extra {
     Engram,
+    /// A per-layer n-gram embedding, before the layer's attention mix.
+    Ple,
 }
 
-/// The engram dimensions.
+/// The n-gram embedding dimensions: every site's rows are gathered by a hash
+/// of the token's last n-grams, `heads` rows per n-gram size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngramSpec {
-    /// `engram.head_count`.
+    /// `engram.head_count`, `ple.heads_per_ngram`: rows per n-gram size.
     pub heads: u32,
-    /// `engram.max_ngram_size`: n-grams of 2 to this many tokens.
+    /// `engram.max_ngram_size`, `ple.ngram_size`: n-grams of 2 to this many tokens.
     pub max_ngram: u32,
-    /// `engram.key_length`: values per gathered row.
+    /// `engram.key_length`, `embedding_length_per_layer_input`: values per gathered row.
     pub key_length: u32,
+    pub rule: NgramRule,
+}
+
+/// What a site hashes and what it does with the rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NgramRule {
+    /// Token ids through the file's token map, the window before the start
+    /// padded with the file's pad id; the gated value added to every stream.
+    Engram,
+    /// Raw token ids; an `eos` in the window, or a position before the start,
+    /// turns it and every older slot into `eos`. Each stream's gated value,
+    /// normed, goes through a causal depthwise conv of `conv` taps `dilation`
+    /// positions apart and a SiLU; the gated value and the conv's output are
+    /// both added to that stream.
+    Ple {
+        /// `ple.eos_token_id`.
+        eos: u32,
+        /// `ple.image_token_id`: the id an image position hashes as; `None`
+        /// when the file has none.
+        image: Option<u32>,
+        /// `ple.conv_kernel`.
+        conv: u32,
+        /// The n-gram size (the architecture's rule, no key).
+        dilation: u32,
+    },
 }
 
 /// What a chat front end needs of the model.

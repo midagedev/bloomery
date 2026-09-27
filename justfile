@@ -1169,6 +1169,11 @@ gate-deepseek4-meta:
 gate-glm5next-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
 
+# qwen4exp(Qwen3.8-Flash-Next) 헤더 게이트: qwen35moe 리더의 변형 행이 합성 헤더에서 이름으로 거절하는 것들, 그다음 파일의
+# 서술·역할별 텐서·커버리지 검사의 목록. 헤더만, 초 단위; 샤드 넷이 다 있어야 한다.
+gate-qwen4exp-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture'
+
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
 [group('solo')]

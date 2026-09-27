@@ -13,8 +13,9 @@
 
 use gguf::Split;
 use models::{
-    Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcMix, HcSpec, Latent, LatentOut, LatentUp,
-    LayerSpec, Mixer, ModelSpec, Moe, ReasoningFormat, Residual, Router, Score, Selector, Shared,
+    Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcMix, HcSpec, Latent, LatentOut,
+    LatentUp, LayerSpec, Mixer, ModelSpec, Moe, PoolRule, ReasoningFormat, Residual, Router, Score,
+    Selector, Shared,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -75,7 +76,9 @@ pub fn spec_of(
                     d: spec_u32("attention.indexer.key_length", hp.indexer.head_dim)?,
                     top_k: spec_u32("attention.indexer.top_k", hp.indexer.top_k)?,
                     pool: spec_u32("attention.indexer.kpool", hp.indexer.kpool)?,
-                    key_eps: hp.norm_eps,
+                    rule: PoolRule::Learned {
+                        key_eps: hp.norm_eps,
+                    },
                 }),
             }),
         };
@@ -145,10 +148,12 @@ pub fn spec_of(
         mtp,
         hc: Some(HcSpec {
             streams: spec_u32("hyper_connection.count", hp.hc.streams)?,
-            sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn)?,
-            eps: hp.hc.eps,
-            mix: HcMix::Own,
-            collapse: Collapse::Mean,
+            kind: HcKind::Mhc {
+                sinkhorn: spec_u32("hyper_connection.sinkhorn_iterations", hp.hc.sinkhorn)?,
+                eps: hp.hc.eps,
+                mix: HcMix::Own,
+                collapse: Collapse::Mean,
+            },
         }),
         engram: None,
         chat,

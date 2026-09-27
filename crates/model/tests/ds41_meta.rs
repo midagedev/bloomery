@@ -987,13 +987,15 @@ mod spec_fail_first;
 // PIN(2026-09-27): the served file's description as `arch::deepseek41::spec` reads it, line by line
 // (model-wide fields, then each run of layers that read alike) — docs/research/modelspec-design.md
 // §3 and §4 are the table these lines were checked against.
+// PIN(2026-09-27): the `hc` and `engram` lines re-pinned when `HcSpec` gained its kind (mHC or
+// gated-residual) and `EngramSpec` its rule (engram or PLE); the values are the same.
 const V41_VIEW: &[&str] = &[
     "arch Deepseek41",
     "hidden 5120 vocab 129280 ctx_train 1048576",
     "rms_eps bits 0x1e3ce508",
     "layers 40 mtp 0",
-    "hc Some(HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix })",
-    "engram Some(EngramSpec { heads: 8, max_ngram: 4, key_length: 256 })",
+    "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix } })",
+    "engram Some(EngramSpec { heads: 8, max_ngram: 4, key_length: 256, rule: Engram })",
     "chat pre joyai-llm template bytes 6945 tools Some(Dsml) reasoning Some(ThinkSpan)",
     "[0] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
     "[1] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc [Engram]",
@@ -1012,9 +1014,10 @@ const V41_VIEW: &[&str] = &[
 ];
 
 // PIN(2026-09-27): the DSpark draft's description (`spec::draft_of`), same form; §3's DraftSpec row.
+// PIN(2026-09-27): the `hc` line re-pinned when `HcSpec` gained its kind; the values are the same.
 const DSPARK_VIEW: &[&str] = &[
     "hidden 5120 vocab 129280 rms_eps bits 0x1e3ce508",
-    "hc HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix }",
+    "hc HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix } }",
     "width 5 target_layers [37, 38, 39] mask_token 128799 markov_rank 256",
     "[0-2] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 128/3 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
 ];

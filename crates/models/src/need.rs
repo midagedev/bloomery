@@ -9,8 +9,8 @@ use std::fmt;
 use gguf::GgmlType;
 
 use crate::{
-    Collapse, DeltaKind, Extra, Ffn, HcMix, IndexKeys, LatentUp, LayerIdx, Mixer, ModelSpec,
-    Residual, RopeMode, Score, Selector, Source,
+    Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, LatentUp,
+    LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector, Source,
 };
 
 /// A feature of a file the engine does not run yet: what it is, and the layer
@@ -57,10 +57,18 @@ pub enum Need {
     StreamIndex { heads: u32, d: u32 },
     /// Index keys pooled by the indexer's own compressor.
     IndexKeyCompressor,
-    /// A top-k over pooled keys of the raw positions.
+    /// A top-k over learned pools of the raw positions' keys.
     TokenPool { heads: u32, d: u32, pool: u32 },
     /// A LayerNorm with a gain and a bias on each index key.
     KeyLayerNorm,
+    /// A top-k over mean pools of the raw positions' keys, RMS-normed and
+    /// rotated (`rope` values) at the pool's first position, the heads summed.
+    MeanPool {
+        heads: u32,
+        d: u32,
+        pool: u32,
+        rope: u32,
+    },
     /// A delta-rule layer.
     DeltaRule {
         kind: DeltaKind,
@@ -85,14 +93,25 @@ pub enum Need {
     DenseFfn { ff: u32 },
     /// Hyper-connections of `streams` streams.
     Hc { streams: u32 },
+    /// Gated-residual hyper-connections of `streams` streams through a
+    /// `rank`-value bottleneck.
+    HcGated { streams: u32, rank: u32 },
     /// The trained hyper-connection head.
     HcHead,
+    /// The gated-residual hyper-connection head.
+    HcGatedHead { rank: u32 },
     /// A hyper-connection wiring other than the lagged mix with the last-mix collapse.
     HcWiring { mix: HcMix, collapse: Collapse },
     /// An engram site whose gate reads `row`-value rows.
     Engram { row: u32 },
     /// A model with no engram site, for a program that runs one.
     NoEngram,
+    /// A per-layer n-gram embedding site whose gate reads `row`-value rows,
+    /// with its conv of `conv` taps `dilation` apart.
+    Ple { row: u32, conv: u32, dilation: u32 },
+    /// A text prompt carrying the image token refused by name: the reference
+    /// hashes an image's positions as that id.
+    ImageToken(u32),
     /// Delta-rule and attention layers in one trunk.
     MixedTrunk,
     /// A recurrent state per sequence: the delta-rule layers' state and conv inputs.
@@ -151,6 +170,15 @@ impl fmt::Display for Need {
                 write!(f, "token-pool indexer: {heads} heads x {d}, pool {pool}")
             }
             Need::KeyLayerNorm => f.write_str("a LayerNorm with a bias on the index keys"),
+            Need::MeanPool {
+                heads,
+                d,
+                pool,
+                rope,
+            } => write!(
+                f,
+                "mean-pool indexer: {heads} heads x {d}, pool {pool}, RMS-normed keys roped ({rope} dims) at the pool start, heads summed"
+            ),
             Need::DeltaRule {
                 kind,
                 k_heads,
@@ -158,10 +186,16 @@ impl fmt::Display for Need {
                 d,
                 conv,
             } => match kind {
-                DeltaKind::Gdn { .. } => write!(
-                    f,
-                    "delta rule GDN: d {d}, {k_heads} k-heads and {v_heads} v-heads (tiled), conv {conv}"
-                ),
+                DeltaKind::Gdn { gate, .. } => {
+                    write!(
+                        f,
+                        "delta rule GDN: d {d}, {k_heads} k-heads and {v_heads} v-heads (tiled), conv {conv}"
+                    )?;
+                    match gate {
+                        GdnGate::Silu => Ok(()),
+                        GdnGate::Sigmoid => f.write_str(", sigmoid output gate"),
+                    }
+                }
                 DeltaKind::Kda { .. } => {
                     write!(f, "delta rule KDA: d {d}, {v_heads} heads, conv {conv}")
                 }
@@ -197,12 +231,32 @@ impl fmt::Display for Need {
             }
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
             Need::Hc { streams } => write!(f, "hyper-connections of {streams} streams"),
+            Need::HcGated { streams, rank } => write!(
+                f,
+                "gated-residual hyper-connections of {streams} streams, rank {rank}"
+            ),
             Need::HcHead => f.write_str("the hyper-connection head output_hc_*"),
+            Need::HcGatedHead { rank } => write!(
+                f,
+                "the gated-residual hyper-connection head output_hc_*, rank {rank}"
+            ),
             Need::HcWiring { mix, collapse } => {
                 write!(f, "hyper-connection mix {mix:?}, collapse {collapse:?}")
             }
             Need::Engram { row } => write!(f, "an engram gate of {row}-value rows"),
             Need::NoEngram => f.write_str("a model without engram sites"),
+            Need::Ple {
+                row,
+                conv,
+                dilation,
+            } => write!(
+                f,
+                "a PLE site: a gate of {row}-value rows, a conv of {conv} taps {dilation} apart"
+            ),
+            Need::ImageToken(t) => write!(
+                f,
+                "a text prompt carrying the image token {t} refused by name"
+            ),
             Need::MixedTrunk => {
                 f.write_str("a program that runs delta-rule and attention layers in one trunk")
             }
@@ -249,6 +303,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if g.out_gate {
                     at(Need::OutGate);
                 }
+                if let Some(s) = &g.select {
+                    select_needs(s, &mut at);
+                }
             }
             Mixer::Latent(a) => {
                 at(Need::Latent {
@@ -270,25 +327,8 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         at(Need::WholeStream);
                     }
                 }
-                match &a.select {
-                    Some(Selector::StreamTopK { heads, d, keys, .. }) => {
-                        at(Need::StreamIndex {
-                            heads: *heads,
-                            d: *d,
-                        });
-                        if matches!(keys, Source::Own(IndexKeys::Compressor(_))) {
-                            at(Need::IndexKeyCompressor);
-                        }
-                    }
-                    Some(Selector::TokenPool { heads, d, pool, .. }) => {
-                        at(Need::TokenPool {
-                            heads: *heads,
-                            d: *d,
-                            pool: *pool,
-                        });
-                        at(Need::KeyLayerNorm);
-                    }
-                    None => {}
+                if let Some(s) = &a.select {
+                    select_needs(s, &mut at);
                 }
             }
             Mixer::DeltaRule(r) => at(Need::DeltaRule {
@@ -323,12 +363,30 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         if layer.residual == Residual::Hc
             && let Some(hc) = spec.hc
         {
-            at(Need::Hc {
-                streams: hc.streams,
+            at(match hc.kind {
+                HcKind::Mhc { .. } => Need::Hc {
+                    streams: hc.streams,
+                },
+                HcKind::Gated { rank } => Need::HcGated {
+                    streams: hc.streams,
+                    rank,
+                },
             });
         }
         if layer.extras.contains(&Extra::Engram) {
             at(Need::Engram { row: spec.hidden });
+        }
+        if layer.extras.contains(&Extra::Ple)
+            && let Some(EngramSpec {
+                rule: NgramRule::Ple { conv, dilation, .. },
+                ..
+            }) = spec.engram
+        {
+            at(Need::Ple {
+                row: spec.hidden,
+                conv,
+                dilation,
+            });
         }
     }
     let mut model = |n: Need| out.push((n, None));
@@ -339,12 +397,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
     {
         model(Need::QueryHeadNorm);
     }
-    if let Some(hc) = spec.hc {
-        match (hc.mix, hc.collapse) {
+    match spec.hc.map(|hc| hc.kind) {
+        Some(HcKind::Mhc { mix, collapse, .. }) => match (mix, collapse) {
             (_, Collapse::Head) => model(Need::HcHead),
             (HcMix::Lagged, Collapse::LastMix) => {}
             (mix, collapse) => model(Need::HcWiring { mix, collapse }),
-        }
+        },
+        Some(HcKind::Gated { rank }) => model(Need::HcGatedHead { rank }),
+        None => {}
     }
     let delta = spec
         .layers
@@ -357,5 +417,55 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             model(Need::MixedTrunk);
         }
     }
+    if let Some(EngramSpec {
+        rule: NgramRule::Ple {
+            image: Some(token), ..
+        },
+        ..
+    }) = spec.engram
+    {
+        model(Need::ImageToken(token));
+    }
     out
+}
+
+/// What a layer's position selector needs, pushed through `at`.
+fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
+    match select {
+        Selector::StreamTopK { heads, d, keys, .. } => {
+            at(Need::StreamIndex {
+                heads: *heads,
+                d: *d,
+            });
+            if matches!(keys, Source::Own(IndexKeys::Compressor(_))) {
+                at(Need::IndexKeyCompressor);
+            }
+        }
+        Selector::TokenPool {
+            heads,
+            d,
+            pool,
+            rule: PoolRule::Learned { .. },
+            ..
+        } => {
+            at(Need::TokenPool {
+                heads: *heads,
+                d: *d,
+                pool: *pool,
+            });
+            at(Need::KeyLayerNorm);
+        }
+        Selector::TokenPool {
+            heads,
+            d,
+            pool,
+            rule: PoolRule::Mean { rope },
+            ..
+        } => at(Need::MeanPool {
+            heads: *heads,
+            d: *d,
+            pool: *pool,
+            rope: rope.dims,
+        }),
+    }
 }

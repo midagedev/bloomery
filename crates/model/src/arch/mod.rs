@@ -30,7 +30,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
     Ok(match split.architecture() {
         Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
-        Some("qwen35moe") => qwen35moe::spec::read(split)?,
+        Some("qwen35moe" | "qwen4exp") => qwen35moe::spec::read(split)?,
         Some("glm5next") => glm5next::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -73,6 +73,23 @@ pub fn deepseek41_model(split: &Split) -> Result<deepseek41::hparams::Model, Pla
             key: "general.architecture".to_string(),
             detail: format!(
                 "is {:?}; the deepseek41 module reads deepseek41 and {DEEPSEEK4}",
+                other.unwrap_or("<missing>")
+            ),
+        }),
+    }
+}
+
+/// Which of the [`qwen35moe`] module's variants `split` holds, by its
+/// `general.architecture`; any other string is an error naming it.
+pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, PlacementError> {
+    use qwen35moe::hparams::Variant;
+    match split.architecture() {
+        Some("qwen35moe") => Ok(Variant::Qwen35Moe),
+        Some("qwen4exp") => Ok(Variant::Qwen4Exp),
+        other => Err(PlacementError::Metadata {
+            key: "general.architecture".to_string(),
+            detail: format!(
+                "is {:?}; the qwen35moe module reads qwen35moe and qwen4exp",
                 other.unwrap_or("<missing>")
             ),
         }),
@@ -263,6 +280,8 @@ pub(crate) mod synthetic {
         I32s(Vec<i32>),
         /// An array of F32.
         F32s(Vec<f32>),
+        /// An array of U64, the type a converter writes a hash constant in.
+        U64s(Vec<u64>),
     }
 
     fn string(b: &mut Vec<u8>, x: &str) {
@@ -274,6 +293,19 @@ pub(crate) mod synthetic {
     /// keys `kv` under the `<arch>.` prefix, and one 1-value F32 tensor per
     /// name of `tensors`; written to a temp path named after `tag`.
     pub(crate) fn header(tag: &str, arch: &str, kv: &[(&str, V)], tensors: &[String]) -> PathBuf {
+        let shaped: Vec<(String, Vec<u64>)> =
+            tensors.iter().map(|n| (n.clone(), vec![1])).collect();
+        header_shaped(tag, arch, kv, &shaped)
+    }
+
+    /// [`header`] with each tensor's dims: zero-filled F32 data, each
+    /// tensor's start aligned to 32 bytes.
+    pub(crate) fn header_shaped(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> PathBuf {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -321,16 +353,26 @@ pub(crate) mod synthetic {
                     xs.iter()
                         .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
                 }
+                V::U64s(xs) => {
+                    b.extend_from_slice(&9u32.to_le_bytes());
+                    b.extend_from_slice(&10u32.to_le_bytes());
+                    b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
+                    xs.iter()
+                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                }
             }
         }
-        for (i, name) in tensors.iter().enumerate() {
+        let mut offset = 0u64;
+        for (name, dims) in tensors {
             string(&mut b, name);
-            b.extend_from_slice(&1u32.to_le_bytes());
-            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            dims.iter()
+                .for_each(|d| b.extend_from_slice(&d.to_le_bytes()));
             b.extend_from_slice(&0u32.to_le_bytes()); // F32
-            b.extend_from_slice(&(32 * i as u64).to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+            offset += (4 * dims.iter().product::<u64>()).div_ceil(32) * 32;
         }
-        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len(), 0);
+        b.resize(b.len().div_ceil(32) * 32 + offset as usize, 0);
         let path = std::env::temp_dir().join(format!("bloomery-{}-{tag}.gguf", std::process::id()));
         std::fs::write(&path, b).expect("write the synthetic header");
         path
@@ -381,6 +423,19 @@ mod tests {
             .to_string();
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("glm5next.block_count"), "{err}");
+    }
+
+    /// A `qwen4exp` header goes to the qwen35moe reader, which names its keys
+    /// under the file's own prefix.
+    #[test]
+    fn a_qwen4exp_header_goes_to_the_qwen35moe_reader() {
+        let path = super::synthetic::header("qwen4exp-spec", "qwen4exp", &[], &[]);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = super::spec(&split)
+            .expect_err("a header without keys")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("qwen4exp.block_count"), "{err}");
     }
 
     #[test]

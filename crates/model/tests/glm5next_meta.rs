@@ -24,23 +24,26 @@ const GLM: &str = "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-000
 
 // PIN(2026-09-27): the file's description as `arch::glm5next::spec` reads it, line by line (the key
 // values checked against the header dump and ik's glm5next loader, src/llama-hparams.cpp).
+// PIN(2026-09-27): the `hc` and latent lines re-pinned when `HcSpec` gained its kind (mHC or
+// gated-residual) and `TokenPool` its rule (learned or mean pools); the values are the same.
 const VIEW: &[&str] = &[
     "arch Glm5Next",
     "hidden 4096 vocab 154880 ctx_train 1048576",
     "rms_eps bits 0x3727c5ac",
     "layers 45 mtp 1",
-    "hc Some(HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Mean })",
+    "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Mean } })",
     "engram None",
     "chat pre glm4 template bytes 10648 tools None reasoning Some(ThinkSpan)",
     "[0-2] delta Kda { gate_lower_bound: -5.0 } k 64 v 64 d 128 conv 4 || dense 12288 swiglu Some(10.0) || hc",
-    "[3,7,11,15,19,23,27,31,35,39,43] latent h 64 q 1536 kv 512 Absorbed { qk: 256, v: 256 } rope - qhn false out Plain win None sinks false | TokenPool { heads: 32, d: 128, top_k: 2048, pool: 4, key_eps: 1e-6 } || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
+    "[3,7,11,15,19,23,27,31,35,39,43] latent h 64 q 1536 kv 512 Absorbed { qk: 256, v: 256 } rope - qhn false out Plain win None sinks false | TokenPool { heads: 32, d: 128, top_k: 2048, pool: 4, rule: Learned { key_eps: 1e-6 } } || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
     "[4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44] delta Kda { gate_lower_bound: -5.0 } k 64 v 64 d 128 conv 4 || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
 ];
 
 // PIN(2026-09-27): the next-token layer, carried and not run: ik numbers it 45, the first past the
 // trunk (n_layer_kv_from_start).
+// PIN(2026-09-27): re-pinned when `TokenPool` gained its rule; the values are the same.
 const MTP: &[&str] = &[
-    "mtp 45: latent h 64 q 1536 kv 512 Absorbed { qk: 256, v: 256 } rope - qhn false out Plain win None sinks false | TokenPool { heads: 32, d: 128, top_k: 2048, pool: 4, key_eps: 1e-6 } || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || plain",
+    "mtp 45: latent h 64 q 1536 kv 512 Absorbed { qk: 256, v: 256 } rope - qhn false out Plain win None sinks false | TokenPool { heads: 32, d: 128, top_k: 2048, pool: 4, rule: Learned { key_eps: 1e-6 } } || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || plain",
 ];
 
 // PIN(2026-09-27): the file carries every key the reader reads, so it takes no default.

@@ -23,6 +23,8 @@ const UD: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
 
 // PIN(2026-09-27): both files' description as `arch::qwen35moe::spec` reads it, line by line, but
 // the chat line — docs/research/modelspec-design.md §2b and §5 are what these were checked against.
+// PIN(2026-09-27): the delta line re-pinned when the GDN kind gained its output gate's activation
+// (SiLU here); the coverage lists below are unchanged.
 const VIEW: &[&str] = &[
     "arch Qwen35Moe",
     "hidden 2048 vocab 248320 ctx_train 262144",
@@ -30,7 +32,7 @@ const VIEW: &[&str] = &[
     "layers 40 mtp 0",
     "hc None",
     "engram None",
-    "[0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38] delta Gdn { khead_map: Tiled } k 16 v 32 d 128 conv 4 || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
+    "[0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38] delta Gdn { khead_map: Tiled, gate: Silu } k 16 v 32 d 128 conv 4 || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
     "[3,7,11,15,19,23,27,31,35,39] gqa 16/2 x 256 rope Imrope { sections: [11, 11, 10, 0] } 64 base 10000000 yarn - qk_norm true out_gate true || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
 ];
 

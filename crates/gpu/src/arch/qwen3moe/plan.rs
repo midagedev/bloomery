@@ -16,7 +16,7 @@
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
 use model::arch::models::{
-    Act, DeltaKind, DeltaRule, Ffn, Gqa, KHeadMap, LayerSpec, Mixer, Moe, RopeMode, Score,
+    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, RopeMode, Score,
 };
 
 /// The two K-quants a mixed site comes in: a value projection, an experts'
@@ -203,14 +203,15 @@ fn gqa_fits(g: &Gqa) -> Result<(), String> {
         && g.rope.yarn.is_none()
         && rope_ok
         && g.qk_norm
-        && g.out_gate;
+        && g.out_gate
+        && g.select.is_none();
     if fits {
         Ok(())
     } else {
         Err(format!(
             "attention {g:?}; the kernels take {HEADS}/{KV_HEADS} heads of {HEAD_DIM}, the first \
-             {ROPE_DIMS} values turned by NEOX (IMROPE sections covering them), q/k norms and the \
-             output gate"
+             {ROPE_DIMS} values turned by NEOX (IMROPE sections covering them), q/k norms, the \
+             output gate and no key selection"
         ))
     }
 }
@@ -220,7 +221,14 @@ fn delta_shape(d: &DeltaRule) -> Result<LinearShape, String> {
     let map = match d.kind {
         DeltaKind::Gdn {
             khead_map: KHeadMap::Tiled,
+            gate: GdnGate::Silu,
         } => linear::KHeadMap::Tiled,
+        DeltaKind::Gdn {
+            gate: GdnGate::Sigmoid,
+            ..
+        } => {
+            return Err("a sigmoid-gated GDN layer, which this body does not run".into());
+        }
         DeltaKind::Kda { .. } => {
             return Err("a Kimi delta rule, which no kernel here runs".into());
         }
@@ -278,8 +286,8 @@ mod tests {
     use super::{Kind35, kinds35, q35};
     use crate::linear::{KHeadMap as LinearMap, LinearShape};
     use model::arch::models::{
-        Act, DeltaKind, DeltaRule, Ffn, Gqa, KHeadMap, LayerSpec, Mixer, Moe, Residual, Rope,
-        RopeMode, Router, Score, Shared,
+        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, Residual,
+        Rope, RopeMode, Router, Score, Shared,
     };
 
     fn gqa() -> Mixer {
@@ -297,6 +305,7 @@ mod tests {
             },
             qk_norm: true,
             out_gate: true,
+            select: None,
         })
     }
 
@@ -304,6 +313,7 @@ mod tests {
         Mixer::DeltaRule(DeltaRule {
             kind: DeltaKind::Gdn {
                 khead_map: KHeadMap::Tiled,
+                gate: GdnGate::Silu,
             },
             k_heads: 16,
             v_heads: 32,
