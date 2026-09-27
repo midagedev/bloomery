@@ -343,11 +343,12 @@ mod gate {
 
     /// Each layer's worst relative distance over the positions `taps` holds
     /// against ik's `l_out-L`, whose last rows are those positions' (ik
-    /// keeps only the output token's rows past the last attention).
-    fn layer_rels(man: &RefManifest, taps: &[Vec<f32>]) -> Result<Vec<f64>, GateError> {
+    /// keeps only the output token's rows past the last attention), and the
+    /// index into `taps` it was met at.
+    fn layer_rels(man: &RefManifest, taps: &[Vec<f32>]) -> Result<Vec<(f64, usize)>, GateError> {
         let row = STREAMS * HIDDEN;
         let n = taps.len();
-        let mut worst = vec![0.0f64; N_LAYER];
+        let mut worst = vec![(0.0f64, 0usize); N_LAYER];
         for (l, w) in worst.iter_mut().enumerate() {
             let ik = tap(man, &format!("l_out-{l}"))?;
             let kept = ik.len() / row;
@@ -356,7 +357,10 @@ mod gate {
                     continue;
                 };
                 let got = &ours[l * row..(l + 1) * row];
-                *w = w.max(rel(got, &ik[i * row..(i + 1) * row]));
+                let e = rel(got, &ik[i * row..(i + 1) * row]);
+                if e > w.0 {
+                    *w = (e, t);
+                }
             }
         }
         Ok(worst)
@@ -364,13 +368,13 @@ mod gate {
 
     /// The worst layer and the first past the band, printed; whether every
     /// layer is inside it.
-    fn print_layers(what: &str, rels: &[f64]) -> bool {
-        for (l, &e) in rels.iter().enumerate() {
+    fn print_layers(what: &str, rels: &[(f64, usize)]) -> bool {
+        for (l, &(e, t)) in rels.iter().enumerate() {
             if l % 8 == 0 || l == rels.len() - 1 || e > FREE_BAND {
-                println!("{what} layer={l} l_out_rel={e:.3e}");
+                println!("{what} layer={l} l_out_rel={e:.3e} at tap {t}");
             }
         }
-        match rels.iter().position(|&e| e > FREE_BAND) {
+        match rels.iter().position(|&(e, _)| e > FREE_BAND) {
             Some(l) => {
                 println!("{what}: first layer past the band {FREE_BAND:.2}: {l}");
                 false
@@ -394,7 +398,7 @@ mod gate {
             "free: {} tokens, worst l_out_rel={:.3e} (band {FREE_BAND:.2}); last position argmax \
              ours={top} ik={ik_top} logits_rel={:.3e} (printed) {}",
             eager.tokens.len(),
-            rels.iter().copied().fold(0.0, f64::max),
+            rels.iter().map(|r| r.0).fold(0.0, f64::max),
             rel(ours, ik_last),
             verdict(ok)
         );
@@ -449,7 +453,7 @@ mod gate {
             prefill.len(),
             t.elapsed().as_secs_f64(),
             if tie { ", a named tie" } else { "" },
-            rels.iter().copied().fold(0.0, f64::max),
+            rels.iter().map(|r| r.0).fold(0.0, f64::max),
             if banded { "band" } else { "printed" },
             verdict(ok)
         );
