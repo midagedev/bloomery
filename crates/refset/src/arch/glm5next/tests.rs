@@ -1,4 +1,4 @@
-use super::{ARCH, IK, IK_BUILD, MODEL};
+use super::{ARCH, IK, IK_BUILD, MODEL, MTP, MTP_BUILD, MTP_SET};
 use crate::RefError;
 use std::path::{Path, PathBuf};
 
@@ -124,6 +124,63 @@ fn the_family_refuses_a_set_without_its_trailer() -> Result<(), RefError> {
     match check(&dir, MODEL, IK_BUILD, ARCH, false) {
         Err(RefError::Unfinished { set: s }) if s == set => {}
         r => panic!("a set without its trailer: {r:?}"),
+    }
+    remove(&dir)
+}
+
+/// The MTP family is its own row: its set is dumped from the file the node
+/// dumps are, by the MTP tree and not the node dumps' build, and adding it
+/// leaves the architecture's node-dump family the node dumps'. A set of the
+/// file and the MTP build passes; one naming the node dumps' build, whose
+/// tree has no MTP graph, is foreign.
+#[test]
+fn the_mtp_family_takes_its_file_and_the_mtp_build() -> Result<(), RefError> {
+    assert!(std::ptr::eq(
+        crate::arch::node_dumps(ARCH).unwrap_or(&MTP),
+        &IK
+    ));
+    assert!(std::ptr::eq(
+        crate::arch::named("mtp-glm5next").unwrap_or(&IK),
+        &MTP
+    ));
+    assert_eq!(MTP.path(MTP_SET), crate::data_dir().join(MTP_SET));
+    let dir = set_dir("mtp")?;
+    let write = |build: &str| {
+        let lines = [
+            "# dump_mtp — ik_llama.cpp MTP (NextN) draft tensors, raw f32, little-endian".to_string(),
+            format!("# model\t{MODEL}"),
+            format!("# build\t{build}"),
+            format!("# arch\t{ARCH}"),
+            "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tblock\trow\taccepted\tgraph"
+                .to_string(),
+            "# draft\tblock\trow\ttoken".to_string(),
+            "# verify\tblock\tpos\tid_last\tcarry\tdrafted\taccepted\ttarget".to_string(),
+            "tensor\tmtp_fused-45\t0\tf32\t4096\t1\t1\t1\t16384\t0\tMUL_MAT\t0\t-\t0\tupdate"
+                .to_string(),
+            "draft\t0\t0\t15".to_string(),
+            "verify\t0\t64\t4\t0\t1\t1\t4,15,99".to_string(),
+            "# complete\t1\t0".to_string(),
+        ];
+        let path = dir.join("MANIFEST.tsv");
+        std::fs::write(&path, lines.join("\n") + "\n")
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    };
+    write(MTP_BUILD);
+    let p = MTP.check_set(&dir)?;
+    assert_eq!(
+        (p.dumped_from.as_str(), p.build.as_deref()),
+        (MODEL, Some(MTP_BUILD))
+    );
+    write(IK_BUILD);
+    match MTP.check_set(&dir) {
+        Err(RefError::Foreign {
+            field: "build",
+            family: "mtp-glm5next",
+            got,
+            want,
+            ..
+        }) if got == IK_BUILD && want == MTP_BUILD => {}
+        r => panic!("an MTP set of the node dumps' build: {r:?}"),
     }
     remove(&dir)
 }

@@ -107,6 +107,16 @@
 #   EXL3_WIKITEXT   the wikitext-2 test text perf.py's token stream reads; its loader otherwise
 #                   downloads it into the temp dir, so the runner stages this copy there first
 #
+# The MTP draft oracle (tools/ref/build-dump-mtp.sh, tools/ref/dump-mtp.sh; refset family
+# mtp-glm5next). IK's tree has no MTP graph for this architecture, so the MTP set comes from another:
+#   GLM_MTP_IK      ik's glm5next MTP graph merged onto upstream 7434a014, the tree whose llama-server
+#                   measured the MTP accept rate on this box (rig-log 09-15). 7434a014 is an ancestor of
+#                   IK's db517b69; the nine commits between them are V4.1's, the vision encoder's, the
+#                   server's and iqk's (converters for the repacked quants, the flash-attention work
+#                   buffer of a K with more than one head), none in a glm5next graph file
+#   GLM_MTP_SHA     that tree's HEAD: the tree must still be at it, clean, and every MTP set names it as
+#                   its `# build`; the refset family pins the same value (MTP_BUILD)
+#
 # Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs arms (IK_GPU_FLAGS, MRS,
 # MRS_FLAGS): ik is the oracle, and mistral.rs (d5ae0f1 on the box) has no glm5next loader
 # (glm4, glm4moe and glm4moelite only). Every script that reads them runs under `set -u`, so such a
@@ -164,6 +174,8 @@ fi
 : "${EXL3_BPW:=4.05}"
 : "${EXL3_FLAGS:=-mcs 224 -mct 32}"
 : "${EXL3_WIKITEXT:=/home/user/eval/wikitext-2-raw/wiki.test.raw}"
+: "${GLM_MTP_IK:=/home/user/ik-glm53-mtp}"
+GLM_MTP_SHA=425a2c1d
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-glm5next <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
