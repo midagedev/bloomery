@@ -41,7 +41,7 @@ In progress: batched prompts for GLM-5.3 and Qwen3.8; GLM-5.3's sparse-attention
 
 ## Measured numbers
 
-All numbers are single-stream tok/s on the development machine: an RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), with a 32-core AVX2 CPU. Decode generates `n = 96` tokens. Every number comes from the runners in `tools/ref/` under the quiet-machine protocol, and each row links to its rig-log entry with the command lines.
+All numbers are single-stream tok/s on the development machine: an RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), with a 32-core AVX2 CPU. Decode generates `n = 96` tokens. Every number comes from the runners in `tools/ref/` under the quiet-machine protocol, and each row links to its rig-log entry with the command lines. Every measured number, the other engines' rows and bloomery's progress over time are on the living benchmark page, [rig-log `docs/bloomery-bench.md`](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md), rendered from the runner logs after each sitting.
 
 ### Against llama.cpp: DeepSeek-V4.1-Flash
 
