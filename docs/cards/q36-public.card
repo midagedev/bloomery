@@ -47,6 +47,11 @@
 #                                               MMQ at 16 rows an expert x 1.3, + the recurrent
 #                                               GDN 30 x 512 x 1.44 us = 22 ms a ubatch)
 #   llama.cpp pp4096           2,800..4,700
+#   llama.cpp pp4096 at -ub/-b 4096  4,600..7,700 (Qwen3's llama.cpp 4,205 -> 6,904 at -ub 4096,
+#                                               09-25#q3ubatch-ab: x1.64 on the 2,800..4,700 above)
+#   llama.cpp fit rows         = the lcpp rows inside the ruler (the whole model fits the A6000, so
+#                                               llama-bench's fit leaves the placement as -ngl 99:
+#                                               fitarm, common/fit.cpp:354 "no changes needed")
 # So ours / llama.cpp: decode 1.05..1.85, ~~pp about 0.07..0.16 — the pass path is not a prefill
 # to publish (Body35 has no ubatch path); the pp rows are sat to check the pass derivation above~~
 # pp about 1.4..2.7 at P = 512 and 1.7..3.4 at P = 4096 on the default path (the ubatch prompt
@@ -59,7 +64,9 @@ term: tok/s @ n=96, depth 6, A6000, bloomery (generate_qwen3moe of the landing t
 unit: tok/s
 predict: 183..205
 condition: one lease, three rounds, arms 6 lcpp:6 1024 lcpp:1024 4096 lcpp:4096 512 lcpppp:512
-  lcpppp:4096, the order rotated every round; the whole model is card-resident for both engines,
+  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096, the order rotated every round; every
+  lcppfit/lcppppfit row carries its fit column (a failed fit is a FAIL row, not a number); the
+  whole model is card-resident for both engines,
   so no arm pages the host; no row carries [cpu-busy] or [other-busy]; the full runner output goes
   to a file first. Command: BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q36-public.card' just depth-gpu-qwen35moe
@@ -69,7 +76,8 @@ reason: sets the decode rows of the public Qwen3.6 table (llama.cpp beside ours)
   pp row goes out~~ the pp rows of the ubatch prompt call; why now: the final sitting takes every
   model's table in one window
 decide-in: write the decode rows into rig-log first, then the README's Qwen3.6 section, ratios
-  from this window only; ~~the pp rows go into rig-log only, marked the pass path, until the Body35
+  from this window only; each llama.cpp row publishes the faster of its hand-set and fit arms
+  (they should read equal here); ~~the pp rows go into rig-log only, marked the pass path, until the Body35
   ubatch prefill lands~~ the pp rows likewise, each checked against its ubatch band above
 decide-below: no Qwen3.6 row goes out: nsys-gpu.sh has no qwen35moe form (its seed form reads
   the qwen3moe profile only), so a round gives it one, times the depth-6 step by kernel class and
