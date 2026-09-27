@@ -13,9 +13,8 @@
 //! which refuses by name every coverage item past the two the program
 //! allows (`bloomery_gpu::arch::qwen3moe::ALLOWED`, the chat surface's; the
 //! plain `PlanInputs::read` refuses those two as well). The coverage check
-//! holds qwen4exp to `Body38`'s own rows once they land (proposal P1;
-//! `crates/model/src/arch/coverage.rs` is not this gate's to change); until
-//! then it lists every qwen4exp item and the open stops with that list.
+//! holds qwen4exp to `Body38`'s own rows (`crates/model/src/arch/coverage.rs`,
+//! not this gate's to change).
 //!
 //! What is asserted:
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
@@ -162,12 +161,11 @@ mod gate {
     /// norm, the output projection) and a selecting layer's 14 (q, k, v, the
     /// indexer key's projection, its append and the pool, the indexer query,
     /// the selection's two, the q/k norm, turn and append, the selected
-    /// flash, the out gate, the output projection); each block's 9 (the
+    /// flash's two, the out gate, the output projection); each block's 9 (the
     /// router, the handoff, the go, the shared expert's four, the wait, the
     /// gated sum); the PLE site's 5 on layer 1 (the combine, key and value,
     /// gate, conv); the head's 5 (its mix's three, the q8_0 gemv, the argmax):
-    /// 1 + 36·22 + 12·29 + 5 + 5. (Stage A's design read 1,163, one launch a
-    /// selecting layer too many.)
+    /// 1 + 36·22 + 12·29 + 5 + 5.
     const NODES_DECODE: usize = 1151;
 
     /// PIN(2026-09-27): each layer's go and wait.
@@ -358,8 +356,7 @@ mod gate {
 
     /// Arm or disarm the layer and route taps.
     fn set_taps(m: &mut Qwen38Model, on: bool) -> Result<(), GateError> {
-        let (gpu, _, b) = m.body_parts("set_taps")?;
-        b.set_taps(gpu, on)?;
+        m.set_layer_taps(on)?;
         Ok(())
     }
 

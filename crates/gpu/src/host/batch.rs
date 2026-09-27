@@ -136,50 +136,26 @@ impl BatchPort {
 
     /// Enqueue the copies of `key`'s tokens `at .. u` of `x` (`n_embd` a
     /// token), `ids` and `w` (`n_used` a token) into the next set, and its
-    /// event. Refused while that set holds a layer not uploaded yet.
+    /// event: [`BatchPort::download_pitched`] at a pitch of `n_used`.
     pub fn download(
         &mut self,
         stream: &CudaStream,
-        [x, w]: [&DeviceBuffer<f32>; 2],
+        xw: [&DeviceBuffer<f32>; 2],
         ids: &DeviceBuffer<u32>,
         key: BatchKey,
     ) -> Result<(), GpuError> {
-        let (n, s) = (self.n_embd, self.n_used);
-        let BatchKey { at, u, .. } = key;
-        let set = &mut self.sets[self.down];
-        if set.stage != Stage::Free {
-            return Err(GpuError::Shape {
-                what: PORT,
-                detail: format!(
-                    "a route of {key:?} into an exchange set that holds {:?}: both sets hold a \
-                     layer not uploaded yet",
-                    set.stage
-                ),
-            });
-        }
-        // SAFETY: each copy reads the first values of a device buffer and
-        // writes as many into this set's page-locked buffers (`dtoh` checks
-        // both lengths). The set is free: its last serve returned, so the
-        // union no longer reads them, and its upload is enqueued before these
-        // copies. The host reads them again only in this set's next serve,
-        // after its wait on the event recorded below.
-        unsafe {
-            dtoh(stream, &mut set.x, x, at * n..u * n)?;
-            dtoh(stream, &mut set.ids, ids, at * s..u * s)?;
-            dtoh(stream, &mut set.w, w, at * s..u * s)?;
-        }
-        set.routed.record(stream)?;
-        set.stage = Stage::Routed(key);
-        self.down ^= 1;
-        Ok(())
+        self.download_pitched(stream, xw, ids, self.n_used, key)
     }
 
-    /// [`BatchPort::download`] from routing buffers of `pitch >= n_used`
-    /// entries a token whose first `n_used` are the routed slots — a router
-    /// that writes a shared expert's slot after them: token `t`'s ids and
-    /// weights are copied from entries `t·pitch .. t·pitch + n_used`, one
-    /// strided copy each, into the set's `n_used` a token. Refused while that
-    /// set holds a layer not uploaded yet, and for a pitch below `n_used`.
+    /// Enqueue the copies of `key`'s tokens `at .. u` of `x` (`n_embd` a
+    /// token) and of the routing into the next set, and its event. The
+    /// routing buffers hold `pitch >= n_used` entries a token whose first
+    /// `n_used` are the routed slots (a router that writes a shared expert's
+    /// slot after them): token `t`'s ids and weights are entries `t·pitch ..
+    /// t·pitch + n_used`, copied into the set's `n_used` a token — one
+    /// contiguous copy each at a pitch of `n_used`, one strided copy each
+    /// past it. Refused while that set holds a layer not uploaded yet, and
+    /// for a pitch below `n_used`.
     pub fn download_pitched(
         &mut self,
         stream: &CudaStream,
@@ -207,14 +183,20 @@ impl BatchPort {
                 ),
             });
         }
-        // SAFETY: as in `download`: the set is free, so neither the union nor
-        // an upload reads its buffers until this set's next serve, which
-        // waits on the event recorded below; each copy's extents are checked
-        // against both buffers inside the helpers.
+        // SAFETY: each copy writes this set's page-locked buffers (the helpers
+        // check both extents). The set is free: its last serve returned, so the
+        // union no longer reads them, and its upload is enqueued before these
+        // copies. The host reads them again only in this set's next serve,
+        // after its wait on the event recorded below.
         unsafe {
             dtoh(stream, &mut set.x, x, at * n..u * n)?;
-            dtoh_pitched(stream, &mut set.ids, ids, (at..u, s, pitch))?;
-            dtoh_pitched(stream, &mut set.w, w, (at..u, s, pitch))?;
+            if pitch == s {
+                dtoh(stream, &mut set.ids, ids, at * s..u * s)?;
+                dtoh(stream, &mut set.w, w, at * s..u * s)?;
+            } else {
+                dtoh_pitched(stream, &mut set.ids, ids, (at..u, s, pitch))?;
+                dtoh_pitched(stream, &mut set.w, w, (at..u, s, pitch))?;
+            }
         }
         set.routed.record(stream)?;
         set.stage = Stage::Routed(key);

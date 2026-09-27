@@ -327,6 +327,30 @@ pub struct SharedAddArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// [`Q38Kernels::enqueue_out_gate`]'s arguments: the attention output and
+/// the `[q | gate]` rows it is gated by, `m` tokens of `n_head` heads, and
+/// the output.
+pub struct OutGateArgs<'a> {
+    pub attn: &'a DeviceBuffer<f32>,
+    pub qg: &'a DeviceBuffer<f32>,
+    pub n_head: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q38Kernels::enqueue_key_append`]'s arguments: the f32 gemv's `[DIM][m]`
+/// raw keys and the `m` rows' positions, the plane's `ctx` rows, and the
+/// layer's raw plane.
+pub struct KeyAppendArgs<'a> {
+    pub kr: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub m: usize,
+    pub ctx: usize,
+    pub fault: FaultSink,
+    pub raw: &'a mut DeviceBuffer<u16>,
+}
+
 /// A buffer shorter than a launch reads or writes, named.
 fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
     match lens.iter().find(|(_, got, need)| got < need) {
@@ -419,18 +443,22 @@ impl Q38Kernels {
     }
 
     /// Enqueue `y = attn · σ(gate)` over `m` tokens of `n_head` heads of
-    /// [`HEAD`] (module doc): `attn` and `y` `m·n_head·HEAD`, `qg` the
-    /// `[q | gate]` rows, `m·n_head·2·HEAD`. One launch. Asynchronous,
-    /// allocation-free, capturable.
+    /// [`HEAD`] ([`OutGateArgs`], module doc): `attn` and `y`
+    /// `m·n_head·HEAD`, `qg` the `[q | gate]` rows, `m·n_head·2·HEAD`. One
+    /// launch. Asynchronous, allocation-free, capturable.
     pub fn enqueue_out_gate(
         &self,
         stream: &CudaStream,
-        (attn, qg): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
-        n_head: usize,
-        m: usize,
-        fault: FaultSink,
-        y: &mut DeviceBuffer<f32>,
+        a: OutGateArgs<'_>,
     ) -> Result<(), GpuError> {
+        let OutGateArgs {
+            attn,
+            qg,
+            n_head,
+            m,
+            fault,
+            y,
+        } = a;
         let what = "q38::enqueue_out_gate";
         let n = HEAD * n_head * m;
         if n == 0 {
@@ -459,18 +487,23 @@ impl Q38Kernels {
         Ok(())
     }
 
-    /// Enqueue the raw key append of `m` rows (module doc): `kr` the f32
-    /// gemv's `[DIM][m]` output, `pos` the rows' positions, `raw` the layer's
-    /// `[ctx][DIM]` f16 plane. One launch. Asynchronous, allocation-free,
-    /// capturable.
+    /// Enqueue the raw key append of `m` rows ([`KeyAppendArgs`], module
+    /// doc): `kr` the f32 gemv's `[DIM][m]` output, `pos` the rows'
+    /// positions, `raw` the layer's `[ctx][DIM]` f16 plane. One launch.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_key_append(
         &self,
         stream: &CudaStream,
-        (kr, pos): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
-        (m, ctx): (usize, usize),
-        fault: FaultSink,
-        raw: &mut DeviceBuffer<u16>,
+        a: KeyAppendArgs<'_>,
     ) -> Result<(), GpuError> {
+        let KeyAppendArgs {
+            kr,
+            pos,
+            m,
+            ctx,
+            fault,
+            raw,
+        } = a;
         let what = "q38::enqueue_key_append";
         if m == 0 || ctx == 0 {
             return Err(GpuError::shape(
