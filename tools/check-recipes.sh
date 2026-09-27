@@ -190,6 +190,7 @@ echo "${ggt##*$'\n'}"
 selftests=(
   "tools/bloomery/manifest.py --self-test"
   "tools/flow/ds41_prefill.py --self-test"
+  "tools/flow/pplb.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"
