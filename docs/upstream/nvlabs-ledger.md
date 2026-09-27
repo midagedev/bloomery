@@ -66,4 +66,6 @@ GPU 단계에서 만나는 이슈·PR 후보를 발견 즉시 여기 적는다(�
 
 **§11 호스트 코드만 바뀌어도 PTX 모듈의 `.shared` 선언 번호 순서가 바뀐다(2026-09-26, attndead).** 호스트 함수 제거만 한 트리에서 `generate_ds41` 번들이 5 B 짧아졌다 — `__shared_mem_N`을 (align, size)로 치환하면 선언 50개·본문 전부 같고 엔트리 순서도 같다. `ptx-scan` 표 행·md5는 같아 증명은 서지만, 번들 바이트 동일성(gatesel (a))은 이것으로도 깨진다. 결정성 이슈 후보(낮음). 같은 부류가 의존 그래프 변경에서도 난다(2026-09-27, levers): `crates/gpu`를 한 줄도 바꾸지 않고 `bloomery-threads`에 `bloomery-levers` 의존만 붙인 트리에서 `bloomery-gpu` 번들이 두 bin 모두 29 B 짧아졌고(2,507,392 → 2,507,363), `bloomery-gpu-deepseek41` 번들은 22 B 길어졌다. 표 행과 md5는 같다. 원문 덤프로 기제를 확인하지는 않았다.
 
+**§12 제네릭 몸체에서 상수 제네릭 매개변수가 든 산술 경계(`for i in 0..CONST / PARAM`)의 완전 `#[unroll]`이 펼쳐지지 않는다(2026-09-27, kfixgqa).** 빌드는 "loop was not unrolled … needs a compile-time-constant trip count" 경고만 낸다. 원인은 펼침 단계가 반복 수를 `mir.constant` 연산에서만 읽고, 그 앞에 상수 접기가 없는 것이다(`cuda-oxide-codegen/src/prep.rs:148`, `induction.rs:159` `const_i128`). 결과로 카운터로 색인하는 배열이 로컬 디포로 간다. q38gqa의 p4 프리필이 여기 걸려 jit_local 24 B였다. 우회: 경계를 상수 매개변수 하나로 넘기거나 상수 경계로 다시 짠다(kfix `c3fda0d`). 포크 수정(반복 수 분석 전에 상수 접기, M)은 03이 일정을 잡는다. 업스트림 이슈 후보.
+
 발견 규칙: 우회로를 쓰기로 했더라도 여기 먼저 한 줄 적고 우회한다. 우회가 증거를 지운다.
