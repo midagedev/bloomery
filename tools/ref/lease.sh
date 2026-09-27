@@ -81,6 +81,11 @@ unset __lease_dir
 # lease_take refuses the override (exit 64): a fake lock during a real sitting would contaminate it.
 # A command that tools/ref/lease-hold.sh runs carries BLOOMERY_LEASE_HELD (that script's pid): a lease
 # taken inside it would wait on the one already held and end as contention, so it exits 64 at once.
+# The record beside the lock names the run's timing cards: TIMING_GPU, and in timing-card.sh's two-card
+# mode TIMING_GPU2 after a comma. tools/gpu-gate.sh reads a two-card record as naming neither card, a
+# doubt, and so refuses a gate forced onto either card and passes both by under `any`.
+# LEASE_CARDS_RECORD says so to timing-card.sh, whose two-card precheck refuses a lease.sh without it.
+LEASE_CARDS_RECORD=1
 lease_take() {
   if [ -n "${BLOOMERY_LEASE_HELD:-}" ]; then
     echo "[lease] refused: this run is inside tools/ref/lease-hold.sh (pid $BLOOMERY_LEASE_HELD), which holds the lease; a second lease would wait on it" >&2
@@ -89,7 +94,7 @@ lease_take() {
   # A GPU runner (timing-card.sh sourced: it defines witness_card) must name its timing card, or the
   # record below would say `none` and let a forced gate share that card.
   if declare -F witness_card > /dev/null && [ -z "${TIMING_GPU:-}" ]; then
-    echo "[lease] refused: a GPU timing runner (timing-card.sh sourced) with TIMING_GPU empty — the lease would record no timing card" >&2
+    echo "[lease] refused: a GPU timing runner (timing-card.sh sourced) with TIMING_GPU empty — the lease would record no timing card${TIMING_CARDS_WHY:+ ($TIMING_CARDS_WHY)}" >&2
     exit 64
   fi
   if [ "$LEASE_LOCK" != /root/bloomery-cpu.lock ] && [ -e /root/bloomery-cpu.lock ]; then
@@ -117,8 +122,9 @@ lease_take() {
       lease_holders "$LEASE_LOCK"
     done
   fi
-  # The timing-card record tools/gpu-gate.sh reads while the lease is held: this runner and its card, `none` for one that times no GPU.
-  { printf 'pid=%s timing_gpu=%s\n' "$$" "${TIMING_GPU:-none}" > "$LEASE_LOCK.card.$$" && mv -f "$LEASE_LOCK.card.$$" "$LEASE_LOCK.card"; } ||
+  # The timing-card record tools/gpu-gate.sh reads while the lease is held: this runner and its card (both
+  # cards in the two-card mode, the A6000 first), `none` for one that times no GPU.
+  { printf 'pid=%s timing_gpu=%s\n' "$$" "${TIMING_GPU:-none}${TIMING_GPU2:+,$TIMING_GPU2}" > "$LEASE_LOCK.card.$$" && mv -f "$LEASE_LOCK.card.$$" "$LEASE_LOCK.card"; } ||
     echo "[lease] the timing-card record $LEASE_LOCK.card was not written: forced GPU gates refuse (75) while this lease is held" >&2
   echo "[lease] held by pid $$ at $(now)"
   lease_netdata
