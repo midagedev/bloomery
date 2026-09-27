@@ -55,6 +55,7 @@ pub mod q5;
 pub mod q5_1_sel;
 pub mod q6k_sel;
 pub mod q8f32;
+pub mod qsa;
 pub mod rope_neox;
 pub mod rope_table;
 pub mod route_core;

@@ -17,6 +17,7 @@
 
 pub mod combine;
 mod lookup;
+pub mod qsa;
 pub mod sched;
 mod speculative;
 pub mod state;
