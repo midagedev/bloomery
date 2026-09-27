@@ -1022,7 +1022,9 @@ const DSPARK_VIEW: &[&str] = &[
 /// 4. `hw_ds41_spec` — the typed description of the served file and of the
 ///    DSpark draft: (a) every field pinned; (b) the three facts the prompt
 ///    call's triangle reads (owns rows, owns keys, sources) equal the layer
-///    table's on every layer; (c) the coverage check lists nothing, and with
+///    table's on every layer, and so does whether the layer's stores make it
+///    run every position (`runtime::state::every_position` against the layer
+///    table's compressor or index keys); (c) the coverage check lists nothing, and with
 ///    the router's row taken out of its table it lists that router on every
 ///    layer.
 #[test]
@@ -1065,6 +1067,14 @@ fn hw_ds41_spec() {
             from_spec,
             kind,
             "LayerKind",
+        );
+        layer_row(
+            &mut o,
+            &mut b,
+            &format!("layer {l} every position"),
+            runtime::state::every_position(ls),
+            k.compressor.is_some() || k.index_keys,
+            "LayerKind compressor || index_keys",
         );
     }
     let items = spec_view::items(&model::arch::coverage::check(s, &tensors));

@@ -21,3 +21,5 @@ bloomery-levers = { path = "../levers" }
 bloomery-model = { path = "../model" }
 # Host only: the glue's host half reads each token's engram rows through the engram tables.
 bloomery-engram = { path = "../engram" }
+# Host only: the step and the pair pass are walks of the schedules' overlap (`runtime::sched`).
+bloomery-runtime = { path = "../runtime" }

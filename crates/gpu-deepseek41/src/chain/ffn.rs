@@ -54,8 +54,9 @@
 //! A caller's shadow work is its own and is not counted here.
 //!
 //! A layer is enqueued in two halves — up to the shadow work
-//! ([`FfnPiece::enqueue_go_half`]) and from the wait on
-//! ([`FfnPiece::enqueue_join_half`]) — on one row of the piece's buffers. A
+//! ([`FfnPiece::enqueue_go_half`], itself the front up to the go and the
+//! shadow after it) and from the wait on ([`FfnPiece::enqueue_join_half`])
+//! — on one row of the piece's buffers. A
 //! pass whose two rows run one layer apart puts the other row's layer
 //! between them, so every buffer a layer writes is the row's own; only
 //! HC_PRE's reduction scratch, which its own launches consume, is shared.
@@ -577,6 +578,25 @@ struct LayerCfg {
     fold: bool,
 }
 
+/// A layer's MoE sub-layer on one row between its front and its shadow
+/// ([`FfnPiece::enqueue_go_front`], [`FfnPiece::enqueue_go_shadow`]): the
+/// layer's weights and card stacks as the front resolved and checked them.
+pub struct GoFront<'w> {
+    layer: usize,
+    row: usize,
+    i: usize,
+    lw: LayerWeights<'w>,
+    card: Option<CardStacks<'w>>,
+}
+
+impl GoFront<'_> {
+    /// The layer and the row the front ran.
+    #[must_use]
+    pub fn at(&self) -> (usize, usize) {
+        (self.layer, self.row)
+    }
+}
+
 /// One layer's resident weights, looked up and format-checked at enqueue.
 struct LayerWeights<'w> {
     gain: &'w DeviceBuffer<f32>,
@@ -1041,12 +1061,11 @@ impl FfnPiece {
         self.enqueue_join_half(gpu, io, hybrid, layer, 0)
     }
 
-    /// The layer's launches up to its join, on row `row`'s buffers: the
-    /// norm, the router, the handoff into the row's image and the go — with
-    /// the overlap lever off, the wait right after it — then the piece's own
-    /// shadow work and `extra`. A pass whose rows run one layer apart
-    /// enqueues the other row's work here, before this row's
-    /// [`FfnPiece::enqueue_join_half`] of the same layer.
+    /// The layer's launches up to its join, on row `row`'s buffers:
+    /// [`FfnPiece::enqueue_go_front`] then [`FfnPiece::enqueue_go_shadow`]. A
+    /// pass whose rows run one layer apart enqueues the other row's work
+    /// here, before this row's [`FfnPiece::enqueue_join_half`] of the same
+    /// layer.
     #[allow(
         clippy::too_many_arguments,
         reason = "enqueue's arguments, the row and the shadow work; the pieces take the shared buffers flat (rust-quality R8)"
@@ -1062,6 +1081,28 @@ impl FfnPiece {
         row: usize,
         extra: &mut [&mut dyn ShadowWork],
     ) -> Result<(), GpuError> {
+        let go = self.enqueue_go_front(gpu, w, card, io, hybrid, layer, row)?;
+        self.enqueue_go_shadow(gpu, go, io, hybrid.boundary(), extra)
+    }
+
+    /// The layer's front on row `row`'s buffers: the norm, the router, the
+    /// handoff into the row's image and the go — with the overlap lever off,
+    /// the wait right after it. What the shadow reads of it comes back as a
+    /// [`GoFront`], for [`FfnPiece::enqueue_go_shadow`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue's arguments and the row; the pieces take the shared buffers flat (rust-quality R8)"
+    )]
+    pub fn enqueue_go_front<'w, H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        w: &'w Weights,
+        card: Option<CardStacks<'w>>,
+        io: &FfnIo<'_>,
+        hybrid: &mut Hybrid<H>,
+        layer: usize,
+        row: usize,
+    ) -> Result<GoFront<'w>, GpuError> {
         let i = self.check_io(layer, hybrid.boundary().slots(), io, row)?;
         let card = self.check_card(layer, i, card)?;
         let lw = LayerWeights::resolve(
@@ -1072,7 +1113,30 @@ impl FfnPiece {
             self.hc_iters,
         )?;
         self.enqueue_handoff(gpu, i, row, &lw, io, hybrid, layer)?;
-        self.enqueue_shadow(gpu, i, row, &lw, card, io, hybrid.boundary())?;
+        Ok(GoFront {
+            layer,
+            row,
+            i,
+            lw,
+            card,
+        })
+    }
+
+    /// The layer's shadow after its `go`: the piece's own shadow work, then
+    /// `extra`, on the row the front ran on. `io` is the buffers the front
+    /// took.
+    pub fn enqueue_go_shadow(
+        &mut self,
+        gpu: &Gpu,
+        go: GoFront<'_>,
+        io: &FfnIo<'_>,
+        boundary: &Boundary,
+        extra: &mut [&mut dyn ShadowWork],
+    ) -> Result<(), GpuError> {
+        let GoFront {
+            row, i, lw, card, ..
+        } = go;
+        self.enqueue_shadow(gpu, i, row, &lw, card, io, boundary)?;
         for work in extra.iter_mut() {
             work.enqueue(gpu)?;
         }
