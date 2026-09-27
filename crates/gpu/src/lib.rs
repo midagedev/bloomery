@@ -36,6 +36,7 @@ pub mod flash;
 pub mod flash_gqa;
 pub mod flash_gqa_prefill;
 pub mod fused;
+pub mod gated_quant;
 pub mod gemm;
 pub(crate) mod graph;
 pub mod head;

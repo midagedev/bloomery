@@ -20,6 +20,21 @@ pub struct GemmAct {
     pub(super) k: usize,
 }
 
+/// A [`GemmAct`]'s five planes borrowed for writing, for a quantizer outside
+/// this module that writes the layout [`GemmAct`] documents.
+pub(crate) struct GemmActPlanesMut<'a> {
+    /// The codes in the q3 pair permutation: `64 * ceil(n_sb/2)` u64 per column.
+    pub(crate) q3: &'a mut DeviceBuffer<u64>,
+    /// The codes in the q4 permutation: `256 * ceil(n_sb/4)` u32 per column.
+    pub(crate) q4: &'a mut DeviceBuffer<u32>,
+    /// The codes in the q6 permutation the GEMM stages: `128 * ceil(n_sb/2)` u32 per column.
+    pub(crate) q6: &'a mut DeviceBuffer<u32>,
+    /// The 32-value code sums: `8 * n_sb` i32 per column.
+    pub(crate) s8: &'a mut DeviceBuffer<i32>,
+    /// The 128-value block scales: `2 * n_sb` f32 per column.
+    pub(crate) d8: &'a mut DeviceBuffer<f32>,
+}
+
 impl GemmAct {
     /// Scratch for `cols` (1..=[`GEMM_MAX_SLOTS`]) columns of `k` values, `k`
     /// a multiple of 256 up to the quantizer's cap. Load-time only.
@@ -97,6 +112,18 @@ impl GemmAct {
     #[must_use]
     pub fn q6(&self) -> &DeviceBuffer<u32> {
         &self.q6
+    }
+
+    /// The five planes, writable, for a quantizer outside this module that
+    /// writes the layout above (`gated_quant`).
+    pub(crate) fn planes_mut(&mut self) -> GemmActPlanesMut<'_> {
+        GemmActPlanesMut {
+            q3: &mut self.q3,
+            q4: &mut self.q4,
+            q6: &mut self.q6,
+            s8: &mut self.s8,
+            d8: &mut self.d8,
+        }
     }
 
     /// Device bytes of the five planes.

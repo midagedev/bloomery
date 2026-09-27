@@ -294,6 +294,10 @@ name = "gate_linear"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen35moe_attn"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_qwen3moe_router"
 required-features = ["gpu"]
 
