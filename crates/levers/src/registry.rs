@@ -26,6 +26,7 @@ pub const HOST_POPULATE: &str = "BLOOMERY_HOST_POPULATE";
 pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
 pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
+pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -208,6 +209,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "`generate_ds41`: `lookup` serves an n-gram lookup draft, `dspark` the DSpark \
               draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed two-row pass; the \
               `tokens` line is the plain run's.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: MTP_HEAD_ROWS,
+        class: Class::C,
+        kind: Kind::Path,
+        default: Unset::Means("the full head: every token of the vocabulary"),
+        doc: "Qwen3.8's MTP draft: the reduced head's row list (`tools/ref/draft-vocab.py`), \
+              the vocabulary ids its head scores, gathered from the target's `output` at \
+              load. Its first line names the list's vocabulary and the target tokenizer's \
+              digest; a list of another tokenizer, unsorted, with an id repeated or past the \
+              vocabulary, or of no row is refused by name. It moves the drafts' acceptance, \
+              never the emitted tokens.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

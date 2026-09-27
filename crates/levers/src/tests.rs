@@ -224,6 +224,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.card_budget_bytes(), None);
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
+    assert_eq!(unset.mtp_head_rows(), None);
     assert!(!unset.check_finite());
     assert_eq!(
         unset.host(),
@@ -248,6 +249,7 @@ fn accessors_read_their_rows() {
             (CARD_BUDGET, "38G"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
+            (MTP_HEAD_ROWS, "/data/rows.txt"),
             (CHECK_FINITE, "1"),
             (HOST_POPULATE, "0"),
             (HOST_LOCK, "1"),
@@ -269,6 +271,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.card_budget_bytes(), Some(38 << 30));
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
+    assert_eq!(set.mtp_head_rows(), Some(Path::new("/data/rows.txt")));
     assert!(set.check_finite());
     assert_eq!(
         set.host(),
@@ -295,6 +298,7 @@ fn accessors_read_their_rows() {
             CARD_BUDGET,
             PIN_MAIN,
             DRAFT,
+            MTP_HEAD_ROWS,
             CHECK_FINITE,
             HOST_POPULATE,
             HOST_LOCK,
