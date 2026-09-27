@@ -949,12 +949,18 @@ time-lcpp-prompt CORPUS N:
 # placement (a)), ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS) and mainline's `lcpp:<D>`
 # (llama-bench -d D at LCPP_GPU_FLAGS; `lcpp<K>:<D>` sweeps --n-cpu-moe K), alternated, rounds rotated, with per-depth
 # ours/reference ratios. tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
+# BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' runs the arms in engine blocks instead (ours, each corpus, each bin:,
+# lcpp, ik), each block's rounds together with its arms rotated inside it, and one discarded DISCARD r0 process first
+# (a reference block's arm with the most token draws at its largest --n-cpu-moe, so its engram rows are warm; ours'
+# longest prompt); the preheat is then off unless BLOOMERY_PREHEAT=1. The recipe passes BLOOMERY_AB_ROUNDS alone from
+# the Mac's environment: every other runner variable goes through BLOOMERY_BOX_ENV.
 # Prefill: every `<D>` row also carries pp_tok/s from generate_ds41's `time prompt` row (the D fed steps), and
 # `ikpp:<P>`/`lcpppp:<P>` run llama-bench -p P -n 0 at the same flags (`ikpp<U>`/`lcpppp<U>`: -ub U), with a per-P table.
 # `prose:<P>[@NAME=VALUE,...]` is ours on the first P ids of corpus-prose.ids (--tokens), in prose-only tables;
 # `code:<P>` the same on corpus-code.ids. BLOOMERY_GEN_PLACE=a|gate picks our arms' --place (gate: the 3090 as
-# BLOOMERY_TIMING_GPU); each reference arm's host set is preheated first (BLOOMERY_PREHEAT=0: off), rows carry majflt and
-# [cold], and a failed arm is a FAIL row the runner goes past (rc 1 at the end).
+# BLOOMERY_TIMING_GPU); under the default order each reference arm's host set is preheated first (BLOOMERY_PREHEAT=0:
+# off), rows carry majflt with the measured window's count (lcpp arms through llama-bench --progress) and [cold], and a
+# failed arm is a FAIL row the runner goes past (rc 1 at the end).
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:

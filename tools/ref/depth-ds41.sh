@@ -3,20 +3,21 @@
 # (run on the box, lead-only): our engine (generate_ds41 --depth D --time --place a|gate), ik
 # (llama-bench -gp D,N, or -p P -n 0 for prefill, at the profile's IK_GPU_FLAGS, under its
 # IK_GPU_ENV) and mainline llama.cpp (llama-bench -d D, or -p P -n 0, at the profile's
-# LCPP_GPU_FLAGS), alternated arm by arm.
+# LCPP_GPU_FLAGS), alternated arm by arm or run in engine blocks (Order below).
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/depth-ds41.sh 6 ik:6 lcpp:6'
 #   just depth-gpu-ds41 6 lcpp:6 4096 lcpp:4096
 #   just depth-gpu-ds41 512 ikpp:512 lcpppp:512 4096 ikpp:4096 lcpppp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
+#   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512   # engine blocks
 #   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines and row from a saved generate_ds41 output
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
 # quoted as "decode is faster" — a step's attention term grows with the cached keys, so the depth
 # goes into every number (`tok/s @ n=N, depth D, <card>`).
 #
-# Arms, in lease order (the order rotates by one slot each round — the position bias ab-decode.sh
-# names):
+# Arms, in lease order under the default order (it rotates by one slot each round — the position
+# bias ab-decode.sh names; Order below has the engine blocks):
 #   <D>      ours: generate_ds41 --depth D -n N --time. The fed ids are lease.sh's lcg_prompt D,
 #            one real decode step each, untimed; generated token 0 comes out of the last of them and
 #            the N - 1 steps after it are timed. The context is the binary's default, the serving
@@ -110,27 +111,50 @@
 # lease, and preheats them (pread in chunks, the data discarded). The read sits outside the arm's
 # witness blocks and its row's wall, and prints `preheat <engine> K=<k> bytes=<b> s=<t> gbps=<rate>`:
 # the rate tells how much came from NVMe and how much from the page cache. Not preheated: the engram
-# tables (tens of GB, read a few rows a token through the mapping) and what the engine uploads to the
-# card, which it reads once at load, before its timer — preheating that too would evict the host set
-# it is meant to keep: at K = 33 the host set and the card set are 262.4 GB together [derived], the
-# page cache's whole. Flags whose host set this rule does not model (-ot, --override-tensor,
+# tables and what the engine uploads to the card. The engram tables are 84.5 GB of lazy rows, and a
+# token reads about 49 4-KB pages of them (48 rows: 2 layers x 3 n-gram orders x 8 heads, plus the
+# rows that straddle a page) [derived, round memfit]. They are no small term: llama.cpp's V4.1 build
+# faults each row in alone (MADV_RANDOM on the lazy range, GET_ROWS as one task), about 1.9 s per 512
+# tokens it has not read before — the whole of a cold reference pp row's deficit (rig-log
+# 2026-09-27#v41-xeng) — and which rows a run reads depends on its token ids, which only the block
+# order's discard process covers (Order below). What the engine uploads to the card it reads once at
+# load, before its timer; preheating that too would evict the host set it is meant to keep: at
+# K = 33 the host set and the card set are 262.8 GB together [derived], more than the file cache holds.
+# Flags whose host set this rule does not model (-ot, --override-tensor,
 # -cmoe, --cpu-moe, a list for --n-cpu-moe, -ngl below the block count + 1) are refused before the
 # lease. BLOOMERY_PREHEAT=0 turns the preheat off (the same-lease A/B of it); any value but 0 or 1 is
-# refused. A dry run prints each reference arm's K, bytes and ranges and the seconds they take cold at
-# PH_RATE, and reads nothing but the headers.
+# refused. Its default follows the order: 1 under rotate, 0 under blocks. Under blocks the block's
+# discard process has just read the host set through the same mapping, with no other engine between it
+# and the block's arms: at -nopo 1 a prompt runs the host layers' experts on the host, and a 4096-token
+# prompt leaves a host layer's expert unread with probability (1 - 6/384)^4096 < e^-64 [derived]. The
+# preheat would read a resident set — 6.4-28.5 s of lease wall before each reference arm in the two
+# windows of rig-log 2026-09-27 — for a window term of 0 [derived]. BLOOMERY_PREHEAT=1 under blocks
+# preheats every reference process, the discard included. A dry run prints each reference arm's K,
+# bytes and ranges and the seconds they take cold at PH_RATE, and reads nothing but the headers.
 # Cold tag. Every row carries `majflt <n>`, the change in /proc/vmstat pgmajfault across the arm's
-# process — a reference's load and warm-up included — and an ours, corpus or bin row also `timed <n>`,
-# the change from its `fed` line (generate_ds41 prints it just before its prompt timer starts) to its
-# exit. The count (the timed one where there is one) is set against the row's own timed window W: P /
-# tok/s for a pp row, N / tok/s for a decode row, the prompt's ms plus N × mean ms for ours. At COLD_US
-# microseconds a fault — the costlier of the two cold/warm pairs of one lease (rig-log
-# 2026-09-25#v41-prefill-baseline-p512: ik pp512 54.23 tok/s at 120,615 faults and 165.76 at 423 give
-# 53 µs a fault, llama.cpp's 74.03 at 114,409 and 104.57 at 7,926 give 19) [derived] — a row whose faults could have cost COLD_PCT percent of W or more (the ruler at four
-# rounds) ends in ` [cold]`, and the column prints that bound (`≤ <x> % of W`). An untagged row lost
-# less than 1 % to page faults; a tagged reference row may have faulted only in its load or warm-up,
-# which its whole-process count cannot tell apart. The witness still prints the page cache and the
-# fault count before and after every arm. BLOOMERY_GEN_WARM (generate_ds41 --warm) trims our arm's
-# first steps.
+# process — a reference's load and warm-up included — and `timed <n>`, the change over the row's
+# measured window, where the runner can see that window start: an ours, corpus or bin arm counts from
+# its `fed` line (generate_ds41 prints it just before its prompt timer starts) to its exit; an lcpp arm
+# (lcpp…, lcpppp…) runs llama-bench with --progress and counts from the progress line of its last
+# repetition's timed test to its exit — `prompt run 2/2` for a pp arm, `generation run 1/1` for a
+# decode arm, each printed after the repetition's clock starts (tools/llama-bench/llama-bench.cpp:2440,
+# 2444, 2457 on the V4.1 branch; `depth run` comes before the clock). ik's llama-bench has no
+# --progress, so an ik row counts its whole process. Both counts read the machine-wide counter, which
+# the lease keeps to this arm's process, as the `fed` count does. The count (the timed one where there
+# is one) is set against the row's own timed window W: P / tok/s for a pp row, N / tok/s for a decode
+# row, the prompt's ms plus N × mean ms for ours. A fault is priced at COLD_US microseconds, the serial
+# cost of one engram fault measured on this box (rig-log 2026-09-23: 75.4 µs a 4 KB fault, taken one
+# after another on one thread, the way llama.cpp's V4.1 build reads its engram rows) and the largest
+# serial cost a fault has been measured at here. A row whose faults could have cost COLD_PCT percent of
+# W or more (the ruler at four rounds) ends in ` [cold]`, and the column prints that bound (`≤ <x> % of
+# W`). The counter does not tell the two kinds of fault apart: an engram fault reads 4 KB and waits
+# alone; a host-set fault reads around (up to the device's read-ahead) on one of the threads that share
+# the expert work, and its serial cost has not been measured. So the bound is an upper bound for engram
+# faults and a price by count for the others: an untagged row lost under 1 % of W if its faults were
+# engram faults, and a tagged row faulted at least that often inside its window — or, an ik row, in its
+# load or warm-up, which a whole-process count cannot tell apart. The witness still prints the page
+# cache and the fault count before and after every arm. BLOOMERY_GEN_WARM (generate_ds41 --warm) trims
+# our arm's first steps.
 # With BLOOMERY_STEP_STATS=1 (BLOOMERY_BOX_ENV on the Mac side) our arm's `stat summary` line is
 # echoed with its load lines; the per-step `stat step` lines stay in the arm's output only.
 #
@@ -170,11 +194,56 @@
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE and
 # BLOOMERY_PREHEAT (above), BLOOMERY_ARM_BOUND (seconds one arm, or one preheat, may run, default
 # 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease), BLOOMERY_AB_WARMUP
-# (below), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines, the preheat plan,
-# the CPU guard's settings and reading, the warm-up and the rotation, then exit 0 before the lease:
-# nothing is loaded and nothing is timed).
+# and BLOOMERY_AB_ORDER (below), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree
+# lines, the preheat plan, the CPU guard's settings and reading, the warm-up or the blocks' discards,
+# and the order of every round, then exit 0 before the lease: nothing is loaded and nothing is timed).
 #
-# Warm-up. The lease's first process reads the model's pages cold — the plan's reads of the file and
+# Order. BLOOMERY_AB_ORDER=rotate (the default) runs every arm once a round, the arms of all engines
+# in one order rotated by one slot each round. BLOOMERY_AB_ORDER=blocks runs the arms in engine blocks,
+# the blocks in the order their first arms are given; a block runs all its rounds together, its own
+# arms' order rotated by one slot each round. Any other value is refused. The blocks:
+#   ours         every <D> and <D>@… arm: this tree's binary on the LCG prompt
+#   prose, code  each corpus's arms, its @ arms included: the same binary on that corpus's ids
+#   bin:<tree>   each second binary's arms
+#   lcpp         every mainline arm, lcpp, lcpp<K>, lcpppp and lcpppp<U>: one binary and one token
+#                stream; a sweep value only moves whole layers between the card and the host, and
+#                every K reads the same non-lazy bytes of the file
+#   ik           every ik arm, ik, ikpp and ikpp<U>
+# Same-binary lever arms stay interleaved inside their block. Rotation across engines is dropped here:
+# what it guards is the position bias inside a round, 0.3-0.8 % for a round's first arm (AGENTS.md,
+# the ab-decode.sh rotation), while the cross-engine ratios are 1.2-3.2x (our rows in rig-log
+# 2026-09-27#v41-xeng against round memfit's warm llama.cpp predictions [derived]); what it costs
+# is a swap of two engines' sets through the page cache at every arm (the two host sets' union was
+# about 357 GB beside a file
+# cache of about 261 GB [derived, round memfit]), which is the larger term. The ratio tables still pair
+# round r of one block with round r of another, now measured minutes apart; the witness blocks carry
+# the card's clocks and the page cache across that gap.
+# Discard. Before a block's rounds the runner runs one discard process, its row printed as `DISCARD r0
+# …` between its own witness blocks and in no mean, ratio or row count, as the warm-up's is; a discard
+# that fails is `FAIL r0 …` and counts in the failed list. It is the block's arm that reads the most of
+# what the others will:
+#   a reference block: the arm with the most token draws, at the block's largest --n-cpu-moe (the
+#     `[block]` line names it when that is not the arm's own). llama-bench seeds no generator, so every
+#     process draws its ids from one std::rand() stream from its start, and an arm's ids are the stream's
+#     first draws. Mainline draws 3P for a pp arm (-r 2, its warm-up the whole prompt) and D + N + 3 for a
+#     decode arm (-r 1: 2 in its 1-token warm-up, then D, then N + 1); ik draws 2P + 1 and D + N + 4, or
+#     N + 3 at D = 0 (its warm-up prompt is 1 token) — the V4.1 branch's tools/llama-bench/llama-bench.cpp
+#     :2146-2178 and :2370-2460, ik's examples/llama-bench/llama-bench.cpp:2108-2130 and :2226-2250. So the
+#     discard reads every engram row the block's arms will, bar the n-grams that straddle a boundary
+#     between two of its prompts (two positions a boundary, tens of 4 KB faults) [derived]. The block's
+#     largest K makes the discard's host set the union of the block's.
+#   an ours, corpus or bin block: the arm with the longest prompt, with that arm's variables — the LCG
+#     walk and a corpus's first P ids are prefixes of each other, so it reads every shorter arm's prompt
+#     ids, though not the tokens another arm generates. Our engine reads a step's engram rows ahead of
+#     it (WILLNEED, then the copy), so those are not a serial term in our rows. A lever arm whose
+#     variable moves the host set (a hot list) reads its own set after the discard; its `timed` count
+#     shows what that cost.
+# Its cost is one row of the arm a block, 22-230 s for the V4.1 rows (the `wall` column of rig-log
+# 2026-09-27's two windows). Under blocks BLOOMERY_AB_WARMUP=1 (the default) is the discards — the first
+# block's discard is the lease's first process, so there is no separate warm-up — and 0 skips them.
+#
+# Warm-up (under rotate; under blocks, Discard above). The lease's first process reads the model's
+# pages cold — the plan's reads of the file and
 # the host tier's experts through the mapping, both inside our arm's timed window — so the first row
 # of a lease reads low. The runner runs the first arm once before round 1 and discards it: its row
 # prints as `WARMUP r0 …`, between its own witness blocks and after the same guards, and is in no
@@ -257,9 +326,10 @@ ours_row() {
   fi
   echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
-# The cold tag's constants [derived, the header's Cold tag]: microseconds a major fault can cost, and
-# the percent of a row's timed window at which the faults' bound tags it.
-COLD_US=53 COLD_PCT=1
+# The cold tag's constants (the header's Cold tag): microseconds one serial engram fault costs
+# [measured, rig-log 2026-09-23], and the percent of a row's timed window at which the faults' price
+# tags it.
+COLD_US=75 COLD_PCT=1
 # cold_check <faults> <window s>: MAJ_BOUND, faults × COLD_US as a percent of the window, and COLD_TAG
 # (` [cold]` at COLD_PCT or more).
 cold_check() {
@@ -299,15 +369,23 @@ case $AB_WARMUP in
   0 | 1) ;;
   *) echo "depth-ds41.sh: BLOOMERY_AB_WARMUP is 1 (the default: one discarded run of the first arm) or 0, got '$AB_WARMUP'" >&2; exit 64 ;;
 esac
+ORDER=${BLOOMERY_AB_ORDER:-rotate}
+case $ORDER in
+  rotate | blocks) ;;
+  *) echo "depth-ds41.sh: BLOOMERY_AB_ORDER is rotate (the default: every arm once a round, the order rotated) or blocks (the arms by engine, a discard process before each block), got '$ORDER'" >&2; exit 64 ;;
+esac
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 case $PLACE in
   a | gate) ;;
   *) echo "depth-ds41.sh: BLOOMERY_GEN_PLACE is a (plan (a), on the A6000; the default) or gate (the gate plan, on the 3090), got '$PLACE'" >&2; exit 64 ;;
 esac
-PREHEAT=${BLOOMERY_PREHEAT:-1}
+# The preheat's default follows the order (the header's Preheat): the blocks' discards read the host set.
+PREHEAT_DEFAULT=1
+[ "$ORDER" = rotate ] || PREHEAT_DEFAULT=0
+PREHEAT=${BLOOMERY_PREHEAT:-$PREHEAT_DEFAULT}
 case $PREHEAT in
   0 | 1) ;;
-  *) echo "depth-ds41.sh: BLOOMERY_PREHEAT is 1 (the default: read each reference arm's host set before it) or 0, got '$PREHEAT'" >&2; exit 64 ;;
+  *) echo "depth-ds41.sh: BLOOMERY_PREHEAT is 1 (read each reference arm's host set before it; the default under BLOOMERY_AB_ORDER=rotate) or 0 (the default under blocks), got '$PREHEAT'" >&2; exit 64 ;;
 esac
 GGUF_RANGES="${BASH_SOURCE[0]%/*}/gguf-ranges.py"
 # The word an arm's row starts with: ROW, a row of the tables, or WARMUP, the discarded warm-up run.
@@ -488,10 +566,20 @@ WITNESS=(head-open indent card busiest model mem pgmajfault)
 # into REF_ENV, REF_BIN, REF_ARGS and REF_LABEL, and for a prefill arm the batch sizes its row names
 # into REF_BATCH. The flags are word-split on purpose: the profile keeps them as one string. An
 # lcpp<K> engine is LCPP_GPU_FLAGS with its --n-cpu-moe value replaced by K. A prefill arm is its
-# decode twin's binary, flags and environment with -p P -n 0 in place of the decode test.
+# decode twin's binary, flags and environment with -p P -n 0 in place of the decode test. REF_K, when
+# set, is the --n-cpu-moe every engine runs at instead (a block's discard, the header's Discard). An
+# lcpp arm also gets --progress, and REF_MARK is the ERE of the progress line its measured window
+# starts at (the header's Cold tag); REF_MARK is empty for ik, whose llama-bench has no --progress.
+REF_K=
+# with_ncmoe <flags> <K>: the flags with their --n-cpu-moe value replaced by K.
+with_ncmoe() {
+  local f
+  f=$(echo " $1 " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
+  echo "${f# }--n-cpu-moe $2"
+}
 ref_cmd() {
   local eng=$1 dep=$2 flags ub reps=(-r 1)
-  REF_ENV=() REF_BATCH=
+  REF_ENV=() REF_BATCH='' REF_MARK=''
   case $eng in
     ik | ikpp*)
       # shellcheck disable=SC2206
@@ -501,13 +589,11 @@ ref_cmd() {
     *)
       REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS
       case $eng in
-        lcpp[0-9]*)
-          flags=$(echo " $flags " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
-          flags="${flags# }--n-cpu-moe ${eng#lcpp}"
-          ;;
+        lcpp[0-9]*) flags=$(with_ncmoe "$flags" "${eng#lcpp}") ;;
       esac
       ;;
   esac
+  [ -z "$REF_K" ] || flags=$(with_ncmoe "$flags" "$REF_K")
   case $eng in
     ikpp* | lcpppp*)
       ub=$(pp_ub "$eng")
@@ -520,6 +606,12 @@ ref_cmd() {
       ;;
     ik) if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n 0 -gp "$dep,$N"); REF_LABEL="tg$N@pp$dep |"; fi ;;
     *) if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi ;;
+  esac
+  # The last repetition's timed test: its prompt for a pp arm, its generation for a decode arm.
+  case $eng in
+    ik | ikpp*) ;;
+    lcpppp*) REF_MARK=": prompt run ${reps[1]}/${reps[1]}\$" flags="$flags --progress" ;;
+    *) REF_MARK=": generation run ${reps[1]}/${reps[1]}\$" flags="$flags --progress" ;;
   esac
   # shellcheck disable=SC2206
   REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" "${reps[@]}" $flags)
@@ -576,11 +668,112 @@ ph_bytes() {
   for w in ${!var}; do case $w in bytes=*) echo "${w#bytes=}" ;; esac; done
 }
 
+# The blocks (the header's Order and Discard), fixed before the lease; none under rotate. Per block b:
+# BLK_KEY[b] its name, BLK_ARMS[b] its arms' indices in ARMS (space-separated, in the order given),
+# BLK_DISC[b] the index of the arm its discard runs, BLK_K[b] the --n-cpu-moe that discard runs at when
+# it is not the arm's own (empty otherwise), BLK_WHY[b] what the choice rests on.
+# arm_block <i>: the block arm <i> belongs to.
+arm_block() {
+  case ${A_KIND[$1]} in
+    ref) case ${A_ENG[$1]} in ik | ikpp*) echo ik ;; *) echo lcpp ;; esac ;;
+    ours) echo ours ;;
+    corpus) echo "${A_ENG[$1]}" ;;
+    *) echo "${A_LABEL[$1]}" ;;
+  esac
+}
+# arm_draws <i>: how many token ids arm <i>'s process takes — a reference arm's std::rand() draws, an
+# ours, corpus or bin arm's prompt length.
+arm_draws() {
+  local e=${A_ENG[$1]} d=${A_DEP[$1]}
+  if [ "${A_KIND[$1]}" != ref ]; then
+    echo "$d"
+    return
+  fi
+  case $e in
+    lcpppp*) echo $((3 * d)) ;;
+    ikpp*) echo $((2 * d + 1)) ;;
+    ik) if [ "$d" = 0 ]; then echo $((N + 3)); else echo $((d + N + 4)); fi ;;
+    *) echo $((d + N + 3)) ;;
+  esac
+}
+# arm_k <i>: a reference arm's --n-cpu-moe when its flags carry one integer, else nothing.
+arm_k() {
+  local w prev='' k=''
+  ref_cmd "${A_ENG[$1]}" "${A_DEP[$1]}"
+  for w in "${REF_ARGS[@]}"; do
+    case $prev in --n-cpu-moe | -ncmoe) k=$w ;; esac
+    prev=$w
+  done
+  case $k in '' | *[!0-9]*) ;; *) echo "$k" ;; esac
+}
+BLK_KEY=() BLK_ARMS=() BLK_DISC=() BLK_K=() BLK_WHY=()
+if [ "$ORDER" = blocks ]; then
+  for i in "${!ARMS[@]}"; do
+    key=$(arm_block "$i") b=
+    for j in "${!BLK_KEY[@]}"; do [ "${BLK_KEY[$j]}" != "$key" ] || b=$j; done
+    if [ -z "$b" ]; then
+      b=${#BLK_KEY[@]}
+      BLK_KEY+=("$key") BLK_ARMS+=("")
+    fi
+    BLK_ARMS[b]="${BLK_ARMS[$b]:+${BLK_ARMS[$b]} }$i"
+  done
+  for b in "${!BLK_KEY[@]}"; do
+    best='' bestd=-1 kmax='' kall=1 list=''
+    for i in ${BLK_ARMS[$b]}; do
+      d=$(arm_draws "$i")
+      list="${list:+$list, }${ARMS[$i]} $d"
+      if [ "$d" -gt "$bestd" ]; then best=$i bestd=$d; fi
+      [ "${A_KIND[$i]}" = ref ] || continue
+      k=$(arm_k "$i")
+      if [ -z "$k" ]; then
+        kall=0
+      elif [ -z "$kmax" ] || [ "$k" -gt "$kmax" ]; then
+        kmax=$k
+      fi
+    done
+    BLK_DISC[b]=$best BLK_K[b]=''
+    if [ "${A_KIND[$best]}" = ref ]; then
+      BLK_WHY[b]="the most token draws of the block's arms ($list)"
+      if [ "$kall" = 1 ] && [ "$kmax" != "$(arm_k "$best")" ]; then
+        BLK_K[b]=$kmax
+        BLK_WHY[b]="${BLK_WHY[$b]}, at the block's largest --n-cpu-moe"
+      fi
+    else
+      BLK_WHY[b]="the longest prompt of the block's arms, $bestd ids"
+    fi
+  done
+fi
+# block_line <b>: `<b>/<blocks> <name>: <arms>; discard <arm>…`, the block's plan in one line.
+block_line() {
+  local i arms=''
+  for i in ${BLK_ARMS[$1]}; do arms="${arms:+$arms }${ARMS[$i]}"; done
+  echo "$(($1 + 1))/${#BLK_KEY[@]} ${BLK_KEY[$1]}: $arms; discard ${ARMS[${BLK_DISC[$1]}]}${BLK_K[$1]:+ at --n-cpu-moe ${BLK_K[$1]}}, ${BLK_WHY[$1]}"
+}
+# block_round <b> <round>: the block's arm indices in that round's order, rotated by round - 1 slots.
+block_round() {
+  local -a idx
+  local i
+  read -r -a idx <<< "${BLK_ARMS[$1]}"
+  for i in "${!idx[@]}"; do printf '%s ' "${idx[$(((i + $2 - 1) % ${#idx[@]}))]}"; done
+}
+# preheat_off: why the preheat is off, for the dry run and the [config] line.
+preheat_off() {
+  if [ "$ik$lcpp" = 00 ]; then
+    echo "off (no reference arm)"
+  elif [ -n "${BLOOMERY_PREHEAT:-}" ]; then
+    echo "off (BLOOMERY_PREHEAT=0)"
+  else
+    echo "off (BLOOMERY_AB_ORDER=blocks: each block's discard reads its host set; BLOOMERY_PREHEAT=1 turns it on)"
+  fi
+}
+
 majflt_now() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
-# fed_mark <file>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into <file> at the
-# first `fed ` line — generate_ds41 prints that record just before its prompt timer starts.
-fed_mark() {
-  awk -v f="$1" '!s && /^fed / {
+# majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into <file>
+# at the first line matching <ERE> (at none when <ERE> is empty): generate_ds41's `fed` record, printed
+# just before its prompt timer starts, or an lcpp arm's progress line of its measured repetition,
+# printed just after that repetition's clock starts.
+majflt_mark() {
+  awk -v f="$1" -v re="$2" '!s && re != "" && $0 ~ re {
     while ((getline l < "/proc/vmstat") > 0) if (l ~ /^pgmajfault /) { sub(/^pgmajfault /, "", l); print l > f; close(f) }
     close("/proc/vmstat"); s = 1
   } { print; fflush() }'
@@ -618,29 +811,35 @@ preheat_arm() {
 }
 
 # One reference arm: its preheat, its llama-bench on its flags, the row, and the sum; a FAIL row when
-# any of them fails.
+# any of them fails. The llama-bench output passes through majflt_mark on its way into `raw` (stderr
+# alone for a pp arm, whose stdout is the json), so the fault count at an lcpp arm's measured window's
+# start is known.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags
+  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags markf mark whole
   ref_cmd "$eng" "$dep"
   if pp_eng "$eng"; then key=p=$dep; else key=d=$dep; fi
   if [ -n "$PH_DIR" ]; then
     ph_k "$eng:$dep"
     preheat_arm "$eng" || { rc=$?; arm_fail "$r" "$eng" "$key" "$rc" "$FAIL_WHY"; return 0; }
   fi
+  markf=$(mktemp "${TMPDIR:-/tmp}/depth-ds41-mark.XXXXXX") || exit 2
   witness "pre r$r $eng d=$dep"
   ref_witness
   t0=$(date +%s)
   f0=$(majflt_now)
   if pp_eng "$eng"; then
-    # The json goes to stdout alone; the loader's log goes to a file, shown on a failure.
+    # The json goes to stdout alone (fd 3 out of the pipe); the loader's log, through majflt_mark,
+    # goes to a file, shown on a failure. One pipeline, so both are whole when `raw` is.
     errf=${TMPDIR:-/tmp}/depth-ds41-$eng-d$dep-r$r.err
-    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>"$errf") || rc=$?
+    raw=$({ timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1 1>&3 3>&- | majflt_mark "$markf" "$REF_MARK" > "$errf"; exit "${PIPESTATUS[0]}"; } 3>&1) || rc=$?
   else
-    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1) || rc=$?
+    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1 | majflt_mark "$markf" "$REF_MARK"; exit "${PIPESTATUS[0]}") || rc=$?
   fi
   f1=$(majflt_now)
   t1=$(date +%s)
+  mark=$(cat "$markf")
+  rm -f "$markf"
   witness "post r$r $eng d=$dep"
   guard_cpu "post r$r $eng d=$dep"
   if pp_eng "$eng"; then
@@ -659,8 +858,17 @@ $(tail -n 40 "$errf" 2>/dev/null)"
   fi
   # The timed window of one repetition: P / tok/s for a pp row, N / tok/s for a decode row.
   if pp_eng "$eng"; then win=$(awk -v p="$dep" -v v="$val" 'BEGIN { printf "%.4f", p / v }'); else win=$(awk -v n="$N" -v v="$val" 'BEGIN { printf "%.4f", n / v }'); fi
-  cold_check "$((f1 - f0))" "$win"
-  MAJ_COL=" | majflt $((f1 - f0)) (whole process; ≤ $MAJ_BOUND % of W ${win} s)"
+  whole=$((f1 - f0))
+  if [ -z "$REF_MARK" ]; then
+    cold_check "$whole" "$win"
+    MAJ_COL=" | majflt $whole (whole process; ≤ $MAJ_BOUND % of W ${win} s)"
+  elif [ -n "$mark" ]; then
+    cold_check "$((f1 - mark))" "$win"
+    MAJ_COL=" | majflt $whole (timed $((f1 - mark)); ≤ $MAJ_BOUND % of W ${win} s)"
+  else
+    cold_check "$whole" "$win"
+    MAJ_COL=" | majflt $whole (timed ? (no progress line: the whole process); ≤ $MAJ_BOUND % of W ${win} s)"
+  fi
   tags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
   # The reference's own table, header and row: its columns name every setting it ran with that
   # differs from its defaults, so the log shows which flags took.
@@ -713,7 +921,7 @@ arm_feed() {
 }
 # One arm of a generate_ds41 at --place PLACE: ours (our binary, with the arm's variables when it has
 # any), a corpus arm, or a second binary. The row and the sum under the arm's label, or a FAIL row.
-# The output passes through fed_mark on its way into `out`, so the fault count at the prompt timer's
+# The output passes through majflt_mark on its way into `out`, so the fault count at the prompt timer's
 # start is known: MAJ_WHOLE over the process, MAJ_TIMED from the fed line on.
 # ours_arm <index> <round>
 ours_arm() {
@@ -729,9 +937,9 @@ ours_arm() {
   t0=$(date +%s)
   f0=$(majflt_now)
   if [ ${#envs[@]} -eq 0 ]; then
-    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | fed_mark "$fedf"; exit "${PIPESTATUS[0]}")
+    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
   else
-    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | fed_mark "$fedf"; exit "${PIPESTATUS[0]}")
+    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
   fi
   rc=$?
   f1=$(majflt_now)
@@ -797,53 +1005,88 @@ ratio_table() {
 }'
 }
 
+# dry_cmd <i>: arm <i>'s command line as the dry run prints it (a reference arm at REF_K when set).
+dry_cmd() {
+  local i=$1 dep=${A_DEP[$1]} note='' feedline var
+  if [ "${A_KIND[$i]}" = ref ]; then
+    ref_cmd "${A_ENG[$i]}" "$dep"
+    echo "timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_MARK:+, measured window from /${REF_MARK}/}"
+    return
+  fi
+  feedline="--depth $dep"
+  [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
+  if [ "${A_KIND[$i]}" = corpus ]; then
+    var=CORPUS_N_${A_ENG[$i]}
+    feedline="--tokens \"\$(head -n $dep $(corpus_file "${A_ENG[$i]}") | paste -sd, -)\""
+    note="$note, $dep of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
+  fi
+  arm_envs "$i"
+  echo "timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place $PLACE --time${WARM:+ --warm $WARM}$note"
+}
+# run_arm <index> <round> <guard label>: one arm after the contention guards, into its row or FAIL row.
+run_arm() {
+  CPU_BUSY_TAG=
+  guard_other
+  guard_cpu "$3"
+  case ${A_KIND[$1]} in
+    ref) ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$2" ;;
+    *) ours_arm "$1" "$2" ;;
+  esac
+}
+
 if [ -n "$DRY" ]; then
-  echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES place=$PLACE preheat=$PREHEAT"
+  echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES place=$PLACE preheat=$PREHEAT order=$ORDER"
   ref_witness | sed 's/^   /[dry]/'
   echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
   ph_round=0
   for i in "${!ARMS[@]}"; do
     a=${ARMS[$i]}
     dep=${A_DEP[$i]}
-    case ${A_KIND[$i]} in
-      ref)
-        ref_cmd "${A_ENG[$i]}" "$dep"
-        echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
-        if [ -n "$PH_DIR" ]; then
-          ph_k "$a"
-          b=$(ph_bytes "$PHK" "$PHNGL")
-          var=PH_LINE_${PHK}_${PHNGL:-none}
-          ph_round=$((ph_round + b))
-          echo "[dry] $a: preheat K=$PHK: $b B ($(awk -v b="$b" 'BEGIN { printf "%.1f", b / 1e9 }') GB), $(awk -v b="$b" -v r="$PH_RATE" 'BEGIN { printf "%.0f", b / 1e9 / r }') s if all of it is cold at $PH_RATE GB/s; ${!var}"
-        fi
-        ;;
-      *)
-        note='' feedline="--depth $dep"
-        [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
-        if [ "${A_KIND[$i]}" = corpus ]; then
-          var=CORPUS_N_${A_ENG[$i]}
-          feedline="--tokens \"\$(head -n $dep $(corpus_file "${A_ENG[$i]}") | paste -sd, -)\""
-          note="$note, $dep of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
-        fi
-        arm_envs "$i"
-        echo "[dry] $a: timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place $PLACE --time${WARM:+ --warm $WARM}$note"
-        ;;
-    esac
+    echo "[dry] $a: $(dry_cmd "$i")"
+    if [ "${A_KIND[$i]}" = ref ] && [ -n "$PH_DIR" ]; then
+      ref_cmd "${A_ENG[$i]}" "$dep"
+      ph_k "$a"
+      b=$(ph_bytes "$PHK" "$PHNGL")
+      var=PH_LINE_${PHK}_${PHNGL:-none}
+      ph_round=$((ph_round + b))
+      echo "[dry] $a: preheat K=$PHK: $b B ($(awk -v b="$b" 'BEGIN { printf "%.1f", b / 1e9 }') GB), $(awk -v b="$b" -v r="$PH_RATE" 'BEGIN { printf "%.0f", b / 1e9 / r }') s if all of it is cold at $PH_RATE GB/s; ${!var}"
+    fi
   done
   if [ -n "$PH_DIR" ]; then
     echo "[dry] preheat: $ph_round B a round over the reference arms, $(awk -v b="$ph_round" -v r="$PH_RATE" 'BEGIN { printf "%.0f", b / 1e9 / r }') s a round if every byte is cold at $PH_RATE GB/s (the upper end: an arm after one of its own engine finds its set cached)"
   else
-    echo "[dry] preheat: off$([ "$PREHEAT" = 0 ] && echo ' (BLOOMERY_PREHEAT=0)' || echo ' (no reference arm)')"
+    echo "[dry] preheat: $(preheat_off)"
+  fi
+  if [ "$ORDER" = rotate ]; then
+    if [ "$AB_WARMUP" = 1 ]; then
+      echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
+    else
+      echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): round 1's first row is the lease's first process"
+    fi
+    for r in $(seq "$ROUNDS"); do
+      order=()
+      for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
+      echo "[dry] round $r order: ${order[*]}"
+    done
+    exit 0
   fi
   if [ "$AB_WARMUP" = 1 ]; then
-    echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
+    echo "[dry] warmup: the blocks' discards below, each row DISCARD r0 and in no mean, ratio or row count; the first block's discard is the lease's first process (BLOOMERY_AB_WARMUP=0 skips them)"
   else
-    echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): round 1's first row is the lease's first process"
+    echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): no discard; each block's round 1 first row follows the block before it, the first one the lease's first process"
   fi
-  for r in $(seq "$ROUNDS"); do
-    order=()
-    for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
-    echo "[dry] round $r order: ${order[*]}"
+  for b in "${!BLK_KEY[@]}"; do
+    echo "[dry] block $(block_line "$b")"
+    if [ "$AB_WARMUP" = 1 ]; then
+      REF_K=${BLK_K[$b]}
+      echo "[dry] block $((b + 1)) discard ${ARMS[${BLK_DISC[$b]}]}: $(dry_cmd "${BLK_DISC[$b]}")"
+      REF_K=
+    fi
+    for r in $(seq "$ROUNDS"); do
+      order=()
+      for j in $(block_round "$b" "$r"); do order+=("${ARMS[$j]}"); done
+      echo "[dry] block $((b + 1)) round $r order: ${order[*]}"
+    done
   done
   exit 0
 fi
@@ -858,9 +1101,11 @@ done
 if [ -n "$PH_DIR" ]; then
   for var in ${!PH_LINE_*}; do echo "[config] preheat: ${!var}"; done
 else
-  echo "[config] preheat: off$([ "$PREHEAT" = 0 ] && echo ' (BLOOMERY_PREHEAT=0)' || echo ' (no reference arm)')"
+  echo "[config] preheat: $(preheat_off)"
 fi
-echo "[config] cold tag: majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of the row's timed window"
+echo "[config] order: $ORDER$([ "$ORDER" = rotate ] || echo ", a discard before each block: $([ "$AB_WARMUP" = 1 ] && echo on || echo 'off (BLOOMERY_AB_WARMUP=0)')")"
+for b in "${!BLK_KEY[@]}"; do echo "[config] block $(block_line "$b")"; done
+echo "[config] cold tag: majflt in the row's measured window (ours: from its fed line; lcpp: from its --progress line; ik: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
@@ -873,35 +1118,38 @@ guard_cpu pre
 
 sums=() pp_sums=()
 n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
-if [ "$AB_WARMUP" = 1 ]; then
-  CPU_BUSY_TAG=
-  guard_other
-  guard_cpu "pre warmup ${ARMS[0]}"
-  ROW_TAG=WARMUP
-  case ${A_KIND[0]} in
-    ref) ref_arm "${A_ENG[0]}" "${A_DEP[0]}" 0 ;;
-    *) ours_arm 0 0 ;;
-  esac
-  ROW_TAG=ROW
-  echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above): the lease's first process reads the model's pages cold"
-fi
-for r in $(seq "$ROUNDS"); do
-  for i in $(seq 0 $((${#ARMS[@]} - 1))); do
-    j=$(((i + r - 1) % ${#ARMS[@]}))
-    CPU_BUSY_TAG=
-    guard_other
-    guard_cpu "pre r$r ${ARMS[$j]}"
-    case ${A_KIND[$j]} in
-      ref) ref_arm "${A_ENG[$j]}" "${A_DEP[$j]}" "$r" ;;
-      *) ours_arm "$j" "$r" ;;
-    esac
+if [ "$ORDER" = rotate ]; then
+  if [ "$AB_WARMUP" = 1 ]; then
+    ROW_TAG=WARMUP
+    run_arm 0 0 "pre warmup ${ARMS[0]}"
+    ROW_TAG=ROW
+    echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above): the lease's first process reads the model's pages cold"
+  fi
+  for r in $(seq "$ROUNDS"); do
+    for i in $(seq 0 $((${#ARMS[@]} - 1))); do
+      j=$(((i + r - 1) % ${#ARMS[@]}))
+      run_arm "$j" "$r" "pre r$r ${ARMS[$j]}"
+    done
   done
-done
+else
+  for b in "${!BLK_KEY[@]}"; do
+    echo "[block] $(block_line "$b")"
+    if [ "$AB_WARMUP" = 1 ]; then
+      ROW_TAG=DISCARD REF_K=${BLK_K[$b]}
+      run_arm "${BLK_DISC[$b]}" 0 "pre discard ${ARMS[${BLK_DISC[$b]}]}"
+      ROW_TAG=ROW REF_K=
+      echo "[discard] ${ARMS[${BLK_DISC[$b]}]}${BLK_K[$b]:+ at --n-cpu-moe ${BLK_K[$b]}} ran once before block $((b + 1))'s rounds and is discarded (the DISCARD or FAIL r0 row above)"
+    fi
+    for r in $(seq "$ROUNDS"); do
+      for j in $(block_round "$b" "$r"); do run_arm "$j" "$r" "pre r$r ${ARMS[$j]}"; done
+    done
+  done
+fi
 echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
-echo "cold rows: $cold_rows of $n_rows (majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of the row's timed window)"
-echo "failed arms: ${#FAILED[@]} (FAIL rows, the warm-up's included)"
+echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
+echo "failed arms: ${#FAILED[@]} (FAIL rows, the warm-up's or the discards' included)"
 # A failed arm drops out at its depth or P: FAILED_KEYS against each record's `label|key`.
 drop_failed() {
   awk -F'|' -v ex="$(printf '%s\n' "${FAILED_KEYS[@]}")" '

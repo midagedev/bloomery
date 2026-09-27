@@ -1,0 +1,20 @@
+# E21's llama.cpp rows on the 3090 in engine blocks (relrunner2): ours at --place gate (lcg d6 and
+# d4096) against llama.cpp's V4.1 PR branch at --n-cpu-moe 37 and 38. The lcpp block opens with a
+# discarded lcpp:4096 at --n-cpu-moe 38 (4,195 draws, a superset of every lcpp arm's ids; 38 the block's
+# largest K). Warm prediction for 37 at depth 4096: round memfit, ~21.0 tok/s [derived].
+kind: baseline
+question: with its engram rows warm, where does llama.cpp's V4.1 decode at depth 4096 sit beside ours
+  on the RTX 3090?
+term: tok/s @ n = 96, depth 4096, llama.cpp PR #28696 (llama-bench -p 0 -n 96 -d 4096 -r 1 -ngl 999
+  --n-cpu-moe 37 -fa on -t 32 -nopo 1), RTX 3090 at 250 W, engine blocks with the discard
+unit: tok/s
+predict: 20.0..22.0
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_GEN_PLACE=gate, the 3090 as
+  BLOOMERY_TIMING_GPU, arms 6 4096 lcpp:6 lcpp:4096 lcpp38:6; the lcpp block's DISCARD r0 row present;
+  every lcpp row's `timed` count printed; no [cpu-busy] or [other-busy]; the full output to a file first
+reason: sets the llama.cpp rows beside E21's public 3090 numbers; why now: E21's llama.cpp rows were
+  all cold for the engram reason, and the runner now runs engine blocks with a discard
+decide-in: write the 3090 ratio rows (rig-log first) with each row's timed-window fault bound
+decide-below: read the lcpp rows' timed counts; faults near 49 per generated token mean the discard's
+  engram pages did not survive: a discard before every lcpp arm is the next runner change
+decide-above: the depth-4096 derivation missed a term: re-derive from the row's timed count

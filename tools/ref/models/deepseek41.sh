@@ -133,9 +133,14 @@
 #                   No IK_GPU_ENV twin: mainline keeps the host context on the file mapping with
 #                   buffer overrides (src/llama-model.cpp: use_mmap_buffer is always true).
 #                   No --defer-experts twin either: the loader WILLNEEDs every non-lazy range
-#                   (src/llama-mmap.cpp), 262,653,755,588 B of V41_PUBLIC
-#                   on a 270 GB machine — the witness's
-#                   page cache and pgmajfault lines show what it costs.
+#                   (src/llama-mmap.cpp:501-502, the complement of the lazy ranges over each
+#                   shard), 262,788,958,788 B of V41_PUBLIC [derived: the nine shards'
+#                   347,271,472,288 B, headers included, less the lazy engram_embd tables'
+#                   84,482,513,500 B from the headers], on a 270 GB machine whose file cache
+#                   peaks near 261.5 GB (the witness's Cached less Shmem) — the witness's page cache and
+#                   pgmajfault lines show what it costs. The lazy engram_embd rows it reads one
+#                   4 KB fault at a time (MADV_RANDOM on the lazy range, GET_ROWS as one task);
+#                   tools/ref/depth-ds41.sh's Order and Discard say how a window keeps them warm.
 #   LCPP_CLI_FLAGS  the same placement in common/arg.cpp's spellings, for llama-completion (the
 #                   `lcpp` arm of ik-draft.sh): --no-op-offload for -nopo 1, and -fit off —
 #                   common's default fit pass would otherwise adjust the arguments not given

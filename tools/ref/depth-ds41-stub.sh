@@ -21,6 +21,20 @@
 #                every row a majflt column (ours also the timed count).
 #   corpus       code:4 code:4@STUB_X=1 lcpp:4: the code arms' rows and their own ratio table.
 #   place        an ours arm whose SMOKE footer names another placement than --place is a FAIL row.
+#   blocks       BLOOMERY_AB_ORDER=blocks, 6 lcpp:6 4 lcpppp:4 lcpp2:6 ik:6 code:4, two rounds: four blocks
+#                (ours, lcpp, ik, code) in the order given, each opened by one DISCARD r0 row — the longest
+#                prompt for ours and code, for lcpp the arm with the most token draws (lcpp:6, 13) at the
+#                block's largest --n-cpu-moe (2), which the stub llama-bench echoes in its table — and each
+#                block's rows rotated by one slot a round; the rows' heads are compared with that sequence
+#                whole. The discards are in no mean; no preheat runs (its default under blocks is 0) and
+#                no WARMUP row; every lcpp row carries a `timed` count from its --progress line and every
+#                ik row a whole-process count (the stub ik llama-bench refuses --progress). Red on the
+#                runner before blocks: it ignores the variable and rotates every arm.
+#   order-bad    BLOOMERY_AB_ORDER=sideways is refused by name (rc 64).
+#   blocks-dry   the same arms under BLOOMERY_DRY=1: the block plan, the lcpp discard's command line at
+#                --n-cpu-moe 2 with --progress, and each block's rotation, then rc 0.
+#   blocks-ph    BLOOMERY_AB_ORDER=blocks BLOOMERY_PREHEAT=1, lcpp:6 lcpp2:6, one round: the preheat runs
+#                before every reference process, the discard's at the block's largest K (2).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -55,29 +69,44 @@ case "$*" in
 esac
 EOF
 # The stub llama-bench: refuses --n-cpu-moe STUB_BENCH_FAIL_K; a pp run (-o json) prints one test with
-# two samples; a decode run prints the markdown row under the engine's label.
+# two samples; a decode run prints the markdown row under the engine's label, its model column naming
+# the --n-cpu-moe it ran at. Under --progress it prints mainline's progress lines on stderr (the ik
+# copy refuses the flag, as ik's llama-bench does), the error of a refused K last.
 cat > "$T/bin/bench" << 'EOF'
 #!/usr/bin/env bash
-eng=${0##*/} k='' p='' n='' d='' gp='' json=
+eng=${0##*/} k='' p='' n='' d='' gp='' json='' prog=''
 while [ $# -gt 0 ]; do
   case $1 in
     --n-cpu-moe) k=$2; shift ;; -p) p=$2; shift ;; -n) n=$2; shift ;; -d) d=$2; shift ;; -gp) gp=$2; shift ;;
-    -o) json=1; shift ;;
+    -o) json=1; shift ;; --progress) prog=1 ;;
   esac
   shift
 done
+if [ -n "$prog" ] && [ "$eng" = ik-bench ]; then
+  echo "error: unknown argument: --progress" >&2
+  exit 1
+fi
+[ -z "$prog" ] || echo "llama-bench: benchmark 1/1: starting" >&2
 if [ "$k" = "${STUB_BENCH_FAIL_K:-none}" ]; then
   echo "llama_init_from_model: failed to create context (stub: --n-cpu-moe $k)" >&2
   exit 1
 fi
 if [ -n "$json" ]; then
+  if [ -n "$prog" ]; then
+    for l in "warmup prompt run" "prompt run 1/2" "prompt run 2/2"; do echo "llama-bench: benchmark 1/1: $l" >&2; done
+  fi
   echo "[{\"n_prompt\": $p, \"samples_ns\": [2000000000, 1000000000], \"build_commit\": \"stub\", \"build_number\": 0, \"gpu_info\": \"stub card\"}]"
   exit 0
+fi
+if [ -n "$prog" ]; then
+  echo "llama-bench: benchmark 1/1: warmup generation run" >&2
+  [ -z "$d" ] || echo "llama-bench: benchmark 1/1: depth run 1/1" >&2
+  echo "llama-bench: benchmark 1/1: generation run 1/1" >&2
 fi
 if [ "$eng" = ik-bench ]; then label="tg${gp#*,}@pp${gp%,*}"; else label="tg$n @ d$d"; fi
 echo "| model | size | test | t/s |"
 echo "| --- | ---: | ---: | ---: |"
-echo "| stub | 1 | $label | 20.00 ± 0.01 |"
+echo "| stub k=$k | 1 | $label | 20.00 ± 0.01 |"
 echo "build: stub (0)"
 EOF
 cp "$T/bin/bench" "$T/bin/ik-bench"
@@ -186,8 +215,87 @@ elif want place "$L" 1 '^FAIL r1 ours d=6 rc=0 \| its SMOKE footer names place=g
   pass place
 fi
 
+BLOCK_ARMS=(6 lcpp:6 4 lcpppp:4 lcpp2:6 ik:6 code:4)
+L=$tmp/blocks.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_ORDER=blocks -- "${BLOCK_ARMS[@]}"
+want_seq="DISCARD r0 ours d=6
+ROW r1 ours d=6
+ROW r1 ours d=4
+ROW r2 ours d=4
+ROW r2 ours d=6
+DISCARD r0 lcpp d=6
+ROW r1 lcpp d=6
+ROW r1 lcpppp p=4
+ROW r1 lcpp2 d=6
+ROW r2 lcpppp p=4
+ROW r2 lcpp2 d=6
+ROW r2 lcpp d=6
+DISCARD r0 ik d=6
+ROW r1 ik d=6
+ROW r2 ik d=6
+DISCARD r0 code d=4
+ROW r1 code d=4
+ROW r2 code d=4"
+seq=$(grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$L")
+if [ "$RC" != 0 ]; then
+  fail blocks "rc $RC, want 0" "$L"
+elif [ "$seq" != "$want_seq" ]; then
+  fail blocks "the rows' heads are not the block order: $(echo "$seq" | paste -sd'|' -)" "$L"
+elif want blocks "$L" 1 '^\[config\] order: blocks, a discard before each block: on$' &&
+  want blocks "$L" 1 '^\[config\] block 2/4 lcpp: lcpp:6 lcpppp:4 lcpp2:6; discard lcpp:6 at --n-cpu-moe 2, the most token draws of the block.s arms \(lcpp:6 13, lcpppp:4 12, lcpp2:6 13\), at the block.s largest --n-cpu-moe$' &&
+  want blocks "$L" 1 '^\[config\] block 1/4 ours: 6 4; discard 6, the longest prompt' &&
+  want blocks "$L" 4 '^\[block\] [1-4]/4 ' &&
+  want blocks "$L" 3 '^    lcpp2? table \| stub k=2 ' &&
+  want blocks "$L" 2 '^    lcpp table \| stub k=1 ' &&
+  want blocks "$L" 1 '^mean ours d=6 .*\(n=2\)' &&
+  want blocks "$L" 1 '^mean lcpp d=6 .*\(n=2\)' &&
+  want blocks "$L" 1 '^mean ik d=6 .*\(n=2\)' &&
+  want blocks "$L" 1 '^\[config\] preheat: off \(BLOOMERY_AB_ORDER=blocks' &&
+  want blocks "$L" 0 '^preheat |^WARMUP ' &&
+  want blocks "$L" 7 '^(DISCARD|ROW) r[0-2] lcpp(2|pp)? .*\| majflt [0-9]+ \(timed [0-9]+; ≤ ' &&
+  want blocks "$L" 3 '^(DISCARD|ROW) r[0-2] ik .*\| majflt [0-9]+ \(whole process; ≤ ' &&
+  want blocks "$L" 1 '^\[config\] cold tag: .* × 75 µs ≥ 1 % ' &&
+  want blocks "$L" 1 '^failed arms: 0 '; then
+  pass blocks
+fi
+
+L=$tmp/order-bad.log
+stub_run "$L" BLOOMERY_AB_ORDER=sideways -- 6
+if [ "$RC" != 64 ]; then
+  fail order-bad "rc $RC, want 64" "$L"
+elif want order-bad "$L" 1 "^depth-ds41.sh: BLOOMERY_AB_ORDER is rotate .* or blocks .*, got 'sideways'$"; then
+  pass order-bad
+fi
+
+L=$tmp/blocks-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_ORDER=blocks BLOOMERY_DRY=1 -- "${BLOCK_ARMS[@]}"
+if [ "$RC" != 0 ]; then
+  fail blocks-dry "rc $RC, want 0" "$L"
+elif want blocks-dry "$L" 1 '^\[dry\] block 2/4 lcpp: lcpp:6 lcpppp:4 lcpp2:6; discard lcpp:6 at --n-cpu-moe 2,' &&
+  want blocks-dry "$L" 1 '^\[dry\] block 2 discard lcpp:6: timeout .*lcpp-bench -m .* -p 0 -n 4 -d 6 -r 1 -ngl 999 -fa on -t 4 --n-cpu-moe 2 --progress ' &&
+  want blocks-dry "$L" 1 '^\[dry\] block 2 round 2 order: lcpppp:4 lcpp2:6 lcpp:6$' &&
+  want blocks-dry "$L" 1 '^\[dry\] block 1 round 1 order: 6 4$' &&
+  want blocks-dry "$L" 1 '^\[dry\] block 4 discard code:4: ' &&
+  want blocks-dry "$L" 1 '^\[dry\] warmup: the blocks. discards below' &&
+  want blocks-dry "$L" 0 '^\[dry\] round '; then
+  pass blocks-dry
+fi
+
+L=$tmp/blocks-ph.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks BLOOMERY_PREHEAT=1 -- lcpp:6 lcpp2:6
+if [ "$RC" != 0 ]; then
+  fail blocks-ph "rc $RC, want 0" "$L"
+elif want blocks-ph "$L" 3 '^preheat ' &&
+  want blocks-ph "$L" 1 '^preheat lcpp K=2 bytes=2136 ' &&
+  want blocks-ph "$L" 1 '^preheat lcpp K=1 bytes=1416 ' &&
+  want blocks-ph "$L" 1 '^preheat lcpp2 K=2 bytes=2136 ' &&
+  want blocks-ph "$L" 1 '^DISCARD r0 lcpp d=6 '; then
+  pass blocks-ph
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
-  for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log; do
+  for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
+    "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done

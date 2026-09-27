@@ -539,7 +539,9 @@ first suspect is a hung gate on the box, not the agent.
   union. `code:<P>` is the same on `corpus-code.ids`, in its own tables; `BLOOMERY_GEN_PLACE=gate` runs our
   arms at `--place gate`, with the 3090 as `BLOOMERY_TIMING_GPU`; each reference arm's host set is preheated
   first (`BLOOMERY_PREHEAT=0` off), rows carry `majflt` and `[cold]`, and a failed arm is a `FAIL` row the
-  runner goes past (rc 1 at the end). The `card` witness field prints the timing card's SM clock, the active clock-event mask and
+  runner goes past (rc 1 at the end). `BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks'` runs a cross-engine V4.1 window in
+  engine blocks, each opened by a discarded process that warms that engine's engram rows and host set; the
+  preheat is then off unless `BLOOMERY_PREHEAT=1`. The `card` witness field prints the timing card's SM clock, the active clock-event mask and
   the cumulative power and thermal slowdown counters (post − pre bounds the arm's capped time), and a
   `cpu-freq` line (`scaling_cur_freq` mean/min/max over the cores at the block's instant).
 - **The step does no load-time work.** Anything that does not depend on the

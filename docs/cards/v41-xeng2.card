@@ -1,0 +1,22 @@
+# V4.1 cross-engine window, second try, in engine blocks (relrunner2): ours (placement (a), lcg ids, no
+# hot list) against llama.cpp's V4.1 PR branch (#28696 at 5210c7c, --n-cpu-moe 33) on the A6000. The
+# lcpp block opens with a discarded lcpppp:4096 process (12,288 draws, a superset of every lcpp arm's
+# ids), so the engram rows the measured rows read are resident (round memfit: the cold term was ~1.9 s
+# per 512 new tokens of serial 4 KB faults). Warm predictions are memfit's [derived].
+kind: baseline
+question: with its engram rows warm, where does llama.cpp's V4.1 prompt row sit beside ours in one
+  window, for the public V4.1 table?
+term: pp tok/s @ P = 512, llama.cpp PR #28696 (llama-bench -p 512 -n 0 -r 2, second sample, -ngl 999
+  --n-cpu-moe 33 -fa on -t 32 -nopo 1), A6000, engine blocks with the discard
+unit: tok/s
+predict: 104.6..119
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, arms 6 512 4096 lcpp:6 lcpppp:512 lcpp:4096
+  lcpppp:4096; each block's DISCARD r0 row present; every lcpp row's `timed` count (from its
+  --progress line) printed; no row carries [cpu-busy] or [other-busy]; the full output to a file first
+reason: sets the V4.1 rows of the public table, ours and llama.cpp in one window with both engines'
+  engram rows resident; why now: the first window's llama.cpp rows were all cold (rig-log
+  09-27#v41-xeng) and the runner now runs engine blocks with a discard
+decide-in: write the table (rig-log first, then README) with each row's timed-window fault bound
+decide-below: read each lcpp row's timed count; about 25k faults per 512 tokens means a load evicted
+  the discard's engram pages: the next runner change is a discard before every lcpp arm
+decide-above: the morning's 104.6 was itself fault-limited: restate the README row from this window
