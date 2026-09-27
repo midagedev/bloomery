@@ -219,7 +219,7 @@ impl Body35 {
     fn read_ffn(&self, gpu: &Gpu, m: usize) -> Result<Ffn35Run, GpuError> {
         let stream = gpu.stream();
         let a = &self.a;
-        let (hidden, slots) = (a.dims.hidden, a.dims.slots);
+        let (hidden, slots) = (a.dims.hidden, a.dims.slots());
         let super::scratch::Route::Gated(r) = &a.route else {
             return Err(GpuError::state(
                 "qwen35moe::read_ffn",
@@ -229,7 +229,7 @@ impl Body35 {
         let mut ids = r.ids.to_host_vec(stream)?;
         ids.truncate(m * slots);
         Ok(Ffn35Run {
-            logits: head_of(stream, &r.logits, m * super::router::gated::ROWS)?,
+            logits: head_of(stream, &r.logits, m * a.dims.router.logits())?,
             ids,
             weights: head_of(stream, &r.weights, m * slots)?,
             l_out: head_of(stream, &a.x, m * hidden)?,

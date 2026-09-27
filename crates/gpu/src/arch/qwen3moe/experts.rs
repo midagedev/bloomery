@@ -3,7 +3,7 @@
 //! combine of the down outputs with the router weights and the residual.
 //! The combine is the weighted sum over a token's slots plus the residual
 //! and nothing else: Qwen3-30B-A3B has no shared expert, and Qwen3.6's runs
-//! as one more slot (`router::gated`, nine slots a token), so its weighted
+//! as one more slot (`router::gated`, `k + 1` slots a token), so its weighted
 //! term is inside the sum.
 //!
 //! The gate·up kernel is `moe_fused::expert_gate_up_swiglu_q3k`'s shape over

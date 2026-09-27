@@ -161,8 +161,8 @@ pub const ROUTERS: &[RouterInst] = &[
         rule: SOFTMAX_NORM,
         norm_arg: false,
         per_lane: 4,
-        top_k_min: 8,
-        top_k_max: 8,
+        top_k_min: 1,
+        top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen3moe_router_*",
     },
     RouterInst {
@@ -170,8 +170,8 @@ pub const ROUTERS: &[RouterInst] = &[
         rule: SOFTMAX_NORM_GATED,
         norm_arg: false,
         per_lane: 8,
-        top_k_min: 8,
-        top_k_max: 8,
+        top_k_min: 1,
+        top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen35moe_router_*",
     },
     RouterInst {
@@ -179,8 +179,8 @@ pub const ROUTERS: &[RouterInst] = &[
         rule: SOFTMAX_NORM_GATED,
         norm_arg: false,
         per_lane: 16,
-        top_k_min: 10,
-        top_k_max: 10,
+        top_k_min: 1,
+        top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen35moe_router_*_512",
     },
     RouterInst {
@@ -511,8 +511,8 @@ pub fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttnShape, GQA, GroupRule, MoeShape, ROUTERS, Refusal, RouterRule, Shape, rules,
-        select_gqa, select_router,
+        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterRule, Shape,
+        rules, select_gqa, select_router,
     };
     use crate::{Act, Moe, Router, Score, Shared};
 
@@ -614,15 +614,25 @@ mod tests {
     #[test]
     fn a_top_k_outside_the_row_is_refused() {
         for (s, min, max) in [
-            (moe(rules::SOFTMAX_NORM_GATED, 256, 0), 8, 8),
-            (moe(rules::SOFTMAX_NORM_GATED, 256, 10), 8, 8),
-            (moe(rules::SOFTMAX_NORM_GATED, 512, 8), 10, 10),
+            (moe(rules::SOFTMAX_NORM_GATED, 256, 0), 1, LANE_PICKS),
+            (
+                moe(rules::SOFTMAX_NORM_GATED, 256, LANE_PICKS + 1),
+                1,
+                LANE_PICKS,
+            ),
+            (moe(rules::SOFTMAX_NORM, 128, 33), 1, LANE_PICKS),
             (moe(rules::SOFTMAX_TOPK, 64, 8), 6, 6),
             (moe(rules::BIASED_SQRT_SOFTPLUS, 384, 8), 6, 6),
             (moe(rules::BIASED_SQRT_SOFTPLUS, 128, 6), 3, 3),
         ] {
             let e = select_router(s).expect_err("selected outside the row");
             assert_eq!(e.why, Refusal::TopK { min, max }, "{s:?}");
+        }
+        // Every count of a lane-held row selects.
+        for k in 1..=LANE_PICKS {
+            assert!(select_router(moe(rules::SOFTMAX_NORM_GATED, 256, k)).is_ok());
+            assert!(select_router(moe(rules::SOFTMAX_NORM_GATED, 512, k)).is_ok());
+            assert!(select_router(moe(rules::SOFTMAX_NORM, 128, k)).is_ok());
         }
     }
 

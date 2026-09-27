@@ -107,7 +107,7 @@ mod bench_arm;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::router::{N_EXPERT, N_USED, gated};
+    use bloomery_gpu::arch::qwen3moe::router::RouterDims;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
         GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmTile,
@@ -122,6 +122,7 @@ mod gate {
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+    use model::arch::models::shape::{MoeShape, rules};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// What `y` holds before a launch, so an output the kernel leaves alone
@@ -1560,9 +1561,22 @@ mod gate {
         let max_tok = ROUTE_TOKENS[ROUTE_TOKENS.len() - 1];
         let mut ok = true;
         gpu.clear_fault()?;
+        // Qwen3's and Qwen3.6's routers, each at its model's shape through
+        // the instance table: the stacks' experts and a token's slots.
+        let router = |rule, experts, top_k| {
+            RouterDims::of(MoeShape {
+                rule,
+                experts,
+                top_k,
+            })
+        };
+        let (q3, q35) = (
+            router(rules::SOFTMAX_NORM, 128, 8)?,
+            router(rules::SOFTMAX_NORM_GATED, 256, 8)?,
+        );
         for (stack, n_exp, top_k) in [
-            ("qwen3", N_EXPERT, N_USED),
-            ("qwen35", gated::ROWS, gated::N_SLOTS),
+            ("qwen3", q3.experts(), q3.slots()),
+            ("qwen35", q35.logits(), q35.slots()),
             ("v41", 384usize, 6usize),
         ] {
             let max_slots = max_tok * top_k;
