@@ -8,6 +8,7 @@ use crate::family::{Family, Identity};
 
 pub mod deepseek41;
 pub mod deepseek41v;
+pub mod glm5next;
 pub mod qwen35moe;
 
 /// Each architecture's families, by the architecture's name.
@@ -15,6 +16,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (deepseek41::ARCH, deepseek41::FAMILIES),
     (deepseek41v::ARCH, deepseek41v::FAMILIES),
     (qwen35moe::ARCH, qwen35moe::FAMILIES),
+    (glm5next::ARCH, glm5next::FAMILIES),
 ];
 
 /// The families of architecture `arch`; none for one the table does not hold.

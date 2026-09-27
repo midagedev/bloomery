@@ -1,0 +1,28 @@
+# Round glmref: ik's CPU node dumps of the GLM-5.3-Flash UD-Q4_K_XL split set (six shards, 199,707,321,347 B),
+# each one `just dump-ref-glm5next [VARIANT]` under this card: the batch set, then step4, step4-every-node and
+# d1k, one lease each. dump_ref loads without --defer-experts, so ik's loader populates every shard in turn
+# (one stream), then computes on 32 threads, then writes the nodes to /root/bloomery-data (nvme1; the model is
+# on nvme0). The three phases run one after the other: the wall is their sum.
+# The one term the batch dump fixes: the cold-read rate of this file on this NVMe through the loader's populate.
+# The file was 0.0 % resident at 2026-09-27T02:59Z (mincore over the six shards), so the first dump reads
+# all of it from the device; the witness block's read-sectors and wall give the rate.
+# Minutes per dump [derived]:
+#   populate  cold: 199.7 GB at 1.07-1.33 GB/s, the single-stream populate rates of the 09-13 and 09-23
+#             witnesses (q35oracle's 21.17 GB cold batch fits them: ~16 s): 150-187 s; at the memo's 2.5 GB/s
+#             (exl3's GLM load, rig-log 09-16; parallel reads) 80 s. Warm: the page cache mapped again, >= 7 GB/s
+#             (q35oracle's warm step dumps held their 21 GB inside a ~3 s fixed term): <= 29 s
+#   fixed     lease, witnesses, 1,412 tensors' metadata over six shards, context: 3-15 s (q35oracle: ~3 s)
+#   compute   batch and step4: 5 tokens, the memo's 1.15 TFLOP for 32 tokens scaled to 5: < 2 s.
+#             d1k: 1,024 tokens at ~36 GFLOP a token (the memo's 32-token figure) = ~37 TFLOP at the 1.25 TFLOP/s
+#             qwen35moe's fused 1,024-token prefill ran (4.0 s at 2.44 B active): 20-45 s
+#   dump      1-6 GB a set (qwen35moe 1.5 GB; GLM's 4-wide hyper-connection residual over 46 layers) at the
+#             0.5 GB/s the qwen3moe and qwen35moe step dumps wrote: 2-12 s
+#   batch cold 1.4-3.6 min (1.5-3 min in the memo); step4, step4-every-node warm 0.2-0.9 min; d1k 0.6-1.6 min;
+#   2.4-7.0 min in all. A step dump that reads the file from the device again (a peer's run between two dumps
+#   evicted it) costs the batch's populate term again; its read-sectors say so.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and populates the whole 199.7 GB split set into the page cache,
+  evicting most of what else is cached (the V4.1 host set among it); beside a timed run or a gate batch it
+  would take their cores, their memory bandwidth and their cache, so it holds the lease; why now: the
+  glm5next oracle every GLM kernel and body round is judged against (round glmref, disposition G10)
+minutes: 0.2..3.6

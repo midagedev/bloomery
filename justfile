@@ -449,6 +449,20 @@ dump-ref-qwen3moe-cuda:
 dump-ref-qwen35moe *VARIANT:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
+# $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
+# 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
+# 덤프마다 199.7 GB 샤드 집합 전체를 CPU 임대 아래서 올리므로 카드가 있어야 한다
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmref-dump.card').
+dump-ref-glm5next *VARIANT:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
+# 같은 5개 id를 ik의 CUDA 백엔드로 $BLOOMERY_DATA/ref_cuda_glm5next/에, TF32는 끈다(NVIDIA_TF32_OVERRIDE=0: 없으면 이 모델에서
+# ik CUDA의 top-1 일치가 0.896이었다, rig-log 2026-09-15). 이대로는 돌 수 없다: dump.sh의 -ngl 99가 199.7 GB 파일을 카드 한 장에
+# 올리므로 CUDA 세트에는 배치 계획이 먼저 필요하다. GPU 소비자는 아직 없다.
+dump-ref-glm5next-cuda:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
