@@ -440,8 +440,8 @@ fn hw_qwen3moe_spec() {
         &mut b,
         &read.spec,
         &read.tensors,
-        "gpu/src/flash_gqa.rs HEAD, GROUP",
-        "GQA flash, head 128, pack 8: 0-47",
+        "models/src/shape.rs GQA",
+        "GQA flash, head 128, group 8: 0-47",
     );
     fail_if_bad(&o, &b);
 }

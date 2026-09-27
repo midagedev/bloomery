@@ -8,6 +8,7 @@ use std::fmt;
 
 use gguf::GgmlType;
 
+use crate::shape::MoeShape;
 use crate::{
     Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, LatentUp,
     LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector, Source,
@@ -25,9 +26,9 @@ pub struct Unimplemented {
 /// instance key: what a kernel is built for, not what it takes as an argument.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Need {
-    /// Grouped-query flash attention: `head` values per head, query heads
-    /// packed `pack` to a key head (the largest power of two dividing the group).
-    Gqa { head: u32, pack: u32 },
+    /// Grouped-query flash attention: `head` values per head, `group` query
+    /// heads to a key head (the shape table picks the pack that serves it).
+    Gqa { head: u32, group: u32 },
     /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer.
     QkRope {
         qk_norm: bool,
@@ -77,14 +78,9 @@ pub enum Need {
         d: u32,
         conv: u32,
     },
-    /// A router over `experts` keeping `top_k`.
-    Router {
-        score: Score,
-        experts: u32,
-        top_k: u32,
-        bias: bool,
-        norm: bool,
-    },
+    /// A router: its rule, the experts it routes over and the experts each
+    /// token keeps.
+    Router(MoeShape),
     /// Experts from a token table.
     HashRouting,
     /// A shared expert of `ff` values.
@@ -131,7 +127,7 @@ pub enum Need {
 impl fmt::Display for Need {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Need::Gqa { head, pack } => write!(f, "GQA flash, head {head}, pack {pack}"),
+            Need::Gqa { head, group } => write!(f, "GQA flash, head {head}, group {group}"),
             Need::QkRope {
                 qk_norm,
                 head,
@@ -200,24 +196,25 @@ impl fmt::Display for Need {
                     write!(f, "delta rule KDA: d {d}, {v_heads} heads, conv {conv}")
                 }
             },
-            Need::Router {
-                score,
+            Need::Router(MoeShape {
+                rule,
                 experts,
                 top_k,
-                bias,
-                norm,
-            } => {
-                let score = match score {
+            }) => {
+                let score = match rule.score {
                     Score::SqrtSoftplus => "sqrt-softplus",
                     Score::Softmax => "softmax",
                     Score::Sigmoid => "sigmoid",
                 };
                 write!(f, "router: {score}, {experts} experts, top {top_k}")?;
-                if *bias {
+                if rule.bias {
                     f.write_str(", with a selection bias")?;
                 }
-                if !norm {
+                if !rule.norm {
                     f.write_str(", kept weights not renormalized")?;
+                }
+                if rule.gated {
+                    f.write_str(", the shared expert's gate as one more row")?;
                 }
                 Ok(())
             }
@@ -292,7 +289,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             Mixer::Gqa(g) => {
                 at(Need::Gqa {
                     head: g.head_dim,
-                    pack: 1 << g.group().trailing_zeros(),
+                    group: g.group(),
                 });
                 at(Need::QkRope {
                     qk_norm: g.qk_norm,
@@ -344,13 +341,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if m.router.hash {
                     at(Need::HashRouting);
                 }
-                at(Need::Router {
-                    score: m.router.score,
-                    experts: m.experts,
-                    top_k: m.top_k,
-                    bias: m.router.bias,
-                    norm: m.router.norm,
-                });
+                at(Need::Router(MoeShape::of(m)));
                 if let Some(s) = m.shared {
                     at(Need::Shared {
                         ff: s.ff,

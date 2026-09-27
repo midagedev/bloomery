@@ -1,11 +1,13 @@
 //! The coverage check: what of a file no program in this tree runs, every
 //! item listed at once ([`check`]). It joins the model's [`needs`] with a
-//! hand-written table of what exists ([`AVAILABLE`], one row per kernel
-//! instance or program step, each citing the constant or the function that
-//! owns it), the card formats of the tensors' types ([`CardFormat`], the
-//! format owner), the program's per-tensor type pins, the pre-tokenizers the
-//! tokenizer runs (`tokenizer::runs_pre_tokenizer`, the tokenizer's own
-//! table) and the chat parsers.
+//! table of what exists ([`AVAILABLE`], one row per kernel instance or
+//! program step, each citing the constant or the function that owns it; the
+//! routers' and the GQA flashes' rows ask the shape table `models::shape`,
+//! which the router crates are held to), the card formats of the tensors'
+//! types ([`CardFormat`], the format owner), the program's per-tensor type
+//! pins, the pre-tokenizers the tokenizer runs
+//! (`tokenizer::runs_pre_tokenizer`, the tokenizer's own table) and the chat
+//! parsers.
 //!
 //! The kernels' own file-against-constant checks stay behind it as a second
 //! line: a file this check passes cannot trip them.
@@ -15,7 +17,8 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use gguf::GgmlType;
-use models::{Arch, Extra, LatentUp, ModelSpec, Need, RopeMode, Score, needs};
+use models::shape::{RouterBody, gqa_row, select_router};
+use models::{Arch, Extra, LatentUp, ModelSpec, Need, RopeMode, needs};
 
 use crate::placement::{CardFormat, ModelTensors, Role, Unimplemented};
 
@@ -77,19 +80,8 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         program: Program::Deepseek41Chain,
-        at: "gpu-deepseek41/src/router.rs N_EXPERT, N_USED",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Router {
-                    score: Score::SqrtSoftplus,
-                    experts: 384,
-                    top_k: 6,
-                    bias: true,
-                    norm: true
-                }
-            )
-        },
+        at: "models/src/shape.rs ROUTERS, the Ds41 body",
+        runs: |n| routes(n, &[RouterBody::Ds41]),
     },
     Available {
         program: Program::Deepseek41Chain,
@@ -116,8 +108,8 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         program: Program::Qwen3moeBody,
-        at: "gpu/src/flash_gqa.rs HEAD, GROUP",
-        runs: |n| matches!(n, Need::Gqa { head: 128, pack: 8 }),
+        at: "models/src/shape.rs GQA",
+        runs: |n| matches!(n, Need::Gqa { head, group } if gqa_row(*head, *group).is_some()),
     },
     Available {
         program: Program::Qwen3moeBody,
@@ -136,21 +128,17 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         program: Program::Qwen3moeBody,
-        at: "gpu/src/arch/qwen3moe/router.rs N_EXPERT, N_USED",
-        runs: |n| {
-            matches!(
-                n,
-                Need::Router {
-                    score: Score::Softmax,
-                    experts: 128,
-                    top_k: 8,
-                    bias: false,
-                    norm: true
-                }
-            )
-        },
+        at: "models/src/shape.rs ROUTERS, the Qwen3moe and Qwen35moe bodies",
+        runs: |n| routes(n, &[RouterBody::Qwen3moe, RouterBody::Qwen35moe]),
     },
 ];
+
+/// Whether the router `n` names has an instance among `bodies`' rows: the
+/// row [`select_router`] picks, so a count or a pick the launchers refuse
+/// is an item here too.
+fn routes(n: &Need, bodies: &[RouterBody]) -> bool {
+    matches!(n, Need::Router(s) if select_router(*s).is_ok_and(|r| bodies.contains(&r.body)))
+}
 
 /// A tensor family whose type a program pins, and the types it reads.
 struct TypePin {
