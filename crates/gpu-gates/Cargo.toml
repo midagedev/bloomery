@@ -267,6 +267,10 @@ name = "gate_kquant"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_cand"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_hc_gated"
 required-features = ["gpu"]
 

@@ -5,7 +5,10 @@
 //! not in types: what the chain reads is the table below, never the
 //! architecture string.
 //!
-//! Nothing here has a default: a key the file lacks is an error naming the key.
+//! Nothing here has a default: a key the file lacks is an error naming the key,
+//! with one exception, the candidate mask's three keys ([`CandidateMask`]): ik
+//! reads them as optional with the reference's values as defaults, and the
+//! files carry none of them.
 //! Three quantities have no key in the file and come from where ik takes them:
 //! the vocabulary size from the token list, dense-ness from the router's
 //! presence, and the layer kinds from the tensors each layer carries. A value
@@ -31,17 +34,25 @@ use crate::placement::PlacementError;
 const IK_SQRT_SOFTPLUS: u64 = 4;
 
 /// The V4.1 reference's two-level candidate mask (`select_candidate_blocks`,
-/// model.py:583-610), which the HF `config.json` carries (:125-127) and the GGUF
-/// does not: every layer after the source layer takes its index top-k among
-/// the [`CANDIDATE_TOPK_BLOCKS`] blocks of [`CANDIDATE_BLOCK_SIZE`] compressed
-/// rows that the source layer's index scores rank first. This engine does not
-/// build it; [`Hparams::candidate_free_positions`] bounds where that changes
+/// model.py:583-610), which the HF `config.json` carries (:125-127): every
+/// layer after the source layer takes its index top-k among the
+/// [`CANDIDATE_TOPK_BLOCKS`] blocks of [`CANDIDATE_BLOCK_SIZE`] compressed rows
+/// that the source layer's index scores rank first. The three constants are
+/// the defaults of the file's keys ([`CandidateMask`]).
+/// [`Hparams::candidate_free_positions`] bounds where the mask changes
 /// nothing.
 pub const CANDIDATE_SOURCE_LAYER: usize = 20;
 /// Blocks the candidate mask keeps ([`CANDIDATE_SOURCE_LAYER`]).
 pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
 /// Compressed rows per candidate block ([`CANDIDATE_SOURCE_LAYER`]).
 pub const CANDIDATE_BLOCK_SIZE: usize = 8;
+
+/// `attention.candidate_source_layer_id`, ik's `LLM_KV_CANDIDATE_SOURCE_LAYER`.
+const CANDIDATE_SOURCE_KEY: &str = "attention.candidate_source_layer_id";
+/// `attention.candidate_block_size`, ik's `LLM_KV_CANDIDATE_BLOCK_SIZE`.
+const CANDIDATE_BLOCK_KEY: &str = "attention.candidate_block_size";
+/// `attention.candidate_topk_blocks`, ik's `LLM_KV_CANDIDATE_TOPK_BLOCKS`.
+const CANDIDATE_TOPK_KEY: &str = "attention.candidate_topk_blocks";
 
 /// Which model of this module a file holds, by its `general.architecture`
 /// ([`crate::arch::deepseek41_model`] reads it).
@@ -113,6 +124,8 @@ pub struct Hparams {
     pub hca_ratio: u32,
     /// The indexer's shape and selection width.
     pub indexer: Indexer,
+    /// The candidate mask; `None` for V4, which has none.
+    pub candidates: Option<CandidateMask>,
     /// The hyper-connections' stream count and Sinkhorn constants.
     pub hc: HyperConnections,
     /// How the hyper-connection streams become one before the output norm.
@@ -198,6 +211,117 @@ pub struct Indexer {
     /// `attention.indexer.top_k` — the compressed rows one query keeps, unless
     /// [`Hparams::with_indexer_top_k`] replaced it.
     pub top_k: usize,
+}
+
+/// V4.1's candidate mask: the blocks of compressed rows the later indexers
+/// choose among. Its three keys are optional, each absent key taking the
+/// reference's value, as ik reads them (a tree newer than the oracle build,
+/// `81af2772`, llama-hparams.cpp:2309-2323, under `V41_SEPARATE`). One
+/// difference is named: ik turns a present block size or block count of 0
+/// into the default, and here a present value that cannot be one is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateMask {
+    /// `attention.candidate_source_layer_id` — the layer whose index scores
+    /// rank the blocks ([`CANDIDATE_SOURCE_LAYER`]).
+    pub source_layer: usize,
+    /// `attention.candidate_block_size` — compressed rows per block
+    /// ([`CANDIDATE_BLOCK_SIZE`]).
+    pub block_size: usize,
+    /// `attention.candidate_topk_blocks` — blocks kept, the source's newest
+    /// block among them ([`CANDIDATE_TOPK_BLOCKS`]).
+    pub topk_blocks: usize,
+}
+
+impl CandidateMask {
+    /// The fewest candidate rows a query of a selecting position keeps: the
+    /// `topk_blocks − 1` full blocks besides its newest, which can hold one
+    /// row.
+    #[must_use]
+    pub fn min_candidate_rows(&self) -> usize {
+        self.topk_blocks
+            .saturating_sub(1)
+            .saturating_mul(self.block_size)
+            .saturating_add(1)
+    }
+
+    /// The mask the three values make for an indexer that keeps `top_k`
+    /// rows; the key suffix and the reason of the first value that cannot be
+    /// one. A source layer the file names (`source`: its layer count, and
+    /// whether layer `l` runs the indexer) must be one of its indexer layers;
+    /// the default names none, and a file without that layer (the gate
+    /// fixture's nine) keeps the mask's reach unknown
+    /// ([`Hparams::candidate_free_positions`] is then 0).
+    fn checked(
+        mask: CandidateMask,
+        source: Option<(usize, &dyn Fn(usize) -> bool)>,
+        top_k: usize,
+    ) -> Result<CandidateMask, (&'static str, String)> {
+        let CandidateMask {
+            source_layer: src,
+            block_size,
+            topk_blocks,
+        } = mask;
+        if block_size == 0 {
+            return Err((CANDIDATE_BLOCK_KEY, "is 0: a block holds rows".to_string()));
+        }
+        if topk_blocks == 0 {
+            return Err((
+                CANDIDATE_TOPK_KEY,
+                "is 0: the source's newest block is always kept".to_string(),
+            ));
+        }
+        if let Some((n_layer, indexes)) = source {
+            if src >= n_layer {
+                return Err((
+                    CANDIDATE_SOURCE_KEY,
+                    format!("is {src}, past the file's {n_layer} layers"),
+                ));
+            }
+            if !indexes(src) {
+                return Err((
+                    CANDIDATE_SOURCE_KEY,
+                    format!("names layer {src}, which runs no indexer to rank the blocks"),
+                ));
+            }
+        }
+        if mask.min_candidate_rows() < top_k {
+            return Err((
+                CANDIDATE_TOPK_KEY,
+                format!(
+                    "keeps {topk_blocks} blocks of {block_size}: as few as {} candidate rows, fewer \
+                     than the indexer's top_k {top_k}",
+                    mask.min_candidate_rows()
+                ),
+            ));
+        }
+        Ok(mask)
+    }
+
+    /// V4.1's mask from `split`'s keys, checked against top_k, and a source
+    /// layer the file names against its layers.
+    fn read(
+        split: &Split,
+        layers: &[LayerKind],
+        top_k: usize,
+    ) -> Result<CandidateMask, PlacementError> {
+        let key_or = |suffix: &str, default: usize| -> Result<usize, PlacementError> {
+            if split.value(&split.arch_key(suffix)).is_some() {
+                meta_usize(split, suffix)
+            } else {
+                Ok(default)
+            }
+        };
+        let mask = CandidateMask {
+            source_layer: key_or(CANDIDATE_SOURCE_KEY, CANDIDATE_SOURCE_LAYER)?,
+            block_size: key_or(CANDIDATE_BLOCK_KEY, CANDIDATE_BLOCK_SIZE)?,
+            topk_blocks: key_or(CANDIDATE_TOPK_KEY, CANDIDATE_TOPK_BLOCKS)?,
+        };
+        let indexes = |l: usize| layers.get(l).is_some_and(|k| k.indexer);
+        let named = split.value(&split.arch_key(CANDIDATE_SOURCE_KEY)).is_some();
+        let source = named.then_some((layers.len(), &indexes as &dyn Fn(usize) -> bool));
+        CandidateMask::checked(mask, source, top_k)
+            .map_err(|(suffix, detail)| metadata(split, suffix, detail))
+    }
 }
 
 /// The hyper-connections every sublayer folds its input from and mixes its
@@ -464,6 +588,10 @@ impl Hparams {
         };
         let layers = layer_kinds(split, &carries, &walk, &tables, engram.as_ref(), &ropes)?;
         let dense_lead = dense_lead(split, &layers)?;
+        let candidates = match model {
+            Model::Deepseek41 => Some(CandidateMask::read(split, &layers, indexer.top_k)?),
+            Model::Deepseek4 => None,
+        };
         Ok(Hparams {
             model,
             n_layer,
@@ -483,6 +611,7 @@ impl Hparams {
             csa_ratio: walk.csa_ratio,
             hca_ratio: walk.hca_ratio,
             indexer,
+            candidates,
             hc: HyperConnections {
                 streams: meta_usize(split, "hyper_connection.count")?,
                 sinkhorn_iters: meta_usize(split, "hyper_connection.sinkhorn_iterations")?,
@@ -513,33 +642,57 @@ impl Hparams {
         self
     }
 
+    /// The same model with the candidate mask keeping `blocks` blocks: ik's
+    /// `--override-kv <arch>.attention.candidate_topk_blocks=int:<blocks>`.
+    /// Refused by name for V4, which has no mask, and for a count whose
+    /// fewest candidate rows are fewer than the indexer's top_k.
+    pub fn with_candidate_topk_blocks(mut self, blocks: usize) -> Result<Hparams, ModelError> {
+        let key = format!("{}.{CANDIDATE_TOPK_KEY}", self.model.name());
+        let Some(mask) = self.candidates else {
+            return Err(ModelError::Metadata {
+                key,
+                detail: "cannot be set: the model has no candidate mask".to_string(),
+            });
+        };
+        let mask = CandidateMask::checked(
+            CandidateMask {
+                topk_blocks: blocks,
+                ..mask
+            },
+            None,
+            self.indexer.top_k,
+        )
+        .map_err(|(_, detail)| ModelError::Metadata { key, detail })?;
+        self.candidates = Some(mask);
+        Ok(self)
+    }
+
     /// The positions at which an index top-k over every compressed row is
     /// the reference's. V4.1's candidate mask keeps every block while the
-    /// source layer's stream holds at most `CANDIDATE_TOPK_BLOCKS ·
-    /// CANDIDATE_BLOCK_SIZE` rows, and a query at position `p` reaches
-    /// `(p + 1) / ratio` of them (model.py:562-567): so the first `blocks ·
-    /// size · ratio` positions, exact at ratio 1 (the V4.1 file's) and a
-    /// bound below the exact end above it. `usize::MAX` for V4, which has no
-    /// mask; 0 for a V4.1 file without that layer or whose layer compresses
-    /// nothing, where the mask's reach is unknown.
+    /// source layer's stream holds at most `topk_blocks · block_size` rows,
+    /// and a query at position `p` reaches `(p + 1) / ratio` of them
+    /// (model.py:562-567): so the first `blocks · size · ratio` positions,
+    /// exact at ratio 1 (the V4.1 file's) and a bound below the exact end
+    /// above it. `usize::MAX` for V4, which has no mask; 0 for a file without
+    /// the source layer (the gate fixture's nine layers) or whose source
+    /// layer compresses nothing, where the mask's reach is unknown.
     pub fn candidate_free_positions(&self) -> usize {
         candidate_free_positions(
-            self.model,
-            self.layers
-                .get(CANDIDATE_SOURCE_LAYER)
+            self.candidates,
+            self.candidates
+                .and_then(|c| self.layers.get(c.source_layer))
                 .map(LayerKind::ratio),
         )
     }
 }
 
-/// [`Hparams::candidate_free_positions`] for `model` whose candidate source
-/// layer compresses at `source_ratio` (`None`: the file has no such layer).
-fn candidate_free_positions(model: Model, source_ratio: Option<u32>) -> usize {
-    match model {
-        Model::Deepseek4 => usize::MAX,
-        Model::Deepseek41 => {
-            CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE * source_ratio.unwrap_or(0) as usize
-        }
+/// [`Hparams::candidate_free_positions`] for the mask `mask` (`None`: the
+/// model has none) whose source layer compresses at `source_ratio` (`None`:
+/// the file has no such layer).
+fn candidate_free_positions(mask: Option<CandidateMask>, source_ratio: Option<u32>) -> usize {
+    match mask {
+        None => usize::MAX,
+        Some(c) => c.topk_blocks * c.block_size * source_ratio.unwrap_or(0) as usize,
     }
 }
 
@@ -1559,13 +1712,59 @@ mod tests {
     fn candidate_mask_bounds_the_positions() {
         let (_, ratios) = served();
         let source = ratios.get(CANDIDATE_SOURCE_LAYER).copied();
-        assert_eq!(candidate_free_positions(Model::Deepseek41, source), 16_384);
-        assert_eq!(candidate_free_positions(Model::Deepseek41, Some(2)), 32_768);
-        assert_eq!(candidate_free_positions(Model::Deepseek41, Some(0)), 0);
-        assert_eq!(candidate_free_positions(Model::Deepseek41, None), 0);
+        let mask = Some(DEFAULT_MASK);
+        assert_eq!(candidate_free_positions(mask, source), 16_384);
+        assert_eq!(candidate_free_positions(mask, Some(2)), 32_768);
+        assert_eq!(candidate_free_positions(mask, Some(0)), 0);
+        assert_eq!(candidate_free_positions(mask, None), 0);
+        assert_eq!(candidate_free_positions(None, source), usize::MAX);
+    }
+
+    /// The reference's values, the defaults of the three keys.
+    const DEFAULT_MASK: CandidateMask = CandidateMask {
+        source_layer: CANDIDATE_SOURCE_LAYER,
+        block_size: CANDIDATE_BLOCK_SIZE,
+        topk_blocks: CANDIDATE_TOPK_BLOCKS,
+    };
+
+    /// The served table's mask passes; each value that cannot be one is
+    /// refused by its key: a zero block size or count, a named source past
+    /// the layers or one without an indexer, and a count whose fewest
+    /// candidate rows fall below top_k — `(K − 1)·B + 1`, since the newest
+    /// block can hold a single row. The default source is not checked
+    /// against the layers: the fixture's nine layers load.
+    #[test]
+    fn candidate_mask_refuses_each_value_by_its_key() {
+        let (carries, _) = served();
+        let indexes = |l: usize| carries.get(l).is_some_and(|c| c.indexer);
+        let named = Some((carries.len(), &indexes as &dyn Fn(usize) -> bool));
+        let check = |m: CandidateMask, top_k: usize| {
+            CandidateMask::checked(m, named, top_k).map_err(|(key, _)| key)
+        };
+        assert_eq!(check(DEFAULT_MASK, 512), Ok(DEFAULT_MASK));
         assert_eq!(
-            candidate_free_positions(Model::Deepseek4, source),
-            usize::MAX
+            CandidateMask::checked(DEFAULT_MASK, None, 512),
+            Ok(DEFAULT_MASK)
         );
+        let nine = |l: usize| l < 9;
+        assert_eq!(
+            CandidateMask::checked(DEFAULT_MASK, Some((9, &nine)), 512).map_err(|(k, _)| k),
+            Err(CANDIDATE_SOURCE_KEY)
+        );
+        assert_eq!(DEFAULT_MASK.min_candidate_rows(), 16_377);
+        let with = |source_layer, block_size, topk_blocks| CandidateMask {
+            source_layer,
+            block_size,
+            topk_blocks,
+        };
+        assert_eq!(check(with(20, 0, 2048), 512), Err(CANDIDATE_BLOCK_KEY));
+        assert_eq!(check(with(20, 8, 0), 512), Err(CANDIDATE_TOPK_KEY));
+        assert_eq!(check(with(40, 8, 2048), 512), Err(CANDIDATE_SOURCE_KEY));
+        assert_eq!(check(with(21, 8, 2048), 512), Err(CANDIDATE_SOURCE_KEY));
+        // The d1c geometry: 16 blocks of 8 keep at least 121 rows.
+        assert_eq!(check(with(20, 8, 16), 64), Ok(with(20, 8, 16)));
+        assert_eq!(check(with(20, 8, 16), 121), Ok(with(20, 8, 16)));
+        assert_eq!(check(with(20, 8, 16), 122), Err(CANDIDATE_TOPK_KEY));
+        assert_eq!(check(with(20, 8, 1), 2), Err(CANDIDATE_TOPK_KEY));
     }
 }

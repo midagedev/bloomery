@@ -120,6 +120,11 @@ gate-gpu-q4k-sel:
 gate-gpu-kquant:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
 
+# 두 단계 후보 선택(bloomery_gpu::cand, V4.1 후보 마스크의 커널 넷)을 모델 없이 합성 점수로 호스트 규칙과 비트 대조한다: 블록 키,
+# 참조 select_candidate_blocks의 선택(핀, 동점은 낮은 블록, ±0 동점), 경계 이하 무작업, 압축·히스토그램·카운트 뷰, remap, 폴트, 캡처 재생.
+gate-gpu-cand:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_cand && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_cand'
+
 # Qwen3.8의 gated-residual hyper-connection(bloomery_gpu::hc_gated)을 모델 없이 파일 모양(4×2560, rank 320)의 합성
 # 입력으로 본다: f64 규칙의 밴드, 단계마다 카드 규칙과 비트 동일, 8열과 1열, combine·init, 이름 붙은 거부, 폴트, 로컬 depot.
 gate-gpu-hc-gated:
