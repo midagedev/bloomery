@@ -1,0 +1,28 @@
+# Lead, 2026-09-28: the Mac's V4.1 router sets (prose, code, korean) and hotlist-384.txt were traced from
+# the dropped DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8 file (their `# model` lines), not
+# the public Q3_K_M the plans and the re-sit load. The warm re-sit needs held-out lists anyway
+# (adaptres §5: the seed from each corpus's [0, 24576), prompt ids from [24576, ...)). So three traces of
+# the public file, each corpus's first 24,576 ids, and a hot list from those three only.
+# Paper: the two files share every routed expert tensor's quant (Q3_K) and differ in the engram, token
+# embedding and attention precision, so the router sees slightly different hidden states: most top-384
+# ranks agree, near-tie ranks move. Predict the mean per-layer overlap of the two lists' first 384 at
+# 0.80..0.95 [derived, no measurement of this kind yet].
+# Wall [derived]: 24,576 ids at the prose set's 66.5 tok/s = 6.2 min a corpus plus a cold read, 7-12 min
+# each, three runs in one lease each; the hot-list build seconds.
+kind: profile
+question: how far does the hot list learned on the public file's routing sit from the engramQ8 list
+  the V4.1 plans read today?
+term: mean over layers 0-39 of |top384(pub-seed) ∩ top384(hotlist-384)| / 384, where pub-seed is the
+  hot list built from prose-pub, code-pub and korean-pub (each corpus's ids [0, 24576), public Q3_K_M)
+unit: ratio
+predict: 0.80..0.95
+condition: three runs, one lease each (router-trace.sh's lease_take):
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/router-pub.card' just trace-router prose --name
+  prose-pub --chunk 2048 --max-tokens 24576, the same for code and korean; then `just hotlist all
+  hotlist-pub-seed.txt prose-pub code-pub korean-pub` (no lease); every set's manifest names the public
+  first shard and carries its complete trailer; the overlap read on the Mac from the two list files
+decide-in: the plans move to hotlist-pub-seed.txt; the re-sit draws prompt ids from [24576, ...)
+decide-below: the engramQ8 list was a different list for the public file: every V4.1 hot-list row since
+  the requant was dropped is re-read as a cross-file list, and the replays (ideaverify V1-V4) are re-run
+  on the public sets before their numbers are cited
+decide-above: the lists agree; the switch is still made (held-out by construction), no row is re-read
