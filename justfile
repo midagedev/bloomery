@@ -668,17 +668,19 @@ gate-engram:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --lib --test engram -- --include-ignored --nocapture'
 
 # 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
-# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3)와 qwen3moe 어휘(qwen2) 둘 다.
+# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3), qwen3moe 어휘(qwen2), GLM-5.3-Flash 어휘(glm4) 셋 다.
 # oracle.sh가 어휘마다 오라클 파일을 먼저 다시 쓴다(어휘만 적재, 임대 없음, 1분 안).
-# qwen3moe 어휘의 참조는 /home/user/ik-tokref(ik-idxkey와 같은 커밋 + ik#2520 tolower 수정)의 llama-tokenize로 뜬다 —
-# ik의 unicode_tolower는 정렬되지 않은 표에 lower_bound를 써서 (?i:'re) 같은 축약이 어긋나고, 그 경로는 qwen2 정규식만 탄다.
+# qwen3moe와 GLM 어휘의 참조는 /home/user/ik-tokref(ik-idxkey와 같은 커밋 + ik#2520 tolower 수정)의 llama-tokenize로 뜬다 —
+# ik의 unicode_tolower는 정렬되지 않은 표에 lower_bound를 써서 (?i:'re) 같은 축약이 어긋나고, 그 경로는 qwen2 정규식과
+# llama3 정규식(glm4가 쓰는 분할기)이 탄다.
 # #2520이 ik에 들어가면 기본 트리로 되돌린다. V4.1 어휘의 참조도 곁가지 트리다: oracle.sh의 기본 TOKENIZE는 /home/user/ik-tilde
 # (ik main + `~`를 S에 넣는 한 줄, ik#2528)이고, 참조의 `~/`가 [71520]이 아니면 거부한다 — #2528이 들어가면 되돌린다.
 gate-tokenizer:
-    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
-# HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙, V4.1 채팅 템플릿 렌더링. 박스 자원 불필요.
+    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf TOKENIZER_SET=tokenizer-glm5next timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+# HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
+# GLM 도구 호출 파서(glmxml). 박스 자원 불필요.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml -- --include-ignored --nocapture'
 
 # engram IO 실험실의 시험(crates/engram-lab, 엔진 사용처 없음): 컨텍스트 창의 슬롯 순서, 행 캐시의 LRU를 스택
 # 거리 모의와 대조, 캐시가 내주는 바이트. 이름이 gate-가 아니라 lab-이라 `just affected`가 엔진 착륙에서 고르지

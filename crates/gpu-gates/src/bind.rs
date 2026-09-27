@@ -89,6 +89,11 @@ impl Tokenizer for Vocab {
         self.eos
     }
 
+    fn stops(&self) -> Vec<u32> {
+        // The reference's end-of-generation set: the header's eos, eot and eom.
+        self.tok.eog().to_vec()
+    }
+
     fn add_bos(&self) -> bool {
         self.tok.add_bos()
     }

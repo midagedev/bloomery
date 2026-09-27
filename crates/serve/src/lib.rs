@@ -10,6 +10,7 @@ mod api;
 pub mod dsml;
 pub mod engine;
 mod genloop;
+pub mod glmxml;
 mod http;
 pub mod mock;
 pub mod reasoning;
