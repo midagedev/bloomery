@@ -153,7 +153,7 @@ e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 
 | `launchlog` | S | `gpu/src/graph.rs`(`NodeInfo.kernel`), 런치 진입점 하나, `record.rs` kind, 레버 행 | gpumodel WIP; `graph.rs`는 03 hostone A와 순서(A가 먼저면 그 위) | 850 s[유도] | 3 | 발사 11:xx |
 | `q5kexp` | M | 새 `gpu/src/kquant/**`, 새 bin `gate_kquant`, 등록 파일(12번) | 없음(증명 급 "add" — AGENTS 행은 리드가 열차 2에) | 디바이스 빌드, 모델 파일 없는 게이트 | 3 | 발사 11:xx; 첫 소비자 GLM |
 | `glm5next` | S–M | 새 `arch/glm5next/**`, `crates/models`의 새 층 종류·연산(KDA, MLA+k-pool 인덱서, LayerNorm, mHC 평균 합류, 288/8 sigmoid 라우터), `gate-glm5next-meta` | modelspec WIP(10번); 헤더 핀은 샤드 1(검증됨), 텐서 커버리지는 `/root/glmdl.rc` ok 뒤 | 호스트 전용 | 3 | 발사 11:xx |
-| `glmops` (설계) | M | 없음 | — | 없음 | — | 발사 11:xx → 메모 `research/glmops-design.md` → 라운드 `kda`·`kpool`·`hcmean`·`router288`·`ln` |
+| ~~`glmops`~~ (설계) | M | 없음 | — | 없음 | — | 보고 11:30 → `research/glmops-design.md`(처분 G1–G12) → 트리아지 「glm 사슬」: `glmserve`(지금, 함대) · `glmref`(다운로드 ok 즉시) · `glmkda`(03) → opslib 뒤 {`hcq8` ‖ `route288` ‖ `glmmla` ‖ `ffnq8act`} → `glmprog` → `glmsel` → `glmmtp` |
 | ~~`qwen4arch`~~ (설계) | S–M | 없음 | — | 없음 | — | 보고 11:23 → `research/qwen4arch-design.md`(처분 Q1–Q8) → 트리아지 「q38 사슬」: `q38reader`(aa, glm5next 뒤) → {K1–K3 03 ‖ K4 03 ‖ K5 `q38hc`·K6 `q38ple` aa} → P1 `q38prog` ‖ E1 `q38oracle` → K7 `q38qsa` |
 | ~~`machineaxes`~~ (설계) | S | 없음 | — | 없음 | — | 보고 11:20 → `research/machine-axes.md`(처분 M1–M5) → 라운드 `archkey`(S, 도구)·`isarefuse`(S, 공개 전, fixup7과)·`sparkprep`(S 넷, 하드웨어 없이) |
 | `candmask` R1 | M | 새 커널 계열 + 비트 단위 게이트(`research/candmask-design.md`) | q5kexp와 등록 파일만 공유 | 디바이스 | 3–4 | 열차 2 뒤 발사 |

@@ -3,8 +3,7 @@
 The memo of round `machineaxes` (rebuild wave 3, research only, 2026-09-27), kept as it reported, under the lead's
 dispositions. It answers `docs/rebuild.md` §2-3's two "check first" questions and sizes the three axes the user asked
 about. Every number in the memo is derived unless it names its measured source; the NVIDIA figures were read through
-WebFetch summaries (the lead did not re-read the pages; the values match what the lead knows of GB10 — cc 12.1, 128 GB
-LPDDR5x at 273 GB/s, 20 Arm cores — and are to be re-read from the pages before any of them is written into `docs/facts.md`).
+WebFetch summaries; ~~the lead did not re-read the pages~~ the lead re-read the three pages by curl the same day (11:35): the hardware page says "128 GB LPDDR5x unified system memory, 256-bit interface, 4266 MHz, 273 GB/s bandwidth", "CUDA Cores : 6,144", "20 cores (10 Cortex-X925 + 10 Cortex-A725)", "GB10 SOC Thermal Design Power (TDP) is 140W"; the CUDA GPUs page lists "12.1 NVIDIA GB10 (DGX Spark)". The memo's figures stand and may go into `docs/facts.md` as quoted.
 
 ## Lead's dispositions (2026-09-27)
 
