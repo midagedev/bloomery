@@ -49,6 +49,12 @@
 #   llama.cpp pp4096           2,800..4,700
 #   llama.cpp pp4096 at -ub/-b 4096  4,600..7,700 (Qwen3's llama.cpp 4,205 -> 6,904 at -ub 4096,
 #                                               09-25#q3ubatch-ab: x1.64 on the 2,800..4,700 above)
+#   mistral.rs decode, d 6     85..115 tok/s  (q36mrs's functional smoke on the 3090, 16 tokens: 119.1 at
+#                                               d 6 and 109.0 at d 4096, x 768/936 GB/s for the A6000,
+#                                               +-15 %)
+#   mistral.rs decode, d 4096  78..105 tok/s
+#   mistral.rs pp512           the reference, not predicted (its prompt runs in 512-token chunks
+#                                               under PagedAttention: scheduler.rs:217-224)
 #   llama.cpp fit rows         = the lcpp rows inside the ruler (the whole model fits the A6000, so
 #                                               llama-bench's fit leaves the placement as -ngl 99:
 #                                               fitarm, common/fit.cpp:354 "no changes needed")
@@ -64,11 +70,12 @@ term: tok/s @ n=96, depth 6, A6000, bloomery (generate_qwen3moe of the landing t
 unit: tok/s
 predict: 183..205
 condition: one lease, three rounds, arms 6 lcpp:6 1024 lcpp:1024 4096 lcpp:4096 512 lcpppp:512
-  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096, the order rotated every round; every
+  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096 mrs:6 mrs:4096 mrspp:512, the order
+  rotated every round (mrspa0 stays out: paged attention off has had no smoke); every
   lcppfit/lcppppfit row carries its fit column (a failed fit is a FAIL row, not a number); the
   whole model is card-resident for both engines,
   so no arm pages the host; no row carries [cpu-busy] or [other-busy]; the full runner output goes
-  to a file first. Command: BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
+  to a file first. Command: BLOOMERY_AB_ROUNDS=3
   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q36-public.card' just depth-gpu-qwen35moe
   <the arms above> > <log> 2>&1
 reason: sets the decode rows of the public Qwen3.6 table (llama.cpp beside ours) and ~~checks the

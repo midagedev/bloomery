@@ -29,10 +29,21 @@
 #                   no PR branch; LCPPBIN moves its llama-bench alone
 #   LCPP_GPU_FLAGS  qwen3moe.sh's: every layer and the head on the card, flash attention on. No
 #                   flag sweep has been run on this model
+#   MRS             the mistral.rs tree the `mrs:<D>`, `mrspa0:<D>` and `mrspp:<P>` arms run, qwen3moe.sh's
+#                   (its release build). It opens this file as `qwen35moe` through its native Qwen3-Next
+#                   loader (mistralrs-core/src/gguf/normal_registry.rs: the Qwen35Moe schema and the
+#                   Qwen3Next adapter; normal_bindings.rs bind_qwen3_next maps the GDN tensors); MRSBIN
+#                   moves its `mistralrs` binary alone
+#   MRS_FLAGS       qwen3moe.sh's: `--format gguf`. Under PagedAttention (the mrs and mrspp arms) this
+#                   model's prompt runs in chunks of at most 512 tokens whatever P: its hybrid cache sends
+#                   the prompt down the scheduler's recurrent path (mistralrs-core/src/paged_attention/
+#                   scheduler.rs, select_recurrent_prompt_batch: chunk = min(max_prefill_chunk_tokens,
+#                   budget)), not the up to 4096 a step qwen3moe's prompt gets. An mrspp row of this
+#                   profile is a prefill in 512-token chunks
 #
-# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs reference arms
-# (IK_GPU_FLAGS, MRS, MRS_FLAGS): nobody has read whether ik's fused flags apply to build_qwen35moe
-# or whether the mistral.rs tree opens this file. Every script that reads them runs under `set -u`
+# Deliberately unset: IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, IK_BEST_FLAGS and REF_PROMPTS. Nobody has
+# read whether ik's fused flags (-fmoe, -mqkv, -muge) apply to build_qwen35moe, and no CPU flag sweep
+# and no prompt set exist for this model. Every script that reads them runs under `set -u`
 # (depth-qwen3moe.sh reads an engine's names only when it has arms), so such a script stops at the
 # unset name instead of running an engine at flags nobody chose.
 #
@@ -54,6 +65,9 @@ REF_DUMP_LEASE=1
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
+: "${MRS:=/home/user/mistral.rs}"
+: "${MRSBIN:=$MRS/target/release/mistralrs}"
+: "${MRS_FLAGS:=--format gguf}"
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-qwen35moe <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
