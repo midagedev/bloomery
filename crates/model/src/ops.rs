@@ -586,13 +586,13 @@ unsafe impl Sync for ParWrite {}
 /// dequantizes one row at a time (the row buffer stays in L1).
 ///
 /// Activations are quantized first into the format the weight type implies
-/// (Q8_K for Q3_K, Q8_2_X4 for Q4_K/Q5_K/Q6_K/Q5_0/Q5_1, none for F32;
+/// (Q8_K for Q3_K, Q8_2_X4 for Q4_K/Q5_K/Q6_K/Q5_0/Q5_1/Q8_0, none for F32;
 /// `gguf::activation_format` owns the table) — the oracle is ggml's output,
 /// and the wrong format would force every gate open.
 ///
 /// A quantized type with a fused kernel takes the fused path (`crates/qdot`):
 /// k a multiple of `qdot::k_granularity(ty)` — 256 for Q3_K/Q4_K/Q6_K, 32
-/// for Q5_0/Q5_1. The fused dot is deliberately NOT bit-identical to the
+/// for Q5_0/Q5_1/Q8_0. The fused dot is deliberately NOT bit-identical to the
 /// scalar path (it is more accurate than the dequant round trip) — gates
 /// across it assert closeness to the oracle, never bit equality; all other
 /// types keep the scalar path.
@@ -1586,7 +1586,7 @@ fn group_core(
         // Fused path decided per pair, exactly the single-pair rule: qdot
         // dots the quantized codes directly, so activations are quantized
         // into `qdot::quantize_col`'s layout, and `qdot::fuses` owns the
-        // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
+        // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1/Q8_0).
         let fused = qdot::fuses(ty, k);
         let layout = ws.layout(i);
         assert!(
@@ -4609,31 +4609,60 @@ mod tests {
         }
     }
 
-    /// No CPU matmul takes a Q8_0 or BF16 weight: every entry that reaches the scalar
-    /// arm of the fused decision refuses it with an error naming the type, instead of
-    /// running it against f32 activations.
+    /// No CPU matmul takes a BF16 weight: every entry that reaches the scalar arm of the
+    /// fused decision refuses it with an error naming the type, instead of running it
+    /// against f32 activations. A Q8_0 weight takes the fused arm in every entry alike
+    /// (`qdot::fuses`, the Q8_0 x q8_2_x4 kernel): over zero bytes every output is 0.
+    // PIN(2026-09-27): Q8_0 moved from the refusals to the fused arm — qdot fuses Q8_0 (q8qdot).
     #[test]
     fn matmul_refuses_weight_types_without_an_activation_format() {
-        for ty in [GgmlType::Q8_0, GgmlType::BF16] {
-            let path = one_tensor_file(ty);
-            let g = Gguf::open(&path).unwrap();
-            let w = g.find("w").unwrap();
-            let x = Tensor2::zeros(32, 1);
-            let mut out = [0.0f32; 2];
-            let errors = [
-                refusal(matmul_q(&g, w, &x)),
-                refusal(matmul_q_group(&g, &[w], &[&x])),
-                refusal(matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)])),
-                refusal(matvec_q_local(&g, w, x.col(0), &mut out)),
-            ];
-            for e in &errors {
-                assert!(
-                    e.contains(&ty.to_string()),
-                    "{ty}: the refusal must name the type, got {e:?}"
-                );
-            }
-            std::fs::remove_file(&path).unwrap();
+        let ty = GgmlType::BF16;
+        let path = one_tensor_file(ty);
+        let g = Gguf::open(&path).unwrap();
+        let w = g.find("w").unwrap();
+        let x = Tensor2::zeros(32, 1);
+        let mut out = [0.0f32; 2];
+        let errors = [
+            refusal(matmul_q(&g, w, &x)),
+            refusal(matmul_q_group(&g, &[w], &[&x])),
+            refusal(matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)])),
+            refusal(matvec_q_local(&g, w, x.col(0), &mut out)),
+        ];
+        for e in &errors {
+            assert!(
+                e.contains(&ty.to_string()),
+                "{ty}: the refusal must name the type, got {e:?}"
+            );
         }
+        std::fs::remove_file(&path).unwrap();
+
+        let ty = GgmlType::Q8_0;
+        assert!(qdot::fuses(ty, 32), "{ty}: qdot fuses a 32-value row");
+        let path = one_tensor_file(ty);
+        let g = Gguf::open(&path).unwrap();
+        let w = g.find("w").unwrap();
+        let fused = |r: Result<Tensor2, crate::ModelError>, entry: &str| {
+            let y = r.unwrap_or_else(|e| panic!("{ty}: {entry} must take the fused arm, got {e}"));
+            assert_eq!(
+                (y.ne0, y.ne1, y.data.as_slice()),
+                (2, 1, &[0.0f32; 2][..]),
+                "{ty}: {entry}"
+            );
+        };
+        fused(matmul_q(&g, w, &x), "matmul_q");
+        fused(
+            matmul_q_group(&g, &[w], &[&x]).map(|mut v| v.remove(0)),
+            "matmul_q_group",
+        );
+        fused(
+            matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)]).map(|(mut v, _)| v.remove(0)),
+            "matmul_q_group_swiglu",
+        );
+        out = [f32::NAN; 2];
+        matvec_q_local(&g, w, x.col(0), &mut out)
+            .unwrap_or_else(|e| panic!("{ty}: matvec_q_local must take the fused arm, got {e}"));
+        assert_eq!(out, [0.0f32; 2], "{ty}: matvec_q_local");
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A column-mapped input's output has one column per listed column, a

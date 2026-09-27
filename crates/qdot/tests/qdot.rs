@@ -524,12 +524,40 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::MXFP4, &wrowmx, &acolmx, 2048).unwrap(),
         0.0
     );
+    // Q8_0 uses 32-value blocks (34 bytes per 32 values) and q8_2 tails past the x4 groups:
+    // k = 2144 is 16 groups and three tail blocks.
+    assert_eq!(col_bytes(GgmlType::Q8_0, 2144), 144 * 16 + 3 * 36);
+    assert_eq!(col_bytes(GgmlType::Q8_0, 480), 144 * 3 + 3 * 36);
+    let wrow80 = vec![0u8; 34 * 67];
+    let acol80 = vec![0u8; 144 * 16 + 3 * 36];
+    assert!(matches!(
+        dot_row(GgmlType::Q8_0, &wrow80, &acol80, 100),
+        Err(QdotError::UnalignedK { k: 100, gran: 32 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q8_0, &wrow80[..34 * 67 - 1], &acol80, 2144),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(
+            GgmlType::Q8_0,
+            &wrow80,
+            &acol80[..144 * 16 + 3 * 36 - 1],
+            2144
+        ),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::Q8_0, &wrow80, &acol80, 2144).unwrap(),
+        0.0
+    );
     // Supported type table check.
     assert!(!supports(GgmlType::F16));
     assert!(supports(GgmlType::Q5_K));
     assert!(supports(GgmlType::Q5_1));
     assert!(supports(GgmlType::IQ3_XXS));
     assert!(supports(GgmlType::MXFP4));
+    assert!(supports(GgmlType::Q8_0));
 }
 
 /// `col_bytes` panics on unaligned k.
@@ -1340,6 +1368,203 @@ fn hw_mxfp4_kernel_predicts_ik() {
     );
 }
 
+// ------------------------------------------------------- Q8_0 x Q8_2_X4
+// The oracle is a synthetic block set (tools/ref/q8f0_ref.cpp): its generator writes the
+// column's f32 values, ik's q8_2_x4 bytes of it and every weight row into the dump, so this
+// side reads the inputs instead of regenerating them. k = 2144 is 16 whole x4 groups and three
+// tail blocks. The set carries -128 weight codes, zero, subnormal and negative f16 scales, a
+// zero activation block, and block 9, whose bf16 scale is the subnormal 2^-127 and whose first
+// code is -128: under a negative weight code that product takes the sign trick's wrap, in ik's
+// kernel and in ours alike. Gate B is bit identity: ours is ik's instruction graph, with the
+// same operand order at every float operation, so no rounding can differ.
+
+/// The synthetic Q8_0 dump: `k`, the column's f32 values, ik's q8_2_x4 bytes of the column,
+/// the weight rows and ik's result bits per row.
+struct Q8f0Dump {
+    k: usize,
+    x: Vec<f32>,
+    ik_acol: Vec<u8>,
+    rows: Vec<Vec<u8>>,
+    want: Vec<u32>,
+}
+
+/// Lower-case hex to bytes.
+fn unhex(h: &str) -> Vec<u8> {
+    assert!(h.len().is_multiple_of(2), "odd hex length {}", h.len());
+    h.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).expect("hex digits"))
+        .collect()
+}
+
+/// Reads `q8f0-ik-dot.txt`, every line by its tag; an untagged or unknown line is refused.
+fn q8f0_dump() -> Q8f0Dump {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let path = format!("{base}/ref/q8f0-ik-dot.txt");
+    let dump = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{path}: {e} — run just build-ref first"));
+    let mut d = Q8f0Dump {
+        k: 0,
+        x: Vec::new(),
+        ik_acol: Vec::new(),
+        rows: Vec::new(),
+        want: Vec::new(),
+    };
+    for line in dump.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        match t.as_slice() {
+            ["tensor", "synthetic-q8_0", "k", k] => d.k = k.parse().unwrap(),
+            ["x", h] => {
+                d.x = unhex(h)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect();
+            }
+            ["a", h] => d.ik_acol = unhex(h),
+            ["w", r, h] => {
+                assert_eq!(r.parse::<usize>().unwrap(), d.rows.len(), "rows in order");
+                d.rows.push(unhex(h));
+            }
+            ["row", r, bits] => {
+                assert_eq!(
+                    r.parse::<usize>().unwrap(),
+                    d.want.len(),
+                    "results in order"
+                );
+                d.want
+                    .push(u32::from_str_radix(bits, 16).expect("ik dumps raw f32 bits"));
+            }
+            _ => panic!("{path}: an unknown line {:?}", &line[..line.len().min(40)]),
+        }
+    }
+    assert_eq!(d.k, 2144, "{path}: the harness's k");
+    assert_eq!(d.x.len(), d.k, "{path}: the column");
+    assert_eq!(
+        d.ik_acol.len(),
+        col_bytes(GgmlType::Q8_0, d.k),
+        "{path}: ik's column"
+    );
+    assert_eq!(d.rows.len(), 64, "{path}: rows");
+    assert_eq!(d.want.len(), 64, "{path}: results");
+    for (r, w) in d.rows.iter().enumerate() {
+        assert_eq!(w.len(), 34 * d.k / 32, "{path}: row {r}");
+    }
+    d
+}
+
+/// Q8_0 gate 0: `quantize_col` codes the synthetic column byte for byte as ik's
+/// `quantize_row_q8_2_x4`, and ik's bytes carry the edge the set was built for — block 9's
+/// bf16 scale the subnormal 2^-127 (bits 0x0040) and its first code -128.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_q8f0_encoder_matches_ik() {
+    let d = q8f0_dump();
+    let mut acol = vec![0u8; col_bytes(GgmlType::Q8_0, d.k)];
+    quantize_col(GgmlType::Q8_0, &d.x, &mut acol);
+    for (i, (a, b)) in d.ik_acol.iter().zip(&acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    // Block 9 is block 1 of group 2: its d at group byte 2, its codes from byte 48.
+    let g = &d.ik_acol[2 * 144..3 * 144];
+    assert_eq!(
+        u16::from_le_bytes([g[2], g[3]]),
+        0x0040,
+        "block 9's scale is the subnormal bf16 2^-127"
+    );
+    assert_eq!(g[48], 0x80, "block 9's first code is -128");
+    eprintln!(
+        "Q8_0 gate 0: {} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 \
+         (k = {}, three tail blocks, block 9 at d = 2^-127 with a -128 code)",
+        acol.len(),
+        d.k
+    );
+}
+
+/// Q8_0 gate A: the AVX2 kernel and its mirror agree bit for bit — on the dump's 64 rows
+/// against ik's column, and on `ROWS` generated rows at every tail count (k = 32, 96, 128,
+/// 160, 224 and 2144: 1, 3, 0, 1, 3 and 3 tail blocks) against columns of every magnitude.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_q8f0_kernel_matches_mirror() {
+    assert!(
+        supports(GgmlType::Q8_0),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    let same = |w: &[u8], a: &[u8], k: usize, what: &str| {
+        let p = dot_row_avx2(GgmlType::Q8_0, w, a, k).unwrap();
+        let q = dot_row_scalar(GgmlType::Q8_0, w, a, k).unwrap();
+        assert!(
+            p.to_bits() == q.to_bits(),
+            "{what}: kernel {p:e} (bits {:#x}) and mirror {q:e} (bits {:#x}) must be bit-identical",
+            p.to_bits(),
+            q.to_bits()
+        );
+    };
+    let d = q8f0_dump();
+    for (r, w) in d.rows.iter().enumerate() {
+        same(w, &d.ik_acol, d.k, &format!("dump row {r}"));
+    }
+    let mut rng = Lcg(0x0008_F0DA_7A5E);
+    let mut n = 0;
+    for k in [32usize, 96, 128, 160, 224, 2144] {
+        for c in 0..ROWS / 16 {
+            let mag = [1e-3f32, 1.0, 1e3][c % 3];
+            let x: Vec<f32> = (0..k).map(|_| rng.unit() * mag).collect();
+            let mut a = vec![0u8; col_bytes(GgmlType::Q8_0, k)];
+            quantize_col(GgmlType::Q8_0, &x, &mut a);
+            let mut w: Vec<u8> = (0..34 * k / 32).map(|_| rng.next_u32() as u8).collect();
+            // Finite f16 scales: a random exponent below 0x1f, sign and mantissa kept.
+            for b in w.as_chunks_mut::<34>().0 {
+                let h = u16::from_le_bytes([b[0], b[1]]);
+                let h = (h & 0x83ff) | ((h % 0x1f) << 10);
+                b[0..2].copy_from_slice(&h.to_le_bytes());
+            }
+            same(&w, &a, k, &format!("generated k = {k} column {c}"));
+            n += 1;
+        }
+    }
+    eprintln!(
+        "Q8_0 gate A: 64 dump rows and {n} generated rows bit-identical (kernel vs mirror, \
+         tails of 0 to 3 blocks)"
+    );
+}
+
+/// Q8_0 gate B: on ik's column, every dumped row bit-identical to ik's
+/// `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`.
+#[test]
+#[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
+fn hw_q8f0_kernel_predicts_ik() {
+    let d = q8f0_dump();
+    // Rows whose block-9 first weight code is negative under a nonzero scale: the -128
+    // activation code meets the sign trick's wrap there.
+    let wraps = d
+        .rows
+        .iter()
+        .filter(|w| {
+            let b = &w[9 * 34..10 * 34];
+            (b[2] as i8) < 0 && u16::from_le_bytes([b[0], b[1]]) & 0x7fff != 0
+        })
+        .count();
+    assert!(wraps > 0, "the set must carry the sign trick's wrap");
+    for (r, (w, &want)) in d.rows.iter().zip(&d.want).enumerate() {
+        let got = dot_row(GgmlType::Q8_0, w, &d.ik_acol, d.k).unwrap();
+        assert!(
+            got.to_bits() == want,
+            "row {r}: ours {got:.9e} (bits {:#010x}) vs ik {:.9e} (bits {want:#010x})",
+            got.to_bits(),
+            f32::from_bits(want)
+        );
+    }
+    eprintln!(
+        "Q8_0 gate B: 64 rows bit-identical to ik's mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, \
+         block_q8_2> (on ik's own column, {wraps} rows through the -128 wrap)"
+    );
+}
+
 // ------------------------------------------------- q_nope2 cell kernel
 // Q8_0 x act cell kernel gates: AVX2 kernel vs scalar mirror, bit for bit,
 // over model and boundary shapes and extreme code patterns.
@@ -1887,6 +2112,7 @@ fn quantize_col_random_bit_identical() {
         (GgmlType::Q6_K, &[256, 512, 2048]),
         (GgmlType::Q5_0, &[128, 160, 192, 352]),
         (GgmlType::Q5_1, &[128, 192, 10944]),
+        (GgmlType::Q8_0, &[128, 224, 2144]),
     ];
     const COLS: usize = 200;
     const MAGS: [f32; 11] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0, 1e2, 1e3, 1e4];
@@ -2306,6 +2532,12 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
         (GgmlType::Q5_K, 176, &[0, 2][..]),
         (GgmlType::Q6_K, 210, &[208][..]),
         (GgmlType::IQ3_XXS, 98, &[0][..]),
+        // Q8_0 at k = 256 is eight 34-byte blocks, one f16 scale each.
+        (
+            GgmlType::Q8_0,
+            272,
+            &[0, 34, 68, 102, 136, 170, 204, 238][..],
+        ),
     ] {
         assert!(supports(w), "{w:?}: this CPU lacks the kernel's ISA");
         let mut row: Vec<u8> = (0..block).map(|_| rng.next_u32() as u8).collect();
