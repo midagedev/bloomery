@@ -76,29 +76,10 @@ const TENSORS: &[&str] = &[
     "unused q8_0 13",
 ];
 
-// PIN(2026-09-27): the coverage check's list (feature: layers). No program runs glm5next, so a
-// need any program's row covers (the four hyper-connection streams, the plain shared expert) and
-// a type any program's pin reads are not items; the next-token layer needs nothing.
-// PIN(2026-09-27): "pre-tokenizer glm4" and "a tool-call parser for this template" leave the list:
-// the check asks the tokenizer (which runs glm4) instead of a hand copy of its names, and reads the
-// declared tool format; `arch::glm5next::spec::tests::the_chat_surface_is_covered` is red on the
-// old copies.
-const COVERAGE: &[&str] = &[
-    "delta rule KDA: d 128, 64 heads, conv 4: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44",
-    "dense SwiGLU layer: ff 12288: 0-2",
-    "latent attention 512 x rope 0, absorbed qk 256 / v 256: 3,7,11,15,19,23,27,31,35,39,43",
-    "token-pool indexer: 32 heads x 128, pool 4: 3,7,11,15,19,23,27,31,35,39,43",
-    "a LayerNorm with a bias on the index keys: 3,7,11,15,19,23,27,31,35,39,43",
-    "router: sigmoid, 288 experts, top 8, with a selection bias: 3-44",
-    "q8_0 token embedding (the card reads q4_K rows)",
-    "q8_0 output head (the head reads q6_K)",
-    "q8_0 hyper-connection fn (the chain reads q3_K and f32): 0-44",
-    "q5_K routed experts on a card: 3-11,13-43",
-    "hyper-connection mix Own, collapse Mean",
-    "a recurrent-state slot per sequence (delta-rule state and conv inputs)",
-    "a program that runs delta-rule and attention layers in one trunk",
-    "a layer program for glm5next",
-];
+// PIN(2026-09-27): the coverage check's list (feature: layers). The glm5next body
+// (`gpu-glm5next`) runs every need of the trunk and reads every type the file holds (its routed
+// stacks on the host tier, which refuses a type with no host kernel), so nothing is listed.
+const COVERAGE: &[&str] = &[];
 
 #[test]
 #[ignore = "needs the GLM-5.3-Flash shards on the box (just gate-glm5next-meta)"]
@@ -152,11 +133,11 @@ fn hw_glm5next_spec() {
     );
     for (at, want) in [
         (
-            "gpu-deepseek41/src/hc.rs HC_STREAMS",
+            "gpu-deepseek41/src/hc.rs HC_STREAMS (hc_pre_q8_0)",
             "hyper-connections of 4 streams: 0-44",
         ),
         (
-            "gpu-deepseek41/src/chain/ffn.rs (the shared expert)",
+            "gpu-glm5next/src/ffn.rs (the shared expert)",
             "shared expert, ff 2048: 3-44",
         ),
     ] {
