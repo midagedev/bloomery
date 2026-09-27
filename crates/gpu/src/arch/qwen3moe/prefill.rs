@@ -41,9 +41,11 @@
 
 use super::body::Body;
 use super::dispatch::{self, PassCtx};
+use super::program::{self, Program, Tail};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
+use crate::head::Head;
 use crate::model::{GpuModel, StepMode};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo, launch_u32};
@@ -302,19 +304,32 @@ impl Body {
     /// Run pass `chunk` of `m` tokens of the prompt in the image: with
     /// `graph`, its block copied into the slot and the captured pass of `m`
     /// replayed behind it; without, the same enqueues reading the block
-    /// where it lies.
+    /// where it lies. With `head`, the pass is the prompt's last: its last
+    /// row into `head` and that head after it, eager in either mode.
     fn run_pass(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        chunk: usize,
-        m: usize,
+        (chunk, m): (usize, usize),
         graph: bool,
+        head: Option<&mut Head>,
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         if graph {
             self.prefill.stage(stream, chunk, m)?;
-            return self.prefill.replay(stream, chunk, m);
+            self.prefill.replay(stream, chunk, m)?;
+            return match head {
+                Some(head) => program::enqueue_last(
+                    gpu,
+                    w,
+                    &self.k,
+                    &mut self.head_state,
+                    &self.prefill.a,
+                    m,
+                    head,
+                ),
+                None => Ok(()),
+            };
         }
         let win = self.prefill.image_windows(chunk, m)?;
         let Body {
@@ -325,6 +340,7 @@ impl Body {
             k,
             mma,
             prefill,
+            head_state,
             ..
         } = self;
         let c = PassCtx {
@@ -336,7 +352,22 @@ impl Body {
             eps: hp.rms_eps,
             table: &rope.table,
         };
-        dispatch::enqueue_pass(&c, kv, &mut prefill.a, &win.io(), m)
+        let tail = match head {
+            Some(head) => Tail::Last {
+                head,
+                state: head_state,
+            },
+            None => Tail::Pass,
+        };
+        Program {
+            c: &c,
+            stores: kv.as_mut_slice(),
+            s: &mut prefill.a,
+            io: &win.io(),
+            m,
+            tail,
+        }
+        .walk()
     }
 }
 
@@ -599,18 +630,7 @@ impl GpuModel<Body> {
                     let c = chunk;
                     chunk += 1;
                     self.run_rows(m, WHAT, |gpu, w, body, head, _| {
-                        body.run_pass(gpu, w, c, m, graph)?;
-                        if last {
-                            let Body {
-                                k,
-                                head_state,
-                                prefill,
-                                ..
-                            } = body;
-                            dispatch::enqueue_pass_head(
-                                gpu, w, k, head_state, &prefill.a, m, head,
-                            )?;
-                        }
+                        body.run_pass(gpu, w, (c, m), graph, last.then_some(head))?;
                         Ok(last)
                     })?
                 }

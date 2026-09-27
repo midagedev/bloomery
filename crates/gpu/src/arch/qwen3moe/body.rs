@@ -13,6 +13,7 @@ use super::router::{RouterDims, RouterKernels, gated};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
 use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
+use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::GemmKernels;
 use crate::head::Head;
@@ -57,6 +58,9 @@ pub(super) struct Kernels {
     pub(super) proj: ProjKernels,
     pub(super) neox: RopeNeoxKernels,
     pub(super) flash: FlashGqaKernels,
+    /// The prefill flash: each of a prompt unit's rows over its own live key
+    /// count, the cache's key tiles staged once per block.
+    pub(super) prefill: FlashGqaPrefill,
     pub(super) router: RouterKernels,
     pub(super) experts: ExpertKernels,
     pub(super) q6_sel: Q6kSelKernels,
@@ -77,6 +81,7 @@ impl Kernels {
             proj: ProjKernels::load(ctx)?,
             neox: RopeNeoxKernels::load(ctx)?,
             flash: FlashGqaKernels::load(ctx)?,
+            prefill: FlashGqaPrefill::load(ctx)?,
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             q6_sel: Q6kSelKernels::load(ctx, gpu.fault_word())?,

@@ -6,12 +6,13 @@
 //! ([`NoLeg`]) exchanges nothing and refuses by name a point the arena
 //! cannot hold. What follows the last layer is the walk's [`Tail`].
 
-use super::body::TapRows;
+use super::body::{Kernels, TapRows};
 use super::dispatch::{self, Ctx, PassCtx};
 use super::head_argmax::HeadArgmaxState;
-use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut};
-use crate::GpuError;
+use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
 use crate::head::Head;
+use crate::weights::Weights;
+use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
 
@@ -53,6 +54,12 @@ pub(super) enum Tail<'a> {
     },
     /// A prefill pass: the last layer's output stays in the arena's `x`.
     Pass,
+    /// A prompt's last unit: its last row's residual, row `m − 1` of the
+    /// arena's `x`, into `head`'s input and that head ([`enqueue_last`]).
+    Last {
+        head: &'a mut Head,
+        state: &'a mut HeadArgmaxState,
+    },
 }
 
 /// One walk of a qwen3moe chain: every layer at `m` rows over arena `s`
@@ -125,7 +132,7 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
 
     /// The walk's [`Tail`].
     fn end(&mut self, _: usize) -> Result<(), GpuError> {
-        let Program { c, s, tail, .. } = self;
+        let Program { c, s, m, tail, .. } = self;
         let (gpu, w, k) = (c.gpu, c.w, c.k);
         match tail {
             Tail::Step { head, state, .. } => dispatch::enqueue_head(gpu, w, k, state, head),
@@ -137,8 +144,37 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
                 Ok(())
             }
             Tail::Pass => Ok(()),
+            Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, *m, head),
         }
     }
+}
+
+/// Enqueue the head after a unit of `m` rows over arena `s`: row `m − 1` of
+/// `x`, the unit's last residual, into the head's input, then the one-row
+/// head. A unit of no row, or of more rows than the arena holds, is refused
+/// by name.
+pub(super) fn enqueue_last(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    state: &mut HeadArgmaxState,
+    s: &Arena,
+    m: usize,
+    head: &mut Head,
+) -> Result<(), GpuError> {
+    let h = s.dims.hidden;
+    if m == 0 || m > s.rows {
+        return Err(GpuError::shape(
+            "qwen3moe::enqueue_last",
+            format!("a unit of {m} rows on a {}-row arena", s.rows),
+        ));
+    }
+    // SAFETY: row m − 1 < rows spans `hidden` values inside `x` (rows ·
+    // hidden), which stays in place while the window lives (one copy).
+    let row = unsafe { f32_view(&s.x, (m - 1) * h, h) };
+    head.input_mut()
+        .copy_from_device_async(&row, gpu.stream())?;
+    dispatch::enqueue_head(gpu, w, k, state, head)
 }
 
 /// The port of a chain with no host leg: it exchanges nothing, and opens
