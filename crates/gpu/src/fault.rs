@@ -541,6 +541,46 @@ pub fn quad_finite(v: [f32; 4]) -> bool {
     v[0].is_finite() & v[1].is_finite() & v[2].is_finite() & v[3].is_finite()
 }
 
+/// What the fault `word` (a `Gpu`'s fault allocation, [`FAULT_WORDS`] u32s or
+/// more) holds now: the first-layer word and that layer's site mask, each read
+/// by a synchronous copy that waits on no stream of the engine (they are all
+/// non-blocking). The one reader of the word: the caller orders it — the
+/// engine's reader synchronizes its stream first ([`crate::Gpu::fault`]), a
+/// batch service runs after the event its handoffs came down at, so every
+/// kernel that wrote them has finished.
+pub fn read(word: &cuda_core::DeviceBuffer<u32>) -> Result<Option<Fault>, crate::GpuError> {
+    use cuda_core::sys;
+    word.context().bind_to_thread()?;
+    let at = |i: usize| -> Result<u32, crate::GpuError> {
+        let mut v = FAULT_NONE;
+        // SAFETY: word `i` lies inside the allocation (`i` is 0 or a mask
+        // index of a layer at most LAYER_NONE, below FAULT_WORDS, which every
+        // holder of the word checked its length against —
+        // `module_fault_word` and the `Gpu`'s own allocation); the
+        // destination is `v`, four bytes that outlive the synchronous copy;
+        // the context is current on this thread (bound above).
+        let rc = unsafe {
+            sys::cuMemcpyDtoH_v2(
+                (&raw mut v).cast(),
+                word.cu_deviceptr() + 4 * i as u64,
+                std::mem::size_of::<u32>(),
+            )
+        };
+        crate::graph::cu(rc, "cuMemcpyDtoH_v2 (fault word)")?;
+        Ok(v)
+    };
+    let first = at(0)?;
+    if first == FAULT_NONE {
+        return Ok(None);
+    }
+    let sites = if first >> 8 <= LAYER_NONE {
+        at(mask_index(first >> 8))?
+    } else {
+        0
+    };
+    Ok(Fault::from_words(first, sites))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

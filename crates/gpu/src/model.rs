@@ -691,11 +691,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// wait or read names `e` beside its own error.
     fn fault_behind(&self, what: &'static str, e: GpuError) -> GpuError {
         let gpu = &self.gpu;
-        let read = gpu
-            .stream()
-            .synchronize()
-            .map_err(GpuError::from)
-            .and_then(|()| gpu.fault());
+        let read = gpu.fault();
         match read {
             Ok(Some(fault)) => GpuError::Fault {
                 what,
