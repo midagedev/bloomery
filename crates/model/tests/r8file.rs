@@ -921,7 +921,7 @@ fn hw_a_sidecar_of_another_source_is_refused_beside_its_split() {
         (0..embd).map(|i| (i % 13) as f32 / 13.0 - 0.5).collect(),
     );
     let list = [(1u32, 0.75f32), (3, 0.25)];
-    let mut scratch = model::moe::HostScratch::new(embd, 256);
+    let mut scratch = model::moe::HostScratch::new(embd, 256, list.len()).unwrap();
     let mut want = vec![f32::NAN; embd];
     layer
         .experts_into(src_a, &x, &list, &mut want, &mut scratch)

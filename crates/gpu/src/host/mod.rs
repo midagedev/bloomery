@@ -97,8 +97,9 @@ use step::{Boundary, Chain, SERVE, StepPort, stream_idle, word};
 /// weighted sum of the listed routed experts of layer `layer` for the
 /// activation `x` (one column of the model width), written over `out` (that
 /// width; an empty list writes zeros). The list is the handoff's host slots
-/// in slot order, at most [`EXPERTS_INTO_MAX`](model::moe::EXPERTS_INTO_MAX), each id with its routing
-/// weight. The protocol around the call — waiting for the go, checking the
+/// in slot order, at most the boundary's routed width `n_used`, each id with
+/// its routing weight; an architecture's scratch is made for that width at
+/// load and refuses a longer list by name. The protocol around the call — waiting for the go, checking the
 /// handoff, signalling the card, releasing it on a failure — is
 /// [`HostTier`]'s alone.
 pub trait HostExperts {

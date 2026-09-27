@@ -255,7 +255,7 @@ fn hw_experts_into_matches_group_composition() {
         }
     }
 
-    let mut scratch = moe::HostScratch::new(x1.ne0, plan.meta.ff);
+    let mut scratch = moe::HostScratch::new(x1.ne0, plan.meta.ff, plan.meta.n_used).unwrap();
     for call in 0..2 {
         let mut got = vec![f32::NAN; x1.ne0];
         moe::experts_into(&g, plan, &x1, &list, &mut got, &mut scratch).unwrap();

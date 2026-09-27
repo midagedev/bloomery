@@ -363,12 +363,12 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         .shapes
         .get("ffn_norm-0")
         .expect("the set has ffn_norm-0")[1];
-    let mut scratch = HostScratch::new(embd, ff);
+    let mut scratch = HostScratch::new(embd, ff, n_used).expect("a scratch of n_used experts");
     let r8 = HostR8::at_gate(&split, r8_lever())
         .unwrap_or_else(|e| panic!("the r8 reading of {path}: {e}"));
     let rows = R8Source::rows(&split);
     let pair = R8Source::of(&split, &r8).unwrap_or_else(|e| panic!("the r8 pair of {path}: {e}"));
-    let mut scratch_r8 = HostScratch::new(embd, ff);
+    let mut scratch_r8 = HostScratch::new(embd, ff, n_used).expect("a scratch of n_used experts");
     let (e_gu, e_down) = (gamma(n_dot(embd)), gamma(n_dot(ff)));
     let g3 = gamma(3.0);
     let mut failed: Vec<usize> = Vec::new();

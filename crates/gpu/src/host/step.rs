@@ -16,7 +16,6 @@ use crate::graph::{
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use model::Tensor2;
-use model::moe::EXPERTS_INTO_MAX;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -464,16 +463,6 @@ impl Boundary {
 
 // ------------------------------------------------------------------ chains
 
-/// Row 0's host slot ids of the layer its two-row pass served last — what
-/// row 1's service of that layer counts its overlap against. Written by
-/// [`Chain::Pair`] services only.
-#[derive(Clone, Copy, Debug)]
-struct PairRow0 {
-    layer: usize,
-    n: usize,
-    ids: [u32; EXPERTS_INTO_MAX],
-}
-
 /// A chain the host tier serves: the one-token step, or the two-row pass
 /// whose rows run one layer apart (row `r`'s go of layer `l` and the other
 /// row's of the layer before can both be in flight).
@@ -528,6 +517,9 @@ pub struct StepPort {
     /// The host's copy of a handoff's activation — one column, allocated at
     /// load.
     x: Tensor2,
+    /// A service's host list, in slot order, with room for the boundary's
+    /// `n_used` slots made at load; refilled by each service.
+    list: Vec<(u32, f32)>,
     /// Services done: the sequence number the next handoff carries.
     pub(super) served: u32,
     /// Per [`Chain`], the (layer, row) services its last capture recorded,
@@ -539,8 +531,12 @@ pub struct StepPort {
     capturing: bool,
     /// A step service's refusal its step's caller has not yet named.
     pub(super) step_refusal: Option<Refusal>,
-    /// For the row overlap in `stats`; `None` until a pair's row 0 is served.
-    pair_row0: Option<PairRow0>,
+    /// For the row overlap in `stats`: the layer whose host ids row 0 of a
+    /// two-row pass served last ([`Chain::Pair`] services only), `None` until
+    /// a pair's row 0 is served, and those ids, with room for `n_used` made
+    /// at load.
+    pair_row0: Option<usize>,
+    row0_ids: Vec<u32>,
     pub(super) stats: StepStats,
 }
 
@@ -548,10 +544,11 @@ impl StepPort {
     /// The port over `boundary`, for chains of up to `layers` hybrid layers.
     /// Load-time only.
     pub fn new(boundary: Boundary, layers: usize) -> StepPort {
-        let hidden = boundary.layout.handoff().hidden;
+        let h = boundary.layout.handoff();
         StepPort {
             boundary,
-            x: Tensor2::zeros(hidden, 1),
+            x: Tensor2::zeros(h.hidden, 1),
+            list: Vec::with_capacity(h.n_used),
             served: 0,
             captured: [
                 Vec::with_capacity(layers),
@@ -561,6 +558,7 @@ impl StepPort {
             capturing: false,
             step_refusal: None,
             pair_row0: None,
+            row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
         }
     }
@@ -722,9 +720,10 @@ impl StepPort {
             "a hybrid layer without a slot map row",
         ))?;
         // The host's slots, in slot order: every routed id the slot map sends
-        // to the host, with its weight.
-        let mut list = [(0u32, 0.0f32); EXPERTS_INTO_MAX];
-        let (mut n, mut w2_host, mut w2_all) = (0usize, 0.0f64, 0.0f64);
+        // to the host, with its weight — at most the page's `n_used`, the
+        // list's room.
+        self.list.clear();
+        let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
         let mut unknown = None;
         for s in 0..h.n_used {
             let (Some(id), Some(wb)) = (
@@ -737,8 +736,7 @@ impl StepPort {
             w2_all += f64::from(w) * f64::from(w);
             match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
                 Some(&HOST) => {
-                    list[n] = (id, w);
-                    n += 1;
+                    self.list.push((id, w));
                     w2_host += f64::from(w) * f64::from(w);
                 }
                 Some(_) => {}
@@ -783,38 +781,34 @@ impl StepPort {
             health.record_refusal(r, true);
             return Err(e);
         }
-        experts.experts_into(layer, &self.x, &list[..n], out)?;
+        experts.experts_into(layer, &self.x, &self.list, out)?;
         word(&self.boundary.page, Word::Cnt(row)).fetch_add(1, Ordering::Release);
         self.served = want;
         let s = &mut self.stats;
         s.served += 1;
-        s.host_slots += n as u64;
+        s.host_slots += self.list.len() as u64;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
         s.leg_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         s.parks_in_service += threads::pool().stats().worker_parks.saturating_sub(parks);
         if chain == Chain::Pair {
-            self.count_pair_overlap(layer, row, &list[..n]);
+            self.count_pair_overlap(layer, row);
         }
         Ok(())
     }
 
-    /// The row overlap of a two-row pass: row 0's service keeps its host ids,
-    /// row 1's service of the same layer — the next one served — counts its
-    /// ids found among them. A copy of at most [`EXPERTS_INTO_MAX`] ids and
-    /// that many squared compares, no lock; the one-token step never calls it.
-    fn count_pair_overlap(&mut self, layer: usize, row: usize, list: &[(u32, f32)]) {
+    /// The row overlap of a two-row pass, over the host list the service
+    /// just served: row 0's service keeps its host ids, row 1's service of
+    /// the same layer — the next one served — counts its ids found among
+    /// them. A copy of at most `n_used` ids into room made at load and that
+    /// many squared compares, no lock; the one-token step never calls it.
+    fn count_pair_overlap(&mut self, layer: usize, row: usize) {
+        let list = &self.list;
         if row == 0 {
-            let mut ids = [0u32; EXPERTS_INTO_MAX];
-            for (d, &(id, _)) in ids.iter_mut().zip(list) {
-                *d = id;
-            }
-            self.pair_row0 = Some(PairRow0 {
-                layer,
-                n: list.len(),
-                ids,
-            });
-        } else if let Some(r0) = self.pair_row0.take_if(|r0| r0.layer == layer) {
-            let row0 = &r0.ids[..r0.n];
+            self.row0_ids.clear();
+            self.row0_ids.extend(list.iter().map(|&(id, _)| id));
+            self.pair_row0 = Some(layer);
+        } else if self.pair_row0.take_if(|l0| *l0 == layer).is_some() {
+            let row0 = &self.row0_ids;
             let overlap = list.iter().filter(|(id, _)| row0.contains(id)).count();
             self.stats.overlap_slots += overlap as u64;
             self.stats.pair_row1_slots += list.len() as u64;

@@ -46,7 +46,7 @@
 //!    `committed ..= committed + w`: `w + 1` rows served one after another
 //!    per layer, as its two-row pass (`bloomery_gpu::hybrid::Chain::Pair`)
 //!    does today: the target's `moe.rs` serves each row's host experts on
-//!    its own (`ne1 == 1`, `EXPERTS_INTO_MAX`). Consecutive rows share many
+//!    its own (`ne1 == 1`, the routed width's list). Consecutive rows share many
 //!    of those experts, so a service that reads each distinct expert once
 //!    per layer is an open design on the target side; the draft's contract
 //!    does not depend on it.

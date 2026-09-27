@@ -2033,7 +2033,7 @@ impl Ds41Host {
             file,
             layers: views,
             first,
-            scratch: HostScratch::new(hp.n_embd, hp.experts.ff),
+            scratch: HostScratch::new(hp.n_embd, hp.experts.ff, hp.experts.n_used)?,
             union: None,
             embd: hp.n_embd,
             ff: hp.experts.ff,

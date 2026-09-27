@@ -12,8 +12,12 @@
 //! (`cols · hidden` f32) — follows at a 256-byte boundary, the images one
 //! after another, then every row's sum (`cols · hidden` f32), each at a
 //! 256-byte boundary.
+//!
+//! The routed width `n_used` is the model's, any count from one: the page
+//! holds what it was built for, and a call that brings more slots than that
+//! is refused where it meets the page — the batch service's routing count,
+//! the host scratches' list width.
 
-use model::moe::EXPERTS_INTO_MAX;
 use model::ops::DEFER_MAX_COLS;
 
 /// Rows a page carries at most: tokens whose handoffs can be in flight at
@@ -83,11 +87,8 @@ pub enum PageError {
     Cols(usize),
     /// No model width.
     Hidden,
-    /// Routed slots outside `1..=EXPERTS_INTO_MAX`: the host lists of a
-    /// step service, of the pair's overlap record and of a batch service's
-    /// columns hold that many a column, and `DEFER_MAX_COLS` columns of that
-    /// many are the union call's claim states.
-    Used(usize),
+    /// No routed slot a token.
+    Used,
     /// A size past `usize`.
     Overflow,
 }
@@ -101,11 +102,7 @@ impl std::fmt::Display for PageError {
                 "{c} columns a row: a host service serves 1..={DEFER_MAX_COLS} in one union call"
             ),
             PageError::Hidden => write!(f, "a model width of 0"),
-            PageError::Used(n) => write!(
-                f,
-                "{n} routed slots a token: the host tier's lists hold 1..={EXPERTS_INTO_MAX} a \
-                 column (`EXPERTS_INTO_MAX`)"
-            ),
+            PageError::Used => write!(f, "0 routed slots a token: a page carries at least one"),
             PageError::Overflow => write!(f, "the page's size passes usize"),
         }
     }
@@ -140,13 +137,20 @@ impl PageLayout {
         if hidden == 0 {
             return Err(PageError::Hidden);
         }
-        if !(1..=EXPERTS_INTO_MAX).contains(&n_used) {
-            return Err(PageError::Used(n_used));
+        if n_used == 0 {
+            return Err(PageError::Used);
         }
         let o = PageError::Overflow;
-        let field = (cols * n_used).next_multiple_of(FIELD_MIN);
+        let field = cols
+            .checked_mul(n_used)
+            .and_then(|k| k.checked_next_multiple_of(FIELD_MIN))
+            .ok_or(o.clone())?;
+        let x = field
+            .checked_mul(2)
+            .and_then(|f| f.checked_add(FIELD_MIN))
+            .and_then(|w| w.checked_next_multiple_of(X_ALIGN))
+            .ok_or(o.clone())?;
         let (ids, weights) = (FIELD_MIN, FIELD_MIN + field);
-        let x = (weights + field).next_multiple_of(X_ALIGN);
         let x_words = cols.checked_mul(hidden).ok_or(o.clone())?;
         let words = x.checked_add(x_words).ok_or(o.clone())?;
         let image_stride = words
@@ -231,7 +235,7 @@ impl PageLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{HandoffLayout, MAX_ROWS, PAYLOAD_OFF, PageError, PageLayout, Word};
+    use super::{FIELD_MIN, HandoffLayout, MAX_ROWS, PAYLOAD_OFF, PageError, PageLayout, Word};
 
     /// V4.1's page — two rows of one column of 4096 values, six slots — is
     /// the fixed layout the handoff kernel and the step port read: the
@@ -267,13 +271,14 @@ mod tests {
         assert_eq!(p.hsum_off(2), None);
     }
 
-    /// Every layout of one column of up to 16 slots keeps the fixed field
-    /// offsets, one row or two; V2-Lite's page (one row of 2048, six slots)
-    /// is one of them.
+    /// Every layout of one column of up to `FIELD_MIN` (16) slots keeps the
+    /// fixed field offsets, one row or two — the bound is the smallest
+    /// routing field, not a routed width; V2-Lite's page (one row of 2048,
+    /// six slots), GLM-5.3-Flash's eight and Qwen3.8's ten are among them.
     #[test]
     fn one_column_keeps_the_fixed_fields() {
         for rows in 1..=MAX_ROWS {
-            for n_used in 1..=model::moe::EXPERTS_INTO_MAX {
+            for n_used in 1..=FIELD_MIN {
                 let p = PageLayout::new(rows, 1, 2048, n_used).expect("a one-column page");
                 let h = p.handoff();
                 assert_eq!(
@@ -294,7 +299,7 @@ mod tests {
     fn fields_hold_their_columns_apart() {
         for rows in 1..=MAX_ROWS {
             for cols in 1..=model::ops::DEFER_MAX_COLS {
-                for n_used in 1..=model::moe::EXPERTS_INTO_MAX {
+                for n_used in 1..=2 * FIELD_MIN {
                     let p = PageLayout::new(rows, cols, 256, n_used).expect("a page");
                     let h = p.handoff();
                     let k = cols * n_used;
@@ -310,13 +315,20 @@ mod tests {
         }
     }
 
-    /// A layout past a bound is refused by the bound's name: GLM-5.3-Flash's
-    /// eight slots fit, Qwen3.8's ten do not (the host lists hold eight).
+    /// A layout past a bound is refused by the bound's name. The routed
+    /// width has none past `usize`: GLM-5.3-Flash's eight slots and
+    /// Qwen3.8's ten fit, and so do sixty-four; none is refused.
     #[test]
     fn bounds_are_refused_by_name() {
-        assert!(PageLayout::new(1, 1, 4096, 8).is_ok());
-        assert_eq!(PageLayout::new(1, 1, 2048, 10), Err(PageError::Used(10)));
-        assert_eq!(PageLayout::new(1, 1, 2048, 0), Err(PageError::Used(0)));
+        for n_used in [8, 10, 64] {
+            let p = PageLayout::new(1, 1, 4096, n_used).expect("a routed width");
+            assert_eq!(p.handoff().n_used, n_used);
+        }
+        assert_eq!(PageLayout::new(1, 1, 2048, 0), Err(PageError::Used));
+        assert_eq!(
+            PageLayout::new(1, 8, 2048, usize::MAX / 4),
+            Err(PageError::Overflow)
+        );
         assert_eq!(PageLayout::new(0, 1, 2048, 6), Err(PageError::Rows(0)));
         assert_eq!(PageLayout::new(3, 1, 2048, 6), Err(PageError::Rows(3)));
         assert_eq!(PageLayout::new(1, 0, 2048, 6), Err(PageError::Cols(0)));
@@ -326,8 +338,8 @@ mod tests {
             PageLayout::new(1, 1, usize::MAX / 2, 6),
             Err(PageError::Overflow)
         );
-        let e = PageError::Used(10).to_string();
-        assert!(e.contains("EXPERTS_INTO_MAX") && e.contains("10"), "{e}");
+        let e = PageError::Used.to_string();
+        assert!(e.contains("0 routed slots"), "{e}");
     }
 
     /// The flag words sit in the page's first `PAYLOAD_OFF` bytes, each on a
