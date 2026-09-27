@@ -1,0 +1,25 @@
+# Lead, 2026-09-28: the Qwen3.8 form of dma-dram-share.card, the one q38stream is decided on. The
+# prefill design (q38pfd) streams the hot experts over a pinned staging ring while the host union
+# computes the rest; its pp4096 band (1,559-1,663 tok/s, lcg, A6000) assumes the copy holds 26.28 GB/s
+# beside the union. Unlike V4.1's engine:6 (136 GB/s, at the DRAM ceiling), Qwen3.8's union at 10
+# columns an expert is compute-bound, 62-85 GB/s [derived, q38pfd §3], so U + 3C fits under ~145 GB/s
+# with C near the link rate: predict C 20..26 and U within 10 % of its alone value.
+# Wall [derived]: build 1-5 min, 4 rounds x 3 arms x ~40 s plus the copies alone, 10-15 min.
+kind: profile
+question: beside Qwen3.8's compute-bound host union, does the streaming design's staged copy hold the
+  link rate?
+term: C_staged, the median over rounds of h2d_probe staged-loop's GB/s (64 MiB pinned chunks, ring 4,
+  4 fill threads, A6000) over each arm-round of bench_v41_host --time --arms union5:8x40u0.1 (32 experts
+  x 10 columns) at 28 threads, Qwen3.8 UD-Q4_K_XL, beside it (dma-dram-share.sh's summary `staged ... C=`)
+unit: GB/s
+predict: 20..26
+condition: BLOOMERY_MODEL=qwen4exp BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share-q38.card'
+  just time-dma-dram --arms union5:8x40u0.1 --rounds 4, one lease; the same admissibility, pinning,
+  copy-alone and witness reads as dma-dram-share.card; U_alone printed beside U_with so the union's loss
+  is read too
+decide-in: spec q38stream at the q38pfd flow (c) rates, the ring pinned-staged, k(U) from q38-union.card's
+  measured t(m)
+decide-below: re-derive flow (c)'s k(U) with the measured C and k before q38stream is spec'd; try the
+  L3-sized ring (--chunk 4194304) once
+decide-above: not reachable (the link is 26.28): a reading above 26.5 is an instrument fault; read the
+  runner's intervals before anything else
