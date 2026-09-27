@@ -14,6 +14,12 @@
 //! residual store write straight into it, and `set_input` is the gate's way
 //! in.
 //!
+//! A head's [`HeadNorm`] is its body's choice, never a guess from the file:
+//! [`HeadNorm::Rms`] normalizes by `output_norm.weight` first,
+//! [`HeadNorm::Mixed`] projects its input as it stands — a body whose own
+//! last launch is the final norm (a hyper-connection head's mix) writes the
+//! normed rows into the input, and the file carries no `output_norm`.
+//!
 //! The argmax also carries the card's fault (crate::fault) out: the readback
 //! buffer holds the `m` tokens, then the first-layer word and that layer's
 //! site mask, one copy, and a raised word turns the readback into
@@ -99,12 +105,43 @@ fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
     }
 }
 
+/// What stands between a head's input and its projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadNorm {
+    /// The final RMS norm by `output_norm.weight`, then the projection.
+    Rms,
+    /// None: the input is the normed rows, which the body's own last launch
+    /// wrote (a hyper-connection head's mix).
+    Mixed,
+}
+
+/// Enqueue the final norm `norm` names over `m` rows of `hidden` in `x`
+/// and return the rows the projection reads: `normed`, or `x` itself.
+fn norm_rows<'a>(
+    gpu: &Gpu,
+    w: &Weights,
+    norm: HeadNorm,
+    (eps, hidden, m): (f32, usize, usize),
+    x: &'a DeviceBuffer<f32>,
+    normed: &'a mut DeviceBuffer<f32>,
+) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+    match norm {
+        HeadNorm::Rms => {
+            gpu.elem()
+                .enqueue_rms_norm(gpu.stream(), x, head_gain(w)?, eps, hidden, m, normed)?;
+            Ok(normed)
+        }
+        HeadNorm::Mixed => Ok(x),
+    }
+}
+
 /// The resident output head for `m` rows: input `m * hidden` f32 (row-major,
 /// one row per token), the normed rows, their q8_1 quantization, `n_vocab * m`
 /// logits (`logits[v*m + c]`, the gemv's layout) and `m` argmax tokens. Every
 /// buffer is allocated at construction and `enqueue` touches addresses only,
 /// so a graph that captures it serves every input written into `x`.
 pub struct Head {
+    norm: HeadNorm,
     eps: f32,
     hidden: usize,
     n_vocab: usize,
@@ -129,6 +166,25 @@ impl Head {
     /// Cross-check the two weights against each other and allocate the
     /// scratch for `m` rows (1..=8). Load-time only.
     pub fn with_m(gpu: &Gpu, w: &Weights, eps: f32, m: usize) -> Result<Head, GpuError> {
+        Head::with_norm(gpu, w, eps, m, HeadNorm::Rms)
+    }
+
+    /// The decode head of a body whose final norm is `norm`: [`Head::new`]
+    /// for [`HeadNorm::Rms`].
+    pub fn of(gpu: &Gpu, w: &Weights, eps: f32, norm: HeadNorm) -> Result<Head, GpuError> {
+        Head::with_norm(gpu, w, eps, 1, norm)
+    }
+
+    /// [`Head::with_m`] with the final norm `norm`: under
+    /// [`HeadNorm::Mixed`] the width is the projection's rows' and no
+    /// `output_norm` is read. Load-time only.
+    pub fn with_norm(
+        gpu: &Gpu,
+        w: &Weights,
+        eps: f32,
+        m: usize,
+        norm: HeadNorm,
+    ) -> Result<Head, GpuError> {
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(
                 "Head::with_m",
@@ -136,8 +192,11 @@ impl Head {
             ));
         }
         let stream = gpu.stream();
-        let hidden = head_gain(w)?.len();
         let (out_w, k) = head_out_w(w)?;
+        let hidden = match norm {
+            HeadNorm::Rms => head_gain(w)?.len(),
+            HeadNorm::Mixed => k,
+        };
         if k != hidden {
             return Err(GpuError::shape(
                 "Head::new",
@@ -152,6 +211,7 @@ impl Head {
             return Err(GpuError::shape("Head::new", "output.weight has no rows"));
         }
         Ok(Head {
+            norm,
             eps,
             hidden,
             n_vocab,
@@ -201,28 +261,17 @@ impl Head {
     /// records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            &self.x,
-            head_gain(w)?,
-            self.eps,
-            self.hidden,
-            self.m,
-            &mut self.normed,
-        )?;
+        let shape = (self.eps, self.hidden, self.m);
+        let rows = norm_rows(gpu, w, self.norm, shape, &self.x, &mut self.normed)?;
         match head_out_w(w)?.0 {
             OutW::Q6K(out_w) => {
-                gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
+                gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
                 gpu.enqueue_gemv_q6k(out_w, &self.act, &mut self.logits)?;
             }
-            OutW::Q8_0 { qs, d } => gpu.q8f32().enqueue_q8_0_gemv(
-                stream,
-                qs,
-                d,
-                &self.normed,
-                self.m,
-                &mut self.logits,
-            )?,
+            OutW::Q8_0 { qs, d } => {
+                gpu.q8f32()
+                    .enqueue_q8_0_gemv(stream, qs, d, rows, self.m, &mut self.logits)?;
+            }
         }
         let fault = gpu.fault_sink(LAYER_HEAD);
         if self.m == 1 {
@@ -271,16 +320,9 @@ impl Head {
             &mut DeviceBuffer<u32>,
         ) -> Result<(), GpuError>,
     {
-        gpu.elem().enqueue_rms_norm(
-            gpu.stream(),
-            &self.x,
-            head_gain(w)?,
-            self.eps,
-            self.hidden,
-            self.m,
-            &mut self.normed,
-        )?;
-        gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
+        let shape = (self.eps, self.hidden, self.m);
+        let rows = norm_rows(gpu, w, self.norm, shape, &self.x, &mut self.normed)?;
+        gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
         tail(
             &self.act,
             head_q6k_w(w)?,
@@ -315,10 +357,15 @@ impl Head {
         &mut self.x
     }
 
-    /// The normed rows of the last run (the dump's `result_norm` tap).
-    /// Blocking read; gate/debug use.
+    /// The normed rows of the last run (the dump's `result_norm` tap; under
+    /// [`HeadNorm::Mixed`] the input, `result_embd`). Blocking read;
+    /// gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
-        Ok(self.normed.to_host_vec(gpu.stream())?)
+        let rows = match self.norm {
+            HeadNorm::Rms => &self.normed,
+            HeadNorm::Mixed => &self.x,
+        };
+        Ok(rows.to_host_vec(gpu.stream())?)
     }
 
     /// The logits of the last run (`n_vocab * m` f32, `[v*m + c]`). Blocking

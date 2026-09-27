@@ -34,7 +34,7 @@ pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
-use crate::head::Head;
+use crate::head::{Head, HeadNorm};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -97,6 +97,12 @@ pub trait ChainBody: Sized {
     /// The rms epsilon the output head normalizes with, read from the file at
     /// load by this body's plan.
     fn head_eps(&self) -> f32;
+
+    /// What stands between the output head's input and its projection: the
+    /// final RMS norm unless the body's own last launch is the final norm.
+    fn head_norm(&self) -> HeadNorm {
+        HeadNorm::Rms
+    }
 
     /// Device bytes this body holds resident: caches, arena, step module.
     fn resident_bytes(&self) -> usize;
@@ -363,7 +369,7 @@ impl<B: ChainBody> GpuModel<B> {
         let mut weights = Weights::load(gpu.stream(), file, layers, true)?;
         let body = body(&gpu, &mut weights)?;
         let head = if head {
-            Some(Head::new(&gpu, &weights, body.head_eps())?)
+            Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
         } else {
             None
         };
@@ -418,7 +424,7 @@ impl<B: ChainBody> GpuModel<B> {
         let residency = HostResidency::at_load(&file, plan, |_| true, host)?;
         let body = body(&gpu, file, &weights, residency)?;
         let head = if spec.head {
-            Some(Head::new(&gpu, &weights, body.head_eps())?)
+            Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
         } else {
             None
         };
@@ -966,7 +972,13 @@ impl<B: Rows> GpuModel<B> {
             return Err(no_head(what));
         }
         while self.heads.len() < m {
-            let head = Head::new(&self.gpu, &self.weights, self.body.head_eps())?;
+            let head = Head::with_norm(
+                &self.gpu,
+                &self.weights,
+                self.body.head_eps(),
+                1,
+                self.body.head_norm(),
+            )?;
             self.heads.push(head);
         }
         Ok(())
