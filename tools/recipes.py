@@ -13,6 +13,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
+    python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -88,11 +89,32 @@ and both fail loudly: a doc comment's example is blanked as a comment but compil
 doctest, and a Linux-only name missing from the list above is not seen. Either way the crate is
 selected and its native build fails in `just mac-test`, which names it — a rule bug to fix here, never
 an exception list.
+
+Orphan tests (`orphan-tests`). Every `#[test]` fn of every workspace target (lib, bins, tests/*.rs) is run
+on the box by some cargo test call of a gate-* or lab-* recipe (a lab-* recipe is a lab crate's own test
+runner; `just mac-test` runs on the Mac and is not one). A call runs a test when all hold:
+  1. it runs the test's target — `--lib` for a lib's tests, `--bin N`, `--test N`, no selector for all
+     three kinds (doctests are not #[test] fns; example and bench tests run only with `test = true`);
+  2. every cfg on the test's path — the file's `#![cfg]`, each module's `#[cfg]`, the fn's own — holds on
+     x86_64-unknown-linux-gnu with cfg(test) on and the call's features: its `--features`, the defaults
+     unless `--no-default-features`, their closure;
+  3. its name filter, if any, matches the libtest name (the module path from the target's root, then the fn:
+     a substring, or equality under `--exact`), and no `--skip` does;
+  4. its ignore flags reach it: an `#[ignore]`d test needs `--ignored` or `--include-ignored`, and
+     `--ignored` alone runs no other.
+The check prints `path:line name — why` per test no call runs, then a count, and exits 1; 0 when there is
+none. What it cannot read exits 2, named by file and line, never a pass: a cfg it cannot parse or whose key
+it does not know (target_feature, debug_assertions — the profile decides it), a `cfg_attr` carrying cfg,
+ignore, path or test, a test attribute from a macro crate (`#[tokio::test]`), a test attribute inside a
+macro or any other non-module item, a module-level `include!`, a test argument from a recipe parameter, a
+libtest option it does not know. Two gaps it does not see: tests a macro defined elsewhere expands into
+(its invocation carries no test attribute), and anything outside the workspace members.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import concurrent.futures
 import datetime
 import difflib
@@ -278,6 +300,8 @@ class Invocation:
     all_features: bool = False
     all_targets: bool = False
     raw: str = ""
+    names: list[str] = field(default_factory=list)  # positional test-name filters before `--` (`cargo test <filter>`)
+    test_args: list[str] = field(default_factory=list)  # the test binary's arguments, after `--`
 
 
 def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocation | None:
@@ -306,9 +330,11 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
         rest = args[1:]
     if sub not in BUILD_SUBS:
         return None
+    test_args: list[str] = []
     if "--" in rest:
+        test_args = rest[rest.index("--") + 1 :]
         rest = rest[: rest.index("--")]
-    inv = Invocation(sub=sub, oxide=oxide, raw=raw)
+    inv = Invocation(sub=sub, oxide=oxide, raw=raw, test_args=test_args)
     i = 0
     while i < len(rest):
         w = rest[i]
@@ -356,7 +382,9 @@ def parse_cargo(args: list[str], raw: str, via_gate_sh: bool = False) -> Invocat
                 inv.all_features = True
         elif w.startswith("-"):
             raise RecipeError(f"cargo option `{w}` is not known to tools/recipes.py (add it to _CARGO_VALUE or _CARGO_FLAG): {raw}")
-        # a positional word is a test-name filter (`cargo test <filter>`); it selects no target
+        else:
+            # a positional word is a test-name filter (`cargo test <filter>`); it selects no target
+            inv.names.append(w)
         i += 1
     return inv
 
@@ -711,22 +739,10 @@ class Tree:
                 pending_path = None
                 pending_test = False
                 inner = [n for (i, n, _) in inline if i < indent]
-                if path_attr is not None:
-                    base = os.path.join(fdir, *inner) if inner else fdir
-                    child = os.path.normpath(os.path.join(base, path_attr))
-                    if not self.exists(child):
-                        self.unresolved.append(f"{rel}: #[path = \"{path_attr}\"] mod {name} ({child} not found)")
-                        continue
-                    # a #[path] file is a mod-rs file: its children live beside it
-                    self._walk(child, os.path.dirname(child), acc, child_test)
-                    continue
-                base = os.path.join(moddir, *inner) if inner else moddir
-                cand = [os.path.normpath(os.path.join(base, name + ".rs")), os.path.normpath(os.path.join(base, name, "mod.rs"))]
-                hit = next((c for c in cand if self.exists(c)), None)
+                hit, child_dir, err = self.mod_file(rel, moddir, inner, name, path_attr)
                 if hit is None:
-                    self.unresolved.append(f"{rel}: mod {name} (neither {cand[0]} nor {cand[1]})")
+                    self.unresolved.append(err)
                     continue
-                child_dir = os.path.dirname(hit) if hit.endswith("mod.rs") else hit[: -len(".rs")]
                 self._walk(hit, child_dir, acc, child_test)
                 continue
             if im:
@@ -740,6 +756,25 @@ class Tree:
                 continue
             pending_path = None
             pending_test = False
+
+    def mod_file(self, rel: str, moddir: str, inner: list[str], name: str, path_attr: str | None) -> tuple[str | None, str, str]:
+        """(file, its module directory, "") of `mod name;` declared in `rel`, whose children live in
+        `moddir`, inside the inline modules `inner` — or (None, "", why) when no file is there. The
+        one resolver of a file module for both walks (`_walk`, `tests_of`)."""
+        fdir = os.path.dirname(rel)
+        if path_attr is not None:
+            base = os.path.join(fdir, *inner) if inner else fdir
+            child = os.path.normpath(os.path.join(base, path_attr))
+            if not self.exists(child):
+                return None, "", f"{rel}: #[path = \"{path_attr}\"] mod {name} ({child} not found)"
+            # a #[path] file is a mod-rs file: its children live beside it
+            return child, os.path.dirname(child), ""
+        base = os.path.join(moddir, *inner) if inner else moddir
+        cand = [os.path.normpath(os.path.join(base, name + ".rs")), os.path.normpath(os.path.join(base, name, "mod.rs"))]
+        hit = next((c for c in cand if self.exists(c)), None)
+        if hit is None:
+            return None, "", f"{rel}: mod {name} (neither {cand[0]} nor {cand[1]})"
+        return hit, os.path.dirname(hit) if hit.endswith("mod.rs") else hit[: -len(".rs")], ""
 
     def tree_of(self, src: str, test: bool = False) -> tuple[set[str], list[tuple[str, str]]]:
         """`src`'s module tree as one build of it sees it: a test build (`test`) with its test-only
@@ -1624,20 +1659,24 @@ def parse_cfg(text: str):
     return tree if at == len(toks) else None
 
 
-def eval_cfg(pred, test: bool | None) -> bool | None:
-    """The predicate on MAC_TARGET: True, False, or None (unknown). `test` is cfg(test)'s value."""
+def eval_cfg(pred, test: bool | None, keys: dict[str, str] = _MAC_CFG_KEYS, names: dict[str, bool] = _MAC_CFG_NAMES, features: set[str] | None = None) -> bool | None:
+    """The predicate on MAC_TARGET (or the target `keys` and `names` describe): True, False, or None
+    (unknown). `test` is cfg(test)'s value; `features`, when given, is the crate's enabled feature set,
+    else `feature = …` is unknown."""
     if pred is None:
         return None
     kind = pred[0]
     if kind == "name":
         if pred[1] == "test":
             return test
-        return _MAC_CFG_NAMES.get(pred[1])
+        return names.get(pred[1])
     if kind == "kv":
-        if pred[1] in _MAC_CFG_KEYS:
-            return _MAC_CFG_KEYS[pred[1]] == pred[2]
+        if pred[1] in keys:
+            return keys[pred[1]] == pred[2]
+        if pred[1] == "feature" and features is not None:
+            return pred[2] in features
         return None
-    vals = [eval_cfg(p, test) for p in pred[1]]
+    vals = [eval_cfg(p, test, keys, names, features) for p in pred[1]]
     if kind == "not":
         return None if vals[0] is None else not vals[0]
     if kind == "all":
@@ -1817,6 +1856,436 @@ def cmd_pure_crates(args: argparse.Namespace) -> int:
         for w in why:
             print(f"rejected  {n}  {w}")
     print(f"pure-crates: {sum(1 for _, w in rows if not w)} pure, {sum(1 for _, w in rows if w)} rejected, on {MAC_TARGET} (the rule: tools/recipes.py, section «pure crates»)")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------
+# orphan tests: every test is run by some gate (`orphan-tests`)
+# ----------------------------------------------------------------------------------------------
+# The rule is the module docstring's «orphan tests» paragraphs; `just check-recipes` runs it.
+
+# The recipes whose cargo test calls count as running a test. A lab-* recipe is a lab crate's own test
+# runner (AGENTS.md: `just lab-engram`); it is left out of landing batches, not out of this count.
+TEST_RUNNERS = ("gate-", "lab-")
+# The box's target, x86_64-unknown-linux-gnu, where every gate-* recipe runs; any other key is unknown.
+_BOX_CFG_KEYS = {
+    "target_arch": "x86_64",
+    "target_os": "linux",
+    "target_family": "unix",
+    "target_vendor": "unknown",
+    "target_env": "gnu",
+    "target_pointer_width": "64",
+    "target_endian": "little",
+}
+_BOX_CFG_NAMES = {"unix": True, "windows": False}
+# libtest's options. The ones that take a value are tools/gate.sh's list (it skips their values when it
+# looks for a call's filters); an option in neither set is a named error.
+_LIBTEST_VALUE = {"--skip", "--test-threads", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
+_LIBTEST_FLAG = {
+    "--nocapture", "--no-capture", "--show-output", "--ignored", "--include-ignored", "--exact", "--list", "--test",
+    "--bench", "-q", "--quiet", "--report-time", "--ensure-time", "--shuffle", "--force-run-in-process",
+    "--exclude-should-panic",
+}
+_WS = re.compile(r"\s*")
+_ATTR_OPEN = re.compile(r"#\s*(!?)\s*\[")
+_ATTR_PATH = re.compile(r"^((?:::)?[A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)")
+_VIS = r"(?:pub(?:\s*\([^)]*\))?\s+)?"
+_ITEM_MOD = re.compile(rf"^{_VIS}(?:unsafe\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)$")
+_ITEM_FN = re.compile(rf"^{_VIS}(?:(?:default|const|async|unsafe|safe)\s+|extern\s+(?:\"[^\"]*\"\s+)?)*fn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)")
+# A test attribute anywhere in an item's text (on `shape`: comments and string contents blanked).
+_TEST_ATTR = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:test|rstest|test_case)\b")
+
+
+@dataclass
+class TestItem:
+    file: str
+    line: int
+    path: str  # the name libtest gives it: the module path from the target's root, then the fn
+    cfgs: list[tuple[str, int, str, object]]  # (file, line, predicate text, parse_cfg tree) on its path, outermost first
+    ignored: bool
+
+
+@dataclass
+class LibtestArgs:
+    filters: list[str]
+    skips: list[str]
+    exact: bool
+    ignored: str  # "plain" (an #[ignore]d test does not run) | "only" (--ignored) | "include" (--include-ignored)
+    runs: bool  # False under --list or --bench: the binary runs no test
+
+    def misses(self, path: str, ignored: bool) -> str | None:
+        """None when this call runs the test named `path`, else why it does not."""
+        if not self.runs:
+            return "the call lists or benches, it runs no test"
+        hit = (lambda f: path == f) if self.exact else (lambda f: f in path)
+        if self.filters and not any(hit(f) for f in self.filters):
+            return f"its filter {' '.join(self.filters)}{' (--exact)' if self.exact else ''} does not match {path}"
+        skip = next((s for s in self.skips if hit(s)), None)
+        if skip is not None:
+            return f"its --skip {skip} matches {path}"
+        if ignored and self.ignored == "plain":
+            return "the test is #[ignore]d and the call has neither --ignored nor --include-ignored"
+        if not ignored and self.ignored == "only":
+            return "the call runs --ignored only and the test is not #[ignore]d"
+        return None
+
+
+def libtest_args(inv: Invocation) -> LibtestArgs:
+    """The test binary's arguments of a cargo test call: `cargo test <filter>` and the words after `--`."""
+    out = LibtestArgs(filters=list(inv.names), skips=[], exact=False, ignored="plain", runs=True)
+    if any("{{" in w for w in inv.names):
+        raise RecipeError(f"test filter `{' '.join(inv.names)}` is a recipe parameter: which tests it runs is known only at run time: {inv.raw}")
+    words = list(inv.test_args)
+    flags: set[str] = set()
+    i = 0
+    while i < len(words):
+        w = words[i]
+        opt, val = (w.split("=", 1) + [None])[:2] if w.startswith("--") and "=" in w else (w, None)
+        if "{{" in w:
+            raise RecipeError(f"test argument `{w}` is a recipe parameter: which tests it runs is known only at run time: {inv.raw}")
+        if opt in _LIBTEST_VALUE:
+            if val is None:
+                i += 1
+                if i >= len(words):
+                    raise RecipeError(f"libtest option `{opt}` without a value in: {inv.raw}")
+                val = words[i]
+            if opt == "--skip":
+                out.skips.append(val)
+        elif opt in _LIBTEST_FLAG:
+            flags.add(opt)
+        elif w.startswith("-"):
+            raise RecipeError(f"libtest option `{w}` is not known to tools/recipes.py (add it to _LIBTEST_FLAG or _LIBTEST_VALUE): {inv.raw}")
+        else:
+            out.filters.append(w)
+        i += 1
+    if "--ignored" in flags and "--include-ignored" in flags:
+        raise RecipeError(f"--ignored and --include-ignored together, which libtest refuses: {inv.raw}")
+    out.ignored = "only" if "--ignored" in flags else ("include" if "--include-ignored" in flags else "plain")
+    out.exact = "--exact" in flags
+    out.runs = not ({"--list", "--bench"} & flags)
+    return out
+
+
+def _close(shape: str, at: int) -> int | None:
+    """The index of the bracket that closes the one at `at` (every bracket kind counted as one)."""
+    depth = 0
+    for j in range(at, len(shape)):
+        c = shape[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _split_top(text: str) -> list[str]:
+    """`text` split at its commas outside brackets and string literals."""
+    items, depth, cur, quote = [], 0, "", False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            cur += ch
+            if ch == "\\" and i + 1 < len(text):
+                cur += text[i + 1]
+                i += 1
+            elif ch == '"':
+                quote = False
+        elif ch == '"':
+            quote, cur = True, cur + ch
+        elif ch == "," and depth == 0:
+            items.append(cur.strip())
+            cur = ""
+        else:
+            depth += (ch in "([{") - (ch in ")]}")
+            cur += ch
+        i += 1
+    if cur.strip():
+        items.append(cur.strip())
+    return items
+
+
+class TestScan:
+    """Every `#[test]` fn of one target's module tree, with the cfgs on its path and its #[ignore]; what
+    the scan cannot read goes to `errors` by file and line, never into a guess."""
+
+    def __init__(self, tree: Tree):
+        self.tree = tree
+        self._lex: dict[str, tuple[str, str, list[int]]] = {}
+        self._cache: dict[str, tuple[list[TestItem], list[str]]] = {}
+
+    def lexed(self, rel: str) -> tuple[str, str, list[int]]:
+        if rel not in self._lex:
+            code, shape = rust_lex(self.tree.read(rel))
+            starts = [0] + [m.end() for m in re.finditer("\n", shape)]
+            self._lex[rel] = (code, shape, starts)
+        return self._lex[rel]
+
+    def tests_of(self, src: str) -> tuple[list[TestItem], list[str]]:
+        if src not in self._cache:
+            out: list[TestItem] = []
+            errs: list[str] = []
+            self._file(src, os.path.dirname(src), [], [], out, errs, ())
+            self._cache[src] = (out, errs)
+        return self._cache[src]
+
+    def _file(self, rel: str, moddir: str, modpath: list[str], cfgs: list, out: list[TestItem], errs: list[str], stack: tuple[str, ...]) -> None:
+        if rel in stack:
+            errs.append(f"{rel}:1: a module cycle ({' -> '.join(stack + (rel,))})")
+            return
+        code, shape, _ = self.lexed(rel)
+        self._items(rel, 0, len(shape), moddir, [], modpath, cfgs, out, errs, stack + (rel,))
+
+    def line_of(self, rel: str, at: int) -> int:
+        return bisect.bisect_right(self.lexed(rel)[2], at)
+
+    def _items(self, rel: str, pos: int, end: int, moddir: str, inner: list[str], modpath: list[str], cfgs: list, out: list[TestItem], errs: list[str], stack: tuple[str, ...]) -> None:
+        code, shape, _ = self.lexed(rel)
+
+        def line_of(at: int) -> int:
+            return self.line_of(rel, at)
+
+        attrs: list[tuple[str, int]] = []
+        cfgs = list(cfgs)
+        while True:
+            pos = _WS.match(shape, pos).end()
+            if pos >= end:
+                break
+            m = _ATTR_OPEN.match(shape, pos)
+            if m:
+                close = _close(shape, m.end() - 1)
+                if close is None or close >= end:
+                    errs.append(f"{rel}:{line_of(pos)}: an attribute with no closing bracket")
+                    return
+                text = " ".join(code[m.end() : close].split())
+                if m.group(1):
+                    am = _ATTR_PATH.match(text)
+                    name = re.sub(r"\s+", "", am.group(1)) if am else ""
+                    if name == "cfg":
+                        pred = self._cfg_of(rel, line_of(pos), text, errs)
+                        if pred is None:
+                            return
+                        cfgs.append(pred)
+                    elif name == "cfg_attr":
+                        errs.append(f"{rel}:{line_of(pos)}: #![{text}] — a conditional inner attribute this checker does not evaluate")
+                        return
+                else:
+                    attrs.append((text, line_of(pos)))
+                pos = close + 1
+                continue
+            j, depth, body, semi = pos, 0, None, False
+            while j < end:
+                c = shape[j]
+                if c in "([":
+                    depth += 1
+                elif c in ")]":
+                    depth -= 1
+                elif c == "{":
+                    if depth == 0:
+                        close = _close(shape, j)
+                        if close is None or close >= end:
+                            errs.append(f"{rel}:{line_of(j)}: a brace with no close")
+                            return
+                        body = (j + 1, close)
+                        j = close + 1
+                        break
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                elif c == ";" and depth == 0:
+                    semi = True
+                    j += 1
+                    break
+                j += 1
+            head_end = body[0] - 1 if body else (j - 1 if semi else j)
+            head = " ".join(code[pos:head_end].split())
+            if head:
+                self._item(rel, (pos, j), head, body, attrs, moddir, inner, modpath, cfgs, out, errs, stack)
+            attrs = []
+            pos = j
+
+    def _cfg_of(self, rel: str, line: int, text: str, errs: list[str]):
+        """(file, line, text, tree) of a `cfg(…)` attribute's predicate, or None (errs names it)."""
+        inside = text[len("cfg") :].strip()
+        if not (inside.startswith("(") and inside.endswith(")")):
+            errs.append(f"{rel}:{line}: #[{text}] is not a cfg(…) this checker reads")
+            return None
+        pt = inside[1:-1].strip()
+        tree = parse_cfg(pt)
+        if tree is None:
+            errs.append(f"{rel}:{line}: cfg({pt}) is not a predicate this checker reads")
+            return None
+        return (rel, line, pt, tree)
+
+    def _item(self, rel: str, span: tuple[int, int], head: str, body, attrs: list[tuple[str, int]], moddir: str, inner: list[str], modpath: list[str], cfgs: list, out: list[TestItem], errs: list[str], stack: tuple[str, ...]) -> None:
+        """One item after its outer attributes: `span` is its text (head and body), `body` its braces' inside."""
+        _, shape, _ = self.lexed(rel)
+        line = self.line_of(rel, span[0])
+        here = list(cfgs)
+        test = ignored = False
+        path_attr = None
+        for text, aline in attrs:
+            m = _ATTR_PATH.match(text)
+            name = re.sub(r"\s+", "", m.group(1)) if m else ""
+            if name == "cfg":
+                pred = self._cfg_of(rel, aline, text, errs)
+                if pred is None:
+                    return
+                here.append(pred)
+            elif name == "cfg_attr":
+                inside = text[len("cfg_attr") :].strip()
+                parts = _split_top(inside[1:-1]) if inside.startswith("(") and inside.endswith(")") else []
+                named = [re.sub(r"\s+", "", pm.group(1)) if (pm := _ATTR_PATH.match(p)) else p for p in parts[1:]]
+                if not parts or any(n in ("cfg", "ignore", "path", "test") or n.endswith("::test") for n in named):
+                    errs.append(f"{rel}:{aline}: #[{text}] — a conditional cfg, ignore, path or test attribute this checker does not evaluate")
+                    return
+            elif name == "test":
+                if text != "test":
+                    errs.append(f"{rel}:{aline}: #[{text}] is not a plain #[test] this checker reads")
+                    return
+                test = True
+            elif name == "ignore":
+                ignored = True
+            elif name == "path":
+                pm = re.match(r'^path\s*=\s*"([^"]*)"$', text)
+                if pm is None:
+                    errs.append(f"{rel}:{aline}: #[{text}] is not a #[path = \"…\"] this checker reads")
+                    return
+                path_attr = pm.group(1)
+            elif name.endswith("::test") or name in ("rstest", "test_case"):
+                errs.append(f"{rel}:{aline}: #[{text}] — a test attribute from a macro crate, whose expansion this checker does not see")
+                return
+        mm = _ITEM_MOD.match(head)
+        if mm:
+            name = mm.group(1)
+            if body is None:
+                hit, child_dir, err = self.tree.mod_file(rel, moddir, inner, name, path_attr)
+                if hit is None:
+                    errs.append(f"{rel}:{line}: {err}")
+                    return
+                self._file(hit, child_dir, modpath + [name], here, out, errs, stack)
+            else:
+                self._items(rel, body[0], body[1], moddir, inner + [name], modpath + [name], here, out, errs, stack)
+            return
+        fm = _ITEM_FN.match(head)
+        nested = _TEST_ATTR.search(shape, span[0], span[1])
+        if fm and test:
+            out.append(TestItem(rel, line, "::".join(modpath + [fm.group(1)]), here, ignored))
+            if nested:
+                errs.append(f"{rel}:{self.line_of(rel, nested.start())}: a test attribute inside the test fn {fm.group(1)} — an inner item libtest cannot name")
+            return
+        if test:
+            errs.append(f"{rel}:{line}: #[test] on `{head[:60]}`, which is not a fn this checker reads")
+        elif nested:
+            errs.append(f"{rel}:{self.line_of(rel, nested.start())}: a test attribute inside `{head[:60]}` — a macro or a nested item this checker does not read")
+        elif re.match(r"^include\s*!", head):
+            errs.append(f"{rel}:{line}: `{head[:60]}` at module level — the items it includes are not read")
+
+
+@dataclass
+class TestRun:
+    recipe: str
+    features: set[str] | None  # None: a feature from a recipe parameter, known only at run time
+    args: LibtestArgs
+
+
+def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ...] = TEST_RUNNERS) -> tuple[list[str], list[str], int]:
+    """(orphans, errors, tests checked): every `#[test]` of every workspace target that no cargo test call of
+    a recipe named with `prefixes` runs on the box, one `path:line name — why` line each; and every input
+    it cannot decide, by file and line."""
+    runs: dict[tuple[str, str, str | None], list[TestRun]] = {}
+    errors: list[str] = []
+    for rname in sorted(recipes, key=lambda n: (recipes[n].line, n)):
+        if not rname.startswith(prefixes):
+            continue
+        try:
+            invocations = recipe_commands(recipes[rname]).invocations
+        except RecipeError as err:
+            errors.append(f"justfile:{recipes[rname].line} {rname}: {err}")
+            continue
+        for inv in invocations:
+            if inv.sub != "test":
+                continue
+            try:
+                args = libtest_args(inv)
+            except RecipeError as err:
+                errors.append(f"justfile:{recipes[rname].line} {rname}: {err}")
+                continue
+            targets, _ = tree.resolve(inv)  # a target the call names wrongly is check()'s error, not this one's
+            param = any("{{" in f for f in inv.features)
+            for pname, kind, tname, feats in targets:
+                if kind == "libtest":
+                    key = (pname, "lib", None)
+                elif kind in ("bin", "test"):
+                    key = (pname, kind, tname)
+                else:
+                    # doctests are not #[test] fns; an example's or a bench's tests run only with `test = true`
+                    continue
+                enabled = None if param else tree.feature_closure(tree.packages[pname], feats, not inv.no_default, inv.all_features)[0]
+                runs.setdefault(key, []).append(TestRun(rname, enabled, args))
+    scan = TestScan(tree)
+    orphans: list[str] = []
+    checked = 0
+    for pname in sorted(tree.packages):
+        for t in tree.packages[pname].targets:
+            if t.kind == "build":
+                continue
+            key = (pname, t.kind, None if t.kind == "lib" else t.name)
+            label = f"{pname} {t.kind}" + ("" if t.kind == "lib" else f" {t.name}")
+            items, errs = scan.tests_of(t.src)
+            errors.extend(errs)
+            for item in items:
+                checked += 1
+                cands = runs.get(key, [])
+                if not cands:
+                    orphans.append(f"{item.file}:{item.line} {item.path} — {label}: no {' or '.join(p + '*' for p in prefixes)} recipe runs this target's tests")
+                    continue
+                reasons: list[str] = []
+                unknown: list[str] = []
+                for run in cands:
+                    bad = None
+                    for f, ln, text, pred in item.cfgs:
+                        v = eval_cfg(pred, True, _BOX_CFG_KEYS, _BOX_CFG_NAMES, run.features)
+                        if v is None:
+                            unknown.append(f"cfg({text}) at {f}:{ln} under {run.recipe}")
+                            bad = "?"
+                            break
+                        if v is False:
+                            feats = "no feature" if not run.features else "features " + ",".join(sorted(run.features))
+                            bad = f"{run.recipe} ({feats}): cfg({text}) at {f}:{ln} is false"
+                            break
+                    if bad is None:
+                        miss = run.args.misses(item.path, item.ignored)
+                        if miss is None:
+                            break
+                        bad = f"{run.recipe}: {miss}"
+                    if bad != "?" and bad not in reasons:
+                        reasons.append(bad)
+                else:
+                    if unknown:
+                        errors.append(f"{item.file}:{item.line} {item.path}: cannot evaluate {unknown[0]}")
+                    else:
+                        orphans.append(f"{item.file}:{item.line} {item.path} — {label}: " + "; ".join(reasons))
+    return orphans, list(dict.fromkeys(errors)), checked  # a module several targets include is read once per target
+
+
+def cmd_orphan_tests(args: argparse.Namespace) -> int:
+    tree = Tree(ROOT)
+    recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
+    orphans, errors, checked = orphan_tests(tree, recipes)
+    for o in orphans:
+        print(o)
+    for e in errors:
+        print(f"orphan-tests: cannot decide: {e}")
+    if errors:
+        print(f"orphan-tests: {len(errors)} inputs the checker cannot read, {len(orphans)} of {checked} tests no gate-* or lab-* recipe runs")
+        return 2
+    if orphans:
+        print(f"orphan-tests: {len(orphans)} of {checked} tests no gate-* or lab-* recipe runs")
+        return 1
+    print(f"orphan-tests: ok ({checked} tests, each run by a gate-* or lab-* recipe)")
     return 0
 
 
@@ -2870,6 +3339,159 @@ def key_self_test(expect, real: Side) -> None:
 
 
 
+def orphan_self_test(expect, real: Side) -> None:
+    """orphan-tests: the libtest argument reader, the scan and the run rule on a synthetic crate, then
+    FAIL-first on the real tree — a recipe removed, a crate with a planted feature-gated test, a filter
+    that matches nothing."""
+    # libtest arguments: filters, --skip, --exact, the ignore modes; a refusal names what it refuses
+    a = libtest_args(parse_cargo(["test", "-p", "p", "pre", "--", "--ignored", "x::", "--skip", "x::slow", "--test-threads=1", "--nocapture"], "t"))
+    expect(a.filters == ["pre", "x::"] and a.skips == ["x::slow"] and a.ignored == "only" and a.runs, f"libtest args: {a}")
+    expect(a.misses("x::fast", True) is None and "--skip x::slow" in (a.misses("x::slow", True) or ""), "libtest args: --skip")
+    expect("not #[ignore]d" in (a.misses("x::fast", False) or ""), "libtest args: --ignored ran a plain test")
+    e = libtest_args(parse_cargo(["test", "--", "--exact", "m::t"], "t"))
+    expect(e.misses("m::t", False) is None and e.misses("m::t2", False) is not None, "libtest args: --exact")
+    expect("#[ignore]d" in (libtest_args(parse_cargo(["test"], "t")).misses("t", True) or ""), "libtest args: a plain call ran an #[ignore]d test")
+    for words, why in [
+        (["--", "--ignored", "--include-ignored"], "together"),
+        (["--", "--frobnicate"], "not known"),
+        (["--", "{{ARGS}}"], "recipe parameter"),
+        (["{{F}}"], "recipe parameter"),
+        (["--", "--skip"], "without a value"),
+    ]:
+        try:
+            libtest_args(parse_cargo(["test"] + words, "t"))
+            fails = f"libtest args: {words} accepted"
+        except RecipeError as err:
+            fails = "" if why in str(err) else f"libtest args: {words} refused without '{why}': {err}"
+        expect(not fails, fails)
+
+    # a synthetic crate: file and inline modules, cfgs on the path, #[ignore], an integration target, and
+    # every shape the scan refuses by name
+    with tempfile.TemporaryDirectory(prefix="recipes-orphan-") as tmp:
+        files = {
+            "p/Cargo.toml": "",
+            "p/src/lib.rs": (
+                "//! #[test] in a doc comment is not a test\n"
+                "#![allow(dead_code)]\n"
+                "pub fn f() -> Result<(), String> { Ok(()) }\n"
+                "#[test]\nfn plain() {}\n"
+                '#[test]\n#[ignore = "hw"]\nfn hw_ign() {}\n'
+                '#[cfg(feature = "f")]\nmod feat {\n    #[test]\n    fn t() {}\n}\n'
+                '#[cfg(feature = "g")]\nmod on {\n    #[test]\n    fn t() {}\n}\n'
+                '#[cfg(target_os = "macos")]\nmod mac {\n    #[test]\n    fn t() {}\n}\n'
+                "#[cfg(test)]\nmod m;\n"
+                '#[path = "other.rs"]\nmod moved;\n'
+                'const S: &str = "#[test] fn fake() {}";\n'
+            ),
+            "p/src/m.rs": "#[test]\nfn file_mod() {}\nmod deep {\n    #[test]\n    fn t() { let _ = '{'; }\n}\n",
+            "p/src/other.rs": '#[cfg(all(unix, not(windows)))]\n#[test]\nfn via_path() {}\n',
+            "p/tests/it.rs": "mod common;\n#[test]\nfn integ() {}\n",
+            "p/tests/common/mod.rs": "#[test]\nfn shared() {}\n",
+            "q/Cargo.toml": "",
+            "q/src/lib.rs": (
+                '#[cfg_attr(feature = "g", ignore)]\n#[test]\nfn cond() {}\n'
+                "macro_rules! mk {\n    () => {\n        #[test]\n        fn gen() {}\n    };\n}\n"
+                "#[tokio::test]\nasync fn tok() {}\n"
+                '#[cfg(target_feature = "avx2")]\n#[test]\nfn avx() {}\n'
+                "#[cfg(foo bar)]\n#[test]\nfn junk() {}\n"
+                'include!("gen.rs");\n'
+            ),
+        }
+        for rel, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        def pkg(name: str, targets: list[tuple[str, str, str]], features: dict) -> dict:
+            return {
+                "id": name,
+                "name": name,
+                "manifest_path": os.path.join(tmp, name, "Cargo.toml"),
+                "features": features,
+                "dependencies": [],
+                "targets": [{"kind": [k], "name": n, "src_path": os.path.join(tmp, name, s)} for k, n, s in targets],
+            }
+
+        meta = {
+            "workspace_root": tmp,
+            "workspace_members": ["p", "q"],
+            "packages": [
+                pkg("p", [("lib", "p", "src/lib.rs"), ("test", "it", "tests/it.rs")], {"f": [], "g": [], "default": []}),
+                pkg("q", [("lib", "q", "src/lib.rs")], {"g": []}),
+            ],
+        }
+        st = Tree(tmp, meta)
+
+        def rec(name: str, cmd: str) -> Recipe:
+            return Recipe(name, [f"./tools/box.sh '{cmd}'"], [], "")
+
+        rs = {
+            "gate-p": rec("gate-p", "bash tools/gate.sh -p p --lib -- --include-ignored"),
+            "gate-p-g": rec("gate-p-g", "bash tools/gate.sh -p p --features g --lib -- on::"),
+            "check-p": rec("check-p", "bash tools/gate.sh -p p --test it"),
+            "gate-q": rec("gate-q", "bash tools/gate.sh -p q --lib"),
+        }
+        orphans, errors, checked = orphan_tests(st, rs)
+        names = sorted(o.split(" ")[1] for o in orphans)
+        expect(names == ["common::shared", "feat::t", "integ", "mac::t"], f"orphan scan: orphans {names}")
+        expect(any("p/src/lib.rs:12 feat::t" in o and 'cfg(feature = "f") at p/src/lib.rs:9 is false' in o for o in orphans), f"orphan scan: feat::t's line {orphans}")
+        expect(any(o.startswith("p/tests/it.rs:3 integ — p test it: no gate-* or lab-* recipe") for o in orphans), f"orphan scan: a check-* recipe counted as a runner {orphans}")
+        expect(checked == 11, f"orphan scan: {checked} tests checked, not 11")
+        for where, why in [
+            ("q/src/lib.rs:1:", "cfg_attr"),
+            ("q/src/lib.rs:6:", "macro_rules! mk"),
+            ("q/src/lib.rs:10:", "tokio::test"),
+            ("q/src/lib.rs:14 avx:", 'cfg(target_feature = "avx2") at q/src/lib.rs:12'),
+            ("q/src/lib.rs:15:", "cfg(foo bar)"),
+            ("q/src/lib.rs:18:", "include!"),
+        ]:
+            expect(any(x.startswith(where) and why in x for x in errors), f"orphan scan: no named error at {where} ({why}): {errors}")
+        expect(len(errors) == 6, f"orphan scan: {len(errors)} errors, not 6: {errors}")
+
+    # the real tree: gate-ds41-bind runs both bind tests (the deepseek41 feature, the bind:: filter)
+    orphans, errors, checked = orphan_tests(real.tree, real.recipes)
+    expect(not errors, f"orphan scan on the real tree: {errors[:3]}")
+    expect(not any(" bind::tests::" in o for o in orphans), f"orphan scan: a bind test is an orphan on the real tree: {[o for o in orphans if 'bind::' in o]}")
+    base = set(orphans)
+    with open(os.path.join(ROOT, "justfile"), encoding="utf-8") as fh:
+        text = fh.read()
+    with tempfile.TemporaryDirectory(prefix="recipes-orphan-ff-") as tmp:
+        p = os.path.join(tmp, "justfile")
+        # (a) the recipe removed: both bind tests red, each naming the cfg the plain lib run lacks
+        m = re.search(r"^gate-ds41-bind:\n(?:    .*\n)+", text, re.M)
+        if m is None:
+            expect(False, "orphan FAIL-first: no gate-ds41-bind recipe to remove")
+        else:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text[: m.start()] + text[m.end() :])
+            got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
+            bind = [o for o in got if " bind::tests::" in o]
+            expect(len(bind) == 2 and len(got) == 2 and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (no feature)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
+        # (c) a filter that matches nothing of its module: the tests only that filter reached go red
+        for pat in (r"--lib -- (bind::)'", r"--ignored (hw_ds41_oracle) "):
+            m = re.search(pat, text)
+            if m is None:
+                expect(False, f"orphan FAIL-first: no anchor {pat}")
+                continue
+            bad = m.group(1).rstrip(":_") + "x"
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text[: m.start(1)] + bad + text[m.end(1) :])
+            got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
+            expect(got and all(f"its filter {bad} does not match" in o and m.group(1).rstrip(":") in o for o in got), f"orphan FAIL-first (c) {bad}: {sorted(got)}")
+        # (b) a scratch copy of the crates with a test planted behind a feature no recipe enables
+        copy_root = os.path.join(tmp, "tree")
+        shutil.copytree(os.path.join(ROOT, "crates"), os.path.join(copy_root, "crates"), ignore=lambda d, names: [n for n in names if n == "target" or (os.path.isfile(os.path.join(d, n)) and not n.endswith(".rs"))])
+        rel = os.path.join("crates", "levers", "src", "lib.rs")  # spelled in parts: a whole path here would join the closure of every script that names this file
+        lib = os.path.join(copy_root, rel)
+        with open(lib, encoding="utf-8") as fh:
+            n_lines = fh.read().count("\n")
+        with open(lib, "a", encoding="utf-8") as fh:
+            fh.write('#[cfg(feature = "nonexistent")]\nmod x {\n    #[test]\n    fn t() {}\n}\n')
+        got = set(orphan_tests(Tree(copy_root, cargo_metadata(ROOT)), real.recipes)[0]) - base
+        want = f"{rel}:{n_lines + 4} x::t — bloomery-levers lib: gate-levers (no feature): cfg(feature = \"nonexistent\") at {rel}:{n_lines + 1} is false"
+        expect(got == {want}, f"orphan FAIL-first (b): {sorted(got)}, not {want}")
+
+
 def ledger_self_test(expect) -> None:
     """Two ledgers, the lead's and the rounds': a key green in either skips, the lead's first; the
     detail names the source before `tree=`; a key in neither runs; a malformed line is counted."""
@@ -3246,6 +3868,9 @@ def self_test() -> int:
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")
     expect(t.endswith("/g") and root == "/r/b" and "/r/b/crates/a b.rs" in deps, "dep-info parse")
 
+    # orphan-tests
+    orphan_self_test(expect, side)
+
     # the green ledger's key
     key_self_test(expect, side)
     ledger_self_test(expect)
@@ -3286,6 +3911,8 @@ def main(argv: list[str]) -> int:
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
     bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
+    ot = sub.add_parser("orphan-tests", help="every #[test] no gate-* or lab-* recipe runs on the box, one `path:line name — why` line each")
+    ot.add_argument("--justfile")
     pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
     pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
@@ -3308,6 +3935,8 @@ def main(argv: list[str]) -> int:
             return cmd_key(args)
         if args.cmd == "box-command":
             return cmd_box_command(args)
+        if args.cmd == "orphan-tests":
+            return cmd_orphan_tests(args)
         if args.cmd == "pure-crates":
             return cmd_pure_crates(args)
         if args.cmd == "box-manifest":

@@ -201,4 +201,14 @@ for t in "${selftests[@]}"; do
   fi
 done
 echo "check-recipes: ${#selftests[@]} tool self-tests ok"
+# Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
+# target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
+# orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
+# tests sit behind a feature no recipe enables. An input the scan cannot read fails here by file and line.
+if ! ot=$(python3 "$(dirname "$0")/recipes.py" orphan-tests 2>&1); then
+  echo "$ot" >&2
+  echo "check-recipes: a test no gate-* or lab-* recipe runs, or a source the scan cannot read (tools/recipes.py orphan-tests)" >&2
+  exit 1
+fi
+echo "${ot##*$'\n'}"
 echo "check-recipes: ok"
