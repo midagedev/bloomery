@@ -58,15 +58,16 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 
 ### On this machine
 
-| Model | Setup | Decode, tok/s | Prompt, tok/s | rig-log |
-|---|---|---|---|---|
-| DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, hot list, prose prompt of 512 | 44.8; **51.3** with the DSpark draft on the 3090 | — | [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps) |
-| DeepSeek-V4.1-Flash `Q3_K_M` | RTX 3090 + CPU, hot list, synthetic ids | 28.14 (depth 6), 28.92 (depth 4096) | 329.3 (P = 4096) | [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release) |
-| GLM-5.3-Flash `UD-Q4_K_XL` | A6000 + CPU, prose prompt | 20.95 (depth 512), 20.99 (depth 1024) | — | [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release) |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + every routed expert on the CPU | 40.46 (depth 6), 40.90 (depth 1024) | 105.7 (P = 512), 104.0 (P = 4096) | [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release) |
-| Qwen3.6-35B-A3B `Q4_K_M` | A6000, whole model | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
-| Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
+| Model | Setup | Decode, tok/s | Prompt, tok/s | vs llama.cpp | rig-log |
+|---|---|---|---|---|---|
+| DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, hot list, prose prompt of 512 | 44.8; **51.3** with the DSpark draft on the 3090 | — | not measured | [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps) |
+| DeepSeek-V4.1-Flash `Q3_K_M` | RTX 3090 + CPU, hot list, synthetic ids | 28.14 (depth 6), 28.92 (depth 4096) | 329.3 (P = 4096) | decode faster; prompt not measured | [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release) |
+| GLM-5.3-Flash `UD-Q4_K_XL` | A6000 + CPU, prose prompt | 20.95 (depth 512), 20.99 (depth 1024) | — | decode faster, but slower than its MTP draft; prompt slower | [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release) |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + every routed expert on the CPU | 40.46 (depth 6), 40.90 (depth 1024) | 105.7 (P = 512), 104.0 (P = 4096) | slower | [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release) |
+| Qwen3.6-35B-A3B `Q4_K_M` | A6000, whole model | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | faster | [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
+| Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | faster; near par in decode at depth 4096 | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
 
+- "vs llama.cpp" is the direction in the same window as the linked rig-log entry (decode and prompt alike unless it says otherwise): mainline llama.cpp, or the model's llama.cpp pull request. The rows from 2026-09-28 are provisional, as above.
 - The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, so that row is its favorable case.
 - GLM-5.3's prompt runs one step per token for now (about 21 tok/s), so it has no prompt value. With a hot list its decode is at least 28.14 at depth 512; that row is a lower bound, because its page faults were counted over the whole process.
 - Qwen3.8's prompt is fed eight positions at a time; batched prompts are next. The rig-log entries carry the other engines' rows from the same windows, including where llama.cpp is ahead.
