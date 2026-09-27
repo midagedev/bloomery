@@ -41,6 +41,18 @@
 //! position's 2,560 values and copied to the arena ahead of the step. The
 //! hash's history is the sequence's: a step at any position other than the
 //! next is refused by name, and `reset` starts a new one.
+//!
+//! The model's position (`GpuModel::pos`) owns the next position. The body
+//! keeps what its stores hold ([`Body38::kept`] reads it), which equals the
+//! position except after a call failed past its launch. A call's plan (its
+//! PLE rows, its record, its copies) moves nothing it would have to undo:
+//! the history past its rows waits beside it, and the stores' count, the
+//! history and a verify's commit move together at the launch — a step's at
+//! the end of its refresh, a pass's right before its walk, a verify's at
+//! the end of its plan. A call that fails before that runs again at the
+//! same position with the same bits. One that fails after it leaves the
+//! recurrent stores one call on, so a call at that position is refused by
+//! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -68,6 +80,7 @@ use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::Plan;
+use runtime::seqstate::{Kept, Why};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -154,9 +167,10 @@ struct PleHost {
     rows: usize,
     width: usize,
     row_bytes: usize,
-    /// Row ids of up to a pass's positions, and their decoded values
-    /// (`HIDDEN` a position).
+    /// Row ids of up to a pass's positions, the count the last fill or keep
+    /// named, and the fill's decoded values (`HIDDEN` a position).
     ids: Vec<u32>,
+    named: usize,
     e: Vec<f32>,
 }
 
@@ -209,16 +223,18 @@ impl PleHost {
             width,
             row_bytes,
             ids: vec![0; PASS_ROWS * per_token],
+            named: 0,
             e: vec![0.0; PASS_ROWS * geo::HIDDEN],
         })
     }
 
-    /// The rows of `tokens` at positions `pos ..`, the history moved past
-    /// them, decoded into the first `tokens.len()` positions of `e`. A token
-    /// the hash refuses (the image placeholder, an id past the vocabulary),
-    /// a position other than the history's next, or a row past the table is
-    /// refused by name before the history moves.
-    fn fill(&mut self, pos: u32, tokens: &[u32]) -> Result<(), GpuError> {
+    /// The rows of `tokens` at positions `pos ..`, decoded into the first
+    /// `tokens.len()` positions of `e`, and the history past them, returned:
+    /// the history stays where it stands until the call's launch takes the
+    /// returned one ([`Body38::launch`]). A token the hash refuses (the
+    /// image placeholder, an id past the vocabulary), a position other than
+    /// the history's next, or a row past the table is refused by name.
+    fn fill(&mut self, pos: u32, tokens: &[u32]) -> Result<History, GpuError> {
         let n = tokens.len();
         let per_token = geo::HIDDEN / self.width;
         let ids = self
@@ -226,9 +242,11 @@ impl PleHost {
             .get_mut(..n * per_token)
             .ok_or_else(|| GpuError::shape(WHAT, format!("{n} PLE positions at once")))?;
         let mut hist = self.hist.clone();
+        self.named = 0;
         self.hash
             .ple_rows_into(&mut hist, u64::from(pos), tokens, ids)
             .map_err(|e| GpuError::shape(WHAT, format!("PLE rows at position {pos}: {e}")))?;
+        self.named = ids.len();
         if let Some(&r) = ids.iter().find(|&&r| r as usize >= self.rows) {
             return Err(GpuError::shape(
                 WHAT,
@@ -245,8 +263,7 @@ impl PleHost {
             let out = &mut self.e[j * self.width..][..self.width];
             dequant_row(GgmlType::IQ4_NL, src, out).map_err(model::ModelError::from)?;
         }
-        self.hist = hist;
-        Ok(())
+        Ok(hist)
     }
 
     /// The history a verify's `fill` moved past its rows, moved instead
@@ -259,9 +276,11 @@ impl PleHost {
             GpuError::shape(WHAT, format!("{} PLE positions at once", kept.len()))
         })?;
         let mut hist = before;
+        self.named = 0;
         self.hash
             .ple_rows_into(&mut hist, u64::from(pos), kept, ids)
             .map_err(|e| GpuError::shape(WHAT, format!("PLE rows at position {pos}: {e}")))?;
+        self.named = ids.len();
         self.hist = hist;
         Ok(())
     }
@@ -349,6 +368,52 @@ struct Pending38 {
     hist: History,
 }
 
+/// A call planned and not yet launched: its first position, its rows, the
+/// PLE history past them, and a verify's tokens. [`Body38::launch`] takes
+/// it; a call that fails first leaves it to be planned over.
+struct Staged38 {
+    pos: u32,
+    rows: u32,
+    hist: History,
+    verify: Option<Vec<u32>>,
+}
+
+/// Where a gate plants a call's failure ([`Body38::plant_before_launch`],
+/// [`Body38::plant_after_launch`]): once its plan and copies are made and
+/// before its launch, or once its chain has run and its host legs been
+/// served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plant {
+    BeforeLaunch,
+    AfterLaunch,
+}
+
+/// The planted failure at `at`, taken, as the call's error; nothing when
+/// none is planted there.
+fn planted(plant: &mut Option<Plant>, at: Plant) -> Result<(), GpuError> {
+    if *plant == Some(at) {
+        *plant = None;
+        return Err(GpuError::state(
+            WHAT,
+            match at {
+                Plant::BeforeLaunch => "the planted failure before the launch",
+                Plant::AfterLaunch => "the planted failure after the launch",
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// [`planted`] after an eager walk, which a capture also records: a capture
+/// launches nothing, so an armed plant waits for a walk that does. The
+/// stream is asked only while a plant is armed.
+fn planted_eager(plant: &mut Option<Plant>, gpu: &Gpu) -> Result<(), GpuError> {
+    if plant.is_some() && !crate::capturing(gpu.stream())? {
+        planted(plant, Plant::AfterLaunch)?;
+    }
+    Ok(())
+}
+
 /// One step's host values: its token and position.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeInput38 {
@@ -384,8 +449,15 @@ pub struct Body38 {
     eps: f32,
     vocab: usize,
     ctx: usize,
-    /// Positions fed since the load or the last reset.
-    fed: u32,
+    /// Positions the stores hold: a call's count once it is launched
+    /// ([`Body38::launch`]). The next position is the model's
+    /// (`GpuModel::pos`); the two differ only after a call failed past its
+    /// launch, and a call at the model's position is then refused.
+    held: u32,
+    /// The call planned and not yet launched.
+    staged: Option<Staged38>,
+    /// A failure a gate planted for the next call.
+    plant: Option<Plant>,
 }
 
 impl Body38 {
@@ -590,7 +662,9 @@ impl Body38 {
             eps: spec.rms_eps,
             vocab: spec.vocab as usize,
             ctx,
-            fed: 0,
+            held: 0,
+            staged: None,
+            plant: None,
         };
         body.sp.write(stream, 0, 0)?;
         stream.synchronize()?;
@@ -775,9 +849,129 @@ impl Body38 {
         verify_launches(&self.plans, m)
     }
 
-    /// The step's position `pos` is the next one and inside the stores, and
-    /// no verify waits for its commit, else refused by name.
+    /// Refused by name unless the stores hold `pos` positions: a call from
+    /// `pos` that failed after its launch has already run the delta layers'
+    /// recurrence and the conv ring over its rows, and running them again
+    /// would apply them twice.
+    fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
+        match self.held {
+            h if h == pos => Ok(()),
+            h if h > pos => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "position {pos}: the call there failed after its chain was launched, so the \
+                     recurrent stores hold it already (they stand at {h}); reset — a delta layer \
+                     keeps no earlier state to cut back to"
+                ),
+            )),
+            h => Err(GpuError::shape(
+                WHAT,
+                format!("position {pos}, where the stores hold {h} positions"),
+            )),
+        }
+    }
+
+    /// What a cut to at most `n` positions of a model standing at `pos`
+    /// keeps, and why: every position when `n` reaches `pos` (`Current`);
+    /// with a verify waiting, `n` when it lies past the verify's first
+    /// position (`Rule`: its commit moves the lane word and copies
+    /// nothing); anything else nothing (`Missed`), since a delta layer keeps
+    /// no earlier state — also after a call failed past its launch, when
+    /// the stores hold more than `pos`. Never past `pos`. The rule
+    /// [`Body38::commit`] takes.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        let (at, why) = if self.held != pos {
+            (0, Why::Missed { lost: None })
+        } else if n >= pos {
+            (pos, Why::Current)
+        } else if self.pending.as_ref().is_some_and(|p| n > p.pos0) {
+            (n, Why::Rule)
+        } else {
+            (0, Why::Missed { lost: None })
+        };
+        Kept {
+            asked: n,
+            held: self.held,
+            at,
+            why,
+        }
+    }
+
+    /// Plant a failure for the next call once its plan and copies are made,
+    /// before its launch: the call fails and moves nothing. Gate use.
+    pub fn plant_before_launch(&mut self) {
+        self.plant = Some(Plant::BeforeLaunch);
+    }
+
+    /// Plant a failure for the next call once its chain has run and its
+    /// host legs been served: the call fails with the stores past it. Gate
+    /// use.
+    pub fn plant_after_launch(&mut self) {
+        self.plant = Some(Plant::AfterLaunch);
+    }
+
+    /// The PLE row ids the last fill (or a commit's replay) named, a
+    /// position's ids after the one before. Gate use.
+    #[must_use]
+    pub fn ple_rows(&self) -> &[u32] {
+        &self.ple.ids[..self.ple.named]
+    }
+
+    /// Stage a call of `rows` from `pos` whose PLE rows `fill` returned the
+    /// history past: [`Body38::launch`] takes it.
+    fn stage(
+        &mut self,
+        pos: u32,
+        rows: usize,
+        hist: History,
+        verify: Option<Vec<u32>>,
+    ) -> Result<(), GpuError> {
+        self.staged = Some(Staged38 {
+            pos,
+            rows: launch_u32(WHAT, "positions", rows)?,
+            hist,
+            verify,
+        });
+        Ok(())
+    }
+
+    /// The staged call of `rows` from `pos` launched: the stores' count past
+    /// its rows, the PLE history past them, and a verify's commit waiting,
+    /// with the history as it stood before. Refused by name, moving nothing,
+    /// when no call of those rows from there is staged. A launch that fails
+    /// after this is counted as run: the refusal that follows is named,
+    /// where a count left behind would run the rows twice.
+    fn launch(&mut self, pos: u32, rows: usize) -> Result<(), GpuError> {
+        let s = self
+            .staged
+            .take_if(|s| s.pos == pos && s.pos == self.held && s.rows as usize == rows);
+        let Some(s) = s else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a launch of {rows} rows from {pos} with the stores at {} and no such call \
+                     planned",
+                    self.held
+                ),
+            ));
+        };
+        let before = std::mem::replace(&mut self.ple.hist, s.hist);
+        self.held = s.pos + s.rows;
+        if let Some(tokens) = s.verify {
+            self.pending = Some(Pending38 {
+                pos0: s.pos,
+                tokens,
+                hist: before,
+            });
+        }
+        Ok(())
+    }
+
+    /// The call's position `pos` is where the stores stand and `n` more fit
+    /// them, and no verify waits for its commit, else refused by name.
     fn check_next(&self, pos: u32, n: usize) -> Result<(), GpuError> {
+        self.stores_at(pos)?;
         if let Some(p) = &self.pending {
             return Err(GpuError::shape(
                 WHAT,
@@ -789,53 +983,52 @@ impl Body38 {
                 ),
             ));
         }
-        let end = pos as usize + n;
-        if pos != self.fed || end > self.ctx {
+        if pos as usize + n > self.ctx {
             return Err(GpuError::shape(
                 WHAT,
-                format!(
-                    "{n} positions from {pos} after {} positions, in stores of {}",
-                    self.fed, self.ctx
-                ),
+                format!("{n} positions from {pos}, in stores of {}", self.ctx),
             ));
         }
         Ok(())
     }
 
-    /// Plan an eager pass of `tokens` (1..=8) at `pos`, the next position:
-    /// its PLE rows, its record and its rows' copy to the pass arena.
+    /// Plan an eager pass of `tokens` (1..=8) at `pos`, where the stores
+    /// stand: its PLE rows, its record and its rows' copy to the pass arena,
+    /// staged for [`Body38::walk_pass`]'s launch.
     fn plan_pass(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
         let n = tokens.len();
         if self.taps.is_some() {
             return Err(GpuError::state(WHAT, "layer taps off (a pass writes none)"));
         }
         self.check_next(pos, n)?;
-        self.ple.fill(pos, tokens)?;
+        let hist = self.ple.fill(pos, tokens)?;
         self.rp.write(stream, tokens, pos)?;
         // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
         // `n <= PASS_ROWS` (the record's write refused more), and `e` stays in
         // place while the window lives (one synchronous copy).
         let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
         e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
-        self.fed += launch_u32(WHAT, "positions", n)?;
-        Ok(())
+        self.stage(pos, n, hist, None)
     }
 
-    /// Enqueue the planned pass of `m` rows through the batch port, then the
-    /// head of its last row into `head` when given.
+    /// Launch the planned pass of `m` rows from `pos` through the batch
+    /// port, then the head of its last row into `head` when given.
     fn walk_pass(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
         m: usize,
+        pos: u32,
         head: Option<&mut Head>,
     ) -> Result<(), GpuError> {
-        if m > self.a.rows {
+        if !(1..=self.a.rows).contains(&m) {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a pass of {m} rows on an arena of {}", self.a.rows),
             ));
         }
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.launch(pos, m)?;
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.rp.io(m)?
@@ -852,6 +1045,7 @@ impl Body38 {
             slots,
             eps,
             ctx,
+            plant,
             ..
         } = self;
         let mut prog = Pass38 {
@@ -878,6 +1072,7 @@ impl Body38 {
         };
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, PASS_ROWS);
         prog.walk(&mut leg)?;
+        planted(plant, Plant::AfterLaunch)?;
         match head {
             Some(h) => prog.head(h),
             None => Ok(()),
@@ -944,8 +1139,8 @@ impl GpuModel<Body38> {
                         body.plan_pass(gpu.stream(), chunk, pos)?;
                     }
                     let m = chunk.len();
-                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, _| {
-                        body.walk_pass(gpu, w, m, last.then_some(head))?;
+                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
+                        body.walk_pass(gpu, w, m, pos, last.then_some(head))?;
                         Ok(last)
                     })?;
                 }
@@ -963,22 +1158,27 @@ impl ChainBody for Body38 {
         Arch::Qwen35moe
     }
 
-    /// The step at `pos`, the next position: its PLE rows read from the file.
+    /// The step at `pos`, where the stores stand: its PLE rows read from the
+    /// file, staged for the refresh's launch.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput38, GpuError> {
         self.check_next(pos, 1)?;
-        self.ple.fill(pos, &[token])?;
-        self.fed += 1;
+        let hist = self.ple.fill(pos, &[token])?;
+        self.stage(pos, 1, hist, None)?;
         Ok(DecodeInput38 { token, pos })
     }
 
     /// The step's input record (its position, its token, the lane word) and
-    /// its PLE rows: two copies ahead of the step's launches.
+    /// its PLE rows: two copies ahead of the step's launches. Once they are
+    /// sent the step is launched ([`Body38::launch`]): what follows enqueues
+    /// or replays its chain.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput38) -> Result<(), GpuError> {
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.s
             .ple
             .e
             .copy_from_host(stream, &self.ple.e[..geo::HIDDEN])?;
-        self.sp.write(stream, input.token, input.pos)
+        self.sp.write(stream, input.token, input.pos)?;
+        self.launch(input.pos, 1)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
@@ -998,6 +1198,7 @@ impl ChainBody for Body38 {
             taps,
             eps,
             ctx,
+            plant,
             ..
         } = self;
         let prog = Step38 {
@@ -1024,12 +1225,13 @@ impl ChainBody for Body38 {
             head,
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
-        prog.walk(&mut leg)
+        prog.walk(&mut leg)?;
+        planted_eager(plant, gpu)
     }
 
     /// Every delta store's lanes and the PLE ring back to zero, every lane's
     /// stamp to a fresh store's, the lane word to 0, a new PLE history, no
-    /// verify waiting, after the host tier's reset. The K/V planes and the
+    /// verify waiting or call staged, after the host tier's reset. The K/V planes and the
     /// raw and pooled keys need nothing: nothing reads a row at or past a
     /// live count, and every row below it is written by its own step first.
     /// Synchronizes.
@@ -1058,7 +1260,9 @@ impl ChainBody for Body38 {
             .ple
             .reset_ring(stream, &mut self.ple_ring, geo::STREAMS)?;
         self.ple.restart()?;
-        self.fed = 0;
+        self.held = 0;
+        self.staged = None;
+        self.plant = None;
         self.sp.write(stream, 0, 0)?;
         debug_assert_eq!(LANE, 0);
         stream.synchronize()?;
@@ -1099,7 +1303,8 @@ impl ChainBody for Body38 {
 
 impl HostServed for Body38 {
     fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)
+        self.hybrid.serve_captured_of(chain)?;
+        planted(&mut self.plant, Plant::AfterLaunch)
     }
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
@@ -1112,12 +1317,15 @@ impl HostServed for Body38 {
 }
 
 impl Body38 {
-    /// Plan a verify of `tokens` (2..=[`VERIFY_ROWS`]) at `pos`, the next
-    /// position: the ids checked as a prompt's are, the PLE rows, the record
-    /// and the rows' copy to the pass arena, and the verify left waiting for
-    /// its commit. Refused by name before anything moves: another row count, the
-    /// taps armed, a verify already waiting, a position other than the next
-    /// or past the stores, an id the embedding or the PLE hash does not take.
+    /// Plan a verify of `tokens` (2..=[`VERIFY_ROWS`]) at `pos`, where the
+    /// stores stand: the ids checked as a prompt's are, the PLE rows, the
+    /// record and the rows' copy to the pass arena, then the verify launched
+    /// ([`Body38::launch`]) and left waiting for its commit — its graph's
+    /// launch follows this plan with no body call between. Refused by name
+    /// before anything moves: another row count, the taps armed, a verify
+    /// already waiting, a position other than the stores' or past them, an
+    /// id the embedding or the PLE hash does not take; a failure before the
+    /// launch leaves no verify waiting and the lane word where it stood.
     fn plan_verify(
         &mut self,
         stream: &CudaStream,
@@ -1141,21 +1349,16 @@ impl Body38 {
         self.check_next(pos, n)?;
         super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
         ple_takes(WHAT_V, self.ple.hash.window(), tokens)?;
-        let before = self.ple.hist.clone();
-        self.ple.fill(pos, tokens)?;
+        let hist = self.ple.fill(pos, tokens)?;
         self.rp.write(stream, tokens, pos)?;
         // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
         // `n <= VERIFY_ROWS <= PASS_ROWS`, and `e` stays in place while the
         // window lives (one synchronous copy).
         let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
         e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
-        self.fed += launch_u32(WHAT_V, "positions", n)?;
-        self.pending = Some(Pending38 {
-            pos0: pos,
-            tokens: tokens.to_vec(),
-            hist: before,
-        });
-        Ok(())
+        self.stage(pos, n, hist, Some(tokens.to_vec()))?;
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.launch(pos, n)
     }
 
     /// Enqueue the planned verify of `head.m()` rows through the step port
@@ -1186,6 +1389,7 @@ impl Body38 {
             slots,
             eps,
             ctx,
+            plant,
             ..
         } = self;
         let prog = Verify38 {
@@ -1212,52 +1416,45 @@ impl Body38 {
             head,
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
-        prog.walk(&mut leg)
+        prog.walk(&mut leg)?;
+        planted_eager(plant, gpu)
     }
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: the lane word to the last kept row's lane
     /// ([`kept_lane`]), the PLE history over the kept rows. With no
-    /// verify waiting only the position the body stands at is taken; any
-    /// other, and a count outside the verify's rows, is refused by name.
+    /// verify waiting only the position the stores stand at is taken. What
+    /// is taken is [`Body38::kept`]'s rule; anything else is refused by
+    /// name, the verify left waiting.
     fn commit(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         const WHAT_C: &str = "qwen4exp commit";
-        let Some(p) = self.pending.take() else {
-            if pos == self.fed {
-                return Ok(());
-            }
-            return Err(GpuError::shape(
-                WHAT_C,
-                format!(
+        let rule = self.kept(pos, self.held);
+        if rule.at != pos || matches!(rule.why, Why::Missed { .. }) {
+            let why = match &self.pending {
+                None => format!(
                     "back to position {pos} from {} with no verify waiting: a delta layer keeps \
                      no state for an earlier position",
-                    self.fed
+                    self.held
                 ),
-            ));
-        };
-        let rows = p.tokens.len();
-        let kept = pos
-            .checked_sub(p.pos0)
-            .map(|k| k as usize)
-            .filter(|k| (1..=rows).contains(k));
-        let Some(kept) = kept else {
-            let e = GpuError::shape(
-                WHAT_C,
-                format!(
+                Some(p) => format!(
                     "back to position {pos}: the verify of {rows} rows at {} keeps 1..={rows} \
                      (row 0 always)",
-                    p.pos0
+                    p.pos0,
+                    rows = p.tokens.len()
                 ),
-            );
-            self.pending = Some(p);
-            return Err(e);
+            };
+            return Err(GpuError::shape(WHAT_C, format!("{why} ({rule})")));
+        }
+        let Some(p) = self.pending.take() else {
+            return Ok(());
         };
+        let (rows, kept) = (p.tokens.len(), (pos - p.pos0) as usize);
         let stream = gpu.stream();
         self.lane.set(stream, kept_lane(self.lane.lane(), kept))?;
         if kept < rows {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;
         }
-        self.fed = pos;
+        self.held = pos;
         Ok(())
     }
 }
