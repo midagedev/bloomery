@@ -85,6 +85,16 @@
 //! eager run; the captured nodes by kind (kernels, copies — none: the handoff
 //! launch writes the page —, the two memory-operation batches) equal to the
 //! piece's own count.
+//!
+//! The join's instances, before the layers, on synthetic inputs of eight
+//! slots (`FfnKernels::enqueue_post`, which picks the entry from the slot
+//! count): `ds41_ffn_post_8` and `ds41_ffn_post_streams_8` against the host
+//! rule `runtime::combine::combine` at eight slots with HC_POST and the fold on
+//! the host, bit for bit, over places that put slot 7 on the card and NaN in
+//! every slot off it; `ds41_ffn_post` on the first six slots against the
+//! same rule at six and V4.1's `combine_elem`; 5, 7 and 9 slots refused by
+//! name with nothing launched. The `_8` entries, the handoff's among them,
+//! compile with no local depot.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -105,9 +115,9 @@ mod gate {
     use bloomery_gpu::fused::FusedKernels;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, Hybrid, SlotMap};
     use bloomery_gpu::weights::{DevWeight, Weights};
-    use bloomery_gpu::{DeviceTensor, Gpu, NodeInfo, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, NodeInfo, Q8Act};
     use bloomery_gpu_deepseek41::chain::ffn::{
-        CardStacks, Ds41Host, FfnIo, FfnPiece, combine_elem,
+        CardStacks, Ds41Host, FfnIo, FfnKernels, FfnPiece, Post, combine_elem,
     };
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
@@ -119,9 +129,9 @@ mod gate {
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed, no_local_depot,
-        q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes, topk_ids_logical_within,
-        verdict,
+        GateError, RefManifest, RefRow, activations, bits_equal, bytes_to_words, checks_failed,
+        no_local_depot, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
+        topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
@@ -1579,6 +1589,211 @@ mod gate {
         Ok(())
     }
 
+    // ------------------------------------------------ the 8-slot instances
+
+    /// Slots a token of the join's second instance (`runtime::combine::Slots`).
+    const SLOTS8: usize = 8;
+    /// Values of the synthetic join: two blocks, the second partial.
+    const ROWS8: usize = 300;
+    /// What an output holds before a launch, so a value the launch leaves
+    /// alone reads back as these bits.
+    const SENT: f32 = 1.0e30;
+    /// The synthetic join's places against [`N_CARD8`]: the card's at slots
+    /// 0, 2, 3, 5 and 7 (slot 7 past a six-slot walk), place 9 (not below
+    /// the card count) at slot 4, [`HOST`] at slots 1 and 6.
+    const PLACES8: [u32; SLOTS8] = [0, HOST, 2, 1, 9, 5, HOST, 3];
+    const N_CARD8: usize = 6;
+
+    /// The synthetic join's inputs, [`SLOTS8`] slots of [`ROWS8`] values in
+    /// the layout `FfnKernels::enqueue_post` reads. A slot off the card holds
+    /// NaN in its down rows and its weight, so a read of it poisons the value;
+    /// slot `j`'s down rows scale by `4^(j mod 4)`, so the slots' sum rounds
+    /// differently in another order; every third value's host and shared
+    /// sums are `1e8` and `−1e8`, so another association of the join moves
+    /// its bits.
+    struct Join8 {
+        down: Vec<f32>,
+        w: Vec<f32>,
+        hsum: Vec<f32>,
+        shexp: Vec<f32>,
+        res: Vec<f32>,
+        hc: Vec<f32>,
+    }
+
+    fn join8_inputs() -> Join8 {
+        let on = |j: usize| (PLACES8[j] as usize) < N_CARD8;
+        let raw = activations(ROWS8, SLOTS8, 801);
+        let down = (0..SLOTS8 * ROWS8)
+            .map(|i| {
+                let j = i / ROWS8;
+                if on(j) {
+                    raw[i] * (1u32 << (2 * (j % 4))) as f32
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let wr = activations(SLOTS8, 1, 802);
+        let w = (0..SLOTS8)
+            .map(|j| if on(j) { wr[j] } else { f32::NAN })
+            .collect();
+        let (hr, sr) = (activations(ROWS8, 1, 803), activations(ROWS8, 1, 804));
+        let hsum = (0..ROWS8)
+            .map(|d| if d % 3 == 0 { 1.0e8 } else { hr[d] })
+            .collect();
+        let shexp = (0..ROWS8)
+            .map(|d| if d % 3 == 0 { -1.0e8 } else { sr[d] })
+            .collect();
+        Join8 {
+            down,
+            w,
+            hsum,
+            shexp,
+            res: activations(ROWS8, HC_STREAMS, 805),
+            hc: activations(HC_MIX, 1, 806),
+        }
+    }
+
+    /// Value `d`'s combine over the first `N` slots of `j`, by the host rule
+    /// `runtime::combine::combine`.
+    fn join8_y<const N: usize>(j: &Join8, d: usize) -> f32 {
+        let card: [bool; N] = std::array::from_fn(|s| (PLACES8[s] as usize) < N_CARD8);
+        let dv: [f32; N] = std::array::from_fn(|s| j.down[s * ROWS8 + d]);
+        let wv: [f32; N] = std::array::from_fn(|s| j.w[s]);
+        runtime::combine::combine(dv, wv, card, j.hsum[d], j.shexp[d])
+    }
+
+    /// `FfnKernels::enqueue_post` over the synthetic join: the `_8` entries
+    /// (with the fold and without) against `runtime::combine::combine::<8>`,
+    /// HC_POST and the fold on the host, bit for bit, and the form without
+    /// the fold leaving its fold buffer alone; the six-slot entry on the
+    /// first six slots against the same rule at six and V4.1's
+    /// `combine_elem`; 5, 7 and 9 slots refused by name before any launch.
+    fn join8_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        let kernels = FfnKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let j = join8_inputs();
+        let sel = DeviceBuffer::from_host(stream, &PLACES8)?;
+        let dev = |v: &[f32]| DeviceBuffer::from_host(stream, v);
+        let (down, w, hsum, shexp, res, hc) = (
+            dev(&j.down)?,
+            dev(&j.w)?,
+            dev(&j.hsum)?,
+            dev(&j.shexp)?,
+            dev(&j.res)?,
+            dev(&j.hc)?,
+        );
+        let post = |n_used: usize| Post {
+            down: &down,
+            w: &w,
+            sel: &sel,
+            hsum: &hsum,
+            shexp: &shexp,
+            res: &res,
+            hc: &hc,
+            rows: ROWS8,
+            n_card: N_CARD8,
+            n_used,
+        };
+        let mut ok = true;
+        for (n_used, folds) in [(SLOTS8, true), (SLOTS8, false), (N_USED, true)] {
+            let mut y = dev(&[SENT; ROWS8])?;
+            let mut out = dev(&vec![SENT; HC_STREAMS * ROWS8])?;
+            let mut fold = dev(&[SENT; ROWS8])?;
+            kernels.enqueue_post(
+                stream,
+                &post(n_used),
+                &mut y,
+                &mut out,
+                folds.then_some(&mut fold),
+            )?;
+            let (y, out, fold) = (
+                y.to_host_vec(stream)?,
+                out.to_host_vec(stream)?,
+                fold.to_host_vec(stream)?,
+            );
+            stream.synchronize()?;
+            let want_y: Vec<f32> = (0..ROWS8)
+                .map(|d| {
+                    if n_used == SLOTS8 {
+                        join8_y::<SLOTS8>(&j, d)
+                    } else {
+                        join8_y::<N_USED>(&j, d)
+                    }
+                })
+                .collect();
+            // At six slots the host rule is V4.1's `combine_elem` too.
+            let v41_ok = n_used == SLOTS8
+                || (0..ROWS8).all(|d| {
+                    let card: [bool; N_USED] =
+                        std::array::from_fn(|s| (PLACES8[s] as usize) < N_CARD8);
+                    let dv: [f32; N_USED] = std::array::from_fn(|s| j.down[s * ROWS8 + d]);
+                    let wv: [f32; N_USED] = std::array::from_fn(|s| j.w[s]);
+                    combine_elem(dv, wv, card, j.hsum[d], j.shexp[d]).to_bits()
+                        == want_y[d].to_bits()
+                });
+            let mut want_out = vec![0.0f32; HC_STREAMS * ROWS8];
+            let mut want_fold = vec![SENT; ROWS8];
+            for d in 0..ROWS8 {
+                let o = post_elem(want_y[d], streams_at(&j.res, ROWS8, d), &j.hc);
+                for (i, &oi) in o.iter().enumerate() {
+                    want_out[i * ROWS8 + d] = oi;
+                }
+                if folds {
+                    want_fold[d] = fold_elem(o, &j.hc[..4]);
+                }
+            }
+            let (y_ok, out_ok, fold_ok) = (
+                bits_equal(&y, &want_y),
+                bits_equal(&out, &want_out),
+                bits_equal(&fold, &want_fold),
+            );
+            let bad_y = (0..ROWS8)
+                .filter(|&d| y[d].to_bits() != want_y[d].to_bits())
+                .count();
+            let pass = y_ok && out_ok && fold_ok && v41_ok;
+            ok &= pass;
+            println!(
+                "join{n_used} {}: places {PLACES8:?} n_card {N_CARD8}, {ROWS8} values: y {} ({bad_y} \
+                 differ) streams {} fold {} v41_rule {}: {}",
+                if folds { "post+fold" } else { "post" },
+                verdict(y_ok),
+                verdict(out_ok),
+                if folds {
+                    verdict(fold_ok)
+                } else if fold_ok {
+                    "untouched"
+                } else {
+                    "WRITTEN"
+                },
+                verdict(v41_ok),
+                verdict(pass)
+            );
+        }
+        for n_used in [5, 7, 9] {
+            let mut y = dev(&[SENT; ROWS8])?;
+            let mut out = dev(&vec![SENT; HC_STREAMS * ROWS8])?;
+            let got = kernels.enqueue_post(stream, &post(n_used), &mut y, &mut out, None);
+            let y = y.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let refused = matches!(
+                &got,
+                Err(GpuError::Shape { what: "ds41_ffn_post", detail })
+                    if detail.starts_with(&format!("{n_used} routed slots"))
+            );
+            let untouched = y.iter().all(|v| v.to_bits() == SENT.to_bits());
+            let pass = refused && untouched;
+            ok &= pass;
+            println!(
+                "join{n_used}: {}; y untouched {untouched}: {}",
+                got.err()
+                    .map_or_else(|| "launched".to_string(), |e| format!("refused ({e})")),
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
     // ---------------------------------------------------------- driver
 
     #[derive(Default)]
@@ -1676,7 +1891,11 @@ mod gate {
             "ds41_ffn_handoff",
             "ds41_ffn_post",
             "ds41_ffn_post_streams",
+            "ds41_ffn_handoff_8",
+            "ds41_ffn_post_8",
+            "ds41_ffn_post_streams_8",
         ])?);
+        tally.add(join8_cases(&gpu)?);
         for l in 0..hp.n_layer {
             let w = layer_weights(stream, &split, l)?;
             let stacks = if cards[l].is_empty() {
