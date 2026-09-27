@@ -1,0 +1,54 @@
+# The public Qwen3.8-Flash-Next (qwen4exp) rows in one window: decode at depth 6 / 1024 / 3000 and
+# prompt processing at P = 512 / 4096, bloomery (generate_qwen3moe on the qwen4exp UD-Q4_K_XL file,
+# Body38, every routed expert on the host tier) against mainline llama.cpp at `-ot exps=CPU` (the
+# same split: dense on the card, routed experts on the host). Runs only after proposal P8 gives
+# tools/ref/depth-qwen3moe.sh its qwen4exp profile.
+#
+# The step is a sum, not a max: layer l+1 waits for layer l's combine, and only the shared expert
+# overlaps the host's routed service. Per token, A6000, depth <= 2k [derived, q38prog stage A §4]:
+#   card SMs     8.5..10 ms   (dense 4.83 GB at ~650 GB/s = 7.4 ms, + ~1.6 ms of latency floor
+#                              over 1,151 nodes)
+#   PCIe / sync  0.15..0.35   (the go and the wait of 48 layers, 3..7 us each; 20 KB a layer)
+#   NVMe (PLE)   0.1..1.6     (16 IQ4_NL rows of 90 B a token, read serially in decode_input;
+#                              0 when the table's pages are cached)
+#   host DRAM    48 x h       (h: one layer's routed service, 18.4 MB gate-up + 12.3 MB down)
+# h is the one term the derivation cannot fix: 390 us expected, 350..460 (the per-dispatch byte law,
+# facts.md:108, at ~77 / ~62 GB/s for the two dispatches, +10..20 us fixed; ik's Qwen3.6 host tier
+# 0.20 ms for 14.4 MB a layer, facts.md:64). So decode 30..38 tok/s at depth 6 and 1024, the same
+# band at 3000 (the selected flash reads a fixed 2,051 rows: +12 x 2.1 MB).
+# The prompt rows [derived]: --prefill step = decode, 30..37 tok/s at P = 512 and 4096; --prefill
+# pass (passes of 8 through the batch port: the host union 74.8 distinct experts a layer, 23..32 us
+# an expert, 82..115 ms over 48 layers, + card ~12 ms, eager enqueue and sync 2..5 ms) 60..80 tok/s
+# at both P. llama.cpp's rows are the reference, not predicted here past "host-bound too".
+kind: baseline
+question: how long does one Qwen3.8 layer's routed service on the host tier take inside the
+  decode step on the A6000, the one term the step derivation leaves open, and what are ours and
+  llama.cpp's public Qwen3.8 rows in one window?
+term: host service us a layer @ n=96, depth 6, A6000, all-host = (p50 step ms of the `6` arm of
+  just depth-gpu-qwen4exp - 8.5..10 ms card - 0.25..1.95 ms sync and PLE) / 48, the card and sync
+  terms at their band centres (9.25 and 1.1 ms)
+unit: us
+predict: 350..460
+condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 3000 lcpp:3000
+  4096 lcpppp:4096, the order rotated every round (each ours arm's row carries its prompt's pass
+  pp, so the 512 and 4096 arms give pp512 and pp4096); about 45 minutes of lease [derived: five
+  ours arms of a 20..80 s load, up to 56 s of passes and 3 s of steps, four llama.cpp arms of a
+  host-bound load and run, three rounds], past 30: the user's approval first; the qwen4exp host set (~111 GB) preheated
+  before the first timed arm of each engine and no arm reads the file cold (majflt printed per
+  row, [cold] rows void); no row carries [cpu-busy] or [other-busy]; the full runner output goes
+  to a file first. Command: BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card' just depth-gpu-qwen4exp
+  <the arms above> > <log> 2>&1
+reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp beside ours) and
+  the host service term every later Qwen3.8 lever is priced against (hot list, card experts, the
+  q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
+  Qwen3.8 has no timed number yet
+decide-in: write the rows into rig-log first, then the README's Qwen3.8 section, ratios from this
+  window only; the pass pp row is written as the pass path's, the baseline q38ub is judged against
+decide-below: the host tier serves faster than the byte law says for 3 MB experts: name the term
+  (the dispatch rate or the fixed cost) against V4.1's measured union, re-derive the card-expert
+  and hot-list levers from the lower h before any lever round opens, then write the rows
+decide-above: no Qwen3.8 row goes out: profile one depth-6 step (nsys-gpu.sh's qwen form) to split
+  h into the gate-up and down dispatches and the go/wait gaps, and name the term that missed
+  (dispatch rate, a serial host cost such as the PLE read, or the union's fixed term) before a
+  re-sit
