@@ -55,11 +55,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::fs::File;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
+    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -149,21 +148,6 @@ mod gate {
         }
     }
 
-    /// `a,b,c` or `[a, b, c]` as ids.
-    fn parse_ids(s: &str) -> Result<Vec<u32>, GateError> {
-        s.trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| {
-                t.parse::<u32>()
-                    .map_err(|e| format!("id {t:?}: {e}").into())
-            })
-            .collect()
-    }
-
     /// The `tokens [..]` line of a `generate_ds41` log.
     fn gen_tokens(log: &Path) -> Result<Vec<u32>, GateError> {
         let text = std::fs::read_to_string(log).map_err(|e| format!("{}: {e}", log.display()))?;
@@ -172,92 +156,6 @@ mod gate {
             .find_map(|l| l.strip_prefix("tokens "))
             .ok_or_else(|| format!("{}: no `tokens` line", log.display()))?;
         parse_ids(line)
-    }
-
-    /// The server this gate started; killed and reaped on every way out.
-    struct Served {
-        child: Child,
-    }
-
-    impl Served {
-        fn stop(&mut self) -> Result<String, GateError> {
-            self.child.kill()?;
-            Ok(format!("{}", self.child.wait()?))
-        }
-    }
-
-    impl Drop for Served {
-        fn drop(&mut self) {
-            if matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-    }
-
-    /// One request through curl: the status and the body.
-    fn curl(url: &str, body: Option<&Value>, stream: bool) -> Result<(u16, String), GateError> {
-        let mut c = Command::new("curl");
-        c.args(["-sS", "--max-time", "600", "-w", "\n%{http_code}"]);
-        if stream {
-            c.arg("-N");
-        }
-        if let Some(b) = body {
-            c.args(["-H", "Content-Type: application/json", "-d", &b.to_string()]);
-        }
-        let out = c.arg(url).output()?;
-        if !out.status.success() {
-            return Err(format!(
-                "curl {url}: {} {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-            .into());
-        }
-        let text = String::from_utf8(out.stdout)?;
-        let (body, code) = text
-            .rsplit_once('\n')
-            .ok_or_else(|| format!("curl {url}: no status line"))?;
-        Ok((code.trim().parse()?, body.to_owned()))
-    }
-
-    fn json_of(what: &str, status: u16, body: &str) -> Result<Value, GateError> {
-        if status != 200 {
-            return Err(format!("{what}: HTTP {status}: {body}").into());
-        }
-        Ok(serde_json::from_str(body).map_err(|e| format!("{what}: {e}: {body}"))?)
-    }
-
-    fn ids_of(v: &Value) -> Vec<u32> {
-        v.as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_u64().and_then(|i| u32::try_from(i).ok()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Waits for the `listening on http://<addr>` line in the server's stderr.
-    fn address(served: &mut Served, err_log: &Path) -> Result<String, GateError> {
-        for _ in 0..POLLS {
-            let text = std::fs::read_to_string(err_log).unwrap_or_default();
-            if let Some(addr) = text
-                .lines()
-                .find_map(|l| l.split_once("listening on http://").map(|(_, a)| a.trim()))
-            {
-                return Ok(addr.to_owned());
-            }
-            if let Some(status) = served.child.try_wait()? {
-                return Err(format!(
-                    "the server exited ({status}) before listening; {}:\n{text}",
-                    err_log.display()
-                )
-                .into());
-            }
-            std::thread::sleep(POLL);
-        }
-        Err(format!("the server did not listen within {POLLS} polls").into())
     }
 
     /// The rendered ids of a chat's `messages`, through the server's own
@@ -484,18 +382,11 @@ mod gate {
         let ratios = file_ratios()?;
         println!("compression ratios {ratios:?}");
         std::fs::create_dir_all(&a.dir)?;
-        let exe = std::env::current_exe()?.with_file_name("bloomery-serve-ds41");
+        let exe = Served::exe()?;
         let err_log = a.dir.join("server.err");
-        let child = Command::new(&exe)
-            .args(SERVER_ARGS)
-            .stdin(Stdio::null())
-            .stdout(File::create(a.dir.join("server.out"))?)
-            .stderr(File::create(&err_log)?)
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-        let mut served = Served { child };
+        let mut served = Served::spawn(&SERVER_ARGS, &a.dir)?;
         println!("server pid {}", served.child.id());
-        let addr = address(&mut served, &err_log)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         println!("server listening on {addr}");
 
