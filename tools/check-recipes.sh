@@ -4,6 +4,9 @@
 # 열세 게이트 전부를 "빨강이어도 0"으로 만들었다(2026-09-20, tools/gate.sh 머리말 참조).
 # 게이트의 종료 코드는 tools/gate.sh가 소유한다 — 시험을 돌리는 레시피 줄에 `||`가 있으면 빨강.
 set -euo pipefail
+# The self-tests below run gate-batch.sh, which reads BLOOMERY_BOX_ENV as its caller's box env; a batch lane
+# that runs this check passes its card there. A static check's verdict does not depend on the caller's box env.
+unset BLOOMERY_BOX_ENV
 JF="$(cd "$(dirname "$0")/.." && pwd)/justfile"
 bad=$(grep -nE '(cargo (oxide )?test|tools/gate\.sh).*\|\|' "$JF" || true)
 if [ -n "$bad" ]; then
@@ -194,6 +197,22 @@ if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${ggt##*$'\n'}"
+# ptx-spill-check.sh's table reading (a process-substitution table read for every binary, a binary with no
+# pinned row) and its verdict lines, through a stub ptx-scan.sh on fixed scans, no build.
+if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then
+  echo "$psc" >&2
+  echo "check-recipes: the ptx-spill-check self-test failed" >&2
+  exit 1
+fi
+echo "${psc##*$'\n'}"
+# mutant-run.sh's kill, survive, not-built and no-Compiling verdicts, its restore checks (a broken copy, an
+# edit during the run, a TERM) and its refusals, in a temp git repo with a fake gate, no box.
+if ! mrt=$(bash "$(dirname "$0")/mutant-run.sh" --self-test 2>&1); then
+  echo "$mrt" >&2
+  echo "check-recipes: the mutant-run self-test failed" >&2
+  exit 1
+fi
+echo "${mrt##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(

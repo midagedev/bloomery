@@ -34,7 +34,10 @@ oracle    Per layer, the set's ids against the oracle set's integer twin of ffn_
           `tensor` row points at: the logical twin when the row marks a view (its flat file is the
           argsort's head, the first n_expert_used x n_tokens values of token 0's sorted row, not each
           token's top-k), else the flat one. The set's tokens, model file and ik build must be the
-          oracle's. Exit 1 on any difference.
+          oracle's: the model file is the `# model` line, the first shard's full path (two quantizations
+          of one model share their shard names, so `# model_file`, the basename, cannot tell them
+          apart); a manifest without it or `# build`, or naming another, is refused. Exit 1 on any
+          difference.
 """
 import importlib.util
 import os
@@ -272,10 +275,14 @@ def oracle(set_dir, oracle_dir):
     s = read_manifest(set_dir)
     header, tensors, ints = read_oracle(oracle_dir)
     K, T = s["n_used"], s["tokens"]
+    for key in ("model", "build"):
+        ours, theirs = s["header"].get(key), header.get(key)
+        if ours is None or theirs is None:
+            where = set_dir if ours is None else oracle_dir
+            raise SetError(f"{where}: its manifest has no `# {key}` line, so what it was traced from is unknown")
+        if ours != theirs:
+            raise SetError(f"the set and the oracle name another `# {key}`: set {ours!r}, oracle {theirs!r}")
     problems = []
-    for key in ("model_file", "build"):
-        if s["header"].get(key) != header.get(key):
-            problems.append(f"{key}: set {s['header'].get(key)!r}, oracle {header.get(key)!r}")
     want = [int(x) for x in header.get("tokens", "").split(",") if x]
     try:
         with open(s["header"]["ids"], encoding="utf-8") as f:
@@ -330,8 +337,9 @@ def oracle(set_dir, oracle_dir):
 def self_test():
     """Synthetic sets with known answers: the math, the refusals and the oracle comparison."""
     E, K = 8, 2
+    MODEL = "/models/q3/m-00001-of-00002.gguf"
     with tempfile.TemporaryDirectory() as tmp:
-        def make(name, rows_by_layer, complete=True):
+        def make(name, rows_by_layer, complete=True, model=MODEL):
             d = os.path.join(tmp, name)
             os.mkdir(d)
             T = len(next(iter(rows_by_layer.values())))
@@ -348,6 +356,8 @@ def self_test():
                         g.write(array("H", [e for r in rows for e in r]).tobytes())
             with open(os.path.join(d, "MANIFEST.tsv"), "w") as f:
                 f.write("# router_trace — self-test\n# tokens\t%d\n# n_expert\t%d\n# n_expert_used\t%d\n" % (T, E, K))
+                if model is not None:
+                    f.write(f"# model\t{model}\n")
                 f.write("# model_file\tm.gguf\n# build\tb\n# ids\t%s\n" % os.path.join(d, "ids"))
                 f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
                 for l in rows_by_layer:
@@ -385,7 +395,7 @@ def self_test():
         with open(os.path.join(o, "ffn_moe_topk-0.0.i32"), "wb") as f:
             f.write(struct.pack(f"<{T * K}i", *flat))
         with open(os.path.join(o, "MANIFEST.tsv"), "w") as f:
-            f.write("# model_file\tm.gguf\n# build\tb\n# tokens\t0,1,2\n")
+            f.write(f"# model\t{MODEL}\n# model_file\tm.gguf\n# build\tb\n# tokens\t0,1,2\n")
             f.write("# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical"
                     "\tsrc0\tsrc1\n")
             f.write("# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile\n")
@@ -398,6 +408,14 @@ def self_test():
         try:
             good = oracle(make("og", {0: rows}), o)
             bad = oracle(make("ob", {0: [[3, 5], [0, 1], [7, 2]]}), o)
+            # identity is the first shard's full path: another file whose shards share the basename, or a
+            # set that states no path, is refused by name
+            for name, model in (("other", "/models/q3-requant/m-00001-of-00002.gguf"), ("nomodel", None)):
+                try:
+                    oracle(make(name, {0: rows}, model=model), o)
+                    raise AssertionError(f"{name}: a set of another model file was accepted")
+                except SetError as e:
+                    assert "model" in str(e), e
             # the report commands run end to end on a two-layer set
             two = make("two", {0: uniform, 3: skew})
             coverage([two])

@@ -1289,8 +1289,11 @@ gate-gpu-p8b *ARGS:
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
 # 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
 # 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
+# BIN 뒤의 말은 ptx-scan.sh의 엔트리 부분 문자열 하나뿐이다. 자리로 준 피처(`gpu,deepseek41`, 피처 이름)나 플래그는
+# 빌드 전에 거절한다 — ARGS로 흘러 기본 피처로 빌드되면 트랙의 바이너리를 호스트 전용으로 덮어쓴다.
 [arg("FEATURES", long="features")]
 ptx-scan BIN FEATURES='gpu' *ARGS:
+    @set -- {{ARGS}}; for w in "$@"; do case "$w" in -*) why="tools/ptx-scan.sh takes no flag" ;; *,*) why="a comma list is a features list" ;; *) why=$(awk -v w="$w" '/^\[/ { f = ($0 == "[features]"); next } f && $1 == w { print "a cargo feature of crates/gpu-gates (an entry filter by this name needs a longer substring)" }' crates/gpu-gates/Cargo.toml) || { echo "ptx-scan: cannot read crates/gpu-gates/Cargo.toml for its feature names" >&2; exit 2; } ;; esac; [ $# -le 1 ] || why="${why:-tools/ptx-scan.sh takes one entry substring}"; [ -z "$why" ] || { echo "ptx-scan: '$w' after {{BIN}}: $why; features go through --features (just ptx-scan {{BIN}} --features <features> [entry substring])" >&2; exit 2; }; done
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
 
 # PTX 스필 래칫 — 빌드 시점 게이트. generate_ds41(deepseek41)과 gate_e2e(V2-Lite)의 ptx-scan 표에서 엔트리마다
