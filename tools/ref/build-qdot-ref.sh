@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the harnesses that link ik's own kernel tables, and run the seven
+# Build the harnesses that link ik's own kernel tables, and run the eight
 # reference ones (on the box). Runs under tools/box.sh (toolchain env already
 # sourced).
 #
@@ -7,8 +7,9 @@
 # entry the oracle dispatches (iqk_set_kernels_kquants /
 # iqk_set_kernels_legacy_quants / iqk_set_kernels_iquants).
 #
-# The seven *_ref harnesses dump $BLOOMERY_DATA/ref/<name>-ik-dot.txt from the
-# first aligned tensor of their type; gate-qdot's hw tests read those dumps,
+# The *_ref harnesses dump $BLOOMERY_DATA/ref/<name>-ik-dot.txt from the
+# first aligned tensor of their type (q8f0_ref from a synthetic block set it
+# writes into the dump, reading no model); gate-qdot's hw tests read those dumps,
 # and without them the tests fail on a missing file, which is a standing red,
 # not a gate. Unlike build.sh they are built AND run here: the dump is the
 # product, the binary is scaffolding. Four read the reference model; q5k_x4_ref
@@ -48,7 +49,7 @@ DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSee
 V4_MODEL=${BLOOMERY_V4_MODEL:-/models/DeepSeek-V4-Flash-0731-UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M-00002-of-00004.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
-DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref"
+DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref"
 RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate"
 
 # Same flags for both sets: the rate harnesses include the same ik headers under
@@ -78,5 +79,6 @@ ls -l "$BLOOMERY_DATA"/ref/q4k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q6k-x4-ik-dot.
       "$BLOOMERY_DATA"/ref/q5f0-ik-dot.txt "$BLOOMERY_DATA"/ref/q5f1-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q5k-v41-dequant.raw \
       "$BLOOMERY_DATA"/ref/iq3xxs-ik-dot.txt "$BLOOMERY_DATA"/ref/mxfp4-x4-ik-dot.txt \
+      "$BLOOMERY_DATA"/ref/q8f0-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta \
       "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.raw "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.meta
