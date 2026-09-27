@@ -71,13 +71,13 @@ const TENSORS: &[&str] = &[
 // a card expert kernel for it, and no card `_sel` reads either type yet. No pin reads the PLE
 // table's type. The gated-residual hyper-connections, the mean-pool indexer and the PLE site are
 // needs of their own, which no row for mHC, the token pool or the engram covers.
+// PIN(2026-09-27): the router and the GQA flash rows left the list when the shape registry gained
+// their serving rows (shapes p1-4: the `_512` router and the `_256_p4` flash entries serve them).
 const COVERAGE: &[&str] = &[
     "delta rule GDN: d 128, 16 k-heads and 48 v-heads (tiled), conv 4, sigmoid output gate: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44-46",
-    "router: softmax, 512 experts, top 10: 0-47",
     "shared expert, ff 640, with a sigmoid gate: 0-47",
     "gated-residual hyper-connections of 4 streams, rank 320: 0-47",
     "a PLE site: a gate of 2560-value rows, a conv of 4 taps 3 apart: 1",
-    "GQA flash, head 256, pack 4: 3,7,11,15,19,23,27,31,35,39,43,47",
     "per-head QK norm plus rope: head 256, IMROPE [11, 11, 10, 0], 64 of 256 dims: 3,7,11,15,19,23,27,31,35,39,43,47",
     "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39,43,47",
     "mean-pool indexer: 4 heads x 128, pool 4, RMS-normed keys roped (64 dims) at the pool start, heads summed: 3,7,11,15,19,23,27,31,35,39,43,47",
