@@ -94,7 +94,7 @@
 //! every slot off it; `ds41_ffn_post` on the first six slots against the
 //! same rule at six and V4.1's `combine_elem`; 5, 7 and 9 slots refused by
 //! name with nothing launched. The `_8` entries, the handoff's among them,
-//! compile with no local depot.
+//! and the handoff's `_10` compile with no local depot.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -1894,6 +1894,7 @@ mod gate {
             "ds41_ffn_handoff_8",
             "ds41_ffn_post_8",
             "ds41_ffn_post_streams_8",
+            "ds41_ffn_handoff_10",
         ])?);
         tally.add(join8_cases(&gpu)?);
         for l in 0..hp.n_layer {

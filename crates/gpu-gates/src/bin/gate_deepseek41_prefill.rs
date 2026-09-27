@@ -50,6 +50,8 @@
 //!   The same for `ds41_ffn_handoff_8` through the launcher, which picks it
 //!   for an 8-slot `PageLayout` (a past id at slot 7 among them), writing no
 //!   word of the image but its fields; a handoff of 5, 7 or 9 slots is
+//!   refused by name. The same for `ds41_ffn_handoff_10` over a 10-slot
+//!   `PageLayout` (past ids at slots 3 and 9), a handoff of 9 or 11 slots
 //!   refused by name. Then the prompt batch's 8-slot entries through their
 //!   launchers: `ds41_ffn_card_acc_8` against the host rule
 //!   `runtime::combine::card_sum` bit for bit (the six-slot entry against the
@@ -950,6 +952,7 @@ mod gate {
         let mut ok = places_cases(gpu)?;
         ok &= handoff_cases(gpu)?;
         ok &= handoff8_cases(gpu)?;
+        ok &= handoff10_cases(gpu)?;
         ok &= batch8_cases(gpu)?;
         ok &= tile_case(gpu, w, layers, hp)?;
         gpu.clear_fault()?;
@@ -1123,7 +1126,9 @@ mod gate {
     const SLOTS8: usize = 8;
 
     /// Whether `got` is `what`'s refusal of `n_used` slots by name
-    /// (`runtime::combine::SlotsRefused`), and the result as text.
+    /// (`runtime::combine::SlotsRefused`, the handoff's
+    /// `bloomery_gpu::host::handoff::HandoffRefused`), and the result as
+    /// text.
     fn refused_by_name(got: Result<(), GpuError>, what: &str, n_used: usize) -> (bool, String) {
         let ok = matches!(
             &got,
@@ -1144,35 +1149,74 @@ mod gate {
     /// past the stack (slots 3 and 7) raise `expert_id` and place [`HOST`].
     /// A handoff of 5, 7 or 9 slots is refused by name, nothing written.
     fn handoff8_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        let past = N_EXPERT as u32;
+        handoff_slots_cases::<SLOTS8>(
+            gpu,
+            [0, 3, 5, 383, 9, 12, 300, 6],
+            [0, 3, 5, past, 9, 12, 300, past + 616],
+            [0.25, 0.125, 0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625],
+            &[5, 7, 9],
+        )
+    }
+
+    /// Slots a token of the handoff's third entry (Qwen3.8's).
+    const SLOTS10: usize = 10;
+
+    /// [`handoff8_cases`] at ten slots: `ds41_ffn_handoff_10` into an image
+    /// laid out by a 10-slot `PageLayout`, ids at and past the stack at slots
+    /// 3 and 9 (the last); a handoff of 9 or 11 slots is refused by name,
+    /// nothing written.
+    fn handoff10_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        let past = N_EXPERT as u32;
+        handoff_slots_cases::<SLOTS10>(
+            gpu,
+            [0, 3, 5, 383, 9, 12, 300, 6, 200, 1],
+            [0, 3, 5, past, 9, 12, 300, 6, 200, past + 616],
+            [
+                0.25, 0.125, 0.125, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625,
+            ],
+            &[9, 11],
+        )
+    }
+
+    /// `FfnKernels::enqueue_handoff` of `S` slots a token against the second
+    /// row of [`synthetic_map`], into an image laid out by an `S`-slot
+    /// `PageLayout`, twice: `inside` (every id in the stack, no fault) and
+    /// `past` (ids at and past the stack, `expert_id` raised and those slots
+    /// placed [`HOST`]); the image holds the sequence word, the ids as they
+    /// came, the weights and the activation and nothing else, and `sel`
+    /// every slot's place. A handoff of each count in `refuse` is refused by
+    /// name, nothing written.
+    fn handoff_slots_cases<const S: usize>(
+        gpu: &Gpu,
+        inside: [u32; S],
+        past: [u32; S],
+        wts: [f32; S],
+        refuse: &[usize],
+    ) -> Result<bool, GateError> {
         const N: usize = 256;
         let kernels = FfnKernels::load(gpu.context())?;
         let stream = gpu.stream();
         let map = synthetic_map();
         let map_dev = DeviceBuffer::from_host(stream, &map)?;
         let row_off = N_EXPERT;
-        let layout = PageLayout::new(1, 1, N, SLOTS8)
+        let layout = PageLayout::new(1, 1, N, S)
             .map_err(|e| e.to_string())?
             .handoff();
         let x: Vec<f32> = (0..N).map(|d| d as f32 * 0.25 - 3.0).collect();
         let x_dev = DeviceBuffer::from_host(stream, &x)?;
         let seq_dev = DeviceBuffer::from_host(stream, &[41u32])?;
-        let wts = [0.25f32, 0.125, 0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625];
         let wts_dev = DeviceBuffer::from_host(stream, &wts)?;
-        let past = N_EXPERT as u32;
-        let cases: [(&str, [u32; SLOTS8], Option<FaultSite>); 2] = [
-            ("ids inside the stack", [0, 3, 5, 383, 9, 12, 300, 6], None),
-            (
-                "ids at and past the stack",
-                [0, 3, 5, past, 9, 12, 300, past + 616],
-                Some(FaultSite::ExpertId),
-            ),
+        let cases: [(&str, [u32; S], Option<FaultSite>); 2] = [
+            ("ids inside the stack", inside, None),
+            ("ids at and past the stack", past, Some(FaultSite::ExpertId)),
         ];
         let mut ok = true;
         for (what, ids, want) in cases {
             gpu.clear_fault()?;
             let ids_dev = DeviceBuffer::from_host(stream, &ids)?;
             let mut image = DeviceBuffer::from_host(stream, &vec![SENT_U32; layout.x + N])?;
-            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; SLOTS8])?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; S])?;
             let h = Handoff {
                 ids: &ids_dev,
                 weights: &wts_dev,
@@ -1194,7 +1238,7 @@ mod gate {
             let places_ok = got_sel == places_of(&map, row_off, &ids);
             let mut want_image = vec![SENT_U32; layout.x + N];
             want_image[layout.seq] = 41;
-            want_image[layout.ids..layout.ids + SLOTS8].copy_from_slice(&ids);
+            want_image[layout.ids..layout.ids + S].copy_from_slice(&ids);
             for (s, w) in wts.iter().enumerate() {
                 want_image[layout.weights + s] = w.to_bits();
             }
@@ -1205,7 +1249,7 @@ mod gate {
             let pass = fault_ok && places_ok && image_ok;
             ok &= pass;
             println!(
-                "{NAME}: handoff8 {what} {ids:?} (ids at {}, weights at {}, x at {}): {fault}; places \
+                "{NAME}: handoff{S} {what} {ids:?} (ids at {}, weights at {}, x at {}): {fault}; places \
                  {} {got_sel:?}; image (seq, ids as they came, weights, activation, nothing else) \
                  {}: {}",
                 layout.ids,
@@ -1217,9 +1261,9 @@ mod gate {
             );
         }
         gpu.clear_fault()?;
-        for n_used in [5, 7, 9] {
-            let ids_dev = DeviceBuffer::from_host(stream, &[0u32; SLOTS8 + 1])?;
-            let w_dev = DeviceBuffer::from_host(stream, &[0.0f32; SLOTS8 + 1])?;
+        for &n_used in refuse {
+            let ids_dev = DeviceBuffer::from_host(stream, &[0u32; SLOTS10 + 2])?;
+            let w_dev = DeviceBuffer::from_host(stream, &[0.0f32; SLOTS10 + 2])?;
             let lay = HandoffLayout {
                 seq: 0,
                 ids: 1,
@@ -1229,7 +1273,7 @@ mod gate {
                 hidden: N,
             };
             let mut image = DeviceBuffer::from_host(stream, &vec![SENT_U32; lay.x + N])?;
-            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; SLOTS8 + 1])?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; SLOTS10 + 2])?;
             let h = Handoff {
                 ids: &ids_dev,
                 weights: &w_dev,
