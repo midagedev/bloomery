@@ -89,6 +89,43 @@
 //! not start 16-byte aligned). Last, the fault's site
 //! mask: two sites raised in one layer after a third in a later layer are
 //! all the first layer's mask holds, on the card and in the argmax's copy.
+//!
+//! The 32-value family (`Gemm32Kernels`, cases `g32_*`), on synthetic stacks
+//! whose decode is checked against ggml's `dequant_row`:
+//! - `g32_quant`: `quantize_gemm32`'s three planes bit for bit the host
+//!   quantizer (per 32 values `d = amax/127`, codes, their sum; the padding
+//!   untouched) at K ∈ {96, 320, 352, 640, 2560, 6144, 10240} for 1, 9 and
+//!   4096 columns; a NaN and an infinity each refuse their block (NaN
+//!   scale, zero codes and sum) and raise `QuantColumn`; `swiglu_quant32`
+//!   bit for bit `ElemKernels::enqueue_swiglu` then `quantize_gemm32`, its
+//!   NaN refused the same way.
+//! - `g32_dense`: at every K above and m ∈ {1, 8, 9, 512, 4096}, one
+//!   quantization and the three entries over the dense table, 272 rows (two
+//!   full slabs and one of 16): every output inside its band of the f64
+//!   reference (per block the exact integer dot, at most three f32 roundings
+//!   and the accumulation, `|y − ref| <= γ(K/32 + 3) · Σ_b (|D_b| + |M_b|)`)
+//!   and bit for bit the contract's transcription (`gemm32.rs`); the file's
+//!   Q8_0 words and the planes made from the same bytes give the same bits;
+//!   a captured table and GEMM replay the eager run.
+//! - `g32_routed`: routed stacks under uniform and same-expert routings — a
+//!   Q8_0 file and a Q5_1 stack of 16 × 272 rows at K 640, each slot its own
+//!   column; a Q8_0 plane stack of 8 experts at K 2560 whose two slots a
+//!   token share its column; a Q5_1 stack of 8 × 2560 rows at K 640 (the
+//!   routed down's shape) up to 4096 slots.
+//! - `g32_remap`: `enqueue_route_remap` over 48 experts, every third on a
+//!   16-expert card stack in reversed slots and the rest `HOST`: the listed
+//!   slots and tiles the host grouping of the mapped ids less the host slots,
+//!   no slot refused, every host slot's rows untouched (still the sentinel)
+//!   and every card slot's rows the contract's bits; `gemm_q4k` over the same
+//!   table leaves the host slots untouched and gives every card slot the bits
+//!   it gives over `gemm_route`'s table of the mapped ids; an identity map
+//!   gives `gemm_route`'s table; an id past the map and a map value past the stack
+//!   each raise `ExpertId`, their slots refused and NaN, the rest the clean
+//!   run's bits.
+//! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
+//!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
+//!   columns, nothing written past its output.
+//! - `g32_refuse`: the host API's refusals by name.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -1933,6 +1970,7 @@ mod gate {
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
         ok &= site_mask(&dev)?;
+        ok &= g32::run(&gpu, &dev.gk)?;
 
         if !ok {
             return Err(checks_failed());
@@ -1944,7 +1982,9 @@ mod gate {
             "PASSED: gate_gemm — every run inside its derived band of the f64 reference and bit for bit \
              the contract's transcription, every slot written, rerun and graph replay bit-identical, \
              faults named; the route table the host's stable grouping bit for bit up to 32,768 slots; \
-             the SwiGLU quantizer bit for bit its composition"
+             the SwiGLU quantizer bit for bit its composition; the 32-value family (Q8_0 planes and \
+             file, Q5_1) bit for bit its contract, its quantizers the host's, the remapped route's \
+             host slots untouched, the wide F32 product f32_gemv's bits"
         );
         Ok(())
     }
@@ -2183,6 +2223,1298 @@ mod gate {
                 ids.extend(pick);
             }
             ids
+        }
+    }
+
+    /// The 32-value family (`Gemm32Kernels`): module doc, last part.
+    mod g32 {
+        use super::{
+            Lcg, Routing, SENT, fnv, pad, route_ids, route_ref, row_checked, synthetic, wanted,
+        };
+        use bloomery_gpu::gemm::{
+            Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput,
+            GemmKernels, GemmRoute, GemmWeight,
+        };
+        use bloomery_gpu::hybrid::HOST;
+        use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
+        use bloomery_gpu_gates::rounding::gamma;
+        use bloomery_gpu_gates::{GateError, activations, bits_equal, bytes_to_words, verdict};
+        use cuda_core::DeviceBuffer;
+        use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// K per dense case: 96 and 352 end in a one-block step (K/32 odd),
+        /// 320 and 640 are Qwen3.8's HC up and shared down, not multiples of
+        /// 256; 2560, 6144 and 10240 its hidden, GDN value and HC widths.
+        const KS: [usize; 7] = [96, 320, 352, 640, 2560, 6144, 10240];
+        /// Columns per dense case.
+        const MS: [usize; 5] = [1, 8, 9, 512, 4096];
+        /// Rows of a dense case: two full 128-row slabs and one of 16.
+        const ROWS: usize = 272;
+
+        /// The three layouts under test.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Lay {
+            Q8Plane,
+            Q8File,
+            Q51,
+        }
+
+        /// A synthetic stack of `n_rows` rows of `k` values, decoded to what
+        /// the kernels multiply: per block `d`, `m` (Q5_1) and per value the
+        /// code; `bytes` the file's block stream.
+        struct Wts {
+            k: usize,
+            bytes: Vec<u8>,
+            d: Vec<f32>,
+            m: Vec<f32>,
+            q: Vec<i8>,
+        }
+
+        /// A finite f16 of exponent 3..=9 (2^-12 .. 2^-5), sign from `neg`.
+        fn f16_bits(g: &mut Lcg, neg: bool) -> u16 {
+            let e = 3 + g.below(7) as u16;
+            let bits = (e << 10) | (g.next() as u16 & 0x3ff);
+            if neg { bits | 0x8000 } else { bits }
+        }
+
+        /// `n_rows` rows of Q8_0 (`q51` false) or Q5_1 blocks from `seed`,
+        /// decoded; the decode is checked against ggml's `dequant_row` (Q8_0
+        /// bit for bit, Q5_1 within one rounding of its fma).
+        fn weights(
+            q51: bool,
+            n_rows: usize,
+            k: usize,
+            seed: u64,
+        ) -> Result<(Wts, bool), GateError> {
+            let mut g = Lcg(seed);
+            let kb = k / 32;
+            let bpb = if q51 { 24 } else { 34 };
+            let mut bytes = vec![0u8; n_rows * kb * bpb];
+            let (mut d, mut m, mut q) = (
+                Vec::with_capacity(n_rows * kb),
+                Vec::with_capacity(n_rows * kb),
+                Vec::with_capacity(n_rows * k),
+            );
+            for blk in bytes.chunks_exact_mut(bpb) {
+                for b in blk.iter_mut() {
+                    *b = g.next() as u8;
+                }
+                let db = f16_bits(&mut g, false);
+                blk[0..2].copy_from_slice(&db.to_le_bytes());
+                d.push(half_to_f32(db));
+                if q51 {
+                    let neg = g.next() & 1 == 1;
+                    let mb = f16_bits(&mut g, neg);
+                    blk[2..4].copy_from_slice(&mb.to_le_bytes());
+                    m.push(half_to_f32(mb));
+                    let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+                    let qs = &blk[8..24];
+                    let mut v = [0i8; 32];
+                    for (j, &b) in qs.iter().enumerate() {
+                        v[j] = ((b & 0x0f) | ((((qh >> j) & 1) as u8) << 4)) as i8;
+                        v[16 + j] = ((b >> 4) | ((((qh >> (16 + j)) & 1) as u8) << 4)) as i8;
+                    }
+                    q.extend_from_slice(&v);
+                } else {
+                    m.push(0.0);
+                    q.extend(blk[2..34].iter().map(|&b| b as i8));
+                }
+            }
+            let ty = if q51 { GgmlType::Q5_1 } else { GgmlType::Q8_0 };
+            let mut want = vec![0.0f32; k];
+            let mut decode_ok = true;
+            for r in 0..n_rows {
+                dequant_row(ty, &bytes[r * kb * bpb..(r + 1) * kb * bpb], &mut want)?;
+                for (v, &w) in want.iter().enumerate() {
+                    let b = r * kb + v / 32;
+                    let mine = f64::from(d[b]) * f64::from(q[r * k + v]) + f64::from(m[b]);
+                    decode_ok &= if q51 {
+                        (mine - f64::from(w)).abs() <= gamma(1) * mine.abs() + 1e-38
+                    } else {
+                        mine as f32 == w
+                    };
+                }
+            }
+            Ok((Wts { k, bytes, d, m, q }, decode_ok))
+        }
+
+        /// The host quantizer of one column into the device layout: per
+        /// 32-value block `d = amax/127` (1 for an all-zero block), codes
+        /// `round(x/d)` clamped to ±127 and their sum; a block holding a
+        /// non-finite value refused (NaN `d`, zero codes and sum). Returns
+        /// the column's `16·steps` code words, `2·steps` scales and sums,
+        /// padding zero.
+        fn quant_col(x: &[f32], steps: usize) -> Planes32 {
+            let (mut q, mut d, mut s) = (
+                vec![0u32; 16 * steps],
+                vec![0f32; 2 * steps],
+                vec![0i32; 2 * steps],
+            );
+            for (b, blk) in x.as_chunks::<32>().0.iter().enumerate() {
+                if blk.iter().any(|v| !v.is_finite()) {
+                    d[b] = f32::NAN;
+                    continue;
+                }
+                let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let db = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                d[b] = db;
+                let mut sum = 0i32;
+                for (i, &v) in blk.iter().enumerate() {
+                    let c = (v / db).round().clamp(-127.0, 127.0) as i8;
+                    sum += i32::from(c);
+                    q[8 * b + i / 4] |= u32::from(c as u8) << (8 * (i % 4));
+                }
+                s[b] = sum;
+            }
+            (q, d, s)
+        }
+
+        /// A `GemmAct32`'s three planes on the host: codes, scales, sums.
+        type Planes32 = (Vec<u32>, Vec<f32>, Vec<i32>);
+
+        /// The activations as the reference reads them: per column its
+        /// codes (value order), block scales and sums.
+        struct HostAct {
+            k: usize,
+            codes: Vec<i8>,
+            d: Vec<f32>,
+            s: Vec<i32>,
+        }
+
+        /// Quantize `x` (`n` columns of `k`) on the host; also returns the
+        /// three planes in the device layout for a bitwise comparison.
+        fn host_act(x: &[f32], k: usize, n: usize) -> (HostAct, Planes32) {
+            let steps = k.div_ceil(64);
+            let kb = k / 32;
+            let mut planes = (Vec::new(), Vec::new(), Vec::new());
+            let mut ha = HostAct {
+                k,
+                codes: Vec::with_capacity(n * k),
+                d: Vec::with_capacity(n * kb),
+                s: Vec::with_capacity(n * kb),
+            };
+            for c in 0..n {
+                let (q, d, s) = quant_col(&x[c * k..(c + 1) * k], steps);
+                for w in &q[..k / 4] {
+                    ha.codes.extend(w.to_le_bytes().iter().map(|&b| b as i8));
+                }
+                ha.d.extend_from_slice(&d[..kb]);
+                ha.s.extend_from_slice(&s[..kb]);
+                planes.0.extend(q);
+                planes.1.extend(d);
+                planes.2.extend(s);
+            }
+            (ha, planes)
+        }
+
+        /// The device planes of the first `n` columns equal the host's bit
+        /// for bit, padding included.
+        fn planes_equal(
+            act: &GemmAct32,
+            n: usize,
+            want: &Planes32,
+            stream: &cuda_core::CudaStream,
+        ) -> Result<bool, GateError> {
+            let st = act.steps();
+            let q = act.q().to_host_vec(stream)?;
+            let d = act.d().to_host_vec(stream)?;
+            let s = act.s().to_host_vec(stream)?;
+            Ok(q[..n * 16 * st] == want.0[..]
+                && scales_equal(&d[..n * 2 * st], &want.1)
+                && s[..n * 2 * st] == want.2[..])
+        }
+
+        /// Two scale planes equal: each pair the same bits, or both NaN (a
+        /// refused block's scale, whatever its payload).
+        fn scales_equal(a: &[f32], b: &[f32]) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()))
+        }
+
+        /// One output three ways: the contract's transcription (per block
+        /// the exact i32 dot, then `acc = fma(d_a, d_w·f32(isum), acc)`, the
+        /// min term `fma(m_w, f32(s_a), ·)` inside for Q5_1, from 0, blocks in
+        /// increasing k), the f64 value and its band's magnitude.
+        fn dot32(w: &Wts, row: usize, a: &HostAct, col: usize, mins: bool) -> (f32, f64, f64) {
+            let (k, kb) = (w.k, w.k / 32);
+            let (mut acc, mut y, mut mag) = (0.0f32, 0.0f64, 0.0f64);
+            for b in 0..kb {
+                let wq = &w.q[row * k + 32 * b..row * k + 32 * b + 32];
+                let aq = &a.codes[col * a.k + 32 * b..col * a.k + 32 * b + 32];
+                let isum: i32 = wq
+                    .iter()
+                    .zip(aq)
+                    .map(|(&p, &q)| i32::from(p) * i32::from(q))
+                    .sum();
+                let (dw, mw) = (w.d[row * kb + b], w.m[row * kb + b]);
+                let (da, sa) = (a.d[col * kb + b], a.s[col * kb + b]);
+                let t = dw * isum as f32;
+                let t = if mins { mw.mul_add(sa as f32, t) } else { t };
+                acc = da.mul_add(t, acc);
+                let dd = f64::from(da) * f64::from(dw) * f64::from(isum);
+                let mm = if mins {
+                    f64::from(da) * f64::from(mw) * f64::from(sa)
+                } else {
+                    0.0
+                };
+                y += dd + mm;
+                mag += dd.abs() + mm.abs();
+            }
+            (acc, y, mag)
+        }
+
+        /// One run's reference check: outputs checked, outside the band,
+        /// off the contract's bits, host slots written; the worst error over
+        /// its band and the first failure.
+        struct Checked {
+            checked: usize,
+            band_off: usize,
+            bits_off: usize,
+            host_bad: usize,
+            worst: f64,
+            first: Option<String>,
+        }
+
+        /// The reference check of one run over `slots` slots: slot `s` on
+        /// weight rows `e(s)·rows ..` (`None`: a host slot, whose outputs must
+        /// still read [`SENT`]), column `col(s)`.
+        #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
+        fn check(
+            w: &Wts,
+            mins: bool,
+            rows: usize,
+            a: &HostAct,
+            expert: &(dyn Fn(usize) -> Option<usize> + Sync),
+            col: &(dyn Fn(usize) -> usize + Sync),
+            y: &[f32],
+            slots: usize,
+        ) -> Checked {
+            let next = AtomicUsize::new(0);
+            let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
+            let kb = w.k / 32;
+            let parts: Vec<_> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        sc.spawn(|| {
+                            let (mut checked, mut band_off, mut bits_off, mut host_bad) = (0, 0, 0, 0);
+                            let mut worst = 0.0f64;
+                            let mut first: Option<String> = None;
+                            loop {
+                                let s = next.fetch_add(1, Ordering::Relaxed);
+                                if s >= slots {
+                                    break;
+                                }
+                                let out = &y[s * rows..(s + 1) * rows];
+                                let Some(e) = expert(s) else {
+                                    if out.iter().any(|v| v.to_bits() != SENT.to_bits()) {
+                                        host_bad += 1;
+                                        first.get_or_insert_with(|| format!("host slot {s} written"));
+                                    }
+                                    continue;
+                                };
+                                for r in (0..rows).filter(|&r| row_checked(slots, s, r)) {
+                                    let (want, y64, mag) = dot32(w, e * rows + r, a, col(s), mins);
+                                    let got = out[r];
+                                    let band = gamma(kb + 3) * mag;
+                                    let err = (f64::from(got) - y64).abs();
+                                    checked += 1;
+                                    worst = worst.max(if band > 0.0 { err / band } else { err });
+                                    let within = err <= band;
+                                    if !within {
+                                        band_off += 1;
+                                        first.get_or_insert_with(|| {
+                                            format!("slot {s} row {r}: got {got:e} f64 {y64:e} band {band:.3e}")
+                                        });
+                                    }
+                                    if got.to_bits() != want.to_bits() {
+                                        bits_off += 1;
+                                        first.get_or_insert_with(|| {
+                                            format!("slot {s} row {r}: got {got:e} contract {want:e}")
+                                        });
+                                    }
+                                }
+                            }
+                            Checked { checked, band_off, bits_off, host_bad, worst, first }
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join()).collect()
+            });
+            let mut all = Checked {
+                checked: 0,
+                band_off: 0,
+                bits_off: 0,
+                host_bad: 0,
+                worst: 0.0,
+                first: None,
+            };
+            for p in parts {
+                let p = p.unwrap_or(Checked {
+                    checked: 0,
+                    band_off: 0,
+                    bits_off: 0,
+                    host_bad: 1,
+                    worst: 0.0,
+                    first: Some("reference thread panicked".into()),
+                });
+                all.checked += p.checked;
+                all.band_off += p.band_off;
+                all.bits_off += p.bits_off;
+                all.host_bad += p.host_bad;
+                all.worst = all.worst.max(p.worst);
+                all.first = all.first.or(p.first);
+            }
+            all
+        }
+
+        /// The device side: both kernel families' modules and the engine.
+        struct Dev<'g> {
+            gpu: &'g Gpu,
+            gk: &'g GemmKernels,
+            g32: Gemm32Kernels,
+        }
+
+        /// A stack resident in every layout it has: a Q8_0 stack as the
+        /// planes and as the file's words, a Q5_1 stack as the file's words.
+        struct Res {
+            plane: Option<(DeviceTensor<u32>, DeviceTensor<u16>)>,
+            file: DeviceTensor<u32>,
+        }
+
+        impl Res {
+            fn new(dev: &Dev<'_>, w: &Wts, q51: bool, n_rows: usize) -> Result<Res, GateError> {
+                let stream = dev.gpu.stream();
+                let kb = w.k / 32;
+                let plane = if q51 {
+                    None
+                } else {
+                    let qs: Vec<u32> =
+                        w.q.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| {
+                                u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])
+                            })
+                            .collect();
+                    let d: Vec<u16> = w
+                        .bytes
+                        .as_chunks::<34>()
+                        .0
+                        .iter()
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    Some((
+                        DeviceTensor::upload(stream, &qs, n_rows, w.k / 4)?,
+                        DeviceTensor::upload(stream, &d, n_rows, kb)?,
+                    ))
+                };
+                let mut words = bytes_to_words(&w.bytes);
+                words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
+                let cols = words.len() / n_rows;
+                Ok(Res {
+                    plane,
+                    file: DeviceTensor::upload(stream, &words, n_rows, cols)?,
+                })
+            }
+
+            fn weight(&self, lay: Lay) -> Result<Gemm32Weight<'_>, GateError> {
+                Ok(match lay {
+                    Lay::Q8Plane => {
+                        let (qs, d) = self.plane.as_ref().ok_or("a Q5_1 stack has no planes")?;
+                        Gemm32Weight::Q8_0Plane { qs, d }
+                    }
+                    Lay::Q8File => Gemm32Weight::Q8_0File(&self.file),
+                    Lay::Q51 => Gemm32Weight::Q5_1File(&self.file),
+                })
+            }
+        }
+
+        /// One GEMM over the table `route` last filled with `n_slots` slots,
+        /// `y` set to [`SENT`] first; `y`'s first `n_slots·rows` values back.
+        #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
+        fn gemm(
+            dev: &Dev<'_>,
+            res: &Res,
+            lay: Lay,
+            rows: usize,
+            act: &GemmAct32,
+            route: &GemmRoute,
+            input: GemmInput,
+            y: &mut DeviceBuffer<f32>,
+            n_slots: usize,
+        ) -> Result<Vec<f32>, GateError> {
+            let stream = dev.gpu.stream();
+            y.copy_from_host(stream, &vec![SENT; y.len()])?;
+            dev.g32.enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: res.weight(lay)?,
+                    rows_per_expert: rows,
+                    act,
+                    route,
+                    input,
+                    y,
+                },
+            )?;
+            stream.synchronize()?;
+            let mut out = y.to_host_vec(stream)?;
+            out.truncate(n_slots * rows);
+            Ok(out)
+        }
+
+        /// The quantizer against the host transcription, its NaN refusal,
+        /// and the SwiGLU quantizer against its two-launch composition.
+        fn quant_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_quant") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            gpu.clear_fault()?;
+            for k in KS {
+                let mut act = GemmAct32::new(stream, 4096, k)?;
+                for n in [1usize, 9, 4096] {
+                    let x = activations(k, n, 9100 + (k + n) as u32);
+                    let xd = DeviceBuffer::from_host(stream, &x)?;
+                    dev.g32.enqueue_quantize_gemm32(
+                        stream,
+                        &xd,
+                        n,
+                        &mut act,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    stream.synchronize()?;
+                    let (_, want) = host_act(&x, k, n);
+                    let same = planes_equal(&act, n, &want, stream)?;
+                    let fault = gpu.take_fault()?;
+                    let pass = same && fault.is_none();
+                    println!(
+                        "gemm32 case=g32_quant K={k} cols={n} planes_eq_host={same} fault={} {}",
+                        fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            // A NaN and an infinity: each block refused, the named site raised.
+            for (what, bad) in [("nan", f32::NAN), ("inf", f32::INFINITY)] {
+                let (k, n) = (320usize, 9usize);
+                let mut act = GemmAct32::new(stream, n, k)?;
+                let mut x = activations(k, n, 9200);
+                x[k + 2 * 32 + 5] = bad;
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, n, &mut act, gpu.unlabelled_sink())?;
+                stream.synchronize()?;
+                let (_, want) = host_act(&x, k, n);
+                let same = planes_equal(&act, n, &want, stream)?;
+                let d = act.d().to_host_vec(stream)?;
+                let refused = d[act.steps() * 2 + 2].is_nan();
+                let fault = gpu.take_fault()?;
+                let site = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+                let pass = same && refused && site;
+                println!(
+                    "gemm32 case=g32_quant fault={what} K={k} planes_eq_host(block refused: NaN d, \
+                     zero codes and sum)={same} d_nan={refused} site_quant_column={site} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            // SwiGLU: the fused launch against `enqueue_swiglu` then the
+            // quantizer, bit for bit, and its fault.
+            for k in [96usize, 640] {
+                let max = 4096;
+                let mut fused = GemmAct32::new(stream, max, k)?;
+                let mut split = GemmAct32::new(stream, max, k)?;
+                let mut h = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
+                for (n, nan) in [(1usize, false), (9, false), (4096, false), (9, true)] {
+                    let gh = activations(k, n, 9300 + (k + n) as u32);
+                    let mut gh = gh.into_iter().map(|v| 4.0 * v).collect::<Vec<_>>();
+                    if nan {
+                        gh[3 * k + 33] = f32::NAN;
+                    }
+                    let uh = activations(k, n, 9400 + (k + n) as u32);
+                    let (g, u) = (
+                        DeviceBuffer::from_host(stream, &gh)?,
+                        DeviceBuffer::from_host(stream, &uh)?,
+                    );
+                    dev.g32.enqueue_swiglu_quant32(
+                        stream,
+                        &g,
+                        &u,
+                        n,
+                        &mut fused,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    stream.synchronize()?;
+                    let f_fault = gpu.take_fault()?;
+                    gpu.elem().enqueue_swiglu(stream, &g, &u, n * k, &mut h)?;
+                    dev.g32.enqueue_quantize_gemm32(
+                        stream,
+                        &h,
+                        n,
+                        &mut split,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    stream.synchronize()?;
+                    let s_fault = gpu.take_fault()?;
+                    let st = fused.steps();
+                    let same = fused.q().to_host_vec(stream)?[..n * 16 * st]
+                        == split.q().to_host_vec(stream)?[..n * 16 * st]
+                        && scales_equal(
+                            &fused.d().to_host_vec(stream)?[..n * 2 * st],
+                            &split.d().to_host_vec(stream)?[..n * 2 * st],
+                        )
+                        && fused.s().to_host_vec(stream)?[..n * 2 * st]
+                            == split.s().to_host_vec(stream)?[..n * 2 * st];
+                    let hh = h.to_host_vec(stream)?;
+                    let (_, host) = host_act(&hh[..n * k], k, n);
+                    let host_ok = planes_equal(&fused, n, &host, stream)?;
+                    let want = nan.then(|| Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+                    let pass = same && host_ok && f_fault == want && s_fault == want;
+                    println!(
+                        "gemm32 case=g32_quant swiglu K={k} cols={n} nan={nan} planes_eq_composition={same} \
+                         planes_eq_host_of_swiglu_rows={host_ok} fault={} {}",
+                        f_fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
+        /// The dense cases: per K a Q8_0 stack (planes and file words from
+        /// the same bytes) and a Q5_1 stack of [`ROWS`] rows, per column
+        /// count one quantization and the three entries through the dense
+        /// table; each against the reference, the two Q8_0 layouts equal bit
+        /// for bit; then one captured route and GEMM replayed.
+        fn dense_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_dense") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let max = MS[MS.len() - 1];
+            let mut route = GemmRoute::new(stream, max, 1)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, max * ROWS)?;
+            let mut ok = true;
+            for (ki, k) in KS.into_iter().enumerate() {
+                let (w8, dec8) = weights(false, ROWS, k, 0x3280 + ki as u64)?;
+                let (w5, dec5) = weights(true, ROWS, k, 0x3250 + ki as u64)?;
+                let r8 = Res::new(dev, &w8, false, ROWS)?;
+                let r5 = Res::new(dev, &w5, true, ROWS)?;
+                let mut act = GemmAct32::new(stream, max, k)?;
+                for m in MS {
+                    let x = activations(k, m, 9500 + (k * 7 + m) as u32);
+                    let xd = DeviceBuffer::from_host(stream, &x)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+                    dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                    stream.synchronize()?;
+                    let (ha, want) = host_act(&x, k, m);
+                    let act_ok = planes_equal(&act, m, &want, stream)?;
+                    let mut y8 = Vec::new();
+                    for (lay, w, res, dec) in [
+                        (Lay::Q8Plane, &w8, &r8, dec8),
+                        (Lay::Q8File, &w8, &r8, dec8),
+                        (Lay::Q51, &w5, &r5, dec5),
+                    ] {
+                        let got = gemm(
+                            dev,
+                            res,
+                            lay,
+                            ROWS,
+                            &act,
+                            &route,
+                            GemmInput::PerSlot,
+                            &mut y,
+                            m,
+                        )?;
+                        let unwritten =
+                            got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
+                        let Checked {
+                            checked,
+                            band_off,
+                            bits_off,
+                            worst,
+                            first,
+                            ..
+                        } = check(w, lay == Lay::Q51, ROWS, &ha, &|_| Some(0), &|s| s, &got, m);
+                        let layouts = match lay {
+                            Lay::Q8Plane => {
+                                y8 = got.clone();
+                                "-".to_string()
+                            }
+                            Lay::Q8File => bits_equal(&got, &y8).to_string(),
+                            Lay::Q51 => "-".to_string(),
+                        };
+                        let fault = gpu.take_fault()?;
+                        let pass = act_ok
+                            && dec
+                            && unwritten == 0
+                            && band_off == 0
+                            && bits_off == 0
+                            && layouts != "false"
+                            && fault.is_none();
+                        println!(
+                            "gemm32 case=g32_dense lay={lay:?} K={k} m={m} rows={ROWS} act_eq_host={act_ok} \
+                             decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
+                             worst_err_over_band={worst:.3} band_off={band_off} contract_bits_differ={bits_off} \
+                             file_eq_plane={layouts} y_fnv={:016x} {}",
+                            fnv(&got),
+                            verdict(pass)
+                        );
+                        if let Some(f) = first {
+                            println!(
+                                "gemm32 case=g32_dense lay={lay:?} K={k} m={m} first_failure: {f}"
+                            );
+                        }
+                        ok &= pass;
+                    }
+                }
+            }
+            // Graph: the dense table and a plane GEMM captured, replayed.
+            let (k, m) = (2560usize, 512usize);
+            let (w8, _) = weights(false, ROWS, k, 0x32a0)?;
+            let r8 = Res::new(dev, &w8, false, ROWS)?;
+            let mut act = GemmAct32::new(stream, m, k)?;
+            let xd = DeviceBuffer::from_host(stream, &activations(k, m, 9600))?;
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+            dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+            let eager = gemm(
+                dev,
+                &r8,
+                Lay::Q8Plane,
+                ROWS,
+                &act,
+                &route,
+                GemmInput::PerSlot,
+                &mut y,
+                m,
+            )?;
+            y.copy_from_host(stream, &vec![SENT; y.len()])?;
+            let w = r8.weight(Lay::Q8Plane)?;
+            let (gk, g32, route_r, act_r, y_r) = (dev.gk, &dev.g32, &mut route, &act, &mut y);
+            let graph = gpu.capture(|s| {
+                gk.enqueue_route_dense(s, m, route_r, sink)?;
+                g32.enqueue_gemm32(
+                    s,
+                    Gemm32Args {
+                        w,
+                        rows_per_expert: ROWS,
+                        act: act_r,
+                        route: route_r,
+                        input: GemmInput::PerSlot,
+                        y: y_r,
+                    },
+                )
+            })?;
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            let mut replay = y.to_host_vec(stream)?;
+            replay.truncate(m * ROWS);
+            let (same, nodes) = (bits_equal(&replay, &eager), graph.node_count());
+            let pass = same && nodes == 2;
+            println!(
+                "gemm32 case=g32_dense graph K={k} m={m} graph_nodes={nodes} replay_eq_eager={same} {}",
+                verdict(pass)
+            );
+            Ok(ok && pass)
+        }
+
+        /// Routed stacks: a Q8_0 file stack and a Q5_1 one of 16 experts ×
+        /// [`ROWS`] rows at K 640 (the routed down's K), each slot its own
+        /// column, and one Q8_0 plane stack of 8 experts at K 2560 whose two
+        /// slots a token share the token's column; plus a Q5_1 stack at the
+        /// routed down's full shape, 2560 rows × K 640.
+        fn routed_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_routed") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let mut ok = true;
+            for (name, lay, n_exp, rows, k, top_k, shared, tokens) in [
+                (
+                    "q8_0f_16x272x640",
+                    Lay::Q8File,
+                    16usize,
+                    ROWS,
+                    640usize,
+                    1usize,
+                    false,
+                    &MS[..],
+                ),
+                (
+                    "q5_1_16x272x640",
+                    Lay::Q51,
+                    16,
+                    ROWS,
+                    640,
+                    1,
+                    false,
+                    &MS[..],
+                ),
+                (
+                    "q8_0p_8x272x2560_top2",
+                    Lay::Q8Plane,
+                    8,
+                    ROWS,
+                    2560,
+                    2,
+                    true,
+                    &MS[..],
+                ),
+                (
+                    "q5_1_8x2560x640",
+                    Lay::Q51,
+                    8,
+                    2560,
+                    640,
+                    1,
+                    false,
+                    &[9usize, 512, 4096][..],
+                ),
+            ] {
+                let q51 = lay == Lay::Q51;
+                let n_rows = n_exp * rows;
+                let (w, dec) = weights(q51, n_rows, k, 0x3300 + k as u64 + n_exp as u64)?;
+                let res = Res::new(dev, &w, q51, n_rows)?;
+                let max_t = tokens[tokens.len() - 1];
+                let max_slots = max_t * top_k;
+                let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
+                let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+                let mut act = GemmAct32::new(stream, max_slots, k)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
+                for &t in tokens {
+                    for r in [Routing::Uniform, Routing::SameTopk] {
+                        let ids = route_ids(r, t, top_k, n_exp, 0x77 ^ (t as u64) << 4);
+                        let n_slots = ids.len();
+                        let n_cols = if shared { t } else { n_slots };
+                        let x = activations(k, n_cols, 9700 + (t + k) as u32);
+                        let xd = DeviceBuffer::from_host(stream, &x)?;
+                        dev.g32
+                            .enqueue_quantize_gemm32(stream, &xd, n_cols, &mut act, sink)?;
+                        ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                        dev.gk
+                            .enqueue_route(stream, &ids_d, n_slots, &mut route, sink)?;
+                        let input = if shared {
+                            GemmInput::Shared { top_k }
+                        } else {
+                            GemmInput::PerSlot
+                        };
+                        let got = gemm(dev, &res, lay, rows, &act, &route, input, &mut y, n_slots)?;
+                        let (ha, _) = host_act(&x, k, n_cols);
+                        let unwritten =
+                            got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
+                        let Checked {
+                            checked,
+                            band_off,
+                            bits_off,
+                            worst,
+                            first,
+                            ..
+                        } = check(
+                            &w,
+                            q51,
+                            rows,
+                            &ha,
+                            &|s| Some(ids[s] as usize),
+                            &|s| s / top_k,
+                            &got,
+                            n_slots,
+                        );
+                        let fault = gpu.take_fault()?;
+                        let pass = dec
+                            && unwritten == 0
+                            && band_off == 0
+                            && bits_off == 0
+                            && fault.is_none();
+                        println!(
+                            "gemm32 case=g32_routed {name} T={t} routing={r:?} slots={n_slots} \
+                             decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
+                             worst_err_over_band={worst:.3} band_off={band_off} contract_bits_differ={bits_off} \
+                             y_fnv={:016x} {}",
+                            fnv(&got),
+                            verdict(pass)
+                        );
+                        if let Some(f) = first {
+                            println!("gemm32 case=g32_routed {name} T={t} first_failure: {f}");
+                        }
+                        ok &= pass;
+                    }
+                }
+            }
+            Ok(ok)
+        }
+
+        /// The remapped route: a map of 48 experts, every third on the card
+        /// (slot `15 − e/3`, so the map reverses them) and the rest [`HOST`],
+        /// under a Q5_1 stack of the 16 card experts. Per token count: the
+        /// table's listed slots and tiles the host's grouping of the mapped
+        /// ids with the host slots taken out, nothing refused, every host
+        /// slot's rows still [`SENT`] and every card slot's rows the
+        /// contract's bits. An identity map gives `gemm_route`'s table bit
+        /// for bit. Then the faults: an id past the map and a map value past
+        /// the stack each raise `ExpertId`, their slots listed as refused and
+        /// NaN, every other output as the clean run's.
+        fn remap_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_remap") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let (n_map, n_card, rows, k, top_k) = (48usize, 16usize, ROWS, 640usize, 4usize);
+            let map: Vec<u32> = (0..n_map)
+                .map(|e| {
+                    if e % 3 == 0 {
+                        (n_card - 1 - e / 3) as u32
+                    } else {
+                        HOST
+                    }
+                })
+                .collect();
+            let (w, dec) = weights(true, n_card * rows, k, 0x3400)?;
+            let res = Res::new(dev, &w, true, n_card * rows)?;
+            let tokens = [1usize, 17, 512, 2048];
+            let max_slots = tokens[tokens.len() - 1] * top_k;
+            let mut route = GemmRoute::new(stream, max_slots, n_card)?;
+            let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+            let map_d = DeviceBuffer::from_host(stream, &map)?;
+            let mut act = GemmAct32::new(stream, max_slots, k)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
+            let mut ok = true;
+            gpu.clear_fault()?;
+            let mut last = None;
+            for t in tokens {
+                let ids = route_ids(Routing::Uniform, t, top_k, n_map, 0x88 ^ t as u64);
+                let n_slots = ids.len();
+                let x = activations(k, n_slots, 9800 + t as u32);
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, n_slots, &mut act, sink)?;
+                ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                dev.g32
+                    .enqueue_route_remap(stream, &ids_d, &map_d, n_slots, &mut route, sink)?;
+                let got = gemm(
+                    dev,
+                    &res,
+                    Lay::Q51,
+                    rows,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    n_slots,
+                )?;
+                let mapped: Vec<u32> = ids.iter().map(|&e| map[e as usize]).collect();
+                let (want_cols, want_tiles) = route_ref(&mapped, n_card);
+                let (cols, tiles) = route.read_back(stream)?;
+                let refused = route.refused_back(stream)?;
+                let table_ok = tiles == want_tiles
+                    && cols[..want_cols.len()] == want_cols[..]
+                    && refused.is_empty();
+                let (ha, _) = host_act(&x, k, n_slots);
+                let host_slots = mapped.iter().filter(|&&v| v == HOST).count();
+                let Checked {
+                    checked,
+                    band_off,
+                    bits_off,
+                    host_bad,
+                    worst,
+                    first,
+                } = check(
+                    &w,
+                    true,
+                    rows,
+                    &ha,
+                    &|s| (mapped[s] != HOST).then_some(mapped[s] as usize),
+                    &|s| s,
+                    &got,
+                    n_slots,
+                );
+                let fault = gpu.take_fault()?;
+                let pass = dec
+                    && table_ok
+                    && host_bad == 0
+                    && band_off == 0
+                    && bits_off == 0
+                    && fault.is_none();
+                println!(
+                    "gemm32 case=g32_remap T={t} slots={n_slots} host_slots={host_slots} listed={} tiles={} \
+                     table_eq_host={table_ok} host_untouched={} checked={checked} worst_err_over_band={worst:.3} \
+                     band_off={band_off} contract_bits_differ={bits_off} {}",
+                    want_cols.len(),
+                    tiles.len(),
+                    host_bad == 0,
+                    verdict(pass)
+                );
+                if let Some(f) = first {
+                    println!("gemm32 case=g32_remap T={t} first_failure: {f}");
+                }
+                ok &= pass;
+                last = Some((ids, got));
+            }
+            let (ids, clean) = last.ok_or("no remap run")?;
+
+            // The K-quant family over the same remapped table: a Q4_K stack of
+            // the 16 card experts (the routed gate·up's type). Host slots keep
+            // the sentinel; every card slot is bit for bit the same GEMM over
+            // `gemm_route`'s table of the mapped ids, each host id replaced by
+            // card slot 0 — an output's bits do not depend on its tile.
+            {
+                let (kq, rq) = (2048usize, 256usize);
+                let n_slots = ids.len();
+                let bytes = synthetic(GemmWeight::Q4K, n_card * rq * kq / 256, 0x3410);
+                let words = bytes_to_words(&bytes);
+                let wq =
+                    DeviceTensor::upload(stream, &words, n_card * rq, words.len() / (n_card * rq))?;
+                let mut aq = GemmAct::new(stream, n_slots, kq)?;
+                let xq = DeviceBuffer::from_host(stream, &activations(kq, n_slots, 9870))?;
+                gpu.enqueue_quantize_gemm(&xq, n_slots, &mut aq, sink)?;
+                let mut yq = DeviceBuffer::<f32>::zeroed(stream, n_slots * rq)?;
+                let mut run_q4k = |route: &GemmRoute| -> Result<Vec<f32>, GateError> {
+                    yq.copy_from_host(stream, &vec![SENT; yq.len()])?;
+                    dev.gk.enqueue_gemm(
+                        stream,
+                        GemmArgs {
+                            ty: GemmWeight::Q4K,
+                            w: &wq,
+                            rows_per_expert: rq,
+                            act: &aq,
+                            route,
+                            input: GemmInput::PerSlot,
+                            y: &mut yq,
+                        },
+                    )?;
+                    stream.synchronize()?;
+                    Ok(yq.to_host_vec(stream)?)
+                };
+                ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                dev.g32
+                    .enqueue_route_remap(stream, &ids_d, &map_d, n_slots, &mut route, sink)?;
+                let y_remap = run_q4k(&route)?;
+                let mapped: Vec<u32> = ids.iter().map(|&e| map[e as usize]).collect();
+                let plain_ids: Vec<u32> = mapped
+                    .iter()
+                    .map(|&v| if v == HOST { 0 } else { v })
+                    .collect();
+                let mut plain = GemmRoute::new(stream, max_slots, n_card)?;
+                ids_d.copy_from_host(stream, &pad(&plain_ids, ids_d.len()))?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, n_slots, &mut plain, sink)?;
+                let y_plain = run_q4k(&plain)?;
+                let (mut host_ok, mut card_ok) = (true, true);
+                for s in 0..n_slots {
+                    let (a, b) = (
+                        &y_remap[s * rq..(s + 1) * rq],
+                        &y_plain[s * rq..(s + 1) * rq],
+                    );
+                    if mapped[s] == HOST {
+                        host_ok &= a.iter().all(|v| v.to_bits() == SENT.to_bits());
+                    } else {
+                        card_ok &=
+                            bits_equal(a, b) && a.iter().all(|v| v.to_bits() != SENT.to_bits());
+                    }
+                }
+                let fault = gpu.take_fault()?;
+                let pass = host_ok && card_ok && fault.is_none();
+                println!(
+                    "gemm32 case=g32_remap gemm_q4k slots={n_slots} host_untouched={host_ok} \
+                     card_eq_gemm_route_table={card_ok} fault={} {}",
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            let n_slots = ids.len();
+            let x = activations(k, n_slots, 9800 + 2048);
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &xd, n_slots, &mut act, sink)?;
+
+            // An identity map is `gemm_route`'s table.
+            {
+                let ident: Vec<u32> = (0..n_card as u32).collect();
+                let ident_d = DeviceBuffer::from_host(stream, &ident)?;
+                let ids16 = route_ids(Routing::Uniform, 1000, top_k, n_card, 0x99);
+                ids_d.copy_from_host(stream, &pad(&ids16, ids_d.len()))?;
+                dev.g32.enqueue_route_remap(
+                    stream,
+                    &ids_d,
+                    &ident_d,
+                    ids16.len(),
+                    &mut route,
+                    sink,
+                )?;
+                let a = route.read_back(stream)?;
+                let mut plain = GemmRoute::new(stream, max_slots, n_card)?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, ids16.len(), &mut plain, sink)?;
+                let b = plain.read_back(stream)?;
+                let pass = a == b && gpu.take_fault()?.is_none();
+                println!(
+                    "gemm32 case=g32_remap identity_map slots={} table_eq_gemm_route={} {}",
+                    ids16.len(),
+                    a == b,
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+
+            // Faults: slot 5's id past the map; then every slot of card expert
+            // 3 (map value 16, past the stack).
+            let want = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+            for case in ["id_past_map", "value_past_stack"] {
+                let (ids_f, map_f) = if case == "id_past_map" {
+                    let mut v = ids.clone();
+                    v[5] = n_map as u32 + 2;
+                    (v, map.clone())
+                } else {
+                    let mut mp = map.clone();
+                    mp[3] = n_card as u32;
+                    (ids.clone(), mp)
+                };
+                let bad: Vec<usize> = (0..n_slots)
+                    .filter(|&s| {
+                        ids_f[s] as usize >= n_map || map_f[ids_f[s] as usize] == n_card as u32
+                    })
+                    .collect();
+                let map_fd = DeviceBuffer::from_host(stream, &map_f)?;
+                ids_d.copy_from_host(stream, &pad(&ids_f, ids_d.len()))?;
+                dev.g32
+                    .enqueue_route_remap(stream, &ids_d, &map_fd, n_slots, &mut route, sink)?;
+                let got = gemm(
+                    dev,
+                    &res,
+                    Lay::Q51,
+                    rows,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    n_slots,
+                )?;
+                let fault = gpu.take_fault()?;
+                let refused = route.refused_back(stream)?;
+                let listed_ok = refused.iter().map(|&s| s as usize).collect::<Vec<_>>() == bad;
+                let nan_ok = bad
+                    .iter()
+                    .all(|&s| got[s * rows..(s + 1) * rows].iter().all(|v| v.is_nan()));
+                let others = (0..n_slots).filter(|s| !bad.contains(s)).all(|s| {
+                    bits_equal(
+                        &got[s * rows..(s + 1) * rows],
+                        &clean[s * rows..(s + 1) * rows],
+                    )
+                });
+                let pass = fault == want && listed_ok && nan_ok && others && !bad.is_empty();
+                println!(
+                    "gemm32 case=g32_remap fault={case} bad_slots={} fault=\"{}\" refused_listed={listed_ok} \
+                     refused_nan={nan_ok} others_eq_clean={others} {}",
+                    bad.len(),
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        }
+
+        /// The wide F32 product against `f32_gemv` launches of up to eight
+        /// columns, bit for bit, at the Qwen3.8 row counts (96, 128, 512) and
+        /// one that is not a multiple of 32 (100); a column count one short of
+        /// a ubatch (4095) ragged at both edges.
+        fn f32tile_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_f32tile") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let k = 2560usize;
+            let mut ok = true;
+            for (rows, ns) in [
+                (96usize, &[1usize, 8, 9, 512, 4095][..]),
+                (100, &[1, 9, 512][..]),
+                (128, &[1, 8, 9, 512, 4095][..]),
+                (512, &[1, 9, 512][..]),
+            ] {
+                let wh = activations(k, rows, 9900 + rows as u32);
+                let w = DeviceTensor::upload(stream, &wh, rows, k)?;
+                for &n in ns {
+                    let xh = activations(k, n, 9950 + n as u32);
+                    let xd = DeviceBuffer::from_host(stream, &xh)?;
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 64])?;
+                    dev.g32.enqueue_f32_tile(stream, &w, &xd, n, &mut y)?;
+                    stream.synchronize()?;
+                    let got = y.to_host_vec(stream)?;
+                    let tail_ok = got[rows * n..]
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                    let mut differ = 0usize;
+                    let mut yg = DeviceBuffer::<f32>::zeroed(stream, rows * 8)?;
+                    for c0 in (0..n).step_by(8) {
+                        let m = (n - c0).min(8);
+                        let xc = DeviceBuffer::from_host(stream, &xh[c0 * k..(c0 + m) * k])?;
+                        gpu.q8f32().enqueue_f32_gemv(stream, &w, &xc, m, &mut yg)?;
+                        let g = yg.to_host_vec(stream)?;
+                        for c in 0..m {
+                            for r in 0..rows {
+                                if got[(c0 + c) * rows + r].to_bits() != g[r * m + c].to_bits() {
+                                    differ += 1;
+                                }
+                            }
+                        }
+                    }
+                    let pass = differ == 0 && tail_ok;
+                    println!(
+                        "gemm32 case=g32_f32tile rows={rows} K={k} n={n} bits_differ_vs_f32_gemv={differ} \
+                         past_end_untouched={tail_ok} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
+        /// The host API's refusals, each a named error.
+        fn refusals(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_refuse") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let (k, rows) = (320usize, 32usize);
+            let (w8, _) = weights(false, rows, k, 0x3500)?;
+            let r8 = Res::new(dev, &w8, false, rows)?;
+            let act = GemmAct32::new(stream, 8, k)?;
+            let mut act_q = GemmAct32::new(stream, 8, k)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 8 * rows)?;
+            let unfilled = GemmRoute::new(stream, 8, 1)?;
+            let mut route = GemmRoute::new(stream, 8, 1)?;
+            dev.gk.enqueue_route_dense(stream, 8, &mut route, sink)?;
+            let wh = activations(96, 4, 1);
+            let w96 = DeviceTensor::upload(stream, &wh, 4, 96)?;
+            let x = DeviceBuffer::from_host(stream, &activations(k, 8, 2))?;
+            let short = DeviceBuffer::from_host(stream, &activations(k, 1, 3))?;
+            let empty = DeviceBuffer::<u32>::zeroed(stream, 0)?;
+            let ids = DeviceBuffer::<u32>::zeroed(stream, 8)?;
+            let plane = r8.weight(Lay::Q8Plane)?;
+            let refused = [
+                ("act_k_48", GemmAct32::new(stream, 8, 48).is_err()),
+                ("act_cols_0", GemmAct32::new(stream, 0, k).is_err()),
+                (
+                    "quant_short_input",
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &short, 8, &mut act_q, sink)
+                        .is_err(),
+                ),
+                (
+                    "quant_cols_past_act",
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &x, 9, &mut act_q, sink)
+                        .is_err(),
+                ),
+                (
+                    "unfilled_route",
+                    dev.g32
+                        .enqueue_gemm32(
+                            stream,
+                            Gemm32Args {
+                                w: plane,
+                                rows_per_expert: rows,
+                                act: &act,
+                                route: &unfilled,
+                                input: GemmInput::PerSlot,
+                                y: &mut y,
+                            },
+                        )
+                        .is_err(),
+                ),
+                (
+                    "rows_not_16",
+                    dev.g32
+                        .enqueue_gemm32(
+                            stream,
+                            Gemm32Args {
+                                w: plane,
+                                rows_per_expert: 24,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: &mut y,
+                            },
+                        )
+                        .is_err(),
+                ),
+                (
+                    "q5_1_layout_at_q8_0_words",
+                    dev.g32
+                        .enqueue_gemm32(
+                            stream,
+                            Gemm32Args {
+                                w: Gemm32Weight::Q5_1File(&r8.file),
+                                rows_per_expert: rows,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: &mut y,
+                            },
+                        )
+                        .is_err(),
+                ),
+                (
+                    "remap_empty_map",
+                    dev.g32
+                        .enqueue_route_remap(stream, &ids, &empty, 8, &mut route, sink)
+                        .is_err(),
+                ),
+                (
+                    "f32_tile_k_96",
+                    dev.g32
+                        .enqueue_f32_tile(stream, &w96, &x, 1, &mut y)
+                        .is_err(),
+                ),
+            ];
+            let all = refused.iter().all(|(_, r)| *r);
+            println!(
+                "gemm32 case=g32_refuse {} {}",
+                refused
+                    .iter()
+                    .map(|(n, r)| format!("{n}={}", if *r { "refused" } else { "ACCEPTED" }))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                verdict(all)
+            );
+            Ok(all)
+        }
+
+        /// Every 32-value case.
+        pub(super) fn run(gpu: &Gpu, gk: &GemmKernels) -> Result<bool, GateError> {
+            let dev = Dev {
+                gpu,
+                gk,
+                g32: Gemm32Kernels::load(gpu.context())?,
+            };
+            let t0 = std::time::Instant::now();
+            let mut ok = quant_case(&dev)?;
+            ok &= dense_case(&dev)?;
+            ok &= routed_case(&dev)?;
+            ok &= remap_case(&dev)?;
+            ok &= f32tile_case(&dev)?;
+            ok &= refusals(&dev)?;
+            println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
+            Ok(ok)
         }
     }
 }
