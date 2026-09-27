@@ -47,7 +47,7 @@ use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
-use crate::q38::{EmbedQ8Args, Q38Kernels, SharedAddArgs};
+use crate::q38::{EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs};
 use crate::qsa::{PoolArgs, QsaKernels, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::tensor::DeviceTensor;
@@ -65,25 +65,25 @@ const MMA: bool = true;
 /// A delta layer's mixer launches at one row: the q·k·v, `z` and joined
 /// β·α projections, the conv, the delta step, the gated norm and the output
 /// projection.
-pub const GDN_LAUNCHES: usize = 7;
+pub(super) const GDN_LAUNCHES: usize = 7;
 /// A selecting layer's mixer launches at one row: q, k and v; the indexer
 /// key's projection, its append and the pool; the indexer query's projection
 /// and the selection's two; the q/k norm, turn and append; the selected
 /// flash's two; the gate and the output projection.
-pub const QSA_LAUNCHES: usize = 14;
+pub(super) const QSA_LAUNCHES: usize = 14;
 /// The PLE site's launches: the previous combine, the key and value
 /// projections, the gate and the conv.
-pub const PLE_LAUNCHES: usize = 5;
+pub(super) const PLE_LAUNCHES: usize = 5;
 /// A layer's two mixes.
-pub const MIX_LAUNCHES: usize = 2 * 3;
+pub(super) const MIX_LAUNCHES: usize = 2 * 3;
 /// The block's launches in the step: the router, the handoff, the go, the
 /// shared expert's four, the wait and the gated sum.
-pub const FFN_LAUNCHES: usize = 1 + 1 + 1 + 4 + 1 + 1;
+pub(super) const FFN_LAUNCHES: usize = 1 + 1 + 1 + 4 + 1 + 1;
 /// Of the block's launches, the stream memory-operation batches: the go and
 /// the wait.
-pub const STEP_MEMOPS: usize = 2;
+pub(super) const STEP_MEMOPS: usize = 2;
 /// The head: its mix, the projection and the argmax.
-pub const HEAD_LAUNCHES: usize = 3 + 2;
+pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
 
 /// The captured decode step's launches for `plans` (module doc).
 pub(super) fn step_launches(plans: &[Layer38]) -> usize {
@@ -649,8 +649,17 @@ fn qsa(
     c.q8_gemv(&qp.k, mixed, m, &mut q.k)?;
     c.q8_gemv(&qp.v, mixed, m, &mut q.v)?;
     c.f32_gemv(&qp.idx_k, mixed, m, &mut q.kr)?;
-    c.k.q38
-        .enqueue_key_append(stream, (&q.kr, &*pos), (m, ctx), sink, &mut *raw)?;
+    c.k.q38.enqueue_key_append(
+        stream,
+        KeyAppendArgs {
+            kr: &q.kr,
+            pos: &*pos,
+            m,
+            ctx,
+            fault: sink,
+            raw: &mut *raw,
+        },
+    )?;
     c.k.qsa.enqueue_pool(
         stream,
         PoolArgs {
@@ -732,8 +741,17 @@ fn qsa(
         geo::N_HEAD,
         MMA,
     )?;
-    c.k.q38
-        .enqueue_out_gate(stream, (&*flash, &q.qg), geo::N_HEAD, m, sink, &mut *attn)?;
+    c.k.q38.enqueue_out_gate(
+        stream,
+        OutGateArgs {
+            attn: &*flash,
+            qg: &q.qg,
+            n_head: geo::N_HEAD,
+            m,
+            fault: sink,
+            y: &mut *attn,
+        },
+    )?;
     c.q8_gemv(&qp.out, &*attn, m, y)
 }
 
@@ -831,12 +849,22 @@ impl<'a> Pass38<'a> {
     }
 
     /// After the walk: the head's mix over the unit's columns, its last row
-    /// into `head`'s input, and the head.
+    /// into `head`'s input, and the head. A unit of no row, or of more rows
+    /// than the arena holds, is refused by name before any launch.
     pub(super) fn head(&mut self, head: &mut Head) -> Result<(), GpuError> {
         let (m, h, gpu) = (self.p.m, geo::HIDDEN, self.p.c.gpu);
+        if m == 0 || m > self.p.s.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a head after a unit of {m} rows on a {}-row arena",
+                    self.p.s.rows
+                ),
+            ));
+        }
         self.p.head_mix(None)?;
-        // SAFETY: row m − 1 spans `hidden` values inside `mixed` (`rows ·
-        // hidden`, m at most the arena's rows), which stays in place while
+        // SAFETY: 1 <= m <= rows (checked above), so row m − 1 spans `hidden`
+        // values inside `mixed` (`rows · hidden`), which stays in place while
         // the window lives (one copy).
         let row = unsafe { f32_view(&self.p.s.mixed, (m - 1) * h, h) };
         head.input_mut()

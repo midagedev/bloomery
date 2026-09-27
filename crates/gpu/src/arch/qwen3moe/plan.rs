@@ -16,9 +16,10 @@
 use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
+use model::arch::coverage::turns_as_neox;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{
-    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, RopeMode,
+    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe,
 };
 
 /// The two K-quants a mixed site comes in: a value projection, an experts'
@@ -189,16 +190,7 @@ pub(super) fn kinds35(layers: &[LayerSpec]) -> Result<Vec<Kind35>, GpuError> {
 /// Ok when `g` is the gated attention the head-256 kernels run.
 fn gqa_fits(g: &Gqa) -> Result<(), String> {
     use q35::{HEAD_DIM, HEADS, KV_HEADS, ROPE_DIMS};
-    let rope_ok = match g.rope.mode {
-        RopeMode::Neox => true,
-        // A text-only position gives every section the same position, so
-        // the sections' pairs turn as NEOX's when they cover the rotated
-        // values' pairs.
-        RopeMode::Imrope { sections } => {
-            sections.iter().map(|&s| u64::from(s)).sum::<u64>() == u64::from(g.rope.dims / 2)
-        }
-        RopeMode::NormTail => false,
-    };
+    let rope_ok = turns_as_neox(g.rope.mode, g.rope.dims);
     let fits = g.heads == HEADS
         && g.kv_heads == KV_HEADS
         && g.head_dim == HEAD_DIM

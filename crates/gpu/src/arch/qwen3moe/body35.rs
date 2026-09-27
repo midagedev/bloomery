@@ -848,19 +848,7 @@ impl GpuModel<Body35> {
                     "layer taps off (a prompt unit writes none)",
                 ));
             }
-            if let Some((i, &id)) = tokens
-                .iter()
-                .enumerate()
-                .find(|&(_, &id)| id as usize >= body.vocab)
-            {
-                return Err(GpuError::shape(
-                    WHAT_P,
-                    format!(
-                        "token {i} is id {id}, past the vocabulary of {}",
-                        body.vocab
-                    ),
-                ));
-            }
+            super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
             body.img.write(gpu.stream(), tokens, pos0)?;
         }
         let n_steps = plan.steps.len();

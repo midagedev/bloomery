@@ -182,9 +182,9 @@ pub const AVAILABLE: &[Available] = &[
                 Need::QkRope {
                     qk_norm: true,
                     head: 256,
-                    mode: RopeMode::Imrope { sections },
+                    mode: mode @ RopeMode::Imrope { .. },
                     dims: 64
-                } if sections.iter().sum::<u32>() == 32
+                } if turns_as_neox(*mode, 64)
             )
         },
     },
@@ -325,7 +325,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         program: Program::Qwen38Body,
         at: "models/src/shape.rs GQA, the `_256_p4` flash (Body38)",
-        runs: |n| matches!(n, Need::Gqa { head, group } if gqa_row(*head, *group).is_some()),
+        runs: |n| matches!(n, Need::Gqa { head: 256, group: 12 } if gqa_row(256, 12).is_some()),
     },
     Available {
         program: Program::Qwen38Body,
@@ -336,9 +336,9 @@ pub const AVAILABLE: &[Available] = &[
                 Need::QkRope {
                     qk_norm: true,
                     head: 256,
-                    mode: RopeMode::Imrope { .. },
+                    mode: mode @ RopeMode::Imrope { .. },
                     dims: 64
-                }
+                } if turns_as_neox(*mode, 64)
             )
         },
     },
@@ -429,6 +429,22 @@ pub const AVAILABLE: &[Available] = &[
     },
 ];
 
+/// Whether a rope of `mode` over the first `dims` values of a head turns
+/// them as NEOX does at a text-only position: NEOX itself, or IMROPE whose
+/// sections cover the `dims / 2` pairs (a text-only position gives every
+/// section the same position). The one test the head-256 kernels' plans and
+/// their coverage rows share.
+#[must_use]
+pub fn turns_as_neox(mode: RopeMode, dims: u32) -> bool {
+    match mode {
+        RopeMode::Neox => true,
+        RopeMode::Imrope { sections } => {
+            sections.iter().map(|&s| u64::from(s)).sum::<u64>() == u64::from(dims / 2)
+        }
+        RopeMode::NormTail => false,
+    }
+}
+
 /// Whether the router `n` names has an instance among `bodies`' rows: the
 /// row [`select_router`] picks, so a count or a pick the launchers refuse
 /// is an item here too.
@@ -443,6 +459,8 @@ struct TypePin {
     /// Only the quantized tensors of two or more dimensions (the matrices a
     /// gemv reads; an F32 parameter table is its layer's mixer's).
     matrices: bool,
+    /// Only the tensors whose name this takes; `None`: every one of the role.
+    names: Option<fn(&str) -> bool>,
     what: &'static str,
     reads: &'static [GgmlType],
 }
@@ -459,6 +477,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen3moeBody,
         role: Role::Attention,
         matrices: true,
+        names: None,
         what: "attention matrices (the body reads q4_K and q6_K)",
         reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
@@ -466,6 +485,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen3moeBody,
         role: Role::Head,
         matrices: true,
+        names: None,
         what: "output head (the head reads q6_K)",
         reads: &[GgmlType::Q6_K],
     },
@@ -473,6 +493,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen3moeBody,
         role: Role::TokenEmbedding,
         matrices: true,
+        names: None,
         what: "token embedding (the card reads q4_K rows)",
         reads: &[GgmlType::Q4_K],
     },
@@ -480,6 +501,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Deepseek41Chain,
         role: Role::Attention,
         matrices: true,
+        names: None,
         what: "attention matrices (the chain reads q3_K and q8_0)",
         reads: &[GgmlType::Q3_K, GgmlType::Q8_0],
     },
@@ -487,6 +509,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Deepseek41Chain,
         role: Role::Head,
         matrices: true,
+        names: None,
         what: "output head (the head reads q6_K)",
         reads: &[GgmlType::Q6_K],
     },
@@ -494,6 +517,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Deepseek41Chain,
         role: Role::HyperConnection,
         matrices: true,
+        names: None,
         what: "hyper-connection fn (the chain reads q3_K and f32)",
         reads: &[GgmlType::Q3_K],
     },
@@ -501,6 +525,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::Attention,
         matrices: true,
+        names: None,
         what: "attention matrices (the body reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -508,6 +533,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::HyperConnection,
         matrices: true,
+        names: None,
         what: "hyper-connection fn (hc_pre_q8_0 reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -515,6 +541,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::DenseFfn,
         matrices: true,
+        names: None,
         what: "dense block (the body reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -522,6 +549,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::SharedExpert,
         matrices: true,
+        names: None,
         what: "shared expert (the body reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -529,6 +557,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::Head,
         matrices: true,
+        names: None,
         what: "output head (the head reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -536,6 +565,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Glm5nextBody,
         role: Role::TokenEmbedding,
         matrices: true,
+        names: None,
         what: "token embedding (the host reads q8_0 rows)",
         reads: &[GgmlType::Q8_0],
     },
@@ -543,13 +573,23 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen38Body,
         role: Role::Attention,
         matrices: true,
-        what: "attention matrices (the body reads q8_0, and bf16 widened to f32)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
+        names: Some(|n| !indexer_projection(n)),
+        what: "attention matrices (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::Attention,
+        matrices: true,
+        names: Some(indexer_projection),
+        what: "indexer projections (the body reads bf16 widened to f32)",
+        reads: &[GgmlType::BF16],
     },
     TypePin {
         program: Program::Qwen38Body,
         role: Role::HyperConnection,
         matrices: true,
+        names: None,
         what: "hyper-connection down and up (the body reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -557,6 +597,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen38Body,
         role: Role::SharedExpert,
         matrices: true,
+        names: None,
         what: "shared expert (the body reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -564,6 +605,7 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen38Body,
         role: Role::Head,
         matrices: true,
+        names: None,
         what: "output head (the head reads q8_0)",
         reads: &[GgmlType::Q8_0],
     },
@@ -571,10 +613,18 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen38Body,
         role: Role::TokenEmbedding,
         matrices: true,
+        names: None,
         what: "token embedding (the card reads q8_0 rows)",
         reads: &[GgmlType::Q8_0],
     },
 ];
+
+/// A qwen4exp selector's key or query projection, which `Body38` reads as
+/// bf16 widened to f32 (`plan38::plans`), where it reads every other
+/// attention matrix as q8_0.
+fn indexer_projection(name: &str) -> bool {
+    name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
+}
 
 /// Every part of `spec` (with its tensors `model`) that no program runs:
 /// layer by layer in layer order, then the tensor formats, then the
@@ -638,6 +688,7 @@ pub fn check_with(
                 program.is_none_or(|p| pin.program == p)
                     && pin.role == t.role
                     && (!pin.matrices || matrix)
+                    && pin.names.is_none_or(|takes| takes(&t.name))
             })
             .collect();
         let refused: Vec<&TypePin> = match program {

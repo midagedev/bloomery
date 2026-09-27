@@ -26,7 +26,7 @@ mod plan;
 mod plan38;
 mod prefill;
 mod program;
-pub mod program38;
+mod program38;
 pub mod proj;
 pub mod router;
 mod scratch;
@@ -47,3 +47,23 @@ pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHo
 pub type Qwen35moeModel = crate::GpuModel<Body35>;
 pub use prefill::{PrefillPath, PrefillPlan, PrefillStep};
 pub use taps::LayerRun;
+
+/// The first of a prompt call's `tokens` at or past a vocabulary of `vocab`
+/// ids, refused by name: a call checks every id before its first launch.
+fn refuse_past_vocab(
+    what: &'static str,
+    tokens: &[u32],
+    vocab: usize,
+) -> Result<(), crate::GpuError> {
+    match tokens
+        .iter()
+        .enumerate()
+        .find(|&(_, &id)| id as usize >= vocab)
+    {
+        Some((i, &id)) => Err(crate::GpuError::shape(
+            what,
+            format!("token {i} is id {id}, past the vocabulary of {vocab}"),
+        )),
+        None => Ok(()),
+    }
+}

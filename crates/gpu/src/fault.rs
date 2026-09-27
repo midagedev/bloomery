@@ -106,9 +106,10 @@ pub enum FaultSite {
     /// non-finite input, a norm whose mean square or variance is not
     /// finite, or a value past f16's range.
     CacheValue = 16,
-    /// A token-pool selector (`qsa`) met a pooled key or a head's score
-    /// that is not finite, or its selected flash a list entry at or past
-    /// the cache.
+    /// A token-pool selector met an indexer key that is not finite after its
+    /// f16 rounding (`q38::qsa_key_append`, the raw key), a pooled key or a
+    /// head's score that is not finite (`qsa`), or its selected flash a list
+    /// entry at or past the cache.
     PoolSelect = 18,
     /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
     /// conv input whose sum of squares, dot or value is not finite, or a
@@ -211,7 +212,8 @@ impl FaultSite {
                  variance, or a value past f16's range"
             }
             FaultSite::PoolSelect => {
-                "a pooled key or a selector score not finite, or a selected token past the cache"
+                "a raw or pooled indexer key or a selector score not finite, or a selected token \
+                 past the cache"
             }
             FaultSite::Ple => {
                 "a PLE key, stream, gated value or conv input not finite (a value, its sum of \
@@ -326,16 +328,22 @@ pub mod step_order {
         F32Product,
     ];
 
-    /// Qwen3.6-35B-A3B (`arch::qwen3moe`'s second body): the two layer
-    /// kinds' sites in one order. A PLE site (Qwen3.8's) before its layer's
-    /// mix, then Qwen3.8's gated-residual mix before anything else of the
-    /// layer; the fused norm and quantizer at the layer's entry; an attention
-    /// layer's cache append and flash key count;
-    /// a delta layer's conv, delta step (its lane word right after it) and
-    /// gated norm; Qwen3.8's f32 products (the gated attention output, then
-    /// the shared expert's sum); the output projection's quantizer either
-    /// kind's; then the router's fused norm and the routed experts. A mask holds one layer's
-    /// sites, so each kind reads in its own launch order.
+    /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
+    /// and `Body38`; both are `Arch::Qwen35moe`, so one order serves both).
+    /// Qwen3.6's two layer kinds read in their launch order: the fused norm
+    /// and quantizer at the layer's entry; an attention layer's cache append
+    /// and flash key count, or a delta layer's conv, delta step (its lane
+    /// word right after it) and gated norm; the output projection's
+    /// quantizer; then the router's fused norm and the routed experts.
+    /// Qwen3.8's sites stand beside them: its PLE site before its layer's
+    /// mix, its gated-residual mix before the rest of the layer, its f32
+    /// products before the output projection's quantizer. That is not every
+    /// Qwen3.8 layer's launch order; among the differences, a delta layer's
+    /// first [`F32Product`] is the shared expert's sum, raised after
+    /// [`Router`] and [`ExpertId`], and a selecting layer raises
+    /// [`PoolSelect`] (its raw key append first) before its out gate's
+    /// [`F32Product`]. The mask names every site raised either way; only the
+    /// order it prints them in differs.
     pub const QWEN35MOE: &[FaultSite] = &[
         TokenId,
         Ple,

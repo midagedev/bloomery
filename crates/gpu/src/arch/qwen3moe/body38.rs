@@ -28,7 +28,7 @@
 //! hash's history is the sequence's: a step at any position other than the
 //! next is refused by name, and `reset` starts a new one.
 
-use super::plan38::{self, GDN, Kind38, Layer38, beta_alpha, geo, router};
+use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, step_launches};
 use super::scratch::{LANE, RopeRows, StepParams, f32_view};
 use super::scratch38::{Arena38, PASS_ROWS, PassRecord, Store38, Taps38, dims, store_rule_bytes};
@@ -43,7 +43,7 @@ use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::Hash;
-use engram::hash::History;
+use engram::hash::{History, Window};
 use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
@@ -56,8 +56,7 @@ const WHAT: &str = "qwen4exp Body38";
 /// The coverage items the program opens a file with: the tokenizer's
 /// pre-tokenizer and the template's tool-call parser are the chat surface's,
 /// which the program does not use. Every other item the check lists is
-/// refused by name; until proposal P1 lands the program's rows, that is every
-/// qwen4exp item.
+/// refused by name.
 pub const ALLOWED: &[&str] = &[
     "pre-tokenizer qwen35",
     "a tool-call parser for this template",
@@ -240,6 +239,22 @@ impl PleHost {
     }
 }
 
+/// Refused by name, `what` the caller: the first of `tokens` the raw-id PLE
+/// hash of `window` does not take (the image placeholder, an id past the
+/// vocabulary), with its index in the call, or a hash that is not raw-id.
+/// The hash's own test ([`engram::hash::EosWindow::check`]), so a call's
+/// check before its first launch and each fill refuse the same ids.
+fn ple_takes(what: &'static str, window: &Window, tokens: &[u32]) -> Result<(), GpuError> {
+    let Window::Eos(w) = window else {
+        return Err(GpuError::state(what, "a raw-id PLE hash"));
+    };
+    for (i, &t) in tokens.iter().enumerate() {
+        w.check(t)
+            .map_err(|e| GpuError::shape(what, format!("token {i}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// A layer's store read back ([`Body38::stores_host`]): a delta layer's
 /// state and conv ring, or a selecting layer's K/V planes (f16 bits) and its
 /// raw and pooled indexer keys.
@@ -356,15 +371,32 @@ impl Body38 {
                 ),
             ));
         }
-        let (kinds, _, _, _) = plan38::read(&inputs.spec)?;
+        let n = inputs.spec.layers.len();
+        let layers = plan
+            .machine
+            .cards
+            .get(card)
+            .map(|c| c.layers.clone())
+            .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
+        if plan.machine.cards.len() != 1 || layers != (0..n) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "card {card} runs layers {layers:?} of a plan over {} cards; the program runs \
+                     every layer (0..{n}) on one card",
+                    plan.machine.cards.len()
+                ),
+            ));
+        }
+        let shape = plan38::read(&inputs.spec)?;
         GpuModel::load_placed(
             file,
             plan,
             card,
             host,
-            |stream, _, layers, w| Body38::derive(stream, &kinds, layers, w),
+            |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, residency| {
-                Body38::load_placed(gpu, file, w, plan, inputs, card, host, residency)
+                Body38::load_placed(gpu, file, w, plan, inputs, &shape, host, residency)
             },
         )
     }
@@ -398,10 +430,10 @@ impl Body38 {
         Ok(())
     }
 
-    /// The body of card `card` (module doc).
+    /// The body of the plan's one card over the chain's `shape` (module doc).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, plan and inputs, and the host tier's residency and levers (rust-quality R8)"
+        reason = "the load's card handle, file, weights, plan, inputs and chain shape, and the host tier's residency and levers (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -409,34 +441,24 @@ impl Body38 {
         w: &Weights,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
-        card: usize,
+        shape: &Shape38,
         host: HostCfg,
         residency: HostResidency,
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
         let n = spec.layers.len();
-        let layers = plan
-            .machine
-            .cards
-            .get(card)
-            .map(|c| c.layers.clone())
-            .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
-        if plan.machine.cards.len() != 1 || layers != (0..n) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "card {card} runs layers {layers:?} of a plan over {} cards; the program runs \
-                     every layer (0..{n}) on one card",
-                    plan.machine.cards.len()
-                ),
-            ));
-        }
         let ctx = usize::try_from(plan.ctx_max)
             .ok()
             .filter(|&c| c > 0)
             .ok_or_else(|| GpuError::shape(WHAT, format!("ctx_max {}", plan.ctx_max)))?;
-        let (kinds, router_dims, base, ple_layer) = plan38::read(spec)?;
-        let plans = plan38::plans(w, &kinds, ple_layer)?;
+        let Shape38 {
+            kinds,
+            router: router_dims,
+            base,
+            ple: ple_layer,
+        } = shape;
+        let (router_dims, base) = (*router_dims, *base);
+        let plans = plan38::plans(w, kinds, *ple_layer)?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let d = dims(router_dims, ctx);
@@ -448,7 +470,7 @@ impl Body38 {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (rec, sel) = store_rule_bytes(ctx);
-        for (l, (st, k)) in stores.iter().zip(&kinds).enumerate() {
+        for (l, (st, k)) in stores.iter().zip(kinds).enumerate() {
             let want = match k {
                 Kind38::Gdn => rec,
                 Kind38::Qsa => sel,
@@ -566,12 +588,9 @@ impl Body38 {
         &self.hybrid
     }
 
-    /// Arm (or disarm) the per-layer taps: after each layer the step copies
-    /// its streams into the layer's tap, which [`Body38::taps`] reads back,
-    /// and after each router its logits and ids ([`Body38::route_taps`]).
-    /// For an eager step: a capture taken while they are armed records the
-    /// copies. Load-time allocation.
-    pub fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+    /// Arm (or disarm) the per-layer taps ([`GpuModel::set_layer_taps`], the
+    /// one caller, drops the captures first). Load-time allocation.
+    fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
         self.taps = if on {
             Some(Taps38::new(gpu.stream(), self.plans.len(), &self.s.route)?)
         } else {
@@ -587,7 +606,7 @@ impl Body38 {
         let taps = self
             .taps
             .as_ref()
-            .ok_or(GpuError::state(WHAT, "armed taps (Body38::set_taps)"))?;
+            .ok_or(GpuError::state(WHAT, "armed taps (set_layer_taps)"))?;
         let mut out = Vec::with_capacity(taps.out.len() * geo::STREAMS * geo::HIDDEN);
         for t in &taps.out {
             out.extend(t.to_host_vec(gpu.stream())?);
@@ -602,7 +621,7 @@ impl Body38 {
         let taps = self
             .taps
             .as_ref()
-            .ok_or(GpuError::state(WHAT, "armed taps (Body38::set_taps)"))?;
+            .ok_or(GpuError::state(WHAT, "armed taps (set_layer_taps)"))?;
         taps.logits
             .iter()
             .zip(&taps.ids)
@@ -762,12 +781,27 @@ impl Body38 {
 }
 
 impl GpuModel<Body38> {
+    /// Arm (or disarm) the per-layer taps: after each layer the step copies
+    /// its streams into the layer's tap, which [`Body38::taps`] reads back,
+    /// and after each router its logits and ids ([`Body38::route_taps`]).
+    /// Every captured chain is dropped first, the mode kept: a capture
+    /// records the copies into the taps armed at its time, so a replay after
+    /// a change would write freed memory or leave the new taps unwritten.
+    /// Load-time allocation.
+    pub fn set_layer_taps(&mut self, on: bool) -> Result<(), GpuError> {
+        self.drop_captures();
+        let (gpu, _, body) = self.body_parts("qwen4exp set_layer_taps")?;
+        body.set_taps(gpu, on)
+    }
+
     /// Feed `tokens` from where the model stands by `path` and return the
     /// greedy next token after the last one: captured steps, one a position,
     /// or eager passes of up to eight positions, the last one ending in its
     /// last row's head. Either leaves every position's state and logits bit
-    /// for bit. A prompt past the stores is refused before any launch; the
-    /// layer taps must be off for passes.
+    /// for bit. A prompt past the stores, or with an id the embedding or the
+    /// PLE hash does not take (one past the vocabulary, the image
+    /// placeholder), is refused before any launch, so either path leaves the
+    /// model where it stood; the layer taps must be off for passes.
     pub fn prompt38(&mut self, tokens: &[u32], path: Prompt38) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         if tokens.is_empty() {
@@ -779,7 +813,10 @@ impl GpuModel<Body38> {
                 fault,
             });
         }
-        let (pos, ctx) = (self.pos() as usize, self.body(WHAT_P)?.ctx());
+        let body = self.body(WHAT_P)?;
+        super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
+        ple_takes(WHAT_P, body.ple.hash.window(), tokens)?;
+        let (pos, ctx) = (self.pos() as usize, body.ctx());
         if pos + tokens.len() > ctx {
             return Err(GpuError::shape(
                 WHAT_P,
@@ -961,3 +998,33 @@ impl HostServed for Body38 {
 }
 
 const _: () = assert!(GDN.n_v == geo::V_HEADS);
+
+#[cfg(test)]
+mod tests {
+    use super::ple_takes;
+    use engram::hash::{EosWindow, Window};
+
+    /// The call's check is the hash's: a text id passes; the image
+    /// placeholder and an id past the vocabulary are refused by name with
+    /// their index wherever they stand; a hash that is not raw-id is
+    /// refused.
+    #[test]
+    fn a_call_is_checked_by_the_hashs_own_test() {
+        let w = Window::Eos(EosWindow {
+            eos: 1,
+            image: Some(9),
+            n_vocab: 16,
+        });
+        assert!(ple_takes("t", &w, &[0, 1, 15]).is_ok());
+        for (ids, at) in [([2, 3, 9], "token 2:"), ([15, 16, 2], "token 1:")] {
+            let e = ple_takes("t", &w, &ids).expect_err("the id is refused");
+            assert!(e.to_string().contains(at), "{ids:?}: {e}");
+        }
+        let mapped = Window::Mapped {
+            token_map: vec![0; 16],
+            pad: 0,
+        };
+        let e = ple_takes("t", &mapped, &[0]).expect_err("a mapped hash is refused");
+        assert!(e.to_string().contains("a raw-id PLE hash"), "{e}");
+    }
+}

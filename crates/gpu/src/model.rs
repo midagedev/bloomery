@@ -497,6 +497,13 @@ impl<B: ChainBody> GpuModel<B> {
         self.mode = mode;
     }
 
+    /// Drop every captured chain, the mode kept: for a body change that
+    /// moves what a capture recorded (the buffers its launches address), so
+    /// the next `Graph` run recaptures rather than replay a stale one.
+    pub(crate) fn drop_captures(&mut self) {
+        self.graphs.clear();
+    }
+
     /// Whether any chain is captured.
     #[must_use]
     pub fn has_capture(&self) -> bool {

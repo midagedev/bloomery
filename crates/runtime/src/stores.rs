@@ -17,16 +17,26 @@ pub const F32_BYTES: u64 = 4;
 pub const PASS_ROWS: usize = 8;
 
 /// Rows of a recurrent layer's conv ring: the reach of a `conv`-tap conv and
-/// a pass. `conv` is at least one.
+/// a pass.
+///
+/// # Panics
+///
+/// On a conv of no tap, by name.
 #[must_use]
 pub const fn conv_ring_rows(conv: usize) -> usize {
+    assert!(conv >= 1, "conv_ring_rows: a conv of at least one tap");
     conv - 1 + PASS_ROWS
 }
 
 /// Rows of a PLE conv ring: the reach of `taps` taps `dilation` apart and a
-/// pass. `taps` is at least one.
+/// pass.
+///
+/// # Panics
+///
+/// On a conv of no tap, by name.
 #[must_use]
 pub const fn ple_ring_rows(taps: usize, dilation: usize) -> usize {
+    assert!(taps >= 1, "ple_ring_rows: a conv of at least one tap");
     (taps - 1) * dilation + PASS_ROWS
 }
 
@@ -104,6 +114,20 @@ mod tests {
             selecting_bytes(2, 256, 128, 4, 4097),
             4097 * 2304 + 1025 * 256
         );
+    }
+
+    /// A conv of no tap has no reach: both ring sizes refuse it by name
+    /// rather than wrap to a ring of `usize::MAX` rows.
+    #[test]
+    #[should_panic(expected = "conv_ring_rows: a conv of at least one tap")]
+    fn a_conv_of_no_tap_is_refused() {
+        let _ = conv_ring_rows(std::hint::black_box(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "ple_ring_rows: a conv of at least one tap")]
+    fn a_ple_conv_of_no_tap_is_refused() {
+        let _ = ple_ring_rows(std::hint::black_box(0), 3);
     }
 
     /// The pooled plane counts a partial last pool whole and nothing past it.

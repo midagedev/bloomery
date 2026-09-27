@@ -30,8 +30,8 @@ use crate::placement::{
     Violation,
 };
 
-use runtime::stores::{F16_BYTES, kv_row_bytes, ple_ring_bytes, recurrent_bytes};
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
+use runtime::stores::{kv_row_bytes, ple_ring_bytes, recurrent_bytes, selecting_bytes};
 
 /// The positions the selector's kernels take: the QSA passes take the
 /// context as a `u32` launch argument and the selected flash reads `u32`
@@ -162,9 +162,10 @@ pub fn machine(card: CardSpec, layers: usize) -> Machine {
 ///   file;
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
-/// - an attention layer: a position's K and V (`2 · kv_heads · head_dim` f16)
-///   and its raw indexer key (`idx_dim` f16), and a pooled key (`idx_dim`
-///   f16) per pool of `ratio` positions, the last pool counted whole.
+/// - an attention layer: a position's K and V (`2 · kv_heads · head_dim` f16);
+///   with the selector, also its raw indexer key (`idx_dim` f16) and a
+///   pooled key (`idx_dim` f16) per pool of `ratio` positions, the last pool
+///   counted whole (`runtime::stores::selecting_bytes`).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per layer: its kind.
@@ -173,12 +174,12 @@ pub struct KvLayout {
     recurrent: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
-    /// An attention layer's bytes a position.
-    row: u64,
-    /// A pooled key's bytes (none on a qwen35moe file).
-    pooled: Option<u64>,
-    /// Per layer: its pool ratio (0 on a GDN layer or without a selector).
-    ratios: Vec<u64>,
+    /// An attention layer's K and V heads and their width.
+    kv_heads: usize,
+    head_dim: usize,
+    /// The selector's key width and each layer's pool (0 on a GDN layer);
+    /// `None` on a qwen35moe file.
+    select: Option<(usize, Vec<usize>)>,
 }
 
 impl KvLayout {
@@ -186,7 +187,6 @@ impl KvLayout {
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
         let exp = hp.exp.as_ref();
-        let raw_key = exp.map_or(0, |e| e.idx_dim as u64 * F16_BYTES);
         KvLayout {
             kinds: hp.kinds.clone(),
             recurrent: recurrent_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv),
@@ -196,11 +196,9 @@ impl KvLayout {
                     ple_ring_bytes(p.conv, p.ngram, streams(hp), hp.n_embd),
                 )
             }),
-            row: kv_row_bytes(hp.n_head_kv, hp.head_dim) + raw_key,
-            pooled: exp.map(|e| e.idx_dim as u64 * F16_BYTES),
-            ratios: (0..hp.n_layer)
-                .map(|l| exp.map_or(0, |e| e.ratios[l] as u64))
-                .collect(),
+            kv_heads: hp.n_head_kv,
+            head_dim: hp.head_dim,
+            select: exp.map(|e| (e.idx_dim, e.ratios.clone())),
         }
     }
 }
@@ -218,13 +216,16 @@ impl KvBytes for KvLayout {
         };
         let own = match self.kinds.get(layer) {
             Some(Kind::DeltaRule) => self.recurrent,
-            Some(Kind::Attention) => {
-                let pooled = match (self.pooled, self.ratios.get(layer)) {
-                    (Some(bytes), Some(&ratio)) if ratio > 0 => ctx_max.div_ceil(ratio) * bytes,
-                    _ => 0,
-                };
-                ctx_max * self.row + pooled
-            }
+            Some(Kind::Attention) => match &self.select {
+                Some((idx_dim, pools)) => {
+                    let pool = pools.get(layer).copied().filter(|&p| p > 0).expect(
+                        "KvLayout: an attention layer's pool (Hparams::read refuses 0 there)",
+                    );
+                    let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
+                    selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
+                }
+                None => ctx_max * kv_row_bytes(self.kv_heads, self.head_dim),
+            },
             None => 0,
         };
         own + ple
@@ -233,30 +234,21 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Kind, KvBytes, KvLayout, conv_ring_rows, kv_row_bytes, ple_ring_bytes, ple_ring_rows,
-        recurrent_bytes,
-    };
+    use super::{Kind, KvBytes, KvLayout, ple_ring_bytes, recurrent_bytes};
 
-    /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32 and
-    /// eleven conv rows of 10,240 f32 channels; the PLE ring 17 rows of four
-    /// 2,560-value streams in f32 (the card's `ple::ring_len(4)` values); an
-    /// attention position 2 × 2 × 256 f16 of K and V and a 128-value raw
-    /// indexer key, and a 128-value pooled key per four positions.
+    /// Qwen3.8's layers by kind (the sizes themselves are
+    /// `runtime::stores`'s, pinned there): a GDN layer's state and conv ring,
+    /// the PLE ring beside it on its layer, an attention layer's K/V, raw and
+    /// pooled keys at a context of whole pools and one past.
     #[test]
     fn qwen38_layer_bytes() {
-        assert_eq!(conv_ring_rows(4), 11);
-        assert_eq!(ple_ring_rows(4, 3), 17);
-        assert_eq!(recurrent_bytes(48, 16, 128, 4), 3_145_728 + 11 * 10_240 * 4);
-        assert_eq!(ple_ring_bytes(4, 3, 4, 2560), 17 * 10_240 * 4);
-        assert_eq!(kv_row_bytes(2, 256), 2048);
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
             recurrent: recurrent_bytes(48, 16, 128, 4),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
-            row: kv_row_bytes(2, 256) + 256,
-            pooled: Some(256),
-            ratios: vec![0, 0, 4],
+            kv_heads: 2,
+            head_dim: 256,
+            select: Some((128, vec![0, 0, 4])),
         };
         assert_eq!(kv.layer_bytes(0, 4096), 3_596_288);
         assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 696_320);

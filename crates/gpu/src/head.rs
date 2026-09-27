@@ -18,7 +18,9 @@
 //! [`HeadNorm::Rms`] normalizes by `output_norm.weight` first,
 //! [`HeadNorm::Mixed`] projects its input as it stands — a body whose own
 //! last launch is the final norm (a hyper-connection head's mix) writes the
-//! normed rows into the input, and the file carries no `output_norm`.
+//! normed rows into the input. Its file carries no `output_norm`: the plan
+//! refuses a qwen4exp file that does by name (the tensor has no role there,
+//! `model::arch::qwen35moe::roles`), and a Mixed head reads none.
 //!
 //! The argmax also carries the card's fault (crate::fault) out: the readback
 //! buffer holds the `m` tokens, then the first-layer word and that layer's
@@ -115,23 +117,29 @@ pub enum HeadNorm {
     Mixed,
 }
 
-/// Enqueue the final norm `norm` names over `m` rows of `hidden` in `x`
-/// and return the rows the projection reads: `normed`, or `x` itself.
+/// A head's final norm with what it writes: the normed rows under
+/// [`HeadNorm::Rms`], nothing under [`HeadNorm::Mixed`].
+enum Final {
+    Rms { normed: DeviceBuffer<f32> },
+    Mixed,
+}
+
+/// Enqueue the final norm `fin` names over `m` rows of `hidden` in `x`
+/// and return the rows the projection reads: its normed rows, or `x` itself.
 fn norm_rows<'a>(
     gpu: &Gpu,
     w: &Weights,
-    norm: HeadNorm,
+    fin: &'a mut Final,
     (eps, hidden, m): (f32, usize, usize),
     x: &'a DeviceBuffer<f32>,
-    normed: &'a mut DeviceBuffer<f32>,
 ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
-    match norm {
-        HeadNorm::Rms => {
+    match fin {
+        Final::Rms { normed } => {
             gpu.elem()
                 .enqueue_rms_norm(gpu.stream(), x, head_gain(w)?, eps, hidden, m, normed)?;
             Ok(normed)
         }
-        HeadNorm::Mixed => Ok(x),
+        Final::Mixed => Ok(x),
     }
 }
 
@@ -141,7 +149,7 @@ fn norm_rows<'a>(
 /// buffer is allocated at construction and `enqueue` touches addresses only,
 /// so a graph that captures it serves every input written into `x`.
 pub struct Head {
-    norm: HeadNorm,
+    fin: Final,
     eps: f32,
     hidden: usize,
     n_vocab: usize,
@@ -149,7 +157,6 @@ pub struct Head {
     /// The chain's input — the last block's output vector. The assembly round
     /// writes here through `input_mut`; the gate through `set_input`.
     x: DeviceBuffer<f32>,
-    normed: DeviceBuffer<f32>,
     act: Q8Act,
     logits: DeviceBuffer<f32>,
     /// The `m` argmax tokens, then the fault's first-layer word and that
@@ -185,9 +192,10 @@ impl Head {
         m: usize,
         norm: HeadNorm,
     ) -> Result<Head, GpuError> {
+        const WHAT: &str = "Head::with_norm";
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(
-                "Head::with_m",
+                WHAT,
                 format!("need 1 <= m <= 8, got m={m}"),
             ));
         }
@@ -199,7 +207,7 @@ impl Head {
         };
         if k != hidden {
             return Err(GpuError::shape(
-                "Head::new",
+                WHAT,
                 format!(
                     "output.weight rows are {k} values wide, the norm \
                  gain is {hidden}"
@@ -208,16 +216,22 @@ impl Head {
         }
         let n_vocab = out_w.rows();
         if n_vocab == 0 {
-            return Err(GpuError::shape("Head::new", "output.weight has no rows"));
+            return Err(GpuError::shape(WHAT, "output.weight has no rows"));
         }
+        let x = DeviceBuffer::zeroed(stream, m * hidden)?;
+        let fin = match norm {
+            HeadNorm::Rms => Final::Rms {
+                normed: DeviceBuffer::zeroed(stream, m * hidden)?,
+            },
+            HeadNorm::Mixed => Final::Mixed,
+        };
         Ok(Head {
-            norm,
+            fin,
             eps,
             hidden,
             n_vocab,
             m,
-            x: DeviceBuffer::zeroed(stream, m * hidden)?,
-            normed: DeviceBuffer::zeroed(stream, m * hidden)?,
+            x,
             act: Q8Act::with_k(stream, m, hidden)?,
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
@@ -242,8 +256,12 @@ impl Head {
     /// Device bytes of the scratch (the weights are counted by their owner).
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
+        let normed = match &self.fin {
+            Final::Rms { normed } => normed.num_bytes(),
+            Final::Mixed => 0,
+        };
         self.x.num_bytes()
-            + self.normed.num_bytes()
+            + normed
             + self.logits.num_bytes()
             + self.token_out.num_bytes()
             + self.act.q3.num_bytes()
@@ -262,7 +280,7 @@ impl Head {
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
-        let rows = norm_rows(gpu, w, self.norm, shape, &self.x, &mut self.normed)?;
+        let rows = norm_rows(gpu, w, &mut self.fin, shape, &self.x)?;
         match head_out_w(w)?.0 {
             OutW::Q6K(out_w) => {
                 gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
@@ -321,7 +339,7 @@ impl Head {
         ) -> Result<(), GpuError>,
     {
         let shape = (self.eps, self.hidden, self.m);
-        let rows = norm_rows(gpu, w, self.norm, shape, &self.x, &mut self.normed)?;
+        let rows = norm_rows(gpu, w, &mut self.fin, shape, &self.x)?;
         gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
         tail(
             &self.act,
@@ -361,9 +379,9 @@ impl Head {
     /// [`HeadNorm::Mixed`] the input, `result_embd`). Blocking read;
     /// gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
-        let rows = match self.norm {
-            HeadNorm::Rms => &self.normed,
-            HeadNorm::Mixed => &self.x,
+        let rows = match &self.fin {
+            Final::Rms { normed } => normed,
+            Final::Mixed => &self.x,
         };
         Ok(rows.to_host_vec(gpu.stream())?)
     }
