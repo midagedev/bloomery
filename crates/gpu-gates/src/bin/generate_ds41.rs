@@ -3,7 +3,10 @@
 //!
 //!     generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N]
 //!                   [--ctx C] [--place a|gate] [--mode eager|graph]
-//!                   [--time [--warm W]] [--plan]
+//!                   [--time [--warm W]] [--plan] [--logits]
+//!     generate_ds41 --arm SPEC [--arm SPEC ...] [--arm-sync] [-n N] [--ctx C]
+//!                   [--place a|gate] [--mode eager|graph] [--time [--warm W]]
+//!                   [--logits]
 //!     generate_ds41 --records-schema
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
@@ -78,7 +81,8 @@
 //! of them the batch-wide attention projections' `proj_bytes=` and what the
 //! batches past a group's first hold for themselves, `group_bytes=`, for
 //! groups of `group=` batches) before the prompt and a `stat prefill` line after its `step 0` line: the
-//! host tier's batch services since load (`union_layers`, `union_cols`,
+//! host tier's batch services since the arm's start — the load, in a run of one arm
+//! (`union_layers`, `union_cols`,
 //! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
 //! the feed the card waits on the host; a runtime value, as `time prompt` is.
 //! A `stat prefill split` line follows (`body::PrefillStats`): the group
@@ -133,6 +137,29 @@
 //! The run drives the V4.1 session (`app::Session`, `runtime::generate`):
 //! the fed ids through its prompt, then one pass at a time until `-n`
 //! tokens are out.
+//!
+//! `--arm SPEC` runs several arms after one load (`app::Session::arms`), in
+//! the order given: `D` feeds `lcg_prompt D` as `--depth D` does, `prose:P`
+//! and `code:P` the first P ids of `$BLOOMERY_DATA/engram/corpus-<name>.ids`
+//! as `--tokens` does, each optionally followed by `/N`, its own `-n`. Each
+//! arm opens with an `arm` record (its index, the list's length, the feed and
+//! its counts), then its call's plan under a batched feed, then every line a
+//! one-arm run prints after its capture; each arm after the first starts
+//! from the session's clear, so it prints the tokens, logits and counters it
+//! prints in a fresh process. The since-load counters (`stat prefill`'s
+//! `union_*`) count from the arm's start. The load-time lines (`plan`,
+//! `load`, `capture`, `prefill`) print once, before arm 0. `--arm` does not
+//! mix with `--prompt-id`, `--tokens`, `--depth` or `--plan`, and a list of
+//! more than one arm is refused beside `BLOOMERY_DRAFT` (a draft's state has
+//! no clear) and `BLOOMERY_CHECK_FINITE`. `--arm-sync` makes each arm wait,
+//! after its `arm` record, for one line on stdin: the timing runner takes its
+//! witness blocks between two arms of one load there. A failed arm ends the
+//! process, naming the arm; the model is never cleared past a fault.
+//!
+//! `--logits` prints a `logits` record after the loop: the head's last
+//! logits row read back once, its length, argmax and FNV-1a 64 of its f32
+//! bits — the bit-identity check's handle on the logits, outside every timed
+//! window.
 //!
 //! `BLOOMERY_DRAFT=lookup` serves an n-gram lookup draft (`runtime::Lookup`,
 //! fed the fed ids and every kept token) through the skewed two-row pass. A
@@ -234,9 +261,11 @@ mod drive {
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
                          [-n N] [--ctx C] [--place a|gate] [--mode eager|graph] \
-                         [--time [--warm W]] [--plan]";
+                         [--time [--warm W]] [--plan] [--logits], or --arm SPEC [--arm SPEC ...] \
+                         [--arm-sync] in place of the prompt flags";
 
     /// Where the prompt comes from.
+    #[derive(Clone)]
     enum Prompt {
         /// Row 0, or nothing under `--depth`.
         Default,
@@ -244,6 +273,60 @@ mod drive {
         Ids(Vec<u32>),
     }
 
+    /// The corpora an `--arm` names: `corpus-<name>.ids` under
+    /// `$BLOOMERY_DATA/engram`, one id per line.
+    const CORPORA: &[&str] = &["prose", "code"];
+
+    /// What an `--arm` feeds.
+    #[derive(Clone, Copy)]
+    enum ArmFeed {
+        /// `lcg_prompt D`, as `--depth D`.
+        Lcg(usize),
+        /// The first P ids of a corpus, as `--tokens`.
+        Corpus(&'static str, usize),
+    }
+
+    /// One `--arm SPEC`: its feed and its own `-n`, if it names one.
+    #[derive(Clone, Copy)]
+    struct ArmSpec {
+        feed: ArmFeed,
+        n_gen: Option<usize>,
+    }
+
+    impl ArmSpec {
+        /// `D`, `prose:P` or `code:P`, each optionally followed by `/N`.
+        fn parse(spec: &str) -> Result<ArmSpec, GateError> {
+            let bad = || -> GateError {
+                format!("--arm {spec:?} is D, prose:P or code:P, optionally followed by /N").into()
+            };
+            let (feed, n_gen) = match spec.split_once('/') {
+                Some((f, n)) => (f, Some(n.parse::<usize>().map_err(|_| bad())?)),
+                None => (spec, None),
+            };
+            let feed = match feed.split_once(':') {
+                None => ArmFeed::Lcg(feed.parse().map_err(|_| bad())?),
+                Some((name, p)) => {
+                    let name = CORPORA
+                        .iter()
+                        .copied()
+                        .find(|&c| c == name)
+                        .ok_or_else(bad)?;
+                    ArmFeed::Corpus(name, p.parse().map_err(|_| bad())?)
+                }
+            };
+            Ok(ArmSpec { feed, n_gen })
+        }
+
+        /// The feed's name, as the `arm` record prints it.
+        fn feed_name(self) -> &'static str {
+            match self.feed {
+                ArmFeed::Lcg(_) => "lcg",
+                ArmFeed::Corpus(name, _) => name,
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct Args {
         prompt: Prompt,
         depth: Option<usize>,
@@ -257,6 +340,12 @@ mod drive {
         stats: bool,
         /// `--plan`: print the call's whole plan and load nothing.
         plan: bool,
+        /// `--arm`: the arms, in order; empty for a run of the prompt flags.
+        arms: Vec<ArmSpec>,
+        /// `--arm-sync`: each arm waits for a line on stdin after its record.
+        sync: bool,
+        /// `--logits`: the `logits` record after the loop.
+        logits: bool,
     }
 
     fn parse_args(levers: &Levers) -> Result<Args, GateError> {
@@ -271,6 +360,9 @@ mod drive {
             warm: None,
             stats: levers.step_stats(),
             plan: false,
+            arms: Vec::new(),
+            sync: false,
+            logits: false,
         };
         let (mut row, mut ids) = (None, None);
         let mut it = std::env::args().skip(1);
@@ -281,6 +373,14 @@ mod drive {
             }
             if flag == "--plan" {
                 a.plan = true;
+                continue;
+            }
+            if flag == "--arm-sync" {
+                a.sync = true;
+                continue;
+            }
+            if flag == "--logits" {
+                a.logits = true;
                 continue;
             }
             let v = it
@@ -296,6 +396,7 @@ mod drive {
                     );
                 }
                 "--depth" => a.depth = Some(v.parse()?),
+                "--arm" => a.arms.push(ArmSpec::parse(&v)?),
                 "-n" => a.n_gen = v.parse()?,
                 "--ctx" => a.ctx = v.parse()?,
                 "--warm" => a.warm = Some(v.parse()?),
@@ -320,8 +421,36 @@ mod drive {
             (None, Some(v)) => Prompt::Ids(v),
             (None, None) => Prompt::Default,
         };
+        if !a.arms.is_empty() {
+            let beside = [
+                (
+                    !matches!(a.prompt, Prompt::Default),
+                    "--prompt-id or --tokens",
+                ),
+                (a.depth.is_some(), "--depth"),
+                (a.plan, "--plan"),
+            ];
+            if let Some((_, what)) = beside.iter().find(|(set, _)| *set) {
+                return Err(format!("--arm names the prompt: {what} does not mix with it").into());
+            }
+        } else if a.sync {
+            return Err("--arm-sync paces the arms of an --arm list, and none is given".into());
+        }
         check_counts(&a)?;
+        for arm in &a.arms {
+            check_counts(&a.for_arm(arm))?;
+        }
         Ok(a)
+    }
+
+    impl Args {
+        /// The run's arguments for `arm`: its own `-n` when it names one.
+        fn for_arm(&self, arm: &ArmSpec) -> Args {
+            Args {
+                n_gen: arm.n_gen.unwrap_or(self.n_gen),
+                ..self.clone()
+            }
+        }
     }
 
     /// Refused rather than ignored, as `generate` refuses them: a `--warm`
@@ -416,6 +545,35 @@ mod drive {
         Ok((ids, prompt_len))
     }
 
+    /// An arm's fed ids and how many of them are the prompt's: `--depth D`'s
+    /// for `D`, `--tokens`' for a corpus arm.
+    fn arm_ids(arm: &ArmSpec) -> Result<(Vec<u32>, usize), GateError> {
+        match arm.feed {
+            ArmFeed::Lcg(0) => Err("--arm 0: nothing to feed".into()),
+            ArmFeed::Lcg(d) => Ok((depth_ids(d), 0)),
+            ArmFeed::Corpus(name, p) => {
+                let path = data_dir().join("engram").join(format!("corpus-{name}.ids"));
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("--arm {name}:{p}: {}: {e}", path.display()))?;
+                let all = text
+                    .lines()
+                    .map(|t| t.trim().parse::<u32>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("--arm {name}:{p}: {}: {e}", path.display()))?;
+                if p == 0 || p > all.len() {
+                    return Err(format!(
+                        "--arm {name}:{p}: {} holds {} ids (1..{})",
+                        path.display(),
+                        all.len(),
+                        all.len()
+                    )
+                    .into());
+                }
+                Ok((all[..p].to_vec(), p))
+            }
+        }
+    }
+
     /// The Parsed levers the run acts on besides the pool's two.
     const ACTS_ON: &[&str] = &[
         CED,
@@ -443,12 +601,20 @@ mod drive {
         }
         let pin_main = levers.pin_main();
         let pinned = pin_main && threads::pool().pin_caller();
-        let (ids, prompt_len) = fed_ids(&a)?;
-        let depth = ids.len();
-        // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
-        // take depth .. depth + N − 2.
-        let fed = depth + a.n_gen - 1;
-        if draft != Draft::Off && a.n_gen < 2 {
+        let runs = arm_runs(&a)?;
+        if runs.len() > 1 && (draft != Draft::Off || check_finite) {
+            return Err(format!(
+                "{} arms after one load are refused with {}: its state has no clear",
+                runs.len(),
+                if check_finite {
+                    "BLOOMERY_CHECK_FINITE=1"
+                } else {
+                    "BLOOMERY_DRAFT"
+                }
+            )
+            .into());
+        }
+        if draft != Draft::Off && runs.iter().any(|r| r.a.n_gen < 2) {
             return Err(format!(
                 "BLOOMERY_DRAFT={} with -n 1 has no pass to draft: token 0 comes out of the \
                  prompt's own step",
@@ -456,6 +622,15 @@ mod drive {
             )
             .into());
         }
+        // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
+        // take depth .. depth + N − 2. The plan is checked against the arm
+        // that steps the most positions.
+        let widest = runs
+            .iter()
+            .max_by_key(|r| r.ids.len() + r.a.n_gen)
+            .ok_or("generate_ds41: no arm to run")?;
+        let (depth, fed_n) = (widest.ids.len(), widest.a.n_gen);
+        let fed = depth + fed_n - 1;
         let draft_file = match draft {
             Draft::Dspark => Some(dspark::draft_hparams()?),
             _ => None,
@@ -489,10 +664,12 @@ mod drive {
             check_finite,
             depth,
             fed,
+            fed_n,
             t,
             pin_main,
             pinned,
             hp: None,
+            ctx_max: 0,
             call: None,
         };
         let Some(mut loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
@@ -547,27 +724,52 @@ mod drive {
             None
         };
         let call = log.call.take();
-        let fed = Fed {
-            ids: &ids,
-            prompt_len,
-            mode: feed_mode,
-            need: call.as_ref().map(|c| &c.need),
+        let pre = Prelude {
+            cfg: &cfg,
+            hp: &hp,
+            ctx_max: log.ctx_max,
+            call: batched && draft != Draft::Dspark,
+            sync: a.sync,
+            arms: runs.len(),
         };
+        if draft == Draft::Off && !check_finite {
+            return s
+                .arms(&runs, |s, i, r| {
+                    let view = pre.arm(i, r)?;
+                    let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), s)?;
+                    decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {})
+                })
+                .map_err(|f| Box::new(f) as GateError);
+        }
+        // One arm: the pair pass's capture comes before its prelude, so no
+        // arm's window holds it.
+        let [r] = runs.as_slice() else {
+            return Err("generate_ds41: a draft or the finite probe runs one arm".into());
+        };
+        let a = &r.a;
         match (draft, spark, check.as_mut()) {
-            (Draft::Off, _, None) => decode(&mut s, &a, &fed, &mut runtime::Plain, "steps", |_| {}),
+            (Draft::Off, _, None) => {
+                Err("generate_ds41: the plain run goes through the arm list".into())
+            }
             (Draft::Off, _, Some(c)) => {
+                let view = pre.arm(0, r)?;
+                let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let mut checked = Checked { c };
-                decode(&mut s, &a, &fed, &mut checked, "checked", |k| {
+                decode(&mut s, a, &fed, &mut checked, "checked", |k| {
                     print_finite(k.c, fed.ids.len());
                 })
             }
             (Draft::Lookup, ..) => {
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(Lookup::new(), &mut log)?;
-                decode_draft(&mut s, &a, &fed, &mut spec, "steps", "lookup", |_| Ok(()))
+                let view = pre.arm(0, r)?;
+                let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
+                decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()))
             }
             (Draft::Dspark, Some(d), _) => {
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(d, &mut log)?;
-                decode_draft(&mut s, &a, &fed, &mut spec, "dspark", "dspark", |d| {
+                let view = pre.arm(0, r)?;
+                let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
+                decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
                     Ok(d.draft_mut().check_fault()?)
                 })
             }
@@ -575,14 +777,120 @@ mod drive {
         }
     }
 
+    /// One arm of the run: its arguments (its own `-n`), its fed ids, how
+    /// many of them are the prompt's, and the `--arm` it came from (none for
+    /// a run of the prompt flags).
+    struct ArmRun {
+        a: Args,
+        ids: Vec<u32>,
+        prompt_len: usize,
+        spec: Option<ArmSpec>,
+    }
+
+    /// The run's arms: the `--arm` list, or the one arm the prompt flags
+    /// name.
+    fn arm_runs(a: &Args) -> Result<Vec<ArmRun>, GateError> {
+        if a.arms.is_empty() {
+            let (ids, prompt_len) = fed_ids(a)?;
+            return Ok(vec![ArmRun {
+                a: a.clone(),
+                ids,
+                prompt_len,
+                spec: None,
+            }]);
+        }
+        a.arms
+            .iter()
+            .map(|arm| {
+                let (ids, prompt_len) = arm_ids(arm)?;
+                Ok(ArmRun {
+                    a: a.for_arm(arm),
+                    ids,
+                    prompt_len,
+                    spec: Some(*arm),
+                })
+            })
+            .collect()
+    }
+
+    impl ArmRun {
+        /// The arm's feed under `mode`, with the needs of its call's printed
+        /// plan, and the host tier's counters at its start: the zero its
+        /// since-load counters are read from.
+        fn fed<'a>(
+            &'a self,
+            mode: body::PrefillMode,
+            call: Option<&'a CallView>,
+            s: &Session<Body>,
+        ) -> Result<Fed<'a>, GateError> {
+            Ok(Fed {
+                ids: &self.ids,
+                prompt_len: self.prompt_len,
+                mode,
+                need: call.map(|c| &c.need),
+                base: s.model().body("generate_ds41")?.hybrid().stats(),
+            })
+        }
+    }
+
+    /// What each `--arm` prints before it runs: the `arm` record, and under
+    /// a batched feed (`call`) its call's plan; under `sync`, a line read
+    /// from stdin after the record.
+    struct Prelude<'a> {
+        cfg: &'a body::OpenCfg,
+        hp: &'a Hparams,
+        /// The plan's `ctx_max`: the call's plan is the one the caches hold.
+        ctx_max: usize,
+        call: bool,
+        sync: bool,
+        arms: usize,
+    }
+
+    impl Prelude<'_> {
+        /// Arm `i`'s records and its pacing; its call's plan, which a run of
+        /// the prompt flags printed before the load instead.
+        fn arm(&self, i: usize, r: &ArmRun) -> Result<Option<CallView>, GateError> {
+            let Some(spec) = r.spec else {
+                return Ok(None);
+            };
+            Record::new(&record::ARM)
+                .u("i", i)
+                .u("arms", self.arms)
+                .w("feed", spec.feed_name())
+                .u("ids", r.ids.len())
+                .u("n", r.a.n_gen)
+                .print();
+            if self.sync {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line)? == 0 {
+                    return Err(format!(
+                        "--arm-sync: stdin closed before arm {i} of {}",
+                        self.arms
+                    )
+                    .into());
+                }
+            }
+            let view = self
+                .call
+                .then(|| CallView::of(self.cfg, self.hp, self.ctx_max, r.ids.len()));
+            if let Some(c) = &view {
+                c.print(false, self.hp, &[]);
+            }
+            Ok(view)
+        }
+    }
+
     /// What a run feeds before its first generated token: the ids, how many
-    /// of them are the prompt's, the feed's mode, and on a planned batched
-    /// feed the needs its printed plan gives the call.
+    /// of them are the prompt's, the feed's mode, on a planned batched feed
+    /// the needs its printed plan gives the call, and the host tier's
+    /// counters the arm starts from.
     struct Fed<'a> {
         ids: &'a [u32],
         prompt_len: usize,
         mode: body::PrefillMode,
         need: Option<&'a body::Need>,
+        /// The host tier's counters at the arm's start.
+        base: HybridStats,
     }
 
     /// `--plan` prints a batched call's plan and runs nothing: refused with
@@ -966,17 +1274,21 @@ mod drive {
         draft: Draft,
         batched: bool,
         check_finite: bool,
-        /// The fed ids.
+        /// The fed ids of the arm that steps the most positions.
         depth: usize,
-        /// The positions the run steps: the fed ids and the N − 1 feedback
+        /// The positions that arm steps: its fed ids and its N − 1 feedback
         /// steps.
         fed: usize,
+        /// That arm's `-n`.
+        fed_n: usize,
         /// Before the file was opened: the `load` line's `load_s`.
         t: Instant,
         pin_main: bool,
         pinned: bool,
         /// The hyperparameters the plan was made from.
         hp: Option<Hparams>,
+        /// The plan's `ctx_max`, once planned.
+        ctx_max: usize,
         call: Option<CallView>,
     }
 
@@ -1003,7 +1315,7 @@ mod drive {
                 return Err(SessionError::Refused(format!(
                     "depth {depth} + {} fed tokens exceed the plan's ctx_max {ctx_max} \
                      (--ctx {})",
-                    a.n_gen - 1,
+                    self.fed_n - 1,
                     a.ctx
                 )));
             }
@@ -1012,18 +1324,20 @@ mod drive {
                     "BLOOMERY_DRAFT={}: depth {depth} + {} fed tokens and the last pair's \
                      overshoot exceed the plan's ctx_max {ctx_max} (--ctx {})",
                     self.draft.name(),
-                    a.n_gen - 1,
+                    self.fed_n - 1,
                     a.ctx
                 )));
             }
             // The DSpark feed's taps widen the tapped layers' blocks: its call
-            // is not the plain call's plan.
-            let call = (self.batched && self.draft != Draft::Dspark)
+            // is not the plain call's plan. An `--arm` list prints each arm's
+            // call before it runs.
+            let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty())
                 .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, depth));
             if let Some(c) = &call {
                 c.print(a.plan, &inputs.hp, &plan.n_l);
             }
             self.hp = Some(inputs.hp.clone());
+            self.ctx_max = ctx_max;
             self.call = call;
             Ok(!a.plan)
         }
@@ -1113,19 +1427,22 @@ mod drive {
         }
     }
 
-    /// The host tier's batch services since load, one line: the layers
-    /// served, the columns and host slots they carried, and the union calls'
+    /// The host tier's batch services since `base`, the arm's start, one
+    /// line: the layers served, the columns and host slots they carried, and the union calls'
     /// wall — the part of a batched feed the card waits on the host; then
     /// the last call's needs and its split.
-    fn print_union(m: &mut Deepseek41Model) -> Result<(), GateError> {
+    fn print_union(m: &mut Deepseek41Model, base: &HybridStats) -> Result<(), GateError> {
         let stats = m.body_parts("generate_ds41")?.2.take_prefill_stats();
         let b = m.body("generate_ds41")?;
         let s = b.hybrid().stats();
         Record::new(&record::STAT_PREFILL)
-            .u("union_layers", s.batch_served)
-            .u("union_cols", s.batch_cols)
-            .u("union_host_slots", s.batch_host_slots)
-            .f("union_ms", s.batch_ns as f64 / 1e6)
+            .u("union_layers", s.batch_served - base.batch_served)
+            .u("union_cols", s.batch_cols - base.batch_cols)
+            .u(
+                "union_host_slots",
+                s.batch_host_slots - base.batch_host_slots,
+            )
+            .f("union_ms", (s.batch_ns - base.batch_ns) as f64 / 1e6)
             .print();
         if let Some(need) = b.prefill_need() {
             let (block, part) = need.counts();
@@ -1255,7 +1572,7 @@ mod drive {
         print_step0(s.pos() - 1, next, depth, wall);
         if batch {
             check_plan(s.model(), f.need)?;
-            print_union(s.model_mut())?;
+            print_union(s.model_mut(), &f.base)?;
         }
         let time = FeedTime {
             n: depth,
@@ -1362,6 +1679,9 @@ mod drive {
         Record::new(&record::TOKENS)
             .list("tokens", &out.tokens)
             .print();
+        if a.logits {
+            print_logits(s.model())?;
+        }
         if a.stats {
             print_counts(s.model())?;
             print_stats(&sink.probes, warm);
@@ -1375,6 +1695,28 @@ mod drive {
             let mean = counted.iter().sum::<f64>() / counted.len() as f64;
             smoke(a, f.prompt_len, depth, warm, counted.len(), p50, mean).print();
         }
+        Ok(())
+    }
+
+    /// The `logits` record: the head's last logits row, its length, argmax
+    /// and FNV-1a 64 of its f32 bits in order.
+    fn print_logits(m: &Deepseek41Model) -> Result<(), GateError> {
+        let row = m.logits()?;
+        let argmax = row
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
+            .map_or(0, |(i, _)| i);
+        let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+            v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        });
+        Record::new(&record::LOGITS)
+            .u("n", row.len())
+            .u("argmax", argmax)
+            .w("fnv64", format!("{fnv:016x}"))
+            .print();
         Ok(())
     }
 
@@ -1529,6 +1871,9 @@ mod drive {
         }
         feed_time.print();
         print_draft_rows(a, first, &sink.emitted, &passes);
+        if a.logits {
+            print_logits(s.model())?;
+        }
         if a.stats {
             print_counts(s.model())?;
             print_stats(&sink.probes, warm);

@@ -715,6 +715,32 @@ pub static FED: Kind = Kind {
     ],
 };
 
+/// One arm of an `--arm` list.
+pub static ARM: Kind = Kind {
+    name: "arm",
+    head: "arm",
+    doc: "An arm of one load's --arm list, before its lines: its index, the list's length, its feed (lcg or a corpus), its fed ids and its generated count.",
+    parts: &[
+        key("i", U64, ""),
+        key("arms", U64, ""),
+        key("feed", Word, ""),
+        key("ids", U64, "positions"),
+        key("n", U64, "tokens"),
+    ],
+};
+
+/// The head's last logits row, by its bits.
+pub static LOGITS: Kind = Kind {
+    name: "logits",
+    head: "logits",
+    doc: "--logits: the head's last logits row after the loop, its length, argmax and FNV-1a 64 of its f32 bits.",
+    parts: &[
+        key("n", U64, ""),
+        key("argmax", U64, ""),
+        key("fnv64", Word, ""),
+    ],
+};
+
 /// Generated token 0.
 pub static STEP0: Kind = Kind {
     name: "step0",
@@ -1086,6 +1112,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &CAPTURE_PAIR,
     &PREFILL_BYTES,
     &CHECK_FINITE,
+    &ARM,
     &FED,
     &STEP0,
     &STAT_PREFILL,
@@ -1098,6 +1125,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &TIME_STEP,
     &TIME_PASS,
     &TOKENS,
+    &LOGITS,
     &STAT_STEP,
     &STAT_SUMMARY,
     &STAT_FINITE_STEP,

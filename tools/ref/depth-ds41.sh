@@ -188,13 +188,31 @@
 # `FAIL r<r> <label> d=<D>|p=<P> rc=<rc> | <why or its last line> | full output: <file>` where its
 # row would be, and the runner goes on with the next arm. That label at that depth or P drops out of
 # the means and the ratios (the tables name what they dropped), and the runner ends with `failed arms:
-# …` and exits 1. A warm-up that fails is `FAIL r0 …` and counts in that list.
+# …` and exits 1. A warm-up that fails is `FAIL r0 …` and counts in that list. An arm that fails in a
+# load shared with other arms ends that process: the arms after it in the round re-run in a fresh load
+# (Loads below), never on the failed one.
+#
+# Loads. A round's ours and corpus arms that share a load key — this binary, --place and the arm's
+# NAME=VALUE list, every variable of which the binary consumes at its load — run in one process:
+# generate_ds41 --arm <D|prose:P|code:P> ... --arm-sync, the engine cleared between two arms
+# (app::Session::clear, bit for bit a fresh process's state). The binary waits after each arm's `arm`
+# line, so the guards and witness blocks stand before and after every arm as before; the row's wall,
+# majflt (from the go) and timed majflt (from its fed line) are the arm's own, and the row carries
+# `slot <k>/<n>`, its place in its load. The load's own lines print once, under `[load]`. The grouping,
+# the order (units and the arms inside each rotated by round) and the process driver are
+# tools/ref/load-groups.sh's, shared with depth-qwen3moe.sh. BLOOMERY_AB_LOAD=arm runs every arm in a
+# process of its own, and an arm's own `@BLOOMERY_AB_LOAD=arm` runs that arm alone (its label keeps
+# it: `prose:512 512 prose:512@BLOOMERY_AB_LOAD=arm` is the A/A of the clear, the fresh process against
+# the in-load arm). A BLOOMERY_DRAFT or BLOOMERY_CHECK_FINITE arm always runs alone (a draft's state has
+# no clear), and a bin: arm is its own process with the one-arm command line. The warm-up and the
+# blocks' discards are one arm in a process of its own.
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE and
 # BLOOMERY_PREHEAT (above), BLOOMERY_ARM_BOUND (seconds one arm, or one preheat, may run, default
-# 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease), BLOOMERY_AB_WARMUP
-# and BLOOMERY_AB_ORDER (below), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree
+# 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a shared load's
+# process has that bound per arm and one more for its load, and one that prints nothing for that long
+# is killed), BLOOMERY_AB_LOAD (Loads above), BLOOMERY_AB_WARMUP and BLOOMERY_AB_ORDER (below), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree
 # lines, the preheat plan, the CPU guard's settings and reading, the warm-up or the blocks' discards,
 # and the order of every round, then exit 0 before the lease: nothing is loaded and nothing is timed).
 #
@@ -264,6 +282,8 @@ set -uo pipefail
 # An ours arm's output is read by tools/bloomery/records.py, which owns the record kinds
 # crates/gpu-gates/src/record.rs declares; the runner names kinds and fields, never a column.
 RECORDS="${BASH_SOURCE[0]%/*}/../bloomery/records.py"
+# An arm's place in its load, ` | slot <k>/<n>` on its row (ours_post; empty for a one-arm command line).
+SLOT_COL=
 # ours_parse: an ours or bin arm's output on stdin, into what its row reads: the SMOKE footer's p50,
 # mean, warm and placement (P50 empty without a footer) with its depth and generated count, the `time
 # step`/`time pass` walls in order (SERIES), the draft summary (D_*), the generated tokens past token
@@ -324,7 +344,7 @@ ours_row() {
     cold_check "${MAJ_TIMED:-$MAJ_WHOLE}" "$win"
     MAJ_COL=" | majflt $MAJ_WHOLE (timed ${MAJ_TIMED:-? (no fed line)}; ≤ $MAJ_BOUND % of W ${win} s)"
   fi
-  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
+  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
 # The cold tag's constants (the header's Cold tag): microseconds one serial engram fault costs
 # [measured, rig-log 2026-09-23], and the percent of a row's timed window at which the faults' price
@@ -488,6 +508,21 @@ for a in "${ARMS[@]}"; do
     fi
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok")
+done
+# The load keys (the header's Loads): an ours or corpus arm's binary, placement and variables, the solo
+# marker left out; `|solo` on an arm that runs alone. A reference or bin: arm has none.
+# shellcheck source=tools/ref/load-groups.sh
+source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
+for i in "${!ARMS[@]}"; do
+  case ${A_KIND[$i]} in
+    ours | corpus)
+      LG_KEY[i]="$BIN|place=$PLACE|$(lg_env_key "$(lg_strip_solo "${A_ENV[$i]}")")"
+      if lg_is_solo "${A_ENV[$i]}" || [[ ,${A_ENV[$i]}, =~ ,BLOOMERY_(DRAFT|CHECK_FINITE)= ]]; then
+        LG_KEY[i]+='|solo'
+      fi
+      ;;
+    *) LG_KEY[i]= ;;
+  esac
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
 # shellcheck source=tools/ref/timing-card.sh
@@ -749,13 +784,6 @@ block_line() {
   for i in ${BLK_ARMS[$1]}; do arms="${arms:+$arms }${ARMS[$i]}"; done
   echo "$(($1 + 1))/${#BLK_KEY[@]} ${BLK_KEY[$1]}: $arms; discard ${ARMS[${BLK_DISC[$1]}]}${BLK_K[$1]:+ at --n-cpu-moe ${BLK_K[$1]}}, ${BLK_WHY[$1]}"
 }
-# block_round <b> <round>: the block's arm indices in that round's order, rotated by round - 1 slots.
-block_round() {
-  local -a idx
-  local i
-  read -r -a idx <<< "${BLK_ARMS[$1]}"
-  for i in "${!idx[@]}"; do printf '%s ' "${idx[$(((i + $2 - 1) % ${#idx[@]}))]}"; done
-}
 # preheat_off: why the preheat is off, for the dry run and the [config] line.
 preheat_off() {
   if [ "$ik$lcpp" = 00 ]; then
@@ -906,8 +934,10 @@ count_row() {
 # (BLOOMERY_DRAFT=dspark) the other card's visibility and the draft file (timing-card.sh dspark_env).
 # The dry run prints the same list.
 arm_envs() {
+  local envs
   ARM_ENVS=()
-  [ -z "${A_ENV[$1]}" ] || IFS=, read -r -a ARM_ENVS <<< "${A_ENV[$1]}"
+  envs=$(lg_strip_solo "${A_ENV[$1]}")
+  [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
   if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
     local -a extra=()
     mapfile -t extra < <(dspark_env)
@@ -919,21 +949,21 @@ arm_envs() {
 arm_feed() {
   if [ "${A_KIND[$1]}" = corpus ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "${A_DEP[$1]}"); fi
 }
-# One arm of a generate_ds41 at --place PLACE: ours (our binary, with the arm's variables when it has
-# any), a corpus arm, or a second binary. The row and the sum under the arm's label, or a FAIL row.
-# The output passes through majflt_mark on its way into `out`, so the fault count at the prompt timer's
-# start is known: MAJ_WHOLE over the process, MAJ_TIMED from the fed line on.
+# One arm of a generate_ds41 at --place PLACE in a process of its own, with the one-arm command line:
+# a bin: arm (a second binary, which may know no --arm). The row and the sum under the arm's label, or
+# a FAIL row (ours_post). The output passes through majflt_mark on its way into `out`, so the fault
+# count at the prompt timer's start is known: MAJ_WHOLE over the process, MAJ_TIMED from the fed line on.
 # ours_arm <index> <round>
 ours_arm() {
-  local i=$1 r=$2 dep label bin out rc t0 t1 f0 f1 fedf fed tags
+  local i=$1 r=$2 dep bin out rc t0 t1 f0 f1 fedf fed
   local -a envs=() feed=()
-  dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
+  dep=${A_DEP[$i]} bin=${A_BIN[$i]}
   arm_envs "$i"
   envs=("${ARM_ENVS[@]}")
   arm_feed "$i"
   feed=("${ARM_FEED[@]}")
   fedf=$(mktemp "${TMPDIR:-/tmp}/depth-ds41-fed.XXXXXX") || exit 2
-  witness "pre r$r $label d=$dep n=$N"
+  ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
   if [ ${#envs[@]} -eq 0 ]; then
@@ -948,13 +978,26 @@ ours_arm() {
   rm -f "$fedf"
   MAJ_WHOLE=$((f1 - f0)) MAJ_TIMED=
   [ -z "$fed" ] || MAJ_TIMED=$((f1 - fed))
+  ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
+}
+# ours_pre <index> <round>: the witness block before a generate_ds41 arm.
+ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
+# ours_post <index> <round> <rc> <output> <wall s>: the witness block after a generate_ds41 arm, then its
+# row and sums, or its FAIL row; MAJ_WHOLE and MAJ_TIMED are the arm's. An output that opens with an
+# `arm` record (an --arm list's) gives the row its slot in the load.
+ours_post() {
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a
+  dep=${A_DEP[$i]} label=${A_LABEL[$i]}
   witness "post r$r $label d=$dep n=$N"
   guard_cpu "post r$r $label d=$dep"
-  if [ $rc -ne 0 ]; then
+  SLOT_COL=
+  a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
+  [ -z "$a" ] || SLOT_COL=" | slot $((${a% *} + 1))/${a#* }"
+  if [ "$rc" -ne 0 ]; then
     arm_fail "$r" "$label" "d=$dep" "$rc" "exited $rc" "$out"
     return 0
   fi
-  ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$((t1 - t0))" || {
+  ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {
     arm_fail "$r" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
   }
@@ -964,6 +1007,40 @@ ours_arm() {
   if [ -n "$DRAFT" ]; then TPS_MEAN=${DRAFT##*tok/s(positions)=}; fi
   sums+=("$label|$dep|$r|$TPS_MEAN|$TPS_P50|$tags")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$tags")
+  [ -z "$SLOT_COL" ] || slot_sums+=("$label|${SLOT_COL##*slot }|$PP_N|${PP_TPS:-}|$TPS_MEAN")
+}
+# The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment, and an arm's
+# guards and witness blocks around it. The load's lines echoed once: its plan, load, host set, capture
+# and prompt buffer lines.
+LG_HEADER_RE='^(plan|load|host|capture|prefill) '
+lg_cmd() {
+  local i
+  arm_envs "$1"
+  LG_ENV=("${ARM_ENVS[@]}")
+  LG_CMD=("$BIN")
+  for i in "$@"; do
+    case ${A_KIND[$i]} in
+      corpus) LG_CMD+=(--arm "${A_ENG[$i]}:${A_DEP[$i]}") ;;
+      *) LG_CMD+=(--arm "${A_DEP[$i]}") ;;
+    esac
+  done
+  # shellcheck disable=SC2206 # an empty WARM adds nothing
+  LG_CMD+=(-n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} --arm-sync)
+}
+lg_pre() {
+  CPU_BUSY_TAG=
+  guard_other
+  guard_cpu "$(guard_label "$1" "$2")"
+  ours_pre "$1" "$2"
+}
+lg_post() { ours_post "$@"; }
+# guard_label <index> <round>: the CPU guard's label before arm <index>.
+guard_label() {
+  case $ROW_TAG in
+    WARMUP) echo "pre warmup ${ARMS[$1]}" ;;
+    DISCARD) echo "pre discard ${ARMS[$1]}" ;;
+    *) echo "pre r$2 ${ARMS[$1]}" ;;
+  esac
 }
 
 # ratio_table <prefix> <keys> <labels> <tag field> [base]: records `label|key|round|value|…` on stdin;
@@ -1013,6 +1090,11 @@ dry_cmd() {
     echo "timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_MARK:+, measured window from /${REF_MARK}/}"
     return
   fi
+  if lg_grouped "$i"; then
+    lg_cmd "$i"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${LG_ENV[*]:+env ${LG_ENV[*]} }${LG_CMD[*]}   # row label '${A_LABEL[$i]}', load key ${LG_KEY[$i]}"
+    return
+  fi
   feedline="--depth $dep"
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
   if [ "${A_KIND[$i]}" = corpus ]; then
@@ -1023,15 +1105,51 @@ dry_cmd() {
   arm_envs "$i"
   echo "timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place $PLACE --time${WARM:+ --warm $WARM}$note"
 }
-# run_arm <index> <round> <guard label>: one arm after the contention guards, into its row or FAIL row.
-run_arm() {
+# run_unit <round> <index...>: one unit of a round (tools/ref/load-groups.sh): the arms of one load key
+# in one process through the driver, or one reference or bin: arm after the contention guards; into
+# their rows or FAIL rows.
+run_unit() {
+  local r=$1
+  shift
+  if lg_grouped "$1"; then
+    lg_run_unit "$r" "$@"
+    return
+  fi
   CPU_BUSY_TAG=
   guard_other
-  guard_cpu "$3"
+  guard_cpu "$(guard_label "$1" "$r")"
   case ${A_KIND[$1]} in
-    ref) ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$2" ;;
-    *) ours_arm "$1" "$2" ;;
+    ref) ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$r" ;;
+    *) ours_arm "$1" "$r" ;;
   esac
+}
+# run_round <round> <index...>: those arms' units in the round's order.
+run_round() {
+  local r=$1 line
+  local -a units idx
+  shift
+  lg_units "$@"
+  mapfile -t units < <(lg_round "$r")
+  for line in "${units[@]}"; do
+    read -r -a idx <<< "$line"
+    run_unit "$r" "${idx[@]}"
+  done
+}
+# round_order <round> <index...>: the round's arms in order, and its loads: `<arms>` and `[<a b> <c>]`.
+round_order() {
+  local r=$1 line i o='' u=''
+  local -a units idx
+  shift
+  lg_units "$@"
+  mapfile -t units < <(lg_round "$r")
+  for line in "${units[@]}"; do
+    read -r -a idx <<< "$line"
+    local -a names=()
+    for i in "${idx[@]}"; do names+=("${ARMS[$i]}"); done
+    o+="${o:+ }${names[*]}"
+    if lg_grouped "${idx[0]}"; then u+="${u:+ }[${names[*]}]"; else u+="${u:+ }${names[*]}"; fi
+  done
+  ORDER_ARMS=$o ORDER_LOADS=$u
 }
 
 if [ -n "$DRY" ]; then
@@ -1064,9 +1182,9 @@ if [ -n "$DRY" ]; then
       echo "[dry] warmup: off (BLOOMERY_AB_WARMUP=0): round 1's first row is the lease's first process"
     fi
     for r in $(seq "$ROUNDS"); do
-      order=()
-      for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
-      echo "[dry] round $r order: ${order[*]}"
+      round_order "$r" "${!ARMS[@]}"
+      echo "[dry] round $r order: $ORDER_ARMS"
+      echo "[dry] round $r loads: $ORDER_LOADS"
     done
     exit 0
   fi
@@ -1083,9 +1201,10 @@ if [ -n "$DRY" ]; then
       REF_K=
     fi
     for r in $(seq "$ROUNDS"); do
-      order=()
-      for j in $(block_round "$b" "$r"); do order+=("${ARMS[$j]}"); done
-      echo "[dry] block $((b + 1)) round $r order: ${order[*]}"
+      # shellcheck disable=SC2086 # the block's indices, one word each
+      round_order "$r" ${BLK_ARMS[$b]}
+      echo "[dry] block $((b + 1)) round $r order: $ORDER_ARMS"
+      echo "[dry] block $((b + 1)) round $r loads: $ORDER_LOADS"
     done
   done
   exit 0
@@ -1116,32 +1235,28 @@ ref_witness
 guard_other
 guard_cpu pre
 
-sums=() pp_sums=()
+sums=() pp_sums=() slot_sums=()
 n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
 if [ "$ORDER" = rotate ]; then
   if [ "$AB_WARMUP" = 1 ]; then
     ROW_TAG=WARMUP
-    run_arm 0 0 "pre warmup ${ARMS[0]}"
+    run_unit 0 0
     ROW_TAG=ROW
     echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above): the lease's first process reads the model's pages cold"
   fi
-  for r in $(seq "$ROUNDS"); do
-    for i in $(seq 0 $((${#ARMS[@]} - 1))); do
-      j=$(((i + r - 1) % ${#ARMS[@]}))
-      run_arm "$j" "$r" "pre r$r ${ARMS[$j]}"
-    done
-  done
+  for r in $(seq "$ROUNDS"); do run_round "$r" "${!ARMS[@]}"; done
 else
   for b in "${!BLK_KEY[@]}"; do
     echo "[block] $(block_line "$b")"
     if [ "$AB_WARMUP" = 1 ]; then
       ROW_TAG=DISCARD REF_K=${BLK_K[$b]}
-      run_arm "${BLK_DISC[$b]}" 0 "pre discard ${ARMS[${BLK_DISC[$b]}]}"
+      run_unit 0 "${BLK_DISC[$b]}"
       ROW_TAG=ROW REF_K=
       echo "[discard] ${ARMS[${BLK_DISC[$b]}]}${BLK_K[$b]:+ at --n-cpu-moe ${BLK_K[$b]}} ran once before block $((b + 1))'s rounds and is discarded (the DISCARD or FAIL r0 row above)"
     fi
     for r in $(seq "$ROUNDS"); do
-      for j in $(block_round "$b" "$r"); do run_arm "$j" "$r" "pre r$r ${ARMS[$j]}"; done
+      # shellcheck disable=SC2086 # the block's indices, one word each
+      run_round "$r" ${BLK_ARMS[$b]}
     done
   done
 fi
@@ -1213,6 +1328,21 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
     echo "=== the $c prompt's prefill: $c / each $c@ arm per P, the same statistics ==="
     printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp $c p=" "$pp_keys" "$c_refs" 5 "$c"
   done
+fi
+if [ ${#slot_sums[@]} -gt 0 ]; then
+  echo
+  echo "=== load slots: each label's rows first after their load (slot 1) and after another arm of it"
+  echo "    (slot 2 on), the prefill per P and the decode ==="
+  printf '%s\n' "${slot_sums[@]}" | awk -F'|' '{
+    split($2, sl, "/"); later = (sl[1] > 1); k = $1 " p=" $3
+    if ($4 != "") { pp[k, later] += $4; np[k, later]++ }
+    tg[k, later] += $5; nt[k, later]++; keys[k] = 1
+  } END { for (k in keys) {
+    line = sprintf("slots %-24s", k)
+    for (l = 0; l <= 1; l++) line = line sprintf("  %s: pp %s tg %s (n=%d)", l ? "later" : "first", \
+      np[k, l] ? sprintf("%.2f", pp[k, l] / np[k, l]) : "-", nt[k, l] ? sprintf("%.2f", tg[k, l] / nt[k, l]) : "-", nt[k, l] + 0)
+    if (np[k, 0] && np[k, 1]) line = line sprintf("  later/first pp %.4f", (pp[k, 1] / np[k, 1]) / (pp[k, 0] / np[k, 0]))
+    print line } }' | sort
 fi
 witness post
 ref_witness

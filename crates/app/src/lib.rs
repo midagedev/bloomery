@@ -16,7 +16,15 @@
 //! them. [`Session::with_draft`] then captures the verify pass.
 //!
 //! What a model adds is its [`Open`], [`Prompt`] and [`Keep`], under
-//! [`arch`].
+//! [`arch`]. A body loaded by its own constructor, with no placement plan,
+//! becomes a session through [`Session::from_model`].
+//!
+//! One load serves several prompts: [`Session::clear`] returns the model to
+//! the state right after its load, and [`Session::arms`] runs a list of arms
+//! with the clear between them, as `llama-bench` keeps a model while the next
+//! test's model parameters are the previous one's and clears the context's
+//! memory before each repetition. The clear keeps the buffers and zeroes what
+//! a later call could read before writing it; it never lifts a fault.
 
 pub mod arch;
 
@@ -72,6 +80,26 @@ impl std::error::Error for SessionError {
         }
     }
 }
+
+/// An arm of [`Session::arms`] that failed: which of how many, and its
+/// error. The arms before it ran; the ones after it did not.
+#[derive(Debug)]
+pub struct ArmFailed<E> {
+    /// The arm's index in the list, from 0.
+    pub arm: usize,
+    pub arms: usize,
+    pub error: E,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ArmFailed<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "arm {} of {}: {}", self.arm, self.arms, self.error)
+    }
+}
+
+/// Any displayable error, a caller's boxed one included; the text is the
+/// arm's and then its error's own.
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for ArmFailed<E> {}
 
 /// A body that loads by a placement plan: the file's headers read once, the
 /// plan made once from them, and gpumodel's constructor over that plan.
@@ -259,6 +287,63 @@ pub struct Session<B: ChainBody> {
 }
 
 impl<B: ChainBody> Session<B> {
+    /// A session over `model` as its own constructor loaded and made it
+    /// ready, for a body loaded without a placement plan (no [`Open`]),
+    /// whose caches hold `ctx` positions.
+    pub fn from_model(model: GpuModel<B>, ctx: u32) -> Session<B> {
+        Session {
+            model,
+            ctx,
+            rows: None,
+            logits: Vec::new(),
+        }
+    }
+
+    /// The clear: the model back to the state it had right after its load
+    /// and its captures, so a prompt run after it gives the tokens, logits
+    /// and counters that prompt gives in a fresh process ([`GpuModel::reset`]
+    /// is the body's half, the verify in flight and the kept logits row the
+    /// session's). The weights, the captured chains and the prompt call's
+    /// buffers stay: that is the load. Refused on a model a fault poisoned:
+    /// a fault ends the load, it is not cleared into the next prompt.
+    pub fn clear(&mut self) -> Result<(), SessionError> {
+        if let Some(fault) = self.model.poisoned() {
+            return Err(SessionError::Refused(format!(
+                "the clear on a model a fault poisoned ({fault}): the fault ends the load"
+            )));
+        }
+        self.model.reset()?;
+        self.rows = None;
+        self.logits.clear();
+        Ok(())
+    }
+
+    /// Several arms after one load: `run` of each of `arms` in order, the
+    /// first on the model as it stands and each later one after the
+    /// [`Session::clear`]. The first failure ends the list, and names its
+    /// arm: a fault is never cleared into the next arm.
+    pub fn arms<A, E>(
+        &mut self,
+        arms: &[A],
+        mut run: impl FnMut(&mut Self, usize, &A) -> Result<(), E>,
+    ) -> Result<(), ArmFailed<E>>
+    where
+        E: From<SessionError>,
+    {
+        let failed = |arm, error| ArmFailed {
+            arm,
+            arms: arms.len(),
+            error,
+        };
+        for (i, arm) in arms.iter().enumerate() {
+            if i > 0 {
+                self.clear().map_err(|e| failed(i, E::from(e)))?;
+            }
+            run(self, i, arm).map_err(|e| failed(i, e))?;
+        }
+        Ok(())
+    }
+
     /// The model, for what the traits do not carry (records, instruments).
     pub fn model(&self) -> &GpuModel<B> {
         &self.model
