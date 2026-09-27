@@ -263,7 +263,7 @@ impl Body {
             &self.mla,
             self.moe.as_ref(),
             false,
-            Some(&mut h.boundary),
+            Some(h.boundary_mut()),
             &mut |_, _, _| Ok(()),
         )?;
         h.layer_enqueued(names.layer)
@@ -532,7 +532,7 @@ impl ChainBody for Body {
             + self
                 .hybrid
                 .as_ref()
-                .map_or(0, |h| h.boundary.device_bytes())
+                .map_or(0, |h| h.boundary().device_bytes())
     }
 
     fn layers(&self) -> Range<usize> {
@@ -783,8 +783,8 @@ impl GpuModel<Body> {
             .ok_or(GpuError::state(what, "no MoE arena"))?;
         Ok(HybridTaps {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
-            ids: h.boundary.ids.to_host_vec(stream)?,
-            weights: h.boundary.weights.to_host_vec(stream)?,
+            ids: h.boundary().ids.to_host_vec(stream)?,
+            weights: h.boundary().weights.to_host_vec(stream)?,
             down: m.down.to_host_vec(stream)?,
             shexp: m.shexp.to_host_vec(stream)?,
             hsum: h.hsum_copy()?,

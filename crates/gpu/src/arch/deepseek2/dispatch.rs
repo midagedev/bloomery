@@ -70,7 +70,7 @@ pub(super) fn enqueue_chain<H: HostExperts>(
             mla,
             moe,
             slot == 0,
-            hybrid.as_deref_mut().map(|h| &mut h.boundary),
+            hybrid.as_deref_mut().map(Hybrid::boundary_mut),
             &mut |_, _, _| Ok(()),
         )?;
         if slot == last {
