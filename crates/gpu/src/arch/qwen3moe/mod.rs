@@ -19,6 +19,7 @@ pub mod experts;
 pub mod head_argmax;
 mod plan;
 mod prefill;
+mod program;
 pub mod proj;
 pub mod router;
 mod scratch;
