@@ -137,7 +137,7 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # prints what would skip and what moved; the header lists what the key cannot see
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
-                      # alloc threads qdot engram prompts placement 1-1
+                      # alloc threads qdot engram prompts placement 1-1 runtime app
     just gate-ptx-spill  # compile-time ratchet: every PTX entry's spill/jit_local bytes
                       # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
@@ -359,6 +359,10 @@ first suspect is a hung gate on the box, not the agent.
     crates/tokenizer/      byte-level BPE from the GGUF header, bit-identical to
                            llama-tokenize (gate-tokenizer); bin bloomery-tokenize
     crates/sampler/        the sampling chain in the reference's order (gate-sampler)
+    crates/runtime/        the generation loop, host only: Target/Verify/Draft, the
+                           plain and speculative advances, Lookup, Stop (gate-runtime)
+    crates/app/            Session<B> over a GpuModel: open, plan, capture, and the
+                           card draft (DSpark) for V4.1 (gate-app)
     crates/serve/          llama-server-compatible HTTP API over an Engine trait
                            (gate-serve on a mock engine); bin bloomery-serve
     crates/refset/         the reference sets the gates compare against: one reader per kind

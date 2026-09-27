@@ -638,6 +638,17 @@ gate-levers:
 gate-sampler:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-sampler --test sampler -- --nocapture'
 
+# The generation loop (crates/runtime, host only): the stop rule, the lookup draft, and the drafts'
+# pick/commit arithmetic against a mock target — plain = draft tokens, a rejected row taken back,
+# only kept tokens in the lookup's context, a failed call not run again.
+gate-runtime:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-runtime --lib -- --nocapture'
+
+# The session crate's host tests (crates/app, a device-linked crate, so cargo oxide test): a fault
+# read at a step, a group end or a call end is one SessionError::Fault.
+gate-app:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-app --release --lib'
+
 # 2단계 qdot 게이트: Q3_K×Q8_K 융합 커널이 현재 경로(dequant+roundtrip+f32)와
 # 1e-5 안팎에서 일치하고, 정확해(f64)에 더 가깝고, 스칼라 폴백과 비트 동일인가.
 # 순수 게이트(rejects_unaligned_k)는 #[ignore]가 아니라 --include-ignored로 같이 돈다.

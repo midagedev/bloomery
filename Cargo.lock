@@ -62,6 +62,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-app"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-model",
+ "bloomery-runtime",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-engram"
 version = "0.1.0"
 dependencies = [
@@ -119,6 +131,7 @@ dependencies = [
 name = "bloomery-gpu-gates"
 version = "0.1.0"
 dependencies = [
+ "bloomery-app",
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-gpu",
@@ -127,6 +140,7 @@ dependencies = [
  "bloomery-levers",
  "bloomery-model",
  "bloomery-refset",
+ "bloomery-runtime",
  "bloomery-sampler",
  "bloomery-serve",
  "bloomery-threads",
@@ -192,6 +206,10 @@ dependencies = [
  "bloomery-gguf",
  "thiserror",
 ]
+
+[[package]]
+name = "bloomery-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "bloomery-sampler"
