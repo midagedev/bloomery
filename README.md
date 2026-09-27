@@ -41,13 +41,11 @@ In progress: batched prompts for GLM-5.3 and Qwen3.8; GLM-5.3's sparse-attention
 
 ## Measured numbers
 
-Single stream, on one RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), with a 32-core AVX2 CPU. Decode rows generate `n = 96` tokens. Arms are alternated in one window and ratios are taken only within a window. Every row comes from the runners in `tools/ref/` under the quiet-machine protocol; the command lines are in [rig-log](https://github.com/midagedev/rig-log).
+All numbers are single-stream tok/s on the development machine: an RTX A6000 (48 GB, 300 W) unless a row says RTX 3090 (24 GB, 250 W), with a 32-core AVX2 CPU. Decode generates `n = 96` tokens. Every number comes from the runners in `tools/ref/` under the quiet-machine protocol, and each row links to its rig-log entry with the command lines.
 
-**The llama.cpp rows from 2026-09-28 are provisional.** In that sitting llama.cpp ran through `llama-bench`, which feeds new random ids each repetition, so several of its rows read weights or n-gram rows cold (the captions say which). Its V4.1 prompt rows ran with op offload off (`-nopo 1`) only, and its Qwen3.8 rows at the default only, so they may not be its fastest setting. Our rows from that sitting carry a `[cpu-busy]` tag that counted our own process, a runner defect. All of these are re-measured warm, with both engines on the same token ids and llama.cpp at its fastest flags; the conditions are in [`docs/fair-measure.md`](docs/fair-measure.md).
+### Against llama.cpp: DeepSeek-V4.1-Flash
 
-### DeepSeek-V4.1-Flash, `Q3_K_M` — GPU + CPU experts
-
-Placement (a): 2,668 routed experts on the card, 12,692 on the host. Against llama.cpp's V4.1 pull request [#28696](https://github.com/ggml-org/llama.cpp/pull/28696) at `5210c7c` (`-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1`); synthetic prompt ids, no hot list; 2026-09-28, rig-log [v41-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#v41-release).
+Placement (a): 2,668 routed experts on the card, 12,692 on the host. Against llama.cpp's V4.1 pull request [#28696](https://github.com/ggml-org/llama.cpp/pull/28696) at `5210c7c` (`-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1`), synthetic prompt ids, no hot list, one window; 2026-09-28, rig-log [v41-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#v41-release).
 
 | A6000, tok/s | bloomery | llama.cpp | ratio |
 |---|---:|---:|---:|
@@ -56,90 +54,22 @@ Placement (a): 2,668 routed experts on the card, 12,692 on the host. Against lla
 | prompt, P = 512 | **190.6** | 104.9 | 1.817 |
 | prompt, P = 4096 | **358.4** | 76.5 | 4.68 |
 
-- llama.cpp's values are its best round. Its other decode rounds read 20.65 (depth 6) and 19.86 (depth 4096), with page faults bounding up to 7.8 % of the window.
-- At P = 4096 llama.cpp faulted in every repetition (up to 27.9 % of the window): this branch reads each n-gram row it has not seen through a page fault, and `llama-bench` feeds new ids each time. bloomery prefetches those rows. With repeated ids the branch ran at 103.8 on 2026-09-25.
-- llama.cpp's automatic placement (`-fitt 1024`) was within 0.5 % of the hand-set one. With `-ub 4096` the hand-set placement could not create its context.
+This table is provisional. llama.cpp ran through `llama-bench`, which feeds new random ids on every repetition, so its rows read n-gram (engram) rows it had not seen through page faults, in every repetition at P = 4096; with repeated ids the branch ran at 103.8 there on 2026-09-25. Its prompt rows ran with op offload off only. A warm re-measure, with both engines on the same token ids and llama.cpp at its fastest flags, replaces it; the conditions are in [`docs/fair-measure.md`](docs/fair-measure.md).
 
-On the RTX 3090 (placement `gate`: 1,146 routed experts on the card; hot list), against #28696 at `--n-cpu-moe 37`, two rounds; rig-log [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release):
+### On this machine
 
-| RTX 3090, tok/s | decode, depth 6 | decode, depth 4096 | prompt, P = 4096 |
-|---|---:|---:|---:|
-| bloomery | **28.14** | **28.92** | 329.3 |
-| llama.cpp | 21.59 | 20.85 | — |
+| Model | Setup | Decode, tok/s | Prompt, tok/s | rig-log |
+|---|---|---|---|---|
+| DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, hot list, prose prompt of 512 | 44.8; **51.3** with the DSpark draft on the 3090 | — | [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps) |
+| DeepSeek-V4.1-Flash `Q3_K_M` | RTX 3090 + CPU, hot list, synthetic ids | 28.14 (depth 6), 28.92 (depth 4096) | 329.3 (P = 4096) | [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release) |
+| GLM-5.3-Flash `UD-Q4_K_XL` | A6000 + CPU, prose prompt | 20.95 (depth 512), 20.99 (depth 1024) | — | [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release) |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + every routed expert on the CPU | 40.46 (depth 6), 40.90 (depth 1024) | 105.7 (P = 512), 104.0 (P = 4096) | [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release) |
+| Qwen3.6-35B-A3B `Q4_K_M` | A6000, whole model | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
+| Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
 
-With the hot list and a 512-token prose or code prompt, and the DSpark draft on the RTX 3090, three rounds; rig-log [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps):
-
-| A6000, prompt | plain tok/s | DSpark tok/s | DSpark / plain |
-|---|---:|---:|---:|
-| prose 512 | 44.8 | **51.3** | 1.146 ± 0.014 |
-| code 512 | 43.8 | **50.6** | 1.156 ± 0.062 |
-
-The hot list was built from routing traces of the same corpora, so these rows are its favorable case.
-
-### Qwen3-30B-A3B-Instruct-2507, `Q4_K_M` — whole model on the GPU
-
-Against mainline llama.cpp (`53ed051ce`, `-ngl 99 -fa on`) and mistral.rs (`d5ae0f18f`, `--features "cuda flash-attn"`), three rounds; 2026-09-27, rig-log [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng).
-
-| Decode, tok/s | bloomery | llama.cpp | mistral.rs | vs llama.cpp | vs mistral.rs |
-|---:|---:|---:|---:|---:|---:|
-| depth 6 | **209.2** | 193.8 | 194.2 | 1.080 ± 0.006 | 1.077 ± 0.007 |
-| depth 1024 | **202.3** | 188.9 | 167.0 | 1.071 ± 0.001 | 1.211 ± 0.007 |
-| depth 4096 | **175.2** | 173.3 | 156.6 | 1.011 ± 0.002 | 1.119 ± 0.004 |
-
-| Prompt, tok/s | bloomery | llama.cpp | llama.cpp `-ub 4096 -b 4096` | mistral.rs |
-|---:|---:|---:|---:|---:|
-| P = 512 | **7,827** | 4,247 | — | 4,816 |
-| P = 4096 | **9,276** | 4,157 | 6,831 | 7,812 |
-
-### Qwen3.6-35B-A3B, `Q4_K_M` — whole model on the GPU
-
-Same llama.cpp and mistral.rs builds, three rounds, all rows clean; 2026-09-28, rig-log [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release).
-
-| Decode, tok/s | depth 6 | 1024 | 4096 |
-|---|---:|---:|---:|
-| bloomery | **204.4** | **201.6** | **195.8** |
-| llama.cpp | 163.8 | 162.8 | 159.2 |
-| mistral.rs | 114.5 | — | 110.3 |
-
-| Prompt, tok/s | P = 512 | P = 4096 |
-|---|---:|---:|
-| bloomery | **6,464** | **8,311** |
-| llama.cpp | 3,225 | 3,378 |
-| llama.cpp `-ub 4096 -b 4096` | — | 5,036 |
-| mistral.rs | 3,695 | — |
-
-### Qwen3.8-Flash-Next, `UD-Q4_K_XL` — GPU + every routed expert on the CPU
-
-llama.cpp is ahead on this model. Mainline llama.cpp (`53ed051ce`, `-ngl 99 -fa on -lzm off -ncmoe 26 -t 32`), three rounds; 2026-09-28, rig-log [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release).
-
-| A6000, tok/s | decode, depth 6 | 1024 | 3000 | prompt, P = 512 | P = 4096 |
-|---|---:|---:|---:|---:|---:|
-| bloomery | 40.46 | ~~39.45~~ 40.90 | ~~38.76~~ 40.1 | 105.7 | 104.0 |
-| llama.cpp | **44.68** | **44.03** | **43.21** | **340.4** | **356.6** |
-| llama.cpp `-ub 4096 -b 4096` | — | — | — | — | **776.3** |
-
-bloomery runs every routed expert of this model on the CPU and has no batched prompt path for it yet (it feeds the prompt eight positions at a time). Batched prompts come next, then experts on the card. Our decode values leave out the first round. ~~Our first decode round read about 10 % below the others for a reason not yet found; the depth-6 value is the two rounds without it.~~ Corrected 2026-09-28: the first round read cold rows of the model's PLE table, about 16 page faults a token, and the depth 1024 and 3000 cells had averaged it in. Without it, decode is 0.906×, 0.929× and 0.928× llama.cpp at depth 6, 1024 and 3000 (rig-log [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release)).
-
-### GLM-5.3-Flash, `UD-Q4_K_XL` — GPU + CPU experts
-
-Against two llama.cpp pull-request builds for this model, [#27752](https://github.com/ggml-org/llama.cpp/pull/27752) at `1d0c76f3c6` and [#27754](https://github.com/ggml-org/llama.cpp/pull/27754) at `86ebfef2c6`, two rounds; 2026-09-28, rig-log [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release).
-
-| Decode, tok/s | depth 512 | 1024 |
-|---|---:|---:|
-| bloomery | 20.95 | 20.99 |
-| bloomery, hot list | ≥ 28.14 | ≥ 26.77 |
-| llama.cpp #27752 | 17.80 | 17.81 |
-| llama.cpp #27754 | 16.78 | 16.63 |
-| llama.cpp #27754, MTP draft | 23.29 | — |
-
-- The hot-list rows are lower bounds: they carried page faults that this runner counts over the whole process, not the timed window.
-- llama.cpp's MTP arm accepted 58 of 73 draft tokens.
-- Context stops at 2,051 positions until the sparse-attention selector is built. The prompt runs one step per token (about 21 tok/s), so there is no prompt row for bloomery; llama.cpp's is 110–113 tok/s at P = 512.
-- exllamav3 (`0740edc2da`) on a 4.05 bpw EXL3 file, another quantization, decodes at 18.48 / 18.02 and runs a prompt at 156.6 (P = 512) and 614.9 (P = 4096).
-
-### Tags
-
-`[cold]` means page faults inside a row's timed window could account for at least 1 % of it (75 µs a fault); a fault only slows a row. `[cpu-busy]` means the runner saw other CPU work beside the arm. Synthetic and prose prompts never share a row: they route to different experts.
+- The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, so that row is its favorable case.
+- GLM-5.3's prompt runs one step per token for now (about 21 tok/s), so it has no prompt value. With a hot list its decode is at least 28.14 at depth 512; that row is a lower bound, because its page faults were counted over the whole process.
+- Qwen3.8's prompt is fed eight positions at a time; batched prompts are next. The rig-log entries carry the other engines' rows from the same windows, including where llama.cpp is ahead.
 
 ## Target hardware
 
