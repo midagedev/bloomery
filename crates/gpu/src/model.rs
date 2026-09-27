@@ -726,6 +726,15 @@ impl<B: ChainBody> GpuModel<B> {
             .logits_to_host(&self.gpu)
     }
 
+    /// [`GpuModel::logits`] into `out` (`n_vocab` f32), for a caller that reads
+    /// them every token into one buffer. Blocking read.
+    pub fn logits_into(&self, out: &mut [f32]) -> Result<(), GpuError> {
+        self.heads
+            .first()
+            .ok_or(no_head("GpuModel::logits_into"))?
+            .logits_into_host(&self.gpu, out)
+    }
+
     // --------------------------------------------- what the body's own impl
     // --------------------------------------------- blocks are handed
 

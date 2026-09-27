@@ -125,7 +125,10 @@ pub trait Engine: Send {
         let _ = n;
         Err(EngineError("cut is not supported".to_owned()))
     }
-    /// Positions the cache holds.
+    /// Positions the engine serves: its cache holds at least these, and it
+    /// computes the model at each. The server refuses a prompt of `ctx_max`
+    /// tokens or more and stops generation there, so an engine never sees a
+    /// position past it.
     fn ctx_max(&self) -> usize;
     /// What a crash report names besides the error: the device, the position.
     fn describe(&self) -> String;

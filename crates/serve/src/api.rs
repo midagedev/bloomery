@@ -5,6 +5,18 @@
 //! the first. `/health`, `/props`, `/slots`, `/metrics`, `/v1/models` and the
 //! tokenizer endpoints never take that mutex.
 //!
+//! No request takes the engine past [`Engine::ctx_max`], as llama-server's
+//! slots do not pass `n_ctx`: a prompt of `ctx_max` tokens or more is a 400
+//! before it reaches the engine, and generation stops at `ctx_max` with
+//! `truncated`, whatever `max_tokens` asked.
+//!
+//! At most [`MAX_CONNECTIONS`] connections are served at once, one thread each;
+//! a connection past them gets a 503 with `Retry-After` and is closed. A
+//! connection that sends nothing of a next request for [`KEEP_ALIVE_IDLE`] is
+//! closed, so an idle client gives its place back. An `accept` that fails
+//! while the listener still stands is a named line on stderr and the loop goes
+//! on; a listener that no longer stands ends [`Server::run`].
+//!
 //! An engine error is fatal: the request that met it gets a 500 carrying the
 //! engine's message, every later generation and `/health` a 503 with the reason,
 //! and after [`ServerConfig::fatal_linger`] [`Server::run`] returns
@@ -18,8 +30,8 @@
 //! [`ServerConfig::slot_save_path`]; the file is [`crate::slotfile`]'s.
 
 use std::fmt;
-use std::io::{self, BufReader};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{self, BufRead, BufReader, Read};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
@@ -60,6 +72,44 @@ pub struct ServerConfig {
     pub slot_save_path: Option<PathBuf>,
 }
 
+/// Connections served at once, each on a thread of its own. The engine runs one
+/// request at a time, so past the one generating these hold requests waiting for
+/// the slot, streams, keep-alive clients and the cheap endpoints' pollers; a
+/// connection past them is refused, never queued. An idle connection keeps its
+/// place for [`KEEP_ALIVE_IDLE`] at most.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// What a refused connection's 503 tells the client to wait, in seconds: a place
+/// frees when any request ends.
+const RETRY_AFTER_SECS: &str = "1";
+
+/// How long a connection may send nothing of its next request (its first one
+/// too) before it is closed: cpp-httplib's keep-alive timeout, which
+/// llama-server keeps.
+pub const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(5);
+
+/// How long one read inside a request may wait (llama-server's `--timeout`).
+const REQUEST_READ: Duration = Duration::from_secs(600);
+
+/// How long the accept loop waits after a failed `accept` that will fail again
+/// at once: out of descriptors or memory, or the same failure twice in a row.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// `EMFILE` and `ENFILE`, the same numbers on Linux and the BSDs; std gives
+/// them no `ErrorKind` of their own.
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+/// `EBADF`, `EFAULT` and `EINVAL` (also the same numbers): the listening socket
+/// itself is wrong, so the next `accept` fails the same way.
+const EBADF: i32 = 9;
+const EFAULT: i32 = 14;
+const EINVAL: i32 = 22;
+
+/// How long a refused connection is written to and read from: the read consumes
+/// the request it sent, so the close does not reset the connection before the
+/// client reads the 503.
+const REFUSE_DRAIN: Duration = Duration::from_millis(200);
+
 /// The default [`ServerConfig::fatal_linger`]: long enough for a client or a
 /// supervisor to read the 503, short enough that the port frees promptly.
 pub const FATAL_LINGER: Duration = Duration::from_secs(2);
@@ -87,7 +137,7 @@ impl fmt::Display for EngineFailure {
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
-    #[error("bind: {0}")]
+    #[error("listener: {0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Template(#[from] TemplateError),
@@ -170,8 +220,8 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Accepts connections, one thread each, until the listener fails or the
-    /// engine does, and returns why.
+    /// Accepts connections, one thread each and at most [`MAX_CONNECTIONS`] at
+    /// once, until the listener fails or the engine does, and returns why.
     pub fn run(self) -> ServeError {
         let Server {
             listener,
@@ -179,16 +229,35 @@ impl Server {
             ended,
         } = self;
         let accept_state = Arc::clone(&state);
+        let port = listener.local_addr().map_or(0, |a| a.port());
+        let live = Arc::new(AtomicUsize::new(0));
         thread::spawn(move || {
+            let mut repeats = 0;
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {
-                        let state = Arc::clone(&accept_state);
-                        thread::spawn(move || serve_conn(&state, stream));
+                        repeats = 0;
+                        admit(&accept_state, &live, port, stream);
                     }
                     Err(e) => {
-                        let _ = accept_state.end.send(End::Io(e));
-                        return;
+                        let stands = listener.local_addr().is_ok();
+                        let Some(wait) = after_accept_error(&e, stands, repeats) else {
+                            let gone = io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "accept failed ({e}); the listener cannot accept again \
+                                     (it stands: {stands})"
+                                ),
+                            );
+                            let _ = accept_state.end.send(End::Io(gone));
+                            return;
+                        };
+                        eprintln!(
+                            "bloomery-serve: accept failed ({e}); the listener stands, next accept in {} ms",
+                            wait.as_millis()
+                        );
+                        repeats = repeats.saturating_add(1);
+                        thread::sleep(wait);
                     }
                 }
             }
@@ -318,29 +387,156 @@ fn unix_now() -> u64 {
 
 // ---------------------------------------------------------------- connection
 
+/// What the accept loop does after `accept` failed with `e` for the
+/// `repeats + 1`-th time in a row: `None` ends the server (the listener no
+/// longer stands, or the error is the listening socket's own), else the wait
+/// before the next `accept`. A connection that failed before it was taken
+/// (aborted, reset, a network error it carried) is that client's; the loop goes
+/// on at once, and waits only when the failure repeats or cannot clear by
+/// itself (out of descriptors or memory).
+fn after_accept_error(e: &io::Error, listener_stands: bool, repeats: u32) -> Option<Duration> {
+    if !listener_stands || matches!(e.raw_os_error(), Some(EBADF | EFAULT | EINVAL)) {
+        return None;
+    }
+    let exhausted =
+        matches!(e.raw_os_error(), Some(EMFILE | ENFILE)) || e.kind() == io::ErrorKind::OutOfMemory;
+    Some(if exhausted || repeats > 0 {
+        ACCEPT_BACKOFF
+    } else {
+        Duration::ZERO
+    })
+}
+
+/// One live connection's place under [`MAX_CONNECTIONS`], given back when its
+/// thread ends, by a return or a panic.
+struct Permit(Arc<AtomicUsize>);
+
+impl Permit {
+    /// A place, or `None` when [`MAX_CONNECTIONS`] are live.
+    fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
+        let held = live.fetch_add(1, Ordering::SeqCst);
+        let permit = Permit(Arc::clone(live));
+        (held < MAX_CONNECTIONS).then_some(permit)
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Serves `stream` on a thread of its own, named `serve:<port>`, or refuses it
+/// with a 503 when [`MAX_CONNECTIONS`] are live or no thread can be started.
+fn admit(state: &Arc<State>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStream) {
+    let Some(permit) = Permit::take(live) else {
+        refuse(
+            stream,
+            &format!("the server is serving {MAX_CONNECTIONS} connections, its limit"),
+        );
+        return;
+    };
+    // The spawn consumes the stream even when it fails; the clone answers then.
+    let answer = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            refuse(stream, &format!("cannot hold the connection: {e}"));
+            return;
+        }
+    };
+    let state = Arc::clone(state);
+    let spawned = thread::Builder::new()
+        .name(format!("serve:{port}"))
+        .spawn(move || {
+            let _permit = permit;
+            serve_conn(&state, stream);
+        });
+    if let Err(e) = spawned {
+        refuse(answer, &format!("cannot start a connection thread: {e}"));
+    }
+}
+
+/// Answers a connection the server does not serve with a 503 carrying
+/// `Retry-After`, then closes it after reading what the client sent, for at most
+/// about [`REFUSE_DRAIN`] twice.
+fn refuse(mut stream: TcpStream, message: &str) {
+    let _ = stream.set_write_timeout(Some(REFUSE_DRAIN));
+    let body = error_body(503, "unavailable_error", message);
+    let sent = http::respond(
+        &mut stream,
+        &closing(),
+        503,
+        JSON,
+        &[("Retry-After", RETRY_AFTER_SECS.to_owned())],
+        body.to_string().as_bytes(),
+    );
+    if sent.is_err() || stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    if stream.set_read_timeout(Some(REFUSE_DRAIN)).is_err() {
+        return;
+    }
+    let until = Instant::now() + REFUSE_DRAIN;
+    let mut sink = [0u8; 4096];
+    while Instant::now() < until {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// The request an answer stands on when none was read: HTTP/1.1, closing.
+fn closing() -> Request {
+    Request {
+        method: String::new(),
+        path: String::new(),
+        query: Vec::new(),
+        http10: false,
+        headers: Vec::new(),
+        body: Vec::new(),
+        keep_alive: false,
+    }
+}
+
+/// Waits at most [`KEEP_ALIVE_IDLE`] for the first byte of the connection's
+/// next request (a byte already buffered counts), then gives the rest of the
+/// request [`REQUEST_READ`] per read. `false` when nothing came: the peer
+/// closed, the wait ran out or the read failed, and the connection closes.
+fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
+    if !r.buffer().is_empty() {
+        return true;
+    }
+    if r.get_ref().set_read_timeout(Some(KEEP_ALIVE_IDLE)).is_err() {
+        return false;
+    }
+    let arrived = r.fill_buf().is_ok_and(|b| !b.is_empty());
+    arrived && r.get_ref().set_read_timeout(Some(REQUEST_READ)).is_ok()
+}
+
 fn serve_conn(state: &State, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
     let Ok(mut w) = stream.try_clone() else {
         return;
     };
     let mut r = BufReader::new(stream);
     loop {
+        if !next_request_arrives(&mut r) {
+            return;
+        }
         let req = match http::read_request(&mut r, &mut w) {
             Ok(Some(req)) => req,
             Ok(None) => return,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 let body = error_body(400, "invalid_request_error", &e.to_string());
-                let req = Request {
-                    method: String::new(),
-                    path: String::new(),
-                    query: Vec::new(),
-                    http10: false,
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                    keep_alive: false,
-                };
-                let _ = http::respond(&mut w, &req, 400, JSON, &[], body.to_string().as_bytes());
+                let _ = http::respond(
+                    &mut w,
+                    &closing(),
+                    400,
+                    JSON,
+                    &[],
+                    body.to_string().as_bytes(),
+                );
                 return;
             }
             Err(_) => return,
@@ -1773,4 +1969,33 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
         "id": meta.id,
         "timings": o.timings.to_json(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, after_accept_error};
+    use std::io;
+    use std::time::Duration;
+
+    /// A failed `accept` ends the server only when the listener no longer
+    /// stands or the error is the listening socket's own; a client's aborted
+    /// connection retries at once, running out of descriptors or memory, or
+    /// failing twice in a row, backs off.
+    #[test]
+    fn accept_failures_end_the_server_only_with_the_listener() {
+        let aborted = io::Error::from(io::ErrorKind::ConnectionAborted);
+        assert_eq!(after_accept_error(&aborted, true, 0), Some(Duration::ZERO));
+        assert_eq!(after_accept_error(&aborted, true, 1), Some(ACCEPT_BACKOFF));
+        for raw in [EMFILE, ENFILE] {
+            let e = io::Error::from_raw_os_error(raw);
+            assert_eq!(after_accept_error(&e, true, 0), Some(ACCEPT_BACKOFF), "{e}");
+        }
+        let oom = io::Error::from(io::ErrorKind::OutOfMemory);
+        assert_eq!(after_accept_error(&oom, true, 0), Some(ACCEPT_BACKOFF));
+        assert_eq!(after_accept_error(&aborted, false, 0), None);
+        for raw in [EBADF, EFAULT, EINVAL] {
+            let e = io::Error::from_raw_os_error(raw);
+            assert_eq!(after_accept_error(&e, true, 0), None, "{e}");
+        }
+    }
 }

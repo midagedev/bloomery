@@ -12,7 +12,14 @@
 //!
 //! How long a prefix of the cache can be kept is the body's rule, which the
 //! opener hands in beside the model ([`Ds41Engine::spawn`]'s `keep`) and the
-//! engine thread answers ([`Ds41Engine`]'s `keepable`).
+//! engine thread answers ([`Ds41Engine`]'s `keepable`). How far the positions
+//! go is the lesser of the cache and the positions the body computes the model
+//! at (`spawn`'s `defined`): the server refuses a request past it, so a client's
+//! long prompt or `max_tokens` never reaches the body's refusal, which is fatal.
+//!
+//! A sampled token's logits cross to the calling thread in one buffer the
+//! engine owns: lent with each `Next` that wants them, filled on the engine
+//! thread, and handed back with the reply, so no token allocates a row.
 //!
 //! What `/props` says about the engine ([`model_props`], [`placement_props`])
 //! is read from the file's header and the placement plan the engine loads by,
@@ -343,9 +350,10 @@ pub fn nvidia_smi_index(name: &str) -> Result<u32, String> {
 /// What the engine thread is asked to do.
 enum Cmd {
     Prefill(Vec<u32>),
+    /// With the engine's logits buffer when the caller wants the row.
     Next {
         last: u32,
-        logits: bool,
+        logits: Option<Vec<f32>>,
     },
     Reset,
     /// Take back the positions from this one on.
@@ -356,24 +364,35 @@ enum Cmd {
     Pos,
 }
 
-/// Its answer: the argmax and the logits of a `Next` (the kept length of a
-/// `Keep`), and the position it stands at afterwards (the position it failed
-/// at, on an error).
+/// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
+/// logits buffer a `Next` was lent (filled unless the result is an error), and
+/// the position it stands at afterwards (the position it failed at, on an
+/// error).
 struct Reply {
-    result: Result<(u32, Option<Vec<f32>>), String>,
+    result: Result<u32, String>,
+    logits: Option<Vec<f32>>,
     pos: usize,
 }
 
 /// `serve::Engine` over a [`Generator`] that lives on its own thread. The
 /// position is the model's alone: every question about it goes to the thread.
 pub struct Ds41Engine {
-    tx: Option<Sender<Cmd>>,
-    rx: Receiver<Reply>,
+    link: Link,
     worker: Option<JoinHandle<()>>,
     vocab: Arc<Vocab>,
     ctx_max: usize,
     card: String,
     props: EngineProps,
+}
+
+/// The handle's side of the engine thread: its channels and the logits buffer
+/// a sampled step borrows. It keeps no position; the thread's replies carry it.
+struct Link {
+    tx: Option<Sender<Cmd>>,
+    rx: Receiver<Reply>,
+    /// The logits row a sampled `next` reads (`n_vocab` f32), lent to the
+    /// engine thread for the call; empty while lent or when it never came back.
+    logits: Vec<f32>,
 }
 
 impl Ds41Engine {
@@ -383,13 +402,15 @@ impl Ds41Engine {
     /// the model's rollback keeps, from where it stands. `prefill` is the
     /// body's prompt feed: it feeds the ids from where the model stands and
     /// returns the argmax after the last (a batched body's batch, or
-    /// `GpuModel::step`). `card` names the device in a crash report; `props`
-    /// is what `/props` reports about the engine ([`model_props`],
-    /// [`placement_props`]).
+    /// `GpuModel::step`). `defined` is how many positions the body computes
+    /// the model at; the engine serves the lesser of it and the cache. `card`
+    /// names the device in a crash report; `props` is what `/props` reports
+    /// about the engine ([`model_props`], [`placement_props`]).
     pub fn spawn<B, F, K, P>(
         open: F,
         keep: K,
         prefill: P,
+        defined: usize,
         vocab: Arc<Vocab>,
         card: String,
         props: EngineProps,
@@ -418,15 +439,18 @@ impl Ds41Engine {
                     return;
                 }
                 for cmd in cmds {
-                    let result = match cmd {
-                        Cmd::Keep(n) => u32::try_from(keep(g.model(), n.min(g.pos())))
-                            .map(|k| (k, None))
-                            .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
+                    let (result, logits) = match cmd {
+                        Cmd::Keep(n) => (
+                            u32::try_from(keep(g.model(), n.min(g.pos())))
+                                .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
+                            None,
+                        ),
                         cmd => serve_cmd(&mut g, cmd, n_vocab, &prefill),
                     };
                     if replies
                         .send(Reply {
                             result,
+                            logits,
                             pos: g.pos(),
                         })
                         .is_err()
@@ -436,13 +460,16 @@ impl Ds41Engine {
                 }
             })?;
         let ctx_max = match loaded.recv() {
-            Ok(Ok(c)) => c,
+            Ok(Ok(c)) => c.min(defined),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
         Ok(Ds41Engine {
-            tx: Some(tx),
-            rx,
+            link: Link {
+                tx: Some(tx),
+                rx,
+                logits: vec![0.0; n_vocab],
+            },
             worker: Some(worker),
             vocab,
             ctx_max,
@@ -450,9 +477,16 @@ impl Ds41Engine {
             props,
         })
     }
+}
 
-    fn call(&mut self, cmd: Cmd) -> Result<(u32, Option<Vec<f32>>), EngineError> {
-        self.ask(cmd)?.result.map_err(EngineError)
+impl Link {
+    /// One command; a lent logits buffer comes back to the link.
+    fn call(&mut self, cmd: Cmd) -> Result<u32, EngineError> {
+        let reply = self.ask(cmd)?;
+        if let Some(row) = reply.logits {
+            self.logits = row;
+        }
+        reply.result.map_err(EngineError)
     }
 
     /// One command and its reply, the position left to the caller.
@@ -465,68 +499,101 @@ impl Ds41Engine {
             .recv()
             .map_err(|_| EngineError("the engine thread ended mid-call".to_owned()))
     }
+
+    /// A step; with `logits_out`, the engine's buffer is lent for it and
+    /// copied out once it is back.
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        let lent = logits_out
+            .is_some()
+            .then(|| std::mem::take(&mut self.logits));
+        let arg = self.call(Cmd::Next { last, logits: lent })?;
+        if let Some(out) = logits_out {
+            if out.len() != self.logits.len() {
+                return Err(EngineError(format!(
+                    "the caller's logits buffer holds {}, the engine's {}",
+                    out.len(),
+                    self.logits.len()
+                )));
+            }
+            out.copy_from_slice(&self.logits);
+        }
+        Ok(arg)
+    }
 }
 
 /// A body's prompt feed ([`Ds41Engine::spawn`]'s `prefill`): the ids from
 /// where the model stands, the argmax after the last.
 type PrefillFn<B> = dyn Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>;
 
-/// One command on the engine thread. A logits read is checked here: a row of
-/// the wrong length or one holding a NaN is the step's error, not the
-/// sampler's to absorb.
+/// One command on the engine thread, and the logits buffer a `Next` was lent,
+/// handed back whatever the result.
 fn serve_cmd<B: Rollback>(
     g: &mut Generator<B>,
     cmd: Cmd,
     n_vocab: usize,
     prefill: &PrefillFn<B>,
-) -> Result<(u32, Option<Vec<f32>>), String> {
+) -> (Result<u32, String>, Option<Vec<f32>>) {
     let at = g.pos();
-    match cmd {
+    let result = match cmd {
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            g.check_feed(ids.len()).map_err(refuse)?;
-            prefill(g.model_mut(), &ids)
-                .map(|a| (a, None))
-                .map_err(|e| refuse(e.to_string()))
+            g.check_feed(ids.len())
+                .map_err(refuse)
+                .and_then(|()| prefill(g.model_mut(), &ids).map_err(|e| refuse(e.to_string())))
         }
-        Cmd::Next { last, logits } => {
-            let arg = g
-                .step(last)
-                .map_err(|e| format!("step at position {at}: {e}"))?;
-            if !logits {
-                return Ok((arg, None));
-            }
-            let row = g
-                .logits()
-                .map_err(|e| format!("logits after position {at}: {e}"))?;
-            if row.len() != n_vocab {
-                return Err(format!(
-                    "the head gave {} logits at position {at}, the vocabulary has {n_vocab}",
-                    row.len()
-                ));
-            }
-            if let Some(i) = row.iter().position(|v| v.is_nan()) {
-                return Err(format!("logit {i} is NaN after position {at}"));
-            }
-            Ok((arg, Some(row)))
+        Cmd::Next { last, mut logits } => {
+            let arg = next_row(g, last, logits.as_deref_mut(), n_vocab);
+            return (arg, logits);
         }
         Cmd::Reset => g
             .model_mut()
             .reset()
-            .map(|()| (0, None))
+            .map(|()| 0)
             .map_err(|e| format!("reset at position {at}: {e}")),
-        Cmd::Rollback(pos) if pos as usize == at => Ok((0, None)),
+        Cmd::Rollback(pos) if pos as usize == at => Ok(0),
         Cmd::Rollback(pos) => g
             .model_mut()
             .rollback(pos)
-            .map(|()| (0, None))
+            .map(|()| 0)
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
         Cmd::Keep(n) => Err(format!(
             "a keep query of {n} reached the step loop; the engine thread answers it"
         )),
-        Cmd::Pos => Ok((0, None)),
+        Cmd::Pos => Ok(0),
+    };
+    (result, None)
+}
+
+/// One step and, into `row`, its logits. The row is checked here: one of the
+/// wrong length or holding a NaN is the step's error, not the sampler's to
+/// absorb.
+fn next_row<B: Rollback>(
+    g: &mut Generator<B>,
+    last: u32,
+    row: Option<&mut [f32]>,
+    n_vocab: usize,
+) -> Result<u32, String> {
+    let at = g.pos();
+    let arg = g
+        .step(last)
+        .map_err(|e| format!("step at position {at}: {e}"))?;
+    let Some(row) = row else {
+        return Ok(arg);
+    };
+    if row.len() != n_vocab {
+        return Err(format!(
+            "a logits buffer of {} at position {at}, the vocabulary has {n_vocab}",
+            row.len()
+        ));
     }
+    g.model()
+        .logits_into(row)
+        .map_err(|e| format!("logits after position {at}: {e}"))?;
+    if let Some(i) = row.iter().position(|v| v.is_nan()) {
+        return Err(format!("logit {i} is NaN after position {at}"));
+    }
+    Ok(arg)
 }
 
 impl Engine for Ds41Engine {
@@ -538,35 +605,23 @@ impl Engine for Ds41Engine {
         if ids.is_empty() {
             return Ok(());
         }
-        self.call(Cmd::Prefill(ids.to_vec())).map(|_| ())
+        self.link.call(Cmd::Prefill(ids.to_vec())).map(|_| ())
     }
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
-        let want = logits_out.is_some();
-        let (arg, row) = self.call(Cmd::Next { last, logits: want })?;
-        if let (Some(out), Some(row)) = (logits_out, row) {
-            if out.len() != row.len() {
-                return Err(EngineError(format!(
-                    "the caller's logits buffer holds {}, the head gave {}",
-                    out.len(),
-                    row.len()
-                )));
-            }
-            out.copy_from_slice(&row);
-        }
-        Ok(arg)
+        self.link.next(last, logits_out)
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {
-        self.call(Cmd::Reset).map(|_| ())
+        self.link.call(Cmd::Reset).map(|_| ())
     }
 
     /// The body's rule, asked on the engine thread (`spawn`'s `keep`). A
     /// thread that does not answer grants nothing: the caller resets, and the
     /// next call reports the thread.
     fn keepable(&self, n: usize) -> usize {
-        match self.ask(Cmd::Keep(n)).map(|r| r.result) {
-            Ok(Ok((k, _))) => (k as usize).min(n),
+        match self.link.ask(Cmd::Keep(n)).map(|r| r.result) {
+            Ok(Ok(k)) => (k as usize).min(n),
             _ => 0,
         }
     }
@@ -576,7 +631,7 @@ impl Engine for Ds41Engine {
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {
         let pos =
             u32::try_from(n).map_err(|_| EngineError(format!("cut to position {n}: past u32")))?;
-        self.call(Cmd::Rollback(pos)).map(|_| ())
+        self.link.call(Cmd::Rollback(pos)).map(|_| ())
     }
 
     fn ctx_max(&self) -> usize {
@@ -584,7 +639,7 @@ impl Engine for Ds41Engine {
     }
 
     fn describe(&self) -> String {
-        match self.ask(Cmd::Pos) {
+        match self.link.ask(Cmd::Pos) {
             Ok(r) => format!("card={} position={}", self.card, r.pos),
             Err(e) => format!("card={} position unknown ({})", self.card, e.0),
         }
@@ -598,9 +653,84 @@ impl Engine for Ds41Engine {
 impl Drop for Ds41Engine {
     fn drop(&mut self) {
         // Closing the channel ends the thread's loop; the model is dropped there.
-        self.tx = None;
+        self.link.tx = None;
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cmd, Link, Reply};
+    use std::sync::mpsc;
+
+    const N_VOCAB: usize = 8;
+
+    /// A link to a thread that answers every `Next` as the engine thread does:
+    /// it fills the lent row and hands it back with the argmax.
+    fn echo_link() -> (Link, std::thread::JoinHandle<()>) {
+        let (tx, cmds) = mpsc::channel::<Cmd>();
+        let (replies, rx) = mpsc::channel::<Reply>();
+        let worker = std::thread::spawn(move || {
+            for (at, cmd) in cmds.into_iter().enumerate() {
+                let Cmd::Next { last, mut logits } = cmd else {
+                    panic!("the echo thread answers Next only");
+                };
+                if let Some(row) = logits.as_deref_mut() {
+                    row.fill(last as f32);
+                }
+                let reply = Reply {
+                    result: Ok(last + 1),
+                    logits,
+                    pos: at + 1,
+                };
+                if replies.send(reply).is_err() {
+                    return;
+                }
+            }
+        });
+        let link = Link {
+            tx: Some(tx),
+            rx,
+            logits: vec![0.0; N_VOCAB],
+        };
+        (link, worker)
+    }
+
+    /// Every sampled step reads into the buffer the link was built with: the
+    /// row crosses to the engine thread and back, and no token allocates one.
+    #[test]
+    fn sampled_steps_reuse_one_logits_buffer() {
+        let (mut link, worker) = echo_link();
+        let built = link.logits.as_ptr();
+        let mut out = [0.0f32; N_VOCAB];
+        for last in [3u32, 5, 9] {
+            let arg = link.next(last, Some(&mut out)).expect("a step");
+            assert_eq!(arg, last + 1);
+            assert_eq!(out, [last as f32; N_VOCAB], "the row of step {last}");
+            assert_eq!(
+                link.logits.as_ptr(),
+                built,
+                "step {last} read into another allocation than the link's"
+            );
+            assert_eq!(link.logits.len(), N_VOCAB);
+        }
+        let greedy = link.next(11, None).expect("a greedy step");
+        assert_eq!(greedy, 12);
+        assert_eq!(link.logits.as_ptr(), built, "a greedy step kept the buffer");
+        link.tx = None;
+        worker.join().expect("the echo thread");
+    }
+
+    /// A caller's buffer of another length is a named error, not a partial copy.
+    #[test]
+    fn a_short_caller_buffer_is_refused() {
+        let (mut link, worker) = echo_link();
+        let mut short = [0.0f32; N_VOCAB - 1];
+        let e = link.next(3, Some(&mut short)).expect_err("a short buffer");
+        assert!(e.0.contains("holds 7, the engine's 8"), "{e}");
+        link.tx = None;
+        worker.join().expect("the echo thread");
     }
 }
