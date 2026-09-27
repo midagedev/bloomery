@@ -103,6 +103,7 @@ pub enum Arch {
     Deepseek41,
     Qwen3moe,
     Qwen35moe,
+    Glm5next,
 }
 
 impl Arch {
@@ -125,6 +126,7 @@ impl Arch {
             "deepseek41" | DEEPSEEK4 => Ok(Arch::Deepseek41),
             "qwen3moe" => Ok(Arch::Qwen3moe),
             "qwen35moe" => Ok(Arch::Qwen35moe),
+            "glm5next" => Ok(Arch::Glm5next),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -139,6 +141,7 @@ impl Arch {
             Arch::Deepseek41 => "deepseek41",
             Arch::Qwen3moe => "qwen3moe",
             Arch::Qwen35moe => "qwen35moe",
+            Arch::Glm5next => "glm5next",
         }
     }
 }
@@ -407,6 +410,7 @@ mod tests {
             Arch::Deepseek41,
             Arch::Qwen3moe,
             Arch::Qwen35moe,
+            Arch::Glm5next,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

@@ -68,6 +68,8 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-glm5next",
+ "bloomery-levers",
  "bloomery-model",
  "bloomery-runtime",
  "cuda-core",
@@ -139,6 +141,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-glm5next",
  "bloomery-gpu-vision",
  "bloomery-levers",
  "bloomery-model",
@@ -157,6 +160,20 @@ dependencies = [
  "memmap2",
  "oxide-artifacts",
  "serde_json",
+]
+
+[[package]]
+name = "bloomery-gpu-glm5next"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-models",
+ "bloomery-runtime",
+ "cuda-core",
 ]
 
 [[package]]

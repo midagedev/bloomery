@@ -1,7 +1,7 @@
-//! `glm5next` — GLM-5.3-Flash. A header reader only: no program here runs
-//! this architecture yet. The file's keys (`hparams`), every tensor's role
-//! (`roles`) and the typed description (`spec`) exist so the coverage check
-//! can list what a program has to run.
+//! `glm5next` — GLM-5.3-Flash. The file's keys (`hparams`), every tensor's
+//! role (`roles`), the typed description (`spec`), the tensor names the
+//! program reads (`names`), the host tier's view of a routed layer (`host`)
+//! and the plan from the headers (`place`); the program is `gpu-glm5next`.
 //!
 //! The trunk interleaves KDA delta-rule layers with absorbed, rope-free
 //! latent attention layers that pick their positions by a token-pool
@@ -11,6 +11,9 @@
 //! dialect's authority is ik_llama.cpp; the line numbers cited are its
 //! `src/llama-hparams.cpp` unless another file is named.
 
+pub mod host;
 pub mod hparams;
+pub mod names;
+pub mod place;
 pub mod roles;
 pub mod spec;

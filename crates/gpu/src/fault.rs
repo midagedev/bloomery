@@ -343,6 +343,32 @@ pub mod step_order {
         CacheValue,
     ];
 
+    /// GLM-5.3-Flash (`gpu-glm5next`): a KDA layer's conv, delta step (its
+    /// lane word right after it) and gated norm; a latent layer's two cache
+    /// appends and its attention's visible count; then the router and the
+    /// handoff's id check. The token id is checked on the host before the
+    /// step (the embedding is a host row), and the hyper-connection and
+    /// projection launches read f32 rows with nothing to raise; those sites
+    /// follow the ones the step raises.
+    pub const GLM5NEXT: &[FaultSite] = &[
+        TokenId,
+        LinearConv,
+        LinearDelta,
+        DeltaLane,
+        LinearGate,
+        CachePos,
+        CacheValue,
+        AttnCount,
+        Router,
+        ExpertId,
+        HcQuant,
+        NormQuant,
+        QuantColumn,
+        AttnSel,
+        KeyCount,
+        Q5Quant,
+    ];
+
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -351,6 +377,7 @@ pub mod step_order {
             model::arch::Arch::Deepseek41 => DEEPSEEK41,
             model::arch::Arch::Qwen3moe => QWEN3MOE,
             model::arch::Arch::Qwen35moe => QWEN35MOE,
+            model::arch::Arch::Glm5next => GLM5NEXT,
         }
     }
 }
@@ -646,16 +673,21 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 4] {
+    fn every_arch() -> [Arch; 5] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
             Arch::Qwen3moe,
             Arch::Qwen35moe,
+            Arch::Glm5next,
         ];
         for a in all {
             match a {
-                Arch::Deepseek2 | Arch::Deepseek41 | Arch::Qwen3moe | Arch::Qwen35moe => {}
+                Arch::Deepseek2
+                | Arch::Deepseek41
+                | Arch::Qwen3moe
+                | Arch::Qwen35moe
+                | Arch::Glm5next => {}
             }
         }
         all

@@ -18,7 +18,7 @@
 
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, select_router};
-use models::{Arch, Extra, LatentUp, ModelSpec, Need, RopeMode, needs};
+use models::{Arch, Collapse, DeltaKind, Extra, HcMix, LatentUp, ModelSpec, Need, RopeMode, needs};
 
 use crate::placement::{CardFormat, ModelTensors, Role, Unimplemented};
 
@@ -29,6 +29,9 @@ pub enum Program {
     Deepseek41Chain,
     /// The whole-card qwen3moe body (`crates/gpu/src/arch/qwen3moe`).
     Qwen3moeBody,
+    /// The glm5next body (`crates/gpu-glm5next`): every routed expert on the
+    /// host tier.
+    Glm5nextBody,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -37,7 +40,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
     match arch {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(Program::Deepseek41Chain),
         Arch::Qwen3Moe | Arch::Qwen35Moe => Some(Program::Qwen3moeBody),
-        Arch::Glm5Next | Arch::Qwen4Exp => None,
+        Arch::Glm5Next => Some(Program::Glm5nextBody),
+        Arch::Qwen4Exp => None,
     }
 }
 
@@ -131,6 +135,106 @@ pub const AVAILABLE: &[Available] = &[
         at: "models/src/shape.rs ROUTERS, the Qwen3moe and Qwen35moe bodies",
         runs: |n| routes(n, &[RouterBody::Qwen3moe, RouterBody::Qwen35moe]),
     },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/mla.rs (the absorbed heads over gpu-deepseek41 attn.rs LATENT)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Latent {
+                    latent: 512,
+                    rope: 0,
+                    up: LatentUp::Absorbed { qk: 256, v: 256 }
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/mla.rs (the keys appended; every position attended up to \
+             place::dense_positions, a later one refused)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::TokenPool {
+                    heads: 32,
+                    d: 128,
+                    pool: 4
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu/src/latent.rs INDEX_HEAD (index_key_ln_append)",
+        runs: |n| matches!(n, Need::KeyLayerNorm),
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu/src/linear/mod.rs HEAD, CONV_TAPS (kda_conv_prep, kda_delta)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Kda { .. },
+                    d: 128,
+                    conv: 4,
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "models/src/shape.rs ROUTERS, the Glm5next body",
+        runs: |n| routes(n, &[RouterBody::Glm5next]),
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/ffn.rs (the shared expert)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    sigmoid_gate: false,
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/ffn.rs (the dense block)",
+        runs: |n| matches!(n, Need::DenseFfn { .. }),
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-deepseek41/src/hc.rs HC_STREAMS (hc_pre_q8_0)",
+        runs: |n| matches!(n, Need::Hc { streams: 4 }),
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/body.rs (each sub-layer's own mix, the streams' mean)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::HcWiring {
+                    mix: HcMix::Own,
+                    collapse: Collapse::Mean
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/kda.rs (the state and the conv ring, one lane)",
+        runs: |n| matches!(n, Need::RecurrentState),
+    },
+    Available {
+        program: Program::Glm5nextBody,
+        at: "gpu-glm5next/src/program.rs (a mixer program per layer)",
+        runs: |n| matches!(n, Need::MixedTrunk),
+    },
 ];
 
 /// Whether the router `n` names has an instance among `bodies`' rows: the
@@ -155,7 +259,9 @@ struct TypePin {
 /// calls in `Body::load`, the head's Q6_K gemv in `gpu/src/head.rs`, the
 /// card embedding's `embed_rows_q4k`; the V4.1 chain's attention gemvs, whose
 /// head-split sites in `chain/attn.rs` take q3_K or q8_0, the same head, and
-/// the hyper-connection fn `hc.rs` reads as q3_K words, `hc_f32.rs` as f32).
+/// the hyper-connection fn `hc.rs` reads as q3_K words, `hc_f32.rs` as f32;
+/// the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the head's
+/// q8_0 arm, and the embedding row the host dequantizes).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::Qwen3moeBody,
@@ -198,6 +304,48 @@ const TYPE_PINS: &[TypePin] = &[
         matrices: true,
         what: "hyper-connection fn (the chain reads q3_K and f32)",
         reads: &[GgmlType::Q3_K],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::Attention,
+        matrices: true,
+        what: "attention matrices (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::HyperConnection,
+        matrices: true,
+        what: "hyper-connection fn (hc_pre_q8_0 reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::DenseFfn,
+        matrices: true,
+        what: "dense block (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::SharedExpert,
+        matrices: true,
+        what: "shared expert (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::Head,
+        matrices: true,
+        what: "output head (the head reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Glm5nextBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        what: "token embedding (the host reads q8_0 rows)",
+        reads: &[GgmlType::Q8_0],
     },
 ];
 
@@ -242,7 +390,9 @@ pub fn check_with(
     for t in &model.tensors {
         let card = match program {
             // The V4.1 chain's rule: a stack of a type no card format loads.
-            Some(Program::Deepseek41Chain) => CardFormat::of(t.ty),
+            // The glm5next body serves every stack on the host, whose load
+            // refuses a type with no host kernel.
+            Some(Program::Deepseek41Chain | Program::Glm5nextBody) => CardFormat::of(t.ty),
             // A whole-card program, or the one still to be written, needs a
             // card expert kernel for the type.
             Some(Program::Qwen3moeBody) | None => CardFormat::of_routed(t.ty),

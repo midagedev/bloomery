@@ -36,9 +36,10 @@ impl AnyEngine {
     /// ([`model::arch::spec`]) — qwen3moe through its `open` (the whole model
     /// on one card, with the ubatch size and the flash pass its levers name,
     /// read here) once the coverage check finds nothing it cannot run.
-    /// A deepseek41 file is [`GpuError::UnsupportedArch`] here, before any
-    /// load; a file whose description has parts no program runs is refused
-    /// with every such part listed. deepseek2 has no description reader and
+    /// A deepseek41 or glm5next file (each a placed load of its own) is
+    /// [`GpuError::UnsupportedArch`] here, before any load; a file whose
+    /// description has parts no program runs is refused with every such
+    /// part listed. deepseek2 has no description reader and
     /// dispatches on the architecture string. The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
         const WHAT: &str = "AnyEngine::open";
@@ -50,7 +51,7 @@ impl AnyEngine {
             Ok(Arch::Deepseek2) => {
                 return Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?));
             }
-            Ok(a @ Arch::Deepseek41) => {
+            Ok(a @ (Arch::Deepseek41 | Arch::Glm5next)) => {
                 return Err(GpuError::UnsupportedArch(a.name().to_string()));
             }
             Ok(Arch::Qwen3moe | Arch::Qwen35moe) | Err(_) => {}

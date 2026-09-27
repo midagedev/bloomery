@@ -1,8 +1,9 @@
-//! The GPU output head: `result_norm → lm_head (Q6_K) → argmax` as one
-//! capturable sequence over resident scratch (docs/gpu-design.md decisions 4
-//! and 6). No kernels of its own — the chain is the gated `rms_norm`, the
-//! shared q8_1 quantizer, the Q6_K gemv and `argmax_fault` exactly as the
-//! block path launches them, so their gates are this chain's gates.
+//! The GPU output head: `result_norm → lm_head → argmax` as one capturable
+//! sequence over resident scratch (docs/gpu-design.md decisions 4 and 6). No
+//! kernels of its own — the chain is the gated `rms_norm`, then for a Q6_K
+//! lm_head the shared q8_1 quantizer and the Q6_K gemv, for a Q8_0 one the
+//! f32-activation Q8_0 gemv, then `argmax_fault`, exactly as the block path
+//! launches them, so their gates are this chain's gates.
 //!
 //! A head carries `m` rows (1..=8), fixed at construction: the decode step
 //! samples one position (`m = 1`), a k-token step every row. Each row's
@@ -33,33 +34,67 @@ fn head_gain(w: &Weights) -> Result<&DeviceBuffer<f32>, GpuError> {
     crate::model::f32_gain(w, "output_norm.weight")
 }
 
-/// The lm_head weight (`output.weight`): its Q6_K word plane and row width.
-/// The type is checked, not assumed — a future file whose lm_head is another
-/// K-quant needs a different gemv, and a silent word-plane reuse would
-/// misread its bytes.
-fn head_out_w(w: &Weights) -> Result<(&DeviceTensor<u32>, usize), GpuError> {
+/// The lm_head weight (`output.weight`) in a format a gemv here reads: a
+/// Q6_K word plane over q8_1 rows, or Q8_0's two planes over the f32 rows.
+enum OutW<'a> {
+    Q6K(&'a DeviceTensor<u32>),
+    Q8_0 {
+        qs: &'a DeviceTensor<u32>,
+        d: &'a DeviceTensor<u16>,
+    },
+}
+
+impl OutW<'_> {
+    /// Its rows: the vocabulary.
+    fn rows(&self) -> usize {
+        match self {
+            OutW::Q6K(w) => w.rows(),
+            OutW::Q8_0 { d, .. } => d.rows(),
+        }
+    }
+}
+
+/// The lm_head weight (`output.weight`) and its row width. The type is
+/// checked, not assumed — a file whose lm_head is another format needs a
+/// different gemv, and a silent plane reuse would misread its bytes.
+fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
     match w.get("output.weight") {
         Some(DevWeight::KQuant { ty, w, k }) => {
             if *ty != GgmlType::Q6_K {
                 return Err(GpuError::shape(
                     "head_out_w",
                     format!(
-                        "output.weight is {ty}, want Q6_K (the gemv \
-                     this head launches reads Q6_K rows)"
+                        "output.weight is {ty}, want Q6_K or Q8_0 (the gemvs \
+                     this head launches read those rows)"
                     ),
                 ));
             }
-            Ok((w, *k))
+            Ok((OutW::Q6K(w), *k))
         }
+        Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
             "output.weight",
-            "a K-quant word plane",
+            "a Q6_K word plane or Q8_0 planes",
         )),
         None => Err(GpuError::tensor(
             "head_out_w",
             "output.weight",
             "resident — load Weights with globals",
+        )),
+    }
+}
+
+/// The Q6_K lm_head's word plane, for a chain that folds the projection
+/// into its own launch ([`Head::enqueue_with_tail`]); another format is
+/// refused by name.
+fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
+    match head_out_w(w)?.0 {
+        OutW::Q6K(w) => Ok(w),
+        OutW::Q8_0 { .. } => Err(GpuError::tensor(
+            "head_q6k_w",
+            "output.weight",
+            "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
         )),
     }
 }
@@ -159,7 +194,8 @@ impl Head {
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k → argmax_fault (`argmax_rows_fault` when `m > 1`), the
+    /// → gemv_q6k (a Q8_0 lm_head: q8_0_gemv over the normed f32 rows) →
+    /// argmax_fault (`argmax_rows_fault` when `m > 1`), the
     /// argmax copying the fault word after the tokens. Pure enqueues — no
     /// allocation, no synchronization — so the same body is what a capture
     /// records.
@@ -174,8 +210,20 @@ impl Head {
             self.m,
             &mut self.normed,
         )?;
-        gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
-        gpu.enqueue_gemv_q6k(head_out_w(w)?.0, &self.act, &mut self.logits)?;
+        match head_out_w(w)?.0 {
+            OutW::Q6K(out_w) => {
+                gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
+                gpu.enqueue_gemv_q6k(out_w, &self.act, &mut self.logits)?;
+            }
+            OutW::Q8_0 { qs, d } => gpu.q8f32().enqueue_q8_0_gemv(
+                stream,
+                qs,
+                d,
+                &self.normed,
+                self.m,
+                &mut self.logits,
+            )?,
+        }
         let fault = gpu.fault_sink(LAYER_HEAD);
         if self.m == 1 {
             gpu.elem().enqueue_argmax_fault(
@@ -235,7 +283,7 @@ impl Head {
         gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
         tail(
             &self.act,
-            head_out_w(w)?.0,
+            head_q6k_w(w)?,
             gpu.fault_sink(LAYER_HEAD),
             &mut self.logits,
             &mut self.token_out,

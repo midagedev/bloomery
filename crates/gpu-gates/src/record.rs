@@ -1160,6 +1160,21 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &LISTENING,
 ];
 
+/// What `generate_glm5next` prints, in the order it prints them.
+pub static GENERATE_GLM5NEXT: &[&Kind] = &[
+    &PLAN,
+    &LOAD_GENERATOR,
+    &HOST_POPULATE,
+    &HOST_POPULATE_OFF,
+    &HOST_LOCK,
+    &CAPTURE,
+    &FED,
+    &STEP0,
+    &STEP,
+    &TOKENS,
+    &LOGITS,
+];
+
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
 /// its name and the case's.
 pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
@@ -1231,6 +1246,7 @@ mod tests {
             GENERATE_DS41,
             BLOOMERY_CHAT,
             BLOOMERY_SERVE_DS41,
+            GENERATE_GLM5NEXT,
             GATE_DEEPSEEK41_PREFILL,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
@@ -1323,6 +1339,11 @@ mod tests {
                 "bloomery-serve-ds41",
                 BLOOMERY_SERVE_DS41,
                 include_str!("../../../tools/bloomery/schema/bloomery-serve-ds41.jsonl"),
+            ),
+            (
+                "generate_glm5next",
+                GENERATE_GLM5NEXT,
+                include_str!("../../../tools/bloomery/schema/generate_glm5next.jsonl"),
             ),
             (
                 "gate_deepseek41_prefill",

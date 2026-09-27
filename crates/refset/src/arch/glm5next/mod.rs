@@ -39,8 +39,8 @@ fn model() -> String {
     MODEL.to_string()
 }
 
-/// ik's node dumps: the batch set and the decode-step sets. No gate reads
-/// them yet: the GLM gates do not exist, so `consumers` is empty.
+/// ik's node dumps: the batch set and the decode-step sets, which the
+/// end-to-end gate reads.
 pub static IK: Family = Family {
     name: "ik-glm5next",
     sets: &[BATCH, STEP4, STEP4_EVERY_NODE, D1K],
@@ -51,7 +51,7 @@ pub static IK: Family = Family {
     build: Some(Build::Is(IK_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-glm5next-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.

@@ -269,8 +269,10 @@ impl Weights {
     /// Refused unless every part is resident as a K-quant of the first
     /// part's type and width, and every part but the last ends on a word
     /// boundary (its rows' bytes a multiple of 4). F32 parts join the same
-    /// way ([`Weights::join_f32_rows`]) when the first part is F32. Load-time
-    /// only: the copies are synchronized before the parts are freed.
+    /// way ([`Weights::join_f32_rows`]) when the first part is F32, and Q8_0
+    /// parts plane by plane ([`Weights::join_q8_0_rows`]) when it is Q8_0.
+    /// Load-time only: the copies are synchronized before the parts are
+    /// freed.
     pub fn join_rows(
         &mut self,
         stream: &CudaStream,
@@ -279,8 +281,10 @@ impl Weights {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
         derived_slot_free(&self.by_name, &joint)?;
-        if let Some(DevWeight::F32 { .. }) = parts.first().and_then(|&n| self.by_name.get(n)) {
-            return self.join_f32_rows(stream, parts, joint);
+        match parts.first().and_then(|&n| self.by_name.get(n)) {
+            Some(DevWeight::F32 { .. }) => return self.join_f32_rows(stream, parts, joint),
+            Some(DevWeight::Q8_0 { .. }) => return self.join_q8_0_rows(stream, parts, joint),
+            _ => {}
         }
         let mut shape: Option<(GgmlType, usize, usize)> = None;
         let mut rows = 0usize;
@@ -424,6 +428,98 @@ impl Weights {
             self.by_name.remove(*name);
         }
         self.by_name.insert(joint, DevWeight::F32 { w, k });
+        Ok(())
+    }
+
+    /// [`Weights::join_rows`] over Q8_0 parts: every part resident as a Q8_0
+    /// file tensor of the first part's width `k`, their rows one after another
+    /// in each of the two planes (`qs` words, `d` scales), filed as the Q8_0
+    /// weight `joint` — every row the bits its own tensor holds. The parts
+    /// leave the map and their buffers are freed. Refused unless every part is
+    /// Q8_0 of that width.
+    fn join_q8_0_rows(
+        &mut self,
+        stream: &CudaStream,
+        parts: &[&str],
+        joint: String,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::join_rows";
+        let mut width: Option<usize> = None;
+        let mut rows = 0usize;
+        for &name in parts {
+            let Some(DevWeight::Q8_0 { qs, d, k }) = self.by_name.get(name) else {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{name} is not resident as Q8_0 beside Q8_0 {}", parts[0]),
+                ));
+            };
+            let want = *width.get_or_insert(*k);
+            if *k != want || qs.cols() != want / 4 || d.cols() != want / 32 || qs.rows() != d.rows()
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{name} is Q8_0 K={k} in {}x{} words and {}x{} scales; {} is K={want}",
+                        qs.rows(),
+                        qs.cols(),
+                        d.rows(),
+                        d.cols(),
+                        parts[0]
+                    ),
+                ));
+            }
+            rows += d.rows();
+        }
+        let Some(k) = width else {
+            return Err(GpuError::shape(WHAT, "no parts to join"));
+        };
+        let qs = DeviceTensor::<u32>::zeroed(stream, rows, k / 4)?;
+        let d = DeviceTensor::<u16>::zeroed(stream, rows, k / 32)?;
+        let (qs_base, d_base) = (qs.buf().cu_deviceptr(), d.buf().cu_deviceptr());
+        let mut at = 0usize;
+        for &name in parts {
+            let Some(DevWeight::Q8_0 {
+                qs: part_qs,
+                d: part_d,
+                ..
+            }) = self.by_name.get(name)
+            else {
+                return Err(GpuError::shape(WHAT, format!("{name} left the map")));
+            };
+            let n = part_d.rows();
+            let (words, scales) = (n * (k / 4), n * (k / 32));
+            let qs_off = u64::try_from(at * (k / 4) * size_of::<u32>())
+                .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
+            let d_off = u64::try_from(at * (k / 32) * size_of::<u16>())
+                .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
+            // SAFETY: rows `at .. at + n` of each plane lie inside the joint's
+            // `rows` (the parts' rows sum to `rows`), and each window over the
+            // part is that plane's whole buffer; all are `cuMemAlloc`
+            // allocations that outlive the windows, which are released below
+            // and free nothing.
+            let (mut dst_qs, src_qs, mut dst_d, src_d) = unsafe {
+                (
+                    window::<u32>(qs_base + qs_off, words, stream.context()),
+                    window::<u32>(part_qs.buf().cu_deviceptr(), words, stream.context()),
+                    window::<u16>(d_base + d_off, scales, stream.context()),
+                    window::<u16>(part_d.buf().cu_deviceptr(), scales, stream.context()),
+                )
+            };
+            let copied = dst_qs
+                .copy_from_device_async(&src_qs, stream)
+                .and_then(|()| dst_d.copy_from_device_async(&src_d, stream));
+            drop(ManuallyDrop::into_inner(dst_qs).into_raw_parts());
+            drop(ManuallyDrop::into_inner(src_qs).into_raw_parts());
+            drop(ManuallyDrop::into_inner(dst_d).into_raw_parts());
+            drop(ManuallyDrop::into_inner(src_d).into_raw_parts());
+            copied?;
+            at += n;
+        }
+        stream.synchronize()?;
+        for name in parts {
+            self.by_name.remove(*name);
+        }
+        self.by_name.insert(joint, DevWeight::Q8_0 { qs, d, k });
         Ok(())
     }
 

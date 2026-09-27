@@ -1306,6 +1306,49 @@ pub fn plan_with<'a>(
     hot: Option<&HotList>,
     card_budget: Option<u64>,
 ) -> Result<Plan<'a>, PlacementError> {
+    plan_rule(model, machine, ctx_max, kv, hot, card_budget, true)
+}
+
+/// [`plan`] with every routed stack on the host: no card is eligible for the
+/// expert rule, for a program with no card kernel for the model's routed
+/// experts. The card budget applies as in [`plan`]; a hot list ranks card
+/// experts, and this plan keeps none, so one is refused by name.
+pub fn plan_host_routed<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    levers: &PlanLevers,
+) -> Result<Plan<'a>, PlacementError> {
+    if let Some(h) = &levers.hot {
+        return Err(PlacementError::HotList {
+            path: h.path().to_string(),
+            detail: "this plan keeps every routed expert on the host: a hot list ranks none"
+                .to_string(),
+        });
+    }
+    plan_rule(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        None,
+        levers.card_budget_bytes,
+        false,
+    )
+}
+
+/// [`plan_with`], the expert rule run on each card's eligible layers when
+/// `card_experts` and on none otherwise.
+fn plan_rule<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    hot: Option<&HotList>,
+    card_budget: Option<u64>,
+    card_experts: bool,
+) -> Result<Plan<'a>, PlacementError> {
     if let Some(h) = hot {
         h.check_model(model)?;
     }
@@ -1341,7 +1384,11 @@ pub fn plan_with<'a>(
             - i128::from(card.context_bytes)
             - i128::from(card.scratch_bytes)
             - i128::from(card.margin_bytes);
-        let eligible = eligible(card, &routed, model);
+        let eligible = if card_experts {
+            eligible(card, &routed, model)
+        } else {
+            Vec::new()
+        };
         let uploads = card_uploads(model, c, &rows, &eligible)?;
         if let Some(b) = card_budget {
             let dense = footprint(card.granule_bytes, &uploads, &n_l)?;
