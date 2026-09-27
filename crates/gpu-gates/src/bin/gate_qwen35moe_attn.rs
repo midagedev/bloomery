@@ -69,6 +69,21 @@
 //!    the gated quantizer on ik's `fa-3` with the gates of `Qaux-3` against
 //!    the plain quantizer on ik's `qkv_gated-3`, codes within one and scales
 //!    within `γ(10)` (ik's sigmoid is its CPU `expf`, ours the card's).
+//! 7. Qwen3.8-Flash-Next's layout (24 query heads over 2, group 12, heads of
+//!    256) through the pack-of-four entries (`flash_gqa::enqueue_pass_256_p4`,
+//!    `flash_gqa_prefill::enqueue_256_p4`), head `h` reading key head `h /
+//!    12`: clause 2 at the counts [`DEC_KEYS_Q38`] (one key, and 2,051 — 33
+//!    segments, the last of three keys) with a group of 13 refused by name,
+//!    and clause 4 with [`SEED_Q38`] added (a 14-row tail tile, its last row
+//!    slice two positions short; counts 2,049–2,051), the lines tagged `p4
+//!    24/2`.
+//! 8. Cross geometry: Qwen3.6's layout through the pack-of-four entries (two
+//!    packs a key head) bit for bit the eight-head entries' output — the
+//!    decode passes on one-row launches and the eight-row launch, the prefill
+//!    on [`SEED_CROSS`]. A row's arithmetic does not depend on the heads that
+//!    share its block or tensor-core tile, so the two geometries agree to the
+//!    bit; the clause pins the new block and row maps to the gated kernel.
+//!    The window refusals of clause 4 (both layouts) run last.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -87,8 +102,8 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, HEAD_256 as HEAD, KEY_TILE, SEG_KEYS, partials_ms_len,
-        partials_v_len_256, segments_for,
+        FlashGqaKernels, GROUP, GqaArgs, HEAD_256 as HEAD, KEY_TILE, PACK_4, SEG_KEYS,
+        partials_ms_len, partials_v_len_256, segments_for,
     };
     use bloomery_gpu::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, KEY_TILE as PREF_TILE};
     use bloomery_gpu::gated_quant::{GateLayout, GatedQuantKernels};
@@ -127,9 +142,16 @@ mod gate {
     const ROPE_P0: usize = 3;
     const ROPE_CTX: usize = 40;
 
+    /// Qwen3.8-Flash-Next's full-attention layers: 24 query heads over the
+    /// same two key heads (group 12), heads of 256, served by the pack-of-four
+    /// entries.
+    const N_HEAD_Q38: usize = 24;
+
     /// Decode: the live counts of the one-row launches, and the rows of the
-    /// multi-row launch.
+    /// multi-row launch. Qwen3.8's add one key (the first position) and 2,051,
+    /// the first program's last: 33 segments, the last holding three keys.
     const DEC_KEYS: [usize; 4] = [5, 64, 1025, 4097];
+    const DEC_KEYS_Q38: [usize; 5] = [1, 5, 512, 2051, 4097];
     const ROWS: usize = 8;
     /// Cache rows past a launch's largest count.
     const PAD: usize = 40;
@@ -137,6 +159,101 @@ mod gate {
     /// The prefill flash's seeded launches: row counts and first positions.
     const SEED_T: [usize; 5] = [1, 17, 64, 65, 512];
     const SEED_P0: [usize; 4] = [0, 63, 64, 1000];
+    /// Qwen3.8's further `(p0, T)`: a tail tile of 14 of the pack-of-four
+    /// kernel's 16 positions (its last row slice two positions short), and the
+    /// first program's last three positions (counts 2,049–2,051).
+    const SEED_Q38: [(usize, usize); 2] = [(0, 30), (2048, 3)];
+    /// The cross-geometry clause's prefill launches, `(p0, T)`.
+    const SEED_CROSS: [(usize, usize); 3] = [(0, 17), (63, 65), (1000, 30)];
+
+    /// A head layout a flash clause runs at, and the entries that serve it:
+    /// `n_head` query heads over [`N_KV`] key heads, through the eight-head
+    /// entries (`enqueue_pass_256`, `enqueue_256`) or the pack-of-four ones
+    /// (`enqueue_pass_256_p4`, `enqueue_256_p4`).
+    #[derive(Clone, Copy)]
+    struct Shape {
+        n_head: usize,
+        pack4: bool,
+    }
+
+    impl Shape {
+        /// Query heads per key head: head `h` reads key head `h / group`.
+        fn group(self) -> usize {
+            self.n_head / N_KV
+        }
+
+        /// f32 of one row's query (or output) heads.
+        fn width(self) -> usize {
+            self.n_head * HEAD
+        }
+
+        /// The tag a clause's lines carry: none for Qwen3.6 through its own
+        /// entries.
+        fn tag(self) -> String {
+            if self.pack4 {
+                format!(" p4 {}/{N_KV}", self.n_head)
+            } else {
+                String::new()
+            }
+        }
+
+        /// The prefill enqueue's name, as its refusals carry it.
+        fn pref_what(self) -> &'static str {
+            if self.pack4 {
+                "flash_gqa_prefill::enqueue_256_p4"
+            } else {
+                "flash_gqa_prefill::enqueue_256"
+            }
+        }
+    }
+
+    /// Qwen3.6 through the eight-head entries.
+    const Q36: Shape = Shape {
+        n_head: N_HEAD,
+        pack4: false,
+    };
+    /// Qwen3.8 (group 12) through the pack-of-four entries.
+    const Q38: Shape = Shape {
+        n_head: N_HEAD_Q38,
+        pack4: true,
+    };
+    /// Qwen3.6's layout through the pack-of-four entries (two packs a key
+    /// head): the cross-geometry clause's second arm.
+    const Q36_P4: Shape = Shape {
+        n_head: N_HEAD,
+        pack4: true,
+    };
+    const _: () = assert!(GROUP == 8 && N_HEAD == N_KV * GROUP);
+    const _: () = assert!(PACK_4 == 4 && N_HEAD_Q38 == N_KV * 3 * PACK_4);
+
+    /// One decode pass through `sh`'s entry.
+    fn enqueue_dec(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        sh: Shape,
+        args: GqaArgs<'_>,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        if sh.pack4 {
+            k.enqueue_pass_256_p4(stream, args, sh.n_head, mma)
+        } else {
+            k.enqueue_pass_256(stream, args, mma)
+        }
+    }
+
+    /// One prefill launch through `sh`'s entry.
+    fn enqueue_pref(
+        kp: &FlashGqaPrefill,
+        stream: &CudaStream,
+        sh: Shape,
+        args: GqaPrefillArgs<'_>,
+    ) -> Result<(), GpuError> {
+        if sh.pack4 {
+            kp.enqueue_256_p4(stream, args)
+        } else {
+            kp.enqueue_256(stream, args)
+        }
+    }
 
     /// The seeded query's scale over [`activations`]' [-1, 1): scores of a
     /// few units, so the weights spread over several orders of magnitude.
@@ -516,10 +633,12 @@ mod gate {
     }
 
     /// Every (row, head) of `y` against its exact value under `pass`'s bound:
-    /// `q` holds the rows' query heads token-major, `counts[t]` row `t`'s keys.
-    /// Returns whether every value is within its bound and the largest
-    /// measured over bound. Rows are shared among worker threads.
+    /// `q` holds the rows' `sh.n_head` query heads token-major, head `h`
+    /// reading key head `h / sh.group()`, `counts[t]` row `t`'s keys. Returns
+    /// whether every value is within its bound and the largest measured over
+    /// bound. Rows are shared among worker threads.
     fn band_rows(
+        sh: Shape,
         q: &[f32],
         counts: &[usize],
         cache: &HostCache,
@@ -535,9 +654,9 @@ mod gate {
                     sc.spawn(move || {
                         let (mut ok, mut worst) = (true, 0.0f64);
                         for (t, &n) in counts.iter().enumerate().skip(r0).take(chunk) {
-                            for h in 0..N_HEAD {
-                                let plane = (h / GROUP) * cache.ctx * HEAD;
-                                let row = (t * N_HEAD + h) * HEAD;
+                            for h in 0..sh.n_head {
+                                let plane = (h / sh.group()) * cache.ctx * HEAD;
+                                let row = (t * sh.n_head + h) * HEAD;
                                 let ex = exact(
                                     &q[row..row + HEAD],
                                     &cache.kf[plane..plane + n * HEAD],
@@ -609,15 +728,17 @@ mod gate {
 
     // ---------------------------------------------------------- decode
 
-    /// One decode launch of `n_keys.len()` rows, into fresh scratch, read back.
+    /// One decode launch of `n_keys.len()` rows through `sh`'s entry, into
+    /// fresh scratch, read back.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the kernels, the stream and sink, the rows, the cache and its height, the pass"
+        reason = "the kernels, the stream and sink, the layout, the rows, the cache and its height, the pass"
     )]
     fn run_dec(
         k: &FlashGqaKernels,
         stream: &CudaStream,
         fault: FaultSink,
+        sh: Shape,
         q: &[f32],
         n_keys: &[u32],
         (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
@@ -627,11 +748,13 @@ mod gate {
         let m = n_keys.len();
         let qd = DeviceBuffer::from_host(stream, q)?;
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, N_HEAD, ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, N_HEAD, ctx))?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * N_HEAD * HEAD)?;
-        k.enqueue_pass_256(
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, sh.n_head, ctx))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, sh.n_head, ctx))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * sh.width())?;
+        enqueue_dec(
+            k,
             stream,
+            sh,
             GqaArgs {
                 q: &qd,
                 kc,
@@ -652,30 +775,38 @@ mod gate {
         Ok(y.to_host_vec(stream)?)
     }
 
-    fn decode_check(gpu: &Gpu, k: &FlashGqaKernels) -> Result<bool, GateError> {
+    /// The decode clause (module doc, 2) at `sh`: `keys` the one-row
+    /// launches' counts.
+    fn decode_check(
+        gpu: &Gpu,
+        k: &FlashGqaKernels,
+        sh: Shape,
+        keys: &[usize],
+    ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
-        let w = N_HEAD * HEAD;
+        let w = sh.width();
+        let tag = sh.tag();
         let mut ok = true;
-        for (i, &live) in DEC_KEYS.iter().enumerate() {
+        for (i, &live) in keys.iter().enumerate() {
             let ctx = live + PAD;
             let seed = 100 + 10 * u32::try_from(i)?;
             let c = cache(stream, ctx, live, seed)?;
-            let q: Vec<f32> = activations(HEAD, N_HEAD, seed + 5)
+            let q: Vec<f32> = activations(HEAD, sh.n_head, seed + 5)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
                 .collect();
             let nk = [u32::try_from(live)?];
             for (pass, mma) in [(Pass::Scalar, false), (Pass::Mma, true)] {
-                let y = run_dec(k, stream, unl, &q, &nk, (&c.kc, &c.vc), ctx, mma)?;
-                let y2 = run_dec(k, stream, unl, &q, &nk, (&c.kc, &c.vc), ctx, mma)?;
-                let yn = run_dec(k, stream, unl, &q, &nk, (&c.kn, &c.vn), ctx, mma)?;
+                let y = run_dec(k, stream, unl, sh, &q, &nk, (&c.kc, &c.vc), ctx, mma)?;
+                let y2 = run_dec(k, stream, unl, sh, &q, &nk, (&c.kc, &c.vc), ctx, mma)?;
+                let yn = run_dec(k, stream, unl, sh, &q, &nk, (&c.kn, &c.vn), ctx, mma)?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
-                let (band, worst) = band_rows(&q, &[live], &c.host, &y, pass);
+                let (band, worst) = band_rows(sh, &q, &[live], &c.host, &y, pass);
                 let pass_ok = band && rerun && nan_same;
                 println!(
-                    "decode pass={} keys={live} ctx={ctx} segments={}: measured/bound {worst:.3e} \
-                     band={band} rerun={rerun} nan_padding_same={nan_same} {}",
+                    "decode{tag} pass={} keys={live} ctx={ctx} segments={}: measured/bound \
+                     {worst:.3e} band={band} rerun={rerun} nan_padding_same={nan_same} {}",
                     pass.name(),
                     segments_for(ctx),
                     verdict(pass_ok)
@@ -689,12 +820,12 @@ mod gate {
         let live = 1025usize;
         let ctx = live + PAD;
         let c = cache(stream, ctx, live, 300)?;
-        let q1 = activations(HEAD, N_HEAD, 305);
+        let q1 = activations(HEAD, sh.n_head, 305);
         let rows: Vec<f32> = (0..ROWS)
             .flat_map(|t| {
                 let q1 = &q1;
-                (0..N_HEAD).flat_map(move |h| {
-                    q1[((h + t) % N_HEAD) * HEAD..][..HEAD]
+                (0..sh.n_head).flat_map(move |h| {
+                    q1[((h + t) % sh.n_head) * HEAD..][..HEAD]
                         .iter()
                         .map(|v| v * SEED_Q_SCALE)
                 })
@@ -705,13 +836,14 @@ mod gate {
             .collect::<Result<_, _>>()?;
         for mma in [false, true] {
             let name = if mma { "mma" } else { "scalar" };
-            let all = run_dec(k, stream, unl, &rows, &counts, (&c.kc, &c.vc), ctx, mma)?;
+            let all = run_dec(k, stream, unl, sh, &rows, &counts, (&c.kc, &c.vc), ctx, mma)?;
             let mut alone = true;
             for t in 0..ROWS {
                 let one = run_dec(
                     k,
                     stream,
                     unl,
+                    sh,
                     &rows[t * w..(t + 1) * w],
                     &counts[t..=t],
                     (&c.kc, &c.vc),
@@ -721,8 +853,8 @@ mod gate {
                 alone &= bits_equal(&all[t * w..(t + 1) * w], &one);
             }
             println!(
-                "decode rows pass={name} m={ROWS} keys={counts:?} ctx={ctx}: each row = its one-row \
-                 launch bit for bit {}",
+                "decode{tag} rows pass={name} m={ROWS} keys={counts:?} ctx={ctx}: each row = its \
+                 one-row launch bit for bit {}",
                 verdict(alone)
             );
             ok &= alone;
@@ -737,6 +869,7 @@ mod gate {
                 k,
                 stream,
                 gpu.layer_sink(LAYER)?,
+                sh,
                 &rows,
                 &bad,
                 (&c.kc, &c.vc),
@@ -757,7 +890,7 @@ mod gate {
             }
             let fault_ok = before.is_none() && raised == want && nan && others;
             println!(
-                "decode fault pass={name}: counts {} and 0 at rows {bad_hi}, {bad_zero}: word \
+                "decode{tag} fault pass={name}: counts {} and 0 at rows {bad_hi}, {bad_zero}: word \
                  {raised:?} (want {want:?}), those rows NaN {nan}, other rows bit-identical {others} {}",
                 ctx + 1,
                 verdict(fault_ok)
@@ -768,12 +901,15 @@ mod gate {
             let qd = DeviceBuffer::from_host(stream, &rows)?;
             let nk = DeviceBuffer::from_host(stream, &counts)?;
             let mut pv =
-                DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, N_HEAD, ctx))?;
-            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, N_HEAD, ctx))?;
+                DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, sh.n_head, ctx))?;
+            let mut pms =
+                DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, sh.n_head, ctx))?;
             let mut yg = DeviceBuffer::<f32>::zeroed(stream, ROWS * w)?;
             let graph = gpu.capture(|s| {
-                k.enqueue_pass_256(
+                enqueue_dec(
+                    k,
                     s,
+                    sh,
                     GqaArgs {
                         q: &qd,
                         kc: &c.kc,
@@ -797,11 +933,49 @@ mod gate {
             let nodes = graph.node_count();
             let graph_ok = same && nodes == 2;
             println!(
-                "decode graph pass={name} m={ROWS}: eager_vs_graph_bit_identical={same} \
+                "decode{tag} graph pass={name} m={ROWS}: eager_vs_graph_bit_identical={same} \
                  graph_nodes={nodes} {}",
                 verdict(graph_ok)
             );
             ok &= graph_ok;
+
+            // A group the pack-of-four entry is not built for: 26 heads over
+            // two key heads, refused by name before any launch.
+            if sh.pack4 {
+                let n_head = sh.n_head + 2;
+                let r = k.enqueue_pass_256_p4(
+                    stream,
+                    GqaArgs {
+                        q: &qd,
+                        kc: &c.kc,
+                        vc: &c.vc,
+                        n_keys: &nk,
+                        scale: scale(),
+                        n_kv: N_KV,
+                        ctx,
+                        m: ROWS,
+                        part_v: &mut pv,
+                        part_ms: &mut pms,
+                        fault: gpu.unlabelled_sink(),
+                        y: &mut yg,
+                    },
+                    n_head,
+                    mma,
+                );
+                let named = matches!(
+                    r,
+                    Err(GpuError::Shape {
+                        what: "flash_gqa::enqueue_256_p4",
+                        ..
+                    })
+                );
+                println!(
+                    "decode{tag} refusal pass={name} n_head={n_head} over n_kv={N_KV}: {} {}",
+                    r.err().map_or("accepted".to_string(), |e| e.to_string()),
+                    verdict(named)
+                );
+                ok &= named;
+            }
         }
         Ok(ok)
     }
@@ -850,8 +1024,8 @@ mod gate {
         let kc = DeviceBuffer::from_host(stream, &kb)?;
         let vc = DeviceBuffer::from_host(stream, &vb)?;
         let unl = gpu.unlabelled_sink();
-        let dec = run_dec(k, stream, unl, &q, &[2], (&kc, &vc), ctx, true)?;
-        let pre = run_pref(kp, gpu, &q, &[2], (&kc, &vc), ctx)?;
+        let dec = run_dec(k, stream, unl, Q36, &q, &[2], (&kc, &vc), ctx, true)?;
+        let pre = run_pref(kp, gpu, Q36, &q, &[2], (&kc, &vc), ctx)?;
         let (dec_ok, pre_ok) = (bits_equal(&dec, &want), bits_equal(&pre, &want));
         let pass = dec_ok && pre_ok;
         println!(
@@ -865,11 +1039,12 @@ mod gate {
 
     // --------------------------------------------------------- prefill
 
-    /// One prefill launch of `n_keys.len()` rows, into fresh output, read
-    /// back. The fault word is the caller's to read.
+    /// One prefill launch of `n_keys.len()` rows through `sh`'s entry, into
+    /// fresh output, read back. The fault word is the caller's to read.
     fn run_pref(
         kp: &FlashGqaPrefill,
         gpu: &Gpu,
+        sh: Shape,
         q: &[f32],
         n_keys: &[u32],
         (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
@@ -877,12 +1052,13 @@ mod gate {
     ) -> Result<Vec<f32>, GateError> {
         let stream = gpu.stream();
         let qd = DeviceBuffer::from_host(stream, q)?;
-        run_pref_dev(kp, gpu, &qd, n_keys, (kc, vc), ctx)
+        run_pref_dev(kp, gpu, sh, &qd, n_keys, (kc, vc), ctx)
     }
 
     fn run_pref_dev(
         kp: &FlashGqaPrefill,
         gpu: &Gpu,
+        sh: Shape,
         q: &DeviceBuffer<f32>,
         n_keys: &[u32],
         (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
@@ -891,16 +1067,18 @@ mod gate {
         let stream = gpu.stream();
         let t = n_keys.len();
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * N_HEAD * HEAD)?;
-        kp.enqueue_256(
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * sh.width())?;
+        enqueue_pref(
+            kp,
             stream,
+            sh,
             GqaPrefillArgs {
                 q,
                 kc,
                 vc,
                 n_keys: &nk,
                 scale: scale(),
-                n_head: N_HEAD,
+                n_head: sh.n_head,
                 n_kv: N_KV,
                 ctx,
                 t,
@@ -914,64 +1092,93 @@ mod gate {
 
     /// Each row of `all` against the same row launched alone. Returns the
     /// rows that differ in any bit.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernels and card, the layout, the rows, the cache and its height, the launch"
+    )]
     fn rows_alone(
         kp: &FlashGqaPrefill,
         gpu: &Gpu,
+        sh: Shape,
         q: &[f32],
         counts: &[u32],
         cache: (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
         ctx: usize,
         all: &[f32],
     ) -> Result<usize, GateError> {
-        let w = N_HEAD * HEAD;
+        let w = sh.width();
         let mut differ = 0usize;
         for (t, &c) in counts.iter().enumerate() {
-            let one = run_pref(kp, gpu, &q[t * w..(t + 1) * w], &[c], cache, ctx)?;
+            let one = run_pref(kp, gpu, sh, &q[t * w..(t + 1) * w], &[c], cache, ctx)?;
             differ += usize::from(!bits_equal(&all[t * w..(t + 1) * w], &one));
         }
         Ok(differ)
     }
 
-    fn prefill_check(gpu: &Gpu, kp: &FlashGqaPrefill) -> Result<bool, GateError> {
+    /// What the window check of one layout reads: the fault launch's query
+    /// and cache bytes, its clean counts and output, and the cache height.
+    struct Windows {
+        q: Vec<f32>,
+        kb: Vec<u16>,
+        vb: Vec<u16>,
+        clean: Vec<u32>,
+        y: Vec<f32>,
+        ctx: usize,
+    }
+
+    /// The prefill clause (module doc, 4) at `sh`: the seeded launches
+    /// `SEED_P0 × SEED_T` and then `extra` (`(p0, T)` pairs), the fault, graph
+    /// and head-count refusal checks. Returns the verdict and what
+    /// [`misaligned`] reads, which the caller runs last.
+    fn prefill_check(
+        gpu: &Gpu,
+        kp: &FlashGqaPrefill,
+        sh: Shape,
+        extra: &[(usize, usize)],
+    ) -> Result<(bool, Windows), GateError> {
         let stream = gpu.stream();
-        let w = N_HEAD * HEAD;
+        let w = sh.width();
+        let tag = sh.tag();
         let mut ok = true;
         let mut seed = 500u32;
-        for &p0 in &SEED_P0 {
-            for &t in &SEED_T {
-                seed += 7;
-                let ctx = p0 + t + PAD;
-                let live = p0 + t;
-                let c = cache(stream, ctx, live, seed)?;
-                let q: Vec<f32> = activations(HEAD, t * N_HEAD, seed + 3)
-                    .iter()
-                    .map(|v| v * SEED_Q_SCALE)
-                    .collect();
-                let counts: Vec<u32> = (0..t)
-                    .map(|i| u32::try_from(p0 + i + 1))
-                    .collect::<Result<_, _>>()?;
-                let y = run_pref(kp, gpu, &q, &counts, (&c.kc, &c.vc), ctx)?;
-                let y2 = run_pref(kp, gpu, &q, &counts, (&c.kc, &c.vc), ctx)?;
-                let yn = run_pref(kp, gpu, &q, &counts, (&c.kn, &c.vn), ctx)?;
-                let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
-                let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
-                let (band, worst) = band_rows(&q, &cu, &c.host, &y, Pass::Prefill);
-                let differ = rows_alone(kp, gpu, &q, &counts, (&c.kc, &c.vc), ctx, &y)?;
-                let pass = rerun && nan_same && band && differ == 0;
-                println!(
-                    "prefill seeded T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} band={band} \
-                     rows_alone_differing={differ} rerun={rerun} nan_padding_same={nan_same} {}",
-                    verdict(pass)
-                );
-                ok &= pass;
-            }
+        let seeded = SEED_P0
+            .iter()
+            .flat_map(|&p0| SEED_T.iter().map(move |&t| (p0, t)))
+            .chain(extra.iter().copied());
+        for (p0, t) in seeded {
+            seed += 7;
+            let ctx = p0 + t + PAD;
+            let live = p0 + t;
+            let c = cache(stream, ctx, live, seed)?;
+            let q: Vec<f32> = activations(HEAD, t * sh.n_head, seed + 3)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let counts: Vec<u32> = (0..t)
+                .map(|i| u32::try_from(p0 + i + 1))
+                .collect::<Result<_, _>>()?;
+            let y = run_pref(kp, gpu, sh, &q, &counts, (&c.kc, &c.vc), ctx)?;
+            let y2 = run_pref(kp, gpu, sh, &q, &counts, (&c.kc, &c.vc), ctx)?;
+            let yn = run_pref(kp, gpu, sh, &q, &counts, (&c.kn, &c.vn), ctx)?;
+            let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
+            let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
+            let (band, worst) = band_rows(sh, &q, &cu, &c.host, &y, Pass::Prefill);
+            let differ = rows_alone(kp, gpu, sh, &q, &counts, (&c.kc, &c.vc), ctx, &y)?;
+            let pass = rerun && nan_same && band && differ == 0;
+            println!(
+                "prefill{tag} seeded T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} \
+                 band={band} rows_alone_differing={differ} rerun={rerun} \
+                 nan_padding_same={nan_same} {}",
+                verdict(pass)
+            );
+            ok &= pass;
         }
 
         // A count of zero and one past the cache, on a 17-row launch at 63.
         let (t, p0) = (17usize, 63usize);
         let ctx = p0 + t + PAD;
         let c = cache(stream, ctx, p0 + t, 91)?;
-        let q = activations(HEAD, t * N_HEAD, 94);
+        let q = activations(HEAD, t * sh.n_head, 94);
         let clean: Vec<u32> = (0..t)
             .map(|i| u32::try_from(p0 + i + 1))
             .collect::<Result<_, _>>()?;
@@ -980,9 +1187,9 @@ mod gate {
         bad[bad_hi] = u32::try_from(ctx + 1)?;
         bad[bad_zero] = 0;
         let before = gpu.fault()?;
-        let y = run_pref(kp, gpu, &q, &clean, (&c.kc, &c.vc), ctx)?;
+        let y = run_pref(kp, gpu, sh, &q, &clean, (&c.kc, &c.vc), ctx)?;
         let after_clean = gpu.fault()?;
-        let yb = run_pref(kp, gpu, &q, &bad, (&c.kc, &c.vc), ctx)?;
+        let yb = run_pref(kp, gpu, sh, &q, &bad, (&c.kc, &c.vc), ctx)?;
         let raised = gpu.take_fault()?;
         let mut others = true;
         let mut nan = true;
@@ -998,8 +1205,9 @@ mod gate {
         let fault_ok =
             before.is_none() && after_clean.is_none() && raised == Some(want) && nan && others;
         println!(
-            "prefill fault: counts {} (past ctx {ctx}) and 0 at rows {bad_hi}, {bad_zero}: word \
-             {raised:?} (want {want:?}), those rows NaN {nan}, other rows bit-identical {others} {}",
+            "prefill{tag} fault: counts {} (past ctx {ctx}) and 0 at rows {bad_hi}, {bad_zero}: \
+             word {raised:?} (want {want:?}), those rows NaN {nan}, other rows bit-identical \
+             {others} {}",
             ctx + 1,
             verdict(fault_ok)
         );
@@ -1010,15 +1218,17 @@ mod gate {
         let nk = DeviceBuffer::from_host(stream, &clean)?;
         let mut yg = DeviceBuffer::<f32>::zeroed(stream, t * w)?;
         let graph = gpu.capture(|s| {
-            kp.enqueue_256(
+            enqueue_pref(
+                kp,
                 s,
+                sh,
                 GqaPrefillArgs {
                     q: &qd,
                     kc: &c.kc,
                     vc: &c.vc,
                     n_keys: &nk,
                     scale: scale(),
-                    n_head: N_HEAD,
+                    n_head: sh.n_head,
                     n_kv: N_KV,
                     ctx,
                     t,
@@ -1033,22 +1243,25 @@ mod gate {
         let nodes = graph.node_count();
         let graph_ok = same && nodes == 1;
         println!(
-            "prefill graph T={t} p0={p0}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            "prefill{tag} graph T={t} p0={p0}: eager_vs_graph_bit_identical={same} \
+             graph_nodes={nodes} {}",
             verdict(graph_ok)
         );
         ok &= graph_ok;
 
         // A head count the kernel is not built for.
         let mut yr = DeviceBuffer::<f32>::zeroed(stream, t * w)?;
-        let refused = kp.enqueue_256(
+        let refused = enqueue_pref(
+            kp,
             stream,
+            sh,
             GqaPrefillArgs {
                 q: &qd,
                 kc: &c.kc,
                 vc: &c.vc,
                 n_keys: &nk,
                 scale: scale(),
-                n_head: N_HEAD - 1,
+                n_head: sh.n_head - 1,
                 n_kv: N_KV,
                 ctx,
                 t,
@@ -1056,33 +1269,129 @@ mod gate {
                 y: &mut yr,
             },
         );
-        let refuse_ok = refused.is_err();
+        let refuse_ok =
+            matches!(refused, Err(GpuError::Shape { what, .. }) if what == sh.pref_what());
         println!(
-            "prefill refusal n_head={} over n_kv={N_KV}: {} {}",
-            N_HEAD - 1,
+            "prefill{tag} refusal n_head={} over n_kv={N_KV}: {} {}",
+            sh.n_head - 1,
             refused
                 .err()
                 .map_or("accepted".to_string(), |e| e.to_string()),
             verdict(refuse_ok)
         );
         ok &= refuse_ok;
-        ok &= misaligned(kp, gpu, &q, (&c.kb, &c.vb), (&clean, &y), ctx)?;
+        let win = Windows {
+            q,
+            kb: c.kb,
+            vb: c.vb,
+            clean,
+            y,
+            ctx,
+        };
+        Ok((ok, win))
+    }
+
+    /// The pack-of-four entries against the eight-head ones on Qwen3.6's
+    /// layout (two packs a key head): a row's arithmetic does not depend on
+    /// the rows or heads that share its block or its tensor-core tile, so both
+    /// geometries give every output bit for bit — the decode passes on one-row
+    /// launches and the eight-row launch, the prefill on [`SEED_CROSS`].
+    fn cross_check(
+        gpu: &Gpu,
+        k: &FlashGqaKernels,
+        kp: &FlashGqaPrefill,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let mut ok = true;
+        for (i, &live) in [5usize, 64, 1025].iter().enumerate() {
+            let ctx = live + PAD;
+            let seed = 700 + 10 * u32::try_from(i)?;
+            let c = cache(stream, ctx, live, seed)?;
+            let q: Vec<f32> = activations(HEAD, N_HEAD, seed + 5)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let counts: Vec<u32> = if live == 1025 {
+                (0..ROWS)
+                    .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)))
+                    .collect::<Result<_, _>>()?
+            } else {
+                vec![u32::try_from(live)?]
+            };
+            let q: Vec<f32> = q
+                .iter()
+                .cycle()
+                .take(counts.len() * q.len())
+                .copied()
+                .collect();
+            for mma in [false, true] {
+                let a = run_dec(k, stream, unl, Q36, &q, &counts, (&c.kc, &c.vc), ctx, mma)?;
+                let b = run_dec(
+                    k,
+                    stream,
+                    unl,
+                    Q36_P4,
+                    &q,
+                    &counts,
+                    (&c.kc, &c.vc),
+                    ctx,
+                    mma,
+                )?;
+                let same = bits_equal(&a, &b);
+                println!(
+                    "cross decode pass={} m={} keys={live}: p4 = group-8 entry bit for bit {same} {}",
+                    if mma { "mma" } else { "scalar" },
+                    counts.len(),
+                    verdict(same)
+                );
+                ok &= same;
+            }
+        }
+        for (i, &(p0, t)) in SEED_CROSS.iter().enumerate() {
+            let ctx = p0 + t + PAD;
+            let seed = 800 + 10 * u32::try_from(i)?;
+            let c = cache(stream, ctx, p0 + t, seed)?;
+            let q: Vec<f32> = activations(HEAD, t * N_HEAD, seed + 3)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            let counts: Vec<u32> = (0..t)
+                .map(|i| u32::try_from(p0 + i + 1))
+                .collect::<Result<_, _>>()?;
+            let a = run_pref(kp, gpu, Q36, &q, &counts, (&c.kc, &c.vc), ctx)?;
+            let b = run_pref(kp, gpu, Q36_P4, &q, &counts, (&c.kc, &c.vc), ctx)?;
+            let same = bits_equal(&a, &b);
+            println!(
+                "cross prefill T={t} p0={p0}: p4 = group-8 entry bit for bit {same} {}",
+                verdict(same)
+            );
+            ok &= same;
+        }
         Ok(ok)
     }
 
-    /// `gate_qwen3moe_flash`'s window check at a head of 256: aligned windows
-    /// accepted and bit for bit the plain launch, `q` at 4 bytes past 8 and
-    /// `kc`/`vc` at 8 bytes past 16 refused by name before any launch. The
-    /// last device check of its section: a launch through a misaligned window
-    /// is a sticky error that ends the context.
+    /// `gate_qwen3moe_flash`'s window check at a head of 256, through `sh`'s
+    /// entry: aligned windows accepted and bit for bit the plain launch, `q`
+    /// at 4 bytes past 8 and `kc`/`vc` at 8 bytes past 16 refused by name
+    /// before any launch. The gate's last device checks: a launch through a
+    /// misaligned window is a sticky error that ends the context.
     fn misaligned(
         kp: &FlashGqaPrefill,
         gpu: &Gpu,
-        q: &[f32],
-        (kb, vb): (&[u16], &[u16]),
-        (clean, y): (&[u32], &[f32]),
-        ctx: usize,
+        sh: Shape,
+        win: &Windows,
     ) -> Result<bool, GateError> {
+        let Windows {
+            q,
+            kb,
+            vb,
+            clean,
+            y,
+            ctx,
+        } = win;
+        let (q, kb, vb, clean, y, ctx) = (&q[..], &kb[..], &vb[..], &clean[..], &y[..], *ctx);
+        let tag = sh.tag();
         let stream = gpu.stream();
         let t = clean.len();
         let qd = DeviceBuffer::from_host(stream, q)?;
@@ -1110,30 +1419,32 @@ mod gate {
                 window::<u16>(v_pad.cu_deviceptr() + 8, vb.len(), cx),
             )
         };
-        let ya = run_pref_dev(kp, gpu, &q_al, clean, (&*k_al, &*v_al), ctx)?;
+        let ya = run_pref_dev(kp, gpu, sh, &q_al, clean, (&*k_al, &*v_al), ctx)?;
         let aligned_ok = bits_equal(&ya, y);
         println!(
-            "prefill windows at aligned offsets: accepted, bit-identical to the plain launch \
-             {aligned_ok} {}",
+            "prefill{tag} windows at aligned offsets: accepted, bit-identical to the plain \
+             launch {aligned_ok} {}",
             verdict(aligned_ok)
         );
         let mut ok = aligned_ok;
-        let mut ym = DeviceBuffer::<f32>::zeroed(stream, t * N_HEAD * HEAD)?;
+        let mut ym = DeviceBuffer::<f32>::zeroed(stream, t * sh.width())?;
         let cases = [
             ("q", "4 bytes past an 8-byte boundary", &*q_mis, &kc, &vc),
             ("kc", "8 bytes past a 16-byte boundary", &qd, &*k_mis, &vc),
             ("vc", "8 bytes past a 16-byte boundary", &qd, &kc, &*v_mis),
         ];
         for (name, off, q_in, kc_in, vc_in) in cases {
-            let r = kp.enqueue_256(
+            let r = enqueue_pref(
+                kp,
                 stream,
+                sh,
                 GqaPrefillArgs {
                     q: q_in,
                     kc: kc_in,
                     vc: vc_in,
                     n_keys: &nk,
                     scale: scale(),
-                    n_head: N_HEAD,
+                    n_head: sh.n_head,
                     n_kv: N_KV,
                     ctx,
                     t,
@@ -1144,9 +1455,9 @@ mod gate {
             let named = matches!(
                 r,
                 Err(GpuError::Shape {
-                    what: "flash_gqa_prefill::enqueue_256",
+                    what,
                     ref detail,
-                }) if detail.starts_with(&format!("{name} at "))
+                }) if what == sh.pref_what() && detail.starts_with(&format!("{name} at "))
             );
             let seen = match &r {
                 _ if named => "refused by name".to_string(),
@@ -1157,7 +1468,7 @@ mod gate {
                 Err(e) => format!("refused without the name: {e}"),
             };
             println!(
-                "prefill refusal {name} window {off}: {seen} {}",
+                "prefill{tag} refusal {name} window {off}: {seen} {}",
                 verdict(named)
             );
             ok &= named;
@@ -1576,9 +1887,15 @@ mod gate {
         let r = rope_check(&gpu, &rope)?;
         println!("rope-256 {}", verdict(r));
         ok &= r;
-        let d = decode_check(&gpu, &k)?;
+        let d = decode_check(&gpu, &k, Q36, &DEC_KEYS)?;
         println!("decode flash 256 {}", verdict(d));
         ok &= d;
+        let d = decode_check(&gpu, &k, Q38, &DEC_KEYS_Q38)?;
+        println!("decode flash 256 p4 {}", verdict(d));
+        ok &= d;
+        let x = cross_check(&gpu, &k, &kp)?;
+        println!("cross geometry {}", verdict(x));
+        ok &= x;
         let t = tie_check(&gpu, &k, &kp)?;
         println!("score order {}", verdict(t));
         ok &= t;
@@ -1588,11 +1905,18 @@ mod gate {
         let i = model_check(&gpu, &rope, &gq)?;
         println!("ik taps, layer {MODEL_LAYER} {}", verdict(i));
         ok &= i;
-        // Last: its window refusals end with the check whose failure would
-        // be a sticky error.
-        let p = prefill_check(&gpu, &kp)?;
+        let (p, win36) = prefill_check(&gpu, &kp, Q36, &[])?;
         println!("prefill flash 256 {}", verdict(p));
         ok &= p;
+        let (p, win38) = prefill_check(&gpu, &kp, Q38, &SEED_Q38)?;
+        println!("prefill flash 256 p4 {}", verdict(p));
+        ok &= p;
+        // Last: the window refusals, whose failure would be a sticky error.
+        for (sh, win) in [(Q36, &win36), (Q38, &win38)] {
+            let m = misaligned(&kp, &gpu, sh, win)?;
+            println!("prefill windows{} {}", sh.tag(), verdict(m));
+            ok &= m;
+        }
         println!("gate_qwen35moe_attn: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

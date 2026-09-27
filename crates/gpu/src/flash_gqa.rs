@@ -56,6 +56,13 @@
 //! score in its own accumulator and adds the halves, low first — the order of
 //! the prefill flash at that width. They are instances of the head-generic
 //! bodies `seg_scalar`, `seg_mma` and `merge_body`.
+//!
+//! The `_p4` entries ([`FlashGqaKernels::enqueue_pass_256_p4`]) serve heads of
+//! [`HEAD_256`] in groups of any multiple of [`PACK_4`] query heads per key
+//! head: a segment block takes four query heads — four warps, the tensor-core
+//! pass's rows `0..4` — and a key head's group is `group / 4` neighbouring
+//! blocks, each staging the key head's tiles for its own heads. Every row's
+//! arithmetic is the `_256` pass's; the merge is `gqa_flash_merge_256`.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -119,6 +126,15 @@ const MERGE_THREADS_256: u32 = HEAD_256 as u32;
 const _: () = assert!(MERGE_THREADS_256 as usize == HEAD_256);
 // The entries' launch contracts spell GROUP and HEAD_256 out as 8 and 256.
 const _: () = assert!(GROUP == 8 && HEAD_256 == 256);
+
+/// Query heads one block of the `_p4` entries takes
+/// ([`FlashGqaKernels::enqueue_pass_256_p4`]): a group of any multiple of four
+/// query heads per key head runs as `group / 4` blocks per key head.
+pub const PACK_4: usize = 4;
+const THREADS_P4: usize = PACK_4 * 32;
+const THREADS_P4_U32: u32 = THREADS_P4 as u32;
+// The `_p4` launch contracts spell PACK_4 and its block out as 4 and 128.
+const _: () = assert!(PACK_4 == 4 && THREADS_P4_U32 == 128);
 
 /// Segments a `ctx`-row cache is cut into.
 #[must_use]
@@ -247,8 +263,8 @@ const SLICE: usize = 128;
 /// accumulated over the tile's keys ascending, one fused multiply-add per key
 /// and dim.
 ///
-/// SAFETY: as [`fold_tile`], with `vs` the staged `KEY_TILE · HEAD/4` value
-/// tile.
+/// SAFETY: as [`fold_tile`], with `ws` a weight tile of `KEY_TILE` f32 per
+/// warp of the block and `vs` the staged `KEY_TILE · HEAD/4` value tile.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -302,7 +318,8 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
     }
     *s_sum += psum;
 
-    // SAFETY: w·32 + lane < GROUP·KEY_TILE; this warp's own slots.
+    // SAFETY: w·32 + lane is below the tile's KEY_TILE f32 per warp; this
+    // warp's own slots.
     unsafe { *ws.add(w * KEY_TILE + lane) = pw };
     warp::sync_mask(u32::MAX);
     let mut j = 0usize;
@@ -325,16 +342,100 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
     warp::sync_mask(u32::MAX);
 }
 
+/// The block of the head-generic segment passes: block `b = ((seg·n_kv +
+/// kh)·packs + p)·m + t` is row `t`, segment `seg` and query heads `(kh·packs
+/// + p)·PACK ..` of key head `kh` — `packs` blocks of `PACK` heads per key
+/// head, the rows and then the packs of one segment neighbouring blocks.
+/// Returns `(t, seg, kh, head0, n_head)`, or `None` past the grid. At
+/// `packs = 1` this is the one-block-per-group map of the `GROUP` entries.
+#[inline(always)]
+const fn seg_block<const PACK: usize>(
+    b: usize,
+    rows: usize,
+    nkv: usize,
+    packs: usize,
+    n_seg: usize,
+) -> Option<(usize, usize, usize, usize, usize)> {
+    let units = nkv * packs;
+    if b >= rows * units * n_seg {
+        return None;
+    }
+    let t = b % rows;
+    let sk = b / rows;
+    let seg = sk / units;
+    let r = sk - seg * units;
+    Some((t, seg, r / packs, r * PACK, units * PACK))
+}
+
+/// [`seg_block`] over `rows · n_kv · packs · n_seg` blocks: every block below
+/// the grid names a distinct (row, segment, query head) for each of its
+/// `PACK` warps, every query head `head0 + w` reads key head `(head0 + w) /
+/// (packs · PACK)` — its group's — and the blocks cover every (row, segment,
+/// head) once; the block past the grid names nothing.
+const fn seg_blocks_hold<const PACK: usize>(
+    rows: usize,
+    nkv: usize,
+    packs: usize,
+    n_seg: usize,
+) -> bool {
+    const CAP: usize = 1024;
+    let blocks = rows * nkv * packs * n_seg;
+    if blocks * PACK > CAP {
+        return false;
+    }
+    let mut seen = [false; CAP];
+    let mut b = 0;
+    while b < blocks {
+        let Some((t, seg, kh, head0, n_head)) = seg_block::<PACK>(b, rows, nkv, packs, n_seg)
+        else {
+            return false;
+        };
+        if t >= rows || seg >= n_seg || kh >= nkv || n_head != nkv * packs * PACK {
+            return false;
+        }
+        let mut w = 0;
+        while w < PACK {
+            let h = head0 + w;
+            let at = (t * n_head + h) * n_seg + seg;
+            if h >= n_head || h / (packs * PACK) != kh || seen[at] {
+                return false;
+            }
+            seen[at] = true;
+            w += 1;
+        }
+        b += 1;
+    }
+    let mut i = 0;
+    while i < blocks * PACK {
+        if !seen[i] {
+            return false;
+        }
+        i += 1;
+    }
+    seg_block::<PACK>(blocks, rows, nkv, packs, n_seg).is_none()
+}
+
+// The block maps the entries run: one block a group of eight, and packs of
+// four at groups 4, 8 and 12 (Qwen3.8's 24/2), over several rows and segments.
+const _: () = assert!(seg_blocks_hold::<GROUP>(3, 2, 1, 4) && seg_blocks_hold::<GROUP>(2, 4, 1, 3));
+const _: () =
+    assert!(seg_blocks_hold::<PACK_4>(3, 2, 3, 4) && seg_blocks_hold::<PACK_4>(2, 3, 2, 3));
+const _: () =
+    assert!(seg_blocks_hold::<PACK_4>(1, 2, 1, 5) && seg_blocks_hold::<PACK_4>(2, 1, 3, 7));
+
 /// The scalar segment pass of [`flash_gqa_kernels::gqa_flash_seg`] over a
-/// head of `HEAD = QW · 128` values: the grid, the partial index, the
+/// head of `HEAD = QW · 128` values and blocks of `PACK` query heads
+/// ([`seg_block`], `packs` of them per key head): the partial index, the
 /// neutral segment, the staging and the reduction structure of the module
-/// doc, lane `l` holding dims `4l + 128·i .. +3`.
+/// doc, warp `w` query head `head0 + w`, lane `l` holding dims `4l + 128·i ..
+/// +3`.
 ///
-/// SAFETY: the entry's launch contract at `HEAD` (every buffer bound it
-/// names), a block of `GROUP · 32` threads, and the four tiles this block's
-/// shared memory as the entry declared them: the group's query rows
-/// (`GROUP · HEAD` f32), the key tile at stride `HEAD/2 + 1` words, the value
-/// tile (`KEY_TILE · HEAD/4` u64) and the weight tile (`GROUP · KEY_TILE`).
+/// SAFETY: the entry's launch contract at `HEAD` and `packs · PACK` query
+/// heads per key head (every buffer bound it names), a block of `PACK · 32`
+/// threads, and the four tiles this block's shared memory as the entry
+/// declared them: the pack's query rows (`PACK · HEAD` f32), the key tile at
+/// stride `HEAD/2 + 1` words, the value tile (`KEY_TILE · HEAD/4` u64) and the
+/// weight tile (`PACK · KEY_TILE`).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -344,7 +445,7 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
+unsafe fn seg_scalar<const HEAD: usize, const QW: usize, const PACK: usize>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -355,6 +456,7 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     segs: u32,
     seg_keys: u32,
     m: u32,
+    packs: usize,
     mut part_v: DisjointSlice<f32>,
     mut part_ms: DisjointSlice<f32>,
     qs: *mut f32,
@@ -363,28 +465,26 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     ws: *mut f32,
 ) {
     const { assert!(HEAD == QW * SLICE && HEAD.is_multiple_of(2 * ILP)) };
+    const { assert!((KEY_TILE * HEAD / 4).is_multiple_of(PACK * 32)) };
     let row_words = HEAD / 2;
     let k_stride = row_words + 1;
     let row_qwords = HEAD / 4;
-    // q values and K/V tile words one thread stages per tile.
+    let threads = PACK * 32;
+    // q values one thread stages, and K/V tile words per tile.
     let per_thread = HEAD / 32;
+    let stage_per = KEY_TILE * row_qwords / threads;
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
     let n_seg = segs as usize;
     let rows = m as usize;
-    if b >= rows * nkv * n_seg {
+    let Some((t, seg, kh, head0, n_head)) = seg_block::<PACK>(b, rows, nkv, packs, n_seg) else {
         return; // block-uniform
-    }
-    let t = b % rows;
-    let sk = b / rows;
-    let seg = sk / nkv;
-    let kh = sk - seg * nkv;
+    };
     let tid = thread::threadIdx_x() as usize;
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
-    let n_head = nkv * GROUP;
-    let h = kh * GROUP + w;
+    let h = head0 + w;
     let idx = (t * n_head + h) * n_seg + seg;
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
@@ -392,7 +492,7 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     let lo = seg * seg_keys as usize;
     if lo >= limit {
         if lane == 0 {
-            // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
+            // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
             unsafe {
                 *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
@@ -402,13 +502,13 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     }
     let hi = (lo + seg_keys as usize).min(limit);
 
-    // Row t's group query rows: thread `tid` stages values
-    // `per_thread·tid ..` of the group's GROUP·HEAD.
-    let qb = (t * n_head + kh * GROUP) * HEAD;
+    // Row t's pack of query rows: thread `tid` stages values
+    // `per_thread·tid ..` of the pack's PACK·HEAD.
+    let qb = (t * n_head + head0) * HEAD;
     let mut i = 0usize;
     while i < per_thread {
-        // SAFETY: qb + per_thread·tid + i < (t·n_head + (kh + 1)·GROUP)·HEAD
-        // <= m·n_kv·GROUP·HEAD <= q.len(); the shared index < GROUP·HEAD.
+        // SAFETY: qb + per_thread·tid + i < (t·n_head + head0 + PACK)·HEAD <=
+        // m·n_head·HEAD <= q.len(); the shared index < PACK·HEAD.
         unsafe { *qs.add(per_thread * tid + i) = *q.get_unchecked(qb + per_thread * tid + i) };
         i += 1;
     }
@@ -425,8 +525,8 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
         // Stage the tile: 32 keys × HEAD/4 u64 of K and of V; a key at or
         // past `hi` stages zeros.
         let mut i = 0usize;
-        while i < per_thread {
-            let e = tid + THREADS * i;
+        while i < stage_per {
+            let e = tid + threads * i;
             let key = e / row_qwords;
             let word = e - key * row_qwords;
             let (kw, vw) = if t0 + key < hi {
@@ -460,7 +560,7 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
             let mut p = 0usize;
             while p < ILP {
                 // SAFETY: lane < 32, wd + p < row_words: inside KS; the query
-                // index w·HEAD + 2(wd + p) + 1 < GROUP·HEAD.
+                // index w·HEAD + 2(wd + p) + 1 < PACK·HEAD.
                 let (kw, q0, q1) = unsafe {
                     (
                         *ks.add(lane * k_stride + wd + p),
@@ -480,14 +580,14 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
         let sc = if live { dot * scale } else { f32::NEG_INFINITY };
 
         // SAFETY: WS and VS are this block's tiles, VS staged before the
-        // barrier above; w < GROUP and lane < 32.
+        // barrier above; w < PACK and lane < 32.
         unsafe {
             fold_tile_w::<HEAD, QW>(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane)
         };
         t0 += KEY_TILE;
     }
 
-    // SAFETY: idx < m·n_kv·GROUP·segs; dims 4·lane + 128·i .. +3 of the
+    // SAFETY: idx < m·n_head·segs; dims 4·lane + 128·i .. +3 of the
     // partial row are this lane's alone, and lane 0 writes (m, s).
     unsafe {
         for i in 0..QW {
@@ -506,10 +606,11 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
 }
 
 /// The tensor-core segment pass of [`flash_gqa_kernels::gqa_flash_seg_mma`]
-/// over a head of `HEAD = QW · 128` values: the grid, the staging and every
-/// step after the scores are [`seg_scalar`]'s (`fold_tile_w`). Warp `w`
-/// rounds its head's `HEAD/2` value pairs into row `w` of the 16-row query
-/// tile (rows `8..16` zero); warps `0..4` each take eight keys of a tile and
+/// over a head of `HEAD = QW · 128` values and blocks of `PACK` query heads:
+/// the grid, the staging and every step after the scores are
+/// [`seg_scalar`]'s (`fold_tile_w`). Warp `w` rounds its head's `HEAD/2` value
+/// pairs into row `w` of the 16-row query tile (rows `PACK..16` zero); warps
+/// `0..4` each take eight keys of a tile and
 /// accumulate the score of each 128-value slice `i` of the head in its own
 /// f32 accumulator, the slice's eight k16 steps ascending from zero (two
 /// `mma.m16n8k16` per `ldmatrix.x4` of the key), then add the slices in
@@ -517,11 +618,12 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
 /// scores in, so both compute a key's score to the same bits — and write
 /// `scale · S`. Both staged strides are `mma_row_words(HEAD)` words.
 ///
-/// SAFETY: the entry's launch contract at `HEAD`, a block of `GROUP · 32`
-/// threads, and the four tiles this block's shared memory as the entry
-/// declared them: the query tile (`MMA_ROWS · mma_row_words(HEAD)` u32), the
-/// key tile (`KEY_TILE · mma_row_words(HEAD)` u32), the value tile
-/// (`KEY_TILE · HEAD/4` u64) and the weight tile (`GROUP · KEY_TILE` f32).
+/// SAFETY: the entry's launch contract at `HEAD` and `packs · PACK` query
+/// heads per key head, a block of `PACK · 32` threads, and the four tiles this
+/// block's shared memory as the entry declared them: the query tile
+/// (`MMA_ROWS · mma_row_words(HEAD)` u32), the key tile (`KEY_TILE ·
+/// mma_row_words(HEAD)` u32), the value tile (`KEY_TILE · HEAD/4` u64) and the
+/// weight tile (`PACK · KEY_TILE` f32).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -531,7 +633,7 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
+unsafe fn seg_mma<const HEAD: usize, const QW: usize, const PACK: usize>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -542,6 +644,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     segs: u32,
     seg_keys: u32,
     m: u32,
+    packs: usize,
     mut part_v: DisjointSlice<f32>,
     mut part_ms: DisjointSlice<f32>,
     qt: *mut u32,
@@ -550,28 +653,28 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     ws: *mut f32,
 ) {
     const { assert!(HEAD == QW * SLICE) };
-    const { assert!(mma_row_words(HEAD) * 4 % 128 == 16 && MMA_ROWS == 2 * GROUP) };
+    // The pack's heads are rows `0..PACK` of the 16-row tile, the fragment's
+    // rows `lane/4 < 8`; four warps take a tile's keys.
+    const { assert!(mma_row_words(HEAD) * 4 % 128 == 16 && MMA_ROWS.is_multiple_of(PACK)) };
+    const { assert!(PACK >= 4 && PACK <= MMA_ROWS / 2) };
     const { assert!(KEY_TILE == 4 * MMA_NTILE && SLICE.is_multiple_of(2 * MMA_K)) };
+    const { assert!((KEY_TILE * HEAD / 4).is_multiple_of(PACK * 32)) };
     let row_w = mma_row_words(HEAD);
     let row_qwords = HEAD / 4;
-    let per_thread = HEAD / 32;
+    let threads = PACK * 32;
+    let stage_per = KEY_TILE * row_qwords / threads;
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
     let n_seg = segs as usize;
     let rows = m as usize;
-    if b >= rows * nkv * n_seg {
+    let Some((t, seg, kh, head0, n_head)) = seg_block::<PACK>(b, rows, nkv, packs, n_seg) else {
         return; // block-uniform
-    }
-    let t = b % rows;
-    let sk = b / rows;
-    let seg = sk / nkv;
-    let kh = sk - seg * nkv;
+    };
     let tid = thread::threadIdx_x() as usize;
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
-    let n_head = nkv * GROUP;
-    let h = kh * GROUP + w;
+    let h = head0 + w;
     let idx = (t * n_head + h) * n_seg + seg;
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
@@ -579,7 +682,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     let lo = seg * seg_keys as usize;
     if lo >= limit {
         if lane == 0 {
-            // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
+            // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
             unsafe {
                 *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
@@ -589,10 +692,11 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     }
     let hi = (lo + seg_keys as usize).min(limit);
 
-    // The query tile: warp `w` rounds row t's head `w`'s HEAD/2 value pairs,
-    // HEAD/64 per lane, and writes the zero rows `8 + w`. Each pair is one
-    // 8-byte load, and the loads come before the roundings.
-    let qb = (t * n_head + kh * GROUP + w) * HEAD;
+    // The query tile: warp `w` rounds row t's head `head0 + w`'s HEAD/2 value
+    // pairs, HEAD/64 per lane, into row `w`, and writes the zero rows `z·PACK +
+    // w` for `z >= 1`. Each pair is one 8-byte load, and the loads come before
+    // the roundings.
+    let qb = (t * n_head + head0 + w) * HEAD;
     let q64 = q.as_ptr() as *const u64;
     let mut raw = [[0u64; 2]; QW];
     for s in 0..QW {
@@ -601,8 +705,8 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
             cuda_device::thread::__unroll_config::<0>();
             // SAFETY: qb is a multiple of HEAD, so word qb/2 + wd holds values
             // qb + 2·wd and + 1 (wd = lane + 32·i + 64·s < HEAD/2), inside
-            // (t·n_head + kh·GROUP + w + 1)·HEAD <= m·n_kv·GROUP·HEAD <=
-            // q.len(); the buffer starts 8-byte aligned (a device allocation).
+            // (t·n_head + h + 1)·HEAD <= m·n_head·HEAD <= q.len(); the buffer
+            // starts 8-byte aligned (a device allocation).
             unsafe { raw[s][i] = *q64.add(qb / 2 + lane + 32 * i + 64 * s) };
         }
     }
@@ -613,11 +717,15 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
             let wd = lane + 32 * i + 64 * s;
             let lo16 = f32_to_f16_bits(f32::from_bits(raw[s][i] as u32)) as u32;
             let hi16 = f32_to_f16_bits(f32::from_bits((raw[s][i] >> 32) as u32)) as u32;
-            // SAFETY: the tile words w·row_w + wd and (8 + w)·row_w + wd are
-            // inside QT (wd < HEAD/2 < row_w, 8 + w < MMA_ROWS).
+            // SAFETY: the tile words w·row_w + wd and (z·PACK + w)·row_w + wd
+            // are inside QT (wd < HEAD/2 < row_w, z·PACK + w < MMA_ROWS).
             unsafe {
                 *qt.add(w * row_w + wd) = lo16 | (hi16 << 16);
-                *qt.add((GROUP + w) * row_w + wd) = 0;
+                *qt.add((PACK + w) * row_w + wd) = 0;
+                for z in 2..MMA_ROWS / PACK {
+                    cuda_device::thread::__unroll_config::<0>();
+                    *qt.add((z * PACK + w) * row_w + wd) = 0;
+                }
             }
         }
     }
@@ -637,8 +745,8 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     while t0 < hi {
         thread::sync_threads();
         let mut i = 0usize;
-        while i < per_thread {
-            let e = tid + THREADS * i;
+        while i < stage_per {
+            let e = tid + threads * i;
             let key = e / row_qwords;
             let word = e - key * row_qwords;
             let (kw, vw) = if t0 + key < hi {
@@ -662,7 +770,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
         }
         thread::sync_threads();
 
-        if w < 4 {
+        if PACK <= 4 || w < 4 {
             let mut c = [[0.0f32; 4]; QW];
             for s in 0..QW {
                 cuda_device::thread::__unroll_config::<0>();
@@ -705,8 +813,9 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
                 sc0 = add_rn_f32(sc0, c[s][0]);
                 sc1 = add_rn_f32(sc1, c[s][1]);
             }
-            // sc0, sc1: head lane/4 at keys key0 + 2·(lane%4) + {0, 1}; each
-            // slice's c[2], c[3] are the zero rows.
+            // sc0, sc1: tile row lane/4 at keys key0 + 2·(lane%4) + {0, 1},
+            // the pack's head when lane/4 < PACK; each slice's c[2], c[3] are
+            // zero rows.
             let g = lane / 4;
             let kk = key0 + 2 * (lane % 4);
             let s0 = if t0 + kk < hi {
@@ -719,21 +828,24 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
             } else {
                 f32::NEG_INFINITY
             };
-            // SAFETY: g < GROUP and kk + 1 < KEY_TILE: inside WS; each
-            // (head, key) slot has one writer.
-            unsafe {
-                *ws.add(g * KEY_TILE + kk) = s0;
-                *ws.add(g * KEY_TILE + kk + 1) = s1;
+            // A pack of eight fills rows 0..8, so every lane's row is a head.
+            if PACK >= MMA_ROWS / 2 || g < PACK {
+                // SAFETY: g < PACK and kk + 1 < KEY_TILE: inside WS; each
+                // (head, key) slot has one writer.
+                unsafe {
+                    *ws.add(g * KEY_TILE + kk) = s0;
+                    *ws.add(g * KEY_TILE + kk + 1) = s1;
+                }
             }
         }
         thread::sync_threads();
-        // SAFETY: w < GROUP and lane < KEY_TILE: inside WS, written before
+        // SAFETY: w < PACK and lane < KEY_TILE: inside WS, written before
         // the barrier above.
         let sc = unsafe { *ws.add(w * KEY_TILE + lane) };
         let live = t0 + lane < hi;
         warp::sync_mask(u32::MAX);
         // SAFETY: WS and VS are this block's tiles, VS staged before the
-        // barriers above; w < GROUP and lane < 32.
+        // barriers above; w < PACK and lane < 32.
         unsafe {
             fold_tile_w::<HEAD, QW>(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane)
         };
@@ -1421,7 +1533,7 @@ mod flash_gqa_kernels {
         // allocation, sized for HEAD_256; the raw form reaches it without a
         // reference. The launch contract is `seg_scalar`'s at HEAD_256.
         unsafe {
-            seg_scalar::<HEAD_256, QW_256>(
+            seg_scalar::<HEAD_256, QW_256, GROUP>(
                 q,
                 kc,
                 vc,
@@ -1432,6 +1544,7 @@ mod flash_gqa_kernels {
                 segs,
                 seg_keys,
                 m,
+                1,
                 part_v,
                 part_ms,
                 SharedArray::as_raw_mut_ptr(&raw mut QS),
@@ -1486,7 +1599,7 @@ mod flash_gqa_kernels {
         // allocation, sized for HEAD_256; the raw form reaches it without a
         // reference. The launch contract is `seg_mma`'s at HEAD_256.
         unsafe {
-            seg_mma::<HEAD_256, QW_256>(
+            seg_mma::<HEAD_256, QW_256, GROUP>(
                 q,
                 kc,
                 vc,
@@ -1497,6 +1610,7 @@ mod flash_gqa_kernels {
                 segs,
                 seg_keys,
                 m,
+                1,
                 part_v,
                 part_ms,
                 SharedArray::as_raw_mut_ptr(&raw mut QT),
@@ -1542,6 +1656,145 @@ mod flash_gqa_kernels {
         unsafe {
             merge_body::<HEAD_256>(
                 part_v, part_ms, n_keys_buf, n_head, ctx, segs, seg_keys, m, fault, y,
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_256`] in blocks of [`PACK_4`] query heads, `packs` of
+    /// them per key head (`seg_scalar` at `PACK_4`): block `b = ((seg·n_kv +
+    /// kh)·packs + p)·m + t`, warp `w` query head `(kh·packs + p)·4 + w`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
+            q.len() >= m * n_kv * packs * 4 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            part_v.len() >= m * n_kv * packs * 4 * segs * 256,
+            part_ms.len() >= m * n_kv * packs * 4 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_256_p4(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { PACK_4 * HEAD_256 }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_4 * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_256 and PACK_4; the raw form reaches it
+        // without a reference. The launch contract is `seg_scalar`'s at
+        // HEAD_256 and `packs · PACK_4` heads per key head.
+        unsafe {
+            seg_scalar::<HEAD_256, QW_256, PACK_4>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
+    /// [`gqa_flash_seg_mma_256`] in blocks of [`PACK_4`] query heads (`seg_mma`
+    /// at `PACK_4`): the pack's heads are rows `0..4` of the 16-row query tile
+    /// and all four warps take a tile's keys; the block map is
+    /// [`gqa_flash_seg_256_p4`]'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
+            q.len() >= m * n_kv * packs * 4 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            part_v.len() >= m * n_kv * packs * 4 * segs * 256,
+            part_ms.len() >= m * n_kv * packs * 4 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_256_p4(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_4 * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_256 and PACK_4; the raw form reaches it
+        // without a reference. The launch contract is `seg_mma`'s at HEAD_256
+        // and `packs · PACK_4` heads per key head.
+        unsafe {
+            seg_mma::<HEAD_256, QW_256, PACK_4>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
             )
         };
     }
@@ -1736,6 +1989,101 @@ impl FlashGqaKernels {
             self.module.gqa_flash_seg_256(
                 stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
                 part_ms,
+            )?;
+        }
+        let prep = self
+            .module
+            .prepare_gqa_flash_merge_256(LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0))?;
+        self.module.gqa_flash_merge_256(
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass_256`] for `n_head` query heads over
+    /// `args.n_kv` key heads in blocks of [`PACK_4`]: `n_head` a nonzero
+    /// multiple of `4 · n_kv` (refused by name otherwise), `args.q` and
+    /// `args.y` `m · n_head` rows of 256, `args.part_v` [`partials_v_len_256`]
+    /// and `args.part_ms` [`partials_ms_len`] of `n_head`. The segment pass
+    /// (`gqa_flash_seg_mma_256_p4` when `mma`, else `gqa_flash_seg_256_p4`;
+    /// `m · n_head / 4 · segments_for(ctx)` blocks of 128 threads) and
+    /// `gqa_flash_merge_256` (`m · n_head` blocks): two launches, the refusals
+    /// of `enqueue_pass_256`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_256_p4(
+        &self,
+        stream: &CudaStream,
+        args: GqaArgs<'_>,
+        n_head: usize,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_256_p4";
+        let GqaArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ctx == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
+            ));
+        }
+        if n_head == 0 || !n_head.is_multiple_of(n_kv * PACK_4) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the kernel packs {PACK_4} query heads a block, so the group must be a \
+                     multiple of {PACK_4}; got {n_head} heads over {n_kv}"
+                ),
+            ));
+        }
+        let packs = n_head / (n_kv * PACK_4);
+        let segs = segments_for(ctx);
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD_256),
+            ("kc", kc.len(), n_kv * ctx * HEAD_256),
+            ("vc", vc.len(), n_kv * ctx * HEAD_256),
+            ("n_keys", n_keys.len(), m),
+            ("part_v", part_v.len(), partials_v_len_256(m, n_head, ctx)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("y", y.len(), m * n_head * HEAD_256),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * packs * segs)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let packs = launch_u32(what, "packs", packs)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
+        if mma {
+            let prep = self.module.prepare_gqa_flash_seg_mma_256_p4(cfg)?;
+            self.module.gqa_flash_seg_mma_256_p4(
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
+                part_v, part_ms,
+            )?;
+        } else {
+            let prep = self.module.prepare_gqa_flash_seg_256_p4(cfg)?;
+            self.module.gqa_flash_seg_256_p4(
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
+                part_v, part_ms,
             )?;
         }
         let prep = self
