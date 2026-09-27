@@ -46,6 +46,11 @@
 //!   of it by the HC_POST launch's own rule — the new streams and, except
 //!   into an engram layer and after the last layer, the next sub-layer's
 //!   fold. The combine's output is written too, for a gate to read.
+//! - The handoff and the join are built for 6 slots a token (this piece's)
+//!   and 8 (`_8` entries, for a program with eight): their launchers
+//!   ([`FfnKernels::enqueue_handoff`], [`FfnKernels::enqueue_post`]) pick
+//!   the entry from the slot count ([`Slots::of`]) and refuse any other by
+//!   name.
 //!
 //! Launches per layer: ten kernels with card experts, seven without (one more
 //! each for a shared down projection that reads q8_1), and
@@ -82,6 +87,7 @@ use model::arch::deepseek41::{host, names};
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
 use model::r8file::R8Pair;
 use model::{Tensor2, Tensor2View};
+use runtime::combine::Slots;
 
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
@@ -94,7 +100,8 @@ use crate::transpose::TransposeKernels;
 
 mod batch;
 pub use batch::{
-    BatchLayer, BlockIo, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places, TiledGateUp,
+    BatchLayer, BlockIo, CardAcc, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places,
+    TiledGateUp,
 };
 
 /// What the enqueue path's errors name.
@@ -115,6 +122,13 @@ const POST_THREADS: u32 = 256;
 
 // The handoff kernel's contract spells the slot count as a literal.
 const _: () = assert!(N_USED == 6);
+
+/// Slots a token of the `_8` entries: the join's second instance
+/// ([`Slots::Eight`]), whose contracts spell it as a literal.
+const SLOTS_8: usize = 8;
+const _: () = assert!(SLOTS_8 == 8);
+// The instance table's counts are the entries' own.
+const _: () = assert!(Slots::Six.n() == N_USED && Slots::Eight.n() == SLOTS_8);
 
 /// The combine of one output value: the card's slots in slot order by
 /// fused multiply-adds from zero ([`card_sum_elem`]), then `(acc + hsum) +
@@ -376,6 +390,197 @@ mod ffn_kernels {
             store4(&mut out, rows, d, o);
         }
     }
+
+    /// [`ds41_ffn_handoff`] of eight slots a token ([`handoff_at`]): threads
+    /// `s < 8` copy slot `s`'s id and weight and write its place.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids_in.len() >= 8,
+            w_in.len() >= 8,
+            map.len() >= row_off + n_expert,
+            x.len() >= n,
+            seq.len() >= 1,
+            n >= 8,
+            ids_at >= seq_at + 1,
+            wts_at >= ids_at + 8,
+            x_at >= wts_at + 8,
+            image.len() >= x_at + n,
+            sel.len() >= 8
+        )
+    )]
+    pub fn ds41_ffn_handoff_8(
+        ids_in: &[u32],
+        w_in: &[f32],
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        x: &[f32],
+        seq: &[u32],
+        n: u32,
+        seq_at: u32,
+        ids_at: u32,
+        wts_at: u32,
+        x_at: u32,
+        fault: FaultSink,
+        mut image: DisjointSlice<u32>,
+        mut sel: DisjointSlice<u32>,
+    ) {
+        let d = thread::index_1d().get();
+        if d >= n as usize {
+            return;
+        }
+        let a = HandoffIn {
+            ids_in,
+            w_in,
+            map,
+            row_off,
+            n_expert,
+            x,
+            seq,
+            seq_at,
+            ids_at,
+            wts_at,
+            x_at,
+            fault,
+        };
+        // SAFETY: d < n, and the launch contract is `handoff_at`'s at
+        // SLOTS_8 slots; thread d is the launch's only thread at d.
+        unsafe { handoff_at::<SLOTS_8>(&a, d, &mut image, &mut sel) };
+    }
+
+    /// [`ds41_ffn_post`] of eight slots a token ([`combine_post_at_n`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * rows,
+            w.len() >= 8,
+            sel.len() >= 8,
+            hsum.len() >= rows,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows,
+            fold.len() >= rows
+        )
+    )]
+    pub fn ds41_ffn_post_8(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        hsum: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+        mut fold: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostIn {
+            down,
+            w,
+            sel,
+            hsum,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_8 slots.
+        let (yv, o, pre) = unsafe { combine_post_at_n::<SLOTS_8>(&a, rows, n_card, d) };
+        // SAFETY: d < rows <= y.len() and fold.len(), and d + 3·rows < 4·rows
+        // <= out.len(), by the launch contract; thread d is the only writer of
+        // y[d], fold[d] and the four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+            *fold.get_unchecked_mut(d) = hc_fold_elem(o, pre);
+        }
+    }
+
+    /// [`ds41_ffn_post_8`] without the fold: into an engram layer and after
+    /// the last layer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * rows,
+            w.len() >= 8,
+            sel.len() >= 8,
+            hsum.len() >= rows,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows
+        )
+    )]
+    pub fn ds41_ffn_post_streams_8(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        hsum: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostIn {
+            down,
+            w,
+            sel,
+            hsum,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows (checked above), and the launch contract gives
+        // every length the helper's contract asks for at SLOTS_8 slots.
+        let (yv, o, _) = unsafe { combine_post_at_n::<SLOTS_8>(&a, rows, n_card, d) };
+        // SAFETY: d < rows <= y.len() and d + 3·rows < 4·rows <= out.len(),
+        // by the launch contract; thread d is the only writer of y[d] and the
+        // four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+        }
+    }
 }
 
 /// What the combine-and-HC_POST launches read: `down` the six slots' down
@@ -486,6 +691,154 @@ unsafe fn store4(out: &mut DisjointSlice<f32>, rows: usize, d: usize, o: [f32; 4
         *out.get_unchecked_mut(d + 2 * rows) = o[2];
         *out.get_unchecked_mut(d + 3 * rows) = o[3];
     }
+}
+
+/// What a handoff entry of `N` slots reads ([`handoff_at`]): its arguments
+/// but the value count, as [`ffn_kernels::ds41_ffn_handoff`] names them.
+struct HandoffIn<'a> {
+    ids_in: &'a [u32],
+    w_in: &'a [f32],
+    map: &'a [u32],
+    row_off: u32,
+    n_expert: u32,
+    x: &'a [f32],
+    seq: &'a [u32],
+    seq_at: u32,
+    ids_at: u32,
+    wts_at: u32,
+    x_at: u32,
+    fault: FaultSink,
+}
+
+/// Thread `d`'s part of the handoff of `N` slots a token:
+/// `ds41_ffn_handoff`'s rule with `N` in place of six — thread `d` copies
+/// `x[d]` to the image's word `x_at + d`; threads `s < N` copy slot `s`'s id
+/// and weight to words `ids_at + s` and `wts_at + s` and write `sel[s]`, the
+/// id's place or [`HOST`] with [`FaultSite::ExpertId`] raised for an id not
+/// below `n_expert`; thread 0 copies the sequence word.
+///
+/// SAFETY: `d < n`, and no other thread of the launch runs `d`;
+/// `ids_in.len()`, `w_in.len()` and `sel.len() >= N`, `n >= N`,
+/// `map.len() >= row_off + n_expert`, `x.len() >= n`, `seq.len() >= 1`,
+/// `ids_at >= seq_at + 1`, `wts_at >= ids_at + N`, `x_at >= wts_at + N` and
+/// `image.len() >= x_at + n`.
+#[inline(always)]
+unsafe fn handoff_at<const N: usize>(
+    a: &HandoffIn<'_>,
+    d: usize,
+    image: &mut DisjointSlice<u32>,
+    sel: &mut DisjointSlice<u32>,
+) {
+    // SAFETY: d < n <= x.len(), and x_at + d < x_at + n <= image.len(), by
+    // this fn's contract; the image's words past x_at are the activation's
+    // alone, and thread d is word x_at + d's only writer.
+    unsafe {
+        *image.get_unchecked_mut(a.x_at as usize + d) = (*a.x.get_unchecked(d)).to_bits();
+    }
+    if d < N {
+        // SAFETY: d < N <= ids_in.len() and w_in.len() by this fn's contract.
+        let (id, w) = unsafe { (*a.ids_in.get_unchecked(d), *a.w_in.get_unchecked(d)) };
+        let place = if id < a.n_expert {
+            // SAFETY: id < n_expert, so row_off + id < map.len() by this fn's
+            // contract.
+            unsafe { *a.map.get_unchecked(a.row_off as usize + id as usize) }
+        } else {
+            a.fault.raise(FaultSite::ExpertId);
+            HOST
+        };
+        // SAFETY: d < N <= sel.len(); ids_at + d and wts_at + d lie in the
+        // routing's two spans, which the contract keeps apart from each
+        // other, from seq_at and from the activation, all inside the image;
+        // thread d is each of those words' only writer.
+        unsafe {
+            *image.get_unchecked_mut(a.ids_at as usize + d) = id;
+            *image.get_unchecked_mut(a.wts_at as usize + d) = w.to_bits();
+            *sel.get_unchecked_mut(d) = place;
+        }
+    }
+    if d == 0 {
+        // SAFETY: seq.len() >= 1, and seq_at < ids_at is inside the image and
+        // no other span's word, by this fn's contract; thread 0 alone writes
+        // it.
+        unsafe { *image.get_unchecked_mut(a.seq_at as usize) = *a.seq.get_unchecked(0) };
+    }
+}
+
+/// Value `d`'s combine of `N` slots, then HC_POST of it: [`combine_post_at`]
+/// with `a.down`, `a.w` and `a.sel` holding `N` slots, the card sum run as it
+/// reads them — `acc = fma(down_j, w_j, acc)` from zero for each slot `j`
+/// below `N` whose place is below `n_card`, in ascending `j` (the order
+/// `runtime::combine::combine` pins; this order is the gate), then
+/// [`join_elem`]. The combine's `y`, the four new stream values and `pre`.
+///
+/// SAFETY: `d < rows`, `down.len() >= N * rows`, `w.len()` and `sel.len() >=
+/// N`, `hsum.len()` and `shexp.len() >= rows`, `res.len() >= 4 * rows` and
+/// `hc.len() >= 24`.
+#[inline(always)]
+unsafe fn combine_post_at_n<const N: usize>(
+    a: &PostIn<'_>,
+    rows: usize,
+    n_card: u32,
+    d: usize,
+) -> (f32, [f32; 4], [f32; 4]) {
+    let mut acc = 0.0f32;
+    for j in 0..N {
+        cuda_device::thread::__unroll_config::<0>();
+        // SAFETY: j < N <= sel.len() and w.len() by this fn's contract.
+        let (place, wj) = unsafe { (*a.sel.get_unchecked(j), *a.w.get_unchecked(j)) };
+        if place < n_card {
+            // SAFETY: j < N and d < rows, so j·rows + d < N·rows <=
+            // down.len() by this fn's contract.
+            let dj = unsafe { *a.down.get_unchecked(j * rows + d) };
+            acc = dj.mul_add(wj, acc);
+        }
+    }
+    // SAFETY: d < rows <= hsum.len() and shexp.len(); d + 3·rows < 4·rows <=
+    // res.len(); 23 < 24 <= hc.len() — all by this fn's contract.
+    let (hs, sh, r, pre, post, comb) = unsafe {
+        (
+            *a.hsum.get_unchecked(d),
+            *a.shexp.get_unchecked(d),
+            [
+                *a.res.get_unchecked(d),
+                *a.res.get_unchecked(d + rows),
+                *a.res.get_unchecked(d + 2 * rows),
+                *a.res.get_unchecked(d + 3 * rows),
+            ],
+            [
+                *a.hc.get_unchecked(0),
+                *a.hc.get_unchecked(1),
+                *a.hc.get_unchecked(2),
+                *a.hc.get_unchecked(3),
+            ],
+            [
+                *a.hc.get_unchecked(4),
+                *a.hc.get_unchecked(5),
+                *a.hc.get_unchecked(6),
+                *a.hc.get_unchecked(7),
+            ],
+            [
+                *a.hc.get_unchecked(8),
+                *a.hc.get_unchecked(9),
+                *a.hc.get_unchecked(10),
+                *a.hc.get_unchecked(11),
+                *a.hc.get_unchecked(12),
+                *a.hc.get_unchecked(13),
+                *a.hc.get_unchecked(14),
+                *a.hc.get_unchecked(15),
+                *a.hc.get_unchecked(16),
+                *a.hc.get_unchecked(17),
+                *a.hc.get_unchecked(18),
+                *a.hc.get_unchecked(19),
+                *a.hc.get_unchecked(20),
+                *a.hc.get_unchecked(21),
+                *a.hc.get_unchecked(22),
+                *a.hc.get_unchecked(23),
+            ],
+        )
+    };
+    let y = join_elem(acc, hs, sh);
+    (y, hc_post_elem(y, r, post, &comb), pre)
 }
 
 /// A layer's routed stacks on the card: the experts its slot-map row puts
@@ -654,9 +1007,9 @@ pub struct FfnKernels {
     module: ffn_kernels::LoadedModule,
 }
 
-/// What [`FfnKernels::enqueue_handoff`] reads: a token's six routed ids and
-/// weights, and the slot map's card copy with the layer's row at `row_off`
-/// (`n_expert` places a row).
+/// What [`FfnKernels::enqueue_handoff`] reads: a token's routed ids and
+/// weights (the target layout's `n_used` each), and the slot map's card copy
+/// with the layer's row at `row_off` (`n_expert` places a row).
 pub struct Handoff<'a> {
     pub ids: &'a DeviceBuffer<u32>,
     pub weights: &'a DeviceBuffer<f32>,
@@ -674,11 +1027,13 @@ impl FfnKernels {
         Ok(FfnKernels { module })
     }
 
-    /// Enqueue `ds41_ffn_handoff`: `h`'s routing and `target`'s activation
-    /// into `target`'s image, with the region's sequence word, and each
-    /// slot's place into `sel`. An id past the stack raises
-    /// [`FaultSite::ExpertId`] on `fault` and its place is [`HOST`]. One
-    /// launch. Asynchronous, allocation-free, capturable.
+    /// Enqueue the handoff of `target.layout.n_used` slots a token
+    /// (`ds41_ffn_handoff` for 6, `ds41_ffn_handoff_8` for 8; any other count
+    /// is refused by name): `h`'s routing and `target`'s activation into
+    /// `target`'s image, with the region's sequence word, and each slot's
+    /// place into `sel`. An id past the stack raises [`FaultSite::ExpertId`]
+    /// on `fault` and its place is [`HOST`]. One launch. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_handoff(
         &self,
         stream: &CudaStream,
@@ -687,43 +1042,161 @@ impl FfnKernels {
         fault: FaultSink,
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        let what = "ds41_ffn_handoff";
         let lay = target.layout;
-        if lay.n_used != N_USED {
-            return Err(GpuError::Shape {
-                what,
-                detail: format!(
-                    "a handoff of {} slots; the kernel hands over {N_USED}",
-                    lay.n_used
-                ),
-            });
-        }
+        let slots = slots_of("ds41_ffn_handoff", lay.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_ffn_handoff",
+            Slots::Eight => "ds41_ffn_handoff_8",
+        };
         let n = lay.hidden;
         let grid = launch_u32(what, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
-        let prep =
-            self.module
-                .prepare_ds41_ffn_handoff(LaunchConfig1D::new(grid, HANDOFF_THREADS, 0))?;
-        self.module.ds41_ffn_handoff(
-            stream,
-            &prep,
-            h.ids,
-            h.weights,
-            h.map,
+        let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
+        let (row_off, n_expert) = (
             launch_u32(what, "row_off", h.row_off)?,
             launch_u32(what, "n_expert", h.n_expert)?,
-            target.x,
-            target.seq,
+        );
+        let at = [
             launch_u32(what, "n", n)?,
             launch_u32(what, "seq_at", lay.seq)?,
             launch_u32(what, "ids_at", lay.ids)?,
             launch_u32(what, "wts_at", lay.weights)?,
             launch_u32(what, "x_at", lay.x)?,
-            fault,
-            target.image,
-            sel,
-        )?;
+        ];
+        match slots {
+            Slots::Six => {
+                let prep = self.module.prepare_ds41_ffn_handoff(cfg)?;
+                self.module.ds41_ffn_handoff(
+                    stream,
+                    &prep,
+                    h.ids,
+                    h.weights,
+                    h.map,
+                    row_off,
+                    n_expert,
+                    target.x,
+                    target.seq,
+                    at[0],
+                    at[1],
+                    at[2],
+                    at[3],
+                    at[4],
+                    fault,
+                    target.image,
+                    sel,
+                )?;
+            }
+            Slots::Eight => {
+                let prep = self.module.prepare_ds41_ffn_handoff_8(cfg)?;
+                self.module.ds41_ffn_handoff_8(
+                    stream,
+                    &prep,
+                    h.ids,
+                    h.weights,
+                    h.map,
+                    row_off,
+                    n_expert,
+                    target.x,
+                    target.seq,
+                    at[0],
+                    at[1],
+                    at[2],
+                    at[3],
+                    at[4],
+                    fault,
+                    target.image,
+                    sel,
+                )?;
+            }
+        }
         Ok(())
     }
+
+    /// Enqueue the combine and HC_POST of `p.n_used` slots a token
+    /// (`ds41_ffn_post`/`ds41_ffn_post_streams` for 6, their `_8` entries for
+    /// 8; any other count is refused by name), one thread per value `d <
+    /// p.rows`: the combine's `y[d]`, the four new streams at `d` into `out`
+    /// and, when `fold` is given, their fold by the HC_PRE result's `pre`
+    /// into it. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_post(
+        &self,
+        stream: &CudaStream,
+        p: &Post<'_>,
+        y: &mut DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        fold: Option<&mut DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
+        let slots = slots_of("ds41_ffn_post", p.n_used)?;
+        let what = match (slots, fold.is_some()) {
+            (Slots::Six, true) => "ds41_ffn_post",
+            (Slots::Six, false) => "ds41_ffn_post_streams",
+            (Slots::Eight, true) => "ds41_ffn_post_8",
+            (Slots::Eight, false) => "ds41_ffn_post_streams_8",
+        };
+        let grid = launch_u32(what, "grid", p.rows.div_ceil(POST_THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
+        let rows = launch_u32(what, "rows", p.rows)?;
+        let n_card = launch_u32(what, "n_card", p.n_card)?;
+        let m = &self.module;
+        match (slots, fold) {
+            (Slots::Six, Some(fold)) => {
+                let prep = m.prepare_ds41_ffn_post(cfg)?;
+                m.ds41_ffn_post(
+                    stream, &prep, p.down, p.w, p.sel, p.hsum, p.shexp, p.res, p.hc, rows, n_card,
+                    y, out, fold,
+                )?;
+            }
+            (Slots::Six, None) => {
+                let prep = m.prepare_ds41_ffn_post_streams(cfg)?;
+                m.ds41_ffn_post_streams(
+                    stream, &prep, p.down, p.w, p.sel, p.hsum, p.shexp, p.res, p.hc, rows, n_card,
+                    y, out,
+                )?;
+            }
+            (Slots::Eight, Some(fold)) => {
+                let prep = m.prepare_ds41_ffn_post_8(cfg)?;
+                m.ds41_ffn_post_8(
+                    stream, &prep, p.down, p.w, p.sel, p.hsum, p.shexp, p.res, p.hc, rows, n_card,
+                    y, out, fold,
+                )?;
+            }
+            (Slots::Eight, None) => {
+                let prep = m.prepare_ds41_ffn_post_streams_8(cfg)?;
+                m.ds41_ffn_post_streams_8(
+                    stream, &prep, p.down, p.w, p.sel, p.hsum, p.shexp, p.res, p.hc, rows, n_card,
+                    y, out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What [`FfnKernels::enqueue_post`] reads: `down` the `n_used` slots' down
+/// outputs slot-major (`rows` each), `w` the `n_used` routing weights, `sel`
+/// each slot's place (the card's below `n_card`; every other slot's rows are
+/// never read), `hsum` the host's partial sum, `shexp` the shared expert's
+/// output (`rows` each), `res` the four streams the sub-layer read (`rows`
+/// each) and `hc` its HC_PRE result ([`HC_MIX`] values).
+pub struct Post<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub hsum: &'a DeviceBuffer<f32>,
+    pub shexp: &'a DeviceBuffer<f32>,
+    pub res: &'a DeviceBuffer<f32>,
+    pub hc: &'a DeviceBuffer<f32>,
+    pub rows: usize,
+    pub n_card: usize,
+    pub n_used: usize,
+}
+
+/// The join's instance for `n_used` slots a token ([`Slots::of`]), or
+/// `what`'s shape error naming the count.
+fn slots_of(what: &'static str, n_used: usize) -> Result<Slots, GpuError> {
+    Slots::of(n_used).map_err(|e| GpuError::Shape {
+        what,
+        detail: e.to_string(),
+    })
 }
 
 /// The piece's own buffers, as the last enqueued layer left them — what a
@@ -1446,54 +1919,22 @@ impl FfnPiece {
         io: FfnIo<'_>,
         boundary: &Boundary,
     ) -> Result<(), GpuError> {
-        let stream = gpu.stream();
         let hsum = boundary.hsum_of(row)?;
         let r = &mut self.rows[row];
-        let n = self.n_embd;
-        let grid = launch_u32("ds41_ffn_post", "grid", n.div_ceil(POST_THREADS as usize))?;
-        let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
-        let rows = launch_u32("ds41_ffn_post", "rows", n)?;
-        let n_card = launch_u32("ds41_ffn_post", "n_card", self.cfg[i].n_card)?;
-        match io.fold_out {
-            Some(fold) => {
-                let prep = self.kernels.module.prepare_ds41_ffn_post(cfg)?;
-                self.kernels.module.ds41_ffn_post(
-                    stream,
-                    &prep,
-                    &r.down,
-                    &r.rout.weights,
-                    &r.sel,
-                    hsum,
-                    &r.sh_y,
-                    io.streams,
-                    &r.hc_out,
-                    rows,
-                    n_card,
-                    &mut r.y,
-                    io.streams_out,
-                    fold,
-                )?;
-            }
-            None => {
-                let prep = self.kernels.module.prepare_ds41_ffn_post_streams(cfg)?;
-                self.kernels.module.ds41_ffn_post_streams(
-                    stream,
-                    &prep,
-                    &r.down,
-                    &r.rout.weights,
-                    &r.sel,
-                    hsum,
-                    &r.sh_y,
-                    io.streams,
-                    &r.hc_out,
-                    rows,
-                    n_card,
-                    &mut r.y,
-                    io.streams_out,
-                )?;
-            }
-        }
-        Ok(())
+        let p = Post {
+            down: &r.down,
+            w: &r.rout.weights,
+            sel: &r.sel,
+            hsum,
+            shexp: &r.sh_y,
+            res: io.streams,
+            hc: &r.hc_out,
+            rows: self.n_embd,
+            n_card: self.cfg[i].n_card,
+            n_used: N_USED,
+        };
+        self.kernels
+            .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, io.fold_out)
     }
 }
 

@@ -47,6 +47,16 @@
 //!   send them: `ds41_ffn_places` and `ds41_ffn_handoff` with ids at and
 //!   past the stack raise `expert_id` and give those slots HOST (the handoff
 //!   still carries the ids as they came), with ids inside it raise nothing.
+//!   The same for `ds41_ffn_handoff_8` through the launcher, which picks it
+//!   for an 8-slot `PageLayout` (a past id at slot 7 among them), writing no
+//!   word of the image but its fields; a handoff of 5, 7 or 9 slots is
+//!   refused by name. Then the prompt batch's 8-slot entries through their
+//!   launchers: `ds41_ffn_card_acc_8` against the host rule
+//!   `runtime::combine::card_sum` bit for bit (the six-slot entry against the
+//!   same rule at six and `card_sum_elem`), `ds41_card_gather_8` copying
+//!   column `order[j] / 8` and raising `expert_id` for an entry past the
+//!   slots, both refusing 5, 7 and 9 slots by name and both free of a local
+//!   depot.
 //!   Then `ds41_expert_gate_up_tiles` on a layer's card stacks over the tiles
 //!   of the table the bucket rule writes for two tokens routed to the same
 //!   four card experts and two host slots each: it raises nothing, every card
@@ -189,7 +199,7 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
-    use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget};
+    use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget, PageLayout};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::q4k_sel::tile_cap;
     use bloomery_gpu::weights::{DevWeight, Weights};
@@ -200,7 +210,8 @@ mod gate {
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
     use bloomery_gpu_deepseek41::body::{self, Body, CedState, Deepseek41Model, Need};
     use bloomery_gpu_deepseek41::chain::ffn::{
-        CardStacks, FfnBatchKernels, FfnKernels, Handoff, Places, TiledGateUp,
+        CardAcc, CardGather, CardStacks, FfnBatchKernels, FfnKernels, Handoff, Places, TiledGateUp,
+        card_sum_elem,
     };
     use bloomery_gpu_deepseek41::dense::{
         DenseKernels, Q3kHeadsGroupsArgs, Q3kHeadsMcolArgs, RowsPart,
@@ -213,7 +224,7 @@ mod gate {
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
-        patch_bytes, record, row_bytes, verdict,
+        no_local_depot, patch_bytes, record, row_bytes, verdict,
     };
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST,
@@ -928,6 +939,8 @@ mod gate {
         let (gpu, w, _) = m.body_parts(NAME)?;
         let mut ok = places_cases(gpu)?;
         ok &= handoff_cases(gpu)?;
+        ok &= handoff8_cases(gpu)?;
+        ok &= batch8_cases(gpu)?;
         ok &= tile_case(gpu, w, layers, hp)?;
         gpu.clear_fault()?;
         Ok(ok)
@@ -1093,6 +1106,368 @@ mod gate {
             );
         }
         gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// Slots a token of the join's second instance (`runtime::combine::Slots`).
+    const SLOTS8: usize = 8;
+
+    /// Whether `got` is `what`'s refusal of `n_used` slots by name
+    /// (`runtime::combine::SlotsRefused`), and the result as text.
+    fn refused_by_name(got: Result<(), GpuError>, what: &str, n_used: usize) -> (bool, String) {
+        let ok = matches!(
+            &got,
+            Err(GpuError::Shape { what: w, detail })
+                if *w == what && detail.starts_with(&format!("{n_used} routed slots"))
+        );
+        let text = got
+            .err()
+            .map_or_else(|| "launched".to_string(), |e| format!("refused ({e})"));
+        (ok, text)
+    }
+
+    /// `FfnKernels::enqueue_handoff` of eight slots a token against the
+    /// second row of [`synthetic_map`], into an image laid out by an 8-slot
+    /// `PageLayout`: `ds41_ffn_handoff_8` writes the sequence word, the ids
+    /// as they came, the weights and the activation and nothing else of the
+    /// image, and every slot's place, the one at slot 7 included; ids at and
+    /// past the stack (slots 3 and 7) raise `expert_id` and place [`HOST`].
+    /// A handoff of 5, 7 or 9 slots is refused by name, nothing written.
+    fn handoff8_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        const N: usize = 256;
+        let kernels = FfnKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let map = synthetic_map();
+        let map_dev = DeviceBuffer::from_host(stream, &map)?;
+        let row_off = N_EXPERT;
+        let layout = PageLayout::new(1, 1, N, SLOTS8)
+            .map_err(|e| e.to_string())?
+            .handoff();
+        let x: Vec<f32> = (0..N).map(|d| d as f32 * 0.25 - 3.0).collect();
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let seq_dev = DeviceBuffer::from_host(stream, &[41u32])?;
+        let wts = [0.25f32, 0.125, 0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625];
+        let wts_dev = DeviceBuffer::from_host(stream, &wts)?;
+        let past = N_EXPERT as u32;
+        let cases: [(&str, [u32; SLOTS8], Option<FaultSite>); 2] = [
+            ("ids inside the stack", [0, 3, 5, 383, 9, 12, 300, 6], None),
+            (
+                "ids at and past the stack",
+                [0, 3, 5, past, 9, 12, 300, past + 616],
+                Some(FaultSite::ExpertId),
+            ),
+        ];
+        let mut ok = true;
+        for (what, ids, want) in cases {
+            gpu.clear_fault()?;
+            let ids_dev = DeviceBuffer::from_host(stream, &ids)?;
+            let mut image = DeviceBuffer::from_host(stream, &vec![SENT_U32; layout.x + N])?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; SLOTS8])?;
+            let h = Handoff {
+                ids: &ids_dev,
+                weights: &wts_dev,
+                map: &map_dev,
+                row_off,
+                n_expert: N_EXPERT,
+            };
+            let target = HandoffTarget {
+                x: &x_dev,
+                seq: &seq_dev,
+                image: &mut image,
+                layout,
+            };
+            kernels.enqueue_handoff(stream, &h, target, gpu.unlabelled_sink(), &mut sel)?;
+            let got_sel = sel.to_host_vec(stream)?;
+            let got_image = image.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
+            let places_ok = got_sel == places_of(&map, row_off, &ids);
+            let mut want_image = vec![SENT_U32; layout.x + N];
+            want_image[layout.seq] = 41;
+            want_image[layout.ids..layout.ids + SLOTS8].copy_from_slice(&ids);
+            for (s, w) in wts.iter().enumerate() {
+                want_image[layout.weights + s] = w.to_bits();
+            }
+            for (d, v) in x.iter().enumerate() {
+                want_image[layout.x + d] = v.to_bits();
+            }
+            let image_ok = got_image == want_image;
+            let pass = fault_ok && places_ok && image_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: handoff8 {what} {ids:?} (ids at {}, weights at {}, x at {}): {fault}; places \
+                 {} {got_sel:?}; image (seq, ids as they came, weights, activation, nothing else) \
+                 {}: {}",
+                layout.ids,
+                layout.weights,
+                layout.x,
+                verdict(places_ok),
+                verdict(image_ok),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        for n_used in [5, 7, 9] {
+            let ids_dev = DeviceBuffer::from_host(stream, &[0u32; SLOTS8 + 1])?;
+            let w_dev = DeviceBuffer::from_host(stream, &[0.0f32; SLOTS8 + 1])?;
+            let lay = HandoffLayout {
+                seq: 0,
+                ids: 1,
+                weights: 1 + n_used,
+                x: 1 + 2 * n_used,
+                n_used,
+                hidden: N,
+            };
+            let mut image = DeviceBuffer::from_host(stream, &vec![SENT_U32; lay.x + N])?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; SLOTS8 + 1])?;
+            let h = Handoff {
+                ids: &ids_dev,
+                weights: &w_dev,
+                map: &map_dev,
+                row_off,
+                n_expert: N_EXPERT,
+            };
+            let target = HandoffTarget {
+                x: &x_dev,
+                seq: &seq_dev,
+                image: &mut image,
+                layout: lay,
+            };
+            let got = kernels.enqueue_handoff(stream, &h, target, gpu.unlabelled_sink(), &mut sel);
+            let untouched = image.to_host_vec(stream)?.iter().all(|&v| v == SENT_U32)
+                && sel.to_host_vec(stream)?.iter().all(|&v| v == SENT_U32);
+            stream.synchronize()?;
+            let (refused, text) = refused_by_name(got, "ds41_ffn_handoff", n_used);
+            let pass = refused && untouched;
+            ok &= pass;
+            println!(
+                "{NAME}: handoff of {n_used} slots: {text}; image and places untouched {untouched}: {}",
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
+    /// The prompt batch's 8-slot entries through their launchers, which
+    /// pick the entry from the slot count, on synthetic inputs:
+    /// - `ds41_ffn_card_acc_8`, three tokens of 300 values, against the host
+    ///   rule `runtime::combine::card_sum` at eight slots bit for bit — slot 7 on
+    ///   the card, NaN in every slot off it, slot `j`'s rows scaled by
+    ///   `4^(j mod 4)` so another order rounds differently; the six-slot
+    ///   entry on six-slot tokens against the rule at six and V4.1's
+    ///   `card_sum_elem`;
+    /// - `ds41_card_gather_8`, three token columns of one super-block, over a
+    ///   table whose entries name slots 7, 15, 23, 0, 9 and 17: entry `j`
+    ///   copies column `order[j] / 8` and nothing raises; the entries past
+    ///   the count keep what they held; with the table's last entry naming
+    ///   slot 24 (past the slots) that entry raises `expert_id` and writes
+    ///   nothing;
+    /// - both launchers refuse 5, 7 and 9 slots by name, nothing written;
+    /// - both `_8` entries compile with no local depot.
+    fn batch8_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        const N: usize = 300;
+        const M: usize = 3;
+        const N_CARD: usize = 6;
+        let kernels = FfnBatchKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let mut ok = no_local_depot(&["ds41_ffn_card_acc_8", "ds41_card_gather_8"])?;
+
+        // Per token, the places of its eight slots: slot 7 on the card in
+        // every token, place 9 (not below N_CARD) and HOST off it.
+        let places: [[u32; SLOTS8]; M] = [
+            [0, HOST, 2, 1, 9, 5, HOST, 3],
+            [HOST, 4, 4, 0, 1, HOST, 9, 5],
+            [3, 2, HOST, HOST, 0, 1, 5, 4],
+        ];
+        for n_used in [SLOTS8, N_USED] {
+            let sel: Vec<u32> = (0..M * n_used)
+                .map(|s| places[s / n_used][s % n_used])
+                .collect();
+            let on = |s: usize| (sel[s] as usize) < N_CARD;
+            let raw = activations(N, M * n_used, 811);
+            let down: Vec<f32> = (0..M * n_used * N)
+                .map(|i| {
+                    let s = i / N;
+                    if on(s) {
+                        raw[i] * (1u32 << (2 * (s % n_used % 4))) as f32
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect();
+            let wr = activations(M * n_used, 1, 812);
+            let w: Vec<f32> = (0..M * n_used)
+                .map(|s| if on(s) { wr[s] } else { f32::NAN })
+                .collect();
+            let (sel_d, down_d, w_d) = (
+                DeviceBuffer::from_host(stream, &sel)?,
+                DeviceBuffer::from_host(stream, &down)?,
+                DeviceBuffer::from_host(stream, &w)?,
+            );
+            let mut acc = DeviceBuffer::from_host(stream, &[SENT; N * M])?;
+            let a = CardAcc {
+                down: &down_d,
+                w: &w_d,
+                sel: &sel_d,
+                n: N,
+                m: M,
+                n_card: N_CARD,
+                n_used,
+            };
+            kernels.enqueue_card_acc(stream, &a, &mut acc)?;
+            let got = acc.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let rule = |t: usize, d: usize| -> (f32, Option<f32>) {
+                let at = |s: usize| t * n_used + s;
+                if n_used == SLOTS8 {
+                    let card: [bool; SLOTS8] = std::array::from_fn(|s| on(at(s)));
+                    let dv: [f32; SLOTS8] = std::array::from_fn(|s| down[at(s) * N + d]);
+                    let wv: [f32; SLOTS8] = std::array::from_fn(|s| w[at(s)]);
+                    (runtime::combine::card_sum(dv, wv, card), None)
+                } else {
+                    let card: [bool; N_USED] = std::array::from_fn(|s| on(at(s)));
+                    let dv: [f32; N_USED] = std::array::from_fn(|s| down[at(s) * N + d]);
+                    let wv: [f32; N_USED] = std::array::from_fn(|s| w[at(s)]);
+                    (
+                        runtime::combine::card_sum(dv, wv, card),
+                        Some(card_sum_elem(dv, wv, card)),
+                    )
+                }
+            };
+            let mut bad = 0usize;
+            let mut v41_ok = true;
+            for (i, g) in got.iter().enumerate() {
+                let (want, v41) = rule(i / N, i % N);
+                bad += usize::from(g.to_bits() != want.to_bits());
+                v41_ok &= v41.is_none_or(|v| v.to_bits() == want.to_bits());
+            }
+            let pass = bad == 0 && v41_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: card_acc of {n_used} slots, {M} tokens of {N} (card below {N_CARD}): {bad} \
+                 values differ from runtime::combine::card_sum; v41_rule {}: {}",
+                verdict(v41_ok),
+                verdict(pass)
+            );
+        }
+        for n_used in [5, 7, 9] {
+            let z = DeviceBuffer::from_host(stream, &vec![0.0f32; SLOTS8 * N * M])?;
+            let s = DeviceBuffer::from_host(stream, &[HOST; SLOTS8 * M])?;
+            let mut acc = DeviceBuffer::from_host(stream, &[SENT; N * M])?;
+            let a = CardAcc {
+                down: &z,
+                w: &z,
+                sel: &s,
+                n: N,
+                m: M,
+                n_card: N_CARD,
+                n_used,
+            };
+            let got = kernels.enqueue_card_acc(stream, &a, &mut acc);
+            let untouched = acc
+                .to_host_vec(stream)?
+                .iter()
+                .all(|v| v.to_bits() == SENT.to_bits());
+            stream.synchronize()?;
+            let (refused, text) = refused_by_name(got, "ds41_ffn_card_acc", n_used);
+            let pass = refused && untouched;
+            ok &= pass;
+            println!(
+                "{NAME}: card_acc of {n_used} slots: {text}; sums untouched {untouched}: {}",
+                verdict(pass)
+            );
+        }
+
+        // The gather: one super-block a column (64 q words, 2 scales).
+        const COLS: usize = 3;
+        const QC: usize = 64;
+        const DC: usize = 2;
+        let slots_n = SLOTS8 * COLS;
+        let q_in: Vec<u64> = (0..COLS * QC)
+            .map(|i| ((i / QC) as u64) << 32 | (i % QC) as u64)
+            .collect();
+        let d8_in: Vec<f32> = (0..COLS * DC).map(|i| i as f32 + 0.5).collect();
+        let (q_in_d, d8_in_d) = (
+            DeviceBuffer::from_host(stream, &q_in)?,
+            DeviceBuffer::from_host(stream, &d8_in)?,
+        );
+        let start = DeviceBuffer::from_host(stream, &[0u32, 3, 6])?;
+        // A gather's launch result and its two output planes read back.
+        type GatherRun = (Result<(), GpuError>, Vec<u64>, Vec<f32>);
+        let run = |order: &[u32], n_used: usize| -> Result<GatherRun, GateError> {
+            let mut o = order.to_vec();
+            o.resize(slots_n, SENT_U32);
+            let order_d = DeviceBuffer::from_host(stream, &o)?;
+            let mut q_out = DeviceBuffer::from_host(stream, &vec![u64::MAX; slots_n * QC])?;
+            let mut d8_out = DeviceBuffer::from_host(stream, &vec![SENT; slots_n * DC])?;
+            let g = CardGather {
+                q3: &q_in_d,
+                d8: &d8_in_d,
+                order: &order_d,
+                start: &start,
+                n_experts: 2,
+                n_slots: slots_n,
+                col0: 0,
+                cols: COLS,
+                n_sb: 1,
+                n_used,
+            };
+            let got = kernels.enqueue_card_gather(
+                stream,
+                &g,
+                gpu.unlabelled_sink(),
+                &mut q_out,
+                &mut d8_out,
+            );
+            let (q, d) = (q_out.to_host_vec(stream)?, d8_out.to_host_vec(stream)?);
+            stream.synchronize()?;
+            Ok((got, q, d))
+        };
+        let gather_cases: [(&str, [u32; 6], Option<FaultSite>); 2] = [
+            ("entries inside the slots", [7, 15, 23, 0, 9, 17], None),
+            (
+                "the last entry past the slots",
+                [7, 15, 23, 0, 9, 24],
+                Some(FaultSite::ExpertId),
+            ),
+        ];
+        for (what, order, want) in gather_cases {
+            gpu.clear_fault()?;
+            let (got, q, d) = run(&order, SLOTS8)?;
+            got?;
+            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
+            let mut want_q = vec![u64::MAX; slots_n * QC];
+            let mut want_d = vec![SENT; slots_n * DC];
+            for (j, &slot) in order.iter().enumerate() {
+                let col = slot as usize / SLOTS8;
+                if (slot as usize) < slots_n && col < COLS {
+                    want_q[j * QC..(j + 1) * QC].copy_from_slice(&q_in[col * QC..(col + 1) * QC]);
+                    want_d[j * DC..(j + 1) * DC].copy_from_slice(&d8_in[col * DC..(col + 1) * DC]);
+                }
+            }
+            let cols_ok = q == want_q && bits_equal(&d, &want_d);
+            let pass = fault_ok && cols_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: gather of 8 slots, {what} {order:?}: {fault}; columns order[j] / 8, \
+                 entries past the count untouched {}: {}",
+                verdict(cols_ok),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        for n_used in [5, 7, 9] {
+            let (got, q, d) = run(&[7, 15, 23, 0, 9, 17], n_used)?;
+            let untouched =
+                q.iter().all(|&v| v == u64::MAX) && d.iter().all(|v| v.to_bits() == SENT.to_bits());
+            let (refused, text) = refused_by_name(got, "ds41_card_gather", n_used);
+            let pass = refused && untouched;
+            ok &= pass;
+            println!(
+                "{NAME}: gather of {n_used} slots: {text}; columns untouched {untouched}: {}",
+                verdict(pass)
+            );
+        }
         Ok(ok)
     }
 
