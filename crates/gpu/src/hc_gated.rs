@@ -225,12 +225,11 @@ unsafe fn up_mix_value<const M: usize>(
     fault: FaultSink,
     mixed: &mut DisjointSlice<f32>,
 ) {
-    let mut g = [[0.0f32; MAX_COLS]; STREAMS];
+    let mut q = [[0u32; UP_LANE_WORDS]; STREAMS];
+    let mut sc = [[0.0f32; UP_LANE_WORDS]; STREAMS];
     for s in 0..STREAMS {
         thread::__unroll_config::<0>();
         let row = s * hidden + h;
-        let mut q = [0u32; UP_LANE_WORDS];
-        let mut sc = [0.0f32; UP_LANE_WORDS];
         for t in 0..UP_LANE_WORDS {
             thread::__unroll_config::<0>();
             let wd = lane + 32 * t;
@@ -243,26 +242,34 @@ unsafe fn up_mix_value<const M: usize>(
                         *d.get_unchecked(row * UP_BLOCKS + wd / 8),
                     )
                 };
-                q[t] = w;
-                sc[t] = half_bits_to_f32(b);
+                q[s][t] = w;
+                sc[s][t] = half_bits_to_f32(b);
             }
         }
-        for c in 0..M {
+    }
+    // Columns outer, streams inner: a column's bottleneck words live for that column only.
+    let mut g = [[0.0f32; MAX_COLS]; STREAMS];
+    for c in 0..M {
+        thread::__unroll_config::<0>();
+        let mut f = [0.0f32; STREAMS];
+        for t in 0..UP_LANE_WORDS {
             thread::__unroll_config::<0>();
-            let mut f = 0.0f32;
-            for t in 0..UP_LANE_WORDS {
-                thread::__unroll_config::<0>();
-                let wd = lane + 32 * t;
-                if wd < UP_WORDS {
-                    // SAFETY: c < M and 4·wd + 3 < RANK: inside lo_s.
-                    let x = unsafe {
-                        let p = lo_s.add(c * RANK + 4 * wd);
-                        [*p, *p.add(1), *p.add(2), *p.add(3)]
-                    };
-                    f = word_dot(f, q[t], sc[t], x);
+            let wd = lane + 32 * t;
+            if wd < UP_WORDS {
+                // SAFETY: c < M and 4·wd + 3 < RANK: inside lo_s.
+                let x = unsafe {
+                    let p = lo_s.add(c * RANK + 4 * wd);
+                    [*p, *p.add(1), *p.add(2), *p.add(3)]
+                };
+                for s in 0..STREAMS {
+                    thread::__unroll_config::<0>();
+                    f[s] = word_dot(f[s], q[s][t], sc[s][t], x);
                 }
             }
-            g[s][c] = warp::reduce_sum_f32(f);
+        }
+        for s in 0..STREAMS {
+            thread::__unroll_config::<0>();
+            g[s][c] = warp::reduce_sum_f32(f[s]);
         }
     }
     if lane != 0 {
