@@ -63,10 +63,11 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-/// The most tokens one ubatch takes: the grouped GEMM's slot cap at top-8.
-/// Also the default ubatch size: the one that reads each weight the fewest
-/// times per prompt and gives each expert's GEMM the most columns.
-pub const UBATCH: usize = GEMM_MAX_SLOTS / N_USED;
+/// The most tokens one ubatch takes; at top-8 it fits the grouped GEMM's slot
+/// cap. Also the default ubatch size: the one that reads each weight the
+/// fewest times per prompt and gives each expert's GEMM the most columns.
+pub const UBATCH: usize = 4096;
+const _: () = assert!(UBATCH * N_USED <= GEMM_MAX_SLOTS);
 
 /// The environment variable a load reads the ubatch size from.
 pub const UBATCH_ENV: &str = "BLOOMERY_QWEN3_UBATCH";

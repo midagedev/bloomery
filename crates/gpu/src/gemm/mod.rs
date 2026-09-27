@@ -48,7 +48,8 @@ pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
 pub use route::{GemmRoute, GemmTile};
 
-/// Slots one route and one GEMM take: a 4096-token ubatch at top-8.
-pub const GEMM_MAX_SLOTS: usize = 32_768;
+/// Slots one route and one GEMM take: a 4096-token ubatch at nine slots a
+/// token (eight routed experts and the shared one).
+pub const GEMM_MAX_SLOTS: usize = 36_864;
 /// Columns (slots) one tile holds: eight n-tiles of eight.
 pub const GEMM_BN: usize = 64;

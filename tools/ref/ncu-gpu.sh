@@ -81,7 +81,7 @@
 #     trace of main's binary agrees: its first kernel is embed_rows_q4k, and it holds 48 gqa_prefill_flash
 #     launches at P = 4096, none in a graph, the first at kernel index 8 (layer 0's ninth launch);
 #   - the prompt runs as PrefillPlan::new(P, Auto, U) (arch/qwen3moe/prefill.rs): ubatches of U =
-#     BLOOMERY_QWEN3_UBATCH, else UBATCH = GEMM_MAX_SLOTS / N_USED = 4096, then a tail of at most
+#     BLOOMERY_QWEN3_UBATCH, else UBATCH = 4096, then a tail of at most
 #     MAX_TOKENS as a pass (the decode flash) or a longer tail as one more ubatch;
 #   - each ubatch launches it once per layer, layers in order (ubatch.rs Ubatch::enqueue -> attention);
 # so the skip is K x n_layer + LAYER and the count 1, K the ubatch profiled (BLOOMERY_NCU_UNIT, default the
