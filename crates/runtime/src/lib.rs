@@ -10,9 +10,15 @@
 //! Everything here is greedy: a pass keeps the target's argmax, so a draft
 //! changes which passes run and never a token. Sampling — the sampler chain,
 //! and verification by sampling each verified row — needs the rows' logits.
+//!
+//! Beneath a target's call: [`sched`], the order in which a schedule runs a
+//! layer program's parts over its units ([`sched::walk`]), and [`state`], the
+//! stores a layer keeps and how later positions read them.
 
 mod lookup;
+pub mod sched;
 mod speculative;
+pub mod state;
 mod stop;
 
 pub use lookup::Lookup;

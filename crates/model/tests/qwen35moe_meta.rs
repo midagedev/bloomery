@@ -1,8 +1,10 @@
 //! qwen35moe metadata gate: what the header reader `arch::qwen35moe` resolves
 //! from a Qwen3.6-35B-A3B file, and what the coverage check lists for it —
 //! the parts no program in this tree runs yet, the work queue of the rounds
-//! that build one. One contract, one test; it prints what it compared, then
-//! fails with the whole list of what differs.
+//! that build one, and which layers a prompt call runs at every position
+//! (every one: the GQA layers keep their planes, the GDN layers their state).
+//! One contract, one test; it prints what it compared, then fails with the
+//! whole list of what differs.
 //!
 //! `hw_`: needs both files on the box (`just gate-qwen35moe-meta`). Headers
 //! only: seconds.
@@ -102,6 +104,18 @@ fn hw_qwen35moe_spec() {
             "coverage",
             &spec_view::items(&list),
             coverage,
+        );
+        let short: Vec<String> = (0..)
+            .zip(&read.spec.layers)
+            .filter(|(_, l)| !runtime::state::every_position(l))
+            .map(|(i, _): (usize, _)| format!("layer {i}: its stores are windows alone"))
+            .collect();
+        spec_view::compare(
+            &mut o,
+            &mut b,
+            "layers a prompt call runs at fewer than every position",
+            &short,
+            &[],
         );
         let err = model::placement::PlacementError::Unimplemented(list);
         let _ = writeln!(o, "as the engine refuses it: {err}");

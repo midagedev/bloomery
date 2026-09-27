@@ -25,3 +25,6 @@ thiserror = { workspace = true }
 # The gates read the oracle sets through the reference-set reader, which checks each set's
 # provenance. It depends on the GGUF reader only, so the edge makes no cycle.
 bloomery-refset = { path = "../refset" }
+# The header gates hold the store rules (`runtime::state`) to the files' layers. The runtime depends
+# on the model description alone, so the edge makes no cycle.
+bloomery-runtime = { path = "../runtime" }
