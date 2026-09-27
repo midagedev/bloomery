@@ -468,6 +468,18 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# GLM-5.3-Flash MTP draft oracle: dump_mtp linked against the ik tree that carries the glm5next MTP graph (the profile's
+# GLM_MTP_IK at GLM_MTP_SHA, checked clean); `cmake --build` of its libllama and libcommon first (nothing to do when
+# current). Under the CPU lease: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmmtpref-dump.card'.
+build-ref-dump-mtp:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/build-dump-mtp.sh'
+
+# Every node ik's MTP context computes while the target decodes 64 positions after the first 64 prose ids, one draft
+# token a round, into $BLOOMERY_DATA/ref-mtp/prose64_n64_k1/ (refset family mtp-glm5next). ik on the CPU, CUDA hidden,
+# under the CPU lease and the same card; the set is installed from staging only with its `# complete` trailer.
+dump-ref-mtp-glm5next:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/dump-mtp.sh'
+
 # Qwen3.8-Flash-Next(qwen4exp) 오라클: 같은 덤프 도구를 qwen4exp 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_qwen4exp/에 뜬다. VARIANT(step4, d1k, d3k와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/qwen4exp.sh. d1k와 d3k는 $BLOOMERY_DATA/qwen4exp/corpus-prose.ids의 첫 1,025개와 3,001개 id를

@@ -1,0 +1,35 @@
+# Round glmmtpref: the GLM-5.3-Flash MTP draft oracle set, ref-mtp/prose64_n64_k1 (refset family
+# mtp-glm5next). Two runs under this card, one lease each, back to back:
+#   `just build-ref-dump-mtp`  cmake --build of libllama and libcommon in /home/user/ik-glm53-mtp
+#     (425a2c1d; its libraries were built at 08:32 on 09-15, after its HEAD's 08:23 commit, so make is
+#     expected to find nothing to do: 5-30 s), then g++ of dump_mtp.cpp against them (20-60 s):
+#     0.5-1.5 min. Should make rebuild the tree after all, the hold is ik's CUDA build (~10-15 min,
+#     not measured on this tree) and the run's log says so.
+#   `just dump-ref-mtp-glm5next`  ik on 32 CPU threads, CUDA hidden, the target and its MTP context:
+#     64 prose ids, then 64 positions at one draft token a round. The phases run one after the other,
+#     so the wall is their sum [derived]:
+#     fixed     lease, witnesses, 1,412 tensors' metadata over six shards, two contexts: 3-15 s
+#               (glmref's dumps of this file)
+#     populate  the loader pages in the 199.7 GB split set: warm <= 17-29 s whole-run as glmref's warm
+#               step dumps measured (commit 0b5d1c9); cold 133 s (glmref's batch dump, 1.5 GB/s)
+#     prompt    64 ids x ~36 GFLOP at 1.25-3 TFLOP/s: 1-2 s; the MTP warmup graph over 64 rows,
+#               node by node: < 1 s
+#     rounds    R = 61 / (1 + alpha) + 1 = 32-39 at alpha 0.6-0.95 (0.753 measured, 09-15 chat
+#               prose): per round a 2-row verify of ~17.7 GB (8.97 GB of dense a token, 5.1 GB routed
+#               x 1.71, the k = 2 union) at 100-150 GB/s, 118-177 ms, plus the update graph (~1.0 GB
+#               with the shared output, ~300 nodes alone, 3-6 MB written) 30-50 ms: 5-10 s; a
+#               rejected round may add a 1-row re-decode (94-141 ms)
+#     dump      the set: warmup 60-90 MB, gen 3 MB, R x 3.5-5.5 MB = 170-310 MB, 7k-12k files, at the
+#               0.5 GB/s glmref wrote: < 1 s
+#     warm 0.4-0.7 min, cold 2.4-2.7 min.
+# What the dump itself checks (no trailer otherwise): one warmup graph; every committed block ran one
+# update graph; in every block the proposal equals the target's token exactly when ik accepted it;
+# ik's draft sampler names each update graph's result_output argmax. Then `just gate-refset` (no
+# lease): red before the dump on this family's set (Missing), green after.
+kind: exclusive
+reason: dump_mtp runs ik on 32 CPU threads and populates the whole 199.7 GB split set into the page
+  cache, evicting that much of what else is cached; beside a timed run or a gate batch it would take
+  their cores, their memory bandwidth and their cache, so it holds the lease, and the dumper's build
+  holds it for its compile; why now: the MTP chain's first link (glmmtpref, then deltalanes, glmpair,
+  glmmtpload, glmmtp), the oracle the GLM MTP port is judged against
+minutes: 0.4..3
