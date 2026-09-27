@@ -145,10 +145,12 @@ selftests=(
   "tools/ref/check-int-twins.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"
+  "tools/ref/ptx-canon.py --self-test"
   "tools/ref/ds41pp.py self-test"
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-hotlist.py --self-test"
   "tools/ref/window-union.py --self-test"
+  "tools/verdict-diff.py --self-test"
 )
 root="$(cd "$(dirname "$0")/.." && pwd)"
 listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)

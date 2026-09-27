@@ -32,10 +32,11 @@
 //! The counts see the instructions an entry carries, not their order or
 //! their operands: predicated selects rewritten into branches, or a
 //! `stacksave` appearing, can leave every count equal. [`normalize`] is the
-//! entry's whole instruction stream with only the names the backend numbers
+//! entry's whole instruction stream with only the names the backend picks
 //! freely taken out, so two bodies that differ in anything else normalize
 //! differently; `tools/ptx-scan.sh` prints the md5 of each entry's
-//! normalized text. The rules, applied to the entry's [`body`] line by line:
+//! normalized text, under the method name [`DIGEST_METHOD`]. The rules,
+//! applied to the entry's [`body`] line by line:
 //!
 //! | input                                  | normalized                 |
 //! |----------------------------------------|----------------------------|
@@ -45,10 +46,27 @@
 //! | `%r12` `%rd7` `%f3` `%p1` (a register) | `%r` `%rd` `%f` `%p`       |
 //! | `%r<143>` (a register declaration)     | `%r<N>`                    |
 //! | `$L__BB54_3` (a block label)           | `$L`                       |
-//! | `__shared_mem_7`, `__local_depot2`     | `__shared_mem_`, `__local_depot` |
-//! | `__device_global_3`                    | `__device_global_`         |
+//! | `__local_depot2`                       | `__local_depot`            |
+//! | a generated module symbol (below)      | `<stem><<signature>>#k`    |
 //! | the entry's own name, `<name>_param_3` | `ENTRY`, `ENTRY_param_3`   |
 //! | anything else                          | kept byte for byte         |
+//!
+//! A generated module symbol is a whole token that starts with one of
+//! [`GENERATED_STEMS`] (`__shared_mem_`, `__device_global_`,
+//! `__dynamic_smem_`), whatever follows the stem: the backend picks the rest
+//! of the name — a crate hash, a number, the kernel's name — and numbers and
+//! orders the module's declarations freely. Such a token becomes its stem,
+//! the signature of its declaration in the entry's module ([`Decls`]), and
+//! `#k`, where k counts the entry's distinct generated symbols in order of
+//! first appearance. The signature is the declaration with its name taken
+//! out: linkage, state space, alignment, element type, dimensions, and
+//! `= #<hex>`, the FNV-1a 64 of its initializer, when it has one. So the
+//! digest moves when the entry's instructions move, when a symbol it names
+//! changes its declaration, or when two of its references come to name one
+//! symbol or one splits into two; not when only names or numbering move. A
+//! generated token its module does not declare, or declares twice, is an
+//! error, never a guess. Every other symbol (`_$_str`, a named global) is
+//! kept byte for byte.
 //!
 //! Registers are the classes `%r %rd %rs %f %fd %p %h %hh %rq`; a special
 //! register (`%tid.x`, `%clock64`) is kept. Opcodes with their type
@@ -99,6 +117,13 @@ impl<'a> Module<'a> {
     #[must_use]
     pub fn text(&self) -> &'a [u8] {
         self.text
+    }
+
+    /// A module saved as a file of its own (the `mod<N>.ptx` `oxart_ptx`
+    /// writes): the file's bytes are the payload, with nothing past them.
+    #[must_use]
+    pub fn saved(bundle: &'a str, text: &'a [u8]) -> Module<'a> {
+        Module { bundle, text }
     }
 }
 
@@ -202,13 +227,18 @@ fn directive_line(text: &[u8], directive: &[u8]) -> Option<usize> {
 /// an entry of that name.
 #[must_use]
 pub fn body<'a>(modules: &[Module<'a>], name: &str) -> Option<&'a [u8]> {
+    located(modules, name).map(|(_, b)| b)
+}
+
+/// [`body`], with the index of the module that holds it.
+fn located<'a>(modules: &[Module<'a>], name: &str) -> Option<(usize, &'a [u8])> {
     let head = format!(".visible .entry {name}(");
-    modules.iter().find_map(|m| {
+    modules.iter().enumerate().find_map(|(i, m)| {
         let start = find(m.text, head.as_bytes())? + head.len();
         let rest = &m.text[start..];
         let end = directive_line(rest, b".entry").unwrap_or(rest.len());
         let end = directive_line(&rest[..end], b".func").unwrap_or(end);
-        Some(&rest[..end])
+        Some((i, &rest[..end]))
     })
 }
 
@@ -325,57 +355,310 @@ pub fn scan(modules: &[Module<'_>]) -> Vec<Counts> {
 /// declaration `%<class><<count>>`.
 const REG_CLASSES: &[&[u8]] = &[b"r", b"rd", b"rs", b"f", b"fd", b"p", b"h", b"hh", b"rq"];
 
-/// Generated symbols that carry a number with no meaning of its own.
-const NUMBERED_STEMS: &[&[u8]] = &[b"__shared_mem_", b"__local_depot", b"__device_global_"];
+/// Entry-local generated symbols that carry a number with no meaning of its own.
+const NUMBERED_STEMS: &[&[u8]] = &[b"__local_depot"];
+
+/// The stems of the module symbols the backend generates and names freely
+/// (the table in this module's comment): a token that starts with one is
+/// replaced by its declaration's signature.
+pub const GENERATED_STEMS: &[&[u8]] = &[b"__shared_mem_", b"__device_global_", b"__dynamic_smem_"];
+
+/// The name of the rule set [`normalize`] applies, which `tools/ptx-scan.sh`
+/// prints over its digest block. Two digests compare only under one method:
+/// a rule change that can move the digest of unchanged code renames it.
+pub const DIGEST_METHOD: &str = "decl1";
+
+/// The state spaces a module-scope declaration can open with, after its
+/// linkage.
+const DECL_OPENERS: &[&[u8]] = &[
+    b".visible",
+    b".extern",
+    b".weak",
+    b".common",
+    b".shared",
+    b".global",
+    b".const",
+];
 
 /// A character of a PTX identifier (or of the alphanumeric run of a number).
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
 }
 
-/// The text of entry `name`'s [`body`] with the freely numbered names taken
-/// out — the table in this module's comment. Every kept line ends in `\n`.
-#[must_use]
-pub fn normalize(name: &str, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    for raw in body.split(|&c| c == b'\n') {
-        let code = find(raw, b"//").map_or(raw, |i| &raw[..i]);
-        let start = out.len();
-        normalize_line(name.as_bytes(), code, &mut out);
-        if out.len() > start {
-            out.push(b'\n');
+/// Whether `tok`, a whole identifier token, is a generated module symbol.
+fn generated(tok: &[u8]) -> bool {
+    GENERATED_STEMS.iter().any(|s| tok.starts_with(s))
+}
+
+/// Whitespace runs to one space, none at the ends.
+fn collapse(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for word in text
+        .split(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+        .filter(|w| !w.is_empty())
+    {
+        if !out.is_empty() {
+            out.push(b' ');
         }
+        out.extend_from_slice(word);
     }
     out
 }
 
-/// One line with its comment already cut off: whitespace runs to one space,
-/// registers and symbols through [`register`] and [`symbol`].
-fn normalize_line(name: &[u8], line: &[u8], out: &mut Vec<u8>) {
-    let start = out.len();
-    let mut space = false;
-    let mut i = 0;
-    while i < line.len() {
-        let c = line[i];
-        if matches!(c, b' ' | b'\t' | b'\r') {
-            space = true;
-            i += 1;
-            continue;
+/// FNV-1a, 64 bits: the initializer digest of a signature.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The generated module symbols a module declares, each with its signature
+/// (the table in this module's comment). Only [`Decls::of`] makes one.
+#[derive(Debug, Clone, Default)]
+pub struct Decls(std::collections::HashMap<Vec<u8>, Vec<u8>>);
+
+impl Decls {
+    /// The declarations of every generated symbol in `module`: each line
+    /// that opens with a linkage or a state space and names a generated
+    /// symbol. An error when such a line is not one whole declaration this
+    /// reader parses, or when a symbol is declared twice.
+    pub fn of(module: &Module<'_>) -> Result<Decls, GateError> {
+        let mut map = std::collections::HashMap::new();
+        for raw in module.text.split(|&c| c == b'\n') {
+            let Some((name, sig)) =
+                declaration(raw).map_err(|e| format!("module {}: {e}", module.bundle))?
+            else {
+                continue;
+            };
+            if map.insert(name.clone(), sig).is_some() {
+                return Err(format!(
+                    "module {} declares {} twice",
+                    module.bundle,
+                    String::from_utf8_lossy(&name)
+                )
+                .into());
+            }
         }
-        if space && out.len() > start {
-            out.push(b' ');
+        Ok(Decls(map))
+    }
+
+    /// The signature of generated symbol `name`, or `None` when the module
+    /// does not declare it.
+    #[must_use]
+    pub fn signature(&self, name: &[u8]) -> Option<&[u8]> {
+        self.0.get(name).map(Vec::as_slice)
+    }
+}
+
+/// A generated symbol's name and the signature of its declaration.
+type Declared = (Vec<u8>, Vec<u8>);
+
+/// The name and signature of the generated symbol `raw` declares; `None`
+/// for a line that declares none (an instruction, another symbol). An error
+/// for a line that opens like a declaration and names a generated symbol,
+/// but is not `<directives> <name>[dims] [= init];` on one line.
+fn declaration(raw: &[u8]) -> Result<Option<Declared>, String> {
+    let code = find(raw, b"//").map_or(raw, |i| &raw[..i]).trim_ascii();
+    let opens = DECL_OPENERS
+        .iter()
+        .any(|o| code.starts_with(o) && matches!(code.get(o.len()), Some(b' ' | b'\t')));
+    if !opens {
+        return Ok(None);
+    }
+    let mut at = 0;
+    let (start, end) = loop {
+        let Some(off) = code[at..].iter().position(|&c| is_ident(c)) else {
+            return Ok(None);
+        };
+        let i = at + off;
+        let end = i + code[i..].iter().take_while(|&&b| is_ident(b)).count();
+        let whole = i == 0 || !is_ident(code[i - 1]);
+        if whole && generated(&code[i..end]) {
+            break (i, end);
         }
-        space = false;
-        if c == b'%' {
-            i = register(line, i, out);
-        } else if is_ident(c) && (i == 0 || !is_ident(line[i - 1])) {
-            let end = i + line[i..].iter().take_while(|&&b| is_ident(b)).count();
-            symbol(name, &line[i..end], out);
-            i = end;
+        at = end;
+    };
+    let name = code[start..end].to_vec();
+    let refuse = |why: &str| {
+        Err(format!(
+            "declaration of {} {why}: {}",
+            String::from_utf8_lossy(&name),
+            String::from_utf8_lossy(code)
+        ))
+    };
+    let head = &code[..start];
+    let words_ok = head
+        .split(|c| matches!(c, b' ' | b'\t'))
+        .filter(|w| !w.is_empty())
+        .all(|w| w.starts_with(b".") || w.iter().all(u8::is_ascii_digit));
+    let spaced = [b".shared".as_slice(), b".global", b".const"]
+        .iter()
+        .any(|s| head.split(|c| matches!(c, b' ' | b'\t')).any(|w| w == *s));
+    if !words_ok || !spaced {
+        return refuse("does not open with directives naming a state space");
+    }
+    let Some(tail) = code[end..].strip_suffix(b";") else {
+        return refuse("does not end on its line with `;`");
+    };
+    let (dims, init) = match tail.iter().position(|&c| c == b'=') {
+        Some(eq) => (&tail[..eq], Some(tail[eq + 1..].trim_ascii())),
+        None => (tail, None),
+    };
+    let dims = collapse(dims);
+    let dims_ok = dims.is_empty()
+        || dims.split(|&c| c == b']').all(|d| {
+            d.is_empty()
+                || d.strip_prefix(b"[")
+                    .is_some_and(|n| n.iter().all(u8::is_ascii_digit))
+        });
+    if !dims_ok || init.is_some_and(<[u8]>::is_empty) {
+        return refuse("has dimensions or an initializer this reader does not parse");
+    }
+    let mut sig = collapse(head);
+    if !dims.is_empty() {
+        sig.push(b' ');
+        sig.extend_from_slice(&dims);
+    }
+    if let Some(init) = init {
+        sig.extend_from_slice(format!(" = #{:016x}", fnv1a64(&collapse(init))).as_bytes());
+    }
+    Ok(Some((name, sig)))
+}
+
+/// Entry `name`'s normalized body ([`normalize`]) read out of `modules`,
+/// with the declarations of the module that holds it; `decls` is
+/// [`module_decls`] of the same `modules`. An error when no module declares
+/// the entry, or when [`normalize`] refuses it.
+pub fn normalized(
+    modules: &[Module<'_>],
+    decls: &[Decls],
+    name: &str,
+) -> Result<Vec<u8>, GateError> {
+    let (i, b) =
+        located(modules, name).ok_or_else(|| format!("no module declares entry {name}"))?;
+    let d = decls
+        .get(i)
+        .ok_or_else(|| format!("no declarations read for module {i} (entry {name})"))?;
+    normalize(d, name, b)
+}
+
+/// [`Decls::of`] of each module, in order.
+pub fn module_decls(modules: &[Module<'_>]) -> Result<Vec<Decls>, GateError> {
+    modules.iter().map(Decls::of).collect()
+}
+
+/// The text of entry `name`'s [`body`] with the freely picked names taken
+/// out — the table in this module's comment — against `decls`, the
+/// declarations of its module. Every kept line ends in `\n`. An error when
+/// the body names a generated symbol `decls` does not hold.
+pub fn normalize(decls: &Decls, name: &str, body: &[u8]) -> Result<Vec<u8>, GateError> {
+    let mut n = Normalizer {
+        decls,
+        name: name.as_bytes(),
+        seen: Vec::new(),
+    };
+    let mut out = Vec::with_capacity(body.len());
+    for raw in body.split(|&c| c == b'\n') {
+        let code = find(raw, b"//").map_or(raw, |i| &raw[..i]);
+        let start = out.len();
+        n.line(code, &mut out)?;
+        if out.len() > start {
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+/// One entry's normalization state: its module's declarations, its name,
+/// and its generated symbols in order of first appearance.
+struct Normalizer<'d> {
+    decls: &'d Decls,
+    name: &'d [u8],
+    seen: Vec<Vec<u8>>,
+}
+
+impl Normalizer<'_> {
+    /// One line with its comment already cut off: whitespace runs to one
+    /// space, registers through [`register`], tokens through [`Self::symbol`].
+    fn line(&mut self, line: &[u8], out: &mut Vec<u8>) -> Result<(), GateError> {
+        let start = out.len();
+        let mut space = false;
+        let mut i = 0;
+        while i < line.len() {
+            let c = line[i];
+            if matches!(c, b' ' | b'\t' | b'\r') {
+                space = true;
+                i += 1;
+                continue;
+            }
+            if space && out.len() > start {
+                out.push(b' ');
+            }
+            space = false;
+            if c == b'%' {
+                i = register(line, i, out);
+            } else if is_ident(c) && (i == 0 || !is_ident(line[i - 1])) {
+                let end = i + line[i..].iter().take_while(|&&b| is_ident(b)).count();
+                self.symbol(&line[i..end], out)?;
+                i = end;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// One whole identifier token: a block label, a numbered local symbol,
+    /// a generated module symbol or the entry's own name is replaced; any
+    /// other token is kept.
+    fn symbol(&mut self, tok: &[u8], out: &mut Vec<u8>) -> Result<(), GateError> {
+        let numbered = |rest: &[u8]| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit);
+        if let Some(rest) = tok.strip_prefix(b"$L__BB".as_slice())
+            && rest.split(|&c| c == b'_').all(numbered)
+        {
+            out.extend_from_slice(b"$L");
+            return Ok(());
+        }
+        for stem in NUMBERED_STEMS {
+            if tok.strip_prefix(*stem).is_some_and(numbered) {
+                out.extend_from_slice(stem);
+                return Ok(());
+            }
+        }
+        if let Some(stem) = GENERATED_STEMS.iter().find(|s| tok.starts_with(s)) {
+            let sig = self.decls.signature(tok).ok_or_else(|| {
+                format!(
+                    "entry {} names {}, which its module does not declare",
+                    String::from_utf8_lossy(self.name),
+                    String::from_utf8_lossy(tok)
+                )
+            })?;
+            let k = match self.seen.iter().position(|s| s == tok) {
+                Some(p) => p + 1,
+                None => {
+                    self.seen.push(tok.to_vec());
+                    self.seen.len()
+                }
+            };
+            out.extend_from_slice(stem);
+            out.push(b'<');
+            out.extend_from_slice(sig);
+            out.extend_from_slice(format!(">#{k}").as_bytes());
+            return Ok(());
+        }
+        let name = self.name;
+        if tok == name {
+            out.extend_from_slice(b"ENTRY");
+        } else if let Some(rest) = tok.strip_prefix(name)
+            && rest.starts_with(b"_param_")
+        {
+            out.extend_from_slice(b"ENTRY");
+            out.extend_from_slice(rest);
         } else {
-            out.push(c);
-            i += 1;
+            out.extend_from_slice(tok);
         }
+        Ok(())
     }
 }
 
@@ -412,34 +695,6 @@ fn register(line: &[u8], at: usize, out: &mut Vec<u8>) -> usize {
         }
     }
     class_end
-}
-
-/// One whole identifier token: a block label, a numbered generated symbol,
-/// or the entry's own name is replaced; any other token is kept.
-fn symbol(name: &[u8], tok: &[u8], out: &mut Vec<u8>) {
-    let numbered = |rest: &[u8]| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit);
-    if let Some(rest) = tok.strip_prefix(b"$L__BB".as_slice())
-        && rest.split(|&c| c == b'_').all(numbered)
-    {
-        out.extend_from_slice(b"$L");
-        return;
-    }
-    for stem in NUMBERED_STEMS {
-        if tok.strip_prefix(*stem).is_some_and(numbered) {
-            out.extend_from_slice(stem);
-            return;
-        }
-    }
-    if tok == name {
-        out.extend_from_slice(b"ENTRY");
-    } else if let Some(rest) = tok.strip_prefix(name)
-        && rest.starts_with(b"_param_")
-    {
-        out.extend_from_slice(b"ENTRY");
-        out.extend_from_slice(rest);
-    } else {
-        out.extend_from_slice(tok);
-    }
 }
 
 #[cfg(test)]
@@ -796,12 +1051,32 @@ $L__BB11_7:
 }
 ";
 
+    /// The declarations of a module whose only generated symbols are
+    /// `lines`, one declaration a line.
+    fn decls_of(lines: &str) -> Decls {
+        Decls::of(&Module::saved("test", lines.as_bytes())).expect("the declarations parse")
+    }
+
+    /// `normalize` against `decls`, which must accept the body.
+    fn norm(decls: &Decls, name: &str, body: &[u8]) -> Vec<u8> {
+        normalize(decls, name, body).expect("every generated symbol is declared")
+    }
+
     /// Renumbering and renaming leave the normalized text — and so its md5
     /// — unchanged; the text is the stream with only the numbers gone.
     #[test]
     fn normalize_ignores_renumbering() {
-        let a = normalize("alpha", NORM_A);
-        assert_eq!(a, normalize("beta", NORM_A_RENUMBERED));
+        let a = norm(
+            &decls_of(".visible .shared .align 4 .b8 __shared_mem_4[4];"),
+            "alpha",
+            NORM_A,
+        );
+        let b = norm(
+            &decls_of(".visible .shared .align 4 .b8 __shared_mem_19[4];"),
+            "beta",
+            NORM_A_RENUMBERED,
+        );
+        assert_eq!(a, b);
         let text = String::from_utf8(a).expect("ascii");
         assert_eq!(text.lines().count(), 18, "{text}");
         for kept in [
@@ -809,7 +1084,7 @@ $L__BB11_7:
             "mov.u32 %r, %tid.x;",
             "@%p bra $L;",
             "mov.b32 %r, 0fFF800000;",
-            "st.shared.b32 [__shared_mem_], %r;",
+            "st.shared.b32 [__shared_mem_<.visible .shared .align 4 .b8 [4]>#1], %r;",
             "$L:",
             "add.s64 %rd, %rd, 4;",
             ".reg .b64 %rd<N>;",
@@ -827,7 +1102,8 @@ $L__BB11_7:
     /// order, a special register, the block width.
     #[test]
     fn normalize_sees_every_other_change() {
-        let a = normalize("alpha", NORM_A);
+        let d = decls_of(".visible .shared .align 4 .b8 __shared_mem_4[4];");
+        let a = norm(&d, "alpha", NORM_A);
         let src = std::str::from_utf8(NORM_A).expect("ascii");
         for (from, to) in [
             ("setp.ne.b32", "setp.eq.b32"),
@@ -841,7 +1117,7 @@ $L__BB11_7:
             ("\tret;", "\texit;"),
         ] {
             assert!(src.contains(from), "{from:?} is not in the body");
-            let changed = normalize("alpha", src.replacen(from, to, 1).as_bytes());
+            let changed = norm(&d, "alpha", src.replacen(from, to, 1).as_bytes());
             assert_ne!(a, changed, "{from:?} -> {to:?} normalized the same");
         }
         let swapped = src.replacen(
@@ -850,7 +1126,7 @@ $L__BB11_7:
             1,
         );
         assert_ne!(swapped, src, "the swap must apply");
-        assert_ne!(a, normalize("alpha", swapped.as_bytes()));
+        assert_ne!(a, norm(&d, "alpha", swapped.as_bytes()));
     }
 
     /// Only whole tokens are rewritten: a longer name that starts with the
@@ -858,7 +1134,9 @@ $L__BB11_7:
     /// outside the list stay as they are.
     #[test]
     fn normalize_rewrites_whole_tokens_only() {
-        let n = normalize(
+        let none = Decls::default();
+        let n = norm(
+            &none,
             "alpha",
             b"call alpha2, (alpha_x);\nmov.u64 %rd1, %clock64;\n%q3;\n",
         );
@@ -866,17 +1144,221 @@ $L__BB11_7:
             std::str::from_utf8(&n).expect("ascii"),
             "call alpha2, (alpha_x);\nmov.u64 %rd, %clock64;\n%q3;\n"
         );
-        assert_eq!(normalize("alpha", b"  // only a comment\n\n\t\n"), b"");
+        assert_eq!(norm(&none, "alpha", b"  // only a comment\n\n\t\n"), b"");
         assert_eq!(
-            normalize("a", b"$L__BB1_x: __local_depot7 __local_depotx\n"),
+            norm(&none, "a", b"$L__BB1_x: __local_depot7 __local_depotx\n"),
             b"$L__BB1_x: __local_depot __local_depotx\n"
         );
         assert_eq!(
-            normalize(
+            norm(
+                &decls_of(".visible .global .align 8 .b8 __device_global_3;"),
                 "a",
                 b"ld.global.nc.u64 %rd1, [__device_global_3+8], __device_globalx;\n"
             ),
-            b"ld.global.nc.u64 %rd, [__device_global_+8], __device_globalx;\n"
+            b"ld.global.nc.u64 %rd, [__device_global_<.visible .global .align 8 .b8>#1+8], \
+              __device_globalx;\n"
         );
+    }
+
+    /// A module like the backend's, its generated names spelled by `names`:
+    /// the device global, three shared buffers (`s2` and `s3` of one
+    /// signature, `s5` another) and the dynamic shared symbol, in that
+    /// order; `order` is the order the declarations are written in. `alpha`
+    /// names the global, `s2`, `s3` and the dynamic symbol; `beta` names `s5`.
+    fn module(names: [&str; 5], order: [usize; 5]) -> String {
+        let [g, s2, s3, s5, dy] = names;
+        let decls = [
+            format!(".visible .global .align 4 .b8 {g}[8] = {{1, 2, 3, 4, 5, 6, 7, 8}};"),
+            format!(".visible .shared .align 4 .b8 {s2}[256];"),
+            format!(".visible .shared .align 4 .b8 {s3}[256];"),
+            format!(".visible .shared .align 4 .b8 {s5}[64];"),
+            format!(".extern .shared .align 16 .b8 {dy}[];"),
+        ];
+        let decls: Vec<&str> = order.iter().map(|&i| decls[i].as_str()).collect();
+        format!(
+            ".version 8.7\n.target sm_86\n.address_size 64\n\n{}\n\
+             .global .align 1 .b8 _$_str[4] = {{97, 98, 99, 0}};\n\n\
+             .visible .entry alpha(\n\t.param .u64 alpha_param_0\n)\n{{\n\
+             \tld.global.nc.u32 \t%r1, [{g}+4];\n\
+             \tst.shared.b32 \t[{s2}], %r1;\n\
+             \tst.shared.b32 \t[{s3}+4], %r1;\n\
+             \tld.shared.b32 \t%r2, [{dy}];\n\
+             \tmov.u64 \t%rd1, _$_str;\n\
+             \tret;\n}}\n\
+             .visible .entry beta(\n)\n{{\n\
+             \tld.shared.b32 \t%r1, [{s5}];\n\
+             \tret;\n}}\n",
+            decls.join("\n")
+        )
+    }
+
+    const PLAIN: [&str; 5] = [
+        "__device_global_4",
+        "__shared_mem_2",
+        "__shared_mem_3",
+        "__shared_mem_5",
+        "__dynamic_smem_alpha",
+    ];
+    const IN_ORDER: [usize; 5] = [0, 1, 2, 3, 4];
+
+    /// Each entry's normalized body, in entry order, or the first refusal.
+    fn digests(text: &str) -> Result<Vec<Vec<u8>>, GateError> {
+        let mods = [Module::saved("test", text.as_bytes())];
+        let decls = module_decls(&mods)?;
+        entries(&mods)
+            .iter()
+            .map(|e| normalized(&mods, &decls, e))
+            .collect()
+    }
+
+    /// The backend spells a generated name with a crate hash between the
+    /// stem and the number (or the kernel's name); the hash is a name, so
+    /// the hashed module normalizes like the plain one.
+    #[test]
+    fn a_hashed_generated_name_normalizes_like_the_plain_one() {
+        let hashed = [
+            "__device_global_0123456789abcdef_4",
+            "__shared_mem_0123456789abcdef_2",
+            "__shared_mem_0123456789abcdef_3",
+            "__shared_mem_0123456789abcdef_5",
+            "__dynamic_smem_0123456789abcdef_alpha",
+        ];
+        let plain = digests(&module(PLAIN, IN_ORDER)).expect("plain");
+        assert_eq!(plain, digests(&module(hashed, IN_ORDER)).expect("hashed"));
+        let alpha = String::from_utf8(plain[0].clone()).expect("ascii");
+        for kept in [
+            "ld.global.nc.u32 %r, [__device_global_<.visible .global .align 4 .b8 [8] = \
+             #187158eaeba8f101>#1+4];",
+            "st.shared.b32 [__shared_mem_<.visible .shared .align 4 .b8 [256]>#2], %r;",
+            "st.shared.b32 [__shared_mem_<.visible .shared .align 4 .b8 [256]>#3+4], %r;",
+            "ld.shared.b32 %r, [__dynamic_smem_<.extern .shared .align 16 .b8 []>#4];",
+            "mov.u64 %rd, _$_str;",
+        ] {
+            assert!(
+                alpha.lines().any(|l| l == kept),
+                "no line {kept:?} in\n{alpha}"
+            );
+        }
+    }
+
+    /// Declarations renumbered and written in another order — each symbol
+    /// keeping its own declaration — leave every entry's digest in place.
+    #[test]
+    fn two_modules_that_differ_only_by_renumbering_give_equal_entry_digests() {
+        let renumbered = [
+            "__device_global_0",
+            "__shared_mem_9",
+            "__shared_mem_1",
+            "__shared_mem_2",
+            "__dynamic_smem_alpha",
+        ];
+        assert_eq!(
+            digests(&module(PLAIN, IN_ORDER)).expect("base"),
+            digests(&module(renumbered, [4, 3, 0, 2, 1])).expect("renumbered")
+        );
+    }
+
+    /// A referenced symbol's declaration that changes size moves the digest
+    /// of the entry that names it, and of no other entry.
+    #[test]
+    fn a_changed_declaration_size_moves_the_digest() {
+        let base = digests(&module(PLAIN, IN_ORDER)).expect("base");
+        let text = module(PLAIN, IN_ORDER);
+        for (from, to, moved) in [
+            ("__shared_mem_5[64]", "__shared_mem_5[128]", [false, true]),
+            ("__shared_mem_3[256]", "__shared_mem_3[512]", [true, false]),
+            (
+                ".align 4 .b8 __shared_mem_2",
+                ".align 8 .b8 __shared_mem_2",
+                [true, false],
+            ),
+            (
+                "{1, 2, 3, 4, 5, 6, 7, 8}",
+                "{1, 2, 3, 4, 5, 6, 7, 9}",
+                [true, false],
+            ),
+        ] {
+            assert!(text.contains(from), "{from:?} is not in the module");
+            let changed = digests(&text.replacen(from, to, 1)).expect("changed");
+            for (e, m) in moved.into_iter().enumerate() {
+                assert_eq!(base[e] != changed[e], m, "{from:?} -> {to:?}, entry {e}");
+            }
+        }
+    }
+
+    /// Two declarations swapped under their references — each reference now
+    /// lands on a symbol of another size — move the digest of every entry
+    /// that names either; the same swap made in the references too is a
+    /// renaming and moves nothing.
+    #[test]
+    fn a_reference_moved_onto_a_declaration_of_another_size_moves_the_digest() {
+        let text = module(PLAIN, IN_ORDER);
+        let base = digests(&text).expect("base");
+        let decl_swapped = text
+            .replacen(".b8 __shared_mem_3[256]", ".b8 __shared_mem_X[256]", 1)
+            .replacen(".b8 __shared_mem_5[64]", ".b8 __shared_mem_3[64]", 1)
+            .replacen(".b8 __shared_mem_X[256]", ".b8 __shared_mem_5[256]", 1);
+        let changed = digests(&decl_swapped).expect("swapped");
+        assert_ne!(base[0], changed[0]);
+        assert_ne!(base[1], changed[1]);
+        let renamed = [
+            "__device_global_4",
+            "__shared_mem_2",
+            "__shared_mem_5",
+            "__shared_mem_3",
+            "__dynamic_smem_alpha",
+        ];
+        assert_eq!(base, digests(&module(renamed, IN_ORDER)).expect("renamed"));
+    }
+
+    /// Two references to two symbols of one signature that come to name one
+    /// symbol move the digest: the order of first appearance tells them apart.
+    #[test]
+    fn two_references_merged_into_one_symbol_move_the_digest() {
+        let base = digests(&module(PLAIN, IN_ORDER)).expect("base");
+        let text = module(PLAIN, IN_ORDER).replacen("[__shared_mem_3+4]", "[__shared_mem_2+4]", 1);
+        let merged = digests(&text).expect("merged");
+        assert_ne!(base[0], merged[0]);
+        assert_eq!(base[1], merged[1]);
+    }
+
+    /// A symbol that is not generated is kept byte for byte, name included.
+    #[test]
+    fn a_symbol_that_is_not_generated_is_kept_by_name() {
+        let base = digests(&module(PLAIN, IN_ORDER)).expect("base");
+        let text = module(PLAIN, IN_ORDER).replace("_$_str", "_$_str_$_2");
+        assert_ne!(base[0], digests(&text).expect("renamed")[0]);
+    }
+
+    /// A generated symbol its module does not declare, one declared twice,
+    /// and a declaration this reader does not parse are named errors, never
+    /// a digest.
+    #[test]
+    fn an_undeclared_or_unreadable_generated_symbol_is_a_named_error() {
+        let text = module(PLAIN, IN_ORDER);
+        let away = text.replacen(".b8 __shared_mem_5[64]", ".b8 __shared_mem_6[64]", 1);
+        let e = digests(&away).expect_err("beta names an undeclared symbol");
+        assert!(
+            e.to_string().contains("entry beta names __shared_mem_5"),
+            "{e}"
+        );
+        let twice = format!("{text}.visible .shared .align 4 .b8 __shared_mem_5[64];\n");
+        let e = digests(&twice).expect_err("declared twice");
+        assert!(
+            e.to_string().contains("declares __shared_mem_5 twice"),
+            "{e}"
+        );
+        for bad in [
+            ".visible .global .align 4 .b8 __device_global_7[8] = {1, 2,",
+            ".visible .align 4 .b8 __shared_mem_7[8];",
+            ".visible .shared .align 4 .b8 __shared_mem_7[x];",
+        ] {
+            let e = digests(&format!("{bad}\n{text}")).expect_err(bad);
+            assert!(
+                e.to_string().contains("__shared_mem_7")
+                    || e.to_string().contains("__device_global_7"),
+                "{e}"
+            );
+        }
     }
 }

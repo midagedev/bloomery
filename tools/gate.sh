@@ -14,6 +14,18 @@
 #     cargo의 코드를 그대로 돌려주고, 타임아웃 문구는 타임아웃일 때만 찍는다.
 # The bound is BLOOMERY_GATE_BOUND, parsed by tools/gate-bound.sh: a value it refuses ends this runner
 # with 64 before cargo runs.
+#
+# A third failure it closes: a filter that matches nothing. libtest passes a run of 0 tests, so a
+# call whose test-name filter names no test that exists (or none that runs under its ignore flags) is
+# green and checks nothing. A call that carries a filter — an argument after its `--` that is not a
+# flag, nor the value of `--skip`, `--test-threads`, `--format`, `--color`, `--logfile`, `-Z` or
+# `--shuffle-seed` — and that cargo ends with 0 fails with 78 when the `passed` counts of its
+# `test result:` lines sum to 0 over the whole call (one target printing "running 0 tests" is normal:
+# `--lib --test x -- f` names a test of one target). A call with no filter, or with `--list`, is not
+# judged.
+#
+# Exit codes: cargo's own (0 green, 101 a test failed, …); 124 or 137 the bound ran out; 64 the bound
+# was refused; 78 a filter matched no test that passed.
 set -uo pipefail
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
@@ -23,8 +35,42 @@ if [ "${1:-}" = --oxide ]; then
   shift
   RUN=(cargo oxide test --arch sm_86 --)
 fi
-timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
-rc=$?
+FILTERS=()
+LISTING=0
+after=0
+value=0
+for a in "$@"; do
+  if [ "$after" = 0 ]; then
+    [ "$a" = -- ] && after=1
+    continue
+  fi
+  if [ "$value" = 1 ]; then
+    value=0
+    continue
+  fi
+  case $a in
+    --skip | --test-threads | --format | --color | --logfile | -Z | --shuffle-seed) value=1 ;;
+    --list) LISTING=1 ;;
+    -*) ;;
+    *) FILTERS+=("$a") ;;
+  esac
+done
+if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
+  timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
+  rc=$?
+else
+  LOG=$(mktemp)
+  trap 'rm -f "$LOG"' EXIT
+  timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@" | tee "$LOG"
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" -eq 0 ]; then
+    passed=$(awk '/^test result: / { for (i = 2; i <= NF; i++) if ($i == "passed;") n += $(i - 1) } END { print n + 0 }' "$LOG")
+    if [ "$passed" -eq 0 ]; then
+      echo "GATE RED (exit 78): the filter ${FILTERS[*]} matched no test — 0 passed over the whole call" >&2
+      exit 78
+    fi
+  fi
+fi
 # 124 = timeout이 TERM으로 끝냄, 137 = TERM을 무시해 --kill-after의 KILL로 끝냄.
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
   echo "GATE TIMED OUT after the ${BOUND}s bound (exit $rc) — a gate that hangs is a red gate, not a silent one" >&2

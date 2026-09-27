@@ -46,11 +46,19 @@
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
 #
-# After the table, a second block: a `ptx-scan-md5:` line, then `<entry> <md5> <lines>` per row of
-# the table (the same filter), by name ascending. The md5 is of the entry's normalized body and
+# After the table, a second block: a `ptx-scan-md5: method=<m>` line, then `<entry> <md5> <lines>` per
+# row of the table (the same filter), by name ascending. The md5 is of the entry's normalized body and
 # `lines` its line count: the instruction stream with comments, whitespace runs, register numbers,
-# block-label numbers, `__shared_mem_N`/`__local_depotN`/`__device_global_N` numbers and the entry's own name taken out
-# (the rule table is in crates/gpu-gates/src/ptx.rs, `normalize`; the extractor writes the text).
+# block-label numbers, `__local_depotN` numbers and the entry's own name taken out, and every generated
+# module symbol (`__shared_mem_…`, `__device_global_…`, `__dynamic_smem_…`, hashed or not) replaced by
+# its declaration's signature — space, alignment, type, size, an initializer digest — and its order of
+# first appearance in the entry, so neither the backend's crate hash nor its numbering reaches the md5
+# (the rule table is in crates/gpu-gates/src/ptx.rs, `normalize`; the extractor writes the text). <m>
+# names that rule set (`ptx::DIGEST_METHOD`, written by the extractor): two md5 blocks compare only under
+# one method, and a block with no method line comes from an older rule set — rescan the old binary with
+# this tree's tools instead, from the base tree's directory: `PTX_SCAN_EXTRACT=<this tree>/target/release/
+# oxart_ptx bash <this tree>/tools/ptx-scan.sh <binary>` (`tools/ref/ptx-canon.py --scans` compares two
+# scans and refuses a pair of two methods by name).
 # The table counts instructions; this block sees their order and operands, so a rewrite that keeps
 # every count (predicated selects turned into branches, a `stacksave` appearing) changes a digest.
 # Compare the two blocks separately: the table is what the columns measure, the digest is whether
@@ -60,7 +68,8 @@
 # on stdout ends in `scan=failed`, names what failed, and no rows follow; the detail is on stderr:
 #   missing              no target/release/<binary>
 #   section=none         the binary carries no .oxart section (a host-only binary?)
-#   extract=failed       the extractor rejected the section, or is not there
+#   extract=failed       the extractor rejected the section or a declaration, met a generated symbol
+#                        its module does not declare, or is not there
 #   modules=0            the section carries no PTX payload
 #   ptxas=none           no executable ptxas, so the ptxas columns cannot be read
 #   ptxas-failed=modN    ptxas rejected these modules (comma-separated)
@@ -69,7 +78,8 @@
 #   jit-unread=NAME      the driver loaded every module but reported nothing for these entries
 #   bytescan=failed      the byte scan itself failed
 #   rows=0               no entry, or none the entry substring matches
-#   digest-unread=NAME   the extractor wrote no normalized body for these entries
+#   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
+#                        no digest method)
 # 2: a usage error.
 #
 # The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
@@ -310,6 +320,11 @@ for E in $(awk '{print $1}' "$ROWS" | LC_ALL=C sort); do
   fi
   printf '%s %s %s\n' "$E" "$(md5sum <"$MODS/norm/$E" | cut -d' ' -f1)" "$(wc -l <"$MODS/norm/$E" | tr -d ' ')" >>"$DIGESTS"
 done
+METHOD=$(cat "$MODS/norm-method" 2>/dev/null)
+if [ -z "$METHOD" ]; then
+  echo "ptx-scan: the extractor named no digest method ($MODS/norm-method)" >&2
+  NODIGEST=${NODIGEST:+$NODIGEST,}method
+fi
 if [ -n "$NODIGEST" ]; then
   echo "ptx-scan: the extractor wrote no normalized body for: $NODIGEST" >&2
   fail "$SEC $TOOLS modules=$NMOD $JITS digest-unread=$NODIGEST"
@@ -323,6 +338,6 @@ echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} $JIT
 printf '%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s %8s %9s\n' \
   entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local
 cat "$ROWS"
-echo "ptx-scan-md5:"
+echo "ptx-scan-md5: method=$METHOD"
 cat "$DIGESTS"
 exit 0
