@@ -81,29 +81,29 @@ Sources: rig-log [b1-pp-ab](https://github.com/midagedev/rig-log/blob/main/log/2
 
 ### Qwen3-30B-A3B-Instruct-2507, `Q4_K_M` — the whole model on the GPU
 
-**Decode** against mainline llama.cpp (`53ed051ce`, `llama-bench -ngl 99 -fa on`), arms alternated in one window, four rounds (rig-log [2026-09-24, Qwen3-30B-A3B](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#qwen3-30b-a3b-e28)):
+Against mainline llama.cpp (`53ed051ce`, `llama-bench -ngl 99 -fa on`) and mistral.rs (`d5ae0f18f`, built with `--features "cuda flash-attn"`, its recommended build), in one window, arms alternated, three rounds (2026-09-27, rig-log [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng)).
 
-| Depth | bloomery tok/s | llama.cpp tok/s | bloomery / llama.cpp |
-|---:|---:|---:|---:|
-| 6 | **206.0** | 193.7 | 1.063 ± 0.004 |
-| 1024 | **194.4** | 188.9 | 1.029 ± 0.002 |
-| 4096 | 160.7 | **173.1** | 0.929 ± 0.006 |
+**Decode** (tok/s, `n = 96`):
 
-In that window bloomery was ahead at short context and behind at 4096 keys, where its attention was slower. In a later window with no reference decode arms, bloomery alone decoded at 207.5 tok/s at depth 512 and 175.9 at depth 4096 (2026-09-26, [mrs-flash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-flash)); a table with llama.cpp and mistral.rs in one window is next.
+| Depth | bloomery | llama.cpp | mistral.rs | bloomery / llama.cpp | bloomery / mistral.rs |
+|---:|---:|---:|---:|---:|---:|
+| 6 | **209.2** | 193.8 | 194.2 | 1.080 ± 0.006 | 1.077 ± 0.007 |
+| 1024 | **202.3** | 188.9 | 167.0 | 1.071 ± 0.001 | 1.211 ± 0.007 |
+| 4096 | **175.2** | 173.3 | 156.6 | 1.011 ± 0.002 | 1.119 ± 0.004 |
 
-**Prompt processing** on the same card, arms alternated in one window, three rounds (`llama-bench -p P -n 0`; mistral.rs `d5ae0f18f` built with `--features "cuda flash-attn"`, its recommended build, `bench --prompt-len P --gen-len 1`; rig-log [2026-09-26, mrs-flash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-flash)):
+**Prompt processing** (pp tok/s over a prompt of P tokens; `llama-bench -p P -n 0`, mistral.rs `bench --prompt-len P --gen-len 1`):
 
-| Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
+| Prompt | bloomery | llama.cpp | llama.cpp `-ub 4096 -b 4096` | mistral.rs |
 |---:|---:|---:|---:|---:|
-| 512 | **6,821** | 4,285 | — | 4,835 |
-| 4096 | **8,009** | 4,184 | 6,860 | 7,890 |
+| 512 | **7,827** | 4,247 | — | 4,816 |
+| 4096 | **9,276** | 4,157 | 6,831 | 7,812 |
 
-The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. The router's logits for a ubatch run as register tiles, 32 tokens by 32 experts a block. In this window, at 4096 tokens, bloomery's default is 1.167× llama.cpp with `-ub 4096 -b 4096` and 1.015 ± 0.009× mistral.rs, about equal (1.41× at 512 tokens). Since then `gemm_q4k` runs its step in fewer instructions (`ccdd3dc`): 7,706 tok/s at 512 and 8,818 at 4096 against the previous binary's 6,803 and 7,955 in one window (1.133 ± 0.005 and 1.108 ± 0.009; no reference rows in that window; rig-log [q3gemmb-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#q3gemmb-ab)). Before that change, at 4096 tokens, nsys put the GEMMs at 59 % of 510 ms of kernels, prefill attention at 17 % and the per-token kernels at the remaining 23 % ([q3router-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#q3router-ab)). After the GEMM change, the prefill attention kernel went to fewer instructions and XOR-swizzled K/V tiles (`031b842`): 7,854 tok/s at 512 and 9,268 at 4096 against the previous binary's 7,714 and 8,838 in one window (1.018 ± 0.009 and 1.049 ± 0.004; no reference rows in that window; rig-log [q3swz-pp](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#q3swz-pp)).
+At 4096 tokens bloomery is 1.358 ± 0.002× llama.cpp with `-ub 4096` and 1.187 ± 0.002× mistral.rs. The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM that reads each expert once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. The router's logits for a ubatch run as register tiles, 32 tokens by 32 experts a block.
 
 ### Read these numbers with their conditions
 
 - **Rows are plain decoding unless they say DSpark.** The DSpark rows use two cards: the model on the A6000 and the draft on the RTX 3090.
-- **The mistral.rs prefill column is its recommended build** (`flash-attn` on, as upstream's release builds and install script build it on Ampere). The rows we published before 2026-09-26, 3,460 and 1,317 tok/s, came from a build without `flash-attn`, whose prompt attention took the eager P × P path ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)).
+- **The mistral.rs columns are its recommended build** (`flash-attn` on, as upstream's release builds and install script build it on Ampere). The prefill rows we published before 2026-09-26, 3,460 and 1,317 tok/s, came from a build without `flash-attn`, whose prompt attention took the eager P × P path ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)).
 - **The card is an A6000.** The 24 GB row emulates a 3090's budget on the A6000; a run on a real 3090 has not been timed.
 - **The V4.1 hot list was built from routing traces of the same corpora** the prose and code prompts come from, so those rows are its favorable case. With synthetic prompt ids, whose output collapses into a few repeating tokens, the same placement decoded at 34.7 tok/s at depth 6 and 32.3 at depth 4096 (2026-09-24).
 - **Synthetic and prose prompts do not share a table row.** Random ids route to different experts than text does, and the prose rows run with the hot list.
