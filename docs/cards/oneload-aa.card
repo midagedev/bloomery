@@ -1,0 +1,44 @@
+# Round oneload, the A/A of the clear: the same arm run first after a load (a fresh process, or slot 1
+# of a shared load: nothing ran before it) against run after another arm of its load and the clear
+# (slot 2 on). The clear (app::Session::clear) makes the bits a fresh process's (the bit-identity
+# check on the 3090: tokens, logits fnv64 and every non-time record field equal); what it does not
+# restore is what a first call pays that a later one does not. Terms: the step graph's first replay
+# uploads it (a node table once, against 15 timed steps: under 0.1 % of the decode mean [derived]);
+# the prompt call's prologue reads the prompt's embedding and engram rows through the file mapping, and
+# a process that has not touched a page yet maps it with a fault even when the page cache holds it -
+# the bit-identity run's `stat prefill split` (3090, --place gate, prose:512, untimed runtime values)
+# read prologue_ms 90.9 in the fresh process (the page cache cold too), 50.0 at slot 1 of the next
+# process and 14.9 at slot 3, the same prompt again: 35 ms of the 50 is the process's first touch;
+# the same run's union_ms read 2217 / 2187 / 2118 (the union's scratch first touched, or scatter).
+# Against the A6000's prose pp512 wall (216.1 tok/s, 2.37 s, rig-log 09-26#cardtile-ab) the prologue
+# term alone is +1.5 %, the union's up to +3 % more [derived]. So in-load reads faster by +1.0..+3.5 %.
+# Repeating one prompt is the upper end of the overlap: an in-load arm after a different prompt maps
+# only the rows the two share (token_embd rows of common ids; a prefix: prose:512 after prose:4096).
+# Ruler: fresh rows 6 (three solo processes, three slot-1 rows) against in-load rows 6 (slots 2 and 3):
+# the pooled interval t(0.975, 10) x 0.55 % x sqrt(1/6 + 1/6) = 0.71 % [derived].
+kind: calibration
+question: does an arm run after another arm of its load and the clear time the same as it does first
+  after a load, so rows of a shared load and rows of one process an arm share a table?
+term: pp tok/s @ P = 512, prose prompt, no hot list, A6000, plan (a), CED on, N = 16 - the rows at
+  slot 2 and 3 of a shared load over the rows first after their load (the solo processes and slot 1),
+  the runner's `slots` line
+unit: %
+predict: 1.0..3.5
+reason: sets whether depth-ds41.sh's shared loads (tools/ref/load-groups.sh) are admissible beside the
+  one-process-an-arm rows every earlier table holds; why now: the r8host-pp sitting and every later
+  V4.1 sitting would run through them (16 loads become 4)
+condition: the oneload binary; BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_DECODE_N=16
+  BLOOMERY_LEASE_CARD=docs/cards/oneload-aa.card' just depth-gpu-ds41 prose:512 prose:512 prose:512 prose:512@BLOOMERY_AB_LOAD=arm: each round one
+  load runs prose:512 three times (slots 1, 2, 3) and one process runs it alone; the warm-up reads the
+  file first; no row [cpu-busy] or [other-busy], and no in-load row faults more (majflt, timed) than
+  the fresh rows of its round. Box time ~13 min [derived: 7 loads of ~100 s and 12 arms of ~7 s]
+decide-in: the first call after a load pays a mapping and first-touch term inside its timed window:
+  one-process rows (every table so far) carry it, shared-load rows at slot 2 on do not. Move it out
+  of the window for both - a discarded warm prompt call at the load (the driver runs each load's first
+  arm twice, the first discarded, or the binary's ready runs one) - and re-sit this card; until then
+  sittings run with BLOOMERY_AB_LOAD=arm
+decide-below: in-load is no faster than fresh within the ruler: shared loads are admissible as they
+  are; r8host-pp and later sittings run grouped, their rows compared with one-process rows
+decide-above: the in-load side is faster than the two terms explain: a third warm state (the pool's
+  threads, a host cache, the card's clocks after the load's idle) - find it by the split's terms per
+  slot before any sitting runs grouped

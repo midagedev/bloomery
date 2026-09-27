@@ -87,7 +87,10 @@ pub trait ChainBody: Sized {
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError>;
 
     /// Rewind every cache to empty. The weights, the arena and any captured
-    /// chain stay: none of them depends on the cache contents.
+    /// chain stay: none of them depends on the cache contents. The contract
+    /// is the load's: every state a call writes and a later call reads before
+    /// writing it is back where the load left it, so the next prompt writes
+    /// the bits it writes in a fresh process ([`GpuModel::reset`]).
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
 
     /// The rms epsilon the output head normalizes with, read from the file at
@@ -487,8 +490,11 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Rewind to position 0 with empty caches — the fresh-context state for
-    /// the next prompt. The weights, the arena and any captured chain stay
-    /// (they do not depend on the cache contents).
+    /// the next prompt: a prompt after it gives the tokens and logits it
+    /// gives in a fresh process right after the load, bit for bit. The
+    /// weights, the arena and any captured chain stay (they do not depend on
+    /// the cache contents). It also lifts a fault; a caller that must not
+    /// continue past one checks [`GpuModel::poisoned`] first.
     pub fn reset(&mut self) -> Result<(), GpuError> {
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
