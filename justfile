@@ -1285,9 +1285,10 @@ gen-glm5next *ARGS:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next && bash tools/gpu-gate.sh generate_glm5next --place gate {{ARGS}}'
 
 # qwen4exp(Qwen3.8-Flash-Next) 헤더 게이트: qwen35moe 리더의 변형 행이 합성 헤더에서 이름으로 거절하는 것들, 그다음 파일의
-# 서술·역할별 텐서·커버리지 검사의 목록. 헤더만, 초 단위; 샤드 넷이 다 있어야 한다.
+# 서술·역할별 텐서·커버리지 검사의 목록과 헤더에서 세운 계획(카드·호스트·캐시 바이트). 헤더만, 초 단위. 마지막 호출은
+# 호스트 티어가 48층을 모두 서빙하는지와 네 층의 단계별 밴드다(네 층에서 expert 30개의 행을 읽는다, 초 단위). 샤드 넷이 다 있어야 한다.
 gate-qwen4exp-meta:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture'
 
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
