@@ -91,8 +91,10 @@
 //!    four rows' mean, the RMS gain norm, the turn of the first 64 values at
 //!    the pool's first position, f16), within its band of the references'
 //!    rule in f64, the incomplete pool untouched, a rerun and launches of
-//!    seven rows the same plane; a NaN in one raw row raises `pool_select`
-//!    with that pool alone not finite.
+//!    seven rows the same plane; the same on a crafted input whose rows
+//!    cancel across 24 binades, where the transcription's pairwise and
+//!    reversed sums move every key, so the bits see the mean's order; a NaN
+//!    in one raw row raises `pool_select` with that pool alone not finite.
 //! 10. Selection (score and top-k): the query heads bit for bit the
 //!     transcription, each scored pool's score within its band of the f64
 //!     score on the launch's own heads and keys, each list and length
@@ -1941,6 +1943,9 @@ mod gate {
     /// 4,097 (1,024 pools) the 512 kept end inside their shared score +0.
     const TIE_POOLS: std::ops::Range<usize> = 100..700;
     const TIE_COUNT: usize = 4097;
+    /// The cache height of the pool clause's crafted input: 128 pools, every
+    /// one complete.
+    const ORDER_CTX: usize = 512;
 
     fn qsa_shape() -> Qsa {
         Qsa::new(IDX_TOP_K, u32::try_from(POOL).unwrap_or(0)).expect("Qwen3.8's selector shape")
@@ -1979,13 +1984,33 @@ mod gate {
         y
     }
 
-    /// Pool `j`'s key, the kernel's rule: the sum of the four raw rows
-    /// `((r0 + r1) + r2) + r3` times 0.25 in f32, [`idx_rule`] at the pool's
+    /// A pool's four raw values summed in the kernel's order, left to right.
+    fn in_order(r: [f32; 4]) -> f32 {
+        ((r[0] + r[1]) + r[2]) + r[3]
+    }
+
+    /// Two other orders, which [`order_inputs`] must tell from [`in_order`].
+    fn pairwise(r: [f32; 4]) -> f32 {
+        (r[0] + r[1]) + (r[2] + r[3])
+    }
+
+    fn reversed(r: [f32; 4]) -> f32 {
+        ((r[3] + r[2]) + r[1]) + r[0]
+    }
+
+    /// Pool `j`'s key, the kernel's rule when `sum` is [`in_order`]: the sum
+    /// of the four raw rows times 0.25 in f32, [`idx_rule`] at the pool's
     /// first position, rounded to f16.
-    fn pool_rule(raw: &[u16], j: usize, gain: &[f32], table: &[f32]) -> Vec<u16> {
+    fn pool_rule(
+        raw: &[u16],
+        j: usize,
+        gain: &[f32],
+        table: &[f32],
+        sum: fn([f32; 4]) -> f32,
+    ) -> Vec<u16> {
         let r = |row: usize, d: usize| half_to_f32(raw[(POOL * j + row) * IDX_DIM + d]);
         let x: Vec<f32> = (0..IDX_DIM)
-            .map(|d| (((r(0, d) + r(1, d)) + r(2, d)) + r(3, d)) * 0.25)
+            .map(|d| sum([r(0, d), r(1, d), r(2, d), r(3, d)]) * 0.25)
             .collect();
         let p = POOL * j;
         to16(&idx_rule(&x, gain, &table[p * IDX_ROT..(p + 1) * IDX_ROT]))
@@ -2064,6 +2089,28 @@ mod gate {
             table,
             ctx,
         })
+    }
+
+    /// The pool clause's crafted input: [`idx_inputs`]' at [`ORDER_CTX`] with,
+    /// in every pool, each even unturned value holding `(s·2^k, s·2^(k−24),
+    /// s·2^(k−24), −s·2^k)` over the four rows, `k` cycling 10..=15 and `s`
+    /// alternating. [`idx_inputs`]' four-row sums are exact in f32 in any
+    /// order; these are not: left to right the mean is 0, pairwise
+    /// `s·2^(k−26)`, reversed `s·2^(k−25)`.
+    fn order_inputs(stream: &CudaStream) -> Result<Idx, GateError> {
+        let mut idx = idx_inputs(stream, ORDER_CTX, 501, false)?;
+        for j in 0..ORDER_CTX / POOL {
+            let dims = (IDX_ROT..IDX_DIM).step_by(2).zip((10..16).cycle());
+            for (i, (d, k)) in dims.enumerate() {
+                let s = if (i + j) % 2 == 0 { 1.0f32 } else { -1.0 };
+                let (a, e) = (s * 2f32.powi(k), s * 2f32.powi(k - 24));
+                for (row, v) in [a, e, e, -a].into_iter().enumerate() {
+                    idx.raw[(POOL * j + row) * IDX_DIM + d] = f32_to_f16_bits(v);
+                }
+            }
+        }
+        idx.raw_d = DeviceBuffer::from_host(stream, &idx.raw)?;
+        Ok(idx)
     }
 
     /// The pooled plane after the pool pass over counts `1 ..= n` in
@@ -2244,19 +2291,15 @@ mod gate {
         (heads, sc, lists, worst)
     }
 
-    /// The pool clause (module doc, 9).
-    fn pool_check(gpu: &Gpu, qk: &QsaKernels) -> Result<bool, GateError> {
-        let stream = gpu.stream();
-        let unl = gpu.unlabelled_sink();
-        let idx = idx_inputs(stream, SEL_CTX, 501, false)?;
-        let complete = SEL_N / POOL;
-        let (_, a) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
-        let (_, b) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
+    /// Pools `0..complete` of the plane `plane` against [`pool_rule`] bit for
+    /// bit and within their band of [`pool_f64`]: `(bit exact, largest
+    /// measured/bound)`.
+    fn pool_keys_ok(idx: &Idx, plane: &[u16], complete: usize) -> (bool, f64) {
         let mut exact = true;
         let mut worst = 0.0f64;
         for j in 0..complete {
-            let got = &a[j * IDX_DIM..(j + 1) * IDX_DIM];
-            exact &= got == pool_rule(&idx.raw, j, &idx.gk, &idx.table).as_slice();
+            let got = &plane[j * IDX_DIM..(j + 1) * IDX_DIM];
+            exact &= got == pool_rule(&idx.raw, j, &idx.gk, &idx.table, in_order).as_slice();
             let (y, scale64) = pool_f64(&idx.raw, j, &idx.gk, &idx.table);
             let ymax = y.iter().fold(0.0f64, |m, v| m.max(v.abs()));
             // The mean's three adds err by γ(3) of the rows' absolute sum, which
@@ -2284,6 +2327,18 @@ mod gate {
                 worst = worst.max(e / bound);
             }
         }
+        (exact, worst)
+    }
+
+    /// The pool clause (module doc, 9).
+    fn pool_check(gpu: &Gpu, qk: &QsaKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let idx = idx_inputs(stream, SEL_CTX, 501, false)?;
+        let complete = SEL_N / POOL;
+        let (_, a) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
+        let (_, b) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
+        let (exact, worst) = pool_keys_ok(&idx, &a, complete);
         let band = worst <= 1.0;
         let untouched = a[complete * IDX_DIM..].iter().all(|&h| h == SENTINEL);
         let rerun = a == b;
@@ -2293,11 +2348,29 @@ mod gate {
         let (_, c) = pool_plane(qk, stream, &idx, small, 7, unl)?;
         let chunked = c[..small / POOL * IDX_DIM] == a[..small / POOL * IDX_DIM]
             && c[small / POOL * IDX_DIM..].iter().all(|&h| h == SENTINEL);
-        let pass = exact && band && untouched && rerun && chunked;
+        // The crafted input, where the order of the mean's adds moves bits.
+        let ord = order_inputs(stream)?;
+        let crafted = ORDER_CTX / POOL;
+        let (_, o) = pool_plane(qk, stream, &ord, ORDER_CTX, ORDER_CTX, unl)?;
+        let (o_exact, o_worst) = pool_keys_ok(&ord, &o, crafted);
+        let o_band = o_worst <= 1.0;
+        let key =
+            |j: usize, sum: fn([f32; 4]) -> f32| pool_rule(&ord.raw, j, &ord.gk, &ord.table, sum);
+        let seen = (0..crafted)
+            .filter(|&j| {
+                let k = key(j, in_order);
+                k != key(j, pairwise) && k != key(j, reversed)
+            })
+            .count();
+        let pass =
+            exact && band && untouched && rerun && chunked && o_exact && o_band && seen == crafted;
         println!(
             "qsa pool counts 1..={SEL_N} ctx={SEL_CTX}: {complete} pools bit_exact_host={exact} \
              f64 measured/bound {worst:.3e} band={band} incomplete pools untouched={untouched} \
-             rerun={rerun} seven-row launches the same plane={chunked} {}",
+             rerun={rerun} seven-row launches the same plane={chunked}; crafted \
+             ctx={ORDER_CTX}: {crafted} pools bit_exact_host={o_exact} f64 measured/bound \
+             {o_worst:.3e} band={o_band}, pairwise and reversed sums move {seen} of {crafted} \
+             keys {}",
             verdict(pass)
         );
 
