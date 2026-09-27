@@ -66,7 +66,8 @@
 #   twocard      lcpp:6 lcpppp:4, one round, the preheat on: the decode row and the json prefill row (its
 #                device lines on stderr) carry `A6000+3090` and both cards, the stub llama-bench got -ts
 #                1.5/1.5, the witness's two-card lines; rc 0.
-#   twocard-arms 6, code:4 and ik:6 each refused by name before anything runs (rc 64); ours naming --place b.
+#   twocard-arms 6, code:4, ik:6 and lcppsrv:6 each refused by name before anything runs (rc 64); ours naming
+#                --place b, the server arm naming the two-card checks it lacks.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
 # The server arms and the warm rows (lcpp-warm.sh; red on the runner before them: arm usage, rc 64, or
@@ -600,6 +601,7 @@ twocard_refused() {
 twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 loads one card \(--place a\|gate\); its two-card placement, plan \(b\) \(workstation::plan_b\), is expected as --place b and does not exist yet" lcpp:6 6
 twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 loads one card " lcpp:6 code:4
 twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
+twocard_refused twocard-arms-srv "^depth-ds41.sh: arm 'lcppsrv:6': a llama-server arm has no two-card checks yet " lcpp:6 lcppsrv:6
 
 L=$tmp/twocard-xid.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_BENCH_XID=pp4 -- lcpp:6 lcpppp:4
