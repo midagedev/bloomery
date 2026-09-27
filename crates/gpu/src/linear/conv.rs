@@ -101,6 +101,10 @@ struct Outputs {
     reason = "one token's coordinates and the warp's inputs and outputs, forwarded from the entry"
 )]
 #[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 unsafe fn conv_token(
     t: usize,
     p: usize,
@@ -116,14 +120,12 @@ unsafe fn conv_token(
     let mut vals = [0.0f32; 4];
     let mut sumsq = 0.0f64;
     let mut ok = contiguous;
-    let mut i = 0usize;
-    while i < 4 {
+    for i in 0usize..4 {
         cuda_device::thread::__unroll_config::<0>();
         let c = hp * HEAD + lane + 32 * i;
         // Tap j reads the predecessor at distance d = CONV_ROWS − j.
         let mut xs = [0.0f32; 4];
-        let mut j = 0usize;
-        while j < CONV_TAPS {
+        for j in 0..CONV_TAPS {
             cuda_device::thread::__unroll_config::<0>();
             let d = CONV_ROWS - j;
             // SAFETY: c < ch; for d <= t the row t − d < m, inside x (m·ch
@@ -138,7 +140,6 @@ unsafe fn conv_token(
                     *ring.add((p + RING_ROWS - d) % RING_ROWS * ch + c)
                 }
             };
-            j += 1;
         }
         // SAFETY: 4c + 3 < 4·ch <= w.len() by the contract.
         let wv = unsafe {
@@ -157,7 +158,6 @@ unsafe fn conv_token(
         let s = silu(acc);
         vals[i] = s;
         sumsq += f64::from(mul_rn_f32(s, s));
-        i += 1;
     }
 
     if hp < 2 * inp.n_k {
@@ -175,24 +175,20 @@ unsafe fn conv_token(
         } else {
             f32::NAN
         };
-        let mut i = 0usize;
-        while i < 4 {
+        for i in 0usize..4 {
             cuda_device::thread::__unroll_config::<0>();
             vals[i] = mul_rn_f32(vals[i], scale);
             if hp < inp.n_k {
                 vals[i] = mul_rn_f32(vals[i], Q_SCALE);
             }
-            i += 1;
         }
     }
-    let mut i = 0usize;
-    while i < 4 {
+    for i in 0usize..4 {
         cuda_device::thread::__unroll_config::<0>();
         let v = if contiguous { vals[i] } else { f32::NAN };
         // SAFETY: t < m and c < ch, inside y (m·ch values by the contract);
         // one lane per channel.
         unsafe { *out.y.add(t * ch + hp * HEAD + lane + 32 * i) = v };
-        i += 1;
     }
 
     if hp >= 2 * inp.n_k && lane == 0 {
@@ -336,15 +332,13 @@ mod conv_kernels {
             while t < m {
                 // SAFETY: t < m <= pos.len().
                 let slot = unsafe { *pos.get_unchecked(t) } as usize % RING_ROWS;
-                let mut i = 0usize;
                 #[unroll]
-                while i < 4 {
+                for i in 0usize..4 {
                     let c = hp * HEAD + lane + 32 * i;
                     // SAFETY: slot < RING_ROWS and c < ch: inside the ring
                     // (RING_ROWS·ch values) and row t of x (m·ch values);
                     // channel c of the ring is this lane's alone.
                     unsafe { *ring.add(slot * ch + c) = *x.get_unchecked(t * ch + c) };
-                    i += 1;
                 }
                 t += 1;
             }

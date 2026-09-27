@@ -187,12 +187,10 @@ unsafe fn norm_partial_append<const HEAD: usize, const ROT: usize, const WARPS: 
     thread::sync_threads();
     // SAFETY: every slot was written before the barrier above.
     let mut sum = unsafe { *wsum };
-    let mut w = 1usize;
-    while w < WARPS {
+    for w in 1..WARPS {
         cuda_device::thread::__unroll_config::<0>();
         // SAFETY: w < WARPS.
         sum += unsafe { *wsum.add(w) };
-        w += 1;
     }
     let mean = (sum / HEAD as f64) as f32;
     let scale = 1.0 / (mean + eps).sqrt();

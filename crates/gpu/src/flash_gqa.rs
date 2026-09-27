@@ -254,6 +254,10 @@ const SLICE: usize = 128;
     clippy::too_many_arguments,
     reason = "the tile step's state is the caller's registers, passed by reference"
 )]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
     sc: f32,
     live: bool,
@@ -287,14 +291,12 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
             0.0
         };
         *s_sum *= f;
-        let mut i = 0usize;
-        while i < QW {
+        for i in 0..QW {
             cuda_device::thread::__unroll_config::<0>();
             acc[i][0] *= f;
             acc[i][1] *= f;
             acc[i][2] *= f;
             acc[i][3] *= f;
-            i += 1;
         }
         *mx = m_new;
     }
@@ -308,8 +310,7 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
         // SAFETY: j < 32 and lane < 32: inside WS, written before the warp
         // sync above.
         let pj = unsafe { *ws.add(w * KEY_TILE + j) };
-        let mut i = 0usize;
-        while i < QW {
+        for i in 0..QW {
             cuda_device::thread::__unroll_config::<0>();
             // SAFETY: j < KEY_TILE and lane + 32·i < HEAD/4: inside VS,
             // written before the caller's barrier.
@@ -318,7 +319,6 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
             acc[i][1] = f32::mul_add(pj, half_bits_to_f32((vw >> 16) as u16), acc[i][1]);
             acc[i][2] = f32::mul_add(pj, half_bits_to_f32((vw >> 32) as u16), acc[i][2]);
             acc[i][3] = f32::mul_add(pj, half_bits_to_f32((vw >> 48) as u16), acc[i][3]);
-            i += 1;
         }
         j += 1;
     }
@@ -339,6 +339,10 @@ unsafe fn fold_tile_w<const HEAD: usize, const QW: usize>(
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
 unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     q: &[f32],
@@ -486,15 +490,13 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     // SAFETY: idx < m·n_kv·GROUP·segs; dims 4·lane + 128·i .. +3 of the
     // partial row are this lane's alone, and lane 0 writes (m, s).
     unsafe {
-        let mut i = 0usize;
-        while i < QW {
+        for i in 0..QW {
             cuda_device::thread::__unroll_config::<0>();
             let o = idx * HEAD + 4 * lane + SLICE * i;
             *part_v.get_unchecked_mut(o) = acc[i][0];
             *part_v.get_unchecked_mut(o + 1) = acc[i][1];
             *part_v.get_unchecked_mut(o + 2) = acc[i][2];
             *part_v.get_unchecked_mut(o + 3) = acc[i][3];
-            i += 1;
         }
         if lane == 0 {
             *part_ms.get_unchecked_mut(2 * idx) = mx;
@@ -524,6 +526,10 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
 unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     q: &[f32],
@@ -589,26 +595,20 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     let qb = (t * n_head + kh * GROUP + w) * HEAD;
     let q64 = q.as_ptr() as *const u64;
     let mut raw = [[0u64; 2]; QW];
-    let mut s = 0usize;
-    while s < QW {
+    for s in 0..QW {
         cuda_device::thread::__unroll_config::<0>();
-        let mut i = 0usize;
-        while i < 2 {
+        for i in 0usize..2 {
             cuda_device::thread::__unroll_config::<0>();
             // SAFETY: qb is a multiple of HEAD, so word qb/2 + wd holds values
             // qb + 2·wd and + 1 (wd = lane + 32·i + 64·s < HEAD/2), inside
             // (t·n_head + kh·GROUP + w + 1)·HEAD <= m·n_kv·GROUP·HEAD <=
             // q.len(); the buffer starts 8-byte aligned (a device allocation).
             unsafe { raw[s][i] = *q64.add(qb / 2 + lane + 32 * i + 64 * s) };
-            i += 1;
         }
-        s += 1;
     }
-    let mut s = 0usize;
-    while s < QW {
+    for s in 0..QW {
         cuda_device::thread::__unroll_config::<0>();
-        let mut i = 0usize;
-        while i < 2 {
+        for i in 0usize..2 {
             cuda_device::thread::__unroll_config::<0>();
             let wd = lane + 32 * i + 64 * s;
             let lo16 = f32_to_f16_bits(f32::from_bits(raw[s][i] as u32)) as u32;
@@ -619,9 +619,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
                 *qt.add(w * row_w + wd) = lo16 | (hi16 << 16);
                 *qt.add((GROUP + w) * row_w + wd) = 0;
             }
-            i += 1;
         }
-        s += 1;
     }
 
     let plane = kh * ctx * HEAD;
@@ -666,8 +664,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
 
         if w < 4 {
             let mut c = [[0.0f32; 4]; QW];
-            let mut s = 0usize;
-            while s < QW {
+            for s in 0..QW {
                 cuda_device::thread::__unroll_config::<0>();
                 let mut d = SLICE * s;
                 while d < SLICE * (s + 1) {
@@ -699,17 +696,14 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
                     }
                     d += 2 * MMA_K;
                 }
-                s += 1;
             }
             // The slices' scores added in ascending order.
             let mut sc0 = c[0][0];
             let mut sc1 = c[0][1];
-            let mut s = 1usize;
-            while s < QW {
+            for s in 1..QW {
                 cuda_device::thread::__unroll_config::<0>();
                 sc0 = add_rn_f32(sc0, c[s][0]);
                 sc1 = add_rn_f32(sc1, c[s][1]);
-                s += 1;
             }
             // sc0, sc1: head lane/4 at keys key0 + 2·(lane%4) + {0, 1}; each
             // slice's c[2], c[3] are the zero rows.
@@ -748,15 +742,13 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
 
     // SAFETY: as in seg_scalar.
     unsafe {
-        let mut i = 0usize;
-        while i < QW {
+        for i in 0..QW {
             cuda_device::thread::__unroll_config::<0>();
             let o = idx * HEAD + 4 * lane + SLICE * i;
             *part_v.get_unchecked_mut(o) = acc[i][0];
             *part_v.get_unchecked_mut(o + 1) = acc[i][1];
             *part_v.get_unchecked_mut(o + 2) = acc[i][2];
             *part_v.get_unchecked_mut(o + 3) = acc[i][3];
-            i += 1;
         }
         if lane == 0 {
             *part_ms.get_unchecked_mut(2 * idx) = mx;
@@ -818,8 +810,7 @@ unsafe fn merge_body<const HEAD: usize>(
     while j < live {
         let mut ms = [0.0f32; 2 * MERGE_BATCH];
         let mut vs = [0.0f32; MERGE_BATCH];
-        let mut i = 0usize;
-        while i < MERGE_BATCH {
+        for i in 0..MERGE_BATCH {
             cuda_device::thread::__unroll_config::<0>();
             if j + i < live {
                 let idx = b * n_seg + j + i;
@@ -832,15 +823,12 @@ unsafe fn merge_body<const HEAD: usize>(
                     vs[i] = *part_v.get_unchecked(idx * HEAD + d);
                 }
             }
-            i += 1;
         }
-        let mut i = 0usize;
-        while i < MERGE_BATCH {
+        for i in 0..MERGE_BATCH {
             cuda_device::thread::__unroll_config::<0>();
             if j + i < live && ms[2 * i + 1] != 0.0 {
                 (mx, s, acc) = online_fold(mx, s, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
             }
-            i += 1;
         }
         j += MERGE_BATCH;
     }
@@ -1061,6 +1049,10 @@ mod flash_gqa_kernels {
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1148,19 +1140,16 @@ mod flash_gqa_kernels {
         let qb = (t * n_head + kh * GROUP + w) * HEAD;
         let q64 = q.as_ptr() as *const u64;
         let mut raw = [0u64; 2];
-        let mut i = 0usize;
         #[unroll]
-        while i < 2 {
+        for i in 0usize..2 {
             // SAFETY: qb is a multiple of HEAD, so word (qb + 2·wd)/2 holds
             // values qb + 2·wd and + 1, with qb + 2·wd + 1 < (t·n_head +
             // kh·GROUP + w + 1)·HEAD <= m·n_kv·1024 <= q.len(); the buffer
             // starts 8-byte aligned (a device allocation).
             unsafe { raw[i] = *q64.add(qb / 2 + lane + 32 * i) };
-            i += 1;
         }
-        let mut i = 0usize;
         #[unroll]
-        while i < 2 {
+        for i in 0usize..2 {
             let wd = lane + 32 * i;
             let lo16 = f32_to_f16_bits(f32::from_bits(raw[i] as u32)) as u32;
             let hi16 = f32_to_f16_bits(f32::from_bits((raw[i] >> 32) as u32)) as u32;
@@ -1170,7 +1159,6 @@ mod flash_gqa_kernels {
                 *qt.add(w * MMA_ROW_W + wd) = lo16 | (hi16 << 16);
                 *qt.add((GROUP + w) * MMA_ROW_W + wd) = 0;
             }
-            i += 1;
         }
 
         let plane = kh * ctx * HEAD;
@@ -1363,9 +1351,8 @@ mod flash_gqa_kernels {
             // does not wait on memory twice per segment.
             let mut ms = [0.0f32; 2 * MERGE_BATCH];
             let mut vs = [0.0f32; MERGE_BATCH];
-            let mut i = 0usize;
             #[unroll]
-            while i < MERGE_BATCH {
+            for i in 0..MERGE_BATCH {
                 if j + i < live {
                     let idx = b * n_seg + j + i;
                     // SAFETY: idx < m·n_head·segs: both slots inside part_ms,
@@ -1377,15 +1364,12 @@ mod flash_gqa_kernels {
                         vs[i] = *part_v.get_unchecked(idx * HEAD + d);
                     }
                 }
-                i += 1;
             }
-            let mut i = 0usize;
             #[unroll]
-            while i < MERGE_BATCH {
+            for i in 0..MERGE_BATCH {
                 if j + i < live && ms[2 * i + 1] != 0.0 {
                     (mx, s, acc) = online_fold(mx, s, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
                 }
-                i += 1;
             }
             j += MERGE_BATCH;
         }

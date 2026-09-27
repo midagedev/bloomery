@@ -256,11 +256,11 @@ fn fmax(a: f32, b: f32) -> f32 {
 // positions × eight heads as the 128 body's warp `w % 4` — and dim half
 // `w / 4`: it computes the half-dim scores `S_w` of its sixteen rows over its
 // own 128 dims, publishes them in shared memory, and adds its partner's
-// (`w ^ 4`, the other half) as `S = S_lo + S_hi` — the order
-// `flash_gqa::gqa_flash_seg_mma_256` adds its two slice accumulators in, so a
-// key's score is that pass's bit for bit. Both warps of a pair then run the
-// same softmax on the same bits and each accumulates `P̂·V` over its own 128
-// dims.
+// (`w ^ 4`, the other half): a rounded add is commutative, so `S_w + S_mate`
+// is `S_lo + S_hi`, the sum `flash_gqa::gqa_flash_seg_mma_256` forms from its
+// two slice accumulators, and a key's score is that pass's bit for bit. Both
+// warps of a pair then run the same softmax on the same bits and each
+// accumulates `P̂·V` over its own 128 dims.
 
 /// Values per head, and those of one warp's half.
 pub const HEAD_256: usize = 256;
@@ -390,6 +390,10 @@ mod flash_gqa_prefill_kernels {
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
     #[kernel]
     #[launch_bounds(128, 2)]
     #[launch_contract(
@@ -453,8 +457,7 @@ mod flash_gqa_prefill_kernels {
         let mut hi = 0u32;
         let mut cnt = [0u32; 2];
         let mut bad = [false; 2];
-        let mut lp = 0usize;
-        while lp < POSITIONS {
+        for lp in 0..POSITIONS {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + lp;
             let (c, refused) = if t < rows {
@@ -473,7 +476,6 @@ mod flash_gqa_prefill_kernels {
                 cnt[lp % 2] = c;
                 bad[lp % 2] = refused;
             }
-            lp += 1;
         }
         if lane == 0 && (bad[0] || bad[1]) {
             fault.raise(FaultSite::KeyCount);
@@ -495,8 +497,7 @@ mod flash_gqa_prefill_kernels {
         let q_pos = n_head * Q_PAIRS;
         let q64 = q.as_ptr().cast::<u64>();
         let mut raw = [0u64; Q_WORDS];
-        let mut e = 0usize;
-        while e < Q_WORDS {
+        for e in 0..Q_WORDS {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + e / Q_POS_PASSES;
             if t < rows {
@@ -510,19 +511,15 @@ mod flash_gqa_prefill_kernels {
                 // values 2·wd, 2·wd + 1 is aligned.
                 raw[e] = unsafe { *q64.add(at) };
             }
-            e += 1;
         }
         // The staged word of each pass of the first position; a later
         // position's is it plus whole groups of rows (staged_offsets_hold).
         let mut q_at = [0usize; Q_POS_PASSES];
-        let mut j = 0usize;
-        while j < Q_POS_PASSES {
+        for j in 0..Q_POS_PASSES {
             cuda_device::thread::__unroll_config::<0>();
             q_at[j] = staged_word(Q_ROW_STEP * j + r0, wd);
-            j += 1;
         }
-        let mut e = 0usize;
-        while e < Q_WORDS {
+        for e in 0..Q_WORDS {
             cuda_device::thread::__unroll_config::<0>();
             let pair = f32x2_to_f16x2_bits(
                 f32::from_bits(raw[e] as u32),
@@ -533,14 +530,12 @@ mod flash_gqa_prefill_kernels {
             unsafe {
                 *kt.add(q_at[e % Q_POS_PASSES] + (e / Q_POS_PASSES) * GROUP * ROW_WORDS) = pair
             };
-            e += 1;
         }
         thread::sync_threads();
 
         // This warp's 16 query rows as A fragments, one per k16 step.
         let mut qa = [[0u32; 4]; QK_STEPS];
-        let mut kk = 0usize;
-        while kk < QK_STEPS {
+        for kk in 0..QK_STEPS {
             cuda_device::thread::__unroll_config::<0>();
             let row = wid * 16 + lane % 16;
             // SAFETY: row < Q_ROWS and words 8·kk + 4·(lane/16) .. + 4 <=
@@ -553,7 +548,6 @@ mod flash_gqa_prefill_kernels {
                     p.cast_const().cast::<u8>(),
                 ))
             };
-            kk += 1;
         }
         // Every warp has its fragments before the first key tile lands.
         thread::sync_threads();
@@ -576,8 +570,7 @@ mod flash_gqa_prefill_kernels {
                 let (dst, src, kb): (*mut u32, *const u32, u32) = ($dst, $src, $kb);
                 let tile_src = src.wrapping_add(kb as usize * TILE_WORDS);
                 let key0 = kb * KEY_TILE_U32 + key_of_pass0;
-                let mut i = 0usize;
-                while i < CHUNKS {
+                for i in 0..CHUNKS {
                     cuda_device::thread::__unroll_config::<0>();
                     let at = staged_word(tid / ROW_CHUNKS + i * PASS_KEYS, dst_col);
                     // SAFETY: key tid / ROW_CHUNKS + PASS_KEYS·i < KEY_TILE and
@@ -603,7 +596,6 @@ mod flash_gqa_prefill_kernels {
                         // stage's wait.
                         unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
                     }
-                    i += 1;
                 }
                 // SAFETY: closes this thread's copies above as one group.
                 unsafe { cp_async_commit_group() };
@@ -626,8 +618,7 @@ mod flash_gqa_prefill_kernels {
         let v_row = lane % 8 + 8 * ((lane / 8) % 2);
         let mut k_at = [0u32; HALF_PAIRS];
         let mut v_at = [0u32; HALF_PAIRS];
-        let mut j = 0usize;
-        while j < HALF_PAIRS {
+        for j in 0..HALF_PAIRS {
             cuda_device::thread::__unroll_config::<0>();
             // SAFETY: k_row, v_row < 16 <= KEY_TILE and words 8·j + 4 .. + 4
             // <= HALF_ROW: inside the tiles; only the addresses are formed here.
@@ -643,7 +634,6 @@ mod flash_gqa_prefill_kernels {
                         .cast::<u8>(),
                 );
             }
-            j += 1;
         }
 
         let t4k = 2 * t4 as u32;
@@ -672,11 +662,9 @@ mod flash_gqa_prefill_kernels {
             let mut f = [1.0f32; 2];
             if live {
                 let mut sc = [[0.0f32; 4]; KEY_NT];
-                let mut kk = 0usize;
-                while kk < QK_STEPS {
+                for kk in 0..QK_STEPS {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut nj = 0usize;
-                    while nj < KEY_NT / 2 {
+                    for nj in 0..KEY_NT / 2 {
                         cuda_device::thread::__unroll_config::<0>();
                         // Key row 16·nj + k_row, chunk 2·kk + (lane/8) % 2.
                         let at = k_at[kk % HALF_PAIRS]
@@ -693,9 +681,7 @@ mod flash_gqa_prefill_kernels {
                             sc[2 * nj + 1] =
                                 wmma::mma_m16n8k16_f32_f16(sc[2 * nj + 1], qa[kk], [bf[2], bf[3]]);
                         }
-                        nj += 1;
                     }
-                    kk += 1;
                 }
 
                 // The softmax over the tile's scores. `masked` (a literal)
@@ -708,11 +694,9 @@ mod flash_gqa_prefill_kernels {
                         // warp's position 2·w + j / 2, head g), key
                         // 64·kb + 8·nt + 2·t4 + j % 2.
                         let mut tmax = [f32::NEG_INFINITY; 2];
-                        let mut nt = 0usize;
-                        while nt < KEY_NT {
+                        for nt in 0..KEY_NT {
                             cuda_device::thread::__unroll_config::<0>();
-                            let mut j = 0usize;
-                            while j < 4 {
+                            for j in 0usize..4 {
                                 cuda_device::thread::__unroll_config::<0>();
                                 let key = kb0 + (8 * nt + j % 2) as u32;
                                 let v = if !$masked || key < cnt[j / 2] {
@@ -722,13 +706,10 @@ mod flash_gqa_prefill_kernels {
                                 };
                                 sc[nt][j] = v;
                                 tmax[j / 2] = fmax(tmax[j / 2], v);
-                                j += 1;
                             }
-                            nt += 1;
                         }
                         let mut mn = [f32::NEG_INFINITY; 2];
-                        let mut h = 0usize;
-                        while h < 2 {
+                        for h in 0usize..2 {
                             cuda_device::thread::__unroll_config::<0>();
                             let mut x = tmax[h];
                             x = fmax(x, warp::shuffle_xor_f32(x, 1));
@@ -744,7 +725,6 @@ mod flash_gqa_prefill_kernels {
                             }
                             mn[h] = m[h];
                             l[h] = mul_rn_f32(l[h], f[h]);
-                            h += 1;
                         }
                         // The weights, rounded to f16 pairs as the A fragment
                         // of the value product: k16 step kk2 is key tiles
@@ -752,11 +732,9 @@ mod flash_gqa_prefill_kernels {
                         // each, low key first. The lane's sum takes the
                         // rounded values in that order. The mask is the key's
                         // position, not its score: a NaN score stays NaN.
-                        let mut kk2 = 0usize;
-                        while kk2 < PV_STEPS {
+                        for kk2 in 0..PV_STEPS {
                             cuda_device::thread::__unroll_config::<0>();
-                            let mut e = 0usize;
-                            while e < 4 {
+                            for e in 0usize..4 {
                                 cuda_device::thread::__unroll_config::<0>();
                                 let nt = 2 * kk2 + e / 2;
                                 let j0 = 2 * (e % 2);
@@ -776,9 +754,7 @@ mod flash_gqa_prefill_kernels {
                                 let (r0, r1) = cvt_f32x2_f16x2(packed);
                                 l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
                                 pa[kk2][e] = packed;
-                                e += 1;
                             }
-                            kk2 += 1;
                         }
                     }};
                 }
@@ -791,16 +767,12 @@ mod flash_gqa_prefill_kernels {
                 // The accumulators times f, unless no lane of the warp has a
                 // factor other than 1 (the vote keeps the branch uniform).
                 if warp::any(f[0] != 1.0 || f[1] != 1.0) {
-                    let mut nd = 0usize;
-                    while nd < 2 * DIM_PAIRS {
+                    for nd in 0..2 * DIM_PAIRS {
                         cuda_device::thread::__unroll_config::<0>();
-                        let mut j = 0usize;
-                        while j < 4 {
+                        for j in 0usize..4 {
                             cuda_device::thread::__unroll_config::<0>();
                             o[nd][j] = mul_rn_f32(o[nd][j], f[j / 2]);
-                            j += 1;
                         }
-                        nd += 1;
                     }
                 }
             }
@@ -823,11 +795,9 @@ mod flash_gqa_prefill_kernels {
 
             // ---- O += P̂·V.
             if live {
-                let mut kk2 = 0usize;
-                while kk2 < PV_STEPS {
+                for kk2 in 0..PV_STEPS {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut nd = 0usize;
-                    while nd < DIM_PAIRS {
+                    for nd in 0..DIM_PAIRS {
                         cuda_device::thread::__unroll_config::<0>();
                         // Value row 16·kk2 + v_row, chunk 2·nd + lane/16.
                         let at = v_at[nd % HALF_PAIRS]
@@ -844,9 +814,7 @@ mod flash_gqa_prefill_kernels {
                             o[2 * nd + 1] =
                                 wmma::mma_m16n8k16_f32_f16(o[2 * nd + 1], pa[kk2], [bf[2], bf[3]]);
                         }
-                        nd += 1;
                     }
-                    kk2 += 1;
                 }
             }
             kb += 1;
@@ -854,19 +822,15 @@ mod flash_gqa_prefill_kernels {
 
         // ---- the row sums over the four lanes of a row, then o · (1/l).
         let mut inv = [0.0f32; 2];
-        let mut h = 0usize;
-        while h < 2 {
+        for h in 0usize..2 {
             cuda_device::thread::__unroll_config::<0>();
             let a = add_rn_f32(l[h], warp::shuffle_xor_f32(l[h], 1));
             let s = add_rn_f32(a, warp::shuffle_xor_f32(a, 2));
             inv[h] = 1.0 / s;
-            h += 1;
         }
-        let mut nd = 0usize;
-        while nd < 2 * DIM_PAIRS {
+        for nd in 0..2 * DIM_PAIRS {
             cuda_device::thread::__unroll_config::<0>();
-            let mut j = 0usize;
-            while j < 4 {
+            for j in 0usize..4 {
                 cuda_device::thread::__unroll_config::<0>();
                 let h = j / 2;
                 let t = t0 + 2 * wid + h;
@@ -884,9 +848,7 @@ mod flash_gqa_prefill_kernels {
                         *y.get_unchecked_mut((t * n_head + kh * GROUP + g) * HEAD + d) = v;
                     }
                 }
-                j += 1;
             }
-            nd += 1;
         }
     }
 
@@ -901,6 +863,10 @@ mod flash_gqa_prefill_kernels {
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
     )]
     #[kernel]
     #[launch_bounds(256, 1)]
@@ -968,8 +934,7 @@ mod flash_gqa_prefill_kernels {
         let mut hi = 0u32;
         let mut cnt = [0u32; 2];
         let mut bad = [false; 2];
-        let mut lp = 0usize;
-        while lp < POSITIONS {
+        for lp in 0..POSITIONS {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + lp;
             let (c, refused) = if t < rows {
@@ -988,7 +953,6 @@ mod flash_gqa_prefill_kernels {
                 cnt[lp % 2] = c;
                 bad[lp % 2] = refused;
             }
-            lp += 1;
         }
         if lane == 0 && dh == 0 && (bad[0] || bad[1]) {
             fault.raise(FaultSite::KeyCount);
@@ -1007,8 +971,7 @@ mod flash_gqa_prefill_kernels {
         let q_pos = n_head * Q_PAIRS_256;
         let q64 = q.as_ptr().cast::<u64>();
         let mut raw = [0u64; Q_WORDS_256];
-        let mut e = 0usize;
-        while e < Q_WORDS_256 {
+        for e in 0..Q_WORDS_256 {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + e / Q_POS_PASSES_256;
             if t < rows {
@@ -1021,17 +984,13 @@ mod flash_gqa_prefill_kernels {
                 // 8-byte aligned (host-checked), so the u64 read is aligned.
                 raw[e] = unsafe { *q64.add(at) };
             }
-            e += 1;
         }
         let mut q_at = [0usize; Q_POS_PASSES_256];
-        let mut j = 0usize;
-        while j < Q_POS_PASSES_256 {
+        for j in 0..Q_POS_PASSES_256 {
             cuda_device::thread::__unroll_config::<0>();
             q_at[j] = staged_word_256(Q_ROW_STEP_256 * j + r0, wd);
-            j += 1;
         }
-        let mut e = 0usize;
-        while e < Q_WORDS_256 {
+        for e in 0..Q_WORDS_256 {
             cuda_device::thread::__unroll_config::<0>();
             let pair = f32x2_to_f16x2_bits(
                 f32::from_bits(raw[e] as u32),
@@ -1044,15 +1003,13 @@ mod flash_gqa_prefill_kernels {
                     q_at[e % Q_POS_PASSES_256] + (e / Q_POS_PASSES_256) * GROUP * ROW_WORDS_256,
                 ) = pair
             };
-            e += 1;
         }
         thread::sync_threads();
 
         // This warp's sixteen query rows over its half, one A fragment per
         // k16 step.
         let mut qa = [[0u32; 4]; QK_STEPS_256];
-        let mut kk = 0usize;
-        while kk < QK_STEPS_256 {
+        for kk in 0..QK_STEPS_256 {
             cuda_device::thread::__unroll_config::<0>();
             let row = rs * 16 + lane % 16;
             // SAFETY: row < Q_ROWS_256 and words HALF_256/2·dh + 8·kk +
@@ -1068,7 +1025,6 @@ mod flash_gqa_prefill_kernels {
                     p.cast_const().cast::<u8>(),
                 ))
             };
-            kk += 1;
         }
         // Every warp has its fragments before the first key tile lands.
         thread::sync_threads();
@@ -1089,8 +1045,7 @@ mod flash_gqa_prefill_kernels {
                 let (dst, src, kb): (*mut u32, *const u32, u32) = ($dst, $src, $kb);
                 let tile_src = src.wrapping_add(kb as usize * TILE_WORDS_256);
                 let key0 = kb * KEY_TILE_U32 + key_of_pass0;
-                let mut i = 0usize;
-                while i < CHUNKS_256 {
+                for i in 0..CHUNKS_256 {
                     cuda_device::thread::__unroll_config::<0>();
                     let at = staged_word_256(tid / ROW_CHUNKS_256 + i * PASS_KEYS_256, dst_col);
                     // SAFETY: the key is below KEY_TILE and words dst_col ..
@@ -1116,7 +1071,6 @@ mod flash_gqa_prefill_kernels {
                         // stage's wait.
                         unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
                     }
-                    i += 1;
                 }
                 // SAFETY: closes this thread's copies above as one group.
                 unsafe { cp_async_commit_group() };
@@ -1131,32 +1085,32 @@ mod flash_gqa_prefill_kernels {
         }
 
         // This lane's `ldmatrix` addresses in the first sixteen rows and the
-        // first line, one per chunk pair `j` (the 128 body's).
+        // first line of the warp's half, one per chunk pair `j` (the 128
+        // body's): the half starts HALF_256/2 words, whole lines, into a row,
+        // so every other address of the walk is one of these plus a constant.
         let k_row = lane % 8 + 8 * (lane / 16);
         let v_row = lane % 8 + 8 * ((lane / 8) % 2);
+        let half_bytes = (4 * (HALF_256 / 2) * dh) as u32;
         let mut k_at = [0u32; LINE_PAIRS];
         let mut v_at = [0u32; LINE_PAIRS];
-        let mut j = 0usize;
-        while j < LINE_PAIRS {
+        for j in 0..LINE_PAIRS {
             cuda_device::thread::__unroll_config::<0>();
             // SAFETY: k_row, v_row < 16 <= KEY_TILE and words 8·j + 4 .. + 4
-            // <= LINE: inside the tiles; only the addresses are formed here.
+            // <= LINE: inside the tiles; only the addresses are formed here
+            // (the half's HALF_256/2 more words stay inside the row).
             unsafe {
                 k_at[j] = shared::cvta_generic_to_shared_u32(
                     kt.add(staged_word_256(k_row, 8 * j + 4 * ((lane / 8) % 2)))
                         .cast_const()
                         .cast::<u8>(),
-                );
+                ) + half_bytes;
                 v_at[j] = shared::cvta_generic_to_shared_u32(
                     vt.add(staged_word_256(v_row, 8 * j + 4 * (lane / 16)))
                         .cast_const()
                         .cast::<u8>(),
-                );
+                ) + half_bytes;
             }
-            j += 1;
         }
-        // The warp's half starts HALF_256/2 words, whole lines, into a row.
-        let half_lines = (HALF_256 / 2 / LINE) * dh;
         // This lane's slots of its own and its partner's published scores.
         let ex_own = ex.wrapping_add(wid * EXCH_WARP + lane);
         let ex_mate = ex.wrapping_add((wid ^ SLICES_256) * EXCH_WARP + lane);
@@ -1185,18 +1139,14 @@ mod flash_gqa_prefill_kernels {
             // ---- S_w = Q·Kᵀ over the warp's half, published.
             let mut sc = [[0.0f32; 4]; KEY_NT];
             if live {
-                let mut kk = 0usize;
-                while kk < QK_STEPS_256 {
+                for kk in 0..QK_STEPS_256 {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut nj = 0usize;
-                    while nj < KEY_NT / 2 {
+                    for nj in 0..KEY_NT / 2 {
                         cuda_device::thread::__unroll_config::<0>();
                         // Key row 16·nj + k_row, chunk 2·kk + (lane/8) % 2 of
                         // the warp's half.
                         let at = k_at[kk % LINE_PAIRS]
-                            + (4 * (16 * nj * ROW_WORDS_256
-                                + LINE * (half_lines + kk / LINE_PAIRS)))
-                                as u32;
+                            + (4 * (16 * nj * ROW_WORDS_256 + LINE * (kk / LINE_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
                         // whole inside KT (staged_word_256,
                         // staged_offsets_hold_256), published by the barrier
@@ -1209,22 +1159,16 @@ mod flash_gqa_prefill_kernels {
                             sc[2 * nj + 1] =
                                 wmma::mma_m16n8k16_f32_f16(sc[2 * nj + 1], qa[kk], [bf[2], bf[3]]);
                         }
-                        nj += 1;
                     }
-                    kk += 1;
                 }
-                let mut nt = 0usize;
-                while nt < KEY_NT {
+                for nt in 0..KEY_NT {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut j = 0usize;
-                    while j < 4 {
+                    for j in 0usize..4 {
                         cuda_device::thread::__unroll_config::<0>();
                         // SAFETY: (4·nt + j)·32 + lane < EXCH_WARP: this
                         // lane's own slot of this warp's exchange.
                         unsafe { *ex_own.add((4 * nt + j) * 32) = sc[nt][j] };
-                        j += 1;
                     }
-                    nt += 1;
                 }
             }
             // Both halves are published.
@@ -1233,25 +1177,17 @@ mod flash_gqa_prefill_kernels {
             let mut pa = [[0u32; 4]; PV_STEPS];
             let mut f = [1.0f32; 2];
             if live {
-                // S = S_lo + S_hi, low half first: the same bits in both
-                // warps of the pair.
-                let mut nt = 0usize;
-                while nt < KEY_NT {
+                // S = S_w + S_mate = S_lo + S_hi: a rounded add is
+                // commutative, so both warps of the pair hold the same bits.
+                for nt in 0..KEY_NT {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut j = 0usize;
-                    while j < 4 {
+                    for j in 0usize..4 {
                         cuda_device::thread::__unroll_config::<0>();
                         // SAFETY: the partner's slot for the same fragment
                         // value, written before the barrier above.
                         let mate = unsafe { *ex_mate.add((4 * nt + j) * 32) };
-                        sc[nt][j] = if dh == 0 {
-                            add_rn_f32(sc[nt][j], mate)
-                        } else {
-                            add_rn_f32(mate, sc[nt][j])
-                        };
-                        j += 1;
+                        sc[nt][j] = add_rn_f32(sc[nt][j], mate);
                     }
-                    nt += 1;
                 }
 
                 // The softmax over the tile's scores, the 128 body's.
@@ -1259,11 +1195,9 @@ mod flash_gqa_prefill_kernels {
                     ($masked:literal) => {{
                         let kb0 = KEY_TILE_U32 * kb + t4k;
                         let mut tmax = [f32::NEG_INFINITY; 2];
-                        let mut nt = 0usize;
-                        while nt < KEY_NT {
+                        for nt in 0..KEY_NT {
                             cuda_device::thread::__unroll_config::<0>();
-                            let mut j = 0usize;
-                            while j < 4 {
+                            for j in 0usize..4 {
                                 cuda_device::thread::__unroll_config::<0>();
                                 let key = kb0 + (8 * nt + j % 2) as u32;
                                 let v = if !$masked || key < cnt[j / 2] {
@@ -1273,13 +1207,10 @@ mod flash_gqa_prefill_kernels {
                                 };
                                 sc[nt][j] = v;
                                 tmax[j / 2] = fmax(tmax[j / 2], v);
-                                j += 1;
                             }
-                            nt += 1;
                         }
                         let mut mn = [f32::NEG_INFINITY; 2];
-                        let mut h = 0usize;
-                        while h < 2 {
+                        for h in 0usize..2 {
                             cuda_device::thread::__unroll_config::<0>();
                             let mut x = tmax[h];
                             x = fmax(x, warp::shuffle_xor_f32(x, 1));
@@ -1295,13 +1226,10 @@ mod flash_gqa_prefill_kernels {
                             }
                             mn[h] = m[h];
                             l[h] = mul_rn_f32(l[h], f[h]);
-                            h += 1;
                         }
-                        let mut kk2 = 0usize;
-                        while kk2 < PV_STEPS {
+                        for kk2 in 0..PV_STEPS {
                             cuda_device::thread::__unroll_config::<0>();
-                            let mut e = 0usize;
-                            while e < 4 {
+                            for e in 0usize..4 {
                                 cuda_device::thread::__unroll_config::<0>();
                                 let nt = 2 * kk2 + e / 2;
                                 let j0 = 2 * (e % 2);
@@ -1321,9 +1249,7 @@ mod flash_gqa_prefill_kernels {
                                 let (r0, r1) = cvt_f32x2_f16x2(packed);
                                 l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
                                 pa[kk2][e] = packed;
-                                e += 1;
                             }
-                            kk2 += 1;
                         }
                     }};
                 }
@@ -1334,16 +1260,12 @@ mod flash_gqa_prefill_kernels {
                 }
 
                 if warp::any(f[0] != 1.0 || f[1] != 1.0) {
-                    let mut nd = 0usize;
-                    while nd < 2 * DIM_PAIRS_256 {
+                    for nd in 0..2 * DIM_PAIRS_256 {
                         cuda_device::thread::__unroll_config::<0>();
-                        let mut j = 0usize;
-                        while j < 4 {
+                        for j in 0usize..4 {
                             cuda_device::thread::__unroll_config::<0>();
                             o[nd][j] = mul_rn_f32(o[nd][j], f[j / 2]);
-                            j += 1;
                         }
-                        nd += 1;
                     }
                 }
             }
@@ -1365,18 +1287,14 @@ mod flash_gqa_prefill_kernels {
 
             // ---- O += P̂·V over the warp's half.
             if live {
-                let mut kk2 = 0usize;
-                while kk2 < PV_STEPS {
+                for kk2 in 0..PV_STEPS {
                     cuda_device::thread::__unroll_config::<0>();
-                    let mut nd = 0usize;
-                    while nd < DIM_PAIRS_256 {
+                    for nd in 0..DIM_PAIRS_256 {
                         cuda_device::thread::__unroll_config::<0>();
                         // Value row 16·kk2 + v_row, chunk 2·nd + lane/16 of
                         // the warp's half.
                         let at = v_at[nd % LINE_PAIRS]
-                            + (4 * (16 * kk2 * ROW_WORDS_256
-                                + LINE * (half_lines + nd / LINE_PAIRS)))
-                                as u32;
+                            + (4 * (16 * kk2 * ROW_WORDS_256 + LINE * (nd / LINE_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
                         // whole inside VT, published by the barrier above;
                         // every lane issues the load, then both `mma.sync`
@@ -1388,9 +1306,7 @@ mod flash_gqa_prefill_kernels {
                             o[2 * nd + 1] =
                                 wmma::mma_m16n8k16_f32_f16(o[2 * nd + 1], pa[kk2], [bf[2], bf[3]]);
                         }
-                        nd += 1;
                     }
-                    kk2 += 1;
                 }
             }
             kb += 1;
@@ -1398,19 +1314,15 @@ mod flash_gqa_prefill_kernels {
 
         // ---- the row sums over the four lanes of a row, then o · (1/l).
         let mut inv = [0.0f32; 2];
-        let mut h = 0usize;
-        while h < 2 {
+        for h in 0usize..2 {
             cuda_device::thread::__unroll_config::<0>();
             let a = add_rn_f32(l[h], warp::shuffle_xor_f32(l[h], 1));
             let s = add_rn_f32(a, warp::shuffle_xor_f32(a, 2));
             inv[h] = 1.0 / s;
-            h += 1;
         }
-        let mut nd = 0usize;
-        while nd < 2 * DIM_PAIRS_256 {
+        for nd in 0..2 * DIM_PAIRS_256 {
             cuda_device::thread::__unroll_config::<0>();
-            let mut j = 0usize;
-            while j < 4 {
+            for j in 0usize..4 {
                 cuda_device::thread::__unroll_config::<0>();
                 let h = j / 2;
                 let t = t0 + 2 * rs + h;
@@ -1428,9 +1340,7 @@ mod flash_gqa_prefill_kernels {
                         *y.get_unchecked_mut((t * n_head + kh * GROUP + g) * HEAD_256 + d) = v;
                     }
                 }
-                j += 1;
             }
-            nd += 1;
         }
     }
 }

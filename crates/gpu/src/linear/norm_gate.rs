@@ -89,9 +89,8 @@ mod norm_gate_kernels {
         let mut zv = [0.0f32; 4];
         let mut wv = [0.0f32; 4];
         let mut sumsq = 0.0f64;
-        let mut i = 0usize;
         #[unroll]
-        while i < 4 {
+        for i in 0usize..4 {
             let at = lane + 32 * i;
             // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
             // by the contract; at < 128 <= w.len().
@@ -101,7 +100,6 @@ mod norm_gate_kernels {
                 wv[i] = *w.get_unchecked(at);
             }
             sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
-            i += 1;
         }
         let mut acc = sumsq;
         acc += warp::shuffle_xor_f64(acc, 16);
@@ -120,16 +118,14 @@ mod norm_gate_kernels {
             & crate::fault::quad_finite(ov)
             & crate::fault::quad_finite(zv)
             & crate::fault::quad_finite(wv);
-        let mut i = 0usize;
         #[unroll]
-        while i < 4 {
+        for i in 0usize..4 {
             let v = mul_rn_f32(
                 mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
                 act::<GATE_SILU>(zv[i]),
             );
             // SAFETY: as the reads above; one lane per value.
             unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
-            i += 1;
         }
         if !ok {
             fault.raise(FaultSite::LinearGate);

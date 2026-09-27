@@ -413,8 +413,7 @@ macro_rules! mma_segment_walk {
             let row = $base_row + wid;
             let live = row < $rows;
             let mut raw = [0.0f32; 2 * ($width / 64)];
-            let mut i = 0usize;
-            while i < const { $width / 64 } {
+            for i in 0..const { $width / 64 } {
                 ::cuda_device::thread::__unroll_config::<{ 0 }>();
                 let w = lane + i * 32;
                 if live {
@@ -426,10 +425,8 @@ macro_rules! mma_segment_walk {
                         raw[2 * i + 1] = *$q.get_unchecked(row * $width_rt + 2 * w + 1);
                     }
                 }
-                i += 1;
             }
-            let mut i = 0usize;
-            while i < const { $width / 64 } {
+            for i in 0..const { $width / 64 } {
                 ::cuda_device::thread::__unroll_config::<{ 0 }>();
                 let w = lane + i * 32;
                 let a = $crate::flash::f32_to_f16_bits(raw[2 * i]) as u32;
@@ -440,7 +437,6 @@ macro_rules! mma_segment_walk {
                     *$qs.add(wid * const { $crate::flash::mma_row_words($width) } + w) =
                         a | (c << 16);
                 }
-                i += 1;
             }
         }
 
@@ -469,15 +465,13 @@ macro_rules! mma_segment_walk {
             // already f16, so this stage is a copy. A row at or past
             // `hi_max` — which may hold NaN — is not read and stays zero,
             // and its weight is zero, so it leaves every partial alone.
-            let mut rr = 0usize;
-            while rr < $crate::flash::MMA_KROWS_PER_WARP {
+            for rr in 0..$crate::flash::MMA_KROWS_PER_WARP {
                 ::cuda_device::thread::__unroll_config::<{ 0 }>();
                 let row = wid * $crate::flash::MMA_KROWS_PER_WARP + rr;
                 let $key = blk + row;
                 let live = $key < $hi_max;
                 let mut raw = [0u32; $width / 64];
-                let mut i = 0usize;
-                while i < const { $width / 64 } {
+                for i in 0..const { $width / 64 } {
                     ::cuda_device::thread::__unroll_config::<{ 0 }>();
                     let ww = lane + i * 32;
                     if live {
@@ -492,10 +486,8 @@ macro_rules! mma_segment_walk {
                             raw[i] = *$kvw.add(src_row * ($width_rt / 2) + ww);
                         }
                     }
-                    i += 1;
                 }
-                let mut i = 0usize;
-                while i < const { $width / 64 } {
+                for i in 0..const { $width / 64 } {
                     ::cuda_device::thread::__unroll_config::<{ 0 }>();
                     let ww = lane + i * 32;
                     // SAFETY: row < MMA_KEYS and ww < width / 2 < the
@@ -504,9 +496,7 @@ macro_rules! mma_segment_walk {
                         *$kt.add(row * const { $crate::flash::mma_row_words($width) } + ww) =
                             raw[i];
                     }
-                    i += 1;
                 }
-                rr += 1;
             }
             ::cuda_device::thread::sync_threads();
 
@@ -593,8 +583,7 @@ macro_rules! mma_segment_walk {
             if wid < $crate::flash::MMA_QK_WARPS {
                 let g = lane / 4;
                 let t4 = lane % 4;
-                let mut j = 0usize;
-                while j < 4 {
+                for j in 0usize..4 {
                     ::cuda_device::thread::__unroll_config::<{ 0 }>();
                     let head = g + if j >= 2 {
                         $crate::flash::MMA_ROWS / 2
@@ -615,7 +604,6 @@ macro_rules! mma_segment_walk {
                     unsafe {
                         *$klog.add(head * $crate::flash::MMA_KEYS + key) = sv;
                     }
-                    j += 1;
                 }
             }
             ::cuda_device::thread::sync_threads();
@@ -670,15 +658,13 @@ macro_rules! mma_segment_walk {
             // is what lets the sixteen accumulators be scheduled across
             // keys, and it measured faster even at a depth where most of
             // the tile is dead.
-            let mut h = 0usize;
-            while h < $crate::flash::MMA_ROWS {
+            for h in 0..$crate::flash::MMA_ROWS {
                 ::cuda_device::thread::__unroll_config::<{ 0 }>();
                 // SAFETY: h < MMA_ROWS bounds the read, and the rescales
                 // hold this tile's (published before the barrier above).
                 unsafe {
                     r[h] *= *$vms_sh.add(h);
                 }
-                h += 1;
             }
             let vword = ($rope + d0) / 2;
             let vlo = ($rope + d0).is_multiple_of(2);
@@ -692,22 +678,19 @@ macro_rules! mma_segment_walk {
                     )
                 };
                 let v = if vlo { v0 } else { v1 };
-                let mut h = 0usize;
-                while h < $crate::flash::MMA_ROWS {
+                for h in 0..$crate::flash::MMA_ROWS {
                     ::cuda_device::thread::__unroll_config::<{ 0 }>();
                     // SAFETY: h < MMA_ROWS and l < MMA_KEYS bound the read
                     // inside the weights.
                     let wgt = unsafe { *$kw.add(h * $crate::flash::MMA_KEYS + l) };
                     r[h] = f32::mul_add(wgt, v, r[h]);
-                    h += 1;
                 }
                 l += 1;
             }
             blk += $crate::flash::MMA_KEYS;
         }
 
-        let mut h = 0usize;
-        while h < $crate::flash::MMA_ROWS {
+        for h in 0..$crate::flash::MMA_ROWS {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
             let row = $base_row + h;
             if row < $rows {
@@ -718,7 +701,6 @@ macro_rules! mma_segment_walk {
                     *$part_v.get_unchecked_mut((row * $n_seg + $seg) * $lat + d0) = r[h];
                 }
             }
-            h += 1;
         }
         if lane == 0 {
             let row = $base_row + wid;
@@ -1388,8 +1370,7 @@ mod flash_kernels {
             // does not wait on memory twice per segment.
             let mut ms = [0.0f32; 2 * MERGE_BATCH];
             let mut vs = [0.0f32; MERGE_BATCH];
-            let mut i = 0usize;
-            while i < MERGE_BATCH {
+            for i in 0..MERGE_BATCH {
                 cuda_device::thread::__unroll_config::<0>();
                 if seg + i < n_seg {
                     let idx = row * segs as usize + seg + i;
@@ -1403,15 +1384,12 @@ mod flash_kernels {
                         vs[i] = *part_v.get_unchecked(idx * lat + tid);
                     }
                 }
-                i += 1;
             }
-            let mut i = 0usize;
-            while i < MERGE_BATCH {
+            for i in 0..MERGE_BATCH {
                 cuda_device::thread::__unroll_config::<0>();
                 if seg + i < n_seg && ms[2 * i + 1] != 0.0 {
                     (mx, s_sum, acc) = online_fold(mx, s_sum, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
                 }
-                i += 1;
             }
             seg += MERGE_BATCH;
         }
