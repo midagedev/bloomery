@@ -492,6 +492,7 @@ fn hw_deepseek4_plans() {
     }
     let want: BTreeMap<String, Option<Vec<usize>>> = pins::UNIMPLEMENTED
         .iter()
+        .chain(pins::INSTANCES)
         .map(|&(f, ls)| (f.to_string(), ls.map(<[usize]>::to_vec)))
         .collect();
     for (f, ls) in &got {
@@ -506,4 +507,78 @@ fn hw_deepseek4_plans() {
         Err(e) => b.push(format!("PlanInputs::read refused with another error: {e}")),
     }
     fail_if_bad(o, b);
+}
+
+#[path = "common/spec_view.rs"]
+mod spec_view;
+
+#[path = "common/spec_fail_first.rs"]
+mod spec_fail_first;
+
+// PIN(2026-09-27): the V4-Flash file's description as `arch::deepseek41::spec` reads it, line by
+// line — docs/research/modelspec-design.md §3 and the pins above are what these were checked against.
+const V4_VIEW: &[&str] = &[
+    "arch Deepseek4",
+    "hidden 4096 vocab 129280 ctx_train 1048576",
+    "rms_eps bits 0x358637bd",
+    "layers 43 mtp 0",
+    "hc Some(HcSpec { streams: 4, sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Head })",
+    "engram None",
+    "chat pre joyai-llm template bytes 13772 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    "[0-1] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias false norm true x1.5 hash true shared 2048 swiglu Some(10.0) gate false || hc",
+    "[2] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r4 Own{g1 a1 o1} | sel 64x128 k512 keys Own{icmp Compressor { gated: true, ape: true, overlap: true }} list Own cand None || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias false norm true x1.5 hash true shared 2048 swiglu Some(10.0) gate false || hc",
+    "[3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r128 Own{g1 a1 o0} || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
+    "[4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r4 Own{g1 a1 o1} | sel 64x128 k512 keys Own{icmp Compressor { gated: true, ape: true, overlap: true }} list Own cand None || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
+];
+
+/// 4. `hw_deepseek4_spec` — the typed description: (a) every field pinned;
+///    (c) the coverage check lists exactly `pins::UNIMPLEMENTED` and
+///    `pins::INSTANCES`, and with the compressor's row taken out of its table it
+///    lists that compressor on every compressed layer.
+#[test]
+#[ignore = "needs the V4-Flash file (just gate-deepseek4-meta)"]
+fn hw_deepseek4_spec() {
+    let (split, inputs) = open();
+    let mut o = String::new();
+    let mut b = Vec::new();
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "V4 description",
+        &spec_view::view(&inputs.spec),
+        V4_VIEW,
+    );
+    let read = model::arch::deepseek41::spec::read(&split).unwrap_or_else(|e| panic!("spec: {e}"));
+    row(
+        &mut o,
+        &mut b,
+        "spec::read = PlanInputs' spec",
+        read.spec == inputs.spec,
+        true,
+    );
+    let want: Vec<String> = pins::UNIMPLEMENTED
+        .iter()
+        .chain(pins::INSTANCES)
+        .map(|&(f, ls)| match ls {
+            None => f.to_string(),
+            Some(ls) => format!("{f}: {}", spec_view::ranges_of(ls)),
+        })
+        .collect();
+    let mut got = spec_view::items(&inputs.unimplemented());
+    let mut want_sorted = want.clone();
+    got.sort();
+    want_sorted.sort();
+    for g in &got {
+        let _ = writeln!(o, "  item {g}");
+    }
+    row(&mut o, &mut b, "coverage items", got, want_sorted);
+    spec_fail_first::fail_first(
+        &mut o,
+        &mut b,
+        &inputs.spec,
+        &inputs.model,
+        "gpu-deepseek41/src/compress.rs WIDTH",
+        "a compressor of 512-value rows: 2-42",
+    );
+    fail_if_bad(&o, &b);
 }

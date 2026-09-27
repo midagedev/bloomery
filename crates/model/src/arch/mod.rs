@@ -6,13 +6,46 @@
 //! and the gates at once.
 
 use crate::ModelError;
-use crate::placement::PlacementError;
+use crate::placement::{ModelTensors, PlacementError};
 use gguf::{Gguf, Split, Value};
+use models::{ChatSpec, ModelSpec, ReasoningFormat, ToolFormat};
 
+pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
 pub mod dspark;
+pub mod qwen35moe;
 pub mod qwen3moe;
+
+/// The typed model description, its readers' output: re-exported so a
+/// caller names one crate for the model and its description.
+pub use models;
+
+/// `split`'s [`ModelSpec`] by its family's reader, with every tensor's role:
+/// what the coverage check ([`coverage::check`]) and the programs read. An
+/// architecture no reader here reads is [`ModelError::UnknownArchitecture`]
+/// with the string the file held. `deepseek2` has no reader.
+pub fn spec(split: &Split) -> Result<Read, ModelError> {
+    Ok(match split.architecture() {
+        Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
+        Some("qwen3moe") => qwen3moe::spec::read(split)?,
+        Some("qwen35moe") => qwen35moe::spec::read(split)?,
+        other => {
+            return Err(ModelError::UnknownArchitecture(
+                other.unwrap_or("<missing>").to_string(),
+            ));
+        }
+    })
+}
+
+/// A reader's output: the description, the roles, and the keys it took a
+/// default for (each with its value and the line that sets it).
+#[derive(Debug)]
+pub struct Read {
+    pub spec: ModelSpec,
+    pub tensors: ModelTensors,
+    pub defaults: Vec<String>,
+}
 
 /// The architecture string of the DSpark draft file ([`dspark`]). It is not an
 /// [`Arch`]: the draft is read beside a V4.1 model, never run as a model.
@@ -146,6 +179,49 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
+/// `tokenizer.ggml.pre`.
+const PRE: &str = "tokenizer.ggml.pre";
+/// `tokenizer.chat_template`.
+const TEMPLATE: &str = "tokenizer.chat_template";
+
+/// The file's chat surface: its pre-tokenizer (required) and template, with
+/// the family's parsers.
+fn chat_of(
+    split: &Split,
+    tools: Option<ToolFormat>,
+    reasoning: Option<ReasoningFormat>,
+) -> Result<ChatSpec, PlacementError> {
+    let pre = split
+        .value(PRE)
+        .and_then(Value::as_str)
+        .ok_or_else(|| PlacementError::Metadata {
+            key: PRE.to_string(),
+            detail: "is absent or not a string".to_string(),
+        })?;
+    let template = match split.value(TEMPLATE) {
+        None => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| PlacementError::Metadata {
+            key: TEMPLATE.to_string(),
+            detail: "is not a string".to_string(),
+        })?),
+    };
+    Ok(ChatSpec {
+        pre: pre.to_string(),
+        template: template.map(str::to_string),
+        tools,
+        reasoning,
+    })
+}
+
+/// `v`, a count a reader holds as `usize`, as the `u32` a [`ModelSpec`]
+/// holds; `what` names it in the error.
+fn spec_u32(what: &str, v: usize) -> Result<u32, PlacementError> {
+    u32::try_from(v).map_err(|_| PlacementError::Metadata {
+        key: what.to_string(),
+        detail: format!("{v} does not fit u32"),
+    })
+}
+
 /// The vocabulary size where ik takes it (llama-hparams.cpp:155):
 /// `vocab_size` when the file carries it, else the token list's length.
 fn n_vocab(split: &Split) -> Result<usize, PlacementError> {
@@ -253,6 +329,19 @@ mod tests {
     #[test]
     fn deepseek4_is_read_by_the_deepseek41_module() {
         assert_eq!(Arch::from_name(super::DEEPSEEK4).unwrap(), Arch::Deepseek41);
+    }
+
+    /// An architecture no reader reads — GLM-5.3-Flash's `glm5next` — is
+    /// refused by its name before any key is read.
+    #[test]
+    fn a_glm5next_header_has_no_reader() {
+        let path = super::synthetic::header("glm5next-spec", "glm5next", &[], &[]);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = super::spec(&split)
+            .expect_err("no glm5next reader")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("\"glm5next\""), "{err}");
     }
 
     #[test]

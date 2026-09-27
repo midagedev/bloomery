@@ -13,3 +13,4 @@ pub mod names;
 pub mod place;
 pub mod plan;
 pub mod roles;
+pub mod spec;
