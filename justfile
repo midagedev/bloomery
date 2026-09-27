@@ -408,6 +408,12 @@ dump-ref-qwen3moe *VARIANT:
 dump-ref-qwen3moe-cuda:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# Qwen3.6-35B-A3B(qwen35moe) 오라클: ik가 lmstudio Q4_K_M 파일을 CPU로 돌린 노드 덤프(5토큰 배치 세트).
+# VARIANT를 주면 조용한 프리필 뒤 디코드 한 스텝을 제 세트로 뜬다(step4, d1k, u1s4, u1s5와 -every-node —
+# tools/ref/models/qwen35moe.sh). CPU 임대 아래서 돌므로 카드(docs/cards/q35oracle-dump.card)가 있어야 한다.
+dump-ref-qwen35moe *VARIANT:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
