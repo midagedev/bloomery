@@ -296,6 +296,7 @@ pub mod step_order {
         AttnSel,
         Q5Quant,
         HcQuant,
+        CacheValue,
     ];
 
     /// The order of `arch`'s step.
