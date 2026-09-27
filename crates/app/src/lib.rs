@@ -29,7 +29,7 @@
 pub mod arch;
 
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, StepMode};
-use bloomery_gpu::{GpuError, GpuModel};
+use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
 use runtime::{Draft, Out, Speculative, Target, Verify, Want};
@@ -100,6 +100,43 @@ impl<E: std::fmt::Display> std::fmt::Display for ArmFailed<E> {
 /// Any displayable error, a caller's boxed one included; the text is the
 /// arm's and then its error's own.
 impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for ArmFailed<E> {}
+
+/// Whether a model poisoned by `fault` may be cleared: refused by name when
+/// it is, since a fault ends the load.
+fn clearable(fault: Option<Fault>) -> Result<(), SessionError> {
+    match fault {
+        Some(fault) => Err(SessionError::Refused(format!(
+            "the clear on a model a fault poisoned ({fault}): the fault ends the load"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// [`Session::arms`] over any `s`: `run` of each arm in order, `clear` before
+/// every arm after the first, and the first failure ends the list naming its
+/// arm.
+fn run_arms<S, A, E>(
+    s: &mut S,
+    arms: &[A],
+    mut clear: impl FnMut(&mut S) -> Result<(), SessionError>,
+    mut run: impl FnMut(&mut S, usize, &A) -> Result<(), E>,
+) -> Result<(), ArmFailed<E>>
+where
+    E: From<SessionError>,
+{
+    let failed = |arm, error| ArmFailed {
+        arm,
+        arms: arms.len(),
+        error,
+    };
+    for (i, arm) in arms.iter().enumerate() {
+        if i > 0 {
+            clear(s).map_err(|e| failed(i, E::from(e)))?;
+        }
+        run(s, i, arm).map_err(|e| failed(i, e))?;
+    }
+    Ok(())
+}
 
 /// A body that loads by a placement plan: the file's headers read once, the
 /// plan made once from them, and gpumodel's constructor over that plan.
@@ -307,11 +344,7 @@ impl<B: ChainBody> Session<B> {
     /// buffers stay: that is the load. Refused on a model a fault poisoned:
     /// a fault ends the load, it is not cleared into the next prompt.
     pub fn clear(&mut self) -> Result<(), SessionError> {
-        if let Some(fault) = self.model.poisoned() {
-            return Err(SessionError::Refused(format!(
-                "the clear on a model a fault poisoned ({fault}): the fault ends the load"
-            )));
-        }
+        clearable(self.model.poisoned())?;
         self.model.reset()?;
         self.rows = None;
         self.logits.clear();
@@ -325,23 +358,12 @@ impl<B: ChainBody> Session<B> {
     pub fn arms<A, E>(
         &mut self,
         arms: &[A],
-        mut run: impl FnMut(&mut Self, usize, &A) -> Result<(), E>,
+        run: impl FnMut(&mut Self, usize, &A) -> Result<(), E>,
     ) -> Result<(), ArmFailed<E>>
     where
         E: From<SessionError>,
     {
-        let failed = |arm, error| ArmFailed {
-            arm,
-            arms: arms.len(),
-            error,
-        };
-        for (i, arm) in arms.iter().enumerate() {
-            if i > 0 {
-                self.clear().map_err(|e| failed(i, E::from(e)))?;
-            }
-            run(self, i, arm).map_err(|e| failed(i, e))?;
-        }
-        Ok(())
+        run_arms(self, arms, Session::clear, run)
     }
 
     /// The model, for what the traits do not carry (records, instruments).
@@ -490,8 +512,98 @@ impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionError;
+    use super::{ArmFailed, SessionError, clearable, run_arms};
     use bloomery_gpu::{Fault, FaultSite, GpuError};
+
+    /// A poisoned model is refused by name, naming its fault; a clean one
+    /// may be cleared.
+    #[test]
+    fn clear_refuses_a_poisoned_model() {
+        let fault = Fault::at(3, FaultSite::QuantColumn);
+        let text = match clearable(Some(fault)) {
+            Err(SessionError::Refused(t)) => t,
+            other => panic!("a poisoned model's clear gave {other:?}"),
+        };
+        assert!(
+            text.contains("poisoned") && text.contains(&fault.to_string()),
+            "{text}"
+        );
+        assert!(clearable(None).is_ok());
+    }
+
+    /// The clear runs before every arm but the first; the first failure,
+    /// the run's or the clear's, ends the list and names its arm, and no
+    /// arm after it runs.
+    #[test]
+    fn arms_clear_between_and_stop_at_the_first_failure() {
+        #[derive(Debug, PartialEq)]
+        enum Ev {
+            Clear,
+            Run(usize),
+        }
+        let mut log = Vec::new();
+        let ok = run_arms(
+            &mut log,
+            &['a', 'b', 'c'],
+            |l: &mut Vec<Ev>| {
+                l.push(Ev::Clear);
+                Ok(())
+            },
+            |l: &mut Vec<Ev>, i, _| {
+                l.push(Ev::Run(i));
+                Ok::<(), SessionError>(())
+            },
+        );
+        assert!(ok.is_ok());
+        assert_eq!(
+            log,
+            [Ev::Run(0), Ev::Clear, Ev::Run(1), Ev::Clear, Ev::Run(2)]
+        );
+
+        let mut log = Vec::new();
+        let run_failed = run_arms(
+            &mut log,
+            &['a', 'b', 'c'],
+            |l: &mut Vec<Ev>| {
+                l.push(Ev::Clear);
+                Ok(())
+            },
+            |l: &mut Vec<Ev>, i, _| {
+                l.push(Ev::Run(i));
+                if i == 1 {
+                    Err(SessionError::Refused("arm b".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let Err(ArmFailed { arm, arms, error }) = run_failed else {
+            panic!("a failing arm ended the list with Ok");
+        };
+        assert_eq!((arm, arms), (1, 3));
+        assert_eq!(error.to_string(), "arm b");
+        assert_eq!(log, [Ev::Run(0), Ev::Clear, Ev::Run(1)]);
+
+        let mut log = Vec::new();
+        let clear_failed = run_arms(
+            &mut log,
+            &['a', 'b', 'c'],
+            |_: &mut Vec<Ev>| clearable(Some(Fault::at(3, FaultSite::QuantColumn))),
+            |l: &mut Vec<Ev>, i, _| {
+                l.push(Ev::Run(i));
+                Ok::<(), SessionError>(())
+            },
+        );
+        let Err(f) = clear_failed else {
+            panic!("a refused clear ended the list with Ok");
+        };
+        assert_eq!((f.arm, f.arms), (1, 3));
+        assert!(
+            f.to_string()
+                .starts_with("arm 1 of 3: the clear on a model a fault poisoned")
+        );
+        assert_eq!(log, [Ev::Run(0)]);
+    }
 
     /// A fault reads as one error whichever way the call met it: raised by
     /// its own readback, or found poisoned by an earlier one.

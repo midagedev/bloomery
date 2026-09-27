@@ -17,7 +17,25 @@
 //! `Body::keep_point` grants restores a row outside those — what the batch
 //! leaves unwritten is never claimed.
 //!
-//! - **Attention count.** Before anything else, two direct launches of the
+//! - **Clear.** First, right after the load and the step's capture, before
+//!   any other call touches the model: three arms through the session
+//!   (`app::Session::arms`), each after the first from `Session::clear` —
+//!   arm A, a prompt call of the first [`CLEAR_A`] prose ids and its decode
+//!   steps; arm B, the code corpus at another length, and its steps; arm A
+//!   again. The first A stands in for a fresh process, so the second must
+//!   equal it in every field that is not a time: the position it starts at,
+//!   its tokens, its last logits (FNV-1a 64), every layer's window ring and
+//!   compressor state and the compressed rows and index keys below its end,
+//!   the call's needs and queue counts, the prompt stats' counts and the host
+//!   tier's integer counters over the arm. A's length is the least that
+//!   leaves every kind of call state for its steps to read: past the window
+//!   (the ring wraps), not a multiple of any ratio above one (the call leaves
+//!   a half group in each compressor state, which its steps complete), past
+//!   `top_k` rows at every ratio at the call's last position (every indexer
+//!   stream selects inside the call), and more than one batch. Those premises
+//!   are checked against the file's hyperparameters and refused by name when
+//!   A no longer meets them.
+//! - **Attention count.** Then two direct launches of the
 //!   attention with a visible count past its source's rows — window keys past
 //!   the ring's, compressed rows past the stream's — each raise the fault word
 //!   at `attn_count`; a launch within the rows raises nothing.
@@ -170,6 +188,7 @@ mod gate {
     use std::ops::Range;
     use std::time::Instant;
 
+    use app::Session;
     use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::q4k_sel::tile_cap;
@@ -179,7 +198,7 @@ mod gate {
         col_group_of,
     };
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
-    use bloomery_gpu_deepseek41::body::{self, CedState, Deepseek41Model, Need};
+    use bloomery_gpu_deepseek41::body::{self, Body, CedState, Deepseek41Model, Need};
     use bloomery_gpu_deepseek41::chain::ffn::{
         CardStacks, FfnBatchKernels, FfnKernels, Handoff, Places, TiledGateUp,
     };
@@ -193,7 +212,7 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{
-        GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
+        Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         patch_bytes, record, row_bytes, verdict,
     };
     use bloomery_levers::{CARD_BUDGET, CED, ENGRAM_HELPER, HOT_LIST, PREFILL_GROUP, STEP_STATS};
@@ -203,6 +222,7 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
     use model::placement::workstation;
+    use runtime::{Target, Want};
 
     use crate::{dspark, finite, split};
 
@@ -234,6 +254,30 @@ mod gate {
     /// kernel leaves alone reads back as these bits.
     const SENT: f32 = 1.0e30;
     const SENT_U32: u32 = 0xdead_beef;
+    /// The clear clause's arm A (module doc): the least odd length whose last
+    /// position sees more than `top_k` rows at ratio 2, and two steps — the
+    /// first completes the half group the call leaves, the second reads a
+    /// compressed row a step wrote and opens a new group.
+    const CLEAR_A: ClearArm = ClearArm {
+        corpus: "prose",
+        p: 1027,
+        steps: 2,
+    };
+    /// Arm B: another corpus, another length, parity and batch count.
+    const CLEAR_B: ClearArm = ClearArm {
+        corpus: "code",
+        p: 600,
+        steps: 2,
+    };
+
+    /// One arm of the clear clause: the first `p` ids of
+    /// `corpus-<corpus>.ids` as one prompt call, then `steps` greedy steps.
+    #[derive(Clone, Copy)]
+    struct ClearArm {
+        corpus: &'static str,
+        p: usize,
+        steps: usize,
+    }
 
     struct Args {
         cases: Vec<usize>,
@@ -274,9 +318,9 @@ mod gate {
         Ok(a)
     }
 
-    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
-    fn corpus(n: usize) -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("engram").join("corpus-prose.ids");
+    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-<name>.ids`.
+    fn corpus(name: &str, n: usize) -> Result<Vec<u32>, GateError> {
+        let path = data_dir().join("engram").join(format!("corpus-{name}.ids"));
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let ids = text
@@ -362,15 +406,21 @@ mod gate {
             b.set_prefill_card_timing(gpu, true)?;
         }
         if let Some(p) = args.seams {
-            let ids = corpus(p)?;
+            let ids = corpus("prose", p)?;
             return seams(&mut m, &ids);
         }
+        m.capture_step()?;
+        let clear_t = Instant::now();
+        let mut s = Session::from_model(m, u32::try_from(workstation::CTX_MAX)?);
+        let mut pass = clear_case(&mut s, &hp)?;
+        let clear_wall = clear_t.elapsed();
+        let m = s.model_mut();
         let ced = m.body(NAME)?.ced();
         let (group, group_bytes) = m.body(NAME)?.prefill_group().unwrap_or_default();
-        let mut pass = count_cases(&mut m)?;
-        pass &= router_cases(&mut m)?;
-        pass &= raise_cases(&mut m, &hp)?;
-        pass &= proj_cases(&mut m, &hp)?;
+        pass &= count_cases(m)?;
+        pass &= router_cases(m)?;
+        pass &= raise_cases(m, &hp)?;
+        pass &= proj_cases(m, &hp)?;
         let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
         let top = args
             .cases
@@ -381,14 +431,14 @@ mod gate {
             .max()
             .unwrap_or(1);
         let steps = (top + 1).min(ORACLE);
-        let ids = corpus(ORACLE + 1)?;
+        let ids = corpus("prose", ORACLE + 1)?;
         println!(
             "{NAME}: loaded in {:.1} s; ced={ced}; group={group}; batch \
              buffers {} B (attention projections {} B, batches past a group's first \
              {group_bytes} B); ids \
              corpus-prose.ids[..{}] first {:?}; tap layers {layers:?}, draft window {}; oracle \
              {steps} steps; cases {:?} splits {splits:?} extra {}",
-            t.elapsed().as_secs_f64(),
+            (t.elapsed() - clear_wall).as_secs_f64(),
             m.body(NAME)?.batch_bytes(),
             m.body(NAME)?.batch_proj_bytes(),
             ORACLE + 1,
@@ -409,7 +459,7 @@ mod gate {
         wanted.sort_unstable();
         wanted.dedup();
         let t = Instant::now();
-        let (oracle, rows) = oracle(&mut m, &hp, &ids, steps, &wanted)?;
+        let (oracle, rows) = oracle(m, &hp, &ids, steps, &wanted)?;
         println!(
             "{NAME}: oracle {steps} steps in {:.1} s",
             t.elapsed().as_secs_f64()
@@ -435,7 +485,7 @@ mod gate {
             let t = Instant::now();
             m.reset()?;
             m.body_parts(NAME)?.2.take_prefill_stats();
-            let case = run_case(&mut m, &hp, &ids, parts, *window, &rows)?;
+            let case = run_case(m, &hp, &ids, parts, *window, &rows)?;
             if stats {
                 let stats = m.body_parts(NAME)?.2.take_prefill_stats();
                 println!("{NAME}: {what} {}", split::split(&stats).line());
@@ -444,17 +494,240 @@ mod gate {
             pass &= compare(what, &case, &oracle[&p], &rows, t);
         }
         let p_clean = args.cases.iter().copied().min().unwrap_or(1);
-        pass &= fault_reset_case(&mut m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
-        pass &= group_fault_case(&mut m, &hp, &ids)?;
+        pass &= fault_reset_case(m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
+        pass &= group_fault_case(m, &hp, &ids)?;
         if args.extra {
-            pass &= rollback_case(&mut m, &ids, &oracle)?;
-            pass &= take_back_case(&mut m, &ids, &oracle)?;
+            pass &= rollback_case(m, &ids, &oracle)?;
+            pass &= take_back_case(m, &ids, &oracle)?;
         }
         if !pass {
             return Err(checks_failed());
         }
         println!("PASSED: {NAME}");
         Ok(())
+    }
+
+    /// What one arm of the clear clause leaves: every field but its time.
+    struct ArmOut {
+        /// The position the arm starts at: 0 after a clear.
+        pos0: u32,
+        /// The call's argmax, then each step's.
+        tokens: Vec<u32>,
+        /// FNV-1a 64 of the last logits' bits.
+        logits: u64,
+        need: Option<Need>,
+        /// The call's queue counts per batch and layer-batch, as printed.
+        counts: String,
+        /// `PrefillStats`' counts: group, batches, layer-batches, those of a
+        /// group's first batch, route and shadow entries, excluded slots.
+        split: [u64; 7],
+        /// The host tier's integer counters over the arm: layers served, host
+        /// slots, pair overlap and row-1 slots, batch services, their
+        /// columns, host and excluded slots, refusals, resets.
+        host: [u64; 10],
+        /// Folded md5s of every layer's ring, compressor state, compressed
+        /// rows and index keys below the arm's end.
+        caches: [Digest; 4],
+        secs: f64,
+    }
+
+    impl ArmOut {
+        /// The names of the fields that differ from `want`'s.
+        fn differs(&self, want: &ArmOut) -> Vec<&'static str> {
+            [
+                ("pos0", self.pos0 == want.pos0),
+                ("tokens", self.tokens == want.tokens),
+                ("logits", self.logits == want.logits),
+                ("need", self.need == want.need),
+                ("counts", self.counts == want.counts),
+                ("split", self.split == want.split),
+                ("host", self.host == want.host),
+                ("ring", self.caches[0] == want.caches[0]),
+                ("state", self.caches[1] == want.caches[1]),
+                ("rows", self.caches[2] == want.caches[2]),
+                ("keys", self.caches[3] == want.caches[3]),
+            ]
+            .into_iter()
+            .filter_map(|(name, same)| (!same).then_some(name))
+            .collect()
+        }
+    }
+
+    /// The clear clause (module doc): A's premises against the file, then A,
+    /// B and A through `Session::arms`, the last A against the first.
+    fn clear_case(s: &mut Session<Body>, hp: &Hparams) -> Result<bool, GateError> {
+        let top_k = s.model().body(NAME)?.indexer_top_k();
+        let mut ratios: Vec<usize> = hp
+            .layers
+            .iter()
+            .map(|k| usize::try_from(k.ratio()))
+            .collect::<Result<_, _>>()?;
+        ratios.retain(|&r| r > 0);
+        ratios.sort_unstable();
+        ratios.dedup();
+        let a = CLEAR_A;
+        let mut broken = Vec::new();
+        if a.p <= hp.window {
+            broken.push(format!("P {} is within the window of {}", a.p, hp.window));
+        }
+        if ratios.is_empty() {
+            broken.push("no layer compresses".to_string());
+        }
+        for &r in &ratios {
+            if a.p / r <= top_k {
+                broken.push(format!(
+                    "at ratio {r} the call's last position sees {} rows, top_k {top_k}",
+                    a.p / r
+                ));
+            }
+            if r > 1 && (a.p.is_multiple_of(r) || a.steps < r - a.p % r) {
+                broken.push(format!(
+                    "at ratio {r} the call leaves no half group its {} steps complete",
+                    a.steps
+                ));
+            }
+        }
+        if body::batch_count(a.p) < 2 {
+            broken.push(format!("P {} is one batch", a.p));
+        }
+        if s.model().body(NAME)?.prefill_mode() != body::PrefillMode::Batch {
+            broken.push("the prompt schedule is not the batched call".to_string());
+        }
+        if !broken.is_empty() {
+            return Err(format!(
+                "{NAME}: the clear clause's arm A no longer exercises the call's state: {}",
+                broken.join("; ")
+            )
+            .into());
+        }
+        println!(
+            "{NAME}: clear premises: A = {} P={} + {} steps: past the window {}, a half group \
+             at every ratio above 1, rows at the call's last position {:?} at ratios {ratios:?} \
+             past top_k {top_k}, {} batches; B = {} P={} + {} steps",
+            a.corpus,
+            a.p,
+            a.steps,
+            hp.window,
+            ratios.iter().map(|r| a.p / r).collect::<Vec<_>>(),
+            body::batch_count(a.p),
+            CLEAR_B.corpus,
+            CLEAR_B.p,
+            CLEAR_B.steps
+        );
+        let arms = [CLEAR_A, CLEAR_B, CLEAR_A];
+        let ids: Vec<Vec<u32>> = arms
+            .iter()
+            .map(|a| corpus(a.corpus, a.p))
+            .collect::<Result<_, _>>()?;
+        let mut outs: Vec<ArmOut> = Vec::with_capacity(arms.len());
+        s.arms(&arms, |s, i, arm| {
+            let out = clear_arm(s, hp, &ids[i], arm.steps)?;
+            println!(
+                "{NAME}: clear arm {i} of {}: {} P={} + {} steps from position {}: tokens {:?} \
+                 logits fnv64 {:016x} | ring md5 {} state {} rows {} keys {} | split {:?} | \
+                 host {:?} | {:.1} s (runtime value)",
+                arms.len(),
+                arm.corpus,
+                arm.p,
+                arm.steps,
+                out.pos0,
+                out.tokens,
+                out.logits,
+                hex(&out.caches[0]),
+                hex(&out.caches[1]),
+                hex(&out.caches[2]),
+                hex(&out.caches[3]),
+                out.split,
+                out.host,
+                out.secs
+            );
+            outs.push(out);
+            Ok::<(), GateError>(())
+        })
+        .map_err(|f| Box::new(f) as GateError)?;
+        let [first, _, again] = outs.as_slice() else {
+            return Err(format!("{NAME}: the clear clause ran {} arms of 3", outs.len()).into());
+        };
+        let off = again.differs(first);
+        let ok = off.is_empty();
+        println!(
+            "{NAME}: clear: arm 2 (A after B and the clear) against arm 0 (A right after the \
+             load): {}; {:.1} s (runtime value): {}",
+            if ok {
+                "every field but the time equal".to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            outs.iter().map(|o| o.secs).sum::<f64>(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// One arm: `ids` as one prompt call through the session, then `steps`
+    /// greedy steps; what it leaves.
+    fn clear_arm(
+        s: &mut Session<Body>,
+        hp: &Hparams,
+        ids: &[u32],
+        steps: usize,
+    ) -> Result<ArmOut, GateError> {
+        let t = Instant::now();
+        let pos0 = s.pos();
+        s.model_mut().body_parts(NAME)?.2.take_prefill_stats();
+        let base = s.model().body(NAME)?.hybrid().stats();
+        let mut tokens = vec![s.prompt(ids, Want::Argmax)?.argmax()];
+        let st = s.model_mut().body_parts(NAME)?.2.take_prefill_stats();
+        let b = s.model().body(NAME)?;
+        let need = b.prefill_need().cloned();
+        let counts = format!("{:?}", b.prefill_counts());
+        for _ in 0..steps {
+            let last = *tokens.last().ok_or("no token")?;
+            tokens.push(s.step(last, Want::Argmax)?.argmax());
+        }
+        let logits = Fnv1a64::default().f32s(&s.model().logits()?).value();
+        let h = s.model().body(NAME)?.hybrid().stats();
+        let host = [
+            h.served - base.served,
+            h.host_slots - base.host_slots,
+            h.overlap_slots - base.overlap_slots,
+            h.pair_row1_slots - base.pair_row1_slots,
+            h.batch_served - base.batch_served,
+            h.batch_cols - base.batch_cols,
+            h.batch_host_slots - base.batch_host_slots,
+            h.batch_excluded_slots - base.batch_excluded_slots,
+            h.refusals - base.refusals,
+            h.resets - base.resets,
+        ];
+        let end = usize::try_from(s.pos())?;
+        let m = s.model_mut();
+        let mut snap = live(m)?;
+        written_rows(m, hp, end, &mut snap)?;
+        let opt = |v: &[Option<Digest>]| -> Vec<Digest> { v.iter().flatten().copied().collect() };
+        Ok(ArmOut {
+            pos0,
+            tokens,
+            logits,
+            need,
+            counts,
+            split: [
+                u64::try_from(st.group)?,
+                st.batches,
+                st.layer_batches,
+                st.first_layer_batches,
+                st.entries_route,
+                st.entries_shadow,
+                st.excluded_slots,
+            ],
+            host,
+            caches: [
+                fold(&snap.ring),
+                fold(&opt(&snap.state)),
+                fold(&opt(&snap.rows)),
+                fold(&opt(&snap.keys)),
+            ],
+            secs: t.elapsed().as_secs_f64(),
+        })
     }
 
     /// The attention count cases (module doc): the fault each launch leaves
