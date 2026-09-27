@@ -59,6 +59,8 @@ pub enum Need {
     IndexKeyCompressor,
     /// A top-k over pooled keys of the raw positions.
     TokenPool { heads: u32, d: u32, pool: u32 },
+    /// A LayerNorm with a gain and a bias on each index key.
+    KeyLayerNorm,
     /// A delta-rule layer.
     DeltaRule {
         kind: DeltaKind,
@@ -148,6 +150,7 @@ impl fmt::Display for Need {
             Need::TokenPool { heads, d, pool } => {
                 write!(f, "token-pool indexer: {heads} heads x {d}, pool {pool}")
             }
+            Need::KeyLayerNorm => f.write_str("a LayerNorm with a bias on the index keys"),
             Need::DeltaRule {
                 kind,
                 k_heads,
@@ -277,11 +280,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                             at(Need::IndexKeyCompressor);
                         }
                     }
-                    Some(Selector::TokenPool { heads, d, pool, .. }) => at(Need::TokenPool {
-                        heads: *heads,
-                        d: *d,
-                        pool: *pool,
-                    }),
+                    Some(Selector::TokenPool { heads, d, pool, .. }) => {
+                        at(Need::TokenPool {
+                            heads: *heads,
+                            d: *d,
+                            pool: *pool,
+                        });
+                        at(Need::KeyLayerNorm);
+                    }
                     None => {}
                 }
             }

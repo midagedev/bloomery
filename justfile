@@ -1100,3 +1100,8 @@ gate-gpu-vision:
 # 카드 예산이 담을 expert 수[유도], 엔진이 거절하는 기능 목록을 tests/common/deepseek4_pins.rs에 대조한다. 헤더만, 초 단위.
 gate-deepseek4-meta:
     BLOOMERY_MODEL=deepseek4 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 --nocapture && bash tools/gate.sh --release -p bloomery-model --test deepseek4_meta -- --ignored --nocapture'
+
+# glm5next (GLM-5.3-Flash) header gate: the reader's refusals on synthetic headers, then its description of the
+# file and the coverage check's list. Headers only, seconds; needs all six shards.
+gate-glm5next-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
