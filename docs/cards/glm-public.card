@@ -1,7 +1,8 @@
 # The public GLM-5.3-Flash table in one window (the release sitting's GLM segment): decode at depth 512
 # and 1024 and prompt processing at P = 512 (and 4096 for the references), bloomery (generate_glm5next,
 # plan (a) on the A6000) against llama.cpp on the two open PR branches that build glm5next (#27752,
-# #27754 with NVIDIA_TF32_OVERRIDE=0 and -fa off; mainline does not build it) at --n-cpu-moe 36, and
+# #27754 with NVIDIA_TF32_OVERRIDE=0 and -fa off; mainline does not build it) at --n-cpu-moe 36 and,
+# for the depth-512 and P = 512 rows, at llama-bench's own fit (the fit twins), and
 # exllamav3's perf.py on its EXL3 4.05 bpw quantization (another file: a table of its own). mistral.rs
 # has no glm5next loader. Our context stops at 2,051 positions (the plan's dense limit), so ours has
 # no P = 4096 row. Every prediction is [derived]; nothing of GLM has been timed on the A6000:
@@ -49,6 +50,23 @@
 #                                                       under the DRAM rate, so a 3-row pass costs
 #                                                       less than its bytes)
 #   llama.cpp #27754 srv (server)    12..17 tok/s      (llama-bench's decode through the server path)
+#   llama.cpp fit twins, both PRs    0.98..1.00 x the hand-set twin, decode (11.8..17.0 tok/s) and
+#   (lcpp2775xfit:512,                                  pp512 (64..90) alike. llama-bench's fit keeps
+#    lcpp2775xppfit:512)                                the trailing blocks' experts on the host,
+#                                                       predicted `overridden CPU:101 in blk 11-44
+#                                                       (blk 11: 2)` (models/glm5next.sh has the
+#                                                       arithmetic): the host reads 0.6..1.2 % more
+#                                                       routed bytes a token than at --n-cpu-moe 36,
+#                                                       0.3..0.6 ms of the ~49 ms host leg, plus -v's
+#                                                       `CUDA Graph id N reused` lines, at most ~70 a
+#                                                       step of a few us (<= 0.4 ms). At two rounds
+#                                                       that does not separate from the twin: the
+#                                                       expected outcome is the same row within the
+#                                                       ruler, with the fit column as the measured
+#                                                       placement. A fit row 3 % or more below its
+#                                                       twin means the fit placed otherwise (read its
+#                                                       column); one above it means the leading
+#                                                       blocks' card experts save more than their bytes
 #   exllamav3 decode (4.05 bpw)      15..21 tok/s      (its 09-15 two-card run on this box, 103 of 288
 #                                                       experts a layer on the cards: 23 tok/s; here
 #                                                       64 on the A6000 (-mcs 224, the most that loads):
@@ -71,19 +89,26 @@ predict: 18.7..22.2
 condition: one lease, two rounds, the GGUF arms rotated each round after a discarded warm-up, the
   exllamav3 arms after them behind a discarded load; arms 512 1024 hot:512 hot:1024 lcpp27752:512
   lcpp27752:1024 lcpp27754:512 lcpp27754:1024 lcpp27752pp:512 lcpp27754pp:512 lcpp27752pp4096:4096
-  lcpp27754pp:4096 lcpp27754srv:512 lcpp27754mtp:512 exl3:512 exl3:1024 exl3pp:512 exl3pp:4096; no row carries [cpu-busy] or
-  [other-busy], and no GGUF row [cold] (the discarded warm-up keeps the file cached; exllamav3's fault
-  counts are its load's and untagged); every hot row names card_experts > 0; a llama.cpp arm that fails
+  lcpp27754pp:4096 lcpp27754srv:512 lcpp27754mtp:512 lcpp27752fit:512 lcpp27754fit:512
+  lcpp27752ppfit:512 lcpp27754ppfit:512 exl3:512 exl3:1024 exl3pp:512 exl3pp:4096; no row carries [cpu-busy] or
+  [other-busy], and no GGUF row [cold] (the discarded warm-up keeps the file cached — both placements'
+  host sets together are the 199.7 GB file, which the page cache holds; exllamav3's fault
+  counts are its load's and untagged); every hot row names card_experts > 0; every fit row carries its
+  `fit` column; a llama.cpp arm that fails
   to fit is a FAIL row the runner goes past, rerun at BLOOMERY_BOX_ENV='GLM_NCMOE=37 …' (the profile
-  keeps a caller's value); the full output to a file first. Command:
+  keeps a caller's value), and a fit twin whose fit failed is a FAIL row naming it; the full output to a file first. Command:
   BLOOMERY_HOLD_OWNER=<the sitting's> BLOOMERY_AB_ROUNDS=2
   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glm-public.card' just depth-gpu-glm5next <the arms
-  above> > <log> 2>&1. Wall 35..44 min [derived]; without the five depth-1024 arms, 24..33
+  above> > <log> 2>&1. Wall 40..53 min [derived]: 35..44 for the arms before the fit twins, and 5..9
+  for the four fit twins' eight runs, each 33..58 s (the glmtime smoke's lcpp27754:6 row read `wall
+  18s` for a load and 16 steps; here the 512-id depth or prompt and the steps, 11..16 s, and the fit's ~10
+  measuring loads, 5..25 s); without the five depth-1024 arms, 29..42
 reason: sets every row of the public GLM-5.3-Flash table (llama.cpp's two PR branches beside ours,
   exllamav3 in its own table) from one window; why now: the release sitting takes every model's
   table in one window, and GLM has had no timed row
 decide-in: write the rows into rig-log first, then the README's GLM section, ratios from this window
-  only, each llama.cpp row naming its PR and commit, exllamav3 as another quantization
+  only, each llama.cpp row naming its PR and commit and beside its fit twin (the placement column
+  says which), exllamav3 as another quantization
 decide-below: read the step series and the plan line: a step over 53.5 ms with card experts on the
   card means the host leg is slower than 130 GB/s or its fixed cost larger; time the leg per layer
   (BLOOMERY_STEP_STATS, the glmhostfix round) before any row goes out

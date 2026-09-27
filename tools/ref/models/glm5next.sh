@@ -56,6 +56,23 @@
 #                   The 3090 at 42: blocks 42-44, 13,457,424,384 B; total 21,386 MiB of 24,576, 2,790 MiB
 #                   left beside the driver's 400. Host share of routed bytes at 36: blocks 3-35, 4.05 GB
 #                   a token against ours' 5.15 GB with every routed expert on the host [derived]
+#   (fit twins)     depth-glm5next.sh's lcpp2775xfit / lcpp2775xppfit arms drop -ngl and --n-cpu-moe
+#                   and leave the placement to llama-bench's fit (tools/ref/lcpp-fit.sh): every
+#                   block's dense part on the card, then the routed experts of whole blocks front to
+#                   back, then the up and gate of one more, the rest on the host — the TRAILING blocks,
+#                   where --n-cpu-moe 36 holds the leading 3-35. Predicted on the A6000 [derived, not
+#                   loaded]: room for experts 49,140 MiB less the driver's 548, the 1,024 margin and the
+#                   8,551 of card dense = 39,017 MiB less X, the card's KV, recurrent state and compute
+#                   buffer at the arm's n_ctx and ubatch (not measured; the hand-set load leaves it at
+#                   most 2,151). Blocks 3-10 whole take 33,408 MiB (4,176 each); block 11 whole (5,058)
+#                   needs X <= 551; its up and gate (their types not read; 2,784 at q4_K, 3,666 if the
+#                   down is the q4_K one) need X <= 1,943..2,825. So `overridden CPU:101 in blk 11-44
+#                   (blk 11: 2)`: block 11's ffn_down.* (its routed and its shared down: the fit's
+#                   partial-layer pattern is by name) and blocks 12-44's three expert tensors on the
+#                   host; 36,192..37,074 MiB of experts on the card against the hand-set's 37,890; host
+#                   routed bytes 139,812..140,694 MiB against 138,996 (+0.6..+1.2 %), 4.07..4.10 GB a
+#                   token. X <= 551 instead: `CPU:99 in blk 12-44 (blk 12: 3)`. The NextN block stays
+#                   out: the fit counts it only under load_mtp (common/fit.cpp:141 in #27754, 140 in #27752)
 #   LCPP27752_GPU_FLAGS, LCPP27754_GPU_FLAGS  llama-bench's flags, V4.1's set
 #                   (models/deepseek41.sh LCPP_GPU_FLAGS): -ngl 999, --n-cpu-moe GLM_NCMOE, -t 32 (the
 #                   host's cores, spelled out), -nopo 1 (no op offload: at a batch >= 32 the backend

@@ -32,6 +32,23 @@
 #             flags, `ppP`. lcpp27752pp<U>:<P> (and 27754's) adds -ub U -b max(U, 2048): the ubatch
 #             lever, not a default. P is not bounded by our context: the branches run the indexer
 #             past 2,051 positions, ours does not, so a P above C has no ours row beside it.
+#   lcpp27752fit:<D>, lcpp27754fit:<D>, lcpp27752ppfit[<U>]:<P>, lcpp27754ppfit[<U>]:<P>   the
+#             branch at llama.cpp's own placement: the lcpp2775x:<D> and lcpp2775xpp[<U>]:<P> command
+#             lines with the profile's placement options (-ngl, --n-cpu-moe, -ts, -ot) removed and
+#             `-fitt 1024 -v` added, so llama-bench's fit chooses the layers and the overrides
+#             (tools/ref/lcpp-fit.sh: what the fit does and where, the flags, the probe, the column);
+#             #27754's twins keep LCPP27754_ENV and -fa off. The fit keeps the trailing blocks'
+#             experts on the host where --n-cpu-moe keeps the leading ones' (models/glm5next.sh has
+#             the predicted placement). The row carries `fit <what it chose>` from -v's loader
+#             lines, echoed as `<label> fit …`. A fit that failed or never ran is a FAIL row naming
+#             it, whatever the exit code: llama-bench ignores the fit's status and loads at -ngl -1
+#             with no overrides, which on this file runs out of card memory or times a placement
+#             nobody chose. Refused before the lease when that branch's llama-bench --help lists no
+#             --fit-target, or when its flags already carry a fit option.
+#             The server arms have no fit twin: an MTP context's fit counts the NextN block
+#             (common/fit.cpp:141 in #27754, 140 in #27752, under load_mtp) and a server without the
+#             draft's does not, so a fitted srv/mtp pair would sit at two placements and their ratio
+#             would no longer be the draft's alone; the placement question is the llama-bench twins'.
 #   lcpp27754mtp:<D>, lcpp27754srv:<D> (and lcpp27752's)   the branch's llama-server, because
 #             llama-bench drives no speculation: one server process a row (LCPP2775x_SRV_FLAGS, or
 #             LCPP2775x_MTP_FLAGS with the MTP draft, --spec-type draft-mtp --spec-draft-n-max 2, at
@@ -118,11 +135,17 @@ ARMS=("$@")
 # Per arm: the engine (ours, hot, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
 # ubatch lever, its depth or prompt length, and its row label (a prefill arm's names its ubatch).
 A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=()
-ours=0 lcpp=0 exl3=0 gguf=0 srv=0
+ours=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
 usage() {
-  echo "depth-glm5next.sh: arm '$1' is <D>, hot:<D>, lcpp27752:<D>, lcpp27754:<D>, lcpp27752pp[<U>]:<P>, lcpp27754pp[<U>]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
+  echo "depth-glm5next.sh: arm '$1' is <D>, hot:<D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}:<D>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
   exit 64
 }
+# The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
+# shellcheck source=tools/ref/lcpp-fit.sh
+source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
+fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1-9]*) return 0 ;; *) return 1 ;; esac; }
+# gpu_flags <engine>: the profile's llama-bench flags of that engine's branch.
+gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
 for a in "${ARMS[@]}"; do
   eng=${a%%:*} dep=${a#*:} pp=0 ub=''
   [ "$a" != "$eng" ] || { eng=ours dep=$a; }
@@ -133,12 +156,14 @@ for a in "${ARMS[@]}"; do
       [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$CTX" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $CTX)"
       ;;
     lcpp27752 | lcpp27754) lcpp=1 ;;
+    lcpp27752fit | lcpp27754fit) lcpp=1 ;;
     lcpp27752srv | lcpp27754srv | lcpp27752mtp | lcpp27754mtp)
       lcpp=1 srv=1
       [ "$dep" -ge 1 ] || usage "$a" "a server arm feeds D >= 1 prose ids"
       ;;
     lcpp27752pp* | lcpp27754pp*)
       lcpp=1 pp=1 ub=${eng#lcpp2775?pp}
+      ub=${ub#fit}
       case $ub in *[!0-9]* | 0*) usage "$a" ;; esac
       [ "$dep" -ge 1 ] || usage "$a" "a prompt of 0 ids has no prefill to time"
       ;;
@@ -152,6 +177,10 @@ for a in "${ARMS[@]}"; do
       ;;
     *) usage "$a" ;;
   esac
+  if fit_eng "$eng"; then
+    lcpp_fit_flags "$(gpu_flags "$eng")" || usage "$a" "$FIT_WHY"
+    case $eng in lcpp27752*) fit27752=1 ;; *) fit27754=1 ;; esac
+  fi
   case $eng in exl3*) ;; *) gguf=1 ;; esac
   A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng")
 done
@@ -191,7 +220,7 @@ if [ "$ours" = 1 ] || [ "$srv" = 1 ]; then
     check 65 "$PROSE is not the prose the profile pins (sha256 $GLM_PROSE_SHA256)"
   else
     for i in "${!ARMS[@]}"; do
-      case ${A_ENG[$i]} in exl3* | lcpp2775[24] | lcpp2775[24]pp*) continue ;; esac
+      case ${A_ENG[$i]} in exl3* | lcpp2775[24] | lcpp2775[24]fit | lcpp2775[24]pp*) continue ;; esac
       [ "${A_DEP[$i]}" -le "$(wc -l < "$PROSE")" ] || check 64 "arm ${ARMS[$i]}: $PROSE holds fewer than ${A_DEP[$i]} ids"
     done
   fi
@@ -210,6 +239,10 @@ if [ "$ours" = 1 ]; then
 fi
 case " ${A_ENG[*]}" in *" lcpp27752"*) [ -x "$LCPP27752BIN" ] || check 2 "no llama-bench at $LCPP27752BIN (PR #27752's tree)" ;; esac
 case " ${A_ENG[*]}" in *" lcpp27754"*) [ -x "$LCPP27754BIN" ] || check 2 "no llama-bench at $LCPP27754BIN (PR #27754's tree)" ;; esac
+# A fit arm needs its branch's llama-bench to have the fit (lcpp_fit_probe runs its --help with no card).
+# shellcheck disable=SC2153 # LCPP27752 and LCPP27754 are the profile's
+{ [ "$fit27752" = 0 ] || [ ! -x "$LCPP27752BIN" ] || lcpp_fit_probe "$LCPP27752BIN"; } || check 64 "the lcpp27752fit/lcpp27752ppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP27752)"
+{ [ "$fit27754" = 0 ] || [ ! -x "$LCPP27754BIN" ] || lcpp_fit_probe "$LCPP27754BIN"; } || check 64 "the lcpp27754fit/lcpp27754ppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP27754)"
 case " ${A_ENG[*]} " in *" lcpp27752srv "* | *" lcpp27752mtp "*) [ -x "$LCPP27752SRV" ] || check 2 "no llama-server at $LCPP27752SRV" ;; esac
 case " ${A_ENG[*]} " in *" lcpp27754srv "* | *" lcpp27754mtp "*) [ -x "$LCPP27754SRV" ] || check 2 "no llama-server at $LCPP27754SRV" ;; esac
 [ "$srv" = 0 ] || command -v curl > /dev/null || check 2 "no curl for the server arms"
@@ -241,11 +274,11 @@ if [ "$exl3" = 1 ]; then
 fi
 ref_witness() { [ ${#REF_LINES[@]} -eq 0 ] || printf '    %s\n' "${REF_LINES[@]}"; }
 
-# The command of arm <i>, into CMD (an array, its environment first through env) and LABEL_TEST
-# (the row the reference's output is read by).
+# The command of arm <i>, into CMD (an array, its environment first through env), LABEL_TEST
+# (the row the reference's output is read by) and, for a fit arm, FIT_NOTE (what its flags dropped).
 arm_cmd() {
   local i=$1 eng=${A_ENG[$1]} dep=${A_DEP[$1]} ub=${A_UB[$1]} flags envs=''
-  CMD=() LABEL_TEST='' BATCH=''
+  CMD=() LABEL_TEST='' BATCH='' FIT_NOTE=''
   case $eng in
     ours | hot)
       envs="-u BLOOMERY_HOT_LIST"
@@ -268,6 +301,11 @@ arm_cmd() {
     lcpp*)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
       case $eng in lcpp27752*) CMD=(env "$LCPP27752BIN") flags=$LCPP27752_GPU_FLAGS ;; *) CMD=(env $LCPP27754_ENV "$LCPP27754BIN") flags=$LCPP27754_GPU_FLAGS ;; esac
+      if fit_eng "$eng"; then
+        lcpp_fit_flags "$flags"
+        flags=$FIT_FLAGS
+        FIT_NOTE="placement: llama-bench's fit at -fitt $LCPP_FIT_TARGET MiB (dropped: $FIT_DROPPED), -v for the fit column"
+      fi
       if [ "${A_PP[$i]}" = 1 ]; then
         CMD+=(-m "$MODEL" -p "$dep" -n 0 -r 1) LABEL_TEST="pp$dep |" BATCH="ub 512 b 2048 (llama-bench defaults)"
         if [ -n "$ub" ]; then
@@ -321,7 +359,7 @@ if [ -n "$DRY" ]; then
   for i in "${!ARMS[@]}"; do
     arm_cmd "$i"
     row=${LABEL_TEST% |}
-    echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}"
+    echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}${FIT_NOTE:+, $FIT_NOTE}"
     case ${A_ENG[$i]} in lcpp2775[24]srv | lcpp2775[24]mtp) pre='' post=' --port <free>' ;; *) pre="timeout --kill-after=10 $BOUND " post='' ;; esac
     echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <the first '"${A_DEP[$i]}"' ids of GLM_PROSE>/')$post"
   done
@@ -426,8 +464,8 @@ RESPONSE $resp"
 
 # run_arm <tag> <round> <index>: tag is ROW (a round's arm), WARMUP or DISCARD (discarded rows).
 run_arm() {
-  local tag=$1 r=$2 i=$3 eng=${A_ENG[$3]} dep=${A_DEP[$3]} label=${A_LABEL[$3]} out rc t0 t1 m0 m1 val w rowtags
-  CPU_BUSY_TAG=''
+  local tag=$1 r=$2 i=$3 eng=${A_ENG[$3]} dep=${A_DEP[$3]} label=${A_LABEL[$3]} out rc t0 t1 m0 m1 val w rowtags why line
+  CPU_BUSY_TAG='' FIT_COL='' FIT_LINES=''
   guard_other
   guard_timing
   guard_cpu "pre r$r $label $dep"
@@ -452,6 +490,14 @@ run_arm() {
   }
   local r_tag=r$r
   [ "$tag" = ROW ] || r_tag=r0
+  # A fit arm's loader lines say what the fit chose; a fit that failed or never ran fails the arm by
+  # name, whatever llama-bench measured or how it exited after it.
+  if fit_eng "$eng" && ! lcpp_fit_col "$out"; then
+    why=$FIT_WHY
+    [ "$rc" = 0 ] || why="exited $rc; $why"
+    fail_row "" "${r_tag#r}" "$i" "$rc" "$why" "$out"
+    return
+  fi
   if [ "$rc" -ne 0 ]; then fail_row "" "${r_tag#r}" "$i" "$rc" "exited $rc" "$out"; return; fi
   case $eng in
     ours | hot)
@@ -501,18 +547,19 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       val=$(echo "$out" | grep -F "$LABEL_TEST" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//; s/ //g' | head -n 1)
       [ -n "$val" ] || { fail_row "" "${r_tag#r}" "$i" 0 "no '${LABEL_TEST% |}' row" "$out"; return; }
       echo "$out" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $label table /"
+      [ -z "$FIT_COL" ] || while IFS= read -r line; do echo "    $label fit $line"; done <<< "$FIT_LINES"
       local build dev
       build=$(echo "$out" | sed -n 's/^build: //p' | head -n 1)
       dev=$(echo "$out" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
       if [ "${A_PP[$i]}" = 1 ]; then
         cold_col "$((m1 - m0))" "$(awk -v p="$dep" -v v="$val" 'BEGIN{print p / v}')"
         rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-        echo "$tag $r_tag $label p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | $BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$tag $r_tag $label p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
         [ "$tag" = ROW ] && pp_sums+=("$label|$dep|$r|$val")
       else
         cold_col "$((m1 - m0))" "$(awk -v n="$N" -v v="$val" 'BEGIN{print n / v}')"
         rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-        echo "$tag $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        echo "$tag $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
         [ "$tag" = ROW ] && sums+=("$label|$dep|$r|$val")
       fi
       ;;
@@ -579,6 +626,11 @@ lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE hot=$HOT"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
+for e in 27752 27754; do
+  case $e in 27752) [ "$fit27752" = 1 ] || continue ;; *) [ "$fit27754" = 1 ] || continue ;; esac
+  lcpp_fit_flags "$(gpu_flags "lcpp$e")"
+  echo "[config] lcpp${e}fit: flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcpp${e}ppfit<U>: -ub U -b max(U, 2048))"
+done
 [ "$exl3" = 0 ] || echo "[config] exl3: $EXL3_MODEL ($EXL3_BPW bpw) flags=$EXL3_FLAGS, perf.py's defaults otherwise (cache 32768, chunk 4096)"
 echo "[config] arms=${ARMS[*]}"
 witness pre
