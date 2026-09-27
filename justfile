@@ -704,6 +704,12 @@ gate-sampler:
 gate-runtime:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-runtime --lib -- --nocapture'
 
+# The model description crate (crates/models, host only): the shape selector's rows — every model
+# the tree runs selects its router and flash instance, a shape between or outside the rows is
+# refused by name, no two rows overlap.
+gate-models:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-models --lib -- --nocapture'
+
 # The session crate's host tests (crates/app, a device-linked crate, so cargo oxide test): a fault
 # read at a step, a group end or a call end is one SessionError::Fault.
 gate-app:
