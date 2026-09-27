@@ -120,7 +120,7 @@
 # one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box
 # manifest) and found unchanged, so a tree-side input that moved while the batch ran is never recorded
 # as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red,
-# never, unkeyed, append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
+# never, unkeyed (no key before the batch, or a recheck that failed — named on stderr), append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
 # that ran. --rerun runs every item and still records. --dry-run --ledger prints each item's status and
 # why: `skip` with the green run's commit, date and tree; `run` with what moved since the item's last
 # green (the parts of each green key are kept in <ledger>.parts/<key>.parts).
@@ -891,7 +891,16 @@ ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose ke
     error) echo unkeyed; return ;;
   esac
   if [ "$2" != 0 ]; then echo red; return; fi
-  k2=$(python3 "$ROOT/tools/recipes.py" key --manifest "$LWORK/box-manifest.txt" --box-env "${BLOOMERY_BOX_ENV:-}" "$(item_of "$i")" 2> /dev/null | cut -f1) || k2=''
+  # The recheck's failure is named, never read as a moved input: its stderr and a keyless line
+  # (`-<TAB>item<TAB>error<TAB>why`) go to the batch's stderr, and the state is `unkeyed`.
+  local out err=$LWORK/recheck-$i.err rc=0
+  out=$(python3 "$ROOT/tools/recipes.py" key --manifest "$LWORK/box-manifest.txt" --box-env "${BLOOMERY_BOX_ENV:-}" "$(item_of "$i")" 2> "$err") || rc=$?
+  k2=${out%%$'\t'*}
+  if [ "$rc" != 0 ] || [ -z "$k2" ] || [ "$k2" = - ]; then
+    echo "gate-batch: ledger: the key recheck of $(item_of "$i") failed (rc=$rc): $(tail -1 "$err")${out:+ $out}" >&2
+    echo unkeyed
+    return
+  fi
   if [ "$k2" != "${P_KEY[$i]}" ]; then echo changed; return; fi
   rec=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${P_KEY[$i]}" "${P_NAME[$i]}" "$(item_of "$i")" "$COMMIT" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ROOT")
   if python3 -c "$PYAPPEND" "$LEDGER_FILE" "$rec" "$LWORK/parts/${P_CI[$i]}.parts" "$LEDGER_PARTS/${P_KEY[$i]}.parts"; then
