@@ -133,8 +133,10 @@
 # of $BLOOMERY_DATA (sha256 per file, cached by stat on the box in ~/.cache/bloomery/sha256-cache.tsv,
 # so a file rewritten with the same bytes keeps its hash; the first fetch hashes everything, later ones
 # only what moved), and the stat of every file in each /models/<name> directory the profiles, the box
-# env or the tree name. The whole manifest is in every key: the data a gate reads is not bounded by
-# its recipe text, so a data change reruns every item — the safe side.
+# env or the tree name. The whole manifest is in every key but its model rows: the data a gate reads
+# is not bounded by its recipe text, so a data change reruns every item — the safe side; a model
+# directory's rows enter only the keys of the items that can open it (a /models literal in the item's
+# files or recipe text, its profile among them, or a /models value in the box env).
 #   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
 # gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
 # one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box
@@ -164,6 +166,8 @@
 #     crates/gpu/src/model/launcher.rs:278, crates/engram/src/prefetch.rs:477 and lib.rs:700,
 #     crates/gpu-gates/src/bin/gate_load_v41.rs:701 and :712);
 #   - a model file's content: model files are keyed by size, mtime, ctime and inode;
+#   - a model directory a gate opens through a path no literal spells (one ~/bloomery-env.sh exports,
+#     one a program builds at run time): its rows reach no item's key;
 #   - a box file that changes during the batch (the manifest is read once, before it): the next batch's
 #     key differs, so the item reruns then;
 #   - a stale binary: the key trusts cargo's freshness check, so a green run of a binary cargo failed
