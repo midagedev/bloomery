@@ -5,11 +5,16 @@ edition = "2024"
 publish = false
 license = "MIT"
 
-# Host only, no dependency: the generation loop and the traits it drives. A target is whatever
-# implements them — the GPU session in `bloomery-app`, a mock in a test — so the loop, the stop
-# rule and the drafts' arithmetic are tested without a card.
+# Host only: the generation loop and the traits it drives, and the schedules' overlap and the
+# layers' store rules. A target or a layer program is whatever implements them — the GPU session in
+# `bloomery-app`, a chain body, a mock in a test — so the loop, the stop rule, the drafts'
+# arithmetic and a walk's order are tested without a card. The one dependency is the model
+# description the store rules read (`bloomery-models`, itself host-only over the GGUF reader).
 [lib]
 name = "runtime"
 
 [lints]
 workspace = true
+
+[dependencies]
+bloomery-models = { path = "../models" }

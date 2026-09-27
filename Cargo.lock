@@ -122,6 +122,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-runtime",
  "cuda-core",
  "cuda-device",
  "cuda-host",
@@ -180,6 +181,7 @@ dependencies = [
  "bloomery-models",
  "bloomery-qdot",
  "bloomery-refset",
+ "bloomery-runtime",
  "bloomery-threads",
  "libc",
  "sha2",
@@ -212,6 +214,9 @@ dependencies = [
 [[package]]
 name = "bloomery-runtime"
 version = "0.1.0"
+dependencies = [
+ "bloomery-models",
+]
 
 [[package]]
 name = "bloomery-sampler"
