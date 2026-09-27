@@ -45,6 +45,19 @@
 #   load-arm     BLOOMERY_AB_LOAD=arm: every arm its own process.
 #   solo         6 4 6@BLOOMERY_AB_LOAD=arm: the marked arm alone, under its own label and ratio.
 #   grouped-dry  the dry run's loads per round and a grouped arm's command line.
+#   fit          BLOOMERY_AB_ORDER=blocks, lcpp:6 lcppfit:6 lcppppfit:4 lcppppfit8:4, one round: the fit
+#                arms are a block of their own (lcppfit), opened by the discard of lcppfit:6 (13 draws, no
+#                --n-cpu-moe to raise); the stub llama-bench sees no -ngl or --n-cpu-moe from them, and
+#                under -fitt -v prints two loads, the last with two overrides; every fit row, the discard's
+#                included, carries the `fit` column read from that last load and echoes its lines, and the
+#                lcpp row carries none. Red on the runner before the fit arms: arm usage, rc 64.
+#   fit-preheat  lcppfit:6 under the default rotate order (preheat on): refused by name, rc 64 — the
+#                preheat does not model the fit's host set.
+#   fit-nobench  a llama-bench whose --help lists no --fit-target: the fit arms refused by name, rc 64.
+#   fit-fail     a llama-bench whose fit fails (common_fit_params' warning) and runs anyway: each fit
+#                arm is a FAIL row naming it, the discard's included, rc 1.
+#   fit-dry      the dry run: a fit arm's command line (the profile's flags less -ngl and --n-cpu-moe,
+#                then -fitt 1024 -v --progress) and what it dropped; the lcpp arm's line as before.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -57,7 +70,7 @@ mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/bin" "$T/dat
 cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
-  "$ROOT/tools/ref/load-groups.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2
@@ -82,17 +95,39 @@ EOF
 # The stub llama-bench: refuses --n-cpu-moe STUB_BENCH_FAIL_K; a pp run (-o json) prints one test with
 # two samples; a decode run prints the markdown row under the engine's label, its model column naming
 # the --n-cpu-moe it ran at. Under --progress it prints mainline's progress lines on stderr (the ik
-# copy refuses the flag, as ik's llama-bench does), the error of a refused K last.
+# copy refuses the flag, as ik's llama-bench does), the error of a refused K last. --help lists
+# --fit-target unless STUB_BENCH_NO_FIT is set; under -fitt it prints common_fit_params' failure warning
+# when STUB_BENCH_FIT_FAIL is set, and under -fitt -v two model loads on stderr, the fit's measuring one
+# and the real one with two expert tensors of blk 1 overridden to the host.
 cat > "$T/bin/bench" << 'EOF'
 #!/usr/bin/env bash
-eng=${0##*/} k='' p='' n='' d='' gp='' json='' prog=''
+eng=${0##*/} k='' p='' n='' d='' gp='' json='' prog='' fitt='' verb=''
 while [ $# -gt 0 ]; do
   case $1 in
     --n-cpu-moe) k=$2; shift ;; -p) p=$2; shift ;; -n) n=$2; shift ;; -d) d=$2; shift ;; -gp) gp=$2; shift ;;
-    -o) json=1; shift ;; --progress) prog=1 ;;
+    -o) json=1; shift ;; --progress) prog=1 ;; -fitt) fitt=$2; shift ;; -v) verb=1 ;;
+    -h | --help)
+      echo "usage: $eng [options]"
+      [ -n "${STUB_BENCH_NO_FIT:-}" ] || echo "  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)"
+      exit 0
+      ;;
   esac
   shift
 done
+if [ -n "$fitt" ]; then
+  [ -z "${STUB_BENCH_FIT_FAIL:-}" ] || echo "common_fit_params: failed to fit params to free device memory: stub" >&2
+  if [ -n "$verb" ]; then
+    for l in "llama_model_loader: loaded meta data with 3 key-value pairs and 6 tensors from stub" \
+      "load_tensors: offloaded 3/3 layers to GPU" "load_tensors:        CUDA0 model buffer size =    12.00 MiB" \
+      "llama_model_loader: loaded meta data with 3 key-value pairs and 6 tensors from stub" \
+      "tensor blk.1.ffn_up_exps.weight (1 MiB q4_K) buffer type overridden to CPU" \
+      "tensor blk.1.ffn_down_exps.weight (1 MiB q4_K) buffer type overridden to CPU" \
+      "load_tensors: offloaded 3/3 layers to GPU" "load_tensors:        CUDA0 model buffer size =    10.00 MiB" \
+      "load_tensors:   CPU_Mapped model buffer size =     2.00 MiB"; do
+      echo "$l" >&2
+    done
+  fi
+fi
 if [ -n "$prog" ] && [ "$eng" = ik-bench ]; then
   echo "error: unknown argument: --progress" >&2
   exit 1
@@ -392,10 +427,71 @@ elif want grouped-dry "$L" 1 '^\[dry\] round 1 loads: \[6 4\] lcpp:6$' &&
   pass grouped-dry
 fi
 
+FIT_ROW='\| fit offloaded 3/3, overridden CPU:2 in blk 1-1 \(blk 1: 2\), buffers CUDA0 10.00 CPU_Mapped 2.00 MiB \|'
+L=$tmp/fit.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks -- lcpp:6 lcppfit:6 lcppppfit:4 lcppppfit8:4
+if [ "$RC" != 0 ]; then
+  fail fit "rc $RC, want 0" "$L"
+elif want fit "$L" 1 "^\[config\] block 2/2 lcppfit: lcppfit:6 lcppppfit:4 lcppppfit8:4; discard lcppfit:6, the most token draws of the block.s arms \(lcppfit:6 13, lcppppfit:4 12, lcppppfit8:4 12\)$" &&
+  want fit "$L" 1 "^\[config\] lcppfit: .*/lcpp-bench flags=-fa on -t 4 -fitt 1024 -v \(llama-bench.s fit places the model; dropped: -ngl 999 --n-cpu-moe 1;" &&
+  want fit "$L" 1 "^DISCARD r0 lcppfit d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000 \(stub\) $FIT_ROW build " &&
+  want fit "$L" 1 "^ROW r1 lcppfit d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000 \(stub\) $FIT_ROW build " &&
+  want fit "$L" 1 "^ROW r1 lcppppfit p=4 n=0 \| tok/s\(pp\) [0-9.]+ @ n=0, prompt 4, A6000 \(stub\) $FIT_ROW cold .* \| ub 512 b 2048 \(llama-bench defaults\) \|" &&
+  want fit "$L" 1 "^ROW r1 lcppppfit8 p=4 n=0 .*$FIT_ROW cold .* \| ub 8 b 2048 \(the arm.s lever\) \|" &&
+  want fit "$L" 1 '^ROW r1 lcpp d=6 ' &&
+  want fit "$L" 0 '^(ROW|DISCARD) r[01] lcpp (d|p)=.*\| fit ' &&
+  want fit "$L" 4 '^    lcpp(pp)?fit8? fit load_tensors: offloaded 3/3 layers to GPU$' &&
+  want fit "$L" 4 '^    lcpp(pp)?fit8? fit load_tensors: +CPU_Mapped model buffer size = +2.00 MiB$' &&
+  want fit "$L" 2 '^    lcppfit table \| stub k= \|' &&
+  want fit "$L" 1 '^mean lcppfit d=6 ' &&
+  want fit "$L" 1 '^failed arms: 0 '; then
+  pass fit
+fi
+
+L=$tmp/fit-preheat.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- lcppfit:6
+if [ "$RC" != 64 ]; then
+  fail fit-preheat "rc $RC, want 64" "$L"
+elif want fit-preheat "$L" 1 "^depth-ds41.sh: arm 'lcppfit:6': its flags carry -fitt, a host set the preheat does not model; set BLOOMERY_PREHEAT=0" &&
+  want fit-preheat "$L" 0 '^(ROW|WARMUP|preheat) '; then
+  pass fit-preheat
+fi
+
+L=$tmp/fit-nobench.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks STUB_BENCH_NO_FIT=1 -- lcpp:6 lcppfit:6
+if [ "$RC" != 64 ]; then
+  fail fit-nobench "rc $RC, want 64" "$L"
+elif want fit-nobench "$L" 1 "^depth-ds41.sh: the lcppfit/lcppppfit arms need llama-bench.s fit: .*/lcpp-bench --help lists no -fitt/--fit-target: this llama-bench has no fit \(tree " &&
+  want fit-nobench "$L" 0 '^(ROW|DISCARD) '; then
+  pass fit-nobench
+fi
+
+L=$tmp/fit-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks STUB_BENCH_FIT_FAIL=1 -- lcppfit:6 lcppppfit:4
+if [ "$RC" != 1 ]; then
+  fail fit-fail "rc $RC, want 1" "$L"
+elif want fit-fail "$L" 2 "^FAIL r[01] lcppfit d=6 rc=0 \| llama-bench.s fit failed, and llama-bench loads without it: common_fit_params: failed to fit params to free device memory: stub" &&
+  want fit-fail "$L" 1 "^FAIL r1 lcppppfit p=4 rc=0 \| llama-bench.s fit failed, " &&
+  want fit-fail "$L" 0 '^(ROW|DISCARD) '; then
+  pass fit-fail
+fi
+
+L=$tmp/fit-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks BLOOMERY_DRY=1 -- lcpp:6 lcppfit:6 lcppppfit:4
+if [ "$RC" != 0 ]; then
+  fail fit-dry "rc $RC, want 0" "$L"
+elif want fit-dry "$L" 1 "^\[dry\] lcppfit:6: timeout --kill-after=10 60 env  [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -fa on -t 4 -fitt 1024 -v --progress   # row label 'tg4 @ d6', measured window from /: generation run 1/1\\\$/, placement: llama-bench.s fit at -fitt 1024 MiB \(dropped: -ngl 999 --n-cpu-moe 1\), -v for the fit column$" &&
+  want fit-dry "$L" 1 "^\[dry\] lcppppfit:4: timeout .*/lcpp-bench -m [^ ]* -p 4 -n 0 -r 2 -o json -fa on -t 4 -fitt 1024 -v --progress   # row label 'pp4', ub 512 b 2048 \(llama-bench defaults\), measured window from /: prompt run 2/2\\\$/, placement: " &&
+  want fit-dry "$L" 1 "^\[dry\] lcpp:6: timeout .*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 999 --n-cpu-moe 1 -fa on -t 4 --progress   # row label 'tg4 @ d6', measured window from /: generation run 1/1\\\$/$" &&
+  want fit-dry "$L" 1 '^\[dry\] block 2/2 lcppfit: lcppfit:6 lcppppfit:4; discard lcppfit:6, '; then
+  pass fit-dry
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
-    "$tmp"/solo.log "$tmp"/grouped-dry.log; do
+    "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done
