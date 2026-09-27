@@ -36,6 +36,7 @@ generate_ds41   ds41_ffn_card_acc                       0          0
 generate_ds41   ds41_ffn_card_acc_8                     0          0
 generate_ds41   ds41_ffn_handoff                        0          0
 generate_ds41   ds41_ffn_handoff_10                     0          0
+generate_ds41   ds41_ffn_handoff_10_cols                0          0
 generate_ds41   ds41_ffn_handoff_8                      0          0
 generate_ds41   ds41_ffn_places                         0          0
 generate_ds41   ds41_ffn_post                           0          0
@@ -93,6 +94,7 @@ generate_ds41   gate_up_swiglu_q3k                      0          0
 generate_ds41   gather_pairs                            0          0
 generate_ds41   gdn_conv_prep                           0          0
 generate_ds41   gdn_delta                               0          0
+generate_ds41   gdn_delta_lanes                         0          0
 generate_ds41   gdn_norm_gate                           0          0
 generate_ds41   gdn_norm_gate_sigmoid                   0          0
 generate_ds41   glm5next_router                         0          0
@@ -209,6 +211,7 @@ gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
 gate_e2e        ds41_ffn_handoff                        0          0
 gate_e2e        ds41_ffn_handoff_10                     0          0
+gate_e2e        ds41_ffn_handoff_10_cols                0          0
 gate_e2e        ds41_ffn_handoff_8                      0          0
 gate_e2e        embed_rows                              0          0
 gate_e2e        embed_rows_q4k                          0          0
@@ -228,6 +231,7 @@ gate_e2e        gate_up_swiglu_q3k                      0          0
 gate_e2e        gather_pairs                            0          0
 gate_e2e        gdn_conv_prep                           0          0
 gate_e2e        gdn_delta                               0          0
+gate_e2e        gdn_delta_lanes                         0          0
 gate_e2e        gdn_norm_gate                           0          0
 gate_e2e        gdn_norm_gate_sigmoid                   0          0
 gate_e2e        gemm_q3k                                0          0
