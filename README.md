@@ -47,13 +47,13 @@ A prompt does not run one decode step per token:
 
 The reference sets the gates read come from the public file: ik_llama.cpp's greedy tokens, the PPL/KLD baseline and the DSpark draft's intermediate dumps were made again from it on 2026-09-27 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#sit10)). A gate refuses by name a set made from another file.
 
-In progress: a timed run on one RTX 3090; faster V4.1 prompts on the CPU side; DeepSeek-V4-Flash-0731.
+In progress: faster V4.1 prompts on the CPU side; DeepSeek-V4-Flash-0731.
 
 As far as we know (2026-09-24), this is the only Rust engine that runs DeepSeek-V4.1-Flash with CPU expert offloading, with the GPU kernels also written in Rust. If you know of another one, please open an issue.
 
 ## Measured numbers
 
-Built for Ampere GPUs (sm_86) and AVX2 CPUs. Every number is a single stream on one RTX A6000 (48 GB, 300 W) in a 32-core AVX2 workstation, instrumentation off, one fresh process per arm, measured under the quiet-machine protocol below. Decode rows generate `n = 96` tokens. Each table comes from one window with its arms alternated, and a ratio is only taken between arms of the same window.
+Built for Ampere GPUs (sm_86) and AVX2 CPUs. Every number is a single stream on one RTX A6000 (48 GB, 300 W), or where a row says so on the workstation's RTX 3090 (24 GB, 250 W), in a 32-core AVX2 workstation, instrumentation off, one fresh process per arm, measured under the quiet-machine protocol below. Decode rows generate `n = 96` tokens. Each table comes from one window with its arms alternated, and a ratio is only taken between arms of the same window.
 
 ### DeepSeek-V4.1-Flash, public `Q3_K_M` — one GPU plus CPU experts
 
@@ -66,7 +66,9 @@ Placement plan (a): every layer and the head on the card, 2,668 routed experts o
 | prose 512 | 44.8 | **51.3** | 1.146 ± 0.014 |
 | code 512 | 43.8 | **50.6** | 1.156 ± 0.062 |
 
-The same placement decodes at 39.6 tok/s after a 4096-token prose prompt (plain; 2026-09-26, [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab)). With the card budget of a 24 GB card, emulated on the A6000 (1,171 card experts), prose 512 decodes at 35.8 tok/s (plain; 2026-09-24, [public-q3km-prose-code-and-budget](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-prose-code-and-budget)).
+**On one RTX 3090** (24 GB, capped at 250 W; placement `gate`: 1,146 routed experts on the card, the rest on the host; hot list), V4.1 decodes at **36.7 tok/s** after the prose 512 prompt and 36.5 after the code 512 prompt (plain, first of two rounds; the second round's rows carried page faults in their timed windows; 2026-09-27, rig-log [e21-3090](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#e21-3090)). The power cap was active for about a third of that window.
+
+On the A6000, the same placement (a) decodes at 39.6 tok/s after a 4096-token prose prompt (plain; 2026-09-26, [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab)). With the card budget of a 24 GB card, emulated on the A6000 (1,171 card experts), prose 512 decodes at 35.8 tok/s (plain; 2026-09-24, [public-q3km-prose-code-and-budget](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-prose-code-and-budget)).
 
 Against llama.cpp's V4.1 pull request ([#28696](https://github.com/ggml-org/llama.cpp/pull/28696) at `5210c7c`, `--n-cpu-moe 33`), in one window with three rounds: on synthetic prompt ids at depth 6, with no hot list, bloomery decodes at 29.7 tok/s and llama.cpp at 21.5, 1.38 ± 0.19. llama.cpp's first round read 11 % below its other two, which is most of that interval (rig-log [2026-09-25, launch-thread-lever-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#launch-thread-lever-ab)).
 
@@ -104,7 +106,7 @@ At 4096 tokens bloomery is 1.358 ± 0.002× llama.cpp with `-ub 4096` and 1.187 
 
 - **Rows are plain decoding unless they say DSpark.** The DSpark rows use two cards: the model on the A6000 and the draft on the RTX 3090.
 - **The mistral.rs columns are its recommended build** (`flash-attn` on, as upstream's release builds and install script build it on Ampere). The prefill rows we published before 2026-09-26, 3,460 and 1,317 tok/s, came from a build without `flash-attn`, whose prompt attention took the eager P × P path ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)).
-- **The card is an A6000.** The 24 GB row emulates a 3090's budget on the A6000; a run on a real 3090 has not been timed.
+- **The card is an A6000 unless a row says RTX 3090.** The 24 GB row emulates a 3090's budget on the A6000; the RTX 3090 rows ran on the real card.
 - **The V4.1 hot list was built from routing traces of the same corpora** the prose and code prompts come from, so those rows are its favorable case. With synthetic prompt ids, whose output collapses into a few repeating tokens, the same placement decoded at 34.7 tok/s at depth 6 and 32.3 at depth 4096 (2026-09-24).
 - **Synthetic and prose prompts do not share a table row.** Random ids route to different experts than text does, and the prose rows run with the hot list.
 
