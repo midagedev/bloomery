@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh and tools/bloomery, and a copy of
-# lease.sh whose lease_take is replaced by a line that takes nothing; ref-paths.sh there is a stub
+# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh,
+# cold-blocks.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a line that
+# takes nothing; ref-paths.sh there is a stub
 # profile whose engines are stub scripts (llama-bench, generate_ds41, nvidia-smi) and whose MODEL is
 # gguf-ranges.py's two-shard fixture. Nothing it starts loads a model or touches a card.
 #
@@ -70,7 +71,7 @@ mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/bin" "$T/dat
 cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
-  "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2

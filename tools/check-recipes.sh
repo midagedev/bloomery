@@ -153,6 +153,14 @@ if ! lf=$(bash "$(dirname "$0")/ref/lcpp-fit.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${lf##*$'\n'}"
+# cold-blocks.sh is the depth runners' cold tag and engine-block planner: its bound, its flag rewrite, its
+# order refusal and its block plan on fixed arms are tested here, no box.
+if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
+  echo "$cb" >&2
+  echo "check-recipes: the cold-blocks self-test failed" >&2
+  exit 1
+fi
+echo "${cb##*$'\n'}"
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then

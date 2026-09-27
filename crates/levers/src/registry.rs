@@ -885,9 +885,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     ),
     runner(
         "BLOOMERY_AB_ORDER",
-        Some("ref/depth-ds41.sh"),
-        "`tools/ref/depth-ds41.sh`: `rotate` (unset) runs every arm once a round in rotated \
-         order; `blocks` runs each engine's arms together after one discarded process.",
+        Some("ref/cold-blocks.sh"),
+        "`tools/ref/depth-ds41.sh` and `depth-qwen3moe.sh` (through `cold-blocks.sh`): `rotate` \
+         (unset) runs every arm once a round in rotated order; `blocks` runs each engine's arms \
+         together after one discarded process.",
     ),
     runner(
         "BLOOMERY_AB_LOAD",
@@ -904,8 +905,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_AB_WARMUP",
         Some("ref/depth-ds41.sh"),
-        "`tools/ref/depth-ds41.sh`: `0` skips the discarded run of the first arm before \
-         round 1.",
+        "`tools/ref/depth-ds41.sh` and `depth-qwen3moe.sh`: `1` runs the first arm once, \
+         discarded, before round 1 under `rotate`, and is the blocks' discards under `blocks`; \
+         `0` skips them. Unset is `1` in `depth-ds41.sh`; in `depth-qwen3moe.sh` it is `0` under \
+         `rotate` and `1` under `blocks`.",
     ),
     runner(
         "BLOOMERY_ARM_BOUND",
