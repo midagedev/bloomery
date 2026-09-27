@@ -179,8 +179,9 @@
 #
 # Qwen3.6-35B-A3B runs under the qwen35moe profile (`just depth-gpu-qwen35moe`, BLOOMERY_MODEL=qwen35moe)
 # with the same arms, command lines and tables: generate_qwen3moe reads the architecture from the file's
-# header. What differs is the ours arm's prefill: Qwen3.6 has no ubatch path, so its D fed ids run in
-# passes of up to 8 positions (`kind=prefill`, `plan=pass:8x<k>`), and its pp_tok/s is that path's. The
+# header. What differs is the ours arm's prefill: Qwen3.6 runs its prompt through `prefill_with` as qwen3moe
+# does (`--prefill auto|gemm`: `kind=gemm`, `plan=ubatch:<U>…`; `pass` keeps the 8-position passes), so its
+# pp_tok/s is the ubatch path's. The
 # profile's reference trees and flags are its own (models/qwen35moe.sh).
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,

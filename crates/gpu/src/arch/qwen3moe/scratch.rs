@@ -14,7 +14,8 @@
 //! position ([`RopeRows`]) and appends it there, and the flash reads its
 //! live key count.
 
-use super::router::{RouterDims, RouterOut};
+use super::router::{MAX_TOKENS, RouterDims, RouterOut};
+use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::linear::{self, LinearShape};
@@ -262,16 +263,19 @@ impl KvPlanes {
 
 /// The arena, in chain order: every intermediate of one layer for up to
 /// `rows` tokens, token-major, shared by all layers (they run in turn). The
-/// decode step's arena has one row, the prompt prefill's
-/// [`super::router::MAX_TOKENS`]; a pass of `m <= rows` tokens uses the
-/// first `m` rows and the `m`-column activations.
+/// decode step's arena has one row, a pass's [`GEMV_COLS`], a prompt's up to
+/// its ubatch size; a unit of `m <= rows` tokens uses the first `m` rows.
+/// What only an op's gemv arm reads — the `m`-column activations, the flash
+/// pass's partials, a Q6_K projection's row-major copy, the row windows — is
+/// cut for at most [`GEMV_COLS`] rows; past that the ops run their wide arm
+/// over the arena's [`Wide`] part.
 pub(super) struct Arena {
     pub(super) dims: Dims,
     pub(super) rows: usize,
     /// The layer's input residual (the embedding rows for layer 0), and its
     /// output: the combine writes the next layer's input here.
     pub(super) x: DeviceBuffer<f32>,
-    /// Row `t` of `x`.
+    /// Row `t` of `x`, for `t` below `min(rows, GEMV_COLS)`.
     pub(super) x_rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
     /// Row `t`'s position and live key count, which the embedding launch
     /// writes: the rope turns by the table's row `pos[t]` and appends there,
@@ -322,6 +326,8 @@ pub(super) struct Arena {
     pub(super) down: DeviceBuffer<f32>,
     /// A delta layer's intermediates; `None` when the chain has none.
     pub(super) gdn: Option<GdnArena>,
+    /// What the ops' wide arm reads; `Some` iff `rows > GEMV_COLS`.
+    pub(super) wide: Option<Wide>,
 }
 
 /// Where a router launch leaves its results: the plain router's `k` slots a
@@ -389,8 +395,8 @@ pub(super) struct GdnArena {
     pub(super) from_z: ManuallyDrop<DeviceBuffer<f32>>,
     pub(super) from_b: ManuallyDrop<DeviceBuffer<f32>>,
     /// A Q6_K q·k·v projection's output at more than one token, row-major
-    /// as `q6k_gemv` writes it; a copy puts it into `x` token-major. `None`
-    /// on a one-row arena.
+    /// as `q6k_gemv` writes it, for at most [`GEMV_COLS`] tokens; a copy
+    /// puts it into `x` token-major. `None` on a one-row arena.
     pub(super) x_cols: Option<DeviceBuffer<f32>>,
     /// The conv's output `[rows][C]` (q normed and scaled, k normed, v),
     /// β and decay `[rows][n_v]`, the delta output `[rows][n_v][128]`.
@@ -432,7 +438,7 @@ impl GdnArena {
             a,
             from_z,
             from_b,
-            x_cols: (rows > 1).then(|| f(rows * c)).transpose()?,
+            x_cols: (rows > 1).then(|| f(rows.min(GEMV_COLS) * c)).transpose()?,
             conv: f(rows * c)?,
             beta: f(rows * nv)?,
             decay: f(rows * nv)?,
@@ -659,37 +665,43 @@ pub(super) unsafe fn f32_view(
 }
 
 impl Arena {
-    /// Allocate the arena for `d` and up to `rows` tokens. Load-time only.
+    /// Allocate the arena for `d` and up to `rows` tokens: `wide::arena_bytes`
+    /// device bytes. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: Dims, rows: usize) -> Result<Arena, GpuError> {
         let (q_len, kv_len, attn_len) = (d.q_rows, d.kv_len(), d.attn_len());
         let gated = q_len != attn_len;
+        let narrow = rows.min(GEMV_COLS);
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let acts = |k: usize| {
-            (1..=rows)
+            (1..=narrow)
                 .map(|m| Q8Act::with_k(stream, m, k))
                 .collect::<Result<Vec<_>, _>>()
         };
         let x = f(rows * d.hidden)?;
         let qkv = f(rows * (q_len + 2 * kv_len))?;
-        let bufs = RouterOut::with_tokens(stream, d.router, rows)?;
+        let bufs = if rows > MAX_TOKENS {
+            RouterOut::for_ubatch(stream, d.router, rows)?
+        } else {
+            RouterOut::with_tokens(stream, d.router, rows)?
+        };
         let route = if d.router.gated() {
             Route::Gated(bufs)
         } else {
             Route::Plain(bufs)
         };
         let part_v = if d.head == HEAD_256 {
-            partials_v_len_256(rows, d.n_head, d.ctx)
+            partials_v_len_256(narrow, d.n_head, d.ctx)
         } else {
-            partials_v_len(rows, d.n_head, d.ctx)
+            partials_v_len(narrow, d.n_head, d.ctx)
         };
-        // SAFETY: every window below lies inside its parent — row `t < rows`
-        // of `x` (`hidden` values), and the three blocks that tile `qkv`
+        // SAFETY: every window below lies inside its parent — row `t <
+        // narrow <= rows` of `x` (`hidden` values), and the three blocks that tile `qkv`
         // (`rows · (q_len + 2·kv_len)`) — and each parent moves into the
         // arena beside its windows (a move of the handle, not of the
         // allocation), where it outlives them.
         let (x_rows, q, k, v) = unsafe {
             (
-                (0..rows)
+                (0..narrow)
                     .map(|t| f32_view(&x, t * d.hidden, d.hidden))
                     .collect(),
                 f32_view(&qkv, 0, rows * q_len),
@@ -709,16 +721,16 @@ impl Arena {
             k,
             v,
             q_out: gated.then(|| f(rows * attn_len)).transpose()?,
-            v_cols: (rows > 1).then(|| f(rows * kv_len)).transpose()?,
+            v_cols: (rows > 1).then(|| f(narrow * kv_len)).transpose()?,
             part_v: f(part_v)?,
-            part_ms: f(partials_ms_len(rows, d.n_head, d.ctx))?,
+            part_ms: f(partials_ms_len(narrow, d.n_head, d.ctx))?,
             attn: f(rows * attn_len)?,
             act_attn: acts(attn_len)?,
             ffn_inp: f(rows * d.hidden)?,
             act_ffn: acts(d.hidden)?,
             route,
             h: f(rows * d.slots() * d.ff)?,
-            act_h: (1..=rows)
+            act_h: (1..=narrow)
                 .map(|m| Q8Act::with_slots(stream, m * d.slots(), d.ff))
                 .collect::<Result<Vec<_>, _>>()?,
             down: f(rows * d.slots() * d.hidden)?,
@@ -726,9 +738,26 @@ impl Arena {
                 .lin
                 .map(|shape| GdnArena::new(stream, shape, rows))
                 .transpose()?,
+            wide: (rows > GEMV_COLS)
+                .then(|| Wide::new(stream, &d, rows))
+                .transpose()?,
             dims: d,
             rows,
         })
+    }
+
+    /// `m − 1`, the index of the `m`-column activations a gemv arm of `m`
+    /// rows reads, or a named refusal when the arena holds none of `m`
+    /// columns (`m` past `min(rows, GEMV_COLS)`, or 0).
+    pub(super) fn col(&self, m: usize) -> Result<usize, GpuError> {
+        let n = self.act_x.len();
+        if m == 0 || m > n {
+            return Err(GpuError::shape(
+                "qwen3moe::Arena::col",
+                format!("a gemv arm of {m} rows; the arena's activations hold 1..={n} columns"),
+            ));
+        }
+        Ok(m - 1)
     }
 
     /// Where the key and value blocks start in `qkv`.
@@ -763,6 +792,7 @@ impl Arena {
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.q_out.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.gdn.as_ref().map_or(0, GdnArena::bytes)
+            + self.wide.as_ref().map_or(0, Wide::bytes)
             + self.route.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }

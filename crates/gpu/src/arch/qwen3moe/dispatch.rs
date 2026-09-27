@@ -6,7 +6,10 @@
 //! [`LayerPlan`] picks its mixer — attention over K/V planes, or the delta
 //! rule over a recurrent store ([`super::delta`]) — and whether its experts
 //! carry a folded shared expert. Which kernel an op launches follows from
-//! `m` and the plan inside the op. At one row the FFN norm is folded into
+//! `m` and the plan inside the op: past [`GEMV_COLS`] rows its first line
+//! hands the unit to its wide arm (`wide`: the grouped GEMM, the prefill
+//! flash, the router's two launches), and a unit's embedding is followed by
+//! its dense route table. At one row the FFN norm is folded into
 //! the router's launch, which writes the bytes of the pair it replaces, so a
 //! one-row pass and a multi-row one leave the same state. The q8_1 of the
 //! attention rows and of the SwiGLU rows stay launches of their own: folded
@@ -21,6 +24,7 @@ use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, KvPlanes, StoreMut};
+use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::GqaArgs;
 use crate::gated_quant::GateLayout;
@@ -239,17 +243,25 @@ pub(super) fn enqueue_pass(
 ///   every token's slots, and the combine — 5 or 6.
 ///
 /// So a qwen3moe layer is 12 or 13 launches at one row and 13 or 15 at
-/// every `m` from two on.
+/// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
+/// embedding is followed by the unit's dense route table, and a layer is
+/// its mixer — the gated attention's norm, quantizer, three GEMMs, rope,
+/// prefill flash, gated quantizer, output GEMM and residual add, 10; the
+/// delta rule's 12 ([`delta::launches`]) — and the FFN's norm, quantizer,
+/// router logits and routing, route table, gate, up, SwiGLU quantizer, down
+/// and combine, 10.
 pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
+    let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
     let per_layer = |p: &LayerPlan| {
         let mixer = match &p.mixer {
+            MixerPlan::Gqa(_) if wide => 10,
             MixerPlan::Gqa(g) => 7 + usize::from(g.v_ty == Kq::Q6K) * (1 + many),
             MixerPlan::Delta(d) => delta::launches(d, m),
         };
-        mixer + 5 + many
+        mixer + if wide { 10 } else { 5 + many }
     };
-    1 + plans.iter().map(per_layer).sum::<usize>()
+    1 + usize::from(wide) + plans.iter().map(per_layer).sum::<usize>()
 }
 
 /// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, the output residual
@@ -296,6 +308,9 @@ pub(super) fn layer(
 ) -> Result<(), GpuError> {
     if embed {
         embed_rows(c.gpu, c.w, io, s)?;
+        if m > GEMV_COLS {
+            wide::route_dense(c, s, m)?;
+        }
     }
     match (&c.p.mixer, st) {
         (MixerPlan::Gqa(g), StoreMut::Kv(kv)) => attention(c, g, kv, s, m)?,
@@ -352,10 +367,13 @@ fn attention(
     s: &mut Arena,
     m: usize,
 ) -> Result<(), GpuError> {
+    if m > GEMV_COLS {
+        return wide::attention(c, n, kv, s, m);
+    }
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = s.dims;
-    let i = m - 1;
+    let i = s.col(m)?;
     gpu.fused().enqueue_norm_quant(
         stream,
         &s.x,
@@ -462,6 +480,7 @@ fn gated_256(
     let q35 = k.q35(WHAT)?;
     let stream = gpu.stream();
     let d = s.dims;
+    let i = s.col(m)?;
     let q_out = s
         .q_out
         .as_mut()
@@ -514,7 +533,7 @@ fn gated_256(
             offset: d.head,
             col_stride: d.q_rows,
         },
-        &mut s.act_attn[m - 1],
+        &mut s.act_attn[i],
         m,
         c.sink,
     )
@@ -543,10 +562,13 @@ pub(super) fn ffn(
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::ffn";
+    if m > GEMV_COLS {
+        return wide::ffn(c, n, s, m, out);
+    }
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = s.dims;
-    let i = m - 1;
+    let i = s.col(m)?;
     let router = f32_tensor(w, &n.ffn_gate_inp)?;
     let gain = f32_gain(w, &n.ffn_norm)?;
     match n.shared {

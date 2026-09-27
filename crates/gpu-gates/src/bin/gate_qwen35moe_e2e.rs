@@ -46,6 +46,34 @@
 //!   output within [`FREE_BAND`], the argmax equal to ik's, every delta
 //!   layer's new state within [`RATIO_BAND`] of the input gap; and (t2) each
 //!   layer teacher-forced at one row on its reloaded store, its taps as (f).
+//! - (p′) the ubatch arena's gemv arm: the batch set's five tokens through
+//!   the prompt call (`prefill_with`) from zero stores — on the pass path
+//!   (one unit of five rows) and on the GEMM path (a ubatch of five, which
+//!   is no more than `GEMV_COLS` and so the same walk) — leave (p)'s five
+//!   decode steps' last token, last logits (the last unit's last row
+//!   through the head, `Tail::Last`) and every store bit for bit.
+//! - (u) the wide arm against the gemv arm: the 1,024 prompt ids of the
+//!   step-1,024 set prefilled on the pass path (128 units of eight, bit for
+//!   bit the one-token path) and as one ubatch of 1,024 (the wide arm), each
+//!   from zero stores: layer 0's recurrent state and conv ring within
+//!   [`U_L0_REL`] of the pass run's; every layer's store distance and the
+//!   prefill's last logits printed.
+//! - (d) both prefills against ik's state after its 1,024-token prompt batch
+//!   (the set's `cache_s_lL`, `cache_k_lL`, `cache_v_lL`): each layer's
+//!   store distance from ik's, the ubatch run's over the pass run's, within
+//!   [`PROMPT_RATIO`]; then the step at position 1,024 free-running from each
+//!   run's own state: each layer's output distance from ik's `l_out`, and the
+//!   logits' from ik's `result_output`, the ubatch run's over the pass run's
+//!   within the same ratio; the three argmaxes printed.
+//! - (w) the ubatch size moves no bit: the same 1,024 ids on the GEMM path at
+//!   each size of [`W_SIZES`] (ubatches of 512 x 2; 1,000 and 24; 100 x 10
+//!   and 24), and at [`U_GATE`] in two calls cut at [`W_CUT`], leave the last
+//!   token, the last logits and every store of the one-ubatch run bit for
+//!   bit. Every unit of these runs is wide: a unit of at most `GEMV_COLS`
+//!   rows is the gemv arm, a band away.
+//! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
+//!   with the size and the resident bytes kept; a prompt past the cache is
+//!   refused by name before any launch, the position kept.
 //!
 //! Tap maps (ik → ours). Delta layer: `qkv_mixed` → the q·k·v projection;
 //! `z` → the gate projection; `beta_in`, `alpha` → β's and α's raw
@@ -90,8 +118,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
-        Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Qwen35moeModel, StoreHost,
+        Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, Qwen35moeModel,
+        StoreHost,
     };
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
@@ -105,6 +135,7 @@ mod gate {
     };
     use cuda_core::sys;
     use gguf::Split;
+    use gguf::quant::half_to_f32;
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
@@ -112,6 +143,53 @@ mod gate {
 
     /// Cache rows: the 1,024-token set's step at position 1,024, with room.
     const CTX: usize = 1088;
+
+    /// The ubatch size the gate opens with and every clause but (w) runs at:
+    /// the step-1,024 set's prompt as one ubatch, and an arena of 1,024 rows
+    /// (about 0.36 GB at some 350 KB a row, derived from the arena's
+    /// buffers), which fits a gate lane on either card.
+    const U_GATE: usize = 1024;
+
+    /// (w)'s other ubatch sizes, and where its two-call run cuts the prompt.
+    const W_SIZES: [usize; 3] = [512, 1000, 100];
+    const W_CUT: usize = 24;
+
+    /// PIN(2026-09-27): (u)'s band on layer 0's recurrent state and conv ring
+    /// against the pass run's (`‖ubatch − pass‖ / ‖pass‖`). Layer 0's input is
+    /// the same bits on both paths (the embedding rows; `rms_norm` then the
+    /// GEMM quantizer write the bytes `norm_quant` writes, gate_qwen3moe's
+    /// premise for the same kernels), so only its four projections differ,
+    /// each within its sum's rounding of the exact dot of the same codes:
+    /// about 1.2e-6 of `Σ |terms|` at K = 2,048, some four times a value, so
+    /// Δ ≤ 1e-5 of a row (gate_qwen3moe's GEMM_L0_REL note). The ring holds
+    /// the q·k·v projection's rows (Δ). The state is f32 throughout — no f16
+    /// step turns Δ into an ulp, as the K/V rows' band had to — and each
+    /// token's update is a product of its normed k, its v, β and the decay,
+    /// each carrying Δ, under a map that does not expand (unit k, β and the
+    /// decay at most 1); over 1,024 tokens whose updates partly cancel the
+    /// sum's relative error is a few Δ. Predicted 1e-6 to 3e-5; a wiring
+    /// fault in layer 0 (β read from α's weights, a token's position off)
+    /// reads an error of order one.
+    const U_L0_REL: f64 = 1e-4;
+
+    /// PIN(2026-09-27): (d)'s bound on a layer's distance from ik, the ubatch
+    /// run's over the pass run's — its store (a recurrent state and the conv
+    /// ring's rows ik keeps, or the K and V rows, the larger of the two), its
+    /// step output, and the step's logits. Derivation: past layer 0 the two
+    /// runs' first difference (Δ, [`U_L0_REL`]) grows at every q8_1
+    /// re-quantization by code flips until, within two or three layers, the
+    /// ubatch run is another q8_1 realization of the same rule
+    /// (gate_qwen3moe's GEMM_SPREAD_RATIO note) — statistically the pass
+    /// run's twin against ik, whose own distance is the gap between q8_1 per
+    /// 128 values and ik's q8_2 per 32, composed over the layers. The ratio
+    /// then reads about 1: 1.00 to 1.10 predicted; the prefill flash's f16
+    /// weights are the same class as the decode flash's tensor-core pass.
+    /// Were the two runs' difference independent of the pass run's distance
+    /// from ik and as large, the ratio would be √2 ≈ 1.41, still inside. A
+    /// wiring fault — another layer's weight, a token off by one, a stale
+    /// route row — adds an error of order one to distances of 1e-2 to 0.3, a
+    /// ratio above 3 on every layer it reaches.
+    const PROMPT_RATIO: f64 = 1.5;
 
     /// The file's shape, as the header states it (q35design §1): what the
     /// derivations below are written against.
@@ -317,12 +395,22 @@ mod gate {
             return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
         }
         let t = Instant::now();
-        let m = Qwen35moeModel::open(Gpu::new()?, file, ctx, true)?;
+        let m = Qwen35moeModel::open(
+            Gpu::new()?,
+            file,
+            Open35 {
+                ctx,
+                mma: true,
+                ubatch: U_GATE,
+            },
+        )?;
         println!(
-            "load resident_bytes={} ctx={ctx} layers={} flash_mma={} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={ctx} layers={} flash_mma={} ubatch={} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
             m.layers().len(),
             m.body("gate_qwen35moe_e2e")?.flash_mma(),
+            m.ubatch()?,
             t.elapsed().as_secs_f64()
         );
         Ok(m)
@@ -1293,6 +1381,299 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------- (p′) the ubatch arena's gemv arm
+
+    fn gemv_arm(m: &mut Qwen35moeModel, toks: &[u32], decode: &PathRun) -> Result<bool, GateError> {
+        let (want_tok, want_logits) = decode
+            .tokens
+            .last()
+            .zip(decode.logits.last())
+            .ok_or("no decode run")?;
+        let mut ok = true;
+        for path in [PrefillPath::Pass, PrefillPath::Gemm] {
+            fresh(m)?;
+            let plan = m.prefill_plan(toks.len(), path)?;
+            let tok = m.prefill_with(toks, path)?;
+            let logits = m.logits()?;
+            let got = stores(m)?;
+            let differ: Vec<usize> = (0..got.len())
+                .filter(|&l| !decode.stores.get(l).is_some_and(|w| same_store(&got[l], w)))
+                .collect();
+            let same_logits = bits_equal(&logits, want_logits);
+            let pass = tok == *want_tok
+                && same_logits
+                && differ.is_empty()
+                && got.len() == decode.stores.len();
+            println!(
+                "gemv arm {path:?} plan={plan}: token {tok} vs the fifth step's {want_tok}, last \
+                 logits bit-identical={same_logits}, every store bit-identical (layers differing \
+                 {differ:?}) {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    // ------------------------------------------- (u)/(d) the wide arm
+
+    /// A prompt prefilled from zero stores, and the step after it.
+    struct PromptRun {
+        next: u32,
+        logits: Vec<f32>,
+        stores: Vec<StoreHost>,
+        step_top: u32,
+        step_taps: Vec<Vec<f32>>,
+        step_logits: Vec<f32>,
+    }
+
+    fn prompt_run(
+        m: &mut Qwen35moeModel,
+        prompt: &[u32],
+        path: PrefillPath,
+        token: u32,
+    ) -> Result<PromptRun, GateError> {
+        fresh(m)?;
+        println!(
+            "prompt {path:?}: {} ids, plan={}",
+            prompt.len(),
+            m.prefill_plan(prompt.len(), path)?
+        );
+        let next = m.prefill_with(prompt, path)?;
+        let logits = m.logits()?;
+        let stores = stores(m)?;
+        m.set_layer_taps(true)?;
+        m.set_mode(StepMode::Eager);
+        let step_top = m.step(&[token])?;
+        let step_taps = m.layer_taps()?;
+        let step_logits = m.logits()?;
+        m.set_layer_taps(false)?;
+        m.set_mode(StepMode::Graph);
+        Ok(PromptRun {
+            next,
+            logits,
+            stores,
+            step_top,
+            step_taps,
+            step_logits,
+        })
+    }
+
+    /// The ring slots of the three positions before `p`, the rows ik's conv
+    /// state holds.
+    fn ik_slots(p: usize) -> Vec<usize> {
+        (1..=3).rev().map(|d| (p - d) % RING_ROWS).collect()
+    }
+
+    /// The rows `slots` of a `[RING_ROWS][C]` ring.
+    fn ring_rows(ring: &[f32], slots: &[usize]) -> Vec<f32> {
+        slots
+            .iter()
+            .flat_map(|&s| ring[s * C..(s + 1) * C].to_vec())
+            .collect()
+    }
+
+    /// `(a, b)` of a layer's store against `base`'s, each `rel_to`: the
+    /// recurrent state and the ring's rows `slots`, or the K and the V rows.
+    fn store_rel(ours: &StoreHost, base: &StoreHost, slots: &[usize]) -> (f64, f64) {
+        let f16 = |v: &[u16]| -> Vec<f32> { v.iter().map(|&b| half_to_f32(b)).collect() };
+        match (ours, base) {
+            (StoreHost::Rec { state, ring }, StoreHost::Rec { state: s, ring: r }) => (
+                rel_to(state, s),
+                rel_to(&ring_rows(ring, slots), &ring_rows(r, slots)),
+            ),
+            (StoreHost::Kv { k, v }, StoreHost::Kv { k: kb, v: vb }) => {
+                (rel_to(&f16(k), &f16(kb)), rel_to(&f16(v), &f16(vb)))
+            }
+            _ => (f64::INFINITY, f64::INFINITY),
+        }
+    }
+
+    fn wide_arm(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (p, tail, prompt) = man.step()?;
+        let token = *tail.first().ok_or("the step set holds no token")?;
+        let pu = p as usize;
+        if prompt.len() != pu || m.ubatch()? != U_GATE {
+            return Err(format!(
+                "the step set's prompt is {} ids before position {p}, the model's ubatch {}; \
+                 the clause runs {U_GATE} ids as one ubatch",
+                prompt.len(),
+                m.ubatch()?
+            )
+            .into());
+        }
+        let pass = prompt_run(m, prompt, PrefillPath::Pass, token)?;
+        let ub = prompt_run(m, prompt, PrefillPath::Gemm, token)?;
+        let kinds = m.body("wide_arm")?.kinds();
+        let slots: Vec<usize> = (0..RING_ROWS).collect();
+        // (u)
+        let mut ok = true;
+        for (l, (a, b)) in ub.stores.iter().zip(&pass.stores).enumerate() {
+            let (x, y) = store_rel(a, b, &slots);
+            if l == 0 {
+                let pass0 = kinds[0] == LayerKind35::Delta && worse(x, y) <= U_L0_REL;
+                println!(
+                    "wide layer=0 {:?} state_rel={x:.3e} ring_rel={y:.3e} against the pass run \
+                     (band {U_L0_REL:.0e}) {}",
+                    kinds[0],
+                    verdict(pass0)
+                );
+                ok &= pass0;
+            } else if l % 8 == 0 || l + 1 == ub.stores.len() {
+                println!(
+                    "wide layer={l} {:?} rel={x:.3e} / {y:.3e} (printed)",
+                    kinds[l]
+                );
+            }
+        }
+        println!(
+            "wide prefill: token ours ubatch={} pass={}, last logits_rel={:.3e} (printed)",
+            ub.next,
+            pass.next,
+            rel_to(&ub.logits, &pass.logits)
+        );
+        // (d)
+        let ik_slot = ik_slots(pu);
+        let mut worst = (0.0f64, 0usize);
+        for (l, &kind) in kinds.iter().enumerate() {
+            let ik = prefill_store(&man, kind, l, pu)?;
+            let (ua, ub_) = store_rel(&ub.stores[l], &ik, &ik_slot);
+            let (pa, pb) = store_rel(&pass.stores[l], &ik, &ik_slot);
+            let r = worse(0.0, worse(ua, ub_) / worse(pa, pb).max(f64::MIN_POSITIVE));
+            if r > worst.0 {
+                worst = (r, l);
+            }
+            if l % 8 == 0 || l + 1 == kinds.len() || r > PROMPT_RATIO {
+                println!(
+                    "prompt store layer={l} {kind:?} from ik: ubatch {:.3e} pass {:.3e} ratio \
+                     {r:.2}",
+                    worse(ua, ub_),
+                    worse(pa, pb)
+                );
+            }
+        }
+        let pass_d = worst.0 <= PROMPT_RATIO;
+        println!(
+            "prompt stores: worst ratio {:.2} at layer {} (band {PROMPT_RATIO}) {}",
+            worst.0,
+            worst.1,
+            verdict(pass_d)
+        );
+        ok &= pass_d;
+        let mut worst_out = (0.0f64, 0usize);
+        for (l, (a, b)) in ub.step_taps.iter().zip(&pass.step_taps).enumerate() {
+            let want = tap(&man, &format!("l_out-{l}"))?;
+            let want = last_rows(&want, HIDDEN, 1).ok_or("l_out")?;
+            let r = worse(
+                0.0,
+                rel_to(a, want) / rel_to(b, want).max(f64::MIN_POSITIVE),
+            );
+            if r > worst_out.0 {
+                worst_out = (r, l);
+            }
+        }
+        let ik_logits = tap(&man, "result_output")?;
+        let vocab = m.body("wide_arm")?.vocab();
+        let ik_last = last_rows(&ik_logits, vocab, 1).ok_or("result_output")?;
+        let (lu, lp) = (
+            rel_to(&ub.step_logits, ik_last),
+            rel_to(&pass.step_logits, ik_last),
+        );
+        let r_logits = worse(0.0, lu / lp.max(f64::MIN_POSITIVE));
+        let pass_s = worst_out.0 <= PROMPT_RATIO && r_logits <= PROMPT_RATIO;
+        println!(
+            "prompt step {p}: worst l_out ratio {:.2} at layer {}, logits from ik ubatch {lu:.3e} \
+             pass {lp:.3e} ratio {r_logits:.2} (band {PROMPT_RATIO}); argmax ubatch={} pass={} \
+             ik={} (printed) {}",
+            worst_out.0,
+            worst_out.1,
+            ub.step_top,
+            pass.step_top,
+            argmax(ik_last),
+            verdict(pass_s)
+        );
+        Ok(ok && pass_s)
+    }
+
+    // ------------------------------------------ (w) the ubatch size
+
+    fn ubatch_bits(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prompt) = man.step()?;
+        let run = |m: &mut Qwen35moeModel,
+                   u: usize,
+                   cut: Option<usize>|
+         -> Result<(u32, Vec<f32>, Vec<StoreHost>), GateError> {
+            m.set_ubatch(u)?;
+            fresh(m)?;
+            let next = match cut {
+                None => m.prefill_with(prompt, PrefillPath::Gemm)?,
+                Some(c) => {
+                    m.prefill_with(&prompt[..c], PrefillPath::Gemm)?;
+                    m.prefill_with(&prompt[c..], PrefillPath::Gemm)?
+                }
+            };
+            Ok((next, m.logits()?, stores(m)?))
+        };
+        let (tok0, logits0, stores0) = run(m, U_GATE, None)?;
+        let arms = W_SIZES
+            .iter()
+            .map(|&u| (u, None))
+            .chain(std::iter::once((U_GATE, Some(W_CUT))));
+        let mut ok = true;
+        for (u, cut) in arms {
+            let (tok, logits, st) = run(m, u, cut)?;
+            let differ: Vec<usize> = (0..st.len())
+                .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
+                .collect();
+            let same_logits = bits_equal(&logits, &logits0);
+            let pass = tok == tok0 && same_logits && differ.is_empty();
+            let how = match cut {
+                None => format!("plan={}", m.prefill_plan(prompt.len(), PrefillPath::Gemm)?),
+                Some(c) => format!("two calls of {c} and {} ids", prompt.len() - c),
+            };
+            println!(
+                "ubatch {u} {how}: token {tok} vs {tok0}, last logits bit-identical={same_logits}, \
+                 every store bit-identical (layers differing {differ:?}) {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        m.set_ubatch(U_GATE)?;
+        Ok(ok)
+    }
+
+    // ---------------------------------------------------- (r) refusals
+
+    fn refusals(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+        let (u0, bytes0) = (m.ubatch()?, m.resident_bytes());
+        let mut ok = true;
+        for u in [0, UBATCH + 1] {
+            let e = m.set_ubatch(u).err();
+            let kept = m.ubatch()? == u0 && m.resident_bytes() == bytes0;
+            let pass = e.is_some() && kept;
+            println!(
+                "refuse ubatch {u}: {} (size {u0} and resident bytes kept={kept}) {}",
+                e.map_or("accepted".to_string(), |e| e.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        fresh(m)?;
+        let long = vec![0u32; CTX + 1];
+        let e = m.prefill_with(&long, PrefillPath::Auto).err();
+        let pass = e.is_some() && m.pos() == 0;
+        println!(
+            "refuse a prompt of {} ids on a {CTX}-row cache: {} (position {}) {}",
+            long.len(),
+            e.map_or("accepted".to_string(), |e| e.to_string()),
+            m.pos(),
+            verdict(pass)
+        );
+        Ok(ok && pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -1317,6 +1698,10 @@ mod gate {
         for set in [STEP4, D1K] {
             ok &= step_set(&mut m, set, &gains)?;
         }
+        ok &= gemv_arm(&mut m, &toks, &decode)?;
+        ok &= wide_arm(&mut m)?;
+        ok &= ubatch_bits(&mut m)?;
+        ok &= refusals(&mut m)?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

@@ -24,14 +24,18 @@
 //! The ubatch size is `BLOOMERY_QWEN3_UBATCH` (1..=4096, default 4096), read
 //! at load.
 //!
-//! A qwen35moe file has the pass path only (`Body35` has no GEMM ubatch):
-//! `auto` and `pass` run passes of up to eight positions, each a
-//! `step_rows` of its size — bit for bit its one-token steps — and a pass of
-//! one id a step; `gemm` is refused by name before the load, and so is a
-//! `BLOOMERY_QWEN3_UBATCH` other than its default (it sizes Qwen3's ubatch,
-//! and this file has none). Its `load` line names no `ubatch=`, and its
-//! `stat prompt` line is always `ubatch_tokens=0`. `--prompt` is refused by
-//! the tokenizer (its pre-tokenizer `qwen35` is not one the crate runs).
+//! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
+//! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
+//! layer program over the ubatch arena, eager in either mode — a ubatch of
+//! more than eight ids through each op's wide arm, a pass through its gemv
+//! arm), its ubatch size `BLOOMERY_QWEN3_UBATCH` too, clipped to the cache;
+//! `pass` runs passes of up to eight positions, each a `step_rows` of its
+//! size (in graph mode a replay) — bit for bit its one-token steps — and a
+//! pass of one id a step. Its `load` line names `ubatch=`; its `stat prompt`
+//! line's `ubatch_tokens=` counts the ubatches' ids, and its `image_bytes=`
+//! is the whole prompt's image, which the passes after them read too.
+//! `--prompt` is refused by the tokenizer (its pre-tokenizer `qwen35` is not
+//! one the crate runs).
 //!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
@@ -109,9 +113,9 @@ fn main() -> std::process::ExitCode {
 mod cli {
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, UBATCH, UBATCH_ENV, ubatch_size};
+    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, PrefillPath, PrefillPlan, PrefillStep, Qwen35moeModel,
+        Body, Body35, Open35, PrefillPath, PrefillPlan, PrefillStep, Qwen35moeModel,
     };
     use bloomery_gpu::model::{Instrumented, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
@@ -191,8 +195,9 @@ mod cli {
             ids: &[u32],
             path: PrefillPath,
         ) -> Result<u32, GateError>;
-        /// The last prompt image a ubatch wrote; `None` when none did.
-        fn image(m: &GpuModel<Self>) -> Result<Option<ImageWrite>, GateError>;
+        /// The last prompt image a ubatch of `plan` wrote; `None` when none
+        /// did.
+        fn image(m: &GpuModel<Self>, plan: &PrefillPlan) -> Result<Option<ImageWrite>, GateError>;
     }
 
     impl Prompted for Body {
@@ -212,39 +217,41 @@ mod cli {
             Ok(m.prefill_with(ids, path)?)
         }
 
-        fn image(m: &Qwen3moeModel) -> Result<Option<ImageWrite>, GateError> {
+        fn image(m: &Qwen3moeModel, _: &PrefillPlan) -> Result<Option<ImageWrite>, GateError> {
             Ok(m.ubatch_prologue()?.last)
         }
     }
 
     impl Prompted for Body35 {
-        /// Passes only: `auto` and `pass` are the pass path, `gemm` has no
-        /// body behind it.
+        /// Every path: `pass` the captured passes (`step_rows`), `auto` and
+        /// `gemm` the prompt call.
         fn path(path: PrefillPath) -> Result<PrefillPath, GateError> {
+            Ok(path)
+        }
+
+        fn plan(m: &Qwen35moeModel, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError> {
             match path {
-                PrefillPath::Auto | PrefillPath::Pass => Ok(PrefillPath::Pass),
-                PrefillPath::Gemm => Err("--prefill gemm: a qwen35moe file has no GEMM \
-                                          ubatch prefill (the pass path only: auto or pass)"
-                    .into()),
+                PrefillPath::Pass => Ok(PrefillPlan::new(n, path, NonZeroUsize::MIN)),
+                PrefillPath::Auto | PrefillPath::Gemm => Ok(m.prefill_plan(n, path)?),
             }
         }
 
-        fn plan(_: &Qwen35moeModel, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError> {
-            Ok(PrefillPlan::new(n, Self::path(path)?, NonZeroUsize::MIN))
-        }
-
-        /// Each pass of the plan as one `step_rows` of its size, a pass of
-        /// one id as a step: bit for bit one step per token.
+        /// `pass`: each pass of the plan as one `step_rows` of its size, a
+        /// pass of one id as a step, bit for bit one step per token; `auto`
+        /// and `gemm`: the prompt call.
         fn prefill(
             m: &mut Qwen35moeModel,
             ids: &[u32],
             path: PrefillPath,
         ) -> Result<u32, GateError> {
+            if path != PrefillPath::Pass {
+                return Ok(m.prefill_with(ids, path)?);
+            }
             let plan = Self::plan(m, ids.len(), path)?;
             let (mut at, mut next) = (0usize, None);
             for step in &plan.steps {
                 let PrefillStep::Pass(k) = *step else {
-                    return Err(format!("a qwen35moe prompt plan holds a ubatch ({plan})").into());
+                    return Err(format!("a qwen35moe pass plan holds a ubatch ({plan})").into());
                 };
                 let rows = ids
                     .get(at..at + k)
@@ -255,8 +262,13 @@ mod cli {
             next.ok_or_else(|| "the prompt has no ids".into())
         }
 
-        fn image(_: &Qwen35moeModel) -> Result<Option<ImageWrite>, GateError> {
-            Ok(None)
+        /// The prompt call's image when a ubatch of `plan` ran, its
+        /// `tokens` the ubatches' ids.
+        fn image(m: &Qwen35moeModel, plan: &PrefillPlan) -> Result<Option<ImageWrite>, GateError> {
+            let ub = plan.ubatch_tokens();
+            Ok(m.prompt_image()?
+                .filter(|_| ub > 0)
+                .map(|w| ImageWrite { tokens: ub, ..w }))
         }
     }
 
@@ -340,16 +352,7 @@ mod cli {
         let t = Instant::now();
         let (file, arch) = open_file()?;
         let path = match arch {
-            Arch::Qwen35moe => {
-                let u = ubatch_size()?;
-                if u != UBATCH {
-                    return Err(format!(
-                        "{UBATCH_ENV}={u} sizes Qwen3's GEMM ubatch; a qwen35moe file has none"
-                    )
-                    .into());
-                }
-                Body35::path(path)?
-            }
+            Arch::Qwen35moe => Body35::path(path)?,
             _ => Body::path(path)?,
         };
         let arms: Vec<Arm> = if arm_specs.is_empty() {
@@ -391,10 +394,14 @@ mod cli {
                 );
             }
         }
-        if arch == Arch::Qwen35moe && logits && arms.iter().any(|a| a.n_gen == 1) {
+        if arch == Arch::Qwen35moe
+            && path == PrefillPath::Pass
+            && logits
+            && arms.iter().any(|a| a.n_gen == 1)
+        {
             return Err(
-                "--logits with -n 1 on a qwen35moe file: the prompt's last pass leaves \
-                        its logits in its last row's head, and --logits reads row 0's"
+                "--logits with -n 1 and --prefill pass on a qwen35moe file: the prompt's last \
+                 pass leaves its logits in its last row's head, and --logits reads row 0's"
                     .into(),
             );
         }
@@ -459,17 +466,23 @@ mod cli {
         mode: StepMode,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
-        let mut m = Qwen35moeModel::open(Gpu::new()?, file, ctx, true)?;
+        let o = Open35 {
+            ctx,
+            mma: true,
+            ubatch: ubatch_size()?,
+        };
+        let mut m = Qwen35moeModel::open(Gpu::new()?, file, o)?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
             "load arch=qwen35moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             store_bytes={} in {:.1} s (runtime value)",
+             store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.layers().len(),
             mode_name(mode),
             body.flash_mma(),
             body.store_bytes(),
+            m.ubatch()?,
             t.elapsed().as_secs_f64()
         );
         if mode == StepMode::Graph {
@@ -561,7 +574,7 @@ mod cli {
         let t = Instant::now();
         let mut next = B::prefill(m, ids, run.path)?;
         let prefill_wall = t.elapsed();
-        let image = B::image(m)?;
+        let image = B::image(m, &plan)?;
         println!(
             "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={plan}, {:.2} s, \
              runtime value)",
