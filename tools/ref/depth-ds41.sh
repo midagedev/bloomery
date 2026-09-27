@@ -53,6 +53,25 @@
 #            removed and `-fitt 1024 -v` added, so llama-bench's fit chooses the layers and the
 #            overrides (Fit below). The row carries `fit <what it chose>`; refused before the lease when
 #            the tree's llama-bench has no --fit-target, or when the profile's flags carry a fit option.
+#   lcppsrv:<D>, lcppsrvpp[<U>]:<P>  mainline warm, on our ids: the tree's llama-server (lcpp-warm.sh:
+#            LCPPSRV, else the llama-server beside LCPPBIN) at LCPP_GPU_FLAGS in the server's spellings, one
+#            process a row. After it listens, one POST /completion of the arm's ids is sent and discarded
+#            (the warm-up), then the same request is timed. The ids are the ones ours feeds at that D or P:
+#            lease.sh's lcg_prompt, which --depth feeds. A decode arm asks n_predict N, greedy, and its row
+#            is predicted_per_second (the N - 1 decode steps over their wall); a prompt arm asks n_predict 1
+#            and its row is prompt_per_second (lcpp-warm.sh has both against llama-bench's, and every flag
+#            the server gets that the bench has no word for). <U> is the ubatch lever as for lcpppp<U>. The
+#            row carries `ids=lcg`, the warm-up's rate and fault count, whether the timed continuation is
+#            the warm-up's, prompt_n, build, device, majflt (timed: around the timed request, against W =
+#            its prompt_ms + predicted_ms) and wall. prompt_n other than the ids sent, cache_n other than 0,
+#            predicted_n other than asked, a server that exits or never answers /health inside
+#            BLOOMERY_ARM_BOUND: each a FAIL row. Refused before the lease when the tree has no llama-server,
+#            its --help lacks a flag the arm passes, or LCPP_GPU_FLAGS holds a word lcpp-warm.sh's table
+#            does not translate. No preheat: the warm-up request reads the arm's set in its own process.
+#   lcppsrvfit:<D>, lcppsrvppfit[<U>]:<P>  the same at the server's fit: the lcppfit arms' flags, the
+#            server's `-fit on -fitt 1024 -v`, and their `fit` column.
+#   lcppsrv…:prose:<P>, lcppsrv…:code:<P>  a server arm fed the corpus's first P ids, the ids a prose:<P> or
+#            code:<P> arm feeds: row label `<engine>@prose` (`@code`), `ids=prose`, in that corpus's tables.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`.
@@ -238,7 +257,7 @@
 # BLOOMERY_PREHEAT (above), BLOOMERY_ARM_BOUND (seconds one arm, or one preheat, may run, default
 # 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a shared load's
 # process has that bound per arm and one more for its load, and one that prints nothing for that long
-# is killed), BLOOMERY_AB_LOAD (Loads above), BLOOMERY_AB_WARMUP and BLOOMERY_AB_ORDER (below), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree
+# is killed), BLOOMERY_AB_LOAD (Loads above), BLOOMERY_AB_WARMUP and BLOOMERY_AB_ORDER (below), BLOOMERY_WARM_ROWS (Warm rows), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree
 # lines, the preheat plan, the CPU guard's settings and reading, the warm-up or the blocks' discards,
 # and the order of every round, then exit 0 before the lease: nothing is loaded and nothing is timed).
 #
@@ -260,6 +279,9 @@
 #                -ub moves the compute buffer), so the discard's set covers the others' but for that
 #                layer, and a row's `timed` count shows what it missed
 #   ik           every ik arm, ik, ikpp and ikpp<U>
+#   lcppsrv      every server arm at the hand-set placement, lcppsrv and lcppsrvpp[<U>], whatever its ids;
+#   lcppsrvfit   and at the server's fit. A server block's discard is its arm with the longest prompt, as
+#                an ours block's: each server row has its own warm-up request besides
 # Same-binary lever arms stay interleaved inside their block. Rotation across engines is dropped here:
 # what it guards is the position bias inside a round, 0.3-0.8 % for a round's first arm (AGENTS.md,
 # the ab-decode.sh rotation), while the cross-engine ratios are 1.2-3.2x (our rows in rig-log
@@ -292,6 +314,12 @@
 # Its cost is one row of the arm a block, 22-230 s for the V4.1 rows (the `wall` column of rig-log
 # 2026-09-27's two windows). Under blocks BLOOMERY_AB_WARMUP=1 (the default) is the discards — the first
 # block's discard is the lease's first process, so there is no separate warm-up — and 0 skips them.
+#
+# Warm rows. BLOOMERY_WARM_ROWS=1 takes every counted row warm and names the one that is not
+# (cold-blocks.sh has the rule): a same-id PRIME run of each of our arms right before its row, in its load,
+# and one retry of a row the cold tag marks, printed first as `COLD r<r> …` — a reference arm as a second
+# process, ours as a fresh load of its prime and the arm, a server arm as one more timed request; cold
+# again it is `FAIL … rc=cold`. Off by default: nothing prints differently.
 #
 # Warm-up (under rotate; under blocks, Discard above). The lease's first process reads the model's
 # pages cold — the plan's reads of the file and
@@ -366,7 +394,8 @@ pp_col() {
 # records it echoes, then its row — from its output; into TPS_MEAN, TPS_P50 and DRAFT for the sums.
 # The majflt column and the cold tag come from MAJ_WHOLE and MAJ_TIMED (ours_arm; empty under
 # --parse: no column). An output with no row, or one that ran another placement than PLACE, prints
-# nothing and returns non-zero with FAIL_WHY set.
+# nothing and returns non-zero with FAIL_WHY set; 3 is a warm-rows retry that was cold again, its FAIL row
+# printed.
 ours_row() {
   local kind=$1 label=$2 dep=$3 r=$4 out=$5 wall=$6 h10 t10 uniq_tok win
   ours_parse <<< "$out" || return
@@ -392,6 +421,8 @@ ours_row() {
     win=$(awk -v p="${PP_MS:-0}" -v n="$N" -v m="$MEAN" 'BEGIN { printf "%.4f", (p + n * m) / 1e3 }')
     cold_check "${MAJ_TIMED:-$MAJ_WHOLE}" "$win"
     MAJ_COL=" | majflt $MAJ_WHOLE (timed ${MAJ_TIMED:-? (no fed line)}; ≤ $MAJ_BOUND % of W ${win} s)"
+    # 3: a retry cold again, whose FAIL row cold_verdict printed (cold-blocks.sh).
+    cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 3
   fi
   echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
@@ -417,6 +448,9 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # The fit arms' flags, probe and column (lcppfit, lcppppfit[<U>]).
 # shellcheck source=tools/ref/lcpp-fit.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
+# The server arms' start, requests, flags and stop (lcppsrv…).
+# shellcheck source=tools/ref/lcpp-warm.sh
+source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 [ "$MODEL_NAME" = deepseek41 ] || {
   echo "depth-ds41.sh: the profile is $MODEL_NAME — pick deepseek41 on the Mac side (BLOOMERY_MODEL=deepseek41)" >&2
   exit 64
@@ -433,6 +467,7 @@ case $AB_WARMUP in
   *) echo "depth-ds41.sh: BLOOMERY_AB_WARMUP is 1 (the default: one discarded run of the first arm) or 0, got '$AB_WARMUP'" >&2; exit 64 ;;
 esac
 ab_order depth-ds41.sh
+warm_rows_init depth-ds41.sh
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 case $PLACE in
   a | gate) ;;
@@ -449,12 +484,13 @@ esac
 GGUF_RANGES="${BASH_SOURCE[0]%/*}/gguf-ranges.py"
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
-# ours: an arm runs this tree's generate_ds41; gen: an arm runs a generate_ds41 (ours, corpus or bin).
-ours=0 gen=0 ik=0 lcpp=0 lcppfit=0
-# Per arm, by its index in ARMS: the kind (ours, corpus, ref or bin), the depth, the row label, the
-# reference engine (ref; the corpus name for a corpus arm), the binary (ours, corpus and bin) and the
-# NAME=VALUE list (comma-separated).
-A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=()
+# ours: an arm runs this tree's generate_ds41; gen: an arm runs a generate_ds41 (ours, corpus or bin); srv:
+# a server arm.
+ours=0 gen=0 ik=0 lcpp=0 lcppfit=0 srv=0
+# Per arm, by its index in ARMS: the kind (ours, corpus, ref, srv or bin), the depth, the row label, the
+# reference engine (ref and srv; the corpus name for a corpus arm), the binary (ours, corpus and bin), the
+# NAME=VALUE list (comma-separated) and a server arm's ids (lcg, or the corpus's name).
+A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=() A_IDS=()
 # A corpus arm's prompt, the ids as generate_ds41 --tokens takes them (empty for every other arm).
 A_TOK=()
 # The corpus arms' names: corpus-<name>.ids under $BLOOMERY_DATA/engram, one id per line; each file's
@@ -466,7 +502,7 @@ corpus_file() { echo "${BLOOMERY_DATA:-}/engram/corpus-$1.ids"; }
 pp_eng() { case $1 in ikpp* | lcpppp*) return 0 ;; *) return 1 ;; esac; }
 pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; echo "${u#fit}"; }
 arm_usage() {
-  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, lcppsrv[fit]:[prose:|code:]<D>, lcppsrvpp[fit][<U>]:[prose:|code:]<P> or bin:<path>:<D>" >&2
   exit 64
 }
 # arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
@@ -492,7 +528,24 @@ corpus_check() {
   fi
 }
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' ids=''
+  if srv_eng "$eng"; then
+    kind=srv srv=1 ids=lcg label=$eng
+    case $dep in
+      prose:* | code:*)
+        ids=${dep%%:*} dep=${dep#*:}
+        case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+        corpus_check "$a" "$ids" "$dep"
+        tok=$(head -n "$dep" "$(corpus_file "$ids")" | paste -sd, -)
+        label=$eng@$ids
+        ;;
+    esac
+    case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+    [ "$dep" -ge 1 ] || { echo "depth-ds41.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
+    srv_check_arm "$a" || { echo "depth-ds41.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
+    A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_ENV+=('') A_TOK+=("$tok") A_IDS+=("$ids")
+    continue
+  fi
   case $a in
     prose:* | code:*)
       kind=corpus bin=$BIN label=$eng
@@ -547,7 +600,7 @@ for a in "${ARMS[@]}"; do
       esac
     fi
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok") A_IDS+=("$ids")
 done
 # The load keys (the header's Loads): an ours or corpus arm's binary, placement and variables, the solo
 # marker left out; `|solo` on an arm that runs alone. A reference or bin: arm has none.
@@ -606,6 +659,13 @@ if [ "$lcppfit" = 1 ]; then
   # shellcheck disable=SC2153 # LCPP is the profile's, as below
   lcpp_fit_probe "$LCPPBIN" || { echo "depth-ds41.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
 fi
+# A server arm needs the tree's llama-server, every flag it passes in that server's --help (run with no
+# card), and curl; the server is a reference engine to the CPU guard.
+SRVBIN=
+if [ "$srv" = 1 ]; then
+  srv_preflight depth-ds41.sh
+  CPU_BUSY_COMMS="$CPU_BUSY_COMMS llama-server"
+fi
 if [ -n "$TIMING_CARDS" ]; then
   CARD_NAME=$TIMING_CARDS_NAME
 else
@@ -633,6 +693,9 @@ IK_LINE='' LCPP_LINE='' BIN_LINES=()
 [ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
 [ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
+# The server's launcher is a few KB; what it runs is the tree's libllama-server-impl.so beside it.
+SRV_LINE=
+[ "$srv" = 0 ] || SRV_LINE=$(srv_tree "$(tree_line "$SRVBIN" "$LCPP")")
 for i in "${!ARMS[@]}"; do
   [ "${A_KIND[$i]}" = bin ] || continue
   b=${A_BIN[$i]}
@@ -644,6 +707,7 @@ done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"
+  [ -z "$SRV_LINE" ] || echo "    lcppsrv: $SRV_LINE"
   [ ${#BIN_LINES[@]} -eq 0 ] || printf '    %s\n' "${BIN_LINES[@]}"
 }
 
@@ -766,13 +830,14 @@ ph_bytes() {
 arm_block() {
   case ${A_KIND[$1]} in
     ref) case ${A_ENG[$1]} in ik | ikpp*) echo ik ;; lcppfit | lcppppfit*) echo lcppfit ;; *) echo lcpp ;; esac ;;
+    srv) case ${A_ENG[$1]} in *fit*) echo lcppsrvfit ;; *) echo lcppsrv ;; esac ;;
     ours) echo ours ;;
     corpus) echo "${A_ENG[$1]}" ;;
     *) echo "${A_LABEL[$1]}" ;;
   esac
 }
 # arm_draws <i>: how many token ids arm <i>'s process takes — a reference arm's std::rand() draws, an
-# ours, corpus or bin arm's prompt length.
+# ours, corpus, bin or server arm's prompt length.
 arm_draws() {
   local e=${A_ENG[$1]} d=${A_DEP[$1]}
   if [ "${A_KIND[$1]}" != ref ]; then
@@ -823,7 +888,7 @@ preheat_arm() {
 # start is known.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags markf mark whole fitsrc
+  local eng=$1 dep=$2 r=$3 raw rc=0 val build dev t0 t1 cold errf key f0 f1 win tags markf mark whole fitsrc cnt
   FIT_COL=''
   ref_cmd "$eng" "$dep"
   if pp_eng "$eng"; then key=p=$dep; else key=d=$dep; fi
@@ -879,17 +944,20 @@ $(tail -n 40 "$errf" 2>/dev/null)"
   fi
   # The timed window of one repetition: P / tok/s for a pp row, N / tok/s for a decode row.
   if pp_eng "$eng"; then win=$(awk -v p="$dep" -v v="$val" 'BEGIN { printf "%.4f", p / v }'); else win=$(awk -v n="$N" -v v="$val" 'BEGIN { printf "%.4f", n / v }'); fi
-  whole=$((f1 - f0))
+  whole=$((f1 - f0)) cnt=$((f1 - f0))
   if [ -z "$REF_MARK" ]; then
     cold_check "$whole" "$win"
     MAJ_COL=" | majflt $whole (whole process; ≤ $MAJ_BOUND % of W ${win} s)"
   elif [ -n "$mark" ]; then
+    cnt=$((f1 - mark))
     cold_check "$((f1 - mark))" "$win"
     MAJ_COL=" | majflt $whole (timed $((f1 - mark)); ≤ $MAJ_BOUND % of W ${win} s)"
   else
     cold_check "$whole" "$win"
     MAJ_COL=" | majflt $whole (timed ? (no progress line: the whole process); ≤ $MAJ_BOUND % of W ${win} s)"
   fi
+  # Under the warm rows a tagged first run prints as COLD, a tagged retry as its FAIL row (cold-blocks.sh).
+  cold_verdict "$r" "$eng" "$key" "$cnt" "$win" || return 0
   tags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
   # The reference's own table, header and row: its columns name every setting it ran with that
   # differs from its defaults, so the log shows which flags took.
@@ -917,6 +985,10 @@ $(tail -n 40 "$errf" 2>/dev/null)"
   fi
   count_row
 }
+
+# A server arm's row after its device column (lcpp-warm.sh srv_row), and its CPU guard after the server.
+srv_tail() { echo "$MAJ_COL | wall ${1}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"; }
+srv_after() { guard_cpu "post r$1 $2 $3"; }
 
 # The closing summary's row counts: every ROW line, and those that carried each tag.
 count_row() {
@@ -990,11 +1062,11 @@ ours_post() {
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || SLOT_COL=" | slot $((${a% *} + 1))/${a#* }"
   if [ "$rc" -ne 0 ]; then
-    arm_fail "$r" "$label" "d=$dep" "$rc" "exited $rc" "$out"
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "exited $rc" "$out"
     return 0
   fi
   ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {
-    arm_fail "$r" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
+    [ $? = 3 ] || arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
   }
   counted || return 0
@@ -1024,12 +1096,19 @@ lg_cmd() {
   LG_CMD+=(-n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
 lg_pre() {
+  prime_tag "$1"
   CPU_BUSY_TAG=
   guard_other
   guard_cpu "$(guard_label "$1" "$2")"
   ours_pre "$1" "$2"
 }
-lg_post() { ours_post "$@"; }
+# A COLD row's arm goes on COLD_LIST, its unit's retry (run_unit); a PRIME or COLD row's tag is undone.
+lg_post() {
+  COLD_QUEUED=0
+  ours_post "$@"
+  [ "$COLD_QUEUED" = 0 ] || COLD_LIST+=("$1")
+  [ "$PRIMING" = 0 ] && [ "$COLD_QUEUED" = 0 ] || ROW_TAG=ROW
+}
 # guard_label <index> <round>: the CPU guard's label before arm <index>.
 guard_label() {
   case $ROW_TAG in
@@ -1081,6 +1160,10 @@ ratio_table() {
 # dry_cmd <i>: arm <i>'s command line as the dry run prints it (a reference arm at REF_K when set).
 dry_cmd() {
   local i=$1 dep=${A_DEP[$1]} note='' feedline var
+  if [ "${A_KIND[$i]}" = srv ]; then
+    srv_dry_cmd "$i"
+    return
+  fi
   if [ "${A_KIND[$i]}" = ref ]; then
     ref_cmd "${A_ENG[$i]}" "$dep"
     echo "timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}${REF_MARK:+, measured window from /${REF_MARK}/}${REF_FIT:+, $REF_FIT}"
@@ -1104,20 +1187,65 @@ dry_cmd() {
 # run_unit <round> <index...>: one unit of a round (tools/ref/load-groups.sh): the arms of one load key
 # in one process through the driver, or one reference or bin: arm after the contention guards; into
 # their rows or FAIL rows.
+# Under the warm rows (cold-blocks.sh) a unit of our arms runs each arm after its PRIME in one load, and
+# its COLD rows' arms again in a fresh load, prime and arm; a reference arm's COLD row runs its process
+# again; a server arm retries inside srv_arm.
 run_unit() {
   local r=$1
   shift
+  COLD_QUEUED=0
   if lg_grouped "$1"; then
-    lg_run_unit "$r" "$@"
+    if [ "$WARM_ROWS" = 0 ] || ! counted; then
+      lg_run_unit "$r" "$@"
+      return
+    fi
+    COLD_LIST=()
+    prime_list "$@"
+    lg_run_unit "$r" "${PRIME_LIST[@]}"
+    PRIMING=0
+    [ ${#COLD_LIST[@]} -gt 0 ] || return 0
+    prime_list "${COLD_LIST[@]}"
+    COLD_TRY=1
+    lg_run_unit "$r" "${PRIME_LIST[@]}"
+    COLD_TRY=0 PRIMING=0
     return
   fi
+  unit_guard "$1" "$r"
+  case ${A_KIND[$1]} in
+    ref)
+      ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$r"
+      [ "$COLD_QUEUED" = 1 ] || return 0
+      ROW_TAG=ROW COLD_TRY=1
+      unit_guard "$1" "$r"
+      ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$r"
+      COLD_TRY=0
+      ;;
+    srv) srv_arm "$1" "$r" ;;
+    *)
+      if [ "$WARM_ROWS" = 1 ] && counted; then
+        ROW_TAG=PRIME
+        ours_arm "$1" "$r"
+        ROW_TAG=ROW
+        unit_guard "$1" "$r"
+      fi
+      COLD_QUEUED=0
+      ours_arm "$1" "$r"
+      [ "$COLD_QUEUED" = 1 ] || return 0
+      ROW_TAG=PRIME COLD_TRY=1
+      unit_guard "$1" "$r"
+      ours_arm "$1" "$r"
+      ROW_TAG=ROW
+      unit_guard "$1" "$r"
+      ours_arm "$1" "$r"
+      COLD_TRY=0
+      ;;
+  esac
+}
+# unit_guard <index> <round>: the contention guards before an arm's process.
+unit_guard() {
   CPU_BUSY_TAG=
   guard_other
-  guard_cpu "$(guard_label "$1" "$r")"
-  case ${A_KIND[$1]} in
-    ref) ref_arm "${A_ENG[$1]}" "${A_DEP[$1]}" "$r" ;;
-    *) ours_arm "$1" "$r" ;;
-  esac
+  guard_cpu "$(guard_label "$1" "$2")"
 }
 # run_round <round> <index...>: those arms' units in the round's order.
 run_round() {
@@ -1181,6 +1309,7 @@ if [ -n "$DRY" ]; then
   else
     echo "[dry] preheat: $(preheat_off)"
   fi
+  [ "$WARM_ROWS" = 0 ] || echo "[dry] warm rows: each of our arms after a same-id PRIME in its load; a counted row tagged [cold] prints as COLD and runs once more (cold-blocks.sh)"
   if [ "$ORDER" = rotate ]; then
     if [ "$AB_WARMUP" = 1 ]; then
       echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
@@ -1227,6 +1356,8 @@ if [ "$lcppfit" = 1 ]; then
   echo "[config] lcppfit: $LCPPBIN flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcppfit and lcppppfit get --progress as lcpp and lcpppp do)"
 fi
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
+[ "$srv" = 0 ] || srv_config
+warm_rows_config
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 witness pre
@@ -1251,6 +1382,7 @@ echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
+warm_rows_summary
 # A failed arm drops out at its depth or P (cold-blocks.sh).
 failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
@@ -1270,10 +1402,10 @@ echo "    the ratio of the arm means, and each side's tagged rows ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 # The corpus labels have their own tables: their prompt is not the one ours and the references ran.
 corpus_re=${CORPORA// /|}
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)" | sort -u | tr '\n' ' ')
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)$" | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 6 ours
 for c in $CORPORA; do
-  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep "^$c@" | sort -u | tr '\n' ' ')
+  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "^$c@|@$c$" | sort -u | tr '\n' ' ')
   [ -n "$c_refs" ] || continue
   echo
   echo "=== the $c prompt: $c / each $c@ arm per P, the same statistics ==="
@@ -1295,10 +1427,10 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [cpu-busy], [other-busy] and [cold] ==="
   pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE "^($corpus_re)(@|$)" | sort -u | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)$" | sort -u | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 5 ours
   for c in $CORPORA; do
-    c_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep "^$c@" | sort -u | tr '\n' ' ')
+    c_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E "^$c@|@$c$" | sort -u | tr '\n' ' ')
     [ -n "$c_refs" ] || continue
     echo
     echo "=== the $c prompt's prefill: $c / each $c@ arm per P, the same statistics ==="
