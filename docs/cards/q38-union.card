@@ -1,0 +1,40 @@
+# Round q38hostbench's one box run: the host union's cost per (expert, column) on Qwen3.8's routed
+# stacks (Q4_K gate/up through the column tile, Q5_1 down per column, 3.134 MB experts; five layers
+# with a Q8_0 down, layer 2's gate/up Q5_K), the one term the q38pfd prefill derivation leaves open.
+# Every other term is measured (M2 H2D, a5gemm) or small. It sets flow (a)'s pp512 outright and the
+# split k(U) of flow (c).
+# [derived, q38pfd]: t(m) = max(W, a + c*m), W = 3.134 MB / 121..137 GB/s = 22.9..25.9 us,
+# a = 3.9..5.5 us (V4.1's 28.1 us scaled by expert bytes), c = 3.6..4.6 us (V4.1's 22.98 us
+# scaled by MACs for the tiled gate/up, 1.5..2.3 us for the untiled Q5_1 down).
+# The other arms read beside it, not decided on [derived]: union5:2x16 (32 experts, 1 column each, the
+# 5-dispatch flow like the wider arms) sits on the W branch, 22.9..25.9 us (a + c = 7.5..10.1 is under
+# W); union5:8x128u0.03125 (32 experts, 32 columns each, where the stream split turns: m* = 25..32)
+# 119..153 us; union5:8x320u0.0125 (32 experts, 80 columns each) 293..373 us. So a and c are fit from
+# the 10-, 32- and 80-column points, W from the 1-column point. union5:8x1 is the spec's 1-column
+# point: 8 experts, and 1 row is at most ops::DEFER_MAX_COLS (8), so its call takes the 2-dispatch
+# narrow flow; it reads about W (23..27 us: the narrow flow's two dispatches over 8 experts add under
+# 1 us an expert), and is not the intercept a.
+kind: calibration
+question: what does one Qwen3.8 expert with 10 columns cost the host union at 32 threads?
+term: union5 us per (expert, 10 columns) @ 32 threads, qwen4exp UD-Q4_K_XL, all 48 layers, working
+  set 32 experts a layer, arm union5:8x40u0.1 (32 distinct experts, 10 columns each), page cache warm:
+  the summary line's us_per_expert (mean token ms over 48 layers x 32 experts)
+unit: us
+predict: 40..51
+condition: CPU lease, no card work, one bench process at 32 threads:
+  BLOOMERY_MODEL=qwen4exp BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-union.card'
+  just time-cpu-v41-host --threads 32 --rounds 3 --seconds 30
+  --arms union5:8x1,union5:2x16,union5:8x40u0.1,union5:8x128u0.03125,union5:8x320u0.0125
+  The bench's check passes before any timing (the q5_1 and q8_0 decoder sites, every checked layer's
+  gate, up, swiglu and down within 1e-5, every arm bit-equal to the union shape on every layer), and
+  its check arm lines read cols_drawn=1..1, 1..1, 10..10, 32..32 and 80..80; every time and summary line reads
+  admissible=yes (lease held, the working set resident before and after, majflt 0); the witness blocks
+  show no other CPU load. Box time about 10 minutes [derived: build 1..5 min, start-up and check under
+  1 min, 5 arms x 3 rounds x 10 s timed plus warm-ups about 3 min]
+decide-in: keep the q38pfd tables; the q38stream spec takes k(512) from the derived rule
+decide-below: the host is faster than derived: re-derive k(U) (fewer streamed experts at U = 512;
+  if t(10) <= 30 us, stream nothing at U = 512 and open q38stream for U >= 1024 only)
+decide-above: the Q5_1 down is the likely term: open q38hostq51 (the Q5_1 column tile) before
+  q38stream, and re-derive k(U) with the measured c
+reason: sets a and c for Qwen3.8's expert types and size before the prefill rounds are specced;
+  why now: the q38pfd design's pp512 band and the stream split hang on it
