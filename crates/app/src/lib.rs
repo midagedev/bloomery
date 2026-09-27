@@ -13,7 +13,8 @@
 //! loads by that same plan; [`Loaded::ready`] captures the one-token step and
 //! makes the prompt call's buffers. Between the two a card draft attaches its
 //! taps to the loaded model, since a capture made before them would not write
-//! them. [`Session::with_draft`] then captures the verify pass.
+//! them. [`Session::with_draft`] then captures the verify passes, one a
+//! width its draft may propose.
 //!
 //! What a model adds is its [`Open`], [`Prompt`] and [`Keep`], under
 //! [`arch`]. A body loaded by its own constructor, with no placement plan,
@@ -33,7 +34,7 @@ use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::Kept;
-use runtime::{Draft, Out, Speculative, Target, Verify, Want};
+use runtime::{Draft, Out, Speculative, Target, Verify, Want, Width, Widths, Window};
 
 /// What a session call failed with. Its text is the failure's own: a card
 /// error reads as the card's error.
@@ -492,19 +493,39 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
     }
 }
 
+/// The capture of a verify pass of each width, `log` told of each.
+struct CaptureRows<'a, B: ChainBody, L> {
+    model: &'a mut GpuModel<B>,
+    log: &'a mut L,
+}
+
+impl<B: Rows, L: RowsLog> Width for CaptureRows<'_, B, L> {
+    type Error = SessionError;
+
+    fn run<const R: usize>(&mut self) -> Result<(), SessionError> {
+        self.model.capture_rows::<R>()?;
+        let nodes = self.model.rows_graph_nodes::<R>()?.len();
+        self.log.capture_rows(R, nodes)
+    }
+}
+
 impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
-    /// Drive `draft` on this session: in graph mode its verify pass of `M` =
-    /// [`Draft::WIDTH`] + 1 rows captured now, with the heads it needs, so no
-    /// pass pays for them, and `log` told; in eager mode nothing is captured
-    /// and the first pass makes the heads. A draft that reads the target's
+    /// Drive `draft` on this session: in graph mode a verify pass of every
+    /// width the draft may propose, 2 to `M` = [`Draft::WIDTH`] + 1 rows,
+    /// captured now with the heads it needs, so no pass pays for them, and
+    /// `log` told of each; in eager mode nothing is captured and the first
+    /// pass of each width makes its heads. A draft that reads the target's
     /// hidden rows has attached its taps on the [`Loaded`] model already. `M`
-    /// past the body's [`Rows::MAX_ROWS`], or not the draft's width + 1, does
-    /// not compile.
+    /// past the body's [`Rows::MAX_ROWS`] or a pass's rows, or not the
+    /// draft's width + 1, does not compile.
     pub fn with_draft<D: Draft<Self>, const M: usize>(
         &mut self,
         draft: D,
         log: &mut impl RowsLog,
-    ) -> Result<Speculative<D, M>, SessionError> {
+    ) -> Result<Speculative<D, M>, SessionError>
+    where
+        Window<M>: Widths,
+    {
         let () = D::FITS;
         const {
             assert!(
@@ -514,9 +535,10 @@ impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
         }
         self.idle("with_draft")?;
         if self.model.mode() == StepMode::Graph {
-            self.model.capture_rows::<M>()?;
-            let nodes = self.model.rows_graph_nodes::<M>()?.len();
-            log.capture_rows(M, nodes)?;
+            Window::<M>::each(&mut CaptureRows {
+                model: &mut self.model,
+                log,
+            })?;
         }
         Ok(Speculative::new(draft))
     }

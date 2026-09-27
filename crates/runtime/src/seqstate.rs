@@ -23,8 +23,18 @@
 //! Every outcome is named: [`Kept`] says what a cut keeps and why in a stable
 //! code and a sentence with the positions ([`Why::code`], `Display`), and an
 //! evicted point stays listed so that a miss it caused reads as an eviction.
+//!
+//! A verify pass takes positions back without a checkpoint. Its rows run from
+//! the position the model stands at, and the commit keeps the first `k` of
+//! them, row 0 always. Two rules say what the stores hold after it: [`Lanes`]
+//! for a recurrent state written row by row into lanes, and [`Rewind`] for a
+//! host history of the last tokens. A pass is begun with the position and its
+//! rows and committed with `k`; each refusal is a [`PassError`].
 
 use std::fmt;
+use std::num::NonZeroUsize;
+
+use crate::stores::PASS_ROWS;
 
 /// The host bytes one model's checkpoints may hold unless its load names
 /// another budget: exllamav3's recurrent cache default.
@@ -451,9 +461,589 @@ impl Ledger {
     }
 }
 
+/// A pass a rule refuses, by name. `what` names the rule: `lanes` or
+/// `history`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PassError {
+    /// A pass of `rows` rows over `lanes` lanes: row `lanes` would write the
+    /// lane row 0 wrote, and a pass runs at least one row.
+    LaneRows { rows: usize, lanes: usize },
+    /// The lane a pass reads, or a commit keeps, was never written: no state
+    /// stands in it, not even the zero one.
+    LaneUnwritten { lane: usize, want: u32 },
+    /// The lane stands at another position than the one asked.
+    LaneStale { lane: usize, stands: u32, want: u32 },
+    /// A history pass of `rows` rows: it keeps 1 to `PASS_ROWS`.
+    ReplayRows { rows: usize },
+    /// A commit keeping no row: row 0 is always kept.
+    NoRowKept { what: &'static str },
+    /// A commit keeping more rows than the pass ran.
+    KeptPastRows {
+        what: &'static str,
+        kept: usize,
+        rows: usize,
+    },
+    /// A commit or a rewind with no pass begun.
+    NoPass { what: &'static str },
+    /// A pass begun while the last one waits for its commit.
+    PassOpen {
+        what: &'static str,
+        from: u32,
+        rows: usize,
+    },
+    /// A rewind to before the pass's first position: the history kept nothing
+    /// older than the pass's start.
+    RewindBefore { to: u32, from: u32 },
+    /// A rewind past the pass's last row.
+    RewindPast { to: u32, end: u32 },
+}
+
+impl fmt::Display for PassError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            PassError::LaneRows { rows, lanes } => write!(
+                f,
+                "lanes: a pass of {rows} rows over {lanes} lanes; a pass writes 1 to {lanes} \
+                 rows, one lane each"
+            ),
+            PassError::LaneUnwritten { lane, want } => write!(
+                f,
+                "lanes: lane {lane} was never written, and position {want} is asked of it: an \
+                 unwritten lane is not a zero state"
+            ),
+            PassError::LaneStale { lane, stands, want } => write!(
+                f,
+                "lanes: lane {lane} stands at position {stands}, and position {want} is asked \
+                 of it"
+            ),
+            PassError::ReplayRows { rows } => write!(
+                f,
+                "history: a pass of {rows} rows; a pass keeps 1 to {PASS_ROWS}"
+            ),
+            PassError::NoRowKept { what } => {
+                write!(f, "{what}: a commit of 0 rows; row 0 is always kept")
+            }
+            PassError::KeptPastRows { what, kept, rows } => {
+                write!(f, "{what}: a commit of {kept} rows of a pass of {rows}")
+            }
+            PassError::NoPass { what } => write!(f, "{what}: a commit with no pass begun"),
+            PassError::PassOpen { what, from, rows } => write!(
+                f,
+                "{what}: a pass begun while the pass of {rows} rows from {from} waits for its \
+                 commit"
+            ),
+            PassError::RewindBefore { to, from } => write!(
+                f,
+                "history: a rewind to {to}, before the pass's start {from}: nothing older is kept"
+            ),
+            PassError::RewindPast { to, end } => {
+                write!(f, "history: a rewind to {to}, past the pass's end {end}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PassError {}
+
+/// A pass begun and not yet committed: its first position and its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Open {
+    from: u32,
+    rows: usize,
+}
+
+impl Open {
+    /// Begin a pass of `rows` from `from` in `slot`, refused while one is open.
+    fn begin(
+        slot: &mut Option<Open>,
+        what: &'static str,
+        from: u32,
+        rows: usize,
+    ) -> Result<(), PassError> {
+        if let Some(o) = *slot {
+            return Err(PassError::PassOpen {
+                what,
+                from: o.from,
+                rows: o.rows,
+            });
+        }
+        *slot = Some(Open { from, rows });
+        Ok(())
+    }
+
+    /// The open pass, checked to keep `kept` of its rows (1 to its rows); it
+    /// stays open when refused.
+    fn kept(slot: Option<Open>, what: &'static str, kept: usize) -> Result<Open, PassError> {
+        let o = slot.ok_or(PassError::NoPass { what })?;
+        if kept == 0 {
+            return Err(PassError::NoRowKept { what });
+        }
+        if kept > o.rows {
+            return Err(PassError::KeptPastRows {
+                what,
+                kept,
+                rows: o.rows,
+            });
+        }
+        Ok(o)
+    }
+
+    /// The position `rows` rows past the pass's start.
+    fn at(self, rows: usize) -> u32 {
+        self.from + u32::try_from(rows).expect("a pass's rows are at most PASS_ROWS")
+    }
+}
+
+/// The lane ledger of a recurrent state kept in `L` lanes. A pass from
+/// position `p` reads the current lane `c` and writes row `j`'s state, the
+/// state standing at `p + j + 1`, into lane `(c + j) mod L`; a commit of `k`
+/// rows makes lane `(c + k − 1) mod L` current. No state is copied: the
+/// commit moves the lane word.
+///
+/// Each lane's stamp is the position its state stands at, or none for a
+/// lane never written. A pass reads, and a commit keeps, only a lane whose
+/// stamp is the position asked: a lane never written is refused by name,
+/// never read as a zero state.
+#[derive(Clone, Debug)]
+pub struct Lanes {
+    stamps: Vec<Option<u32>>,
+    current: usize,
+    open: Option<Open>,
+}
+
+impl Lanes {
+    const WHAT: &'static str = "lanes";
+
+    /// `lanes` lanes, none written; lane 0 current.
+    #[must_use]
+    pub fn new(lanes: NonZeroUsize) -> Lanes {
+        Lanes {
+            stamps: vec![None; lanes.get()],
+            current: 0,
+            open: None,
+        }
+    }
+
+    /// The lane count.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.stamps.len()
+    }
+
+    /// The current lane: the lane word a pass reads.
+    #[must_use]
+    pub fn current(&self) -> usize {
+        self.current
+    }
+
+    /// The position lane `lane`'s state stands at; `None` if never written.
+    ///
+    /// # Panics
+    ///
+    /// When `lane` is not one of the ledger's.
+    #[must_use]
+    pub fn stamp(&self, lane: usize) -> Option<u32> {
+        *self
+            .stamps
+            .get(lane)
+            .unwrap_or_else(|| panic!("lane {lane} of a ledger of {} lanes", self.count()))
+    }
+
+    /// The current lane now holds the state at `at`, written in place and
+    /// not by a pass: the zero state at 0 once the caller has zeroed it, or
+    /// a checkpoint copied back. Every other lane holds another branch's
+    /// state and is unwritten from here. Refused while a pass is open.
+    pub fn restored(&mut self, at: u32) -> Result<(), PassError> {
+        self.idle()?;
+        self.stamps.fill(None);
+        self.stamps[self.current] = Some(at);
+        Ok(())
+    }
+
+    /// A call that runs positions `from .. to` in place on the current lane,
+    /// the prompt call's: refused unless the lane stands at `from`.
+    pub fn ran(&mut self, from: u32, to: u32) -> Result<(), PassError> {
+        self.idle()?;
+        self.stands(self.current, from)?;
+        self.stamps[self.current] = Some(to);
+        Ok(())
+    }
+
+    /// Begin a pass of `rows` rows from `from`: refused unless the current
+    /// lane stands at `from` and `rows` is 1 to the lane count. The lane
+    /// word the pass reads is [`Lanes::current`]; row `j` writes lane
+    /// [`Lanes::lane_of`]`(j)` and stands at `from + j + 1`.
+    pub fn begin(&mut self, from: u32, rows: usize) -> Result<(), PassError> {
+        if rows == 0 || rows > self.count() {
+            return Err(PassError::LaneRows {
+                rows,
+                lanes: self.count(),
+            });
+        }
+        self.idle()?;
+        self.stands(self.current, from)?;
+        let o = Open { from, rows };
+        self.open = Some(o);
+        for j in 0..rows {
+            let lane = self.lane_of(j);
+            self.stamps[lane] = Some(o.at(j + 1));
+        }
+        Ok(())
+    }
+
+    /// The lane row `j` of a pass from the current lane writes.
+    #[must_use]
+    pub fn lane_of(&self, j: usize) -> usize {
+        (self.current + j) % self.count()
+    }
+
+    /// Keep the first `kept` rows of the open pass: lane `(c + kept − 1) mod
+    /// L` becomes current, and is returned. Refused with no pass open, for 0
+    /// rows or more than the pass ran, and when that lane does not stand at
+    /// the pass's start plus `kept`.
+    pub fn commit(&mut self, kept: usize) -> Result<usize, PassError> {
+        let o = Open::kept(self.open, Self::WHAT, kept)?;
+        let lane = self.lane_of(kept - 1);
+        self.stands(lane, o.at(kept))?;
+        self.open = None;
+        self.current = lane;
+        Ok(lane)
+    }
+
+    /// Refused while a pass waits for its commit.
+    fn idle(&self) -> Result<(), PassError> {
+        match self.open {
+            Some(o) => Err(PassError::PassOpen {
+                what: Self::WHAT,
+                from: o.from,
+                rows: o.rows,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Refused unless lane `lane` stands at `want`.
+    fn stands(&self, lane: usize, want: u32) -> Result<(), PassError> {
+        match self.stamps[lane] {
+            None => Err(PassError::LaneUnwritten { lane, want }),
+            Some(stands) if stands != want => Err(PassError::LaneStale { lane, stands, want }),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// The rewind of a host history of the last tokens (the PLE hash's), which
+/// a pass moves one push a row. The history before the pass is kept with the
+/// pass's rows; after a commit of `k` rows it is that history with rows `0 ..
+/// k` pushed, standing at the pass's start plus `k` — what `k` steps would
+/// have left. Nothing older than the pass's start is kept.
+#[derive(Clone, Debug)]
+pub struct Rewind<H> {
+    open: Option<Open>,
+    before: Option<H>,
+    rows: [u32; PASS_ROWS],
+}
+
+impl<H> Default for Rewind<H> {
+    fn default() -> Rewind<H> {
+        Rewind {
+            open: None,
+            before: None,
+            rows: [0; PASS_ROWS],
+        }
+    }
+}
+
+impl<H> Rewind<H> {
+    const WHAT: &'static str = "history";
+
+    /// No pass begun.
+    #[must_use]
+    pub fn new() -> Rewind<H> {
+        Rewind::default()
+    }
+
+    /// Begin a pass of `rows` from position `from`, where `before` is the
+    /// history standing. Refused unless `rows` holds 1 to `PASS_ROWS` ids.
+    pub fn begin(&mut self, from: u32, before: H, rows: &[u32]) -> Result<(), PassError> {
+        if rows.is_empty() || rows.len() > PASS_ROWS {
+            return Err(PassError::ReplayRows { rows: rows.len() });
+        }
+        Open::begin(&mut self.open, Self::WHAT, from, rows.len())?;
+        self.rows[..rows.len()].copy_from_slice(rows);
+        self.before = Some(before);
+        Ok(())
+    }
+
+    /// The history standing at `to`, the pass's start to its end: the one
+    /// before the pass with the rows before `to` pushed by `push`, one call
+    /// a row. Ends the pass. Refused with no pass begun and for a `to`
+    /// outside the pass; the pass stays open then.
+    pub fn rewind(&mut self, to: u32, mut push: impl FnMut(&mut H, u32)) -> Result<H, PassError> {
+        let o = self.open.ok_or(PassError::NoPass { what: Self::WHAT })?;
+        if to < o.from {
+            return Err(PassError::RewindBefore { to, from: o.from });
+        }
+        let end = o.at(o.rows);
+        if to > end {
+            return Err(PassError::RewindPast { to, end });
+        }
+        let mut h = self
+            .before
+            .take()
+            .expect("an open pass holds the history before it");
+        self.open = None;
+        for &id in &self.rows[..(to - o.from) as usize] {
+            push(&mut h, id);
+        }
+        Ok(h)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lanes(n: usize) -> Lanes {
+        Lanes::new(NonZeroUsize::new(n).unwrap())
+    }
+
+    /// Four lanes, lane 2 current at position 10: lanes 0 and 1 hold the
+    /// rejected rows of the pass that got there (8 and 9).
+    fn lane_2_at_10() -> Lanes {
+        let mut l = lanes(4);
+        l.restored(0).unwrap();
+        l.ran(0, 7).unwrap();
+        l.begin(7, 3).unwrap();
+        assert_eq!(l.commit(3), Ok(2));
+        l
+    }
+
+    /// The lane table from lane 2 at position 10, every T of 1 to 4 and
+    /// every k of 1 to T: the stamps the pass leaves (row j at 11 + j in lane
+    /// (2 + j) mod 4, the other lanes as they were), the lane the commit
+    /// keeps, and the next pass reading it at 10 + k.
+    #[test]
+    fn lane_table() {
+        let n = None;
+        // (T, k, stamps after the pass, lane kept)
+        let table: [(usize, usize, [Option<u32>; 4], usize); 10] = [
+            (1, 1, [Some(8), Some(9), Some(11), n], 2),
+            (2, 1, [Some(8), Some(9), Some(11), Some(12)], 2),
+            (2, 2, [Some(8), Some(9), Some(11), Some(12)], 3),
+            (3, 1, [Some(13), Some(9), Some(11), Some(12)], 2),
+            (3, 2, [Some(13), Some(9), Some(11), Some(12)], 3),
+            (3, 3, [Some(13), Some(9), Some(11), Some(12)], 0),
+            (4, 1, [Some(13), Some(14), Some(11), Some(12)], 2),
+            (4, 2, [Some(13), Some(14), Some(11), Some(12)], 3),
+            (4, 3, [Some(13), Some(14), Some(11), Some(12)], 0),
+            (4, 4, [Some(13), Some(14), Some(11), Some(12)], 1),
+        ];
+        for (t, k, stamps, lane) in table {
+            let mut l = lane_2_at_10();
+            assert_eq!(l.current(), 2);
+            l.begin(10, t).unwrap();
+            let got: Vec<Option<u32>> = (0..4).map(|i| l.stamp(i)).collect();
+            assert_eq!(got, stamps, "T {t}");
+            assert_eq!(l.commit(k), Ok(lane), "T {t} k {k}");
+            assert_eq!(l.current(), lane);
+            assert_eq!(l.stamp(lane), Some(10 + k as u32));
+            l.begin(10 + k as u32, 1).unwrap();
+            assert_eq!(l.commit(1), Ok(lane), "a one-row pass stays on its lane");
+        }
+    }
+
+    /// The lane count is the caller's: two lanes carry a two-row pass and
+    /// refuse a third row; one lane is a state written in place.
+    #[test]
+    fn lane_count_is_a_parameter() {
+        let mut l = lanes(2);
+        l.restored(0).unwrap();
+        l.begin(0, 2).unwrap();
+        assert_eq!(l.commit(2), Ok(1));
+        l.begin(2, 2).unwrap();
+        assert_eq!(l.commit(1), Ok(1));
+        assert_eq!(
+            l.begin(3, 3),
+            Err(PassError::LaneRows { rows: 3, lanes: 2 })
+        );
+        let mut one = lanes(1);
+        one.restored(0).unwrap();
+        for p in 0..5 {
+            one.begin(p, 1).unwrap();
+            assert_eq!(one.commit(1), Ok(0));
+        }
+        assert_eq!(one.stamp(0), Some(5));
+    }
+
+    /// Every lane refusal by name: a lane never written (a fresh ledger, and
+    /// the lanes a restore drops), a lane at another position, a pass of no
+    /// rows or of more than the lanes, a commit of none, of too many, or
+    /// with no pass, and a pass, a restore or a call begun over an open pass.
+    /// A refused commit leaves the pass open.
+    #[test]
+    fn lane_refusals() {
+        let mut l = lanes(4);
+        assert_eq!(
+            l.begin(0, 1),
+            Err(PassError::LaneUnwritten { lane: 0, want: 0 })
+        );
+        assert_eq!(
+            l.ran(0, 5),
+            Err(PassError::LaneUnwritten { lane: 0, want: 0 })
+        );
+        l.restored(0).unwrap();
+        assert_eq!(
+            l.begin(5, 1),
+            Err(PassError::LaneStale {
+                lane: 0,
+                stands: 0,
+                want: 5
+            })
+        );
+        assert_eq!(
+            l.begin(0, 0),
+            Err(PassError::LaneRows { rows: 0, lanes: 4 })
+        );
+        assert_eq!(
+            l.begin(0, 5),
+            Err(PassError::LaneRows { rows: 5, lanes: 4 })
+        );
+        assert_eq!(l.commit(1), Err(PassError::NoPass { what: "lanes" }));
+        l.begin(0, 3).unwrap();
+        let open = PassError::PassOpen {
+            what: "lanes",
+            from: 0,
+            rows: 3,
+        };
+        assert_eq!(l.begin(0, 1), Err(open.clone()));
+        assert_eq!(l.restored(0), Err(open.clone()));
+        assert_eq!(l.ran(0, 1), Err(open));
+        assert_eq!(l.commit(0), Err(PassError::NoRowKept { what: "lanes" }));
+        assert_eq!(
+            l.commit(4),
+            Err(PassError::KeptPastRows {
+                what: "lanes",
+                kept: 4,
+                rows: 3
+            })
+        );
+        assert_eq!(l.commit(2), Ok(1));
+        // A restore drops the other branch's lanes: lane 2 held row 2.
+        assert_eq!(l.stamp(2), Some(3));
+        l.restored(2).unwrap();
+        assert_eq!((l.stamp(1), l.stamp(2)), (Some(2), None));
+        l.begin(2, 2).unwrap();
+        assert_eq!(l.commit(2), Ok(2));
+        assert_eq!(
+            PassError::LaneUnwritten { lane: 3, want: 7 }.to_string(),
+            "lanes: lane 3 was never written, and position 7 is asked of it: an unwritten lane \
+             is not a zero state"
+        );
+    }
+
+    /// The PLE hash's history as `engram::hash::History` keeps it: the last
+    /// `n − 1` tokens, the sequence's start read as `eos`, and the next
+    /// position; one push a token.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Tail {
+        prev: Vec<u32>,
+        next: u64,
+    }
+
+    const EOS: u32 = 99;
+
+    impl Tail {
+        fn new(n_gram: usize) -> Tail {
+            Tail {
+                prev: vec![EOS; n_gram - 1],
+                next: 0,
+            }
+        }
+
+        fn push(&mut self, t: u32) {
+            self.prev.rotate_left(1);
+            let last = self.prev.len() - 1;
+            self.prev[last] = t;
+            self.next += 1;
+        }
+
+        fn of(n_gram: usize, ids: &[u32]) -> Tail {
+            let mut h = Tail::new(n_gram);
+            for &t in ids {
+                h.push(t);
+            }
+            h
+        }
+    }
+
+    /// After a pass of T rows from p and a commit of k, the history is the
+    /// one k steps would have left — the sequence's tokens through row k − 1,
+    /// standing at p + k — for T of 1 to a pass's rows, every k of 0 to T,
+    /// from near the start (the eos fill) and from past it.
+    #[test]
+    fn rewind_is_the_steps() {
+        let seq: Vec<u32> = (0..40).map(|i| (i * 7 + 3) % 23).collect();
+        for n_gram in [2, 3, 4] {
+            for p in [0usize, 1, 9] {
+                for t in 1..=PASS_ROWS {
+                    let rows = &seq[p..p + t];
+                    for k in 0..=t {
+                        let before = Tail::of(n_gram, &seq[..p]);
+                        let mut r = Rewind::new();
+                        r.begin(p as u32, before.clone(), rows).unwrap();
+                        let got = r.rewind((p + k) as u32, Tail::push).unwrap();
+                        let want = Tail::of(n_gram, &seq[..p + k]);
+                        assert_eq!(got, want, "n {n_gram} p {p} T {t} k {k}");
+                        assert_eq!(got.next, (p + k) as u64);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every rewind refusal by name: a pass of no rows or of more than a
+    /// pass holds, a rewind with no pass, to before the pass's start (nothing
+    /// older is kept) or past its end, and a pass begun over an open one. A
+    /// refused rewind leaves the pass open.
+    #[test]
+    fn rewind_refusals() {
+        let mut r: Rewind<Tail> = Rewind::new();
+        let h = Tail::of(3, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            r.rewind(5, Tail::push),
+            Err(PassError::NoPass { what: "history" })
+        );
+        assert_eq!(
+            r.begin(5, h.clone(), &[]),
+            Err(PassError::ReplayRows { rows: 0 })
+        );
+        let wide = [0u32; PASS_ROWS + 1];
+        assert_eq!(
+            r.begin(5, h.clone(), &wide),
+            Err(PassError::ReplayRows {
+                rows: PASS_ROWS + 1
+            })
+        );
+        r.begin(5, h.clone(), &[6, 7, 8]).unwrap();
+        assert_eq!(
+            r.begin(5, h.clone(), &[6]),
+            Err(PassError::PassOpen {
+                what: "history",
+                from: 5,
+                rows: 3
+            })
+        );
+        assert_eq!(
+            r.rewind(4, Tail::push),
+            Err(PassError::RewindBefore { to: 4, from: 5 })
+        );
+        assert_eq!(
+            r.rewind(9, Tail::push),
+            Err(PassError::RewindPast { to: 9, end: 8 })
+        );
+        assert_eq!(r.rewind(5, Tail::push), Ok(h));
+    }
 
     /// The call's start (when the model holds any position), the multiples
     /// of the spacing strictly inside, and the end.

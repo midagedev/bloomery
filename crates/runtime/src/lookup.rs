@@ -95,13 +95,13 @@ impl<T: Verify> Draft<T> for Lookup {
         Ok(())
     }
 
-    fn propose(&mut self, _t: &T, _last: u32, out: &mut [u32]) -> Result<bool, T::Error> {
+    fn propose(&mut self, _t: &mut T, _last: u32, out: &mut [u32]) -> Result<usize, T::Error> {
         Ok(match Lookup::propose(self) {
             Some(d) => {
                 out[0] = d;
-                true
+                1
             }
-            None => false,
+            None => 0,
         })
     }
 
