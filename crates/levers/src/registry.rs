@@ -1428,4 +1428,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("ref/vision/dump-vision.sh"),
         "Seconds each vision dump run may take.",
     ),
+    runner(
+        "BLOOMERY_WARM_ROWS",
+        Some("ref/cold-blocks.sh"),
+        "`tools/ref/depth-ds41.sh` and `depth-qwen3moe.sh` (through `cold-blocks.sh`): `1` runs \
+         each of our arms once more on the same ids right before its row (a discarded `PRIME` \
+         row) and runs a counted row the cold tag marks once more (`COLD`, then its row or `FAIL \
+         rc=cold`); `0` (unset) runs and prints as before; anything else is refused.",
+    ),
 ];
