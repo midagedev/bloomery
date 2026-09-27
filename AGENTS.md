@@ -41,7 +41,12 @@ The plan lives in `docs/plan.md`. This file is the working contract.
   `ncu-gpu.sh` pin it through `TIMING_GPU`, override with
   `BLOOMERY_TIMING_GPU`, and every witness block opens with the card name and
   power limit). The ik baselines are re-measured there; **3090 numbers from
-  before that date and A6000 numbers never share a table**. The 3090 is the
+  before that date and A6000 numbers never share a table**. One exception
+  (user, 2026-09-28): a model that does not fit one card may carry a second,
+  separate "A6000+3090" table — the reference engine gets the same two cards
+  (`-ts` split) in the same lease, the 3090 stays at its 250 W cap, and the
+  witness blocks check for Xid before and after; it never shares a table with
+  the A6000 rows. The 3090 is the
   gate-and-build card: `tools/box.sh` defaults to it (the box env pin), it is
   capped at 250 W by a systemd oneshot (`gpu-power-limit.service`), and a
   compute process on it does not stop a timing run — the runner records it as

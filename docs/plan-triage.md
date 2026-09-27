@@ -119,13 +119,17 @@
 
 - **Qwen 최신 — 어느 모델부터, 다운로드 둘**(qwennext-lit 09-25, `research/qwennext-lit-report.md`): 추천은 **Qwen3.6-35B-A3B 먼저**(`qwen35moe`, 04-15; 3090에 통째로 들어감 — lmstudio Q4_K_M 21.17 GB + KV 0.67 GB@32k + 상태 + 여유 ≈ 24.2 GB[유도]; 공개 3090 기준 llama.cpp 115.7 tok/s 비투기·pp2048 4,436 → 5,490(PR #29353); 우리 예측 A6000 183–205 tok/s@깊이 6·pp512 ≈ 4,800(청크 GDN 뒤 5,700–5,900)[유도], 3090 환산 219–248 — PR #83의 목표 252는 못 넘을 쪽), 같은 GDN 사슬 뒤에 **Qwen3.8-27B**(`qwen35`, 08-05; 가장 많이 받는 최신 Qwen — unsloth GGUF 6.9M 다운로드 대 35B-A3B 1.3M; 추가 비용 셋: GROUP 6 flash 타일·dense FFN 역할·MTP 링크(공개 비교선이 llama.cpp + MTP 66.4 tok/s, 비투기 41.6); 예측 A6000 27–42[유도, dense gemv 실효 대역이 한 측정으로만 닫힘]). 표면화할 충돌: 사람들이 도는 것은 27B인데 값싼 첫걸음은 35B-A3B다 — **순서는 사용자 결정**. **다운로드 결정**: lmstudio-community `Qwen3.6-35B-A3B-Q4_K_M.gguf`(21.17 GB)와 `Qwen3.8-27B-Q4_K_M.gguf`(16.81 GB) — 둘 다 Q4_K/Q6_K/F32뿐이라 새 형식 공백이 없고(unsloth UD 파일은 Q5_K·Q8_0·IQ 경로가 필요하고 UD-Q3_K_M은 활성 바이트가 Q4_K_M보다 크다), 박스에 없다(`tools/fetch-gguf.sh`). 보류 권장: Qwen3 dense(최신 아님), Qwen3.8-Flash-Next(L+, PLE·QSA 오라클, 111 GB), Coder-Next(IQ4_XS 경로 전체, 파일은 `/models/Qwen3-Coder-Next/…IQ4_XS.gguf`).
 
-- **두 카드 timing**: Qwen3.8을 A6000+3090에 raw로 올리면 T=1 약 102 tok/s, MTP와 함께 168–197이다 [유도, strataread]. AGENTS의 "timed는 A6000만"(3090 Xid 79 이력)과 부딪힌다.
-- **Qwen3.8 tiered requant**: 자주 쓰는 expert는 비트를 올리고 드문 것은 내려 72 GB에 통째로 넣는다(3×3090 공개 23 → 79–92 tok/s + MTP). 대가는 KLD 0.045 → 0.091이다.
-- **K7 선택 폭**: 우리는 풀 전체 + 꼬리(transformers·exllamav3)이고, ik·mainline·Strata는 `top_k + 3` = 2,051칸이다. 오라클에 맞출지 정한다.
-- **Qwen3.8 레버 순서**: strataread가 제안한 raw Q5_1 → MTP → residency → 프리필 규칙.
-- **GLM MTP의 자리**(glmmtp 09-28, `specs/wave-r3/reports/glmmtp.md`): hot list 뒤 k = 1(짝 walk 검증, 비트 동일 = 평문 greedy)이 ×1.08–1.57(중심 1.3), 목록 없이 MTP만이면 llama.cpp #27754 MTP 팔과 동률[유도] — 순서 hot list → MTP k = 1 → 두 카드 plan (b)를 제안한다. strataread는 GLM의 가장 큰 항을 적응형 residency로 본다; 둘을 한 순서로 묶는 판단이 남았다.
+사용자 결정(2026-09-28 아침, "응 그렇게 하자" — 리드 제안 여섯 줄을 그대로 수락):
 
-남은 사용자 결정: **공개 시점**(M1 숫자만 vs M2와 함께) · **down 활성값 q8_K**(위).
+- ~~**두 카드 timing**: Qwen3.8을 A6000+3090에 raw로 올리면 T=1 약 102 tok/s, MTP와 함께 168–197이다 [유도, strataread]. AGENTS의 "timed는 A6000만"(3090 Xid 79 이력)과 부딪힌다.~~ **결정: 허용하되 별도 표.** 주 표는 A6000만 그대로 두고, "A6000+3090" 표를 따로 세운다. 조건 셋: llama.cpp에도 같은 두 카드를 준다(`-ts` 분할, 같은 임대에서 번갈아), 3090은 250 W 상한 그대로, 증인 블록 앞뒤에 Xid 검사. 두 표는 섞지 않는다.
+- ~~**Qwen3.8 tiered requant**: 자주 쓰는 expert는 비트를 올리고 드문 것은 내려 72 GB에 통째로 넣는다(3×3090 공개 23 → 79–92 tok/s + MTP). 대가는 KLD 0.045 → 0.091이다.~~ **결정: 보류.** KLD 두 배는 반올림 규칙이 아니라 모델 품질 손실이고, 파일이 달라져 llama.cpp와 같은 파일 비교가 깨진다. 두 카드 raw 실측을 먼저 보고, 그 뒤에도 필요하면 KLD를 표기한 별도 파일로만 낸다.
+- ~~**K7 선택 폭**: 우리는 풀 전체 + 꼬리(transformers·exllamav3)이고, ik·mainline·Strata는 `top_k + 3` = 2,051칸이다. 오라클에 맞출지 정한다.~~ **결정: `top_k + 3`(mainline과 같게).** 「Performance first, accuracy opt-in」: 좁은 쪽이 싸고 공개 비교선·ik 오라클과 같다. 풀 전체 + 꼬리는 `exact_ref`의 팔로만 남긴다.
+- ~~**Qwen3.8 레버 순서**: strataread가 제안한 raw Q5_1 → MTP → residency → 프리필 규칙.~~ **결정: 배치 프리필 → 두 카드 residency → raw Q5_1 → MTP.** 격차가 pp 쪽(llama.cpp의 약 0.3배)이 decode(약 0.9배)보다 크고 프리필은 헤드라인 축이다. Qwen3.6의 ubatch GEMM 경로 재사용 여부가 첫 라운드의 종이 분해 항목이다.
+- ~~**GLM MTP의 자리**(glmmtp 09-28, `specs/wave-r3/reports/glmmtp.md`): hot list 뒤 k = 1(짝 walk 검증, 비트 동일 = 평문 greedy)이 ×1.08–1.57(중심 1.3), 목록 없이 MTP만이면 llama.cpp #27754 MTP 팔과 동률[유도] — 순서 hot list → MTP k = 1 → 두 카드 plan (b)를 제안한다. strataread는 GLM의 가장 큰 항을 적응형 residency로 본다; 둘을 한 순서로 묶는 판단이 남았다.~~ **결정: DSA 선택기(2,051 한계 해제, 위 `top_k + 3`) → hot list → MTP k = 1 → 두 카드 plan (b) → 적응형 residency.** decode는 이미 #27752보다 앞서고(20.95 대 17.81), 2k 문맥 한계가 실사용과 공개 표 캡션을 막는다. MTP는 03 `deltalanes`가 선행이라 그 사이에 선택기가 먼저 온다.
+- **출시 범위**: 네 모델(V4.1·Qwen3.6·GLM·Qwen3.8) 모두 싣는다. Qwen3.8은 진 숫자 그대로, 캡션에 이유(호스트 전용 경로, 배치 프리필 없음). GLM은 "깊이 ≤ 2k" 캡션, hot 행은 하한.
+- ~~**down 활성값 q8_K**(위)~~ **결정: 위 기본 추천대로** — h3tile(비트 동일)을 먼저 올려 c를 실측하고, 실측이 예측 안이면 q8_K 라운드를 연다.
+
+남은 사용자 결정: **공개 시점**(M1 숫자만 vs M2와 함께).
 
 ## 열린 항목 — 받을 라운드별
 
