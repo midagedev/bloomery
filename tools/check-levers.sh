@@ -220,7 +220,8 @@ FIXTURES = {('tools/recipes.py', FIXTURE), ('tools/ref/card-tests/run.sh', FIXTU
 NAME = re.compile(rb'BLOOMERY_[A-Z0-9_]+')
 given = [os.path.join(root, 'justfile')]
 for top in ('tools', '.cargo'):
-    for dirpath, _, files in os.walk(os.path.join(root, top)):
+    for dirpath, dirs, files in os.walk(os.path.join(root, top)):
+        dirs[:] = [d for d in dirs if d != '__pycache__']  # Python's byte-code cache repeats the sources' names
         given += [os.path.join(dirpath, name) for name in sorted(files)]
 names = set()
 for path in given:
