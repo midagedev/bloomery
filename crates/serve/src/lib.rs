@@ -19,7 +19,9 @@ mod slotfile;
 mod stop;
 pub mod template;
 
-pub use api::{EngineFailure, FATAL_LINGER, ServeError, Server, ServerConfig};
+pub use api::{
+    EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server, ServerConfig,
+};
 pub use engine::{
     Decoder, DeviceProps, DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
     Sampler, SamplerFactory, SamplingParams, SavedState, StateError, Tokenizer,

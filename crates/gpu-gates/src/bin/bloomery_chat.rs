@@ -309,16 +309,10 @@ mod drive {
         let mut text = String::new();
         let mut dec = Decoder::new(tok, true);
         let mut stdout = std::io::stdout().lock();
+        // One row for every token: the head refuses a row of another length.
+        let mut logits = vec![0.0f32; tok.n_vocab()];
         let stop = loop {
-            let logits = g.logits()?;
-            if logits.len() != tok.n_vocab() {
-                return Err(format!(
-                    "the head gives {} logits, the vocabulary has {} tokens",
-                    logits.len(),
-                    tok.n_vocab()
-                )
-                .into());
-            }
+            g.model().logits_into(&mut logits)?;
             let next = sampler.sample(&logits, &history);
             if a.greedy && next != argmax {
                 return Err(format!(

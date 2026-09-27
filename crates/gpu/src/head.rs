@@ -279,6 +279,23 @@ impl Head {
         Ok(self.logits.to_host_vec(gpu.stream())?)
     }
 
+    /// [`Head::logits_to_host`] into `out`, which holds exactly `n_vocab * m`
+    /// f32: a caller reading every token reuses one buffer. Blocking read.
+    pub fn logits_into_host(&self, gpu: &Gpu, out: &mut [f32]) -> Result<(), GpuError> {
+        if out.len() != self.logits.len() {
+            return Err(GpuError::shape(
+                "Head::logits_into_host",
+                format!(
+                    "a buffer of {} f32 for {} logits",
+                    out.len(),
+                    self.logits.len()
+                ),
+            ));
+        }
+        self.logits.copy_to_host(gpu.stream(), out)?;
+        Ok(())
+    }
+
     /// The argmax token of the last run's first row: a blocking read — the
     /// decode step's single synchronize-shaped retrieval. A fault raised by
     /// any launch before the argmax is [`GpuError::Fault`], not a token.
