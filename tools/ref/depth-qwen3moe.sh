@@ -77,7 +77,7 @@
 #             removed and `-fitt 1024 -v` added, so llama-bench's fit chooses the layers and the
 #             overrides (tools/ref/lcpp-fit.sh has what the fit does and where). The row carries `fit
 #             <what it chose>` from -v's loader lines, which are echoed as `lcppfit fit …`; a fit that
-#             failed or never ran ends the runner as a failed arm does. Refused before the lease when
+#             failed or never ran is a FAIL row (Failures below). Refused before the lease when
 #             the tree's llama-bench has no --fit-target, or when the profile's flags carry a fit option.
 #   mrspp:<P> mistral.rs's prefill: mistralrs bench -f <MODEL> --prompt-len P --gen-len 1
 #             --iterations 1 --warmup 1 --max-seq-len C --pa-context-len C+32 $MRS_FLAGS, C = P + 1
@@ -95,7 +95,8 @@
 # load's lines print once under `[load]`, and the timing card's guard runs before each load's process
 # (after that the process holds the card). The grouping, the order (the units and the arms in each
 # rotated by round) and the driver are tools/ref/load-groups.sh's, shared with depth-ds41.sh:
-# BLOOMERY_AB_LOAD=arm runs every arm in a process of its own. A failed arm ends the runner, as before.
+# BLOOMERY_AB_LOAD=arm runs every arm in a process of its own. An arm that fails in a shared load ends
+# that process: the arms after it in the round re-run in a fresh load (Failures below).
 #
 # Flags. The ours, ik and lcpp arms hold every layer, the output head and an f16 K/V cache on the
 # card (llama-bench's -ctk/-ctv default is f16; ours keeps f16 planes), so a step reads the same
@@ -228,10 +229,24 @@
 # holds the arm until it is gone, and after 10 minutes stops the runner with rc 75 and no summary
 # (guard_timing below).
 #
+# Failures (depth-ds41.sh's contract; the FAIL row, the failed list and the drop are cold-blocks.sh's).
+# An arm that exits non-zero, prints no row (no SMOKE line or one without its p50 and mean, no time
+# prompt row from ours, no value from a llama-bench or mistralrs bench), or whose fit failed or never ran
+# (a fit arm) prints `FAIL r<r> <label> d=<D>|p=<P> rc=<rc> | <why or its last line> | full output:
+# <file>` where its row would be, and the runner goes on with the next arm. That label at that depth or
+# P drops out of the means and the ratios (the tables name what they dropped), and the runner ends with
+# `failed arms: …` and exits 1. A warm-up or a block's discard that fails is `FAIL r0 …` and counts in
+# that list; the block's rounds still run. An arm that fails in a load shared with other arms ends that
+# process: the arms after it in the round re-run in a fresh load (tools/ref/load-groups.sh), never on
+# the failed one; a load that fails before its first arm fails every arm of it. A row's rc is the
+# process's (134 an abort, 124/137 the arm bound's timeout), 0 when it exited cleanly with no row.
+#
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 4),
 # BLOOMERY_GEN_WARM (generate_qwen3moe --warm), BLOOMERY_GEN_CTX (above; mrs arms take the same C),
 # BLOOMERY_GEN_BIN (default target/release/generate_qwen3moe), BLOOMERY_ARM_BOUND (seconds one arm
-# may run, default 900: a hung arm fails the runner with rc 124/137 instead of holding the lease),
+# may run, default 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a
+# shared load's process has that bound per arm and one more for its load, and one that prints nothing
+# for that long is killed),
 # BLOOMERY_AB_ORDER and BLOOMERY_AB_WARMUP (above), BLOOMERY_DRY=1 (print each arm's command line,
 # the binaries' tree lines and the rotation, or the blocks and their discards, then exit 0 before the
 # lease: nothing is loaded and nothing is timed).
@@ -272,9 +287,12 @@ DRY=${BLOOMERY_DRY:-}
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
 esac
-# The fault witness, the cold tag, ROW_TAG and the order's blocks: shared with depth-ds41.sh.
+# The fault witness, the cold tag, ROW_TAG, the order's blocks and the FAIL rows: shared with
+# depth-ds41.sh. A failed arm's whole output goes to
+# ${TMPDIR:-/tmp}/depth-qwen3moe-<label>-<d|p><key>-r<round>.log.
 # shellcheck source=tools/ref/cold-blocks.sh
 source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
+ARM_FAIL_STEM=depth-qwen3moe
 ab_order depth-qwen3moe.sh
 AB_WARMUP_DEFAULT=0
 [ "$ORDER" = rotate ] || AB_WARMUP_DEFAULT=1
@@ -539,13 +557,15 @@ ref_val() {
   esac
 }
 
-# One reference arm: its binary on its flags, the row, and the sum. The output passes through
-# majflt_mark on its way into `raw`, so the fault count at the measured window's start is known.
+# One reference arm: its binary on its flags, the row, and the sum; a FAIL row when it exits non-zero,
+# prints no value, or (a fit arm) its fit failed or never ran. The output passes through majflt_mark on
+# its way into `raw`, so the fault count at the measured window's start is known.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 fail f0 f1 markf mark whole win
+  local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 key f0 f1 markf mark whole win
   FIT_COL=''
   ref_cmd "$eng" "$dep"
+  if pp_eng "$eng"; then key=p=$dep; else key=d=$dep; fi
   markf=$(mktemp "${TMPDIR:-/tmp}/depth-qwen3moe-mark.XXXXXX") || exit 2
   witness "pre r$r $eng d=$dep"
   ref_witness
@@ -559,22 +579,15 @@ ref_arm() {
   rm -f "$markf"
   witness "post r$r $eng d=$dep"
   val=$(echo "$raw" | ref_val "$eng" "$REF_LABEL")
-  # A fit arm's loader lines say what the fit chose; a fit that failed or never ran is a failed arm,
+  # A fit arm's loader lines say what the fit chose; a fit that failed or never ran is a FAIL row,
   # whatever llama-bench measured after it.
   if lcpp_fit_eng "$eng" && ! lcpp_fit_col "$raw"; then
-    fail=${TMPDIR:-/tmp}/depth-qwen3moe-$eng-d$dep-r$r.log
-    echo "$raw" > "$fail"
-    echo "r$r $eng d=$dep: $FIT_WHY (rc $rc); full output: $fail" >&2
-    exit 1
+    arm_fail "$r" "$eng" "$key" "$rc" "$FIT_WHY" "$raw"
+    return 0
   fi
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
-    # The whole output goes to a file: the loader's reason for a failed load is many lines
-    # above the tail.
-    fail=${TMPDIR:-/tmp}/depth-qwen3moe-$eng-d$dep-r$r.log
-    echo "$raw" > "$fail"
-    echo "r$r $eng d=$dep produced no '${REF_LABEL% |}' row (rc $rc); full output: $fail" >&2
-    echo "$raw" | tail -n 20 >&2
-    exit 1
+    arm_fail "$r" "$eng" "$key" "$rc" "no '${REF_LABEL% |}' row" "$raw"
+    return 0
   fi
   case $eng in
     mrs | mrspa0 | mrspp)
@@ -639,22 +652,21 @@ parse_pp() {
   sed -nE 's/^time prompt n=([0-9]+) ms=([0-9.]+) tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)( .*)?$/\1 \3 \4 \5 \2/p' | head -n 1
 }
 
-# pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its run's output, into
-# PP_COL, with the parsed P, tok/s and ms in PP_N, PP_TPS and PP_MS for the closing tables and the
-# timed window. A bin arm's base build may print no time prompt row (PP_N empty, the column says so);
-# an ours arm's binary is this tree's, so a missing row stops the runner.
+# pp_col <arm kind> <output>: an ours or bin arm's prefill column from its run's output, into PP_COL,
+# with the parsed P, tok/s and ms in PP_N, PP_TPS and PP_MS for the closing tables and the timed
+# window. A bin arm's base build may print no time prompt row (PP_N empty, the column says so); an ours
+# arm's binary is this tree's, so a missing row fails the arm (1, FAIL_WHY).
 pp_col() {
   local passes kind
-  read -r PP_N PP_TPS passes kind PP_MS <<< "$(echo "$3" | parse_pp)"
+  read -r PP_N PP_TPS passes kind PP_MS <<< "$(echo "$2" | parse_pp)"
   if [ -n "$PP_N" ]; then
     PP_COL=" | pp_tok/s $PP_TPS (n=$PP_N, passes=$passes)"
     [ "$kind" = prefill ] || PP_COL="${PP_COL%)}, kind=$kind)"
   elif [ "$1" = bin ]; then
     PP_COL=" | pp_tok/s ? (the binary prints no time prompt row)"
   else
-    echo "$2 produced no time prompt row" >&2
-    echo "$3" | tail -n 20 >&2
-    exit 1
+    FAIL_WHY="no time prompt row"
+    return 1
   fi
 }
 
@@ -677,7 +689,8 @@ ours_arm() {
 # ours_pre <index> <round>: the witness block before an ours or bin arm.
 ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "$1")"; }
 # ours_post <index> <round> <rc> <output> <wall s>: the witness block after an ours or bin arm, then its
-# row; a failed arm ends the runner. An output that opens with an `arm` line (an --arm list's) gives the
+# row, or its FAIL row when it exited non-zero or printed no row (no SMOKE line, or one without its p50
+# and mean, no time prompt row). An output that opens with an `arm` line (an --arm list's) gives the
 # row its slot in the load. MAJ_WHOLE and MAJ_TIMED are the arm's (the driver's, or ours_arm's).
 ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed
@@ -686,18 +699,21 @@ ours_post() {
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
   if [ "$rc" -ne 0 ]; then
-    echo "r$r $label d=$dep ctx=$ctx FAILED rc=$rc" >&2
-    echo "$out" | tail -n 20 >&2
-    exit 1
+    arm_fail "$r" "$label" "d=$dep" "$rc" "exited $rc" "$out"
+    return 0
   fi
   smoke=$(echo "$out" | grep -E '^SMOKE ')
-  [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
+  [ -n "$smoke" ] || { arm_fail "$r" "$label" "d=$dep" "$rc" "no SMOKE line" "$out"; return 0; }
+  p50=$(echo "$smoke" | sed -n 's/.*p50_ms=\([0-9.]*[0-9]\).*/\1/p' | head -n 1)
+  mean=$(echo "$smoke" | sed -n 's/.*mean_ms=\([0-9.]*[0-9]\).*/\1/p' | head -n 1)
+  if [ -z "$p50" ] || [ -z "$mean" ]; then
+    arm_fail "$r" "$label" "d=$dep" "$rc" "its SMOKE line has no p50_ms or mean_ms" "$out"
+    return 0
+  fi
+  pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$r" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
   # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
   # lines are the arm's configuration, the prefill's time and its host prologue.
   echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt) '
-  pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
-  p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
-  mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
@@ -927,7 +943,7 @@ if [ "$ORDER" = rotate ]; then
     ROW_TAG=WARMUP
     run_unit 0 0
     ROW_TAG=ROW
-    echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP row above)"
+    echo "[warmup] ${ARMS[0]} ran once before round 1 and is discarded (the WARMUP or FAIL r0 row above)"
   fi
   for r in $(seq "$ROUNDS"); do run_round "$r" "${!ARMS[@]}"; done
 else
@@ -936,10 +952,12 @@ fi
 echo
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
+# A failed arm drops out at its depth or P (cold-blocks.sh).
+failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)"
 echo "    — the cross-engine ratio reads these. The p50 column is ours only. ==="
-printf '%s\n' "${sums[@]}" | awk -F'|' '{
+[ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | awk -F'|' '{
   k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
   if ($6 ~ /cold/) c[k]++
   if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
@@ -974,3 +992,4 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
 fi
 witness post
 ref_witness
+failed_end

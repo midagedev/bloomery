@@ -213,7 +213,8 @@
 # `FAIL r<r> <label> d=<D>|p=<P> rc=<rc> | <why or its last line> | full output: <file>` where its
 # row would be, and the runner goes on with the next arm. That label at that depth or P drops out of
 # the means and the ratios (the tables name what they dropped), and the runner ends with `failed arms:
-# …` and exits 1. A warm-up that fails is `FAIL r0 …` and counts in that list. An arm that fails in a
+# …` and exits 1 (cold-blocks.sh's arm_fail, failed_tally and failed_end, depth-qwen3moe.sh's too). A
+# warm-up that fails is `FAIL r0 …` and counts in that list. An arm that fails in a
 # load shared with other arms ends that process: the arms after it in the round re-run in a fresh load
 # (Loads below), never on the failed one.
 #
@@ -775,25 +776,9 @@ preheat_off() {
 # timer starts, or an lcpp arm's progress line of its measured repetition, printed just after that
 # repetition's clock starts.
 
-# The arms that failed: FAILED, one `r<r> <label> <d|p>=<key> rc=<rc>` each, and FAILED_KEYS, the
-# `label|key` pairs of the counted ones, which the tables drop.
-FAILED=() FAILED_KEYS=()
-# arm_fail <round> <label> <d=|p=key> <rc> <why> [<output>]: the FAIL row in place of the arm's row; the
-# output, when there is one, goes whole to a file (a loader's reason is many lines above its tail).
-arm_fail() {
-  local r=$1 label=$2 key=$3 rc=$4 why=$5 out=${6:-} f='' last
-  if [ -n "$out" ]; then
-    f=${TMPDIR:-/tmp}/depth-ds41-${label//[^A-Za-z0-9_.=-]/_}-${key/=/}-r$r.log
-    printf '%s\n' "$out" > "$f"
-    last=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
-    echo "$out" | tail -n 20 >&2
-    [ -z "$last" ] || why="$why; last line: $last"
-  fi
-  echo "FAIL r$r $label $key rc=$rc | $why${f:+ | full output: $f}$CPU_BUSY_TAG$OTHER_BUSY_TAG"
-  FAILED+=("r$r $label $key rc=$rc")
-  counted || return 0
-  FAILED_KEYS+=("$label|${key#*=}")
-}
+# The arms that failed: arm_fail, FAILED and FAILED_KEYS (cold-blocks.sh); an arm's whole output goes to
+# ${TMPDIR:-/tmp}/depth-ds41-<label>-<d|p><key>-r<round>.log.
+ARM_FAIL_STEM=depth-ds41
 # preheat_arm <engine>: the host set of K = PHK into the page cache (gguf-ranges.py preheat, under the
 # arm bound) and its `preheat` line; non-zero with FAIL_WHY on a failure.
 preheat_arm() {
@@ -1215,19 +1200,8 @@ echo
 echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
-echo "failed arms: ${#FAILED[@]} (FAIL rows, the warm-up's or the discards' included)"
-# A failed arm drops out at its depth or P: FAILED_KEYS against each record's `label|key`.
-drop_failed() {
-  awk -F'|' -v ex="$(printf '%s\n' "${FAILED_KEYS[@]}")" '
-    BEGIN { n = split(ex, e, "\n"); for (i = 1; i <= n; i++) if (e[i] != "") x[e[i]] = 1 }
-    !(($1 "|" $2) in x)'
-}
-if [ ${#FAILED_KEYS[@]} -gt 0 ]; then
-  echo "=== dropped from the means and the ratios below, a failed arm each (the FAIL rows above) ==="
-  printf '%s\n' "${FAILED_KEYS[@]}" | sort -u | awk -F'|' '{ printf "    dropped: %s at %s\n", $1, $2 }'
-  [ ${#sums[@]} -eq 0 ] || mapfile -t sums < <(printf '%s\n' "${sums[@]}" | drop_failed)
-  [ ${#pp_sums[@]} -eq 0 ] || mapfile -t pp_sums < <(printf '%s\n' "${pp_sums[@]}" | drop_failed)
-fi
+# A failed arm drops out at its depth or P (cold-blocks.sh).
+failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    llama-bench's own mean over the N steps — the cross-engine ratio reads these. The p50"
 echo "    column is ours only. ==="
@@ -1297,7 +1271,4 @@ if [ ${#slot_sums[@]} -gt 0 ]; then
 fi
 witness post
 ref_witness
-if [ ${#FAILED[@]} -gt 0 ]; then
-  echo "failed arms: $(printf '%s; ' "${FAILED[@]}")"
-  exit 1
-fi
+failed_end
