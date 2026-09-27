@@ -170,8 +170,14 @@ mod gate {
             }
         }
 
-        /// Tokens `a .. b` of `self`, then every token of `tail`.
+        /// Tokens `a .. b` of `self`, then every token of `tail`: one layer's
+        /// tokens, so `tail` carries `self`'s taps (panics by name otherwise —
+        /// a reference over two layers' taps is not the rule of either).
         fn then(&self, b: usize, tail: &ConvIn) -> ConvIn {
+            assert!(
+                bits_equal(&self.w, &tail.w),
+                "ConvIn::then: the tail's taps are not this layer's"
+            );
             let join = |x: &[f32], y: &[f32]| [&x[..b * CH], y].concat();
             ConvIn {
                 ngv: join(&self.ngv, &tail.ngv),
@@ -618,7 +624,8 @@ mod gate {
         let old = ConvIn::new(28, 0x726f);
         let a = cx.conv(unl, &old.rows(0, 20), &positions(0, 20), &zero)?;
         let pass8 = cx.conv(unl, &old.rows(20, 28), &positions(20, 8), &a.ring)?;
-        let new = ConvIn::new(4, 0x6e77);
+        let mut new = ConvIn::new(4, 0x6e77);
+        new.w.clone_from(&old.w);
         let after = cx.conv(unl, &new, &positions(23, 4), &pass8.ring)?;
         let joined = old.then(23, &new);
         let host = joined.host(&positions(0, 27), &zero);
