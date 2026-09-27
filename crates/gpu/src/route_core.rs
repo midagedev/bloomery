@@ -47,8 +47,10 @@ pub fn sqrt_softplus(x: f32) -> f32 {
 /// `1 + e^x` rounds to 1, so a token whose selected scores all sit there
 /// divided 0 by 0. The addend is under half an ulp of every sum from 2^-42
 /// up, and a nonzero [`sqrt_softplus`] score is at least
-/// `sqrt(ln(1 + 2^-23))` ≈ 3.45e-4: every nonzero sum keeps its bits, and an
-/// all-zero selection weighs 0.
+/// `sqrt(ln(1 + 2^-23))` ≈ 3.45e-4: every nonzero sum of those scores keeps
+/// its bits, and an all-zero selection weighs 0. Other scores can sum below
+/// 2^-42 — a sigmoid's eight all far below 0 — and there the addend moves
+/// the bits.
 #[inline(always)]
 pub fn renorm_divisor(sum: f32) -> f32 {
     sum + 1e-20

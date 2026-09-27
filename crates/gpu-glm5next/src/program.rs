@@ -29,12 +29,13 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::hc::{HcPostArgs, HcQ8Params, HcQ8PreArgs};
 use cuda_core::CudaStream;
-use model::arch::glm5next::names::{self, Sub};
+use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
 
 use crate::body::{Parts, f32v, q8};
 use crate::host::GlmHost;
+use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
 
 /// What the walk's errors name.
@@ -233,12 +234,20 @@ pub(crate) fn hc_in(
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let d = *p.d;
-    let (qs, dd) = q8(w, &names::hc_fn(l, sub))?;
+    let names: &[LayerNames] = p.names;
+    let n = names
+        .get(l)
+        .ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!("layer {l} past the {} named", names.len()),
+        })?
+        .hc(sub);
+    let (qs, dd) = q8(w, &n.fn_)?;
     let params = HcQ8Params {
         qs,
         d: dd,
-        scale: f32v(w, &names::hc_scale(l, sub))?,
-        base: f32v(w, &names::hc_base(l, sub))?,
+        scale: f32v(w, &n.scale)?,
+        base: f32v(w, &n.base)?,
         eps: d.hc_eps,
         iters: d.hc_iters,
     };

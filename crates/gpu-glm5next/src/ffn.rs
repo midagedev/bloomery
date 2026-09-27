@@ -49,6 +49,7 @@ use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v, gemv, weight};
 use crate::host::GlmHost;
+use crate::tensors::{FfnNames, LayerNames, other_kind};
 
 /// The dense block's launches.
 pub(crate) const DENSE_LAUNCHES: usize = 3;
@@ -236,15 +237,57 @@ impl<'w> CardStacks<'w> {
     }
 }
 
+/// A routed layer's names, borrowed out of their [`FfnNames::Moe`].
+pub(crate) struct MoeNames<'a> {
+    pub norm: &'a str,
+    pub router: &'a str,
+    pub bias: &'a str,
+    pub sh_gate: &'a str,
+    pub sh_up: &'a str,
+    pub sh_down: &'a str,
+}
+
+/// Layer `l`'s routed block's names; another kind's is refused by name.
+pub(crate) fn moe_names<'a>(p: &Parts<'a>, l: usize) -> Result<MoeNames<'a>, GpuError> {
+    let names: &'a [LayerNames] = p.names;
+    match names.get(l).map(|n| &n.ffn) {
+        Some(FfnNames::Moe {
+            norm,
+            router,
+            bias,
+            sh_gate,
+            sh_up,
+            sh_down,
+        }) => Ok(MoeNames {
+            norm,
+            router,
+            bias,
+            sh_gate,
+            sh_up,
+            sh_down,
+        }),
+        _ => Err(other_kind("glm5next routed block", l)),
+    }
+}
+
 /// Enqueue layer `l`'s dense block (module doc).
 pub(crate) fn dense(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let (d, c) = (*p.d, p.cfg[l]);
+    let Some(FfnNames::Dense {
+        norm,
+        gate,
+        up,
+        down,
+    }) = p.names.get(l).map(|n| &n.ffn)
+    else {
+        return Err(other_kind("glm5next dense", l));
+    };
     let s = &mut *p.s;
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
-        f32v(w, &names::ffn_norm(l))?,
+        f32v(w, norm)?,
         d.rms_eps,
         d.embd,
         1,
@@ -252,13 +295,13 @@ pub(crate) fn dense(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Resu
     )?;
     p.k.experts.enqueue_shexp_gate_up(
         stream,
-        weight(w, &names::ffn_gate(l))?,
-        weight(w, &names::ffn_up(l))?,
+        weight(w, gate)?,
+        weight(w, up)?,
         &s.xn,
         c.limit,
         &mut s.h,
     )?;
-    gemv(gpu, w, &names::ffn_down(l), &s.h, &mut s.out)
+    gemv(gpu, w, down, &s.h, &mut s.out)
 }
 
 /// Enqueue layer `l`'s routed block up to its go (module doc).
@@ -272,24 +315,21 @@ pub(crate) fn front(
     let stream = gpu.stream();
     let (d, c) = (*p.d, p.cfg[l]);
     let fault = gpu.layer_sink(l)?;
+    let n = moe_names(p, l)?;
     let s = &mut *p.s;
     gpu.elem().enqueue_rms_norm(
         stream,
         &s.x,
-        f32v(w, &names::ffn_norm(l))?,
+        f32v(w, n.norm)?,
         d.rms_eps,
         d.embd,
         1,
         hybrid.boundary_mut().normed_mut(),
     )?;
-    let bias = if c.bias {
-        f32v(w, &names::exp_probs_b(l))?
-    } else {
-        &s.no_bias
-    };
+    let bias = if c.bias { f32v(w, n.bias)? } else { &s.no_bias };
     p.k.router.enqueue_router(
         stream,
-        f32t(w, &names::ffn_gate_inp(l))?,
+        f32t(w, n.router)?,
         hybrid.boundary().normed(),
         bias,
         d.scale,
@@ -324,16 +364,17 @@ pub(crate) fn shadow(
     if let Some(cl) = card {
         card_slots(gpu, w, p, boundary, l, cl)?;
     }
+    let sh = moe_names(p, l)?;
     let s = &mut *p.s;
     p.k.experts.enqueue_shexp_gate_up(
         gpu.stream(),
-        weight(w, &names::ffn_gate_shexp(l))?,
-        weight(w, &names::ffn_up_shexp(l))?,
+        weight(w, sh.sh_gate)?,
+        weight(w, sh.sh_up)?,
         boundary.normed(),
         c.limit,
         &mut s.h,
     )?;
-    gemv(gpu, w, &names::ffn_down_shexp(l), &s.h, &mut s.sh_y)?;
+    gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
     if card.is_some() {
         let k = &mut *p.card;
         gpu.elem()

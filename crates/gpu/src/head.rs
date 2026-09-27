@@ -1,9 +1,12 @@
 //! The GPU output head: `result_norm → lm_head → argmax` as one capturable
 //! sequence over resident scratch (docs/gpu-design.md decisions 4 and 6). No
 //! kernels of its own — the chain is the gated `rms_norm`, then for a Q6_K
-//! lm_head the shared q8_1 quantizer and the Q6_K gemv, for a Q8_0 one the
-//! f32-activation Q8_0 gemv, then `argmax_fault`, exactly as the block path
-//! launches them, so their gates are this chain's gates.
+//! lm_head the shared q8_1 quantizer and the Q6_K gemv, then `argmax_fault`,
+//! for a Q8_0 one the f32-activation Q8_0 gemv, then `argmax_finite_fault`,
+//! exactly as the block path launches them, so their gates are this chain's
+//! gates. The Q6_K head's quantizer refuses a non-finite input; the Q8_0 head
+//! has none, so its argmax refuses a non-finite logit, and a Q8_0 head is
+//! one row: that argmax's readback carries its own raise only in one block.
 //!
 //! A head carries `m` rows (1..=8), fixed at construction: the decode step
 //! samples one position (`m = 1`), a k-token step every row. Each row's
@@ -218,6 +221,15 @@ impl Head {
         if n_vocab == 0 {
             return Err(GpuError::shape(WHAT, "output.weight has no rows"));
         }
+        if matches!(out_w, OutW::Q8_0 { .. }) && m != 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a Q8_0 lm_head of {m} rows: its argmax checks the logits in one block, so \
+                     it takes one row"
+                ),
+            ));
+        }
         let x = DeviceBuffer::zeroed(stream, m * hidden)?;
         let fin = match norm {
             HeadNorm::Rms => Final::Rms {
@@ -272,15 +284,16 @@ impl Head {
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k (a Q8_0 lm_head: q8_0_gemv over the normed f32 rows) →
-    /// argmax_fault (`argmax_rows_fault` when `m > 1`), the
-    /// argmax copying the fault word after the tokens. Pure enqueues — no
+    /// → gemv_q6k → argmax_fault (`argmax_rows_fault` when `m > 1`), or for
+    /// a Q8_0 lm_head q8_0_gemv over the normed f32 rows → argmax_finite_fault,
+    /// the argmax copying the fault word after the tokens. Pure enqueues — no
     /// allocation, no synchronization — so the same body is what a capture
     /// records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
         let rows = norm_rows(gpu, w, &mut self.fin, shape, &self.x)?;
+        let fault = gpu.fault_sink(LAYER_HEAD);
         match head_out_w(w)?.0 {
             OutW::Q6K(out_w) => {
                 gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
@@ -289,9 +302,15 @@ impl Head {
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()
                     .enqueue_q8_0_gemv(stream, qs, d, rows, self.m, &mut self.logits)?;
+                return gpu.elem().enqueue_argmax_finite_fault(
+                    stream,
+                    &self.logits,
+                    self.n_vocab,
+                    fault,
+                    &mut self.token_out,
+                );
             }
         }
-        let fault = gpu.fault_sink(LAYER_HEAD);
         if self.m == 1 {
             gpu.elem().enqueue_argmax_fault(
                 stream,

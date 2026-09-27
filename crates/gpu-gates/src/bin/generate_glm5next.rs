@@ -207,9 +207,12 @@ mod cli {
             Some(o) => return Err(format!("--mode is eager or graph, not {o}").into()),
         };
         let path = flag("--model")?.unwrap_or_else(|| refset::arch::glm5next::MODEL.to_string());
-        if ids.len() + n_gen > ctx {
+        // The last generated token is read out, not fed: the run takes the
+        // prompt's positions and one a step after the first token.
+        let takes = ids.len() + n_gen.saturating_sub(1);
+        if takes > ctx {
             return Err(format!(
-                "{} prompt ids and {n_gen} generated exceed --ctx {ctx}",
+                "{} prompt ids and {n_gen} generated take {takes} positions, past --ctx {ctx}",
                 ids.len()
             )
             .into());
