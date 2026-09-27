@@ -29,11 +29,71 @@
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
 # the page cache (unlike V4.1's), so a later dump of the same file reads nothing from the device.
 #
-# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the reference-line arms (IK_GPU_FLAGS, LCPP,
-# LCPP_GPU_FLAGS, MRS, MRS_FLAGS). No flag has been chosen or measured for this model; the depth and
-# prompt-processing lines against ik, llama.cpp and mistral.rs belong to a later round. Every script
-# that reads them runs under `set -u`, so such a script stops at the unset name instead of running
-# an engine at flags nobody chose.
+#   GLM_PROSE       the prose ids under $BLOOMERY_DATA (the d1k variant's and the timing runner's
+#   GLM_PROSE_SHA256  prompt, below) and their sha256
+#   GLM_HOT         the card hot list under $BLOOMERY_DATA (`just hotlist all glm5next-hotlist.txt
+#                   glm5next-prose`: 42 layers x 288 ids ranked over 50,000 prose tokens)
+#
+# The public lines (tools/ref/depth-glm5next.sh, `just depth-gpu-glm5next`). Mainline llama.cpp does
+# not build glm5next; two open PR branches do, each in a tree of its own built with mainline's CMake
+# flags. Neither is ik, and ik has no arm here: ik is the oracle, not a public row.
+#   LCPP27752       ggml-org/llama.cpp PR #27752 (glm5next, KDA through kimi-linear's ops, the DSA
+#                   indexer on the hybrid-idx memory); LCPP27752BIN its llama-bench
+#   LCPP27754       PR #27754 (GLM-5-Next); LCPP27754BIN its llama-bench. Its body names two settings
+#                   for correct output, both in its arms: NVIDIA_TF32_OVERRIDE=0 (LCPP27754_ENV: the
+#                   CUDA backend sets TF32 tensor-op math on every fp32 GEMM) and -fa off (its MLA casts
+#                   the f32 latent to f16 before the flash kernel)
+#   GLM_NCMOE       the leading layers whose routed experts stay on the host (--n-cpu-moe), per timing
+#                   card: 36 on the A6000, 42 on the 3090 [derived from the file's header; no load has
+#                   been run]. Both branches skip the NextN block (blk.45) unless an MTP context loads
+#                   it (TENSOR_SKIP when !load_mtp), and layers 0-2 are dense, so K counts blocks and
+#                   the card holds the experts of blocks K..44. Card dense: every tensor but
+#                   token_embd, the routed experts and blk.45 — 8,966,188,280 B. Experts a block
+#                   4,378,853,376 B; blocks 11 (5,303,697,408), 12 and 44 (4,699,717,632 each) carry
+#                   wider down stacks. A6000 at 36: blocks 36-44, 39,730,544,640 B; card total
+#                   48,696,732,920 B = 46,441 MiB of 49,140, 2,151 MiB left beside the driver's 548 —
+#                   V4.1's 33 loaded with 2,165. At 35 block 35 adds 4,176 MiB: it does not fit.
+#                   The 3090 at 42: blocks 42-44, 13,457,424,384 B; total 21,386 MiB of 24,576, 2,790 MiB
+#                   left beside the driver's 400. Host share of routed bytes at 36: blocks 3-35, 4.05 GB
+#                   a token against ours' 5.15 GB with every routed expert on the host [derived]
+#   LCPP27752_GPU_FLAGS, LCPP27754_GPU_FLAGS  llama-bench's flags, V4.1's set
+#                   (models/deepseek41.sh LCPP_GPU_FLAGS): -ngl 999, --n-cpu-moe GLM_NCMOE, -t 32 (the
+#                   host's cores, spelled out), -nopo 1 (no op offload: at a batch >= 32 the backend
+#                   would copy a host expert tensor to the card per ubatch, and the compute buffer
+#                   that needs, one block expert tensor of 1.36 GB (gate, q4_K) or more, must then
+#                   fit in the 2,151 MiB left beside the ubatch activations) [derived],
+#                   and -fa on / -fa off (#27754's correctness setting)
+#   LCPP27752_CLI_FLAGS, LCPP27754_CLI_FLAGS  the same placement in llama-completion's spellings, for
+#                   the build smoke: --no-op-offload, and -fit off (common's fit pass would move the
+#                   arguments not given)
+#   LCPP27752SRV, LCPP27754SRV  each branch's llama-server: the server arms (`lcpp2775xsrv:<D>`,
+#                   `lcpp2775xmtp:<D>`) time one /completion request, because llama-bench drives no
+#                   speculation; llama-server prints the draft acceptance and returns it in `timings`
+#   LCPP27752_SRV_FLAGS, LCPP27754_SRV_FLAGS  the CLI flags with one slot (-np 1: the automatic slots
+#                   would set four and a unified cache)
+#   GLM_NCMOE_MTP   the MTP arm's --n-cpu-moe, GLM_NCMOE + 1: an MTP context loads the NextN block
+#                   (blk.45, 4,378,853,376 B of experts and 200,306,816 B beside them), which the
+#                   leading-layer rule keeps on the card, so one more block goes to the host: blocks
+#                   37-45 hold the bytes 36-44 held, plus 191 MiB [derived]
+#   GLM_MTP_FLAGS   the MTP draft: --spec-type draft-mtp --spec-draft-n-max 2 (#27754's body and the
+#                   unsloth guide: n = 2 is its best, more drafts run slower)
+#   LCPP27752_MTP_FLAGS, LCPP27754_MTP_FLAGS  the server flags at GLM_NCMOE_MTP with GLM_MTP_FLAGS
+#   EXL3            the exllamav3 source tree; its bench is eval/perf.py, run by EXL3_PY (the venv of
+#                   exllamav3 1.5.0 +cu128, torch 2.10.0), on EXL3_MODEL: another quantization (EXL3
+#                   at EXL3_BPW bits a weight), so its rows are a table of their own, never a ratio
+#   EXL3_FLAGS      perf.py's model flags: -mcs, the tail experts of every layer on the CPU with its
+#                   dynamic hot/cold placement (its default), 224 of 288: 64 a layer on the A6000.
+#                   ~~214 [derived from the two-card run of 09-15]~~ 214 does not load on the A6000
+#                   alone ("Insufficient VRAM in split for model and cache", perf.py's default cache
+#                   32768 and chunk 4096) and 224 does (load probe of round glmtime, 41 s);
+#                   -mct 32 worker threads, as -t 32
+#   EXL3_WIKITEXT   the wikitext-2 test text perf.py's token stream reads; its loader otherwise
+#                   downloads it into the temp dir, so the runner stages this copy there first
+#
+# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs arms (IK_GPU_FLAGS, MRS,
+# MRS_FLAGS): ik is the oracle, and mistral.rs (d5ae0f1 on the box) has no glm5next loader
+# (glm4, glm4moe and glm4moelite only). Every script that reads them runs under `set -u`, so such a
+# script stops at the unset name instead of running an engine at flags nobody chose.
 #
 # SC2034: every name here is read by the file that sources this one, which shellcheck does not
 # see from this file alone.
@@ -51,6 +111,42 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4
 # Changing them invalidates the whole set.
 REF_TOKENS=785,6722,315,9621,374
 REF_DUMP_LEASE=1
+GLM_PROSE=glm5next/corpus-prose.ids
+GLM_PROSE_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64
+GLM_HOT=router/glm5next-hotlist.txt
+: "${LCPP27752:=/home/user/llama.cpp-pr27752}"
+: "${LCPP27752BIN:=$LCPP27752/build/bin/llama-bench}"
+: "${LCPP27754:=/home/user/llama.cpp-pr27754}"
+: "${LCPP27754BIN:=$LCPP27754/build/bin/llama-bench}"
+: "${LCPP27754_ENV=NVIDIA_TF32_OVERRIDE=0}"
+__glm_dir=${BASH_SOURCE[0]%/*}
+[ "$__glm_dir" != "${BASH_SOURCE[0]}" ] || __glm_dir=.
+# shellcheck source=tools/ref/cards.sh
+source "$__glm_dir/../cards.sh"
+unset __glm_dir
+if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
+  : "${GLM_NCMOE:=42}"
+else
+  : "${GLM_NCMOE:=36}"
+fi
+: "${LCPP27752_GPU_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE -fa on -t 32 -nopo 1}"
+: "${LCPP27754_GPU_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE -fa off -t 32 -nopo 1}"
+: "${LCPP27752_CLI_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE -fa on -t 32 --no-op-offload -fit off}"
+: "${LCPP27754_CLI_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE -fa off -t 32 --no-op-offload -fit off}"
+: "${LCPP27752SRV:=$LCPP27752/build/bin/llama-server}"
+: "${LCPP27754SRV:=$LCPP27754/build/bin/llama-server}"
+: "${GLM_NCMOE_MTP:=$((GLM_NCMOE + 1))}"
+: "${LCPP27752_SRV_FLAGS:=$LCPP27752_CLI_FLAGS -np 1}"
+: "${LCPP27754_SRV_FLAGS:=$LCPP27754_CLI_FLAGS -np 1}"
+: "${GLM_MTP_FLAGS:=--spec-type draft-mtp --spec-draft-n-max 2}"
+: "${LCPP27752_MTP_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE_MTP -fa on -t 32 --no-op-offload -fit off -np 1 $GLM_MTP_FLAGS}"
+: "${LCPP27754_MTP_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE_MTP -fa off -t 32 --no-op-offload -fit off -np 1 $GLM_MTP_FLAGS}"
+: "${EXL3:=/home/user/exllamav3-src}"
+: "${EXL3_PY:=/home/user/.venv-exl3/bin/python}"
+: "${EXL3_MODEL:=/models/GLM-5.3-Flash-exl3-4.05}"
+: "${EXL3_BPW:=4.05}"
+: "${EXL3_FLAGS:=-mcs 224 -mct 32}"
+: "${EXL3_WIKITEXT:=/home/user/eval/wikitext-2-raw/wiki.test.raw}"
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-glm5next <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
@@ -81,8 +177,8 @@ ref_step_variant() {
     *)     return 1 ;;
   esac
   case $name in
-    d1k) STEP_TOKENS_FILE=$BLOOMERY_DATA/glm5next/corpus-prose.ids
-         STEP_TOKENS_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64 ;;
+    d1k) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
+         STEP_TOKENS_SHA256=$GLM_PROSE_SHA256 ;;
   esac
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node

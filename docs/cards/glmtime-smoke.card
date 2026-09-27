@@ -1,0 +1,28 @@
+# Round glmtime's end-to-end smoke of tools/ref/depth-glm5next.sh: one lease, one round, one ours arm
+# and one llama.cpp arm at the smallest depth, n = 16. Not a published number: it proves the runner's
+# path (the lease, the guards, the witness, ours' records through records.py, llama-bench's table, the
+# ratio table) before the release sitting uses it. The tree is train6a (4b01809) with the scratch
+# patch that gives generate_glm5next --time: plan (a) keeps every routed expert on the host.
+# ours: 42 routed layers in sequence, each a card front of 0.30-0.41 ms, a host leg of 122.7 MB at
+# 130-137 GB/s plus 60-80 us, and the back: 53.6-61.6 ms a step (glmhot) [derived]; at n = 16 the
+# mean holds the first steps after the capture, so the band's low edge is widened to 15.0.
+kind: baseline
+question: does the GLM timing runner produce an ours row and a llama.cpp row, with the step where
+  the host-only derivation puts it?
+term: tok/s @ n=16, depth 6, A6000, bloomery (generate_glm5next of train6a with the --time patch,
+  plan (a), the `6` arm of just depth-gpu-glm5next, prose ids)
+unit: tok/s
+predict: 15.0..18.7
+condition: one lease, one round, no warm-up (BLOOMERY_AB_WARMUP=0: the load reads its host set before
+  its timer), arms 6 lcpp27754:6 lcpp27754mtp:6 (the server path and the MTP load at --n-cpu-moe 37,
+  its acceptance line carried); no row carries [cpu-busy] or [other-busy]; the full output to a file
+  first. Command: BLOOMERY_DECODE_N=16 BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmtime-smoke.card
+  BLOOMERY_AB_WARMUP=0 BLOOMERY_DECODE_N=16' just depth-gpu-glm5next 6 lcpp27754:6 lcpp27754mtp:6 > <log>
+  2>&1
+reason: the runner's first live pair; why now: the release sitting's GLM segment runs it next
+decide-in: hand the segment line to the sitting as written; glm-public.card's host-only band stands
+decide-below: read the step series: first10 far above last10 is the capture and first-touch term,
+  so the sitting keeps its warm-up; a flat series under 15 means the step model missed a term (the
+  host leg's rate or its fixed cost): re-derive glm-public.card's bands before the sitting
+decide-above: the step model over-counts the host leg: lower glm-public.card's bands from this row
+  before the sitting

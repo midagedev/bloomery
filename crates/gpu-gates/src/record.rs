@@ -1266,9 +1266,12 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &CAPTURE,
     &FED,
     &STEP0,
+    &TIME_PROMPT,
     &STEP,
+    &TIME_STEP,
     &TOKENS,
     &LOGITS,
+    &SMOKE,
 ];
 
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after

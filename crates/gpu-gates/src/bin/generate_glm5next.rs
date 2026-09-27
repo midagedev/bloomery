@@ -6,7 +6,7 @@
 //! steps.
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate]
-//! [--mode graph|eager] [--model PATH] [--logits] [--plan]`
+//! [--mode graph|eager] [--model PATH] [--time [--warm W]] [--logits] [--plan]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
@@ -19,6 +19,14 @@
 //! - `--plan` prints the plan and exits before the load.
 //! - `--logits` prints the head's last logits row by its bits after the
 //!   tokens.
+//! - `--time` times the feed (`time prompt`, `kind=steps`: one step a fed
+//!   id, then the readback of generated token 0) and each generated step
+//!   after token 0 (`time step`, the step through its token's readback), and
+//!   ends with the `SMOKE` footer over the kept steps. `--warm W` drops the
+//!   first W of them from the footer. A measurement: it belongs under the
+//!   machine-wide lease (`tools/ref/depth-glm5next.sh`). The `step` and `time
+//!   step` records print after the last step, so no write sits between two
+//!   timed steps.
 //!
 //! The `load` line's `top_k` is the file's indexer top-k: at the contexts the
 //! plan allows every position is within it, so the latent layers attend all
@@ -165,6 +173,27 @@ mod cli {
             return Err("--tokens holds no id".into());
         }
         let n_gen: usize = flag("-n")?.map_or(Ok(16), |s| s.parse())?;
+        let timed = has("--time");
+        let warm: usize = match flag("--warm")? {
+            None => 0,
+            Some(_) if !timed => {
+                return Err("--warm drops steps from --time's footer; it needs --time".into());
+            }
+            Some(w) => w.parse()?,
+        };
+        if timed && n_gen < 2 {
+            return Err(
+                "--time needs -n 2 or more: token 0 comes out of the feed, and the steps after it are timed"
+                    .into(),
+            );
+        }
+        if timed && warm >= n_gen - 1 {
+            return Err(format!(
+                "--warm {warm} leaves no timed step of the {} that -n {n_gen} generates",
+                n_gen - 1
+            )
+            .into());
+        }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
         let (place, machine): (&'static str, fn(usize) -> Machine) =
             match flag("--place")?.as_deref() {
@@ -224,22 +253,46 @@ mod cli {
             .print();
         let t_feed = Instant::now();
         let mut next = s.prompt(&ids, Want::Argmax)?.argmax();
+        let feed = t_feed.elapsed();
         Record::new(&record::STEP0)
             .u("pos", s.pos() - 1)
             .u("token", next)
             .u("fed", ids.len())
-            .f("feed_s", t_feed.elapsed().as_secs_f64())
+            .f("feed_s", feed.as_secs_f64())
             .print();
         let mut tokens = vec![next];
+        // (i, pos, token, ms): printed after the last step.
+        let mut rows: Vec<(usize, u32, u32, f64)> = Vec::with_capacity(n_gen);
         for i in 1..n_gen {
             let pos = s.pos();
+            let t = Instant::now();
             next = s.step(next, Want::Argmax)?.argmax();
+            rows.push((i, pos, next, t.elapsed().as_secs_f64() * 1e3));
+            tokens.push(next);
+        }
+        if timed {
+            let ms = feed.as_secs_f64() * 1e3;
+            Record::new(&record::TIME_PROMPT)
+                .u("n", ids.len())
+                .f("ms", ms)
+                .f("tok/s", ids.len() as f64 * 1e3 / ms)
+                .u("passes", ids.len())
+                .w("kind", "steps")
+                .print();
+        }
+        for &(i, pos, token, ms) in &rows {
             Record::new(&record::STEP)
                 .u("i", i)
                 .u("pos", pos)
-                .u("token", next)
+                .u("token", token)
                 .print();
-            tokens.push(next);
+            if timed {
+                Record::new(&record::TIME_STEP)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .print();
+            }
         }
         Record::new(&record::TOKENS).list("tokens", &tokens).print();
         if has("--logits") {
@@ -258,6 +311,25 @@ mod cli {
                 .u("n", row.len())
                 .u("argmax", argmax)
                 .w("fnv64", format!("{fnv:016x}"))
+                .print();
+        }
+        if timed {
+            let kept: Vec<f64> = rows[warm..].iter().map(|r| r.3).collect();
+            let mut sorted = kept.clone();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+            Record::new(&record::SMOKE)
+                .w("mode", mode_name(mode))
+                .w("place", place)
+                .u("prompt_tokens", ids.len())
+                .u("depth", ids.len())
+                .u("generated", n_gen)
+                .u("warm", warm)
+                .u("steps", kept.len())
+                .f("p50_ms", p50)
+                .f("mean_ms", mean)
+                .f("tok/s(p50)", 1e3 / p50)
                 .print();
         }
         Ok(())

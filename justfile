@@ -1137,6 +1137,15 @@ depth-gpu-qwen35moe *ARMS:
 depth-gpu-qwen4exp *ARMS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
+# GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(산문 첫 D개 id를 스텝마다 먹임, pp는
+# `kind=steps`)·`hot:<D>`(BLOOMERY_HOT_LIST), llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
+# llama-server 한 요청으로 재는 `…srv:<D>`·`…mtp:<D>`(MTP 초안, 서버가 찍는 draft acceptance 줄을 행에 그대로 싣는다),
+# exllamav3 `exl3:<D>`·`exl3pp:<P>`(perf.py, EXL3 4.05 bpw — 다른 양자화라 비율 표에 넣지 않는다). GGUF 팔은 바퀴마다 순서를
+# 돌리고 exllamav3 팔은 그 뒤 한 덩어리로 돈다. 팔·플래그 근거는 tools/ref/depth-glm5next.sh와 models/glm5next.sh 머리에.
+# 우리 팔이 없거나 BLOOMERY_BOX_ENV=BLOOMERY_DRY=1이면 generate_glm5next를 빌드하지 않는다; 인자 없으면 512 lcpp27754:512.
+depth-gpu-glm5next *ARMS:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in hot:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
+
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
