@@ -22,11 +22,17 @@
 //! step walk the rows in order through the ring and the state — so a pass
 //! of `m` rows leaves the state, the ring and the outputs of `m` one-row
 //! steps.
+//!
+//! Past [`GEMV_COLS`] rows the input half (1–2) and the output half (6) are
+//! the wide arm's (`wide::delta_in`, `wide::delta_out`: the norm and the
+//! quantizer, each projection a GEMM, the residual add a launch of its own);
+//! the conv, the delta step and the gated norm (3–5) are the same launches.
 
 use super::dispatch::Ctx;
 use super::plan::{DeltaPlan, Kq};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, RecStore};
+use super::wide::{self, GEMV_COLS};
 use crate::GpuError;
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::DeltaArgs;
@@ -34,8 +40,13 @@ use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, kq_weight};
 
 /// The launches [`delta`] makes at `m` rows: eight, plus a Q6_K q·k·v
-/// projection's token-major copy at more than one row.
+/// projection's token-major copy at more than one row; past [`GEMV_COLS`]
+/// rows twelve (the norm, the quantizer and the four projections apart, the
+/// residual add its own launch).
 pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
+    if m > GEMV_COLS {
+        return 12;
+    }
     8 + usize::from(d.qkv_ty == Kq::Q6K && m > 1)
 }
 
@@ -54,24 +65,13 @@ pub(super) fn delta(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let q35 = k.q35(WHAT)?;
     let stream = gpu.stream();
-    let i = m - 1;
     let lane = io.lane.ok_or(GpuError::state(
         WHAT,
         "the record's lane word (a chain with delta layers carries one)",
     ))?;
-    let Arena {
-        x,
-        normed,
-        act_x,
-        pos,
-        attn,
-        act_attn,
-        ffn_inp,
-        gdn,
-        ..
-    } = s;
-    let g = gdn
-        .as_mut()
+    let g = s
+        .gdn
+        .as_ref()
         .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
     if g.shape != d.shape {
         return Err(GpuError::shape(
@@ -82,70 +82,15 @@ pub(super) fn delta(
             ),
         ));
     }
-    gpu.fused().enqueue_norm_quant(
-        stream,
-        x,
-        f32_gain(w, &d.attn_norm)?,
-        c.eps,
-        &mut act_x[i],
-        normed,
-        c.sink,
-    )?;
-    let act = &act_x[i];
-    let (wqkv, wz) = (kq_weight(w, &d.qkv)?, kq_weight(w, &d.gate)?);
-    let (wb, wa) = (kq_weight(w, &d.beta)?, kq_weight(w, &d.alpha)?);
-    let (b_in_z, a_in_z, a_in_b) = g.tail_offsets();
-    let (x_len, z_len, a_len) = (g.x.len(), g.z.len(), g.a.len());
-    match d.qkv_ty {
-        Kq::Q4K => {
-            k.proj.enqueue_qkv(
-                stream,
-                QkvArgs {
-                    wq: wqkv,
-                    wk: wz,
-                    wv: None,
-                    act,
-                    y: &mut g.proj,
-                    off_k: x_len,
-                    off_v: x_len + z_len,
-                },
-            )?;
-            k.proj.enqueue_qkv(
-                stream,
-                QkvArgs {
-                    wq: wb,
-                    wk: wa,
-                    wv: None,
-                    act,
-                    y: &mut g.from_b,
-                    off_k: a_in_b,
-                    off_v: a_in_b + a_len,
-                },
-            )?;
-        }
-        Kq::Q6K => {
-            match g.x_cols.as_mut().filter(|_| m > 1) {
-                Some(cols) => {
-                    gpu.enqueue_gemv_q6k(wqkv, act, cols)?;
-                    k.proj
-                        .enqueue_token_major(stream, cols, d.shape.channels(), m, &mut g.x)?;
-                }
-                None => gpu.enqueue_gemv_q6k(wqkv, act, &mut g.x)?,
-            }
-            k.proj.enqueue_qkv(
-                stream,
-                QkvArgs {
-                    wq: wz,
-                    wk: wb,
-                    wv: Some(wa),
-                    act,
-                    y: &mut g.from_z,
-                    off_k: b_in_z,
-                    off_v: a_in_z,
-                },
-            )?;
-        }
+    if m > GEMV_COLS {
+        wide::delta_in(c, d, s, m)?;
+    } else {
+        project(c, d, s, m)?;
     }
+    let Arena { pos, attn, gdn, .. } = s;
+    let g = gdn
+        .as_mut()
+        .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
     let lin = &q35.linear;
     lin.conv.enqueue_conv_prep(
         stream,
@@ -196,9 +141,113 @@ pub(super) fn delta(
             y: attn,
         },
     )?;
+    if m > GEMV_COLS {
+        wide::delta_out(c, d, s, m)
+    } else {
+        output(c, d, s, m)
+    }
+}
+
+/// The gemv arm's input half at `m <= GEMV_COLS` rows: the fused norm and
+/// q8_1 quantizer of `x`, then the four input projections in two launches
+/// (module doc, 1–2).
+fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::delta::project";
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let stream = gpu.stream();
+    let i = s.col(m)?;
+    let Arena {
+        x,
+        normed,
+        act_x,
+        gdn,
+        ..
+    } = s;
+    let g = gdn
+        .as_mut()
+        .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
+    gpu.fused().enqueue_norm_quant(
+        stream,
+        x,
+        f32_gain(w, &d.attn_norm)?,
+        c.eps,
+        &mut act_x[i],
+        normed,
+        c.sink,
+    )?;
+    let act = &act_x[i];
+    let (wqkv, wz) = (kq_weight(w, &d.qkv)?, kq_weight(w, &d.gate)?);
+    let (wb, wa) = (kq_weight(w, &d.beta)?, kq_weight(w, &d.alpha)?);
+    let (b_in_z, a_in_z, a_in_b) = g.tail_offsets();
+    let (x_len, z_len, a_len) = (g.x.len(), g.z.len(), g.a.len());
+    match d.qkv_ty {
+        Kq::Q4K => {
+            k.proj.enqueue_qkv(
+                stream,
+                QkvArgs {
+                    wq: wqkv,
+                    wk: wz,
+                    wv: None,
+                    act,
+                    y: &mut g.proj,
+                    off_k: x_len,
+                    off_v: x_len + z_len,
+                },
+            )?;
+            k.proj.enqueue_qkv(
+                stream,
+                QkvArgs {
+                    wq: wb,
+                    wk: wa,
+                    wv: None,
+                    act,
+                    y: &mut g.from_b,
+                    off_k: a_in_b,
+                    off_v: a_in_b + a_len,
+                },
+            )
+        }
+        Kq::Q6K => {
+            match g.x_cols.as_mut().filter(|_| m > 1) {
+                Some(cols) => {
+                    gpu.enqueue_gemv_q6k(wqkv, act, cols)?;
+                    k.proj
+                        .enqueue_token_major(stream, cols, d.shape.channels(), m, &mut g.x)?;
+                }
+                None => gpu.enqueue_gemv_q6k(wqkv, act, &mut g.x)?,
+            }
+            k.proj.enqueue_qkv(
+                stream,
+                QkvArgs {
+                    wq: wz,
+                    wk: wb,
+                    wv: Some(wa),
+                    act,
+                    y: &mut g.from_z,
+                    off_k: b_in_z,
+                    off_v: a_in_z,
+                },
+            )
+        }
+    }
+}
+
+/// The gemv arm's output half at `m <= GEMV_COLS` rows: the gated norm's
+/// rows quantized, then the output projection with the residual add (module
+/// doc, 6).
+fn output(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let i = s.col(m)?;
+    let Arena {
+        x,
+        attn,
+        act_attn,
+        ffn_inp,
+        ..
+    } = s;
     gpu.enqueue_quantize_q8_1_layer(attn, &mut act_attn[i], c.layer)?;
     k.proj.enqueue_o_resid(
-        stream,
+        gpu.stream(),
         OResidArgs {
             w: kq_weight(w, &d.ssm_out)?,
             act: &act_attn[i],

@@ -9,28 +9,41 @@
 //! routed stacks and its gate into the router (`Weights::join_rows`: the
 //! parts leave the map, nothing is resident twice); the stores — K/V planes
 //! for an attention layer, a recurrent state and conv ring for a delta
-//! layer; two arenas — the decode step's one row and a pass's
-//! [`MAX_PASS_ROWS`]; and the input records the captured chains read.
+//! layer; three arenas — the decode step's one row, a pass's
+//! [`MAX_PASS_ROWS`] and the prompt call's ubatch (allocated last, after a
+//! check that it fits the card: [`Open35::ubatch`]); and the input records
+//! the captured chains read, and the prompt image the prompt call reads.
 //!
-//! A step's and a pass's record carry the lane word: the state lane every
-//! delta launch reads and writes, a device word and never a launch argument,
-//! so one capture serves every position. A load holds one lane, and the
-//! word is [`LANE`] in every record. `reset` zeroes every lane and every
-//! conv ring: the recurrence is written in place, so the next sequence
-//! would read the previous one's state.
+//! A step's and a pass's record, and the prompt image, carry the lane word:
+//! the state lane every delta launch reads and writes, a device word and
+//! never a launch argument, so one capture serves every position. A load
+//! holds one lane, and the word is [`LANE`] in every record. `reset` zeroes
+//! every lane and every conv ring: the recurrence is written in place, so
+//! the next sequence would read the previous one's state.
+//!
+//! The prompt call ([`GpuModel::prefill_with`]) cuts a prompt by
+//! [`PrefillPlan`] and walks each unit through the layer program over the
+//! ubatch arena, eager in either step mode; a unit of more than
+//! [`GEMV_COLS`] rows takes each op's wide arm (`wide`), one of at most
+//! that many the gemv arm, bit for bit the decode steps. The last unit ends
+//! in its last row's head ([`Tail::Last`]).
 
 use super::body::{Kernels, TapRows, f32_site, kq_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
+use super::image::{ImageWrite, PromptImage};
 use super::plan::{
     DeltaPlan, GqaKind, GqaPlan, Kind35, Kq, LayerPlan, MixerPlan, MoePlan, SharedPlan, kinds35,
     moe_fits, q35,
 };
+use super::prefill::{PrefillPath, PrefillPlan, PrefillStep};
 use super::program::{Program, Tail};
 use super::scratch::{
     Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
     StepParams, param_view, put_input,
 };
+use super::ubatch::UBATCH;
+use super::wide::{GEMV_COLS, arena_bytes};
 use crate::flash_gqa::{GROUP, HEAD_256};
 use crate::head::Head;
 use crate::hybrid::Chain;
@@ -39,16 +52,105 @@ use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, NoHost, Row
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::window;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Mixer, ModelSpec};
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 const WHAT: &str = "qwen35moe::Body35::load";
+
+/// Card bytes a load leaves free past the ubatch arena: what the load and
+/// the first prompt still allocate after it — the output head and the
+/// heads of a pass of up to [`MAX_PASS_ROWS`] rows (a vocabulary of logits
+/// each, some 8 MB together), the captured step and passes, and the
+/// allocator's rounding of the arena's some forty buffers to its 2 MiB
+/// pages (at most 80 MiB) — with the rest as margin.
+pub const FIT_RESERVE: usize = 256 << 20;
+
+/// What [`GpuModel::<Body35>::open`](GpuModel::open) takes besides the card
+/// and the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Open35 {
+    /// KV rows the caches hold.
+    pub ctx: usize,
+    /// The decode flash: the tensor-core pass when `true`.
+    pub mma: bool,
+    /// Tokens per ubatch of the prompt call, `1..=` the router's
+    /// [`ubatch`](super::router::RouterDims::ubatch) (at most [`UBATCH`]);
+    /// the ubatch arena holds `max(ubatch, GEMV_COLS)` rows, at most `ctx`.
+    /// A size outside that range, or an arena that does not fit the card's
+    /// free bytes with [`FIT_RESERVE`] left, is refused by name at load.
+    pub ubatch: usize,
+}
+
+/// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
+/// at least a pass's [`GEMV_COLS`] (the plan's passes and tail walk it too),
+/// at most the cache.
+fn prompt_rows(u: usize, ctx: usize) -> usize {
+    u.max(GEMV_COLS).min(ctx)
+}
+
+/// `u` as a ubatch size of `d`, or a named refusal outside
+/// `1..=d.router.ubatch()`.
+fn ubatch_of(d: &Dims, u: usize) -> Result<NonZeroUsize, GpuError> {
+    let most = d.router.ubatch();
+    NonZeroUsize::new(u)
+        .filter(|u| u.get() <= most)
+        .ok_or_else(|| {
+            GpuError::shape(
+                "qwen35moe::ubatch",
+                format!(
+                    "a ubatch of {u} tokens (1..={most}: at most {UBATCH}, and {} slots a token \
+                     in one route table)",
+                    d.slots()
+                ),
+            )
+        })
+}
+
+/// The ubatch arena of `d` for ubatches of `u` tokens, after the check that
+/// it fits: its bytes ([`arena_bytes`]) and [`FIT_RESERVE`] within the
+/// card's `free` bytes, else a named refusal with the free bytes, the need
+/// and the largest ubatch that fits, before anything is allocated. The
+/// arena it allocates holds the bytes the check counted, or the load fails
+/// by name. Load-time allocation.
+fn ubatch_arena(stream: &CudaStream, d: Dims, u: usize, free: usize) -> Result<Arena, GpuError> {
+    const WHAT_FIT: &str = "qwen35moe::ubatch_arena";
+    let rows = prompt_rows(u, d.ctx);
+    let need = arena_bytes(&d, rows);
+    if need + FIT_RESERVE > free {
+        let fits = (1..u)
+            .rev()
+            .find(|&v| arena_bytes(&d, prompt_rows(v, d.ctx)) + FIT_RESERVE <= free)
+            .map_or("no ubatch size fits".to_string(), |v| {
+                format!("ubatches of {v} tokens fit")
+            });
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena for ubatches of {u} tokens ({rows} rows) needs {need} bytes and \
+                 {FIT_RESERVE} more stay free for what the load allocates after it; the card has \
+                 {free} free: {fits}"
+            ),
+        ));
+    }
+    let a = Arena::new(stream, d, rows)?;
+    if a.bytes() != need {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena holds {} bytes, its fit check counted {need}",
+                a.bytes()
+            ),
+        ));
+    }
+    Ok(a)
+}
 
 /// Lanes of every recurrent store: one, read and written in place.
 pub(super) const LANES: usize = 1;
@@ -170,6 +272,10 @@ pub struct Body35 {
     /// A pass's arena of [`MAX_PASS_ROWS`] rows and its input record.
     pub(super) a: Arena,
     pub(super) rp: RowsParams,
+    /// The prompt call's ubatch arena, its image, and the ubatch size.
+    pub(super) u: Arena,
+    pub(super) img: PromptImage,
+    pub(super) ubatch: NonZeroUsize,
     pub(super) k: Kernels,
     pub(super) head_state: HeadArgmaxState,
     /// The flash pass the chain runs: the tensor-core pass from load on.
@@ -368,17 +474,13 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
 
 impl GpuModel<Body35> {
     /// The whole Qwen3.6 model of `file` resident on `gpu`, plus the output
-    /// head, with caches of `ctx` rows and the decode flash `mma` (the
-    /// tensor-core pass when `true`). The model takes the file.
-    pub fn open(
-        gpu: Gpu,
-        file: Split,
-        ctx: usize,
-        mma: bool,
-    ) -> Result<GpuModel<Body35>, GpuError> {
+    /// head, with caches of `o.ctx` rows, the decode flash `o.mma` (the
+    /// tensor-core pass when `true`) and ubatches of `o.ubatch` tokens
+    /// ([`Open35`]). The model takes the file.
+    pub fn open(gpu: Gpu, file: Split, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
         let n_layers = block_count(&file, "qwen35moe GpuModel::open")?;
-        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
-            Body35::load(gpu, &file, w, 0..n_layers, ctx, mma)
+        GpuModel::load_blocks(gpu, &file, o.ctx, 0..n_layers, true, |gpu, w| {
+            Body35::load(gpu, &file, w, 0..n_layers, o)
         })
     }
 }
@@ -389,9 +491,9 @@ impl Body35 {
         file: &Split,
         w: &mut Weights,
         layers: Range<usize>,
-        ctx: usize,
-        mma: bool,
+        o: Open35,
     ) -> Result<Body35, GpuError> {
+        let Open35 { ctx, mma, ubatch } = o;
         let read = model::arch::qwen35moe::spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = read.spec;
         if layers != (0..spec.layers.len()) || ctx == 0 {
@@ -406,6 +508,7 @@ impl Body35 {
         }
         let kinds = kinds35(&spec.layers)?;
         let d = dims(&spec, &kinds, ctx)?;
+        let ubatch = ubatch_of(&d, ubatch)?;
         let base = spec
             .layers
             .iter()
@@ -435,18 +538,31 @@ impl Body35 {
             stores.push(store);
         }
         let rope = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
+        let rope = RopeRows::new(stream, &rope, q35::ROPE_DIMS as usize, ctx)?;
+        let s = Arena::new(stream, d, 1)?;
+        let sp = StepParams::new(stream, true)?;
+        let a = Arena::new(stream, d, MAX_PASS_ROWS)?;
+        let rp = RowsParams::new(stream)?;
+        let k = Kernels::load(gpu, true)?;
+        let head_state = HeadArgmaxState::new(stream)?;
+        let img = PromptImage::new(stream, ctx, true)?;
+        let (free, _) = gpu.mem_info()?;
+        let u = ubatch_arena(stream, d, ubatch.get(), free)?;
         Ok(Body35 {
             vocab: spec.vocab as usize,
             eps: spec.rms_eps,
             plans,
             stores,
-            rope: RopeRows::new(stream, &rope, q35::ROPE_DIMS as usize, ctx)?,
-            s: Arena::new(stream, d, 1)?,
-            sp: StepParams::new(stream, true)?,
-            a: Arena::new(stream, d, MAX_PASS_ROWS)?,
-            rp: RowsParams::new(stream)?,
-            k: Kernels::load(gpu, true)?,
-            head_state: HeadArgmaxState::new(stream)?,
+            rope,
+            s,
+            sp,
+            a,
+            rp,
+            u,
+            img,
+            ubatch,
+            k,
+            head_state,
             mma,
             taps: None,
         })
@@ -604,6 +720,167 @@ fn enqueue_rows(
     .walk()
 }
 
+impl Body35 {
+    /// Enqueue the unit of the image's `tokens`, standing at position `pos`
+    /// (the image's position for its first token, else refused): the walk
+    /// `(1, t, Step)` over the ubatch arena, ending in the head of its last
+    /// row when `head` is given.
+    fn walk_unit(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        tokens: Range<usize>,
+        pos: u32,
+        head: Option<&mut Head>,
+    ) -> Result<(), GpuError> {
+        const WHAT_UNIT: &str = "qwen35moe::walk_unit";
+        let want = u32::try_from(tokens.start)
+            .ok()
+            .and_then(|s| self.img.pos0.checked_add(s));
+        if want != Some(pos) {
+            return Err(GpuError::state(
+                WHAT_UNIT,
+                "the unit's first position is the image's position for its first token",
+            ));
+        }
+        let m = tokens.len();
+        let win = self.img.windows(tokens)?;
+        let Body35 {
+            eps,
+            plans,
+            stores,
+            rope,
+            u,
+            k,
+            head_state,
+            mma,
+            ..
+        } = self;
+        let c = PassCtx {
+            gpu,
+            w,
+            plans,
+            k,
+            mma: *mma,
+            eps: *eps,
+            table: &rope.table,
+        };
+        let tail = match head {
+            Some(head) => Tail::Last {
+                head,
+                state: head_state,
+            },
+            None => Tail::Pass,
+        };
+        Program {
+            c: &c,
+            stores: stores.as_mut_slice(),
+            s: u,
+            io: &win.io(),
+            m,
+            tail,
+        }
+        .walk()
+    }
+}
+
+impl GpuModel<Body35> {
+    /// The prompt call's ubatch size: the most tokens one ubatch takes.
+    pub fn ubatch(&self) -> Result<usize, GpuError> {
+        Ok(self.body("qwen35moe::ubatch")?.ubatch.get())
+    }
+
+    /// Run the prompt call in ubatches of up to `u` tokens from here on: the
+    /// ubatch arena reallocated for them, after [`Open35::ubatch`]'s checks
+    /// (the new arena is allocated before the old one is freed, so a refusal
+    /// or a failed allocation leaves the old size in place). Load-time
+    /// allocation; a token's values do not depend on the ubatch it lands in,
+    /// so a prompt leaves the same bits at every size.
+    pub fn set_ubatch(&mut self, u: usize) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen35moe::set_ubatch")?;
+        let d = body.u.dims;
+        let size = ubatch_of(&d, u)?;
+        let (free, _) = gpu.mem_info()?;
+        body.u = ubatch_arena(gpu.stream(), d, u, free)?;
+        body.ubatch = size;
+        Ok(())
+    }
+
+    /// The units [`GpuModel::prefill_with`] runs a prompt of `tokens` ids as
+    /// by `path`, at this model's ubatch size.
+    pub fn prefill_plan(&self, tokens: usize, path: PrefillPath) -> Result<PrefillPlan, GpuError> {
+        let ub = self.body("qwen35moe::prefill_plan")?.ubatch;
+        Ok(PrefillPlan::new(tokens, path, ub))
+    }
+
+    /// The last prompt image the prompt call wrote; `None` before one.
+    pub fn prompt_image(&self) -> Result<Option<ImageWrite>, GpuError> {
+        Ok(self.body("qwen35moe::prompt_image")?.img.last)
+    }
+
+    /// Feed `tokens` through the chain by the plan of `path` and return the
+    /// greedy next token after the last one; positions continue from wherever
+    /// the model stands. The prompt's image — its first position, its ids
+    /// and the lane word — is written and copied once, then each unit of the
+    /// plan is one walk over the ubatch arena, eager in either step mode: a
+    /// unit of at most [`GEMV_COLS`] rows (a pass, or a ubatch that short)
+    /// leaves the cache rows, the recurrent state and the logits of one step
+    /// per token bit for bit, a longer one agrees with them to its band
+    /// (`wide`). The last unit's last row runs the head. The layer taps must
+    /// be off, and every id must be below the vocabulary; a prompt past the
+    /// cache is refused before any launch.
+    pub fn prefill_with(&mut self, tokens: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
+        const WHAT_P: &str = "qwen35moe::prefill";
+        if tokens.is_empty() {
+            return Err(GpuError::shape(WHAT_P, "empty token slice"));
+        }
+        let pos0 = self.pos();
+        self.check_pos(
+            pos0 + launch_u32(WHAT_P, "tokens", tokens.len())? - 1,
+            WHAT_P,
+        )?;
+        let plan = self.prefill_plan(tokens.len(), path)?;
+        {
+            let (gpu, _, body) = self.body_parts(WHAT_P)?;
+            if body.taps.is_some() {
+                return Err(GpuError::state(
+                    WHAT_P,
+                    "layer taps off (a prompt unit writes none)",
+                ));
+            }
+            if let Some((i, &id)) = tokens
+                .iter()
+                .enumerate()
+                .find(|&(_, &id)| id as usize >= body.vocab)
+            {
+                return Err(GpuError::shape(
+                    WHAT_P,
+                    format!(
+                        "token {i} is id {id}, past the vocabulary of {}",
+                        body.vocab
+                    ),
+                ));
+            }
+            body.img.write(gpu.stream(), tokens, pos0)?;
+        }
+        let n_steps = plan.steps.len();
+        let (mut at, mut next) = (0usize, None);
+        for (i, &step) in plan.steps.iter().enumerate() {
+            let t = match step {
+                PrefillStep::Ubatch(t) | PrefillStep::Pass(t) => t,
+            };
+            let last = i + 1 == n_steps;
+            let unit = at..at + t;
+            at += t;
+            next = self.run_rows(t, WHAT_P, |gpu, w, body, head, pos| {
+                body.walk_unit(gpu, w, unit, pos, last.then_some(head))?;
+                Ok(last)
+            })?;
+        }
+        next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
+    }
+}
+
 impl ChainBody for Body35 {
     type Input = DecodeInput35;
     type Host = NoHost;
@@ -664,6 +941,8 @@ impl ChainBody for Body35 {
             + self.sp.bytes()
             + self.a.bytes()
             + self.rp.bytes()
+            + self.u.bytes()
+            + self.img.bytes()
             + self.head_state.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }
