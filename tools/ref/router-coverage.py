@@ -5,6 +5,7 @@
     tools/ref/router-coverage.py transfer <set A> <set B> [--n 64]
     tools/ref/router-coverage.py compare <set A> <set B>
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
+    tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec> [--hot <file>]] [--layers 2-39]
     tools/ref/router-coverage.py --self-test
 
 A set is a directory router_trace wrote under $BLOOMERY_DATA/router/: counts.tsv, topk-<layer>.u16
@@ -21,14 +22,29 @@ coverage  Per layer: the share of the layer's selections (tokens x n_expert_used
           tables:
             in    the hot list and the share come from the same tokens. Biased up: the top n of noisy
                   counts are partly the lucky ones.
-            held  the hot list from the first half of the tokens, the share on the second half — what
-                  a placement fixed before the traffic would serve, and the noise floor for `transfer`.
+            held  the hot list from the tokens before the held-out split, the share on the tokens after
+                  it — what a placement fixed before the traffic would serve, and the noise floor for
+                  `transfer`. The split is the chunk boundary nearest T / 2 (held_split), so no context
+                  is cut in two; a set without a `chunk` line, or of one chunk, splits at T / 2.
 transfer  Per layer, with each set's hot-n list learned on all its tokens: the overlap |hot(A) & hot(B)|,
           A's list measured on B's selections beside B's own list on B (in-sample) and B's held-out
-          share, and the same the other way round. Does a list learned on one stream serve another?
+          share (split as coverage's), and the same the other way round. Does a list learned on one stream serve another?
 compare   Two traces of the same tokens (another schedule, ubatch or backend), token by token, per
           layer: the ids equal in rank order, the ids shared as sets, the tokens whose selection is the
           same set, and the first layer where any token's set differs.
+bursts    Per window of W consecutive positions inside one chunk (--window, default 512; a window across a
+          chunk edge crosses a context reset and is skipped), how bursty the routing of the host experts
+          is — the experts the card does not hold (--n-l and --hot as tools/ref/window-union.py reads
+          them; without --n-l every expert is a host expert). Two tables:
+            m     per window and host expert, m = the window's selections of it, over m̄ = W x
+                  n_expert_used / n_expert (every expert's mean): p50, p90, p99 and max of m / m̄ over the
+                  (window, host expert) pairs the window touches, and the share of the host slots taken
+                  by experts with m >= 2m̄, 3m̄, 4m̄ and by the window's hottest tenth of host experts
+            phi   per window, the fraction phi of the host experts that reproduces the window's count of
+                  touched host experts when each routes at rate lambda / phi, lambda = its set-wide count
+                  x W / tokens: sum over host experts of phi (1 - (1 - min(lambda / (phi W), 1))^W), solved
+                  by bisection on (0, 1]; phi 1 is routing that follows the set-wide rates (tools/flow's
+                  prose_phi rows are this quantity fitted from a union's time). Mean, p10, p90 and window 0
 oracle    Per layer, the set's ids against the oracle set's integer twin of ffn_moe_topk-<layer>,
           integer for integer in rank order, and as sets. The twin is the one the oracle manifest's
           `tensor` row points at: the logical twin when the row marks a view (its flat file is the
@@ -138,6 +154,18 @@ def pct(v):
     return f"{100.0 * v:.1f}"
 
 
+def held_split(s):
+    """The held-out split: the chunk boundary nearest T / 2 (ties to the lower one), so the learning and
+    the held-out halves are whole contexts; T / 2 when the set has no `chunk` line or no boundary inside
+    it (one context)."""
+    T = s["tokens"]
+    chunk = int(s["header"].get("chunk", 0) or 0)
+    if chunk <= 0 or chunk >= T:
+        return T // 2
+    bounds = range(chunk, T, chunk)
+    return min(bounds, key=lambda b: (abs(b - T // 2), b))
+
+
 def coverage(set_dirs, asked=None, keep=None):
     for d in set_dirs:
         s = read_manifest(d)
@@ -148,7 +176,7 @@ def coverage(set_dirs, asked=None, keep=None):
         if not all(0 < n <= E for n in n_list):
             raise SetError(f"{d}: --n {','.join(map(str, n_list))} is not within 1..{E}")
         h = s["header"]
-        half = T // 2
+        half = held_split(s)
         print(f"## {d}\n")
         print(f"{T} tokens of {h.get('ids', '?')} (md5 {h.get('ids_md5', '?')}), chunk {h.get('chunk', '?')}, "
               f"{len(s['layers'])} layers, {E} experts, top-{K}. held = hot list from tokens [0, {half}), "
@@ -206,8 +234,8 @@ def transfer(dir_a, dir_b, n):
     E, K = a["n_expert"], a["n_used"]
 
     def held(s, l):
-        ids, T = read_topk(s, l), s["tokens"]
-        return share(count(ids, E, T // 2, T, K), hot(count(ids, E, 0, T // 2, K), n))
+        ids, T, half = read_topk(s, l), s["tokens"], held_split(s)
+        return share(count(ids, E, half, T, K), hot(count(ids, E, 0, half, K), n))
 
     print(f"## hot-{n} transfer: A = {dir_a} ({a['tokens']} tokens), B = {dir_b} ({b['tokens']} tokens)\n")
     print(f"Shares are of the evaluated set's selections, %. Uniform: {pct(n / E)}.\n")
@@ -255,6 +283,108 @@ def compare(dir_a, dir_b):
             first_diff = l
         print(f"| {l} | {pct(ranked / (T * K))} | {pct(shared / (T * K))} | {pct(same / T)} |")
     print(f"\nfirst layer with a differing set: {first_diff if first_diff is not None else 'none'}\n")
+
+
+def window_union():
+    """tools/ref/window-union.py, loaded by path when a command needs a placement (it loads this file)."""
+    spec = importlib.util.spec_from_file_location(
+        "window_union", os.path.join(os.path.dirname(os.path.abspath(__file__)), "window-union.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def solve_phi(lams, window, touched):
+    """The phi in (0, 1] at which sum over lams of phi (1 - (1 - min(lam / (phi window), 1))^window) equals
+    touched; the sum rises with phi, so bisection. A window that touches more than phi 1 predicts reads 1."""
+    def f(phi):
+        return sum(phi * (1.0 - (1.0 - min(lam / (phi * window), 1.0)) ** window) for lam in lams)
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if f(mid) > touched:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def burst_stats(s, card, window, keep=None):
+    """Per window of `window` positions inside one chunk: the m / m̄ samples of the touched host experts,
+    the slot shares by m threshold and of the hottest tenth, and phi."""
+    T, K, E = s["tokens"], s["n_used"], s["n_expert"]
+    chunk = int(s["header"].get("chunk", 0) or 0) or T
+    starts = [w for w in range(0, T - window + 1, window) if w // chunk == (w + window - 1) // chunk]
+    if not starts:
+        raise SetError(f"{s['dir']}: no window of {window} positions inside a chunk of {chunk}")
+    mbar = window * K / E
+    layers = [l for l in s["layers"] if keep is None or l in keep]
+    counts = read_counts(s)
+    per_window = [[0] * E for _ in starts]  # scratch reused per layer
+    touched = [0] * len(starts)
+    slots = [0] * len(starts)
+    thresh = {2: [0] * len(starts), 3: [0] * len(starts), 4: [0] * len(starts)}
+    top_tenth = [0] * len(starts)
+    ratios = []
+    lams = []
+    for l in layers:
+        host = [e for e in range(E) if e not in card.get(l, ())]
+        lams.extend(counts[l][e] * window / T for e in host if counts[l][e])
+        ids = read_topk(s, l)
+        for i, w in enumerate(starts):
+            m = per_window[i]
+            for e in range(E):
+                m[e] = 0
+            for e in ids[w * K:(w + window) * K]:
+                m[e] += 1
+            hm = sorted((m[e] for e in host if m[e]), reverse=True)
+            touched[i] += len(hm)
+            slots[i] += sum(hm)
+            for x, acc in thresh.items():
+                acc[i] += sum(v for v in hm if v >= x * mbar)
+            top_tenth[i] += sum(hm[:max(1, len(host) // 10)]) if hm else 0
+            ratios.extend(v / mbar for v in hm)
+    phis = [solve_phi(lams, window, touched[i]) for i in range(len(starts))]
+    return {"windows": len(starts), "mbar": mbar, "layers": len(layers), "ratios": sorted(ratios),
+            "slots": slots, "thresh": thresh, "top_tenth": top_tenth, "phi": phis, "touched": touched}
+
+
+def bursts(set_dirs, window, spec=None, hot_path=None, keep=None):
+    wu = window_union() if spec else None
+    for d in set_dirs:
+        s = read_manifest(d)
+        if keep is not None and not set(keep) <= set(s["layers"]):
+            raise SetError(f"{d}: --layers {sorted(set(keep) - set(s['layers']))} not in the set")
+        if spec:
+            n_l = wu.parse_n_l(spec, s["layers"])
+            card = wu.card_sets(s["layers"], n_l, s["n_expert"], wu.read_hot(hot_path) if hot_path else None)
+        else:
+            card = {l: set() for l in s["layers"]}
+        b = burst_stats(s, card, window, keep)
+        r = b["ratios"]
+        total = sum(b["slots"])
+
+        def q(v):
+            return r[min(len(r) - 1, int(v * (len(r) - 1) + 0.5))] if r else float("nan")
+
+        def mean_share(acc):
+            v = [a / sl for a, sl in zip(acc, b["slots"]) if sl]
+            return sum(v) / len(v) if v else float("nan")
+        phis = sorted(b["phi"])
+        print(f"## {d}: {b['windows']} windows of {window} inside chunks of {s['header'].get('chunk', '-')}, "
+              f"{b['layers']} layers, card {'n_l ' + spec if spec else 'none'}"
+              f"{', list ' + hot_path if hot_path else ''}, m̄ {b['mbar']:.2f}\n")
+        print("| host slots/window, layers summed | p50 m/m̄ | p90 | p99 | max | slots m>=2m̄ | >=3m̄ | >=4m̄ | hottest tenth |")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print(f"| {total / b['windows']:.0f} | {q(0.5):.2f} | {q(0.9):.2f} | {q(0.99):.2f} | "
+              f"{(r[-1] if r else float('nan')):.1f} | {pct(mean_share(b['thresh'][2]))} | "
+              f"{pct(mean_share(b['thresh'][3]))} | {pct(mean_share(b['thresh'][4]))} | "
+              f"{pct(mean_share(b['top_tenth']))} |\n")
+        print("| phi mean | p10 | p90 | window 0 | touched host experts/window |")
+        print("|---:|---:|---:|---:|---:|")
+        print(f"| {sum(phis) / len(phis):.3f} | {phis[int(0.1 * (len(phis) - 1) + 0.5)]:.3f} | "
+              f"{phis[int(0.9 * (len(phis) - 1) + 0.5)]:.3f} | {b['phi'][0]:.3f} | "
+              f"{sum(b['touched']) / b['windows']:.0f} |\n")
 
 
 def read_oracle(oracle_dir):
@@ -339,25 +469,28 @@ def self_test():
     E, K = 8, 2
     MODEL = "/models/q3/m-00001-of-00002.gguf"
     with tempfile.TemporaryDirectory() as tmp:
-        def make(name, rows_by_layer, complete=True, model=MODEL):
+        def make(name, rows_by_layer, complete=True, model=MODEL, chunk=None, n_expert=E):
             d = os.path.join(tmp, name)
             os.mkdir(d)
             T = len(next(iter(rows_by_layer.values())))
             with open(os.path.join(d, "counts.tsv"), "w") as f:
                 f.write("# layer\texpert\tcount\n")
                 for l, rows in rows_by_layer.items():
-                    c = [0] * E
+                    c = [0] * n_expert
                     for r in rows:
                         for e in r:
                             c[e] += 1
-                    for e in range(E):
+                    for e in range(n_expert):
                         f.write(f"{l}\t{e}\t{c[e]}\n")
                     with open(os.path.join(d, f"topk-{l}.u16"), "wb") as g:
                         g.write(array("H", [e for r in rows for e in r]).tobytes())
             with open(os.path.join(d, "MANIFEST.tsv"), "w") as f:
-                f.write("# router_trace — self-test\n# tokens\t%d\n# n_expert\t%d\n# n_expert_used\t%d\n" % (T, E, K))
+                f.write("# router_trace — self-test\n# tokens\t%d\n# n_expert\t%d\n# n_expert_used\t%d\n"
+                        % (T, n_expert, len(next(iter(rows_by_layer.values()))[0])))
                 if model is not None:
                     f.write(f"# model\t{model}\n")
+                if chunk:
+                    f.write(f"# chunk\t{chunk}\n")
                 f.write("# model_file\tm.gguf\n# build\tb\n# ids\t%s\n" % os.path.join(d, "ids"))
                 f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
                 for l in rows_by_layer:
@@ -378,6 +511,32 @@ def self_test():
         assert share(c, hot(c, 2)) == 12 / 16 and hot(c, 2) == [0, 1], (c, hot(c, 2))
         assert abs(gini([0] * 7 + [1]) - 7 / 8) < 1e-12
         assert agreement([1, 2, 3, 4], [2, 1, 3, 5], K) == (1, 3, 1)
+        # the held-out split lands on the chunk boundary nearest T / 2, never inside a context
+        assert held_split({"tokens": 50000, "header": {"chunk": "2048"}}) == 24576
+        assert held_split({"tokens": 10, "header": {"chunk": "4"}}) == 4
+        assert held_split({"tokens": 12, "header": {"chunk": "4"}}) == 4  # 4 and 8 tie around 6: the lower
+        assert held_split({"tokens": 10, "header": {}}) == 5
+        assert held_split({"tokens": 10, "header": {"chunk": "16"}}) == 5
+        # bursts: routing that follows the set-wide rates everywhere reads phi 1 — 16 experts over 8
+        # windows of 4 rows, every window every expert twice (K 8)
+        flat = [[(t * 8 + j) % 16 for j in range(8)] for t in range(32)]
+        b = burst_stats(read_manifest(make("flat", {0: flat}, n_expert=16, chunk=16)), {0: set()}, 4)
+        assert b["windows"] == 8 and abs(b["mbar"] - 2.0) < 1e-12, b["windows"]
+        assert all(abs(p - 1.0) < 1e-9 for p in b["phi"]), b["phi"]
+        assert b["ratios"] == [1.0] * 128 and all(v == 0 for v in b["thresh"][2])
+        # a burst: each window of 4 rows picks the same two experts, a new pair per window; each
+        # expert's set-wide rate is 0.5 a window, so phi solves 16 phi (1 - (1 - 1 / (8 phi))^4) = 2:
+        # phi 1/8, and every touched expert takes m = 4 = 8 m̄ (m̄ = 4 x 2 / 16)
+        burst = [[2 * (t // 4), 2 * (t // 4) + 1] for t in range(32)]
+        b = burst_stats(read_manifest(make("burst", {0: burst}, n_expert=16)), {0: set()}, 4)
+        assert all(abs(p - 0.125) < 1e-9 for p in b["phi"]), b["phi"]
+        assert b["ratios"] == [8.0] * 16 and b["thresh"][4] == b["slots"], (b["ratios"], b["thresh"])
+        # the cap: an expert whose rate is past phi W reads 1, not a power of a negative base — one at
+        # 8 a window and 16 at 0.5 over W 4 touching 2 solve phi + 16 phi = 2 with every rate capped
+        assert abs(solve_phi([8.0] + [0.5] * 16, 4, 2.0) - 2 / 17) < 1e-9
+        # experts 0 and 1 on the card: window 0 touches no host expert, window 1 two
+        b = burst_stats(read_manifest(make("burst2", {0: burst}, n_expert=16)), {0: {0, 1}}, 4)
+        assert b["touched"][0] == 0 and b["touched"][1] == 2
         try:
             read_manifest(make("x", {0: uniform}, complete=False))
             raise AssertionError("an incomplete set was accepted")
@@ -434,6 +593,7 @@ def self_test():
                 pass
             transfer(two, two, 2)
             compare(two, two)
+            bursts([two], 2)
         finally:
             sys.stdout = saved
             devnull.close()
@@ -467,6 +627,27 @@ def main(argv):
             return 0
         if len(argv) == 3 and argv[0] == "oracle":
             return oracle(argv[1], argv[2])
+        if len(argv) >= 2 and argv[0] == "bursts":
+            sets, opts = [], {}
+            it = iter(argv[1:])
+            for a in it:
+                if a in ("--window", "--n-l", "--hot", "--layers"):
+                    v = next(it, None)
+                    if v is None:
+                        raise SetError(f"{a} takes a value")
+                    opts[a] = v
+                elif a.startswith("-"):
+                    raise SetError(f"bursts: unknown flag {a}")
+                else:
+                    sets.append(a)
+            if "--hot" in opts and "--n-l" not in opts:
+                raise SetError("bursts: --hot names the card's order; --n-l says how many it keeps")
+            window = int(opts.get("--window", 512))
+            if window < 1 or not sets:
+                raise SetError("bursts: a set and a window of at least one position")
+            keep = layer_list(opts["--layers"]) if "--layers" in opts else None
+            bursts(sets, window, opts.get("--n-l"), opts.get("--hot"), keep)
+            return 0
     except SetError as e:
         print(f"router-coverage: {e}", file=sys.stderr)
         return 1

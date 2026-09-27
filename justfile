@@ -277,6 +277,21 @@ ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
 time-gpu-cnode:
     ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
 
+# 호스트 → 카드 링크(리드 전용): `nvidia-smi topo -m`과 카드마다 PCI 주소·sysfs 경로·링크를 찍고, A6000에서 1 GiB pinned와
+# pageable(facts.md의 교정값), 1.6 GB pinned 복사 48회 연속(복사마다 GB/s의 퍼짐, 복사 중에 읽은 링크)을 잰다.
+# BLOOMERY_CARD=both면 3090 단독과 두 카드 동시 복사(카드별 율과 합)도 잰다. 임대·증인·Xid 수는 tools/ref/h2d-pcie.sh가
+# 쥐고, 카드는 docs/cards/pcie-a6000.card다. 예: `BLOOMERY_CARD=both BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/pcie-a6000.card' just time-gpu-h2d`.
+time-gpu-h2d:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/h2d-pcie.sh'
+
+# 호스트 → 카드 복사가 호스트 티어의 DRAM 읽기에서 뺏는 몫(리드 전용): bench_v41_host --time을 단독으로, h2d_probe의
+# pageable-loop 옆에서, staged-loop(스트리밍 설계의 pinned 링) 옆에서 라운드마다 번갈아 돌린다. 복사는 벤치가 비워 둔 코어에
+# 고정하고, 라운드마다 두 율과 k = (U_alone − U_with) / C_with를 찍는다. ARGS는 tools/ref/dma-dram-share.sh로 간다(--arms는
+# 벤치의 팔을 그대로 넘기고 --rounds, --seconds, --chunk, --fill-threads …). 카드는 docs/cards/dma-dram-share.card다.
+# 예: `BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share.card' just time-dma-dram --arms engine:6`.
+time-dma-dram *ARGS:
+    BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/dma-dram-share.sh {{ARGS}}'
+
 # 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
 # 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
 # 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`.

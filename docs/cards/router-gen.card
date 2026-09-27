@@ -1,0 +1,41 @@
+# Round probes38, P3: every residency verdict (ideaverify V1) rests on teacher-forced human text. Decode
+# routes over the model's own greedy output, which repeats more (rig-log 09-24 free-draft: lookup
+# acceptance 0.31-0.60 on text). Teacher-forcing our engine's greedy continuation through ik's router
+# trace gives decode's routing up to near-ties (same prefix, same argmax).
+# The comparison stays inside one model file: the V1 sets were traced from the dropped
+# engramQ8-tokembdBF16-attnQ8 file, whose shards share their names with the public Q3_K_M's, so this run
+# traces two sets from the public file (the profile's V41_MODEL): gen-v41, four chunks of a 256-id prompt
+# and our greedy 1,792 ids, and gen-v41-text, the same four prompts continued by the corpus's own 1,792
+# ids. router-residency.py refuses sets of two model files (their `# model` lines).
+# Paper: ideaverify's mid setting read 77.9-81.1 % on text; generated text repeats more, so its hit
+# should sit at or above the text arm's: +0..+8 points; the low edge allows 2 points of noise over four
+# chunks (7,168 scored steps an arm) [derived].
+# Precondition, the ids (box, no lease: a functional run on the 3090's gate placement, ~2-4 min a
+# prompt [assumed load time], 8-16 min in all): for each of the four prompts — the first 256 ids of
+# corpus-prose-all.ids, of corpus-code.ids, of corpus-korean.ids, and ids 200,000..200,255 of
+# corpus-prose-all.ids — `bash tools/gpu-gate.sh generate_ds41 --place gate --tokens <ids> -n 1792`, its
+# `tokens` record appended after the prompt (2,048 ids a chunk, one id a line); the text arm's chunk is the
+# corpus's 2,048 ids from the same start. The two ids files and the four generate_ds41 logs go beside the
+# sets.
+# Wall of the traces [derived]: 8,192 ids each at the prose set's 66.5 tok/s = 2.1 min, plus a cold read of
+# the public file's experts, 3-6 min each, 6-12 min for both, inside the harness's 1800 s bound; the replay
+# is the Mac's (~5 s a set).
+kind: profile
+question: on the model's own greedy continuation, does Strata's adaptive rule hold the card hit it
+  holds on human text?
+term: hit(gen-v41) - hit(gen-v41-text), in points: router-residency.py replay <set> --split 0 --n-l
+  spread:2668@2-39 --policy strata (mid: every 4, cap 24, margin 3, decay 0.9, min count 2) --seed
+  prefix --score 256-2047 --expert-bytes 16773120 --step-ms 25.3, plan (a)'s n_l 70/71 on layers 2-39,
+  positions 256-2047 of each chunk (the generated ones)
+unit: points
+predict: -2..8
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/router-gen.card' just trace-router
+  <gen ids path> --name gen-v41 --chunk 2048, then the same for <text ids path> --name gen-v41-text,
+  each under the CPU lease with its witness blocks and 1800 s bound; both sets' manifests carry their
+  complete trailer and the same `# model` line (the public Q3_K_M's first shard); the four generate_ds41
+  logs show 1,792 generated ids each (no early end); the Mac replays both sets with the same command
+decide-in: adaptive residency stands on generation: open runtime/residency.rs at the mid setting
+decide-below: generation is less local than text: re-run the V1 grid on gen-v41 before building, and
+  price the verdict at the generated hit
+decide-above: generation is more local: the swap cap can drop; re-read the grid's low-cap rows on
+  gen-v41 before residency.rs is sized
