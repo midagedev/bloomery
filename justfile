@@ -53,6 +53,11 @@ mac-lint:
 mac-fmt-check:
     ./tools/mac-check.sh fmt-check
 
+# 순수 크레이트(tools/recipes.py pure-crates가 크레이트 그래프와 소스로 고른 것)의 `cargo test -p`를 맥에서 네이티브로 돈다.
+# 개발 루프의 증거이고, 착륙의 증거는 박스의 기록이다.
+mac-test:
+    ./tools/mac-check.sh test
+
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
     ./tools/check-recipes.sh

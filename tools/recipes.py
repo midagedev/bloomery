@@ -12,6 +12,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
+    python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -51,6 +52,42 @@ value is the list itself: no forgotten gate, and a gate left out is a printed re
 What this layer cannot see: data under $BLOOMERY_DATA and the ik trees (not in git), and a card
 dependence (BLOOMERY_GATE_CARD). The box's dep-info can be stale or missing; the walk does not depend
 on it, and the notes say which targets had one and how old it is.
+
+Pure crates (`pure-crates`). A workspace crate is pure when `cargo test -p <crate>` builds and runs on aarch64-apple-darwin, and the
+rule below decides it from the tree without building anything. Two conditions, both over every feature
+of the crate (its optional dependencies enabled, `cfg(feature = …)` read as unknown), so the verdict
+does not depend on which feature set a recipe picks:
+
+  1. No device root in its dependency closure. The closure is the crate's normal, build and dev
+     dependencies, the workspace ones' normal and build dependencies transitively (an optional one of a
+     workspace dependency counts as enabled), and every external package's dependencies as Cargo.lock
+     resolves them. The roots are read from Cargo.lock: every package whose source is a cuda-oxide git
+     repository (NVlabs' or the fork's spelling), and cutile-rs's `cuda-core` and `cuda-bindings`. The
+     bloomery device crates (bloomery-gpu, -gpu-deepseek41, -gpu-vision) declare cuda-device and
+     cuda-host themselves, so they are the first hop of the chain the reason prints, not a second list.
+  2. No code the Mac cannot build or run, in the files `cargo test -p <crate>` compiles: the crate's own
+     targets (lib with its test modules, bins, tests, examples, doctests, build script) and the libs of
+     its dependencies as a dependent sees them. What counts is what the crates use:
+     `std::arch::x86_64` / `core::arch::x86_64`, `#[target_feature(…)]`, `is_x86_feature_detected!`,
+     `std::os::linux`, the Linux-only libc items the tree calls (cpu_set_t and CPU_*, sched_*affinity,
+     posix_fadvise, sync_file_range, RUSAGE_THREAD, renameat2, prctl, MADV_POPULATE_*, the huge-page
+     flags), memmap2's Linux-only advice (PopulateRead/Write, HugePage, NoHugePage), and a "/proc/" or
+     "/sys/" path literal (the file does not exist on the Mac, so the code that reads it fails there).
+     Comments are not code. An item or statement under a `#[cfg(…)]` that is false on
+     aarch64-apple-darwin (target_arch, target_os, target_family, target_vendor, target_env,
+     target_pointer_width, target_endian, unix, windows) is left out, up to its end — the `;` or `,` at
+     its own depth, its closing brace, or the close of the block around it, whichever comes first. A
+     file whose `#![cfg(…)]` is false is left out whole. `cfg(test)` is unknown in the crate's own files
+     (both sides are built) and false in a dependency's (its test modules are not built). Any other
+     predicate is unknown, and an unknown one leaves the item in.
+
+The rule errs one way: whatever it cannot read stays in, so a crate is rejected with a line to look at,
+never selected on a guess. A file module declared under a target cfg (`#[cfg(target_arch = "x86_64")]
+mod avx;`) is still read — the module walk does not evaluate target cfgs. Two gaps go the other way,
+and both fail loudly: a doc comment's example is blanked as a comment but compiled by `cargo test` as a
+doctest, and a Linux-only name missing from the list above is not seen. Either way the crate is
+selected and its native build fails in `just mac-test`, which names it — a rule bug to fix here, never
+an exception list.
 """
 
 from __future__ import annotations
@@ -1427,6 +1464,363 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------------------------
+# pure crates: the ones `tools/mac-check.sh test` runs natively on the Mac
+# ----------------------------------------------------------------------------------------------
+# The rule is the module docstring's «pure crates» paragraphs; `tools/mac-check.sh test` runs what it selects.
+
+MAC_TARGET = "aarch64-apple-darwin"
+# The cfg keys and names whose value on MAC_TARGET is fixed; every other predicate is unknown.
+_MAC_CFG_KEYS = {
+    "target_arch": "aarch64",
+    "target_os": "macos",
+    "target_family": "unix",
+    "target_vendor": "apple",
+    "target_env": "",
+    "target_pointer_width": "64",
+    "target_endian": "little",
+}
+_MAC_CFG_NAMES = {"unix": True, "windows": False}
+DEVICE_GIT_SOURCE = "/cuda-oxide.git"
+DEVICE_REGISTRY_ROOTS = ("cuda-core", "cuda-bindings")
+_NOT_ON_MAC = [
+    (re.compile(r"\b(?:std|core)::arch::x86_64\b"), "x86_64 intrinsics"),
+    (re.compile(r"#\s*\[\s*target_feature\s*\("), "#[target_feature]"),
+    (re.compile(r"\bis_x86_feature_detected!"), "is_x86_feature_detected!"),
+    (re.compile(r"\bstd::os::linux\b"), "std::os::linux"),
+    (
+        re.compile(
+            r"\blibc::(?:cpu_set_t|CPU_[A-Z_]+|sched_[gs]etaffinity|sched_getcpu|posix_fadvise|POSIX_FADV_[A-Z_]+|sync_file_range"
+            r"|SYNC_FILE_RANGE_[A-Z_]+|RUSAGE_THREAD|renameat2|RENAME_[A-Z_]+|prctl|PR_[A-Z_]+|MADV_POPULATE_[A-Z_]+"
+            r"|MADV_(?:NO)?HUGEPAGE|MAP_POPULATE|MAP_HUGETLB)\b"
+        ),
+        "a Linux-only libc item",
+    ),
+    (re.compile(r"\bAdvice::(?:PopulateRead|PopulateWrite|HugePage|NoHugePage)\b"), "memmap2's Linux-only advice"),
+    (re.compile(r"\"/(?:proc|sys)/"), "a Linux /proc or /sys path"),
+]
+_CFG_ATTR = re.compile(r"#(!?)\s*\[\s*cfg\s*\(")
+_RAW_STR = re.compile(r"b?r(#*)\"")
+_IDENT_CH = re.compile(r"[A-Za-z0-9_]")
+
+
+def _blank(buf: list[str], a: int, b: int) -> None:
+    for i in range(a, b):
+        if buf[i] != "\n":
+            buf[i] = " "
+
+
+def rust_lex(text: str) -> tuple[str, str]:
+    """(code, shape), both as long as `text` with its newlines: `code` has the comments blanked, `shape`
+    also the contents of string and char literals — brackets are counted on `shape`, patterns matched on
+    `code` (a path literal is in a string)."""
+    code, shape = list(text), list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            _blank(code, i, j)
+            _blank(shape, i, j)
+            i = j
+            continue
+        if text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            _blank(code, i, j)
+            _blank(shape, i, j)
+            i = j
+            continue
+        if c in "br" and (i == 0 or not _IDENT_CH.match(text[i - 1])):
+            m = _RAW_STR.match(text, i)
+            if m:
+                close = '"' + m.group(1)
+                j = text.find(close, m.end())
+                j = n if j < 0 else j
+                _blank(shape, m.end(), j)
+                i = j + len(close)
+                continue
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            _blank(shape, i + 1, min(j, n))
+            i = j + 1
+            continue
+        if c == "'":
+            if i + 1 < n and text[i + 1] == "\\":
+                j = text.find("'", i + 3)
+                j = n if j < 0 else j
+                _blank(shape, i + 1, j)
+                i = j + 1
+                continue
+            if i + 2 < n and text[i + 2] == "'":
+                _blank(shape, i + 1, i + 2)
+                i += 3
+                continue
+        i += 1
+    return "".join(code), "".join(shape)
+
+
+_CFG_TOKEN = re.compile(r"\s*(?:([A-Za-z_][A-Za-z0-9_]*)|\"((?:\\.|[^\"\\])*)\"|([=(),]))")
+
+
+def parse_cfg(text: str):
+    """A cfg predicate as a tree — ("name", n) | ("kv", k, v) | (op, [items]) for all/any/not — or None
+    when it is not one this parser reads."""
+    toks: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(text.rstrip()):
+        m = _CFG_TOKEN.match(text, pos)
+        if not m:
+            return None
+        pos = m.end()
+        if m.group(1) is not None:
+            toks.append(("id", m.group(1)))
+        elif m.group(2) is not None:
+            toks.append(("str", m.group(2)))
+        else:
+            toks.append(("p", m.group(3)))
+    at = 0
+
+    def pred():
+        nonlocal at
+        if at >= len(toks) or toks[at][0] != "id":
+            raise ValueError
+        name = toks[at][1]
+        at += 1
+        if at < len(toks) and toks[at] == ("p", "="):
+            if at + 1 >= len(toks) or toks[at + 1][0] != "str":
+                raise ValueError
+            at += 2
+            return ("kv", name, toks[at - 1][1])
+        if at < len(toks) and toks[at] == ("p", "("):
+            if name not in ("all", "any", "not"):
+                raise ValueError
+            at += 1
+            items = []
+            while at < len(toks) and toks[at] != ("p", ")"):
+                items.append(pred())
+                if at < len(toks) and toks[at] == ("p", ","):
+                    at += 1
+            if at >= len(toks):
+                raise ValueError
+            at += 1
+            if name == "not" and len(items) != 1:
+                raise ValueError
+            return (name, items)
+        return ("name", name)
+
+    try:
+        tree = pred()
+    except ValueError:
+        return None
+    return tree if at == len(toks) else None
+
+
+def eval_cfg(pred, test: bool | None) -> bool | None:
+    """The predicate on MAC_TARGET: True, False, or None (unknown). `test` is cfg(test)'s value."""
+    if pred is None:
+        return None
+    kind = pred[0]
+    if kind == "name":
+        if pred[1] == "test":
+            return test
+        return _MAC_CFG_NAMES.get(pred[1])
+    if kind == "kv":
+        if pred[1] in _MAC_CFG_KEYS:
+            return _MAC_CFG_KEYS[pred[1]] == pred[2]
+        return None
+    vals = [eval_cfg(p, test) for p in pred[1]]
+    if kind == "not":
+        return None if vals[0] is None else not vals[0]
+    if kind == "all":
+        return False if False in vals else (True if all(v is True for v in vals) else None)
+    return True if True in vals else (False if all(v is False for v in vals) else None)
+
+
+def _item_end(shape: str, start: int) -> int:
+    """The end of the item or statement that starts at `start`: after its `;` or `,` at its own depth or
+    its closing brace, or before the bracket that closes the block around it."""
+    depth, braced = 0, False
+    for j in range(start, len(shape)):
+        c = shape[j]
+        if c in "([{":
+            depth += 1
+            braced = braced or c == "{"
+        elif c in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+            if depth == 0 and c == "}" and braced:
+                return j + 1
+        elif c in ";," and depth == 0:
+            return j + 1
+    return len(shape)
+
+
+def mac_view(text: str, test: bool | None) -> str:
+    """`text` as aarch64-apple-darwin compiles it: comments blanked, and every item or statement under a
+    `#[cfg(…)]` false there (a file under a false `#![cfg(…)]`) blanked; newlines kept, so line numbers hold."""
+    code, shape = rust_lex(text)
+    out = list(code)
+    pos = 0
+    while True:
+        m = _CFG_ATTR.search(shape, pos)
+        if not m:
+            break
+        open_at = m.end() - 1
+        depth, close = 0, None
+        for j in range(open_at, len(shape)):
+            if shape[j] == "(":
+                depth += 1
+            elif shape[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+        if close is None:
+            break
+        rb = re.compile(r"\s*\]").match(shape, close + 1)
+        if not rb:
+            pos = close + 1
+            continue
+        attr_end = rb.end()
+        val = eval_cfg(parse_cfg(code[open_at + 1 : close]), test)
+        if val is False:
+            if m.group(1):
+                _blank(out, 0, len(out))
+                break
+            end = _item_end(shape, attr_end)
+            _blank(out, m.start(), end)
+            pos = end
+        else:
+            pos = attr_end
+    return "".join(out)
+
+
+def mac_hits(text: str, test: bool | None) -> list[tuple[int, str, str]]:
+    """(line, what, the line's code) for every use in `text` the Mac cannot build or run."""
+    hits = []
+    for no, line in enumerate(mac_view(text, test).split("\n"), 1):
+        for pat, what in _NOT_ON_MAC:
+            m = pat.search(line)
+            if m:
+                hits.append((no, f"{what} ({m.group(0).strip()})", line.strip()[:120]))
+    return hits
+
+
+@dataclass
+class Lock:
+    roots: set[str]  # device roots by package name
+    deps: dict[str, set[str]]  # package name -> the names it depends on, every version merged
+
+
+def load_lock(root: str) -> Lock:
+    import tomllib
+
+    path = os.path.join(root, "Cargo.lock")
+    if not os.path.isfile(path):
+        raise RecipeError(f"no Cargo.lock in {root} — the device roots and the external closure are read from it")
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    roots: set[str] = set()
+    deps: dict[str, set[str]] = {}
+    for p in data.get("package", []):
+        name = p["name"]
+        if DEVICE_GIT_SOURCE in p.get("source", "") or name in DEVICE_REGISTRY_ROOTS:
+            roots.add(name)
+        deps.setdefault(name, set()).update(d.split(" ", 1)[0] for d in p.get("dependencies", []))
+    return Lock(roots, deps)
+
+
+def device_chain(tree: Tree, lock: Lock, name: str) -> str | None:
+    """The shortest chain from `name` to a device root, or None."""
+    pkg = tree.packages[name]
+    _, on, _ = tree.feature_closure(pkg, [], True, True)
+    frontier: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    ws = [(name, name)] + [(q, why) for q, why in tree.closure(pkg, [], True, True, True).items()]
+    for q, why in ws:
+        qp = tree.packages[q]
+        for d in qp.deps:
+            if d.pkg in tree.packages or (d.kind == "dev" and q != name) or (q == name and d.optional and d.key not in on):
+                continue
+            frontier.append((d.pkg, f"{why} -> {d.pkg}"))
+    while frontier:
+        nxt: list[tuple[str, str]] = []
+        for d, why in frontier:
+            if d in seen:
+                continue
+            seen.add(d)
+            if d in lock.roots:
+                return why
+            nxt.extend((e, f"{why} -> {e}") for e in sorted(lock.deps.get(d, ())))
+        frontier = nxt
+    return None
+
+
+def mac_purity(tree: Tree, lock: Lock, name: str) -> list[str]:
+    """Why `cargo test -p <name>` cannot run natively on the Mac, one reason a line; empty when it can."""
+    reasons: list[str] = []
+    chain = device_chain(tree, lock, name)
+    if chain is not None:
+        reasons.append(f"reaches the device root {chain.rsplit(' -> ', 1)[1]}: {chain}")
+    pkg = tree.packages[name]
+    targets, errors = tree.resolve(Invocation(sub="test", oxide=False, packages=[name], all_features=True))
+    if errors:
+        raise RecipeError(f"pure-crates: {name}: " + "; ".join(errors))
+    files: set[str] = set()
+    for p, kind, tname, feats in targets:
+        # a path literal names a file read at run time, not compiled; dep-info is the box's
+        files |= {f for f, why in tree.target_files(p, kind, tname, feats, True, True).items() if "(path literal)" not in why and not why.startswith("dep-info")}
+    own = pkg.dir.rstrip("/") + "/"
+    hits = []
+    for f in sorted(files):
+        if not f.endswith(".rs") or not tree.exists(f):
+            continue
+        mine = f.startswith(own)
+        for no, what, line in mac_hits(tree.read(f), None if mine else False):
+            hits.append((not mine, f, no, what, line))
+    hits.sort()
+    if hits:
+        _, f, no, what, line = hits[0]
+        kinds = sorted({h[3].split(" (", 1)[0] for h in hits[1:]})
+        more = f" [+{len(hits) - 1} more: {'; '.join(kinds)}]" if len(hits) > 1 else ""
+        reasons.append(f"{f}:{no}: {what}: {line}{more}")
+    return reasons
+
+
+def pure_crates(tree: Tree, lock: Lock) -> list[tuple[str, list[str]]]:
+    """Every workspace crate with its reasons, in name order; the pure ones have none."""
+    return [(n, mac_purity(tree, lock, n)) for n in sorted(tree.packages)]
+
+
+def cmd_pure_crates(args: argparse.Namespace) -> int:
+    tree = Tree(ROOT)
+    rows = pure_crates(tree, load_lock(tree.root))
+    if args.names:
+        for n, why in rows:
+            if not why:
+                print(n)
+        return 0
+    for n, why in rows:
+        if not why:
+            print(f"pure      {n}")
+    for n, why in rows:
+        for w in why:
+            print(f"rejected  {n}  {w}")
+    print(f"pure-crates: {sum(1 for _, w in rows if not w)} pure, {sum(1 for _, w in rows if w)} rejected, on {MAC_TARGET} (the rule: tools/recipes.py, section «pure crates»)")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------
 # the green ledger's input key (tools/gate-batch.sh --ledger)
 # ----------------------------------------------------------------------------------------------
 #
@@ -2659,6 +3053,145 @@ def self_test() -> int:
         expect(built <= dep and not dep & only_test, f"cfg(test) walk: a dependent reads {sorted(dep & only_test)}, misses {sorted(built - dep)}")
         expect(not st.unresolved, f"cfg(test) walk: unresolved {st.unresolved[:2]}")
 
+    # pure crates: the cfg reader, then a synthetic workspace with a lock file — a device root reached
+    # directly, through a workspace crate, through an external package, a git source and a dev
+    # dependency; x86_64 and Linux-only code unguarded (rejected) and under a cfg false on the Mac (not);
+    # a dependency's #[cfg(test)] module (its dependent stays pure, it does not)
+    for text, test, want in [
+        ('target_os = "linux"', None, False),
+        ('target_arch = "aarch64"', None, True),
+        ('not(target_os = "macos")', None, False),
+        ('any(target_arch = "x86_64", target_arch = "x86")', None, False),
+        ("all(unix, not(windows))", None, True),
+        ('feature = "avx"', None, None),
+        ('all(feature = "avx", target_os = "linux")', None, False),
+        ('any(feature = "avx", target_os = "linux")', None, None),
+        ("test", False, False),
+        ("test", None, None),
+        ("debug_assertions", None, None),
+        ('target_os = "linux" junk', None, None),
+    ]:
+        got = eval_cfg(parse_cfg(text), test)
+        expect(got is want, f"cfg({text}) with test={test} is {got}, not {want}")
+    with tempfile.TemporaryDirectory(prefix="recipes-pure-") as tmp:
+        srcs = {
+            "devc": "pub fn f() {}\n",
+            "via": "pub fn f() {}\n",
+            "wrap": "pub fn f() {}\n",
+            "gitdep": "pub fn f() {}\n",
+            "devdep": "pub fn f() {}\n",
+            "x86": "pub fn f() {}\nuse std::arch::x86_64::_mm256_add_ps;\n",
+            "guarded": (
+                '//! Uses #[target_feature(enable = "avx2")] and std::arch::x86_64 in prose only.\n'
+                "/// libc::RUSAGE_THREAD in a doc comment\n"
+                '#[cfg(target_arch = "x86_64")]\n'
+                '#[target_feature(enable = "avx2", enable = "fma")]\n'
+                "unsafe fn avx(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {\n"
+                "    use std::arch::x86_64::*;\n"
+                "    if true { x } else { _mm256_setzero_ps() }\n"
+                "}\n"
+                "pub struct S {\n"
+                '    #[cfg(target_os = "linux")]\n'
+                "    set: libc::cpu_set_t,\n"
+                "    pub n: u32,\n"
+                "}\n"
+                "pub fn g(m: &memmap2::Mmap, populate: bool) -> &'static str {\n"
+                '    #[cfg(target_os = "linux")]\n'
+                "    if populate {\n"
+                '        m.advise(memmap2::Advice::PopulateRead).unwrap();\n'
+                '        let _ = format!("{}{{", "/sys/x");\n'
+                "    }\n"
+                '    #[cfg(not(target_os = "linux"))]\n'
+                "    let _ = populate;\n"
+                '    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]\n'
+                "    let _ = unsafe { libc::sched_setaffinity(0, 0, std::ptr::null()) };\n"
+                "    let c = '{';\n"
+                '    let _ = c;\n'
+                '    "CUDA0#dflash_kv_input_target_features#0"\n'
+                "}\n"
+            ),
+            "inner": '#![cfg(target_os = "linux")]\nuse std::os::linux::fs::MetadataExt;\n',
+            "feat": '#[cfg(feature = "avx")]\nuse std::arch::x86_64::*;\n',
+            "truecfg": '#[cfg(all(unix, target_arch = "aarch64"))]\npub fn g() -> i32 { libc::RUSAGE_THREAD }\n',
+            "after": '#[cfg(target_os = "linux")]\nfn a() {}\npub fn b() { unsafe { libc::sched_setaffinity(0, 0, std::ptr::null()); } }\n',
+            "field": 'pub struct S {\n    #[cfg(target_os = "linux")]\n    a: u32,\n    b: libc::cpu_set_t,\n}\n',
+            "procp": 'pub fn f() -> String { std::fs::read_to_string("/proc/self/io").unwrap() }\n',
+            "lastfield": 'pub struct S {\n    #[cfg(target_os = "linux")]\n    a: u32\n}\npub fn b() -> i32 { libc::RUSAGE_THREAD }\n',
+            "tmod": "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = libc::RUSAGE_THREAD; }\n}\n",
+            "user": "pub fn f() {}\n",
+        }
+        deps = {
+            "devc": [("cuda-core", None)],
+            "via": [("devc", None)],
+            "wrap": [("wrapper", None)],
+            "gitdep": [("cuda-device", None)],
+            "devdep": [("devc", "dev")],
+            "user": [("tmod", None)],
+        }
+        for name, text in srcs.items():
+            os.makedirs(os.path.join(tmp, name, "src"))
+            with open(os.path.join(tmp, name, "Cargo.toml"), "w", encoding="utf-8") as fh:
+                fh.write("")
+            with open(os.path.join(tmp, name, "src", "lib.rs"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        with open(os.path.join(tmp, "Cargo.lock"), "w", encoding="utf-8") as fh:
+            fh.write(
+                'version = 4\n\n[[package]]\nname = "cuda-core"\nversion = "0.3.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                'dependencies = ["cuda-bindings"]\n\n[[package]]\nname = "cuda-bindings"\nversion = "0.3.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
+                '[[package]]\nname = "wrapper"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\ndependencies = ["plain 1.0.0", "cuda-bindings"]\n\n'
+                '[[package]]\nname = "plain"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
+                '[[package]]\nname = "cuda-device"\nversion = "0.2.1"\nsource = "git+https://github.com/NVlabs/cuda-oxide.git?rev=b98#b98"\ndependencies = ["cuda-macros"]\n\n'
+                '[[package]]\nname = "cuda-macros"\nversion = "0.2.1"\nsource = "git+https://github.com/midagedev/cuda-oxide.git?rev=e58#e58"\n'
+            )
+        lock = load_lock(tmp)
+        expect(lock.roots == {"cuda-core", "cuda-bindings", "cuda-device", "cuda-macros"}, f"pure: the lock's device roots are {sorted(lock.roots)}")
+        meta = {
+            "workspace_root": tmp,
+            "workspace_members": list(srcs),
+            "packages": [
+                {
+                    "id": n,
+                    "name": n,
+                    "manifest_path": os.path.join(tmp, n, "Cargo.toml"),
+                    "features": {},
+                    "dependencies": [{"name": d, "kind": k, "optional": False, "features": [], "uses_default_features": True} for d, k in deps.get(n, [])],
+                    "targets": [{"kind": ["lib"], "name": n, "src_path": os.path.join(tmp, n, "src", "lib.rs")}],
+                }
+                for n in srcs
+            ],
+        }
+        pt = Tree(tmp, meta)
+        verdict = dict(pure_crates(pt, lock))
+        for n, want in [
+            ("devc", "devc -> cuda-core"),
+            ("via", "via -> devc -> cuda-core"),
+            ("wrap", "wrap -> wrapper -> cuda-bindings"),
+            ("gitdep", "gitdep -> cuda-device"),
+            ("devdep", "devdep -> devc -> cuda-core"),
+            ("x86", "x86/src/lib.rs:2: x86_64 intrinsics"),
+            ("feat", "feat/src/lib.rs:2: x86_64 intrinsics"),
+            ("truecfg", "truecfg/src/lib.rs:2: a Linux-only libc item"),
+            ("after", "after/src/lib.rs:3: a Linux-only libc item"),
+            ("field", "field/src/lib.rs:4: a Linux-only libc item"),
+            ("lastfield", "lastfield/src/lib.rs:5: a Linux-only libc item"),
+            ("procp", "procp/src/lib.rs:1: a Linux /proc or /sys path"),
+            ("tmod", "tmod/src/lib.rs:4: a Linux-only libc item"),
+        ]:
+            expect(any(want in w for w in verdict.get(n, [])), f"pure: {n} is not rejected with '{want}': {verdict.get(n)}")
+        for n in ("guarded", "inner", "user"):
+            expect(verdict.get(n) == [], f"pure: {n} is rejected: {verdict.get(n)}")
+    # the real tree: the rule's selection is the set whose native `cargo test` passes (`just mac-test`), and a
+    # rejected crate names a device root or a source line
+    real = dict(pure_crates(tree, load_lock(tree.root)))
+    pure_now = sorted(n for n, w in real.items() if not w)
+    expect(
+        pure_now == ["bloomery-levers", "bloomery-models", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
+        f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
+    )
+    expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
+    expect(any("bloomery-gpu -> cuda-" in w for w in real.get("bloomery-gpu", [])), f"pure: bloomery-gpu's reason {real.get('bloomery-gpu')}")
+    expect(any("x86_64 intrinsics" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
+
     # FAIL-first on a mutated justfile: a typo'd --bin, --test, -p, feature and runner name
     with open(os.path.join(ROOT, "justfile"), encoding="utf-8") as fh:
         text = fh.read()
@@ -2753,6 +3286,8 @@ def main(argv: list[str]) -> int:
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
     bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
+    pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
+    pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
@@ -2773,6 +3308,8 @@ def main(argv: list[str]) -> int:
             return cmd_key(args)
         if args.cmd == "box-command":
             return cmd_box_command(args)
+        if args.cmd == "pure-crates":
+            return cmd_pure_crates(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
         ap.print_help()

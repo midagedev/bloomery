@@ -15,7 +15,10 @@ The plan lives in `docs/plan.md`. This file is the working contract.
   kernels (`qdot`) use `std::arch::x86_64` and the worker pool (`threads`)
   Linux affinity calls, neither of which the Mac runs. The static tier (`just mac-check`,
   `just mac-lint`: check and clippy as an x86_64-linux cross check, no linker; `just mac-fmt-check`)
-  runs on the Mac with the box's result; tests and gates never.
+  and the pure crates' native tests (`just mac-test`: `cargo test -p` for each crate
+  `tools/recipes.py pure-crates` selects — no device root in its closure, no x86_64 or Linux-only
+  code) run on the Mac; every other crate's tests and every gate never, and a Mac result is
+  development-loop evidence — landing evidence is the box's record (the landing batch).
   Every command below goes through `tools/box.sh`, which rsyncs the tree to the
   workstation and runs there. That rsync is `--delete`: never edit on the box.
 - **Never hand-run a benchmark.** Measurements belong to the lease runners in
@@ -146,6 +149,7 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just box-tracks   # remote track dirs vs local worktrees; --remove NAME… deletes those, if stale
     just mac-check    # check, and `mac-lint` clippy held to the Known-state count, on the Mac (tools/mac-check.sh):
     just mac-lint     # the recipes' box commands as an x86_64-linux cross check, no linker; `mac-fmt-check` is fmt-check
+    just mac-test     # native `cargo test -p` of the pure crates on the Mac (`tools/recipes.py pure-crates`: the rule, each rejected crate's reason)
     just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
                       # selects it. Plan (b) — the tree's only two-card load — staged on both
                       # cards and checked byte for byte against the plan; solo. `-lock` also
