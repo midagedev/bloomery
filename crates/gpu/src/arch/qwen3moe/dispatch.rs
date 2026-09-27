@@ -9,12 +9,13 @@
 //! own: folded into the projection beside them, the work lands in every
 //! block of a grid that already streams its weights at the card's bandwidth.
 
-use super::body::{Body, Kernels, Kq, LayerNames};
+use super::body::{ATTN_SCALE, Body, Kernels, Kq, LayerNames};
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::proj::{OResidArgs, QkvArgs};
 use super::router::N_USED;
 use super::scratch::{Arena, Io, KvPlanes};
+use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::{GqaArgs, HEAD};
 use crate::head::Head;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
@@ -26,8 +27,9 @@ use model::arch::qwen3moe::names::token_embd;
 
 /// What every launch of one layer reads besides the arena and the cache:
 /// the engine, the weights, the layer's names, the kernels, the flash pass,
-/// the norm epsilon, and the layer's index with its fault sink — every
-/// launch of the layer that can refuse its input raises with that index.
+/// the norm epsilon, the rope table, and the layer's index with its fault
+/// sink — every launch of the layer that can refuse its input raises with
+/// that index.
 struct Ctx<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
@@ -35,6 +37,7 @@ struct Ctx<'a> {
     k: &'a Kernels,
     mma: bool,
     eps: f32,
+    table: &'a DeviceBuffer<f32>,
     layer: usize,
     sink: FaultSink,
 }
@@ -48,6 +51,7 @@ impl<'a> Ctx<'a> {
         k: &'a Kernels,
         mma: bool,
         eps: f32,
+        table: &'a DeviceBuffer<f32>,
     ) -> Result<Ctx<'a>, GpuError> {
         Ok(Ctx {
             gpu,
@@ -56,6 +60,7 @@ impl<'a> Ctx<'a> {
             k,
             mma,
             eps,
+            table,
             layer,
             sink: gpu.layer_sink(layer)?,
         })
@@ -108,9 +113,11 @@ pub(super) fn enqueue_head(
     })
 }
 
-/// Enqueue layer `slot`'s step, embedding the token into `x` in front when
-/// `embed`; `x` in, the output residual into `out` (`None`: back into `x`),
-/// the step's K/V row appended to the layer's planes.
+/// Enqueue layer `slot`'s step, the step's front in front of it when `embed`
+/// — the token's embedding row into `x` and its position and live key count
+/// into the arena, from the step's input record; `x` in, the output residual
+/// into `out` (`None`: back into `x`), the step's K/V row appended to the
+/// layer's planes at the position the front wrote.
 pub(super) fn enqueue_layer(
     gpu: &Gpu,
     w: &Weights,
@@ -123,19 +130,38 @@ pub(super) fn enqueue_layer(
         hp,
         names,
         kv,
+        rope,
         s,
         sp,
         k,
         mma,
         ..
     } = b;
-    let c = Ctx::new(gpu, w, (&names[slot], slot), k, *mma, hp.rms_eps)?;
+    let c = Ctx::new(
+        gpu,
+        w,
+        (&names[slot], slot),
+        k,
+        *mma,
+        hp.rms_eps,
+        &rope.table,
+    )?;
     layer(&c, &mut kv[slot], s, &sp.io(), 1, embed, out)
+}
+
+/// Enqueue the step's front alone: the embedding row of the step's token
+/// into the one-row arena's `x`, and its position and live key count. A
+/// layer run on its own from another input ([`enqueue_layer`] without
+/// `embed`) needs the position the front writes; the caller then replaces
+/// `x`.
+pub(super) fn enqueue_front(gpu: &Gpu, w: &Weights, b: &mut Body) -> Result<(), GpuError> {
+    let Body { s, sp, .. } = b;
+    embed_rows(gpu, w, &sp.io(), s)
 }
 
 /// What every launch of a prefill pass reads besides its arena, its inputs
 /// and the cache: the engine, the weights, every layer's names, the kernels,
-/// the flash pass and the norm epsilon.
+/// the flash pass, the norm epsilon and the rope table.
 pub(super) struct PassCtx<'a> {
     pub(super) gpu: &'a Gpu,
     pub(super) w: &'a Weights,
@@ -143,12 +169,13 @@ pub(super) struct PassCtx<'a> {
     pub(super) k: &'a Kernels,
     pub(super) mma: bool,
     pub(super) eps: f32,
+    pub(super) table: &'a DeviceBuffer<f32>,
 }
 
-/// Enqueue one prefill pass of `m` tokens over arena `s`, reading the
-/// tokens, positions, live key counts and rope rows in `io`: every layer at
-/// `m` rows, the combine leaving each layer's output in `x`. The same
-/// enqueues run eager and under a capture.
+/// Enqueue one prefill pass of `m` tokens over arena `s` from the input
+/// record windows in `io`: the embedding rows with the rows' positions and
+/// live key counts, then every layer at `m` rows, the combine leaving each
+/// layer's output in `x`. The same enqueues run eager and under a capture.
 pub(super) fn enqueue_pass(
     c: &PassCtx<'_>,
     kv: &mut [KvPlanes],
@@ -157,7 +184,7 @@ pub(super) fn enqueue_pass(
     m: usize,
 ) -> Result<(), GpuError> {
     for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
-        let lc = Ctx::new(c.gpu, c.w, (n, slot), c.k, c.mma, c.eps)?;
+        let lc = Ctx::new(c.gpu, c.w, (n, slot), c.k, c.mma, c.eps, c.table)?;
         layer(&lc, kv, s, io, m, slot == 0, None)?;
     }
     Ok(())
@@ -215,18 +242,27 @@ pub(super) fn enqueue_ffn(
     let Body {
         hp,
         names,
+        rope,
         s,
         k,
         mma,
         ..
     } = b;
-    let c = Ctx::new(gpu, w, (&names[slot], slot), k, *mma, hp.rms_eps)?;
+    let c = Ctx::new(
+        gpu,
+        w,
+        (&names[slot], slot),
+        k,
+        *mma,
+        hp.rms_eps,
+        &rope.table,
+    )?;
     ffn(&c, s, 1, None)
 }
 
-/// One layer at `m` rows: the embedding rows into `x` in front when
-/// `embed`, the attention half, then the FFN half into `out` (`None`: back
-/// into `x`).
+/// One layer at `m` rows: the embedding rows with their positions and live
+/// key counts in front when `embed` ([`embed_rows`]), the attention half,
+/// then the FFN half into `out` (`None`: back into `x`).
 fn layer(
     c: &Ctx<'_>,
     kv: &mut KvPlanes,
@@ -237,27 +273,36 @@ fn layer(
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     if embed {
-        c.gpu.elem().enqueue_embed_rows_q4k(
-            c.gpu.stream(),
-            kq_weight(c.w, &token_embd())?,
-            io.tokens,
-            &mut s.x,
-        )?;
+        embed_rows(c.gpu, c.w, io, s)?;
     }
-    attention(c, kv, s, io, m)?;
+    attention(c, kv, s, m)?;
     ffn(c, s, m, out)
 }
 
+/// A unit's front, one launch: the embedding rows of `io`'s ids into `s.x`
+/// and each row's position and live key count into `s.pos` and `s.n_keys` —
+/// the rows every later launch of the unit reads.
+fn embed_rows(gpu: &Gpu, w: &Weights, io: &Io<'_>, s: &mut Arena) -> Result<(), GpuError> {
+    gpu.elem().enqueue_embed_rows_q4k(
+        gpu.stream(),
+        EmbedRowsArgs {
+            w: kq_weight(w, &token_embd())?,
+            ids: io.ids,
+            pos0: io.pos0,
+            first: io.first,
+            y: &mut s.x,
+            pos: &mut s.pos,
+            n_keys: &mut s.n_keys,
+        },
+    )
+}
+
 /// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
-/// q, k and v in one launch (a Q6_K v in its own), the output projection
-/// with the residual add in its store.
-fn attention(
-    c: &Ctx<'_>,
-    kv: &mut KvPlanes,
-    s: &mut Arena,
-    io: &Io<'_>,
-    m: usize,
-) -> Result<(), GpuError> {
+/// q, k and v in one launch (a Q6_K v in its own), the head norm and the
+/// rope by the rows' positions with the cache append, the flash over the
+/// rows' live key counts, the output projection with the residual add in its
+/// store.
+fn attention(c: &Ctx<'_>, kv: &mut KvPlanes, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     let (gpu, w, n, k) = (c.gpu, c.w, c.n, c.k);
     let stream = gpu.stream();
     let d = s.dims;
@@ -303,8 +348,8 @@ fn attention(
             v: &s.v,
             gq: f32_gain(w, &n.attn_q_norm)?,
             gk: f32_gain(w, &n.attn_k_norm)?,
-            cs: io.cs,
-            pos: io.pos,
+            table: c.table,
+            pos: &s.pos,
             eps: c.eps,
             n_head: d.n_head,
             n_kv: d.n_kv,
@@ -321,8 +366,8 @@ fn attention(
             q: &s.q,
             kc: &kv.k,
             vc: &kv.v,
-            n_keys: io.n_keys,
-            scale: 1.0 / (HEAD as f32).sqrt(),
+            n_keys: &s.n_keys,
+            scale: ATTN_SCALE,
             n_kv: d.n_kv,
             ctx: d.ctx,
             m,

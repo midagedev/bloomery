@@ -139,8 +139,9 @@ def flash_consts(tree):
     src_const(tree, fp, r"let warp_hi = cnt\[0\]\.max\(cnt\[1\]\);", "warp_hi, its two rows' larger count")
     src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
               r"^pub const UBATCH: usize = GEMM_MAX_SLOTS / N_USED;", "UBATCH = GEMM_MAX_SLOTS / N_USED")
-    src_const(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs",
-              r"self\.host\[o_nk \+ i\] = pos \+ 1;", "a row's live key count, its position + 1")
+    src_const(tree, "crates/gpu/src/elem.rs",
+              r"\*n_keys\.get_unchecked_mut\(i\) = position_word\(p \+ 1\);",
+              "a row's live key count, its position + 1 (written by the embedding gather)")
     src_count(tree, "crates/gpu/src/arch/qwen3moe/ubatch.rs", r"\bflash\.enqueue\(", 1,
               "prefill-flash enqueues a layer")
     # The two mma loops: QK_STEPS x KEY_NT/2 pairs, PV_STEPS x DIM_PAIRS pairs, two mma each.

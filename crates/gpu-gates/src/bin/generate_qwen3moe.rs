@@ -24,8 +24,8 @@
 //! ubatches' attention, `ubatch_attn=gqa_prefill_flash`; and their size,
 //! `ubatch=`, on the `load` line because the `time prompt` row's shape is
 //! parsed to its end; and `rope_table_us=`, the host time that computed the
-//! ubatches' rope table at load, one `RopeTable::push` for each of the `ctx`
-//! positions — a runtime value), in graph
+//! rope table every path reads at load, one `RopeTable::push` for each of
+//! the `ctx` positions — a runtime value), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
 //! and the card's free bytes it took, runtime values), `step 0 pos tok`
@@ -40,9 +40,10 @@
 //! it, so that wall carries neither),
 //! `stat prompt ubatch_tokens=<n> image_bytes= fill_us= copy_us=` (the host
 //! prologue inside that wall before the first ubatch launch: the prompt
-//! image's fill and its copy to the card, which synchronizes; runtime values
-//! read from three clock reads the engine takes on every prompt;
-//! `ubatch_tokens=0` when no ubatch ran),
+//! image's fill and the enqueue of its copy to the card, which the launches
+//! behind it wait for, not the host; runtime values read from three clock
+//! reads the engine takes on every prompt; `ubatch_tokens=0` when no ubatch
+//! ran),
 //! per feedback step `step i pos tok` (and `time step i ms=` under
 //! `--time`); then
 //! `tokens [..]`, `text` for a `--prompt` run, and under `--time` the

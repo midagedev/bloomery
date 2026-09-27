@@ -1,9 +1,12 @@
 //! One launch per layer for the query and key heads of a grouped-query
 //! attention layer with a per-head norm and a NEOX rope over the whole head:
 //! each head's RMS norm by its own gain vector (`attn_q_norm` /
-//! `attn_k_norm`), the NEOX turn of pair `(i, i + HEAD/2)` by the token's
-//! table pair `i`, and for the key heads the append of the turned key and of
-//! the value head to the layer's f16 cache planes.
+//! `attn_k_norm`), the NEOX turn of pair `(i, i + HEAD/2)` by pair `i` of
+//! the rope table's row at the token's position, and for the key heads the
+//! append of the turned key and of the value head to the layer's f16 cache
+//! planes at that position. The table holds a row for every cache position,
+//! so the one check a position gets — below the planes' rows — covers the
+//! table read and the append.
 //!
 //! The planes are head-major, `[n_kv][ctx][HEAD]` u16: key head `h` of the
 //! token at position `p` is row `h·ctx + p`, so a flash block that walks one
@@ -71,13 +74,17 @@ mod rope_neox_kernels {
     /// for `h = n_head + j` key head `j` is normalized by `gk`, turned,
     /// written back in place in `k` and rounded to f16 into `cache_k` row
     /// `j·ctx + pos[t]`, and value head `j` of `v` is rounded into `cache_v`
-    /// at the same row. The table of token `t` is `cs[t·HEAD ..]`, `[cos_0,
-    /// sin_0, …]` for the 64 pairs. The branch is on the block index, so no
-    /// warp splits across it; `pos[t] < ctx` is host-checked where the host
-    /// can see it and bounds-checked here where it cannot: a position read
-    /// from device memory at or past the planes has no row, so the block
-    /// raises [`FaultSite::CachePos`] on `fault` and appends nothing — no
-    /// write outside the planes, and no stale row passes for the token's.
+    /// at the same row. Token `t` turns by the table's row `pos[t]`,
+    /// `table[pos[t]·HEAD ..]`, `[cos_0, sin_0, …]` for the 64 pairs. The
+    /// branch is on the block index, so no warp splits across it. `pos[t] <
+    /// ctx` is host-checked where the host can see it and bounds-checked here
+    /// where it cannot: a position read from device memory at or past the
+    /// planes has no row in the planes or the table, so every block of the
+    /// token raises [`FaultSite::CachePos`] on `fault`, writes NaN over its
+    /// head in place and appends nothing — no read or write outside the
+    /// buffers, and no stale row passes for the token's. The position is
+    /// loaded first and checked after the norm, so its load overlaps the
+    /// head's.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -93,7 +100,7 @@ mod rope_neox_kernels {
             v.len() >= m * n_kv * 128,
             gq.len() >= 128,
             gk.len() >= 128,
-            cs.len() >= m * 128,
+            table.len() >= ctx * 128,
             pos.len() >= m,
             cache_k.len() >= n_kv * ctx * 128,
             cache_v.len() >= n_kv * ctx * 128
@@ -102,7 +109,7 @@ mod rope_neox_kernels {
     pub fn head_norm_neox_append(
         gq: &[f32],
         gk: &[f32],
-        cs: &[f32],
+        table: &[f32],
         pos: &[u32],
         v: &[f32],
         eps: f32,
@@ -133,6 +140,8 @@ mod rope_neox_kernels {
         } else {
             (t * n_kv as usize + kh) * HEAD
         };
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let p = unsafe { *pos.get_unchecked(t) } as usize;
 
         // SAFETY: base + tid + 64 < (t·n + h + 1)·128 <= m·n·128, inside the
         // head's buffer by the launch contract; one thread per value pair.
@@ -170,15 +179,31 @@ mod rope_neox_kernels {
         let mean = (sum / HEAD as f64) as f32;
         let scale = 1.0 / (mean + eps).sqrt();
 
-        // SAFETY: tid + 64 < 128 <= the gain's length; 2·tid + 1 < 128, so
-        // the table pair is inside token t's 128 values, t < m.
+        if p >= ctx as usize {
+            if tid == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            // SAFETY: the positions read above; this thread owns them.
+            unsafe {
+                if is_q {
+                    *q.get_unchecked_mut(base + tid) = f32::NAN;
+                    *q.get_unchecked_mut(base + tid + THREADS) = f32::NAN;
+                } else {
+                    *k.get_unchecked_mut(base + tid) = f32::NAN;
+                    *k.get_unchecked_mut(base + tid + THREADS) = f32::NAN;
+                }
+            }
+            return; // block-uniform: p is the token's
+        }
+        // SAFETY: tid + 64 < 128 <= the gain's length; p < ctx and 2·tid + 1
+        // < 128, so the table pair is inside row p of the table's ctx rows.
         let (g0, g1, c, s) = unsafe {
             let g = if is_q { gq } else { gk };
             (
                 *g.get_unchecked(tid),
                 *g.get_unchecked(tid + THREADS),
-                *cs.get_unchecked(t * HEAD + 2 * tid),
-                *cs.get_unchecked(t * HEAD + 2 * tid + 1),
+                *table.get_unchecked(p * HEAD + 2 * tid),
+                *table.get_unchecked(p * HEAD + 2 * tid + 1),
             )
         };
         let n0 = (scale * g0) * x0;
@@ -198,19 +223,12 @@ mod rope_neox_kernels {
             *k.get_unchecked_mut(base + tid) = y0;
             *k.get_unchecked_mut(base + tid + THREADS) = y1;
         }
-        // SAFETY: t < m <= pos.len() by the launch contract.
-        let p = unsafe { *pos.get_unchecked(t) } as usize;
-        if p >= ctx as usize {
-            if tid == 0 {
-                fault.raise(FaultSite::CachePos);
-            }
-            return;
-        }
         let row = (kh * ctx as usize + p) * HEAD;
         // SAFETY: kh < n_kv and p < ctx, so row + 127 < n_kv·ctx·128 <= the
         // planes' lengths; base + tid + 64 < m·n_kv·128 <= v.len(). One
         // thread per pair of the row; the tokens of one launch hold distinct
-        // positions (host-checked), so no two blocks write one row.
+        // positions (the launch contract; the engine's embedding launch
+        // writes consecutive ones), so no two blocks write one row.
         unsafe {
             *cache_k.get_unchecked_mut(row + tid) = f32_to_f16_bits(y0);
             *cache_k.get_unchecked_mut(row + tid + THREADS) = f32_to_f16_bits(y1);
@@ -224,16 +242,17 @@ mod rope_neox_kernels {
 /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]'s arguments: `m`
 /// tokens of `n_head` query heads in `q` and `n_kv` key and value heads in
 /// `k` and `v` (token-major, head after head, [`HEAD`] values each), the
-/// gains, the `m` tables (`RopeTable::push` over a [`HEAD`]-wide spec) and
-/// positions on the device, the sink a position past the planes raises on,
-/// and the layer's two cache planes of `n_kv · ctx` rows of [`HEAD`] f16.
+/// gains, the rope table on the device — a row of [`HEAD`] f32 for each of
+/// at least `ctx` positions, `RopeTable::push` over a [`HEAD`]-wide spec —
+/// and the `m` tokens' positions, the sink a position past the planes raises
+/// on, and the layer's two cache planes of `n_kv · ctx` rows of [`HEAD`] f16.
 pub struct NeoxArgs<'a> {
     pub q: &'a mut DeviceBuffer<f32>,
     pub k: &'a mut DeviceBuffer<f32>,
     pub v: &'a DeviceBuffer<f32>,
     pub gq: &'a DeviceBuffer<f32>,
     pub gk: &'a DeviceBuffer<f32>,
-    pub cs: &'a DeviceBuffer<f32>,
+    pub table: &'a DeviceBuffer<f32>,
     pub pos: &'a DeviceBuffer<u32>,
     pub eps: f32,
     pub n_head: usize,
@@ -260,10 +279,11 @@ impl RopeNeoxKernels {
     }
 
     /// Enqueue the norm, turn and append of `args.m` tokens: one block per
-    /// (token, head), `m·(n_head + n_kv)` blocks of 64 threads. The tokens
-    /// of one launch must hold distinct positions below `ctx` (the caller's
-    /// positions are consecutive); a position `>= ctx` raises
-    /// [`FaultSite::CachePos`] on `args.fault` and is not appended.
+    /// (token, head), `m·(n_head + n_kv)` blocks of 64 threads, token `t`
+    /// turned by the table's row `pos[t]`. The tokens of one launch must hold
+    /// distinct positions below `ctx` (the caller's positions are
+    /// consecutive); a position `>= ctx` raises [`FaultSite::CachePos`] on
+    /// `args.fault`, leaves the token's heads NaN and is not appended.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_head_norm_neox_append(
         &self,
@@ -277,7 +297,7 @@ impl RopeNeoxKernels {
             v,
             gq,
             gk,
-            cs,
+            table,
             pos,
             eps,
             n_head,
@@ -304,7 +324,7 @@ impl RopeNeoxKernels {
             ("v", v.len(), m * n_kv * HEAD),
             ("gq", gq.len(), HEAD),
             ("gk", gk.len(), HEAD),
-            ("cs", cs.len(), m * HEAD),
+            ("table", table.len(), ctx * HEAD),
             ("pos", pos.len(), m),
             ("cache_k", cache_k.len(), plane),
             ("cache_v", cache_v.len(), plane),
@@ -324,7 +344,7 @@ impl RopeNeoxKernels {
             .module
             .prepare_head_norm_neox_append(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
         self.module.head_norm_neox_append(
-            stream, &prep, gq, gk, cs, pos, v, eps, n_head, n_kv, ctx, m, fault, q, k, cache_k,
+            stream, &prep, gq, gk, table, pos, v, eps, n_head, n_kv, ctx, m, fault, q, k, cache_k,
             cache_v,
         )?;
         Ok(())

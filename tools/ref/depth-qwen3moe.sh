@@ -19,11 +19,12 @@
 # Arms, in lease order (the order rotates by one slot each round — the position bias ab-decode.sh
 # names):
 #   <D>       ours, D >= 1: generate_qwen3moe --tokens <lcg_prompt D> -n N --ctx C --time. The D
-#             fed ids are prefilled untimed (Qwen3moeModel::prefill: D >= 9 in ubatches of up to 512
-#             through the grouped GEMM, a tail of at most 8 and a D <= 8 as one pass; the `step 0`
-#             line's `plan=` names the units), from lease.sh's lcg_prompt: 100000, then ids in
-#             [1000, 91000), all inside this vocabulary; generated token 0 comes out of the last
-#             pass and the N - 1 steps after it are timed. C is D + N rounded up to 256: both
+#             fed ids are prefilled untimed (Qwen3moeModel::prefill: D >= 9 in ubatches of up to the
+#             ubatch size — UBATCH, or BLOOMERY_QWEN3_UBATCH; ubatch.rs:1-4 — through the grouped
+#             GEMM, a tail of at most 8 and a D <= 8 as one pass; the `load` line's `ubatch=` names
+#             the size, the `step 0` line's `plan=` the units), from lease.sh's lcg_prompt: 100000,
+#             then ids in [1000, 91000), all inside this vocabulary; generated token 0 comes out of
+#             the last pass and the N - 1 steps after it are timed. C is D + N rounded up to 256: both
 #             llama-benches size n_ctx to D + N for this test and pad it to 256 under flash
 #             attention (ik: GGML_PAD(n_ctx, llama_kv_cache::get_padding(flash_attn)) in
 #             src/llama.cpp; mainline: GGML_PAD(n_ctx, 256) in src/llama-context.cpp), so the
@@ -134,8 +135,9 @@
 #
 # Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
 #   ours      generate_qwen3moe's `time prompt` row: the wall of Qwen3moeModel::prefill through the
-#             readback of its token — P >= 9 in ubatches of up to 512 through the grouped GEMM
-#             (`kind=gemm`), a P <= 8 as one pass (`kind=prefill`), `passes` the units. The prefill
+#             readback of its token — P >= 9 in ubatches of up to the ubatch size (`load ubatch=`)
+#             through the grouped GEMM (`kind=gemm`), a P <= 8 as one pass (`kind=prefill`),
+#             `passes` the units; the `stat prompt` line is the host prologue inside it. The prefill
 #             buffers are allocated at load, so the wall carries no allocation. The arm's cache
 #             height is C (D + N rounded up to 256), not P.
 #   ik, lcpp  llama-bench's pp test: llama_decode over the P ids in batches of -b and ubatches of
@@ -501,9 +503,9 @@ ours_arm() {
   fi
   smoke=$(echo "$out" | grep -E '^SMOKE ')
   [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-  # The prompt_ids line is the whole prompt; the load, capture, step-0 and time prompt lines are
-  # the arm's configuration and the prefill's time.
-  echo "$out" | grep -E '^(load|capture|step 0|time prompt) '
+  # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
+  # lines are the arm's configuration, the prefill's time and its host prologue.
+  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt) '
   pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
   p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')

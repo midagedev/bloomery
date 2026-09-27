@@ -22,7 +22,9 @@ pub struct LayerRun {
 impl GpuModel<Body> {
     /// Run layer `l` eagerly from input residual `x_in` at `pos` (rows
     /// `0..pos` already in that layer's planes — this call appends row
-    /// `pos`) and read it back. Synchronizes; gate use.
+    /// `pos`) and read it back. The step's front runs first, for the row's
+    /// position and live key count; `x_in` then replaces its embedding row.
+    /// Synchronizes; gate use.
     pub fn step_layer(&mut self, l: usize, x_in: &[f32], pos: u32) -> Result<LayerRun, GpuError> {
         let what = "qwen3moe::step_layer";
         self.check_pos(pos, what)?;
@@ -40,6 +42,7 @@ impl GpuModel<Body> {
                 ),
             ));
         }
+        dispatch::enqueue_front(gpu, w, body)?;
         body.s.x.copy_from_host(stream, x_in)?;
         dispatch::enqueue_layer(gpu, w, body, slot, false, None)?;
         let s = &body.s;
