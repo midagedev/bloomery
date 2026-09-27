@@ -57,14 +57,15 @@
 //!   bit the one-token path) and as one ubatch of 1,024 (the wide arm), each
 //!   from zero stores: layer 0's recurrent state and conv ring within
 //!   [`U_L0_REL`] of the pass run's; every layer's store distance and the
-//!   prefill's last logits printed.
+//!   prefill's last logits printed, and (d) prints each layer's store
+//!   distance between the two runs beside its distances from ik.
 //! - (d) both prefills against ik's state after its 1,024-token prompt batch
 //!   (the set's `cache_s_lL`, `cache_k_lL`, `cache_v_lL`): each layer's
 //!   store distance from ik's, the ubatch run's over the pass run's, within
 //!   [`PROMPT_RATIO`]; then the step at position 1,024 free-running from each
 //!   run's own state: each layer's output distance from ik's `l_out`, and the
 //!   logits' from ik's `result_output`, the ubatch run's over the pass run's
-//!   within the same ratio; the three argmaxes printed.
+//!   within [`STEP_RATIO`]; the three argmaxes printed.
 //! - (w) the ubatch size moves no bit: the same 1,024 ids on the GEMM path at
 //!   each size of [`W_SIZES`] (ubatches of 512 x 2; 1,000 and 24; 100 x 10
 //!   and 24), and at [`U_GATE`] in two calls cut at [`W_CUT`], leave the last
@@ -172,24 +173,30 @@ mod gate {
     /// reads an error of order one.
     const U_L0_REL: f64 = 1e-4;
 
-    /// PIN(2026-09-27): (d)'s bound on a layer's distance from ik, the ubatch
-    /// run's over the pass run's — its store (a recurrent state and the conv
-    /// ring's rows ik keeps, or the K and V rows, the larger of the two), its
-    /// step output, and the step's logits. Derivation: past layer 0 the two
-    /// runs' first difference (Δ, [`U_L0_REL`]) grows at every q8_1
-    /// re-quantization by code flips until, within two or three layers, the
-    /// ubatch run is another q8_1 realization of the same rule
-    /// (gate_qwen3moe's GEMM_SPREAD_RATIO note) — statistically the pass
-    /// run's twin against ik, whose own distance is the gap between q8_1 per
-    /// 128 values and ik's q8_2 per 32, composed over the layers. The ratio
-    /// then reads about 1: 1.00 to 1.10 predicted; the prefill flash's f16
-    /// weights are the same class as the decode flash's tensor-core pass.
-    /// Were the two runs' difference independent of the pass run's distance
-    /// from ik and as large, the ratio would be √2 ≈ 1.41, still inside. A
-    /// wiring fault — another layer's weight, a token off by one, a stale
-    /// route row — adds an error of order one to distances of 1e-2 to 0.3, a
-    /// ratio above 3 on every layer it reaches.
-    const PROMPT_RATIO: f64 = 1.5;
+    /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
+    /// from each run's own state — each layer's output distance from ik's and
+    /// the logits' — the ubatch run's over the pass run's. Derivation: past
+    /// layer 0 the two runs' first difference (Δ, [`U_L0_REL`]) grows at every
+    /// q8_1 re-quantization by code flips until the ubatch run is another q8_1
+    /// realization of the same rule (gate_qwen3moe's GEMM_SPREAD_RATIO note),
+    /// statistically the pass run's twin against ik; one step from each state
+    /// reads about 1. A wiring fault — another layer's weight, a token off by
+    /// one, a stale route row — adds an error of order one to distances of
+    /// 1e-2 to 0.3, a ratio above 3 on every layer it reaches.
+    const STEP_RATIO: f64 = 1.5;
+
+    /// PIN(2026-09-28): (d)'s bound on a layer's store distance from ik (a
+    /// recurrent state and the conv ring's rows ik keeps, or the K and V rows,
+    /// the larger of the two), the ubatch run's over the pass run's. Raised from
+    /// 1.5 [잠정 — 백로그]: 1.5 assumed the two runs' own distance d_wp is at
+    /// most the pass run's distance from ik d_pi, so the ratio is at most
+    /// √(1 + (d_wp/d_pi)²) ≤ √2; over 1,024 positions the recurrent stores
+    /// integrate the flips and d_wp/d_pi reads 0.52, 1.03, 1.19, 1.41 at layers
+    /// 8, 16, 24, 32, each measured ratio (0.97, 1.14, 1.30, 1.54) at or under
+    /// that bound, the worst 1.72 at layer 29. 2.5 holds d_wp up to 2.3 d_pi;
+    /// the wiring faults above still read past 3. A band derived from the flip
+    /// amplification replaces this pin.
+    const PROMPT_RATIO: f64 = 2.5;
 
     /// The file's shape, as the header states it (q35design §1): what the
     /// derivations below are written against.
@@ -1520,7 +1527,7 @@ mod gate {
                     verdict(pass0)
                 );
                 ok &= pass0;
-            } else if l % 8 == 0 || l + 1 == ub.stores.len() {
+            } else {
                 println!(
                     "wide layer={l} {:?} rel={x:.3e} / {y:.3e} (printed)",
                     kinds[l]
@@ -1540,18 +1547,21 @@ mod gate {
             let ik = prefill_store(&man, kind, l, pu)?;
             let (ua, ub_) = store_rel(&ub.stores[l], &ik, &ik_slot);
             let (pa, pb) = store_rel(&pass.stores[l], &ik, &ik_slot);
-            let r = worse(0.0, worse(ua, ub_) / worse(pa, pb).max(f64::MIN_POSITIVE));
+            let (wa, wb) = store_rel(&ub.stores[l], &pass.stores[l], &ik_slot);
+            let d_pi = worse(pa, pb).max(f64::MIN_POSITIVE);
+            let r = worse(0.0, worse(ua, ub_) / d_pi);
             if r > worst.0 {
                 worst = (r, l);
             }
-            if l % 8 == 0 || l + 1 == kinds.len() || r > PROMPT_RATIO {
-                println!(
-                    "prompt store layer={l} {kind:?} from ik: ubatch {:.3e} pass {:.3e} ratio \
-                     {r:.2}",
-                    worse(ua, ub_),
-                    worse(pa, pb)
-                );
-            }
+            let rw = worse(wa, wb) / d_pi;
+            println!(
+                "prompt store layer={l} {kind:?} from ik: ubatch {:.3e} pass {:.3e} ratio {r:.2}; \
+                 ubatch from pass {:.3e}, independent-error bound {:.2} (printed)",
+                worse(ua, ub_),
+                worse(pa, pb),
+                worse(wa, wb),
+                (1.0 + rw * rw).sqrt()
+            );
         }
         let pass_d = worst.0 <= PROMPT_RATIO;
         println!(
@@ -1581,10 +1591,10 @@ mod gate {
             rel_to(&pass.step_logits, ik_last),
         );
         let r_logits = worse(0.0, lu / lp.max(f64::MIN_POSITIVE));
-        let pass_s = worst_out.0 <= PROMPT_RATIO && r_logits <= PROMPT_RATIO;
+        let pass_s = worst_out.0 <= STEP_RATIO && r_logits <= STEP_RATIO;
         println!(
             "prompt step {p}: worst l_out ratio {:.2} at layer {}, logits from ik ubatch {lu:.3e} \
-             pass {lp:.3e} ratio {r_logits:.2} (band {PROMPT_RATIO}); argmax ubatch={} pass={} \
+             pass {lp:.3e} ratio {r_logits:.2} (band {STEP_RATIO}); argmax ubatch={} pass={} \
              ik={} (printed) {}",
             worst_out.0,
             worst_out.1,
