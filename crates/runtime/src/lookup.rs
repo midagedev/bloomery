@@ -1,12 +1,16 @@
-//! The n-gram lookup draft `generate_ds41` serves under `BLOOMERY_DRAFT=lookup`:
-//! `lookup-recent` of `tools/ref/draft-accept.py` (`score_recent`), streamed.
+//! The n-gram lookup draft: `lookup-recent` of `tools/ref/draft-accept.py`
+//! (`score_recent`), streamed.
 //!
 //! For n = 3, 2, 1 in that order, the most recent earlier occurrence of the
 //! context's last n tokens proposes the token that followed it; no match at
 //! any n is no proposal. The n-grams ending at the last token enter the index
-//! only when its follower is pushed, so a proposal never sees itself.
+//! only when its follower is pushed, so a proposal never sees itself. As a
+//! [`Draft`] it is fed the prompt, then only the tokens the passes keep: a
+//! rejected proposal never enters the context, so it has nothing to take back.
 
 use std::collections::HashMap;
+
+use crate::{Draft, TapNeed, Verify};
 
 /// The streamed lookup: the context so far and, per n, where each n-gram's
 /// most recent follower sits in it.
@@ -58,6 +62,54 @@ impl Lookup {
             })
             .or_else(|| (i >= 1).then(|| self.idx1.get(&c[i - 1])).flatten())?;
         Some(c[*j])
+    }
+
+    /// The context so far: the prompt, then every kept token.
+    #[must_use]
+    pub fn context(&self) -> &[u32] {
+        &self.ctx
+    }
+}
+
+/// One id a proposal, from the token history alone.
+impl<T: Verify> Draft<T> for Lookup {
+    const WIDTH: usize = 1;
+    const TAPS: TapNeed = TapNeed::None;
+
+    fn begin(&mut self, _t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
+        for &id in prompt {
+            self.push(id);
+        }
+        self.push(first);
+        Ok(())
+    }
+
+    fn propose(&mut self, _t: &T, _last: u32, out: &mut [u32]) -> Result<bool, T::Error> {
+        Ok(match Lookup::propose(self) {
+            Some(d) => {
+                out[0] = d;
+                true
+            }
+            None => false,
+        })
+    }
+
+    fn accept(
+        &mut self,
+        _t: &mut T,
+        _rows: &[u32],
+        out: &[u32],
+        accepted: usize,
+    ) -> Result<(), T::Error> {
+        for &tok in &out[..accepted] {
+            self.push(tok);
+        }
+        Ok(())
+    }
+
+    fn stepped(&mut self, _t: &mut T, _last: u32, next: u32) -> Result<(), T::Error> {
+        self.push(next);
+        Ok(())
     }
 }
 
