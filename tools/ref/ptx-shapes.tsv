@@ -35,6 +35,7 @@ generate_ds41   ds41_expert_gate_up_tiles               0          0
 generate_ds41   ds41_ffn_card_acc                       0          0
 generate_ds41   ds41_ffn_card_acc_8                     0          0
 generate_ds41   ds41_ffn_handoff                        0          0
+generate_ds41   ds41_ffn_handoff_10                     0          0
 generate_ds41   ds41_ffn_handoff_8                      0          0
 generate_ds41   ds41_ffn_places                         0          0
 generate_ds41   ds41_ffn_post                           0          0
@@ -202,6 +203,9 @@ gate_e2e        argmax_fault                            0          0
 gate_e2e        argmax_rows_fault                       0          0
 gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
+gate_e2e        ds41_ffn_handoff                        0          0
+gate_e2e        ds41_ffn_handoff_10                     0          0
+gate_e2e        ds41_ffn_handoff_8                      0          0
 gate_e2e        embed_rows                              0          0
 gate_e2e        embed_rows_q4k                          0          0
 gate_e2e        expert_gate_up_swiglu_q3k               0          0

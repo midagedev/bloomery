@@ -192,16 +192,20 @@ fn hw_qwen4exp_plan() {
     };
     let split = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
     let refused = match PlanInputs::read(&split) {
-        Err(model::placement::PlacementError::Unimplemented(list)) => list.len(),
+        Err(model::placement::PlacementError::Unimplemented(list)) => spec_view::items(&list),
         other => panic!("PlanInputs::read: want the coverage refusal, got {other:?}"),
     };
     check(
         &mut o,
         format!(
-            "read refuses the file with the coverage list: {refused} items (want {})",
+            "read refuses the file with the coverage list: {} items (want {})",
+            refused.len(),
             COVERAGE.len()
         ),
-        refused == COVERAGE.len(),
+        refused
+            .iter()
+            .map(String::as_str)
+            .eq(COVERAGE.iter().copied()),
     );
     let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     let hp = &inputs.hp;
