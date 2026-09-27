@@ -1,0 +1,39 @@
+# The warm re-sit of the V4.1 table on the A6000 (lcppwarm). llama-bench draws random ids, so V4.1's
+# lazily paged engram rows fault inside its timed window: every A6000 lcpp row of the release sitting
+# was [cold] (pp4096 timed ~197k faults, <= 28 % of W; decode ~4.7k, ~49 pages a token) except two
+# rows that landed warm by chance (v41.log r2: d6 22.75, d4096 21.78, pp512 105.34, timed 0). The
+# server arms (tools/ref/lcpp-warm.sh) read the same lcg ids as ours: a warm-up request, then the
+# timed one, so the timed window reads only what the warm-up just read. Our arms run after a same-id
+# PRIME in their load (BLOOMERY_WARM_ROWS=1), and a row still tagged [cold] runs once more, then FAILs
+# rc=cold. The fit twins (292-298 GB CPU_Mapped against ~261 GB of page cache) and the llama-bench
+# arms fault by design and would FAIL rc=cold under the switch: they are not in this sitting.
+#
+# Wall [derived from v41.log / v41resit.log]: ours 6 512 4096 in one load of ~66-72 s, arm walls 4 / 6 /
+# 18 s, each twice under PRIME: ~126 s a round; server lcppsrv:6 lcppsrv:4096 lcppsrvpp:512
+# lcppsrvpp:4096 (hand-set, -fit off): ~25 + 125 + 27 + 120 s a round (a ~12 s cached load, two
+# requests each); three rounds ~12.5 min, the ours discard ~2 min, the server block's discard ~3.5 min
+# (the first read of the file after our load), witnesses and guards ~2 min: ~27 min, under 30.
+kind: baseline
+question: with its engram rows warm, what is llama.cpp's V4.1 prompt rate at P = 4096 on the A6000
+  beside ours, and do its decode and pp512 rows match the two warm-by-chance bench rows?
+term: pp tok/s @ P = 4096, llama.cpp PR #28696 llama-server /completion prompt_per_second on the lcg
+  ids after a same-id warm-up request (-ngl 999 --n-cpu-moe 33 -fa on -t 32 --no-op-offload -fit off
+  -np 1 -ctxcp 0 --cache-ram 0), A6000, engine blocks with the discard
+unit: tok/s
+predict: 76.6..106
+condition: one lease, three rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_WARM_ROWS=1, arms 6 512 4096
+  lcppsrv:6 lcppsrv:4096 lcppsrvpp:512 lcppsrvpp:4096; each block's DISCARD r0 row present; every
+  server row's `majflt N` field (the timed request's own faults) near 0 and its prompt_n equal to the
+  id count; no row carries [cpu-busy] or [other-busy]; the full output to a file first. Command:
+  BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/v41-warm.card
+  BLOOMERY_AB_ORDER=blocks BLOOMERY_WARM_ROWS=1' just depth-gpu-ds41 <the arms above> > <log> 2>&1
+reason: sets the warm llama.cpp rows of the public V4.1 table; the band's low edge is the cold bench
+  row (76.6, the faults cost nothing), its high edge that row with its whole timed-fault bound (28 %)
+  removed [derived]; why now: every A6000 lcpp row of the release sitting was cold
+decide-in: write the llama.cpp V4.1 rows from the server arms (rig-log first), captioned server
+  /completion on our ids after a warm-up; our ratio from this window only
+decide-below: the server pays a term the bench does not (request parse, the sampler per position, a
+  ubatch the server picks): read the server log's n_ubatch and the row's prompt_n, re-derive before
+  any row goes out
+decide-above: the bench's cold fault bound underprices a V4.1 engram fault on this box: re-price
+  COLD_US from this row's warm - cold difference over the timed count before the tag is trusted again

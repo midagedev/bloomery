@@ -1,0 +1,42 @@
+# The warm re-sit of the Qwen3.8 table on the A6000 (lcppwarm), after the Qwen3.8 batched prefill lands.
+# Its bench rows were warm (q38.log: timed 0..1) but our round-1 rows read cold PLE rows (timed
+# 873..1062 faults, ~10 % slower decode, while the cold bound said 0.2..2.6 %): BLOOMERY_WARM_ROWS=1
+# primes each of our arms with a same-id run first. The server twins give the reference side the same
+# ids as ours.
+#
+# Assumed, not measured: our arms run the batched prefill (kind=batch) at 300..800 tok/s for P >= 512,
+# where the release sitting's kind=pass ran ~104; a 4096 prompt then takes 5..14 s instead of ~40 s.
+# Wall [derived from q38.log]: ours 6 512 1024 3000 4096, each a process of ~8 s load + ~2.5 s steps + its
+# prompt (8,638 ids a round, 11..29 s), twice under PRIME: 127..163 s a round; the bench arms lcpp:6
+# lcpppp:512 lcpp:1024 lcpp:3000 lcpppp:4096 lcpppp4096:4096 lcppfit:6: ~106 s + the fit's load; the
+# server arms lcppsrv:6 :1024 :3000 lcppsrvpp:512 :4096 lcppsrvpp4096:4096 lcppsrvfit:6 lcppsrvppfit:4096:
+# ~173 s (a ~7 s load, two requests each); three rounds ~21..23 min;
+# five engine blocks under blocks order (ours, lcpp, lcppfit, lcppsrv, lcppsrvfit: depth-qwen3moe.sh
+# arm_block), five discards ~4 min (q38.log: ours 59 s at kind=pass, lcpp 50 s; the fit and server ones
+# a load and one request or run each): ~25..27 min, under 30 on paper, near it: the lead prices it.
+# lcppppfit4096 and its server twin are out: the release sitting's lcppppfit4096 aborted (rc 134, a CUDA
+# error in ggml_backend_cuda_graph_compute), which ended the segment.
+kind: baseline
+question: with our arms primed on their own ids, what is Qwen3.8's decode at depth 1024 on the A6000,
+  and do the warm llama.cpp server rows match its warm bench rows?
+term: tok/s @ n=96, depth 1024, ours (generate over qwen4exp, the lcg ids, after a same-id PRIME
+  process), A6000
+unit: tok/s
+predict: 39.9..41.9
+condition: one lease, three rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_WARM_ROWS=1, arms 6 512 1024
+  3000 4096 lcpp:6 lcpppp:512 lcpp:1024 lcpp:3000 lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppsrv:6
+  lcppsrv:1024 lcppsrv:3000 lcppsrvpp:512 lcppsrvpp:4096 lcppsrvpp4096:4096 lcppsrvfit:6
+  lcppsrvppfit:4096; llama-server built in the mainline tree first (else the server arms are refused
+  by name before the lease); each block's DISCARD r0 row present; no counted row [cold] (a COLD row's
+  retry clean, else FAIL rc=cold); our rows kind=batch; no [cpu-busy] or [other-busy]; the full output
+  to a file first
+reason: the band is round 2 and 3's warm d1024 rows, 40.74 and 41.06 (timed 0), +-2 % [derived]; the
+  decode step does not move with the batched prefill; why now: round 1's cold PLE rows cost ~10 % and
+  the public Qwen3.8 table is re-sat once the batched prefill lands
+decide-in: write the Qwen3.8 rows (rig-log first), llama.cpp at the faster of bench and server per
+  row, both shown; our pp rows kind=batch
+decide-below: the prime did not warm what the row reads: read the PRIME and ROW majflt pair; if the
+  row's timed count is still ~900, the faults are not the ids' pages and the PLE read path is the
+  next round's question
+decide-above: the batched prefill moved a decode term too: diff the step's node count against q38.log
+  before the row is published

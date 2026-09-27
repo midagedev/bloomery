@@ -2,10 +2,12 @@
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh,
-# cold-blocks.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a line that
-# takes nothing; ref-paths.sh there is a stub
-# profile whose engines are stub scripts (llama-bench, generate_ds41, nvidia-smi) and whose MODEL is
-# gguf-ranges.py's two-shard fixture. Nothing it starts loads a model or touches a card.
+# cold-blocks.sh, lcpp-warm.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a
+# line that takes nothing; ref-paths.sh there is a stub
+# profile whose engines are stub scripts (llama-bench, llama-server, generate_ds41, nvidia-smi) and whose
+# MODEL is gguf-ranges.py's two-shard fixture. Nothing it starts loads a model or touches a card. The
+# fault counter every copy reads (majflt_now, majflt_mark, lg_majflt, lcpp_srv_majflt) is a file the stub
+# engines add to when a case makes them fault, so a row is cold exactly where a case says.
 #
 #   BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh 'bash tools/ref/depth-ds41-stub.sh'
 #   ... 'DEPTH_DS41_RUNNER=/tmp/base-depth-ds41.sh bash tools/ref/depth-ds41-stub.sh'   # FAIL-first
@@ -67,6 +69,30 @@
 #   twocard-arms 6, code:4 and ik:6 each refused by name before anything runs (rc 64); ours naming --place b.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
+# The server arms and the warm rows (lcpp-warm.sh; red on the runner before them: arm usage, rc 64, or
+# BLOOMERY_WARM_ROWS ignored):
+#   srv          6 lcppsrv:6 4 lcppsrvpp:4 lcppsrvpp8:4, one round: each server arm's row (ids=lcg, its
+#                warm-up, the continuation, W = prompt_ms + predicted_ms), the servers' command lines (the
+#                profile's flags in its spellings, -fit off, -np 1 -ctxcp 0 --cache-ram 0, -c, port 0; the
+#                decode arm's and the default prompt arm's alike, the lever's with -ub 8 -b 2048), the ids
+#                each was sent twice (lease.sh's lcg_prompt), the ratio rows against ours, no server left up.
+#   srv-blocks   BLOOMERY_AB_ORDER=blocks: the server arms are a block, its discard the longest prompt.
+#   srv-exit, srv-hang, srv-badn  a server that exits before it listens (rc 5), one that never listens
+#                (rc 124 after the arm bound), one whose timed answer has one predicted token too few:
+#                each a FAIL row naming it, rc 1, no server left up.
+#   srv-nobin, srv-probe  no llama-server (rc 2), a server whose --help lacks a flag the arm passes (rc
+#                64): refused by name before the lease.
+#   srv-corpus   code:4 lcppsrv:code:4: the server arm's row (ids=code, label lcppsrv@code) in the code
+#                table, not in ours'.
+#   srv-fit      lcppsrvfit:6: the server's fit flags and its fit column.
+#   srv-dry      the dry run's server command line.
+#   srv-cold     BLOOMERY_WARM_ROWS=1, a server whose timed request faults: a COLD row, then the retry's
+#                row from one more request to the same server, rc 0.
+#   srv-cold2    the retry faults too: the COLD row, then FAIL rc=cold, dropped, rc 1.
+#   warm         BLOOMERY_WARM_ROWS=1, 6 4 lcpp:6, one round: ours' load runs 6 6 4 4 (each arm after its
+#                PRIME); the ours arm at depth 4 faults twice (its prime and its row) and lcpp:6 once: a
+#                COLD row each, then a fresh load of 4 4 and a second llama-bench, both rows clean, rc 0.
+#   warm-fail    the same, cold again on the retry: FAIL rc=cold for ours at 4 and lcpp at 6, rc 1.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -80,10 +106,19 @@ cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
   "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
+[ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 # The stub's lease writes no record; it says it would write a two-card one (the precheck asks).
 echo 'LEASE_CARDS_RECORD=1' >> "$T/tools/ref/lease.sh"
+# The fault counter: $STUB_MAJFLT, a number the stub engines add to.
+# shellcheck disable=SC2016 # the copies expand them when they run
+{
+  echo 'majflt_now() { cat "$STUB_MAJFLT"; }'
+  echo 'majflt_mark() { awk -v f="$1" -v re="$2" -v src="$STUB_MAJFLT" '"'"'!s && re != "" && $0 ~ re { getline l < src; close(src); print l > f; close(f); s = 1 } { print; fflush() }'"'"'; }'
+} >> "$T/tools/ref/cold-blocks.sh"
+echo 'lg_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/load-groups.sh"
+[ ! -f "$T/tools/ref/lcpp-warm.sh" ] || echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2
 seq 101 110 > "$T/data/engram/corpus-code.ids"
 cat > "$T/tools/ref/ref-paths.sh" << EOF
@@ -149,10 +184,22 @@ if [ "$k" = "${STUB_BENCH_FAIL_K:-none}" ]; then
   echo "llama_init_from_model: failed to create context (stub: --n-cpu-moe $k)" >&2
   exit 1
 fi
+# fault_once <key>: the first K runs of the test <key> (d<D> or p<P>) that STUB_COLD_BENCH=<key>:<K> names
+# add 100000 faults to the counter, 0.3 s after the timed window's progress line.
+fault_once() {
+  local m=${TMPDIR:-/tmp}/stub-cold-bench-$1 c
+  [ "${STUB_COLD_BENCH%%:*}" = "$1" ] || return 0
+  c=$(cat "$m" 2> /dev/null || echo 0)
+  [ "$c" -lt "${STUB_COLD_BENCH#*:}" ] || return 0
+  echo $((c + 1)) > "$m"
+  sleep 0.3
+  echo $(($(cat "$STUB_MAJFLT") + 100000)) > "$STUB_MAJFLT"
+}
 if [ -n "$json" ]; then
   if [ -n "$prog" ]; then
     for l in "warmup prompt run" "prompt run 1/2" "prompt run 2/2"; do echo "llama-bench: benchmark 1/1: $l" >&2; done
   fi
+  fault_once "p$p"
   echo "[{\"n_prompt\": $p, \"samples_ns\": [2000000000, 1000000000], \"build_commit\": \"stub\", \"build_number\": 0, \"gpu_info\": \"stub card\"${ts:+, \"tensor_split\": \"$ts\"}}]"
   exit 0
 fi
@@ -161,6 +208,7 @@ if [ -n "$prog" ]; then
   [ -z "$d" ] || echo "llama-bench: benchmark 1/1: depth run 1/1" >&2
   echo "llama-bench: benchmark 1/1: generation run 1/1" >&2
 fi
+fault_once "d$d"
 if [ "$eng" = ik-bench ]; then label="tg${gp#*,}@pp${gp%,*}"; else label="tg$n @ d$d"; fi
 echo "| model | size | test | t/s |"
 echo "| --- | ---: | ---: | ---: |"
@@ -203,12 +251,21 @@ for k in "${!arms[@]}"; do
     exit 3
   fi
   echo "fed ids=$depth first=[1,2,3,4] last=[5,6,7,8] depth_sequence_from=0"
+  # STUB_COLD_GEN=<depth>:<K>: the first K arms of that depth add 100000 faults after their fed line.
+  cm=${TMPDIR:-/tmp}/stub-cold-gen-$depth
+  if [ "${STUB_COLD_GEN%%:*}" = "$depth" ] && [ "$(cat "$cm" 2> /dev/null || echo 0)" -lt "${STUB_COLD_GEN#*:}" ]; then
+    echo $(($(cat "$cm" 2> /dev/null || echo 0) + 1)) > "$cm"
+    sleep 0.3
+    echo $(($(cat "$STUB_MAJFLT") + 100000)) > "$STUB_MAJFLT"
+  fi
   echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=batch"
   for i in $(seq 0 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; done
   for i in $(seq 1 $((n - 1))); do echo "time step $i ms=33.0000"; done
   echo "SMOKE mode=graph place=${STUB_GEN_PLACE:-$place} prompt_tokens=0 depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=33.0000 mean_ms=33.0000 tok/s(p50)=30.30"
 done
 EOF
+# The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
+cp "$ROOT/tools/ref/stub-llama-server.py" "$T/bin/llama-server"
 chmod +x "$T/bin/"* "$T/target/release/generate_ds41"
 
 n=0 failed=0
@@ -224,11 +281,20 @@ stub_run() {
   shift
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
-  rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp/stub-xid"
+  rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp/stub-xid" \
+    "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
+  echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
-    BLOOMERY_CPU_BUSY_COMMS=none STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 "${e[@]}" \
-    bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
+    BLOOMERY_CPU_BUSY_COMMS=none STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 \
+    STUB_MAJFLT="$tmp/tmp/stub-majflt" "${e[@]}" bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
   RC=$?
+}
+# srv_left: the stub servers of the last run still up (pids from their own file), none when all stopped.
+srv_left() {
+  local p left=''
+  [ -f "$tmp/tmp/stub-srv-pids" ] || return 0
+  while read -r p; do ! kill -0 "$p" 2> /dev/null || left+="$p "; done < "$tmp/tmp/stub-srv-pids"
+  echo "$left"
 }
 # want <name> <log> <count> <pattern>: the log holds exactly <count> lines matching grep -E <pattern>.
 want() {
@@ -554,12 +620,178 @@ elif want twocard-dry "$L" 1 '^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE
   want twocard-dry "$L" 1 "^\[dry\] lcpp:6: timeout --kill-after=10 60 env  [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5 --progress "; then
   pass twocard-dry
 fi
+SRVROW='\| llama-server ids=lcg: warm-up 20.00 tok/s majflt 0, continuation same \| prompt_n 6 prompt tok/s 60.00 \| build 1 \(stub\) \| device Stub Card \| majflt 0 \(timed 0; ≤ 0.0 % of W 0.2500 s\) \| wall [0-9]+s$'
+L=$tmp/srv.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 lcppsrv:6 4 lcppsrvpp:4 lcppsrvpp8:4
+lcg6=$(awk -v n=6 'BEGIN{s=12345; printf "100000"; for(i=1;i<n;i++){s=(s*1103515245+12345)%2147483648; printf ",%d", 1000+(s%90000)}}')
+if [ "$RC" != 0 ]; then
+  fail srv "rc $RC, want 0" "$L"
+elif [ -n "$(srv_left)" ]; then
+  fail srv "servers still up: $(srv_left)" "$L"
+elif want srv "$L" 1 "^ROW r1 lcppsrv d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000 \(stub\) $SRVROW" &&
+  want srv "$L" 1 '^ROW r1 lcppsrvpp p=4 n=0 \| tok/s\(pp\) 40.00 @ n=0, prompt 4, A6000 \(stub\) \| llama-server ids=lcg: warm-up 40.00 tok/s\(pp\) majflt 0, continuation same \| ub 512 b 2048 \(llama-server defaults\) \| build 1 \(stub\) \| device Stub Card \| majflt 0 \(timed 0; ≤ 0.0 % of W 0.1000 s\) \| wall ' &&
+  want srv "$L" 1 '^ROW r1 lcppsrvpp8 p=4 n=0 .*\| ub 8 b 2048 \(the arm.s lever\) \|' &&
+  want srv "$L" 1 '^ratio d=6 +ours/lcppsrv ' &&
+  want srv "$L" 1 '^ratio pp p=4 +ours/lcppsrvpp ' &&
+  want srv "$L" 1 '^ratio pp p=4 +ours/lcppsrvpp8 ' &&
+  want srv "$L" 1 '^\[config\] lcppsrv: .*/llama-server -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c ' &&
+  want srv "$L" 5 '^    lcppsrv: .*/llama-server sha256=' &&
+  want "srv argv" "$tmp/tmp/stub-srv-argv" 2 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 --host 127.0.0.1 --port 0$" &&
+  want "srv argv" "$tmp/tmp/stub-srv-argv" 1 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ub 8 -b 2048 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 " &&
+  want "srv ids" "$tmp/tmp/stub-srv-reqs" 2 "^[12] 6 4 $lcg6$" &&
+  want "srv ids" "$tmp/tmp/stub-srv-reqs" 4 "^[12] 4 1 100000,"; then
+  pass srv
+fi
+
+L=$tmp/srv-blocks.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_ORDER=blocks -- 6 lcppsrv:6 lcppsrvpp:4
+if [ "$RC" != 0 ]; then
+  fail srv-blocks "rc $RC, want 0" "$L"
+elif want srv-blocks "$L" 1 '^\[config\] block 2/2 lcppsrv: lcppsrv:6 lcppsrvpp:4; discard lcppsrv:6, the longest prompt of the block.s arms, 6 ids$' &&
+  want srv-blocks "$L" 1 '^DISCARD r0 lcppsrv d=6 ' &&
+  want srv-blocks "$L" 2 '^ROW r1 lcppsrv(pp)? '; then
+  pass srv-blocks
+fi
+
+for c in "srv-exit STUB_SRV_EXIT=1 rc=5 \| llama-server exited 5 before it answered /health" \
+  "srv-hang STUB_SRV_HANG=1 rc=124 \| llama-server did not answer /health within 4 s" \
+  "srv-badn STUB_SRV_BADN=1 rc=0 \| timed: predicted_n 3, not 4"; do
+  name=${c%% *} rest=${c#* } envv=${rest%% *} pat=${rest#* }
+  L=$tmp/$name.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_ARM_BOUND=4 "$envv" -- lcppsrv:6
+  if [ "$RC" != 1 ]; then
+    fail "$name" "rc $RC, want 1" "$L"
+  elif [ -n "$(srv_left)" ]; then
+    fail "$name" "servers still up: $(srv_left)" "$L"
+  elif want "$name" "$L" 1 "^FAIL r1 lcppsrv d=6 $pat.* \| full output: " &&
+    want "$name" "$L" 0 '^ROW ' &&
+    want "$name" "$L" 1 '^    dropped: lcppsrv at 6$'; then
+    pass "$name"
+  fi
+done
+
+L=$tmp/srv-nobin.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 LCPPSRV="$T/bin/no-server" -- lcppsrv:6
+if [ "$RC" != 2 ]; then
+  fail srv-nobin "rc $RC, want 2" "$L"
+elif want srv-nobin "$L" 1 "^depth-ds41.sh: the lcppsrv arms: no llama-server at $T/bin/no-server "; then
+  pass srv-nobin
+fi
+L=$tmp/srv-probe.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_SRV_HELP_MISSING=--cache-ram -- lcppsrv:6
+if [ "$RC" != 64 ]; then
+  fail srv-probe "rc $RC, want 64" "$L"
+elif want srv-probe "$L" 1 "^depth-ds41.sh: arm 'lcppsrv:6': .*/llama-server --help lists no --cache-ram$"; then
+  pass srv-probe
+fi
+
+L=$tmp/srv-corpus.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- code:4 lcppsrv:code:4 4
+if [ "$RC" != 0 ]; then
+  fail srv-corpus "rc $RC, want 0" "$L"
+elif want srv-corpus "$L" 1 '^ROW r1 lcppsrv@code d=4 n=4 .*\| llama-server ids=code: ' &&
+  want srv-corpus "$L" 1 '^ratio code d=4 +code/lcppsrv@code ' &&
+  want srv-corpus "$L" 0 '^ratio d=4 +ours/lcppsrv' &&
+  want "srv-corpus ids" "$tmp/tmp/stub-srv-reqs" 2 '^[12] 4 4 101,102,103,104$'; then
+  pass srv-corpus
+fi
+
+L=$tmp/srv-fit.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- lcppsrvfit:6
+if [ "$RC" != 0 ]; then
+  fail srv-fit "rc $RC, want 0" "$L"
+elif want srv-fit "$L" 1 "^ROW r1 lcppsrvfit d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000 \(stub\) $FIT_ROW llama-server ids=lcg: " &&
+  want srv-fit "$L" 1 '^    lcppsrvfit fit load_tensors: +CPU_Mapped model buffer size = +2.00 MiB$' &&
+  want "srv-fit argv" "$tmp/tmp/stub-srv-argv" 1 '^-m [^ ]+ -fa on -t 4 -fit on -fitt 1024 -v -np 1 '; then
+  pass srv-fit
+fi
+
+L=$tmp/srv-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- lcppsrv:6 lcppsrvpp:4
+if [ "$RC" != 0 ]; then
+  fail srv-dry "rc $RC, want 0" "$L"
+elif want srv-dry "$L" 1 "^\[dry\] lcppsrv:6: timeout --kill-after=10 60 [^ ]*/llama-server -m [^ ]* -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 --host 127.0.0.1 --port 0   # row label 'lcppsrv', ids=lcg \(6 ids\): one POST /completion discarded, then the same timed, n_predict 4, " &&
+  want srv-dry "$L" 1 "^\[dry\] lcppsrvpp:4: .* n_predict 1, greedy, ignore_eos, cache_prompt off, ub 512 b 2048 \(llama-server defaults\)$" &&
+  [ ! -f "$tmp/tmp/stub-srv-argv" ]; then
+  pass srv-dry
+elif [ -f "$tmp/tmp/stub-srv-argv" ]; then
+  fail srv-dry "the dry run started a server" "$L"
+fi
+
+L=$tmp/srv-cold.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_WARM_ROWS=1 STUB_SRV_COLD=2 -- lcppsrv:6
+if [ "$RC" != 0 ]; then
+  fail srv-cold "rc $RC, want 0" "$L"
+elif want srv-cold "$L" 1 '^COLD r1 lcppsrv d=6 n=4 .*\| majflt 1000000 \(timed 1000000; ≤ [0-9.]+ % of W 0.2500 s\) \| wall [0-9]+s \[cold\]$' &&
+  want srv-cold "$L" 1 '^ROW r1 lcppsrv d=6 n=4 .* continuation same \(the retry\) \| .*\| majflt 1000000 \(timed 0; ≤ 0.0 % of W 0.2500 s\) \| wall [0-9]+s$' &&
+  want srv-cold "$L" 1 '^mean lcppsrv d=6 .*\(n=1\)' &&
+  want "srv-cold requests" "$tmp/tmp/stub-srv-reqs" 3 '^[123] 6 4 ' &&
+  want srv-cold "$L" 1 '^warm rows: 1 COLD row\(s\) ran once more: 1 clean on the retry, 0 FAIL rc=cold$' &&
+  want srv-cold "$L" 1 '^\[config\] warm rows: BLOOMERY_WARM_ROWS=1 '; then
+  pass srv-cold
+fi
+L=$tmp/srv-cold2.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_WARM_ROWS=1 STUB_SRV_COLD=2,3 -- lcppsrv:6
+if [ "$RC" != 1 ]; then
+  fail srv-cold2 "rc $RC, want 1" "$L"
+elif want srv-cold2 "$L" 1 '^COLD r1 lcppsrv d=6 ' &&
+  want srv-cold2 "$L" 1 '^FAIL r1 lcppsrv d=6 rc=cold \| cold after warm-up and one retry \(timed 1000000; ≤ [0-9.]+ % of W 0.2500 s\)$' &&
+  want srv-cold2 "$L" 0 '^ROW ' &&
+  want srv-cold2 "$L" 1 '^    dropped: lcppsrv at 6$' &&
+  want srv-cold2 "$L" 1 '^failed arms: r1 lcppsrv d=6 rc=cold; $'; then
+  pass srv-cold2
+fi
+
+L=$tmp/warm.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_WARM_ROWS=1 STUB_COLD_GEN=4:2 STUB_COLD_BENCH=d6:1 -- 6 4 lcpp:6
+want_seq="PRIME r1 ours d=6
+ROW r1 ours d=6
+PRIME r1 ours d=4
+COLD r1 ours d=4
+PRIME r1 ours d=4
+ROW r1 ours d=4
+COLD r1 lcpp d=6
+ROW r1 lcpp d=6"
+seq=$(grep -oE '^(DISCARD|WARMUP|PRIME|COLD|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$L")
+if [ "$RC" != 0 ]; then
+  fail warm "rc $RC, want 0" "$L"
+elif [ "$seq" != "$want_seq" ]; then
+  fail warm "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 6 4 4|4 4" ]; then
+  fail warm "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 6 4 4|4 4" "$L"
+elif want warm "$L" 1 '^COLD r1 ours d=4 .* \[cold\]$' &&
+  want warm "$L" 1 '^COLD r1 lcpp d=6 .*\(timed 100000; .* \[cold\]$' &&
+  want warm "$L" 1 '^mean ours d=4 .*\(n=1\)' &&
+  want warm "$L" 1 '^mean lcpp d=6 .*\(n=1\)' &&
+  want warm "$L" 1 '^cold rows: 0 of 3 ' &&
+  want warm "$L" 1 '^warm rows: 2 COLD row\(s\) ran once more: 2 clean on the retry, 0 FAIL rc=cold$'; then
+  pass warm
+fi
+L=$tmp/warm-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_WARM_ROWS=1 STUB_COLD_GEN=4:4 STUB_COLD_BENCH=d6:2 -- 6 4 lcpp:6
+if [ "$RC" != 1 ]; then
+  fail warm-fail "rc $RC, want 1" "$L"
+elif want warm-fail "$L" 1 '^FAIL r1 ours d=4 rc=cold \| cold after warm-up and one retry \(timed 100000; ' &&
+  want warm-fail "$L" 1 '^FAIL r1 lcpp d=6 rc=cold \| cold after warm-up and one retry \(timed 100000; ' &&
+  want warm-fail "$L" 1 '^    dropped: ours at 4$' &&
+  want warm-fail "$L" 1 '^    dropped: lcpp at 6$' &&
+  want warm-fail "$L" 1 '^ROW r1 ours d=6 ' &&
+  want warm-fail "$L" 1 '^failed arms: r1 ours d=4 rc=cold; r1 lcpp d=6 rc=cold; $'; then
+  pass warm-fail
+fi
+L=$tmp/warm-bad.log
+stub_run "$L" BLOOMERY_WARM_ROWS=yes -- 6
+if [ "$RC" != 64 ]; then
+  fail warm-bad "rc $RC, want 64" "$L"
+elif want warm-bad "$L" 1 "^depth-ds41.sh: BLOOMERY_WARM_ROWS is 0 .* or 1 .*, got 'yes'$"; then
+  pass warm-bad
+fi
 
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
-    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log; do
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/srv*.log "$tmp"/warm*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done
