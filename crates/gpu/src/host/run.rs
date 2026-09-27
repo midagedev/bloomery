@@ -73,14 +73,25 @@ impl HostRun {
 
     /// The union's slabs for batch calls of up to `cols` columns of the
     /// run's routed width, made once: a load that never serves a batch never
-    /// holds them. A width past what was made is refused by name at the call.
+    /// holds them. A later call for no more columns than they hold keeps
+    /// them; one for more is refused by name (the slabs are the load's size).
     /// Load-time only.
     pub fn prepare_union(&mut self, cols: usize) -> Result<(), GpuError> {
-        if self.union.is_none() {
-            let w = self.widths;
-            self.union = Some(UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?);
+        match &self.union {
+            None => {
+                let w = self.widths;
+                self.union = Some(UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?);
+                Ok(())
+            }
+            Some(u) if cols <= u.max_cols() => Ok(()),
+            Some(u) => Err(GpuError::shape(
+                "HostRun::prepare_union",
+                format!(
+                    "slabs for {cols} columns; the load made them for {}",
+                    u.max_cols()
+                ),
+            )),
         }
-        Ok(())
     }
 
     /// The first layer of the run.

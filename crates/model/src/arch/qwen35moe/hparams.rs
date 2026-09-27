@@ -227,7 +227,7 @@ impl Hparams {
             ));
         }
         let rope_sections = sections(split)?;
-        let conv = meta_usize(split, "ssm.conv_kernel")?;
+        let conv = positive(split, "ssm.conv_kernel")?;
         let state = meta_usize(split, "ssm.state_size")?;
         let v_heads = meta_usize(split, "ssm.time_step_rank")?;
         let k_heads = meta_usize(split, "ssm.group_count")?;
@@ -1022,6 +1022,18 @@ mod tests {
             &keys(),
             &t,
             "tensor blk.0.attn_norm.weight: is in",
+        );
+    }
+
+    /// A delta conv of no tap is refused at the header, as the PLE conv is.
+    #[test]
+    fn a_delta_conv_of_no_tap_is_refused() {
+        let kv = with("ssm.conv_kernel", Some(V::U32(0)));
+        refused(
+            "q4x-conv",
+            &kv,
+            &tensors(),
+            "qwen4exp.ssm.conv_kernel: is 0",
         );
     }
 
