@@ -41,10 +41,11 @@
 #   ref_step_variant  the decode-step variants, below
 #
 #   IK_NCMOE        how many leading layers keep their routed experts on the host in IK_GPU_FLAGS
-#                   (--n-cpu-moe), sized exactly as LCPP_NCMOE is: 33 when MODEL is V41_PUBLIC
-#                   [derived, LCPP_NCMOE's arithmetic below; no ik load has been run at 33], and unset
-#                   for any other file, which no count was sized for — IK_GPU_FLAGS is then unset too,
-#                   and a runner that reads it stops at the name (set -u), as for IK_BEST_FLAGS below.
+#                   (--n-cpu-moe), sized exactly as LCPP_NCMOE is, per timing card: 33 on the A6000 and
+#                   37 on the 3090 when MODEL is V41_PUBLIC [derived, LCPP_NCMOE's arithmetic below; no ik
+#                   load has been run at 33 or 37], and unset for any other file, which no count was
+#                   sized for — IK_GPU_FLAGS is then unset too, and a runner that reads it stops at the
+#                   name (set -u), as for IK_BEST_FLAGS below.
 #                   The arithmetic carries over because ik places the same tensors: token_embd and
 #                   the engram tables (engram_embd) are made in the host input context
 #                   (src/llama-load-tensors.cpp:3326, 3468 at db517b69), engram_wkv/k/q and every other
@@ -81,10 +82,13 @@
 #                   of ik-draft.sh run: the V4.1 port's branch (ggml-org/llama.cpp PR #28696,
 #                   runtime/deepseek41). LCPPBIN moves its llama-bench alone, as IKBIN does ik's
 #   LCPP_NCMOE      how many leading layers keep their routed experts on the host (--n-cpu-moe),
-#                   sized for the A6000: 33 when MODEL is V41_PUBLIC, unset for any other file (and
-#                   with it LCPP_GPU_FLAGS, LCPP_CLI_FLAGS and LCPP_NCMOE_SWEEP) [all derived, from the
-#                   file's header and the card's memory.total, 49,140 MiB; no load has been run at
-#                   these flags]. Layer experts, layers 0-1 7,007,109,120 B (down Q5_K), layers 2-39
+#                   sized per timing card from BLOOMERY_TIMING_GPU (the 3090 when it names GPU_3090,
+#                   tools/ref/cards.sh; else the A6000, timing-card.sh's default): 33 on the A6000 and 37
+#                   on the 3090 when MODEL is V41_PUBLIC, unset for any other file (and with it
+#                   LCPP_GPU_FLAGS, LCPP_CLI_FLAGS and LCPP_NCMOE_SWEEP) [all derived, from the file's
+#                   header and the card's memory.total — 49,140 MiB and 24,576 MiB, the CardSpecs in
+#                   crates/model/src/placement/workstation.rs; no load has been run at 37].
+#                   Layer experts, layers 0-1 7,007,109,120 B (down Q5_K), layers 2-39
 #                   6,440,878,080 B (down Q4_K). Card dense is every other tensor but token_embd
 #                   (the input embedding stays on the host) and the engram tables (the port marks
 #                   them TENSOR_READ_LAZY, a host buffer).
@@ -98,6 +102,16 @@
 #                     port passes one tensor as K and V — 170 MiB at ctx 4,352) and the compute
 #                     buffers. At 32 the experts alone are 8 × 6,440,878,080 = 51,527,024,640 B,
 #                     the card's whole 49,140 MiB: it does not load.
+#                   The 3090 (24,576 MiB, capped at 250 W — power does not move the fit), the same
+#                   arithmetic: the most layers whose experts fit beside the card dense with the
+#                   A6000's margin at 33 (2,713 MiB, a margin a load has passed). 37 keeps layers
+#                   37-39, 3 × 6,440,878,080 = 19,322,634,240 B; card total 22,918,552,000 B = 21,857 MiB,
+#                   2,719 MiB left (against usable memory, total less the driver's 400 MiB on the 3090
+#                   and 548 MiB on the A6000: 2,319 MiB here, 2,165 at the A6000's 33). At 36 the experts
+#                   alone are 4 × 6,440,878,080 = 25,763,512,320 B = 24,570 MiB and the total 27,999 MiB:
+#                   it does not load. 37 holds 1,152 routed experts on the card, the gate placement
+#                   generate_ds41 runs there (--place gate) 888 (14,894,530,560 B of experts); host share
+#                   of routed work 37/40 = 0.925 against 1 − 888/15360 = 0.942.
 #   LCPP_GPU_FLAGS  llama-bench's flags for the `lcpp:<D>` arms (tools/llama-bench/llama-bench.cpp's
 #                   spellings):
 #                   -ngl 999          every layer and the output head on the card
@@ -126,7 +140,8 @@
 #                   `lcpp` arm of ik-draft.sh): --no-op-offload for -nopo 1, and -fit off —
 #                   common's default fit pass would otherwise adjust the arguments not given
 #   LCPP_NCMOE_SWEEP  the --n-cpu-moe values the sweep arms `lcpp<K>:<D>` take (depth-ds41.sh):
-#                   LCPP_NCMOE and the two above it; below it the file does not load (above)
+#                   LCPP_NCMOE and the two above it, on either card; below it the file does not load
+#                   (above). An arm whose value does not load is a FAIL row there, and the runner goes on
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
@@ -147,9 +162,20 @@ DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSee
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${LCPP:=/home/user/llama.cpp-v41}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+# The timing card decides the references' --n-cpu-moe (LCPP_NCMOE above): the 3090's UUID from cards.sh.
+__v41_dir=${BASH_SOURCE[0]%/*}
+[ "$__v41_dir" != "${BASH_SOURCE[0]}" ] || __v41_dir=.
+# shellcheck source=tools/ref/cards.sh
+source "$__v41_dir/../cards.sh"
+unset __v41_dir
 if [ "$MODEL" = "$V41_PUBLIC" ]; then
-  : "${IK_NCMOE:=33}"
-  : "${LCPP_NCMOE:=33}"
+  if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
+    : "${IK_NCMOE:=37}"
+    : "${LCPP_NCMOE:=37}"
+  else
+    : "${IK_NCMOE:=33}"
+    : "${LCPP_NCMOE:=33}"
+  fi
 fi
 if [ -n "${IK_NCMOE:-}" ]; then
   : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe $IK_NCMOE -t 32 --defer-experts}"

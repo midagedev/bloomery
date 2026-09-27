@@ -532,7 +532,10 @@ first suspect is a hung gate on the box, not the agent.
   `corpus-prose.ids` (`--tokens`) instead of the lcg prompt; prose arms are compared only with prose
   arms of the same P, in their own decode and prefill tables — a lever that moves the card's routed
   experts (the shadow) is judged on them, because the lcg prompt's routing leaves the shadow under the
-  union. The `card` witness field prints the timing card's SM clock, the active clock-event mask and
+  union. `code:<P>` is the same on `corpus-code.ids`, in its own tables; `BLOOMERY_GEN_PLACE=gate` runs our
+  arms at `--place gate`, with the 3090 as `BLOOMERY_TIMING_GPU`; each reference arm's host set is preheated
+  first (`BLOOMERY_PREHEAT=0` off), rows carry `majflt` and `[cold]`, and a failed arm is a `FAIL` row the
+  runner goes past (rc 1 at the end). The `card` witness field prints the timing card's SM clock, the active clock-event mask and
   the cumulative power and thermal slowdown counters (post − pre bounds the arm's capped time), and a
   `cpu-freq` line (`scaling_cur_freq` mean/min/max over the cores at the block's instant).
 - **The step does no load-time work.** Anything that does not depend on the
