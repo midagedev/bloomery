@@ -15,6 +15,7 @@
 //! - [`ik`]: ik's node dumps (`tools/ref/dump_ref.cpp`), the v1 and v2
 //!   `MANIFEST.tsv` and the files its rows name.
 //! - [`dsref`]: ik's DSpark draft sets (`tools/ref/dump_draft.cpp`).
+//! - [`mtpref`]: ik's MTP draft sets (`tools/ref/dump_mtp.cpp`).
 //! - [`greedy`]: ik's greedy continuations (`tools/ref/argmax_ref.cpp`).
 //! - [`kld`]: ik's KL-divergence base runs (`tools/ref/ik-ppl.sh`).
 //! - [`vision`]: the vision encoder's oracle (`tools/ref/vision/dump_vision.py`).
@@ -31,6 +32,7 @@ pub mod family;
 pub mod greedy;
 pub mod ik;
 pub mod kld;
+pub mod mtpref;
 pub mod vision;
 
 /// Why a reference set cannot be used.

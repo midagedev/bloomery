@@ -1,6 +1,7 @@
 //! The GLM-5.3-Flash families. The node dumps are dumped from unsloth's
 //! UD-Q4_K_XL split set, [`MODEL`], by the ik tree [`IK_BUILD`]
-//! (`tools/ref/models/glm5next.sh`).
+//! (`tools/ref/models/glm5next.sh`); the MTP draft set from the same file by
+//! the ik tree that carries the MTP graph, [`MTP_BUILD`].
 
 use crate::family::{Build, Family, Identity};
 
@@ -54,8 +55,34 @@ pub static IK: Family = Family {
     consumers: &["gate-gpu-glm5next-e2e"],
 };
 
+/// The ik tree the MTP draft set is dumped from: ik's glm5next MTP graph
+/// merged onto an ancestor of [`IK_BUILD`], whose tree has no MTP graph for
+/// this architecture. The profile's `GLM_MTP_SHA` names the same commit.
+// PIN(2026-09-28): /home/user/ik-glm53-mtp at its HEAD, the tree whose
+// llama-server measured the MTP accept rate on this box.
+pub const MTP_BUILD: &str = "425a2c1d";
+
+/// The MTP draft set: every node ik's MTP context computes while the target
+/// decodes 64 positions after the first 64 ids of the prose, one draft token
+/// a round (`tools/ref/dump-mtp.sh`).
+pub const MTP_SET: &str = "ref-mtp/prose64_n64_k1";
+
+/// ik's MTP draft sets, dumped from [`MODEL`], which carries the NextN block.
+pub static MTP: Family = Family {
+    name: "mtp-glm5next",
+    sets: &[MTP_SET],
+    resolve: None,
+    recipe: "just dump-ref-mtp-glm5next",
+    identity: Identity::MtpManifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(MTP_BUILD)),
+    runs: Some(model),
+    draft_runs: None,
+    consumers: &[],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK];
+pub static FAMILIES: &[&Family] = &[&IK, &MTP];
 
 #[cfg(test)]
 mod tests;
