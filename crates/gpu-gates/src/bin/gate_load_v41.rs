@@ -35,8 +35,9 @@
 //! 4. Resident host set: the gate derives the plan's host set as the engine
 //!    does — the r8 reading under the engine's `BLOOMERY_R8`
 //!    (`HostR8::at_gate`: with the lever on, no sidecar at its path refuses
-//!    the run by name) and `HostSet::of_r8` over the sidecar it reads,
-//!    `HostSet::of` with the lever off — and before anything is loaded drops the
+//!    the run by name) and `HostSet::of` over the pair it makes of the file
+//!    and that reading (`R8Source::of`, the one pairing check, before any page
+//!    is dropped) — and before anything is loaded drops the
 //!    shard files and that sidecar from the page cache
 //!    (`posix_fadvise(DONTNEED)`, the pages another process maps excepted —
 //!    the count still resident is printed), so a lazy mapping cannot pass by
@@ -97,7 +98,7 @@ mod gate {
         Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
         PlanLevers, Segment, workstation,
     };
-    use model::r8file::HostR8;
+    use model::r8file::{HostR8, R8Source};
 
     /// Design §5's two plans.
     #[derive(Clone, Copy)]
@@ -238,11 +239,9 @@ mod gate {
         let cards = open_cards(&plan)?;
         let lock = args.lock.as_ref();
         let r8 = HostR8::at_gate(&split, levers.r8)?;
-        let set = match r8.sidecar() {
-            Some(side) => HostSet::of_r8(&split, side, &plan, |t| keeps(lock, t))?,
-            None => HostSet::of(&split, &plan, |t| keeps(lock, t))?,
-        };
-        evict(&split, &set, &r8)?;
+        let src = R8Source::of(&split, &r8)?;
+        let set = HostSet::of(src, &plan, |t| keeps(lock, t))?;
+        evict(src, &set)?;
         let cached_before = meminfo_cached()?;
         let mut ok = true;
         for (c, on) in cards.iter().enumerate() {
@@ -252,6 +251,7 @@ mod gate {
         let host = Host {
             set: &set,
             r8: &r8,
+            src,
             lock,
             levers,
         };
@@ -762,21 +762,22 @@ mod gate {
         Ok(kb.trim().parse::<u64>()? * 1024)
     }
 
-    /// Check 4's precondition: every shard file and the sidecar `r8` reads
+    /// Check 4's precondition: every shard file and the sidecar `src` reads
     /// out of the page cache, so the host set is resident afterwards only if
     /// the load read it in. Pages another process maps stay; the count left
     /// is printed.
-    fn evict(split: &Split, set: &HostSet, r8: &HostR8) -> Result<(), GateError> {
-        let mut release = PageDrop::new(split);
+    fn evict(src: R8Source<'_>, set: &HostSet) -> Result<(), GateError> {
+        let split = src.split();
+        let mut release = PageDrop::of(src);
         for s in 0..split.shard_count() {
             let len = split.shard(s).ok_or("shard out of range")?.mapping().len() as u64;
             release.release(s, 0..len)?;
         }
         let shards = release.bytes();
-        if let Some(side) = r8.sidecar() {
-            release.release_sidecar(side)?;
+        if src.sidecar().is_some() {
+            release.release_sidecar()?;
         }
-        let files = set.resident(split)?;
+        let files = set.resident(src)?;
         let resident: u64 = files.iter().map(|f| f.resident).sum();
         let pages: u64 = files.iter().map(|f| f.pages).sum();
         println!(
@@ -794,6 +795,8 @@ mod gate {
     struct Host<'a> {
         set: &'a HostSet,
         r8: &'a HostR8,
+        /// The file and `r8`, checked as a pair before the eviction.
+        src: R8Source<'a>,
         lock: Option<&'a Lock>,
         levers: HostLevers,
     }
@@ -865,7 +868,7 @@ mod gate {
                 h.set.files()
             );
         }
-        let files = h.set.resident(split)?;
+        let files = h.set.resident(h.src)?;
         let (mut resident, mut pages) = (0, 0);
         for f in &files {
             println!(

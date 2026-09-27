@@ -94,14 +94,16 @@ pub enum ModelError {
     R8(#[from] r8file::R8Error),
 }
 
-/// A hyperparameter reader's metadata refusal stays a metadata error; every
-/// other placement refusal keeps its own variant and text.
+/// A hyperparameter reader's metadata refusal stays a metadata error and an
+/// r8 sidecar's refusal an r8 error; every other placement refusal keeps its
+/// own variant and text.
 impl From<placement::PlacementError> for ModelError {
     fn from(e: placement::PlacementError) -> ModelError {
         match e {
             placement::PlacementError::Metadata { key, detail } => {
                 ModelError::Metadata { key, detail }
             }
+            placement::PlacementError::R8(e) => ModelError::R8(e),
             other => ModelError::Placement(other),
         }
     }

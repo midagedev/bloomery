@@ -80,7 +80,7 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
-use model::r8file::HostR8;
+use model::r8file::R8Pair;
 use model::{Tensor2, Tensor2View};
 
 use crate::dense::{Dense, DenseKernels};
@@ -1502,7 +1502,9 @@ fn q8act_bytes(a: &Q8Act) -> usize {
 /// call writes, made at load — the union's for a prompt batch at its first
 /// call.
 pub struct Ds41Host {
-    file: Arc<Split>,
+    /// The file and the r8 reading its layers were built from, checked
+    /// against each other at load; every call reads through this pair.
+    file: R8Pair,
     /// Per layer of `layers`, its host view; `None` for a layer that does
     /// not route.
     layers: Vec<Option<HostLayer>>,
@@ -1520,18 +1522,17 @@ impl Ds41Host {
     /// `hp`. Load-time only: every stack is found and checked here. A body
     /// passes its own mapping, so the pages its load populated are the ones
     /// the step reads; the routed gates and ups come from `file`'s r8 sidecar
-    /// when the load reads one ([`HostR8::at_load`] under the load's host
+    /// when the load reads one ([`R8Pair::at_load`] under the load's host
     /// levers: the reading and the mapping the load's host set took).
     pub fn build(
         file: impl Into<Arc<Split>>,
         hp: &Hparams,
         layers: Range<usize>,
     ) -> Result<Ds41Host, GpuError> {
-        let file = file.into();
+        let file = R8Pair::at_load(file.into(), bloomery_gpu::hybrid::host_levers()?.r8)?;
         let first = layers.start;
-        let r8 = HostR8::at_load(&file, bloomery_gpu::hybrid::host_levers()?.r8)?;
         let views = layers
-            .map(|l| host::layer_r8(&file, r8.sidecar(), hp, l))
+            .map(|l| host::layer(file.source(), hp, l))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Ds41Host {
             file,
@@ -1592,7 +1593,7 @@ impl HostExperts for Ds41Host {
         out: &mut [f32],
     ) -> Result<(), GpuError> {
         let view = host_view(&self.layers, self.first, layer, "Ds41Host::experts_into")?;
-        view.experts_into(&self.file, x, experts, out, &mut self.scratch)?;
+        view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
         Ok(())
     }
 
@@ -1617,7 +1618,7 @@ impl HostExperts for Ds41Host {
             Some(s) => s,
             None => union.insert(union_scratch(*embd, *ff)?),
         };
-        view.experts_union_into(file, x, lists, out, scratch)?;
+        view.experts_union_into(file.source(), x, lists, out, scratch)?;
         Ok(())
     }
 }

@@ -23,7 +23,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use gguf::{GgmlType, Gguf, Split, TensorInfo};
@@ -35,7 +35,7 @@ use crate::ops::{
     matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
 };
 use crate::profile;
-use crate::r8file::{R8Error, Sidecar};
+use crate::r8file::{R8Error, R8Source};
 
 /// Tokens grouped by the expert they were routed to.
 ///
@@ -1523,25 +1523,17 @@ impl HostLayer {
     /// evenly, each with a fused kernel at its row width — the union call's
     /// own check ([`UnionStack::of_call`]), whose error names the stack. Every
     /// stack error a call could meet is raised here, at load.
-    pub fn build(split: &Split, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
-        HostLayer::build_r8(split, spec, None)
-    }
-
-    /// [`HostLayer::build`] with the gate and the up read from `r8`, the
-    /// source's r8 sidecar, when given ([`crate::r8file::HostR8`]): each is
-    /// the sidecar's copy of its source stack (`R8Stack::of` — the same
-    /// name, dims and bytes, so every expert keeps its byte range), and the
-    /// down, which a sidecar never holds, is the source's. Refused by name: a
-    /// sidecar that lacks the gate or the up, one that holds the down, and
-    /// one that is not `split`'s — opened for another source, however alike
-    /// its names and shapes (`Sidecar::pairs`). The sidecar is a second byte
-    /// source the load resolves, not a property of the layer's tensors, so it
-    /// rides beside the spec.
-    pub fn build_r8(
-        split: &Split,
-        spec: &HostLayerSpec<'_>,
-        r8: Option<&Arc<Sidecar>>,
-    ) -> Result<HostLayer, ModelError> {
+    ///
+    /// When `src` reads the source's r8 sidecar ([`R8Source`]), the gate and
+    /// the up are the sidecar's copies of their source stacks (`R8Stack::of`
+    /// — the same name, dims and bytes, so every expert keeps its byte
+    /// range), and the down, which a sidecar never holds, is the source's.
+    /// Refused by name: a sidecar that lacks the gate or the up, and one that
+    /// holds the down. The sidecar is a second byte source the load resolves,
+    /// not a property of the layer's tensors, so it rides beside the spec, in
+    /// the pair.
+    pub fn build(src: R8Source<'_>, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
+        let split = src.split();
         let gate = ShardTensor::find(split, spec.gate)?;
         let up = ShardTensor::find(split, spec.up)?;
         let down = ShardTensor::find(split, spec.down)?;
@@ -1554,7 +1546,7 @@ impl HostLayer {
             // The per-expert cut: `expert_view`'s check, once, here.
             expert_view(t.info(), 0, spec.n_expert)?;
         }
-        let (gate, up) = match r8 {
+        let (gate, up) = match src.sidecar() {
             None => (GateUp::File(gate), GateUp::File(up)),
             Some(side) => {
                 if side.find(spec.down).is_some() {
@@ -1565,8 +1557,8 @@ impl HostLayer {
                     .into());
                 }
                 (
-                    GateUp::R8(R8Stack::of(split, side, spec.gate)?),
-                    GateUp::R8(R8Stack::of(split, side, spec.up)?),
+                    GateUp::R8(R8Stack::of(src, spec.gate)?),
+                    GateUp::R8(R8Stack::of(src, spec.up)?),
                 )
             }
         };
@@ -1605,6 +1597,19 @@ impl HostLayer {
         [self.gate.layout(), self.up.layout(), RowLayout::Rows]
     }
 
+    /// `src` is a pair this layer reads beside: one that reads the open of
+    /// the sidecar its r8 stacks were built from — a pointer compare, the
+    /// pair's own check having run when it was made. A layer that reads only
+    /// the file takes any pair: it reads no sidecar.
+    fn read_beside(&self, src: R8Source<'_>) -> Result<(), ModelError> {
+        for s in [&self.gate, &self.up] {
+            if let GateUp::R8(s) = s {
+                src.reads(s.sidecar(), "a host layer's call")?;
+            }
+        }
+        Ok(())
+    }
+
     /// The three stacks as a union call reads them, resolved once.
     fn stacks_of<'a>(&'a self, split: &'a Split) -> Result<[ExpertStack<'a>; 3], ModelError> {
         Ok([
@@ -1625,16 +1630,19 @@ impl HostLayer {
     /// [`experts_into`] for this layer: a given list of routed experts of
     /// ONE token, `out = Σ_i w_i · down_{e_i}(clamp(up_{e_i}·x, ±L) ⊙
     /// min(silu(gate_{e_i}·x), L))` in list order, each matrix read from
-    /// the shard that holds it. `scratch` is the caller's, made for this
-    /// layer's widths; after the call it holds what the call computed.
+    /// the shard that holds it, or the sidecar. `src` is the pair the layer
+    /// was built from. `scratch` is the caller's, made for this layer's
+    /// widths; after the call it holds what the call computed.
     pub fn experts_into(
         &self,
-        split: &Split,
+        src: R8Source<'_>,
         x: &Tensor2,
         experts: &[(u32, f32)],
         out: &mut [f32],
         scratch: &mut HostScratch,
     ) -> Result<(), ModelError> {
+        self.read_beside(src)?;
+        let split = src.split();
         check_host_call(x, experts, out)?;
         out.fill(0.0);
         let n = experts.len();
@@ -1667,15 +1675,18 @@ impl HostLayer {
     /// was made for, column `j` of `out` equal to
     /// [`HostLayer::experts_into`] of column `j` of `x` and `lists[j]` bit
     /// for bit, each distinct expert's matrices read once per call from the
-    /// shard that holds them. `x` is read in place, a block or a view.
+    /// shard that holds them. `x` is read in place, a block or a view; `src`
+    /// is the pair the layer was built from.
     pub fn experts_union_into<'x>(
         &self,
-        split: &Split,
+        src: R8Source<'_>,
         x: impl Into<Tensor2View<'x>>,
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
+        self.read_beside(src)?;
+        let split = src.split();
         let x = x.into();
         check_union_call(
             x,
@@ -1702,6 +1713,7 @@ mod tests {
         check_host_call, gather_expert_inputs, last_touched_experts, reset_touched,
     };
     use crate::ops::{self, Tensor2};
+    use crate::r8file::R8Source;
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
 
@@ -1843,7 +1855,7 @@ mod tests {
         n_expert: usize,
     ) -> Result<HostLayer, crate::ModelError> {
         HostLayer::build(
-            split,
+            R8Source::rows(split),
             &HostLayerSpec {
                 gate: "gate_exps",
                 up: "up_exps",
@@ -1929,13 +1941,19 @@ mod tests {
             for (j, list) in lists.iter().enumerate() {
                 let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
                 layer
-                    .experts_into(&split, &xj, list, &mut want[j * embd..][..embd], &mut host)
+                    .experts_into(
+                        R8Source::rows(&split),
+                        &xj,
+                        list,
+                        &mut want[j * embd..][..embd],
+                        &mut host,
+                    )
                     .unwrap();
             }
             let mut got = vec![f32::NAN; embd * cols];
             let p0 = us.passes();
             layer
-                .experts_union_into(&split, &x, &slices, &mut got, &mut us)
+                .experts_union_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
                 .unwrap();
             let passes = us.passes() - p0;
             let diff = got
@@ -1982,10 +2000,22 @@ mod tests {
             [(0u32, 1.0f32), (1, 1.0), (2, 1.0), (3, 1.0)],
         );
         layer
-            .experts_union_into(&split, &x, &[&three[..], &three[..]], &mut out, &mut us)
+            .experts_union_into(
+                R8Source::rows(&split),
+                &x,
+                &[&three[..], &three[..]],
+                &mut out,
+                &mut us,
+            )
             .unwrap();
         let e = layer
-            .experts_union_into(&split, &x, &[&three[..], &four[..]], &mut out, &mut us)
+            .experts_union_into(
+                R8Source::rows(&split),
+                &x,
+                &[&three[..], &four[..]],
+                &mut out,
+                &mut us,
+            )
             .expect_err("a list past the routed width is refused")
             .to_string();
         std::fs::remove_file(&path).unwrap();

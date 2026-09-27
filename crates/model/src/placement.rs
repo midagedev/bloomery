@@ -684,6 +684,10 @@ pub enum PlacementError {
     /// kernel's answer.
     #[error("host lock: {0}")]
     Host(String),
+    /// A host set, a walk or a page release met an r8 sidecar it cannot take
+    /// beside its pair: the sidecar's own named refusal.
+    #[error(transparent)]
+    R8(#[from] crate::r8file::R8Error),
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),

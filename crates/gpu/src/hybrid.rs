@@ -82,7 +82,7 @@ use gguf::Split;
 use model::moe::EXPERTS_INTO_MAX;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
 use model::placement::{ModelTensor, Plan};
-use model::r8file::HostR8;
+use model::r8file::{HostR8, R8Source};
 use model::{Tensor2, Tensor2View};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -265,19 +265,16 @@ impl HostResidency {
     ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
         let r8 = HostR8::at_load(split, levers.r8)?;
-        let set = match r8.sidecar() {
-            Some(side) => HostSet::of_r8(split, side, plan, keep),
-            None => HostSet::of(split, plan, keep),
-        }
-        .map_err(|e| GpuError::plan(WHAT, e))?;
+        let src = R8Source::of(split, &r8)?;
+        let set = HostSet::of(src, plan, keep).map_err(|e| GpuError::plan(WHAT, e))?;
         let populate = levers
             .populate
-            .then(|| set.populate(split))
+            .then(|| set.populate(src))
             .transpose()
             .map_err(|e| GpuError::plan(WHAT, e))?;
         let lock = levers
             .lock
-            .then(|| HostLock::lock(split, &set))
+            .then(|| HostLock::lock(src, &set))
             .transpose()
             .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(HostResidency {
