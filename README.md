@@ -68,7 +68,7 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 | Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | faster; near par in decode at depth 4096 | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
 
 - "vs llama.cpp" is the direction in the same window as the linked rig-log entry (decode and prompt alike unless it says otherwise): mainline llama.cpp, or the model's llama.cpp pull request. The rows from 2026-09-28 are provisional, as above.
-- The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, so that row is its favorable case.
+- The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, and the prompt's 512 ids are inside the list's training range: the row is in-sample, its favorable case. The warm re-measure uses held-out prompts ([`docs/fair-measure.md`](docs/fair-measure.md) §4.2).
 - GLM-5.3's prompt runs one step per token for now (about 21 tok/s), so it has no prompt value. With a hot list its decode is at least 28.14 at depth 512; that row is a lower bound, because its page faults were counted over the whole process.
 - Qwen3.8's prompt is fed eight positions at a time; batched prompts are next. The rig-log entries carry the other engines' rows from the same windows, including where llama.cpp is ahead.
 
