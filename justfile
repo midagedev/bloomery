@@ -317,7 +317,7 @@ box-gc *ARGS='--kill':
     if [ "$rc" = 66 ]; then echo "box-gc: this track has no remote directory on the box (box.sh rc 66): nothing ran there, nothing to collect"; rc=0; fi
     exit "$rc"
 
-# 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove`로 stale 삭제.
+# 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove NAME…`로 준 이름만 삭제(그때도 stale일 때).
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}
 

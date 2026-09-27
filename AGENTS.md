@@ -141,7 +141,7 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just gate-ptx-spill  # compile-time ratchet: every PTX entry's spill/jit_local bytes
                       # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
-    just box-tracks   # remote track dirs vs local worktrees; --remove deletes stale ones
+    just box-tracks   # remote track dirs vs local worktrees; --remove NAME… deletes those, if stale
     just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
                       # selects it. Plan (b) — the tree's only two-card load — staged on both
                       # cards and checked byte for byte against the plan; solo. `-lock` also
@@ -333,11 +333,14 @@ Track checklist, first and last:
    `/proc/<pid>/exe`, never by cmdline — a `pgrep -f '<dir>'` also matches the
    shell that runs it).
 3. **Last**: `just box-gc` again, remove the worktree, then `just box-tracks
-   --remove` — a removed worktree leaves its remote directory (and a
-   `target/` of several hundred MB) behind on the box. Read the listing
-   before removing. A track's auxiliary remote directory (a `git archive`
+   --remove <track> [<track>-<suffix>…]` — a removed worktree leaves its remote
+   directory (and a `target/` of several hundred MB) behind on the box. It
+   removes only the names given, each only if it is still stale when it runs;
+   a stale directory not named is printed and kept (another session's track
+   can turn stale between your listing and your remove), and a bare
+   `--remove` is refused. A track's auxiliary remote directory (a `git archive`
    base tree, say) is named `bloomery-<track>-<suffix>`: `box-tracks` lists
-   it as `aux` of the live track and removes it only after that track's
+   it as `aux` of the live track and can remove it only after that track's
    worktree is gone, and it never removes a directory a process runs in
    (an exe under its `target/`, or a cwd inside it — a build in progress).
 

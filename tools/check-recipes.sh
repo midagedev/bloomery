@@ -129,6 +129,14 @@ if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
   exit 1
 fi
 echo "${cards##*$'\n'}"
+# box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
+# the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.
+if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
+  echo "$bt" >&2
+  echo "check-recipes: the box-tracks self-test failed" >&2
+  exit 1
+fi
+echo "${bt##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(
