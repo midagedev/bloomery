@@ -109,6 +109,7 @@ generate_ds41   head_norm_neox_append_256                   0          0
 generate_ds41   iq2_xs_rows                             0          0
 generate_ds41   iq3_xxs_rows                            0          0
 generate_ds41   iq4_xs_rows                             0          0
+generate_ds41   kq_gate_up_act_q5k                      0          0
 generate_ds41   kv_append                               0          0
 generate_ds41   kv_append_pos_buf                       0          0
 generate_ds41   kv_norm_rope_append                     0          0
@@ -129,6 +130,7 @@ generate_ds41   q5_0_gemv_sel                           0          0
 generate_ds41   q5_1_gemv                               0          0
 generate_ds41   q5_q8_1_quantize_pair                   0          0
 generate_ds41   q5_quantize_q8                          0          0
+generate_ds41   q5k_gemv_sel                            0          0
 generate_ds41   q6k_gemv                                0          0
 generate_ds41   q6k_gemv_sel                            0          0
 generate_ds41   q8_0_gemv                               0          0
@@ -205,6 +207,7 @@ gate_e2e        head_norm_neox_append_256                   0          0
 gate_e2e        iq2_xs_rows                             0          0
 gate_e2e        iq3_xxs_rows                            0          0
 gate_e2e        iq4_xs_rows                             0          0
+gate_e2e        kq_gate_up_act_q5k                      0          0
 gate_e2e        kv_append                               0          0
 gate_e2e        kv_append_pos_buf                       0          0
 gate_e2e        kv_norm_rope_append                     0          0
@@ -225,6 +228,7 @@ gate_e2e        q5_0_gemv_sel                           0          0
 gate_e2e        q5_1_gemv                               0          0
 gate_e2e        q5_q8_1_quantize_pair                   0          0
 gate_e2e        q5_quantize_q8                          0          0
+gate_e2e        q5k_gemv_sel                            0          0
 gate_e2e        q6k_gemv                                0          0
 gate_e2e        q6k_gemv_sel                            0          0
 gate_e2e        q8_0_gemv                               0          0
