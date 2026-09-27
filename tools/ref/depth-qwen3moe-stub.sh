@@ -51,6 +51,27 @@
 #   warmup-fail  BLOOMERY_AB_WARMUP=1 under rotate, the warm-up lcpp:6 aborts: `FAIL r0 lcpp`, the rows after.
 #   group-fail   6 4 5 in one load, depth 4 ending the process once: 6's row, 4's FAIL row, the driver's
 #                `[load]` line, and 5 in a fresh load (the processes' --arm lists 6 4 5, then 5); rc 1.
+# The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, timing-card.sh), red on the runner before it (it
+# has no mode: timing-card.sh leaves it no card, and its rows would name one):
+#   twocard      lcpp:6 lcpppp:4 lcppfit:6, one round: every row's card field `A6000+3090` and device
+#                field both cards, the stub llama-bench given -ts 1.5/1.5 (the fit arm dropping it), the
+#                witness's two-card lines (each card, the 3090's cap, the Xid count), the [config] line; rc 0.
+#   twocard-dry  the same under BLOOMERY_DRY=1: both cards visible, the precheck's lines and `ok`, the lcpp
+#                command line with -ts.
+#   twocard-arms[-bin|-ik|-mrs]  6, bin:<base>:6, ik:6 and mrs:6 each refused by name before anything
+#                runs (rc 64); ours naming --place b as the expected interface.
+#   twocard-profile  a profile with no two-card line (TWO_CARD_PLACEMENT empty): refused by name, rc 64.
+#   twocard-cap  the 3090 at 300 W: refused before the lease, rc 78, no row.
+#   twocard-gone the 3090 not answering nvidia-smi: refused before the lease, rc 69.
+#   twocard-lease a lease.sh with no two-card record: refused before the lease, rc 64.
+#   twocard-value BLOOMERY_TIMING_CARDS=both: refused by name, rc 64.
+#   twocard-xid  lcpp:6 lcpppp:4 lcpp:5, an Xid 79 line in the kernel journal during lcpppp:4: its FAIL row
+#                naming the Xid, the arms before and after it rows (the count moves on), rc 1.
+#   twocard-one  a llama-bench that sees one CUDA device (lcpp:6): its FAIL row naming it, rc 1.
+#   twocard-busy a compute process on the 3090 as the first arm starts, gone at the next poll: the
+#                [cards-busy] wait and then the row; rc 0.
+#   twocard-optin  timing-card.sh sourced by a runner that does not opt in: TIMING_GPU and
+#                CUDA_VISIBLE_DEVICES empty and the refusal named (lease_take refuses an empty TIMING_GPU).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -65,6 +86,10 @@ cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
+# The stub's lease writes no record; it says it would write a two-card one (the precheck asks), and
+# STUB_ONE_CARD_LEASE=1 takes that back: a lease.sh without the two-card record.
+# shellcheck disable=SC2016 # the line is written for the copy to expand
+echo 'if [ -n "${STUB_ONE_CARD_LEASE:-}" ]; then unset LEASE_CARDS_RECORD; else LEASE_CARDS_RECORD=1; fi' >> "$T/tools/ref/lease.sh"
 touch "$T/model-00001-of-00001.gguf"
 cat > "$T/tools/ref/ref-paths.sh" << EOF
 # shellcheck shell=bash
@@ -74,15 +99,14 @@ IK=$T IKBIN=$T/bin/ik-bench LCPP=$T LCPPBIN=$T/bin/lcpp-bench MRS=$T MRSBIN=$T/b
 IK_GPU_FLAGS='-ngl 99 --n-cpu-moe 1' IK_GPU_DEFAULT_FLAGS='-ngl 99 --n-cpu-moe 2'
 LCPP_GPU_FLAGS='-ngl 99 -fa on -ncmoe 1'
 MRS_FLAGS='--format gguf'
+TWO_CARD_PLACEMENT=
+if [ "\${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ] && [ -z "\${STUB_NO_TWO_CARD:-}" ]; then
+  LCPP_GPU_FLAGS='-ngl 99 -fa on -ncmoe 1 -ts 1.5/1.5'
+  TWO_CARD_PLACEMENT='the stub two-card line: -ncmoe 1 -ts 1.5/1.5'
+fi
 EOF
-cat > "$T/bin/nvidia-smi" << 'EOF'
-#!/usr/bin/env bash
-case "$*" in
-  *--query-gpu=name\ *) echo "NVIDIA RTX A6000 (stub)" ;;
-  *--query-compute-apps*) ;;
-  *) echo "stub, stub, stub, stub, stub, stub, stub, stub" ;;
-esac
-EOF
+# shellcheck source=tools/ref/depth-stub-cards.sh
+. "$HERE/depth-stub-cards.sh"
 # The stub llama-bench at -r 1: a markdown row under the engine's label (pp<P> at 400.00 t/s, a decode
 # test at 20.00), its model column naming the --n-cpu-moe (or -ncmoe) it ran at. Under --progress it
 # prints mainline's progress lines on stderr (the ik copy refuses the flag, as ik's llama-bench does).
@@ -94,11 +118,11 @@ EOF
 # prints no model load (the fit never ran).
 cat > "$T/bin/bench" << 'EOF'
 #!/usr/bin/env bash
-eng=${0##*/} k='' p=0 n=0 d='' gp='' prog='' fitt='' verb=''
+eng=${0##*/} k='' p=0 n=0 d='' gp='' prog='' fitt='' verb='' ts=''
 while [ $# -gt 0 ]; do
   case $1 in
     --n-cpu-moe | -ncmoe) k=$2; shift ;; -p) p=$2; shift ;; -n) n=$2; shift ;; -d) d=$2; shift ;; -gp) gp=$2; shift ;;
-    --progress) prog=1 ;; -fitt) fitt=$2; shift ;; -v) verb=1 ;;
+    --progress) prog=1 ;; -fitt) fitt=$2; shift ;; -v) verb=1 ;; -ts) ts=$2; shift ;;
     -h | --help)
       echo "usage: $eng [options]"
       echo "  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)"
@@ -137,6 +161,7 @@ if [ -n "$prog" ] && [ "$eng" = ik-bench ]; then
   echo "error: unknown argument: --progress" >&2
   exit 1
 fi
+. "${STUB_BENCH_CARDS:?}"
 if [ -n "$prog" ]; then
   echo "llama-bench: benchmark 1/1: starting" >&2
   if [ "$p" != 0 ]; then
@@ -154,7 +179,7 @@ if once ABORT; then
 fi
 echo "| model | size | test | t/s |"
 echo "| --- | ---: | ---: | ---: |"
-once NOVAL || echo "| stub k=$k | 1 | $label | $val ± 0.01 |"
+once NOVAL || echo "| stub k=$k${ts:+ ts=$ts} | 1 | $label | $val ± 0.01 |"
 echo "build: stub (0)"
 EOF
 cp "$T/bin/bench" "$T/bin/ik-bench"
@@ -243,8 +268,9 @@ stub_run() {
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
   rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-*
+  rm -f "$tmp/tmp/stub-xid"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
-    "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
+    STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
   RC=$?
 }
 # want <name> <log> <count> <pattern>: the log holds exactly <count> lines matching grep -E <pattern>.
@@ -549,10 +575,124 @@ elif want group-fail "$L" 1 '^ROW r1 ours d=6 .*\| slot 1/3 \|' &&
   pass group-fail
 fi
 
+# The two-card mode (red on the runner before it).
+TC=BLOOMERY_TIMING_CARDS=a6000+3090
+TWO_CVD="GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4,GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1"
+L=$tmp/twocard.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" -- lcpp:6 lcpppp:4 lcppfit:6
+if [ "$RC" != 0 ]; then
+  fail twocard "rc $RC, want 0" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 lcpp d=6|ROW r1 lcpppp p=4|ROW r1 lcppfit d=6" ]; then
+  fail twocard "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want twocard "$L" 1 "^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| build stub \(0\) \| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\) $END" &&
+  want twocard "$L" 1 "^ROW r1 lcpppp p=4 n=0 \| tok/s\(pp\) 400.00 @ n=0, prompt 4, A6000\+3090 \| ub 512 b 2048 \(llama-bench defaults\) \| build stub \(0\) \| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\) $END" &&
+  want twocard "$L" 1 "^ROW r1 lcppfit d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| fit offloaded 3/3, " &&
+  want twocard "$L" 2 '^    lcpp(pp)? table \| stub k=1 ts=1.5/1.5 \| ' &&
+  want twocard "$L" 1 '^    lcppfit table \| stub k= \| ' &&
+  want twocard "$L" 0 '[, ]A6000 \(stub\) \|' &&
+  want twocard "$L" 0 '^    timing-card: ' &&
+  want twocard "$L" 8 '^    card A6000: NVIDIA RTX A6000 \(stub\), 300.00 W, 300.00 W, 2100 MHz$' &&
+  want twocard "$L" 8 '^    card 3090: NVIDIA GeForce RTX 3090 \(stub\), 250.00 W, 250.00 W, 2100 MHz$' &&
+  want twocard "$L" 8 '^    3090 cap: ok \(3090: NVIDIA GeForce RTX 3090 \(stub\), power.limit 250.00 W, enforced 250.00 W, bus 00000000:41:00.0 \(the 250 W cap: ok\)\)$' &&
+  want twocard "$L" 8 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken \(@[0-9]+\): A6000 0, 3090 0, other 0; last: none$' &&
+  want twocard "$L" 1 '^\[config\] two cards: A6000\+3090, the profile.s two-card line: the stub two-card line: ' &&
+  want twocard "$L" 1 "^\[config\] arms=lcpp:6 lcpppp:4 lcppfit:6 timing_gpu=GPU-8c129fa6-[^ ]* other_gpu= CUDA_VISIBLE_DEVICES=$TWO_CVD$" &&
+  want twocard "$L" 1 '^\[timing-cards\] Xid count from @[0-9]+ ' &&
+  want twocard "$L" 1 '^mean lcpp d=6 .*\(n=1\)'; then
+  pass twocard
+fi
+
+L=$tmp/twocard-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "$TC" -- lcpp:6 lcpppp:4
+if [ "$RC" != 0 ]; then
+  fail twocard-dry "rc $RC, want 0" "$L"
+elif want twocard-dry "$L" 1 "^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE_DEVICES=$TWO_CVD$" &&
+  want twocard-dry "$L" 1 '^\[dry\] two cards: A6000\+3090, the profile.s two-card line: ' &&
+  want twocard-dry "$L" 1 '^\[dry\] \[timing-cards\] A6000: NVIDIA RTX A6000 \(stub\), power.limit 300.00 W, enforced 300.00 W, bus 00000000:61:00.0$' &&
+  want twocard-dry "$L" 1 '^\[dry\] \[timing-cards\] 3090: .*\(the 250 W cap: ok\)$' &&
+  want twocard-dry "$L" 1 '^\[dry\] \[timing-cards\] Xid reader: journalctl -k, NVRM Xid lines on PCI:0000:61:00 \(A6000\) and PCI:0000:41:00 \(3090\)$' &&
+  want twocard-dry "$L" 1 '^\[dry\] two-card precheck: ok$' &&
+  want twocard-dry "$L" 1 "^\[dry\] lcpp:6: timeout --kill-after=10 60 [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 99 -fa on -ncmoe 1 -ts 1.5/1.5 --progress "; then
+  pass twocard-dry
+fi
+
+# twocard_refused <name> <want rc> <pattern> <env…> -- <arms…>: the run refused with that rc, the pattern
+# on one line, and no row, witness or lease.
+twocard_refused() {
+  local name=$1 rc=$2 pat=$3
+  shift 3
+  L=$tmp/$name.log
+  stub_run "$L" "$@"
+  if [ "$RC" != "$rc" ]; then
+    fail "$name" "rc $RC, want $rc" "$L"
+  elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+    pass "$name"
+  fi
+}
+twocard_refused twocard-arms 64 "^depth-qwen3moe.sh: arm '6': generate_qwen3moe loads one card \(--place a\|gate\); its two-card placement, plan \(b\) \(workstation::plan_b\), is expected as --place b and does not exist yet" \
+  "$TC" -- lcpp:6 6
+twocard_refused twocard-arms-bin 64 "^depth-qwen3moe.sh: arm 'bin:[^']*:6': generate_qwen3moe loads one card " \
+  "$TC" -- lcpp:6 "bin:$BASEBIN:6"
+twocard_refused twocard-arms-ik 64 "^depth-qwen3moe.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp \(the profile.s two-card line: [^)]*\); ik has no two-card arm$" \
+  "$TC" -- lcpp:6 ik:6
+twocard_refused twocard-arms-mrs 64 "^depth-qwen3moe.sh: arm 'mrs:6': .*; mrs has no two-card arm$" \
+  "$TC" -- lcpp:6 mrs:6
+twocard_refused twocard-profile 64 "^depth-qwen3moe.sh: BLOOMERY_TIMING_CARDS=a6000\+3090 and the profile qwen4exp has no two-card line \(TWO_CARD_PLACEMENT\)" \
+  "$TC" STUB_NO_TWO_CARD=1 -- lcpp:6
+twocard_refused twocard-cap 78 "^depth-qwen3moe.sh: two cards, refused before the lease: the 3090.s power limit reads 300.00 W \(enforced 300.00 W\), not its 250 W cap" \
+  "$TC" STUB_3090_LIMIT=300.00 -- lcpp:6
+twocard_refused twocard-gone 69 "^depth-qwen3moe.sh: two cards, refused before the lease: the 3090 \(GPU-307fa0f6-[^)]*\) does not answer nvidia-smi \(rc 15\)" \
+  "$TC" STUB_3090_GONE=1 -- lcpp:6
+twocard_refused twocard-lease 64 "^depth-qwen3moe.sh: two cards, refused before the lease: tools/ref/lease.sh records one timing card" \
+  "$TC" STUB_ONE_CARD_LEASE=1 -- lcpp:6
+twocard_refused twocard-value 64 "^depth-qwen3moe.sh: BLOOMERY_TIMING_CARDS is a6000\+3090 \(the two-card mode\) or unset \(one card\), got 'both'$" \
+  BLOOMERY_TIMING_CARDS=both -- lcpp:6
+
+L=$tmp/twocard-xid.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" STUB_BENCH_XID=pp4 -- lcpp:6 lcpppp:4 lcpp:5
+if [ "$RC" != 1 ]; then
+  fail twocard-xid "rc $RC, want 1" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 lcpp d=6|FAIL r1 lcpppp p=4|ROW r1 lcpp d=5" ]; then
+  fail twocard-xid "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want twocard-xid "$L" 1 "^FAIL r1 lcpppp p=4 rc=0 \| two cards: 1 NVRM Xid line\(s\) since the last arm.s check \(A6000 0, 3090 1 since the lease was taken\); last: [0-9.]+ ws kernel: NVRM: Xid \(PCI:0000:41:00\): 79, .*GPU has fallen off the bus\.; last line: " &&
+  want twocard-xid "$L" 4 '^    xid: 1 NVRM Xid line\(s\) since the lease was taken \(@[0-9]+\): A6000 0, 3090 1, other 0; last: ' &&
+  want twocard-xid "$L" 1 '^    dropped: lcpppp at 4$' &&
+  want twocard-xid "$L" 1 '^failed arms: r1 lcpppp p=4 rc=0; $'; then
+  pass twocard-xid
+fi
+
+L=$tmp/twocard-one.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" 'STUB_SEE_ONE=tg4 @ d6' -- lcpp:6 lcpppp:4
+if [ "$RC" != 1 ]; then
+  fail twocard-one "rc $RC, want 1" "$L"
+elif want twocard-one "$L" 1 "^FAIL r1 lcpp d=6 rc=0 \| two cards: the engine saw 1 CUDA device\(s\) \(device 0 'NVIDIA RTX A6000 \(stub\)', device 1 '\?'\), not the A6000 and the 3090" &&
+  want twocard-one "$L" 1 '^ROW r1 lcpppp p=4 '; then
+  pass twocard-one
+fi
+
+L=$tmp/twocard-busy.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" STUB_BUSY_ONCE=3090 -- lcpp:6
+if [ "$RC" != 0 ]; then
+  fail twocard-busy "rc $RC, want 0" "$L"
+elif want twocard-busy "$L" 1 '^\[cards-busy\] .* compute apps on a timed card: \[GPU-307fa0f6-[^,]*, 4242, 100 MiB;\]; waiting up to 10 min$' &&
+  want twocard-busy "$L" 1 '^\[cards-busy\] .* both cards are free after 1 s$' &&
+  want twocard-busy "$L" 1 '^--- witness wait-cards ' &&
+  want twocard-busy "$L" 1 '^ROW r1 lcpp d=6 '; then
+  pass twocard-busy
+fi
+
+L=$tmp/twocard-optin.log
+# shellcheck disable=SC2016 # the inner shell expands them
+(cd "$T" && env PATH="$T/bin:$PATH" "$TC" bash -c 'source tools/ref/timing-card.sh; echo "TIMING_GPU=[$TIMING_GPU] CUDA_VISIBLE_DEVICES=[$CUDA_VISIBLE_DEVICES] TIMING_CARDS=[$TIMING_CARDS]"' other-runner.sh) > "$L" 2>&1
+if want twocard-optin "$L" 1 '^\[timing-cards\] refused: BLOOMERY_TIMING_CARDS=a6000\+3090, and other-runner.sh has no two-card mode \(a runner opts in with TIMING_CARDS_RUNNER=1\): it would time the A6000 alone$' &&
+  want twocard-optin "$L" 1 '^TIMING_GPU=\[\] CUDA_VISIBLE_DEVICES=\[\] TIMING_CARDS=\[\]$'; then
+  pass twocard-optin
+fi
+
 if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
-    "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log; do
+    "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

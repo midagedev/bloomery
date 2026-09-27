@@ -59,6 +59,14 @@
 #                arm is a FAIL row naming it, the discard's included, rc 1.
 #   fit-dry      the dry run: a fit arm's command line (the profile's flags less -ngl and --n-cpu-moe,
 #                then -fitt 1024 -v --progress) and what it dropped; the lcpp arm's line as before.
+# The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, timing-card.sh; depth-qwen3moe-stub.sh has the
+# pre-lease refusals), red on the runner before it:
+#   twocard      lcpp:6 lcpppp:4, one round, the preheat on: the decode row and the json prefill row (its
+#                device lines on stderr) carry `A6000+3090` and both cards, the stub llama-bench got -ts
+#                1.5/1.5, the witness's two-card lines; rc 0.
+#   twocard-arms 6, code:4 and ik:6 each refused by name before anything runs (rc 64); ours naming --place b.
+#   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
+#   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -74,6 +82,8 @@ cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/
   "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
+# The stub's lease writes no record; it says it would write a two-card one (the precheck asks).
+echo 'LEASE_CARDS_RECORD=1' >> "$T/tools/ref/lease.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2
 seq 101 110 > "$T/data/engram/corpus-code.ids"
 cat > "$T/tools/ref/ref-paths.sh" << EOF
@@ -84,15 +94,14 @@ IK=$T IKBIN=$T/bin/ik-bench LCPP=$T LCPPBIN=$T/bin/lcpp-bench
 IK_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -t 4' IK_GPU_ENV=''
 LCPP_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -fa on -t 4'
 BLOOMERY_DATA=$T/data
+TWO_CARD_PLACEMENT=
+if [ "\${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ]; then
+  LCPP_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5'
+  TWO_CARD_PLACEMENT='the stub two-card line: --n-cpu-moe 1 -ts 1.5/1.5'
+fi
 EOF
-cat > "$T/bin/nvidia-smi" << 'EOF'
-#!/usr/bin/env bash
-case "$*" in
-  *--query-gpu=name\ *) echo "NVIDIA RTX A6000 (stub)" ;;
-  *--query-compute-apps*) ;;
-  *) echo "stub, stub, stub, stub, stub, stub, stub, stub" ;;
-esac
-EOF
+# shellcheck source=tools/ref/depth-stub-cards.sh
+. "$HERE/depth-stub-cards.sh"
 # The stub llama-bench: refuses --n-cpu-moe STUB_BENCH_FAIL_K; a pp run (-o json) prints one test with
 # two samples; a decode run prints the markdown row under the engine's label, its model column naming
 # the --n-cpu-moe it ran at. Under --progress it prints mainline's progress lines on stderr (the ik
@@ -102,11 +111,11 @@ EOF
 # and the real one with two expert tensors of blk 1 overridden to the host.
 cat > "$T/bin/bench" << 'EOF'
 #!/usr/bin/env bash
-eng=${0##*/} k='' p='' n='' d='' gp='' json='' prog='' fitt='' verb=''
+eng=${0##*/} k='' p='' n='' d='' gp='' json='' prog='' fitt='' verb='' ts=''
 while [ $# -gt 0 ]; do
   case $1 in
     --n-cpu-moe) k=$2; shift ;; -p) p=$2; shift ;; -n) n=$2; shift ;; -d) d=$2; shift ;; -gp) gp=$2; shift ;;
-    -o) json=1; shift ;; --progress) prog=1 ;; -fitt) fitt=$2; shift ;; -v) verb=1 ;;
+    -o) json=1; shift ;; --progress) prog=1 ;; -fitt) fitt=$2; shift ;; -v) verb=1 ;; -ts) ts=$2; shift ;;
     -h | --help)
       echo "usage: $eng [options]"
       [ -n "${STUB_BENCH_NO_FIT:-}" ] || echo "  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)"
@@ -133,6 +142,8 @@ if [ -n "$prog" ] && [ "$eng" = ik-bench ]; then
   echo "error: unknown argument: --progress" >&2
   exit 1
 fi
+if [ -n "$p" ] && [ "$p" != 0 ]; then label="pp$p"; elif [ "$eng" = ik-bench ]; then label="tg${gp#*,}@pp${gp%,*}"; else label="tg$n @ d$d"; fi
+. "${STUB_BENCH_CARDS:?}"
 [ -z "$prog" ] || echo "llama-bench: benchmark 1/1: starting" >&2
 if [ "$k" = "${STUB_BENCH_FAIL_K:-none}" ]; then
   echo "llama_init_from_model: failed to create context (stub: --n-cpu-moe $k)" >&2
@@ -142,7 +153,7 @@ if [ -n "$json" ]; then
   if [ -n "$prog" ]; then
     for l in "warmup prompt run" "prompt run 1/2" "prompt run 2/2"; do echo "llama-bench: benchmark 1/1: $l" >&2; done
   fi
-  echo "[{\"n_prompt\": $p, \"samples_ns\": [2000000000, 1000000000], \"build_commit\": \"stub\", \"build_number\": 0, \"gpu_info\": \"stub card\"}]"
+  echo "[{\"n_prompt\": $p, \"samples_ns\": [2000000000, 1000000000], \"build_commit\": \"stub\", \"build_number\": 0, \"gpu_info\": \"stub card\"${ts:+, \"tensor_split\": \"$ts\"}}]"
   exit 0
 fi
 if [ -n "$prog" ]; then
@@ -153,7 +164,7 @@ fi
 if [ "$eng" = ik-bench ]; then label="tg${gp#*,}@pp${gp%,*}"; else label="tg$n @ d$d"; fi
 echo "| model | size | test | t/s |"
 echo "| --- | ---: | ---: | ---: |"
-echo "| stub k=$k | 1 | $label | 20.00 ± 0.01 |"
+echo "| stub k=$k${ts:+ ts=$ts} | 1 | $label | 20.00 ± 0.01 |"
 echo "build: stub (0)"
 EOF
 cp "$T/bin/bench" "$T/bin/ik-bench"
@@ -213,9 +224,10 @@ stub_run() {
   shift
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
-  rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads"
+  rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp/stub-xid"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
-    BLOOMERY_CPU_BUSY_COMMS=none "${e[@]}" bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
+    BLOOMERY_CPU_BUSY_COMMS=none STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 "${e[@]}" \
+    bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
   RC=$?
 }
 # want <name> <log> <count> <pattern>: the log holds exactly <count> lines matching grep -E <pattern>.
@@ -488,11 +500,66 @@ elif want fit-dry "$L" 1 "^\[dry\] lcppfit:6: timeout --kill-after=10 60 env  [^
   pass fit-dry
 fi
 
+# The two-card mode (red on the runner before it).
+TC=BLOOMERY_TIMING_CARDS=a6000+3090
+L=$tmp/twocard.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" -- lcpp:6 lcpppp:4
+if [ "$RC" != 0 ]; then
+  fail twocard "rc $RC, want 0" "$L"
+elif want twocard "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| build stub \(0\) \| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\) \| majflt ' &&
+  want twocard "$L" 1 '^ROW r1 lcpppp p=4 n=0 \| tok/s\(pp\) 4 @ n=0, prompt 4, A6000\+3090 \| cold 2 \(repetition 1 of 2\) \| ub 512 b 2048 \(llama-bench defaults\) \| build stub \(0\) \| device stub card \| majflt ' &&
+  want twocard "$L" 1 '^    lcpp table \| stub k=1 ts=1.5/1.5 \| ' &&
+  want twocard "$L" 1 '^    lcpppp params .*"tensor_split":"1.5/1.5"' &&
+  want twocard "$L" 2 '^preheat lcpp(pp)? K=1 ' &&
+  want twocard "$L" 0 '^    timing-card: ' &&
+  want twocard "$L" 6 '^    3090 cap: ok ' &&
+  want twocard "$L" 6 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken ' &&
+  want twocard "$L" 1 '^\[config\] two cards: A6000\+3090, the profile.s two-card line: the stub two-card line: '; then
+  pass twocard
+fi
+
+# twocard_refused <name> <pattern> <arms…>: the two-card run of those arms refused, rc 64, the pattern on
+# one line, and no row, witness or lease.
+twocard_refused() {
+  local name=$1 pat=$2
+  shift 2
+  L=$tmp/$name.log
+  stub_run "$L" "$TC" -- "$@"
+  if [ "$RC" != 64 ]; then
+    fail "$name" "rc $RC, want 64" "$L"
+  elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+    pass "$name"
+  fi
+}
+twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 loads one card \(--place a\|gate\); its two-card placement, plan \(b\) \(workstation::plan_b\), is expected as --place b and does not exist yet" lcpp:6 6
+twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 loads one card " lcpp:6 code:4
+twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
+
+L=$tmp/twocard-xid.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_BENCH_XID=pp4 -- lcpp:6 lcpppp:4
+if [ "$RC" != 1 ]; then
+  fail twocard-xid "rc $RC, want 1" "$L"
+elif want twocard-xid "$L" 1 '^ROW r1 lcpp d=6 ' &&
+  want twocard-xid "$L" 1 "^FAIL r1 lcpppp p=4 rc=0 \| two cards: 1 NVRM Xid line\(s\) since the last arm.s check \(A6000 0, 3090 1 since the lease was taken\); last: .*Xid \(PCI:0000:41:00\): 79, " &&
+  want twocard-xid "$L" 1 '^failed arms: r1 lcpppp p=4 rc=0; $'; then
+  pass twocard-xid
+fi
+
+L=$tmp/twocard-dry.log
+stub_run "$L" BLOOMERY_DRY=1 "$TC" -- lcpp:6
+if [ "$RC" != 0 ]; then
+  fail twocard-dry "rc $RC, want 0" "$L"
+elif want twocard-dry "$L" 1 '^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE_DEVICES=GPU-8c129fa6-[^,]*,GPU-307fa0f6-[^ ]* place=a ' &&
+  want twocard-dry "$L" 1 '^\[dry\] two-card precheck: ok$' &&
+  want twocard-dry "$L" 1 "^\[dry\] lcpp:6: timeout --kill-after=10 60 env  [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5 --progress "; then
+  pass twocard-dry
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
-    "$tmp"/fit-fail.log "$tmp"/fit-dry.log; do
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done

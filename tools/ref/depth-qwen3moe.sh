@@ -264,6 +264,21 @@
 # through the host tier's batch port (`--prefill pass`, the default: `kind=pass`, `plan=pass:8x<k>…`);
 # it has no ubatch path, and `--seed-depth` is refused. Its reference is mainline llama.cpp at
 # its profile's hand-set -ncmoe placement and llama-bench's fit (models/qwen4exp.sh).
+#
+# Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
+# the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table (AGENTS.md, user
+# 2026-09-28: a model that does not fit one card; the reference on the same two cards, in the same
+# lease; the 3090 at its 250 W cap; the witness counting the kernel's Xid lines). Every row's card field
+# reads `A6000+3090`, so no reader puts it in the A6000 table. Only a profile with a two-card line
+# (TWO_CARD_PLACEMENT, models/qwen4exp.sh: its LCPP_GPU_FLAGS then carry -ts) runs in the mode, and only
+# its llama.cpp arms: lcpp, lcpppp[<U>] at the profile's split, and the fit arms, whose fit places over
+# both cards. An ours or bin: arm is refused by name before anything runs (generate_qwen3moe loads one
+# card; --place b is its expected two-card interface), and so are ik and mistral.rs arms (no two-card
+# line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
+# refuses the run; after every arm an Xid since the last arm, a card lost or off its cap, or a
+# llama-bench that did not see both cards (its ggml_cuda_init lines) makes the arm a FAIL row. A compute
+# process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
+# pre-lease checks' verdict and goes on.
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # MRS, MRSBIN, MRS_FLAGS); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so
@@ -382,9 +397,15 @@ for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" != ours ] || LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")"
 done
-# The card pin, the card's witness lines, the other-card guard and the binary's freshness.
+# The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
+# has the two-card mode (the header's Two cards).
+TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
+TC_ARMS=()
+for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
+timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -407,7 +428,11 @@ if [ "$lcppfit" = 1 ]; then
   lcpp_fit_probe "$LCPPBIN" || { echo "depth-qwen3moe.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
 fi
 if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
-CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+if [ -n "$TIMING_CARDS" ]; then
+  CARD_NAME=$TIMING_CARDS_NAME
+else
+  CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+fi
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
 # status` from rewriting the index of a tree this root process does not own.
 tree_line() {
@@ -578,6 +603,11 @@ ref_arm() {
   mark=$(cat "$markf")
   rm -f "$markf"
   witness "post r$r $eng d=$dep"
+  # Two cards: an Xid, a card lost or off its cap, or an engine that saw one card fails the arm.
+  if ! timing_cards_arm "$raw"; then
+    arm_fail "$r" "$eng" "$key" "$rc" "two cards: $TWOCARD_WHY" "$raw"
+    return 0
+  fi
   val=$(echo "$raw" | ref_val "$eng" "$REF_LABEL")
   # A fit arm's loader lines say what the fit chose; a fit that failed or never ran is a FAIL row,
   # whatever llama-bench measured after it.
@@ -606,6 +636,7 @@ ref_arm() {
       [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $eng fit /"
       build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
       dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
+      [ -z "$TWOCARD_DEVS" ] || dev=$TWOCARD_DEVS
       ;;
   esac
   # The timed window of the row: P / tok/s for a pp row, N / tok/s for a llama-bench decode row,
@@ -900,6 +931,16 @@ ratio_table() {
 
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+  if [ -n "$TIMING_CARDS" ]; then
+    echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
+    tc_rc=0
+    timing_cards_precheck '[dry] ' || tc_rc=$?
+    if [ "$tc_rc" = 0 ]; then
+      echo "[dry] two-card precheck: ok"
+    else
+      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
+    fi
+  fi
   ref_witness | sed 's/^   /[dry]/'
   for i in "${!ARMS[@]}"; do echo "[dry] ${ARMS[$i]}: $(dry_cmd "$i")"; done
   if [ "$ORDER" = rotate ]; then
@@ -916,7 +957,14 @@ if [ -n "$DRY" ]; then
 fi
 
 majflt_require depth-qwen3moe.sh
+timing_cards_precheck || {
+  rc=$?
+  echo "depth-qwen3moe.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
+  exit "$rc"
+}
 lease_take
+timing_cards_start
+[ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
 blocks_config

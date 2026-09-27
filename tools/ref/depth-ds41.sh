@@ -311,6 +311,22 @@
 # arm started beside a compute process on the other card in ` [other-busy]` (guard_other's
 # OTHER_BUSY_TAG), and the closing summary counts both. BLOOMERY_OTHER_STRICT=1 aborts (rc 75) on
 # either instead.
+#
+# Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
+# the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table (AGENTS.md, user
+# 2026-09-28: a model that does not fit one card; the reference on the same two cards, in the same
+# lease; the 3090 at its 250 W cap; the witness counting the kernel's Xid lines). Every row's card field
+# reads `A6000+3090`, so no reader puts it in the A6000 table. The profile's two-card line
+# (TWO_CARD_PLACEMENT, models/deepseek41.sh, V41_PUBLIC only) gives mainline its --n-cpu-moe and -ts;
+# only the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], and the fit arms, whose fit places over both
+# cards). An ours, corpus or bin: arm is refused by name before anything runs (generate_ds41 loads one
+# card; plan (b), --place b, is its expected two-card interface), and so is an ik arm (ik's -ts is a
+# byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
+# placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
+# its cap or an unpatched lease.sh refuses the run; after every arm an Xid since the last arm, a card lost
+# or off its cap, or a llama-bench that did not see both cards (its ggml_cuda_init lines) makes the arm a
+# FAIL row. A compute process on either card as an arm starts is waited out (10 minutes, then rc 75). A
+# dry run prints the pre-lease checks' verdict and goes on.
 set -uo pipefail
 # An ours arm's output is read by tools/bloomery/records.py, which owns the record kinds
 # crates/gpu-gates/src/record.rs declares; the runner names kinds and fields, never a column.
@@ -548,9 +564,15 @@ for i in "${!ARMS[@]}"; do
     *) LG_KEY[i]= ;;
   esac
 done
-# The card pin, the card's witness lines, the other-card guard and the binary's freshness.
+# The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
+# has the two-card mode (the header's Two cards).
+TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
+TC_ARMS=()
+for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
+timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
 # The placement's card must be the timing card, the only one the arms see: plan (a) loads on the card
 # named A6000, the gate plan on the one named 3090 (workstation::plan_a, plan_gate).
 if [ "$gen" = 1 ]; then
@@ -584,7 +606,11 @@ if [ "$lcppfit" = 1 ]; then
   # shellcheck disable=SC2153 # LCPP is the profile's, as below
   lcpp_fit_probe "$LCPPBIN" || { echo "depth-ds41.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
 fi
-CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+if [ -n "$TIMING_CARDS" ]; then
+  CARD_NAME=$TIMING_CARDS_NAME
+else
+  CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+fi
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
 # status` from rewriting the index of a tree this root process does not own. A tree box.sh synced
 # has no .git (the rsync leaves it out): when that tree is the one this runner stands in, its commit
@@ -824,6 +850,13 @@ ref_arm() {
   rm -f "$markf"
   witness "post r$r $eng d=$dep"
   guard_cpu "post r$r $eng d=$dep"
+  # Two cards: an Xid, a card lost or off its cap, or an engine that saw one card fails the arm (a pp
+  # arm's ggml_cuda_init lines are on its stderr, the errf file).
+  if pp_eng "$eng"; then fitsrc=$(cat "$errf" 2> /dev/null); else fitsrc=$raw; fi
+  if ! timing_cards_arm "$fitsrc"; then
+    arm_fail "$r" "$eng" "$key" "$rc" "two cards: $TWOCARD_WHY" "$fitsrc"
+    return 0
+  fi
   if pp_eng "$eng"; then
     # Exactly one test and two samples, or no value: a missing field is a failed arm, not a 0.
     val=$(echo "$raw" | jq -r 'if length == 1 and (.[0].samples_ns | length) == 2
@@ -871,6 +904,7 @@ $(tail -n 40 "$errf" 2>/dev/null)"
     [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $eng fit /"
     build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
     dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
+    [ -z "$TWOCARD_DEVS" ] || dev=$TWOCARD_DEVS
   fi
   if pp_eng "$eng"; then
     echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$tags"
@@ -1118,6 +1152,16 @@ if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES place=$PLACE preheat=$PREHEAT order=$ORDER"
   ref_witness | sed 's/^   /[dry]/'
   echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
+  if [ -n "$TIMING_CARDS" ]; then
+    echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
+    tc_rc=0
+    timing_cards_precheck '[dry] ' || tc_rc=$?
+    if [ "$tc_rc" = 0 ]; then
+      echo "[dry] two-card precheck: ok"
+    else
+      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
+    fi
+  fi
   ph_round=0
   for i in "${!ARMS[@]}"; do
     a=${ARMS[$i]}
@@ -1155,7 +1199,14 @@ if [ -n "$DRY" ]; then
 fi
 
 majflt_require depth-ds41.sh
+timing_cards_precheck || {
+  rc=$?
+  echo "depth-ds41.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
+  exit "$rc"
+}
 lease_take
+timing_cards_start
+[ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s warmup=$AB_WARMUP"
 echo "[config] ours: $BIN (--place $PLACE, default ctx)"
 for c in $CORPORA; do

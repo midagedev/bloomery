@@ -38,6 +38,25 @@
 #                   lcppppfit) let llama-bench place to the byte; each row publishes the faster.
 #                   -t 32 is the host's cores, spelled out as deepseek41.sh does: the host layers'
 #                   experts run on them. No flag sweep has been run
+#   TWO_CARD_PLACEMENT  the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, tools/ref/timing-card.sh; the
+#                   default file only, empty otherwise, and depth-qwen3moe.sh then refuses the mode by name):
+#                   the "A6000+3090" table's mainline line, LCPP_GPU_FLAGS at -ncmoe 21 and -ts 42.5/6.5
+#                   (QWEN38_TS), and what they place. llama-bench's -sm layer (its default) gives device d
+#                   the layers il whose il / 49 is below the d-th cumulative -ts fraction — 48 layers and the
+#                   output as a 49th slot (src/llama-model.cpp:1521-1546 at 53ed051ce) — the A6000 device 0
+#                   and the 3090 device 1; -ncmoe K keeps layers 0..K-1's experts on the host, so the 3090
+#                   takes the last expert layers and the output. The A6000 (device 0) keeps 22 expert layers,
+#                   the one-card line's count, now layers 21-42 with layers 0-20 beside them; the 3090 (device
+#                   1) layers 43-47 with their experts and the output. 42.5/6.5 puts the boundary at 0.867,
+#                   between slot 42 (0.857) and slot 43 (0.878). The 3090's five: its usable 24,176 MiB
+#                   (25.35 GB) less the one-card line's ~10 GB reserve for the -ub 4096 buffers (the output,
+#                   and its logits, are on the 3090 now) and at most all ~4.9 GB of non-expert weights leave
+#                   ~10.5 GB, five layers at the band's top of 1.84 GB. The A6000's bound: 22 x 1.84 GB and at
+#                   most the 4.9 GB beside them is 45.4 GB of its ~47.45 GB usable, ~2 GB where the one-card
+#                   line kept ~10 at the band's middle [derived: the band is this comment's, per-layer bytes
+#                   not read; no two-card load has been run]. The fit arms drop -ncmoe and -ts and let
+#                   llama-bench's fit place over both cards (common/fit.cpp sets tensor_split per device):
+#                   they are the check, and a line that does not load is a FAIL row
 #
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
 # the page cache (unlike V4.1's), so a later dump of the same file reads nothing from the device.
@@ -53,12 +72,19 @@
 # shellcheck disable=SC2034
 MODEL_NAME=qwen4exp
 : "${IK:=/home/user/ik-idxkey}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}
+QWEN38_FILE=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+MODEL=${BLOOMERY_REF_MODEL:-$QWEN38_FILE}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_qwen4exp}"
 : "${REF_SET_CUDA:=ref_cuda_qwen4exp}"
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+TWO_CARD_PLACEMENT=
+if [ "${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ] && [ "$MODEL" = "$QWEN38_FILE" ]; then
+  : "${QWEN38_TS:=42.5/6.5}"
+  : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 21 -t 32 -ts $QWEN38_TS}"
+  TWO_CARD_PLACEMENT="lcpp -ncmoe 21 -ts $QWEN38_TS: the A6000 (device 0) layers 0-42, 21-42 with their experts; the 3090 (device 1) layers 43-47 with their experts and the output [derived, models/qwen4exp.sh]"
+fi
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26 -t 32}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints (it loads
