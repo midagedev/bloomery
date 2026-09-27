@@ -66,7 +66,12 @@ impl CardDraft<DraftBody> {
     ) -> Result<CardDraft<DraftBody>, SessionError> {
         let m = target.model_mut();
         let DraftSpec::Block(spec) = draft_of(hp)
-            .map_err(|e| SessionError::Refused(format!("the draft's description: {e}")))?;
+            .map_err(|e| SessionError::Refused(format!("the draft's description: {e}")))?
+        else {
+            return Err(SessionError::Refused(
+                "the draft's description is not a block draft".to_string(),
+            ));
+        };
         let taps: Vec<usize> = spec.target_layers.iter().map(|&l| l as usize).collect();
         body::attach_features(m, &taps)?;
         let ctx = m.gpu().context().clone();
