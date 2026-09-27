@@ -119,6 +119,7 @@ import concurrent.futures
 import datetime
 import difflib
 import fcntl
+import functools
 import glob
 import hashlib
 import json
@@ -1878,14 +1879,44 @@ _BOX_CFG_KEYS = {
     "target_endian": "little",
 }
 _BOX_CFG_NAMES = {"unix": True, "windows": False}
-# libtest's options. The ones that take a value are tools/gate.sh's list (it skips their values when it
-# looks for a call's filters); an option in neither set is a named error.
-_LIBTEST_VALUE = {"--skip", "--test-threads", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
+# libtest's options. The ones that take a value have one owner, tools/gate.sh's `LIBTEST_VALUE=(…)` line
+# (gate.sh skips their values when it looks for a call's filters, and runs on the box with no Python):
+# this file reads that line; the flags are listed here. An option in neither set is a named error.
+GATE_SH = "tools/gate.sh"
+_LIBTEST_VALUE_LINE = re.compile(r"^LIBTEST_VALUE=\((.*)\)$")
+_LIBTEST_OPTION = re.compile(r"^--?[A-Za-z][A-Za-z-]*$")
 _LIBTEST_FLAG = {
     "--nocapture", "--no-capture", "--show-output", "--ignored", "--include-ignored", "--exact", "--list", "--test",
     "--bench", "-q", "--quiet", "--report-time", "--ensure-time", "--shuffle", "--force-run-in-process",
     "--exclude-should-panic",
 }
+
+
+def libtest_value_options(text: str, where: str = GATE_SH) -> frozenset[str]:
+    """The libtest options that take a value, from gate.sh's text: its one `LIBTEST_VALUE=(…)` line."""
+    lines = [m.group(1) for m in map(_LIBTEST_VALUE_LINE.match, text.splitlines()) if m]
+    if len(lines) != 1:
+        raise RecipeError(f"{where} has {len(lines)} `LIBTEST_VALUE=(…)` lines, not one: the libtest options that take a value are read from there")
+    words = lines[0].split()
+    bad = [w for w in words if not _LIBTEST_OPTION.match(w)]
+    if not words or bad:
+        raise RecipeError(f"{where}'s LIBTEST_VALUE is not a list of plain options: {lines[0]!r}")
+    both = sorted(set(words) & _LIBTEST_FLAG)
+    if len(set(words)) != len(words) or both:
+        raise RecipeError(f"{where}'s LIBTEST_VALUE repeats an option or names a flag of _LIBTEST_FLAG: {both or words}")
+    return frozenset(words)
+
+
+@functools.cache
+def _libtest_value() -> frozenset[str]:
+    try:
+        with open(os.path.join(ROOT, GATE_SH), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as err:
+        raise RecipeError(f"cannot read {GATE_SH}, the owner of the libtest value options: {err}") from err
+    return libtest_value_options(text)
+
+
 _WS = re.compile(r"\s*")
 _ATTR_OPEN = re.compile(r"#\s*(!?)\s*\[")
 _ATTR_PATH = re.compile(r"^((?:::)?[A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)")
@@ -1943,7 +1974,7 @@ def libtest_args(inv: Invocation) -> LibtestArgs:
         opt, val = (w.split("=", 1) + [None])[:2] if w.startswith("--") and "=" in w else (w, None)
         if "{{" in w:
             raise RecipeError(f"test argument `{w}` is a recipe parameter: which tests it runs is known only at run time: {inv.raw}")
-        if opt in _LIBTEST_VALUE:
+        if opt in _libtest_value():
             if val is None:
                 i += 1
                 if i >= len(words):
@@ -1954,7 +1985,7 @@ def libtest_args(inv: Invocation) -> LibtestArgs:
         elif opt in _LIBTEST_FLAG:
             flags.add(opt)
         elif w.startswith("-"):
-            raise RecipeError(f"libtest option `{w}` is not known to tools/recipes.py (add it to _LIBTEST_FLAG or _LIBTEST_VALUE): {inv.raw}")
+            raise RecipeError(f"libtest option `{w}` is not known to tools/recipes.py (add it to _LIBTEST_FLAG, or to tools/gate.sh's LIBTEST_VALUE if it takes a value): {inv.raw}")
         else:
             out.filters.append(w)
         i += 1
@@ -2499,6 +2530,7 @@ def scan_lines(text: str, pat: re.Pattern, where: str, numbered: bool = True) ->
 
 
 _SCAN_MEMO: dict[tuple, str | None] = {}
+_LITERAL_MEMO: dict[tuple[str, int, int], frozenset[str]] = {}
 _JUST_VERSION: list[str] = []
 
 
@@ -2511,6 +2543,16 @@ def scan_file(root: str, rel: str, pat: re.Pattern) -> str | None:
         with open(p, encoding="utf-8", errors="replace") as fh:
             _SCAN_MEMO[k] = scan_lines(fh.read(), pat, rel)
     return _SCAN_MEMO[k]
+
+
+def file_model_literal_dirs(path: str) -> frozenset[str]:
+    """model_literal_dirs of one file, memoized on its stat for the process: every KeyContext reads through it."""
+    st = os.stat(path)
+    k = (path, st.st_size, st.st_mtime_ns)
+    if k not in _LITERAL_MEMO:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            _LITERAL_MEMO[k] = frozenset(model_literal_dirs(fh.read()))
+    return _LITERAL_MEMO[k]
 
 
 def just_version() -> str:
@@ -2567,7 +2609,7 @@ class KeyContext:
             self.manifest_error = f"the box manifest failed: {manifest_error}"
         self.settings = settings if settings is not None else justfile_settings(os.path.join(side.tree.root, "justfile"))
         self._sha: dict[str, str] = {}
-        self._lit: dict[str, set[str]] = {}
+        self._lit: dict[str, frozenset[str]] = {}
         self._tree: list[str] | None = None
 
     def tree_files(self) -> list[str]:
@@ -2583,9 +2625,9 @@ class KeyContext:
             self._sha[rel] = sha256_file(p)
         return f"file\t{rel}\t{self._sha[rel]}"
 
-    def literal_dirs(self, rel: str) -> set[str]:
+    def literal_dirs(self, rel: str) -> frozenset[str]:
         if rel not in self._lit:
-            self._lit[rel] = model_literal_dirs(self.side.tree.read(rel)) if scans_for_models(rel) else set()
+            self._lit[rel] = file_model_literal_dirs(os.path.join(self.side.tree.root, rel)) if scans_for_models(rel) else frozenset()
         return self._lit[rel]
 
     def model_scope(self, names: list[str], files: set[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[dict[str, str], set[str]]:
@@ -3286,17 +3328,14 @@ def key_self_test(expect, real: Side) -> None:
         expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
 
     with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp:
-        roots = []
-        for sub in ("a", "b"):
-            r = os.path.join(tmp, sub)
-            for rel in shipped_files(ROOT):
-                src, dst = os.path.join(ROOT, rel), os.path.join(r, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                if os.path.islink(src):
-                    os.symlink(os.readlink(src), dst)
-                else:
-                    shutil.copyfile(src, dst)
-            roots.append(r)
+        roots = [os.path.join(tmp, "a")]
+        for rel in shipped_files(ROOT):
+            src, dst = os.path.join(ROOT, rel), os.path.join(roots[0], rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.islink(src):
+                os.symlink(os.readlink(src), dst)
+            else:
+                shutil.copyfile(src, dst)
         mf = os.path.join(tmp, "manifest.txt")
         manifest = [
             f"# {MANIFEST_VERSION} host=selftest data=/root/bloomery-data",
@@ -3326,7 +3365,7 @@ def key_self_test(expect, real: Side) -> None:
             "fmt": "fmt-check",
             "args": "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--x",
         }
-        sa, sb = side_at(roots[0], meta), side_at(roots[1], meta)
+        sa = side_at(roots[0], meta)
 
         def keys(side: Side, box_env: str = "", environ: dict | None = None, manifest_path: str | None = mf, only: dict | None = None, fresh: bool = False) -> dict[str, str]:
             st = justfile_settings(os.path.join(side.tree.root, "justfile")) if fresh else settings
@@ -3340,7 +3379,15 @@ def key_self_test(expect, real: Side) -> None:
         base = keys(sa)
         expect(not any(v.startswith("error") for v in base.values()), f"base keys: {base}")
         expect(keys(sa) == base, "the same inputs gave another key")
-        expect(keys(sb) == base, "a second checkout at another path gives other keys (a path is not relative)")
+        # The same tree at a second absolute path: the copy renamed there and back (a symlink would not
+        # do — Tree takes the realpath).
+        other = os.path.join(tmp, "b")
+        os.rename(roots[0], other)
+        try:
+            elsewhere = keys(side_at(other, meta))
+        finally:
+            os.rename(other, roots[0])
+        expect(elsewhere == base, "a second checkout at another path gives other keys (a path is not relative)")
 
         def moved(after: dict[str, str]) -> set[str]:
             return {k for k in after if after[k] != base[k]}
@@ -3559,6 +3606,60 @@ def orphan_self_test(expect, real: Side) -> None:
         except RecipeError as err:
             fails = "" if why in str(err) else f"libtest args: {words} refused without '{why}': {err}"
         expect(not fails, fails)
+
+    # The libtest value options have one owner, tools/gate.sh's LIBTEST_VALUE line. This file reads it, an
+    # option added there is one here, a line the reader cannot take is refused by name, and gate.sh's own
+    # walk picks the same filters as libtest_args from every recipe's test arguments and the edge cases.
+    with open(os.path.join(ROOT, GATE_SH), encoding="utf-8") as fh:
+        gate_text = fh.read()
+    vals = _libtest_value()
+    expect("--skip" in vals, f"libtest value options read from {GATE_SH}: {sorted(vals)}")
+    line = next((ln for ln in gate_text.splitlines() if ln.startswith("LIBTEST_VALUE=(")), "LIBTEST_VALUE=()")
+    expect(libtest_value_options(gate_text.replace(line, line[:-1] + " --frobnicate)")) == vals | {"--frobnicate"}, f"an option added to {GATE_SH}'s LIBTEST_VALUE is not read")
+    for text, why in [
+        (gate_text.replace(line, ""), "has 0 `LIBTEST_VALUE"),
+        (gate_text.replace(line, line + "\n" + line), "has 2 `LIBTEST_VALUE"),
+        (gate_text.replace(line, "LIBTEST_VALUE=()"), "not a list of plain options"),
+        (gate_text.replace(line, 'LIBTEST_VALUE=(--skip "$X")'), "not a list of plain options"),
+        (gate_text.replace(line, line[:-1] + " --skip)"), "repeats an option"),
+        (gate_text.replace(line, line[:-1] + " --nocapture)"), "names a flag"),
+    ]:
+        try:
+            libtest_value_options(text)
+            fails = f"libtest value options: a gate.sh text wanting '{why}' was accepted"
+        except RecipeError as err:
+            fails = "" if why in str(err) else f"libtest value options: refused without '{why}': {err}"
+        expect(not fails, fails)
+    calls = set()
+    for r in real.recipes.values():
+        try:
+            invs = recipe_commands(r).invocations  # a recipe the parser refuses is check()'s error
+        except RecipeError:
+            continue
+        calls |= {("--",) + tuple(inv.test_args) for inv in invs if inv.sub == "test" and not any("{{" in w for w in inv.test_args)}
+    expect(len(calls) >= 10, f"only {len(calls)} recipe test argument lists to hold gate.sh's walk to")
+    calls |= {
+        ("--",), ("--", "f"), ("--", "--skip", "f"), ("--", "--skip=f", "g"), ("--", "--test-threads", "1", "f"),
+        ("--", "--list", "f"), ("--", "-Z", "unstable-options", "--format", "json", "f"), ("--", "--exact", "a::b", "c"),
+        ("--", "--color", "never", "--logfile", "l", "--shuffle-seed", "3"), ("--", "--ignored", "--nocapture", "a", "b"),
+    } | {("--", v, "x", "f") for v in vals}
+    with tempfile.TemporaryDirectory(prefix="recipes-gatewalk-") as stub:
+        # a `timeout` that runs nothing: gate.sh then names its filters in its exit-78 line, or exits 0 with none
+        with open(os.path.join(stub, "timeout"), "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(os.path.join(stub, "timeout"), 0o755)
+        env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_GATE_BOUND"}
+        env["PATH"] = stub + os.pathsep + env.get("PATH", "")
+        for c in sorted(calls):
+            p = subprocess.run(["bash", os.path.join(ROOT, GATE_SH), *c], env=env, capture_output=True, text=True)
+            m = re.search(r"the filter (.*) matched no test", p.stderr)
+            walk = m.group(1).split(" ") if p.returncode == 78 and m else [] if p.returncode == 0 else None
+            try:
+                a = libtest_args(parse_cargo(["test", *c], "t"))
+                want = [] if "--list" in c else a.filters
+            except RecipeError as err:
+                want = f"refused: {err}"
+            expect(walk == want, f"{GATE_SH}'s walk and libtest_args disagree on {' '.join(c)}: gate.sh {walk if walk is not None else p.stderr.strip()}, recipes.py {want}")
 
     # a synthetic crate: file and inline modules, cfgs on the path, #[ignore], an integration target, and
     # every shape the scan refuses by name
