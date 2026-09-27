@@ -146,3 +146,268 @@ fn hw_qwen4exp_spec() {
         b.join("\n  ")
     );
 }
+
+// PIN(2026-09-27): the plan's card and host figures [derived from the header dump: every
+// non-routed tensor but the PLE table on the card in its CardFormat (q8_0 two planes of the file's
+// bytes, f32 as is, bf16 widened to f32), its buffers through a 2 MiB-granule heap in the file's
+// tensor order; the routed stacks, 1,224 − 1,080 = 144 of them, on the host in the file's bytes; the
+// PLE table in the file]. The cache at 4,096 and 32,768 positions: 36 GDN layers of 3,145,728 B of
+// state and 11 · 10,240 f32 of conv ring, the PLE ring 17 · 10,240 f32, 12 attention layers of
+// 2,304 B a position and 256 B a pool of four.
+const CARD_DENSE: u64 = 5_544_906_240;
+const CARD_ROUNDING: u64 = 398_422_528;
+const HOST_EXPERTS: u64 = 77_017_907_200;
+const NVME_TABLE: u64 = 28_800_138_240;
+const KV_AT: [(u64, u64); 2] = [(4096, 246_554_624), (32_768, 1_061_298_176)];
+// The largest context each card holds, as predicted [derived: (usable − margin − the dense
+// granules − context − scratch − 130,162,688 B of recurrent bytes) over 28,416 B a position, the
+// last pool counted whole]. Printed beside the boundary the test finds from the plan's own totals;
+// the clause holds the placement to that boundary, not to this figure.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_520_312), ("3090", 619_339)];
+
+/// The plan of the Qwen3.8 file from its headers (`arch::qwen35moe::place`):
+/// `PlanInputs::read` refuses it with the coverage list; `describe` reads
+/// it, and on each card at 4,096 and 32,768 positions the plan places every
+/// tensor once — the routed stacks whole on the host, the PLE table in the
+/// file, everything else on the card — with the card, host and cache bytes
+/// predicted; every name the program reads is in the file on the layers that
+/// carry it; a context of 0 or past `u32` positions is refused by name, and
+/// one past what a card holds breaks the plan with `CardOver`.
+#[test]
+#[ignore = "needs the Qwen3.8-Flash-Next shards on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_plan() {
+    use model::arch::qwen35moe::hparams::Kind;
+    use model::arch::qwen35moe::names::{self, Sub};
+    use model::arch::qwen35moe::place::{self, KERNEL_POSITIONS, PlaceError, PlanInputs};
+    use model::placement::workstation::{A6000, RTX_3090};
+    use model::placement::{Device, KvBytes, PlanLevers, Role, Violation};
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let split = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
+    let refused = match PlanInputs::read(&split) {
+        Err(model::placement::PlacementError::Unimplemented(list)) => list.len(),
+        other => panic!("PlanInputs::read: want the coverage refusal, got {other:?}"),
+    };
+    check(
+        &mut o,
+        format!(
+            "read refuses the file with the coverage list: {refused} items (want {})",
+            COVERAGE.len()
+        ),
+        refused == COVERAGE.len(),
+    );
+    let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    let hp = &inputs.hp;
+    let file: std::collections::HashSet<&str> = inputs
+        .model
+        .tensors
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    let mut missing = Vec::new();
+    let mut want = |name: String| {
+        if !file.contains(name.as_str()) {
+            missing.push(name);
+        }
+    };
+    for n in [
+        names::token_embd(),
+        names::output(),
+        names::output_hc_norm(),
+        names::output_hc_down(),
+        names::output_hc_up(),
+        names::per_layer_token_embd(),
+    ] {
+        want(n);
+    }
+    let ple = hp.exp.as_ref().and_then(|e| e.ple).map(|p| p.layer);
+    for (l, kind) in hp.kinds.iter().enumerate() {
+        for sub in [Sub::Attn, Sub::Ffn] {
+            want(names::hc_norm(l, sub));
+            want(names::hc_down(l, sub));
+            want(names::hc_up(l, sub));
+            want(names::hc_inject(l, sub));
+        }
+        for f in [
+            names::ffn_gate_inp,
+            names::ffn_gate_inp_shexp,
+            names::ffn_gate_shexp,
+            names::ffn_up_shexp,
+            names::ffn_down_shexp,
+            names::ffn_gate_exps,
+            names::ffn_up_exps,
+            names::ffn_down_exps,
+        ] {
+            want(f(l));
+        }
+        let mixer: &[fn(usize) -> String] = match kind {
+            Kind::DeltaRule => &[
+                names::attn_qkv,
+                names::attn_gate,
+                names::ssm_conv1d,
+                names::ssm_dt_bias,
+                names::ssm_a,
+                names::ssm_alpha,
+                names::ssm_beta,
+                names::ssm_norm,
+                names::ssm_out,
+            ],
+            Kind::Attention => &[
+                names::attn_q,
+                names::attn_k,
+                names::attn_v,
+                names::attn_q_norm,
+                names::attn_k_norm,
+                names::attn_output,
+                names::indexer_q_proj,
+                names::indexer_k_proj,
+                names::indexer_q_norm,
+                names::indexer_k_norm,
+            ],
+        };
+        for f in mixer {
+            want(f(l));
+        }
+        if ple == Some(l) {
+            for f in [
+                names::ple_key,
+                names::ple_value,
+                names::ple_norm_key,
+                names::ple_norm_query,
+                names::ple_norm_conv,
+                names::ple_conv1d,
+            ] {
+                want(f(l));
+            }
+        }
+    }
+    check(
+        &mut o,
+        format!("every name the program reads is in the file: missing {missing:?}"),
+        missing.is_empty(),
+    );
+    let levers = PlanLevers::default();
+    for card in [A6000, RTX_3090] {
+        let machine = place::machine(card, hp.n_layer);
+        for (ctx, kv) in KV_AT {
+            let plan = match inputs.plan(&machine, ctx, &levers) {
+                Ok(p) => p,
+                Err(e) => {
+                    check(
+                        &mut o,
+                        format!("{} ctx {ctx}: plan refused: {e}", card.name),
+                        false,
+                    );
+                    continue;
+                }
+            };
+            let mut once = vec![0usize; inputs.model.tensors.len()];
+            let mut misplaced = Vec::new();
+            for r in &plan.rows {
+                once[r.tensor] += 1;
+                let t = &inputs.model.tensors[r.tensor];
+                let want = match t.role {
+                    Role::RoutedExperts => Device::Host,
+                    Role::EngramTable => Device::Nvme,
+                    _ => Device::Card(0),
+                };
+                if r.segments.len() != 1 || r.segments[0].device != want {
+                    misplaced.push(t.name.clone());
+                }
+            }
+            let placed_once = once.iter().all(|&n| n == 1);
+            let c = &plan.cards[0];
+            let figures = [
+                ("card dense", c.dense_bytes, CARD_DENSE),
+                ("card rounding", c.rounding_bytes, CARD_ROUNDING),
+                ("card experts", c.expert_bytes, 0),
+                ("card kv", c.kv_bytes, kv),
+                ("host experts", plan.host.expert_bytes, HOST_EXPERTS),
+                ("host tables", plan.host.table_bytes, 0),
+                ("nvme", plan.nvme_bytes, NVME_TABLE),
+            ];
+            let bytes_ok = figures.iter().all(|&(_, got, want)| got == want);
+            let shown: Vec<String> = figures
+                .iter()
+                .map(|(what, got, want)| format!("{what} {got} (want {want})"))
+                .collect();
+            check(
+                &mut o,
+                format!(
+                    "{} ctx {ctx}: every tensor placed once {placed_once}, by its role (misplaced \
+                     {misplaced:?}); n_l all 0 {}; {}; headroom {}",
+                    card.name,
+                    plan.n_l.iter().all(|&n| n == 0),
+                    shown.join(", "),
+                    c.headroom_bytes
+                ),
+                placed_once && misplaced.is_empty() && plan.n_l.iter().all(|&n| n == 0) && bytes_ok,
+            );
+        }
+        let predicted = CARD_MAX_CTX
+            .iter()
+            .find(|(n, _)| *n == card.name)
+            .map_or(0, |&(_, c)| c);
+        // The boundary from the plan's own totals: the card's granules, scratch and
+        // context, and the cache the layout gives each context, against usable − margin.
+        let Ok(at) = inputs.plan(&machine, KV_AT[0].0, &levers) else {
+            check(
+                &mut o,
+                format!("{}: no plan to find the boundary from", card.name),
+                false,
+            );
+            continue;
+        };
+        let (c, spec) = (&at.cards[0], &machine.cards[0]);
+        let fixed =
+            c.dense_bytes + c.expert_bytes + c.rounding_bytes + c.scratch_bytes + c.context_bytes;
+        let limit = at.usable_bytes(spec) - spec.margin_bytes;
+        let kv = |ctx: u64| -> u64 { (0..hp.n_layer).map(|l| inputs.kv.layer_bytes(l, ctx)).sum() };
+        let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fixed + kv(mid) <= limit {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let max = lo;
+        let at_max = inputs.plan(&machine, max, &levers).is_ok();
+        let past = matches!(
+            inputs.plan(&machine, max + 1, &levers),
+            Err(PlaceError::Broken(v)) if v.iter().any(|x| matches!(x, Violation::CardOver { .. }))
+        );
+        check(
+            &mut o,
+            format!(
+                "{} holds ctx {max} ({at_max}; predicted {predicted}) and breaks with CardOver \
+                 at {} ({past})",
+                card.name,
+                max + 1
+            ),
+            at_max && past,
+        );
+    }
+    let machine = place::machine(A6000, hp.n_layer);
+    for ctx in [0, KERNEL_POSITIONS + 1] {
+        let got = inputs.plan(&machine, ctx, &levers);
+        let named = matches!(&got, Err(PlaceError::Positions { ctx_max }) if *ctx_max == ctx);
+        let text = got.err().map_or("planned".to_string(), |e| e.to_string());
+        check(&mut o, format!("ctx {ctx}: {text}"), named);
+    }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} clause(s) failed:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
