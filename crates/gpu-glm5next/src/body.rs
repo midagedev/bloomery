@@ -753,7 +753,7 @@ impl Body {
     }
 
     /// The walk's parts, lent apart from the host tier.
-    fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<GlmHost>) {
+    pub(crate) fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<GlmHost>) {
         (
             Parts {
                 k: &self.k,

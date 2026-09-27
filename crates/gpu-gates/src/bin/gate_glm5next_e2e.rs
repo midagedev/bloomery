@@ -19,10 +19,31 @@
 //! - (p) one chain: the batch set's five tokens as five graph steps and as
 //!   five eager steps (the per-layer taps armed), each from a reset, leave
 //!   the same per-position tokens and logits bit for bit.
-//! - (c) free-running on the batch set: each position's every layer output
-//!   (its four streams) against ik's `l_out-L` within [`FREE_BAND`], the
-//!   first layer past it named; the last position's argmax equal to ik's
-//!   `result_output` argmax.
+//! - (l) layer by layer: the batch set's five positions run through one
+//!   layer at a time (`Body::forced_row`), each layer on our own previous
+//!   layer's streams from the embedding, leave every layer output bit for
+//!   bit the eager chain's tap: the forced arm runs what the chain runs.
+//! - (c) free-running on the batch set, each routed layer's picks read from
+//!   the layered run: a token whose chosen set differs from ik's
+//!   `ffn_moe_topk-L` is a flip, allowed only when every exchanged pair's
+//!   gap in ik's ranked values (`ffn_moe_probs_biased`) lies within our two
+//!   values' error there ([`Flip::allowed`]), named and counted. A flip at
+//!   layer `L'` and position `t'` lies on the path of every layer output from
+//!   `L'` on at `t'` and at every later position (the mixers' stores carry
+//!   it), and no band here derives how far it moves them: each layer output
+//!   off every flip's path against ik's `l_out-L` within [`FREE_BAND`], the
+//!   outputs past a flip printed and counted; the last position's argmax
+//!   equal to ik's `result_output` argmax. ik's margins, every routed layer
+//!   by token, and the worst output off a same-position path are printed.
+//! - (f) teacher-forced, per layer, on the batch set: the mixer sub-layer
+//!   on ik's layer input (`hc_init`, then `l_out-(L−1)`), the feed-forward
+//!   sub-layer on ik's streams after the mixer (`attn_out-L`), from a reset;
+//!   the folds, the mixer's output, the streams' updates, the normed block
+//!   input, the router's logits and ranked values, the weights matched by
+//!   id and the block's output, each tap's error over its input's gap within
+//!   [`RATIO_BAND`]; a flip allowed as in (c), its position's block output
+//!   and layer output left out. Each layer's error on the streams is
+//!   printed: [`FREE_BAND`]'s derivation input.
 //! - (t) each step set: its prefill fed by our own steps from a reset, then
 //!   the step; its argmax equal to ik's, or — named and counted, never
 //!   silently — our argmax ik's runner-up, ik's own margin between the two
@@ -30,9 +51,12 @@
 //!   and our whole logits row within [`FREE_BAND`] of ik's (the head is a
 //!   linear map of the last layer's streams, so it carries their bound). The step's layer
 //!   outputs against ik's `l_out-L` are printed, and held to [`FREE_BAND`]
-//!   on the two 4-token sets only: ik's prefill is its own fused graph, not
-//!   our steps, and after 1,024 positions the two states have drifted by an
-//!   amount no band here derives.
+//!   on the two 4-token sets only, below the first layer a flip lies on the
+//!   path of the batch set's last position as (c) names them (those sets'
+//!   prefill and step are the batch set's tokens, and our steps route them
+//!   as (c)'s): ik's prefill is its own fused graph, not our steps, and
+//!   after 1,024 positions the two states have drifted by an amount no band
+//!   here derives.
 //!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
@@ -63,15 +87,23 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in, verdict,
+        GateError, RefManifest, checks_failed, data_dir, ik_q8_2, ref_tensor_logical_in, split_f32,
+        topk_ids_logical_within, verdict,
     };
+    use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, step_launches};
     use cuda_core::sys;
-    use gguf::Split;
+    use gguf::quant::dequant_row;
+    use gguf::{GgmlType, Split};
+    use model::arch::glm5next::names;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use runtime::layer::{FfnKind, MixerKind};
+
+    /// The router's experts and picks a token.
+    const N_EXPERT: usize = 288;
+    const N_USED: usize = 8;
 
     /// Cache rows: the 1,024-token set's step at position 1,024, with room.
     const CTX: usize = 1088;
@@ -110,12 +142,33 @@ mod gate {
             && N_DENSE + N_ROUTED == N_LAYER
     );
 
+    /// PIN(2026-09-27): the teacher-forced bound on a tap's error ratio — its
+    /// relative error over the relative distance between ik's 8-bit
+    /// activation of the input that reaches it and that input ([`quant_gap`]:
+    /// ik quantizes a q8_0 projection's input to q8_2, 32 values a bf16
+    /// scale; our q8_0 gemvs read it in f32, so the gap is ik's alone; inputs
+    /// in quadrature). Derivation, the qwen35moe gate's for this model: a
+    /// linear map carries its input's relative perturbation unchanged, so the
+    /// folds, the projections, the router's f32 logits and its sigmoid scores
+    /// read about 1 (a sigmoid's slope is at most 1/4 of its value's scale,
+    /// the Sinkhorn mix a normalization, neither amplifies); the KDA output,
+    /// a sum over the call's positions the decay and β (both at most 1) do not
+    /// amplify, at most √5 times a position's, so at most 5; the latent
+    /// attention's softmax over at most 5 positions at most 3; a block's
+    /// output at most 6 (qwen3moe measured 6.1 on a layer with one dominant
+    /// channel). A wiring fault — another layer's input or weight, a position
+    /// or a stream off by one — reads an error of order one over a gap of
+    /// order 1e-2, a ratio above 40.
+    const RATIO_BAND: f64 = 10.0;
+
     /// PIN(2026-09-27): the free-running bound on a layer output's relative
-    /// distance from ik's. Derivation, the qwen3moe and qwen35moe gates':
-    /// the forced arm's per-layer errors, up to about 4e-2 of a layer's
-    /// update, whose norm is of the residual's order, added in quadrature
-    /// over 45 layers, independent: √45 · 4e-2 ≈ 0.27, rounded up.
-    const FREE_BAND: f64 = 0.28;
+    /// distance from ik's, off every flip's path. Derivation, the qwen3moe
+    /// and qwen35moe gates' form with this gate's own forced arm as its
+    /// input: each layer's error on the streams on ik's inputs, the mixer's
+    /// and the block's in quadrature, at most 1.415e-2 (layer 0, whose input
+    /// is the bare embedding), added in quadrature over 45 layers,
+    /// independent: √45 · 1.415e-2 ≈ 0.095, rounded up.
+    const FREE_BAND: f64 = 0.10;
 
     /// The stores' bytes at [`CTX`] rows, derived from the header: each KDA
     /// layer's state, 64 heads of 128 × 128 f32, and conv ring, 11 rows of
@@ -346,35 +399,58 @@ mod gate {
     /// keeps only the output token's rows past the last attention), and the
     /// index into `taps` it was met at.
     fn layer_rels(man: &RefManifest, taps: &[Vec<f32>]) -> Result<Vec<(f64, usize)>, GateError> {
-        let row = STREAMS * HIDDEN;
-        let n = taps.len();
-        let mut worst = vec![(0.0f64, 0usize); N_LAYER];
-        for (l, w) in worst.iter_mut().enumerate() {
-            let ik = tap(man, &format!("l_out-{l}"))?;
-            let kept = ik.len() / row;
-            for (t, ours) in taps.iter().enumerate() {
-                let Some(i) = (t + kept).checked_sub(n) else {
-                    continue;
-                };
-                let got = &ours[l * row..(l + 1) * row];
-                let e = rel(got, &ik[i * row..(i + 1) * row]);
-                if e > w.0 {
-                    *w = (e, t);
-                }
-            }
-        }
-        Ok(worst)
+        Ok(worst_of(&layer_table(man, taps)?))
     }
 
-    /// The worst layer and the first past the band, printed; whether every
-    /// layer is inside it.
-    fn print_layers(what: &str, rels: &[(f64, usize)]) -> bool {
+    /// Each row's worst entry of a [`layer_table`] and the tap it was met at.
+    fn worst_of(table: &[Vec<Option<f64>>]) -> Vec<(f64, usize)> {
+        table
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter_map(|(t, e)| e.map(|e| (e, t)))
+                    .fold((0.0f64, 0usize), |w, x| if x.0 > w.0 { x } else { w })
+            })
+            .collect()
+    }
+
+    /// Each layer's relative distance at every position `taps` holds
+    /// against ik's `l_out-L` (`None` where ik kept no row for it).
+    fn layer_table(
+        man: &RefManifest,
+        taps: &[Vec<f32>],
+    ) -> Result<Vec<Vec<Option<f64>>>, GateError> {
+        let row = STREAMS * HIDDEN;
+        let n = taps.len();
+        (0..N_LAYER)
+            .map(|l| {
+                let ik = tap(man, &format!("l_out-{l}"))?;
+                let kept = ik.len() / row;
+                Ok(taps
+                    .iter()
+                    .enumerate()
+                    .map(|(t, ours)| {
+                        let i = (t + kept).checked_sub(n)?;
+                        Some(rel(
+                            &ours[l * row..(l + 1) * row],
+                            &ik[i * row..(i + 1) * row],
+                        ))
+                    })
+                    .collect())
+            })
+            .collect()
+    }
+
+    /// The worst layer and the first of layers `0..held` past the band,
+    /// printed; whether every one of those is inside it.
+    fn print_layers(what: &str, rels: &[(f64, usize)], held: usize) -> bool {
         for (l, &(e, t)) in rels.iter().enumerate() {
-            if l % 8 == 0 || l == rels.len() - 1 || e > FREE_BAND {
+            if l % 8 == 0 || l == rels.len() - 1 || (l < held && e > FREE_BAND) {
                 println!("{what} layer={l} l_out_rel={e:.3e} at tap {t}");
             }
         }
-        match rels.iter().position(|&(e, _)| e > FREE_BAND) {
+        match rels.iter().take(held).position(|&(e, _)| e > FREE_BAND) {
             Some(l) => {
                 println!("{what}: first layer past the band {FREE_BAND:.2}: {l}");
                 false
@@ -383,9 +459,346 @@ mod gate {
         }
     }
 
-    fn free(man: &RefManifest, eager: &Run) -> Result<bool, GateError> {
-        let rels = layer_rels(man, &eager.taps)?;
-        let inside = print_layers("free", &rels);
+    // ------------------------------------------------ routing and flips
+
+    /// ik's routing of one routed layer over the set's tokens: its ranked
+    /// values (`ffn_moe_probs_biased`, [`N_EXPERT`] a token) and its chosen
+    /// ids ([`N_USED`] a token).
+    struct IkRoute {
+        biased: Vec<f32>,
+        ids: Vec<i32>,
+    }
+
+    impl IkRoute {
+        fn read(man: &RefManifest, l: usize) -> Result<IkRoute, GateError> {
+            let biased = tap(man, &format!("ffn_moe_probs_biased-{l}"))?;
+            let row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
+            let ids = topk_ids_logical_within(man, row, N_EXPERT as u32)?;
+            if biased.len() % N_EXPERT != 0 || ids.len() * N_EXPERT != biased.len() * N_USED {
+                return Err(format!(
+                    "layer {l}: {} ranked values and {} ids",
+                    biased.len(),
+                    ids.len()
+                )
+                .into());
+            }
+            Ok(IkRoute { biased, ids })
+        }
+
+        fn tokens(&self) -> usize {
+            self.ids.len() / N_USED
+        }
+
+        /// Token `t`'s ranked values and ids.
+        fn at(&self, t: usize) -> (&[f32], &[i32]) {
+            (
+                &self.biased[t * N_EXPERT..(t + 1) * N_EXPERT],
+                &self.ids[t * N_USED..(t + 1) * N_USED],
+            )
+        }
+
+        /// ik's own margin at token `t`: its eighth pick's ranked value less
+        /// the best it left.
+        fn margin(&self, t: usize) -> f64 {
+            let (v, ids) = self.at(t);
+            let min_in = ids
+                .iter()
+                .map(|&e| f64::from(v[e as usize]))
+                .fold(f64::INFINITY, f64::min);
+            let max_out = (0..N_EXPERT)
+                .filter(|&e| !ids.contains(&(e as i32)))
+                .map(|e| f64::from(v[e]))
+                .fold(f64::NEG_INFINITY, f64::max);
+            min_in - max_out
+        }
+    }
+
+    /// Our ranked values: the scores plus the selection bias, the f32 add
+    /// the router's pick makes.
+    fn ours_ranked(r: &ForcedRoute) -> Vec<f32> {
+        r.probs.iter().zip(&r.bias).map(|(&p, &b)| p + b).collect()
+    }
+
+    /// A token whose chosen set differs from ik's: every exchanged pair —
+    /// `a` ours only, `b` ik's only — with ik's gap `ik[b] − ik[a]` and our
+    /// two ranked values' error `|ours[a] − ik[a]| + |ours[b] − ik[b]|`.
+    struct Flip {
+        layer: usize,
+        token: usize,
+        margin: f64,
+        pairs: Vec<(u32, u32, f64, f64)>,
+    }
+
+    impl Flip {
+        /// Allowed only when every pair's gap lies within its error: our
+        /// ranking then differs from ik's by no more than our values'
+        /// distance from ik's. Past it the pick itself is wrong (a router
+        /// defect), named.
+        fn allowed(&self) -> bool {
+            !self.pairs.is_empty() && self.pairs.iter().all(|&(_, _, gap, err)| gap <= err)
+        }
+
+        fn line(&self, arm: &str) -> String {
+            let pairs: Vec<String> = self
+                .pairs
+                .iter()
+                .map(|(a, b, gap, err)| format!("{a}<-{b} gap {gap:.3e} err {err:.3e}"))
+                .collect();
+            format!(
+                "{arm} flip layer={} token={}: ik margin {:.3e}; {}: {}",
+                self.layer,
+                self.token,
+                self.margin,
+                pairs.join(", "),
+                if self.allowed() {
+                    "allowed (counted)"
+                } else {
+                    "FAIL: a pair's gap past our error"
+                }
+            )
+        }
+    }
+
+    /// The flip at layer `l`, token `t`, if our chosen set is not ik's.
+    fn flip_at(l: usize, t: usize, ours: &ForcedRoute, ik: &IkRoute) -> Option<Flip> {
+        let (iv, ids) = ik.at(t);
+        let ov = ours_ranked(ours);
+        let only_ours: Vec<u32> = ours
+            .ids
+            .iter()
+            .copied()
+            .filter(|&e| !ids.contains(&(e as i32)))
+            .collect();
+        let only_ik: Vec<u32> = ids
+            .iter()
+            .map(|&e| e as u32)
+            .filter(|e| !ours.ids.contains(e))
+            .collect();
+        if only_ours.is_empty() && only_ik.is_empty() {
+            return None;
+        }
+        let v = |x: &[f32], e: u32| x.get(e as usize).map_or(f64::NAN, |&y| f64::from(y));
+        let mut pairs = Vec::new();
+        for &a in &only_ours {
+            for &b in &only_ik {
+                let gap = v(iv, b) - v(iv, a);
+                let err = (v(&ov, a) - v(iv, a)).abs() + (v(&ov, b) - v(iv, b)).abs();
+                pairs.push((a, b, gap, err));
+            }
+        }
+        Some(Flip {
+            layer: l,
+            token: t,
+            margin: ik.margin(t),
+            pairs,
+        })
+    }
+
+    /// Every routed layer's ik routing, by layer (`None` for a dense one).
+    fn ik_routes(man: &RefManifest) -> Result<Vec<Option<IkRoute>>, GateError> {
+        (0..N_LAYER)
+            .map(|l| {
+                if l < N_DENSE {
+                    Ok(None)
+                } else {
+                    IkRoute::read(man, l).map(Some)
+                }
+            })
+            .collect()
+    }
+
+    /// ik's margins, every routed layer by token: printed, the numbers a
+    /// free table's jumps are read against.
+    fn print_margins(routes: &[Option<IkRoute>]) {
+        for (l, r) in routes.iter().enumerate() {
+            if let Some(r) = r {
+                let cells: Vec<String> = (0..r.tokens())
+                    .map(|t| format!("{:.2e}", r.margin(t)))
+                    .collect();
+                println!("ik margin layer={l} by token {}", cells.join(" "));
+            }
+        }
+    }
+
+    // ---------------------------------------------- (l) layer by layer
+
+    /// Token `t`'s embedding row from the file, dequantized as the body
+    /// reads it, in each of the four streams.
+    fn embedding(file: &Split, t: u32) -> Result<Vec<f32>, GateError> {
+        let name = names::token_embd();
+        let (s, info) = file
+            .find(&name)
+            .ok_or_else(|| format!("{name}: not in the file"))?;
+        if info.ty != GgmlType::Q8_0 {
+            return Err(format!("{name} is {:?}, not q8_0", info.ty).into());
+        }
+        let rb = HIDDEN / 32 * 34;
+        let data = file.shard(s).ok_or("the embedding's shard")?.data(info)?;
+        let src = data
+            .get(t as usize * rb..(t as usize + 1) * rb)
+            .ok_or_else(|| format!("token {t} past the embedding"))?;
+        let mut row = vec![0.0f32; HIDDEN];
+        dequant_row(GgmlType::Q8_0, src, &mut row)?;
+        Ok(row.repeat(STREAMS))
+    }
+
+    /// Layer `l` alone at positions `0..inputs.len()` from a reset, one
+    /// forced row each: input `t` its streams, `ffn[t]` the feed-forward
+    /// sub-layer's when given.
+    fn layer_rows(
+        m: &mut Glm5nextModel,
+        l: usize,
+        inputs: &[&[f32]],
+        ffn: Option<&[&[f32]]>,
+    ) -> Result<Vec<ForcedRow>, GateError> {
+        m.reset()?;
+        let rows = {
+            let (gpu, w, b) = m.body_parts("layer_rows")?;
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(t, x)| b.forced_row(gpu, w, l, t as u32, x, ffn.map(|f| f[t])))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        m.reset()?;
+        Ok(rows)
+    }
+
+    /// The batch tokens through every layer, one layer at a time, each on
+    /// our own previous layer's streams, from the embedding.
+    fn layered(m: &mut Glm5nextModel, toks: &[u32]) -> Result<Vec<Vec<ForcedRow>>, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let mut x: Vec<Vec<f32>> = toks
+            .iter()
+            .map(|&t| embedding(&file, t))
+            .collect::<Result<_, _>>()?;
+        let mut all = Vec::with_capacity(N_LAYER);
+        for l in 0..N_LAYER {
+            let inputs: Vec<&[f32]> = x.iter().map(Vec::as_slice).collect();
+            let rows = layer_rows(m, l, &inputs, None)?;
+            x = rows.iter().map(|r| r.out.clone()).collect();
+            all.push(rows);
+        }
+        Ok(all)
+    }
+
+    /// Every layer output of the layered run against the eager chain's tap,
+    /// bit for bit.
+    fn layered_is_chain(layered: &[Vec<ForcedRow>], eager: &Run) -> bool {
+        let row = STREAMS * HIDDEN;
+        let differ: Vec<(usize, usize)> = layered
+            .iter()
+            .enumerate()
+            .flat_map(|(l, rows)| rows.iter().enumerate().map(move |(t, r)| (l, t, r)))
+            .filter(|&(l, t, r)| {
+                eager
+                    .taps
+                    .get(t)
+                    .and_then(|tap| tap.get(l * row..(l + 1) * row))
+                    .is_none_or(|want| !same_bits(&r.out, want))
+            })
+            .map(|(l, t, _)| (l, t))
+            .collect();
+        let ok = layered.len() == N_LAYER
+            && layered.iter().all(|r| r.len() == eager.taps.len())
+            && differ.is_empty();
+        println!(
+            "layered: {} layers x {} positions one layer at a time on our own streams against the \
+             eager chain's taps, bit for bit; (layer, position) differing: {} {:?} {}",
+            layered.len(),
+            eager.taps.len(),
+            differ.len(),
+            &differ[..differ.len().min(8)],
+            verdict(ok)
+        );
+        ok
+    }
+
+    // --------------------------------------------------- (c) free
+
+    /// Whether a flip at `(l', t')` lies on the path of layer `l`'s output
+    /// at position `t`: every layer from `l'` on reads it at `t'`, and every
+    /// later position through the mixers' stores.
+    fn on_path(flips: &[Flip], l: usize, t: usize, same_position: bool) -> bool {
+        flips.iter().any(|f| {
+            f.layer <= l
+                && if same_position {
+                    f.token == t
+                } else {
+                    f.token <= t
+                }
+        })
+    }
+
+    /// The free clause's verdict, and by position the first layer a flip
+    /// lies on the path of ([`N_LAYER`] where none does).
+    fn free(
+        man: &RefManifest,
+        eager: &Run,
+        layered: &[Vec<ForcedRow>],
+        routes: &[Option<IkRoute>],
+    ) -> Result<(bool, Vec<usize>), GateError> {
+        let table = layer_table(man, &eager.taps)?;
+        for (l, row) in table.iter().enumerate() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|e| e.map_or("-".to_string(), |e| format!("{e:.3e}")))
+                .collect();
+            println!("free table layer={l} l_out_rel by tap {}", cells.join(" "));
+        }
+        print_margins(routes);
+        let mut flips = Vec::new();
+        for (l, (rows, ik)) in layered.iter().zip(routes).enumerate() {
+            let Some(ik) = ik else { continue };
+            for (t, r) in rows.iter().enumerate() {
+                let route = r
+                    .route
+                    .as_ref()
+                    .ok_or_else(|| format!("layer {l}: a routed layer with no route"))?;
+                flips.extend(flip_at(l, t, route, ik));
+            }
+        }
+        for f in &flips {
+            println!("{}", f.line("free"));
+        }
+        let flips_ok = flips.iter().all(Flip::allowed);
+        let worst_held = |same: bool| -> (f64, usize, usize, usize) {
+            let mut w = (0.0f64, 0usize, 0usize, 0usize);
+            for (l, row) in table.iter().enumerate() {
+                for (t, e) in row.iter().enumerate() {
+                    let Some(e) = *e else { continue };
+                    if on_path(&flips, l, t, same) {
+                        w.3 += 1;
+                    } else if e > w.0 {
+                        (w.0, w.1, w.2) = (e, l, t);
+                    }
+                }
+            }
+            w
+        };
+        let (held, hl, ht, exempt) = worst_held(false);
+        let (same, sl, st, same_exempt) = worst_held(true);
+        let firsts: Vec<usize> = (0..eager.taps.len())
+            .map(|t| {
+                (0..N_LAYER)
+                    .find(|&l| on_path(&flips, l, t, false))
+                    .unwrap_or(N_LAYER)
+            })
+            .collect();
+        println!(
+            "free: the band holds before the first flip on a position's path (any flip at an \
+             earlier or equal layer and position); first such layer by position {}; {exempt} \
+             (layer, position) outputs past a flip, printed and counted",
+            firsts
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!(
+            "free (same-position path, printed): worst l_out_rel={same:.3e} at layer {sl} \
+             position {st}; {same_exempt} outputs past a flip at their own position"
+        );
         let ik = tap(man, "result_output")?;
         let ik_last = &ik[ik
             .len()
@@ -393,27 +806,283 @@ mod gate {
             .ok_or("result_output holds no row")?..];
         let ours = eager.logits.last().ok_or("no logits")?;
         let (top, ik_top) = (argmax(ours), argmax(ik_last));
-        let ok = inside && top == ik_top;
+        let ok = held <= FREE_BAND && flips_ok && top == ik_top;
         println!(
-            "free: {} tokens, worst l_out_rel={:.3e} (band {FREE_BAND:.2}); last position argmax \
+            "free: {} tokens, {} flips ({} allowed), worst l_out_rel off every flip's path \
+             {held:.3e} at layer {hl} position {ht} (band {FREE_BAND:.2}); last position argmax \
              ours={top} ik={ik_top} logits_rel={:.3e} (printed) {}",
             eager.tokens.len(),
-            rels.iter().map(|r| r.0).fold(0.0, f64::max),
+            flips.len(),
+            flips.iter().filter(|f| f.allowed()).count(),
             rel(ours, ik_last),
             verdict(ok)
         );
-        Ok(ok)
+        Ok((ok, firsts))
+    }
+
+    // ------------------------------------------------ (f) teacher-forced
+
+    /// `‖x̂_ik − x‖ / ‖x‖`: how far ik's 8-bit activation of `x` (q8_2,
+    /// blocks of 32, a bf16 scale) sits from the f32 `x` our kernels read.
+    fn quant_gap(x: &[f32]) -> f64 {
+        let whole = x.len() / ik_q8_2::QK * ik_q8_2::QK;
+        rel(&ik_q8_2::reconstruct(&x[..whole]), &x[..whole])
+    }
+
+    /// The RMS-normed rows of `x` times `gain`, in f64 then rounded: the
+    /// input a mixer's projections read, near enough for its gap.
+    fn normed(x: &[f32], gain: &[f32]) -> Vec<f32> {
+        x.chunks(HIDDEN)
+            .flat_map(|r| {
+                let ms = r.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / HIDDEN as f64;
+                let s = 1.0 / (ms + 1e-6).sqrt();
+                r.iter()
+                    .zip(gain)
+                    .map(move |(&v, &g)| (f64::from(v) * s * f64::from(g)) as f32)
+            })
+            .collect()
+    }
+
+    /// Worst ratio and its tap, over a layer's taps.
+    #[derive(Default)]
+    struct Worst {
+        ratio: f64,
+        tap: String,
+        lines: Vec<String>,
+    }
+
+    impl Worst {
+        fn add(&mut self, tap: &str, e: f64, gap: f64) {
+            let r = e / gap.max(f64::MIN_POSITIVE);
+            let r = if r.is_nan() { f64::INFINITY } else { r };
+            self.lines
+                .push(format!("{tap} rel={e:.3e} gap={gap:.3e} ratio={r:.2}"));
+            if self.tap.is_empty() || r > self.ratio {
+                self.ratio = r;
+                self.tap = tap.to_string();
+            }
+        }
+    }
+
+    /// `rows` of `k` values of `v`, concatenated.
+    fn pick(v: &[f32], k: usize, rows: &[usize]) -> Vec<f32> {
+        rows.iter()
+            .flat_map(|&t| v[t * k..(t + 1) * k].to_vec())
+            .collect()
+    }
+
+    /// `a − b`, value by value.
+    fn minus(a: &[f32], b: &[f32]) -> Vec<f32> {
+        a.iter().zip(b).map(|(&x, &y)| x - y).collect()
+    }
+
+    /// One field of every row, concatenated.
+    fn cat(rows: &[ForcedRow], f: impl Fn(&ForcedRow) -> &[f32]) -> Vec<f32> {
+        rows.iter().flat_map(|r| f(r).to_vec()).collect()
+    }
+
+    /// Every layer alone on ik's own inputs at the batch set's positions:
+    /// the mixer sub-layer on ik's layer input (`hc_init`, then `l_out-(L−1)`),
+    /// the feed-forward sub-layer on ik's streams after the mixer
+    /// (`attn_out-L`); each tap's error over its input's gap within
+    /// [`RATIO_BAND`], every flip allowed ([`Flip::allowed`]). Returns the
+    /// verdict and each layer's error on the streams (the mixer's and the
+    /// block's in quadrature), the input [`FREE_BAND`] is derived from.
+    fn forced(
+        m: &mut Glm5nextModel,
+        man: &RefManifest,
+        routes: &[Option<IkRoute>],
+    ) -> Result<(bool, Vec<f64>), GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let kinds = m.body("forced")?.kinds();
+        let row = STREAMS * HIDDEN;
+        let (mut ok, mut worst, mut flips_all) = (true, 0.0f64, 0usize);
+        let mut errs = Vec::with_capacity(N_LAYER);
+        for (l, kind) in kinds.iter().enumerate() {
+            let x = if l == 0 {
+                tap(man, "hc_init")?
+            } else {
+                tap(man, &format!("l_out-{}", l - 1))?
+            };
+            let f = tap(man, &format!("attn_out-{l}"))?;
+            let out = tap(man, &format!("l_out-{l}"))?;
+            let t_n = x.len() / row;
+            if t_n == 0 || x.len() != t_n * row || f.len() != x.len() || out.len() != x.len() {
+                return Err(format!(
+                    "layer {l}: streams of {}, {} and {} values",
+                    x.len(),
+                    f.len(),
+                    out.len()
+                )
+                .into());
+            }
+            let xs: Vec<&[f32]> = x.chunks(row).collect();
+            let fs: Vec<&[f32]> = f.chunks(row).collect();
+            let rows = layer_rows(m, l, &xs, Some(&fs))?;
+            let mut w = Worst::default();
+            // The mixer sub-layer.
+            let gap_hca = quant_gap(&tap_at(man, &format!("hc_pre-{l}"), 0)?);
+            let fold_a = tap(man, &format!("hc_attn_pre-{l}"))?;
+            let gain = split_f32(&file, &names::attn_norm(l), HIDDEN)?;
+            let gap_a = quant_gap(&normed(&fold_a, &gain));
+            let (y_name, out_name) = match kind.mixer {
+                MixerKind::DeltaRule => ("final_output", "linear_attn_out"),
+                MixerKind::Latent => ("kqv_2d", "kqv_out"),
+                MixerKind::Gqa => return Err(format!("layer {l}: a GQA mixer").into()),
+            };
+            let gap_y = quant_gap(&tap(man, &format!("{y_name}-{l}"))?);
+            let gap_mix = gap_hca.hypot(gap_a).hypot(gap_y);
+            w.add(
+                "hc_attn_pre (fold)",
+                rel(&cat(&rows, |r| &r.mix_in), &fold_a),
+                gap_hca,
+            );
+            w.add(
+                &format!("{out_name} (mixer out)"),
+                rel(
+                    &cat(&rows, |r| &r.mix_out),
+                    &tap(man, &format!("{out_name}-{l}"))?,
+                ),
+                gap_mix,
+            );
+            let mixed = cat(&rows, |r| &r.mixed);
+            w.add(
+                "attn_out (update)",
+                rel(&minus(&mixed, &x), &minus(&f, &x)),
+                gap_mix,
+            );
+            let e_mix = rel(&mixed, &f);
+            // The feed-forward sub-layer on ik's streams.
+            let gap_hcf = quant_gap(&tap_at(man, &format!("hc_pre-{l}"), 1)?);
+            let ik_normed = tap(man, &format!("ffn_norm-{l}"))?;
+            let gap_ffn = gap_hcf.hypot(quant_gap(&ik_normed));
+            w.add(
+                "hc_ffn_pre (fold)",
+                rel(
+                    &cat(&rows, |r| &r.ffn_in),
+                    &tap(man, &format!("hc_ffn_pre-{l}"))?,
+                ),
+                gap_hcf,
+            );
+            w.add(
+                "ffn_norm",
+                rel(&cat(&rows, |r| &r.ffn_normed), &ik_normed),
+                gap_hcf,
+            );
+            let mut kept: Vec<usize> = (0..t_n).collect();
+            let mut flips_ok = true;
+            if let Some(ik) = &routes[l] {
+                let rs: Vec<&ForcedRoute> = rows
+                    .iter()
+                    .map(|r| r.route.as_ref().ok_or("a routed layer with no route"))
+                    .collect::<Result<_, _>>()?;
+                if ik.tokens() != t_n {
+                    return Err(format!("layer {l}: ik routes {} tokens", ik.tokens()).into());
+                }
+                let logits: Vec<f32> = rs.iter().flat_map(|r| r.logits.clone()).collect();
+                w.add(
+                    "ffn_moe_logits",
+                    rel(&logits, &tap(man, &format!("ffn_moe_logits-{l}"))?),
+                    gap_hcf,
+                );
+                let ranked: Vec<f32> = rs.iter().flat_map(|r| ours_ranked(r)).collect();
+                w.add("ffn_moe_probs_biased", rel(&ranked, &ik.biased), gap_hcf);
+                let ik_w = tap(man, &format!("ffn_moe_weights_scaled-{l}"))?;
+                let (mut w_ours, mut w_ik) = (Vec::new(), Vec::new());
+                for (t, r) in rs.iter().enumerate() {
+                    if let Some(fl) = flip_at(l, t, r, ik) {
+                        println!("{}", fl.line("forced"));
+                        flips_ok &= fl.allowed();
+                        flips_all += 1;
+                        kept.retain(|&k| k != t);
+                        continue;
+                    }
+                    let (_, ids) = ik.at(t);
+                    for (s, &e) in r.ids.iter().enumerate() {
+                        let j = ids
+                            .iter()
+                            .position(|&x| x == e as i32)
+                            .ok_or("an id the set test found")?;
+                        w_ours.push(r.weights[s]);
+                        w_ik.push(ik_w[t * N_USED + j]);
+                    }
+                }
+                if !w_ik.is_empty() {
+                    w.add("ffn_moe_weights_scaled", rel(&w_ours, &w_ik), gap_hcf);
+                }
+            }
+            let e_ffn = if kept.is_empty() {
+                0.0
+            } else {
+                let ours_out = cat(&rows, |r| &r.ffn_out);
+                w.add(
+                    "ffn_out",
+                    rel(
+                        &pick(&ours_out, HIDDEN, &kept),
+                        &pick(&tap(man, &format!("ffn_out-{l}"))?, HIDDEN, &kept),
+                    ),
+                    gap_ffn,
+                );
+                let got = pick(&cat(&rows, |r| &r.out), row, &kept);
+                let (want, base) = (pick(&out, row, &kept), pick(&f, row, &kept));
+                w.add(
+                    "l_out (update)",
+                    rel(&minus(&got, &base), &minus(&want, &base)),
+                    gap_ffn,
+                );
+                rel(&got, &want)
+            };
+            let e = e_mix.hypot(e_ffn);
+            errs.push(e);
+            let pass = flips_ok && w.ratio <= RATIO_BAND;
+            println!(
+                "forced layer={l} {:?}/{:?}: worst ratio {:.2} at {} (band {RATIO_BAND}); \
+                 stream error {e:.3e} (mixer {e_mix:.3e}, block {e_ffn:.3e}); {} of {t_n} \
+                 positions past a flip {}",
+                kind.mixer,
+                kind.ffn,
+                w.ratio,
+                w.tap,
+                t_n - kept.len(),
+                verdict(pass)
+            );
+            if !pass || l % 8 == 0 || l == N_LAYER - 1 {
+                for line in &w.lines {
+                    println!("  forced layer={l} {line}");
+                }
+            }
+            worst = worst.max(w.ratio);
+            ok &= pass;
+        }
+        let e_max = errs.iter().copied().fold(0.0, f64::max);
+        let quad = errs.iter().map(|e| e * e).sum::<f64>().sqrt();
+        println!(
+            "forced: {N_LAYER} layers on ik's inputs; worst ratio {worst:.2} (band {RATIO_BAND}); \
+             {flips_all} flips; worst stream error a layer {e_max:.3e}, sqrt(45)·it {:.3e}, the \
+             errors in quadrature {quad:.3e} (FREE_BAND's derivation input) {}",
+            (N_LAYER as f64).sqrt() * e_max,
+            verdict(ok)
+        );
+        Ok((ok, errs))
+    }
+
+    /// A set's tap `name`, occurrence `occ`, in its logical order.
+    fn tap_at(man: &RefManifest, name: &str, occ: u32) -> Result<Vec<f32>, GateError> {
+        Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, occ)?)?)
     }
 
     // --------------------------------------------------- (t) step sets
 
     /// The step of set `name` after its prefill fed by our steps; its
-    /// argmax against ik's, a tie named and counted; its layer outputs
-    /// held to the band when `banded`.
+    /// argmax against ik's, a tie named and counted; with `band` — the batch
+    /// set's tokens and the first layer a flip lies on the path of its last
+    /// position — its layer outputs below that layer held to the band. The
+    /// set's prefill and step must then be those tokens, which our steps
+    /// route as the batch set's free arm did.
     fn step_set(
         m: &mut Glm5nextModel,
         name: &str,
-        banded: bool,
+        band: Option<(&[u32], usize)>,
         ties: &mut usize,
     ) -> Result<bool, GateError> {
         let man = RefManifest::open(&data_dir().join(name), &IK)?;
@@ -421,6 +1090,18 @@ mod gate {
         let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
         let [tok] = step[..] else {
             return Err(format!("{name}: a step of {} tokens, not one", step.len()).into());
+        };
+        let held = match band {
+            Some((toks, first)) => {
+                if toks.split_last() != Some((&tok, &prefill[..])) {
+                    return Err(format!(
+                        "{name}: prefill {prefill:?} and step {tok} are not the batch set's {toks:?}"
+                    )
+                    .into());
+                }
+                first
+            }
+            None => 0,
         };
         m.reset()?;
         let t = Instant::now();
@@ -444,17 +1125,17 @@ mod gate {
         let tie = top != ik_top && top == ik_2 && margin <= 2.0 * dist && logits_rel <= FREE_BAND;
         *ties += usize::from(tie);
         let rels = layer_rels(&man, std::slice::from_ref(&r.0))?;
-        let inside = print_layers(name, &rels);
-        let ok = (top == ik_top || tie) && (inside || !banded);
+        let inside = print_layers(name, &rels, held);
+        let ok = (top == ik_top || tie) && inside;
         println!(
             "step {name}: position {pos} after {} fed ({:.1} s, runtime value); argmax ours={top} \
              ik={ik_top} (ik's runner-up {ik_2}, margin {margin:.4}, our distance at the two \
-             {dist:.4}, logits_rel {logits_rel:.3e}{}); worst l_out_rel={:.3e} ({}) {}",
+             {dist:.4}, logits_rel {logits_rel:.3e}{}); worst l_out_rel={:.3e} (band on layers \
+             0..{held}, off every flip's path; the rest printed) {}",
             prefill.len(),
             t.elapsed().as_secs_f64(),
             if tie { ", a named tie" } else { "" },
             rels.iter().map(|r| r.0).fold(0.0, f64::max),
-            if banded { "band" } else { "printed" },
             verdict(ok)
         );
         Ok(ok)
@@ -490,10 +1171,19 @@ mod gate {
         let graph = run_steps(m, &toks, StepMode::Graph)?;
         let eager = run_steps(m, &toks, StepMode::Eager)?;
         ok &= one_chain(&graph, &eager);
-        ok &= free(&man, &eager)?;
+        let routes = ik_routes(&man)?;
+        let layered = layered(m, &toks)?;
+        ok &= layered_is_chain(&layered, &eager);
+        let (free_ok, firsts) = free(&man, &eager, &layered, &routes)?;
+        ok &= free_ok;
+        drop(layered);
+        let last = *firsts.last().ok_or("no positions")?;
+        let (forced_ok, _) = forced(m, &man, &routes)?;
+        ok &= forced_ok;
         let mut ties = 0usize;
-        for (name, banded) in [(STEP4, true), (STEP4_EVERY_NODE, true), (D1K, false)] {
-            ok &= step_set(m, name, banded, &mut ties)?;
+        let band = Some((&toks[..], last));
+        for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band), (D1K, None)] {
+            ok &= step_set(m, name, band, &mut ties)?;
         }
         println!("step sets: {ties} named tie(s)");
         if ok { Ok(()) } else { Err(checks_failed()) }

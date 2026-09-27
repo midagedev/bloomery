@@ -11,12 +11,14 @@
 //! - `program`: the step's walk and its host leg's port;
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block and the routed
 //!   block around its host leg;
-//! - `host`: the host tier's routed stacks.
+//! - `host`: the host tier's routed stacks;
+//! - [`forced`]: one layer alone on given streams, for the gates.
 //!
 //! Built with `cargo oxide`, as the device crates it links are.
 
 pub mod body;
 mod ffn;
+pub mod forced;
 mod host;
 mod kda;
 mod mla;
