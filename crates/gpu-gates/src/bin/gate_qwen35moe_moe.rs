@@ -74,7 +74,30 @@
 //!   twice the token's largest logit difference plus [`BAND`] of
 //!   `ffn_moe_weights_norm-L`; the sigmoid's distance to
 //!   `shared_expert_gate_sigmoid-L` printed.
-//! - `shape`: the four entries compile with no local depot.
+//! - `wide512`: the second instance (512 experts, the top 10, the shared
+//!   gate as row 512 and slot 10), synthetic: its widths against the gate's
+//!   own 512 and 10; a router weight of 0, ±1/8 and activations of 0, ±1 at
+//!   K = 2560, so every logit is exact in any sum order. The fused launch at
+//!   m = 1, 5, 8, the routing alone over 70 tokens (rerun bit-identical) and
+//!   the ubatch pair over 70 (three token blocks, all 17 row blocks) against
+//!   the host: logits BIT-EQUAL to the host dot, the eleven ids EXACT to the
+//!   host rule and to the selection over the kernel's own probabilities, the
+//!   ten routed ids distinct and below 512, the ten weights BIT-EQUAL to the
+//!   weight stage over the kernel's probabilities, the probabilities and the
+//!   gate weight within [`BAND`]; the ubatch pair BIT-EQUAL to the fused
+//!   launch per token; the fused ticket count zero. Constructed ties (all
+//!   equal — bit-identical to the host outright; a tenth place shared across
+//!   two lanes; a first place shared inside one lane; a first place shared
+//!   in the upper half). Refusals at layer 5: the routing alone on a NaN,
+//!   a +inf and a −inf expert logit in the upper half and a NaN gate logit,
+//!   the fused launch with a NaN in row 400, the ubatch pair with a NaN in
+//!   row 512 — every token refused, eleven NaN weights, ids kept. Then the
+//!   sum orders on inputs that round (LCG weights and activations, K =
+//!   2560: the one-column walk's 32-chunk trip with an 8-chunk tail): the
+//!   fused launch at m = 1, 5, 8 against `f32_gemv` over 513 rows then the
+//!   routing alone, and the ubatch pair over 70 against the fused launch
+//!   per token, all BIT-EQUAL.
+//! - `shape`: the seven entries compile with no local depot.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -94,7 +117,8 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::router::gated::{
-        N_EXPERT, N_SLOTS, N_USED, ROWS, RouterKernels, RouterOut, SHARED,
+        N_EXPERT, N_EXPERT_512, N_SLOTS, N_SLOTS_512, N_USED, N_USED_512, ROWS, ROWS_512,
+        RouterKernels, RouterOut, RouterOut512, SHARED, SHARED_512,
     };
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::gemm::{GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight};
@@ -161,6 +185,21 @@ mod gate {
 
     /// The logits case's ubatch: three 32-token blocks.
     const LOGITS_UB: usize = 70;
+
+    /// The wide instance's experts and routed slots, Qwen3.8's
+    /// `expert_count` and `expert_used_count`: the gate's own values, apart
+    /// from the kernel constants, so a change to those is a red line rather
+    /// than a rewrite of both sides.
+    const WIDE_EXPERT: usize = 512;
+    const WIDE_USED: usize = 10;
+    /// The wide instance's slots per token (the shared expert last) and
+    /// logits per token (its gate row last).
+    const WIDE_SLOTS: usize = WIDE_USED + 1;
+    const WIDE_ROWS: usize = WIDE_EXPERT + 1;
+    /// The wide case's router width, Qwen3.8's hidden width.
+    const WIDE_K: usize = 2560;
+    /// The wide case's tokens: three 32-token blocks of the ubatch pair.
+    const WIDE_UB: usize = 70;
 
     // ------------------------------------------------------------ context
 
@@ -393,8 +432,22 @@ mod gate {
     /// The host rule for one token's `ROWS` logits: probabilities, the nine
     /// ids and the nine weights.
     fn host_route(logits: &[f32]) -> Result<Routed, GateError> {
-        let (probs, ids, w) = route_ref_within(&logits[..N_EXPERT], 1, N_EXPERT, N_USED, 1.0)?;
-        let g = logits[SHARED];
+        host_route_at(logits, N_EXPERT, N_USED)
+    }
+
+    /// The gated host rule at `n_expert` experts and `n_used` routed slots,
+    /// for one token's `n_expert + 1` logits (the last the shared gate's):
+    /// the probabilities, then `n_used + 1` ids and weights — the top
+    /// `n_used` renormalized in f64, slot `n_used` `(n_expert,
+    /// sigmoid(gate))`.
+    fn host_route_at(logits: &[f32], n_expert: usize, n_used: usize) -> Result<Routed, GateError> {
+        if logits.len() != n_expert + 1 {
+            return Err(
+                format!("host_route: {} logits, want {}", logits.len(), n_expert + 1).into(),
+            );
+        }
+        let (probs, ids, w) = route_ref_within(&logits[..n_expert], 1, n_expert, n_used, 1.0)?;
+        let g = logits[n_expert];
         if !g.is_finite() {
             return Err(format!("host_route: gate logit {g}").into());
         }
@@ -402,13 +455,28 @@ mod gate {
         let mut weights: Vec<f32> = w.iter().map(|&v| v / sum).collect();
         weights.push(sigmoid(g));
         let mut ids: Vec<u32> = ids.into_iter().map(|i| i as u32).collect();
-        ids.push(SHARED as u32);
+        ids.push(n_expert as u32);
         Ok(Routed {
             logits: logits.to_vec(),
             probs,
             ids,
             weights,
         })
+    }
+
+    /// The kernels' selection and weight stage over one token's
+    /// probabilities `p`, op for op: the top `n_used` by descending
+    /// probability, ties toward the smaller id; their sum in f64 in slot
+    /// order, rounded once to f32; each weight the f32 divide by it.
+    fn host_select(p: &[f32], n_used: usize) -> (Vec<u32>, Vec<f32>) {
+        let mut ranked: Vec<u32> = (0..p.len() as u32).collect();
+        ranked.sort_by(|&a, &b| p[b as usize].total_cmp(&p[a as usize]).then(a.cmp(&b)));
+        ranked.truncate(n_used);
+        let sum = ranked
+            .iter()
+            .fold(0.0f64, |a, &e| a + f64::from(p[e as usize])) as f32;
+        let w = ranked.iter().map(|&e| p[e as usize] / sum).collect();
+        (ranked, w)
     }
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
@@ -536,6 +604,593 @@ mod gate {
             ok &= pass;
         }
         Ok(ok)
+    }
+
+    // ------------------------------------------------------------ wide512
+
+    /// One step of a 64-bit LCG: its high 31 bits.
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u32
+    }
+
+    /// The wide case's joined router weight, [`WIDE_ROWS`] rows of
+    /// [`WIDE_K`]: each value 1/8, −1/8 or 0 (half of them). With
+    /// [`wide_cols`]' values every product is 0 or ±1/8 and every partial
+    /// sum of a row a multiple of 1/8 at most `WIDE_K / 8` in size — at most
+    /// `WIDE_K` < 2^24 eighths — so each logit is exact in f32 in any sum
+    /// order, fused multiply-adds included: the kernels' logits equal the
+    /// host's integer dot bit for bit, and two distinct logits differ by at
+    /// least 1/8, far past the ulps where `exp` on the card and on the host
+    /// part.
+    fn wide_weight() -> Vec<f32> {
+        let mut s = 0x5eed_0512_u64;
+        (0..WIDE_ROWS * WIDE_K)
+            .map(|_| match lcg(&mut s) % 4 {
+                0 => 0.125,
+                1 => -0.125,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    /// `m` synthetic activation columns of [`WIDE_K`]: each value 1, −1 or 0.
+    fn wide_cols(m: usize) -> Vec<f32> {
+        let mut s = 0xc01_0512_u64;
+        (0..m * WIDE_K)
+            .map(|_| match lcg(&mut s) % 3 {
+                0 => 1.0,
+                1 => -1.0,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    /// Token `t`'s [`WIDE_ROWS`] logits on the host: each row's dot with
+    /// column `t`, exact (the sum of ±1 counts, over 8).
+    fn wide_logits(w: &[f32], x: &[f32], t: usize) -> Vec<f32> {
+        let col = &x[t * WIDE_K..(t + 1) * WIDE_K];
+        (0..WIDE_ROWS)
+            .map(|r| {
+                let row = &w[r * WIDE_K..(r + 1) * WIDE_K];
+                let eighths: i64 = row
+                    .iter()
+                    .zip(col)
+                    .map(|(&a, &b)| (a * 8.0) as i64 * b as i64)
+                    .sum();
+                eighths as f32 / 8.0
+            })
+            .collect()
+    }
+
+    /// A wide run's buffers, read whole.
+    fn read_wide(stream: &CudaStream, out: &RouterOut512) -> Result<Routed, GateError> {
+        Ok(Routed {
+            logits: out.logits.to_host_vec(stream)?,
+            probs: out.probs.to_host_vec(stream)?,
+            ids: out.ids.to_host_vec(stream)?,
+            weights: out.weights.to_host_vec(stream)?,
+        })
+    }
+
+    /// Whether a wide run's buffers hold `tokens` tokens at the gate's own
+    /// widths ([`WIDE_ROWS`], [`WIDE_EXPERT`], [`WIDE_SLOTS`] a token):
+    /// every token view below indexes by those.
+    fn wide_sized(r: &Routed, tokens: usize) -> bool {
+        r.logits.len() >= tokens * WIDE_ROWS
+            && r.probs.len() >= tokens * WIDE_EXPERT
+            && r.ids.len() >= tokens * WIDE_SLOTS
+            && r.weights.len() >= tokens * WIDE_SLOTS
+    }
+
+    /// Token `t` of a wide run as one token's [`Routed`].
+    fn wide_token(r: &Routed, t: usize) -> Routed {
+        Routed {
+            logits: r.logits[t * WIDE_ROWS..(t + 1) * WIDE_ROWS].to_vec(),
+            probs: r.probs[t * WIDE_EXPERT..(t + 1) * WIDE_EXPERT].to_vec(),
+            ids: r.ids[t * WIDE_SLOTS..(t + 1) * WIDE_SLOTS].to_vec(),
+            weights: r.weights[t * WIDE_SLOTS..(t + 1) * WIDE_SLOTS].to_vec(),
+        }
+    }
+
+    /// One wide token against the host rule, its fields the clause's terms.
+    #[derive(Default)]
+    struct WideCheck {
+        tokens: usize,
+        logits_bits: bool,
+        ids: bool,
+        distinct: bool,
+        weights_bits: bool,
+        probs_err: f32,
+        gate_err: f32,
+    }
+
+    impl WideCheck {
+        fn new() -> WideCheck {
+            WideCheck {
+                logits_bits: true,
+                ids: true,
+                distinct: true,
+                weights_bits: true,
+                ..WideCheck::default()
+            }
+        }
+
+        /// Add token `got` (one token's [`Routed`]) against `want`, its
+        /// [`WIDE_ROWS`] logits: the logits bit for bit; the ids EXACT to the
+        /// host rule over the host's probabilities and to the selection over
+        /// the kernel's own; the ten routed ids distinct and below
+        /// [`WIDE_EXPERT`]; the ten weights bit for bit the weight stage over
+        /// the kernel's probabilities; the probabilities within [`BAND`] of
+        /// the host's, the gate weight within [`BAND`] of the host sigmoid.
+        fn add(&mut self, got: &Routed, want: &[f32]) -> Result<bool, GateError> {
+            let h = host_route_at(want, WIDE_EXPERT, WIDE_USED)?;
+            let (sel_ids, sel_w) = host_select(&got.probs, WIDE_USED);
+            let routed = &got.ids[..WIDE_USED];
+            let lb = bits_equal(&got.logits, want);
+            let ids = got.ids == h.ids && routed == &sel_ids[..];
+            let mut seen = routed.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            let distinct =
+                seen.len() == WIDE_USED && routed.iter().all(|&e| (e as usize) < WIDE_EXPERT);
+            let wb = bits_equal(&got.weights[..WIDE_USED], &sel_w);
+            let pe = max_abs(&got.probs, &h.probs);
+            let ge = (got.weights[WIDE_USED] - h.weights[WIDE_USED]).abs();
+            self.tokens += 1;
+            self.logits_bits &= lb;
+            self.ids &= ids;
+            self.distinct &= distinct;
+            self.weights_bits &= wb;
+            self.probs_err = self.probs_err.max(pe);
+            self.gate_err = self.gate_err.max(ge);
+            Ok(lb && ids && distinct && wb && pe <= BAND && ge <= BAND)
+        }
+
+        fn pass(&self) -> bool {
+            self.logits_bits
+                && self.ids
+                && self.distinct
+                && self.weights_bits
+                && self.probs_err <= BAND
+                && self.gate_err <= BAND
+        }
+
+        fn line(&self, what: &str) -> bool {
+            let pass = self.pass();
+            println!(
+                "wide512 {what}: {} tokens logits_bits={} ids_exact={} distinct_below_512={} \
+                 weights_bits={} probs_err={:.3e} gate_err={:.3e} (band {BAND:.0e}) {}",
+                self.tokens,
+                self.logits_bits,
+                self.ids,
+                self.distinct,
+                self.weights_bits,
+                self.probs_err,
+                self.gate_err,
+                verdict(pass)
+            );
+            pass
+        }
+    }
+
+    /// Whether token `t` of a wide run is refused: NaN probabilities and
+    /// eleven NaN weights, and the ids `kept` held for it.
+    fn wide_refused(got: &Routed, t: usize, kept: &Routed) -> bool {
+        let (e, s) = (
+            t * WIDE_EXPERT..(t + 1) * WIDE_EXPERT,
+            t * WIDE_SLOTS..(t + 1) * WIDE_SLOTS,
+        );
+        got.probs[e].iter().all(|v| v.is_nan())
+            && got.weights[s.clone()].iter().all(|v| v.is_nan())
+            && got.ids[s.clone()] == kept.ids[s]
+    }
+
+    /// The routing alone of `n` wide tokens' logits (`n ·` [`WIDE_ROWS`]).
+    fn wide_route(
+        c: &Ctx,
+        logits: &[f32],
+        n: usize,
+        sink: FaultSink,
+        out: &mut RouterOut512,
+    ) -> Result<Routed, GateError> {
+        let stream = c.stream();
+        let x = DeviceBuffer::from_host(stream, logits)?;
+        out.logits.copy_from_device_async(&x, stream)?;
+        c.router.enqueue_route_512(stream, n, sink, out)?;
+        stream.synchronize()?;
+        read_wide(stream, out)
+    }
+
+    fn wide_case(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.stream();
+        let sink = c.gpu.unlabelled_sink();
+
+        // The instance against the gate's own widths.
+        let consts = (N_EXPERT_512, N_USED_512, N_SLOTS_512, ROWS_512, SHARED_512);
+        let want = (WIDE_EXPERT, WIDE_USED, WIDE_SLOTS, WIDE_ROWS, WIDE_EXPERT);
+        let pass = consts == want;
+        println!(
+            "wide512 instance: (experts, used, slots, rows, shared) = {consts:?} (want {want:?}) {}",
+            verdict(pass)
+        );
+        if !pass {
+            return Ok(false);
+        }
+        let mut ok = true;
+
+        let wh = wide_weight();
+        let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
+        let cols = wide_cols(WIDE_UB);
+        let want: Vec<Vec<f32>> = (0..WIDE_UB).map(|t| wide_logits(&wh, &cols, t)).collect();
+
+        // The fused launch: m = 1 takes the one-column gemv, 5 and 8 the
+        // m-column one.
+        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
+        let mut fused = WideCheck::new();
+        let mut tickets = Vec::new();
+        for m in [1usize, 5, MAX_TOKENS] {
+            let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
+            c.router
+                .enqueue_fused_512(stream, &w, &x, m, sink, &mut fout)?;
+            stream.synchronize()?;
+            let got = read_wide(stream, &fout)?;
+            tickets.push(fout.tickets(stream)?);
+            if !wide_sized(&got, m) {
+                println!(
+                    "wide512 fused m={m}: buffers {} / {} / {} / {} values, want {m} tokens of \
+                     {WIDE_ROWS} / {WIDE_EXPERT} / {WIDE_SLOTS} / {WIDE_SLOTS} FAIL",
+                    got.logits.len(),
+                    got.probs.len(),
+                    got.ids.len(),
+                    got.weights.len()
+                );
+                return Ok(false);
+            }
+            for (t, lt) in want.iter().enumerate().take(m) {
+                fused.add(&wide_token(&got, t), lt)?;
+            }
+        }
+        ok &= fused.line("fused m=1,5,8 vs host (exact logits)");
+        let pass = tickets.iter().all(|&t| t == 0);
+        println!(
+            "wide512 fused tickets after each launch {tickets:?} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // The routing alone over the host's exact logits of every token, one
+        // launch (warps 0..8 of nine blocks), then again: bit-identical.
+        let flat: Vec<f32> = want.concat();
+        let mut rout = RouterOut512::with_tokens(stream, 1)?;
+        let mut uout = RouterOut512::for_ubatch(stream, WIDE_UB)?;
+        let a = wide_route(c, &flat, WIDE_UB, sink, &mut uout)?;
+        let b = wide_route(c, &flat, WIDE_UB, sink, &mut uout)?;
+        let mut route = WideCheck::new();
+        for (t, lt) in want.iter().enumerate() {
+            route.add(&wide_token(&a, t), lt)?;
+        }
+        ok &= route.line(&format!("route n={WIDE_UB} vs host"));
+        let pass = routed_equal(&a, &b);
+        println!("wide512 route rerun bit-identical={pass} {}", verdict(pass));
+        ok &= pass;
+
+        // The ubatch pair: its logits the host's exact ones, every token the
+        // fused launch's bits at one token.
+        let x = DeviceBuffer::from_host(stream, &cols)?;
+        c.router
+            .enqueue_ubatch_512(stream, &w, &x, WIDE_UB, sink, &mut uout)?;
+        stream.synchronize()?;
+        let ub = read_wide(stream, &uout)?;
+        let mut pair = WideCheck::new();
+        let mut same = 0usize;
+        for (t, lt) in want.iter().enumerate() {
+            let gt = wide_token(&ub, t);
+            pair.add(&gt, lt)?;
+            let xt = DeviceBuffer::from_host(stream, &cols[t * WIDE_K..(t + 1) * WIDE_K])?;
+            c.router
+                .enqueue_fused_512(stream, &w, &xt, 1, sink, &mut rout)?;
+            stream.synchronize()?;
+            same += usize::from(routed_equal(
+                &gt,
+                &wide_token(&read_wide(stream, &rout)?, 0),
+            ));
+        }
+        ok &= pair.line(&format!(
+            "ubatch n={WIDE_UB} (logits_512 + route_512, 3 token blocks x 17 row blocks) vs host"
+        ));
+        let pass = same == WIDE_UB;
+        println!(
+            "wide512 ubatch vs the fused launch per token: {same}/{WIDE_UB} bit-identical {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // Constructed ties: lanes own experts `lane + 32 j`, j < 16.
+        let mut cases: Vec<(&str, Vec<f32>, Vec<u32>)> = Vec::new();
+        let mut l = vec![0.5f32; WIDE_ROWS];
+        l[WIDE_EXPERT] = 0.0;
+        cases.push(("all-equal", l, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 512]));
+        let mut l = vec![-4.0f32; WIDE_ROWS];
+        for (i, &e) in [500usize, 300, 64, 33, 5, 511, 70, 290, 257]
+            .iter()
+            .enumerate()
+        {
+            l[e] = 3.0 - 0.2 * i as f32;
+        }
+        // Lanes 0, 0, 1, 1 at j = 15, 1, 0, 14.
+        for e in [480usize, 32, 1, 449] {
+            l[e] = 1.0;
+        }
+        l[WIDE_EXPERT] = -1.5;
+        cases.push((
+            "tenth-shared-by-480-32-1-449",
+            l,
+            vec![500, 300, 64, 33, 5, 511, 70, 290, 257, 1, 512],
+        ));
+        let mut l = vec![-4.0f32; WIDE_ROWS];
+        for (i, e) in (40..48).enumerate() {
+            l[e] = 1.0 - 0.1 * i as f32;
+        }
+        l[511] = 2.0;
+        l[31] = 2.0;
+        l[WIDE_EXPERT] = 3.0;
+        cases.push((
+            "first-shared-by-511-31",
+            l,
+            vec![31, 511, 40, 41, 42, 43, 44, 45, 46, 47, 512],
+        ));
+        let mut l = vec![-4.0f32; WIDE_ROWS];
+        // Lanes 0, 1, 0, 0 at j = 11, 9, 9, 8: the upper half only this
+        // instance has.
+        for e in [352usize, 289, 288, 256] {
+            l[e] = 2.5;
+        }
+        for (i, &e) in [100usize, 200, 300, 400, 500, 510].iter().enumerate() {
+            l[e] = 2.0 - 0.1 * i as f32;
+        }
+        l[WIDE_EXPERT] = 0.0;
+        cases.push((
+            "first-four-shared-upper-half",
+            l,
+            vec![256, 288, 289, 352, 100, 200, 300, 400, 500, 510, 512],
+        ));
+        for (name, logits, want_ids) in &cases {
+            let got = wide_token(&wide_route(c, logits, 1, sink, &mut rout)?, 0);
+            let h = host_route_at(logits, WIDE_EXPERT, WIDE_USED)?;
+            let mut one = WideCheck::new();
+            let checked = one.add(&got, logits)?;
+            let pass = checked && got.ids == *want_ids && h.ids == *want_ids;
+            println!(
+                "wide512 tie case={name} ids={:?} host={:?} want={want_ids:?} weights_bits={} {}",
+                got.ids,
+                h.ids,
+                one.weights_bits,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        // All-equal is exact on both sides: probabilities 1/512, weights
+        // 1/10 each, the gate sigmoid(0) = 1/2.
+        let (_, l, _) = &cases[0];
+        let got = wide_token(&wide_route(c, l, 1, sink, &mut rout)?, 0);
+        let h = host_route_at(l, WIDE_EXPERT, WIDE_USED)?;
+        let pass = bits_equal(&got.probs, &h.probs) && bits_equal(&got.weights, &h.weights);
+        println!(
+            "wide512 tie case=all-equal probabilities and all eleven weights bit-identical to the \
+             host rule={pass} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        ok &= wide_fault(c, &wh, &w, &cols, &want)?;
+        ok &= wide_order(c)?;
+        Ok(ok)
+    }
+
+    /// The wide instance's sum orders, on inputs whose sums round: LCG
+    /// weights and activations with full mantissas. The fused launch at m =
+    /// 1, 5, 8 against `f32_gemv` over the same [`WIDE_ROWS`] rows followed
+    /// by the routing alone per token, and the ubatch pair over
+    /// [`WIDE_UB`] tokens against the fused launch per token: logits,
+    /// probabilities, ids and weights BIT-EQUAL — the `logits` case's
+    /// clauses at this width and at K = 2560, where the one-column walk's 80
+    /// chunks run two 32-chunk trips and two 8-chunk ones. A line first
+    /// shows the inputs round: logits of the m = 8 gemv that differ from
+    /// the f64 dot rounded once, nonzero or the clauses below could not see
+    /// an order.
+    fn wide_order(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let mut s = 0x0de5_0512_u64;
+        let mut val = |scale: f32| ((lcg(&mut s) % 4001) as f32 - 2000.0) * scale;
+        let wh: Vec<f32> = (0..WIDE_ROWS * WIDE_K).map(|_| val(1.3e-5)).collect();
+        let cols: Vec<f32> = (0..WIDE_UB * WIDE_K).map(|_| val(7.1e-4)).collect();
+        let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
+        let mut one = RouterOut512::with_tokens(stream, 1)?;
+        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
+        let mut ok = true;
+        for m in [1usize, 5, MAX_TOKENS] {
+            let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, WIDE_ROWS * m)?;
+            c.gpu.q8f32().enqueue_f32_gemv(stream, &w, &x, m, &mut y)?;
+            stream.synchronize()?;
+            let y = y.to_host_vec(stream)?;
+            if m == MAX_TOKENS {
+                let mut rounded = 0usize;
+                for t in 0..m {
+                    let col = &cols[t * WIDE_K..(t + 1) * WIDE_K];
+                    for r in 0..WIDE_ROWS {
+                        let dot: f64 = wh[r * WIDE_K..(r + 1) * WIDE_K]
+                            .iter()
+                            .zip(col)
+                            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                            .sum();
+                        rounded += usize::from((dot as f32).to_bits() != y[r * m + t].to_bits());
+                    }
+                }
+                let pass = rounded > 0;
+                println!(
+                    "wide512 order inputs: {rounded}/{} logits of the m={m} gemv differ from the \
+                     f64 dot rounded once (want > 0) {}",
+                    WIDE_ROWS * m,
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            c.router
+                .enqueue_fused_512(stream, &w, &x, m, sink, &mut fout)?;
+            stream.synchronize()?;
+            let got = read_wide(stream, &fout)?;
+            let tickets = fout.tickets(stream)?;
+            let mut same = 0usize;
+            for t in 0..m {
+                let col: Vec<f32> = (0..WIDE_ROWS).map(|r| y[r * m + t]).collect();
+                let want = wide_token(&wide_route(c, &col, 1, sink, &mut one)?, 0);
+                same += usize::from(routed_equal(&wide_token(&got, t), &want));
+            }
+            let pass = same == m && tickets == 0;
+            println!(
+                "wide512 order fused m={m} vs f32_gemv ({WIDE_ROWS} rows) + route_512: {same}/{m} \
+                 tokens bit-identical tickets={tickets} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let x = DeviceBuffer::from_host(stream, &cols)?;
+        let mut ub = RouterOut512::for_ubatch(stream, WIDE_UB)?;
+        c.router
+            .enqueue_ubatch_512(stream, &w, &x, WIDE_UB, sink, &mut ub)?;
+        stream.synchronize()?;
+        let got = read_wide(stream, &ub)?;
+        let mut same = 0usize;
+        for t in 0..WIDE_UB {
+            let xt = DeviceBuffer::from_host(stream, &cols[t * WIDE_K..(t + 1) * WIDE_K])?;
+            c.router
+                .enqueue_fused_512(stream, &w, &xt, 1, sink, &mut one)?;
+            stream.synchronize()?;
+            let want = wide_token(&read_wide(stream, &one)?, 0);
+            same += usize::from(routed_equal(&wide_token(&got, t), &want));
+        }
+        let pass = same == WIDE_UB;
+        println!(
+            "wide512 order ubatch n={WIDE_UB} vs the fused launch per token: {same}/{WIDE_UB} \
+             bit-identical {}",
+            verdict(pass)
+        );
+        Ok(ok && pass)
+    }
+
+    /// The wide instance's refusals, each launch labelled with layer 5: the
+    /// routing alone on a non-finite expert logit in the upper half and on a
+    /// NaN gate logit; the fused launch at five tokens with a NaN in router
+    /// row 400, and the ubatch pair at nine tokens with a NaN in row 512 —
+    /// every token refused. A refused token: `FaultSite::Router` with that
+    /// layer, its probabilities and all eleven weights NaN, its ids as they
+    /// stood; a clean run after it bit-identical to the clean run before.
+    fn wide_fault(
+        c: &Ctx,
+        wh: &[f32],
+        w: &DeviceTensor<f32>,
+        cols: &[f32],
+        want: &[Vec<f32>],
+    ) -> Result<bool, GateError> {
+        let stream = c.stream();
+        let sink = c.gpu.layer_sink(FAULT_LAYER)?;
+        let want_word = Some(Fault::at(u32::try_from(FAULT_LAYER)?, FaultSite::Router));
+        let show = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        let mut ok = true;
+
+        let clean_l = want[0].clone();
+        let mut out = RouterOut512::with_tokens(stream, 1)?;
+        let before = c.gpu.fault()?;
+        let clean = wide_route(c, &clean_l, 1, sink, &mut out)?;
+        let after = c.gpu.fault()?;
+        let pass = before.is_none() && after.is_none();
+        println!(
+            "wide512 fault clean routing: word before {before:?} after {after:?} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        // Expert 300 is lane 12's j = 9, 511 lane 31's j = 15.
+        for (name, at, v) in [
+            ("expert logit[300]=nan", 300usize, f32::NAN),
+            ("expert logit[511]=+inf", 511, f32::INFINITY),
+            ("expert logit[256]=-inf", 256, f32::NEG_INFINITY),
+            ("gate logit[512]=nan", WIDE_EXPERT, f32::NAN),
+        ] {
+            let mut l = clean_l.clone();
+            l[at] = v;
+            let r = wide_route(c, &l, 1, sink, &mut out)?;
+            let word = c.gpu.take_fault()?;
+            let refused = wide_refused(&r, 0, &clean);
+            let again = wide_route(c, &clean_l, 1, sink, &mut out)?;
+            let clean_after = c.gpu.fault()?.is_none() && routed_equal(&again, &clean);
+            let pass = word == want_word && refused && clean_after;
+            println!(
+                "wide512 fault op=qwen35moe_router_route_512 {name}: word \"{}\" (want \"{}\") \
+                 refused={refused} clean_rerun={clean_after} {}",
+                show(word),
+                show(want_word),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        let m = 5usize;
+        let xc = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
+        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
+        c.router
+            .enqueue_fused_512(stream, w, &xc, m, sink, &mut fout)?;
+        stream.synchronize()?;
+        let clean_f = read_wide(stream, &fout)?;
+        let clean_word = c.gpu.take_fault()?;
+        let mut wn = wh.to_vec();
+        wn[400 * WIDE_K + 3] = f32::NAN;
+        let wnd = DeviceTensor::upload(stream, &wn, WIDE_ROWS, WIDE_K)?;
+        c.router
+            .enqueue_fused_512(stream, &wnd, &xc, m, sink, &mut fout)?;
+        stream.synchronize()?;
+        let got = read_wide(stream, &fout)?;
+        let tickets = fout.tickets(stream)?;
+        let word = c.gpu.take_fault()?;
+        let refused = (0..m).all(|t| wide_refused(&got, t, &clean_f));
+        let pass = clean_word.is_none() && word == want_word && refused && tickets == 0;
+        println!(
+            "wide512 fault op=qwen35moe_router_fused_512 m={m} router weight [400][3]=NaN: word \
+             \"{}\" every token refused={refused} tickets={tickets} {}",
+            show(word),
+            verdict(pass)
+        );
+        ok &= pass;
+
+        let n = 9usize;
+        let xu = DeviceBuffer::from_host(stream, &cols[..n * WIDE_K])?;
+        let mut ub = RouterOut512::for_ubatch(stream, n)?;
+        c.router
+            .enqueue_ubatch_512(stream, w, &xu, n, sink, &mut ub)?;
+        stream.synchronize()?;
+        let clean_u = read_wide(stream, &ub)?;
+        let clean_word = c.gpu.take_fault()?;
+        let mut wn = wh.to_vec();
+        wn[WIDE_EXPERT * WIDE_K + 5] = f32::NAN;
+        let wnd = DeviceTensor::upload(stream, &wn, WIDE_ROWS, WIDE_K)?;
+        c.router
+            .enqueue_ubatch_512(stream, &wnd, &xu, n, sink, &mut ub)?;
+        stream.synchronize()?;
+        let got = read_wide(stream, &ub)?;
+        let word = c.gpu.take_fault()?;
+        let refused = (0..n).all(|t| wide_refused(&got, t, &clean_u));
+        let pass = clean_word.is_none() && word == want_word && refused;
+        println!(
+            "wide512 fault op=qwen35moe_router_logits_512+route_512 n={n} router weight [512][5]=NaN: \
+             word \"{}\" every token refused={refused} {}",
+            show(word),
+            verdict(pass)
+        );
+        Ok(ok && pass)
     }
 
     // ------------------------------------------------------------ logits
@@ -1929,10 +2584,16 @@ mod gate {
                 "qwen35moe_router_norm",
                 "qwen35moe_router_logits",
                 "qwen35moe_router_route",
+                "qwen35moe_router_fused_512",
+                "qwen35moe_router_logits_512",
+                "qwen35moe_router_route_512",
             ])?;
         }
         if c.want("routing") {
             ok &= routing_case(&c, n_layer)?;
+        }
+        if c.want("wide512") {
+            ok &= wide_case(&c)?;
         }
         if c.want("ik") {
             ok &= ik_case(&c, n_layer)?;
