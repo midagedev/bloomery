@@ -30,4 +30,4 @@ unsafe_op_in_unsafe_fn = "deny"     # 적중 0
 
 [workspace.lints.clippy]
 missing_safety_doc = "deny"         # 적중 0
-undocumented_unsafe_blocks = "warn" # 적중 54 — deny로 올리는 것은 MUL-10
+undocumented_unsafe_blocks = "deny" # 적중 0 (del2 뒤; 54였다) — 새 unsafe 블록은 SAFETY 주석 없이는 컴파일되지 않는다

@@ -31,15 +31,19 @@ pub use model::arch::deepseek2::attn::MlaParams;
 pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
+use crate::head::Head;
 use crate::hybrid::{
-    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, HybridWords, Refusal,
-    SlotMap,
+    Boundary, BoundaryShape, Chain, HostExperts, Hybrid, HybridConfig, HybridStats, HybridWords,
+    Refusal, SlotMap,
 };
 use crate::model::probe::Observer;
-use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe, one_shard};
+use crate::model::{
+    ChainBody, GpuModel, HostServed, Instrumented, Probed, Resident, StepKernels, StepProbe,
+    block_count, one_shard,
+};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights, q8_0_planes};
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, Graph};
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::Tensor2;
@@ -66,6 +70,14 @@ pub struct DecodeInput {
 /// layer, the weight names each layer looks up, the m = 1 arena every layer
 /// shares and this architecture's own step module.
 pub struct Body {
+    /// The layer graph a block gate captured ([`GpuModel::capture_layer`]),
+    /// with what it is a capture of. Declared first: fields drop in
+    /// declaration order, and the graph addresses the caches and the arena
+    /// below.
+    layer_graph: Option<LayerGraph>,
+    /// The model layers this load carries, in order: `names[i]` is layer
+    /// `layers.start + i`.
+    layers: Range<usize>,
     mla: MlaParams,
     /// The MoE shapes — `None` when no resident layer routes.
     moe: Option<MoeDims>,
@@ -78,6 +90,15 @@ pub struct Body {
     step: StepKernels,
     /// The hybrid boundary and its host tier — `None` on an all-card load.
     hybrid: Option<Hybrid<PlanHost>>,
+}
+
+/// One layer's step captured on its own, and what it is a capture OF: the
+/// layer and whether it embeds in front. A replay names what it expects, so a
+/// graph of another layer is an error, not a silent replay of the wrong
+/// chain.
+struct LayerGraph {
+    graph: Graph,
+    of: (usize, bool),
 }
 
 /// deepseek2's host tier: the CPU engine's plan of every routed block over
@@ -166,7 +187,7 @@ impl Body {
         )
     }
 
-    /// Everything [`ChainBody::load`] builds over the resident weights, with
+    /// Everything [`Body::load`] builds over the resident weights, with
     /// the routed stacks holding `resident_experts` experts each (`None`:
     /// all of them). No hybrid tier yet. The file's hyperparameters are read
     /// here, once per load, and every value the kernels were not built for is
@@ -200,6 +221,8 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let step = StepKernels::load(gpu.context())?;
         Ok(Body {
+            layer_graph: None,
+            layers,
             mla,
             moe,
             kv,
@@ -256,21 +279,89 @@ impl Body {
     }
 }
 
-impl ChainBody for Body {
-    type Input = DecodeInput;
-    type Meta = ();
+// ------------------------------------------------------------ constructors
 
-    fn arch() -> Arch {
-        Arch::Deepseek2
+impl GpuModel<Body> {
+    /// Every block of `file` resident, plus the output head: the model
+    /// [`GpuModel::step`] needs, normalizing with the file's epsilon.
+    ///
+    /// The model takes the file: `BLOOMERY_HYBRID_NL` below the file's expert
+    /// count makes this the hybrid load of [`GpuModel::open_hybrid`], whose
+    /// host tier keeps it for the experts the card does not hold; unset or
+    /// equal to the expert count, every weight is on the card and the file is
+    /// closed once they are.
+    pub fn open(file: Split, ctx_max: usize) -> Result<GpuModel<Body>, GpuError> {
+        if let Some(cfg) = HybridConfig::from_levers(&file)? {
+            return GpuModel::open_hybrid(file, ctx_max, cfg);
+        }
+        let n_layers = block_count(&file, "deepseek2 GpuModel::open")?;
+        GpuModel::open_range(&file, ctx_max, 0..n_layers, true)
     }
 
+    /// Blocks `layers` of `file` resident with no output head — a block
+    /// gate's model: every tensor of that range plus the globals in its
+    /// kernels' device format, the derived weights, the caches, the m = 1
+    /// arena and the step module. The file is one shard, refused otherwise
+    /// before anything is uploaded ([`GpuModel::load_blocks`]).
+    pub fn open_blocks(
+        file: &Split,
+        ctx_max: usize,
+        layers: Range<usize>,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        GpuModel::open_range(file, ctx_max, layers, false)
+    }
+
+    /// [`GpuModel::open_blocks`] of `layers`, with the output head when `head`.
+    fn open_range(
+        file: &Split,
+        ctx_max: usize,
+        layers: Range<usize>,
+        head: bool,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        let gpu = Gpu::new()?;
+        GpuModel::load_blocks(gpu, file, ctx_max, layers.clone(), head, |gpu, w| {
+            Body::derive(gpu.stream(), file, layers.clone(), w)?;
+            Body::load(gpu, file, w, layers, ctx_max)
+        })
+    }
+
+    /// Every block of `file` resident, plus the output head, with each MoE
+    /// layer's experts `[0, cfg.n_l)` on the card — the V2-Lite prefix cut —
+    /// and the rest computed on the host inside the captured step
+    /// (crate::hybrid). The model keeps `file` for its host experts.
+    pub fn open_hybrid(
+        file: Split,
+        ctx_max: usize,
+        cfg: HybridConfig,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        let what = "deepseek2 GpuModel::open_hybrid";
+        if ctx_max == 0 {
+            return Err(GpuError::shape(what, "ctx_max must be >= 1"));
+        }
+        let n_layers = block_count(&file, what)?;
+        let gpu = Gpu::new()?;
+        let mut weights = Body::hybrid_weights(gpu.stream(), &file, 0..n_layers, cfg.n_l)?;
+        let body = Body::load_hybrid(&gpu, file, &mut weights, 0..n_layers, ctx_max, cfg)?;
+        let head = Head::new(&gpu, &weights, body.head_eps())?;
+        Ok(GpuModel::new(Resident {
+            gpu,
+            weights,
+            body,
+            head: Some(head),
+            host: None,
+            ctx_max,
+        }))
+    }
+}
+
+impl Body {
     /// The derived q_nope2 weights of every block in `layers`: `wk_b`
     /// requantized to Q8_0 by the CPU crate's [`Derived`] (never re-derived
     /// here), in the q8f32 two-plane layout over `rows = n_head · latent`
     /// rows of `k = nope` (`qs` rows × k/4 words, `d` rows × k/32 scales),
     /// head-major, block (row, b) at `wblocks[row·nope/32 + b]`, each filed
     /// under [`derived_name`]. An empty range derives nothing.
-    fn derive(
+    pub fn derive(
         stream: &CudaStream,
         file: &Split,
         layers: Range<usize>,
@@ -283,6 +374,8 @@ impl ChainBody for Body {
         Ok(())
     }
 
+    /// Everything the chain of `layers` needs resident, over the weights
+    /// already loaded and derived: the caches, the arena and the step module.
     fn load(
         gpu: &Gpu,
         file: &Split,
@@ -292,6 +385,74 @@ impl ChainBody for Body {
     ) -> Result<Body, GpuError> {
         let gguf = one_shard(file, "Body::load")?;
         Body::assemble(gpu, gguf, w, layers, ctx_max, None)
+    }
+
+    /// The file tensors of a hybrid load of `layers` (crate::hybrid): every
+    /// tensor a whole-model load uploads, except that each routed expert
+    /// stack keeps only its experts `[0, n_l)` — the leading rows the `_sel`
+    /// kernels address.
+    fn hybrid_weights(
+        stream: &CudaStream,
+        file: &Split,
+        layers: Range<usize>,
+        n_l: usize,
+    ) -> Result<Weights, GpuError> {
+        let model = hybrid_tensors(file, &layers)?;
+        let n_l = u64::try_from(n_l)
+            .map_err(|_| GpuError::shape("Body::hybrid_weights", "n_l passes u64"))?;
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| hybrid_row(i, t, &model, n_l))
+            .collect::<Result<Vec<_>, _>>()?;
+        Weights::load_rows(stream, file, &model, &rows, 0)
+    }
+
+    /// [`Body::derive`] and [`Body::load`] of a hybrid load in one: the
+    /// derived weights filed into `w`, then the body over them, whose routed
+    /// layers hand experts `[cfg.n_l, n_expert)` to a host tier that keeps
+    /// `file`. One `Derived` serves both the derived weights and the host
+    /// tier's expert plans.
+    fn load_hybrid(
+        gpu: &Gpu,
+        file: Split,
+        w: &mut Weights,
+        layers: Range<usize>,
+        ctx_max: usize,
+        cfg: HybridConfig,
+    ) -> Result<Body, GpuError> {
+        let what = "Body::load_hybrid";
+        let gguf = one_shard(&file, what)?;
+        let derived = Derived::new(gguf)?;
+        derive_blocks(gpu.stream(), &derived, layers.clone(), w)?;
+        let mut body = Body::assemble(gpu, gguf, w, layers.clone(), ctx_max, Some(cfg.n_l))?;
+        let (n_used, n_expert, ff) = body
+            .moe
+            .as_ref()
+            .map(|m| (m.n_used, m.n_expert, m.ff))
+            .ok_or(GpuError::state(
+                what,
+                "no resident layer routes: nothing to split",
+            ))?;
+        let hidden = body.scratch.dims.hidden;
+        let shape = BoundaryShape { hidden, n_used };
+        let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
+        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots, cfg.overlap)?;
+        let host = PlanHost::new(derived, file, hidden, ff)?;
+        body.hybrid = Some(Hybrid::new(boundary, host, layers.len())?);
+        Ok(body)
+    }
+}
+
+// --------------------------------------------------------- the chain body
+
+impl ChainBody for Body {
+    type Input = DecodeInput;
+    type Host = Body;
+
+    fn arch() -> Arch {
+        Arch::Deepseek2
     }
 
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput, GpuError> {
@@ -359,23 +520,6 @@ impl ChainBody for Body {
         Ok(())
     }
 
-    /// The pattern is deterministic in `rows` alone: the same `rows` gives the
-    /// same bytes. Every row differs (a repeated row makes the softmax
-    /// uniform, a different path from a real cache) and no value is zero, inf
-    /// or NaN by construction.
-    fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
-        let block = seed_pattern(rows, self.cache_cols("GpuModel::seed_depth")?);
-        for cache in self.kv.iter_mut() {
-            seed_cache(gpu, cache, &block, "seed_depth")?;
-        }
-        Ok(())
-    }
-
-    fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
-        self.scratch.probe_cfg = probe;
-        Ok(())
-    }
-
     /// One architecture-wide rms epsilon serves every norm, the head's
     /// included.
     fn head_eps(&self) -> f32 {
@@ -391,59 +535,22 @@ impl ChainBody for Body {
                 .map_or(0, |h| h.boundary.device_bytes())
     }
 
-    fn hybrid_weights(
-        stream: &CudaStream,
-        file: &Split,
-        layers: Range<usize>,
-        n_l: usize,
-    ) -> Result<Weights, GpuError> {
-        let model = hybrid_tensors(file, &layers)?;
-        let n_l = u64::try_from(n_l)
-            .map_err(|_| GpuError::shape("Body::hybrid_weights", "n_l passes u64"))?;
-        let rows = model
-            .tensors
-            .iter()
-            .enumerate()
-            .map(|(i, t)| hybrid_row(i, t, &model, n_l))
-            .collect::<Result<Vec<_>, _>>()?;
-        Weights::load_rows(stream, file, &model, &rows, 0)
+    fn layers(&self) -> Range<usize> {
+        self.layers.clone()
     }
 
-    /// One `Derived` serves both the derived weights and the host tier's
-    /// expert plans.
-    fn load_hybrid(
-        gpu: &Gpu,
-        file: Split,
-        w: &mut Weights,
-        layers: Range<usize>,
-        ctx_max: usize,
-        cfg: HybridConfig,
-    ) -> Result<Body, GpuError> {
-        let what = "Body::load_hybrid";
-        let gguf = one_shard(&file, what)?;
-        let derived = Derived::new(gguf)?;
-        derive_blocks(gpu.stream(), &derived, layers.clone(), w)?;
-        let mut body = Body::assemble(gpu, gguf, w, layers.clone(), ctx_max, Some(cfg.n_l))?;
-        let (n_used, n_expert, ff) = body
-            .moe
-            .as_ref()
-            .map(|m| (m.n_used, m.n_expert, m.ff))
-            .ok_or(GpuError::state(
-                what,
-                "no resident layer routes: nothing to split",
-            ))?;
-        let hidden = body.scratch.dims.hidden;
-        let shape = BoundaryShape { hidden, n_used };
-        let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
-        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots, cfg.overlap)?;
-        let host = PlanHost::new(derived, file, hidden, ff)?;
-        body.hybrid = Some(Hybrid::new(boundary, host, layers.len())?);
-        Ok(body)
+    /// The body is its own host service; an all-card load serves nothing.
+    fn host(&mut self) -> Option<&mut Body> {
+        Some(self)
     }
+}
 
-    fn serve_replay(&mut self) -> Result<(), GpuError> {
+impl HostServed for Body {
+    /// The host tier's share of the replay, on a hybrid load; nothing on an
+    /// all-card one.
+    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
         match self.hybrid.as_mut() {
-            Some(h) => h.serve_captured(),
+            Some(h) => h.serve_captured_of(chain),
             None => Ok(()),
         }
     }
@@ -453,8 +560,32 @@ impl ChainBody for Body {
     }
 }
 
+impl Instrumented for Body {
+    /// The pattern is deterministic in `rows` alone: the same `rows` gives the
+    /// same bytes. Every row differs (a repeated row makes the softmax
+    /// uniform, a different path from a real cache) and no value is zero, inf
+    /// or NaN by construction.
+    fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
+        let block = seed_pattern(rows, self.cache_cols("GpuModel::seed_depth")?);
+        for cache in self.kv.iter_mut() {
+            seed_cache(gpu, cache, &block, "seed_depth")?;
+        }
+        Ok(())
+    }
+}
+
+impl Probed for Body {
+    /// The probe changes which launches a layer issues, so the layer graph a
+    /// block gate captured goes with it.
+    fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
+        self.scratch.probe_cfg = probe;
+        self.layer_graph = None;
+        Ok(())
+    }
+}
+
 /// The derived q_nope2 weights of every block in `layers`, from `derived`,
-/// filed into `w` (see [`ChainBody::derive`]).
+/// filed into `w` (see [`Body::derive`]).
 fn derive_blocks(
     stream: &CudaStream,
     derived: &Derived,

@@ -549,7 +549,7 @@ mod gate {
     ) -> Result<NlOutcome, GateError> {
         let tag = format!("n_l={n_l} overlap={}", u8::from(overlap));
         let mut ok = true;
-        let mut h = Deepseek2Model::load_hybrid(
+        let mut h = Deepseek2Model::open_hybrid(
             Split::open(ref_model_path()?)?,
             CTX_MAX,
             HybridConfig { n_l, overlap },
@@ -1502,7 +1502,7 @@ mod gate {
             .filter(|&l| derived.block_plan(l).is_ok_and(|b| b.routed))
             .count();
 
-        let mut a = Deepseek2Model::load_full(Split::open(ref_model_path()?)?, CTX_MAX)?;
+        let mut a = Deepseek2Model::open(Split::open(ref_model_path()?)?, CTX_MAX)?;
         println!(
             "all_card resident_bytes={} layers={n_layers} routed={routed} ctx_max={CTX_MAX}",
             a.resident_bytes()
@@ -1553,7 +1553,7 @@ mod gate {
 
         // The overlap lever: same nodes, same logits.
         {
-            let mut h = Deepseek2Model::load_hybrid(
+            let mut h = Deepseek2Model::open_hybrid(
                 Split::open(ref_model_path()?)?,
                 CTX_MAX,
                 HybridConfig {

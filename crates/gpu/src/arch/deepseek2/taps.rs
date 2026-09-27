@@ -163,16 +163,76 @@ impl LayerTaps {
 // runs, the per-layer capture/replay the block gates drive, the per-op
 // profile and the cache seeding they need. Monomorphic and inherent, not a
 // trait, so every gate keeps calling the same method names it always did.
+// The layer capture is the body's own ([`Body::layer_graph`]): the skeleton's
+// graph cache holds whole chains only.
 
-use super::Body;
 use super::scratch::{LayerScratch, MoeScratch, SP_N_KEYS, SP_POS};
+use super::{Body, LayerGraph};
 use crate::model::probe::{Observer, check_one_node_per_tick, profile_reps};
 use crate::model::{GpuModel, OpTime};
+use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::deepseek2::attn::MlaParams;
 
 impl GpuModel<Body> {
+    /// The card, the weights and the body, requiring the load to hold
+    /// block 0.
+    fn block0_parts(
+        &mut self,
+        what: &'static str,
+    ) -> Result<(&Gpu, &Weights, &mut Body), GpuError> {
+        if self.body(what)?.layers.start != 0 {
+            return Err(GpuError::state(
+                what,
+                "the assembled block-0 step needs a load of blocks starting at layer 0",
+            ));
+        }
+        self.body_parts(what)
+    }
+
+    /// Capture one body of the layer graph — the per-layer capture the block
+    /// gates drive — and record what it is a capture OF. `want` is the
+    /// `(layer, embeds in front)` identity a later replay must name.
+    fn capture_stage(
+        &mut self,
+        want: (usize, bool),
+        f: impl FnOnce(&Gpu, &Weights, &mut Body) -> Result<(), GpuError>,
+    ) -> Result<usize, GpuError> {
+        let (gpu, w, body) = self.body_parts("GpuModel::capture_stage")?;
+        let captured = gpu.capture(|_| f(gpu, w, body))?;
+        let nodes = captured.node_count();
+        body.layer_graph = Some(LayerGraph {
+            graph: captured,
+            of: want,
+        });
+        Ok(nodes)
+    }
+
+    /// Launch the layer graph, requiring it to be the capture of `want`
+    /// (layer, embeds in front).
+    fn launch_graph(&self, want: (usize, bool)) -> Result<(), GpuError> {
+        let g = self
+            .body("GpuModel::launch_graph")?
+            .layer_graph
+            .as_ref()
+            .ok_or(GpuError::state(
+                "GpuModel::launch_graph",
+                "no captured graph",
+            ))?;
+        if g.of != want {
+            return Err(GpuError::shape(
+                "GpuModel::launch_graph",
+                format!(
+                    "the captured graph is {:?} (layer, embed), the replay \
+                 wants {want:?}",
+                    Some(g.of)
+                ),
+            ));
+        }
+        g.graph.launch(self.gpu().stream())
+    }
+
     /// The attention geometry read from the model file at load.
     pub fn mla(&self) -> Result<&MlaParams, GpuError> {
         Ok(&self.body("GpuModel::mla")?.mla)
@@ -313,7 +373,7 @@ impl GpuModel<Body> {
         self.set_layer_input(x_in)?;
         self.refresh_params(0, pos)?;
         self.launch_graph((l, false))?;
-        self.stage_stream()?.synchronize()?;
+        self.gpu().stream().synchronize()?;
         Ok(())
     }
 
@@ -366,7 +426,7 @@ impl GpuModel<Body> {
         self.check_pos(pos, "GpuModel::replay_block0")?;
         self.refresh_params(token, pos)?;
         self.launch_block0_graph()?;
-        self.stage_stream()?.synchronize()?;
+        self.gpu().stream().synchronize()?;
         Ok(())
     }
 
@@ -454,14 +514,14 @@ impl GpuModel<Body> {
         for _ in 0..20 {
             self.refresh_params(token, pos)?;
         }
-        self.stage_stream()?.synchronize()?;
+        self.gpu().stream().synchronize()?;
         let mut total = 0.0f64;
         for _ in 0..reps {
             let t0 = std::time::Instant::now();
             self.refresh_params(token, pos)?;
             total += t0.elapsed().as_secs_f64() * 1e6;
         }
-        self.stage_stream()?.synchronize()?;
+        self.gpu().stream().synchronize()?;
         Ok(total / f64::from(reps))
     }
 }

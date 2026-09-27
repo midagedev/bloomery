@@ -61,7 +61,7 @@ pub enum DevWeight {
     /// A derived weight — computed at load by an architecture's plan, never
     /// read from the file — in the same two planes as `Q8_0` (`qs` rows ×
     /// k/4 words, `d` rows × k/32 f16 scales); its row geometry is the
-    /// plan's ([`ChainBody::derive`](crate::model::ChainBody::derive)). A
+    /// plan's (the constructor's derive step, see `GpuModel::load_placed`). A
     /// distinct variant so nothing can read derived bytes as a file tensor
     /// or vice versa.
     Q8_0Derived {

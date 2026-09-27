@@ -168,9 +168,9 @@ fn run() -> Res<()> {
     }
     std::fs::create_dir_all(&dump)?;
 
-    let mut model = Deepseek2Model::load_full(Split::open(ref_model_path()?)?, ctx)?;
+    let mut model = Deepseek2Model::open(Split::open(ref_model_path()?)?, ctx)?;
     model.set_mode(StepMode::Eager);
-    let layers = model.stages()[0].layers();
+    let layers = model.layers();
     println!(
         "arm seg_keys={} ctx={ctx} prompt={id} tokens={} step={step} \
          pos={} live_keys={} segments={} live_segments={}",

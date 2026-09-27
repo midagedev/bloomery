@@ -52,7 +52,7 @@ mod dspark;
 mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::{ChainBody, StepMode};
-    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, Seam};
+    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
     use gguf::Split;
@@ -167,8 +167,8 @@ mod gate {
     /// The step's and the pair's node counts without a tap.
     fn plain_counts(m: &mut Deepseek41Model, t: u32) -> Result<[usize; 2], GateError> {
         let step = m.capture_step()?;
-        m.step_pair(t, t)?;
-        let pair = m.pair_graph_nodes()?.len();
+        m.step_rows([t, t])?;
+        let pair = m.rows_graph_nodes::<PAIR_ROWS>()?.len();
         m.reset()?;
         println!("{NAME}: structure | no tap: step {step} nodes, pair {pair}");
         Ok([step, pair])
@@ -183,8 +183,8 @@ mod gate {
     ) -> Result<bool, GateError> {
         let n = layers.len();
         let step = m.capture_step()?;
-        m.step_pair(t, t)?;
-        let pair = m.pair_graph_nodes()?.len();
+        m.step_rows([t, t])?;
+        let pair = m.rows_graph_nodes::<PAIR_ROWS>()?.len();
         m.reset()?;
         let counts = step == step0 + n
             && pair == pair0 + 2 * n
@@ -389,7 +389,7 @@ mod gate {
             &h_b,
         );
         m.rollback(p)?;
-        let [ta, tb] = m.step_pair(t, t1)?;
+        let [ta, tb] = m.step_rows([t, t1])?;
         let tokens = ta == t1 && tb == seq[p as usize + 2];
         println!(
             "{NAME}: tap | pos {p}: pair over [{t}, {t1}] gives [{ta}, {tb}], the run's [{t1}, {}]: {}",

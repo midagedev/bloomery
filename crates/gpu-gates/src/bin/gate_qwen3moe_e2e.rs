@@ -131,7 +131,7 @@ mod gate {
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu::{GpuError, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuError, Qwen3moeModel};
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -310,14 +310,14 @@ mod gate {
     fn open(ctx: usize, mode: StepMode) -> Result<Qwen3moeModel, GateError> {
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
         let t = Instant::now();
-        let mut m = Qwen3moeModel::load_full(file, ctx)?;
+        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
         m.set_mode(mode);
         let mma = m.body("gate_qwen3moe_e2e")?.flash_mma();
         println!(
             "load resident_bytes={} ctx={ctx} layers={} flash_mma={mma} ubatch={} in {:.1} s \
              (runtime value)",
             m.resident_bytes(),
-            m.stages()[0].layers().len(),
+            m.layers().len(),
             m.ubatch()?,
             t.elapsed().as_secs_f64()
         );
@@ -398,16 +398,16 @@ mod gate {
     /// (x) (module doc).
     fn fault_layer(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
         m.reset()?;
-        let before = m.stages()[0].gpu().fault()?;
+        let before = m.gpu().fault()?;
         let hidden = m.body("gate_qwen3moe_e2e")?.hparams().n_embd;
         let mut x = vec![0.25f32; hidden];
         x[5] = f32::NAN;
         m.step_ffn(FAULT_LAYER, &x)?;
-        let raised = m.stages()[0].gpu().fault()?;
+        let raised = m.gpu().fault()?;
         let step = m.step(&[1]);
         let poisoned = m.poisoned();
         m.reset()?;
-        let after = m.stages()[0].gpu().fault()?;
+        let after = m.gpu().fault()?;
         let clean_step = m.step(&[1]).is_ok();
         m.reset()?;
         let layer = u32::try_from(FAULT_LAYER)?;

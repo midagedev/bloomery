@@ -684,7 +684,7 @@ fn run() -> Result<(), GateError> {
     println!(
         "resident bytes={} ctx_max={CTX_MAX} layers=0..{} gen={GEN}",
         model.resident_bytes(),
-        model.stages()[0].layers().end
+        model.layers().end
     );
 
     // Calibration, printed and not judged: ik's own CPU backend against the

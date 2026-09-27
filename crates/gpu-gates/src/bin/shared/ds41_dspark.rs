@@ -232,14 +232,9 @@ impl Dspark {
     }
 }
 
-/// The context of `m`'s one stage.
+/// The context of `m`'s card.
 fn target_ctx(m: &Deepseek41Model) -> Result<Arc<CudaContext>, GateError> {
-    Ok(m.stages()
-        .first()
-        .ok_or("dspark loop: the model has no stage")?
-        .gpu()
-        .context()
-        .clone())
+    Ok(m.gpu().context().clone())
 }
 
 /// Step the fed `ids` one position at a time, each position's features into
@@ -280,7 +275,7 @@ pub fn pass(m: &mut Deepseek41Model, d: &mut Dspark, next: u32) -> Result<Verdic
         .into());
     }
     let draft = d.propose(next)?;
-    let [ta, tb] = m.step_pair(next, draft)?;
+    let [ta, tb] = m.step_rows([next, draft])?;
     let accept = ta == draft;
     let rows = if accept { 2 } else { 1 };
     {

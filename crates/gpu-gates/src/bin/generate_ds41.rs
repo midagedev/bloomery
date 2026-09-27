@@ -40,8 +40,8 @@
 //! the prompt, then the depth tables' sequence (`lcg_prompt` in
 //! `tools/ref/lease.sh`) from index `P` on, every id one real step. With no
 //! prompt the fed ids are exactly `lcg_prompt D`, the ids the V2-Lite depth
-//! runner feeds. There is no synthetic depth: `seed_depth` refuses on this
-//! body.
+//! runner feeds. There is no synthetic depth: this body has no
+//! `seed_depth`.
 //!
 //! Any depth up to `--ctx` runs: every indexer layer selects its stream's
 //! list at every position (the identity while the visible rows fit in
@@ -131,7 +131,7 @@
 //! `BLOOMERY_DRAFT=lookup` serves an n-gram lookup draft
 //! (`bloomery_gpu_gates::draft::Lookup`, fed the fed ids and every emitted
 //! token) through the skewed two-row pass. A pass with a proposal `d` runs
-//! `step_pair(next, d)`: row A's argmax equal to `d` accepts both rows' tokens
+//! `step_rows([next, d])`: row A's argmax equal to `d` accepts both rows' tokens
 //! (two positions), otherwise the second position is taken back and row A's
 //! token alone is emitted (one position). A pass with no proposal is one
 //! `step`. Greedy either way, so the `tokens` line equals the plain run's;
@@ -202,7 +202,7 @@ mod drive {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, PAIR_ROWS};
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::record::{self, Record};
@@ -1299,10 +1299,10 @@ mod drive {
         // The pair pass's second head and, in graph mode, its capture are
         // made by the first pair: one here, then back to the fresh context,
         // so no timed pass pays for them.
-        m.step_pair(f.ids[0], f.ids[0])?;
+        m.step_rows([f.ids[0], f.ids[0]])?;
         m.reset()?;
         if a.mode == StepMode::Graph {
-            let nodes = m.pair_graph_nodes()?.len();
+            let nodes = m.rows_graph_nodes::<PAIR_ROWS>()?.len();
             Record::new(&record::CAPTURE_PAIR)
                 .u("pair_graph_nodes", nodes)
                 .print();
@@ -1389,7 +1389,7 @@ mod drive {
     /// The lookup's pass: the pair over `[next, d]`, the second position
     /// taken back unless row A's argmax is `d`.
     fn lookup_pass(m: &mut Deepseek41Model, next: u32, d: u32) -> Result<Verdict, GateError> {
-        let [ta, tb] = m.step_pair(next, d)?;
+        let [ta, tb] = m.step_rows([next, d])?;
         if ta == d {
             Ok(Verdict::Accept([ta, tb]))
         } else {
@@ -1533,11 +1533,7 @@ mod drive {
             let hybrid = body.hybrid().stats();
             let eng = body.step_rows().engram_stats();
             let eng_helper = body.step_rows().helper_cpu();
-            let stage = m
-                .stages()
-                .first()
-                .ok_or("generate_ds41: the model has no stage")?;
-            let vram_free = u64::try_from(stage.gpu().mem_info()?.0)?;
+            let vram_free = u64::try_from(m.gpu().mem_info()?.0)?;
             // SAFETY: `rusage` is integers only, so all-zero is a valid value,
             // and `getrusage` writes only through the pointer it is given.
             let (rc, ru) = unsafe {

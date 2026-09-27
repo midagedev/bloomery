@@ -43,7 +43,7 @@
 //! builds its image; the rows reach the card after the launch
 //! ([`RowsArrival`]): the first site's token-only work waits on a host flag
 //! and copies them in, and the host delivers them before it serves the
-//! replay's host tier ([`ChainBody::serve_replay`]).
+//! replay's host tier ([`HostServed::serve_captured`]).
 //!
 //! The pair pass ([`Body::enqueue_pair`]) runs two tokens as rows one layer
 //! apart on the same launches, so the host tier serves one row's layer while
@@ -59,9 +59,10 @@
 //! [`Body::read_features`] brings to the host. Without it the step is the
 //! same launches as before, and none of its buffers exist.
 //!
-//! [`ChainBody::seed_depth`] refuses: a synthetic depth would have to fill
-//! the rings, the compressed rows, the index keys and the states
-//! consistently with each other.
+//! The body has no synthetic depth (it is not
+//! [`bloomery_gpu::model::Instrumented`]): one would have to fill the rings,
+//! the compressed rows, the index keys and the states consistently with each
+//! other.
 
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -71,7 +72,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HOST, Hybrid, Refusal, SlotMap, levers,
 };
-use bloomery_gpu::model::{ChainBody, StepProbe};
+use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
@@ -156,7 +157,7 @@ impl OpenCfg {
     }
 }
 
-/// What a placed load hands the V4.1 body ([`ChainBody::load_placed`]): the
+/// What a placed load hands the V4.1 body ([`Body::open_placed`]): the
 /// hyperparameters the plan was made from, and the body's levers.
 #[derive(Clone, Debug)]
 pub struct BodyMeta {
@@ -167,7 +168,7 @@ pub struct BodyMeta {
 /// The whole V4.1 model on this machine's placement `machine`: the file's
 /// headers read once ([`Hparams`]), its tensors classified and planned at
 /// `ctx_max` positions under `cfg`'s placement levers, and the plan's card
-/// loaded with its layers and the head ([`GpuModel::load_placed`]) under
+/// loaded with its layers and the head ([`Body::open_placed`]) under
 /// `cfg`'s body levers. A plan that breaks its invariants, or that spreads
 /// the layers over more than one card, is refused before anything is
 /// uploaded.
@@ -196,7 +197,7 @@ pub fn open(
         hp: inputs.hp.clone(),
         levers: cfg.body,
     };
-    GpuModel::load_placed(file, &plan, 0, &meta)
+    Body::open_placed(file, &plan, 0, &meta)
 }
 
 /// Build the feature tap a draft reads ([`Body::read_features`]): for every
@@ -208,7 +209,7 @@ pub fn open(
 /// that holds one is refused. Load-time only.
 pub fn attach_features(m: &mut Deepseek41Model, layers: &[usize]) -> Result<(), GpuError> {
     const WHAT: &str = "deepseek41 attach_features";
-    if m.step_graph_nodes().is_ok() || m.pair_graph_nodes().is_ok() {
+    if m.has_capture() {
         return Err(GpuError::State {
             what: WHAT,
             missing: "a model with no captured graph: attach the tap before the first capture",
@@ -1952,12 +1953,21 @@ impl FeatureTap {
     }
 }
 
-impl ChainBody for Body {
-    type Input = StepInput;
-    type Meta = BodyMeta;
-
-    fn arch() -> Arch {
-        Arch::Deepseek41
+impl Body {
+    /// Card `card` of `plan` resident ([`GpuModel::load_placed`]): the
+    /// card's segments, the joined projections ([`Body::derive`]), the host
+    /// set read in, the body over them ([`Body::load_placed`]) sized from
+    /// `meta`'s hparams under `meta`'s levers, and the head when the card
+    /// carries it. `meta` is what the plan was made from.
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        meta: &BodyMeta,
+    ) -> Result<Deepseek41Model, GpuError> {
+        GpuModel::load_placed(file, plan, card, Body::derive, |gpu, file, _| {
+            Body::load_placed(gpu, file, plan, card, meta)
+        })
     }
 
     /// V4.1 derives no new values at load: it moves the attention's Q3_K
@@ -1973,193 +1983,6 @@ impl ChainBody for Body {
         join_projections(stream, &hp, layers, w)
     }
 
-    /// V4.1 loads by its placement plan ([`ChainBody::load_placed`]); a load
-    /// of a layer range with every weight on the card is refused.
-    fn load(
-        _gpu: &Gpu,
-        _file: &Split,
-        _w: &Weights,
-        _layers: Range<usize>,
-        _ctx_max: usize,
-    ) -> Result<Body, GpuError> {
-        Err(GpuError::State {
-            what: "deepseek41 Body::load",
-            missing: "a placement plan: V4.1 loads by one (GpuModel::load_placed)",
-        })
-    }
-
-    /// The step at `pos` after the tokens decoded so far: its plan, its
-    /// embedding row read from the file on this thread while the rows'
-    /// helper reads its engram rows ([`StepRows::begin`]), and its image built
-    /// without them — they reach the card after the launch
-    /// ([`RowsArrival`]). Rows still due from before (a pair's first row, or
-    /// a step whose chain never ran) are delivered first. A position other
-    /// than the next one is refused, and so is every step after one whose
-    /// rows failed, until a reset.
-    fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        const WHAT: &str = "deepseek41 Body::decode_input";
-        if self.rows_failed {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "a reset: an earlier step's engram rows failed after its launch, and \
-                          the card ran that step on stale rows",
-            });
-        }
-        self.arrive()?;
-        self.rows.finish()?;
-        if self.history.len() != pos as usize || self.history.len() >= self.positions() {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "a step at position {pos} after {} tokens, in caches of {} positions",
-                    self.history.len(),
-                    self.positions()
-                ),
-            });
-        }
-        self.check_defined(WHAT, pos as usize + 1)?;
-        self.planner
-            .plan_into(&[token], pos, &self.history, &mut self.plan)
-            .map_err(|e| GpuError::plan(WHAT, e))?;
-        self.rows.begin(&self.file, &self.plan)?;
-        // The rows section is written again by the arrival; what it holds
-        // here is never read.
-        self.image
-            .build(&self.plan, self.rows.embd(), self.rows.engram())?;
-        self.history.push(token);
-        Ok(StepInput { pos })
-    }
-
-    /// One host-to-device copy of the whole image into row 0's copy; the
-    /// image must hold the step `input` names.
-    fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
-        self.refresh_row(stream, input, 0)
-    }
-
-    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
-    }
-
-    /// Every ring, compressed row, index key, compressor state, the source
-    /// compressor's pooled rows, and every row's streams, folds and lists are
-    /// zeroed in place — a captured chain keeps their addresses — and the
-    /// token history is emptied. The ring shadows are not: a cut reads only
-    /// shadow rows a step since wrote. Rows due or in flight are taken back
-    /// first; a failure there is returned before anything is zeroed, and a
-    /// second reset finds nothing in flight. A reset clears what a failed step
-    /// left: the rows' refusal, the host tier's poison, and the pooled rows
-    /// every later step would re-quantize.
-    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.arrive()?;
-        self.rows.finish()?;
-        self.hybrid.reset(gpu.stream())?;
-        self.attn.reset(gpu.stream())?;
-        self.rows_failed = false;
-        let stream = gpu.stream();
-        for layer in &mut self.kv {
-            layer.zero(stream)?;
-        }
-        for lane in &mut self.lanes {
-            for t in &mut lane.hc {
-                t.buf_mut().zero_async(stream)?;
-            }
-            for f in &mut lane.folds {
-                f.zero_async(stream)?;
-            }
-        }
-        for l in self.lists.iter_mut().flatten() {
-            l.zero_async(stream)?;
-        }
-        if let Some(tap) = self.tap.as_mut() {
-            tap.pos = [None; PAIR_ROWS];
-        }
-        self.history.clear();
-        self.holds.known(0);
-        self.shadow_from = 0;
-        self.holes.clear();
-        self.need = None;
-        self.restore = false;
-        Ok(())
-    }
-
-    fn seed_depth(&mut self, _gpu: &Gpu, _rows: usize) -> Result<(), GpuError> {
-        Err(GpuError::State {
-            what: "deepseek41 Body::seed_depth",
-            missing: "a synthetic depth: the rings, compressed rows, index keys and states \
-                      would have to agree with each other",
-        })
-    }
-
-    fn set_probe(&mut self, _probe: StepProbe) -> Result<(), GpuError> {
-        Err(GpuError::State {
-            what: "deepseek41 Body::set_probe",
-            missing: "the node-price probe: V4.1 has none",
-        })
-    }
-
-    /// `attention.layer_norm_rms_epsilon`: every RMS norm's, the head's
-    /// included.
-    fn head_eps(&self) -> f32 {
-        self.eps
-    }
-
-    /// The ring shadows are page-locked host memory, not counted here
-    /// ([`Body::shadow_host`]); a feature tap's device buffer is.
-    fn resident_bytes(&self) -> usize {
-        let caches: usize = self
-            .kv
-            .iter()
-            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
-            .sum();
-        caches
-            + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
-            + self.feature_bytes()
-            + self.batch_bytes()
-    }
-
-    /// The replay's engram rows delivered ([`Body::arrive`]), then the host
-    /// tier's share of the chain it submitted — served even when the rows
-    /// failed, whose error comes back after it.
-    fn serve_replay(&mut self) -> Result<(), GpuError> {
-        let rows = self.arrive();
-        self.hybrid.serve_captured().and(rows)
-    }
-
-    /// The host tier's refusal that failed the step's service, once
-    /// ([`Hybrid::take_step_refusal`]).
-    fn take_host_refusal(&mut self) -> Option<Refusal> {
-        self.hybrid.take_step_refusal()
-    }
-
-    fn decode_pair(
-        &mut self,
-        stream: &CudaStream,
-        tokens: [u32; 2],
-        pos: u32,
-    ) -> Result<(), GpuError> {
-        Body::decode_pair(self, stream, tokens, pos)
-    }
-
-    fn enqueue_pair(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        heads: [&mut Head; 2],
-    ) -> Result<(), GpuError> {
-        Body::enqueue_pair(self, gpu, w, heads)
-    }
-
-    /// [`ChainBody::serve_replay`] of the pair pass: row 1's rows (row 0's
-    /// were delivered before the launch), then the host tier's share.
-    fn serve_replay_pair(&mut self) -> Result<(), GpuError> {
-        let rows = self.arrive();
-        self.hybrid.serve_captured_of(Chain::Pair).and(rows)
-    }
-
-    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        Body::rollback(self, pos)
-    }
-
     /// The body of card `card`: its buffers sized from `meta`'s hparams — the
     /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
     /// slot map from the plan's routed segments on the card, the host tier
@@ -2167,7 +1990,6 @@ impl ChainBody for Body {
     fn load_placed(
         gpu: &Gpu,
         file: Split,
-        _w: &Weights,
         plan: &Plan<'_>,
         card: usize,
         meta: &BodyMeta,
@@ -2295,6 +2117,185 @@ impl ChainBody for Body {
             levers: cfg,
             batch: None,
         })
+    }
+}
+
+impl ChainBody for Body {
+    type Input = StepInput;
+    type Host = Body;
+
+    fn arch() -> Arch {
+        Arch::Deepseek41
+    }
+
+    /// The step at `pos` after the tokens decoded so far: its plan, its
+    /// embedding row read from the file on this thread while the rows'
+    /// helper reads its engram rows ([`StepRows::begin`]), and its image built
+    /// without them — they reach the card after the launch
+    /// ([`RowsArrival`]). Rows still due from before (a pair's first row, or
+    /// a step whose chain never ran) are delivered first. A position other
+    /// than the next one is refused, and so is every step after one whose
+    /// rows failed, until a reset.
+    fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
+        const WHAT: &str = "deepseek41 Body::decode_input";
+        if self.rows_failed {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a reset: an earlier step's engram rows failed after its launch, and \
+                          the card ran that step on stale rows",
+            });
+        }
+        self.arrive()?;
+        self.rows.finish()?;
+        if self.history.len() != pos as usize || self.history.len() >= self.positions() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a step at position {pos} after {} tokens, in caches of {} positions",
+                    self.history.len(),
+                    self.positions()
+                ),
+            });
+        }
+        self.check_defined(WHAT, pos as usize + 1)?;
+        self.planner
+            .plan_into(&[token], pos, &self.history, &mut self.plan)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        self.rows.begin(&self.file, &self.plan)?;
+        // The rows section is written again by the arrival; what it holds
+        // here is never read.
+        self.image
+            .build(&self.plan, self.rows.embd(), self.rows.engram())?;
+        self.history.push(token);
+        Ok(StepInput { pos })
+    }
+
+    /// One host-to-device copy of the whole image into row 0's copy; the
+    /// image must hold the step `input` names.
+    fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
+        self.refresh_row(stream, input, 0)
+    }
+
+    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
+    }
+
+    /// Every ring, compressed row, index key, compressor state, the source
+    /// compressor's pooled rows, and every row's streams, folds and lists are
+    /// zeroed in place — a captured chain keeps their addresses — and the
+    /// token history is emptied. The ring shadows are not: a cut reads only
+    /// shadow rows a step since wrote. Rows due or in flight are taken back
+    /// first; a failure there is returned before anything is zeroed, and a
+    /// second reset finds nothing in flight. A reset clears what a failed step
+    /// left: the rows' refusal, the host tier's poison, and the pooled rows
+    /// every later step would re-quantize.
+    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.arrive()?;
+        self.rows.finish()?;
+        self.hybrid.reset(gpu.stream())?;
+        self.attn.reset(gpu.stream())?;
+        self.rows_failed = false;
+        let stream = gpu.stream();
+        for layer in &mut self.kv {
+            layer.zero(stream)?;
+        }
+        for lane in &mut self.lanes {
+            for t in &mut lane.hc {
+                t.buf_mut().zero_async(stream)?;
+            }
+            for f in &mut lane.folds {
+                f.zero_async(stream)?;
+            }
+        }
+        for l in self.lists.iter_mut().flatten() {
+            l.zero_async(stream)?;
+        }
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos = [None; PAIR_ROWS];
+        }
+        self.history.clear();
+        self.holds.known(0);
+        self.shadow_from = 0;
+        self.holes.clear();
+        self.need = None;
+        self.restore = false;
+        Ok(())
+    }
+
+    /// `attention.layer_norm_rms_epsilon`: every RMS norm's, the head's
+    /// included.
+    fn head_eps(&self) -> f32 {
+        self.eps
+    }
+
+    /// The ring shadows are page-locked host memory, not counted here
+    /// ([`Body::shadow_host`]); a feature tap's device buffer is.
+    fn resident_bytes(&self) -> usize {
+        let caches: usize = self
+            .kv
+            .iter()
+            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
+            .sum();
+        caches
+            + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
+            + self.feature_bytes()
+            + self.batch_bytes()
+    }
+
+    fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    fn host(&mut self) -> Option<&mut Body> {
+        Some(self)
+    }
+}
+
+impl HostServed for Body {
+    /// The replay's engram rows delivered ([`Body::arrive`]) — row 1's for a
+    /// pair, whose row 0's were delivered before the launch — then the host
+    /// tier's share of the chain it submitted, served even when the rows
+    /// failed, whose error comes back after it.
+    fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
+        let rows = self.arrive();
+        self.hybrid.serve_captured_of(chain).and(rows)
+    }
+
+    /// The host tier's refusal that failed the step's service, once
+    /// ([`Hybrid::take_step_refusal`]).
+    fn take_host_refusal(&mut self) -> Option<Refusal> {
+        self.hybrid.take_step_refusal()
+    }
+}
+
+impl Rows for Body {
+    const MAX_ROWS: usize = PAIR_ROWS;
+    const CHAIN: Chain = Chain::Pair;
+
+    /// [`Body::decode_pair`] of the pass's two tokens.
+    fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        let tokens: [u32; PAIR_ROWS] = tokens.try_into().map_err(|_| GpuError::Shape {
+            what: "deepseek41 Body::plan_rows",
+            detail: format!("{} tokens; the pair pass runs {PAIR_ROWS}", tokens.len()),
+        })?;
+        Body::decode_pair(self, stream, tokens, pos)
+    }
+
+    /// [`Body::enqueue_pair`] into the pass's two heads.
+    fn enqueue_rows(&mut self, gpu: &Gpu, w: &Weights, heads: &mut [Head]) -> Result<(), GpuError> {
+        let [a, b] = heads else {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::enqueue_rows",
+                detail: format!("{} heads; the pair pass runs {PAIR_ROWS}", heads.len()),
+            });
+        };
+        Body::enqueue_pair(self, gpu, w, [a, b])
+    }
+}
+
+impl Rollback for Body {
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        Body::rollback(self, pos)
     }
 }
 

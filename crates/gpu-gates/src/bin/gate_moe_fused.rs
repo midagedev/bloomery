@@ -45,7 +45,6 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::arch::deepseek2::Body;
     use bloomery_gpu::hybrid::HOST;
-    use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::moe_fused::MoeFusedKernels;
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::weights::{DevWeight, Weights};

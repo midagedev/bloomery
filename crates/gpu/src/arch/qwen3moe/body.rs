@@ -14,7 +14,7 @@ use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
 use crate::gemm::GemmKernels;
 use crate::head::Head;
-use crate::model::{ChainBody, GpuModel, StepProbe};
+use crate::model::{ChainBody, GpuModel, Instrumented, NoHost, block_count};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
@@ -293,30 +293,77 @@ impl Body {
     }
 }
 
-impl ChainBody for Body {
-    type Input = DecodeInput;
-    type Meta = ();
+/// What [`GpuModel::open`] takes besides the card and the file: the cache's
+/// rows and the two load-time choices a binary reads at its edge
+/// ([`GpuModel::lever_opts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenOpts {
+    /// KV rows the caches hold.
+    pub ctx: usize,
+    /// Tokens per ubatch of the GEMM prefill ([`Ubatch`]); a size outside
+    /// the arena's range is refused at load.
+    pub ubatch: usize,
+    /// The decode flash pass.
+    pub flash: FlashKind,
+}
 
-    fn arch() -> Arch {
-        Arch::Qwen3moe
+/// The decode flash pass a qwen3moe body runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashKind {
+    /// The tensor-core pass.
+    Mma,
+    /// The scalar segment pass, the tensor-core pass's banded twin.
+    Scalar,
+}
+
+impl FlashKind {
+    /// The pass a `BLOOMERY_GQA_MMA` reading names: `true` is the tensor-core
+    /// pass.
+    #[must_use]
+    pub fn from_mma(mma: bool) -> FlashKind {
+        if mma {
+            FlashKind::Mma
+        } else {
+            FlashKind::Scalar
+        }
+    }
+}
+
+impl GpuModel<Body> {
+    /// The whole model of `file` resident on `gpu`, plus the output head:
+    /// every tensor in its kernels' device format, the caches of `opts.ctx`
+    /// rows, the arenas and the step module. The model takes the file and
+    /// closes it once the weights are resident.
+    pub fn open(gpu: Gpu, file: Split, opts: OpenOpts) -> Result<GpuModel<Body>, GpuError> {
+        let n_layers = block_count(&file, "qwen3moe GpuModel::open")?;
+        let mma = opts.flash == FlashKind::Mma;
+        GpuModel::load_blocks(gpu, &file, opts.ctx, 0..n_layers, true, |gpu, w| {
+            Body::load(gpu, &file, w, 0..n_layers, opts.ctx, opts.ubatch, mma)
+        })
     }
 
-    /// Nothing is derived: every weight runs from the file's bytes.
-    fn derive(
-        _stream: &CudaStream,
-        _file: &Split,
-        _layers: Range<usize>,
-        _w: &mut Weights,
-    ) -> Result<(), GpuError> {
-        Ok(())
+    /// `ctx` cache rows, with the ubatch size and the flash pass this
+    /// process's levers name ([`ubatch_size`], [`gqa_mma`]): the options a
+    /// binary's edge passes to [`GpuModel::open`] when it takes the levers as
+    /// they are.
+    pub fn lever_opts(ctx: usize) -> Result<OpenOpts, GpuError> {
+        Ok(OpenOpts {
+            ctx,
+            ubatch: ubatch_size()?,
+            flash: FlashKind::from_mma(gqa_mma()),
+        })
     }
+}
 
+impl Body {
     fn load(
         gpu: &Gpu,
         file: &Split,
         w: &Weights,
         layers: Range<usize>,
         ctx_max: usize,
+        ubatch: usize,
+        mma: bool,
     ) -> Result<Body, GpuError> {
         let what = "qwen3moe::Body::load";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
@@ -362,7 +409,7 @@ impl ChainBody for Body {
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
             prefill: Prefill::new(stream, dims)?,
-            ub: Ubatch::new(stream, dims, ubatch_size()?)?,
+            ub: Ubatch::new(stream, dims, ubatch)?,
             rope: RopeRows::new(stream, &rope, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
@@ -371,9 +418,18 @@ impl ChainBody for Body {
             kv,
             k,
             head_state: HeadArgmaxState::new(stream)?,
-            mma: gqa_mma(),
+            mma,
             taps: None,
         })
+    }
+}
+
+impl ChainBody for Body {
+    type Input = DecodeInput;
+    type Host = NoHost;
+
+    fn arch() -> Arch {
+        Arch::Qwen3moe
     }
 
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput, GpuError> {
@@ -397,6 +453,31 @@ impl ChainBody for Body {
         Ok(())
     }
 
+    fn head_eps(&self) -> f32 {
+        self.hp.rms_eps
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.kv.iter().map(KvPlanes::bytes).sum::<usize>()
+            + self.rope.table.num_bytes()
+            + self.s.bytes()
+            + self.sp.bytes()
+            + self.head_state.bytes()
+            + self.prefill.bytes()
+            + self.ub.bytes()
+            + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
+    }
+
+    fn layers(&self) -> Range<usize> {
+        0..self.names.len()
+    }
+
+    fn host(&mut self) -> Option<&mut NoHost> {
+        None
+    }
+}
+
+impl Instrumented for Body {
     /// Rows `0..rows` of every layer's K and V planes filled with a
     /// deterministic pattern of finite, nonzero f16 values that differ from
     /// row to row — a step shape, not a model state.
@@ -420,33 +501,6 @@ impl ChainBody for Body {
         }
         stream.synchronize()?;
         Ok(())
-    }
-
-    /// The chain carries no probe arms: only the off state is accepted.
-    fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
-        if probe == StepProbe::default() {
-            Ok(())
-        } else {
-            Err(GpuError::state(
-                "qwen3moe::Body::set_probe",
-                "a probe arm — this chain has none",
-            ))
-        }
-    }
-
-    fn head_eps(&self) -> f32 {
-        self.hp.rms_eps
-    }
-
-    fn resident_bytes(&self) -> usize {
-        self.kv.iter().map(KvPlanes::bytes).sum::<usize>()
-            + self.rope.table.num_bytes()
-            + self.s.bytes()
-            + self.sp.bytes()
-            + self.head_state.bytes()
-            + self.prefill.bytes()
-            + self.ub.bytes()
-            + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }
 }
 

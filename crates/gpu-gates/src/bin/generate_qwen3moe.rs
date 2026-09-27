@@ -74,9 +74,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod cli {
-    use bloomery_gpu::Qwen3moeModel;
     use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::{Gpu, Qwen3moeModel};
     use bloomery_gpu_gates::{GateError, open_split, ref_model_path};
     use model::arch::Arch;
     use std::time::Instant;
@@ -149,13 +149,13 @@ mod cli {
         println!("prompt_ids {ids:?}");
         let t = Instant::now();
         let file = open_split(Arch::Qwen3moe, "gen-qwen3moe")?;
-        let mut m = Qwen3moeModel::load_full(file, ctx)?;
+        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
         m.set_mode(mode);
         println!(
             "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
              ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
             m.resident_bytes(),
-            m.stages()[0].layers().len(),
+            m.layers().len(),
             if mode == StepMode::Graph {
                 "graph"
             } else {
@@ -168,12 +168,12 @@ mod cli {
         );
         if mode == StepMode::Graph {
             println!("capture graph_nodes={}", m.capture_step()?);
-            let gpu = m.stages()[0].gpu();
+            let gpu = m.gpu();
             let (free0, _) = gpu.mem_info()?;
             let t = Instant::now();
             let nodes = m.capture_prefill()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            let (free1, _) = m.stages()[0].gpu().mem_info()?;
+            let (free1, _) = m.gpu().mem_info()?;
             let list: Vec<String> = nodes.iter().map(usize::to_string).collect();
             println!(
                 "capture prefill_graphs={} nodes={} ms={ms:.1} vram_bytes={} (runtime values)",
