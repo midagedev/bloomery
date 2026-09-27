@@ -18,7 +18,10 @@
 
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, select_router};
-use models::{Arch, Collapse, DeltaKind, Extra, HcMix, LatentUp, ModelSpec, Need, RopeMode, needs};
+use models::{
+    Arch, Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, LatentUp, ModelSpec, Need,
+    RopeMode, needs,
+};
 
 use crate::placement::{CardFormat, ModelTensors, Role, Unimplemented};
 
@@ -32,6 +35,9 @@ pub enum Program {
     /// The glm5next body (`crates/gpu-glm5next`): every routed expert on the
     /// host tier.
     Glm5nextBody,
+    /// The qwen4exp body (`crates/gpu/src/arch/qwen3moe` `Body38`): every
+    /// routed expert on the host tier.
+    Qwen38Body,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -41,7 +47,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(Program::Deepseek41Chain),
         Arch::Qwen3Moe | Arch::Qwen35Moe => Some(Program::Qwen3moeBody),
         Arch::Glm5Next => Some(Program::Glm5nextBody),
-        Arch::Qwen4Exp => None,
+        Arch::Qwen4Exp => Some(Program::Qwen38Body),
     }
 }
 
@@ -235,6 +241,130 @@ pub const AVAILABLE: &[Available] = &[
         at: "gpu-glm5next/src/program.rs (a mixer program per layer)",
         runs: |n| matches!(n, Need::MixedTrunk),
     },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/arch/qwen3moe/plan38.rs GDN (norm_gate GATE_SIGMOID)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Gdn {
+                        khead_map: KHeadMap::Tiled,
+                        gate: GdnGate::Sigmoid
+                    },
+                    k_heads: 16,
+                    v_heads: 48,
+                    d: 128,
+                    conv: 4,
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "models/src/shape.rs GQA, the `_256_p4` flash (Body38)",
+        runs: |n| matches!(n, Need::Gqa { head, group } if gqa_row(*head, *group).is_some()),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/rope_neox.rs head_norm_neox_append_256 (Body38, 64 of 256 dims)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: 256,
+                    mode: RopeMode::Imrope { .. },
+                    dims: 64
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/q38.rs gqa_out_gate_f32",
+        runs: |n| matches!(n, Need::OutGate),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/qsa.rs (pool, score, top-k; q38.rs qsa_key_append)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::MeanPool {
+                    heads: 4,
+                    d: 128,
+                    pool: 4,
+                    rope: 64
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "models/src/shape.rs ROUTERS, the Qwen35moe body's `_512` instance (Body38)",
+        runs: |n| routes(n, &[RouterBody::Qwen35moe]),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/arch/qwen3moe/program38.rs shared (q38.rs q38_shared_add)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    ff: 640,
+                    sigmoid_gate: true
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/hc_gated.rs (mix and combine; Body38)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::HcGated {
+                    streams: 4,
+                    rank: 320
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/arch/qwen3moe/program38.rs head_mix (the head's mix, no inject)",
+        runs: |n| matches!(n, Need::HcGatedHead { rank: 320 }),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/ple.rs (gate, conv; Body38's host rows)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Ple {
+                    row: 2560,
+                    conv: 4,
+                    dilation: 3
+                }
+            )
+        },
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "engram/src/hash.rs ple_rows_into (the image placeholder refused by name)",
+        runs: |n| matches!(n, Need::ImageToken(_)),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/arch/qwen3moe/scratch38.rs Store38 (the state and the conv ring, one lane)",
+        runs: |n| matches!(n, Need::RecurrentState),
+    },
+    Available {
+        program: Program::Qwen38Body,
+        at: "gpu/src/arch/qwen3moe/program38.rs (a mixer per layer's plan)",
+        runs: |n| matches!(n, Need::MixedTrunk),
+    },
 ];
 
 /// Whether the router `n` names has an instance among `bodies`' rows: the
@@ -347,6 +477,41 @@ const TYPE_PINS: &[TypePin] = &[
         what: "token embedding (the host reads q8_0 rows)",
         reads: &[GgmlType::Q8_0],
     },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::Attention,
+        matrices: true,
+        what: "attention matrices (the body reads q8_0, and bf16 widened to f32)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
+    },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::HyperConnection,
+        matrices: true,
+        what: "hyper-connection down and up (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::SharedExpert,
+        matrices: true,
+        what: "shared expert (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::Head,
+        matrices: true,
+        what: "output head (the head reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Qwen38Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        what: "token embedding (the card reads q8_0 rows)",
+        reads: &[GgmlType::Q8_0],
+    },
 ];
 
 /// Every part of `spec` (with its tensors `model`) that no program runs:
@@ -390,9 +555,11 @@ pub fn check_with(
     for t in &model.tensors {
         let card = match program {
             // The V4.1 chain's rule: a stack of a type no card format loads.
-            // The glm5next body serves every stack on the host, whose load
-            // refuses a type with no host kernel.
-            Some(Program::Deepseek41Chain | Program::Glm5nextBody) => CardFormat::of(t.ty),
+            // The glm5next and qwen4exp bodies serve every stack on the host,
+            // whose load refuses a type with no host kernel.
+            Some(Program::Deepseek41Chain | Program::Glm5nextBody | Program::Qwen38Body) => {
+                CardFormat::of(t.ty)
+            }
             // A whole-card program, or the one still to be written, needs a
             // card expert kernel for the type.
             Some(Program::Qwen3moeBody) | None => CardFormat::of_routed(t.ty),

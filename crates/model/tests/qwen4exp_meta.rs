@@ -7,6 +7,8 @@
 //! `hw_`: needs the four shards on the box (`just gate-qwen4exp-meta`).
 //! Headers only: seconds.
 
+#[path = "common/spec_fail_first.rs"]
+mod spec_fail_first;
 #[path = "common/spec_view.rs"]
 mod spec_view;
 
@@ -77,19 +79,13 @@ const TENSORS: &[&str] = &[
 // pins the whole-tree listing now counts: the q8_0 output head, token embedding and hyper-connection
 // fn (its pins read q8_0), the recurrent-state slot (`gpu-glm5next/src/kda.rs`) and the program that
 // runs delta-rule and attention layers in one trunk (`gpu-glm5next/src/program.rs`).
+// PIN(2026-09-27): twelve items left the list with qwen4exp's own program (`Body38`, q38prog), which
+// the check now holds the file to alone: its rows cover the GDN, the shared expert, the gated
+// hyper-connections and their head, the PLE site, the QK norm and rope, the output gate, the
+// mean-pool indexer, the image placeholder's refusal; its type pins read the q8_0 and bf16
+// attention matrices; the routed q5_K stacks are served on the host (`CardFormat::of`). The two
+// left are the chat surface's, which the program does not use (`Body38`'s `ALLOWED`).
 const COVERAGE: &[&str] = &[
-    "delta rule GDN: d 128, 16 k-heads and 48 v-heads (tiled), conv 4, sigmoid output gate: 0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44-46",
-    "shared expert, ff 640, with a sigmoid gate: 0-47",
-    "gated-residual hyper-connections of 4 streams, rank 320: 0-47",
-    "a PLE site: a gate of 2560-value rows, a conv of 4 taps 3 apart: 1",
-    "per-head QK norm plus rope: head 256, IMROPE [11, 11, 10, 0], 64 of 256 dims: 3,7,11,15,19,23,27,31,35,39,43,47",
-    "attention output gate: sigmoid, interleaved with q: 3,7,11,15,19,23,27,31,35,39,43,47",
-    "mean-pool indexer: 4 heads x 128, pool 4, RMS-normed keys roped (64 dims) at the pool start, heads summed: 3,7,11,15,19,23,27,31,35,39,43,47",
-    "q5_K routed experts on a card: 2",
-    "bf16 attention matrices (the body reads q4_K and q6_K): 3,7,11,15,19,23,27,31,35,39,43,47",
-    "the gated-residual hyper-connection head output_hc_*, rank 320",
-    "a text prompt carrying the image token 248056 refused by name",
-    "a layer program for qwen4exp",
     "pre-tokenizer qwen35",
     "a tool-call parser for this template",
 ];
@@ -136,6 +132,18 @@ fn hw_qwen4exp_spec() {
         &spec_view::items(&list),
         COVERAGE,
     );
+    for (at, want) in [
+        (
+            "gpu/src/ple.rs (gate, conv; Body38's host rows)",
+            "a PLE site: a gate of 2560-value rows, a conv of 4 taps 3 apart: 1",
+        ),
+        (
+            "gpu/src/arch/qwen3moe/program38.rs shared (q38.rs q38_shared_add)",
+            "shared expert, ff 640, with a sigmoid gate: 0-47",
+        ),
+    ] {
+        spec_fail_first::fail_first(&mut o, &mut b, &read.spec, &read.tensors, at, want);
+    }
     let err = model::placement::PlacementError::Unimplemented(list);
     let _ = writeln!(o, "as the engine refuses it: {err}");
     println!("{o}");
