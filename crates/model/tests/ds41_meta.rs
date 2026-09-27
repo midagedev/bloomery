@@ -1094,7 +1094,7 @@ fn hw_ds41_spec() {
         &mut b,
         s,
         &tensors,
-        "gpu-deepseek41/src/router.rs N_EXPERT, N_USED",
+        "models/src/shape.rs ROUTERS, the Ds41 body",
         "router: sqrt-softplus, 384 experts, top 6, with a selection bias: 0-39",
     );
     let dpath = std::env::var("BLOOMERY_DSPARK_MODEL").unwrap_or_else(|_| {
