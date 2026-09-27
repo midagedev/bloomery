@@ -268,8 +268,9 @@ impl Weights {
     /// so nothing is resident twice and the resident bytes are unchanged.
     /// Refused unless every part is resident as a K-quant of the first
     /// part's type and width, and every part but the last ends on a word
-    /// boundary (its rows' bytes a multiple of 4). Load-time only: the copies
-    /// are synchronized before the parts are freed.
+    /// boundary (its rows' bytes a multiple of 4). F32 parts join the same
+    /// way ([`Weights::join_f32_rows`]) when the first part is F32. Load-time
+    /// only: the copies are synchronized before the parts are freed.
     pub fn join_rows(
         &mut self,
         stream: &CudaStream,
@@ -278,6 +279,9 @@ impl Weights {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
         derived_slot_free(&self.by_name, &joint)?;
+        if let Some(DevWeight::F32 { .. }) = parts.first().and_then(|&n| self.by_name.get(n)) {
+            return self.join_f32_rows(stream, parts, joint);
+        }
         let mut shape: Option<(GgmlType, usize, usize)> = None;
         let mut rows = 0usize;
         let mut spans = Vec::with_capacity(parts.len());
@@ -351,6 +355,75 @@ impl Weights {
             self.by_name.remove(*name);
         }
         self.by_name.insert(joint, DevWeight::KQuant { ty, w, k });
+        Ok(())
+    }
+
+    /// [`Weights::join_rows`] over F32 parts: every part resident as an F32
+    /// weight of the first part's width `k`, their rows one after another in
+    /// one `rows × k` tensor filed as the derived F32 weight `joint` (a
+    /// router's expert rows with a shared expert's gate row below them). The
+    /// parts leave the map and their buffers are freed. Refused unless every
+    /// part is F32 of that width.
+    fn join_f32_rows(
+        &mut self,
+        stream: &CudaStream,
+        parts: &[&str],
+        joint: String,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::join_rows";
+        let mut width: Option<usize> = None;
+        let mut rows = 0usize;
+        for &name in parts {
+            let Some(DevWeight::F32 { w, k }) = self.by_name.get(name) else {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{name} is not resident as F32 beside F32 {}", parts[0]),
+                ));
+            };
+            let want = *width.get_or_insert(*k);
+            if *k != want || w.cols() != want {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{name} is F32 K={k}; {} is K={want}", parts[0]),
+                ));
+            }
+            rows += w.rows();
+        }
+        let Some(k) = width else {
+            return Err(GpuError::shape(WHAT, "no parts to join"));
+        };
+        let w = DeviceTensor::<f32>::zeroed(stream, rows, k)?;
+        let base = w.buf().cu_deviceptr();
+        let mut at = 0usize;
+        for &name in parts {
+            let Some(DevWeight::F32 { w: part, .. }) = self.by_name.get(name) else {
+                return Err(GpuError::shape(WHAT, format!("{name} left the map")));
+            };
+            let len = part.rows() * k;
+            let off = u64::try_from(at * size_of::<f32>())
+                .map_err(|_| GpuError::shape(WHAT, format!("value {at} passes u64")))?;
+            // SAFETY: the values `at .. at + len` lie inside the joint's
+            // `rows · k` (the parts' rows sum to `rows`), and the part's
+            // `len` values are its whole buffer; both are `cuMemAlloc`
+            // allocations that outlive the windows, which are released below
+            // and free nothing.
+            let (mut dst, src) = unsafe {
+                (
+                    window::<f32>(base + off, len, stream.context()),
+                    window::<f32>(part.buf().cu_deviceptr(), len, stream.context()),
+                )
+            };
+            let copied = dst.copy_from_device_async(&src, stream);
+            drop(ManuallyDrop::into_inner(dst).into_raw_parts());
+            drop(ManuallyDrop::into_inner(src).into_raw_parts());
+            copied?;
+            at += len;
+        }
+        stream.synchronize()?;
+        for name in parts {
+            self.by_name.remove(*name);
+        }
+        self.by_name.insert(joint, DevWeight::F32 { w, k });
         Ok(())
     }
 

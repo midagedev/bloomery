@@ -530,6 +530,11 @@ gate-gpu-qwen3moe-rope:
 gate-gpu-qwen3moe-router:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_router'
 
+# Qwen3.6-35B-A3B MoE 블록: 257행 게이트 라우터(전문가 256 + 공유 전문가 게이트 행), 조인된 257-전문가 스택, K=512 down `_sel`,
+# 아홉 슬롯 FFN과 ubatch 경로를 호스트 규칙과 ik 밴드에 맞춘다. ARGS는 `--case <이름>[,…]`.
+gate-gpu-qwen35moe-moe *ARGS:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_moe {{ARGS}}'
+
 gate-gpu-qwen3moe-down:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
 
