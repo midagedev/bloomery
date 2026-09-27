@@ -8,6 +8,10 @@
 //!
 //! The kernels' own file-against-constant checks stay behind it as a second
 //! line: a file this check passes cannot trip them.
+//!
+//! An architecture no program runs yet ([`program_of`] is `None`) is listed
+//! against the whole tree: a need any program's row covers, and a tensor type
+//! any program's pin reads, is not an item; the program itself is one.
 
 use gguf::GgmlType;
 use models::{Arch, Extra, LatentUp, ModelSpec, Need, RopeMode, Score, needs};
@@ -164,7 +168,9 @@ struct TypePin {
 
 /// The per-tensor type pins of the programs (the qwen3moe body's `kq_site`
 /// calls in `Body::load`, the head's Q6_K gemv in `gpu/src/head.rs`, the
-/// card embedding's `embed_rows_q4k`).
+/// card embedding's `embed_rows_q4k`; the V4.1 chain's attention gemvs, whose
+/// head-split sites in `chain/attn.rs` take q3_K or q8_0, the same head, and
+/// the hyper-connection fn `hc.rs` reads as q3_K words, `hc_f32.rs` as f32).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
         program: Program::Qwen3moeBody,
@@ -186,6 +192,27 @@ const TYPE_PINS: &[TypePin] = &[
         matrices: true,
         what: "token embedding (the card reads q4_K rows)",
         reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Deepseek41Chain,
+        role: Role::Attention,
+        matrices: true,
+        what: "attention matrices (the chain reads q3_K and q8_0)",
+        reads: &[GgmlType::Q3_K, GgmlType::Q8_0],
+    },
+    TypePin {
+        program: Program::Deepseek41Chain,
+        role: Role::Head,
+        matrices: true,
+        what: "output head (the head reads q6_K)",
+        reads: &[GgmlType::Q6_K],
+    },
+    TypePin {
+        program: Program::Deepseek41Chain,
+        role: Role::HyperConnection,
+        matrices: true,
+        what: "hyper-connection fn (the chain reads q3_K and f32)",
+        reads: &[GgmlType::Q3_K],
     },
 ];
 
@@ -215,8 +242,11 @@ pub fn check_with(
             out.push(f);
         }
     };
+    // With no program, the row of any program covers a need.
     let runs = |need: &Need| {
-        program.is_some_and(|p| available.iter().any(|a| a.program == p && (a.runs)(need)))
+        available
+            .iter()
+            .any(|a| program.is_none_or(|p| a.program == p) && (a.runs)(need))
     };
     let (layered, wide): (Vec<_>, Vec<_>) = needs(spec).into_iter().partition(|(_, l)| l.is_some());
     for (need, l) in layered {
@@ -227,27 +257,43 @@ pub fn check_with(
     for t in &model.tensors {
         let card = match program {
             // The V4.1 chain's rule: a stack of a type no card format loads.
-            Some(Program::Deepseek41Chain) | None => CardFormat::of(t.ty),
-            // A whole-card program needs a card expert kernel for the type.
-            Some(Program::Qwen3moeBody) => CardFormat::of_routed(t.ty),
+            Some(Program::Deepseek41Chain) => CardFormat::of(t.ty),
+            // A whole-card program, or the one still to be written, needs a
+            // card expert kernel for the type.
+            Some(Program::Qwen3moeBody) | None => CardFormat::of_routed(t.ty),
         };
         if t.role == Role::RoutedExperts && card.is_none() {
             at(t.layer, Need::RoutedFormat(t.ty));
         }
-        for pin in TYPE_PINS {
-            if Some(pin.program) == program
-                && pin.role == t.role
-                && (!pin.matrices || (t.dims.len() >= 2 && t.ty != GgmlType::F32))
-                && !pin.reads.contains(&t.ty)
-            {
-                at(
-                    t.layer,
-                    Need::WeightFormat {
-                        what: pin.what,
-                        ty: t.ty,
-                    },
-                );
+        let matrix = t.dims.len() >= 2 && t.ty != GgmlType::F32;
+        let pins: Vec<&TypePin> = TYPE_PINS
+            .iter()
+            .filter(|pin| {
+                program.is_none_or(|p| pin.program == p)
+                    && pin.role == t.role
+                    && (!pin.matrices || matrix)
+            })
+            .collect();
+        let refused: Vec<&TypePin> = match program {
+            Some(_) => pins
+                .into_iter()
+                .filter(|pin| !pin.reads.contains(&t.ty))
+                .collect(),
+            // No program: an item only when no program's pin reads the type,
+            // named by the first pin.
+            None if pins.iter().all(|pin| !pin.reads.contains(&t.ty)) => {
+                pins.into_iter().take(1).collect()
             }
+            None => Vec::new(),
+        };
+        for pin in refused {
+            at(
+                t.layer,
+                Need::WeightFormat {
+                    what: pin.what,
+                    ty: t.ty,
+                },
+            );
         }
     }
     for (need, _) in wide {

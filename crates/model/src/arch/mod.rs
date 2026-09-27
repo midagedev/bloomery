@@ -14,6 +14,7 @@ pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
 pub mod dspark;
+pub mod glm5next;
 pub mod qwen35moe;
 pub mod qwen3moe;
 
@@ -30,6 +31,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
         Some("qwen35moe") => qwen35moe::spec::read(split)?,
+        Some("glm5next") => glm5next::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
                 other.unwrap_or("<missing>").to_string(),
@@ -254,6 +256,10 @@ pub(crate) mod synthetic {
         F32(f32),
         Str(&'static str),
         Bool(bool),
+        /// An array of I32, the type a converter writes a per-layer count in.
+        I32s(Vec<i32>),
+        /// An array of F32.
+        F32s(Vec<f32>),
     }
 
     fn string(b: &mut Vec<u8>, x: &str) {
@@ -298,6 +304,20 @@ pub(crate) mod synthetic {
                     b.extend_from_slice(&7u32.to_le_bytes());
                     b.push(u8::from(*x));
                 }
+                V::I32s(xs) => {
+                    b.extend_from_slice(&9u32.to_le_bytes());
+                    b.extend_from_slice(&5u32.to_le_bytes());
+                    b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
+                    xs.iter()
+                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                }
+                V::F32s(xs) => {
+                    b.extend_from_slice(&9u32.to_le_bytes());
+                    b.extend_from_slice(&6u32.to_le_bytes());
+                    b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
+                    xs.iter()
+                        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+                }
             }
         }
         for (i, name) in tensors.iter().enumerate() {
@@ -331,17 +351,28 @@ mod tests {
         assert_eq!(Arch::from_name(super::DEEPSEEK4).unwrap(), Arch::Deepseek41);
     }
 
-    /// An architecture no reader reads — GLM-5.3-Flash's `glm5next` — is
-    /// refused by its name before any key is read.
+    /// An architecture no reader reads is refused by its name before any key
+    /// is read.
     #[test]
-    fn a_glm5next_header_has_no_reader() {
+    fn an_unknown_architecture_has_no_reader() {
+        let path = super::synthetic::header("unknown-spec", "glm6", &[], &[]);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = super::spec(&split).expect_err("no glm6 reader").to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("\"glm6\""), "{err}");
+    }
+
+    /// A `glm5next` header goes to its reader, which refuses a file without
+    /// keys by the first key it reads.
+    #[test]
+    fn a_glm5next_header_goes_to_its_reader() {
         let path = super::synthetic::header("glm5next-spec", "glm5next", &[], &[]);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let err = super::spec(&split)
-            .expect_err("no glm5next reader")
+            .expect_err("a header without keys")
             .to_string();
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("\"glm5next\""), "{err}");
+        assert!(err.contains("glm5next.block_count"), "{err}");
     }
 
     #[test]
