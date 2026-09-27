@@ -77,6 +77,7 @@ generate_ds41   ds41_shexp_gate_up_q3k_mcol             0          0
 generate_ds41   ds41_tap_means                          0          0
 generate_ds41   embed_rows                              0          0
 generate_ds41   embed_rows_q4k                          0          0
+generate_ds41   embed_rows_q8_0                         0          0
 generate_ds41   expert_gate_up_swiglu_q3k               0          0
 generate_ds41   expert_table                            0          0
 generate_ds41   f32_gemv                                0          0
@@ -113,6 +114,7 @@ generate_ds41   gqa_flash_seg_mma                       0          0
 generate_ds41   gqa_flash_seg_mma_256                       0          0
 generate_ds41   gqa_flash_seg_mma_256_p4                0          0
 generate_ds41   gqa_flash_seg_mma_256_p4_sel            0          0
+generate_ds41   gqa_out_gate_f32                        0          0
 generate_ds41   gqa_prefill_flash                       0          0
 generate_ds41   gqa_prefill_flash_256                       0          0
 generate_ds41   gqa_prefill_flash_256_p4                0          0
@@ -143,6 +145,7 @@ generate_ds41   norm_quant                              0          0
 generate_ds41   ple_conv                                0          0
 generate_ds41   ple_gate                                0          0
 generate_ds41   q2_k_rows                               0          0
+generate_ds41   q38_shared_add                          0          0
 generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
 generate_ds41   q3k_gemv_heads_pair                     0          0
@@ -169,6 +172,7 @@ generate_ds41   q8_0_gemv_sel                           0          0
 generate_ds41   q8_1_quantize_ord                       0          0
 generate_ds41   q8_1_quantize_gated                         0          0
 generate_ds41   q8_1_quantize_sel                       0          0
+generate_ds41   qsa_key_append                          0          0
 generate_ds41   qsa_pool                                0          0
 generate_ds41   qsa_score                               0          0
 generate_ds41   qsa_topk                                0          0
@@ -207,6 +211,7 @@ gate_e2e        ds41_ffn_handoff_10                     0          0
 gate_e2e        ds41_ffn_handoff_8                      0          0
 gate_e2e        embed_rows                              0          0
 gate_e2e        embed_rows_q4k                          0          0
+gate_e2e        embed_rows_q8_0                         0          0
 gate_e2e        expert_gate_up_swiglu_q3k               0          0
 gate_e2e        expert_table                            0          0
 gate_e2e        f32_gemv                                0          0
@@ -240,6 +245,7 @@ gate_e2e        gqa_flash_seg_mma                       0          0
 gate_e2e        gqa_flash_seg_mma_256                       0          0
 gate_e2e        gqa_flash_seg_mma_256_p4                0          0
 gate_e2e        gqa_flash_seg_mma_256_p4_sel            0          0
+gate_e2e        gqa_out_gate_f32                        0          0
 gate_e2e        gqa_prefill_flash                       0          0
 gate_e2e        gqa_prefill_flash_256                       0          0
 gate_e2e        gqa_prefill_flash_256_p4                0          0
@@ -269,6 +275,7 @@ gate_e2e        norm_quant                              0          0
 gate_e2e        ple_conv                                0          0
 gate_e2e        ple_gate                                0          0
 gate_e2e        q2_k_rows                               0          0
+gate_e2e        q38_shared_add                          0          0
 gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0
 gate_e2e        q3k_gemv_heads_pair                     0          0
@@ -295,6 +302,7 @@ gate_e2e        q8_0_gemv_sel                           0          0
 gate_e2e        q8_1_quantize_ord                       0          0
 gate_e2e        q8_1_quantize_gated                         0          0
 gate_e2e        q8_1_quantize_sel                       0          0
+gate_e2e        qsa_key_append                          0          0
 gate_e2e        qsa_pool                                0          0
 gate_e2e        qsa_score                               0          0
 gate_e2e        qsa_topk                                0          0
