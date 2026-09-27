@@ -88,6 +88,7 @@ generate_ds41   embed_rows_q8_0                         0          0
 generate_ds41   expert_gate_up_swiglu_q3k               0          0
 generate_ds41   expert_table                            0          0
 generate_ds41   f32_gemv                                0          0
+generate_ds41   f32_tile_gemm                           0          0
 generate_ds41   flash_latent                            0          0
 generate_ds41   flash_latent_mma                        0          0
 generate_ds41   flash_latent_q8                         0          0
@@ -108,9 +109,13 @@ generate_ds41   glm5next_router_pick                    0          0
 generate_ds41   glm5next_router_scores                  0          0
 generate_ds41   gemm_q3k                                0          0
 generate_ds41   gemm_q4k                                0          0
+generate_ds41   gemm_q5_1                               0          0
 generate_ds41   gemm_q5k                                0          0
 generate_ds41   gemm_q6k                                0          0
+generate_ds41   gemm_q8_0f                              0          0
+generate_ds41   gemm_q8_0p                              0          0
 generate_ds41   gemm_route                              0          0
+generate_ds41   gemm_route_remap                        0          0
 generate_ds41   gemm_swiglu_quant                       0          0
 generate_ds41   gqa_flash_merge                         0          0
 generate_ds41   gqa_flash_merge_256                         0          0
@@ -185,6 +190,7 @@ generate_ds41   qsa_key_append                          0          0
 generate_ds41   qsa_pool                                0          0
 generate_ds41   qsa_score                               0          0
 generate_ds41   qsa_topk                                0          0
+generate_ds41   quantize_gemm32                         0          0
 generate_ds41   qwen3moe_combine                        0          0
 generate_ds41   qwen3moe_gate_up_swiglu_q4k             0          0
 generate_ds41   qwen3moe_head_q6k_argmax                0          0
@@ -206,6 +212,7 @@ generate_ds41   rms_norm                                0          0
 generate_ds41   rope                                    0          0
 generate_ds41   router_topk                             0          0
 generate_ds41   swiglu                                  0          0
+generate_ds41   swiglu_quant32                          0          0
 generate_ds41   touch                                   0          0
 generate_ds41   weighted_sum                            0          0
 
@@ -231,6 +238,7 @@ gate_e2e        embed_rows_q8_0                         0          0
 gate_e2e        expert_gate_up_swiglu_q3k               0          0
 gate_e2e        expert_table                            0          0
 gate_e2e        f32_gemv                                0          0
+gate_e2e        f32_tile_gemm                           0          0
 gate_e2e        flash_latent                            0          0
 gate_e2e        flash_latent_mma                        0          0
 gate_e2e        flash_latent_q8                         0          0
@@ -248,9 +256,13 @@ gate_e2e        gdn_norm_gate                           0          0
 gate_e2e        gdn_norm_gate_sigmoid                   0          0
 gate_e2e        gemm_q3k                                0          0
 gate_e2e        gemm_q4k                                0          0
+gate_e2e        gemm_q5_1                               0          0
 gate_e2e        gemm_q5k                                0          0
 gate_e2e        gemm_q6k                                0          0
+gate_e2e        gemm_q8_0f                              0          0
+gate_e2e        gemm_q8_0p                              0          0
 gate_e2e        gemm_route                              0          0
+gate_e2e        gemm_route_remap                        0          0
 gate_e2e        gemm_swiglu_quant                       0          0
 gate_e2e        gqa_flash_merge                         0          0
 gate_e2e        gqa_flash_merge_256                         0          0
@@ -324,6 +336,7 @@ gate_e2e        qsa_key_append                          0          0
 gate_e2e        qsa_pool                                0          0
 gate_e2e        qsa_score                               0          0
 gate_e2e        qsa_topk                                0          0
+gate_e2e        quantize_gemm32                         0          0
 gate_e2e        qwen3moe_combine                        0          0
 gate_e2e        qwen3moe_gate_up_swiglu_q4k             0          0
 gate_e2e        qwen3moe_head_q6k_argmax                0          0
@@ -345,5 +358,6 @@ gate_e2e        rms_norm                                0          0
 gate_e2e        rope                                    0          0
 gate_e2e        router_topk                             0          0
 gate_e2e        swiglu                                  0          0
+gate_e2e        swiglu_quant32                          0          0
 gate_e2e        touch                                   0          0
 gate_e2e        weighted_sum                            0          0

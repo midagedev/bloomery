@@ -31,6 +31,15 @@
 //! every entry is declared in — one `#[cuda_module]`, so one bundle load for
 //! the whole family.
 //!
+//! The 32-value family is the same shape for the weights whose scales come
+//! per 32 values (Q8_0, Q5_1), over [`GemmAct32`] activations (one scale and
+//! one code sum per 32 values, K any multiple of 32), in a device module of
+//! its own ([`Gemm32Kernels`], `kernels32.rs`): `gemm32.rs` the GEMM and its
+//! numeric contract, `act32.rs` the activations and their two quantizers,
+//! `remap.rs` the route table over ids mapped to a card stack's slots or to
+//! the host, and `f32tile.rs` the wide F32 product. Its GEMMs read the same
+//! [`GemmRoute`] as the K-quant ones.
+//!
 //! [`Gpu::enqueue_quantize_gemm`]: crate::Gpu::enqueue_quantize_gemm
 
 mod act;
@@ -43,9 +52,21 @@ mod swiglu;
 // after that module's declaration.
 mod kernels;
 
+mod act32;
+mod f32tile;
+#[macro_use]
+mod gemm32;
+mod remap;
+
+// After `gemm32`, for the same reason.
+mod kernels32;
+
 pub use act::GemmAct;
+pub use act32::GemmAct32;
+pub use gemm32::{Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
+pub use kernels32::Gemm32Kernels;
 pub use route::{GemmRoute, GemmTile};
 
 /// Slots one route and one GEMM take: a 4096-token ubatch at nine slots a
@@ -53,3 +74,6 @@ pub use route::{GemmRoute, GemmTile};
 pub const GEMM_MAX_SLOTS: usize = 36_864;
 /// Columns (slots) one tile holds: eight n-tiles of eight.
 pub const GEMM_BN: usize = 64;
+/// Values one step of the 32-value family's K walk covers: two blocks. A
+/// [`GemmAct32`] column is padded to whole steps.
+pub const GEMM32_STEP: usize = 64;
