@@ -167,10 +167,10 @@ pub fn spec_of(
 mod tests {
     use models::Ffn;
 
-    use super::super::hparams::tests::{keys, tensors};
+    use super::super::hparams::tests::{keys, shaped, tensors};
     use super::super::roles::SELECTION_BIAS;
     use crate::arch::coverage;
-    use crate::arch::synthetic::{V, header_with};
+    use crate::arch::synthetic::{V, header_shaped};
 
     /// The small header of the `hparams` tests, with `tokenizer.ggml.pre`
     /// `glm4` and a chat template, and the tensors `keep` keeps; its read
@@ -181,7 +181,7 @@ mod tests {
             ("tokenizer.ggml.pre", V::Str("glm4")),
             ("tokenizer.chat_template", V::Str("{{ messages }}")),
         ];
-        let path = header_with(tag, "glm5next", &keys(), &global, &tensors);
+        let path = header_shaped(tag, "glm5next", &keys(), &global, &shaped(&tensors));
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let read = super::read(&split).map_err(|e| e.to_string());
         let _ = std::fs::remove_file(&path);

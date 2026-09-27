@@ -44,7 +44,7 @@ use bloomery_gpu::hybrid::{
 };
 use bloomery_gpu::latent::{INDEX_ROW, LATENT, LatentKernels};
 use bloomery_gpu::linear::{HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
-use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels};
+use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels, StepMode};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
@@ -60,13 +60,14 @@ use model::arch::Arch;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{self, PlanInputs};
 use model::placement::Plan;
-use models::{Act, Ffn, LayerSpec, Mixer};
+use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 
 use crate::ffn::CardExperts;
 use crate::host::GlmHost;
 use crate::program;
+use crate::tensors::LayerNames;
 
 /// What the body's errors name.
 const WHAT: &str = "glm5next Body";
@@ -256,13 +257,9 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
-    fn new(
-        stream: &CudaStream,
-        d: &Dims,
-        ff: usize,
-        ranks: [usize; 2],
-        ctx: usize,
-    ) -> Result<Scratch, GpuError> {
+    /// The step's buffers; the low-rank halves are `kda.head_dim` wide, as
+    /// the header reader holds every KDA tensor to ik's exact dims.
+    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<Scratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (n, c, v) = (d.embd, d.kda.channels(), d.kda.n_v * HEAD);
         let rows = d.heads;
@@ -278,8 +275,8 @@ impl Scratch {
             hc_scratch: HcPreScratch::with_groups(stream, HC_STREAMS * n, 1)?,
             qkv: z(c)?,
             conv: z(c)?,
-            fa: z(ranks[0])?,
-            ga: z(ranks[1])?,
+            fa: z(HEAD)?,
+            ga: z(HEAD)?,
             beta_raw: z(d.kda.n_v)?,
             beta: z(d.kda.n_v)?,
             f: z(v)?,
@@ -340,9 +337,13 @@ impl Scratch {
             &self.h,
             &self.sh_y,
             &self.no_bias,
+            &self.rout.logits,
+            &self.rout.probs,
+            &self.rout.weights,
         ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.hc_scratch.device_bytes()
+            + self.rout.ids.num_bytes()
             + self.sel.num_bytes()
             + self.pos.num_bytes()
             + self.vis.num_bytes()
@@ -432,6 +433,8 @@ pub struct Body {
     hybrid: Hybrid<GlmHost>,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
+    /// Each layer's tensor names, made at load.
+    names: Vec<LayerNames>,
     dims: Dims,
     k: Kernels,
     s: Scratch,
@@ -443,8 +446,13 @@ pub struct Body {
     embd: Embedding,
     /// Each layer's streams after it, when a gate armed them.
     taps: Option<Vec<DeviceBuffer<f32>>>,
-    /// Positions fed since the load or the last reset.
-    fed: u32,
+    /// Positions the stores hold: a step's position counts once its inputs
+    /// are on the card, before its chain is enqueued or replayed. The next
+    /// position is the model's (`GpuModel::pos`); the two differ only after
+    /// a step failed past that point, and the next step is then refused.
+    held: u32,
+    /// A failure a gate planted for the next step ([`Body::plant`]).
+    plant: Option<Plant>,
     /// Positions every store holds.
     ctx: usize,
     /// The KDA layers' stores on the host at chosen positions.
@@ -466,6 +474,7 @@ pub(crate) struct Parts<'s> {
     pub k: &'s Kernels,
     pub d: &'s Dims,
     pub cfg: &'s [LayerCfg],
+    pub names: &'s [LayerNames],
     pub s: &'s mut Scratch,
     pub stores: &'s mut [Store],
     pub slots: &'s DeviceTensor<u32>,
@@ -676,11 +685,15 @@ impl Body {
             .enumerate()
             .map(|(l, s)| layer_cfg(l, s, &map))
             .collect::<Result<Vec<_>, _>>()?;
+        let names = cfg
+            .iter()
+            .enumerate()
+            .map(|(l, c)| LayerNames::of(l, c.kind))
+            .collect::<Result<Vec<_>, _>>()?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let ff = cfg.iter().map(|c| c.ff).max().unwrap_or(0);
-        let ranks = low_ranks(w, &cfg)?;
-        let s = Scratch::new(stream, &dims, ff, ranks, ctx)?;
+        let s = Scratch::new(stream, &dims, ff, ctx)?;
         let stores = cfg
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx))
@@ -720,6 +733,7 @@ impl Body {
             hybrid,
             layers,
             cfg,
+            names,
             dims,
             k: Kernels::load(gpu)?,
             s,
@@ -728,7 +742,8 @@ impl Body {
             card: experts_on_card,
             embd,
             taps: None,
-            fed: 0,
+            held: 0,
+            plant: None,
             ctx,
             ckpt,
         };
@@ -775,10 +790,10 @@ impl Body {
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the chain copies
-    /// its streams into the layer's tap, which [`Body::taps`] reads back. For
-    /// an eager chain: a capture taken while they are armed records the
-    /// copies.
-    pub fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+    /// its streams into the layer's tap, which [`Body::taps`] reads back.
+    /// Only through [`set_taps`], which drops the captured chains first: a
+    /// capture holds the tap copies it was taken with.
+    pub(crate) fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
         self.taps = if on {
             let n = HC_STREAMS * self.dims.embd;
             Some(
@@ -815,6 +830,7 @@ impl Body {
                 k: &self.k,
                 d: &self.dims,
                 cfg: &self.cfg,
+                names: &self.names,
                 s: &mut self.s,
                 stores: &mut self.stores,
                 slots: &self.slots,
@@ -825,18 +841,24 @@ impl Body {
         )
     }
 
-    /// The longest prefix of at most `n` positions a cut keeps: every fed
-    /// position, the empty model, or the nearest checkpoint at or below `n`
-    /// ([`Body::kept`] says which).
+    /// The longest prefix of at most `n` positions a cut of a model standing
+    /// at `pos` keeps: every position, the empty model, or the nearest
+    /// checkpoint at or below `n` ([`Body::kept`] says which).
     #[must_use]
-    pub fn keep_point(&self, n: u32) -> u32 {
-        self.kept(n).at
+    pub fn keep_point(&self, n: u32, pos: u32) -> u32 {
+        self.kept(n, pos).at
     }
 
-    /// What a cut to at most `n` positions keeps, and why.
+    /// What a cut to at most `n` positions of a model standing at `pos`
+    /// keeps, and why: never past `pos`, and after a step that failed past
+    /// its launch not `pos` either, since the stores hold one more.
     #[must_use]
-    pub fn kept(&self, n: u32) -> Kept {
-        self.ckpt.kept(n, self.fed)
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        if self.held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), self.held)
+        }
     }
 
     /// The checkpoints: their positions, their slots, what they have done.
@@ -845,14 +867,72 @@ impl Body {
         &self.ckpt
     }
 
-    /// A checkpoint at the fed position, after any waiting cut: the KDA
-    /// layers' stores copied to a host slot, or nothing where one stands.
-    /// Waits for the copies.
-    pub fn checkpoint(&mut self, gpu: &Gpu) -> Result<Take, GpuError> {
-        let fed = self.fed;
+    /// A checkpoint at `pos`, the model's position, after any waiting cut:
+    /// the KDA layers' stores copied to a host slot, or nothing where one
+    /// stands. Refused by name when the stores hold other positions (a step
+    /// failed past its launch). Waits for the copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        self.stores_at(pos)?;
         self.ckpt
-            .take(gpu.stream(), fed, &mut copied(&mut self.stores))
+            .take(gpu.stream(), pos, &mut copied(&mut self.stores))
     }
+
+    /// Refused by name unless the stores hold `pos` positions: a step at
+    /// `pos` that failed after its inputs were on the card has already run
+    /// the KDA layers' recurrence over it, and running it again would apply
+    /// the position twice.
+    fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
+        match self.held {
+            h if h == pos => Ok(()),
+            h if h == pos.wrapping_add(1) => Err(shape(format!(
+                "position {pos}: the step there failed after its chain was launched, so the \
+                 recurrent stores hold it already; cut to a checkpoint (Body::kept) or reset"
+            ))),
+            h => Err(shape(format!(
+                "position {pos}, where the stores hold {h} positions"
+            ))),
+        }
+    }
+
+    /// Plant `plant` for the next step: a gate's way to fail a step on
+    /// either side of its launch without a fault ([`Plant`]).
+    pub fn plant(&mut self, plant: Plant) {
+        self.plant = Some(plant);
+    }
+
+    /// The planted failure at `at`, taken, as the step's error.
+    fn planted(&mut self, at: Plant) -> Result<(), GpuError> {
+        if self.plant == Some(at) {
+            self.plant = None;
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: match at {
+                    Plant::BeforeLaunch => "the planted failure before the launch",
+                    Plant::AfterLaunch => "the planted failure after the launch",
+                },
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Where a gate plants a step's failure ([`Body::plant`]): in its refresh,
+/// before any input reaches the card, or once its chain has run and its
+/// host legs been served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plant {
+    BeforeLaunch,
+    AfterLaunch,
+}
+
+/// Arm (or disarm) `m`'s per-layer taps ([`Body::taps`] reads them back),
+/// the model first set to eager steps: a captured chain holds the tap
+/// copies it was taken with, so arming under one would leave the taps
+/// unwritten and disarming would free buffers its replays write.
+pub fn set_taps(m: &mut Glm5nextModel, on: bool) -> Result<(), GpuError> {
+    m.set_mode(StepMode::Eager);
+    let (gpu, _, body) = m.body_parts("glm5next set_taps")?;
+    body.set_taps(gpu, on)
 }
 
 /// Feed `ids` from where `m` stands, one step a position, and take the
@@ -880,8 +960,9 @@ pub fn prompt(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
             argmax = Some(m.step(seg)?);
             at = mark;
         }
+        let pos = m.pos();
         let (gpu, _, body) = m.body_parts(WHAT)?;
-        body.checkpoint(gpu)?;
+        body.checkpoint(gpu, pos)?;
     }
     argmax.ok_or(GpuError::State {
         what: WHAT,
@@ -965,6 +1046,14 @@ fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuErro
     let (limit, ff, bias) = match &s.ffn {
         Ffn::Dense { ff, act } => (limit_of(*act), *ff as usize, false),
         Ffn::Moe(m) => {
+            let r = &m.router;
+            if r.score != Score::Sigmoid || !r.norm || r.hash {
+                return Err(shape(format!(
+                    "layer {l}: a router scoring by {:?}, renormalizing {}, hashed {}; the \
+                     routed block runs the sigmoid router that renormalizes its picks, unhashed",
+                    r.score, r.norm, r.hash
+                )));
+            }
             let sh = m.shared.ok_or_else(|| {
                 shape(format!(
                     "layer {l}: a routed block without its shared expert"
@@ -986,20 +1075,6 @@ fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuErro
         bias,
         row_off,
     })
-}
-
-/// The low-rank projections' widths, `[ssm_f_a, ssm_g_a]` rows, the widest
-/// over the KDA layers' resident weights (each layer's gemv checks its own
-/// against the buffers at enqueue); 0 with no KDA layer.
-fn low_ranks(w: &Weights, cfg: &[LayerCfg]) -> Result<[usize; 2], GpuError> {
-    let mut ranks = [0usize; 2];
-    for (l, c) in cfg.iter().enumerate() {
-        if c.kind.mixer == MixerKind::DeltaRule {
-            ranks[0] = ranks[0].max(q8(w, &names::ssm_f_a(l))?.1.rows());
-            ranks[1] = ranks[1].max(q8(w, &names::ssm_g_a(l))?.1.rows());
-        }
-    }
-    Ok(ranks)
 }
 
 /// Layer `kind`'s store at `ctx` positions: a KDA layer's one-lane state and
@@ -1027,22 +1102,25 @@ impl ChainBody for Body {
     }
 
     /// The step at `pos`: its embedding row read from the file. A position
-    /// other than the next one, or past the stores, is refused by name.
+    /// past the stores, or one the stores do not stand at, is refused by
+    /// name ([`Body::stores_at`]).
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        if pos != self.fed || pos as usize >= self.ctx {
+        if pos as usize >= self.ctx {
             return Err(shape(format!(
-                "a step at position {pos} after {} positions, in stores of {}",
-                self.fed, self.ctx
+                "a step at position {pos} in stores of {}",
+                self.ctx
             )));
         }
+        self.stores_at(pos)?;
         self.embd.fill(token)?;
-        self.fed += 1;
         Ok(StepInput { pos })
     }
 
     /// The four stream copies of the row into the first stream buffer, the
-    /// position and the visible counts: three host-to-device copies.
+    /// position and the visible counts: three host-to-device copies. Once
+    /// they are sent the stores count the position: what follows launches.
     fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
+        self.planted(Plant::BeforeLaunch)?;
         if self.ckpt.pending() {
             self.ckpt.apply(stream, &mut copied(&mut self.stores))?;
         }
@@ -1050,12 +1128,14 @@ impl ChainBody for Body {
         self.s.streams[0].copy_from_host(stream, &self.embd.streams)?;
         self.s.pos.copy_from_host(stream, &[p])?;
         self.s.vis.copy_from_host(stream, &[0, p + 1])?;
+        self.held = p + 1;
         Ok(())
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
         let (parts, hybrid) = self.parts();
-        program::walk_step(gpu, w, parts, hybrid, head)
+        program::walk_step(gpu, w, parts, hybrid, head)?;
+        self.planted(Plant::AfterLaunch)
     }
 
     /// Every store and both stream buffers zeroed in place — a captured chain
@@ -1070,7 +1150,8 @@ impl ChainBody for Body {
         for s in &mut self.s.streams {
             s.zero_async(stream)?;
         }
-        self.fed = 0;
+        self.held = 0;
+        self.plant = None;
         self.ckpt.clear();
         Ok(())
     }
@@ -1084,6 +1165,7 @@ impl ChainBody for Body {
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
             + self.s.bytes()
+            + self.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
             + self.card.bytes()
             + self
@@ -1106,15 +1188,16 @@ impl Rollback for Body {
     /// else the checkpoint at `pos`, copied back at the next step. Any other
     /// position is refused by name ([`Body::kept`] says what a cut keeps).
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        self.ckpt.cut(pos, self.fed)?;
-        self.fed = pos;
+        self.ckpt.cut(pos, self.held)?;
+        self.held = pos;
         Ok(())
     }
 }
 
 impl HostServed for Body {
     fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)
+        self.hybrid.serve_captured_of(chain)?;
+        self.planted(Plant::AfterLaunch)
     }
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
