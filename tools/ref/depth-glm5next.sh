@@ -12,14 +12,18 @@
 # `tok/s @ n=N, depth D, <card>`, and the prefill `tok/s(pp) @ n=0, prompt P, <card>`.
 #
 # Arms:
-#   <D>       ours: generate_glm5next --tokens <the first D ids of GLM_PROSE> -n N --ctx C --place
+#   <D>       ours: generate_glm5next --tokens <D ids of GLM_PROSE from GLM_PROSE_FROM> -n N --ctx C --place
 #             PLACE --time. The prompt is fed one decode step a position (the program has no batched
 #             prefill), so the row's pp_tok/s is the step feed's rate, `kind=steps`: D over the wall
 #             from the first fed step to the readback of generated token 0. The N - 1 steps after
 #             token 0 are timed. C is one context for every ours arm (BLOOMERY_GEN_CTX, default
 #             2048): the plan refuses more positions than the latent layers attend whole (2,051), so
 #             D + N <= C is checked before the lease. The prompt is prose under this model's own
-#             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease).
+#             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease): the D
+#             ids from 0-based index GLM_PROSE_FROM, past the GLM_HOT_TRACE ids the hot list was traced
+#             from (docs/fair-measure.md 4.2: the list is held out from the measured prompt). Each ours,
+#             hot and server row prints `prompt ids <a>..<b>`; a hot row whose ids overlap the trace
+#             ends in ` [in-trace]`, the favourable case, which the contract publishes only as such.
 #   hot:<D>   ours with BLOOMERY_HOT_LIST=$BLOOMERY_DATA/$GLM_HOT (the profile's list; a plain <D>
 #             arm runs with BLOOMERY_HOT_LIST unset): the card experts ranked by the hot list. The row carries the plan's card_experts; a
 #             hot row whose plan put no expert on the card is a FAIL row (a binary whose placement
@@ -53,8 +57,8 @@
 #             llama-bench drives no speculation: one server process a row (LCPP2775x_SRV_FLAGS, or
 #             LCPP2775x_MTP_FLAGS with the MTP draft, --spec-type draft-mtp --spec-draft-n-max 2, at
 #             GLM_NCMOE_MTP), -c D + N + 256 rounded up to 256, on 127.0.0.1 at a free port; after
-#             its /health answers (its own warm-up runs before that), one POST /completion of the
-#             first D ids of GLM_PROSE — ours' prompt, so the draft sees prose — with n_predict N,
+#             its /health answers (its own warm-up runs before that), one POST /completion of
+#             ours' D prompt ids (from GLM_PROSE_FROM), so the draft sees prose — with n_predict N,
 #             temperature 0, ignore_eos and cache_prompt off. The row is the response's `timings`:
 #             predicted_per_second over predicted_n (the decode, drafts included), prompt_n and
 #             prompt_per_second, and for the MTP arm draft_n / draft_n_accepted beside the server's
@@ -76,16 +80,40 @@
 # the branches read the same file pages, so their arms rotate freely. The EXL3 directory (154 GB) and
 # its CPU-tier copies do not fit beside it: the exllamav3 arms run as a block after every GGUF round,
 # opened by a discarded process (`DISCARD r0`), so no GGUF row is timed after the EXL3 set evicted the
-# file. The lease opens with a discarded run of the first GGUF arm (`WARMUP r0`, BLOOMERY_AB_WARMUP=0
-# skips it and the discard): the sitting's earlier segments leave another model's pages cached.
-# Every row carries `majflt <n>`, the change in /proc/vmstat pgmajfault across the arm's whole process
-# (load and warm-up included, so an upper bound on its timed window's), and ` [cold]` when those
-# faults at COLD_US µs each (75.4: the serial 4 KB fault measured on this box, rig-log 2026-09-23,
-# depth-ds41.sh's price) could be 1 % of the row's timed window or more. The whole-process count is
-# only a bound while the file stays cached: ours populates its host set before its timer, llama-bench
-# faults the host experts through the mapping inside it. exllamav3 rows print their count untagged:
-# its load reads the 154 GB directory and copies the CPU experts into its own memory, faulting in
-# every process, and perf.py's clock starts after that load, reading no file.
+# file. Every GGUF arm runs once, discarded, right before its round-1 row, on the same ids (`WARMUP
+# r0`, docs/fair-measure.md 2.1; the exllamav3 block keeps its one discard; BLOOMERY_AB_WARMUP=0 skips
+# both): the sitting's earlier segments leave another model's pages cached.
+# The file does not stay whole in the cache on its own: our load drops the file pages of what it
+# uploads (BLOOMERY_CARD_DONTNEED, 1 by default: the card trunk, 8.97 GB, and the card experts,
+# 39.94 GB), so the next arm whose host set holds those pages reads them from the drive — ours in its
+# populate, before its timer (a hot arm after an id-prefix arm: the id-prefix card experts the hot
+# list leaves on the host), llama-bench through its mapping, at its load and inside its timer.
+# Preheat. Before every GGUF arm (the warm-up included; no exllamav3 arm) the runner reads a host set
+# into the page cache with tools/ref/gguf-ranges.py (host, once per K before the lease; preheat, pread
+# in chunks, the data discarded): token_embd and the routed experts of blocks 0..K-1. A llama.cpp
+# arm's K is its own --n-cpu-moe (the MTP arm's GLM_NCMOE_MTP); ours' and a fit twin's is the
+# profile's GLM_PREHEAT_K, every routed expert of the engine's blocks, a superset of ours' host set
+# under any card rule and of the fit's trailing blocks' routed experts — gguf-ranges.py cannot read a
+# plan, and the whole set fits beside the rest of the file. The read sits outside the arm's witness
+# blocks, its wall and its fault counts, and prints `preheat <label> K=<k> bytes=<b> s=<t>
+# gbps=<rate>`: the rate tells how much the arm before left uncached. For ours it moves the drive
+# reads out of the load and makes the load's faults independent of the arm before; it cannot move the
+# timed window, which starts after the populate. Flags whose host set the rule does not model (-ot,
+# --override-tensor, -cmoe, --cpu-moe, a list for --n-cpu-moe) are refused before the lease.
+# BLOOMERY_PREHEAT=0 turns the preheat off (1, the default; anything else is refused). A dry run
+# prints each arm's K and the `host` line of every K, and reads nothing but the headers.
+# Every row carries `majflt <n>` and ` [cold]` when those faults at COLD_US µs each (75.4: the serial
+# 4 KB fault measured on this box, rig-log 2026-09-23, depth-ds41.sh's price) could be 1 % of the
+# row's timed window or more. Ours counts from its `fed` record, which generate_glm5next prints just
+# before its feed's timer starts, to its exit (majflt_mark, tools/ref/cold-blocks.sh), and prints the
+# whole process's count beside it; an ours output with no `fed` line counts the whole process and says
+# so. Every other row counts the change in /proc/vmstat pgmajfault across the arm's whole process
+# (load and warm-up included, so an upper bound on its timed window's). exllamav3 rows print their
+# count untagged: its load reads the 154 GB directory and copies the CPU experts into its own memory,
+# faulting in every process, and perf.py's clock starts after that load, reading no file.
+# A round's row that reads [cold] prints as `COLD r<r> …`, is in no mean, and its arm runs once more
+# right away (its preheat included); a second [cold] prints `FAIL-cold r<r> …`, stays out of the means
+# and the ratios, and joins the failed list (docs/fair-measure.md 2.3). Warm-up rows are not re-run.
 #
 # Contention. Before every arm: the other card (guard_other, ` [other-busy]`), the timing card
 # (guard_timing: waits for another round's process on it, rc 75 after 10 minutes) and the CPU
@@ -100,9 +128,10 @@
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (default 2), BLOOMERY_GEN_WARM
 # (--warm), BLOOMERY_GEN_CTX (C), BLOOMERY_GEN_BIN (default target/release/generate_glm5next),
 # BLOOMERY_GEN_PLACE (a, the default, needs the A6000 as the timing card; gate the 3090),
-# BLOOMERY_AB_WARMUP (1 or 0), BLOOMERY_ARM_BOUND (seconds one
-# arm may run, default 900), BLOOMERY_DRY=1 (every arm's command line, the trees, the checks and each
-# round's order, then exit 0 before the lease: nothing is loaded and nothing is timed).
+# BLOOMERY_AB_WARMUP (1 or 0), BLOOMERY_PREHEAT (1 or 0, above), BLOOMERY_ARM_BOUND (seconds one
+# arm, or one preheat, may run, default 900), BLOOMERY_DRY=1 (every arm's command line and preheat,
+# the trees, the checks and each round's order, then exit 0 before the lease: nothing is loaded and
+# nothing is timed).
 set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -119,15 +148,23 @@ BIN=${BLOOMERY_GEN_BIN:-target/release/generate_glm5next}
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 WARMUP=${BLOOMERY_AB_WARMUP:-1}
+PREHEAT=${BLOOMERY_PREHEAT:-1}
+# majflt_mark (the timed window's fault mark) is cold-blocks.sh's; sourced before COLD_US, which this
+# runner keeps at its own value.
+# shellcheck source=tools/ref/cold-blocks.sh
+source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
 COLD_US=75.4
 DRY=${BLOOMERY_DRY:-}
 PROSE=$BLOOMERY_DATA/$GLM_PROSE
+PROSE_FROM=$GLM_PROSE_FROM
 HOT=$BLOOMERY_DATA/$GLM_HOT
+case $PROSE_FROM:$GLM_HOT_TRACE in *[!0-9:]* | :* | *:) echo "depth-glm5next.sh: GLM_PROSE_FROM and GLM_HOT_TRACE are id counts, got '$PROSE_FROM' and '$GLM_HOT_TRACE'" >&2; exit 64 ;; esac
 for v in N:$N ROUNDS:$ROUNDS CTX:$CTX BOUND:$BOUND; do
   case ${v#*:} in '' | *[!0-9]* | 0*) echo "depth-glm5next.sh: ${v%%:*} is a positive integer, got '${v#*:}'" >&2; exit 64 ;; esac
 done
 case $PLACE in a | gate) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PLACE is a or gate, got '$PLACE'" >&2; exit 64 ;; esac
 case $WARMUP in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_AB_WARMUP is 0 or 1, got '$WARMUP'" >&2; exit 64 ;; esac
+case $PREHEAT in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_PREHEAT is 1 (read each GGUF arm's host set before it, the default) or 0, got '$PREHEAT'" >&2; exit 64 ;; esac
 case $WARM in '' | [0-9] | [1-9][0-9]*) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_WARM is a count, got '$WARM'" >&2; exit 64 ;; esac
 
 ARMS=("$@")
@@ -221,7 +258,7 @@ if [ "$ours" = 1 ] || [ "$srv" = 1 ]; then
   else
     for i in "${!ARMS[@]}"; do
       case ${A_ENG[$i]} in exl3* | lcpp2775[24] | lcpp2775[24]fit | lcpp2775[24]pp*) continue ;; esac
-      [ "${A_DEP[$i]}" -le "$(wc -l < "$PROSE")" ] || check 64 "arm ${ARMS[$i]}: $PROSE holds fewer than ${A_DEP[$i]} ids"
+      [ $((PROSE_FROM + A_DEP[i])) -le "$(wc -l < "$PROSE")" ] || check 64 "arm ${ARMS[$i]}: $PROSE holds fewer than GLM_PROSE_FROM + ${A_DEP[$i]} = $((PROSE_FROM + A_DEP[i])) ids"
     done
   fi
 fi
@@ -274,6 +311,14 @@ if [ "$exl3" = 1 ]; then
 fi
 ref_witness() { [ ${#REF_LINES[@]} -eq 0 ] || printf '    %s\n' "${REF_LINES[@]}"; }
 
+# prompt_ids <D>: the D prompt ids, one a line: GLM_PROSE from 0-based index PROSE_FROM (the header's
+# Arms). prompt_col <engine> <D>: the row's `prompt ids` column, and ` [in-trace]` for a hot arm whose
+# ids overlap the hot list's trace, ids 0..GLM_HOT_TRACE-1.
+prompt_ids() { tail -n +"$((PROSE_FROM + 1))" "$PROSE" | head -n "$1"; }
+prompt_col() {
+  PROMPT_COL=" | prompt ids $PROSE_FROM..$((PROSE_FROM + $2 - 1))" TRACE_TAG=''
+  [ "$1" != hot ] || [ "$PROSE_FROM" -ge "$GLM_HOT_TRACE" ] || TRACE_TAG=' [in-trace]'
+}
 # The command of arm <i>, into CMD (an array, its environment first through env), LABEL_TEST
 # (the row the reference's output is read by) and, for a fit arm, FIT_NOTE (what its flags dropped).
 arm_cmd() {
@@ -284,7 +329,7 @@ arm_cmd() {
       envs="-u BLOOMERY_HOT_LIST"
       [ "$eng" = ours ] || envs="BLOOMERY_HOT_LIST=$HOT"
       # shellcheck disable=SC2206 # an empty envs adds nothing
-      CMD=(env $envs "$BIN" --tokens "$(head -n "$dep" "$PROSE" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"})
+      CMD=(env $envs "$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"})
       ;;
     lcpp2775[24]srv | lcpp2775[24]mtp)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
@@ -296,7 +341,7 @@ arm_cmd() {
       esac
       # shellcheck disable=SC2206
       CMD=(timeout --kill-after=10 "$BOUND" "${CMD[@]}" -m "$MODEL" --host 127.0.0.1 -c "$(((dep + N + 256 + 255) / 256 * 256))" $flags)
-      LABEL_TEST="POST /completion: the first $dep ids of GLM_PROSE, n_predict $N, temperature 0, ignore_eos"
+      LABEL_TEST="POST /completion: GLM_PROSE ids $PROSE_FROM..$((PROSE_FROM + dep - 1)), n_predict $N, temperature 0, ignore_eos"
       ;;
     lcpp*)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
@@ -351,9 +396,86 @@ order_of() { # order_of <round> <exl3 0|1>: the indices of that group's arms in 
 }
 first_of() { local o; o=$(order_of 1 "$1"); echo "${o%% *}"; }
 
+# The preheat's plan, before the lease (the header's Preheat): per arm A_PHK, the K of the host set it
+# reads (empty for an exllamav3 arm, with BLOOMERY_PREHEAT=0, or in a dry run whose ranges failed), and
+# per K and -ngl gguf-ranges.py's `host` line PH_LINE_<K>_<ngl> and the ranges file PH_DIR/k<K>.tsv.
+# PH_RATE prices a cold preheat in a dry run: GB/s, depth-ds41.sh's NVMe populate rate, the slow end.
+GGUF_RANGES="${BASH_SOURCE[0]%/*}/gguf-ranges.py"
+PH_RATE=1.33
+PH_DIR='' A_PHK=()
+# ph_k <index>: arm <index>'s host set K and -ngl into PHK and PHNGL (PHK empty: no preheat). Flags whose
+# host set the rule does not model exit 64.
+ph_k() {
+  local i=$1 w prev='' k=0 ngl='' fit=0
+  PHK='' PHNGL=''
+  case ${A_ENG[$i]} in
+    exl3*) return 0 ;;
+    ours | hot) PHK=$GLM_PREHEAT_K; return 0 ;;
+  esac
+  arm_cmd "$i"
+  for w in "${CMD[@]}"; do
+    case $w in
+      -ot | --override-tensor | --override-tensor=* | -cmoe | --cpu-moe)
+        echo "depth-glm5next.sh: arm '${ARMS[$i]}': its flags carry $w, a host set the preheat does not model; set BLOOMERY_PREHEAT=0 to run it unpreheated" >&2
+        exit 64
+        ;;
+      -fitt | --fit-target) fit=1 ;;
+    esac
+    case $prev in
+      --n-cpu-moe | -ncmoe) k=$w ;;
+      -ngl | --n-gpu-layers | --gpu-layers) ngl=$w ;;
+    esac
+    prev=$w
+  done
+  if [ "$fit" = 1 ]; then
+    PHK=$GLM_PREHEAT_K
+    return 0
+  fi
+  case $k in '' | *[!0-9]*) echo "depth-glm5next.sh: arm '${ARMS[$i]}': --n-cpu-moe '$k' is not one layer count (a list runs several placements)" >&2; exit 64 ;; esac
+  case $ngl in *[!0-9]*) echo "depth-glm5next.sh: arm '${ARMS[$i]}': -ngl '$ngl' is not one layer count" >&2; exit 64 ;; esac
+  PHK=$k PHNGL=$ngl
+}
+if [ "$PREHEAT" = 1 ] && [ "$gguf" = 1 ]; then
+  PH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/depth-glm5next-preheat.XXXXXX") || exit 2
+  trap 'rm -rf "$PH_DIR"' EXIT
+  for i in "${!ARMS[@]}"; do
+    ph_k "$i"
+    A_PHK[i]=$PHK
+    [ -n "$PHK" ] || continue
+    var=PH_LINE_${PHK}_${PHNGL:-none}
+    [ -z "${!var:-}" ] || continue
+    # shellcheck disable=SC2086 # an empty PHNGL adds nothing
+    if line=$(python3 "$GGUF_RANGES" host "$MODEL" --n-cpu-moe "$PHK" ${PHNGL:+--ngl "$PHNGL"} --out "$PH_DIR/k$PHK.tsv"); then
+      printf -v "$var" '%s' "$line"
+    else
+      rc=$?
+      check "$rc" "arm '${ARMS[$i]}': no preheat ranges for K=$PHK (tools/ref/gguf-ranges.py rc $rc)"
+      A_PHK[i]=''
+    fi
+  done
+fi
+# ph_bytes <K> <ngl>: the host set's bytes from its `host` line.
+ph_bytes() {
+  local var=PH_LINE_${1}_${2:-none} w
+  for w in ${!var}; do case $w in bytes=*) echo "${w#bytes=}" ;; esac; done
+}
+# preheat_arm <index>: the host set of arm <index>'s K into the page cache (gguf-ranges.py preheat, under
+# the arm bound) and its `preheat` line; non-zero with FAIL_WHY on a failure. Nothing without a plan.
+preheat_arm() {
+  local k=${A_PHK[$1]:-} out rc=0
+  [ -n "$PH_DIR" ] && [ -n "$k" ] || return 0
+  out=$(timeout --kill-after=10 "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$k.tsv" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    FAIL_WHY="its preheat failed (rc $rc): ${out##*$'\n'}"
+    return "$rc"
+  fi
+  echo "preheat ${A_LABEL[$1]} K=$k $out"
+}
+
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE hot=$HOT"
+  echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM; the hot list's trace: ids 0..$((GLM_HOT_TRACE - 1))"
   ref_witness | sed 's/^   /[dry]/'
   [ ${#CHECKS[@]} -eq 0 ] || printf '[dry] check: %s\n' "${CHECKS[@]}"
   for i in "${!ARMS[@]}"; do
@@ -361,9 +483,20 @@ if [ -n "$DRY" ]; then
     row=${LABEL_TEST% |}
     echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}${FIT_NOTE:+, $FIT_NOTE}"
     case ${A_ENG[$i]} in lcpp2775[24]srv | lcpp2775[24]mtp) pre='' post=' --port <free>' ;; *) pre="timeout --kill-after=10 $BOUND " post='' ;; esac
-    echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <the first '"${A_DEP[$i]}"' ids of GLM_PROSE>/')$post"
+    echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <GLM_PROSE ids '"$PROSE_FROM..$((PROSE_FROM + A_DEP[i] - 1))"'>/')$post"
+    [ -n "${A_PHK[$i]:-}" ] || continue
+    ph_k "$i"
+    b=$(ph_bytes "$PHK" "$PHNGL")
+    ph_round=$((${ph_round:-0} + b))
+    echo "[dry]     preheat K=$PHK: $b B ($(awk -v b="$b" 'BEGIN { printf "%.1f", b / 1e9 }') GB), $(awk -v b="$b" -v r="$PH_RATE" 'BEGIN { printf "%.0f", b / 1e9 / r }') s if all of it is cold at $PH_RATE GB/s"
   done
-  [ "$gguf" = 0 ] || [ "$WARMUP" = 0 ] || echo "[dry] WARMUP r0: ${ARMS[$(first_of 0)]} (discarded)"
+  if [ -n "$PH_DIR" ]; then
+    for var in ${!PH_LINE_*}; do echo "[dry] preheat: ${!var}"; done
+    echo "[dry] preheat: ${ph_round:-0} B a round over the GGUF arms, $(awk -v b="${ph_round:-0}" -v r="$PH_RATE" 'BEGIN { printf "%.0f", b / 1e9 / r }') s a round if every byte is cold at $PH_RATE GB/s (the upper end: a set the arm before left cached reads at page-cache speed)"
+  else
+    echo "[dry] preheat: off ($([ "$PREHEAT" = 0 ] && echo BLOOMERY_PREHEAT=0 || echo 'no GGUF arm'))"
+  fi
+  [ "$gguf" = 0 ] || [ "$WARMUP" = 0 ] || echo "[dry] WARMUP r0: every GGUF arm once on its own ids, discarded, right before its round-1 row"
   for r in $(seq "$ROUNDS"); do
     o='' ; for i in $(order_of "$r" 0); do o+="${ARMS[$i]} "; done
     [ "$gguf" = 0 ] || echo "[dry] round $r gguf order: $o"
@@ -397,18 +530,36 @@ guard_timing() {
 }
 majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 strip() { sed 's/\x1b\[[0-9;]*m//g' | tr '\r' '\n'; }
-# cold_col <faults> <timed window, s>: the majflt column, and COLD_TAG when the faults could cost 1 %
-# of the window.
+# cold_col <faults> <timed window, s> [<what the count spans>]: the majflt column, and COLD_TAG when the
+# faults could cost 1 % of the window. The span defaults to the whole process.
 cold_col() {
   local f=$1 w=$2 pct
   pct=$(awk -v f="$f" -v us="$COLD_US" -v w="$w" 'BEGIN { printf "%.1f", (w > 0) ? 100 * f * us / 1e6 / w : 0 }')
   COLD_TAG=''
   awk -v p="$pct" 'BEGIN { exit !(p >= 1) }' && COLD_TAG=' [cold]'
-  MAJ_COL=" | majflt $f (whole process) <= $pct % of the timed window"
+  MAJ_COL=" | majflt $f (${3:-whole process}) <= $pct % of the timed window"
 }
 
 sums=() pp_sums=() failed=()
-n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
+n_rows=0 busy_rows=0 other_rows=0 cold_rows=0 retry_rows=0 fail_cold=0
+# cold_pass <tag> <round> <index>: PTAG, the word the row prints under the cold rule (the header):
+# <tag> for a row that is not [cold] or not a round's; COLD on a round row's first pass, which sets
+# COLD_AGAIN so run_row runs the arm once more; FAIL-cold on its second, which joins the failed list.
+# Only a ROW row goes into the sums.
+COLD_PASS=0 COLD_AGAIN=0
+cold_pass() {
+  local key=d
+  PTAG=$1
+  [ "$1" = ROW ] && [ -n "$COLD_TAG" ] || return 0
+  if [ "$COLD_PASS" = 0 ]; then
+    PTAG=COLD COLD_AGAIN=1
+  else
+    [ "${A_PP[$3]}" = 0 ] || key=p
+    PTAG=FAIL-cold
+    failed+=("r$2:${A_LABEL[$3]}@$key=${A_DEP[$3]}(cold)")
+    fail_cold=$((fail_cold + 1))
+  fi
+}
 # fail_row <tag> <round> <index> <rc> <why> <output>
 fail_row() {
   local f=${TMPDIR:-/tmp}/depth-glm5next-${A_LABEL[$3]}-${A_DEP[$3]}-r$2.log key=d
@@ -441,7 +592,7 @@ srv_run() {
     sleep 2
   done
   if [ "$rc" = 0 ]; then
-    body=$(head -n "$dep" "$PROSE" | python3 -c '
+    body=$(prompt_ids "$dep" | python3 -c '
 import json, sys
 ids = [int(l) for l in sys.stdin if l.strip()]
 print(json.dumps({"prompt": ids, "n_predict": int(sys.argv[1]), "temperature": 0, "ignore_eos": True, "cache_prompt": False}))' "$N")
@@ -464,10 +615,16 @@ RESPONSE $resp"
 
 # run_arm <tag> <round> <index>: tag is ROW (a round's arm), WARMUP or DISCARD (discarded rows).
 run_arm() {
-  local tag=$1 r=$2 i=$3 eng=${A_ENG[$3]} dep=${A_DEP[$3]} label=${A_LABEL[$3]} out rc t0 t1 m0 m1 val w rowtags why line
+  local tag=$1 r=$2 i=$3 eng=${A_ENG[$3]} dep=${A_DEP[$3]} label=${A_LABEL[$3]} out rc t0 t1 m0 m1 val w rowtags why line markf mark
   CPU_BUSY_TAG='' FIT_COL='' FIT_LINES=''
   guard_other
   guard_timing
+  preheat_arm "$i" || {
+    rc=$?
+    [ "$tag" != ROW ] || n_rows=$((n_rows + 1))
+    if [ "$tag" = ROW ]; then fail_row "" "$r" "$i" "$rc" "$FAIL_WHY" ""; else fail_row "" 0 "$i" "$rc" "$FAIL_WHY" ""; fi
+    return
+  }
   guard_cpu "pre r$r $label $dep"
   arm_cmd "$i"
   witness "pre $tag r$r $label ${dep}"
@@ -475,6 +632,14 @@ run_arm() {
   m0=$(majflt) t0=$(date +%s)
   case $eng in
     lcpp2775[24]srv | lcpp2775[24]mtp) srv_run "$dep" ;;
+    ours | hot)
+      # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
+      markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
+      out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
+      rc=$?
+      mark=$(cat "$markf")
+      rm -f "$markf"
+      ;;
     *)
       out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1)
       rc=$?
@@ -518,10 +683,16 @@ run_arm() {
       tps=$(awk -v m="$MEAN" 'BEGIN{printf "%.2f", 1e3/m}')
       tps50=$(awk -v p="$P50" 'BEGIN{printf "%.2f", 1e3/p}')
       w=$(awk -v a="$PP_MS" -v m="$MEAN" -v n="$N" 'BEGIN{print (a + (n - 1) * m) / 1e3}')
-      cold_col "$((m1 - m0))" "$w"
-      rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$tag $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MAJ_COL | wall $((t1 - t0))s$rowtags"
-      [ "$tag" = ROW ] || return 0
+      if [ -n "$mark" ]; then
+        cold_col "$((m1 - mark))" "$w" "timed, from the fed line; whole process $((m1 - m0))"
+      else
+        cold_col "$((m1 - m0))" "$w" "whole process: no fed line"
+      fi
+      cold_pass "$tag" "$r" "$i"
+      prompt_col "$eng" "$dep"
+      rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$TRACE_TAG"
+      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       sums+=("$label|$dep|$r|$tps")
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
       ;;
@@ -539,9 +710,11 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       echo "$out" | grep -v '^RESPONSE ' | grep -E '^build:|model buffer size|speculative|draft-mtp|nextn' | head -n 8 | sed "s/^/    $label load /"
       val=$(awk -v v="$val" 'BEGIN{printf "%.2f", v}')
       cold_col "$((m1 - m0))" "$(awk -v n="$N" -v v="$val" 'BEGIN{print n / v}')"
+      cold_pass "$tag" "$r" "$i"
+      prompt_col "$eng" "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$tag $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion | prompt_n $prn prompt tok/s $(awk -v v="$prps" 'BEGIN{printf "%.2f", v}') | draft_n $dn draft_n_accepted $dna | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
-      [ "$tag" = ROW ] && sums+=("$label|$dep|$r|$val")
+      echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | prompt_n $prn prompt tok/s $(awk -v v="$prps" 'BEGIN{printf "%.2f", v}') | draft_n $dn draft_n_accepted $dna | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      [ "$PTAG" = ROW ] && sums+=("$label|$dep|$r|$val")
       ;;
     lcpp*)
       val=$(echo "$out" | grep -F "$LABEL_TEST" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//; s/ //g' | head -n 1)
@@ -553,14 +726,16 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       dev=$(echo "$out" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
       if [ "${A_PP[$i]}" = 1 ]; then
         cold_col "$((m1 - m0))" "$(awk -v p="$dep" -v v="$val" 'BEGIN{print p / v}')"
+        cold_pass "$tag" "$r" "$i"
         rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-        echo "$tag $r_tag $label p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
-        [ "$tag" = ROW ] && pp_sums+=("$label|$dep|$r|$val")
+        echo "$PTAG $r_tag $label p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $BATCH | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        [ "$PTAG" = ROW ] && pp_sums+=("$label|$dep|$r|$val")
       else
         cold_col "$((m1 - m0))" "$(awk -v n="$N" -v v="$val" 'BEGIN{print n / v}')"
+        cold_pass "$tag" "$r" "$i"
         rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-        echo "$tag $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
-        [ "$tag" = ROW ] && sums+=("$label|$dep|$r|$val")
+        echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        [ "$PTAG" = ROW ] && sums+=("$label|$dep|$r|$val")
       fi
       ;;
     exl3*)
@@ -571,7 +746,7 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       echo "$clean" | grep -E '^ -- (Bitrate|Chunk size)|CPU MoE worker started' | sed "s/^/    $label load /"
       echo "    $label load CPU split: $(echo "$clean" | grep -c 'CPU split experts') layers, first: $(echo "$clean" | grep -m1 'CPU split experts' | sed 's/.*mlp //')"
       echo "$clean" | grep -E '^(Context|Length) +[0-9]+:' | sed "s/^/    $label table /"
-      MAJ_COL=" | majflt $((m1 - m0)) (whole process, its load's; untagged)" COLD_TAG=''
+      MAJ_COL=" | majflt $((m1 - m0)) (whole process, its load's; untagged)" COLD_TAG='' PTAG=$tag
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG"
       if [ "${A_PP[$i]}" = 1 ]; then
         echo "$tag $r_tag $label p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | EXL3 $EXL3_BPW bpw, another quantization | chunk 4096$MAJ_COL | wall $((t1 - t0))s$rowtags"
@@ -582,8 +757,22 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       fi
       ;;
   esac
-  [ "$tag" != ROW ] || [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
+  cold_count "$tag"
   return 0
+}
+# cold_count <tag>: a round's [cold] row into cold_rows.
+cold_count() { [ "$1" != ROW ] || [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1)); }
+# run_row <round> <index>: a round's row of arm <index> under the cold rule (the header): a COLD row runs
+# the arm once more.
+run_row() {
+  COLD_PASS=0 COLD_AGAIN=0
+  run_arm ROW "$1" "$2"
+  [ "$COLD_AGAIN" = 1 ] || return 0
+  retry_rows=$((retry_rows + 1))
+  echo "[cold] r$1 ${ARMS[$2]} read [cold]: its arm runs once more (docs/fair-measure.md 2.3)"
+  COLD_PASS=1 COLD_AGAIN=0
+  run_arm ROW "$1" "$2"
+  COLD_PASS=0
 }
 
 # ratio_table <prefix> <keys> <labels>: records `label|key|round|value` on stdin; for every key and
@@ -622,9 +811,11 @@ means() { # means <unit>: `label|key|round|value` on stdin, one mean line per la
   } END { for (k in s) printf "mean %-26s %9.2f %s  [%s..%s, spread %.2f%%]  (n=%d)\n", k, s[k] / n[k], unit, mn[k], mx[k], (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0, n[k] }' | sort
 }
 
+majflt_require depth-glm5next.sh
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE hot=$HOT"
+[ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM; the hot list's trace: ids 0..$((GLM_HOT_TRACE - 1))"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
 for e in 27752 27754; do
   case $e in 27752) [ "$fit27752" = 1 ] || continue ;; *) [ "$fit27754" = 1 ] || continue ;; esac
@@ -633,20 +824,27 @@ for e in 27752 27754; do
 done
 [ "$exl3" = 0 ] || echo "[config] exl3: $EXL3_MODEL ($EXL3_BPW bpw) flags=$EXL3_FLAGS, perf.py's defaults otherwise (cache 32768, chunk 4096)"
 echo "[config] arms=${ARMS[*]}"
+if [ -n "$PH_DIR" ]; then
+  for var in ${!PH_LINE_*}; do echo "[config] preheat: ${!var}"; done
+else
+  echo "[config] preheat: off ($([ "$PREHEAT" = 0 ] && echo BLOOMERY_PREHEAT=0 || echo 'no GGUF arm'))"
+fi
 witness pre
 ref_witness
 for grp in 0 1; do
   case $grp in 0) [ "$gguf" = 1 ] || continue ;; 1) [ "$exl3" = 1 ] || continue ;; esac
-  if [ "$WARMUP" = 1 ]; then
-    if [ "$grp" = 0 ]; then run_arm WARMUP 0 "$(first_of 0)"; else run_arm DISCARD 0 "$(first_of 1)"; fi
-  fi
+  [ "$WARMUP" = 0 ] || [ "$grp" = 0 ] || run_arm DISCARD 0 "$(first_of 1)"
   for r in $(seq "$ROUNDS"); do
-    for i in $(order_of "$r" "$grp"); do run_arm ROW "$r" "$i"; done
+    for i in $(order_of "$r" "$grp"); do
+      # Each GGUF arm's warm-up: the same ids, discarded, right before its first round's row.
+      [ "$WARMUP" = 0 ] || [ "$grp" = 1 ] || [ "$r" != 1 ] || run_arm WARMUP 0 "$i"
+      run_row "$r" "$i"
+    done
   done
 done
 
 echo
-echo "arm runs: $n_rows (FAIL rows included); rows tagged [cpu-busy] $busy_rows, [other-busy] $other_rows, [cold] $cold_rows"
+echo "arm runs: $n_rows (FAIL rows included); rows tagged [cpu-busy] $busy_rows, [other-busy] $other_rows, [cold] $cold_rows; cold re-runs $retry_rows, FAIL-cold $fail_cold"
 echo "=== per-arm decode means (tok/s @ n=$N, $CARD_NAME; exl3 rows @ n=100, another quantization) ==="
 [ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | means tok/s
 echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours is the step feed, kind=steps) ==="

@@ -1,0 +1,90 @@
+# Round glmwarm: GLM-5.3-Flash's hot-list rows on the A6000 with a clean fault count, for the public table.
+# In the release sitting (glm-public.card's window) all four hot:<D> rows read [cold]: 28.17 / 28.10 at depth
+# 512 (11,837 / 11,842 faults) and 26.65 / 26.89 at depth 1024 (49,676 / 49,606), each count the whole
+# process's. glm-public's condition took the 199.7 GB file to stay cached; the term that was wrong is our
+# load's page drop (BLOOMERY_CARD_DONTNEED=1, the engine default): every ours arm drops its card trunk
+# (8,966,188,280 B) and card experts (39,941,832,704 B) after uploading them. Evidence: an ours load read
+# 48.9 s after an llama.cpp arm (the card set cached) and 60.9-61.4 s after an ours arm (dropped): 49.1 GB
+# in 12.3 s, 4.0 GB/s [derived]. A hot arm after an id-prefix arm loaded in 77.5 / 77.6 s: 48.9 s, plus the
+# upload's dropped part (the id-prefix and hot sets' overlap, 615 experts x 15.2 MB, and the trunk: 18.3 GB
+# at 4.0 GB/s, 4.6 s), plus the populate of the id-prefix card experts the hot list leaves on the host
+# (2,012 experts, 30.6 GB [derived: a hot list independent of the id order]) at depth-ds41.sh's populate
+# rate 1.33 GB/s, 23 s: 76.5 s against 77.5 read. So hot:512's 11.8k faults are its populate's, before its
+# timer, 2.6 MB a fault. hot:1024 (after hot:512 in both rounds) loaded in 100.2 / 100.9 s: 48.9 s, the
+# upload of the set hot:512 dropped (49.1 GB at 4.0 GB/s, 12.3 s), and 39 s more — 52 GB at 1.33 GB/s,
+# about 20k faults at 2.6 MB [derived] — which the drop does not explain: hot:512 had just populated the
+# same host set, so something evicted it between the two loads. The other 30k of its 49.6k faults are
+# unplaced: in its window, or a load that faults smaller. The two readings of hot:1024:
+#   load   every fault before the timer; the release's 26.77 is clean, and its 5 % gap under hot:512 is
+#          routing (the prompt's second 512 ids and the steps after them hit the list less), as the no-list
+#          arm shows no depth cost (20.95 / 20.99; 11 latent layers x 1,536 B a position, 0.03 ms a step)
+#   window 30k faults at 75.4 us = 2.3 s of its 41 s window, 5.5 %: clean hot:1024 at about hot:512's 28.1
+# This run follows docs/fair-measure.md for our side (the llama.cpp arms stay llama-bench until
+# lcpp-warm.sh replaces them):
+#   4.2 held-out prompt. The hot list (router/glm5next-hotlist.txt) was ranked from the trace
+#       router/glm5next-prose: ids 0..49,999 of glm5next/corpus-prose.ids (sha256 8af07981...bb64, 71,727
+#       ids; router_trace.cpp reads the file's first --max-tokens 50000; manifest `# complete 50000 42`).
+#       The prompts are ids 50,000..50,511 (d512) and 50,000..51,023 (d1024) of the same file
+#       (GLM_PROSE_FROM 50000), for the no-list and the hot arms alike and for the MTP server's request;
+#       each row prints `prompt ids <a>..<b>`, and a hot row inside the trace would end in [in-trace].
+#   2.1 every GGUF arm runs once on its own ids, discarded (WARMUP r0), right before its round-1 row.
+#   2.2 every GGUF arm opens with its host set's preheat (gguf-ranges.py; GLM_PREHEAT_K 45 for ours,
+#       185.5 GB and token_embd, a superset of any plan's host set; K 36 / 37 for llama.cpp). For ours it
+#       changes the timed window by 0 [derived]: the populate runs before the timer.
+#   2.3 our rows count faults from generate_glm5next's `fed` record; a [cold] row prints COLD and its arm
+#       runs once more; a second [cold] prints FAIL-cold and is published nowhere.
+# The held-out prompt moves the hot rows down. The release's prompts (ids 0..1,023) were in the list's own
+# trace; glmcard's stage 1 read the hot-67 share at 54.0 % in-sample and 48.9 % held out (39-layer mean;
+# per-document drift can take it lower, 43 % as the floor). Host bytes a token 0.408 + 4.744 x (1 - h) GB:
+# 2.59 GB in-sample, 2.83..3.11 GB held out, +0.24..+0.52 GB at 130-137 GB/s = +1.8..+4.0 ms a step
+# [derived]. Per arm, 2 rounds [derived; the release rows' own round spread 0.1-1.5 %]:
+#   512           20.3..21.5 tok/s   (20.79, 21.11: the id-prefix card set does not follow the text)
+#   1024          20.3..21.5         (20.99, 21.00)
+#   hot:512       25.3..27.6         (35.5 ms + 1.8..4.0 ms; its release faults were its load's)
+#   hot:1024      24.2..27.6         (load reading: 37.4 ms + 1.8..4.0; window reading: hot:512's)
+#   lcpp27752:512 17.3..18.3         (17.65, 17.96 [cold]; its d1024 twin, clean, 17.76 / 17.86); its row still
+#                                     counts the whole process, whose load faults the card trunk and card
+#                                     experts our arms dropped; the cold rule re-runs it once
+#   lcpp27754mtp:512 21.5..24.5      (23.07, 23.51 on in-trace prose; the draft's acceptance moves with the text)
+# Wall 31..37 min [derived], past 30: the user's approval first. The release's walls a round (ours 81-93 s,
+# 1024 106-118, hot:512 102, hot:1024 145, lcpp27752 25-55, mtp 20-21: 8.6 min) three times (two rounds and
+# the per-arm warm-ups), 18 preheats of 146-186 GB at 15-25 s each (the dropped 34-49 GB at 4 GB/s, the rest
+# from the page cache) less the loads' own drive reads, the lease's first preheat up to 186 GB at 1.33-4
+# GB/s (47-140 s), and 1.5-2.5 min for each cold re-run. The dry run's "every byte cold" line (about 1 TB a
+# round) is that bound for every arm, not the estimate.
+kind: baseline
+question: what do GLM-5.3-Flash's hot-list rows read on the A6000 on a prompt the list never saw, warmed,
+  with their fault count the timed window's, and is hot:1024's gap under hot:512 routing or faults?
+term: tok/s @ n=96, depth 1024, A6000, bloomery hot:1024 (generate_glm5next, plan (a),
+  BLOOMERY_HOT_LIST=router/glm5next-hotlist.txt, prose ids 50,000..51,023, held out from the list's trace of
+  ids 0..49,999), faults counted from its `fed` line
+unit: tok/s
+predict: 24.2..27.6
+condition: one lease, two rounds, the arms rotated each round, each GGUF arm warmed once on its own ids right
+  before its round-1 row; BLOOMERY_PREHEAT=1, so every GGUF arm opens with its `preheat` line; each ours and
+  hot row counts its faults from the `fed` line (`majflt <n> (timed, from the fed line; whole process <m>)`),
+  prints `prompt ids 50000..<b>` and carries no [in-trace]; no ours or hot FAIL-cold row (a COLD row's
+  re-run is the row); no ours or hot row [cpu-busy] or [other-busy]; every hot row names card_experts > 0.
+  The engine runs as shipped (BLOOMERY_CARD_DONTNEED=1): after an ours arm the next ours load re-reads the
+  dropped card set, 49.1 GB, about 12 s at 4.0 GB/s, before its timer and outside the timed window. The
+  runner is glmwarm's (main's has neither the preheat nor the fed mark): from /Users/hckim/repo/bloomery-glmwarm, after
+  generate_glm5next is built in that remote directory outside the lease,
+  BLOOMERY_REMOTE='~/repo/bloomery-glmwarm' BLOOMERY_HOLD_OWNER=<the sitting's> BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glm-hot.card' just depth-gpu-glm5next 512 hot:512 1024
+  hot:1024 lcpp27752:512 lcpp27754mtp:512 > <log> 2>&1 (GLM_PROSE_FROM is the profile's 50000)
+reason: sets the hot rows of the public GLM-5.3-Flash table, which the release sitting could carry only as
+  lower bounds; why now: the public table goes out with the release, and the headline needs a clean hot row
+decide-in: write the four hot rows and the two no-list rows into rig-log as the public GLM rows, their
+  prompt and trace id ranges beside them, with the timed counts; the ratio to llama.cpp waits for
+  lcpp-warm.sh's rows on the same ids. hot:1024 / hot:512 at 0.97 or below names the depth gap routing,
+  above 0.97 names the release's window faults; either way the rows are clean. A FAIL-cold ours row fails
+  the condition: its faults are in the window after the populate, which no preheat reaches; the next run
+  is a same-lease arm pair at BLOOMERY_HOST_LOCK=1 (the host set locked) or BLOOMERY_CARD_DONTNEED=0, not a
+  rerun
+decide-below: hot:1024 under 24.2: the held-out hit is under 43 %; read it from the step stats
+  (BLOOMERY_STEP_STATS) and the preheat lines' seconds and GB/s beside the witness's io pressure (a
+  preheat that ran into the window or evicted the host set); no row goes out before the term is named, and
+  a hit that low reopens the list's corpus (a trace over more text) before the rows
+decide-above: hot:1024 over 27.6: the held-out hit is above in-sample, or the release's hot:512 also lost
+  time in its window; read hot:512 beside it, re-derive the host-byte term, and write the rows with the
+  corrected derivation
