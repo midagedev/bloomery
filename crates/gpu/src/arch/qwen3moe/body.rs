@@ -9,7 +9,7 @@ use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
-use super::router::{N_EXPERT, N_USED, RouterKernels, gated};
+use super::router::{RouterDims, RouterKernels, gated};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
 use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
@@ -28,6 +28,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::Arch;
+use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names;
 use std::mem::ManuallyDrop;
@@ -146,9 +147,18 @@ pub(super) struct TapRows {
 }
 
 /// `(what, want, got)` for every hyperparameter the kernels were built for
-/// that the file does not carry: the flash head and group, the router's
-/// expert counts, the rope width.
-fn pins(hp: &Hparams) -> Result<(), GpuError> {
+/// that the file does not carry: the flash head and group, the rope width;
+/// and the router's instance, which the file's routed shape selects.
+fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
+    let e = &hp.experts;
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let mut rule = rules::SOFTMAX_NORM;
+    rule.norm = e.weights_norm;
+    let router = RouterDims::of(MoeShape {
+        rule,
+        experts: count(e.n_expert),
+        top_k: count(e.n_used),
+    })?;
     let checks = [
         ("attention.key_length (the flash head)", HEAD, hp.head_dim),
         (
@@ -156,8 +166,6 @@ fn pins(hp: &Hparams) -> Result<(), GpuError> {
             GROUP,
             hp.group(),
         ),
-        ("expert_count (the router)", N_EXPERT, hp.experts.n_expert),
-        ("expert_used_count (the router)", N_USED, hp.experts.n_used),
         ("rope.dimension_count (the NEOX turn)", HEAD, hp.rope.dims),
     ];
     let bad: Vec<String> = checks
@@ -168,12 +176,6 @@ fn pins(hp: &Hparams) -> Result<(), GpuError> {
     if !bad.is_empty() {
         return Err(GpuError::shape("qwen3moe::Body::load", bad.join("; ")));
     }
-    if !hp.experts.weights_norm {
-        return Err(GpuError::shape(
-            "qwen3moe::Body::load",
-            "the router kernel renormalizes the chosen weights; this file does not",
-        ));
-    }
     if !hp.n_embd.is_multiple_of(256) || !hp.experts.ff.is_multiple_of(256) {
         return Err(GpuError::shape(
             "qwen3moe::Body::load",
@@ -183,7 +185,7 @@ fn pins(hp: &Hparams) -> Result<(), GpuError> {
             ),
         ));
     }
-    Ok(())
+    Ok(router)
 }
 
 /// Weight `name` as a K-quant word plane of `rows` rows of `k` values, and
@@ -402,7 +404,7 @@ impl Body {
     ) -> Result<Body, GpuError> {
         let what = "qwen3moe::Body::load";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
-        pins(&hp)?;
+        let router = pins(&hp)?;
         if layers != (0..hp.n_layer) {
             return Err(GpuError::shape(
                 what,
@@ -424,7 +426,7 @@ impl Body {
             hp.n_head,
             hp.n_head_kv,
             hp.experts.ff,
-            N_USED,
+            router,
             ctx_max,
         );
         let stream = gpu.stream();

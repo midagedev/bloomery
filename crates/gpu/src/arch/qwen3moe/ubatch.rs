@@ -46,7 +46,7 @@
 use super::body::{ATTN_SCALE, Body, Kernels};
 use super::experts::CombineArgs;
 use super::plan::{GqaPlan, Kq, LayerPlan, MoePlan};
-use super::router::{N_EXPERT, N_USED, RouterOut};
+use super::router::RouterOut;
 use super::scratch::{Dims, IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::HEAD;
@@ -64,11 +64,12 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-/// The most tokens one ubatch takes; at top-8 it fits the grouped GEMM's slot
-/// cap. Also the default ubatch size: the one that reads each weight the
-/// fewest times per prompt and gives each expert's GEMM the most columns.
+/// The most tokens one ubatch takes; its slots must also fit the grouped
+/// GEMM's slot cap at the file's `top_k` (the arena refuses by name a ubatch
+/// they do not fit). Also the default ubatch size: the one that reads each
+/// weight the fewest times per prompt and gives each expert's GEMM the most
+/// columns.
 pub const UBATCH: usize = 4096;
-const _: () = assert!(UBATCH * N_USED <= GEMM_MAX_SLOTS);
 
 /// The environment variable a load reads the ubatch size from.
 pub const UBATCH_ENV: &str = "BLOOMERY_QWEN3_UBATCH";
@@ -138,11 +139,11 @@ pub(super) struct UbArena {
     attn_o: DeviceBuffer<f32>,
     /// The FFN's input residual: `x` plus the attention output.
     ffn_inp: DeviceBuffer<f32>,
-    /// The router's outputs, slot `t · N_USED + j` token `t`'s slot `j`.
+    /// The router's outputs, slot `t · k + j` token `t`'s slot `j`.
     route: RouterOut,
     /// The one-expert table every dense projection of a ubatch reads.
     dense: GemmRoute,
-    /// The layer's expert table over `t · N_USED` slots.
+    /// The layer's expert table over `t · k` slots.
     moe: GemmRoute,
     /// Gate and up rows, per slot `ff` values.
     gate: DeviceBuffer<f32>,
@@ -158,7 +159,17 @@ impl UbArena {
     fn new(stream: &CudaStream, d: Dims, rows: usize) -> Result<UbArena, GpuError> {
         let q_len = d.n_head * HEAD;
         let kv_len = d.n_kv * HEAD;
-        let slots = rows * N_USED;
+        let slots = rows * d.slots();
+        if slots > GEMM_MAX_SLOTS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a ubatch of {rows} tokens at {} slots a token is {slots} slots; the grouped \
+                     GEMM's route table holds {GEMM_MAX_SLOTS}",
+                    d.slots()
+                ),
+            ));
+        }
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(UbArena {
             x: f(rows * d.hidden)?,
@@ -173,9 +184,9 @@ impl UbArena {
             act_attn: GemmAct::new(stream, rows, q_len)?,
             attn_o: f(rows * d.hidden)?,
             ffn_inp: f(rows * d.hidden)?,
-            route: RouterOut::for_ubatch(stream, rows)?,
+            route: RouterOut::for_ubatch(stream, d.router, rows)?,
             dense: GemmRoute::new(stream, rows, 1)?,
-            moe: GemmRoute::new(stream, slots, N_EXPERT)?,
+            moe: GemmRoute::new(stream, slots, d.router.experts())?,
             gate: f(slots * d.ff)?,
             up: f(slots * d.ff)?,
             act_h: GemmAct::new(stream, slots, d.ff)?,
@@ -607,7 +618,7 @@ fn attention(
 }
 
 /// The routed FFN half at `t` rows: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
-/// down_s(swiglu(gate_s, up_s))` over each token's eight experts out, into
+/// down_s(swiglu(gate_s, up_s))` over each token's `k` experts out, into
 /// `x`.
 fn ffn(
     c: &UbCtx<'_>,
@@ -619,7 +630,7 @@ fn ffn(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = a.dims;
-    let slots = t * N_USED;
+    let slots = t * d.slots();
     gpu.elem().enqueue_rms_norm(
         stream,
         &a.ffn_inp,
@@ -649,7 +660,9 @@ fn ffn(
                 rows_per_expert: d.ff,
                 act: &a.act_hid,
                 route: &a.moe,
-                input: GemmInput::Shared { top_k: N_USED },
+                input: GemmInput::Shared {
+                    top_k: d.router.used(),
+                },
                 y,
             },
         )?;
@@ -675,7 +688,7 @@ fn ffn(
             w: &a.route.weights,
             resid: &a.ffn_inp,
             rows: d.hidden,
-            n_slots: N_USED,
+            n_slots: d.slots(),
             m: t,
             y: &mut a.x,
         },

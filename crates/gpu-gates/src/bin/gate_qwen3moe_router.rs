@@ -92,7 +92,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::router::{
-        MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
+        MAX_TOKENS, ROW, RouterDims, RouterKernels, RouterOut,
     };
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
@@ -108,6 +108,7 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::GgmlType;
     use model::arch::Arch;
+    use model::arch::models::shape::{MoeShape, rules};
     use model::arch::qwen3moe::hparams::{Hparams, Score};
     use model::arch::qwen3moe::names;
     use std::mem::ManuallyDrop;
@@ -115,6 +116,27 @@ mod gate {
     /// Probabilities and weights against the host rule, absolute: both are
     /// in [0, 1] and the only divergence is `exp`'s last ulps.
     const BAND: f32 = 1e-6;
+
+    /// The body's width: its instance row's.
+    const N_EXPERT: usize = ROW.experts() as usize;
+
+    /// The pick count the clauses run at: the file's `expert_used_count`,
+    /// which `run` holds to it before anything else. The pick-count clause
+    /// runs others.
+    const N_USED: usize = 8;
+
+    /// The pick counts the pick-count clause runs besides [`N_USED`]: one,
+    /// an odd count, and the lane picks' bound.
+    const PICKS: [usize; 3] = [1, 3, 32];
+
+    /// The router's dims at `top_k` picks.
+    fn dims(top_k: usize) -> Result<RouterDims, GateError> {
+        Ok(RouterDims::of(MoeShape {
+            rule: rules::SOFTMAX_NORM,
+            experts: ROW.experts(),
+            top_k: u32::try_from(top_k)?,
+        })?)
+    }
 
     /// What the ubatch clause's f32 buffers hold before a launch, so a store
     /// past the launch's tokens reads back as something else.
@@ -150,7 +172,12 @@ mod gate {
     /// The host rule for one token: probabilities, ids and renormalized
     /// weights.
     fn host(logits: &[f32]) -> Result<Routed, GateError> {
-        let (probs, ids, w) = route_ref_within(logits, 1, N_EXPERT, N_USED, 1.0)?;
+        host_k(logits, N_USED)
+    }
+
+    /// [`host`] at `top_k` picks.
+    fn host_k(logits: &[f32], top_k: usize) -> Result<Routed, GateError> {
+        let (probs, ids, w) = route_ref_within(logits, 1, N_EXPERT, top_k, 1.0)?;
         let sum = w.iter().fold(0.0f64, |a, &v| a + f64::from(v)) as f32;
         Ok(Routed {
             probs,
@@ -172,14 +199,15 @@ mod gate {
     }
 
     fn read_fused(stream: &CudaStream, out: &RouterOut, m: usize) -> Result<Fused, GateError> {
+        let used = out.dims().used();
         let mut logits = out.logits.to_host_vec(stream)?;
         let mut probs = out.probs.to_host_vec(stream)?;
         let mut ids = out.ids.to_host_vec(stream)?;
         let mut weights = out.weights.to_host_vec(stream)?;
         logits.truncate(m * N_EXPERT);
         probs.truncate(m * N_EXPERT);
-        ids.truncate(m * N_USED);
-        weights.truncate(m * N_USED);
+        ids.truncate(m * used);
+        weights.truncate(m * used);
         Ok(Fused {
             logits,
             routed: Routed {
@@ -512,8 +540,8 @@ mod gate {
         let stream = gpu.stream();
         let cpu = &sets()?[0].1;
         let mut ok = true;
-        let mut out_s = RouterOut::with_tokens(stream, 1)?;
-        let mut out_f = RouterOut::with_tokens(stream, 1)?;
+        let mut out_s = RouterOut::with_tokens(stream, dims(N_USED)?, 1)?;
+        let mut out_f = RouterOut::with_tokens(stream, dims(N_USED)?, 1)?;
         let norm = FusedKernels::load(gpu.context())?;
         let mut last = None;
         for (l, src) in [(13usize, "l_out-12"), (47, "l_out-46")] {
@@ -662,8 +690,8 @@ mod gate {
         let sink = gpu.unlabelled_sink();
         let wd = DeviceTensor::upload(stream, w, N_EXPERT, k)?;
         let max = UBATCH_TOKENS[UBATCH_TOKENS.len() - 1];
-        let mut ub = RouterOut::for_ubatch(stream, max)?;
-        let mut fused = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut ub = RouterOut::for_ubatch(stream, dims(N_USED)?, max)?;
+        let mut fused = RouterOut::with_tokens(stream, dims(N_USED)?, MAX_TOKENS)?;
         let mut ok = true;
         // What every output buffer holds before a launch: a store past the
         // launch's T tokens reads back as something else.
@@ -798,9 +826,12 @@ mod gate {
             ("input_misaligned", input_misaligned),
             (
                 "ubatch_over_limit",
-                RouterOut::for_ubatch(stream, UBATCH + 1).is_err(),
+                RouterOut::for_ubatch(stream, dims(N_USED)?, UBATCH + 1).is_err(),
             ),
-            ("ubatch_empty", RouterOut::for_ubatch(stream, 0).is_err()),
+            (
+                "ubatch_empty",
+                RouterOut::for_ubatch(stream, dims(N_USED)?, 0).is_err(),
+            ),
         ];
         let all = refusals.iter().all(|(_, r)| *r);
         println!(
@@ -907,7 +938,7 @@ mod gate {
 
         // The routing alone: a NaN, a +inf and a −inf logit.
         let before = gpu.fault()?;
-        let mut out = RouterOut::with_tokens(stream, 1)?;
+        let mut out = RouterOut::with_tokens(stream, dims(N_USED)?, 1)?;
         let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
         let clean = route(k, stream, &x, sink, &mut out)?;
         let after_clean = gpu.fault()?;
@@ -955,7 +986,7 @@ mod gate {
         // The fused launch: token 2 of 5 overflows to +inf from a finite row.
         let m = 5usize;
         let bad_t = 2usize;
-        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut fout = RouterOut::with_tokens(stream, dims(N_USED)?, MAX_TOKENS)?;
         let xc = DeviceBuffer::from_host(stream, &cols[..m * kk])?;
         k.enqueue_fused(stream, &w, &xc, m, sink, &mut fout)?;
         stream.synchronize()?;
@@ -995,7 +1026,7 @@ mod gate {
         ok &= pass;
 
         // The ubatch router: token 8 of 9 (the second chunk) overflows.
-        let mut ub = RouterOut::for_ubatch(stream, ub_n)?;
+        let mut ub = RouterOut::for_ubatch(stream, dims(N_USED)?, ub_n)?;
         let xu = DeviceBuffer::from_host(stream, &cols[..ub_n * kk])?;
         k.enqueue_ubatch(stream, &w, &xu, ub_n, sink, &mut ub)?;
         stream.synchronize()?;
@@ -1092,6 +1123,65 @@ mod gate {
         Ok(ok)
     }
 
+    /// The pick count is a launch argument: at each of [`PICKS`], the fused
+    /// launch of five tokens of `cols` through `w` against the split pair at
+    /// the same count bit for bit, and each token's ids, probabilities and
+    /// weights against the host rule at that count; and the top
+    /// [`N_USED`] of every count past it are the ids at [`N_USED`] (one
+    /// ranking, cut at another length).
+    fn picks_section(
+        gpu: &Gpu,
+        k: &RouterKernels,
+        w: &DeviceTensor<f32>,
+        cols: &[f32],
+        kk: usize,
+    ) -> Result<bool, GateError> {
+        const M: usize = 5;
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let x = DeviceBuffer::from_host(stream, &cols[..M * kk])?;
+        let mut at8 = RouterOut::with_tokens(stream, dims(N_USED)?, MAX_TOKENS)?;
+        k.enqueue_fused(stream, w, &x, M, sink, &mut at8)?;
+        stream.synchronize()?;
+        let base = read_fused(stream, &at8, M)?;
+        let mut ok = true;
+        for top_k in PICKS {
+            let d = dims(top_k)?;
+            let mut out = RouterOut::with_tokens(stream, d, 1)?;
+            let mut fout = RouterOut::with_tokens(stream, d, MAX_TOKENS)?;
+            let want = split_pair(gpu, k, w, &x, M, &mut out)?;
+            k.enqueue_fused(stream, w, &x, M, sink, &mut fout)?;
+            stream.synchronize()?;
+            let got = read_fused(stream, &fout, M)?;
+            let split = fused_equal(&got, &want);
+            let (mut ids_exact, mut pe, mut we, mut prefix) = (true, 0.0f32, 0.0f32, true);
+            for t in 0..M {
+                let h = host_k(&got.logits[t * N_EXPERT..(t + 1) * N_EXPERT], top_k)?;
+                let ids = &got.routed.ids[t * top_k..(t + 1) * top_k];
+                ids_exact &= ids == h.ids.as_slice();
+                pe = pe.max(max_abs(
+                    &got.routed.probs[t * N_EXPERT..(t + 1) * N_EXPERT],
+                    &h.probs,
+                ));
+                we = we.max(max_abs(
+                    &got.routed.weights[t * top_k..(t + 1) * top_k],
+                    &h.weights,
+                ));
+                let n = top_k.min(N_USED);
+                prefix &= ids[..n] == base.routed.ids[t * N_USED..t * N_USED + n];
+            }
+            let pass = split && ids_exact && pe <= BAND && we <= BAND && prefix;
+            println!(
+                "picks k={top_k} m={M} src=ffn_inp_normed-13/14: fused vs f32_gemv+router bits={split} \
+                 ids=host {ids_exact} probs_err={pe:.3e} weights_err={we:.3e} (band {BAND:.0e}) \
+                 first min(k, {N_USED}) ids = the k={N_USED} run's {prefix} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -1099,13 +1189,19 @@ mod gate {
         let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-router")?;
         let hp = Hparams::read(&split)?;
         let e = hp.experts;
-        if e.n_expert != N_EXPERT
-            || e.n_used != N_USED
-            || e.score != Score::Softmax
-            || !e.weights_norm
-        {
+        // The file's routed shape selects the instance; the clauses below
+        // are written at its pick count.
+        let mut rule = rules::SOFTMAX_NORM;
+        rule.norm = e.weights_norm;
+        let file = RouterDims::of(MoeShape {
+            rule,
+            experts: u32::try_from(e.n_expert)?,
+            top_k: u32::try_from(e.n_used)?,
+        })?;
+        if file.inst() != ROW || file.used() != N_USED || e.score != Score::Softmax {
             return Err(format!(
-                "the file routes {:?}; the kernel is softmax, {N_USED} of {N_EXPERT}, renormalized",
+                "the file routes {:?}; the clauses are written at softmax, {N_USED} of {N_EXPERT}, \
+                 renormalized",
                 e
             )
             .into());
@@ -1114,7 +1210,7 @@ mod gate {
         let k = RouterKernels::load(gpu.context())?;
         let stream = gpu.stream();
         let sink = gpu.unlabelled_sink();
-        let mut out = RouterOut::with_tokens(stream, 1)?;
+        let mut out = RouterOut::with_tokens(stream, file, 1)?;
         println!("gate_qwen3moe_router: device {}", gpu.device_name()?);
         let mut ok = true;
 
@@ -1283,7 +1379,7 @@ mod gate {
             )
             .into());
         }
-        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut fout = RouterOut::with_tokens(stream, file, MAX_TOKENS)?;
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * kk])?;
             let want = split_pair(&gpu, &k, &w, &x, m, &mut out)?;
@@ -1331,6 +1427,7 @@ mod gate {
         );
         ok &= pass;
 
+        ok &= picks_section(&gpu, &k, &w, &cols, kk)?;
         ok &= norm_section(&gpu, &gguf, &k, hp.rms_eps)?;
         let (w0, k0) = router_weight_host(&gguf, 0)?;
         ok &= ubatch_section(&gpu, &k, &w0, k0)?;

@@ -8,15 +8,17 @@
 //! Qwen3-30B-A3B's layers are all [`MixerPlan::Gqa`] at head 128 with no
 //! shared expert. Qwen3.6-35B-A3B interleaves [`MixerPlan::Delta`] (gated
 //! delta rule) with gated GQA at head 256, each followed by 256 routed
-//! experts and a sigmoid-gated shared expert folded in as a ninth slot of
+//! experts and a sigmoid-gated shared expert folded in as one more slot of
 //! joined stacks. A Qwen3.6 layer's kind comes from its [`LayerSpec`] — the
 //! file's tensors, cross-checked with its interval key by the reader —
 //! never from the layer's number.
 
+use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
+use model::arch::models::shape::MoeShape;
 use model::arch::models::{
-    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, RopeMode, Score,
+    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, RopeMode,
 };
 
 /// The two K-quants a mixed site comes in: a value projection, an experts'
@@ -102,9 +104,9 @@ pub(super) struct MoePlan {
     pub(super) shared: Option<SharedPlan>,
 }
 
-/// A shared expert folded into the routed stacks as their last expert
-/// (`router::gated::SHARED`, the routed count) in every token's last slot,
-/// weighted by the sigmoid of the router's last row.
+/// A shared expert folded into the routed stacks as their last expert (id
+/// the routed count) in every token's last slot, weighted by the sigmoid of
+/// the router's last row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SharedPlan;
 
@@ -137,15 +139,14 @@ pub(super) enum Kind35 {
 
 /// The Qwen3.6 geometry the chain's kernels are built for: 16/2 query/key
 /// heads of 256, 64 values turned, 16/32 delta heads of 128 with a 4-tap
-/// conv, 256 routed experts of 512 with eight used and a sigmoid-gated
-/// shared expert of 512.
+/// conv, and experts of 512 with a sigmoid-gated shared expert of 512. The
+/// routed experts' count and the experts a token keeps are the router
+/// instance's the file's shape selects ([`RouterDims::of`]).
 pub(super) mod q35 {
     pub(in super::super) const HEADS: u32 = 16;
     pub(in super::super) const KV_HEADS: u32 = 2;
     pub(in super::super) const HEAD_DIM: u32 = 256;
     pub(in super::super) const ROPE_DIMS: u32 = 64;
-    pub(in super::super) const EXPERTS: u32 = 256;
-    pub(in super::super) const TOP_K: u32 = 8;
     pub(in super::super) const EXPERT_FF: u32 = 512;
 }
 
@@ -168,7 +169,9 @@ pub(super) fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, GpuError> {
         }
     };
     match &s.ffn {
-        Ffn::Moe(m) => moe_fits(m).map_err(refuse)?,
+        Ffn::Moe(m) => {
+            moe_fits(m).map_err(refuse)?;
+        }
         Ffn::Dense { .. } => return Err(refuse("a dense FFN, which no kernel here runs".into())),
     }
     Ok(kind)
@@ -253,30 +256,23 @@ fn delta_shape(d: &DeltaRule) -> Result<LinearShape, String> {
     }
 }
 
-/// Ok when `m` is the routed FFN the gated router and the joined stacks run.
-fn moe_fits(m: &Moe) -> Result<(), String> {
-    use q35::{EXPERT_FF, EXPERTS, TOP_K};
+/// The router `m` runs on when it is the routed FFN the gated router and the
+/// joined stacks run: its instance and pick count from the file's shape
+/// ([`RouterDims::of`], which refuses a count or rule no instance serves).
+pub(super) fn moe_fits(m: &Moe) -> Result<RouterDims, String> {
+    use q35::EXPERT_FF;
+    let router = RouterDims::of(MoeShape::of(m)).map_err(|e| e.to_string())?;
     let swiglu = matches!(m.act, Act::SwiGlu { limit: None });
-    let router = m.router.score == Score::Softmax
-        && m.router.norm
-        && !m.router.bias
-        && !m.router.hash
-        && m.router.scale == 1.0;
+    let plain = !m.router.hash && m.router.scale == 1.0;
     let shared = m.shared.is_some_and(|s| {
         s.ff == EXPERT_FF && s.sigmoid_gate && matches!(s.act, Act::SwiGlu { limit: None })
     });
-    if m.experts == EXPERTS
-        && m.top_k == TOP_K
-        && m.expert_ff == EXPERT_FF
-        && swiglu
-        && router
-        && shared
-    {
-        Ok(())
+    if router.gated() && m.expert_ff == EXPERT_FF && swiglu && plain && shared {
+        Ok(router)
     } else {
         Err(format!(
-            "experts {m:?}; the kernels take {EXPERTS} SwiGLU experts of {EXPERT_FF}, {TOP_K} used, \
-             softmax renormalized at scale 1, and a sigmoid-gated shared expert of {EXPERT_FF}"
+            "experts {m:?}; the kernels take SwiGLU experts of {EXPERT_FF}, softmax renormalized \
+             at scale 1, and a sigmoid-gated shared expert of {EXPERT_FF}"
         ))
     }
 }
@@ -326,8 +322,8 @@ mod tests {
         LayerSpec {
             mixer,
             ffn: Ffn::Moe(Moe {
-                experts: q35::EXPERTS,
-                top_k: q35::TOP_K,
+                experts: 256,
+                top_k: 8,
                 expert_ff: q35::EXPERT_FF,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
@@ -374,6 +370,31 @@ mod tests {
             })
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// The routed shape comes from the file: the wide instance's 512/10
+    /// and any pick count up to the lane picks run, an expert count no
+    /// instance is built for is refused by name with its index.
+    #[test]
+    fn the_routed_shape_selects_its_instance() {
+        let with = |experts: u32, top_k: u32| {
+            let mut l = layer(delta());
+            if let Ffn::Moe(m) = &mut l.ffn {
+                m.experts = experts;
+                m.top_k = top_k;
+            }
+            l
+        };
+        for (experts, top_k) in [(256u32, 8u32), (512, 10), (256, 1), (512, 32)] {
+            let got = kinds35(&[with(experts, top_k)]);
+            assert!(got.is_ok(), "{experts}/{top_k}: {got:?}");
+        }
+        for (experts, top_k) in [(384u32, 8u32), (256, 33), (256, 0)] {
+            match kinds35(&[layer(delta()), with(experts, top_k)]) {
+                Err(e) => assert!(e.to_string().contains("layer 1:"), "{e}"),
+                Ok(k) => panic!("{experts}/{top_k} accepted: {k:?}"),
+            }
+        }
     }
 
     /// A layer the kernels were not built for is refused by name with its

@@ -19,7 +19,6 @@ use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
 use super::proj::{OResidArgs, QkvArgs};
-use super::router::N_USED;
 use super::scratch::{Arena, Io, KvPlanes, StoreMut};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::GqaArgs;
@@ -520,10 +519,11 @@ fn gated_256(
 
 /// The routed FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's slots out, into `out`
-/// (`None`: into `x`). A plan without a shared expert routes eight slots a
-/// token; with one ([`MoePlan::shared`]) the gated router adds a ninth, the
-/// shared expert's id in the joined stacks weighted by the sigmoid of the
-/// router's last row, and every launch after it runs nine slots a token.
+/// (`None`: into `x`). A plan without a shared expert routes `k` slots a
+/// token (the file's `top_k`); with one ([`MoePlan::shared`]) the gated
+/// router adds one more, the shared expert's id in the joined stacks
+/// weighted by the sigmoid of the router's last row, and every launch after
+/// it runs `k + 1` slots a token.
 /// The down `_sel` runs every token's slots in one launch: slot `t · slots
 /// + j` is token `t`'s slot `j`, its id, its q8_1 column and its down rows
 /// all at that index, so each slot's row is the row a one-token launch
@@ -600,14 +600,14 @@ pub(super) fn ffn(
             )?;
         }
     }
-    let slots = d.slots;
-    if slots != c.p.slots(N_USED) {
+    let slots = d.slots();
+    if slots != c.p.slots(d.router.used()) {
         return Err(GpuError::shape(
             WHAT,
             format!(
                 "layer {}: the arena is cut for {slots} slots a token, the plan routes {}",
                 c.layer,
-                c.p.slots(N_USED)
+                c.p.slots(d.router.used())
             ),
         ));
     }

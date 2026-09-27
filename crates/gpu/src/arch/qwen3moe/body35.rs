@@ -1,7 +1,7 @@
 //! The Qwen3.6-35B-A3B (`qwen35moe`) `ChainBody`: the family's one layer
 //! body (`dispatch::layer`) over plans that interleave gated-delta-rule
 //! layers with gated GQA layers at head 256, every layer's experts carrying
-//! the sigmoid-gated shared expert as a ninth slot of joined stacks.
+//! the sigmoid-gated shared expert as one more slot of joined stacks.
 //!
 //! Load reads the file's description once (`model::arch::qwen35moe`): each
 //! layer's kind from its tensors, never from its number, checked against
@@ -24,9 +24,8 @@ use super::dispatch::{self, Ctx};
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{
     DeltaPlan, GqaKind, GqaPlan, Kind35, Kq, LayerPlan, MixerPlan, MoePlan, SharedPlan, kinds35,
-    q35,
+    moe_fits, q35,
 };
-use super::router::gated;
 use super::scratch::{
     Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
     StepParams, param_view, put_input,
@@ -43,6 +42,7 @@ use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
+use model::arch::models::shape::MoeShape;
 use model::arch::models::{Mixer, ModelSpec};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -187,9 +187,9 @@ fn joint(l: usize, part: &str) -> String {
 }
 
 /// Layer `l`'s routed FFN with the shared expert folded in: the three
-/// stacks joined with their shared expert as expert [`gated::SHARED`], the
-/// router with the shared gate as row [`gated::SHARED`], each checked
-/// against the shape and type its launch takes.
+/// stacks joined with their shared expert as expert `n` (the routed count),
+/// the router with the shared gate as row `n`, each checked against the
+/// shape and type its launch takes.
 fn resolve_ffn(
     stream: &CudaStream,
     w: &mut Weights,
@@ -216,7 +216,7 @@ fn resolve_ffn(
         ],
         router.clone(),
     )?;
-    let e = gated::ROWS;
+    let e = d.router.logits();
     let f = MoePlan {
         ffn_norm: blk(l, "post_attention_norm.weight"),
         ffn_gate_inp: router,
@@ -294,9 +294,9 @@ fn resolve_delta(
 }
 
 /// The arena's dims of `spec`, whose kinds `kinds` the plan checked: the
-/// attention layers' head of 256 with a gate beside each query, nine slots
-/// a token, and the delta layers' one shape (every delta layer of a file
-/// shares it). A delta layer's gated norm writes the attention rows' buffer,
+/// attention layers' head of 256 with a gate beside each query, the router
+/// the routed shape selects (every layer of a file shares it), and the delta
+/// layers' one shape (every delta layer of a file shares it). A delta layer's gated norm writes the attention rows' buffer,
 /// so the two widths must agree.
 fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError> {
     let mut shapes = kinds.iter().filter_map(|k| match k {
@@ -312,6 +312,22 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
             format!("two delta shapes, {s:?} and {other:?}; one arena serves one"),
         ));
     }
+    let mut routed = spec.layers.iter().filter_map(|l| l.moe());
+    let first = routed.next().ok_or(GpuError::shape(
+        WHAT,
+        "no routed layer to size the router for",
+    ))?;
+    if let Some(other) = routed.find(|m| MoeShape::of(m) != MoeShape::of(first)) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "two routed shapes, {:?} and {:?}; one arena serves one",
+                MoeShape::of(first),
+                MoeShape::of(other)
+            ),
+        ));
+    }
+    let router = moe_fits(first).map_err(|e| GpuError::shape(WHAT, e))?;
     let (n_head, n_kv) = (q35::HEADS as usize, q35::KV_HEADS as usize);
     let d = Dims {
         hidden: spec.hidden as usize,
@@ -320,7 +336,7 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
         head: HEAD_256,
         q_rows: 2 * n_head * HEAD_256,
         ff: q35::EXPERT_FF as usize,
-        slots: gated::N_SLOTS,
+        router,
         lin,
         ctx,
     };

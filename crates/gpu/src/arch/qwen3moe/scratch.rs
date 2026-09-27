@@ -14,7 +14,7 @@
 //! position ([`RopeRows`]) and appends it there, and the flash reads its
 //! live key count.
 
-use super::router::{RouterOut, gated};
+use super::router::{RouterDims, RouterOut};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::linear::{self, LinearShape};
@@ -191,9 +191,9 @@ pub(super) struct Dims {
     /// when it writes a gate beside each head's query.
     pub(super) q_rows: usize,
     pub(super) ff: usize,
-    /// Expert slots a token takes: the routed ones, plus a folded shared
-    /// expert's.
-    pub(super) slots: usize,
+    /// The router's instance and the experts a token keeps, from the file's
+    /// routed shape.
+    pub(super) router: RouterDims,
     /// The delta layers' head counts; `None` when the chain has none.
     pub(super) lin: Option<LinearShape>,
     pub(super) ctx: usize,
@@ -201,13 +201,13 @@ pub(super) struct Dims {
 
 impl Dims {
     /// qwen3moe's: heads of [`HEAD`], a query projection of `n_head · HEAD`
-    /// rows, `slots` routed slots, no delta layer.
+    /// rows, the router `router`, no delta layer.
     pub(super) fn qwen3(
         hidden: usize,
         n_head: usize,
         n_kv: usize,
         ff: usize,
-        slots: usize,
+        router: RouterDims,
         ctx: usize,
     ) -> Dims {
         Dims {
@@ -217,7 +217,7 @@ impl Dims {
             head: HEAD,
             q_rows: n_head * HEAD,
             ff,
-            slots,
+            router,
             lin: None,
             ctx,
         }
@@ -231,6 +231,12 @@ impl Dims {
     /// Values of a token's key (or value) rows: `n_kv · head`.
     pub(super) fn kv_len(&self) -> usize {
         self.n_kv * self.head
+    }
+
+    /// Expert slots a token takes: the routed ones, plus a folded shared
+    /// expert's.
+    pub(super) fn slots(&self) -> usize {
+        self.router.slots()
     }
 }
 
@@ -318,11 +324,11 @@ pub(super) struct Arena {
     pub(super) gdn: Option<GdnArena>,
 }
 
-/// Where a router launch leaves its results: qwen3moe's eight slots a
-/// token, or the gated router's nine (the shared expert's last).
+/// Where a router launch leaves its results: the plain router's `k` slots a
+/// token, or the gated router's `k + 1` (the shared expert's last).
 pub(super) enum Route {
     Plain(RouterOut),
-    Gated(gated::RouterOut),
+    Gated(RouterOut),
 }
 
 impl Route {
@@ -342,16 +348,16 @@ impl Route {
         }
     }
 
-    /// The eight-slot router's buffers, or a named refusal.
+    /// The plain router's buffers, or a named refusal.
     pub(super) fn plain(&mut self, what: &'static str) -> Result<&mut RouterOut, GpuError> {
         match self {
             Route::Plain(r) => Ok(r),
-            Route::Gated(_) => Err(GpuError::state(what, "the eight-slot router's buffers")),
+            Route::Gated(_) => Err(GpuError::state(what, "the plain router's buffers")),
         }
     }
 
     /// The gated router's buffers, or a named refusal.
-    pub(super) fn gated(&mut self, what: &'static str) -> Result<&mut gated::RouterOut, GpuError> {
+    pub(super) fn gated(&mut self, what: &'static str) -> Result<&mut RouterOut, GpuError> {
         match self {
             Route::Gated(r) => Ok(r),
             Route::Plain(_) => Err(GpuError::state(what, "the gated router's buffers")),
@@ -665,10 +671,11 @@ impl Arena {
         };
         let x = f(rows * d.hidden)?;
         let qkv = f(rows * (q_len + 2 * kv_len))?;
-        let route = if d.slots == gated::N_SLOTS {
-            Route::Gated(gated::RouterOut::with_tokens(stream, rows)?)
+        let bufs = RouterOut::with_tokens(stream, d.router, rows)?;
+        let route = if d.router.gated() {
+            Route::Gated(bufs)
         } else {
-            Route::Plain(RouterOut::with_tokens(stream, rows)?)
+            Route::Plain(bufs)
         };
         let part_v = if d.head == HEAD_256 {
             partials_v_len_256(rows, d.n_head, d.ctx)
@@ -710,11 +717,11 @@ impl Arena {
             ffn_inp: f(rows * d.hidden)?,
             act_ffn: acts(d.hidden)?,
             route,
-            h: f(rows * d.slots * d.ff)?,
+            h: f(rows * d.slots() * d.ff)?,
             act_h: (1..=rows)
-                .map(|m| Q8Act::with_slots(stream, m * d.slots, d.ff))
+                .map(|m| Q8Act::with_slots(stream, m * d.slots(), d.ff))
                 .collect::<Result<Vec<_>, _>>()?,
-            down: f(rows * d.slots * d.hidden)?,
+            down: f(rows * d.slots() * d.hidden)?,
             gdn: d
                 .lin
                 .map(|shape| GdnArena::new(stream, shape, rows))

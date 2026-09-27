@@ -115,11 +115,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
-    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu::arch::qwen3moe::router::gated::{
-        N_EXPERT, N_EXPERT_512, N_SLOTS, N_SLOTS_512, N_USED, N_USED_512, ROWS, ROWS_512,
-        RouterKernels, RouterOut, RouterOut512, SHARED, SHARED_512,
-    };
+    use bloomery_gpu::arch::qwen3moe::router::gated::{ROW, ROW_WIDE, RouterKernels, RouterOut};
+    use bloomery_gpu::arch::qwen3moe::router::{MAX_TOKENS, RouterDims};
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::gemm::{GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
@@ -136,7 +133,37 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+    use model::arch::models::shape::{MoeShape, rules};
     use refset::arch::qwen35moe as oracle;
+
+    /// The narrow instance's experts, its row's; the routed slots the
+    /// clauses run at, Qwen3.6's `expert_used_count` (`run` holds the file
+    /// to both); the slots and logits a token (the shared expert's last),
+    /// and the shared expert's id and gate row.
+    const N_EXPERT: usize = ROW.experts() as usize;
+    const N_USED: usize = 8;
+    const N_SLOTS: usize = N_USED + 1;
+    const ROWS: usize = N_EXPERT + 1;
+    const SHARED: usize = N_EXPERT;
+
+    /// The router's dims at `experts` and `top_k` routed slots.
+    fn dims(experts: usize, top_k: usize) -> Result<RouterDims, GateError> {
+        Ok(RouterDims::of(MoeShape {
+            rule: rules::SOFTMAX_NORM_GATED,
+            experts: u32::try_from(experts)?,
+            top_k: u32::try_from(top_k)?,
+        })?)
+    }
+
+    /// The narrow instance's dims at [`N_USED`].
+    fn narrow() -> Result<RouterDims, GateError> {
+        dims(N_EXPERT, N_USED)
+    }
+
+    /// The wide instance's dims at [`WIDE_USED`].
+    fn wide() -> Result<RouterDims, GateError> {
+        dims(WIDE_EXPERT, WIDE_USED)
+    }
 
     /// Probabilities and weights against the host rule, absolute: all lie
     /// in [0, 1] and the only divergence is `exp`'s last ulps (and the
@@ -188,8 +215,8 @@ mod gate {
 
     /// The wide instance's experts and routed slots, Qwen3.8's
     /// `expert_count` and `expert_used_count`: the gate's own values, apart
-    /// from the kernel constants, so a change to those is a red line rather
-    /// than a rewrite of both sides.
+    /// from the instance row, so a change to that is a red line rather than
+    /// a rewrite of both sides.
     const WIDE_EXPERT: usize = 512;
     const WIDE_USED: usize = 10;
     /// The wide instance's slots per token (the shared expert last) and
@@ -200,6 +227,12 @@ mod gate {
     const WIDE_K: usize = 2560;
     /// The wide case's tokens: three 32-token blocks of the ubatch pair.
     const WIDE_UB: usize = 70;
+
+    /// The routed slot counts the picks case runs at each instance besides
+    /// the models' own: one, an odd count, and the lane picks' bound.
+    const PICKS: [usize; 3] = [1, 3, 32];
+    /// The picks case's tokens: two routing blocks and a part of a third.
+    const PICK_TOKENS: usize = 19;
 
     // ------------------------------------------------------------ context
 
@@ -504,7 +537,7 @@ mod gate {
 
     fn routing_case(c: &Ctx, n_layer: usize) -> Result<bool, GateError> {
         let sink = c.gpu.unlabelled_sink();
-        let mut out = RouterOut::with_tokens(c.stream(), 1)?;
+        let mut out = RouterOut::with_tokens(c.stream(), narrow()?, 1)?;
         let (mut tokens, mut ids_ok, mut w_ok, mut gate_ok, mut rerun_ok) =
             (0, true, true, true, true);
         let (mut worst_p, mut worst_w, mut worst_g) = (0.0f32, 0.0f32, 0.0f32);
@@ -666,7 +699,7 @@ mod gate {
     }
 
     /// A wide run's buffers, read whole.
-    fn read_wide(stream: &CudaStream, out: &RouterOut512) -> Result<Routed, GateError> {
+    fn read_wide(stream: &CudaStream, out: &RouterOut) -> Result<Routed, GateError> {
         Ok(Routed {
             logits: out.logits.to_host_vec(stream)?,
             probs: out.probs.to_host_vec(stream)?,
@@ -794,14 +827,102 @@ mod gate {
         logits: &[f32],
         n: usize,
         sink: FaultSink,
-        out: &mut RouterOut512,
+        out: &mut RouterOut,
     ) -> Result<Routed, GateError> {
         let stream = c.stream();
         let x = DeviceBuffer::from_host(stream, logits)?;
         out.logits.copy_from_device_async(&x, stream)?;
-        c.router.enqueue_route_512(stream, n, sink, out)?;
+        c.router.enqueue_route(stream, n, sink, out)?;
         stream.synchronize()?;
         read_wide(stream, out)
+    }
+
+    /// The routed slot count is a launch argument: at each instance and each
+    /// of [`PICKS`], the routing alone of [`PICK_TOKENS`] tokens of synthetic
+    /// logits against the host rule at that count — the ids exact, the
+    /// probabilities, the routed weights and the gate weight within [`BAND`]
+    /// — and the wide fused launch at three slots over five tokens of the
+    /// wide case's exact logits: its logits the host's bits, its routing the
+    /// routing alone's over those logits, bit for bit.
+    fn picks_case(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let mut ok = true;
+        let mut s = 0x9_1c45_u64;
+        for experts in [N_EXPERT, WIDE_EXPERT] {
+            let rows = experts + 1;
+            let logits: Vec<f32> = (0..PICK_TOKENS * rows)
+                .map(|_| ((lcg(&mut s) % 2001) as f32 - 1000.0) * 4.0e-3)
+                .collect();
+            let x = DeviceBuffer::from_host(stream, &logits)?;
+            for top_k in PICKS {
+                let mut out = RouterOut::for_ubatch(stream, dims(experts, top_k)?, PICK_TOKENS)?;
+                out.logits.copy_from_device_async(&x, stream)?;
+                c.router
+                    .enqueue_route(stream, PICK_TOKENS, sink, &mut out)?;
+                stream.synchronize()?;
+                let (probs, ids, weights) = (
+                    out.probs.to_host_vec(stream)?,
+                    out.ids.to_host_vec(stream)?,
+                    out.weights.to_host_vec(stream)?,
+                );
+                let slots = top_k + 1;
+                let (mut ids_ok, mut pe, mut we) = (true, 0.0f32, 0.0f32);
+                for t in 0..PICK_TOKENS {
+                    let h = host_route_at(&logits[t * rows..(t + 1) * rows], experts, top_k)?;
+                    ids_ok &= ids[t * slots..(t + 1) * slots] == h.ids[..];
+                    pe = pe.max(max_abs(&probs[t * experts..(t + 1) * experts], &h.probs));
+                    we = we.max(max_abs(&weights[t * slots..(t + 1) * slots], &h.weights));
+                }
+                let pass = ids_ok && pe <= BAND && we <= BAND;
+                println!(
+                    "picks experts={experts} k={top_k} route n={PICK_TOKENS} vs host: \
+                     ids_exact={ids_ok} probs_err={pe:.3e} weights_err={we:.3e} (band {BAND:.0e}) {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+
+        const M: usize = 5;
+        const K3: usize = 3;
+        let wh = wide_weight();
+        let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
+        let cols = wide_cols(M);
+        let want: Vec<f32> = (0..M).flat_map(|t| wide_logits(&wh, &cols, t)).collect();
+        let d = dims(WIDE_EXPERT, K3)?;
+        let mut fout = RouterOut::with_tokens(stream, d, MAX_TOKENS)?;
+        let mut rout = RouterOut::for_ubatch(stream, d, M)?;
+        c.router.enqueue_fused(
+            stream,
+            &w,
+            &DeviceBuffer::from_host(stream, &cols)?,
+            M,
+            sink,
+            &mut fout,
+        )?;
+        stream.synchronize()?;
+        let got = read_wide(stream, &fout)?;
+        rout.logits
+            .copy_from_device_async(&DeviceBuffer::from_host(stream, &want)?, stream)?;
+        c.router.enqueue_route(stream, M, sink, &mut rout)?;
+        stream.synchronize()?;
+        let alone = read_wide(stream, &rout)?;
+        let slots = K3 + 1;
+        let logits = bits_equal(&got.logits[..M * WIDE_ROWS], &want);
+        let routing = bits_equal(
+            &got.probs[..M * WIDE_EXPERT],
+            &alone.probs[..M * WIDE_EXPERT],
+        ) && got.ids[..M * slots] == alone.ids[..M * slots]
+            && bits_equal(&got.weights[..M * slots], &alone.weights[..M * slots]);
+        let pass = logits && routing;
+        println!(
+            "picks experts={WIDE_EXPERT} k={K3} fused m={M} (exact logits): logits_bits={logits} \
+             routing = the routing alone's bits {routing} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        Ok(ok)
     }
 
     fn wide_case(c: &Ctx) -> Result<bool, GateError> {
@@ -809,11 +930,14 @@ mod gate {
         let sink = c.gpu.unlabelled_sink();
 
         // The instance against the gate's own widths.
-        let consts = (N_EXPERT_512, N_USED_512, N_SLOTS_512, ROWS_512, SHARED_512);
+        let d = wide()?;
+        let consts = (d.experts(), d.used(), d.slots(), d.logits(), d.experts());
         let want = (WIDE_EXPERT, WIDE_USED, WIDE_SLOTS, WIDE_ROWS, WIDE_EXPERT);
-        let pass = consts == want;
+        let row = d.inst() == ROW_WIDE;
+        let pass = consts == want && row;
         println!(
-            "wide512 instance: (experts, used, slots, rows, shared) = {consts:?} (want {want:?}) {}",
+            "wide512 instance: (experts, used, slots, rows, shared) = {consts:?} (want {want:?}), \
+             the wide row {row} {}",
             verdict(pass)
         );
         if !pass {
@@ -828,13 +952,12 @@ mod gate {
 
         // The fused launch: m = 1 takes the one-column gemv, 5 and 8 the
         // m-column one.
-        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
+        let mut fout = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
         let mut fused = WideCheck::new();
         let mut tickets = Vec::new();
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
-            c.router
-                .enqueue_fused_512(stream, &w, &x, m, sink, &mut fout)?;
+            c.router.enqueue_fused(stream, &w, &x, m, sink, &mut fout)?;
             stream.synchronize()?;
             let got = read_wide(stream, &fout)?;
             tickets.push(fout.tickets(stream)?);
@@ -864,8 +987,8 @@ mod gate {
         // The routing alone over the host's exact logits of every token, one
         // launch (warps 0..8 of nine blocks), then again: bit-identical.
         let flat: Vec<f32> = want.concat();
-        let mut rout = RouterOut512::with_tokens(stream, 1)?;
-        let mut uout = RouterOut512::for_ubatch(stream, WIDE_UB)?;
+        let mut rout = RouterOut::with_tokens(stream, wide()?, 1)?;
+        let mut uout = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
         let a = wide_route(c, &flat, WIDE_UB, sink, &mut uout)?;
         let b = wide_route(c, &flat, WIDE_UB, sink, &mut uout)?;
         let mut route = WideCheck::new();
@@ -881,7 +1004,7 @@ mod gate {
         // fused launch's bits at one token.
         let x = DeviceBuffer::from_host(stream, &cols)?;
         c.router
-            .enqueue_ubatch_512(stream, &w, &x, WIDE_UB, sink, &mut uout)?;
+            .enqueue_ubatch(stream, &w, &x, WIDE_UB, sink, &mut uout)?;
         stream.synchronize()?;
         let ub = read_wide(stream, &uout)?;
         let mut pair = WideCheck::new();
@@ -891,7 +1014,7 @@ mod gate {
             pair.add(&gt, lt)?;
             let xt = DeviceBuffer::from_host(stream, &cols[t * WIDE_K..(t + 1) * WIDE_K])?;
             c.router
-                .enqueue_fused_512(stream, &w, &xt, 1, sink, &mut rout)?;
+                .enqueue_fused(stream, &w, &xt, 1, sink, &mut rout)?;
             stream.synchronize()?;
             same += usize::from(routed_equal(
                 &gt,
@@ -1009,8 +1132,8 @@ mod gate {
         let wh: Vec<f32> = (0..WIDE_ROWS * WIDE_K).map(|_| val(1.3e-5)).collect();
         let cols: Vec<f32> = (0..WIDE_UB * WIDE_K).map(|_| val(7.1e-4)).collect();
         let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
-        let mut one = RouterOut512::with_tokens(stream, 1)?;
-        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
+        let mut one = RouterOut::with_tokens(stream, wide()?, 1)?;
+        let mut fout = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
         let mut ok = true;
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
@@ -1040,8 +1163,7 @@ mod gate {
                 );
                 ok &= pass;
             }
-            c.router
-                .enqueue_fused_512(stream, &w, &x, m, sink, &mut fout)?;
+            c.router.enqueue_fused(stream, &w, &x, m, sink, &mut fout)?;
             stream.synchronize()?;
             let got = read_wide(stream, &fout)?;
             let tickets = fout.tickets(stream)?;
@@ -1060,16 +1182,15 @@ mod gate {
             ok &= pass;
         }
         let x = DeviceBuffer::from_host(stream, &cols)?;
-        let mut ub = RouterOut512::for_ubatch(stream, WIDE_UB)?;
+        let mut ub = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
         c.router
-            .enqueue_ubatch_512(stream, &w, &x, WIDE_UB, sink, &mut ub)?;
+            .enqueue_ubatch(stream, &w, &x, WIDE_UB, sink, &mut ub)?;
         stream.synchronize()?;
         let got = read_wide(stream, &ub)?;
         let mut same = 0usize;
         for t in 0..WIDE_UB {
             let xt = DeviceBuffer::from_host(stream, &cols[t * WIDE_K..(t + 1) * WIDE_K])?;
-            c.router
-                .enqueue_fused_512(stream, &w, &xt, 1, sink, &mut one)?;
+            c.router.enqueue_fused(stream, &w, &xt, 1, sink, &mut one)?;
             stream.synchronize()?;
             let want = wide_token(&read_wide(stream, &one)?, 0);
             same += usize::from(routed_equal(&wide_token(&got, t), &want));
@@ -1104,7 +1225,7 @@ mod gate {
         let mut ok = true;
 
         let clean_l = want[0].clone();
-        let mut out = RouterOut512::with_tokens(stream, 1)?;
+        let mut out = RouterOut::with_tokens(stream, wide()?, 1)?;
         let before = c.gpu.fault()?;
         let clean = wide_route(c, &clean_l, 1, sink, &mut out)?;
         let after = c.gpu.fault()?;
@@ -1141,9 +1262,8 @@ mod gate {
 
         let m = 5usize;
         let xc = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
-        let mut fout = RouterOut512::with_tokens(stream, MAX_TOKENS)?;
-        c.router
-            .enqueue_fused_512(stream, w, &xc, m, sink, &mut fout)?;
+        let mut fout = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
+        c.router.enqueue_fused(stream, w, &xc, m, sink, &mut fout)?;
         stream.synchronize()?;
         let clean_f = read_wide(stream, &fout)?;
         let clean_word = c.gpu.take_fault()?;
@@ -1151,7 +1271,7 @@ mod gate {
         wn[400 * WIDE_K + 3] = f32::NAN;
         let wnd = DeviceTensor::upload(stream, &wn, WIDE_ROWS, WIDE_K)?;
         c.router
-            .enqueue_fused_512(stream, &wnd, &xc, m, sink, &mut fout)?;
+            .enqueue_fused(stream, &wnd, &xc, m, sink, &mut fout)?;
         stream.synchronize()?;
         let got = read_wide(stream, &fout)?;
         let tickets = fout.tickets(stream)?;
@@ -1168,9 +1288,8 @@ mod gate {
 
         let n = 9usize;
         let xu = DeviceBuffer::from_host(stream, &cols[..n * WIDE_K])?;
-        let mut ub = RouterOut512::for_ubatch(stream, n)?;
-        c.router
-            .enqueue_ubatch_512(stream, w, &xu, n, sink, &mut ub)?;
+        let mut ub = RouterOut::for_ubatch(stream, wide()?, n)?;
+        c.router.enqueue_ubatch(stream, w, &xu, n, sink, &mut ub)?;
         stream.synchronize()?;
         let clean_u = read_wide(stream, &ub)?;
         let clean_word = c.gpu.take_fault()?;
@@ -1178,7 +1297,7 @@ mod gate {
         wn[WIDE_EXPERT * WIDE_K + 5] = f32::NAN;
         let wnd = DeviceTensor::upload(stream, &wn, WIDE_ROWS, WIDE_K)?;
         c.router
-            .enqueue_ubatch_512(stream, &wnd, &xu, n, sink, &mut ub)?;
+            .enqueue_ubatch(stream, &wnd, &xu, n, sink, &mut ub)?;
         stream.synchronize()?;
         let got = read_wide(stream, &ub)?;
         let word = c.gpu.take_fault()?;
@@ -1257,8 +1376,8 @@ mod gate {
         let stream = c.stream();
         let sink = c.gpu.unlabelled_sink();
         let mut ok = true;
-        let mut one = RouterOut::with_tokens(stream, 1)?;
-        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut one = RouterOut::with_tokens(stream, narrow()?, 1)?;
+        let mut fout = RouterOut::with_tokens(stream, narrow()?, MAX_TOKENS)?;
         let cols = normed_cols(c, ly.l, LOGITS_UB)?;
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * HIDDEN])?;
@@ -1281,7 +1400,7 @@ mod gate {
         // The ubatch pair against the fused launch per token.
         let n = LOGITS_UB;
         let x = DeviceBuffer::from_host(stream, &cols[..n * HIDDEN])?;
-        let mut ub = RouterOut::for_ubatch(stream, n)?;
+        let mut ub = RouterOut::for_ubatch(stream, narrow()?, n)?;
         c.router
             .enqueue_ubatch(stream, &ly.router, &x, n, sink, &mut ub)?;
         stream.synchronize()?;
@@ -1384,8 +1503,8 @@ mod gate {
         let stream = c.stream();
         let sink = c.gpu.unlabelled_sink();
         let rows = resid_rows(c, ly.l, 5)?;
-        let mut out_s = RouterOut::with_tokens(stream, 1)?;
-        let mut out_f = RouterOut::with_tokens(stream, 1)?;
+        let mut out_s = RouterOut::with_tokens(stream, narrow()?, 1)?;
+        let mut out_f = RouterOut::with_tokens(stream, narrow()?, 1)?;
         let (mut same, mut tickets_ok) = (0usize, true);
         for t in 0..5 {
             let x = DeviceBuffer::from_host(stream, &rows[t * HIDDEN..(t + 1) * HIDDEN])?;
@@ -1446,7 +1565,7 @@ mod gate {
         // The routing alone.
         let (lg, _) = ik_logits(c, 0, ly.l)?;
         let clean_l = lg[..ROWS].to_vec();
-        let mut out = RouterOut::with_tokens(stream, 1)?;
+        let mut out = RouterOut::with_tokens(stream, narrow()?, 1)?;
         let before = c.gpu.fault()?;
         let clean = route_one(c, &clean_l, sink, &mut out)?;
         let after = c.gpu.fault()?;
@@ -1484,7 +1603,7 @@ mod gate {
         let m = 5usize;
         let cols = normed_cols(c, ly.l, 9)?;
         let xc = DeviceBuffer::from_host(stream, &cols[..m * HIDDEN])?;
-        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut fout = RouterOut::with_tokens(stream, narrow()?, MAX_TOKENS)?;
         let (clean_f, _) = fused_run(c, &ly.router, &xc, m, sink, &mut fout)?;
         let clean_word = c.gpu.take_fault()?;
         let all: Vec<usize> = (0..m).collect();
@@ -1509,7 +1628,7 @@ mod gate {
         // every token; a column overflowing the gate row refuses its token.
         let ub_n = 9usize;
         let xu = DeviceBuffer::from_host(stream, &cols[..ub_n * HIDDEN])?;
-        let mut ub = RouterOut::for_ubatch(stream, ub_n)?;
+        let mut ub = RouterOut::for_ubatch(stream, narrow()?, ub_n)?;
         c.router
             .enqueue_ubatch(stream, &ly.router, &xu, ub_n, sink, &mut ub)?;
         stream.synchronize()?;
@@ -1565,7 +1684,7 @@ mod gate {
         // The norm-fused launch with a NaN in the gate row.
         let rows = resid_rows(c, ly.l, 1)?;
         let x0 = DeviceBuffer::from_host(stream, &rows)?;
-        let mut o1 = RouterOut::with_tokens(stream, 1)?;
+        let mut o1 = RouterOut::with_tokens(stream, narrow()?, 1)?;
         let (cq, cr, _) = norm_fused(c, ly, &ly.router, &x0, sink, &mut o1)?;
         let clean_word = c.gpu.take_fault()?;
         let (gq, gr, _) = norm_fused(c, ly, &wnd, &x0, sink, &mut o1)?;
@@ -1820,7 +1939,7 @@ mod gate {
                 m,
                 act_x: Q8Act::with_k(stream, m, HIDDEN)?,
                 normed: DeviceBuffer::zeroed(stream, m * HIDDEN)?,
-                out: RouterOut::with_tokens(stream, MAX_TOKENS)?,
+                out: RouterOut::with_tokens(stream, narrow()?, MAX_TOKENS)?,
                 h: DeviceBuffer::zeroed(stream, m * N_SLOTS * FF)?,
                 act_h: Q8Act::with_slots(stream, m * N_SLOTS, FF)?,
                 down: DeviceBuffer::zeroed(stream, m * N_SLOTS * HIDDEN)?,
@@ -2254,7 +2373,7 @@ mod gate {
         // The ubatch path.
         let mut act_hid = GemmAct::new(stream, n, HIDDEN)?;
         c.gpu.enqueue_quantize_gemm(&xd, n, &mut act_hid, sink)?;
-        let mut ub = RouterOut::for_ubatch(stream, n)?;
+        let mut ub = RouterOut::for_ubatch(stream, narrow()?, n)?;
         c.router
             .enqueue_ubatch(stream, &ly.router, &xd, n, sink, &mut ub)?;
         let mut route = GemmRoute::new(stream, slots, ROWS)?;
@@ -2318,7 +2437,7 @@ mod gate {
         let mut y_one = Vec::with_capacity(n * HIDDEN);
         let mut routing_same = true;
         let z1 = DeviceBuffer::<f32>::zeroed(stream, HIDDEN)?;
-        let mut out = RouterOut::with_tokens(stream, 1)?;
+        let mut out = RouterOut::with_tokens(stream, narrow()?, 1)?;
         for t in 0..n {
             let xt = DeviceBuffer::from_host(stream, &x[t * HIDDEN..(t + 1) * HIDDEN])?;
             let mut act = Q8Act::with_k(stream, 1, HIDDEN)?;
@@ -2394,7 +2513,7 @@ mod gate {
     fn ik_case(c: &Ctx, n_layer: usize) -> Result<bool, GateError> {
         let stream = c.stream();
         let sink = c.gpu.unlabelled_sink();
-        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut fout = RouterOut::with_tokens(stream, narrow()?, MAX_TOKENS)?;
         let (mut tokens, mut logits_ok, mut ids_ok, mut w_ok, mut gate_ok) =
             (0usize, true, true, true, true);
         let (mut worst_l, mut worst_w, mut worst_sig) = (0.0f64, 0.0f32, 0.0f32);
@@ -2594,6 +2713,9 @@ mod gate {
         }
         if c.want("wide512") {
             ok &= wide_case(&c)?;
+        }
+        if c.want("picks") {
+            ok &= picks_case(&c)?;
         }
         if c.want("ik") {
             ok &= ik_case(&c, n_layer)?;
