@@ -53,7 +53,7 @@ impl AnyEngine {
             Ok(a @ Arch::Deepseek41) => {
                 return Err(GpuError::UnsupportedArch(a.name().to_string()));
             }
-            Ok(Arch::Qwen3moe) | Err(_) => {}
+            Ok(Arch::Qwen3moe | Arch::Qwen35moe) | Err(_) => {}
         }
         let read = arch::spec(&file)?;
         let missing = coverage::check(&read.spec, &read.tensors);
