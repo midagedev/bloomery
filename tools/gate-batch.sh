@@ -83,9 +83,8 @@
 # (lease_guard, tools/ref/lease-probe.sh) with BLOOMERY_BOX_WAIT=0. Once the batch runs, every item's box.sh
 # call passes that guard with its default wait: a sitting that takes the lease mid-batch gets a quiet
 # box — the item waits (up to 30 min, then rc 75, which retries below) and starts after the sitting.
-# The wait comes before the item's command, so the runners' 900 s bound does not count it; nor does the
-# item's times row: the final try's seconds less the waits its log names (box.sh's guard, gpu-gate.sh's lock),
-# which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
+# The wait comes before the item's command, so the runners' 900 s bound does not count it; the item's
+# times row does (its final try's seconds). --dry-run validates, prints each item's lane, command and
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
 #
@@ -994,20 +993,8 @@ echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" 
 echo "gate-batch: $N items, lanes $LANES, logs in $OUT"
 predicted
 
-# try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
-# (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock (`gpu-gate.sh: waited N s`),
-# summed over the try's section of the item's log. A times row holds the rest: a lock queue is not a gate's cost.
-try_waits() {
-  awk -v t="=== try $2 " '
-    index($0, t) == 1 { on = 1; next }
-    /^=== try / { on = 0 }
-    on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
-    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the gate lock/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
-    END { print w + 0 }' "$1"
-}
-
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line waits=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran s benv line
   local argv=()
   eval "argv=(${P_ARGS[$i]})"
   benv=$(box_env_of "$i")
@@ -1021,7 +1008,6 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     echo $! > "$OUT/lane-$lane.child"
     wait $! || rc=$?
     ran=$(($(date +%s) - t1))
-    waits=$(try_waits "$log" "$try")
     if [ "$rc" -eq 75 ] && [ "$try" -lt "$TRIES_MAX" ]; then
       echo "=== rc 75 (lock contention): retry in ${RETRY_WAIT} s" >> "$log"
       sleep "$RETRY_WAIT"
@@ -1031,8 +1017,6 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   done
   s=$(($(date +%s) - t0))
   line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
-  [ "$waits" = 0 ] || line="$line waited=${waits}s"
-  ran=$((ran > waits ? ran - waits : 0))
   [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing.
   if [ "$rc" != 75 ] && ! times_record "$i" "$lane" "$ran"; then
