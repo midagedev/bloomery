@@ -2274,7 +2274,7 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
         {
             return GpuError::fault(r.what, fault);
         }
-        Some(f) => format!("first names {f} — later than this layer"),
+        Some(f) => format!("first names {f:#} — later than this layer"),
         None => "is clean".to_owned(),
     };
     GpuError::protocol(

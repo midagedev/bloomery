@@ -428,7 +428,7 @@ impl std::fmt::Display for GpuError {
                 fault,
                 behind,
             } => {
-                write!(f, "{what}: device fault at {fault}")?;
+                write!(f, "{what}: device fault at {fault:#}")?;
                 match behind {
                     Some(e) => write!(f, "; the call also failed: {e}"),
                     None => Ok(()),
@@ -436,7 +436,7 @@ impl std::fmt::Display for GpuError {
             }
             GpuError::Poisoned { what, fault } => write!(
                 f,
-                "{what}: the model is poisoned by an earlier device fault at {fault}; reset() \
+                "{what}: the model is poisoned by an earlier device fault at {fault:#}; reset() \
                  clears it"
             ),
         }

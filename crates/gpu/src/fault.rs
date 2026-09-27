@@ -375,6 +375,11 @@ impl Fault {
     }
 }
 
+/// Where the fault was raised, its site's name and the mask in step order.
+/// The alternate form (`{:#}`) adds the site's [`FaultSite::cause`] after its
+/// name: an error's text carries it once ([`crate::GpuError::Fault`]), while a
+/// gate line that prints a fault beside the one it wants reads the two
+/// without it.
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let where_ = match self.layer {
@@ -384,7 +389,8 @@ impl std::fmt::Display for Fault {
         };
         write!(f, "{where_}")?;
         match self.site() {
-            Some(s) => write!(f, " site {} ({})", s.name(), s.cause())?,
+            Some(s) if f.alternate() => write!(f, " site {} ({})", s.name(), s.cause())?,
+            Some(s) => write!(f, " site {}", s.name())?,
             None => write!(f, " site code {} (unknown)", self.code)?,
         }
         let (order, named) = match self.arch {
@@ -561,5 +567,29 @@ mod tests {
         assert!(shown.contains("key_count, quant_column"), "{shown}");
         let odd = Fault::from_words((3 << 8) | 1, (1 << 1) | (1 << 20)).unwrap();
         assert!(odd.to_string().contains("code 20"), "{odd}");
+    }
+
+    #[test]
+    fn the_cause_prints_once_in_an_error_and_not_in_the_plain_form() {
+        let f = Fault::at(7, FaultSite::ExpertId);
+        let cause = FaultSite::ExpertId.cause();
+        let plain = f.to_string();
+        assert!(
+            plain.contains("site expert_id") && !plain.contains(cause),
+            "{plain}"
+        );
+        assert_eq!(format!("{f:#}").matches(cause).count(), 1, "{f:#}");
+        let line = format!("word \"{f}\" (want \"{f}\")");
+        assert!(!line.contains(cause), "{line}");
+        for e in [
+            crate::GpuError::fault("step", f),
+            crate::GpuError::Poisoned {
+                what: "step",
+                fault: f,
+            },
+        ] {
+            let text = e.to_string();
+            assert_eq!(text.matches(cause).count(), 1, "{text}");
+        }
     }
 }

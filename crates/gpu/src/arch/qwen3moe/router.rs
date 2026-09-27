@@ -65,6 +65,7 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Experts the router softmaxes over (`expert_count`).
@@ -1793,45 +1794,72 @@ mod qwen3moe_router_kernels {
     }
 }
 
+/// One router's widths in its [`RouterBufs`]: logits and probabilities per
+/// token, slots per token, the most tokens a ubatch output holds, and the
+/// names its allocation refusals carry.
+pub trait RouterShape {
+    /// Logits per token: one per router row.
+    const LOGITS: usize;
+    /// Probabilities per token: one per softmaxed expert.
+    const PROBS: usize;
+    /// Slots (an id and a weight each) per token.
+    const SLOTS: usize;
+    /// The most tokens [`RouterBufs::for_ubatch`] allocates.
+    const UBATCH: usize;
+    /// The refusal name of [`RouterBufs::with_tokens`].
+    const WITH_TOKENS: &'static str;
+    /// The refusal name of [`RouterBufs::for_ubatch`].
+    const FOR_UBATCH: &'static str;
+}
+
+/// [`RouterOut`]'s shape: [`N_EXPERT`] logits and probabilities, [`N_USED`]
+/// slots a token, ubatches of up to [`UBATCH`] tokens.
+pub struct Plain;
+
+impl RouterShape for Plain {
+    const LOGITS: usize = N_EXPERT;
+    const PROBS: usize = N_EXPERT;
+    const SLOTS: usize = N_USED;
+    const UBATCH: usize = UBATCH;
+    const WITH_TOKENS: &'static str = "qwen3moe::router::RouterOut::with_tokens";
+    const FOR_UBATCH: &'static str = "qwen3moe::router::RouterOut::for_ubatch";
+}
+
 /// Where one router launch leaves its results, allocated once and reused by
-/// every launch and replay: per token the logits (the fused launch's) and
+/// every launch and replay: per token the logits (the fused launches') and
 /// the probabilities, per slot the expert id and the weight, and the fused
-/// launch's block ticket count, which it returns to zero. The count serves
-/// one launch at a time, so launches that share a `RouterOut` must be
-/// ordered on one stream. `tokens` is how many tokens the buffers hold, and
-/// only that: each launcher checks its own launch's bound beside it.
-pub struct RouterOut {
+/// launches' block ticket count, which they return to zero. The count serves
+/// one launch at a time, so launches that share one must be ordered on one
+/// stream. `tokens` is how many tokens the buffers hold, and only that: each
+/// launcher checks its own launch's bound beside it. `S` sets the widths; a
+/// router's kernels take only buffers of their own shape.
+pub struct RouterBufs<S: RouterShape> {
     pub logits: DeviceBuffer<f32>,
     pub probs: DeviceBuffer<f32>,
     pub ids: DeviceBuffer<u32>,
     pub weights: DeviceBuffer<f32>,
     done: DeviceBuffer<u32>,
     tokens: usize,
+    shape: PhantomData<S>,
 }
 
-impl RouterOut {
+/// The 128-expert router's buffers ([`RouterKernels`]).
+pub type RouterOut = RouterBufs<Plain>;
+
+impl<S: RouterShape> RouterBufs<S> {
     /// Allocate the buffers for up to `tokens` (1..=[`MAX_TOKENS`]) tokens
     /// per launch. Load-time only.
-    pub fn with_tokens(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-        RouterOut::alloc(
-            stream,
-            tokens,
-            MAX_TOKENS,
-            "qwen3moe::router::RouterOut::with_tokens",
-        )
+    pub fn with_tokens(stream: &CudaStream, tokens: usize) -> Result<Self, GpuError> {
+        Self::alloc(stream, tokens, MAX_TOKENS, S::WITH_TOKENS)
     }
 
-    /// Allocate the buffers for a ubatch of up to `tokens` (1..=[`UBATCH`])
-    /// tokens, the output of [`RouterKernels::enqueue_ubatch`]. A fused
-    /// launch into them still routes at most [`MAX_TOKENS`] tokens and is
-    /// refused by name past that. Load-time only.
-    pub fn for_ubatch(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-        RouterOut::alloc(
-            stream,
-            tokens,
-            UBATCH,
-            "qwen3moe::router::RouterOut::for_ubatch",
-        )
+    /// Allocate the buffers for a ubatch of up to `tokens`
+    /// (1..=[`RouterShape::UBATCH`]) tokens, the output of the shape's
+    /// `enqueue_ubatch`. A fused launch into them still routes at most
+    /// [`MAX_TOKENS`] tokens and is refused by name past that. Load-time
+    /// only.
+    pub fn for_ubatch(stream: &CudaStream, tokens: usize) -> Result<Self, GpuError> {
+        Self::alloc(stream, tokens, S::UBATCH, S::FOR_UBATCH)
     }
 
     /// The buffers for `tokens` (1..=`most`) tokens, the ticket count zeroed;
@@ -1841,20 +1869,21 @@ impl RouterOut {
         tokens: usize,
         most: usize,
         what: &'static str,
-    ) -> Result<RouterOut, GpuError> {
+    ) -> Result<Self, GpuError> {
         if !(1..=most).contains(&tokens) {
             return Err(GpuError::shape(
                 what,
                 format!("{tokens} tokens, want 1..={most}"),
             ));
         }
-        Ok(RouterOut {
-            logits: DeviceBuffer::zeroed(stream, tokens * N_EXPERT)?,
-            probs: DeviceBuffer::zeroed(stream, tokens * N_EXPERT)?,
-            ids: DeviceBuffer::zeroed(stream, tokens * N_USED)?,
-            weights: DeviceBuffer::zeroed(stream, tokens * N_USED)?,
+        Ok(RouterBufs {
+            logits: DeviceBuffer::zeroed(stream, tokens * S::LOGITS)?,
+            probs: DeviceBuffer::zeroed(stream, tokens * S::PROBS)?,
+            ids: DeviceBuffer::zeroed(stream, tokens * S::SLOTS)?,
+            weights: DeviceBuffer::zeroed(stream, tokens * S::SLOTS)?,
             done: DeviceBuffer::zeroed(stream, 1)?,
             tokens,
+            shape: PhantomData,
         })
     }
 
@@ -2159,8 +2188,8 @@ impl RouterKernels {
 pub mod gated {
     use super::{
         FUSED_THREADS_U32, FUSED_WARPS, LINE, LOGITS_THREADS_U32, LOGITS_TOKENS, MAX_TOKENS,
-        NORM_K, RMS_WARPS, STAGE_FLOATS, STAGES, gated_fused_body, gated_norm_body,
-        gated_route_body, logits_body,
+        NORM_K, RMS_WARPS, RouterBufs, RouterShape, STAGE_FLOATS, STAGES, gated_fused_body,
+        gated_norm_body, gated_route_body, logits_body,
     };
     use crate::fault::FaultSink;
     use crate::gemm::GEMM_MAX_SLOTS;
@@ -2453,90 +2482,22 @@ pub mod gated {
         }
     }
 
-    /// Where one gated router launch leaves its results, allocated once and
-    /// reused by every launch and replay: per token the [`ROWS`] logits and
-    /// the [`N_EXPERT`] probabilities, per slot ([`N_SLOTS`] a token) the
-    /// expert id and the weight, and the fused launches' block ticket count,
-    /// which they return to zero. As [`super::RouterOut`]: launches that
-    /// share one are ordered on one stream, and `tokens` bounds the buffers
-    /// only.
-    pub struct RouterOut {
-        pub logits: DeviceBuffer<f32>,
-        pub probs: DeviceBuffer<f32>,
-        pub ids: DeviceBuffer<u32>,
-        pub weights: DeviceBuffer<f32>,
-        done: DeviceBuffer<u32>,
-        tokens: usize,
+    /// The gated router's shape: [`ROWS`] logits and [`N_EXPERT`]
+    /// probabilities a token, [`N_SLOTS`] slots a token, ubatches of up to
+    /// [`UBATCH_TOKENS`] tokens.
+    pub struct Gated;
+
+    impl RouterShape for Gated {
+        const LOGITS: usize = ROWS;
+        const PROBS: usize = N_EXPERT;
+        const SLOTS: usize = N_SLOTS;
+        const UBATCH: usize = UBATCH_TOKENS;
+        const WITH_TOKENS: &'static str = "qwen3moe::router::gated::RouterOut::with_tokens";
+        const FOR_UBATCH: &'static str = "qwen3moe::router::gated::RouterOut::for_ubatch";
     }
 
-    impl RouterOut {
-        /// Allocate the buffers for up to `tokens` (1..=`MAX_TOKENS`)
-        /// tokens per launch. Load-time only.
-        pub fn with_tokens(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-            RouterOut::alloc(
-                stream,
-                tokens,
-                MAX_TOKENS,
-                "qwen3moe::router::gated::RouterOut::with_tokens",
-            )
-        }
-
-        /// Allocate the buffers for a ubatch of up to `tokens`
-        /// (1..=[`UBATCH_TOKENS`]) tokens, the output of
-        /// [`RouterKernels::enqueue_ubatch`]; a fused launch into them still
-        /// routes at most `MAX_TOKENS`. Load-time only.
-        pub fn for_ubatch(stream: &CudaStream, tokens: usize) -> Result<RouterOut, GpuError> {
-            RouterOut::alloc(
-                stream,
-                tokens,
-                UBATCH_TOKENS,
-                "qwen3moe::router::gated::RouterOut::for_ubatch",
-            )
-        }
-
-        /// The buffers for `tokens` (1..=`most`) tokens, the ticket count
-        /// zeroed; a count outside that is refused as `what`.
-        fn alloc(
-            stream: &CudaStream,
-            tokens: usize,
-            most: usize,
-            what: &'static str,
-        ) -> Result<RouterOut, GpuError> {
-            if !(1..=most).contains(&tokens) {
-                return Err(GpuError::shape(
-                    what,
-                    format!("{tokens} tokens, want 1..={most}"),
-                ));
-            }
-            Ok(RouterOut {
-                logits: DeviceBuffer::zeroed(stream, tokens * ROWS)?,
-                probs: DeviceBuffer::zeroed(stream, tokens * N_EXPERT)?,
-                ids: DeviceBuffer::zeroed(stream, tokens * N_SLOTS)?,
-                weights: DeviceBuffer::zeroed(stream, tokens * N_SLOTS)?,
-                done: DeviceBuffer::zeroed(stream, 1)?,
-                tokens,
-            })
-        }
-
-        /// The tokens these buffers hold.
-        pub fn tokens(&self) -> usize {
-            self.tokens
-        }
-
-        /// The ticket count as it stands: zero between launches.
-        pub fn tickets(&self, stream: &CudaStream) -> Result<u32, GpuError> {
-            Ok(self.done.to_host_vec(stream)?[0])
-        }
-
-        /// Device bytes of the buffers.
-        pub fn bytes(&self) -> usize {
-            self.logits.num_bytes()
-                + self.probs.num_bytes()
-                + self.ids.num_bytes()
-                + self.weights.num_bytes()
-                + self.done.num_bytes()
-        }
-    }
+    /// The gated router's buffers ([`RouterKernels`]).
+    pub type RouterOut = RouterBufs<Gated>;
 
     /// Err unless `w` is a joined router weight of [`ROWS`] rows whose
     /// width is a positive multiple of `unit` (and at most `most`): its
