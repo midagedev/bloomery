@@ -161,6 +161,15 @@ if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${cb##*$'\n'}"
+# lcpp-warm.sh is the depth runners' llama-server arms: its flag translation (against V4.1's LCPP_CLI_FLAGS),
+# its refusals, the context, the --help probe and a stub server's start, requests, checks and stop (python3
+# and curl, 127.0.0.1) are tested here, no box.
+if ! lw=$(bash "$(dirname "$0")/ref/lcpp-warm.sh" --self-test 2>&1); then
+  echo "$lw" >&2
+  echo "check-recipes: the lcpp-warm self-test failed" >&2
+  exit 1
+fi
+echo "${lw##*$'\n'}"
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
 if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
