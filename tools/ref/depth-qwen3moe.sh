@@ -195,6 +195,13 @@
 # does (`--prefill auto|gemm`: `kind=gemm`, `plan=ubatch:<U>…`; `pass` keeps the 8-position passes), so its
 # pp_tok/s is the ubatch path's. The
 # profile's reference trees and flags are its own (models/qwen35moe.sh).
+#
+# Qwen3.8-Flash-Next runs under the qwen4exp profile (`just depth-gpu-qwen4exp`, BLOOMERY_MODEL=qwen4exp)
+# the same way: generate_qwen3moe opens Body38, its plan on the A6000 (`--place a`, the default),
+# every routed expert on the host tier. Its prompt runs as eager passes of up to eight positions
+# through the host tier's batch port (`--prefill pass`, the default: `kind=pass`, `plan=pass:8x<k>…`);
+# it has no ubatch path, and `--seed-depth` is refused. Its reference is mainline llama.cpp at
+# its profile's hand-set -ncmoe placement and llama-bench's fit (models/qwen4exp.sh).
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # MRS, MRSBIN, MRS_FLAGS); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so
@@ -202,9 +209,9 @@ set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 case $MODEL_NAME in
-  qwen3moe | qwen35moe) ;;
+  qwen3moe | qwen35moe | qwen4exp) ;;
   *)
-    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe or qwen35moe on the Mac side (BLOOMERY_MODEL=…)" >&2
+    echo "depth-qwen3moe.sh: the profile is $MODEL_NAME — pick qwen3moe, qwen35moe or qwen4exp on the Mac side (BLOOMERY_MODEL=…)" >&2
     exit 64
     ;;
 esac

@@ -1124,6 +1124,13 @@ depth-gpu-qwen3moe *ARMS:
 depth-gpu-qwen35moe *ARMS:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
+# Qwen3.8-Flash-Next (qwen4exp), the same table: depth-gpu-qwen3moe's runner, arms and tables under the qwen4exp
+# profile. Our arm is generate_qwen3moe opening Body38 on the A6000, every routed expert on the host tier, its prompt
+# by passes of up to eight (`kind=pass`); the reference is mainline llama.cpp, hand-set -ncmoe and fit (models/qwen4exp.sh).
+# Each arm pages the ~111 GB host set in when it is cold. BLOOMERY_DRY=1 prints the command lines only, nothing built.
+depth-gpu-qwen4exp *ARMS:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.

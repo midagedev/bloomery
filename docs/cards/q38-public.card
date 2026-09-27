@@ -1,7 +1,8 @@
 # The public Qwen3.8-Flash-Next (qwen4exp) rows in one window: decode at depth 6 / 1024 / 3000 and
 # prompt processing at P = 512 / 4096, bloomery (generate_qwen3moe on the qwen4exp UD-Q4_K_XL file,
-# Body38, every routed expert on the host tier) against mainline llama.cpp at `-ot exps=CPU` (the
-# same split: dense on the card, routed experts on the host). Runs only after proposal P8 gives
+# Body38, every routed expert on the host tier) against mainline llama.cpp (53ed051ce) at its best
+# placement on the A6000: the profile's hand-set `-ngl 99 -fa on -lzm off -ncmoe 26` and llama-bench's
+# fit, each row publishing the faster (models/qwen4exp.sh). Runs only after proposal P8 gives
 # tools/ref/depth-qwen3moe.sh its qwen4exp profile.
 #
 # The step is a sum, not a max: layer l+1 waits for layer l's combine, and only the shared expert
@@ -19,7 +20,8 @@
 # The prompt rows [derived]: --prefill step = decode, 30..37 tok/s at P = 512 and 4096; --prefill
 # pass (passes of 8 through the batch port: the host union 74.8 distinct experts a layer, 23..32 us
 # an expert, 82..115 ms over 48 layers, + card ~12 ms, eager enqueue and sync 2..5 ms) 60..80 tok/s
-# at both P. llama.cpp's rows are the reference, not predicted here past "host-bound too".
+# at both P. llama.cpp's rows are the reference, not predicted here past "host-bound too"; its
+# lcppfit / lcppppfit rows carry their fit column (a failed fit is a FAIL row, not a number).
 kind: baseline
 question: how long does one Qwen3.8 layer's routed service on the host tier take inside the
   decode step on the A6000, the one term the step derivation leaves open, and what are ours and
@@ -30,15 +32,15 @@ term: host service us a layer @ n=96, depth 6, A6000, all-host = (p50 step ms of
 unit: us
 predict: 350..460
 condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 3000 lcpp:3000 4096
-  lcpppp:4096, the order rotated every round (each ours arm's row carries its prompt's pass pp, so
-  the 512 and 4096 arms give pp512 and pp4096); about 45 minutes of lease [derived: five ours arms
-  of a 20..80 s load, up to 56 s of passes and 3 s of steps, four llama.cpp arms of a host-bound
+  lcpppp:4096 lcpppp4096:4096 lcppfit:6 lcppppfit4096:4096, the order rotated every round (each ours arm's row carries its prompt's pass pp, so
+  the 512 and 4096 arms give pp512 and pp4096); about 60 minutes of lease [derived: five ours arms
+  of a 20..80 s load, up to 56 s of passes and 3 s of steps, seven llama.cpp arms of a host-bound
   load and run, three rounds], past 30: the user's approval first; the qwen4exp host set (~111 GB)
   stays in the page cache: the runner has no preheat, so the lead reads each row's witness, and a
   row whose major-fault count rises by more than 10,000 across its arm (the host set paged in inside
   the timed steps; a warm arm faults about 0) is void and its arm re-run after the window; no row
   carries [cpu-busy] or [other-busy]; the full runner output goes to a file first. Command:
-  BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_AB_ROUNDS=3
   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card' just depth-gpu-qwen4exp <the
   arms above> > <log> 2>&1
 reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp beside ours) and
@@ -46,7 +48,7 @@ reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp be
   q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
   Qwen3.8 has no timed number yet
 decide-in: write the rows into rig-log first, then the README's Qwen3.8 section, ratios from this
-  window only; the pass pp row is written as the pass path's, the baseline q38ub is judged against
+  window only; each llama.cpp row publishes the faster of its hand-set and fit arms; the pass pp row is written as the pass path's, the baseline q38ub is judged against
 decide-below: the host tier serves faster than the byte law says for 3 MB experts: name the term
   (the dispatch rate or the fixed cost) against V4.1's measured union, re-derive the card-expert
   and hot-list levers from the lower h before any lever round opens, then write the rows

@@ -25,12 +25,25 @@
 #                   the whole 111.3 GB split set. Not overridable from here.
 #   ref_step_variant  the decode-step variants, below
 #
+#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` and `lcpppp:<P>` arms of
+#                   depth-qwen3moe.sh run (`just depth-gpu-qwen4exp`): mainline itself, which builds
+#                   this architecture (src/models/qwen4exp.cpp), so no PR branch; LCPPBIN moves its
+#                   llama-bench alone
+#   LCPP_GPU_FLAGS  the hand-set arm: every layer and the head on the card, flash attention on,
+#                   the PLE table read into RAM up front (-lzm off: 270 GB of RAM holds it, and the
+#                   lazy path costs the baseline its prefill), and the routed stacks of the first
+#                   26 layers on the host (-ncmoe 26): 22 layers' experts, 1.57..1.84 GB each, fill
+#                   the A6000's ~51 GB after ~4.9 GB of non-expert weights and ~10 GB left for the
+#                   -ub 4096 arm's compute and output buffers [derived]. The fit arms (lcppfit,
+#                   lcppppfit) let llama-bench place to the byte; each row publishes the faster.
+#                   The thread count is llama-bench's default; no flag sweep has been run
+#
 # No REF_DUMP_ARGS: without --defer-experts the loader populates the whole split set, which fits in
 # the page cache (unlike V4.1's), so a later dump of the same file reads nothing from the device.
 #
-# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the reference-line arms (IK_GPU_FLAGS, LCPP,
-# LCPP_GPU_FLAGS, MRS, MRS_FLAGS). No flag has been chosen or measured for this model; the depth and
-# prompt-processing lines against ik, llama.cpp and mistral.rs belong to a later round. Every script
+# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs reference arms
+# (IK_GPU_FLAGS, MRS, MRS_FLAGS): the public table's reference is mainline llama.cpp, and nobody has
+# read whether the mistral.rs tree opens this file. Every script
 # that reads them runs under `set -u`, so such a script stops at the unset name instead of running
 # an engine at flags nobody chose.
 #
@@ -43,6 +56,9 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_qwen4exp}"
 : "${REF_SET_CUDA:=ref_cuda_qwen4exp}"
+: "${LCPP:=/home/user/llama.cpp-mainline}"
+: "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints (it loads
 # the vocabulary only). Five ids and no BOS: the file sets tokenizer.ggml.add_bos_token to false.
