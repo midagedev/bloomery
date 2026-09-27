@@ -3373,12 +3373,6 @@ thread_local! {
     static PAR_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The most experts a narrow union call's down pass claims: the claim states
-/// sit inline in the pass. A narrow call is at most [`DEFER_MAX_COLS`]
-/// columns of at most eight experts each (`moe::EXPERTS_INTO_MAX`, which
-/// `moe` holds to this bound).
-pub(crate) const UNION_CLAIM_EXPERTS: usize = 64;
-
 /// Columns up to which a union call sums on the caller: the decode and verify
 /// shapes, whose sums are shorter than a pool dispatch pays back. A wider
 /// call splits its sums by column across the pool.
@@ -3744,7 +3738,9 @@ impl XClaims<'_> {
 struct CombineClaims<'c> {
     src: Combines<'c>,
     next: std::sync::atomic::AtomicUsize,
-    states: [std::sync::atomic::AtomicU8; UNION_CLAIM_EXPERTS],
+    /// One per distinct expert of the plan, the front of the scratch's
+    /// claim states.
+    states: &'c [std::sync::atomic::AtomicU8],
     /// The longest claim pass (level >= 1).
     claim_ns: std::sync::atomic::AtomicU64,
 }
@@ -3972,6 +3968,9 @@ pub(crate) struct UnionSlabs<'s> {
     pub(crate) qc: &'s mut [u8],
     /// Slot `q`'s down output at `store[q·embd..(q + 1)·embd]`.
     pub(crate) store: &'s mut [f32],
+    /// A narrow call's claim state per distinct expert, made at load for
+    /// every expert such a call can list.
+    pub(crate) claims: &'s mut [std::sync::atomic::AtomicU8],
 }
 
 /// The front `len` cells of `slab`, or a named panic when the scratch has no
@@ -4108,7 +4107,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             *passes += 1;
             h_ns += since(t);
         }
-        h_ns += self.down(gu, qc, store, claim, lvl)?;
+        h_ns += self.down(gu, qc, store, claim.then_some(slabs.claims), lvl)?;
         *passes += 1;
         let t_sum = timer();
         if self.sum(store, lists, out) {
@@ -4242,27 +4241,38 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     }
 
     /// Every expert's down rows over its combines, into `store`, one
-    /// dispatch. With `claim` each expert's combines are the dispatch's first
-    /// work, from `gu` into `qc`; without, `qc` holds them. Returns the
-    /// longest claim pass at level >= 1.
+    /// dispatch. With `claims` — the scratch's claim states — each expert's
+    /// combines are the dispatch's first work, from `gu` into `qc`; without,
+    /// `qc` holds them. Returns the longest claim pass at level >= 1.
     fn down(
         &self,
         gu: &[f32],
         qc: &mut [u8],
         store: &mut [f32],
-        claim: bool,
+        claims: Option<&mut [std::sync::atomic::AtomicU8]>,
         lvl: u8,
     ) -> Result<u64, crate::ModelError> {
-        assert!(
-            !claim || self.plan.n() <= UNION_CLAIM_EXPERTS,
-            "host union: {} experts past the {UNION_CLAIM_EXPERTS} claim states",
-            self.plan.n()
-        );
+        let n = self.plan.n();
+        let claim = claims.is_some();
+        let states: &[std::sync::atomic::AtomicU8] = match claims {
+            Some(states) => {
+                assert!(
+                    n <= states.len(),
+                    "host union: {n} experts past the scratch's {} claim states",
+                    states.len()
+                );
+                for s in &mut states[..n] {
+                    *s.get_mut() = SLOT_TODO;
+                }
+                &states[..n]
+            }
+            None => &[],
+        };
         let src = self.combines(gu, qc);
         let claims = CombineClaims {
             src,
             next: std::sync::atomic::AtomicUsize::new(0),
-            states: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(SLOT_TODO)),
+            states,
             claim_ns: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY (construction site, referenced by every access): the slabs are

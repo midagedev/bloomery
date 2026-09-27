@@ -132,9 +132,7 @@ use std::time::Instant;
 
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
 use model::ModelError;
-use model::moe::{
-    EXPERTS_INTO_MAX, HostLayer, HostLayerSpec, UNION_MAX_COLS, UnionScratch, expert_view,
-};
+use model::moe::{HostLayer, HostLayerSpec, UNION_MAX_COLS, UnionScratch, expert_view};
 use model::ops::{
     DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
     matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
@@ -175,9 +173,10 @@ const MATRIX: [&str; 3] = ["gate", "up", "down"];
 /// private there); the `unionr8` shape splits a wider sum as it does.
 const UNION_INLINE_COLS: usize = 8;
 /// Distinct experts per chunk of the chunked union flow (the `union`,
-/// `unionr8` and `unionq` shapes): a chunk's gate and up fill the group
-/// bookkeeping's inline block and its downs fit the claim table.
-const UNION_CHUNK: usize = EXPERTS_INTO_MAX;
+/// `unionr8` and `unionq` shapes), a geometry of the flow and no model's
+/// width: a chunk's gate and up fill the group bookkeeping's inline block
+/// (16 pairs) and its downs fit the claim table.
+const UNION_CHUNK: usize = 8;
 /// The arms `--check` runs the pre-timing arm check for, on the checked
 /// layers: the union sitting's shapes.
 const R8_CHECK_ARMS: &str = "union5:4x8u0.125,unionr8:4x8u0.125,unionq:4x8u0.125,\
@@ -592,7 +591,7 @@ struct UnionBlocks {
     xs: Vec<Tensor2>,
     scratch: UnionScratch,
     out: Vec<f32>,
-    lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
+    lists: Vec<Vec<(u32, f32)>>,
 }
 
 impl UnionBlocks {
@@ -607,7 +606,7 @@ impl UnionBlocks {
             xs: union_xs(xs, rows, embd),
             scratch: UnionScratch::new_routed(embd, ff, rows, n_used)?,
             out: vec![0.0; embd * rows],
-            lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
+            lists: vec![vec![(0, 0.0); n_used]; rows],
         })
     }
 }
@@ -637,7 +636,7 @@ impl Blocks {
 /// Row `i` of `lists` listing its `n_host` slots of `slots` at weight
 /// `1 / n_host`, as every union shape lists them.
 fn fill_lists(
-    lists: &mut [[(u32, f32); EXPERTS_INTO_MAX]],
+    lists: &mut [Vec<(u32, f32)>],
     l: &Layer<'_>,
     slots: &[usize],
     n_host: usize,
@@ -795,8 +794,9 @@ struct R8Plan {
 }
 
 impl R8Plan {
-    fn with_room(cols: usize) -> R8Plan {
-        let slots = cols * EXPERTS_INTO_MAX;
+    /// Room for `cols` columns of `n_used` experts each.
+    fn with_room(cols: usize, n_used: usize) -> R8Plan {
+        let slots = cols * n_used;
         R8Plan {
             ids: Vec::with_capacity(slots),
             slots: Vec::with_capacity(slots),
@@ -810,7 +810,7 @@ impl R8Plan {
     /// `l`'s working set is the named error.
     fn build(
         &mut self,
-        lists: &[[(u32, f32); EXPERTS_INTO_MAX]],
+        lists: &[Vec<(u32, f32)>],
         n: usize,
         l: &Layer<'_>,
     ) -> Result<(), BenchError> {
@@ -878,16 +878,17 @@ struct R8Blocks {
     downs: Vec<Tensor2>,
     out: Vec<f32>,
     plan: R8Plan,
-    lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
+    lists: Vec<Vec<(u32, f32)>>,
     claim_block: usize,
 }
 
 impl R8Blocks {
-    /// Blocks for calls over `rows` columns and at most `distinct` experts,
-    /// `claim_block` units a claim.
+    /// Blocks for calls over `rows` columns of up to `n_used` experts and at
+    /// most `distinct` experts, `claim_block` units a claim.
     fn new(
         xs: &[Tensor2],
         (rows, embd, ff): (usize, usize, usize),
+        n_used: usize,
         distinct: usize,
         claim_block: usize,
     ) -> R8Blocks {
@@ -899,8 +900,8 @@ impl R8Blocks {
             pars: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
             downs: (0..distinct).map(|_| Tensor2::zeros(embd, rows)).collect(),
             out: vec![0.0; embd * rows],
-            plan: R8Plan::with_room(rows),
-            lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
+            plan: R8Plan::with_room(rows, n_used),
+            lists: vec![vec![(0, 0.0); n_used]; rows],
         }
     }
 }
@@ -918,22 +919,22 @@ struct ChunkBlocks {
     xq: QuantizedCols,
     plan: R8Plan,
     out: Vec<f32>,
-    lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
+    lists: Vec<Vec<(u32, f32)>>,
 }
 
 impl ChunkBlocks {
-    /// Blocks for calls over `rows` columns.
-    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> ChunkBlocks {
+    /// Blocks for calls over `rows` columns of up to `n_used` experts.
+    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize, n_used: usize) -> ChunkBlocks {
         ChunkBlocks {
             xs: union_xs(xs, rows, embd),
             gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
             pars: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
             downs: std::array::from_fn(|_| Tensor2::zeros(embd, rows)),
-            store: vec![0.0; embd * EXPERTS_INTO_MAX * rows],
+            store: vec![0.0; embd * n_used * rows],
             xq: QuantizedCols::new(),
-            plan: R8Plan::with_room(rows),
+            plan: R8Plan::with_room(rows, n_used),
             out: vec![0.0; embd * rows],
-            lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
+            lists: vec![vec![(0, 0.0); n_used]; rows],
         }
     }
 }
@@ -2452,7 +2453,7 @@ fn check_union(
     rows.push(extra);
     let embd = xs[0].ne0;
     let ff = l.weight(0, GATE).n();
-    let mut u = ChunkBlocks::new(xs, 2, embd, ff);
+    let mut u = ChunkBlocks::new(xs, 2, embd, ff, n_used);
     let mut u5 = UnionBlocks::new(xs, 2, embd, ff, n_used)?;
     let x0 = l.index % N_X;
     let mut tally = Tally::default();
@@ -2551,7 +2552,7 @@ fn check_union_r8(
     let slots: Vec<usize> = (0..rows * n_host).map(|i| pool[i % distinct_n]).collect();
     let x0 = li % N_X;
     let mut tally = Tally::default();
-    let mut u = ChunkBlocks::new(&bench.xs, rows, embd, ff);
+    let mut u = ChunkBlocks::new(&bench.xs, rows, embd, ff, bench.n_used);
     union_layer(
         host,
         bench.split,
@@ -2580,7 +2581,7 @@ fn check_union_r8(
         ("unionr8", GateUpTile::RowLane(r8)),
         ("unionq", GateUpTile::Column),
     ] {
-        let mut v = R8Blocks::new(&bench.xs, (rows, embd, ff), distinct_n, 1);
+        let mut v = R8Blocks::new(&bench.xs, (rows, embd, ff), bench.n_used, distinct_n, 1);
         union_r8_layer(
             host,
             bench.split,
@@ -2633,7 +2634,7 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
             let ff = layer.weight(0, GATE).n();
             let x = l % N_X;
             let mut tally = Tally::default();
-            let mut u = ChunkBlocks::new(&bench.xs, arm.rows, embd, ff);
+            let mut u = ChunkBlocks::new(&bench.xs, arm.rows, embd, ff, bench.n_used);
             union_layer(
                 host,
                 bench.split,
@@ -2661,8 +2662,13 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
                 v.out
             } else {
                 let tile = bench.gate_up_tile(arm.shape, l)?;
-                let mut v =
-                    R8Blocks::new(&bench.xs, (arm.rows, embd, ff), arm.union, arm.claim_block);
+                let mut v = R8Blocks::new(
+                    &bench.xs,
+                    (arm.rows, embd, ff),
+                    bench.n_used,
+                    arm.union,
+                    arm.claim_block,
+                );
                 union_r8_layer(
                     host,
                     bench.split,
@@ -2902,9 +2908,9 @@ impl Arm {
         if shape.one_row() && rows > 1 {
             return Err(format!("arm {s:?}: the {name} shape runs one row"));
         }
-        if shape.is_union() && (rows > UNION_MAX_COLS || n_host > EXPERTS_INTO_MAX) {
+        if shape.is_union() && rows > UNION_MAX_COLS {
             return Err(format!(
-                "arm {s:?}: a union call takes at most {UNION_MAX_COLS} rows of {EXPERTS_INTO_MAX} experts"
+                "arm {s:?}: a union call takes at most {UNION_MAX_COLS} rows"
             ));
         }
         let slots = n_host * rows;
@@ -3195,7 +3201,8 @@ impl Bench<'_> {
             let ff = self.layers.first().ok_or("no layers")?.weight(0, GATE).n();
             match arm.shape {
                 Shape::Union => {
-                    blocks.chunks = Some(ChunkBlocks::new(&self.xs, arm.rows, embd, ff))
+                    blocks.chunks =
+                        Some(ChunkBlocks::new(&self.xs, arm.rows, embd, ff, self.n_used))
                 }
                 Shape::Union5 => {
                     blocks.union =
@@ -3206,6 +3213,7 @@ impl Bench<'_> {
                     blocks.r8 = Some(R8Blocks::new(
                         &self.xs,
                         (arm.rows, embd, ff),
+                        self.n_used,
                         arm.union,
                         arm.claim_block,
                     ));

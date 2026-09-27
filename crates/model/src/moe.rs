@@ -22,7 +22,7 @@
 //! the weight type's and nothing else. `crate::ops::matmul_q` is that single owner.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
@@ -746,12 +746,6 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     Ok(out)
 }
 
-/// The most experts one host call takes ([`experts_into`],
-/// [`HostLayer::experts_into`]). Its dispatch lists live in stack arrays of
-/// this size and [`HostScratch`] holds this many experts' blocks, so a call
-/// allocates nothing.
-pub const EXPERTS_INTO_MAX: usize = 8;
-
 /// A given list of routed experts of ONE token, weighted and summed into
 /// `out`: `out = Σ_i w_i · down_{e_i}(silu(gate_{e_i}·x) ⊙ (up_{e_i}·x))`,
 /// accumulated in list order.
@@ -762,9 +756,11 @@ pub const EXPERTS_INTO_MAX: usize = 8;
 /// by the weight type's own activation rule), one for their downs with each
 /// SwiGLU combine produced inside it. The weights are applied as given — the
 /// caller's router has already scaled them. `x` is one column of the model
-/// width and `out` holds that width; an empty list writes zeros. The
+/// width and `out` holds that width; an empty list writes zeros. The list
+/// holds at most the experts `scratch` was made for ([`HostScratch::new`],
+/// the model's routed width), a longer one is refused by name. The
 /// dispatches write into the caller's `scratch`, made at load for the
-/// block's widths ([`HostScratch::new`]), so a call allocates nothing.
+/// block's widths, so a call allocates nothing.
 pub fn experts_into(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
@@ -773,7 +769,7 @@ pub fn experts_into(
     out: &mut [f32],
     scratch: &mut HostScratch,
 ) -> Result<(), ModelError> {
-    check_host_call(x, experts, out)?;
+    check_host_call(x, experts, out, scratch.n_used)?;
     if !scratch.fits(x.ne0, plan.meta.ff) {
         return Err(ModelError::Shape {
             what: "host experts: the scratch must be made for the block's widths",
@@ -784,25 +780,21 @@ pub fn experts_into(
         });
     }
     out.fill(0.0);
-    let n = experts.len();
-    if n == 0 {
+    if experts.is_empty() {
         return Ok(());
     }
     // The plan's views are headers of `gguf`, the one file this model has.
     let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
         Weight::in_file(gguf, expert_of(views, e, plan.block)?)
     };
-    // The unused tails keep the first expert's gate; only the first n (2n)
-    // are passed.
-    let first = view(&plan.gate_views, experts[0].0)?;
-    let mut gu = [first; 2 * EXPERTS_INTO_MAX];
-    let mut down = [first; EXPERTS_INTO_MAX];
-    for (i, &(e, _)) in experts.iter().enumerate() {
-        gu[2 * i] = view(&plan.gate_views, e)?;
-        gu[2 * i + 1] = view(&plan.up_views, e)?;
-        down[i] = view(&plan.down_views, e)?;
-    }
-    serve(&gu[..2 * n], &down[..n], None, x, experts, out, scratch)
+    let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
+        Ok([
+            view(&plan.gate_views, e)?,
+            view(&plan.up_views, e)?,
+            view(&plan.down_views, e)?,
+        ])
+    };
+    serve(weights, None, x, experts, out, scratch)
 }
 
 /// Expert `e`'s view in one of a block plan's per-expert view lists; an id
@@ -814,8 +806,14 @@ fn expert_of(views: &[TensorInfo], e: u32, block: usize) -> Result<&TensorInfo, 
 }
 
 /// A host call's three shape conditions, each its own error: `x` is one
-/// token, `out` holds its width, and the list fits [`EXPERTS_INTO_MAX`].
-fn check_host_call(x: &Tensor2, experts: &[(u32, f32)], out: &[f32]) -> Result<(), ModelError> {
+/// token, `out` holds its width, and the list holds at most the `n_used`
+/// experts its scratch was made for.
+fn check_host_call(
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &[f32],
+    n_used: usize,
+) -> Result<(), ModelError> {
     if x.ne1 != 1 {
         return Err(ModelError::Shape {
             what: "host experts: x must be one token",
@@ -834,10 +832,10 @@ fn check_host_call(x: &Tensor2, experts: &[(u32, f32)], out: &[f32]) -> Result<(
             got_ne1: 1,
         });
     }
-    if experts.len() > EXPERTS_INTO_MAX {
+    if experts.len() > n_used {
         return Err(ModelError::Shape {
-            what: "host experts: at most EXPERTS_INTO_MAX experts",
-            want_ne0: EXPERTS_INTO_MAX,
+            what: "host experts: at most the experts the scratch was made for",
+            want_ne0: n_used,
             want_ne1: 1,
             got_ne0: experts.len(),
             got_ne1: 1,
@@ -846,36 +844,82 @@ fn check_host_call(x: &Tensor2, experts: &[(u32, f32)], out: &[f32]) -> Result<(
     Ok(())
 }
 
+/// `v` emptied and handed back as a list of `B` over the same allocation.
+/// `A` and `B` differ only in a lifetime, so the collect reuses the buffer
+/// and keeps its room: a call's view lists borrow for the call alone, and
+/// between calls the scratch holds them empty with the room made at load.
+fn relist<A, B>(mut v: Vec<A>) -> Vec<B> {
+    const {
+        assert!(size_of::<A>() == size_of::<B>() && align_of::<A>() == align_of::<B>());
+    }
+    v.clear();
+    v.into_iter()
+        .map(|_| -> B { unreachable!("the list was cleared") })
+        .collect()
+}
+
 /// The blocks one host call writes — the gate and up outputs, the SwiGLU
-/// combines and the down outputs of up to [`EXPERTS_INTO_MAX`] experts —
-/// made once for a layer shape and held across calls, so a call allocates
-/// nothing. After a call, [`HostScratch::gate`] and its siblings read what
-/// it computed for the list's `i`-th expert.
+/// combines and the down outputs of up to `n_used` experts, the model's
+/// routed width — and the room of the call's view lists, made once for a
+/// layer shape and held across calls, so a call allocates nothing. After a
+/// call, [`HostScratch::gate`] and its siblings read what it computed for
+/// the list's `i`-th expert.
 pub struct HostScratch {
     embd: usize,
     ff: usize,
+    n_used: usize,
     /// `[gate_0, up_0, gate_1, up_1, ..]`, `{ff, 1}` each.
-    gate_up: [Tensor2; 2 * EXPERTS_INTO_MAX],
+    gate_up: Vec<Tensor2>,
     /// The combines, `{ff, 1}` each.
-    pars: [Tensor2; EXPERTS_INTO_MAX],
+    pars: Vec<Tensor2>,
     /// The down outputs, `{embd, 1}` each.
-    downs: [Tensor2; EXPERTS_INTO_MAX],
+    downs: Vec<Tensor2>,
+    /// The call's gate and up matrices, interleaved; empty between calls.
+    gu_w: Vec<Weight<'static>>,
+    /// The call's down matrices; empty between calls.
+    down_w: Vec<Weight<'static>>,
+    /// The gate/up dispatch's inputs, `x` once a pair; empty between calls.
+    xs: Vec<&'static Tensor2>,
+    /// The down dispatch's inputs, the combines; empty between calls.
+    srcs: Vec<GroupInput<'static>>,
 }
 
 impl HostScratch {
-    /// Blocks for experts that map `embd -> ff -> embd`.
-    pub fn new(embd: usize, ff: usize) -> HostScratch {
-        HostScratch {
+    /// Blocks for lists of up to `n_used` experts that map
+    /// `embd -> ff -> embd`; a width of none is a named error.
+    pub fn new(embd: usize, ff: usize, n_used: usize) -> Result<HostScratch, ModelError> {
+        if n_used == 0 {
+            return Err(ModelError::Shape {
+                what: "host scratch: at least one routed expert a token",
+                want_ne0: 1,
+                want_ne1: 1,
+                got_ne0: 0,
+                got_ne1: 1,
+            });
+        }
+        let blocks =
+            |count: usize, rows: usize| (0..count).map(|_| Tensor2::zeros(rows, 1)).collect();
+        Ok(HostScratch {
             embd,
             ff,
-            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, 1)),
-            pars: std::array::from_fn(|_| Tensor2::zeros(ff, 1)),
-            downs: std::array::from_fn(|_| Tensor2::zeros(embd, 1)),
-        }
+            n_used,
+            gate_up: blocks(2 * n_used, ff),
+            pars: blocks(n_used, ff),
+            downs: blocks(n_used, embd),
+            gu_w: Vec::with_capacity(2 * n_used),
+            down_w: Vec::with_capacity(n_used),
+            xs: Vec::with_capacity(2 * n_used),
+            srcs: Vec::with_capacity(n_used),
+        })
     }
 
     fn fits(&self, embd: usize, ff: usize) -> bool {
         (self.embd, self.ff) == (embd, ff)
+    }
+
+    /// The most experts one call through this scratch takes.
+    pub fn n_used(&self) -> usize {
+        self.n_used
     }
 
     /// The gate output of the last call's `i`-th expert.
@@ -899,6 +943,35 @@ impl HostScratch {
     }
 }
 
+/// The host leg of one token: each listed expert's `[gate, up, down]` from
+/// `weights`, resolved in list order into the scratch's view lists, then
+/// [`serve_resolved`]. The lists go back to the scratch, emptied, whether the
+/// call succeeds or not. The caller has checked the list against the
+/// scratch's width, so no push grows a list.
+fn serve<'w>(
+    weights: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    limit: Option<f32>,
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &mut [f32],
+    s: &mut HostScratch,
+) -> Result<(), ModelError> {
+    let mut gu: Vec<Weight<'w>> = relist(std::mem::take(&mut s.gu_w));
+    let mut down: Vec<Weight<'w>> = relist(std::mem::take(&mut s.down_w));
+    let r = experts
+        .iter()
+        .try_for_each(|&(e, _)| {
+            let [g, u, d] = weights(e)?;
+            gu.extend([g, u]);
+            down.push(d);
+            Ok(())
+        })
+        .and_then(|()| serve_resolved(&gu, &down, limit, x, experts, out, s));
+    s.gu_w = relist(gu);
+    s.down_w = relist(down);
+    r
+}
+
 /// The host leg of one token over resolved weights: `gu` holds each listed
 /// expert's gate and up interleaved, `down` its down. One group dispatch for
 /// every gate and up (`x` quantized once), one for every down with each
@@ -908,7 +981,7 @@ impl HostScratch {
 /// quantization), `host_gate_up` (the gate/up rows, per weight type),
 /// `host_h_quant` (the combines and their quantization), `host_down` (the
 /// down rows, per weight type) and `host_sum`.
-fn serve(
+fn serve_resolved(
     gu: &[Weight<'_>],
     down: &[Weight<'_>],
     limit: Option<f32>,
@@ -919,27 +992,35 @@ fn serve(
 ) -> Result<(), ModelError> {
     let n = experts.len();
     let lvl = profile::level();
-    let xs: [&Tensor2; 2 * EXPERTS_INTO_MAX] = [x; 2 * EXPERTS_INTO_MAX];
-    let gt = matmul_q_group_into("host_gate_up", gu, &xs[..2 * n], &mut s.gate_up[..2 * n])?;
-    let srcs: [GroupInput<'_>; EXPERTS_INTO_MAX] = std::array::from_fn(|i| {
-        if i >= n {
-            return GroupInput::Ready(x);
-        }
-        let (gate, up) = (&s.gate_up[2 * i], &s.gate_up[2 * i + 1]);
-        match limit {
-            Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
-            None => GroupInput::Swiglu(gate, up),
-        }
-    });
-    let dt = matmul_q_group_swiglu_into(
-        "host_down",
-        down,
-        &srcs[..n],
-        &mut s.downs[..n],
-        &mut s.pars[..n],
-    )?;
+    let HostScratch {
+        gate_up,
+        pars,
+        downs,
+        xs,
+        srcs,
+        ..
+    } = s;
+    let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
+    xl.extend(std::iter::repeat_n(x, 2 * n));
+    let gt = matmul_q_group_into("host_gate_up", gu, &xl, &mut gate_up[..2 * n]);
+    *xs = relist(xl);
+    let gt = gt?;
+    let mut sl: Vec<GroupInput<'_>> = relist(std::mem::take(srcs));
+    sl.extend(
+        gate_up[..2 * n]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[gate, up]| match limit {
+                Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
+                None => GroupInput::Swiglu(gate, up),
+            }),
+    );
+    let dt = matmul_q_group_swiglu_into("host_down", down, &sl, &mut downs[..n], &mut pars[..n]);
+    *srcs = relist(sl);
+    let dt = dt?;
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
-    for (&(_, w), d) in experts.iter().zip(&s.downs[..n]) {
+    for (&(_, w), d) in experts.iter().zip(&downs[..n]) {
         for (o, &dv) in out.iter_mut().zip(d.col(0)) {
             *o += w * dv;
         }
@@ -954,7 +1035,7 @@ fn serve(
 }
 
 /// The most token columns a batch's union scratch can be made for
-/// ([`UnionScratch::new`]): one prefill ubatch. A call takes at most the
+/// ([`UnionScratch::new_routed`]): one prefill ubatch. A call takes at most the
 /// columns its scratch was made for ([`experts_union_into`],
 /// [`HostLayer::experts_union_into`]); a group tail's scratch is the one
 /// exception ([`UnionScratch::new_tail`]).
@@ -969,13 +1050,13 @@ pub const UNION_TAIL_MAX_GROUPS: usize = 8;
 pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
 
 /// The listed slots — (expert, column) pairs, a column once per expert — of
-/// one batch at its worst, every column listing [`EXPERTS_INTO_MAX`] experts:
-/// the least slot budget a group tail's scratch takes, so any batch's columns
-/// fit it.
-pub const UNION_BATCH_SLOTS: usize = UNION_MAX_COLS * EXPERTS_INTO_MAX;
-
-// A narrow call's claim states hold every expert its columns can list.
-const _: () = assert!(DEFER_MAX_COLS * EXPERTS_INTO_MAX <= ops::UNION_CLAIM_EXPERTS);
+/// one batch at its worst, every column listing `n_used` experts: the least
+/// slot budget a group tail's scratch for that routed width takes, so any
+/// batch's columns fit it.
+#[must_use]
+pub const fn union_batch_slots(n_used: usize) -> usize {
+    UNION_MAX_COLS * n_used
+}
 
 /// A union call's plan, in storage its scratch made at load: the distinct
 /// experts in ascending id, and per expert the columns that list it,
@@ -1002,14 +1083,12 @@ impl UnionPlan {
     }
 
     /// The plan of `lists` in place, or the named error of a list past
-    /// `per_list` experts — [`EXPERTS_INTO_MAX`], or the routed width a
-    /// scratch was made for. The caller has checked the column count against
+    /// `per_list` experts, the routed width a scratch was made for. The caller has checked the column count against
     /// the room, so no push grows a buffer.
     fn build(&mut self, lists: &[&[(u32, f32)]], per_list: usize) -> Result<(), ModelError> {
         if let Some(list) = lists.iter().find(|l| l.len() > per_list) {
             return Err(ModelError::Shape {
-                what: "host union: at most EXPERTS_INTO_MAX experts per column, or the \
-                       scratch's routed width",
+                what: "host union: at most the scratch's routed width of experts per column",
                 want_ne0: per_list,
                 want_ne1: 1,
                 got_ne0: list.len(),
@@ -1064,7 +1143,8 @@ impl UnionPlan {
 /// and per slot — a listed (expert, column) pair, expert `d`'s slots at the
 /// plan's `off[d]..off[d + 1]` — its gate and up outputs, its combine
 /// quantized in the down's encoding and its down output, kept until the
-/// list-order sums at the end; and the plan's buffers.
+/// list-order sums at the end; the plan's buffers; and the claim states of a
+/// narrow call's down pass, one per expert its columns can list.
 ///
 /// For `cols` columns, `slots` slots and `embd` and `ff` wide experts, it
 /// holds `4 · (2 · ff + embd) · slots` bytes of gate/up and down slabs,
@@ -1072,10 +1152,9 @@ impl UnionPlan {
 /// encoding and the up's) of `ops::col_bytes_max` bytes each (a little over
 /// `ff` and `embd` bytes), and a few words per slot of plan.
 ///
-/// A batch's scratch ([`UnionScratch::new`], [`UnionScratch::new_routed`])
-/// takes up to [`UNION_MAX_COLS`] columns and holds their every slot: each
-/// column's list is at most [`EXPERTS_INTO_MAX`] experts, or the routed
-/// width it was made for. A group tail's ([`UnionScratch::new_tail`]) takes
+/// A batch's scratch ([`UnionScratch::new_routed`]) takes up to
+/// [`UNION_MAX_COLS`] columns and holds their every slot: each column's list
+/// is at most the routed width it was made for. A group tail's ([`UnionScratch::new_tail`]) takes
 /// up to [`UNION_TAIL_MAX_COLS`] and holds a slot budget instead. A call
 /// whose plan holds no more slots than the scratch runs as one call; one
 /// that holds more runs as consecutive calls of [`UNION_MAX_COLS`] columns,
@@ -1109,21 +1188,18 @@ pub struct UnionScratch {
     /// Slot `q`'s down output at `store[q·embd..(q + 1)·embd]`.
     store: Vec<f32>,
     plan: UnionPlan,
+    /// A narrow call's claim state per distinct expert:
+    /// `min(max_cols, DEFER_MAX_COLS) · per_list`, every expert such a call
+    /// can list.
+    claims: Vec<AtomicU8>,
 }
 
 impl UnionScratch {
     /// Slabs for a batch's calls, up to `cols` columns over experts that map
-    /// `embd -> ff -> embd`, each column listing at most
-    /// [`EXPERTS_INTO_MAX`] experts; `cols` outside `1..=UNION_MAX_COLS` is a
-    /// named error.
-    pub fn new(embd: usize, ff: usize, cols: usize) -> Result<UnionScratch, ModelError> {
-        UnionScratch::new_routed(embd, ff, cols, EXPERTS_INTO_MAX)
-    }
-
-    /// [`UnionScratch::new`] for lists of at most `n_used` experts — the
-    /// model's routed width — so it holds `n_used · cols` slots, not
-    /// `EXPERTS_INTO_MAX · cols`; a call with a longer list is refused by
-    /// name. `n_used` outside `1..=EXPERTS_INTO_MAX` is a named error.
+    /// `embd -> ff -> embd`, each column listing at most `n_used` experts —
+    /// the model's routed width — so it holds `n_used · cols` slots; a call
+    /// with a longer list is refused by name. `cols` outside
+    /// `1..=UNION_MAX_COLS` and a width of none are named errors.
     pub fn new_routed(
         embd: usize,
         ff: usize,
@@ -1139,10 +1215,10 @@ impl UnionScratch {
                 got_ne1: cols,
             });
         }
-        if n_used == 0 || n_used > EXPERTS_INTO_MAX {
+        if n_used == 0 {
             return Err(ModelError::Shape {
-                what: "host union scratch: 1..=EXPERTS_INTO_MAX experts per column",
-                want_ne0: EXPERTS_INTO_MAX,
+                what: "host union scratch: at least one expert per column",
+                want_ne0: 1,
                 want_ne1: cols,
                 got_ne0: n_used,
                 got_ne1: cols,
@@ -1158,17 +1234,19 @@ impl UnionScratch {
     }
 
     /// Slabs for a group tail's call: the columns of `groups` batches of
-    /// [`UNION_MAX_COLS`] in one call, so each expert it lists is read once
-    /// for all of them, over `slots` slots — the budget, from
-    /// [`UNION_BATCH_SLOTS`] (so a batch's columns always fit) to every slot
-    /// of the columns. `groups` outside `1..=UNION_TAIL_MAX_GROUPS` or a
-    /// budget outside that range is a named error. A call through it may take
-    /// fewer columns (a short last batch), and batch calls fit it too.
+    /// [`UNION_MAX_COLS`] in one call, each column listing at most `n_used`
+    /// experts, so each expert it lists is read once for all of them, over
+    /// `slots` slots — the budget, from [`union_batch_slots`] of `n_used` (so
+    /// a batch's columns always fit) to every slot of the columns. `groups`
+    /// outside `1..=UNION_TAIL_MAX_GROUPS`, a width of none or a budget
+    /// outside that range is a named error. A call through it may take fewer
+    /// columns (a short last batch), and batch calls fit it too.
     pub fn new_tail(
         embd: usize,
         ff: usize,
         groups: usize,
         slots: usize,
+        n_used: usize,
     ) -> Result<UnionScratch, ModelError> {
         if groups == 0 || groups > UNION_TAIL_MAX_GROUPS {
             return Err(ModelError::Shape {
@@ -1179,23 +1257,26 @@ impl UnionScratch {
                 got_ne1: groups,
             });
         }
-        let cols = groups * UNION_MAX_COLS;
-        if !(UNION_BATCH_SLOTS..=cols * EXPERTS_INTO_MAX).contains(&slots) {
+        if n_used == 0 {
             return Err(ModelError::Shape {
-                what: "host union tail scratch: UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns slots",
-                want_ne0: UNION_BATCH_SLOTS,
-                want_ne1: cols * EXPERTS_INTO_MAX,
+                what: "host union tail scratch: at least one expert per column",
+                want_ne0: 1,
+                want_ne1: groups,
+                got_ne0: n_used,
+                got_ne1: groups,
+            });
+        }
+        let cols = groups * UNION_MAX_COLS;
+        if !(union_batch_slots(n_used)..=cols * n_used).contains(&slots) {
+            return Err(ModelError::Shape {
+                what: "host union tail scratch: one batch's slots at worst ..= every column's slots",
+                want_ne0: union_batch_slots(n_used),
+                want_ne1: cols * n_used,
                 got_ne0: slots,
                 got_ne1: groups,
             });
         }
-        Ok(UnionScratch::with_caps(
-            embd,
-            ff,
-            cols,
-            slots,
-            EXPERTS_INTO_MAX,
-        ))
+        Ok(UnionScratch::with_caps(embd, ff, cols, slots, n_used))
     }
 
     /// `cols` columns a call of lists of at most `per_list` experts over
@@ -1222,6 +1303,9 @@ impl UnionScratch {
             qc: vec![0; slots * c_col],
             store: vec![0.0; slots * embd],
             plan: UnionPlan::with_room(cols, per_list),
+            claims: (0..cols.min(DEFER_MAX_COLS) * per_list)
+                .map(|_| AtomicU8::new(0))
+                .collect(),
         }
     }
 
@@ -1350,7 +1434,7 @@ fn serve_union(
         s.plan.build(&lists[c0..c1], s.per_list)?;
         assert!(
             s.plan.fits(s.max_slots),
-            "host union: a batch's columns fit every scratch (UNION_BATCH_SLOTS slots or more)"
+            "host union: a batch's columns fit every scratch (union_batch_slots or more)"
         );
         serve_planned(
             stacks,
@@ -1387,6 +1471,7 @@ fn serve_planned(
         gu: &mut s.gu,
         qc: &mut s.qc,
         store: &mut s.store,
+        claims: &mut s.claims,
     };
     call.run(slabs, lists, out, &mut s.passes)
 }
@@ -1398,12 +1483,12 @@ fn serve_planned(
 /// `experts_into(x_j, lists[j])` bit for bit, while each distinct expert's
 /// matrices are read once for every column that lists it (see
 /// [`serve_union`]). `x` is a block ([`Tensor2`]) or any view of `k` columns
-/// ([`Tensor2View`]), read in place. A list holds at most
-/// [`EXPERTS_INTO_MAX`] experts; that bound, the column bound, a list count
+/// ([`Tensor2View`]), read in place. A list holds at most the routed width
+/// `scratch` was made for; that bound, the column bound, a list count
 /// other than `x`'s columns, an `out` of another length and an expert id past
 /// the block's are named errors. The dispatches write into the caller's
 /// `scratch`, made at load for the block's widths and a column count
-/// ([`UnionScratch::new`]), so a call allocates nothing.
+/// ([`UnionScratch::new_routed`]), so a call allocates nothing.
 pub fn experts_union_into<'x>(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
@@ -1632,7 +1717,8 @@ impl HostLayer {
     /// min(silu(gate_{e_i}·x), L))` in list order, each matrix read from
     /// the shard that holds it, or the sidecar. `src` is the pair the layer
     /// was built from. `scratch` is the caller's, made for this layer's
-    /// widths; after the call it holds what the call computed.
+    /// widths and the model's routed width, and a list past that width is
+    /// refused by name; after the call it holds what the call computed.
     pub fn experts_into(
         &self,
         src: R8Source<'_>,
@@ -1643,32 +1729,20 @@ impl HostLayer {
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
-        check_host_call(x, experts, out)?;
+        check_host_call(x, experts, out, scratch.n_used)?;
         out.fill(0.0);
-        let n = experts.len();
-        if n == 0 {
+        if experts.is_empty() {
             return Ok(());
         }
-        // The unused tails keep the first expert's gate; only the first n
-        // (2n) are passed.
-        let first = self.gate.expert(split, experts[0].0 as usize)?;
-        let mut gu = [first; 2 * EXPERTS_INTO_MAX];
-        let mut down = [first; EXPERTS_INTO_MAX];
-        for (i, &(e, _)) in experts.iter().enumerate() {
+        let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
             let e = e as usize;
-            gu[2 * i] = self.gate.expert(split, e)?;
-            gu[2 * i + 1] = self.up.expert(split, e)?;
-            down[i] = self.down.expert(split, e)?;
-        }
-        serve(
-            &gu[..2 * n],
-            &down[..n],
-            Some(self.limit),
-            x,
-            experts,
-            out,
-            scratch,
-        )
+            Ok([
+                self.gate.expert(split, e)?,
+                self.up.expert(split, e)?,
+                self.down.expert(split, e)?,
+            ])
+        };
+        serve(weights, Some(self.limit), x, experts, out, scratch)
     }
 
     /// [`experts_union_into`] for this layer: up to the columns `scratch`
@@ -1709,8 +1783,8 @@ impl HostLayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        Buckets, EXPERTS_INTO_MAX, HostLayer, HostLayerSpec, HostScratch, TOUCHED, UnionScratch,
-        check_host_call, gather_expert_inputs, last_touched_experts, reset_touched,
+        Buckets, HostLayer, HostLayerSpec, HostScratch, TOUCHED, UnionScratch, check_host_call,
+        gather_expert_inputs, last_touched_experts, relist, reset_touched,
     };
     use crate::ops::{self, Tensor2};
     use crate::r8file::R8Source;
@@ -1750,7 +1824,7 @@ mod tests {
     fn host_call_shape_errors_name_their_condition() {
         let refusal = |x: &Tensor2, n: usize, out: usize| {
             let experts = vec![(0u32, 1.0f32); n];
-            match check_host_call(x, &experts, &vec![0.0; out]) {
+            match check_host_call(x, &experts, &vec![0.0; out], 10) {
                 Ok(()) => panic!("a bad host call must be refused"),
                 Err(e) => e.to_string(),
             }
@@ -1760,13 +1834,46 @@ mod tests {
         assert!(e.contains("one token") && e.contains("got [8, 2]"), "{e}");
         let e = refusal(&x1, 1, 7);
         assert!(e.contains("width") && e.contains("got [7, 1]"), "{e}");
-        let e = refusal(&x1, EXPERTS_INTO_MAX + 1, 8);
+        let e = refusal(&x1, 11, 8);
         assert!(
-            e.contains("EXPERTS_INTO_MAX")
-                && e.contains(&format!("got [{}, 1]", EXPERTS_INTO_MAX + 1)),
+            e.contains("the scratch was made for") && e.contains("expected [10, 1], got [11, 1]"),
             "{e}"
         );
-        assert!(check_host_call(&x1, &[(0, 1.0); EXPERTS_INTO_MAX], &[0.0; 8]).is_ok());
+        assert!(check_host_call(&x1, &[(0, 1.0); 10], &[0.0; 8], 10).is_ok());
+    }
+
+    /// A scratch is made for the model's routed width, ten as readily as
+    /// six, and a width of none is refused by name.
+    #[test]
+    fn host_scratch_takes_the_routed_width() {
+        for n_used in [6, 8, 10] {
+            let s = HostScratch::new(16, 32, n_used).expect("a routed width");
+            assert_eq!(s.n_used(), n_used);
+            assert_eq!((s.gate(n_used - 1).ne0, s.down(n_used - 1).ne0), (32, 16));
+        }
+        let e = HostScratch::new(16, 32, 0)
+            .err()
+            .expect("a width of none is refused")
+            .to_string();
+        assert!(e.contains("at least one routed expert"), "{e}");
+    }
+
+    /// A list relisted at another lifetime keeps its allocation and its
+    /// room, so a call that refills it to the room it was made with
+    /// allocates nothing.
+    #[test]
+    fn relist_keeps_the_room() {
+        let mut v: Vec<&'static u32> = Vec::with_capacity(20);
+        let at = v.as_ptr();
+        v.push(&7);
+        let local = 3u32;
+        let mut w: Vec<&u32> = relist(v);
+        assert!(w.is_empty());
+        assert_eq!((w.capacity(), w.as_ptr()), (20, at));
+        w.extend(std::iter::repeat_n(&local, 20));
+        assert_eq!(w.as_ptr(), at, "a refill to the room reallocates nothing");
+        let back: Vec<&'static u32> = relist(w);
+        assert_eq!((back.capacity(), back.as_ptr()), (20, at));
     }
 
     /// A stack `{k, n, n_expert}` of `ty` whose every value is finite and
@@ -1919,8 +2026,8 @@ mod tests {
         let path = layer_file("mixed", tys, embd, ff, n_expert);
         let split = gguf::Split::open(&path).unwrap();
         let layer = build_layer(&split, embd, ff, n_expert).unwrap();
-        let mut us = UnionScratch::new(embd, ff, 16).unwrap();
-        let mut host = HostScratch::new(embd, ff);
+        let mut us = UnionScratch::new_routed(embd, ff, 16, 3).unwrap();
+        let mut host = HostScratch::new(embd, ff, 3).unwrap();
         for (cols, want_passes) in [(3, if ops::defer_quant() { 2 } else { 4 }), (12, 5)] {
             let x = Tensor2::from_vec(
                 embd,
@@ -1975,19 +2082,19 @@ mod tests {
     }
 
     /// A scratch made for a routed width holds that many slots a column and
-    /// refuses a longer list by name; a width outside `1..=EXPERTS_INTO_MAX`
-    /// is refused when it is made.
+    /// refuses a longer list by name; a width of none is refused when it is
+    /// made, and Qwen3.8's ten is made like any other.
     #[test]
     fn routed_scratch_refuses_a_list_past_its_width() {
         let (embd, ff, n_expert) = (256, 256, 6);
         let tys = [GgmlType::Q4_K; 3];
-        for n_used in [0, EXPERTS_INTO_MAX + 1] {
-            let e = UnionScratch::new_routed(embd, ff, 4, n_used)
-                .err()
-                .expect("a routed width outside 1..=EXPERTS_INTO_MAX is refused")
-                .to_string();
-            assert!(e.contains("1..=EXPERTS_INTO_MAX experts per column"), "{e}");
-        }
+        let e = UnionScratch::new_routed(embd, ff, 4, 0)
+            .err()
+            .expect("a routed width of none is refused")
+            .to_string();
+        assert!(e.contains("at least one expert per column"), "{e}");
+        let ten = UnionScratch::new_routed(embd, ff, 4, 10).expect("a routed width of ten");
+        assert_eq!(ten.max_slots(), 40, "ten slots a column");
         let mut us = UnionScratch::new_routed(embd, ff, 4, 3).unwrap();
         assert_eq!(us.max_slots(), 12, "three slots a column");
         let path = layer_file("routed", tys, embd, ff, n_expert);
@@ -2020,10 +2127,73 @@ mod tests {
             .to_string();
         std::fs::remove_file(&path).unwrap();
         assert!(
-            e.contains("or the scratch's routed width")
-                && e.contains("expected [3, 1], got [4, 1]"),
+            e.contains("the scratch's routed width") && e.contains("expected [3, 1], got [4, 1]"),
             "{e}"
         );
         println!("routed scratch: refusal {e}");
+    }
+
+    /// Qwen3.8's routed width, ten experts a column: through scratches made
+    /// for ten, the one-column call takes a list of ten, and a narrow union
+    /// call of eight columns whose lists share no expert — 80 distinct, each
+    /// its own claim in the down pass — writes, column for column and bit for
+    /// bit, what the one-column calls write, in the passes of its form.
+    #[test]
+    fn ten_a_column_through_the_narrow_claims() {
+        let (embd, ff, n_used, cols) = (256, 256, 10, 8);
+        let n_expert = n_used * cols;
+        let tys = [GgmlType::Q4_K; 3];
+        let path = layer_file("ten", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut us = UnionScratch::new_routed(embd, ff, cols, n_used).unwrap();
+        let mut host = HostScratch::new(embd, ff, n_used).unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            cols,
+            (0..embd * cols)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+            .map(|j| {
+                (0..n_used)
+                    .map(|s| ((j * n_used + s) as u32, 0.0625 * (1 + s) as f32))
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let mut want = vec![f32::NAN; embd * cols];
+        for (j, list) in lists.iter().enumerate() {
+            let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
+            layer
+                .experts_into(
+                    R8Source::rows(&split),
+                    &xj,
+                    list,
+                    &mut want[j * embd..][..embd],
+                    &mut host,
+                )
+                .unwrap_or_else(|e| panic!("column {j}'s list of ten: {e}"));
+        }
+        let want_passes = if ops::defer_quant() { 2 } else { 4 };
+        let mut got = vec![f32::NAN; embd * cols];
+        let p0 = us.passes();
+        layer
+            .experts_union_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
+            .unwrap_or_else(|e| panic!("the union of eight lists of ten: {e}"));
+        let passes = us.passes() - p0;
+        std::fs::remove_file(&path).unwrap();
+        let diff = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("ten a column k={cols} distinct={n_expert}: diff_cells={diff} passes={passes}");
+        assert_eq!(
+            diff, 0,
+            "the union of lists of ten differs from its columns"
+        );
+        assert_eq!(passes, want_passes, "a narrow call's passes");
     }
 }
