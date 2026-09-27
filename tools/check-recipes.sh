@@ -220,6 +220,7 @@ selftests=(
   "tools/flow/ds41_prefill.py --self-test"
   "tools/flow/pplb.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
+  "tools/ref/dma-dram-share.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/draft-vocab.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"

@@ -1,0 +1,29 @@
+# Round probes38, P4: ideaverify V2 measured a static list's hit inside a 2,048-token context only (the
+# sets' n_ctx is 2048). Inside it, prose with its own held-out list: 65.4 (positions 0-127), 64.9 (128-511),
+# 65.1 (512-1023), 63.1 (1024-2047); the 0-2047 mean weighted by bucket length is 64.1; cross lists lose
+# 2-7 points, GLM 6.7. A list learned at depth recovered at most 0.5 of it: the routing flattens with
+# depth rather than moving. Extrapolating the in-domain slope past 2k, -1..-3 points per doubling of
+# position from the 1024-2047 bucket's centre (~1.5k) to 4096-8191's (~6k), two doublings: the 4-8k
+# bucket 2..6 points under 63.1, 3..7 under the 0-2k mean; the high edge allows the drift to slow [derived].
+# The set is traced from the public Q3_K_M (the profile's V41_MODEL); the V2 sets came from the dropped
+# engramQ8 file, so the term is a difference inside this one set, not against V2's absolute values.
+# Wall [derived]: 32,768 ids (4 chunks of 8,192) at the 2k prose set's 66.5 tok/s = 8.2 min, times 1.3-2
+# for MLA over up to 8k keys, plus a cold read of the experts 1-3 min: 12-20 min, inside the harness's
+# 1800 s bound. The replay is the Mac's (~10 s).
+kind: profile
+question: does a static hot list keep losing hit past position 2,048?
+term: hit(positions 4096-8191) - hit(positions 0-2047), in points: router-residency.py replay prose-8k
+  --n-l spread:2668@2-39 --policy static --seed in --buckets 0-2047,2048-4095,4096-8191, plan (a)'s n_l
+  70/71 on layers 2-39, the list learned on the first two chunks (the split at 16,384), scored on the
+  last two
+unit: points
+predict: -7..-2
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/router-8k.card' just trace-router prose-all
+  --name prose-8k --chunk 8192 --max-tokens 32768, under the CPU lease with its witness blocks and 1800 s
+  bound; the set's manifest has chunk 8192, 32,768 tokens and its complete trailer
+decide-in: static lists drift with depth past 2k at V2's slope; adaptive residency's margin stands, no
+  depth-aware list
+decide-below: depth costs a static list more than 7 points by 4-8k: raise adaptive residency's priority
+  for long contexts and name it in the release notes' decode-at-depth rows
+decide-above: the drift stops near 2k: a static list is enough at depth; adaptive residency is for
+  domain shifts only

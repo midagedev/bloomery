@@ -1,0 +1,49 @@
+# Round probes38, P2: what a host-to-card copy costs the host tier's DRAM reads. This box refuses to
+# register the file map (rig-log 09-25#m2-h2d-a6000), so every copy is staged. Passes per copied byte
+# [derived]: the source read 1, the staging write 1 (plus 1 if the store reads the line first; glibc's
+# memcpy stores non-temporally above a size threshold, and each fill thread here copies 16 MiB, which
+# the run's `fill_bytes_per_thread` records), the card's DMA read 1: k = 3 non-temporal, 4 with the read.
+# DRAM ceiling: STREAM 147.7, the bench's read-mmap 140-145 at 32 threads, engine:6 132-137 alone (rig-log
+# 09-24); at 28 threads (four cores left for the copy) engine:6 stays near the ceiling: 125-137.
+# Demand at the link rate: U + k x 26.28 = 132 + 79 = 211 (k 3) against ~145. The spec's pair, union
+# 80-100 with the copy >= 24, needs 80 + 72 = 152: it does not fit at k = 3. How the controller splits
+# the shortfall is the one term arithmetic cannot fix:
+#   demand-proportional  scale 145 / 211 = 0.69: U ~91, C ~18 (k 4: U ~81, C ~16)
+#   union first          C = (145 - 132) / 3 ~ 4
+#   copy first           C = 26.28, U = 145 - 79 = 66
+# The band is the proportional split with the k range and the ceiling's spread: C 12..24; q38stream's
+# threshold (>= 24) is the band's top. The runner prints U_alone, U_with, C_with and k = (U_alone -
+# U_with) / C_with per round, so a miss names the term: the passes (k) or the split (U against C).
+# This card measures against V4.1's DRAM-bound engine:6. Qwen3.8's union reads 62-85 GB/s alone
+# (compute-bound, q38pfd section 3); beside it U + 3 x 26.28 <= 145 holds up to U 66, so its q38stream
+# answer is its own run, with union5 arms once q38hostbench lands, and its own card (the term names the arm).
+# Arms: alone / pageable-loop / staged-loop (64 MiB chunks, ring of 4, 4 fill threads), interleaved,
+# rotated each round; each copy also alone for 12 s first.
+# Wall [derived; the bench start-up is assumed]: 4 rounds x 3 bench runs x (start-up 10-30 s + 24 s timed
+# + warm-up) + 2 x ~15 s copy alone + the two builds in a warm target (1-5 min): 10-20 min, under 30.
+kind: profile
+question: while the streaming design's staged copy runs beside the host tier's union, what rate does
+  the copy hold, and how many union bytes does each copied byte displace?
+term: C_staged, the median over rounds of h2d_probe staged-loop's GB/s (64 MiB pinned chunks, ring 4,
+  4 fill threads, A6000) over each arm-round of bench_v41_host --time --arms engine:6 at 28 threads, V4.1
+  public Q3_K_M, beside it (dma-dram-share.sh's summary `staged ... C=`)
+unit: GB/s
+predict: 12..24
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share.card' just time-dma-dram
+  --arms engine:6 --rounds 4, one lease (the runner's lease_take; both processes inherit it and run under
+  timeout, the bench under 600 s, the copy under 660 s and its stop file); the bench's rows admissible
+  (BLOOMERY_HOST_LEASE=1, resident, no major faults); the copy pinned by taskset to the cores the pool
+  leaves free, checked per round from the bench's thread lines ([overlap] rows left out); the copy running
+  through each measured span ([copy-gap] rows left out) and the bench's threads pinned ([unpinned] rows
+  left out); witness blocks pre and post. Two reads before the band: the staged copy alone (the `copy
+  alone staged=` cell) must reach 25 GB/s, or the run measured the fill threads, not DRAM sharing; and
+  U_alone at 28 threads must sit within 10 % of engine:6's 136.3 at 32 (rig-log 09-24), or the union is
+  under the DRAM ceiling, part of the copy runs in idle headroom and k reads low
+decide-in: q38stream is not spec'd at the link rate beside a DRAM-bound union; price every swap, fill
+  and stream byte at the measured k of host DRAM (V5 stays rejected for decode), re-derive q38stream's
+  k(U) with the measured C, and re-run this runner with Qwen3.8's union5 arms before it is spec'd
+decide-below: the fill cores starve beside 28 streaming cores: re-run with --fill-threads 8 at
+  --threads 24 and with an L3-sized ring (--chunk 4194304) before any streaming design, and cap the
+  adaptive swap rate at the measured C
+decide-above: the copy holds 24 GB/s beside a DRAM-bound union: spec q38stream at the measured rate
+  and re-derive V5's balanced split with the measured k before rejecting it
