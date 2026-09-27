@@ -68,6 +68,7 @@ done
 take_a6000() { flock -n 8 || return 1; if [ "$CARD" = any ] && ! { lease_free && a6000_idle; }; then flock -u 8; return 1; fi; GOT=a6000; }
 take_3090() { flock -n 9 || return 1; GOT=3090; }
 GOT=
+LOCK_T0=$SECONDS
 if [ "$CARD" = both ]; then
   # 3090 락을 먼저, 그것을 쥔 채 A6000 락을. 다른 실행은 락을 하나만 쥐므로 이 순서로는 교착이 없고, 막혀 기다리는
   # flock은 해제 순간 깨어나 5초마다 도는 한 카드 실행들의 폴링보다 먼저 잡는다(둘이 함께 빌 때만 잡는 폴링은 게이트가
@@ -92,6 +93,9 @@ if [ -z "$GOT" ]; then
   echo "gpu-gate.sh: no gate lock ($CARD) was free within 30 min — contention, not a red gate" >&2
   exit 75
 fi
+# The wait is not the gate's time: tools/gate-batch.sh subtracts this line's seconds from the item's times row.
+LOCK_WAIT=$((SECONDS - LOCK_T0))
+[ "$LOCK_WAIT" = 0 ] || echo "gpu-gate.sh: waited ${LOCK_WAIT} s for the gate lock ($CARD)" >&2
 if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
   U=$(uuid_of "$([ "$GOT" = a6000 ] && echo A6000 || echo 3090)")
   [ -n "$U" ] || { echo "gpu-gate.sh: the $GOT lookup failed" >&2; exit 75; }
