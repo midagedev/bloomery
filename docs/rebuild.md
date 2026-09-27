@@ -164,9 +164,33 @@ extras   = Engram | Ple | Deepstack
   - LATENT 256은 Mistral-Small-4가 요구한다.
 - 모델 e2e는 조립만 본다. 오라클은 GLM이 ik `glm5next`, Qwen3.5/3.6이 메인라인 `qwen35moe`다.
 
-**대상 순위(보고).** ① GLM-5.3-Flash ② Qwen3.6-35B-A3B ③ Qwen3.8-Flash-Next ④ gpt-oss-120b.
+**대상 순위(보고).** ① GLM-5.3-Flash ② Qwen3.6-35B-A3B ③ Qwen3.8-Flash-Next ~~④ gpt-oss-120b~~(사용자 09-27: 대상이 아니다).
 - ②는 Qwen3.5 계열의 운반체다. 같은 프로그램으로 27B dense, 122B, 397B, Qwen3-Next까지 간다.
 - 제작 순서는 사용자가 정한다(§7 결정 6).
+
+### 2-3. 확장 축과 그 비용 — 왜 모델마다 일이 많고, 무엇이 폭발을 막는가 (사용자 질문, 09-27)
+
+사용자의 두 질문에서 나왔다. "어떻게 모델마다 엔진이 구현해야 하는 게 이렇게 많은가", "Ampere 이상 세대·AVX-512·DGX Spark를 지원하면 또 폭발하는가."
+
+**모델마다 일이 많은 이유 셋.**
+1. **모델들이 진짜로 갈라졌다.** 2024년까지의 모델은 "트랜스포머 + 하이퍼파라미터"라 리더 하나에 숫자만 바꾸면 됐다. 지금 대상은 층 종류가 다르다: Qwen3.6은 GDN 30층 + 게이트 GQA 10층, GLM은 KDA 34층 + 압축 인덱서 + HC 잔차, V4.1은 MLA + 압축 스트림 + 인덱서 + engram, Qwen3.8-Flash-Next는 거기에 PLE n-gram 표와 MTP다(§2-2 표). 새 층 종류는 새 커널이고 커널마다 오라클 게이트가 붙는다. 참조 엔진도 같다 — llama.cpp는 아키텍처마다 그래프 빌더 파일 하나(`qwen35moe.cpp`, `glm5next`…)에 GDN·KDA·인덱서 커널을 따로 넣었다.
+2. **우리 트리가 필요 이상으로 비쌌다.** 모델마다 층 오케스트레이션을 처음부터 지었고(V4.1만 디코드·프롬프트 체인 둘로 1.5만 줄, DS6), 커널에 모델 이름과 상수를 박았다(`qwen3moe_*`의 HEAD 128·GROUP 8은 Qwen3.6의 256·8과 이미 안 맞는다, §2-1). 그래서 새 모델 = 새 트리였다. V4.1을 먼저 한 판단은 재료를 많이 남겼지만(호스트 티어, MoE 라우터·결합, 양자화 gemv 계열, 그래프 캡처, fault word, 레코드·게이트·임대 규율, 세션·서빙) 그 재료가 "V4.1 모양"으로 있었고, Qwen3는 V4.1의 부분집합이 아니었다(GQA flash, 밀집 MoE 프롬프트 GEMM, ubatch 라우팅은 새 커널). 가장 복잡한 모델은 가장 많은 재료를 줬지만 가장 공통인 재료를 준 것은 아니었다. 이 재구성이 갚는 빚이 이것이다.
+3. **증명 기준을 높게 잡았다.** 커널마다 오라클과 비트 대조, 게이트에 FAIL-first, 이동은 ptx-scan 동일. 선택한 비용이고, 이 덕에 착륙 뒤 회귀를 거의 겪지 않는다.
+
+Qwen3-30B-A3B에 든 이틀의 대부분은 "붙이기"가 아니라 "이기기"였다: e2e가 도는 데까지는 짧았고, 프리필 사다리(q3pflash → q3ubatch → q3router → q3gemmb → q3swz)로 pp4096을 2,615에서 9,268 tok/s로 올리는 라운드와 시팅이 그 시간이다(AGENTS 「Prefill is a headline metric」의 기록). 거기에 라운드 시간의 71 %가 박스 밖(착륙 대기·직렬화·설계 왕복)이던 운영 문제가 얹혔다(09-27 실측, `specs/wave-r2/PLAN.md` 08:50 절).
+
+**재구성 뒤의 잣대.** 새 모델 = 리더 팔 하나 + 커버리지 목록. modelspec이 Qwen3.6 파일을 열어 낸 목록이 그대로 03의 작업 큐가 된 것이 그 모양이다(Q4_K_M 144개 항목: GDN 30층, 라우터 softmax 256/8, shared expert sigmoid gate, GQA flash head 256, QK norm + IMROPE, attention output gate, 순환 상태 슬롯, 두 층 종류를 한 트렁크로 도는 프로그램, pre-tokenizer, 도구 파서 — 포맷 항목 0). Qwen3.6이 재구성된 모양에서 처음 붙이는 모델이라 이것이 하루 안에 들어오면 방향이 맞은 것이고, 또 이틀이면 덜 된 자리를 그 목록이 이름으로 가리킨다. GLM은 목록이 더 짧다(KDA는 GDN 커널의 인스턴스 하나, k-pool 인덱서, 288/8 sigmoid 라우터, routed Q5_K gemv, pre-tokenizer, 도구 파서). Qwen3.8-Flash-Next는 GQA 그룹 12, 전체 어텐션 층의 블록 인덱서(4헤드 × 128, top 2048, 압축비 4), gated-residual HC(4 스트림, rank 320), PLE n-gram 임베딩(51B, 호스트 티어 필수), MTP 1층이 더 붙는다.
+
+**폭발하는 조건은 하나다.** 새 축이 **코드 분기**로 들어오면 곱셈(모델 × 형식 × 세대 × ISA × 기계)이 되고, **표의 키**로 들어오면 덧셈이 된다. 연산 라이브러리(모델 상수는 인자, 컴파일 시간 크기만 인스턴스 표, 원칙 1)가 그 표다. 축마다 예상 비용:
+
+| 축 | 무엇이 바뀌나 | 비용 | 곱셈을 막는 자리 |
+|---|---|---|---|
+| **GPU 세대**(Ada·Hopper·Blackwell) | 커널은 세대 전용 명령을 쓰지 않는 SIMT 코드라 `--arch`를 바꿔 다시 컴파일하면 돈다. 바뀌는 것은 ① `ptx-shapes.tsv`(레지스터·스필 래칫)와 `launch_bounds`·타일 상수 — 세대별 값 ② **비트 게이트**: ptxas가 세대마다 FMA 접합을 다르게 할 수 있어 "오라클과 비트 동일" 핀이 세대별 핀이나 밴드가 된다 ③ cuda-oxide가 새 sm 타깃을 내는지(포크 패치 후보) | S–M | 인스턴스 표의 키에 `arch`, ptx-shapes에 세대 열, 게이트 핀에 세대 라벨 |
+| **AVX-512** | 호스트 티어는 DRAM 바운드라 디코드 이득 ≈ 0(h3tile 실측: 커널 명령을 줄여도 Δ 0). 프리필 유니온(연산 바운드)에서만 뜻이 있고, 그때도 qdot 커널 약 8개에 `#[target_feature]` 변형 하나씩(ik의 AVX2/AVX512/NEON 삼중 선례) | S, 기본은 안 함 | 유도가 이득을 보이는 커널에만; 런타임 디스패치 하나 |
+| **DGX Spark**(GB10) | "새 세대"가 아니라 **다른 기계**다. CPU가 Grace(ARM, NEON/SVE)라 AVX 커널이 하나도 안 돌고, 메모리 128 GB 통합이라 PCIe 다리와 호스트 티어라는 개념이 사라진다. 엔진은 더 단순해진다: 모든 층이 카드 프로그램(오늘 Qwen 모양), 배치는 "한 카드에 전부". 비용은 x86 전용 코드 점검(토크나이저·샘플러·세션·threads의 affinity), 호스트 티어 없는 배치 하나, Blackwell 컴파일 축. V4.1 Q3(약 300 GB)는 안 들어가고 V4-Flash Q2·Qwen3.6·GLM Q4는 들어간다[유도, 파일 크기] | M, 새 커널 계열 없음 | 기계 서술(아래) |
+| **양자화 형식** | 형식 주인 하나(`CardFormat`, 커버리지 검사가 읽는다, §3-D)에 행 하나 + 그 형식의 gemv·GEMM 인스턴스 | S–M/형식 | 형식 표 |
+
+**원칙(모델 쪽과 같다).** 세대·ISA·기계를 `ModelSpec`의 짝인 **기계 서술**로 둔다 — 카드의 sm과 SM 수, 메모리, 호스트 ISA, 통합 메모리 여부, PCIe 대역 — 그리고 배치와 인스턴스 선택이 그 서술을 읽는다. 지금 `docs/facts.md`에 산문으로 있는 기계 사실이 그 자리다. `opslib`가 인스턴스 표를 만들 때 키에 `arch`를 넣어 두면 세대는 그때 열만 는다. 세 축 중 먼저 확인할 것은 cuda-oxide의 sm 타깃 범위와 비트 게이트의 세대 의존이다 — 둘 다 코드를 읽어 답할 수 있고, 박스 실험이 필요하지 않다.
 
 ## 3. 지금 모양이 오늘 설계와 갈라진 곳 — 부류별
 
@@ -334,11 +358,11 @@ extras   = Engram | Ple | Deepstack
 |---|---|---|---|
 | **1 삭제** — 착륙(09-26, `35c95ec`..`d665eb5`) | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
 | **2 한 주인** | ~~`levers`~~(TL-1, aa 레버 — 착륙 `64aaab8`: `crates/levers` 등록부, `at_main`, 은퇴 이름 거절, `check-levers`) · ~~`records`~~(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼 — 착륙 `8fc1832`·`d2e42d3`: `record.rs`의 `Kind`·`Record`와 `--records-schema`, `records.py`, `generate_ds41 --plan`과 `tools/flow/plans/`, enqueue 자리에서 세는 `Entries`·`Tally`, 흐름 모형의 `--counts`) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · ~~`refset`~~(GD1·GG5, 시팅 10과 짝 — 착륙 `30b25fc`: `crates/refset`의 판독기 다섯과 아키텍처별 계열 표, `RefError::{Stale,Foreign,Unfinished,Malformed}`, `tools/bloomery/manifest.py`) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
-| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나; 설계는 `docs/research/modelspec-design.md`, 헤더만 읽는 `qwen35moe` 팔 포함) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로); V4.1 후보 마스크 커널 계열과 그 비트 단위 단위 게이트(candmask R1, `docs/research/candmask-design.md`) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리 — 설계 `docs/research/session-design.md`(09-27): 크레이트 `runtime`·`app`·`serve`, 라운드 `session` → `oneloop` → `draftserve` ∥ `cli`, `seqstate`는 나란히; 이 칸에서 4파동으로 넘치고, `gatesproc`보다 먼저 간다) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
+| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나; 설계는 `docs/research/modelspec-design.md`, 헤더만 읽는 `qwen35moe` 팔 포함) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로; 첫 커널은 카드의 routed Q5_K 전문가 gemv다 — Qwen3.6 UD-Q4_K_XL과 GLM UD-Q4_K_XL이 함께 기다린다(hosttier 메모 §7 13번, 설계 라운드 `q5kexpdesign`; 선택한 Qwen3.6 파일 Q4_K_M에는 Q5_K가 없어 첫 소비자는 GLM이다)); V4.1 후보 마스크 커널 계열과 그 비트 단위 단위 게이트(candmask R1, `docs/research/candmask-design.md`) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리 — 설계 `docs/research/session-design.md`(09-27): 크레이트 `runtime`·`app`·`serve`, 라운드 `session` → `oneloop` → `draftserve` ∥ `cli`, `seqstate`는 나란히; 이 칸에서 4파동으로 넘치고, `gatesproc`보다 먼저 간다) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로. 설계 `docs/research/v2fence-design.md`(09-27): 커널은 옮기지 않고 `tools/v2fence.txt` 목록에 올린다. 라운드는 `v2host` → `v2fence-cpu` → `v2fence-gpu` ∥ `v2fence-gates`이고, 03의 `hostcfg`·`hybridgate` 뒤, hostone C 전에 간다) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
 | **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`; 후보 마스크 배선과 16,384 거절 걷기 — candmask R2) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
-| **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6 |
+| **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6, `opslib`의 routed Q5_K 전문가 커널(GLM) |
 
-03 파동은 03의 계획을 따른다: `q3prune` → `q3input`·`q3gates` → `gemmsplit`·`q3act` → Q3-3 → 호스트 티어(`hostcfg` → `benchprune` → `hostone` → `hybridgate`) → `q3plan`, 그리고 `kernelshape` 설계 라운드. 공유 타입은 설계자와 서명자를 나눈다: `Act`(03 설계, aa 서명), `step_rows`(aa 설계, 03 서명), `HostTier`(03 설계, aa 서명).
+03 파동은 03의 계획을 따른다: `q3prune` → `q3input`·`q3gates` → `gemmsplit`·`q3act` → Q3-3 → 호스트 티어(`hostcfg` → `hybridgate` → `benchprune` → `hostone`; `hybridgate`는 v2fence 전에 gate_hybrid의 스텁 절반을 모델 없는 게이트로 뺀다 — 03, 09-27) → `q3plan`, 그리고 `kernelshape` 설계 라운드. 공유 타입은 설계자와 서명자를 나눈다: `Act`(03 설계, aa 서명), `step_rows`(aa 설계, 03 서명), `HostTier`(03 설계, aa 서명).
 
 리드 몫(라운드 밖): 원장 키 픽스업, AGENTS·CLAUDE를 규칙만으로(TL-2; ~~레버 절은 `levers` 뒤~~ 레버 절은 `levers` 착륙 때 등록부를 가리키는 한 문단이 됐다), 열린 일의 주인 정리(결정 2 뒤).
 
@@ -347,7 +371,7 @@ extras   = Engram | Ple | Deepstack
 09-27 아침 사용자가 여덟 가지를 모두 정했다. 모두 권고안이다(2·3·5번은 권고를 한 줄씩 붙여 다시 물은 답이다). 항목마다 **정함** 줄이 결정이고, 그 위는 그때의 물음이다.
 
 1. **V2-Lite(와 stage 0, CPU 엔진)의 은퇴.** 추천은 격리를 먼저 하고, 은퇴는 대체 게이트가 생긴 뒤에 하는 것이다.
-   - **정함(09-27):** V2-Lite와 CPU 엔진은 격리가 먼저다(3파동 `v2fence`). 은퇴는 대체 게이트가 생긴 뒤다. stage 0(`q3k-gemv`, `q3k-cpu`, `gpu-spike` — CPU2의 정의, gpu-spike는 따로 물어 같은 날 정함)은 대체가 필요 없으니 지금 지운다(삭제 라운드 `del2`). gpu-spike만 가진 검사 둘은 `crates/gpu`의 hw 시험으로 옮긴다.
+   - **정함(09-27):** V2-Lite와 CPU 엔진은 격리가 먼저다(3파동 `v2fence`). 은퇴는 대체 게이트가 생긴 뒤다. stage 0(`q3k-gemv`, `q3k-cpu`, `gpu-spike` — CPU2의 정의, gpu-spike는 따로 물어 같은 날 정함)은 대체가 필요 없으니 지금 지운다(삭제 라운드 `del2`, 착륙 `e28c7e2`). gpu-spike만 가진 검사 둘은 `crates/gpu`의 hw 시험으로 옮긴다.
    - 오늘 V2-Lite만 주는 커버리지가 둘이다. `gate-gpu-hybrid`는 호스트 티어가 전부 카드에서 돌린 결과와 비트 동일함을 본다. `gate-gpu-e2e`는 ik CUDA와 33프롬프트 × 32스텝 토큰을 대조한다.
    - 대체 후보: V4.1 픽스처 부분 집합(606 MB, 전부 카드 가능) 위의 hybrid 계약, 그리고 새 대상 모델의 작은 변형으로 하는 참조 토큰 대조.
    - AGENTS "Performance first"가 f64 심판으로 부르는 `exact_ref`와 forced_exact 핀도 V2-Lite 전용이다. 은퇴 때 정확도 자를 ik 덤프 밴드 + KLD로 옮길지, 서빙 모델용 심판을 새로 지을지를 같이 정한다.
@@ -360,7 +384,7 @@ extras   = Engram | Ple | Deepstack
    - `Q3K_SPLIT`: 예측이 자 아래라 13바퀴 시팅이 필요하다. 게이트가 착륙마다 5.6–6분을 쓴다.
    - `LAUNCH_THREAD`: 판정하려면 13바퀴가 필요하다.
    - 추천은 둘 다 지우고 아이디어는 트리아지에 남기는 것이다.
-   - **정함(09-27):** 둘 다 지운다(`del2`). `LAUNCH_THREAD`는 `GpuModel`의 필드이므로 `gpumodel`보다 먼저 착륙한다.
+   - **정함(09-27):** 둘 다 지운다(`del2`, 착륙 `e28c7e2`). `LAUNCH_THREAD`는 `GpuModel`의 필드이므로 `gpumodel`보다 먼저 착륙한다.
 5. **프리필 계약(GC8).** 모델 공통 계약을 "프롬프트는 스텝과 밴드, 비트는 배치 크기와 무관"으로 둘지 정한다. 지금 V4.1은 비트 동일, Qwen3는 밴드다. 층 프로그램 하나(DS6)와 연산 라이브러리의 GEMM 분기가 이 결정에 닿는다. 값은 호스트 항이 줄어든 뒤에 생긴다.
    - **정함(09-27):** 밴드 계약이다. 프롬프트는 스텝과 밴드로 판정하고, 비트는 배치·그룹·우배치 크기와 무관하다. V4.1 프리필 게이트는 GEMM 분기(3파동 `opslib`의 선택기, hoststream 뒤)가 설 때 비트에서 밴드로 다시 쓴다. FAIL-first와 날짜 사유를 붙인다. 그때까지 V4.1은 지금의 비트 계약 그대로다.
 6. **새 모델의 제작 순서.** 대상 순위는 ① GLM-5.3-Flash ② Qwen3.6-35B-A3B다(§2-2). 어느 쪽이든 앞에 공통 단계가 있다: 2–4파동에서 `ModelSpec`과 연산 라이브러리를 만들고 오늘의 두 모델을 그 위로 옮긴다.
@@ -368,9 +392,10 @@ extras   = Engram | Ple | Deepstack
    - Qwen3.6 먼저: delta rule 커널을 메인라인 `qwen35moe` 오라클과 카드 한 장의 빠른 게이트로 세운다. 그 뒤 GLM의 KDA는 같은 커널의 const 변형이 되고(메인라인 커널도 GDN과 KDA를 bool 하나로 가른다), 호스트 티어와 mHC는 V4.1 것을 쓴다. Qwen 변형 요구도 이 길에서 함께 닫힌다.
    - 추천은 Qwen3.6을 먼저 하고 바로 GLM으로 가는 것이다(보고와 같음).
    - **정함(09-27):** Qwen3.6-35B-A3B가 먼저고, 바로 GLM-5.3-Flash로 간다.
+   - **정함(09-27, 사용자 재확인):** GLM은 미루지 않는다 — Qwen3.6 사슬이 도는 동안 GLM의 선행(UD-Q4_K_XL 파일 199.7 GB 다운로드, 카드 routed Q5_K 전문가 gemv, `glm5next` 리더 팔)을 병행해 둔다. GLM 다음은 **Qwen3.8-Flash-Next**(`qwen4exp`)다. gpt-oss-120b는 대상이 아니다(§2-2의 ④를 지운다).
 7. **V4.1 후보 마스크의 깊은 진실 실행**(R4가 올 때 묻는다; **정함(09-27): 그대로, R4 때 묻는다**). 마스크 자체는 파동 안에서 짓는다(3파동 커널, 4파동 배선, `docs/research/candmask-design.md`). 16,448위치 d3 세트와 CPU 끝-끝 대조는 ik CPU 속도에 따라 6–48분이다[유도]. 비관 끝이 30분을 넘는다. 공개 긴 컨텍스트 숫자는 이 대조 뒤에 낸다.
 8. **혼합 파일과 그 세트의 삭제.** 혼합 파일 476,991,454,912 B, 혼합 노드 덤프 8,265,740,084 B, ikppl 혼합 7,401,300,256 B와 시팅 10이 옮겨 둔 사본들이다.
-   - **정함(09-27):** `refset` 착륙 뒤에 지운다. 파일이 없으면 빨강이 되는 핀 넷을 먼저 빼서 착륙시킨다(`plan-triage.md` 「재구성 파동 2가 남긴 것」).
+   - **정함(09-27):** `refset` 착륙 뒤에 지운다. 파일이 없으면 빨강이 되는 핀 넷을 먼저 빼서 착륙시킨다(`plan-triage.md` 「재구성 파동 2가 남긴 것」). 핀과 분기는 `del2`가 뺐다(착륙 `e28c7e2`). 파일은 조용한 창에 리드가 지운다.
 
 ## 8. 리드가 원본에서 다시 확인한 것
 
