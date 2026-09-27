@@ -145,6 +145,14 @@ if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${lg##*$'\n'}"
+# mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
+# recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
+if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
+  echo "$mc" >&2
+  echo "check-recipes: the mac-check self-test failed" >&2
+  exit 1
+fi
+echo "${mc##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(

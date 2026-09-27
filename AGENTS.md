@@ -13,7 +13,9 @@ The plan lives in `docs/plan.md`. This file is the working contract.
   `cargo oxide` (the recipes do).
 - **Never run a gate on the Mac.** The Mac is arm64 and an editor; the CPU
   kernels (`qdot`) use `std::arch::x86_64` and the worker pool (`threads`)
-  Linux affinity calls, neither of which the Mac runs.
+  Linux affinity calls, neither of which the Mac runs. The static tier (`just mac-check`,
+  `just mac-lint`: check and clippy as an x86_64-linux cross check, no linker; `just mac-fmt-check`)
+  runs on the Mac with the box's result; tests and gates never.
   Every command below goes through `tools/box.sh`, which rsyncs the tree to the
   workstation and runs there. That rsync is `--delete`: never edit on the box.
 - **Never hand-run a benchmark.** Measurements belong to the lease runners in
@@ -85,7 +87,7 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # (2026-09-21): a Mac `touch` changes no content, so the
                       # box never sees it — to force a rebuild of UNCHANGED
                       # source, touch on the box (`box.sh 'touch <file> && …'`).
-    just fmt          # cargo fmt --all
+    just fmt          # cargo fmt --all on the Mac, with the pinned nightly's rustfmt (tools/mac-check.sh)
     just build-ref    # the C++ reference harnesses that link ggml
     just deny         # cargo deny check; fails if the cuda-oxide pin ever floats
     just affected [BASE|A..B]  # the gate-* recipes a change touches, from the crate graph,
@@ -142,6 +144,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
     just box-tracks   # remote track dirs vs local worktrees; --remove NAME… deletes those, if stale
+    just mac-check    # check, and `mac-lint` clippy held to the Known-state count, on the Mac (tools/mac-check.sh):
+    just mac-lint     # the recipes' box commands as an x86_64-linux cross check, no linker; `mac-fmt-check` is fmt-check
     just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
                       # selects it. Plan (b) — the tree's only two-card load — staged on both
                       # cards and checked byte for byte against the plan; solo. `-lock` also

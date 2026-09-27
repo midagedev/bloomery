@@ -30,12 +30,28 @@ lint:
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
 # 하지 않고 파싱만 하므로 arm64 맥에서 정상 동작한다 — AGENTS.md의 "맥에서 게이트 금지"는
-# 빌드가 필요한 것에 대한 규칙이고, 판정은 박스의 fmt-check가 한다.
+# 빌드가 필요한 것에 대한 규칙이고, 판정은 박스의 fmt-check가 한다. rustfmt는 rust-toolchain.toml이 고정한
+# 나이틀리의 것이다 — PATH의 Homebrew rustfmt는 다른 판이다. 명령은 fmt-check의 것에서 `-- --check`를 뺀 것이고
+# 툴체인을 고르는 것은 tools/mac-check.sh다.
 fmt:
-    cargo fmt --all
+    ./tools/mac-check.sh fmt
 
 fmt-check:
     ./tools/box.sh 'cargo fmt --all -- --check'
+
+# 정적 계층을 맥에서 돈다: check·lint 레시피의 박스 명령에 `--target x86_64-unknown-linux-gnu`를 붙인 교차
+# 검사(링크 없음), fmt-check의 명령은 고정 툴체인의 rustfmt로. 테스트와 게이트는 여기서 돌지 않는다.
+# 환경은 레포 밖 ~/opt/bloomery-mac-env.sh 하나다 — 준비물과 만드는 법은 tools/mac-check.sh 머리말.
+mac-check:
+    ./tools/mac-check.sh check
+
+# lint의 `^warning:` 수를 AGENTS.md의 기준값과 비교한다. 넘으면 빨강.
+mac-lint:
+    ./tools/mac-check.sh lint
+
+# fmt-check를 맥에서, 고정 나이틀리의 rustfmt로 돈다.
+mac-fmt-check:
+    ./tools/mac-check.sh fmt-check
 
 # 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
 check-recipes:
