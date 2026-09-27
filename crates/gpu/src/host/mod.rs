@@ -3,9 +3,10 @@
 //! ([`step::StepPort`]) serves a captured chain's handoffs per go, inside the
 //! graph; the batch port ([`batch::BatchPort`]) serves an eager layer-batch
 //! behind an event and a host sync. The tier ([`HostTier`]) owns what both
-//! share: the host computation, the fault word a refusal is named by, the
-//! health (a failed service poisons the tier) and the counters, which
-//! [`HostTier::stats`] shows as one [`HybridStats`].
+//! share: the host computation, the slot map that sends a layer's slots to
+//! it, the fault word a refusal is named by, the health (a failed service
+//! poisons the tier), the counters, which [`HostTier::stats`] shows as one
+//! [`HybridStats`], and a placed load's host set ([`HostTier::residency`]).
 //!
 //! Per hybrid layer the captured chain carries, after the router:
 //!
@@ -87,6 +88,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
 use residency::HostResidency;
+use slots::SlotMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use step::{Boundary, Chain, SERVE, StepPort, stream_idle, word};
@@ -405,6 +407,8 @@ pub struct HostTier<H> {
     /// card's fault.
     fault: Option<Arc<DeviceBuffer<u32>>>,
     health: Health,
+    /// Which experts each layer's card stack holds; the host serves the rest.
+    slots: SlotMap,
     step: StepPort,
     /// The batch service's scratch and counters, and the port's sets once a
     /// caller made them ([`HostTier::prepare_batch`]).
@@ -413,15 +417,20 @@ pub struct HostTier<H> {
 }
 
 impl<H: HostExperts> HostTier<H> {
-    /// The tier over `boundary`: `experts` computes every expert the
-    /// boundary's slot map sends to the host, and `layers` bounds the chain.
-    /// Load-time only.
-    pub fn new(boundary: Boundary, experts: H, layers: usize) -> Result<HostTier<H>, GpuError> {
+    /// The tier over `boundary`: `experts` computes every expert `slots`
+    /// sends to the host, and `layers` bounds the chain. Load-time only.
+    pub fn new(
+        boundary: Boundary,
+        slots: SlotMap,
+        experts: H,
+        layers: usize,
+    ) -> Result<HostTier<H>, GpuError> {
         Ok(HostTier {
             residency: None,
             experts,
             fault: None,
             health: Health::default(),
+            slots,
             step: StepPort::new(boundary, layers),
             batch: BatchService::default(),
             port: None,
@@ -506,7 +515,7 @@ impl<H: HostExperts> HostTier<H> {
             });
         };
         let (batch, experts, health) = (&mut self.batch, &mut self.experts, &mut self.health);
-        let (slots, fault) = (&self.step.boundary.slots, self.fault.as_ref());
+        let (slots, fault) = (&self.slots, self.fault.as_ref());
         port.serve(key, |layer, x, ids, w, out| {
             let t = Tier {
                 experts,
@@ -675,8 +684,14 @@ impl<H: HostExperts> HostTier<H> {
     /// The slot map the tier serves by: which experts each layer's card
     /// stack holds.
     #[must_use]
-    pub fn slots(&self) -> &slots::SlotMap {
-        &self.step.boundary.slots
+    pub fn slots(&self) -> &SlotMap {
+        &self.slots
+    }
+
+    /// The boundary to enqueue a chain's handoffs on, and the slot map that
+    /// says which of a layer's slots the card computes.
+    pub fn boundary_and_slots(&mut self) -> (&mut Boundary, &SlotMap) {
+        (&mut self.step.boundary, &self.slots)
     }
 
     /// The step port.
@@ -736,6 +751,19 @@ impl<H: HostExperts> HostTier<H> {
     pub fn begin_chain_of(&mut self, stream: &CudaStream, chain: Chain) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned("Hybrid::begin_chain")?;
         self.step.begin(stream, chain)
+    }
+
+    /// Open the chain of a step walk of `units` rows of `cols` columns
+    /// ([`StepPort`]'s point): one row of one column is [`Chain::Step`], two
+    /// [`Chain::Pair`]; any other point is refused by name.
+    pub fn open_step(
+        &mut self,
+        stream: &CudaStream,
+        units: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        self.health.refuse_if_poisoned("Hybrid::begin_chain")?;
+        self.step.open(stream, units, cols)
     }
 
     /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager
@@ -805,7 +833,7 @@ impl<H: HostExperts> HostTier<H> {
         let t = Tier {
             experts: &mut self.experts,
             health: &mut self.health,
-            slots: &self.step.boundary.slots,
+            slots: &self.slots,
             fault: self.fault.as_ref(),
             hidden: h.hidden,
             n_used: h.n_used,
@@ -826,8 +854,17 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(SERVE)?;
         let (step, experts, health) = (&mut self.step, &mut self.experts, &mut self.health);
+        let slots = &self.slots;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            step.serve_one(experts, &mut *health, layer, row, opens_replay, chain)
+            step.serve_one(
+                experts,
+                &mut *health,
+                slots,
+                layer,
+                row,
+                opens_replay,
+                chain,
+            )
         }));
         match r {
             Ok(Ok(())) => Ok(()),

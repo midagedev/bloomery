@@ -803,8 +803,8 @@ mod gate {
             n_used: R_USED,
         };
         let slots = SlotMap::prefix(0..R_LAYERS, R_EXPERTS, R_CARD)?;
-        let b = Boundary::new(gpu.context(), gpu.stream(), shape, slots)?;
-        let mut h = Hybrid::new(b, Stub::default(), R_LAYERS)?;
+        let b = Boundary::new(gpu.context(), gpu.stream(), shape)?;
+        let mut h = Hybrid::new(b, slots, Stub::default(), R_LAYERS)?;
         if watch {
             h.watch_fault(gpu.fault_word())?;
         }

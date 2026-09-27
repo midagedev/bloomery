@@ -125,6 +125,11 @@ pub trait HostServed {
     /// ([`crate::hybrid::Hybrid::take_step_refusal`]): what the step's
     /// failure is named from after the stream has drained.
     fn take_host_refusal(&mut self) -> Option<Refusal>;
+
+    /// What a placed load did to the plan's host set — populated, locked —
+    /// held by the host tier for its lifetime ([`GpuModel::load_placed`]);
+    /// `None` on any other load.
+    fn host_residency(&self) -> Option<&HostResidency>;
 }
 
 /// The host service of a body whose chain runs on the card alone: no value
@@ -137,6 +142,10 @@ impl HostServed for NoHost {
     }
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
+        match *self {}
+    }
+
+    fn host_residency(&self) -> Option<&HostResidency> {
         match *self {}
     }
 }
@@ -264,8 +273,6 @@ pub struct Resident<B> {
     /// The output head, when the load carries it: a load of some blocks has
     /// no logits to take.
     pub head: Option<Head>,
-    /// What a placed load did to the plan's host set ([`HostResidency`]).
-    pub host: Option<HostResidency>,
     /// KV rows the resident caches were sized for.
     pub ctx_max: usize,
 }
@@ -275,7 +282,8 @@ pub struct Resident<B> {
 ///
 /// Fields drop in declaration order, and a graph must be destroyed while
 /// every buffer it addresses is still alive: the captured chains first, then
-/// the heads, the host set, the body (which drops its own captures first),
+/// the heads, the body (which drops its own captures first, and its host
+/// tier's lock over the host set before the mappings under it),
 /// the weights they all address, and the card last.
 pub struct GpuModel<B: ChainBody> {
     /// The captured chains, keyed by rows.
@@ -284,10 +292,6 @@ pub struct GpuModel<B: ChainBody> {
     /// when the load carries the head; rows 1 on are made by the first pass
     /// of [`Rows`] that needs them. Empty on a load without the head.
     heads: Vec<Head>,
-    /// What a placed load did to the plan's host set, and the lock over it
-    /// when one was asked for. Declared before `body` so that it drops
-    /// first: the lock's spans are pages of the file mappings the body keeps.
-    host: Option<HostResidency>,
     /// On the heap, so moving the model never moves the body's own state.
     body: Box<B>,
     weights: Weights,
@@ -312,13 +316,11 @@ impl<B: ChainBody> GpuModel<B> {
             weights,
             body,
             head,
-            host,
             ctx_max,
         } = r;
         GpuModel {
             graphs: Graphs::new(),
             heads: head.into_iter().collect(),
-            host,
             body: Box::new(body),
             weights,
             gpu,
@@ -370,7 +372,6 @@ impl<B: ChainBody> GpuModel<B> {
             weights,
             body,
             head,
-            host: None,
             ctx_max,
         }))
     }
@@ -380,10 +381,11 @@ impl<B: ChainBody> GpuModel<B> {
     /// stack's card `ExpertList` of its layer, the id prefix or a hot list's
     /// ranked ids), the weights `derive` files for the card's layers, and the
     /// body `body` builds over them, which keeps `file` for what the plan
-    /// leaves on the host; plus the output head when the card carries it.
-    /// Between the uploads and the body the plan's host set is read in and
-    /// locked as `host` asks ([`HostResidency::at_load`]), so that no step
-    /// takes the first touch of a host expert page; `host` also says whether
+    /// leaves on the host and its host tier the host set's residency; plus
+    /// the output head when the card carries it. Between the uploads and the
+    /// body the plan's host set is read in and locked as `host` asks
+    /// ([`HostResidency::at_load`]), so that no step takes the first touch of
+    /// a host expert page; `host` also says whether
     /// the card segments' file pages are released once uploaded. The caches hold the plan's `ctx_max` rows, the
     /// context its budget was made for. The card is found by its name in the
     /// plan ([`Gpu::for_card`]), never by ordinal.
@@ -393,7 +395,7 @@ impl<B: ChainBody> GpuModel<B> {
         card: usize,
         host: HostCfg,
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
-        body: impl FnOnce(&Gpu, Split, &Weights) -> Result<B, GpuError>,
+        body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
         let what = "GpuModel::load_placed";
         let spec = plan
@@ -413,8 +415,8 @@ impl<B: ChainBody> GpuModel<B> {
         // After the uploads, so the card's file bytes have left the page
         // cache before the host set is read in; before the body, which
         // takes `file`.
-        let host = HostResidency::at_load(&file, plan, |_| true, host)?;
-        let body = body(&gpu, file, &weights)?;
+        let residency = HostResidency::at_load(&file, plan, |_| true, host)?;
+        let body = body(&gpu, file, &weights, residency)?;
         let head = if spec.head {
             Some(Head::new(&gpu, &weights, body.head_eps())?)
         } else {
@@ -425,15 +427,18 @@ impl<B: ChainBody> GpuModel<B> {
             weights,
             body,
             head,
-            host: Some(host),
             ctx_max,
         }))
     }
 
     /// What the load did to the plan's host set — populated, locked — on a
-    /// placed load ([`GpuModel::load_placed`]); `None` on any other.
-    pub fn host_residency(&self) -> Option<&HostResidency> {
-        self.host.as_ref()
+    /// placed load ([`GpuModel::load_placed`]), as the body's host tier holds
+    /// it ([`HostServed::host_residency`]); `None` on any other.
+    pub fn host_residency(&mut self) -> Option<&HostResidency> {
+        self.body
+            .host()
+            .map(|h| &*h)
+            .and_then(HostServed::host_residency)
     }
 
     /// The card this model runs on.

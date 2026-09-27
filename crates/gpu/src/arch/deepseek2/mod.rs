@@ -33,8 +33,8 @@ pub use taps::{Block0Taps, LayerTaps};
 
 use crate::head::Head;
 use crate::hybrid::{
-    Boundary, BoundaryShape, Chain, HostExperts, Hybrid, HybridConfig, HybridStats, HybridWords,
-    Refusal, SlotMap,
+    Boundary, BoundaryShape, Chain, HostExperts, HostResidency, Hybrid, HybridConfig, HybridStats,
+    HybridWords, Refusal, SlotMap,
 };
 use crate::model::probe::Observer;
 use crate::model::{
@@ -263,7 +263,7 @@ impl Body {
             &self.mla,
             self.moe.as_ref(),
             false,
-            Some(h.boundary_mut()),
+            Some(h.boundary_and_slots()),
             &mut |_, _, _| Ok(()),
         )?;
         h.layer_enqueued(names.layer)
@@ -348,7 +348,6 @@ impl GpuModel<Body> {
             weights,
             body,
             head: Some(head),
-            host: None,
             ctx_max,
         }))
     }
@@ -438,9 +437,9 @@ impl Body {
         let hidden = body.scratch.dims.hidden;
         let shape = BoundaryShape { hidden, n_used };
         let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
-        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots)?;
+        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape)?;
         let host = PlanHost::new(derived, file, hidden, ff)?;
-        body.hybrid = Some(Hybrid::new(boundary, host, layers.len())?);
+        body.hybrid = Some(Hybrid::new(boundary, slots, host, layers.len())?);
         Ok(body)
     }
 }
@@ -557,6 +556,11 @@ impl HostServed for Body {
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.as_mut().and_then(Hybrid::take_step_refusal)
+    }
+
+    /// A V2-Lite load is not placed: its tier holds no host set.
+    fn host_residency(&self) -> Option<&HostResidency> {
+        self.hybrid.as_ref().and_then(Hybrid::residency)
     }
 }
 

@@ -94,8 +94,7 @@ use crate::transpose::TransposeKernels;
 
 mod batch;
 pub use batch::{
-    BatchLayer, BlockIo, ChunkIo, ExchangeKey, FfnBatch, FfnBatchKernels, JoinIo, Places,
-    TiledGateUp,
+    BatchLayer, BlockIo, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places, TiledGateUp,
 };
 
 /// What the enqueue path's errors name.
@@ -1100,7 +1099,7 @@ impl FfnPiece {
         layer: usize,
         row: usize,
     ) -> Result<GoFront<'w>, GpuError> {
-        let i = self.check_io(layer, hybrid.boundary().slots(), io, row)?;
+        let i = self.check_io(layer, hybrid.slots(), io, row)?;
         let card = self.check_card(layer, i, card)?;
         let lw = LayerWeights::resolve(
             &self.cfg[i],
@@ -1150,7 +1149,7 @@ impl FfnPiece {
         layer: usize,
         row: usize,
     ) -> Result<(), GpuError> {
-        let i = self.check_io(layer, hybrid.boundary().slots(), &io, row)?;
+        let i = self.check_io(layer, hybrid.slots(), &io, row)?;
         let boundary = hybrid.boundary();
         boundary.enqueue_back_of(gpu.stream(), row)?;
         self.enqueue_join(gpu, i, row, io, boundary)?;
@@ -1566,6 +1565,8 @@ pub struct Ds41Host {
     union: Option<UnionScratch>,
     embd: usize,
     ff: usize,
+    /// Routed slots a token: the union's list width.
+    n_used: usize,
 }
 
 impl Ds41Host {
@@ -1595,6 +1596,7 @@ impl Ds41Host {
             union: None,
             embd: hp.n_embd,
             ff: hp.experts.ff,
+            n_used: hp.experts.n_used,
         })
     }
 }
@@ -1623,18 +1625,17 @@ impl Ds41Host {
     /// nothing.
     pub fn prepare_union(&mut self) -> Result<(), GpuError> {
         if self.union.is_none() {
-            self.union = Some(union_scratch(self.embd, self.ff)?);
+            self.union = Some(union_scratch(self.embd, self.ff, self.n_used)?);
         }
         Ok(())
     }
 }
 
 /// The one shape of the tier's union scratch, for [`Ds41Host::prepare_union`]
-/// and the lazy path alike: [`UNION_MAX_COLS`] columns of [`N_USED`] routed
-/// slots, the width the card kernels are built for; a longer list is refused
-/// by name.
-fn union_scratch(embd: usize, ff: usize) -> Result<UnionScratch, GpuError> {
-    Ok(UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, N_USED)?)
+/// and the lazy path alike: [`UNION_MAX_COLS`] columns of the model's `n_used`
+/// routed slots; a longer list is refused by name.
+fn union_scratch(embd: usize, ff: usize, n_used: usize) -> Result<UnionScratch, GpuError> {
+    Ok(UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, n_used)?)
 }
 
 impl HostExperts for Ds41Host {
@@ -1664,12 +1665,13 @@ impl HostExperts for Ds41Host {
             union,
             embd,
             ff,
+            n_used,
             ..
         } = self;
         let view = host_view(layers, *first, layer, "Ds41Host::experts_union_into")?;
         let scratch = match union {
             Some(s) => s,
-            None => union.insert(union_scratch(*embd, *ff)?),
+            None => union.insert(union_scratch(*embd, *ff, *n_used)?),
         };
         view.experts_union_into(file.source(), x, lists, out, scratch)?;
         Ok(())

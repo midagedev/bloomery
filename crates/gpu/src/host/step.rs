@@ -146,8 +146,6 @@ pub struct Boundary {
     pub(crate) pages: Vec<RowPage>,
     /// `shared expert + hsum`: the combine's shared-expert input.
     pub(crate) sum: DeviceBuffer<f32>,
-    /// Which experts each layer's card stack holds; the host serves the rest.
-    pub(crate) slots: SlotMap,
     pub(super) region: DeviceBuffer<u32>,
     pub(super) page: MappedHost,
     pub(super) layout: PageLayout,
@@ -194,15 +192,14 @@ impl Drop for Boundary {
 }
 
 impl Boundary {
-    /// Allocate the region, the page and the sum for `shape`; the host
-    /// serves the experts `slots` sends to it. One row. Load-time only.
+    /// Allocate the region, the page and the sum for `shape`. One row.
+    /// Load-time only.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         shape: BoundaryShape,
-        slots: SlotMap,
     ) -> Result<Boundary, GpuError> {
-        Boundary::with_rows(ctx, stream, shape, slots, 1)
+        Boundary::with_rows(ctx, stream, shape, 1)
     }
 
     /// [`Boundary::new`] with `rows` rows (1..=[`super::page::MAX_ROWS`]) of
@@ -214,7 +211,6 @@ impl Boundary {
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         shape: BoundaryShape,
-        slots: SlotMap,
         rows: usize,
     ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
@@ -274,7 +270,6 @@ impl Boundary {
             seq,
             pages,
             sum: DeviceBuffer::<f32>::zeroed(stream, h.hidden)?,
-            slots,
             region,
             page,
             layout,
@@ -302,12 +297,6 @@ impl Boundary {
                 format!("row {row} of a boundary of {} rows", self.pages.len()),
             )
         })
-    }
-
-    /// The slot map the host tier serves by.
-    #[must_use]
-    pub fn slots(&self) -> &SlotMap {
-        &self.slots
     }
 
     /// The handoff's activation, `hidden` f32: what the norm writes on a
@@ -602,6 +591,32 @@ impl StepPort {
         Ok(())
     }
 
+    /// Open the chain of a walk of `units` rows of `cols` columns on
+    /// `stream`: the chain whose rows in flight are `units`, of one column
+    /// each ([`Chain::in_flight`]); any other point is refused by name.
+    pub(super) fn open(
+        &mut self,
+        stream: &CudaStream,
+        units: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        let chain = [Chain::Step, Chain::Pair]
+            .into_iter()
+            .find(|c| c.in_flight() == units)
+            .filter(|_| cols == 1)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "Hybrid::begin_chain",
+                    format!(
+                        "{units} rows of {cols} columns: the step port serves one row or {}, of \
+                         one column",
+                        Chain::Pair.in_flight()
+                    ),
+                )
+            })?;
+        self.begin(stream, chain)
+    }
+
     /// Whether the chain being enqueued is a capture; if so, note that
     /// `(layer, row)` is enqueued, which a replay then asks the host for.
     pub(super) fn note(&mut self, layer: usize, row: usize) -> bool {
@@ -631,11 +646,16 @@ impl StepPort {
 
     /// Serve layer `layer` of row `row` in `chain` with `experts`, recording
     /// a refusal in `health`: wait for the go, check it, build the host list
-    /// from the slot map, run the experts into the row's sum and signal.
+    /// from `slots`, run the experts into the row's sum and signal.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the tier's three parts the service reads, the go it serves and its chain"
+    )]
     pub(super) fn serve_one<H: HostExperts>(
         &mut self,
         experts: &mut H,
         health: &mut Health,
+        slots: &SlotMap,
         layer: usize,
         row: usize,
         opens_replay: bool,
@@ -697,7 +717,7 @@ impl StepPort {
                 format!("row {row}'s go is layer {lyr}'s, the host serves layer {layer}"),
             ));
         }
-        let map_row = self.boundary.slots.row(layer).ok_or(GpuError::state(
+        let map_row = slots.row(layer).ok_or(GpuError::state(
             what,
             "a hybrid layer without a slot map row",
         ))?;
@@ -836,7 +856,7 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, SlotMap};
+    use super::{Boundary, BoundaryShape};
     use cuda_core::CudaContext;
     use std::sync::Arc;
 
@@ -852,8 +872,7 @@ mod tests {
             n_used: 6,
         };
         let before = Arc::strong_count(&ctx);
-        let slots = SlotMap::prefix(0..2, 16, 8).expect("a prefix of 8 of 16");
-        let b = Boundary::with_rows(&ctx, &stream, shape, slots, 2).expect("a boundary");
+        let b = Boundary::with_rows(&ctx, &stream, shape, 2).expect("a boundary");
         let held = Arc::strong_count(&ctx);
         drop(b);
         let after = Arc::strong_count(&ctx);

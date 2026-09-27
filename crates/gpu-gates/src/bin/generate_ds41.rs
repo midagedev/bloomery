@@ -1388,7 +1388,7 @@ mod drive {
                 .u("group", b.prefill_group_lever())
                 .f("load_s", self.t.elapsed().as_secs_f64())
                 .print();
-            if let Some(h) = m.host_residency() {
+            if let Some(h) = b.hybrid().residency() {
                 for r in record::host_residency(h) {
                     r.print();
                 }

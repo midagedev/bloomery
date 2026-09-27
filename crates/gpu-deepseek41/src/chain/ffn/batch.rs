@@ -14,9 +14,10 @@
 //!    the layer's tensors are resolved once for the route and the shadow
 //!    ([`FfnPiece::resolve_batch`]);
 //! 2. the exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
-//!    [`FfnBatch::enqueue_upload`]): the block's activations and routing to
-//!    the host, one union call over its tokens for the layer's host experts
-//!    ([`Hybrid::serve_batch`]), the sums back;
+//!    [`FfnBatch::enqueue_upload`], through the host tier's batch port):
+//!    the block's activations and routing to the host, one union call over
+//!    its tokens for the layer's host experts ([`Hybrid::serve_key`]), the
+//!    sums back;
 //! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), enqueued before the
 //!    host computes: per chunk HC_PRE, the norm's q8_1 form again and the
 //!    shared expert; then over the whole block the card's routed experts by
@@ -45,13 +46,13 @@
 use std::mem::size_of;
 
 use bloomery_gpu::cores::q3k_row_dot;
+use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
 use bloomery_gpu::q4k_sel::{TILE_MAX_EXPERTS, tile_at, tile_cap};
 use bloomery_gpu::{FaultSink, FaultSite, col_sums, store_cols};
-use cuda_core::{CudaContext, CudaEvent, IntoResult, PinnedHostBuffer, sys};
+use cuda_core::{CudaContext, IntoResult, sys};
 use cuda_device::{SharedArray, warp};
 
 use super::*;
-use crate::chain::nanos;
 use crate::experts::swiglu_clamp;
 use crate::hc::hc_mean_elem;
 use crate::span::{span, span_mut};
@@ -896,8 +897,9 @@ unsafe fn join_post_at(a: &JoinIn<'_>, n: usize, i: usize) -> ([f32; 4], [f32; 4
 /// layer of one batch leaves for the next layer of the same batch is kept
 /// per batch of the group (`hc`, by `set`); what a layer's phases consume
 /// before the next batch's launches write it is one buffer (the stream runs
-/// them in order); and the host copies come in two sets ([`exchange`]),
-/// since the host reads them outside the stream's order.
+/// them in order); and the host copies are the host tier's batch port's
+/// ([`Hybrid::prepare_batch`]), in two sets, since the host reads them outside
+/// the stream's order.
 pub struct FfnBatch {
     kernels: FfnBatchKernels,
     cap: usize,
@@ -945,231 +947,6 @@ pub struct FfnBatch {
     q3_ord: DeviceBuffer<u64>,
     d8_ord: DeviceBuffer<f32>,
     tiles: DeviceBuffer<u32>,
-    /// The exchange: page-locked copies of the activations, the routing and
-    /// the host sums, the union reading the activations in place, in two
-    /// sets, each with the event its route's copies complete at.
-    exchange: exchange::Exchange,
-}
-
-/// The host exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
-/// [`FfnBatch::enqueue_upload`]) in two sets, taken in turn: a layer's
-/// route copies into one set while the union still reads the other, and the
-/// union writes its sums into its own set while the other's upload may not
-/// have run yet.
-///
-/// Each set owns the event its download records, and a serve waits on the
-/// event of the set whose buffers it reads: a serve that waited on a shared
-/// event would wait for the next batch's route too — the same bits with the
-/// overlap gone. Nothing outside this module names a set's event.
-mod exchange {
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    use super::{
-        CudaContext, CudaEvent, CudaStream, DeviceBuffer, ExchangeKey, GpuError, HostExperts,
-        Hybrid, N_USED, PinnedHostBuffer, ServeTimes, Tensor2View, WHAT, dtoh, htod, nanos,
-    };
-
-    /// Where a set stands: free, holding a layer-batch's route copies, or
-    /// holding its host sums before their upload.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Stage {
-        Free,
-        Routed(ExchangeKey),
-        Served(ExchangeKey),
-    }
-
-    /// One set: page-locked copies of a block's activations, routing and host
-    /// sums, the event its route's copies complete at, and its stage.
-    struct Set {
-        x: PinnedHostBuffer<f32>,
-        ids: PinnedHostBuffer<u32>,
-        w: PinnedHostBuffer<f32>,
-        sum: PinnedHostBuffer<f32>,
-        routed: CudaEvent,
-        stage: Stage,
-    }
-
-    /// The two sets, and the set the next download, serve and upload take:
-    /// each of the three goes through the sets in turn, so a serve takes the
-    /// set of the oldest download not served yet.
-    pub(super) struct Exchange {
-        sets: [Set; 2],
-        n_embd: usize,
-        down: usize,
-        serve: usize,
-        up: usize,
-    }
-
-    impl Exchange {
-        /// Two sets for blocks of up to `cap` tokens of rows of `n_embd`.
-        pub(super) fn new(
-            ctx: &Arc<CudaContext>,
-            n_embd: usize,
-            cap: usize,
-        ) -> Result<Exchange, GpuError> {
-            let pinned = |what: &'static str, n: usize| {
-                PinnedHostBuffer::<f32>::zeroed(ctx, n).map_err(|source| GpuError::Driver {
-                    op: Some(what),
-                    source,
-                })
-            };
-            let set = || -> Result<Set, GpuError> {
-                Ok(Set {
-                    x: pinned("cuMemAllocHost (the batch's activations)", cap * n_embd)?,
-                    ids: PinnedHostBuffer::<u32>::zeroed(ctx, cap * N_USED).map_err(|source| {
-                        GpuError::Driver {
-                            op: Some("cuMemAllocHost (the batch's routing)"),
-                            source,
-                        }
-                    })?,
-                    w: pinned("cuMemAllocHost (the batch's routing)", cap * N_USED)?,
-                    sum: pinned("cuMemAllocHost (the batch's host sums)", cap * n_embd)?,
-                    routed: ctx.new_event(None)?,
-                    stage: Stage::Free,
-                })
-            };
-            Ok(Exchange {
-                sets: [set()?, set()?],
-                n_embd,
-                down: 0,
-                serve: 0,
-                up: 0,
-            })
-        }
-
-        /// Both sets free, the next download into the first: at a group's
-        /// start, when the stream holds no copy of an earlier group (the
-        /// group's prologue waits for the stream).
-        pub(super) fn begin(&mut self) {
-            for s in &mut self.sets {
-                s.stage = Stage::Free;
-            }
-            (self.down, self.serve, self.up) = (0, 0, 0);
-        }
-
-        /// Enqueue the copies of `key`'s tokens `at .. u` of `x` (`n_embd` a
-        /// token), `ids` and `w` (six a token) into the next set, and its
-        /// event. Refused while that set holds a layer not uploaded yet.
-        pub(super) fn download(
-            &mut self,
-            stream: &CudaStream,
-            [x, w]: [&DeviceBuffer<f32>; 2],
-            ids: &DeviceBuffer<u32>,
-            key: ExchangeKey,
-        ) -> Result<(), GpuError> {
-            let (n, s) = (self.n_embd, N_USED);
-            let ExchangeKey { at, u, .. } = key;
-            let set = &mut self.sets[self.down];
-            if set.stage != Stage::Free {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "a route of {key:?} into an exchange set that holds {:?}: both sets \
-                         hold a layer not uploaded yet",
-                        set.stage
-                    ),
-                });
-            }
-            // SAFETY: each copy reads the first values of a device buffer
-            // (u ≤ cap, checked by the caller) and writes as many into this
-            // set's page-locked buffers. The set is free: its last serve
-            // returned, so the union no longer reads them, and its upload is
-            // enqueued before these copies. The host reads them again only
-            // in this set's next serve, after its wait on the event recorded
-            // below.
-            unsafe {
-                dtoh(stream, &mut set.x, x, at * n..u * n)?;
-                dtoh(stream, &mut set.ids, ids, at * s..u * s)?;
-                dtoh(stream, &mut set.w, w, at * s..u * s)?;
-            }
-            set.routed.record(stream)?;
-            set.stage = Stage::Routed(key);
-            self.down ^= 1;
-            Ok(())
-        }
-
-        /// Wait for the oldest unserved set's copies, which must be `key`'s,
-        /// then serve its layer's host experts for its tokens in one union
-        /// call: the sums into the set's copy the upload sends.
-        pub(super) fn serve<H: HostExperts>(
-            &mut self,
-            hybrid: &mut Hybrid<H>,
-            key: ExchangeKey,
-        ) -> Result<ServeTimes, GpuError> {
-            let n = self.n_embd;
-            let ExchangeKey { layer, at, u, .. } = key;
-            let set = &mut self.sets[self.serve];
-            if set.stage != Stage::Routed(key) {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "the serve of {key:?}; the oldest unserved exchange set holds {:?}",
-                        set.stage
-                    ),
-                });
-            }
-            let t0 = Instant::now();
-            set.routed.synchronize()?;
-            let t1 = Instant::now();
-            let x = Tensor2View::new(&set.x[at * n..u * n], n, u - at)?;
-            let times = ServeTimes {
-                wait_ns: nanos(t1 - t0),
-                copy_ns: nanos(t1.elapsed()),
-            };
-            hybrid.serve_batch(
-                layer,
-                x,
-                &set.ids[at * N_USED..u * N_USED],
-                &set.w[at * N_USED..u * N_USED],
-                &[],
-                &mut set.sum[at * n..u * n],
-            )?;
-            set.stage = Stage::Served(key);
-            self.serve ^= 1;
-            Ok(times)
-        }
-
-        /// Enqueue the copy of the oldest served set's sums, which must be
-        /// `key`'s, to `hsum`; the set is free again.
-        pub(super) fn upload(
-            &mut self,
-            stream: &CudaStream,
-            hsum: &mut DeviceBuffer<f32>,
-            key: ExchangeKey,
-        ) -> Result<(), GpuError> {
-            let n = self.n_embd;
-            let ExchangeKey { at, u, .. } = key;
-            let set = &mut self.sets[self.up];
-            if set.stage != Stage::Served(key) {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "the upload of {key:?}; the oldest served exchange set holds {:?}",
-                        set.stage
-                    ),
-                });
-            }
-            // SAFETY: the copy writes values at·n .. u·n of `hsum` from this
-            // set's page-locked sums, which the host writes again only in
-            // this set's next serve, after a wait on the event of its next
-            // download — enqueued after this copy, since the set is free
-            // from here on.
-            unsafe { htod(stream, hsum, &set.sum, at * n..u * n)? };
-            set.stage = Stage::Free;
-            self.up ^= 1;
-            Ok(())
-        }
-    }
-}
-
-/// [`FfnBatch::serve`]'s host time outside the union call, in nanoseconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ServeTimes {
-    /// Waiting on the route's copies to the host.
-    pub wait_ns: u64,
-    /// Copying the activations into the union's view.
-    pub copy_ns: u64,
 }
 
 impl FfnBatch {
@@ -1235,7 +1012,6 @@ impl FfnBatch {
             q3_ord: DeviceBuffer::zeroed(stream, slot_cols * 64 * n_sb.div_ceil(2))?,
             d8_ord: z(slot_cols * 2 * n_sb)?,
             tiles: DeviceBuffer::zeroed(stream, tile_cap(slot_cols, BUCKET_EXPERTS) + 1)?,
-            exchange: exchange::Exchange::new(ctx, n_embd, cap)?,
         })
     }
 
@@ -1263,12 +1039,6 @@ impl FfnBatch {
     #[must_use]
     pub fn hc_bytes(&self) -> usize {
         self.hc.iter().map(DeviceBuffer::num_bytes).sum()
-    }
-
-    /// Both exchange sets free: at a group's start, before its first launch,
-    /// once the stream holds nothing an earlier group enqueued.
-    pub fn begin_group(&mut self) {
-        self.exchange.begin();
     }
 
     /// Device bytes of the buffers, the chunk scratch's included; the
@@ -1352,39 +1122,50 @@ impl FfnBatch {
     }
 
     /// Enqueue the copies of `key`'s tokens' activations and routing to the
-    /// host into the next exchange set, and the event they complete at.
-    /// Asynchronous. Refused while both sets hold a layer not uploaded yet.
-    pub fn enqueue_download(&mut self, gpu: &Gpu, key: ExchangeKey) -> Result<(), GpuError> {
+    /// host into the host tier's next batch set, and the event they complete
+    /// at ([`Hybrid::enqueue_download`]). Asynchronous. Refused while both
+    /// sets hold a layer not uploaded yet.
+    pub fn enqueue_download<H: HostExperts>(
+        &self,
+        gpu: &Gpu,
+        tier: &mut Hybrid<H>,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
         self.check_key(key)?;
-        self.exchange
-            .download(gpu.stream(), [&self.x, &self.weights], &self.ids, key)
+        tier.enqueue_download(gpu.stream(), [&self.x, &self.weights], &self.ids, key)
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused
     /// by name — then serve its layer's host experts for its tokens in one
-    /// union call: the sums into the set's host copy
+    /// union call ([`Hybrid::serve_key`]): the sums into the set's host copy
     /// [`FfnBatch::enqueue_upload`] sends back. Returns the host time
     /// outside the union call.
     pub fn serve<H: HostExperts>(
-        &mut self,
-        hybrid: &mut Hybrid<H>,
-        key: ExchangeKey,
+        &self,
+        tier: &mut Hybrid<H>,
+        key: BatchKey,
     ) -> Result<ServeTimes, GpuError> {
         self.check_key(key)?;
-        self.exchange.serve(hybrid, key)
+        tier.serve_key(key)
     }
 
     /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
-    /// refused by name — to the card. Asynchronous.
-    pub fn enqueue_upload(&mut self, gpu: &Gpu, key: ExchangeKey) -> Result<(), GpuError> {
+    /// refused by name — to the card ([`Hybrid::enqueue_upload`]).
+    /// Asynchronous.
+    pub fn enqueue_upload<H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        tier: &mut Hybrid<H>,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
         self.check_key(key)?;
-        self.exchange.upload(gpu.stream(), &mut self.hsum, key)
+        tier.enqueue_upload(gpu.stream(), &mut self.hsum, key)
     }
 
     /// A key's tokens `at .. u` of a batch: at least one, at most the cap;
     /// its batch within the group's sets.
-    fn check_key(&self, key: ExchangeKey) -> Result<(), GpuError> {
-        let ExchangeKey { set, at, u, .. } = key;
+    fn check_key(&self, key: BatchKey) -> Result<(), GpuError> {
+        let BatchKey { set, at, u, .. } = key;
         if at >= u || u > self.cap || set >= self.hc.len() {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -1397,20 +1178,6 @@ impl FfnBatch {
         }
         Ok(())
     }
-}
-
-/// Which layer-batch a host exchange set holds ([`FfnBatch::enqueue_download`],
-/// [`FfnBatch::serve`], [`FfnBatch::enqueue_upload`]): model layer `layer` of
-/// the group's batch `set`, the batch's tokens `at .. u` of its block. Two
-/// batches' blocks can cover the same tokens of their batches; their keys
-/// still differ, so a serve or an upload out of the route order is refused
-/// by name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExchangeKey {
-    pub layer: usize,
-    pub set: usize,
-    pub at: usize,
-    pub u: usize,
 }
 
 /// The group's batch `set`'s HC_PRE results of `hc`, refused past the sets.
@@ -1464,68 +1231,6 @@ unsafe fn dtod<T: cuda_core::DeviceCopy>(
     };
     rc.result().map_err(|source| GpuError::Driver {
         op: Some("cuMemcpyDtoDAsync_v2 (the block's q8_1 planes)"),
-        source,
-    })
-}
-
-/// Enqueue the copy of values `at` of `src` to the same values of `dst`.
-///
-/// SAFETY: `dst` is not read, written or freed until the copy completes.
-unsafe fn dtoh<T: cuda_core::DeviceCopy>(
-    stream: &CudaStream,
-    dst: &mut PinnedHostBuffer<T>,
-    src: &DeviceBuffer<T>,
-    at: Range<usize>,
-) -> Result<(), GpuError> {
-    if at.is_empty() || at.end > src.len() || at.end > dst.len() {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!("values {at:?} from {} into {}", src.len(), dst.len()),
-        });
-    }
-    // SAFETY: both buffers hold the values of `at` (checked above); `dst`
-    // stays untouched until the copy completes by this fn's contract.
-    let rc = unsafe {
-        sys::cuMemcpyDtoHAsync_v2(
-            dst.as_mut_ptr().add(at.start).cast(),
-            src.cu_deviceptr() + (at.start * size_of::<T>()) as u64,
-            at.len() * size_of::<T>(),
-            stream.cu_stream(),
-        )
-    };
-    rc.result().map_err(|source| GpuError::Driver {
-        op: Some("cuMemcpyDtoHAsync_v2 (the batch's handoffs)"),
-        source,
-    })
-}
-
-/// Enqueue the copy of values `at` of `src` to the same values of `dst`.
-///
-/// SAFETY: `src` is not written or freed until the copy completes.
-unsafe fn htod<T: cuda_core::DeviceCopy>(
-    stream: &CudaStream,
-    dst: &mut DeviceBuffer<T>,
-    src: &PinnedHostBuffer<T>,
-    at: Range<usize>,
-) -> Result<(), GpuError> {
-    if at.is_empty() || at.end > src.len() || at.end > dst.len() {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!("values {at:?} from {} into {}", src.len(), dst.len()),
-        });
-    }
-    // SAFETY: both buffers hold the values of `at` (checked above); `src`
-    // stays unwritten until the copy completes by this fn's contract.
-    let rc = unsafe {
-        sys::cuMemcpyHtoDAsync_v2(
-            dst.cu_deviceptr() + (at.start * size_of::<T>()) as u64,
-            src.as_ptr().add(at.start).cast(),
-            at.len() * size_of::<T>(),
-            stream.cu_stream(),
-        )
-    };
-    rc.result().map_err(|source| GpuError::Driver {
-        op: Some("cuMemcpyHtoDAsync_v2 (the batch's host sums)"),
         source,
     })
 }
