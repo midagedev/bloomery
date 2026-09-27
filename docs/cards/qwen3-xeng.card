@@ -1,0 +1,29 @@
+# The public Qwen3-30B-A3B table in one window: decode at depth 6 / 1024 / 4096 and prompt
+# processing at P = 512 / 4096, bloomery against mainline llama.cpp (53ed051ce) and mistral.rs
+# (d5ae0f18f, the flash-attn build of 09-26) — the release sitting of 09-27. The README's decode
+# rows are from 09-24 (E28, before the flash and graph rounds) and its prefill rows from 09-26
+# (mrs-flash); no window has held all three engines at every depth yet. Ours at depth 4096 read
+# 175.9 tok/s in mrs-flash (no reference arms); the prefill changes since (q3swz, q3fa) do not run
+# in a decode step, so the step at 4096 is predicted unchanged within the ruler [derived].
+kind: baseline
+question: what are the three engines' decode and prompt rows on the A6000 in one window, for the
+  public Qwen3 table?
+term: tok/s @ n=96, depth 4096, A6000, bloomery (generate_qwen3moe of main, the `4096` arm of just
+  depth-gpu-qwen3moe)
+unit: tok/s
+predict: 172..180
+condition: one lease, three rounds, arms 6 lcpp:6 mrs:6 1024 lcpp:1024 mrs:1024 4096 lcpp:4096
+  mrs:4096 512 lcpppp:512 mrspp:512 lcpppp:4096 lcpppp4096:4096 mrspp:4096, the order rotated every
+  round; the whole model is card-resident for every engine, so no arm pages the host; no row carries
+  [cpu-busy] or [other-busy]; the full runner output goes to a file first. Command:
+  BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/qwen3-xeng.card' just
+  depth-gpu-qwen3moe <the arms above> > <log> 2>&1
+reason: sets every row of the public Qwen3 table (decode by depth and pp, llama.cpp and mistral.rs
+  beside ours) from one window; why now: the release track needs one table, and the prefill rows
+  moved twice since 09-24
+decide-in: write the table into rig-log first, then the README's Qwen3 section, one window, ratios
+  within it only
+decide-below: a decode regression since mrs-flash: rerun 4096 against a bin: arm of af929ae's
+  build before any row goes out
+decide-above: write the rows, then name the term: a decode change landed since mrs-flash that the
+  derivation missed

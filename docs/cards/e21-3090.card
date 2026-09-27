@@ -1,0 +1,29 @@
+# E21: V4.1 on a real RTX 3090 (24 GB, capped at 250 W), the target card of the public release.
+# Ours at --place gate (dense + 888 routed experts, 14.9 GB of experts) with the hot list, prose 512
+# and code 512 prompts, n 96; llama.cpp's V4.1 branch at --n-cpu-moe 37 (derived by relrunner: 1,152
+# card experts, 2,719 MiB left) with the same host set preheat. The A6000 emulation of a 24 GB budget
+# (1,171 card experts) read 35.83 tok/s on prose 512 (rig-log 09-24#public-q3km-prose-code-and-budget);
+# the gate placement holds fewer card experts (888): at ~2.5 us a card expert near that end of the
+# curve [derived, the same entry's slope], -283 experts cost ~0.7 ms on a 27.9 ms step, 34.9 tok/s;
+# the 3090's higher memory bandwidth (936 against 768 GB/s) shortens the card's share (~9 of 28 ms)
+# by up to ~1.6 ms, +2 tok/s [derived]; N6's band was 33-38.
+kind: baseline
+question: what does V4.1 decode at on the release's target card, a real RTX 3090, beside llama.cpp
+  on the same card?
+term: tok/s @ n=96, prose 512 prompt, RTX 3090 (250 W), ours --place gate with the hot list
+unit: tok/s
+predict: 33..38
+condition: one lease on the 3090 as the timing card, two rounds, arms prose:512 code:512 6 4096 lcpp:6
+  lcpp:4096 lcpp38:6, the order rotated; the card witness shows no power-cap time beyond the 250 W
+  limit's own; no row carries [cpu-busy] or [other-busy]; a FAIL row for lcpp at 37 or 38 is a
+  finding, not a stop. Command: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/e21-3090.card
+  BLOOMERY_TIMING_GPU=<the 3090 UUID, cards.sh> BLOOMERY_GEN_PLACE=gate
+  BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt' just depth-gpu-ds41 prose:512 code:512
+  6 4096 lcpp:6 lcpp:4096 lcpp38:6 > <log> 2>&1
+reason: the public headline is the target card's number, and no V4.1 run has been timed on a real
+  3090; why now: the release track, the relrunner placement lever and 3090 profile
+decide-in: write the 3090 table into rig-log and the README's target-hardware section, replacing the
+  emulated row's role as the 3090 number
+decide-below: read the card witness (sm clock, power and thermal cap counters) and the step split: a
+  capped card is a condition to state; otherwise the gate placement's host share is the term
+decide-above: the bandwidth term was larger than derived; restate N6's band from this row

@@ -1,0 +1,31 @@
+# The public V4.1 table in one window on the A6000: ours (placement (a), lcg ids, no hot list) against
+# llama.cpp's V4.1 PR branch (#28696 at 5210c7c, --n-cpu-moe 33), decode at depth 6 and 4096, pp at
+# P = 512 and 4096, with the relrunner preheat: each reference arm's host set (K = 33, 213,965,854,720 B,
+# header-read) is read into the page cache before its timer. The README's llama.cpp prefill rows
+# (104.6 / 103.8, 09-25 morning, reference first in its lease) carry 7,926 and 44,922 major faults —
+# by the relrunner rule (53 us a fault) up to 8.6 % and 6.0 % of their windows [derived]; the evening
+# rows after our arms read 73.2 (S13b). Preheated, the P = 512 row should sit at or above the morning
+# row: 104.6 .. 104.6 / (1 - 0.086) = 114 [derived]; the lower edge allows 4 % for a load that still
+# evicts part of the set (relrunner: 3k-24k residual faults predicted).
+kind: baseline
+question: with its host set preheated, where does llama.cpp's V4.1 prompt row sit beside ours in one
+  window, for the public V4.1 table?
+term: pp tok/s @ P = 512, llama.cpp PR #28696 (llama-bench -p 512 -n 0 -r 2, second sample,
+  -ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1), preheated, A6000
+unit: tok/s
+predict: 100..115
+condition: one lease, two rounds, arms 6 lcpp:6 512 lcpppp:512 4096 lcpp:4096 lcpppp:4096, the order
+  rotated; every reference row prints its preheat line (bytes, s, GB/s) and majflt; no row carries
+  [cpu-busy] or [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/v41-xeng.card' just depth-gpu-ds41 6 lcpp:6 512
+  lcpppp:512 4096 lcpp:4096 lcpppp:4096 > <log> 2>&1
+reason: sets the V4.1 rows of the public table, ours and llama.cpp in one window, which the README
+  has not had (its llama.cpp prefill rows are from another window); why now: the release track, and
+  the relrunner preheat that makes a reference arm after ours admissible
+decide-in: write the table (rig-log first, then README) with the majflt column's bound beside each
+  reference row
+decide-below: the preheat did not hold: read each reference row's majflt and preheat GB/s; no
+  reference row goes out without its [cold] bound, and the preheat's second pass (relrunner's
+  proposal) is the next runner change
+decide-above: the morning rows were fault-limited by more than derived: strike the README's 104.6 /
+  103.8 and restate them from this window
