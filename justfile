@@ -120,6 +120,11 @@ gate-gpu-q4k-sel:
 gate-gpu-kquant:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
 
+# Qwen3.8의 gated-residual hyper-connection(bloomery_gpu::hc_gated)을 모델 없이 파일 모양(4×2560, rank 320)의 합성
+# 입력으로 본다: f64 규칙의 밴드, 단계마다 카드 규칙과 비트 동일, 8열과 1열, combine·init, 이름 붙은 거부, 폴트, 로컬 depot.
+gate-gpu-hc-gated:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hc_gated && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hc_gated'
+
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:

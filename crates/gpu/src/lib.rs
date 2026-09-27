@@ -39,6 +39,7 @@ pub mod fused;
 pub mod gated_quant;
 pub mod gemm;
 pub(crate) mod graph;
+pub mod hc_gated;
 pub mod head;
 pub mod host;
 pub mod hybrid;
