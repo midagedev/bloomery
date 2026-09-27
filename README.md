@@ -13,7 +13,7 @@ bloomery runs mixture-of-experts models that do not fit on one GPU. Each routed 
 
 ## Models
 
-The files below are the ones the gates and the numbers use; each is byte-identical (sha256) to the upload linked.
+The files below are the ones the gates and the numbers use; ~~each is byte-identical (sha256) to the upload linked~~ each was downloaded from the upload linked, and a sha256 comparison against the uploads has not been recorded yet.
 
 | Model | File | Runs as | Checked by |
 |---|---|---|---|
@@ -53,7 +53,7 @@ As far as we know (2026-09-24), this is the only Rust engine that runs DeepSeek-
 
 ## Measured numbers
 
-Built for Ampere GPUs (sm_86) and AVX2 CPUs. Every number is a single stream on one RTX A6000 (48 GB, 300 W), or where a row says so on the workstation's RTX 3090 (24 GB, 250 W), in a 32-core AVX2 workstation, instrumentation off, one fresh process per arm, measured under the quiet-machine protocol below. Decode rows generate `n = 96` tokens. Each table comes from one window with its arms alternated, and a ratio is only taken between arms of the same window.
+Built for Ampere GPUs (sm_86) and AVX2 CPUs. Every number is a single stream on one RTX A6000 (48 GB, 300 W), or where a row says so on the workstation's RTX 3090 (24 GB, 250 W), in a 32-core AVX2 workstation, instrumentation off unless a row says otherwise, one fresh process per arm, measured under the quiet-machine protocol below. Decode rows generate `n = 96` tokens. Arms are alternated within a window, a table names its windows, and a ratio is only taken between arms of the same window.
 
 ### DeepSeek-V4.1-Flash, public `Q3_K_M` — one GPU plus CPU experts
 
@@ -68,18 +68,18 @@ Placement plan (a): every layer and the head on the card, 2,668 routed experts o
 
 **On one RTX 3090** (24 GB, capped at 250 W; placement `gate`: 1,146 routed experts on the card, the rest on the host; hot list), V4.1 decodes at **36.7 tok/s** after the prose 512 prompt and 36.5 after the code 512 prompt (plain, first of two rounds; the second round's rows carried page faults in their timed windows; 2026-09-27, rig-log [e21-3090](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#e21-3090)). The power cap was active for about a third of that window.
 
-On the A6000, the same placement (a) decodes at 39.6 tok/s after a 4096-token prose prompt (plain; 2026-09-26, [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab)). With the card budget of a 24 GB card, emulated on the A6000 (1,171 card experts), prose 512 decodes at 35.8 tok/s (plain; 2026-09-24, [public-q3km-prose-code-and-budget](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-prose-code-and-budget)).
+On the A6000, the same placement (a) decodes at 39.6 tok/s after a 4096-token prose prompt (plain, with `BLOOMERY_STEP_STATS=1` card-event timing on; 2026-09-26, [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab)). With the card budget of a 24 GB card, emulated on the A6000 (1,171 card experts), prose 512 decodes at 35.8 tok/s (plain; 2026-09-24, [public-q3km-prose-code-and-budget](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-prose-code-and-budget)).
 
 Against llama.cpp's V4.1 pull request ([#28696](https://github.com/ggml-org/llama.cpp/pull/28696) at `5210c7c`, `--n-cpu-moe 33`), in one window with three rounds: on synthetic prompt ids at depth 6, with no hot list, bloomery decodes at 29.7 tok/s and llama.cpp at 21.5, 1.38 ± 0.19. llama.cpp's first round read 11 % below its other two, which is most of that interval (rig-log [2026-09-25, launch-thread-lever-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#launch-thread-lever-ab)).
 
-**Prompt processing** (pp tok/s over a prompt of P tokens):
+**Prompt processing** (pp tok/s over a prompt of P tokens; every row ran with `BLOOMERY_STEP_STATS=1`, card-event timing on):
 
 | Prompt | Card experts by | P = 512 | P = 4096 | Measured |
 |---|---|---:|---:|---|
 | synthetic ids | id order (no hot list) | 144.6 | **247.5** | 2026-09-26; main at `0bcee2c` (512) and `e690f54` (4096) |
 | prose corpus | hot list | **216.1** | 292.1 | 2026-09-26; main at `efc202f`, before the paired batches |
 
-Sources: rig-log [b1-pp-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#b1-pp-ab), [prefillgroup-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#prefillgroup-ab) and [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab). The 247.5 is the clean round of two. The other round read 235.2, because its row was the window's first run and its prompt planning read the file cold (0.7 s). Later changes to the tree are not expected to move the 144.6 [derived: at 512 synthetic tokens the card work already runs under the CPU's]. llama.cpp's V4.1 branch (`-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1`, `llama-bench -p P -n 0`, which also feeds random ids) ran at 104.6 tok/s at P = 512 and 103.8 at P = 4096 on 2026-09-25 ([P = 512](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-baseline-p512), [P = 4096](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-baseline-p4096)). That was a different window from ours, so no ratio is given here. Those two values are warm ones: that run fed the random ids it had fed minutes before, so the n-gram (engram) rows the branch reads were already in memory. With ids it has not seen, the branch reads each such row through a single-threaded 4 KB page fault, about 1.9 s per 512 tokens on this machine, and ran at 73–76 tok/s (2026-09-27, rig-log [v41-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#v41-xeng)). bloomery prefetches those rows. A table from one window, with both engines' rows warm, is next.
+Sources: rig-log [b1-pp-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#b1-pp-ab), [prefillgroup-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#prefillgroup-ab) and [cardtile-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#cardtile-ab). The 247.5 is the clean round of two. The other round read 235.2, because its row was the window's first run and its prompt planning read the file cold (0.7 s). ~~Later changes to the tree are not expected to move the 144.6 [derived: at 512 synthetic tokens the card work already runs under the CPU's].~~ The r8 sidecar (2026-09-27) changed the CPU side, which bounds P = 512, so the 144.6 is out of date; it has not been re-measured in a clean window. llama.cpp's V4.1 branch (`-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1`, `llama-bench -p P -n 0`, which also feeds random ids) ran at 104.6 tok/s at P = 512 and 103.8 at P = 4096 on 2026-09-25 ([P = 512](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-baseline-p512), [P = 4096](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-baseline-p4096)). That was a different window from ours, so no ratio is given here. Those two values are warm ones: that run fed the random ids it had fed minutes before, so the n-gram (engram) rows the branch reads were already in memory. With ids it has not seen, the branch reads each such row through a single-threaded 4 KB page fault, about 1.9 s per 512 tokens on this machine [derived], and ran at 73–76 tok/s (2026-09-27, rig-log [v41-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#v41-xeng)). bloomery prefetches those rows. A table from one window, with both engines' rows warm, is next.
 
 ### Qwen3-30B-A3B-Instruct-2507, `Q4_K_M` — the whole model on the GPU
 
@@ -105,9 +105,9 @@ At 4096 tokens bloomery is 1.358 ± 0.002× llama.cpp with `-ub 4096` and 1.187 
 ### Read these numbers with their conditions
 
 - **Rows are plain decoding unless they say DSpark.** The DSpark rows use two cards: the model on the A6000 and the draft on the RTX 3090.
-- **The mistral.rs columns are its recommended build** (`flash-attn` on, as upstream's release builds and install script build it on Ampere). The prefill rows we published before 2026-09-26, 3,460 and 1,317 tok/s, came from a build without `flash-attn`, whose prompt attention took the eager P × P path ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)).
+- **The mistral.rs columns are its recommended build** (`flash-attn` on, as upstream's release builds and install script build it on Ampere). The prefill rows we published before 2026-09-26, 3,460 and 1,317 tok/s, came from a build without `flash-attn`, whose prompt attention took the eager P × P path (measured in [q3router-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#q3router-ab); the cause is in [mrs-noflash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)).
 - **The card is an A6000 unless a row says RTX 3090.** The 24 GB row emulates a 3090's budget on the A6000; the RTX 3090 rows ran on the real card.
-- **The V4.1 hot list was built from routing traces of the same corpora** the prose and code prompts come from, so those rows are its favorable case. With synthetic prompt ids, whose output collapses into a few repeating tokens, the same placement decoded at 34.7 tok/s at depth 6 and 32.3 at depth 4096 (2026-09-24).
+- **The V4.1 hot list was built from routing traces of the same corpora** the prose and code prompts come from, so those rows are its favorable case. With synthetic prompt ids, whose output collapses into a few repeating tokens, the same placement decoded at 34.7 tok/s at depth 6 and 32.3 at depth 4096 (2026-09-24, rig-log [public-q3km-first-timing](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-first-timing)).
 - **Synthetic and prose prompts do not share a table row.** Random ids route to different experts than text does, and the prose rows run with the hot list.
 
 For V4.1 decode, the host tier's memory bandwidth sets the step: 135–137 GB/s at 32 threads ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#v41-host-tier-k-rows)). The cost of each part is in [`docs/HARDWARE.md`](docs/HARDWARE.md).
@@ -160,7 +160,8 @@ What this work needed from its reference and its toolchain went upstream:
 - ik_llama.cpp [#2444](https://github.com/ikawrakow/ik_llama.cpp/pull/2444): `GGML_CUDA_NO_PINNED_WEIGHTS`, which loading V4.1 with CPU experts needs. Merged 2026-09-15.
 - ik_llama.cpp [#2522](https://github.com/ikawrakow/ik_llama.cpp/pull/2522): loading DeepSeek-V4.1 DSpark drafts. Merged 2026-09-25.
 - ik_llama.cpp [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507): V4.1 index keys from the pre-RoPE latent. Open, draft.
-- cuda-oxide [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) (a constant-folder crash on mixed-width shifts, merged 2026-09-23) and [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321) (unrolling loops whose exit test adds a constant to the counter, merged 2026-09-24); [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329) (installing the cached backend by rename) is open.
+- ik_llama.cpp [#2546](https://github.com/ikawrakow/ik_llama.cpp/pull/2546): the SwiGLU limits in DeepSeek-V4 DSpark drafts. Open.
+- cuda-oxide [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) (a constant-folder crash on mixed-width shifts, merged 2026-09-23) and [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321) (unrolling loops whose exit test adds a constant to the counter, merged 2026-09-24); [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329) (installing the cached backend by rename) and [#1346](https://github.com/NVlabs/cuda-oxide/pull/1346) (unrolling range `for` loops) are open.
 - llama.cpp [#29008](https://github.com/ggml-org/llama.cpp/pull/29008): message delimiters in the DeepSeek V3.2/V4 chat parser. Merged 2026-09-17.
 - Open: mistral.rs [#2430](https://github.com/EricLBuehler/mistral.rs/pull/2430) (non-F32 activations in the CPU GGUF MoE gather) and cutile-rs [#309](https://github.com/NVlabs/cutile-rs/pull/309) (`CudaContext::mem_info`).
 

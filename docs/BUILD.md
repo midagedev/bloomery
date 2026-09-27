@@ -1,6 +1,6 @@
 # Building and running bloomery
 
-This page is for building on your own Linux host. The maintainers build on one workstation through `tools/box.sh`, which copies the tree there and runs the command inside the quotes. On your own host, run the quoted command directly from the repository root.
+This page is for building on your own Linux host. The maintainers build on one workstation through `tools/box.sh`, which copies the tree there and runs the command inside the quotes. On your own host, run the quoted command directly from the repository root. When a recipe sets a variable in front of `./tools/box.sh` (for example `BLOOMERY_MODEL=deepseek41`), set it for your command too.
 
 ## Toolchain
 
@@ -14,7 +14,7 @@ This page is for building on your own Linux host. The maintainers build on one w
 | CUDA toolkit | 13.3 | `CUDA_TOOLKIT_PATH` |
 | NVIDIA driver | 615.71.09 on the development machine | — |
 | GPU | sm_86 (RTX 3090, RTX A6000) | `--arch sm_86` |
-| CPU | x86-64 with AVX2 and FMA | `.cargo/config.toml` |
+| CPU | x86-64 with AVX2 and FMA | `.cargo/config.toml` (cargo), `.cargo/cuda-oxide.toml` (cargo oxide) |
 
 The nightly moves only when the cuda-oxide pin moves. Other CUDA versions, drivers and GPU architectures are not tested.
 
@@ -36,7 +36,7 @@ cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --
 
 This builds the V4.1 CLI, the GPU kernels and the host expert tier into one binary, `target/release/generate_ds41`.
 
-**The CPU tier** is compiled with `-C target-cpu=znver3`. `.cargo/config.toml` sets it for `x86_64-unknown-linux-gnu`, so every release build on Linux gets AVX2 and FMA. The bit gates all run under this flag. The kernels also carry their own `#[target_feature]` attributes, so they stay correct if you override `RUSTFLAGS`. A host that is not Zen 3 has not been tested.
+**The CPU tier** is compiled with `-C target-cpu=znver3`. `.cargo/config.toml` sets it for `x86_64-unknown-linux-gnu` in plain `cargo` builds. A `cargo oxide` build (`generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41`) does not read that setting, because cargo-oxide passes its own rustflags; it takes the flag from `.cargo/cuda-oxide.toml` (`extra-rustflags`), and `just check-rustflags` fails when the two files disagree. So every release build on Linux gets AVX2 and FMA. The bit gates all run under this flag. The kernels also carry their own `#[target_feature]` attributes, so they stay correct if you override `RUSTFLAGS`. A host that is not Zen 3 has not been tested.
 
 `just check`, `just lint` and the `just gate-*` recipes are the maintainers' gates. They go through `tools/box.sh`; see `AGENTS.md` for what each one runs.
 
@@ -60,6 +60,8 @@ export BLOOMERY_REF_MODEL=/path/to/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.ggu
 
 `generate_ds41` has no default model path and stops if this variable is unset.
 
+**The r8 sidecar.** The host expert tier reads its routed gate and up weights from a second file, the r8 sidecar, laid out for the CPU kernels: `<model dir>-r8/<name>-r8.gguf` beside the model directory, 155.7 GB. `just r8-sidecar` writes it from the model file and checks it. It is on by default (`BLOOMERY_R8`). Without the file the engine reads the model file instead, with the same output bit for bit, and says so on its `load` line: `load host_tier r8=off (no sidecar at <path>: just r8-sidecar)`. A sidecar that does not match the model file is an error, never a fall-back. Budget the disk for both files.
+
 ## The data directory
 
 `$BLOOMERY_DATA` holds everything that is not the model and not the source tree. Its default is `/root/bloomery-data`. The parts `generate_ds41` can read:
@@ -71,7 +73,7 @@ export BLOOMERY_REF_MODEL=/path/to/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.ggu
 | `engram/corpus-*.ids` | token-id corpora for the draft gate and the router trace | not in this repository |
 | `ref_deepseek41/` | the oracle tensor dumps the gates read | `tools/ref/dump.sh` (needs ik_llama.cpp) |
 
-None of these is needed for a plain run with `--tokens`.
+None of these is needed for a plain run with `--tokens`. Without `--tokens` or `--depth`, `generate_ds41` reads `greedy-ds41/prompt0.tsv` and stops with an error that names the file when it is missing.
 
 ## Running `generate_ds41`
 
@@ -105,9 +107,9 @@ On the V4.1 engine the server is `bloomery-serve-ds41` (build it with `--bin blo
 
 | Variable | Effect |
 |---|---|
-| `BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt` | each routed layer's card keeps the list's first `n_l` experts instead of the id prefix. Same count and bytes. It was 4.5 ms per step faster (A6000, placement (a), depth 6, `n = 96`, instrumentation off; rig-log 2026-09-24) |
+| `BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt` | each routed layer's card keeps the list's first `n_l` experts instead of the id prefix. Same count and bytes. It was 4.5 ms per step faster (A6000, placement (a), depth 6, `n = 96`, instrumentation off, the earlier mixed-quantization file; rig-log [2026-09-24](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-placement-and-real-text-prompt)) |
 | `BLOOMERY_DRAFT=lookup` | the n-gram lookup draft through the skewed two-row pass. The `tokens` line equals the plain run's. Needs `--ctx` to hold one extra position. Prints a `draft summary` line |
 | `BLOOMERY_STEP_STATS=1` | a `stat step` line per step. It slows each step by 2.5–3 ms, so compare instrumented runs only with instrumented runs |
 | `BLOOMERY_PIN_MAIN=0` | leave the main thread unpinned |
 
-The full list of runtime levers is at the end of `AGENTS.md`.
+The full list of runtime levers is the registry in `crates/levers/src/registry.rs`: `just gate-levers` prints it as a table, and `<bin> --levers` prints what one binary parsed.
