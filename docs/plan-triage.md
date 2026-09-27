@@ -119,9 +119,127 @@
 
 - **Qwen 최신 — 어느 모델부터, 다운로드 둘**(qwennext-lit 09-25, `research/qwennext-lit-report.md`): 추천은 **Qwen3.6-35B-A3B 먼저**(`qwen35moe`, 04-15; 3090에 통째로 들어감 — lmstudio Q4_K_M 21.17 GB + KV 0.67 GB@32k + 상태 + 여유 ≈ 24.2 GB[유도]; 공개 3090 기준 llama.cpp 115.7 tok/s 비투기·pp2048 4,436 → 5,490(PR #29353); 우리 예측 A6000 183–205 tok/s@깊이 6·pp512 ≈ 4,800(청크 GDN 뒤 5,700–5,900)[유도], 3090 환산 219–248 — PR #83의 목표 252는 못 넘을 쪽), 같은 GDN 사슬 뒤에 **Qwen3.8-27B**(`qwen35`, 08-05; 가장 많이 받는 최신 Qwen — unsloth GGUF 6.9M 다운로드 대 35B-A3B 1.3M; 추가 비용 셋: GROUP 6 flash 타일·dense FFN 역할·MTP 링크(공개 비교선이 llama.cpp + MTP 66.4 tok/s, 비투기 41.6); 예측 A6000 27–42[유도, dense gemv 실효 대역이 한 측정으로만 닫힘]). 표면화할 충돌: 사람들이 도는 것은 27B인데 값싼 첫걸음은 35B-A3B다 — **순서는 사용자 결정**. **다운로드 결정**: lmstudio-community `Qwen3.6-35B-A3B-Q4_K_M.gguf`(21.17 GB)와 `Qwen3.8-27B-Q4_K_M.gguf`(16.81 GB) — 둘 다 Q4_K/Q6_K/F32뿐이라 새 형식 공백이 없고(unsloth UD 파일은 Q5_K·Q8_0·IQ 경로가 필요하고 UD-Q3_K_M은 활성 바이트가 Q4_K_M보다 크다), 박스에 없다(`tools/fetch-gguf.sh`). 보류 권장: Qwen3 dense(최신 아님), Qwen3.8-Flash-Next(L+, PLE·QSA 오라클, 111 GB), Coder-Next(IQ4_XS 경로 전체, 파일은 `/models/Qwen3-Coder-Next/…IQ4_XS.gguf`).
 
+- **두 카드 timing**: Qwen3.8을 A6000+3090에 raw로 올리면 T=1 약 102 tok/s, MTP와 함께 168–197이다 [유도, strataread]. AGENTS의 "timed는 A6000만"(3090 Xid 79 이력)과 부딪힌다.
+- **Qwen3.8 tiered requant**: 자주 쓰는 expert는 비트를 올리고 드문 것은 내려 72 GB에 통째로 넣는다(3×3090 공개 23 → 79–92 tok/s + MTP). 대가는 KLD 0.045 → 0.091이다.
+- **K7 선택 폭**: 우리는 풀 전체 + 꼬리(transformers·exllamav3)이고, ik·mainline·Strata는 `top_k + 3` = 2,051칸이다. 오라클에 맞출지 정한다.
+- **Qwen3.8 레버 순서**: strataread가 제안한 raw Q5_1 → MTP → residency → 프리필 규칙.
+- **GLM MTP의 자리**(glmmtp 09-28, `specs/wave-r3/reports/glmmtp.md`): hot list 뒤 k = 1(짝 walk 검증, 비트 동일 = 평문 greedy)이 ×1.08–1.57(중심 1.3), 목록 없이 MTP만이면 llama.cpp #27754 MTP 팔과 동률[유도] — 순서 hot list → MTP k = 1 → 두 카드 plan (b)를 제안한다. strataread는 GLM의 가장 큰 항을 적응형 residency로 본다; 둘을 한 순서로 묶는 판단이 남았다.
+
 남은 사용자 결정: **공개 시점**(M1 숫자만 vs M2와 함께) · **down 활성값 q8_K**(위).
 
 ## 열린 항목 — 받을 라운드별
+
+### 열차 6이 남긴 것 (09-28 새벽 — 03 `q8qdot`·`q38load` 0–3·`poolord`·`hcspill`·`q8wrap`·`q38prog` B + P1/P2/P8, aa `glmforced`·`kvckpt`·`kvgate`·`kvhost`·`glmcard`·`glmtime`·`glmfit`, e1 `modelkey`·`toolsdedup`·`fitarm`·`q3cold` — 50커밋)
+
+- **게이트 공백·잠정 핀**
+  - `gate_qwen4exp_e2e`의 `FLIP_ERR_CAP = 2.0`은 `[잠정 — 백로그]` 핀이다. 깨끗한 실행의 허용 flip 최대 오차 0.942와 m06(PLE 생략)의 4.69 사이에 둔 것이다. 코시-슈바르츠 한계는 약 √2560배 느슨해 유도하지 못했다. Qwen3.8 강제 팔로 flip을 아는 한계를 유도해 이 핀을 대체한다(M).
+  - GLM free 절도 같은 형태로 맞춘다. 공유 도우미는 `crates/gpu-gates`에 두고, 상한은 GLM 자신의 로그에서 정한다. `glmfix` 8번이 맡는다.
+  - q38prog 변이 14개 중 m01은 m03의 첫 캡처 중단에 가려 따로 관측되지 않았다. 그 절 (s)는 m06(1146 ≠ 1151)이 빨강으로 보였다.
+  - glmcard M5(back이 카드층에서도 `sh_y`를 씀)와 kvgate (a)(b)·kvhost `load()` 장치 FAIL-first 넷은 시팅 뒤 변이 창으로 미뤘다. 스크립트는 lead scratch `train6/kvmut.sh`에 있다.
+- **도구**
+  - `tools/ref/lease.sh:202` `cpu_busy_reading`은 프로세스 수명 평균 `ps pcpu`를 합한다. 그래서 러너 자기 팔이 `[cpu-busy]`로 찍힌다(09-27 v41-ppdepth 전 행). 구간 델타로 재고 자기 pid를 빼야 한다. `pplbrec`이 맡는다(S). 같은 파일 `:79` `CPU_BUSY_COMMS`에는 `generate_glm5next`·`generate_qwen3moe`가 빠져 있다(XS).
+  - `depth-ds41.sh`의 `[cold]`는 majflt만 세서 readahead로 들어온 engram 행을 못 본다. 우리 산문 팔에는 engram 예열도 없다(S).
+  - `nsys-ds41.sh:51`은 `prose:<P>`를 받지 않는다(S).
+  - `router-trace.sh`·`dump.sh`·`dump-draft.sh`가 `ikgit`을 각자 정의한다. 공용 헬퍼 하나로 모은다(XS).
+  - `lcpp-fit.sh:48` `lcpp_fit_eng`는 이름을 박아 둬서 러너마다 판별을 따로 둔다(S).
+  - 트랙 디렉터리에서 `-C` 없이 git을 부르는 박스 스크립트는 Mac 경로 `.git`에 걸린다(`build-lcpp-pr.sh`에서 실측). check-recipes 검사 후보(XS).
+  - `gguf-ranges.py:233` `host_set`은 앞쪽에 dense 층이 있는 모델(GLM 0–2)을 거절한다. 그래서 GLM은 예열을 쓸 수 없다(S).
+  - 러너 셋에 `tree_line`·`guard_timing`·`ratio_table`이 복사돼 있다. `tools/ref/tables.sh`로 모은다(S).
+  - `check-levers`는 게이트 bin의 `at_main(&[])` 누락을 못 잡는다(glmcard 창에서 GLM 두 게이트가 `HOT_LIST`를 거부한 원인, S).
+  - `flow/constants.tsv:24` `idx_row_ns` hi는 prefill 청크에서 약 6배 높다. prose union 상수는 r8 이전 값이고, `flow/plans`는 4096에서 끝난다(XS–S).
+  - `window-union.py:44` `DEFAULT_RANGES`가 V4.1 층 번호다(XS).
+- **엔진**
+  - V4.1 `chain/ffn.rs:922`도 `row_off`를 따로 계산한다. `SlotMap::row_offset`으로 옮긴다(S).
+  - `gpu-glm5next/src/forced.rs` `ForcedRoute`의 필드를 e2e가 읽지 않는다(S).
+  - `indexer.rs:1125` top-k는 청크당 8블록이라 84 SM 중 8개만 쓴다(M). `indexer.rs:1093`은 query를 다시 만든다(M).
+  - `body/prefill.rs:1312,1423`: 그룹 끝 fault 읽기와 동기 프롤로그가 카드를 비운다. 256k 사다리 1단 후보다(M).
+  - `generate_glm5next`에는 `--arm-sync`가 없어 팔마다 185 GB 호스트 집합을 다시 적재한다(M).
+  - `head.rs:30-34`는 norm 이름이 `output_norm`으로 고정돼 있다. MTP `shared_head_norm`용 인자가 필요하다(S).
+  - kvckpt `copied()`는 레인이 생기면 커밋된 레인을 복사해야 한다. `glmpair`와 함께 처리한다(S).
+- **데이터·문서**
+  - `corpus-prose.ids`는 75,268 ids라 128k·256k 산문 프롬프트가 없다(XS–S).
+  - ctx256k 보고의 "256k 여유 0.35 GB"는 배치가 KV를 먼저 뺀다는 것을 놓쳤다. 실제 대가는 카드 expert 약 44개다(XS).
+- **업스트림 후보**(FAIL-first·중복 점검 먼저)
+  - exllamav3 `moe_cpu_host.py:537`: CPU 워커의 예외가 부모에 `ConnectionResetError`로만 보인다.
+- **다음 라운드**(스펙 작성됨, `specs/wave-r3/`)
+  - `glmfix`(12항, KDA 복원 스탬프 포함)
+  - `pplbrec` → `v41-pplb` 시팅(사용자 승인 09-28)
+  - GLM MTP 사슬: `glmmtpref` → 03 `deltalanes` → `glmpair` → `glmmtpload` → `glmmtp`(보고 `glmmtp.md`)
+  - V4.1 256k: `candmask` → `candwire` → `candref` → `shadowlite`
+
+### 열차 6 밤이 남긴 것 (09-28 새벽, 03 — `q8qdot`·`q38load`·`poolord`·`hcspill`·`q8wrap`·`q38prog`·`q36mrs`, 조사 `strataread`·`enginesurvey`·`q38mtpd`)
+
+- **Qwen3.8 게이트** (`gate_qwen4exp_e2e`)
+  - flip을 반영한 밴드를 강제 arm으로 유도한다(M). (t) 로짓 행은 동점 판정에만 쓰고, (c) flip 허용은 `FLIP_ERR_CAP` 2.0 `[잠정 — 백로그]`로 막아 두었다(`9eccbea`, `e12f17c`). 두 값 모두 유도가 아니라 측정 경계다. 층 0–2의 flip이 거의 모든 출력을 경로 밖 밴드에서 빼는 것도 같은 라운드가 닫는다. GLM의 free 절(glmfix 8)과 같은 모양으로 한다.
+  - m01 단독 실행(XS, 박스 약 220 s). W3에서 m03이 먼저 중단해 가려졌다. 그 절((s) 노드 수)은 m06이 빨강으로 증명했다. 교훈: 중단형 뮤턴트는 단독으로 돌리거나 맨 뒤에 둔다.
+  - `Flip.pairs`의 맨 튜플 `(u32, u32, f64, f64)`을 이름 붙은 구조체로 바꾼다(S). gap과 err가 뒤바뀌지 않게 한다.
+  - `qwen4exp_host.rs:237`: `host::layer` 실패가 그 자리에서 panic해 뒤 층의 절을 가린다(XS). check로 기록하고 다음 층으로 넘어간다.
+- **Qwen3.8 프로그램**
+  - `program38`을 공유 `Program`으로 수렴시킨다(M–L). `program.rs:93-94`의 Port를 제네릭으로 하고, `dispatch::layer`에 잔차와 FFN 종류를 넣는다. 이동 클래스이므로 Qwen3와 Qwen3.6의 ptx·노드 수·e2e가 모두 동일해야 한다. layerprog §0 항목 7을 오늘은 어겼다.
+  - `body38.rs` `refresh`: `copy_from_host`가 스텝마다 스트림을 동기화한다(S, 토큰당 0.1 ms 미만 [유도]). 비동기 pinned 복사로 바꾼다.
+  - `PleHost::fill`: IQ4_NL 16행을 직렬로 읽는다. 캐시가 차가우면 0.1–1.6 ms/토큰이다(M). 한 스텝 앞서 읽거나 WILLNEED를 쓴다.
+  - m02 경로가 날것의 `DriverError(900, capturing)`로 올라온다(S). 캡처 중 호스트 복사를 이름으로 거부한다.
+  - `crates/gpu/src/gemm/mod.rs:53` `GEMM_MAX_SLOTS` = 4096 × 9는 Qwen3.6 기준이다. Qwen3.8(토큰당 11슬롯)은 U ≤ 3,351에서 막힌다. q38ub의 입력이다(XS).
+- **`q38fix` 착륙** (커밋 `0ea39a9`, 브랜치 `q38fix`, base `49b350e`; Mac 단계 녹색, clippy 48; 시팅 뒤 aa의 묶음에 넣는다. 게이트 목록은 `reports/q38fix.md` §5)
+  - 남은 것:
+    - `engram/src/hash/ngram.rs:141` `History`에 손으로 쓴 `clone_from`을 둔다. derive는 할당을 없애지 못한다(XS).
+    - `model/src/moe.rs:1172`: `UnionScratch`가 폭을 넘는 호출을 잘라 돌리는데(`cut_calls`), 이것이 조용한 실패인지 확인한다(S).
+    - `model.rs:607` `run_tokens`에서 `step(&[1, IMAGE])`는 첫 토큰을 진행한 뒤에 거부한다(S).
+    - `gate_qwen4exp_e2e.rs:958` (r) 절을 여러 pass로 넓힌다(step `[1, IMAGE]`, pass `[1;8]++[IMAGE]`). 이것이 mutant-5b의 FAIL-first다(S).
+    - `head.rs:162` Q8_0 lm_head가 쓰지 않는 `act`를 할당한다(S).
+    - `set_probe`의 `graphs.clear()`를 `drop_captures`로 옮기고, 아무도 쓰지 않는 `place.rs:34` `pub use`를 지운다(XS).
+    - `PassRecord`와 `RowsParams`를 `scratch.rs`로 합친다(M).
+  - mutant 1·3·4는 도달하는 게이트가 없다. 공개 API로 닿지 않는 거부라서 FAIL-first를 증명할 수 없고, 이 사실을 기록으로 남긴다.
+- **(처분 전 원본) q38review의 발견 20건**
+  - 정확성과 조용한 실패:
+    - `body38.rs:574` `set_taps`가 `pub`이고 캡처된 그래프를 버리지 않는다(①). 무장한 채 캡처한 뒤 해제하면 replay가 해제된 메모리에 쓴다. 게이트의 지금 순서는 안전하다. `taps35.rs:322`처럼 `set_mode(Eager)`를 먼저 부르는 `set_layer_taps`로 옮기고, 뿌리인 `model.rs:756` `body_parts`도 같이 본다.
+    - `stores.rs:22`에서 conv·taps가 0이면 `− 1`이 랩한다. 그 뿌리인 `hparams.rs:230`은 `ssm.conv_kernel`을 `positive`로 읽지 않는다.
+    - `run.rs` `prepare_union`이 더 큰 `cols`에도 `Ok`를 돌려준다.
+    - `program38.rs:835` `Pass38::head`가 m = 0을 이름으로 거부하지 않는다(형제 `program.rs:165`는 거부).
+    - `body38.rs:771` `prompt38`은 이미지 placeholder를 미리 검사하지 않아, 거부된 뒤 Pass와 Step의 상태가 갈린다.
+  - 한 소유자:
+    - `place.rs:219`의 선택 층 바이트가 `stores.rs`의 식을 쓰지 않는다.
+    - `coverage.rs:325,541`의 Qwen3.8 행이 plan38보다 넓게 받는다(GQA 인스턴스, IMROPE 섹션 합, BF16). IMROPE 판정이 네 곳에 있으니 술어 하나로 모은다.
+  - 주석:
+    - `fault.rs:329` QWEN35MOE 사이트 순서가 Qwen3.8의 실제 순서와 다르고, `qsa_key_append`의 PoolSelect 설명이 좁다.
+    - `body38.rs:58`, `gate_qwen4exp_e2e.rs:15`의 "until P1 lands"는 이미 지난 일이다.
+    - `gate_qwen4exp_e2e.rs:163`: selected flash가 두 런치라는 사실과 이력 문장.
+    - `head.rs:188` 에러 `what`, `batch.rs` `download_pitched`의 SAFETY 문구.
+  - 모양:
+    - 튜플 인자 `q38.rs:425,466`, `plan38.rs:208`의 4-튜플, `mod.rs:29`의 `pub`, `body38.rs:209` `hist.clone()`, `place.rs:243` 중복 테스트.
+    - 중복 `scratch38.rs:381` `PassRecord` ≈ `body35.rs:174` `RowsParams`, `download_pitched` ≈ `download`.
+  - 버리는 것: `front` 125줄(R12, 두 화면 조금 넘음)과 `ALLOWED` 문자열 일치(거부는 조용하지 않음)는 program38 수렴 때 함께 본다. 게이트와 `open_qwen38`은 합치지 않는다(게이트는 독립 판정자).
+- **Qwen3.6 게이트** (`gate_qwen35moe_e2e`)
+  - (d) 스토어 비율 `PROMPT_RATIO` 2.5 `[잠정 — 백로그]`(`q35ratio`, 09-28)를 유도된 밴드로 바꾼다. 재귀 스토어가 1,024 위치 동안 flip을 적분해, ubatch와 pass의 거리가 pass와 ik의 거리의 0.5–1.4배까지 간다. 측정 비율은 모두 √(1+r²) 이하였다. Qwen3.8의 flip 반영 밴드와 모양이 같으므로 한 라운드로 닫는다.
+  - (d)의 비율 절은 한쪽만 본다. 두 팔이 함께 지는 결함(q35ratio m2, 이미지 경로 first=0)에서는 분모가 커져 비율이 0.16으로 떨어졌다. 그 뮤턴트는 (u)가 잡았다. 같은 라운드에서 비율의 바닥이나 pass 팔의 ik 거리 절대 상한을 FAIL-first와 함께 넣는다(S).
+- **Qwen3.8 레버** (strataread·q38mtpd 순서 [유도]: 카드 raw Q5_1 → MTP → 적응형 residency → expert별 프리필 규칙)
+  - `q38card` raw Q5_1 팔(aa): 슬롯당 3.07 MB로 packed 4.87 MB 대신 파일 바이트를 그대로 쓴다. A6000에 올라가는 비율이 0.385에서 0.59로 늘고, T=1 기준 +5–15 %다.
+  - MTP 사슬(03): `mtpread`(0a, Mac 완료, 박스 단계 대기) → `mtprule`(0b) ‖ `mtpmeasure`(0c) → `q38rows` → `mtpload` → `mtpprog` → `mtpwin`. 설계는 `specs/wave-m8/reports/q38mtpd.md`다. 순환 상태 레인은 `deltalanes`(03, `linear/delta.rs`, GDN과 KDA 공유)가 받는다.
+  - 적응형 residency: 정책은 `runtime/residency.rs` 한 곳에 둔다. 카운터는 `host/step.rs:718-757`, 교체는 새 `host/swap.rs`다. `SlotMap`에 "in flight" 상태가 필요하다. 먼저 라우터 트레이스를 Mac에서 재생해 판정한다(`router-trace.sh`가 qwen4exp를 잡는다). GLM의 가장 큰 항이다.
+  - expert별 프리필 규칙: 교차점 c* ≈ 27슬롯 [유도]. 호스트 절반은 이미 `batch.rs:470`의 `exclude`에 있다. 엔진 호출자가 없으니 배선하거나 은퇴시킨다.
+  - `cuMemHostRegister`가 `crates/` 어디에도 없다(S). 모든 DMA 레버의 전제이고, 없으면 pageable 14.4 GB/s다. 약 210 GB 등록 비용을 재는 프로브를 함께 둔다.
+- **q8qdot**
+  - Q8_0의 −128 wrap이 ik와 패리티가 맞는지 보이게 한다(S). `tools/ref/q8f0_ref.cpp`에 단위 스케일 −128 열을 만들어 gate B가 wrap을 보게 한다. gate A 쪽은 `012a854`가 닫았다.
+  - `dot_row`의 Q8_0 AVX2 팔을 빼면 `_ =>` 미러로 조용히 떨어진다(S). 속도만 느려지고 값 게이트는 못 잡는다. 이름 붙은 거부나 커널 존재 단언으로 막는다.
+  - `quant.rs:1119` q8_2_x4 왕복이 포화하지 않는다. `qdot/lib.rs:3406` Q5_1 꼬리 `corr*0.25`가 비대칭이다(각 XS, 먼저 읽기).
+- **스필·ptx 도구**
+  - `tools/ref/ptx-shapes.tsv:2` 머리글이 spill을 "stores"라고 적지만, 실제는 저장과 적재의 합이다(`ptx-scan.sh:88`; 80 = STL 10 + LDL 10 × 4 B). XS.
+  - hcspill의 `lds.sh`를 `tools/`로 올린다(S, e1). ptx-scan에 `ld.shared`·SASS `LDS`/`STL`/`LDL` 열을 더한다.
+  - `ds41_attn_seg_stage` 8 B 스필을 hcspill과 같은 방식(합쳐진 로드의 생존 구간)으로 종이 확인한다(S).
+  - `hc_gated.rs:510` `launch_bounds(512, 2)` + k 바깥 순서로 2 블록/SM(S–M, 기하 부류, 토큰당 0.1 ms 이하 [유도]).
+- **게이트 하니스**
+  - Mac 단계만 거친 라운드의 새 게이트 절이 착륙 묶음에서 처음 돌았고, 열차 6에서 둘이 빨갛게 나왔다. `q35ubi`의 (d)는 예측이 빗나갔고, `q38ple`의 rollback은 참조가 다른 층의 탭을 썼다. 새 절을 처음 박스에서 돌리는 일을 착륙 묶음보다 앞에 둘지 정한다. 예를 들면 라운드마다 박스 스모크를 한 번 돌리거나, `--round-ledger`에 녹색 기록이 없는 새 게이트는 묶음이 거부하게 한다(S).
+  - `gate_deepseek41_prefill.rs:442` handoff·places 절은 카드와 합성 입력만 쓰는데 V4.1 전체를 적재한다(S–M). 적재 없는 게이트로 떼어 낸다. 뮤턴트 그룹당 약 150 s가 적재다.
+  - `gate-qwen4exp-meta`의 `&&` 연쇄는 `mtpread`가 rc 수집으로 고쳤다(착륙 대기).
+  - `spec_fail_first.rs:24-29`: AVAILABLE `at` 유일성을 전체 행에 대해 검사하는 lib 테스트를 둔다(S).
+  - `tools/check-arch.sh` 규칙 ①이 패밀리 자신의 `model::arch::qwen35moe`까지 외부로 센다(S). 그래서 plan38·program38·body38에 인라인 경로가 약 40개 생겼다.
+- **문서 (XS)**
+  - `hybrid.md:43`, `hybrid-lit-report.md:449`의 "평평한 라우터면 hit ≈ γ(0.23–0.33)"는 09-23 held-out 실측(61–74 % @ 16.7 %)과 FreeToken·JigSaw가 반박한다. 줄을 긋고 정정한다.
+  - `facts.md:66`(pageable H2D 14.4 GB/s)과 `plan.md:105`(21.2)를 맞춘다.
+  - `session-design.md:371` 체크포인트를 프롬프트 끝이 아니라 특수 토큰 경계에 둔다(OpenCode·OpenClaw의 편집 위치). 복원 게이트에 쓰이지 않은 0 상태 사례를 넣는다(aa glmfix 12).
+  - `plan.md:12` DSpark 1.4–1.5× 예측이 09-24 k-rows 선형 법칙 위에 있는지 확인한다. 두 외부 실측(JigSaw +17–20 %, ox-boost 순손실)이 오프로드에서 작다고 한다.
+  - hot list의 깊이 드리프트: 목록은 25k 토큰 절반에서 배웠다. 깊이 4096 이상의 hit를 재지 않았다(exllamav3 #315: 앞 문맥만 바뀌어도 cold 20.8 → 28.6 %). 같은 재생으로 잰다.
+  - `~/opt/bloomery-mac-env.sh`가 호출자의 `T` 변수를 덮어쓴다(XS, 두 번 당함).
 
 ### 출시 트랙이 남긴 것 (09-27, e1 — `relrunner`, `soak`, 창 1)
 
@@ -386,6 +504,9 @@
 - mainline: jinja 음수 step 슬라이스 — **패치 준비 끝(09-27, 라운드 `jinjaslice`, `~/repo/upstream/llama.cpp` 워킹 트리, 미커밋)**: #24580이 남긴 두 경우(`a[-10::-1]`이 `[0]`, `a[3:-1:-1]`이 `[3,2,1,0]`; Python은 둘 다 `[]`). 코드 3줄 + test-jinja 케이스 4개, FAIL-first 4/4, jinja2 3.1.6 대조 9,072 템플릿에서 불일치 180 → 0. **제출은 사용자 몫이다**: llama.cpp `CONTRIBUTING.md:25,35`와 `AGENTS.md:47,92,99`가 AI가 쓴 이슈·PR 본문·커밋 메시지·답글을 금지하고, 에이전트가 PR을 여는 것을 거절하라고 적는다(위반 시 밴) — 재현 이슈를 먼저 사람이 쓰고, 커밋은 사람이 요청할 때만 `Assisted-by:` 트레일러로. ik는 #24580 이전 상태라(음수 step이 start·stop을 무시) mainline 머지 뒤 둘을 함께 옮긴다.
 - ~~ik: DSpark(DSV4 서명 DFlash) 드래프트가 SwiGLU clamp를 안 건다~~ **[#2546](https://github.com/ikawrakow/ik_llama.cpp/pull/2546) 열림(09-27)**, 한 줄(`!hparams.dflash_dsv4`). V4.1에서 clamp가 걸려 20개 중 16개 프롬프트의 드래프트가 바뀌지만 n_max 3 수락은 58.1 → 58.3 %(+0.2 pp [−2.2, +2.1])로 그대로라 이득은 주장하지 않았다. V4 드래프트는 이 프롬프트들에서 clamp에 한 번도 닿지 않았다(rig-log 09-27#ik-dspark-clamp). 라운드가 본 ik 쪽 개선 셋(보고만): `llama-build-context.cpp:1214` split-graph 경로에서 shared expert가 routed 한계를 받음(지금 파일은 두 값이 같음, XS); `unary.cu:71` 대 `:80-82` limit 0 커널과 limit 커널의 식 순서가 달라 비트가 갈림(XS); `common/speculative.cpp:2030-2036` 드래프트가 target의 `-ot`를 물려받아 V4 드래프트 expert가 CPU로 감(S).
 - cuda-oxide(장부 `docs/upstream/nvlabs-ledger.md` 1–23): 함수·식 단위 FP 수축 제어 없음·`{mul,add}_rn_f32` 호스트 `unreachable!()`(17, 기능 요청); PTX를 트리 루트에 씀(XS); 공유 백엔드 캐시 `.so` 제자리 재빌드로 다른 트랙 rustc SIGBUS(가설, 원자적 rename); PTX 모듈 머리 정적 심볼 번호가 host 변경에 움직임; `DynamicSharedArray … shared_mem_bytes` 경고 출처(XS). Nsight Compute 2026.2.1 `derived__local_spilling_requests_pct` 분자 = 분모(코드 독해).
+- ik `ggml/src/ggml-cuda/topk-moe.cu:86-101`: butterfly에 인덱스 동점 규칙이 없다. 정확히 같은 값이면 expert가 빠지고 `ids[k]`에 경쟁이 생긴다(S).
+- ik `ggml/src/ggml-cuda/argsort.cu:571-575`: 프리필의 분할 정렬이 안정 정렬이 아니다(S).
+- ik `src/llama-hparams.cpp:775`: `ple.eos_token_id`가 조용히 0이 된다(S). 조용한 실패다.
 
 ### serve (propsengine 남긴 것 — 템플릿 정리 라운드 하나)
 
