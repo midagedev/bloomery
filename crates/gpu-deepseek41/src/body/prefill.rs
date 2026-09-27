@@ -1917,11 +1917,7 @@ impl<'a> GroupCx<'a> {
 /// failed wait or read names `e` beside its own error, and a fault `e`
 /// stays.
 fn fault_or(gpu: &Gpu, b: usize, e: GpuError) -> GpuError {
-    let read = gpu
-        .stream()
-        .synchronize()
-        .map_err(GpuError::from)
-        .and_then(|()| gpu.fault());
+    let read = gpu.fault();
     match read {
         Ok(Some(fault)) if matches!(&e, GpuError::Fault { fault: seen, .. } if *seen == fault) => e,
         Ok(Some(fault)) => GpuError::Fault {

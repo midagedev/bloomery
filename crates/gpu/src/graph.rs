@@ -372,47 +372,38 @@ pub fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
     Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
 }
 
-/// Bytes between two flags of a [`HostFlags`]: each has a cache line of its
-/// own, so a host store to one never shares a line with another.
-const FLAG_STRIDE: usize = 64;
-
-/// Operations in the batch [`HostFlags::enqueue_wait`] enqueues: the one
-/// wait. A gate tells this batch from the host tier's go and wait by it.
-pub const FLAG_WAIT_OPS: u32 = 1;
-
-/// Flag words the host raises and a stream waits on: page-locked host memory
-/// mapped into the device's address space (`cuMemHostAlloc` with `PORTABLE
-/// | DEVICEMAP`), one word per flag on its own line, zero at allocation.
-///
-/// [`HostFlags::enqueue_wait`] holds a stream until the host raises a flag —
-/// one batch memory-operation node when captured, a wait until the word is
-/// non-zero. A captured wait carries its value fixed, so the host, not the
-/// graph, rearms the flag: [`HostFlags::clear`] before the launch whose wait
-/// it gates, [`HostFlags::raise`] once what the wait guards is in place.
-/// A launched wait on a flag the host never raises waits forever: whoever
-/// launches a gated wait raises its flag on every path, errors included.
-pub struct HostFlags {
+/// Pinned host memory mapped into the device's address space
+/// (`cuMemHostAlloc` with `PORTABLE | DEVICEMAP`): the host reaches it at
+/// `host`, kernels, copies and stream memory operations at `dev`, from every
+/// context of the process. Zeroed at allocation, freed on drop. The one owner
+/// of mapped host memory: the host flags ([`HostFlags`]) and the host tier's
+/// page are views over it.
+pub(crate) struct MappedHost {
     host: *mut u8,
     dev: sys::CUdeviceptr,
-    len: usize,
+    bytes: usize,
 }
 
 // SAFETY: the allocation is owned by this value alone and freed once, in its
-// drop; the host touches the words only through atomics, from any thread.
-unsafe impl Send for HostFlags {}
-// SAFETY: as above — every host access is an atomic load or store.
-unsafe impl Sync for HostFlags {}
+// drop; the host pointer is plain process memory any thread may reach, and
+// every access to it goes through the methods below.
+unsafe impl Send for MappedHost {}
+// SAFETY: a host access through `&self` is an atomic word
+// ([`MappedHost::atomic_u32`]) or a plain read of bytes the protocol that
+// owns the span orders before it — the host tier reads a handoff image only
+// after an Acquire load of the generation word saw the go that published it,
+// and nothing writes it again before the host's Release signal; a host write
+// takes `&mut self`.
+unsafe impl Sync for MappedHost {}
 
-impl HostFlags {
-    /// `len` cleared flags of `ctx`. Load-time only.
-    pub fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<HostFlags, GpuError> {
-        const WHAT: &str = "HostFlags::new";
-        if len == 0 {
-            return Err(GpuError::shape(WHAT, "no flags"));
-        }
-        let bytes = len
-            .checked_mul(FLAG_STRIDE)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("{len} flags pass usize bytes")))?;
+impl MappedHost {
+    /// `bytes` zeroed bytes of `ctx`'s mapped host memory. `what` names the
+    /// allocation in a driver error. Load-time only.
+    pub(crate) fn new(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        what: &'static str,
+    ) -> Result<MappedHost, GpuError> {
         ctx.bind_to_thread()?;
         let mut host: *mut c_void = ptr::null_mut();
         // SAFETY: the context is current on this thread (bound above) and
@@ -424,11 +415,11 @@ impl HostFlags {
                 sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP,
             )
         };
-        cu(rc, "cuMemHostAlloc (host flags)")?;
+        cu(rc, what)?;
         let mut dev: sys::CUdeviceptr = 0;
         // SAFETY: `host` is the mapped allocation just made; the flags must be 0.
         let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
-        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2 (host flags)") {
+        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2") {
             // SAFETY: `host` came from cuMemHostAlloc and is freed once, here.
             unsafe { sys::cuMemFreeHost(host) };
             return Err(e);
@@ -436,9 +427,195 @@ impl HostFlags {
         // SAFETY: the allocation holds `bytes` writable bytes and nothing else
         // references it yet.
         unsafe { ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
-        Ok(HostFlags {
+        Ok(MappedHost {
             host: host.cast(),
             dev,
+            bytes,
+        })
+    }
+
+    /// The device address of byte `off`, which the caller's layout keeps
+    /// inside the allocation.
+    pub(crate) fn dev_at(&self, off: usize) -> sys::CUdeviceptr {
+        self.dev + off as u64
+    }
+
+    /// The host address of byte `off`. Computing it touches nothing; each
+    /// access proves its own span.
+    pub(crate) fn host_at(&self, off: usize) -> *mut u8 {
+        self.host.wrapping_add(off)
+    }
+
+    /// The u32 at byte `off` as an atomic; `None` when it is not 4-aligned
+    /// or passes the allocation.
+    pub(crate) fn atomic_u32(&self, off: usize) -> Option<&AtomicU32> {
+        if !off.is_multiple_of(4) || off + 4 > self.bytes {
+            return None;
+        }
+        // SAFETY: the word is 4-aligned and inside the allocation (checked
+        // above; the allocation is page-aligned); `AtomicU32` has `u32`'s
+        // layout, and every host access to a flag word goes through this
+        // view.
+        Some(unsafe { &*self.host_at(off).cast::<AtomicU32>() })
+    }
+
+    /// The `len` f32 at byte `off`, for the host to write; `None` when not
+    /// 4-aligned or past the allocation. `&mut self` makes it the only host
+    /// reference; the owner's protocol keeps the card off the span meanwhile.
+    pub(crate) fn f32_mut(&mut self, off: usize, len: usize) -> Option<&mut [f32]> {
+        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+            return None;
+        }
+        // SAFETY: the span is inside the allocation and 4-aligned (checked
+        // above); `&mut self` makes it the only host reference.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.host_at(off).cast::<f32>(), len) })
+    }
+
+    /// A copy of the `len` f32 at byte `off`, when inside the allocation.
+    pub(crate) fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
+        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+            return None;
+        }
+        let mut out = vec![0.0f32; len];
+        // SAFETY: the span is inside the allocation and 4-aligned (checked
+        // above); `out` is a distinct host buffer of `len` f32.
+        unsafe {
+            ptr::copy_nonoverlapping(self.host_at(off).cast::<f32>(), out.as_mut_ptr(), len);
+        }
+        Some(out)
+    }
+}
+
+impl Drop for MappedHost {
+    fn drop(&mut self) {
+        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here —
+        // after every graph that names it, since the graphs are declared
+        // before the bodies that own the views over it. A failure on the drop
+        // path is unreportable and ignored.
+        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+    }
+}
+
+// ------------------------------------------------------ stream memory ops
+
+/// An all-zero batch operation.
+fn op_zero() -> sys::CUstreamBatchMemOpParams {
+    // SAFETY: every member of the union is a plain C struct of integers, so
+    // all-zero bytes are a valid value.
+    unsafe { std::mem::zeroed() }
+}
+
+/// Wait until the u32 at `addr` is at least `value`.
+pub(crate) fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
+        address: addr,
+        __bindgen_anon_1:
+            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
+                value,
+            },
+        flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+        alias: 0,
+    };
+    p
+}
+
+/// Write `value` to the u32 at `addr`.
+pub(crate) fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.writeValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WRITE_VALUE_32,
+        address: addr,
+        __bindgen_anon_1:
+            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st__bindgen_ty_1 {
+                value,
+            },
+        flags: sys::CUstreamWriteValue_flags_enum_CU_STREAM_WRITE_VALUE_DEFAULT,
+        alias: 0,
+    };
+    p
+}
+
+/// A system-scope memory barrier: everything the stream wrote before it is
+/// visible system-wide before anything after it.
+pub(crate) fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.memoryBarrier = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpMemoryBarrierParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER,
+        flags: sys::CUstreamMemoryBarrier_flags_enum_CU_STREAM_MEMORY_BARRIER_TYPE_SYS,
+    };
+    p
+}
+
+/// Atomic reduction `*addr += value` on a u32 (wrapping).
+pub(crate) fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.atomicReduction = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpAtomicReductionParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_ATOMIC_REDUCTION,
+        flags: 0,
+        reductionOp: sys::CUstreamAtomicReductionOpType_enum_CU_STREAM_ATOMIC_REDUCTION_OP_ADD,
+        dataType: sys::CUstreamAtomicReductionDataType_enum_CU_STREAM_ATOMIC_REDUCTION_UNSIGNED_32,
+        address: addr,
+        value: u64::from(value),
+        alias: 0,
+    };
+    p
+}
+
+/// Enqueue `ops` on `stream` as one batch of stream memory operations — one
+/// graph node when captured.
+pub(crate) fn mem_batch(
+    stream: &CudaStream,
+    ops: &mut [sys::CUstreamBatchMemOpParams],
+    what: &'static str,
+) -> Result<(), GpuError> {
+    let n = u32::try_from(ops.len()).map_err(|_| GpuError::shape(what, "batch too long"))?;
+    // SAFETY: `ops` is a live array of `n` initialized operations the driver
+    // reads during the call (a capture copies them into the node); the flags
+    // must be 0.
+    let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), n, ops.as_mut_ptr(), 0) };
+    cu(rc, what)
+}
+
+// ------------------------------------------------------------- host flags
+
+/// Bytes between two flags of a [`HostFlags`]: each has a cache line of its
+/// own, so a host store to one never shares a line with another.
+const FLAG_STRIDE: usize = 64;
+
+/// Operations in the batch [`HostFlags::enqueue_wait`] enqueues: the one
+/// wait. A gate tells this batch from the host tier's go and wait by it.
+pub const FLAG_WAIT_OPS: u32 = 1;
+
+/// Flag words the host raises and a stream waits on: a view over mapped host
+/// memory ([`MappedHost`]), one word per flag on its own line, zero at
+/// allocation.
+///
+/// [`HostFlags::enqueue_wait`] holds a stream until the host raises a flag —
+/// one batch memory-operation node when captured, a wait until the word is
+/// non-zero. A captured wait carries its value fixed, so the host, not the
+/// graph, rearms the flag: [`HostFlags::clear`] before the launch whose wait
+/// it gates, [`HostFlags::raise`] once what the wait guards is in place.
+/// A launched wait on a flag the host never raises waits forever: whoever
+/// launches a gated wait raises its flag on every path, errors included.
+pub struct HostFlags {
+    page: MappedHost,
+    len: usize,
+}
+
+impl HostFlags {
+    /// `len` cleared flags of `ctx`. Load-time only.
+    pub fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<HostFlags, GpuError> {
+        const WHAT: &str = "HostFlags::new";
+        if len == 0 {
+            return Err(GpuError::shape(WHAT, "no flags"));
+        }
+        let bytes = len
+            .checked_mul(FLAG_STRIDE)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{len} flags pass usize bytes")))?;
+        Ok(HostFlags {
+            page: MappedHost::new(ctx, bytes, "cuMemHostAlloc (host flags)")?,
             len,
         })
     }
@@ -457,17 +634,11 @@ impl HostFlags {
 
     /// Flag `i`'s host word, or the refusal of an index past the flags.
     fn word(&self, i: usize, what: &'static str) -> Result<&AtomicU32, GpuError> {
+        let refuse = || GpuError::shape(what, format!("flag {i} of {} flags", self.len));
         if i >= self.len {
-            return Err(GpuError::shape(
-                what,
-                format!("flag {i} of {} flags", self.len),
-            ));
+            return Err(refuse());
         }
-        // SAFETY: i < len, so the word at i·FLAG_STRIDE lies inside the
-        // allocation of len·FLAG_STRIDE bytes, 4-aligned (the allocation is
-        // page-aligned); `AtomicU32` has `u32`'s layout, and the host reaches
-        // a flag only through this view.
-        Ok(unsafe { &*self.host.add(i * FLAG_STRIDE).cast::<AtomicU32>() })
+        self.page.atomic_u32(i * FLAG_STRIDE).ok_or_else(refuse)
     }
 
     /// Lower flag `i`: a wait on it enqueued from here on holds its stream.
@@ -496,36 +667,9 @@ impl HostFlags {
     /// captured. Capturable, allocation-free.
     pub fn enqueue_wait(&self, stream: &CudaStream, i: usize) -> Result<(), GpuError> {
         self.word(i, "HostFlags::enqueue_wait")?;
-        // SAFETY: every member of the union is a plain C struct of integers,
-        // so all-zero bytes are a valid value.
-        let mut op: sys::CUstreamBatchMemOpParams = unsafe { std::mem::zeroed() };
-        op.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
-            operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
-            address: self.dev + (i * FLAG_STRIDE) as u64,
-            __bindgen_anon_1:
-                sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
-                    value: 1,
-                },
-            flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
-            alias: 0,
-        };
-        let mut ops = [op];
-        // SAFETY: `ops` is a live array of FLAG_WAIT_OPS initialized
-        // operations the driver reads during the call (a capture copies them
-        // into the node); the word it names lives as long as this value, and
-        // the flags must be 0.
-        let rc = unsafe {
-            sys::cuStreamBatchMemOp_v2(stream.cu_stream(), FLAG_WAIT_OPS, ops.as_mut_ptr(), 0)
-        };
-        cu(rc, "cuStreamBatchMemOp_v2 (host flag wait)")
-    }
-}
-
-impl Drop for HostFlags {
-    fn drop(&mut self) {
-        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here. A
-        // failure on the drop path is unreportable and ignored.
-        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+        let mut ops = [op_wait_geq(self.page.dev_at(i * FLAG_STRIDE), 1)];
+        const _: () = assert!(FLAG_WAIT_OPS == 1);
+        mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (host flag wait)")
     }
 }
 

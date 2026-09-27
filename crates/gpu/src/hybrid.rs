@@ -74,8 +74,10 @@
 //! ([`Hybrid::reset`]), and any other stays until a reload.
 
 use crate::GpuError;
-use crate::fault::{FAULT_NONE, Fault, LAYER_NONE, mask_index};
-use crate::graph::cu;
+use crate::fault::{Fault, LAYER_NONE};
+use crate::graph::{
+    MappedHost, capturing, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
+};
 use crate::tensor::window;
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
@@ -85,7 +87,6 @@ use model::placement::host_lock::{HostLock, HostSet, Walk};
 use model::placement::{ModelTensor, Plan};
 use model::r8file::{HostR8, R8Source};
 use model::{Tensor2, Tensor2View};
-use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -413,227 +414,48 @@ const GO_DEADLINE: Duration = Duration::from_secs(10);
 /// Spins between two clock reads while waiting for a go.
 const DEADLINE_POLL: u32 = 1 << 12;
 
-/// Pinned host memory mapped into the device's address space
-/// (`cuMemHostAlloc` with `DEVICEMAP`): the host reaches it at `host`,
-/// kernels, copies and stream memory operations at `dev`. Zeroed at
-/// allocation, freed on drop.
-struct MappedHost {
-    host: *mut u8,
-    dev: sys::CUdeviceptr,
-    bytes: usize,
+/// Flag word `w` of the page, as an atomic.
+fn word(page: &MappedHost, w: Word) -> &AtomicU32 {
+    page.atomic_u32(w.offset())
+        .expect("every flag word lies in the page's first PAYLOAD_OFF bytes")
 }
 
-// SAFETY: the allocation is owned by this value alone and freed once, in its
-// drop; the host pointer is plain process memory any thread may reach, and
-// every access to it goes through `&self`/`&mut self` methods below.
-unsafe impl Send for MappedHost {}
-
-impl MappedHost {
-    fn new(ctx: &Arc<CudaContext>, bytes: usize) -> Result<MappedHost, GpuError> {
-        ctx.bind_to_thread()?;
-        let mut host: *mut c_void = std::ptr::null_mut();
-        // SAFETY: the context is current on this thread (bound above) and
-        // `host` is a live local the call writes.
-        let rc = unsafe { sys::cuMemHostAlloc(&mut host, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
-        cu(rc, "cuMemHostAlloc")?;
-        let mut dev: sys::CUdeviceptr = 0;
-        // SAFETY: `host` is the mapped allocation just made; the flags must be 0.
-        let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
-        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2") {
-            // SAFETY: `host` came from cuMemHostAlloc and is freed once, here.
-            unsafe { sys::cuMemFreeHost(host) };
-            return Err(e);
-        }
-        // SAFETY: the allocation holds `bytes` writable bytes and nothing else
-        // references it yet.
-        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
-        Ok(MappedHost {
-            host: host.cast(),
-            dev,
-            bytes,
-        })
+/// Word `i` of the handoff image of `words` words at byte `at` of the page;
+/// `None` past it.
+fn payload_word(page: &MappedHost, at: usize, i: usize, words: usize) -> Option<u32> {
+    if i >= words {
+        return None;
     }
-
-    /// The device address of byte `off`, which the layout keeps inside the
-    /// allocation.
-    fn dev_at(&self, off: usize) -> sys::CUdeviceptr {
-        self.dev + off as u64
-    }
-
-    /// The host address of byte `off`. Computing it touches nothing; each
-    /// access below proves its own span.
-    fn host_at(&self, off: usize) -> *mut u8 {
-        self.host.wrapping_add(off)
-    }
-
-    /// Flag word `w`, as an atomic.
-    fn word(&self, w: Word) -> &AtomicU32 {
-        // SAFETY: every `Word` offset is a 4-aligned byte inside the first
-        // PAYLOAD_OFF bytes of the allocation (`Boundary::new` sizes it past
-        // them); `AtomicU32` has `u32`'s layout, and the host reaches a flag
-        // word only through this view.
-        unsafe { &*self.host_at(w.offset()).cast::<AtomicU32>() }
-    }
-
-    /// Word `i` of the handoff image of `words` words at byte `at`; `None`
-    /// past it.
-    fn payload_word(&self, at: usize, i: usize, words: usize) -> Option<u32> {
-        if i >= words {
-            return None;
-        }
-        // SAFETY: i < words, and an image's `words` words start at a
-        // word-aligned `at` inside the allocation (`Boundary::new` lays the
-        // images out). The write that filled them finished before the go the
-        // caller acquired, and none writes them again before the caller's
-        // signal.
-        Some(unsafe { self.host_at(at + 4 * i).cast::<u32>().read_volatile() })
-    }
-
-    /// Copy `dst.len()` f32 of the image of `words` words at byte `at` from
-    /// word `from` into `dst`; `false` when the span passes the image.
-    fn payload_f32_into(&self, at: usize, from: usize, words: usize, dst: &mut [f32]) -> bool {
-        if from + dst.len() > words {
-            return false;
-        }
-        // SAFETY: the span is inside the image (checked above), which is
-        // f32-aligned at `at` + 4·from; `dst` is a distinct host slice.
-        // Ordered after the go as in `payload_word`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.host_at(at + 4 * from).cast::<f32>(),
-                dst.as_mut_ptr(),
-                dst.len(),
-            );
-        }
-        true
-    }
-
-    /// The `len` f32 at byte `off`, for the host to write. The caller holds
-    /// the page mutably, and the card reads the span only between a wait and
-    /// the next go — never while the host writes it.
-    fn f32_mut(&mut self, off: usize, len: usize) -> Option<&mut [f32]> {
-        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
-            return None;
-        }
-        // SAFETY: the span is inside the allocation and 4-aligned (checked
-        // above); `&mut self` makes it the only host reference.
-        Some(unsafe { std::slice::from_raw_parts_mut(self.host_at(off).cast::<f32>(), len) })
-    }
-
-    /// A copy of the `len` f32 at byte `off`, when inside the allocation.
-    fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
-        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
-            return None;
-        }
-        let mut out = vec![0.0f32; len];
-        // SAFETY: the span is inside the allocation and 4-aligned (checked
-        // above); `out` is a distinct host buffer of `len` f32.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.host_at(off).cast::<f32>(), out.as_mut_ptr(), len);
-        }
-        Some(out)
-    }
+    // SAFETY: i < words, and an image's `words` words start at a word-aligned
+    // `at` inside the page (`Boundary::new` lays the images out). The write
+    // that filled them finished before the go the caller acquired, and none
+    // writes them again before the caller's signal.
+    Some(unsafe { page.host_at(at + 4 * i).cast::<u32>().read_volatile() })
 }
 
-impl Drop for MappedHost {
-    fn drop(&mut self) {
-        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here —
-        // after every graph that names it, since the graphs are declared
-        // before the body that owns this page. A failure on the drop path is
-        // unreportable and ignored.
-        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+/// Copy `dst.len()` f32 of the image of `words` words at byte `at` of the
+/// page from word `from` into `dst`; `false` when the span passes the image.
+fn payload_f32_into(
+    page: &MappedHost,
+    at: usize,
+    from: usize,
+    words: usize,
+    dst: &mut [f32],
+) -> bool {
+    if from + dst.len() > words {
+        return false;
     }
-}
-
-// ------------------------------------------------------ stream memory ops
-
-/// An all-zero batch operation.
-fn op_zero() -> sys::CUstreamBatchMemOpParams {
-    // SAFETY: every member of the union is a plain C struct of integers, so
-    // all-zero bytes are a valid value.
-    unsafe { std::mem::zeroed() }
-}
-
-/// Wait until the u32 at `addr` is at least `value`.
-fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
-    let mut p = op_zero();
-    p.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
-        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
-        address: addr,
-        __bindgen_anon_1:
-            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
-                value,
-            },
-        flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
-        alias: 0,
-    };
-    p
-}
-
-/// Write `value` to the u32 at `addr`.
-fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
-    let mut p = op_zero();
-    p.writeValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st {
-        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WRITE_VALUE_32,
-        address: addr,
-        __bindgen_anon_1:
-            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st__bindgen_ty_1 {
-                value,
-            },
-        flags: sys::CUstreamWriteValue_flags_enum_CU_STREAM_WRITE_VALUE_DEFAULT,
-        alias: 0,
-    };
-    p
-}
-
-/// A system-scope memory barrier: everything the stream wrote before it is
-/// visible system-wide before anything after it.
-fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
-    let mut p = op_zero();
-    p.memoryBarrier = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpMemoryBarrierParams_st {
-        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER,
-        flags: sys::CUstreamMemoryBarrier_flags_enum_CU_STREAM_MEMORY_BARRIER_TYPE_SYS,
-    };
-    p
-}
-
-/// Atomic reduction `*addr += value` on a u32 (wrapping).
-fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
-    let mut p = op_zero();
-    p.atomicReduction = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpAtomicReductionParams_st {
-        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_ATOMIC_REDUCTION,
-        flags: 0,
-        reductionOp: sys::CUstreamAtomicReductionOpType_enum_CU_STREAM_ATOMIC_REDUCTION_OP_ADD,
-        dataType: sys::CUstreamAtomicReductionDataType_enum_CU_STREAM_ATOMIC_REDUCTION_UNSIGNED_32,
-        address: addr,
-        value: u64::from(value),
-        alias: 0,
-    };
-    p
-}
-
-/// Enqueue `ops` on `stream` as one batch of stream memory operations — one
-/// graph node when captured.
-fn mem_batch(
-    stream: &CudaStream,
-    ops: &mut [sys::CUstreamBatchMemOpParams],
-    what: &'static str,
-) -> Result<(), GpuError> {
-    let n = u32::try_from(ops.len()).map_err(|_| GpuError::shape(what, "batch too long"))?;
-    // SAFETY: `ops` is a live array of `n` initialized operations the driver
-    // reads during the call (a capture copies them into the node); the flags
-    // must be 0.
-    let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), n, ops.as_mut_ptr(), 0) };
-    cu(rc, what)
-}
-
-/// Whether `stream` is recording a capture right now.
-fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
-    let mut status: sys::CUstreamCaptureStatus = 0;
-    // SAFETY: the stream is live and `status` is a local the call writes.
-    let rc = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut status) };
-    cu(rc, "cuStreamIsCapturing")?;
-    Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
+    // SAFETY: the span is inside the image (checked above), which is
+    // f32-aligned at `at` + 4·from; `dst` is a distinct host slice. Ordered
+    // after the go as in `payload_word`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            page.host_at(at + 4 * from).cast::<f32>(),
+            dst.as_mut_ptr(),
+            dst.len(),
+        );
+    }
+    true
 }
 
 /// Whether every operation enqueued on `stream` has finished, without
@@ -805,7 +627,11 @@ impl Boundary {
         let image_stride = (4 * words).next_multiple_of(256);
         let hsum_stride = (4 * shape.hidden).next_multiple_of(256);
         let sums_off = PAYLOAD_OFF + rows * image_stride;
-        let page = MappedHost::new(ctx, sums_off + rows * hsum_stride)?;
+        let page = MappedHost::new(
+            ctx,
+            sums_off + rows * hsum_stride,
+            "cuMemHostAlloc (hybrid page)",
+        )?;
         let base = region.cu_deviceptr();
         // SAFETY: the ids span is n_used <= MAX_USED words at IDS_W, inside the
         // region's X_W + hidden words; `region` moves into the boundary beside
@@ -1034,9 +860,7 @@ impl Boundary {
     /// row's counter goes far past anything a step subtracts.
     fn release(&self) {
         for row in 0..self.pages.len() {
-            self.page
-                .word(Word::Cnt(row))
-                .store(RELEASE, Ordering::Release);
+            word(&self.page, Word::Cnt(row)).store(RELEASE, Ordering::Release);
         }
     }
 }
@@ -1472,10 +1296,10 @@ impl<H: HostExperts> Hybrid<H> {
         let rows = self.boundary.rows();
         let mut counters = [0u32; MAX_ROWS];
         for (row, c) in counters.iter_mut().enumerate().take(rows) {
-            *c = page.word(Word::Cnt(row)).load(Ordering::Acquire);
+            *c = word(page, Word::Cnt(row)).load(Ordering::Acquire);
         }
         HybridWords {
-            generation: page.word(Word::Gen).load(Ordering::Acquire),
+            generation: word(page, Word::Gen).load(Ordering::Acquire),
             served: self.served,
             counters,
             rows,
@@ -1544,7 +1368,7 @@ impl<H: HostExperts> Hybrid<H> {
             ));
         }
         stream.synchronize()?;
-        let generation = self.boundary.page.word(Word::Gen).load(Ordering::Acquire);
+        let generation = word(&self.boundary.page, Word::Gen).load(Ordering::Acquire);
         let mut seq = [0u32; 1];
         self.boundary.seq.copy_to_host(stream, &mut seq)?;
         if seq[0] != generation {
@@ -1558,10 +1382,7 @@ impl<H: HostExperts> Hybrid<H> {
             ));
         }
         for row in 0..self.boundary.rows() {
-            self.boundary
-                .page
-                .word(Word::Cnt(row))
-                .store(0, Ordering::Release);
+            word(&self.boundary.page, Word::Cnt(row)).store(0, Ordering::Release);
         }
         self.served = generation;
         self.poisoned = false;
@@ -1835,7 +1656,7 @@ impl<H: HostExperts> Hybrid<H> {
             return Ok(());
         };
         self.record_refusal(r.clone(), true);
-        Err(name_refusal(&r, read_fault(&word)?))
+        Err(name_refusal(&r, crate::fault::read(&word)?))
     }
 
     /// A batch service's counters: `cols` columns, `host_slots` host slots
@@ -1903,7 +1724,7 @@ impl<H: HostExperts> Hybrid<H> {
             (p.image_off, p.hsum_off)
         };
         let want = self.served.wrapping_add(1);
-        let generation = self.boundary.page.word(Word::Gen);
+        let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
@@ -1934,7 +1755,7 @@ impl<H: HostExperts> Hybrid<H> {
         let t0 = Instant::now();
         let page = &self.boundary.page;
         let words = self.boundary.words();
-        let seq = page.payload_word(image_off, SEQ_W, words);
+        let seq = payload_word(page, image_off, SEQ_W, words);
         if seq != Some(self.served) {
             return Err(GpuError::protocol(
                 what,
@@ -1944,7 +1765,7 @@ impl<H: HostExperts> Hybrid<H> {
                 ),
             ));
         }
-        let lyr = page.word(Word::Lyr(row)).load(Ordering::Acquire);
+        let lyr = word(page, Word::Lyr(row)).load(Ordering::Acquire);
         if usize::try_from(lyr).ok() != Some(layer) {
             return Err(GpuError::protocol(
                 what,
@@ -1962,8 +1783,8 @@ impl<H: HostExperts> Hybrid<H> {
         let mut unknown = None;
         for s in 0..self.boundary.shape.n_used {
             let (Some(id), Some(wb)) = (
-                page.payload_word(image_off, IDS_W + s, words),
-                page.payload_word(image_off, WTS_W + s, words),
+                payload_word(page, image_off, IDS_W + s, words),
+                payload_word(page, image_off, WTS_W + s, words),
             ) else {
                 return Err(GpuError::shape(what, "the routing is outside the handoff"));
             };
@@ -1979,7 +1800,7 @@ impl<H: HostExperts> Hybrid<H> {
                 None => unknown = unknown.or(Some((s, id))),
             }
         }
-        if !page.payload_f32_into(image_off, X_W, words, &mut self.x.data) {
+        if !payload_f32_into(page, image_off, X_W, words, &mut self.x.data) {
             return Err(GpuError::shape(
                 what,
                 "the activation is outside the handoff",
@@ -2019,10 +1840,7 @@ impl<H: HostExperts> Hybrid<H> {
             return Err(e);
         }
         self.host.experts_into(layer, &self.x, &list[..n], out)?;
-        self.boundary
-            .page
-            .word(Word::Cnt(row))
-            .fetch_add(1, Ordering::Release);
+        word(&self.boundary.page, Word::Cnt(row)).fetch_add(1, Ordering::Release);
         self.served = want;
         let s = &mut self.stats;
         s.served += 1;
@@ -2189,44 +2007,6 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
             r.layer, r.detail
         ),
     )
-}
-
-/// What the fault `word` (a `Gpu`'s fault allocation, [`FAULT_WORDS`] u32s
-/// or more) holds now: the first-layer word and that layer's site mask, each
-/// read by a synchronous copy that waits on no stream. The caller orders it —
-/// a batch service runs after the event its handoffs came down at, so every
-/// kernel that wrote them has finished.
-///
-/// [`FAULT_WORDS`]: crate::fault::FAULT_WORDS
-fn read_fault(word: &DeviceBuffer<u32>) -> Result<Option<Fault>, GpuError> {
-    word.context().bind_to_thread()?;
-    let at = |i: usize| -> Result<u32, GpuError> {
-        let mut v = FAULT_NONE;
-        // SAFETY: word `i` lies inside the allocation (`i` is 0 or a mask
-        // index of a layer at most LAYER_NONE, below FAULT_WORDS, which
-        // `module_fault_word` checked the length against); the destination
-        // is `v`, four bytes that outlive the synchronous copy; the context
-        // is current on this thread (bound above).
-        let rc = unsafe {
-            sys::cuMemcpyDtoH_v2(
-                (&raw mut v).cast(),
-                word.cu_deviceptr() + 4 * i as u64,
-                std::mem::size_of::<u32>(),
-            )
-        };
-        cu(rc, "cuMemcpyDtoH_v2 (hybrid fault word)")?;
-        Ok(v)
-    };
-    let first = at(0)?;
-    if first == FAULT_NONE {
-        return Ok(None);
-    }
-    let sites = if first >> 8 <= LAYER_NONE {
-        at(mask_index(first >> 8))?
-    } else {
-        0
-    };
-    Ok(Fault::from_words(first, sites))
 }
 
 #[cfg(test)]

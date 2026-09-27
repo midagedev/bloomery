@@ -1823,46 +1823,11 @@ impl Gpu {
     }
 
     /// The fault the allocation holds, if any — the first-layer word and
-    /// that layer's site mask: blocking reads on the engine stream, so they
-    /// see every launch enqueued before them.
+    /// that layer's site mask: the engine stream waited for, so they see
+    /// every launch enqueued before them, then read ([`fault::read`]).
     pub fn fault(&self) -> Result<Option<Fault>, GpuError> {
-        let word = self.fault_u32(0)?;
-        if word == FAULT_NONE {
-            return Ok(None);
-        }
-        let sites = match usize::try_from(word >> 8) {
-            Ok(l) if l <= LAYER_NONE as usize => self.fault_u32(fault::mask_index(word >> 8))?,
-            _ => 0,
-        };
-        Ok(Fault::from_words(word, sites))
-    }
-
-    /// Word `at` of the fault allocation, read on the engine stream.
-    fn fault_u32(&self, at: usize) -> Result<u32, GpuError> {
-        if at >= FAULT_WORDS {
-            return Err(GpuError::shape(
-                "Gpu::fault_u32",
-                format!("word {at} of a fault allocation of {FAULT_WORDS}"),
-            ));
-        }
-        self.ctx.bind_to_thread()?;
-        let mut word = FAULT_NONE;
-        // SAFETY: the source is word `at < FAULT_WORDS` of this Gpu's own
-        // live allocation of FAULT_ALLOC_WORDS; the destination is `word`,
-        // four bytes that outlive the copy because the stream is synchronized
-        // before it goes out of scope; this context is current on the
-        // calling thread (bound above).
-        let rc = unsafe {
-            cuda_core::sys::cuMemcpyDtoHAsync_v2(
-                (&raw mut word).cast(),
-                self.fault.cu_deviceptr() + 4 * at as u64,
-                std::mem::size_of::<u32>(),
-                self.stream.cu_stream(),
-            )
-        };
-        graph::cu(rc, "cuMemcpyDtoHAsync_v2 (fault word)")?;
         self.stream.synchronize()?;
-        Ok(word)
+        fault::read(&self.fault)
     }
 
     /// Put the first-layer word back to [`FAULT_NONE`] and every site mask
