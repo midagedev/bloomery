@@ -32,6 +32,7 @@ use bloomery_gpu::model::{ChainBody, Rollback, Rows, StepMode};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
+use runtime::seqstate::Kept;
 use runtime::{Draft, Out, Speculative, Target, Verify, Want};
 
 /// What a session call failed with. Its text is the failure's own: a card
@@ -186,6 +187,12 @@ pub trait Prompt: ChainBody {
 pub trait Keep: ChainBody {
     /// The longest prefix of at most `n` positions a cut keeps.
     fn keepable(m: &GpuModel<Self>, n: u32) -> u32;
+
+    /// [`Keep::keepable`] with its reason; a body whose rule states none
+    /// says `Why::Rule`.
+    fn kept(m: &GpuModel<Self>, n: u32) -> Kept {
+        Kept::rule(n, m.pos(), Self::keepable(m, n))
+    }
 
     /// Take back the positions from `n` on; the session asks only for a cut
     /// [`Keep::keepable`] grants.
@@ -429,13 +436,18 @@ impl<B: Prompt + Keep> Target for Session<B> {
         B::keepable(&self.model, n)
     }
 
+    fn kept(&self, n: u32) -> Kept {
+        B::kept(&self.model, n)
+    }
+
     fn cut(&mut self, n: u32) -> Result<(), SessionError> {
         self.idle("cut")?;
-        let kept = B::keepable(&self.model, n);
-        if kept != n {
+        let kept = B::kept(&self.model, n);
+        if kept.at != n {
             return Err(SessionError::Refused(format!(
-                "a cut to position {n} from {}: the caches keep {kept}",
-                self.model.pos()
+                "a cut to position {n} from {}: the caches keep {} ({kept})",
+                self.model.pos(),
+                kept.at
             )));
         }
         Ok(B::cut(&mut self.model, n)?)

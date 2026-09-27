@@ -3,8 +3,10 @@
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
 //! A prompt is fed one step a position: the step walk is the only walk the
-//! body has. A cut keeps the whole history or none of it: each KDA layer
-//! holds one recurrent state and no history of it.
+//! body has. Each prompt call takes the KDA layers' checkpoints its marks
+//! name ([`bloomery_gpu_glm5next::prompt`]), and a cut keeps every fed
+//! position, the empty model, or a checkpoint: each KDA layer holds one
+//! recurrent state, and its history only in those copies.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -13,6 +15,7 @@ use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::glm5next::place::PlanInputs;
 use model::placement::{Machine, Plan, PlanLevers};
+use runtime::seqstate::Kept;
 
 use crate::{Keep, Open, Prompt};
 
@@ -82,32 +85,34 @@ impl Open for Body {
 }
 
 impl Prompt for Body {
-    /// One step per id with one readback after the last.
+    /// One step per id, a readback at each checkpoint mark and after the
+    /// last ([`bloomery_gpu_glm5next::prompt`]).
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        bloomery_gpu_glm5next::prompt(m, ids)
     }
 }
 
 impl Keep for Body {
-    /// [`Body::keep_point`]: every fed position, or none.
+    /// [`Body::keep_point`]: every fed position, the empty model, or the
+    /// nearest checkpoint at or below `n`.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        m.body(WHAT).map_or(0, |b| b.keep_point(n))
+        <Body as Keep>::kept(m, n).at
+    }
+
+    /// [`Body::kept`].
+    fn kept(m: &GpuModel<Body>, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n))
     }
 
     /// Nothing to take back at the model's position; back to empty at 0;
-    /// any other cut refused by name.
+    /// else the checkpoint at `n` ([`Body`]'s rollback), any other position
+    /// refused by name.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
         match n {
             n if n == m.pos() => Ok(()),
             0 => m.reset(),
-            n => Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "a cut to position {n} from {}: the KDA layers keep one state and no \
-                     history of it",
-                    m.pos()
-                ),
-            }),
+            n => m.rollback(n),
         }
     }
 }

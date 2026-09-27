@@ -24,6 +24,6 @@ mod kda;
 mod mla;
 mod program;
 
-pub use body::{Body, Glm5nextModel};
+pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, prompt};
 pub use host::GlmHost;
 pub use program::{layer_launches, step_launches};

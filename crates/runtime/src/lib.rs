@@ -13,8 +13,9 @@
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
 //! layer program's parts over its units ([`sched::walk`]), [`state`], the
-//! stores a layer keeps and how later positions read them, and [`layer`], the
-//! sub-layer programs a layer's description names.
+//! stores a layer keeps and how later positions read them, [`seqstate`], the
+//! checkpoints of the recurrent ones and which cuts they serve, and
+//! [`layer`], the sub-layer programs a layer's description names.
 
 pub mod combine;
 pub mod hc_gated;
@@ -22,6 +23,7 @@ pub mod layer;
 mod lookup;
 pub mod qsa;
 pub mod sched;
+pub mod seqstate;
 mod speculative;
 pub mod state;
 mod stop;
@@ -89,6 +91,12 @@ pub trait Target {
 
     /// The longest prefix of at most `n` positions [`Target::cut`] keeps.
     fn keepable(&self, n: u32) -> u32;
+
+    /// [`Target::keepable`] with its reason. A target whose rule states none
+    /// says [`seqstate::Why::Rule`].
+    fn kept(&self, n: u32) -> seqstate::Kept {
+        seqstate::Kept::rule(n, self.pos(), self.keepable(n))
+    }
 
     /// Take back the positions from `n` on; refused by name unless
     /// [`Target::keepable`] grants `n` whole.

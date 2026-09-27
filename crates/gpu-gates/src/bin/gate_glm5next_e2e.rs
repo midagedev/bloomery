@@ -58,6 +58,17 @@
 //!   after 1,024 positions the two states have drifted by an amount no band
 //!   here derives.
 //!
+//! - (k) checkpoints, on the prose set's ids through the session: a prompt
+//!   of [`A`] ids takes its checkpoints at 512 and [`A`]; a cut keeps 512 for
+//!   600 and nothing for 500, each with its reason's code, and a cut to 600
+//!   is refused by name; a cut to 512 and a branch of 200 ids leave the
+//!   points at 512 and 712 (the abandoned 640 dropped); a cut to 712 (a
+//!   point the restored branch took, then a step: the copy back runs in the
+//!   step) and a cut to 512 (below the abandoned point, then a prompt call:
+//!   the copy back runs in its first take) then a tail of 64 ids each give
+//!   the logits plain steps of the same ids from a reset give, bit for bit;
+//!   and a prompt call's takes leave those logits as they are.
+//!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
 //! finite and clamps nothing; ik renormalizes the router's eight weights by
@@ -100,6 +111,7 @@ mod gate {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use runtime::layer::{FfnKind, MixerKind};
+    use runtime::{Out, Target, Want};
 
     /// The router's experts and picks a token.
     const N_EXPERT: usize = 288;
@@ -1161,6 +1173,135 @@ mod gate {
         Ok((taps, logits))
     }
 
+    // ------------------------------------------------ (k) checkpoints
+
+    /// The first prompt's ids: past one inner mark (512) and short of the
+    /// next.
+    const A: usize = 640;
+
+    /// The logits row a session call read back.
+    fn row(out: Out<'_>) -> Result<Vec<f32>, GateError> {
+        match out {
+            Out::Logits { row, .. } => Ok(row.to_vec()),
+            Out::Argmax(_) => Err("a call asked for logits read back none".into()),
+        }
+    }
+
+    fn keep(s: &mut Session<Body>) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        let ids = prefill.to_vec();
+        if ids.len() < 964 {
+            return Err(format!("{D1K}: {} prefill ids, the clause reads 964", ids.len()).into());
+        }
+        let (a, d, e) = (&ids[..A], &ids[700..900], &ids[900..964]);
+        let points = |s: &Session<Body>| -> Result<Vec<u32>, GateError> {
+            Ok(s.model().body("keep")?.checkpoints().positions())
+        };
+        let mut ok = true;
+        // One take into a slot made for it, then one into a reused slot:
+        // the copy alone, and the copy with the slot's pinned allocation.
+        let mut take_ms = [0.0f64; 2];
+        for ms in &mut take_ms {
+            s.reset()?;
+            s.step(ids[0], Want::Argmax)?;
+            let (gpu, _, b) = s.model_mut().body_parts("keep")?;
+            let t = Instant::now();
+            b.checkpoint(gpu)?;
+            *ms = t.elapsed().as_secs_f64() * 1e3;
+        }
+        println!(
+            "keep: a checkpoint's take {:.2} ms with its slot made, {:.2} ms into a reused slot \
+             (runtime values)",
+            take_ms[0], take_ms[1]
+        );
+        let t = Instant::now();
+        s.reset()?;
+        s.prompt(a, Want::Argmax)?;
+        let first = t.elapsed().as_secs_f64();
+        s.step(ids[A], Want::Argmax)?;
+        s.step(ids[A + 1], Want::Argmax)?;
+        let p1 = points(s)?;
+        let (k600, k500) = (s.kept(600), s.kept(500));
+        let refused = match s.cut(600) {
+            Err(SessionError::Refused(t)) => t,
+            other => format!("not refused: {other:?}"),
+        };
+        let first_ok = p1 == [512, A as u32]
+            && (k600.at, k600.why.code()) == (512, "checkpoint")
+            && (k500.at, k500.why.code()) == (0, "no-checkpoint")
+            && refused.contains("checkpoint: the recurrent state copied back at 512");
+        println!(
+            "keep: prompt of {A} ({first:.1} s, runtime value) and 2 steps; points {p1:?} (want \
+             [512, {A}]); kept(600) = {k600}; kept(500) = {k500}; cut(600): {refused} {}",
+            verdict(first_ok)
+        );
+        ok &= first_ok;
+        s.cut(512)?;
+        s.prompt(d, Want::Argmax)?;
+        let p2 = points(s)?;
+        s.step(ids[A], Want::Argmax)?;
+        s.step(ids[A + 1], Want::Argmax)?;
+        s.cut(712)?;
+        // A step first: the restore runs in the step's refresh, not in a
+        // prompt call's first take.
+        s.step(e[0], Want::Argmax)?;
+        let l712 = row(s.prompt(&e[1..], Want::Logits)?)?;
+        let k700 = s.kept(700);
+        s.cut(k700.at)?;
+        let l512 = row(s.prompt(e, Want::Logits)?)?;
+        let branch_ok = p2 == [512, 712] && k700.at == 512;
+        println!(
+            "keep: cut to 512, branch of {}: points {p2:?} (want [512, 712]); kept(700) = {k700} \
+             {}",
+            d.len(),
+            verdict(branch_ok)
+        );
+        ok &= branch_ok;
+        let stats = s.model().body("keep")?.checkpoints().stats();
+        // The references are plain steps from a reset: no mark, no take.
+        let plain = |s: &mut Session<Body>, ids: &[u32]| -> Result<Vec<f32>, GateError> {
+            s.reset()?;
+            let m = s.model_mut();
+            m.step(ids)?;
+            Ok(m.logits()?)
+        };
+        let f512 = plain(s, &[&a[..512], e].concat())?;
+        let f712 = plain(s, &[&a[..512], d, e].concat())?;
+        s.reset()?;
+        let t512 = row(s.prompt(&[&a[..512], e].concat(), Want::Logits)?)?;
+        let read_only = same_bits(&t512, &f512);
+        println!(
+            "keep: a prompt call's takes leave the logits of plain steps, bit for bit: \
+             {read_only} {}",
+            verdict(read_only)
+        );
+        ok &= read_only;
+        let bits = same_bits(&l712, &f712) && same_bits(&l512, &f512);
+        let c = s.model().body("keep")?.checkpoints();
+        println!(
+            "keep: restored at 712 and at 512, a tail of {} each, against plain steps of the \
+             same ids from a reset: logits bit for bit {bits} (argmax {} / {} and {} / {}); {} \
+             taken, {} restored, {} dropped, {} evicted before the references; {} slots made of \
+             {}, {} bytes a checkpoint {}",
+            e.len(),
+            argmax(&l712),
+            argmax(&f712),
+            argmax(&l512),
+            argmax(&f512),
+            stats.taken,
+            stats.restored,
+            stats.dropped,
+            stats.evicted,
+            c.slots(),
+            c.capacity(),
+            c.bytes(),
+            verdict(bits)
+        );
+        ok &= bits;
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let (mut s, nodes) = open()?;
         let m = s.model_mut();
@@ -1186,6 +1327,7 @@ mod gate {
             ok &= step_set(m, name, band, &mut ties)?;
         }
         println!("step sets: {ties} named tie(s)");
+        ok &= keep(&mut s)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

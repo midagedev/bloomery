@@ -121,12 +121,30 @@ pub fn every_position(layer: &LayerSpec) -> bool {
     stores(layer).iter().any(|&(_, r)| r.reads_past_window())
 }
 
+/// Whether a checkpoint copies layer `layer`'s stores: a layer with a
+/// recurrent store keeps its history nowhere else, so every store of it (the
+/// state and the conv inputs it reads) is copied whole. Every other layer's
+/// stores are cut by position, under the body's own window and ratio rules.
+#[must_use]
+pub fn copied(layer: &LayerSpec) -> bool {
+    stores(layer)
+        .iter()
+        .any(|&(_, r)| r == StoreRule::Recurrent)
+}
+
+/// The layers a checkpoint copies ([`copied`]), ascending: none for a model
+/// every store of which is cut by position.
+#[must_use]
+pub fn copied_layers(layers: &[LayerSpec]) -> Vec<usize> {
+    (0..layers.len()).filter(|&l| copied(&layers[l])).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use models::{
         Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
-        Latent, LatentOut, LatentUp, Moe, Residual, Rope, RopeMode, Router, Score,
+        Latent, LatentOut, LatentUp, Moe, PoolRule, Residual, Rope, RopeMode, Router, Score,
     };
 
     fn moe() -> Ffn {
@@ -359,5 +377,74 @@ mod tests {
             ]
         );
         assert_eq!(stores(&q[3]), [(Store::Kv, StoreRule::Positional)]);
+    }
+
+    /// A GLM-5.3-Flash-like trunk: KDA layers, every fourth a latent layer
+    /// with its own index keys.
+    fn glm() -> Vec<LayerSpec> {
+        (0..45)
+            .map(|l| {
+                if l % 4 == 3 {
+                    let mut s = v41_layer(l, None, Some((l, l)), false);
+                    if let Mixer::Latent(a) = &mut s.mixer {
+                        a.window = None;
+                    }
+                    s
+                } else {
+                    layer(
+                        Mixer::DeltaRule(DeltaRule {
+                            kind: DeltaKind::Kda {
+                                gate_lower_bound: -5.0,
+                            },
+                            k_heads: 64,
+                            v_heads: 64,
+                            d: 128,
+                            conv: 4,
+                        }),
+                        Residual::Hc,
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// A Qwen3.8-like trunk: Qwen3.6's, its GQA layers selecting by token
+    /// pools.
+    fn qwen38() -> Vec<LayerSpec> {
+        let mut q = qwen36();
+        for s in &mut q {
+            if let Mixer::Gqa(g) = &mut s.mixer {
+                g.select = Some(Selector::TokenPool {
+                    heads: 4,
+                    d: 128,
+                    top_k: 2048,
+                    pool: 64,
+                    rule: PoolRule::Learned { key_eps: 1e-6 },
+                });
+            }
+        }
+        q
+    }
+
+    /// The checkpoint copies exactly the delta-rule layers, whatever the
+    /// model: none of V4.1's (its rings are cut by position), Qwen3.6's and
+    /// Qwen3.8's thirty GDN layers, GLM's thirty-four KDA layers.
+    #[test]
+    fn copied_layers_are_the_recurrent_ones() {
+        assert!(copied_layers(&v41()).is_empty());
+        let delta: Vec<usize> = (0..40).filter(|l| l % 4 != 3).collect();
+        assert_eq!(copied_layers(&qwen36()), delta);
+        assert_eq!(copied_layers(&qwen38()), delta);
+        let kda: Vec<usize> = (0..45).filter(|l| l % 4 != 3).collect();
+        assert_eq!(kda.len(), 34);
+        assert_eq!(copied_layers(&glm()), kda);
+        let g = glm();
+        assert_eq!(
+            stores(&g[3]),
+            [
+                (Store::Latent, StoreRule::Positional),
+                (Store::IndexKeys, StoreRule::Positional),
+            ]
+        );
     }
 }

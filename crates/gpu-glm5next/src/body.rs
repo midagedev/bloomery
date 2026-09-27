@@ -25,17 +25,24 @@
 //! selector never has to run. The next-token (MTP) layer is carried by the
 //! file and not loaded: its tensors are `Role::Unused`, as ik loads and does
 //! not run it.
+//!
+//! A cut behind the fed positions finds a KDA layer's state only in a
+//! checkpoint ([`bloomery_gpu::checkpoint`]): each prompt call ([`prompt`])
+//! copies every KDA layer's state and conv ring to the host at the marks of
+//! `runtime::seqstate`, and a cut to one of them copies it back at the next
+//! step; the latent rows are cut by position.
 
 use std::ops::Range;
 use std::sync::Arc;
 
+use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
 use bloomery_gpu::latent::{INDEX_ROW, LATENT, LatentKernels};
 use bloomery_gpu::linear::{HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
-use bloomery_gpu::model::{ChainBody, HostServed, StepKernels};
+use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
@@ -53,6 +60,7 @@ use model::arch::glm5next::place::{self, PlanInputs};
 use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
+use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 
 use crate::host::GlmHost;
 use crate::program;
@@ -65,6 +73,10 @@ const _: () = assert!(place::PASS_ROWS == PASS_ROWS);
 
 /// The GLM model: one card, the skeleton over this body.
 pub type Glm5nextModel = GpuModel<Body>;
+
+/// The spacing of a prompt call's inner checkpoints: a context the plan
+/// caps near two thousand positions takes at most three inside a call.
+pub const CHECKPOINT_EVERY: u32 = 512;
 
 /// The kernels the step launches, loaded once.
 pub(crate) struct Kernels {
@@ -160,6 +172,14 @@ impl Store {
         match self {
             Store::Kda { state, ring } => state.num_bytes() + ring.num_bytes(),
             Store::Latent { latent, index } => latent.buf().num_bytes() + index.buf().num_bytes(),
+        }
+    }
+
+    /// A KDA layer's state and conv ring, the stores a checkpoint copies.
+    fn copied(&mut self) -> Option<[&mut DeviceBuffer<f32>; 2]> {
+        match self {
+            Store::Kda { state, ring } => Some([state, ring]),
+            Store::Latent { .. } => None,
         }
     }
 
@@ -421,6 +441,18 @@ pub struct Body {
     fed: u32,
     /// Positions every store holds.
     ctx: usize,
+    /// The KDA layers' stores on the host at chosen positions.
+    ckpt: Checkpoints,
+}
+
+/// Every KDA layer's state and conv ring, in layer order: the list the
+/// checkpoints copy.
+fn copied(stores: &mut [Store]) -> Vec<&mut DeviceBuffer<f32>> {
+    stores
+        .iter_mut()
+        .filter_map(Store::copied)
+        .flatten()
+        .collect()
 }
 
 /// The parts of the body a walk writes, lent apart from its host tier.
@@ -668,6 +700,12 @@ impl Body {
                 embd.n_vocab, hp.n_vocab
             )));
         }
+        let lens: Vec<usize> = cfg
+            .iter()
+            .filter(|c| c.kind.mixer == MixerKind::DeltaRule)
+            .flat_map(|_| [dims.kda.state_len(), dims.kda.ring_len()])
+            .collect();
+        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
         let lane = [0u32];
         let mut body = Body {
             hybrid,
@@ -682,6 +720,7 @@ impl Body {
             taps: None,
             fed: 0,
             ctx,
+            ckpt,
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
@@ -768,13 +807,68 @@ impl Body {
         )
     }
 
-    /// Whether the positions from `n` on can be taken back: only the next
-    /// one, since a KDA layer keeps one state and no history of it — or all
-    /// of them, back to an empty model.
+    /// The longest prefix of at most `n` positions a cut keeps: every fed
+    /// position, the empty model, or the nearest checkpoint at or below `n`
+    /// ([`Body::kept`] says which).
     #[must_use]
     pub fn keep_point(&self, n: u32) -> u32 {
-        if n >= self.fed { self.fed } else { 0 }
+        self.kept(n).at
     }
+
+    /// What a cut to at most `n` positions keeps, and why.
+    #[must_use]
+    pub fn kept(&self, n: u32) -> Kept {
+        self.ckpt.kept(n, self.fed)
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// A checkpoint at the fed position, after any waiting cut: the KDA
+    /// layers' stores copied to a host slot, or nothing where one stands.
+    /// Waits for the copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu) -> Result<Take, GpuError> {
+        let fed = self.fed;
+        self.ckpt
+            .take(gpu.stream(), fed, &mut copied(&mut self.stores))
+    }
+}
+
+/// Feed `ids` from where `m` stands, one step a position, and take the
+/// checkpoints the call's marks name ([`Checkpoints::marks`]): its start, the
+/// multiples of [`CHECKPOINT_EVERY`] inside it, its end. The argmax after
+/// the last id. Refused on a model a fault poisoned: no checkpoint copies
+/// what a fault condemned.
+pub fn prompt(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
+    const WHAT: &str = "glm5next prompt";
+    if let Some(fault) = m.poisoned() {
+        return Err(GpuError::Poisoned { what: WHAT, fault });
+    }
+    let from = m.pos();
+    let to = u32::try_from(ids.len())
+        .ok()
+        .and_then(|n| from.checked_add(n))
+        .filter(|&to| to > from)
+        .ok_or_else(|| shape(format!("a prompt of {} ids from {from}", ids.len())))?;
+    let marks = m.body(WHAT)?.ckpt.marks(from, to);
+    let mut argmax = None;
+    let mut at = from;
+    for mark in marks {
+        if mark > at {
+            let seg = &ids[(at - from) as usize..(mark - from) as usize];
+            argmax = Some(m.step(seg)?);
+            at = mark;
+        }
+        let (gpu, _, body) = m.body_parts(WHAT)?;
+        body.checkpoint(gpu)?;
+    }
+    argmax.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "a mark at the call's end",
+    })
 }
 
 /// The file's widths and constants, each checked against the kernel that
@@ -933,6 +1027,9 @@ impl ChainBody for Body {
     /// The four stream copies of the row into the first stream buffer, the
     /// position and the visible counts: three host-to-device copies.
     fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
+        if self.ckpt.pending() {
+            self.ckpt.apply(stream, &mut copied(&mut self.stores))?;
+        }
         let p = input.pos;
         self.s.streams[0].copy_from_host(stream, &self.embd.streams)?;
         self.s.pos.copy_from_host(stream, &[p])?;
@@ -946,7 +1043,8 @@ impl ChainBody for Body {
     }
 
     /// Every store and both stream buffers zeroed in place — a captured chain
-    /// keeps their addresses — after the host tier's reset.
+    /// keeps their addresses — after the host tier's reset; every checkpoint
+    /// dropped.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         self.hybrid.reset(stream)?;
@@ -957,6 +1055,7 @@ impl ChainBody for Body {
             s.zero_async(stream)?;
         }
         self.fed = 0;
+        self.ckpt.clear();
         Ok(())
     }
 
@@ -982,6 +1081,17 @@ impl ChainBody for Body {
 
     fn host(&mut self) -> Option<&mut Body> {
         Some(self)
+    }
+}
+
+impl Rollback for Body {
+    /// A cut to `pos`: nothing at the fed position; the empty model at 0;
+    /// else the checkpoint at `pos`, copied back at the next step. Any other
+    /// position is refused by name ([`Body::kept`] says what a cut keeps).
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.ckpt.cut(pos, self.fed)?;
+        self.fed = pos;
+        Ok(())
     }
 }
 
