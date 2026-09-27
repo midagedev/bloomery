@@ -37,6 +37,20 @@ impl Layer {
     /// `embd` and `ff` are multiples of 256 — the grids the tile and the
     /// down's blocks take.
     pub fn write(tag: &str, embd: usize, ff: usize, n_expert: usize, down: GgmlType) -> Layer {
+        Layer::write_salted(tag, embd, ff, n_expert, down, 0)
+    }
+
+    /// [`Layer::write`] with every stack's codes drawn from its seed xor
+    /// `salt`: another salt is another model of the same names, shapes and
+    /// header, different bytes.
+    pub fn write_salted(
+        tag: &str,
+        embd: usize,
+        ff: usize,
+        n_expert: usize,
+        down: GgmlType,
+        salt: u64,
+    ) -> Layer {
         let dir = std::env::temp_dir().join(format!("r8layer-{}-{tag}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
@@ -52,7 +66,7 @@ impl Layer {
         let tensors: Vec<(TensorDecl, Vec<u8>)> = stacks
             .iter()
             .map(|&(name, ty, dims, seed)| {
-                let b = stack_bytes(ty, dims, seed);
+                let b = stack_bytes(ty, dims, seed ^ salt);
                 let decl = TensorDecl {
                     name: name.to_string(),
                     dims: dims.map(|d| d as u64).to_vec(),
@@ -68,7 +82,7 @@ impl Layer {
             w.tensor(&t.name, b).unwrap();
         }
         w.finish().unwrap();
-        let sidecar = r8file::sidecar_path(&source);
+        let sidecar = r8file::sidecar_path(&source).unwrap();
         let split = Split::open(&source).unwrap();
         r8file::convert(&split, &[GATE.into(), UP.into()], &sidecar, &mut |_| {})
             .unwrap_or_else(|e| panic!("convert {}: {e}", source.display()));

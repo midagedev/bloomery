@@ -34,13 +34,15 @@
 //!
 //! 4. Resident host set: the gate derives the plan's host set as the engine
 //!    does — the r8 reading under the engine's `BLOOMERY_R8`
-//!    (`HostR8::at_load`) and `HostSet::of_r8` over the sidecar it reads,
-//!    `HostSet::of` without one — and before anything is loaded drops the
+//!    (`HostR8::at_gate`: with the lever on, no sidecar at its path refuses
+//!    the run by name) and `HostSet::of_r8` over the sidecar it reads,
+//!    `HostSet::of` with the lever off — and before anything is loaded drops the
 //!    shard files and that sidecar from the page cache
 //!    (`posix_fadvise(DONTNEED)`, the pages another process maps excepted —
 //!    the count still resident is printed), so a lazy mapping cannot pass by
 //!    luck. After the host step the engine's set must be this one, file for
-//!    file, and `mincore` must find every page of it resident — the
+//!    file and page range for page range, and `mincore` must find every page
+//!    of it resident — the
 //!    sidecar's among them, since only the load read them back. Red with
 //!    `BLOOMERY_HOST_POPULATE=0`, and red when the engine walks another set
 //!    than the one its host tier reads. `Cached` of `/proc/meminfo` before
@@ -234,7 +236,7 @@ mod gate {
 
         let cards = open_cards(&plan)?;
         let lock = args.lock.as_ref();
-        let r8 = HostR8::at_load(&split, levers.r8)?;
+        let r8 = HostR8::at_gate(&split, levers.r8)?;
         let set = match r8.sidecar() {
             Some(side) => HostSet::of_r8(&split, side, &plan, |t| keeps(lock, t))?,
             None => HostSet::of(&split, &plan, |t| keeps(lock, t))?,
@@ -806,7 +808,7 @@ mod gate {
         h: &Host<'_>,
         cached: [u64; 2],
     ) -> Result<bool, GateError> {
-        let page = page_bytes();
+        let page = page_bytes()?;
         let before = vm_lck()?;
         let host = HostResidency::at_load(split, plan, |t| keeps(h.lock, t), h.levers)?;
         let after = vm_lck()?;
@@ -814,7 +816,7 @@ mod gate {
         match host.populated() {
             Some(w) => {
                 println!(
-                    "host_populate={} in {:.1} s over {} chunks (runtime value), the sidecar's {} B",
+                    "populate: {} B in {:.1} s over {} chunks (runtime value), the sidecar's {} B",
                     w.bytes(),
                     w.wall().as_secs_f64(),
                     w.chunks().len(),
@@ -839,7 +841,7 @@ mod gate {
                     );
                 }
             }
-            None => println!("host_populate=off"),
+            None => println!("populate: off"),
         }
         let delta = |a: u64, b: u64| i128::from(b) - i128::from(a);
         println!(
@@ -853,13 +855,13 @@ mod gate {
             delta(cached[1], cached_host),
             h.set.bytes()
         );
-        let theirs = host.set().files();
-        let ours = h.set.files();
-        let same_set = theirs == ours;
+        let same_set = host.set().runs() == h.set.runs();
         if !same_set {
             eprintln!(
-                "FAIL: check 4 host: the engine walked {theirs:?} pages per file, the host tier's \
-                 set is {ours:?}"
+                "FAIL: check 4 host: the engine walked other page ranges than the host tier's set: \
+                 {:?} pages per file against {:?}",
+                host.set().files(),
+                h.set.files()
             );
         }
         let files = h.set.resident(split)?;
@@ -911,7 +913,7 @@ mod gate {
             );
         }
         println!(
-            "host_lock={} vm_lck={after} over {} chunks in {:.1} s (runtime value), the sidecar's {} B",
+            "lock: {} B vm_lck={after} over {} chunks in {:.1} s (runtime value), the sidecar's {} B",
             held.bytes(),
             held.chunks().len(),
             held.wall().as_secs_f64(),

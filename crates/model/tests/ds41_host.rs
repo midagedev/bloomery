@@ -16,6 +16,13 @@
 //! `u < −L` all occur; every slot's combine must be `qdot::swiglu_clamp`'s bits
 //! on the same dots and the clamp's f64 statement within [`COMBINE_EVAL`].
 //!
+//! The r8 arm: with `BLOOMERY_R8` on (unset), every layer is built a second
+//! time with its routed gate and up read from the file's r8 sidecar
+//! (`host::layer_r8`) and must give every token's partial sum bit for bit as
+//! the file's layer does, so the band above holds it too; no sidecar at its
+//! path refuses the run by name (`HostR8::at_gate`). `BLOOMERY_R8=off` runs
+//! the file's layer alone.
+//!
 //! `hw_`: needs the V4.1 shards and the oracle set on the box
 //! (`just gate-ds41-host`); `BLOOMERY_V41_MODEL` names another first shard.
 //!
@@ -63,6 +70,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{HostLayer, HostScratch};
 use model::ops::{Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
+use model::r8file::HostR8;
 
 /// The oracle set: the V4.1 node dumps' 5-token batch set.
 const SET: &str = refset::arch::deepseek41::BATCH;
@@ -205,11 +213,27 @@ struct Layer {
     up_hi: usize,
     up_lo: usize,
     visible: usize,
+    /// Cells of the r8 arm's partial sums that are not the file layer's bits.
+    r8_cells: usize,
 }
 
 impl Layer {
     fn pass(&self) -> bool {
-        self.h <= 1.0 && self.down <= 1.0 && self.out <= 1.0 && self.step <= 1
+        self.h <= 1.0 && self.down <= 1.0 && self.out <= 1.0 && self.step <= 1 && self.r8_cells == 0
+    }
+}
+
+/// `BLOOMERY_R8` as the engine takes it, by the lever registry's kind: unset
+/// is on.
+fn r8_lever() -> bool {
+    const R8: &str = "BLOOMERY_R8";
+    match std::env::var(R8) {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(v) => match bloomery_levers::spec(R8).and_then(|s| s.kind.parse(&v)) {
+            Some(bloomery_levers::Value::Flag(on)) => on,
+            _ => panic!("{R8}={v:?}: want on or off"),
+        },
+        Err(e) => panic!("{R8}: {e}"),
     }
 }
 
@@ -345,6 +369,9 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         .get("ffn_norm-0")
         .expect("the set has ffn_norm-0")[1];
     let mut scratch = HostScratch::new(embd, ff);
+    let r8 = HostR8::at_gate(&split, r8_lever())
+        .unwrap_or_else(|e| panic!("the r8 reading of {path}: {e}"));
+    let mut scratch_r8 = HostScratch::new(embd, ff);
     let (e_gu, e_down) = (gamma(n_dot(embd)), gamma(n_dot(ff)));
     let g3 = gamma(3.0);
     let mut failed: Vec<usize> = Vec::new();
@@ -359,6 +386,11 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             continue;
         };
         routed += 1;
+        let r8_layer = r8.sidecar().map(|side| {
+            host::layer_r8(&split, Some(side), &hp, l)
+                .unwrap_or_else(|e| panic!("layer {l} from the r8 sidecar: {e}"))
+                .unwrap_or_else(|| panic!("layer {l} routes in the file and not from the sidecar"))
+        });
         let limit = layer.swiglu_limit();
         let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
         let ids = set.i32s_logical(&format!("ffn_moe_topk-{l}"), n_used * n_tokens);
@@ -387,6 +419,17 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             layer
                 .experts_into(&split, &x, &list, &mut out, &mut scratch)
                 .unwrap_or_else(|e| panic!("layer {l} token {t}: {e}"));
+            if let Some(r8_layer) = &r8_layer {
+                let mut out_r8 = vec![0.0f32; embd];
+                r8_layer
+                    .experts_into(&split, &x, &list, &mut out_r8, &mut scratch_r8)
+                    .unwrap_or_else(|e| panic!("layer {l} token {t} r8: {e}"));
+                st.r8_cells += out_r8
+                    .iter()
+                    .zip(&out)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            }
             // x's magnitudes per block, ik's within γ_3 of ours.
             let ax: Vec<f64> = q8k_block_abs(&x.data);
             let (mut flip, mut band_r, mut terms) =
@@ -492,7 +535,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             "layer={l} down={down_ty} shards(gate,up,down)={shards:?} limit={limit} tokens={n_tokens} slots={} \
              h_ratio={:.3e} flips={} scale_moves={} max_code_step={} down_ratio={:.3e} down_bits_equal={}/{} \
              out_ratio={:.3e} max_abs_diff={:.3e} max_flip_term={:.3e} \
-             clamp_hits silu>L={} u>L={} u<-L={} visible={} {}",
+             clamp_hits silu>L={} u>L={} u<-L={} visible={} r8_cells_off={} {}",
             st.slots,
             st.h,
             st.flips,
@@ -508,6 +551,11 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             st.up_hi,
             st.up_lo,
             st.visible,
+            if r8_layer.is_some() {
+                st.r8_cells.to_string()
+            } else {
+                format!("- ({r8})")
+            },
             if st.pass() { "PASS" } else { "FAIL" }
         );
         if !st.pass() {
@@ -559,6 +607,12 @@ fn hw_ds41_host_matches_ik_routed_sum() {
     );
     println!(
         "PASSED: ds41_host — the host tier's routed partial sum equals ik's ffn_moe_out on every layer \
-         within the derived band, flips counted; the routed clamp crossed on all three sides on {clamped} layers"
+         within the derived band, flips counted; the routed clamp crossed on all three sides on {clamped} layers; \
+         {r8}{}",
+        if r8.sidecar().is_some() {
+            ", its partial sums the file's bit for bit on every layer"
+        } else {
+            ""
+        }
     );
 }

@@ -47,7 +47,7 @@ fn run(args: &[String]) -> Res<()> {
         ("path", [first]) => {
             println!(
                 "{}",
-                r8file::sidecar_path(&std::path::absolute(first)?).display()
+                r8file::sidecar_path(&std::path::absolute(first)?)?.display()
             );
             Ok(())
         }
@@ -115,7 +115,10 @@ fn convert(args: &[String]) -> Res<()> {
         Some(list) => list,
         None => routed_stacks(&split)?,
     };
-    let out = out.unwrap_or_else(|| r8file::sidecar_path(&first));
+    let out = match out {
+        Some(out) => out,
+        None => r8file::sidecar_path(&first)?,
+    };
     let bytes: u64 = names
         .iter()
         .filter_map(|n| split.find(n))
@@ -144,7 +147,10 @@ fn convert(args: &[String]) -> Res<()> {
 fn verify(first: &str, side: Option<&String>) -> Res<()> {
     let first = std::path::absolute(first)?;
     let split = Split::open(&first)?;
-    let side = side.map_or_else(|| r8file::sidecar_path(&first), PathBuf::from);
+    let side = match side {
+        Some(side) => PathBuf::from(side),
+        None => r8file::sidecar_path(&first)?,
+    };
     let sidecar = Sidecar::open(&side, &split, Weights::Mapped { populate: false })?;
     println!(
         "r8conv: verify {} against {} ({} shards): {} tensors",

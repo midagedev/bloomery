@@ -1136,7 +1136,7 @@ fn hw_union_r8_matches_file_rows() {
     let rows = HostLayer::build(&split, &spec).unwrap();
     let r8 = HostLayer::build_r8(&split, &spec, Some(&side)).unwrap();
     assert_eq!(
-        r8.layouts(0).unwrap(),
+        r8.layouts(),
         [RowLayout::R8, RowLayout::R8, RowLayout::Rows],
         "the gate and the up are the sidecar's"
     );

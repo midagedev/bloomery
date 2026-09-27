@@ -9,8 +9,11 @@
 //! builds the layer's gate and up from it, hands a held sidecar back to
 //! another open of the same bytes, and refuses by name a sidecar whose
 //! source's header or stack head differs, also while an earlier load holds
-//! it open. Releasing a resident sidecar's pages is refused by name and leaves
-//! its bytes as they were. No clause reads a model file.
+//! it open; a gate's reading (`HostR8::at_gate`) refuses no file by name. A
+//! sidecar replaced at its path is opened anew, and a sidecar opened for one
+//! source is refused by name beside another source's split of the same names
+//! and shapes. Releasing a resident sidecar's pages is refused by name and
+//! leaves its bytes as they were. No clause reads a model file.
 
 #[path = "common/r8layer.rs"]
 mod r8layer;
@@ -649,11 +652,32 @@ fn the_sidecar_lives_in_a_directory_of_its_own() {
     ];
     for (first, want) in cases {
         assert_eq!(
-            r8file::sidecar_path(Path::new(first)),
+            r8file::sidecar_path(Path::new(first)).unwrap(),
             PathBuf::from(want),
             "{first}"
         );
     }
+    let cwd = std::fs::canonicalize(".").unwrap();
+    let up = cwd.parent().unwrap();
+    let beside = |dir: &Path| {
+        let mut d = dir.as_os_str().to_owned();
+        d.push("-r8");
+        PathBuf::from(d).join("m-r8.gguf")
+    };
+    for (first, dir) in [
+        ("m.gguf", cwd.as_path()),
+        ("./m.gguf", cwd.as_path()),
+        ("../m.gguf", up),
+    ] {
+        assert_eq!(
+            r8file::sidecar_path(Path::new(first)).unwrap(),
+            beside(dir),
+            "{first}: a directory that ends in no name is the one it resolves to"
+        );
+    }
+    println!(
+        "sidecar path: lexical under a named directory; m.gguf, ./m.gguf and ../m.gguf resolved"
+    );
 }
 
 /// The `r8conv` binary on the synthetic source: `convert --tensors` and
@@ -697,7 +721,7 @@ fn the_r8conv_binary_converts_and_verifies() {
     assert_eq!(rc, Some(0));
     assert_eq!(
         stdout.trim_end(),
-        r8file::sidecar_path(&first).to_str().unwrap()
+        r8file::sidecar_path(&first).unwrap().to_str().unwrap()
     );
     flip(&out, sidecar_data_at(&out, G1) + 1, 0x01);
     let (rc, _, stderr) = run(&["verify", first_s, out_s]);
@@ -728,18 +752,21 @@ fn refused(split: &Split, what: &str, by: &str, want: impl Fn(&R8Error) -> bool)
 
 /// A host tier's load of a synthetic routed layer: with the sidecar at its
 /// path the reading is `r8=on` and the layer's gate and up are its row-lane
-/// copies (`HostLayer::layouts`, an expert past the layer refused); with the
-/// lever off the reading is the source's, named, and the layer reads its
-/// rows. While the earlier load's layer holds the sidecar open, a second
-/// reading of another open of the same bytes hands back the held sidecar;
-/// once the source's header differs in a byte the sidecar does not hold, or
-/// its gate's head does, the load is refused by `R8Error::HeaderDigest`
-/// naming the shard or by `R8Error::Head` naming the gate — the second
-/// reading compares its source with what the held sidecar's check read — and
-/// the head's difference on a fresh open too. With no file at the path the
-/// reading is the source's, named, and the layer reads its rows.
+/// copies (`HostLayer::layouts`); with the lever off the reading is the
+/// source's, named, and the layer reads its rows. While the earlier load's
+/// layer holds the sidecar open, a second reading of another open of the
+/// same bytes hands back the held sidecar; once the source's header differs
+/// in a byte the sidecar does not hold, or its gate's head does, the load is
+/// refused by `R8Error::HeaderDigest` naming the shard or by `R8Error::Head`
+/// naming the gate — the second reading compares its source with what the
+/// held sidecar's check read — and the head's difference on a fresh open
+/// too. With no file at the path the load's reading is the source's, named,
+/// and the layer reads its rows; a gate's reading is refused by
+/// `R8Error::NoSidecar` naming the path, and with the lever off is the
+/// source's.
 #[test]
-fn a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
+#[ignore = "hw: the box's CPU (a host layer's r8 stack needs qdot's fused Q3_K); reads no model file"]
+fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
     let layer = r8layer::Layer::write("host", 512, 256, 4, GgmlType::Q4_K);
     let spec = layer.spec();
     let split = Split::open(&layer.source).unwrap();
@@ -752,20 +779,14 @@ fn a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
     );
     let held = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
     assert_eq!(
-        held.layouts(0).unwrap(),
+        held.layouts(),
         [RowLayout::R8, RowLayout::R8, RowLayout::Rows]
-    );
-    let past = held.layouts(layer.n_expert).map(|_| ()).unwrap_err();
-    assert!(
-        past.to_string()
-            .contains(&format!("expert {}", layer.n_expert)),
-        "an expert past the layer is refused by name, got {past}"
     );
     let off = HostR8::at_load(&split, false).unwrap();
     assert!(off.sidecar().is_none(), "the lever off reads the source");
     assert_eq!(off.to_string(), "r8=off (BLOOMERY_R8=off)");
     let rows = HostLayer::build_r8(&split, &spec, off.sidecar()).unwrap();
-    assert_eq!(rows.layouts(0).unwrap(), [RowLayout::Rows; 3]);
+    assert_eq!(rows.layouts(), [RowLayout::Rows; 3]);
     let again = Split::open(&layer.source).unwrap();
     let reuse = HostR8::at_load(&again, true).unwrap();
     assert!(
@@ -818,11 +839,80 @@ fn a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
         )
     );
     let rows = HostLayer::build_r8(&split, &spec, r8.sidecar()).unwrap();
-    assert_eq!(rows.layouts(0).unwrap(), [RowLayout::Rows; 3]);
+    assert_eq!(rows.layouts(), [RowLayout::Rows; 3]);
+    match HostR8::at_gate(&split, true) {
+        Err(ModelError::R8(R8Error::NoSidecar { path })) => assert_eq!(path, layer.sidecar),
+        Err(other) => panic!("a gate's reading with no file: refused, but not by name: {other}"),
+        Ok(r8) => panic!("a gate's reading with no file must be refused, got {r8}"),
+    }
+    assert!(
+        matches!(HostR8::at_gate(&split, false), Ok(HostR8::Lever)),
+        "a gate's reading with the lever off is the source's"
+    );
     println!(
         "host tier load: r8=on reads the sidecar; a changed header or head is refused; no file \
-         reads rows"
+         reads rows, and refuses a gate's reading by name"
     );
+}
+
+/// A sidecar opened for one source, beside another source's split of the
+/// same tensor names, shapes and header — other stack bytes — is refused by
+/// name wherever a reader takes the two together: a host layer's build and a
+/// page release, each by `R8Error::Head` naming the gate (the first stack
+/// whose identity differs). Before the pairing, the build took the other
+/// source's gate and up bytes from the sidecar with its own down.
+#[test]
+#[ignore = "hw: the box's CPU (a host layer's r8 stack needs qdot's fused Q3_K); reads no model file"]
+fn hw_a_sidecar_of_another_source_is_refused_beside_its_split() {
+    let a = r8layer::Layer::write("pair-a", 512, 256, 4, GgmlType::Q4_K);
+    let b = r8layer::Layer::write_salted("pair-b", 512, 256, 4, GgmlType::Q4_K, 0x5a17);
+    let (split_a, split_b) = (
+        Split::open(&a.source).unwrap(),
+        Split::open(&b.source).unwrap(),
+    );
+    let side_a = std::sync::Arc::new(Sidecar::open(&a.sidecar, &split_a, LAZY).unwrap());
+    HostLayer::build_r8(&split_a, &a.spec(), Some(&side_a)).unwrap();
+    let head = |e: &R8Error| matches!(e, R8Error::Head { tensor, .. } if tensor == r8layer::GATE);
+    match HostLayer::build_r8(&split_b, &b.spec(), Some(&side_a)) {
+        Err(ModelError::R8(e)) if head(&e) => println!("build beside another source: {e}"),
+        Err(other) => panic!("build beside another source: refused, but not by its head: {other}"),
+        Ok(_) => panic!("a host layer built its gate and up from another source's sidecar"),
+    }
+    let mut drop = PageDrop::new(&split_b);
+    match drop.release_sidecar(&side_a) {
+        Err(PlacementError::Host(msg)) if msg.contains("is not this split's") => {
+            println!("release beside another source: {msg}");
+        }
+        other => panic!("release beside another source must be refused by name, got {other:?}"),
+    }
+    assert_eq!(drop.bytes(), 0, "nothing is released");
+}
+
+/// A long-lived process holds a sidecar open while the file at its path is
+/// replaced by the sidecar of a new source at the same path: the next load
+/// of the new source opens the new file — another device and inode — and
+/// passes, instead of checking the held one against the new source and
+/// refusing a good file.
+#[test]
+fn a_sidecar_replaced_at_its_path_is_opened_anew() {
+    let old = r8layer::Layer::write("replaced", 512, 256, 4, GgmlType::Q4_K);
+    let split = Split::open(&old.source).unwrap();
+    let held = HostR8::at_load(&split, true).unwrap();
+    assert!(held.sidecar().is_some(), "the first load reads the sidecar");
+    let new = r8layer::Layer::write_salted("replaced", 512, 256, 4, GgmlType::Q4_K, 0x5a17);
+    assert_eq!(
+        new.sidecar, old.sidecar,
+        "the new sidecar is at the same path"
+    );
+    let split = Split::open(&new.source).unwrap();
+    let again = HostR8::at_load(&split, true)
+        .unwrap_or_else(|e| panic!("the new source's own sidecar must be read: {e}"));
+    let (was, now) = (held.sidecar().unwrap(), again.sidecar().unwrap());
+    assert!(
+        !std::sync::Arc::ptr_eq(was, now),
+        "the replaced file is opened anew, not the held one handed back"
+    );
+    println!("replaced sidecar: the new file at the path is opened and passes");
 }
 
 /// A sidecar that holds a layer's down stack — a Q3_K down converted beside
@@ -830,7 +920,8 @@ fn a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
 /// from it is refused by name (`R8Error::HoldsDown`): a host tier reads only
 /// a gate and an up from a sidecar.
 #[test]
-fn a_host_layer_refuses_a_sidecar_that_holds_its_down() {
+#[ignore = "hw: the box's CPU (a host layer's r8 stack needs qdot's fused Q3_K); reads no model file"]
+fn hw_a_host_layer_refuses_a_sidecar_that_holds_its_down() {
     let layer = r8layer::Layer::write("holds-down", 512, 256, 4, GgmlType::Q3_K);
     std::fs::remove_file(&layer.sidecar).unwrap();
     let split = Split::open(&layer.source).unwrap();

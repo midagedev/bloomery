@@ -40,7 +40,7 @@ use qdot::{Q3K_R8_LAYOUT, Q3K_R8_ROWS};
 
 use crate::ModelError;
 use crate::fileio::{self, sha256_hex};
-use crate::placement::host_lock::page_bytes;
+use crate::placement::host_lock::{HostFile, drop_pages};
 
 /// The sidecar's architecture string: a file with any other is not a sidecar.
 pub const R8_ARCH: &str = "bloomery-r8";
@@ -198,6 +198,14 @@ pub enum R8Error {
         expert: u64,
         byte: u64,
     },
+    #[error("the source split has no first shard to name the sidecar after")]
+    NoFirstShard,
+    #[error(
+        "no r8 sidecar at {}: a gate that covers the r8 path reads one (just r8-sidecar); \
+         BLOOMERY_R8=off runs it on the source",
+        .path.display()
+    )]
+    NoSidecar { path: PathBuf },
 }
 
 fn io_err(path: &Path, op: &'static str, source: io::Error) -> ModelError {
@@ -213,20 +221,37 @@ fn io_err(path: &Path, op: &'static str, source: io::Error) -> ModelError {
 /// `<source dir>-r8/<stem>-r8.gguf`, the stem being the file name without
 /// `.gguf` and without a split's `-00001-of-000NN`. A directory of its own,
 /// so nothing that globs the source directory or finds shards by name ever
-/// meets it. The rule is lexical: a bare file name's directory is `.`.
-pub fn sidecar_path(first_shard: &Path) -> PathBuf {
+/// meets it. The rule is lexical while the source directory ends in a name;
+/// one that does not — a bare file name's, `.`, `..` — is resolved on the
+/// filesystem first (`canonicalize`), so every spelling of one directory
+/// gives one sidecar and none gives a hidden `.-r8`. A path with no file
+/// name is refused by name.
+pub fn sidecar_path(first_shard: &Path) -> Result<PathBuf, R8Error> {
+    let name = first_shard
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| R8Error::Io {
+            path: first_shard.to_path_buf(),
+            op: "name the sidecar",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "the path names no file"),
+        })?;
     let dir = match first_shard.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let name = first_shard
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let dir = if dir.file_name().is_some() {
+        dir.to_path_buf()
+    } else {
+        std::fs::canonicalize(dir).map_err(|source| R8Error::Io {
+            path: dir.to_path_buf(),
+            op: "resolve the source directory",
+            source,
+        })?
+    };
     let stem = name.strip_suffix(".gguf").unwrap_or(&name);
-    let mut side = dir.as_os_str().to_owned();
+    let mut side = dir.into_os_string();
     side.push("-r8");
-    PathBuf::from(side).join(format!("{}-r8.gguf", without_split(stem)))
+    Ok(PathBuf::from(side).join(format!("{}-r8.gguf", without_split(stem))))
 }
 
 /// `stem` without a trailing `-NNNNN-of-NNNNN`, llama.cpp's shard suffix.
@@ -263,10 +288,8 @@ impl<'s> Stack<'s> {
     }
 }
 
-/// Source tensor `name` as a sidecar stack: present, Q3_K and on the grids —
-/// `[k, rows, experts]` with `k` on the 256-value grid and `rows` on the
-/// 8-row one, so no group straddles two experts. `path` names the file the
-/// check is for in the refusal.
+/// Source tensor `name` as a sidecar stack: present, Q3_K and on the grids
+/// ([`grids`]). `path` names the file the check is for in the refusal.
 fn stack<'s>(source: &'s Split, name: &str, path: &Path) -> Result<Stack<'s>, R8Error> {
     let missing = || R8Error::SourceMissing {
         path: path.to_path_buf(),
@@ -274,76 +297,54 @@ fn stack<'s>(source: &'s Split, name: &str, path: &Path) -> Result<Stack<'s>, R8
     };
     let (i, info) = source.find(name).ok_or_else(missing)?;
     let shard = source.shard(i).ok_or_else(missing)?;
-    if info.ty != GgmlType::Q3_K {
+    let [k, rows, experts] = grids(path, name, info.ty, &info.dims)?;
+    Ok(Stack {
+        shard,
+        info,
+        k,
+        rows,
+        experts,
+    })
+}
+
+/// A source stack of type `ty` and dims `dims` as the sidecar takes it: Q3_K
+/// `[k, rows, experts]` with `k` on the 256-value grid and `rows` on the
+/// 8-row one, so no group straddles two experts; `name` and `path` name it
+/// in the refusal.
+fn grids(path: &Path, name: &str, ty: GgmlType, dims: &[u64]) -> Result<[usize; 3], R8Error> {
+    if ty != GgmlType::Q3_K {
         return Err(R8Error::SourceType {
             path: path.to_path_buf(),
             tensor: name.to_string(),
-            got: info.ty,
+            got: ty,
         });
     }
-    let dims: Option<Vec<usize>> = info.dims.iter().map(|&d| usize::try_from(d).ok()).collect();
-    match dims.as_deref() {
-        Some(&[k, rows, experts]) if k % 256 == 0 && rows % Q3K_R8_ROWS == 0 => Ok(Stack {
-            shard,
-            info,
-            k,
-            rows,
-            experts,
-        }),
+    let sizes: Option<Vec<usize>> = dims.iter().map(|&d| usize::try_from(d).ok()).collect();
+    match sizes.as_deref() {
+        Some(&[k, rows, experts]) if k % 256 == 0 && rows % Q3K_R8_ROWS == 0 => {
+            Ok([k, rows, experts])
+        }
         _ => Err(R8Error::Grid {
             path: path.to_path_buf(),
             tensor: name.to_string(),
-            dims: info.dims.clone(),
+            dims: dims.to_vec(),
         }),
     }
 }
 
-/// The source's shard identity, in split order: file names, lengths, and the
-/// sha256 of each shard's bytes before its data base.
-struct Shards {
-    names: Vec<String>,
-    bytes: Vec<u64>,
-    headers: Vec<String>,
-}
-
-fn shards_of(source: &Split) -> Shards {
-    let mut s = Shards {
-        names: Vec::new(),
-        bytes: Vec::new(),
-        headers: Vec::new(),
-    };
-    for i in 0..source.shard_count() {
-        let g = source
-            .shard(i)
-            .expect("a split has a reader for every shard index");
-        let path = source
-            .shard_path(i)
-            .expect("a split has a path for every shard index");
-        s.names.push(
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        s.bytes.push(g.mapping().len() as u64);
-        s.headers.push(sha256_hex(g.header_bytes()));
-    }
-    s
-}
-
-/// The source stack's head and tail digests: sha256 of its first and last
-/// [`SPAN`] bytes, the whole tensor when it is shorter.
-fn head_tail(s: &Stack<'_>) -> Result<(String, String), ModelError> {
-    let data = s.data()?;
+/// A stack's head and tail, the bytes its identity hashes: its first and
+/// last [`SPAN`] bytes, the whole tensor when it is shorter.
+fn ends(data: &[u8]) -> [&[u8]; 2] {
     let n = data.len().min(SPAN);
-    Ok((sha256_hex(&data[..n]), sha256_hex(&data[data.len() - n..])))
+    [&data[..n], &data[data.len() - n..]]
 }
 
 /// The path a split's refusals name: its first shard.
-fn first_shard(source: &Split) -> PathBuf {
+fn first_shard(source: &Split) -> Result<PathBuf, R8Error> {
     source
         .shard_path(0)
         .map(Path::to_path_buf)
-        .unwrap_or_default()
+        .ok_or(R8Error::NoFirstShard)
 }
 
 /// One tensor done: its name, its bytes and the seconds it took.
@@ -403,7 +404,7 @@ pub fn convert(
     if names.is_empty() {
         return Err(R8Error::NoTensors.into());
     }
-    let first = first_shard(source);
+    let first = first_shard(source)?;
     let stacks = names
         .iter()
         .map(|n| stack(source, n, &first))
@@ -453,26 +454,41 @@ pub fn convert(
     })
 }
 
-/// The sidecar's header: the identity pairs and one declaration per stack.
+/// The sidecar's header: the identity pairs — the digests of what
+/// [`Inputs::of`] collects of `source` for `stacks`, the collector [`check`]
+/// compares against — and one declaration per stack.
 fn sidecar_layout(source: &Split, stacks: &[Stack<'_>], out: &Path) -> Result<Layout, ModelError> {
-    let shards = shards_of(source);
+    let now = Inputs::of(source, stacks.iter().map(Stack::name))?;
     let mut heads = Vec::with_capacity(stacks.len());
     let mut tails = Vec::with_capacity(stacks.len());
-    for s in stacks {
-        let (h, t) = head_tail(s)?;
-        heads.push(Value::String(h));
-        tails.push(Value::String(t));
+    for s in &now.stacks {
+        let s = s
+            .as_ref()
+            .expect("every stack convert takes is the source's");
+        heads.push(Value::String(sha256_hex(s.head)));
+        tails.push(Value::String(sha256_hex(s.tail)));
     }
-    let strings = |v: Vec<String>| Value::Array(v.into_iter().map(Value::String).collect());
+    let hex = |b: &[u8]| Value::String(sha256_hex(b));
     let kvs = [
         (GENERAL_ARCHITECTURE, Value::String(R8_ARCH.to_string())),
         (KEY_LAYOUT, Value::U32(Q3K_R8_LAYOUT)),
-        (KEY_SHARDS, strings(shards.names)),
+        (
+            KEY_SHARDS,
+            Value::Array(
+                now.shards
+                    .iter()
+                    .map(|s| Value::String(s.name.clone()))
+                    .collect(),
+            ),
+        ),
         (
             KEY_SHARD_BYTES,
-            Value::Array(shards.bytes.into_iter().map(Value::U64).collect()),
+            Value::Array(now.shards.iter().map(|s| Value::U64(s.len)).collect()),
         ),
-        (KEY_HEADERS, strings(shards.headers)),
+        (
+            KEY_HEADERS,
+            Value::Array(now.shards.iter().map(|s| hex(s.header)).collect()),
+        ),
         (KEY_HEADS, Value::Array(heads)),
         (KEY_TAILS, Value::Array(tails)),
     ]
@@ -675,13 +691,17 @@ fn publish(file: File, part: &Path, out: &Path, dir: &Path) -> Result<(), ModelE
 }
 
 /// An open sidecar that matched its source at open: its tensors' names and
-/// bytes, nothing else.
+/// bytes, and what its check read of that source.
 pub struct Sidecar {
     path: PathBuf,
     gguf: Gguf,
     /// The bytes live in the file's own mapping, whose pages [`verify`] drops
     /// after it; a resident copy has no file pages mapped.
     mapped: bool,
+    /// What the check this sidecar passed read of its source ([`Inputs`]).
+    seen: Seen,
+    /// The file at `path` when it was opened: device and inode.
+    id: (u64, u64),
 }
 
 impl Sidecar {
@@ -693,30 +713,51 @@ impl Sidecar {
     /// the digests of that stack's head and tail. Each difference is its own
     /// [`R8Error`]. The check runs on a lazy mapping; when `weights` asks for
     /// another backing, the file is opened again that way and checked again,
-    /// so a refused file never costs its data's pages.
+    /// so a refused file never costs its data's pages. The sidecar keeps what
+    /// the last check read of `source`, which [`Sidecar::pairs`] compares a
+    /// split with.
     pub fn open(
         path: impl AsRef<Path>,
         source: &Split,
         weights: Weights,
     ) -> Result<Sidecar, ModelError> {
         let path = path.as_ref();
+        let id = file_id(path)?;
         let lazy = Weights::Mapped { populate: false };
         let mut gguf = open_sidecar(path, lazy)?;
-        check(path, &gguf, source)?;
+        let mut now = Inputs::of(source, tensor_names(&gguf))?;
+        check(path, &gguf, &now)?;
         if weights != lazy {
             gguf = open_sidecar(path, weights)?;
-            check(path, &gguf, source)?;
+            now = Inputs::of(source, tensor_names(&gguf))?;
+            check(path, &gguf, &now)?;
         }
         Ok(Sidecar {
             path: path.to_path_buf(),
+            seen: now.to_seen(),
             gguf,
             mapped: matches!(weights, Weights::Mapped { .. }),
+            id,
         })
+    }
+
+    /// Whether this is `source`'s sidecar, as its open found it: what
+    /// `source` gives the identity check ([`Inputs`]) is compared with what
+    /// the check this sidecar passed read; on any difference the check runs
+    /// again against `source`, and its refusal names the difference. Every
+    /// reader that takes a sidecar beside a split asks here first, so a
+    /// sidecar opened for one model never serves another's split.
+    pub(crate) fn pairs(&self, source: &Split) -> Result<(), ModelError> {
+        let now = Inputs::of(source, tensor_names(&self.gguf))?;
+        if !self.seen.gives(&now) {
+            check(&self.path, &self.gguf, &now)?;
+        }
+        Ok(())
     }
 
     /// The sidecar's tensor names, in file order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.gguf.iter_tensors().map(|t| t.name.as_str())
+        tensor_names(&self.gguf)
     }
 
     /// The file the sidecar was opened from.
@@ -724,10 +765,11 @@ impl Sidecar {
         &self.path
     }
 
-    /// Whether the sidecar's bytes are its file's own mapping: `false` for a
-    /// resident copy, whose pages are anonymous.
-    pub(crate) fn is_mapped(&self) -> bool {
-        self.mapped
+    /// The sidecar's bytes as its file's own read-only mapping, file offset
+    /// `o` at index `o`; `None` for a resident copy, whose pages are
+    /// anonymous — `MADV_DONTNEED` would zero them.
+    pub(crate) fn file_pages(&self) -> Option<&[u8]> {
+        self.mapped.then(|| self.gguf.mapping())
     }
 
     /// Tensor `name`'s header entry, `None` for a name the sidecar lacks.
@@ -773,44 +815,10 @@ impl Sidecar {
     /// Drop tensor `t`'s whole pages from this process's mapping (a file
     /// mapping only) and then from the page cache, which skips a mapped page.
     fn release(&self, file: &File, t: &TensorInfo) -> Result<(), ModelError> {
-        let page = page_bytes();
         let start = self.gguf.data_base() + t.offset;
-        let (first, end) = (
-            start.div_ceil(page) * page,
-            (start + t.nbytes) / page * page,
-        );
-        if end <= first {
-            return Ok(());
-        }
-        if self.mapped {
-            let span = usize::try_from(first)
-                .ok()
-                .zip(usize::try_from(end).ok())
-                .and_then(|(a, b)| self.gguf.mapping().get(a..b))
-                .ok_or_else(|| R8Error::NotInSidecar {
-                    path: self.path.clone(),
-                    tensor: t.name.clone(),
-                })?;
-            // SAFETY: `span` is a live, page-aligned sub-slice of a read-only
-            // MAP_SHARED file mapping. MADV_DONTNEED drops this process's
-            // page-table entries only; the next touch re-faults the same file
-            // bytes, so no borrow of the mapping ever sees other contents.
-            let rc = unsafe {
-                libc::madvise(
-                    span.as_ptr().cast_mut().cast(),
-                    span.len(),
-                    libc::MADV_DONTNEED,
-                )
-            };
-            if rc != 0 {
-                return Err(io_err(
-                    &self.path,
-                    "madvise(MADV_DONTNEED)",
-                    io::Error::last_os_error(),
-                ));
-            }
-        }
-        drop_cached(file, &self.path, first..end)
+        let name = HostFile::Sidecar(self.path.clone());
+        drop_pages(&name, file, self.file_pages(), start..start + t.nbytes)?;
+        Ok(())
     }
 }
 
@@ -842,14 +850,15 @@ impl HostR8 {
     /// an error: the tier reads the source. A file that does not match the
     /// source is its named [`R8Error`] ([`Sidecar::open`]), never a
     /// fall-back to the source. While any holder keeps a sidecar open, a
-    /// second reading of the same file hands back the same one, checked again
-    /// against this source — by comparison with what the held one's check
-    /// read of its source — so the pages a load populates and locks are the
-    /// pages its host tier reads. Each distinct reading prints one
-    /// `load host_tier r8=…` line per process.
+    /// second reading of the same file — the same device and inode at the
+    /// path — hands back the same one, paired with this source
+    /// ([`Sidecar::pairs`]), so the pages a load populates and locks are the
+    /// pages its host tier reads; a file replaced at the path is opened anew.
+    /// Each distinct reading prints one `load host_tier r8=…` line per
+    /// process.
     pub fn at_load(source: &Split, r8: bool) -> Result<HostR8, ModelError> {
         let r8 = if r8 {
-            let path = sidecar_path(&first_shard(source));
+            let path = sidecar_path(&first_shard(source)?)?;
             if path.try_exists().map_err(|e| io_err(&path, "stat", e))? {
                 HostR8::On(shared(&path, source)?)
             } else {
@@ -860,6 +869,18 @@ impl HostR8 {
         };
         announce(&r8);
         Ok(r8)
+    }
+
+    /// [`HostR8::at_load`] for a gate that covers the r8 path: no file at the
+    /// sidecar's path is refused by name ([`R8Error::NoSidecar`]) instead of
+    /// read as the source, so such a gate never passes source against
+    /// source unasked. `r8 = false` (`BLOOMERY_R8=off`) reads the source, as
+    /// the load does.
+    pub fn at_gate(source: &Split, r8: bool) -> Result<HostR8, ModelError> {
+        match HostR8::at_load(source, r8)? {
+            HostR8::Missing(path) => Err(R8Error::NoSidecar { path }.into()),
+            read => Ok(read),
+        }
     }
 
     /// The sidecar the tier reads, when it reads one.
@@ -885,27 +906,47 @@ impl fmt::Display for HostR8 {
     }
 }
 
-/// What [`check`] reads of a source for a sidecar: each shard's file name,
-/// length and header bytes (it hashes the headers), and each sidecar
-/// tensor's source stack's head and tail [`SPAN`] bytes, in the sidecar's
-/// order (it hashes those too). Borrowed from the source's mappings.
-struct Inputs<'s> {
-    names: Vec<String>,
-    lens: Vec<u64>,
-    headers: Vec<&'s [u8]>,
-    windows: Vec<[&'s [u8]; 2]>,
+/// What the identity reads of a source for a sidecar: each shard's file
+/// name, length and header bytes, and per sidecar tensor, in the sidecar's
+/// order, the source's stack of that name — its type, dims and byte count
+/// and its [`ends`] — or `None` where the source lacks it. [`convert`]
+/// records the digests of these and [`check`] compares with them, reading
+/// nothing of the source besides; so a source that gives the same inputs
+/// gets the same verdict, and [`Sidecar::pairs`] compares them instead of
+/// hashing again. `B` holds the bytes: borrowed from the source's mappings
+/// (`&[u8]`) or kept by a sidecar ([`Seen`]).
+struct Inputs<B> {
+    shards: Vec<ShardIn<B>>,
+    stacks: Vec<Option<StackIn<B>>>,
 }
 
-impl<'s> Inputs<'s> {
-    /// `source`'s inputs to a check of the sidecar `g`; a stack the source
-    /// does not hold as the sidecar needs it is the check's refusal.
-    fn of(g: &Gguf, source: &'s Split, path: &Path) -> Result<Inputs<'s>, ModelError> {
-        let mut i = Inputs {
-            names: Vec::with_capacity(source.shard_count()),
-            lens: Vec::with_capacity(source.shard_count()),
-            headers: Vec::with_capacity(source.shard_count()),
-            windows: Vec::with_capacity(g.tensor_count()),
-        };
+/// A shard as [`Inputs`] reads it.
+struct ShardIn<B> {
+    name: String,
+    len: u64,
+    header: B,
+}
+
+/// A source stack as [`Inputs`] reads it.
+struct StackIn<B> {
+    ty: GgmlType,
+    dims: Vec<u64>,
+    nbytes: u64,
+    head: B,
+    tail: B,
+}
+
+/// The inputs a sidecar's check read, kept by the sidecar.
+type Seen = Inputs<Box<[u8]>>;
+
+impl<'s> Inputs<&'s [u8]> {
+    /// `source`'s inputs to the identity of the stacks `names`, borrowed
+    /// from its mappings.
+    fn of<'n>(
+        source: &'s Split,
+        names: impl IntoIterator<Item = &'n str>,
+    ) -> Result<Self, ModelError> {
+        let mut shards = Vec::with_capacity(source.shard_count());
         for s in 0..source.shard_count() {
             let shard = source
                 .shard(s)
@@ -913,95 +954,136 @@ impl<'s> Inputs<'s> {
             let file = source
                 .shard_path(s)
                 .expect("a split has a path for every shard index");
-            i.names.push(
-                file.file_name()
+            shards.push(ShardIn {
+                name: file
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
-            );
-            i.lens.push(shard.mapping().len() as u64);
-            i.headers.push(shard.header_bytes());
+                len: shard.mapping().len() as u64,
+                header: shard.header_bytes(),
+            });
         }
-        for t in g.iter_tensors() {
-            let data = stack(source, &t.name, path)?.data()?;
-            let n = data.len().min(SPAN);
-            i.windows.push([&data[..n], &data[data.len() - n..]]);
+        let mut stacks = Vec::new();
+        for name in names {
+            let Some((s, info)) = source.find(name) else {
+                stacks.push(None);
+                continue;
+            };
+            let data = source
+                .shard(s)
+                .expect("a split has a reader for every shard index")
+                .data(info)?;
+            let [head, tail] = ends(data);
+            stacks.push(Some(StackIn {
+                ty: info.ty,
+                dims: info.dims.clone(),
+                nbytes: info.nbytes,
+                head,
+                tail,
+            }));
         }
-        Ok(i)
+        Ok(Inputs { shards, stacks })
     }
-}
 
-/// The inputs of the check a sidecar the registry holds passed, copied
-/// ([`Inputs`]). `check` is a function of these and of the sidecar's parsed
-/// header, which the entry holds and which cannot change; a reading whose
-/// source gives the same bytes back gets the same verdict, by comparison
-/// instead of by hashing them again.
-struct Seen {
-    names: Vec<String>,
-    lens: Vec<u64>,
-    headers: Vec<Vec<u8>>,
-    windows: Vec<[Vec<u8>; 2]>,
-}
-
-impl Seen {
-    fn of(i: &Inputs<'_>) -> Seen {
-        Seen {
-            names: i.names.clone(),
-            lens: i.lens.clone(),
-            headers: i.headers.iter().map(|h| h.to_vec()).collect(),
-            windows: i
-                .windows
+    /// A copy a sidecar keeps.
+    fn to_seen(&self) -> Seen {
+        let bytes = |b: &[u8]| -> Box<[u8]> { b.into() };
+        Inputs {
+            shards: self
+                .shards
                 .iter()
-                .map(|[h, t]| [h.to_vec(), t.to_vec()])
+                .map(|s| ShardIn {
+                    name: s.name.clone(),
+                    len: s.len,
+                    header: bytes(s.header),
+                })
+                .collect(),
+            stacks: self
+                .stacks
+                .iter()
+                .map(|s| {
+                    s.as_ref().map(|s| StackIn {
+                        ty: s.ty,
+                        dims: s.dims.clone(),
+                        nbytes: s.nbytes,
+                        head: bytes(s.head),
+                        tail: bytes(s.tail),
+                    })
+                })
                 .collect(),
         }
     }
+}
 
-    /// Whether `i` is, byte for byte, what this check read.
-    fn gives(&self, i: &Inputs<'_>) -> bool {
-        self.names == i.names
-            && self.lens == i.lens
-            && self.headers.len() == i.headers.len()
-            && self
-                .headers
-                .iter()
-                .zip(&i.headers)
-                .all(|(a, b)| a.as_slice() == *b)
-            && self.windows.len() == i.windows.len()
-            && self
-                .windows
-                .iter()
-                .zip(&i.windows)
-                .all(|([h, t], [ih, it])| h.as_slice() == *ih && t.as_slice() == *it)
+impl Seen {
+    /// Whether `now` is, field for field and byte for byte, what this check
+    /// read. Every field is named here, so a field added to the inputs is
+    /// compared or does not compile.
+    fn gives(&self, now: &Inputs<&[u8]>) -> bool {
+        let shard = |a: &ShardIn<Box<[u8]>>, b: &ShardIn<&[u8]>| {
+            let ShardIn { name, len, header } = a;
+            *name == b.name && *len == b.len && **header == *b.header
+        };
+        let stack = |a: &StackIn<Box<[u8]>>, b: &StackIn<&[u8]>| {
+            let StackIn {
+                ty,
+                dims,
+                nbytes,
+                head,
+                tail,
+            } = a;
+            *ty == b.ty
+                && *dims == b.dims
+                && *nbytes == b.nbytes
+                && **head == *b.head
+                && **tail == *b.tail
+        };
+        let Inputs { shards, stacks } = self;
+        shards.len() == now.shards.len()
+            && stacks.len() == now.stacks.len()
+            && shards.iter().zip(&now.shards).all(|(a, b)| shard(a, b))
+            && stacks.iter().zip(&now.stacks).all(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => stack(a, b),
+                (None, None) => true,
+                _ => false,
+            })
     }
 }
 
-/// A sidecar a holder keeps open: the path it was opened from, and what the
-/// check it passed read of its source.
+/// A sidecar's tensor names, in file order.
+fn tensor_names(g: &Gguf) -> impl Iterator<Item = &str> {
+    g.iter_tensors().map(|t| t.name.as_str())
+}
+
+/// The file at `path`: its device and inode.
+fn file_id(path: &Path) -> Result<(u64, u64), ModelError> {
+    let m = std::fs::metadata(path).map_err(|e| io_err(path, "stat", e))?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// A sidecar a holder keeps open, and the path it was opened from.
 struct Held {
     path: PathBuf,
     side: Weak<Sidecar>,
-    seen: Seen,
 }
 
 /// Every sidecar a holder keeps open.
 static OPEN: Mutex<Vec<Held>> = Mutex::new(Vec::new());
 
-/// The sidecar at `path`, checked against `source`: the one a holder keeps
-/// open, or a fresh lazy mapping — the source's own backing. A held one is
-/// handed back when `source` gives the inputs its check read ([`Seen`]);
-/// on any difference it is checked again in full, which names the refusal.
+/// The sidecar at `path`, paired with `source`: the one a holder keeps open
+/// of the file now at `path` (the same device and inode — it was stat'ed
+/// before its open, so a file replaced in between only costs a second open),
+/// or a fresh lazy mapping, the source's own backing.
 fn shared(path: &Path, source: &Split) -> Result<Arc<Sidecar>, ModelError> {
+    let id = file_id(path)?;
     let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
     open.retain(|h| h.side.strong_count() > 0);
     let live = open
         .iter()
         .filter(|h| h.path == path)
-        .find_map(|h| h.side.upgrade().map(|s| (s, &h.seen)));
-    if let Some((s, seen)) = live {
-        let same = Inputs::of(&s.gguf, source, &s.path).is_ok_and(|i| seen.gives(&i));
-        if !same {
-            check(&s.path, &s.gguf, source)?;
-        }
+        .find_map(|h| h.side.upgrade().filter(|s| s.id == id));
+    if let Some(s) = live {
+        s.pairs(source)?;
         return Ok(s);
     }
     let s = Arc::new(Sidecar::open(
@@ -1009,11 +1091,9 @@ fn shared(path: &Path, source: &Split) -> Result<Arc<Sidecar>, ModelError> {
         source,
         Weights::Mapped { populate: false },
     )?);
-    let seen = Seen::of(&Inputs::of(&s.gguf, source, path)?);
     open.push(Held {
         path: path.to_path_buf(),
         side: Arc::downgrade(&s),
-        seen,
     });
     Ok(s)
 }
@@ -1077,30 +1157,36 @@ fn entries<'g, T>(
         .collect()
 }
 
-/// [`Sidecar::open`]'s check of `g`, the sidecar at `path`, against `source`.
-fn check(path: &Path, g: &Gguf, source: &Split) -> Result<(), ModelError> {
+/// The identity check of `g`, the sidecar at `path`, against `now`, what a
+/// source gives it ([`Inputs::of`] over `g`'s tensors). It reads nothing of
+/// the source but `now`.
+fn check(path: &Path, g: &Gguf, now: &Inputs<&[u8]>) -> Result<(), R8Error> {
     let arch = g.architecture();
     if arch != Some(R8_ARCH) {
         return Err(R8Error::Architecture {
             path: path.to_path_buf(),
             got: arch.unwrap_or("<missing>").to_string(),
-        }
-        .into());
+        });
     }
     let layout = match value(path, g, KEY_LAYOUT)? {
         Value::U32(v) => *v,
-        other => return Err(key_err(path, KEY_LAYOUT, format!("is {other:?}, not a u32")).into()),
+        other => {
+            return Err(key_err(
+                path,
+                KEY_LAYOUT,
+                format!("is {other:?}, not a u32"),
+            ));
+        }
     };
     if layout != Q3K_R8_LAYOUT {
         return Err(R8Error::Layout {
             path: path.to_path_buf(),
             got: layout,
-        }
-        .into());
+        });
     }
     let recorded = match value(path, g, KEY_SHARDS)? {
         Value::Array(items) => items.len(),
-        _ => return Err(key_err(path, KEY_SHARDS, "is not an array".to_string()).into()),
+        _ => return Err(key_err(path, KEY_SHARDS, "is not an array".to_string())),
     };
     let names = entries(path, g, KEY_SHARDS, recorded, Value::as_str)?;
     let bytes = entries(path, g, KEY_SHARD_BYTES, recorded, |v| match v {
@@ -1108,76 +1194,78 @@ fn check(path: &Path, g: &Gguf, source: &Split) -> Result<(), ModelError> {
         _ => None,
     })?;
     let headers = entries(path, g, KEY_HEADERS, recorded, Value::as_str)?;
-    if recorded != source.shard_count() {
+    if recorded != now.shards.len() {
         return Err(R8Error::ShardCount {
             path: path.to_path_buf(),
             recorded,
-            found: source.shard_count(),
-        }
-        .into());
+            found: now.shards.len(),
+        });
     }
-    let now = shards_of(source);
-    for (i, name) in names.iter().enumerate() {
-        if *name != now.names[i] {
+    for (i, s) in now.shards.iter().enumerate() {
+        if names[i] != s.name {
             return Err(R8Error::ShardName {
                 path: path.to_path_buf(),
                 shard: i,
-                recorded: (*name).to_string(),
-                found: now.names[i].clone(),
-            }
-            .into());
+                recorded: names[i].to_string(),
+                found: s.name.clone(),
+            });
         }
-        if bytes[i] != now.bytes[i] {
+        if bytes[i] != s.len {
             return Err(R8Error::ShardBytes {
                 path: path.to_path_buf(),
-                shard: now.names[i].clone(),
+                shard: s.name.clone(),
                 recorded: bytes[i],
-                found: now.bytes[i],
-            }
-            .into());
+                found: s.len,
+            });
         }
-        if headers[i] != now.headers[i] {
+        let digest = sha256_hex(s.header);
+        if headers[i] != digest {
             return Err(R8Error::HeaderDigest {
                 path: path.to_path_buf(),
-                shard: now.names[i].clone(),
+                shard: s.name.clone(),
                 recorded: headers[i].to_string(),
-                found: now.headers[i].clone(),
-            }
-            .into());
+                found: digest,
+            });
         }
     }
     let n = g.tensor_count();
+    assert_eq!(
+        now.stacks.len(),
+        n,
+        "the inputs of a check are collected over its sidecar's tensors"
+    );
     let heads = entries(path, g, KEY_HEADS, n, Value::as_str)?;
     let tails = entries(path, g, KEY_TAILS, n, Value::as_str)?;
     let mut seen = HashSet::with_capacity(n);
-    for (i, t) in g.iter_tensors().enumerate() {
+    for ((i, t), s) in g.iter_tensors().enumerate().zip(&now.stacks) {
         let tensor = || t.name.clone();
         if !seen.insert(t.name.as_str()) {
             return Err(R8Error::DuplicateTensor {
                 path: path.to_path_buf(),
                 tensor: tensor(),
-            }
-            .into());
+            });
         }
         if t.ty != GgmlType::Unknown(Q3K_R8_TYPE) {
             return Err(R8Error::TensorType {
                 path: path.to_path_buf(),
                 tensor: tensor(),
                 got: t.ty.as_u32(),
-            }
-            .into());
+            });
         }
-        let s = stack(source, &t.name, path)?;
-        same_shape(path, t, &s)?;
-        let (head, tail) = head_tail(&s)?;
+        let s = s.as_ref().ok_or_else(|| R8Error::SourceMissing {
+            path: path.to_path_buf(),
+            tensor: tensor(),
+        })?;
+        grids(path, &t.name, s.ty, &s.dims)?;
+        same_shape(path, t, &s.dims, s.nbytes)?;
+        let (head, tail) = (sha256_hex(s.head), sha256_hex(s.tail));
         if head != heads[i] {
             return Err(R8Error::Head {
                 path: path.to_path_buf(),
                 tensor: tensor(),
                 recorded: heads[i].to_string(),
                 found: head,
-            }
-            .into());
+            });
         }
         if tail != tails[i] {
             return Err(R8Error::Tail {
@@ -1185,16 +1273,15 @@ fn check(path: &Path, g: &Gguf, source: &Split) -> Result<(), ModelError> {
                 tensor: tensor(),
                 recorded: tails[i].to_string(),
                 found: tail,
-            }
-            .into());
+            });
         }
     }
     Ok(())
 }
 
 /// Sidecar tensor `t` has its source stack's dims and bytes.
-fn same_shape(path: &Path, t: &TensorInfo, s: &Stack<'_>) -> Result<(), R8Error> {
-    if t.dims == s.info.dims && t.nbytes == s.info.nbytes {
+fn same_shape(path: &Path, t: &TensorInfo, dims: &[u64], nbytes: u64) -> Result<(), R8Error> {
+    if t.dims == dims && t.nbytes == nbytes {
         return Ok(());
     }
     Err(R8Error::Shape {
@@ -1202,8 +1289,8 @@ fn same_shape(path: &Path, t: &TensorInfo, s: &Stack<'_>) -> Result<(), R8Error>
         tensor: t.name.clone(),
         recorded_dims: t.dims.clone(),
         recorded_bytes: t.nbytes,
-        found_dims: s.info.dims.clone(),
-        found_bytes: s.info.nbytes,
+        found_dims: dims.to_vec(),
+        found_bytes: nbytes,
     })
 }
 
@@ -1224,7 +1311,7 @@ pub fn verify(
     for t in sidecar.gguf.iter_tensors() {
         let t1 = Instant::now();
         let s = stack(source, &t.name, &sidecar.path)?;
-        same_shape(&sidecar.path, t, &s)?;
+        same_shape(&sidecar.path, t, &s.info.dims, s.info.nbytes)?;
         let src = s.data()?;
         let r8 = sidecar.gguf.data(t)?;
         if let Some(at) = first_mismatch(&s, r8, src, threads)? {

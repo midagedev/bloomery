@@ -5,7 +5,7 @@
 
 use crate::ffn::swiglu_timed;
 use crate::profile;
-use crate::r8file::{R8Error, Sidecar};
+use crate::r8file::Sidecar;
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
 use std::ops::Range;
@@ -1054,9 +1054,8 @@ impl RowLayout {
 /// A routed Q3_K stack of a split model read from its r8 sidecar
 /// ([`crate::r8file`]): the same experts in the same byte ranges, each 8-row
 /// group's super-blocks interleaved for [`qdot::dot_q3k_r8_cols`]. Made only
-/// by [`R8Stack::of`], once the sidecar's tensor has matched its source
-/// stack's name, dims and bytes; its matrices carry [`RowLayout::R8`], so no
-/// dispatch reads them as Q3_K rows.
+/// by [`R8Stack::of`], once the sidecar has paired with the split; its
+/// matrices carry [`RowLayout::R8`], so no dispatch reads them as Q3_K rows.
 #[derive(Clone)]
 pub(crate) struct R8Stack {
     /// The source's stack, the header the sidecar's tensor was checked
@@ -1068,59 +1067,26 @@ pub(crate) struct R8Stack {
 }
 
 impl R8Stack {
-    /// Stack `name` of `split` as `sidecar` holds it. Refused by name: a name
-    /// the split or the sidecar lacks, a sidecar tensor of another type id,
-    /// dims or byte count than its source's, a source stack that is not
-    /// Q3_K `{k, n, n_expert}` on the tile's grids (`k` whole super-blocks,
-    /// `n` whole groups — so every expert's range holds whole groups and is
-    /// the same range in both files), and a machine where qdot does not fuse
-    /// Q3_K at `k`, whose columns the tile reads.
+    /// Stack `name` of `split` as `sidecar` holds it. The sidecar must be
+    /// `split`'s ([`Sidecar::pairs`], refused by name otherwise); its check
+    /// is what makes the sidecar's tensor the private type with its source
+    /// stack's dims and bytes, and that stack Q3_K `{k, n, n_expert}` on the
+    /// tile's grids (`k` whole super-blocks, `n` whole groups — so every
+    /// expert's range holds whole groups and is the same range in both
+    /// files). Refused by name here besides: a name the split or the sidecar
+    /// lacks, a stack its experts do not cut evenly, and a machine where qdot
+    /// does not fuse Q3_K at `k`, whose columns the tile reads.
     pub(crate) fn of(
         split: &Split,
         sidecar: &Arc<Sidecar>,
         name: &str,
     ) -> Result<R8Stack, crate::ModelError> {
+        sidecar.pairs(split)?;
         let source = ShardTensor::find(split, name)?;
         let info = sidecar.tensor(name)?.clone();
-        let path = || sidecar.path().to_path_buf();
-        if info.ty != GgmlType::Unknown(crate::r8file::Q3K_R8_TYPE) {
-            return Err(R8Error::TensorType {
-                path: path(),
-                tensor: name.to_string(),
-                got: info.ty.as_u32(),
-            }
-            .into());
-        }
         let src = &source.info;
-        if (info.dims.as_slice(), info.nbytes) != (src.dims.as_slice(), src.nbytes) {
-            return Err(R8Error::Shape {
-                path: path(),
-                tensor: name.to_string(),
-                recorded_dims: info.dims.clone(),
-                recorded_bytes: info.nbytes,
-                found_dims: src.dims.clone(),
-                found_bytes: src.nbytes,
-            }
-            .into());
-        }
-        if src.ty != GgmlType::Q3_K {
-            return Err(R8Error::SourceType {
-                path: path(),
-                tensor: name.to_string(),
-                got: src.ty,
-            }
-            .into());
-        }
         stack_cut(src)?;
-        let (k, n) = (k_of(src), n_of(src));
-        if !n.is_multiple_of(qdot::Q3K_R8_ROWS) || !k.is_multiple_of(256) {
-            return Err(R8Error::Grid {
-                path: path(),
-                tensor: name.to_string(),
-                dims: src.dims.clone(),
-            }
-            .into());
-        }
+        let k = k_of(src);
         if !qdot::fuses(GgmlType::Q3_K, k) {
             return Err(crate::ModelError::HostStack {
                 what: "an r8 stack: the row-lane tile reads fused Q3_K columns",
@@ -1620,8 +1586,9 @@ fn group_core(
         let fused = qdot::fuses(ty, k);
         let layout = ws.layout(i);
         assert!(
-            layout == RowLayout::Rows || fused,
-            "a row-lane matrix is made only where qdot fuses Q3_K at its k (R8Stack::of)"
+            layout == RowLayout::Rows || (fused && n.is_multiple_of(layout.grain())),
+            "a row-lane matrix is made only where qdot fuses Q3_K at its k, of whole row-lane \
+             groups (R8Stack::of): n = {n}"
         );
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
@@ -2000,8 +1967,12 @@ impl<T> Default for Flex<T> {
     }
 }
 
-/// One (weight view, activation block) pair plus everything a row needs; the
-/// row loop exists once, here — a duplicate is how the shapes would drift bit for bit.
+/// One (weight view, activation block) pair plus everything a row needs. Its
+/// rows run in [`PairWork::compute_rows`]: file rows there, row-lane groups in
+/// [`PairWork::compute_groups`]. The two cut a row's columns into tile runs
+/// differently — greedy runs of [`qdot::TILE_COLS`] against even runs — and
+/// write the same values, because every qdot tile writes each (row, column)'s
+/// `dot_row` value bit for bit.
 /// A group is heterogeneous: `ty`/`k`/`n` are this pair's own, not the call's.
 struct PairWork<'a> {
     ty: GgmlType,
@@ -4929,7 +4900,8 @@ mod tests {
     /// group of the one and a row of the other), at column counts that cut
     /// the tile's runs evenly and unevenly (1, 2, 3, 8, 9, 17).
     #[test]
-    fn row_lane_pairs_write_their_source_rows_values() {
+    #[ignore = "hw: the box's CPU (the row-lane tile runs on AVX2 and F16C)"]
+    fn hw_row_lane_pairs_write_their_source_rows_values() {
         let (k, n) = (512, 48);
         let rows = q3k_rows(k, n, 0x8a11);
         let mut lanes = vec![0u8; rows.len()];
@@ -4978,6 +4950,33 @@ mod tests {
             }
         }
         println!("row-lane pairs: equal to their source rows at 1, 2, 3, 8, 9 and 17 columns");
+    }
+
+    /// A row-lane matrix whose rows are not whole groups is refused by name
+    /// before any row runs, not cut to its whole groups with the rest of its
+    /// output left unwritten: 12 rows are one group and half of another.
+    #[test]
+    #[ignore = "hw: the box's CPU (the row-lane tile runs on AVX2 and F16C)"]
+    #[should_panic(expected = "of whole row-lane groups")]
+    fn hw_a_row_lane_matrix_of_part_of_a_group_is_refused() {
+        let (k, n) = (512, 12);
+        let rows = q3k_rows(k, 16, 0x8a12);
+        let mut lanes = vec![0u8; rows.len()];
+        qdot::repack_q3k_r8(&rows, 16, k, &mut lanes).unwrap();
+        let r8 = Weight {
+            ty: GgmlType::Q3_K,
+            k,
+            n,
+            bytes: &lanes[..rows.len() / 16 * n],
+            layout: RowLayout::R8,
+        };
+        let x = Tensor2::from_vec(k, 1, (0..k).map(|i| i as f32 / k as f32 - 0.5).collect());
+        let mut out = [Tensor2::zeros(n, 1)];
+        let r = matmul_q_group_into("test", &[r8], &[&x], &mut out);
+        println!(
+            "12 rows of a row-lane matrix ran: {:?}",
+            r.map(|_| &out[0].data[8..])
+        );
     }
 
     /// The first column holding a value that is not finite is found wherever

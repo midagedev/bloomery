@@ -1531,10 +1531,12 @@ impl HostLayer {
     /// source's r8 sidecar, when given ([`crate::r8file::HostR8`]): each is
     /// the sidecar's copy of its source stack (`R8Stack::of` — the same
     /// name, dims and bytes, so every expert keeps its byte range), and the
-    /// down, which a sidecar never holds, is the source's; a sidecar that
-    /// lacks the gate or the up, or holds the down, is refused by name. The
-    /// sidecar is a second byte source the load resolves, not a property of
-    /// the layer's tensors, so it rides beside the spec.
+    /// down, which a sidecar never holds, is the source's. Refused by name: a
+    /// sidecar that lacks the gate or the up, one that holds the down, and
+    /// one that is not `split`'s — opened for another source, however alike
+    /// its names and shapes (`Sidecar::pairs`). The sidecar is a second byte
+    /// source the load resolves, not a property of the layer's tensors, so it
+    /// rides beside the spec.
     pub fn build_r8(
         split: &Split,
         spec: &HostLayerSpec<'_>,
@@ -1594,19 +1596,13 @@ impl HostLayer {
         [self.gate.source(), self.up.source(), &self.down]
     }
 
-    /// Where each stack's rows lie, `[gate, up, down]`, for expert `e` of
-    /// the layer — every expert of a stack shares its layout. A reader of an
-    /// expert's bytes other than this layer's calls (the host stream's fill)
-    /// asks here: a [`RowLayout::R8`] matrix is the sidecar's bytes, which no
-    /// path reads as Q3_K rows. An expert past the layer is refused by name.
-    pub fn layouts(&self, e: usize) -> Result<[RowLayout; 3], ModelError> {
-        if e >= self.n_expert {
-            return Err(ModelError::MissingTensor(format!(
-                "expert {e} of {}",
-                self.down.info().name
-            )));
-        }
-        Ok([self.gate.layout(), self.up.layout(), RowLayout::Rows])
+    /// Where each stack's rows lie, `[gate, up, down]` — every expert of a
+    /// stack has its stack's layout: [`RowLayout::R8`] for a stack the layer
+    /// reads from the r8 sidecar, which no path reads as Q3_K rows. What the
+    /// load's reading made of the layer, for a caller that holds it to that
+    /// reading.
+    pub fn layouts(&self) -> [RowLayout; 3] {
+        [self.gate.layout(), self.up.layout(), RowLayout::Rows]
     }
 
     /// The three stacks as a union call reads them, resolved once.

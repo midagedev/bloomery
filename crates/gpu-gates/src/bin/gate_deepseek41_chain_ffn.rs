@@ -1601,6 +1601,10 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path)?;
+        // Check 1 is the one real-model clause that holds the r8 path to the
+        // source bit for bit: with BLOOMERY_R8 on, no sidecar refuses the run
+        // by name. Held here, so the tiers below read this open of it.
+        let _r8 = model::r8file::HostR8::at_gate(&split, bloomery_gpu::hybrid::host_levers()?.r8)?;
         let hp = Hparams::read(&split)?;
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
