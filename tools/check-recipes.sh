@@ -137,14 +137,14 @@ if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${bt##*$'\n'}"
-# host2.sh runs a recipe's box command on a second host: its allowlist, its refused tokens, the track
-# rule and the exit-code wrapper are tested here, no ssh.
-if ! h2=$(bash "$(dirname "$0")/host2.sh" --self-test 2>&1); then
-  echo "$h2" >&2
-  echo "check-recipes: the host2 self-test failed" >&2
+# mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
+# recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
+if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
+  echo "$mc" >&2
+  echo "check-recipes: the mac-check self-test failed" >&2
   exit 1
 fi
-echo "${h2##*$'\n'}"
+echo "${mc##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(

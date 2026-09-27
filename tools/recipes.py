@@ -11,7 +11,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
-    python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/host2.sh runs it)
+    python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -33,7 +33,8 @@ A recipe's inputs are:
   - on the box's last build, the bin's top-level dep-info (`target/release/<bin>.d`, which lists every
     local source file of the binary) — a cross-check of the walk, and a union with it;
   - the scripts the recipe text names (`tools/**`, `crates/*/tools/**`) and, transitively, the repository
-    files those scripts name;
+    files those scripts name, and every file under a tree directory a shell script walks with `find`
+    from its root variable (`find "$ROOT/docs" -name '*.md'`: the whole directory, whatever the filter);
   - for a box recipe, tools/box.sh and what it sources on every command: tools/ref/ref-paths.sh,
     tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
     deepseek2);
@@ -44,7 +45,8 @@ A recipe's inputs are:
 
 Honest expectation: a change in crates/gpu or crates/model selects every GPU gate — that is the
 crate graph's true answer (a one-line enum change in the fault word selects them all, and it should).
-The saving is on leaf changes (serve, tokenizer, sampler, one gate binary, a runner, docs); the larger
+The saving is on leaf changes (serve, tokenizer, sampler, one gate binary, a runner, docs — which only
+gate-tokenizer reads, through its oracle's `find`); the larger
 value is the list itself: no forgotten gate, and a gate left out is a printed record, not a judgment.
 What this layer cannot see: data under $BLOOMERY_DATA and the ik trees (not in git), and a card
 dependence (BLOOMERY_GATE_CARD). The box's dep-info can be stale or missing; the walk does not depend
@@ -331,6 +333,10 @@ _PATHLIKE = re.compile(r"(?:^|(?<=[\s\"'=:(]))(?:\./)?((?:tools|crates)/[A-Za-z0
 # every hit is kept only when it names a file of the tree.
 _SCRIPT_PATH = re.compile(r"(?:^|(?<=[\s\"'=:(/]))(?:\./)?((?:tools|crates)/[A-Za-z0-9_./-]*[A-Za-z0-9_-])")
 _SCRIPT_EXT = (".sh", ".py")
+# A shell script's `find` rooted at a directory of the tree under its root variable (`find "$ROOT/docs"
+# -name '*.md'`) reads files no path in the script names: the directory is an input, a prefix. A bare
+# `find crates … -newer` (timing-card.sh's staleness probe) reads mtimes, not contents, and is not one.
+_SCRIPT_WALK = re.compile(r"\bfind\s+\"?\$\{?(?:ROOT|HERE)\}?\"?/((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*)\"?(?=[\s);|&]|$)")
 
 
 @dataclass
@@ -422,9 +428,9 @@ _BOX_LINE = re.compile(r"^(?:\./)?tools/box\.sh '([^']*)'$")
 
 
 def box_command(recipe: Recipe) -> str:
-    """The single-quoted argument of the recipe's one `tools/box.sh '…'` line, verbatim: tools/host2.sh
-    runs it as it is, so the recipe stays the one owner of its command. Refused by name: no box.sh line,
-    more than one, an environment prefix on the call (it would not reach the other host), an argument
+    """The single-quoted argument of the recipe's one `tools/box.sh '…'` line, verbatim: tools/mac-check.sh
+    derives its cargo call from it, so the recipe stays the one owner of its command. Refused by name: no
+    box.sh line, more than one, an environment prefix on the call (it would not reach the Mac), an argument
     that is not one single-quoted word ending the line, a `{{…}}` parameter left in it."""
     found: list[str] = []
     for line in recipe.lines:
@@ -436,7 +442,7 @@ def box_command(recipe: Recipe) -> str:
             if not rest or _norm(rest[0]) != "tools/box.sh":
                 continue
             if env or rest[0] != cmd[0]:
-                raise BoxCommandError(f"{recipe.name}: its box.sh call carries a prefix ({' '.join(cmd[: len(cmd) - len(rest)])}) that would not reach the other host")
+                raise BoxCommandError(f"{recipe.name}: its box.sh call carries a prefix ({' '.join(cmd[: len(cmd) - len(rest)])}) that would not reach the Mac")
             m = _BOX_LINE.match(stripped)
             if m is None:
                 raise BoxCommandError(f"{recipe.name}: its box.sh line is not `./tools/box.sh '<command>'` alone on the line: {stripped[:120]}")
@@ -964,7 +970,8 @@ class Graph:
         self._script_cache: dict[str, dict[str, str]] = {}
 
     def script_closure(self, rel: str) -> dict[str, str]:
-        """Repository files a script names, transitively (comments skipped)."""
+        """Repository files a script names, transitively (comments skipped), and as `dir/` each tree
+        directory a shell script walks with `find`."""
         if rel in self._script_cache:
             return self._script_cache[rel]
         out: dict[str, str] = {}
@@ -992,6 +999,11 @@ class Graph:
                     p = _norm(p)
                     if self.tree.exists(p):
                         stack.append(p)
+                if s.endswith((".sh", ".bash")):
+                    for d in _SCRIPT_WALK.findall(line):
+                        d = _norm(d)
+                        if d != "." and self.tree.isdir(d):
+                            out.setdefault(d + "/", f"find in {s}" if s == rel else f"find in {s} (script {rel})")
                 for b in re.findall(r"([A-Za-z0-9_.-]+\.(?:sh|py|tsv|cpp|h|txt|json|jinja))\b", line):
                     p = os.path.normpath(os.path.join(sdir, b))
                     if self.tree.exists(p):
@@ -1040,7 +1052,10 @@ class Graph:
         for s in rc.scripts + rc.paths:
             if self.tree.exists(s):
                 for f, why in self.script_closure(s).items():
-                    files.setdefault(f, why)
+                    if f.endswith("/"):
+                        prefixes.setdefault(f, why)
+                    else:
+                        files.setdefault(f, why)
             elif self.tree.isdir(s):
                 prefixes.setdefault(s.rstrip("/") + "/", "named directory")
             elif s in rc.scripts or s.endswith(_SCRIPT_EXT):
@@ -2538,23 +2553,16 @@ def self_test() -> int:
     expect(refused(["BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo check'"], "prefix (BLOOMERY_MODEL=deepseek41)"), "box-command: an env prefix accepted or not named")
     expect(refused(["./tools/box.sh 'cargo test {{ARGS}}'"]), "box-command: a {{…}} parameter accepted")
     expect(refused(["./tools/box.sh 'cargo check' && echo done"]), "box-command: a line that goes on after the argument accepted")
-    lists = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--lists"], capture_output=True, text=True)
-    allow = [ln.split(" ", 1)[1] for ln in lists.stdout.splitlines() if ln.startswith("allow ")]
-    forbid = [ln.split(" ", 1)[1] for ln in lists.stdout.splitlines() if ln.startswith("forbid ")]
-    expect(lists.returncode == 0 and allow and forbid, f"tools/host2.sh --lists: rc {lists.returncode}, {len(allow)} recipes, {len(forbid)} tokens")
+    # the recipes tools/mac-check.sh derives from: each gives one plain `cargo <subcommand> …` (mac-check
+    # adds --target to it and refuses any other shape; its own self-test holds that side)
     jf = load_justfile(os.path.join(ROOT, "justfile"))
-    for n in allow:
+    for n, verb in (("check", "check"), ("lint", "clippy"), ("fmt-check", "fmt")):
         try:
             got = box_command(jf[n]) if n in jf else ""
         except BoxCommandError as err:
             got = ""
             fails.append(f"box-command {n}: {err}")
-        expect(bool(got.strip()), f"box-command {n}: no command")
-        refusal = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--check-command", got], capture_output=True, text=True)
-        expect(refusal.returncode == 0, f"box-command {n}: host2.sh refuses it (rc {refusal.returncode}): {refusal.stderr.strip()}")
-    for t in forbid[:1]:
-        probe = subprocess.run(["bash", os.path.join(ROOT, "tools", "host2.sh"), "--check-command", f"cd x && {t} y"], capture_output=True, text=True)
-        expect(probe.returncode == 64, f"host2.sh --check-command accepts a command naming '{t}' (rc {probe.returncode})")
+        expect(got.split()[:2] == ["cargo", verb], f"box-command {n}: not `cargo {verb} …`: {got!r}")
 
     # the real tree
     side = make_side(ROOT)
@@ -2588,7 +2596,13 @@ def self_test() -> int:
     expect(spill == {"gate-ptx-spill"}, f"ptx-shapes.tsv selects {sorted(spill)}")
     qprof = sel("tools/ref/models/qwen3moe.sh")
     expect("gate-gpu-qwen3moe-e2e" in qprof and "gate-gpu-e2e" not in qprof, f"qwen3moe profile selects {sorted(qprof)[:5]}")
-    expect(sel("docs/plan.md") == set(), "docs/plan.md is selected")
+    # oracle.sh builds its Korean corpus with `find "$ROOT/docs" -name '*.md'`: a docs change selects that
+    # gate and no other
+    docs = sel("docs/plan.md")
+    expect(docs == {"gate-tokenizer"}, f"docs/plan.md (walked by oracle.sh) selects {sorted(docs)}")
+    expect(graph.inputs("gate-tokenizer").prefixes.get("docs/", "").startswith("find in crates/tokenizer/tools/oracle.sh"), f"gate-tokenizer's docs/ prefix: {graph.inputs('gate-tokenizer').prefixes}")
+    walks = [(ln, _SCRIPT_WALK.findall(ln)) for ln in ('find "$ROOT/docs" -name x', 'find "$ROOT"/docs/cards -type f', "find crates -name '*.rs'", 'find "$REF/docs" -name x', "find . -name x", 'find "$ROOT" -name x')]
+    expect([w for _, w in walks] == [["docs"], ["docs/cards"], [], [], [], []], f"find roots: {walks}")
     cases = sel("crates/tokenizer/tests/cases.txt")
     expect(cases == {"gate-tokenizer"}, f"tokenizer cases.txt (read by oracle.sh) selects {sorted(cases)}")
     expect(len(sel("tools/box.sh")) == len(gates), "tools/box.sh does not select every gate")
@@ -2693,7 +2707,7 @@ def self_test() -> int:
     sels, unmapped, _ = select(["justfile"], side, b2, GATE_PREFIX)
     expect([x.recipe for x in sels] == ["gate-sampler"] and not unmapped, f"recipe-text change selects {[x.recipe for x in sels]}")
     sels, _, _ = select(["crates/gpu-gates/src/bin/gate_p1.rs", "docs/plan.md"], side, side, GATE_PREFIX)
-    expect([x.recipe for x in sels] == ["gate-gpu-p1"], f"select() on gate_p1.rs gives {[x.recipe for x in sels]}")
+    expect(sorted(x.recipe for x in sels) == ["gate-gpu-p1", "gate-tokenizer"], f"select() on gate_p1.rs and docs/plan.md gives {[x.recipe for x in sels]}")
 
     # dep-info parsing
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")
@@ -2737,7 +2751,7 @@ def main(argv: list[str]) -> int:
     k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
     k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
-    bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/host2.sh)")
+    bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
