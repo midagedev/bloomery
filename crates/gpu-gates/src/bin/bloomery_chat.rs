@@ -56,7 +56,9 @@ mod drive {
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
-    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST, PIN_MAIN};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, PIN_MAIN, R8,
+    };
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, PlanLevers, workstation};
@@ -218,7 +220,16 @@ mod drive {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET, PIN_MAIN])?;
+        let levers = bloomery_levers::at_main(&[
+            ENGRAM_HELPER,
+            HOT_LIST,
+            CARD_BUDGET,
+            PIN_MAIN,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;

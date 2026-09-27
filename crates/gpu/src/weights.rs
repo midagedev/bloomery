@@ -9,7 +9,6 @@
 //! pin the uploads against independent host packings bit for bit.
 
 use crate::GpuError;
-use crate::hybrid::host_levers;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::{DeviceTensor, window};
 use ::model::placement::host_lock::PageDrop;
@@ -178,7 +177,7 @@ impl Weights {
     }
 
     /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
-    /// of the plan's rows), and — unless `BLOOMERY_CARD_DONTNEED=0` — release
+    /// of the plan's rows), and — when `card_dontneed` — release
     /// each uploaded segment's file pages from the page cache as soon as it
     /// is on the card ([`PageDrop`]): the plan names every later reader of
     /// the file, and none of them reads a card segment's bytes. Whole pages
@@ -190,8 +189,9 @@ impl Weights {
         split: &Split,
         plan: &Plan<'_>,
         card: usize,
+        card_dontneed: bool,
     ) -> Result<Weights, GpuError> {
-        let mut release = host_levers()?.card_dontneed.then(|| PageDrop::new(split));
+        let mut release = card_dontneed.then(|| PageDrop::new(split));
         load_segments(
             stream,
             split,

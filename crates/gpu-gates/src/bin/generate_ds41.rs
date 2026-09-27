@@ -245,8 +245,8 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
-        CARD_BUDGET, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOT_LIST, Levers, PIN_MAIN, PREFILL,
-        PREFILL_GROUP, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
+        HOST_POPULATE, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -586,6 +586,10 @@ mod drive {
         PIN_MAIN,
         DRAFT,
         CHECK_FINITE,
+        HOST_POPULATE,
+        HOST_LOCK,
+        CARD_DONTNEED,
+        R8,
     ];
 
     pub fn run() -> Result<(), GateError> {

@@ -438,7 +438,7 @@ impl Body {
         let hidden = body.scratch.dims.hidden;
         let shape = BoundaryShape { hidden, n_used };
         let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
-        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots, cfg.overlap)?;
+        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots)?;
         let host = PlanHost::new(derived, file, hidden, ff)?;
         body.hybrid = Some(Hybrid::new(boundary, host, layers.len())?);
         Ok(body)

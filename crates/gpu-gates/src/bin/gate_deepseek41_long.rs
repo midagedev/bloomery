@@ -136,7 +136,9 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
-    use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER, HOT_LIST};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, HostCfg, R8,
+    };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
@@ -237,7 +239,15 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[
+            ENGRAM_HELPER,
+            HOT_LIST,
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
+        ])?;
         let args = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
@@ -281,7 +291,7 @@ mod gate {
             .tokens;
         let mut pass = true;
         if args.faults {
-            pass &= faults_arm(&mut m, &prompt)?;
+            pass &= faults_arm(&mut m, &prompt, cfg.body.host)?;
         }
         if args.free {
             // Prompt 7: ik's greedy ids for it run tens of ids before its
@@ -407,8 +417,11 @@ mod gate {
     /// The faults arm: `prompt` from a reset, then [`FAULT_STEPS`] greedy
     /// steps of the engine's graph, each step's faults outside the engram
     /// helper against the pins from the second step on.
-    fn faults_arm(m: &mut Deepseek41Model, prompt: &[u32]) -> Result<bool, GateError> {
-        let host = bloomery_gpu::hybrid::host_levers()?;
+    fn faults_arm(
+        m: &mut Deepseek41Model,
+        prompt: &[u32],
+        host: HostCfg,
+    ) -> Result<bool, GateError> {
         m.reset()?;
         let mut next = m.step(prompt)?;
         let (mut tokens, mut rows) = (

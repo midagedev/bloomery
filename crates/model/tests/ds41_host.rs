@@ -223,17 +223,13 @@ impl Layer {
     }
 }
 
-/// `BLOOMERY_R8` as the engine takes it (`crates/gpu/src/hybrid.rs`, an
-/// in-place read of the registry's on/off row): unset is on.
+/// `BLOOMERY_R8` as the engine takes it: the registry's on/off row, parsed by
+/// the levers crate (`Levers::host`); unset is on.
 fn r8_lever() -> bool {
-    const R8: &str = "BLOOMERY_R8";
-    match std::env::var(R8) {
-        Err(std::env::VarError::NotPresent) => true,
-        Ok(v) if v == "on" => true,
-        Ok(v) if v == "off" => false,
-        Ok(v) => panic!("{R8}={v:?}: want on or off"),
-        Err(e) => panic!("{R8}: {e}"),
-    }
+    bloomery_levers::Levers::from_env()
+        .unwrap_or_else(|e| panic!("the levers: {e}"))
+        .host()
+        .r8
 }
 
 /// `|got − want| / band`, a NaN anywhere reading as a miss.

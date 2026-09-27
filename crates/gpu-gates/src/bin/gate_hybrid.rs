@@ -26,9 +26,6 @@
 //!   wherever the all-card margin is above the derived flip band; every
 //!   disagreement is printed with its margin.
 //!
-//! And once: `n_l` = 32 with the overlap lever off captures the same node
-//! count and kinds and gives the same logits, bit for bit, as with it on.
-//!
 //! And the host tier's refusals, on a boundary of its own over host experts
 //! that scale each column by its listed weights (no model file): a handoff
 //! the card should already have refused — a routed id the slot map does not
@@ -61,7 +58,7 @@
 //! Deepseek2 step order — with one refusal recorded by the host tier. The
 //! model's reset then lifts the tier's poison (one reset counted, the poison
 //! kept as refused at that layer), and the first prompt, eagerly and by
-//! replay, gives the overlap-on run's logits bit for bit with every step
+//! replay, gives the n_l = 32 run's logits bit for bit with every step
 //! served by the host on every routed layer and the words at rest after it.
 //!
 //! And the batch service's exclusion set, on the same stub boundary: a
@@ -201,13 +198,11 @@ mod gate {
     /// Node counts by kind, in `KINDS` order, and every other kind together.
     type Kinds = ([i64; 4], i64);
 
-    /// What one `n_l` leaves behind: its verdict, and the replay logits,
-    /// node count and kinds the overlap arm compares against.
+    /// What one `n_l` leaves behind: its verdict, and the replay logits the
+    /// engine's reset arm compares against.
     struct NlOutcome {
         ok: bool,
         replay: LogitsRun,
-        nodes: usize,
-        kinds: Kinds,
     }
 
     fn kinds(nodes: &[NodeInfo]) -> Kinds {
@@ -532,11 +527,10 @@ mod gate {
     }
 
     /// Everything one `n_l` asserts. Returns whether it all held, and the
-    /// eager = replay logits for the overlap comparison.
+    /// eager = replay logits for the engine's reset arm.
     #[allow(clippy::too_many_arguments, reason = "one n_l's inputs")]
     fn run_n_l(
         n_l: usize,
-        overlap: bool,
         a: &Deepseek2Model,
         a_kinds: Kinds,
         routed: usize,
@@ -547,12 +541,12 @@ mod gate {
         gguf: &Gguf,
         derived: &Derived,
     ) -> Result<NlOutcome, GateError> {
-        let tag = format!("n_l={n_l} overlap={}", u8::from(overlap));
+        let tag = format!("n_l={n_l}");
         let mut ok = true;
         let mut h = Deepseek2Model::open_hybrid(
             Split::open(ref_model_path()?)?,
             CTX_MAX,
-            HybridConfig { n_l, overlap },
+            HybridConfig { n_l },
         )?;
         println!(
             "{tag} load resident_bytes={} all_card_resident_bytes={}",
@@ -738,12 +732,7 @@ mod gate {
             }
         }
         println!("{tag} verdict {}", verdict(ok));
-        Ok(NlOutcome {
-            ok,
-            replay,
-            nodes,
-            kinds: (hk, ho),
-        })
+        Ok(NlOutcome { ok, replay })
     }
 
     /// The refusal arm's boundary: its width, slots, layers, experts and the
@@ -814,7 +803,7 @@ mod gate {
             n_used: R_USED,
         };
         let slots = SlotMap::prefix(0..R_LAYERS, R_EXPERTS, R_CARD)?;
-        let b = Boundary::new(gpu.context(), gpu.stream(), shape, slots, true)?;
+        let b = Boundary::new(gpu.context(), gpu.stream(), shape, slots)?;
         let mut h = Hybrid::new(b, Stub::default(), R_LAYERS)?;
         if watch {
             h.watch_fault(gpu.fault_word())?;
@@ -1541,42 +1530,25 @@ mod gate {
         let mut on32: Option<NlOutcome> = None;
         for n_l in N_LS {
             let out = run_n_l(
-                n_l, true, &a, a_kinds, routed, &chains, &forced, &prompts, &reference, &gguf,
-                &derived,
+                n_l, &a, a_kinds, routed, &chains, &forced, &prompts, &reference, &gguf, &derived,
             )?;
             ok &= out.ok;
             if n_l == 32 {
                 on32 = Some(out);
             }
         }
-        let on32 = on32.ok_or("gate_hybrid: no n_l = 32 run to compare the overlap lever with")?;
+        let on32 = on32.ok_or("gate_hybrid: no n_l = 32 run for the engine's reset arm")?;
 
-        // The overlap lever: same nodes, same logits.
         {
             let mut h = Deepseek2Model::open_hybrid(
                 Split::open(ref_model_path()?)?,
                 CTX_MAX,
-                HybridConfig {
-                    n_l: 32,
-                    overlap: false,
-                },
+                HybridConfig { n_l: 32 },
             )?;
-            let nodes = h.capture_step()?;
-            let k = kinds(&h.step_graph_nodes()?);
-            let s_ok = nodes == on32.nodes && k == on32.kinds;
-            let same = match eager_replay(&mut h, &prompts) {
-                Ok((e, g)) => logits_equal(&e, &g) && logits_equal(&g, &on32.replay),
-                Err(e) => {
-                    arm_err("n_l=32 overlap=0 eager_vs_replay", &e);
-                    false
-                }
-            };
-            ok &= s_ok && same;
-            println!(
-                "n_l=32 overlap=0 graph_nodes={nodes} kinds[{}] same_as_overlap_on={s_ok} logits_bit_identical_to_overlap_on={same} {}",
-                fmt_kinds(&k.0, k.1),
-                verdict(s_ok && same)
-            );
+            // The state the refusal meets: a captured step, and a prompt run
+            // eagerly and by replay.
+            h.capture_step()?;
+            eager_replay(&mut h, &prompts)?;
 
             // The engine's own naming on a real layer: a NaN in a hybrid
             // layer's input residual is refused by the card's norm at that
@@ -1621,7 +1593,7 @@ mod gate {
             );
 
             // The reset: the first prompt eagerly and by replay gives the
-            // logits the overlap-on run gave, every step served by the host
+            // logits the n_l = 32 run gave, every step served by the host
             // on every routed layer, the words at rest after it.
             let s0 = h.hybrid_stats().unwrap_or_default();
             let reset = h.reset();
@@ -1654,7 +1626,7 @@ mod gate {
             ok &= pass;
             println!(
                 "n_l=32 engine reset after the refusal: reset {} resets={} last_poison={:?} lifted \
-                 {lifted}; prompt {} eager and replay, {steps} steps, logits = the overlap-on run's \
+                 {lifted}; prompt {} eager and replay, {steps} steps, logits = the n_l = 32 run's \
                  bit for bit {same}; services {} (want {services_per_step} routed layers x {steps} \
                  steps = {want_served}) {served}; words {} at rest {rest} {}",
                 match &reset {
@@ -1675,8 +1647,7 @@ mod gate {
                 "gate_hybrid: PASS — at n_l 32 and 0 the captured step carries exactly the boundary's nodes, \
                  replays its eager body bit for bit, runs every routed layer on the all-card routing with the \
                  card's slots unchanged, the host's slots zero and the host sum inside the error model's band, \
-                 and leaves the all-card argmax only inside the flip band; the overlap lever changes the order \
-                 and nothing else; a handoff the card should have refused names the card's fault, or says the \
+                 and leaves the all-card argmax only inside the flip band; a handoff the card should have refused names the card's fault, or says the \
                  card raised nothing; a batch service leaves exactly its exclusion set's slots off the host, \
                  over one batch or more, and refuses a malformed set by name."
             );

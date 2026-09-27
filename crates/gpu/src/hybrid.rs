@@ -18,8 +18,8 @@
 //! the layer's id written into the page, a second barrier, then an atomic add
 //! of one to the host-mapped generation word and to the device sequence word
 //! the next handoff carries. `wait` waits until the host-mapped counter is at
-//! least one and adds minus one. With the overlap lever off
-//! (`BLOOMERY_HYBRID_OVERLAP=0`) the wait sits right after the go instead.
+//! least one and adds minus one; it sits after the card's experts and the
+//! shared expert, so their work runs under the host's.
 //!
 //! No word is written by the card and the host at the same time: the
 //! generation, sequence and layer words only by the card; the counter by the
@@ -77,6 +77,7 @@ use crate::GpuError;
 use crate::fault::{FAULT_NONE, Fault, LAYER_NONE, mask_index};
 use crate::graph::cu;
 use crate::tensor::window;
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use gguf::Split;
 use model::moe::EXPERTS_INTO_MAX;
@@ -93,18 +94,15 @@ use std::time::{Duration, Instant};
 
 // ----------------------------------------------------------------- levers
 
-/// The hybrid path's two runtime levers, as read from the environment.
+/// The V2-Lite hybrid load's lever, as read from the environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Levers {
     /// `BLOOMERY_HYBRID_NL`: experts per MoE layer kept on the card; `None`
     /// when unset.
     pub n_l: Option<usize>,
-    /// `BLOOMERY_HYBRID_OVERLAP`: `false` (`0`) puts each hybrid layer's wait
-    /// right after its go; unset or `1` puts it just before the combine.
-    pub overlap: bool,
 }
 
-/// The levers, read once per process (a `OnceLock`: the environment is read at
+/// The lever, read once per process (a `OnceLock`: the environment is read at
 /// first use and never again).
 pub fn levers() -> Result<Levers, GpuError> {
     static LEVERS: OnceLock<Result<Levers, String>> = OnceLock::new();
@@ -124,27 +122,19 @@ fn read_levers() -> Result<Levers, String> {
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("BLOOMERY_HYBRID_NL: {e}")),
     };
-    let overlap = match std::env::var("BLOOMERY_HYBRID_OVERLAP") {
-        Err(std::env::VarError::NotPresent) => true,
-        Ok(v) if v.trim() == "1" => true,
-        Ok(v) if v.trim() == "0" => false,
-        Ok(v) => return Err(format!("BLOOMERY_HYBRID_OVERLAP={v:?}: want 0 or 1")),
-        Err(e) => return Err(format!("BLOOMERY_HYBRID_OVERLAP: {e}")),
-    };
-    Ok(Levers { n_l, overlap })
+    Ok(Levers { n_l })
 }
 
-/// A V2-Lite (deepseek2) hybrid load's parameters: experts `[0, n_l)` of
-/// every MoE layer on the card and the rest on the host, and where each
-/// layer's wait sits. A V4.1 load takes its card set from the plan instead.
+/// A V2-Lite (deepseek2) hybrid load's parameter: experts `[0, n_l)` of
+/// every MoE layer on the card and the rest on the host. A V4.1 load takes
+/// its card set from the plan instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridConfig {
     pub n_l: usize,
-    pub overlap: bool,
 }
 
 impl HybridConfig {
-    /// What the levers ask of `file`'s model: `None` when `BLOOMERY_HYBRID_NL`
+    /// What the lever asks of `file`'s model: `None` when `BLOOMERY_HYBRID_NL`
     /// is unset or keeps every expert on the card — today's all-card path — and
     /// an error when it asks for more experts than a layer has.
     pub fn from_levers(file: &Split) -> Result<Option<HybridConfig>, GpuError> {
@@ -164,83 +154,14 @@ impl HybridConfig {
                 format!("BLOOMERY_HYBRID_NL={n_l} keeps more experts than a layer's {n_expert}"),
             ));
         }
-        Ok((n_l < n_expert).then_some(HybridConfig {
-            n_l,
-            overlap: l.overlap,
-        }))
+        Ok((n_l < n_expert).then_some(HybridConfig { n_l }))
     }
 }
 
 // ------------------------------------------------------- the host set at load
 
-/// The host tier's load levers, as read from the environment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostLevers {
-    /// `BLOOMERY_HOST_POPULATE`: unset or `1` reads the plan's host set into
-    /// the page cache and maps it at load; `0` leaves it to the steps' first
-    /// touches.
-    pub populate: bool,
-    /// `BLOOMERY_HOST_LOCK`: `1` locks the host set in RAM for the model's
-    /// lifetime ([`HostLock`]); unset or `0` does not.
-    pub lock: bool,
-    /// `BLOOMERY_CARD_DONTNEED`: unset or `1` releases each card segment's
-    /// file pages from the page cache once uploaded
-    /// ([`crate::weights::Weights::load_placed`]); `0` keeps them cached.
-    pub card_dontneed: bool,
-    /// `BLOOMERY_R8`: unset or `on` reads a V4.1 host tier's routed gates and
-    /// ups from the r8 sidecar when there is one ([`HostR8::at_load`]); `off`
-    /// reads the source's, the same-binary arm.
-    pub r8: bool,
-}
-
-/// `BLOOMERY_R8`, the one lever of the four taken as `on`/`off`.
-const R8_LEVER: &str = "BLOOMERY_R8";
-
-/// The host levers, read once per process.
-pub fn host_levers() -> Result<HostLevers, GpuError> {
-    static LEVERS: OnceLock<Result<HostLevers, String>> = OnceLock::new();
-    LEVERS
-        .get_or_init(|| {
-            Ok(HostLevers {
-                populate: flag("BLOOMERY_HOST_POPULATE", true)?,
-                lock: flag("BLOOMERY_HOST_LOCK", false)?,
-                card_dontneed: flag("BLOOMERY_CARD_DONTNEED", true)?,
-                r8: on_off(R8_LEVER, std::env::var(R8_LEVER), true)?,
-            })
-        })
-        .clone()
-        .map_err(|detail| GpuError::shape("hybrid::host_levers", detail))
-}
-
-/// A `0`/`1` lever; `default` when unset.
-fn flag(name: &str, default: bool) -> Result<bool, String> {
-    match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Ok(v) if v.trim() == "1" => Ok(true),
-        Ok(v) if v.trim() == "0" => Ok(false),
-        Ok(v) => Err(format!("{name}={v:?}: want 0 or 1")),
-        Err(e) => Err(format!("{name}: {e}")),
-    }
-}
-
-/// An `on`/`off` lever as `value` read it, exactly as written — ` on` or
-/// `ON` is refused like any other value; `default` when unset.
-fn on_off(
-    name: &str,
-    value: Result<String, std::env::VarError>,
-    default: bool,
-) -> Result<bool, String> {
-    match value {
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Ok(v) if v == "on" => Ok(true),
-        Ok(v) if v == "off" => Ok(false),
-        Ok(v) => Err(format!("{name}={v:?}: want on or off")),
-        Err(e) => Err(format!("{name}: {e}")),
-    }
-}
-
 /// What a placed load did to its plan's host set: populated it, locked it,
-/// both or neither ([`HostLevers`]), in the files the host tier reads
+/// both or neither ([`HostCfg`]), in the files the host tier reads
 /// ([`HostR8`]). Holds the lock, when there is one, for as long as it lives;
 /// its owner keeps the split's mappings alive longer.
 pub struct HostResidency {
@@ -251,9 +172,9 @@ pub struct HostResidency {
 
 impl HostResidency {
     /// The host set of `plan` over `split` — the host segments whose tensor
-    /// `keep` selects — populated, then locked, as `levers` ask. Populating
+    /// `keep` selects — populated, then locked, as `cfg` asks. Populating
     /// first makes the lock a walk over resident pages. When the host tier
-    /// reads the r8 sidecar ([`HostR8::at_load`] under `levers.r8`, the same
+    /// reads the r8 sidecar ([`HostR8::at_load`] under `cfg.r8`, the same
     /// reading and the same mapping a V4.1 host tier's build takes), the
     /// stacks it holds are walked in its mapping and their source pages are
     /// not; everything else is the source's.
@@ -261,18 +182,18 @@ impl HostResidency {
         split: &Split,
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
-        levers: HostLevers,
+        cfg: HostCfg,
     ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
-        let r8 = HostR8::at_load(split, levers.r8)?;
+        let r8 = HostR8::at_load(split, cfg.r8)?;
         let src = R8Source::of(split, &r8)?;
         let set = HostSet::of(src, plan, keep).map_err(|e| GpuError::plan(WHAT, e))?;
-        let populate = levers
+        let populate = cfg
             .populate
             .then(|| set.populate(src))
             .transpose()
             .map_err(|e| GpuError::plan(WHAT, e))?;
-        let lock = levers
+        let lock = cfg
             .lock
             .then(|| HostLock::lock(src, &set))
             .transpose()
@@ -782,9 +703,6 @@ pub struct Boundary {
     pub(crate) sum: DeviceBuffer<f32>,
     /// Which experts each layer's card stack holds; the host serves the rest.
     pub(crate) slots: SlotMap,
-    /// Whether the wait sits before the combine (`true`) or right after the
-    /// go.
-    pub(crate) overlap: bool,
     region: DeviceBuffer<u32>,
     page: MappedHost,
     shape: BoundaryShape,
@@ -845,16 +763,14 @@ impl Drop for Boundary {
 
 impl Boundary {
     /// Allocate the region, the page and the sum for `shape`; the host
-    /// serves the experts `slots` sends to it, and `overlap` places each
-    /// layer's wait. One row. Load-time only.
+    /// serves the experts `slots` sends to it. One row. Load-time only.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         shape: BoundaryShape,
         slots: SlotMap,
-        overlap: bool,
     ) -> Result<Boundary, GpuError> {
-        Boundary::with_rows(ctx, stream, shape, slots, overlap, 1)
+        Boundary::with_rows(ctx, stream, shape, slots, 1)
     }
 
     /// [`Boundary::new`] with `rows` rows (1..=[`MAX_ROWS`]): row 0's image
@@ -866,7 +782,6 @@ impl Boundary {
         stream: &CudaStream,
         shape: BoundaryShape,
         slots: SlotMap,
-        overlap: bool,
         rows: usize,
     ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
@@ -936,7 +851,6 @@ impl Boundary {
             pages,
             sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
             slots,
-            overlap,
             region,
             page,
             shape,
@@ -964,13 +878,6 @@ impl Boundary {
     #[must_use]
     pub fn slots(&self) -> &SlotMap {
         &self.slots
-    }
-
-    /// Whether each layer's wait sits just before the combine (`true`) or
-    /// right after its go.
-    #[must_use]
-    pub fn overlap(&self) -> bool {
-        self.overlap
     }
 
     /// The handoff's activation, `hidden` f32: what the norm writes on a
@@ -2324,29 +2231,9 @@ fn read_fault(word: &DeviceBuffer<u32>) -> Result<Option<Fault>, GpuError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, HOST, R8_LEVER, SlotMap, on_off};
+    use super::{Boundary, BoundaryShape, HOST, SlotMap};
     use cuda_core::CudaContext;
-    use std::env::VarError;
-    use std::os::unix::ffi::OsStringExt;
     use std::sync::Arc;
-
-    /// `BLOOMERY_R8` takes `on` or `off` exactly as written, unset is `on`,
-    /// and every other value — another case, a space around it, a flag's
-    /// `1`, bytes that are not UTF-8 — is refused naming the lever.
-    #[test]
-    fn r8_takes_on_or_off_as_written() {
-        let read = |v: Result<String, VarError>| on_off(R8_LEVER, v, true);
-        assert_eq!(read(Err(VarError::NotPresent)), Ok(true));
-        assert_eq!(read(Ok("on".into())), Ok(true));
-        assert_eq!(read(Ok("off".into())), Ok(false));
-        for v in [" on", "off\n", "ON", "On", "1", "0", "", "x"] {
-            let e = read(Ok(v.into())).expect_err(v);
-            assert_eq!(e, format!("BLOOMERY_R8={v:?}: want on or off"));
-        }
-        let bad = std::ffi::OsString::from_vec(vec![b'o', b'n', 0xff]);
-        let e = read(Err(VarError::NotUnicode(bad))).expect_err("not UTF-8");
-        assert!(e.starts_with("BLOOMERY_R8: "), "{e}");
-    }
 
     /// A boundary gives back every context handle its windows took: the
     /// context's count after one is dropped is the count before it was made.
@@ -2361,7 +2248,7 @@ mod tests {
         };
         let before = Arc::strong_count(&ctx);
         let slots = SlotMap::prefix(0..2, 16, 8).expect("a prefix of 8 of 16");
-        let b = Boundary::with_rows(&ctx, &stream, shape, slots, true, 2).expect("a boundary");
+        let b = Boundary::with_rows(&ctx, &stream, shape, slots, 2).expect("a boundary");
         let held = Arc::strong_count(&ctx);
         drop(b);
         let after = Arc::strong_count(&ctx);

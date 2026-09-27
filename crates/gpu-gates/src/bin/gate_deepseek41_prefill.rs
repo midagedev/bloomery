@@ -215,7 +215,10 @@ mod gate {
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         patch_bytes, record, row_bytes, verdict,
     };
-    use bloomery_levers::{CARD_BUDGET, CED, ENGRAM_HELPER, HOT_LIST, PREFILL_GROUP, STEP_STATS};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST,
+        PREFILL_GROUP, R8, STEP_STATS,
+    };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -381,6 +384,10 @@ mod gate {
             STEP_STATS,
             HOT_LIST,
             CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            R8,
         ])?;
         record::at_main("gate_deepseek41_prefill", record::GATE_DEEPSEEK41_PREFILL);
         let args = parse_args()?;

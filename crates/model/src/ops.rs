@@ -863,7 +863,7 @@ pub fn first_non_finite_col(x: Tensor2View<'_>) -> Option<usize> {
 /// poisoned scratch par (`qdot::swiglu`, the exact call `ffn::swiglu` makes,
 /// or `qdot::swiglu_clamp`) and quantizes it before any row of its pair
 /// runs — the caller never serializes on the combine or the encoder. Inputs
-/// of more than one column, or `BLOOMERY_DEFER_QUANT=0`, keep today's shape:
+/// of more than one column, or the tests' pre-pass arm ([`set_defer_quant`]), keep today's shape:
 /// the combine runs on the caller (its own `swiglu` profiler site) and the
 /// group takes the ordinary pre-pass.
 ///
@@ -2493,20 +2493,13 @@ const QUANT_INLINE_COLS: usize = 8;
 /// down pair) all sit far below it.
 const MAX_DEFER_SLOTS: usize = 16;
 
-/// `BLOOMERY_DEFER_QUANT=0` forces today's caller-side pre-pass — the A/B
-/// lever. Same binary, same bytes: only WHO quantizes changes.
-fn defer_quant_env() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("BLOOMERY_DEFER_QUANT").map_or(true, |v| v != "0"))
-}
-
-/// The in-process override the deferral tests drive: the env var is read
-/// once per process, so this is how one binary exercises both arms.
+/// The deferral tests' oracle arm: `2` runs the caller-side pre-pass, the
+/// twin the deferred path is compared against; anything else defers. Same
+/// bytes either way: only who quantizes changes.
 static DEFER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Test override for the deferral lever: `Some(true)` forces the deferred
-/// path, `Some(false)` forces the caller-side pre-pass, `None` follows
-/// `BLOOMERY_DEFER_QUANT`.
+/// The deferral tests' switch: `Some(false)` runs the caller-side pre-pass,
+/// `Some(true)` and `None` the deferred path the engine runs.
 #[doc(hidden)]
 pub fn set_defer_quant(mode: Option<bool>) {
     DEFER_OVERRIDE.store(
@@ -2519,13 +2512,10 @@ pub fn set_defer_quant(mode: Option<bool>) {
     );
 }
 
-/// The deferral lever's reading: the test override, else the environment.
+/// Whether the row dispatch quantizes its activations itself: always, unless
+/// a test picked the pre-pass ([`set_defer_quant`]).
 pub(crate) fn defer_quant() -> bool {
-    match DEFER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => defer_quant_env(),
-    }
+    DEFER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 2
 }
 
 /// A deferred slot's claim state.
@@ -2688,7 +2678,7 @@ impl<'a> DeferredSlots<'a> {
 /// any row runs — one pool dispatch over the concatenated column space
 /// (inline for the small counts below), chunk-straddling slots handled
 /// segment-wise. The decode shape does not come through here while the
-/// deferral lever is on (see [`run_group`]); `BLOOMERY_DEFER_QUANT=0` and
+/// pre-pass arm is off (see [`run_group`]); the tests' pre-pass arm and
 /// multi-column inputs do (past [`DEFER_MAX_COLS`] for
 /// [`matmul_q_group_cols_into`]).
 ///
@@ -2982,24 +2972,8 @@ fn parse_steal(v: Option<&str>) -> bool {
 }
 
 /// Blocks a lane is cut into: the barrier waits for at most one block per
-/// participant once every block is claimed. `BLOOMERY_STEAL_BLOCKS` is the
-/// same-binary lever for that granularity, a positive count, 4 when unset;
-/// any other value panics by name.
-fn steal_blocks() -> usize {
-    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *B.get_or_init(|| parse_steal_blocks(lever_var("BLOOMERY_STEAL_BLOCKS").as_deref()))
-}
-
-/// [`steal_blocks`]'s reading of the variable's value (`None`: unset).
-fn parse_steal_blocks(v: Option<&str>) -> usize {
-    let Some(v) = v else {
-        return 4;
-    };
-    match v.trim().parse::<usize>() {
-        Ok(b) if b > 0 => b,
-        _ => panic!("BLOOMERY_STEAL_BLOCKS={v:?}: want a positive count of blocks per lane"),
-    }
-}
+/// participant once every block is claimed.
+const STEAL_BLOCKS: usize = 4;
 
 /// The most rows one steal block of a union pass takes: 18 groups of 8 rows,
 /// so a block's cells in each output column are 144 · 4 = 576 bytes, nine
@@ -3186,7 +3160,7 @@ impl ErrGate {
 /// pool splits the lane indices, not the rows, so every lane the cut balanced
 /// has the participant it was cut for. Otherwise the row split names the
 /// home lanes, as below. A lane's steal block is a quarter of it
-/// (`BLOOMERY_STEAL_BLOCKS`), capped by the set's [`RowSet::block_cap`].
+/// ([`STEAL_BLOCKS`]), capped by the set's [`RowSet::block_cap`].
 ///
 /// A profiled dispatch pays the chunk collector (one `Vec` of pool-width
 /// slots); an unprofiled one runs the error channel above and allocates
@@ -3254,7 +3228,6 @@ fn run_row_pool<S: RowSet>(
     }
     // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lanes only.
     let steal = steal_enabled();
-    let steal_blocks = steal_blocks();
     let cap = set.block_cap();
     let lanes: [Lane; MAX_LANES] = std::array::from_fn(|t| {
         let (start, end) = if t < nlanes {
@@ -3263,7 +3236,7 @@ fn run_row_pool<S: RowSet>(
             (0, 0)
         };
         let block = if steal {
-            let block = ((end - start) / steal_blocks).max(1);
+            let block = ((end - start) / STEAL_BLOCKS).max(1);
             cap.map_or(block, |cap| block.min(cap))
         } else {
             total_rows.max(1)
@@ -4591,7 +4564,7 @@ mod tests {
     use super::{
         ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack, Weight,
         first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu,
-        matvec_q_local, parse_steal, parse_steal_blocks,
+        matvec_q_local, parse_steal,
     };
     use gguf::{GgmlType, Gguf};
 
@@ -4685,32 +4658,20 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The steal levers read unset as their default and a usable value as
+    /// The steal lever reads unset as its default and a usable value as
     /// itself; anything else panics by name — never a quiet default.
     #[test]
     fn steal_levers_refuse_an_unusable_value_by_name() {
         assert!(parse_steal(None) && parse_steal(Some("1")) && !parse_steal(Some(" 0 ")));
-        assert_eq!(
-            [None, Some("4"), Some("16")].map(parse_steal_blocks),
-            [4, 4, 16]
-        );
         let refusal = |f: fn()| {
             let e = std::panic::catch_unwind(f).expect_err("an unusable lever value must panic");
             e.downcast_ref::<String>()
                 .cloned()
                 .unwrap_or_else(|| "a panic without a message".to_string())
         };
-        let cases: [(fn(), &str); 4] = [
+        let cases: [(fn(), &str); 2] = [
             (|| _ = parse_steal(Some("")), "BLOOMERY_STEAL=\"\""),
             (|| _ = parse_steal(Some("yes")), "BLOOMERY_STEAL=\"yes\""),
-            (
-                || _ = parse_steal_blocks(Some("0")),
-                "BLOOMERY_STEAL_BLOCKS=\"0\"",
-            ),
-            (
-                || _ = parse_steal_blocks(Some("four")),
-                "BLOOMERY_STEAL_BLOCKS=\"four\"",
-            ),
         ];
         for (f, lever) in cases {
             let e = refusal(f);

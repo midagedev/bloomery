@@ -793,8 +793,7 @@ fn enqueue_ffn_moe(
 /// The norm and the router write the boundary's handoff instead of the
 /// arena, and the handoff goes out right behind them, so the host experts
 /// start while the card runs its own experts and the shared expert; the
-/// wait sits just before the join (right after the go with the overlap
-/// lever off). The card's expert outputs are zeroed first, and the card's
+/// wait sits just before the join. The card's expert outputs are zeroed first, and the card's
 /// slot list (`card_sel`) writes a host slot — an id past the resident
 /// prefix — as [`crate::hybrid::HOST`], which the `_sel` kernels leave
 /// untouched without a fault, so the combine reads zero there and never an
@@ -841,9 +840,6 @@ fn enqueue_ffn_moe_hybrid(
     };
     moe_router(gpu, w, names, io, dims, hidden, i, obs)?;
     hybrid_go(gpu, b, names.layer, i, obs)?;
-    if !b.overlap {
-        hybrid_wait(gpu, b, i, obs)?;
-    }
     // With no expert on the card nothing writes `m.down` on a hybrid load: it
     // keeps the zeros it was allocated with, so every slot the combine reads
     // is zero without the memset.
@@ -883,9 +879,7 @@ fn enqueue_ffn_moe_hybrid(
         moe_shexp_quantize(gpu, m, dims, i, obs)?;
     }
     moe_shexp_down(gpu, w, names, m, hidden, i, obs)?;
-    if b.overlap {
-        hybrid_wait(gpu, b, i, obs)?;
-    }
+    hybrid_wait(gpu, b, i, obs)?;
     gpu.elem()
         .enqueue_add(stream, &m.shexp, &b.pages[0].hsum, hidden, &mut b.sum)?;
     // The shared expert's output, the host's sum through the mapping, the
