@@ -26,7 +26,9 @@
 //!   tier its host copy ([`SlotMap`]);
 //! - per layer that runs the indexer, its list: the compressed rows its
 //!   stream's layers attend this step, [`AttnChain::list_len`] entries;
-//! - the host tier ([`Hybrid`]): the join buffers and the host experts;
+//! - the host tier ([`Hybrid`]): the join buffers, the host experts, the
+//!   slot map's host copy, the load's host set and the prompt batch's host
+//!   copies;
 //! - the three chain pieces ([`crate::chain`]) with their scratch.
 //!
 //! One step ([`ChainBody::enqueue_chain`]), in the order the dump's nodes
@@ -71,7 +73,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, Refusal, SlotMap};
+use bloomery_gpu::hybrid::{
+    Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, Refusal, SlotMap,
+};
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
@@ -861,7 +865,7 @@ impl Body {
     /// The slot map's host copy, which the host tier serves by.
     #[must_use]
     pub fn slot_map(&self) -> &SlotMap {
-        self.hybrid.boundary().slots()
+        self.hybrid.slots()
     }
 
     /// The host tier: the boundary and what it has served.
@@ -1971,7 +1975,7 @@ impl Body {
             card,
             meta.levers.host,
             Body::derive,
-            |gpu, file, _| Body::load_placed(gpu, file, plan, card, meta),
+            |gpu, file, _, residency| Body::load_placed(gpu, file, plan, card, meta, residency),
         )
     }
 
@@ -1991,13 +1995,15 @@ impl Body {
     /// The body of card `card`: its buffers sized from `meta`'s hparams — the
     /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
     /// slot map from the plan's routed segments on the card, the host tier
-    /// over the file, and the three pieces, under `meta`'s levers.
+    /// over the file holding `residency`, the load's host set, and the three
+    /// pieces, under `meta`'s levers.
     fn load_placed(
         gpu: &Gpu,
         file: Split,
         plan: &Plan<'_>,
         card: usize,
         meta: &BodyMeta,
+        residency: HostResidency,
     ) -> Result<Body, GpuError> {
         const WHAT: &str = "deepseek41 Body::load_placed";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
@@ -2076,13 +2082,13 @@ impl Body {
                 hidden: hp.n_embd,
                 n_used: hp.experts.n_used,
             },
-            map,
             PAIR_ROWS,
         )?;
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
-        let mut hybrid = Hybrid::new(boundary, host, layers.len())?;
+        let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
+        hybrid.keep_residency(residency);
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
         let ced = ced::Ced::new(&hp.layers, ring_rows, cfg.ced);
@@ -2269,6 +2275,12 @@ impl HostServed for Body {
     /// ([`Hybrid::take_step_refusal`]).
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.take_step_refusal()
+    }
+
+    /// The host set the placed load read in and locked, which the host tier
+    /// holds ([`Hybrid::residency`]).
+    fn host_residency(&self) -> Option<&HostResidency> {
+        self.hybrid.residency()
     }
 }
 
