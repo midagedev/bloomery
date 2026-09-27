@@ -12,6 +12,10 @@ generate_ds41   add                                     0          0
 generate_ds41   argmax_fault                            0          0
 generate_ds41   argmax_finite_fault                     0          0
 generate_ds41   argmax_rows_fault                       0          0
+generate_ds41   cand_block_max                          0          0
+generate_ds41   cand_compact                            0          0
+generate_ds41   cand_remap                              0          0
+generate_ds41   cand_select                             0          0
 generate_ds41   card_sel                                0          0
 generate_ds41   dflash_expert_down                      0          0
 generate_ds41   dflash_expert_gate_up                   0          0
@@ -209,6 +213,10 @@ gate_e2e        add                                     0          0
 gate_e2e        argmax_fault                            0          0
 gate_e2e        argmax_finite_fault                     0          0
 gate_e2e        argmax_rows_fault                       0          0
+gate_e2e        cand_block_max                          0          0
+gate_e2e        cand_compact                            0          0
+gate_e2e        cand_remap                              0          0
+gate_e2e        cand_select                             0          0
 gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
 gate_e2e        ds41_ffn_handoff                        0          0

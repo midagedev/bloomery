@@ -29,6 +29,7 @@ use cuda_host::cuda_module;
 use std::sync::Arc;
 
 pub mod arch;
+pub mod cand;
 pub mod checkpoint;
 pub mod cores;
 pub mod elem;
