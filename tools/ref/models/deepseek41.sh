@@ -147,6 +147,31 @@
 #   LCPP_NCMOE_SWEEP  the --n-cpu-moe values the sweep arms `lcpp<K>:<D>` take (depth-ds41.sh):
 #                   LCPP_NCMOE and the two above it, on either card; below it the file does not load
 #                   (above). An arm whose value does not load is a FAIL row there, and the runner goes on
+#   TWO_CARD_PLACEMENT, LCPP_TS  the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, tools/ref/timing-card.sh;
+#                   V41_PUBLIC only, empty otherwise, and depth-ds41.sh then refuses the mode by name): the
+#                   "A6000+3090" table's mainline line, LCPP_NCMOE 30 and -ts LCPP_TS (36.5/4.5) in
+#                   LCPP_GPU_FLAGS; TWO_CARD_PLACEMENT says what they place. llama-bench's -sm layer (its
+#                   default) gives device d the layers il whose il / 41 is below the d-th cumulative -ts
+#                   fraction — 40 layers and the output as a 41st slot, upper_bound on the normalized split
+#                   (src/llama-model.cpp:1521-1546 at 53ed051ce; the V4.1 branch 5210c7c5e has the same code)
+#                   — the A6000 device 0 (first in CUDA_VISIBLE_DEVICES) and the 3090 device 1. --n-cpu-moe K
+#                   keeps layers 0..K-1's experts on the host, so the card-expert layers are the last 40 - K
+#                   and the 3090 takes the last of them and the output. The 3090 holds at most 3 expert
+#                   layers (4 × 6,440,878,080 B = 24,570 MiB, more than its usable 24,176), the A6000 at most
+#                   7 (8 of them are the whole card): K = 30, the A6000 layers 0-36 (30-36 with experts),
+#                   the 3090 layers 37-39 and the output. 36.5/4.5 puts the boundary at 0.890, between slot
+#                   36 (0.878) and slot 37 (0.902); 37/4 would put it on slot 37's own value, an equal float
+#                   under upper_bound. Each card holds at most its one-card load's bytes: the A6000 7 expert
+#                   layers and at most all 3,429 MiB of card dense (46,427 MiB at 33, a load that ran, 2,713
+#                   left), the 3090 3 and at most all the dense and the head (21,857 MiB, 2,319 left of its
+#                   usable memory: the 37 arithmetic above, never loaded); each card now has a compute
+#                   buffer of its own, for its layers [derived; no two-card load has been run]. Host share
+#                   of routed work 30/40 = 0.75. The fit arms drop both and let llama-bench's fit place over
+#                   the two cards (common/fit.cpp sets tensor_split per device). ik has no two-card line:
+#                   its -ts is a byte split over its own layer sizes (get_layer_sizes, src/llama.cpp:4575-4640
+#                   at db517b69), not a slot split, and whether those count a host-overridden expert is
+#                   unread; the public reference is llama.cpp. LCPP_CLI_FLAGS stays unset in the mode (its
+#                   reader, ik-draft.sh, has no two-card mode)
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
@@ -173,8 +198,15 @@ __v41_dir=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/cards.sh
 source "$__v41_dir/../cards.sh"
 unset __v41_dir
+TWO_CARD_PLACEMENT=
 if [ "$MODEL" = "$V41_PUBLIC" ]; then
-  if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
+  if [ "${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ]; then
+    # ik has no two-card arm; its one-card count keeps IK_GPU_FLAGS defined for the runner's lines.
+    : "${IK_NCMOE:=33}"
+    : "${LCPP_NCMOE:=30}"
+    : "${LCPP_TS:=36.5/4.5}"
+    TWO_CARD_PLACEMENT="lcpp --n-cpu-moe $LCPP_NCMOE -ts $LCPP_TS: the A6000 (device 0) layers 0-36, 30-36 with their experts; the 3090 (device 1) layers 37-39 with their experts and the output [derived, models/deepseek41.sh]"
+  elif [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
     : "${IK_NCMOE:=37}"
     : "${LCPP_NCMOE:=37}"
   else
@@ -186,8 +218,8 @@ if [ -n "${IK_NCMOE:-}" ]; then
   : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe $IK_NCMOE -t 32 --defer-experts}"
 fi
 if [ -n "${LCPP_NCMOE:-}" ]; then
-  : "${LCPP_GPU_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 -nopo 1}"
-  : "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off}"
+  : "${LCPP_GPU_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 -nopo 1${LCPP_TS:+ -ts $LCPP_TS}}"
+  [ -n "$TWO_CARD_PLACEMENT" ] || : "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off}"
   : "${LCPP_NCMOE_SWEEP:=$LCPP_NCMOE $((LCPP_NCMOE + 1)) $((LCPP_NCMOE + 2))}"
 fi
 : "${REF_CTX:=512}"
