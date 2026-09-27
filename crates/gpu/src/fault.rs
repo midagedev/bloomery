@@ -106,10 +106,14 @@ pub enum FaultSite {
     /// non-finite input, a norm whose mean square or variance is not
     /// finite, or a value past f16's range.
     CacheValue = 16,
+    /// A token-pool selector (`qsa`) met a pooled key or a head's score
+    /// that is not finite, or its selected flash a list entry at or past
+    /// the cache.
+    PoolSelect = 18,
 }
 
 // A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::CacheValue as u32) < 32);
+const _: () = assert!((FaultSite::PoolSelect as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -130,6 +134,7 @@ impl FaultSite {
         FaultSite::LinearGate,
         FaultSite::DeltaLane,
         FaultSite::CacheValue,
+        FaultSite::PoolSelect,
     ];
 
     /// The site's name as an error prints it.
@@ -152,6 +157,7 @@ impl FaultSite {
             FaultSite::LinearGate => "linear_gate",
             FaultSite::DeltaLane => "delta_lane",
             FaultSite::CacheValue => "cache_value",
+            FaultSite::PoolSelect => "pool_select",
         }
     }
 
@@ -185,6 +191,9 @@ impl FaultSite {
                 "a cache row value not finite: a non-finite input, a non-finite mean square or \
                  variance, or a value past f16's range"
             }
+            FaultSite::PoolSelect => {
+                "a pooled key or a selector score not finite, or a selected token past the cache"
+            }
         }
     }
 }
@@ -201,7 +210,8 @@ pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
         AttnCount, AttnSel, CachePos, CacheValue, DeltaLane, ExpertId, HcQuant, KeyCount,
-        LinearConv, LinearDelta, LinearGate, NormQuant, Q5Quant, QuantColumn, Router, TokenId,
+        LinearConv, LinearDelta, LinearGate, NormQuant, PoolSelect, Q5Quant, QuantColumn, Router,
+        TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -226,6 +236,7 @@ pub mod step_order {
         LinearGate,
         DeltaLane,
         CacheValue,
+        PoolSelect,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -248,6 +259,7 @@ pub mod step_order {
         LinearGate,
         DeltaLane,
         CacheValue,
+        PoolSelect,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -271,6 +283,7 @@ pub mod step_order {
         LinearGate,
         DeltaLane,
         CacheValue,
+        PoolSelect,
     ];
 
     /// Qwen3.6-35B-A3B (`arch::qwen3moe`'s second body): the two layer
@@ -296,6 +309,7 @@ pub mod step_order {
         AttnSel,
         Q5Quant,
         HcQuant,
+        PoolSelect,
         CacheValue,
     ];
 

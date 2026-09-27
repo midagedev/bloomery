@@ -76,6 +76,7 @@ gpu = [
     "dep:cuda-host",
     "dep:bloomery-tokenizer",
     "dep:bloomery-app",
+    "dep:bloomery-runtime",
 ]
 deepseek41 = [
     "gpu",
