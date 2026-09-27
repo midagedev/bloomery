@@ -1051,7 +1051,11 @@ mod gate {
     /// state (ik's `[k][v]` per head, transposed into ours) and conv ring
     /// (ik's `[C][3]` window of the three positions before `p`, into slots
     /// `(p − 3 + j) mod RING_ROWS`), or an attention layer's K and V rows
-    /// `0..p` (ik's rows of 512, or its transposed V, by the row's `ne`).
+    /// `0..p`. ik lays a plane out as rows of 512 in three shapes: `[512,
+    /// cells]`, K's `[256, 2·cells]` (a cell's two heads adjacent) and, with
+    /// flash attention, V's flat `[512·cells]`; without flash attention V is
+    /// transposed, `[cells, 512]`. A flat plane from a set with no
+    /// `FLASH_ATTN_EXT` at the layer is refused by name.
     fn prefill_store(
         man: &RefManifest,
         kind: LayerKind35,
@@ -1088,26 +1092,32 @@ mod gate {
                 Ok(StoreHost::Rec { state, ring })
             }
             LayerKind35::Attention => {
+                let flash = man
+                    .tensor(&format!("fa-{l}"), 0)
+                    .is_ok_and(|t| t.op == "FLASH_ATTN_EXT");
                 let plane = |name: String| -> Result<Vec<u16>, GateError> {
                     let row = man.input(&name, 0)?;
                     let bits = widened_f16_rows_in(&man.dir, row)?;
                     let (ne0, ne1) = (row.ne[0] as usize, row.ne[1] as usize);
+                    let flat = ne1 == 1 && ne0.is_multiple_of(KV_ROW);
+                    let rows = (ne0 == KV_ROW && ne1 >= p)
+                        || (ne0 == HEAD && ne1.is_multiple_of(N_KV) && ne1 / N_KV >= p)
+                        || (flat && flash && ne0 / KV_ROW >= p);
+                    let transposed = ne1 == KV_ROW && ne0 >= p;
+                    if !rows && !transposed {
+                        return Err(format!(
+                            "{name} is {:?} (flash attention at the layer: {flash}), \
+                             not rows of {KV_ROW} holding {p} positions",
+                            row.ne
+                        )
+                        .into());
+                    }
                     let mut out = vec![0u16; N_KV * CTX * HEAD];
                     for r in 0..p {
                         for h in 0..N_KV {
                             for d in 0..HEAD {
                                 let c = h * HEAD + d;
-                                let src = if ne0 == KV_ROW {
-                                    r * KV_ROW + c
-                                } else if ne1 == KV_ROW {
-                                    c * ne0 + r
-                                } else {
-                                    return Err(format!(
-                                        "{name} is {:?}, not rows of {KV_ROW}",
-                                        row.ne
-                                    )
-                                    .into());
-                                };
+                                let src = if rows { r * KV_ROW + c } else { c * ne0 + r };
                                 out[(h * CTX + r) * HEAD + d] = bits[src];
                             }
                         }
