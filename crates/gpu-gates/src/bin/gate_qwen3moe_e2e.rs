@@ -14,6 +14,16 @@
 //!   a host node; the captured prefill pass holds [`NODES_PASS_1`] nodes at
 //!   one token and [`NODES_PASS_M`] at every count from two to `MAX_TOKENS`,
 //!   all of them kernels.
+//! - (k) the clear: right after (s), before any token has run, three arms
+//!   through the session (`app::Session::arms`), each after the first from
+//!   `Session::clear` — a GEMM ubatch arm (the prose's first [`CLEAR_A`] ids
+//!   and greedy steps), a pass arm (ids after those, at most `MAX_TOKENS`,
+//!   and steps), and the GEMM arm again. The first arm stands in for a fresh
+//!   process, so the third must equal it in every field that is not a time:
+//!   the position it starts at, the plan, the tokens, the last logits and
+//!   every layer's K/V rows below its end (FNV-1a 64 each), and the ubatch
+//!   image it wrote. Each arm's plan is refused by name unless it takes the
+//!   path the clause names. (s) has read its node counts before it.
 //! - (f) teacher-forced, per layer: each layer run alone on ik's own input
 //!   row (`inp_embd` for layer 0, `l_out-(L−1)` after) at each of the
 //!   oracle's five positions. The attention half against ik's `attn_out-L`
@@ -126,9 +136,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::PrefillPath;
+    use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
+    use bloomery_gpu::arch::qwen3moe::{Body, PrefillPath};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
@@ -140,9 +151,9 @@ mod gate {
         GreedyClass, GreedyRow, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir, ik_q8_2,
-        open_split, q8_1_dequant, ref_ints, ref_tensor_logical_in, topk_ids_logical_within,
-        verdict,
+        Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
+        ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_tensor_logical_in,
+        topk_ids_logical_within, verdict,
     };
     use cuda_core::sys;
     use model::arch::Arch;
@@ -378,20 +389,132 @@ mod gate {
         }
         let mut ok = true;
         ok &= structure(&mut m)?;
+        let mut s = Session::from_model(m, u32::try_from(CTX)?);
+        ok &= clear(&mut s)?;
+        let m = s.model_mut();
         let o = oracle::for_arch(Arch::Qwen3moe)?;
         let man = o.open(Set::Cpu)?;
-        ok &= forced(&mut m, &man)?;
-        ok &= free(&mut m, &man)?;
-        ok &= greedy(&mut m, dump.as_deref())?;
-        ok &= rope_table(&mut m, CTX)?;
-        ok &= fault_layer(&mut m)?;
-        drop(m);
+        ok &= forced(m, &man)?;
+        ok &= free(m, &man)?;
+        ok &= greedy(m, dump.as_deref())?;
+        ok &= rope_table(m, CTX)?;
+        ok &= fault_layer(m)?;
+        drop(s);
         ok &= ubatch_sizes()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------- (k) the clear
+
+    /// The clear clause's arms, as (first id, ids, steps) of the prose: A one
+    /// GEMM ubatch, B one pass after A's ids.
+    const CLEAR_A: (usize, usize, usize) = (0, 600, 4);
+    const CLEAR_B: (usize, usize, usize) = (600, 5, 4);
+
+    /// What one arm of (k) leaves: every field but its time.
+    struct ArmOut {
+        /// The position the arm starts at: 0 after a clear.
+        pos0: u32,
+        /// The prefill's plan, as its units print.
+        plan: String,
+        /// The prefill's argmax, then each step's.
+        tokens: Vec<u32>,
+        /// FNV-1a 64 of the last logits' bits, and of every layer's K/V rows
+        /// below the arm's end.
+        logits: u64,
+        kv: u64,
+        /// The last ubatch image written: its tokens and bytes.
+        image: Option<(usize, usize)>,
+    }
+
+    /// (k) (module doc).
+    fn clear(s: &mut Session<Body>) -> Result<bool, GateError> {
+        let (a, b) = (CLEAR_A, CLEAR_B);
+        let prose = prose((a.0 + a.1).max(b.0 + b.1))?;
+        let arms = [a, b, a];
+        let want = ["gemm", "prefill", "gemm"];
+        for (arm, kind) in arms.iter().zip(want) {
+            let plan = s.model().prefill_plan(arm.1, PrefillPath::Auto)?;
+            if plan.kind() != kind {
+                return Err(format!(
+                    "(k): {} ids plan {plan} ({}); the clause wants the {kind} path",
+                    arm.1,
+                    plan.kind()
+                )
+                .into());
+            }
+        }
+        let t = Instant::now();
+        let mut outs: Vec<ArmOut> = Vec::with_capacity(arms.len());
+        s.arms(&arms, |s, i, &(first, n, steps)| {
+            let t = Instant::now();
+            let m = s.model_mut();
+            let pos0 = m.pos();
+            let plan = m.prefill_plan(n, PrefillPath::Auto)?.to_string();
+            let mut tokens = vec![m.prefill_with(&prose[first..first + n], PrefillPath::Auto)?];
+            for _ in 0..steps {
+                let last = *tokens.last().ok_or("no token")?;
+                tokens.push(m.step(&[last])?);
+            }
+            let logits = Fnv1a64::default().f32s(&m.logits()?).value();
+            let end = usize::try_from(m.pos())?;
+            let kv = m
+                .kv_rows(end)?
+                .iter()
+                .flatten()
+                .fold(Fnv1a64::default(), |h, v| h.bytes(&v.to_le_bytes()))
+                .value();
+            let image = m.ubatch_prologue()?.last.map(|w| (w.tokens, w.bytes));
+            println!(
+                "clear arm {i} of {}: prose ids {first}..{} ({plan}) + {steps} steps from \
+                 position {pos0}: tokens {tokens:?} logits fnv64 {logits:016x} kv fnv64 \
+                 {kv:016x} image {image:?} | {:.2} s (runtime value)",
+                arms.len(),
+                first + n,
+                t.elapsed().as_secs_f64()
+            );
+            outs.push(ArmOut {
+                pos0,
+                plan,
+                tokens,
+                logits,
+                kv,
+                image,
+            });
+            Ok::<(), GateError>(())
+        })
+        .map_err(|f| Box::new(f) as GateError)?;
+        let [first, _, again] = outs.as_slice() else {
+            return Err(format!("(k): {} arms of 3 ran", outs.len()).into());
+        };
+        let off: Vec<&str> = [
+            ("pos0", again.pos0 == first.pos0),
+            ("plan", again.plan == first.plan),
+            ("tokens", again.tokens == first.tokens),
+            ("logits", again.logits == first.logits),
+            ("kv", again.kv == first.kv),
+            ("image", again.image == first.image),
+        ]
+        .into_iter()
+        .filter_map(|(name, same)| (!same).then_some(name))
+        .collect();
+        let ok = off.is_empty();
+        println!(
+            "clear: arm 2 (the GEMM arm after the pass arm and the clear) against arm 0 (the \
+             GEMM arm right after the load): {}; {:.2} s (runtime value) {}",
+            if ok {
+                "every field but the time equal".to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            t.elapsed().as_secs_f64(),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     // ------------------------------------------------- (x) a fault's layer
