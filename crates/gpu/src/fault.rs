@@ -88,10 +88,20 @@ pub enum FaultSite {
     KeyCount = 10,
     /// A cache append was handed a position at or past the cache's rows.
     CachePos = 11,
+    /// A linear-attention conv and prep (`linear::conv`) met a non-finite
+    /// input, or a conv sum, a query/key norm, β or decay not finite.
+    LinearConv = 12,
+    /// A linear-attention delta step (`linear::delta`) produced a
+    /// non-finite output: a non-finite input, or a state that stopped being
+    /// finite.
+    LinearDelta = 13,
+    /// A linear-attention gated norm (`linear::norm_gate`) met a non-finite
+    /// input or a mean square that is not finite.
+    LinearGate = 14,
 }
 
 // A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::CachePos as u32) < 32);
+const _: () = assert!((FaultSite::LinearGate as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -107,6 +117,9 @@ impl FaultSite {
         FaultSite::TokenId,
         FaultSite::KeyCount,
         FaultSite::CachePos,
+        FaultSite::LinearConv,
+        FaultSite::LinearDelta,
+        FaultSite::LinearGate,
     ];
 
     /// The site's name as an error prints it.
@@ -124,6 +137,9 @@ impl FaultSite {
             FaultSite::TokenId => "token_id",
             FaultSite::KeyCount => "key_count",
             FaultSite::CachePos => "cache_pos",
+            FaultSite::LinearConv => "linear_conv",
+            FaultSite::LinearDelta => "linear_delta",
+            FaultSite::LinearGate => "linear_gate",
         }
     }
 
@@ -144,6 +160,13 @@ impl FaultSite {
             FaultSite::TokenId => "a token id past the table's rows",
             FaultSite::KeyCount => "a flash row's live key count of zero or past the cache",
             FaultSite::CachePos => "a cache append position at or past the cache's rows",
+            FaultSite::LinearConv => {
+                "a non-finite conv input, or a conv sum, query/key norm, beta or decay not finite"
+            }
+            FaultSite::LinearDelta => {
+                "a non-finite delta-step output: a non-finite input or a state no longer finite"
+            }
+            FaultSite::LinearGate => "a non-finite gated-norm input or mean square",
         }
     }
 }
@@ -159,8 +182,8 @@ impl FaultSite {
 pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
-        AttnCount, AttnSel, CachePos, ExpertId, HcQuant, KeyCount, NormQuant, Q5Quant, QuantColumn,
-        Router, TokenId,
+        AttnCount, AttnSel, CachePos, ExpertId, HcQuant, KeyCount, LinearConv, LinearDelta,
+        LinearGate, NormQuant, Q5Quant, QuantColumn, Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -180,6 +203,9 @@ pub mod step_order {
         AttnSel,
         KeyCount,
         HcQuant,
+        LinearConv,
+        LinearDelta,
+        LinearGate,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -197,6 +223,9 @@ pub mod step_order {
         KeyCount,
         Q5Quant,
         CachePos,
+        LinearConv,
+        LinearDelta,
+        LinearGate,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
     /// layer's entry, the cache append's position, the flash's key count,
@@ -215,6 +244,9 @@ pub mod step_order {
         AttnSel,
         Q5Quant,
         HcQuant,
+        LinearConv,
+        LinearDelta,
+        LinearGate,
     ];
 
     /// The order of `arch`'s step.
