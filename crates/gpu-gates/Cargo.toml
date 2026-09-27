@@ -35,6 +35,11 @@ bloomery-gpu = { path = "../gpu", optional = true }
 # compiler failure in V4.1 device code then breaks those gates' builds and no other.
 bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
 cuda-core = { workspace = true, optional = true }
+# A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
+# device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
+# `::cuda_device` paths.
+cuda-device = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }
 # The V4.1 decode CLI (`generate_ds41`) owns its main thread: it pins it to the dispatcher's cpu
 # slot as bloomery-decode does, and reads its own fault counts (`getrusage`) under
 # `BLOOMERY_STEP_STATS`. Reached only through the `deepseek41` feature.
@@ -61,7 +66,13 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
-gpu = ["dep:bloomery-gpu", "dep:cuda-core", "dep:bloomery-tokenizer"]
+gpu = [
+    "dep:bloomery-gpu",
+    "dep:cuda-core",
+    "dep:cuda-device",
+    "dep:cuda-host",
+    "dep:bloomery-tokenizer",
+]
 deepseek41 = [
     "gpu",
     "dep:bloomery-gpu-deepseek41",
@@ -216,6 +227,10 @@ required-features = ["gpu"]
 
 [[bin]]
 name = "gate_iq"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_kquant"
 required-features = ["gpu"]
 
 [[bin]]

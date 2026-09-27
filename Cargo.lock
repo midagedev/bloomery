@@ -147,6 +147,8 @@ dependencies = [
  "bloomery-tokenizer",
  "bloomery-vision",
  "cuda-core",
+ "cuda-device",
+ "cuda-host",
  "libc",
  "memmap2",
  "oxide-artifacts",

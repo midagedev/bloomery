@@ -93,6 +93,11 @@ gate-gpu-p9:
 gate-gpu-q4k-sel:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && bash tools/gpu-gate.sh gate_q4k_sel'
 
+# 모델 없는 K-quant expert 계열(bloomery_gpu::kquant): Q5_K `_sel` down과 gate·up(act 런타임 인자)을 합성 스택에서
+# f64 참조의 밴드, 슬롯·m열·폴트·act 절로 보고, 같은 워크의 Q4_K 형제가 q4k_gemv_sel과 비트 동일한지 본다. 모델 파일 없음.
+gate-gpu-kquant:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
+
 # IQ2_XS·IQ3_XXS·IQ4_XS·Q2_K 행 코어(bloomery_gpu::iq): ref-synth 합성 행(gate-1-1이 덤프)을 q8_1 8열과 곱해 호스트 규칙과
 # 비트 동일한지, ggml 디퀀트 × f32 기준 대비 유도 한계와 핀 안인지 본다. K = 4096과 꼬리가 남는 K = 2304 두 형상.
 gate-gpu-iq:
