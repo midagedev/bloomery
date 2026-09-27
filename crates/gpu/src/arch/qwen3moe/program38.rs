@@ -1,9 +1,12 @@
 //! Qwen3.8's layer program: [`runtime::sched::walk`] over one unit of `m`
 //! columns — the decode step `(1, 1, Step)` through the host tier's step port
-//! ([`Step38`], captured), an eager pass `(1, m <= 8, Batch)` through its
-//! batch port ([`Pass38`]). Both walks share every card launch
-//! ([`Parts38`]); they differ only in how a layer's routed experts reach the
-//! host and come back.
+//! ([`Step38`], captured), a verify `(1, 2 <= m <= 4, Step)` through the same
+//! port's `Cols(m)` chain ([`Verify38`], captured), an eager pass `(1, m <=
+//! 8, Batch)` through its batch port ([`Pass38`]). The walks share every
+//! card launch ([`Parts38`]); they differ in how a layer's routed experts
+//! reach the host and come back, and a verify keeps each row's delta state
+//! in a lane of its own where the step and the pass write the last row's
+//! back into the committed lane.
 //!
 //! A layer's parts, by its plan ([`Layer38`]), never its number:
 //! - the front: the embedding in front of layer 0; the attention site's mix
@@ -41,7 +44,7 @@ use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
 use crate::linear::conv::ConvArgs;
-use crate::linear::delta::DeltaArgs;
+use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
@@ -85,14 +88,34 @@ pub(super) const STEP_MEMOPS: usize = 2;
 /// The head: its mix, the projection and the argmax.
 pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
 
+/// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: β
+/// and α copied token-major out of the joined projection.
+pub(super) const GDN_ROWS_LAUNCHES: usize = 2;
+/// A selecting layer's launches past [`QSA_LAUNCHES`] at more than one row:
+/// the indexer queries copied token-major.
+pub(super) const QSA_ROWS_LAUNCHES: usize = 1;
+
 /// The captured decode step's launches for `plans` (module doc).
 pub(super) fn step_launches(plans: &[Layer38]) -> usize {
+    walk_launches(plans, 1)
+}
+
+/// The captured verify's launches for `plans` at `m >= 2` rows: the step's,
+/// plus each mixer's token-major copies ([`GDN_ROWS_LAUNCHES`],
+/// [`QSA_ROWS_LAUNCHES`]); the handoff, the go, the wait and the head are
+/// one each whatever `m`.
+pub(super) fn verify_launches(plans: &[Layer38], m: usize) -> usize {
+    walk_launches(plans, m)
+}
+
+fn walk_launches(plans: &[Layer38], m: usize) -> usize {
+    let rows = m > 1;
     1 + plans
         .iter()
         .map(|p| {
             let mixer = match p.mixer {
-                Mixer38::Gdn(_) => GDN_LAUNCHES,
-                Mixer38::Qsa(_) => QSA_LAUNCHES,
+                Mixer38::Gdn(_) => GDN_LAUNCHES + usize::from(rows) * GDN_ROWS_LAUNCHES,
+                Mixer38::Qsa(_) => QSA_LAUNCHES + usize::from(rows) * QSA_ROWS_LAUNCHES,
             };
             MIX_LAUNCHES + mixer + FFN_LAUNCHES + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
         })
@@ -261,6 +284,10 @@ pub(super) struct Parts38<'a> {
     pub(super) cur: usize,
     pub(super) taps: Option<&'a mut Taps38>,
     pub(super) slots: &'a DeviceTensor<u32>,
+    /// A verify's row mode: each row's delta state into a lane of its own
+    /// (`linear::delta`'s `gdn_delta_lanes`); else the last row's back into
+    /// the committed lane.
+    pub(super) each: bool,
 }
 
 /// Layer `l`'s plan.
@@ -400,12 +427,12 @@ impl Parts38<'_> {
             .get_mut(l)
             .ok_or(GpuError::state(WHAT, "a store for every layer"))?;
         match (&p.mixer, store) {
-            (Mixer38::Gdn(g), Store38::Rec(r)) => {
+            (Mixer38::Gdn(g), Store38::Rec { rec, stamp }) => {
                 let lane = self.io.lane.ok_or(GpuError::state(
                     WHAT,
                     "the record's lane word (a chain with delta layers carries one)",
                 ))?;
-                gdn(c, g, (r, lane), s, m, sink)
+                gdn(c, g, (rec, stamp, lane), s, (m, self.each), sink)
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, raw, pooled }) => {
                 qsa(c, q, (kv, raw, pooled), s, m, sink)
@@ -530,14 +557,19 @@ impl Parts38<'_> {
     }
 }
 
-/// A delta layer's mixer at `m` rows over its store `r` and lane word, the
-/// attention site's mix in `s.mixed`, its output projection into `s.y`.
+/// A delta layer's mixer at `m` rows over its store `r`, its lanes' stamps
+/// and the lane word, in row mode when `each`, the attention site's mix in
+/// `s.mixed`, its output projection into `s.y`.
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
-    (r, lane): (&mut super::scratch::RecStore, &DeviceBuffer<u32>),
+    (r, stamp, lane): (
+        &mut super::scratch::RecStore,
+        &mut DeviceBuffer<u32>,
+        &DeviceBuffer<u32>,
+    ),
     s: &mut Arena38,
-    m: usize,
+    (m, each): (usize, bool),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let (w, stream) = (c.w, c.gpu.stream());
@@ -586,20 +618,25 @@ fn gdn(
             ring: &mut r.ring,
         },
     )?;
-    lin.delta.enqueue_delta(
+    lin.delta.enqueue_delta_lanes(
         stream,
-        DeltaArgs {
-            qkv: &g.conv,
-            beta: &g.beta,
-            decay: &g.decay,
-            lane,
-            lane_at: 0,
-            lanes: r.lanes,
-            shape: GDN,
-            m,
-            fault: sink,
-            o: &mut g.o,
-            state: &mut r.state,
+        DeltaLanesArgs {
+            delta: DeltaArgs {
+                qkv: &g.conv,
+                beta: &g.beta,
+                decay: &g.decay,
+                lane,
+                lane_at: 0,
+                lanes: r.lanes,
+                shape: GDN,
+                m,
+                fault: sink,
+                o: &mut g.o,
+                state: &mut r.state,
+            },
+            each,
+            pos: &*pos,
+            stamp,
         },
     )?;
     lin.norm_gate.enqueue_norm_gate_sigmoid(
@@ -824,6 +861,107 @@ impl<'a> LayerProgram for Step38<'a> {
     }
 
     /// The head's mix into its input, then the head.
+    fn end(&mut self, _unit: usize) -> Result<(), GpuError> {
+        self.p.head_mix(Some(self.head.input_mut()))?;
+        self.head.enqueue(self.p.c.gpu, self.p.c.w)
+    }
+}
+
+/// The captured verify's walk `(1, m, Step)` over `m` consecutive
+/// positions: every layer through the step port's `Cols(m)` chain — one
+/// handoff launch writing the `m` columns' image, one go, one union call on
+/// the host, one wait — each delta row's state into a lane of its own, then
+/// the head's mix over the `m` columns into `head`, a head of `m` rows (one
+/// projection and one argmax for every row). Each row is bit for bit its
+/// step.
+pub(super) struct Verify38<'a> {
+    pub(super) p: Parts38<'a>,
+    pub(super) head: &'a mut Head,
+}
+
+impl<'a> Verify38<'a> {
+    /// Walk every layer at the unit's `m` columns through `leg`, then the
+    /// head. A head of other rows than the walk's, or a walk not in row
+    /// mode, is refused by name before any launch.
+    pub(super) fn walk(mut self, leg: &mut StepLeg<'a, HostRun>) -> Result<(), GpuError> {
+        let m = self.p.m;
+        if self.head.m() != m || !self.p.each {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a verify of {m} rows (row mode {}) into a head of {} rows",
+                    self.p.each,
+                    self.head.m()
+                ),
+            ));
+        }
+        let o = Overlap {
+            units: 1,
+            cols: m,
+            port: PortKind::Step,
+        };
+        let layers = self.p.plans.len();
+        sched::walk(o, layers, leg, &mut self)
+    }
+}
+
+impl<'a> LayerProgram for Verify38<'a> {
+    type Port = StepLeg<'a, HostRun>;
+
+    /// The layer up to its router over the `m` columns, the mix into the
+    /// boundary's activations, then the `m` columns' handoff into the page
+    /// in one launch and the go.
+    fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        self.p.front(l)?;
+        let hy = port.hybrid();
+        self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;
+        self.p.route(l, Some(hy.boundary().normed()))?;
+        let sink = self.p.c.gpu.layer_sink(l)?;
+        let stream = self.p.c.gpu.stream();
+        let m = self.p.m;
+        let s = &mut *self.p.s;
+        let h = Handoff {
+            ids: &s.route.ids,
+            weights: &s.route.weights,
+            map: self.p.slots.buf(),
+            row_off: l * geo::EXPERTS,
+            n_expert: geo::EXPERTS,
+        };
+        let target = hy.boundary_mut().handoff_target_of(0)?;
+        self.p.c.k.handoff.enqueue_handoff_cols(
+            stream,
+            &h,
+            geo::N_USED + 1,
+            m,
+            target,
+            sink,
+            &mut s.sel,
+        )?;
+        hy.boundary().enqueue_go_of(stream, l, 0)
+    }
+
+    /// The shared expert over the boundary's activations.
+    fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        self.p
+            .shared(at.layer, Some(port.hybrid().boundary().normed()))
+    }
+
+    /// The wait, the gated sum over the `m` columns' host sums, and the host
+    /// tier told the layer is enqueued (an eager verify is served there).
+    fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        let stream = self.p.c.gpu.stream();
+        {
+            let b = port.hybrid().boundary();
+            b.enqueue_back_of(stream, 0)?;
+            self.p.shared_add(l, b.hsum_of(0)?)?;
+        }
+        port.hybrid().row_enqueued(l, 0)
+    }
+
+    /// The head's mix over the `m` columns into the head's input, then the
+    /// head.
     fn end(&mut self, _unit: usize) -> Result<(), GpuError> {
         self.p.head_mix(Some(self.head.input_mut()))?;
         self.head.enqueue(self.p.c.gpu, self.p.c.w)

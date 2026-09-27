@@ -15,7 +15,8 @@ use crate::graph::{
 };
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
-use model::Tensor2;
+use model::ops::DEFER_MAX_COLS;
+use model::{Tensor2, Tensor2View};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -212,8 +213,23 @@ impl Boundary {
         shape: BoundaryShape,
         rows: usize,
     ) -> Result<Boundary, GpuError> {
+        Boundary::with_cols(ctx, stream, shape, rows, 1)
+    }
+
+    /// [`Boundary::with_rows`] with `cols` columns a row
+    /// (1..=`DEFER_MAX_COLS`): a row's image carries up to `cols` columns'
+    /// routing and activations, its sum `cols` columns, and the activation
+    /// window the norm writes is `cols · hidden` wide. A one-column chain
+    /// uses column 0 of it. Load-time only.
+    pub fn with_cols(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        shape: BoundaryShape,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
-        let layout = PageLayout::new(rows, 1, shape.hidden, shape.n_used)
+        let layout = PageLayout::new(rows, cols, shape.hidden, shape.n_used)
             .map_err(|e| GpuError::shape(what, e.to_string()))?;
         let bytes = layout
             .bytes()
@@ -231,9 +247,9 @@ impl Boundary {
         let ids = unsafe { window::<u32>(base + 4 * h.ids as u64, h.n_used, ctx) };
         // SAFETY: as above, for the weights' n_used words at `h.weights`.
         let weights = unsafe { window::<f32>(base + 4 * h.weights as u64, h.n_used, ctx) };
-        // SAFETY: as above, for the activation's `hidden` words at `h.x`, the
-        // region's tail.
-        let normed = unsafe { window::<f32>(base + 4 * h.x as u64, h.hidden, ctx) };
+        // SAFETY: as above, for the activation's `cols · hidden` words at
+        // `h.x`, the region's tail.
+        let normed = unsafe { window::<f32>(base + 4 * h.x as u64, layout.hsum_len(), ctx) };
         // SAFETY: as for the ids, for the sequence's one word at `h.seq`.
         let seq = unsafe { window::<u32>(base + 4 * h.seq as u64, 1, ctx) };
         let pages = (0..rows)
@@ -243,7 +259,7 @@ impl Boundary {
                     .zip(layout.hsum_off(r))
                     .ok_or_else(|| GpuError::shape(what, format!("row {r} of the page")))?;
                 // SAFETY: row r's image — `words` words from a 256-aligned
-                // offset — and its sum — `hidden` f32 from a 256-aligned
+                // offset — and its sum — `cols · hidden` f32 from a 256-aligned
                 // offset — lie inside the page (sized by the layout past the
                 // last sum), apart from each other and from every other
                 // row's; the page moves into the boundary beside the windows
@@ -251,7 +267,7 @@ impl Boundary {
                 let (image, hsum) = unsafe {
                     (
                         window::<u32>(page.dev_at(image_off), words, ctx),
-                        window::<f32>(page.dev_at(hsum_off), h.hidden, ctx),
+                        window::<f32>(page.dev_at(hsum_off), layout.hsum_len(), ctx),
                     )
                 };
                 Ok(RowPage {
@@ -298,8 +314,9 @@ impl Boundary {
         })
     }
 
-    /// The handoff's activation, `hidden` f32: what the norm writes on a
-    /// hybrid layer and the host reads.
+    /// The handoff's activations, `cols · hidden` f32 (a one-column chain
+    /// uses the first `hidden`): what the norm writes on a hybrid layer and
+    /// the host reads.
     #[must_use]
     pub fn normed(&self) -> &DeviceBuffer<f32> {
         &self.normed
@@ -310,8 +327,9 @@ impl Boundary {
         &mut self.normed
     }
 
-    /// The host experts' weighted sum, `hidden` f32 in the host-mapped page:
-    /// what a combine reads in place after the layer's wait. Row 0's.
+    /// The host experts' weighted sums, `cols · hidden` f32 in the
+    /// host-mapped page: what a combine reads in place after the layer's
+    /// wait. Row 0's.
     #[must_use]
     pub fn hsum(&self) -> &DeviceBuffer<f32> {
         &self.pages[0].hsum
@@ -463,20 +481,30 @@ impl Boundary {
 
 // ------------------------------------------------------------------ chains
 
-/// A chain the host tier serves: the one-token step, or the two-row pass
+/// A chain the host tier serves: the one-token step, the two-row pass
 /// whose rows run one layer apart (row `r`'s go of layer `l` and the other
-/// row's of the layer before can both be in flight).
+/// row's of the layer before can both be in flight), or one row of `m`
+/// columns (2..=`DEFER_MAX_COLS`) — `m` consecutive positions whose layer is
+/// served by one go, one union call and one wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chain {
     Step,
     Pair,
+    Cols(usize),
 }
 
+/// Chains with a capture record of their own: the step, the pair and one per
+/// column count up to `DEFER_MAX_COLS` ([`Chain::index`]).
+const CHAINS: usize = 2 + DEFER_MAX_COLS;
+
 impl Chain {
+    /// The chain's capture record; a `Cols` chain is made only by
+    /// [`StepPort::open`], inside `2..=DEFER_MAX_COLS`.
     fn index(self) -> usize {
         match self {
             Chain::Step => 0,
             Chain::Pair => 1,
+            Chain::Cols(m) => 1 + m,
         }
     }
 
@@ -484,8 +512,31 @@ impl Chain {
     /// plus one: the rows in flight.
     pub(super) fn in_flight(self) -> usize {
         match self {
-            Chain::Step => 1,
+            Chain::Step | Chain::Cols(_) => 1,
             Chain::Pair => 2,
+        }
+    }
+
+    /// Columns one go of the chain carries.
+    #[must_use]
+    pub fn cols(self) -> usize {
+        match self {
+            Chain::Step | Chain::Pair => 1,
+            Chain::Cols(m) => m,
+        }
+    }
+
+    /// The chain of a walk of `units` rows of `cols` columns on a page of
+    /// `page_cols` columns a row: one row of one column is the step, two the
+    /// pair, one row of 2..=`page_cols` columns `Cols`; `None` for any other
+    /// point.
+    #[must_use]
+    pub fn of(units: usize, cols: usize, page_cols: usize) -> Option<Chain> {
+        match (units, cols) {
+            (1, 1) => Some(Chain::Step),
+            (2, 1) => Some(Chain::Pair),
+            (1, m) if (2..=page_cols.min(DEFER_MAX_COLS)).contains(&m) => Some(Chain::Cols(m)),
+            _ => None,
         }
     }
 }
@@ -506,12 +557,17 @@ pub(super) struct StepStats {
     pub(super) straggle_max_ns: u64,
     pub(super) overlap_slots: u64,
     pub(super) pair_row1_slots: u64,
+    pub(super) host_calls: u64,
+    pub(super) cols_served: u64,
+    pub(super) cols_cols: u64,
 }
 
 /// The step port: the boundary and the service state of the go/wait
 /// protocol — the sequence served, each chain's captured services, the chain
 /// being enqueued, a step refusal not yet named, the pair's overlap record —
-/// and its counters.
+/// and its counters. A `Cols` chain's service reads every column of its
+/// image and calls the host experts once for all of them
+/// ([`StepPort::serve_cols`]); the step's and the pair's read one.
 pub struct StepPort {
     pub(crate) boundary: Boundary,
     /// The host's copy of a handoff's activation — one column, allocated at
@@ -520,11 +576,18 @@ pub struct StepPort {
     /// A service's host list, in slot order, with room for the boundary's
     /// `n_used` slots made at load; refilled by each service.
     list: Vec<(u32, f32)>,
+    /// A `Cols` service's columns (`cols · hidden`), its host lists
+    /// (`n_used` a column, each column's first `lens[j]` its list) and the
+    /// lists' slices, with room for the page's columns made at load.
+    xs: Vec<f32>,
+    lists: Vec<(u32, f32)>,
+    lens: Vec<usize>,
+    slices: Vec<&'static [(u32, f32)]>,
     /// Services done: the sequence number the next handoff carries.
     pub(super) served: u32,
     /// Per [`Chain`], the (layer, row) services its last capture recorded,
     /// in go order — what a replay of it asks the host to serve.
-    captured: [Vec<(usize, usize)>; 2],
+    captured: [Vec<(usize, usize)>; CHAINS],
     /// The chain being enqueued, and whether it is a capture, not an eager
     /// step.
     chain: Chain,
@@ -545,15 +608,26 @@ impl StepPort {
     /// Load-time only.
     pub fn new(boundary: Boundary, layers: usize) -> StepPort {
         let h = boundary.layout.handoff();
+        let cols = boundary.layout.cols();
         StepPort {
             boundary,
             x: Tensor2::zeros(h.hidden, 1),
             list: Vec::with_capacity(h.n_used),
+            xs: if cols > 1 {
+                vec![0.0; cols * h.hidden]
+            } else {
+                Vec::new()
+            },
+            lists: vec![(0, 0.0); if cols > 1 { cols * h.n_used } else { 0 }],
+            lens: vec![0; if cols > 1 { cols } else { 0 }],
+            slices: Vec::with_capacity(if cols > 1 { cols } else { 0 }),
             served: 0,
-            captured: [
-                Vec::with_capacity(layers),
-                Vec::with_capacity(Chain::Pair.in_flight() * layers),
-            ],
+            captured: std::array::from_fn(|i| match i {
+                0 => Vec::with_capacity(layers),
+                1 => Vec::with_capacity(Chain::Pair.in_flight() * layers),
+                i if i <= cols + 1 => Vec::with_capacity(layers),
+                _ => Vec::new(),
+            }),
             chain: Chain::Step,
             capturing: false,
             step_refusal: None,
@@ -572,6 +646,17 @@ impl StepPort {
     /// Open `chain` on `stream`; a pair needs a boundary of two rows.
     pub(super) fn begin(&mut self, stream: &CudaStream, chain: Chain) -> Result<(), GpuError> {
         let what = "Hybrid::begin_chain";
+        if let Chain::Cols(m) = chain
+            && Chain::of(1, m, self.boundary.layout.cols()) != Some(chain)
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a chain of {m} columns on a page of {} columns a row",
+                    self.boundary.layout.cols()
+                ),
+            ));
+        }
         if chain.in_flight() > self.boundary.rows() {
             return Err(GpuError::shape(
                 what,
@@ -590,28 +675,26 @@ impl StepPort {
     }
 
     /// Open the chain of a walk of `units` rows of `cols` columns on
-    /// `stream`: the chain whose rows in flight are `units`, of one column
-    /// each ([`Chain::in_flight`]); any other point is refused by name.
+    /// `stream` ([`Chain::of`] over the page's columns); any other point is
+    /// refused by name.
     pub(super) fn open(
         &mut self,
         stream: &CudaStream,
         units: usize,
         cols: usize,
     ) -> Result<(), GpuError> {
-        let chain = [Chain::Step, Chain::Pair]
-            .into_iter()
-            .find(|c| c.in_flight() == units)
-            .filter(|_| cols == 1)
-            .ok_or_else(|| {
-                GpuError::shape(
-                    "Hybrid::begin_chain",
-                    format!(
-                        "{units} rows of {cols} columns: the step port serves one row or {}, of \
-                         one column",
-                        Chain::Pair.in_flight()
-                    ),
-                )
-            })?;
+        let page_cols = self.boundary.layout.cols();
+        let chain = Chain::of(units, cols, page_cols).ok_or_else(|| {
+            GpuError::shape(
+                "Hybrid::begin_chain",
+                format!(
+                    "{units} rows of {cols} columns: the step port serves one row or {} of one \
+                     column, or one row of 2..={} columns (the page's)",
+                    Chain::Pair.in_flight(),
+                    page_cols.min(DEFER_MAX_COLS)
+                ),
+            )
+        })?;
         self.begin(stream, chain)
     }
 
@@ -631,7 +714,7 @@ impl StepPort {
 
     /// The `i`-th service `chain`'s last capture recorded; `None` past them.
     pub(super) fn captured(&self, chain: Chain, i: usize) -> Option<(usize, usize)> {
-        self.captured[chain.index()].get(i).copied()
+        self.captured.get(chain.index())?.get(i).copied()
     }
 
     /// Back to a fresh port's relation after a refusal's reset: `served` at
@@ -642,23 +725,18 @@ impl StepPort {
         self.pair_row0 = None;
     }
 
-    /// Serve layer `layer` of row `row` in `chain` with `experts`, recording
-    /// a refusal in `health`: wait for the go, check it, build the host list
-    /// from `slots`, run the experts into the row's sum and signal.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the tier's three parts the service reads, the go it serves and its chain"
-    )]
-    pub(super) fn serve_one<H: HostExperts>(
+    /// Wait for the go of layer `layer` of row `row` in `chain` and check
+    /// it: the go landed in time and no later go is past the rows in
+    /// flight, the handoff carries the sequence the host is at, the row's
+    /// layer word is `layer`. Returns the row's image and sum offsets, the
+    /// service's start and the pool's parks at its wait.
+    fn take_go(
         &mut self,
-        experts: &mut H,
-        health: &mut Health,
-        slots: &SlotMap,
         layer: usize,
         row: usize,
         opens_replay: bool,
         chain: Chain,
-    ) -> Result<(), GpuError> {
+    ) -> Result<Go, GpuError> {
         let what = SERVE;
         let entered = Instant::now();
         let (image_off, hsum_off) = {
@@ -715,6 +793,55 @@ impl StepPort {
                 format!("row {row}'s go is layer {lyr}'s, the host serves layer {layer}"),
             ));
         }
+        Ok(Go {
+            image_off,
+            hsum_off,
+            t0,
+            parks,
+        })
+    }
+
+    /// The service of `go` is done: one added to the row's counter, the
+    /// sequence moved on, the service's time and parks counted.
+    fn signal(&mut self, row: usize, go: &Go) {
+        word(&self.boundary.page, Word::Cnt(row)).fetch_add(1, Ordering::Release);
+        self.served = self.served.wrapping_add(1);
+        let s = &mut self.stats;
+        s.served += 1;
+        s.leg_ns += u64::try_from(go.t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        s.parks_in_service += threads::pool()
+            .stats()
+            .worker_parks
+            .saturating_sub(go.parks);
+    }
+
+    /// Serve layer `layer` of row `row` in `chain` with `experts`, recording
+    /// a refusal in `health`: wait for the go, check it, build the host list
+    /// from `slots`, run the experts into the row's sum and signal. A `Cols`
+    /// chain is [`StepPort::serve_cols`]'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the tier's three parts the service reads, the go it serves and its chain"
+    )]
+    pub(super) fn serve_one<H: HostExperts>(
+        &mut self,
+        experts: &mut H,
+        health: &mut Health,
+        slots: &SlotMap,
+        layer: usize,
+        row: usize,
+        opens_replay: bool,
+        chain: Chain,
+    ) -> Result<(), GpuError> {
+        let what = SERVE;
+        if let Chain::Cols(_) = chain {
+            return self.serve_cols(experts, health, slots, layer, opens_replay, chain);
+        }
+        let go = self.take_go(layer, row, opens_replay, chain)?;
+        let (image_off, hsum_off) = (go.image_off, go.hsum_off);
+        let page = &self.boundary.page;
+        let h = self.boundary.layout.handoff();
+        let words = self.boundary.layout.image_words();
         let map_row = slots.row(layer).ok_or(GpuError::state(
             what,
             "a hybrid layer without a slot map row",
@@ -764,36 +891,143 @@ impl StepPort {
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
         if let Some(saw) = saw {
             out.fill(f32::NAN);
-            let r = Refusal {
-                what,
-                layer,
-                detail: format!("row {row}: {saw}"),
-            };
-            let e = GpuError::protocol(
-                what,
-                format!(
-                    "host saw undefined input: layer {layer}, {}; the card's fault word is \
-                     read once the step drains",
-                    r.detail
-                ),
-            );
-            self.step_refusal = Some(r.clone());
-            health.record_refusal(r, true);
-            return Err(e);
+            return Err(self.refuse(health, layer, format!("row {row}: {saw}")));
         }
         experts.experts_into(layer, &self.x, &self.list, out)?;
-        word(&self.boundary.page, Word::Cnt(row)).fetch_add(1, Ordering::Release);
-        self.served = want;
+        self.stats.host_calls += 1;
+        self.signal(row, &go);
         let s = &mut self.stats;
-        s.served += 1;
         s.host_slots += self.list.len() as u64;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
-        s.leg_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        s.parks_in_service += threads::pool().stats().worker_parks.saturating_sub(parks);
         if chain == Chain::Pair {
             self.count_pair_overlap(layer, row);
         }
         Ok(())
+    }
+
+    /// Serve layer `layer` of a `Cols` chain's one row: wait for the go and
+    /// check it, build each column's host list in slot order from the
+    /// image's routing (`n_used` a column), and run the layer's host experts
+    /// for every column in one union call
+    /// ([`HostExperts::experts_union_into`]), each column's sum bit for bit
+    /// what a one-column service writes for it, into the row's sum; then
+    /// signal. A column the card should already have refused runs nothing:
+    /// every column's sum is NaN and the service fails by name.
+    fn serve_cols<H: HostExperts>(
+        &mut self,
+        experts: &mut H,
+        health: &mut Health,
+        slots: &SlotMap,
+        layer: usize,
+        opens_replay: bool,
+        chain: Chain,
+    ) -> Result<(), GpuError> {
+        let what = SERVE;
+        let m = chain.cols();
+        let go = self.take_go(layer, 0, opens_replay, chain)?;
+        let page = &self.boundary.page;
+        let h = self.boundary.layout.handoff();
+        let words = self.boundary.layout.image_words();
+        let n = h.n_used;
+        if self.lens.len() < m || self.lists.len() < m * n || self.xs.len() < m * h.hidden {
+            return Err(GpuError::shape(
+                what,
+                format!("a service of {m} columns; the port was made for fewer"),
+            ));
+        }
+        let map_row = slots.row(layer).ok_or(GpuError::state(
+            what,
+            "a hybrid layer without a slot map row",
+        ))?;
+        let (mut w2_host, mut w2_all, mut host_slots) = (0.0f64, 0.0f64, 0u64);
+        let mut refused = None;
+        for j in 0..m {
+            let list = &mut self.lists[j * n..][..n];
+            let mut len = 0usize;
+            for s in 0..n {
+                let (Some(id), Some(wb)) = (
+                    payload_word(page, go.image_off, h.ids + j * n + s, words),
+                    payload_word(page, go.image_off, h.weights + j * n + s, words),
+                ) else {
+                    return Err(GpuError::shape(what, "the routing is outside the handoff"));
+                };
+                let w = f32::from_bits(wb);
+                w2_all += f64::from(w) * f64::from(w);
+                match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
+                    Some(&HOST) => {
+                        list[len] = (id, w);
+                        len += 1;
+                        w2_host += f64::from(w) * f64::from(w);
+                    }
+                    Some(_) => {}
+                    None => refused = refused.or(Some((j, unknown_id(s, id, map_row.len())))),
+                }
+            }
+            self.lens[j] = len;
+            host_slots += len as u64;
+        }
+        let xs = &mut self.xs[..m * h.hidden];
+        if !payload_f32_into(page, go.image_off, h.x, words, xs) {
+            return Err(GpuError::shape(
+                what,
+                "the activation is outside the handoff",
+            ));
+        }
+        if refused.is_none() {
+            refused = (0..m)
+                .find_map(|j| non_finite(&xs[j * h.hidden..][..h.hidden]).map(|saw| (j, saw)));
+        }
+        let out = self
+            .boundary
+            .page
+            .f32_mut(go.hsum_off, m * h.hidden)
+            .ok_or(GpuError::state(what, "the sum is outside the page"))?;
+        if let Some((j, saw)) = refused {
+            out.fill(f32::NAN);
+            return Err(self.refuse(health, layer, format!("row 0 column {j} of {m}: {saw}")));
+        }
+        let x =
+            Tensor2View::new(xs, h.hidden, m).map_err(|e| GpuError::shape(what, e.to_string()))?;
+        let mut lists = reuse_slices(std::mem::take(&mut self.slices));
+        lists.extend(
+            self.lens[..m]
+                .iter()
+                .enumerate()
+                .map(|(j, &len)| &self.lists[j * n..][..len]),
+        );
+        let r = experts.experts_union_into(layer, x, &lists, out);
+        self.stats.host_calls += 1;
+        self.slices = reuse_slices(lists);
+        r?;
+        self.signal(0, &go);
+        let s = &mut self.stats;
+        s.host_slots += host_slots;
+        s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
+        s.cols_served += 1;
+        s.cols_cols += m as u64;
+        Ok(())
+    }
+
+    /// Record a step service's refusal of layer `layer`, which saw `detail`,
+    /// and the error it fails with.
+    fn refuse(&mut self, health: &mut Health, layer: usize, detail: String) -> GpuError {
+        let what = SERVE;
+        let r = Refusal {
+            what,
+            layer,
+            detail,
+        };
+        let e = GpuError::protocol(
+            what,
+            format!(
+                "host saw undefined input: layer {layer}, {}; the card's fault word is read once \
+                 the step drains",
+                r.detail
+            ),
+        );
+        self.step_refusal = Some(r.clone());
+        health.record_refusal(r, true);
+        e
     }
 
     /// The row overlap of a two-row pass, over the host list the service
@@ -814,6 +1048,26 @@ impl StepPort {
             self.stats.pair_row1_slots += list.len() as u64;
         }
     }
+}
+
+/// A go a service took ([`StepPort::take_go`]): the row's image and sum
+/// offsets in the page, the service's start and the pool's parks at its
+/// wait.
+struct Go {
+    image_off: usize,
+    hsum_off: usize,
+    t0: Instant,
+    parks: u64,
+}
+
+/// `v`'s storage as an empty `Vec` of slices of another lifetime: the
+/// in-place collect of an empty iterator keeps the allocation, so a buffer of
+/// borrowed lists outlives the borrow it held without a copy.
+fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
+    v.clear();
+    v.into_iter()
+        .map(|_| -> &'b [T] { unreachable!("the vector was cleared") })
+        .collect()
 }
 
 /// Wait until the generation word has reached `want` or `deadline` has
@@ -850,9 +1104,40 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape};
+    use super::{Boundary, BoundaryShape, CHAINS, Chain};
     use cuda_core::CudaContext;
+    use model::ops::DEFER_MAX_COLS;
     use std::sync::Arc;
+
+    /// A walk's point names its chain: one row of one column the step, two
+    /// the pair, one row of 2 up to the page's columns `Cols`, one go a
+    /// layer each; anything else has none. Every chain has a capture record
+    /// of its own.
+    #[test]
+    fn a_walk_point_names_its_chain() {
+        assert_eq!(Chain::of(1, 1, 1), Some(Chain::Step));
+        assert_eq!(Chain::of(2, 1, 4), Some(Chain::Pair));
+        assert_eq!(Chain::of(1, 4, 4), Some(Chain::Cols(4)));
+        for bad in [
+            (1, 5, 4),
+            (1, 2, 1),
+            (2, 2, 4),
+            (0, 1, 1),
+            (1, 0, 4),
+            (3, 1, 4),
+        ] {
+            assert_eq!(Chain::of(bad.0, bad.1, bad.2), None, "{bad:?}");
+        }
+        let mut seen = [false; CHAINS];
+        let chains = [Chain::Step, Chain::Pair]
+            .into_iter()
+            .chain((2..=DEFER_MAX_COLS).map(Chain::Cols));
+        for c in chains {
+            assert!(!std::mem::replace(&mut seen[c.index()], true), "{c:?}");
+            assert_eq!(c.in_flight(), if c == Chain::Pair { 2 } else { 1 });
+            assert_eq!(Chain::of(c.in_flight(), c.cols(), DEFER_MAX_COLS), Some(c));
+        }
+    }
 
     /// A boundary gives back every context handle its windows took: the
     /// context's count after one is dropped is the count before it was made.

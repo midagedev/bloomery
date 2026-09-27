@@ -160,6 +160,17 @@ impl HostServed for NoHost {
 /// the bound on every body's [`Rows::MAX_ROWS`].
 pub const MAX_PASS_ROWS: usize = 8;
 
+/// How a pass of [`Rows`] lays its rows over output heads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowHeads {
+    /// A head of one row a row: row `r` into head `r`, row 0's the step's.
+    PerRow,
+    /// One head of `m` rows for the whole pass: the lm_head read once for
+    /// every row, each row's logits and token bit for bit its one-row
+    /// head's (`Head`'s rows are independent).
+    One,
+}
+
 /// A body that runs several consecutive positions as one pass of `m` rows,
 /// bit for bit `m` one-token steps in turn — what a verify of drafted tokens
 /// runs.
@@ -172,14 +183,25 @@ pub trait Rows: ChainBody {
     /// replay of it ([`HostServed::serve_captured`]).
     const CHAIN: Chain;
 
+    /// How the pass lays its rows over output heads.
+    const HEADS: RowHeads = RowHeads::PerRow;
+
+    /// The chain a replay of the pass of `m` rows is served as: [`Rows::CHAIN`]
+    /// unless the body's chain depends on the rows.
+    fn chain_of(m: usize) -> Chain {
+        let _ = m;
+        Self::CHAIN
+    }
+
     /// The pass's host half: the steps of `tokens[r]` at `pos + r`, planned
     /// in turn and written into the buffers the captured pass reads.
     /// `tokens` holds 2 to [`Rows::MAX_ROWS`] ids. Never inside a capture.
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError>;
 
     /// Enqueue the pass the last [`Rows::plan_rows`] planned, through every
-    /// resident layer and row `r` into `heads[r]`, one head a row.
-    /// Asynchronous as [`ChainBody::enqueue_chain`] is.
+    /// resident layer and row `r` into `heads[r]`, one head a row — or, for
+    /// [`RowHeads::One`], every row into `heads[0]`, a head of the pass's
+    /// rows. Asynchronous as [`ChainBody::enqueue_chain`] is.
     fn enqueue_rows(&mut self, gpu: &Gpu, w: &Weights, heads: &mut [Head]) -> Result<(), GpuError>;
 }
 
@@ -187,6 +209,14 @@ pub trait Rows: ChainBody {
 pub trait Rollback: ChainBody {
     /// Take back the positions from `pos` on, so the next step runs at `pos`.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError>;
+
+    /// [`Rollback::rollback`] with the card at hand, for a body whose take
+    /// back enqueues work on the engine stream; what [`GpuModel::rollback`]
+    /// calls.
+    fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
+        let _ = gpu;
+        self.rollback(pos)
+    }
 }
 
 /// A body that can stand at a synthetic depth.
@@ -298,6 +328,12 @@ pub struct GpuModel<B: ChainBody> {
     /// when the load carries the head; rows 1 on are made by the first pass
     /// of [`Rows`] that needs them. Empty on a load without the head.
     heads: Vec<Head>,
+    /// A [`RowHeads::One`] body's head of `m` rows at `m − 1`, made by the
+    /// first pass of `m` rows.
+    pass_heads: Vec<Option<Head>>,
+    /// The rows of the last call when it was a [`RowHeads::One`] pass: its
+    /// logits are that head's, and the step head's readbacks refuse.
+    one_pass: Option<usize>,
     /// On the heap, so moving the model never moves the body's own state.
     body: Box<B>,
     weights: Weights,
@@ -327,6 +363,8 @@ impl<B: ChainBody> GpuModel<B> {
         GpuModel {
             graphs: Graphs::new(),
             heads: head.into_iter().collect(),
+            pass_heads: (0..MAX_PASS_ROWS).map(|_| None).collect(),
+            one_pass: None,
             body: Box::new(body),
             weights,
             gpu,
@@ -469,6 +507,12 @@ impl<B: ChainBody> GpuModel<B> {
         self.weights.resident_bytes()
             + self.body.resident_bytes()
             + self.heads.iter().map(Head::resident_bytes).sum::<usize>()
+            + self
+                .pass_heads
+                .iter()
+                .flatten()
+                .map(Head::resident_bytes)
+                .sum::<usize>()
     }
 
     /// The cache row the next [`GpuModel::step`] token lands in.
@@ -522,6 +566,7 @@ impl<B: ChainBody> GpuModel<B> {
         // Empty caches hold nothing a fault condemned.
         self.gpu.clear_fault()?;
         self.poisoned = None;
+        self.one_pass = None;
         self.stand_at(0);
         Ok(())
     }
@@ -608,6 +653,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// here can follow launches, so the caller passes it through
     /// [`GpuModel::note_fault`].
     fn run_tokens(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+        self.one_pass = None;
         for &token in tokens {
             let pos = self.pos;
             self.check_pos(pos, "GpuModel::step")?;
@@ -671,6 +717,21 @@ impl<B: ChainBody> GpuModel<B> {
                     refusal.what, refusal.layer, refusal.detail
                 ),
             )),
+        }
+    }
+
+    /// The step head's readback after a [`RowHeads::One`] pass, whose rows
+    /// that head never saw, is refused by name.
+    fn refuse_one_pass(&self, what: &'static str) -> Result<(), GpuError> {
+        match self.one_pass {
+            Some(m) => Err(GpuError::shape(
+                what,
+                format!(
+                    "the last call was a pass of {m} rows into one head of {m} rows; \
+                     `rows_logits` reads its rows"
+                ),
+            )),
+            None => Ok(()),
         }
     }
 
@@ -738,6 +799,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// pass writes row 0 through this same head and row `r` through head `r`
     /// ([`GpuModel::rows_logits`]).
     pub fn logits(&self) -> Result<Vec<f32>, GpuError> {
+        self.refuse_one_pass("GpuModel::logits")?;
         self.heads
             .first()
             .ok_or(no_head("GpuModel::logits"))?
@@ -747,6 +809,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// [`GpuModel::logits`] into `out` (`n_vocab` f32), for a caller that reads
     /// them every token into one buffer. Blocking read.
     pub fn logits_into(&self, out: &mut [f32]) -> Result<(), GpuError> {
+        self.refuse_one_pass("GpuModel::logits_into")?;
         self.heads
             .first()
             .ok_or(no_head("GpuModel::logits_into"))?
@@ -846,6 +909,7 @@ impl<B: ChainBody> GpuModel<B> {
         }
         let (pos, n) = (self.pos, crate::launch_u32(what, "positions", n)?);
         self.check_pos(pos + n - 1, what)?;
+        self.one_pass = None;
         let GpuModel {
             heads,
             body,
@@ -873,10 +937,10 @@ impl<B: Rows> GpuModel<B> {
     /// greedy next token. Bit for bit `M` calls of `step(&[tokens[r]])`; the
     /// model stands `M` positions on. `M` is 2 to the body's
     /// [`Rows::MAX_ROWS`], or the call does not compile. The first pass of
-    /// `M` rows makes the heads it needs, and in graph mode captures the
-    /// pass (key `M`). A caller that does not keep the later rows takes them
-    /// back with [`GpuModel::rollback`]. A fault the pass raised is its
-    /// error, as [`GpuModel::step`]'s is.
+    /// `M` rows makes the heads it needs ([`Rows::HEADS`]), and in graph mode
+    /// captures the pass (key `M`). A caller that does not keep the later
+    /// rows takes them back with [`GpuModel::rollback`]. A fault the pass
+    /// raised is its error, as [`GpuModel::step`]'s is.
     pub fn step_rows<const M: usize>(&mut self, tokens: [u32; M]) -> Result<[u32; M], GpuError> {
         const WHAT: &str = "GpuModel::step_rows";
         const { rows_fit::<B>(M) };
@@ -898,28 +962,53 @@ impl<B: Rows> GpuModel<B> {
     /// [`GpuModel::note_fault`].
     fn run_pass<const M: usize>(&mut self, pos: u32) -> Result<[u32; M], GpuError> {
         const WHAT: &str = "GpuModel::step_rows";
+        self.one_pass = (B::HEADS == RowHeads::One).then_some(M);
         let r = match self.mode {
             StepMode::Eager => {
                 let GpuModel {
                     heads,
+                    pass_heads,
                     body,
                     weights,
                     gpu,
                     ..
                 } = self;
-                let heads = heads.get_mut(..M).ok_or(no_head(WHAT))?;
+                let heads = pass_slice::<B>(heads, pass_heads, M, WHAT)?;
                 body.enqueue_rows(gpu, weights, heads)
             }
-            StepMode::Graph => self.replay(M, B::CHAIN),
+            StepMode::Graph => self.replay(M, B::chain_of(M)),
         };
         self.name_host_refusal(r)?;
         self.stand_at(pos + crate::launch_u32(WHAT, "rows", M)?);
         let mut out = [0u32; M];
-        let heads = self.heads.get(..M).ok_or(no_head(WHAT))?;
-        for (o, head) in out.iter_mut().zip(heads) {
-            *o = head.token(&self.gpu)?;
+        match B::HEADS {
+            RowHeads::PerRow => {
+                let heads = self.heads.get(..M).ok_or(no_head(WHAT))?;
+                for (o, head) in out.iter_mut().zip(heads) {
+                    *o = head.token(&self.gpu)?;
+                }
+            }
+            RowHeads::One => {
+                let head = self.pass_head(M, WHAT)?;
+                let tokens = head.tokens(&self.gpu)?;
+                if tokens.len() != M {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("{} tokens from a head of {M} rows", tokens.len()),
+                    ));
+                }
+                out.copy_from_slice(&tokens);
+            }
         }
         Ok(out)
+    }
+
+    /// The [`RowHeads::One`] head of `m` rows, once a pass made it.
+    fn pass_head(&self, m: usize, what: &'static str) -> Result<&Head, GpuError> {
+        self.pass_heads
+            .get(m.wrapping_sub(1))
+            .and_then(Option::as_ref)
+            .ok_or(GpuError::state(what, "no pass of these rows has run"))
     }
 
     /// Capture the pass of `M` rows into its own graph over the resident
@@ -932,12 +1021,13 @@ impl<B: Rows> GpuModel<B> {
         let GpuModel {
             graphs,
             heads,
+            pass_heads,
             body,
             weights,
             gpu,
             ..
         } = self;
-        let heads = heads.get_mut(..M).ok_or(no_head(WHAT))?;
+        let heads = pass_slice::<B>(heads, pass_heads, M, WHAT)?;
         let graph = gpu.capture(|_| body.enqueue_rows(gpu, weights, heads))?;
         let nodes = graph.node_count();
         *graphs.slot(M, WHAT)? = Some(graph);
@@ -961,34 +1051,84 @@ impl<B: Rows> GpuModel<B> {
     pub fn rows_logits<const M: usize>(&self) -> Result<[Vec<f32>; M], GpuError> {
         const WHAT: &str = "GpuModel::rows_logits";
         const { rows_fit::<B>(M) };
-        let heads = self
-            .heads
-            .get(..M)
-            .ok_or(GpuError::state(WHAT, "no pass of these rows has run"))?;
         let mut out: [Vec<f32>; M] = std::array::from_fn(|_| Vec::new());
-        for (o, head) in out.iter_mut().zip(heads) {
-            *o = head.logits_to_host(&self.gpu)?;
+        match B::HEADS {
+            RowHeads::PerRow => {
+                let heads = self
+                    .heads
+                    .get(..M)
+                    .ok_or(GpuError::state(WHAT, "no pass of these rows has run"))?;
+                for (o, head) in out.iter_mut().zip(heads) {
+                    *o = head.logits_to_host(&self.gpu)?;
+                }
+            }
+            RowHeads::One => {
+                // The head's layout is `[v·m + r]`: row r is every m-th value.
+                let all = self.pass_head(M, WHAT)?.logits_to_host(&self.gpu)?;
+                for (r, o) in out.iter_mut().enumerate() {
+                    *o = all.iter().skip(r).step_by(M).copied().collect();
+                }
+            }
         }
         Ok(out)
     }
 
-    /// Row `r`'s head for every `r < m`: row 0's is the load's, the rest are
-    /// made here over the resident weights.
+    /// The heads a pass of `m` rows writes: for [`RowHeads::PerRow`] row
+    /// `r`'s head for every `r < m` (row 0's is the load's, the rest made
+    /// here), for [`RowHeads::One`] one head of `m` rows; each over the
+    /// resident weights.
     fn make_heads(&mut self, m: usize, what: &'static str) -> Result<(), GpuError> {
         if self.heads.is_empty() {
             return Err(no_head(what));
         }
-        while self.heads.len() < m {
-            let head = Head::with_norm(
-                &self.gpu,
-                &self.weights,
-                self.body.head_eps(),
-                1,
-                self.body.head_norm(),
-            )?;
-            self.heads.push(head);
+        match B::HEADS {
+            RowHeads::PerRow => {
+                while self.heads.len() < m {
+                    let head = Head::with_norm(
+                        &self.gpu,
+                        &self.weights,
+                        self.body.head_eps(),
+                        1,
+                        self.body.head_norm(),
+                    )?;
+                    self.heads.push(head);
+                }
+            }
+            RowHeads::One => {
+                let slot = self.pass_heads.get_mut(m.wrapping_sub(1)).ok_or_else(|| {
+                    GpuError::shape(what, format!("a head of {m} rows (1..={MAX_PASS_ROWS})"))
+                })?;
+                if slot.is_none() {
+                    *slot = Some(Head::with_norm(
+                        &self.gpu,
+                        &self.weights,
+                        self.body.head_eps(),
+                        m,
+                        self.body.head_norm(),
+                    )?);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// The heads a pass of `m` rows of `B` writes: `heads[..m]`, or the one
+/// head of `m` rows in `pass` for [`RowHeads::One`]; refused by name before
+/// they are made.
+fn pass_slice<'a, B: Rows>(
+    heads: &'a mut [Head],
+    pass: &'a mut [Option<Head>],
+    m: usize,
+    what: &'static str,
+) -> Result<&'a mut [Head], GpuError> {
+    match B::HEADS {
+        RowHeads::PerRow => heads.get_mut(..m).ok_or(no_head(what)),
+        RowHeads::One => pass
+            .get_mut(m.wrapping_sub(1))
+            .and_then(Option::as_mut)
+            .map(std::slice::from_mut)
+            .ok_or(no_head(what)),
     }
 }
 
@@ -1016,7 +1156,7 @@ impl<B: Rollback> GpuModel<B> {
                 format!("back to position {pos} from {}", self.pos),
             ));
         }
-        self.body.rollback(pos)?;
+        self.body.rollback_on(&self.gpu, pos)?;
         self.stand_at(pos);
         Ok(())
     }
