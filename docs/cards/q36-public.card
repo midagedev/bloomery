@@ -1,0 +1,60 @@
+# The public Qwen3.6-35B-A3B table in one window: decode at depth 6 / 1024 / 4096 and prompt
+# processing at P = 512 / 4096, bloomery (generate_qwen3moe on the qwen35moe file, Body35) against
+# mainline llama.cpp (53ed051ce, which builds qwen35moe: src/models/qwen35moe.cpp,
+# LLM_ARCH_QWEN35MOE). The file is lmstudio's Q4_K_M (tools/ref/models/qwen35moe.sh).
+#
+# Every row's prediction [derived; nothing of Qwen3.6 has been timed on the A6000 yet]:
+#   ours decode, depth 6       183..205 tok/s  (docs/research/qwennext-lit-report.md: 1,975.7 MB a
+#                                               step at 426..455 GB/s, the rate Qwen3's 4.728 ms
+#                                               step leaves after its nodes, + 520 nodes x
+#                                               0.37..0.85 us + the GDN state and conv 0.31 ms)
+#   ours decode, depth 1024    181..203 tok/s  (+ 10 GQA layers x 1,024 keys x 2,048 B = 21 MB of
+#                                               K/V at Qwen3's measured depth rate, 2.33 ms/GB:
+#                                               +0.05 ms)
+#   ours decode, depth 4096    174..199 tok/s  (+ 84 MB of K/V: +0.15..0.29 ms)
+#   ours pp512                 340..460 tok/s  (passes of 8, 64 of them: a pass of 8 reads the
+#                                               experts once per slot, 8 x 360 slots x 1.77..2.04
+#                                               MB = 5.1..5.9 GB at 400..470 GB/s, 10.9..14.7 ms;
+#                                               the dense projections and routers once, 0.87 GB,
+#                                               1.3..1.9 ms; eight Q6_K heads, 8 x 417 MB,
+#                                               4.8..5.6 ms; GDN 0.2..0.5 ms; 609 nodes
+#                                               0.23..0.52 ms; the per-pass readback 0.1..0.2 ms;
+#                                               17.5..23.4 ms a pass, centre 20.3 ms = 394 tok/s)
+#   ours pp4096                335..455 tok/s  (the same passes + the flash's depth term, Qwen3's
+#                                               measured 1.59 ms a pass for 48 layers scaled to
+#                                               10: +0.2..0.6 ms a pass)
+#   llama.cpp decode, d 6      110..175 tok/s  (bytes at Qwen3's llama.cpp rate plus a GDN fixed
+#                                               term fitted to the public 3090 row, 115.7 tok/s
+#                                               on UD-Q4_K_XL; the widest band of the table)
+#   llama.cpp decode, d 4096   105..172 tok/s
+#   llama.cpp pp512            2,900..4,800    (Qwen3's 4,247 in qwen3-xeng: MACs x 0.89, expert
+#                                               MMQ at 16 rows an expert x 1.3, + the recurrent
+#                                               GDN 30 x 512 x 1.44 us = 22 ms a ubatch)
+#   llama.cpp pp4096           2,800..4,700
+# So ours / llama.cpp: decode 1.05..1.85, pp about 0.07..0.16 — the pass path is not a prefill
+# to publish (Body35 has no ubatch path); the pp rows are sat to check the pass derivation above.
+kind: baseline
+question: what are ours and mainline llama.cpp's Qwen3.6-35B-A3B decode and prompt rows on the
+  A6000 in one window, for the public table?
+term: tok/s @ n=96, depth 6, A6000, bloomery (generate_qwen3moe of the landing tree on the
+  qwen35moe Q4_K_M file, the `6` arm of just depth-gpu-qwen35moe)
+unit: tok/s
+predict: 183..205
+condition: one lease, three rounds, arms 6 lcpp:6 1024 lcpp:1024 4096 lcpp:4096 512 lcpppp:512
+  lcpppp:4096, the order rotated every round; the whole model is card-resident for both engines,
+  so no arm pages the host; no row carries [cpu-busy] or [other-busy]; the full runner output goes
+  to a file first. Command: BLOOMERY_HOLD_OWNER=e1 BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q36-public.card' just depth-gpu-qwen35moe
+  <the arms above> > <log> 2>&1
+reason: sets the decode rows of the public Qwen3.6 table (llama.cpp beside ours) and checks the
+  pass-path pp derivation that decides whether a Body35 ubatch prefill comes before any Qwen3.6
+  pp row goes out; why now: the final sitting takes every model's table in one window
+decide-in: write the decode rows into rig-log first, then the README's Qwen3.6 section, ratios
+  from this window only; the pp rows go into rig-log only, marked the pass path, until the Body35
+  ubatch prefill lands
+decide-below: no Qwen3.6 row goes out: nsys-gpu.sh has no qwen35moe form (its seed form reads
+  the qwen3moe profile only), so a round gives it one, times the depth-6 step by kernel class and
+  names the term of the step derivation that missed (effective bandwidth, node gaps or the GDN
+  state) before a re-sit
+decide-above: write the rows, then name the term: the step's bytes or its node cost is lower than
+  the derivation took, and the Qwen3 step derivation shares that term

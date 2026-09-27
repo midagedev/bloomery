@@ -23,11 +23,18 @@
 #                   the whole 21.2 GB file. Not overridable from here.
 #   ref_step_variant  the decode-step variants, below
 #
-# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the reference-line arms (IK_GPU_FLAGS, LCPP,
-# LCPP_GPU_FLAGS, MRS, MRS_FLAGS). No flag has been chosen or measured for this model; the depth and
-# prompt-processing lines against ik, llama.cpp and mistral.rs belong to a later round. Every script
-# that reads them runs under `set -u`, so such a script stops at the unset name instead of running
-# an engine at flags nobody chose.
+#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` and `lcpppp:<P>` arms of
+#                   depth-qwen3moe.sh run (`just depth-gpu-qwen35moe`): mainline itself, which builds
+#                   this architecture (src/models/qwen35moe.cpp, LLM_ARCH_QWEN35MOE at 53ed051ce), so
+#                   no PR branch; LCPPBIN moves its llama-bench alone
+#   LCPP_GPU_FLAGS  qwen3moe.sh's: every layer and the head on the card, flash attention on. No
+#                   flag sweep has been run on this model
+#
+# Deliberately unset: IK_BEST_FLAGS, REF_PROMPTS and the ik and mistral.rs reference arms
+# (IK_GPU_FLAGS, MRS, MRS_FLAGS): nobody has read whether ik's fused flags apply to build_qwen35moe
+# or whether the mistral.rs tree opens this file. Every script that reads them runs under `set -u`
+# (depth-qwen3moe.sh reads an engine's names only when it has arms), so such a script stops at the
+# unset name instead of running an engine at flags nobody chose.
 #
 # SC2034: every name here is read by the file that sources this one, which shellcheck does not
 # see from this file alone.
@@ -44,6 +51,9 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf}
 # Changing them invalidates the whole set.
 REF_TOKENS=760,6511,314,9338,369
 REF_DUMP_LEASE=1
+: "${LCPP:=/home/user/llama.cpp-mainline}"
+: "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-qwen35moe <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
