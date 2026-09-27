@@ -1,0 +1,405 @@
+{
+  "template": "tokenizer.chat_template of GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf (unsloth GLM-5.3-Flash UD-Q4_K_XL, the first shard, md5 b51b6090ebdb7d1340d69474497d66d1), read from the GGUF header on the box: 10648 bytes, md5 d219eb07b8cdc23a3ec51a977b421d07; glm5-chat-template.jinja is those bytes",
+  "reference": "jinja2 3.1.2 (Python 3.12.3, on the box), the HF chat-template environment of ik_llama.cpp tests/test-jinja.cpp (SandboxedEnvironment with trim_blocks, lstrip_blocks and the loopcontrols extension; tojson = json.dumps with ensure_ascii=False, indent=None, separators=None, sort_keys=False as defaults; globals strftime_now and raise_exception); each case rendered with the variables bloomery-serve's /apply-template passes (messages with a content array flattened to its text parts, add_generation_prompt default true, the mock's bos_token and eos_token, tools and reasoning_effort when not null, chat_template_kwargs merged); every body has its keys sorted at every level (jinja2 keeps insertion order, bloomery iterates keys sorted, so only a sorted body is one both render alike); a case jinja2 refused carries its error in place of a prompt. Script: crates/serve/tests/fixtures/render_glm5.py, run as `python3 render_glm5.py glm5-chat-template.jinja > glm5-renders.json`",
+  "cases": [
+    {
+      "name": "system and user",
+      "body": {
+        "messages": [
+          {
+            "content": "You are terse.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>Hi<|assistant|><think>"
+    },
+    {
+      "name": "three turns",
+      "body": {
+        "messages": [
+          {
+            "content": "What is the capital of France?",
+            "role": "user"
+          },
+          {
+            "content": "Paris.",
+            "role": "assistant"
+          },
+          {
+            "content": "And of Italy?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think></think>Paris.<|user|>And of Italy?<|assistant|><think>"
+    },
+    {
+      "name": "past reasoning kept, clear_thinking absent",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>The user greets.</think>Hello!<|user|>Again?<|assistant|><think>"
+    },
+    {
+      "name": "past reasoning cleared, clear_thinking true",
+      "body": {
+        "chat_template_kwargs": {
+          "clear_thinking": true
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think></think>Hello!<|user|>Again?<|assistant|><think>"
+    },
+    {
+      "name": "think span in the answer, no generation prompt",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "2+2?",
+            "role": "user"
+          },
+          {
+            "content": "<think>Add them.</think>\n\n4",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>2+2?<|assistant|><think>Add them.</think>4"
+    },
+    {
+      "name": "reasoning_effort low",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think>"
+    },
+    {
+      "name": "reasoning_effort outside the list",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>"
+    },
+    {
+      "name": "tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}}\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Seoul?<|assistant|><think>"
+    },
+    {
+      "name": "two calls, their results in the other order",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather and time in Seoul?",
+            "role": "user"
+          },
+          {
+            "content": "Checking both.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "days": 3,
+                    "location": "Seoul"
+                  },
+                  "name": "get_weather"
+                },
+                "id": "call_a",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_b",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_b"
+          },
+          {
+            "content": "{\"temp\": 21}",
+            "role": "tool",
+            "tool_call_id": "call_a"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}}\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather and time in Seoul?<|assistant|><think></think>Checking both.<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value><arg_key>location</arg_key><arg_value>Seoul</arg_value></tool_call><tool_call>get_time</tool_call><|observation|><tool_response>{\"temp\": 21}</tool_response><tool_response>12:00</tool_response><|assistant|><think>"
+    },
+    {
+      "name": "a tool result without an id",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_c",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Time?<|assistant|><think></think><tool_call>get_time</tool_call><|observation|><tool_response>12:00</tool_response><|user|>Thanks.<|assistant|><think>"
+    },
+    {
+      "name": "non-ASCII and nested arguments",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "filter": {
+                      "n": [
+                        1,
+                        2
+                      ],
+                      "q": "서울 ☃"
+                    },
+                    "text": "a<b & \"c\""
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_d",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Note it.<|assistant|><think></think><tool_call>save_note<arg_key>filter</arg_key><arg_value>{\"n\": [1, 2], \"q\": \"서울 ☃\"}</arg_value><arg_key>text</arg_key><arg_value>a<b & \"c\"</arg_value></tool_call>"
+    },
+    {
+      "name": "string arguments",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{}",
+                  "name": "get_time"
+                },
+                "id": "call_e",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "error": "UndefinedError: 'str object' has no attribute 'items'"
+    }
+  ]
+}

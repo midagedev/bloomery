@@ -239,8 +239,10 @@ impl Vocab {
             return Err(Error::UnsupportedModel(model.to_string()));
         }
         // The names `Pre` runs share the rest of the reference's per-name
-        // flags: byte-level encoding, merges always applied, spaces not
-        // cleaned, no BOS unless the file asks for it.
+        // flags that reach `encode` and `piece`: byte-level encoding, merges
+        // always applied, no BOS unless the file asks for it. (`glm4` keeps
+        // the reference's `clean_spaces`, which only its `llama_detokenize`
+        // reads; `llama_token_to_piece`, what this crate mirrors, does not.)
         let pre = m.str("tokenizer.ggml.pre")?.unwrap_or("");
         let Some(pretok) = Pre::of(pre) else {
             return Err(Error::UnsupportedPre(pre.to_string()));
@@ -275,9 +277,10 @@ impl Vocab {
             attrs.push(types.as_ref().map_or(attr::NORMAL, |t| attr_of_type(t[i])));
         }
 
-        // Defaults for a gpt2 vocabulary, then the file's ids where in range.
+        // Defaults for a gpt2 vocabulary, with the reference's per-name
+        // override (`glm4` names no BOS), then the file's ids where in range.
         let mut sp = Specials {
-            bos: Some(11),
+            bos: (pretok != Pre::Glm4).then_some(11),
             eos: Some(11),
             ..Specials::default()
         };

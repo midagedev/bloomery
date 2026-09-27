@@ -1,5 +1,7 @@
 //! DSML tool calls for the V4.1 chat template, and the parser that turns one
-//! generation into `reasoning_content`, `content` and `tool_calls`.
+//! generation into `reasoning_content`, `content` and `tool_calls` under the
+//! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's in
+//! [`crate::glmxml`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
 //! `tool_calls` branch):
@@ -22,6 +24,7 @@
 //! Every decision depends on the text only, never on how it was cut into pieces,
 //! so a stream and a whole response parse to the same message.
 
+use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
 use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_suffix};
 
 /// The template's `dsml_token`.
@@ -255,18 +258,55 @@ impl Message {
     }
 }
 
+/// The tool-call markup a chat template teaches its model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// V4.1's `<｜DSML｜tool_calls>` blocks.
+    Dsml,
+    /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
+    GlmXml,
+}
+
+impl ToolFormat {
+    /// The markup the template `source` writes for a call: GLM's when it
+    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, DSML otherwise.
+    #[must_use]
+    pub fn of_template(source: &str) -> ToolFormat {
+        let glm = [glmxml::CALL_OPEN, glmxml::KEY_OPEN, glmxml::VALUE_OPEN];
+        if glm.iter().all(|tag| source.contains(tag)) {
+            ToolFormat::GlmXml
+        } else {
+            ToolFormat::Dsml
+        }
+    }
+}
+
+/// The tool-call scan a parser runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tools {
+    Dsml,
+    /// GLM's markup, typing each argument by the request's tool schemas.
+    GlmXml(ArgTypes),
+}
+
+#[derive(Debug)]
+enum Scan {
+    Dsml(DsmlScan),
+    Glm(GlmScan),
+}
+
 /// The streaming parser for one chat generation.
 ///
 /// With [`ReasoningFormat::None`] and no tools the text passes through unchanged,
-/// piece for piece. With tools, the think span is tracked in either format so DSML
-/// inside it is never parsed; with `None` the span's text, its `</think>` included,
-/// stays in `content`.
+/// piece for piece. With tools, the think span is tracked in either format so
+/// tool-call markup inside it is never parsed; with `None` the span's text, its
+/// `</think>` included, stays in `content`.
 #[derive(Debug)]
 pub struct ChatParser {
     format: ReasoningFormat,
     /// `None` when neither a split nor a scan is asked for.
     think: Option<ThinkSplit>,
-    dsml: Option<DsmlScan>,
+    scan: Option<Scan>,
     total: Message,
 }
 
@@ -275,11 +315,21 @@ impl ChatParser {
     /// `tools` turns the DSML scan on.
     #[must_use]
     pub fn new(prompt: &str, format: ReasoningFormat, tools: bool) -> Self {
-        let split = format == ReasoningFormat::Deepseek || tools;
+        ChatParser::with_tools(prompt, format, tools.then_some(Tools::Dsml))
+    }
+
+    /// A parser for a generation that follows `prompt`, scanning for `tools`'
+    /// markup when it is `Some`.
+    #[must_use]
+    pub fn with_tools(prompt: &str, format: ReasoningFormat, tools: Option<Tools>) -> Self {
+        let split = format == ReasoningFormat::Deepseek || tools.is_some();
         ChatParser {
             format,
             think: split.then(|| ThinkSplit::for_prompt(prompt)),
-            dsml: tools.then(DsmlScan::default),
+            scan: tools.map(|t| match t {
+                Tools::Dsml => Scan::Dsml(DsmlScan::default()),
+                Tools::GlmXml(types) => Scan::Glm(GlmScan::new(types)),
+            }),
             total: Message::default(),
         }
     }
@@ -293,8 +343,32 @@ impl ChatParser {
         p.total
     }
 
-    /// Feeds generated text; returns what may be sent now.
+    /// Feeds generated text; returns what may be sent now. For a parser with
+    /// no scan or the DSML scan, which cannot fail; a GLM parser's caller
+    /// uses [`ChatParser::try_push`].
+    ///
+    /// # Panics
+    ///
+    /// On markup a GLM scan refuses, naming it.
     pub fn push(&mut self, text: &str) -> Message {
+        self.try_push(text)
+            .unwrap_or_else(|e| panic!("ChatParser::push on a scan that failed: {e}"))
+    }
+
+    /// Releases everything held at the end of the generation; see
+    /// [`ChatParser::push`] for which parsers may call it.
+    ///
+    /// # Panics
+    ///
+    /// On markup a GLM scan refuses, naming it.
+    pub fn finish(&mut self) -> Message {
+        self.try_finish()
+            .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
+    }
+
+    /// Feeds generated text; returns what may be sent now, or the tool-call
+    /// markup that does not parse.
+    pub fn try_push(&mut self, text: &str) -> Result<Message, GlmXmlError> {
         let split = match &mut self.think {
             Some(t) => t.push(text),
             None => Split {
@@ -302,20 +376,29 @@ impl ChatParser {
                 ..Split::default()
             },
         };
-        let dsml = self.dsml.as_mut().map(|d| d.push(&split.content));
-        self.emit(split, dsml)
+        let scanned = match &mut self.scan {
+            None => None,
+            Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
+            Some(Scan::Glm(g)) => Some(g.push(&split.content)?),
+        };
+        Ok(self.emit(split, scanned))
     }
 
-    /// Releases everything held at the end of the generation.
-    pub fn finish(&mut self) -> Message {
+    /// Releases everything held at the end of the generation, or names the
+    /// tool call still open.
+    pub fn try_finish(&mut self) -> Result<Message, GlmXmlError> {
         // An open span's tail is reasoning; the scanner has seen none of it.
         let split = self
             .think
             .as_mut()
             .map(ThinkSplit::finish)
             .unwrap_or_default();
-        let dsml = self.dsml.as_mut().map(DsmlScan::finish);
-        self.emit(split, dsml)
+        let scanned = match &mut self.scan {
+            None => None,
+            Some(Scan::Dsml(d)) => Some(d.finish()),
+            Some(Scan::Glm(g)) => Some(g.finish()?),
+        };
+        Ok(self.emit(split, scanned))
     }
 
     /// The message so far.
@@ -324,7 +407,7 @@ impl ChatParser {
         &self.total
     }
 
-    fn emit(&mut self, split: Split, dsml: Option<Scanned>) -> Message {
+    fn emit(&mut self, split: Split, scanned: Option<Scanned>) -> Message {
         let mut d = Message::default();
         match self.format {
             ReasoningFormat::Deepseek => d.reasoning = split.reasoning,
@@ -335,7 +418,7 @@ impl ChatParser {
                 }
             }
         }
-        match dsml {
+        match scanned {
             Some(s) => {
                 d.content.push_str(&s.content);
                 d.calls = s.calls;

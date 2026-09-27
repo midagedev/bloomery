@@ -32,3 +32,13 @@ It's we're they've I'm you'll he'd IT'S WE'RE THEY'VE I'M YOU'LL HE'D 'S 'x don'
  ~/foo
 a~b
 x ~= y; `~/.cargo`; a~~b
+# Digit runs: the glm4 pre-tokenizer cuts a run into words of three, qwen2 into single digits.
+7
+12
+123
+1234
+1234567
+abc1234def 7x 12ab x9
+中文123中文 数字4567 ２０２６年
+ 1234567
+x 12 345 6789 1234567 12345678901

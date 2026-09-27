@@ -85,8 +85,14 @@ pub trait Tokenizer: Send + Sync {
     fn decoder(&self) -> Box<dyn Decoder>;
     /// Beginning-of-sequence token id.
     fn bos(&self) -> u32;
-    /// End-of-generation token id.
+    /// End-of-sequence token id: the text `/props` names as `eos_token`.
     fn eos(&self) -> u32;
+    /// Every id that ends a generation (a vocabulary's end-of-generation
+    /// set: a file can name an end of turn and an end of message besides its
+    /// end of sequence). Never empty; the default is [`Tokenizer::eos`] alone.
+    fn stops(&self) -> Vec<u32> {
+        vec![self.eos()]
+    }
     /// Whether a text prompt on `/completion` gets a BOS prepended (GGUF `add_bos_token`).
     fn add_bos(&self) -> bool;
     /// Vocabulary size, which is also the logit vector length.

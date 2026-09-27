@@ -6,8 +6,9 @@
 //! is the reference's pipeline: special tokens are cut out of the text as
 //! whole pieces first (longest text first), each remaining fragment is split
 //! by the pre-tokenizer ([`pretok`]), and each word is merged by BPE rank
-//! ([`bpe`]). Decoding concatenates pieces; this vocabulary family adds no
-//! space prefix and cleans no spaces, so decoding strips nothing.
+//! ([`bpe`]). Decoding concatenates pieces as `llama_token_to_piece` renders
+//! them; this vocabulary family adds no space prefix, so decoding strips
+//! nothing.
 
 mod bpe;
 mod collapse_table;
@@ -36,7 +37,9 @@ pub enum Error {
     WrongType(&'static str),
     #[error("tokenizer model {0:?} is not supported (only gpt2)")]
     UnsupportedModel(String),
-    #[error("pre-tokenizer {0:?} is not supported (deepseek-v3, hunyuan-dense, joyai-llm, qwen2)")]
+    #[error(
+        "pre-tokenizer {0:?} is not supported (deepseek-v3, hunyuan-dense, joyai-llm, qwen2, glm4)"
+    )]
     UnsupportedPre(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },

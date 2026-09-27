@@ -1210,6 +1210,71 @@ fn hw_qwen3_template_renders_as_jinja2() {
     }
 }
 
+/// GLM-5.3-Flash's chat template renders as jinja2 does: every case of the
+/// fixture through `/apply-template` equals its reference render byte for
+/// byte, and the case jinja2 refuses (tool-call `arguments` given as a JSON
+/// string, which the template walks with `.items()`) is refused by name. The
+/// cases reach the template's twelve macros (called in output, in `+`, in
+/// `==` and as conditions), `break` in three loops, `| capitalize` on the
+/// reasoning effort, `tojson(ensure_ascii=False)`, `clear_thinking`, and the
+/// tool-result reordering by call id.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_glm5_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/glm5-chat-template.jinja"),
+    );
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/glm5-renders.json")).expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 12, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if case["error"].is_string() {
+            assert_eq!(r.status, 500, "{}: {}", case["name"], r.body);
+            let message = r.json()["error"]["message"].clone();
+            assert!(
+                message.as_str().is_some_and(|m| m.contains("items()")),
+                "{}: {message} does not name items()",
+                case["name"]
+            );
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
+/// Every id the vocabulary names as a stop ends a generation, not only its
+/// EOS: with GLM-5.3-Flash's three (the header's eos, eot and eom), a
+/// generation that emits any one of them stops there, reports `stopped_eos`,
+/// and counts the stop among its tokens. The script runs on past each stop,
+/// so a loop that stopped on the EOS alone would run to `n_predict` on the
+/// other two.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_every_stop_id_ends_a_generation() {
+    use serve::{MockTokenizer, ScriptedEngine, Tokenizer};
+    const STOPS: [u32; 3] = [154_820, 154_827, 154_829];
+    let (a, b) = (MockTokenizer.encode("a")[0], MockTokenizer.encode("b")[0]);
+    for stop in STOPS {
+        let script = vec![a, stop, b, b, b, b, b, b];
+        let engine = ScriptedEngine::from_ids(4096, script).with_stops(&STOPS);
+        let addr = common::start_with(Box::new(engine));
+        let r = post(
+            addr,
+            "/completion",
+            &json!({"prompt": "hi", "n_predict": 6, "temperature": 0}),
+        )
+        .json();
+        assert_eq!(r["stopped_eos"], true, "stop {stop}: {r}");
+        assert_eq!(r["stopped_limit"], false, "stop {stop}: {r}");
+        assert_eq!(r["tokens_predicted"], 2, "stop {stop}: {r}");
+        assert_eq!(r["content"], "a", "stop {stop}: {r}");
+    }
+}
+
 /// What request A leaves in the cache and request B shares with it (see
 /// `hw_cache_prompt_reuses_the_common_prefix`): A holds 10 ids, B's first 8 are
 /// among them.

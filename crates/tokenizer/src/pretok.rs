@@ -1,6 +1,6 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`) and [`Pre::Qwen2`] (`qwen2`).
+//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`) and [`Pre::Glm4`] (`glm4`).
 //!
 //! ## deepseek-v3
 //!
@@ -35,7 +35,7 @@
 //! splitter that reads the codepoints' flags from its Unicode tables. It
 //! differs from a regex engine in one place that matters: a position no
 //! alternative matches becomes a one-codepoint piece, so every position is
-//! consumed. [`split_qwen2`] is that function line for line. The flags it
+//! consumed. [`split_custom`] is that function line for line. The flags it
 //! reads — letter, number, whitespace — are exactly what the collapsed byte
 //! keeps: below 0x80 the reference's tables agree with the ASCII classes
 //! used here, and above it a letter collapses to its own byte, a number to
@@ -43,6 +43,19 @@
 //! codepoint with the reference's `unicode_tolower`; the only codepoints that
 //! table maps onto `s t m d r v e l` are their ASCII capitals, so ASCII
 //! lowercasing is the same test.
+//!
+//! ## glm4
+//!
+//! The reference maps `glm4` to its CHATGLM4 type, whose one regex is qwen2's
+//! with `\p{N}{1,3}` in place of `\p{N}`; that regex goes to
+//! `unicode_regex_split_custom_llama3`, the qwen2 splitter with a different
+//! digit branch and nothing else. There a run of numbers is cut into words of
+//! three from its start, the last one shorter. [`split_custom`] takes that
+//! difference as its one parameter, the longest run of numbers one word holds:
+//! 1 for qwen2, 3 for glm4. The reference cuts the whole run in one visit and
+//! the function here one word per visit; a visit that starts on a number takes
+//! the number branch (the contraction needs `'` and the letter branch refuses a
+//! number), so the words are the same.
 
 use crate::unicode::collapse;
 
@@ -202,17 +215,21 @@ pub(crate) struct Scratch {
 pub(crate) enum Pre {
     /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
     DeepseekV3,
-    /// `qwen2`: the reference's hand-written splitter.
+    /// `qwen2`: the reference's hand-written splitter, one number a word.
     Qwen2,
+    /// `glm4`: the reference's llama3 splitter, qwen2's with up to three
+    /// numbers a word.
+    Glm4,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 4] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 5] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
         ("qwen2", Pre::Qwen2),
+        ("glm4", Pre::Glm4),
     ];
 
     /// The pre-tokenizer `name` stands for; `None` for one this crate does
@@ -230,7 +247,11 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
     match pre {
         Pre::DeepseekV3 => split_deepseek_v3(cpts, s),
         Pre::Qwen2 => {
-            split_qwen2(cpts, &s.collapsed, &mut s.b);
+            split_custom(cpts, &s.collapsed, 1, &mut s.b);
+            &s.b
+        }
+        Pre::Glm4 => {
+            split_custom(cpts, &s.collapsed, 3, &mut s.b);
             &s.b
         }
     }
@@ -252,11 +273,11 @@ fn split_deepseek_v3<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     &s.b
 }
 
-/// `unicode_regex_split_custom_qwen2` over one fragment: `cpts` its
-/// codepoints, `c` their collapsed bytes; the words' lengths go to `out`.
-/// Each branch is the reference's, in its order, and names the alternative
-/// it stands for.
-fn split_qwen2(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
+/// `unicode_regex_split_custom_qwen2` (`digits` 1) or `_llama3` (`digits` 3)
+/// over one fragment: `cpts` its codepoints, `c` their collapsed bytes; the
+/// words' lengths go to `out`. Each branch is the reference's, in its order,
+/// and names the alternative it stands for.
+fn split_custom(cpts: &[u32], c: &[u8], digits: usize, out: &mut Vec<usize>) {
     out.clear();
     let end = cpts.len();
     let letter = |p: usize| p < end && is_letter(c[p]);
@@ -310,9 +331,12 @@ fn split_qwen2(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
             word(pos, &mut prev);
             continue;
         }
-        // `\p{N}`
+        // `\p{N}` (qwen2) or `\p{N}{1,3}` (glm4): up to `digits` numbers.
         if number(pos) {
-            pos += 1;
+            let start = pos;
+            while pos - start < digits && number(pos) {
+                pos += 1;
+            }
             word(pos, &mut prev);
             continue;
         }
@@ -402,6 +426,29 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Qwen2, text), want, "{text:?}");
+        }
+    }
+
+    /// The glm4 splitter is qwen2's but for its number branch: a run of
+    /// numbers is cut into words of three from its start, and every other
+    /// alternative splits as qwen2's does.
+    #[test]
+    fn glm4_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("7", &["7"]),
+            ("12", &["12"]),
+            ("123", &["123"]),
+            ("1234", &["123", "4"]),
+            ("1234567", &["123", "456", "7"]),
+            (" 12345", &[" ", "123", "45"]),
+            ("abc1234def", &["abc", "123", "4", "def"]),
+            ("x²³ ١٢٣٤", &["x", "²³", " ", "١٢٣", "٤"]),
+            ("it's", &["it", "'s"]),
+            ("a  b", &["a", " ", " b"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Glm4, text), want, "{text:?}");
         }
     }
 }
