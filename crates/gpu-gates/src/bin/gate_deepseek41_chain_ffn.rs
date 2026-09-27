@@ -1651,9 +1651,9 @@ mod gate {
             hidden: n,
             n_used: N_USED,
         };
-        let boundary = Boundary::new(gpu.context(), stream, shape, map.clone())?;
+        let boundary = Boundary::new(gpu.context(), stream, shape)?;
         let tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer, r8)?;
-        let mut hybrid = Hybrid::new(boundary, tier, hp.n_layer)?;
+        let mut hybrid = Hybrid::new(boundary, map.clone(), tier, hp.n_layer)?;
         let mut piece = FfnPiece::new(&gpu, &hp, &map)?;
         let mut op = Op::new(&gpu, &hp)?;
         let mut io = Io {

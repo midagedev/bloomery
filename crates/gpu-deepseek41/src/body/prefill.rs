@@ -59,10 +59,11 @@
 //! folds, the lists, the HC_PRE results, the images and tables — is kept per
 //! batch of the group; what it consumes before the next layer-batch's
 //! launches write it is one buffer, since the stream runs them in order; the
-//! host copies come in two sets, since the host reads them outside that
-//! order. The batch's buffers ([`Batch`]) are made by the first group, or
-//! before it by [`prepare_prefill`], never per group; the decode step's
-//! buffers and launches do not change.
+//! host copies — the host tier's batch port's — come in two sets, since the
+//! host reads them outside that order. The batch's buffers ([`Batch`]) and
+//! the port's sets are made by the first group, or before it by
+//! [`prepare_prefill`], never per group; the decode step's buffers and
+//! launches do not change.
 //!
 //! A call's plan — its batches, chunks, groups, the triangle's needs and each
 //! layer-batch's starts and sub-blocks — is [`CallPlan`], read off the same
@@ -86,12 +87,13 @@ use gguf::quant::GgmlType;
 use model::moe::UNION_MAX_COLS;
 
 use bloomery_gpu::COL_GROUP;
+use bloomery_gpu::hybrid::BatchKey;
 use bloomery_gpu::weights::DevWeight;
 
 use super::ced::{Ced, Mode};
 use super::*;
 use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
-use crate::chain::ffn::{BatchLayer, BlockIo, ExchangeKey, FfnBatch, JoinIo};
+use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -740,10 +742,10 @@ impl Member {
         self.cuts.get(k).map_or(self.u, |r| r.start - self.b)
     }
 
-    /// The host exchange's key of model layer `layer`'s block of the batch,
-    /// from its token `at` on.
-    fn key(&self, layer: usize, at: usize) -> ExchangeKey {
-        ExchangeKey {
+    /// The host tier's batch key of model layer `layer`'s block of the
+    /// batch, from its token `at` on.
+    fn key(&self, layer: usize, at: usize) -> BatchKey {
+        BatchKey {
             layer,
             set: self.set,
             at,
@@ -941,11 +943,13 @@ impl Body {
     /// The batch's buffers, made by the first call: the attention piece over
     /// the batch layout, the glue's and the MoE sub-layer's scratch, each
     /// batch's streams, folds, lists and images for a group of the most
-    /// batches `BLOOMERY_PREFILL_GROUP` gives, the staging, the host union's
-    /// scratch.
+    /// batches `BLOOMERY_PREFILL_GROUP` gives, the staging, the host tier's
+    /// batch sets for as many tokens as the MoE scratch takes, the host
+    /// union's scratch.
     fn batch_mut(&mut self, gpu: &Gpu) -> Result<&mut Batch, GpuError> {
         if self.batch.is_none() {
             let b = self.make_batch(gpu)?;
+            self.hybrid.prepare_batch(gpu.context(), b.ffn.cap())?;
             self.hybrid.host_mut().prepare_union()?;
             self.batch = Some(Box::new(b));
         }
@@ -1458,7 +1462,7 @@ impl Body {
             what: WHAT,
             missing: "the call's needs",
         })?;
-        batch.ffn.begin_group();
+        hybrid.begin_group()?;
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
             gpu,
@@ -1702,7 +1706,7 @@ impl<'a> GroupCx<'a> {
         // places.
         self.tally
             .route(i, m.set, (m.cuts.len() - full) as u64 + 3)?;
-        batch.ffn.enqueue_download(gpu, m.key(l, at))?;
+        batch.ffn.enqueue_download(gpu, self.hybrid, m.key(l, at))?;
         // The three copies to the host and the event the host waits on.
         self.tally.route(i, m.set, 4)?;
         if timed {
@@ -1850,7 +1854,7 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         if r.block.is_some() {
-            batch.ffn.enqueue_upload(gpu, m.key(l, r.at))?;
+            batch.ffn.enqueue_upload(gpu, self.hybrid, m.key(l, r.at))?;
             // The host sums' copy to the card.
             self.tally.route(i, m.set, 1)?;
             let (sin, sout) = ping(&mut own.hc, m.cur.s);

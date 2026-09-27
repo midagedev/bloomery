@@ -30,6 +30,10 @@ use crate::chain::ffn::{Ds41Host, GoFront};
 /// What the walks' errors name.
 const WHAT: &str = "deepseek41 Body::enqueue_chain";
 
+// The step port opens a walk of `PAIR_ROWS` rows as `Chain::Pair`; a replay
+// of the pair pass is served as `Rows::CHAIN`: the two must name one chain.
+const _: () = assert!(matches!(<Body as Rows>::CHAIN, Chain::Pair) && PAIR_ROWS == 2);
+
 /// An observer of the step's seams ([`super::Body::enqueue_observed`]).
 pub(super) type Observe<'o> = dyn FnMut(&Gpu, Seam<'_>) -> Result<(), GpuError> + 'o;
 
@@ -78,23 +82,11 @@ impl Port for HostLeg<'_> {
     type Error = GpuError;
     const KIND: PortKind = PortKind::Step;
 
-    /// Opens the host tier's chain of the point's rows: one row of one column
-    /// is the step, [`PAIR_ROWS`] the pair pass; any other point is refused.
+    /// Opens the host tier's step port on the point's rows
+    /// ([`Hybrid::open_step`]): one row of one column is the step,
+    /// [`PAIR_ROWS`] the pair pass; any other point is refused by name.
     fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        let chain = match (o.units, o.cols) {
-            (1, 1) => Chain::Step,
-            (PAIR_ROWS, 1) => <Body as Rows>::CHAIN,
-            (units, cols) => {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "{units} rows of {cols} columns: the host leg runs one row or \
-                         {PAIR_ROWS}, of one column"
-                    ),
-                });
-            }
-        };
-        self.hybrid.begin_chain_of(self.stream, chain)
+        self.hybrid.open_step(self.stream, o.units, o.cols)
     }
 
     fn refused(why: Refused) -> GpuError {

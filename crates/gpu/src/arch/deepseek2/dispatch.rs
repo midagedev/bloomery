@@ -8,7 +8,7 @@ use crate::flash::{
     FlashSegArgs,
 };
 use crate::head::Head;
-use crate::hybrid::{Boundary, HostExperts, Hybrid};
+use crate::hybrid::{Boundary, HostExperts, Hybrid, SlotMap};
 use crate::model::kernels::{HeadsGeom, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels};
 use crate::model::lookup::{dev_weight, f32_gain, f32_tensor, kq_weight, q8_derived};
 use crate::model::probe::{
@@ -70,7 +70,7 @@ pub(super) fn enqueue_chain<H: HostExperts>(
             mla,
             moe,
             slot == 0,
-            hybrid.as_deref_mut().map(Hybrid::boundary_mut),
+            hybrid.as_deref_mut().map(Hybrid::boundary_and_slots),
             &mut |_, _, _| Ok(()),
         )?;
         if slot == last {
@@ -93,7 +93,7 @@ pub(super) fn enqueue_chain<H: HostExperts>(
 /// the gated kernels plus this file's gather. Asynchronous throughout —
 /// capturable as a body. A layer that does not embed reads its input
 /// residual from the resident input buffer. A routed layer takes the hybrid
-/// MoE half when `hybrid` carries a boundary.
+/// MoE half when `hybrid` carries a boundary and the tier's slot map.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enqueue_layer(
     gpu: &Gpu,
@@ -105,7 +105,7 @@ pub(super) fn enqueue_layer(
     mla: &MlaParams,
     moe: Option<&MoeDims>,
     embed: bool,
-    hybrid: Option<&mut Boundary>,
+    hybrid: Option<(&mut Boundary, &SlotMap)>,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let mut i = 0usize;
@@ -138,7 +138,9 @@ pub(super) fn enqueue_layer(
             )
         })?;
         match hybrid {
-            Some(b) => enqueue_ffn_moe_hybrid(gpu, w, names, s, mla, dims, b, &mut i, obs),
+            Some((b, slots)) => {
+                enqueue_ffn_moe_hybrid(gpu, w, names, s, mla, dims, (b, slots), &mut i, obs)
+            }
             None => enqueue_ffn_moe(gpu, w, names, s, mla, dims, &mut i, obs),
         }
     } else {
@@ -815,7 +817,7 @@ fn enqueue_ffn_moe_hybrid(
     s: &mut LayerScratch,
     mla: &MlaParams,
     dims: &MoeDims,
-    b: &mut Boundary,
+    (b, slots): (&mut Boundary, &SlotMap),
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
@@ -843,7 +845,7 @@ fn enqueue_ffn_moe_hybrid(
     // With no expert on the card nothing writes `m.down` on a hybrid load: it
     // keeps the zeros it was allocated with, so every slot the combine reads
     // is zero without the memset.
-    let n_card = b.slots.on_card(names.layer);
+    let n_card = slots.on_card(names.layer);
     let card = n_card > 0;
     if card {
         m.down.zero_async(stream)?;
