@@ -45,7 +45,7 @@ A prompt does not run one decode step per token:
 
 **It runs on the public `Q3_K_M` GGUF as uploaded**, and the maintainers' gates run on that file by default ([`docs/BUILD.md`](docs/BUILD.md#the-model-file)). You can run `generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (text in, streamed text out, sampled or greedy) and `bloomery-serve-ds41` (llama-server's HTTP API with streaming, prompt-prefix reuse, reasoning and tool calls; one request at a time). The tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
-Three reference sets were made from the engine's first file (the same upload with attention, shared experts and the engram tables in Q8_0), and they are being made again from the public file: ik_llama.cpp's greedy tokens, the PPL/KLD baseline and the DSpark draft's intermediate dumps. The DSpark graph gate stays red until its set is remade.
+The reference sets the gates read come from the public file: ik_llama.cpp's greedy tokens, the PPL/KLD baseline and the DSpark draft's intermediate dumps were made again from it on 2026-09-27 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#sit10)). A gate refuses by name a set made from another file.
 
 In progress: a timed run on one RTX 3090; faster V4.1 prompts on the CPU side; DeepSeek-V4-Flash-0731.
 
@@ -126,7 +126,7 @@ The DSpark draft (about 8 GB) has been timed only on a second card. On one card 
 - **Oracle sets against ik_llama.cpp.** Intermediate tensors are dumped from ik_llama.cpp's CPU backend for V4.1 and compared per tensor and per layer. Integer outputs (engram row ids, router top-6 ids, indexer top-k lists) must match exactly, except where two candidates are within a tie band. Float outputs must stay inside bands derived from the two engines' rounding rules.
 - **Bit gates.** A captured graph replay must equal the eager run bit for bit. The skewed two-row pass must equal two single steps bit for bit, and so must a rollback. A batched prompt must leave the model in the state one step per token leaves, bit for bit, for prompts of 1 to 4096 tokens and under each prompt setting. Node and launch counts are pinned at build time.
 - **Drafts change no output.** With the DSpark or the lookup draft, greedy tokens must equal the plain run's.
-- **PPL and KLD.** Hot list, wikitext-2 at 2048 context, 4 chunks, 3090, on the engine's first file (Q8_0 attention; see Status): PPL 1.9003 (bloomery) against 1.8989 (ik_llama.cpp CPU), KLD 0.00601 ± 0.00028, same top token 97.87 % ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-ppl-kld)).
+- **PPL and KLD.** On the public file, wikitext-2 at 2048 context, 4 chunks (4,092 positions), on the RTX 3090: PPL 2.2401 (bloomery) against 2.2378 (ik_llama.cpp CPU), +0.105 %; KLD 0.00987 ± 0.00049; same top token 97.46 % ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#sit10)).
 - **A gate is shown to fail** on the defect it guards before the fix goes in. Bands are not relaxed to make a gate pass.
 
 Timing runs only on a quiet machine, under a machine-wide lease, with a witness block around every timed region. The protocol is rig-log's [`docs/quiet-machine.md`](https://github.com/midagedev/rig-log/blob/main/docs/quiet-machine.md).
