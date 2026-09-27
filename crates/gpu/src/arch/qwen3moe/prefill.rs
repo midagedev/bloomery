@@ -114,6 +114,7 @@ impl Windows {
             ids: &self.ids,
             pos0: &self.pos0,
             first: 0,
+            lane: None,
         }
     }
 }
@@ -262,7 +263,7 @@ impl Body {
         check_m(m)?;
         let Body {
             hp,
-            names,
+            plans,
             kv,
             rope,
             k,
@@ -273,7 +274,7 @@ impl Body {
         let c = PassCtx {
             gpu,
             w,
-            names,
+            plans,
             k,
             mma: *mma,
             eps: hp.rms_eps,
@@ -287,7 +288,7 @@ impl Body {
         } = prefill;
         let io = slot_windows[m - 1].io();
         let graph = gpu.capture(|_| dispatch::enqueue_pass(&c, kv, a, &io, m))?;
-        let (nodes, launches) = (graph.node_count(), dispatch::pass_launches(names, m));
+        let (nodes, launches) = (graph.node_count(), dispatch::pass_launches(plans, m));
         if nodes != launches {
             return Err(GpuError::shape(
                 WHAT,
@@ -318,7 +319,7 @@ impl Body {
         let win = self.prefill.image_windows(chunk, m)?;
         let Body {
             hp,
-            names,
+            plans,
             kv,
             rope,
             k,
@@ -329,7 +330,7 @@ impl Body {
         let c = PassCtx {
             gpu,
             w,
-            names,
+            plans,
             k,
             mma: *mma,
             eps: hp.rms_eps,
@@ -468,7 +469,7 @@ impl Body {
     ) -> Result<(), GpuError> {
         let Body {
             hp,
-            names,
+            plans,
             kv,
             rope,
             k,
@@ -478,7 +479,7 @@ impl Body {
         let c = UbCtx {
             gpu,
             w,
-            names,
+            plans,
             k,
             eps: hp.rms_eps,
             table: &rope.table,

@@ -85,6 +85,7 @@ pub enum Arch {
     Deepseek2,
     Deepseek41,
     Qwen3moe,
+    Qwen35moe,
 }
 
 impl Arch {
@@ -106,6 +107,7 @@ impl Arch {
             "deepseek2" => Ok(Arch::Deepseek2),
             "deepseek41" | DEEPSEEK4 => Ok(Arch::Deepseek41),
             "qwen3moe" => Ok(Arch::Qwen3moe),
+            "qwen35moe" => Ok(Arch::Qwen35moe),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -119,6 +121,7 @@ impl Arch {
             Arch::Deepseek2 => "deepseek2",
             Arch::Deepseek41 => "deepseek41",
             Arch::Qwen3moe => "qwen3moe",
+            Arch::Qwen35moe => "qwen35moe",
         }
     }
 }
@@ -340,7 +343,12 @@ mod tests {
 
     #[test]
     fn known_names_round_trip() {
-        for a in [Arch::Deepseek2, Arch::Deepseek41, Arch::Qwen3moe] {
+        for a in [
+            Arch::Deepseek2,
+            Arch::Deepseek41,
+            Arch::Qwen3moe,
+            Arch::Qwen35moe,
+        ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }
     }
