@@ -282,7 +282,7 @@ name = "gate_qwen3moe_flash"
 required-features = ["gpu"]
 
 [[bin]]
-name = "gate_qwen3moe_qknorm"
+name = "gate_qwen3moe_head"
 required-features = ["gpu"]
 
 [[bin]]

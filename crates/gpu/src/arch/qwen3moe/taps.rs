@@ -90,12 +90,12 @@ impl GpuModel<Body> {
         body.set_taps(gpu.stream(), on)
     }
 
-    /// Run the chain's attention on the tensor-core flash pass (`mma`) or
-    /// the scalar one from here on, in place of the pass read at load
-    /// (`BLOOMERY_GQA_MMA`) — the other of the chain's two gated attention
-    /// arithmetics, a same-class ruler for a gate. Eager mode only: a
-    /// captured graph holds the pass it was captured with, so in graph mode
-    /// this is refused; set the load's pass back before replaying one.
+    /// Run the chain's attention on the tensor-core flash pass (`mma`, the
+    /// pass a load runs) or the scalar one from here on — the other of the
+    /// chain's two gated attention arithmetics, a same-class ruler for a
+    /// gate, and not an engine path. Eager mode only: a captured graph holds
+    /// the pass it was captured with, so in graph mode this is refused; set
+    /// the tensor-core pass back before replaying one.
     pub fn set_flash_mma(&mut self, mma: bool) -> Result<(), GpuError> {
         const WHAT: &str = "qwen3moe::set_flash_mma";
         if self.mode() != StepMode::Eager {

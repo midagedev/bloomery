@@ -122,6 +122,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        bloomery_levers::at_main(&[])?;
         let gguf = open_model()?;
         let gpu = Gpu::new()?;
         let ex = ExpertKernels::load(gpu.context())?;

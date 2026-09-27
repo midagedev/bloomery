@@ -192,18 +192,19 @@ prof-gpu-p8:
 # 커널 런치당 실제 비용(리드 전용): op별 표가 답할 수 없는 것 — 한 행의 net_us가 디바이스 시간인지
 # 프로파일 자신의 제출 경로인지 — 를 두 갈래로 가른다. eager는 N런치 뒤 동기화 하나(호스트 제출과
 # 디바이스 시간 중 큰 쪽), graph는 같은 N런치를 그래프 하나로 캡처해 재생(스텝의 그래프 노드가 실제로
-# 무는 값). 빈 커널 touch가 둘의 바닥이고, f32 gemv는 행 수 셋에서 같은 프로세스로 잰다. 임대·증인은 time-gate.sh 소유.
+# 무는 값). 빈 커널 touch가 둘의 바닥이고, f32 gemv는 행 수 셋에서 같은 프로세스로 잰다. 이어서 그룹 int8 GEMM의
+# 팔들을 `gate_gemm --bench-kernels`로 잰다(ARGS, 예를 들어 `--bench-arm`은 이쪽으로 간다). 임대·증인은 time-gate.sh 소유.
 bench-gpu-kernels *ARGS:
-    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 --bin gate_gemm && bash tools/ref/time-gate.sh gate_p8 --bench-kernels && bash tools/ref/time-gate.sh gate_gemm --bench-kernels {{ARGS}}'
 
-# The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_p8 --bench-kernels --bench-arm ARM (default
+# The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_gemm --bench-kernels --bench-arm ARM (default
 # gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
 # gemm_q4k launches after the 64-launch warm-up burst; the form and its levers are in the header of tools/ref/ncu-gpu.sh.
 # Expected on main [derived, docs/research/q3next-design-report.md sections 3 and 6; not numbers of record]: L1TEX
 # 55-65 % and the top unit, about 1.29e8 LSU data-pipe wavefronts a launch, issue-active 35-40 %, tensor 22-26 %, DRAM
 # 10-15 %. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
-    ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
+    ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
 
 # The V4.1 prompt projections' counters (ncu, A6000, under the lease, lead-only): one launch each of the joined qkv, q_b,
 # wo_a heads and wo_b at m = 8 in the middle full chunk of a layer >= 2 of a P-token prompt (default 512). The launch skip
@@ -518,12 +519,10 @@ gate-qwen3moe-meta:
 gate-qwen35moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen35moe_meta -- --ignored --nocapture'
 
-# qwen3moe 커널 게이트(3090, ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). 헤드별 QK RMS 노름,
-# NEOX 로프와 K/V 캐시 쓰기(한 런치), 소프트맥스 라우터 128/8과 재정규화, 다운 `_sel`(Q6_K 새 커널, Q4_K 기존 커널),
-# GQA 플래시 디코드(스칼라·텐서 코어 두 패스). 레시피마다 바이너리 하나.
-gate-gpu-qwen3moe-qknorm:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_qknorm'
-
+# qwen3moe 커널 게이트(ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). `rope`는 헤드별 QK RMS
+# 노름과 NEOX 로프·K/V 캐시 쓰기(한 런치)를 두 절로, `router`는 소프트맥스 라우터 128/8과 재정규화, 그리고 ubatch 라우터를,
+# `down`은 다운 `_sel`(Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서
+# 코어)를 잰다. 레시피마다 바이너리 하나.
 gate-gpu-qwen3moe-rope:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_rope'
 
@@ -538,9 +537,15 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen3moe-down:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'
 
+# qwen3moe 헤드: argmax를 접은 Q6_K 투영을 `q6k_gemv` + `argmax_fault`에 대고 — logits 비트 동일, 토큰과 폴트 워드 동일,
+# 동점, NaN 행, NaN 활성, 그래프.
+gate-gpu-qwen3moe-head:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_head && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_head'
+
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
-# 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
-# fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터.
+# 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
+# fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
+# (리드 전용, `bench-gpu-kernels`).
 gate-gpu-gemm *ARGS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
@@ -564,9 +569,9 @@ gate-gpu-qwen3moe-experts:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_experts'
 
 # qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
-# 파일), graph = eager. 플래시 패스는 프로세스마다 한 번 읽으므로 MMA 기본과 스칼라(BLOOMERY_GQA_MMA=0)를 따로 돈다.
+# 파일), graph = eager. 텐서 코어 플래시(엔진 경로)로 한 번 돈다. 스칼라 패스는 (u)의 자로 eager 안에서만 돈다.
 gate-gpu-qwen3moe-e2e:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e && BLOOMERY_GQA_MMA=0 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
 # ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
 ik-greedy-qwen3moe:

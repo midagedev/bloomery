@@ -99,6 +99,9 @@ mod cli {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        bloomery_levers::at_main(&[])?;
         let timed = std::env::args().any(|a| a == "--time");
         let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
         let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;

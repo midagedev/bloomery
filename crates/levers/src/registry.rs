@@ -425,14 +425,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: "BLOOMERY_GQA_MMA",
         class: Class::T,
         kind: Kind::Flag,
-        default: Unset::Is("1"),
-        doc: "Qwen3 GQA flash: `0` runs the scalar segment pass instead of the tensor-core \
-              one, its banded twin. The `load` line prints which ran.",
-        site: Site::Direct {
-            at: &[InPlace {
-                file: "crates/gpu/src/flash_gqa.rs",
-                round: R03,
-            }],
+        default: Unset::Means("the only path"),
+        doc: "Was the Qwen3 GQA flash's scalar segment pass.",
+        site: Site::Retired {
+            why: "the tensor-core segment pass is the only Qwen3 decode flash pass; the scalar \
+                  pass is a gate's ruler, picked by `set_flash_mma`",
+            left: &[],
         },
     },
     LeverSpec {

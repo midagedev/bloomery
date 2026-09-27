@@ -53,12 +53,6 @@
 //! by the same tick that names the op; the footer prints their sum, the
 //! effective GB/s of the whole chain and the two references of
 //! docs/roofline.md so a reader sees where each op sits between them.
-//!
-//! `--bench-arm <op>` with `--bench-kernels` runs only the grouped-GEMM arm
-//! whose row is `bench op=<op>` (`gemm_q4k_moe_t4096`, say) and none of the
-//! other arms, so every `gemm_q4k` launch of the process is that arm's — the
-//! shape a counter run (`just ncu-gpu-gemm`) filters by kernel name. A name
-//! no arm carries is a named error.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -760,25 +754,6 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
 
     println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS} m_cols=1");
 
-    // `--bench-arm <op>`: that one grouped-GEMM arm and nothing else.
-    let only = {
-        let mut args = std::env::args().skip_while(|a| a != "--bench-arm");
-        match args.next() {
-            None => None,
-            Some(_) => Some(
-                args.next()
-                    .ok_or("gate_p8: --bench-arm wants an arm name (a `bench op=` value)")?,
-            ),
-        }
-    };
-    if let Some(arm) = only.as_deref() {
-        return if gemm_arms(gpu, Some(arm))? {
-            Ok(())
-        } else {
-            Err(format!("gate_p8: --bench-arm {arm} names no grouped-GEMM arm").into())
-        };
-    }
-
     {
         let mut enq = |s: &CudaStream| probe.enqueue_touch(s, &mut tbuf);
         let e = burst(stream, &mut enq)?;
@@ -913,115 +888,6 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
         print_arm("q6k_gemv_lm_head", rows, bytes, g.node_count(), e, r);
     }
 
-    gemm_arms(gpu, None)?;
-    // The grouped int8 GEMM (`bloomery_gpu::gemm`): Qwen3-30B-A3B's routed
-    // gate shape — 128 experts of 768 x 2048 Q4_K, top-8, every slot reading
-    // its token's column — and the dense 2048 x 2048 Q4_K case, each at T
-    // tokens up to the largest ubatch (4096: 32,768 routed slots). The route
-    // table is built once per T and its launch priced on its own; the GEMM
-    // arm is the GEMM alone. Beside the usual row: the
-    // arithmetic rate `2 * slots * rows * K` over the graph minimum, and that
-    // rate against the card's int8 dense tensor peak. `only` keeps the one
-    // arm of that name; the return says whether any arm ran.
-    fn gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
-        use bloomery_gpu::gemm::{
-            GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight,
-        };
-        let stream = gpu.stream();
-        let mut ran = false;
-        let gk = GemmKernels::load(gpu.context())?;
-        let name = gpu.device_name()?;
-        let peak = int8_peak_tops(&name);
-        println!(
-            "bench gemm device={name:?} int8_dense_peak_tops={}",
-            peak.map_or_else(|| "?".to_string(), |p| format!("{p}"))
-        );
-        let sink = gpu.unlabelled_sink();
-        for (label, n_exp, top_k, rows, k) in [
-            ("moe", 128usize, 8usize, 768usize, 2048usize),
-            ("dense", 1, 1, 2048, 2048),
-        ] {
-            if only.is_some_and(|o| !o.starts_with(&format!("gemm_q4k_{label}_t"))) {
-                continue;
-            }
-            let n_rows = n_exp * rows;
-            let cols = 36 * k / 256;
-            let w =
-                DeviceTensor::<u32>::upload(stream, &fill_pattern(n_rows * cols), n_rows, cols)?;
-            for t in [16usize, 64, 256, 512, 1024, 2048, 4096] {
-                let op = format!("gemm_q4k_{label}_t{t}");
-                if only.is_some_and(|o| o != op) {
-                    continue;
-                }
-                ran = true;
-                let n_slots = t * top_k;
-                let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
-                let mut act = GemmAct::new(stream, t, k)?;
-                gpu.enqueue_quantize_gemm(&xs, t, &mut act, sink)?;
-                let ids = gemm_ids(t, top_k, n_exp);
-                let ids_d = DeviceBuffer::<u32>::from_host(stream, &ids)?;
-                let mut route = GemmRoute::new(stream, n_slots, n_exp)?;
-                let input = if n_exp == 1 {
-                    gk.enqueue_route_dense(stream, n_slots, &mut route, sink)?;
-                    GemmInput::PerSlot
-                } else {
-                    let mut enq =
-                        |s: &CudaStream| gk.enqueue_route(s, &ids_d, n_slots, &mut route, sink);
-                    let e = burst(stream, &mut enq)?;
-                    let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
-                    let r = replay(stream, &g)?;
-                    print_arm(
-                        &format!("gemm_route_t{t}"),
-                        n_slots,
-                        4 * n_slots as u64,
-                        g.node_count(),
-                        e,
-                        r,
-                    );
-                    GemmInput::Shared { top_k }
-                };
-                let mut y = DeviceBuffer::<f32>::zeroed(stream, n_slots * rows)?;
-                let mut enq = |s: &CudaStream| {
-                    gk.enqueue_gemm(
-                        s,
-                        GemmArgs {
-                            ty: GemmWeight::Q4K,
-                            w: &w,
-                            rows_per_expert: rows,
-                            act: &act,
-                            route: &route,
-                            input,
-                            y: &mut y,
-                        },
-                    )
-                };
-                let e = burst(stream, &mut enq)?;
-                let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
-                let r = replay(stream, &g)?;
-                let mut hit = vec![false; n_exp];
-                for &i in &ids {
-                    hit[i as usize] = true;
-                }
-                let experts = hit.iter().filter(|&&h| h).count();
-                let n_sb = k / 256;
-                // The weights of the experts a slot picked, the activation
-                // buffers the launch reads, and the outputs it writes.
-                let bytes = (experts * rows * 144 * n_sb
-                    + t * (4 * 128 * n_sb.div_ceil(2) + 4 * 8 * n_sb + 4 * 2 * n_sb)
-                    + 4 * n_slots * rows) as u64;
-                print_arm(&op, rows, bytes, g.node_count(), e, r);
-                let ops = 2.0 * (n_slots * rows * k) as f64;
-                let tops = ops / r.0 / 1e6;
-                println!(
-                    "bench op={op} slots={n_slots} experts={experts} ops={ops:.0} tops_graph_min={tops:.2} \
-                     pct_int8_peak={}",
-                    peak.map_or_else(|| "?".to_string(), |p| format!("{:.1}", 100.0 * tops / p))
-                );
-            }
-        }
-        Ok(ran)
-    }
-
     // The grid-barrier trio. The grids are the ones the three stopped folds
     // would have launched at — 16 and 22 of this card's 82 SMs — plus one
     // block per SM and two, so the reader can see whether either price is a
@@ -1073,42 +939,6 @@ fn fill_pattern(n: usize) -> Vec<u32> {
     (0..n)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9)
         .collect()
-}
-
-/// The int8 dense tensor peak of the card named `name`, in TOPS — GA102
-/// whitepaper figures, the denominator the prefill literature report uses —
-/// or `None` for a card not listed.
-#[cfg(feature = "gpu")]
-fn int8_peak_tops(name: &str) -> Option<f64> {
-    if name.contains("A6000") {
-        Some(309.7)
-    } else if name.contains("3090") {
-        Some(284.0)
-    } else {
-        None
-    }
-}
-
-/// Expert ids for `t` tokens of `top_k` distinct experts out of `n_exp`,
-/// drawn from a fixed LCG: the bench's uniform routing.
-#[cfg(feature = "gpu")]
-fn gemm_ids(t: usize, top_k: usize, n_exp: usize) -> Vec<u32> {
-    let mut s = 0x9e37_79b9_7f4a_7c15u64;
-    let mut ids = Vec::with_capacity(t * top_k);
-    for _ in 0..t {
-        let mut pick: Vec<u32> = Vec::with_capacity(top_k);
-        while pick.len() < top_k {
-            s = s
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let e = ((s >> 33) % n_exp as u64) as u32;
-            if !pick.contains(&e) {
-                pick.push(e);
-            }
-        }
-        ids.extend(pick);
-    }
-    ids
 }
 
 /// The same pattern as f32 activations, mapped into roughly ±1 so a

@@ -43,7 +43,7 @@
 //! the merge: [`flash_gqa_kernels::gqa_flash_seg`] computes each score as
 //! the f32 dot above, [`flash_gqa_kernels::gqa_flash_seg_mma`] on the tensor
 //! cores from the query rounded to f16 (`mma.m16n8k16`, the group's eight
-//! heads in rows 0–7 of a 16-row tile). [`gqa_mma`] picks one per process.
+//! heads in rows 0–7 of a 16-row tile). The caller picks one per launch.
 //!
 //! Keys at or past the live count get weight exactly zero and are never
 //! loaded: the staging writes zero for them, so a padded row holding a NaN
@@ -119,23 +119,6 @@ const MERGE_THREADS_256: u32 = HEAD_256 as u32;
 const _: () = assert!(MERGE_THREADS_256 as usize == HEAD_256);
 // The entries' launch contracts spell GROUP and HEAD_256 out as 8 and 256.
 const _: () = assert!(GROUP == 8 && HEAD_256 == 256);
-
-/// Whether the qwen3moe chain has [`FlashGqaKernels::enqueue_pass`] run the
-/// tensor-core segment pass
-/// ([`flash_gqa_kernels::gqa_flash_seg_mma`]) rather than the f32 scalar one
-/// ([`flash_gqa_kernels::gqa_flash_seg`]): `BLOOMERY_GQA_MMA=1` (the default)
-/// picks it, `0` the scalar pass. Read once, at first use, so a captured
-/// graph and its replays run one pass; a value that is set but unusable
-/// panics rather than falling back.
-pub fn gqa_mma() -> bool {
-    static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MMA.get_or_init(|| match std::env::var("BLOOMERY_GQA_MMA") {
-        Err(_) => true,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" => false,
-        Ok(v) => panic!("BLOOMERY_GQA_MMA={v} is neither `1` nor `0`"),
-    })
-}
 
 /// Segments a `ctx`-row cache is cut into.
 #[must_use]

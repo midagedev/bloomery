@@ -11,7 +11,7 @@ use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
 use super::ubatch::{Ubatch, ubatch_size};
-use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
+use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
 use crate::gemm::GemmKernels;
 use crate::head::Head;
 use crate::model::{ChainBody, GpuModel, Instrumented, NoHost, block_count};
@@ -106,7 +106,8 @@ pub struct Body {
     /// The fused head argmax's key and ticket, back at their seeds after
     /// every launch.
     pub(super) head_state: HeadArgmaxState,
-    /// The flash pass this process runs ([`gqa_mma`]), read once at load.
+    /// The flash pass the chain runs: the tensor-core pass from load on,
+    /// the scalar one after `GpuModel::set_flash_mma(false)`.
     pub(super) mma: bool,
     /// The per-layer output copies an instrument asked for
     /// ([`Body::set_taps`]).
@@ -317,8 +318,7 @@ pub enum FlashKind {
 }
 
 impl FlashKind {
-    /// The pass a `BLOOMERY_GQA_MMA` reading names: `true` is the tensor-core
-    /// pass.
+    /// `true` is the tensor-core pass.
     #[must_use]
     pub fn from_mma(mma: bool) -> FlashKind {
         if mma {
@@ -342,15 +342,15 @@ impl GpuModel<Body> {
         })
     }
 
-    /// `ctx` cache rows, with the ubatch size and the flash pass this
-    /// process's levers name ([`ubatch_size`], [`gqa_mma`]): the options a
-    /// binary's edge passes to [`GpuModel::open`] when it takes the levers as
-    /// they are.
+    /// `ctx` cache rows, the ubatch size this process's lever names
+    /// ([`ubatch_size`]) and the tensor-core flash, the engine's only decode
+    /// pass: the options a binary's edge passes to [`GpuModel::open`] when it
+    /// takes the levers as they are.
     pub fn lever_opts(ctx: usize) -> Result<OpenOpts, GpuError> {
         Ok(OpenOpts {
             ctx,
             ubatch: ubatch_size()?,
-            flash: FlashKind::from_mma(gqa_mma()),
+            flash: FlashKind::Mma,
         })
     }
 }

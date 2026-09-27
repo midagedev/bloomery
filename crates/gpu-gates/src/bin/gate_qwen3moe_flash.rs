@@ -85,8 +85,6 @@
 //! a 16-byte boundary (the tiles copy 16-byte pieces) each refused by name
 //! before any launch — the last check, because a launch through such a
 //! window is a sticky error that ends the context.
-//!
-//! PIN(2026-09-25): removed — the engine no longer runs `qwen3moe_o_resid_quant_q4k` (the output projection with its input's q8_1 folded in, every block re-quantizing the attention row): decode was slower with it (rig-log 2026-09-25.md#qwen3fuse-regression-nsys), the step quantizes in its own launch again, and the kernel is gone with its check.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -935,6 +933,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        bloomery_levers::at_main(&[])?;
         let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-flash")?;
         let hp = Hparams::read(&split)?;
         if hp.head_dim != HEAD {

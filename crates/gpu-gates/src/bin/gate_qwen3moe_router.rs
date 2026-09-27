@@ -49,6 +49,19 @@
 //! captured graph: one node, two replays bit-identical to the eager launch,
 //! the count zero after each.
 //!
+//! The ubatch router the GEMM prefill routes with
+//! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
+//! launch) runs on the file's layer-0 router weight for T ∈ {1, 7, 8, 9, 15,
+//! 16, 17, 31, 33, 63, 512} tokens: every logit, probability, id and weight
+//! bit for bit what the fused router (`enqueue_fused`, eight tokens a launch)
+//! writes for the same columns, and every logit within `γ(k/32 + 5) · Σ
+//! |w·x|` of the f64 dot (each lane's sequential sum of `k/32` products, then
+//! the five-step butterfly), T = 4096 included, and every buffer past T's
+//! tokens still holding the sentinel written before the launch. Then its
+//! refusals (tokens past the buffers, none, a short input, a weight of the
+//! wrong shape or a `k` not a multiple of 64, a weight or an input not
+//! 16-byte aligned, a ubatch past `UBATCH` tokens).
+//!
 //! Refusals, each launch labelled with layer 13: a token with a non-finite
 //! logit raises `FaultSite::Router` with that layer, its probabilities and
 //! weights are NaN and its ids those it held before the launch, and every
@@ -81,24 +94,31 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::router::{
         MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
     };
+    use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::{
-        DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act,
+        DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, window,
     };
     use bloomery_gpu_gates::qwen3moe::sets;
+    use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
-        GateError, bits_equal, checks_failed, open_model, open_split, ref_tensor_logical_in,
-        route_ref_within, tensor_bytes_as, topk_ids_logical_within, verdict,
+        GateError, activations, bits_equal, checks_failed, open_model, open_split,
+        ref_tensor_logical_in, route_ref_within, tensor_bytes_as, topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::GgmlType;
     use model::arch::Arch;
     use model::arch::qwen3moe::hparams::{Hparams, Score};
     use model::arch::qwen3moe::names;
+    use std::mem::ManuallyDrop;
 
     /// Probabilities and weights against the host rule, absolute: both are
     /// in [0, 1] and the only divergence is `exp`'s last ulps.
     const BAND: f32 = 1e-6;
+
+    /// What the ubatch clause's f32 buffers hold before a launch, so a store
+    /// past the launch's tokens reads back as something else.
+    const SENT: f32 = 1.0e30;
 
     /// One launch's results.
     struct Routed {
@@ -625,6 +645,176 @@ mod gate {
         Ok(ok && pass)
     }
 
+    /// Token counts of the ubatch clause: every edge of the logits launch's
+    /// 32-token block and of its warps' 8-token tiles.
+    const UBATCH_TOKENS: [usize; 12] = [1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 512, UBATCH];
+
+    /// The ubatch router against the fused router and the f64 dot (module
+    /// doc), then its refusals. `w` is the router weight, [`N_EXPERT`] rows
+    /// of `k` f32.
+    fn ubatch_section(
+        gpu: &Gpu,
+        rk: &RouterKernels,
+        w: &[f32],
+        k: usize,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let wd = DeviceTensor::upload(stream, w, N_EXPERT, k)?;
+        let max = UBATCH_TOKENS[UBATCH_TOKENS.len() - 1];
+        let mut ub = RouterOut::for_ubatch(stream, max)?;
+        let mut fused = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut ok = true;
+        // What every output buffer holds before a launch: a store past the
+        // launch's T tokens reads back as something else.
+        const SENT_ID: u32 = 0xA5A5_A5A5;
+        for &t in &UBATCH_TOKENS {
+            let x = activations(k, t, 9100 + t as u32);
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            ub.logits
+                .copy_from_host(stream, &vec![SENT; ub.logits.len()])?;
+            ub.probs
+                .copy_from_host(stream, &vec![SENT; ub.probs.len()])?;
+            ub.ids
+                .copy_from_host(stream, &vec![SENT_ID; ub.ids.len()])?;
+            ub.weights
+                .copy_from_host(stream, &vec![SENT; ub.weights.len()])?;
+            rk.enqueue_ubatch(stream, &wd, &xd, t, sink, &mut ub)?;
+            stream.synchronize()?;
+            let (lg, pr, id, wt) = (
+                ub.logits.to_host_vec(stream)?,
+                ub.probs.to_host_vec(stream)?,
+                ub.ids.to_host_vec(stream)?,
+                ub.weights.to_host_vec(stream)?,
+            );
+            let sent = |v: &[f32]| v.iter().all(|x| x.to_bits() == SENT.to_bits());
+            let past_untouched = sent(&lg[t * N_EXPERT..])
+                && sent(&pr[t * N_EXPERT..])
+                && id[t * N_USED..].iter().all(|&v| v == SENT_ID)
+                && sent(&wt[t * N_USED..]);
+            let mut same = true;
+            for c0 in (0..t).step_by(MAX_TOKENS) {
+                let m = (t - c0).min(MAX_TOKENS);
+                let xc = DeviceBuffer::from_host(stream, &x[c0 * k..(c0 + m) * k])?;
+                rk.enqueue_fused(stream, &wd, &xc, m, sink, &mut fused)?;
+                stream.synchronize()?;
+                let e = N_EXPERT;
+                same &= bits_equal(
+                    &fused.logits.to_host_vec(stream)?[..m * e],
+                    &lg[c0 * e..(c0 + m) * e],
+                );
+                same &= bits_equal(
+                    &fused.probs.to_host_vec(stream)?[..m * e],
+                    &pr[c0 * e..(c0 + m) * e],
+                );
+                same &= fused.ids.to_host_vec(stream)?[..m * N_USED]
+                    == id[c0 * N_USED..(c0 + m) * N_USED];
+                same &= bits_equal(
+                    &fused.weights.to_host_vec(stream)?[..m * N_USED],
+                    &wt[c0 * N_USED..(c0 + m) * N_USED],
+                );
+            }
+            let band_n = k / 32 + 5;
+            let mut worst = 0.0f64;
+            let mut in_band = true;
+            for tok in 0..t {
+                for e in 0..N_EXPERT {
+                    let (mut dot, mut mag) = (0.0f64, 0.0f64);
+                    for i in 0..k {
+                        let p = f64::from(w[e * k + i]) * f64::from(x[tok * k + i]);
+                        dot += p;
+                        mag += p.abs();
+                    }
+                    let band = gamma(band_n) * mag;
+                    let err = (f64::from(lg[tok * N_EXPERT + e]) - dot).abs();
+                    in_band &= err <= band;
+                    if band > 0.0 {
+                        worst = worst.max(err / band);
+                    }
+                }
+            }
+            let pass = same && in_band && past_untouched;
+            println!(
+                "router ubatch T={t} ubatch_eq_fused_bits={same} logits_in_band={in_band} \
+                 worst_err_over_band={worst:.3} past_T_untouched={past_untouched} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let x = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
+        let short = DeviceBuffer::<f32>::zeroed(stream, k)?;
+        let wrong = DeviceTensor::upload(stream, &w[..64 * k], 64, k)?;
+        let k_96 = DeviceTensor::upload(stream, &w[..N_EXPERT * 96], N_EXPERT, 96)?;
+        // The logits launch copies both operands in 16-byte pieces: a window
+        // one f32 into an allocation is aligned for f32 and not for that.
+        let w_pad = DeviceBuffer::from_host(stream, &[w, &[0.0f32; 4][..]].concat())?;
+        let x_pad = DeviceBuffer::<f32>::zeroed(stream, 8 * k + 4)?;
+        let ctx = gpu.context();
+        // SAFETY: each window is the f32 span after the first element of its
+        // own live allocation, which holds four more than the span; both
+        // allocations outlive the calls below, and the windows are given
+        // back right after them.
+        let (w_off, x_off) = unsafe {
+            (
+                DeviceTensor::<f32>::window(w_pad.cu_deviceptr() + 4, N_EXPERT, k, ctx),
+                window::<f32>(x_pad.cu_deviceptr() + 4, 8 * k, ctx),
+            )
+        };
+        let weight_misaligned = rk
+            .enqueue_ubatch(stream, &w_off, &x, 8, sink, &mut ub)
+            .is_err();
+        let input_misaligned = rk
+            .enqueue_ubatch(stream, &wd, &x_off, 8, sink, &mut ub)
+            .is_err();
+        DeviceTensor::release(w_off);
+        drop(ManuallyDrop::into_inner(x_off).into_raw_parts());
+        let refusals = [
+            (
+                "tokens_past_buffers",
+                rk.enqueue_ubatch(stream, &wd, &x, max + 1, sink, &mut ub)
+                    .is_err(),
+            ),
+            (
+                "no_tokens",
+                rk.enqueue_ubatch(stream, &wd, &x, 0, sink, &mut ub)
+                    .is_err(),
+            ),
+            (
+                "short_input",
+                rk.enqueue_ubatch(stream, &wd, &short, 2, sink, &mut ub)
+                    .is_err(),
+            ),
+            (
+                "weight_rows",
+                rk.enqueue_ubatch(stream, &wrong, &x, 8, sink, &mut ub)
+                    .is_err(),
+            ),
+            (
+                "k_not_64",
+                rk.enqueue_ubatch(stream, &k_96, &x, 8, sink, &mut ub)
+                    .is_err(),
+            ),
+            ("weight_misaligned", weight_misaligned),
+            ("input_misaligned", input_misaligned),
+            (
+                "ubatch_over_limit",
+                RouterOut::for_ubatch(stream, UBATCH + 1).is_err(),
+            ),
+            ("ubatch_empty", RouterOut::for_ubatch(stream, 0).is_err()),
+        ];
+        let all = refusals.iter().all(|(_, r)| *r);
+        println!(
+            "router ubatch refusals {} {}",
+            refusals
+                .iter()
+                .map(|(n, r)| format!("{n}={}", if *r { "refused" } else { "ACCEPTED" }))
+                .collect::<Vec<_>>()
+                .join(" "),
+            verdict(all)
+        );
+        Ok(ok && all)
+    }
+
     /// The model layer the refusal cases label their launches with, so the
     /// word shows each launcher carried its caller's label.
     const FAULT_LAYER: usize = 13;
@@ -903,6 +1093,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        bloomery_levers::at_main(&[])?;
         let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-router")?;
         let hp = Hparams::read(&split)?;
         let e = hp.experts;
@@ -1139,6 +1332,8 @@ mod gate {
         ok &= pass;
 
         ok &= norm_section(&gpu, &gguf, &k, hp.rms_eps)?;
+        let (w0, k0) = router_weight_host(&gguf, 0)?;
+        ok &= ubatch_section(&gpu, &k, &w0, k0)?;
         ok &= fault_section(&gpu, &gguf, &k, hp.rms_eps)?;
 
         println!("gate_qwen3moe_router: {}", verdict(ok));

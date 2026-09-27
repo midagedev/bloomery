@@ -92,8 +92,9 @@
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x).
 //!
-//! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
-//! pass is its own run; the `load` line names it.
+//! The chain runs the tensor-core flash pass, the engine's; the scalar pass
+//! runs only eagerly as (u)'s ruler (`set_flash_mma`), and the kernel itself
+//! is `gate_qwen3moe_flash`'s. The `load` line names the pass.
 //!
 //! `--dump DIR` also writes each greedy prompt's tokens (u32 LE) and last
 //! logits (f32 LE) of the graph, the eager and the prefilled pass as raw
@@ -162,8 +163,8 @@ mod gate {
     /// oracle's five tokens and the prompts' concatenation fit far below).
     const CTX: usize = 1344;
 
-    /// The GEMM clause's prompt lengths: three ubatch-sized units each, the
-    /// last a one-id pass and a 276-id ubatch.
+    /// The GEMM clause's prompt lengths: at the default ubatch size (4,096,
+    /// its arena clipped to the [`CTX`]-row cache) each is one ubatch.
     const LONG: [usize; 2] = [1025, 1300];
 
     /// Where the split GEMM prefill of the longer prompt cuts it: off every
@@ -325,6 +326,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--ppl") {
             let tag = args.get(i + 1).ok_or("--ppl needs a tag")?;

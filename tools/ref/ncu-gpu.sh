@@ -19,7 +19,7 @@
 #
 # The grouped GEMM form (BLOOMERY_NCU_FORM=gemm, `just ncu-gpu-gemm [ARM]`): the counters of one
 # bench arm of the grouped int8 GEMM instead of a decode step. The profiled command is
-# `gate_p8 --bench-kernels --bench-arm ARM` (BLOOMERY_NCU_GEMM_ARM, default gemm_q4k_moe_t4096:
+# `gate_gemm --bench-kernels --bench-arm ARM` (BLOOMERY_NCU_GEMM_ARM, default gemm_q4k_moe_t4096:
 # Qwen3's routed gate shape, 128 experts of 768 x 2048 Q4_K, top-8, T = 4096), which runs that one
 # arm and none of the others, so every `gemm_q4k` launch in the process is the arm's and no skip has
 # to be counted across the other arms (the depth form's two wrong skips above are what that saves).
@@ -227,7 +227,7 @@ source_pages() {
 }
 
 if [ "$FORM" = gemm ]; then
-  GEMM_BIN=${BLOOMERY_NCU_GEMM_BIN:-target/release/gate_p8}
+  GEMM_BIN=${BLOOMERY_NCU_GEMM_BIN:-target/release/gate_gemm}
   GEMM_ARM=${BLOOMERY_NCU_GEMM_ARM:-gemm_q4k_moe_t4096}
   GEMM_KERNELS=${BLOOMERY_NCU_KERNELS:-^gemm_q4k}
   GEMM_SKIP=${BLOOMERY_NCU_SKIP:-64}
@@ -249,7 +249,7 @@ if [ "$FORM" = gemm ]; then
   GEMM_METRICS+=,dram__throughput.avg.pct_of_peak_sustained_elapsed
   case $GEMM_ARM in
     gemm_q4k_*_t*) ;;
-    *) echo "ncu-gpu.sh: BLOOMERY_NCU_GEMM_ARM is a gate_p8 grouped-GEMM arm (gemm_q4k_<label>_t<T>), got '$GEMM_ARM'" >&2; exit 64 ;;
+    *) echo "ncu-gpu.sh: BLOOMERY_NCU_GEMM_ARM is a gate_gemm grouped-GEMM arm (gemm_q4k_<label>_t<T>), got '$GEMM_ARM'" >&2; exit 64 ;;
   esac
   case "$GEMM_SKIP:$COUNT" in
     *[!0-9:]* | :* | *:) echo "ncu-gpu.sh: BLOOMERY_NCU_SKIP and BLOOMERY_NCU_COUNT are whole numbers, got '$GEMM_SKIP' and '$COUNT'" >&2; exit 64 ;;
