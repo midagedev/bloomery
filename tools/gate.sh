@@ -18,11 +18,10 @@
 # A third failure it closes: a filter that matches nothing. libtest passes a run of 0 tests, so a
 # call whose test-name filter names no test that exists (or none that runs under its ignore flags) is
 # green and checks nothing. A call that carries a filter — an argument after its `--` that is not a
-# flag, nor the value of `--skip`, `--test-threads`, `--format`, `--color`, `--logfile`, `-Z` or
-# `--shuffle-seed` — and that cargo ends with 0 fails with 78 when the `passed` counts of its
-# `test result:` lines sum to 0 over the whole call (one target printing "running 0 tests" is normal:
-# `--lib --test x -- f` names a test of one target). A call with no filter, or with `--list`, is not
-# judged.
+# flag, nor the value of an option in LIBTEST_VALUE below — and that cargo ends with 0 fails with 78
+# when the `passed` counts of its `test result:` lines sum to 0 over the whole call (one target
+# printing "running 0 tests" is normal: `--lib --test x -- f` names a test of one target). A call with
+# no filter, or with `--list`, is not judged.
 #
 # Exit codes: cargo's own (0 green, 101 a test failed, …); 124 or 137 the bound ran out; 64 the bound
 # was refused; 78 a filter matched no test that passed.
@@ -35,6 +34,16 @@ if [ "${1:-}" = --oxide ]; then
   shift
   RUN=(cargo oxide test --arch sm_86 --)
 fi
+# The libtest options that take a value. The one list: tools/recipes.py reads this line (by its
+# `LIBTEST_VALUE=(` prefix, one line, one word per option) to tell a recipe's filters from values.
+LIBTEST_VALUE=(--skip --test-threads --format --color --logfile -Z --shuffle-seed)
+takes_value() {
+  local o
+  for o in "${LIBTEST_VALUE[@]}"; do
+    [ "$1" = "$o" ] && return 0
+  done
+  return 1
+}
 FILTERS=()
 LISTING=0
 after=0
@@ -48,8 +57,11 @@ for a in "$@"; do
     value=0
     continue
   fi
+  if takes_value "$a"; then
+    value=1
+    continue
+  fi
   case $a in
-    --skip | --test-threads | --format | --color | --logfile | -Z | --shuffle-seed) value=1 ;;
     --list) LISTING=1 ;;
     -*) ;;
     *) FILTERS+=("$a") ;;
@@ -66,6 +78,7 @@ else
   if [ "$rc" -eq 0 ]; then
     passed=$(awk '/^test result: / { for (i = 2; i <= NF; i++) if ($i == "passed;") n += $(i - 1) } END { print n + 0 }' "$LOG")
     if [ "$passed" -eq 0 ]; then
+      # tools/recipes.py's self-test reads the filters back from this line: keep "the filter … matched no test".
       echo "GATE RED (exit 78): the filter ${FILTERS[*]} matched no test — 0 passed over the whole call" >&2
       exit 78
     fi
