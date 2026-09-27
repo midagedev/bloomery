@@ -79,9 +79,15 @@
 #             table: T/s = P / TTFT.
 # ik and mainline feed std::rand() ids, prefill and steps alike; mistral.rs feeds prompt ids 1000 +
 # (start + i) mod 2048 and then its greedy continuation; ours feeds its greedy continuation, which
-# is why our row carries distinct_tokens. Every arm is one process — a model load, the prefill, N
-# steps (mistral.rs: its warmup request, then the timed one) — and the four engines open the one
-# file.
+# is why our row carries distinct_tokens. Every reference arm is one process — a model load, the
+# prefill, N steps (mistral.rs: its warmup request, then the timed one) — and the four engines open
+# the one file. Our arms of one round that share a load key — this binary and C — run in one process
+# (generate_qwen3moe --arm <ids> ... --arm-sync), the engine cleared between them (app::Session::clear),
+# each arm between its own witness blocks, its row carrying `slot <k>/<n>`, its place in its load; the
+# load's lines print once under `[load]`, and the timing card's guard runs before each load's process
+# (after that the process holds the card). The grouping, the order (the units and the arms in each
+# rotated by round) and the driver are tools/ref/load-groups.sh's, shared with depth-ds41.sh:
+# BLOOMERY_AB_LOAD=arm runs every arm in a process of its own. A failed arm ends the runner, as before.
 #
 # Flags. The ours, ik and lcpp arms hold every layer, the output head and an f16 K/V cache on the
 # card (llama-bench's -ctk/-ctv default is f16; ours keeps f16 planes), so a step reads the same
@@ -250,6 +256,15 @@ for a in "${ARMS[@]}"; do
     exit 64
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_BIN+=("$bin")
+done
+# The load keys (tools/ref/load-groups.sh): an ours arm's binary and its --ctx, the cache height and the
+# flash grid the load fixes, so ours arms share a load when they share C (BLOOMERY_GEN_CTX, or one D).
+# shellcheck source=tools/ref/load-groups.sh
+source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
+arm_ctx() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
+for i in "${!ARMS[@]}"; do
+  LG_KEY[i]=
+  [ "${A_KIND[$i]}" != ours ] || LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")"
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
 # shellcheck source=tools/ref/timing-card.sh
@@ -487,16 +502,26 @@ pp_col() {
 # under the arm's label.
 # ours_arm <index> <round>
 ours_arm() {
-  local i=$1 r=$2 dep label bin ctx out rc t0 t1 smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50
-  dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
-  ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
-  witness "pre r$r $label d=$dep n=$N ctx=$ctx"
+  local i=$1 r=$2 out rc t0 t1
+  ours_pre "$i" "$r"
   t0=$(date +%s)
-  out=$(timeout --kill-after=10 "$BOUND" "$bin" --tokens "$(lcg_prompt "$dep")" -n "$N" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
+  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(lcg_prompt "${A_DEP[$i]}")" -n "$N" --ctx "$(arm_ctx "$i")" --time ${WARM:+--warm "$WARM"} 2>&1)
   rc=$?
   t1=$(date +%s)
+  ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
+}
+# ours_pre <index> <round>: the witness block before an ours or bin arm.
+ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "$1")"; }
+# ours_post <index> <round> <rc> <output> <wall s>: the witness block after an ours or bin arm, then its
+# row; a failed arm ends the runner. An output that opens with an `arm` line (an --arm list's) gives the
+# row its slot in the load.
+ours_post() {
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot=''
+  dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
   witness "post r$r $label d=$dep n=$N ctx=$ctx"
-  if [ $rc -ne 0 ]; then
+  a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
+  [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
+  if [ "$rc" -ne 0 ]; then
     echo "r$r $label d=$dep ctx=$ctx FAILED rc=$rc" >&2
     echo "$out" | tail -n 20 >&2
     exit 1
@@ -511,16 +536,67 @@ ours_arm() {
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
+  [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
   series=$(echo "$out" | awk '/^time step /{sub(/.*ms=/,""); print}')
   h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "ROW r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+  echo "ROW r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$slot | wall ${wall}s$OTHER_BUSY_TAG"
   count_row
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$OTHER_BUSY_TAG")
+}
+# The driver's hooks (tools/ref/load-groups.sh). The timing card must be free before the load's process
+# starts: after that the process itself holds it between its arms. The load's lines echoed once; its
+# capture line's node count goes into every row of the load (LG_HEADER).
+LG_HEADER_RE='^(load|capture) '
+lg_cmd() {
+  local i
+  LG_ENV=()
+  LG_CMD=("$BIN")
+  for i in "$@"; do LG_CMD+=(--arm "$(lcg_prompt "${A_DEP[$i]}")"); done
+  # shellcheck disable=SC2206 # an empty WARM adds nothing
+  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" --time ${WARM:+--warm "$WARM"} --arm-sync)
+}
+lg_before_load() {
+  guard_other
+  guard_timing
+}
+lg_pre() { ours_pre "$@"; }
+lg_post() { ours_post "$@"; }
+# run_unit <round> <index...>: one unit of a round: the ours arms of one load key in one process, or one
+# reference or bin: arm after the card guards.
+run_unit() {
+  local r=$1 a
+  shift
+  if lg_grouped "$1"; then
+    lg_run_unit "$r" "$@"
+    return
+  fi
+  a=${ARMS[$1]}
+  guard_other
+  guard_timing
+  case ${A_KIND[$1]} in
+    ref) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
+    *) ours_arm "$1" "$r" ;;
+  esac
+}
+# round_order <round>: the round's arms in order and its loads, into ORDER_ARMS and ORDER_LOADS.
+round_order() {
+  local r=$1 line i o='' u=''
+  local -a units idx names
+  lg_units "${!ARMS[@]}"
+  mapfile -t units < <(lg_round "$r")
+  for line in "${units[@]}"; do
+    read -r -a idx <<< "$line"
+    names=()
+    for i in "${idx[@]}"; do names+=("${ARMS[$i]}"); done
+    o+="${o:+ }${names[*]}"
+    if lg_grouped "${idx[0]}"; then u+="${u:+ }[${names[*]}]"; else u+="${u:+ }${names[*]}"; fi
+  done
+  ORDER_ARMS=$o ORDER_LOADS=$u
 }
 
 # ratio_table <prefix> <keys> <labels> <tagged>: records `label|key|round|value|extra` on stdin; for
@@ -570,16 +646,20 @@ if [ -n "$DRY" ]; then
       ref_cmd "${a%%:*}" "$dep"
       echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
     else
-      ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
+      ctx=$(arm_ctx "$i")
       note=''
       [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
-      echo "[dry] $a: timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens <lcg_prompt $dep> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
+      if lg_grouped "$i"; then
+        echo "[dry] $a: one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${A_BIN[$i]} --arm <lcg_prompt $dep> ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}"
+      else
+        echo "[dry] $a: timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens <lcg_prompt $dep> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
+      fi
     fi
   done
   for r in $(seq "$ROUNDS"); do
-    order=()
-    for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
-    echo "[dry] round $r order: ${order[*]}"
+    round_order "$r"
+    echo "[dry] round $r order: $ORDER_ARMS"
+    echo "[dry] round $r loads: $ORDER_LOADS"
   done
   exit 0
 fi
@@ -600,15 +680,11 @@ guard_timing
 sums=() pp_sums=()
 n_rows=0 other_rows=0
 for r in $(seq "$ROUNDS"); do
-  for i in $(seq 0 $((${#ARMS[@]} - 1))); do
-    j=$(((i + r - 1) % ${#ARMS[@]}))
-    a=${ARMS[$j]}
-    guard_other
-    guard_timing
-    case ${A_KIND[$j]} in
-      ref) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
-      *) ours_arm "$j" "$r" ;;
-    esac
+  lg_units "${!ARMS[@]}"
+  mapfile -t units < <(lg_round "$r")
+  for line in "${units[@]}"; do
+    read -r -a idx <<< "$line"
+    run_unit "$r" "${idx[@]}"
   done
 done
 echo

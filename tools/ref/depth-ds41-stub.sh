@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py and tools/bloomery, and a copy of
+# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh and tools/bloomery, and a copy of
 # lease.sh whose lease_take is replaced by a line that takes nothing; ref-paths.sh there is a stub
 # profile whose engines are stub scripts (llama-bench, generate_ds41, nvidia-smi) and whose MODEL is
 # gguf-ranges.py's two-shard fixture. Nothing it starts loads a model or touches a card.
@@ -35,6 +35,16 @@
 #                --n-cpu-moe 2 with --progress, and each block's rotation, then rc 0.
 #   blocks-ph    BLOOMERY_AB_ORDER=blocks BLOOMERY_PREHEAT=1, lcpp:6 lcpp2:6, one round: the preheat runs
 #                before every reference process, the discard's at the block's largest K (2).
+#   grouped      6 4 code:4 lcpp:6, two rounds, no warm-up: the three generate_ds41 arms share one load a
+#                round (one --arm list a process, 6 4 code:4 then 4 code:4 6: the units and the arms in
+#                them rotated), each row between its own witness blocks and carrying its slot, the load's
+#                lines once under [load], and the slot summary. Red on the runner before loads: a process
+#                per arm, no --arm.
+#   group-fail   6 4 5 with depth 4 refused once: the load's process ends at arm 4, a FAIL row, and 5 runs
+#                in a fresh load.
+#   load-arm     BLOOMERY_AB_LOAD=arm: every arm its own process.
+#   solo         6 4 6@BLOOMERY_AB_LOAD=arm: the marked arm alone, under its own label and ratio.
+#   grouped-dry  the dry run's loads per round and a grouped arm's command line.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -46,7 +56,8 @@ T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/bin" "$T/data/engram" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
-  "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" "$T/tools/ref/"
+  "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
+  "$ROOT/tools/ref/load-groups.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2
@@ -113,30 +124,43 @@ cp "$T/bin/bench" "$T/bin/ik-bench"
 mv "$T/bin/bench" "$T/bin/lcpp-bench"
 touch "$T/Cargo.toml"
 # The stub generate_ds41: refuses depth STUB_GEN_FAIL_DEPTH the first time (a marker file), and names
-# STUB_GEN_PLACE in its SMOKE footer when set.
+# STUB_GEN_PLACE in its SMOKE footer when set. Under --arm it runs the list after one `load` line, each
+# arm opening with its `arm` record and, under --arm-sync, waiting for a line on stdin; every process
+# appends a line to $TMPDIR/stub-gen-loads.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
-depth='' n=32 place=a tokens=''
+depth='' n=32 place=a tokens='' sync='' arms=()
 while [ $# -gt 0 ]; do
   case $1 in
     --depth) depth=$2; shift ;; --tokens) tokens=$2; shift ;; -n) n=$2; shift ;; --place) place=$2; shift ;;
-    --warm) shift ;;
+    --warm) shift ;; --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;;
   esac
   shift
 done
+echo "${arms[*]:-one}" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ -z "$tokens" ] || depth=$(echo "$tokens" | tr ',' '\n' | grep -c .)
-mark=${TMPDIR:-/tmp}/stub-gen-failed-$depth
-if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
-  touch "$mark"
-  echo "plan place=$place (stub)"
-  echo "error: the stub refuses depth $depth once" >&2
-  exit 3
-fi
-echo "fed ids=$depth first=[1,2,3,4] last=[5,6,7,8] depth_sequence_from=0"
-echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=batch"
-for i in $(seq 0 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; done
-for i in $(seq 1 $((n - 1))); do echo "time step $i ms=33.0000"; done
-echo "SMOKE mode=graph place=${STUB_GEN_PLACE:-$place} prompt_tokens=0 depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=33.0000 mean_ms=33.0000 tok/s(p50)=30.30"
+[ ${#arms[@]} -gt 0 ] || arms=("$depth")
+echo "plan place=$place (stub)"
+echo "load place=$place arms=${#arms[@]} (stub)"
+for k in "${!arms[@]}"; do
+  a=${arms[$k]} feed=lcg
+  case $a in *:*) feed=${a%%:*} depth=${a#*:} ;; *) depth=$a ;; esac
+  if [ -n "$sync" ]; then
+    echo "arm i=$k arms=${#arms[@]} feed=$feed ids=$depth n=$n"
+    read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }
+  fi
+  mark=${TMPDIR:-/tmp}/stub-gen-failed-$depth
+  if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
+    touch "$mark"
+    echo "error: the stub refuses depth $depth once" >&2
+    exit 3
+  fi
+  echo "fed ids=$depth first=[1,2,3,4] last=[5,6,7,8] depth_sequence_from=0"
+  echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=batch"
+  for i in $(seq 0 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; done
+  for i in $(seq 1 $((n - 1))); do echo "time step $i ms=33.0000"; done
+  echo "SMOKE mode=graph place=${STUB_GEN_PLACE:-$place} prompt_tokens=0 depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=33.0000 mean_ms=33.0000 tok/s(p50)=30.30"
+done
 EOF
 chmod +x "$T/bin/"* "$T/target/release/generate_ds41"
 
@@ -153,7 +177,7 @@ stub_run() {
   shift
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
-  rm -f "$tmp/tmp"/stub-gen-failed-*
+  rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     BLOOMERY_CPU_BUSY_COMMS=none "${e[@]}" bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
   RC=$?
@@ -178,7 +202,7 @@ elif want failed-arm "$L" 2 '^FAIL r[12] lcpp2 d=6 rc=1 \| no .tg4 @ d6. row; la
   want failed-arm "$L" 1 '^    dropped: ours at 4$' &&
   want failed-arm "$L" 0 '^mean (pp )?(lcpp2|ours) (d|p)=4|^mean lcpp2 ' &&
   want failed-arm "$L" 1 '^ratio d=6 +ours/lcpp ' &&
-  want failed-arm "$L" 1 '^failed arms: r1 lcpp2 d=6 rc=1; r1 ours d=4 rc=3; r2 lcpp2 d=6 rc=1; $'; then
+  want failed-arm "$L" 1 '^failed arms: r1 ours d=4 rc=3; r1 lcpp2 d=6 rc=1; r2 lcpp2 d=6 rc=1; $'; then
   pass failed-arm
 fi
 if [ "$RC" = 1 ] && grep -q '^failed arms: ' "$L"; then
@@ -293,9 +317,85 @@ elif want blocks-ph "$L" 3 '^preheat ' &&
   pass blocks-ph
 fi
 
+LOADS=$tmp/tmp/stub-gen-loads
+L=$tmp/grouped.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 -- 6 4 code:4 lcpp:6
+want_seq="ROW r1 ours d=6
+ROW r1 ours d=4
+ROW r1 code d=4
+ROW r1 lcpp d=6
+ROW r2 lcpp d=6
+ROW r2 ours d=4
+ROW r2 code d=4
+ROW r2 ours d=6"
+seq=$(grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$L")
+if [ "$RC" != 0 ]; then
+  fail grouped "rc $RC, want 0" "$L"
+elif [ "$seq" != "$want_seq" ]; then
+  fail grouped "the rows' heads are not the load order: $(echo "$seq" | paste -sd'|' -)" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 4 code:4|4 code:4 6" ]; then
+  fail grouped "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 4 code:4|4 code:4 6" "$L"
+elif want grouped "$L" 2 '^\[load\] r[12] 3 arm\(s\): ' &&
+  want grouped "$L" 2 '^    load place=a arms=3 \(stub\)$' &&
+  want grouped "$L" 1 '^ROW r1 ours d=6 .*\| majflt [0-9]+ \(timed [0-9]+; .*\| slot 1/3 \| wall ' &&
+  want grouped "$L" 1 '^ROW r2 ours d=6 .*\| slot 3/3 \| wall ' &&
+  want grouped "$L" 1 '^ROW r1 code d=4 .*\| slot 3/3 \| wall ' &&
+  want grouped "$L" 1 '^ROW r2 code d=4 .*\| slot 2/3 \| wall ' &&
+  want grouped "$L" 0 '^ROW r[12] lcpp .*\| slot ' &&
+  want grouped "$L" 1 '^slots ours p=6 .*first: pp 60.00 tg 30.30 \(n=1\)  later: pp 60.00 tg 30.30 \(n=1\)  later/first pp 1.0000$' &&
+  want grouped "$L" 12 '^--- witness (pre|post) r[12] (ours|code) '; then
+  pass grouped
+fi
+
+L=$tmp/group-fail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_GEN_FAIL_DEPTH=4 -- 6 4 5
+if [ "$RC" != 1 ]; then
+  fail group-fail "rc $RC, want 1" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 4 5|5" ]; then
+  fail group-fail "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 4 5|5" "$L"
+elif want group-fail "$L" 1 '^ROW r1 ours d=6 .*\| slot 1/3 \|' &&
+  want group-fail "$L" 1 '^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once' &&
+  want group-fail "$L" 1 '^\[load\] r1: arm 4 failed \(rc 3\); the 1 arm\(s\) after it run in a fresh load$' &&
+  want group-fail "$L" 1 '^ROW r1 ours d=5 .*\| slot 1/1 \|' &&
+  want group-fail "$L" 1 '^failed arms: r1 ours d=4 rc=3; $'; then
+  pass group-fail
+fi
+
+L=$tmp/load-arm.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_AB_LOAD=arm -- 6 4
+if [ "$RC" != 0 ]; then
+  fail load-arm "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6|4" ]; then
+  fail load-arm "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6|4" "$L"
+elif want load-arm "$L" 2 '^ROW r1 ours d=[46] .*\| slot 1/1 \|'; then
+  pass load-arm
+fi
+
+L=$tmp/solo.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 4 6@BLOOMERY_AB_LOAD=arm
+if [ "$RC" != 0 ]; then
+  fail solo "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 4|6" ]; then
+  fail solo "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 4|6" "$L"
+elif want solo "$L" 1 '^ROW r1 ours@BLOOMERY_AB_LOAD=arm d=6 .*\| slot 1/1 \|' &&
+  want solo "$L" 1 '^ratio d=6 +ours/ours@BLOOMERY_AB_LOAD=arm '; then
+  pass solo
+fi
+
+L=$tmp/grouped-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 -- 6 4 lcpp:6
+if [ "$RC" != 0 ]; then
+  fail grouped-dry "rc $RC, want 0" "$L"
+elif want grouped-dry "$L" 1 '^\[dry\] round 1 loads: \[6 4\] lcpp:6$' &&
+  want grouped-dry "$L" 1 '^\[dry\] round 2 loads: lcpp:6 \[4 6\]$' &&
+  want grouped-dry "$L" 1 '^\[dry\] 4: one arm of a load: .*generate_ds41 --arm 4 -n 4 --place a --time --arm-sync '; then
+  pass grouped-dry
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
-    "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log; do
+    "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
+    "$tmp"/solo.log "$tmp"/grouped-dry.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done

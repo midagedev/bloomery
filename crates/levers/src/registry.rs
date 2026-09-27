@@ -911,6 +911,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          order; `blocks` runs each engine's arms together after one discarded process.",
     ),
     runner(
+        "BLOOMERY_AB_LOAD",
+        Some("ref/load-groups.sh"),
+        "`tools/ref/depth-ds41.sh` and `depth-qwen3moe.sh`: `key` (unset) runs a round's arms of \
+         one load key in one process, the engine cleared between them; `arm` runs each arm in a \
+         process of its own. An arm's own `@BLOOMERY_AB_LOAD=arm` runs that arm alone.",
+    ),
+    runner(
         "BLOOMERY_AB_ROUNDS",
         Some("ref/ab-decode.sh"),
         "The A/B and depth runners: the rounds each arm runs.",

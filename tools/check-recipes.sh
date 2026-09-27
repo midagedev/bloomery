@@ -137,6 +137,14 @@ if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${bt##*$'\n'}"
+# load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
+# rotation are tested on fixed keys, no process started.
+if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
+  echo "$lg" >&2
+  echo "check-recipes: the load-groups self-test failed" >&2
+  exit 1
+fi
+echo "${lg##*$'\n'}"
 # Every Python tool's own tests, on the Mac (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(

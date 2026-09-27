@@ -4,7 +4,8 @@
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph] [--prefill auto|pass|gemm]
-//!                       [--time [--warm W]]
+//!                       [--time [--warm W]] [--logits]
+//!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!
 //! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. A flag given twice
 //! takes its last value. `--prompt` tokenizes the text with the file's own vocabulary
@@ -56,6 +57,20 @@
 //! leaves. The tokens it prints are meaningless; only the timing is. Its
 //! `time prompt` row is that one token's prefill, `n=1`.
 //!
+//! `--arm a,b,c[/N]` runs several arms after one load (`app::Session::arms`),
+//! in the order given: each prefills its ids and generates its `N` (`-n`
+//! when it names none), and each after the first starts from the session's
+//! clear, so it prints what it prints in a fresh process. Each arm opens
+//! with `arm i=<i> arms=<k> ids=<P> n=<N>` and its `prompt_ids` line, then
+//! the lines a one-prompt run prints from `step 0` on; the load and capture
+//! lines print once, before arm 0. `--arm` does not mix with `--prompt`,
+//! `--tokens` or `--seed-depth`. `--arm-sync` makes each arm wait, after its
+//! `arm` line, for one line on stdin: the timing runner takes its witness
+//! blocks there. A failed arm ends the process, naming the arm.
+//!
+//! `--logits` prints `logits n= argmax= fnv64=` after the `tokens` line: the
+//! head's last logits row, read back once, by its f32 bits (FNV-1a 64).
+//!
 //! `--time` is a MEASUREMENT and belongs under the machine-wide lease
 //! (`tools/ref/time-gate.sh`), never at a bare prompt. The cache's
 //! height is `--ctx`: the flash's segment grid is fixed by it, so a timed
@@ -74,6 +89,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod cli {
+    use app::Session;
     use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, Qwen3moeModel};
@@ -84,11 +100,16 @@ mod cli {
 
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
+        Ok(flags(name)?.pop())
+    }
+
+    /// Every value of flag `name`, in order.
+    fn flags(name: &str) -> Result<Vec<String>, GateError> {
         let args: Vec<String> = std::env::args().collect();
-        let mut out = None;
+        let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
             if a == name {
-                out = Some(
+                out.push(
                     args.get(i + 1)
                         .ok_or_else(|| format!("{name} needs a value"))?
                         .clone(),
@@ -98,11 +119,39 @@ mod cli {
         Ok(out)
     }
 
+    /// Comma-separated ids.
+    fn ids_of(s: &str) -> Result<Vec<u32>, GateError> {
+        Ok(s.split(',')
+            .map(|v| v.trim().parse::<u32>())
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// What every arm of the run shares.
+    struct Run {
+        timed: bool,
+        warm: usize,
+        mode: StepMode,
+        path: PrefillPath,
+        seed_depth: Option<usize>,
+        logits: bool,
+        tok: Option<Tokenizer>,
+        /// `--ctx`, as the `SMOKE` line prints it.
+        ctx: usize,
+    }
+
+    /// One arm: its ids and its generated count.
+    struct Arm {
+        ids: Vec<u32>,
+        n_gen: usize,
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
         bloomery_levers::at_main(&[])?;
         let timed = std::env::args().any(|a| a == "--time");
+        let sync = std::env::args().any(|a| a == "--arm-sync");
+        let logits = std::env::args().any(|a| a == "--logits");
         let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
         let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
         let warm: usize = flag("--warm")?.map_or(Ok(0), |s| s.parse())?;
@@ -120,36 +169,64 @@ mod cli {
         let seed_depth: Option<usize> = flag("--seed-depth")?.map(|s| s.parse()).transpose()?;
         let text = flag("--prompt")?;
         let tokens = flag("--tokens")?;
+        let arm_specs = flags("--arm")?;
         let sources = usize::from(text.is_some())
             + usize::from(tokens.is_some())
-            + usize::from(seed_depth.is_some());
+            + usize::from(seed_depth.is_some())
+            + usize::from(!arm_specs.is_empty());
         if sources != 1 {
-            return Err("give exactly one of --prompt, --tokens, --seed-depth".into());
+            return Err("give exactly one of --prompt, --tokens, --seed-depth, --arm".into());
         }
-        if n_gen == 0 || (timed && n_gen <= warm + 1) {
-            return Err(format!("-n {n_gen} leaves no counted step (warm {warm})").into());
+        if sync && arm_specs.is_empty() {
+            return Err("--arm-sync paces the arms of an --arm list, and none is given".into());
         }
         let tok = match &text {
             Some(_) => Some(Tokenizer::from_gguf(ref_model_path()?)?),
             None => None,
         };
-        let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
-            (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
-            (_, Some(s), _) => s
-                .split(',')
-                .map(|v| v.trim().parse::<u32>())
-                .collect::<Result<_, _>>()?,
-            (_, _, Some(_)) => vec![0],
-            _ => unreachable!("one source by the check above"),
+        let arms: Vec<Arm> = if arm_specs.is_empty() {
+            let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
+                (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
+                (_, Some(s), _) => ids_of(s)?,
+                (_, _, Some(_)) => vec![0],
+                _ => unreachable!("one source by the check above"),
+            };
+            vec![Arm { ids, n_gen }]
+        } else {
+            arm_specs
+                .iter()
+                .map(|spec| {
+                    let (ids, n) = match spec.split_once('/') {
+                        Some((ids, n)) => (ids, n.parse::<usize>()?),
+                        None => (spec.as_str(), n_gen),
+                    };
+                    Ok(Arm {
+                        ids: ids_of(ids)?,
+                        n_gen: n,
+                    })
+                })
+                .collect::<Result<_, GateError>>()?
         };
-        if ids.is_empty() {
-            return Err("the prompt has no ids".into());
+        for arm in &arms {
+            if arm.ids.is_empty() {
+                return Err("the prompt has no ids".into());
+            }
+            if arm.n_gen == 0 || (timed && arm.n_gen <= warm + 1) {
+                return Err(
+                    format!("-n {} leaves no counted step (warm {warm})", arm.n_gen).into(),
+                );
+            }
+            let depth = seed_depth.unwrap_or(arm.ids.len());
+            if depth + arm.n_gen > ctx {
+                return Err(
+                    format!("depth {depth} + {} tokens pass --ctx {ctx}", arm.n_gen).into(),
+                );
+            }
         }
-        let depth = seed_depth.unwrap_or(ids.len());
-        if depth + n_gen > ctx {
-            return Err(format!("depth {depth} + {n_gen} tokens pass --ctx {ctx}").into());
+        let listed = !arm_specs.is_empty();
+        if !listed {
+            println!("prompt_ids {:?}", arms[0].ids);
         }
-        println!("prompt_ids {ids:?}");
         let t = Instant::now();
         let file = open_split(Arch::Qwen3moe, "gen-qwen3moe")?;
         let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
@@ -159,11 +236,7 @@ mod cli {
              ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.layers().len(),
-            if mode == StepMode::Graph {
-                "graph"
-            } else {
-                "eager"
-            },
+            mode_name(mode),
             m.body("generate_qwen3moe")?.flash_mma(),
             m.ubatch()?,
             m.ubatch_prologue()?.table_build.as_secs_f64() * 1e6,
@@ -185,13 +258,60 @@ mod cli {
                 free0.saturating_sub(free1)
             );
         }
-        if let Some(d) = seed_depth.filter(|&d| d > 1) {
+        let run = Run {
+            timed,
+            warm,
+            mode,
+            path,
+            seed_depth,
+            logits,
+            tok,
+            ctx,
+        };
+        let mut s = Session::from_model(m, u32::try_from(ctx)?);
+        let count = arms.len();
+        s.arms(&arms, |s, i, arm| {
+            if listed {
+                println!(
+                    "arm i={i} arms={count} ids={} n={}",
+                    arm.ids.len(),
+                    arm.n_gen
+                );
+                if sync {
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line)? == 0 {
+                        return Err(
+                            format!("--arm-sync: stdin closed before arm {i} of {count}").into(),
+                        );
+                    }
+                }
+                println!("prompt_ids {:?}", arm.ids);
+            }
+            run_arm(s.model_mut(), &run, arm)
+        })
+        .map_err(|f| Box::new(f) as GateError)
+    }
+
+    fn mode_name(mode: StepMode) -> &'static str {
+        if mode == StepMode::Graph {
+            "graph"
+        } else {
+            "eager"
+        }
+    }
+
+    /// One arm on the loaded model: its prefill, its steps, and every line
+    /// from `step 0` on.
+    fn run_arm(m: &mut Qwen3moeModel, run: &Run, arm: &Arm) -> Result<(), GateError> {
+        let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
+        if let Some(d) = run.seed_depth.filter(|&d| d > 1) {
             m.seed_depth(d - 1)?;
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
-        let plan = m.prefill_plan(ids.len(), path)?;
+        let depth = run.seed_depth.unwrap_or(ids.len());
+        let plan = m.prefill_plan(ids.len(), run.path)?;
         let t = Instant::now();
-        let mut next = m.prefill_with(&ids, path)?;
+        let mut next = m.prefill_with(ids, run.path)?;
         let prefill_wall = t.elapsed();
         let image = m.ubatch_prologue()?.last;
         println!(
@@ -235,16 +355,30 @@ mod cli {
             let i = k + 1;
             tokens_out.push(tok);
             println!("step {i} {pos} {tok}");
-            if timed {
+            if run.timed {
                 let tag = if i <= warm { " warm" } else { "" };
                 println!("time step {i}{tag} ms={ms:.4}");
             }
         }
         println!("tokens {tokens_out:?}");
-        if let Some(t) = &tok {
+        if run.logits {
+            let row = m.logits()?;
+            let argmax = row
+                .iter()
+                .enumerate()
+                .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
+                .map_or(0, |(i, _)| i);
+            let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+                v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+            });
+            println!("logits n={} argmax={argmax} fnv64={fnv:016x}", row.len());
+        }
+        if let Some(t) = &run.tok {
             println!("text {:?}", t.decode(&tokens_out));
         }
-        if timed {
+        if run.timed {
             let counted: Vec<f64> = rows[warm..].iter().map(|r| r.2).collect();
             let mut sorted = counted.clone();
             sorted.sort_by(f64::total_cmp);
@@ -252,16 +386,13 @@ mod cli {
             let mean = counted.iter().sum::<f64>() / counted.len() as f64;
             println!(
                 "SMOKE mode={} prompt_tokens={} depth={depth} seeded={} generated={n_gen} \
-                 warm={warm} steps={} p50_ms={p50:.4} mean_ms={mean:.4} tok/s(p50)={:.2} ctx={ctx}",
-                if mode == StepMode::Graph {
-                    "graph"
-                } else {
-                    "eager"
-                },
+                 warm={warm} steps={} p50_ms={p50:.4} mean_ms={mean:.4} tok/s(p50)={:.2} ctx={}",
+                mode_name(run.mode),
                 ids.len(),
-                seed_depth.is_some(),
+                run.seed_depth.is_some(),
                 counted.len(),
-                1e3 / p50
+                1e3 / p50,
+                run.ctx
             );
         }
         Ok(())
