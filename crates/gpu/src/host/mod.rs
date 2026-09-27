@@ -76,6 +76,7 @@
 //! ([`HostTier::reset`]), and any other stays until a reload.
 
 pub mod batch;
+pub mod handoff;
 pub mod leg;
 pub mod page;
 pub mod residency;
