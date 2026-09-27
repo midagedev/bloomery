@@ -48,7 +48,8 @@ fn act<const ACT: u32>(z: f32) -> f32 {
 }
 
 /// One warp's gated norm (module doc) with the gate `ACT`: head `wi` of
-/// the `[m][n_v]` order.
+/// the `[m][n_v]` order. `gdn_norm_gate_sigmoid`'s; `gdn_norm_gate` keeps its
+/// own body.
 ///
 /// # Safety
 ///
@@ -159,9 +160,53 @@ mod norm_gate_kernels {
         if wi >= m as usize * n_v as usize {
             return; // warp-uniform
         }
-        // SAFETY: wi < m·n_v by the guard, lane < 32; the contract's
-        // lengths; head wi of y is this warp's.
-        unsafe { norm_gate_body::<GATE_SILU>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
+        let lane = tid % 32;
+        let base = wi * HEAD;
+        let mut ov = [0.0f32; 4];
+        let mut zv = [0.0f32; 4];
+        let mut wv = [0.0f32; 4];
+        let mut sumsq = 0.0f64;
+        #[unroll]
+        for i in 0usize..4 {
+            let at = lane + 32 * i;
+            // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
+            // by the contract; at < 128 <= w.len().
+            unsafe {
+                ov[i] = *o.get_unchecked(base + at);
+                zv[i] = *z.get_unchecked(base + at);
+                wv[i] = *w.get_unchecked(at);
+            }
+            sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
+        }
+        let mut acc = sumsq;
+        acc += warp::shuffle_xor_f64(acc, 16);
+        acc += warp::shuffle_xor_f64(acc, 8);
+        acc += warp::shuffle_xor_f64(acc, 4);
+        acc += warp::shuffle_xor_f64(acc, 2);
+        acc += warp::shuffle_xor_f64(acc, 1);
+        let mean = (acc / HEAD as f64) as f32;
+        let fin = mean.is_finite();
+        let scale = if fin {
+            1.0 / (mean + eps).sqrt()
+        } else {
+            f32::NAN
+        };
+        let ok = fin
+            & crate::fault::quad_finite(ov)
+            & crate::fault::quad_finite(zv)
+            & crate::fault::quad_finite(wv);
+        #[unroll]
+        for i in 0usize..4 {
+            let v = mul_rn_f32(
+                mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
+                act::<GATE_SILU>(zv[i]),
+            );
+            // SAFETY: as the reads above; one lane per value.
+            unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
+        }
+        if !ok {
+            fault.raise(FaultSite::LinearGate);
+        }
     }
 
     /// [`gdn_norm_gate`] with the sigmoid gate: Qwen3.8's Gated DeltaNet and
@@ -198,7 +243,8 @@ mod norm_gate_kernels {
         if wi >= m as usize * n_v as usize {
             return; // warp-uniform
         }
-        // SAFETY: as gdn_norm_gate's.
+        // SAFETY: wi < m·n_v by the guard, lane < 32; the contract's
+        // lengths; head wi of y is this warp's.
         unsafe { norm_gate_body::<GATE_SIGMOID>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
     }
 }
