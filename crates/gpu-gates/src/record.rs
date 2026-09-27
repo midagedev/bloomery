@@ -1094,6 +1094,95 @@ pub static LISTENING: Kind = Kind {
     ],
 };
 
+/// The server's prompt cache: its budget, the host headroom it was derived
+/// from, and the token a prompt call is cut at.
+pub static CACHE_CONFIG: Kind = Kind {
+    name: "cache_config",
+    head: "cache",
+    doc: "The prompt cache's budget, the plan's host headroom, and the user-message token prompt calls are cut at, with whether the chat template writes it.",
+    parts: &[
+        key("ram", U64, "B"),
+        key("headroom", I64, "B"),
+        key("user_start", Word, ""),
+        key("in_template", Bool, ""),
+    ],
+};
+
+/// A request whose shared prefix the engine keeps less of.
+pub static CACHE_REUSE: Kind = Kind {
+    name: "cache_reuse",
+    head: "cache reuse",
+    doc: "A request shared common ids with the slot, asked to keep ask of them, and the engine kept fewer, for the reason given.",
+    parts: &[
+        key("common", U64, "positions"),
+        key("ask", U64, "positions"),
+        key("kept", U64, "positions"),
+        key("held", U64, "positions"),
+        key("reason", Text, ""),
+    ],
+};
+
+/// The slot's state into the prompt cache.
+pub static CACHE_SAVE: Kind = Kind {
+    name: "cache_save",
+    head: "cache save",
+    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot, and the cache after it.",
+    parts: &[
+        key("positions", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("ms", F64(3), "ms"),
+        key("entries", U64, ""),
+        key("cache_bytes", U64, "B"),
+    ],
+};
+
+/// A cached state into the slot.
+pub static CACHE_LOAD: Kind = Kind {
+    name: "cache_load",
+    head: "cache load",
+    doc: "A cached state replaced the slot's: its positions, the ids it shares with the request, what the engine keeps of them after it and what the slot would have kept, its bytes and the server's wall clock around the resume.",
+    parts: &[
+        key("positions", U64, "positions"),
+        key("common", U64, "positions"),
+        key("kept", U64, "positions"),
+        key("slot_kept", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("ms", F64(3), "ms"),
+    ],
+};
+
+/// A state out of the prompt cache.
+pub static CACHE_EVICT: Kind = Kind {
+    name: "cache_evict",
+    head: "cache evict",
+    doc: "A cached state left the cache: its positions, its bytes, and why.",
+    parts: &[
+        key("positions", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("why", Text, ""),
+    ],
+};
+
+/// A state the prompt cache did not keep.
+pub static CACHE_SKIP: Kind = Kind {
+    name: "cache_skip",
+    head: "cache skip",
+    doc: "The slot's state was not cached, or a cached state was not taken back, and why.",
+    parts: &[key("positions", U64, "positions"), key("why", Text, "")],
+};
+
+/// A prompt call cut at message starts.
+pub static PREFILL_SPLIT: Kind = Kind {
+    name: "prefill_split",
+    head: "prefill split",
+    doc: "A prompt call ran as calls cut at the positions given, so a later request keeps them.",
+    parts: &[
+        key("first", U64, "positions"),
+        key("end", U64, "positions"),
+        key("at", Csv, "positions"),
+    ],
+};
+
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLAN,
@@ -1152,12 +1241,19 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 /// What `bloomery-serve-ds41` prints, all on stderr.
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &PLAN,
+    &CACHE_CONFIG,
     &LOAD_GENERATOR,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
     &CAPTURE,
     &LISTENING,
+    &CACHE_REUSE,
+    &CACHE_SAVE,
+    &CACHE_LOAD,
+    &CACHE_EVICT,
+    &CACHE_SKIP,
+    &PREFILL_SPLIT,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.

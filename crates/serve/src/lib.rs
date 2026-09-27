@@ -13,6 +13,7 @@ mod genloop;
 pub mod glmxml;
 mod http;
 pub mod mock;
+mod promptcache;
 pub mod reasoning;
 pub mod sampling;
 mod slotfile;
@@ -23,8 +24,9 @@ pub use api::{
     EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server, ServerConfig,
 };
 pub use engine::{
-    Decoder, DeviceProps, DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
-    Sampler, SamplerFactory, SamplingParams, SavedState, StateError, Tokenizer,
+    CacheNote, Decoder, DeviceProps, DraftProps, Engine, EngineError, EngineProps, ModelProps,
+    PlacementProps, Sampler, SamplerFactory, SamplingParams, Saved, SavedState, StateError,
+    Tokenizer,
 };
 pub use mock::{MockEngine, MockTokenizer, ScriptedEngine};
 pub use template::{ChatTemplate, TemplateError};

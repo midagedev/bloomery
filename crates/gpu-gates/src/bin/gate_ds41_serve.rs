@@ -56,6 +56,16 @@
 //!   is everything the most recent request left (no cut), else in whole
 //!   compression groups: its cut lands in a reply or at a prompt call's end,
 //!   outside every prompt call's hole. The other two print what they kept.
+//! - two conversations interleaved (the prompt cache): `--ids` and its
+//!   greedy ids, then the ids reversed, then `--ids` plus its greedy ids
+//!   again keeps every position the first left (`cache_n` = its length − 1)
+//!   and gives the ids of `cache_prompt: false`;
+//! - a shared system prompt: a chat whose system prompt and user message are
+//!   long enough that a single prompt call would leave the system prompt in
+//!   its hole, then a chat with the same system prompt and another message
+//!   keeps the system prompt (`cache_n` is the first user marker's position,
+//!   or one less for the compressor's parity) and answers as with
+//!   `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -122,6 +132,13 @@ mod gate {
     const LONG_RULES: usize = 20;
     const LONG_LINES: usize = 30;
     const LONG_PREDICT: usize = 8;
+    /// The shared-system-prompt clause's messages: a system prompt of some
+    /// hundreds of ids, and a first user message long enough that one prompt
+    /// call would leave the system prompt in its CED hole.
+    const SYSTEM_LINE: &str = "You are a careful assistant. Answer briefly and cite nothing. ";
+    const SYSTEM_REPEAT: usize = 24;
+    const LONG_USER_LINE: &str = "Here is a line of a long document to read before the question. ";
+    const LONG_USER_REPEAT: usize = 48;
     /// The sampled requests' temperature and seed.
     const SAMPLED_TEMPERATURE: f64 = 0.8;
     const SAMPLED_SEED: u64 = 7;
@@ -650,6 +667,105 @@ mod gate {
         Ok(ok)
     }
 
+    /// One greedy `/completion` of `prompt` run past the end-of-generation id:
+    /// its ids and `timings.cache_n`.
+    fn greedy(
+        url: &dyn Fn(&str) -> String,
+        prompt: &[u32],
+        cache: bool,
+    ) -> Result<(Vec<u32>, Value), GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
+            "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&body), false)?;
+        let v = json_of("/completion", st, &body)?;
+        let ids = ids_of(&v["tokens"]);
+        println!(
+            "greedy prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
+            prompt.len(),
+            v["timings"]["cache_n"]
+        );
+        Ok((ids, v["timings"]["cache_n"].clone()))
+    }
+
+    /// Two conversations interleaved (module header).
+    fn interleaved(url: &dyn Fn(&str) -> String, ids: &[u32]) -> Result<bool, GateError> {
+        let (g1, _) = greedy(url, ids, true)?;
+        let other: Vec<u32> = ids.iter().rev().copied().collect();
+        greedy(url, &other, true)?;
+        let cont: Vec<u32> = ids.iter().chain(&g1).copied().collect();
+        let (g2, c2) = greedy(url, &cont, true)?;
+        let (g3, c3) = greedy(url, &cont, false)?;
+        let mut ok = true;
+        check(
+            &mut ok,
+            "interleaved_keeps_the_first_conversation",
+            c2 == json!(cont.len() - 1),
+        );
+        check(
+            &mut ok,
+            "interleaved_ids_are_fresh",
+            g2 == g3 && c3 == json!(0),
+        );
+        Ok(ok)
+    }
+
+    /// A shared system prompt (module header).
+    fn shared_system(url: &dyn Fn(&str) -> String) -> Result<bool, GateError> {
+        let system = SYSTEM_LINE.repeat(SYSTEM_REPEAT);
+        let first = LONG_USER_LINE.repeat(LONG_USER_REPEAT);
+        let one =
+            json!([{"role": "system", "content": system}, {"role": "user", "content": first}]);
+        let two =
+            json!([{"role": "system", "content": system}, {"role": "user", "content": TURN2}]);
+        // The chat requests below send no template kwargs; render them the same way.
+        let none = json!({});
+        let (p1, p2) = (rendered(url, &one, &none)?, rendered(url, &two, &none)?);
+        let (st, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({"content": "<｜User｜>"})),
+            false,
+        )?;
+        let marker = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let mark = p1
+            .iter()
+            .position(|id| marker.as_slice() == [*id])
+            .ok_or("the rendered chat holds no user marker")?;
+        let chat = |messages: &Value, cache: bool| -> Result<Value, GateError> {
+            let body = json!({
+                "messages": messages, "temperature": 0, "max_tokens": TURN_PREDICT,
+                "cache_prompt": cache,
+            });
+            let (st, body) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+            json_of("/v1/chat/completions", st, &body)
+        };
+        chat(&one, true)?;
+        let warm = chat(&two, true)?;
+        let fresh = chat(&two, false)?;
+        let kept = warm["timings"]["cache_n"].as_u64().unwrap_or(0) as usize;
+        println!(
+            "shared system prompt: turn 1 {} ids, turn 2 {} ids, first user marker at {mark} \
+             (shared {}): cache_n={kept}",
+            p1.len(),
+            p2.len(),
+            common(&p1, &p2)
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "shared_system_prompt_kept",
+            common(&p1, &p2) > mark && (mark - 1..=mark).contains(&kept),
+        );
+        check(
+            &mut ok,
+            "shared_system_prompt_answer_is_fresh",
+            warm["choices"][0]["message"] == fresh["choices"][0]["message"]
+                && fresh["timings"]["cache_n"] == json!(0),
+        );
+        Ok(ok)
+    }
+
     /// `/props`' `engine` object (see the module header) against the plan of
     /// the file the server opens, made here from its headers the way the
     /// server makes it, under the placement's `levers` the server inherits;
@@ -990,6 +1106,8 @@ mod gate {
         }
 
         ok &= conversations(&url, &rules)?;
+        ok &= interleaved(&url, &a.ids)?;
+        ok &= shared_system(&url)?;
 
         println!("server stopped: {}", served.stop()?);
         if ok {

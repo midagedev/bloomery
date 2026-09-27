@@ -129,6 +129,15 @@
 //! - **Take back.** After a prefill of 700 ids, a call of 400 more whose
 //!   feature reader fails once the batch has run: the call is taken back to
 //!   700, and the same call again gives the oracle's logits at 1099 and 1100.
+//! - **Snapshot.** The body cuts a prompt call of 1100 ids with a mark at 700
+//!   there (`Body::prefill_splits`), which then keeps 700; the state saved
+//!   (`body::snapshot`), the ids reversed prefilled over it from a reset, the
+//!   state put back (`body::resume`): the model stands at 1100 with the ids,
+//!   every layer's ring, compressor state, compressed rows and keys are the
+//!   saved ones' md5, the saved state and the body grant the same cuts, the
+//!   next step gives the oracle's logits at 1100, and a cut back to 700 then
+//!   steps to 1100 give its logits at 1099 (the ring rows restored from the
+//!   saved shadow).
 //!
 //! `--cases a,b,…` runs those `P` only (the oracle then stops at the largest
 //! one's `P + 1`); `--split` / `--no-split` turns the splits on or off, and
@@ -517,6 +526,7 @@ mod gate {
         if args.extra {
             pass &= rollback_case(m, &ids, &oracle)?;
             pass &= take_back_case(m, &ids, &oracle)?;
+            pass &= resume_case(m, &hp, &ids, &oracle)?;
         }
         if !pass {
             return Err(checks_failed());
@@ -2534,6 +2544,73 @@ mod gate {
             verdict(back),
             verdict(at_end),
             verdict(next),
+            t.elapsed().as_secs_f64(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The snapshot case (module doc).
+    fn resume_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        ids: &[u32],
+        oracle: &BTreeMap<usize, Snap>,
+    ) -> Result<bool, GateError> {
+        const MARK_MIN: usize = 64;
+        let t = Instant::now();
+        let (a, b) = SPLITS[0];
+        let p = a + b;
+        m.reset()?;
+        let cuts = m.body(NAME)?.prefill_splits(0, p, &[a], MARK_MIN);
+        body::prefill(m, &ids[..a])?;
+        body::prefill(m, &ids[a..p])?;
+        let kept_mark = m.body(NAME)?.keep_point(a);
+        let grants: Vec<usize> = {
+            let b = m.body(NAME)?;
+            (0..=p).map(|k| b.keep_point(k)).collect()
+        };
+        let mut before = live(m)?;
+        written_rows(m, hp, p, &mut before)?;
+        let saved = body::snapshot(m)?;
+        let other: Vec<u32> = ids[..p].iter().rev().copied().collect();
+        m.reset()?;
+        body::prefill(m, &other)?;
+        body::resume(m, &saved)?;
+        let mut after = live(m)?;
+        written_rows(m, hp, p, &mut after)?;
+        let same = before.ring == after.ring
+            && before.state == after.state
+            && before.rows == after.rows
+            && before.keys == after.keys;
+        let body_grants: Vec<usize> = {
+            let b = m.body(NAME)?;
+            (0..=p).map(|k| b.keep_point(k)).collect()
+        };
+        let saved_grants: Vec<usize> = (0..=p).map(|k| saved.keep_point(k)).collect();
+        let stands = m.pos() as usize == p
+            && m.body(NAME)?.history() == &ids[..p]
+            && body_grants == grants
+            && saved_grants == grants;
+        m.step(&[ids[p]])?;
+        let next = Some(bits(&m.logits()?)) == oracle[&p].next;
+        m.rollback(u32::try_from(kept_mark)?)?;
+        for &id in &ids[kept_mark..p] {
+            m.step(&[id])?;
+        }
+        let at_end = bits(&m.logits()?) == oracle[&p].logits;
+        let ok = cuts == [a] && kept_mark == a && same && stands && next && at_end;
+        println!(
+            "{NAME}: case snapshot P={p}: cut at {cuts:?} keeps {kept_mark} {} | saved {} B, \
+             resumed over the reversed ids: caches {} | stands at {p} with the ids and the same \
+             cuts {} | next step logits {} | cut to {kept_mark}, stepped to {p}: logits[P-1] {} | \
+             {:.1} s: {}",
+            verdict(cuts == [a] && kept_mark == a),
+            saved.bytes(),
+            verdict(same),
+            verdict(stands),
+            verdict(next),
+            verdict(at_end),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );

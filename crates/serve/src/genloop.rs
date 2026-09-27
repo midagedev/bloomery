@@ -17,8 +17,10 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::engine::{
-    Engine, EngineError, Sampler, SamplerFactory, SamplingParams, StateError, Tokenizer,
+    CacheNote, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Saved, StateError,
+    Tokenizer,
 };
+use crate::promptcache::{self, PromptCache};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
 use crate::stop::StopScan;
@@ -168,19 +170,22 @@ fn choose(
     }
 }
 
-/// The one slot: the engine and the ids its cache holds, one per position.
+/// The one slot: the engine, the ids its cache holds, one per position, and
+/// the host prompt cache of states it held before ([`PromptCache`]).
 pub(crate) struct Slot {
     pub engine: Box<dyn Engine>,
     vocab: Arc<dyn Tokenizer>,
     /// Every id the engine has evaluated since its last reset, in order. The
     /// last generated id of a request is not in it: it is never fed back.
     held: Vec<u32>,
+    cache: PromptCache,
 }
 
 impl Slot {
     pub(crate) fn new(engine: Box<dyn Engine>) -> Slot {
         Slot {
             vocab: engine.tokenizer(),
+            cache: PromptCache::new(engine.cache_ram()),
             engine,
             held: Vec::new(),
         }
@@ -190,18 +195,52 @@ impl Slot {
     /// least the last id for `next`, and returns that length. `want` false
     /// (`cache_prompt: false`) always resets. While an engine call is in flight
     /// `held` is empty, so a failed call leaves no claim about the cache.
+    ///
+    /// With the prompt cache on: a cached state that keeps more of `ids` than
+    /// the slot replaces the slot's state; the slot's state goes into the
+    /// cache first whenever it is replaced or the request keeps less than half
+    /// of it (llama-server's rule). A prefix the engine keeps less of than the
+    /// request shares is noted with the engine's reason.
     fn reuse(&mut self, ids: &[u32], want: bool) -> Result<usize, EngineError> {
-        let common = if want {
-            self.held
-                .iter()
-                .zip(ids)
-                .take_while(|(a, b)| a == b)
-                .count()
+        let (mut common, mut ask, mut k) = self.keep_of(ids, want);
+        // The pick is taken out before the slot's state is saved: making room
+        // for that state may evict it, and the pick then lives on in `picked`.
+        let picked = if want && self.cache.enabled() {
+            self.cache.best(ids, k).map(|p| self.cache.take(p))
         } else {
-            0
+            None
         };
-        let ask = common.min(ids.len() - 1);
-        let k = self.engine.keepable(ask).min(ask);
+        if self.cache.enabled()
+            && !self.held.is_empty()
+            && (picked.is_some() || 2 * k < self.held.len())
+        {
+            self.save_held()?;
+        }
+        if let Some((entry, state)) = picked {
+            let slot_kept = k;
+            if let Some((positions, bytes, ms)) = self.load(entry, &state)? {
+                (common, ask, k) = self.keep_of(ids, want);
+                self.engine.note(&CacheNote::Load {
+                    positions,
+                    common,
+                    kept: k,
+                    slot_kept,
+                    bytes,
+                    ms,
+                });
+            } else {
+                (common, ask, k) = (0, 0, 0);
+            }
+        }
+        if k < ask {
+            self.engine.note(&CacheNote::Reuse {
+                common,
+                ask,
+                kept: k,
+                held: self.held.len(),
+                reason: self.engine.keep_limit(ask),
+            });
+        }
         let held = std::mem::take(&mut self.held);
         if k == 0 {
             self.engine.reset()?;
@@ -211,6 +250,117 @@ impl Slot {
         self.held = held;
         self.held.truncate(k);
         Ok(k)
+    }
+
+    /// The ids `ids` shares with the slot, the most of them a request may
+    /// keep (all but its last), and what the engine keeps of those.
+    fn keep_of(&self, ids: &[u32], want: bool) -> (usize, usize, usize) {
+        let common = if want {
+            promptcache::common_prefix(&self.held, ids)
+        } else {
+            0
+        };
+        let ask = common.min(ids.len() - 1);
+        (common, ask, self.engine.keepable(ask).min(ask))
+    }
+
+    /// The slot's state into the prompt cache, unless a cached state already
+    /// keeps all of it. A snapshot the engine refuses is noted and not kept;
+    /// an engine failure is the request's error.
+    fn save_held(&mut self) -> Result<(), EngineError> {
+        if self.cache.covers(&self.held) {
+            return Ok(());
+        }
+        let positions = self.held.len();
+        let t = Instant::now();
+        let state = match self.engine.snapshot() {
+            Ok(s) => s,
+            Err(StateError::Engine(e)) => return Err(e),
+            Err(e) => {
+                self.engine.note(&CacheNote::Skip {
+                    positions,
+                    why: format!("the engine took no snapshot: {e}"),
+                });
+                return Ok(());
+            }
+        };
+        if state.n_tokens() != positions {
+            self.engine.note(&CacheNote::Skip {
+                positions,
+                why: format!(
+                    "the engine's snapshot holds {} positions, the slot {positions}",
+                    state.n_tokens()
+                ),
+            });
+            return Ok(());
+        }
+        for note in self.cache.insert(self.held.clone(), state, ms_since(t)) {
+            self.engine.note(&note);
+        }
+        Ok(())
+    }
+
+    /// A cached `state` of `ids` into the engine, the slot then holding its
+    /// ids; returns its positions, bytes and the wall time of the resume. A
+    /// state the engine refuses leaves the cache, the engine is reset and the
+    /// slot holds nothing (`None`); an engine failure is the request's error.
+    fn load(
+        &mut self,
+        ids: Vec<u32>,
+        state: &Arc<dyn Saved>,
+    ) -> Result<Option<(usize, u64, f64)>, EngineError> {
+        self.held.clear();
+        let t = Instant::now();
+        match self.engine.resume(state) {
+            Ok(()) => {
+                let ms = ms_since(t);
+                let got = (ids.len(), state.n_bytes(), ms);
+                self.held = ids;
+                Ok(Some(got))
+            }
+            Err(StateError::Engine(e)) => Err(e),
+            Err(e) => {
+                self.cache.remove(state);
+                self.engine.reset()?;
+                self.engine.note(&CacheNote::Skip {
+                    positions: ids.len(),
+                    why: format!("the engine refused to take the state back: {e}"),
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    /// Feeds `ids[from..to]`, cut into calls where the engine asks
+    /// ([`Engine::prefill_splits`]) at the messages the prompt opens
+    /// ([`Tokenizer::user_start`]): its first and its last inside the range.
+    fn prefill_marked(&mut self, ids: &[u32], from: usize, to: usize) -> Result<(), EngineError> {
+        let marks = message_starts(&ids[..to], &self.vocab.user_start(), from);
+        let at = if marks.is_empty() {
+            Vec::new()
+        } else {
+            self.engine.prefill_splits(from, to, &marks)
+        };
+        if !at.iter().all(|u| marks.contains(u)) || !at.windows(2).all(|w| w[0] < w[1]) {
+            return Err(EngineError(format!(
+                "the engine cut the prompt call {from}..{to} at {at:?}, not among its marks \
+                 {marks:?} in order"
+            )));
+        }
+        let mut first = from;
+        for &u in &at {
+            self.prefill(&ids[first..u])?;
+            first = u;
+        }
+        self.prefill(&ids[first..to])?;
+        if !at.is_empty() {
+            self.engine.note(&CacheNote::Split {
+                first: from,
+                end: to,
+                at,
+            });
+        }
+        Ok(())
     }
 
     /// `prefill` that books what it fed.
@@ -335,6 +485,19 @@ impl Slot {
     }
 }
 
+/// The positions in `from + 1 .. ids.len()` where `marker` starts: the first
+/// and the last of them (one when they are the same). An empty marker marks
+/// nothing.
+fn message_starts(ids: &[u32], marker: &[u32], from: usize) -> Vec<usize> {
+    if marker.is_empty() {
+        return Vec::new();
+    }
+    let mut at = (from + 1..ids.len()).filter(|&u| ids[u..].starts_with(marker));
+    let first = at.next();
+    let last = at.next_back();
+    first.into_iter().chain(last).collect()
+}
+
 /// Where a save to `path` is written before it is renamed there: a name no
 /// slot file can take (a slot file name has no `:`), and no other save's —
 /// the process id and a count of the process's saves, so two servers of one
@@ -375,7 +538,7 @@ pub(crate) fn generate(
     ];
     let cache_n = slot.reuse(ids, p.cache_prompt)?;
     let t0 = Instant::now();
-    slot.prefill(&ids[cache_n..n - 1])?;
+    slot.prefill_marked(ids, cache_n, n - 1)?;
     let greedy = slot.next(ids[n - 1], out(&mut logits))?;
     let tim = timings_out;
     *tim = Timings {
@@ -485,5 +648,429 @@ mod tests {
                 "{name} is a valid slot name"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::any::Any;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    use super::{GenParams, Slot, Timings, generate};
+    use crate::engine::{
+        CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
+    };
+    use crate::mock::{MockEngine, MockTokenizer};
+    use crate::sampling;
+
+    /// The mock vocabulary, whose `<｜User｜>` (id 2) opens a message.
+    struct MarkTok(MockTokenizer);
+
+    impl Tokenizer for MarkTok {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            self.0.encode(text)
+        }
+        fn decode(&self, ids: &[u32]) -> String {
+            self.0.decode(ids)
+        }
+        fn decoder(&self) -> Box<dyn Decoder> {
+            self.0.decoder()
+        }
+        fn bos(&self) -> u32 {
+            self.0.bos()
+        }
+        fn eos(&self) -> u32 {
+            self.0.eos()
+        }
+        fn add_bos(&self) -> bool {
+            self.0.add_bos()
+        }
+        fn n_vocab(&self) -> usize {
+            self.0.n_vocab()
+        }
+        fn user_start(&self) -> Vec<u32> {
+            vec![2]
+        }
+    }
+
+    /// What a [`Probe`] saw: its notes and the length of every prefill call.
+    #[derive(Default)]
+    struct Log {
+        notes: Vec<CacheNote>,
+        calls: Vec<usize>,
+    }
+
+    /// The mock engine under a cut rule like V4.1's CED hole: a position
+    /// strictly inside a prompt call is not kept, and a cut there falls to the
+    /// call's start. It caches its states (`budget` bytes) and, with `split`,
+    /// cuts a prompt call at every mark it is offered.
+    struct Probe {
+        inner: MockEngine,
+        tok: Arc<MarkTok>,
+        ctx: Vec<u32>,
+        calls: Vec<Range<usize>>,
+        budget: u64,
+        split: bool,
+        /// Cut one position past each mark instead: a defective engine.
+        off_mark: bool,
+        /// Refuse every state it is handed back.
+        refuse: bool,
+        log: Arc<Mutex<Log>>,
+    }
+
+    fn rule(n: usize, calls: &[Range<usize>]) -> (usize, Option<String>) {
+        let mut k = n;
+        let mut why = None;
+        while let Some(c) = calls.iter().find(|c| c.start < k && k < c.end) {
+            why = Some(format!("position {k} lies inside prompt call {c:?}"));
+            k = c.start;
+        }
+        (k, why)
+    }
+
+    struct ProbeSaved {
+        ctx: Vec<u32>,
+        calls: Vec<Range<usize>>,
+    }
+
+    impl Saved for ProbeSaved {
+        fn n_tokens(&self) -> usize {
+            self.ctx.len()
+        }
+        fn n_bytes(&self) -> u64 {
+            4 * self.ctx.len() as u64
+        }
+        fn keepable(&self, n: usize) -> usize {
+            rule(n.min(self.ctx.len()), &self.calls).0
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    impl Probe {
+        fn slot(budget: u64, split: bool) -> (Slot, Arc<Mutex<Log>>) {
+            let log = Arc::new(Mutex::new(Log::default()));
+            let probe = Probe {
+                inner: MockEngine::new(4096),
+                tok: Arc::new(MarkTok(MockTokenizer)),
+                ctx: Vec::new(),
+                calls: Vec::new(),
+                budget,
+                split,
+                off_mark: false,
+                refuse: false,
+                log: Arc::clone(&log),
+            };
+            (Slot::new(Box::new(probe)), log)
+        }
+    }
+
+    impl Engine for Probe {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.tok.clone()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.inner.prefill(ids)?;
+            let at = self.ctx.len();
+            self.calls.push(at..at + ids.len());
+            self.ctx.extend_from_slice(ids);
+            self.log.lock().expect("the log").calls.push(ids.len());
+            Ok(())
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            let g = self.inner.next(last, out)?;
+            self.ctx.push(last);
+            Ok(g)
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.ctx.clear();
+            self.calls.clear();
+            self.inner.reset()
+        }
+        fn keepable(&self, n: usize) -> usize {
+            rule(n.min(self.ctx.len()), &self.calls).0
+        }
+        fn keep_limit(&self, n: usize) -> Option<String> {
+            rule(n.min(self.ctx.len()), &self.calls).1
+        }
+        fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+            if self.keepable(n) != n {
+                return Err(EngineError(format!("probe: {n} is not a kept point")));
+            }
+            self.inner.cut(n)?;
+            self.ctx.truncate(n);
+            self.calls.retain_mut(|c| {
+                c.end = c.end.min(n);
+                c.start < c.end
+            });
+            Ok(())
+        }
+        fn ctx_max(&self) -> usize {
+            self.inner.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn cache_ram(&self) -> u64 {
+            self.budget
+        }
+        fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+            Ok(Arc::new(ProbeSaved {
+                ctx: self.ctx.clone(),
+                calls: self.calls.clone(),
+            }))
+        }
+        fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+            let s = state
+                .as_any()
+                .downcast_ref::<ProbeSaved>()
+                .ok_or_else(|| StateError::Format("not a probe state".to_owned()))?;
+            if self.refuse {
+                return Err(StateError::Format("probe: refused".to_owned()));
+            }
+            self.inner.reset()?;
+            self.inner.prefill(&s.ctx)?;
+            self.ctx.clone_from(&s.ctx);
+            self.calls.clone_from(&s.calls);
+            Ok(())
+        }
+        fn prefill_splits(&self, _first: usize, _end: usize, marks: &[usize]) -> Vec<usize> {
+            match (self.split, self.off_mark) {
+                (true, false) => marks.to_vec(),
+                (true, true) => marks.iter().map(|u| u + 1).collect(),
+                (false, _) => Vec::new(),
+            }
+        }
+        fn note(&self, note: &CacheNote) {
+            self.log.lock().expect("the log").notes.push(note.clone());
+        }
+    }
+
+    /// One greedy request of at most 8 tokens: what the cache kept, and
+    /// what came out.
+    fn run(slot: &mut Slot, ids: &[u32]) -> (usize, Vec<u32>) {
+        let p = GenParams {
+            n_predict: 8,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: false,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+        };
+        let factory = sampling::reference_factory();
+        let mut tim = Timings::default();
+        let o = generate(
+            slot,
+            &factory,
+            ids,
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut tim,
+        )
+        .expect("a generation");
+        (o.timings.cache_n, o.tokens)
+    }
+
+    fn enc(text: &str) -> Vec<u32> {
+        MockTokenizer.encode(text)
+    }
+
+    /// A second conversation between two turns of the first costs the first
+    /// nothing: its state goes to the cache and comes back, and the turn
+    /// keeps all it held and generates what a fresh prefill does.
+    #[test]
+    fn an_interleaved_conversation_keeps_the_first_ones_prefix() {
+        let (mut slot, log) = Probe::slot(1 << 20, false);
+        let a1 = enc("<｜User｜>the cat sat on the mat and the ");
+        let (_, t1) = run(&mut slot, &a1);
+        run(&mut slot, &enc("<｜User｜>xyz uvw xyz "));
+        let mut a2 = a1.clone();
+        a2.extend(&t1);
+        a2.extend(enc("<｜User｜>and then the "));
+        let (kept, t2) = run(&mut slot, &a2);
+        assert_eq!(
+            kept,
+            a1.len() + t1.len() - 1,
+            "{:?}",
+            log.lock().expect("log").notes
+        );
+        let (fresh, _) = Probe::slot(0, false);
+        let mut fresh = fresh;
+        assert_eq!(run(&mut fresh, &a2).1, t2, "the restored turn's ids");
+        let notes = &log.lock().expect("log").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, CacheNote::Load { positions, .. }
+                if *positions == a1.len() + t1.len() - 1)),
+            "{notes:?}"
+        );
+    }
+
+    /// A prefix the engine keeps less of than the request shares is noted,
+    /// with the engine's reason.
+    #[test]
+    fn a_prefix_the_engine_drops_is_noted_with_its_reason() {
+        let (mut slot, log) = Probe::slot(0, false);
+        let a = enc("<｜User｜>the cat sat on the mat and the ");
+        run(&mut slot, &a);
+        let mut b = a[..20].to_vec();
+        b.extend(enc("dog ran"));
+        let (kept, _) = run(&mut slot, &b);
+        assert_eq!(kept, 0);
+        let notes = &log.lock().expect("log").notes;
+        assert!(
+            notes.iter().any(
+                |n| matches!(n, CacheNote::Reuse { common: 20, ask: 20, kept: 0,
+                reason: Some(r), .. } if r.contains("inside prompt call"))
+            ),
+            "{notes:?}"
+        );
+    }
+
+    /// A prompt call is cut at its first and last message starts where the
+    /// engine asks, and the cut position is then kept by a request that
+    /// shares the prompt up to it — with the same ids a fresh prefill gives.
+    #[test]
+    fn a_prompt_call_is_cut_at_its_messages() {
+        let (mut slot, log) = Probe::slot(0, true);
+        let system = enc("be brief and kind. ");
+        let mut a = system.clone();
+        a.extend(enc(
+            "<｜User｜>the cat sat<｜Assistant｜>on the mat<｜User｜>and the ",
+        ));
+        run(&mut slot, &a);
+        let u1 = system.len();
+        let u2 = a.len() - enc("<｜User｜>and the ").len();
+        assert_eq!(
+            log.lock().expect("log").calls[..3],
+            [u1, u2 - u1, a.len() - 1 - u2],
+            "the prompt call's pieces"
+        );
+        let mut b = system.clone();
+        b.extend(enc("<｜User｜>a dog ran and the "));
+        let (kept, tb) = run(&mut slot, &b);
+        assert_eq!(kept, u1, "the system prompt, where the second call starts");
+        let (mut fresh, _) = Probe::slot(0, false);
+        assert_eq!(run(&mut fresh, &b).1, tb);
+    }
+
+    /// An engine that cuts a prompt call anywhere but at the marks it was
+    /// offered fails the request by name; nothing is fed.
+    #[test]
+    fn a_cut_off_the_marks_is_a_named_error() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let probe = Probe {
+            inner: MockEngine::new(4096),
+            tok: Arc::new(MarkTok(MockTokenizer)),
+            ctx: Vec::new(),
+            calls: Vec::new(),
+            budget: 0,
+            split: true,
+            off_mark: true,
+            refuse: false,
+            log: Arc::clone(&log),
+        };
+        let mut slot = Slot::new(Box::new(probe));
+        let a = enc("be brief and kind. <｜User｜>the cat sat on the mat and the ");
+        let p = GenParams {
+            n_predict: 4,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: false,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+        };
+        let mut tim = Timings::default();
+        let r = generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &a,
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut tim,
+        );
+        let e = r.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("not among its marks"), "{e}");
+        assert!(log.lock().expect("log").calls.is_empty());
+    }
+
+    /// A full cache: saving the slot's state before the pick is taken back
+    /// evicts the oldest state, and the pick is still the one taken back.
+    #[test]
+    fn the_pick_survives_the_save_that_makes_room() {
+        let a1 = enc("<｜User｜>the cat sat on the mat and the ");
+        let b = enc("<｜User｜>xyz uvw xyz ");
+        let c = enc("<｜User｜>abc def abc def abc ");
+        let (mut probe_slot, _) = Probe::slot(1 << 20, false);
+        let (_, t1) = run(&mut probe_slot, &a1);
+        let held_a = a1.len() + t1.len() - 1;
+        let (_, tb) = run(&mut probe_slot, &b);
+        let (_, tc) = run(&mut probe_slot, &c);
+        let held_c = c.len() + tc.len() - 1;
+        let held_b = b.len() + tb.len() - 1;
+        assert!(held_b <= held_a, "the fixture needs b no longer than a");
+        // Room for a's state and c's, not for b's beside them.
+        let budget = 4 * (held_a + held_c) as u64;
+        let (mut slot, log) = Probe::slot(budget, false);
+        run(&mut slot, &a1);
+        run(&mut slot, &b);
+        run(&mut slot, &c);
+        let mut a2 = a1.clone();
+        a2.extend(&t1);
+        a2.extend(enc("<｜User｜>and then the "));
+        let (kept, t2) = run(&mut slot, &a2);
+        assert_eq!(kept, held_a, "{:?}", log.lock().expect("log").notes);
+        let (mut fresh, _) = Probe::slot(0, false);
+        assert_eq!(run(&mut fresh, &a2).1, t2);
+    }
+
+    /// A state the engine refuses to take back leaves the cache, is noted,
+    /// and the request runs from a reset with a fresh prefill's ids.
+    #[test]
+    fn a_refused_state_leaves_the_cache() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let probe = Probe {
+            inner: MockEngine::new(4096),
+            tok: Arc::new(MarkTok(MockTokenizer)),
+            ctx: Vec::new(),
+            calls: Vec::new(),
+            budget: 1 << 20,
+            split: false,
+            off_mark: false,
+            refuse: true,
+            log: Arc::clone(&log),
+        };
+        let mut slot = Slot::new(Box::new(probe));
+        let a1 = enc("<｜User｜>the cat sat on the mat and the ");
+        let (_, t1) = run(&mut slot, &a1);
+        run(&mut slot, &enc("<｜User｜>xyz uvw xyz "));
+        let mut a2 = a1.clone();
+        a2.extend(&t1);
+        a2.extend(enc("<｜User｜>and then the "));
+        let (kept, t2) = run(&mut slot, &a2);
+        assert_eq!(kept, 0);
+        let (mut fresh, _) = Probe::slot(0, false);
+        assert_eq!(run(&mut fresh, &a2).1, t2);
+        let notes = log.lock().expect("log").notes.clone();
+        let refused = |n: &CacheNote| matches!(n, CacheNote::Skip { why, .. } if why.contains("refused to take the state back"));
+        assert_eq!(notes.iter().filter(|n| refused(n)).count(), 1, "{notes:?}");
+        assert!(!slot.cache.covers(&a1), "the refused state is still cached");
     }
 }

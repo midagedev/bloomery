@@ -22,7 +22,16 @@
 //! [`Engine::reset`] and the slot forgetting its ids. The defaults refuse with
 //! [`StateError::Unsupported`], which is not fatal: the server answers 501 and
 //! keeps serving.
+//!
+//! The host prompt cache (llama-server's `--cache-ram`): before a request
+//! drops most of what the slot holds, the server takes the engine's state as a
+//! value ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`]
+//! bytes, keyed by the ids it covers; a later request that one of those states
+//! serves better than the slot does gets it back ([`Engine::resume`]). What
+//! the cache did, and every prefix the engine keeps less of than a request
+//! shares, reaches the engine's binary as a [`CacheNote`] ([`Engine::note`]).
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -97,6 +106,12 @@ pub trait Tokenizer: Send + Sync {
     fn add_bos(&self) -> bool;
     /// Vocabulary size, which is also the logit vector length.
     fn n_vocab(&self) -> usize;
+    /// The ids that open a user (or tool) message in this vocabulary's chat
+    /// format: where a prompt's messages start, which a prompt call is cut at
+    /// ([`Engine::prefill_splits`]). Empty (the default) marks none.
+    fn user_start(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// What the server needs from a model.
@@ -153,6 +168,217 @@ pub trait Engine: Send {
     fn restore_state(&mut self, input: &mut dyn Read) -> Result<SavedState, StateError> {
         let _ = input;
         Err(StateError::Unsupported("slot save/restore"))
+    }
+    /// Why [`Engine::keepable`] of `n` keeps less than `n`: the rule that
+    /// stopped it, which the server's reuse note prints. Asked only after
+    /// `keepable(n)` granted less, before the cache changes. `None` names no
+    /// rule; the default names none.
+    fn keep_limit(&self, n: usize) -> Option<String> {
+        let _ = n;
+        None
+    }
+    /// The host RAM, in bytes, the server's prompt cache may hold this
+    /// engine's saved states in. 0 (the default) turns the cache off.
+    fn cache_ram(&self) -> u64 {
+        0
+    }
+    /// The whole cache as a value [`Engine::resume`] takes back, the cache
+    /// unchanged. The default is [`Engine::save_state`] into host memory.
+    fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+        let mut bytes = Vec::new();
+        let saved = self.save_state(&mut bytes)?;
+        if saved.n_bytes != bytes.len() as u64 {
+            return Err(StateError::Format(format!(
+                "the engine saved {} bytes and reported {}",
+                bytes.len(),
+                saved.n_bytes
+            )));
+        }
+        Ok(Arc::new(SavedBytes {
+            n_tokens: saved.n_tokens,
+            bytes,
+        }))
+    }
+    /// Replaces the cache with `state`, which this engine's
+    /// [`Engine::snapshot`] took; the next `prefill` continues after
+    /// `state.n_tokens()`. A refusal leaves the cache in no defined state (the
+    /// server resets it). The default reads the default snapshot's bytes with
+    /// [`Engine::restore_state`].
+    fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+        let Some(saved) = state.as_any().downcast_ref::<SavedBytes>() else {
+            return Err(StateError::Format(
+                "a saved state this engine did not take".to_owned(),
+            ));
+        };
+        let mut input = saved.bytes.as_slice();
+        let read = self.restore_state(&mut input)?;
+        if !input.is_empty() || read.n_tokens != saved.n_tokens {
+            return Err(StateError::Format(format!(
+                "the engine restored {} positions and left {} bytes of a state of {} positions",
+                read.n_tokens,
+                input.len(),
+                saved.n_tokens
+            )));
+        }
+        Ok(())
+    }
+    /// Where to cut a prompt call of positions `first .. end` into calls so
+    /// that the `marks` (ascending, each inside the call) a later request may
+    /// be cut back to stay keepable: a subset of `marks`, ascending. The
+    /// default cuts nowhere: an engine whose cache keeps every position needs
+    /// no cut.
+    fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+        let _ = (first, end, marks);
+        Vec::new()
+    }
+    /// What the prompt cache did, for this engine's binary to print. The
+    /// default writes one plain line to stderr.
+    fn note(&self, note: &CacheNote) {
+        eprintln!("bloomery-serve: {note}");
+    }
+}
+
+/// A saved engine state held by the prompt cache ([`Engine::snapshot`]).
+pub trait Saved: Send + Sync {
+    /// The positions it holds.
+    fn n_tokens(&self) -> usize;
+    /// The host bytes it holds, which the cache's budget counts.
+    fn n_bytes(&self) -> u64;
+    /// What [`Engine::keepable`] would grant of `n` right after a resume of
+    /// this state: the cache ranks its states by it.
+    fn keepable(&self, n: usize) -> usize;
+    /// The value, for the engine that took it to read back.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The default snapshot: [`Engine::save_state`]'s bytes. Its `keepable` is
+/// every position it holds.
+struct SavedBytes {
+    n_tokens: usize,
+    bytes: Vec<u8>,
+}
+
+impl Saved for SavedBytes {
+    fn n_tokens(&self) -> usize {
+        self.n_tokens
+    }
+
+    fn n_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        n.min(self.n_tokens)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// What the prompt cache did ([`Engine::note`]). `ms` is the server's wall
+/// clock around the engine call, not an admissible measurement.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CacheNote {
+    /// A request shared `common` ids with the slot and asked to keep `ask` of
+    /// them (all but its last id), and the engine kept `kept < ask`, for
+    /// `reason` ([`Engine::keep_limit`]; `None` when it named none).
+    Reuse {
+        common: usize,
+        ask: usize,
+        kept: usize,
+        held: usize,
+        reason: Option<String>,
+    },
+    /// The slot's state of `positions` went into the cache.
+    Save {
+        positions: usize,
+        bytes: u64,
+        ms: f64,
+        entries: usize,
+        cache_bytes: u64,
+    },
+    /// A cached state of `positions` sharing `common` ids with the request
+    /// replaced the slot's, which kept `slot_kept` of them; the engine then
+    /// keeps `kept`.
+    Load {
+        positions: usize,
+        common: usize,
+        kept: usize,
+        slot_kept: usize,
+        bytes: u64,
+        ms: f64,
+    },
+    /// A cached state left the cache: the budget needed its bytes, or a newer
+    /// state keeps everything it did.
+    Evict {
+        positions: usize,
+        bytes: u64,
+        why: &'static str,
+    },
+    /// The slot's state of `positions` was not cached, for `why`.
+    Skip { positions: usize, why: String },
+    /// A prompt call from `first` to `end` ran as calls cut at `at`, so a
+    /// later request keeps those positions.
+    Split {
+        first: usize,
+        end: usize,
+        at: Vec<usize>,
+    },
+}
+
+impl std::fmt::Display for CacheNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheNote::Reuse {
+                common,
+                ask,
+                kept,
+                held,
+                reason,
+            } => write!(
+                f,
+                "reuse common={common} ask={ask} kept={kept} held={held} reason={}",
+                reason.as_deref().unwrap_or("unstated")
+            ),
+            CacheNote::Save {
+                positions,
+                bytes,
+                ms,
+                entries,
+                cache_bytes,
+            } => write!(
+                f,
+                "cache save positions={positions} bytes={bytes} ms={ms:.3} entries={entries} \
+                 cache_bytes={cache_bytes}"
+            ),
+            CacheNote::Load {
+                positions,
+                common,
+                kept,
+                slot_kept,
+                bytes,
+                ms,
+            } => write!(
+                f,
+                "cache load positions={positions} common={common} kept={kept} \
+                 slot_kept={slot_kept} bytes={bytes} ms={ms:.3}"
+            ),
+            CacheNote::Evict {
+                positions,
+                bytes,
+                why,
+            } => write!(
+                f,
+                "cache evict positions={positions} bytes={bytes} why={why}"
+            ),
+            CacheNote::Skip { positions, why } => {
+                write!(f, "cache skip positions={positions} why={why}")
+            }
+            CacheNote::Split { first, end, at } => {
+                write!(f, "prefill split first={first} end={end} at={at:?}")
+            }
+        }
     }
 }
 

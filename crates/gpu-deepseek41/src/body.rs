@@ -102,12 +102,14 @@ use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 mod ced;
 mod prefill;
 mod program;
+mod seq;
 pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
     BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode,
     PrefillStats, T_MAX, batch_count, batches, prefill, prefill_observed, prefill_with,
     prepare_prefill,
 };
+pub use seq::{KeepLimit, SeqSnapshot, resume, snapshot};
 
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;
@@ -1212,31 +1214,7 @@ impl Body {
     ///   token history, truncated.
     #[must_use]
     pub fn keep_point(&self, n: usize) -> usize {
-        let len = self.history.len();
-        if n >= len {
-            return len;
-        }
-        let mut k = n;
-        loop {
-            while k > 0 && !self.holds.state_keeps(k) {
-                k -= 1;
-            }
-            let unwritten = self.holds.stale(k).find_map(|q| {
-                if q < self.shadow_from {
-                    Some(None)
-                } else {
-                    self.holes
-                        .iter()
-                        .find(|h| h.contains(&q))
-                        .map(|h| Some(h.start))
-                }
-            });
-            match unwritten {
-                None => return k,
-                Some(None) => return 0,
-                Some(Some(start)) => k = start,
-            }
-        }
+        self.keep_why(n).0
     }
 
     /// `n_embd`, as the planner's image holds it.
@@ -1767,6 +1745,7 @@ fn layer_io<'a>(
 /// position overwrites holds — the raw window ring's `slots` and each
 /// compressed stream's state ring of `ratio` — every layer alike, since every
 /// step writes every layer's slots. [`Body::keep_point`] reads it.
+#[derive(Clone)]
 struct Holds {
     ring: Vec<Option<usize>>,
     /// Per stream of the plan, above ratio 1: its ratio and its slots.

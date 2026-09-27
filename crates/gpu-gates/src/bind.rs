@@ -10,9 +10,12 @@
 //! handle that sends it commands. The opener comes in as a closure because
 //! this library does not name a device crate (see [`crate::generate`]).
 //!
-//! How long a prefix of the cache can be kept is the body's rule, which the
-//! opener hands in beside the model ([`Ds41Engine::spawn`]'s `keep`) and the
-//! engine thread answers ([`Ds41Engine`]'s `keepable`). How far the positions
+//! How long a prefix of the cache can be kept, and why no longer, is the
+//! body's rule, which the opener hands in beside the model
+//! ([`Ds41Engine::spawn`]'s [`BodyOps`]) and the engine thread answers
+//! ([`Ds41Engine`]'s `keepable` and `keep_limit`); so are the prompt feed, where
+//! a prompt call is cut, and the state the server's prompt cache saves and
+//! puts back ([`BodyOps::snapshot`], [`BodyOps::resume`]). How far the positions
 //! go is the lesser of the cache and the positions the body computes the model
 //! at (`spawn`'s `defined`): the server refuses a request past it, so a client's
 //! long prompt or `max_tokens` never reaches the body's refusal, which is fatal.
@@ -38,8 +41,8 @@ use gguf::Split;
 use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::{
-    Decoder, DeviceProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
-    SamplerFactory, SamplingParams, Tokenizer,
+    CacheNote, Decoder, DeviceProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
+    SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
 };
 
 use crate::GateError;
@@ -50,6 +53,7 @@ pub struct Vocab {
     tok: Arc<tokenizer::Tokenizer>,
     bos: u32,
     eos: u32,
+    user_start: Vec<u32>,
 }
 
 impl Vocab {
@@ -62,7 +66,23 @@ impl Vocab {
             tok: Arc::new(tok),
             bos,
             eos,
+            user_start: Vec::new(),
         })
+    }
+
+    /// The same vocabulary with `marker`, one of its special tokens, as the
+    /// token that opens a user message ([`Tokenizer::user_start`]); refused
+    /// when no special token has that text.
+    pub fn with_user_start(mut self, marker: &str) -> Result<Vocab, GateError> {
+        let id = self
+            .tok
+            .special_tokens()
+            .iter()
+            .copied()
+            .find(|&id| self.tok.text(id) == Some(marker))
+            .ok_or_else(|| format!("the vocabulary has no special token {marker:?}"))?;
+        self.user_start = vec![id];
+        Ok(self)
     }
 
     /// The vocabulary itself.
@@ -107,6 +127,10 @@ impl Tokenizer for Vocab {
 
     fn n_vocab(&self) -> usize {
         self.tok.n_vocab()
+    }
+
+    fn user_start(&self) -> Vec<u32> {
+        self.user_start.clone()
     }
 }
 
@@ -358,20 +382,65 @@ enum Cmd {
     Reset,
     /// Take back the positions from this one on.
     Rollback(u32),
-    /// The longest prefix of at most this many positions a rollback keeps.
+    /// The longest prefix of at most this many positions a rollback keeps,
+    /// and the rule that kept less.
     Keep(usize),
+    /// Where to cut a prompt call of `first .. end` at `marks`.
+    Splits {
+        first: usize,
+        end: usize,
+        marks: Vec<usize>,
+    },
+    /// The sequence state, as a value.
+    Save,
+    /// Replace the sequence state with a saved one.
+    Resume(Arc<dyn Saved>),
     /// Nothing: the reply carries the position the model stands at.
     Pos,
 }
 
+/// What a reply carries besides its result.
+enum Extra {
+    None,
+    /// A `Keep`'s rule.
+    Why(Option<String>),
+    /// A `Splits`' cuts.
+    Splits(Vec<usize>),
+    /// A `Save`'s state.
+    Saved(Arc<dyn Saved>),
+}
+
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
-/// logits buffer a `Next` was lent (filled unless the result is an error), and
+/// logits buffer a `Next` was lent (filled unless the result is an error),
 /// the position it stands at afterwards (the position it failed at, on an
-/// error).
+/// error), and what a `Keep`, `Splits` or `Save` returns besides.
 struct Reply {
     result: Result<u32, String>,
     logits: Option<Vec<f32>>,
     pos: usize,
+    extra: Extra,
+}
+
+/// What the engine thread asks the body besides a step ([`Ds41Engine::spawn`]).
+pub trait BodyOps<B: Rollback>: Send + 'static {
+    /// The longest prefix of at most `n` positions (no more than the model
+    /// holds) the model's rollback keeps, and the rule that kept less.
+    fn keep(&self, m: &GpuModel<B>, n: usize) -> (usize, Option<String>);
+    /// The body's prompt feed: the ids from where the model stands, the
+    /// argmax after the last (a batched body's batch, or `GpuModel::step`).
+    fn prefill(&self, m: &mut GpuModel<B>, ids: &[u32]) -> Result<u32, GpuError>;
+    /// Where to cut a prompt call of `first .. end` (from where the model
+    /// stands) so the `marks` stay keepable (`serve::Engine::prefill_splits`).
+    fn splits(&self, m: &GpuModel<B>, first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
+    /// The model's sequence state as a value the server's prompt cache holds.
+    fn snapshot(&self, m: &mut GpuModel<B>) -> Result<Arc<dyn Saved>, GpuError>;
+    /// Replace the model's sequence state with `state`, which
+    /// [`BodyOps::snapshot`] took of this model.
+    fn resume(&self, m: &mut GpuModel<B>, state: &dyn Saved) -> Result<(), GpuError>;
+    /// Prints what the server's prompt cache did, as the binary's records.
+    fn note(note: &CacheNote)
+    where
+        Self: Sized;
 }
 
 /// `serve::Engine` over a [`Generator`] that lives on its own thread. The
@@ -383,6 +452,8 @@ pub struct Ds41Engine {
     ctx_max: usize,
     card: String,
     props: EngineProps,
+    cache_ram: u64,
+    note: fn(&CacheNote),
 }
 
 /// The handle's side of the engine thread: its channels and the logits buffer
@@ -397,29 +468,26 @@ struct Link {
 
 impl Ds41Engine {
     /// Start the engine thread, open the model on it with `open` (which
-    /// writes the load lines), and wait until it is loaded. `keep` is the
-    /// body's rule for `keepable`: the longest prefix of at most `n` positions
-    /// the model's rollback keeps, from where it stands. `prefill` is the
-    /// body's prompt feed: it feeds the ids from where the model stands and
-    /// returns the argmax after the last (a batched body's batch, or
-    /// `GpuModel::step`). `defined` is how many positions the body computes
-    /// the model at; the engine serves the lesser of it and the cache. `card`
-    /// names the device in a crash report; `props` is what `/props` reports
-    /// about the engine ([`model_props`], [`placement_props`]).
-    pub fn spawn<B, F, K, P>(
+    /// writes the load lines), and wait until it is loaded. `ops` is what the
+    /// thread asks the body besides a step ([`BodyOps`]). `defined` is how
+    /// many positions the body computes the model at; the engine serves the
+    /// lesser of it and the cache. `card` names the device in a crash report;
+    /// `props` is what `/props` reports about the engine ([`model_props`],
+    /// [`placement_props`]); `cache_ram` is the server's prompt cache budget
+    /// (`serve::Engine::cache_ram`).
+    pub fn spawn<B, F, O>(
         open: F,
-        keep: K,
-        prefill: P,
+        ops: O,
         defined: usize,
         vocab: Arc<Vocab>,
         card: String,
         props: EngineProps,
+        cache_ram: u64,
     ) -> Result<Ds41Engine, GateError>
     where
         B: Rollback + 'static,
         F: FnOnce() -> Result<Generator<B>, GateError> + Send + 'static,
-        K: Fn(&GpuModel<B>, usize) -> usize + Send + 'static,
-        P: Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError> + Send + 'static,
+        O: BodyOps<B>,
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
@@ -439,19 +507,48 @@ impl Ds41Engine {
                     return;
                 }
                 for cmd in cmds {
-                    let (result, logits) = match cmd {
-                        Cmd::Keep(n) => (
-                            u32::try_from(keep(g.model(), n.min(g.pos())))
-                                .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
+                    let (result, logits, extra) = match cmd {
+                        Cmd::Keep(n) => {
+                            let (k, why) = ops.keep(g.model(), n.min(g.pos()));
+                            (
+                                u32::try_from(k).map_err(|_| {
+                                    format!("a kept prefix of at most {n} passes u32")
+                                }),
+                                None,
+                                Extra::Why(why),
+                            )
+                        }
+                        Cmd::Splits { first, end, marks } => (
+                            Ok(0),
                             None,
+                            Extra::Splits(ops.splits(g.model(), first, end, &marks)),
                         ),
-                        cmd => serve_cmd(&mut g, cmd, n_vocab, &prefill),
+                        Cmd::Save => match ops.snapshot(g.model_mut()) {
+                            Ok(s) => (Ok(0), None, Extra::Saved(s)),
+                            Err(e) => (
+                                Err(format!("snapshot at position {}: {e}", g.pos())),
+                                None,
+                                Extra::None,
+                            ),
+                        },
+                        Cmd::Resume(state) => (
+                            ops.resume(g.model_mut(), &*state).map(|()| 0).map_err(|e| {
+                                format!("resume of a state of {} positions: {e}", state.n_tokens())
+                            }),
+                            None,
+                            Extra::None,
+                        ),
+                        cmd => {
+                            let (result, logits) = serve_cmd(&mut g, cmd, n_vocab, &ops);
+                            (result, logits, Extra::None)
+                        }
                     };
                     if replies
                         .send(Reply {
                             result,
                             logits,
                             pos: g.pos(),
+                            extra,
                         })
                         .is_err()
                     {
@@ -475,6 +572,8 @@ impl Ds41Engine {
             ctx_max,
             card,
             props,
+            cache_ram,
+            note: O::note,
         })
     }
 }
@@ -521,26 +620,23 @@ impl Link {
     }
 }
 
-/// A body's prompt feed ([`Ds41Engine::spawn`]'s `prefill`): the ids from
-/// where the model stands, the argmax after the last.
-type PrefillFn<B> = dyn Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>;
-
 /// One command on the engine thread, and the logits buffer a `Next` was lent,
 /// handed back whatever the result.
-fn serve_cmd<B: Rollback>(
+fn serve_cmd<B: Rollback, O: BodyOps<B>>(
     g: &mut Generator<B>,
     cmd: Cmd,
     n_vocab: usize,
-    prefill: &PrefillFn<B>,
+    ops: &O,
 ) -> (Result<u32, String>, Option<Vec<f32>>) {
     let at = g.pos();
     let result = match cmd {
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            g.check_feed(ids.len())
-                .map_err(refuse)
-                .and_then(|()| prefill(g.model_mut(), &ids).map_err(|e| refuse(e.to_string())))
+            g.check_feed(ids.len()).map_err(refuse).and_then(|()| {
+                ops.prefill(g.model_mut(), &ids)
+                    .map_err(|e| refuse(e.to_string()))
+            })
         }
         Cmd::Next { last, mut logits } => {
             let arg = next_row(g, last, logits.as_deref_mut(), n_vocab);
@@ -557,9 +653,10 @@ fn serve_cmd<B: Rollback>(
             .rollback(pos)
             .map(|()| 0)
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
-        Cmd::Keep(n) => Err(format!(
-            "a keep query of {n} reached the step loop; the engine thread answers it"
-        )),
+        Cmd::Keep(_) | Cmd::Splits { .. } | Cmd::Save | Cmd::Resume(_) => Err(
+            "a keep, split, save or resume reached the step loop; the engine thread answers it"
+                .to_owned(),
+        ),
         Cmd::Pos => Ok(0),
     };
     (result, None)
@@ -626,6 +723,64 @@ impl Engine for Ds41Engine {
         }
     }
 
+    /// The body's rule, as `keepable` asks it; a thread that does not answer
+    /// is named as the reason.
+    fn keep_limit(&self, n: usize) -> Option<String> {
+        match self.link.ask(Cmd::Keep(n)) {
+            Ok(Reply {
+                extra: Extra::Why(why),
+                ..
+            }) => why,
+            Ok(_) => Some("the engine thread answered a keep query with no rule".to_owned()),
+            Err(e) => Some(e.0),
+        }
+    }
+
+    fn cache_ram(&self) -> u64 {
+        self.cache_ram
+    }
+
+    fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+        let reply = self.link.ask(Cmd::Save)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Saved(s)) => Ok(s),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a save with no state".to_owned(),
+            ))),
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+        }
+    }
+
+    /// A state the body refuses leaves the model in no defined state: every
+    /// refusal is the engine's error, which ends the server.
+    fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+        self.link
+            .call(Cmd::Resume(Arc::clone(state)))
+            .map(|_| ())
+            .map_err(StateError::Engine)
+    }
+
+    /// The body's cuts; a thread that does not answer cuts nowhere, and the
+    /// next call reports the thread.
+    fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+        let cmd = Cmd::Splits {
+            first,
+            end,
+            marks: marks.to_vec(),
+        };
+        match self.link.ask(cmd) {
+            Ok(Reply {
+                extra: Extra::Splits(at),
+                ..
+            }) => at,
+            _ => Vec::new(),
+        }
+    }
+
+    fn note(&self, note: &CacheNote) {
+        (self.note)(note);
+    }
+
     /// A cut to where the model stands is nothing to do: the thread answers
     /// it without a rollback.
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {
@@ -684,6 +839,7 @@ mod tests {
                     result: Ok(last + 1),
                     logits,
                     pos: at + 1,
+                    extra: super::Extra::None,
                 };
                 if replies.send(reply).is_err() {
                     return;

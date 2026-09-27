@@ -1,7 +1,7 @@
 //! `bloomery-serve-ds41` — the llama-server-compatible HTTP API on the V4.1 engine.
 //!
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place a|gate]
-//!                         [--ctx C] [--alias NAME]
+//!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! the chat template (`tokenizer.chat_template`) and the default alias
@@ -21,6 +21,15 @@
 //! at (`Hparams::candidate_free_positions`): `/props`' `n_ctx` is that number,
 //! a prompt that long is a 400 before it reaches the engine, and generation
 //! stops there with `truncated`.
+//!
+//! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
+//! holds the body's saved sequence states in host RAM. Its default is the
+//! lesser of [`CACHE_RAM_CAP`] and half the host headroom the printed plan
+//! leaves (host RAM less the host expert set, tables, shadows and reserves);
+//! the `cache` record prints it, and the token a prompt call is cut at so a
+//! later request keeps the start of a user message ([`USER_START`], with
+//! whether the chat template writes it). Every cache event and every prefix
+//! the body keeps less of than a request shares is a record line.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -61,12 +70,14 @@ mod serve_levers;
 
 #[cfg(feature = "deepseek41")]
 mod drive {
+    use std::any::Any;
     use std::sync::Arc;
 
+    use bloomery_gpu::GpuError;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, SeqSnapshot};
     use bloomery_gpu_gates::bind::{
-        Ds41Engine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+        BodyOps, Ds41Engine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
     };
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
     use bloomery_gpu_gates::record::{self, Record};
@@ -74,11 +85,26 @@ mod drive {
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, PlanLevers, workstation};
-    use serve::{EngineProps, FATAL_LINGER, PlacementProps, ServeError, Server, ServerConfig};
+    use serve::{
+        CacheNote, EngineProps, FATAL_LINGER, PlacementProps, Saved, ServeError, Server,
+        ServerConfig,
+    };
     use tokenizer::Tokenizer;
 
     const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] [--place a|gate] \
-                         [--ctx C] [--alias NAME]";
+                         [--ctx C] [--alias NAME] [--cache-ram MIB]";
+
+    /// The token V4.1's chat template opens every user and tool message with.
+    pub const USER_START: &str = "<｜User｜>";
+
+    /// The most the prompt cache takes by default: llama-server's
+    /// `--cache-ram` default.
+    pub const CACHE_RAM_CAP: u64 = 8192 << 20;
+
+    /// A prompt call is cut at a message start only this far past the call's
+    /// start: below it the cut's second call costs more than the prefix a
+    /// later request keeps saves.
+    const SPLIT_MIN: usize = 64;
 
     struct Args {
         host: String,
@@ -86,6 +112,8 @@ mod drive {
         place: Place,
         ctx: usize,
         alias: Option<String>,
+        /// `--cache-ram` in bytes; `None` takes the default.
+        cache_ram: Option<u64>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
@@ -95,6 +123,7 @@ mod drive {
             place: Place::A,
             ctx: usize::try_from(workstation::CTX_MAX)?,
             alias: None,
+            cache_ram: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -110,6 +139,13 @@ mod drive {
                 "--place" => a.place = Place::parse(&v)?,
                 "--ctx" => a.ctx = v.parse()?,
                 "--alias" => a.alias = Some(v),
+                "--cache-ram" => {
+                    let mib: u64 = v.parse()?;
+                    a.cache_ram = Some(
+                        mib.checked_mul(1 << 20)
+                            .ok_or_else(|| format!("--cache-ram {mib} MiB passes u64 bytes"))?,
+                    );
+                }
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
@@ -124,7 +160,8 @@ mod drive {
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
         let path = ref_model_path()?;
-        let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
+        let vocab =
+            Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
         let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let template = inv
             .value("tokenizer.chat_template")
@@ -142,7 +179,16 @@ mod drive {
         let inputs = PlanInputs::read(&split)?;
         let model = model_props(&split, &inputs.model);
         drop(split);
-        let (card, placement) = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
+        let (card, placement, headroom) = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
+        let cache_ram = a.cache_ram.unwrap_or_else(|| {
+            u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP))
+        });
+        Record::new(&record::CACHE_CONFIG)
+            .u("ram", cache_ram)
+            .u("headroom", headroom)
+            .w("user_start", USER_START)
+            .w("in_template", template.contains(USER_START))
+            .eprint();
         let props = EngineProps {
             model: Some(model),
             placement,
@@ -190,18 +236,12 @@ mod drive {
                 }
                 Ok(g)
             },
-            |m: &Deepseek41Model, n| m.body("bloomery-serve-ds41").map_or(0, |b| b.keep_point(n)),
-            |m: &mut Deepseek41Model, ids: &[u32]| {
-                let mode = m.body("bloomery-serve-ds41")?.prefill_mode();
-                match mode {
-                    body::PrefillMode::Batch => body::prefill(m, ids),
-                    body::PrefillMode::Steps => m.step(ids),
-                }
-            },
+            V41,
             defined,
             vocab,
             card,
             props,
+            cache_ram,
         )?;
 
         let config = ServerConfig {
@@ -222,15 +262,15 @@ mod drive {
     }
 
     /// The plan the engine is about to load under the placement's `levers`,
-    /// on stderr; returns the card's name and the plan's placement for
-    /// `/props` (`None`, and a line saying why, when a card's nvidia-smi index
-    /// cannot be found).
+    /// on stderr; returns the card's name, the plan's placement for `/props`
+    /// (`None`, and a line saying why, when a card's nvidia-smi index cannot
+    /// be found) and the plan's host headroom in bytes.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
         ctx: usize,
         levers: &PlanLevers,
-    ) -> Result<(String, Option<PlacementProps>), GateError> {
+    ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
         let machine = place.machine()(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
@@ -244,6 +284,148 @@ mod drive {
         if let Err(e) = &placement {
             eprintln!("bloomery-serve-ds41: /props leaves the placement out: {e}");
         }
-        Ok((machine.cards[0].name.to_string(), placement.ok()))
+        let headroom = i64::try_from(plan.host.headroom_bytes).map_err(|_| {
+            format!(
+                "the plan's host headroom {} B passes i64",
+                plan.host.headroom_bytes
+            )
+        })?;
+        Ok((machine.cards[0].name.to_string(), placement.ok(), headroom))
+    }
+
+    const WHAT: &str = "bloomery-serve-ds41";
+
+    /// The V4.1 body's side of the engine thread.
+    struct V41;
+
+    /// A body's saved sequence state, as the server's prompt cache holds it.
+    struct Ds41Saved(SeqSnapshot);
+
+    impl Saved for Ds41Saved {
+        fn n_tokens(&self) -> usize {
+            self.0.positions()
+        }
+
+        fn n_bytes(&self) -> u64 {
+            self.0.bytes() as u64
+        }
+
+        fn keepable(&self, n: usize) -> usize {
+            self.0.keep_point(n)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    impl BodyOps<Body> for V41 {
+        fn keep(&self, m: &Deepseek41Model, n: usize) -> (usize, Option<String>) {
+            match m.body(WHAT) {
+                Ok(b) => {
+                    let (k, why) = b.keep_why(n);
+                    (k, why.map(|w| w.to_string()))
+                }
+                Err(e) => (0, Some(e.to_string())),
+            }
+        }
+
+        fn prefill(&self, m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
+            match m.body(WHAT)?.prefill_mode() {
+                body::PrefillMode::Batch => body::prefill(m, ids),
+                body::PrefillMode::Steps => m.step(ids),
+            }
+        }
+
+        /// The body's cuts under the batched feed; the step feed leaves no
+        /// hole and needs none.
+        fn splits(
+            &self,
+            m: &Deepseek41Model,
+            first: usize,
+            end: usize,
+            marks: &[usize],
+        ) -> Vec<usize> {
+            match m.body(WHAT) {
+                Ok(b) if b.prefill_mode() == body::PrefillMode::Batch => {
+                    b.prefill_splits(first, end, marks, SPLIT_MIN)
+                }
+                _ => Vec::new(),
+            }
+        }
+
+        fn snapshot(&self, m: &mut Deepseek41Model) -> Result<Arc<dyn Saved>, GpuError> {
+            Ok(Arc::new(Ds41Saved(body::snapshot(m)?)))
+        }
+
+        fn resume(&self, m: &mut Deepseek41Model, state: &dyn Saved) -> Result<(), GpuError> {
+            let s = state
+                .as_any()
+                .downcast_ref::<Ds41Saved>()
+                .ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "a V4.1 body's saved state",
+                })?;
+            body::resume(m, &s.0)
+        }
+
+        fn note(note: &CacheNote) {
+            let r = match note {
+                CacheNote::Reuse {
+                    common,
+                    ask,
+                    kept,
+                    held,
+                    reason,
+                } => Record::new(&record::CACHE_REUSE)
+                    .u("common", common)
+                    .u("ask", ask)
+                    .u("kept", kept)
+                    .u("held", held)
+                    .w("reason", reason.as_deref().unwrap_or("unstated")),
+                CacheNote::Save {
+                    positions,
+                    bytes,
+                    ms,
+                    entries,
+                    cache_bytes,
+                } => Record::new(&record::CACHE_SAVE)
+                    .u("positions", positions)
+                    .u("bytes", bytes)
+                    .f("ms", *ms)
+                    .u("entries", entries)
+                    .u("cache_bytes", cache_bytes),
+                CacheNote::Load {
+                    positions,
+                    common,
+                    kept,
+                    slot_kept,
+                    bytes,
+                    ms,
+                } => Record::new(&record::CACHE_LOAD)
+                    .u("positions", positions)
+                    .u("common", common)
+                    .u("kept", kept)
+                    .u("slot_kept", slot_kept)
+                    .u("bytes", bytes)
+                    .f("ms", *ms),
+                CacheNote::Evict {
+                    positions,
+                    bytes,
+                    why,
+                } => Record::new(&record::CACHE_EVICT)
+                    .u("positions", positions)
+                    .u("bytes", bytes)
+                    .w("why", why),
+                CacheNote::Skip { positions, why } => Record::new(&record::CACHE_SKIP)
+                    .u("positions", positions)
+                    .w("why", why),
+                CacheNote::Split { first, end, at } => Record::new(&record::PREFILL_SPLIT)
+                    .u("first", first)
+                    .u("end", end)
+                    .csv("at", at),
+            };
+            r.eprint();
+        }
     }
 }
