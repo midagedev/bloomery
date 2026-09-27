@@ -2,7 +2,7 @@
 
 GPU 단계에서 만나는 이슈·PR 후보를 발견 즉시 여기 적는다(사용자 지시 2026-09-21: "cuda oxide에 이슈나 PR 만들 거리 있으면 캐치해 놔줘"). 한 줄이면 된다 — 정식 초안은 `docs/upstream/<slug>.md`, 제출 파이프라인은 rig-log `docs/upstream-contributions.md`(중복 검색 → FAIL-first 실측 → 최소 패치 → 적대적 리뷰). 여기 적힌 것은 **후보**다. 코드 독해로 확정한 결함은 가설이고, 실측 재현이 붙은 것만 상태 열이 `재현`으로 오른다.
 
-**포크 경로(2026-09-25, 사용자 결정).** cuda-oxide는 `Cargo.toml`에서 NVlabs rev로 선언하고 `[patch]`로 우리 포크 [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide) `bloomery` 브랜치에서 받는다. 순서는 그대로다: 결함은 먼저 이 장부에 한 줄(우회 코드보다 먼저), ~~고칠 가치가 있으면~~ 우리 코드의 모양을 정하는 결함은 만나는 대로(사용자 지시 2026-09-27: "oxide는 패치해가면서 쓰고 있으니 결함은 패치해가면서 써") 포크 브랜치에 커밋 하나(재현·FAIL-first·기존 엔트리 PTX md5 동일 또는 핀 이동 절차), 업스트림 PR은 그 커밋을 메인테이너 속도대로(한 레포에 열린 PR 1–2개). 우회 코드는 포크 커밋이 착륙할 때까지만 둔다. 업스트림이 받으면 포크에서 뺀다. 목록은 `THIRD_PARTY_NOTICES.md`.
+**포크 경로(2026-09-25, 사용자 결정).** cuda-oxide는 `Cargo.toml`에서 NVlabs rev로 선언하고 `[patch]`로 우리 포크 [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide) `bloomery` 브랜치에서 받는다. 순서는 그대로다: 결함은 먼저 이 장부에 한 줄(우회 코드보다 먼저), ~~고칠 가치가 있으면~~ 우리 코드의 모양을 정하는 결함은 만나는 대로(사용자 지시 2026-09-27: "oxide는 패치해가면서 쓰고 있으니 결함은 패치해가면서 써") 포크 브랜치에 커밋 하나(재현·FAIL-first·기존 엔트리 PTX md5 동일 또는 핀 이동 절차), 업스트림 PR은 그 커밋을 메인테이너 속도대로(한 레포에 열린 PR 1–2개). 우회 코드는 포크 커밋이 착륙할 때까지만 둔다. 업스트림이 받으면 포크에서 뺀다. 목록은 `THIRD_PARTY_NOTICES.md`. cuda-oxide PR을 여는 모양(메인테이너가 커밋을 더하지 않아도 되게)은 [cuda-oxide-pr.md](cuda-oxide-pr.md).
 
 | # | 대상 | 무엇 | 상태 | 근거 |
 |---|---|---|---|---|
