@@ -17,6 +17,9 @@ bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
 bloomery-qdot = { path = "../qdot" }
 bloomery-threads = { path = "../threads" }
+# The plans count the stores by the rules the card bodies allocate them by (`runtime::stores`).
+# The runtime depends on the model description alone, so the edge makes no cycle.
+bloomery-runtime = { path = "../runtime" }
 # The coverage check asks the tokenizer which pre-tokenizers it runs.
 bloomery-tokenizer = { path = "../tokenizer" }
 libc = { workspace = true }
@@ -27,6 +30,3 @@ thiserror = { workspace = true }
 # The gates read the oracle sets through the reference-set reader, which checks each set's
 # provenance. It depends on the GGUF reader only, so the edge makes no cycle.
 bloomery-refset = { path = "../refset" }
-# The header gates hold the store rules (`runtime::state`) to the files' layers. The runtime depends
-# on the model description alone, so the edge makes no cycle.
-bloomery-runtime = { path = "../runtime" }

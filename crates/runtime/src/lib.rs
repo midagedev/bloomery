@@ -13,7 +13,8 @@
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
 //! layer program's parts over its units ([`sched::walk`]), [`state`], the
-//! stores a layer keeps and how later positions read them, [`seqstate`], the
+//! stores a layer keeps and how later positions read them, [`stores`], their
+//! sizes, [`seqstate`], the
 //! checkpoints of the recurrent ones and which cuts they serve, and
 //! [`layer`], the sub-layer programs a layer's description names.
 
@@ -27,6 +28,7 @@ pub mod seqstate;
 mod speculative;
 pub mod state;
 mod stop;
+pub mod stores;
 
 pub use lookup::Lookup;
 pub use speculative::{Draft, Speculative, TapNeed, Tapped};

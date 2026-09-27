@@ -30,13 +30,8 @@ use crate::placement::{
     Violation,
 };
 
-const F16_BYTES: u64 = 2;
-const F32_BYTES: u64 = 4;
-
-/// The widest call a later call may roll back into, in positions: the GDN
-/// conv ring keeps `conv − 1 + PASS_ROWS` inputs and the PLE conv ring its
-/// reach plus as many. The card body binds it to its kernels' own constant.
-pub const PASS_ROWS: usize = 8;
+use runtime::stores::{F16_BYTES, kv_row_bytes, ple_ring_bytes, recurrent_bytes};
+pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
 /// The positions the selector's kernels take: the QSA passes take the
 /// context as a `u32` launch argument and the selected flash reads `u32`
@@ -213,38 +208,6 @@ impl KvLayout {
 /// The hyper-connection streams of a qwen4exp file (1 without).
 fn streams(hp: &Hparams) -> usize {
     hp.exp.as_ref().map_or(1, |e| e.hc_streams)
-}
-
-/// Rows of the GDN conv ring: the conv's reach and a pass.
-#[must_use]
-pub const fn conv_ring_rows(conv: usize) -> usize {
-    conv - 1 + PASS_ROWS
-}
-
-/// Rows of the PLE conv ring: the reach of `taps` taps `dilation` apart and a
-/// pass.
-#[must_use]
-pub const fn ple_ring_rows(taps: usize, dilation: usize) -> usize {
-    (taps - 1) * dilation + PASS_ROWS
-}
-
-/// A GDN layer's state and conv ring over `v_heads` value heads and
-/// `k_heads` key heads of `state` values with a `conv`-tap conv, in bytes.
-fn recurrent_bytes(v_heads: usize, k_heads: usize, state: usize, conv: usize) -> u64 {
-    let (v, k, d) = (v_heads as u64, k_heads as u64, state as u64);
-    let channels = 2 * k * d + v * d;
-    v * d * d * F32_BYTES + conv_ring_rows(conv) as u64 * channels * F32_BYTES
-}
-
-/// The PLE conv ring of `taps` taps `dilation` apart over `streams` streams
-/// of `n_embd`, in bytes.
-fn ple_ring_bytes(taps: usize, dilation: usize, streams: usize, n_embd: usize) -> u64 {
-    ple_ring_rows(taps, dilation) as u64 * (streams * n_embd) as u64 * F32_BYTES
-}
-
-/// A GQA position's K and V in f16.
-fn kv_row_bytes(kv_heads: usize, head_dim: usize) -> u64 {
-    2 * (kv_heads * head_dim) as u64 * F16_BYTES
 }
 
 impl KvBytes for KvLayout {
