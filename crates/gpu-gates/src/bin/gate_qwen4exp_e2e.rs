@@ -96,6 +96,17 @@
 //!   while a verify waits for its commit, and a commit with no verify
 //!   waiting, by name; the lane word planted on a lane no call wrote makes
 //!   the next step's first delta layer raise `delta_stamp` there, alone.
+//! - (o) one owner of the position: after the prefix, a graph step, an eager
+//!   pass of three rows and a graph verify of two rows (kept whole), each
+//!   with a failure planted before its launch (`Body38::plant_before_launch`)
+//!   fail by name with the model at the prefix and not poisoned, and the
+//!   same call again gives the clean call's token, logits, PLE rows
+//!   (`Body38::ple_rows`) and every store bit for bit; each with a failure
+//!   planted after its launch (`Body38::plant_after_launch`) fails by name
+//!   with the model at the prefix, `Body38::kept` keeps less than the
+//!   prefix (no delta state holds it any more), a step there is refused by
+//!   name (the recurrent stores hold it already), and after `reset` the
+//!   prefix and the same call give the clean bits.
 //! - (r) refusals: `Prompt38::parse` refuses `gemm` and `auto` by name,
 //!   naming `gemm_q8_0`; the image placeholder [`IMAGE_TOKEN`] as a step and
 //!   as a pass is refused by name with the position kept and the model not
@@ -1525,6 +1536,190 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------- (o) one owner of the position
+
+    /// The calls (o) plants its failures on, each from position [`PREFIX`].
+    #[derive(Clone, Copy)]
+    enum Call {
+        Step,
+        Pass,
+        Verify,
+    }
+
+    impl Call {
+        fn name(self) -> &'static str {
+            match self {
+                Call::Step => "a graph step",
+                Call::Pass => "an eager pass of 3 rows",
+                Call::Verify => "a graph verify of 2 rows",
+            }
+        }
+
+        /// The call at [`PREFIX`]: its last row's token.
+        fn run(self, m: &mut Qwen38Model, toks: &[u32], rows: [u32; 2]) -> Result<u32, GpuError> {
+            match self {
+                Call::Step => m.step(&toks[PREFIX..PREFIX + 1]),
+                Call::Pass => m.prompt38(&toks[PREFIX..PREFIX + 3], Prompt38::Pass),
+                Call::Verify => m.step_rows::<2>(rows).map(|t| t[1]),
+            }
+        }
+    }
+
+    /// What a clean call left: its last row's token and logits, the PLE
+    /// rows its fill named, and every store with the PLE ring after it (a
+    /// verify's after its commit of both rows).
+    struct Owned {
+        token: u32,
+        logits: Vec<f32>,
+        rows: Vec<u32>,
+        stores: Vec<Store38Host>,
+        ple_ring: Vec<f32>,
+    }
+
+    /// The call `c` that just returned `token`, read back.
+    fn owned(m: &mut Qwen38Model, c: Call, token: u32) -> Result<Owned, GateError> {
+        let rows = m.body("owned")?.ple_rows().to_vec();
+        let logits = match c {
+            Call::Verify => {
+                let [_, last] = m.rows_logits::<2>()?;
+                m.rollback(PREFIX as u32 + 2)?;
+                last
+            }
+            Call::Step | Call::Pass => m.logits()?,
+        };
+        let (stores, ple_ring) = stores(m)?;
+        Ok(Owned {
+            token,
+            logits,
+            rows,
+            stores,
+            ple_ring,
+        })
+    }
+
+    /// [`fresh`], the prefix as graph steps, then the call `c`.
+    fn clean_call(
+        m: &mut Qwen38Model,
+        c: Call,
+        toks: &[u32],
+        rows: [u32; 2],
+    ) -> Result<Owned, GateError> {
+        Prefix::Steps(&toks[..PREFIX]).feed(m)?;
+        let token = c.run(m, toks, rows)?;
+        owned(m, c, token)
+    }
+
+    /// `got` against the clean call `want`, bit for bit: a line's tail.
+    fn same_owned(got: &Owned, want: &Owned) -> (bool, String) {
+        let logits = same_bits(&got.logits, &want.logits);
+        let rows = got.rows == want.rows && !got.rows.is_empty();
+        let layers: Vec<usize> = (0..got.stores.len().max(want.stores.len()))
+            .filter(|&l| match (got.stores.get(l), want.stores.get(l)) {
+                (Some(x), Some(y)) => !x.same_bits(y),
+                _ => true,
+            })
+            .collect();
+        let ring = same_bits(&got.ple_ring, &want.ple_ring);
+        let ok = got.token == want.token && logits && rows && layers.is_empty() && ring;
+        (
+            ok,
+            format!(
+                "token {} (clean {}), logits bit for bit: {logits}, PLE rows equal: {rows}, \
+                 stores differing at layers {layers:?}, PLE ring equal: {ring}",
+                got.token, want.token
+            ),
+        )
+    }
+
+    fn text<T: std::fmt::Display>(r: &Result<T, GpuError>) -> String {
+        match r {
+            Ok(t) => format!("accepted ({t})"),
+            Err(e) => format!("error \"{e}\""),
+        }
+    }
+
+    /// (o) for the call `c`: a failure before its launch, then one after.
+    fn owner_call(
+        m: &mut Qwen38Model,
+        c: Call,
+        toks: &[u32],
+        rows: [u32; 2],
+    ) -> Result<bool, GateError> {
+        let clean = clean_call(m, c, toks, rows)?;
+        let at = PREFIX as u32;
+
+        Prefix::Steps(&toks[..PREFIX]).feed(m)?;
+        let lane = m.body("owner")?.lane();
+        m.body_parts("owner")?.2.plant_before_launch();
+        let first = c.run(m, toks, rows);
+        let (pos, lane_after) = (m.pos(), m.body("owner")?.lane());
+        let failed = matches!(&first, Err(e)
+            if e.to_string().contains("the planted failure before the launch"));
+        let again = c.run(m, toks, rows);
+        let (rerun_ok, rerun) = match &again {
+            Ok(t) => same_owned(&owned(m, c, *t)?, &clean),
+            Err(_) => (false, String::new()),
+        };
+        let before_ok = failed
+            && pos == at
+            && lane_after == lane
+            && m.poisoned().is_none()
+            && again.is_ok()
+            && rerun_ok;
+        println!(
+            "position owner, {}: a failure before the launch at {at}: {} at position {pos} (want \
+             {at}), lane {lane_after} (want {lane}); the call again: {} {rerun} {}",
+            c.name(),
+            text(&first),
+            text(&again),
+            verdict(before_ok)
+        );
+
+        Prefix::Steps(&toks[..PREFIX]).feed(m)?;
+        m.body_parts("owner")?.2.plant_after_launch();
+        let first = c.run(m, toks, rows);
+        let pos = m.pos();
+        let failed = matches!(&first, Err(e)
+            if e.to_string().contains("the planted failure after the launch"));
+        let kept = m.body("owner")?.kept(at, pos);
+        let step = m.step(&toks[PREFIX..PREFIX + 1]);
+        let refused = matches!(&step, Err(e)
+            if e.to_string().contains("failed after its chain was launched"));
+        let (pos_step, poisoned) = (m.pos(), m.poisoned());
+        let back = clean_call(m, c, toks, rows)?;
+        let (back_ok, back_line) = same_owned(&back, &clean);
+        let after_ok = failed
+            && pos == at
+            && kept.at < at
+            && refused
+            && pos_step == at
+            && poisoned.is_none()
+            && back_ok;
+        println!(
+            "position owner, {}: a failure after the launch at {at}: {} at position {pos} (want \
+             {at}); a cut keeps {} ({kept}, want under {at}); a step at {at}: {} (want refused \
+             by name), position {pos_step}; after reset the call again: {back_line} {}",
+            c.name(),
+            text(&first),
+            kept.at,
+            text(&step),
+            verdict(after_ok)
+        );
+        m.reset()?;
+        Ok(before_ok && after_ok)
+    }
+
+    /// (o): each call's failures, before and after its launch.
+    fn position_owner(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        let (rows, _) = verify_rows(toks)?;
+        let rows = [rows[0], rows[1]];
+        let mut ok = true;
+        for c in [Call::Step, Call::Pass, Call::Verify] {
+            ok &= owner_call(m, c, toks, rows)?;
+        }
+        Ok(ok)
+    }
+
     // ---------------------------------------------------- (r) refusals
 
     fn refusals(m: &mut Qwen38Model) -> Result<bool, GateError> {
@@ -1619,6 +1814,7 @@ mod gate {
         ok &= pass_selects(&mut m, &d3k)?;
         drop(d3k);
         ok &= verify_clause(&mut m, &toks)?;
+        ok &= position_owner(&mut m, &toks)?;
         ok &= refusals(&mut m)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
