@@ -1,8 +1,10 @@
 //! The qwen3moe routed experts' two launches beside the down `_sel`: the
 //! selected experts' gate·up·SwiGLU over Q4_K stacks in one launch, and the
-//! combine of the down outputs with the router weights and the residual —
-//! this model has no shared expert, so the combine is the weighted sum plus
-//! the residual and nothing else.
+//! combine of the down outputs with the router weights and the residual.
+//! The combine is the weighted sum over a token's slots plus the residual
+//! and nothing else: Qwen3-30B-A3B has no shared expert, and Qwen3.6's runs
+//! as one more slot (`router::gated`, nine slots a token), so its weighted
+//! term is inside the sum.
 //!
 //! The gate·up kernel is `moe_fused::expert_gate_up_swiglu_q3k`'s shape over
 //! Q4_K rows: one warp per output row, thread row
@@ -25,7 +27,11 @@
 //! The combine, one thread per output value `d` of token `t`: `y[t · rows +
 //! d] = elem::weighted_expert_sum(down, w, t, d) + resid[t · rows + d]` — the
 //! slot-ascending weighted sum, then one add, the grouping of the
-//! reference's `routed_out + ffn_inp`.
+//! reference's `routed_out + ffn_inp`. For Qwen3.6 the reference adds the
+//! shared expert after the residual, `(routed_out + ffn_inp) + shexp`, a
+//! grouping this combine does not take; its gate prints the distance to
+//! ik's `l_out` and pins the output to the host transcription of this
+//! grouping.
 
 use crate::GpuError;
 use crate::cores::q4k_row_dot_1col;

@@ -72,6 +72,10 @@ use bloomery_gpu_gates::{
 #[cfg(feature = "gpu")]
 use gguf::Split;
 
+#[cfg(feature = "gpu")]
+#[path = "shared/bench.rs"]
+mod bench_arm;
+
 /// The six-token prompt the CUDA dump was made for (gate_p4's constant —
 /// the same dump set), positions 0..5.
 #[cfg(feature = "gpu")]
@@ -671,8 +675,8 @@ fn run() -> Result<(), GateError> {
 /// weight load, a round trip `q3k_gemv` does not pay, so the pair's gap is
 /// a lower bound on the guards' cost.
 ///
-/// Weight and activation bytes come from [`fill_pattern`], a fixed
-/// non-trivial bit pattern. A K-quant core's control flow does not branch on
+/// Weight and activation bytes come from [`bench_arm::fill_pattern`], a
+/// fixed non-trivial bit pattern. A K-quant core's control flow does not branch on
 /// a value, but its f16 scale decode does: `cores::half_to_f32` takes its
 /// cheapest arm on a zero, so a zeroed weight buffer makes every arm that
 /// runs a decode path read faster than the step it is meant to predict. The
@@ -685,59 +689,10 @@ fn run() -> Result<(), GateError> {
 /// instrument, and against the same `touch` floor, as the node price.
 #[cfg(feature = "gpu")]
 fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
+    use bench_arm::{GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay};
     use bloomery_gpu::probe::{GAP_THREADS, GapArm};
-    use bloomery_gpu::{DeviceTensor, GpuError, Graph, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Q8Act};
     use cuda_core::{CudaStream, DeviceBuffer};
-
-    /// Launches per burst, and nodes per captured graph.
-    const N: usize = 64;
-    /// Bursts (or graph replays) per arm — the spread of these is printed.
-    const ROUNDS: u32 = 7;
-    /// Graph launches per round, so the one synchronize is amortized.
-    const GREPS: usize = 4;
-
-    fn burst(
-        stream: &CudaStream,
-        enq: &mut dyn FnMut(&CudaStream) -> Result<(), GpuError>,
-    ) -> Result<(f64, f64, f64), GateError> {
-        for _ in 0..N {
-            enq(stream)?;
-        }
-        stream.synchronize()?;
-        let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
-        for _ in 0..ROUNDS {
-            let t0 = std::time::Instant::now();
-            for _ in 0..N {
-                enq(stream)?;
-            }
-            stream.synchronize()?;
-            let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
-            lo = lo.min(us);
-            hi = hi.max(us);
-            sum += us;
-        }
-        Ok((lo, sum / f64::from(ROUNDS), hi))
-    }
-
-    fn replay(stream: &CudaStream, g: &Graph) -> Result<(f64, f64, f64), GateError> {
-        for _ in 0..2 {
-            g.launch(stream)?;
-        }
-        stream.synchronize()?;
-        let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
-        for _ in 0..ROUNDS {
-            let t0 = std::time::Instant::now();
-            for _ in 0..GREPS {
-                g.launch(stream)?;
-            }
-            stream.synchronize()?;
-            let us = t0.elapsed().as_secs_f64() * 1e6 / (N * GREPS) as f64;
-            lo = lo.min(us);
-            hi = hi.max(us);
-            sum += us;
-        }
-        Ok((lo, sum / f64::from(ROUNDS), hi))
-    }
 
     let gpu = model.gpu();
     let stream = gpu.stream();
@@ -927,51 +882,6 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
         }
     }
     Ok(())
-}
-
-/// A fixed non-trivial u32 pattern — a multiplicative hash of the index,
-/// which spreads bits through every byte and every f16 field a K-quant
-/// super-block carries. Not a model of any weight distribution: its one job
-/// is that no value-dependent decode path (`half_to_f32`'s zero arm above
-/// all) is skipped by a buffer of zeros.
-#[cfg(feature = "gpu")]
-fn fill_pattern(n: usize) -> Vec<u32> {
-    (0..n)
-        .map(|i| (i as u32).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9)
-        .collect()
-}
-
-/// The same pattern as f32 activations, mapped into roughly ±1 so a
-/// quantization of it exercises rounding rather than saturation.
-#[cfg(feature = "gpu")]
-fn fill_pattern_f32(n: usize) -> Vec<f32> {
-    fill_pattern(n)
-        .into_iter()
-        .map(|w| (w >> 8) as f32 / 8_388_608.0 - 1.0)
-        .collect()
-}
-
-/// One `bench` row: the eager burst and the graph replay of the same launch,
-/// each as min/mean/max over the arm's rounds, with the graph GB/s beside it.
-#[cfg(feature = "gpu")]
-fn print_arm(
-    name: &str,
-    rows: usize,
-    bytes: u64,
-    nodes: usize,
-    eager: (f64, f64, f64),
-    graph: (f64, f64, f64),
-) {
-    let gbps = match (bytes > 0, graph.0 > 0.0) {
-        (true, true) => format!("{:.1}", bytes as f64 / graph.0 / 1e3),
-        _ => "?".to_string(),
-    };
-    println!(
-        "bench op={name} rows={rows} nodes={nodes} bytes={bytes} \
-         eager_us_min={:.3} eager_us_mean={:.3} eager_us_max={:.3} \
-         graph_us_min={:.3} graph_us_mean={:.3} graph_us_max={:.3} graph_gbps={gbps}",
-        eager.0, eager.1, eager.2, graph.0, graph.1, graph.2
-    );
 }
 
 /// One `<flag> <u32>` pair off the command line: `--profile-pos` names the

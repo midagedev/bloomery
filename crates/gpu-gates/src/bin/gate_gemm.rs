@@ -52,8 +52,10 @@
 //!
 //! The route table (`GemmKernels::enqueue_route`, case `route_table`) for T
 //! ∈ {1, 17, 512, 1000, 4095, 4096} tokens under the four routings, on a
-//! Qwen3 stack's shape (128 experts, top-8: up to 32,768 slots) and a V4.1
-//! one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
+//! Qwen3 stack's shape (128 experts, top-8: up to 32,768 slots), a Qwen3.6
+//! one's (257 experts — the shared expert joined as the last — and nine
+//! slots a token: up to 36,864 slots, the route's cap, in 31 chunks) and a
+//! V4.1 one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
 //! at the same counts: the slot list and the tiles bit for bit the host's
 //! stable grouping — experts ascending, each expert's slots ascending, runs
 //! cut into tiles of at most `GEMM_BN`. Then at 32,768 slots: three ids past
@@ -100,8 +102,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/bench.rs"]
+mod bench_arm;
+
+#[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::router::{N_EXPERT, N_USED};
+    use bloomery_gpu::arch::qwen3moe::router::{N_EXPERT, N_USED, gated};
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
         GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmTile,
@@ -1554,7 +1560,11 @@ mod gate {
         let max_tok = ROUTE_TOKENS[ROUTE_TOKENS.len() - 1];
         let mut ok = true;
         gpu.clear_fault()?;
-        for (stack, n_exp, top_k) in [("qwen3", N_EXPERT, N_USED), ("v41", 384usize, 6usize)] {
+        for (stack, n_exp, top_k) in [
+            ("qwen3", N_EXPERT, N_USED),
+            ("qwen35", gated::ROWS, gated::N_SLOTS),
+            ("v41", 384usize, 6usize),
+        ] {
             let max_slots = max_tok * top_k;
             let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
             let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
@@ -1970,9 +1980,10 @@ mod gate {
     /// `--bench-kernels`: the grouped int8 GEMM's launch cost, the eager
     /// burst and the graph replay of each arm (`bench op=` rows), timed by
     /// `tools/ref/time-gate.sh` under the machine lease. Weight and activation
-    /// bytes come from [`fill_pattern`]: a K-quant core's f16 scale decode
-    /// takes its cheapest arm on a zero, so a zeroed buffer would read faster
-    /// than the launch it prices. Nothing here asserts on the results.
+    /// bytes come from [`fill_pattern`](crate::bench_arm::fill_pattern): a
+    /// K-quant core's f16 scale decode takes its cheapest arm on a zero, so a
+    /// zeroed buffer would read faster than the launch it prices. Nothing
+    /// here asserts on the results.
     ///
     /// `--bench-arm <op>` runs only the arm whose row is `bench op=<op>`
     /// (`gemm_q4k_moe_t4096`, say) and none of the others, so every `gemm_q4k`
@@ -1980,59 +1991,12 @@ mod gate {
     /// ncu-gpu-gemm`) filters by kernel name. A name no arm carries is a named
     /// error.
     mod bench {
-        use bloomery_gpu::{DeviceTensor, GpuError, Graph};
+        use crate::bench_arm::{
+            GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay,
+        };
+        use bloomery_gpu::DeviceTensor;
         use bloomery_gpu_gates::GateError;
         use cuda_core::{CudaStream, DeviceBuffer};
-
-        /// Launches per burst, and nodes per captured graph.
-        const N: usize = 64;
-        /// Bursts (or graph replays) per arm — the spread of these is printed.
-        const ROUNDS: u32 = 7;
-        /// Graph launches per round, so the one synchronize is amortized.
-        const GREPS: usize = 4;
-
-        fn burst(
-            stream: &CudaStream,
-            enq: &mut dyn FnMut(&CudaStream) -> Result<(), GpuError>,
-        ) -> Result<(f64, f64, f64), GateError> {
-            for _ in 0..N {
-                enq(stream)?;
-            }
-            stream.synchronize()?;
-            let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
-            for _ in 0..ROUNDS {
-                let t0 = std::time::Instant::now();
-                for _ in 0..N {
-                    enq(stream)?;
-                }
-                stream.synchronize()?;
-                let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
-                lo = lo.min(us);
-                hi = hi.max(us);
-                sum += us;
-            }
-            Ok((lo, sum / f64::from(ROUNDS), hi))
-        }
-
-        fn replay(stream: &CudaStream, g: &Graph) -> Result<(f64, f64, f64), GateError> {
-            for _ in 0..2 {
-                g.launch(stream)?;
-            }
-            stream.synchronize()?;
-            let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
-            for _ in 0..ROUNDS {
-                let t0 = std::time::Instant::now();
-                for _ in 0..GREPS {
-                    g.launch(stream)?;
-                }
-                stream.synchronize()?;
-                let us = t0.elapsed().as_secs_f64() * 1e6 / (N * GREPS) as f64;
-                lo = lo.min(us);
-                hi = hi.max(us);
-                sum += us;
-            }
-            Ok((lo, sum / f64::from(ROUNDS), hi))
-        }
 
         pub fn run(gpu: &bloomery_gpu::Gpu) -> Result<(), GateError> {
             println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS}");
@@ -2173,26 +2137,6 @@ mod gate {
             Ok(ran)
         }
 
-        /// A fixed non-trivial u32 pattern — a multiplicative hash of the index,
-        /// which spreads bits through every byte and every f16 field a K-quant
-        /// super-block carries. Not a model of any weight distribution: its one job
-        /// is that no value-dependent decode path (`half_to_f32`'s zero arm above
-        /// all) is skipped by a buffer of zeros.
-        fn fill_pattern(n: usize) -> Vec<u32> {
-            (0..n)
-                .map(|i| (i as u32).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9)
-                .collect()
-        }
-
-        /// The same pattern as f32 activations, mapped into roughly ±1 so a
-        /// quantization of it exercises rounding rather than saturation.
-        fn fill_pattern_f32(n: usize) -> Vec<f32> {
-            fill_pattern(n)
-                .into_iter()
-                .map(|w| (w >> 8) as f32 / 8_388_608.0 - 1.0)
-                .collect()
-        }
-
         /// The int8 dense tensor peak of the card named `name`, in TOPS — GA102
         /// whitepaper figures, the denominator the prefill literature report uses —
         /// or `None` for a card not listed.
@@ -2225,28 +2169,6 @@ mod gate {
                 ids.extend(pick);
             }
             ids
-        }
-
-        /// One `bench` row: the eager burst and the graph replay of the same launch,
-        /// each as min/mean/max over the arm's rounds, with the graph GB/s beside it.
-        fn print_arm(
-            name: &str,
-            rows: usize,
-            bytes: u64,
-            nodes: usize,
-            eager: (f64, f64, f64),
-            graph: (f64, f64, f64),
-        ) {
-            let gbps = match (bytes > 0, graph.0 > 0.0) {
-                (true, true) => format!("{:.1}", bytes as f64 / graph.0 / 1e3),
-                _ => "?".to_string(),
-            };
-            println!(
-                "bench op={name} rows={rows} nodes={nodes} bytes={bytes} \
-                 eager_us_min={:.3} eager_us_mean={:.3} eager_us_max={:.3} \
-                 graph_us_min={:.3} graph_us_mean={:.3} graph_us_max={:.3} graph_gbps={gbps}",
-                eager.0, eager.1, eager.2, graph.0, graph.1, graph.2
-            );
         }
     }
 }
