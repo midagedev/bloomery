@@ -37,6 +37,9 @@ bloomery-gpu = { path = "../gpu", optional = true }
 # The V4.1 device crate, reached only through the `deepseek41` feature (the V4.1 op gates): a
 # compiler failure in V4.1 device code then breaks those gates' builds and no other.
 bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
+# The GLM-5.3-Flash program, reached only through the `glm5next` feature (its generator and its
+# end-to-end gate).
+bloomery-gpu-glm5next = { path = "../gpu-glm5next", optional = true }
 cuda-core = { workspace = true, optional = true }
 # A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
 # device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
@@ -92,6 +95,7 @@ deepseek41 = [
     "dep:bloomery-runtime",
 ]
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
+glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 
 # A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
 # feature before it links anything, instead of linking the feature-off stub `main` over the working
@@ -217,6 +221,14 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "generate_ds41"
 required-features = ["deepseek41"]
+
+[[bin]]
+name = "generate_glm5next"
+required-features = ["glm5next"]
+
+[[bin]]
+name = "gate_glm5next_e2e"
+required-features = ["glm5next"]
 
 [[bin]]
 name = "cnode_probe"

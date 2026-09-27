@@ -17,7 +17,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -25,7 +25,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next'
 
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
@@ -994,7 +994,7 @@ gen-ds41 *ARGS:
 # checked_in_schemas_are_current holds to the binaries', and the engine's plans the flow model reads
 # (generate_ds41 --plan, placement (a), P 128/256/384/512/4096, CED on and off) into tools/flow/plans/. Loads nothing onto a card.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin gate_deepseek41_prefill >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 gate_deepseek41_prefill; do target/release/$b --records-schema; done && for P in 128 256 384 512 4096; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 gate_deepseek41_prefill generate_glm5next; do target/release/$b --records-schema; done && for P in 128 256 384 512 4096; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 --depth 512 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), once at the default group and once
@@ -1259,6 +1259,21 @@ gate-deepseek4-meta:
 # file and the coverage check's list. Headers only, seconds; needs all six shards.
 gate-glm5next-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
+
+# glm5next (GLM-5.3-Flash) end-to-end: the program loaded once by the gate placement on the 3090 (every routed expert
+# on the host tier, the host set of about 185 GB populated), against ik's four sets (refset `ik-glm5next`): the step's
+# node count, graph = eager bit for bit, every layer's streams on the batch set within the derived band, and the argmax
+# after each set's prompt. Loads the whole model: alone in a batch, and under the big-load lock the V4.1 loads take.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-e2e:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e'
+
+# glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
+# tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
+[group('v41-load')]
+gen-glm5next *ARGS:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next && bash tools/gpu-gate.sh generate_glm5next --place gate {{ARGS}}'
 
 # qwen4exp(Qwen3.8-Flash-Next) 헤더 게이트: qwen35moe 리더의 변형 행이 합성 헤더에서 이름으로 거절하는 것들, 그다음 파일의
 # 서술·역할별 텐서·커버리지 검사의 목록. 헤더만, 초 단위; 샤드 넷이 다 있어야 한다.
