@@ -70,7 +70,7 @@ const _: () = assert!(MAX_COLS == 8 && NORM_THREADS == 256 && NORM_WARPS == 8);
 const _: () = assert!(DOWN_WARPS == 8);
 
 /// The fault site every entry here raises.
-pub const SITE: FaultSite = FaultSite::HcQuant;
+pub const SITE: FaultSite = FaultSite::HcMix;
 
 /// `1/streams`: the scale inside the silu and the sigmoid, and the mean's.
 const INV: f32 = 1.0 / STREAMS as f32;
