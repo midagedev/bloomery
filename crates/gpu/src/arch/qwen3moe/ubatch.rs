@@ -45,12 +45,14 @@
 
 use super::body::{ATTN_SCALE, Body, Kernels};
 use super::experts::CombineArgs;
+pub use super::image::ImageWrite;
+use super::image::PromptImage;
 use super::plan::{GqaPlan, Kq, LayerPlan, MoePlan};
 use super::router::RouterOut;
-use super::scratch::{Dims, IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
+use super::scratch::{Dims, KvPlanes, f32_view};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::HEAD;
-use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
+use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
@@ -62,7 +64,7 @@ use model::arch::qwen3moe::names::token_embd;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The most tokens one ubatch takes; its slots must also fit the grouped
 /// GEMM's slot cap at the file's `top_k` (the arena refuses by name a ubatch
@@ -237,138 +239,23 @@ pub struct UbPrologue {
     pub last: Option<ImageWrite>,
 }
 
-/// One prompt image's write: its tokens, the bytes copied to the card, the
-/// host's fill of them and the enqueue of their copy, which does not wait
-/// for it: the launches behind it do.
-#[derive(Clone, Copy, Debug)]
-pub struct ImageWrite {
-    pub tokens: usize,
-    pub bytes: usize,
-    pub fill: Duration,
-    pub copy: Duration,
-}
-
-/// The prompt image: one input record, the prompt's first position and its
-/// ids.
-struct UbImage {
-    /// The record, with room for a prompt of `cap` tokens; a prompt of `n`
-    /// tokens writes and copies its first `n + 1` words.
-    inbox: Inbox,
-    /// Tokens the image has room for, and positions the rope table holds:
-    /// the cache's rows.
-    cap: usize,
-    /// Tokens of the prompt the image holds (0 while it holds none), and the
-    /// position of its first.
-    len: usize,
-    pos0: u32,
-    /// The last prompt's write.
-    last: Option<ImageWrite>,
-}
-
-/// One ubatch's windows onto the image: its ids and the prompt's position
-/// word, and the ids' offset in the prompt.
-struct UbIo {
-    ids: ManuallyDrop<DeviceBuffer<u32>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    first: usize,
-}
-
-impl UbImage {
-    /// The image for a cache of `cap` rows. Load-time only.
-    fn new(stream: &CudaStream, cap: usize) -> Result<UbImage, GpuError> {
-        Ok(UbImage {
-            inbox: Inbox::new(stream, IN_IDS + cap)?,
-            cap,
-            len: 0,
-            pos0: 0,
-            last: None,
-        })
-    }
-
-    /// Write the record of `tokens` at positions `pos0 ..` — its first
-    /// `n + 1` words — and enqueue their copy to the card. Asynchronous: the
-    /// ubatches behind it read it. A prompt whose positions pass the cache's
-    /// rows, the rope table's too, is refused.
-    fn write(&mut self, stream: &CudaStream, tokens: &[u32], pos0: u32) -> Result<(), GpuError> {
-        self.len = 0;
-        let n = tokens.len();
-        let end = pos0 as usize + n;
-        if n == 0 || end > self.cap {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{n} tokens at positions {pos0}..{end}: the image and the rope table hold \
-                     positions 0..{}",
-                    self.cap
-                ),
-            ));
-        }
-        let t0 = Instant::now();
-        put_input(self.inbox.host_mut()?, tokens, pos0)?;
-        let t1 = Instant::now();
-        self.inbox.upload(stream, IN_IDS + n)?;
-        let t2 = Instant::now();
-        self.len = n;
-        self.pos0 = pos0;
-        self.last = Some(ImageWrite {
-            tokens: n,
-            bytes: (IN_IDS + n) * size_of::<u32>(),
-            fill: t1 - t0,
-            copy: t2 - t1,
-        });
-        Ok(())
-    }
-
-    /// Windows onto the prompt's `tokens` in the image and its position
-    /// word: row `t` of the ubatch is position `pos0 + tokens.start + t`.
-    fn io(&self, tokens: Range<usize>) -> Result<UbIo, GpuError> {
-        if tokens.is_empty() || tokens.end > self.len {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "tokens {tokens:?} are not inside the {}-token prompt in the image",
-                    self.len
-                ),
-            ));
-        }
-        // SAFETY: tokens.end <= len <= cap, so the ids lie inside the
-        // record's `IN_IDS + cap` words, and so does its position word; the
-        // windows live for one ubatch, while the image stays in place (it is
-        // allocated only at load).
-        let (ids, pos0) = unsafe {
-            (
-                param_view::<u32>(self.inbox.dev(), IN_IDS + tokens.start, tokens.len()),
-                param_view::<u32>(self.inbox.dev(), IN_POS0, 1),
-            )
-        };
-        Ok(UbIo {
-            ids,
-            pos0,
-            first: tokens.start,
-        })
-    }
-}
-
-/// The GEMM prefill's resident state: the arena, the prompt image and the
-/// prefill flash.
+/// The GEMM prefill's resident state: the arena and the prompt image (the
+/// prefill flash is the chain's, [`Kernels`]).
 pub(super) struct Ubatch {
     a: UbArena,
-    img: UbImage,
-    flash: FlashGqaPrefill,
+    img: PromptImage,
     /// The ubatch size `U`; the arena holds `min(U, ctx)` rows.
     size: NonZeroUsize,
 }
 
 impl Ubatch {
-    /// The arena for `min(u, d.ctx)` rows of `d`, an image for a prompt of
-    /// `d.ctx` tokens, and the prefill flash's module; `u` in `1..=UBATCH`,
-    /// else refused. Load-time only.
+    /// The arena for `min(u, d.ctx)` rows of `d` and an image for a prompt
+    /// of `d.ctx` tokens; `u` in `1..=UBATCH`, else refused. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: Dims, u: usize) -> Result<Ubatch, GpuError> {
         let size = ubatch_of(u)?;
         Ok(Ubatch {
             a: UbArena::new(stream, d, u.min(d.ctx))?,
-            img: UbImage::new(stream, d.ctx)?,
-            flash: FlashGqaPrefill::load(stream.context())?,
+            img: PromptImage::new(stream, d.ctx, false)?,
             size,
         })
     }
@@ -403,7 +290,7 @@ impl Ubatch {
 
     /// Device bytes of the arena and the image.
     pub(super) fn bytes(&self) -> usize {
-        self.a.bytes() + self.img.inbox.bytes()
+        self.a.bytes() + self.img.bytes()
     }
 
     /// Enqueue the ubatch of the image's `tokens`, standing at position `pos`
@@ -434,15 +321,16 @@ impl Ubatch {
                 "the ubatch's first position is the image's position for its first token",
             ));
         }
-        let io = self.img.io(tokens)?;
+        let win = self.img.windows(tokens)?;
+        let io = win.io();
         let (gpu, a) = (c.gpu, &mut self.a);
         let stream = gpu.stream();
         gpu.elem().enqueue_embed_rows_q4k(
             stream,
             EmbedRowsArgs {
                 w: kq_weight(c.w, &token_embd())?,
-                ids: &io.ids,
-                pos0: &io.pos0,
+                ids: io.ids,
+                pos0: io.pos0,
                 first: io.first,
                 y: &mut a.x,
                 pos: &mut a.pos,
@@ -453,16 +341,7 @@ impl Ubatch {
             .enqueue_route_dense(stream, t, &mut a.dense, gpu.unlabelled_sink())?;
         for (slot, (p, kv)) in c.plans.iter().zip(kv.iter_mut()).enumerate() {
             let sink = gpu.layer_sink(slot)?;
-            attention(
-                c,
-                p.gqa(WHAT, slot)?,
-                kv,
-                a,
-                &self.flash,
-                t,
-                pos as usize,
-                sink,
-            )?;
+            attention(c, p.gqa(WHAT, slot)?, kv, a, t, pos as usize, sink)?;
             ffn(c, &p.ffn, a, t, sink)?;
         }
         Ok(())
@@ -512,16 +391,11 @@ pub(super) struct UbCtx<'a> {
 /// The attention half at `t` rows: `x` in, `ffn_inp = x + attn_output(attn(x))`
 /// out; the ubatch's K/V rows appended to the layer's planes at the rows'
 /// positions.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the chain's context, the layer, its arena, the flash, the ubatch's shape"
-)]
 fn attention(
     c: &UbCtx<'_>,
     n: &GqaPlan,
     kv: &mut KvPlanes,
     a: &mut UbArena,
-    flash: &FlashGqaPrefill,
     t: usize,
     p0: usize,
     sink: FaultSink,
@@ -584,7 +458,7 @@ fn attention(
             cache_v: &mut kv.v,
         },
     )?;
-    flash.enqueue(
+    k.prefill.enqueue(
         stream,
         GqaPrefillArgs {
             q: &a.q,

@@ -17,6 +17,7 @@ mod delta;
 mod dispatch;
 pub mod experts;
 pub mod head_argmax;
+mod image;
 mod plan;
 mod prefill;
 mod program;

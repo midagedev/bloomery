@@ -223,30 +223,6 @@ pub(super) fn enqueue_pass(
     .walk()
 }
 
-/// Enqueue the head after the last prefill pass of `m` tokens: that pass's
-/// last row of `x` into the head's input, then the one-row head.
-pub(super) fn enqueue_pass_head(
-    gpu: &Gpu,
-    w: &Weights,
-    k: &Kernels,
-    state: &mut HeadArgmaxState,
-    s: &Arena,
-    m: usize,
-    head: &mut Head,
-) -> Result<(), GpuError> {
-    let row = m
-        .checked_sub(1)
-        .and_then(|i| s.x_rows.get(i))
-        .ok_or_else(|| {
-            GpuError::shape(
-                "qwen3moe::enqueue_pass_head",
-                format!("a pass of {m} rows on a {}-row arena", s.rows),
-            )
-        })?;
-    head.input_mut().copy_from_device_async(row, gpu.stream())?;
-    enqueue_head(gpu, w, k, state, head)
-}
-
 /// The launches a pass of `m` rows makes over layers `plans`, counted from
 /// [`layer`]'s enqueues: the embedding, then per layer the mixer and the FFN
 /// half.
