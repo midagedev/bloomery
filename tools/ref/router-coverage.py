@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """How concentrated MoE routing is, per layer, from router sets (tools/ref/router_trace.cpp).
 
-    tools/ref/router-coverage.py coverage <set> [<set>...]
+    tools/ref/router-coverage.py coverage <set> [<set>...] [--n 16,32,...] [--layers 3-10,13-43]
     tools/ref/router-coverage.py transfer <set A> <set B> [--n 64]
     tools/ref/router-coverage.py compare <set A> <set B>
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
@@ -15,7 +15,10 @@ coverage  Per layer: the share of the layer's selections (tokens x n_expert_used
           experts receive, for n in N, under the uniform share n/n_expert; the same over all layers
           (the mean of the layer shares — every layer has the same number of selections); the top-1
           expert's share of tokens (at most 100 %: an expert is picked once per token at most) and
-          the Gini coefficient of the counts (0 = uniform). Two tables:
+          the Gini coefficient of the counts (0 = uniform). N is --n's comma-separated counts, or
+          N_LIST's up to the expert count. --layers keeps only the listed layers (ranges `a-b`
+          inclusive), rows and the `all` mean alike; a listed layer the set lacks is refused. Two
+          tables:
             in    the hot list and the share come from the same tokens. Biased up: the top n of noisy
                   counts are partly the lucky ones.
             held  the hot list from the first half of the tokens, the share on the second half — what
@@ -132,11 +135,15 @@ def pct(v):
     return f"{100.0 * v:.1f}"
 
 
-def coverage(set_dirs):
+def coverage(set_dirs, asked=None, keep=None):
     for d in set_dirs:
         s = read_manifest(d)
         counts = read_counts(s)
         E, T, K = s["n_expert"], s["tokens"], s["n_used"]
+        # N_LIST's counts up to E by default; an asked count past E is refused.
+        n_list = tuple(n for n in N_LIST if n <= E) if asked is None else asked
+        if not all(0 < n <= E for n in n_list):
+            raise SetError(f"{d}: --n {','.join(map(str, n_list))} is not within 1..{E}")
         h = s["header"]
         half = T // 2
         print(f"## {d}\n")
@@ -144,7 +151,11 @@ def coverage(set_dirs):
               f"{len(s['layers'])} layers, {E} experts, top-{K}. held = hot list from tokens [0, {half}), "
               f"share on [{half}, {T}).\n")
         rows_in, rows_held = [], []
+        if keep is not None and not set(keep) <= set(s["layers"]):
+            raise SetError(f"{d}: --layers {sorted(set(keep) - set(s['layers']))} not in the set")
         for l in s["layers"]:
+            if keep is not None and l not in keep:
+                continue
             c = counts[l]
             ids = read_topk(s, l)
             first, second = count(ids, E, 0, half, K), count(ids, E, half, T, K)
@@ -153,10 +164,10 @@ def coverage(set_dirs):
             order = hot(c, E)
             order_first = hot(first, E)
             # in-sample rows carry the top-1 share of tokens and the Gini ahead of the hot-n shares
-            rows_in.append((l, [max(c) / T, gini(c)] + [share(c, order[:n]) for n in N_LIST]))
-            rows_held.append((l, [share(second, order_first[:n]) for n in N_LIST]))
-        n_cols = " | ".join(f"n={n}" for n in N_LIST)
-        uniform = " | ".join(pct(n / E) for n in N_LIST)
+            rows_in.append((l, [max(c) / T, gini(c)] + [share(c, order[:n]) for n in n_list]))
+            rows_held.append((l, [share(second, order_first[:n]) for n in n_list]))
+        n_cols = " | ".join(f"n={n}" for n in n_list)
+        uniform = " | ".join(pct(n / E) for n in n_list)
         tables = (("in-sample", "top-1 % of tokens | Gini | ", f"{pct(K / E)} | 0.000 | ", 2, rows_in),
                   ("held-out", "", "", 0, rows_held))
         for title, extra_head, extra_uniform, n_extra, rows in tables:
@@ -164,12 +175,24 @@ def coverage(set_dirs):
                 return " | ".join(f"{x:.3f}" if i == 1 and n_extra else pct(x) for i, x in enumerate(v))
             print(f"### hot-n share of selections, {title} (%)\n")
             print(f"| layer | {extra_head}{n_cols} |")
-            print("|---:|" + "---:|" * (n_extra + len(N_LIST)))
+            print("|---:|" + "---:|" * (n_extra + len(n_list)))
             print(f"| uniform | {extra_uniform}{uniform} |")
             for l, v in rows:
                 print(f"| {l} | {cells(v)} |")
             mean = [sum(r[1][i] for r in rows) / len(rows) for i in range(len(rows[0][1]))]
             print(f"| all | {cells(mean)} |\n")
+
+
+def layer_list(text):
+    """`3-10,13` as [3, ..., 10, 13]; a range whose end is before its start is refused."""
+    out = []
+    for part in text.split(","):
+        lo, _, hi = part.partition("-")
+        lo, hi = int(lo), int(hi or lo)
+        if hi < lo:
+            raise SetError(f"--layers {part}: the end is before the start")
+        out.extend(range(lo, hi + 1))
+    return out
 
 
 def transfer(dir_a, dir_b, n):
@@ -378,6 +401,19 @@ def self_test():
             # the report commands run end to end on a two-layer set
             two = make("two", {0: uniform, 3: skew})
             coverage([two])
+            coverage([two], (1, E))
+            coverage([two], (1,), layer_list("3"))
+            assert layer_list("0-2,5") == [0, 1, 2, 5]
+            try:
+                coverage([two], (1,), [1])
+                raise AssertionError("a layer the set lacks was accepted")
+            except SetError:
+                pass
+            try:
+                coverage([two], (E + 1,))
+                raise AssertionError("a hot-n past the expert count was accepted")
+            except SetError:
+                pass
             transfer(two, two, 2)
             compare(two, two)
         finally:
@@ -393,7 +429,16 @@ def main(argv):
         return self_test()
     try:
         if len(argv) >= 2 and argv[0] == "coverage":
-            coverage(argv[1:])
+            sets, opts = [], {}
+            it = iter(argv[1:])
+            for a in it:
+                if a in ("--n", "--layers"):
+                    opts[a] = next(it, "")
+                else:
+                    sets.append(a)
+            asked = tuple(int(n) for n in opts["--n"].split(",")) if "--n" in opts else None
+            keep = layer_list(opts["--layers"]) if "--layers" in opts else None
+            coverage(sets, asked, keep)
             return 0
         if len(argv) in (3, 5) and argv[0] == "transfer":
             n = int(argv[4]) if len(argv) == 5 and argv[3] == "--n" else 64

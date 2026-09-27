@@ -498,9 +498,15 @@ check-int-twins *ARGS:
 trace-router CORPUS *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# GLM-5.3-Flash의 라우터 추적: trace-router와 같고, 코퍼스는 $BLOOMERY_DATA/glm5next/corpus-<이름>.ids(GLM 토크나이저),
+# 세트 이름은 glm5next-<이름>이다(V4.1 세트와 한 디렉터리를 쓴다).
+trace-router-glm5next CORPUS *ARGS:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
+
 # 라우터 세트들을 합쳐 층마다 뜨거운 expert를 순위대로 적은 목록(B12)을 $BLOOMERY_DATA/router/<OUT>에 쓴다. 적재는
-# BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(384 = 전체 순위).
-hotlist N='384' OUT='hotlist-384.txt' *SETS='code prose korean threads':
+# BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(all = 세트의 expert 수, 전체 순위).
+# GLM: just hotlist all glm5next-hotlist.txt glm5next-prose
+hotlist N='all' OUT='hotlist-384.txt' *SETS='code prose korean threads':
     ./tools/box.sh 'D=$BLOOMERY_DATA/router && python3 tools/ref/router-hotlist.py $(for s in {{SETS}}; do printf "%s " "$D/$s"; done) --n {{N}} --out "$D/{{OUT}}"'
 
 # ik 트리 하나의 wikitext-2 퍼플렉서티(c2048, 4청크, CPU만)를 서빙하는 V4.1 파일로 CPU 임대 아래서 잰다.
@@ -1293,6 +1299,14 @@ gate-glm5next-meta:
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e'
+
+# GLM의 카드 expert를 게이트 배치(BLOOMERY_HOT_LIST가 있으면 그 목록, 없으면 id 접두)대로 올린다. 슬롯 맵이 목록의 앞 n_l개를
+# 오름차순으로 담는지, 카드가 읽는 층에만 있는지, 층마다 슬롯 0·n/2·n-1에서 스택의 `_sel`과 gate·up이 그 expert만 파일에서
+# 올린 것과 비트까지 같은지 본다. 모델 전체를 올린다: e2e와 같은 묶음 규칙.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-card:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_card && bash tools/gpu-gate.sh gate_glm5next_card'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.

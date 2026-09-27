@@ -9,8 +9,9 @@
 //! its format's decoder, reduced by the fixed warp tree.
 //!
 //! The bodies are generic over the decoder ([`gemv_sel_body`],
-//! [`gate_up_act_body`]); this module instantiates them for Q5_K and Q8_0,
-//! and a caller outside the crate may instantiate them for another format
+//! [`gate_up_act_body`]); this module instantiates them for Q5_K and Q8_0
+//! and the gate·up for Q4_K (whose down `_sel` is `q4k_sel`'s
+//! `q4k_gemv_sel`), and a caller outside the crate may instantiate them for another format
 //! in its own module (its entries then land in its own binary alone).
 //!
 //! A non-routed FFN (a dense layer, a shared expert) is the one-expert
@@ -30,7 +31,7 @@
 use super::act::{self, Act};
 use super::q5k::Q5k;
 use super::q8_0::Q8_0;
-use super::walk::{SbDecode, row_dot_1col};
+use super::walk::{Q4k, SbDecode, row_dot_1col};
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -325,6 +326,80 @@ mod kquant_kernels {
         }
     }
 
+    /// The Q4_K gate·up with its rule as an argument ([`gate_up_act_body`]
+    /// over [`Q4k`]), four blocks an SM pinned as [`q5k_gemv_sel`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wg.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            wu.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn kq_gate_up_act_q4k(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // SAFETY: the launch contract is the body's (36 = Q4k::WORDS); the
+        // host passes iters = ceil(n_sb/4) and one of Act::code's codes; the
+        // return above is warp-uniform and keeps row in range.
+        unsafe {
+            gate_up_act_body::<Q4k>(
+                wg,
+                wu,
+                q,
+                s8,
+                d8,
+                sel,
+                n_experts,
+                rows_per_expert,
+                slots_per_col,
+                n_sb,
+                iters,
+                act,
+                limit,
+                fault,
+                row,
+                &mut h,
+            );
+        }
+    }
+
     /// The Q8_0 down `_sel` ([`gemv_sel_body`] over [`Q8_0`]), four blocks
     /// an SM pinned as [`q5k_gemv_sel`].
     #[allow(
@@ -460,8 +535,8 @@ mod kquant_kernels {
     }
 }
 
-// The entries spell Q5_K's super-block words as 44 and Q8_0's as 68.
-const _: () = assert!(Q5k::WORDS == 44 && Q8_0::WORDS == 68);
+// The entries spell Q4_K's super-block words as 36, Q5_K's as 44 and Q8_0's as 68.
+const _: () = assert!(Q4k::WORDS == 36 && Q5k::WORDS == 44 && Q8_0::WORDS == 68);
 
 /// A down `_sel` launch ([`KquantKernels::enqueue_gemv_q5k_sel`],
 /// [`KquantKernels::enqueue_gemv_q8_0_sel`]).
@@ -478,10 +553,11 @@ pub struct SelDown<'a> {
     pub rows_per_expert: usize,
 }
 
-/// A gate·up launch ([`KquantKernels::enqueue_gate_up_q5k`],
+/// A gate·up launch ([`KquantKernels::enqueue_gate_up_q4k`],
+/// [`KquantKernels::enqueue_gate_up_q5k`],
 /// [`KquantKernels::enqueue_gate_up_q8_0`]).
 pub struct GateUpAct<'a> {
-    /// The gate stack, as [`SelDown::w`].
+    /// The gate stack, as [`SelDown::w`] (Q4_K 36 words a super-block).
     pub wg: &'a DeviceTensor<u32>,
     /// The up stack, the same shape as `wg`.
     pub wu: &'a DeviceTensor<u32>,
@@ -513,6 +589,10 @@ struct Fmt {
     words: usize,
 }
 
+const FMT_Q4K: Fmt = Fmt {
+    name: "Q4_K",
+    words: Q4k::WORDS,
+};
 const FMT_Q5K: Fmt = Fmt {
     name: "Q5_K",
     words: Q5k::WORDS,
@@ -738,6 +818,44 @@ impl KquantKernels {
             .prepare_kq_gate_up_act_q5k(LaunchConfig1D::new(d.grid, THREADS, 0))?;
         let (q, s8, d8) = walk_a_planes(a.act);
         self.module.kq_gate_up_act_q5k(
+            stream,
+            &prep,
+            a.wg.buf(),
+            a.wu.buf(),
+            q,
+            s8,
+            d8,
+            a.sel,
+            d.n_experts,
+            d.rows_per_expert,
+            d.n_slots,
+            d.m_cols,
+            d.slots_per_col,
+            d.n_sb,
+            d.iters,
+            d.act,
+            d.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the Q4_K gate·up: as [`Self::enqueue_gate_up_q5k`], `36 ·
+    /// n_sb` words a row, the Walk A arithmetic of `q4k_gemv_sel`.
+    pub fn enqueue_gate_up_q4k(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAct<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let d = gate_up_dims("enqueue_gate_up_q4k", FMT_Q4K, a, h.len())?;
+        let prep = self
+            .module
+            .prepare_kq_gate_up_act_q4k(LaunchConfig1D::new(d.grid, THREADS, 0))?;
+        let (q, s8, d8) = walk_a_planes(a.act);
+        self.module.kq_gate_up_act_q4k(
             stream,
             &prep,
             a.wg.buf(),

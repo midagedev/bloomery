@@ -7,7 +7,7 @@
 //! on the engine stream, and reads back what a gate compares between them:
 //! the mixer sub-layer's fold, its output and the streams after it; the
 //! feed-forward sub-layer's fold and normed input, the router's results, the
-//! routed sum and the shared expert's output, the block's output and the
+//! routed sum's host and card parts and the shared expert's output, the block's output and the
 //! streams after the layer. The layer's store holds what the earlier
 //! positions of the same run wrote: the caller resets the model before
 //! position 0 of each layer's run.
@@ -38,8 +38,10 @@ pub struct ForcedRoute {
     /// weights.
     pub ids: Vec<u32>,
     pub weights: Vec<f32>,
-    /// The host tier's routed sum and the shared expert's output.
+    /// The host tier's part of the routed sum, the card slots' part (zeros
+    /// on a layer without card experts) and the shared expert's output.
     pub routed: Vec<f32>,
+    pub card: Vec<f32>,
     pub shared: Vec<f32>,
 }
 
@@ -125,7 +127,7 @@ impl Body {
                 hybrid.open_step(stream, 1, 1)?;
                 ffn::front(gpu, w, &mut p, hybrid, l)?;
                 ffn::shadow(gpu, w, &mut p, hybrid.boundary(), l)?;
-                ffn::back(gpu, &mut p, hybrid.boundary())?;
+                ffn::back(gpu, &mut p, hybrid.boundary(), l)?;
                 hybrid.row_enqueued(l, 0)?;
                 let bias = if p.cfg[l].bias {
                     f32v(w, &names::exp_probs_b(l))?
@@ -140,6 +142,11 @@ impl Body {
                     ids: r.ids.to_host_vec(stream)?,
                     weights: r.weights.to_host_vec(stream)?,
                     routed: hybrid.boundary().hsum_of(0)?.to_host_vec(stream)?,
+                    card: if p.card.has(l) {
+                        p.card.acc().to_host_vec(stream)?
+                    } else {
+                        vec![0.0; n]
+                    },
                     shared: p.s.sh_y.to_host_vec(stream)?,
                 };
                 (hybrid.boundary().normed().to_host_vec(stream)?, Some(route))

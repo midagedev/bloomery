@@ -231,6 +231,10 @@ name = "gate_glm5next_e2e"
 required-features = ["glm5next"]
 
 [[bin]]
+name = "gate_glm5next_card"
+required-features = ["glm5next"]
+
+[[bin]]
 name = "cnode_probe"
 required-features = ["gpu"]
 

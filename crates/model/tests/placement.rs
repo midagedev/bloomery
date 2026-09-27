@@ -29,9 +29,10 @@ use std::ops::Range;
 
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
+use model::arch::glm5next::place::card_routed;
 use model::placement::{
     self, CardFormat, CardTotals, Device, Format, HotList, KvBytes, Machine, ModelTensor,
-    ModelTensors, PlacementError, Plan, Role, workstation,
+    ModelTensors, PlacementError, Plan, PlanLevers, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -983,6 +984,52 @@ fn card_tensor_without_card_format_is_refused_by_name() {
             "{ty}: {:?}",
             row.segments
         );
+    }
+}
+
+/// Which routed stacks go on the card is the program's: under glm5next's
+/// card experts ([`card_routed`]) a q5_K stack keeps experts on the card, in
+/// its file bytes, where V4.1's rule ([`placement::plan_with`]) keeps it on
+/// the host; a q6_K stack stays on the host under both.
+#[test]
+fn routed_card_format_is_the_programs() {
+    let machine = workstation::plan_a(1);
+    let levers = PlanLevers::default();
+    for (ty, on_card) in [
+        (GgmlType::Q4_K, true),
+        (GgmlType::Q5_K, true),
+        (GgmlType::Q6_K, false),
+    ] {
+        let stack = synthetic_model(vec![synthetic(
+            "blk.0.ffn_down_exps.weight",
+            Some(0),
+            Role::RoutedExperts,
+            ty,
+            &[4, 8],
+        )]);
+        let plan = placement::plan_routed(&stack, &machine, 4096, &NoKv, &levers, card_routed)
+            .unwrap_or_else(|e| panic!("a {ty} routed stack plans: {e}"));
+        assert!(
+            plan.violations().is_empty(),
+            "{ty}: {:?}",
+            plan.violations()
+        );
+        let row = &plan.rows[1];
+        if on_card {
+            assert_eq!(plan.n_l, vec![8], "{ty}");
+            assert!(
+                matches!(row.segments.as_slice(), [s] if s.device == Device::Card(0) && s.format == Format::Card(CardFormat::KQuant)),
+                "{ty}: {:?}",
+                row.segments
+            );
+        } else {
+            assert_eq!(plan.n_l, vec![0], "{ty}");
+            assert!(
+                matches!(row.segments.as_slice(), [s] if s.device == Device::Host && s.format == Format::HostFile),
+                "{ty}: {:?}",
+                row.segments
+            );
+        }
     }
 }
 

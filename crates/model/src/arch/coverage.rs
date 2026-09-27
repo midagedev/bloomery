@@ -616,9 +616,11 @@ pub fn check_with(
     }
     for t in &model.tensors {
         let card = match program {
-            // The V4.1 chain's rule: a stack of a type no card format loads.
-            // The glm5next and qwen4exp bodies serve every stack on the host,
-            // whose load refuses a type with no host kernel.
+            // The V4.1 chain's and the glm5next body's rule: a stack of a type
+            // no card format loads. A layer whose stacks the program's card
+            // experts do not read keeps them on the host, whose load refuses
+            // a type with no host kernel; the qwen4exp body serves every
+            // stack on the host.
             Some(Program::Deepseek41Chain | Program::Glm5nextBody | Program::Qwen38Body) => {
                 CardFormat::of(t.ty)
             }

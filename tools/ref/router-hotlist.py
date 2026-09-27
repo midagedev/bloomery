@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A hot list for the placement lever BLOOMERY_HOT_LIST, learned from router sets.
 
-    tools/ref/router-hotlist.py <set> [<set>...] --n 64 --out <file>
+    tools/ref/router-hotlist.py <set> [<set>...] --n 64|all --out <file>
     tools/ref/router-hotlist.py --self-test
 
 Each <set> is a router_trace directory (tools/ref/router-coverage.py's docstring has the format); a set
@@ -22,7 +22,8 @@ in that rank order:
 
 The placement (crates/model/src/placement/hot_list.rs) takes each layer's first n_l ids, where n_l is
 the plan's count for the layer — the plan decides how many, this file decides which — and refuses a
-layer that lists fewer than n_l. --n is therefore the largest count any plan may ask for.
+layer that lists fewer than n_l. --n is therefore the largest count any plan may ask for; `all` is
+the sets' own n_expert, every expert of a layer ranked.
 """
 import datetime
 import importlib.util
@@ -48,6 +49,8 @@ def learn(set_dirs, n):
         if s["header"].get("model_file") != first["header"].get("model_file"):
             raise rc.SetError(f"{s['dir']}: model_file differs from {first['dir']}'s")
     E = first["n_expert"]
+    if n == "all":
+        n = E
     if not 0 < n <= E:
         raise rc.SetError(f"--n {n} is not in 1..{E}")
     lists = {}
@@ -59,7 +62,7 @@ def learn(set_dirs, n):
         if max(c, default=0) >= E:
             raise rc.SetError(f"layer {layer}: an id {max(c)} is not below n_expert {E}")
         lists[layer] = rc.hot(counts, n)
-    return sets, lists
+    return sets, lists, n
 
 
 def write(path, sets, lists, n):
@@ -90,7 +93,8 @@ def main(argv):
     it = iter(argv)
     for a in it:
         if a == "--n":
-            n = int(next(it))
+            n = next(it)
+            n = n if n == "all" else int(n)
         elif a == "--out":
             out = next(it)
         elif a.startswith("-"):
@@ -100,7 +104,7 @@ def main(argv):
     if not sets or n is None or out is None:
         sys.exit(__doc__)
     try:
-        s, lists = learn(sets, n)
+        s, lists, n = learn(sets, n)
     except rc.SetError as e:
         sys.exit(f"router-hotlist: {e}")
     write(out, s, lists, n)
@@ -135,8 +139,10 @@ def self_test():
         # the ties at 1 selection broken by the lower id.
         a = _fake_set(root, "a", [0, 1], [(5, 3), (5, 3), (5, 0)])
         b = _fake_set(root, "b", [0, 1], [(3, 1), (3, 1), (7, 2)])
-        sets, lists = learn([a, b], 4)
-        assert lists[0] == [3, 5, 1, 0], lists[0]
+        sets, lists, n = learn([a, b], 4)
+        assert lists[0] == [3, 5, 1, 0] and n == 4, lists[0]
+        _, whole, n_all = learn([a, b], "all")
+        assert n_all == 8 and len(whole[0]) == 8 and whole[0][:4] == [3, 5, 1, 0], whole[0]
         out = os.path.join(root, "hot.txt")
         write(out, sets, lists, 4)
         text = open(out, encoding="utf-8").read()

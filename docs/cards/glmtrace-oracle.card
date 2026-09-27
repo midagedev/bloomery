@@ -1,0 +1,21 @@
+# Round glmcard, stage 1: the router trace harness under the glm5next profile, first on the oracle's
+# five tokens (REF_TOKENS at REF_CTX 512, tools/ref/router-trace.sh oracle), every routed layer's ids
+# against the integer twin of ffn_moe_topk-<layer> in $BLOOMERY_DATA/ref_glm5next, the dump made by
+# the same ik build (ik-idxkey) under the same every-node schedule the trace runs by default
+# (router_trace.cpp: "a trace under it reproduces the oracle's ids exactly"). ik's glm5next graph
+# builds its routed block with llm_build_moe_ffn, whose selection node is ffn_moe_topk-<layer>, and
+# its kv clear zeroes the KDA state buffers, so nothing in the harness is V4.1-only [read, ik
+# src/graphs/build_glm5next.cpp:497, src/llama.cpp:2451]. Wall: load plus five tokens, 1-3 min.
+kind: profile
+question: does router_trace read GLM-5.3-Flash's router selections as ik's oracle dump holds them?
+term: routed layers (of 42) whose top-8 ids differ from the oracle set's ffn_moe_topk twin, in rank
+  order, over the 5 oracle tokens, ik CPU, every-node schedule
+unit: layers
+predict: 0..0 layers
+condition: the harness runs under the CPU lease with its witness blocks and its 1800 s bound; the set's
+  manifest has its complete trailer and arch glm5next; router-coverage.py oracle exits with the
+  comparison's code
+decide-in: run the prose trace (docs/cards/glmtrace.card)
+decide-below: none can fall below 0; a count under 0 is a harness defect: stop and read the log
+decide-above: stop before the prose trace: read which layer differs first and whether the capture's
+  source is the sort view or another node kind, then fix the harness for glm5next

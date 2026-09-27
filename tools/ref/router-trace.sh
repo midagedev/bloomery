@@ -4,14 +4,20 @@
 # says what it captures and what the set holds; tools/ref/router-coverage.py reads it.
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/router-trace.sh <corpus> [--name N] [args...]'
-#   just trace-router <corpus> [--name N] [args...]
+#   just trace-router <corpus> [--name N] [args...]            (deepseek41)
+#   just trace-router-glm5next <corpus> [--name N] [args...]   (glm5next)
 #
-#   <corpus>   code | prose | prose-all   $BLOOMERY_DATA/engram/corpus-<corpus>.ids (engram-corpus.sh)
-#              oracle                     the profile's REF_TOKENS at its REF_CTX, the oracle dump's
-#                                         input; the run ends with router-coverage.py comparing every
-#                                         layer's ids with the profile's oracle set, and exits with it
-#              <path>                     any ids file, one decimal token id per line
-#   --name N   the set's directory under $BLOOMERY_DATA/router (default: the corpus name)
+#   <corpus>   a name    the profile's corpus file: deepseek41's $BLOOMERY_DATA/engram/corpus-<corpus>.ids
+#                        (engram-corpus.sh: code | prose | prose-all | ...), any other profile's
+#                        $BLOOMERY_DATA/<profile>/corpus-<corpus>.ids, tokenized by its own vocabulary
+#              oracle    the profile's REF_TOKENS at its REF_CTX, the oracle dump's input; the run
+#                        ends with router-coverage.py comparing every layer's ids with the profile's
+#                        oracle set, and exits with it
+#              <path>    any ids file, one decimal token id per line
+#   --name N   the set's directory under $BLOOMERY_DATA/router (default: the corpus name). Every
+#              profile but deepseek41 names its sets `<profile>-<name>` (the default gets the prefix,
+#              an explicit name must carry it): the directory is shared with V4.1's sets, whose
+#              names came first. A set is only ever replaced by a trace of its own architecture.
 #   --chunk C  tokens per independent context (default 2048; the oracle's REF_CTX for `oracle`). n_ctx
 #              is C, except for `oracle`, which keeps the dump's REF_CTX.
 #   args       passed to the harness after the defaults: --max-tokens N, --top-k-only (the fused
@@ -59,35 +65,57 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# V4.1's sets hold the directory's bare names; every other profile's carry its prefix.
+if [ "$MODEL_NAME" = deepseek41 ]; then
+  PREFIX= CORPORA=$BLOOMERY_DATA/engram
+else
+  PREFIX=$MODEL_NAME- CORPORA=$BLOOMERY_DATA/$MODEL_NAME
+fi
+
 mkdir -p "$ROUTER"
 case $CORPUS in
   oracle)
     [ -n "${REF_TOKENS:-}" ] || { echo "router-trace.sh: the $MODEL_NAME profile sets no REF_TOKENS" >&2; exit 2; }
-    IDS=$ROUTER/oracle-tokens.ids
+    IDS=$ROUTER/${PREFIX}oracle-tokens.ids
     tr ',' '\n' <<< "$REF_TOKENS" > "$IDS"
     CTX=$REF_CTX
     CHUNK=${CHUNK:-$REF_CTX} ;;
   */*)
     IDS=$CORPUS
-    NAME=${NAME:-$(basename "$CORPUS" .ids)}
+    NAME=${NAME:-$PREFIX$(basename "$CORPUS" .ids)}
     CHUNK=${CHUNK:-2048}
     CTX=$CHUNK ;;
   *)
-    IDS=$BLOOMERY_DATA/engram/corpus-$CORPUS.ids
+    IDS=$CORPORA/corpus-$CORPUS.ids
     CHUNK=${CHUNK:-2048}
     CTX=$CHUNK ;;
 esac
-NAME=${NAME:-$CORPUS}
-[ -f "$IDS" ] || { echo "router-trace.sh: no ids file at $IDS (tools/ref/engram-corpus.sh writes the corpora)" >&2; exit 2; }
+NAME=${NAME:-$PREFIX$CORPUS}
+[ -f "$IDS" ] || { echo "router-trace.sh: no ids file at $IDS (the profile's corpora: $CORPORA)" >&2; exit 2; }
 case $NAME in
   bin|*/*|.*|*.staging|*.old|'') echo "router-trace.sh: '$NAME' cannot name a set" >&2; exit 64 ;;
 esac
+case $NAME in
+  "$PREFIX"*) ;;
+  *) echo "router-trace.sh: the $MODEL_NAME profile's sets are named ${PREFIX}<name>; '$NAME' is not" >&2; exit 64 ;;
+esac
+# A set of another architecture under this name is not this trace's to replace.
+if [ -f "$ROUTER/$NAME/MANIFEST.tsv" ]; then
+  HAS=$(awk -F'\t' '$1 == "# arch" { print $2; exit }' "$ROUTER/$NAME/MANIFEST.tsv")
+  if [ "$HAS" != "$MODEL_NAME" ]; then
+    echo "router-trace.sh: $ROUTER/$NAME holds a set of arch '${HAS:-none}', not $MODEL_NAME: pick another --name" >&2
+    exit 64
+  fi
+fi
 
 # Build first, outside the lease: the trace runs the source box.sh just synced, never an older binary.
 bash "${BASH_SOURCE[0]%/*}/build-router-trace.sh"
 [ -x "$BIN" ] || { echo "router-trace.sh: no harness at $BIN after the build" >&2; exit 2; }
-# Which ik build the set is the output of, as dump.sh records it: $IK is the tree the harness links.
-BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# Which ik build the set is the output of, as dump.sh records it (the same git call): $IK is the tree
+# the harness links. The tree belongs to the serving user, so root's git needs safe.directory.
+ikgit() { git -c safe.directory='*' -C "$IK" "$@"; }
+BUILD=$(ikgit rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD="$BUILD-dirty"; fi
 MD5=$(md5sum "$IDS" | cut -d' ' -f1)
 
 LOG=$ROUTER/$NAME.log

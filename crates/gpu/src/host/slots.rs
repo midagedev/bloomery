@@ -2,6 +2,7 @@
 //! computes the rest ([`HOST`]).
 
 use crate::GpuError;
+use model::placement::{Device, Plan, Role};
 use std::ops::Range;
 
 /// The slot map's entry for an expert the card does not hold: the host
@@ -92,6 +93,78 @@ impl SlotMap {
         })
     }
 
+    /// The map a placement plan makes for card `card`: per layer of `layers`,
+    /// the card's segments of each routed stack, in plan order, fill its
+    /// slots from 0 with their experts, [`HOST`] for the rest. Every routed
+    /// stack of a layer must put the same experts in the same slots, and
+    /// each expert must be one of the `n_expert`; either is refused by name.
+    pub fn of_plan(
+        plan: &Plan<'_>,
+        card: usize,
+        layers: Range<usize>,
+        n_expert: usize,
+    ) -> Result<SlotMap, GpuError> {
+        let refuse = |detail: String| GpuError::Shape {
+            what: "SlotMap::of_plan",
+            detail,
+        };
+        let mut map = vec![HOST; layers.len() * n_expert];
+        let mut first: Vec<Option<&str>> = vec![None; layers.len()];
+        let mut stack = vec![HOST; n_expert];
+        for row in &plan.rows {
+            let t = plan
+                .model
+                .tensors
+                .get(row.tensor)
+                .ok_or_else(|| refuse(format!("a plan row names tensor {}", row.tensor)))?;
+            let Some(l) = t.layer.filter(|l| layers.contains(l)) else {
+                continue;
+            };
+            if t.role != Role::RoutedExperts {
+                continue;
+            }
+            stack.fill(HOST);
+            let mut slot = 0u32;
+            for seg in row
+                .segments
+                .iter()
+                .filter(|s| s.device == Device::Card(card))
+            {
+                let experts = seg.experts.clone().ok_or_else(|| {
+                    refuse(format!(
+                        "{}: a card segment without an expert range",
+                        t.name
+                    ))
+                })?;
+                for e in experts {
+                    let entry = usize::try_from(e)
+                        .ok()
+                        .and_then(|e| stack.get_mut(e))
+                        .ok_or_else(|| refuse(format!("{}: expert {e} of {n_expert}", t.name)))?;
+                    *entry = slot;
+                    slot += 1;
+                }
+            }
+            let i = l - layers.start;
+            let dst = &mut map[i * n_expert..(i + 1) * n_expert];
+            let seen = first[i];
+            match seen {
+                None => {
+                    dst.copy_from_slice(&stack);
+                    first[i] = Some(&t.name);
+                }
+                Some(other) if *dst != *stack => {
+                    return Err(refuse(format!(
+                        "{} puts other experts on the card than {other}",
+                        t.name
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        SlotMap::from_rows(layers, n_expert, map)
+    }
+
     /// The layers the map has rows for.
     #[must_use]
     pub fn layers(&self) -> Range<usize> {
@@ -110,11 +183,21 @@ impl SlotMap {
         &self.slots
     }
 
+    /// Layer `layer`'s row's first entry in [`SlotMap::as_slice`], the card
+    /// copy's word offset a kernel adds an expert id to; `None` for a layer
+    /// the map has no row for. The one owner of that offset: [`SlotMap::row`]
+    /// reads the same row.
+    #[must_use]
+    pub fn row_offset(&self, layer: usize) -> Option<usize> {
+        let i = layer.checked_sub(self.layers.start)?;
+        (i < self.layers.len()).then_some(i * self.n_expert)
+    }
+
     /// Layer `layer`'s row; `None` for a layer the map has no row for.
     #[must_use]
     pub fn row(&self, layer: usize) -> Option<&[u32]> {
-        let i = layer.checked_sub(self.layers.start)?;
-        self.slots.chunks_exact(self.n_expert).nth(i)
+        let at = self.row_offset(layer)?;
+        self.slots.get(at..at + self.n_expert)
     }
 
     /// The experts of layer `layer` the card holds; 0 for a layer the map has
@@ -148,6 +231,24 @@ mod tests {
         assert!(map.row(0).is_none() && map.row(4).is_none());
         assert_eq!(map.on_card(4), 0);
         assert!(SlotMap::prefix(0..1, 64, 65).is_err());
+    }
+
+    /// A layer's row offset is its row's place in the card copy: rows of
+    /// different card experts read back at their offsets, and a layer
+    /// outside the map has none.
+    #[test]
+    fn row_offset_is_the_rows_place_in_the_card_copy() {
+        let rows = vec![1, HOST, 0, HOST, HOST, HOST, HOST, HOST, 2, 0, HOST, 1];
+        let map = SlotMap::from_rows(3..6, 4, rows.clone()).expect("three rows of 4");
+        for (i, layer) in (3..6).enumerate() {
+            let at = map.row_offset(layer).expect("a row per layer of the range");
+            assert_eq!(at, i * 4);
+            assert_eq!(map.row(layer), Some(&rows[at..at + 4]));
+        }
+        assert_eq!(map.on_card(3), 2);
+        assert_eq!(map.on_card(4), 0);
+        assert_eq!(map.on_card(5), 3);
+        assert!(map.row_offset(2).is_none() && map.row_offset(6).is_none());
     }
 
     /// A row's card slots are `0..k` for its `k` experts on the card, each

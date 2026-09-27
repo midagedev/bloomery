@@ -9,7 +9,8 @@
 //! - [`q8_0`]: Q8_0's decoder over the file's 34-byte blocks, eight to a
 //!   Walk A super-block.
 //! - [`sel`]: the down `_sel` and the gate·up with its rule as a launch
-//!   argument, generic bodies and their Q5_K and Q8_0 entries.
+//!   argument, generic bodies and their Q5_K and Q8_0 entries, and the Q4_K
+//!   gate·up.
 //! - [`act`]: the gate·up rules.
 //!
 //! No entry here names a model: a caller passes its stacks' rows, experts

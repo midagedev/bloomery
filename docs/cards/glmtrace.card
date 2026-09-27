@@ -1,0 +1,32 @@
+# Round glmcard, stage 1: GLM-5.3-Flash router selections over GLM-tokenized prose by ik's CPU prefill
+# (tools/ref/router-trace.sh under the glm5next profile, set glm5next-prose, the first 50,000 ids of
+# $BLOOMERY_DATA/glm5next/corpus-prose.ids, chunk 2048). The card experts read Q4_K and Q5_K stacks
+# only (glm5next::place::card_routed), so the three routed layers with a Q6_K down (11, 12, 44) keep
+# every expert on the host and the list serves the other 39: 3-10 and 13-43. The A6000 plan keeps
+# n_l = 67 of 288 on each of them [derived: 40.09 GB after the trunk, stores, context, scratch and
+# margin over 39 x 15,204,352 B = 67.6]; uniform share 23.3 %.
+# V4.1 proxy (rig-log 09-23#v41-router-coverage): held-out share of the hottest 16.7 % 61.3-73.5 %,
+# of 33.3 % 79.2-88.9 %; interpolated at 23.3 %: 68.4-79.6 %. The low edge is widened by 11.5 points
+# to 57 %: GLM's selection bias may balance harder than V4.1's. Wall [derived]: V4.1's prose set ran
+# 50,000 tokens in 751.8 s (66.5 tok/s, the same harness and schedule; warm every-node 76.0 tok/s
+# against top-k-only 73.6 on 2,048 tokens, so the schedule is not the cost); GLM's active weights are
+# 1.1-1.3x V4.1's and only 11 of its 45 layers attend over the chunk: 13-17 min of prefill plus a
+# cold read of the expert set, 15-25 min, inside the harness's 1800 s bound.
+kind: profile
+question: how skewed is GLM-5.3-Flash's router on the layers the card experts serve, as the share a
+  static hot list of 67 experts per layer would serve on held-out prose?
+term: mean over layers 3-10 and 13-43 of the share of routed selections that the 67 hottest experts
+  (learned on the first 25,000 ids) receive on the next 25,000 ids, GLM prose, ik CPU prefill, chunk
+  2048 (router-coverage.py coverage glm5next-prose --n 62,67 --layers 3-10,13-43, held-out table,
+  row all, column n=67)
+unit: %
+predict: 57..80 %
+condition: the oracle check (docs/cards/glmtrace-oracle.card) passed with 0 differing layers before
+  this run; the harness runs under the CPU lease with its witness blocks and its 1800 s bound; the
+  set's manifest has its complete trailer, arch glm5next and 50,000 tokens
+decide-in: learn the list from this set (just hotlist all glm5next-hotlist.txt glm5next-prose), run
+  glmcard's gates with the list arm; trace code with the same card before the timing sitting
+decide-below: the router is flatter than V4.1's: land glmcard with the prefix placement as the default,
+  keep the list as a lever only, and move the MTP probe ahead of any list work
+decide-above: land glmcard with the list; open the dynamic swap design (exllamav3 moe_cpu_host.py)
+  after the first timing sitting, since the held-out ceiling is where an online list pays

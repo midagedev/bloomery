@@ -286,6 +286,16 @@ impl Q8Act {
         self.k
     }
 
+    /// Device bytes of the five planes, as allocated.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.q3.num_bytes()
+            + self.q4.num_bytes()
+            + self.q6.num_bytes()
+            + self.s8.num_bytes()
+            + self.d8.num_bytes()
+    }
+
     /// Super-blocks per row (k/256) — the row geometry every K-quant gemv
     /// of this engine launches with.
     #[must_use]

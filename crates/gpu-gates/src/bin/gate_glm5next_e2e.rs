@@ -1,7 +1,9 @@
 //! The GLM-5.3-Flash end-to-end gate: the whole program — 34 KDA layers and
 //! 11 latent-attention layers, every block in the four hyper-connection
-//! streams, three dense blocks and 42 routed blocks whose experts all run on
-//! the host tier, the streams' mean, the q8_0 head and the argmax — loaded
+//! streams, three dense blocks and 42 routed blocks whose experts run on the
+//! card where the plan puts them (the hot list `BLOOMERY_HOT_LIST`, or the id
+//! prefix) and on the host tier otherwise, the streams' mean, the q8_0 head
+//! and the argmax — loaded
 //! once by its placement on the gate card (`workstation::plan_gate`), against
 //! ik's CPU oracle sets (`refset::arch::glm5next`: the 5-token batch set, the
 //! step after a fused 4-token prefill, the same after a prefill run node by
@@ -9,10 +11,15 @@
 //! read through its family.
 //!
 //! What is asserted:
-//! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes,
+//! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
+//!   plus [`CARD_NODES`] for each routed layer the plan gives card experts
+//!   (its `n_l`, which the host tier's slot map must hold layer for layer),
 //!   [`MEMOPS`] of them stream memory-operation batches (each routed layer's
 //!   go and wait) and the rest kernels, and the program's own count
 //!   (`step_launches` over the body's layer programs) is the same; the
+//!   layers with card experts are routed layers whose three stacks the card
+//!   reads — none of [`Q6K_DOWN`], whose downs are Q6_K — and, without a
+//!   card budget (`BLOOMERY_CARD_BUDGET`), every one of those; the
 //!   latent layers are the ones the file's description names, the dense
 //!   blocks the first three; the stores' bytes equal their derivation from
 //!   the header ([`store_bytes`]).
@@ -103,6 +110,7 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, step_launches};
+    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
     use cuda_core::sys;
     use gguf::quant::dequant_row;
     use gguf::{GgmlType, Split};
@@ -147,6 +155,16 @@ mod gate {
 
     /// PIN(2026-09-27): each routed layer's go and wait.
     const MEMOPS: usize = 2 * N_ROUTED;
+
+    /// PIN(2026-09-27): the shadow's launches more on a routed layer with card
+    /// experts: the norm's q8_1, the gate·up `_sel`, the q8_1 of its card
+    /// columns, the down `_sel`, the card slots' sum and its add to the
+    /// shared expert's output.
+    const CARD_NODES: usize = 6;
+
+    /// The routed layers whose downs are Q6_K in the file (the header), which
+    /// the card experts do not read.
+    const Q6K_DOWN: [usize; 3] = [11, 12, 44];
 
     const _: () = assert!(
         NODES_DECODE == N_LAYER * 6 + N_LAYER * 11 + N_DENSE * 3 + N_ROUTED * 8 + 4
@@ -238,6 +256,8 @@ mod gate {
     struct Log {
         t: Instant,
         nodes: Option<usize>,
+        /// The plan's card experts a layer.
+        n_l: Vec<u64>,
     }
 
     impl OpenLog<Body> for Log {
@@ -252,6 +272,7 @@ mod gate {
                 "plan place={place} ctx_max={} host_experts={} card_experts={}",
                 plan.ctx_max, plan.host.experts, plan.cards[0].experts
             );
+            self.n_l = plan.n_l.clone();
             Ok(true)
         }
 
@@ -275,16 +296,26 @@ mod gate {
         }
     }
 
-    fn open() -> Result<(Session<Body>, usize), GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
+    /// What the open decided besides the session: the step's captured nodes,
+    /// the plan's card experts a layer, and whether it ran under a card budget.
+    struct Opened {
+        nodes: usize,
+        n_l: Vec<u64>,
+        budgeted: bool,
+    }
+
+    fn open() -> Result<(Session<Body>, Opened), GateError> {
+        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let cfg = GlmCfg {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
         };
+        let budgeted = cfg.place.card_budget_bytes.is_some();
         let mut log = Log {
             t: Instant::now(),
             nodes: None,
+            n_l: Vec::new(),
         };
         let args = OpenArgs {
             place: "gate",
@@ -297,12 +328,21 @@ mod gate {
             Loaded::<Body>::open(file, args, &mut log)?.ok_or("the open stopped at its plan")?;
         let s = loaded.ready(&mut log)?;
         let nodes = log.nodes.ok_or("graph mode captured no step")?;
-        Ok((s, nodes))
+        let n_l = log.n_l;
+        Ok((
+            s,
+            Opened {
+                nodes,
+                n_l,
+                budgeted,
+            },
+        ))
     }
 
     // ------------------------------------------------------ (s) structure
 
-    fn structure(m: &Glm5nextModel, nodes: usize) -> Result<bool, GateError> {
+    fn structure(m: &Glm5nextModel, o: &Opened) -> Result<bool, GateError> {
+        let (nodes, budgeted) = (o.nodes, o.budgeted);
         let body = m.body("structure")?;
         let kinds = body.kinds();
         let at = |f: &dyn Fn(usize) -> bool| -> Vec<usize> {
@@ -326,18 +366,43 @@ mod gate {
         );
         let mixers: Vec<MixerKind> = kinds.iter().map(|k| k.mixer).collect();
         let ffns: Vec<FfnKind> = kinds.iter().map(|k| k.ffn).collect();
-        let counted = step_launches(&mixers, &ffns);
+        // The card layers are the plan's: its n_l, which the slot map must hold.
+        let slots = body.hybrid().slots();
+        let planned = |l: usize| o.n_l.get(l).copied().unwrap_or(0);
+        let cards: Vec<bool> = (0..kinds.len()).map(|l| planned(l) > 0).collect();
+        let card_layers = at(&|l| cards[l]);
+        let map_is_plan = o.n_l.len() == kinds.len()
+            && (0..kinds.len()).all(|l| slots.on_card(l) as u64 == planned(l));
+        let readable = at(&|l| kinds[l].ffn == FfnKind::Moe && !Q6K_DOWN.contains(&l));
+        let card_ok = map_is_plan
+            && card_layers.iter().all(|l| readable.contains(l))
+            && (budgeted || card_layers == readable);
+        let per_layer: Vec<u64> = card_layers.iter().map(|&l| planned(l)).collect();
+        println!(
+            "structure the plan's card experts on {} routed layers {card_layers:?}, per layer \
+             {per_layer:?}, the slot map the same ({map_is_plan}); none on a dense layer or on \
+             {Q6K_DOWN:?}, and {} {}",
+            card_layers.len(),
+            if budgeted {
+                "a card budget set".to_string()
+            } else {
+                format!("with no card budget on all {} others", readable.len())
+            },
+            verdict(card_ok)
+        );
+        ok &= card_ok;
+        let want = NODES_DECODE + CARD_NODES * card_layers.len();
+        let counted = step_launches(&mixers, &ffns, &cards);
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let pass = nodes == NODES_DECODE
-            && counted == NODES_DECODE
-            && b == MEMOPS
-            && k == NODES_DECODE - MEMOPS
-            && other == 0;
+        let pass =
+            nodes == want && counted == want && b == MEMOPS && k == want - MEMOPS && other == 0;
         println!(
-            "structure decode graph_nodes={nodes} (want {NODES_DECODE}; the program counts \
-             {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) other={other} {}",
+            "structure decode graph_nodes={nodes} (want {want} = {NODES_DECODE} + {CARD_NODES} x {} \
+             card layers; the program counts {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) \
+             other={other} {}",
+            card_layers.len(),
             verdict(pass)
         );
         ok &= pass;
@@ -1303,9 +1368,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let (mut s, nodes) = open()?;
+        let (mut s, opened) = open()?;
         let m = s.model_mut();
-        let mut ok = structure(m, nodes)?;
+        let mut ok = structure(m, &opened)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();

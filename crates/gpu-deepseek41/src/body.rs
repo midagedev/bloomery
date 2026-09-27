@@ -20,7 +20,7 @@
 //!   between sub-layers;
 //! - the device copy of the step image ([`crate::params`]);
 //! - the slot map: per layer and expert id, the slot of the card's routed
-//!   stack that holds the expert, or [`HOST`] — filled from the plan's
+//!   stack that holds the expert, or [`HOST`](bloomery_gpu::hybrid::HOST) — filled from the plan's
 //!   segments, so moving an expert between the card and the host changes
 //!   this map and not the code; the chain reads its card copy and the host
 //!   tier its host copy ([`SlotMap`]);
@@ -74,7 +74,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, Refusal, SlotMap,
+    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
@@ -89,7 +89,7 @@ use model::arch::deepseek41::hparams::{
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
-use model::placement::{Device, Machine, Plan, PlanLevers, Role};
+use model::placement::{Machine, Plan, PlanLevers};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -857,7 +857,7 @@ impl Body {
     }
 
     /// The slot map's card copy: `layers().len()` rows of the file's
-    /// `n_expert` slots, [`HOST`] where the plan leaves the expert off the
+    /// `n_expert` slots, [`HOST`](bloomery_gpu::hybrid::HOST) where the plan leaves the expert off the
     /// card.
     #[must_use]
     pub fn slots(&self) -> &DeviceTensor<u32> {
@@ -2030,11 +2030,7 @@ impl Body {
         let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
         let n_expert = hp.experts.n_expert;
-        let map = SlotMap::from_rows(
-            layers.clone(),
-            n_expert,
-            plan_slots(plan, card, &layers, n_expert)?,
-        )?;
+        let map = SlotMap::of_plan(plan, card, layers.clone(), n_expert)?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), layers.len(), n_expert)?;
 
         let attn =
@@ -2495,78 +2491,6 @@ fn layer_kv(
         values,
         scores,
     })
-}
-
-/// The slot of card `card`'s stack that holds each expert of each of
-/// `layers` — `layers.len()` rows of `n_expert` — or [`HOST`] where the plan
-/// leaves the expert off the card. The card's segments of a routed stack, in
-/// plan order, fill its slots from 0; every routed stack of a layer must put
-/// the same experts in the same slots.
-fn plan_slots(
-    plan: &Plan<'_>,
-    card: usize,
-    layers: &Range<usize>,
-    n_expert: usize,
-) -> Result<Vec<u32>, GpuError> {
-    let refuse = |detail: String| GpuError::Shape {
-        what: "deepseek41 plan_slots",
-        detail,
-    };
-    let mut map = vec![HOST; layers.len() * n_expert];
-    let mut first: Vec<Option<&str>> = vec![None; layers.len()];
-    let mut stack = vec![HOST; n_expert];
-    for row in &plan.rows {
-        let t = plan
-            .model
-            .tensors
-            .get(row.tensor)
-            .ok_or_else(|| refuse(format!("a plan row names tensor {}", row.tensor)))?;
-        let Some(l) = t.layer.filter(|l| layers.contains(l)) else {
-            continue;
-        };
-        if t.role != Role::RoutedExperts {
-            continue;
-        }
-        stack.fill(HOST);
-        let mut slot = 0u32;
-        for seg in row
-            .segments
-            .iter()
-            .filter(|s| s.device == Device::Card(card))
-        {
-            let experts = seg.experts.clone().ok_or_else(|| {
-                refuse(format!(
-                    "{}: a card segment without an expert range",
-                    t.name
-                ))
-            })?;
-            for e in experts {
-                let entry = usize::try_from(e)
-                    .ok()
-                    .and_then(|e| stack.get_mut(e))
-                    .ok_or_else(|| refuse(format!("{}: expert {e} of {n_expert}", t.name)))?;
-                *entry = slot;
-                slot += 1;
-            }
-        }
-        let i = l - layers.start;
-        let dst = &mut map[i * n_expert..(i + 1) * n_expert];
-        let seen = first[i];
-        match seen {
-            None => {
-                dst.copy_from_slice(&stack);
-                first[i] = Some(&t.name);
-            }
-            Some(other) if *dst != *stack => {
-                return Err(refuse(format!(
-                    "{} puts other experts on the card than {other}",
-                    t.name
-                )));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(map)
 }
 
 /// Bytes of one engram table row: every site's table holds rows of

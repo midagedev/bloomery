@@ -7,7 +7,8 @@
 //!   latent mixer, `hc_post` — then the feed-forward sub-layer's `hc_pre`
 //!   and fold, and either the dense block and its `hc_post` or the routed
 //!   block up to its go;
-//! - the shadow (a routed layer): the shared expert;
+//! - the shadow (a routed layer): its card experts, when the slot map puts
+//!   any on the card, and the shared expert;
 //! - the back (a routed layer): the wait, the sum and `hc_post`, then the
 //!   host tier told the layer is enqueued.
 //!
@@ -19,7 +20,8 @@
 //! Launches per layer: 3 a sub-layer for the streams (`hc_pre`, the fold,
 //! `hc_post`), plus the mixer's ([`crate::kda::LAUNCHES`],
 //! [`crate::mla::LAUNCHES`]) and the block's ([`crate::ffn::DENSE_LAUNCHES`],
-//! [`crate::ffn::MOE_LAUNCHES`]); the head adds the mean and its own three.
+//! [`crate::ffn::MOE_LAUNCHES`], and [`crate::ffn::CARD_LAUNCHES`] more on a
+//! layer with card experts); the head adds the mean and its own three.
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::Hybrid;
@@ -39,21 +41,23 @@ use crate::{ffn, kda, mla};
 const WHAT: &str = "glm5next Body::enqueue_chain";
 
 /// The launches of the step's captured chain: every layer's
-/// ([`layer_launches`]) and the head's four.
+/// ([`layer_launches`], `cards[l]` whether layer `l` has card experts) and
+/// the head's four.
 #[must_use]
-pub fn step_launches(mixers: &[MixerKind], ffns: &[FfnKind]) -> usize {
+pub fn step_launches(mixers: &[MixerKind], ffns: &[FfnKind], cards: &[bool]) -> usize {
     mixers
         .iter()
         .zip(ffns)
-        .map(|(&m, &f)| layer_launches(m, f))
+        .zip(cards)
+        .map(|((&m, &f), &c)| layer_launches(m, f, c))
         .sum::<usize>()
         + 4
 }
 
 /// One layer's launches: two sub-layers' three for the streams, its mixer's
-/// and its block's.
+/// and its block's, with its card experts' when `card`.
 #[must_use]
-pub fn layer_launches(mixer: MixerKind, ffn: FfnKind) -> usize {
+pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool) -> usize {
     let mix = match mixer {
         MixerKind::DeltaRule => kda::LAUNCHES,
         MixerKind::Latent => mla::LAUNCHES,
@@ -61,6 +65,7 @@ pub fn layer_launches(mixer: MixerKind, ffn: FfnKind) -> usize {
     };
     let block = match ffn {
         FfnKind::Dense => ffn::DENSE_LAUNCHES,
+        FfnKind::Moe if card => ffn::MOE_LAUNCHES + ffn::CARD_LAUNCHES,
         FfnKind::Moe => ffn::MOE_LAUNCHES,
     };
     2 * 3 + mix + block
@@ -180,7 +185,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
         }
     }
 
-    /// A routed layer's shared expert under its host leg.
+    /// A routed layer's card experts and shared expert under its host leg.
     fn shadow(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         if !self.parts.cfg[l].kind.host_leg() {
@@ -196,7 +201,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
         if !self.parts.cfg[l].kind.host_leg() {
             return Ok(());
         }
-        ffn::back(gpu, &mut self.parts, port.hybrid.boundary())?;
+        ffn::back(gpu, &mut self.parts, port.hybrid.boundary(), l)?;
         self.hc_out()?;
         self.parts.tap(gpu, l, self.cur)?;
         port.hybrid.row_enqueued(l, 0)

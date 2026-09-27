@@ -62,6 +62,12 @@
 //!    (codes, `d`, 0) as the host's reading of the block bytes; clauses 5 and 4
 //!    on the Q8_0 entries; and each launcher refusing a stack of the other
 //!    format's row width.
+//! 9. q4k_gate_up: the Q4_K gate·up (`kq_gate_up_act_q4k`, GLM-5.3-Flash's
+//!    routed gate and up) under clauses 5 and 4, its down sums from clause 6's
+//!    Walk A instance over `Q4k` (so `q4k_gemv_sel`'s bit for bit): the rows
+//!    are `silu_mul` and `swiglu_clamp` at two limits on the sums of the same
+//!    rows, an id past the stack raises `ExpertId` and NaNs its rows, `HOST`
+//!    leaves them, a NaN column NaNs every row.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -544,7 +550,8 @@ mod gate {
 
     /// The down `_sel` of stack `st` for `sel` (one id a column of `act`) into a
     /// `SENT`-filled output, synchronized; the output and the fault word. The
-    /// stack's type picks the entry: Q8_0's, else Q5_K's.
+    /// stack's type picks the entry: Q8_0's, Q4_K's (this binary's Walk A
+    /// instance, clause 6's), else Q5_K's.
     fn down(
         c: &Ctx,
         st: &Stack,
@@ -564,6 +571,31 @@ mod gate {
         match st.ty {
             GgmlType::Q8_0 => {
                 c.kq.enqueue_gemv_q8_0_sel(stream, &a, c.gpu.unlabelled_sink(), &mut y)?;
+            }
+            GgmlType::Q4_K => {
+                let n_sb = st.n_sb();
+                let (q, s8, d8) = walk_a_planes(act);
+                let prep = c.gm.prepare_kq_gemv_sel_q4k(LaunchConfig1D::new(
+                    u32::try_from((sel.len() * st.rpe).div_ceil(ROWS_PER_BLOCK))?,
+                    THREADS,
+                    0,
+                ))?;
+                c.gm.kq_gemv_sel_q4k(
+                    stream,
+                    &prep,
+                    st.w.buf(),
+                    q,
+                    s8,
+                    d8,
+                    &sel_dev,
+                    u32::try_from(st.w.rows() / st.rpe)?,
+                    u32::try_from(st.rpe)?,
+                    u32::try_from(sel.len())?,
+                    u32::try_from(n_sb)?,
+                    u32::try_from(n_sb.div_ceil(4))?,
+                    c.gpu.unlabelled_sink(),
+                    &mut y,
+                )?;
             }
             _ => {
                 c.kq.enqueue_gemv_q5k_sel(stream, &a, c.gpu.unlabelled_sink(), &mut y)?
@@ -601,6 +633,9 @@ mod gate {
         match g.ty {
             GgmlType::Q8_0 => {
                 c.kq.enqueue_gate_up_q8_0(stream, &a, c.gpu.unlabelled_sink(), &mut h)?
+            }
+            GgmlType::Q4_K => {
+                c.kq.enqueue_gate_up_q4k(stream, &a, c.gpu.unlabelled_sink(), &mut h)?
             }
             _ => {
                 c.kq.enqueue_gate_up_q5k(stream, &a, c.gpu.unlabelled_sink(), &mut h)?
@@ -820,6 +855,7 @@ mod gate {
         ok &= check_q4k_sibling(&c)?;
         ok &= check_q5_1(&c)?;
         ok &= check_q8_0(&c)?;
+        ok &= check_q4k_gate_up(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -836,7 +872,8 @@ mod gate {
              the Q8_0 entries within the band at 8 shapes (GLM's dense and shared \
              FFN among them) with their probe decoding as the host, their gate·up the rule on \
              their down's sums, their faults as Q5_K's, and each launcher refusing the other \
-             format's rows"
+             format's rows; the Q4_K gate·up the rule on Walk A's Q4_K sums, its faults as \
+             Q5_K's"
         );
         Ok(())
     }
@@ -1363,6 +1400,13 @@ mod gate {
             );
         }
         Ok(ok)
+    }
+
+    /// Clause 9 (module doc).
+    fn check_q4k_gate_up(c: &Ctx) -> Result<bool, GateError> {
+        let act = act_cases(c, GgmlType::Q4_K, "q4k_gate_up_act")?;
+        let fault = fault_cases(c, GgmlType::Q4_K, "q4k_gate_up_fault")?;
+        Ok(act && fault)
     }
 
     /// Clause 6 (module doc).

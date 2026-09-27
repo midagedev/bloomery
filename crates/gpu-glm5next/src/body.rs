@@ -11,9 +11,11 @@
 //! `hc_post` also writes is never read. After the last layer the streams'
 //! mean is the head's input.
 //!
-//! The routed experts run on the host tier: a routed layer's front ends at
-//! the go, its shadow is the shared expert, its back the wait, the sum and
-//! `hc_post` ([`crate::ffn`]). The step walks the layers with the runtime's
+//! The routed experts run on the card where the plan puts them and on the
+//! host tier otherwise, the slot map made from the plan saying which: a
+//! routed layer's front ends at the go, its shadow is its card experts and
+//! the shared expert, its back the wait, the sum and `hc_post`
+//! ([`crate::ffn`]). The step walks the layers with the runtime's
 //! one-token walk ([`crate::program`]).
 //!
 //! The token's embedding row is read from the file on the host and written
@@ -62,6 +64,7 @@ use models::{Act, Ffn, LayerSpec, Mixer};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 
+use crate::ffn::CardExperts;
 use crate::host::GlmHost;
 use crate::program;
 
@@ -150,7 +153,8 @@ pub(crate) struct LayerCfg {
     pub ff: usize,
     /// The router's selection bias is in the file.
     pub bias: bool,
-    /// The layer's row in the slot map's card copy, `n_expert` places a row.
+    /// The layer's row in the slot map's card copy, as a word offset
+    /// ([`SlotMap::row_offset`]).
     pub row_off: usize,
 }
 
@@ -434,6 +438,8 @@ pub struct Body {
     stores: Vec<Store>,
     /// The slot map's card copy, the host run's rows.
     slots: DeviceTensor<u32>,
+    /// The routed experts the slot map puts on the card.
+    card: CardExperts,
     embd: Embedding,
     /// Each layer's streams after it, when a gate armed them.
     taps: Option<Vec<DeviceBuffer<f32>>>,
@@ -463,6 +469,7 @@ pub(crate) struct Parts<'s> {
     pub s: &'s mut Scratch,
     pub stores: &'s mut [Store],
     pub slots: &'s DeviceTensor<u32>,
+    pub card: &'s mut CardExperts,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
 }
 
@@ -617,8 +624,8 @@ impl Body {
 
     /// The body of card `card`: its layers' programs and values from the
     /// plan's description, the stores at the plan's `ctx_max`, the step's
-    /// buffers, the slot map (every routed expert on the host) and the host
-    /// tier over the routed run.
+    /// buffers, the slot map the plan's routed segments make, the card
+    /// experts it puts on the card and the host tier over the routed run.
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's card, file, weights, plan and inputs, and the host tier's residency and levers (rust-quality R8)"
@@ -662,11 +669,12 @@ impl Body {
             })?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let dims = dims_of(inputs)?;
+        let map = SlotMap::of_plan(plan, card, run.clone(), N_EXPERT)?;
         let cfg = spec
             .layers
             .iter()
             .enumerate()
-            .map(|(l, s)| layer_cfg(l, s, &run, hp.n_expert))
+            .map(|(l, s)| layer_cfg(l, s, &map))
             .collect::<Result<Vec<_>, _>>()?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
@@ -677,8 +685,9 @@ impl Body {
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        let map = SlotMap::prefix(run.clone(), N_EXPERT, 0)?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), run.len(), N_EXPERT)?;
+        let experts_on_card =
+            CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
         let boundary = Boundary::with_rows(
             gpu.context(),
             stream,
@@ -716,6 +725,7 @@ impl Body {
             s,
             stores,
             slots,
+            card: experts_on_card,
             embd,
             taps: None,
             fed: 0,
@@ -755,6 +765,13 @@ impl Body {
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<GlmHost> {
         &self.hybrid
+    }
+
+    /// The slot map's card copy the handoff reads, a routed layer's row at
+    /// the map's [`SlotMap::row_offset`].
+    #[must_use]
+    pub fn slot_copy(&self) -> &DeviceTensor<u32> {
+        &self.slots
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the chain copies
@@ -801,6 +818,7 @@ impl Body {
                 s: &mut self.s,
                 stores: &mut self.stores,
                 slots: &self.slots,
+                card: &mut self.card,
                 taps: self.taps.as_deref_mut(),
             },
             &mut self.hybrid,
@@ -930,13 +948,9 @@ fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
 }
 
 /// Layer `l`'s programs from its description and the values its launches
-/// take; `run` is the host tier's layers.
-fn layer_cfg(
-    l: usize,
-    s: &LayerSpec,
-    run: &Range<usize>,
-    n_expert: usize,
-) -> Result<LayerCfg, GpuError> {
+/// take; a routed layer's row in the card copy is `map`'s
+/// ([`SlotMap::row_offset`]).
+fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuError> {
     let kind = Layer::of(s);
     if kind.residual != ResidualKind::Hc {
         return Err(shape(format!(
@@ -960,7 +974,9 @@ fn layer_cfg(
         }
     };
     let row_off = match kind.ffn {
-        FfnKind::Moe => (l - run.start) * n_expert,
+        FfnKind::Moe => map
+            .row_offset(l)
+            .ok_or_else(|| shape(format!("layer {l}: a routed layer with no slot-map row")))?,
         FfnKind::Dense => 0,
     };
     Ok(LayerCfg {
@@ -1069,6 +1085,7 @@ impl ChainBody for Body {
         self.store_bytes()
             + self.s.bytes()
             + self.slots.buf().num_bytes()
+            + self.card.bytes()
             + self
                 .taps
                 .as_ref()

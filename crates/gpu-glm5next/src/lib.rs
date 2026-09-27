@@ -3,14 +3,16 @@
 //! their descriptions name (`runtime::layer`). It has no device code of its
 //! own: the KDA delta rule, the latent appends, the q8_0 gemvs and the head
 //! are `bloomery-gpu`'s, the hyper-connections, the absorbed attention, the
-//! GLM router, the shared expert and the host handoff `bloomery-gpu-deepseek41`'s.
-//! Every routed expert runs on the host tier.
+//! GLM router, the shared expert, the host handoff and the card slots' sum
+//! `bloomery-gpu-deepseek41`'s, the routed experts' `_sel` entries
+//! `bloomery-gpu`'s (`kquant`, `q4k_sel`). The routed experts run on the card
+//! where the plan puts them, on the host tier otherwise.
 //!
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
-//! - `kda`, `mla`: the two mixers; `ffn`: the dense block and the routed
-//!   block around its host leg;
+//! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
+//!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
 //! - [`forced`]: one layer alone on given streams, for the gates.
 //!

@@ -1118,16 +1118,26 @@ pub fn whole_on_card(i: usize, t: &ModelTensor, card: usize) -> Result<Row, Plac
     })
 }
 
+/// Which routed stacks a program's card expert kernels run: the card format
+/// a stack of type `ty` loads in, `None` for a type none of them reads. A
+/// layer with such a stack keeps its experts on the host.
+pub type RoutedFormat = fn(GgmlType) -> Option<CardFormat>;
+
 /// A card's eligible layers: the layers of `card` that route, every stack of
-/// which has a card format.
-fn eligible(card: &Card, routed: &[Vec<usize>], model: &ModelTensors) -> Vec<usize> {
+/// which `routed` gives a card format.
+fn eligible(
+    card: &Card,
+    stacks: &[Vec<usize>],
+    model: &ModelTensors,
+    routed: RoutedFormat,
+) -> Vec<usize> {
     card.layers
         .clone()
         .filter(|&l| {
-            !routed[l].is_empty()
-                && routed[l]
+            !stacks[l].is_empty()
+                && stacks[l]
                     .iter()
-                    .all(|&i| CardFormat::of_routed(model.tensors[i].ty).is_some())
+                    .all(|&i| routed(model.tensors[i].ty).is_some())
         })
         .collect()
 }
@@ -1173,12 +1183,14 @@ enum Held {
 
 /// Card `c`'s uploads in the loader's order — the model's tensor order, which
 /// `Weights::load_placed` walks: each whole tensor `rows` puts on the card,
-/// and each routed stack of the card's `eligible` layers.
+/// and each routed stack of the card's `eligible` layers in its `routed`
+/// format.
 fn card_uploads<'m>(
     model: &'m ModelTensors,
     c: usize,
     rows: &[Option<Row>],
     eligible: &[usize],
+    routed: RoutedFormat,
 ) -> Result<Vec<(&'m ModelTensor, CardFormat, Held)>, PlacementError> {
     let mut out = Vec::new();
     for (t, row) in model.tensors.iter().zip(rows) {
@@ -1192,8 +1204,7 @@ fn card_uploads<'m>(
             },
             None => {
                 let layer = layer_of(t, model.layers)?;
-                let Some(f) = CardFormat::of_routed(t.ty).filter(|_| eligible.contains(&layer))
-                else {
+                let Some(f) = routed(t.ty).filter(|_| eligible.contains(&layer)) else {
                     continue;
                 };
                 let (rows_per_expert, _) = per_expert(t, model.experts)?;
@@ -1306,7 +1317,38 @@ pub fn plan_with<'a>(
     hot: Option<&HotList>,
     card_budget: Option<u64>,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_rule(model, machine, ctx_max, kv, hot, card_budget, true)
+    plan_rule(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        hot,
+        card_budget,
+        Some(CardFormat::of_routed),
+    )
+}
+
+/// [`plan`] with the expert rule run on the layers every routed stack of
+/// which `routed` gives a card format, for a program whose card expert
+/// kernels read other types than [`CardFormat::of_routed`]'s: the hot list's
+/// ids, or the id prefix without one, and the card budget, or none.
+pub fn plan_routed<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    levers: &PlanLevers,
+    routed: RoutedFormat,
+) -> Result<Plan<'a>, PlacementError> {
+    plan_rule(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        levers.hot.as_ref(),
+        levers.card_budget_bytes,
+        Some(routed),
+    )
 }
 
 /// [`plan`] with every routed stack on the host: no card is eligible for the
@@ -1334,12 +1376,12 @@ pub fn plan_host_routed<'a>(
         kv,
         None,
         levers.card_budget_bytes,
-        false,
+        None,
     )
 }
 
-/// [`plan_with`], the expert rule run on each card's eligible layers when
-/// `card_experts` and on none otherwise.
+/// [`plan_with`], the expert rule run on each card's layers eligible under
+/// `routed`, and on none without it.
 fn plan_rule<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1347,21 +1389,21 @@ fn plan_rule<'a>(
     kv: &dyn KvBytes,
     hot: Option<&HotList>,
     card_budget: Option<u64>,
-    card_experts: bool,
+    routed: Option<RoutedFormat>,
 ) -> Result<Plan<'a>, PlacementError> {
     if let Some(h) = hot {
         h.check_model(model)?;
     }
     let stages = Stages::new(model.layers, &machine.cards)?;
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
-    let mut routed: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
+    let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
         // A never-loaded tensor's shape is nothing a card must take.
         if let Some(format) = CardFormat::of_role(t.ty, t.role).filter(|_| t.role != Role::Unused) {
             card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {
-            routed[layer_of(t, model.layers)?].push(i);
+            stacks[layer_of(t, model.layers)?].push(i);
         } else {
             rows[i] = Some(place_whole(i, t, &stages, model.layers)?);
         }
@@ -1384,12 +1426,11 @@ fn plan_rule<'a>(
             - i128::from(card.context_bytes)
             - i128::from(card.scratch_bytes)
             - i128::from(card.margin_bytes);
-        let eligible = if card_experts {
-            eligible(card, &routed, model)
-        } else {
-            Vec::new()
+        let (eligible, format): (Vec<usize>, RoutedFormat) = match routed {
+            Some(f) => (eligible(card, &stacks, model, f), f),
+            None => (Vec::new(), CardFormat::of_routed),
         };
-        let uploads = card_uploads(model, c, &rows, &eligible)?;
+        let uploads = card_uploads(model, c, &rows, &eligible, format)?;
         if let Some(b) = card_budget {
             let dense = footprint(card.granule_bytes, &uploads, &n_l)?;
             check_floor(card, b, dense, kv_card)?;
@@ -1399,15 +1440,15 @@ fn plan_rule<'a>(
         })?;
         kv_bytes.push((kv_card, shadow));
     }
-    for (l, stacks) in routed.iter().enumerate() {
-        if stacks.is_empty() {
+    for (l, layer_stacks) in stacks.iter().enumerate() {
+        if layer_stacks.is_empty() {
             continue;
         }
         let on_card = match hot {
             Some(h) => h.card_list(l, n_l[l], model.experts)?,
             None => ExpertList::prefix(n_l[l])?,
         };
-        for &i in stacks {
+        for &i in layer_stacks {
             let t = &model.tensors[i];
             rows[i] = Some(routed_row(
                 i,

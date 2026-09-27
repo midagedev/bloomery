@@ -1,6 +1,7 @@
 //! Greedy generation with the GLM-5.3-Flash program: the file planned onto
-//! one card with every routed expert on the host tier
-//! (`model::arch::glm5next::place`), loaded through the session
+//! one card, the routed experts the card experts read by the expert rule
+//! (the hot list `BLOOMERY_HOT_LIST`, or the id prefix) and the rest on the
+//! host tier (`model::arch::glm5next::place`), loaded through the session
 //! (`app::Loaded`), the prompt fed one step a position, then `-n` greedy
 //! steps.
 //!

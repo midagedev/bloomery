@@ -1,5 +1,6 @@
 //! The GLM-5.3-Flash session: [`Body`] behind the session's traits, planned
-//! once by its placement (every routed expert on the host) and loaded by
+//! once by its placement (the routed experts the card experts read by the
+//! expert rule, the rest on the host) and loaded by
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
 //! A prompt is fed one step a position: the step walk is the only walk the
@@ -24,8 +25,8 @@ const WHAT: &str = "glm5next session";
 /// How the GLM session opens.
 #[derive(Clone, Debug)]
 pub struct GlmCfg {
-    /// The placement's levers the plan is made under; a hot list is refused
-    /// by name (no routed expert is on the card).
+    /// The placement's levers the plan is made under: the hot list, or the
+    /// id prefix, and the card budget.
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,

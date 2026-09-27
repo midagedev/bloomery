@@ -4,12 +4,12 @@
 //! each layer's KV bytes ([`KvLayout`]) are read once
 //! ([`PlanInputs::read`]); a file with a feature the engine does not run is
 //! refused there by the coverage check; then the placement
-//! ([`PlanInputs::plan`]) keeps every routed expert on the host
-//! ([`placement::plan_host_routed`]: no card kernel runs the file's Q5_K and
-//! Q6_K stacks with the clamped SwiGLU) and refuses a context past the
-//! positions the attention runs dense ([`dense_positions`]).
+//! ([`PlanInputs::plan`]) runs the expert rule on the routed layers whose
+//! stacks the card experts read ([`card_routed`]), the rest of every layer's
+//! experts on the host, and refuses a context past the positions the
+//! attention runs dense ([`dense_positions`]).
 
-use gguf::Split;
+use gguf::{GgmlType, Split};
 use models::ModelSpec;
 
 use super::hparams::{Hparams, Kind};
@@ -17,8 +17,8 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
-    Violation,
+    self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
+    Unimplemented, Violation,
 };
 
 const F16_BYTES: u64 = 2;
@@ -28,6 +28,18 @@ const F32_BYTES: u64 = 4;
 /// ring keeps `conv − 1 + PASS_ROWS` inputs. The card body binds it to its
 /// kernels' own constant.
 pub const PASS_ROWS: usize = 8;
+
+/// The routed stacks the program's card experts run, in their file bytes
+/// ([`CardFormat::KQuant`]): Q4_K (the gate·up) and Q5_K (a gate·up or the
+/// down `_sel`). A layer with a stack of any other type — the Q6_K downs —
+/// keeps its experts on the host.
+#[must_use]
+pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
+    match ty {
+        GgmlType::Q4_K | GgmlType::Q5_K => CardFormat::of(ty),
+        _ => None,
+    }
+}
 
 /// What a plan of a glm5next file is made from, read from its headers.
 #[derive(Debug)]
@@ -113,9 +125,10 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`, every routed expert on the host; refused
-    /// past [`dense_positions`], when it cannot be built, or when it breaks
-    /// an invariant.
+    /// the placement's `levers`: the expert rule on the layers whose routed
+    /// stacks [`card_routed`] runs, the hot list's ids or the id prefix;
+    /// refused past [`dense_positions`], when it cannot be built, or when it
+    /// breaks an invariant.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -126,7 +139,8 @@ impl PlanInputs {
         if ctx_max > dense {
             return Err(PlaceError::PastDense { ctx_max, dense });
         }
-        let plan = placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
+        let plan =
+            placement::plan_routed(&self.model, machine, ctx_max, &self.kv, levers, card_routed)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
