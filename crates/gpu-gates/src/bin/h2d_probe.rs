@@ -809,19 +809,33 @@ mod probe {
 
         fn done(&mut self, bytes: usize) -> Result<(), GateError> {
             self.bytes += bytes;
-            let dt = self.mark.elapsed();
-            if dt >= self.interval {
-                let b = self.bytes - self.mark_bytes;
-                println!(
-                    "h2d loop arm={} t_ms={} interval_ms={:.1} bytes={b} GB/s={:.2}",
-                    self.arm.name(),
-                    epoch_ms()?,
-                    dt.as_secs_f64() * 1e3,
-                    b as f64 / dt.as_secs_f64() / 1e9
-                );
-                self.mark = Instant::now();
-                self.mark_bytes = self.bytes;
+            if self.mark.elapsed() >= self.interval {
+                self.emit()?;
             }
+            Ok(())
+        }
+
+        /// The interval since the last line, however short: called once when the loop stops, so the
+        /// intervals cover the copy to its end (dma-dram-share tags a span they leave open [copy-gap]).
+        fn flush(&mut self) -> Result<(), GateError> {
+            if self.bytes > self.mark_bytes {
+                self.emit()?;
+            }
+            Ok(())
+        }
+
+        fn emit(&mut self) -> Result<(), GateError> {
+            let dt = self.mark.elapsed();
+            let b = self.bytes - self.mark_bytes;
+            println!(
+                "h2d loop arm={} t_ms={} interval_ms={:.1} bytes={b} GB/s={:.2}",
+                self.arm.name(),
+                epoch_ms()?,
+                dt.as_secs_f64() * 1e3,
+                b as f64 / dt.as_secs_f64() / 1e9
+            );
+            self.mark = Instant::now();
+            self.mark_bytes = self.bytes;
             Ok(())
         }
     }
@@ -874,6 +888,7 @@ mod probe {
         } else {
             staged(ctx, &stream, &mut dev, window, &offsets, a, &mut meter)?
         };
+        meter.flush()?;
         sampler.finish(arm, card)?;
         let s = meter.started.elapsed().as_secs_f64();
         println!(
