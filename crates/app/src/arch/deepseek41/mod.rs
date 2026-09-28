@@ -1,5 +1,7 @@
 //! The V4.1 session: [`Body`] behind the session's traits, planned once by its
-//! placement and loaded by gpumodel's constructor ([`Body::open_placed`]).
+//! placement and loaded by gpumodel's constructor ([`Body::open_placed_tiered`]),
+//! with the plan's expert tier card hung under the host tier when the
+//! placement names one.
 
 mod draft;
 
@@ -8,7 +10,7 @@ pub use draft::CardDraft;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
 use bloomery_gpu_deepseek41::body::{
-    self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode,
+    self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
 };
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
@@ -71,6 +73,8 @@ impl Open for Body {
             .map_err(|e| GpuError::plan(WHAT, e))
     }
 
+    /// The stage card, card 0, and the plan's expert tier card when it
+    /// names one ([`tier_of`]).
     fn open(
         file: Split,
         inputs: &PlanInputs,
@@ -81,7 +85,7 @@ impl Open for Body {
             hp: inputs.hp.clone(),
             levers: cfg.open.body,
         };
-        Body::open_placed(file, plan, 0, &meta)
+        Body::open_placed_tiered(file, plan, 0, tier_of(plan.machine)?, &meta)
     }
 
     /// The batch's buffers under the batched schedule (with the card-timing
@@ -96,6 +100,27 @@ impl Open for Body {
             b.set_prefill_card_timing(gpu, true)?;
         }
         Ok(true)
+    }
+}
+
+/// The expert tier card `machine` names, as the body opens it: its index in
+/// [`Machine::all_cards`] (after the one stage card) and its name, by which
+/// the card is found. `None` without a tier; more than one is refused by
+/// name, since the host tier holds one.
+pub fn tier_of(machine: &Machine) -> Result<Option<TierOpen>, GpuError> {
+    match machine.tiers.as_slice() {
+        [] => Ok(None),
+        [t] => Ok(Some(TierOpen {
+            card: machine.cards.len(),
+            name: t.name.clone(),
+        })),
+        more => Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the placement names {} expert tier cards; the host tier holds one",
+                more.len()
+            ),
+        }),
     }
 }
 

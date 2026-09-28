@@ -39,9 +39,10 @@ export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 # A DSpark run (BLOOMERY_DRAFT=dspark) puts its draft on the other card, found by name
 # (Gpu::for_card), so that card must be visible too; the timing card stays device 0. The draft file
 # is the profile's DSPARK_MODEL unless the caller names one. dspark_env prints the same two
-# assignments for a runner that sets the lever per arm (depth-ds41.sh).
+# assignments for a runner that sets the lever per arm (depth-ds41.sh); in the two-card mode the cards
+# are the mode's two (the draft sits on the 3090 beside the expert tier).
 dspark_env() {
-  echo "CUDA_VISIBLE_DEVICES=$TIMING_GPU,$OTHER_GPU"
+  echo "CUDA_VISIBLE_DEVICES=$TIMING_GPU${OTHER_GPU:+,$OTHER_GPU}${TIMING_GPU2:+,$TIMING_GPU2}"
   echo "BLOOMERY_DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-${DSPARK_MODEL:-}}"
 }
 if [ "${BLOOMERY_DRAFT:-}" = dspark ]; then
@@ -190,8 +191,11 @@ __card_ok() {
 # (TWO_CARD_PLACEMENT: the model fits one card, and the A6000+3090 table is for one that does not) or an
 # arm has none. Each arm is three words: the arm as given, its kind (ref for a reference engine; ours,
 # corpus or bin run <our binary>) and its engine. Only mainline llama.cpp's arms (lcpp..., the fit arms
-# too) have a two-card line: the profile's -ts split, or llama-bench's fit over both cards. Our binaries
-# load one card (--place a|gate); plan (b) is their expected two-card interface, `--place b`.
+# too) have a two-card line: the profile's -ts split, or llama-bench's fit over both cards. A runner whose
+# binary has a two-card placement names it in TIMING_CARDS_PLACE (depth-ds41.sh: bp, generate_ds41's plan
+# (b′)) and the placement its arms load by in TIMING_CARDS_PLACE_RAN: our arms pass when the two agree and
+# are refused with a hint naming it when they do not. Without TIMING_CARDS_PLACE our binaries load one
+# card (--place a|gate), and plan (b), `--place b`, is their expected two-card interface.
 timing_cards_arms() {
   local bin=$1 a kind eng
   [ -n "$TIMING_CARDS" ] || return 0
@@ -214,6 +218,11 @@ timing_cards_arms() {
         return 64
         ;;
       *)
+        if [ -n "${TIMING_CARDS_PLACE:-}" ]; then
+          [ "${TIMING_CARDS_PLACE_RAN:-}" != "$TIMING_CARDS_PLACE" ] || continue
+          echo "${0##*/}: arm '$a': ${bin##*/} under --place ${TIMING_CARDS_PLACE_RAN:-?} loads one card; its two-card placement is --place $TIMING_CARDS_PLACE (BLOOMERY_GEN_PLACE=$TIMING_CARDS_PLACE)" >&2
+          return 64
+        fi
         echo "${0##*/}: arm '$a': ${bin##*/} loads one card (--place a|gate); its two-card placement, plan (b) (workstation::plan_b), is expected as --place b and does not exist yet, so the A6000+3090 table has no row of ours" >&2
         return 64
         ;;
@@ -352,15 +361,16 @@ guard_cards() {
   exit 75
 }
 
-# timing_cards_arm <engine log>: after an arm's post witness in the two-card mode (0 at once without
+# timing_cards_arm <engine log> [ours]: after an arm's post witness in the two-card mode (0 at once without
 # it): 1 with TWOCARD_WHY when a kernel Xid line came since the last arm's check (between the arms, or
 # inside this one: the arm is charged either way, and the count moves on), when the Xid reader failed,
 # when a card stopped answering or the 3090 left its cap, or when the engine's log does not show exactly
 # the two cards as its devices 0 and 1 (ggml_cuda_init's `found N CUDA devices` and `Device i:` lines): a
-# llama-bench that sees one card spreads nothing and would be timed as if it were one card. TWOCARD_DEVS
-# is `<device 0> + <device 1>` for the row.
+# llama-bench that sees one card spreads nothing and would be timed as if it were one card. With `ours`
+# the log is one of our binaries': its first `load` record's `cards` (read by tools/bloomery/records.py)
+# must name the A6000 and the 3090. TWOCARD_DEVS is `<device 0> + <device 1>` for the row.
 timing_cards_arm() {
-  local n d0 d1
+  local n d0 d1 rec CARDS
   TWOCARD_WHY='' TWOCARD_DEVS=''
   [ -n "$TIMING_CARDS" ] || return 0
   if ! xid_read; then
@@ -374,6 +384,21 @@ timing_cards_arm() {
   fi
   __card_ok A6000 "$GPU_A6000" A6000 '' || return 1
   __card_ok 3090 "$GPU_3090" 3090 250 || return 1
+  if [ "${2:-}" = ours ]; then
+    rec=$(python3 "${BASH_SOURCE[0]%/*}/../bloomery/records.py" sh - CARDS=load.cards <<< "$1") || {
+      TWOCARD_WHY="records.py did not read the engine's load record"
+      return 1
+    }
+    eval "$rec"
+    d0=${CARDS#\[} d0=${d0%\]}
+    if [[ ,$d0, == *,A6000,* && ,$d0, == *,3090,* ]]; then
+      # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
+      TWOCARD_DEVS="${d0//,/ + }"
+      return 0
+    fi
+    TWOCARD_WHY="the engine's load record names cards ${CARDS:-(none)}, not the A6000 and the 3090: a one-card run in the two-card table"
+    return 1
+  fi
   n=$(sed -nE 's/.*ggml_cuda_init: found ([0-9]+) CUDA devices.*/\1/p' <<< "$1" | head -n 1)
   d0=$(sed -nE 's/^ *Device 0: ([^,]*),.*/\1/p' <<< "$1" | head -n 1)
   d1=$(sed -nE 's/^ *Device 1: ([^,]*),.*/\1/p' <<< "$1" | head -n 1)
