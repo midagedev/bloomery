@@ -6,6 +6,7 @@
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/router-trace.sh <corpus> [--name N] [args...]'
 #   just trace-router <corpus> [--name N] [args...]            (deepseek41)
 #   just trace-router-glm5next <corpus> [--name N] [args...]   (glm5next)
+#   just trace-router-qwen4exp <corpus> [--name N] [args...]   (qwen4exp)
 #
 #   <corpus>   a name    the profile's corpus file: deepseek41's $BLOOMERY_DATA/engram/corpus-<corpus>.ids
 #                        (engram-corpus.sh: code | prose | prose-all | ...), any other profile's
