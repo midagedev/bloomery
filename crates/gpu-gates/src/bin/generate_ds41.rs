@@ -227,23 +227,25 @@ mod finite;
 mod dspark;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_draft.rs"]
+mod draft;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_split.rs"]
 mod split;
 
 #[cfg(feature = "deepseek41")]
 mod drive {
     use std::ops::Range;
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use app::arch::deepseek41::{CardDraft, Ds41Cfg};
+    use app::arch::deepseek41::Ds41Cfg;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS};
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
-    use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::generate::{Place, mode_name};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
@@ -260,6 +262,7 @@ mod drive {
         Want,
     };
 
+    use crate::draft::{Draft, open_dspark};
     use crate::{dspark, finite, split};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
@@ -689,28 +692,9 @@ mod drive {
         // The draft builds the target's feature tap, so it loads before the
         // capture: the captured step then carries the tap.
         let spark = match &draft_file {
-            Some((draft_split, dhp)) => {
-                let t = Instant::now();
-                let card = dspark::draft_card()?;
-                let target = Arc::new(
-                    Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
-                );
-                let mut d = CardDraft::open(&mut loaded, draft_split, dhp, target, card)?;
-                let (free, total) = d.mem_info()?;
-                let b = loaded.model().body("generate_ds41")?;
-                Record::new(&record::LOAD_DRAFT)
-                    .w("draft", "dspark")
-                    .w("card", d.card())
-                    .u(
-                        "width",
-                        <CardDraft<DraftBody> as runtime::Draft<Session<Body>>>::WIDTH,
-                    )
-                    .list("target_layers", b.feature_layers().unwrap_or_default())
-                    .u("feature_width", b.feature_width())
-                    .u("draft_card_free", free)
-                    .u("draft_card_total", total)
-                    .f("load_s", t.elapsed().as_secs_f64())
-                    .print();
+            Some(file) => {
+                let (d, load) = open_dspark(&mut loaded, file, &path, "generate_ds41")?;
+                load.print();
                 Some(d)
             }
             None => None,
@@ -1236,40 +1220,6 @@ mod drive {
             .w("first", first)
             .u("eager_differs", differs)
             .print();
-    }
-
-    /// Which draft `BLOOMERY_DRAFT` serves.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Draft {
-        /// Unset: the plain path.
-        Off,
-        /// The n-gram lookup.
-        Lookup,
-        /// The DSpark draft (`shared/ds41_dspark.rs`).
-        Dspark,
-    }
-
-    impl Draft {
-        /// `BLOOMERY_DRAFT` as the levers hold it: unset is the plain path,
-        /// `lookup` and `dspark` the served drafts.
-        fn from_levers(levers: &Levers) -> Result<Draft, GateError> {
-            match levers.draft() {
-                None => Ok(Draft::Off),
-                Some("lookup") => Ok(Draft::Lookup),
-                Some("dspark") => Ok(Draft::Dspark),
-                Some(other) => {
-                    Err(format!("BLOOMERY_DRAFT is lookup, dspark or unset, not {other:?}").into())
-                }
-            }
-        }
-
-        fn name(self) -> &'static str {
-            match self {
-                Draft::Off => "unset",
-                Draft::Lookup => "lookup",
-                Draft::Dspark => "dspark",
-            }
-        }
     }
 
     /// What the open prints and checks at each of its steps: the plan (and,

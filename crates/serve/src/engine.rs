@@ -125,6 +125,23 @@ pub trait Engine: Send {
     /// With `Some(out)` (length `n_vocab`) it also writes those logits; a
     /// greedy request passes `None` and the engine may skip reading them.
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError>;
+    /// One greedy pass from `last`: `last` and whatever the engine's draft
+    /// proposes after it, evaluated together, and the tokens the pass keeps
+    /// appended to `out` in position order — each the target's own argmax,
+    /// the first the one `next(last, None)` returns. The engine then stands
+    /// past `last` and every appended token but the last, which the next call
+    /// feeds. The default is one `next`: nothing drafted.
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        out.push(self.next(last, None)?);
+        Ok(Drafted::default())
+    }
+    /// The most positions one [`Engine::advance`] evaluates: 1 for an engine
+    /// without a draft. Past 1 the engine drafts, and a request that needs the
+    /// logits row (sampling, a banned id) is refused: a draft's pass keeps the
+    /// target's argmax.
+    fn advance_rows(&self) -> usize {
+        1
+    }
     /// Drops the whole cache; the next `prefill` starts at position 0.
     fn reset(&mut self) -> Result<(), EngineError>;
     /// The longest prefix, at most `n` positions, of what the cache holds now
@@ -236,6 +253,15 @@ pub trait Engine: Send {
     fn note(&self, note: &CacheNote) {
         eprintln!("bloomery-serve: {note}");
     }
+}
+
+/// What one [`Engine::advance`] drafted: the ids its draft proposed (0 for a
+/// pass that ran none) and how many of them the target kept, llama-server's
+/// `draft_n` and `draft_n_accepted` of one pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drafted {
+    pub proposed: usize,
+    pub accepted: usize,
 }
 
 /// A saved engine state held by the prompt cache ([`Engine::snapshot`]).
@@ -448,6 +474,13 @@ pub struct DraftProps {
     pub model: String,
     /// The most tokens it drafts per step.
     pub n_max: Option<u64>,
+    /// What drafts: `lookup`, or the draft model's kind (`dspark`).
+    pub kind: Option<String>,
+    /// The draft model's file, as `model_path` names the target's.
+    pub path: Option<String>,
+    /// The device the draft model runs on, as a placement device names it
+    /// (`GPU<n>`); its resident bytes are that device's `draft` class.
+    pub device: Option<String>,
 }
 
 /// The sampling knobs a request carries, llama-server names and defaults.

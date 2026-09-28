@@ -6,6 +6,14 @@
 //! Like llama-server, the prompt phase ends when the first token's logits are
 //! out, and the predicted phase runs from there to the end, so `predicted_ms`
 //! spans `predicted_n - 1` decode steps.
+//!
+//! An engine that drafts ([`Engine::advance_rows`] past 1) takes every greedy
+//! token after the first through [`Engine::advance`]: a pass keeps one token
+//! or more, which the loop then takes one at a time as it takes a step's. A
+//! pass that would run past the context is not run; the positions left take
+//! one step each, so the ids end where a plain run's end. `timings` then carry
+//! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
+//! and kept.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -17,8 +25,8 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::engine::{
-    CacheNote, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Saved, StateError,
-    Tokenizer,
+    CacheNote, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Saved,
+    StateError, Tokenizer,
 };
 use crate::promptcache::{self, PromptCache};
 use crate::sampling;
@@ -57,14 +65,25 @@ pub(crate) struct Timings {
     /// The whole prompt, kept and evaluated (llama-server's `n_prompt_tokens`;
     /// not a `timings` field).
     pub n_prompt: usize,
+    /// The ids the draft proposed and the ones the target kept, over every
+    /// pass (llama-server's `draft_n`, `draft_n_accepted`).
+    pub draft_n: usize,
+    pub draft_n_accepted: usize,
+    /// The passes that verified a proposal (llama-server's
+    /// `n_draft_verif_steps`; not a `timings` field).
+    pub draft_passes: usize,
+    /// The engine calls after the first token's, a step or a pass each (not a
+    /// `timings` field).
+    pub decodes: usize,
 }
 
 impl Timings {
     /// The JSON llama-server emits. A zero count gives NaN per-token fields,
-    /// which serialize as `null` exactly as nlohmann writes them.
+    /// which serialize as `null` exactly as nlohmann writes them. The draft's
+    /// two counts are there once a pass proposed, as llama-server's are.
     pub(crate) fn to_json(&self) -> Value {
         let (pn, dn) = (self.prompt_n as f64, self.predicted_n as f64);
-        json!({
+        let mut v = json!({
             "prompt_n": self.prompt_n,
             "prompt_ms": self.prompt_ms,
             "prompt_per_token_ms": self.prompt_ms / pn,
@@ -76,7 +95,19 @@ impl Timings {
             "n_ctx": self.n_ctx,
             "n_past": self.n_past,
             "cache_n": self.cache_n,
-        })
+        });
+        if self.draft_n > 0 {
+            v["draft_n"] = json!(self.draft_n);
+            v["draft_n_accepted"] = json!(self.draft_n_accepted);
+        }
+        v
+    }
+
+    /// One pass's draft counts into the request's.
+    fn book(&mut self, d: Drafted) {
+        self.draft_n += d.proposed;
+        self.draft_n_accepted += d.accepted;
+        self.draft_passes += usize::from(d.proposed > 0);
     }
 }
 
@@ -381,6 +412,33 @@ impl Slot {
         Ok(g)
     }
 
+    /// `advance` that books what it fed: `last` and every kept token but the
+    /// last. `out` is cleared first. A pass that kept no token, more than the
+    /// engine's rows, or other than one more than its draft's accepted ids is
+    /// the engine's error.
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        out.clear();
+        let d = self.engine.advance(last, out)?;
+        let rows = self.engine.advance_rows();
+        if out.is_empty()
+            || out.len() > rows
+            || out.len() != d.accepted + 1
+            || d.accepted > d.proposed
+        {
+            return Err(EngineError(format!(
+                "a pass of at most {rows} rows kept {} tokens, its draft {} of {} proposed ids",
+                out.len(),
+                d.accepted,
+                d.proposed
+            )));
+        }
+        self.held = held;
+        self.held.push(last);
+        self.held.extend_from_slice(&out[..out.len() - 1]);
+        Ok(d)
+    }
+
     /// Positions the cache holds.
     pub(crate) fn held_len(&self) -> usize {
         self.held.len()
@@ -511,7 +569,8 @@ fn partial_path(path: &Path) -> PathBuf {
 /// Runs one request on the slot. `ids` is non-empty and shorter than the context.
 /// `timings` in the returned outcome are filled even when the sink failed midway
 /// (the caller's counters still see the work done). A greedy request never asks the
-/// engine for its logits. `tick` sees the timings after every generated token.
+/// engine for its logits, and takes its tokens after the first through the
+/// engine's passes. `tick` sees the timings after every generated token.
 pub(crate) fn generate(
     slot: &mut Slot,
     factory: &SamplerFactory,
@@ -561,6 +620,15 @@ pub(crate) fn generate(
     let mut stop = StopKind::Limit;
     let mut stopping_word = String::new();
     let mut truncated = false;
+    // A pass's rows; 1 steps. Only a greedy request with no banned id passes.
+    let rows = if sampler.is_none() && banned.is_empty() {
+        slot.engine.advance_rows()
+    } else {
+        1
+    };
+    // The last pass's kept tokens, and how many of them the loop has taken.
+    let mut kept: Vec<u32> = Vec::with_capacity(rows);
+    let mut taken = 0;
     if budget > 0 {
         let mut tok = choose(&mut sampler, greedy, &mut logits, &generated, banned);
         loop {
@@ -589,10 +657,26 @@ pub(crate) fn generate(
             if generated.len() >= budget {
                 break;
             }
+            // The last pass evaluated this token already.
+            if let Some(&t) = kept.get(taken) {
+                taken += 1;
+                tok = t;
+                continue;
+            }
             // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
             if n + generated.len() > ctx_max {
                 truncated = true;
                 break;
+            }
+            tim.decodes += 1;
+            // A pass takes `rows` positions from there.
+            if rows > 1 && n + generated.len() + rows - 1 <= ctx_max {
+                let d = slot.advance(tok, &mut kept)?;
+                tim.book(d);
+                tim.n_past = n + generated.len() + kept.len() - 1;
+                tok = kept[0];
+                taken = 1;
+                continue;
             }
             let g = slot.next(tok, out(&mut logits))?;
             tim.n_past = n + generated.len();

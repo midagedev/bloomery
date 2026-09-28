@@ -2160,3 +2160,147 @@ fn hw_an_interleaved_conversation_keeps_what_the_engine_grants() {
     assert!(k.last < k.bound, "last {} bound {}", k.last, k.bound);
     assert!(k.cache_n <= k.bound);
 }
+
+/// Prompts whose greedy mock runs are long, short and stopped by EOS.
+const DRAFT_PROMPTS: [&str; 3] = [
+    "abcabcabcab",
+    "the cat sat on the mat and the cat sat on the ",
+    "xyz uvw xyz uv",
+];
+
+/// A greedy `/completion` of `prompt`: its ids and its reply.
+fn drafted_ids(
+    addr: std::net::SocketAddr,
+    prompt: &Value,
+    n: usize,
+    cache: bool,
+) -> (Vec<u64>, Value) {
+    let v = post(
+        addr,
+        "/completion",
+        &json!({"prompt": prompt, "n_predict": n, "temperature": 0, "return_tokens": true,
+                "cache_prompt": cache}),
+    )
+    .json();
+    let ids = v["tokens"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tokens: {v}"))
+        .iter()
+        .map(|t| t.as_u64().expect("an id"))
+        .collect();
+    (ids, v)
+}
+
+/// A drafting engine's greedy ids are the plain engine's, each prompt from a
+/// reset cache and again as a continuation that keeps all but its last id;
+/// `timings` carry the draft's counts, a part of its proposals kept, and
+/// `/metrics` their sums.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_draft_gives_the_plain_ids() {
+    let plain = start(4096);
+    let drafted = common::start_with(Box::new(serve::DraftMock::new(4096)));
+    let (mut proposed, mut accepted) = (0, 0);
+    for p in DRAFT_PROMPTS {
+        let (want, _) = drafted_ids(plain, &json!(p), 40, false);
+        let (got, v) = drafted_ids(drafted, &json!(p), 40, false);
+        assert_eq!(got, want, "{p:?}: {v}");
+        let t = &v["timings"];
+        let (n, a) = (t["draft_n"].as_u64(), t["draft_n_accepted"].as_u64());
+        let (n, a) = n
+            .zip(a)
+            .unwrap_or_else(|| panic!("{p:?}: no draft counts: {t}"));
+        assert!(0 < a && a < n, "{p:?}: {t}");
+        assert_eq!(t["predicted_n"], json!(got.len()), "{t}");
+        (proposed, accepted) = (proposed + n, accepted + a);
+        let prompt_ids =
+            post(drafted, "/tokenize", &json!({"content": p})).json()["tokens"].clone();
+        let mut cont: Vec<Value> = prompt_ids.as_array().expect("ids").clone();
+        cont.extend(got.iter().map(|&id| json!(id)));
+        let (fresh, _) = drafted_ids(plain, &json!(cont), 16, false);
+        let (warm, v) = drafted_ids(drafted, &json!(cont), 16, true);
+        assert_eq!(warm, fresh, "{p:?} continued: {v}");
+        assert_eq!(v["timings"]["cache_n"], json!(cont.len() - 1), "{v}");
+        let t = &v["timings"];
+        (proposed, accepted) = (
+            proposed + t["draft_n"].as_u64().unwrap_or(0),
+            accepted + t["draft_n_accepted"].as_u64().unwrap_or(0),
+        );
+    }
+    let m = get(drafted, "/metrics").body;
+    assert_eq!(
+        metric(&m, "spec_decode_num_draft_tokens_total"),
+        proposed as f64
+    );
+    assert_eq!(
+        metric(&m, "spec_decode_num_accepted_tokens_total"),
+        accepted as f64
+    );
+    let v = drafted_ids(plain, &json!(DRAFT_PROMPTS[0]), 8, false).1;
+    assert!(
+        v["timings"].get("draft_n").is_none(),
+        "a plain engine drafts nothing: {v}"
+    );
+    let e = get(drafted, "/props").json()["engine"].clone();
+    assert_eq!(
+        e["draft"],
+        json!({"model": "mock", "n_max": 1, "kind": "mock"}),
+        "{e}"
+    );
+}
+
+/// Near the context's end a pass that would pass it is not run: the positions
+/// left take one step each, so the drafting engine's ids end where the plain
+/// engine's do. Six contexts in a row put the end at every phase of the
+/// mock's three-pass draft.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_draft_stops_at_the_plain_context_end() {
+    for ctx in 40..46 {
+        let plain = start(ctx);
+        let drafted = common::start_with(Box::new(serve::DraftMock::new(ctx)));
+        let p = json!(DRAFT_PROMPTS[0]);
+        let (want, w) = drafted_ids(plain, &p, 100, false);
+        let (got, v) = drafted_ids(drafted, &p, 100, false);
+        assert_eq!(got, want, "ctx {ctx}: {v}");
+        assert_eq!(w["truncated"], true, "{w}");
+        assert_eq!(v["truncated"], true, "{v}");
+    }
+}
+
+/// What a draft's pass cannot serve — sampling, and a banned end-of-generation
+/// id — is a 400 naming the field, llama-server's default temperature
+/// included; the server serves the next request.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_draft_refuses_what_needs_the_logits() {
+    let addr = common::start_with(Box::new(serve::DraftMock::new(4096)));
+    let cases = [
+        (json!({"prompt": "abc", "n_predict": 4}), "temperature 0.8"),
+        (
+            json!({"prompt": "abc", "n_predict": 4, "temperature": 0.5}),
+            "temperature 0.5",
+        ),
+        (
+            json!({"prompt": "abc", "n_predict": 4, "temperature": 0, "ignore_eos": true}),
+            "ignore_eos",
+        ),
+    ];
+    for (body, field) in cases {
+        let r = post(addr, "/completion", &body);
+        assert_error(&r, 400, "invalid_request_error", field);
+        assert!(r.body.contains("with a draft is not built"), "{}", r.body);
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": body.get("temperature").cloned().unwrap_or(Value::Null),
+                "ignore_eos": body.get("ignore_eos").cloned().unwrap_or(json!(false)),
+            }),
+        );
+        assert_error(&r, 400, "invalid_request_error", field);
+    }
+    let (ids, _) = drafted_ids(addr, &json!("abcabc"), 4, true);
+    assert_eq!(ids.len(), 4);
+}

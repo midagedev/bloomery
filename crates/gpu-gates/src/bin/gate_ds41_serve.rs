@@ -2,6 +2,7 @@
 //! driven over HTTP, as one process under the GPU gate lock.
 //!
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
+//!                     [--plain <the plain run's --dir>]
 //!
 //! Starts the server beside this binary (`--port 0 --place gate`), reads its
 //! address from its stderr, waits for `/health`, then checks:
@@ -68,7 +69,33 @@
 //!   `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for. Logs and the raw stream go to `--dir`.
+//! waited for. Logs and the raw stream go to `--dir`, the first
+//! `/completion`'s ids to `completion.ids` in it, and the greedy ids of the
+//! probe — [`DRAFT_PREDICT`] ids after a long document, a prompt whose
+//! continuation both keeps and rejects DSpark proposals — to `probe.ids`.
+//!
+//! With `--plain`, under `BLOOMERY_DRAFT=dspark` (refused otherwise), the gate
+//! checks the server's DSpark draft instead, and nothing above:
+//!
+//! - `/props`' `engine.draft`: kind `dspark`, the file `$BLOOMERY_DSPARK_MODEL`
+//!   names (its base name as `model`, the path as `path`), `n_max` 1, and the
+//!   device `GPU<n>` of the card `BLOOMERY_DSPARK_CARD` names, whose placement
+//!   row holds the class `draft`; the target's card and host rows are still
+//!   the plan's bytes;
+//! - `/completion` of `--prompt` at temperature 0: its ids are the plain run's
+//!   (`completion.ids` in `--plain`, the plain run's directory) and
+//!   `generate_ds41`'s, and its `timings` carry `draft_n` above 0 and
+//!   `draft_n_accepted` at most that; the probe's ids are the plain run's
+//!   (`probe.ids`), over passes that kept a proposal and passes that did not;
+//! - a request that samples (llama-server's default temperature) or sets
+//!   `ignore_eos` is a 400 naming the field, and the server serves on;
+//! - prefix reuse under the draft, each request's ids those of the same prompt
+//!   with `cache_prompt: false`: a continuation of what the cache holds keeps
+//!   all but its last id (the draft follows); a long prompt cut back inside
+//!   its generated ids keeps no more than its shared prefix less the draft's
+//!   window, and more than none; a long conversation put back from the prompt
+//!   cache after another one keeps the same bound;
+//! - `/metrics`' `spec_decode_num_draft_tokens_total` is above 0.
 //!
 //! The server inherits this binary's environment, so the levers it acts on
 //! are the server's (`serve_levers::ACTS_ON`): one the server would refuse is
@@ -92,10 +119,15 @@ fn main() -> std::process::ExitCode {
 mod serve_levers;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_dspark.rs"]
+mod dspark;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
@@ -105,7 +137,15 @@ mod gate {
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
 
-    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>";
+    use crate::dspark;
+
+    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir>]";
+    /// Where the first `/completion`'s ids go in `--dir`, for the draft run.
+    const COMPLETION_IDS: &str = "completion.ids";
+    /// Where the probe's ids go in `--dir`, for the draft run.
+    const PROBE_IDS: &str = "probe.ids";
+    /// The draft run's greedy requests' length: long enough for several passes.
+    const DRAFT_PREDICT: usize = 32;
     /// The server's arguments after its path; `/props` must echo them.
     const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
@@ -257,10 +297,13 @@ mod gate {
         prompt: String,
         ids: Vec<u32>,
         dir: PathBuf,
+        /// The plain run's `--dir`: the draft run.
+        plain: Option<PathBuf>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
+        let mut plain = None;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -271,6 +314,7 @@ mod gate {
                 "--prompt" => prompt = Some(v),
                 "--ids" => ids = Some(parse_ids(&v)?),
                 "--dir" => dir = Some(PathBuf::from(v)),
+                "--plain" => plain = Some(PathBuf::from(v)),
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
@@ -280,6 +324,7 @@ mod gate {
                 prompt,
                 ids,
                 dir,
+                plain,
             }),
             _ => Err(USAGE.into()),
         }
@@ -872,6 +917,310 @@ mod gate {
         Ok(ok)
     }
 
+    /// `ids` agree with `reference`, a run that did not stop at the
+    /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
+    /// ending there.
+    fn agree(ids: &[u32], stop: &str, reference: &[u32]) -> bool {
+        match stop {
+            "eos" => !ids.is_empty() && reference.starts_with(ids),
+            _ => ids == reference,
+        }
+    }
+
+    /// A greedy `/completion` of `prompt` ([`DRAFT_PREDICT`] ids, stopping at
+    /// the end-of-generation id): its ids, `cache_n` when it and `prompt_n`
+    /// add up to the prompt, and its timings.
+    fn drafted_run(
+        url: &dyn Fn(&str) -> String,
+        what: &str,
+        prompt: &[u32],
+        cache: bool,
+    ) -> Result<(Vec<u32>, Option<usize>, Value), GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": DRAFT_PREDICT, "temperature": 0,
+            "return_tokens": true, "cache_prompt": cache,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&body), false)?;
+        let v = json_of("/completion", st, &body)?;
+        let ids = ids_of(&v["tokens"]);
+        let t = v["timings"].clone();
+        println!(
+            "{what}: prompt {} ids cache_prompt={cache}: cache_n={} prompt_n={} draft_n={} \
+             draft_n_accepted={} tokens {ids:?}",
+            prompt.len(),
+            t["cache_n"],
+            t["prompt_n"],
+            t["draft_n"],
+            t["draft_n_accepted"],
+        );
+        let counted = as_count(&t["cache_n"])
+            .zip(as_count(&t["prompt_n"]))
+            .filter(|(c, n)| c + n == prompt.len());
+        Ok((ids, counted.map(|(c, _)| c), t))
+    }
+
+    /// The draft run (module header), on a server started with this
+    /// process's `BLOOMERY_DRAFT=dspark`.
+    fn drafted(a: &Args, plain: &Path, levers: &PlanLevers) -> Result<(), GateError> {
+        let reference = gen_tokens(&a.gen_log)?;
+        let read_ids = |name: &str| -> Result<Vec<u32>, GateError> {
+            let path = plain.join(name);
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(serde_json::from_str(&text)?)
+        };
+        let plain_ids = read_ids(COMPLETION_IDS)?;
+        let plain_probe = read_ids(PROBE_IDS)?;
+        let (_, hp) = dspark::draft_hparams()?;
+        let draft_path = dspark::draft_path()?;
+        let draft_card = dspark::draft_card()?;
+        let draft_device = format!("GPU{}", nvidia_smi_index(draft_card)?);
+        println!(
+            "draft {} on {draft_card} ({draft_device}), window {}",
+            draft_path.display(),
+            hp.window
+        );
+        std::fs::create_dir_all(&a.dir)?;
+        let err_log = a.dir.join("server.err");
+        let mut served = Served::spawn(&SERVER_ARGS, &a.dir)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        println!("server listening on {addr}");
+        let mut ok = true;
+        ok &= drafted_props(&url, levers, &draft_path, &draft_device)?;
+
+        let completion = json!({
+            "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
+        let c1 = json_of("/completion", st, &body)?;
+        let ids = ids_of(&c1["tokens"]);
+        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let t = &c1["timings"];
+        println!("completion tokens {ids:?} stop_type={stop}");
+        println!("plain server     {plain_ids:?}");
+        println!("generate_ds41    {reference:?}");
+        println!("completion timings {t}");
+        check(
+            &mut ok,
+            "draft_completion_ids_are_the_plain_servers",
+            ids == plain_ids,
+        );
+        check(
+            &mut ok,
+            "draft_completion_ids_are_generate_ds41",
+            agree(&ids, &stop, &reference),
+        );
+        let (n, acc) = (as_count(&t["draft_n"]), as_count(&t["draft_n_accepted"]));
+        check(
+            &mut ok,
+            "draft_timings_carry_the_drafts_counts",
+            n.zip(acc).is_some_and(|(n, acc)| n > 0 && acc <= n),
+        );
+        let (probe, _, t) = drafted_run(&url, "draft probe", &probe_prompt(&url)?, false)?;
+        println!("plain probe      {plain_probe:?}");
+        println!("probe timings {t}");
+        check(
+            &mut ok,
+            "draft_probe_ids_are_the_plain_servers",
+            probe.len() == DRAFT_PREDICT && probe == plain_probe,
+        );
+        let (n, acc) = (as_count(&t["draft_n"]), as_count(&t["draft_n_accepted"]));
+        check(
+            &mut ok,
+            "draft_probe_kept_and_rejected_proposals",
+            n.zip(acc).is_some_and(|(n, acc)| 0 < acc && acc < n),
+        );
+
+        for (body, field) in [
+            (json!({"prompt": a.prompt, "n_predict": 4}), "temperature"),
+            (
+                json!({"prompt": a.prompt, "n_predict": 4, "temperature": 0, "ignore_eos": true}),
+                "ignore_eos",
+            ),
+        ] {
+            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            println!("refused {field}: HTTP {st} {}", v["error"]);
+            check(
+                &mut ok,
+                &format!("draft_refuses_{field}"),
+                st == 400
+                    && v["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with(field) && m.contains("with a draft")),
+            );
+        }
+        let (st, body) = curl(&url("/health"), None, false)?;
+        check(
+            &mut ok,
+            "draft_health_after_the_400s",
+            st == 200 && body.contains("\"ok\""),
+        );
+
+        ok &= drafted_reuse(&url, &a.ids, hp.window)?;
+
+        let (st, m) = curl(&url("/metrics"), None, false)?;
+        let drafted_total = m.lines().find_map(|l| {
+            l.strip_prefix("llamacpp:spec_decode_num_draft_tokens_total ")
+                .and_then(|v| v.parse::<f64>().ok())
+        });
+        println!("metrics spec_decode_num_draft_tokens_total {drafted_total:?}");
+        check(
+            &mut ok,
+            "draft_metrics_count_the_drafts",
+            st == 200 && drafted_total.is_some_and(|v| v > 0.0),
+        );
+
+        println!("server stopped: {}", served.stop()?);
+        if ok {
+            println!("gate-gpu-ds41-serve draft: PASS");
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
+    }
+
+    /// A chat of a long system prompt, a long first message, a short reply
+    /// and `last`.
+    fn long_chat(last: &str) -> Value {
+        json!([
+            {"role": "system", "content": SYSTEM_LINE.repeat(SYSTEM_REPEAT)},
+            {"role": "user", "content": LONG_USER_LINE.repeat(LONG_USER_REPEAT)},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": last},
+        ])
+    }
+
+    /// The probe's prompt: [`long_chat`]'s rendered ids in reverse, whose
+    /// greedy continuation runs [`DRAFT_PREDICT`] ids with no end-of-generation
+    /// id and both keeps and rejects DSpark proposals.
+    fn probe_prompt(url: &dyn Fn(&str) -> String) -> Result<Vec<u32>, GateError> {
+        let mut ids = rendered(url, &long_chat(TURN3), &json!({}))?;
+        ids.reverse();
+        Ok(ids)
+    }
+
+    /// `/props`' `engine.draft` and the draft's placement row (module header).
+    fn drafted_props(
+        url: &dyn Fn(&str) -> String,
+        levers: &PlanLevers,
+        draft_path: &Path,
+        draft_device: &str,
+    ) -> Result<bool, GateError> {
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let e = json_of("/props", st, &body)?["engine"].clone();
+        println!("props engine {e}");
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
+        let card = plan.cards.first().ok_or("the gate's plan has no card")?;
+        let card_bytes = card.dense_bytes + card.expert_bytes;
+        let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;
+        let devices = e["placement"]["devices"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let class = |d: &Value, c: &str| d["classes"][c].as_u64();
+        let row = |name: &str| devices.iter().find(|d| d["device"] == name).cloned();
+        let draft_row = row(draft_device).unwrap_or(Value::Null);
+        let target = devices.first().cloned().unwrap_or(Value::Null);
+        let draft_bytes = class(&draft_row, "draft").unwrap_or(0);
+        let target_bytes = target["bytes"].as_u64().unwrap_or(0);
+        let own = if target["device"] == draft_device {
+            draft_bytes
+        } else {
+            0
+        };
+        let file = draft_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        let mut ok = true;
+        check(
+            &mut ok,
+            "props_engine_draft",
+            e["draft"]["kind"] == "dspark"
+                && e["draft"]["model"] == json!(file)
+                && e["draft"]["path"] == json!(draft_path.display().to_string())
+                && e["draft"]["n_max"] == 1
+                && e["draft"]["device"] == draft_device,
+        );
+        check(
+            &mut ok,
+            "props_engine_draft_row",
+            draft_bytes > 0
+                && devices.last().is_some_and(|d| {
+                    d["device"] == "CPU" && d["bytes"].as_u64() == Some(host_bytes)
+                })
+                && target_bytes == card_bytes + own,
+        );
+        Ok(ok)
+    }
+
+    /// Prefix reuse under the draft (module header).
+    fn drafted_reuse(
+        url: &dyn Fn(&str) -> String,
+        ids: &[u32],
+        window: usize,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        // A continuation: the draft follows the target, every position kept.
+        let (g1, _, _) = drafted_run(url, "draft continue base", ids, false)?;
+        let cont: Vec<u32> = ids.iter().chain(&g1).copied().collect();
+        let (g2, c2, _) = drafted_run(url, "draft continue warm", &cont, true)?;
+        let (g3, c3, _) = drafted_run(url, "draft continue fresh", &cont, false)?;
+        check(
+            &mut ok,
+            "draft_continuation_cache_n",
+            c2 == Some(cont.len() - 1),
+        );
+        check(
+            &mut ok,
+            "draft_continuation_ids_are_fresh",
+            g2 == g3 && c3 == Some(0),
+        );
+        // Two chats that share a long first message and differ in their
+        // second: the second chat's cut falls a window before the prefix they
+        // share, which the cut rule brings to the first message's call start.
+        let none = json!({});
+        let (pa, pb) = (
+            rendered(url, &long_chat(TURN2), &none)?,
+            rendered(url, &long_chat(TURN3), &none)?,
+        );
+        let bound = common(&pa, &pb).saturating_sub(window);
+        println!(
+            "draft chats of {} and {} ids share {}: a cut keeps at most {bound}",
+            pa.len(),
+            pb.len(),
+            common(&pa, &pb)
+        );
+        drafted_run(url, "draft cut base", &pa, true)?;
+        let (b1, cb, _) = drafted_run(url, "draft cut warm", &pb, true)?;
+        let (b2, _, _) = drafted_run(url, "draft cut fresh", &pb, false)?;
+        check(
+            &mut ok,
+            "draft_cut_keeps_a_window_less",
+            cb.is_some_and(|c| c > 0 && c <= bound),
+        );
+        check(&mut ok, "draft_cut_ids_are_fresh", b1 == b2);
+        // The second chat put back from the prompt cache after another prompt:
+        // the draft starts over there too.
+        let other = probe_prompt(url)?;
+        drafted_run(url, "draft other", &other, true)?;
+        let bound = pb.len() - 1 - window;
+        let (r1, cr, _) = drafted_run(url, "draft resume warm", &pb, true)?;
+        check(
+            &mut ok,
+            "draft_resume_keeps_a_window_less",
+            cr.is_some_and(|c| c > 0 && c <= bound),
+        );
+        check(&mut ok, "draft_resume_ids_are_fresh", r1 == b2);
+        Ok(ok)
+    }
+
     fn check(ok: &mut bool, name: &str, pass: bool) {
         println!("check {name}: {}", verdict(pass));
         *ok &= pass;
@@ -881,6 +1230,17 @@ mod gate {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
+        match (&a.plain, levers.draft()) {
+            (Some(plain), Some("dspark")) => return drafted(&a, plain, &place),
+            (None, None) => {}
+            (plain, draft) => {
+                return Err(format!(
+                    "--plain {plain:?} with BLOOMERY_DRAFT={draft:?}: the draft run takes both, \
+                     BLOOMERY_DRAFT=dspark, and the plain run neither"
+                )
+                .into());
+            }
+        }
         let reference = gen_tokens(&a.gen_log)?;
         let rules = file_rules()?;
         println!(
@@ -917,6 +1277,9 @@ mod gate {
             c1["content"]
         );
         println!("generate_ds41    {reference:?}");
+        std::fs::write(a.dir.join(COMPLETION_IDS), serde_json::to_string(&first)?)?;
+        let (probe, _, _) = drafted_run(&url, "probe", &probe_prompt(&url)?, false)?;
+        std::fs::write(a.dir.join(PROBE_IDS), serde_json::to_string(&probe)?)?;
         let matches = match stop.as_str() {
             // The server stopped at the end-of-generation id, which it returns.
             "eos" => !first.is_empty() && reference.starts_with(&first),

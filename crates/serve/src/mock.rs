@@ -16,13 +16,20 @@
 //! [`MockEngine::failing_at`] makes the `k`-th `next` of the engine's life an
 //! error, for the crash-path gate.
 //!
+//! [`DraftMock`] is the same engine behind a draft of one id: each pass
+//! verifies a proposal after `last`, the mock's own next token on two passes of
+//! three and another id on the third, and keeps what the target agrees with.
+//!
 //! Its saved state is its context: [`MOCK_STATE`], a u32 version, a u64 count
 //! and the ids, little-endian.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use crate::engine::{Decoder, Engine, EngineError, EngineProps, SavedState, StateError, Tokenizer};
+use crate::engine::{
+    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, SavedState, StateError,
+    Tokenizer,
+};
 use crate::slotfile;
 
 /// Special strings, in id order. Longest-match wins on encode.
@@ -281,6 +288,100 @@ impl Engine for MockEngine {
             n_tokens: n,
             n_bytes: MOCK_STATE_HEAD + 4 * n as u64,
         })
+    }
+}
+
+/// [`MockEngine`] with a draft of one id a pass (see the module header). Its
+/// passes keep the target's argmax, so its greedy ids are the plain mock's.
+pub struct DraftMock {
+    inner: MockEngine,
+    passes: usize,
+}
+
+impl DraftMock {
+    /// A drafting mock with room for `ctx_max` positions.
+    #[must_use]
+    pub fn new(ctx_max: usize) -> Self {
+        DraftMock {
+            inner: MockEngine::new(ctx_max),
+            passes: 0,
+        }
+    }
+}
+
+impl Engine for DraftMock {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.inner.tokenizer()
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.inner.prefill(ids)
+    }
+
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.inner.next(last, logits_out)
+    }
+
+    /// Row 0 runs `last`; a proposal the target's argmax agrees with runs row
+    /// 1 on it, and both rows' argmax are kept.
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.passes += 1;
+        let first = self.inner.next(last, None)?;
+        let n_vocab =
+            u32::try_from(MockTokenizer.n_vocab()).expect("the mock's vocabulary fits u32");
+        let proposal = if self.passes.is_multiple_of(3) {
+            (first + 1) % n_vocab
+        } else {
+            first
+        };
+        out.push(first);
+        if proposal != first {
+            return Ok(Drafted {
+                proposed: 1,
+                accepted: 0,
+            });
+        }
+        out.push(self.inner.next(proposal, None)?);
+        Ok(Drafted {
+            proposed: 1,
+            accepted: 1,
+        })
+    }
+
+    fn advance_rows(&self) -> usize {
+        2
+    }
+
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.inner.reset()
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        self.inner.keepable(n)
+    }
+
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.inner.cut(n)
+    }
+
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+
+    fn props_engine(&self) -> EngineProps {
+        EngineProps {
+            draft: Some(DraftProps {
+                model: "mock".to_owned(),
+                n_max: Some(1),
+                kind: Some("mock".to_owned()),
+                ..DraftProps::default()
+            }),
+            ..self.inner.props_engine()
+        }
     }
 }
 

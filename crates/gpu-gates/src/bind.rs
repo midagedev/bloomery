@@ -1,24 +1,26 @@
-//! The server's engine over a [`Generator`]: [`Ds41Engine`] implements
+//! The server's engine over a [`Seat`]: [`Ds41Engine`] implements
 //! `serve::Engine`, [`Vocab`] implements `serve::Tokenizer` over the file's
 //! own vocabulary, and [`sampler_factory`] builds each request's sampler from
 //! the sampler crate.
 //!
-//! The generator lives on one thread of its own, for the whole run. The server
-//! calls its engine from whichever connection thread holds the slot; the
-//! model's device state and the pinned dispatcher slot belong to the thread
-//! that opened them, so every step runs on that thread and the engine is a
-//! handle that sends it commands. The opener comes in as a closure because
-//! this library does not name a device crate (see [`crate::generate`]).
+//! The seat — the model, its draft if one runs, and the body's rules — lives
+//! on one thread of its own, for the whole run. The server calls its engine
+//! from whichever connection thread holds the slot; the model's device state
+//! and the pinned dispatcher slot belong to the thread that opened them, so
+//! every step runs on that thread and the engine is a handle that sends it
+//! commands. The opener comes in as a closure, and the seat as a trait the
+//! binary implements, because this library does not name a device crate (see
+//! [`crate::generate`]) or the session crate.
 //!
 //! How long a prefix of the cache can be kept, and why no longer, is the
-//! body's rule, which the opener hands in beside the model
-//! ([`Ds41Engine::spawn`]'s [`BodyOps`]) and the engine thread answers
-//! ([`Ds41Engine`]'s `keepable` and `keep_limit`); so are the prompt feed, where
-//! a prompt call is cut, and the state the server's prompt cache saves and
-//! puts back ([`BodyOps::snapshot`], [`BodyOps::resume`]). How far the positions
-//! go is the lesser of the cache and the positions the body computes the model
-//! at (`spawn`'s `defined`): the server refuses a request past it, so a client's
-//! long prompt or `max_tokens` never reaches the body's refusal, which is fatal.
+//! seat's rule, which the engine thread answers ([`Ds41Engine`]'s `keepable`
+//! and `keep_limit`); so are the prompt feed, a pass of the draft
+//! ([`Seat::pass`]), where a prompt call is cut, and the state the server's
+//! prompt cache saves and puts back ([`Seat::snapshot`], [`Seat::resume`]). How
+//! far the positions go is the lesser of the cache and the positions the body
+//! computes the model at (`spawn`'s `defined`): the server refuses a request
+//! past it, so a client's long prompt or `max_tokens` never reaches the body's
+//! refusal, which is fatal.
 //!
 //! A sampled token's logits cross to the calling thread in one buffer the
 //! engine owns: lent with each `Next` that wants them, filled on the engine
@@ -35,18 +37,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use bloomery_gpu::model::Rollback;
-use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::{
-    CacheNote, Decoder, DeviceProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
-    SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
+    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
+    PlacementProps, SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
 };
 
 use crate::GateError;
-use crate::generate::Generator;
 
 /// The file's vocabulary as the server reads it.
 pub struct Vocab {
@@ -379,6 +378,11 @@ enum Cmd {
         last: u32,
         logits: Option<Vec<f32>>,
     },
+    /// A pass from `last`, its kept tokens into the caller's buffer.
+    Pass {
+        last: u32,
+        out: Vec<u32>,
+    },
     Reset,
     /// Take back the positions from this one on.
     Rollback(u32),
@@ -408,6 +412,9 @@ enum Extra {
     Splits(Vec<usize>),
     /// A `Save`'s state.
     Saved(Arc<dyn Saved>),
+    /// A `Pass`'s buffer, holding its kept tokens on success, and what its
+    /// draft proposed and kept.
+    Pass(Vec<u32>, Drafted),
 }
 
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
@@ -421,35 +428,71 @@ struct Reply {
     extra: Extra,
 }
 
-/// What the engine thread asks the body besides a step ([`Ds41Engine::spawn`]).
-pub trait BodyOps<B: Rollback>: Send + 'static {
+/// What the engine thread runs every command on: the model standing at a
+/// position, the draft that follows it if one runs, and the body's rules
+/// ([`Ds41Engine::spawn`] opens it on the thread). A failed call says what
+/// failed; the thread adds the command and the position.
+pub trait Seat: 'static {
+    /// The position the next fed id lands in.
+    fn pos(&self) -> usize;
+    /// The positions the caches were sized for: `pos` never passes it.
+    fn ctx_max(&self) -> usize;
+    /// The body's prompt feed of `ids` from `pos` (a batched body's batch, or
+    /// one step per id), the draft fed as the call hands its rows over; the
+    /// argmax after the last.
+    fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError>;
+    /// One step on `last` at `pos`, the draft fed its row; the argmax after it.
+    fn step(&mut self, last: u32) -> Result<u32, GateError>;
+    /// The head's logits after the last step into `row` (`n_vocab` f32).
+    fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError>;
+    /// One pass from `last` (`serve::Engine::advance`): the kept tokens into
+    /// `out`, and what the draft proposed and kept. Without a draft, one step.
+    fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+        out.push(self.step(last)?);
+        Ok(Drafted::default())
+    }
+    /// The most positions [`Seat::pass`] runs.
+    fn pass_rows(&self) -> usize {
+        1
+    }
+    /// Empty caches at position 0.
+    fn reset(&mut self) -> Result<(), GateError>;
+    /// Take back the positions from `pos` on; `pos` is one [`Seat::keep`]
+    /// granted.
+    fn rollback(&mut self, pos: u32) -> Result<(), GateError>;
     /// The longest prefix of at most `n` positions (no more than the model
-    /// holds) the model's rollback keeps, and the rule that kept less.
-    fn keep(&self, m: &GpuModel<B>, n: usize) -> (usize, Option<String>);
-    /// The body's prompt feed: the ids from where the model stands, the
-    /// argmax after the last (a batched body's batch, or `GpuModel::step`).
-    fn prefill(&self, m: &mut GpuModel<B>, ids: &[u32]) -> Result<u32, GpuError>;
+    /// holds) a rollback keeps and the next request can run from, and the
+    /// rule that kept less.
+    fn keep(&self, n: usize) -> (usize, Option<String>);
     /// Where to cut a prompt call of `first .. end` (from where the model
     /// stands) so the `marks` stay keepable (`serve::Engine::prefill_splits`).
-    fn splits(&self, m: &GpuModel<B>, first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
-    /// The model's sequence state as a value the server's prompt cache holds.
-    fn snapshot(&self, m: &mut GpuModel<B>) -> Result<Arc<dyn Saved>, GpuError>;
-    /// Replace the model's sequence state with `state`, which
-    /// [`BodyOps::snapshot`] took of this model.
-    fn resume(&self, m: &mut GpuModel<B>, state: &dyn Saved) -> Result<(), GpuError>;
+    fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
+    /// The sequence state as a value the server's prompt cache holds.
+    fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError>;
+    /// Replace the sequence state with `state`, which [`Seat::snapshot`] took
+    /// of this seat.
+    fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError>;
+    /// `/props`' `engine` object: `p`, the opener's, with what only the load
+    /// learned (a draft's device and resident bytes). The default adds
+    /// nothing.
+    fn props(&self, p: EngineProps) -> EngineProps {
+        p
+    }
     /// Prints what the server's prompt cache did, as the binary's records.
     fn note(note: &CacheNote)
     where
         Self: Sized;
 }
 
-/// `serve::Engine` over a [`Generator`] that lives on its own thread. The
+/// `serve::Engine` over a [`Seat`] that lives on its own thread. The
 /// position is the model's alone: every question about it goes to the thread.
 pub struct Ds41Engine {
     link: Link,
     worker: Option<JoinHandle<()>>,
     vocab: Arc<Vocab>,
     ctx_max: usize,
+    /// [`Seat::pass_rows`].
+    rows: usize,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -467,17 +510,16 @@ struct Link {
 }
 
 impl Ds41Engine {
-    /// Start the engine thread, open the model on it with `open` (which
-    /// writes the load lines), and wait until it is loaded. `ops` is what the
-    /// thread asks the body besides a step ([`BodyOps`]). `defined` is how
+    /// Start the engine thread, open the seat on it with `open` (which
+    /// writes the load lines), and wait until it is loaded. `defined` is how
     /// many positions the body computes the model at; the engine serves the
     /// lesser of it and the cache. `card` names the device in a crash report;
     /// `props` is what `/props` reports about the engine ([`model_props`],
-    /// [`placement_props`]); `cache_ram` is the server's prompt cache budget
+    /// [`placement_props`]), which the seat completes ([`Seat::props`]);
+    /// `cache_ram` is the server's prompt cache budget
     /// (`serve::Engine::cache_ram`).
-    pub fn spawn<B, F, O>(
+    pub fn spawn<S, F>(
         open: F,
-        ops: O,
         defined: usize,
         vocab: Arc<Vocab>,
         card: String,
@@ -485,13 +527,12 @@ impl Ds41Engine {
         cache_ram: u64,
     ) -> Result<Ds41Engine, GateError>
     where
-        B: Rollback + 'static,
-        F: FnOnce() -> Result<Generator<B>, GateError> + Send + 'static,
-        O: BodyOps<B>,
+        S: Seat,
+        F: FnOnce() -> Result<S, GateError> + Send + 'static,
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
-        let (opened, loaded) = mpsc::channel::<Result<usize, String>>();
+        let (opened, loaded) = mpsc::channel::<Result<(usize, usize, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -503,13 +544,16 @@ impl Ds41Engine {
                         return;
                     }
                 };
-                if opened.send(Ok(g.ctx_max())).is_err() {
+                if opened
+                    .send(Ok((g.ctx_max(), g.pass_rows(), g.props(props))))
+                    .is_err()
+                {
                     return;
                 }
                 for cmd in cmds {
                     let (result, logits, extra) = match cmd {
                         Cmd::Keep(n) => {
-                            let (k, why) = ops.keep(g.model(), n.min(g.pos()));
+                            let (k, why) = g.keep(n.min(g.pos()));
                             (
                                 u32::try_from(k).map_err(|_| {
                                     format!("a kept prefix of at most {n} passes u32")
@@ -518,12 +562,22 @@ impl Ds41Engine {
                                 Extra::Why(why),
                             )
                         }
-                        Cmd::Splits { first, end, marks } => (
-                            Ok(0),
-                            None,
-                            Extra::Splits(ops.splits(g.model(), first, end, &marks)),
-                        ),
-                        Cmd::Save => match ops.snapshot(g.model_mut()) {
+                        Cmd::Splits { first, end, marks } => {
+                            (Ok(0), None, Extra::Splits(g.splits(first, end, &marks)))
+                        }
+                        Cmd::Pass { last, mut out } => {
+                            let at = g.pos();
+                            out.clear();
+                            match pass(&mut g, last, &mut out) {
+                                Ok(d) => (Ok(0), None, Extra::Pass(out, d)),
+                                Err(e) => (
+                                    Err(format!("pass at position {at}: {e}")),
+                                    None,
+                                    Extra::Pass(out, Drafted::default()),
+                                ),
+                            }
+                        }
+                        Cmd::Save => match g.snapshot() {
                             Ok(s) => (Ok(0), None, Extra::Saved(s)),
                             Err(e) => (
                                 Err(format!("snapshot at position {}: {e}", g.pos())),
@@ -532,14 +586,14 @@ impl Ds41Engine {
                             ),
                         },
                         Cmd::Resume(state) => (
-                            ops.resume(g.model_mut(), &*state).map(|()| 0).map_err(|e| {
+                            g.resume(&*state).map(|()| 0).map_err(|e| {
                                 format!("resume of a state of {} positions: {e}", state.n_tokens())
                             }),
                             None,
                             Extra::None,
                         ),
                         cmd => {
-                            let (result, logits) = serve_cmd(&mut g, cmd, n_vocab, &ops);
+                            let (result, logits) = serve_cmd(&mut g, cmd, n_vocab);
                             (result, logits, Extra::None)
                         }
                     };
@@ -556,8 +610,8 @@ impl Ds41Engine {
                     }
                 }
             })?;
-        let ctx_max = match loaded.recv() {
-            Ok(Ok(c)) => c.min(defined),
+        let (ctx_max, rows, props) = match loaded.recv() {
+            Ok(Ok((c, rows, props))) => (c.min(defined), rows, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -570,10 +624,11 @@ impl Ds41Engine {
             worker: Some(worker),
             vocab,
             ctx_max,
+            rows,
             card,
             props,
             cache_ram,
-            note: O::note,
+            note: S::note,
         })
     }
 }
@@ -618,43 +673,93 @@ impl Link {
         }
         Ok(arg)
     }
+
+    /// A pass into the caller's `out`, which crosses to the engine thread and
+    /// back; it holds the kept tokens on success.
+    fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        let reply = self.ask(Cmd::Pass {
+            last,
+            out: std::mem::take(out),
+        })?;
+        match reply.extra {
+            Extra::Pass(kept, d) => {
+                *out = kept;
+                reply.result.map(|_| d).map_err(EngineError)
+            }
+            _ => Err(EngineError(
+                "the engine thread answered a pass with no tokens".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Whether a feed of `n` ids may start at `g`'s position: at least one, and
+/// all inside the context.
+fn check_feed<S: Seat>(g: &S, n: usize) -> Result<(), String> {
+    if n == 0 {
+        return Err("prefill: no ids to feed".into());
+    }
+    if g.pos() + n > g.ctx_max() {
+        return Err(format!(
+            "prefill: position {} + {n} ids exceed the context {}",
+            g.pos(),
+            g.ctx_max()
+        ));
+    }
+    Ok(())
+}
+
+/// A pass on `g`, refused before it runs when its rows do not fit the
+/// context; one that keeps no token or more than its rows is the seat's
+/// defect, named.
+fn pass<S: Seat>(g: &mut S, last: u32, out: &mut Vec<u32>) -> Result<Drafted, String> {
+    let rows = g.pass_rows();
+    if g.pos() + rows > g.ctx_max() {
+        return Err(format!(
+            "a pass of {rows} rows from position {} passes the context {}",
+            g.pos(),
+            g.ctx_max()
+        ));
+    }
+    let d = g.pass(last, out).map_err(|e| e.to_string())?;
+    if out.is_empty() || out.len() > rows {
+        return Err(format!("a pass of {rows} rows kept {} tokens", out.len()));
+    }
+    Ok(d)
 }
 
 /// One command on the engine thread, and the logits buffer a `Next` was lent,
 /// handed back whatever the result.
-fn serve_cmd<B: Rollback, O: BodyOps<B>>(
-    g: &mut Generator<B>,
+fn serve_cmd<S: Seat>(
+    g: &mut S,
     cmd: Cmd,
     n_vocab: usize,
-    ops: &O,
 ) -> (Result<u32, String>, Option<Vec<f32>>) {
     let at = g.pos();
     let result = match cmd {
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            g.check_feed(ids.len()).map_err(refuse).and_then(|()| {
-                ops.prefill(g.model_mut(), &ids)
-                    .map_err(|e| refuse(e.to_string()))
-            })
+            check_feed(g, ids.len())
+                .map_err(refuse)
+                .and_then(|()| g.prefill(&ids).map_err(|e| refuse(e.to_string())))
         }
         Cmd::Next { last, mut logits } => {
             let arg = next_row(g, last, logits.as_deref_mut(), n_vocab);
             return (arg, logits);
         }
         Cmd::Reset => g
-            .model_mut()
             .reset()
             .map(|()| 0)
             .map_err(|e| format!("reset at position {at}: {e}")),
         Cmd::Rollback(pos) if pos as usize == at => Ok(0),
         Cmd::Rollback(pos) => g
-            .model_mut()
             .rollback(pos)
             .map(|()| 0)
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
-        Cmd::Keep(_) | Cmd::Splits { .. } | Cmd::Save | Cmd::Resume(_) => Err(
-            "a keep, split, save or resume reached the step loop; the engine thread answers it"
+        Cmd::Keep(_) | Cmd::Splits { .. } | Cmd::Save | Cmd::Resume(_) | Cmd::Pass { .. } => Err(
+            "a keep, split, pass, save or resume reached the step loop; the engine thread \
+             answers it"
                 .to_owned(),
         ),
         Cmd::Pos => Ok(0),
@@ -665,13 +770,19 @@ fn serve_cmd<B: Rollback, O: BodyOps<B>>(
 /// One step and, into `row`, its logits. The row is checked here: one of the
 /// wrong length or holding a NaN is the step's error, not the sampler's to
 /// absorb.
-fn next_row<B: Rollback>(
-    g: &mut Generator<B>,
+fn next_row<S: Seat>(
+    g: &mut S,
     last: u32,
     row: Option<&mut [f32]>,
     n_vocab: usize,
 ) -> Result<u32, String> {
     let at = g.pos();
+    if at >= g.ctx_max() {
+        return Err(format!(
+            "step at position {at}: step: the context {} is full",
+            g.ctx_max()
+        ));
+    }
     let arg = g
         .step(last)
         .map_err(|e| format!("step at position {at}: {e}"))?;
@@ -684,8 +795,7 @@ fn next_row<B: Rollback>(
             row.len()
         ));
     }
-    g.model()
-        .logits_into(row)
+    g.logits_into(row)
         .map_err(|e| format!("logits after position {at}: {e}"))?;
     if let Some(i) = row.iter().position(|v| v.is_nan()) {
         return Err(format!("logit {i} is NaN after position {at}"));
@@ -707,6 +817,14 @@ impl Engine for Ds41Engine {
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.link.next(last, logits_out)
+    }
+
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.link.pass(last, out)
+    }
+
+    fn advance_rows(&self) -> usize {
+        self.rows
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {

@@ -42,6 +42,30 @@
 //! the engine holds `BLOOMERY_PREFILL`. The stderr lines named
 //! above are records of the kinds `bloomery_gpu_gates::record` declares;
 //! `--records-schema` prints those kinds and exits.
+//!
+//! The model opens as `generate_ds41`'s does (`app::Loaded`, then
+//! `Loaded::ready`), and `BLOOMERY_DRAFT=lookup|dspark` serves its draft the
+//! same way (`shared/ds41_draft.rs`): the DSpark draft's file is
+//! `$BLOOMERY_DSPARK_MODEL` and its card `BLOOMERY_DSPARK_CARD` (the 3090
+//! when unset), loaded once, its `load draft=dspark` line after the `load`
+//! line, the pair pass captured after the step. Every greedy token after a
+//! request's first then comes out of a pass (`serve::Engine::advance`), and
+//! a request that needs the logits row — `temperature` above 0 (llama-server's
+//! default 0.8 included) or `ignore_eos` — is a 400 naming the field.
+//! `timings` carry `draft_n` and `draft_n_accepted`, `/metrics` their sums,
+//! and `/props`' `engine.draft` names the draft (its kind, file and device),
+//! whose card's placement row holds its resident bytes as the class `draft`.
+//!
+//! The prompt cache under the DSpark draft: the draft keeps no state of its
+//! own worth saving — its window ring is a function of the last
+//! `attention.sliding_window` positions' features, which the target's
+//! prompt call hands over again. A request that continues exactly where the
+//! draft stands keeps every position the target keeps. Any other — a cut, a
+//! saved state put back — starts the draft over, so the target keeps no
+//! position past the request's shared prefix less a window: the prompt call
+//! then carries the window's features to the draft, and the ids are the full
+//! prompt's. The lookup draft rebuilds its n-gram tables from the target's
+//! token history at a request's first token.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -69,27 +93,44 @@ fn main() -> std::process::ExitCode {
 mod serve_levers;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_dspark.rs"]
+mod dspark;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_draft.rs"]
+mod draft;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::any::Any;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Instant;
 
-    use bloomery_gpu::GpuError;
+    use app::arch::deepseek41::{CardDraft, Ds41Cfg};
+    use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, SeqSnapshot};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
+    use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::bind::{
-        BodyOps, Ds41Engine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+        Ds41Engine, Seat, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
     };
-    use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
+    use bloomery_gpu_gates::generate::{Place, mode_name};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{HotList, PlanLevers, workstation};
+    use model::arch::dspark::DraftHparams;
+    use model::placement::{HotList, Machine, Plan, PlanLevers, workstation};
+    use runtime::{Committed, Lookup, Speculative, Target, Want};
     use serve::{
-        CacheNote, EngineProps, FATAL_LINGER, PlacementProps, Saved, ServeError, Server,
-        ServerConfig,
+        CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
+        Saved, ServeError, Server, ServerConfig,
     };
     use tokenizer::Tokenizer;
+
+    use crate::draft::{Draft, open_dspark};
+    use crate::dspark;
 
     const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] [--place a|gate] \
                          [--ctx C] [--alias NAME] [--cache-ram MIB]";
@@ -105,6 +146,9 @@ mod drive {
     /// start: below it the cut's second call costs more than the prefix a
     /// later request keeps saves.
     const SPLIT_MIN: usize = 64;
+
+    /// The class `/props` files the draft's resident bytes under.
+    const DRAFT_CLASS: &str = "draft";
 
     struct Args {
         host: String,
@@ -159,6 +203,12 @@ mod drive {
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
+        let draft = Draft::from_levers(&levers)?;
+        // The draft's file is read before the target's load, which takes a minute.
+        let draft_file = match draft {
+            Draft::Dspark => Some(dspark::draft_hparams()?),
+            Draft::Off | Draft::Lookup => None,
+        };
         let path = ref_model_path()?;
         let vocab =
             Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
@@ -194,50 +244,20 @@ mod drive {
             placement,
             ..EngineProps::default()
         };
-        let want_top_k = inputs.hp.indexer.top_k;
-        let defined = inputs.hp.candidate_free_positions();
-        let n_layer = inputs.hp.n_layer;
-        let open = OpenArgs {
+        let open = SeatArgs {
             place: a.place,
             ctx: a.ctx,
-            mode: StepMode::Graph,
+            cfg,
             pin_main: levers.pin_main(),
+            want_top_k: inputs.hp.indexer.top_k,
+            n_layer: inputs.hp.n_layer,
+            path: path.clone(),
+            draft,
+            draft_file,
         };
         let engine = Ds41Engine::spawn(
-            move || {
-                let mut g = Generator::open(
-                    open,
-                    |file, machine, ctx| body::open(file, machine, ctx, &cfg),
-                    |m: &Deepseek41Model, load: Record| {
-                        let body = m.body("bloomery-serve-ds41")?;
-                        let top_k = body.indexer_top_k();
-                        let shadow = body.shadow_host();
-                        if top_k != want_top_k {
-                            return Err(format!(
-                                "the body selects {top_k} rows per stream, the file's top_k is \
-                                 {want_top_k}: a step past that many visible rows would not be \
-                                 the model's"
-                            )
-                            .into());
-                        }
-                        Ok(load
-                            .u("layers", n_layer)
-                            .u("top_k", top_k)
-                            .w("shadow", "host")
-                            .u("shadow_bytes", shadow.bytes)
-                            .u("unified_addressing", shadow.unified_addressing)
-                            .w("prefill", body.prefill_mode().name()))
-                    },
-                    &mut std::io::stderr(),
-                )?;
-                let mode = g.model_mut().body("bloomery-serve-ds41")?.prefill_mode();
-                if mode == body::PrefillMode::Batch {
-                    body::prepare_prefill(g.model_mut())?;
-                }
-                Ok(g)
-            },
-            V41,
-            defined,
+            move || V41::open(open),
+            inputs.hp.candidate_free_positions(),
             vocab,
             card,
             props,
@@ -295,23 +315,58 @@ mod drive {
 
     const WHAT: &str = "bloomery-serve-ds41";
 
-    /// The V4.1 body's side of the engine thread.
-    struct V41;
+    /// What the engine thread opens the seat with.
+    struct SeatArgs {
+        place: Place,
+        ctx: usize,
+        cfg: body::OpenCfg,
+        pin_main: bool,
+        /// The file's `top_k` and layer count, from its headers.
+        want_top_k: usize,
+        n_layer: usize,
+        path: PathBuf,
+        draft: Draft,
+        draft_file: Option<(Split, DraftHparams)>,
+    }
 
-    /// A body's saved sequence state, as the server's prompt cache holds it.
-    struct Ds41Saved(SeqSnapshot);
+    /// The draft the seat serves, verified by the pair pass.
+    enum Served {
+        Off,
+        /// The lookup, and whether its context is the target's token history
+        /// and the token the target stands before.
+        Lookup(Speculative<Lookup, PAIR_ROWS>, bool),
+        /// Boxed: the draft body is the size of its graphs and buffers.
+        Dspark(Box<Speculative<CardDraft<DraftBody>, PAIR_ROWS>>),
+    }
+
+    /// The V4.1 session on the engine thread, and its draft.
+    struct V41 {
+        s: Session<Body>,
+        /// The positions served (`--ctx`).
+        ctx: usize,
+        draft: Served,
+    }
+
+    /// A body's saved sequence state, as the server's prompt cache holds it,
+    /// and the positions a request after its resume leaves the DSpark draft
+    /// to feed (0 without it).
+    struct Ds41Saved {
+        state: SeqSnapshot,
+        window: usize,
+    }
 
     impl Saved for Ds41Saved {
         fn n_tokens(&self) -> usize {
-            self.0.positions()
+            self.state.positions()
         }
 
         fn n_bytes(&self) -> u64 {
-            self.0.bytes() as u64
+            self.state.bytes() as u64
         }
 
+        /// A resume starts the DSpark draft over: a window less.
         fn keepable(&self, n: usize) -> usize {
-            self.0.keep_point(n)
+            self.state.keep_point(n.saturating_sub(self.window))
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -319,34 +374,218 @@ mod drive {
         }
     }
 
-    impl BodyOps<Body> for V41 {
-        fn keep(&self, m: &Deepseek41Model, n: usize) -> (usize, Option<String>) {
-            match m.body(WHAT) {
-                Ok(b) => {
-                    let (k, why) = b.keep_why(n);
-                    (k, why.map(|w| w.to_string()))
+    impl V41 {
+        /// The session by `a.place` (the `load`, host set and `capture`
+        /// lines), the draft `a.draft` names on it (its `load draft=dspark`
+        /// line before the capture, the pair pass's capture after it), on
+        /// the calling thread, pinned to the dispatcher's cpu slot when asked.
+        fn open(a: SeatArgs) -> Result<V41, GateError> {
+            let pinned = a.pin_main && threads::pool().pin_caller();
+            let t = Instant::now();
+            let file =
+                Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+            let args = app::OpenArgs {
+                place: a.place.name(),
+                machine: a.place.machine(),
+                ctx: a.ctx,
+                mode: StepMode::Graph,
+                cfg: Ds41Cfg {
+                    feed: a.cfg.body.prefill,
+                    open: a.cfg.clone(),
+                    card_timing: false,
+                },
+            };
+            let mut log = Log { a: &a, pinned, t };
+            let mut loaded = Loaded::<Body>::open(file, args, &mut log)?
+                .ok_or("bloomery-serve-ds41: the open planned nothing")?;
+            let spark = match &a.draft_file {
+                Some(file) => {
+                    let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT)?;
+                    load.eprint();
+                    Some(d)
                 }
-                Err(e) => (0, Some(e.to_string())),
+                None => None,
+            };
+            let mut s = loaded.ready(&mut log)?;
+            let draft = match (a.draft, spark) {
+                (Draft::Off, _) => Served::Off,
+                (Draft::Lookup, _) => Served::Lookup(
+                    s.with_draft::<_, PAIR_ROWS>(Lookup::new(), &mut log)?,
+                    false,
+                ),
+                (Draft::Dspark, Some(d)) => {
+                    Served::Dspark(Box::new(s.with_draft::<_, PAIR_ROWS>(d, &mut log)?))
+                }
+                (Draft::Dspark, None) => {
+                    return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
+                }
+            };
+            Ok(V41 {
+                s,
+                ctx: a.ctx,
+                draft,
+            })
+        }
+
+        fn model(&self) -> &Deepseek41Model {
+            self.s.model()
+        }
+
+        /// The DSpark draft's window: the positions a request that starts
+        /// the draft over feeds it before its first proposal.
+        fn window(&self) -> usize {
+            match &self.draft {
+                Served::Dspark(d) => d.draft().window(),
+                Served::Off | Served::Lookup(..) => 0,
             }
         }
 
-        fn prefill(&self, m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
-            match m.body(WHAT)?.prefill_mode() {
-                body::PrefillMode::Batch => body::prefill(m, ids),
-                body::PrefillMode::Steps => m.step(ids),
+        /// The target stands elsewhere than its drafts were fed.
+        fn moved(&mut self) {
+            match &mut self.draft {
+                Served::Off => {}
+                Served::Lookup(_, follows) => *follows = false,
+                Served::Dspark(d) => d.draft_mut().forget(),
             }
+        }
+
+        /// The lookup's context made the target's token history and `next`,
+        /// the token the target stands before, unless it is that already.
+        fn lookup_follows(&mut self, next: u32) -> Result<(), GateError> {
+            let V41 { s, draft, .. } = self;
+            if let Served::Lookup(spec, follows) = draft
+                && !*follows
+            {
+                let l = spec.draft_mut();
+                l.reset();
+                for &id in s.model().body(WHAT)?.history() {
+                    l.push(id);
+                }
+                l.push(next);
+                *follows = true;
+            }
+            Ok(())
+        }
+    }
+
+    /// A pass's draft counts: the proposal's ids, the ones kept.
+    fn drafted(c: Committed) -> Drafted {
+        if c.proposed {
+            Drafted {
+                proposed: c.rows - 1,
+                accepted: c.kept - 1,
+            }
+        } else {
+            Drafted::default()
+        }
+    }
+
+    impl Seat for V41 {
+        fn pos(&self) -> usize {
+            self.s.pos() as usize
+        }
+
+        fn ctx_max(&self) -> usize {
+            self.ctx
+        }
+
+        fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+            match &mut self.draft {
+                Served::Dspark(d) => Ok(d.draft_mut().feed_call(&mut self.s, ids)?),
+                Served::Lookup(_, follows) => {
+                    *follows = false;
+                    Ok(self.s.prompt(ids, Want::Argmax)?.argmax())
+                }
+                Served::Off => Ok(self.s.prompt(ids, Want::Argmax)?.argmax()),
+            }
+        }
+
+        fn step(&mut self, last: u32) -> Result<u32, GateError> {
+            let next = self.s.step(last, Want::Argmax)?.argmax();
+            match &mut self.draft {
+                Served::Lookup(spec, true) => spec.draft_mut().push(next),
+                Served::Dspark(d) => {
+                    runtime::Draft::stepped(d.draft_mut(), &mut self.s, last, next)?;
+                }
+                Served::Lookup(_, false) | Served::Off => {}
+            }
+            self.lookup_follows(next)?;
+            Ok(next)
+        }
+
+        fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
+            Ok(self.model().logits_into(row)?)
+        }
+
+        fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+            self.lookup_follows(last)?;
+            let c = match &mut self.draft {
+                Served::Lookup(spec, _) => runtime::Advance::pass(spec, &mut self.s, last, out)?,
+                Served::Dspark(spec) => {
+                    runtime::Advance::pass(&mut **spec, &mut self.s, last, out)?
+                }
+                Served::Off => {
+                    out.push(self.step(last)?);
+                    return Ok(Drafted::default());
+                }
+            };
+            Ok(drafted(c))
+        }
+
+        fn pass_rows(&self) -> usize {
+            match self.draft {
+                Served::Off => 1,
+                Served::Lookup(..) | Served::Dspark(_) => PAIR_ROWS,
+            }
+        }
+
+        fn reset(&mut self) -> Result<(), GateError> {
+            self.s.reset()?;
+            match &mut self.draft {
+                Served::Off => {}
+                Served::Lookup(_, follows) => *follows = false,
+                Served::Dspark(d) => d.draft_mut().restart()?,
+            }
+            Ok(())
+        }
+
+        fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
+            self.moved();
+            Ok(self.s.model_mut().rollback(pos)?)
+        }
+
+        /// The body's rule; under the DSpark draft, a cut anywhere but where
+        /// the draft stands also leaves the request's prompt call a window.
+        fn keep(&self, n: usize) -> (usize, Option<String>) {
+            let b = match self.model().body(WHAT) {
+                Ok(b) => b,
+                Err(e) => return (0, Some(e.to_string())),
+            };
+            let continues = match &self.draft {
+                Served::Dspark(d) => {
+                    u32::try_from(n).is_ok_and(|n| n == self.s.pos() && d.draft().follows(n))
+                }
+                Served::Off | Served::Lookup(..) => true,
+            };
+            if continues {
+                let (k, why) = b.keep_why(n);
+                return (k, why.map(|w| w.to_string()));
+            }
+            let window = self.window();
+            let (k, why) = b.keep_why(n.saturating_sub(window));
+            let why = format!(
+                "the DSpark draft starts over, so the prompt call carries its window of \
+                 {window} positions: cut to at most {}{}",
+                n.saturating_sub(window),
+                why.map(|w| format!(", then {w}")).unwrap_or_default()
+            );
+            (k, Some(why))
         }
 
         /// The body's cuts under the batched feed; the step feed leaves no
         /// hole and needs none.
-        fn splits(
-            &self,
-            m: &Deepseek41Model,
-            first: usize,
-            end: usize,
-            marks: &[usize],
-        ) -> Vec<usize> {
-            match m.body(WHAT) {
+        fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+            match self.model().body(WHAT) {
                 Ok(b) if b.prefill_mode() == body::PrefillMode::Batch => {
                     b.prefill_splits(first, end, marks, SPLIT_MIN)
                 }
@@ -354,19 +593,58 @@ mod drive {
             }
         }
 
-        fn snapshot(&self, m: &mut Deepseek41Model) -> Result<Arc<dyn Saved>, GpuError> {
-            Ok(Arc::new(Ds41Saved(body::snapshot(m)?)))
+        fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+            let window = self.window();
+            Ok(Arc::new(Ds41Saved {
+                state: body::snapshot(self.s.model_mut())?,
+                window,
+            }))
         }
 
-        fn resume(&self, m: &mut Deepseek41Model, state: &dyn Saved) -> Result<(), GpuError> {
-            let s = state
+        fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
+            let saved = state
                 .as_any()
                 .downcast_ref::<Ds41Saved>()
-                .ok_or(GpuError::State {
-                    what: WHAT,
-                    missing: "a V4.1 body's saved state",
-                })?;
-            body::resume(m, &s.0)
+                .ok_or("a saved state that is not a V4.1 body's")?;
+            self.moved();
+            Ok(body::resume(self.s.model_mut(), &saved.state)?)
+        }
+
+        /// `engine.draft`, and the draft's resident bytes in its card's
+        /// placement row, the class `draft` (a row of its own when the target
+        /// has no layer there). The card's index missing leaves the device out.
+        fn props(&self, mut p: EngineProps) -> EngineProps {
+            match &self.draft {
+                Served::Off => {}
+                Served::Lookup(..) => {
+                    p.draft = Some(DraftProps {
+                        model: Draft::Lookup.name().to_owned(),
+                        n_max: Some(1),
+                        kind: Some(Draft::Lookup.name().to_owned()),
+                        ..DraftProps::default()
+                    });
+                }
+                Served::Dspark(spec) => {
+                    let d = spec.draft();
+                    let device = nvidia_smi_index(d.card()).ok().map(|i| format!("GPU{i}"));
+                    let path = dspark::draft_path().ok();
+                    let file = path
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map(|f| f.to_string_lossy().into_owned());
+                    if let (Some(dev), Some(pl)) = (&device, p.placement.as_mut()) {
+                        add_draft_bytes(pl, dev, d.resident_bytes() as u64);
+                    }
+                    p.draft = Some(DraftProps {
+                        model: file.unwrap_or_else(|| Draft::Dspark.name().to_owned()),
+                        n_max: Some(1),
+                        kind: Some(Draft::Dspark.name().to_owned()),
+                        path: path.map(|p| p.display().to_string()),
+                        device,
+                    });
+                }
+            }
+            p
         }
 
         fn note(note: &CacheNote) {
@@ -426,6 +704,109 @@ mod drive {
                     .csv("at", at),
             };
             r.eprint();
+        }
+    }
+
+    /// `bytes` of the draft on `device`: into that card's row, or a row of its
+    /// own before the host's.
+    fn add_draft_bytes(p: &mut PlacementProps, device: &str, bytes: u64) {
+        if let Some(d) = p.devices.iter_mut().find(|d| d.device == device) {
+            *d.class_bytes.entry(DRAFT_CLASS.to_owned()).or_default() += bytes;
+            return;
+        }
+        let at = p
+            .devices
+            .iter()
+            .position(|d| d.device == "CPU")
+            .unwrap_or(p.devices.len());
+        p.devices.insert(
+            at,
+            DeviceProps {
+                device: device.to_owned(),
+                class_bytes: [(DRAFT_CLASS.to_owned(), bytes)].into(),
+                layers: None,
+            },
+        );
+    }
+
+    /// What the open prints and checks: the body's selection against the
+    /// file's, the `load` record and the host set's, the captures.
+    struct Log<'a> {
+        a: &'a SeatArgs,
+        pinned: bool,
+        t: Instant,
+    }
+
+    impl OpenLog<Body> for Log<'_> {
+        /// The plan was printed before the engine thread started.
+        fn plan(
+            &mut self,
+            _place: &'static str,
+            _inputs: &PlanInputs,
+            _machine: &Machine,
+            _plan: &Plan<'_>,
+        ) -> Result<bool, SessionError> {
+            Ok(true)
+        }
+
+        fn load(&mut self, m: &Deepseek41Model) -> Result<(), SessionError> {
+            let a = self.a;
+            let b = m.body(WHAT)?;
+            let top_k = b.indexer_top_k();
+            let shadow = b.shadow_host();
+            if top_k != a.want_top_k {
+                return Err(SessionError::Refused(format!(
+                    "the body selects {top_k} rows per stream, the file's top_k is {}: a step \
+                     past that many visible rows would not be the model's",
+                    a.want_top_k
+                )));
+            }
+            Record::new(&record::LOAD_GENERATOR)
+                .u("resident_bytes", m.resident_bytes())
+                .u("ctx", a.ctx)
+                .u("layers", a.n_layer)
+                .u("top_k", top_k)
+                .w("shadow", "host")
+                .u("shadow_bytes", shadow.bytes)
+                .u("unified_addressing", shadow.unified_addressing)
+                .w("prefill", b.prefill_mode().name())
+                .w("mode", mode_name(StepMode::Graph))
+                .w("place", a.place.name())
+                .w("pin_main", if a.pin_main { "on" } else { "off" })
+                .w("pinned", self.pinned)
+                .f("load_s", self.t.elapsed().as_secs_f64())
+                .eprint();
+            if let Some(h) = b.hybrid().residency() {
+                for r in record::host_residency(h) {
+                    r.eprint();
+                }
+            }
+            Ok(())
+        }
+
+        fn capture(&mut self, nodes: usize) -> Result<(), SessionError> {
+            Record::new(&record::CAPTURE)
+                .u("graph_nodes", nodes)
+                .eprint();
+            Ok(())
+        }
+
+        fn prompt_buffers(&mut self, _m: &Deepseek41Model) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    impl RowsLog for Log<'_> {
+        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+            if rows != PAIR_ROWS {
+                return Err(SessionError::Refused(format!(
+                    "a verify capture of {rows} rows; the pair pass runs {PAIR_ROWS}"
+                )));
+            }
+            Record::new(&record::CAPTURE_PAIR)
+                .u("pair_graph_nodes", nodes)
+                .eprint();
+            Ok(())
         }
     }
 }
