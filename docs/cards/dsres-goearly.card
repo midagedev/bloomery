@@ -1,0 +1,30 @@
+# Round dsres (paper), the one box term. dsres/work/dsim.py + offsets.py [derived]: with the pair pass simulated in
+# its stream order (sched.rs step_nth, two rows) over the d2-chat trace's per-(position, layer) slots, the ko-08
+# list + draft pass is A6000-stream-bound (A6000 30.7 ms a pass, host 20.2), en-04 list host-bound (34.5 vs 26.5);
+# in all nine model variants ko-08 list is A6000-bound (not-early 36..71 of 80) and its pair residual is -3.0..+4.8 ms
+# (e1's global form: -5.6); with a per-pass edge of 2.2 ms fitted on the draft-off rows (a form picked after seeing
+# the pair rows) all six draft rows land within -0.9..+1.0 ms. The count below separates that from a host-bound pair whose extra time sits in the draft
+# chain outside it (propose + append, serial between passes): there every go lands before the host waits.
+kind: profile
+question: is the ko-08 list + DSpark pair pass bound by the A6000 stream (the host waiting on the card's goes), or
+  host-bound with its extra 5 ms outside the pass?
+term: not-early host services a pair pass = served - go_early of each `stat step` line (BLOOMERY_STEP_STATS=1),
+  mean over the kept passes, scaled to 80 when `served` is not 80; generate_ds41 at a692575, --place bp, BLOOMERY_HOT_LIST=hotlist-chat-learn24.txt,
+  BLOOMERY_DRAFT=dspark (tl37, n_max 1), --tokens <ko-08's chat-template ids> -n 256, A6000 + 3090
+unit: services of 80
+predict: 36..71
+condition: go_early is a race between the host and the card, so the run holds the lease (a runner, or
+  tools/ref/lease-hold.sh --card) and no row carries [cpu-busy] or [other-busy]; BLOOMERY_CARD=both, --ctx one
+  position past the prompt + 256; the en-04 held prompt runs in the same lease with the same levers as the contrast
+  row (predicted 8..26); witness: each run's mean leg_us a pass against the model's host busy (ko-08 20.2 ms,
+  en-04 34.5 ms; the host law is extrapolated from 159-223 slots to 149 a pass); each prompt's ids are the trace's
+  form (route-trace-chat: /apply-template of one user message, no kwargs, tokenized without added specials) and
+  their count equals d2-chat requests.tsv (ko-08 29, en-04 18); the trace holds no token ids, so greedy text is not
+  compared
+decide-in: card side confirmed: replace the global pair form (2 Hd + 4.1) in the prediction scripts by the event
+  model, and specify the verify-width lever for card-bound pairs (Cols(2) m = 2 card kernels) with its derived band
+decide-below: under 36: at or under en-04's band (<= 26) the pass is host-bound: read time pass - leg_us for the
+  draft chain and the edges (propose, taps, append); in 26..36 the card binds on fewer layers than modelled: refit
+  sh0 (the shadow's fixed part) from this run's leg_us and time pass before any lever
+decide-above: the A6000 stream is busier than the model's 30.7 ms: take one nsys range of the pair replay on the
+  A6000 to price the shadow's fixed part (HC_PRE, the shared expert, the routed launches) before any lever

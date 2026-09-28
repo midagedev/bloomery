@@ -94,6 +94,17 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### dsres가 남긴 것 (09-29 아침, 03 종이 라운드 — ko-08 목록 + DSpark 잔차)
+
+rig-log 09-29 #chatlist-dspark의 열린 잔차(ko-08 목록 + draft, 예측 54.2, 실측 46.4 tok/s, toktape 클립 값)를 코드와 트레이스로 가른 종이 판정이다. 쌍 패스는 행마다 한 토큰 스텝의 m = 1 체인을 한 A6000 스트림에서 번갈아 치러서(`gpu-deepseek41/src/body.rs`의 `enqueue_pair`, `runtime/src/sched.rs`의 `step_nth`), A6000 직렬 체인이 두 배가 된다. ko-08은 held A6000 적중이 67.7 %여서 쌍 패스의 호스트 수요 20.2 ms가 A6000 30.7 ms 아래로 내려간다. 그러면 벽시계는 max(호스트, A6000) + 결합 손실 2–3 ms + 가장자리다[유도]. 예측식 2Hd + 4.1은 카드를 늘 호스트 그늘로 두어서 이 경우를 놓쳤다. 보고서: `specs/wave-m8/reports/dsres.md`(세션 쪽 사본). 판정은 아래 측정 하나로 닫는다. 레버 판단은 그 결과를 보고 한다(aa).
+
+- **측정(03, 약 8분, 임대)**: `docs/cards/dsres-goearly.card`. 쌍 패스마다 go를 기다린 호스트 서비스 수(`stat step`의 served − go_early, 80 기준). 카드 가설이면 ko-08 36–71, en-04 8–26이고, draft 사슬 가설이면 ko-08도 26 이하다[유도]. 단일 스텝(served 40)은 구조상 호스트가 늘 go를 기다리므로 쌍 패스 행만 읽는다.
+- **Cols(2) 검증, 상태에 따라 고름 (L)**: 쌍을 한 단위·두 열로 돌리고 호스트와 카드 모두 합집합으로 처리한다. ko-08 목록 45.2 → 51.1…54.5 tok/s, en-04는 0 또는 손해다[유도]. 카드에 묶인 상태에서만 이기므로 패스 종류를 상태로 고르는 설계가 필요하다.
+- **front 노드 줄이기 (M–L)**: 행·층당 front를 10 µs 줄이면 ko-08 쌍 패스 −0.68 ms, en-04 −0.19 ms다[유도]. 한 토큰 스텝에도 똑같이 듣는다.
+- **`take_go`에 기다린 시간 합 (S)**: `gpu/src/host/step.rs`의 `take_go`는 기다린 시간을 알면서 `go_early` 개수와 straggle만 남긴다. `go_wait_ns` 합을 `stat step`에 더하면 카드 노출을 개수가 아니라 시간으로 읽는다.
+- **`bloomery-serve-ds41`이 `BLOOMERY_STEP_STATS`를 읽게 (S–M)**: 지금은 `generate_ds41`과 프리필 게이트만 읽어서, 서빙 클립의 잔차에는 호스트 카운터가 없다.
+- **bp 스텝 공통 +2.2 ms의 출처 (조사, S–M)**: draft를 끈 bp 스텝 여섯 행이 dsparkfix의 plan (a) 보정보다 한결같이 1.9–2.5 ms 길다. 패스당 공통 항 하나로 맞추면 rms 0.25 ms이지만, 그 항이 패스당인지 방출 토큰당인지, 어디서 오는지는 확인하지 못했다. 측정이 카드 가설을 확정해도 이 항은 남는다.
+
 ### 열차 7 파동이 남긴 것 (09-28 오전 — aa `glmsel`·`glmppa`·`q38card`·`adaptres`·`twoeng`·`iktwo`·`swaprule`·`restool`·`toolfix`·`headrows`, 03 `q38gemm32`·`q38wide`·`q38refuse`·`q38hostq51`·`hotlistid`·`docsprune`, e1 `servedraft`·`qwen3taps`·`q8kdown`)
 
 **착륙 대기 스택**(train 7 뒤 한 열차, add 증명은 새 train 7 팁 기준으로 다시 잰다): `glmsel`(GLM DSA 선택기, 기준 `65d7bbf` → `--onto`), `glmppa`(GLM 배치 프리필, 같은 기준), `toolfix`, `restool`, `swaprule`, `hotlistid`, `servedraft`, `qwen3taps`, `probecard`(e1). 충돌 지점: `tools/ref/ptx-shapes.tsv`(glmsel·glmppa·q38card), `tools/check-recipes.sh`(toolfix·restool·slopguard), `place.rs`(q38card·q38wide). `q38card`는 train 8(`q38wide`) 위로 옮기며 `CARD_PLANS`를 arena 항과 함께 다시 유도한다. `q8kdown`(행동 변경)은 그다음 따로: 전체 목록 + 같은 임대 A/B(`q8kdown-ab.card`) + GLM·Qwen3.8 깊이 6 무회귀 행.
