@@ -273,6 +273,8 @@ mod gate {
             let held: Vec<usize> = map
                 .layers()
                 .map(|l| map.on_card(l))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .filter(|&n| n > 0)
                 .collect();
             println!(
