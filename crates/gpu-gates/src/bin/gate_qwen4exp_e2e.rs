@@ -115,11 +115,33 @@
 //!   prefix (no delta state holds it any more), a step there is refused by
 //!   name (the recurrent stores hold it already), and after `reset` the
 //!   prefix and the same call give the clean bits.
-//! - (r) refusals: `Prompt38::parse` refuses `gemm` and `auto` by name,
-//!   naming `gemm_q8_0`; the image placeholder [`IMAGE_TOKEN`] as a step and
-//!   as a pass is refused by name with the position kept and the model not
-//!   poisoned; a prompt past the stores is refused by name before any
-//!   launch, on either path, the position kept.
+//! - (g) the ubatch walk (`Prompt38::Gemm`), whose Q8_0 projections read q8
+//!   activations and so are not the pass's bits: on the batch set from a
+//!   reset, its last argmax equal to ik's; its route taps (armed for the
+//!   walk) each the top ten of their own logits; each flip against the
+//!   pass's routing (the eager steps' taps) excused only while every pair's
+//!   gap lies within our error and that error within six deviations of the
+//!   error model's router error ([`flip_cap`]); the last logits and each
+//!   layer's live stores within the error model's band ([`gemm_band`]: the
+//!   q8 step per 32 values at the largest crest a block can have, four
+//!   projections a layer, √(l + 1) over the layers) off every flip's path,
+//!   the rest printed. On D3K's prefill: one ubatch and two cut at
+//!   [`SPLIT`] (inside the selecting rows, mid-pool, off the eight-row
+//!   runs, past the router's first run) leave the last logits and every
+//!   store bit for bit — a token's bits do not depend on the ubatch it
+//!   lands in; the walk's cut of the selecting layers' rows between the
+//!   prefill flash and the selection is the rule's (2,051 and 949, from
+//!   KEPT and POOL — a record, checked against the gate's own derivation);
+//!   the step after the ubatch as (t) holds a step set. A slot map with a
+//!   routed expert on the card is refused by name before anything moves,
+//!   the position kept and the model not poisoned; `auto` is the pass below
+//!   `Prompt38::GEMM_FROM` positions and the ubatch from it.
+//! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
+//!   and refuses any other name by name; the image placeholder
+//!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
+//!   with the position kept and the model not poisoned; a prompt past the
+//!   stores is refused by name before any launch, on every path, the
+//!   position kept.
 //!
 //! Named differences, not banded away: ik combines the block as
 //! `routed + σ(g)·shared`, ours as `hsum + shared·w` with the sigmoid weight
@@ -151,6 +173,7 @@ mod gate {
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
     };
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::hybrid::{HOST, SlotMap};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
@@ -161,6 +184,7 @@ mod gate {
     };
     use cuda_core::sys;
     use gguf::Split;
+    use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{PlanInputs, machine};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
@@ -1724,13 +1748,366 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------ (g) the ubatch walk
+
+    /// A 32-value block's largest magnitude over its RMS, at most: a block of
+    /// one nonzero value, √32.
+    const CREST_MAX: f64 = 5.656_854_249_492_381;
+
+    /// PIN(2026-09-28): the ubatch walk's distance from the pass per layer, as
+    /// the error model gives it: a q8 activation of 32 values (scale d =
+    /// amax/127) moves each value by at most d/2, uniformly, so by d/√12 in
+    /// RMS, and a block's RMS error over its RMS is crest/(127·√12), at most
+    /// [`CREST_MAX`]/(127·√12) = 1.286e-2; a projection passes that relative
+    /// error to its output. A layer's stream gains it from four projections
+    /// in series whose outputs join the stream — the mixer's input and output
+    /// projections, the shared expert's gate·up and down — √4 of it
+    /// independent, 2.572e-2 a layer (the mixes' down and up reach the
+    /// stream through σ, whose slope is at most ¼, and add under 4 %); layers
+    /// add independently, so layer `l`'s output and store sit within
+    /// √(l + 1) · 2.572e-2 of the pass's, off every flip's path; the head
+    /// reads the last layer's, √48 · 2.572e-2 = 0.178.
+    fn gemm_band(l: usize) -> f64 {
+        let q = CREST_MAX / (127.0 * 12f64.sqrt());
+        ((l + 1) as f64).sqrt() * 2.0 * q
+    }
+
+    /// PIN(2026-09-28): a flip between the ubatch walk's routing and the
+    /// pass's is excused while each exchanged pair's gap in the pass's logits
+    /// lies within our two logits' distance there, and that distance within
+    /// six standard deviations of the router's error at the layer: a logit
+    /// is a dot of the layer's input, which carries [`gemm_band`] of relative
+    /// error, so a logit moves by about that times the logits' RMS; two
+    /// logits, three deviations each.
+    fn flip_cap(l: usize, logits: &[f32]) -> f64 {
+        let rms = (logits.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+            / logits.len().max(1) as f64)
+            .sqrt();
+        6.0 * gemm_band(l) * rms
+    }
+
+    /// Each layer's relative distance between two runs' live stores at count
+    /// `pos` — the committed lane with the conv ring, the K/V planes' and raw
+    /// keys' rows below the count and the pools complete at it — and the PLE
+    /// rings'. Rows past the count hold [`PLANE_FILL`] in both and would
+    /// only dilute the distance.
+    fn live_rel(a: &Run, b: &Run, pos: usize) -> (Vec<f64>, f64) {
+        let f = |v: &[u16]| -> Vec<f32> { v.iter().map(|&h| half_to_f32(h)).collect() };
+        let rows = |x: &[u16], heads: usize, width: usize| -> Vec<f32> {
+            let ctx = x.len() / (heads * width).max(1);
+            (0..heads)
+                .flat_map(|h| {
+                    let at = h * ctx * width;
+                    f(&x[at..at + pos.min(ctx) * width])
+                })
+                .collect()
+        };
+        let layers = a
+            .stores
+            .iter()
+            .zip(&b.stores)
+            .map(|pair| match pair {
+                (
+                    Store38Host::Rec { state: s, ring: r },
+                    Store38Host::Rec {
+                        state: s2,
+                        ring: r2,
+                    },
+                ) => {
+                    let x: Vec<f32> = s.iter().chain(r).copied().collect();
+                    let y: Vec<f32> = s2.iter().chain(r2).copied().collect();
+                    rel(&x, &y)
+                }
+                (
+                    Store38Host::Qsa { k, v, raw, pooled },
+                    Store38Host::Qsa {
+                        k: k2,
+                        v: v2,
+                        raw: raw2,
+                        pooled: pooled2,
+                    },
+                ) => {
+                    let live = (pos / POOL * IDX_DIM).min(pooled.len()).min(pooled2.len());
+                    let x: Vec<f32> = [
+                        rows(k, N_KV, HEAD),
+                        rows(v, N_KV, HEAD),
+                        rows(raw, 1, IDX_DIM),
+                        f(&pooled[..live]),
+                    ]
+                    .concat();
+                    let y: Vec<f32> = [
+                        rows(k2, N_KV, HEAD),
+                        rows(v2, N_KV, HEAD),
+                        rows(raw2, 1, IDX_DIM),
+                        f(&pooled2[..live]),
+                    ]
+                    .concat();
+                    rel(&x, &y)
+                }
+                _ => f64::INFINITY,
+            })
+            .collect();
+        (layers, rel(&a.ple_ring, &b.ple_ring))
+    }
+
+    /// (g) on the batch set: the ubatch walk from [`fresh`] with its route
+    /// taps armed, against the pass (`pass`, and `eager`, the eager steps'
+    /// taps, bit for bit the pass's) and ik: the last argmax equal to ik's;
+    /// every route tap the top ten of its own logits; each flip against the
+    /// pass's routing excused only under [`flip_cap`]; the last logits and
+    /// each layer's live stores within [`gemm_band`] off every flip's path,
+    /// the rest printed and counted.
+    fn gemm_batch(
+        m: &mut Qwen38Model,
+        man: &RefManifest,
+        toks: &[u32],
+        eager: &Run,
+    ) -> Result<bool, GateError> {
+        let pass = run_pass(m, toks)?;
+        fresh(m)?;
+        {
+            let (gpu, _, b) = m.body_parts("gemm_batch")?;
+            b.set_ubatch_route_taps(gpu, toks.len())?;
+        }
+        let last = m.prompt38(toks, Prompt38::Gemm)?;
+        let logits = m.logits()?;
+        let routes = {
+            let (gpu, _, b) = m.body_parts("gemm_batch")?;
+            let r = b.ubatch_route_taps(gpu, toks.len())?;
+            b.set_ubatch_route_taps(gpu, 0)?;
+            r
+        };
+        let (stores, ple_ring) = stores(m)?;
+        let gemm = Run {
+            tokens: vec![last],
+            logits: vec![logits],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores,
+            ple_ring,
+        };
+        let vocab = m.body("gemm_batch")?.vocab();
+        let ik_top = argmax(&ik_last(man, vocab)?);
+        let top = argmax(&gemm.logits[0]);
+        let mut ok = top == ik_top && last == top;
+        println!(
+            "gemm batch: last argmax ours={top} (returned {last}) ik={ik_top} (the pass's {:?}) {}",
+            pass.tokens,
+            verdict(top == ik_top && last == top)
+        );
+        let inconsistent: Vec<(usize, usize)> = routes
+            .iter()
+            .enumerate()
+            .flat_map(|(t, ls)| {
+                ls.iter()
+                    .enumerate()
+                    .filter(|(_, r)| !picks_its_top(r))
+                    .map(move |(l, _)| (l, t))
+            })
+            .collect();
+        let taps_ok = routes.len() == toks.len()
+            && routes.iter().all(|ls| ls.len() == N_LAYER)
+            && inconsistent.is_empty();
+        ok &= taps_ok;
+        println!(
+            "gemm batch: route taps of {} tokens, those not the top {N_USED} of their own logits: \
+             {} {:?} {}",
+            routes.len(),
+            inconsistent.len(),
+            &inconsistent[..inconsistent.len().min(8)],
+            verdict(taps_ok)
+        );
+        let mut flips = Vec::new();
+        let mut refused = 0usize;
+        for (t, (ours, theirs)) in routes.iter().zip(&eager.routes).enumerate() {
+            for (l, (o, p)) in ours.iter().zip(theirs).enumerate() {
+                let ids: Vec<i32> = p.ids.iter().map(|&e| e as i32).collect();
+                let margin = flip::margin(&p.logits, &ids);
+                if let Some(f) =
+                    Flip::between((l, t), (&o.ids, &o.logits), (&ids, &p.logits), margin)
+                {
+                    let cap = flip_cap(l, &p.logits);
+                    refused += usize::from(!f.allowed(cap));
+                    println!("{}", f.line("gemm", cap));
+                    flips.push(f);
+                }
+            }
+        }
+        ok &= refused == 0;
+        println!(
+            "gemm batch: {} flip(s) against the pass's routing, {refused} past the error model {}",
+            flips.len(),
+            verdict(refused == 0)
+        );
+        let first = flips.iter().map(|f| f.layer).min().unwrap_or(N_LAYER);
+        let logits_rel = rel(&gemm.logits[0], pass.logits.last().ok_or("no pass logits")?);
+        let head_band = gemm_band(N_LAYER - 1);
+        let logits_ok = !flips.is_empty() || logits_rel <= head_band;
+        ok &= logits_ok;
+        println!(
+            "gemm batch: last logits' distance from the pass's {logits_rel:.3e} (band \
+             {head_band:.3e}; {}) {}",
+            if flips.is_empty() {
+                "off every flip's path"
+            } else {
+                "on a flip's path: printed"
+            },
+            verdict(logits_ok)
+        );
+        let (layers, ple) = live_rel(&gemm, &pass, toks.len());
+        let mut past = Vec::new();
+        for (l, &e) in layers.iter().enumerate() {
+            let held = l < first;
+            if held && e > gemm_band(l) {
+                past.push(l);
+            }
+            if l % 8 == 0 || l + 1 == layers.len() || (held && e > gemm_band(l)) {
+                println!(
+                    "gemm batch: layer {l} store distance {e:.3e} (band {:.3e}, {})",
+                    gemm_band(l),
+                    if held { "held" } else { "past a flip: printed" }
+                );
+            }
+        }
+        let ple_ok = first < 1 || ple <= gemm_band(1);
+        let stores_ok = layers.len() == N_LAYER && past.is_empty() && ple_ok;
+        ok &= stores_ok;
+        println!(
+            "gemm batch: stores held below layer {first} (the first flip's), past the band at \
+             {past:?}; PLE ring {ple:.3e} (band {:.3e}) {}",
+            gemm_band(1),
+            verdict(stores_ok)
+        );
+        Ok(ok)
+    }
+
+    /// (g) on D3K's prefill: one ubatch against two cut inside the selecting
+    /// rows ([`SPLIT`], mid-pool, off the eight-row runs), the last logits and
+    /// every store bit for bit; the walk's cut of the selecting layers' rows
+    /// against the rule's; then the step after the ubatch against ik's.
+    fn gemm_d3k(m: &mut Qwen38Model, ties: &mut usize) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        let prefill = prefill.to_vec();
+        let rows = m.body("gemm_d3k")?.ubatch_rows();
+        fresh(m)?;
+        let t = Instant::now();
+        let one_tok = m.prompt38(&prefill, Prompt38::Gemm)?;
+        let fed = t.elapsed().as_secs_f64();
+        let split = m.body("gemm_d3k")?.ubatch_split();
+        let one = Run {
+            tokens: vec![one_tok],
+            logits: vec![m.logits()?],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: Vec::new(),
+            ple_ring: Vec::new(),
+        };
+        let (one_stores, one_ring) = stores(m)?;
+        let one = Run {
+            stores: one_stores,
+            ple_ring: one_ring,
+            ..one
+        };
+        // A row selects once it sees more complete pools than the 512 a
+        // select keeps (TOP_K 2,048 over pools of 4): at a count of
+        // 4 · 513 = 2,052, position 2,051. From position 0 the prefill
+        // flash takes the 2,051 rows before it.
+        let dense = (POOL * (KEPT + 1) - 1).min(prefill.len());
+        let want = (dense, prefill.len() - dense);
+        let split_ok = rows >= prefill.len() && split == Some(want);
+        println!(
+            "gemm {D3K}: {} ids in one ubatch (the load's size {rows}; {fed:.1} s, runtime \
+             value); the selecting layers' rows by the prefill flash and by the selection {split:?} \
+             (want {want:?}, from KEPT and POOL) {}",
+            prefill.len(),
+            verdict(split_ok)
+        );
+        let mut ok = split_ok;
+        fresh(m)?;
+        m.prompt38(&prefill[..SPLIT], Prompt38::Gemm)?;
+        let cut_tok = m.prompt38(&prefill[SPLIT..], Prompt38::Gemm)?;
+        let (cut_stores, cut_ring) = stores(m)?;
+        let cut = Run {
+            tokens: vec![cut_tok],
+            logits: vec![m.logits()?],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: cut_stores,
+            ple_ring: cut_ring,
+        };
+        ok &= same_run(
+            &format!("D3K by ubatches cut at {SPLIT} vs one ubatch"),
+            &cut,
+            &one,
+            true,
+        );
+        ok &= step_set(m, D3K, Prompt38::Gemm, None, ties)?.0;
+        Ok(ok)
+    }
+
+    /// Where (g) cuts D3K's prefill in two: inside the selecting rows, in
+    /// the middle of pool 650 (positions 2,600 to 2,603), 550 rows past the
+    /// first selecting row (not a multiple of the eight-row runs), and past
+    /// the router's first 2,048-token run.
+    const SPLIT: usize = 2601;
+    const KEPT: usize = 512;
+    const _: () =
+        assert!(!SPLIT.is_multiple_of(POOL) && !(SPLIT - POOL * (KEPT + 1) + 1).is_multiple_of(8));
+
+    /// (g) the refusals: a slot map with a routed expert on the card
+    /// (planted for the next ubatch call) refused by name before anything
+    /// moves, the position kept and the model not poisoned, the plant
+    /// consumed; `auto` the passes below [`Prompt38::GEMM_FROM`] positions
+    /// and the ubatches from it.
+    fn gemm_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        fresh(m)?;
+        let mut rows = vec![HOST; N_LAYER * N_EXPERT];
+        rows[7 * N_EXPERT + 3] = 0;
+        let map = SlotMap::from_rows(0..N_LAYER, N_EXPERT, rows)?;
+        m.body_parts("gemm_refusals")?.2.plant_slot_map(map);
+        let before = m.pos();
+        let got = m.prompt38(toks, Prompt38::Gemm);
+        let named =
+            matches!(&got, Err(e) if e.to_string().contains("the ubatch walk has no card leg yet"));
+        let kept = m.pos() == before && m.poisoned().is_none();
+        let again = m.prompt38(toks, Prompt38::Gemm).is_ok();
+        let mut ok = named && kept && again;
+        println!(
+            "gemm refusal: a slot map with expert 3 of layer 7 on the card -> {}; position {} \
+             (kept: {kept}); the next ubatch call runs (the plant consumed): {again} {}",
+            match &got {
+                Ok(t) => format!("accepted, next {t}"),
+                Err(e) => e.to_string(),
+            },
+            m.pos(),
+            verdict(named && kept && again)
+        );
+        let at = Prompt38::GEMM_FROM;
+        let auto_ok = Prompt38::Auto.resolve(at - 1) == Prompt38::Pass
+            && Prompt38::Auto.resolve(at) == Prompt38::Gemm
+            && Prompt38::Gemm.resolve(1) == Prompt38::Gemm;
+        ok &= auto_ok;
+        println!(
+            "gemm auto: {} positions -> {}, {at} -> {} {}",
+            at - 1,
+            Prompt38::Auto.resolve(at - 1).name(),
+            Prompt38::Auto.resolve(at).name(),
+            verdict(auto_ok)
+        );
+        Ok(ok)
+    }
+
     // ---------------------------------------------------- (r) refusals
 
     fn refusals(m: &mut Qwen38Model) -> Result<bool, GateError> {
         let mut ok = true;
-        for s in ["gemm", "auto"] {
+        // PIN(2026-09-28): `gemm` and `auto` parse since the ubatch walk
+        // landed; the refusal is a name the four paths do not
+        // include, which the parser names them for.
+        for s in ["step", "pass", "gemm", "auto"] {
             let got = Prompt38::parse(s);
-            let named = matches!(&got, Err(e) if e.to_string().contains("gemm_q8_0"));
+            let named = matches!(&got, Ok(p) if p.name() == s);
             ok &= named;
             println!(
                 "refusal: --prefill {s} -> {} {}",
@@ -1741,6 +2118,17 @@ mod gate {
                 verdict(named)
             );
         }
+        let got = Prompt38::parse("wide");
+        let named = matches!(&got, Err(e) if e.to_string().contains("`gemm` or `auto`"));
+        ok &= named;
+        println!(
+            "refusal: --prefill wide -> {} {}",
+            match &got {
+                Ok(p) => format!("accepted as {}", p.name()),
+                Err(e) => e.to_string(),
+            },
+            verdict(named)
+        );
         m.reset()?;
         m.step(&[0])?;
         // A step refuses its one token; a pass refuses the whole pass before
@@ -1748,6 +2136,7 @@ mod gate {
         for (path, ids) in [
             (Prompt38::Step, &[IMAGE_TOKEN][..]),
             (Prompt38::Pass, &[1, IMAGE_TOKEN][..]),
+            (Prompt38::Gemm, &[1, IMAGE_TOKEN][..]),
         ] {
             let before = m.pos();
             let got = m.prompt38(ids, path);
@@ -1769,7 +2158,7 @@ mod gate {
         }
         let before = m.pos();
         let past = vec![0u32; CTX + 1 - before as usize];
-        for path in [Prompt38::Step, Prompt38::Pass] {
+        for path in [Prompt38::Step, Prompt38::Pass, Prompt38::Gemm] {
             let got = m.prompt38(&past, path);
             let named = matches!(&got, Err(e) if e.to_string().contains("passes the stores"));
             let kept = m.pos() == before;
@@ -1802,6 +2191,7 @@ mod gate {
         let vocab = m.body("run")?.vocab();
         let (free_ok, firsts) = free(&man, &eager, vocab)?;
         ok &= free_ok;
+        ok &= gemm_batch(&mut m, &man, &toks, &eager)?;
         drop(eager);
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
@@ -1818,6 +2208,9 @@ mod gate {
         println!("step sets: {ties} named tie(s)");
         ok &= pass_selects(&mut m, &d3k)?;
         drop(d3k);
+        ok &= gemm_d3k(&mut m, &mut ties)?;
+        ok &= gemm_refusals(&mut m, &toks)?;
+        println!("step sets and the ubatch's D3K step: {ties} named tie(s)");
         ok &= verify_clause(&mut m, &toks)?;
         ok &= position_owner(&mut m, &toks)?;
         ok &= refusals(&mut m)?;

@@ -32,7 +32,17 @@
 //!    (`hc_gated::SITE`, unlabelled) and leaves the other column bit for bit
 //!    the clean launch's, the NaN column's `mixed` all NaN; an infinity in
 //!    the combine's `y` raises it too; clean launches raise nothing.
-//! 7. shape: the four entries compile with no local depot.
+//! 7. shape: the eight entries compile with no local depot.
+//! 8. wide: the wide arm (`HcWideKernels`, a ubatch's mix over any column
+//!    count): its norm and combine the capped entries' bits at three
+//!    columns, the combine alone the rule; over 37 columns its glue — the
+//!    bottleneck, the weights, the mixed values — the card rule on the
+//!    card's readback of its inputs, bit for bit; each column's `xn`, `lo`,
+//!    weights and `mixed` within the bands the error model derives for the q8
+//!    step per 32 values (`WIDE_LO_BAND`, `WIDE_G_REL`) of `mix_ref`; four of
+//!    the columns each its one-column mix bit for bit and a rerun
+//!    bit-identical; a NaN in one column raises and leaves the others clean;
+//!    38 columns on a 37-column scratch refused by name.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -47,13 +57,15 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::gemm::{Gemm32Kernels, GemmKernels, GemmRoute};
     use bloomery_gpu::hc_gated::{
-        Before, HcGatedKernels, HcScratch, MixArgs, SITE, SiteWeights, check_types,
+        Before, HcGatedKernels, HcScratch, HcWideKernels, HcWideScratch, MixArgs, SITE,
+        SiteWeights, WideMixArgs, check_types,
     };
     use bloomery_gpu::linear::{sigmoid, silu};
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{DeviceTensor, Fault, Gpu, LAYER_NONE};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
@@ -288,11 +300,16 @@ mod gate {
         ok &= check_combine(&mut c, &site)?;
         ok &= check_refuse(&mut c, &site)?;
         ok &= check_fault(&mut c, &site)?;
+        ok &= check_wide(&mut c, &site)?;
         ok &= no_local_depot(&[
             "hc_gated_norm_4",
             "hc_gated_down_4x320",
             "hc_gated_up_mix_4x320",
             "hc_gated_combine_4",
+            "hc_gated_norm_4w",
+            "hc_gated_combine_4w",
+            "hc_gated_lo_4x320",
+            "hc_gated_mix_4",
         ])?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
@@ -303,7 +320,9 @@ mod gate {
              inputs, the down partials the q8f32 gemv of the view; eight columns each column's \
              one-column mix and a rerun bit for bit; combine and init as the rule; shapes, \
              columns, planes and types refused by name; a NaN stream raises the site and \
-             leaves the other column clean; no local depot"
+             leaves the other column clean; the wide arm's norm and combine the capped \
+             entries' bits, its glue the card rule, its mix within the error model's bands, \
+             each column its own, a NaN raised; no local depot"
         );
         Ok(())
     }
@@ -722,5 +741,314 @@ mod gate {
             verdict(p2)
         );
         Ok(p1 && p2)
+    }
+
+    // ------------------------------------------------------ 8. the wide arm
+
+    /// Columns the wide scratch holds: past the eight-column cap, and an odd
+    /// count for the independence clause.
+    const WIDE_COLS: usize = 37;
+
+    /// PIN(2026-09-28): the wide mix's distance from the f64 rule, derived,
+    /// never measured: a q8 activation of 32 values (scale amax/127) moves a
+    /// value by at most half a step, uniformly, d/√12 in RMS, so a column's
+    /// RMS error over its RMS is at most √32/(127·√12) = 1.286e-2 (a block of
+    /// one nonzero value, the largest crest); the down reads one such
+    /// quantization (`xn`), the bottleneck `silu(·/4)` passes it with a slope
+    /// of at most 1.1, so `lo` sits within 1.1 · 1.286e-2 = 1.415e-2 in RMS;
+    /// the up reads a second (`lo`), so `g` sits within √2 · 1.415e-2 = 2.0e-2
+    /// of its rule in RMS relative; `mixed` is Σ xn·σ(g)/4, whose relative
+    /// error is at most the absolute error of `g` (σ'/σ = 1 − σ ≤ 1), so it
+    /// sits within 2.0e-2 · rms(g). The inject is the F32 tile on `xn`: no
+    /// quantization, the narrow arm's band.
+    const WIDE_Q: f64 = 1.286e-2;
+    const WIDE_LO_BAND: f64 = 1.1 * WIDE_Q;
+    const WIDE_G_REL: f64 = std::f64::consts::SQRT_2 * WIDE_LO_BAND;
+
+    /// The wide arm's kernels and scratch.
+    struct Wide {
+        hcw: HcWideKernels,
+        g32: Gemm32Kernels,
+        gemm: GemmKernels,
+        route: GemmRoute,
+        scratch: HcWideScratch,
+    }
+
+    /// Everything one wide mix leaves, read back, for its `m` columns.
+    struct WideOut {
+        res: Vec<f32>,
+        xn: Vec<f32>,
+        down: Vec<f32>,
+        inj: Vec<f32>,
+        lo: Vec<f32>,
+        g: Vec<f32>,
+        wgt: Vec<f32>,
+        mixed: Vec<f32>,
+        fault: Option<Fault>,
+    }
+
+    fn wide_mix(
+        c: &mut Ctx,
+        w: &mut Wide,
+        site: &Site,
+        inject: bool,
+        res: &[f32],
+        pre: Pre<'_>,
+        m: usize,
+    ) -> Result<WideOut, GateError> {
+        let st = c.gpu.stream();
+        let z = c.geo.sizes(m);
+        let mut res_d = DeviceBuffer::from_host(st, res)?;
+        let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; z.mixed])?;
+        let y_d = match pre {
+            Pre::Plain => None,
+            Pre::Combine(y) | Pre::Init(y) => Some(DeviceBuffer::from_host(st, y)?),
+        };
+        let before = match (pre, y_d.as_ref()) {
+            (Pre::Combine(_), Some(y)) => Before::Combine { y },
+            (Pre::Init(_), Some(y)) => Before::Init { y },
+            _ => Before::Plain,
+        };
+        w.gemm
+            .enqueue_route_dense(st, m, &mut w.route, c.gpu.unlabelled_sink())?;
+        w.hcw.enqueue_mix(
+            st,
+            WideMixArgs {
+                res: &mut res_d,
+                before,
+                w: site.weights(inject),
+                eps: EPS,
+                m,
+                fault: c.gpu.unlabelled_sink(),
+                scratch: &mut w.scratch,
+                gemm: &w.g32,
+                dense: &w.route,
+                mixed: &mut mixed_d,
+            },
+        )?;
+        let s = &w.scratch;
+        Ok(WideOut {
+            res: res_d.to_host_vec(st)?,
+            xn: s.xn.to_host_vec(st)?[..z.xn].to_vec(),
+            down: s.down.to_host_vec(st)?[..z.lo].to_vec(),
+            inj: s.inj.to_host_vec(st)?[..z.wgt].to_vec(),
+            lo: s.lo.to_host_vec(st)?[..z.lo].to_vec(),
+            g: s.g.to_host_vec(st)?[..z.xn].to_vec(),
+            wgt: s.wgt.to_host_vec(st)?[..z.wgt].to_vec(),
+            mixed: mixed_d.to_host_vec(st)?,
+            fault: c.gpu.take_fault()?,
+        })
+    }
+
+    /// `‖a − b‖ / ‖b‖` in f64, infinite on a NaN or a length mismatch.
+    fn rms_rel(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            num += (f64::from(x) - f64::from(y)).powi(2);
+            den += f64::from(y).powi(2);
+        }
+        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
+        if r.is_nan() { f64::INFINITY } else { r }
+    }
+
+    /// Clause 8 (module doc).
+    fn check_wide(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
+        let mut w = Wide {
+            hcw: HcWideKernels::load(c.gpu.context())?,
+            g32: Gemm32Kernels::load(c.gpu.context())?,
+            gemm: GemmKernels::load(c.gpu.context())?,
+            route: GemmRoute::new(c.gpu.stream(), WIDE_COLS, 1)?,
+            scratch: HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS)?,
+        };
+        let mut ok = true;
+        // (a) the norm and the combine: the capped entries' bits at m <= 8.
+        let m = 3;
+        let res = activations(WIDE, m, 0x3a01);
+        let y = activations(D, m, 0x3a02);
+        let first = mix(c, site, true, &res, Pre::Plain, m)?;
+        let narrow = mix(c, site, true, &res, Pre::Combine(&y), m)?;
+        let _ = wide_mix(c, &mut w, site, true, &res, Pre::Plain, m)?;
+        // The wide scratch's weights are the wide site's, not the narrow
+        // one's: seed them with the narrow first site's so the combines read
+        // the same weights.
+        w.scratch.wgt.copy_from_host(c.gpu.stream(), &first.wgt)?;
+        let wide = wide_mix(c, &mut w, site, true, &res, Pre::Combine(&y), m)?;
+        let p = bits_equal(&wide.res, &narrow.res) && bits_equal(&wide.xn, &narrow.xn);
+        ok &= p;
+        println!(
+            "wide[norm_combine] m={m} streams and xn the capped entries' bit_equal={p} {}",
+            verdict(p)
+        );
+        let mut want = res.clone();
+        combine(c.geo, m, &mut want, &y, &first.wgt);
+        w.scratch.wgt.copy_from_host(c.gpu.stream(), &first.wgt)?;
+        let st = c.gpu.stream();
+        let mut res_d = DeviceBuffer::from_host(st, &res)?;
+        let y_d = DeviceBuffer::from_host(st, &y)?;
+        w.hcw
+            .enqueue_combine(st, &mut res_d, &y_d, m, c.gpu.unlabelled_sink(), &w.scratch)?;
+        let alone = res_d.to_host_vec(st)?;
+        let f = c.gpu.take_fault()?;
+        let p = bits_equal(&alone, &want) && f.is_none();
+        ok &= p;
+        println!(
+            "wide[combine_alone] res the rule bit_equal={p} fault=\"{}\" {}",
+            shown(f),
+            verdict(p)
+        );
+        // (b) the glue: each output the card rule on the card's readback of
+        // its inputs, bit for bit.
+        let m = WIDE_COLS;
+        let res = activations(WIDE, m, 0x3a03);
+        let o = wide_mix(c, &mut w, site, true, &res, Pre::Plain, m)?;
+        let inv = 1.0 / S as f32;
+        let lo: Vec<f32> = o.down.iter().map(|&v| silu(v * inv)).collect();
+        let wgt: Vec<f32> = o.inj.iter().map(|&v| 2.0 * sigmoid(v * inv)).collect();
+        let mixed: Vec<f32> = (0..m * D)
+            .map(|i| {
+                let (k, h) = (i / D, i % D);
+                let mut acc = 0.0f32;
+                for s in 0..S {
+                    let at = (k * S + s) * D + h;
+                    let sg = sigmoid(o.g[at]);
+                    acc = if s == 0 {
+                        o.xn[at] * sg
+                    } else {
+                        o.xn[at].mul_add(sg, acc)
+                    };
+                }
+                acc * inv
+            })
+            .collect();
+        let glue = [
+            ("lo", bits_equal(&o.lo, &lo)),
+            ("wgt", bits_equal(&o.wgt, &wgt)),
+            ("mixed", bits_equal(&o.mixed, &mixed)),
+        ];
+        for (name, p) in glue {
+            ok &= p;
+            println!(
+                "wide[glue:{name}] m={m} the card rule on the readback bit_equal={p} {}",
+                verdict(p)
+            );
+        }
+        // (c) the error model's bands against the f64 rule, per column.
+        let mut worst = [0.0f64; 4];
+        let mut past = Vec::new();
+        for k in 0..m {
+            let r = mix_ref(c.geo, site.host(true), col(&res, WIDE, k), EPS);
+            let as32 = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+            let g = col(&o.g, WIDE, k);
+            let g_rms =
+                (g.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / g.len() as f64).sqrt();
+            let lines = [
+                (
+                    "xn",
+                    f64::from(max_rel_err(col(&o.xn, WIDE, k), &as32(&r.xn))?),
+                    f64::from(XN_BAND),
+                ),
+                ("lo", rms_rel(col(&o.lo, R, k), &as32(&r.lo)), WIDE_LO_BAND),
+                (
+                    "mixed",
+                    rms_rel(col(&o.mixed, D, k), &as32(&r.mixed)),
+                    WIDE_G_REL * g_rms,
+                ),
+                (
+                    "wgt",
+                    f64::from(max_rel_err(
+                        col(&o.wgt, S, k),
+                        &as32(r.wgt.as_deref().unwrap_or(&[])),
+                    )?),
+                    f64::from(LO_BAND),
+                ),
+            ];
+            for (i, (name, err, band)) in lines.into_iter().enumerate() {
+                worst[i] = worst[i].max(err / band);
+                if err > band {
+                    past.push((k, name, err, band));
+                }
+            }
+        }
+        let p = past.is_empty() && o.fault.is_none();
+        ok &= p;
+        println!(
+            "wide[band] m={m} worst err/band xn {:.3} lo {:.3} mixed {:.3} wgt {:.3}; past the \
+             band {:?}; fault=\"{}\" {}",
+            worst[0],
+            worst[1],
+            worst[2],
+            worst[3],
+            &past[..past.len().min(4)],
+            shown(o.fault),
+            verdict(p)
+        );
+        // (d) columns: each of m columns its one-column wide mix bit for bit,
+        // and a rerun bit-identical.
+        let mut same = true;
+        for k in [0, 1, m / 2, m - 1] {
+            let one = wide_mix(c, &mut w, site, true, col(&res, WIDE, k), Pre::Plain, 1)?;
+            let parts = [
+                ("xn", col(&o.xn, WIDE, k), &one.xn[..]),
+                ("lo", col(&o.lo, R, k), &one.lo[..]),
+                ("wgt", col(&o.wgt, S, k), &one.wgt[..]),
+                ("mixed", col(&o.mixed, D, k), &one.mixed[..]),
+            ];
+            for (name, a, b) in parts {
+                if !bits_equal(a, b) {
+                    same = false;
+                    println!(
+                        "wide[cols:col{k}:{name}] differs max_ulps={}",
+                        max_ulps(a, b)
+                    );
+                }
+            }
+        }
+        let again = wide_mix(c, &mut w, site, true, &res, Pre::Plain, m)?;
+        let rerun = bits_equal(&again.mixed, &o.mixed) && bits_equal(&again.wgt, &o.wgt);
+        ok &= same && rerun;
+        println!(
+            "wide[cols] m={m}: columns 0, 1, {}, {} each its one-column mix bit_equal={same}; \
+             rerun bit_equal={rerun} {}",
+            m / 2,
+            m - 1,
+            verdict(same && rerun)
+        );
+        // (e) no silent failure: a NaN in one stream of one column raises (the
+        // quantizer's QuantColumn, the lowest code the launches raise) and
+        // leaves the other columns their clean bits; a column count past the
+        // scratch is refused by name.
+        let mut bad = res.clone();
+        bad[2 * WIDE + D + 11] = f32::NAN;
+        let o2 = wide_mix(c, &mut w, site, true, &bad, Pre::Plain, m)?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+        let others = (0..m).filter(|&k| k != 2).all(|k| {
+            bits_equal(col(&o2.mixed, D, k), col(&o.mixed, D, k))
+                && bits_equal(col(&o2.wgt, S, k), col(&o.wgt, S, k))
+        });
+        let p = o2.fault == want && others;
+        ok &= p;
+        println!(
+            "wide[fault] fault=\"{}\" want=\"{}\" the other columns clean={others} {}",
+            shown(o2.fault),
+            shown(want),
+            verdict(p)
+        );
+        let past_cols = WIDE_COLS + 1;
+        let res_long = activations(WIDE, past_cols, 0x3a04);
+        let got = wide_mix(c, &mut w, site, true, &res_long, Pre::Plain, past_cols);
+        let named = matches!(&got, Err(e) if e.to_string().contains("the wide scratch holds"));
+        ok &= named;
+        println!(
+            "wide[refuse] {past_cols} columns -> {} {}",
+            match &got {
+                Ok(_) => "accepted".to_owned(),
+                Err(e) => e.to_string(),
+            },
+            verdict(named)
+        );
+        Ok(ok)
     }
 }
