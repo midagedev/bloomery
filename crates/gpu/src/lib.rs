@@ -1989,6 +1989,13 @@ impl Gpu {
         &self.stream
     }
 
+    /// The engine stream as a shared handle, for a second card's host side
+    /// that must wait for this card's stream to drain.
+    #[must_use]
+    pub fn stream_handle(&self) -> Arc<CudaStream> {
+        Arc::clone(&self.stream)
+    }
+
     /// Capture `body`'s enqueues on the engine stream into a replayable
     /// graph. See `Graph::capture` for what the body may not do.
     pub fn capture<F>(&self, body: F) -> Result<Graph, GpuError>
