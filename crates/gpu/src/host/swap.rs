@@ -537,6 +537,10 @@ struct Shared {
     deadline: Duration,
     /// Stage whatever the window says: a quiet boundary's relayout.
     flush: AtomicBool,
+    /// Jobs the staging thread has finished (staged, or failed), counted
+    /// before each one's ticket is published: `jobs_issued - served` copies
+    /// wait for staging.
+    served: AtomicU64,
     stop: AtomicBool,
     /// The first staging failure, which the next boundary or reset returns.
     failed: Mutex<Option<StagingFailure>>,
@@ -637,6 +641,11 @@ impl Shared {
                 || self.flush.load(Ordering::Acquire)
                 || job.n < self.due.load(Ordering::Acquire)
         };
+        // No deadline: a job not yet due is idle while no pass runs (a
+        // server between requests). What ends the wait: the step port's
+        // window, a boundary landing the job (`due`), a reset's flush
+        // (`drain_copies`, first thing in `reset`), and the drop's `stop`,
+        // which `wait_until` reads on every turn.
         if self.wait_until(open, None) != Ok(true) {
             return Ok(false);
         }
@@ -685,6 +694,7 @@ impl Shared {
                     self.fail(&job, e);
                 }
             }
+            self.served.fetch_add(1, Ordering::AcqRel);
             // A max, never a store: a word the machine released past this
             // ticket stays released.
             self.staged(job.ring)
@@ -1029,6 +1039,7 @@ impl SwapMachine {
             due: AtomicU64::new(0),
             deadline: cfg.deadline,
             flush: AtomicBool::new(false),
+            served: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
         });
@@ -1529,6 +1540,24 @@ impl SwapMachine {
                 ),
             ));
         }
+        // Every copy waits on the copy stream for its staging. Behind a
+        // closed window, with no flush, a job stages only once its flip is
+        // due, which a later boundary of this host thread makes; so this
+        // thread must never enqueue so much behind unstaged jobs that the
+        // stream's queue fills and the enqueue blocks. A boundary issues at
+        // most the flips the rule keeps in flight (one event each); a reset
+        // stages whatever the window says. Past that the call is refused.
+        let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
+        if !self.shared.flush.load(Ordering::Acquire) && waiting >= self.events.len() as u64 {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {l} expert {id}: {waiting} copies already wait for staging with no \
+                     flush, and a boundary issues at most the {} flips the rule keeps in flight",
+                    self.events.len()
+                ),
+            ));
+        }
         let source = Arc::clone(&self.shared.source);
         let parts = source.part_bytes();
         let dsts = (0..parts.len())
@@ -1719,6 +1748,12 @@ impl SwapMachine {
             );
         }
         self.boundary_event.record(stream)?;
+        // The seed's copies stage as they are issued, whatever the window
+        // says: hundreds of them behind a closed window would fill the copy
+        // stream's queue while this thread still enqueues, and the flush that
+        // stages them (`drain_copies`) comes only after the last. On an error
+        // in between the flush stays on, which only stages sooner.
+        self.shared.flush.store(true, Ordering::Release);
         let mut placed = Vec::with_capacity(back.len());
         for &(l, id) in &back {
             let spare = self.ledger.spare(l).ok_or_else(|| {
