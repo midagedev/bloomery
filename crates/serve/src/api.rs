@@ -897,7 +897,7 @@ fn props(state: &State) -> Value {
 
 /// `engine.version`: the crate version and the commit the build script found
 /// (`unknown` for a tree without git).
-const VERSION: &str = concat!(
+pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
     env!("BLOOMERY_SERVE_COMMIT"),

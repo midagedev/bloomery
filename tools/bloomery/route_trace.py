@@ -13,17 +13,34 @@ read_manifest and read_topk open as they open router_trace's — with what the r
                  input is a prompt id), prompt_call, prompt_ids, cache, generated, stop, prompt_id, genre,
                  split; header lines `# key<TAB>value`, then `# columns<TAB>name...`, then the rows
 
-Every read refuses by name, never defaults: a call row whose columns do not parse, a slots file of another
-length than the set's positions x n_expert_used or holding a byte other than C, T, H, a contexts row that
+Every read refuses by name, never defaults: a call row whose columns do not parse, calls that do not start
+at position 0 or leave positions before the first, a slots file of another length than the set's positions
+x n_expert_used or holding a byte other than C, T, H, an id at or past n_expert, a contexts row that
 disagrees with its call row (first, prompt_call, end), a prompt outside prompt_call..end - first, a request
-index out of order, or a contexts file with another count of rows than the call rows.
+index out of order, a contexts file with another count of rows than the call rows, or a split other than
+learn and held.
+
+The writer rewrites MANIFEST.tsv after every position with `# positions` and writes `# complete` only when
+it finishes; a set without `# complete` is refused by every router set reader. Two commands mend a set
+whose writer's process is gone:
+
+    trim DIR   cut every layer file to the manifest's positions and say what was cut: a process killed
+               between a position's appends and its manifest leaves at most one position more on some
+               files. A file shorter than the manifest, one longer by more than a position, or a
+               mismatch in a complete set is refused.
+    seal DIR   trim, then write `# complete` (and `# sealed`, naming this tool) when every call ran its
+               prompt ids: what a driver does once the server it stopped with a signal has exited and
+               every request it sent was answered. A set already complete is refused.
 
     python3 tools/bloomery/route_trace.py check <set dir>   what router-coverage's reader and these read
+    python3 tools/bloomery/route_trace.py trim|seal <set dir>
     python3 tools/bloomery/route_trace.py --self-test
 
 tools/ has no packages: a script imports this file by path, as it imports manifest.py.
 """
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -39,6 +56,7 @@ CALL_COLUMNS = ("first", "prompt_call", "end", "pos0")
 CONTEXT_COLUMNS = ("request", "first", "end", "prompt", "prompt_call", "prompt_ids", "cache", "generated",
                    "stop", "prompt_id", "genre", "split")
 CONTEXT_INTS = ("request", "first", "end", "prompt", "prompt_call", "prompt_ids", "cache", "generated")
+SPLITS = ("learn", "held")
 
 
 class TraceError(ValueError):
@@ -53,6 +71,10 @@ def read_calls(set_dir):
         tokens = int(m.header["tokens"])
     except (manifest.ManifestError, KeyError, ValueError) as e:
         raise TraceError(f"{set_dir}: {e}") from None
+    if tokens and not calls:
+        raise TraceError(f"{set_dir}: {tokens} positions and no call row: every position belongs to a call")
+    if calls and calls[0]["first"] != 0:
+        raise TraceError(f"{set_dir}: the first call starts at position {calls[0]['first']}, not 0")
     for i, c in enumerate(calls):
         want_end = calls[i + 1]["first"] if i + 1 < len(calls) else tokens
         if c["end"] != want_end or not c["first"] + c["prompt_call"] <= c["end"]:
@@ -108,6 +130,8 @@ def read_contexts(set_dir):
                     r[k] = int(r[k])
                 except ValueError:
                     raise TraceError(f"{at}: {k} {r[k]!r} is not an integer") from None
+            if r["split"] not in SPLITS:
+                raise TraceError(f"{at}: split {r['split']!r} is not learn or held")
             rows.append(r)
     if len(rows) != len(calls):
         raise TraceError(f"{path}: {len(rows)} requests, the manifest has {len(calls)} call rows")
@@ -123,14 +147,93 @@ def read_contexts(set_dir):
     return rows, header
 
 
+def split_spans(set_dir, split):
+    """The [first, end) of every request of `split` in contexts.tsv, in order; refused by name when the set
+    has no contexts.tsv (no split to read) or `split` is not learn or held."""
+    if split not in SPLITS:
+        raise TraceError(f"split {split!r} is not learn or held")
+    rows, _ = read_contexts(set_dir)
+    if rows is None:
+        raise TraceError(f"{set_dir}: no contexts.tsv, so no learn/held split to read")
+    return [(r["first"], r["end"]) for r in rows if r["split"] == split]
+
+
+def _layout(set_dir):
+    """The manifest, its positions, n_expert_used and every layer's two files with their lengths in bytes a
+    position."""
+    try:
+        m = manifest.read(set_dir)
+        tokens = int(m.header["tokens"])
+        k = int(m.header["n_expert_used"])
+        layers = [r.int("layer") for r in m.rows("layer")]
+    except (manifest.ManifestError, KeyError, ValueError) as e:
+        raise TraceError(f"{set_dir}: {e}") from None
+    if "positions" in m.header and int(m.header["positions"]) != tokens:
+        raise TraceError(f"{set_dir}: # positions {m.header['positions']}, # tokens {tokens}")
+    files = [(os.path.join(set_dir, f"topk-{l}.u16"), 2 * k) for l in layers]
+    files += [(os.path.join(set_dir, f"slots-{l}.u8"), k) for l in layers]
+    return m, tokens, layers, files
+
+
+def trim(set_dir):
+    """Cut every layer file to the manifest's positions (the module doc); returns the line that says what
+    was cut."""
+    m, tokens, _, files = _layout(set_dir)
+    cut = []
+    for path, row in files:
+        size = os.path.getsize(path)
+        want = tokens * row
+        if size == want:
+            continue
+        if m.complete is not None:
+            raise TraceError(f"{path}: {size} bytes in a complete set of {tokens} positions ({want} bytes)")
+        if size < want or size - want > row:
+            raise TraceError(f"{path}: {size} bytes, the manifest's {tokens} positions are {want} bytes and a "
+                             f"killed writer leaves at most one position ({row} bytes) more")
+        cut.append((path, size - want))
+        os.truncate(path, want)
+    if not cut:
+        return f"trim {set_dir}: every file holds the manifest's {tokens} positions"
+    return (f"trim {set_dir}: cut to {tokens} positions: "
+            + ", ".join(f"{os.path.basename(p)} -{n} B" for p, n in cut))
+
+
+def seal(set_dir):
+    """trim, then `# complete` for a set whose writer's process is gone (the module doc); returns the lines
+    that say so."""
+    m, tokens, layers, _ = _layout(set_dir)
+    if m.complete is not None:
+        raise TraceError(f"{set_dir}: complete already ({m.complete!r})")
+    said = trim(set_dir)
+    calls, _ = read_calls(set_dir)
+    path = os.path.join(set_dir, "MANIFEST.tsv")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if not text.endswith("\n"):
+        raise TraceError(f"{path}: its last line is cut off")
+    text += ("# sealed\ttools/bloomery/route_trace.py seal: the writer's process ended without finishing the "
+             f"set\n# complete\t{tokens}\t{len(layers)}\n")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return f"{said}; sealed: {tokens} positions in {len(calls)} calls, # complete written"
+
+
 def check(set_dir):
     """Open the set through router-coverage's reader and these; one line a part."""
     spec = importlib.util.spec_from_file_location(
         "router_coverage", os.path.join(_here, "..", "ref", "router-coverage.py"))
     rc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rc)
-    s = rc.read_manifest(set_dir)
-    ids = [rc.read_topk(s, l) for l in s["layers"]]
+    try:
+        s = rc.read_manifest(set_dir)
+        ids = [rc.read_topk(s, l) for l in s["layers"]]
+    except rc.SetError as e:
+        raise TraceError(str(e)) from None
+    for l, a in zip(s["layers"], ids):
+        if len(a) and max(a) >= s["n_expert"]:
+            raise TraceError(f"{set_dir}: layer {l} holds id {max(a)}, not below n_expert {s['n_expert']}")
     print(f"router-coverage read_manifest: {s['tokens']} tokens, {len(s['layers'])} layers "
           f"{s['layers'][0]}..{s['layers'][-1]}, {s['n_expert']} experts, top-{s['n_used']}; read_topk: "
           f"{sum(len(a) for a in ids)} ids, max {max((max(a) for a in ids if len(a)), default=0)}")
@@ -151,14 +254,16 @@ def check(set_dir):
     return 0
 
 
-def _write_set(d, calls, tokens, n_layer=2, n_used=2, kinds=b"CH"):
+def _write_set(d, calls, tokens, n_layer=2, n_used=2, kinds=b"CH", complete=True, n_expert=8):
     os.makedirs(d)
-    lines = ["# router_trace — self-test", f"# tokens\t{tokens}", "# n_expert\t8", f"# n_expert_used\t{n_used}",
-             "# layer\tlayer\ttokens\tfile\tslots"]
+    lines = ["# router_trace — self-test", f"# tokens\t{tokens}", f"# n_expert\t{n_expert}",
+             f"# n_expert_used\t{n_used}", "# layer\tlayer\ttokens\tfile\tslots"]
     lines += [f"layer\t{l}\t{tokens}\ttopk-{l}.u16\tslots-{l}.u8" for l in range(n_layer)]
     lines.append("# call\tindex\tfirst\tprompt_call\tend\tpos0")
     lines += [f"call\t{i}\t{a}\t{p}\t{e}\t0" for i, (a, p, e) in enumerate(calls)]
-    lines.append(f"# complete\t{tokens}\t{n_layer}")
+    lines.append(f"# positions\t{tokens}")
+    if complete:
+        lines.append(f"# complete\t{tokens}\t{n_layer}")
     with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     for l in range(n_layer):
@@ -173,6 +278,72 @@ def _write_contexts(d, rows):
         f.write("# route-trace contexts — self-test\n# build\tb0\n# columns\t" + "\t".join(CONTEXT_COLUMNS) + "\n")
         for r in rows:
             f.write("\t".join(str(r[c]) for c in CONTEXT_COLUMNS) + "\n")
+
+
+def _refused(want, fn, *args):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fn(*args)
+    except TraceError as e:
+        assert want in str(e), (want, str(e))
+        return
+    raise AssertionError(f"accepted: {want}")
+
+
+def _self_test_mend(root):
+    """The call rows' start, the split, the ids' range, trim and seal."""
+    d = os.path.join(root, "late")
+    _write_set(d, [(1, 3, 9)], 9)
+    _refused("the first call starts at position 1, not 0", read_calls, d)
+    d = os.path.join(root, "nocall")
+    _write_set(d, [], 9)
+    _refused("9 positions and no call row", read_calls, d)
+    d = os.path.join(root, "wide")
+    _write_set(d, [(0, 3, 9)], 9, n_expert=4)
+    _refused("layer 0 holds id 7, not below n_expert 4", check, d)
+
+    d = os.path.join(root, "split")
+    _write_set(d, [(0, 3, 9), (9, 2, 12)], 12)
+    rows = [dict(request=0, first=0, end=9, prompt=4, prompt_call=3, prompt_ids=4, cache=0, generated=6,
+                 stop="eos", prompt_id="a", genre="ko", split="learn"),
+            dict(request=1, first=9, end=12, prompt=3, prompt_call=2, prompt_ids=3, cache=0, generated=1,
+                 stop="eos", prompt_id="b", genre="en", split="held")]
+    _refused("no contexts.tsv, so no learn/held split", split_spans, d, "learn")
+    _write_contexts(d, rows)
+    assert split_spans(d, "learn") == [(0, 9)] and split_spans(d, "held") == [(9, 12)]
+    _refused("split 'both' is not learn or held", split_spans, d, "both")
+    _write_contexts(d, [rows[0], dict(rows[1], split="test")])
+    _refused("split 'test' is not learn or held", read_contexts, d)
+
+    # A killed writer: layer 0's files one position past the manifest, layer 1's not.
+    d = os.path.join(root, "killed")
+    _write_set(d, [(0, 3, 9), (9, 2, 12)], 12, complete=False)
+    for name, extra in (("topk-0.u16", b"\x01\x00\x02\x00"), ("slots-0.u8", b"CH")):
+        with open(os.path.join(d, name), "ab") as f:
+            f.write(extra)
+    said = seal(d)
+    assert "topk-0.u16 -4 B, slots-0.u8 -2 B" in said and "12 positions in 2 calls" in said, said
+    m = manifest.read(d)
+    assert m.complete == "12\t2" and m.header["sealed"].startswith("tools/bloomery/route_trace.py seal"), m.header
+    assert os.path.getsize(os.path.join(d, "topk-0.u16")) == 48 and "every file holds" in trim(d)
+    _refused("complete already", seal, d)
+    with open(os.path.join(d, "slots-1.u8"), "ab") as f:
+        f.write(b"C")
+    _refused("slots-1.u8: 25 bytes in a complete set of 12 positions", trim, d)
+    d = os.path.join(root, "far")
+    _write_set(d, [(0, 3, 12)], 12, complete=False)
+    with open(os.path.join(d, "topk-1.u16"), "ab") as f:
+        f.write(bytes(8))
+    _refused("at most one position (4 bytes) more", trim, d)
+    d = os.path.join(root, "short")
+    _write_set(d, [(0, 3, 12)], 12, complete=False)
+    with open(os.path.join(d, "slots-0.u8"), "r+b") as f:
+        f.truncate(23)
+    _refused("slots-0.u8: 23 bytes", trim, d)
+    d = os.path.join(root, "cutcall")
+    _write_set(d, [(0, 3, 9), (9, 5, 12)], 12, complete=False)
+    _refused("call 1", seal, d)
+    assert manifest.read(d).complete is None
 
 
 def self_test():
@@ -226,6 +397,7 @@ def self_test():
             raise AssertionError("a slots file longer than the set was read")
         except TraceError as e:
             assert "holds 25 kinds, not tokens x n_expert_used = 24" in str(e), e
+        _self_test_mend(root)
     print("route_trace: self-test ok")
     return 0
 
@@ -233,9 +405,12 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         sys.exit(self_test())
-    if len(sys.argv) == 3 and sys.argv[1] == "check":
+    if len(sys.argv) == 3 and sys.argv[1] in ("check", "trim", "seal"):
         try:
-            sys.exit(check(sys.argv[2]))
+            if sys.argv[1] == "check":
+                sys.exit(check(sys.argv[2]))
+            print(trim(sys.argv[2]) if sys.argv[1] == "trim" else seal(sys.argv[2]))
+            sys.exit(0)
         except (TraceError, OSError, ValueError) as e:
             print(f"route_trace: {e}", file=sys.stderr)
             sys.exit(1)

@@ -48,14 +48,22 @@
 //!   its own; and after a reset the prompt answers its clean token again.
 //!   And the route trace (`bloomery_gpu::host::route_trace`) holds what the
 //!   engine routed: attached to the host tier, it records a prompt call of
-//!   five ids fed one step each, a step on the prompt's sixth id and three
-//!   greedy steps — a server's split of a request — through the captured
-//!   step; read back from disk, it holds 9 positions of 40 layers, one
-//!   `call` row (first 0, prompt call 5, end 9, position 0), and at every
-//!   position and layer the ids the router wrote in an eager walk of the
-//!   same tokens from a reset (its `Seam::Ffn` taps, read off the card), and
-//!   `C` exactly where that walk's handoff placed the slot on the card; the
-//!   walk's argmax tokens are the traced run's.
+//!   five ids through the session's prompt call (`app::Prompt`, under the
+//!   step feed this gate loads with), a step on the prompt's sixth id and
+//!   three greedy steps — a server's split of a request — through the
+//!   captured step. Read while attached, the set holds those 9 positions
+//!   and no `# complete`; read after the writer finishes, 9 positions of 40
+//!   layers, `# complete` 9, one `call` row (first 0, prompt call 5, end 9,
+//!   position 0), and at every position and layer the ids the router wrote
+//!   in an eager walk of the same tokens from a reset (its `Seam::Ffn` taps,
+//!   read off the card), each slot's kind the one that walk's handoff placed
+//!   (`C` card, `T` tier, `H` host) and the slot map's; the walk's argmax
+//!   tokens are the traced run's. A second trace recovers: a prompt call of
+//!   the id past the vocabulary (refused before it runs an id), then the
+//!   five-id call; a step with layer 1's window ring poisoned (refused at
+//!   layer 1, after layer 0 was recorded), a reset, then the five-id call
+//!   again — each good call answered, and the set 10 positions in two call
+//!   rows, the second call's ids and kinds the first's.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -149,13 +157,16 @@ mod gate {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use app::Prompt;
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::host::route_trace::{CARD, RouteTrace, TraceHeader, TraceSet};
-    use bloomery_gpu::hybrid::{Chain, HOST, HostExperts, PoisonKind, RELEASE};
+    use bloomery_gpu::host::route_trace::{
+        KIND_CARD, KIND_HOST, KIND_TIER, RouteTrace, TraceHeader, TraceSet,
+    };
+    use bloomery_gpu::hybrid::{Chain, HOST, HostExperts, PoisonKind, RELEASE, Slot, TIER};
     use bloomery_gpu::model::{ChainBody, HostServed};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
-    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, Seam};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PrefillMode, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
     use bloomery_gpu_deepseek41::chain::ffn::{Ds41Host, FfnPiece};
     use bloomery_gpu_deepseek41::chain::glue::Glue;
@@ -277,7 +288,16 @@ mod gate {
             R8,
         ])?;
         let args = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        // The route trace's clauses feed their prompts through the session's
+        // prompt call, which records the step feed; no other clause reads the
+        // body's prompt schedule.
+        cfg.body.prefill = PrefillMode::Steps;
+        if args.structure {
+            for dir in [TRACE_DIR, TRACE_RECOVER_DIR] {
+                free_trace_dir(&std::env::current_dir()?.join(dir))?;
+            }
+        }
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
@@ -321,6 +341,7 @@ mod gate {
             pass &= fault_case(&mut m, plan.n_l.len())?;
             pass &= fault_behind_error_case(&mut m, &hp)?;
             pass &= route_trace_case(&mut m, &mut head, &hp, &path)?;
+            pass &= route_trace_recover_case(&mut m, &hp, &path)?;
         }
         if args.sets {
             pass &= sets(&mut m, &mut head, &split, &hp, cfg.body.host.r8, &SETS)?;
@@ -517,16 +538,33 @@ mod gate {
     /// the next run, and read by `tools/bloomery/route_trace.py check`.
     const TRACE_DIR: &str = "target/route-trace-gate";
 
-    /// `dir` made free for a new trace: an earlier run's set is removed, any
-    /// other path there is refused by name.
+    /// Where the recovery clause writes its set, as [`TRACE_DIR`].
+    const TRACE_RECOVER_DIR: &str = "target/route-trace-gate-recover";
+    /// The `# build` line of the sets this gate writes: the one mark by which
+    /// it removes an earlier run's set.
+    const TRACE_BUILD: &str = "gate_deepseek41_step";
+
+    /// `dir` made free for a new trace: an earlier run's set of this gate —
+    /// a route trace whose manifest names [`TRACE_BUILD`] — is removed; any
+    /// other path there, one without a manifest, or one whose manifest
+    /// cannot be read is refused by name and kept.
     fn free_trace_dir(dir: &std::path::Path) -> Result<(), GateError> {
         if !dir.exists() {
             return Ok(());
         }
-        let first = std::fs::read_to_string(dir.join("MANIFEST.tsv")).unwrap_or_default();
-        if !first.starts_with("# router_trace — bloomery engine") {
+        let path = dir.join("MANIFEST.tsv");
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "{} exists and its manifest cannot be read ({e}): not removing it",
+                dir.display()
+            )
+        })?;
+        let ours = text.starts_with("# router_trace — bloomery engine")
+            && text.lines().any(|l| l == format!("# build\t{TRACE_BUILD}"));
+        if !ours {
             return Err(format!(
-                "{} exists and holds no route trace of this gate: not removing it",
+                "{} exists and holds no route trace of this gate (# build {TRACE_BUILD}): not \
+                 removing it",
                 dir.display()
             )
             .into());
@@ -548,41 +586,25 @@ mod gate {
         let dir = std::env::current_dir()?.join(TRACE_DIR);
         free_trace_dir(&dir)?;
         let n_layer = hp.n_layer;
-        let header = TraceHeader {
-            model: PathBuf::from(path),
-            arch: "deepseek41".to_owned(),
-            build: "gate_deepseek41_step".to_owned(),
-            n_expert: hp.experts.n_expert,
-            n_used: hp.experts.n_used,
-            n_layer,
-            extra: vec![("placement".to_owned(), "gate".to_owned())],
-        };
         m.reset()?;
-        let trace = RouteTrace::create(&dir, header)?;
-        m.body_parts(WHAT)?
-            .2
-            .hybrid_mut()
-            .attach_route_trace(trace)?;
-        // A server's request: the prompt call, the last prompt id as a step,
-        // then greedy steps. The trace is taken off on every path.
+        attach_trace(m, &dir, hp, path)?;
+        // A server's request: the prompt call (the session's, which marks
+        // it), the last prompt id as a step, then greedy steps. The set is
+        // read once while the trace is attached, and the trace is taken off
+        // on every path.
         let (call, last) = TRACE_PROMPT.split_at(TRACE_PROMPT.len() - 1);
-        let traced = (|| -> Result<Vec<u32>, GateError> {
-            let pos = m.pos();
-            m.body_parts(WHAT)?
-                .2
-                .hybrid_mut()
-                .route_prompt(pos, call.len())?;
-            m.step(call)?;
+        let traced = (|| -> Result<(Vec<u32>, TraceSet), GateError> {
+            <Body as Prompt>::prompt(m, call)?;
             let mut out = vec![m.step(last)?];
             for _ in 0..TRACE_GREEDY {
                 let t = *out.last().ok_or("no token")?;
                 out.push(m.step(&[t])?);
             }
-            Ok(out)
+            Ok((out, TraceSet::read(&dir)?))
         })();
         let detached = m.body_parts(WHAT)?.2.hybrid_mut().take_route_trace();
-        let generated = traced?;
-        let written = detached.map_or(0, |t| t.rows());
+        let (generated, open) = traced?;
+        let written = detached.map_or(Ok(0), RouteTrace::finish)?;
         // The positions' input tokens: the prompt, then every generated
         // token but the last.
         let tokens: Vec<u32> = TRACE_PROMPT
@@ -596,7 +618,7 @@ mod gate {
         // seam.
         m.reset()?;
         let mut want_ids = vec![Vec::new(); n_layer];
-        let mut want_card = vec![Vec::new(); n_layer];
+        let mut want_kind = vec![Vec::new(); n_layer];
         let mut walked = Vec::new();
         {
             let (gpu, w, body) = m.body_parts(WHAT)?;
@@ -610,14 +632,18 @@ mod gate {
                         stream.synchronize()?;
                         let ids = taps.router.ids.to_host_vec(stream)?;
                         let sel = taps.sel.to_host_vec(stream)?;
-                        if let (Some(i), Some(s), Some(wi), Some(wc)) = (
+                        if let (Some(i), Some(s), Some(wi), Some(wk)) = (
                             ids.get(..N_USED),
                             sel.get(..N_USED),
                             want_ids.get_mut(layer),
-                            want_card.get_mut(layer),
+                            want_kind.get_mut(layer),
                         ) {
                             wi.extend_from_slice(i);
-                            wc.extend(s.iter().map(|&p| p != HOST));
+                            wk.extend(s.iter().map(|&p| match p {
+                                HOST => KIND_HOST,
+                                p if p & TIER != 0 => KIND_TIER,
+                                _ => KIND_CARD,
+                            }));
                             seen += 1;
                         }
                     }
@@ -639,21 +665,34 @@ mod gate {
 
         let set = TraceSet::read(&dir)?;
         let rows = tokens.len();
+        let n = Some(rows as u64);
         let shape = set.tokens == rows as u64
-            && set.complete == Some(rows as u64)
+            && set.positions == n
+            && set.complete == n
             && written == rows as u64
             && set.n_used == N_USED
             && set.ids.len() == n_layer;
         println!(
-            "route trace shape: {} positions on disk (manifest tokens, complete {:?}, writer {written}) \
-             of {} layers x {} ids; want {rows} = prompt call {} + {} steps, {n_layer} x {N_USED} {}",
+            "route trace shape: {} positions on disk (manifest tokens, positions {:?}, complete {:?}, \
+             writer {written}) of {} layers x {} ids; want {rows} = prompt call {} + {} steps, \
+             {n_layer} x {N_USED} {}",
             set.tokens,
+            set.positions,
             set.complete,
             set.ids.len(),
             set.n_used,
             call.len(),
             1 + TRACE_GREEDY,
             verdict(shape)
+        );
+        let sealed = open.tokens == rows as u64 && open.positions == n && open.complete.is_none();
+        println!(
+            "route trace complete: attached, the set on disk holds {} positions (# positions {:?}) \
+             and # complete {:?}; want {rows} and none until the writer finishes {}",
+            open.tokens,
+            open.positions,
+            open.complete,
+            verdict(sealed)
         );
         let want_call = (0u64, call.len() as u64, rows as u64, 0u32);
         let marks = set.calls == [want_call];
@@ -687,20 +726,17 @@ mod gate {
                     ));
                 }
                 let k = kinds.get(span.clone()).unwrap_or_default();
-                let card = want_card[l].get(span).unwrap_or_default();
-                if kinds_bad.is_none()
-                    && (k.len() != card.len()
-                        || k.iter().zip(card).any(|(&k, &c)| (k == CARD) != c))
-                {
+                let walk = want_kind[l].get(span).unwrap_or_default();
+                if kinds_bad.is_none() && k != walk {
                     kinds_bad = Some(format!(
-                        "layer {l} position {p}: kinds {k:?}, card {card:?}"
+                        "layer {l} position {p}: kinds {k:?}, the walk's handoff {walk:?}"
                     ));
                 }
                 for (&id, &kind) in g.iter().zip(k) {
                     let by_map = match slots.slot(l, u32::from(id)) {
-                        Some(bloomery_gpu::hybrid::Slot::Card(_)) => Some(b'C'),
-                        Some(bloomery_gpu::hybrid::Slot::Tier(_)) => Some(b'T'),
-                        Some(bloomery_gpu::hybrid::Slot::Host) => Some(b'H'),
+                        Some(Slot::Card(_)) => Some(KIND_CARD),
+                        Some(Slot::Tier(_)) => Some(KIND_TIER),
+                        Some(Slot::Host) => Some(KIND_HOST),
                         None => None,
                     };
                     if slots_bad.is_none() && by_map != Some(kind) {
@@ -719,9 +755,9 @@ mod gate {
         );
         let kinds_ok = shape && kinds_bad.is_none() && slots_bad.is_none();
         println!(
-            "route trace slots: C exactly where the walk's handoff placed the slot on the card, and \
-             each kind the slot map's {} {} {}",
-            kinds_bad.as_deref().unwrap_or("(card places agree)"),
+            "route trace slots: each kind the one the walk's handoff placed (C its card, T its tier, H \
+             the host), and the slot map's {} {} {}",
+            kinds_bad.as_deref().unwrap_or("(handoff places agree)"),
             slots_bad.as_deref().unwrap_or("(slot map agrees)"),
             verdict(kinds_ok)
         );
@@ -732,7 +768,142 @@ mod gate {
             verdict(same)
         );
         println!("route trace set: {}", dir.display());
-        Ok(shape && marks && ids_ok && kinds_ok && same)
+        Ok(shape && sealed && marks && ids_ok && kinds_ok && same)
+    }
+
+    /// A new route trace of `hp`'s layers into `dir`, attached to the host
+    /// tier, its header the gate's.
+    fn attach_trace(
+        m: &mut Deepseek41Model,
+        dir: &std::path::Path,
+        hp: &Hparams,
+        path: &str,
+    ) -> Result<(), GateError> {
+        let header = TraceHeader {
+            model: PathBuf::from(path),
+            arch: "deepseek41".to_owned(),
+            build: TRACE_BUILD.to_owned(),
+            n_expert: hp.experts.n_expert,
+            n_used: hp.experts.n_used,
+            n_layer: hp.n_layer,
+            extra: vec![("placement".to_owned(), "gate".to_owned())],
+        };
+        let trace = RouteTrace::create(dir, header)?;
+        m.body_parts("gate_deepseek41_step route_trace")?
+            .2
+            .hybrid_mut()
+            .attach_route_trace(trace)?;
+        Ok(())
+    }
+
+    /// The layer whose window ring the recovery clause poisons: past layer
+    /// 0, so the refused step has served (and recorded) a layer first.
+    const RECOVER_LAYER: usize = 1;
+
+    /// The route trace's recovery clause (the module doc): a prompt call a
+    /// step refuses before it runs an id, then a good one; a step refused
+    /// between two layers, a reset, then a good prompt call. Every call goes
+    /// through the session's prompt call; the set holds the two good calls'
+    /// positions, the second the first's ids again.
+    fn route_trace_recover_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        path: &str,
+    ) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step route_trace recover";
+        let dir = std::env::current_dir()?.join(TRACE_RECOVER_DIR);
+        free_trace_dir(&dir)?;
+        let (call, last) = TRACE_PROMPT.split_at(TRACE_PROMPT.len() - 1);
+        let bad = u32::try_from(hp.n_vocab)?;
+        m.reset()?;
+        attach_trace(m, &dir, hp, path)?;
+        let describe = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        let run = (|| -> Result<(Vec<String>, bool), GateError> {
+            // The id past the vocabulary is refused on the host before its
+            // launch: the call runs none of its one id.
+            let refused = <Body as Prompt>::prompt(m, &[bad]);
+            let after_refused = <Body as Prompt>::prompt(m, call);
+            {
+                let (gpu, _, body) = m.body_parts(WHAT)?;
+                let stream = gpu.stream();
+                let ring = body
+                    .state_mut(RECOVER_LAYER)
+                    .ok_or("the body does not run the recovery layer")?
+                    .ring;
+                let width = ring.cols();
+                let mut host = ring.buf().to_host_vec(stream)?;
+                host[..width].fill(NAN_F16);
+                ring.buf_mut().copy_from_host(stream, &host)?;
+            }
+            let cut = m.step(last);
+            let mid = m
+                .body(WHAT)?
+                .hybrid()
+                .stats()
+                .last_poison
+                .is_some_and(|p| p.kind == PoisonKind::Refused && p.layer == RECOVER_LAYER);
+            let reset = m.reset();
+            let after_reset = <Body as Prompt>::prompt(m, call);
+            let ok = refused.is_err()
+                && after_refused.is_ok()
+                && cut.is_err()
+                && mid
+                && reset.is_ok()
+                && after_reset.is_ok();
+            let lines = vec![
+                format!("prompt [{bad}] {}", describe(&refused)),
+                format!("then the prompt {}", describe(&after_refused)),
+                format!(
+                    "a step with layer {RECOVER_LAYER}'s ring poisoned {} (refused at that \
+                     layer: {mid})",
+                    describe(&cut)
+                ),
+                match &reset {
+                    Ok(()) => "reset Ok".to_owned(),
+                    Err(e) => format!("reset error \"{e}\""),
+                },
+                format!("then the prompt {}", describe(&after_reset)),
+            ];
+            Ok((lines, ok))
+        })();
+        let detached = m.body_parts(WHAT)?.2.hybrid_mut().take_route_trace();
+        let (lines, ran) = run?;
+        let written = detached.map_or(Ok(0), RouteTrace::finish)?;
+        m.reset()?;
+        println!("route trace recover: {} {}", lines.join("; "), verdict(ran));
+        let set = TraceSet::read(&dir)?;
+        let k = call.len();
+        let rows = 2 * k;
+        let want_calls = [
+            (0u64, k as u64, k as u64, 0u32),
+            (k as u64, k as u64, rows as u64, 0u32),
+        ];
+        let again = set.ids.len() == hp.n_layer
+            && set.ids.iter().zip(&set.kinds).all(|(ids, kinds)| {
+                let (a, b) = ids.split_at(ids.len().min(k * N_USED));
+                let (c, d) = kinds.split_at(kinds.len().min(k * N_USED));
+                a == b && c == d
+            });
+        let held = set.tokens == rows as u64
+            && set.complete == Some(rows as u64)
+            && written == rows as u64
+            && set.calls == want_calls
+            && again;
+        println!(
+            "route trace recover set: {} positions (complete {:?}, writer {written}), call rows {:?}; \
+             want {rows}, [{:?}, {:?}] (the refused call dropped, the cut position never written), \
+             the second call's ids and kinds the first's on every layer {again} {}",
+            set.tokens,
+            set.complete,
+            set.calls,
+            want_calls[0],
+            want_calls[1],
+            verdict(held)
+        );
+        Ok(ran && held)
     }
 
     /// The output norm's gain, whose first value the fault-behind-an-error

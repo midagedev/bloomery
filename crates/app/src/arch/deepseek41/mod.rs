@@ -179,7 +179,8 @@ impl Session<Body> {
     /// first position they hold, then one row a position): under the batched
     /// schedule the rows of the call's last `window` positions, per batch
     /// ([`body::prefill_with`]); under steps every position's, after its
-    /// step. The argmax after the last id.
+    /// step, the host tier's route trace told the call's positions first as
+    /// [`Prompt::prompt`] tells it. The argmax after the last id.
     pub fn prompt_tapped(
         &mut self,
         ids: &[u32],
@@ -193,6 +194,12 @@ impl Session<Body> {
                 Ok(body::prefill_with(self.model_mut(), ids, Some(rows))?)
             }
             PrefillMode::Steps => {
+                let pos = self.pos();
+                self.model_mut()
+                    .body_parts(WHAT)?
+                    .2
+                    .hybrid_mut()
+                    .route_prompt(pos, ids.len())?;
                 let mut next = None;
                 for &id in ids {
                     let pos = self.pos();

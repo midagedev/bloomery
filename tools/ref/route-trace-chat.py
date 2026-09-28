@@ -7,7 +7,9 @@
     tools/ref/route-trace-chat.py join DIR
     tools/ref/route-trace-chat.py --self-test
 
-run    Starts `timeout --kill-after=10 BOUND BIN --host 127.0.0.1 --port 0 --place PLACE --cache-ram 0`
+run    DIR is an absolute path or one under the repository's target/: a path elsewhere in the tree is
+       refused by name, since tools/box.sh's sync (rsync --delete) removes what it does not carry.
+       Starts `timeout --kill-after=10 BOUND BIN --host 127.0.0.1 --port 0 --place PLACE --cache-ram 0`
        with BLOOMERY_ROUTE_TRACE=DIR and BLOOMERY_PREFILL=steps (the trace records the step feed; the
        server creates DIR at main and refuses an existing one), its stderr in DIR.serve.log, and waits for
        its `listening` record (tools/bloomery/records.py). Then, for every prompt row of the files in file
@@ -16,7 +18,11 @@ run    Starts `timeout --kill-after=10 BOUND BIN --host 127.0.0.1 --port 0 --pla
        n_predict N, cache_prompt false (each request from an empty cache, so no request keeps the template
        head of the one before), return_tokens. One line a request into DIR/requests.tsv as it returns.
        Then TERM to the timeout's pid (recorded at spawn; the timeout passes it on), KILL 30 s later if it
-       is still up, and `join`. Exit 1 with the reason on any failure, after stopping the server.
+       is still up. The server never finishes its trace (a TERM runs no drop), so once it has exited
+       with every request answered the driver seals the set (tools/bloomery/route_trace.py seal: the
+       files cut to the manifest's positions, `# complete` written), then `join`. Exit 1 with the
+       reason on any failure, after stopping the server; a set the driver did not seal stays without
+       `# complete`, which every router set reader refuses.
 join   DIR/contexts.tsv from DIR/requests.tsv and the set's call rows (tools/bloomery/route_trace.py
        read_calls), refused by name unless every request agrees with the serve contract
        (crates/serve/src/engine.rs): cut or reset to `cache` k, a prompt call of ids[k..n-1], a step on
@@ -50,6 +56,8 @@ def _load(name, rel):
 
 
 rt = _load("route_trace", "../bloomery/route_trace.py")
+
+ROOT = os.path.realpath(os.path.join(_here, "..", ".."))
 
 REQUEST_COLUMNS = ("request", "prompt_id", "domain", "genre", "split", "prompt_ids", "cache", "prompt_n",
                    "generated", "stop")
@@ -174,11 +182,25 @@ def listening_port(log, records):
     return int(str(rec["addr"]).rsplit(":", 1)[1])
 
 
+def out_paths(out, root=ROOT):
+    """The trace directory and its server log for `--out`, refused by name when either lands in the
+    repository tree `root` outside its target/ (the sync removes it)."""
+    out = os.path.realpath(out)
+    log = out + ".serve.log"
+    target = os.path.join(root, "target")
+    for p in (out, log):
+        inside = os.path.commonpath([p, root]) == root
+        kept = os.path.commonpath([p, target]) == target and p != target
+        if inside and not kept:
+            raise DriverError(f"--out {out}: {p} is inside the repository tree {root}, whose next box sync "
+                              f"deletes it; give an absolute path outside it or one under {target}/")
+    return out, log
+
+
 def run(a):
     records = _load("records", "../bloomery/records.py")
     prompts = read_prompts(a.prompts.split(","))
-    out = os.path.abspath(a.out)
-    log = out + ".serve.log"
+    out, log = out_paths(a.out)
     if os.path.exists(out):
         raise DriverError(f"{out} exists: the trace takes a new directory")
     env = dict(os.environ, BLOOMERY_ROUTE_TRACE=out, BLOOMERY_PREFILL="steps")
@@ -226,6 +248,10 @@ def run(a):
                       f"{stop}, {time.monotonic() - t:.1f} s", flush=True)
     finally:
         stop_server(p)
+    try:
+        print(f"route-trace-chat: {rt.seal(out)}", flush=True)
+    except rt.TraceError as e:
+        raise DriverError(str(e)) from None
     rows = join(out)
     pos = sum(r["end"] - r["first"] for r in rows)
     print(f"route-trace-chat: {len(rows)} requests, {pos} positions, prompt {sum(r['prompt'] for r in rows)}, "
@@ -247,6 +273,14 @@ def stop_server(p):
 
 
 def self_test():
+    root = "/r/bloomery"
+    for out, ok in (("/r/bloomery/d2", False), ("/r/bloomery/tools/x", False), ("/r/bloomery/target", False),
+                    ("/r/bloomery/target/d2", True), ("/r/other/d2", True), ("/r/bloomery-x/d2", True)):
+        try:
+            got = out_paths(out, root)
+            assert ok and got == (out, out + ".serve.log"), (out, got)
+        except DriverError as e:
+            assert not ok and "inside the repository tree /r/bloomery" in str(e), (out, str(e))
     rows = read_prompts([os.path.join(_here, "data", "d2-prompts-ko.tsv"),
                          os.path.join(_here, "data", "d2-prompts-en-code.tsv")])
     genres = [r["genre"] for r in rows]

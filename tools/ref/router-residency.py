@@ -7,7 +7,8 @@
     tools/ref/router-residency.py hit <family> [<set>...] --window N [--prompt P] [--open M|all
                                   [--stage K] [--open-from all|last:N]] [--seed <seed>] [--d D]
                                   [--copies K] [--json PATH]
-    tools/ref/router-residency.py gen <family> <trace> [--prompt P] [--window N] [--short skip] [--seed <seed>]
+    tools/ref/router-residency.py gen <family> <trace> [--prompt P] [--window N] [--short skip] [--split held|learn]
+                                  [--seed <seed>]
                                   [--open M|all] [--stage K] [--open-from all|last:N] [--d D]
                                   [--copies K] [--json PATH]
     tools/ref/router-residency.py fixture --out PATH [--passes N] [--lcg SEED]
@@ -58,6 +59,11 @@ gen      The router-gen replay: <trace> holds prompt + generation in one context
          gives each request's context and its own P (the `prompt` column) instead, and --prompt is
          refused beside it. A context shorter than P + N is refused by name; with --short skip it gets
          no window arms (a `skipped K of M` line lists them) and still counts in the steady rule.
+         --split held|learn scores only that split's requests of a contexts.tsv (the steady rule still
+         walks every position); without it a `split:` line says both are scored, and --split on a
+         trace with no contexts.tsv is refused. A hot:<file> seed whose `# sets` names the trace is
+         refused unless --split held and the file's `# split` is learn (tools/ref/router-hotlist.py
+         --split learn): a list learned on the requests it is scored on is in-sample.
          Over the window [P, P + N) of each context (N = --window, 96):
            (a) static    the seed's card set
            (b) adaptive  the rule from zero counts, reset to the seed at P
@@ -706,15 +712,20 @@ def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, cop
 
 
 def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spares=1, per_pass=False,
-               skipped=None, last=None):
+               skipped=None, last=None, scored=None):
     """Per context (start, end) of X [T, L, K]: (a), (b), (c) over [start + P, start + P + N), (a) over
     [start + P, end); and the steady rule's hit over every [start + P, end). A context (start, end, p)
     carries its own P. A context shorter than P + N is refused by name, unless `skipped` is a list: then
-    it has no row and (index, length, P + N) goes into the list, and it still counts in the steady hit."""
+    it has no row and (index, length, P + N) goes into the list, and it still counts in the steady hit.
+    With `scored` a set of context indices, the others get no row and no share of the steady hit; the
+    steady rule still runs over every position."""
     rows = []
     res0 = seed_resident(seed, n_l, E)
     contexts = [c if len(c) == 3 else (c[0], c[1], P) for c in contexts]
+    counted = [scored is None or c in scored for c in range(len(contexts))]
     for c, (t0, t1, P) in enumerate(contexts):
+        if not counted[c]:
+            continue
         if t1 - t0 < P + N and skipped is not None:
             skipped.append((c, t1 - t0, P + N))
             continue
@@ -729,8 +740,35 @@ def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spare
         rows.append(dict(context=c, a=float(a), b=float(b), c=float(ch.mean()), open=op, a_all=float(a_all)))
     steady = replay(X, res0, n_l, E, rule, sem="flip", spares=spares, in_flight_cap=not per_pass, d=d,
                     link=Budget(copies)).per_row
-    gen_rows = np.concatenate([steady[t0 + P:t1] for t0, t1, P in contexts])
+    gen_rows = np.concatenate([steady[t0 + P:t1] for (t0, t1, P), k in zip(contexts, counted) if k])
     return rows, float(gen_rows.mean())
+
+
+def hot_header(path):
+    """A router-hotlist.py file's `# key<TAB>value` lines (read_hot reads its layer lines)."""
+    header = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("# ") and "\t" in line:
+                key, value = line[2:].rstrip("\n").split("\t", 1)
+                header.setdefault(key, value)
+    return header
+
+
+def hot_guard(seedname, trace, split):
+    """Refuse a hot:<file> seed learned on the trace it would score, unless it learned on the trace's
+    learn requests alone and --split held scores the others."""
+    if not seedname.startswith("hot:"):
+        return
+    path = seedname[4:]
+    header = hot_header(path)
+    names = [x.rsplit(":", 1)[0] for x in header.get("sets", "").split(",") if x]
+    if trace not in names:
+        return
+    if split != "held" or header.get("split") != "learn":
+        raise ToolError(f"gen: {path} was learned on {trace} (# sets {header.get('sets')}, # split "
+                        f"{header.get('split', 'none: every position')}); scored on it without --split held "
+                        "over a list of its learn requests (router-hotlist.py --split learn) it is in-sample")
 
 
 def verdict(a, c, steady):
@@ -1102,6 +1140,8 @@ def cmd_gen(a, out):
         raise ToolError(str(e)) from None
     if requests is not None and a.prompt is not None:
         raise ToolError(f"{d}: contexts.tsv gives each context its prompt; --prompt is refused beside it")
+    if requests is None and a.split is not None:
+        raise ToolError(f"{d}: no contexts.tsv, so no learn/held split for --split {a.split}")
     if requests is None and (a.prompt is None or a.prompt < 1):
         raise ToolError("gen needs --prompt P >= 1: the positions [0, P) of each context are the prompt")
     N = 96 if a.window is None else a.window
@@ -1131,12 +1171,25 @@ def cmd_gen(a, out):
     if seedname == "pooled" and s.name in F["sets"]:
         raise ToolError(f"gen: {s.name} is one of family {a.family}'s corpus sets, whose first halves build the pooled "
                         "seed: the seed would have seen the trace; use hot:<file> or prefix")
+    hot_guard(seedname, s.name, a.split)
     lists = seed_lists(a.family, s, seedname, a.data, n_l)
     rule = Rule(a.rule)
     X = s.stack(F["eligible"])
     skipped = [] if a.short == "skip" else None
+    scored = None
+    if requests is not None and a.split is not None:
+        scored = {i for i, r in enumerate(requests) if r["split"] == a.split}
+        if not scored:
+            raise ToolError(f"{d}: no request of split {a.split}")
+    if requests is None:
+        split_line = None
+    elif scored is None:
+        split_line = "split: none given, the learn and the held requests both scored"
+    else:
+        split_line = (f"split: {a.split}, {len(scored)} of {len(requests)} requests scored; the steady rule walks "
+                      "every position")
     rows, steady = gen_values(X, contexts, a.prompt, N, lists, n_l, s.E, rule, M, stage, a.d, a.copies, a.spares,
-                              a.spares_per_pass, skipped, last)
+                              a.spares_per_pass, skipped, last, scored)
     if not rows:
         raise ToolError(f"every one of the {len(contexts)} contexts is shorter than its P + window {N}")
     kept = [contexts[r["context"]] for r in rows]
@@ -1145,6 +1198,8 @@ def cmd_gen(a, out):
     out.write(f"# seed {seedname}, n_l {min(n_l)}..{max(n_l)} on {len(n_l)} layers, rule {rule.text()}, flip {spares_text(a)}, "
               f"d {a.d}, copies/step {a.copies}; open M={'all' if M is None else M} stage {stage}"
               + (f" from the last {last} prompt positions" if last else "") + "\n")
+    if split_line is not None:
+        out.write(split_line + "\n")
     if skipped is not None:
         lengths = ", ".join(f"{c}:{n}<{w}" for c, n, w in skipped) or "none"
         out.write(f"skipped {len(skipped)} of {len(contexts)} contexts shorter than P+N (lengths context:positions<P+N "
@@ -1164,6 +1219,8 @@ def cmd_gen(a, out):
               "of each context\n")
     out.write("verdict: " + verdict(mean["a"], mean["c"], steady) + "\n")
     res = dict(contexts=rows, mean=mean, a_all=a_all, steady=steady, verdict=verdict(mean["a"], mean["c"], steady))
+    if requests is not None:
+        res["split"] = a.split or "both"
     if skipped is not None:
         res["skipped"] = [dict(context=c, positions=n, need=w) for c, n, w in skipped]
     if last is not None:
@@ -1264,6 +1321,7 @@ def parser():
     g.add_argument("trace")
     common(g)
     g.add_argument("--short", choices=("skip",))
+    g.add_argument("--split", choices=("held", "learn"))
     f = sub.add_parser("fixture")
     f.add_argument("--out", required=True)
     f.add_argument("--passes", type=int, default=400)
@@ -1547,6 +1605,78 @@ def case_gen_contexts():
         assert got3["contexts"] == want3 and want3 != want and got3["open_from"] == "last:3", (got3, want3)
 
 
+def case_gen_split():
+    # The two requests of case_gen_contexts, 0 learn and 1 held. --split held scores request 1 alone: its
+    # window row as gen_values gives it, and the steady hit over its [P, end) with the rule walked over all
+    # 17 positions; no --split says both are scored; --split on a chunk trace is refused. A hot list whose
+    # `# sets` names the trace is refused unless it learned on the learn split and --split held scores it.
+    with tempfile.TemporaryDirectory() as root:
+        rows = {l: [tuple((7 * t + l + 50 * j) % 384 for j in range(6)) for t in range(17)] for l in range(40)}
+        d = wu._fake_set(root, "chat", rows, 384, 6)
+        path = os.path.join(d, "MANIFEST.tsv")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        calls = "# call\tindex\tfirst\tprompt_call\tend\tpos0\ncall\t0\t0\t3\t10\t0\ncall\t1\t10\t2\t17\t0\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace("# complete", calls + "# complete"))
+        rt._write_contexts(d, [dict(request=0, first=0, end=10, prompt=4, prompt_call=3, prompt_ids=4, cache=0,
+                                    generated=7, stop="eos", prompt_id="a", genre="ko", split="learn"),
+                               dict(request=1, first=10, end=17, prompt=3, prompt_call=2, prompt_ids=3, cache=0,
+                                    generated=5, stop="limit", prompt_id="b", genre="en", split="held")])
+        argv = ["gen", "v41", d, "--data", root, "--window", "2"]
+
+        def gen(extra, seed="prefix"):
+            out, err = io.StringIO(), io.StringIO()
+            js = os.path.join(root, "gen.json")
+            with redirect_stderr(err):
+                code = main(argv + ["--seed", seed, "--json", js] + extra, out)
+            if code != 0:
+                return None, err.getvalue()
+            with open(js, encoding="utf-8") as f:
+                return json.load(f), out.getvalue()
+
+        got, text = gen([])
+        assert "split: none given, the learn and the held requests both scored" in text and got["split"] == "both", text
+        got, text = gen(["--split", "held"])
+        assert "split: held, 1 of 2 requests scored" in text and "context 0:" not in text, text
+        s = Set(d, "v41")
+        n_l = n_plan("v41")
+        seed = seed_lists("v41", s, "prefix", root, n_l)
+        X = s.stack(family("v41")["eligible"])
+        rule = Rule("mid")
+        want, _ = gen_values(X, [(10, 17, 3)], None, 2, seed, n_l, 384, rule, family("v41")["open_m"], 0, 1, COPIES)
+        strip = lambda r: {k: v for k, v in r.items() if k != "context"}
+        assert [r["context"] for r in got["contexts"]] == [1], got["contexts"]
+        assert [strip(r) for r in got["contexts"]] == [strip(r) for r in want], (got["contexts"], want)
+        per = replay(X, seed_resident(seed, n_l, 384), n_l, 384, rule, sem="flip", spares=1, in_flight_cap=True, d=1,
+                     link=Budget(COPIES)).per_row
+        assert got["steady"] == float(per[13:17].mean()) and got["split"] == "held", got
+        got, text = gen(["--split", "learn"])
+        assert [r["context"] for r in got["contexts"]] == [0] and got["steady"] == float(per[4:10].mean()), got
+
+        hot = os.path.join(root, "hot.txt")
+
+        def hot_list(split):
+            lines = ["# router-hotlist", "# sets\tchat:17,other:9"] + ([f"# split\t{split}"] if split else [])
+            lines += [f"{l}\t" + ",".join(str(e) for e in range(384)) for l in family("v41")["eligible"]]
+            with open(hot, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+
+        for split, extra in ((None, ["--split", "held"]), ("learn", []), ("learn", ["--split", "learn"])):
+            hot_list(split)
+            got, err = gen(extra, "hot:" + hot)
+            assert got is None and "it is in-sample" in err, (split, extra, err)
+        hot_list("learn")
+        got, text = gen(["--split", "held"], "hot:" + hot)
+        assert got is not None and [r["context"] for r in got["contexts"]] == [1], text
+
+        c = wu._fake_set(root, "chunked", rows, 384, 6)
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = main(["gen", "v41", c, "--data", root, "--prompt", "4", "--split", "held"])
+        assert code == 1 and "no contexts.tsv, so no learn/held split" in err.getvalue(), err.getvalue()
+
+
 def case_gen_short():
     # Three requests, the middle one 3 positions (prompt 2): shorter than P + N = 4 at window 2. Without
     # --short it is refused by name; with --short skip the line names it, the two long contexts keep the
@@ -1721,7 +1851,7 @@ def case_refusals():
 
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
          case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open,
-         case_open_last, case_gen, case_gen_contexts, case_gen_short, case_fixture, case_refusals]
+         case_open_last, case_gen, case_gen_contexts, case_gen_split, case_gen_short, case_fixture, case_refusals]
 
 
 def self_test():

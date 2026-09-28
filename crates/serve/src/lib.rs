@@ -21,7 +21,8 @@ mod stop;
 pub mod template;
 
 pub use api::{
-    EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server, ServerConfig,
+    EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server,
+    ServerConfig, VERSION,
 };
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,

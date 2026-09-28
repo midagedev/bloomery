@@ -1460,8 +1460,9 @@ gate-qwen4exp-meta:
 # process (one load, plan (a) on the A6000) with BLOOMERY_ROUTE_TRACE=OUT and the step feed runs every prompt row of
 # PROMPTS in file order, greedy (/apply-template, /tokenize, /completion at temperature 0, n_predict 256,
 # cache_prompt false), and the engine writes every position's routed ids per layer into OUT, a new directory, as a
-# router set with the slot kinds and a call row per prompt call; contexts.tsv (one row per request) is joined at
-# the end. tools/ref/route-trace-chat.py's header has the contract. Predicted wall about 13-15 min [derived]. It
+# router set with the slot kinds and a call row per prompt call; the driver seals it once the server has exited
+# (route_trace.py seal) and joins contexts.tsv (one row per request). OUT is an absolute path or target/…: a path
+# elsewhere in the remote tree is refused by name, since the next sync (rsync --delete) removes it. tools/ref/route-trace-chat.py's header has the contract. Predicted wall about 13-15 min [derived]. It
 # takes neither the A6000 gate lock nor the V4.1 load lock (the driver is not a target/release binary
 # tools/gpu-gate.sh can run): run it inside a hold. The server runs under the driver's own bound (--bound, 1800 s),
 # and every request under an HTTP timeout, so the driver ends when the server does.
