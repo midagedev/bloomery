@@ -1,0 +1,31 @@
+# Sitting r0928, job `hostreg` (item 10; recentlit-report.md §1.2 lines 46-67). exllamav3 #341 registers a
+# CPU expert arena of 1 GiB anonymous or shm chunks with cudaHostRegister and DMAs from it. Our record:
+# a READ_ONLY registration of the file mapping is refused (801, rig-log 09-25#m2-h2d-a6000), while
+# flags 0 on a 64 MiB anonymous mmap succeeded (specs/wave-m6/notes-hoststream.md:5, the fixup4
+# probe, 3090). The report's prior is M2's design value, 0.1..0.3 s a GiB; its rule: under 0.02 s/GiB
+# register the whole host set (115-190 GB), above it only the swap and stream candidates, or in the
+# background after start. The chunks are touched before registration, so the time is the pinning
+# alone, not zero fill. PORTABLE is the flag that makes a registration usable from both cards.
+# Minutes: 2 [derived: 8 GiB x 4 arms (anon and shm, flags 0 and PORTABLE) at 0.1-0.3 s/GiB plus the
+# first-touch faults of 32 GiB of chunks].
+kind: profile
+question: how long does registering host memory for DMA take on this box, anonymous and shm, and is
+  a PORTABLE registration usable from both cards?
+term: seconds per GiB of cuMemHostRegister over 8 chunks of 1 GiB of anonymous memory, flags
+  PORTABLE, both cards in view (the arm the two-card arena would use), with the flags-0 and the
+  /dev/shm arms beside it
+unit: s/GiB
+predict: 0.1..0.3
+condition: the probe under tools/ref/probe-twocard.sh (the lease, both cards in view,
+  BLOOMERY_OTHER_STRICT=1): probe_hostreg --time; each arm registers its eight chunks one by one,
+  asks every context in view for the chunks' device address (mapped_cards 2: the registration
+  serves both cards), then unregisters; a refusal prints the driver's code and ends that arm (801,
+  not supported, is an allowed outcome: it reads as decide-above); its --check (one 64 MiB PORTABLE
+  chunk of each kind copied to card 0 and back, equal) passes first
+decide-in: a registered arena is a start-up cost of 12..57 s for the whole host set: register only
+  the swap and stream candidates (adaptres input), or the whole set in the background after start
+decide-below: under 0.1 s/GiB: under 0.02 register the whole host set at load; else register it in
+  the background after start; write the two-branch swap path (staging ring or registered arena)
+  into the adaptres design
+decide-above: over 0.3 s/GiB, or refused: the arena is for the swap ring only (a few GiB); the
+  streaming fill keeps the pinned staging ring, and ideaverify V5's three-crossing count stands

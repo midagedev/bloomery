@@ -1,0 +1,28 @@
+# Sitting r0928, job `kv512` (item 2, first half; ideaaudit-models-report.md §1-7 lines 76-79 and §0 row 7):
+# the k and v projection launches of a Qwen3 P = 512 ubatch, the term the QKV-one-launch fold rests on.
+# At P = 512 k and v are 512-row GEMMs, 4 slabs x 8 token tiles = 32 blocks on 168 slots, one block an
+# SM (arch/qwen3moe/ubatch.rs attention(): q, k, v as three enqueue_gemm calls). Per launch [derived]:
+# a 3.5 k-cycle prologue, 16 block-steps of about 3.5 k cycles for K = 2048 and about 5 k cycles of
+# stores, ~65 k cycles, 43 us at 1.5 GHz; 96 launches (48 layers x k, v) 3.1..5.2 ms. The fold merges k
+# into q everywhere and v where it is Q4_K (24 of 48 layers: use_more_bits puts v at Q6_K on the
+# other 24), q's 256 blocks plus 64 still two waves of 168: saving about 0.75 x the sum, 2.3..3.9 ms
+# of the 65.4 ms window, pp512 +3.6..+6.3 % [derived]; the report's -1.3..-2.7 ms is the lower side.
+# Minutes: 2 [derived: nsys-gpu-qwen3moe-prefill's lease of 09-25 took 25 s at P = 4096].
+kind: profile
+question: how long do the 96 k and v projection launches of a Qwen3 P = 512 prompt take, and is the
+  QKV-one-launch fold worth a round?
+term: summed kernel time of the k and v gemm launches (gemm_q4k and gemm_q6k rows at the 32-block
+  grid) in one P = 512 prompt window, nsys, generate_qwen3moe, A6000
+unit: ms
+predict: 3.1..5.2
+condition: just nsys-gpu-qwen3moe-prefill 512 under the lease on the A6000 (one ubatch, graph mode);
+  the runner's table must show 48 launches of each role; the k and v rows are read from the kept
+  sqlite with tools/ref/nsys-table.py --pattern gemm_ (one row per kernel and grid): the 32-block
+  rows of gemm_q4k (k, and v on the Q4_K layers) and gemm_q6k (v on the Q6_K layers) must sum to
+  96 launches, or the grid mapping is wrong and the run is void; guard_other records the 3090
+decide-in: open the QKV-one-launch round (S): one enqueue_gemm over q, k and v's stacked rows where
+  the types match, with a pp512 A/B card predicting 0.75 x this sum
+decide-below: the k and v launches are cheaper than the block-step model: the fold is worth under
+  +3.6 % and queues behind the act plane; correct the model's per-block cycles from this row
+decide-above: the lone-block launches cost more than the model (latency not hidden at one block an
+  SM): open the fold round now and re-derive its A/B band from this row, the fold's gain larger

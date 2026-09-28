@@ -1,0 +1,31 @@
+# Sitting r0928, job `engram` (item 12; ideaaudit-host-report.md §0 row 2 lines 46-50 and ② lines 112-121):
+# a held-out P = 4096 prompt reads 4096 x 48 = 196,608 engram rows in the prompt call's serial prologue;
+# fully cold that is +0.35..+0.70 s at 1.8..3.5 us a row [derived, the first-process excess of S14 / PG
+# r1 and prose P 512], pp -3..-6 %, and one WILLNEED over the call at its start would win back
+# +2.6..+5.3 % [derived]. The share resident is bounded above by the file cache left beside the r8 host
+# set: (261.5 - 214.0) / 84.6 GB = 0.56 of the table (rig-log 09-27#r8host-pp, memfit). The rows are
+# hashes, so a held-out prompt's rows are resident at about the share of the table that is: after the
+# sitting's V4.1 jobs, somewhere under that ceiling; 0.05 is the floor of "a few prompts ran today".
+# The held-out prompt is corpus-threads.ids from line 2,257,500 (half of its 4,515,000 lines, a range no
+# trace or run reads); the prose 0..4096 run beside it is the warm control (the sitting's prose prompts
+# read those rows). No lease: mincore reads the page cache and times nothing (BLOOMERY_BOX_READONLY=1,
+# the binary built before the sitting). Minutes: 3 [the spec's estimate].
+kind: profile
+question: how much of a held-out P = 4096 prompt's engram rows is already in the page cache when the
+  prompt call starts, and so what is a call-start WILLNEED worth?
+term: resident_share of the probe engram total record (resident distinct rows / distinct rows over all
+  sites) for corpus-threads.ids ids 2,257,500..+4096, probe_engram, root, after the sitting's V4.1 jobs
+unit: share
+predict: 0.05..0.56
+condition: probe_engram --ids $BLOOMERY_DATA/engram/corpus-threads.ids --offset 2257500 --limit 4096,
+  as root on the box (mincore sees the whole page cache only for root), no lease, after the V4.1 jobs
+  and before any GLM or Qwen3 load evicts; its read-row-resident check must pass (a row read once
+  counts as resident); the prose control (--ids corpus-prose.ids --offset 0) printed beside it must
+  read higher than the held-out row, or the count does not see the cache the prompts warmed
+decide-in: the WILLNEED lever is worth (1 - share) x +2.6..+5.3 %: open it (S, one prefetch over the
+  call's rows at call start, lib.rs prefetch merged per page) when that product is over the 4-round
+  ruler of 1.0 %, else fold it into the async-prologue item (plan-triage.md:162)
+decide-below: the held-out prompt is cold: open the call-start WILLNEED round now with its A/B band
+  +2.6..+5.3 % on a cold held-out prompt (the public table's warm rows stay at 0)
+decide-above: more of the table is cached than the memfit ceiling allows: recheck the page-cache
+  budget (the r8 host set's resident size, meminfo) before pricing any engram lever

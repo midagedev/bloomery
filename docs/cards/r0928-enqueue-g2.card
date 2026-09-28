@@ -1,0 +1,26 @@
+# Sitting r0928, job `enqueue` (item 11; ideaaudit-host-report.md §0 row 3 lines 52-56, §1a (3) lines
+# 124-129): the prompt call's host enqueue per layer-batch at lcg P = 4096, G 2, after r8. The flow
+# model's today row (B1 + T + G2 + r8, list 384) puts enqueue at 4.3 ms a layer-batch; the last
+# measurement is before r8: prefillgroup-ab's G 2 arm, lcg P = 4096, no hot list, 4.3-4.4 ms
+# (rig-log 09-26#prefillgroup-ab). r8 moves the union, not the route's issue, so the band is that
+# value +-10 % [derived]. (c') -- issuing the route from the SMT sibling -- is worth lcg P 4096
+# +3.0..+7.6 % at 4.3 ms (host report's flow runs); its value scales with this term.
+# Minutes: 5 [derived: the warm-up and one round, two V4.1 processes of ~2 min each at P = 4096].
+kind: profile
+question: how long does the host thread spend enqueueing the prompt call's route per layer-batch at
+  lcg P = 4096 on today's main, the term the (c') lever moves?
+term: enqueue_lb of stat prefill split (ms a layer-batch), lcg P = 4096, G 2 (the default), r8 on,
+  hot list 384, CED on, A6000, plan (a)
+unit: ms
+predict: 3.9..4.8
+condition: BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt
+  BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/r0928-enqueue-g2.card' just depth-gpu-ds41 4096
+  under the lease on the A6000, the runner's warm-up discarded; the counted row carries no [cold],
+  [cpu-busy] or [other-busy] (else void); the value is the row's stat prefill split enqueue_lb, with
+  wait_lb and union_lb read beside it
+decide-in: (c') keeps its place behind the q8_K down round (host report rank 3); the flow model's
+  enqueue row is confirmed and stays
+decide-below: the issue is under 3.9 ms: (c') is worth under +3 % at lcg P 4096; move it from the
+  queue to held in the idea ledger
+decide-above: the issue grew past 4.8 ms after r8: put the measured value into the flow model and
+  rank (c') right behind q8_K with its recomputed gain

@@ -1,0 +1,28 @@
+# Sitting r0928, job `tred` (item 9; recentlit-report.md §1.4 lines 90-103). The one-way latency of a
+# cross-card reduction through mapped host memory (P2P is absent: docs/v41-placement.md:186). The
+# report's model: tensor split gains 0.5 x 7.9 - 80 x t_red ms a V4.1 step (two reductions a layer,
+# 40 layers): t_red 5..36 us gives +3..+17 %. Its two ends: a host thread relaying (our join floor,
+# 21..36 us) and a device-side spin (5..10 us). What this probe realizes is the device-side wait the
+# engine already uses, a captured stream memop wait on a mapped host word (the front end polls it),
+# not an SM spinning; the band is the report's device-side estimate. Each direction carries a
+# 16 KiB payload (one f32 hidden row of 4,096) as a D2H copy node, a system barrier and the flag
+# write, and the other card's wait then an H2D copy node: a reduction's exchange.
+# Minutes: 1 [derived: 1,024 round trips per launch pair, 7 rounds, a few ms each].
+kind: profile
+question: how long does one exchange between the A6000 and the 3090 take through mapped host memory
+  inside captured graphs, the term that decides the tensor-split idea?
+term: t_red = the round trip over 2 (the median of 7 launch pairs of 1,024 ping-pongs each), copy
+  arm (16 KiB each way), both cards visible, A6000 as card A
+unit: us
+predict: 5..10
+condition: the probe under tools/ref/probe-twocard.sh (the lease, both cards in view, the A6000
+  first, BLOOMERY_OTHER_STRICT=1 so a compute process on either card before the run aborts it):
+  probe_tred --time; its --check (both flag words end at the ping-pong count, the payload B received
+  equals A's, the peer attribute read both ways) passes first or nothing is timed; the flag arm
+  (memops alone) prints beside the copy arm as the floor
+decide-in: the exchange is device-fast: raise the tensor-split shape (recentlit §1.4) to the user
+  with the V4.1 and Qwen3.8 (b) gains recomputed at this t_red and its costs (sum order, the
+  two-stage bit contract)
+decide-below: under 5 us: raise it to the user as in the band, the gains at the upper end
+decide-above: between 10 and 20 us hold it in the idea ledger (gain under +3 %); at 20 us or more
+  reject the tensor split for this box (the reductions eat the bandwidth gain)

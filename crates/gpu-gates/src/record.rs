@@ -1292,6 +1292,156 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// its name and the case's.
 pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 
+/// One case of a probe's `--check`, which runs before any `--time`.
+pub static PROBE_CHECK: Kind = Kind {
+    name: "probe_check",
+    head: "probe check",
+    doc: "One case a probe checks before it times anything: the probe, the case, what it saw, and \
+          whether it passed; `case=all` closes the check.",
+    parts: &[
+        key("probe", Word, ""),
+        key("case", Word, ""),
+        key("saw", Text, ""),
+        key("pass", Bool, ""),
+    ],
+};
+
+/// Whether the two cards of a two-card probe can reach each other's memory.
+pub static PROBE_PEER: Kind = Kind {
+    name: "probe_peer",
+    head: "probe peer",
+    doc: "The two cards in view and cuDeviceCanAccessPeer both ways (read, not timed).",
+    parts: &[
+        key("a", Text, ""),
+        key("b", Text, ""),
+        key("a_to_b", Bool, ""),
+        key("b_to_a", Bool, ""),
+    ],
+};
+
+/// One arm of the cross-card exchange probe.
+pub static PROBE_TRED: Kind = Kind {
+    name: "probe_tred",
+    head: "probe tred",
+    doc: "Round trips between card A and card B through mapped host words inside captured graphs: \
+          per launch pair `k` ping-pongs, `payload` bytes copied each way; the round trip over \
+          `reps` launch pairs, and its half.",
+    parts: &[
+        key("arm", Word, ""),
+        key("k", U64, ""),
+        key("payload", U64, "B"),
+        key("reps", U64, ""),
+        key("rt_us_min", F64(3), "us"),
+        key("rt_us_median", F64(3), "us"),
+        key("rt_us_max", F64(3), "us"),
+        key("one_way_us", F64(3), "us"),
+    ],
+};
+
+/// One arm of the host-registration probe.
+pub static PROBE_HOSTREG: Kind = Kind {
+    name: "probe_hostreg",
+    head: "probe hostreg",
+    doc: "cuMemHostRegister over `chunks` chunks of `chunk` bytes of one memory kind at one flag \
+          set: the driver's result code, and on success the seconds it took, per GiB, the \
+          unregister, and in how many of the contexts in view the range has a device address \
+          (cuMemHostGetDevicePointer): 1 is the registering card's alone, every card is portable.",
+    parts: &[
+        key("mem", Word, ""),
+        key("flags", Word, ""),
+        key("chunk", U64, "B"),
+        key("chunks", U64, ""),
+        key("cards", U64, ""),
+        key("rc", U64, ""),
+        opt("register_s", F64(4), "s"),
+        opt("s_per_gib", F64(4), "s/GiB"),
+        opt("unregister_s", F64(4), "s"),
+        opt("mapped_cards", U64, ""),
+    ],
+};
+
+/// One projection of the int8 tensor-core GEMM probe.
+pub static PROBE_IMMA_ARM: Kind = Kind {
+    name: "probe_imma_arm",
+    head: "probe imma arm",
+    doc: "One V4.1 attention projection as the grouped int8 GEMM at `m` tokens: its type, groups \
+          (1 for a dense role), rows per group and K, the graph-replay time per launch, and the \
+          rate over the minimum.",
+    parts: &[
+        key("layer", U64, ""),
+        key("role", Word, ""),
+        key("ty", Word, ""),
+        key("groups", U64, ""),
+        key("rows", U64, ""),
+        key("k", U64, ""),
+        key("m", U64, "tokens"),
+        key("graph_us_min", F64(3), "us"),
+        key("graph_us_mean", F64(3), "us"),
+        key("tops", F64(2), "TOPS"),
+    ],
+};
+
+/// The int8 GEMM probe's sum over its projections.
+pub static PROBE_IMMA_TOTAL: Kind = Kind {
+    name: "probe_imma_total",
+    head: "probe imma total",
+    doc: "The projections' graph minimums summed for one `m`-token sub-block, and that sum times \
+          the sub-blocks of a `batch`-token layer-batch.",
+    parts: &[
+        key("layer", U64, ""),
+        key("m", U64, "tokens"),
+        key("roles", Csv, ""),
+        key("us_per_sub_block", F64(3), "us"),
+        key("batch", U64, "tokens"),
+        key("ms_per_layer_batch", F64(4), "ms"),
+    ],
+};
+
+/// One engram site's page-cache residency for a prompt's rows.
+pub static PROBE_ENGRAM_SITE: Kind = Kind {
+    name: "probe_engram_site",
+    head: "probe engram site",
+    doc: "The rows one engram site asks for over a prompt, the distinct ones, and how many of \
+          those have every page in the page cache (mincore) right now.",
+    parts: &[
+        key("layer", U64, ""),
+        key("positions", U64, ""),
+        key("rows", U64, ""),
+        key("distinct", U64, ""),
+        key("resident", U64, ""),
+        key("resident_share", F64(4), ""),
+    ],
+};
+
+/// The engram residency probe's sum over the sites.
+pub static PROBE_ENGRAM_TOTAL: Kind = Kind {
+    name: "probe_engram_total",
+    head: "probe engram total",
+    doc: "Every site's distinct rows of the prompt and how many are resident, for the id file, \
+          the first id and the positions read.",
+    parts: &[
+        key("ids", Word, ""),
+        key("offset", U64, ""),
+        key("positions", U64, ""),
+        key("sites", U64, ""),
+        key("distinct", U64, ""),
+        key("resident", U64, ""),
+        key("resident_share", F64(4), ""),
+    ],
+};
+
+/// What `probe_tred` prints.
+pub static PROBE_TRED_BIN: &[&Kind] = &[&PROBE_CHECK, &PROBE_PEER, &PROBE_TRED];
+
+/// What `probe_hostreg` prints.
+pub static PROBE_HOSTREG_BIN: &[&Kind] = &[&PROBE_CHECK, &PROBE_HOSTREG];
+
+/// What `probe_imma` prints.
+pub static PROBE_IMMA_BIN: &[&Kind] = &[&PROBE_CHECK, &PROBE_IMMA_ARM, &PROBE_IMMA_TOTAL];
+
+/// What `probe_engram` prints.
+pub static PROBE_ENGRAM_BIN: &[&Kind] = &[&PROBE_CHECK, &PROBE_ENGRAM_SITE, &PROBE_ENGRAM_TOTAL];
+
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the hot list file the card's experts
@@ -1361,6 +1511,10 @@ mod tests {
             BLOOMERY_SERVE_DS41,
             GENERATE_GLM5NEXT,
             GATE_DEEPSEEK41_PREFILL,
+            PROBE_TRED_BIN,
+            PROBE_HOSTREG_BIN,
+            PROBE_IMMA_BIN,
+            PROBE_ENGRAM_BIN,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
             names.sort_unstable();

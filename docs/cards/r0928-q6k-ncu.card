@@ -1,0 +1,34 @@
+# Sitting r0928, job `q6k` (item 1b; ideaaudit-models-report.md §1-3 lines 49-53 and §0 row 3): which
+# unit carries gemm_q6k. A-Q6K was closed as "the same read as Q4_K, likely 0" (plan-triage.md:559);
+# the q3gemmb report says q6k is now on L1; neither was measured. The report's two branches
+# [derived]: L1-bound -10..-20 ms of the 43.4 ms gemm_q6k total at P = 4096, latency-bound -2..-4 ms.
+# Band: gemm_q4k measured 70.6 % L1TEX as its top unit before lever A (rig-log 09-26#q3gemma-base-prof)
+# while no unit filled its step; gemm_q6k shares the gemm_block! body with 34 LDG a lane read straight
+# into the mma fragments at a step's head (q3gemmlat-design-report.md:249), so its L1TEX share sits at
+# or above q4k's; 60..80 is that band [derived]. The B' barrier term (item 1a) is not in this sitting:
+# it needs a 16-warp gemm_q4k variant, a device-crate change (report section 3).
+# Minutes: 3 [derived: the q3pp ncu leases of 09-26 took 53 s to 2.4 min for one launch of a
+# P = 4096 prompt; two launches here, one pass set each].
+kind: profile
+question: is gemm_q6k's routed down GEMM of a Qwen3 P = 4096 prompt bound by L1TEX, as the q3gemmb
+  report says, or by latency like gemm_q4k?
+term: L1TEX throughput in percent of peak (ncu, --clock-control base) of layer 0's routed down
+  gemm_q6k launch (32,768 slots x 2,048 rows x K = 768 Q6_K), P = 4096, generate_qwen3moe, A6000,
+  with every other unit's throughput beside it
+unit: %
+predict: 60..80
+condition: ncu-gpu.sh's depth form on generate_qwen3moe (BLOOMERY_GEN_BIN), eager, the lcg prompt of
+  4096 ids, kernel filter ^gemm_q6k$, skip 0, count 2, under the lease on the A6000: launch 0 is
+  layer 0's attn_v (512 rows, a dense grid of 4 slabs x 64 token tiles = 256 blocks) and launch 1
+  layer 0's routed down (the MoE grid); each is proved by its grid in the summary, a launch whose
+  grid is the other's is void; the form's default sections (SpeedOfLight, Occupancy, WarpStateStats,
+  MemoryWorkloadAnalysis: the L1TEX, L2, DRAM and SM throughputs) and its stall list, read from the
+  run's CSV; guard_other records any 3090 process
+decide-in: L1TEX is the top unit but not the step: write every unit's demand beside the block-step
+  cycles (AGENTS.md) before any lever; A-Q6K stays closed unless that table puts the demand at the
+  step, and a gemm_q6k instruction cut (q3gemmb's kind, -2..-4 ms) queues behind B' and the act plane
+decide-below: gemm_q6k is latency-bound like gemm_q4k: A-Q6K stays closed with this row as its
+  reason (plan-triage.md:559 corrected by strike-through), and the q3gemmb report's L1 claim is
+  struck
+decide-above: gemm_q6k is L1-bound: open a q6k design round (S) that stages its weight words with
+  the activations as q4k does, predicted -10..-20 ms at P = 4096, with its own ncu card
