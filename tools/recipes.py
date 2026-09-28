@@ -5,7 +5,7 @@ Runs on the Mac: it reads the justfile through `just --dump --dump-format json` 
 the workspace through `cargo metadata --format-version 1 --no-deps --offline --locked` (no build, no
 network, never rewrites Cargo.lock), and the sources as text. It builds nothing and runs no gate.
 
-    python3 tools/recipes.py check            # the target checks of `just check-recipes`
+    python3 tools/recipes.py check            # the target checks of `just check-recipes`, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes]
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
@@ -1520,10 +1520,158 @@ def cmd_box_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------------------------
+# the plan files `just records-refresh` writes
+# ----------------------------------------------------------------------------------------------
+# records-refresh runs only on the box, so a plan it lists can be missing from the tree while every Mac
+# check passes and the box gate that reads it goes red. The rule below checks presence only: whether a
+# plan's contents are the engine's is the box's to say (the recipe rewrites them from generate_ds41).
+
+REFRESH_RECIPE = "records-refresh"
+PLAN_MARKER = "#> "  # tools/bloomery/records.py refresh: the records after this line go to its path
+COUNTS_TOOL = "tools/flow/ds41_prefill.py"
+_SHELL_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+@dataclass
+class PlanFile:
+    path: str  # relative to the tree root
+    what: str  # the marker's text after the path
+    depth: int  # its `--depth`
+
+
+def _command_start(w: str) -> bool:
+    return (bool(w) and all(c in _PUNCT for c in w) and w not in _REDIRECTS) or w in ("do", "then", "else", "elif", "{", "!")
+
+
+def _box_remotes(recipe: Recipe) -> list[str]:
+    """The command text of each tools/box.sh call in the recipe, as recipe_commands reads it (prefixes and
+    pipes around the call allowed, unlike box_command)."""
+    out = []
+    for line in recipe.lines:
+        stripped = line.lstrip("@-").strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for cmd in simple_commands(shell_words(stripped)):
+            rest = strip_wrappers(cmd)[1]
+            if rest and _norm(rest[0]) == "tools/box.sh":
+                out.append(" ".join(rest[1:]))
+    return out
+
+
+def refresh_plans(recipe: Recipe) -> list[PlanFile]:
+    """The files records-refresh writes from generate_ds41 records: each `echo "#> <path> <what>"` of its box
+    command, its `for VAR in …; do … done` loops expanded. Refused by name: a loop value or marker that is not
+    literal after expansion, a path outside the tree, a marker with no integer `--depth`, a path written twice,
+    no marker at all."""
+    remotes = _box_remotes(recipe)
+    if len(remotes) != 1:
+        raise RecipeError(f"{recipe.name}: {len(remotes)} tools/box.sh calls, not one")
+    words = shell_words(remotes[0])
+    loops: list[tuple[str, list[str]]] = []
+    out: list[PlanFile] = []
+    start, i = True, 0
+    while i < len(words):
+        w = words[i]
+        if start and w == "for":
+            if i + 2 >= len(words) or words[i + 2] != "in":
+                raise RecipeError(f"{recipe.name}: a `for` loop this parser cannot read: {' '.join(words[i:i + 4])}")
+            var, j, vals = words[i + 1], i + 3, []
+            while j < len(words) and words[j] not in (";", "do"):
+                if "$" in words[j] or "`" in words[j]:
+                    raise RecipeError(f"{recipe.name}: `for {var}` takes a value that is not literal: {words[j]}")
+                vals.append(words[j])
+                j += 1
+            if j < len(words) and words[j] == ";":
+                j += 1
+            if j >= len(words) or words[j] != "do":
+                raise RecipeError(f"{recipe.name}: `for {var} in …` with no `do`")
+            loops.append((var, vals))
+            i, start = j + 1, True
+            continue
+        if start and w == "done":
+            if not loops:
+                raise RecipeError(f"{recipe.name}: a `done` with no loop open")
+            loops.pop()
+        elif start and w == "echo" and i + 1 < len(words) and words[i + 1].startswith(PLAN_MARKER):
+            combos: list[dict[str, str]] = [{}]
+            for var, vals in loops:
+                combos = [dict(c, **{var: v}) for c in combos for v in vals]
+            for c in combos:
+                text = _SHELL_VAR.sub(lambda m: c.get(m.group(1) or m.group(2), m.group(0)), words[i + 1][len(PLAN_MARKER):])
+                if "$" in text or "`" in text:
+                    raise RecipeError(f"{recipe.name}: a {PLAN_MARKER.strip()} marker names a variable no loop around it sets: {text[:120]}")
+                path, _, what = text.partition(" ")
+                if os.path.isabs(path) or ".." in path.split("/"):
+                    raise RecipeError(f"{recipe.name}: a {PLAN_MARKER.strip()} marker's path is outside the tree: {path}")
+                ws = what.split()
+                d = ws[ws.index("--depth") + 1] if "--depth" in ws[:-1] else ""
+                if not d.isdigit():
+                    raise RecipeError(f"{recipe.name}: the marker of {path} names no integer --depth: {what[:120]}")
+                out.append(PlanFile(path, what, int(d)))
+        start = _command_start(w)
+        i += 1
+    if loops:
+        raise RecipeError(f"{recipe.name}: `for {loops[-1][0]}` with no `done`")
+    if not out:
+        raise RecipeError(f"{recipe.name}: no `echo \"{PLAN_MARKER}<path> …\"` marker in its box command")
+    seen: set[str] = set()
+    for p in out:
+        if p.path in seen:
+            raise RecipeError(f"{recipe.name}: two markers write {p.path}")
+        seen.add(p.path)
+    return out
+
+
+def counts_depths(recipe: Recipe) -> list[int]:
+    """The prompt lengths whose engine plan a recipe's `ds41_prefill.py --counts` reads: every generate_ds41
+    `--depth` in a box command that runs it (the tool reads the plan of each log's call). Empty for a recipe
+    that does not run it; refused by name when it does and no integer depth is found."""
+    cmds = [strip_wrappers(c)[1] for r in _box_remotes(recipe) for c in simple_commands(shell_words(r))]
+    if not any(COUNTS_TOOL in map(_norm, c) and "--counts" in c for c in cmds):
+        return []
+    depths: list[int] = []
+    for c in cmds:
+        if not any(os.path.basename(x) == "generate_ds41" for x in c):
+            continue
+        for k, w in enumerate(c[:-1]):
+            if w == "--depth":
+                if not c[k + 1].isdigit():
+                    raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts on a generate_ds41 --depth that is not an integer: {c[k + 1]}")
+                depths.append(int(c[k + 1]))
+    if not depths:
+        raise RecipeError(f"{recipe.name}: runs {COUNTS_TOOL} --counts and no generate_ds41 --depth this parser can read")
+    return depths
+
+
+def plan_problems(root: str, recipes: dict[str, Recipe]) -> list[str]:
+    """Every plan records-refresh writes, present in the tree at `root`; every depth a --counts reader needs,
+    written by it. Presence only."""
+    if REFRESH_RECIPE not in recipes:
+        return [f"no `{REFRESH_RECIPE}` recipe: the plans in tools/flow/plans/ have no writer"]
+    try:
+        plans = refresh_plans(recipes[REFRESH_RECIPE])
+    except RecipeError as err:
+        return [f"justfile:{recipes[REFRESH_RECIPE].line} {err}"]
+    problems = [f"{p.path} is not in the tree ({REFRESH_RECIPE}: {p.what}) — run just {REFRESH_RECIPE} on the box and commit it"
+                for p in plans if not os.path.isfile(os.path.join(root, p.path))]
+    written = {p.depth for p in plans}
+    for name in sorted(recipes, key=lambda n: recipes[n].line):
+        try:
+            depths = counts_depths(recipes[name])
+        except RecipeError as err:
+            problems.append(f"justfile:{recipes[name].line} {err}")
+            continue
+        for d in sorted(set(depths) - written):
+            problems.append(f"justfile:{recipes[name].line} {name} reads the engine's plan of P = {d} ({COUNTS_TOOL} --counts), "
+                            f"and {REFRESH_RECIPE} writes none: add {d} to its P list, then run just {REFRESH_RECIPE}")
+    return problems
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
-    problems = check(tree, recipes)
+    problems = check(tree, recipes) + plan_problems(ROOT, recipes)
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     return 1 if problems else 0
@@ -3937,6 +4085,47 @@ def self_test() -> int:
             got = ""
             fails.append(f"box-command {n}: {err}")
         expect(got.split()[:2] == ["cargo", verb], f"box-command {n}: not `cargo {verb} …`: {got!r}")
+
+    # the plans records-refresh writes: derived from its markers and loops, each missing one named with the
+    # recipe to run, and a --counts reader's depth that no marker writes named too
+    with tempfile.TemporaryDirectory(prefix="recipes-plans-") as tmp:
+        refresh = ("records-refresh:\n    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates "
+                   "--features deepseek41 --release --bin generate_ds41 >&2 && for P in 8 16; do for c in on off; do echo \"#> "
+                   "tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c\" && "
+                   "BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 "
+                   "tools/bloomery/records.py refresh\n")
+        reader = ("gate-x:\n    ./tools/box.sh 'D=t && BLOOMERY_STEP_STATS=1 bash tools/gpu-gate.sh generate_ds41 --place gate "
+                  "--depth {d} -n 2 > $D/a.log && python3 tools/flow/ds41_prefill.py --counts $D/a.log > $D/a.counts'\n")
+        jp = os.path.join(tmp, "justfile")
+
+        def plan_probs(text: str) -> list[str]:
+            with open(jp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            try:
+                return plan_problems(tmp, load_justfile(jp))
+            except RecipeError as err:
+                return [f"raised: {err}"]
+
+        names = [f"tools/flow/plans/ds41-p{p}-ced-{c}.rec" for p in (8, 16) for c in ("on", "off")]
+        got = plan_probs(refresh + reader.format(d=16))
+        expect(len(got) == 4 and all(any(n in g and "run just records-refresh" in g for g in got) for n in names),
+               f"plans: four missing plans not each named with `run just records-refresh`: {got}")
+        os.makedirs(os.path.join(tmp, "tools/flow/plans"))
+        for n in names:
+            open(os.path.join(tmp, n), "w").close()
+        got = plan_probs(refresh + reader.format(d=16))
+        expect(got == [], f"plans: present plans (empty files: presence only) still refused: {got}")
+        got = plan_probs(refresh + reader.format(d=32))
+        expect(len(got) == 1 and "gate-x reads the engine's plan of P = 32" in got[0] and "add 32 to its P list" in got[0],
+               f"plans: a --counts depth no marker writes not named: {got}")
+        got = plan_probs(refresh.replace("-ced-$c.rec", "-ced-$c-$Q.rec"))
+        expect(len(got) == 1 and "no loop around it sets" in got[0], f"plans: a marker variable no loop sets not refused: {got}")
+        got = plan_probs(refresh.replace("for P in 8 16", "for P in 8 8"))
+        expect(len(got) == 1 and "two markers write" in got[0], f"plans: a path written twice not refused: {got}")
+    real = refresh_plans(jf["records-refresh"]) if "records-refresh" in jf else []
+    depths = {p.depth for p in real}
+    expect({512, 1536, 16384} <= depths, f"plans: records-refresh on the real justfile writes depths {sorted(depths)}")
+    expect(all(d in depths for n in jf for d in counts_depths(jf[n])), "plans: a real --counts reader's depth that records-refresh does not write")
 
     # the real tree
     side = make_side(ROOT)
