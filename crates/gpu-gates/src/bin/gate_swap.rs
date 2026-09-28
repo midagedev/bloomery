@@ -88,9 +88,10 @@
 //!   it between passes), with a source that adds [`INFLATE`] copy stream
 //!   commands to each part it copies, returns within [`QUEUE_BOUND`] with
 //!   every layer back at its seed: the reset's copies stage as they are
-//!   issued, so the host never blocks enqueuing behind copies nothing stages
-//!   (its mutant: the reset's flush turned on only after its copies are
-//!   enqueued). A watchdog thread ends the process by name past the bound.
+//!   issued, a ring's worth at a time, so the host never blocks enqueuing
+//!   behind copies nothing stages (its mutant: the reset's copies all
+//!   enqueued, the flush turned on only after the last). A watchdog thread
+//!   names a reset past the bound, then ends the process.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -156,6 +157,10 @@ mod gate {
     /// The queue arm's bound on its reset, which takes milliseconds when its
     /// copies stage as they are issued.
     const QUEUE_BOUND: Duration = Duration::from_secs(20);
+    /// How long the queue arm's watchdog waits after naming a blocked reset
+    /// before it ends the process: a stack watch (`BLOOMERY_GATE_STACKS`
+    /// under this) dumps the blocked threads in between.
+    const QUEUE_GRACE: Duration = Duration::from_secs(60);
     /// The boundary-event arm's live delay: with `every` 2 a flip lands at a
     /// planning boundary.
     const DELAY_EVEN: u64 = 2;
@@ -1553,6 +1558,7 @@ mod gate {
                     "queue: the reset did not return in {QUEUE_BOUND:?}: the host blocked \
                      enqueuing copies behind copies nothing stages FAIL"
                 );
+                std::thread::sleep(QUEUE_GRACE);
                 std::process::abort();
             }
         });

@@ -387,6 +387,16 @@ pub const RING_SLOTS: usize = 4;
 /// Bytes between two words of the staging page: a cache line each.
 const WORD_STRIDE: usize = 64;
 
+/// Nanoseconds since `t0`, saturated.
+fn nanos(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Whole microseconds since `t0`, saturated.
+fn micros(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 /// Job `n`'s ring slot and its ticket there (its use of that slot, from 1):
 /// the one owner of the job → ring mapping.
 fn ring_ticket(n: u64) -> Result<(usize, u32), GpuError> {
@@ -537,6 +547,10 @@ struct Shared {
     deadline: Duration,
     /// Stage whatever the window says: a quiet boundary's relayout.
     flush: AtomicBool,
+    /// Nanoseconds the staging thread spent copying into the ring and
+    /// preparing victims, since a boundary last took them.
+    stage_ns: AtomicU64,
+    prepare_ns: AtomicU64,
     /// Jobs the staging thread has finished (staged, or failed), counted
     /// before each one's ticket is published: `jobs_issued - served` copies
     /// wait for staging.
@@ -634,7 +648,9 @@ impl Shared {
     /// stage. `Ok(false)` when the machine stops first.
     fn serve(&self, job: &Job) -> Result<bool, GpuError> {
         if let Some(v) = job.victim {
+            let t0 = Instant::now();
             self.source.prepare_victim(job.layer, v)?;
+            self.prepare_ns.fetch_add(nanos(t0), Ordering::Relaxed);
         }
         let open = || {
             self.window.load(Ordering::Acquire) != 0
@@ -665,7 +681,9 @@ impl Shared {
                 ));
             }
         }
+        let t0 = Instant::now();
         self.stage(job)?;
+        self.stage_ns.fetch_add(nanos(t0), Ordering::Relaxed);
         Ok(true)
     }
 
@@ -725,6 +743,15 @@ pub struct PassReport {
     pub in_flight: usize,
     /// Bytes this boundary's flips copy.
     pub bytes: u64,
+    /// Host microseconds this boundary waited for its landing jobs' staging.
+    pub wait_us: u64,
+    /// Host microseconds this boundary spent issuing its flips' copies (the
+    /// copy stream's enqueues and the staging thread's jobs).
+    pub issue_us: u64,
+    /// Staging thread microseconds since the last boundary: copying experts'
+    /// bytes into the ring, and preparing victims for the host.
+    pub stage_us: u64,
+    pub prepare_us: u64,
 }
 
 /// What a reset did ([`SwapMachine::reset`]), for the `residency reset`
@@ -1040,6 +1067,8 @@ impl SwapMachine {
             deadline: cfg.deadline,
             flush: AtomicBool::new(false),
             served: AtomicU64::new(0),
+            stage_ns: AtomicU64::new(0),
+            prepare_ns: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
         });
@@ -1362,9 +1391,11 @@ impl SwapMachine {
             }
             self.shared.due.fetch_max(f.job + 1, Ordering::AcqRel);
         }
+        let t0 = Instant::now();
         for f in &landing {
             self.wait_staged(f, WHAT)?;
         }
+        report.wait_us = micros(t0);
         self.refuse_staging_failure(WHAT, Some(b))?;
         for f in &landing {
             if !self.shared.source.host_resident(f.layer, f.victim)? {
@@ -1378,6 +1409,8 @@ impl SwapMachine {
         }
         let changed = self.land_and_plan(b, stream, slots, &landing, &mut report);
         self.after_change(changed, &format!("boundary {b}"))?;
+        report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
+        report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
         self.planned = Some(b);
         Ok(report)
     }
@@ -1479,9 +1512,11 @@ impl SwapMachine {
         self.boundary_event.record(stream)?;
         if b > 0 {
             let made: Vec<Flip> = self.rule.plan(b).map_err(|e| rule_err(WHAT, e))?.to_vec();
+            let t0 = Instant::now();
             for f in &made {
                 report.bytes += self.issue(slots, f)?;
             }
+            report.issue_us = micros(t0);
             report.made = made.len();
         }
         for (i, f) in landing.iter().enumerate() {
@@ -1749,13 +1784,18 @@ impl SwapMachine {
         }
         self.boundary_event.record(stream)?;
         // The seed's copies stage as they are issued, whatever the window
-        // says: hundreds of them behind a closed window would fill the copy
-        // stream's queue while this thread still enqueues, and the flush that
-        // stages them (`drain_copies`) comes only after the last. On an error
-        // in between the flush stays on, which only stages sooner.
+        // says, and go out a ring's worth at a time, each batch drained
+        // within the deadline: hundreds of them behind unstaged copies would
+        // fill the copy stream's queue while this thread still enqueues, a
+        // block inside the driver with no bound. A copy past the ring waits
+        // on a ring slot's earlier copy anyway, so a batch loses nothing. On
+        // an error in between the flush stays on, which only stages sooner.
         self.shared.flush.store(true, Ordering::Release);
         let mut placed = Vec::with_capacity(back.len());
         for &(l, id) in &back {
+            if !placed.is_empty() && placed.len() % RING_SLOTS == 0 {
+                self.drain_copies(WHAT)?;
+            }
             let spare = self.ledger.spare(l).ok_or_else(|| {
                 GpuError::protocol(
                     WHAT,
@@ -1767,6 +1807,7 @@ impl SwapMachine {
             placed.push((l, id, spare));
         }
         self.drain_copies(WHAT)?;
+        self.shared.flush.store(false, Ordering::Release);
         self.refuse_staging_failure(WHAT, None)?;
         for &(l, id, spare) in &placed {
             slots.admit(l, id, Slot::Card(spare))?;
@@ -1799,9 +1840,9 @@ impl SwapMachine {
 
     /// Stage every queued job whatever the window says and wait, within the
     /// deadline, for the copy stream to drain; past it the refusal of
-    /// `what` names the wait.
+    /// `what` names the wait. The flush is as it was after.
     fn drain_copies(&self, what: &'static str) -> Result<(), GpuError> {
-        self.shared.flush.store(true, Ordering::Release);
+        let was = self.shared.flush.swap(true, Ordering::AcqRel);
         let r = poll_drained(&self.copy, self.shared.deadline).map_err(|e| match e {
             Drain::Driver(e) => e,
             Drain::Late(waited) => GpuError::protocol(
@@ -1812,7 +1853,7 @@ impl SwapMachine {
                 ),
             ),
         });
-        self.shared.flush.store(false, Ordering::Release);
+        self.shared.flush.store(was, Ordering::Release);
         r
     }
 }
