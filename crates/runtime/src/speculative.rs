@@ -92,6 +92,15 @@ pub trait Draft<T: Verify> {
 
     /// A pass with no proposal stepped `last`; its argmax is `next`.
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error>;
+
+    /// [`Draft::stepped`] of a pass whose proposal was held back (a closed
+    /// [`crate::Gated`]): the draft still takes in the position — a window it
+    /// keeps cannot be rebuilt — but may queue the work, as long as its next
+    /// [`Draft::propose`] sees every position before it. The default is
+    /// [`Draft::stepped`].
+    fn held(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error> {
+        self.stepped(t, last, next)
+    }
 }
 
 /// The verify widths of a pass of at most `M` rows: 2 to `M`, the rows of a

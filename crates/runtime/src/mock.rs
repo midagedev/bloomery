@@ -1,6 +1,11 @@
 //! A target on the host for the tests: a deterministic "model" whose greedy
 //! next token is a function of the history, and a log of every call.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use crate::gate::{Clock, GateError};
 use crate::{Committed, Out, PassSink, Target, Verify, Want};
 
 /// One call the mock ran, at the position it started from.
@@ -13,15 +18,56 @@ pub(crate) enum Call {
 }
 
 #[derive(Debug)]
-pub(crate) struct MockError(&'static str);
+pub(crate) enum MockError {
+    Mock(&'static str),
+    Gate(GateError),
+}
 
 impl std::fmt::Display for MockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        match self {
+            MockError::Mock(why) => f.write_str(why),
+            MockError::Gate(e) => e.fmt(f),
+        }
     }
 }
 
 impl std::error::Error for MockError {}
+
+impl From<GateError> for MockError {
+    fn from(e: GateError) -> MockError {
+        MockError::Gate(e)
+    }
+}
+
+/// A clock the mock's calls move: each step and each verify advances it by
+/// its cost, in microseconds; a test changes the costs as it runs.
+#[derive(Debug, Default)]
+pub(crate) struct Clockwork {
+    pub(crate) now: Cell<u64>,
+    pub(crate) step: Cell<u64>,
+    pub(crate) verify: Cell<u64>,
+}
+
+impl Clockwork {
+    pub(crate) fn new(step: u64, verify: u64) -> Rc<Clockwork> {
+        Rc::new(Clockwork {
+            now: Cell::new(0),
+            step: Cell::new(step),
+            verify: Cell::new(verify),
+        })
+    }
+
+    pub(crate) fn advance(&self, us: u64) {
+        self.now.set(self.now.get() + us);
+    }
+}
+
+impl Clock for Rc<Clockwork> {
+    fn now(&mut self) -> Duration {
+        Duration::from_micros(self.now.get())
+    }
+}
 
 pub(crate) struct Mock {
     history: Vec<u32>,
@@ -30,6 +76,7 @@ pub(crate) struct Mock {
     fail_at: Option<u32>,
     rows: Option<(usize, usize)>,
     ctx: u32,
+    clock: Option<Rc<Clockwork>>,
 }
 
 impl Mock {
@@ -41,7 +88,14 @@ impl Mock {
             fail_at: None,
             rows: None,
             ctx: 1000,
+            clock: None,
         }
+    }
+
+    /// Each step and verify advances `clock` by its cost.
+    pub(crate) fn with_clock(mut self, clock: Rc<Clockwork>) -> Mock {
+        self.clock = Some(clock);
+        self
     }
 
     /// Caches of `ctx` positions: a step at `ctx` and a verify whose rows
@@ -82,10 +136,27 @@ impl Mock {
         rule(self.history.len() + 1, id, b)
     }
 
+    /// The `n` tokens greedy steps from `id` would return, the history left as
+    /// it is: [`Mock::next_after`] first.
+    pub(crate) fn greedy_after(&self, id: u32, n: usize) -> Vec<u32> {
+        let (mut len, mut a, mut b) = (
+            self.history.len() + 1,
+            id,
+            self.history.last().copied().unwrap_or(0),
+        );
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let next = rule(len, a, b);
+            out.push(next);
+            (len, a, b) = (len + 1, next, a);
+        }
+        out
+    }
+
     /// Refused unless positions `at()` to `at() + rows − 1` fit the caches.
     fn fits(&self, rows: usize) -> Result<(), MockError> {
         if self.history.len() + rows > self.ctx as usize {
-            return Err(MockError("rows past the caches' ctx"));
+            return Err(MockError::Mock("rows past the caches' ctx"));
         }
         Ok(())
     }
@@ -96,7 +167,7 @@ impl Mock {
 
     fn idle(&self) -> Result<(), MockError> {
         match self.rows {
-            Some(_) => Err(MockError("a verify's rows wait for commit")),
+            Some(_) => Err(MockError::Mock("a verify's rows wait for commit")),
             None => Ok(()),
         }
     }
@@ -122,7 +193,7 @@ impl Target for Mock {
         self.calls.push(Call::Prompt(self.at(), ids.len()));
         self.idle()?;
         if self.fail_prompt {
-            return Err(MockError("the prompt call failed"));
+            return Err(MockError::Mock("the prompt call failed"));
         }
         self.fits(ids.len())?;
         self.history.extend_from_slice(ids);
@@ -133,9 +204,12 @@ impl Target for Mock {
         self.calls.push(Call::Step(self.at()));
         self.idle()?;
         if self.fail_at == Some(self.at()) {
-            return Err(MockError("the step failed"));
+            return Err(MockError::Mock("the step failed"));
         }
         self.fits(1)?;
+        if let Some(c) = &self.clock {
+            c.advance(c.step.get());
+        }
         self.history.push(id);
         Ok(Out::Argmax(self.argmax()))
     }
@@ -163,6 +237,9 @@ impl Verify for Mock {
         self.calls.push(Call::Verify(self.at(), M));
         self.idle()?;
         self.fits(M)?;
+        if let Some(c) = &self.clock {
+            c.advance(c.verify.get());
+        }
         let first = self.history.len();
         let mut out = [0u32; M];
         for (o, &id) in out.iter_mut().zip(&rows) {
@@ -178,9 +255,9 @@ impl Verify for Mock {
         let (first, m) = self
             .rows
             .take()
-            .ok_or(MockError("a commit with no verify"))?;
+            .ok_or(MockError::Mock("a commit with no verify"))?;
         if !(1..=m).contains(&accepted) {
-            return Err(MockError("a commit outside the verify's rows"));
+            return Err(MockError::Mock("a commit outside the verify's rows"));
         }
         self.history.truncate(first + accepted);
         Ok(())
