@@ -1048,6 +1048,18 @@ gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault
 gate-gpu-ds41-twocard *ARGS='--union --loopback --lost':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
 
+# V4.1 adaptive residency (BLOOMERY_RESIDENCY, set in the gate to mid-p40-s1) on plan (b′), both cards, the id-prefix
+# seed, the r8 sidecar: the host-set refusal at load (a host one byte short of the churn pool, named, before the load),
+# then one load — c6 (a DSpark pair pass keeping one row folds what one step folds), c1 (the prose history twice, same
+# tokens and logits, flips landed), the admitted experts' slots byte for byte a static load's (the r8 unpack), the host
+# set's residency answers, the tier entries unmoved, the passes' kinds and kept rows (the prompt call one pass, 0 kept),
+# c3 (the copy stream held 1 s, same history), the serve seat's reset leaving the residency, c7 (a reset back to the
+# seed, no host byte released). One load (the refusal stops before its own). Both cards, alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-ds41-residency *ARGS:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_residency && bash tools/gpu-gate.sh gate_deepseek41_residency {{ARGS}}'
+
 # V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
 # --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
 # six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any

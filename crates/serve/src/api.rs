@@ -28,6 +28,10 @@
 //! 503 at once where llama-server defers it until the slot is free. Save and
 //! restore take `{"filename": "<base name>"}` under
 //! [`ServerConfig::slot_save_path`]; the file is [`crate::slotfile`]'s.
+//!
+//! `POST /residency/reset` is bloomery's own: the engine's adaptive expert
+//! residency back to its load's placement ([`Engine::residency_reset`]), the
+//! one call that does it — a request never resets it.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
@@ -602,6 +606,7 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", p) if p.starts_with("/slots/") => {
             return slot_action(state, req, w, &p["/slots/".len()..]);
         }
+        ("POST", "/residency/reset") => return residency_reset(state, req, w),
         ("POST", "/completion" | "/completions") => return completion(state, req, w),
         ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
         ("POST", "/tokenize") => body(req).and_then(|b| tokenize(state, &b)),
@@ -1442,6 +1447,45 @@ enum SlotAction {
     Save(String),
     Restore(String),
     Erase,
+}
+
+/// `POST /residency/reset`: the engine's adaptive expert residency back to
+/// its load's placement ([`Engine::residency_reset`]), on a free slot (a slot
+/// running a request is a 503 at once). An engine with no residency is a 501;
+/// an engine that fails is fatal, as any engine error.
+fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let mut run = match Run::try_begin(state) {
+        Ok(r) => r,
+        Err(e) => return send_error(w, req, &e),
+    };
+    let t0 = Instant::now();
+    match run.engine.engine.residency_reset() {
+        Ok(Some(r)) => send_json(
+            w,
+            req,
+            200,
+            &json!({
+                "cancelled": r.cancelled,
+                "copies": r.copies,
+                "diff": r.diff,
+                "dropped_bytes": r.dropped_bytes,
+                "timings": { "reset_ms": ms_since(t0) },
+            }),
+        ),
+        Ok(None) => send_error(
+            w,
+            req,
+            &ApiError {
+                code: 501,
+                kind: "not_supported_error",
+                message: "this engine runs no adaptive expert residency".to_owned(),
+            },
+        ),
+        Err(e) => {
+            run.fail(&e);
+            send_error(w, req, &engine_error(&e))
+        }
+    }
 }
 
 /// `POST /slots/{id}?action=…`, checked in llama-server's order: a save

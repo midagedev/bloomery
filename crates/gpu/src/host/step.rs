@@ -629,6 +629,12 @@ pub struct StepPort {
     pair_row0: Option<usize>,
     row0_ids: Vec<u32>,
     pub(super) stats: StepStats,
+    /// The routed ids each service sees, for the residency rule
+    /// ([`super::swap::Tally`]); off without a residency machine.
+    pub(super) tally: super::swap::Tally,
+    /// The residency machine's staging window, held open while the pool
+    /// waits for a go; `None` without a machine.
+    pub(super) window: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl StepPort {
@@ -663,6 +669,8 @@ impl StepPort {
             pair_row0: None,
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
+            tally: super::swap::Tally::off(),
+            window: None,
         }
     }
 
@@ -781,7 +789,13 @@ impl StepPort {
         let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
+        if let Some(w) = &self.window {
+            w.store(1, Ordering::Release);
+        }
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
+        if let Some(w) = &self.window {
+            w.store(0, Ordering::Release);
+        }
         if early {
             self.stats.go_early += 1;
             self.stats.go_early_first += u64::from(opens_replay);
@@ -898,6 +912,7 @@ impl StepPort {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
+            self.tally.note(layer, row, s, id)?;
             match slots.slot(layer, id) {
                 Some(Slot::Host) => {
                     self.list.push((id, w));
@@ -994,6 +1009,7 @@ impl StepPort {
                 };
                 let w = f32::from_bits(wb);
                 w2_all += f64::from(w) * f64::from(w);
+                self.tally.note(layer, j, s, id)?;
                 match slots.slot(layer, id) {
                     Some(Slot::Host) => {
                         list[len] = (id, w);

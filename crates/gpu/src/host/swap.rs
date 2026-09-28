@@ -190,6 +190,22 @@ pub trait SwapSource: Send + Sync {
     /// at. The stacks stay allocated and in place for the machine's life.
     fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError>;
 
+    /// Enqueue on `stream`, the machine's copy stream, whatever turns part
+    /// `part`'s staged bytes, just copied to `dst`, into the slot's layout in
+    /// place (a source whose card layout differs from its host bytes); the
+    /// copies of later parts and the flip's event follow it on the stream.
+    /// Nothing by default: the staged bytes are the slot's.
+    fn convert(
+        &self,
+        layer: usize,
+        part: usize,
+        dst: sys::CUdeviceptr,
+        stream: &CudaStream,
+    ) -> Result<(), GpuError> {
+        let _ = (layer, part, dst, stream);
+        Ok(())
+    }
+
     /// Bring layer `layer`'s expert `id` to where the host serves it from
     /// resident pages (read its pages in).
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError>;
@@ -1077,6 +1093,13 @@ impl SwapMachine {
         &self.rule
     }
 
+    /// Whether a boundary has opened a pass that no [`SwapMachine::end_pass`]
+    /// has ended yet: the next boundary needs that pass's kept rows.
+    #[must_use]
+    pub fn pass_open(&self) -> bool {
+        self.planned == Some(self.rule.passes())
+    }
+
     /// The error that broke the machine, when one has.
     #[must_use]
     pub fn broken(&self) -> Option<&str> {
@@ -1507,8 +1530,9 @@ impl SwapMachine {
             "swap: wait for staging",
         )?;
         let mut at = 0usize;
-        for (&len, &dst) in parts.iter().zip(&dsts) {
+        for (part, (&len, &dst)) in parts.iter().zip(&dsts).enumerate() {
             self.shared.ring.copy_to_device(ring, at, len, dst, &copy)?;
+            source.convert(l, part, dst, &copy)?;
             at += len;
         }
         mem_batch(

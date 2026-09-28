@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use gguf::{Gguf, Split};
 
-use super::{Device, Format, ModelTensor, PlacementError, Plan};
+use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segment};
 use crate::r8file::{R8Error, R8Source, Sidecar};
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
@@ -197,9 +197,23 @@ impl HostSet {
         plan: &Plan<'_>,
         keep: impl Fn(&ModelTensor) -> bool,
     ) -> Result<HostSet, PlacementError> {
+        HostSet::of_with(src, plan, keep, &[])
+    }
+
+    /// [`HostSet::of`] with `extra` too: per entry, the experts of the plan's
+    /// model tensor at that index which the host must serve besides its own
+    /// segments (adaptive residency's churn pool, [`super::churn`]), walked as
+    /// host segments of theirs are — each expert's run in the sidecar when it
+    /// holds the tensor, else in the shard.
+    pub fn of_with(
+        src: R8Source<'_>,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+        extra: &[(usize, ExpertList)],
+    ) -> Result<HostSet, PlacementError> {
         let (split, sidecar) = (src.split(), src.sidecar());
         let page = page_bytes()?;
-        let (pages, side) = host_pages(split, sidecar.map(Arc::as_ref), plan, keep, page)?;
+        let (pages, side) = host_pages(split, sidecar.map(Arc::as_ref), plan, keep, extra, page)?;
         let shards = pages
             .into_iter()
             .enumerate()
@@ -320,6 +334,146 @@ impl HostSet {
         }
         Ok(out)
     }
+}
+
+impl HostSet {
+    /// Whether every page of bytes `at` of `file`'s mapping is in the set.
+    #[must_use]
+    pub fn holds(&self, file: &HostFile, at: &Range<u64>) -> bool {
+        if at.end <= at.start {
+            return false;
+        }
+        let pages = at.start / self.page..at.end.div_ceil(self.page);
+        let runs: &[Range<u64>] = match file {
+            HostFile::Shard(s) => match self.shards.iter().find(|(x, _)| x == s) {
+                Some((_, runs)) => runs,
+                None => return false,
+            },
+            HostFile::Sidecar(p) => match &self.side {
+                Some((side, runs)) if side.path() == p.as_path() => runs,
+                _ => return false,
+            },
+        };
+        let i = runs.partition_point(|r| r.end <= pages.start);
+        runs.get(i)
+            .is_some_and(|r| r.start <= pages.start && pages.end <= r.end)
+    }
+
+    /// Whether bytes `at` of `file`'s mapping in `src` are in the set and
+    /// every page of them is in the page cache now (`mincore`): what the host
+    /// reads there costs no fault. `src` must read the set's sidecar.
+    pub fn serves(
+        &self,
+        src: R8Source<'_>,
+        file: &HostFile,
+        at: &Range<u64>,
+    ) -> Result<bool, PlacementError> {
+        if !self.holds(file, at) {
+            return Ok(false);
+        }
+        let span = self.span(src, file, at)?;
+        let (resident, pages) = resident_pages(span, self.page)
+            .map_err(|e| PlacementError::Host(format!("mincore of {file} bytes {at:?}: {e}")))?;
+        Ok(resident == pages)
+    }
+
+    /// Read bytes `at` of `file`'s mapping in `src` into the page cache and
+    /// map them (`MADV_POPULATE_READ`), when the set holds them; `false`,
+    /// touching nothing, when it does not.
+    pub fn populate_run(
+        &self,
+        src: R8Source<'_>,
+        file: &HostFile,
+        at: &Range<u64>,
+    ) -> Result<bool, PlacementError> {
+        if !self.holds(file, at) {
+            return Ok(false);
+        }
+        let span = self.span(src, file, at)?;
+        // SAFETY: `span` is a live sub-slice of a shard's read-only file
+        // mapping or of the sidecar's mapping (`HostSet::span`);
+        // MADV_POPULATE_READ faults its pages in and never writes them.
+        let rc = unsafe {
+            libc::madvise(
+                span.as_ptr().cast_mut().cast(),
+                span.len(),
+                libc::MADV_POPULATE_READ,
+            )
+        };
+        if rc != 0 {
+            return Err(PlacementError::Host(format!(
+                "madvise(MADV_POPULATE_READ) of {file} bytes {at:?}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(true)
+    }
+
+    /// The whole pages over bytes `at` of `file`'s mapping in `src`.
+    fn span<'a>(
+        &self,
+        src: R8Source<'a>,
+        file: &HostFile,
+        at: &Range<u64>,
+    ) -> Result<&'a [u8], PlacementError> {
+        let g = match file {
+            HostFile::Shard(s) => shard_of(src.split(), *s)?,
+            HostFile::Sidecar(_) => {
+                let (side, _) = self.side.as_ref().ok_or_else(|| {
+                    PlacementError::Host(format!("{file}: the set reads no sidecar"))
+                })?;
+                src.reads(side, "a host set's expert run")?;
+                src.sidecar()
+                    .map(|s| s.gguf())
+                    .ok_or_else(|| PlacementError::Host(format!("{file}: the pair reads none")))?
+            }
+        };
+        run_span(
+            g,
+            file,
+            &(at.start / self.page..at.end.div_ceil(self.page)),
+            self.page,
+        )
+    }
+}
+
+/// Where the host reads expert `id` of `t`, a routed stack of `experts`:
+/// the file and the bytes of its mapping — the sidecar's when `src` reads
+/// one that holds `t` and `sidecar` asks for it, else the shard's.
+pub fn expert_run(
+    src: R8Source<'_>,
+    t: &ModelTensor,
+    experts: u64,
+    id: u32,
+    sidecar: bool,
+) -> Result<(HostFile, Range<u64>), PlacementError> {
+    let (_, per) = super::per_expert(t, experts)?;
+    if u64::from(id) >= experts {
+        return Err(PlacementError::tensor(
+            t,
+            format!("expert {id} is not below the stack's {experts}"),
+        ));
+    }
+    let bytes = u64::from(id) * per..(u64::from(id) + 1) * per;
+    let split = src.split();
+    let (s, info) = split
+        .find(&t.name)
+        .ok_or_else(|| PlacementError::tensor(t, "is not in the split"))?;
+    let held = src
+        .sidecar()
+        .filter(|_| sidecar)
+        .and_then(|sc| sc.find(&t.name).map(|i| (sc, i)));
+    Ok(match held {
+        Some((sc, i)) => (
+            HostFile::Sidecar(sc.path().to_path_buf()),
+            sc.gguf().data_base() + i.offset + bytes.start
+                ..sc.gguf().data_base() + i.offset + bytes.end,
+        ),
+        None => {
+            let base = shard_of(split, s)?.data_base() + info.offset;
+            (HostFile::Shard(s), base + bytes.start..base + bytes.end)
+        }
+    })
 }
 
 /// Page ranges `[first, end)` of one mapping.
@@ -886,62 +1040,82 @@ fn host_pages(
     sidecar: Option<&Sidecar>,
     plan: &Plan<'_>,
     keep: impl Fn(&ModelTensor) -> bool,
+    extra: &[(usize, ExpertList)],
     page: u64,
 ) -> Result<(Vec<Runs>, Runs), PlacementError> {
     let mut pages: Vec<Runs> = vec![Vec::new(); split.shard_count()];
     let mut side: Runs = Vec::new();
+    let named = |tensor: usize, what: &str| {
+        plan.model
+            .tensors
+            .get(tensor)
+            .ok_or_else(|| PlacementError::Host(format!("{what} {tensor} names no tensor")))
+    };
+    let mut pool: Vec<(&ModelTensor, Segment)> = Vec::with_capacity(extra.len());
+    for (tensor, list) in extra {
+        let t = named(*tensor, "an extra host run's tensor")?;
+        pool.push((
+            t,
+            Segment {
+                device: Device::Host,
+                format: Format::HostFile,
+                experts: Some(list.clone()),
+                resident_bytes: 0,
+            },
+        ));
+    }
+    let mut segments: Vec<(&ModelTensor, &Segment)> = Vec::new();
     for row in &plan.rows {
-        let Some(t) = plan.model.tensors.get(row.tensor) else {
-            return Err(PlacementError::Host(format!(
-                "plan row {} names no tensor",
-                row.tensor
-            )));
-        };
+        let t = named(row.tensor, "plan row")?;
         if !keep(t) {
             continue;
         }
-        for seg in &row.segments {
-            if seg.device != Device::Host || seg.format != Format::HostFile {
-                continue;
-            }
-            let located = split
-                .find(&t.name)
-                .and_then(|(s, info)| Some((s, info, split.shard(s)?)));
-            let Some((s, info, g)) = located else {
+        segments.extend(
+            row.segments
+                .iter()
+                .filter(|seg| seg.device == Device::Host && seg.format == Format::HostFile)
+                .map(|seg| (t, seg)),
+        );
+    }
+    segments.extend(pool.iter().map(|(t, seg)| (*t, seg)));
+    for &(t, seg) in &segments {
+        let located = split
+            .find(&t.name)
+            .and_then(|(s, info)| Some((s, info, split.shard(s)?)));
+        let Some((s, info, g)) = located else {
+            return Err(PlacementError::tensor(
+                t,
+                "is not in the split the host set maps",
+            ));
+        };
+        let held = sidecar.and_then(|sc| sc.find(&t.name).map(|i| (sc.gguf(), i)));
+        for span in seg.spans(t, plan.model.experts)? {
+            if s != t.shard || span.bytes.end > info.nbytes {
                 return Err(PlacementError::tensor(
                     t,
-                    "is not in the split the host set maps",
+                    format!(
+                        "the plan's shard {} and bytes {:?} are not the split's shard {s} and {} bytes",
+                        t.shard, span.bytes, info.nbytes
+                    ),
                 ));
-            };
-            let held = sidecar.and_then(|sc| sc.find(&t.name).map(|i| (sc.gguf(), i)));
-            for span in seg.spans(t, plan.model.experts)? {
-                if s != t.shard || span.bytes.end > info.nbytes {
-                    return Err(PlacementError::tensor(
-                        t,
-                        format!(
-                            "the plan's shard {} and bytes {:?} are not the split's shard {s} and {} bytes",
-                            t.shard, span.bytes, info.nbytes
-                        ),
-                    ));
-                }
-                let (base, into) = match held {
-                    Some((sg, side_info)) => {
-                        if span.bytes.end > side_info.nbytes {
-                            return Err(PlacementError::tensor(
-                                t,
-                                format!(
-                                    "the plan's bytes {:?} run past the sidecar's {} bytes of it",
-                                    span.bytes, side_info.nbytes
-                                ),
-                            ));
-                        }
-                        (sg.data_base() + side_info.offset, &mut side)
-                    }
-                    None => (g.data_base() + info.offset, &mut pages[s]),
-                };
-                let (a, b) = (base + span.bytes.start, base + span.bytes.end);
-                into.push(a / page..b.div_ceil(page));
             }
+            let (base, into) = match held {
+                Some((sg, side_info)) => {
+                    if span.bytes.end > side_info.nbytes {
+                        return Err(PlacementError::tensor(
+                            t,
+                            format!(
+                                "the plan's bytes {:?} run past the sidecar's {} bytes of it",
+                                span.bytes, side_info.nbytes
+                            ),
+                        ));
+                    }
+                    (sg.data_base() + side_info.offset, &mut side)
+                }
+                None => (g.data_base() + info.offset, &mut pages[s]),
+            };
+            let (a, b) = (base + span.bytes.start, base + span.bytes.end);
+            into.push(a / page..b.div_ceil(page));
         }
     }
     for spans in pages.iter_mut().chain(std::iter::once(&mut side)) {

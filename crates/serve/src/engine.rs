@@ -199,6 +199,14 @@ pub trait Engine: Send {
     fn cache_ram(&self) -> u64 {
         0
     }
+    /// Returns the engine's adaptive expert residency to the placement it
+    /// loaded with, the sequence left as it stands: the one explicit call a
+    /// runner makes before a timed request (`POST /residency/reset`); no
+    /// request and no other call does it. `Ok(None)` (the default): the
+    /// engine runs no residency, a 501.
+    fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
+        Ok(None)
+    }
     /// The whole cache as a value [`Engine::resume`] takes back, the cache
     /// unchanged. The default is [`Engine::save_state`] into host memory.
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
@@ -406,6 +414,18 @@ impl std::fmt::Display for CacheNote {
             }
         }
     }
+}
+
+/// What a residency reset did ([`Engine::residency_reset`]): flips in flight
+/// cancelled, experts copied back onto the card, entries of the live map
+/// that still differ from the load's after it (0 when it worked), and host
+/// bytes released.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidencyReset {
+    pub cancelled: u64,
+    pub copies: u64,
+    pub diff: u64,
+    pub dropped_bytes: u64,
 }
 
 /// An engine's part of `/props`' `engine` object (toktape's shape), beside the

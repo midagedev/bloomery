@@ -26,6 +26,8 @@ use std::fmt::{Debug, Display, Write as _};
 use std::sync::OnceLock;
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::host::PassKind;
+#[cfg(feature = "gpu")]
 use bloomery_gpu::host::swap::{PassReport, ResetReport};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
@@ -877,11 +879,13 @@ pub static TIME_PROMPT: Kind = Kind {
 pub static RESIDENCY_PASS: Kind = Kind {
     name: "residency_pass",
     head: "residency pass",
-    doc: "A residency boundary: its passes since the load or the last reset, the rows the pass \
-          before it kept, the flips that went live there (late: their copies had not completed and \
+    doc: "A residency boundary: what the pass before it was (none, step, pair, prompt — a \
+          prompt call's rows are not counted — abandoned, or driver: the machine's own test \
+          driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
           the bytes its flips copy.",
     parts: &[
+        key("pass", Word, ""),
         key("boundary", U64, ""),
         key("kept", U64, ""),
         key("landed", U64, ""),
@@ -889,6 +893,25 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("made", U64, ""),
         key("in_flight", U64, ""),
         key("bytes", U64, "B"),
+    ],
+};
+
+/// Adaptive residency's host share at the plan
+/// ([`model::placement::churn::ChurnPool`]).
+pub static RESIDENCY_HOST: Kind = Kind {
+    name: "residency_host",
+    head: "residency host",
+    doc: "Adaptive residency's host share, from the plan before the load: the lever's word, the \
+          seed experts a layer kept on the stage card, the churn pool (the stage card's experts \
+          past them, which the load's host set holds too) and its bytes, and the plan's host \
+          headroom before and after the pool.",
+    parts: &[
+        key("residency", Word, ""),
+        key("pinned", U64, ""),
+        key("churn_experts", U64, ""),
+        key("churn_bytes", U64, "B"),
+        key("headroom", I64, "B"),
+        key("headroom_after", I64, "B"),
     ],
 };
 
@@ -1308,6 +1331,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &STAT_FINITE_SUMMARY,
     &DRAFT_SUMMARY,
     &SMOKE,
+    &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
 ];
@@ -1344,6 +1368,9 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &CACHE_EVICT,
     &CACHE_SKIP,
     &PREFILL_SPLIT,
+    &RESIDENCY_HOST,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -1428,10 +1455,34 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
     out
 }
 
-/// A residency boundary's record.
+/// The churn pool's record under the residency word `residency`, against
+/// the plan it was taken from.
+pub fn residency_host(
+    residency: &str,
+    pool: &model::placement::churn::ChurnPool,
+    plan: &Plan<'_>,
+) -> Record {
+    Record::new(&RESIDENCY_HOST)
+        .w("residency", residency)
+        .u("pinned", pool.pinned)
+        .u("churn_experts", pool.experts)
+        .u("churn_bytes", pool.bytes)
+        .u("headroom", plan.host.headroom_bytes)
+        .u("headroom_after", pool.headroom_after(plan))
+}
+
+/// A residency boundary's record, of a machine driven directly
+/// ([`PassKind::Driver`]).
 #[cfg(feature = "gpu")]
 pub fn residency_pass(r: &PassReport) -> Record {
+    residency_pass_of(PassKind::Driver, r)
+}
+
+/// A residency boundary's record, ending a pass of `kind`.
+#[cfg(feature = "gpu")]
+pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
     Record::new(&RESIDENCY_PASS)
+        .w("pass", kind.word())
         .u("boundary", r.boundary)
         .u("kept", r.kept)
         .u("landed", r.landed)
