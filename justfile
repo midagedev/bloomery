@@ -277,6 +277,42 @@ ncu-gpu-qwen3-pp P='4096' LAYER='24' KERNEL='gqa_prefill_flash':
 time-gpu-cnode:
     ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin cnode_probe && bash tools/ref/time-gate.sh cnode_probe'
 
+# 연구 탐침(시팅 r0928): 카드 사이 환원 지연 t_red의 호스트 경로. probe_tred는 A6000과 3090이 매핑된 호스트 페이지의
+# 깃발로 주고받는 왕복(깃발만인 팔, 16 KiB 복사를 얹은 팔)을 캡처된 그래프로 재고, --check는 K = 16 왕복의 깃발과 탑재물이
+# 맞는지만 본다. 두 카드가 다 보여야 해서 BLOOMERY_CARD=both, 혼자 돈다. 시간은 time-gpu-probe-tred(임대, 리드 전용).
+[group('solo')]
+probe-gpu-tred:
+    BLOOMERY_CARD=both ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_tred && bash tools/gpu-gate.sh probe_tred --check'
+
+# 연구 탐침(시팅 r0928): cuMemHostRegister의 익명·/dev/shm 청크 등록. --check는 64 MiB PORTABLE 청크 하나씩을 카드 0으로
+# 왕복 복사해 바이트를 대조한다. 시간(1 GiB 청크 8개, flags 0·PORTABLE, 두 카드)은 time-gpu-probe-hostreg.
+# 상한에 걸려 죽은 프로세스는 /dev/shm 청크를 못 지우므로 두 레시피가 실행 뒤에 지운다.
+probe-gpu-hostreg:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_hostreg && bash tools/gpu-gate.sh probe_hostreg --check; rc=$?; rm -f /dev/shm/bloomery-probe-hostreg-*; exit $rc'
+
+# 연구 탐침(시팅 r0928): V4.1 한 층(기본 3)의 어텐션 투영 넷(qkv·q_b·묶음 wo_a·wo_b)을 파일 바이트 그대로 grouped int8
+# GEMM에 m = 128 토큰으로 돌리고, 역할마다 출력 여섯을 f64 내적과 반올림 한계 안에서 대조한다. 시간은 time-gpu-probe-imma.
+probe-gpu-imma *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_imma && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh probe_imma --check {{ARGS}}'
+
+# 연구 탐침(시팅 r0928): 프롬프트가 읽을 engram 행의 페이지 캐시 상주율(mincore, 호스트만, 아무것도 재지 않는다).
+# 기본은 --check(한 번 읽은 행이 상주로 세어지는지). 시팅에서는 이 빌드 뒤 BLOOMERY_BOX_READONLY=1 명령으로
+# target/release/probe_engram --ids <파일> --offset O --limit N을 돌린다.
+probe-engram *ARGS='--check':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin probe_engram && bash tools/host-gate.sh probe_engram {{ARGS}}'
+
+# t_red 시간(리드 전용, 임대): probe_tred --time을 두 카드가 보이는 채로 tools/ref/probe-twocard.sh가 임대·증인 사이에서 돌린다.
+time-gpu-probe-tred *ARGS:
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_tred && bash tools/ref/probe-twocard.sh probe_tred {{ARGS}}'
+
+# 호스트 등록 시간(리드 전용, 임대): probe_hostreg --time, 두 카드가 보이는 채로(tools/ref/probe-twocard.sh).
+time-gpu-probe-hostreg *ARGS:
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_hostreg && bash tools/ref/probe-twocard.sh probe_hostreg {{ARGS}}; rc=$?; rm -f /dev/shm/bloomery-probe-hostreg-*; exit $rc'
+
+# t_IMMA 시간(리드 전용, 임대): probe_imma --time을 A6000 하나로 tools/ref/time-gate.sh가 돌린다.
+time-gpu-probe-imma *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_imma && bash tools/ref/time-gate.sh probe_imma --time {{ARGS}}'
+
 # 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
 # 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
 # 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`.
@@ -1234,6 +1270,13 @@ nsys-gpu-qwen3moe-prefill *PROMPTS:
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
+
+# GLM-5.3-Flash decode kernel table (nsys, A6000, under the lease, lead-only): generate_glm5next fed the first D ids of
+# GLM_PROSE (default 512) at --place a, ctx 2048, -n BLOOMERY_NSYS_N (8), each step a replay; the kernel table per step
+# (by the graph launches and by D + N - 1) and the Q8_0 gemv rows. The header of tools/ref/nsys-glm5next.sh has the
+# window. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
+nsys-gpu-glm5next *DEPTHS:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi && bash tools/ref/nsys-glm5next.sh {{DEPTHS}}'
 
 # V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches

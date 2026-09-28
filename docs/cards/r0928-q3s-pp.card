@@ -1,0 +1,29 @@
+# Sitting r0928, job `s` (item 8; modeltools-report.md §0 lines 8-21 and §1-1 lines 67-78): the cost s of
+# one more verify position on the Qwen3 card, in steps. t1 = 4.81 ms at depth 512 (208.02 tok/s,
+# rig-log 09-25 qwen3prefill lease); the 8-position pass is 20.75 ms beside a 5.135 ms step (09-25
+# q3graph), 2.23 ms a position [derived]: the m-row pass reads each slot's expert on its own
+# (arch/qwen3moe/experts.rs:9-19), 1,097 MB a token at ~492 GB/s; the byte floor at 720 GB/s is
+# 1.52 ms. So s = 0.30 (floor) .. 0.46 (today's pass) [derived]. P = 1..5 are one pass each: a prompt
+# of D <= 8 ids is one pass (arch/qwen3moe/prefill.rs, MAX_TOKENS 8), no ubatch cut; P = 1 is the
+# intercept, so the eager pass's own launch cost cancels in the slope.
+# Minutes: 3 [derived: one shared load per round (the five arms share C = 256), ~20 s a load, three
+# rounds plus the warm-up; each arm is a prompt and 96 steps of ~5 ms].
+kind: profile
+question: what does one more verify position cost a Qwen3-30B-A3B pass on the A6000, in plain steps,
+  the term every DFlash and EAGLE-3 speedup of the modeltools report divides by?
+term: s = (slope of the time prompt ms over P = 1..5, least squares) / (the same rows' decode step
+  p50 ms), ours, lcg prompt, n = 96, depth P, A6000
+unit: steps
+predict: 0.30..0.46
+condition: BLOOMERY_AB_ROUNDS=3 just depth-gpu-qwen3moe 1 2 3 4 5 under the lease on the A6000, ours
+  arms only, one load per round (the rows carry slot k/5); every row reports passes=1 (a row with
+  passes other than 1 is void), none [cold] or [other-busy]; the slope is fitted per round and the
+  three rounds' s are reported with their spread; the step is each row's p50
+decide-in: the modeltools S table stands between its s = 0.30 and 0.46 columns: go to the acceptance
+  term (tap dump and the Mac replay of the RedHat DFlash) with S read at the measured s
+decide-below: the m-row pass is cheaper than the byte model (s under 0.30): recheck the expert read
+  in experts.rs against this row; the S table's s = 0.30 column is the pessimistic side, and the
+  draft rounds move ahead of the m-row expert grouping lever
+decide-above: a verify position costs more than today's 8-row pass slope: every draft pays only at
+  j <= 2; the m-row expert grouping (one read per distinct expert, recentlit §6) comes before any
+  draft round, priced from this row

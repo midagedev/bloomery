@@ -247,6 +247,18 @@ name = "cnode_probe"
 required-features = ["gpu"]
 
 [[bin]]
+name = "probe_hostreg"
+required-features = ["gpu"]
+
+[[bin]]
+name = "probe_imma"
+required-features = ["gpu"]
+
+[[bin]]
+name = "probe_tred"
+required-features = ["gpu"]
+
+[[bin]]
 name = "forced_probe"
 required-features = ["gpu"]
 

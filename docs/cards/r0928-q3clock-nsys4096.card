@@ -1,0 +1,26 @@
+# Sitting r0928, job `clock4096` (item 2, second half; plan-triage.md:570, the q3swz decide-above): the SM clock
+# of the Qwen3 P = 4096 prompt pipeline. q3swz-pp measured -21.5 ms of window, which is 28.4 M cycles
+# at 1.32 GHz [derived], against the card's 1.57..1.95 GHz: either the pipeline runs slower than
+# assumed or the swizzle gains more inside it than in ncu's isolated launch. The flash launch is
+# 2,319,186 SM cycles (ncu, layer 24, rig-log 09-26#q3swz-ncu); 48 launches are 111.32 M cycles. The
+# band is q3tail-design-report.md 3.2's prompt clock 1.46..1.55 GHz widened to the 1.57 GHz that the
+# pre-q3fa nsys row implied (89.0 ms for 48 x 2.911 M cycles) [derived]: 70.9..76.2 ms of flash.
+# Minutes: 2 [derived: the 09-25 P = 4096 nsys lease took 25 s].
+kind: profile
+question: at what SM clock does the Qwen3 P = 4096 prompt run its flash launches, the term the
+  q3swz decide-above leaves open?
+term: 48 x 2,319,186 cycles over the summed gqa_prefill_flash kernel time of one P = 4096 prompt
+  window (nsys, generate_qwen3moe, one ubatch, A6000 at its 300 W cap)
+unit: GHz
+predict: 1.46..1.57
+condition: just nsys-gpu-qwen3moe-prefill 4096 under the lease on the A6000, the table's
+  gqa_prefill_flash row holding 48 launches (else void); main's flash is q3swz's (031b842, the ncu
+  row's tree: check git log -1 -- crates/gpu/src/flash_gqa_prefill.rs before the run); the witness
+  clocks line is read beside it; guard_other records the 3090
+decide-in: the clock the pp cards assumed holds: the extra -7 ms of q3swz-pp came from other kernels;
+  compare this window's per-kernel rows with the q3router-ab nsys table and name them, then price the
+  L2-order lever (a profile card, <= +1 %) at this clock
+decide-below: the pipeline clock is under every model's: re-derive the open Qwen3 pp predictions
+  (B', act plane, H1, QKV fold) at the measured clock before the next Qwen3 card
+decide-above: flash runs in fewer cycles inside the pipeline than in ncu's isolated replay (L2 warm
+  from the q/k/v writes): use nsys ms as the flash term from now, and price L2-order on it

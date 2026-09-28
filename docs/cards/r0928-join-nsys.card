@@ -1,0 +1,50 @@
+# Sitting r0928, job `join` (item 4; ideaaudit-card-report.md §0 row 7 line 33, from
+# v41-audit-gpu-report.md:90-93 and plan-ledger:1018 / :1159). The card report puts the join's fixed
+# cost at 36 us a layer (40 layers, 1.44 ms of the 22.3 ms step it read, which ran the hot list: 6.5 %);
+# that 36.0 is the intercept of kr-moeattn's bridge fit 36.0 + 119.5 k_host us, which holds the host's
+# fixed work inside the leg (list build, the x copy out of the page, the pool dispatch) as well as the
+# protocol. ds41join-predict.txt (wave-m4) split it: leg(k) = 375-385 / 735-745 us at k = 3 / 6, so the
+# bridge minus the leg is 10..20 us a service, constant in k: the go batch's two system barriers and
+# the generation word crossing PCIe (~2-5), the wait memop polling the counter (~2-5), the post
+# kernel's launch after the wait (~3-5) [derived]. That split is the term here; the two reports do
+# not disagree, they name different spans. The host report's (b) 21-36 us floor is the same intercept.
+# The id prefix (the default placement, no hot list): card slots a token at lcg depth 6 are 41.7 of 240
+# [derived: 228 routed-eligible slots x 70.2 / 384, the plan's 2,668 card experts over 38 layers,
+# uniform over ids; the model's own chat replies read 40.8 at the prefix, rig-log 09-28#hotlist-chat,
+# and the mixed file's prefix read 240 - 203 = 37 at its smaller card, rig-log 09-24 — neither is the
+# public file's lcg row], against 80.8 with the list (09-28#hotlist-chat, lcg depth 6). So a step
+# serves 198.3 host slots instead of 159.2, k_host 4.96 a layer instead of 3.98 over 40 served layers,
+# and the leg grows by 39 x 0.12..0.14 = 4.7..5.5 ms a step [derived]. The term does not move: it is
+# the bridge minus the leg, constant in k, so the prediction stays 10..20 us. What moves is its share:
+# the id prefix's lcg depth-6 step is 33.7 ms (29.66 tok/s, rig-log 09-28#v41-release, a [cpu-busy]
+# row, instrumentation off), so 1.44 ms is 4.3 % of it and the decisions' 0.4..0.8 ms is 1.2..2.4 %.
+# A step whose every slot of some layer lands on the card serves fewer layers and is void; at the
+# prefix that is 0.18^6 x 38 layers = 1.3e-3 a step [derived, uniform], against 0.35^6 x 38 = 0.07 with
+# the list's lcg share, so the void is rarer here.
+# Minutes: 4 [derived: the V4.1 load 75-117 s (rig-log 09-26 nsyspp: 74.6 s; r8host-pp: 33 min for
+# 16 loads), 8 decode steps, the nsys export].
+kind: profile
+question: how much of a V4.1 host join is protocol (signals, polls, the post launch) and not host
+  compute, at the default placement (the id prefix, no hot list)?
+term: (the mean host bridge a replay, go to join over all layers, from nsys) minus (the mean leg_us a
+  step, stat step) over (the mean served a step), V4.1 plan (a), id prefix (no hot list), lcg depth 6,
+  n = 8, A6000
+unit: us
+predict: 10..20
+condition: BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_NSYS_N=8
+  BLOOMERY_LEASE_CARD=docs/cards/r0928-join-nsys.card' just nsys-gpu-ds41 6 under the lease on the
+  A6000: the runner's bridge line (host bridge, all layers, a replay mean over the tabled replays)
+  and the run log's stat step lines of the same steps (the kept, non-warm ones); the run log's plan
+  records all say hot_list none (the post-read refuses the job otherwise) and its host_slots mean is
+  printed beside the term (about 198 [derived], the first public-file lcg reading of the prefix's
+  share); the runner's replay-count check passes or no table; the step's served count must be the
+  plan's routed layers every step (a step serving fewer is void); guard_other records the 3090
+decide-in: the protocol is 0.4..0.8 ms a step (1.2..2.4 % of the prefix's step): the join-floor
+  levers (the layer word in the image, the post spinning on the counter, BAR1 writes; kr-moeattn J2)
+  are worth at most half that, under a round's worth: record them as held behind adaptive residency
+  in the idea ledger
+decide-below: the protocol is under 0.4 ms a step: the join floor is host work inside the leg, not
+  signalling; reject the protocol levers and price the leg's fixed part (list build, x copy, the
+  pool dispatch) with the next host round instead
+decide-above: the protocol is past 0.8 ms a step: open a join-protocol design round (S-M) on
+  kr-moeattn's (a)-(c) with its own A/B card, the lever predicted from this row

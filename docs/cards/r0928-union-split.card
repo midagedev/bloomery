@@ -1,0 +1,31 @@
+# Sitting r0928, job `union` (item 6; ideaaudit-host-report.md §0 row 1 lines 37-44, §1a (1) lines 95-110;
+# ideaaudit-card-report.md §0 row 4 line 30 and §3 line 146). The down share of the host union's
+# per-column cost c_r8 today, the term the q8_K down round rests on. The host report's split: down
+# Q4_K x q8_2_x4 is 53.5 of 256 instructions a column-row-super-block and q8_K would take it to 27
+# (cpugemm-lit-report.md:78,121); c_r8 13.05..14.63 us (flow constants' anchor fit; rig-log
+# 09-25#h3tile-ab 14.63), so the down share is 5.0..8.5 us [derived]. The card report's band for the
+# same c (14.6, a 28..48) is its whole-call value; the split term is the host report's, as the spec
+# says. NEEDS the bench to tally unionr8's gate-up and down dispatches apart
+# (crates/model/src/bin/bench_v41_host.rs union_r8_call, a proposed diff; not in this round's
+# files): tools/ref/sitting-r0928.sh skips this job, by name, until the bench prints the kinds
+# unionr8_gu and unionr8_down.
+# Minutes: 4 [derived: 09-25's six-arm sweep took 177 s with a 26 s repack; two arms at 32 threads].
+kind: profile
+question: how much of the host union's per-column cost c_r8 is the down projection, the part the
+  q8_K activation rule would shorten?
+term: c_down = the slope over m = 8 and 16 of the unionr8_down dispatch time a layer call, per
+  column, bench_v41_host --time at 32 threads, arms unionr8:4x8u0.125 and unionr8:4x16u0.0625,
+  V4.1 file, Threadripper PRO 5975WX
+unit: us
+predict: 5.0..8.5
+condition: just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms
+  unionr8:4x8u0.125,unionr8:4x16u0.0625 under the lease, both arms' outputs bit-equal to the union
+  shape (the bench's pre-timing check), the witness io pressure under 1 % and no other heavy
+  process; the fit is t = 160 x (a + c m) per dispatch kind, as 09-25#h3tile-ab fitted the whole
+decide-in: open the q8_K down round at the measured c_down, its band re-run in the flow model at the
+  id prefix (the +7.8..+10.3 % at lcg P 4096 was the list-384 row's; the prefix's union carries more
+  host columns), with its sigma and e2e count pin cost named in the spec
+decide-below: the down share is small: q8_K saves under 1.1 us a column; re-run the flow model at
+  the measured split and rank q8_K behind (c') if its gain drops under +5 %
+decide-above: down carries more than its instruction share: q8_K's gain is larger than the 22 %
+  column model; re-derive Delta c from the measured split and open the round with that band

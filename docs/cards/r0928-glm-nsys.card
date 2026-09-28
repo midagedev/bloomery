@@ -1,0 +1,34 @@
+# Sitting r0928, job `glm` (item 3; ideaaudit-models-report.md §1-4 lines 55-59 and §0 row 4): where the
+# GLM-5.3 decode step's 47.7 ms (rig-log 09-28#glm-release, 20.95 tok/s at depth 512, ctx 2048, place a,
+# no hot list) sits against the model's 41.2..43.0 ms (glmops-design.md §2.8, lines 378-388).
+# The card side of that model [derived, glmops-design.md §2.8]: 8.10 GB serial (KDA, MLA, hc, dense,
+# router, output) + 1.12 GB shared experts (under the bridge) = 9.22 GB a token at 604..700 GB/s,
+# 13.2..15.3 ms, plus the routed card experts (q5kexp, 46 us a layer, 42 layers, 1.9 ms) where place a
+# holds any: 13.2..17.2 ms of kernel time a replay; attention at the window's mean depth ~260 adds
+# little. The report's alternative is the 8.10 GB read at ~447 GB/s: 9.22 / 447 = 20.6 ms or more.
+# The two bands do not overlap, so one trace decides where the 4.7..6.5 ms gap is.
+# Placement: the id prefix. Nothing on this job's path sets BLOOMERY_HOT_LIST (its BLOOMERY_BOX_ENV is the card alone,
+# nsys-glm5next.sh sets none); glm5next-hotlist.txt reaches a binary only through depth-glm5next.sh's hot: arm. The
+# traced prompt is GLM_PROSE's first 512 ids, inside that list's trace, which does not matter without the list; the
+# 47.7 ms row fed ids from GLM_PROSE_FROM (50,000, depth-glm5next.sh's default). The two prompts differ only in their
+# routing, which at the id prefix moves the routed card expert rows, at most the 1.9 ms above [derived].
+# Minutes: 15 [the spec's estimate; one GLM load + 519 traced replays + the sqlite export].
+kind: profile
+question: is the GLM decode step's gap to the model (47.7 against 41.2..43.0 ms) on the card, in the
+  Q8_0 gemv read below its bandwidth, or on the host side of the step?
+term: kernel time per step (nsys-table.py's header at --steps 519, kernel time us/step) of generate_glm5next --tokens <first 512 prose ids> -n 8 --ctx 2048 --place a, A6000
+unit: ms
+predict: 13.2..17.5
+condition: just nsys-gpu-glm5next 512 under the lease on the A6000, no BLOOMERY_HOT_LIST (the id
+  prefix: generate_glm5next's default placement); the term is read from the
+  --steps 519 header (512 prompt steps + 7); the cuGraphLaunch header must say N = 518 or 519 (one
+  replay a step; a capture pass may stand for one), else the step is more than one graph and the
+  rows are read per launch instead;
+  the run's time step and SMOKE lines must be present; guard_other records the 3090; the q8_0
+  rows' per-step sum is read from the same table for the gemv GB/s
+decide-in: the card matches the byte model; the 4.7..6.5 ms gap is the host bridge or the joins:
+  open the GLM bridge read (nsys-bridge.py over this trace's go/join gaps) before any card kernel round
+decide-below: the card is faster than the byte model (bytes over-counted, or overlap): correct the
+  §2.8 byte table from the per-kernel rows; the gap is wholly host-side, same next step as in-band
+decide-above: the card is the gap: open the Q8_0 gemv round (S) with its A/B band from the q8_0 rows'
+  GB/s here against 604..700 GB/s, predicted up to ~+13 % decode

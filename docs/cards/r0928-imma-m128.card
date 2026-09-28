@@ -1,0 +1,33 @@
+# Sitting r0928, job `imma` (item 7; ideaaudit-card-report.md §0 row 1 line 27, §1 line 43, §3 line 145;
+# cardroute-design-report.md:242-247; prefill-lit2-report.md:154-156). B4 runs the four attention
+# projections of a V4.1 prompt sub-block (joint qkv, q_b, wo_a heads, wo_b; all Q3_K) as the int8
+# tensor-core GEMM instead of B1's m-column gemv. The four are 126.6 M MAC a token, 64.8 GMAC a
+# P = 512 layer-batch, 1.95 ms at a5gemm's dense 66.4 TOPS (rig-log 09-25#a5gemm-a6000): the floor.
+# B1's projections measured 12.1 ms a layer-batch (card_proj, 09-26#b1-pp-ab); B4 pays when
+# 12.1 - t_IMMA >= 8, t_IMMA <= 4.1 ms. At m = 128 (B1's sub-block) the GEMM's grids are small --
+# joint qkv 14 slabs x 2 token tiles = 28 blocks of 168 slots -- so the launches run one block an SM
+# and sit above the dense rate [derived]; the band is the floor to the pay line. Q3_K decodes on the
+# step's chain (grouped.rs: its weight bytes are read straight into the fragments), another reason
+# for the upper side. wo_a is a block-diagonal GEMM: one expert per output group, each slot its own
+# group's input (GemmInput::PerSlot), which the probe runs as the grouped GEMM.
+# Minutes: 1 [derived: four arms, each 7 bursts of 64 launches and 7 x 4 replays of a 64-launch
+# graph, launches of 0.05-0.6 ms].
+kind: profile
+question: how long do the four V4.1 attention projections of one 128-token sub-block take as the int8
+  tensor-core GEMM, and does B4 pay its 8 ms a layer-batch over B1?
+term: t_IMMA = 4 x the sum over the four roles of the graph-replay minimum per launch at m = 128
+  (probe_imma, the file's layer-3 shapes and types), ms a P = 512 layer-batch, A6000
+unit: ms
+predict: 1.95..4.1
+condition: BLOOMERY_MODEL=deepseek41, the probe under tools/ref/time-gate.sh (the lease, the A6000,
+  the witness): probe_imma --time; its check (six outputs a role against an f64 dot of the file's
+  bytes, within the int8 activation rounding bound) passes first or nothing is timed; the four
+  `probe imma arm` rows and the `probe imma total` row; a weight type the GEMM does not take ends the
+  run with a named error before any timing (then B4 needs that type first, a finding by itself)
+decide-in: B4 saves 8.0..10.2 ms a layer-batch: raise the B4 order question to the user now
+  (plan-triage.md:538 put B4 after streaming on a premise r8 moved), with this row and the band + PIN
+  cost of its off/on arms
+decide-below: under the 66.4 TOPS floor: the MAC count or the shapes are wrong; recount the four
+  roles from the file (tools/ref/ds41pp.py role_shape) before any B4 statement
+decide-above: B4 saves under 8 ms at m = 128: it stays behind streaming as decided; price B4 at
+  m = 512 (one GEMM per layer-batch, a larger grid) from the same probe before it is reopened

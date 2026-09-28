@@ -58,3 +58,4 @@ crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOME
 crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crate directory and the synced tree's commit
 crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
+crates/gpu-gates/src/bin/probe_engram.rs	BLOOMERY_DATA	stays: the data directory
