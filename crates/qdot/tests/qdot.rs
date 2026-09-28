@@ -3269,44 +3269,264 @@ fn hw_q5k_tile_matches_dot_row() {
     eprintln!("q5k tile: {name} (k = {k}) on ik's column + seeded: {calls} calls, bit-identical");
 }
 
+/// Row lengths of the Q5_1 and Q8_0 tile clauses: Qwen3.8's routed down
+/// (k = 640, five x4 groups), its gate and up (2560), 736 — five groups and
+/// three q8_2 tail blocks — and 96, three tail blocks and no group.
+const LEGACY_TILE_KS: [usize; 4] = [640, 2560, 736, 96];
+
+/// Random rows per length in a Q5_1 or Q8_0 tile clause.
+const LEGACY_RANDOM_ROWS: usize = 64;
+
+/// f16 bits of a finite value in ±[2^-10, 2^3), either sign: the scale draw
+/// of the random legacy rows.
+fn rand_f16(rng: &mut Lcg) -> u16 {
+    let r = rng.next_u32();
+    let sign = ((r >> 31) as u16) << 15;
+    let exp = (5 + (r >> 10) % 13) as u16;
+    sign | (exp << 10) | (r & 0x3FF) as u16
+}
+
+/// A synthetic Q5_1 block: code `i` stores `u(i)` in 0..31 (bit 4 in qh bit
+/// `i`), the f16 bits `d` and `m`; packed as the scalar mirror reads a block.
+fn q5f1_block(u: impl Fn(usize) -> u8, d: u16, m: u16) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[0..2].copy_from_slice(&d.to_le_bytes());
+    b[2..4].copy_from_slice(&m.to_le_bytes());
+    let mut qh = 0u32;
+    for i in 0..32 {
+        let v = u(i);
+        assert!(v < 32, "code {i}: u = {v}");
+        qh |= u32::from(v >> 4) << i;
+        if i < 16 {
+            b[8 + i] |= v & 0xF;
+        } else {
+            b[8 + i - 16] |= (v & 0xF) << 4;
+        }
+    }
+    b[4..8].copy_from_slice(&qh.to_le_bytes());
+    b
+}
+
+/// A synthetic Q8_0 block: code `i` is `q(i)`, the f16 bits `d`.
+fn q8f0_block(q: impl Fn(usize) -> i8, d: u16) -> [u8; 34] {
+    let mut b = [0u8; 34];
+    b[0..2].copy_from_slice(&d.to_le_bytes());
+    for (i, c) in b[2..].iter_mut().enumerate() {
+        *c = q(i) as u8;
+    }
+    b
+}
+
+/// The ends a Q5_1 tile clause's adversarial rows are built from, as (codes,
+/// d, m) block kinds: the max code 31 under a positive and a negative min,
+/// code 0 under both signs, codes alternating 0 and 31 with m = 0, a ramp
+/// at d = 0 (the min term alone), and a block of d = m = 0.
+type Q5f1Kind = (fn(usize) -> u8, u16, u16);
+const Q5F1_ENDS: [Q5f1Kind; 7] = [
+    (|_| 31, 0x3C00, 0x4000),
+    (|_| 31, 0x3C00, 0xC000),
+    (|_| 0, 0x3C00, 0xC000),
+    (|_| 0, 0x3800, 0x4000),
+    (|i| if i % 2 == 0 { 0 } else { 31 }, 0x3C00, 0x0000),
+    (|i| (i % 32) as u8, 0x0000, 0xBC00),
+    (|_| 31, 0x0000, 0x0000),
+];
+
+/// The ends a Q8_0 tile clause's adversarial rows are built from, as (codes,
+/// d) block kinds: codes 127, −127 and −128 (whose `sign(w, w)` stays −128,
+/// read unsigned as 128), ±127/−128 alternating under a negative scale, a
+/// ramp over the whole code range, a block of d = 0, and a subnormal scale.
+type Q8f0Kind = (fn(usize) -> i8, u16);
+const Q8F0_ENDS: [Q8f0Kind; 7] = [
+    (|_| 127, 0x3C00),
+    (|_| -127, 0x3C00),
+    (|_| -128, 0x3C00),
+    (|i| if i % 2 == 0 { 127 } else { -128 }, 0xBC00),
+    (|i| (8 * i) as u8 as i8, 0x3800),
+    (|_| 127, 0x0000),
+    (|i| i as i8 - 16, 0x0001),
+];
+
+/// Rows of `nb` blocks from `kinds` (`block(kind)` packs one): one row per
+/// kind whose block `b` takes kind `(r + b) % n` — every kind in every x4
+/// slot — then one row per kind of that kind alone.
+fn legacy_end_rows<K: Copy>(kinds: &[K], nb: usize, block: impl Fn(K) -> Vec<u8>) -> Vec<u8> {
+    let n = kinds.len();
+    let mut rows = Vec::new();
+    for r in 0..n {
+        for b in 0..nb {
+            rows.extend_from_slice(&block(kinds[(r + b) % n]));
+        }
+    }
+    for &kind in kinds {
+        for _ in 0..nb {
+            rows.extend_from_slice(&block(kind));
+        }
+    }
+    rows
+}
+
+/// The columns of a Q5_1 or Q8_0 tile clause: every value +3.0 (codes 127,
+/// block sums +4064), every value −3.0 (sums −4064), then [`tile_columns`]'
+/// nine, after `extra` already-coded ones.
+fn legacy_tile_columns(ty: GgmlType, k: usize, extra: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut cols = extra;
+    for v in [3.0f32, -3.0] {
+        let mut a = vec![0u8; col_bytes(ty, k)];
+        quantize_col(ty, &vec![v; k], &mut a);
+        cols.push(a);
+    }
+    coded_columns(ty, k, cols)
+}
+
+/// Q5_1 tile clause: at each of [`LEGACY_TILE_KS`], random rows (codes,
+/// d and m of either sign) and then the ends of [`Q5F1_ENDS`], against the
+/// ±3.0 columns and the seeded ones; then V2-Lite's Q5_1 `ffn_down` (k =
+/// 10944: two tail blocks) — tile = `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2) and the model file"]
+fn hw_q5f1_tile_matches_dot_row() {
+    let ty = GgmlType::Q5_1;
+    let mut rng = Lcg(0x51_7113);
+    for k in LEGACY_TILE_KS {
+        let nb = k / 32;
+        let row_bytes = nb * 24;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            let (d, m) = (rand_f16(&mut rng), rand_f16(&mut rng));
+            let codes: [u8; 32] = std::array::from_fn(|_| (rng.next_u32() % 32) as u8);
+            rows.extend_from_slice(&q5f1_block(|i| codes[i], d, m));
+        }
+        let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!("q5_1 tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(&Q5F1_ENDS, nb, |(u, d, m)| q5f1_block(u, d, m).to_vec());
+        let calls = assert_tile_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!("q5_1 tile: end rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+    }
+
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let w = g
+        .iter_tensors()
+        .find(|w| w.ty == ty && (w.dims[0] as usize).is_multiple_of(32))
+        .expect("the model must carry the Q5_1 tensor (blk.0.ffn_down)");
+    let k = w.dims[0] as usize;
+    let row_bytes = k / 32 * 24;
+    let bytes = &g.data(w).unwrap()[..TILE_ROWS * row_bytes];
+    let calls = assert_tile_matches(
+        ty,
+        &w.name,
+        k,
+        row_bytes,
+        bytes,
+        &legacy_tile_columns(ty, k, vec![]),
+    );
+    eprintln!(
+        "q5_1 tile: {} (k = {k}): {calls} calls, c = 1..=8, bit-identical",
+        w.name
+    );
+}
+
+/// Q8_0 tile clause: at each of [`LEGACY_TILE_KS`], random rows (every code,
+/// d of either sign) and then the ends of [`Q8F0_ENDS`], against the ±3.0
+/// columns and the seeded ones; then the ik harness's 64 rows (k = 2144:
+/// three tail blocks) with ik's own column, whose block 9 carries a −128
+/// code under a subnormal scale — the sign trick's wrap — tile = `dot_row`
+/// per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box (AVX2) and $BLOOMERY_DATA/ref"]
+fn hw_q8f0_tile_matches_dot_row() {
+    let ty = GgmlType::Q8_0;
+    let mut rng = Lcg(0x80_7113);
+    for k in LEGACY_TILE_KS {
+        let nb = k / 32;
+        let row_bytes = nb * 34;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let mut rows = Vec::new();
+        for _ in 0..LEGACY_RANDOM_ROWS * nb {
+            let d = rand_f16(&mut rng);
+            let codes: [i8; 32] = std::array::from_fn(|_| rng.next_u32() as i8);
+            rows.extend_from_slice(&q8f0_block(|i| codes[i], d));
+        }
+        let calls = assert_tile_matches(ty, "random rows", k, row_bytes, &rows, &cols);
+        eprintln!("q8_0 tile: random rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+        let rows = legacy_end_rows(&Q8F0_ENDS, nb, |(q, d)| q8f0_block(q, d).to_vec());
+        let calls = assert_tile_matches(ty, "end rows", k, row_bytes, &rows, &cols);
+        eprintln!("q8_0 tile: end rows (k = {k}): {calls} calls, c = 1..=8, bit-identical");
+    }
+
+    let d = q8f0_dump();
+    let rows = d.rows.concat();
+    let calls = assert_tile_matches(
+        ty,
+        "ik's rows",
+        d.k,
+        34 * d.k / 32,
+        &rows,
+        &legacy_tile_columns(ty, d.k, vec![d.ik_acol.clone()]),
+    );
+    eprintln!(
+        "q8_0 tile: ik's rows on ik's column + seeded (k = {}): {calls} calls, c = 1..=8, \
+         bit-identical",
+        d.k
+    );
+}
+
 /// A tile call's column count outside `1..=TILE_COLS`, an `out` of another
 /// length and a short column are named refusals, before any kernel runs.
 #[test]
 fn dot_row_cols_refuses_bad_shapes() {
-    let ty = GgmlType::Q3_K;
-    let k = 256;
-    let wrow = vec![0u8; 110];
-    let a = vec![0u8; col_bytes(ty, k)];
-    let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];
-    let mut out = vec![0.0f32; qdot::TILE_COLS + 1];
-    assert_eq!(
-        qdot::dot_row_cols(ty, &wrow, &many, k, &mut out),
-        Err(QdotError::TileShape {
-            cols: qdot::TILE_COLS + 1,
-            outs: qdot::TILE_COLS + 1
-        })
-    );
-    assert_eq!(
-        qdot::dot_row_cols(ty, &wrow, &[], k, &mut []),
-        Err(QdotError::TileShape { cols: 0, outs: 0 })
-    );
-    assert_eq!(
-        qdot::dot_row_cols(ty, &wrow, &many[..2], k, &mut out[..3]),
-        Err(QdotError::TileShape { cols: 2, outs: 3 })
-    );
-    let short = &a[..a.len() - 1];
-    assert_eq!(
-        qdot::dot_row_cols(ty, &wrow, &[a.as_slice(), short], k, &mut out[..2]),
-        Err(QdotError::ShortActivationCol {
-            have: a.len() - 1,
-            need: a.len(),
-            k
-        })
-    );
-    let e = qdot::dot_row_cols(ty, &wrow, &many, k, &mut out)
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("1..=8 columns"), "{e}");
+    for (ty, k, row_bytes) in [
+        (GgmlType::Q3_K, 256, 110),
+        (GgmlType::Q5_1, 640, 480),
+        (GgmlType::Q8_0, 640, 680),
+    ] {
+        let wrow = vec![0u8; row_bytes];
+        let a = vec![0u8; col_bytes(ty, k)];
+        let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];
+        let mut out = vec![0.0f32; qdot::TILE_COLS + 1];
+        assert_eq!(
+            qdot::dot_row_cols(ty, &wrow, &many, k, &mut out),
+            Err(QdotError::TileShape {
+                cols: qdot::TILE_COLS + 1,
+                outs: qdot::TILE_COLS + 1
+            }),
+            "{ty:?}"
+        );
+        assert_eq!(
+            qdot::dot_row_cols(ty, &wrow, &[], k, &mut []),
+            Err(QdotError::TileShape { cols: 0, outs: 0 }),
+            "{ty:?}"
+        );
+        assert_eq!(
+            qdot::dot_row_cols(ty, &wrow, &many[..2], k, &mut out[..3]),
+            Err(QdotError::TileShape { cols: 2, outs: 3 }),
+            "{ty:?}"
+        );
+        let short = &a[..a.len() - 1];
+        assert_eq!(
+            qdot::dot_row_cols(ty, &wrow, &[a.as_slice(), short], k, &mut out[..2]),
+            Err(QdotError::ShortActivationCol {
+                have: a.len() - 1,
+                need: a.len(),
+                k
+            }),
+            "{ty:?}"
+        );
+        assert_eq!(
+            qdot::dot_row_cols(ty, &wrow[..row_bytes - 1], &many[..2], k, &mut out[..2]),
+            Err(QdotError::ShortWeightRow {
+                have: row_bytes - 1,
+                need: row_bytes,
+                k
+            }),
+            "{ty:?}"
+        );
+        let e = qdot::dot_row_cols(ty, &wrow, &many, k, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("1..=8 columns"), "{ty:?}: {e}");
+    }
 }
 
 // ------------------------------------------------- Q3_K row-lane tile

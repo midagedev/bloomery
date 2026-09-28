@@ -16,8 +16,10 @@
 //! - Q8_0 x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:404, :753), the body its AVX2 (no AVX512-VNNI) build runs.
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
-//! - Q3_K, Q4_K and Q5_K tiles: one weight row against up to [`TILE_COLS`] columns, each
-//!   block unpacked once, every column bit-identical to its one-column kernel ([`dot_row_cols`]).
+//! - Q3_K, Q4_K, Q5_K, Q5_1 and Q8_0 tiles: one weight row against up to [`TILE_COLS`]
+//!   columns, each block unpacked once, every column bit-identical to its one-column kernel
+//!   ([`dot_row_cols`]); the Q5_1 and Q8_0 tiles are ik's `AccumT::compute` at `nrc_y` = the
+//!   column count (iqk_gemm_legacy_quants.cpp:302).
 //! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
 //!   ([`repack_q3k_r8`], undone by [`unpack_q3k_r8`]) against up to [`TILE_COLS`] columns,
 //!   every (row, column) value bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
@@ -452,6 +454,8 @@ enum TileKind {
     Q3K,
     Q4K,
     Q5K,
+    Q51,
+    Q80,
 }
 
 /// The tile kernel `w` takes on this machine: a type with one and the ISA its
@@ -461,13 +465,15 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
         GgmlType::Q3_K => TileKind::Q3K,
         GgmlType::Q4_K => TileKind::Q4K,
         GgmlType::Q5_K => TileKind::Q5K,
+        GgmlType::Q5_1 => TileKind::Q51,
+        GgmlType::Q8_0 => TileKind::Q80,
         _ => return None,
     };
     has_features(w).then_some(kind)
 }
 
 /// Whether [`dot_row_cols`] runs a tile kernel for `w` on this machine
-/// (Q3_K, Q4_K and Q5_K with their ISA); otherwise it dots each column
+/// (Q3_K, Q4_K, Q5_K, Q5_1 and Q8_0 with their ISA); otherwise it dots each column
 /// through [`dot_row`].
 #[must_use]
 pub fn has_tile(w: GgmlType) -> bool {
@@ -540,6 +546,11 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Q4K => unsafe { dot_q45k_q82x4_tile_avx2::<C, false>(wrow, &cols, nb) },
         // SAFETY: as the Q4_K arm.
         TileKind::Q5K => unsafe { dot_q45k_q82x4_tile_avx2::<C, true>(wrow, &cols, nb) },
+        // SAFETY: tile_kind saw AVX2+FMA+F16C; check_row sized the row for nb
+        // blocks and every column for nb blocks' x4 groups and q8_2 tails.
+        TileKind::Q51 => unsafe { dot_q5f1_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
+        // SAFETY: as the Q5_1 arm.
+        TileKind::Q80 => unsafe { dot_q8f0_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
     };
     out.copy_from_slice(&v);
 }
@@ -3331,6 +3342,8 @@ fn dot_q5f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// @4/qs @8 vs @2/@6), the scale gather (the (d,m) pair shuffle through one
 /// `_mm256_cvtph_ps` vs four d's), and the tail min correction (the stored
 /// m_w vs -16·d_w). Every edit outside those four must be made in both.
+/// Its column tile [`dot_q5f1_q82x4_tile_avx2`] runs these steps per column
+/// and takes every edit to them too.
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
@@ -3530,6 +3543,151 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     (x[0] + x[2]) + (x[1] + x[3])
 }
 
+/// The Q5_1 tile: one row's blocks against up to [`TILE_COLS`] Q8_2_X4
+/// columns, ik's `AccumT<MinusType1<nrc_y>, nrc_y, _>::compute`
+/// (iqk_gemm_legacy_quants.cpp:302) at `nrc_y = C`, whose `nrc_y = 1`
+/// instance [`dot_q5f1_q82x4_avx2`] ports: per x4 group the four blocks'
+/// codes and (d, m) pairs once; per column its bf16 scales and sums, its
+/// `accm` add and its one FMA; per tail block the codes and `dw`, `mw` once,
+/// then per column the one-column tail step. Each column keeps its own
+/// `acc` and `accm` and ends in the one-column kernel's reduction, so column
+/// `c` sees the one-column kernel's float operations in its order.
+///
+/// TWIN of [`dot_q5f1_q82x4_avx2`]: any edit to the float or integer steps of
+/// one is made in both.
+///
+/// # Safety
+/// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` Q5_1 blocks and each
+/// `acols[c]` point at `col_bytes(Q5_1, 32 · nb)` readable bytes.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q5f1_q82x4_tile_avx2<const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    const { assert!(C != 0 && C <= TILE_COLS) };
+    // SAFETY: AVX2+FMA+F16C present, `wrow` holds nb blocks and every column
+    // the Q8_2_X4 groups and q8_2 tails of nb blocks per contract.
+    unsafe {
+        let m4 = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x10);
+        let hb = Q5HBit {
+            shuffle: _mm256_set_epi64x(
+                0x0303_0303_0303_0303,
+                0x0202_0202_0202_0202,
+                0x0101_0101_0101_0101,
+                0x0000_0000_0000_0000,
+            ),
+            mask: _mm256_set1_epi64x(0x7fbf_dfef_f7fb_fdfe),
+            minus1: _mm256_set1_epi64x(-1),
+        };
+        let m1 = _mm256_set1_epi16(1);
+        let dm_shuf = _mm_set_epi16(
+            0x0f0e, 0x0b0a, 0x0706, 0x0302, 0x0d0c, 0x0908, 0x0504, 0x0100,
+        );
+        let mut acc = [_mm256_setzero_ps(); C];
+        let mut accm = [_mm_setzero_ps(); C];
+
+        let nbg = nb / 4;
+        for i in 0..nbg {
+            let b0 = (4 * i) * Q5F1_BLOCK;
+            let b1 = (4 * i + 1) * Q5F1_BLOCK;
+            let b2 = (4 * i + 2) * Q5F1_BLOCK;
+            let b3 = (4 * i + 3) * Q5F1_BLOCK;
+            let qx0 = q5x_codes::<4, 8>(&wrow[b0..b0 + Q5F1_BLOCK], m4, mh, &hb);
+            let qx1 = q5x_codes::<4, 8>(&wrow[b1..b1 + Q5F1_BLOCK], m4, mh, &hb);
+            let qx2 = q5x_codes::<4, 8>(&wrow[b2..b2 + Q5F1_BLOCK], m4, mh, &hb);
+            let qx3 = q5x_codes::<4, 8>(&wrow[b3..b3 + Q5F1_BLOCK], m4, mh, &hb);
+            let mut pairs = [0u8; 16];
+            pairs[0..4].copy_from_slice(&wrow[b0..b0 + 4]);
+            pairs[4..8].copy_from_slice(&wrow[b1..b1 + 4]);
+            pairs[8..12].copy_from_slice(&wrow[b2..b2 + 4]);
+            pairs[12..16].copy_from_slice(&wrow[b3..b3 + 4]);
+            // SAFETY: 16 readable bytes in the local staging buffer.
+            let other = _mm256_cvtph_ps(_mm_shuffle_epi8(
+                _mm_loadu_si128(pairs.as_ptr() as *const __m128i),
+                dm_shuf,
+            ));
+
+            for ((col, a), am) in acols.iter().zip(acc.iter_mut()).zip(accm.iter_mut()) {
+                // SAFETY: 8 readable bytes at the head of the column's group i.
+                let g = col.add(i * Q82X4_STRIDE);
+                let aux_d = _mm_castsi128_ps(_mm_slli_epi32::<16>(_mm_cvtepu16_epi32(
+                    _mm_loadl_epi64(g as *const __m128i),
+                )));
+                // SAFETY: 8 readable bytes at offset 8 of the group.
+                let aux_m = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(_mm_loadl_epi64(
+                    g.add(8) as *const __m128i
+                )));
+                let prep = _mm256_set_m128(_mm_mul_ps(aux_d, aux_m), aux_d);
+                let s12 = _mm256_mul_ps(other, prep);
+                *am = _mm_add_ps(*am, _mm256_extractf128_ps(s12, 1));
+                let lo = _mm256_castps256_ps128(s12);
+                let dall = _mm256_set_m128(lo, lo);
+
+                // SAFETY: 32 readable bytes at each offset inside the group.
+                let p0 = _mm256_madd_epi16(
+                    m1,
+                    _mm256_maddubs_epi16(qx0, _mm256_loadu_si256(g.add(16) as *const __m256i)),
+                );
+                let p1 = _mm256_madd_epi16(
+                    m1,
+                    _mm256_maddubs_epi16(qx1, _mm256_loadu_si256(g.add(48) as *const __m256i)),
+                );
+                let p2 = _mm256_madd_epi16(
+                    m1,
+                    _mm256_maddubs_epi16(qx2, _mm256_loadu_si256(g.add(80) as *const __m256i)),
+                );
+                let p3 = _mm256_madd_epi16(
+                    m1,
+                    _mm256_maddubs_epi16(qx3, _mm256_loadu_si256(g.add(112) as *const __m256i)),
+                );
+                let p01 =
+                    _mm256_add_epi32(_mm256_unpacklo_epi32(p0, p1), _mm256_unpackhi_epi32(p0, p1));
+                let p23 =
+                    _mm256_add_epi32(_mm256_unpacklo_epi32(p2, p3), _mm256_unpackhi_epi32(p2, p3));
+                let pall = _mm256_add_epi32(
+                    _mm256_unpacklo_epi64(p01, p23),
+                    _mm256_unpackhi_epi64(p01, p23),
+                );
+                *a = _mm256_fmadd_ps(dall, _mm256_cvtepi32_ps(pall), *a);
+            }
+        }
+
+        let nb4 = 4 * nbg;
+        for i in nb4..nb {
+            let b = i * Q5F1_BLOCK;
+            let wb = &wrow[b..b + Q5F1_BLOCK];
+            let dw = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+            let mw = f16c_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+            let qx0 = q5x_codes::<4, 8>(wb, m4, mh, &hb);
+            let tb = nb4 / 4 * Q82X4_STRIDE + (i - nb4) * Q82_BLOCK;
+            for ((col, a), am) in acols.iter().zip(acc.iter_mut()).zip(accm.iter_mut()) {
+                // SAFETY: the tail block's 36 bytes are inside the column.
+                let t = col.add(tb);
+                let da = bf16_bits_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+                let ma = i16::from_le_bytes([*t.add(2), *t.add(3)]) as f32;
+                let d = dw * da;
+                let corr = mw * (da * ma) * 0.25f32;
+                *am = _mm_add_ps(*am, _mm_set1_ps(corr));
+                let qs = _mm256_loadu_si256(t.add(4) as *const __m256i);
+                let p0 = _mm256_madd_epi16(m1, _mm256_maddubs_epi16(qx0, qs));
+                *a = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p0), *a);
+            }
+        }
+
+        // Reduction order is load-bearing: the one-column kernel's, per column.
+        let mut out = [0.0f32; C];
+        for ((o, a), am) in out.iter_mut().zip(&acc).zip(&accm) {
+            let sum = _mm_add_ps(_mm256_castps256_ps128(*a), _mm256_extractf128_ps(*a, 1));
+            let x = _mm_add_ps(sum, *am);
+            let x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+            *o = _mm_cvtss_f32(_mm_add_ss(x, _mm_movehdup_ps(x)));
+        }
+        out
+    }
+}
+
 // --------------------------------------------------------- Q8_0 x Q8_2_X4
 
 /// AVX2+FMA+F16C row dot: Q8_0 weights against Q8_2_X4 column.
@@ -3544,7 +3702,9 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// is ik's rule on its one wrap: an activation code −128 under a negative
 /// weight code stays −128 (`_mm256_sign_epi8`), so that product is taken with
 /// the wrong sign — reachable only from a q8_2 block whose bf16 scale is
-/// subnormal, and the mirror reproduces it.
+/// subnormal, and the mirror reproduces it. Its column tile
+/// [`dot_q8f0_q82x4_tile_avx2`] runs these steps per column and takes every
+/// edit to them too.
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
@@ -3702,6 +3862,124 @@ fn dot_q8f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         *xl = acc[l] + acc[4 + l];
     }
     (x[0] + x[2]) + (x[1] + x[3])
+}
+
+/// The Q8_0 tile: one row's blocks against up to [`TILE_COLS`] Q8_2_X4
+/// columns, ik's `AccumT<MinusType0, nrc_y, _>::compute`
+/// (iqk_gemm_legacy_quants.cpp:302) at `nrc_y = C`, whose `nrc_y = 1`
+/// instance [`dot_q8f0_q82x4_avx2`] ports: per x4 group the four blocks'
+/// codes, their `sign(w, w)` magnitudes and the four f16 scales once; per
+/// column its bf16 scales, the `sign(a, w)` products and its one FMA; per
+/// tail block the codes and `dw` once, then per column the one-column tail
+/// step; each column's `acc` ends in [`hsum_float_8`]. The weight magnitude
+/// is an integer function of the weight alone, so taking it once per block
+/// changes no product; `sign(a, w)` stays per column, the −128 wrap
+/// included.
+///
+/// TWIN of [`dot_q8f0_q82x4_avx2`]: any edit to the float or integer steps of
+/// one is made in both.
+///
+/// # Safety
+/// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` Q8_0 blocks and each
+/// `acols[c]` point at `col_bytes(Q8_0, 32 · nb)` readable bytes.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q8f0_q82x4_tile_avx2<const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    const { assert!(C != 0 && C <= TILE_COLS) };
+    // SAFETY: AVX2+FMA+F16C present, `wrow` holds nb blocks and every column
+    // the Q8_2_X4 groups and q8_2 tails of nb blocks per contract.
+    unsafe {
+        let m1 = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_ps(); C];
+
+        let nbg = nb / 4;
+        for i in 0..nbg {
+            let b0 = (4 * i) * Q8F0_BLOCK;
+            let b1 = (4 * i + 1) * Q8F0_BLOCK;
+            let b2 = (4 * i + 2) * Q8F0_BLOCK;
+            let b3 = (4 * i + 3) * Q8F0_BLOCK;
+            let w = wrow.as_ptr();
+            // SAFETY: 32 readable bytes at offset 2 of each validated block.
+            let qx0 = _mm256_loadu_si256(w.add(b0 + 2) as *const __m256i);
+            let qx1 = _mm256_loadu_si256(w.add(b1 + 2) as *const __m256i);
+            let qx2 = _mm256_loadu_si256(w.add(b2 + 2) as *const __m256i);
+            let qx3 = _mm256_loadu_si256(w.add(b3 + 2) as *const __m256i);
+            let ax0 = _mm256_sign_epi8(qx0, qx0);
+            let ax1 = _mm256_sign_epi8(qx1, qx1);
+            let ax2 = _mm256_sign_epi8(qx2, qx2);
+            let ax3 = _mm256_sign_epi8(qx3, qx3);
+            let mut scales8 = [0u8; 8];
+            scales8[0..2].copy_from_slice(&wrow[b0..b0 + 2]);
+            scales8[2..4].copy_from_slice(&wrow[b1..b1 + 2]);
+            scales8[4..6].copy_from_slice(&wrow[b2..b2 + 2]);
+            scales8[6..8].copy_from_slice(&wrow[b3..b3 + 2]);
+            // SAFETY: 8 readable bytes in the local staging buffer.
+            let s4 = _mm_cvtph_ps(_mm_loadl_epi64(scales8.as_ptr() as *const __m128i));
+
+            for (col, a) in acols.iter().zip(acc.iter_mut()) {
+                // SAFETY: 8 readable bytes at the head of the column's group i.
+                let g = col.add(i * Q82X4_STRIDE);
+                let aux_d = _mm_castsi128_ps(_mm_slli_epi32::<16>(_mm_cvtepu16_epi32(
+                    _mm_loadl_epi64(g as *const __m128i),
+                )));
+                let d4 = _mm_mul_ps(s4, aux_d);
+                let dall = _mm256_set_m128(d4, d4);
+
+                // SAFETY: 32 readable bytes at each offset inside the group.
+                let y0 = _mm256_loadu_si256(g.add(16) as *const __m256i);
+                let y1 = _mm256_loadu_si256(g.add(48) as *const __m256i);
+                let y2 = _mm256_loadu_si256(g.add(80) as *const __m256i);
+                let y3 = _mm256_loadu_si256(g.add(112) as *const __m256i);
+                let p0 =
+                    _mm256_madd_epi16(m1, _mm256_maddubs_epi16(ax0, _mm256_sign_epi8(y0, qx0)));
+                let p1 =
+                    _mm256_madd_epi16(m1, _mm256_maddubs_epi16(ax1, _mm256_sign_epi8(y1, qx1)));
+                let p2 =
+                    _mm256_madd_epi16(m1, _mm256_maddubs_epi16(ax2, _mm256_sign_epi8(y2, qx2)));
+                let p3 =
+                    _mm256_madd_epi16(m1, _mm256_maddubs_epi16(ax3, _mm256_sign_epi8(y3, qx3)));
+                let p01 =
+                    _mm256_add_epi32(_mm256_unpacklo_epi32(p0, p1), _mm256_unpackhi_epi32(p0, p1));
+                let p23 =
+                    _mm256_add_epi32(_mm256_unpacklo_epi32(p2, p3), _mm256_unpackhi_epi32(p2, p3));
+                let pall = _mm256_add_epi32(
+                    _mm256_unpacklo_epi64(p01, p23),
+                    _mm256_unpackhi_epi64(p01, p23),
+                );
+                *a = _mm256_fmadd_ps(dall, _mm256_cvtepi32_ps(pall), *a);
+            }
+        }
+
+        let nb4 = 4 * nbg;
+        for i in nb4..nb {
+            let b = i * Q8F0_BLOCK;
+            let wb = &wrow[b..b + Q8F0_BLOCK];
+            let dw = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+            // SAFETY: 32 readable bytes at offset 2 of the validated block.
+            let qx0 = _mm256_loadu_si256(wb.as_ptr().add(2) as *const __m256i);
+            let ax0 = _mm256_sign_epi8(qx0, qx0);
+            let tb = nb4 / 4 * Q82X4_STRIDE + (i - nb4) * Q82_BLOCK;
+            for (col, a) in acols.iter().zip(acc.iter_mut()) {
+                // SAFETY: the tail block's 36 bytes are inside the column.
+                let t = col.add(tb);
+                let da = bf16_bits_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+                let d = dw * da;
+                let y = _mm256_loadu_si256(t.add(4) as *const __m256i);
+                let p0 = _mm256_madd_epi16(m1, _mm256_maddubs_epi16(ax0, _mm256_sign_epi8(y, qx0)));
+                *a = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p0), *a);
+            }
+        }
+
+        // Reduction order is load-bearing: ik's `hsum_float_8`, per column.
+        let mut out = [0.0f32; C];
+        for (o, a) in out.iter_mut().zip(&acc) {
+            *o = hsum_float_8(*a);
+        }
+        out
+    }
 }
 
 // ------------------------------------------------------------ IQ3_XXS x Q8_K
