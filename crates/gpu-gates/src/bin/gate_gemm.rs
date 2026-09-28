@@ -125,7 +125,13 @@
 //! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
-//! - `g32_refuse`: the host API's refusals by name.
+//! - `g32_refuse`: the host API's refusals, each an error holding its own
+//!   message (another check refusing first does not pass): the scratch's
+//!   K and columns, the quantizer's input and columns, an unfilled table,
+//!   rows not a multiple of 16, a layout or planes of another shape, an
+//!   activation of fewer columns than the slots or quantized for fewer, a
+//!   short `y`, an empty map and slots past the table for the remap, and the
+//!   F32 tile's K, short `x` and an `x` off a 16-byte boundary.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -3386,7 +3392,9 @@ mod gate {
             Ok(ok)
         }
 
-        /// The host API's refusals, each a named error.
+        /// The host API's refusals, each a named error: a case passes only
+        /// when its call is an error whose text holds the case's own fragment
+        /// (another check refusing first, or a launch error, does not).
         fn refusals(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g32_refuse") {
                 return Ok(true);
@@ -3397,101 +3405,164 @@ mod gate {
             let (k, rows) = (320usize, 32usize);
             let (w8, _) = weights(false, rows, k, 0x3500)?;
             let r8 = Res::new(dev, &w8, false, rows)?;
-            let act = GemmAct32::new(stream, 8, k)?;
+            let x = DeviceBuffer::from_host(stream, &activations(k, 8, 2))?;
+            let short = DeviceBuffer::from_host(stream, &activations(k, 1, 3))?;
+            // `act` quantized for all 8 columns; `act4` for 4 of its 8;
+            // `narrow` holds 4; `act_q` takes the quantizer's refusals.
+            let mut act = GemmAct32::new(stream, 8, k)?;
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &x, 8, &mut act, sink)?;
+            let mut act4 = GemmAct32::new(stream, 8, k)?;
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &x, 4, &mut act4, sink)?;
+            let mut narrow = GemmAct32::new(stream, 4, k)?;
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &x, 4, &mut narrow, sink)?;
             let mut act_q = GemmAct32::new(stream, 8, k)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 8 * rows)?;
+            let mut y_short = DeviceBuffer::<f32>::zeroed(stream, 8 * rows - 1)?;
             let unfilled = GemmRoute::new(stream, 8, 1)?;
             let mut route = GemmRoute::new(stream, 8, 1)?;
             dev.gk.enqueue_route_dense(stream, 8, &mut route, sink)?;
-            let wh = activations(96, 4, 1);
-            let w96 = DeviceTensor::upload(stream, &wh, 4, 96)?;
-            let x = DeviceBuffer::from_host(stream, &activations(k, 8, 2))?;
-            let short = DeviceBuffer::from_host(stream, &activations(k, 1, 3))?;
+            let mut remap_route = GemmRoute::new(stream, 8, 1)?;
+            let w96 = DeviceTensor::upload(stream, &activations(96, 4, 1), 4, 96)?;
+            let w320 = DeviceTensor::upload(stream, &activations(k, 4, 4), 4, k)?;
             let empty = DeviceBuffer::<u32>::zeroed(stream, 0)?;
-            let ids = DeviceBuffer::<u32>::zeroed(stream, 8)?;
+            let map = DeviceBuffer::from_host(stream, &[0u32])?;
+            let ids = DeviceBuffer::<u32>::zeroed(stream, 9)?;
             let plane = r8.weight(Lay::Q8Plane)?;
-            let refused = [
-                ("act_k_48", GemmAct32::new(stream, 8, 48).is_err()),
-                ("act_cols_0", GemmAct32::new(stream, 0, k).is_err()),
+            let (qs, _) = r8.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
+            // The scales of a stack one block wider than the codes.
+            let d_wide =
+                DeviceTensor::upload(stream, &vec![0u16; rows * (k / 32 + 1)], rows, k / 32 + 1)?;
+            // `x` from its second value: 4 bytes past a 16-byte boundary.
+            // SAFETY: values 1 .. 1 + 4·k of `x` (8·k values) lie inside it,
+            // f32-aligned; `x` stays in place while the window lives (the
+            // refused call reads nothing).
+            let x_off =
+                unsafe { bloomery_gpu::window::<f32>(x.cu_deviceptr() + 4, 4 * k, x.context()) };
+            let gemm = |w: Gemm32Weight<'_>,
+                        rows_per_expert: usize,
+                        act: &GemmAct32,
+                        route: &GemmRoute,
+                        y: &mut DeviceBuffer<f32>| {
+                dev.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w,
+                        rows_per_expert,
+                        act,
+                        route,
+                        input: GemmInput::PerSlot,
+                        y,
+                    },
+                )
+            };
+            let unit = |r: Result<GemmAct32, bloomery_gpu::GpuError>| r.map(|_| ());
+            let cases: Vec<(&str, Result<(), bloomery_gpu::GpuError>, &str)> = vec![
+                (
+                    "act_k_48",
+                    unit(GemmAct32::new(stream, 8, 48)),
+                    "k must be a multiple of 32",
+                ),
+                (
+                    "act_cols_0",
+                    unit(GemmAct32::new(stream, 0, k)),
+                    "1 <= cols <=",
+                ),
                 (
                     "quant_short_input",
                     dev.g32
-                        .enqueue_quantize_gemm32(stream, &short, 8, &mut act_q, sink)
-                        .is_err(),
+                        .enqueue_quantize_gemm32(stream, &short, 8, &mut act_q, sink),
+                    "< n_cols*k",
                 ),
                 (
                     "quant_cols_past_act",
                     dev.g32
-                        .enqueue_quantize_gemm32(stream, &x, 9, &mut act_q, sink)
-                        .is_err(),
+                        .enqueue_quantize_gemm32(stream, &x, 9, &mut act_q, sink),
+                    "1 <= n_cols <= act.cols()",
                 ),
                 (
                     "unfilled_route",
-                    dev.g32
-                        .enqueue_gemm32(
-                            stream,
-                            Gemm32Args {
-                                w: plane,
-                                rows_per_expert: rows,
-                                act: &act,
-                                route: &unfilled,
-                                input: GemmInput::PerSlot,
-                                y: &mut y,
-                            },
-                        )
-                        .is_err(),
+                    gemm(plane, rows, &act, &unfilled, &mut y),
+                    "a filled route table",
                 ),
                 (
                     "rows_not_16",
-                    dev.g32
-                        .enqueue_gemm32(
-                            stream,
-                            Gemm32Args {
-                                w: plane,
-                                rows_per_expert: 24,
-                                act: &act,
-                                route: &route,
-                                input: GemmInput::PerSlot,
-                                y: &mut y,
-                            },
-                        )
-                        .is_err(),
+                    gemm(plane, 24, &act, &route, &mut y),
+                    "rows_per_expert must be a positive multiple of 16",
                 ),
                 (
                     "q5_1_layout_at_q8_0_words",
-                    dev.g32
-                        .enqueue_gemm32(
-                            stream,
-                            Gemm32Args {
-                                w: Gemm32Weight::Q5_1File(&r8.file),
-                                rows_per_expert: rows,
-                                act: &act,
-                                route: &route,
-                                input: GemmInput::PerSlot,
-                                y: &mut y,
-                            },
-                        )
-                        .is_err(),
+                    gemm(Gemm32Weight::Q5_1File(&r8.file), rows, &act, &route, &mut y),
+                    "Q5_1 rows at K =",
+                ),
+                (
+                    "plane_shape",
+                    gemm(
+                        Gemm32Weight::Q8_0Plane { qs, d: &d_wide },
+                        rows,
+                        &act,
+                        &route,
+                        &mut y,
+                    ),
+                    "Q8_0 planes at K =",
+                ),
+                (
+                    "act_cols_short",
+                    gemm(plane, rows, &narrow, &route, &mut y),
+                    "activation columns, act holds 4",
+                ),
+                (
+                    "act_quantized_short",
+                    gemm(plane, rows, &act4, &route, &mut y),
+                    "the last quantizer launch wrote 4",
+                ),
+                (
+                    "y_short",
+                    gemm(plane, rows, &act, &route, &mut y_short),
+                    "< n_slots*rows_per_expert",
                 ),
                 (
                     "remap_empty_map",
                     dev.g32
-                        .enqueue_route_remap(stream, &ids, &empty, 8, &mut route, sink)
-                        .is_err(),
+                        .enqueue_route_remap(stream, &ids, &empty, 8, &mut remap_route, sink),
+                    "the map holds 1 to",
+                ),
+                (
+                    "remap_slots_past_table",
+                    dev.g32
+                        .enqueue_route_remap(stream, &ids, &map, 9, &mut remap_route, sink),
+                    "1 <= n_slots <= the table's 8 slots",
                 ),
                 (
                     "f32_tile_k_96",
-                    dev.g32
-                        .enqueue_f32_tile(stream, &w96, &x, 1, &mut y)
-                        .is_err(),
+                    dev.g32.enqueue_f32_tile(stream, &w96, &x, 1, &mut y),
+                    "k must be a positive multiple of 64",
+                ),
+                (
+                    "f32_tile_short_x",
+                    dev.g32.enqueue_f32_tile(stream, &w320, &short, 2, &mut y),
+                    "x.len() ",
+                ),
+                (
+                    "f32_tile_x_unaligned",
+                    dev.g32.enqueue_f32_tile(stream, &w320, &x_off, 1, &mut y),
+                    "must be 16-byte aligned",
                 ),
             ];
-            let all = refused.iter().all(|(_, r)| *r);
+            let all = cases
+                .iter()
+                .all(|(_, got, want)| matches!(got, Err(e) if e.to_string().contains(want)));
             println!(
                 "gemm32 case=g32_refuse {} {}",
-                refused
+                cases
                     .iter()
-                    .map(|(n, r)| format!("{n}={}", if *r { "refused" } else { "ACCEPTED" }))
+                    .map(|(n, got, want)| match got {
+                        Err(e) if e.to_string().contains(want) => format!("{n}=refused"),
+                        Err(e) => format!("{n}=REFUSED-OTHERWISE({e})"),
+                        Ok(()) => format!("{n}=ACCEPTED"),
+                    })
                     .collect::<Vec<_>>()
                     .join(" "),
                 verdict(all)
