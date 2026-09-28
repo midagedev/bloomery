@@ -678,7 +678,7 @@ impl Body {
             })?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let dims = dims_of(inputs)?;
-        let map = SlotMap::of_plan(plan, card, run.clone(), N_EXPERT)?;
+        let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
         let cfg = spec
             .layers
             .iter()
@@ -698,7 +698,7 @@ impl Body {
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        let slots = DeviceTensor::upload(stream, map.as_slice(), run.len(), N_EXPERT)?;
+        let slots = DeviceTensor::upload(stream, &map.stage_view(), run.len(), N_EXPERT)?;
         let experts_on_card =
             CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
         let boundary = Boundary::with_rows(

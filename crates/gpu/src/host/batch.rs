@@ -7,7 +7,7 @@
 //! layer-batch's route copies into one set while the union still reads the
 //! other.
 
-use super::slots::{HOST, SlotMap};
+use super::slots::{Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, name_refusal, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::cu;
@@ -474,11 +474,13 @@ impl BatchService {
             ));
         }
         let t0 = Instant::now();
-        let map_row = t.slots.row(layer).ok_or(GpuError::state(
-            WHAT,
-            "a hybrid layer without a slot map row",
-        ))?;
-        check_exclude(exclude, map_row, layer)?;
+        if t.slots.row_offset(layer).is_none() {
+            return Err(GpuError::state(
+                WHAT,
+                "a hybrid layer without a slot map row",
+            ));
+        }
+        check_exclude(exclude, t.slots, layer)?;
         if self.lens.len() < cols {
             self.lens.resize(cols, 0);
             self.lists.resize(cols * n_used, (0, 0.0f32));
@@ -498,18 +500,18 @@ impl BatchService {
             let mut unknown = None;
             for s in 0..n_used {
                 let (id, w) = (ids[j * n_used + s], weights[j * n_used + s]);
-                match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
-                    Some(&HOST) if exclude.binary_search(&id).is_ok() => out_of_set += 1,
-                    Some(&HOST) => {
+                match t.slots.slot(layer, id) {
+                    Some(Slot::Host) if exclude.binary_search(&id).is_ok() => out_of_set += 1,
+                    Some(Slot::Host) => {
                         list[n] = (id, w);
                         n += 1;
                     }
-                    Some(_) => {}
+                    Some(Slot::Card(_) | Slot::Tier(_)) => {}
                     None => unknown = unknown.or(Some((s, id))),
                 }
             }
             let saw = match unknown {
-                Some((s, id)) => Some(unknown_id(s, id, map_row.len())),
+                Some((s, id)) => Some(unknown_id(s, id, t.slots.n_expert())),
                 None if first_non_finite.is_some_and(|f| j >= f) => non_finite(x.col(j)),
                 None => None,
             };
@@ -636,12 +638,12 @@ fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
         .collect()
 }
 
-/// A batch service's exclusion set against layer `layer`'s slot map row
-/// `map_row`: strictly ascending, so no id twice, and every id one of the
-/// layer's experts that the map sends to the host. A set that breaks any of
-/// these is a caller's bug — an expert it names would be computed twice or
-/// never — and is refused by name.
-fn check_exclude(exclude: &[u32], map_row: &[u32], layer: usize) -> Result<(), GpuError> {
+/// A batch service's exclusion set against layer `layer`'s row of `slots`:
+/// strictly ascending, so no id twice, and every id one of the layer's
+/// experts that the map sends to the host. A set that breaks any of these is
+/// a caller's bug — an expert it names would be computed twice or never — and
+/// is refused by name.
+fn check_exclude(exclude: &[u32], slots: &SlotMap, layer: usize) -> Result<(), GpuError> {
     let what = SERVE_BATCH;
     if let Some(p) = exclude.windows(2).find(|p| p[0] >= p[1]) {
         let why = if p[0] == p[1] {
@@ -655,24 +657,24 @@ fn check_exclude(exclude: &[u32], map_row: &[u32], layer: usize) -> Result<(), G
         ));
     }
     for &e in exclude {
-        match usize::try_from(e).ok().and_then(|i| map_row.get(i)) {
-            Some(&HOST) => {}
-            Some(_) => {
-                return Err(GpuError::shape(
-                    what,
-                    format!("exclusion set of layer {layer}: expert {e} is on the card"),
-                ));
-            }
+        let on = match slots.slot(layer, e) {
+            Some(Slot::Host) => continue,
+            Some(Slot::Card(_)) => "the card",
+            Some(Slot::Tier(_)) => "the tier card",
             None => {
                 return Err(GpuError::shape(
                     what,
                     format!(
                         "exclusion set of layer {layer}: expert {e} past the layer's {} experts",
-                        map_row.len()
+                        slots.n_expert()
                     ),
                 ));
             }
-        }
+        };
+        return Err(GpuError::shape(
+            what,
+            format!("exclusion set of layer {layer}: expert {e} is on {on}"),
+        ));
     }
     Ok(())
 }
