@@ -1,0 +1,26 @@
+# Lead, 2026-09-28: round q38hostq51 put Q5_1 and Q8_0 column tiles in qdot, so the host union's routed
+# down (Q5_1 on 43 layers, Q8_0 on 5) decodes each weight row once for up to 8 columns. Paper (the round's
+# §0, instruction counts at IPC 2.52, fit to the Q4_K tile's measured 48.5 a column-superblock): the down
+# is ~1,114k instructions an (expert, column) today and 478-580k tiled, half removed; with the
+# instruction-to-time transfer 0.85-1.0 (hosttile, h1fold) the tree/base ratio of us_per_expert is
+# 0.70-0.88 at 10 columns and 0.65-0.85 at 80, over both base hypotheses (t(10) 40-51 per the design,
+# ~63 per this count). Wall [derived]: two builds of bench_v41_host (1-5 min each), 2 arms x 3 rounds x
+# 30 s and the check, 6-10 min a tree; the base arm reads the sitting's R0 run (sit8, same host code).
+kind: calibration
+question: how much of the Qwen3.8 host union's per-expert time does the Q5_1 / Q8_0 column tile remove?
+term: us_per_expert of union5:8x40u0.1 (32 experts x 10 columns) at 32 threads on the q38hostq51 tree
+  over the same arm on the base (a3dbe46's host code, the sitting's R0 run), qwen4exp UD-Q4_K_XL, page
+  cache warm
+unit: ratio
+predict: 0.70..0.88
+condition: CPU lease; BLOOMERY_REMOTE='~/repo/bloomery-q38hostq51' BLOOMERY_MODEL=qwen4exp
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-tile.card' just time-cpu-v41-host --threads 32
+  --rounds 3 --seconds 30 --arms union5:8x40u0.1,union5:8x320u0.0125 right after the R0 run in the same
+  sitting; admissible=yes on every row; gate-qdot green on the tree first (bit-identical tiles)
+decide-in: land the tile; q38stream's k(U) and the q38wide band re-derived with the tiled c
+decide-below: the tile barely moved the union: the single-column Q5_1 ran above IPC 2.52 or latency-bound;
+  perf stat instructions on one arm of each tree before anything else
+decide-above: the single-column kernel was worse than counted (the pairs store-forward stall): re-derive
+  the base's c from this and R0's rows
+reason: the down is the largest host term of Qwen3.8's prefill path (q38wide) and of an MTP window;
+  why now: q38wide's pp band and q38stream's split both hang on c
