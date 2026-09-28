@@ -1,0 +1,35 @@
+# Lead, 2026-09-28: hotdiag measured 26 % exact top-6 set equality per (layer, position) between the engine
+# (public Q3_K_M, whose oracle is ik-idxkey db517b69) and the old prose set (engramQ8 file, ik c10fbbcc),
+# on corpus-prose-all positions 0-127, layer 0 alone 49/128. Two things differ between those runs: the file
+# and the ik build (db517b69 adds the pre-RoPE index keys, ik#2507, and the sink fix, ik#2511). This card
+# splits them with two short traces of corpus-prose-all's first 4,096 ids (two chunks of 2048, the old set's
+# chunk, n_ubatch and schedule), both on the public file: one with the profile's tree (prose-all-pub-4k),
+# one with IK=/home/user/ik_llama.cpp at c10fbbcc (prose-all-pub-4k-c10). Then `router-coverage.py compare
+# --tokens 4096` on three pairs: old vs -c10 (file only), -c10 vs -pub-4k (build only), old vs -pub-4k
+# (both, hotdiag's pair on more positions).
+# Paper: layer 0's routing sees only the token embedding and layer 0's attention, and 49/128 = 38 % there
+# already, so the file (token embedding precision) carries a large share. If the build carried none, the
+# file-only equality would sit at the combined value (~26 %); if the file carried none, at 100 %. With the
+# file dominant: 26..50 % [derived, a reading of layer 0, not a model].
+# Wall [derived]: 4,096 ids at 66.5 tok/s = 1.0 min each plus a cold read and the harness rebuild against
+# the other tree, 2-5 min each, two runs, one lease each.
+kind: profile
+question: does the file or the ik build carry the routing difference between the engine and the old
+  c10fbbcc traces?
+term: exact top-6 set equality over layers 2-39 and the first 4096 tokens of corpus-prose-all, old
+  prose set (engramQ8 file, c10fbbcc) against prose-all-pub-4k-c10 (public file, c10fbbcc): the file
+  alone
+unit: ratio
+predict: 0.26..0.50
+condition: two runs, one lease each: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/router-attr.card'
+  just trace-router prose-all --name prose-all-pub-4k --chunk 2048 --max-tokens 4096, and the same with
+  IK=/home/user/ik_llama.cpp added to BLOOMERY_BOX_ENV and --name prose-all-pub-4k-c10; each manifest's
+  ids_md5 is cea691301aa62757e947739f7fde75f6 and its build names its tree; compare --tokens 4096 on the
+  Mac for the three pairs
+decide-in: the file carries most of it: the old sets are cross-file lists, not a bug; the build term
+  (-c10 vs -pub-4k) is printed beside it and goes to the #2507 notes
+decide-below: the file alone disagrees more than file and build together: the measurements do not
+  compose; hotdiag's alignment (positions, prefill by steps vs chunk prefill) is chased before any
+  hot-list conclusion is drawn from it
+decide-above: the build carries much of it: the index keys of ik#2507 move routing materially; that goes
+  to #2507's PPL question and the oracle choice, and the pub-seed list is kept as the engine's
