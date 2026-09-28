@@ -5,8 +5,9 @@
 //! for a Q8_0 one the f32-activation Q8_0 gemv, then `argmax_finite_fault`,
 //! exactly as the block path launches them, so their gates are this chain's
 //! gates. The Q6_K head's quantizer refuses a non-finite input; the Q8_0 head
-//! has none, so its argmax refuses a non-finite logit, and a Q8_0 head is
-//! one row: that argmax's readback carries its own raise only in one block.
+//! has none, so its argmax refuses a non-finite logit — over `m > 1` rows
+//! `argmax_rows_finite_fault`, whose last block to finish copies the word, so
+//! the readback carries every row's raise.
 //!
 //! A head carries `m` rows (1..=8), fixed at construction: the decode step
 //! samples one position (`m = 1`), a k-token step every row. Each row's
@@ -165,6 +166,9 @@ pub struct Head {
     /// The `m` argmax tokens, then the fault's first-layer word and that
     /// layer's site mask as the argmax found them.
     token_out: DeviceBuffer<u32>,
+    /// The ticket count of a Q8_0 head of `m > 1` rows (its argmax's blocks
+    /// each draw one), zero between launches; `None` for every other head.
+    rows_done: Option<DeviceBuffer<u32>>,
 }
 
 impl Head {
@@ -221,15 +225,10 @@ impl Head {
         if n_vocab == 0 {
             return Err(GpuError::shape(WHAT, "output.weight has no rows"));
         }
-        if matches!(out_w, OutW::Q8_0 { .. }) && m != 1 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a Q8_0 lm_head of {m} rows: its argmax checks the logits in one block, so \
-                     it takes one row"
-                ),
-            ));
-        }
+        let rows_done = match out_w {
+            OutW::Q8_0 { .. } if m > 1 => Some(DeviceBuffer::zeroed(stream, 1)?),
+            _ => None,
+        };
         let x = DeviceBuffer::zeroed(stream, m * hidden)?;
         let fin = match norm {
             HeadNorm::Rms => Final::Rms {
@@ -247,6 +246,7 @@ impl Head {
             act: Q8Act::with_k(stream, m, hidden)?,
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
+            rows_done,
         })
     }
 
@@ -276,6 +276,7 @@ impl Head {
             + normed
             + self.logits.num_bytes()
             + self.token_out.num_bytes()
+            + self.rows_done.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.act.q3.num_bytes()
             + self.act.q4.num_bytes()
             + self.act.q6.num_bytes()
@@ -285,10 +286,10 @@ impl Head {
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
     /// → gemv_q6k → argmax_fault (`argmax_rows_fault` when `m > 1`), or for
-    /// a Q8_0 lm_head q8_0_gemv over the normed f32 rows → argmax_finite_fault,
-    /// the argmax copying the fault word after the tokens. Pure enqueues — no
-    /// allocation, no synchronization — so the same body is what a capture
-    /// records.
+    /// a Q8_0 lm_head q8_0_gemv over the normed f32 rows → argmax_finite_fault
+    /// (`argmax_rows_finite_fault` when `m > 1`), the argmax copying the fault
+    /// word after the tokens. Pure enqueues — no allocation, no
+    /// synchronization — so the same body is what a capture records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
@@ -302,13 +303,23 @@ impl Head {
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()
                     .enqueue_q8_0_gemv(stream, qs, d, rows, self.m, &mut self.logits)?;
-                return gpu.elem().enqueue_argmax_finite_fault(
-                    stream,
-                    &self.logits,
-                    self.n_vocab,
-                    fault,
-                    &mut self.token_out,
-                );
+                return match &mut self.rows_done {
+                    None => gpu.elem().enqueue_argmax_finite_fault(
+                        stream,
+                        &self.logits,
+                        self.n_vocab,
+                        fault,
+                        &mut self.token_out,
+                    ),
+                    Some(done) => gpu.elem().enqueue_argmax_rows_finite_fault(
+                        stream,
+                        &self.logits,
+                        (self.n_vocab, self.m),
+                        fault,
+                        &mut self.token_out,
+                        done,
+                    ),
+                };
             }
         }
         if self.m == 1 {

@@ -96,6 +96,14 @@
 //!   while a verify waits for its commit, and a commit with no verify
 //!   waiting, by name; the lane word planted on a lane no call wrote makes
 //!   the next step's first delta layer raise `delta_stamp` there, alone.
+//! - (h) the head of m rows: from the prefix, a head of two rows over the
+//!   loaded q8_0 lm_head, its input written from the host, reads back two
+//!   equal tokens for two equal finite rows, and with a NaN in row 0's
+//!   input, then in row 1's, reads back the head's `logit` fault each time,
+//!   never a token (built here because the model's own head mix raises
+//!   `hc_mix` on a row that is not finite first, so no call of the model
+//!   plants one row alone); the word left raised, a verify of two
+//!   rows is that fault and poisons the model.
 //! - (o) one owner of the position: after the prefix, a graph step, an eager
 //!   pass of three rows and a graph verify of two rows (kept whole), each
 //!   with a failure planted before its launch (`Body38::plant_before_launch`)
@@ -142,8 +150,9 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
     };
-    use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Fault, FaultSite, GpuError};
+    use bloomery_gpu::head::Head;
+    use bloomery_gpu::model::{ChainBody, StepMode};
+    use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
@@ -1449,6 +1458,88 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------- (h) the head of m rows
+
+    /// (h): from the prefix, a head of two rows over the loaded q8_0 lm_head,
+    /// its input written from the host: two equal finite rows read back two
+    /// equal tokens; then a NaN in row 0's input, then (the word cleared) in
+    /// row 1's, makes that row's every logit NaN, and each readback is the
+    /// head's [`FaultSite::Logit`], never a token — each launch after one
+    /// that must have put its argmax's ticket count back. The head is built
+    /// here, not reached through a verify, because the model path cannot
+    /// plant one row alone: the head's mix checks every value it writes into
+    /// the head's input and raises [`FaultSite::HcMix`] first, so a NaN
+    /// upstream never reaches the logits as a Logit fault. Then, the word left
+    /// raised, a verify of two rows: its head's readback carries the raised
+    /// word, so the call is that fault and the model poisoned.
+    fn head_rows(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        let want = Fault::at(LAYER_HEAD, FaultSite::Logit);
+        let (rows, _) = verify_rows(toks)?;
+        fresh(m)?;
+        m.step(&toks[..PREFIX])?;
+        let mut ok = true;
+        {
+            let (gpu, w, b) = m.body_parts("head_rows")?;
+            let mut head = Head::with_norm(gpu, w, b.head_eps(), 2, b.head_norm())?;
+            let k = head.hidden();
+            let row: Vec<f32> = (0..k)
+                .map(|j| ((j * 37 % 101) as f32 - 50.0) / 50.0)
+                .collect();
+            gpu.clear_fault()?;
+            head.set_input(gpu, &[&row[..], &row[..]].concat())?;
+            head.enqueue(gpu, w)?;
+            let clean = head.tokens(gpu);
+            let equal = matches!(&clean, Ok(t) if t.len() == 2 && t[0] == t[1]);
+            ok &= equal;
+            println!(
+                "head rows: a head of 2 rows over the q8_0 lm_head, two equal finite rows -> {} \
+                 (want two equal tokens) {}",
+                match &clean {
+                    Ok(t) => format!("tokens {t:?}"),
+                    Err(e) => format!("error \"{e}\""),
+                },
+                verdict(equal)
+            );
+            for r in 0..2 {
+                gpu.clear_fault()?;
+                let mut x = [&row[..], &row[..]].concat();
+                x[r * k] = f32::NAN;
+                head.set_input(gpu, &x)?;
+                head.enqueue(gpu, w)?;
+                let got = head.tokens(gpu);
+                let named = matches!(&got, Err(GpuError::Fault { fault, .. }) if *fault == want);
+                ok &= named;
+                println!(
+                    "head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row {r}'s input \
+                     -> {} (want the output head's fault at site {}) {}",
+                    match &got {
+                        Ok(t) => format!("tokens {t:?}"),
+                        Err(e) => format!("error \"{e}\""),
+                    },
+                    FaultSite::Logit.name(),
+                    verdict(named)
+                );
+            }
+        }
+        let got = m.step_rows::<2>([rows[0], rows[1]]);
+        let poisoned = m.poisoned();
+        let carried = matches!(&got, Err(GpuError::Fault { fault, .. }) if *fault == want)
+            && poisoned == Some(want);
+        ok &= carried;
+        println!(
+            "head rows: the word left raised, a verify of 2 rows at {PREFIX} -> {}, poisoned {} \
+             (want the output head's fault, and poisoned by it) {}",
+            match &got {
+                Ok(t) => format!("tokens {t:?}"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            poisoned.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            verdict(carried)
+        );
+        m.reset()?;
+        Ok(ok)
+    }
+
     // ------------------------------------------- (o) one owner of the position
 
     /// The calls (o) plants its failures on, each from position [`PREFIX`].
@@ -1705,6 +1796,7 @@ mod gate {
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
+        ok &= head_rows(&mut m, &toks)?;
         let (paths_ok, eager) = paths(&mut m, &toks)?;
         ok &= paths_ok;
         let vocab = m.body("run")?.vocab();
