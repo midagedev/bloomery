@@ -11,9 +11,12 @@
 # tok/s, +34..+52 % [derived, q38d1bd §4, pred.py]. The hit a greedy continuation of the lcg prompt
 # reaches is not measured: at h 0.20 / 0.30 / 0.45 the same model gives 44.3..45.8 / 46.5..49.0 /
 # 50.2..54.8 tok/s, so the band is widened down to h 0.20: +9..+52 %.
-# Waits on tools/ref/depth-qwen3moe.sh taking a per-arm lever (an `@K=V` suffix on ours arms, as
-# depth-ds41.sh's `prose:<P>[@K=V,...]`): BLOOMERY_BOX_ENV reaches every arm, so today the runner
-# cannot pair the two arms in one lease. Not to be sat before that change lands.
+# The runner pairs the two arms in one lease through q3arm's lever arms:
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38legs-tg.card BLOOMERY_GEN_CTX=4096' BLOOMERY_AB_ROUNDS=2
+# just depth-gpu-qwen4exp 6 6@BLOOMERY_QWEN38_EXPERTS=card.
+# Wall [derived]: 2 arms x 2 rounds = 4 fresh processes, each a Qwen3.8 load of 40..90 s with the host
+# set warm (the e2e gate's loads) plus its warm-up and ~2.5 s of 96 tokens, and the witness blocks: about
+# 5..8 min; with a cold host set the first load reads ~111 GB at 2..3 GB/s, +40..60 s once. Under 30 min.
 kind: ab
 question: does the card leg shorten Qwen3.8's decode step by the host slots its card experts remove?
 term: tg tok/s @ n=96, depth 6 (the lcg prompt), ctx 4096 (BLOOMERY_GEN_CTX=4096, so the card
