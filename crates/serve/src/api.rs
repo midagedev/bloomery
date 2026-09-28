@@ -183,6 +183,7 @@ impl Server {
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
+            draft_rows: engine.advance_rows(),
             bos_text: tok.decode(&[tok.bos()]),
             eos_text: tok.decode(&[tok.eos()]),
         };
@@ -284,6 +285,8 @@ impl Server {
 struct ModelInfo {
     n_vocab: usize,
     ctx_max: usize,
+    /// [`Engine::advance_rows`]: past 1 the engine drafts.
+    draft_rows: usize,
     bos_text: String,
     eos_text: String,
 }
@@ -301,6 +304,11 @@ struct Stats {
     n_busy_slots_total: u64,
     /// The longest a request's sequence grew (prompt and generation, `n_past`).
     n_tokens_max: u64,
+    /// The ids the draft proposed, the ones kept, and the passes that verified
+    /// a proposal.
+    n_draft_total: u64,
+    n_draft_accepted_total: u64,
+    n_draft_passes_total: u64,
 }
 
 #[derive(Default)]
@@ -729,7 +737,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         .or(get_i(o, "max_completion_tokens")?)
         .unwrap_or(-1);
     let top_k = get_i(o, "top_k")?;
-    Ok(GenParams {
+    let p = GenParams {
         n_predict: if n_predict < 0 { -1 } else { n_predict },
         sampling: SamplingParams {
             temperature: get_f(o, "temperature").map_or(d.temperature, |t| t as f32),
@@ -749,7 +757,31 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .and_then(Value::as_bool)
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
-    })
+    };
+    if state.info.draft_rows > 1 {
+        drafted(&p)?;
+    }
+    Ok(p)
+}
+
+/// A request a drafting engine cannot serve as asked, refused by the field
+/// that asks it: a draft's pass keeps the target's argmax and reads no logits
+/// row, so neither sampling nor a banned id has a pass to run on.
+fn drafted(p: &GenParams) -> Result<(), ApiError> {
+    let t = p.sampling.temperature;
+    if t > 0.0 {
+        return Err(invalid(format!(
+            "temperature {t}: sampling with a draft is not built (the draft's pass keeps the \
+             target's argmax); send temperature 0"
+        )));
+    }
+    if p.ignore_eos {
+        return Err(invalid(
+            "ignore_eos: banning the end-of-generation ids with a draft is not built (the \
+             draft's pass keeps the target's argmax)",
+        ));
+    }
+    Ok(())
 }
 
 /// llama-server's `generation_settings`, with the values this server applies.
@@ -952,6 +984,9 @@ fn draft_object(d: &DraftProps) -> Value {
     let mut o = Map::new();
     o.insert("model".into(), Value::String(d.model.clone()));
     put(&mut o, "n_max", d.n_max);
+    put(&mut o, "kind", d.kind.clone());
+    put(&mut o, "path", d.path.clone());
+    put(&mut o, "device", d.device.clone());
     Value::Object(o)
 }
 
@@ -1018,7 +1053,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 14] = [
+        let rows: [(&str, &str, &str, String); 17] = [
             (
                 "counter",
                 "prompt_tokens_total",
@@ -1060,6 +1095,24 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "n_tokens_max",
                 "Largest observed sequence length (prompt + generation)",
                 s.n_tokens_max.to_string(),
+            ),
+            (
+                "counter",
+                "spec_decode_num_draft_tokens_total",
+                "Speculative: Total draft tokens generated",
+                s.n_draft_total.to_string(),
+            ),
+            (
+                "counter",
+                "spec_decode_num_accepted_tokens_total",
+                "Speculative: Total draft tokens accepted by the target model",
+                s.n_draft_accepted_total.to_string(),
+            ),
+            (
+                "counter",
+                "spec_decode_num_drafts_total",
+                "Speculative: Total speculative decoding verification steps",
+                s.n_draft_passes_total.to_string(),
             ),
             (
                 "gauge",
@@ -1352,15 +1405,15 @@ impl<'a> Run<'a> {
         s.t_prompt_ms_total += t.prompt_ms;
         s.n_predicted_total += dn;
         s.t_predicted_ms_total += t.predicted_ms;
-        // llama_decode calls: one for the prompt, whose logits give the first
-        // generated token, then one per later token (the last is never fed back).
-        let decodes = match (pn, dn) {
-            (0, _) => 0,
-            (_, 0) => 1,
-            (_, d) => d,
-        };
+        // Engine calls: one for the prompt, whose logits give the first
+        // generated token, then a step or a pass each (the last token is never
+        // fed back).
+        let decodes = if pn == 0 { 0 } else { 1 + t.decodes as u64 };
         s.n_decode_total += decodes;
         s.n_busy_slots_total += decodes;
+        s.n_draft_total += t.draft_n as u64;
+        s.n_draft_accepted_total += t.draft_n_accepted as u64;
+        s.n_draft_passes_total += t.draft_passes as u64;
         drop(s);
         let mut v = relock(&self.state.slot);
         v.n_past = t.n_past;
