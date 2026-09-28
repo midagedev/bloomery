@@ -412,7 +412,8 @@ mod gate {
         let cards: Vec<bool> = (0..kinds.len()).map(|l| planned(l) > 0).collect();
         let card_layers = at(&|l| cards[l]);
         let map_is_plan = o.n_l.len() == kinds.len()
-            && (0..kinds.len()).all(|l| slots.on_card(l) as u64 == planned(l));
+            // A dense layer has no slot-map row: no card experts, as planned.
+            && (0..kinds.len()).all(|l| slots.on_card(l).unwrap_or(0) as u64 == planned(l));
         let readable = at(&|l| kinds[l].ffn == FfnKind::Moe && !Q6K_DOWN.contains(&l));
         let card_ok = map_is_plan
             && card_layers.iter().all(|l| readable.contains(l))

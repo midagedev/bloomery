@@ -1064,7 +1064,7 @@ impl FfnPiece {
                 hc_fn: names::hc_ffn_fn(l),
                 hc_scale: names::hc_ffn_scale(l),
                 hc_base: names::hc_ffn_base(l),
-                n_card: map.on_card(l),
+                n_card: map.on_card(l)?,
                 row_off: i * map.n_expert(),
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
@@ -1349,12 +1349,15 @@ impl FfnPiece {
                 self.rows.len()
             )));
         }
-        if map.layers() != self.layers || map.on_card(layer) != c.n_card {
+        let n_card = map.on_card(layer).ok();
+        if map.layers() != self.layers || n_card != Some(c.n_card) {
+            let held = n_card.map_or_else(
+                || format!("no row for layer {layer}"),
+                |n| format!("{n} experts of layer {layer} on the card"),
+            );
             return Err(refuse(format!(
-                "the host tier's map (layers {:?}, {} experts of layer {layer} on the card) is not the \
-                 piece's ({:?}, {})",
+                "the host tier's map (layers {:?}, {held}) is not the piece's ({:?}, {})",
                 map.layers(),
-                map.on_card(layer),
                 self.layers,
                 c.n_card
             )));

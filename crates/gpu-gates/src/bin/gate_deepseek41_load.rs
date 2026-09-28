@@ -497,8 +497,8 @@ mod gate {
                 ));
             }
         }
-        let host = body.slot_map().as_slice();
-        let same = host == got.as_slice();
+        let host = body.slot_map().stage_view();
+        let same = host == got;
         if !same {
             let at = host.iter().zip(&got).position(|(h, c)| h != c);
             bad.push(format!(

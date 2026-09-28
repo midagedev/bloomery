@@ -2030,8 +2030,8 @@ impl Body {
         let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
         let n_expert = hp.experts.n_expert;
-        let map = SlotMap::of_plan(plan, card, layers.clone(), n_expert)?;
-        let slots = DeviceTensor::upload(stream, map.as_slice(), layers.len(), n_expert)?;
+        let map = SlotMap::of_plan(plan, card, None, layers.clone(), n_expert)?;
+        let slots = DeviceTensor::upload(stream, &map.stage_view(), layers.len(), n_expert)?;
 
         let attn =
             AttnChain::with_rows(gpu, hp, layers.clone(), image.layout(), &planner, PAIR_ROWS)?;
