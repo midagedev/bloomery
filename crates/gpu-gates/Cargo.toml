@@ -74,6 +74,8 @@ bloomery-vision = { path = "../vision", optional = true }
 [features]
 gpu = [
     "dep:bloomery-gpu",
+    "dep:bloomery-threads",
+    "dep:libc",
     "dep:cuda-core",
     "dep:cuda-device",
     "dep:cuda-host",

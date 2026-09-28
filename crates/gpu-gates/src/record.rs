@@ -244,12 +244,14 @@ pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
         "record::at_main({bin}): the process registered {}'s kinds already",
         held.bin
     );
+    #[cfg(feature = "gpu")]
     if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
         bloomery_gpu::host::swap::set_leak_sink(eprint_leak);
     }
 }
 
 /// The residency machine's leak sink: its `residency leak` line on stderr.
+#[cfg(feature = "gpu")]
 fn eprint_leak(l: &Leak) {
     residency_leak(l).eprint();
 }
@@ -1572,6 +1574,7 @@ pub fn helper(
 }
 
 /// A dropped residency machine's leak record.
+#[cfg(feature = "gpu")]
 pub fn residency_leak(l: &Leak) -> Record {
     Record::new(&RESIDENCY_LEAK)
         .w("reason", l.reason.word())
