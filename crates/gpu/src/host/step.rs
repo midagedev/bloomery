@@ -7,6 +7,7 @@
 //! into the page and adds one to the row's counter.
 
 use super::page::{HandoffLayout, PageLayout, Word};
+use super::route_trace::RouteTrace;
 use super::slots::{Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, non_finite, unknown_id};
 use crate::GpuError;
@@ -629,6 +630,9 @@ pub struct StepPort {
     pair_row0: Option<usize>,
     row0_ids: Vec<u32>,
     pub(super) stats: StepStats,
+    /// The route trace, when one is attached: each one-row step's routed
+    /// ids, recorded before the service's signal and written after it.
+    pub(super) trace: Option<RouteTrace>,
 }
 
 impl StepPort {
@@ -663,6 +667,7 @@ impl StepPort {
             pair_row0: None,
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
+            trace: None,
         }
     }
 
@@ -934,7 +939,21 @@ impl StepPort {
         }
         experts.experts_into(layer, &self.x, &self.list, out)?;
         self.stats.host_calls += 1;
+        // The page holds the handoff until the signal: the ids are read
+        // before it, the finished position is written after it.
+        let whole = match self.trace.as_mut() {
+            Some(t) => {
+                let page = &self.boundary.page;
+                t.record(layer, chain, slots, |s| {
+                    payload_word(page, image_off, h.ids + s, words)
+                })?
+            }
+            None => false,
+        };
         self.signal(row, &go);
+        if whole && let Some(t) = self.trace.as_mut() {
+            t.write_row()?;
+        }
         let s = &mut self.stats;
         s.host_slots += self.list.len() as u64;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
@@ -963,6 +982,14 @@ impl StepPort {
     ) -> Result<(), GpuError> {
         let what = SERVE;
         let m = chain.cols();
+        if self.trace.is_some() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a {chain:?} service while a route trace is attached: it records one-row steps"
+                ),
+            ));
+        }
         let go = self.take_go(layer, 0, opens_replay, chain)?;
         let page = &self.boundary.page;
         let h = self.boundary.layout.handoff();

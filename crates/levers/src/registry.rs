@@ -27,6 +27,7 @@ pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
 pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
+pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -223,6 +224,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               digest; a list of another tokenizer, unsorted, with an id repeated or past the \
               vocabulary, or of no row is refused by name. It moves the drafts' acceptance, \
               never the emitted tokens.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: ROUTE_TRACE,
+        class: Class::D,
+        kind: Kind::Path,
+        default: Unset::Means("no trace"),
+        doc: "`bloomery-serve-ds41`: the directory, created at `main` as a new directory \
+              (an existing path or a missing parent is refused by name), the host tier \
+              writes a route trace into (`crates/gpu/src/host/route_trace.rs`): every \
+              position's routed ids per layer and the slot each ran in, as a router set, \
+              a `call` row per prompt call. Needs `BLOOMERY_PREFILL=steps` and no \
+              `BLOOMERY_DRAFT`, each refused by name otherwise.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

@@ -46,6 +46,16 @@
 //!   one position on, poisoned by it; with the gain put back, the next step
 //!   must refuse as poisoned rather than read the word back as a fault of
 //!   its own; and after a reset the prompt answers its clean token again.
+//!   And the route trace (`bloomery_gpu::host::route_trace`) holds what the
+//!   engine routed: attached to the host tier, it records a prompt call of
+//!   five ids fed one step each, a step on the prompt's sixth id and three
+//!   greedy steps — a server's split of a request — through the captured
+//!   step; read back from disk, it holds 9 positions of 40 layers, one
+//!   `call` row (first 0, prompt call 5, end 9, position 0), and at every
+//!   position and layer the ids the router wrote in an eager walk of the
+//!   same tokens from a reset (its `Seam::Ffn` taps, read off the card), and
+//!   `C` exactly where that walk's handoff placed the slot on the card; the
+//!   walk's argmax tokens are the traced run's.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -140,7 +150,8 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::hybrid::{Chain, HostExperts, PoisonKind, RELEASE};
+    use bloomery_gpu::host::route_trace::{CARD, RouteTrace, TraceHeader, TraceSet};
+    use bloomery_gpu::hybrid::{Chain, HOST, HostExperts, PoisonKind, RELEASE};
     use bloomery_gpu::model::{ChainBody, HostServed};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
@@ -309,6 +320,7 @@ mod gate {
             pass &= structure(&mut m, &mut head, &split, &hp)?;
             pass &= fault_case(&mut m, plan.n_l.len())?;
             pass &= fault_behind_error_case(&mut m, &hp)?;
+            pass &= route_trace_case(&mut m, &mut head, &hp, &path)?;
         }
         if args.sets {
             pass &= sets(&mut m, &mut head, &split, &hp, cfg.body.host.r8, &SETS)?;
@@ -492,6 +504,235 @@ mod gate {
             verdict(reset_pass)
         );
         Ok(pass && reset_pass)
+    }
+
+    // --------------------------------------------------------- route trace
+
+    /// The route trace case's request: a prompt of these ids, the last fed
+    /// as a step after a prompt call of the others, then [`TRACE_GREEDY`]
+    /// greedy steps.
+    const TRACE_PROMPT: [u32; 6] = [1, 7_000, 23, 40_960, 512, 9];
+    const TRACE_GREEDY: usize = 3;
+    /// Where the case writes its set, beside the tree's build: replaced by
+    /// the next run, and read by `tools/bloomery/route_trace.py check`.
+    const TRACE_DIR: &str = "target/route-trace-gate";
+
+    /// `dir` made free for a new trace: an earlier run's set is removed, any
+    /// other path there is refused by name.
+    fn free_trace_dir(dir: &std::path::Path) -> Result<(), GateError> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let first = std::fs::read_to_string(dir.join("MANIFEST.tsv")).unwrap_or_default();
+        if !first.starts_with("# router_trace — bloomery engine") {
+            return Err(format!(
+                "{} exists and holds no route trace of this gate: not removing it",
+                dir.display()
+            )
+            .into());
+        }
+        std::fs::remove_dir_all(dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
+        Ok(())
+    }
+
+    /// The route trace's clause (the module doc): the traced run through
+    /// the engine's captured step, the eager walk of the same tokens as its
+    /// oracle, and the set on disk against both.
+    fn route_trace_case(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        hp: &Hparams,
+        path: &str,
+    ) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step route_trace";
+        let dir = std::env::current_dir()?.join(TRACE_DIR);
+        free_trace_dir(&dir)?;
+        let n_layer = hp.n_layer;
+        let header = TraceHeader {
+            model: PathBuf::from(path),
+            arch: "deepseek41".to_owned(),
+            build: "gate_deepseek41_step".to_owned(),
+            n_expert: hp.experts.n_expert,
+            n_used: hp.experts.n_used,
+            n_layer,
+            extra: vec![("placement".to_owned(), "gate".to_owned())],
+        };
+        m.reset()?;
+        let trace = RouteTrace::create(&dir, header)?;
+        m.body_parts(WHAT)?
+            .2
+            .hybrid_mut()
+            .attach_route_trace(trace)?;
+        // A server's request: the prompt call, the last prompt id as a step,
+        // then greedy steps. The trace is taken off on every path.
+        let (call, last) = TRACE_PROMPT.split_at(TRACE_PROMPT.len() - 1);
+        let traced = (|| -> Result<Vec<u32>, GateError> {
+            let pos = m.pos();
+            m.body_parts(WHAT)?
+                .2
+                .hybrid_mut()
+                .route_prompt(pos, call.len())?;
+            m.step(call)?;
+            let mut out = vec![m.step(last)?];
+            for _ in 0..TRACE_GREEDY {
+                let t = *out.last().ok_or("no token")?;
+                out.push(m.step(&[t])?);
+            }
+            Ok(out)
+        })();
+        let detached = m.body_parts(WHAT)?.2.hybrid_mut().take_route_trace();
+        let generated = traced?;
+        let written = detached.map_or(0, |t| t.rows());
+        // The positions' input tokens: the prompt, then every generated
+        // token but the last.
+        let tokens: Vec<u32> = TRACE_PROMPT
+            .iter()
+            .copied()
+            .chain(generated[..TRACE_GREEDY].iter().copied())
+            .collect();
+
+        // The oracle: the same tokens walked eagerly from a reset, the
+        // router's own ids and the handoff's card places read at each MoE
+        // seam.
+        m.reset()?;
+        let mut want_ids = vec![Vec::new(); n_layer];
+        let mut want_card = vec![Vec::new(); n_layer];
+        let mut walked = Vec::new();
+        {
+            let (gpu, w, body) = m.body_parts(WHAT)?;
+            for (pos, &t) in tokens.iter().enumerate() {
+                let input = body.decode_input(t, u32::try_from(pos)?)?;
+                body.refresh(gpu.stream(), &input)?;
+                let mut seen = 0usize;
+                let mut observe = |gpu: &Gpu, seam: Seam<'_>| -> Result<(), GpuError> {
+                    if let Seam::Ffn { layer, taps, .. } = seam {
+                        let stream = gpu.stream();
+                        stream.synchronize()?;
+                        let ids = taps.router.ids.to_host_vec(stream)?;
+                        let sel = taps.sel.to_host_vec(stream)?;
+                        if let (Some(i), Some(s), Some(wi), Some(wc)) = (
+                            ids.get(..N_USED),
+                            sel.get(..N_USED),
+                            want_ids.get_mut(layer),
+                            want_card.get_mut(layer),
+                        ) {
+                            wi.extend_from_slice(i);
+                            wc.extend(s.iter().map(|&p| p != HOST));
+                            seen += 1;
+                        }
+                    }
+                    Ok(())
+                };
+                body.enqueue_observed(gpu, w, head, &mut observe)?;
+                gpu.stream().synchronize()?;
+                if seen != n_layer {
+                    return Err(format!(
+                        "the eager walk at position {pos} showed {seen} MoE seams, not {n_layer}"
+                    )
+                    .into());
+                }
+                walked.push(head.token(gpu)?);
+            }
+        }
+        m.reset()?;
+        let slots = m.body(WHAT)?.hybrid().slots();
+
+        let set = TraceSet::read(&dir)?;
+        let rows = tokens.len();
+        let shape = set.tokens == rows as u64
+            && set.complete == Some(rows as u64)
+            && written == rows as u64
+            && set.n_used == N_USED
+            && set.ids.len() == n_layer;
+        println!(
+            "route trace shape: {} positions on disk (manifest tokens, complete {:?}, writer {written}) \
+             of {} layers x {} ids; want {rows} = prompt call {} + {} steps, {n_layer} x {N_USED} {}",
+            set.tokens,
+            set.complete,
+            set.ids.len(),
+            set.n_used,
+            call.len(),
+            1 + TRACE_GREEDY,
+            verdict(shape)
+        );
+        let want_call = (0u64, call.len() as u64, rows as u64, 0u32);
+        let marks = set.calls == [want_call];
+        println!(
+            "route trace marks: call rows {:?} (first, prompt_call, end, pos0); want [{want_call:?}]: \
+             positions 0..{} the prompt call's, {} the prompt's last id as a step, {}..{rows} \
+             greedy {}",
+            set.calls,
+            call.len(),
+            call.len(),
+            call.len() + 1,
+            verdict(marks)
+        );
+        let mut first_bad = None;
+        let mut kinds_bad = None;
+        let mut slots_bad = None;
+        for l in 0..n_layer.min(set.ids.len()) {
+            let (got, kinds) = (&set.ids[l], &set.kinds[l]);
+            for p in 0..rows {
+                let span = p * N_USED..(p + 1) * N_USED;
+                let want: Vec<u16> = want_ids[l]
+                    .get(span.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&v| u16::try_from(v).unwrap_or(u16::MAX))
+                    .collect();
+                let g = got.get(span.clone()).unwrap_or_default();
+                if first_bad.is_none() && g != want.as_slice() {
+                    first_bad = Some(format!(
+                        "layer {l} position {p}: trace {g:?}, router {want:?}"
+                    ));
+                }
+                let k = kinds.get(span.clone()).unwrap_or_default();
+                let card = want_card[l].get(span).unwrap_or_default();
+                if kinds_bad.is_none()
+                    && (k.len() != card.len()
+                        || k.iter().zip(card).any(|(&k, &c)| (k == CARD) != c))
+                {
+                    kinds_bad = Some(format!(
+                        "layer {l} position {p}: kinds {k:?}, card {card:?}"
+                    ));
+                }
+                for (&id, &kind) in g.iter().zip(k) {
+                    let by_map = match slots.slot(l, u32::from(id)) {
+                        Some(bloomery_gpu::hybrid::Slot::Card(_)) => Some(b'C'),
+                        Some(bloomery_gpu::hybrid::Slot::Tier(_)) => Some(b'T'),
+                        Some(bloomery_gpu::hybrid::Slot::Host) => Some(b'H'),
+                        None => None,
+                    };
+                    if slots_bad.is_none() && by_map != Some(kind) {
+                        slots_bad = Some(format!(
+                            "layer {l} position {p} expert {id}: kind {kind}, slot map {by_map:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        let ids_ok = shape && first_bad.is_none();
+        println!(
+            "route trace ids: every position x layer = the eager walk's router ids {} {}",
+            first_bad.as_deref().unwrap_or("(all equal)"),
+            verdict(ids_ok)
+        );
+        let kinds_ok = shape && kinds_bad.is_none() && slots_bad.is_none();
+        println!(
+            "route trace slots: C exactly where the walk's handoff placed the slot on the card, and \
+             each kind the slot map's {} {} {}",
+            kinds_bad.as_deref().unwrap_or("(card places agree)"),
+            slots_bad.as_deref().unwrap_or("(slot map agrees)"),
+            verdict(kinds_ok)
+        );
+        let same = walked[TRACE_PROMPT.len() - 1..] == generated[..];
+        println!(
+            "route trace tokens: traced run {generated:?}, eager walk {:?} {}",
+            &walked[TRACE_PROMPT.len() - 1..],
+            verdict(same)
+        );
+        println!("route trace set: {}", dir.display());
+        Ok(shape && marks && ids_ok && kinds_ok && same)
     }
 
     /// The output norm's gain, whose first value the fault-behind-an-error

@@ -127,11 +127,25 @@ pub fn tier_of(machine: &Machine) -> Result<Option<TierOpen>, GpuError> {
 impl Prompt for Body {
     /// Under the body's `BLOOMERY_PREFILL`: the prompt call's batches
     /// ([`body::prefill`]), or one step per id with one readback after the
-    /// last.
+    /// last, the host tier's route trace told the call's positions first. A
+    /// batched call while a route trace is attached is refused by name.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         match m.body(WHAT)?.prefill_mode() {
+            PrefillMode::Batch if m.body(WHAT)?.hybrid().route_traced() => Err(GpuError::Shape {
+                what: WHAT,
+                detail: "a batched prompt call while a route trace is attached: the trace \
+                         records the step feed (BLOOMERY_PREFILL=steps)"
+                    .to_string(),
+            }),
             PrefillMode::Batch => body::prefill(m, ids),
-            PrefillMode::Steps => m.step(ids),
+            PrefillMode::Steps => {
+                let pos = m.pos();
+                m.body_parts(WHAT)?
+                    .2
+                    .hybrid_mut()
+                    .route_prompt(pos, ids.len())?;
+                m.step(ids)
+            }
         }
     }
 }

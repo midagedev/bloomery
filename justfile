@@ -1431,6 +1431,18 @@ gen-glm5next *ARGS:
 gate-qwen4exp-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture; lib=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture; meta=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_mtp_meta -- --ignored --nocapture; mtp=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture; host=$?; echo "gate-qwen4exp-meta rc: lib $lib meta $meta mtp $mtp host $host"; [ "$lib" = 0 ] && [ "$meta" = 0 ] && [ "$mtp" = 0 ] && [ "$host" = 0 ]'
 
+# The chat route trace (D2's input, not a gate, lead-only, in the lead's A6000 window): one bloomery-serve-ds41
+# process (one load, plan (a) on the A6000) with BLOOMERY_ROUTE_TRACE=OUT and the step feed runs every prompt row of
+# PROMPTS in file order, greedy (/apply-template, /tokenize, /completion at temperature 0, n_predict 256,
+# cache_prompt false), and the engine writes every position's routed ids per layer into OUT, a new directory, as a
+# router set with the slot kinds and a call row per prompt call; contexts.tsv (one row per request) is joined at
+# the end. tools/ref/route-trace-chat.py's header has the contract. Predicted wall about 13-15 min [derived]. It
+# takes neither the A6000 gate lock nor the V4.1 load lock (the driver is not a target/release binary
+# tools/gpu-gate.sh can run): run it inside a hold. The server runs under the driver's own bound (--bound, 1800 s),
+# and every request under an HTTP timeout, so the driver ends when the server does.
+route-trace-chat OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-ds41 --out {{OUT}} --prompts {{PROMPTS}}'
+
 # 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
 [group('solo')]

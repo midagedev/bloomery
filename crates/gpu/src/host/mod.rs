@@ -96,6 +96,7 @@ pub mod handoff;
 pub mod leg;
 pub mod page;
 pub mod residency;
+pub mod route_trace;
 pub mod run;
 pub mod slots;
 pub mod step;
@@ -111,6 +112,7 @@ use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
 use residency::HostResidency;
+use route_trace::RouteTrace;
 use slots::SlotMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -581,6 +583,56 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
+    /// Attach `trace`: from here on every one-row step's service records
+    /// its routed ids into it ([`route_trace`]), and a prompt batch's
+    /// service is refused by name. The trace must cover the slot map's
+    /// layers and experts; a second trace is refused.
+    pub fn attach_route_trace(&mut self, trace: RouteTrace) -> Result<(), GpuError> {
+        if self.step.trace.is_some() {
+            return Err(GpuError::shape(
+                "HostTier::attach_route_trace",
+                "a route trace is attached already",
+            ));
+        }
+        trace.fits(&self.slots, self.step.boundary.layout.handoff().n_used)?;
+        self.step.trace = Some(trace);
+        Ok(())
+    }
+
+    /// Detach the route trace; what it wrote stays on disk.
+    pub fn take_route_trace(&mut self) -> Option<RouteTrace> {
+        self.step.trace.take()
+    }
+
+    /// Whether a route trace is attached.
+    #[must_use]
+    pub fn route_traced(&self) -> bool {
+        self.step.trace.is_some()
+    }
+
+    /// A prompt call of `n` ids from cache position `pos0` begins, fed one
+    /// step an id: the route trace, when one is attached, marks its
+    /// positions ([`RouteTrace::prompt`]); nothing without one.
+    pub fn route_prompt(&mut self, pos0: u32, n: usize) -> Result<(), GpuError> {
+        match self.step.trace.as_mut() {
+            Some(t) => t.prompt(pos0, n),
+            None => Ok(()),
+        }
+    }
+
+    /// The refusal of a prompt batch's service while a route trace is
+    /// attached: the trace records the steps' services alone.
+    fn refuse_traced_batch(&self, what: &'static str) -> Result<(), GpuError> {
+        if self.step.trace.is_some() {
+            return Err(GpuError::protocol(
+                what,
+                "a prompt batch while a route trace is attached: the trace records the step \
+                 feed (BLOOMERY_PREFILL=steps)",
+            ));
+        }
+        Ok(())
+    }
+
     /// The expert tier's card, when one is attached.
     #[must_use]
     pub fn tier(&self) -> Option<&TierCard> {
@@ -786,6 +838,7 @@ impl<H: HostExperts> HostTier<H> {
     /// the wait and the union ([`HostTier::serve_port`]). Returns the host
     /// time outside the union call.
     pub fn serve_key(&mut self, key: BatchKey) -> Result<ServeTimes, GpuError> {
+        self.refuse_traced_batch("HostTier::serve_key")?;
         self.serve_port(key)
     }
 
@@ -1282,6 +1335,7 @@ impl<H: HostExperts> HostTier<H> {
         out: &mut [f32],
     ) -> Result<(), GpuError> {
         self.refuse_tier_batch("Hybrid::serve_batch")?;
+        self.refuse_traced_batch("Hybrid::serve_batch")?;
         let h = self.step.boundary.layout.handoff();
         let t = Tier {
             experts: &mut self.experts,

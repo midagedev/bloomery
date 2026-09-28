@@ -6,7 +6,7 @@
                                   [--policies static,adaptive,lru,belady] [--json PATH]
     tools/ref/router-residency.py hit <family> [<set>...] --window N [--prompt P] [--open M|all
                                   [--stage K]] [--seed <seed>] [--d D] [--copies K] [--json PATH]
-    tools/ref/router-residency.py gen <family> <trace> --prompt P [--window N] [--seed <seed>]
+    tools/ref/router-residency.py gen <family> <trace> [--prompt P] [--window N] [--short skip] [--seed <seed>]
                                   [--open M|all] [--stage K] [--d D] [--copies K] [--json PATH]
     tools/ref/router-residency.py fixture --out PATH [--passes N] [--lcg SEED]
     tools/ref/router-residency.py --self-test
@@ -49,8 +49,12 @@ hit      Without --window, the continuous replay over the eval half, one markdow
          step. The rule then counts from the prompt's decayed counts. Prints the static arm and the
          asked arm: hit, the mean of six 16-step blocks, swaps a token, opening swaps a request.
 gen      The router-gen replay: <trace> holds prompt + generation in one context per manifest
-         `chunk`; positions [0, P) of each context are the prompt. Over the window [P, P + N) of
-         each context (N = --window, 96):
+         `chunk`; positions [0, P) of each context are the prompt (--prompt P). A route trace with a
+         contexts.tsv (crates/gpu/src/host/route_trace.rs, read by tools/bloomery/route_trace.py)
+         gives each request's context and its own P (the `prompt` column) instead, and --prompt is
+         refused beside it. A context shorter than P + N is refused by name; with --short skip it gets
+         no window arms (a `skipped K of M` line lists them) and still counts in the steady rule.
+         Over the window [P, P + N) of each context (N = --window, 96):
            (a) static    the seed's card set
            (b) adaptive  the rule from zero counts, reset to the seed at P
            (c) open      the opening reshuffle over [0, P) (M = --open, the family's default), then
@@ -103,6 +107,9 @@ _spec.loader.exec_module(rc)
 _spec = importlib.util.spec_from_file_location("window_union", os.path.join(_here, "window-union.py"))
 wu = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wu)
+_spec = importlib.util.spec_from_file_location("route_trace", os.path.join(_here, "..", "bloomery", "route_trace.py"))
+rt = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rt)
 
 DATA = "/Users/hckim/data/bloomery-router"
 SPLIT = 24576  # 12 whole chunks of 2048: learn on [0, SPLIT), evaluate on [SPLIT, tokens)
@@ -673,12 +680,19 @@ def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, cop
 # --- gen: prompt + generation in one context --------------------------------------------------------
 
 
-def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spares=1, per_pass=False):
+def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spares=1, per_pass=False,
+               skipped=None):
     """Per context (start, end) of X [T, L, K]: (a), (b), (c) over [start + P, start + P + N), (a) over
-    [start + P, end); and the steady rule's hit over every [start + P, end)."""
+    [start + P, end); and the steady rule's hit over every [start + P, end). A context (start, end, p)
+    carries its own P. A context shorter than P + N is refused by name, unless `skipped` is a list: then
+    it has no row and (index, length, P + N) goes into the list, and it still counts in the steady hit."""
     rows = []
     res0 = seed_resident(seed, n_l, E)
-    for c, (t0, t1) in enumerate(contexts):
+    contexts = [c if len(c) == 3 else (c[0], c[1], P) for c in contexts]
+    for c, (t0, t1, P) in enumerate(contexts):
+        if t1 - t0 < P + N and skipped is not None:
+            skipped.append((c, t1 - t0, P + N))
+            continue
         if t1 - t0 < P + N:
             raise ToolError(f"context {c} holds {t1 - t0} positions, shorter than prompt {P} + window {N}")
         Xp, Xw = X[t0:t0 + P], X[t0 + P:t0 + P + N]
@@ -690,7 +704,7 @@ def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spare
         rows.append(dict(context=c, a=float(a), b=float(b), c=float(ch.mean()), open=op, a_all=float(a_all)))
     steady = replay(X, res0, n_l, E, rule, sem="flip", spares=spares, in_flight_cap=not per_pass, d=d,
                     link=Budget(copies)).per_row
-    gen_rows = np.concatenate([steady[t0 + P:t1] for t0, t1 in contexts])
+    gen_rows = np.concatenate([steady[t0 + P:t1] for t0, t1, P in contexts])
     return rows, float(gen_rows.mean())
 
 
@@ -996,13 +1010,25 @@ def cmd_hit(a, out):
 def cmd_gen(a, out):
     F = family(a.family)
     spares_text(a)
-    if a.prompt is None or a.prompt < 1:
+    d = set_dir(a.data, a.trace)
+    try:
+        requests, _ = rt.read_contexts(d)
+    except (rt.TraceError, OSError) as e:
+        raise ToolError(str(e)) from None
+    if requests is not None and a.prompt is not None:
+        raise ToolError(f"{d}: contexts.tsv gives each context its prompt; --prompt is refused beside it")
+    if requests is None and (a.prompt is None or a.prompt < 1):
         raise ToolError("gen needs --prompt P >= 1: the positions [0, P) of each context are the prompt")
     N = 96 if a.window is None else a.window
-    s = Set(set_dir(a.data, a.trace), a.family)
-    if s.chunk is None:
+    s = Set(d, a.family)
+    if requests is not None:
+        contexts = [(r["first"], r["end"], r["prompt"]) for r in requests]
+        shape = "from contexts.tsv prompt=per context"
+    elif s.chunk is None:
         raise ToolError(f"{s.dir}: the manifest names no `chunk`, so the contexts are unknown")
-    contexts = [(t0, min(t0 + s.chunk, s.T)) for t0 in range(0, s.T, s.chunk)]
+    else:
+        contexts = [(t0, min(t0 + s.chunk, s.T), a.prompt) for t0 in range(0, s.T, s.chunk)]
+        shape = f"x {s.chunk} prompt={a.prompt}"
     if a.open is None:
         M = F["open_m"]
     else:
@@ -1019,26 +1045,38 @@ def cmd_gen(a, out):
     lists = seed_lists(a.family, s, seedname, a.data, n_l)
     rule = Rule(a.rule)
     X = s.stack(F["eligible"])
+    skipped = [] if a.short == "skip" else None
     rows, steady = gen_values(X, contexts, a.prompt, N, lists, n_l, s.E, rule, M, stage, a.d, a.copies, a.spares,
-                              a.spares_per_pass)
+                              a.spares_per_pass, skipped)
+    if not rows:
+        raise ToolError(f"every one of the {len(contexts)} contexts is shorter than its P + window {N}")
+    kept = [contexts[r["context"]] for r in rows]
     out.write(f"# router-residency gen: data={a.data} trace={s.dir} family={a.family} tokens={s.T} contexts="
-              f"{len(contexts)} x {s.chunk} prompt={a.prompt} window={N}\n")
+              f"{len(contexts)} {shape} window={N}\n")
     out.write(f"# seed {seedname}, n_l {min(n_l)}..{max(n_l)} on {len(n_l)} layers, rule {rule.text()}, flip {spares_text(a)}, "
               f"d {a.d}, copies/step {a.copies}; open M={'all' if M is None else M} stage {stage}\n")
-    for r in rows:
+    if skipped is not None:
+        lengths = ", ".join(f"{c}:{n}<{w}" for c, n, w in skipped) or "none"
+        out.write(f"skipped {len(skipped)} of {len(contexts)} contexts shorter than P+N (lengths context:positions<P+N "
+                  f"{lengths}); the steady rule still runs over them\n")
+    for r, (t0, t1, P) in zip(rows, kept):
+        own = "" if requests is None else f"  prompt {P} of {t1 - t0}"
         out.write(f"context {r['context']}: (a) static {100 * r['a']:.1f}  (b) adaptive {100 * r['b']:.1f}  "
-                  f"(c) open {100 * r['c']:.1f} ({r['open']} opening swaps)  static over [P, end) {100 * r['a_all']:.1f}\n")
+                  f"(c) open {100 * r['c']:.1f} ({r['open']} opening swaps)  static over [P, end) {100 * r['a_all']:.1f}"
+                  f"{own}\n")
     mean = {k: float(np.mean([r[k] for r in rows])) for k in ("a", "b", "c")}
-    a_all = float(np.mean(np.concatenate([np.full(t1 - t0 - a.prompt, r["a_all"])
-                                           for (t0, t1), r in zip(contexts, rows)])))
+    a_all = float(np.mean(np.concatenate([np.full(t1 - t0 - P, r["a_all"])
+                                           for (t0, t1, P), r in zip(kept, rows)])))
     out.write(f"mean (n={len(rows)}): (a) {100 * mean['a']:.1f}  (b) {100 * mean['b']:.1f}  (c) {100 * mean['c']:.1f}  "
               f"static over [P, end) {100 * a_all:.1f}  steady {100 * steady:.1f}  "
               f"(b)-(a) {100 * (mean['b'] - mean['a']):+.1f}  (c)-(a) {100 * (mean['c'] - mean['a']):+.1f} points\n")
     out.write("steady = the rule continuous from the seed over every position of the trace, hit over [P, end) "
               "of each context\n")
     out.write("verdict: " + verdict(mean["a"], mean["c"], steady) + "\n")
-    return dict(contexts=rows, mean=mean, a_all=a_all, steady=steady,
-                verdict=verdict(mean["a"], mean["c"], steady))
+    res = dict(contexts=rows, mean=mean, a_all=a_all, steady=steady, verdict=verdict(mean["a"], mean["c"], steady))
+    if skipped is not None:
+        res["skipped"] = [dict(context=c, positions=n, need=w) for c, n, w in skipped]
+    return res
 
 
 def cmd_fixture(a, out, argv):
@@ -1107,6 +1145,7 @@ def parser():
     g.add_argument("family")
     g.add_argument("trace")
     common(g)
+    g.add_argument("--short", choices=("skip",))
     f = sub.add_parser("fixture")
     f.add_argument("--out", required=True)
     f.add_argument("--passes", type=int, default=400)
@@ -1296,6 +1335,97 @@ def case_gen():
     assert verdict(0.60, 0.75, 0.65).endswith("-> R5 alone, hold R3")
 
 
+def case_gen_contexts():
+    # A route trace of two requests of unequal lengths, 10 positions with prompt 4 and 7 with prompt 3:
+    # gen takes each context and its P from contexts.tsv, the same values gen_values gives the triples,
+    # and refuses --prompt beside the sidecar.
+    with tempfile.TemporaryDirectory() as root:
+        rows = {l: [tuple((7 * t + l + 50 * j) % 384 for j in range(6)) for t in range(17)] for l in range(40)}
+        d = wu._fake_set(root, "chat", rows, 384, 6)
+        path = os.path.join(d, "MANIFEST.tsv")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        calls = "# call\tindex\tfirst\tprompt_call\tend\tpos0\ncall\t0\t0\t3\t10\t0\ncall\t1\t10\t2\t17\t0\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace("# complete", calls + "# complete"))
+        ctx = [dict(request=0, first=0, end=10, prompt=4, prompt_call=3, prompt_ids=4, cache=0, generated=7,
+                    stop="eos", prompt_id="a", genre="ko", split="learn"),
+               dict(request=1, first=10, end=17, prompt=3, prompt_call=2, prompt_ids=3, cache=0, generated=5,
+                    stop="limit", prompt_id="b", genre="en", split="held")]
+        rt._write_contexts(d, ctx)
+        js = os.path.join(root, "gen.json")
+        out = io.StringIO()
+        argv = ["gen", "v41", d, "--data", root, "--seed", "prefix", "--window", "2", "--json", js]
+        with redirect_stderr(io.StringIO()) as err:
+            code = main(argv, out)
+        assert code == 0, err.getvalue()
+        text = out.getvalue()
+        assert "contexts=2 from contexts.tsv prompt=per context window=2" in text, text
+        assert "prompt 4 of 10" in text and "prompt 3 of 7" in text, text
+        with open(js, encoding="utf-8") as f:
+            got = json.load(f)
+        s = Set(d, "v41")
+        n_l = n_plan("v41")
+        want, steady = gen_values(s.stack(family("v41")["eligible"]), [(0, 10, 4), (10, 17, 3)], None, 2,
+                                  seed_lists("v41", s, "prefix", root, n_l), n_l, 384, Rule("mid"),
+                                  family("v41")["open_m"], 0, 1, COPIES)
+        assert got["contexts"] == want and got["steady"] == steady, (got, want)
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = main(argv[:-2] + ["--prompt", "4"])
+        assert code == 1 and "--prompt is refused beside it" in err.getvalue(), err.getvalue()
+
+
+def case_gen_short():
+    # Three requests, the middle one 3 positions (prompt 2): shorter than P + N = 4 at window 2. Without
+    # --short it is refused by name; with --short skip the line names it, the two long contexts keep the
+    # arms they have alone, and the steady hit still runs over all three.
+    with tempfile.TemporaryDirectory() as root:
+        rows = {l: [tuple((5 * t + 2 * l + 50 * j) % 384 for j in range(6)) for t in range(20)] for l in range(40)}
+        d = wu._fake_set(root, "chat", rows, 384, 6)
+        path = os.path.join(d, "MANIFEST.tsv")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        calls = ("# call\tindex\tfirst\tprompt_call\tend\tpos0\ncall\t0\t0\t3\t10\t0\n"
+                 "call\t1\t10\t1\t13\t0\ncall\t2\t13\t2\t20\t0\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace("# complete", calls + "# complete"))
+        spans = [(0, 10, 4), (10, 13, 2), (13, 20, 3)]
+        rt._write_contexts(d, [dict(request=i, first=t0, end=t1, prompt=p, prompt_call=p - 1, prompt_ids=p, cache=0,
+                                    generated=t1 - t0 - p + 1, stop="eos", prompt_id=f"p{i}", genre="ko", split="learn")
+                               for i, (t0, t1, p) in enumerate(spans)])
+        argv = ["gen", "v41", d, "--data", root, "--seed", "prefix", "--window", "2"]
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = main(argv)
+        assert code == 1 and "context 1 holds 3 positions, shorter than prompt 2 + window 2" in err.getvalue(), \
+            err.getvalue()
+        js = os.path.join(root, "gen.json")
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()) as e2:
+            code = main(argv + ["--short", "skip", "--json", js], out)
+        assert code == 0, e2.getvalue()
+        text = out.getvalue()
+        assert "skipped 1 of 3 contexts shorter than P+N (lengths context:positions<P+N 1:3<4)" in text, text
+        assert "context 1:" not in text and "mean (n=2)" in text, text
+        with open(js, encoding="utf-8") as f:
+            got = json.load(f)
+        s = Set(d, "v41")
+        n_l = n_plan("v41")
+        seed = seed_lists("v41", s, "prefix", root, n_l)
+        X = s.stack(family("v41")["eligible"])
+        rule = Rule("mid")
+        alone, _ = gen_values(X, [spans[0], spans[2]], None, 2, seed, n_l, 384, rule, family("v41")["open_m"], 0, 1,
+                              COPIES)
+        strip = lambda r: {k: v for k, v in r.items() if k != "context"}
+        assert [r["context"] for r in got["contexts"]] == [0, 2], got["contexts"]
+        assert [strip(r) for r in got["contexts"]] == [strip(r) for r in alone], (got["contexts"], alone)
+        per = replay(X, seed_resident(seed, n_l, 384), n_l, 384, rule, sem="flip", spares=1, in_flight_cap=True, d=1,
+                     link=Budget(COPIES)).per_row
+        want = float(np.concatenate([per[t0 + p:t1] for t0, t1, p in spans]).mean())
+        assert got["steady"] == want and got["skipped"] == [dict(context=1, positions=3, need=4)], got
+
+
 def case_fixture():
     # one layer, E=4, n_l 1 seeded {0}; each pass two rows, 2 then 1, only the first kept: 1 is never
     # counted (counted, it would tie 2 at 4 and win by the lower id). Boundary 4: 2 in, 0 out, live 5.
@@ -1374,7 +1504,7 @@ def case_refusals():
 
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
          case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open, case_gen,
-         case_fixture, case_refusals]
+         case_gen_contexts, case_gen_short, case_fixture, case_refusals]
 
 
 def self_test():

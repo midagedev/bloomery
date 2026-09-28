@@ -225,6 +225,7 @@ fn accessors_read_their_rows() {
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
     assert_eq!(unset.mtp_head_rows(), None);
+    assert_eq!(unset.route_trace(), None);
     assert!(!unset.check_finite());
     assert_eq!(
         unset.host(),
@@ -250,6 +251,7 @@ fn accessors_read_their_rows() {
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (MTP_HEAD_ROWS, "/data/rows.txt"),
+            (ROUTE_TRACE, "/data/trace"),
             (CHECK_FINITE, "1"),
             (HOST_POPULATE, "0"),
             (HOST_LOCK, "1"),
@@ -272,6 +274,7 @@ fn accessors_read_their_rows() {
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
     assert_eq!(set.mtp_head_rows(), Some(Path::new("/data/rows.txt")));
+    assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(
         set.host(),
@@ -299,6 +302,7 @@ fn accessors_read_their_rows() {
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,
+            ROUTE_TRACE,
             CHECK_FINITE,
             HOST_POPULATE,
             HOST_LOCK,

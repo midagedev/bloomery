@@ -915,6 +915,11 @@ impl Body {
         &self.hybrid
     }
 
+    /// The host tier, for a caller that attaches or marks its route trace.
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<Ds41Host> {
+        &mut self.hybrid
+    }
+
     /// The rows the last [`ChainBody::decode_input`] read for its step: its
     /// ids at once, its engram rows once they are delivered (by the replay's
     /// service, an eager chain, or the next step's host half).

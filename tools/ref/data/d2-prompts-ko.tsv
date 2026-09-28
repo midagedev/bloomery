@@ -1,0 +1,22 @@
+# D2 chat prompts, Korean, written by the lead 2026-09-28 (in-house text; ids may be kept and published)
+# columns: id	domain	split	prompt  (split: learn | held — alternating within each domain)
+ko-01	writing	learn	비 오는 날 오래된 서점에서 일하는 주인공이 책 사이에 끼워진 편지를 발견하는 짧은 이야기를 써 줘.
+ko-02	writing	held	할머니 댁 부엌의 냄새를 떠올리게 하는 수필을 한 단락으로 써 줘.
+ko-03	writing	learn	처음 이사한 동네에서 이웃과 인사를 트는 과정을 담은 짧은 콩트를 써 줘.
+ko-04	writing	held	겨울 바다를 주제로 네 줄짜리 시를 두 편 지어 줘.
+ko-05	writing	learn	회사 동료의 송별회에서 읽을 짧은 인사말을 따뜻한 말투로 써 줘.
+ko-06	qa	held	광합성이 무엇인지 중학생이 이해할 수 있게 설명해 줘.
+ko-07	qa	learn	조선 시대 과거 시험은 어떤 절차로 치러졌는지 알려 줘.
+ko-08	qa	held	금리가 오르면 전세와 월세 시장에 어떤 영향이 생기는지 정리해 줘.
+ko-09	qa	learn	김치가 발효될 때 맛이 변하는 이유를 쉽게 설명해 줘.
+ko-10	qa	held	태풍과 허리케인은 무엇이 같고 무엇이 다른지 알려 줘.
+ko-11	advice	learn	아침에 일찍 일어나는 습관을 들이고 싶은데, 현실적인 방법을 단계별로 알려 줘.
+ko-12	advice	held	처음 달리기를 시작하는 사람이 무릎을 다치지 않으려면 무엇을 조심해야 할까?
+ko-13	advice	learn	팀장이 된 지 한 달 됐는데 회의가 자꾸 길어져. 회의를 짧게 끝내는 요령을 알려 줘.
+ko-14	advice	held	부모님께 스마트폰 사용법을 가르쳐 드릴 때 좋은 방법이 있을까?
+ko-15	code	learn	파이썬에서 리스트와 튜플의 차이를 예제 코드와 함께 설명해 줘.
+ko-16	code	held	자바스크립트의 비동기 처리에서 async와 await가 어떻게 동작하는지 예제로 보여 줘.
+ko-17	code	learn	SQL에서 LEFT JOIN과 INNER JOIN의 차이를 표 두 개로 예를 들어 설명해 줘.
+ko-18	code	held	깃에서 실수로 커밋한 파일을 되돌리는 방법을 상황별로 정리해 줘.
+ko-19	summary	learn	다음 문장을 한 줄로 요약해 줘: 도시의 오래된 골목들이 재개발로 사라지면서, 그곳에서 수십 년 동안 장사를 해 온 상인들은 새로운 자리를 찾아야 하는 처지가 되었고, 주민들은 익숙한 풍경을 잃는 아쉬움을 이야기한다.
+ko-20	summary	held	다음 내용을 세 가지 요점으로 정리해 줘: 재택근무는 출퇴근 시간을 줄여 주지만, 동료와의 소통이 줄고 일과 생활의 경계가 흐려질 수 있다. 그래서 많은 회사가 주 2~3일 출근하는 혼합 근무를 택하고 있다.

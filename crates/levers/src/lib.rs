@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, SPIN,
-    STEP_STATS, THREADS,
+    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, ROUTE_TRACE,
+    SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -700,6 +700,17 @@ impl Levers {
             None => None,
             Some(Value::Path(p)) => Some(p),
             v => panic!("{MTP_HEAD_ROWS} holds {v:?}, not a path"),
+        }
+    }
+
+    /// `BLOOMERY_ROUTE_TRACE`: the route trace's new directory; `None` unset
+    /// (no trace).
+    #[must_use]
+    pub fn route_trace(&self) -> Option<&Path> {
+        match &self.entry(ROUTE_TRACE).value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{ROUTE_TRACE} holds {v:?}, not a path"),
         }
     }
 

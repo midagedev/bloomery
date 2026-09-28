@@ -1,0 +1,30 @@
+# D2 chat prompts, English chat and code, written by the lead 2026-09-28 (in-house text; ids may be kept and published)
+# columns: id	genre	split	prompt  (split: learn | held — alternating within each genre)
+en-01	en	learn	Write a short story about a night-shift nurse who hears a patient's radio playing a song from her childhood.
+en-02	en	held	Explain to a ten-year-old why the sky is blue and sunsets are red.
+en-03	en	learn	I have a job interview for a junior data analyst role tomorrow. What should I prepare tonight?
+en-04	en	held	Summarize the main causes of the French Revolution in a few paragraphs.
+en-05	en	learn	Write a polite email to my landlord asking to fix a leaking kitchen faucet.
+en-06	en	held	What are the pros and cons of electric cars compared with hybrids for someone who drives 60 km a day?
+en-07	en	learn	Plan a three-day trip to Lisbon for two people who like food and walking, on a moderate budget.
+en-08	en	held	Describe how vaccines train the immune system, without using jargon.
+en-09	en	learn	Write a limerick about a cat who thinks it runs the office.
+en-10	en	held	My sourdough bread comes out dense. What are the likely causes and how do I fix them?
+en-11	en	learn	Compare stoicism and epicureanism: what did each school think a good life was?
+en-12	en	held	Give me a weekly beginner workout plan that needs no equipment.
+en-13	en	learn	Explain what inflation is and why central banks raise interest rates to fight it.
+en-14	en	held	Write the opening scene of a mystery novel set in a snowed-in mountain hotel.
+code-01	code	learn	Write a Python function that returns the n-th Fibonacci number in O(log n) time, with a short explanation.
+code-02	code	held	In Rust, what is the difference between Box, Rc and Arc? Show a small example of each.
+code-03	code	learn	Write a SQL query that finds, for each customer, their most recent order and its total, from tables customers(id, name) and orders(id, customer_id, created_at, total).
+code-04	code	held	Explain the difference between a process and a thread, and when to use each in Python.
+code-05	code	learn	Write a bash script that finds the ten largest files under a directory and prints their sizes in human-readable form.
+code-06	code	held	Implement a thread-safe LRU cache in Go with Get and Put methods.
+code-07	code	learn	Here is a JavaScript function that sometimes returns undefined: function first(xs) { xs.forEach(x => { if (x > 0) return x; }); }. Explain the bug and fix it.
+code-08	code	held	Write a C function that reverses a singly linked list in place, and explain its complexity.
+code-09	code	learn	How does git rebase differ from git merge? When would you choose each?
+code-10	code	held	Write a TypeScript type that makes every property of an object type optional and readonly, recursively.
+code-11	code	learn	Write unit tests with pytest for a function parse_duration("1h30m") -> seconds, covering edge cases.
+code-12	code	held	Explain what a race condition is and show one in C++ with std::thread, then fix it.
+code-13	code	learn	Write a Python script that reads a CSV of transactions and prints the monthly totals per category.
+code-14	code	held	What does the CAP theorem say, and how do real databases trade off consistency and availability?

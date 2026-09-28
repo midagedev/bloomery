@@ -40,6 +40,14 @@
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
 //!
+//! `BLOOMERY_ROUTE_TRACE=<dir>` writes a route trace
+//! (`bloomery_gpu::host::route_trace`) into `<dir>`, which `main` creates as
+//! a new directory before the load: every position the engine runs, each
+//! layer's routed ids and the slot each ran in, a `call` row per prompt call.
+//! It needs the step feed (`BLOOMERY_PREFILL=steps`) and no draft, and is
+//! refused by name otherwise. Its `# build` names this binary's version; the
+//! commit is `/props`' `engine.version`.
+//!
 //! The levers it acts on (`serve_levers::ACTS_ON`) are parsed once, at
 //! `main` (`bloomery_levers::at_main`), which refuses by name a lever set
 //! outside them and a `BLOOMERY_*` name no registry row names; `--levers`
@@ -119,6 +127,7 @@ mod drive {
 
     use app::arch::deepseek41::{CardDraft, Ds41Cfg};
     use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
     use bloomery_gpu_deepseek41::draft::DraftBody;
@@ -245,6 +254,7 @@ mod drive {
         let model = model_props(&split, &inputs.model);
         let tier_batch = place::tier_batch(a.place, &inputs.hp);
         drop(split);
+        let trace = route_trace(&levers, &cfg, draft, a.place, &path, &inputs)?;
         let (card, placement, headroom) =
             print_plan(&inputs, a.place, reserve, tier_batch, a.ctx, &cfg.place)?;
         let cache_ram = a.cache_ram.unwrap_or_else(|| {
@@ -273,6 +283,7 @@ mod drive {
             draft_file,
             reserve,
             tier_batch,
+            trace,
         };
         let engine = Ds41Engine::spawn(
             move || V41::open(open),
@@ -298,6 +309,68 @@ mod drive {
             .w("addr", server.local_addr()?)
             .eprint();
         Ok(server.run())
+    }
+
+    /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
+    /// now, before the load; refused by name under the batched feed or a
+    /// draft, which it does not record.
+    fn route_trace(
+        levers: &bloomery_levers::Levers,
+        cfg: &body::OpenCfg,
+        draft: Draft,
+        place: Place,
+        path: &Path,
+        inputs: &PlanInputs,
+    ) -> Result<Option<RouteTrace>, GateError> {
+        let Some(dir) = levers.route_trace() else {
+            return Ok(None);
+        };
+        if cfg.body.prefill != body::PrefillMode::Steps {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records the step feed: set BLOOMERY_PREFILL=steps \
+                        (the batched prompt call routes a CED layer only at the positions a later \
+                        reader needs)"
+                    .into(),
+            );
+        }
+        if draft != Draft::Off {
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records one-row steps; BLOOMERY_DRAFT={} runs two-row passes",
+                draft.name()
+            )
+            .into());
+        }
+        let hp = &inputs.hp;
+        let yes = |b: bool| if b { "on" } else { "off" }.to_owned();
+        let header = TraceHeader {
+            model: path.to_path_buf(),
+            arch: "deepseek41".to_owned(),
+            build: format!(
+                "bloomery-serve-ds41 {} (the commit is /props engine.version)",
+                env!("CARGO_PKG_VERSION")
+            ),
+            n_expert: hp.experts.n_expert,
+            n_used: hp.experts.n_used,
+            n_layer: hp.n_layer,
+            extra: vec![
+                ("placement".to_owned(), place.name().to_owned()),
+                (
+                    "hot_list".to_owned(),
+                    levers
+                        .hot_list()
+                        .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
+                ),
+                (
+                    "card_budget".to_owned(),
+                    levers
+                        .card_budget_bytes()
+                        .map_or_else(|| "each card's own".to_owned(), |b| b.to_string()),
+                ),
+                ("r8".to_owned(), yes(cfg.body.host.r8)),
+                ("prefill".to_owned(), cfg.body.prefill.name().to_owned()),
+            ],
+        };
+        Ok(Some(RouteTrace::create(dir, header)?))
     }
 
     /// The plan the engine is about to load under the placement's `levers`
@@ -354,6 +427,8 @@ mod drive {
         reserve: Option<u64>,
         /// The tier's prompt-batch bytes on the placement's tier card.
         tier_batch: Option<TierBatchBytes>,
+        /// The route trace, attached once the session is ready.
+        trace: Option<RouteTrace>,
     }
 
     /// The draft the seat serves, verified by the pair pass.
@@ -406,7 +481,8 @@ mod drive {
         /// lines), the draft `a.draft` names on it (its `load draft=dspark`
         /// line before the capture, the pair pass's capture after it), on
         /// the calling thread, pinned to the dispatcher's cpu slot when asked.
-        fn open(a: SeatArgs) -> Result<V41, GateError> {
+        fn open(mut a: SeatArgs) -> Result<V41, GateError> {
+            let trace = a.trace.take();
             let pinned = a.pin_main && threads::pool().pin_caller();
             let t = Instant::now();
             let file =
@@ -435,6 +511,13 @@ mod drive {
                 None => None,
             };
             let mut s = loaded.ready(&mut log)?;
+            if let Some(t) = trace {
+                s.model_mut()
+                    .body_parts(WHAT)?
+                    .2
+                    .hybrid_mut()
+                    .attach_route_trace(t)?;
+            }
             let draft = match (a.draft, spark) {
                 (Draft::Off, _) => Served::Off,
                 (Draft::Lookup, _) => Served::Lookup(

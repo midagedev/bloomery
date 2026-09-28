@@ -217,6 +217,7 @@ echo "${mrt##*$'\n'}"
 # that grows one is listed here, and the comparison below fails on one that is not.
 selftests=(
   "tools/bloomery/manifest.py --self-test"
+  "tools/bloomery/route_trace.py --self-test"
   "tools/flow/ds41_prefill.py --self-test"
   "tools/flow/pplb.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
@@ -229,6 +230,7 @@ selftests=(
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-hotlist.py --self-test"
   "tools/ref/router-residency.py --self-test"
+  "tools/ref/route-trace-chat.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
   "tools/check-comment-only.py --self-test"
