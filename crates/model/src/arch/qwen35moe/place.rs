@@ -152,7 +152,9 @@ pub fn machine(card: CardSpec, layers: usize) -> Machine {
             layers: 0..layers,
             head: true,
             token_embedding: true,
+            reserves: Vec::new(),
         }],
+        tiers: Vec::new(),
         host: host(),
     }
 }
