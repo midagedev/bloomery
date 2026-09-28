@@ -1,0 +1,35 @@
+# Thread spawns in crates/*/src outside threads::helper::spawn_helper (tools/check-arch.sh, axis 5).
+# A thread inherits its spawner's affinity mask; a spawn from a thread pinned to one cpu
+# (threads::Pool::pin_caller, a pool worker) shares that cpu. Each line: a file, the spawns
+# it holds, and why they may stay plain. The count is exact: a file with more fails, and so
+# does an entry above its file's count.
+crates/threads/src/helper.rs 1 the owner: spawn_helper itself
+crates/threads/src/lib.rs 1 the pool's workers: each pins itself, and pool() builds them before pin_caller pins its caller
+crates/gpu-gates/src/bind.rs 2 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread
+crates/serve/src/api.rs 3 the HTTP server's threads, spawned by the serve main or its accept loop, never pinned
+crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those never pin
+crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
+crates/model/src/arch/deepseek41/fixture.rs 1 the gate fixture's builder, a gate-side tool
+crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu
+crates/model/src/r8file.rs 2 PENDING (triage): the r8 repack and check at load; available_parallelism reads the pinned caller's mask, so one thread
+crates/model/src/bin/bench_v41_host.rs 1 a bench binary
+crates/qdot/src/bin/qdot-rate-mt.rs 2 a rate probe binary
+crates/gpu-gates/src/bin/exact_ref.rs 1 a referee binary, never pinned
+crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 4 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_chain_glue.rs 2 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_engram.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_index.rs 2 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_moe.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_residency.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_woa.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_dspark_experts.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_dspark_hc.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_gemm.rs 2 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_linear.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_qwen35moe_attn.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_qwen35moe_moe.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_qwen3moe_flash.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_swap.rs 1 a gate binary, never pinned (its placement clause pins a thread only around a machine's build)
+crates/gpu-gates/src/bin/gate_vision_encoder.rs 1 a gate binary, never pinned

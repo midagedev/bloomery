@@ -3,7 +3,7 @@
 //! Endpoints: `POST /v1/chat/completions`, `POST /completion`, `POST /tokenize`,
 //! `POST /detokenize`, `POST /apply-template`, `GET /v1/models`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/0?action=save|restore|erase`,
-//! `GET /metrics`. JSON field names, defaults and stream framing are
+//! `GET /metrics`, and `POST /residency/reset` (bloomery's own). JSON field names, defaults and stream framing are
 //! llama-server's; see `api` for the one-slot model.
 
 mod api;
@@ -26,8 +26,8 @@ pub use api::{
 };
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,
-    ModelProps, PlacementProps, Sampler, SamplerFactory, SamplingParams, Saved, SavedState,
-    StateError, Tokenizer,
+    ModelProps, PlacementProps, ResidencyReset, Sampler, SamplerFactory, SamplingParams, Saved,
+    SavedState, StateError, Tokenizer,
 };
 pub use mock::{DraftMock, MockEngine, MockTokenizer, ScriptedEngine};
 pub use template::{ChatTemplate, TemplateError};

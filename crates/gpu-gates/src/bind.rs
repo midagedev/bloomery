@@ -42,7 +42,7 @@ use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
-    PlacementProps, SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
+    PlacementProps, ResidencyReset, SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
 };
 
 use crate::GateError;
@@ -407,6 +407,8 @@ enum Cmd {
     Resume(Arc<dyn Saved>),
     /// Nothing: the reply carries the position the model stands at.
     Pos,
+    /// The residency back to its seed.
+    ResidencyReset,
 }
 
 /// What a reply carries besides its result.
@@ -421,6 +423,8 @@ enum Extra {
     /// A `Pass`'s buffer, holding its kept tokens on success, and what its
     /// draft proposed and kept.
     Pass(Vec<u32>, Drafted),
+    /// A `ResidencyReset`'s report; `None` for a seat with no residency.
+    Residency(Option<ResidencyReset>),
 }
 
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
@@ -483,6 +487,12 @@ pub trait Seat: 'static {
     /// nothing.
     fn props(&self, p: EngineProps) -> EngineProps {
         p
+    }
+    /// The residency back to its seed, the sequence where it stands, and
+    /// its report (the seat prints its record); `None`, the default, for a
+    /// seat with no residency.
+    fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
+        Ok(None)
     }
     /// Prints what the server's prompt cache did, as the binary's records.
     fn note(note: &CacheNote)
@@ -587,6 +597,14 @@ impl Ds41Engine {
                             Ok(s) => (Ok(0), None, Extra::Saved(s)),
                             Err(e) => (
                                 Err(format!("snapshot at position {}: {e}", g.pos())),
+                                None,
+                                Extra::None,
+                            ),
+                        },
+                        Cmd::ResidencyReset => match g.residency_reset() {
+                            Ok(r) => (Ok(0), None, Extra::Residency(r)),
+                            Err(e) => (
+                                Err(format!("residency reset at position {}: {e}", g.pos())),
                                 None,
                                 Extra::None,
                             ),
@@ -763,8 +781,14 @@ fn serve_cmd<S: Seat>(
             .rollback(pos)
             .map(|()| 0)
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
-        Cmd::Keep(_) | Cmd::Splits { .. } | Cmd::Save | Cmd::Resume(_) | Cmd::Pass { .. } => Err(
-            "a keep, split, pass, save or resume reached the step loop; the engine thread \
+        Cmd::Keep(_)
+        | Cmd::Splits { .. }
+        | Cmd::Save
+        | Cmd::Resume(_)
+        | Cmd::Pass { .. }
+        | Cmd::ResidencyReset => Err(
+            "a keep, split, pass, save, resume or residency reset reached the step loop; the \
+             engine thread \
              answers it"
                 .to_owned(),
         ),
@@ -835,6 +859,17 @@ impl Engine for Ds41Engine {
 
     fn reset(&mut self) -> Result<(), EngineError> {
         self.link.call(Cmd::Reset).map(|_| ())
+    }
+
+    fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
+        let reply = self.link.ask(Cmd::ResidencyReset)?;
+        reply.result.map_err(EngineError)?;
+        match reply.extra {
+            Extra::Residency(r) => Ok(r),
+            _ => Err(EngineError(
+                "the engine thread answered a residency reset with no report".to_owned(),
+            )),
+        }
     }
 
     /// The body's rule, asked on the engine thread (`spawn`'s `keep`). A

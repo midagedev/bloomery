@@ -259,16 +259,19 @@ mod drive {
     use app::arch::deepseek41::Ds41Cfg;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS};
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
+    use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::generate::{Place, mode_name};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
-        HOST_POPULATE, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, STEP_STATS,
+        HOST_POPULATE, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
+        STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -613,6 +616,7 @@ mod drive {
         HOST_LOCK,
         CARD_DONTNEED,
         R8,
+        RESIDENCY,
     ];
 
     pub fn run() -> Result<(), GateError> {
@@ -622,6 +626,19 @@ mod drive {
         let draft = Draft::from_levers(&levers)?;
         let check_finite = finite_lever(&a, draft, &levers)?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
+        if cfg.body.residency != Residency::Off && (a.place == Place::Gate || check_finite) {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={} {}: the residency machine runs under --place a and bp, \
+                 on the engine's own passes",
+                levers.residency(),
+                if check_finite {
+                    "beside BLOOMERY_CHECK_FINITE=1"
+                } else {
+                    "under --place gate"
+                }
+            )
+            .into());
+        }
         let batched = !check_finite && cfg.body.prefill == body::PrefillMode::Batch;
         if a.plan {
             refuse_plan(&a, draft, batched)?;
@@ -703,6 +720,7 @@ mod drive {
             t,
             pin_main,
             pinned,
+            residency: levers.residency(),
             hp: None,
             ctx_max: 0,
             call: None,
@@ -729,6 +747,9 @@ mod drive {
         // the batch's buffers made before it, so the timed feed allocates
         // nothing.
         let mut s = loaded.ready(&mut log)?;
+        if cfg.body.residency != Residency::Off {
+            s.model_mut().body_parts("generate_ds41")?.2.log_residency();
+        }
         let mut check = if check_finite {
             let (gpu, w, _) = s.model_mut().body_parts("generate_ds41")?;
             let head = Head::new(gpu, w, hp.rms_eps)?;
@@ -752,9 +773,14 @@ mod drive {
         if draft == Draft::Off && !check_finite {
             return s
                 .arms(&runs, |s, i, r| {
+                    if let Some(c) = s.take_cleared() {
+                        record::residency_reset(&c).print();
+                    }
                     let view = pre.arm(i, r)?;
                     let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), s)?;
-                    decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {})
+                    let ran = decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {});
+                    print_passes(s)?;
+                    ran
                 })
                 .map_err(|f| Box::new(f) as GateError);
         }
@@ -780,18 +806,32 @@ mod drive {
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(Lookup::new(), &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
-                decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()))
+                let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()));
+                print_passes(&mut s)?;
+                ran
             }
             (Draft::Dspark, Some(d), _) => {
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(d, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
-                decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
+                let ran = decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
                     Ok(d.draft_mut().check_fault()?)
-                })
+                });
+                print_passes(&mut s)?;
+                ran
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
         }
+    }
+
+    /// The `residency pass` records of the boundaries since the last print,
+    /// after the run's timed window: nothing prints between two timed steps.
+    fn print_passes(s: &mut Session<Body>) -> Result<(), GateError> {
+        let (_, _, b) = s.model_mut().body_parts("generate_ds41")?;
+        for (kind, r) in b.take_residency_passes() {
+            record::residency_pass_of(kind, &r).print();
+        }
+        Ok(())
     }
 
     /// One arm of the run: its arguments (its own `-n`), its fed ids, how
@@ -1268,6 +1308,8 @@ mod drive {
         t: Instant,
         pin_main: bool,
         pinned: bool,
+        /// `BLOOMERY_RESIDENCY`'s word, for the `residency host` record.
+        residency: &'static str,
         /// The hyperparameters the plan was made from.
         hp: Option<Hparams>,
         /// The plan's `ctx_max`, once planned.
@@ -1288,6 +1330,10 @@ mod drive {
             let a = self.a;
             let hot_list = self.cfg.place.hot.as_ref().map_or("none", HotList::path);
             record::plan(place, machine, plan, hot_list).print();
+            let residency = self.cfg.body.residency;
+            if let Some(pool) = swap::churn(plan, 0, residency)? {
+                record::residency_host(self.residency, &pool, plan).print();
+            }
             // The caches hold the plan's ctx_max positions, the value the
             // model is loaded with; --ctx only asks for it.
             let ctx_max = usize::try_from(plan.ctx_max).map_err(|_| {
@@ -1373,6 +1419,9 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.print();
                 }
+            }
+            for h in threads::helper::helpers() {
+                record::helper(&h.name, h.asked, h.pinned, h.cpus).print();
             }
             Ok(())
         }
@@ -1616,7 +1665,8 @@ mod drive {
         fn begin(&mut self, t: &Session<Body>) -> Result<(), GateError> {
             if self.stats {
                 self.probes.reserve_exact(self.n_gen);
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1630,7 +1680,8 @@ mod drive {
         ) -> Result<(), GateError> {
             self.rows.push((c.pos, tokens[0], wall.as_secs_f64() * 1e3));
             if self.stats {
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1802,7 +1853,8 @@ mod drive {
         fn begin(&mut self, t: &Session<Body>) -> Result<(), GateError> {
             if self.stats {
                 self.probes.reserve_exact(self.n_gen);
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1820,7 +1872,8 @@ mod drive {
             self.passes
                 .push((PassKind::of(c), wall.as_secs_f64() * 1e3));
             if self.stats {
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1949,6 +2002,9 @@ mod drive {
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
+        /// The go waits of the services since the probe before.
+        gap: bloomery_gpu::host::step::GapSummary,
+        params_ns: u64,
         eng: bloomery_gpu_deepseek41::chain::glue::EngramStats,
         eng_helper: Option<Option<usize>>,
         majflt: u64,
@@ -1957,9 +2013,14 @@ mod drive {
     }
 
     impl Probe {
-        fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
+        fn read(m: &Deepseek41Model, prev: Option<&Probe>) -> Result<Probe, GateError> {
             let body = m.body("generate_ds41")?;
             let hybrid = body.hybrid().stats();
+            let gap = match prev {
+                Some(p) => body.hybrid().gap_summary(p.hybrid.gaps, hybrid.gaps)?,
+                None => bloomery_gpu::host::step::GapSummary::default(),
+            };
+            let params_ns = body.params_ns();
             let eng = body.step_rows().engram_stats();
             let eng_helper = body.step_rows().helper_cpu();
             let vram_free = u64::try_from(m.gpu().mem_info()?.0)?;
@@ -1975,6 +2036,8 @@ mod drive {
             }
             Ok(Probe {
                 hybrid,
+                gap,
+                params_ns,
                 eng,
                 eng_helper,
                 majflt: u64::try_from(ru.ru_majflt)?,
@@ -1995,7 +2058,11 @@ mod drive {
     /// `eng_wait_us` the step thread's time in the engram read (the wait on
     /// the helper, or the direct copy), `eng_helper_us` the helper's own and
     /// `eng_classify_us` the time the warm/cold count itself took (inside
-    /// `eng_wait_us` with the helper on, outside it off). `overlap` is the
+    /// `eng_wait_us` with the helper on, outside it off). `gap_min_us`,
+    /// `gap_p50_us` and `gap_max_us` are the step's go waits, one per
+    /// service: the card's time from the host's signal to the next go (the
+    /// lower median); `params_us` the host time in the step's synchronous
+    /// parameter copy. `overlap` is the
     /// step's host slot ids of a two-row pass's row 1 that row 0 also sent
     /// to the host at the same layer, `union` the distinct host slots of the
     /// step's rows per layer, summed (`host_slots − overlap`: a one-row step
@@ -2055,6 +2122,10 @@ mod drive {
                 .f("eng_wait_us", wait_us)
                 .f("eng_helper_us", helper_ns as f64 / 1e3)
                 .f("eng_classify_us", classify_ns as f64 / 1e3)
+                .f("gap_min_us", w[1].gap.min_ns as f64 / 1e3)
+                .f("gap_p50_us", w[1].gap.p50_ns as f64 / 1e3)
+                .f("gap_max_us", w[1].gap.max_ns as f64 / 1e3)
+                .f("params_us", (w[1].params_ns - w[0].params_ns) as f64 / 1e3)
                 .print();
             if i > warm {
                 waits.push(wait_us);

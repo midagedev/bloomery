@@ -107,6 +107,7 @@ pub use leg::{BatchLeg, StepLeg};
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
+use crate::tensor::DeviceTensor;
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use model::placement::Machine;
@@ -235,6 +236,8 @@ pub struct HybridStats {
     /// columns they carried, summed. Both count in `served` too.
     pub cols_served: u64,
     pub cols_cols: u64,
+    /// Go waits written ([`HostTier::gap_summary`] of a span of them).
+    pub gaps: u64,
     /// Batch services ([`HostTier::serve_batch`]): layers served, the columns
     /// they carried, the host slots those columns listed and the service
     /// computed, and the host wall time of the union calls (ns), summed. None
@@ -266,6 +269,65 @@ pub struct Refusal {
     pub layer: usize,
     /// Where and what: `row r: …` of a step, `column j of n: …` of a batch.
     pub detail: String,
+}
+
+/// The bound on a host wait for a stream to drain at a quiet point (a
+/// residency reset, a tier's reset): the same bound as the residency
+/// machine's own drain of its copy stream.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Wait, polling, until `stream` has drained; past [`DRAIN_DEADLINE`] the
+/// error names the wait `what`.
+fn drain_within(stream: &CudaStream, what: &'static str) -> Result<(), GpuError> {
+    let t0 = Instant::now();
+    while !stream_idle(stream)? {
+        if t0.elapsed() > DRAIN_DEADLINE {
+            return Err(GpuError::protocol(
+                what,
+                format!(
+                    "the stream did not drain in {:?} (deadline {DRAIN_DEADLINE:?})",
+                    t0.elapsed()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    Ok(())
+}
+
+/// What a residency pass was, as its caller names it when it keeps its rows
+/// ([`HostTier::keep_rows`]); the `residency pass` record's `pass` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassKind {
+    /// No pass was open at the boundary: the first after the load or a reset.
+    None,
+    /// A decode step, one row kept.
+    Step,
+    /// A verify pass of two rows, its accepted rows kept.
+    Pair,
+    /// A prompt call, one pass whose rows are not counted: 0 kept.
+    Prompt,
+    /// A pass its caller never kept (a failed pass, a verify a reset drops
+    /// before its commit): 0 kept, its noted ids forgotten.
+    Abandoned,
+    /// A pass ended by a driver of the machine itself, not an engine's pass
+    /// caller (`gate_swap`'s synthetic stacks).
+    Driver,
+}
+
+impl PassKind {
+    /// The record's word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            PassKind::None => "none",
+            PassKind::Step => "step",
+            PassKind::Pair => "pair",
+            PassKind::Prompt => "prompt",
+            PassKind::Abandoned => "abandoned",
+            PassKind::Driver => "driver",
+        }
+    }
 }
 
 /// Why a service poisoned the tier ([`HostTier::last_poison`]).
@@ -524,6 +586,13 @@ pub struct HostTier<H> {
     /// Tier layers the host has served since load (wrapping): a tier whose
     /// progress is behind it holds the stage card at a wait.
     tier_goes: u32,
+    /// The residency machine over the stage card's slots, once started
+    /// ([`HostTier::start_swap`]), and the rows the open pass keeps.
+    swap: Option<swap::SwapMachine>,
+    swap_kept: Option<(usize, PassKind)>,
+    /// The stage card's copy of the map the machine writes: after `swap`, so
+    /// it outlives the machine that holds its address.
+    swap_view: Option<Arc<DeviceTensor<u32>>>,
 }
 
 impl<H: HostExperts> HostTier<H> {
@@ -546,7 +615,108 @@ impl<H: HostExperts> HostTier<H> {
             port: None,
             tier: None,
             tier_goes: 0,
+            swap: None,
+            swap_kept: None,
+            swap_view: None,
         })
+    }
+
+    /// Run the residency machine over this tier's slot map
+    /// ([`swap::SwapMachine::new`]): `view` is the stage card's copy of the
+    /// map, which the chain reads and the machine writes, kept alive here for
+    /// the machine's life; the step port notes its routed ids into the
+    /// machine's tally and holds its staging window open while the pool waits
+    /// for a go. The machine frees each layer's spare slots now, so every
+    /// piece that sizes itself from the map's capacity is made first.
+    /// Load-time only; a second machine is refused by name.
+    pub fn start_swap(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        view: Arc<DeviceTensor<u32>>,
+        source: Arc<dyn swap::SwapSource>,
+        cfg: swap::MachineCfg,
+    ) -> Result<(), GpuError> {
+        if self.swap.is_some() {
+            return Err(GpuError::state(
+                "HostTier::start_swap",
+                "a tier without a machine",
+            ));
+        }
+        let machine =
+            swap::SwapMachine::new(ctx, stream, &mut self.slots, view.buf(), source, cfg)?;
+        self.step.tally = machine.tally();
+        self.step.window = Some(machine.window());
+        self.swap = Some(machine);
+        self.swap_view = Some(view);
+        self.swap_kept = None;
+        Ok(())
+    }
+
+    /// The residency machine, once started.
+    #[must_use]
+    pub fn swap(&self) -> Option<&swap::SwapMachine> {
+        self.swap.as_ref()
+    }
+
+    /// The pass that just ran, a `kind`, keeps its first `kept` rows (a
+    /// step 1, a verify its accepted rows, a prompt call 0): what the next
+    /// boundary folds. Nothing without a machine.
+    pub fn keep_rows(&mut self, kept: usize, kind: PassKind) {
+        if self.swap.is_some() {
+            self.swap_kept = Some((kept, kind));
+        }
+    }
+
+    /// The residency boundary before a pass on `stream`
+    /// ([`swap::SwapMachine::boundary`]): the open pass ends with its kept
+    /// rows, then the machine lands and plans; its report, with the kind of
+    /// the pass it ended ([`PassKind::None`] when none was open). `None`
+    /// without a machine; a pass that ran with no kept count is refused by
+    /// name.
+    pub fn swap_boundary(
+        &mut self,
+        stream: &CudaStream,
+    ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Ok(None);
+        };
+        let kept = self.swap_kept.take();
+        let mut kind = PassKind::None;
+        if m.pass_open() {
+            let (rows, of) = kept.ok_or(GpuError::state(
+                "HostTier::swap_boundary",
+                "the last pass's kept rows (HostTier::keep_rows)",
+            ))?;
+            m.end_pass(&mut self.step.tally, rows)?;
+            kind = of;
+        }
+        let report = m.boundary(stream, &mut self.slots)?;
+        Ok(Some((kind, report)))
+    }
+
+    /// The residency back to its seed at a quiet boundary on `stream`
+    /// ([`swap::SwapMachine::reset`]), the tally cleared and no pass open;
+    /// its report. `None` without a machine.
+    pub fn swap_reset(
+        &mut self,
+        stream: &CudaStream,
+    ) -> Result<Option<swap::ResetReport>, GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Ok(None);
+        };
+        drain_within(
+            stream,
+            "HostTier::swap_reset: the engine stream before the reset",
+        )?;
+        let r = m.reset(stream, &mut self.slots)?;
+        drain_within(
+            stream,
+            "HostTier::swap_reset: the engine stream after the reset",
+        )?;
+        self.step.tally.clear();
+        self.swap_kept = None;
+        Ok(Some(r))
     }
 
     /// Hang `tier` under the host tier, on `stage`, the card the chain
@@ -938,13 +1108,14 @@ impl<H: HostExperts> HostTier<H> {
     /// yet to take back.
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         const WHAT: &str = "Hybrid::reset";
+        self.abandon_pass();
         if !self.health.poisoned {
             if !stream_idle(stream)? {
                 return Ok(());
             }
             let w = self.words();
             if let Some(t) = self.tier.as_mut() {
-                t.gpu().stream().synchronize()?;
+                drain_within(t.gpu().stream(), "Hybrid::reset: the expert tier's stream")?;
                 if !t.at_rest() {
                     return Err(GpuError::protocol(
                         WHAT,
@@ -1018,6 +1189,20 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
+    /// A pass its caller never kept (a failed pass, a verify the reset
+    /// drops before its commit) keeps no row: its noted ids are forgotten and
+    /// the next boundary ends it at 0 rows. A kept count already given
+    /// stands.
+    fn abandon_pass(&mut self) {
+        if let Some(m) = &self.swap
+            && m.pass_open()
+            && self.swap_kept.is_none()
+        {
+            self.step.tally.clear();
+            self.swap_kept = Some((0, PassKind::Abandoned));
+        }
+    }
+
     /// The boundary the chain enqueues its handoffs and waits on.
     #[must_use]
     pub fn boundary(&self) -> &Boundary {
@@ -1048,6 +1233,13 @@ impl<H: HostExperts> HostTier<H> {
         &self.step
     }
 
+    /// The go waits of step services `from..to` (counts of
+    /// [`HybridStats::gaps`]): the card's time between the host's signal and
+    /// the next go, per service. No allocation.
+    pub fn gap_summary(&self, from: u64, to: u64) -> Result<step::GapSummary, GpuError> {
+        self.step.gap_summary(from, to)
+    }
+
     /// What the host side has done since load: the step port's, the batch
     /// service's and the tier's own counters, as one view.
     #[must_use]
@@ -1068,6 +1260,7 @@ impl<H: HostExperts> HostTier<H> {
             host_calls: s.host_calls,
             cols_served: s.cols_served,
             cols_cols: s.cols_cols,
+            gaps: s.gaps,
             batch_served: b.batch_served,
             batch_cols: b.batch_cols,
             batch_host_slots: b.batch_host_slots,

@@ -197,6 +197,14 @@ if ! ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${ggt##*$'\n'}"
+# stack-watch.sh (gpu-gate.sh's BLOOMERY_GATE_STACKS): output passed through, a quiet stub dumped and ended by
+# its comm among the spawned command's descendants only, a quiet command with no such process left alone.
+if ! swt=$(bash "$(dirname "$0")/ref/stack-watch.sh" --self-test 2>&1); then
+  echo "$swt" >&2
+  echo "check-recipes: the stack-watch self-test failed" >&2
+  exit 1
+fi
+echo "${swt##*$'\n'}"
 # ptx-spill-check.sh's table reading (a process-substitution table read for every binary, a binary with no
 # pinned row) and its verdict lines, through a stub ptx-scan.sh on fixed scans, no build.
 if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then

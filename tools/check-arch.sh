@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 아키텍처 축 점검 — 맥에서 돈다(grep뿐, 빌드 없음). docs/arch-split.md 「검사」가 정본이다.
 #
-# 네 가지를 본다:
+# 다섯 가지를 본다:
 #   ① 아키텍처 디렉터리끼리 서로를 use 하지 않는다.
 #   ② blk.N.<name> 문자열 리터럴과 "<아키텍처>. 키 접두는 crates/*/src/arch/ 와
 #      tools/ref/models/ 밖에 없다 — 커널 파일은 모델 이름을 모른다(결정 6).
@@ -9,6 +9,8 @@
 #      crates/gguf 의 접근자는 저장소 쪽이라 허용한다.
 #   ④ 공유 파일(crates/*/src 가운데 arch/ 밖)은 아키텍처 모듈 경로(deepseek2:: · qwen3moe:: …)를 쓰지 않는다.
 #      Arch 를 구체 모델로 잇는 디스패치 지점만 파일과 구문(함수·타입 별칭·use 선언) 단위로 허용한다.
+#   ⑤ crates/*/src 의 스레드 spawn 은 threads::helper::spawn_helper 를 거친다 — 고정된 스텝 스레드가
+#      띄운 스레드는 그 한 CPU 마스크를 물려받는다. 예외는 tools/spawn-allow.txt 의 파일별 개수와 이유다.
 #   아키텍처 자신의 크레이트(crates/gpu-<arch>/src/)는 ①②④에서 그 아키텍처의 arch/ 로 센다.
 #   아키텍처 목록은 손으로 적지 않는다: crates/*/src/arch/ 아래 디렉터리 이름이 목록이다. 새 아키텍처는
 #   디렉터리가 생기는 순간 넷 모두의 대상이 된다.
@@ -40,7 +42,7 @@ fail=0
 report() { # report <번호> <설명> <위반 줄들>
   local n=$1 what=$2 hits=$3
   [ -n "$hits" ] || return 0
-  if [ "$n" != 1 ] && [ "$n" != 4 ] && [ "$PENDING" = 1 ]; then
+  if [ "$n" != 1 ] && [ "$n" != 4 ] && [ "$n" != 5 ] && [ "$PENDING" = 1 ]; then
     echo "warning: check-arch $n ($what) — $(printf '%s\n' "$hits" | wc -l | tr -d ' ') hit(s), pending the arch move:"
     printf '%s\n' "$hits" | sed 's/^/    /'
   else
@@ -172,6 +174,34 @@ while IFS= read -r hit; do
   [ "$inside" = 1 ] || outside="${outside:+$outside$'\n'}$hit"
 done <<< "$archpath"
 report 4 "architecture module path in a shared file, outside arch/ and the dispatch points" "$outside"
+
+# ⑤ A thread inherits its spawner's affinity mask: one spawned beside a step thread pinned to one cpu
+#    shares that cpu. Every spawn in crates/*/src (`thread::spawn(`, a Builder's or a scope's
+#    `.spawn(move`/`.spawn(|`) outside a comment is counted per file against tools/spawn-allow.txt
+#    (`<file> <count> <why>`); a file not listed, a file with more spawns than its entry, and an entry
+#    above its file's count (the list follows the tree down) each fail.
+ALLOW=tools/spawn-allow.txt
+spawned=$(grep -rnE 'thread::spawn\(|\.spawn\((move\b|\|)' crates/*/src --include='*.rs' 2>/dev/null \
+  | grep -vE '^crates/oxide-ice-unroll/' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | sort | uniq -c || true)
+spawn_bad=
+while read -r n f; do
+  [ -n "${f:-}" ] || continue
+  want=$(awk -v f="$f" '$1 == f { print $2 }' "$ALLOW")
+  if [ -z "$want" ]; then
+    spawn_bad="${spawn_bad:+$spawn_bad$'\n'}$f: $n spawn(s), not in $ALLOW (use threads::helper::spawn_helper)"
+  elif [ "$n" -gt "$want" ]; then
+    spawn_bad="${spawn_bad:+$spawn_bad$'\n'}$f: $n spawn(s), $ALLOW allows $want"
+  fi
+done <<< "$spawned"
+while read -r f want _; do
+  case "$f" in ''|'#'*) continue ;; esac
+  have=$(awk -v f="$f" '$2 == f { print $1 }' <<< "$spawned")
+  if [ "${have:-0}" -lt "$want" ]; then
+    spawn_bad="${spawn_bad:+$spawn_bad$'\n'}$ALLOW: $f allows $want spawn(s), the file holds ${have:-0} (lower the entry)"
+  fi
+done < "$ALLOW"
+report 5 "thread spawn outside threads::helper::spawn_helper" "$spawn_bad"
 
 if [ "$fail" = 1 ]; then
   echo "check-arch: failed" >&2

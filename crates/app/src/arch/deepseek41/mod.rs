@@ -9,6 +9,7 @@ pub use draft::CardDraft;
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::host::PassKind;
 use bloomery_gpu_deepseek41::body::{
     self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
 };
@@ -126,9 +127,10 @@ pub fn tier_of(machine: &Machine) -> Result<Option<TierOpen>, GpuError> {
 
 impl Prompt for Body {
     /// Under the body's `BLOOMERY_PREFILL`: the prompt call's batches
-    /// ([`body::prefill`]), or one step per id with one readback after the
-    /// last, the host tier's route trace told the call's positions first. A
-    /// batched call while a route trace is attached is refused by name.
+    /// ([`body::prefill`], one residency pass: [`call`]), or one step per id
+    /// with one readback after the last, the host tier's route trace told the
+    /// call's positions first. A batched call while a route trace is attached
+    /// is refused by name.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         match m.body(WHAT)?.prefill_mode() {
             PrefillMode::Batch if m.body(WHAT)?.hybrid().route_traced() => Err(GpuError::Shape {
@@ -137,7 +139,7 @@ impl Prompt for Body {
                          records the step feed (BLOOMERY_PREFILL=steps)"
                     .to_string(),
             }),
-            PrefillMode::Batch => body::prefill(m, ids),
+            PrefillMode::Batch => call(m, |m| body::prefill(m, ids)),
             PrefillMode::Steps => {
                 let pos = m.pos();
                 m.body_parts(WHAT)?
@@ -148,6 +150,21 @@ impl Prompt for Body {
             }
         }
     }
+}
+
+/// A prompt call `run` of `m` as one residency pass: its boundary before it
+/// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
+/// for the whole call, and 0 rows kept after it, whatever it returned — the
+/// residency rule counts decode rows only, and the batch service notes no
+/// id. Nothing more on a load with no residency machine.
+fn call<T>(
+    m: &mut GpuModel<Body>,
+    run: impl FnOnce(&mut GpuModel<Body>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    m.pass_boundary()?;
+    let r = run(m);
+    m.keep_rows(0, PassKind::Prompt);
+    r
 }
 
 impl Keep for Body {
@@ -191,7 +208,9 @@ impl Session<Body> {
         match self.model().body(WHAT)?.prefill_mode() {
             PrefillMode::Batch => {
                 let rows = FeatureRows { window, sink };
-                Ok(body::prefill_with(self.model_mut(), ids, Some(rows))?)
+                Ok(call(self.model_mut(), |m| {
+                    body::prefill_with(m, ids, Some(rows))
+                })?)
             }
             PrefillMode::Steps => {
                 let pos = self.pos();

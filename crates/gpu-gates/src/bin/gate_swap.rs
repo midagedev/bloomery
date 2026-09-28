@@ -83,7 +83,29 @@
 //!   the whole run, while flips evict other seed experts.
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
-//!   before the preparation ends.
+//!   before the preparation ends; the machine dropped then leaves its
+//!   staging thread to finish, never that thread's to free, and reports the
+//!   leak by name.
+//! - placement: a machine built on a thread pinned to one cpu runs its
+//!   staging thread off that cpu.
+//! - leaks: once every machine is dropped, the stall arm's is the one leak
+//!   reported.
+//! - queue: two arms, each a run to its last flip and a reset under a closed
+//!   window (as the engine's step port leaves it between passes) that
+//!   finish within [`QUEUE_BOUND`], every layer back at its seed. The light
+//!   arm's source adds [`LIGHT`] command a part (a job the engine's size), and
+//!   its reset copies more seed experts than flips are kept in flight: the
+//!   in-flight bound refuses that by name unless the reset's copies stage as
+//!   they are issued. The heavy arm, run only once the light one passes,
+//!   adds [`INFLATE`] copy stream commands a part (one job then carries more
+//!   than the stream queues): a job reaches the staging thread before its
+//!   commands reach the copy stream, and the reset's copies go out a ring's
+//!   worth at a time, so the host never blocks enqueuing behind copies
+//!   nothing stages. Its mutants: the job sent after its commands; the
+//!   reset's copies all enqueued with the flush turned on only after the
+//!   last (the light arm's refusal, then with the bound removed the heavy
+//!   arm's block). A watchdog thread names a clause past the bound, then
+//!   ends the process.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -99,18 +121,19 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use std::ops::Range;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
-        MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform,
+        Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
+        Transform, set_leak_sink,
     };
     use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use cuda_core::{DeviceBuffer, LaunchConfig1D, sys};
+    use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
@@ -136,12 +159,31 @@ mod gate {
     /// How soon a dropped machine's copy stream must drain; a copy it left
     /// waiting on the slow victim's ticket never does.
     const RELEASED: Duration = Duration::from_millis(500);
+    /// How long after its drop the stall arm's staging thread may take to
+    /// end: the slow preparation it was left inside, and its exit.
+    const JOINED: Duration = Duration::from_secs(4);
     /// The gate's own bound on a pass's engine stream.
     const ENGINE_DRAIN: Duration = Duration::from_secs(30);
     /// How long a held arm lets the unheld side run before it looks: every
     /// copy and launch here takes microseconds.
     const HOLD_SETTLE: Duration = Duration::from_millis(200);
     const DELAY: u64 = 3;
+    /// Copy stream commands the queue arm's source adds to each part it
+    /// copies: one job then carries thousands and a reset's seed copies tens
+    /// of thousands, past what a stream queues before an enqueue blocks.
+    const INFLATE: usize = 2048;
+    /// The light queue arm's commands a part: a job then carries the engine's
+    /// size of work (its staging wait, three copies, a command a part, the
+    /// drained write), far under what a stream queues, so the in-flight bound
+    /// in the reset's copies is what refuses them, not the driver.
+    const LIGHT: usize = 1;
+    /// The queue arm's bound on its run and reset, which take a few seconds
+    /// when every copy stages as it is issued.
+    const QUEUE_BOUND: Duration = Duration::from_secs(20);
+    /// How long the queue arm's watchdog waits after naming a blocked clause
+    /// before it ends the process: a stack watch (`BLOOMERY_GATE_STACKS`
+    /// under this) dumps the blocked threads in between.
+    const QUEUE_GRACE: Duration = Duration::from_secs(60);
     /// The boundary-event arm's live delay: with `every` 2 a flip lands at a
     /// planning boundary.
     const DELAY_EVEN: u64 = 2;
@@ -264,15 +306,19 @@ mod gate {
 
     /// What an arm's source does wrong: `stuck` experts never become
     /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
-    /// `panic_source` fail or panic when their bytes are read, and every
-    /// stack destination of layer `fail_dest` is an error.
+    /// `panic_source` fail or panic when their bytes are read, every stack
+    /// destination of layer `fail_dest` is an error, and each part a copy
+    /// moves carries `inflate` more copy stream commands. `dropped_on` gets
+    /// the name of the thread that drops the source.
     #[derive(Clone, Debug, Default)]
     struct Faults {
+        dropped_on: Arc<Mutex<Option<String>>>,
         stuck: Vec<(usize, u32)>,
         slow: Vec<(usize, u32)>,
         fail_source: Option<(usize, u32)>,
         panic_source: Option<(usize, u32)>,
         fail_dest: Option<usize>,
+        inflate: usize,
     }
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
@@ -316,6 +362,134 @@ mod gate {
         }
     }
 
+    impl Drop for Synth {
+        fn drop(&mut self) {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string();
+            if let Ok(mut on) = self.faults.dropped_on.lock() {
+                *on = Some(name);
+            }
+        }
+    }
+
+    /// Every leak a dropped machine of this process reported, in order.
+    static LEAKS: Mutex<Vec<Leak>> = Mutex::new(Vec::new());
+
+    /// The gate's leak sink: the `residency leak` record, and the leak kept
+    /// for the clauses.
+    fn note_leak(l: &Leak) {
+        record::residency_leak(l).print();
+        if let Ok(mut v) = LEAKS.lock() {
+            v.push(*l);
+        }
+    }
+
+    fn leaks() -> Result<Vec<Leak>, GateError> {
+        Ok(LEAKS
+            .lock()
+            .map_err(|_| "gate_swap: the leak list")?
+            .clone())
+    }
+
+    /// The tids of this process's threads named as the swap machine names
+    /// its staging thread.
+    fn staging_tids() -> Result<Vec<String>, GateError> {
+        let mut out = Vec::new();
+        for t in std::fs::read_dir("/proc/self/task")? {
+            let t = t?;
+            let comm = std::fs::read_to_string(t.path().join("comm"))?;
+            if comm.trim_end() == "swap-staging" {
+                out.push(t.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cpus in a kernel cpu list (`0-63`, `0,32`, `0-3,8`).
+    fn list_cpus(list: &str) -> Result<usize, GateError> {
+        let mut n = 0;
+        for part in list.trim().split(',') {
+            n += match part.split_once('-') {
+                Some((a, b)) => b.parse::<usize>()? - a.parse::<usize>()? + 1,
+                None => {
+                    part.parse::<usize>()?;
+                    1
+                }
+            };
+        }
+        Ok(n)
+    }
+
+    /// The calling thread's mask set to `cpus`.
+    fn set_mask(cpus: &[usize]) -> Result<(), GateError> {
+        // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET`
+        // with indices read from a mask of the same size, and
+        // `sched_setaffinity` reads it with the matching size.
+        let ok = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("gate_swap: sched_setaffinity to {cpus:?}").into())
+        }
+    }
+
+    /// placement: a machine built on a thread pinned to one cpu (as a
+    /// binary's step thread is) runs its staging thread off that cpu: the
+    /// staging copies never take turns with the step. With no pool built the
+    /// staging thread floats, its mask wider than the one cpu.
+    fn placement(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let wide = threads::helper::mask()?;
+        let Some(&c) = wide.first().filter(|_| wide.len() > 1) else {
+            println!("placement: the gate thread's mask is {wide:?}, too narrow to tell FAIL");
+            return Ok(false);
+        };
+        let before = staging_tids()?;
+        set_mask(&[c])?;
+        let built = plain(gpu, pm, Faults::default(), DELAY);
+        let restored = set_mask(&wide);
+        let r = built?;
+        restored?;
+        let tid = staging_tids()?
+            .into_iter()
+            .find(|t| !before.contains(t))
+            .ok_or("gate_swap: the machine's staging thread")?;
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .ok_or("gate_swap: Cpus_allowed_list")?
+            .trim()
+            .to_owned();
+        let cpus = list_cpus(&list)?;
+        drop(r);
+        let ok = !(cpus == 1 && list == c.to_string());
+        println!(
+            "placement: a machine built on a thread pinned to cpu {c}: its staging thread {tid} \
+             Cpus_allowed_list {list} ({cpus} cpus) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// Threads of this process named as the swap machine names its staging
+    /// thread.
+    fn staging_threads() -> Result<usize, GateError> {
+        let mut n = 0;
+        for t in std::fs::read_dir("/proc/self/task")? {
+            let comm = std::fs::read_to_string(t?.path().join("comm"))?;
+            n += usize::from(comm.trim_end() == "swap-staging");
+        }
+        Ok(n)
+    }
+
     impl SwapSource for Synth {
         fn part_bytes(&self) -> &[usize] {
             &PART_BYTES
@@ -347,6 +521,31 @@ mod gate {
                 });
             }
             Ok(self.bases[li(layer)][part] + (slot as usize * PART_BYTES[part]) as u64)
+        }
+
+        /// `inflate` one-word memsets on the stream, into the stack of the
+        /// layer with no card slot (one slot no probe reads).
+        fn convert(
+            &self,
+            _layer: usize,
+            _part: usize,
+            _dst: sys::CUdeviceptr,
+            stream: &CudaStream,
+        ) -> Result<(), GpuError> {
+            let scratch = self.bases[L - 1][0];
+            for _ in 0..self.faults.inflate {
+                // SAFETY: `scratch` is the first word of a live stack buffer
+                // of the arm's card, which outlives the machine; the memset
+                // writes that one word on the stream.
+                let rc = unsafe { sys::cuMemsetD32Async(scratch, 0, 1, stream.cu_stream()) };
+                if rc != sys::cudaError_enum_CUDA_SUCCESS {
+                    return Err(GpuError::Shape {
+                        what: "Synth::convert",
+                        detail: format!("cuMemsetD32Async rc {rc}"),
+                    });
+                }
+            }
+            Ok(())
         }
 
         fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
@@ -1477,6 +1676,86 @@ mod gate {
         Ok(c7)
     }
 
+    /// queue: an arm whose source adds `inflate` commands a part, driven to
+    /// the last boundary that made flips, its window closed, then reset under
+    /// a watchdog; `heavy` also asks for the tens of thousands of commands
+    /// that overflow the stream's queue, `light` for more reset copies than
+    /// flips kept in flight (the bound a reset without its flush would meet).
+    fn queue(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+        inflate: usize,
+    ) -> Result<bool, GateError> {
+        let arm = if inflate == LIGHT { "light" } else { "heavy" };
+        let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
+        let (done, watched) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watched.recv_timeout(QUEUE_BOUND).is_err() {
+                // The host is blocked inside the driver: nothing returns it,
+                // so the process ends here, by name.
+                println!(
+                    "queue ({arm}): the clause did not finish in {QUEUE_BOUND:?}: the host \
+                     blocked enqueuing copies behind copies nothing stages FAIL"
+                );
+                std::thread::sleep(QUEUE_GRACE);
+                std::process::abort();
+            }
+        });
+        let run = || -> Result<_, GateError> {
+            let faults = Faults {
+                inflate,
+                ..Faults::default()
+            };
+            let mut r = plain(gpu, pm, faults, DELAY)?;
+            drive(
+                gpu,
+                &mut r,
+                trace,
+                0..b_last as usize + 1,
+                Copies::Prompt,
+                Hold::None,
+            )?;
+            let driven = r.err.is_none();
+            let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+            let window = m.window();
+            window.store(0, Ordering::Release);
+            let t0 = Instant::now();
+            let reset = m.reset(gpu.stream(), &mut r.slots);
+            let took = t0.elapsed();
+            window.store(1, Ordering::Release);
+            Ok((driven, reset, took))
+        };
+        let ran = run();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        let (driven, reset, took) = ran?;
+        let rep = match reset {
+            Ok(rep) => rep,
+            Err(e) => {
+                println!("queue ({arm}) reset after boundary {b_last}: {e} FAIL");
+                return Ok(false);
+            }
+        };
+        let commands = rep.copies * PARTS * inflate;
+        let enough = if inflate == LIGHT {
+            rep.copies > LAYERS.len()
+        } else {
+            commands >= 10_000
+        };
+        let ok = driven && rep.diff == 0 && enough;
+        println!(
+            "queue ({arm}): a reset under a closed window, {} seed copies carrying {commands} copy \
+             stream commands of their sources, returned in {:.1} ms, diff {}: {}",
+            rep.copies,
+            took.as_secs_f64() * 1e3,
+            rep.diff,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// tier: a two-card map, each card layer's hottest and coldest expert off
     /// the seed on the tier.
     fn tier(
@@ -1738,9 +2017,12 @@ mod gate {
     /// stall: a victim that takes longer to prepare than the machine's
     /// deadline is a named error at the boundary it would land at, not a
     /// wait without end; and the machine, dropped with that preparation in
-    /// flight, leaves no copy waiting on the card. A copy nobody releases
-    /// holds every later free on the card, so on that fail the gate ends
-    /// here, by name.
+    /// flight, leaves no copy waiting on the card, and its staging thread,
+    /// left to finish the preparation, is never the last owner of the shared
+    /// state (it would free the ring's pinned pages and the source there,
+    /// inside the driver beside the next clause). The clause ends only once
+    /// that thread has. A copy nobody releases holds every later free on the
+    /// card, so on that fail the gate ends here, by name.
     fn stall(
         gpu: &Gpu,
         pm: &probe_kernels::LoadedModule,
@@ -1750,6 +2032,9 @@ mod gate {
             slow: vec![(2usize, 7u32)],
             ..Faults::default()
         };
+        let dropped_on = Arc::clone(&faults.dropped_on);
+        let threads = staging_threads()?;
+        let leaks_before = leaks()?.len();
         let mut st = start(gpu, pm, seed_map(&[])?, faults, cfg(DELAY, STALL_DEADLINE))?;
         let t0 = Instant::now();
         drive(gpu, &mut st, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
@@ -1767,20 +2052,39 @@ mod gate {
             std::thread::sleep(Duration::from_micros(200));
             drained = ev.query()?;
         }
+        let drain_took = t2.elapsed();
+        let mut left = staging_threads()?;
+        while left > threads && t1.elapsed() < JOINED {
+            std::thread::sleep(Duration::from_millis(5));
+            left = staging_threads()?;
+        }
+        let joined = left <= threads;
+        let on = dropped_on
+            .lock()
+            .map_err(|_| "gate_swap: the drop cell")?
+            .clone();
+        let leaked: Vec<LeakReason> = leaks()?[leaks_before..].iter().map(|l| l.reason).collect();
         let stall = stall_said.contains("was not prepared for the host")
             && stall_said.contains("layer 2: the victim 7")
             && took < SLOW
             && drained
-            && dropped < SLOW;
+            && dropped < SLOW
+            && joined
+            && on.as_deref() != Some("swap-staging")
+            && leaked == [LeakReason::Join];
         println!(
             "stall: a victim {SLOW:?} to prepare under a {STALL_DEADLINE:?} deadline: after {} passes \
-             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {} {}",
+             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {}; its staging \
+             thread {} {:?} after the drop, the source dropped on {on:?} (never swap-staging), \
+             leaks reported {leaked:?} (want [Join]) {}",
             st.values.len(),
             if drained {
-                format!("drained {:?} after it", t2.elapsed())
+                format!("drained {drain_took:?} after it")
             } else {
                 format!("still waiting {RELEASED:?} after it")
             },
+            if joined { "ended" } else { "still running" },
+            t1.elapsed(),
             verdict(stall)
         );
         if !drained {
@@ -1794,6 +2098,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        if !set_leak_sink(note_leak) {
+            return Err("gate_swap: a leak sink was set before the gate's".into());
+        }
         let gpu = Gpu::new()?;
         // SAFETY: the module is this binary's own, loaded once into the
         // card's context before any launch.
@@ -1828,6 +2135,26 @@ mod gate {
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= refusal(&gpu, &pm, &trace)?;
         ok &= stall(&gpu, &pm, &trace)?;
+        ok &= placement(&gpu, &pm)?;
+        let light = queue(&gpu, &pm, &trace, &a, LIGHT)?;
+        ok &= light;
+        if light {
+            ok &= queue(&gpu, &pm, &trace, &a, INFLATE)?;
+        } else {
+            println!(
+                "queue (heavy): not run — the light arm failed, and the heavy arm would block the \
+                 process on the same defect FAIL"
+            );
+        }
+        drop((a, b, h));
+        let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
+        let only_stall = all == [LeakReason::Join];
+        println!(
+            "leaks: every machine dropped, leaks reported {all:?} (want the stall arm's [Join] \
+             alone) {}",
+            verdict(only_stall)
+        );
+        ok &= only_stall;
 
         if ok {
             println!(

@@ -35,4 +35,5 @@ pub mod params;
 pub mod rope;
 pub mod router;
 pub mod span;
+pub mod swap;
 pub mod transpose;

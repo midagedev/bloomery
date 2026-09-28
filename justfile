@@ -785,7 +785,7 @@ gate-fixture:
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
 gate-threads:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool --test helper -- --include-ignored --nocapture'
 
 # 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
 # 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.
@@ -1078,6 +1078,18 @@ gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault
 [group('v41-load')]
 gate-gpu-ds41-twocard *ARGS='--union --loopback --lost':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
+
+# V4.1 adaptive residency (BLOOMERY_RESIDENCY, set in the gate to mid-p40-s1) on plan (b′), both cards, the id-prefix
+# seed, the r8 sidecar: the host-set refusal at load (a host one byte short of the churn pool, named, before the load),
+# then one load — c6 (a DSpark pair pass keeping one row folds what one step folds), c1 (the prose history twice, same
+# tokens and logits, flips landed), the admitted experts' slots byte for byte a static load's (the r8 unpack), the host
+# set's residency answers, the tier entries unmoved, the passes' kinds and kept rows (the prompt call one pass, 0 kept),
+# c3 (the copy stream held 1 s, same history), the serve seat's reset leaving the residency, c7 (a reset back to the
+# seed, no host byte released). One load (the refusal stops before its own). Both cards, alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-ds41-residency *ARGS:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_residency && bash tools/gpu-gate.sh gate_deepseek41_residency {{ARGS}}'
 
 # V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
 # --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects

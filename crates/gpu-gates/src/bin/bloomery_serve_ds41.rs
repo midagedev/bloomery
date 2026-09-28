@@ -128,9 +128,11 @@ mod drive {
     use app::arch::deepseek41::{CardDraft, Ds41Cfg};
     use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
     use bloomery_gpu_deepseek41::draft::DraftBody;
+    use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::bind::{
         Ds41Engine, Seat, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
     };
@@ -145,7 +147,7 @@ mod drive {
     use runtime::{Committed, Lookup, Speculative, Target, Want};
     use serve::{
         CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
-        Saved, ServeError, Server, ServerConfig,
+        ResidencyReset, Saved, ServeError, Server, ServerConfig,
     };
     use tokenizer::Tokenizer;
 
@@ -223,6 +225,14 @@ mod drive {
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
         let cfg = body::OpenCfg::from_levers(&levers)?;
+        if cfg.body.residency != Residency::Off && matches!(a.place, Place::Gate) {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={} under --place gate: the residency machine runs under \
+                 --place a and bp only",
+                levers.residency()
+            )
+            .into());
+        }
         let draft = Draft::from_levers(&levers)?;
         // The draft's file is read before the target's load, which takes a minute.
         let draft_file = match draft {
@@ -255,8 +265,15 @@ mod drive {
         let tier_batch = place::tier_batch(a.place, &inputs.hp);
         drop(split);
         let trace = route_trace(&levers, &cfg, draft, a.place, &path, &inputs)?;
-        let (card, placement, headroom) =
-            print_plan(&inputs, a.place, reserve, tier_batch, a.ctx, &cfg.place)?;
+        let (card, placement, headroom) = print_plan(
+            &inputs,
+            a.place,
+            reserve,
+            tier_batch,
+            a.ctx,
+            &cfg.place,
+            (cfg.body.residency, levers.residency()),
+        )?;
         let cache_ram = a.cache_ram.unwrap_or_else(|| {
             u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP))
         });
@@ -340,6 +357,18 @@ mod drive {
             )
             .into());
         }
+        // The trace is the input the residency model replays under a fixed
+        // seed; under the machine its slot files would record the machine's
+        // own moves, its header would not say so, and the step feed would
+        // count each prompt id as a kept row where the batched call keeps 0.
+        if cfg.body.residency != Residency::Off {
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
+                 BLOOMERY_RESIDENCY={} moves the slot map under it",
+                levers.residency()
+            )
+            .into());
+        }
         let hp = &inputs.hp;
         let yes = |b: bool| if b { "on" } else { "off" }.to_owned();
         let header = TraceHeader {
@@ -375,7 +404,10 @@ mod drive {
     /// prompt-batch bytes, on its tier card), on stderr;
     /// returns its cards' names, the plan's placement for `/props` (`None`,
     /// and a line saying why, when a card's nvidia-smi index cannot be found)
-    /// and the plan's host headroom in bytes.
+    /// and the plan's host headroom in bytes. Under `residency` (the rule and
+    /// the lever's word) the churn pool's record follows the plan's, and the
+    /// headroom is what the pool leaves; a pool that does not fit is refused
+    /// by name.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
@@ -383,11 +415,17 @@ mod drive {
         tier_batch: Option<TierBatchBytes>,
         ctx: usize,
         levers: &PlanLevers,
+        residency: (Residency, &str),
     ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
         let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         record::plan(place.name(), &machine, &plan, hot_list).eprint();
+        let mut host_headroom = plan.host.headroom_bytes;
+        if let Some(pool) = swap::churn(&plan, 0, residency.0)? {
+            record::residency_host(residency.1, &pool, &plan).eprint();
+            host_headroom = pool.check(&plan)?;
+        }
         let gpus: Result<Vec<String>, String> = machine
             .all_cards()
             .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
@@ -396,12 +434,8 @@ mod drive {
         if let Err(e) = &placement {
             eprintln!("bloomery-serve-ds41: /props leaves the placement out: {e}");
         }
-        let headroom = i64::try_from(plan.host.headroom_bytes).map_err(|_| {
-            format!(
-                "the plan's host headroom {} B passes i64",
-                plan.host.headroom_bytes
-            )
-        })?;
+        let headroom = i64::try_from(host_headroom)
+            .map_err(|_| format!("the plan's host headroom {host_headroom} B passes i64"))?;
         let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
         Ok((cards.join("+"), placement.ok(), headroom))
     }
@@ -515,6 +549,9 @@ mod drive {
                     .hybrid_mut()
                     .attach_route_trace(t)?;
             }
+            if a.cfg.body.residency != Residency::Off {
+                s.model_mut().body_parts(WHAT)?.2.log_residency();
+            }
             let draft = match (a.draft, spark) {
                 (Draft::Off, _) => Served::Off,
                 (Draft::Lookup, _) => Served::Lookup(
@@ -546,6 +583,21 @@ mod drive {
                 Served::Dspark(d) => d.draft().window(),
                 Served::Off | Served::Lookup(..) => 0,
             }
+        }
+
+        /// The `residency pass` records of the boundaries the last call made,
+        /// on stderr.
+        fn print_passes(&mut self) -> Result<(), GateError> {
+            for (kind, r) in self
+                .s
+                .model_mut()
+                .body_parts(WHAT)?
+                .2
+                .take_residency_passes()
+            {
+                record::residency_pass_of(kind, &r).eprint();
+            }
+            Ok(())
         }
 
         /// The target stands elsewhere than its drafts were fed.
@@ -598,18 +650,21 @@ mod drive {
         }
 
         fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-            match &mut self.draft {
-                Served::Dspark(d) => Ok(d.draft_mut().feed_call(&mut self.s, ids)?),
+            let next = match &mut self.draft {
+                Served::Dspark(d) => d.draft_mut().feed_call(&mut self.s, ids)?,
                 Served::Lookup(_, follows) => {
                     *follows = false;
-                    Ok(self.s.prompt(ids, Want::Argmax)?.argmax())
+                    self.s.prompt(ids, Want::Argmax)?.argmax()
                 }
-                Served::Off => Ok(self.s.prompt(ids, Want::Argmax)?.argmax()),
-            }
+                Served::Off => self.s.prompt(ids, Want::Argmax)?.argmax(),
+            };
+            self.print_passes()?;
+            Ok(next)
         }
 
         fn step(&mut self, last: u32) -> Result<u32, GateError> {
             let next = self.s.step(last, Want::Argmax)?.argmax();
+            self.print_passes()?;
             match &mut self.draft {
                 Served::Lookup(spec, true) => spec.draft_mut().push(next),
                 Served::Dspark(d) => {
@@ -637,6 +692,7 @@ mod drive {
                     return Ok(Drafted::default());
                 }
             };
+            self.print_passes()?;
             Ok(drafted(c))
         }
 
@@ -660,6 +716,22 @@ mod drive {
         fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
             self.moved();
             Ok(self.s.model_mut().rollback(pos)?)
+        }
+
+        /// [`Session::residency_reset`], its `residency reset` record on
+        /// stderr.
+        fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
+            let Some(r) = self.s.residency_reset()? else {
+                return Ok(None);
+            };
+            record::residency_reset(&r).eprint();
+            let n = |v: usize| v as u64;
+            Ok(Some(ResidencyReset {
+                cancelled: n(r.cancelled),
+                copies: n(r.copies),
+                diff: n(r.diff),
+                dropped_bytes: r.dropped_bytes,
+            }))
         }
 
         /// The body's rule; under the DSpark draft, a cut anywhere but where
@@ -890,6 +962,9 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.eprint();
                 }
+            }
+            for h in threads::helper::helpers() {
+                record::helper(&h.name, h.asked, h.pinned, h.cpus).eprint();
             }
             Ok(())
         }

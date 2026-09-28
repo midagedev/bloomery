@@ -1,0 +1,29 @@
+# Round resv41, adaptres section 7 probe 1, V4.1's arm: what a host-to-card staged copy costs V4.1's
+# DRAM-bound host union. adaptres section 1: the swap machine's staged copy (memcpy into a pinned ring,
+# then H2D) runs 1.8-3.5 ms a token beside a 20-37 ms step; whether it displaces union bytes decides if
+# gating the staging into the pool's wait window (StepPort's window word, which resv41 wires) is enough.
+# Passes per copied byte [derived]: source read 1, staging write 1 (+1 if the store reads the line), the
+# card's DMA read 1: k = 3..4. DRAM ceiling 145 (STREAM 147.7; read-mmap 140-145 at 32 threads, rig-log
+# 09-24); engine:6 alone 132-137. Demand at the staged copy's rate beside a union: U + k x C. Qwen3.8's
+# compute-bound union measured C 21.19 GB/s beside it and lost 0.24 GB/s a copied GB/s (rig-log
+# 09-28#q38-dram-share); V4.1's union has no such headroom: the demand-proportional split gives U ~81-91
+# with C ~16-18 (probes38's dma-dram-share.card), the union-first split U ~132 with C ~4, copy-first U ~66.
+# adaptres predicts U 80-100: the proportional split with the ceiling's spread. The runner is probes38's
+# (bloomery sit8: tools/ref/dma-dram-share.sh, `just time-dma-dram`), not in this tree.
+# Wall [derived, probes38's card]: 4 rounds x 3 bench runs + two copies alone + builds: 10-20 min.
+kind: profile
+question: while a staged copy runs beside V4.1's host union (engine:6), what does the union hold?
+term: U_with, the median over rounds of bench_v41_host --time --arms engine:6 GB/s at 28 threads beside
+  h2d_probe staged-loop (64 MiB pinned chunks, ring 4, 4 fill threads, A6000), V4.1 public Q3_K_M
+unit: GB/s
+predict: 80..100
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share-v41.card' just
+  time-dma-dram --arms engine:6 --rounds 4 from a tree with the runner, one lease; the bench's rows
+  admissible (resident, no major faults), the copy pinned to the cores the pool leaves free and running
+  through each measured span ([overlap], [copy-gap], [unpinned] rows left out); witness blocks pre and
+  post; U_alone at 28 threads within 10 % of engine:6's 136.3 at 32
+decide-in: keep the staging gated into the pool's wait window (as resv41 wires it) and price each flip
+  at k = (U_alone - U_with) / C host bytes in the step model
+decide-below: the copy starves the union: cap the machine's flips a pass (cap 12) and move the staging
+  memcpy strictly into the wait window before any serve default
+decide-above: the copy costs the union little: price flips at the link only and raise the cap

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+bloomery-threads = { path = "../threads" }
 libc.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true

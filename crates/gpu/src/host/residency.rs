@@ -6,7 +6,7 @@ use crate::GpuError;
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
-use model::placement::{ModelTensor, Plan};
+use model::placement::{ExpertList, ModelTensor, Plan};
 use model::r8file::{HostR8, R8Source};
 
 /// What a placed load did to its plan's host set: populated it, locked it,
@@ -33,10 +33,23 @@ impl HostResidency {
         keep: impl Fn(&ModelTensor) -> bool,
         cfg: HostCfg,
     ) -> Result<HostResidency, GpuError> {
+        HostResidency::at_load_with(split, plan, keep, cfg, &[])
+    }
+
+    /// [`HostResidency::at_load`] of a set that also holds `extra`, experts
+    /// of card segments the host must serve too ([`HostSet::of_with`]:
+    /// adaptive residency's churn pool).
+    pub fn at_load_with(
+        split: &Split,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+        cfg: HostCfg,
+        extra: &[(usize, ExpertList)],
+    ) -> Result<HostResidency, GpuError> {
         const WHAT: &str = "HostResidency::at_load";
         let r8 = HostR8::at_load(split, cfg.r8)?;
         let src = R8Source::of(split, &r8)?;
-        let set = HostSet::of(src, plan, keep).map_err(|e| GpuError::plan(WHAT, e))?;
+        let set = HostSet::of_with(src, plan, keep, extra).map_err(|e| GpuError::plan(WHAT, e))?;
         let populate = cfg
             .populate
             .then(|| set.populate(src))

@@ -26,7 +26,9 @@ use std::fmt::{Debug, Display, Write as _};
 use std::sync::OnceLock;
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::host::swap::{PassReport, ResetReport};
+use bloomery_gpu::host::PassKind;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::host::swap::{Leak, PassReport, ResetReport};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
 use model::placement::{Machine, Plan};
@@ -242,6 +244,16 @@ pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
         "record::at_main({bin}): the process registered {}'s kinds already",
         held.bin
     );
+    #[cfg(feature = "gpu")]
+    if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
+        bloomery_gpu::host::swap::set_leak_sink(eprint_leak);
+    }
+}
+
+/// The residency machine's leak sink: its `residency leak` line on stderr.
+#[cfg(feature = "gpu")]
+fn eprint_leak(l: &Leak) {
+    residency_leak(l).eprint();
 }
 
 /// The schema of `bin`'s lines on stdout ([`schema`]).
@@ -877,11 +889,16 @@ pub static TIME_PROMPT: Kind = Kind {
 pub static RESIDENCY_PASS: Kind = Kind {
     name: "residency_pass",
     head: "residency pass",
-    doc: "A residency boundary: its passes since the load or the last reset, the rows the pass \
-          before it kept, the flips that went live there (late: their copies had not completed and \
+    doc: "A residency boundary: what the pass before it was (none, step, pair, prompt — a \
+          prompt call's rows are not counted — abandoned, or driver: the machine's own test \
+          driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
-          the bytes its flips copy.",
+          the bytes its flips copy; the host's microseconds folding the pass into the rule and in \
+          the whole boundary call, of \
+          them waiting for the landing jobs' staging and issuing the new flips' copies, and the staging thread's since the last \
+          boundary copying into the ring and preparing victims.",
     parts: &[
+        key("pass", Word, ""),
         key("boundary", U64, ""),
         key("kept", U64, ""),
         key("landed", U64, ""),
@@ -889,6 +906,31 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("made", U64, ""),
         key("in_flight", U64, ""),
         key("bytes", U64, "B"),
+        key("end_us", U64, "us"),
+        key("boundary_us", U64, "us"),
+        key("wait_us", U64, "us"),
+        key("issue_us", U64, "us"),
+        key("stage_us", U64, "us"),
+        key("prepare_us", U64, "us"),
+    ],
+};
+
+/// Adaptive residency's host share at the plan
+/// ([`model::placement::churn::ChurnPool`]).
+pub static RESIDENCY_HOST: Kind = Kind {
+    name: "residency_host",
+    head: "residency host",
+    doc: "Adaptive residency's host share, from the plan before the load: the lever's word, the \
+          seed experts a layer kept on the stage card, the churn pool (the stage card's experts \
+          past them, which the load's host set holds too) and its bytes, and the plan's host \
+          headroom before and after the pool.",
+    parts: &[
+        key("residency", Word, ""),
+        key("pinned", U64, ""),
+        key("churn_experts", U64, ""),
+        key("churn_bytes", U64, "B"),
+        key("headroom", I64, "B"),
+        key("headroom_after", I64, "B"),
     ],
 };
 
@@ -905,6 +947,39 @@ pub static RESIDENCY_RESET: Kind = Kind {
         key("copies", U64, ""),
         key("diff", U64, ""),
         key("dropped_bytes", U64, "B"),
+    ],
+};
+
+/// A helper thread the load spawned (`threads::helper::helpers`).
+pub static HELPER: Kind = Kind {
+    name: "helper",
+    head: "helper",
+    doc: "A helper thread the load spawned beside the step thread: its name, where it asked to \
+          run (pin:<cpu>, sibling:<cpu> — the SMT sibling of that cpu — or float), the cpu it is \
+          pinned to (float when none: a refused pin or a core without a sibling floats) and the \
+          cpus in its mask once placed.",
+    parts: &[
+        key("name", Word, ""),
+        key("asked", Word, ""),
+        key("pinned", Word, ""),
+        key("cpus", U64, ""),
+    ],
+};
+
+/// A dropped residency machine's leak ([`bloomery_gpu::host::swap::Leak`]),
+/// on stderr from the drop.
+pub static RESIDENCY_LEAK: Kind = Kind {
+    name: "residency_leak",
+    head: "residency leak",
+    doc: "A dropped residency machine kept its staging ring, its staging words and its source \
+          rather than free them under a copy or a thread that may still use them: why (join: the \
+          staging thread was still inside the source past the deadline; release: the copies \
+          waiting on staging could not be let through; drain: the copy stream did not drain \
+          within the deadline) and the pinned bytes of the ring and the words.",
+    parts: &[
+        key("reason", Word, ""),
+        key("ring", U64, "B"),
+        key("words", U64, "B"),
     ],
 };
 
@@ -963,7 +1038,7 @@ pub static TOKENS: Kind = Kind {
 pub static STAT_STEP: Kind = Kind {
     name: "stat_step",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows.",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows; the step's go waits (the card's time from the host's signal to the next go, one per service: least, lower median, most) and the host time in its synchronous parameter copy.",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -987,6 +1062,10 @@ pub static STAT_STEP: Kind = Kind {
         key("eng_wait_us", F64(1), "us"),
         key("eng_helper_us", F64(1), "us"),
         key("eng_classify_us", F64(1), "us"),
+        key("gap_min_us", F64(1), "us"),
+        key("gap_p50_us", F64(1), "us"),
+        key("gap_max_us", F64(1), "us"),
+        key("params_us", F64(1), "us"),
     ],
 };
 
@@ -1323,6 +1402,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1349,8 +1429,10 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &STAT_FINITE_SUMMARY,
     &DRAFT_SUMMARY,
     &SMOKE,
+    &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `bloomery-chat` prints, all on stderr.
@@ -1375,6 +1457,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1385,6 +1468,10 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &CACHE_EVICT,
     &CACHE_SKIP,
     &PREFILL_SPLIT,
+    &RESIDENCY_HOST,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -1405,6 +1492,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &SMOKE,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `generate_qwen3moe` prints as records: under `--dump-taps`, after
@@ -1471,10 +1559,34 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
     out
 }
 
-/// A residency boundary's record.
+/// The churn pool's record under the residency word `residency`, against
+/// the plan it was taken from.
+pub fn residency_host(
+    residency: &str,
+    pool: &model::placement::churn::ChurnPool,
+    plan: &Plan<'_>,
+) -> Record {
+    Record::new(&RESIDENCY_HOST)
+        .w("residency", residency)
+        .u("pinned", pool.pinned)
+        .u("churn_experts", pool.experts)
+        .u("churn_bytes", pool.bytes)
+        .u("headroom", plan.host.headroom_bytes)
+        .u("headroom_after", pool.headroom_after(plan))
+}
+
+/// A residency boundary's record, of a machine driven directly
+/// ([`PassKind::Driver`]).
 #[cfg(feature = "gpu")]
 pub fn residency_pass(r: &PassReport) -> Record {
+    residency_pass_of(PassKind::Driver, r)
+}
+
+/// A residency boundary's record, ending a pass of `kind`.
+#[cfg(feature = "gpu")]
+pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
     Record::new(&RESIDENCY_PASS)
+        .w("pass", kind.word())
         .u("boundary", r.boundary)
         .u("kept", r.kept)
         .u("landed", r.landed)
@@ -1482,6 +1594,39 @@ pub fn residency_pass(r: &PassReport) -> Record {
         .u("made", r.made)
         .u("in_flight", r.in_flight)
         .u("bytes", r.bytes)
+        .u("end_us", r.end_us)
+        .u("boundary_us", r.boundary_us)
+        .u("wait_us", r.wait_us)
+        .u("issue_us", r.issue_us)
+        .u("stage_us", r.stage_us)
+        .u("prepare_us", r.prepare_us)
+}
+
+/// A helper thread's record: `name`, where it asked to run, the cpu it is
+/// pinned to, the cpus in its mask.
+pub fn helper(
+    name: &str,
+    asked: impl std::fmt::Display,
+    pinned: Option<usize>,
+    cpus: usize,
+) -> Record {
+    Record::new(&HELPER)
+        .w("name", name)
+        .w("asked", asked)
+        .w(
+            "pinned",
+            pinned.map_or_else(|| "float".to_owned(), |c| c.to_string()),
+        )
+        .u("cpus", cpus)
+}
+
+/// A dropped residency machine's leak record.
+#[cfg(feature = "gpu")]
+pub fn residency_leak(l: &Leak) -> Record {
+    Record::new(&RESIDENCY_LEAK)
+        .w("reason", l.reason.word())
+        .u("ring", l.ring_bytes)
+        .u("words", l.words_bytes)
 }
 
 /// A residency reset's record.

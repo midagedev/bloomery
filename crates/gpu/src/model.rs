@@ -42,7 +42,7 @@ use bloomery_levers::HostCfg;
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
-use model::placement::Plan;
+use model::placement::{ExpertList, Plan};
 use std::ops::Range;
 
 // -------------------------------------------------------------- chain body
@@ -147,13 +147,34 @@ pub trait HostServed {
     /// before every launch that reads the slot map, after the chain it
     /// launches is known to exist, and after the previous pass's host
     /// service has returned, so every host word the engine stream's enqueued
-    /// work waits on is written. `GpuModel::replay` is the only caller: the
-    /// eager path (`GpuModel::enqueue_chain_step`) and the prompt call
-    /// have no boundary, so a body with a machine must not run them until
-    /// each has its own.
+    /// work waits on is written. The callers: `GpuModel::replay`, and through
+    /// [`GpuModel::pass_boundary`] an eager step or pass
+    /// (`GpuModel::run_tokens`, `GpuModel::run_pass`) and a prompt call, whose
+    /// caller makes one before it and none inside it; the pass before a
+    /// boundary ends with the rows it kept ([`HostServed::keep_rows`]).
     fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         let _ = stream;
         Ok(())
+    }
+
+    /// The pass the last boundary opened, a `kind`, keeps its first `kept`
+    /// rows: a step 1, a verify its accepted rows, a prompt call 0. The
+    /// caller that knows the pass's outcome says so before the next
+    /// boundary, which refuses a pass with no kept count by name. A body with
+    /// no machine ignores it.
+    fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) {
+        let _ = (kept, kind);
+    }
+
+    /// The residency back to its seed at a quiet boundary, on `stream`
+    /// ([`crate::host::swap::SwapMachine::reset`]); `None` for a body with no
+    /// machine.
+    fn residency_reset(
+        &mut self,
+        stream: &CudaStream,
+    ) -> Result<Option<crate::host::swap::ResetReport>, GpuError> {
+        let _ = stream;
+        Ok(None)
     }
 }
 
@@ -460,6 +481,27 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_placed_with(file, plan, card, host, &[], derive, body)
+    }
+
+    /// [`GpuModel::load_placed`] whose host set also holds `extra`, experts
+    /// of the card's segments the host must serve too (adaptive residency's
+    /// churn pool, [`HostResidency::at_load_with`]): read in after the card
+    /// segments' pages were released, so a pool expert's host bytes are
+    /// resident again before the body's machine asks.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "load_placed's arguments and the host set's extra runs (rust-quality R8)"
+    )]
+    pub fn load_placed_with(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        host: HostCfg,
+        extra: &[(usize, ExpertList)],
+        derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+        body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
         let what = "GpuModel::load_placed";
         let spec = plan
             .machine
@@ -478,7 +520,7 @@ impl<B: ChainBody> GpuModel<B> {
         // After the uploads, so the card's file bytes have left the page
         // cache before the host set is read in; before the body, which
         // takes `file`.
-        let residency = HostResidency::at_load(&file, plan, |_| true, host)?;
+        let residency = HostResidency::at_load_with(&file, plan, |_| true, host, extra)?;
         let body = body(&gpu, file, &weights, residency)?;
         let head = if spec.head {
             Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
@@ -579,6 +621,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// weights, the arena and any captured chain stay (they do not depend on
     /// the cache contents). It also lifts a fault; a caller that must not
     /// continue past one checks [`GpuModel::poisoned`] first.
+    ///
+    /// A residency machine's map stays where use has taken it
+    /// ([`GpuModel::residency_reset`] is the explicit call).
     pub fn reset(&mut self) -> Result<(), GpuError> {
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
@@ -678,10 +723,13 @@ impl<B: ChainBody> GpuModel<B> {
             self.check_pos(pos, "GpuModel::step")?;
             self.refresh_params(token, pos)?;
             let r = match self.mode {
-                StepMode::Eager => self.enqueue_chain_step(),
+                StepMode::Eager => self
+                    .pass_boundary()
+                    .and_then(|()| self.enqueue_chain_step()),
                 StepMode::Graph => self.replay(1, Chain::Step),
             };
             self.name_host_refusal(r)?;
+            self.keep_rows(1, crate::host::PassKind::Step);
             self.stand_at(pos + 1);
         }
         self.heads
@@ -709,6 +757,38 @@ impl<B: ChainBody> GpuModel<B> {
         match body.host() {
             Some(host) => host.serve_captured(chain),
             None => Ok(()),
+        }
+    }
+
+    /// The residency boundary before a pass the caller enqueues itself (a
+    /// prompt call, before its first group and none inside it), and before
+    /// every eager step or pass here ([`HostServed::at_boundary`]). Nothing
+    /// for a body with no host service.
+    pub fn pass_boundary(&mut self) -> Result<(), GpuError> {
+        let GpuModel { body, gpu, .. } = self;
+        match body.host() {
+            Some(host) => host.at_boundary(gpu.stream()),
+            None => Ok(()),
+        }
+    }
+
+    /// The pass the last boundary opened keeps its first `kept` rows
+    /// ([`HostServed::keep_rows`]): what its caller, which knows the pass's
+    /// outcome, says before the next pass.
+    pub fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) {
+        if let Some(host) = self.body.host() {
+            host.keep_rows(kept, kind);
+        }
+    }
+
+    /// The residency back to its seed ([`HostServed::residency_reset`]);
+    /// `None` for a body with no machine. Only an explicit call does this:
+    /// [`GpuModel::reset`] leaves the residency where use has taken it.
+    pub fn residency_reset(&mut self) -> Result<Option<crate::host::swap::ResetReport>, GpuError> {
+        let GpuModel { body, gpu, .. } = self;
+        match body.host() {
+            Some(host) => host.residency_reset(gpu.stream()),
+            None => Ok(None),
         }
     }
 
@@ -965,6 +1045,10 @@ impl<B: Rows> GpuModel<B> {
     /// captures the pass (key `M`). A caller that does not keep the later
     /// rows takes them back with [`GpuModel::rollback`]. A fault the pass
     /// raised is its error, as [`GpuModel::step`]'s is.
+    ///
+    /// Every caller says how many rows it keeps ([`GpuModel::keep_rows`])
+    /// before the next pass: a body with a residency machine refuses the
+    /// next boundary without it.
     pub fn step_rows<const M: usize>(&mut self, tokens: [u32; M]) -> Result<[u32; M], GpuError> {
         const WHAT: &str = "GpuModel::step_rows";
         const { rows_fit::<B>(M) };
@@ -988,7 +1072,7 @@ impl<B: Rows> GpuModel<B> {
         const WHAT: &str = "GpuModel::step_rows";
         self.one_pass = (B::HEADS == RowHeads::One).then_some(M);
         let r = match self.mode {
-            StepMode::Eager => {
+            StepMode::Eager => self.pass_boundary().and_then(|()| {
                 let GpuModel {
                     heads,
                     pass_heads,
@@ -999,7 +1083,7 @@ impl<B: Rows> GpuModel<B> {
                 } = self;
                 let heads = pass_slice::<B>(heads, pass_heads, M, WHAT)?;
                 body.enqueue_rows(gpu, weights, heads)
-            }
+            }),
             StepMode::Graph => self.replay(M, B::chain_of(M)),
         };
         self.name_host_refusal(r)?;

@@ -1,0 +1,27 @@
+# Round resv41, adaptres section 7 probe 2: the NVMe read rate of one V4.1 victim's host ranges (16.77
+# MB: the r8 sidecar's gate and up, 5,068,800 B each, and the source's down, 6,635,520 B) brought back
+# by MADV_POPULATE_READ after they left the page cache. Never measured; rig-log 09-26's r8 verify at 4.32
+# GB/s (sequential, large) is a loose upper bound, and a 5-6 MB range at queue depth 1 per call sits
+# under it: 3-7 GB/s [adaptres].
+# What rides on it. Under resv41 the churn pool (each layer's card experts past the pinned 40) is in the
+# load's host set, populated before the first step, so a victim's populate (Ds41Swap::prepare_victim)
+# finds its pages resident: the term is worth 0 to resv41's decode [derived] unless the page cache
+# evicted them. It sizes the later rounds that read victims not in the host set: R5's opening reshuffle
+# (M(P) at P = 512 is NVMe-bound in adaptres section 6) and the prompt-call stream S1/S2.
+# No runner exists yet: the round that takes this card builds one under tools/ref/ (drop a victim's
+# ranges with PageDrop, then time populate_run per range; 64 victims across 8 layers, each dropped and
+# populated once, the lease held through lease_take). Wall [derived]: 64 x 16.77 MB at 3 GB/s is 0.4 s
+# of reads; the build and the host-set populate of the three shards' headers dominate: under 10 min.
+kind: profile
+question: how fast does a V4.1 victim's host set come back from NVMe after its pages were dropped?
+term: GB/s of MADV_POPULATE_READ over one victim's three ranges (16.77 MB), the median of 64 victims,
+  V4.1 public Q3_K_M and its r8 sidecar, the box's NVMe, page cache dropped for those ranges only
+unit: GB/s
+predict: 3..7
+condition: one lease through the runner's lease_take (BLOOMERY_LEASE_CARD=docs/cards/
+  v41-victim-populate.card); each range confirmed not resident (mincore) before its populate and
+  resident after; no other process reading the model file (the lease's witness blocks); no row with
+  a major-fault count outside its populate
+decide-in: keep LIVE_DELAY 4 for the host-set pool, and size R5's M(P) and S1's ring at the measured rate
+decide-below: R5 and S1 plan with a pass cap of 12 and a delay of 12 for victims outside the host set
+decide-above: R5's M(P) is bound by the link, not NVMe: re-derive its P = 512 row upward

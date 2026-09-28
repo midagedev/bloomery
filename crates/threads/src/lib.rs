@@ -21,6 +21,8 @@
 //! spawns nothing at all and the caller runs the whole range inline, so the
 //! single-threaded path pays no barrier cost.
 
+pub mod helper;
+
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::ops::Range;
@@ -67,9 +69,16 @@ impl Drop for ParallelGuard {
     }
 }
 
+static POOL: OnceLock<&'static Pool> = OnceLock::new();
+
+/// The pool when something has built it already; `None` builds nothing.
+#[must_use]
+pub fn built() -> Option<&'static Pool> {
+    POOL.get().copied()
+}
+
 /// The process-wide pool. Built once, on first use.
 pub fn pool() -> &'static Pool {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let p: &'static Pool = Box::leak(Box::new(Pool::build()));
         p.spawn_workers();
@@ -204,6 +213,19 @@ impl Pool {
     /// keeps running unpinned in that case.
     pub fn pin_failed(&self) -> bool {
         self.pin_failed.load(Ordering::Relaxed)
+    }
+
+    /// The cpu worker `t` is pinned to; `None` for no such worker or a pool
+    /// whose pins failed.
+    #[must_use]
+    pub fn worker_cpu(&self, t: usize) -> Option<usize> {
+        (t + 1 < self.nthreads && !self.pin_failed()).then(|| self.cpu_for(t) as usize)
+    }
+
+    /// The cpu [`Pool::pin_caller`] pins the dispatcher to.
+    #[must_use]
+    pub fn caller_cpu(&self) -> usize {
+        self.cpu_for(self.nthreads - 1) as usize
     }
 
     /// Opt-in: pin the calling thread to the cpu slot of the chunk it runs

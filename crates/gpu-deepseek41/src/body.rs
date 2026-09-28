@@ -73,6 +73,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::swap::{PassReport, ResetReport, Residency};
 use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
@@ -101,6 +103,7 @@ use crate::chain::ffn::{
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
+use crate::swap;
 
 mod ced;
 mod prefill;
@@ -162,6 +165,10 @@ pub struct BodyLevers {
     /// set and the card segments' pages, and whether the host tier reads the
     /// r8 sidecar.
     pub host: HostCfg,
+    /// Adaptive expert residency (`BLOOMERY_RESIDENCY`): `off` keeps the
+    /// load's slot map; otherwise the load holds the churn pool in its host
+    /// set and runs the residency machine over the stage card ([`swap`]).
+    pub residency: Residency,
 }
 
 /// What [`open`] takes besides the file, the placement and the context: the
@@ -190,6 +197,7 @@ impl OpenCfg {
                 group: levers.prefill_group(),
                 rows: RowsLevers::from_levers(levers),
                 host: levers.host(),
+                residency: Residency::parse(levers.residency())?,
             },
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })
@@ -669,8 +677,9 @@ pub struct Body {
     lists: Vec<Vec<DeviceBuffer<u32>>>,
     image: StepImage,
     /// The slot map's card copy: `layers.len()` rows of `n_expert` slots.
-    /// The host tier holds the host copy.
-    slots: DeviceTensor<u32>,
+    /// The host tier holds the host copy, and its residency machine, when it
+    /// runs one, the second reference: the copy lives until both let go.
+    slots: Arc<DeviceTensor<u32>>,
     hybrid: Hybrid<Ds41Host>,
     attn: AttnChain,
     ffn: FfnPiece,
@@ -687,6 +696,9 @@ pub struct Body {
     /// A step's rows failed after its launch: the card ran it on the rows
     /// the staging held before, and every step is refused until a reset.
     rows_failed: bool,
+    /// Host time in the step's synchronous copy of its parameters to the
+    /// card, summed over steps (ns).
+    params_ns: u64,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
     /// The positions this body computes the reference at
@@ -728,6 +740,13 @@ pub struct Body {
     /// The stage card's side of the tier layers, on a load with a tier card
     /// ([`Body::open_placed_tiered`]).
     tier: Option<TierPiece>,
+    /// The residency boundaries' reports since the last
+    /// [`Body::take_residency_passes`], kept only once a binary that prints
+    /// them asked ([`Body::log_residency`]).
+    residency_log: Option<Vec<(PassKind, PassReport)>>,
+    /// The residency machine's source, when the load runs one: what a gate
+    /// asks of it directly.
+    swap_source: Option<Arc<swap::Ds41Swap>>,
 }
 
 /// The tier card a placed load hangs under the host tier
@@ -920,12 +939,40 @@ impl Body {
         &mut self.hybrid
     }
 
+    /// Keep every residency boundary's report from now on, for
+    /// [`Body::take_residency_passes`]: a binary that prints the `residency
+    /// pass` records asks once. Nothing is kept until then.
+    pub fn log_residency(&mut self) {
+        self.residency_log.get_or_insert_with(Vec::new);
+    }
+
+    /// The residency machine's source, when the load runs one.
+    #[must_use]
+    pub fn residency_source(&self) -> Option<&swap::Ds41Swap> {
+        self.swap_source.as_deref()
+    }
+
+    /// The residency boundaries' reports since the last take, in order,
+    /// each with the kind of the pass it ended.
+    pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
+        self.residency_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     /// The rows the last [`ChainBody::decode_input`] read for its step: its
     /// ids at once, its engram rows once they are delivered (by the replay's
     /// service, an eager chain, or the next step's host half).
     #[must_use]
     pub fn step_rows(&self) -> &StepRows {
         &self.rows
+    }
+
+    /// Host time in the steps' synchronous parameter copies since load (ns).
+    #[must_use]
+    pub fn params_ns(&self) -> u64 {
+        self.params_ns
     }
 
     /// Kernel launches layer `layer`'s MoE sub-layer enqueues, besides its
@@ -1363,7 +1410,9 @@ impl Body {
         })?;
         // Synchronizes the stream: no launched copy of the staging is
         // pending from here on.
+        let t0 = std::time::Instant::now();
         lane.params.copy_from_host(stream, self.image.words())?;
+        self.params_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(tap) = self.tap.as_mut() {
             tap.pos[row] = Some(input.pos);
         }
@@ -2064,14 +2113,21 @@ impl Body {
                 .map_err(|e| GpuError::plan(TIER_MAP_BEFORE_UPLOAD, e))?;
         }
         let tiered = tier.is_some();
-        let mut m = GpuModel::load_placed(
+        let pool = swap::churn(plan, card, meta.levers.residency)?;
+        if let Some(p) = &pool {
+            p.check(plan)
+                .map_err(|e| GpuError::plan("deepseek41 Body::open_placed_tiered", e))?;
+        }
+        let extra = pool.as_ref().map_or(&[][..], |p| p.runs.as_slice());
+        let mut m = GpuModel::load_placed_with(
             file,
             plan,
             card,
             meta.levers.host,
+            extra,
             Body::derive,
-            |gpu, file, _, residency| {
-                Body::load_placed(gpu, file, plan, card, tier, meta, residency)
+            |gpu, file, w, residency| {
+                Body::load_placed(gpu, file, w, plan, card, tier, meta, residency)
             },
         )?;
         if tiered && meta.levers.prefill == PrefillMode::Batch {
@@ -2105,6 +2161,7 @@ impl Body {
     fn load_placed(
         gpu: &Gpu,
         file: Split,
+        w: &Weights,
         plan: &Plan<'_>,
         card: usize,
         tier: Option<TierOpen>,
@@ -2164,7 +2221,12 @@ impl Body {
             layers.clone(),
             n_expert,
         )?;
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), layers.len(), n_expert)?;
+        let slots = Arc::new(DeviceTensor::upload(
+            stream,
+            &map.stage_view(),
+            layers.len(),
+            n_expert,
+        )?);
 
         let attn =
             AttnChain::with_rows(gpu, hp, layers.clone(), image.layout(), &planner, PAIR_ROWS)?;
@@ -2209,6 +2271,20 @@ impl Body {
         };
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
+        let swap_source = match cfg.residency {
+            Residency::Off => None,
+            Residency::Mid { .. } => Some(Arc::new(swap::Ds41Swap::new(
+                plan,
+                layers.clone(),
+                Arc::clone(&file),
+                cfg.host.r8,
+                residency.set().clone(),
+                residency.populated().is_some(),
+                w,
+                gpu.context(),
+                stream,
+            )?)),
+        };
         hybrid.keep_residency(residency);
         let tier = match (tier_card, tier_index) {
             (Some(t), Some(index)) => {
@@ -2221,6 +2297,19 @@ impl Body {
             }
             _ => None,
         };
+        // Last: the machine frees each layer's spare slots, and every piece
+        // above sized itself from the load's map, capacity = live.
+        if let Some(source) = &swap_source {
+            let mc = swap::machine_cfg(cfg.residency, hybrid.slots(), hp.experts.n_used, PAIR_ROWS)
+                .ok_or_else(|| refuse("a residency machine with no rule".to_string()))?;
+            hybrid.start_swap(
+                gpu.context(),
+                stream,
+                Arc::clone(&slots),
+                Arc::clone(source) as Arc<dyn bloomery_gpu::host::swap::SwapSource>,
+                mc,
+            )?;
+        }
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
         let ced = ced::Ced::new(&hp.layers, ring_rows, cfg.ced);
@@ -2244,6 +2333,7 @@ impl Body {
             arrival,
             due: None,
             rows_failed: false,
+            params_ns: 0,
             history: Vec::with_capacity(ctx_max),
             defined: hp.candidate_free_positions(),
             holds,
@@ -2259,6 +2349,8 @@ impl Body {
             levers: cfg,
             batch: None,
             tier,
+            residency_log: None,
+            swap_source,
         })
     }
 }
@@ -2444,6 +2536,25 @@ impl HostServed for Body {
     /// holds ([`Hybrid::residency`]).
     fn host_residency(&self) -> Option<&HostResidency> {
         self.hybrid.residency()
+    }
+
+    /// The host tier's residency boundary ([`Hybrid::swap_boundary`]), its
+    /// report logged when a binary asked ([`Body::log_residency`]).
+    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if let Some(r) = self.hybrid.swap_boundary(stream)?
+            && let Some(log) = self.residency_log.as_mut()
+        {
+            log.push(r);
+        }
+        Ok(())
+    }
+
+    fn keep_rows(&mut self, kept: usize, kind: PassKind) {
+        self.hybrid.keep_rows(kept, kind);
+    }
+
+    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
+        self.hybrid.swap_reset(stream)
     }
 }
 

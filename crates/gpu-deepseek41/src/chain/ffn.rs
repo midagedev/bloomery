@@ -1066,7 +1066,7 @@ impl FfnPiece {
                 hc_fn: names::hc_ffn_fn(l),
                 hc_scale: names::hc_ffn_scale(l),
                 hc_base: names::hc_ffn_base(l),
-                n_card: map.on_card(l)?,
+                n_card: map.capacity(l)?,
                 row_off: i * map.n_expert(),
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
@@ -1351,7 +1351,7 @@ impl FfnPiece {
                 self.rows.len()
             )));
         }
-        let n_card = map.on_card(layer).ok();
+        let n_card = map.capacity(layer).ok();
         if map.layers() != self.layers || n_card != Some(c.n_card) {
             let held = n_card.map_or_else(
                 || format!("no row for layer {layer}"),

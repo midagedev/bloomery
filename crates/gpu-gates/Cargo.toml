@@ -74,6 +74,8 @@ bloomery-vision = { path = "../vision", optional = true }
 [features]
 gpu = [
     "dep:bloomery-gpu",
+    "dep:bloomery-threads",
+    "dep:libc",
     "dep:cuda-core",
     "dep:cuda-device",
     "dep:cuda-host",
@@ -184,6 +186,10 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_twocard"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_residency"
 required-features = ["deepseek41"]
 
 [[bin]]

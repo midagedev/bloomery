@@ -586,6 +586,7 @@ pub(super) struct StepStats {
     pub(super) host_calls: u64,
     pub(super) cols_served: u64,
     pub(super) cols_cols: u64,
+    pub(super) gaps: u64,
 }
 
 /// The step port: the boundary and the service state of the go/wait
@@ -633,6 +634,74 @@ pub struct StepPort {
     /// The route trace, when one is attached: each one-row step's routed
     /// ids, recorded before the service's signal and written after it.
     pub(super) trace: Option<RouteTrace>,
+    /// The routed ids each service sees, for the residency rule
+    /// ([`super::swap::Tally`]); off without a residency machine.
+    pub(super) tally: super::swap::Tally,
+    /// The residency machine's staging window, held open while the pool
+    /// waits for a go; `None` without a machine.
+    pub(super) window: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Each service's wait for its go, from the host's start of the wait to
+    /// the go seen (ns): the card's time between the host's last signal and
+    /// this layer's go. A ring of [`GAP_RING`] made at load; `stats.gaps`
+    /// counts the waits ever written.
+    gaps: Vec<u64>,
+}
+
+/// Go waits the ring keeps ([`StepPort::gap_summary`]).
+pub const GAP_RING: usize = 4096;
+
+/// The go waits of a span of services ([`StepPort::gap_summary`]), ns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GapSummary {
+    pub n: u64,
+    pub min_ns: u64,
+    /// The lower median.
+    pub p50_ns: u64,
+    pub max_ns: u64,
+}
+
+/// The summary of waits `from..to` of a ring of `ring.len()` that has had
+/// `written` waits written in turn, or why not.
+fn gap_span(ring: &[u64], written: u64, from: u64, to: u64) -> Result<GapSummary, String> {
+    let len = ring.len() as u64;
+    if from > to || to > written {
+        return Err(format!("services {from}..{to} of {written} written"));
+    }
+    if written - from > len {
+        return Err(format!(
+            "services {from}..{to}: the ring of {len} holds the last {len} of {written}"
+        ));
+    }
+    let n = to - from;
+    if n == 0 {
+        return Ok(GapSummary::default());
+    }
+    let at = |k: u64| ring[usize::try_from(k % len).unwrap_or(0)];
+    let mut out = GapSummary {
+        n,
+        min_ns: u64::MAX,
+        ..GapSummary::default()
+    };
+    for k in from..to {
+        out.min_ns = out.min_ns.min(at(k));
+        out.max_ns = out.max_ns.max(at(k));
+    }
+    // The lower median by counting: the value with at most (n-1)/2 below it
+    // and more than (n-1)/2 at or below it.
+    let half = (n - 1) / 2;
+    for k in from..to {
+        let v = at(k);
+        let (mut below, mut upto) = (0u64, 0u64);
+        for j in from..to {
+            below += u64::from(at(j) < v);
+            upto += u64::from(at(j) <= v);
+        }
+        if below <= half && upto > half {
+            out.p50_ns = v;
+            break;
+        }
+    }
+    Ok(out)
 }
 
 impl StepPort {
@@ -668,7 +737,18 @@ impl StepPort {
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
             trace: None,
+            tally: super::swap::Tally::off(),
+            window: None,
+            gaps: vec![0; GAP_RING],
         }
+    }
+
+    /// The go waits of services `from..to` (`stats.gaps` counts), with no
+    /// allocation; refused by name when the ring no longer holds them all
+    /// or the span runs past the waits written. An empty span is `n = 0`.
+    pub(super) fn gap_summary(&self, from: u64, to: u64) -> Result<GapSummary, GpuError> {
+        gap_span(&self.gaps, self.stats.gaps, from, to)
+            .map_err(|detail| GpuError::shape("StepPort::gap_summary", detail))
     }
 
     /// The boundary the chain enqueues its handoffs and waits on.
@@ -786,7 +866,16 @@ impl StepPort {
         let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
+        if let Some(w) = &self.window {
+            w.store(1, Ordering::Release);
+        }
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
+        let gap = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let Some(w) = &self.window {
+            w.store(0, Ordering::Release);
+        }
+        self.gaps[(self.stats.gaps % GAP_RING as u64) as usize] = gap;
+        self.stats.gaps += 1;
         if early {
             self.stats.go_early += 1;
             self.stats.go_early_first += u64::from(opens_replay);
@@ -903,6 +992,7 @@ impl StepPort {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
+            self.tally.note(layer, row, s, id)?;
             match slots.slot(layer, id) {
                 Some(Slot::Host) => {
                     self.list.push((id, w));
@@ -1021,6 +1111,7 @@ impl StepPort {
                 };
                 let w = f32::from_bits(wb);
                 w2_all += f64::from(w) * f64::from(w);
+                self.tally.note(layer, j, s, id)?;
                 match slots.slot(layer, id) {
                     Some(Slot::Host) => {
                         list[len] = (id, w);
@@ -1172,10 +1263,51 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, CHAINS, Chain};
+    use super::{Boundary, BoundaryShape, CHAINS, Chain, GapSummary, gap_span};
     use cuda_core::CudaContext;
     use model::ops::DEFER_MAX_COLS;
     use std::sync::Arc;
+
+    /// A span of go waits: least, lower median and most over the span, the
+    /// ring's wrap followed; an empty span is zero; a span past the waits
+    /// written or older than the ring holds is refused.
+    #[test]
+    fn a_gap_span_is_its_waits_summary() {
+        let mut ring = [0u64; 4];
+        let mut written = 0u64;
+        for v in [9, 3, 7, 1, 5, 8] {
+            ring[(written % 4) as usize] = v;
+            written += 1;
+        }
+        // The ring holds waits 2..6: 7, 1, 5, 8.
+        assert_eq!(
+            gap_span(&ring, written, 2, 6),
+            Ok(GapSummary {
+                n: 4,
+                min_ns: 1,
+                p50_ns: 5,
+                max_ns: 8
+            })
+        );
+        assert_eq!(
+            gap_span(&ring, written, 3, 6),
+            Ok(GapSummary {
+                n: 3,
+                min_ns: 1,
+                p50_ns: 5,
+                max_ns: 8
+            })
+        );
+        assert_eq!(gap_span(&ring, written, 6, 6), Ok(GapSummary::default()));
+        assert!(
+            gap_span(&ring, written, 1, 6).is_err(),
+            "wait 1 is overwritten"
+        );
+        assert!(
+            gap_span(&ring, written, 5, 7).is_err(),
+            "wait 6 is not written"
+        );
+    }
 
     /// A walk's point names its chain: one row of one column the step, two
     /// the pair, one row of 2 up to the page's columns `Cols`, one go a

@@ -34,6 +34,7 @@ use std::ops::Range;
 use gguf::GgmlType;
 
 pub mod card_budget;
+pub mod churn;
 pub mod host_lock;
 pub mod hot_list;
 pub mod workstation;
@@ -794,6 +795,11 @@ pub enum PlacementError {
     /// the layer it is on, or none for a model-wide one.
     #[error("{} feature(s) of this file are not implemented: {}", .0.len(), unimplemented_list(.0))]
     Unimplemented(Vec<Unimplemented>),
+    /// Adaptive residency's churn pool does not fit the host: the stage card
+    /// experts past the pinned ones, which the host set holds too
+    /// ([`churn::ChurnPool`]), take more than the plan's host headroom.
+    #[error("{0}")]
+    ResidencyOverHost(Box<churn::OverHost>),
     /// A card budget below what the card needs with no expert on it.
     #[error(
         "card {card}: budget {budget} B is below its floor {floor} B = dense {dense} B (the \
