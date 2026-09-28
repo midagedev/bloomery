@@ -82,7 +82,10 @@
 //!     shared: `runtime::combine::combine`), bit for bit, no fault. The five
 //!     launches captured replay as five nodes and follow places overwritten
 //!     between replays, the host slots moved. A NaN in a card column raises
-//!     `Q5Quant`, a NaN card sum `F32Product` from the combine; the launchers
+//!     `Q5Quant`, a NaN card sum `F32Product` from the combine. A place past
+//!     the card that is not `HOST` raises `ExpertId` in the quantizer (its
+//!     column not read) and in the card sum (its token NaN), a `HOST` place
+//!     in neither, each launch alone over NaN host columns; the launchers
 //!     refuse a card of no expert, weights at a pitch of ten, columns past the
 //!     scratch and a slot past the weights.
 
@@ -1967,6 +1970,14 @@ mod gate {
         1, 2, 5, 0, 4, 2, HOST, 6, 3, HOST,
     ];
 
+    /// [`SEL38`] with token 1's first host slot (slot 11) at place [`E38`]:
+    /// neither a card expert nor [`HOST`].
+    const SEL38_STRAY: [u32; 20] = {
+        let mut s = SEL38;
+        s[11] = E38 as u32;
+        s
+    };
+
     /// The router's weights of clause 10's tokens: each token's own ten, then
     /// its shared expert's gate, none two alike across the tokens.
     fn weights38() -> Vec<f32> {
@@ -2065,6 +2076,7 @@ mod gate {
                     n: N38,
                     m: M38,
                     n_card: E38,
+                    fault: sink,
                     acc: &mut self.acc,
                 },
             )?;
@@ -2259,7 +2271,95 @@ mod gate {
             shown(f32_product),
             verdict(pass)
         );
+        ok &= check_q38_card_places(c, &mut leg, &h)?;
         ok &= check_q38_card_host_contract(c, &mut leg)?;
+        Ok(ok)
+    }
+
+    /// Clause 10's places, per entry: [`SEL38_STRAY`]'s place past the card
+    /// raises `ExpertId`, [`SEL38`]'s [`HOST`] places raise nothing. `h` is
+    /// the gate·up's output with the host columns zeroed; both entries here
+    /// see every [`SEL38`] host column NaN, so reading one would show.
+    fn check_q38_card_places(c: &Ctx, leg: &mut Leg38, h: &[f32]) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let slots = SEL38.len();
+        let expert_id = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+        let stray = DeviceBuffer::from_host(stream, &SEL38_STRAY)?;
+        let host_slots: Vec<usize> = (0..slots).filter(|&s| SEL38[s] == HOST).collect();
+        let mut hp = h.to_vec();
+        for &s in &host_slots {
+            hp[s * FF38..(s + 1) * FF38].fill(f32::NAN);
+        }
+        let hp = DeviceBuffer::from_host(stream, &hp)?;
+        let mut down = leg.y_down.to_host_vec(stream)?;
+        for &s in &host_slots {
+            down[s * N38..(s + 1) * N38].fill(f32::NAN);
+        }
+        leg.y_down.copy_from_host(stream, &down)?;
+        let (acc_ref, _) = leg.host_rule(c, &SEL38)?;
+        let mut ok = true;
+        // (case, the places, slot 11's place, the fault, token 1's check)
+        let cases = [
+            ("host_places", &leg.sel, SEL38[11], None, "is_the_rule"),
+            ("stray_place", &stray, SEL38_STRAY[11], expert_id, "all_nan"),
+        ];
+        for (case, sel, place11, want, token1_is) in cases {
+            // The quantizer: the fault's mask names ExpertId alone, so the
+            // stray column's NaNs were never loaded.
+            let q = QuantSel {
+                x: &hp,
+                cols: 0..slots,
+                sel,
+                n_card: E38,
+            };
+            c.gpu
+                .q5()
+                .enqueue_quantize_q8_sel(stream, &q, &mut leg.act_h, sink)?;
+            stream.synchronize()?;
+            let qf = c.gpu.take_fault()?;
+            let pass = qf == want;
+            ok &= pass;
+            println!(
+                "q38_card_place[quantize_sel:{case}] slot11_place={place11} fault=\"{}\" want=\"{}\" {}",
+                shown(qf),
+                shown(want),
+                verdict(pass)
+            );
+            // The card sum: token 0 the rule's; token 1 the rule's, or NaN
+            // where its slot 1 is stray.
+            leg.q38.enqueue_card_acc(
+                stream,
+                CardAccArgs {
+                    down: &leg.y_down,
+                    w: &leg.w,
+                    sel,
+                    n: N38,
+                    m: M38,
+                    n_card: E38,
+                    fault: sink,
+                    acc: &mut leg.acc,
+                },
+            )?;
+            stream.synchronize()?;
+            let af = c.gpu.take_fault()?;
+            let acc = leg.acc.to_host_vec(stream)?;
+            let token0 = bits_equal(&acc[..N38], &acc_ref[..N38]);
+            let token1 = if want.is_some() {
+                acc[N38..].iter().all(|v| v.is_nan())
+            } else {
+                bits_equal(&acc[N38..], &acc_ref[N38..])
+            };
+            let pass = af == want && token0 && token1;
+            ok &= pass;
+            println!(
+                "q38_card_place[card_acc:{case}] slot11_place={place11} fault=\"{}\" want=\"{}\" \
+                 token0_is_the_rule={token0} token1_{token1_is}={token1} {}",
+                shown(af),
+                shown(want),
+                verdict(pass)
+            );
+        }
         Ok(ok)
     }
 
@@ -2280,6 +2380,7 @@ mod gate {
                     n: N38,
                     m: M38,
                     n_card,
+                    fault: sink,
                     acc: &mut leg.acc,
                 },
             ));
