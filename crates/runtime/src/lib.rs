@@ -29,6 +29,7 @@ mod speculative;
 pub mod state;
 mod stop;
 pub mod stores;
+pub mod swaprule;
 
 pub use lookup::Lookup;
 pub use speculative::{
