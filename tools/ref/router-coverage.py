@@ -3,7 +3,7 @@
 
     tools/ref/router-coverage.py coverage <set> [<set>...] [--n 16,32,...] [--layers 3-10,13-43]
     tools/ref/router-coverage.py transfer <set A> <set B> [--n 64]
-    tools/ref/router-coverage.py compare <set A> <set B>
+    tools/ref/router-coverage.py compare <set A> <set B> [--tokens N]
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
     tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec> [--hot <file>]] [--layers 2-39]
     tools/ref/router-coverage.py --self-test
@@ -31,7 +31,9 @@ transfer  Per layer, with each set's hot-n list learned on all its tokens: the o
           share (split as coverage's), and the same the other way round. Does a list learned on one stream serve another?
 compare   Two traces of the same tokens (another schedule, ubatch or backend), token by token, per
           layer: the ids equal in rank order, the ids shared as sets, the tokens whose selection is the
-          same set, and the first layer where any token's set differs.
+          same set, and the first layer where any token's set differs. --tokens N compares the first N
+          tokens of two sets of other lengths, traced from the same ids file in the same chunk size
+          (another model file's trace of the same text, say).
 bursts    Per window of W consecutive positions inside one chunk (--window, default 512; a window across a
           chunk edge crosses a context reset and is skipped), how bursty the routing of the host experts
           is — the experts the card does not hold (--n-l and --hot as tools/ref/window-union.py reads
@@ -264,25 +266,41 @@ def agreement(a, b, K):
     return ranked, shared, same
 
 
-def compare(dir_a, dir_b):
+def compare(dir_a, dir_b, tokens=None):
+    """Token by token over both sets, or over their first `tokens` tokens: a prefix is the same
+    tokens at the same positions only when both were traced from the same ids file in the same chunk
+    size, so both are required. Returns the first layer with a differing set, or None."""
     a, b = read_manifest(dir_a), read_manifest(dir_b)
-    if (a["tokens"], a["n_used"], a["layers"]) != (b["tokens"], b["n_used"], b["layers"]):
-        raise SetError("the two sets differ in token count, top-k or layers")
+    if (a["n_used"], a["layers"]) != (b["n_used"], b["layers"]):
+        raise SetError("the two sets differ in top-k or layers")
+    if tokens is None:
+        if a["tokens"] != b["tokens"]:
+            raise SetError(f"the two sets differ in token count ({a['tokens']} vs {b['tokens']}); "
+                           "--tokens N compares a common prefix")
+        T = a["tokens"]
+    else:
+        if tokens < 1 or tokens > min(a["tokens"], b["tokens"]):
+            raise SetError(f"--tokens {tokens} is not in 1..{min(a['tokens'], b['tokens'])}, the shorter set")
+        if a["header"].get("chunk") != b["header"].get("chunk"):
+            raise SetError(f"--tokens needs one chunk size: A `{a['header'].get('chunk')}`, "
+                           f"B `{b['header'].get('chunk')}` put the prefix at other positions")
+        T = tokens
     if a["header"].get("ids_md5") != b["header"].get("ids_md5"):
         raise SetError("the two sets were traced from different ids files")
-    T, K = a["tokens"], a["n_used"]
+    K = a["n_used"]
     print(f"## compare: A = {dir_a}, B = {dir_b} ({T} tokens, top-{K})\n")
-    for key in ("schedule", "n_ubatch", "flags"):
+    for key in ("model", "build", "schedule", "n_ubatch", "flags"):
         print(f"- {key}: A `{a['header'].get(key)}`, B `{b['header'].get(key)}`")
     print("\n| layer | ids equal, rank order % | ids shared as sets % | tokens with the same set % |")
     print("|---:|---:|---:|---:|")
     first_diff = None
     for l in a["layers"]:
-        ranked, shared, same = agreement(read_topk(a, l), read_topk(b, l), K)
+        ranked, shared, same = agreement(read_topk(a, l)[:T * K], read_topk(b, l)[:T * K], K)
         if same < T and first_diff is None:
             first_diff = l
         print(f"| {l} | {pct(ranked / (T * K))} | {pct(shared / (T * K))} | {pct(same / T)} |")
     print(f"\nfirst layer with a differing set: {first_diff if first_diff is not None else 'none'}\n")
+    return first_diff
 
 
 def window_union():
@@ -592,7 +610,22 @@ def self_test():
             except SetError:
                 pass
             transfer(two, two, 2)
-            compare(two, two)
+            assert compare(two, two) is None
+            # a prefix: the same first four tokens, then a differing tail and a longer set
+            head = [[0, 1], [2, 3], [4, 5], [6, 7]]
+            short = make("short", {0: head + [[0, 1]] * 2}, chunk=4)
+            long_ = make("long", {0: head + [[7, 6], [5, 4], [3, 2]]}, chunk=4)
+            other = make("chunk2", {0: head + [[0, 1]] * 3}, chunk=2)
+            assert compare(short, long_, 4) is None
+            assert compare(short, long_, 5) == 0
+            for args, why in (((short, long_), "unequal token counts without --tokens"),
+                              ((short, long_, 7), "--tokens past the shorter set"),
+                              ((short, other, 4), "two chunk sizes")):
+                try:
+                    compare(*args)
+                    raise AssertionError(f"compare accepted {why}")
+                except SetError:
+                    pass
             bursts([two], 2)
         finally:
             sys.stdout = saved
@@ -622,8 +655,10 @@ def main(argv):
             n = int(argv[4]) if len(argv) == 5 and argv[3] == "--n" else 64
             transfer(argv[1], argv[2], n)
             return 0
-        if len(argv) == 3 and argv[0] == "compare":
-            compare(argv[1], argv[2])
+        if argv[:1] == ["compare"] and len(argv) in (3, 5):
+            if len(argv) == 5 and argv[3] != "--tokens":
+                raise SetError(f"compare: unknown flag {argv[3]}")
+            compare(argv[1], argv[2], int(argv[4]) if len(argv) == 5 else None)
             return 0
         if len(argv) == 3 and argv[0] == "oracle":
             return oracle(argv[1], argv[2])
