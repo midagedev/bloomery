@@ -2,7 +2,7 @@
 # Sitting r0928: the research probes of the 2026-09-28 idea audit, in one run from the Mac (lead-only).
 # Each job is an existing recipe or runner with its prediction card (docs/cards/r0928-<slug>.card);
 # this script owns only the order, the hold, the logs and the post-reads.
-# Predicted: 58 min of jobs, the cards' minutes summed (54 while the union job is skipped; --dry-run sums the
+# Predicted: 75 min of jobs, the cards' minutes summed (71 while the union job is skipped; --dry-run sums the
 # jobs that run), plus the builds each recipe runs before its lease.
 #
 #   tools/ref/sitting-r0928.sh             # the sitting: the hold up, every job, the hold down
@@ -16,11 +16,14 @@
 # between two jobs. The hold comes down on every exit path (trap). A job that takes the lease does so
 # inside its runner, card first (lease_take); the builds run before each lease, under the hold.
 #
-# Order (the page cache): the Qwen3 jobs, then the V4.1 jobs, the engram residency read right after them
-# (its card asks for the cache the V4.1 prompts left), the V4.1 split proxy (its split arm's host set holds
-# the tier's 23 experts a layer beyond hot list 384's, so it runs after the engram read and while the hot
-# arm's set is still cached), GLM, and last the two-card probes, whose 8 GiB host chunks would evict the
-# model files ahead of the loads.
+# Order (the page cache): the Qwen3 jobs, the Qwen3 half of the A6000 A/A last among them (aaq3: its twelve
+# loads read the file the Qwen3 jobs left cached), then the V4.1 jobs, the engram residency read right after
+# them (its card asks for the cache the V4.1 prompts left), the V4.1 split proxy (its split arm's host set
+# holds the tier's 23 experts a layer beyond hot list 384's, so it runs after the engram read and while the
+# hot arm's set is still cached), the V4.1 half of the A/A (aav41: prose:512 at hot list 384, whose host set
+# the split's hot arm has just read; after the engram read, so that read's cache is the V4.1 prompts'), GLM,
+# and last the two-card probes, whose 8 GiB host chunks would evict the model files ahead of the loads. The
+# A/A is two jobs of one card: one lease a model, each next to its model's jobs.
 #
 # Logs: every job's whole stdout and stderr go to <dir>/<job>.log before anything reads them (never
 # through a pipe that could cut them); the post-reads read those files and write <dir>/<job>.post;
@@ -40,17 +43,23 @@ THREADS_OFFSET=2257500
 
 # The jobs, in the sitting's order: name | card slug | predicted minutes | the command, run from ROOT with
 # BLOOMERY_BOX_ENV set to the card plus the job's own entries (a `box=` prefix, `;`-separated, before `|`).
+# The A/A's same-binary arms: V4.1's second arm is the first run alone (@BLOOMERY_AB_LOAD=arm, which the runner
+# strips before the binary sees it), so the two share argv and environment; Qwen3's is the ours binary named
+# again as a bin: arm, the runner's only same-binary form. Its $PWD stays literal on the Mac (a word of $cmd, a
+# single-quoted recipe line, box.sh's "$*") and expands on the box after box.sh's cd into the remote tree.
 JOBS=(
   "q6k|r0928-q6k-ncu|3|mac=BLOOMERY_MODEL=qwen3moe|q6k_cmd"
   "kv512|r0928-q3kv-nsys512|2||just nsys-gpu-qwen3moe-prefill 512"
   "clock4096|r0928-q3clock-nsys4096|2||just nsys-gpu-qwen3moe-prefill 4096"
   "s|r0928-q3s-pp|3|mac=BLOOMERY_AB_ROUNDS=3|just depth-gpu-qwen3moe 1 2 3 4 5"
+  "aaq3|r0928-aa-ruler|5|mac=BLOOMERY_AB_ROUNDS=6|just depth-gpu-qwen3moe 512 bin:\$PWD/target/release/generate_qwen3moe:512"
   "imma|r0928-imma-m128|1||just time-gpu-probe-imma"
   "join|r0928-join-nsys|4|box=BLOOMERY_HOT_LIST=$HOT;BLOOMERY_STEP_STATS=1;BLOOMERY_NSYS_N=8|just nsys-gpu-ds41 6"
   "enqueue|r0928-enqueue-g2|5|mac=BLOOMERY_AB_ROUNDS=1;box=BLOOMERY_HOT_LIST=$HOT;BLOOMERY_STEP_STATS=1|just depth-gpu-ds41 4096"
   "gt|r0928-gt-ncu|5|box=BLOOMERY_HOT_LIST=$HOT|just ncu-gpu-ds41-gt 512"
   "engram|r0928-engram-resident|3||engram_cmd"
   "split|r0928-split-proxy|8|mac=BLOOMERY_AB_ROUNDS=2;box=BLOOMERY_HOT_LIST=$HOT;BLOOMERY_STEP_STATS=1;BLOOMERY_AB_WARMUP=0|split_cmd"
+  "aav41|r0928-aa-ruler|12|mac=BLOOMERY_AB_ROUNDS=3;box=BLOOMERY_HOT_LIST=$HOT|just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_AB_LOAD=arm"
   "union|r0928-union-split|4||just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms unionr8:4x8u0.125,unionr8:4x16u0.0625"
   "glm|r0928-glm-nsys|15||just nsys-gpu-glm5next 512"
   "tred|r0928-tred|1|box=BLOOMERY_OTHER_STRICT=1|just time-gpu-probe-tred"
@@ -300,6 +309,135 @@ split_post() { # split_post <log>
   split_decide $r
 }
 
+# The A/A (card r0928-aa-ruler): per model two same-binary arms, a (the runner's `prose` / `ours`) and b
+# (`prose@BLOOMERY_AB_LOAD=arm` / the one `bin:<tree>` label), two terms each: decode tok/s(mean) and pp tok/s,
+# read from every counted row (tag ROW). A V4.1 row's plan and time prompt records, echoed before it, are read
+# by tools/bloomery/records.py by kind and field: the row is void unless its plan is place a with the job's hot
+# list and exactly one time prompt record's tok/s is its row's pp_tok/s. generate_qwen3moe's lines have no
+# records.py schema, so a Qwen3 row is read from its ROW line alone. A row tagged [cold], [cpu-busy] or
+# [other-busy] is void; a void row is printed with its values and counts in no term. Per term: each arm's
+# per-round values, mean and SD (sample SD in % of its mean), the pooled SD with its df, and the mean
+# difference b / a - 1 against h = t(0.975, df) x s_p x sqrt(1/n_a + 1/n_b), card.py's interval. A term with
+# fewer than two clean rounds in either arm is void.
+AA_POST=$(cat << 'PY'
+import importlib.util, math, re, statistics, sys
+records_py, tdist_py, log, model, hot = sys.argv[1:6]
+
+
+def module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+t975 = module(tdist_py, "tdist").t975
+schema = module(records_py, "records").load() if model == "v41" else None
+TAG = re.compile(r"^(ROW|WARMUP|DISCARD|PRIME|COLD|FAIL) r(\d+) (\S+) [dp]=(\d+)")
+DECODE = re.compile(r"\| tok/s\(mean\) ([0-9.]+) @")
+PP = re.compile(r"\| pp_tok/s ([0-9.]+) \(n=(\d+)")
+BAD = ("[cold]", "[cpu-busy]", "[other-busy]")
+arm_a = {"v41": "prose", "q3": "ours"}[model]
+arm_b = "prose@BLOOMERY_AB_LOAD=arm" if model == "v41" else None
+plan, pending, rows = None, [], []
+for raw in open(log, errors="replace"):
+    line = raw.strip()
+    m = TAG.match(line)
+    if m:
+        label = m.group(3)
+        if m.group(1) == "ROW" and (label == arm_a or label == arm_b or (model == "q3" and label.startswith("bin:"))):
+            dec, pp = DECODE.search(line), PP.search(line)
+            if not dec or not pp:
+                sys.exit(f"aa: a {label} row without tok/s(mean) or pp_tok/s: {line}")
+            rows.append((int(m.group(2)), label, float(dec.group(1)), float(pp.group(1)), int(pp.group(2)), plan,
+                         pending, [t for t in BAD if t in line]))
+        pending = []
+        continue
+    if schema is None:
+        continue
+    rec = schema.read_line(line)
+    if rec is None:
+        continue
+    if rec.kind == "plan":
+        plan = rec
+    elif rec.kind == "time_prompt":
+        pending.append(rec)
+if model == "q3":
+    bins = sorted({r[1] for r in rows if r[1].startswith("bin:")})
+    if len(bins) > 1:
+        sys.exit(f"aa: more than one bin: label {bins}; the A/A has one second arm")
+    arm_b = bins[0] if bins else "bin:?"
+val = {}
+for r, label, dec, pp, n, pl, recs, tags in rows:
+    why = " ".join(tags)
+    if model == "v41" and not why:
+        tps = [x["tok/s"] for x in recs]
+        if pl is None:
+            why = "no plan record before it"
+        elif pl.get("place") != "a" or pl.get("hot_list") != hot:
+            why = f"its plan ran place={pl.get('place')} hot_list={pl.get('hot_list')}"
+        elif tps != [pp]:
+            why = f"time prompt tok/s {tps} is not its pp_tok/s {pp}"
+    if why:
+        print(f"aa {model} r{r} {label} VOID ({why}): decode {dec} pp {pp}")
+        continue
+    val.setdefault(("decode", label), {})[r] = dec
+    val.setdefault((f"pp{n}", label), {})[r] = pp
+terms = sorted({t for t, _ in val}, key=lambda t: (t != "decode", t)) or ["decode"]
+for term in terms:
+    xs = {}
+    for label in (arm_a, arm_b):
+        per = val.get((term, label), {})
+        xs[label] = [per[r] for r in sorted(per)]
+        if len(per) > 1:
+            v = xs[label]
+            print(f"aa {model} {term} {label}: {' '.join(f'r{r} {per[r]:.2f}' for r in sorted(per))} | n {len(v)} "
+                  f"mean {statistics.fmean(v):.2f} sd {statistics.stdev(v) / statistics.fmean(v) * 100:.3f} %")
+        elif per:
+            print(f"aa {model} {term} {label}: {' '.join(f'r{r} {per[r]:.2f}' for r in sorted(per))} | n 1")
+    na, nb = len(xs[arm_a]), len(xs[arm_b])
+    if na < 2 or nb < 2:
+        print(f"aa {model} {term} void: {arm_a} {na} clean round(s), {arm_b} {nb}; a term needs two in each arm")
+        continue
+    sa = statistics.stdev(xs[arm_a]) / statistics.fmean(xs[arm_a]) * 100
+    sb = statistics.stdev(xs[arm_b]) / statistics.fmean(xs[arm_b]) * 100
+    df = na + nb - 2
+    sp = math.sqrt(((na - 1) * sa ** 2 + (nb - 1) * sb ** 2) / df)
+    d = (statistics.fmean(xs[arm_b]) / statistics.fmean(xs[arm_a]) - 1) * 100
+    h = t975(df) * sp * math.sqrt(1 / na + 1 / nb)
+    cause = "an order or warm-up effect" if model == "v41" else \
+        "an order, warm-up or driver-shape effect (ours --arm-sync against bin: --tokens)"
+    print(f"aa {model} {term} pooled sd {sp:.3f} % df {df} | diff b/a {d:+.3f} % h {h:.3f} % (t {t975(df):.3f}) "
+          f"{'inside' if abs(d) <= h else 'OUTSIDE: ' + cause}")
+PY
+)
+# aa_decide <pooled sd %>...: the card's rule on the largest term (0.35..0.63 in, under below, over above).
+aa_decide() {
+  awk 'BEGIN { if (ARGC < 2) exit 1; m = ARGV[1]; for (i = 2; i < ARGC; i++) if (ARGV[i] + 0 > m + 0) m = ARGV[i]
+    v = m + 0 < 0.35 ? "below" : (m + 0 > 0.63 ? "above" : "in")
+    a = v == "in" ? "the ruler stays 0.6 %" : "sd_same_binary, card.py SD_DEFAULT and the AGENTS.md ruler take " m " %"
+    printf "aa verdict: largest pooled sd %s %% over %d term(s): %s — %s\n", m, ARGC - 1, v, a }' "$@"
+}
+# aa_post <log> <v41|q3> [<the other half's post file>]: the terms of one job, then the verdict over them and,
+# when the other half's post is there, over both models' terms.
+aa_post() {
+  local out sds other=${3:-}
+  out=$(python3 - "$ROOT/tools/bloomery/records.py" "$ROOT/tools/ref/tdist.py" "$1" "$2" "$HOT" <<< "$AA_POST") || { echo "$out"; return 1; }
+  echo "$out"
+  if [ -n "$other" ]; then
+    if [ -r "$other" ]; then
+      echo "aa: with the other half's terms from $other"
+      out=$(printf '%s\n' "$out"; grep -E '^aa (v41|q3) [^ ]+ pooled sd ' "$other")
+    else
+      echo "aa: no post at $other (that half did not run or ended non-zero): the verdict is this half's alone"
+    fi
+  fi
+  sds=$(sed -nE 's/^aa (v41|q3) [^ ]+ pooled sd ([0-9.]+) %.*/\2/p' <<< "$out")
+  [ -n "$sds" ] || { echo "aa verdict: void (no term has two clean rounds in both arms)"; return 1; }
+  # shellcheck disable=SC2086 # the pooled SDs, one word each
+  aa_decide $sds
+}
+
 ro_box() { # ro_box <command>, the script on stdin: a read-only box command (syncs nothing, builds nothing)
   BLOOMERY_BOX_READONLY=1 ./tools/box.sh "$1"
 }
@@ -340,6 +478,8 @@ post() { # post <job> <log>: the job's post-read into stdout
     imma) grep -E '^probe (check|imma) ' "$log" ;;
     engram) grep -E '^probe (check|engram) ' "$log" ;;
     split) split_post "$log" ;;
+    aaq3) aa_post "$log" q3 ;;
+    aav41) aa_post "$log" v41 "$DIR/aaq3.post" ;;
     union) grep -E 'unionr8' "$log" ;;
     glm) grep -E '^(#|--- |    time |    SMOKE)' "$log" | grep -vE '^--- sources' ;;
     tred) grep -E '^probe (check|peer|tred) ' "$log" ;;
@@ -419,6 +559,77 @@ EOF
   [ "${got##*: }" = hold ] || { echo "self-test: split_decide with one P between: $got" >&2; fail=1; }
   got=$(split_decide 0.80 0.96)
   [ "${got##*: }" = hold ] || { echo "self-test: split_decide with the two P apart: $got" >&2; fail=1; }
+  # aa, Qwen3: three clean rounds; the warm-up and a FAIL row count in no term. decode: ours 200, 202, 198
+  # (SD 2 over 200, 1.000 %), bin: 206, 208, 204 (2 over 206, 0.971 %); pooled sqrt((2 x 1 + 2 x 0.9426) / 4) =
+  # 0.986 % at df 4, diff +3.000 % against h = 2.776 x 0.986 x sqrt(2/3) = 2.234: outside. pp: ours 7800, 7878,
+  # 7722 (1.000 %), bin: 7800, 7839, 7761 (0.500 %); pooled 0.791 %, h 1.792, diff 0: inside.
+  aa_q3_row() { # aa_q3_row <tag> <round> <label> <decode tok/s> <pp tok/s> [<tags>]
+    echo "$1 r$2 $3 d=512 n=96 ctx=768 | tok/s(mean) $4 @ n=96, depth 512, A6000 | p50 5.000 ms | mean 5.000 ms | tok/s(p50) $4 | warm 0 | first10_p50 5 | last10_p50 5 | distinct_tokens 9 | nodes 700 | pp_tok/s $5 (n=512, passes=1, kind=ubatch) | wall 21s | majflt 0 (timed 0; ≤ 0 % of W 1 s)${6:+ $6}"
+  }
+  {
+    aa_q3_row WARMUP 0 ours 150.00 5000.00
+    aa_q3_row ROW 1 ours 200.00 7800.00
+    aa_q3_row ROW 1 bin:bloomery 206.00 7800.00
+    aa_q3_row ROW 2 bin:bloomery 208.00 7839.00
+    aa_q3_row ROW 2 ours 202.00 7878.00
+    echo "FAIL r3 ours d=512 rc=1 | no SMOKE line"
+    aa_q3_row ROW 3 ours 198.00 7722.00
+    aa_q3_row ROW 3 bin:bloomery 204.00 7761.00
+  } > "$d/aaq3.log"
+  got=$(aa_post "$d/aaq3.log" q3 2>&1)
+  printf '%s\n' "$got" > "$d/aaq3.post"
+  grep -q '^aa q3 decode ours: r1 200.00 r2 202.00 r3 198.00 | n 3 mean 200.00 sd 1.000 %$' <<< "$got" || { echo "self-test: aa q3 decode ours: $got" >&2; fail=1; }
+  grep -q '^aa q3 decode bin:bloomery: .* | n 3 mean 206.00 sd 0.971 %$' <<< "$got" || { echo "self-test: aa q3 decode bin: $got" >&2; fail=1; }
+  grep -q '^aa q3 decode pooled sd 0.986 % df 4 | diff b/a +3.000 % h 2.234 % (t 2.776) OUTSIDE: an order, warm-up or driver-shape' <<< "$got" || { echo "self-test: aa q3 decode pooled: $got" >&2; fail=1; }
+  grep -q '^aa q3 pp512 pooled sd 0.791 % df 4 | diff b/a +0.000 % h 1.792 % (t 2.776) inside$' <<< "$got" || { echo "self-test: aa q3 pp512 pooled: $got" >&2; fail=1; }
+  grep -q '^aa verdict: largest pooled sd 0.986 % over 2 term(s): above — ' <<< "$got" || { echo "self-test: aa q3 verdict: $got" >&2; fail=1; }
+  # aa, V4.1: three clean rounds, and four void rows (r4 a [cold] row and a row whose time prompt record is not
+  # its pp column, r5 a plan of another hot list and a [cpu-busy] row). decode: 30, 30.3, 29.7 (1.000 %) and 30,
+  # 30.15, 29.85 (0.500 %), pooled 0.791 %; pp: 200, 201, 199 (0.500 %) and 200, 200.5, 199.5 (0.250 %), pooled
+  # sqrt((2 x 0.25 + 2 x 0.0625) / 4) = 0.395 %, h 0.896. With the Qwen3 half's post the verdict is over four terms.
+  aa_v41_arm() { # aa_v41_arm <round> <label> <hot list> <decode tok/s> <pp tok/s> <time prompt tok/s> [<tags>]
+    echo "[load] r$1 1 arm(s): - one process, one load"
+    echo "    plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44000000000 B) host_experts=12692 (214000000000 B) host_shadow=0 B n_l=70..71 on 38 layers card_budget=none hot_list=$3"
+    echo "time prompt n=512 ms=2560.0000 tok/s=$6 passes=1 kind=batch"
+    echo "ROW r$1 $2 d=512 n=96 | tok/s(mean) $4 @ n=96, depth 512, A6000 | place a | p50 33.3 ms | mean 33.3 ms | pp_tok/s $5 (n=512, passes=1, kind=batch) | majflt 0 (timed 0; ≤ 0 % of W 5 s) | slot 1/1 | wall 90s${7:+ $7}"
+  }
+  aa_b=prose@BLOOMERY_AB_LOAD=arm
+  {
+    aa_v41_arm 1 prose "$HOT" 30.00 200.00 200.00
+    aa_v41_arm 1 "$aa_b" "$HOT" 30.00 200.00 200.00
+    aa_v41_arm 2 "$aa_b" "$HOT" 30.15 200.50 200.50
+    aa_v41_arm 2 prose "$HOT" 30.30 201.00 201.00
+    aa_v41_arm 3 prose "$HOT" 29.70 199.00 199.00
+    aa_v41_arm 3 "$aa_b" "$HOT" 29.85 199.50 199.50
+    aa_v41_arm 4 prose "$HOT" 31.00 210.00 210.00 '[cold]'
+    aa_v41_arm 4 "$aa_b" "$HOT" 31.00 210.00 209.00
+    aa_v41_arm 5 prose /tmp/other-hot.txt 31.00 210.00 210.00
+    aa_v41_arm 5 "$aa_b" "$HOT" 31.00 210.00 210.00 '[cpu-busy]'
+  } > "$d/aav41.log"
+  got=$(aa_post "$d/aav41.log" v41 "$d/aaq3.post" 2>&1)
+  grep -q '^aa v41 decode pooled sd 0.791 % df 4 | diff b/a +0.000 % h 1.792 % (t 2.776) inside$' <<< "$got" || { echo "self-test: aa v41 decode pooled: $got" >&2; fail=1; }
+  grep -q '^aa v41 pp512 pooled sd 0.395 % df 4 | diff b/a +0.000 % h 0.896 % (t 2.776) inside$' <<< "$got" || { echo "self-test: aa v41 pp512 pooled: $got" >&2; fail=1; }
+  [ "$(grep -c '^aa v41 r[45] .* VOID (' <<< "$got")" = 4 ] || { echo "self-test: aa v41 did not void the four r4/r5 rows: $got" >&2; fail=1; }
+  grep -q '^aa v41 r4 prose@BLOOMERY_AB_LOAD=arm VOID (time prompt tok/s \[209.0\] is not its pp_tok/s 210.0)' <<< "$got" || { echo "self-test: aa v41 time prompt cross-check: $got" >&2; fail=1; }
+  grep -q '^aa verdict: largest pooled sd 0.986 % over 4 term(s): above — ' <<< "$got" || { echo "self-test: aa joint verdict: $got" >&2; fail=1; }
+  got=$(aa_post "$d/aav41.log" v41 "$d/absent.post" 2>&1)
+  grep -q '^aa verdict: largest pooled sd 0.791 % over 2 term(s): above — ' <<< "$got" || { echo "self-test: aa v41-alone verdict: $got" >&2; fail=1; }
+  # One clean round a arm is no term: the verdict is void and the post fails.
+  aa_q3_row ROW 1 ours 200.00 7800.00 > "$d/aaq3-one.log"
+  aa_q3_row ROW 1 bin:bloomery 206.00 7800.00 >> "$d/aaq3-one.log"
+  got=$(aa_post "$d/aaq3-one.log" q3 2>&1) && { echo "self-test: aa_post passed with no term: $got" >&2; fail=1; }
+  grep -q '^aa verdict: void' <<< "$got" || { echo "self-test: aa void verdict: $got" >&2; fail=1; }
+  # The rule's edges: 0.35 and 0.63 are in the band; the largest term decides.
+  got=$(aa_decide 0.35)
+  [ "$(cut -d: -f3 <<< "$got" | cut -d' ' -f2)" = in ] || { echo "self-test: aa_decide at 0.35: $got" >&2; fail=1; }
+  got=$(aa_decide 0.349)
+  [ "$(cut -d: -f3 <<< "$got" | cut -d' ' -f2)" = below ] || { echo "self-test: aa_decide under 0.35: $got" >&2; fail=1; }
+  got=$(aa_decide 0.2 0.63)
+  [ "$(cut -d: -f3 <<< "$got" | cut -d' ' -f2)" = in ] || { echo "self-test: aa_decide at 0.63: $got" >&2; fail=1; }
+  got=$(aa_decide 0.631 0.2)
+  [ "$(cut -d: -f3 <<< "$got" | cut -d' ' -f2)" = above ] || { echo "self-test: aa_decide over 0.63: $got" >&2; fail=1; }
+  got=$(aa_decide 0.2 0.3)
+  [ "$got" = "aa verdict: largest pooled sd 0.3 % over 2 term(s): below — sd_same_binary, card.py SD_DEFAULT and the AGENTS.md ruler take 0.3 %" ] || { echo "self-test: aa_decide below: $got" >&2; fail=1; }
   rm -rf "$d"
   [ "$fail" = 0 ] && echo "sitting-r0928 self-test: ok"
   return "$fail"

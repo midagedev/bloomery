@@ -1,0 +1,50 @@
+# Sitting r0928, jobs `aaq3` and `aav41`: the A/B ruler on the A6000. The ruler (AGENTS.md 「Know the ruler」,
+# card.py's SD_DEFAULT, tools/flow/constants.tsv sd_same_binary) is a per-run SD of 0.6 % from 18 host-CPU decode
+# runs, yet it sizes every GPU A/B. What the A6000 already shows [derived]: the between-round SD of one arm inside one
+# lease, pooled over the clean rows of the 2026-09-28 release sitting's runner logs, is 0.35 % (Qwen3.6 window, df 30)
+# and 0.63 % (GLM, df 18); those windows rotated several engines, so neither is a same-binary A/A. This is one.
+# Arms. V4.1: `prose:512` and `prose:512@BLOOMERY_AB_LOAD=arm` — two one-arm loads with the same argv and environment
+# (depth-ds41.sh strips the solo pair before the binary sees it and keeps it in the label). Qwen3-30B: `512` and
+# `bin:$PWD/target/release/generate_qwen3moe:512`, the ours binary named again as a bin: arm ($PWD expands on the box
+# to the remote tree), the runner's only same-binary form and the shape of every Qwen3 A/B so far (ours against
+# bin:<base>). The two Qwen3 arms differ in driver: ours runs as a one-arm load (--arm ... --arm-sync: the load, the
+# runner's guards and witness, then the go), bin: as one --tokens process (the load straight into the prompt). A
+# constant offset from that does not enter the SD; it enters the mean difference.
+# Terms, four: decode tok/s(mean) at n = 96 and pp tok/s at P = 512 for each model; per term the per-run SD of each
+# arm (sample SD over its clean rounds, in % of its mean), the two arms pooled (df n_a + n_b - 2), and the difference
+# of the arm means with card.py's interval h = t(0.975, df) x s_p x sqrt(1/n_a + 1/n_b) — the form AGENTS.md's
+# ±1.0 % at four rounds comes from; 1.96 in place of t would give a 1.4x narrower h at the V4.1 half's df 4.
+# Resolution [derived, chi-square quantiles]: a 95 % interval on an SD estimated at df 4 (V4.1, 3 rounds a arm) is
+# 0.60 s .. 2.87 s, wider than the whole band below; at df 10 (Qwen3, 6 rounds) it is 0.70 s .. 1.75 s. The Qwen3
+# half is the one that can move the constant; the V4.1 half says whether V4.1 scatters on another scale.
+# Minutes: 17 [derived]. aav41 12: seven V4.1 processes (the runner's default warm-up and 3 rounds x 2 arms), each a
+# load of 75-117 s (the split card's range, from the rows' wall column) plus a 512-id prose prompt, 96 steps and the
+# witness blocks, about 6 s: 10-15 min. aaq3 5: twelve Qwen3 processes (6 rounds x 2 arms, no warm-up: the runner's
+# default), each a load of about 20 s (the s card's figure) and under a second of prompt and steps plus the witness
+# blocks: about 24 s.
+kind: profile
+question: how far does one same-binary run scatter on the A6000, so that the ruler every GPU A/B is sized by
+  (sd_same_binary, card.py's SD_DEFAULT, AGENTS.md's 0.6 %) is the card's own and not a host-CPU decode's?
+term: per-run SD of one arm in % of its mean, the two identical arms pooled, the largest of four terms: V4.1 decode
+  tok/s(mean) @ n=96, prose prompt P = 512, hot list 384, plan (a), A6000, and its pp tok/s @ P = 512; Qwen3-30B-A3B
+  decode tok/s(mean) @ n=96, depth 512 (lcg), ctx 768, A6000, and its pp tok/s @ P = 512
+unit: %
+predict: 0.35..0.63
+condition: aaq3 = BLOOMERY_AB_ROUNDS=6 just depth-gpu-qwen3moe 512 bin:$PWD/target/release/generate_qwen3moe:512,
+  aav41 = BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_AB_LOAD=arm with
+  BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt, each with BLOOMERY_LEASE_CARD=docs/cards/r0928-aa-ruler.card,
+  under the lease on the A6000, one binary for both arms of a model, the arm order rotated each round. A row tagged
+  [cold], [cpu-busy] or [other-busy], and a FAIL row, is void and printed with its value; a V4.1 row is also void
+  when its plan record is not place a with the hot list above, or its time prompt record's tok/s is not its row's
+  pp_tok/s. A term with fewer than two clean rounds in either arm is void and named; the verdict runs over the rest.
+  Per term: each arm's per-round values, SD and mean, the pooled SD and df, the mean difference b / a - 1 and its h,
+  inside or outside
+decide-in: the largest pooled SD in 0.35..0.63: the ruler stays 0.6 %, and sd_same_binary's source gains this card's
+  rig-log entry as the A6000's same-binary measurement
+decide-below: the largest pooled SD under 0.35: sd_same_binary, card.py's SD_DEFAULT and AGENTS.md's ruler sentence
+  take the measured value (the largest term, with its df), and the round counts card.py computes shrink with it; a
+  mean difference outside its h is reported as an order or warm-up effect (Qwen3: or the ours-against-bin: driver
+  shape), never folded into the SD
+decide-above: the largest pooled SD over 0.63: sd_same_binary, card.py's SD_DEFAULT and AGENTS.md's ruler take the
+  measured value (the largest term, with its df), so every later A/B card is checked at the wider ruler; a mean
+  difference outside its h is reported as an order or warm-up effect (Qwen3: or the driver shape)
