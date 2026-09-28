@@ -2304,3 +2304,38 @@ fn hw_a_draft_refuses_what_needs_the_logits() {
     let (ids, _) = drafted_ids(addr, &json!("abcabc"), 4, true);
     assert_eq!(ids.len(), 4);
 }
+
+/// `POST /residency/reset`: an engine with no residency is a 501; one with a
+/// residency answers the reset's report, and only this call resets it — a
+/// completion before or after it does not.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_residency_reset_is_the_one_explicit_call() {
+    let plain = start(64);
+    let r = call(plain, "POST", "/residency/reset", None);
+    assert_eq!(r.status, 501, "{}", r.body);
+
+    let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = || resets.load(std::sync::atomic::Ordering::SeqCst);
+    let addr = common::start_with(Box::new(serve::MockEngine::with_residency(
+        64,
+        std::sync::Arc::clone(&resets),
+    )));
+    let body = json!({"prompt": "abcabc", "n_predict": 3, "temperature": 0});
+    assert_eq!(post(addr, "/completion", &body).status, 200);
+    assert_eq!(count(), 0, "a completion reset the residency");
+    let r = call(addr, "POST", "/residency/reset", None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    for k in ["cancelled", "copies", "diff", "dropped_bytes"] {
+        assert!(v[k].is_u64(), "{k} in {v}");
+    }
+    assert!(v["timings"]["reset_ms"].is_f64(), "{v}");
+    assert_eq!(count(), 1);
+    assert_eq!(post(addr, "/completion", &body).status, 200);
+    assert_eq!(count(), 1, "a completion reset the residency");
+    // A prompt that shares no prefix: the cache misses and the engine resets.
+    let miss = json!({"prompt": "zyxzyx", "n_predict": 3, "temperature": 0});
+    assert_eq!(post(addr, "/completion", &miss).status, 200);
+    assert_eq!(count(), 1, "a cache miss reset the residency");
+}

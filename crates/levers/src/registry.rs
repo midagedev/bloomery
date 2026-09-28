@@ -303,8 +303,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
-              and S slots a layer freed for flips in flight. No binary acts on it yet: each \
-              refuses it set, by name, until its model adapter lists it at `main`.",
+              and S slots a layer freed for flips in flight. V4.1 only, under `--place a` and \
+              `bp` (`generate_ds41`, `bloomery-serve-ds41`): the load's host set also holds \
+              the churn pool, each layer's stage card experts past the first P, refused by \
+              name when the plan's host headroom cannot take it, and prints `residency host`; \
+              every pass prints `residency pass`; only an explicit call resets it (an arm's \
+              clear, the server's `POST /residency/reset`), with a `residency reset` record. \
+              `bloomery-serve-ds41` refuses it beside `BLOOMERY_ROUTE_TRACE`, which records a \
+              fixed placement's routing. Every other binary refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

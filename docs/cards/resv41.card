@@ -1,0 +1,42 @@
+# Round resv41: V4.1 adaptive expert residency (BLOOMERY_RESIDENCY=mid-p40-s1) against the static id-prefix
+# seed, same binary, decode after a prose prompt of 512 ids on plan (a). The machine counts the router
+# picks from the first decode pass (the prompt call keeps 0 rows), plans every 4 passes (cap 24 over all
+# layers, margin 3, min 2, decay 0.9, one spare a layer), and a flip goes live 4 passes after it is made
+# (LIVE_DELAY, gpu-deepseek41/src/swap.rs). The first 40 seed experts of each layer never move; the other
+# 30-31 of the card's 70-71 and every host expert are the churn pool, in the host set from the load.
+# Step model [derived, rig-log 09-28#residency-replay fit to the chat measurement]: 10 ms + 0.139 ms a
+# host slot, host slots 12 + 228 x (1 - h). The id prefix's h 0.187: 197 slots, 37.4 ms. The replay's
+# window hit (prose set, counts from 0 in each 512 + 96 request): 39.9 % at d 8, 46.6 % at d 1, so
+# 0.40-0.44 at d 4 [interpolated]: 140-149 slots, 29.5-30.7 ms; about 5 flips a token in the window at
+# c = 1..3 host slots of DRAM each, +0.7..+2.1 ms: 30.2..32.8 ms, +14..+24 %. The replay's sets are ik's
+# routing of a deleted mixed file (top-6 agreement with the engine's chat routing 26 %, same entry), so
+# the low edge is widened to +8. The prose ids: the seed is the id prefix and no list is learned from any
+# corpus, so the first 512 prose ids are held out from everything the engine learns (it learns within
+# the request only). No chat arm: depth-ds41.sh drives generate_ds41, not the server.
+# Warm-up curve: every timed step's `time step i ms` (generate_ds41 --time) in windows of 16 steps, per
+# arm and round, beside the arm's `stat step host_slots` (BLOOMERY_STEP_STATS=1) and the `residency pass`
+# records (landed, late) — the hit and the flips' cost read directly, not from the wall.
+# Wall [derived]: 3 rounds x 2 loads (the arms differ in a load variable, so each is its own process)
+# x (a plan (a) load 60-100 s + prompt 5 s + 96 steps 4 s) + the build: 8-15 min, under 30.
+kind: ab
+question: does adaptive residency (mid-p40-s1) raise V4.1 decode over the static id-prefix seed in
+  the first 96 tokens after a held-out prose prompt?
+term: decode tok/s @ n=96 after prose:512 (the first 512 ids of corpus-prose.ids), A6000, plan (a),
+  id-prefix seed, r8 sidecar — (mid-p40-s1 − off) / off, paired by round
+unit: %
+predict: +8..+24
+rounds: 3
+condition: one lease, BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resv41.card
+  BLOOMERY_STEP_STATS=1' BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512
+  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1, the arm order rotated every round; every arm a fresh process
+  (the seed), its `residency host` record printed before the load and no `residency reset` needed; no
+  row [cpu-busy], [other-busy] or [cold]; the residency arm's `residency pass` records show landed > 0
+  and every flip's late count read
+decide-in: land the lever as built, off by default; take the 16-step curve to the user with the
+  serve default question (mid-p40-s1 on bp with the DSpark draft) and open R5's opening reshuffle on it
+decide-below: split the miss by the records: host_slots at the band's hit (140-149) with the step
+  above 30.2-32.8 ms prices the flips (run dma-dram-share-v41.card, then the copy gate); host_slots
+  above it means the engine's routing is not the replay's — replay routetrace's engine traces before
+  any R5
+decide-above: the engine's routing is more local than the replay's: re-derive R5's gain upward and
+  put the serve default to the user
