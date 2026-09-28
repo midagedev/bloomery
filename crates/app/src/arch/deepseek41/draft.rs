@@ -8,10 +8,18 @@
 //!    last [`CardDraft::window`]'s when it is batched (skipped past the rest);
 //! 2. per pass: the proposal after the token at the target's position, the
 //!    target's verify of the pair, and the features of the rows it keeps
-//!    appended before the rest is taken back.
+//!    appended before the rest is taken back; a step's one row after it.
 //!
 //! The proposal changes which passes run, never a token: every kept token is
 //! the target's own argmax.
+//!
+//! A server keeps one target across requests, which cut it back and put saved
+//! states into it. The draft then follows the target only while every
+//! position the target ran reached it: [`CardDraft::forget`] marks a target
+//! moved elsewhere, and [`CardDraft::feed_call`] continues a draft that
+//! follows and starts over one that does not, the positions before the call
+//! skipped. A draft started over proposes only once its window's rows are all
+//! appended: a call that starts past position 0 must carry a whole window.
 //!
 //! The draft's card may be the target's own (the gate runs both on one card
 //! under a card budget); the two then share the card's primary context.
@@ -49,6 +57,10 @@ pub struct CardDraft<D> {
     /// Prompt features waiting for a whole group, `GROUP` rows at most.
     pending: Vec<f32>,
     width: usize,
+    /// Every position the target ran since the draft's reset reached it.
+    follows: bool,
+    /// The device bytes the draft's load took on its card.
+    resident: usize,
 }
 
 impl CardDraft<DraftBody> {
@@ -74,11 +86,14 @@ impl CardDraft<DraftBody> {
         let width = m.body(WHAT)?.feature_width();
         let gpu = Gpu::for_card(card)?;
         let loaded = (|| {
+            let (free, _) = gpu.mem_info()?;
             let w = DraftWeights::load(gpu.stream(), draft, &target_file)?;
-            DraftBody::new(&gpu, w, target_file)
+            let body = DraftBody::new(&gpu, w, target_file)?;
+            let (left, _) = gpu.mem_info()?;
+            Ok::<_, GpuError>((body, free.saturating_sub(left)))
         })();
         ctx.bind_to_thread().map_err(GpuError::from)?;
-        let body = loaded?;
+        let (body, resident) = loaded?;
         let reads = body.weights().hp().target_layers.len() * body.weights().hp().n_embd;
         if reads != width {
             return Err(SessionError::Refused(format!(
@@ -92,7 +107,73 @@ impl CardDraft<DraftBody> {
             card,
             pending: Vec::with_capacity(GROUP * width),
             width,
+            follows: true,
+            resident,
         })
+    }
+
+    /// The device bytes the draft's load took on its card: its weights, rings,
+    /// buffers and captured graphs, read as the card's free bytes before and
+    /// after it.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.resident
+    }
+
+    /// The target now stands elsewhere than the positions the draft was fed
+    /// (a cut, a saved state put back): the next [`CardDraft::feed_call`]
+    /// starts the draft over.
+    pub fn forget(&mut self) {
+        self.follows = false;
+    }
+
+    /// Start the draft over at position 0, for a target that was reset.
+    pub fn restart(&mut self) -> Result<(), GpuError> {
+        self.reset()?;
+        self.follows = true;
+        Ok(())
+    }
+
+    /// The prompt call of `ids` from where `t` stands, each position's
+    /// features into the draft as the call hands them over: after the
+    /// positions the draft holds when it follows `t` there, else after a
+    /// reset that skips every position before the call. The argmax after the
+    /// last id.
+    pub fn feed_call(&mut self, t: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
+        if !self.follows(t.pos()) {
+            self.restart()?;
+        }
+        let (window, width) = (self.window(), self.width);
+        let next = t.prompt_tapped(ids, window, &mut |first, rows| {
+            self.skip_to(first)?;
+            rows.chunks_exact(width).try_for_each(|row| self.feed(row))
+        })?;
+        self.flush()?;
+        Ok(next)
+    }
+
+    /// Whether the draft holds every position the target ran before `pos`,
+    /// the target's position: it can propose there with no prompt call first.
+    #[must_use]
+    pub fn follows(&self, pos: u32) -> bool {
+        self.follows && self.committed() == pos
+    }
+
+    /// Refused unless the draft holds every position before the target's.
+    fn following(&self, t: &Session<Body>) -> Result<(), SessionError> {
+        if self.follows(t.pos()) {
+            return Ok(());
+        }
+        Err(SessionError::Refused(format!(
+            "dspark loop: the draft {} {} positions, the target stands at {}",
+            if self.follows {
+                "has"
+            } else {
+                "was left behind at"
+            },
+            self.committed(),
+            t.pos()
+        )))
     }
 
     /// The card the draft runs on.
@@ -189,18 +270,10 @@ impl Draft<Session<Body>> for CardDraft<DraftBody> {
     const WIDTH: usize = 1;
     const TAPS: TapNeed = TapNeed::Layers;
 
-    /// The draft reset, the prompt through the target's tapped call, each
-    /// position's features into the draft as the call hands them over, and
-    /// the rest appended.
+    /// The draft reset, then [`CardDraft::feed_call`].
     fn prompt(&mut self, t: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
-        self.reset()?;
-        let (window, width) = (self.window(), self.width);
-        let next = t.prompt_tapped(ids, window, &mut |first, rows| {
-            self.skip_to(first)?;
-            rows.chunks_exact(width).try_for_each(|row| self.feed(row))
-        })?;
-        self.flush()?;
-        Ok(next)
+        self.restart()?;
+        self.feed_call(t, ids)
     }
 
     fn begin(
@@ -220,13 +293,7 @@ impl Draft<Session<Body>> for CardDraft<DraftBody> {
         last: u32,
         out: &mut [u32],
     ) -> Result<usize, SessionError> {
-        let pos = t.pos();
-        if self.committed() != pos {
-            return Err(SessionError::Refused(format!(
-                "dspark loop: the draft has {} positions, the target stands at {pos}",
-                self.committed()
-            )));
-        }
+        self.following(t)?;
         let width = <Self as Draft<Session<Body>>>::WIDTH;
         let ids = self.on_card(|gpu, body| body.propose(gpu, last, width))?;
         match ids.as_slice() {
@@ -253,16 +320,28 @@ impl Draft<Session<Body>> for CardDraft<DraftBody> {
         Ok(self.append(feats)?)
     }
 
-    /// Never reached: every pass proposes.
+    /// The step's one row appended: the features of `last`'s position.
     fn stepped(
         &mut self,
-        _t: &mut Session<Body>,
+        t: &mut Session<Body>,
         _last: u32,
         _next: u32,
     ) -> Result<(), SessionError> {
-        Err(SessionError::Refused(
-            "dspark loop: a pass stepped without a proposal, and the draft has no features for it"
-                .into(),
-        ))
+        let pos = t.pos().checked_sub(1).ok_or_else(|| {
+            SessionError::Refused("dspark loop: a step that left the target at 0".into())
+        })?;
+        if !self.follows(pos) {
+            return Err(SessionError::Refused(format!(
+                "dspark loop: a step at position {pos}, and the draft {} {} positions",
+                if self.follows {
+                    "has"
+                } else {
+                    "was left behind at"
+                },
+                self.committed()
+            )));
+        }
+        let feats = t.taps(1)?;
+        Ok(self.append(feats)?)
     }
 }
