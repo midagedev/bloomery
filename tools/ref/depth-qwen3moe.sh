@@ -35,6 +35,29 @@
 #             The row also carries `pp_tok/s <v> (n=D, passes=K)` from the binary's `time prompt`
 #             row, the wall of that prefill (Prefill below): one arm reports both the prefill of
 #             D ids and the decode at depth D.
+#   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D, this binary and the <D> arm's command line, with
+#             those variables set for this arm only (`env NAME=VALUE ... <binary>`; depth-ds41.sh's
+#             grammar): a lever arm, row label `ours@NAME=VALUE[,...]`, in the same tables as the ours
+#             rows of that depth. Beside a plain `<D>` arm it is the same-binary A/B, paired by round in
+#             the ratio table's `ours/ours@…` line, e.g. `6 6@BLOOMERY_QWEN38_EXPERTS=card`. A lever arm is
+#             compared only with ours arms of the same binary, never with a bin: arm or a reference: under
+#             1 % two builds differ by link layout alone (AGENTS.md). The label is what its witness blocks
+#             and its row print, so both name the variables. The variables are load-time
+#             (tools/ref/load-groups.sh), so the load key holds them: a lever arm is a load of its own, a
+#             unit the round's rotation (Order) moves like any other. BLOOMERY_AB_LOAD=arm in the list runs
+#             the arm alone and stays in the label; the binary never sees it. Refused by name before
+#             anything runs: an empty list, item, name or value; a name that is no lever row of
+#             crates/levers/src/registry.rs (a row the crate parses or a file reads in place: a retired
+#             name, a runner's or a path's variable and a name no row names are refused, the registry
+#             read only when an arm has an `@`); a name given twice; a value holding `,`, `@`, `|` or
+#             white space; a name the runner's own environment already sets (BLOOMERY_BOX_ENV reaches
+#             every arm, so the plain rows' labels would hide it); and `@` on a reference, server or bin:
+#             arm — a lever of ours is not a reference's.
+#             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
+#             run does and prints each arm's kind, depth, label, variables and load key, each round's
+#             order and round 1's load command lines (`env NAME=VALUE ...` first), then exits 0 before the card, the binaries and the lease (it runs on the Mac);
+#             `--self-test` runs it on fixed arms, on the Mac. check-recipes does not run it: a script it
+#             names that calls lease_take makes gate-batch.sh refuse the check as a timed recipe.
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
@@ -291,6 +314,134 @@
 # process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
 # pre-lease checks' verdict and goes on.
 set -uo pipefail
+# q3_self_test: `depth-qwen3moe.sh --self-test`, the lever arms' parse and refusals (the header's
+# <D>@NAME=VALUE) on fixed arms against this tree's lever registry, each a --parse-arms run of this file
+# in a clean environment under the qwen3moe profile: no card, no binary, no lease (it runs on the Mac,
+# under bash 3.2). One line per check, `ok <name>` or `FAIL <name>: …`; the last
+# line is the verdict.
+q3_self_test() {
+  local fails=0 checks=0 out rc me=$0 bin=target/release/generate_qwen3moe
+  local nope="BLOOMERY""_NOPE" ex
+  # run_parse [NAME=VALUE...] -- <arms...>: this file's --parse-arms under env -i, into out and rc.
+  run_parse() {
+    local -a pre=()
+    while [ "$1" != -- ]; do
+      pre+=("$1")
+      shift
+    done
+    shift
+    out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen3moe BLOOMERY_AB_ROUNDS=2 ${pre[@]+"${pre[@]}"} "$BASH" "$me" --parse-arms "$@" 2>&1)
+    rc=$?
+  }
+  # want <name> <rc> <line or fixed text>...: rc as given; with rc 0 each text is a whole line of the
+  # output, otherwise a part of it.
+  want() {
+    local name=$1 want_rc=$2 t bad=''
+    shift 2
+    checks=$((checks + 1))
+    [ "$rc" = "$want_rc" ] || bad="rc $rc, want $want_rc"
+    for t in "$@"; do
+      if [ "$want_rc" = 0 ]; then
+        grep -qxF -- "$t" <<< "$out" || bad="${bad:+$bad; }no line [$t]"
+      else
+        grep -qF -- "$t" <<< "$out" || bad="${bad:+$bad; }no [$t]"
+      fi
+    done
+    if [ -z "$bad" ]; then
+      echo "ok $name"
+    else
+      echo "FAIL $name: $bad"
+      while IFS= read -r t; do echo "    | $t"; done <<< "$out"
+      fails=$((fails + 1))
+    fi
+  }
+  run_parse -- 6 6@BLOOMERY_THREADS=8 ik:6
+  want lever-arm 0 \
+    "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
+    "[parse] 6@BLOOMERY_THREADS=8: kind=ours depth=6 label=ours@BLOOMERY_THREADS=8 env=BLOOMERY_THREADS=8 load=$bin|ctx=256|BLOOMERY_THREADS=8" \
+    "[parse] ik:6: kind=ref depth=6 label=ik env=- load=(a process of its own)" \
+    "[parse] round 1 order: 6 6@BLOOMERY_THREADS=8 ik:6" \
+    "[parse] round 2 order: 6@BLOOMERY_THREADS=8 ik:6 6" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --time --arm-sync" \
+    "[parse] load: env BLOOMERY_THREADS=8 $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --time --arm-sync"
+  # Two lever arms of one list in another order share a load; the solo marker takes the arm out of it
+  # and stays in the label only.
+  run_parse -- 6@BLOOMERY_THREADS=8,BLOOMERY_SPIN=0 6@BLOOMERY_SPIN=0,BLOOMERY_THREADS=8 5@BLOOMERY_THREADS=8,BLOOMERY_AB_LOAD=arm
+  want lever-load 0 \
+    "[parse] 6@BLOOMERY_THREADS=8,BLOOMERY_SPIN=0: kind=ours depth=6 label=ours@BLOOMERY_THREADS=8,BLOOMERY_SPIN=0 env=BLOOMERY_THREADS=8,BLOOMERY_SPIN=0 load=$bin|ctx=256|BLOOMERY_SPIN=0,BLOOMERY_THREADS=8" \
+    "[parse] 6@BLOOMERY_SPIN=0,BLOOMERY_THREADS=8: kind=ours depth=6 label=ours@BLOOMERY_SPIN=0,BLOOMERY_THREADS=8 env=BLOOMERY_SPIN=0,BLOOMERY_THREADS=8 load=$bin|ctx=256|BLOOMERY_SPIN=0,BLOOMERY_THREADS=8" \
+    "[parse] 5@BLOOMERY_THREADS=8,BLOOMERY_AB_LOAD=arm: kind=ours depth=5 label=ours@BLOOMERY_THREADS=8,BLOOMERY_AB_LOAD=arm env=BLOOMERY_THREADS=8 load=$bin|ctx=256|BLOOMERY_THREADS=8|solo" \
+    "[parse] round 1 loads: [6@BLOOMERY_THREADS=8,BLOOMERY_SPIN=0 6@BLOOMERY_SPIN=0,BLOOMERY_THREADS=8] [5@BLOOMERY_THREADS=8,BLOOMERY_AB_LOAD=arm]" \
+    "[parse] round 2 loads: [5@BLOOMERY_THREADS=8,BLOOMERY_AB_LOAD=arm] [6@BLOOMERY_SPIN=0,BLOOMERY_THREADS=8 6@BLOOMERY_THREADS=8,BLOOMERY_SPIN=0]" \
+    "[parse] load: env BLOOMERY_THREADS=8 BLOOMERY_SPIN=0 $bin --arm <lcg_prompt 6> --arm <lcg_prompt 6> -n 96 --ctx 256 --time --arm-sync" \
+    "[parse] load: env BLOOMERY_THREADS=8 $bin --arm <lcg_prompt 5> -n 96 --ctx 256 --time --arm-sync"
+  # A run with no lever arm never reads the registry (the box stub test's tree has none).
+  run_parse -- --registry /nonexistent/registry.rs 6 lcpp:6
+  want no-lever-no-registry 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256"
+  run_parse -- --registry /nonexistent/registry.rs 6@BLOOMERY_THREADS=8
+  want registry-missing 2 "no lever registry at /nonexistent/registry.rs"
+  # The refusals, each by name before anything runs.
+  run_parse -- 6@
+  want empty-list 64 "an empty NAME=VALUE list"
+  run_parse -- 6@BLOOMERY_THREADS=8,
+  want empty-item 64 "an empty item in"
+  run_parse -- 6@=8
+  want empty-name 64 "'=8' has an empty name"
+  run_parse -- 6@BLOOMERY_THREADS=
+  want empty-value 64 "BLOOMERY_THREADS has an empty value"
+  run_parse -- 6@BLOOMERY_THREADS=8,9
+  want comma-in-value 64 "'9' is no NAME=VALUE"
+  run_parse -- 6@BLOOMERY_THREADS=8@9
+  want at-in-value 64 "the value of BLOOMERY_THREADS holds '@'"
+  run_parse -- '6@BLOOMERY_THREADS=8 9'
+  want space-in-value 64 "white space"
+  run_parse -- '6@BLOOMERY_THREADS=8|9'
+  want bar-in-value 64 "the value of BLOOMERY_THREADS holds '|'"
+  run_parse -- 6@BLOOMERY_THREADS=8,BLOOMERY_THREADS=9
+  want twice 64 "BLOOMERY_THREADS is given twice"
+  run_parse -- 6@FOO=1
+  want no-row 64 "FOO is no row of the lever registry"
+  run_parse -- "6@$nope=1"
+  want no-row-bloomery 64 "$nope is no row of the lever registry"
+  run_parse -- 6@BLOOMERY_GEN_CTX=512
+  want runner-row 64 "BLOOMERY_GEN_CTX is no lever"
+  run_parse -- 6@BLOOMERY_CARD_EXPERTS=tile
+  want retired-row 64 "BLOOMERY_CARD_EXPERTS is a retired name"
+  run_parse BLOOMERY_THREADS=8 -- 6 6@BLOOMERY_THREADS=4
+  want inherited 64 "BLOOMERY_THREADS is set in the runner's own environment"
+  for ex in ik:6@BLOOMERY_THREADS=8 lcpp:6@BLOOMERY_THREADS=8 lcppsrv:6@BLOOMERY_THREADS=8; do
+    run_parse -- "$ex"
+    want "ref-${ex%%:*}" 64 "a lever of ours is not a reference's"
+  done
+  run_parse -- bin:/root/repo/b/target/release/generate_qwen3moe:6@BLOOMERY_THREADS=8
+  want bin-arm 64 "a bin: arm is another build"
+  # The reader holds the registry's shape: a row it cannot read stops it by name.
+  printf 'pub(crate) static REGISTRY: &[LeverSpec] = &[\n    LeverSpec {\n        class: Class::A,\n    },\n];\n' > "${TMPDIR:-/tmp}/q3arm-registry.$$.rs"
+  run_parse -- --registry "${TMPDIR:-/tmp}/q3arm-registry.$$.rs" 6@BLOOMERY_THREADS=8
+  rm -f "${TMPDIR:-/tmp}/q3arm-registry.$$.rs"
+  want registry-shape 2 "1 LeverSpec rows, 0 read with a name and a site"
+  echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
+  [ "$fails" = 0 ]
+}
+# The modes that run nothing on the box (the header's <D>@NAME=VALUE): --parse-arms prints the parsed
+# arms and exits before the card, the binaries and the lease; --registry names another registry file.
+PARSE_ONLY=
+LEVER_REGISTRY=${BASH_SOURCE[0]%/*}/../../crates/levers/src/registry.rs
+case ${1:-} in
+  --self-test)
+    q3_self_test
+    exit
+    ;;
+  --parse-arms)
+    PARSE_ONLY=1
+    shift
+    if [ "${1:-}" = --registry ]; then
+      [ $# -ge 2 ] || { echo "depth-qwen3moe.sh: --registry takes a file" >&2; exit 64; }
+      LEVER_REGISTRY=$2
+      shift 2
+    fi
+    ;;
+esac
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # MRS, MRSBIN, MRS_FLAGS); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so
 # the four engines open one file.
@@ -334,9 +485,100 @@ ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
 # (ours, bin, or the reference's), the binary (ours and bin) and a server arm's ids (lcg).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_IDS=()
+# A lever arm's NAME=VALUE list as given (comma-separated; empty for every other arm).
+A_ENV=()
 arm_usage() {
-  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
+}
+arm_refuse() {
+  echo "depth-qwen3moe.sh: arm '$1': $2" >&2
+  exit 64
+}
+# lever_rows_py <registry.rs>: every row of the lever registry as `<name> <site>` — Parsed or Direct (a
+# lever), Retired, or Env (a runner's, a harness's or a path's own variable: the path() and runner()
+# rows); a row it cannot read with a name and a site, or a name given twice, stops it by name.
+lever_rows_py() {
+  python3 - "$1" << 'PY'
+import re, sys
+
+path = sys.argv[1]
+src = open(path, encoding='utf-8').read()
+
+
+def die(why):
+    sys.exit(f'{path}: {why}')
+
+
+consts = dict(re.findall(r'\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"]*)"', src))
+at = src.find('static REGISTRY')
+if at < 0:
+    die('no `static REGISTRY`')
+body = src[at:]
+specs = len(re.findall(r'\bLeverSpec\s*\{', body))
+rows = []
+for m in re.finditer(r'\bLeverSpec\s*\{.*?\bname:\s*(?:"([^"]*)"|([A-Z][A-Z0-9_]*))\s*,.*?\bsite:\s*Site::([A-Za-z]+)',
+                     body, re.S):
+    name = m.group(1) or consts.get(m.group(2))
+    if not name:
+        die(f'the row name {m.group(2)} is no const of the file')
+    rows.append((name, m.group(3)))
+if len(rows) != specs:
+    die(f'{specs} LeverSpec rows, {len(rows)} read with a name and a site')
+rows += [(m.group(1), 'Env') for m in re.finditer(r'\b(?:path|runner)\(\s*"([^"]*)"', body)]
+names = [n for n, _ in rows]
+twice = sorted({n for n in names if names.count(n) > 1})
+if twice:
+    die('names given twice: ' + ', '.join(twice))
+for name, site in rows:
+    print(name, site)
+PY
+}
+# lever_rows_load: LEVER_ROWS from LEVER_REGISTRY, once, when the first lever arm is parsed; a missing or
+# unreadable registry exits 2 by name.
+LEVER_ROWS=
+lever_rows_load() {
+  [ -z "$LEVER_ROWS" ] || return 0
+  [ -r "$LEVER_REGISTRY" ] || { echo "depth-qwen3moe.sh: a lever arm is checked against the lever registry, and there is no lever registry at $LEVER_REGISTRY" >&2; exit 2; }
+  LEVER_ROWS=$(lever_rows_py "$LEVER_REGISTRY") || { echo "depth-qwen3moe.sh: the lever registry $LEVER_REGISTRY was not read (above)" >&2; exit 2; }
+  [ -n "$LEVER_ROWS" ] || { echo "depth-qwen3moe.sh: the lever registry $LEVER_REGISTRY has no rows" >&2; exit 2; }
+}
+# arm_envs_ok <arm> <NAME=VALUE list>: a lever arm's list, each refusal by name (the header's
+# <D>@NAME=VALUE), exit 64.
+arm_envs_ok() {
+  local a=$1 list=$2 e name val site seen=,
+  local -a kv
+  [ -n "$list" ] || arm_refuse "$a" "an empty NAME=VALUE list after '@'"
+  case $list in *[[:space:]]*) arm_refuse "$a" "white space in '$list' (a value holds none)" ;; esac
+  case ,$list, in *,,*) arm_refuse "$a" "an empty item in '$list' (NAME=VALUE items are separated by one ',')" ;; esac
+  IFS=, read -r -a kv <<< "$list"
+  for e in "${kv[@]}"; do
+    case $e in *=*) ;; *) arm_refuse "$a" "'$e' is no NAME=VALUE (a ',' separates two variables, so a value holds none)" ;; esac
+    name=${e%%=*} val=${e#*=}
+    [ -n "$name" ] || arm_refuse "$a" "'$e' has an empty name"
+    [ -n "$val" ] || arm_refuse "$a" "$name has an empty value"
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || arm_refuse "$a" "'$name' is no variable name"
+    case $val in
+      *@*) arm_refuse "$a" "the value of $name holds '@', which opens an arm's variables" ;;
+      *'|'*) arm_refuse "$a" "the value of $name holds '|', the separator of this runner's records" ;;
+    esac
+    case $seen in *,"$name",*) arm_refuse "$a" "$name is given twice" ;; esac
+    seen+="$name,"
+    # The load driver's solo marker (load-groups.sh): the runner's, never the binary's.
+    [ "$e" != BLOOMERY_AB_LOAD=arm ] || continue
+    if printenv "$name" > /dev/null; then
+      arm_refuse "$a" "$name is set in the runner's own environment ($name=$(printenv "$name")), which every arm inherits, so the plain arms' labels would not show it: give it per arm only"
+    fi
+    lever_rows_load
+    site=$(awk -v n="$name" '$1 == n { print $2 }' <<< "$LEVER_ROWS")
+    case $site in
+      Parsed | Direct) ;;
+      Retired) arm_refuse "$a" "$name is a retired name ($LEVER_REGISTRY): the binary refuses it" ;;
+      Env) arm_refuse "$a" "$name is no lever: its row in $LEVER_REGISTRY is a runner's, a harness's or a path's own variable, not a setting of the binary's" ;;
+      '') arm_refuse "$a" "$name is no row of the lever registry ($LEVER_REGISTRY): a lever arm sets a lever" ;;
+      *) arm_refuse "$a" "$name's row in $LEVER_REGISTRY is a Site::$site, which this runner does not know" ;;
+    esac
+  done
 }
 # A prefill arm's engine (ikpp[<U>], lcpppp[<U>], lcppppfit[<U>], mrspp), and its ubatch lever U (empty:
 # the default).
@@ -349,13 +591,19 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs=''
+  # `@` is ours only: split at it first, so a value with a `:` is not read as a reference's arm.
+  case ${a%%@*} in
+    "$a") ;;
+    bin:*) arm_refuse "$a" "'@' sets a lever of this tree's binary, and a bin: arm is another build, run as it is" ;;
+    *:*) arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's" ;;
+  esac
   if srv_eng "$eng"; then
     case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
     [ "$dep" -ge 1 ] || { echo "depth-qwen3moe.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
-    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$eng") A_ENG+=("$eng") A_BIN+=('') A_IDS+=(lcg)
+    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$eng") A_ENG+=("$eng") A_BIN+=('') A_IDS+=(lcg) A_ENV+=('')
     continue
   fi
   case $a in
@@ -366,6 +614,10 @@ for a in "${ARMS[@]}"; do
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
       label=bin:${tree##*/}
+      ;;
+    *@*)
+      kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@${a#*@} ours=1
+      arm_envs_ok "$a" "$envs"
       ;;
     *:*)
       case $eng in
@@ -406,7 +658,7 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' needs 1 <= D <= 20000 (D fed ids in one --tokens argument)" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('')
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs")
 done
 # The load keys (tools/ref/load-groups.sh): an ours arm's binary and its --ctx, the cache height and the
 # flash grid the load fixes, so ours arms share a load when they share C (BLOOMERY_GEN_CTX, or one D).
@@ -416,10 +668,71 @@ source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
 # start of its measured window (the header's Cold tag).
 LG_FED_RE='^prompt_ids '
 arm_ctx() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
+# arm_env_list <i>: the variables arm <i> runs with, comma-separated, the solo marker left out.
+arm_env_list() { [ -z "${A_ENV[$1]}" ] || lg_strip_solo "${A_ENV[$1]}"; }
+# A lever arm's variables are load-time, so they go into its key, sorted; `|solo` on an arm whose list
+# holds BLOOMERY_AB_LOAD=arm.
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
-  [ "${A_KIND[$i]}" != ours ] || LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")"
+  [ "${A_KIND[$i]}" = ours ] || continue
+  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")"
+  [ -n "${A_ENV[$i]}" ] || continue
+  env_key=$(lg_env_key "$(arm_env_list "$i")")
+  [ -z "$env_key" ] || LG_KEY[i]+="|$env_key"
+  if lg_is_solo "${A_ENV[$i]}"; then LG_KEY[i]+='|solo'; fi
 done
+# arm_envs <i>: the variables arm <i> of ours runs with, into ARM_ENVS (NAME=VALUE words); a unit's arms
+# share them (their load key holds them).
+arm_envs() {
+  local envs
+  ARM_ENVS=()
+  envs=$(arm_env_list "$1")
+  [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
+}
+# lg_cmd <indices...>: the driver's hook (tools/ref/load-groups.sh): one load's command line into LG_CMD,
+# and into LG_ENV the variables its process runs under, its arms' (one list: their load key holds it).
+lg_cmd() {
+  local i
+  arm_envs "$1"
+  LG_ENV=(${ARM_ENVS[@]+"${ARM_ENVS[@]}"})
+  LG_CMD=("$BIN")
+  for i in "$@"; do LG_CMD+=(--arm "$(lcg_prompt "${A_DEP[$i]}")"); done
+  # shellcheck disable=SC2206 # an empty WARM adds nothing
+  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" --time ${WARM:+--warm "$WARM"} --arm-sync)
+}
+# --parse-arms: the arms as parsed and each round's order, then exit before the card, the binaries and
+# the lease.
+if [ -n "$PARSE_ONLY" ]; then
+  # Each load of round 1 as the driver starts it (lg_cmd), its prompts by name: lease.sh is not sourced here.
+  lcg_prompt() { echo "<lcg_prompt $1>"; }
+  for i in "${!ARMS[@]}"; do
+    echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}"
+  done
+  echo "[parse] order: $ORDER"
+  if [ "$ORDER" = rotate ]; then
+    lg_units "${!ARMS[@]}"
+    for r in $(seq "$ROUNDS"); do
+      o='' u=''
+      while read -r -a idx; do
+        names=''
+        for i in "${idx[@]}"; do names+="${names:+ }${ARMS[$i]}"; done
+        o+="${o:+ }$names"
+        if lg_grouped "${idx[0]}"; then u+="${u:+ }[$names]"; else u+="${u:+ }$names"; fi
+      done < <(lg_round "$r")
+      echo "[parse] round $r order: $o"
+      echo "[parse] round $r loads: $u"
+    done
+    while read -r -a idx; do
+      lg_grouped "${idx[0]}" || continue
+      lg_cmd "${idx[@]}"
+      if [ ${#LG_ENV[@]} -eq 0 ]; then e=''; else e="env ${LG_ENV[*]} "; fi
+      echo "[parse] load: $e${LG_CMD[*]}"
+    done < <(lg_round 1)
+  else
+    echo "[parse] the ours block holds every ours arm, the lever arms with them, each round rotated as under rotate (a dry run prints the blocks)"
+  fi
+  exit 0
+fi
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
 # has the two-card mode (the header's Two cards).
 TIMING_CARDS_RUNNER=1
@@ -803,16 +1116,9 @@ ours_post() {
 }
 # The driver's hooks (tools/ref/load-groups.sh). The timing card must be free before the load's process
 # starts: after that the process itself holds it between its arms. The load's lines echoed once; its
-# capture line's node count goes into every row of the load (LG_HEADER).
+# capture line's node count goes into every row of the load (LG_HEADER). lg_cmd is above, with the load
+# keys.
 LG_HEADER_RE='^(load|capture) '
-lg_cmd() {
-  local i
-  LG_ENV=()
-  LG_CMD=("$BIN")
-  for i in "$@"; do LG_CMD+=(--arm "$(lcg_prompt "${A_DEP[$i]}")"); done
-  # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" --time ${WARM:+--warm "$WARM"} --arm-sync)
-}
 lg_before_load() {
   guard_other
   guard_timing
@@ -974,7 +1280,8 @@ dry_cmd() {
   ctx=$(arm_ctx "$i")
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
   if lg_grouped "$i"; then
-    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${A_BIN[$i]} --arm <lcg_prompt $dep> ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}"
+    arm_envs "$i"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm <lcg_prompt $dep> ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}"
   else
     echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens <lcg_prompt $dep> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
   fi
