@@ -30,8 +30,8 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor, Tensor2,
-    Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
+    self, ActRead, DEFER_MAX_COLS, ExpertStack, GroupInput, R8Stack, RowLayout, ShardTensor,
+    Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack, Weight, matmul_q,
     matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
 };
 use crate::profile;
@@ -1526,24 +1526,42 @@ pub struct HostLayerSpec<'a> {
 }
 
 /// The host tier's matmul path for each (weight type, row width, row
-/// layout) it serves, printed once per process when a layer first brings it
-/// in: `load host_tier type=iq3_xxs k=4096 path=fused` — qdot's fused
-/// kernel, the only path a host tier runs: [`HostLayer::build`] refuses a
-/// stack without one before it prints — or `path=r8`, the row-lane tile over
-/// the r8 sidecar's copy.
-fn announce_paths(stacks: &[(GgmlType, usize, RowLayout)]) {
-    static SEEN: Mutex<Vec<(GgmlType, usize, RowLayout)>> = Mutex::new(Vec::new());
+/// layout, activation reading) it serves, printed once per process when a
+/// layer first brings it in: `load host_tier type=iq3_xxs k=4096 path=fused`
+/// — qdot's fused kernel, the only path a host tier runs: [`HostLayer::build`]
+/// refuses a stack without one before it prints — or `path=r8`, the row-lane
+/// tile over the r8 sidecar's copy; ` act=q8_K` ends the line of a stack whose
+/// rows read q8_K in place of their type's own activation format.
+fn announce_paths(stacks: &[(GgmlType, usize, RowLayout, ActRead)]) {
+    static SEEN: Mutex<Vec<(GgmlType, usize, RowLayout, ActRead)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
-    for &(ty, k, layout) in stacks {
-        if seen.contains(&(ty, k, layout)) {
+    for &key @ (ty, k, layout, act) in stacks {
+        if seen.contains(&key) {
             continue;
         }
-        seen.push((ty, k, layout));
+        seen.push(key);
         let path = match layout {
             RowLayout::Rows => "fused",
             RowLayout::R8 => "r8",
         };
-        eprintln!("load host_tier type={ty} k={k} path={path}");
+        let act = match act {
+            ActRead::Own => String::new(),
+            ActRead::Q8K => format!(" act={}", act.name()),
+        };
+        eprintln!("load host_tier type={ty} k={k} path={path}{act}");
+    }
+}
+
+/// The activation reading of a host tier's routed down of type `ty`: q8_K
+/// where qdot has a q8_K kernel for the type (Q4_K, Q5_K), its own format
+/// otherwise. One rule for the step and the prompt call, both of which read
+/// the down through [`HostLayer`].
+#[must_use]
+pub fn host_down_read(ty: GgmlType) -> ActRead {
+    if qdot::has_q8k_kernel(ty) {
+        ActRead::Q8K
+    } else {
+        ActRead::Own
     }
 }
 
@@ -1598,6 +1616,8 @@ pub struct HostLayer {
     gate: GateUp,
     up: GateUp,
     down: ShardTensor,
+    /// How the down's rows read their combines ([`host_down_read`]).
+    down_read: ActRead,
     n_expert: usize,
     limit: f32,
 }
@@ -1647,20 +1667,31 @@ impl HostLayer {
                 )
             }
         };
+        let down_read = host_down_read(down.info().ty);
         UnionStack::of_call(
-            &[gate.stack(split)?, up.stack(split)?, down.stack(split)?],
+            &[
+                gate.stack(split)?,
+                up.stack(split)?,
+                down.stack(split)?.read_as(down_read)?,
+            ],
             spec.embd,
             spec.ff,
         )?;
         announce_paths(&[
-            (gate.source().info().ty, spec.embd, gate.layout()),
-            (up.source().info().ty, spec.embd, up.layout()),
-            (down.info().ty, spec.ff, RowLayout::Rows),
+            (
+                gate.source().info().ty,
+                spec.embd,
+                gate.layout(),
+                ActRead::Own,
+            ),
+            (up.source().info().ty, spec.embd, up.layout(), ActRead::Own),
+            (down.info().ty, spec.ff, RowLayout::Rows, down_read),
         ]);
         Ok(HostLayer {
             gate,
             up,
             down,
+            down_read,
             n_expert: spec.n_expert,
             limit: spec.swiglu_limit,
         })
@@ -1682,6 +1713,12 @@ impl HostLayer {
         [self.gate.layout(), self.up.layout(), RowLayout::Rows]
     }
 
+    /// How the down's rows read their combines, the layer's one activation
+    /// reading other than its types' own ([`host_down_read`]).
+    pub fn down_read(&self) -> ActRead {
+        self.down_read
+    }
+
     /// `src` is a pair this layer reads beside: one that reads the open of
     /// the sidecar its r8 stacks were built from — a pointer compare, the
     /// pair's own check having run when it was made. A layer that reads only
@@ -1700,7 +1737,7 @@ impl HostLayer {
         Ok([
             self.gate.stack(split)?,
             self.up.stack(split)?,
-            self.down.stack(split)?,
+            self.down.stack(split)?.read_as(self.down_read)?,
         ])
     }
 
@@ -1739,7 +1776,7 @@ impl HostLayer {
             Ok([
                 self.gate.expert(split, e)?,
                 self.up.expert(split, e)?,
-                self.down.expert(split, e)?,
+                self.down.expert(split, e)?.read_as(self.down_read)?,
             ])
         };
         serve(weights, Some(self.limit), x, experts, out, scratch)

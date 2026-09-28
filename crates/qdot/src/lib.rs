@@ -18,6 +18,8 @@
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
 //! - Q3_K, Q4_K and Q5_K tiles: one weight row against up to [`TILE_COLS`] columns, each
 //!   block unpacked once, every column bit-identical to its one-column kernel ([`dot_row_cols`]).
+//! - Q4_K and Q5_K x Q8_K: mainline's `vec_dot_type` for both, as a column tile of up to
+//!   [`TILE_COLS`] columns with its scalar mirror ([`dot_q45k_q8k_cols`], module `q45k_q8k`).
 //! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
 //!   ([`repack_q3k_r8`], undone by [`unpack_q3k_r8`]) against up to [`TILE_COLS`] columns,
 //!   every (row, column) value bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
@@ -33,6 +35,12 @@ use std::fmt;
 use gguf::GgmlType;
 use gguf::iq_tables::{IQ3XXS_GRID, KSIGNS_IQ2XS};
 use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, half_to_f32};
+
+mod q45k_q8k;
+pub use q45k_q8k::{
+    dot_q45k_q8k_cols, dot_q45k_q8k_cols_scalar, has_q8k_kernel, q8k_col_bytes, quantize_col_q8k,
+    quantize_col_q8k_scalar,
+};
 
 /// `sizeof(block_q3_K)` (ggml-common.h): 110 bytes / 256 values.
 const Q3K_BLOCK: usize = 110;
@@ -77,6 +85,9 @@ pub enum QdotError {
         have: usize,
         need: usize,
     },
+    /// The weight type has no kernel against q8_K columns in place of its own
+    /// activation format ([`has_q8k_kernel`]: Q4_K and Q5_K do).
+    NoQ8kKernel(GgmlType),
 }
 
 impl fmt::Display for QdotError {
@@ -124,6 +135,13 @@ impl fmt::Display for QdotError {
                 write!(
                     f,
                     "row-lane {buf} is {have} bytes, its rows and k make {need}"
+                )
+            }
+            QdotError::NoQ8kKernel(w) => {
+                write!(
+                    f,
+                    "no q8_K column kernel for weight type {w:?}: only Q4_K and Q5_K read q8_K \
+                     in place of their own activation format"
                 )
             }
         }

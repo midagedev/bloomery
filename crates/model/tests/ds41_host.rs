@@ -30,9 +30,11 @@
 //! q3_K gate and up, ik's q8_K (`iqk_quantize_row_q8_K_T`, AVX2: codes
 //! `round(fl(127/M)·x)`, `d = fl(M/127)`) and ours (qdot's q8_K: codes
 //! `nearest_int(fl(-127/max)·x)`, `d = fl(1/iscale)`) give the same codes up to
-//! sign and scales within three roundings, `|δd/d| ≤ γ_3`; for the q4_K/q5_K
-//! down, both run the same q8_2_x4 encoder (bit for bit, `gate-qdot`). A
-//! difference has three sources, each bounded or counted:
+//! sign and scales within three roundings, `|δd/d| ≤ γ_3`. For the q4_K/q5_K
+//! down the rules differ: ik reads q8_2 (32 values, a bf16 scale; our
+//! `quantize_col` of the down's type is its encoder bit for bit, `gate-qdot`),
+//! ours q8_K (`moe::host_down_read`: 256 values, an f32 scale). A difference
+//! has four sources, each bounded, counted or computed:
 //!
 //! 1. Float order inside a dot. Every kernel here sums leaves — a float scale
 //!    times an exact integer sum — into f32 lanes by FMA and ends in an
@@ -52,13 +54,20 @@
 //!    once — `E_h` below.
 //! 3. h's quantization. Where the two h sit on either side of a rounding
 //!    boundary, a code moves by one: not bounded but counted. Our down kernel
-//!    run on ik's h gives `d̃`; `F = d_ours − d̃` is the flip term, exactly, and
-//!    `d̃ − d_ik` is kernel against kernel on the same bytes (1.). Every code of
-//!    the two quantized h must be within one of the other — more is not a flip.
+//!    run on ik's h gives `d̃`; `F = d_ours − d̃` is the flip term, exactly.
+//!    Every code of our q8_K of the two h must be within one of the other —
+//!    more is not a flip.
+//! 4. The two rules on ik's h. `A_i = Σ_c W_ic·(r8_c − r2_c)`, `r8` and `r2`
+//!    the values ik's h stands for in q8_K and in q8_2 and `W` the down's rows
+//!    dequantized (f32, within 3u of their exact values), is computed in f64;
+//!    then `d̃ − d_ik − A` is kernel against kernel, each on its own rule's
+//!    bytes of the same h (1.: our q8_K kernel's leaf path, two fmas a
+//!    super-block, is shorter than `n(k)`), within
+//!    `γ_n·(Σ|leaves_ours| + Σ|leaves_ik|) + 4u·Σ_c |W_ic|·|r8_c − r2_c|`.
 //!
-//! The partial sum then satisfies `|out_ours − out_ik − Σ w·F| ≤ Σ|w|·E_R +
-//! γ_{2·n_used}·(Σ|w·d_ours| + Σ|w·d_ik|)`: each engine's weighted sum rounds
-//! at most twice per term.
+//! The partial sum then satisfies `|out_ours − out_ik − Σ w·F − Σ w·A| ≤
+//! Σ|w|·E_R + γ_{2·n_used}·(Σ|w·d_ours| + Σ|w·d_ik|)`: each engine's weighted
+//! sum rounds at most twice per term.
 
 #[path = "common/v41set.rs"]
 mod v41set;
@@ -68,7 +77,7 @@ use gguf::{GgmlType, Split};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{HostLayer, HostScratch};
-use model::ops::{Tensor2, Weight, matmul_q_group_into};
+use model::ops::{ActRead, Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
 use model::r8file::{HostR8, R8Source};
 
@@ -123,8 +132,54 @@ fn q8k_block_abs(x: &[f32]) -> Vec<f64> {
         .collect()
 }
 
-/// `h`'s q8_2_x4 activation for weight type `ty`: per 32-value block its
-/// bf16 scale bits and its codes.
+/// `h`'s q8_K activation (ours, for the down): per 256-value block its f32
+/// scale and its codes.
+fn q8k_blocks(h: &[f32]) -> Vec<(f32, [i8; 256])> {
+    let mut col = vec![0u8; qdot::q8k_col_bytes(h.len())];
+    qdot::quantize_col_q8k(h, &mut col);
+    col.as_chunks::<296>()
+        .0
+        .iter()
+        .map(|b| {
+            let mut q = [0i8; 256];
+            for (qi, &c) in q.iter_mut().zip(&b[8..264]) {
+                *qi = i8::from_le_bytes([c]);
+            }
+            (f32::from_le_bytes([b[0], b[1], b[2], b[3]]), q)
+        })
+        .collect()
+}
+
+/// Per row of `w`, `Σ_c W_rc·δ_c` and `Σ_c |W_rc|·|δ_c|` in f64, `W` the
+/// rows dequantized (`gguf::dequant_row`), over the host's threads.
+fn rows_against(w: &Weight<'_>, delta: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let (n, k) = (w.n(), w.k());
+    assert_eq!(delta.len(), k);
+    let rb = w.bytes().len() / n;
+    let (mut dot, mut abs) = (vec![0.0f64; n], vec![0.0f64; n]);
+    let parts = std::thread::available_parallelism().map_or(1, usize::from);
+    let per = n.div_ceil(parts);
+    std::thread::scope(|sc| {
+        for (c, (d, a)) in dot.chunks_mut(per).zip(abs.chunks_mut(per)).enumerate() {
+            sc.spawn(move || {
+                let mut row = vec![0.0f32; k];
+                for (j, (dj, aj)) in d.iter_mut().zip(a.iter_mut()).enumerate() {
+                    let r = c * per + j;
+                    gguf::dequant_row(w.ty(), &w.bytes()[r * rb..(r + 1) * rb], &mut row)
+                        .unwrap_or_else(|e| panic!("dequant row {r}: {e}"));
+                    for (&wv, &dv) in row.iter().zip(delta) {
+                        *dj += f64::from(wv) * dv;
+                        *aj += (f64::from(wv) * dv).abs();
+                    }
+                }
+            });
+        }
+    });
+    (dot, abs)
+}
+
+/// `h`'s q8_2_x4 activation for weight type `ty` (ik's rule for the down):
+/// per 32-value block its bf16 scale bits and its codes.
 fn q82x4_blocks(ty: GgmlType, h: &[f32]) -> Vec<(u16, [i8; 32])> {
     let mut col = vec![0u8; qdot::col_bytes(ty, h.len())];
     qdot::quantize_col(ty, h, &mut col);
@@ -204,9 +259,11 @@ struct Layer {
     flips: usize,
     scale_moves: usize,
     step: i32,
-    /// `max |out_ours − out_ik|` and `max |Σ w·F|` over the layer.
+    /// `max |out_ours − out_ik|` and `max |Σ w·F|` over the layer, and the
+    /// largest `|A_i|` of one slot (module doc, 4.).
     raw: f64,
     flip_sum: f64,
+    rule: f64,
     /// Clamp hits of the routed combine: `silu(g) > L`, `u > L`, `u < −L`, and
     /// the hits an unclamped h would put outside the h band.
     silu_hi: usize,
@@ -399,6 +456,12 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         let d_ik_all = set.f32s(&format!("ffn_moe_down-{l}"), [embd, n_used, n_tokens]);
         let out_ik_all = set.f32s(&format!("ffn_moe_out-{l}"), [embd, n_tokens, 1]);
         let [sg, su, sd] = layer.stacks();
+        assert_eq!(
+            layer.down_read(),
+            ActRead::Q8K,
+            "layer {l}: the {} down must read q8_K, the rule stage B models",
+            sd.info().ty
+        );
         let mut st = Layer::default();
         let mut down_ty = GgmlType::F32;
         for t in 0..n_tokens {
@@ -429,8 +492,12 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             }
             // x's magnitudes per block, ik's within γ_3 of ours.
             let ax: Vec<f64> = q8k_block_abs(&x.data);
-            let (mut flip, mut band_r, mut terms) =
-                (vec![0.0f64; embd], vec![0.0f64; embd], vec![0.0f64; embd]);
+            let (mut flip, mut act, mut band_r, mut terms) = (
+                vec![0.0f64; embd],
+                vec![0.0f64; embd],
+                vec![0.0f64; embd],
+                vec![0.0f64; embd],
+            );
             for (s, &(e, w)) in list.iter().enumerate() {
                 let e = e as usize;
                 let w = f64::from(w);
@@ -474,18 +541,40 @@ fn hw_ds41_host_matches_ik_routed_sum() {
                     }
                 }
 
-                // Stage B: the two quantized h differ by flips only; our down
-                // on ik's h against ik's down (module doc, 3. and 1.).
-                let (qo, qi) = (q82x4_blocks(wd.ty(), h), q82x4_blocks(wd.ty(), h_ik));
+                // Stage B: our q8_K of the two h differ by flips only; our
+                // down on ik's h against ik's down, the two rules' difference
+                // on ik's h computed (module doc, 3., 4. and 1.).
+                let wq = wd
+                    .read_as(layer.down_read())
+                    .unwrap_or_else(|err| panic!("layer {l} expert {e}: {err}"));
+                let (qo, qi) = (q8k_blocks(h), q8k_blocks(h_ik));
                 for ((so, co), (si, ci)) in qo.iter().zip(&qi) {
-                    st.scale_moves += usize::from(so != si);
+                    st.scale_moves += usize::from(so.to_bits() != si.to_bits());
                     for (&a, &b) in co.iter().zip(ci) {
                         let step = (i32::from(a) - i32::from(b)).abs();
                         st.flips += usize::from(step != 0);
                         st.step = st.step.max(step);
                     }
                 }
-                let a_h: Vec<f64> = qi
+                let r8: Vec<f64> = qi
+                    .iter()
+                    .flat_map(|(dq, q)| q.iter().map(move |&v| f64::from(*dq) * f64::from(v)))
+                    .collect();
+                let a8: Vec<f64> = qi
+                    .iter()
+                    .map(|(dq, q)| {
+                        f64::from(*dq).abs() * q.iter().map(|&v| f64::from(v).abs()).sum::<f64>()
+                    })
+                    .collect();
+                let q2 = q82x4_blocks(wd.ty(), h_ik);
+                let r2: Vec<f64> = q2
+                    .iter()
+                    .flat_map(|(bits, q)| {
+                        let dq = f64::from(f32::from_bits(u32::from(*bits) << 16));
+                        q.iter().map(move |&v| dq * f64::from(v))
+                    })
+                    .collect();
+                let a2: Vec<f64> = q2
                     .chunks(8)
                     .map(|sb| {
                         sb.iter()
@@ -496,21 +585,25 @@ fn hw_ds41_host_matches_ik_routed_sum() {
                             .sum()
                     })
                     .collect();
-                let sdn = kquant_rows(&wd, &a_h);
+                let (sd_ours, sd_ik) = (kquant_rows(&wd, &a8), kquant_rows(&wd, &a2));
+                let delta: Vec<f64> = r8.iter().zip(&r2).map(|(a, b)| a - b).collect();
+                let (rule, rule_abs) = rows_against(&wd, &delta);
                 let h_ik_t = Tensor2::from_vec(ff, 1, h_ik.to_vec());
                 let mut on_ik = [Tensor2::from_vec(embd, 1, vec![f32::NAN; embd])];
-                matmul_q_group_into("ds41_host_gate", &[wd], &[&h_ik_t], &mut on_ik)
+                matmul_q_group_into("ds41_host_gate", &[wq], &[&h_ik_t], &mut on_ik)
                     .unwrap_or_else(|err| panic!("layer {l} token {t} expert {e}: {err}"));
                 let dt = &on_ik[0].data;
                 st.slots += 1;
                 st.down_bits +=
                     usize::from(dt.iter().zip(d_ik).all(|(a, b)| a.to_bits() == b.to_bits()));
                 for i in 0..embd {
-                    let e_r = 2.0 * e_down * sdn[i];
-                    st.down = st
-                        .down
-                        .max(ratio(f64::from(dt[i]), f64::from(d_ik[i]), e_r));
+                    let e_r = e_down * (sd_ours[i] + sd_ik[i]) + 4.0 * U * rule_abs[i];
+                    st.down =
+                        st.down
+                            .max(ratio(f64::from(dt[i]) - rule[i], f64::from(d_ik[i]), e_r));
+                    st.rule = st.rule.max(rule[i].abs());
                     flip[i] += w * (f64::from(d[i]) - f64::from(dt[i]));
+                    act[i] += w * rule[i];
                     band_r[i] += w.abs() * e_r;
                     terms[i] += (w * f64::from(d[i])).abs() + (w * f64::from(d_ik[i])).abs();
                 }
@@ -522,7 +615,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             for i in 0..embd {
                 let (o, oi) = (f64::from(out[i]), f64::from(out_ik[i]));
                 let band = band_r[i] + e_sum * terms[i];
-                st.out = st.out.max(ratio(o - flip[i], oi, band));
+                st.out = st.out.max(ratio(o - flip[i] - act[i], oi, band));
                 st.raw = st.raw.max((o - oi).abs());
                 st.flip_sum = st.flip_sum.max(flip[i].abs());
             }
@@ -531,7 +624,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         println!(
             "layer={l} down={down_ty} shards(gate,up,down)={shards:?} limit={limit} tokens={n_tokens} slots={} \
              h_ratio={:.3e} flips={} scale_moves={} max_code_step={} down_ratio={:.3e} down_bits_equal={}/{} \
-             out_ratio={:.3e} max_abs_diff={:.3e} max_flip_term={:.3e} \
+             max_rule_term={:.3e} out_ratio={:.3e} max_abs_diff={:.3e} max_flip_term={:.3e} \
              clamp_hits silu>L={} u>L={} u<-L={} visible={} r8_cells_off={} {}",
             st.slots,
             st.h,
@@ -541,6 +634,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
             st.down,
             st.down_bits,
             st.slots,
+            st.rule,
             st.out,
             st.raw,
             st.flip_sum,

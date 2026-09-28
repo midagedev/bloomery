@@ -140,7 +140,8 @@ mod gate {
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::{host, names};
-    use model::moe::{HostLayer, HostScratch};
+    use model::moe::{self, HostLayer, HostScratch};
+    use model::ops::ActRead;
     use model::r8file::R8Source;
 
     /// The sets, T = 1 each: a decode step at position 4, and one at 301 with
@@ -1392,6 +1393,19 @@ mod gate {
         })
     }
 
+    /// The values our q8_K codes of `h` stand for (`qdot::quantize_col_q8k`),
+    /// `q·d` in f32 each.
+    fn q8k_image(h: &[f32]) -> Vec<f32> {
+        let mut b = vec![0u8; qdot::q8k_col_bytes(h.len())];
+        qdot::quantize_col_q8k(h, &mut b);
+        b.chunks_exact(b.len() / (h.len() / 256))
+            .flat_map(|blk| {
+                let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
+                blk[8..264].iter().map(move |&q| f32::from(q as i8) * d)
+            })
+            .collect()
+    }
+
     /// Our shared down's activation of `h` under a down weight of type `ty`
     /// as the values its codes stand for, and the roundings on one term's
     /// path through our dot and through ik's: q8_0 and Q5_K read f32, Q4_K
@@ -1428,11 +1442,13 @@ mod gate {
             KQ_DECODE
         };
         let ik_n = n_ik_quant(ff) + decode;
-        // ik's format under the routed down; the host tier quantizes as ik
-        // does (qdot's q8_2_x4, the same codes).
+        // ik's format under the routed down.
         let down_act = Rule::of(bw.down_ty)
             .ok_or_else(|| format!("a routed down of type {} has no rule here", bw.down_ty))?
             .ik;
+        // The host tier's: our q8_K where the down reads it (its f32 image
+        // one rounding more), else ik's q8_2_x4 codes.
+        let host_q8k = moe::host_down_read(bw.down_ty) == ActRead::Q8K;
         let mut pred = vec![0.0f64; n];
         let mut bound = vec![0.0f64; n];
         // Per value: the magnitudes our card chain, the host's sum and ik's
@@ -1465,11 +1481,19 @@ mod gate {
                     .iter()
                     .find(|s| s.slot == j)
                     .ok_or_else(|| format!("slot {j} is neither the card's nor the host's"))?;
-                (
-                    down_act.reconstruct(&s.h),
-                    n_ik_quant(ff) + decode,
-                    s.down.clone(),
-                )
+                if host_q8k {
+                    (
+                        q8k_image(&s.h),
+                        n_ik_quant(ff) + decode + Q8_IMAGE,
+                        s.down.clone(),
+                    )
+                } else {
+                    (
+                        down_act.reconstruct(&s.h),
+                        n_ik_quant(ff) + decode,
+                        s.down.clone(),
+                    )
+                }
             };
             let st = row_stats(wd, &xo, &xi)?;
             for (dd, s) in st.iter().enumerate() {

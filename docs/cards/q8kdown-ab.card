@@ -1,0 +1,43 @@
+# Round q8kdown, the landing A/B: the host tier's routed Q4_K/Q5_K down reads q8_K columns through
+# qdot::dot_q45k_q8k_cols (one path, no lever) against the tree before it (q8_2_x4, dot_row_cols), two
+# binaries in one lease (bin: arm, base built in a worktree before the lease). Derivation from the
+# kernels' own instruction counts (x86_64 asm of bloomery-qdot, loop bodies per row super-block at
+# C = 8 columns): Q4_K down 541 -> 366, Q5_K 565 -> 424; at the r8 gate/up's 2,291 per 8-row group
+# super-block the per-column total is 6.42 M instructions an expert, of which the down's 3.12 M, and
+# the q8_K down takes 1.01 M off it: c_r8 13.05 -> 11.00 us [derived, the instructions-to-c_r8 ratio
+# held]. Flow model (tools/flow, B1+T+G2 wrap+r8, main 0d142ce) with c_r8 11.00: lcg no hot list
+# P 512 181.6 -> 190.9 (+5.1 %), P 4096 331.8 -> 353.5 (+6.6 %); hot list 384 lcg +4.5 / +5.9 %,
+# prose +3.1 % (P 512) and +1.2 % (P 4096, card-bound: 93 of 116 layer-batches) [derived]. The band is
+# the ratio held within -/+30 % (IPC of the new body against the old). Decode: the host leg at m = 1
+# is DRAM-bound (a + c = 51 us under W = 126.4 us an expert) and the q8_K lone column is +7 (Q4_K) and
+# +19 (Q5_K) instructions a super-block over q8_2_x4's, +1.8 us an expert under W: 0 [derived].
+# Prerequisite for the prose rows: the public-file held-out hot list from 03's sitting (the in-sample
+# hotlist-384 is not a fair list for them); without it the prose rows are not read.
+kind: ab
+question: does the q8_K host down shorten the host-bound V4.1 prompt call by the down's instruction
+  share the derivation gives?
+term: pp tok/s @ P = 4096, lcg prompt, A6000, plan (a), CED on, no hot list - (q8kdown - base) /
+  base, paired by round
+unit: %
+predict: +4.6..+8.2
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55
+  and 1.1 %; the larger
+condition: the q8kdown generate_ds41 and the tree before it (a base worktree built before the lease,
+  a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/q8kdown-ab.card' just
+  depth-gpu-ds41 512 bin:<base>:512 4096 bin:<base>:4096 6 bin:<base>:6 4096 bin:<base>:4096, the
+  order rotated every round, union_lb and wait_lb printed per arm; no row carries [cpu-busy] or
+  [other-busy]; the load lines name `path=fused act=q8_K` for the Q4_K and Q5_K downs in the q8kdown
+  arm and not in the base. The P = 512 rows are read against +3.6..+6.3 %, the decode rows (depth 6
+  and 4096) against no move beyond the ruler, and the prose rows, with the held-out list,
+  prose:512/prose:4096 against +2.3..+3.8 / +0.8..+1.5 %
+decide-in: keep the q8_K down; the lcg union is at the W floor on the mean expert (38 + 11.0 x 7.6 =
+  121.6 us under 126.4): host compute levers there predict 0 until streaming or residency moves the
+  bytes, so (c') and hoststream are the next host rounds
+decide-below: read union_lb against the base arm: under half the predicted cut means the new body's
+  IPC fell (count the loop with perf stat cycles,instructions on the union bench's r8 m 8 arm);
+  otherwise the union is DRAM-bound earlier than the model's W floor says - re-derive w
+decide-above: the old down ran below the r8 gate/up's IPC (its C = 6..8 bodies spill): write the
+  measured union_lb into the flow model's c_r8 and re-derive the host streaming and (c') cells before
+  sizing either

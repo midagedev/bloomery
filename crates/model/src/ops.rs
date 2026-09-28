@@ -529,18 +529,24 @@ impl SharedQuantCols {
     /// The caller owns column `t`'s cells — its own sub-range of the pre-pass
     /// split, or the whole slot through a deferred claim's compare-exchange;
     /// `x_col` is column `t` of this buffer's input.
-    unsafe fn quantize_into(&self, ty: GgmlType, k: usize, x_col: &[f32], t: usize) {
-        match self {
-            SharedQuantCols::F32(ptr) => {
+    unsafe fn quantize_into(&self, enc: Enc, k: usize, x_col: &[f32], t: usize) {
+        match (self, enc) {
+            (SharedQuantCols::F32(ptr), Enc::Own(ty)) => {
                 // SAFETY: the disjoint-cell contract above; the cell is `k` f32s, as allocated.
                 let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * k), k) };
                 quantize_activations(ty, x_col, cell)
                     .expect("the scalar arm of the fused decision refused this type before its slot was built");
             }
-            SharedQuantCols::Bytes { cb, ptr } => {
+            (SharedQuantCols::F32(_), Enc::Q8K) => {
+                unreachable!("a q8_K reading is fused at every k it is made for (Weight::read_as)")
+            }
+            (SharedQuantCols::Bytes { cb, ptr }, enc) => {
                 // SAFETY: same contract; the cell is `cb` bytes, as `col_bytes` allocated.
                 let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * cb), *cb) };
-                qdot::quantize_col(ty, x_col, cell);
+                match enc {
+                    Enc::Own(ty) => qdot::quantize_col(ty, x_col, cell),
+                    Enc::Q8K => qdot::quantize_col_q8k(x_col, cell),
+                }
             }
         }
     }
@@ -759,7 +765,7 @@ impl QuantizedCols {
         if poison() {
             self.buf.fill(0xA5);
         }
-        quantize_cols_pool(x, (ty, &mut self.buf[..]), None);
+        quantize_cols_pool(x, (Enc::Own(ty), &mut self.buf[..]), None);
         self.key = Some(QuantKey {
             ty,
             k,
@@ -774,11 +780,17 @@ impl QuantizedCols {
     /// exactly these bytes: fused at `k`, and the same column bytes and
     /// activation format — the dispatch's sharing rule.
     pub fn serves(&self, ty: GgmlType, k: usize) -> bool {
+        self.serves_read(ty, ActRead::Own, k)
+    }
+
+    /// [`QuantizedCols::serves`] for a pair whose rows read `act`.
+    fn serves_read(&self, ty: GgmlType, act: ActRead, k: usize) -> bool {
+        let enc = Enc::of(ty, act);
         self.key.is_some_and(|q| {
             q.k == k
-                && qdot::fuses(ty, k)
-                && qdot::col_bytes(ty, k) == q.cb
-                && gguf::activation_format(ty) == gguf::activation_format(q.ty)
+                && act.fuses(ty, k)
+                && enc.col_bytes(k) == q.cb
+                && enc.format() == Enc::Own(q.ty).format()
         })
     }
 
@@ -805,19 +817,19 @@ impl QuantizedCols {
 /// holds exactly `x`'s columns at its encoding's `qdot::col_bytes`.
 fn quantize_cols_pool(
     x: Tensor2View<'_>,
-    first: (GgmlType, &mut [u8]),
-    second: Option<(GgmlType, &mut [u8])>,
+    first: (Enc, &mut [u8]),
+    second: Option<(Enc, &mut [u8])>,
 ) {
     let (k, ne1) = (x.ne0(), x.ne1());
-    let shared = |(ty, dst): (GgmlType, &mut [u8])| {
-        let cb = qdot::col_bytes(ty, k);
+    let shared = |(enc, dst): (Enc, &mut [u8])| {
+        let cb = enc.col_bytes(k);
         assert_eq!(
             dst.len(),
             ne1 * cb,
-            "quantized columns: {ne1} columns of {cb} bytes in {ty:?}"
+            "quantized columns: {ne1} columns of {cb} bytes"
         );
         (
-            ty,
+            enc,
             SharedQuantCols::Bytes {
                 cb,
                 ptr: dst.as_mut_ptr(),
@@ -831,9 +843,9 @@ fn quantize_cols_pool(
     // the join publishes the writes.
     threads::pool().for_each_chunk(ne1, |cols| {
         for t in cols {
-            for (ty, dst) in shared.iter().flatten() {
+            for (enc, dst) in shared.iter().flatten() {
                 // SAFETY: column `t` is in this participant's chunk — see the construction site.
-                unsafe { dst.quantize_into(*ty, k, x.col(t), t) };
+                unsafe { dst.quantize_into(*enc, k, x.col(t), t) };
             }
         }
     });
@@ -954,6 +966,7 @@ impl ShardTensor {
             n: n_of(&self.info),
             bytes: self.file(split)?.data(&self.info)?,
             layout: RowLayout::Rows,
+            act: ActRead::Own,
         })
     }
 
@@ -1016,6 +1029,7 @@ fn expert_weight<'a>(
         n: n_of(info),
         bytes: &stack[e * per..(e + 1) * per],
         layout,
+        act: ActRead::Own,
     })
 }
 
@@ -1047,6 +1061,96 @@ impl RowLayout {
         match self {
             RowLayout::Rows => "rows",
             RowLayout::R8 => "r8",
+        }
+    }
+}
+
+/// Which activation encoding a matrix's rows read: its type's own
+/// ([`gguf::activation_format`], `qdot::quantize_col`), or q8_K in its place
+/// (`qdot::quantize_col_q8k`, read by `qdot::dot_q45k_q8k_cols`) — only a
+/// type with a q8_K kernel (`qdot::has_q8k_kernel`), whole super-blocks.
+/// Its type says how a row encodes its values; this says how the column it
+/// is dotted with does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActRead {
+    /// The type's own activation format.
+    #[default]
+    Own,
+    /// q8_K: 256 values, an f32 scale and 16 code sums a block.
+    Q8K,
+}
+
+impl ActRead {
+    /// Whether a row of `ty` with `k` values reading this takes the fused
+    /// path: its own format where `qdot::fuses`, q8_K wherever the q8_K
+    /// kernel takes the row (its scalar mirror runs on any CPU).
+    fn fuses(self, ty: GgmlType, k: usize) -> bool {
+        match self {
+            ActRead::Own => qdot::fuses(ty, k),
+            ActRead::Q8K => qdot::has_q8k_kernel(ty) && k.is_multiple_of(256),
+        }
+    }
+
+    /// Whether a matrix of `ty` with `k` values a row can read this.
+    #[must_use]
+    pub fn serves(self, ty: GgmlType, k: usize) -> bool {
+        match self {
+            ActRead::Own => true,
+            ActRead::Q8K => self.fuses(ty, k),
+        }
+    }
+
+    /// The reading's name in a load line.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ActRead::Own => "own",
+            ActRead::Q8K => "q8_K",
+        }
+    }
+
+    /// `Ok` for a matrix of `ty` with `k` values a row that can read this,
+    /// else the named refusal.
+    fn check(self, ty: GgmlType, k: usize) -> Result<(), crate::ModelError> {
+        if self.serves(ty, k) {
+            Ok(())
+        } else if !k.is_multiple_of(256) {
+            Err(qdot::QdotError::UnalignedK { k, gran: 256 }.into())
+        } else {
+            Err(qdot::QdotError::NoQ8kKernel(ty).into())
+        }
+    }
+}
+
+/// How one pair's input columns are encoded — the encoder a column goes
+/// through and the sharing rule's key: `ty`'s own activation format, or q8_K.
+#[derive(Clone, Copy)]
+enum Enc {
+    Own(GgmlType),
+    Q8K,
+}
+
+impl Enc {
+    fn of(ty: GgmlType, act: ActRead) -> Enc {
+        match act {
+            ActRead::Own => Enc::Own(ty),
+            ActRead::Q8K => Enc::Q8K,
+        }
+    }
+
+    /// The encoding's format: two pairs whose inputs are one block share one
+    /// quantization when their formats and column bytes agree.
+    fn format(self) -> Result<Option<gguf::ActivationFormat>, gguf::QuantError> {
+        match self {
+            Enc::Own(ty) => gguf::activation_format(ty),
+            Enc::Q8K => Ok(Some(gguf::ActivationFormat::Q8K)),
+        }
+    }
+
+    /// Bytes of one fused column of `k` values.
+    fn col_bytes(self, k: usize) -> usize {
+        match self {
+            Enc::Own(ty) => qdot::col_bytes(ty, k),
+            Enc::Q8K => qdot::q8k_col_bytes(k),
         }
     }
 }
@@ -1142,6 +1246,7 @@ pub(crate) struct ExpertStack<'w> {
     per: usize,
     bytes: &'w [u8],
     layout: RowLayout,
+    act: ActRead,
 }
 
 impl<'w> ExpertStack<'w> {
@@ -1158,7 +1263,16 @@ impl<'w> ExpertStack<'w> {
             per,
             bytes,
             layout: RowLayout::Rows,
+            act: ActRead::Own,
         })
+    }
+
+    /// The stack with every matrix reading `act`; a type or width that
+    /// cannot read it is a named error.
+    pub(crate) fn read_as(mut self, act: ActRead) -> Result<Self, crate::ModelError> {
+        act.check(self.ty, self.k)?;
+        self.act = act;
+        Ok(self)
     }
 
     /// `info`, a stack of `gguf` — a one-file model's own header.
@@ -1186,6 +1300,7 @@ pub struct Weight<'a> {
     n: usize,
     bytes: &'a [u8],
     layout: RowLayout,
+    act: ActRead,
 }
 
 impl<'a> Weight<'a> {
@@ -1201,7 +1316,21 @@ impl<'a> Weight<'a> {
             n: n_of(info),
             bytes: gguf.data(info)?,
             layout: RowLayout::Rows,
+            act: ActRead::Own,
         })
+    }
+
+    /// The same matrix with its rows reading `act` ([`ActRead`]); a type or
+    /// width that cannot read it is a named error.
+    pub fn read_as(mut self, act: ActRead) -> Result<Weight<'a>, crate::ModelError> {
+        act.check(self.ty, self.k)?;
+        self.act = act;
+        Ok(self)
+    }
+
+    /// The activation encoding the rows read.
+    pub fn act(&self) -> ActRead {
+        self.act
     }
 
     pub fn ty(&self) -> GgmlType {
@@ -1385,6 +1514,15 @@ impl<'a> Weights<'a> {
         match self {
             Weights::File(..) => RowLayout::Rows,
             Weights::Resolved(ws) => ws[i].layout,
+        }
+    }
+
+    /// Pair `i`'s activation reading: a file header's rows read their type's
+    /// own format.
+    fn act(self, i: usize) -> ActRead {
+        match self {
+            Weights::File(..) => ActRead::Own,
+            Weights::Resolved(ws) => ws[i].act,
         }
     }
 }
@@ -1587,7 +1725,9 @@ fn group_core(
         // dots the quantized codes directly, so activations are quantized
         // into `qdot::quantize_col`'s layout, and `qdot::fuses` owns the
         // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1/Q8_0).
-        let fused = qdot::fuses(ty, k);
+        let act = ws.act(i);
+        let fused = act.fuses(ty, k);
+        let enc = Enc::of(ty, act);
         let layout = ws.layout(i);
         assert!(
             layout == RowLayout::Rows || (fused && n.is_multiple_of(layout.grain())),
@@ -1595,7 +1735,7 @@ fn group_core(
              groups (R8Stack::of): n = {n}"
         );
         let cb = if fused {
-            Some(qdot::col_bytes(ty, k))
+            Some(enc.col_bytes(k))
         } else {
             // The scalar path quantizes into the weight type's activation format;
             // a type without one is refused here, before any column exists.
@@ -1697,7 +1837,7 @@ fn group_core(
         // the same rule decided they are this pair's bytes.
         let pre = match src {
             GroupInput::Quantized(_, xq, _) => {
-                if !xq.is_of(xin) || !xq.serves(ty, k) {
+                if !xq.is_of(xin) || !xq.serves_read(ty, act, k) {
                     return Err(crate::ModelError::Shape {
                         what: "group quantized cols: filled from another block or for another encoding",
                         want_ne0: xin.ne0(),
@@ -1714,7 +1854,7 @@ fn group_core(
             (Some(..), _) => {
                 slots.push(QuantSlot {
                     x,
-                    ty,
+                    enc,
                     k,
                     cb,
                     swiglu,
@@ -1728,7 +1868,7 @@ fn group_core(
                 .unwrap_or_else(|| {
                     slots.push(QuantSlot {
                         x,
-                        ty,
+                        enc,
                         k,
                         cb,
                         swiglu: None,
@@ -1744,12 +1884,12 @@ fn group_core(
                         && q.pre.is_none()
                         && q.x.is_input(xin)
                         && q.cb == cb
-                        && gguf::activation_format(q.ty) == gguf::activation_format(ty)
+                        && q.enc.format() == enc.format()
                 })
                 .unwrap_or_else(|| {
                     slots.push(QuantSlot {
                         x,
-                        ty,
+                        enc,
                         k,
                         cb,
                         swiglu: None,
@@ -1766,6 +1906,7 @@ fn group_core(
             n,
             row_bytes: b.len() / n,
             layout,
+            act,
         });
         slot_of.push(slot);
         cols_of.push(src.cols());
@@ -2002,6 +2143,8 @@ struct PairWork<'a> {
     /// Where each row's bytes lie: a row-lane pair computes its rows a group
     /// at a time.
     layout: RowLayout,
+    /// The encoding the slot's columns are in, and the kernel it picks.
+    act: ActRead,
     /// The slot whose columns this pair reads, and the claim table when
     /// quantization is deferred into the dispatch (`None`: the pre-pass
     /// completed every column before any row runs).
@@ -2026,6 +2169,7 @@ struct PairMeta {
     n: usize,
     row_bytes: usize,
     layout: RowLayout,
+    act: ActRead,
 }
 
 impl<'a> PairWork<'a> {
@@ -2080,6 +2224,7 @@ impl<'a> PairWork<'a> {
             ne1,
             out: out_ptr,
             layout: m.layout,
+            act: m.act,
             slot,
             defer,
         }
@@ -2122,14 +2267,16 @@ impl<'a> PairWork<'a> {
             // lone column takes `qdot::dot_row`; runs of up to
             // `qdot::TILE_COLS` columns take `qdot::dot_row_cols`, which
             // unpacks the row's blocks once per run and writes each column's
-            // `dot_row` value bit for bit.
+            // `dot_row` value bit for bit. A q8_K reading takes
+            // `qdot::dot_q45k_q8k_cols` for every run, a lone column too: one
+            // kernel, whose value per column is the same at every width.
             for r in rows {
                 let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                 let mut t0 = 0;
                 while t0 < self.ne1 {
                     let m = (self.ne1 - t0).min(qdot::TILE_COLS);
-                    if m == 1 {
+                    if m == 1 && self.act == ActRead::Own {
                         let c = self.col(t0);
                         let v = qdot::dot_row(ty, src, &acol[c * cb..(c + 1) * cb], k)?;
                         // SAFETY: cell `t0 * n + r` is inside this chunk's row range — see the SharedOut construction site.
@@ -2140,7 +2287,14 @@ impl<'a> PairWork<'a> {
                             &acol[c * cb..(c + 1) * cb]
                         });
                         let mut v = [0.0f32; qdot::TILE_COLS];
-                        qdot::dot_row_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                        match self.act {
+                            ActRead::Own => {
+                                qdot::dot_row_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                            }
+                            ActRead::Q8K => {
+                                qdot::dot_q45k_q8k_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                            }
+                        }
                         for (i, &v) in v[..m].iter().enumerate() {
                             // SAFETY: cell `(t0 + i) * n + r` is inside this chunk's row range — see the SharedOut construction site.
                             unsafe { self.out.write((t0 + i) * n + r, v) };
@@ -2340,9 +2494,10 @@ struct QuantSlot<'a> {
     /// The block whose columns are quantized — a ready input, or the par
     /// block the slot's SwiGLU source produces (see `swiglu`).
     x: SlotBlock<'a>,
-    ty: GgmlType,
+    /// The encoder every column of the slot goes through.
+    enc: Enc,
     k: usize,
-    /// `qdot::col_bytes(ty, k)` on the fused path, `None` on the scalar one.
+    /// `enc`'s column bytes on the fused path, `None` on the scalar one.
     cb: Option<usize>,
     /// The SwiGLU producer, when `x` is not a ready input: the claimer (or,
     /// unless `produced`, the pre-pass) writes the combine through its `par`
@@ -2459,13 +2614,13 @@ fn quant_range(
                         unsafe { std::slice::from_raw_parts_mut(comb.par.0.add(t * s.k), s.k) };
                     swiglu_into(comb.gate.col(t), comb.up.col(t), comb.limit, par);
                     // SAFETY: column `t` of slot `d` is inside this chunk's sub-range — see the construction site in `quantize_slots`.
-                    unsafe { shared.get(d).quantize_into(s.ty, s.k, par, t) };
+                    unsafe { shared.get(d).quantize_into(s.enc, s.k, par, t) };
                 }
             }
             _ => {
                 for t in t0..t_end {
                     // SAFETY: column `t` of slot `d` is inside this chunk's sub-range — see the construction site in `quantize_slots`.
-                    unsafe { shared.get(d).quantize_into(s.ty, s.k, s.x.col(t), t) };
+                    unsafe { shared.get(d).quantize_into(s.enc, s.k, s.x.col(t), t) };
                 }
             }
         }
@@ -2634,7 +2789,7 @@ impl<'a> DeferredSlots<'a> {
                 unsafe {
                     self.shared
                         .get(s)
-                        .quantize_into(q.ty, q.k, &par[t * q.k..(t + 1) * q.k], t);
+                        .quantize_into(q.enc, q.k, &par[t * q.k..(t + 1) * q.k], t);
                 }
             }
             if let Some(t_q) = t_q {
@@ -2645,7 +2800,7 @@ impl<'a> DeferredSlots<'a> {
             for t in 0..ne1 {
                 // SAFETY: every column of the slot is this claimer's
                 // exclusively (the compare-exchange above).
-                unsafe { self.shared.get(s).quantize_into(q.ty, q.k, q.x.col(t), t) };
+                unsafe { self.shared.get(s).quantize_into(q.enc, q.k, q.x.col(t), t) };
             }
             if let Some(t_q) = t_q {
                 acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
@@ -2872,11 +3027,14 @@ fn row_cost(p: &PairWork<'_>) -> u64 {
 /// share (the loop body of `qdot::tile::<C>` in the disassembly, C = 2, 3, 4,
 /// fitted as fixed + C · per column). A lone column's `dot_row` costs about a
 /// run of one. `None`: no tile kernel.
-fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
-    match ty {
-        GgmlType::Q3_K => Some((192, 63)),
-        GgmlType::Q4_K => Some((96, 97)),
-        GgmlType::Q5_K => Some((156, 98)),
+fn tile_units(ty: GgmlType, act: ActRead) -> Option<(u64, u64)> {
+    match (ty, act) {
+        (GgmlType::Q3_K, ActRead::Own) => Some((192, 63)),
+        (GgmlType::Q4_K, ActRead::Own) => Some((96, 97)),
+        (GgmlType::Q5_K, ActRead::Own) => Some((156, 98)),
+        // `qdot::dot_q45k_q8k_cols`, C = 2, 3, 4.
+        (GgmlType::Q4_K, ActRead::Q8K) => Some((156, 59)),
+        (GgmlType::Q5_K, ActRead::Q8K) => Some((200, 66)),
         _ => None,
     }
 }
@@ -2887,14 +3045,20 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
 /// for a pair without a tile kernel on this machine.
 fn tile_cost(p: &PairWork<'_>) -> Option<u64> {
     p.fused_cols
-        .and_then(|_| unit_tile_cost(p.ty, p.layout, p.k, p.ne1))
+        .and_then(|_| unit_tile_cost(p.ty, p.act, p.layout, p.k, p.ne1))
 }
 
 /// [`tile_cost`] of one unit of `layout` — a row of `ty`, or a row-lane
 /// group — over `k` values against `ne1` columns.
-fn unit_tile_cost(ty: GgmlType, layout: RowLayout, k: usize, ne1: usize) -> Option<u64> {
+fn unit_tile_cost(
+    ty: GgmlType,
+    act: ActRead,
+    layout: RowLayout,
+    k: usize,
+    ne1: usize,
+) -> Option<u64> {
     match layout {
-        RowLayout::Rows => tile_cost_of(ty, k, ne1),
+        RowLayout::Rows => tile_cost_of(ty, act, k, ne1),
         RowLayout::R8 => r8_tile_cost(k, ne1),
     }
 }
@@ -2920,10 +3084,11 @@ fn r8_tile_cost(k: usize, ne1: usize) -> Option<u64> {
     Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
 }
 
-/// [`tile_cost`] of a fused row of `ty` over `k` values against `ne1` columns.
-fn tile_cost_of(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
-    let (fixed, per_col) = tile_units(ty)?;
-    if !qdot::has_tile(ty) {
+/// [`tile_cost`] of a fused row of `ty` reading `act` over `k` values
+/// against `ne1` columns.
+fn tile_cost_of(ty: GgmlType, act: ActRead, k: usize, ne1: usize) -> Option<u64> {
+    let (fixed, per_col) = tile_units(ty, act)?;
+    if act == ActRead::Own && !qdot::has_tile(ty) {
         return None;
     }
     let m = ne1.max(1) as u64;
@@ -3471,6 +3636,7 @@ pub(crate) struct UnionStack {
     row_bytes: usize,
     cb: usize,
     layout: RowLayout,
+    act: ActRead,
 }
 
 impl UnionStack {
@@ -3510,10 +3676,10 @@ impl UnionStack {
             k,
             why,
         };
-        if !qdot::supports(s.ty) {
+        if s.act == ActRead::Own && !qdot::supports(s.ty) {
             return Err(refusal(qdot::QdotError::UnsupportedType(s.ty)));
         }
-        if !qdot::fuses(s.ty, k) {
+        if !s.act.fuses(s.ty, k) {
             return Err(refusal(qdot::QdotError::UnalignedK {
                 k,
                 gran: qdot::k_granularity(s.ty),
@@ -3524,8 +3690,9 @@ impl UnionStack {
             k,
             n,
             row_bytes: s.per / n,
-            cb: qdot::col_bytes(s.ty, k),
+            cb: Enc::of(s.ty, s.act).col_bytes(k),
             layout: s.layout,
+            act: s.act,
         })
     }
 
@@ -3585,8 +3752,12 @@ impl UnionStack {
     /// Whether `other`'s rows read this stack's input bytes: the same `k`,
     /// column bytes and activation format — the group engine's sharing rule.
     pub(crate) fn shares_input(&self, other: &UnionStack) -> bool {
-        (self.k, self.cb) == (other.k, other.cb)
-            && gguf::activation_format(self.ty) == gguf::activation_format(other.ty)
+        (self.k, self.cb) == (other.k, other.cb) && self.enc().format() == other.enc().format()
+    }
+
+    /// The encoder this stack's input columns go through.
+    fn enc(&self) -> Enc {
+        Enc::of(self.ty, self.act)
     }
 
     fn meta(&self) -> PairMeta {
@@ -3596,6 +3767,7 @@ impl UnionStack {
             n: self.n,
             row_bytes: self.row_bytes,
             layout: self.layout,
+            act: self.act,
         }
     }
 
@@ -3608,7 +3780,7 @@ impl UnionStack {
     /// its bytes once per column ([`row_cost`]).
     fn cost(&self, m: usize, tile: bool) -> u64 {
         match tile
-            .then(|| unit_tile_cost(self.ty, self.layout, self.k, m))
+            .then(|| unit_tile_cost(self.ty, self.act, self.layout, self.k, m))
             .flatten()
         {
             Some(c) => c,
@@ -3619,14 +3791,14 @@ impl UnionStack {
 
 /// Where a union call's combines come from and go: slot `q` of expert `d` is
 /// `silu(gate) · up` (clamped with `limit`) of its gate and up columns in
-/// `gu`, quantized in `ty`'s encoding into slot `q` of `qc`.
+/// `gu`, quantized by `enc` (the down's encoding) into slot `q` of `qc`.
 #[derive(Clone, Copy)]
 struct Combines<'c> {
     plan: UnionPlanView<'c>,
     gu: &'c [f32],
     ff: usize,
     limit: Option<f32>,
-    ty: GgmlType,
+    enc: Enc,
     qc: SharedQuantCols,
 }
 
@@ -3651,7 +3823,7 @@ impl Combines<'_> {
             let par = &mut par[..self.ff];
             swiglu_into(gate, up, self.limit, par);
             // SAFETY: the caller owns slot `q` of `qc`.
-            unsafe { self.qc.quantize_into(self.ty, self.ff, par, q) };
+            unsafe { self.qc.quantize_into(self.enc, self.ff, par, q) };
         });
     }
 }
@@ -3689,7 +3861,7 @@ fn claim_time(
 /// slot's.
 struct XClaims<'c> {
     x: Tensor2View<'c>,
-    encs: [Option<(GgmlType, SharedQuantCols)>; 2],
+    encs: [Option<(Enc, SharedQuantCols)>; 2],
     next: std::sync::atomic::AtomicUsize,
     done: std::sync::atomic::AtomicUsize,
     /// The longest claim pass (level >= 1).
@@ -3710,13 +3882,13 @@ impl XClaims<'_> {
                 break;
             }
             let _done = UnitDone(&self.done);
-            let (ty, dst) = self.encs[u / cols].expect("a unit's encoding is one the pass reads");
+            let (enc, dst) = self.encs[u / cols].expect("a unit's encoding is one the pass reads");
             let c = u % cols;
             // SAFETY: unit `u` — column `c` in this encoding — is this claimer's
             // alone (the counter) and inside the destination's `cols` columns;
             // no row reads it before `done` counts every unit (Release on the
             // count, Acquire in `wait`).
-            unsafe { dst.quantize_into(ty, self.x.ne0(), self.x.col(c), c) };
+            unsafe { dst.quantize_into(enc, self.x.ne0(), self.x.col(c), c) };
         }
         claim_time(t0, acc, &self.claim_ns);
     }
@@ -3856,7 +4028,7 @@ impl RowSet for UnionRows<'_, '_> {
     fn tile_costs(&self) -> bool {
         self.stacks
             .iter()
-            .all(|s| unit_tile_cost(s.ty, s.layout, s.k, 1).is_some())
+            .all(|s| unit_tile_cost(s.ty, s.act, s.layout, s.k, 1).is_some())
     }
 
     fn block_cap(&self) -> Option<usize> {
@@ -4126,8 +4298,8 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     fn quantize_x(&self, xq: &mut [u8], xq_up: Option<&mut [u8]>) {
         quantize_cols_pool(
             self.x,
-            (self.gate.ty, xq),
-            xq_up.map(|xq_up| (self.up.ty, xq_up)),
+            (self.gate.enc(), xq),
+            xq_up.map(|xq_up| (self.up.enc(), xq_up)),
         );
     }
 
@@ -4155,8 +4327,8 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         let claims = XClaims {
             x: self.x,
             encs: [
-                Some((self.gate.ty, x_gate)),
-                x_up.map(|x_up| (self.up.ty, x_up)),
+                Some((self.gate.enc(), x_gate)),
+                x_up.map(|x_up| (self.up.enc(), x_up)),
             ],
             next: std::sync::atomic::AtomicUsize::new(0),
             done: std::sync::atomic::AtomicUsize::new(0),
@@ -4211,7 +4383,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             gu,
             ff: self.gate.n,
             limit: self.limit,
-            ty: self.down.ty,
+            enc: self.down.enc(),
             qc: SharedQuantCols::Bytes {
                 cb: self.down.cb,
                 ptr: qc.as_mut_ptr(),
@@ -4378,7 +4550,7 @@ fn matmul_q_one(
     let mut slots: Flex<QuantSlot> = Flex::new();
     slots.push(QuantSlot {
         x: SlotBlock::Input(x.view()),
-        ty,
+        enc: Enc::Own(ty),
         k,
         cb,
         swiglu: None,
@@ -4398,6 +4570,7 @@ fn matmul_q_one(
         n,
         row_bytes,
         layout: RowLayout::Rows,
+        act: ActRead::Own,
     });
     let mut out = Tensor2::scratch(n, x.ne1);
     // SAFETY: the construction-site argument in `run_group`'s pair build —
@@ -4572,9 +4745,9 @@ fn matmul_q_multi(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack, Weight,
-        first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into, matmul_q_group_swiglu,
-        matvec_q_local, parse_steal,
+        ActRead, ExpertStack, GroupInput, RowLayout, Tensor2, UnionCall, UnionPlanView, UnionStack,
+        Weight, first_non_finite_col, matmul_q, matmul_q_group, matmul_q_group_into,
+        matmul_q_group_swiglu, matvec_q_local, parse_steal,
     };
     use gguf::{GgmlType, Gguf};
 
@@ -4742,6 +4915,7 @@ mod tests {
             per,
             bytes,
             layout: RowLayout::Rows,
+            act: ActRead::Own,
         }
     }
 
@@ -4916,6 +5090,7 @@ mod tests {
             n,
             bytes: &rows,
             layout: RowLayout::Rows,
+            act: ActRead::Own,
         };
         let r8 = Weight {
             bytes: &lanes,
@@ -4973,6 +5148,7 @@ mod tests {
             n,
             bytes: &lanes[..rows.len() / 16 * n],
             layout: RowLayout::R8,
+            act: ActRead::Own,
         };
         let x = Tensor2::from_vec(k, 1, (0..k).map(|i| i as f32 / k as f32 - 0.5).collect());
         let mut out = [Tensor2::zeros(n, 1)];
