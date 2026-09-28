@@ -73,6 +73,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
@@ -94,7 +95,9 @@ use model::placement::{Machine, Plan, PlanLevers};
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
 };
-use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, GoFront, ShadowWork};
+use crate::chain::ffn::{
+    CardStacks, Ds41Host, Ds41Tier, FfnIo, FfnPiece, FfnTaps, GoFront, ShadowWork, TierPiece,
+};
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
@@ -699,6 +702,19 @@ pub struct Body {
     levers: BodyLevers,
     /// The prompt batch's buffers ([`prefill`]), made by the first batch.
     batch: Option<Box<prefill::Batch>>,
+    /// The stage card's side of the tier layers, on a load with a tier card
+    /// ([`Body::open_placed_tiered`]).
+    tier: Option<TierPiece>,
+}
+
+/// The tier card a placed load hangs under the host tier
+/// ([`Body::open_placed_tiered`]): the plan's device index its routed
+/// segments sit on (`Device::Card(card)`), and the card's name, by which the
+/// card is found ([`Gpu::for_card`]).
+#[derive(Clone, Debug)]
+pub struct TierOpen {
+    pub card: usize,
+    pub name: String,
 }
 
 /// `pair[read]` to read and the other to write.
@@ -1361,6 +1377,7 @@ impl Body {
             glue,
             tap,
             arrival,
+            tier,
             ..
         } = self;
         (
@@ -1377,6 +1394,7 @@ impl Body {
                 glue,
                 tap: tap.as_mut(),
                 arrival,
+                tier: tier.as_mut(),
             },
             hybrid,
         )
@@ -1406,6 +1424,8 @@ struct Parts<'a> {
     glue: &'a mut Glue,
     tap: Option<&'a mut FeatureTap>,
     arrival: &'a RowsArrival,
+    /// The stage card's side of the tier layers, on a load with a tier card.
+    tier: Option<&'a mut TierPiece>,
 }
 
 impl Parts<'_> {
@@ -1535,21 +1555,28 @@ impl Parts<'_> {
         })?;
         let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
         let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
-        self.ffn.enqueue_go_front(
-            gpu,
-            w,
-            CardStacks::of(w, l)?,
-            &FfnIo {
-                streams: streams_in.buf(),
-                fold_in,
-                streams_out: streams_out.buf_mut(),
-                fold_out: step.folds.then_some(fold_out),
-                slots: self.slots,
-            },
-            hybrid,
-            l,
-            row,
-        )
+        let io = FfnIo {
+            streams: streams_in.buf(),
+            fold_in,
+            streams_out: streams_out.buf_mut(),
+            fold_out: step.folds.then_some(fold_out),
+            slots: self.slots,
+        };
+        match self.tier.as_deref_mut() {
+            Some(tier) if hybrid.on_tier(l)? > 0 => self.ffn.enqueue_go_front_tier(
+                gpu,
+                w,
+                CardStacks::of(w, l)?,
+                &io,
+                hybrid,
+                l,
+                row,
+                tier,
+            ),
+            _ => self
+                .ffn
+                .enqueue_go_front(gpu, w, CardStacks::of(w, l)?, &io, hybrid, l, row),
+        }
     }
 
     /// Row `row`'s MoE sub-layer of layer index `i` in its host leg's
@@ -1627,19 +1654,20 @@ impl Parts<'_> {
         })?;
         let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
         let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
-        self.ffn.enqueue_join_half(
-            gpu,
-            FfnIo {
-                streams: streams_in.buf(),
-                fold_in,
-                streams_out: streams_out.buf_mut(),
-                fold_out: step.folds.then_some(fold_out),
-                slots: self.slots,
-            },
-            hybrid,
-            l,
-            row,
-        )?;
+        let io = FfnIo {
+            streams: streams_in.buf(),
+            fold_in,
+            streams_out: streams_out.buf_mut(),
+            fold_out: step.folds.then_some(fold_out),
+            slots: self.slots,
+        };
+        match self.tier.as_deref() {
+            Some(tier) if hybrid.on_tier(l)? > 0 => {
+                self.ffn
+                    .enqueue_join_half_tier(gpu, io, hybrid, l, row, tier)?;
+            }
+            _ => self.ffn.enqueue_join_half(gpu, io, hybrid, l, row)?,
+        }
         cur.s ^= 1;
         if step.folds {
             cur.f ^= 1;
@@ -1948,13 +1976,45 @@ impl Body {
         card: usize,
         meta: &BodyMeta,
     ) -> Result<Deepseek41Model, GpuError> {
+        Body::open_placed_tiered(file, plan, card, None, meta)
+    }
+
+    /// [`Body::open_placed`] with the tier card `tier` hung under the host
+    /// tier when given: the plan's routed segments on `tier.card` load onto
+    /// that card ([`Weights::load_placed`]), the slot map sends their
+    /// experts to it ([`SlotMap::of_plan`]), and each layer that holds one
+    /// runs as a tier layer ([`crate::chain::ffn`]'s tier entries). Without a
+    /// tier it is [`Body::open_placed`], launch for launch.
+    pub fn open_placed_tiered(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        tier: Option<TierOpen>,
+        meta: &BodyMeta,
+    ) -> Result<Deepseek41Model, GpuError> {
+        if let Some(t) = &tier {
+            // The map refuses an expert on two devices before anything uploads.
+            let layers = plan
+                .machine
+                .cards
+                .get(card)
+                .ok_or_else(|| GpuError::Shape {
+                    what: "deepseek41 Body::open_placed_tiered",
+                    detail: format!("the plan has no card {card}"),
+                })?
+                .layers
+                .clone();
+            SlotMap::of_plan(plan, card, Some(t.card), layers, meta.hp.experts.n_expert)?;
+        }
         GpuModel::load_placed(
             file,
             plan,
             card,
             meta.levers.host,
             Body::derive,
-            |gpu, file, _, residency| Body::load_placed(gpu, file, plan, card, meta, residency),
+            |gpu, file, _, residency| {
+                Body::load_placed(gpu, file, plan, card, tier, meta, residency)
+            },
         )
     }
 
@@ -1976,11 +2036,16 @@ impl Body {
     /// slot map from the plan's routed segments on the card, the host tier
     /// over the file holding `residency`, the load's host set, and the three
     /// pieces, under `meta`'s levers.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the placed load's card, file, plan, tier, levers and host set (rust-quality R8)"
+    )]
     fn load_placed(
         gpu: &Gpu,
         file: Split,
         plan: &Plan<'_>,
         card: usize,
+        tier: Option<TierOpen>,
         meta: &BodyMeta,
         residency: HostResidency,
     ) -> Result<Body, GpuError> {
@@ -2030,7 +2095,13 @@ impl Body {
         let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
         let n_expert = hp.experts.n_expert;
-        let map = SlotMap::of_plan(plan, card, None, layers.clone(), n_expert)?;
+        let map = SlotMap::of_plan(
+            plan,
+            card,
+            tier.as_ref().map(|t| t.card),
+            layers.clone(),
+            n_expert,
+        )?;
         let slots = DeviceTensor::upload(stream, &map.stage_view(), layers.len(), n_expert)?;
 
         let attn =
@@ -2061,9 +2132,28 @@ impl Body {
         )?;
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
+        let tier_card = match tier {
+            Some(t) => Some(open_tier(
+                gpu,
+                &file,
+                plan,
+                &t,
+                hp,
+                &map,
+                cfg.host.card_dontneed,
+            )?),
+            None => None,
+        };
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
+        let tier = match tier_card {
+            Some(t) => {
+                hybrid.attach_tier(t, gpu)?;
+                Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
+            }
+            None => None,
+        };
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
         let ced = ced::Ced::new(&hp.layers, ring_rows, cfg.ced);
@@ -2101,8 +2191,43 @@ impl Body {
             hp: hp.clone(),
             levers: cfg,
             batch: None,
+            tier,
         })
     }
+}
+
+/// The tier card `t` of `plan`, for the stage card `stage`'s load: its card
+/// found by name, its routed segments uploaded, its set the map's tier rows,
+/// V4.1's tier computation over them; `card_dontneed` as for the stage
+/// card's segments. The stage card's context is current again on return.
+/// Load-time only.
+fn open_tier(
+    stage: &Gpu,
+    file: &Split,
+    plan: &Plan<'_>,
+    t: &TierOpen,
+    hp: &Hparams,
+    map: &SlotMap,
+    card_dontneed: bool,
+) -> Result<TierCard, GpuError> {
+    let gpu = Gpu::for_card(&t.name)?;
+    let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
+    let set = TierSet::of_map(map)?;
+    let experts = Ds41Tier::new(&gpu, hp, &set, &w)?;
+    let card = TierCard::open(
+        gpu,
+        t.name.clone(),
+        w,
+        set,
+        Box::new(experts),
+        TierShape {
+            hidden: hp.n_embd,
+            n_used: hp.experts.n_used,
+            rows: PAIR_ROWS,
+        },
+    )?;
+    stage.context().bind_to_thread()?;
+    Ok(card)
 }
 
 impl ChainBody for Body {
@@ -2225,6 +2350,7 @@ impl ChainBody for Body {
             + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
             + self.feature_bytes()
             + self.batch_bytes()
+            + self.tier.as_ref().map_or(0, TierPiece::device_bytes)
     }
 
     fn layers(&self) -> Range<usize> {
