@@ -607,6 +607,22 @@
 
 V4.1 `--place gate` 게이트는 카드 이름 "3090"이 박혀 `BLOOMERY_GATE_CARD=any`로도 3090에서만 — A6000에서 `BLOOMERY_CARD_BUDGET`(3090 usable)으로 슬롯 단위 흉내면 두 카드로 나뉜다(핀 대상이 바뀜, S–M); 레시피별 카드 태그(V2-Lite e2e·p6·chain-ffn, qwen3moe, vision, kv, dspark-kv는 `any`)를 justfile에 한 번에(XS).
 
+### 아이디어 원장 (외부 레포·조사에서 얻은 것 — 한 줄에 처분과 근거)
+
+조사 대상에는 추론 엔진뿐 아니라 모델 변환·학습 도구(NVIDIA Model-Optimizer, llm-compressor, z-lab DFlash)도 넣는다. DSpark 작업이 09-24에 시작됐는데, ModelOpt의 DFlash 오프라인 학습(0.45, 07-06)을 09-28에야 봤다.
+
+**NVIDIA Model-Optimizer `23355ed`** (조사 라운드 `modelopt`, 09-28; 보고 원문 `specs/research/modelopt-report.md`, 리드 세션 사본):
+- **DFlash target 층 규약: 기록만.** ModelOpt의 `target_layer_ids`는 층 *출력*(`hidden_states[lid + 1]`, `hf_dflash.py:1044-1045`)이고, 서빙 캡처 id는 거기에 +1이다(`dspark.md` 표). 우리 [37, 38, 39]는 층 *입력*(`draft/mod.rs:12-15`)이라 ModelOpt id로는 [36, 37, 38], 캡처 id로는 [37, 38, 39]다. 두 규약이 한 칸 어긋나 있어서 변환기의 [38, 39, 40] 같은 +1 오류가 생기기 쉽다. 다만 V4.1 draft가 어느 층으로 학습됐는지를 독립적으로 증명하지는 않는다.
+- **acceptance length 정의: 형식만 채택.** specdec_bench는 반복마다 낸 토큰 수의 평균이고(첫 프리필 토큰 포함, 턴 평균의 평균), 우리 positions/passes와 n = 96에서 −0.9 % 차이[유도]. 폭이 다른 AL끼리는 비교하지 않는다(그쪽 기본값 7, 우리 w = 1). w > 1 팔이 생기면 위치별 조건부 수락률을 `draft summary`에 한 줄 추가(XS).
+- **V4.1 DSpark 재학습: 기각.** ModelOpt의 DSpark 바디는 Qwen3 dense 층이라 V4.1 모양 draft를 미세조정할 수 없다. w = 1에서 AL 상한은 2.0이므로 1.89에서 최대 +5.8 %[유도]다. 09-25 결정「드래프터 학습은 열지 않는다」를 유지한다.
+- **draft 헤드 어휘 축소(`calibrate_frequent_vocab`)와 Markov W2 bf16: 기각.** 라운드는 draft 읽기를 제안당 1.45 GB, 2.1–2.6 ms로 잡고 절감을 0.72–0.89 ms로 예측했다. 그러나 rig-log 09-25 「짝 패스」 절이 이미 draft 본체와 특징 읽기를 패스당 0.3–1.6 ms로 쟀고, 패스가 스텝의 1.61배인 원인은 두 행 검증 패스 자체로 판명돼 있다(짝 패스, draft 없음, 1.58–1.61배). 이 레버들의 몫은 그 0.3–1.6 ms 안에 있어 잣대 아래다. DSpark의 다음 레버는 그대로 검증 패스의 카드 쪽(m행 밀집 런치)이다.
+- **confidence head로 약한 제안 건너뛰기: 보류.** 우리 파일의 `conf_proj`는 적재만 되고 쓰이지 않는다(게이트 두 곳만 읽음). 패스 = 1.61 스텝이라 수락 확률이 p > 0.61[유도]인 제안만 이긴다. 평균 α가 0.89라 이득은 p < 0.61인 제안의 비율에 달렸다. 잴 항은 제안마다 confidence 출력과 실제 수락의 결합 분포 하나(박스 프로브, 기록 한 줄 추가가 필요). 검증 패스 레버 뒤에 둔다.
+- **GGML IQ1_S / IQ2_XXS / IQ2_XS 인코더(0.48 미릴리스): 기각.** k-quant 인코더가 없고, 출력도 GGUF가 아니라 safetensors 블록이며, 보정 없이 균일하다. llama.cpp의 IQ 양자화는 imatrix 가중이 필수다(`ggml-quants.c:3302`, `:3338`). 우리 IQ 계획(IQ4_XS)과도 겹치지 않는다.
+- **AutoQuantize(비용·Shapley): 「Qwen3.8 tiered requant」 보류 전제 불변.** 층 하나의 expert 전체가 한 포맷을 쓰고, 활성 비율은 top_k/N 균일값이다. KL을 비트 예산 안에서 줄일 뿐 품질 손실 자체는 남는다. 공개 파일이 아니게 되고, 후보 포맷에 k-quant가 없으며, BF16 역전파가 필요하다.
+- **skip-softmax sparse attention(0.48 미릴리스): 보류, 사용자 결정 사항.** 출력을 바꾸는 손실 근사다(질량을 버린다). 예측[유도]: Qwen3 pp4096 +1.6…+5.3 %, pp512 ≈ 0; V4.1 lcg 0(호스트 union 그늘 아래), prose ≤ 2 %; GLM은 해당 없음(본 attention이 이미 top-k). 그쪽 보정값은 128 × 128 기하라 우리 64 × 8 커널로 옮겨 올 수 없다.
+- **Puzzletron·prune: 보류.** 구조가 다른 모델이 되고 공개 파일이 아니게 된다(tiered requant와 같은 이의에 더 강하다). 같은 목적은 적응형 residency가 무손실로 쫓는다.
+- **KV AutoQuantize: 보류.** 후보가 FP8/NVFP4뿐이고, KV는 적재 몫이 작다(V4.1 kv32k 110 MB).
+
 ### 재판정 잔여 (revisit)
 
 R2 Q3_K 밀집 m ≤ 8 대역(m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드 — DSpark 패스 +4.7 ms 위험; uniongroup 앞); R5 0·1층 Q5_K `_sel`을 카드로(순 −0.15…−0.4 ms); R6 목록 주장 확인·R7 DSpark 재유도(합집합 0.753로)·R8 rows % 4(plainfile이 덮었는지); N1·N2·N3·N4·N5는 시팅 큐와 사용자 결정.
