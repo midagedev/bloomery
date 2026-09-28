@@ -132,9 +132,37 @@
 - **적응형 residency를 지금 병렬 트랙으로**(사용자 2026-09-28 "네 제안대로 할게 잘 고민해서 진행해줘"; 근거 03 `ideaverify`, `specs/wave-m8/reports/ideaverify.md` §1 — 트레이스 재생에서 V4.1 적중 정적 cross 39–50 % / in-domain 64–77 % 대 적응형 mid 78–81 %, GLM 49.1 대 63.4 %, 스왑 토큰당 2.1–5.2개): GLM 순서는 ~~DSA 선택기 → hot list → MTP k = 1 → 두 카드 plan (b) → 적응형 residency~~ **DSA 선택기 ‖ 배치 프리필 ‖ 적응형 residency → MTP k = 1 → 두 카드**로 바뀐다. 세 모델(V4.1·GLM·Qwen3.8)이 한 메커니즘(호스트 규칙 + `SlotMap` 이동 중 상태 + 스테이징 링)을 쓰고, 설계 라운드 `adaptres`(Mac, 읽기 전용)가 결정적 비트 계약과 공정 측정 규칙(시간 창은 정적 시드에서 시작)까지 정한다. 전제 하나: 생성 텍스트 트레이스(03 `router-gen.card`).
 - **웜업·공정 재측정**(사용자 2026-09-28): 모든 엔진의 공개 행은 웜업 상태에서 `docs/fair-measure.md` 계약대로 잰다. 재측정 시팅은 GLM 배치 프리필과 Qwen3.8 개선이 착륙한 뒤("glm의 프리필과 qwen3.8의 개선이 명확해진 다음에 재자").
 
+- **두 카드 모양과 아키텍처 원칙**(사용자 2026-09-28 "네제안대로 할게 나는 심플하여 지속가능하면서도 성능 좋은 아키텍쳐를 원해"; 근거 `twoeng` 설계, `specs/wave-r3/reports/twoeng.md`): GLM의 두 카드 모양은 ~~plan (b)(층 20 절단)~~ **(b′)**(3090 = expert 전용 층, 호스트 티어에 매단다)로 V4.1과 같게 한다. 호스트가 병목이고 카드 몫이 낮은 모델(V4.1 f 0.18–0.28, GLM 0.23–0.37)은 3090 다리가 호스트 다리 그늘에 든다. Qwen3.8(f 0.86–0.98)은 (b) 층 분할을 유지한다. 원칙: 한 가지 일에 기제 하나를 모델이 공유하고, 모델별 차이는 어댑터로만 둔다. 슬롯 표·교체 규칙·두 카드 조각(둘째 `Gpu`, 매핑 핸드오프 페이지, 폴트 합치기, 카드 상실 감시, `Place`)이 그 공유 기제다. 예측[유도]: V4.1 두 카드는 +8–12 %(held-out 평문 40.7 → 44.0, DSpark 45.7 → 50.3)이고, 적응형 residency는 한 카드에서 +29 %로 더 큰 레버다.
+- **탐침 시팅 승인**(사용자 2026-09-28, e1 경유 "run both"): train 7 뒤 `iktwo`(ik 두 카드 최적, 내부 기준선, 약 24분)와 03의 탐침 시팅(`specs/wave-m8/sitting-03-after-train7.md`, 약 76–141분 + `q38hostq51` 1b 약 10분, 항목마다 ≤ 30분). 헤드라인 웜업 재측정만 Model-Optimizer 조사를 기다렸고, 그 보류는 skip-softmax(손실 기법, 사용자 판단 대기) 하나를 빼고 풀렸다(아이디어 원장). e1의 연구 시팅(`probecard`, 100–130분)도 사용자 승인.
+
 남은 사용자 결정: **공개 시점**(M1 숫자만 vs M2와 함께).
 
 ## 열린 항목 — 받을 라운드별
+
+### 열차 7 파동이 남긴 것 (09-28 오전 — aa `glmsel`·`glmppa`·`q38card`·`adaptres`·`twoeng`·`iktwo`·`swaprule`·`restool`·`toolfix`·`headrows`, 03 `q38gemm32`·`q38wide`·`q38refuse`·`q38hostq51`·`hotlistid`·`docsprune`, e1 `servedraft`·`qwen3taps`·`q8kdown`)
+
+**착륙 대기 스택**(train 7 뒤 한 열차, add 증명은 새 train 7 팁 기준으로 다시 잰다): `glmsel`(GLM DSA 선택기, 기준 `65d7bbf` → `--onto`), `glmppa`(GLM 배치 프리필, 같은 기준), `toolfix`, `restool`, `swaprule`, `hotlistid`, `servedraft`, `qwen3taps`, `probecard`(e1). 충돌 지점: `tools/ref/ptx-shapes.tsv`(glmsel·glmppa·q38card), `tools/check-recipes.sh`(toolfix·restool·slopguard), `place.rs`(q38card·q38wide). `q38card`는 train 8(`q38wide`) 위로 옮기며 `CARD_PLANS`를 arena 항과 함께 다시 유도한다. `q8kdown`(행동 변경)은 그다음 따로: 전체 목록 + 같은 임대 A/B(`q8kdown-ab.card`) + GLM·Qwen3.8 깊이 6 무회귀 행.
+
+**적응형 residency 라운드 계획**(`adaptres` 보고 §7, `specs/wave-r3/reports/adaptres.md`): R1 규칙 `runtime::swaprule`(착륙 대기, 재생 도구 fixture와 교체 단위 일치; 예비 슬롯 S는 V4.1 d = 8에서 2, GLM d = 4에서 1 — 재생 창 적중 +0.6/+1.2점 대 슬롯 비용) → **R2 `slotstate`**: `host/slots.rs`의 용량·live·이동 중 상태와 두 카드의 장치 차원(twoeng R2 `tierslots`)을 한 라운드로 합치고, 장치 슬롯 표 사본 셋(`gpu-deepseek41/src/body.rs:2034`, `gpu-glm5next/src/body.rs:688`, `body38.rs:476`)의 소유자를 `HostTier` 하나로, `SlotMap::on_card`의 범위 밖 조용한 0(`slots.rs:206`)을 이름 붙은 오류로 → R3 V4.1 어댑터 → R4 GLM → R5 여는 재배치(열린 질문 둘: open 뒤 규칙 셈의 시작값, CED 프롬프트의 층별 건너뜀과 `RowMissing`) → R6 Qwen3.8. 박스 탐침 둘: `dma-dram-share`(03 P2), V4.1 16.77 MB 희생자 populate 속도(예측 3–7 GB/s). adaptres의 d = 8 예측은 예비 슬롯 둘을 가정한 재생이었다 — S = 1이면 창 적중 0.7–1.5점 낮다(`restool`).
+
+**두 카드 라운드 계획**(`twoeng` §6): R1 `tierplan`(q38card 착륙 뒤, `placement.rs`), R2는 위 `slotstate`에 합침, R3 `tierkern`(3090 층 그래프·핸드오프·post 엔트리), R4 `tierbatch`(pplbrec 뒤), R5 `tierwire`(`Place::Bp`, 폴트 합치기, `CardLost`, 러너 수락 — servedraft 뒤), R6 두 카드 시팅(사용자 승인 필요). 드래프트 카드: (b′)면 3090, (b)면 A6000.
+
+**Qwen3.8**: `q38wide`(배치 프리필, 예측 pp512 368–457·pp4096 398–494[유도] 대 pass 약 104) 창 4와 시간 측정은 train 7 뒤. ubatch arena(U = 4096에 2.84 GB)가 디코드 로드에서도 카드를 잡아 층당 카드 expert 약 22개를 밀어낸다 — "arena를 U 레버로 잡기"(S)는 D1b의 선행 조건, 별칭 공유(M, 약 1 GB)는 그 뒤. D1b는 `plan()` 기본값을 카드로 뒤집고 `qwen4exp_mtp_meta.rs:265` 핀을 같이 고친다. Qwen3.8 down은 열당 약 3.5 µs로 설계 가정 1.5–2.3의 두 배였다(q38hostq51의 발견).
+
+**GLM**: 배치 프리필 시간 측정 쌍 `glmppa-pp.card`(7–11분, glmwarm 러너 위). R2 제안: 층별 체크포인트 take + G = 2 → pp2048 +20…+27 %[유도]. chunked KDA는 밴드 게이트와 함께 R2 이후. 선택기 절 10은 ik CPU flash가 우리 밴드의 10–30배 밖이라 ik 거리를 출력만 한다 — ik 오차 모델(f16 누산)을 유도하면 단언으로 되돌린다(M).
+
+**V4.1**: `hotlist-384.txt`는 퇴역 requant(engramQ8-tokembdBF16-attnQ8)의 라우팅으로 학습됐다 — 03 시팅이 공개 파일로 다시 트레이스하고 [0, 24576)에서 held-out 목록(`hotlist-pub-seed.txt`)을 만든다; 공정 재측정 전 조건. 클립(toktape)은 serve + DSpark(servedraft)로 지금 구성에서도 찍을 수 있고, 드래프트가 켜지면 temperature > 0은 이름 붙은 400이라 `--temp 0`.
+
+**도구·게이트 (각 한 줄)**
+- `router-coverage.py`·`router-hotlist.py`의 모델 정체성 basename 비교 → 첫 샤드 전체 경로(toolfix·hotlistid가 닫음).
+- `ptx-spill-check.sh`가 표를 두 번 읽어 파이프 표에서 거짓 stale 136행(toolfix가 닫음); `justfile` `sass-scan`에 같은 위치 인자 함정(S), `ptx-scan.sh:108-109` 셋째 인자 이후 조용히 버림(S), `recipes.py:221` `\` 줄잇기(S).
+- `gate_qwen4exp_e2e`에 절 필터(`--only`)가 없어 mutant마다 전체 로드(S). `program38.rs:89` `HEAD_LAUNCHES`가 head 종류와 무관한 상수(S). AcqRel 티켓 두 벌(`elem.rs` `argmax_rows_finite_fault`, `qwen3moe/head_argmax.rs:272-278`) → 공용 device helper(이동, reordered-only 확인, S).
+- `gate-ds41-meta`: lib 빨강이 hw 단계를 가린다 — 한 빌드에 mutant 여럿을 넣지 않는다(S). `justfile:753` `gate-runtime`은 `--lib`만이라 `crates/runtime/tests/`는 orphan(관례 한 줄, XS). `check-recipes.sh` Mac 120 s 초과(S).
+- `levers/src/registry.rs:742` `BLOOMERY_LEASE_PROC` 설명(XS); `justfile:1030` flowcounts에 g ≥ 2 팔(S); `depth-ds41.sh:362` echo 필터에 call·arm(XS); `records.py` `cmd_check`가 `load host_tier` 줄로 rc 1(XS).
+- `timing-card.sh` 두 카드 모드가 `srv` 팔을 거부해 두 카드 공개 표에서 fair-measure §1.1을 못 지킨다(S–M, e1); 참조 팔 두 카드 모드·3090 캡·클록 증인 없음(S); `ik-draft.sh:208-215` 워밍업·`[cold]` 없음(S); `deepseek41.sh:43-58,68`·`ik-draft.sh:65` llama-cli `--n-cpu-moe`는 마지막 N층(주석 정정, XS).
+- `router_trace.cpp:282`/`router-trace.sh`: gen 트레이스 manifest에 프롬프트 길이를 적어 `gen --prompt`와 대조(XS–S); `router-coverage.py:148,207` `T//2` ≠ 청크 경계 24576(XS); `window-union.py --policy strata`(S), `router-coverage.py bursts`(S–M).
+- `ds41_dspark.rs:39` 드래프트 카드가 env에서 옴 → 배치를 따르게(S, e1); `step.rs:30` `GO_DEADLINE` 10 s → 스텝 p50의 배수(XS–S); `lib.rs:1885` 같은 카드 `Gpu` 둘이 모듈을 두 번 적재 → 공유(S).
+- 문서: `docs/research/v41-placement/inv.json`·`roles.json` 0바이트라 derive·place.py가 트리에서 안 돈다(XS); `plan.md:185` "걸림돌 여섯"이 트리아지에 없다(XS); fair-measure §2.5 residency 시드 규칙 문안(adaptres §5)과 §3 exllamav3 dynamic placement 조항(XS).
 
 ### 열차 6이 남긴 것 (09-28 새벽 — 03 `q8qdot`·`q38load` 0–3·`poolord`·`hcspill`·`q8wrap`·`q38prog` B + P1/P2/P8, aa `glmforced`·`kvckpt`·`kvgate`·`kvhost`·`glmcard`·`glmtime`·`glmfit`, e1 `modelkey`·`toolsdedup`·`fitarm`·`q3cold` — 50커밋)
 
@@ -675,6 +703,7 @@ V4.1 `--place gate` 게이트는 카드 이름 "3090"이 박혀 `BLOOMERY_GATE_C
 - **Qwen3.8 ubatch 전체 expert 스트리밍:** routed 바이트를 GGUF 헤더에서 세는 Mac 산수가 먼저다. 크기 L.
 - **산술로 기각:** 행 분할(통째 배치가 2.1–4.0배 낫다), 요청별 draft 선택·E19, hc-lag 층간 겹침(`ac250bb`가 이미 가져감), CacheGen(속도 0), Q6_K 호스트 타일(GLM union의 0.9 %).
 - 적응형 residency(`da7a3ea` 등)와 Qwen3.8 계열 여럿(`5ef6051`, `39357f6`, `cf3fbbf`)은 아직 main이 아니라 브랜치에 있다. 이들을 전제로 한 판정은 착륙 뒤 다시 본다.
+- **ik `-ub ≥ 2048` 프리필의 호스트 expert 스트리밍**(`iktwo` 보고, 09-28): ubatch마다 호스트 expert를 카드로 복사하는 방식이고, 오프로드 버퍼를 3090에 두면 PCIe 천장이 약 546 tok/s[유도]다. **처분: 새 라운드 없음** — 우리 `hoststream` 카드(위)와 같은 레버이고, 그 예측(pp4096 링 128 prose 499, B1까지 544–573[유도])과 맞는다. 참조 일치로 기록.
 
 ### 재판정 잔여 (revisit)
 
