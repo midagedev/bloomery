@@ -28,7 +28,10 @@ k per layer is the resource-balance choice (hoststream-design-report.md:92).
 
 Configuration knobs beyond the recorded commits: `b1` (the projections per 128-token sub-block,
 chain/attn/batch.rs sub_pre, sub_post), `tile` (cardtile: the grouped shadow per (card expert, 8-column tile) item),
-`imma` (the IMMA grouped GEMM in its place), `G` with `wrap` (the layer-first scheduler that issues
+`imma` (the IMMA grouped GEMM in its place), `batchwide` (the shadow's per-chunk kernels at batch width, batchwide_ratio of
+their loop time, one launch set a sub-block), `_l2` = "order" (GT's (e, rho, t) block order: its sweep stays in L2, no spill),
+`union` (the host kernel: union, hosttile, r8) with `down` = "q8k" (q8_K down activations, dc_q8k_down off its per-column
+cost), `G` with `wrap` (the layer-first scheduler that issues
 route(i + 1) before union(i), across the layer boundary too, cardnext-design-report.md 1.1), `timed`
 (the card-timing marks a BLOOMERY_STEP_STATS=1 run records, as queue events; `marks4`, prefillgroup's four a
 layer-batch, the shadow's start among them) and `_clk` (the card's
@@ -51,13 +54,15 @@ plan of it (plans/, `generate_ds41 --plan` records).
 
     --backtest         the recorded sittings, predicted against measured, rc != 0 on a red row that names
                        no model term (BLAME, TERMS); a named red row prints RED and its term
-    --predict STEP     the ladder (now, B1, B1+T, B1+T+G, +stream, +h3tile-b, +B4, or all), with bands
+    --predict STEP     the ladder (now, B1, B1+T, B1+T+G, r8, +stream, +B4, or all), with bands
     --self-test        units and identities
     --explain ROW      every term of a backtest row or a ladder step, with its constants
     --uncalibrated     the uncalibrated terms and the runner command that calibrates each
     --cells            B1, B1+T, B1+G, B1+T+G per cell with bands, and the IMMA shadow over T at G 1 and G 2
     --stream           host streaming after B1 + T: the per-expert rules, pp by G and ring, the card bytes,
                        the timeline per layer of a group, the DRAM term and its variants
+    --levers           today's flow (r8, G 2, no streaming) against its measured rows, and each lever re-derived against
+                       it: host streaming, q8_K down, B4 over its GEMM time, the batch-wide shadow, GT's block order
     --counts LOG       a generate_ds41 run's queue-entry counter (BLOOMERY_STEP_STATS=1: `stat prefill front`,
                        `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch
 
@@ -573,12 +578,17 @@ def union_sum(tab, skip=0.0):
 
 
 def union_kernel(p, cfg):
+    """(a, c) of the host kernel's t(m) = max(W, a + c m) an expert; `down` q8k takes dc_q8k_down off c."""
     k = cfg.get("union", "union")
     if k == "hosttile":
-        return p["a_hosttile"], p["c_hosttile"]
-    if k == "r8":
-        return p["a_r8"], p["c_r8"]
-    return p["a_union"], p["c_union"]
+        a, c = p["a_hosttile"], p["c_hosttile"]
+    elif k == "r8":
+        a, c = p["a_r8"], p["c_r8"]
+    else:
+        a, c = p["a_union"], p["c_union"]
+    if cfg.get("down") == "q8k":
+        c -= p["dc_q8k_down"]
+    return a, c
 
 
 GU_SLOT_BYTES = 2 * 2304 * 4 + 2664   # the combine re-reads a slot's gate/up (f32) and writes qc (model/src/ops.rs UnionCall::combine)
@@ -598,7 +608,7 @@ def cause_terms(p, flow, K, slots, touched, T, f, a, c):
     of a 144-row block each; the combine re-reads the gate/up slab; the scan is a pool pass."""
     wide = T > 8
     if flow == "five":
-        cost = a + c * (slots / touched)                       # one expert at its mean m, 32 threads
+        cost = max(p["w"], a + c * (slots / touched))          # one expert at its mean m, 32 threads, W its floor
         share = p["gu_row_share"]
         trow = share * 32 * cost / 4608 + (1 - share) * 32 * cost / 5120
         return dict(tail=f * p["union_block_rows"] * trow / 1000.0,
@@ -961,14 +971,22 @@ def shadow_lb(p, cfg, lb, rt):
     card = rt.n_card(l) > 0
     cs_tok = rt.card_slots_tok(l)
     t, acts = 0.0, 0
+    wide = cfg.get("batchwide") and arm == "expert"
     for _, m in lb.full:
         if arm == "expert":
             k, a = (p["shadow_chunk"], SHADOW_EXPERT_CHUNK) if card else (p["shadow_chunk_nocard"], SHADOW_NOCARD_CHUNK)
             k *= clk
+            if wide:                   # the chunk's kernels at batch width, one launch set a sub-block (below)
+                k *= p["batchwide_ratio"]
+                a = 0
         else:
             k = p["shadow_chunk"] + m * cs_tok * (p["expert_gu_bytes"] + p["expert_down_bytes"]) / bw * 1e6 + 2 * sk
             a = SHADOW_SLOT_CHUNK
         t += k / 1000.0 + a * g
+        acts += a
+    if wide:
+        a = (SHADOW_EXPERT_CHUNK if card else SHADOW_NOCARD_CHUNK) * len(lb.full_sb)
+        t += a * g
         acts += a
     if arm == "expert":
         if card:
@@ -1038,9 +1056,11 @@ def l2_miss(p, cfg, slots, touched):
     alternative): the same step at 0.9 L2 (other data holding a tenth of it), which puts lcg with the hot list (W 0.975
     L2) over the edge; 'random': the random-replacement hit rate L2 / W, which the cardtile lease's card_in rejects at
     both P (-9 %). DT's set (2,376 B a column) stays under L2 on prose."""
+    mode = cfg.get("_l2", "lru")
+    if mode == "order":                # GT's (e, rho, t) block order: a row tile's items run together, the sweep in L2
+        return 0.0
     w = slots * ACT_GT_BYTES + touched * GT_ROW_W_BYTES
     l2 = p["l2_bytes"]
-    mode = cfg.get("_l2", "lru")
     if mode == "random":
         return max(0.0, 1.0 - l2 / w) if w > 0 else 0.0
     return 1.0 if w > l2 * (0.9 if mode == "edge90" else 1.0) else 0.0
@@ -1435,7 +1455,7 @@ def rule_k(p, cfg, rt, l, Ts, U, rule):
     k = 0.0
     for lam, wgt in weighted_ranks(rt.host[l], rt.n_host(l) / phi, phi):
         if rule == "onecall":
-            save = phi * (a + c * sum(T * lam / 512.0 for T in Ts))
+            save = phi * max(p["w"], a + c * sum(T * lam / 512.0 for T in Ts))
         else:
             save = phi * expert_saving_us(p, cfg, rt, l, Ts, lam, U)
         if save <= fus:
@@ -1736,6 +1756,15 @@ CONFIGS = {
                 marks4=True),
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
+    # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), hot list 384, CED on, G 2
+    # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
+    # sitting (09-28#v41-release): main 53e2def, the same flow, lcg without the hot list, no STEP_STATS (no card marks)
+    "R8": dict(commit="6ffed9e", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
+               marks4=True, union="r8"),
+    "R8off": dict(commit="6ffed9e", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
+                  marks4=True),
+    "REL": dict(commit="53e2def", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, G=2, wrap=True,
+                union="r8"),
 }
 DEFAULT_ANCHORS = dict(union="anchor_union_s13b", union_ud="anchor_union_ud512", resid_mode="slot")
 
@@ -1780,6 +1809,7 @@ B1S = "09-26#b1-pp-ab (b1pp, b1pp2 run.log; clean rounds"
 PRS = "09-26#b1-pp-ab (cardin run.log;"
 CTS = "09-26#cardtile-ab (cardab run.log; rounds"
 PGS = "09-26#prefillgroup-ab (gab run.log; rounds"
+R8S = "09-27#r8host-pp (r8hostpp-sitting.log stat prefill split;"
 ROWS = [
     ("B.pp512", "ds41batch", 512, {}, "pp", 91.2, 2, "abs", "09-25#ds41batch-pp: 90.95, 91.46"),
     ("B.pp4096", "ds41batch", 4096, {}, "pp", 89.2, 2, "abs", "89.40, 89.02"),
@@ -2001,6 +2031,64 @@ ROWS = [
     ("PG.g2.chain", "PG2", 4096, {}, "chain", 16225.3, 1, "abs", "round 2 (round 1 16,392.5)"),
     ("PG.g2.prologue", "PG2", 4096, {}, "prologue", 323.2, 1, "info", "round 2"),
     ("PG.g2.r1.prologue", "PG2", 4096, {}, "prologue", 1018.5, 1, "info", "round 1, cold: the named exception"),
+    # r8host (09-27#r8host-pp), the sitting's stat prefill split lines (a scratch log of the lead: r8hostpp-sitting.log), hot list
+    # 384, 0/16 busy rows. lcg P 512 is round 1 alone (round 2 and both off-arm rounds are [cold]: the two files' pages switched);
+    # the others the two rounds' means. Its prologues read 2-3x prologue_tok (67-983 ms: engram and host pages evicted between
+    # the arms), so the pp rows carry the row's own measured prologue (`pro`) and chain (the prompt less its prologues) is the
+    # clean comparison
+    ("R8.p512.lcg.pp", "R8", 512, {"pro": 67.0}, "pp", 190.99, 1, "abs", R8S + " round 1; round 2 185.38 [cold])"),
+    ("R8.p512.lcg.chain", "R8", 512, {}, "chain", 2612.8, 1, "abs", "round 1 (round 2 2,645.2 [cold])"),
+    ("R8.p512.lcg.union", "R8", 512, {}, "union", 45.05, 1, "abs", "round 1: a_r8, c_r8's anchor"),
+    ("R8.p512.lcg.wait", "R8", 512, {}, "wait", 15.79, 1, "abs", ""),
+    ("R8.p512.lcg.enqueue", "R8", 512, {}, "enqueue", 4.48, 1, "abs", ""),
+    ("R8.p512.lcg.card_out", "R8", 512, {}, "card_out", 19.50, 1, "abs", ""),
+    ("R8.p512.lcg.card_in", "R8", 512, {}, "card_in", 12.83, 1, "abs", ""),
+    ("R8.p4096.lcg.pp", "R8", 4096, {"pro": 927.6}, "pp", 338.66, 2, "abs", "338.26, 339.07; prologue 983.1, 872.0"),
+    ("R8.p4096.lcg.chain", "R8", 4096, {}, "chain", 11163.45, 2, "abs", "11,122.5, 11,204.4"),
+    ("R8.p4096.lcg.union", "R8", 4096, {}, "union", 44.28, 2, "abs", "44.01, 44.55"),
+    ("R8.p4096.lcg.wait", "R8", 4096, {}, "wait", 1.355, 2, "info", "1.36, 1.35: under 2 ms, no relative ruler"),
+    ("R8.p4096.lcg.enqueue", "R8", 4096, {}, "enqueue", 5.11, 2, "abs", "5.19, 5.03"),
+    ("R8.p4096.lcg.card_out", "R8", 4096, {}, "card_out", 22.465, 2, "abs", "22.50, 22.43"),
+    ("R8.p4096.lcg.card_in", "R8", 4096, {}, "card_in", 13.435, 2, "abs", "13.46, 13.41"),
+    ("R8.p512.prose.pp", "R8", 512, {"rt": "prose", "clk": "tile", "pro": 104.5}, "pp", 237.33, 2, "abs",
+     "237.73, 236.93; prologue 109.2, 99.8"),
+    ("R8.p512.prose.chain", "R8", 512, {"rt": "prose", "clk": "tile"}, "chain", 2051.9, 2, "abs", "2,043.5, 2,060.3"),
+    ("R8.p512.prose.union", "R8", 512, {"rt": "prose", "clk": "tile"}, "union", 28.345, 2, "abs",
+     "27.99, 28.70: a_r8, c_r8's anchor"),
+    ("R8.p512.prose.wait", "R8", 512, {"rt": "prose", "clk": "tile"}, "wait", 18.50, 2, "abs", "18.94, 18.06"),
+    ("R8.p512.prose.enqueue", "R8", 512, {"rt": "prose", "clk": "tile"}, "enqueue", 4.45, 2, "abs", "4.15, 4.75"),
+    ("R8.p512.prose.card_out", "R8", 512, {"rt": "prose", "clk": "tile"}, "card_out", 20.48, 2, "abs", "20.50, 20.46"),
+    ("R8.p512.prose.card_in", "R8", 512, {"rt": "prose", "clk": "tile"}, "card_in", 23.56, 2, "abs", "23.59, 23.53"),
+    ("R8.p4096.prose.pp", "R8", 4096, {"rt": "prose", "clk": "tile", "pro": 630.4}, "pp", 358.765, 2, "abs",
+     "357.53, 360.00; prologue 665.8, 595.0"),
+    ("R8.p4096.prose.chain", "R8", 4096, {"rt": "prose", "clk": "tile"}, "chain", 10782.7, 2, "abs", "10,786.6, 10,778.8"),
+    ("R8.p4096.prose.union", "R8", 4096, {"rt": "prose", "clk": "tile"}, "union", 30.045, 2, "abs", "30.13, 29.96"),
+    ("R8.p4096.prose.wait", "R8", 4096, {"rt": "prose", "clk": "tile"}, "wait", 4.38, 2, "abs", "4.38, 4.38"),
+    ("R8.p4096.prose.enqueue", "R8", 4096, {"rt": "prose", "clk": "tile"}, "enqueue", 14.59, 2, "abs",
+     "14.52, 14.66: the host blocked in the queue behind the card"),
+    ("R8.p4096.prose.card_out", "R8", 4096, {"rt": "prose", "clk": "tile"}, "card_out", 23.265, 2, "abs", "23.27, 23.26"),
+    ("R8.p4096.prose.card_in", "R8", 4096, {"rt": "prose", "clk": "tile"}, "card_in", 22.445, 2, "abs", "22.45, 22.44"),
+    # the same lease's off arm (BLOOMERY_R8=off: the source rows through today's union kernel)
+    ("R8off.p4096.lcg.chain", "R8off", 4096, {}, "chain", 15787.6, 2, "abs", "15,746.5, 15,828.7"),
+    ("R8off.p4096.lcg.union", "R8off", 4096, {}, "union", 66.28, 2, "abs", "66.14, 66.42"),
+    ("R8off.p512.prose.chain", "R8off", 512, {"rt": "prose", "clk": "tile"}, "chain", 2346.25, 2, "abs", "2,364.7, 2,327.8"),
+    ("R8off.p512.prose.union", "R8off", 512, {"rt": "prose", "clk": "tile"}, "union", 37.24, 2, "abs", "37.87, 36.61"),
+    ("R8off.p4096.prose.chain", "R8off", 4096, {"rt": "prose", "clk": "tile"}, "chain", 11342.4, 2, "abs",
+     "11,328.6, 11,356.2"),
+    ("R8off.p4096.prose.union", "R8off", 4096, {"rt": "prose", "clk": "tile"}, "union", 39.20, 2, "abs", "39.07, 39.33"),
+    ("R8.ratio4096.lcg", "R8", 4096, {"vs": ("R8off", {})}, "ratio:chain", 11163.45 / 15787.6, 2, "ratio",
+     "chain on / off (the pp ratio 1.373 +- 0.055 carries the arms' prologues)"),
+    ("R8.ratio512.prose", "R8", 512, {"rt": "prose", "clk": "tile", "vs": ("R8off", {"rt": "prose", "clk": "tile"})},
+     "ratio:chain", 2051.9 / 2346.25, 2, "ratio", "chain on / off (pp 1.133 +- 0.152)"),
+    ("R8.ratio4096.prose", "R8", 4096, {"rt": "prose", "clk": "tile", "vs": ("R8off", {"rt": "prose", "clk": "tile"})},
+     "ratio:chain", 10782.7 / 11342.4, 2, "ratio", "chain on / off (pp 1.045 +- 0.053)"),
+    # today's public rows (09-28#v41-release): no stat line, and the runner's [cpu-busy] flag counted the arm itself
+    # (rig-log 09-28#release-sit): printed beside the model, not scored
+    ("REL.pp512", "REL", 512, {}, "pp", 190.6, 1, "info", "09-28#v41-release, main 53e2def, lcg, no hot list"),
+    ("REL.pp4096", "REL", 4096, {}, "pp", 358.4, 1, "info", ""),
+    # 09-27#v41-ppdepth: the r8 flow on b684167, prose, hot list 384, STEP_STATS; its prologue 53.7-88.6 us a token
+    ("PPD.p4096.prose.pp", "R8", 4096, {"rt": "prose", "clk": "tile"}, "pp", 373.2, 2, "info",
+     "09-27#v41-ppdepth 373.0, 373.4 (prologue ~0.22 s, the model's 0.32)"),
 ]
 
 # rows a constant in use was taken from: printed as 'anchor', not scored
@@ -2020,6 +2108,8 @@ ANCHOR_ROWS = {
     "prose_swap_4096": {"CT.p4096.slots"},
     "prose_phi_4096": {"CT.p4096.union"},
     "clk_tile_prose": {"CT.p512.tile.card_out"},
+    "a_r8": {"R8.p512.lcg.union", "R8.p512.prose.union"},
+    "c_r8": {"R8.p512.lcg.union", "R8.p512.prose.union"},
 }
 
 # the term that breaks a red row, named after reading its terms (--explain <row>, the diagnostics below)
@@ -2038,12 +2128,30 @@ TERMS = {
                   " is its anchor): the deep positions' attention and indexer terms (attn_seg's decode slope, idx_row_ns)"
                   " carried from layer 2 at P 512. In the card-bound expert arm the host waits for it in the queue: with"
                   " the route at its measured length (clk 1.166 on that row) enqueue reads 5.63 (-3.8 %) and wait 28.11",
+    "enqueue-r8": "the r8 lease's issue: enqueue reads 0.6-0.8 ms a layer-batch over the model (t_issue, 2.42 us a call from"
+                  " B1's lease) at lcg P 512 and 4096 and prose P 512, ~17 % more a call than prefillgroup's lease read (PG2"
+                  " 4.31 against the model's 4.27); the route window enqueue + wait holds (lcg P 512 20.27 measured, 20.36"
+                  " model), so the split moved, not the wall. A per-call issue time in the stat line decides between the"
+                  " calling thread's clock (powersave governor) and the r8 pool's state at the issue",
+    "r8-duty-clock": "prose P 4096 on the r8 binary is card-bound at duty 0.92 (the cardtile lease's prose rows 0.87): its"
+                     " route and shadow read 1.4 / 0.9 ms a layer-batch over the model and the host waits in the queue"
+                     " (enqueue 14.6). With the card-bound clock at the row's duty (clk_at 1.118, the band's term, not the"
+                     " central) the chain reads 10,928 against 10,783 (+1.3 %): the SM clock sampled under a prose P 4096 arm"
+                     " decides (the uncalibrated 'card-bound clock' row)",
+    "card_in-lcg-hot-4096": "lcg with the hot list at P 4096: the tile shadow 13.44 against T's 12.31 (+1.1 ms); T's items were"
+                            " validated on lcg without the list and on prose, and this is the one mix no earlier row held. The"
+                            " host binds lcg (the union 44.3 over the card's 35.9), so the term is under its shadow: 0 to the wall",
 }
 BLAME = dict({r: "router_tok" for r in ("S13.pp4096.on", "S13.pp4096.off", "S13b.nonunion.on", "S14.ratio512.expert_pre",
                                         "S14.ratio4096.expert_pre", "S14.p512.pre.nonunion", "S14.p4096.pre.nonunion",
                                         "S14.pp4096.pre", "B.pp4096")},
              **{r: "union-T" for r in ("S15.slot.union", "S15.slot.pp")},
-             **{"S15.slot.card_in": "slot-shadow", "CT.p4096.expert.enqueue": "route-4096"})
+             **{"S15.slot.card_in": "slot-shadow", "CT.p4096.expert.enqueue": "route-4096"},
+             **{r: "enqueue-r8" for r in ("R8.p512.lcg.wait", "R8.p512.lcg.enqueue", "R8.p4096.lcg.enqueue",
+                                          "R8.p512.prose.wait", "R8.p512.prose.enqueue")},
+             **{r: "r8-duty-clock" for r in ("R8.p4096.prose.pp", "R8.p4096.prose.chain", "R8.p4096.prose.wait",
+                                             "R8.p4096.prose.enqueue", "R8.p4096.prose.card_out", "R8off.p4096.prose.chain")},
+             **{"R8.p4096.lcg.card_out": "route-4096", "R8.p4096.lcg.card_in": "card_in-lcg-hot-4096"})
 
 
 def cold_pp(p, res, P, frac):
@@ -2071,9 +2179,12 @@ def predict_row(p, row, anchors=None):
     over = dict(over)
     cold = over.pop("cold", 0.0)
     vs = over.pop("vs", None)
+    pro = over.pop("pro", None)       # the row's own measured prologue (ms) in place of the model's
     cfg, rname = row_cfg(p, cname, over)
     res = evaluate(p, cfg, P, rname, anchors)
     pp = cold_pp(p, res, P, cold) if cold else res["pp"]
+    if pro is not None:
+        pp = P / (res["wall"] - res["agg"]["prologue"] + pro) * 1000.0
     if q == "ratio":
         ocfg, orn = row_cfg(p, *vs)
         other = evaluate(p, ocfg, P, orn, anchors)
@@ -2098,7 +2209,8 @@ def scored(rid, kind, q, skip, n=2):
 
 
 IN_USE = ("anchor_union_s13b", "anchor_union_ud512", "s_host_lcg", "prologue_tok", "ud_delta_512", "full_res_lat",
-          "t_issue", "clk_cardbound", "prose_swap", "prose_phi_five", "prose_swap_4096", "prose_phi_4096", "clk_tile_prose")
+          "t_issue", "clk_cardbound", "prose_swap", "prose_phi_five", "prose_swap_4096", "prose_phi_4096", "clk_tile_prose",
+          "a_r8", "c_r8")
 
 
 def backtest(verbose=True, out_rows=None):
@@ -2350,12 +2462,13 @@ STEPS = [
      " (cardnext-design-report.md section 2.3)", None),
     ("B1+T+G", {"b1": True, "tile": True, "G": 2, "wrap": True},
      "+ prefillgroup: the layer-first scheduler with the cross-layer wrap over pairs of batches (section 1.1)", None),
-    ("+stream", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8},
-     "+ host streaming (steps 2 and 3): the wrap over up to 8 batches, an unborrowed 8-slot ring, k(T) by resource"
+    ("r8", {"b1": True, "tile": True, "G": 2, "wrap": True, "union": "r8"},
+     "+ r8 (r8land 1ad6599): the host union's gate/up from the row-lane sidecar; today's flow (G 2, no streaming), the"
+     " kernel law fitted to the r8host lease's stat lines (a_r8, c_r8); --levers re-derives each lever against it", None),
+    ("+stream", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
+     "+ host streaming on r8 (steps 2 and 3): the wrap over up to 8 batches, an unborrowed 8-slot ring, k(T) by resource"
      " balance, a static rank table, the streamed experts through T's kernels (bit rule b')",
      None),
-    ("+h3tile-b", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
-     "+ the r8 host tile alone (h3tile-b-design-report.md:236-256; R1 landed as uniondispatch 9626c7f and is in now)", None),
     ("+B4", {"b4": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
      "+ int8 GEMM projections (B4; the prefill = step bits stay on the off arm)", None),
 ]
@@ -2373,6 +2486,8 @@ COMPARE = [
     ("+stream G8 R128B", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 128, "borrow": True},
      "the triage's borrowed 128-slot ring on the G <= 8 wrap"),
     ("h3tile-b on now", {"union": "r8"}, "the r8 host tile alone on today's flow (no B1, G 1)"),
+    ("+stream before r8", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8},
+     "host streaming on B1+T+G without the r8 tile (the order the ladder had before r8 landed first)"),
 ]
 MEASURED = {
     "B1": "measured 09-26#b1-pp-ab on the lcg prompt without the hot list: 144.6 / 201.0 (the B1 rows; the model"
@@ -2383,6 +2498,10 @@ MEASURED = {
             " tile arm's card clock, clk_tile_prose); card_in 23.13 / 21.71 (22.95 / 21.58: the items' m mix x1.13 and"
             " GT's L2 spill 3.5 ms a layer-batch, which the flat t_tile_T left out at 18.2 / 17.4); lcg without the"
             " hot list 200.4 at P 4096 (the prefillgroup lease's G 1 arm, the model 204.8)",
+    "r8": "measured 09-27#r8host-pp (hot list 384, STEP_STATS): lcg 191.0 / 338.7, prose 237.3 / 358.8, with prologues of"
+          " 67-983 ms (the model's 40-317); chain 2,613 / 11,163 and 2,052 / 10,783 ms (the R8 backtest rows); 09-28#v41-release"
+          " (lcg without the hot list): 190.6 / 358.4 (the model 189.7 / 350.8, the REL rows); 09-27#v41-ppdepth prose P 4096"
+          " 373.2 (prologue 0.22 s)",
     "B1+T+G": "measured 09-26#prefillgroup-ab on lcg without the hot list, P 4096: 247.5 (round 2; the model 251.6),"
               " G 2 / G 1 1.232 (round 2's pair; the model 1.228); the union 68.6-69.3 ms a layer-batch in both arms"
               " (the model 67.4) — it does not move with its share of the wall",
@@ -2404,7 +2523,7 @@ DECISIONS = {
                 " under R8)",
                 "the streamed tile items run faster than card_tile_us: read a streamed arm's card work, then a ring of ~32 for"
                 " P 512"),
-    "+h3tile-b": ("the r8 tile's bench gain did not survive the five-dispatch flow: time it alone on today's flow first"
+    "h3tile-b on now": ("the r8 tile's bench gain did not survive the five-dispatch flow: time it alone on today's flow first"
                   " (161 / 227 predicted, the comparison row 'h3tile-b on now')",
                   "at P 4096 the card binds: B4 or the grouped shadow next; at P 512 the route before the union is the"
                   " serial term",
@@ -2659,7 +2778,7 @@ def explain(target):
     step = next((s for s in STEPS + [c + (None,) for c in COMPARE] if s[0] == target), None)
     if row:
         rid, cname, P, over, q, meas, n, kind, src = row
-        over = {k: v for k, v in over.items() if k not in ("cold", "vs")}
+        over = {k: v for k, v in over.items() if k not in ("cold", "vs", "pro")}
         cfg, rname = row_cfg(p, cname, over)
         print(f"{rid}: {q} measured {meas} ({src}); {cname} {cfg}, P {P}, {rname}")
         runs = [(rname, P, cfg)]
@@ -2887,6 +3006,79 @@ def stream_report():
             cells.append(f"{rn} G{G} R{ring} {evaluate(q, stream_cfg(G, ring, bor, **cfg_over), 4096, rn)['pp']:6.1f}")
         print(f"   {label:62} " + ", ".join(cells))
     return res
+
+
+# ============================================================================ the levers against today's flow
+
+TODAY = dict(CONFIGS["REL"], hot=True)        # the r8 flow as it runs without STEP_STATS (no card marks)
+LEVER_CELLS = (("lcg", False, 512), ("lcg", False, 4096), ("lcg", True, 512), ("lcg", True, 4096),
+               ("prose", True, 512), ("prose", True, 4096))
+
+
+def t_imma_tops(t_ms):
+    """gemm_tops_proj for a B4 GEMM that takes t_ms over a normal layer's four projections at T 512."""
+    return 2.0 * proj_macs(3) * 512 / (t_ms * 1e-3) / 1e12
+
+
+def lever_rows(p):
+    """(label, cfg overrides, constant overrides) of each lever, today's flow first."""
+    rows = [("today (r8, G 2)", {}, {})]
+    rows += [("(a0) G <= 8, no stream", {"G": "auto"}, {}),
+             ("(a) stream R8, G 2", {"stream": True, "ring": 8}, {}),
+             ("(a) stream R8, G <= 8", {"stream": True, "ring": 8, "G": "auto"}, {}),
+             ("(a) stream R128 borrowed, G <= 8", {"stream": True, "ring": 128, "borrow": True, "G": "auto"}, {})]
+    rows += [(f"(b) q8_K down, dc {v:g} us", {"down": "q8k"}, {"dc_q8k_down": v})
+             for v in (C["dc_q8k_down"].lo, C["dc_q8k_down"].value, C["dc_q8k_down"].hi)]
+    rows += [(f"(c) B4, t_IMMA {t:g} ms", {"b4": True}, {"gemm_tops_proj": t_imma_tops(t)}) for t in (1.95, 3.0, 4.0)]
+    rows += [(f"(d) batch-wide shadow x{v:g}", {"batchwide": True}, {"batchwide_ratio": v})
+             for v in (C["batchwide_ratio"].lo, C["batchwide_ratio"].value, C["batchwide_ratio"].hi)]
+    rows += [("(e) GT (e, rho, t) order", {"_l2": "order"}, {}),
+             ("(d)+(e)", {"batchwide": True, "_l2": "order"}, {}),
+             ("(c 3 ms)+(d)+(e)", {"b4": True, "batchwide": True, "_l2": "order"}, {"gemm_tops_proj": t_imma_tops(3.0)})]
+    return rows
+
+
+def lever_cell(p, over, pov, rn, hot, P, duty_clock):
+    cfg = dict(TODAY, hot=hot, **over)
+    q = p.but(**pov) if pov else p
+    if rn == "prose":
+        cfg["_clk"] = p["clk_tile_prose"]
+    r = evaluate(q, cfg, P, rn)
+    if duty_clock:
+        clk = clk_at(q, r["duty"])
+        if clk > cfg.get("_clk", 1.0) + 1e-9:
+            r = evaluate(q, dict(cfg, _clk=clk), P, rn)
+    return r
+
+
+def levers():
+    p = central()
+    print("pp tok/s [derived] @ A6000 300 W, plan (a), CED on: today's flow = r8 (r8land), G 2 (prefillgroup's wrap), no"
+          " streaming, T's tile shadow, the r8 kernel law fitted to 09-27#r8host-pp (a_r8 %.2f, c_r8 %.2f us); the prose"
+          " prompt at clk_tile_prose. 'clk' = the card-bound clock at the run's duty (clk_at, the band's term) in place of the"
+          " central clock: it moves the cells where the card binds." % (p["a_r8"], p["c_r8"]))
+    meas = {r[0]: r[5] for r in ROWS}
+    print("measured (the backtest rows): lcg no hot list %.1f / %.1f (REL.pp512 / REL.pp4096); lcg hot list %.1f / %.1f,"
+          " prose %.1f / %.1f (R8.p512 / R8.p4096 .lcg.pp / .prose.pp, under STEP_STATS, each with its own prologue)"
+          % tuple(meas[k] for k in ("REL.pp512", "REL.pp4096", "R8.p512.lcg.pp", "R8.p4096.lcg.pp", "R8.p512.prose.pp",
+                                    "R8.p4096.prose.pp")))
+    rows = lever_rows(p)
+    base = {}
+    for rn, hot, P in LEVER_CELLS:
+        cell = f"{rn}{'' if rn == 'prose' else (' hot' if hot else ' no hot')} P {P}"
+        print(f"\n== {cell}")
+        print(f"   {'lever':34} {'pp':>7} {'gain':>7} {'pp clk':>7} {'gain':>7} | per served lb (ms): {'host':>5} {'card':>5}"
+              f" {'wall':>5} {'union':>5} {'route':>5} {'shadow':>6} {'wait':>5} {'enq':>5}  layers bound")
+        for label, over, pov in rows:
+            r0 = lever_cell(p, over, pov, rn, hot, P, False)
+            r1 = lever_cell(p, over, pov, rn, hot, P, True)
+            if label.startswith("today"):
+                base[(rn, hot, P)] = (r0["pp"], r1["pp"])
+            b0, b1 = base[(rn, hot, P)]
+            a, n = r0["agg"], r0["n_lb"]
+            print(f"   {label:34} {r0['pp']:7.1f} {(r0['pp'] / b0 - 1) * 100:+6.1f}% {r1['pp']:7.1f} {(r1['pp'] / b1 - 1) * 100:+6.1f}%"
+                  f" | {r0['busy']['host'] / n:18.1f} {r0['busy']['card'] / n:5.1f} {r0['wall'] / n:5.1f} {a['union']:5.1f}"
+                  f" {a['card_out']:5.1f} {a['card_in']:6.1f} {a['wait']:5.1f} {a['enqueue']:5.1f}  {bind_summary(r0)}")
 
 
 # ============================================================================ uncalibrated terms
@@ -3221,6 +3413,26 @@ def self_test():
     ks = [rule_k(p, cf, lc, 2, [512] * G, U, "serial") for G in (1, 2, 4)]
     check("lcg's uniform host experts: none beats PCIe serially at G 1-2, all 314 at G 4 (2 E[t] < 638 us < 4 E[t])",
           ks[0] == 0 and ks[1] == 0 and abs(ks[2] - lc.n_host(2)) < 1e-6, str(ks))
+    for rid, want in (("R8.p512.lcg.union", 45.05), ("R8.p512.prose.union", 28.345)):
+        row = next(x for x in ROWS if x[0] == rid)
+        got = predict_row(p, row)[0]
+        check(f"the r8 kernel law reproduces its anchor {rid} ({want}, 0.05 ms)", abs(got - want) < 0.05, f"{got:.3f}")
+    check("the r8 flow issues PG2's queue entries (the r8host counter read equal at P 512 and 4096)",
+          all(counts(P, "R8") == counts(P) for P in (512, 4096)))
+    lo = cause_terms(p, "five", 1.0, 1.0, 1.0, 512, 1.0, -1e6, 0.0)["tail"]
+    check("t(m)'s floor holds in the five-dispatch causes: an expert's tail is never priced under W",
+          abs(lo - p["union_block_rows"] * (p["gu_row_share"] * 32 * p["w"] / 4608 + (1 - p["gu_row_share"]) * 32 * p["w"] / 5120)
+              / 1000.0) < 1e-12, f"{lo:.6f}")
+    q8 = union_kernel(p, dict(union="r8", down="q8k"))
+    check("q8_K down takes dc_q8k_down off the kernel's c and leaves a", q8 == (p["a_r8"], p["c_r8"] - p["dc_q8k_down"]))
+    rb = evaluate(p, TODAY, 512, "prose")["agg"]
+    rw = evaluate(p.but(batchwide_ratio=1.0), dict(TODAY, batchwide=True), 512, "prose")["agg"]
+    rh = evaluate(p.but(batchwide_ratio=0.5), dict(TODAY, batchwide=True), 512, "prose")["agg"]
+    check("the batch-wide shadow issues fewer launches, and its kernel time scales with batchwide_ratio",
+          rw["acts_s"] < rb["acts_s"] and rh["card_in"] < rw["card_in"] <= rb["card_in"] + 1e-9,
+          f"launches {rw['acts_s']:.0f} < {rb['acts_s']:.0f}; shadow {rh['card_in']:.2f} (x0.5) < {rw['card_in']:.2f} (x1)"
+          f" <= {rb['card_in']:.2f} (per chunk)")
+    check("GT's (e, rho, t) order spills nothing", spill_us(p, {"_l2": "order"}, 1e5, 1e3) == 0.0)
     print(f"self-test: {len(fails)} failed")
     return fails
 
@@ -3237,6 +3449,7 @@ def main():
     ap.add_argument("--cells", action="store_true", help="B1, B1+T, B1+G, B1+T+G per cell and the IMMA shadow over T")
     ap.add_argument("--stream", action="store_true", help="host streaming after B1 + T: G, ring, bytes, timeline, DRAM")
     ap.add_argument("--counts", metavar="LOG", help="a generate_ds41 run's queue-entry counter against the model's")
+    ap.add_argument("--levers", action="store_true", help="today's flow (r8, G 2) and each lever re-derived against it")
     args = ap.parse_args()
     rc = 0
     if args.counts:
@@ -3255,8 +3468,10 @@ def main():
         cells()
     if args.stream:
         stream_report()
+    if args.levers:
+        levers()
     if not any((args.self_test, args.backtest, args.predict, args.explain, args.uncalibrated, args.cells, args.stream,
-                args.counts)):
+                args.counts, args.levers)):
         ap.print_help()
     return rc
 
