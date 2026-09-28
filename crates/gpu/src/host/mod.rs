@@ -600,7 +600,8 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
-    /// Detach the route trace; what it wrote stays on disk.
+    /// Detach the route trace; what it wrote stays on disk, completed only
+    /// by [`RouteTrace::finish`].
     pub fn take_route_trace(&mut self) -> Option<RouteTrace> {
         self.step.trace.take()
     }
@@ -625,7 +626,7 @@ impl<H: HostExperts> HostTier<H> {
     /// attached: the trace records the steps' services alone.
     fn refuse_traced_batch(&self, what: &'static str) -> Result<(), GpuError> {
         if self.step.trace.is_some() {
-            return Err(GpuError::protocol(
+            return Err(GpuError::shape(
                 what,
                 "a prompt batch while a route trace is attached: the trace records the step \
                  feed (BLOOMERY_PREFILL=steps)",
@@ -925,7 +926,9 @@ impl<H: HostExperts> HostTier<H> {
     /// as it stood before its go, so the next go brings the generation to
     /// `served + 1` with the handoff's sequence at `served`: what a service
     /// waits for and checks, as on a fresh tier at 0. A captured chain keeps
-    /// its nodes and addresses; its next replay meets these words.
+    /// its nodes and addresses; its next replay meets these words. An
+    /// attached route trace drops the position the refusal cut short
+    /// (`RouteTrace::abandon_position`): its layers were never written.
     ///
     /// A tier poisoned any other way — a failure of its own, a panic in the
     /// host experts — stays poisoned and the call fails by name: only a
@@ -1003,6 +1006,9 @@ impl<H: HostExperts> HostTier<H> {
         if let Some(t) = self.tier.as_mut() {
             t.reset()?;
             self.tier_goes = t.progress();
+        }
+        if let Some(t) = self.step.trace.as_mut() {
+            t.abandon_position();
         }
         let h = &mut self.health;
         h.poisoned = false;

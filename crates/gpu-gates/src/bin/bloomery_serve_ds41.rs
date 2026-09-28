@@ -45,8 +45,8 @@
 //! a new directory before the load: every position the engine runs, each
 //! layer's routed ids and the slot each ran in, a `call` row per prompt call.
 //! It needs the step feed (`BLOOMERY_PREFILL=steps`) and no draft, and is
-//! refused by name otherwise. Its `# build` names this binary's version; the
-//! commit is `/props`' `engine.version`.
+//! refused by name otherwise. Its `# build` names the server's version with
+//! its commit, `/props`' `engine.version` before the engine's note.
 //!
 //! The levers it acts on (`serve_levers::ACTS_ON`) are parsed once, at
 //! `main` (`bloomery_levers::at_main`), which refuses by name a lever set
@@ -345,10 +345,7 @@ mod drive {
         let header = TraceHeader {
             model: path.to_path_buf(),
             arch: "deepseek41".to_owned(),
-            build: format!(
-                "bloomery-serve-ds41 {} (the commit is /props engine.version)",
-                env!("CARGO_PKG_VERSION")
-            ),
+            build: format!("bloomery-serve-ds41 {}", serve::VERSION),
             n_expert: hp.experts.n_expert,
             n_used: hp.experts.n_used,
             n_layer: hp.n_layer,

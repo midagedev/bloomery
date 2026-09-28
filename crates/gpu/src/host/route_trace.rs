@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MANIFEST.tsv      the header by name, a `layer` row per layer, a `call` row per prompt call,
-//!                   `# complete` last
+//!                   `# positions` last, then `# complete` once the writer is finished
 //! topk-<layer>.u16  positions × n_used ids, little-endian, position-major, in step order
 //! slots-<layer>.u8  the same shape: `C` the stage card, `T` the tier card, `H` the host
 //! ```
@@ -13,12 +13,22 @@
 //! The step port records a one-row step's service of each layer before its
 //! signal (the page holds the handoff until then) and appends the row to the
 //! files once its last layer is served; `MANIFEST.tsv` is then rewritten
-//! whole (a new file renamed over the old), so the set on disk is complete
-//! at every position: a process that dies leaves the positions it finished.
+//! whole (a new file renamed over the old) with `# positions` the rows on
+//! disk. A row whose append or manifest fails is cut back off every layer
+//! file, and the trace then refuses to complete. A process killed between a
+//! row's appends and its manifest leaves files longer than the manifest:
+//! `tools/bloomery/route_trace.py trim` cuts them back and says so. `# complete`
+//! is written once, by [`RouteTrace::finish`]: a writer dropped without it
+//! (a failed run's unwinding, a process ending on an error) leaves the set
+//! incomplete and says so on stderr, and a server stopped by a signal is
+//! sealed by its driver (`route_trace.py seal`).
 //! A `call` row marks a prompt call: `prompt_call` positions from `first`
 //! ran its ids one step each; every later position up to the next call is a
 //! step on the id the one before it answered, or on a prompt id a caller
-//! feeds outside the call (a server's last prompt id).
+//! feeds outside the call (a server's last prompt id). A call that ran
+//! fewer ids than it named — a step refused them — is closed at the ids it
+//! ran when the next call is marked or the writer finishes, its row dropped
+//! when it ran none, each with a `route trace:` line on stderr naming it.
 //!
 //! What the trace does not record is refused by name, never skipped: a
 //! position before any prompt call, a service out of layer order, a pass of
@@ -43,7 +53,7 @@ const TITLE: &str = "# router_trace — bloomery engine: the routed ids of every
 
 /// The header keys the trace writes itself; a caller's extra line may not
 /// take one, nor a column line's key.
-const RESERVED: [&str; 20] = [
+const RESERVED: [&str; 22] = [
     "model",
     "model_file",
     "arch",
@@ -55,6 +65,8 @@ const RESERVED: [&str; 20] = [
     "n_layer",
     "feed",
     "slots",
+    "positions",
+    "sealed",
     "complete",
     "layer",
     "call",
@@ -70,9 +82,9 @@ const RESERVED: [&str; 20] = [
 const MAX_USED: usize = 32;
 
 /// The slot kinds as the `slots-<layer>.u8` files hold them.
-pub const CARD: u8 = b'C';
-pub const TIER: u8 = b'T';
-pub const HOST: u8 = b'H';
+pub const KIND_CARD: u8 = b'C';
+pub const KIND_TIER: u8 = b'T';
+pub const KIND_HOST: u8 = b'H';
 
 /// What the manifest's header says about the run besides the positions.
 #[derive(Clone, Debug)]
@@ -123,6 +135,11 @@ pub struct RouteTrace {
     /// Positions on disk.
     rows: u64,
     calls: Vec<Call>,
+    /// The first write that failed: the trace then never completes.
+    failed: Option<String>,
+    /// [`RouteTrace::finish`] ran: `# complete` is on disk, or it returned
+    /// why not.
+    done: bool,
 }
 
 fn io_err(path: &Path, e: &std::io::Error) -> GpuError {
@@ -196,8 +213,10 @@ impl RouteTrace {
             next: 0,
             rows: 0,
             calls: Vec::new(),
+            failed: None,
+            done: false,
         };
-        t.write_manifest()?;
+        t.write_manifest(false)?;
         Ok(t)
     }
 
@@ -243,8 +262,9 @@ impl RouteTrace {
     }
 
     /// A prompt call of `n` ids from cache position `pos0` begins: the next
-    /// `n` positions are its. Refused between two layers of a position, for
-    /// a call of no id, and while the last call has not run all its ids.
+    /// `n` positions are its. Refused between two layers of a position and
+    /// for a call of no id. The last call, when it ran fewer ids than it
+    /// named, is closed first (`RouteTrace::close_short_call`).
     pub fn prompt(&mut self, pos0: u32, n: usize) -> Result<(), GpuError> {
         if self.next != 0 {
             return Err(GpuError::shape(
@@ -255,28 +275,55 @@ impl RouteTrace {
                 ),
             ));
         }
-        if let Some(c) = self.calls.last()
-            && self.rows < c.first + c.prompt
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a prompt call marked while the one from position {} has run {} of its {} ids",
-                    c.first,
-                    self.rows - c.first,
-                    c.prompt
-                ),
-            ));
-        }
         if n == 0 {
             return Err(GpuError::shape(WHAT, "a prompt call of no id"));
         }
+        self.close_short_call(&format!(
+            "before the call of {n} ids from cache position {pos0}"
+        ));
         self.calls.push(Call {
             first: self.rows,
             prompt: n as u64,
             pos0,
         });
         Ok(())
+    }
+
+    /// The last call closed at the ids it ran when a step refused the rest:
+    /// its row dropped when it ran none, else its `prompt_call` cut to the
+    /// positions it holds. Either is a `route trace:` line on stderr, `when`
+    /// saying what closed it.
+    fn close_short_call(&mut self, when: &str) {
+        let (n, rows) = (self.calls.len(), self.rows);
+        let Some(c) = self.calls.last_mut() else {
+            return;
+        };
+        let (i, ran) = (n - 1, rows - c.first);
+        if ran >= c.prompt {
+            return;
+        }
+        if ran == 0 {
+            eprintln!(
+                "route trace: call {i} (position {}, {} ids from cache position {}) ran none of \
+                 its ids, dropped {when}",
+                c.first, c.prompt, c.pos0
+            );
+            self.calls.pop();
+        } else {
+            eprintln!(
+                "route trace: call {i} (position {}, {} ids from cache position {}) ran {ran} of \
+                 its ids, closed at {ran} {when}",
+                c.first, c.prompt, c.pos0
+            );
+            c.prompt = ran;
+        }
+    }
+
+    /// The position being served is dropped: its layers recorded so far
+    /// were never written, and the next service is layer 0 of a new one.
+    /// The host tier's reset calls it when it lifts a refusal.
+    pub(crate) fn abandon_position(&mut self) {
+        self.next = 0;
     }
 
     /// Record `chain`'s service of layer `layer`: its `n_used` routed ids,
@@ -313,11 +360,12 @@ impl RouteTrace {
         }
         let k = self.header.n_used;
         for s in 0..k {
-            let id = id_at(s).ok_or(GpuError::shape(WHAT, "the routing is outside the handoff"))?;
+            let id = id_at(s)
+                .ok_or_else(|| GpuError::shape(WHAT, "the routing is outside the handoff"))?;
             let kind = match slots.slot(layer, id) {
-                Some(Slot::Card(_)) => CARD,
-                Some(Slot::Tier(_)) => TIER,
-                Some(Slot::Host) => HOST,
+                Some(Slot::Card(_)) => KIND_CARD,
+                Some(Slot::Tier(_)) => KIND_TIER,
+                Some(Slot::Host) => KIND_HOST,
                 None => {
                     return Err(GpuError::shape(
                         WHAT,
@@ -339,8 +387,41 @@ impl RouteTrace {
     }
 
     /// Append the recorded position to every layer's files, then rewrite
-    /// the manifest with it.
+    /// the manifest with it. On an error every layer file is cut back to the
+    /// row's start, the manifest keeps the positions before it, and the
+    /// trace no longer completes.
     pub(crate) fn write_row(&mut self) -> Result<(), GpuError> {
+        if let Some(why) = &self.failed {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a row after a failed write ({why})"),
+            ));
+        }
+        let start = self.rows;
+        let written = self.append_row().and_then(|()| {
+            self.rows = start + 1;
+            self.write_manifest(false)
+        });
+        let Err(e) = written else {
+            return Ok(());
+        };
+        self.rows = start;
+        let e = match self.cut_back(start) {
+            Ok(()) => GpuError::shape(
+                WHAT,
+                format!("{e}; every layer file cut back to its {start} positions"),
+            ),
+            Err(cut) => GpuError::shape(
+                WHAT,
+                format!("{e}; cutting the layer files back to {start} positions failed too: {cut}"),
+            ),
+        };
+        self.failed = Some(e.to_string());
+        Err(e)
+    }
+
+    /// The recorded position appended to every layer's two files.
+    fn append_row(&mut self) -> Result<(), GpuError> {
         let k = self.header.n_used;
         let mut bytes = [0u8; 2 * MAX_USED];
         for (l, f) in self.files.iter_mut().enumerate() {
@@ -360,13 +441,53 @@ impl RouteTrace {
                 .write_all(&self.kinds[l * k..][..k])
                 .map_err(|e| io_err(&at(format!("slots-{l}.u8")), &e))?;
         }
-        self.rows += 1;
-        self.write_manifest()
+        Ok(())
+    }
+
+    /// Every layer's files cut to `rows` positions, each opened by its
+    /// path: the append handle may be what failed. An append handle writes
+    /// at the new end.
+    fn cut_back(&self, rows: u64) -> Result<(), GpuError> {
+        let k = self.header.n_used as u64;
+        for l in 0..self.header.n_layer {
+            for (name, len) in [
+                (format!("topk-{l}.u16"), rows * 2 * k),
+                (format!("slots-{l}.u8"), rows * k),
+            ] {
+                let p = self.dir.join(name);
+                OpenOptions::new()
+                    .write(true)
+                    .open(&p)
+                    .and_then(|f| f.set_len(len))
+                    .map_err(|e| io_err(&p, &e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the set complete: a last call short of its ids is closed
+    /// (`RouteTrace::close_short_call`) and the manifest gets
+    /// `# complete`. Refused after a failed write. Returns the positions on
+    /// disk.
+    pub fn finish(mut self) -> Result<u64, GpuError> {
+        self.done = true;
+        if let Some(why) = &self.failed {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{}: not completed: a write failed ({why})",
+                    self.dir.display()
+                ),
+            ));
+        }
+        self.close_short_call("as the writer finished");
+        self.write_manifest(true)?;
+        Ok(self.rows)
     }
 
     /// The manifest of the positions on disk, written beside and renamed
-    /// over the old one.
-    fn write_manifest(&self) -> Result<(), GpuError> {
+    /// over the old one; with `# complete` when `complete`.
+    fn write_manifest(&self, complete: bool) -> Result<(), GpuError> {
         let h = &self.header;
         let mut m = String::new();
         let file = h.model.file_name().map_or_else(
@@ -403,11 +524,29 @@ impl RouteTrace {
             let end = self.calls.get(i + 1).map_or(self.rows, |n| n.first);
             let _ = writeln!(m, "call\t{i}\t{}\t{}\t{end}\t{}", c.first, c.prompt, c.pos0);
         }
-        let _ = writeln!(m, "# complete\t{}\t{}", self.rows, h.n_layer);
+        let _ = writeln!(m, "# positions\t{}", self.rows);
+        if complete {
+            let _ = writeln!(m, "# complete\t{}\t{}", self.rows, h.n_layer);
+        }
         let tmp = self.dir.join("MANIFEST.tsv.tmp");
         let path = self.dir.join("MANIFEST.tsv");
         fs::write(&tmp, m).map_err(|e| io_err(&tmp, &e))?;
         fs::rename(&tmp, &path).map_err(|e| io_err(&path, &e))
+    }
+}
+
+impl Drop for RouteTrace {
+    /// A writer dropped without [`RouteTrace::finish`] leaves its set
+    /// without `# complete` — a drop cannot tell a finished run from a failed
+    /// one — and says so on stderr.
+    fn drop(&mut self) {
+        if !self.done {
+            eprintln!(
+                "route trace: {} dropped without finish: {} positions on disk, not complete",
+                self.dir.display(),
+                self.rows
+            );
+        }
     }
 }
 
@@ -423,6 +562,8 @@ pub struct TraceSet {
     pub kinds: Vec<Vec<u8>>,
     /// The `call` rows: first, prompt_call, end, pos0.
     pub calls: Vec<(u64, u64, u64, u32)>,
+    /// The `# positions` line.
+    pub positions: Option<u64>,
     /// The `# complete` line's positions.
     pub complete: Option<u64>,
 }
@@ -442,7 +583,7 @@ impl TraceSet {
             Some((_, t)) if t.starts_with("# router_trace") => {}
             _ => return Err(bad(0, "not a router set manifest".to_string())),
         }
-        let (mut tokens, mut n_used, mut complete) = (None, None, None);
+        let (mut tokens, mut n_used, mut positions, mut complete) = (None, None, None, None);
         let (mut layer_cols, mut call_cols): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
         let (mut layers, mut calls) = (Vec::new(), Vec::new());
         let field = |cols: &[&str], f: &[&str], name: &str, n: usize| -> Result<u64, GpuError> {
@@ -471,6 +612,7 @@ impl TraceSet {
                 match key {
                     "tokens" => tokens = Some(num()?),
                     "n_expert_used" => n_used = Some(num()?),
+                    "positions" => positions = Some(num()?),
                     "complete" => complete = Some(num()?),
                     "layer" => layer_cols = rest.split('\t').collect(),
                     "call" => call_cols = rest.split('\t').collect(),
@@ -532,7 +674,185 @@ impl TraceSet {
             ids,
             kinds,
             calls,
+            positions,
             complete,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trace of 2 layers of 8 experts, 2 ids a position, in a new
+    /// directory under the system's temp dir named for `name`.
+    fn trace(name: &str) -> RouteTrace {
+        let dir = std::env::temp_dir().join(format!(
+            "bloomery-route-trace-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let header = TraceHeader {
+            model: PathBuf::from("/models/t/m-00001-of-00001.gguf"),
+            arch: "test".to_owned(),
+            build: "test".to_owned(),
+            n_expert: 8,
+            n_used: 2,
+            n_layer: 2,
+            extra: Vec::new(),
+        };
+        RouteTrace::create(&dir, header).unwrap()
+    }
+
+    /// One position recorded as the step port would, ids `id, id + 1` on
+    /// every layer, and written.
+    fn row(t: &mut RouteTrace, id: u16) -> Result<(), GpuError> {
+        for (i, v) in t.ids.iter_mut().enumerate() {
+            *v = id + (i % 2) as u16;
+        }
+        t.kinds.fill(KIND_HOST);
+        t.write_row()
+    }
+
+    fn manifest(t: &RouteTrace) -> String {
+        fs::read_to_string(t.dir().join("MANIFEST.tsv")).unwrap()
+    }
+
+    #[test]
+    fn complete_only_when_finished() {
+        let mut t = trace("finish");
+        t.prompt(0, 1).unwrap();
+        row(&mut t, 1).unwrap();
+        row(&mut t, 3).unwrap();
+        let dir = t.dir().to_path_buf();
+        let open = manifest(&t);
+        assert!(
+            open.contains("# positions\t2\n") && !open.contains("# complete"),
+            "{open}"
+        );
+        let set = TraceSet::read(&dir).unwrap();
+        assert_eq!((set.positions, set.complete), (Some(2), None));
+        assert_eq!(t.finish().unwrap(), 2);
+        let set = TraceSet::read(&dir).unwrap();
+        assert_eq!((set.positions, set.complete), (Some(2), Some(2)));
+        assert_eq!(set.ids[1], [1, 2, 3, 4]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drop_leaves_incomplete() {
+        let mut t = trace("drop");
+        t.prompt(0, 1).unwrap();
+        row(&mut t, 1).unwrap();
+        let dir = t.dir().to_path_buf();
+        drop(t);
+        let set = TraceSet::read(&dir).unwrap();
+        assert_eq!((set.positions, set.complete), (Some(1), None));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failed append cuts every layer file back to the positions before
+    /// it; the manifest keeps them, and the trace refuses to complete.
+    #[test]
+    fn failed_write_cuts_back() {
+        let mut t = trace("cut");
+        t.prompt(0, 3).unwrap();
+        row(&mut t, 1).unwrap();
+        let dir = t.dir().to_path_buf();
+        // Layer 1's slots file behind a read-only handle: layer 0 and layer
+        // 1's ids are appended, then the write fails.
+        t.files[1].slots = File::open(dir.join("slots-1.u8")).unwrap();
+        let e = row(&mut t, 5).unwrap_err().to_string();
+        assert!(e.contains("cut back to its 1 positions"), "{e}");
+        for (name, len) in [
+            ("topk-0.u16", 4),
+            ("slots-0.u8", 2),
+            ("topk-1.u16", 4),
+            ("slots-1.u8", 2),
+        ] {
+            assert_eq!(fs::metadata(dir.join(name)).unwrap().len(), len, "{name}");
+        }
+        assert_eq!(t.rows(), 1);
+        assert!(manifest(&t).contains("# positions\t1\n"));
+        assert!(
+            row(&mut t, 7)
+                .unwrap_err()
+                .to_string()
+                .contains("a row after a failed write")
+        );
+        assert!(
+            t.finish()
+                .unwrap_err()
+                .to_string()
+                .contains("not completed: a write failed")
+        );
+        assert_eq!(TraceSet::read(&dir).unwrap().complete, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A call a step refused is closed at the ids it ran: dropped at none,
+    /// cut at some; the next call is then marked.
+    #[test]
+    fn short_calls_close() {
+        let mut t = trace("short");
+        t.prompt(0, 2).unwrap();
+        t.prompt(0, 3).unwrap();
+        assert_eq!(
+            t.calls(),
+            [Call {
+                first: 0,
+                prompt: 3,
+                pos0: 0
+            }]
+        );
+        row(&mut t, 1).unwrap();
+        t.prompt(0, 2).unwrap();
+        row(&mut t, 1).unwrap();
+        row(&mut t, 1).unwrap();
+        t.prompt(4, 5).unwrap();
+        assert_eq!(
+            t.calls(),
+            [
+                Call {
+                    first: 0,
+                    prompt: 1,
+                    pos0: 0
+                },
+                Call {
+                    first: 1,
+                    prompt: 2,
+                    pos0: 0
+                },
+                Call {
+                    first: 3,
+                    prompt: 5,
+                    pos0: 4
+                },
+            ]
+        );
+        let dir = t.dir().to_path_buf();
+        assert_eq!(t.finish().unwrap(), 3);
+        assert_eq!(
+            TraceSet::read(&dir).unwrap().calls,
+            [(0, 1, 1, 0), (1, 2, 3, 0)]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A position cut short between two layers refuses a call until it is
+    /// abandoned, as the host tier's reset does.
+    #[test]
+    fn abandoned_position() {
+        let mut t = trace("abandon");
+        t.prompt(0, 1).unwrap();
+        row(&mut t, 1).unwrap();
+        t.next = 1;
+        let e = t.prompt(1, 1).unwrap_err().to_string();
+        assert!(e.contains("marked after layer 0 of a position"), "{e}");
+        t.abandon_position();
+        t.prompt(1, 1).unwrap();
+        let dir = t.dir().to_path_buf();
+        drop(t);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
