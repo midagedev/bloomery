@@ -454,6 +454,82 @@ mod ffn_batch_kernels {
         unsafe { *acc.get_unchecked_mut(i) = card_sum_elem(dv, wv, card) };
     }
 
+    /// The card sum of `m` tokens over the stage card's and the expert
+    /// tier's slots: thread `i < m·n` (token `t = i / n`, value `d = i % n`)
+    /// writes [`card_sum_elem`] of its six slots to `acc[i]` — a slot whose
+    /// place `sel[6t + j]` is below `n_card` read from `down`, else one whose
+    /// tier place `tsel[6t + j]` is below `n_tier` read from `trows` (the
+    /// tier's down outputs, slot-major as `down`), each at its slot's turn in
+    /// slot order: the step's tier combine (`combine_post_tier_at`, the same
+    /// mask), the one-card combine over the union of the two cards' slots.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * n * m,
+            trows.len() >= 6 * n * m,
+            w.len() >= 6 * m,
+            sel.len() >= 6 * m,
+            tsel.len() >= 6 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let (t, d) = (i / n, i % n);
+        let mut dv = [0.0f32; N_USED];
+        let mut wv = [0.0f32; N_USED];
+        let mut card = [false; N_USED];
+        let mut j = 0usize;
+        while j < N_USED {
+            let s = t * N_USED + j;
+            // SAFETY: s < 6m <= sel.len(), tsel.len() and w.len() by the
+            // launch contract.
+            let (place, tplace, ws) = unsafe {
+                (
+                    *sel.get_unchecked(s),
+                    *tsel.get_unchecked(s),
+                    *w.get_unchecked(s),
+                )
+            };
+            if place < n_card {
+                card[j] = true;
+                wv[j] = ws;
+                // SAFETY: s < 6m and d < n, so s·n + d < 6nm <= down.len().
+                dv[j] = unsafe { *down.get_unchecked(s * n + d) };
+            } else if tplace < n_tier {
+                card[j] = true;
+                wv[j] = ws;
+                // SAFETY: s < 6m and d < n, so s·n + d < 6nm <= trows.len().
+                dv[j] = unsafe { *trows.get_unchecked(s * n + d) };
+            }
+            j += 1;
+        }
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = card_sum_elem(dv, wv, card) };
+    }
+
     /// The join of `m` tokens: thread `i < m·n` (token `t = i / n`, value `d
     /// = i % n`) combines `y = join_elem(acc[i], hsum[i], shexp[i])`, then
     /// HC_POST of it (`hc_post_elem`) by token `t`'s HC_PRE result
@@ -797,6 +873,148 @@ unsafe fn card_acc_at<const N: usize>(
     acc
 }
 
+/// What the tile path reads for one block ([`enqueue_tiled_experts`]): the
+/// layer's routed stacks on the card, the q8_1 planes of the token columns
+/// `col0 .. cols` of `q3` and `d8` (a column as a [`Q8Act`] lays one out),
+/// each of the block's `N_USED · (cols − col0)` slots' place in the stacks
+/// (`sel`: a stack slot, or [`HOST`] for a slot another device computes),
+/// the layer and its SwiGLU clamp.
+pub struct TiledBlock<'a> {
+    pub stacks: CardStacks<'a>,
+    pub q3: &'a DeviceBuffer<u64>,
+    pub d8: &'a DeviceBuffer<f32>,
+    pub col0: usize,
+    pub cols: usize,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub layer: usize,
+    pub limit: f32,
+}
+
+/// A block's routed experts on one card by tile items: the slots of `t.sel`
+/// grouped by expert (`ds41_card_buckets`), the table's tiles
+/// (`q4k_sel::grouped_tiles`), the q8_1 planes gathered by table entry
+/// (`ds41_card_gather`), the gate·up (`ds41_expert_gate_up_tiles`) into the
+/// SwiGLU outputs by entry, their q8_1 form (`quantize_ord`) and the down
+/// (`q4k_gemv_tiles`), which scatters each entry's rows to its slot's rows
+/// of `down` (slot-major, `n_embd` a slot); a slot whose place is [`HOST`]
+/// is left as it was. Each weight row is read once for up to eight slots.
+/// The table's size is a device value: no launch here reads it on the host.
+/// The stage card's batch shadow and the expert tier's batch service both
+/// run it, each over its own scratch. Asynchronous, allocation-free.
+pub fn enqueue_tiled_experts(
+    gpu: &Gpu,
+    kernels: &FfnBatchKernels,
+    t: &TiledBlock<'_>,
+    s: &mut TileScratch,
+    down: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (stream, ff, n, layer) = (gpu.stream(), s.ff, s.n_embd, t.layer);
+    let fault = gpu.layer_sink(layer)?;
+    let n_sb = n / 256;
+    let slots_n = t.cols.saturating_sub(t.col0) * N_USED;
+    let n_experts = t.stacks.gate.rows() / ff;
+    if slots_n == 0 || slots_n > s.slots || t.sel.len() < slots_n || down.len() < slots_n * n {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "layer {layer}'s tiled block of columns {}..{}: {} places, {} down values; the \
+                 scratch takes 1..={} slots",
+                t.col0,
+                t.cols,
+                t.sel.len(),
+                down.len(),
+                s.slots
+            ),
+        });
+    }
+    if n_experts > BUCKET_EXPERTS {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "layer {layer}'s card stack of {n_experts} experts; the bucket kernel takes at \
+                 most {BUCKET_EXPERTS}"
+            ),
+        });
+    }
+    {
+        let mut order = span_mut(WHAT, &mut s.order, 0, slots_n)?;
+        kernels.enqueue_buckets(
+            stream,
+            t.sel,
+            slots_n,
+            n_experts,
+            fault,
+            &mut order,
+            &mut s.start,
+        )?;
+    }
+    gpu.q4k_sel().enqueue_grouped_tiles(
+        stream,
+        &s.start,
+        n_experts,
+        slots_n,
+        fault,
+        &mut s.tiles,
+    )?;
+    let order = span(WHAT, &s.order, 0, slots_n)?;
+    {
+        let g = CardGather {
+            q3: t.q3,
+            d8: t.d8,
+            order: &order,
+            start: &s.start,
+            n_experts,
+            n_slots: slots_n,
+            col0: t.col0,
+            cols: t.cols,
+            n_sb,
+            n_used: N_USED,
+        };
+        let mut q3 = span_mut(WHAT, &mut s.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
+        let mut d8 = span_mut(WHAT, &mut s.d8_ord, 0, slots_n * 2 * n_sb)?;
+        kernels.enqueue_card_gather(stream, &g, fault, &mut q3, &mut d8)?;
+    }
+    let q3 = span(WHAT, &s.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
+    let d8 = span(WHAT, &s.d8_ord, 0, slots_n * 2 * n_sb)?;
+    let mut h = span_mut(WHAT, &mut s.h, 0, slots_n * ff)?;
+    let g = TiledGateUp {
+        wg: t.stacks.gate.buf(),
+        wu: t.stacks.up.buf(),
+        q3: &q3,
+        d8: &d8,
+        start: &s.start,
+        tiles: &s.tiles,
+        n_experts,
+        rows_per_expert: ff,
+        n_slots: slots_n,
+        n_sb,
+        limit: t.limit,
+    };
+    kernels.enqueue_gate_up_tiles(stream, &g, fault, &mut h)?;
+    drop(h);
+    gpu.q4k_sel().enqueue_quantize_ord(
+        stream,
+        &s.h,
+        &s.start,
+        n_experts,
+        slots_n,
+        fault,
+        &mut s.act_h,
+    )?;
+    gpu.q4k_sel().enqueue_gemv_q4k_tiles(
+        stream,
+        t.stacks.down,
+        &s.act_h,
+        &order,
+        &s.start,
+        &s.tiles,
+        slots_n,
+        n,
+        fault,
+        down,
+    )
+}
+
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
 /// that drives the launches with inputs a batch's route cannot produce.
 pub struct FfnBatchKernels {
@@ -862,6 +1080,23 @@ pub struct CardAcc<'a> {
     pub n: usize,
     pub m: usize,
     pub n_card: usize,
+    pub n_used: usize,
+}
+
+/// What [`FfnBatchKernels::enqueue_card_acc_tier`] reads, `m` tokens of
+/// `n_used` slots: [`CardAcc`]'s, and the expert tier's down outputs `trows`
+/// (slot-major as `down`) and each slot's tier place `tsel` (the tier's
+/// below `n_tier`, the layer's tier experts; no other slot's rows are read).
+pub struct CardAccTier<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub trows: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub tsel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_tier: usize,
     pub n_used: usize,
 }
 
@@ -1018,6 +1253,44 @@ impl FfnBatchKernels {
                     .ds41_ffn_card_acc_8(stream, &prep, a.down, a.w, a.sel, n, m, n_card, acc)?;
             }
         }
+        Ok(())
+    }
+
+    /// Enqueue `ds41_ffn_card_acc_tier`: the card sums of `a.m` tokens over
+    /// the stage card's and the tier's slots, value `i` of token `t = i / a.n`
+    /// into `acc[i]`. Six slots a token; any other count is refused by name.
+    /// One launch. Asynchronous, allocation-free.
+    pub fn enqueue_card_acc_tier(
+        &self,
+        stream: &CudaStream,
+        a: &CardAccTier<'_>,
+        acc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_card_acc_tier";
+        if a.n_used != N_USED {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("{what} of {} slots a token; it takes {N_USED}", a.n_used),
+            });
+        }
+        let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_ffn_card_acc_tier(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_ffn_card_acc_tier(
+            stream,
+            &prep,
+            a.down,
+            a.trows,
+            a.w,
+            a.sel,
+            a.tsel,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+            launch_u32(what, "n_tier", a.n_tier)?,
+            acc,
+        )?;
         Ok(())
     }
 
@@ -1189,32 +1462,99 @@ pub struct FfnBatch {
     act_sh: Vec<Q8Act>,
     sh_raw: DeviceBuffer<f32>,
     /// The block's card experts: per token the norm's q8_1 planes (q3 and
-    /// d8, as the chunk's scratch lays out a column), the block's card slots
-    /// by expert (`order`, runs `start`) and the table's tiles (`tiles`), the
-    /// norm's planes gathered by table entry (`q3_ord`, `d8_ord`), the SwiGLU
-    /// output and its q8_1 form by entry — column `j` is slot `order[j]`'s —
-    /// and the down output by slot.
+    /// d8, as the chunk's scratch lays out a column), the tile path's scratch
+    /// ([`TileScratch`]) and the down output by slot.
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
-    h_all: DeviceBuffer<f32>,
-    act_h_all: Q8Act,
     down_all: DeviceBuffer<f32>,
+    tile: TileScratch,
+    /// With an expert tier, per token each slot's place in the tier's routed
+    /// stacks, which the route writes and the tier computes by; and per
+    /// batch of a group the shadow's copy of a tiered block's routing — the
+    /// weights, the card places and the tier places — which the card sum in
+    /// the post reads: in a group the next layer-batch's route rewrites the
+    /// batch-wide ones before this one's post.
+    tsel: Option<DeviceBuffer<u32>>,
+    held: Vec<HeldRouting>,
+}
+
+/// A tiered block's routing as the shadow left it for the post's card sum
+/// ([`FfnPiece::enqueue_batch_acc_tier`]), a batch's own, token `t`'s six
+/// slots at `6t ..` as in the batch-wide buffers.
+struct HeldRouting {
+    w: DeviceBuffer<f32>,
+    sel: DeviceBuffer<u32>,
+    tsel: DeviceBuffer<u32>,
+}
+
+/// The tile path's scratch for blocks of up to `slots` routed slots
+/// ([`enqueue_tiled_experts`]): the slots grouped by expert (`order`, runs
+/// `start`) and the table's tiles, the q8_1 planes gathered by table entry
+/// (`q3_ord`, `d8_ord`), the SwiGLU output and its q8_1 form by entry —
+/// column `j` is slot `order[j]`'s. The stage card's batch and the expert
+/// tier each own one; the path is the same.
+pub struct TileScratch {
     order: DeviceBuffer<u32>,
     start: DeviceBuffer<u32>,
+    tiles: DeviceBuffer<u32>,
     q3_ord: DeviceBuffer<u64>,
     d8_ord: DeviceBuffer<f32>,
-    tiles: DeviceBuffer<u32>,
+    h: DeviceBuffer<f32>,
+    act_h: Q8Act,
+    slots: usize,
+    n_embd: usize,
+    ff: usize,
+}
+
+impl TileScratch {
+    /// The scratch for blocks of up to `slots` slots (1..=3072, six a token of
+    /// the host union's columns) over rows of `n_embd` through experts of
+    /// `ff`, on `stream`'s card. Load-time only.
+    pub fn new(
+        stream: &CudaStream,
+        slots: usize,
+        n_embd: usize,
+        ff: usize,
+    ) -> Result<TileScratch, GpuError> {
+        let n_sb = n_embd / 256;
+        Ok(TileScratch {
+            order: DeviceBuffer::zeroed(stream, slots)?,
+            start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
+            tiles: DeviceBuffer::zeroed(stream, tile_cap(slots, BUCKET_EXPERTS) + 1)?,
+            q3_ord: DeviceBuffer::zeroed(stream, slots * 64 * n_sb.div_ceil(2))?,
+            d8_ord: DeviceBuffer::zeroed(stream, slots * 2 * n_sb)?,
+            h: DeviceBuffer::zeroed(stream, slots * ff)?,
+            act_h: Q8Act::with_slots(stream, slots, ff)?,
+            slots,
+            n_embd,
+            ff,
+        })
+    }
+
+    /// Device bytes of the scratch.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.order.num_bytes()
+            + self.start.num_bytes()
+            + self.tiles.num_bytes()
+            + self.q3_ord.num_bytes()
+            + self.d8_ord.num_bytes()
+            + self.h.num_bytes()
+            + q8act_bytes(&self.act_h)
+    }
 }
 
 impl FfnBatch {
     /// The buffers for groups of up to `sets` batches of up to `cap` tokens
     /// (at most [`UNION_MAX_COLS`], the host union's columns) of rows of
-    /// `n_embd` through experts of `ff`, on `gpu`.
+    /// `n_embd` through experts of `ff`, on `gpu`; with `tier`, the tier
+    /// places of a model with an expert tier.
     pub fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         [cap, sets]: [usize; 2],
+        tier: bool,
     ) -> Result<FfnBatch, GpuError> {
         if cap == 0 || cap > UNION_MAX_COLS || sets == 0 {
             return Err(GpuError::Shape {
@@ -1261,14 +1601,26 @@ impl FfnBatch {
             sh_raw: z(c * n_embd)?,
             q3_all: DeviceBuffer::zeroed(stream, cap * 64 * n_sb.div_ceil(2))?,
             d8_all: z(cap * 2 * n_sb)?,
-            h_all: z(cap * N_USED * ff)?,
-            act_h_all: Q8Act::with_slots(stream, cap * N_USED, ff)?,
-            down_all: z(cap * N_USED * n_embd)?,
-            order: DeviceBuffer::zeroed(stream, cap * N_USED)?,
-            start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
-            q3_ord: DeviceBuffer::zeroed(stream, slot_cols * 64 * n_sb.div_ceil(2))?,
-            d8_ord: z(slot_cols * 2 * n_sb)?,
-            tiles: DeviceBuffer::zeroed(stream, tile_cap(slot_cols, BUCKET_EXPERTS) + 1)?,
+            down_all: z(slot_cols * n_embd)?,
+            tile: TileScratch::new(stream, slot_cols, n_embd, ff)?,
+            tsel: if tier {
+                Some(DeviceBuffer::zeroed(stream, slot_cols)?)
+            } else {
+                None
+            },
+            held: if tier {
+                (0..sets)
+                    .map(|_| -> Result<HeldRouting, GpuError> {
+                        Ok(HeldRouting {
+                            w: z(slot_cols)?,
+                            sel: DeviceBuffer::zeroed(stream, slot_cols)?,
+                            tsel: DeviceBuffer::zeroed(stream, slot_cols)?,
+                        })
+                    })
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1314,24 +1666,21 @@ impl FfnBatch {
             &self.sh_h,
             &self.sh_raw,
             &self.d8_all,
-            &self.h_all,
             &self.down_all,
-            &self.d8_ord,
         ];
-        let acts = self
-            .act_x
-            .iter()
-            .chain(&self.act_sh)
-            .chain(std::iter::once(&self.act_h_all));
+        let acts = self.act_x.iter().chain(&self.act_sh);
         f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.hc.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.ids.num_bytes()
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
-            + self.q3_ord.num_bytes()
-            + self.tiles.num_bytes()
-            + self.order.num_bytes()
-            + self.start.num_bytes()
+            + self.tile.device_bytes()
+            + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .held
+                .iter()
+                .map(|h| h.w.num_bytes() + h.sel.num_bytes() + h.tsel.num_bytes())
+                .sum::<usize>()
             + acts.map(q8act_bytes).sum::<usize>()
     }
 
@@ -1380,16 +1729,32 @@ impl FfnBatch {
 
     /// Enqueue the copies of `key`'s tokens' activations and routing to the
     /// host into the host tier's next batch set, and the event they complete
-    /// at ([`Hybrid::enqueue_download`]). Asynchronous. Refused while both
+    /// at ([`Hybrid::enqueue_download`]); for a `tiered` layer the slots'
+    /// tier places too ([`Hybrid::enqueue_download_tiered`]), which a batch
+    /// made without them refuses by name. Asynchronous. Refused while both
     /// sets hold a layer not uploaded yet.
     pub fn enqueue_download<H: HostExperts>(
         &self,
         gpu: &Gpu,
         tier: &mut Hybrid<H>,
         key: BatchKey,
+        tiered: bool,
     ) -> Result<(), GpuError> {
         self.check_key(key)?;
-        tier.enqueue_download(gpu.stream(), [&self.x, &self.weights], &self.ids, key)
+        let xw = [&self.x, &self.weights];
+        if !tiered {
+            return tier.enqueue_download(gpu.stream(), xw, &self.ids, key);
+        }
+        let tsel = self.tsel()?;
+        tier.enqueue_download_tiered(gpu.stream(), xw, &self.ids, tsel, key)
+    }
+
+    /// The tier places, refused by name on a batch made without a tier.
+    fn tsel(&self) -> Result<&DeviceBuffer<u32>, GpuError> {
+        self.tsel.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tier places of a batch made with a tier (FfnBatch::new)",
+        })
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused
@@ -1435,6 +1800,61 @@ impl FfnBatch {
         }
         Ok(())
     }
+}
+
+/// The group's batch `set`'s held routing, refused past the sets and on a
+/// batch made without a tier.
+fn held_of(held: &[HeldRouting], set: usize) -> Result<&HeldRouting, GpuError> {
+    held.get(set).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "the held routing of batch {set} of a group of {} (none on a batch made without a tier)",
+            held.len()
+        ),
+    })
+}
+
+/// Enqueue the copies of slots `from .. from + len` of the batch-wide
+/// weights, card places and tier places into the group's batch `set`'s held
+/// routing, at the same slots: three copies.
+fn hold_routing(
+    stream: &CudaStream,
+    b: &mut FfnBatch,
+    set: usize,
+    from: usize,
+    len: usize,
+) -> Result<(), GpuError> {
+    let FfnBatch {
+        weights,
+        sel,
+        tsel,
+        held,
+        ..
+    } = b;
+    let n = held.len();
+    let h = held.get_mut(set).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!("the held routing of batch {set} of a group of {n}"),
+    })?;
+    let tsel = tsel.as_ref().ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the tier places of a batch made with a tier (FfnBatch::new)",
+    })?;
+    let (w, s, t) = (
+        span(WHAT, weights, from, len)?,
+        span(WHAT, sel, from, len)?,
+        span(WHAT, tsel, from, len)?,
+    );
+    // SAFETY: each copy reads the batch-wide buffers and writes this batch's
+    // held copies, all this piece's buffers on the engine stream: the route
+    // that wrote the slots comes before, the next route that rewrites them
+    // and the post's card sum that reads the copies after, in stream order.
+    unsafe {
+        dtod(stream, &mut h.w, from, &w, len)?;
+        dtod(stream, &mut h.sel, from, &s, len)?;
+        dtod(stream, &mut h.tsel, from, &t, len)?;
+    }
+    Ok(())
 }
 
 /// The group's batch `set`'s HC_PRE results of `hc`, refused past the sets.
@@ -1621,11 +2041,98 @@ impl FfnPiece {
         b.kernels.enqueue_places(stream, &places, fault, &mut sel)
     }
 
+    /// The expert tier's places of the block `io`'s slots, after the batch's
+    /// route of it: `ds41_ffn_places` over the route's ids with `tier_map`,
+    /// the slot map's tier copy (`SlotMap::tier_view`, same row offsets as
+    /// the card copy), into the batch's tier places. One launch.
+    /// Asynchronous, allocation-free.
+    pub fn enqueue_batch_tier_places(
+        &self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+        tier_map: &DeviceTensor<u32>,
+    ) -> Result<(), GpuError> {
+        let layer = bl.layer;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let c = &self.cfg[i];
+        let fault = gpu.layer_sink(layer)?;
+        let slots_n = (u - at) * N_USED;
+        let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
+        let tsel = b.tsel.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tier places of a batch made with a tier (FfnBatch::new)",
+        })?;
+        let mut tsel = span_mut(WHAT, tsel, at * N_USED, slots_n)?;
+        let places = Places {
+            ids: &ids,
+            n: slots_n,
+            map: tier_map.buf(),
+            row_off: c.row_off,
+            n_expert: self.n_expert,
+        };
+        b.kernels
+            .enqueue_places(gpu.stream(), &places, fault, &mut tsel)
+    }
+
+    /// The card sum of layer `layer`'s tiered block, tokens `at .. u` of the
+    /// group's batch `set`, once the tier's rows have landed (`trows`: the
+    /// tier's down outputs of the block's slots, slot-major from the block's
+    /// first slot, as the host tier hands them over after the tier's
+    /// service): each token's six slots in slot order, from the card's down
+    /// outputs or the tier's rows by their places — the tier's below `n_tier`,
+    /// the layer's tier experts — with the weights and places the shadow held
+    /// for the batch. Before the join, in place of the
+    /// shadow's card sum. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_batch_acc_tier(
+        &self,
+        gpu: &Gpu,
+        b: &mut FfnBatch,
+        [layer, set, n_tier]: [usize; 3],
+        [at, u]: [usize; 2],
+        trows: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let i = self.layer_index(layer, WHAT)?;
+        let n = self.n_embd;
+        if at >= u || u > b.cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s tier card sum of tokens {at}..{u} (batches of {})",
+                    b.cap
+                ),
+            });
+        }
+        let (m, slots_n) = (u - at, (u - at) * N_USED);
+        let held = held_of(&b.held, set)?;
+        let tsel = span(WHAT, &held.tsel, at * N_USED, slots_n)?;
+        let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
+        let trows = span(WHAT, trows, 0, slots_n * n)?;
+        let sel = span(WHAT, &held.sel, at * N_USED, slots_n)?;
+        let wts = span(WHAT, &held.w, at * N_USED, slots_n)?;
+        let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
+        let a = CardAccTier {
+            down: &down,
+            trows: &trows,
+            w: &wts,
+            sel: &sel,
+            tsel: &tsel,
+            n,
+            m,
+            n_card: self.cfg[i].n_card,
+            n_tier,
+            n_used: N_USED,
+        };
+        b.kernels.enqueue_card_acc_tier(gpu.stream(), &a, &mut acc)
+    }
+
     /// The shadow work of `bl`'s layer for the block `io`, after the batch's
     /// route of it: each chunk's HC_PRE, norm and shared expert; then over the
     /// block the card slots grouped by expert, the gate·up, its q8_1 form and
     /// the down by tile items, each reading a weight row once for up to eight
-    /// slots, and the card sum. Asynchronous, allocation-free.
+    /// slots, and — unless the layer is `tiered` — the card sum.
+    /// Asynchronous, allocation-free.
     pub fn enqueue_batch_shadow(
         &mut self,
         gpu: &Gpu,
@@ -1633,6 +2140,7 @@ impl FfnPiece {
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
+        tiered: bool,
     ) -> Result<(), GpuError> {
         let (layer, lw) = (bl.layer, &bl.lw);
         let (i, at, u) = self.batch_block(layer, b, io)?;
@@ -1652,15 +2160,17 @@ impl FfnPiece {
             self.batch_layer(layer, b, &chunk)?;
             self.enqueue_batch_shadow_chunk(gpu, lw, i, card, b, layer, &chunk)?;
         }
-        self.enqueue_grouped_block(gpu, i, card, b, layer, at, u)
+        self.enqueue_grouped_block(gpu, i, card, b, [layer, io.set], [at, u], tiered)
     }
 
-    /// The block's launches for tokens `at .. u`, after every chunk's part
-    /// before them: with card experts, the card slots by expert
-    /// ([`ds41_card_buckets`]) and the gate·up, its q8_1 form and the down of
-    /// every card slot by tile items ([`FfnPiece::enqueue_tiled_experts`])
-    /// into the block's down outputs by slot; then the card sum of every
-    /// token of the block.
+    /// The block's launches for tokens `at .. u` of the group's batch `set`,
+    /// after every chunk's part before them: with card experts, the tile path
+    /// over the block's card slots ([`enqueue_tiled_experts`]) into the
+    /// block's down outputs by slot; then the card sum of every token of the
+    /// block — or, for a `tiered` layer, whose card sum waits for the tier's
+    /// rows ([`FfnPiece::enqueue_batch_acc_tier`]), the copy of the block's
+    /// weights, card places and tier places into the batch's held routing,
+    /// three copies.
     #[allow(
         clippy::too_many_arguments,
         reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
@@ -1671,15 +2181,30 @@ impl FfnPiece {
         i: usize,
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
-        layer: usize,
-        at: usize,
-        u: usize,
+        [layer, set]: [usize; 2],
+        [at, u]: [usize; 2],
+        tiered: bool,
     ) -> Result<(), GpuError> {
         let (stream, n) = (gpu.stream(), self.n_embd);
         let c = &self.cfg[i];
         let slots_n = (u - at) * N_USED;
         if let Some(s) = card {
-            self.enqueue_tiled_experts(gpu, i, s, b, layer, at, u)?;
+            let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+            let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
+            let t = TiledBlock {
+                stacks: s,
+                q3: &b.q3_all,
+                d8: &b.d8_all,
+                col0: at,
+                cols: u,
+                sel: &sel,
+                layer,
+                limit: c.limit,
+            };
+            enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)?;
+        }
+        if tiered {
+            return hold_routing(stream, b, set, at * N_USED, slots_n);
         }
         let m = u - at;
         let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
@@ -1696,145 +2221,6 @@ impl FfnPiece {
             n_used: N_USED,
         };
         b.kernels.enqueue_card_acc(stream, &a, &mut acc)
-    }
-
-    /// The card's stack count for layer `layer`'s block, refused past the
-    /// bucket kernel's width, and the block's table `b.order`/`b.start` of
-    /// its `slots_n` slots from `at`. One launch.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block's layer, stack, buffers and tokens (rust-quality R8)"
-    )]
-    fn enqueue_block_buckets(
-        &self,
-        gpu: &Gpu,
-        s: CardStacks<'_>,
-        b: &mut FfnBatch,
-        layer: usize,
-        at: usize,
-        slots_n: usize,
-        fault: FaultSink,
-    ) -> Result<usize, GpuError> {
-        let n_experts = s.gate.rows() / self.ff;
-        if n_experts > BUCKET_EXPERTS {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "layer {layer}'s card stack of {n_experts} experts; the bucket kernel \
-                     takes at most {BUCKET_EXPERTS}"
-                ),
-            });
-        }
-        let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
-        let mut order = span_mut(WHAT, &mut b.order, 0, slots_n)?;
-        b.kernels.enqueue_buckets(
-            gpu.stream(),
-            &sel,
-            slots_n,
-            n_experts,
-            fault,
-            &mut order,
-            &mut b.start,
-        )?;
-        Ok(n_experts)
-    }
-
-    /// The card experts of the block `at .. u` by tile items
-    /// ([`FfnPiece::enqueue_grouped_block`]): the table and its tiles
-    /// (`q4k_sel::grouped_tiles`), the norm's q8_1 planes gathered by table
-    /// entry (`ds41_card_gather`), the gate·up
-    /// (`ds41_expert_gate_up_tiles`) into the SwiGLU outputs by entry, their
-    /// q8_1 form by entry, and the down (`q4k_gemv_tiles`), which scatters
-    /// each entry's rows to its slot's down outputs. The table's size is a
-    /// device value: no launch here reads it on the host.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
-    )]
-    fn enqueue_tiled_experts(
-        &self,
-        gpu: &Gpu,
-        i: usize,
-        s: CardStacks<'_>,
-        b: &mut FfnBatch,
-        layer: usize,
-        at: usize,
-        u: usize,
-    ) -> Result<(), GpuError> {
-        let (stream, ff, n) = (gpu.stream(), self.ff, self.n_embd);
-        let c = &self.cfg[i];
-        let fault = gpu.layer_sink(layer)?;
-        let n_sb = self.n_embd / 256;
-        let slots_n = (u - at) * N_USED;
-        let n_experts = self.enqueue_block_buckets(gpu, s, b, layer, at, slots_n, fault)?;
-        gpu.q4k_sel().enqueue_grouped_tiles(
-            stream,
-            &b.start,
-            n_experts,
-            slots_n,
-            fault,
-            &mut b.tiles,
-        )?;
-        let order = span(WHAT, &b.order, 0, slots_n)?;
-        {
-            let g = CardGather {
-                q3: &b.q3_all,
-                d8: &b.d8_all,
-                order: &order,
-                start: &b.start,
-                n_experts,
-                n_slots: slots_n,
-                col0: at,
-                cols: u,
-                n_sb,
-                n_used: N_USED,
-            };
-            let mut q3 = span_mut(WHAT, &mut b.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
-            let mut d8 = span_mut(WHAT, &mut b.d8_ord, 0, slots_n * 2 * n_sb)?;
-            b.kernels
-                .enqueue_card_gather(stream, &g, fault, &mut q3, &mut d8)?;
-        }
-        let q3 = span(WHAT, &b.q3_ord, 0, slots_n * 64 * n_sb.div_ceil(2))?;
-        let d8 = span(WHAT, &b.d8_ord, 0, slots_n * 2 * n_sb)?;
-        let mut h = span_mut(WHAT, &mut b.h_all, 0, slots_n * ff)?;
-        let g = TiledGateUp {
-            wg: s.gate.buf(),
-            wu: s.up.buf(),
-            q3: &q3,
-            d8: &d8,
-            start: &b.start,
-            tiles: &b.tiles,
-            n_experts,
-            rows_per_expert: ff,
-            n_slots: slots_n,
-            n_sb,
-            limit: c.limit,
-        };
-        b.kernels.enqueue_gate_up_tiles(stream, &g, fault, &mut h)?;
-        drop(h);
-        gpu.q4k_sel().enqueue_quantize_ord(
-            stream,
-            &b.h_all,
-            &b.start,
-            n_experts,
-            slots_n,
-            fault,
-            &mut b.act_h_all,
-        )?;
-        let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
-        gpu.q4k_sel().enqueue_gemv_q4k_tiles(
-            stream,
-            s.down,
-            &b.act_h_all,
-            &order,
-            &b.start,
-            &b.tiles,
-            slots_n,
-            n,
-            fault,
-            &mut down,
-        )?;
-        Ok(())
     }
 
     /// Layer `layer`'s shadow work for the chunk `io`, after the batch's

@@ -28,6 +28,29 @@
 //!   drain.
 //! - `--two` (T7): a tiered plan with one expert on both devices is refused
 //!   by name before anything is uploaded.
+//! - `--batch` (B7): the prose prompt of [`BATCH_P`] positions fed as one
+//!   prompt batch (`body::prefill`), then [`BATCH_STEPS`] greedy steps, bit
+//!   for bit the same prompt fed one decode step per position on the tiered
+//!   load: the call's last position and every greedy step, argmax and
+//!   logits. No reference load.
+//! - `--batch2` (B7, a group): [`BATCH_P2`] positions, two batches run as one
+//!   group of [`BATCH_GROUP`], then the greedy steps, bit for bit the
+//!   reference's prompt call of the same ids.
+//!
+//!   Both: precondition, the prompt call itself sent every tier layer at
+//!   least one routed slot (the tier's per-layer hits across the call), and
+//!   `--batch2`'s call ran as a group of two, or the clause proves nothing
+//!   and fails by name.
+//! - `--bfault` (B2): a fault raised on the tier card's word at the first
+//!   tier layer before a prompt call is the call's error, by its layer and
+//!   site, and poisons the model; a reset lifts it and the call is then the
+//!   same prompt fed one decode step per position. No reference load.
+//! - `--blost` (B3): the tier's stream held behind a host flag before a
+//!   prompt call: within the go deadline and its grace the call fails naming
+//!   the lost card, the host tier is poisoned as a lost card, the next call
+//!   and a reset are refused by name; the flag is then raised and both
+//!   streams drain. A lost tier stays lost, so with `--lost` too the tiered
+//!   plan is loaded again for T3.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -46,11 +69,12 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::time::Instant;
 
+    use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::{Chain, PoisonKind};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::{Fault, FaultSite, GpuError, HostFlags, Q8Act};
-    use bloomery_gpu_deepseek41::body::{Body, BodyMeta, Deepseek41Model, OpenCfg, TierOpen};
+    use bloomery_gpu_deepseek41::body::{self, Body, BodyMeta, Deepseek41Model, OpenCfg, TierOpen};
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
@@ -75,6 +99,18 @@ mod gate {
     const PAIRS: usize = 4;
     /// Steps the eager arm runs after the prompt.
     const EAGER_STEPS: usize = 4;
+    /// Positions of the prompt call `--batch` feeds against the steps: one
+    /// batch.
+    const BATCH_P: usize = 512;
+    /// Positions of the prompt call `--batch2` feeds against the reference's:
+    /// two batches, one group of two under the default group lever.
+    const BATCH_P2: usize = 1024;
+    /// The batches a group holds that `--batch2`'s call must run as.
+    const BATCH_GROUP: usize = 2;
+    /// Greedy steps after a prompt call.
+    const BATCH_STEPS: usize = 4;
+    /// Positions of the prompt calls B2 and B3 feed: one batch.
+    const BATCH_FAULT_P: usize = 64;
     /// The device index the tier's segments sit on in the tiered plan.
     const TIER_DEVICE: usize = 1;
     /// The go deadline and the grace a lost card is named within, plus room.
@@ -88,15 +124,24 @@ mod gate {
         fault: bool,
         lost: bool,
         two: bool,
+        batch: bool,
+        batch2: bool,
+        bfault: bool,
+        blost: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two]";
+        const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
+                             [--batch] [--batch2] [--bfault] [--blost]";
         let mut a = Args {
             union: false,
             fault: false,
             lost: false,
             two: false,
+            batch: false,
+            batch2: false,
+            bfault: false,
+            blost: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -104,10 +149,14 @@ mod gate {
                 "--fault" => a.fault = true,
                 "--lost" => a.lost = true,
                 "--two" => a.two = true,
+                "--batch" => a.batch = true,
+                "--batch2" => a.batch2 = true,
+                "--bfault" => a.bfault = true,
+                "--blost" => a.blost = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.fault || a.lost || a.two) {
+        if !(a.union || a.fault || a.lost || a.two || a.batch || a.batch2 || a.bfault || a.blost) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -280,6 +329,121 @@ mod gate {
         Ok(run)
     }
 
+    /// The reference load's runs each clause compares with.
+    #[derive(Default)]
+    struct Want {
+        union: Option<Run>,
+        batch2: Option<Run>,
+    }
+
+    /// What one prompt call sent the tier: its hits per layer from the
+    /// tier's first layer, and the batch counters it moved.
+    struct Sent {
+        first: usize,
+        hits: Vec<u64>,
+        stats: TierBatchStats,
+    }
+
+    /// The tier's per-layer hits and batch counters since load; `None`
+    /// without a tier.
+    fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
+        let hybrid = m.body(NAME)?.hybrid();
+        Ok(hybrid.tier().map(|t| Sent {
+            first: t.set().layers().start,
+            hits: t.stats().layer_hits,
+            stats: hybrid.tier_batch_stats(),
+        }))
+    }
+
+    /// From a reset in graph mode: `ids` fed as one prompt call, then
+    /// [`BATCH_STEPS`] greedy steps; the call's last position and each step,
+    /// and on a tiered load what the call alone sent the tier.
+    fn batch_run(m: &mut Deepseek41Model, ids: &[u32]) -> Result<(Run, Option<Sent>), GateError> {
+        let mut run = Run::default();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let before = tier_counts(m)?;
+        let mut tok = body::prefill(m, ids)?;
+        let sent = match (before, tier_counts(m)?) {
+            (Some(b), Some(a)) => Some(Sent {
+                first: a.first,
+                hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
+                stats: TierBatchStats {
+                    served: a.stats.served - b.stats.served,
+                    settles: a.stats.settles - b.stats.settles,
+                    settle_early: a.stats.settle_early - b.stats.settle_early,
+                    settle_ns: a.stats.settle_ns - b.stats.settle_ns,
+                },
+            }),
+            _ => None,
+        };
+        run.push(tok, m.logits()?);
+        for _ in 0..BATCH_STEPS {
+            tok = m.step(&[tok])?;
+            run.push(tok, m.logits()?);
+        }
+        Ok((run, sent))
+    }
+
+    /// The precondition of a prompt-call clause `what`: the call sent every
+    /// layer of `tier_layers` at least one routed slot; prints its counters.
+    fn sent_every(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} precondition: the tiered load holds no tier card");
+            return false;
+        };
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
+        let st = sent.stats;
+        println!(
+            "{what} tier: {} services, {} settles ({} early, {:.2} ms waited), {slots} tier slots \
+             over {} layers",
+            st.served,
+            st.settles,
+            st.settle_early,
+            st.settle_ns as f64 / 1e6,
+            tier_layers.len()
+        );
+        if missing.is_empty() && st.served > 0 {
+            println!("ok {what} precondition: the prompt call sent every tier layer a routed slot");
+            true
+        } else {
+            println!(
+                "FAIL {what} precondition: tier layers {missing:?} were sent no routed slot by the \
+                 prompt call ({} services); the clause proves nothing there",
+                st.served
+            );
+            false
+        }
+    }
+
+    /// [`batch_run`] with `ids` fed one decode step per position.
+    fn steps_run(m: &mut Deepseek41Model, ids: &[u32]) -> Result<Run, GateError> {
+        let mut run = Run::default();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut tok = 0;
+        for &id in ids {
+            tok = m.step(&[id])?;
+        }
+        run.push(tok, m.logits()?);
+        for _ in 0..BATCH_STEPS {
+            tok = m.step(&[tok])?;
+            run.push(tok, m.logits()?);
+        }
+        Ok(run)
+    }
+
     /// Whether `got` is `want` bit for bit; prints the first difference.
     fn same(what: &str, want: &Run, got: &Run) -> bool {
         if want.tokens.len() != got.tokens.len() {
@@ -400,29 +564,42 @@ mod gate {
         }
 
         let prompt = prose(PROMPT)?;
-        let reference = if args.union || args.fault {
+        let long = if args.batch || args.batch2 || args.bfault || args.blost {
+            prose(BATCH_P2)?
+        } else {
+            Vec::new()
+        };
+        let mut want = Want::default();
+        if args.union || args.fault || args.batch2 {
             let t0 = Instant::now();
             let mut m = open(split()?, &plan, None, &meta)?;
             println!(
                 "reference load (gate plan, one card) in {:.1} s",
                 t0.elapsed().as_secs_f64()
             );
-            let r = union_run(&mut m, &prompt)?;
+            if args.union || args.fault {
+                want.union = Some(union_run(&mut m, &prompt)?);
+            }
+            if args.batch2 {
+                want.batch2 = Some(batch_run(&mut m, &long)?.0);
+            }
             drop(m);
-            Some(r)
-        } else {
-            None
+        }
+
+        let load = || -> Result<Deepseek41Model, GateError> {
+            let t0 = Instant::now();
+            let m = open(split()?, &tplan, Some(tier_open()), &meta)?;
+            let (free, total) = m.gpu().mem_info()?;
+            println!(
+                "tiered load (stage + tier on {card}) in {:.1} s; card free {free} of {total} B \
+                 after it",
+                t0.elapsed().as_secs_f64()
+            );
+            Ok(m)
         };
+        let mut m = load()?;
 
-        let t0 = Instant::now();
-        let mut m = open(split()?, &tplan, Some(tier_open()), &meta)?;
-        let (free, total) = m.gpu().mem_info()?;
-        println!(
-            "tiered load (stage + tier on {card}) in {:.1} s; card free {free} of {total} B after it",
-            t0.elapsed().as_secs_f64()
-        );
-
-        if let Some(want) = &reference {
+        if let Some(want) = &want.union {
             if args.union {
                 let got = union_run(&mut m, &prompt)?;
                 pass &= same("T1 (step, 32 steps, pairs, eager)", want, &got);
@@ -478,6 +655,48 @@ mod gate {
                 pass &= fault_case(&mut m, &prompt, want, first)?;
             }
         }
+        if args.batch {
+            let want = steps_run(&mut m, &long[..BATCH_P])?;
+            let (got, sent) = batch_run(&mut m, &long[..BATCH_P])?;
+            pass &= same(
+                "B7 (one batch against the steps, then greedy steps)",
+                &want,
+                &got,
+            );
+            pass &= sent_every("B7", sent.as_ref(), &tier_layers);
+        }
+        if let Some(want) = &want.batch2 {
+            let (got, sent) = batch_run(&mut m, &long)?;
+            pass &= same(
+                "B7 group (two batches against the reference's call, then greedy steps)",
+                want,
+                &got,
+            );
+            pass &= sent_every("B7 group", sent.as_ref(), &tier_layers);
+            let group = m.body(NAME)?.prefill_group().map(|(g, _)| g);
+            if group == Some(BATCH_GROUP) {
+                println!("ok B7 group structure: the call ran as a group of {BATCH_GROUP}");
+            } else {
+                println!(
+                    "FAIL B7 group structure: the prompt group is {group:?}, want {BATCH_GROUP}: \
+                     the held routing across a group is not exercised"
+                );
+                pass = false;
+            }
+        }
+        if args.bfault {
+            let first = *tier_layers
+                .first()
+                .ok_or("the tiered plan has no tier layer")?;
+            pass &= batch_fault_case(&mut m, &long[..BATCH_FAULT_P], first)?;
+        }
+        if args.blost {
+            pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P])?;
+            if args.lost {
+                drop(m);
+                m = load()?;
+            }
+        }
         if args.lost {
             pass &= lost_case(&mut m, &prompt)?;
         }
@@ -501,25 +720,7 @@ mod gate {
         for &id in &prompt[..prompt.len() - 1] {
             m.step(&[id])?;
         }
-        {
-            let body = m.body(NAME)?;
-            let tier = body.hybrid().tier().ok_or("no tier card")?;
-            let g = tier.gpu();
-            let s = g.stream();
-            let x = DeviceBuffer::from_host(s, &[f32::NAN; 256])?;
-            let sel = DeviceBuffer::from_host(s, &[0u32])?;
-            let mut act = Q8Act::with_k(s, 1, 256)?;
-            let q = QuantSel {
-                x: &x,
-                cols: 0..1,
-                sel: &sel,
-                n_card: 1,
-            };
-            g.q4k_sel()
-                .enqueue_quantize_sel(s, &q, g.layer_sink(layer)?, &mut act)?;
-            s.synchronize()?;
-        }
-        let want_fault = Fault::at(u32::try_from(layer)?, FaultSite::QuantColumn);
+        let want_fault = raise_tier_fault(m, layer)?;
         let r = m.step(&[prompt[prompt.len() - 1]]);
         let mut ok = match &r {
             Err(GpuError::Fault { fault, .. }) if *fault == want_fault => {
@@ -554,6 +755,124 @@ mod gate {
             );
             ok = false;
         }
+        Ok(ok)
+    }
+
+    /// Raise a fault on the tier card's word at `layer`, as a quantizer that
+    /// met a NaN there; returns the fault a read of the word gives.
+    fn raise_tier_fault(m: &mut Deepseek41Model, layer: usize) -> Result<Fault, GateError> {
+        let body = m.body(NAME)?;
+        let tier = body.hybrid().tier().ok_or("no tier card")?;
+        let g = tier.gpu();
+        let s = g.stream();
+        let x = DeviceBuffer::from_host(s, &[f32::NAN; 256])?;
+        let sel = DeviceBuffer::from_host(s, &[0u32])?;
+        let mut act = Q8Act::with_k(s, 1, 256)?;
+        let q = QuantSel {
+            x: &x,
+            cols: 0..1,
+            sel: &sel,
+            n_card: 1,
+        };
+        g.q4k_sel()
+            .enqueue_quantize_sel(s, &q, g.layer_sink(layer)?, &mut act)?;
+        s.synchronize()?;
+        m.gpu().context().bind_to_thread()?;
+        Ok(Fault::at(u32::try_from(layer)?, FaultSite::QuantColumn))
+    }
+
+    /// B2: a fault on the tier card's word at `layer` before a prompt call.
+    fn batch_fault_case(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        layer: usize,
+    ) -> Result<bool, GateError> {
+        let want = steps_run(m, ids)?;
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let want_fault = raise_tier_fault(m, layer)?;
+        let r = body::prefill(m, ids);
+        let mut ok = match &r {
+            Err(GpuError::Fault { fault, .. }) if *fault == want_fault => {
+                println!("ok B2: the prompt call fails with the tier's fault: {fault}");
+                true
+            }
+            other => {
+                println!(
+                    "FAIL B2: the prompt call gave {other:?}, want the tier's fault {want_fault}"
+                );
+                false
+            }
+        };
+        if m.poisoned() != Some(want_fault) {
+            println!("FAIL B2: the model's poison is {:?}", m.poisoned());
+            ok = false;
+        }
+        let (got, _) = batch_run(m, ids)?;
+        ok &= same(
+            "B2 (after the reset, the prompt call against the steps)",
+            &want,
+            &got,
+        );
+        Ok(ok)
+    }
+
+    /// B3: the tier's stream held behind a host flag before a prompt call.
+    fn batch_lost_case(m: &mut Deepseek41Model, ids: &[u32]) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let flags = {
+            let body = m.body(NAME)?;
+            let tier = body.hybrid().tier().ok_or("no tier card")?;
+            let flags = HostFlags::new(tier.gpu().context(), 1)?;
+            flags.enqueue_wait(tier.gpu().stream(), 0)?;
+            flags
+        };
+        m.gpu().context().bind_to_thread()?;
+        let t0 = Instant::now();
+        let r = body::prefill(m, ids);
+        let secs = t0.elapsed().as_secs_f64();
+        let mut ok = match &r {
+            Err(e) if e.to_string().contains("the card is lost") && secs < LOST_BOUND_S => {
+                println!("ok B3: the prompt call fails in {secs:.1} s naming the lost card: {e}");
+                true
+            }
+            other => {
+                println!(
+                    "FAIL B3: after {secs:.1} s the prompt call gave {other:?}, want the lost card"
+                );
+                false
+            }
+        };
+        let kind = m.body(NAME)?.hybrid().last_poison().map(|p| p.mark().kind);
+        if kind != Some(PoisonKind::CardLost) {
+            println!("FAIL B3: the host tier's poison is {kind:?}, want CardLost");
+            ok = false;
+        }
+        match body::prefill(m, ids) {
+            Err(e) => println!("ok B3: the next prompt call is refused: {e}"),
+            Ok(t) => {
+                println!("FAIL B3: the next prompt call gave token {t}");
+                ok = false;
+            }
+        }
+        match m.reset() {
+            Err(e) if e.to_string().contains("lost") => println!("ok B3: a reset is refused: {e}"),
+            other => {
+                println!("FAIL B3: a reset gave {other:?}, want a refusal naming the lost card");
+                ok = false;
+            }
+        }
+        flags.raise(0)?;
+        let body = m.body(NAME)?;
+        body.hybrid()
+            .tier()
+            .ok_or("no tier card")?
+            .gpu()
+            .stream()
+            .synchronize()?;
+        m.gpu().stream().synchronize()?;
+        println!("B3: flag raised, both streams drained");
         Ok(ok)
     }
 

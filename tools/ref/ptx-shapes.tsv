@@ -40,6 +40,7 @@ generate_ds41   ds41_expert_gate_up                     0          0
 generate_ds41   ds41_expert_gate_up_tiles               0          0
 generate_ds41   ds41_ffn_card_acc                       0          0
 generate_ds41   ds41_ffn_card_acc_8                     0          0
+generate_ds41   ds41_ffn_card_acc_tier                  0          0
 generate_ds41   ds41_ffn_handoff                        0          0
 generate_ds41   ds41_ffn_handoff_10                     0          0
 generate_ds41   ds41_ffn_handoff_10_cols                0          0

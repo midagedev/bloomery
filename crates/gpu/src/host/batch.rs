@@ -6,14 +6,30 @@
 //! back ([`BatchPort::upload`]). The port holds two sets, taken in turn, so a
 //! layer-batch's route copies into one set while the union still reads the
 //! other.
+//!
+//! With an expert tier ([`super::tier::TierCard`]) a set also carries the
+//! tier's leg of a tiered layer ([`BatchPort::attach_tier`]): the route's
+//! download adds the slots' tier places; once the host has waited for the
+//! set's copies it enqueues the tier's service on the tier's stream before
+//! the union — the block's f32 activations and places copied from the set to
+//! the tier, quantized there, the tier's experts by the same tile path the
+//! stage card runs, their rows copied back into the set's host-mapped rows
+//! and an event recorded — and after the union the host waits for that event
+//! under the go deadline ([`HostTier::tier_rows_of`]) before the stage card's
+//! card sum reads the rows in place. No launch of either card waits for the
+//! other: the host orders them through the set's two events.
 
-use super::slots::{Slot, SlotMap};
-use super::{Health, HostExperts, Refusal, name_refusal, non_finite, unknown_id};
-use crate::GpuError;
-use crate::graph::cu;
+use super::slots::{HOST, Slot, SlotMap};
+use super::step::GO_DEADLINE;
+use super::tier::{TierBlock, TierCard};
+use super::{Health, HostExperts, HostTier, Refusal, name_refusal, non_finite, unknown_id};
+use crate::fault::Fault;
+use crate::graph::{MappedHost, cu};
+use crate::tensor::window;
+use crate::{Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
 use model::{Tensor2, Tensor2View};
-use std::mem::size_of;
+use std::mem::{ManuallyDrop, size_of};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,6 +83,63 @@ struct Set {
     stage: Stage,
 }
 
+/// Where a set's tier leg stands: no tiered layer, a tiered layer routed
+/// (its places downloaded), the tier's service enqueued, or its rows waited
+/// for — which the set's upload requires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leg {
+    Idle,
+    Routed(BatchKey),
+    Issued(BatchKey),
+    Settled(BatchKey),
+}
+
+/// A set's tier leg: the slots' tier places the route downloads, the rows
+/// the tier's down writes back (host-mapped, slot-major from the block's
+/// first slot) as the stage card's card sum reads them, the event the
+/// tier's service completes at (the tier's context), and its stage.
+///
+/// Field order is drop order: the window before the allocation it views.
+struct TierLeg {
+    rows_stage: ManuallyDrop<DeviceBuffer<f32>>,
+    rows: MappedHost,
+    tsel: PinnedHostBuffer<u32>,
+    done: CudaEvent,
+    leg: Leg,
+}
+
+impl Drop for TierLeg {
+    fn drop(&mut self) {
+        // SAFETY: the window is taken once, here, and never read again; its
+        // raw parts are dropped and nothing is freed — `rows` frees the
+        // allocation after it.
+        unsafe { drop(ManuallyDrop::take(&mut self.rows_stage).into_raw_parts()) };
+    }
+}
+
+/// The tier's side of the port: its two legs, one a set, and its staging on
+/// the tier card for a block — the activations and places copied in, their
+/// q8_1 form, the down outputs by slot.
+struct TierPort {
+    legs: [TierLeg; 2],
+    x: DeviceBuffer<f32>,
+    tsel: DeviceBuffer<u32>,
+    act: Q8Act,
+    y: DeviceBuffer<f32>,
+    stats: TierBatchStats,
+}
+
+/// What the tier's batch services have done since load: services enqueued,
+/// the host's waits for their rows, those the tier had already finished, and
+/// the waits' wall time in nanoseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierBatchStats {
+    pub served: u64,
+    pub settles: u64,
+    pub settle_early: u64,
+    pub settle_ns: u64,
+}
+
 /// The two sets, and the set the next download, serve and upload take: each
 /// of the three goes through the sets in turn, so a serve takes the set of
 /// the oldest download not served yet.
@@ -77,11 +150,31 @@ struct Set {
 /// overlap gone. Nothing outside this port names a set's event.
 pub struct BatchPort {
     sets: [Set; 2],
+    tier: Option<TierPort>,
     n_embd: usize,
     n_used: usize,
+    cap: usize,
     down: usize,
     serve: usize,
     up: usize,
+}
+
+/// What a tiered set hands the tier's service
+/// ([`HostTier::serve_port`]): `key`'s tokens' activations and tier places
+/// in the set, the tier's staging, the set's rows and the event to record.
+struct TierServe<'a> {
+    key: BatchKey,
+    n_embd: usize,
+    n_used: usize,
+    x: &'a PinnedHostBuffer<f32>,
+    tsel: &'a PinnedHostBuffer<u32>,
+    stage_x: &'a mut DeviceBuffer<f32>,
+    stage_tsel: &'a mut DeviceBuffer<u32>,
+    act: &'a mut Q8Act,
+    y: &'a mut DeviceBuffer<f32>,
+    rows: &'a MappedHost,
+    rows_len: usize,
+    done: &'a CudaEvent,
 }
 
 impl BatchPort {
@@ -116,20 +209,103 @@ impl BatchPort {
         };
         Ok(BatchPort {
             sets: [set()?, set()?],
+            tier: None,
             n_embd,
             n_used,
+            cap,
             down: 0,
             serve: 0,
             up: 0,
         })
     }
 
+    /// The tier's side of the port, for an expert tier on `tier` under the
+    /// stage card of `stage`: per set the places' copy, the rows (host-mapped,
+    /// seen from both cards) and the tier's event; on the tier card the
+    /// staging for a block of up to the port's tokens. Load-time only; a
+    /// second call is refused by name.
+    pub fn attach_tier(&mut self, stage: &Arc<CudaContext>, tier: &Gpu) -> Result<(), GpuError> {
+        const WHAT: &str = "BatchPort::attach_tier";
+        if self.tier.is_some() {
+            return Err(GpuError::state(WHAT, "a port without a tier leg"));
+        }
+        let (n, s, cap) = (self.n_embd, self.n_used, self.cap);
+        let slots = cap * s;
+        let row_values = slots * n;
+        let leg = || -> Result<TierLeg, GpuError> {
+            let rows = MappedHost::new(stage, 4 * row_values, "cuMemHostAlloc (the tier's rows)")?;
+            // SAFETY: the window spans the `row_values` f32 of `rows`'s
+            // allocation, which the leg keeps and frees only after the window
+            // (field order).
+            let rows_stage = unsafe { window::<f32>(rows.dev_at(0), row_values, stage) };
+            let tsel = PinnedHostBuffer::<u32>::zeroed(stage, slots).map_err(|source| {
+                GpuError::Driver {
+                    op: Some("cuMemAllocHost (the batch's tier places)"),
+                    source,
+                }
+            })?;
+            Ok(TierLeg {
+                rows_stage,
+                rows,
+                tsel,
+                done: tier.context().new_event(None)?,
+                leg: Leg::Idle,
+            })
+        };
+        let legs = [leg()?, leg()?];
+        tier.context().bind_to_thread()?;
+        let ts = tier.stream();
+        let port = TierPort {
+            legs,
+            x: DeviceBuffer::zeroed(ts, cap * n)?,
+            tsel: DeviceBuffer::zeroed(ts, slots)?,
+            act: Q8Act::with_slots(ts, cap, n)?,
+            y: DeviceBuffer::zeroed(ts, row_values)?,
+            stats: TierBatchStats::default(),
+        };
+        stage.bind_to_thread()?;
+        self.tier = Some(port);
+        Ok(())
+    }
+
+    /// Tokens a block of this port holds at most.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Host bytes the tier's legs hold: per set its rows and places.
+    #[must_use]
+    pub fn tier_host_bytes(&self) -> usize {
+        self.tier.as_ref().map_or(0, |t| {
+            t.legs
+                .iter()
+                .map(|l| 4 * l.rows_stage.len() + l.tsel.len() * size_of::<u32>())
+                .sum()
+        })
+    }
+
+    /// Device bytes the tier's staging holds on the tier card.
+    #[must_use]
+    pub fn tier_device_bytes(&self) -> usize {
+        self.tier.as_ref().map_or(0, |t| {
+            t.x.num_bytes() + t.tsel.num_bytes() + t.act.device_bytes() + t.y.num_bytes()
+        })
+    }
+
     /// Both sets free, the next download into the first: at a group's
-    /// start, when the stream holds no copy of an earlier group (the group's
-    /// prologue waits for the stream).
+    /// start, when neither card's stream holds a copy of an earlier group
+    /// (the group's prologue waits for the stage's stream; a group that
+    /// failed drained the tier's, or lost the tier, after which the host
+    /// tier serves nothing more).
     pub fn begin(&mut self) {
         for s in &mut self.sets {
             s.stage = Stage::Free;
+        }
+        if let Some(t) = self.tier.as_mut() {
+            for l in &mut t.legs {
+                l.leg = Leg::Idle;
+            }
         }
         (self.down, self.serve, self.up) = (0, 0, 0);
     }
@@ -159,9 +335,36 @@ impl BatchPort {
     pub fn download_pitched(
         &mut self,
         stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        pitch: usize,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        self.download_with(stream, xw, ids, pitch, None, key)
+    }
+
+    /// [`BatchPort::download`] of a tiered layer: the slots' tier places
+    /// `tsel` (`n_used` a token) copied into the set's tier leg before the
+    /// event too, so the tier's service, enqueued once the host has waited
+    /// for it, reads them. Refused on a port without a tier leg.
+    pub fn download_tiered(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        tsel: &DeviceBuffer<u32>,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        self.download_with(stream, xw, ids, self.n_used, Some(tsel), key)
+    }
+
+    fn download_with(
+        &mut self,
+        stream: &CudaStream,
         [x, w]: [&DeviceBuffer<f32>; 2],
         ids: &DeviceBuffer<u32>,
         pitch: usize,
+        tsel: Option<&DeviceBuffer<u32>>,
         key: BatchKey,
     ) -> Result<(), GpuError> {
         let (n, s) = (self.n_embd, self.n_used);
@@ -183,11 +386,34 @@ impl BatchPort {
                 ),
             });
         }
+        let mut leg = match (tsel, self.tier.as_mut()) {
+            (None, _) => None,
+            (Some(t), Some(port)) => Some((t, &mut port.legs[self.down])),
+            (Some(_), None) => {
+                return Err(GpuError::state(
+                    PORT,
+                    "a tier leg for a tiered layer's route (BatchPort::attach_tier)",
+                ));
+            }
+        };
+        if let Some((_, l)) = &leg
+            && l.leg != Leg::Idle
+        {
+            return Err(GpuError::Shape {
+                what: PORT,
+                detail: format!(
+                    "a tiered route of {key:?} into a tier leg that holds {:?}",
+                    l.leg
+                ),
+            });
+        }
         // SAFETY: each copy writes this set's page-locked buffers (the helpers
         // check both extents). The set is free: its last serve returned, so the
         // union no longer reads them, and its upload is enqueued before these
-        // copies. The host reads them again only in this set's next serve,
-        // after its wait on the event recorded below.
+        // copies — and a tiered set's upload came only after the host saw the
+        // tier's service, which read its places, complete. The host and the
+        // tier read them again only in this set's next serve, after the host's
+        // wait on the event recorded below.
         unsafe {
             dtoh(stream, &mut set.x, x, at * n..u * n)?;
             if pitch == s {
@@ -197,6 +423,12 @@ impl BatchPort {
                 dtoh_pitched(stream, &mut set.ids, ids, (at..u, s, pitch))?;
                 dtoh_pitched(stream, &mut set.w, w, (at..u, s, pitch))?;
             }
+            if let Some((t, l)) = leg.as_mut() {
+                dtoh(stream, &mut l.tsel, *t, at * s..u * s)?;
+            }
+        }
+        if let Some((_, l)) = leg {
+            l.leg = Leg::Routed(key);
         }
         set.routed.record(stream)?;
         set.stage = Stage::Routed(key);
@@ -211,6 +443,19 @@ impl BatchPort {
     pub fn serve(
         &mut self,
         key: BatchKey,
+        serve: impl FnOnce(usize, Tensor2View<'_>, &[u32], &[f32], &mut [f32]) -> Result<(), GpuError>,
+    ) -> Result<ServeTimes, GpuError> {
+        self.serve_tiered(key, |_| Ok(()), serve)
+    }
+
+    /// [`BatchPort::serve`], and for a tiered set, once its copies have
+    /// landed and before the union, `tier` enqueues the tier's service of
+    /// the set's leg; the leg is then issued, and the set's upload waits for
+    /// [`BatchPort::settle_tier`]. `tier` is not called for a set without one.
+    fn serve_tiered(
+        &mut self,
+        key: BatchKey,
+        tier: impl FnOnce(TierServe<'_>) -> Result<(), GpuError>,
         serve: impl FnOnce(usize, Tensor2View<'_>, &[u32], &[f32], &mut [f32]) -> Result<(), GpuError>,
     ) -> Result<ServeTimes, GpuError> {
         let (n, s) = (self.n_embd, self.n_used);
@@ -228,6 +473,44 @@ impl BatchPort {
         let t0 = Instant::now();
         set.routed.synchronize()?;
         let t1 = Instant::now();
+        if let Some(port) = self.tier.as_mut() {
+            let TierPort {
+                legs,
+                x,
+                tsel,
+                act,
+                y,
+                stats,
+            } = port;
+            let l = &mut legs[self.serve];
+            match l.leg {
+                Leg::Idle => {}
+                Leg::Routed(k) if k == key => {
+                    tier(TierServe {
+                        key,
+                        n_embd: n,
+                        n_used: s,
+                        x: &set.x,
+                        tsel: &l.tsel,
+                        stage_x: x,
+                        stage_tsel: tsel,
+                        act,
+                        y,
+                        rows: &l.rows,
+                        rows_len: l.rows_stage.len(),
+                        done: &l.done,
+                    })?;
+                    l.leg = Leg::Issued(key);
+                    stats.served += 1;
+                }
+                other => {
+                    return Err(GpuError::Shape {
+                        what: PORT,
+                        detail: format!("the serve of {key:?}; the set's tier leg holds {other:?}"),
+                    });
+                }
+            }
+        }
         let x = Tensor2View::new(&set.x[at * n..u * n], n, u - at)?;
         let times = ServeTimes {
             wait_ns: nanos(t1 - t0),
@@ -245,8 +528,74 @@ impl BatchPort {
         Ok(times)
     }
 
+    /// Wait, until `deadline`, for the tier's service of the oldest served
+    /// set — `key`'s, and tiered, else refused by name — and hand back its
+    /// rows as the stage card reads them: the tier's down outputs of the
+    /// block's slots, slot-major from its first slot. `Ok(None)` when the
+    /// tier's event has not completed by `deadline`: the caller names the
+    /// tier lost. A second call on a settled leg returns the rows at once.
+    pub fn settle_tier(
+        &mut self,
+        key: BatchKey,
+        deadline: Instant,
+    ) -> Result<Option<&DeviceBuffer<f32>>, GpuError> {
+        const WHAT: &str = "BatchPort::settle_tier";
+        let set = &self.sets[self.up];
+        let port = self
+            .tier
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "a tier leg (BatchPort::attach_tier)"))?;
+        let l = &mut port.legs[self.up];
+        if set.stage != Stage::Served(key) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the tier's rows of {key:?}; the oldest served exchange set holds {:?}",
+                    set.stage
+                ),
+            });
+        }
+        let settled = match l.leg {
+            Leg::Settled(k) if k == key => true,
+            Leg::Issued(k) if k == key => false,
+            other => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "the tier's rows of {key:?}; the set's tier leg holds {other:?}"
+                    ),
+                });
+            }
+        };
+        if !settled {
+            let t0 = Instant::now();
+            let mut early = true;
+            while !l.done.query()? {
+                early = false;
+                if Instant::now() > deadline {
+                    return Ok(None);
+                }
+                std::thread::yield_now();
+            }
+            let st = &mut port.stats;
+            st.settles += 1;
+            st.settle_early += u64::from(early);
+            st.settle_ns += nanos(t0.elapsed());
+            l.leg = Leg::Settled(key);
+        }
+        Ok(Some(&*l.rows_stage))
+    }
+
+    /// What the tier's batch services have done since load.
+    #[must_use]
+    pub fn tier_stats(&self) -> TierBatchStats {
+        self.tier.as_ref().map(|t| t.stats).unwrap_or_default()
+    }
+
     /// Enqueue the copy of the oldest served set's sums, which must be
-    /// `key`'s, to `hsum`; the set is free again.
+    /// `key`'s, to `hsum`; the set is free again. A tiered set's tier rows
+    /// must have been waited for ([`BatchPort::settle_tier`]) — a join
+    /// without them is refused by name.
     pub fn upload(
         &mut self,
         stream: &CudaStream,
@@ -264,6 +613,22 @@ impl BatchPort {
                     set.stage
                 ),
             });
+        }
+        if let Some(port) = self.tier.as_mut() {
+            let l = &mut port.legs[self.up];
+            match l.leg {
+                Leg::Idle => {}
+                Leg::Settled(k) if k == key => l.leg = Leg::Idle,
+                other => {
+                    return Err(GpuError::Shape {
+                        what: PORT,
+                        detail: format!(
+                            "the upload of {key:?} before its tier rows were joined; the set's \
+                             tier leg holds {other:?}"
+                        ),
+                    });
+                }
+            }
         }
         // SAFETY: the copy writes values at·n .. u·n of `hsum` from this
         // set's page-locked sums, which the host writes again only in this
@@ -393,6 +758,346 @@ unsafe fn htod<T: cuda_core::DeviceCopy>(
         )
     };
     cu(rc, "cuMemcpyHtoDAsync_v2 (the batch's host sums)")
+}
+
+/// Enqueue the copy of values `at` of `src` to `dst` from its start.
+///
+/// SAFETY: `src` is not written or freed until the copy completes.
+unsafe fn htod_front<T: cuda_core::DeviceCopy>(
+    stream: &CudaStream,
+    dst: &mut DeviceBuffer<T>,
+    src: &PinnedHostBuffer<T>,
+    at: Range<usize>,
+) -> Result<(), GpuError> {
+    if at.is_empty() || at.end > src.len() || at.len() > dst.len() {
+        return Err(GpuError::Shape {
+            what: PORT,
+            detail: format!("values {at:?} from {} into {}", src.len(), dst.len()),
+        });
+    }
+    // SAFETY: `src` holds the values of `at` and `dst` their count (checked
+    // above); `src` stays unwritten until the copy completes by this fn's
+    // contract.
+    let rc = unsafe {
+        sys::cuMemcpyHtoDAsync_v2(
+            dst.cu_deviceptr(),
+            src.as_ptr().add(at.start).cast(),
+            at.len() * size_of::<T>(),
+            stream.cu_stream(),
+        )
+    };
+    cu(rc, "cuMemcpyHtoDAsync_v2 (the tier's block)")
+}
+
+/// Enqueue the copy of the first `len` f32 of `src` to the start of `dst`,
+/// a host-mapped allocation of `dst_len` f32.
+///
+/// SAFETY: `dst` holds at least `dst_len` f32; nothing reads its first `len`
+/// until the copy completes.
+unsafe fn dtoh_mapped(
+    stream: &CudaStream,
+    (dst, dst_len): (&MappedHost, usize),
+    src: &DeviceBuffer<f32>,
+    len: usize,
+) -> Result<(), GpuError> {
+    if len == 0 || len > src.len() || len > dst_len {
+        return Err(GpuError::Shape {
+            what: PORT,
+            detail: format!("{len} values from {} into {dst_len}", src.len()),
+        });
+    }
+    // SAFETY: both spans hold `len` f32 (checked above, `dst_len` by this
+    // fn's contract); nothing reads the host span until the copy completes.
+    let rc = unsafe {
+        sys::cuMemcpyDtoHAsync_v2(
+            dst.host_at(0).cast(),
+            src.cu_deviceptr(),
+            4 * len,
+            stream.cu_stream(),
+        )
+    };
+    cu(rc, "cuMemcpyDtoHAsync_v2 (the tier's rows)")
+}
+
+// ------------------------------------------------------------------- tier
+
+/// Enqueue the tier's service of `io`'s block on `tier`'s stream
+/// ([`enqueue_tier_leg`]); the stage card's context `stage` is current again
+/// on return, whatever the result.
+fn enqueue_tier_service(
+    tier: &mut TierCard,
+    io: TierServe<'_>,
+    stage: &Arc<CudaContext>,
+) -> Result<(), GpuError> {
+    let r = enqueue_tier_leg(tier, io);
+    let back = stage.bind_to_thread();
+    r?;
+    back?;
+    Ok(())
+}
+
+/// The tier's service of `io`'s block, on the tier's stream, its tier
+/// slots counted as the tier's hits ([`TierCard::hit`]): the block's
+/// f32 activations and tier places copied from the set to the staging from
+/// column 0; their q8_1 form, the bytes the stage card's fused norm wrote
+/// for the same columns (its q8_1 output is the quantizer's over its f32
+/// output); the tier's experts over the block by the tile path into the
+/// down outputs by slot; those copied into the set's rows; the set's event.
+/// Each copy's source was complete when the host enqueued it: the host has
+/// waited for the set's route copies.
+fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuError> {
+    let TierServe {
+        key,
+        n_embd: n,
+        n_used: s,
+        x,
+        tsel,
+        stage_x,
+        stage_tsel,
+        act,
+        y,
+        rows,
+        rows_len,
+        done,
+    } = io;
+    let BatchKey { layer, at, u, .. } = key;
+    let cols = u - at;
+    let places = tsel.get(at * s..u * s).ok_or_else(|| GpuError::Shape {
+        what: PORT,
+        detail: format!("the tier places of {key:?} from a set of {}", tsel.len()),
+    })?;
+    tier.hit(layer, places.iter().filter(|&&p| p != HOST).count() as u64);
+    {
+        let g = tier.gpu();
+        g.context().bind_to_thread()?;
+        // SAFETY: the set's activations and places are not written again
+        // before its upload, which waits for this service's event, recorded
+        // after these copies.
+        unsafe {
+            htod_front(g.stream(), stage_x, x, at * n..u * n)?;
+            htod_front(g.stream(), stage_tsel, tsel, at * s..u * s)?;
+        }
+        g.enqueue_quantize_q8_1_cols(stage_x, act, cols, layer)?;
+    }
+    tier.enqueue_block(
+        layer,
+        TierBlock {
+            act: &*act,
+            sel: &*stage_tsel,
+            cols,
+            down: &mut *y,
+        },
+    )?;
+    let stream = tier.gpu().stream();
+    // SAFETY: `rows_len` is the rows' allocation's length (their window spans
+    // all of it); the stage card reads them only after the host has seen the
+    // event recorded below complete.
+    unsafe { dtoh_mapped(stream, (rows, rows_len), y, cols * s * n)? };
+    done.record(stream)?;
+    Ok(())
+}
+
+impl<H: HostExperts> HostTier<H> {
+    /// The batch port's tier leg, once the host tier holds both the port
+    /// ([`HostTier::prepare_batch`]) and an expert tier: per set the places,
+    /// the rows and the tier's event, and the tier card's staging
+    /// ([`BatchPort::attach_tier`]). Nothing without a tier; made once.
+    /// Load-time or first-prompt only.
+    pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::prepare_tier_batch";
+        let stage = Arc::clone(self.step.boundary.region.context());
+        let (Some(port), Some(tier)) = (self.port.as_mut(), self.tier.as_ref()) else {
+            return Ok(());
+        };
+        if port.tier.is_some() {
+            return Ok(());
+        }
+        let r = port.attach_tier(&stage, tier.gpu());
+        let back = stage.bind_to_thread();
+        r?;
+        back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
+        let (n, s, cap) = (port.n_embd as u64, port.n_used as u64, port.cap as u64);
+        let want = [
+            model::placement::workstation::tier_batch_staging_bytes(n, s, cap),
+            model::placement::workstation::tier_batch_host_bytes(n, s, cap),
+        ];
+        let got = [
+            port.tier_device_bytes() as u64,
+            port.tier_host_bytes() as u64,
+        ];
+        if got != want {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier's batch staging holds {} B on the tier card and {} B on the host; \
+                     the plan's reserves ({}, {}) are {} and {} B",
+                    got[0],
+                    got[1],
+                    model::placement::workstation::TIER_BATCH_RESERVE,
+                    model::placement::workstation::TIER_BATCH_HOST_RESERVE,
+                    want[0],
+                    want[1]
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`HostTier::enqueue_download`] of a tiered layer: the slots' tier
+    /// places `tsel` (`n_used` a token) too, which the tier's service reads
+    /// ([`BatchPort::download_tiered`]). Refused by name for a layer whose
+    /// tier holds no expert, and without a tier or its leg.
+    pub fn enqueue_download_tiered(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        tsel: &DeviceBuffer<u32>,
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::enqueue_download_tiered";
+        if self.tier.is_none() || self.slots.on_tier(key.layer)? == 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {}: a tiered route of a layer the tier holds no expert of",
+                    key.layer
+                ),
+            ));
+        }
+        self.port_mut(WHAT)?
+            .download_tiered(stream, xw, ids, tsel, key)
+    }
+
+    /// The oldest download not served yet — `key`'s, else refused by name —
+    /// waited for; a tiered set's tier service enqueued on the tier's stream
+    /// ([`enqueue_tier_leg`]); then its layer's host experts served for its
+    /// tokens in one union call, the sums into the set the upload sends. A
+    /// failed tier enqueue poisons the host tier and releases both cards'
+    /// waits; a poisoned host tier is refused by name before either card is
+    /// given work. Returns the host time outside the union call.
+    pub fn serve_port(&mut self, key: BatchKey) -> Result<ServeTimes, GpuError> {
+        const WHAT: &str = "HostTier::serve_key";
+        self.health.refuse_if_poisoned(SERVE_BATCH)?;
+        let h = self.step.boundary.layout.handoff();
+        let stage = Arc::clone(self.step.boundary.region.context());
+        let Some(port) = self.port.as_mut() else {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the batch port's sets (HostTier::prepare_batch)",
+            });
+        };
+        let (batch, experts, health, tier) = (
+            &mut self.batch,
+            &mut self.experts,
+            &mut self.health,
+            &mut self.tier,
+        );
+        let (slots, fault) = (&self.slots, self.fault.as_ref());
+        let mut tier_failed = false;
+        let r = port.serve_tiered(
+            key,
+            |io| {
+                let r = match tier.as_mut() {
+                    Some(t) => enqueue_tier_service(t, io, &stage),
+                    None => Err(GpuError::state(WHAT, "an expert tier for a tiered set")),
+                };
+                tier_failed = r.is_err();
+                r
+            },
+            |layer, x, ids, w, out| {
+                let t = Tier {
+                    experts,
+                    health,
+                    slots,
+                    fault,
+                    hidden: h.hidden,
+                    n_used: h.n_used,
+                };
+                batch.serve_guarded(t, layer, x, ids, w, &[], out)
+            },
+        );
+        if let Err(e) = &r
+            && tier_failed
+        {
+            self.health
+                .set_poison(SERVE_BATCH, key.layer, Some(e), None);
+            self.release_all();
+        }
+        r
+    }
+
+    /// The tier's rows of `key`'s set as the stage card's card sum reads
+    /// them ([`BatchPort::settle_tier`]), once the host has seen the tier's
+    /// service complete, under the go deadline: a tier that has not finished
+    /// by then is lost — the host tier is poisoned as a lost card, both
+    /// cards' waits released, and the error names the card.
+    pub fn tier_rows_of(&mut self, key: BatchKey) -> Result<&DeviceBuffer<f32>, GpuError> {
+        const WHAT: &str = "HostTier::tier_rows_of";
+        let deadline = Instant::now() + GO_DEADLINE;
+        let landed = self.port_mut(WHAT)?.settle_tier(key, deadline)?.is_some();
+        if !landed {
+            let detail = self.tier.as_ref().map_or_else(
+                || "no tier".to_string(),
+                |t| {
+                    format!(
+                        "the expert tier on {} did not finish its service of the prompt block's \
+                         columns {}..{} in {GO_DEADLINE:?}: the card is lost",
+                        t.name(),
+                        key.at,
+                        key.u
+                    )
+                },
+            );
+            return Err(self.lose_tier_as(key.layer, detail));
+        }
+        self.port_mut(WHAT)?
+            .settle_tier(key, deadline)?
+            .ok_or(GpuError::state(WHAT, "the tier's rows just settled"))
+    }
+
+    /// The expert tier's fault word once its stream has drained; `None`
+    /// without a tier or while it is clean, and for a tier lost as a card
+    /// ([`super::PoisonKind::CardLost`]), whose stream may never drain — the
+    /// loss is the error, and no reset lifts it, so no later call reuses a
+    /// set its stream could still touch. The stage card's context is current
+    /// again on return. A prompt call reads it at a group's end and when a
+    /// group fails, beside the stage card's.
+    pub fn tier_fault(&mut self) -> Result<Option<Fault>, GpuError> {
+        let Some(t) = self.tier.as_ref() else {
+            return Ok(None);
+        };
+        if self
+            .health
+            .poison
+            .as_ref()
+            .is_some_and(|p| p.mark().kind == super::PoisonKind::CardLost)
+        {
+            return Ok(None);
+        }
+        let stage = Arc::clone(self.step.boundary.region.context());
+        let r = t.gpu().fault();
+        let back = stage.bind_to_thread();
+        let f = r?;
+        back?;
+        Ok(f)
+    }
+
+    /// Device bytes the tier's batch staging holds on the tier card
+    /// ([`BatchPort::tier_device_bytes`]); 0 before it is made.
+    #[must_use]
+    pub fn tier_batch_bytes(&self) -> usize {
+        self.port.as_ref().map_or(0, BatchPort::tier_device_bytes)
+    }
+
+    /// What the tier's batch services have done since load.
+    #[must_use]
+    pub fn tier_batch_stats(&self) -> TierBatchStats {
+        self.port
+            .as_ref()
+            .map(BatchPort::tier_stats)
+            .unwrap_or_default()
+    }
 }
 
 // ----------------------------------------------------------------- service

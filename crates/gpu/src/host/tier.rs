@@ -47,7 +47,6 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 
-use super::batch::BatchKey;
 use super::page::MAX_ROWS;
 use super::slots::{Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
@@ -401,6 +400,32 @@ pub trait TierExperts {
         layer: usize,
         io: TierIo<'_>,
     ) -> Result<(), GpuError>;
+
+    /// Layer `layer`'s tier experts over the block `io` of a prompt batch,
+    /// from `weights`, on `gpu`'s stream, by the same tile path the stage
+    /// card runs for its card experts over a block. Eager,
+    /// allocation-free; a layer the tier holds no expert of, and a block
+    /// past the scratch the architecture made at load, are refused by name.
+    fn enqueue_block(
+        &mut self,
+        gpu: &Gpu,
+        weights: &Weights,
+        layer: usize,
+        io: TierBlock<'_>,
+    ) -> Result<(), GpuError>;
+}
+
+/// A block of a prompt batch as the tier's batch service hands it to the
+/// architecture ([`TierExperts::enqueue_block`]): the q8_1 form of its
+/// `cols` token columns from column 0, each of its `n_used · cols` slots'
+/// tier place (a tier slot, or [`super::slots::HOST`] for a slot the tier
+/// does not compute), and the down outputs, slot-major (`hidden` a slot), of
+/// which the tier's slots' rows are written and no other.
+pub struct TierBlock<'a> {
+    pub act: &'a Q8Act,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub cols: usize,
+    pub down: &'a mut DeviceBuffer<f32>,
 }
 
 /// What the stage card's handoff writes into a row's tier image and its
@@ -665,17 +690,24 @@ impl TierCard {
         Fault::from_words(w, s)
     }
 
-    /// The tier's batch service for a prompt batch's exchange `key`: the
-    /// tier's experts of the key's layer over its tokens. Not built yet: a
-    /// prompt batch on a model with a tier is refused by name.
-    pub fn serve_batch(&mut self, key: BatchKey) -> Result<(), GpuError> {
-        Err(GpuError::protocol(
-            "TierCard::serve_batch",
-            format!(
-                "tier batch service: tierbatch (layer {}, set {}): the tier's batch port is not built",
-                key.layer, key.set
-            ),
-        ))
+    /// Enqueue layer `layer`'s tier experts over the block `io` of a prompt
+    /// batch on the tier's stream ([`TierExperts::enqueue_block`]), the
+    /// tier's context bound; a layer the set holds no expert of is refused
+    /// by name. The caller binds its own context again afterwards.
+    pub(super) fn enqueue_block(
+        &mut self,
+        layer: usize,
+        io: TierBlock<'_>,
+    ) -> Result<(), GpuError> {
+        if self.set.on_tier(layer)? == 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer}: a tier block of a layer the tier holds no expert of"),
+            ));
+        }
+        self.gpu.context().bind_to_thread()?;
+        self.experts
+            .enqueue_block(&self.gpu, &self.weights, layer, io)
     }
 
     /// Make the stage-side windows in `stage`'s context and keep its
