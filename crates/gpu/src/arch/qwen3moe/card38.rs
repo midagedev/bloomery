@@ -16,15 +16,19 @@ const WHAT: &str = "qwen4exp card leg";
 /// layer and allocates nothing unless it refuses.
 pub(super) fn refuse_card_map(map: &SlotMap, walk: &str) -> Result<(), GpuError> {
     for l in map.layers() {
-        let on = map.on_card(l);
-        if on > 0 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the {walk} walk has no card leg yet: layer {l} holds {on} routed experts on \
-                     the card"
-                ),
-            ));
+        for (on, device) in [
+            (map.on_card(l)?, "the card"),
+            (map.on_tier(l)?, "the tier card"),
+        ] {
+            if on > 0 {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the {walk} walk has no card leg yet: layer {l} holds {on} routed experts \
+                         on {device}"
+                    ),
+                ));
+            }
         }
     }
     Ok(())

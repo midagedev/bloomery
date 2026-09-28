@@ -7,7 +7,7 @@
 //! into the page and adds one to the row's counter.
 
 use super::page::{HandoffLayout, PageLayout, Word};
-use super::slots::{HOST, SlotMap};
+use super::slots::{Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::{
@@ -842,13 +842,15 @@ impl StepPort {
         let page = &self.boundary.page;
         let h = self.boundary.layout.handoff();
         let words = self.boundary.layout.image_words();
-        let map_row = slots.row(layer).ok_or(GpuError::state(
-            what,
-            "a hybrid layer without a slot map row",
-        ))?;
+        if slots.row_offset(layer).is_none() {
+            return Err(GpuError::state(
+                what,
+                "a hybrid layer without a slot map row",
+            ));
+        }
         // The host's slots, in slot order: every routed id the slot map sends
         // to the host, with its weight — at most the page's `n_used`, the
-        // list's room.
+        // list's room. A card's or the tier's id is theirs.
         self.list.clear();
         let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
         let mut unknown = None;
@@ -861,12 +863,12 @@ impl StepPort {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
-            match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
-                Some(&HOST) => {
+            match slots.slot(layer, id) {
+                Some(Slot::Host) => {
                     self.list.push((id, w));
                     w2_host += f64::from(w) * f64::from(w);
                 }
-                Some(_) => {}
+                Some(Slot::Card(_) | Slot::Tier(_)) => {}
                 None => unknown = unknown.or(Some((s, id))),
             }
         }
@@ -881,7 +883,7 @@ impl StepPort {
         // value it writes) — runs no host expert: its sum is NaN, and the
         // service fails by name; the tier then releases the stream.
         let saw = match unknown {
-            Some((s, id)) => Some(unknown_id(s, id, map_row.len())),
+            Some((s, id)) => Some(unknown_id(s, id, slots.n_expert())),
             None => non_finite(&self.x.data),
         };
         let out = self
@@ -935,10 +937,12 @@ impl StepPort {
                 format!("a service of {m} columns; the port was made for fewer"),
             ));
         }
-        let map_row = slots.row(layer).ok_or(GpuError::state(
-            what,
-            "a hybrid layer without a slot map row",
-        ))?;
+        if slots.row_offset(layer).is_none() {
+            return Err(GpuError::state(
+                what,
+                "a hybrid layer without a slot map row",
+            ));
+        }
         let (mut w2_host, mut w2_all, mut host_slots) = (0.0f64, 0.0f64, 0u64);
         let mut refused = None;
         for j in 0..m {
@@ -953,14 +957,14 @@ impl StepPort {
                 };
                 let w = f32::from_bits(wb);
                 w2_all += f64::from(w) * f64::from(w);
-                match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
-                    Some(&HOST) => {
+                match slots.slot(layer, id) {
+                    Some(Slot::Host) => {
                         list[len] = (id, w);
                         len += 1;
                         w2_host += f64::from(w) * f64::from(w);
                     }
-                    Some(_) => {}
-                    None => refused = refused.or(Some((j, unknown_id(s, id, map_row.len())))),
+                    Some(Slot::Card(_) | Slot::Tier(_)) => {}
+                    None => refused = refused.or(Some((j, unknown_id(s, id, slots.n_expert())))),
                 }
             }
             self.lens[j] = len;

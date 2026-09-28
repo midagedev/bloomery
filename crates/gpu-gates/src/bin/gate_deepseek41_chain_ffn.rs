@@ -1018,6 +1018,7 @@ mod gate {
         l: usize,
         w: &'a Weights,
         stacks: Option<&'a Stacks>,
+        /// The layer's row of the stage card's copy: each expert's card slot or HOST.
         row: &'a [u32],
         n_card: usize,
         host: Option<&'a HostLayer>,
@@ -1876,7 +1877,12 @@ mod gate {
             fold_in: DeviceBuffer::zeroed(stream, n)?,
             streams_out: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
             fold_out: DeviceBuffer::zeroed(stream, n)?,
-            slots: DeviceTensor::upload(stream, map.as_slice(), hp.n_layer, hp.experts.n_expert)?,
+            slots: DeviceTensor::upload(
+                stream,
+                &map.stage_view(),
+                hp.n_layer,
+                hp.experts.n_expert,
+            )?,
         };
         println!(
             "piece: layers {:?} scratch_bytes={} map: {} layers with card experts, {} all-host",
@@ -1897,6 +1903,7 @@ mod gate {
             "ds41_ffn_handoff_10",
         ])?);
         tally.add(join8_cases(&gpu)?);
+        let stage = map.stage_view();
         for l in 0..hp.n_layer {
             let w = layer_weights(stream, &split, l)?;
             let stacks = if cards[l].is_empty() {
@@ -1931,14 +1938,15 @@ mod gate {
                 }
             }
             let row = map
-                .row(l)
+                .row_offset(l)
+                .and_then(|at| stage.get(at..at + hp.experts.n_expert))
                 .ok_or_else(|| format!("layer {l} has no map row"))?;
             let lc = LayerCx {
                 l,
                 w: &w,
                 stacks: stacks.as_ref(),
                 row,
-                n_card: map.on_card(l),
+                n_card: map.on_card(l)?,
                 host: host_layers[l].as_ref(),
                 fold,
             };

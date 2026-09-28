@@ -229,11 +229,11 @@ mod gate {
         let copy = body.slot_copy().buf().to_host_vec(gpu.stream())?;
         let n = map.n_expert();
         let mut bad = Vec::new();
-        if copy.len() != map.as_slice().len() {
+        if copy.len() != map.stage_view().len() {
             bad.push(format!(
                 "the card copy holds {} entries, the host map {}",
                 copy.len(),
-                map.as_slice().len()
+                map.stage_view().len()
             ));
         }
         for l in map.layers() {
