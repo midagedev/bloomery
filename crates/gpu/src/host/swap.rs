@@ -843,6 +843,9 @@ pub struct SwapMachine {
     /// Recorded on the engine stream at every boundary: a copy into a slot
     /// freed at or before it waits for it.
     boundary_event: CudaEvent,
+    /// The copy stream already waits for the last record of
+    /// `boundary_event`: one wait serves every copy issued behind it.
+    copy_waits_boundary: bool,
     /// Per flip in flight, the copy stream's event and the flip's job;
     /// `free` lists the idle.
     events: Vec<CudaEvent>,
@@ -938,14 +941,19 @@ impl SwapMachine {
             }
         }
         let rule = SwapMachine::rule_of(&layout, &cfg, n_expert)?;
-        let Staging { shared, tx, thread } =
-            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg)?;
         let events = (0..layers.len() * cfg.params.spares)
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
+        let ledger = SlotLedger::of_map(slots)?;
+        let copy = ctx.new_stream()?;
+        let boundary_event = ctx.new_event(None)?;
+        // The staging thread starts last: from here the machine's drop owns
+        // it, and nothing can fail between.
+        let Staging { shared, tx, thread } =
+            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg)?;
         let mut m = SwapMachine {
             rule,
-            ledger: SlotLedger::of_map(slots)?,
+            ledger,
             rule_shape: Shape {
                 experts: n_expert,
                 top_k: cfg.top_k,
@@ -954,8 +962,9 @@ impl SwapMachine {
             layers,
             n_expert,
             view: view.cu_deviceptr(),
-            copy: ctx.new_stream()?,
-            boundary_event: ctx.new_event(None)?,
+            copy,
+            boundary_event,
+            copy_waits_boundary: false,
             free: (0..events.len()).rev().collect(),
             event_job: vec![0; events.len()],
             events,
@@ -1086,9 +1095,8 @@ impl SwapMachine {
         let (bound_tx, bound_rx) = mpsc::channel::<Result<(), GpuError>>();
         let for_thread = Arc::clone(&shared);
         let ctx = Arc::clone(ctx);
-        // The thread binds the context first: when a drop leaves it to finish
-        // alone, the last reference to the ring and the words is its own, and
-        // their free runs on it.
+        // The thread binds the context first: the source's calls on it may
+        // reach the driver.
         let thread = std::thread::Builder::new()
             .name("swap-staging".into())
             .spawn(move || {
@@ -1101,11 +1109,19 @@ impl SwapMachine {
             .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
         match bound_rx.recv() {
             Ok(Ok(())) => Ok(Staging { shared, tx, thread }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(GpuError::protocol(
-                "SwapMachine::new",
-                "the staging thread ended before it bound the context",
-            )),
+            // The thread is ending: joined here, so its reference to the
+            // shared state goes before this one.
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(GpuError::protocol(
+                    "SwapMachine::new",
+                    "the staging thread ended before it bound the context",
+                ))
+            }
         }
     }
 
@@ -1525,6 +1541,7 @@ impl SwapMachine {
         }
         report.landed = landing.len();
         self.boundary_event.record(stream)?;
+        self.copy_waits_boundary = false;
         if b > 0 {
             let made: Vec<Flip> = self.rule.plan(b).map_err(|e| rule_err(WHAT, e))?.to_vec();
             let t0 = Instant::now();
@@ -1635,7 +1652,10 @@ impl SwapMachine {
             .ok_or_else(|| GpuError::protocol(WHAT, "the staging thread has stopped"))?;
         self.jobs_issued += 1;
         let copy = Arc::clone(&self.copy);
-        copy.wait(&self.boundary_event)?;
+        if !self.copy_waits_boundary {
+            copy.wait(&self.boundary_event)?;
+            self.copy_waits_boundary = true;
+        }
         let staged = self.shared.words.dev_at(2 * ring * WORD_STRIDE);
         let drained = self.shared.words.dev_at((2 * ring + 1) * WORD_STRIDE);
         mem_batch(
@@ -1804,6 +1824,7 @@ impl SwapMachine {
             );
         }
         self.boundary_event.record(stream)?;
+        self.copy_waits_boundary = false;
         // The seed's copies stage as they are issued, whatever the window
         // says, and go out a ring's worth at a time, each batch drained
         // within the deadline: hundreds of them behind unstaged copies would
@@ -1904,16 +1925,17 @@ impl Drop for SwapMachine {
         let deadline = self.shared.deadline;
         self.shared.stop.store(true, Ordering::Release);
         self.tx = None;
+        let mut joined = true;
         if let Some(t) = self.thread.take() {
             let t0 = Instant::now();
             while !t.is_finished() && t0.elapsed() <= deadline {
                 std::thread::sleep(Duration::from_micros(200));
             }
-            // A thread still inside the source past the deadline is left to
-            // finish on its own; it holds its own reference to what it reads.
             if t.is_finished() {
                 // A panic outside a job has nowhere to go on the drop path.
                 let _ = t.join();
+            } else {
+                joined = false;
             }
         }
         // A copy still waiting for a ticket the thread never published is let
@@ -1922,8 +1944,12 @@ impl Drop for SwapMachine {
         // The copy stream waits on no host word now, only on boundary events
         // of the engine stream. Past the deadline (an engine stream held by
         // something else) the ring and the words are leaked, never freed
-        // under a copy that may still read them.
-        if !released || poll_drained(&self.copy, deadline).is_err() {
+        // under a copy that may still read them. A thread still inside the
+        // source past the deadline is left to finish on its own with its
+        // reference, and the shared state is leaked too: its last owner would
+        // free pinned pages and the source on that thread, inside the driver
+        // beside whatever this process runs next.
+        if !joined || !released || poll_drained(&self.copy, deadline).is_err() {
             std::mem::forget(Arc::clone(&self.shared));
         }
     }

@@ -111,7 +111,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
@@ -147,6 +147,9 @@ mod gate {
     /// How soon a dropped machine's copy stream must drain; a copy it left
     /// waiting on the slow victim's ticket never does.
     const RELEASED: Duration = Duration::from_millis(500);
+    /// How long after its drop the stall arm's staging thread may take to
+    /// end: the slow preparation it was left inside, and its exit.
+    const JOINED: Duration = Duration::from_secs(4);
     /// The gate's own bound on a pass's engine stream.
     const ENGINE_DRAIN: Duration = Duration::from_secs(30);
     /// How long a held arm lets the unheld side run before it looks: every
@@ -288,9 +291,11 @@ mod gate {
     /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
     /// `panic_source` fail or panic when their bytes are read, every stack
     /// destination of layer `fail_dest` is an error, and each part a copy
-    /// moves carries `inflate` more copy stream commands.
+    /// moves carries `inflate` more copy stream commands. `dropped_on` gets
+    /// the name of the thread that drops the source.
     #[derive(Clone, Debug, Default)]
     struct Faults {
+        dropped_on: Arc<Mutex<Option<String>>>,
         stuck: Vec<(usize, u32)>,
         slow: Vec<(usize, u32)>,
         fail_source: Option<(usize, u32)>,
@@ -338,6 +343,29 @@ mod gate {
                 prepared: AtomicU32::new(0),
             }
         }
+    }
+
+    impl Drop for Synth {
+        fn drop(&mut self) {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string();
+            if let Ok(mut on) = self.faults.dropped_on.lock() {
+                *on = Some(name);
+            }
+        }
+    }
+
+    /// Threads of this process named as the swap machine names its staging
+    /// thread.
+    fn staging_threads() -> Result<usize, GateError> {
+        let mut n = 0;
+        for t in std::fs::read_dir("/proc/self/task")? {
+            let comm = std::fs::read_to_string(t?.path().join("comm"))?;
+            n += usize::from(comm.trim_end() == "swap-staging");
+        }
+        Ok(n)
     }
 
     impl SwapSource for Synth {
@@ -1857,9 +1885,12 @@ mod gate {
     /// stall: a victim that takes longer to prepare than the machine's
     /// deadline is a named error at the boundary it would land at, not a
     /// wait without end; and the machine, dropped with that preparation in
-    /// flight, leaves no copy waiting on the card. A copy nobody releases
-    /// holds every later free on the card, so on that fail the gate ends
-    /// here, by name.
+    /// flight, leaves no copy waiting on the card, and its staging thread,
+    /// left to finish the preparation, is never the last owner of the shared
+    /// state (it would free the ring's pinned pages and the source there,
+    /// inside the driver beside the next clause). The clause ends only once
+    /// that thread has. A copy nobody releases holds every later free on the
+    /// card, so on that fail the gate ends here, by name.
     fn stall(
         gpu: &Gpu,
         pm: &probe_kernels::LoadedModule,
@@ -1869,6 +1900,8 @@ mod gate {
             slow: vec![(2usize, 7u32)],
             ..Faults::default()
         };
+        let dropped_on = Arc::clone(&faults.dropped_on);
+        let threads = staging_threads()?;
         let mut st = start(gpu, pm, seed_map(&[])?, faults, cfg(DELAY, STALL_DEADLINE))?;
         let t0 = Instant::now();
         drive(gpu, &mut st, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
@@ -1886,20 +1919,36 @@ mod gate {
             std::thread::sleep(Duration::from_micros(200));
             drained = ev.query()?;
         }
+        let drain_took = t2.elapsed();
+        let mut left = staging_threads()?;
+        while left > threads && t1.elapsed() < JOINED {
+            std::thread::sleep(Duration::from_millis(5));
+            left = staging_threads()?;
+        }
+        let joined = left <= threads;
+        let on = dropped_on
+            .lock()
+            .map_err(|_| "gate_swap: the drop cell")?
+            .clone();
         let stall = stall_said.contains("was not prepared for the host")
             && stall_said.contains("layer 2: the victim 7")
             && took < SLOW
             && drained
-            && dropped < SLOW;
+            && dropped < SLOW
+            && joined
+            && on.as_deref() != Some("swap-staging");
         println!(
             "stall: a victim {SLOW:?} to prepare under a {STALL_DEADLINE:?} deadline: after {} passes \
-             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {} {}",
+             in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {}; its staging \
+             thread {} {:?} after the drop, the source dropped on {on:?} (never swap-staging) {}",
             st.values.len(),
             if drained {
-                format!("drained {:?} after it", t2.elapsed())
+                format!("drained {drain_took:?} after it")
             } else {
                 format!("still waiting {RELEASED:?} after it")
             },
+            if joined { "ended" } else { "still running" },
+            t1.elapsed(),
             verdict(stall)
         );
         if !drained {
