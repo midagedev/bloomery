@@ -61,17 +61,43 @@
 # rate — tok_s and step_tok_s are the same number. runs != N - 1 is printed as a [check] line.
 # Its output sits between `--- lcpp raw` markers.
 #
+# The warm-up. Under the lease the command runs twice: first once, discarded, then the timed run, the
+# same command line on the same prompt — the warm-up reads the pages the timed run will (the file
+# mapping, the host experts, the engram rows its ids touch), as the depth runners' warm-ups and server
+# arms' discarded request do (docs/fair-measure.md 2.1). Each run sits between its own witness blocks
+# (`pre warmup …`, `pre …`); a warm-up that fails ends the script with its rc and its tail, before the
+# timed run. The cold tag is the depth runners' (tools/ref/cold-blocks.sh): /proc/vmstat's pgmajfault
+# across the timed process (the whole process: llama-cli prints no line where its clock starts), priced at
+# COLD_US a fault against the window W = eval_ms, the clock the row's rate comes from; the summary line
+# ends in `majflt=<n> (whole process; ≤ <x> % of W <w> s)` and, at COLD_PCT or more, ` [cold]`.
+#
+# Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh's two-card mode) runs the arm on both cards,
+# the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table. The engine's flags
+# must place the model over the two cards (-ts or -ot), or the arm is refused by name before anything
+# runs: the lcpp arm's LCPP_CLI_FLAGS carry the profile's two-card -ts; the profile has no ik two-card
+# line, so an ik arm runs only with an IK_GPU_FLAGS the caller sets. Before the lease timing_cards_precheck refuses a card that does not answer
+# or answers under another name (69), a 3090 off its 250 W cap (78) and a kernel journal it cannot read
+# (69); every witness block prints both cards' limits and clocks, the 3090's cap and the Xid count since
+# the lease was taken (witness_cards); a compute process on either card is waited out (guard_cards); after
+# the warm-up and after the timed run an NVRM Xid, a card lost or off its cap, or an engine whose
+# ggml_cuda_init lines do not show the A6000 and the 3090 as devices 0 and 1 ends the script (rc 1) with
+# the reason. The summary line's card field reads `A6000+3090`.
+#
 # Environment: BLOOMERY_IK_SPEC (the dspark arm's stage, default `dspark`; `dspark:n_max=4` sets
 # ik's canonical keys), BLOOMERY_IK_NCMOE (replaces --n-cpu-moe in IK_GPU_FLAGS: the 3090 holds
-# the dense weights, not six layers of experts), BLOOMERY_LCPP_NCMOE (the same for LCPP_CLI_FLAGS),
+# the dense weights, not six layers of experts; ik's llama-cli hands the count to its loader, which
+# keeps the last N expert layers on the host, not llama-bench's first N — the profile's IK_GPU_FLAGS
+# comment), BLOOMERY_LCPP_NCMOE (the same for LCPP_CLI_FLAGS; mainline's is the first N in both binaries),
 # BLOOMERY_IK_DRAFT_PARAMS, BLOOMERY_IK_CTX (both engines' context),
-# BLOOMERY_ARM_BOUND (seconds, default 900), BLOOMERY_TOKENIZE_BIN (default
-# target/release/bloomery-tokenize), BLOOMERY_TIMING_GPU (timing-card.sh: the card), BLOOMERY_DRY=1
+# BLOOMERY_ARM_BOUND (seconds, default 900, each run's), BLOOMERY_TOKENIZE_BIN (default
+# target/release/bloomery-tokenize), BLOOMERY_TIMING_GPU (timing-card.sh: the card), BLOOMERY_TIMING_CARDS
+# (a6000+3090: the two-card mode above), BLOOMERY_DRY=1
 # (above: every check that runs before the lease, the command lines, exit 0).
 #
-# Exit codes: 0 row printed, 64 usage, 2 a missing binary or corpus, 3 a stale tokenizer binary,
-# 65 the prompt did not round-trip, 1 the reference failed or printed no eval line, 124/137 the bound,
-# 75 the lease was not free within 30 min.
+# Exit codes: 0 row printed, 64 usage (a two-card run whose flags place nothing on two cards included),
+# 2 a missing binary or corpus or no pgmajfault counter, 3 a stale tokenizer binary, 65 the prompt did
+# not round-trip, 1 the reference failed or printed no eval line, or a two-card check after a run failed,
+# 124/137 the bound, 69/78 a two-card precheck, 75 the lease was not free within 30 min or a card stayed busy.
 set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -111,11 +137,26 @@ if [ -n "$NCMOE" ]; then
 fi
 DRAFT_PARAMS=${BLOOMERY_IK_DRAFT_PARAMS:-}
 
-# The card pin (CUDA_VISIBLE_DEVICES), its witness lines and the other-card guard; the lease.
+# The card pin (CUDA_VISIBLE_DEVICES), its witness lines and the other-card guard; the lease. This runner
+# has the two-card mode (the header's Two cards).
+TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
+# The cold tag (COLD_US, COLD_PCT, cold_check) and the fault counter (majflt_now, majflt_require).
+# shellcheck source=tools/ref/cold-blocks.sh
+source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
+if [ -n "$TIMING_CARDS" ]; then
+  case " $FLAGS " in
+    *" -ts "* | *" --tensor-split "* | *" -ot "* | *" --override-tensor "*) ;;
+    *)
+      echo "ik-draft.sh: BLOOMERY_TIMING_CARDS=a6000+3090 and the $ENGINE flags place nothing on two cards ($FLAGS): the profile has no $ENGINE two-card line, so a two-card run names its placement itself (-ts or -ot in $([ "$ENGINE" = ik ] && echo IK_GPU_FLAGS || echo LCPP_CLI_FLAGS)); without one the loader's own split would pick the layers" >&2
+      exit 64
+      ;;
+  esac
+fi
 
 if [ "$ENGINE" = ik ]; then
   TREE=$IK CLI=$IK/build/bin/llama-cli LTOK=$IK/build/bin/llama-tokenize
@@ -181,7 +222,11 @@ if [ "$GOT" != "$WANT" ]; then
   exit 65
 fi
 
-CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+if [ -n "$TIMING_CARDS" ]; then
+  CARD_NAME=$TIMING_CARDS_NAME
+else
+  CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+fi
 CLI_SHA=$(sha256sum "$CLI" | cut -c1-12)
 # GIT_OPTIONAL_LOCKS=0 keeps `git status` from rewriting the index of a tree this root process does not own.
 TREE_HEAD=$(git -c safe.directory="$TREE" -C "$TREE" rev-parse --short=9 HEAD 2> /dev/null || echo '?')
@@ -201,35 +246,74 @@ fi
 if [ -n "$DRY" ]; then
   echo "[dry] prompt check 1 ($LTOK): $PROMPT_N ids round-trip"
   ref_witness | sed 's/^   /[dry]/'
+  if [ -n "$TIMING_CARDS" ]; then
+    tc_rc=0
+    timing_cards_precheck '[dry] ' || tc_rc=$?
+    if [ "$tc_rc" = 0 ]; then echo "[dry] two-card precheck: ok"; else echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"; fi
+  fi
+  echo "[dry] warm-up: the run line above once, discarded, then the same line timed"
   echo "[dry] stops before the lease"
   exit 0
 fi
+majflt_require ik-draft.sh
+timing_cards_precheck || {
+  rc=$?
+  echo "ik-draft.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
+  exit "$rc"
+}
 
 lease_take
+timing_cards_start
 echo "[config] corpus=$CORPUS ids=$IDS prompt=$PROMPT_N n=$N arm=$ARM stage=$STAGE_SHOWN ctx=$CTX card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] $ENGINE: $CLI model=$MODEL flags=$FLAGS env=$RUN_ENV"
 echo "[config] draft: $DRAFT_SHOWN"
 echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] prompt check 1 ($LTOK): $PROMPT_N ids round-trip"
-guard_other
-witness "pre $ENGINE $ARM $CORPUS n=$N"
-ref_witness
-t0=$(date +%s)
-# shellcheck disable=SC2086
-timeout --kill-after=10 "$BOUND" env $RUN_ENV "$CLI" "${args[@]}" < /dev/null > "$WORK/raw" 2>&1
-rc=$?
-t1=$(date +%s)
-witness "post $ENGINE $ARM $CORPUS n=$N"
-ref_witness
-echo "--- $ENGINE raw begin (rc $rc, wall $((t1 - t0))s)"
+[ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES, the placement in the flags above"
+
+# run_once <label> <output file>: the command line between its witness blocks, after the card guard; RUN_RC,
+# RUN_WALL, and the pgmajfault change across the process in RUN_FAULTS. A non-zero rc, or (two cards) a
+# failed check after it, ends the script with the output's tail.
+run_once() {
+  local label=$1 out=$2 t0 f0
+  guard_other
+  witness "pre $label $ENGINE $ARM $CORPUS n=$N"
+  ref_witness
+  t0=$(date +%s) f0=$(majflt_now)
+  # shellcheck disable=SC2086
+  timeout --kill-after=10 "$BOUND" env $RUN_ENV "$CLI" "${args[@]}" < /dev/null > "$out" 2>&1
+  RUN_RC=$?
+  RUN_FAULTS=$(($(majflt_now) - f0)) RUN_WALL=$(($(date +%s) - t0))
+  witness "post $label $ENGINE $ARM $CORPUS n=$N"
+  ref_witness
+  if [ "$RUN_RC" -ne 0 ]; then
+    echo "ik-draft.sh: ${CLI##*/} rc $RUN_RC ($label)" >&2
+    tail -n 20 "$out" >&2
+    exit "$RUN_RC"
+  fi
+  if ! timing_cards_arm "$(cat "$out")"; then
+    echo "ik-draft.sh: two cards ($label): $TWOCARD_WHY" >&2
+    tail -n 20 "$out" >&2
+    exit 1
+  fi
+}
+run_once warmup "$WORK/warm"
+echo "[warmup] the run once, discarded (rc 0, wall ${RUN_WALL}s, majflt $RUN_FAULTS${TWOCARD_DEVS:+, devices $TWOCARD_DEVS}): the timed run below reads the pages it read"
+run_once timed "$WORK/raw"
+rc=$RUN_RC
+echo "--- $ENGINE raw begin (rc $rc, wall ${RUN_WALL}s)"
 cat "$WORK/raw"
 echo "--- $ENGINE raw end"
 
-if [ $rc -ne 0 ]; then
-  echo "ik-draft.sh: ${CLI##*/} rc $rc" >&2
-  tail -n 20 "$WORK/raw" >&2
-  exit "$rc"
-fi
+# cold_col <eval ms>: the timed run's fault column and cold tag (cold_check) against W = eval_ms, into
+# COLD_COL. An eval time that is no positive number is a failed row, not a window of 0.
+cold_col() {
+  local w
+  w=$(awk -v ms="$1" 'BEGIN { if (ms + 0 > 0) printf "%.4f", ms / 1e3 }')
+  [ -n "$w" ] || { echo "ik-draft.sh: eval time '$1' ms is no window for the cold tag" >&2; exit 1; }
+  cold_check "$RUN_FAULTS" "$w"
+  COLD_COL="majflt=$RUN_FAULTS (whole process; ≤ $MAJ_BOUND % of W $w s)$COLD_TAG"
+}
 
 # Check 2: the ids llama-cli itself tokenized the prompt to (--verbose-prompt's list).
 PGOT=$(awk -v n="$PROMPT_N" '/number of tokens in prompt = /{on=1; next} on && /^ *[0-9]+ -> \x27/{print $1; if(++k==n) exit}' "$WORK/raw" | paste -sd,)
@@ -249,7 +333,8 @@ if [ "$ENGINE" = lcpp ]; then
   tok_s=$(echo "$EVAL" | sed -E 's/.*, +([0-9.]+) tokens per second.*/\1/')
   step_tok_s=$(awk -v k="$runs" -v ms="$eval_ms" 'BEGIN{if(k>0 && ms>0) printf "%.2f", k*1e3/ms; else print "-"}')
   [ "$runs" = $((N - 1)) ] || echo "[check] llama-completion ran $runs decode steps, not n - 1 = $((N - 1))"
-  echo "lcpp-prompt corpus=$CORPUS arm=$ARM n=$N depth=$PROMPT_N card=$CARD_NAME tok_s=$tok_s eval_ms=$eval_ms decoded=$((runs + 1)) step_tok_s=$step_tok_s accepted=- drafted=- | ${EVAL#"${EVAL%%[![:space:]]*}"} | -"
+  cold_col "$eval_ms"
+  echo "lcpp-prompt corpus=$CORPUS arm=$ARM n=$N depth=$PROMPT_N card=$CARD_NAME tok_s=$tok_s eval_ms=$eval_ms decoded=$((runs + 1)) step_tok_s=$step_tok_s accepted=- drafted=- | ${EVAL#"${EVAL%%[![:space:]]*}"} | - | $COLD_COL"
   exit 0
 fi
 EVAL=$(grep -E 'main: +eval time = ' "$WORK/raw" | head -n 1)
@@ -267,4 +352,5 @@ if [ "$ARM" = dspark ]; then
   accepted=$(echo "$STATS" | sed -nE 's/.*#acc tokens = ([0-9]+).*/\1/p')
   drafted=$(echo "$STATS" | sed -nE 's/.*#gen tokens = ([0-9]+).*/\1/p')
 fi
-echo "ik-draft corpus=$CORPUS arm=$ARM n=$N depth=$PROMPT_N card=$CARD_NAME tok_s=$tok_s eval_ms=$eval_ms decoded=$decoded step_tok_s=$step_tok_s accepted=$accepted drafted=$drafted | ${EVAL#"${EVAL%%[![:space:]]*}"} | ${STATS}"
+cold_col "$eval_ms"
+echo "ik-draft corpus=$CORPUS arm=$ARM n=$N depth=$PROMPT_N card=$CARD_NAME tok_s=$tok_s eval_ms=$eval_ms decoded=$decoded step_tok_s=$step_tok_s accepted=$accepted drafted=$drafted | ${EVAL#"${EVAL%%[![:space:]]*}"} | ${STATS} | $COLD_COL"
