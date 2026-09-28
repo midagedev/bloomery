@@ -64,7 +64,8 @@ fixture  A synthetic trace (a 32-bit LCG, so the file is the same on every numpy
          params, seed, trace (layers x passes x rows x ids), kept (rows counted per pass), flips
          (boundary, layer, out, in, live_at), and cap_case: the same seed and trace at cap 2 and
          spares 2, its header counting the boundaries the cap bound (refused at 0). Passes carry 1-3
-         rows and count only the first kept.
+         rows and count only the first kept. --pinned P: every layer's first P seed ids are never a
+         victim (params.pinned), and the file is refused unless pinning moves some flip.
 
 The rule (every, cap, margin, min_count, decay): after every `every` passes, per layer the missing
 experts by decayed count (descending, ties to the lower id) pair rank for rank with the residents by
@@ -350,12 +351,15 @@ class Budget:
         return math.ceil(self.t - 1e-9)
 
 
-def pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ties=None, in_flight=None):
+def pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ties=None, in_flight=None,
+               pinned=None):
     """The rule's pairs (layer, in, out, gain) at one boundary, in the order they are issued. A layer takes
-    at most per_layer_cap, less its flips still in flight (in_flight: layer -> count) when given."""
+    at most per_layer_cap, less its flips still in flight (in_flight: layer -> count) when given. pinned
+    [L, E] bool: ids never a victim."""
     L, E = counts.shape
     cand = np.where(resident | pend_in, -1.0, counts)
-    vict = np.where(resident & ~pend_out, counts, np.inf)
+    keep = resident & ~pend_out if pinned is None else resident & ~pend_out & ~pinned
+    vict = np.where(keep, counts, np.inf)
     m = min(max(n_l), E)
     cidx = np.argsort(-cand, axis=1, kind="stable")[:, :m]
     vidx = np.argsort(vict, axis=1, kind="stable")[:, :m]
@@ -396,7 +400,7 @@ class Replay:
 
 
 def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_cap=True, d=1, link=None,
-           counts0=None, record=None, passes=None, on_flip=None, ties=None):
+           counts0=None, record=None, passes=None, on_flip=None, ties=None, pinned=None):
     """The card set over X [rows, L, K]. passes: None (one row a pass, counted) or (r0, r1, kept) per pass;
     every row of a pass is served by the set in force at its start, its first `kept` rows are counted.
     rule None is the static set. sem "hole": the victim leaves at the decision; "flip": it stays live
@@ -404,7 +408,8 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
     decided at boundary b (after pass b - 1) is live from pass max(b + d, link.ready(b)); at a boundary
     the flips live there land first, then the rule plans, so one live at b is no longer in flight when b
     plans. in_flight_cap False is the adaptres window scripts' order: at most `spares` new flips a layer
-    a boundary however many are in flight, and the rule plans before the flips live at b land."""
+    a boundary however many are in flight, and the rule plans before the flips live at b land. pinned
+    [L, E] bool: residents never a victim (crates/runtime's pinned seed ranks)."""
     L = X.shape[1]
     ar = np.arange(L)[:, None]
     resident = resident0.copy()
@@ -448,7 +453,8 @@ def replay(X, resident0, n_l, E, rule=None, *, sem="flip", spares=1, in_flight_c
         if in_flight_cap:
             land(b)
         for i, e_in, e_out, g in pass_swaps(counts, resident, pend_in, pend_out, n_l, rule, per_layer_cap, ties,
-                                            {k: v for k, v in flying.items() if v} if flying is not None else None):
+                                            {k: v for k, v in flying.items() if v} if flying is not None else None,
+                                            pinned):
             live = max(b + d, link.ready(b) if link is not None else b)
             pend_in[i, e_in] = True
             if sem == "hole":
@@ -737,6 +743,8 @@ FIXTURE_CONTRACT = {
              "limit let through (the generator refuses a cap_case with none)",
 }
 CAP_CASE = dict(cap=2, spares=2)
+PINNED_CONTRACT = "params.pinned: a layer's first pinned[l] seed ids are never victims; `pinned_moved` counts the " \
+                  "unpinned rule's flips that are not in `flips`"
 OPEN_CONTRACT = {
     "open": "the opening reshuffle over a whole prompt: `counts` are the prompt's undecayed per-layer counts (every "
             "row); the card set is the seed's first `capacity` ids; per layer candidates = non-resident ids by count "
@@ -770,12 +778,15 @@ def lcg_rows(g, rows, K, E, hot, paired):
     return out
 
 
-def make_fixture(passes, lcg_seed, n_expert=64, top=6, cap_n=16, d=8, spares=1, rule_name="mid"):
+def make_fixture(passes, lcg_seed, n_expert=64, top=6, cap_n=16, d=8, spares=1, rule_name="mid", pinned=0):
     """Three layers: layer 1 relabels layer 0 (+16: equal gains across layers), layer 2 routes ids in even-odd
     pairs (equal counts within a layer); passes of 1-3 rows, the first 1..rows kept. The rule at `spares`,
-    then `cap_case`: the same seed and trace at CAP_CASE's cap and spares."""
-    if d < 0 or spares < 1:
-        raise ToolError(f"--d {d} and --spares {spares}: d >= 0 and spares >= 1")
+    then `cap_case`: the same seed and trace at CAP_CASE's cap and spares. pinned > 0: every layer's first
+    `pinned` seed ids are never victims (params.pinned); the header counts `pinned_moved`, the flips of the
+    unpinned rule that are not the pinned rule's."""
+    if d < 0 or spares < 1 or not 0 <= pinned <= cap_n:
+        raise ToolError(f"--d {d}, --spares {spares} and --pinned {pinned}: d >= 0, spares >= 1, "
+                        f"0 <= pinned <= {cap_n}")
     E, K, g, L = n_expert, top, Lcg(lcg_seed), 3
     trace = [[] for _ in range(L)]
     kept = []
@@ -796,23 +807,31 @@ def make_fixture(passes, lcg_seed, n_expert=64, top=6, cap_n=16, d=8, spares=1, 
         pz.append((r0, len(X), kept[p]))
     X = np.asarray(X, dtype=np.int64)
     res0 = np.zeros((L, E), dtype=bool)
+    pin = np.zeros((L, E), dtype=bool)
     for l in range(L):
         res0[l, seed[l]] = True
+        pin[l, seed[l][:pinned]] = True
 
-    def case(rule, s):
+    def case(rule, s, p):
         flips = []
         ties = {"across_layers": 0, "in_id": 0, "out_id": 0, "blocked_in_flight": 0, "cap_bound": 0}
         replay(X, res0, [cap_n] * L, E, rule, sem="flip", spares=s, d=d, link=Budget(None), passes=pz,
                on_flip=lambda b, i, o, n, live: flips.append({"boundary": b, "layer": i, "out": o, "in": n,
                                                               "live_at": live}),
-               ties=ties)
+               ties=ties, pinned=pin if p else None)
         cap_bound = ties.pop("cap_bound")
         params = dict(rule.params(), spares=s, d=d, n_expert=E, top_k=K, capacity=[cap_n] * L)
+        if p:
+            params["pinned"] = [p] * L
         return {"header": dict(ties=ties, cap_bound=cap_bound), "params": params, "seed": seed, "trace": trace,
                 "kept": kept, "flips": flips}
-    fx = case(Rule(rule_name), spares)
+    fx = case(Rule(rule_name), spares, pinned)
+    if pinned:
+        free = case(Rule(rule_name), spares, 0)["flips"]
+        fx["header"] = dict(pinned=PINNED_CONTRACT, pinned_moved=sum(1 for f in free if f not in fx["flips"]),
+                            **fx["header"])
     fx["header"] = dict(FIXTURE_CONTRACT, **fx["header"])
-    fx["cap_case"] = case(Rule(rule_name, cap=CAP_CASE["cap"]), CAP_CASE["spares"])
+    fx["cap_case"] = case(Rule(rule_name, cap=CAP_CASE["cap"]), CAP_CASE["spares"], pinned)
     return fx
 
 
@@ -1054,8 +1073,11 @@ def cmd_fixture(a, out, argv):
     else:
         if a.passes < 1:
             raise ToolError(f"--passes {a.passes}: at least 1")
-        fx = make_fixture(a.passes, a.lcg, d=a.d, spares=a.spares)
+        fx = make_fixture(a.passes, a.lcg, d=a.d, spares=a.spares, pinned=a.pinned)
         ties = fx["header"]["ties"]
+        if a.pinned and fx["header"]["pinned_moved"] == 0:
+            raise ToolError(f"--pinned {a.pinned} moves no flip, so the file cannot tell pinning from none; "
+                            "change --pinned, --lcg or --passes")
         if a.passes >= 100 and 0 in (ties["across_layers"], ties["in_id"], ties["blocked_in_flight"]):
             raise ToolError(f"the fixture's flips hold no tie or no in-flight block to check ({ties}); change --lcg")
         if fx["cap_case"]["header"]["cap_bound"] == 0:
@@ -1115,6 +1137,7 @@ def parser():
     f.add_argument("--spares", type=int, default=1)
     f.add_argument("--spares-per-pass", action="store_true")
     f.add_argument("--open", action="store_true")
+    f.add_argument("--pinned", type=int, default=0)
     return p
 
 
@@ -1315,6 +1338,19 @@ def case_fixture():
     big = make_fixture(400, 1)
     assert min(big["header"]["ties"].values()) > 0, big["header"]["ties"]
     assert big["header"]["cap_bound"] == 0 < big["cap_case"]["header"]["cap_bound"], big["cap_case"]["header"]
+    # pinned: layer 0 seeded {0, 1}, 0 pinned; 2 hot, then 3: without the pin 0 (no use) leaves first,
+    # with it 1 does, and the second flip finds only 2 (just admitted) and 0 (pinned) -> 2 leaves for 3.
+    X = X_of([[(2,)]] * 4 + [[(3,)]] * 12)
+    res = np.array([[True, True, False, False]])
+    pin = np.array([[True, False, False, False]])
+    for p, want in ((None, [(4, 0, 0, 2, 12), (12, 0, 1, 3, 20)]), (pin, [(4, 0, 1, 2, 12), (12, 0, 2, 3, 20)])):
+        flips = []
+        replay(X, res, [2], 4, rule, d=8, link=Budget(None), pinned=p,
+               on_flip=lambda b, i, o, n, live: flips.append((b, i, o, n, live)))
+        assert flips == want, (p is not None, flips)
+    fp = make_fixture(400, 1, pinned=8)
+    assert fp["params"]["pinned"] == [8, 8, 8] and fp["header"]["pinned_moved"] > 0, fp["header"]
+    assert all(f["out"] not in fp["seed"][f["layer"]][:8] for f in fp["flips"] + fp["cap_case"]["flips"])
     fo = make_open_fixture(1)
     digest = hashlib.md5(fixture_text(fo, "tools/ref/router-residency.py fixture --open --out x").encode()).hexdigest()
     assert digest == OPEN_FIXTURE_MD5, digest

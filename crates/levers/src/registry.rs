@@ -36,11 +36,13 @@ pub const PREFILL_GROUP_MAX: u64 = 8;
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
 const SESSION: &str = "session";
+const ADAPTRES_R3: &str = "adaptres-r3";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
+const SWAP: &str = "crates/gpu/src/host/swap.rs";
 
 /// What an unset name that is no lever means.
 const OWNERS: Unset = Unset::Means("its owner's default");
@@ -533,6 +535,22 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             at: &[InPlace {
                 file: HYBRID,
                 round: V2FENCE,
+            }],
+        },
+    },
+    LeverSpec {
+        name: "BLOOMERY_RESIDENCY",
+        class: Class::C,
+        kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1"]),
+        default: Unset::Is("off"),
+        doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
+              model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
+              stage card's routed stacks, the first P seed experts of each layer never a victim \
+              and S slots a layer freed for flips in flight.",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: SWAP,
+                round: ADAPTRES_R3,
             }],
         },
     },

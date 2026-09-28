@@ -13,7 +13,9 @@
 //! flip goes live, `delay` passes after the boundary that made it, and both
 //! change at that boundary; a layer never has more flips in flight than it has
 //! spares. [`SwapRule::open`] is the other way a map moves: an in-place
-//! relayout at a quiet boundary from a whole prompt's counts.
+//! relayout at a quiet boundary from a whole prompt's counts. A layer's first
+//! pinned seed experts ([`SwapRule::new_pinned`]) stay on the card through
+//! both: they are never a victim.
 //!
 //! One pass is driven as `observe`* → [`SwapRule::end_pass`] →
 //! [`SwapRule::plan`] at the boundary it ends at; anything else is refused by
@@ -99,6 +101,12 @@ pub enum SwapRuleError {
     SeedUnderCapacity {
         layer: usize,
         seed: usize,
+        capacity: usize,
+    },
+    /// A layer pinning more of its seed list than its card slots.
+    PinnedOverCapacity {
+        layer: usize,
+        pinned: usize,
         capacity: usize,
     },
     /// A layer's seed list naming an expert twice.
@@ -189,6 +197,14 @@ impl fmt::Display for SwapRuleError {
                 "layer {layer}'s seed list names {seed} experts, fewer than its {capacity} card \
                  slots: the rule never fills an empty slot"
             ),
+            SwapRuleError::PinnedOverCapacity {
+                layer,
+                pinned,
+                capacity,
+            } => write!(
+                f,
+                "layer {layer} pins {pinned} seed experts, more than its {capacity} card slots"
+            ),
             SwapRuleError::SeedDuplicate { layer, id } => {
                 write!(f, "layer {layer}'s seed list names expert {id} twice")
             }
@@ -252,6 +268,8 @@ impl std::error::Error for SwapRuleError {}
 enum Slot {
     Off,
     Live,
+    /// Live from the seed on and never a victim.
+    Pinned,
     /// Admitted by a flip in flight: not on the card yet.
     Filling,
     /// The victim of a flip in flight: still on the card.
@@ -284,6 +302,9 @@ pub struct SwapRule {
     rank: Vec<u32>,
     /// Each layer's card slots: the first this many of its seed list.
     capacity: Vec<usize>,
+    /// Each layer's pinned experts: the first this many of its seed list,
+    /// never a victim.
+    pinned: Vec<usize>,
     /// `layer * experts + id`.
     slot: Vec<Slot>,
     counts: Vec<f64>,
@@ -311,6 +332,7 @@ impl PartialEq for SwapRule {
             && self.layers == o.layers
             && self.rank == o.rank
             && self.capacity == o.capacity
+            && self.pinned == o.pinned
             && self.slot == o.slot
             && self.counts == o.counts
             && self.in_flight == o.in_flight
@@ -406,6 +428,20 @@ impl SwapRule {
         seed: &[&[u32]],
         capacity: &[usize],
     ) -> Result<Self, SwapRuleError> {
+        SwapRule::new_pinned(params, shape, seed, capacity, &vec![0; capacity.len()])
+    }
+
+    /// [`SwapRule::new`] with layer `l`'s first `pinned[l]` seed experts
+    /// pinned: on the card from the seed on, never a victim of a planning pass
+    /// or of an opening relayout. A pinned count past the layer's capacity, or
+    /// a list of another length, is refused by name.
+    pub fn new_pinned(
+        params: SwapParams,
+        shape: Shape,
+        seed: &[&[u32]],
+        capacity: &[usize],
+        pinned: &[usize],
+    ) -> Result<Self, SwapRuleError> {
         check_params(&params)?;
         let shape_err = |what, value| Err(SwapRuleError::Shape { what, value });
         if shape.experts == 0 || u32::try_from(shape.experts).is_err() {
@@ -427,6 +463,18 @@ impl SwapRule {
                 capacity.len(),
             );
         }
+        if pinned.len() != layers {
+            return shape_err("pinned must list one entry per seed layer", pinned.len());
+        }
+        for (layer, (&p, &cap)) in pinned.iter().zip(capacity).enumerate() {
+            if p > cap {
+                return Err(SwapRuleError::PinnedOverCapacity {
+                    layer,
+                    pinned: p,
+                    capacity: cap,
+                });
+            }
+        }
         let e = shape.experts;
         let mut slot = vec![Slot::Off; layers * e];
         let mut rank = vec![UNRANKED; layers * e];
@@ -445,7 +493,9 @@ impl SwapRule {
                 }
                 rank[i] = u32::try_from(r)
                     .expect("a list naming no expert twice is at most experts <= u32::MAX long");
-                if r < cap {
+                if r < pinned[layer] {
+                    slot[i] = Slot::Pinned;
+                } else if r < cap {
                     slot[i] = Slot::Live;
                 }
             }
@@ -457,6 +507,7 @@ impl SwapRule {
             layers,
             rank,
             capacity: capacity.to_vec(),
+            pinned: pinned.to_vec(),
             slot,
             counts: vec![0.0; layers * e],
             in_flight: vec![0; layers],
@@ -522,7 +573,10 @@ impl SwapRule {
     pub fn is_live(&self, layer: usize, id: u32) -> Result<bool, SwapRuleError> {
         self.check_layer(layer)?;
         let i = Self::index_of(layer, id, self.shape.experts)?;
-        Ok(matches!(self.slot[i], Slot::Live | Slot::Leaving))
+        Ok(matches!(
+            self.slot[i],
+            Slot::Live | Slot::Pinned | Slot::Leaving
+        ))
     }
 
     /// Layer `layer`'s card set, ascending ids.
@@ -532,7 +586,7 @@ impl SwapRule {
         Ok(self.slot[layer * e..(layer + 1) * e]
             .iter()
             .zip(0u32..)
-            .filter(|(s, _)| matches!(s, Slot::Live | Slot::Leaving))
+            .filter(|(s, _)| matches!(s, Slot::Live | Slot::Pinned | Slot::Leaving))
             .map(|(_, id)| id))
     }
 
@@ -689,7 +743,7 @@ impl SwapRule {
                 match s {
                     Slot::Off => keep_best(&mut self.cand, q, (c, id), cand_before),
                     Slot::Live => keep_best(&mut self.vict, q, (c, id), vict_before),
-                    Slot::Filling | Slot::Leaving => {}
+                    Slot::Pinned | Slot::Filling | Slot::Leaving => {}
                 }
             }
             for (rank, (&(c, admit), &(v, evict))) in self.cand.iter().zip(&self.vict).enumerate() {
@@ -767,7 +821,7 @@ impl SwapRule {
                 match s {
                     Slot::Off => cand.push((c, r, id)),
                     Slot::Live => vict.push((c, r, id)),
-                    Slot::Filling | Slot::Leaving => {}
+                    Slot::Pinned | Slot::Filling | Slot::Leaving => {}
                 }
             }
             cand.sort_unstable_by_key(|&(c, r, id)| (Reverse(c), r, id));
@@ -809,9 +863,12 @@ impl SwapRule {
         let e = self.shape.experts;
         self.slot.fill(Slot::Off);
         for layer in 0..self.layers {
-            let cap = self.capacity[layer];
+            let (cap, pin) = (self.capacity[layer], self.pinned[layer]);
             for i in layer * e..(layer + 1) * e {
-                if (self.rank[i] as usize) < cap {
+                let r = self.rank[i] as usize;
+                if r < pin {
+                    self.slot[i] = Slot::Pinned;
+                } else if r < cap {
                     self.slot[i] = Slot::Live;
                 }
             }
@@ -1188,6 +1245,50 @@ mod tests {
         assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [1, 3, 5, 6]);
     }
 
+    /// Pinned seed experts are never a victim: an opening relayout that would
+    /// swap out every resident leaves the pinned one, and a reset brings the
+    /// pinned rule back to its own fresh state, not the unpinned one's.
+    #[test]
+    fn a_pinned_expert_is_never_a_victim() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3]];
+        let shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 1,
+        };
+        let pinned =
+            |p: usize| SwapRule::new_pinned(SwapParams::mid(0), shape, &seed, &[3], &[p]).unwrap();
+        let counts = [0, 0, 0, 0, 9, 9, 9, 9];
+        let mut r = pinned(1);
+        assert_eq!(
+            r.open(&counts, usize::MAX).unwrap(),
+            [flip(0, 4, 2, 0), flip(0, 5, 1, 0)]
+        );
+        assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 4, 5]);
+        r.reset();
+        assert_eq!(r, pinned(1));
+        assert_ne!(r, pinned(0));
+
+        let mut r = pinned(2);
+        let (_, flips) = replay(&mut r, &repeat(6, 8));
+        assert_eq!(flips, [flip(0, 6, 2, 4)], "the unpinned resident 2 leaves");
+        let mut r = pinned(3);
+        let (_, flips) = replay(&mut r, &repeat(6, 8));
+        assert_eq!(flips, [], "every resident pinned: no victim");
+        assert_eq!(
+            SwapRule::new_pinned(SwapParams::mid(0), shape, &seed, &[3], &[4]).unwrap_err(),
+            SwapRuleError::PinnedOverCapacity {
+                layer: 0,
+                pinned: 4,
+                capacity: 3
+            }
+        );
+        assert!(matches!(
+            SwapRule::new_pinned(SwapParams::mid(0), shape, &seed, &[3], &[1, 1]).unwrap_err(),
+            SwapRuleError::Shape { .. }
+        ));
+    }
+
     #[test]
     fn undefined_input_is_refused_by_name() {
         use SwapRuleError as E;
@@ -1477,6 +1578,10 @@ mod tests {
             parse(include_bytes!("../tests/data/swaprule-fixture.json"))
         }
 
+        fn pinned_fixture() -> Json {
+            parse(include_bytes!("../tests/data/swaprule-pinned-fixture.json"))
+        }
+
         fn open_fixture() -> Json {
             parse(include_bytes!("../tests/data/swaprule-open-fixture.json"))
         }
@@ -1523,7 +1628,11 @@ mod tests {
             let seed = seed_of(f);
             let seed_refs: Vec<&[u32]> = seed.iter().map(Vec::as_slice).collect();
             let capacity = usizes(p.get("capacity"));
-            let mut r = SwapRule::new(params, shape, &seed_refs, &capacity).unwrap();
+            let pinned = p
+                .find("pinned")
+                .map_or_else(|| vec![0; capacity.len()], usizes);
+            let mut r =
+                SwapRule::new_pinned(params, shape, &seed_refs, &capacity, &pinned).unwrap();
             let mut got = Vec::new();
             for (pass, &k) in kept.iter().enumerate() {
                 for (layer, l) in trace.iter().enumerate() {
@@ -1580,6 +1689,20 @@ mod tests {
             );
             assert_eq!(case.get("params").get("spares").int(), 2);
             plan_case(case);
+        }
+
+        /// The pinned fixture: the plan fixture's seed and trace with every
+        /// layer's first 8 seed experts pinned, in both its cases; the file
+        /// moves flips against the unpinned rule (its header's `pinned_moved`).
+        #[test]
+        fn the_pinned_replay() {
+            let f = pinned_fixture();
+            assert!(
+                f.get("header").get("pinned_moved").int() > 0,
+                "pinning moves some flip"
+            );
+            plan_case(&f);
+            plan_case(f.get("cap_case"));
         }
 
         /// The open fixture: a prompt's whole counts, ties to the seed rank; the
