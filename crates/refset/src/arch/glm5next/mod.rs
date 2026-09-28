@@ -1,7 +1,10 @@
 //! The GLM-5.3-Flash families. The node dumps are dumped from unsloth's
 //! UD-Q4_K_XL split set, [`MODEL`], by the ik tree [`IK_BUILD`]
-//! (`tools/ref/models/glm5next.sh`); the MTP draft set from the same file by
-//! the ik tree that carries the MTP graph, [`MTP_BUILD`].
+//! (`tools/ref/models/glm5next.sh`): the batch set and the decode-step sets
+//! within the positions a latent layer attends whole ([`IK`]), and the DSA
+//! sets past them, dumped with ik's k-pool indexer on ([`IK_DSA`]); the MTP
+//! draft set from the same file by the ik tree that carries the MTP graph,
+//! [`MTP_BUILD`].
 
 use crate::family::{Build, Family, Identity};
 

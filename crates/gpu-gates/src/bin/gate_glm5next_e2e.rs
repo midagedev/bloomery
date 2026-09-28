@@ -98,6 +98,15 @@
 //!   the copy back runs in its first take) then a tail of 64 ids each give
 //!   the logits plain steps of the same ids from a reset give, bit for bit;
 //!   and a prompt call's takes leave those logits as they are.
+//! - (pb-long) the prompt batch past the positions the latent layers attend
+//!   whole, on the same load: [`LONG`] lcg ids as plain steps from a reset,
+//!   then as two batch calls from a reset, the first of [`LONG_CUT`] ids so
+//!   that the second starts inside a pool, the prompt itself ending inside
+//!   one; every store, the latent layers' pool planes included, the last
+//!   logits and the argmax bit for bit the steps' after the prompt, then
+//!   [`GREEDY`] greedy steps from there each giving the steps' token and
+//!   logits bit for bit, and every store bit for bit again after them (a
+//!   greedy step completes the prompt's last pool).
 //!
 //! The prompt batch, on a second load at [`CTX_PP`] positions — every
 //! position the latent layers attend whole — in its own session fed in
@@ -107,7 +116,8 @@
 //!   store digested and the logits and argmax kept after each of [`PP`]
 //!   positions; then for each, a batch call of that many ids from a reset:
 //!   every KDA layer's state and conv ring, every latent layer's latent and
-//!   index rows, the last logits and the argmax bit for bit the steps', and
+//!   index rows and pool plane, the last logits and the argmax bit for bit
+//!   the steps', and
 //!   the checkpoints at the multiples of 512 inside the call and its end —
 //!   the steps feed's marks, as (k) holds them.
 //! - (pr) a call one position past the stores is refused by name before any
@@ -119,7 +129,9 @@
 //!   it after its first batch, no checkpoint taken of the faulted state; the
 //!   weight put back, a reset and the call give (pb)'s argmax.
 //!
-//! `--only main` runs the clauses above alone, `--only pp` these alone.
+//! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
+//! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
+//! at [`CTX`].
 //!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
@@ -190,6 +202,23 @@ mod gate {
     /// one past it; a batch whole and one past it; a mark with a short tail
     /// after it; every position the stores hold.
     const PP: [usize; 8] = [1, 7, 8, 9, 512, 513, 1030, CTX_PP];
+
+    /// (pb-long)'s prompt: past [`CTX_PP`] by more than a batch's chunk, and
+    /// not a whole number of pools of four, so it ends inside one.
+    const LONG: usize = 2222;
+    /// (pb-long)'s first call: not a whole number of pools either, so the
+    /// second call's first positions complete a pool the first began.
+    const LONG_CUT: usize = 1030;
+    /// (pb-long)'s greedy steps after the prompt: the second completes the
+    /// prompt's last pool.
+    const GREEDY: usize = 4;
+    const _: () = assert!(
+        LONG > CTX_PP + 8
+            && LONG + GREEDY <= CTX
+            && !LONG.is_multiple_of(4)
+            && !LONG_CUT.is_multiple_of(4)
+            && (LONG / 4 + 1) * 4 <= LONG + GREEDY
+    );
 
     /// The file's shape, as the header states it (glmops-design §1): what
     /// the derivations below are written against.
@@ -1543,27 +1572,45 @@ mod gate {
         Ok(ok)
     }
 
-    /// Which clauses a run takes: `--only main`, `--only pp`, or both.
-    fn only() -> Result<(bool, bool), GateError> {
+    /// Which clauses a run takes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Only {
+        /// Every clause, on both loads.
+        All,
+        /// The load at [`CTX`], (pb-long) included.
+        Main,
+        /// The prompt batch's load at [`CTX_PP`].
+        Pp,
+        /// (pb-long) alone, on a load at [`CTX`].
+        PpLong,
+    }
+
+    /// `--only main`, `--only pp`, `--only pplong`, or every clause.
+    fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
-            None => Ok((true, true)),
+            None => Ok(Only::All),
             Some(i) => match args.get(i + 1).map(String::as_str) {
-                Some("main") => Ok((true, false)),
-                Some("pp") => Ok((false, true)),
-                other => Err(format!("--only is main or pp, not {other:?}").into()),
+                Some("main") => Ok(Only::Main),
+                Some("pp") => Ok(Only::Pp),
+                Some("pplong") => Ok(Only::PpLong),
+                other => Err(format!("--only is main, pp or pplong, not {other:?}").into()),
             },
         }
     }
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
-        let (main, pp) = only()?;
+        let only = only()?;
         let mut ok = true;
-        if main {
+        if matches!(only, Only::All | Only::Main) {
             ok &= main_clauses(&levers)?;
         }
-        if pp {
+        if only == Only::PpLong {
+            let (mut s, _) = open(&levers, CTX, PrefillMode::Steps)?;
+            ok &= prompt_long(s.model_mut())?;
+        }
+        if matches!(only, Only::All | Only::Pp) {
             ok &= prompt_batch(&levers)?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
@@ -1605,6 +1652,7 @@ mod gate {
         }
         println!("step sets: {ties} named tie(s)");
         ok &= keep(&mut s)?;
+        ok &= prompt_long(s.model_mut())?;
         Ok(ok)
     }
 
@@ -1662,6 +1710,106 @@ mod gate {
             .collect();
         v.push(p as u32);
         v
+    }
+
+    /// What a feed leaves: every store and the last logits and argmax after
+    /// the prompt, each greedy step's token and logits, every store after
+    /// them.
+    #[derive(PartialEq, Eq)]
+    struct Long {
+        prompt: Vec<StoreDigest>,
+        logits: u64,
+        argmax: u32,
+        greedy: Vec<(u32, u64)>,
+        after: Vec<StoreDigest>,
+    }
+
+    /// What a feed that ended at `argmax` leaves: every store, the last
+    /// logits, then [`GREEDY`] greedy steps from `argmax`, each its token and
+    /// its logits' digest, then every store again.
+    fn after_prompt(m: &mut Glm5nextModel, argmax: u32) -> Result<Long, GateError> {
+        let prompt = store_digests(m)?;
+        let logits = fnv_row(&m.logits()?);
+        let mut tok = argmax;
+        let mut greedy = Vec::with_capacity(GREEDY);
+        for _ in 0..GREEDY {
+            tok = m.step(&[tok])?;
+            greedy.push((tok, fnv_row(&m.logits()?)));
+        }
+        Ok(Long {
+            prompt,
+            logits,
+            argmax,
+            greedy,
+            after: store_digests(m)?,
+        })
+    }
+
+    /// (pb-long) on `m`, a load at [`CTX`]; the model left reset. The taps
+    /// disarmed (a batch refuses them) and graph steps, whatever the clauses
+    /// before it left.
+    fn prompt_long(m: &mut Glm5nextModel) -> Result<bool, GateError> {
+        let ids = lcg_ids(LONG);
+        set_taps(m, false)?;
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let t = Instant::now();
+        let mut argmax = 0;
+        for &id in &ids {
+            argmax = m.step(&[id])?;
+        }
+        let steps_s = t.elapsed().as_secs_f64();
+        let want = after_prompt(m, argmax)?;
+        m.reset()?;
+        let t = Instant::now();
+        let fed = prefill(m, &ids[..LONG_CUT]).and_then(|_| prefill(m, &ids[LONG_CUT..]));
+        let batch_s = t.elapsed().as_secs_f64();
+        let argmax = match fed {
+            Ok(tok) => tok,
+            Err(e) => {
+                println!(
+                    "prompt batch long: {LONG} ids as {LONG_CUT} + {}: error \"{e}\" {}",
+                    LONG - LONG_CUT,
+                    verdict(false)
+                );
+                m.reset()?;
+                return Ok(false);
+            }
+        };
+        let pos = m.pos() as usize;
+        let points = m.body("prompt batch long")?.checkpoints().positions();
+        let got = after_prompt(m, argmax)?;
+        m.reset()?;
+        let pass = got == want && pos == LONG;
+        let tokens = |l: &Long| l.greedy.iter().map(|g| g.0).collect::<Vec<_>>();
+        println!(
+            "prompt batch long: {LONG} ids as {LONG_CUT} + {} in {batch_s:.2} s against {LONG} steps \
+             in {steps_s:.1} s (runtime values), pos {pos}, checkpoints {points:?}: stores after the \
+             prompt {} ({} stores), logits {} argmax {} (steps {}); {GREEDY} greedy steps: tokens {:?} \
+             (steps {:?}), logits {}; stores after them {} {}",
+            LONG - LONG_CUT,
+            first_store_diff(&got.prompt, &want.prompt)
+                .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+            want.prompt.len(),
+            if got.logits == want.logits {
+                "bit for bit"
+            } else {
+                "differ"
+            },
+            got.argmax,
+            want.argmax,
+            tokens(&got),
+            tokens(&want),
+            if got.greedy == want.greedy {
+                "bit for bit"
+            } else {
+                "differ"
+            },
+            first_store_diff(&got.after, &want.after)
+                .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// (pb), (pr), (pf) on a load at [`CTX_PP`] whose session feeds in batches.

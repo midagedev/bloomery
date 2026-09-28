@@ -11,9 +11,10 @@
 //! 5. the index key's biased LayerNorm and the gate beside it, one f16 row
 //!    at the position (`index_key_ln_append`);
 //!
-//! then the k-pool selector forks onto the body's branch stream
-//! ([`select`]) —
-//! 6. the key of the pool the token completes (`index_pool`);
+//! then the k-pool selector forks onto the body's branch stream —
+//! 6. the key of the pool the token completes ([`pool`], `index_pool`);
+//!
+//! and [`select`]:
 //! 7. `indexer.proj`: the head weights, an f32 gemv of the normed input;
 //! 8. `indexer.attn_q_b`: the indexer query, a q8_0 gemv of the q_a norm;
 //! 9. the scores of the pools the token sees (`kpool_score`);
@@ -56,6 +57,41 @@ use crate::tensors::{MixerNames, SelNames, other_kind};
 /// The launches [`mla`] makes.
 pub(crate) const LAUNCHES: usize = 16;
 
+/// The pools `m` tokens complete, on `stream` (module doc, 6): each token of
+/// live count `c` (its `cnt` word, its position plus one) writes the key of
+/// pool `c/4 − 1` into `pooled` when `c` is a multiple of four, from rows it
+/// and the three before it appended to `index`. Those rows must be appended
+/// before it on a stream it is ordered after. A pool whose first rows an
+/// earlier call appended is completed by the token that ends it, in whichever
+/// call that token runs, so a call that ends mid-pool leaves it to the next.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch's stream, kernels, weights and names, and the counts, rows and plane it reads and writes (rust-quality R8)"
+)]
+pub(crate) fn pool(
+    stream: &CudaStream,
+    w: &Weights,
+    k: &Kernels,
+    n: &SelNames,
+    index: &DeviceTensor<u16>,
+    cnt: &DeviceBuffer<u32>,
+    m: usize,
+    fault: FaultSink,
+    pooled: &mut DeviceTensor<u16>,
+) -> Result<(), GpuError> {
+    k.latent.enqueue_index_pool(
+        stream,
+        IndexPoolArgs {
+            cache: index,
+            ape: f32v(w, &n.ape)?,
+            n_keys: cnt,
+            m,
+            fault,
+            pooled,
+        },
+    )
+}
+
 /// What [`select`] reads and writes for `m` tokens of one latent layer: the
 /// stream it launches on, the tokens' normed input (`[m][embd]`) and q_a
 /// norm (`[m][q_lora]`), their live counts, the layer's index cache and pool
@@ -69,7 +105,7 @@ pub(crate) struct Select<'a> {
     pub qr: &'a DeviceBuffer<f32>,
     pub cnt: &'a DeviceBuffer<u32>,
     pub index: &'a DeviceTensor<u16>,
-    pub pooled: &'a mut DeviceTensor<u16>,
+    pub pooled: &'a DeviceTensor<u16>,
     pub qi: &'a mut DeviceBuffer<f32>,
     pub wi: &'a mut DeviceBuffer<f32>,
     pub scores: &'a mut DeviceBuffer<f32>,
@@ -81,10 +117,11 @@ pub(crate) struct Select<'a> {
 }
 
 /// The k-pool selector of one latent layer for `m` tokens, on `a.stream`:
-/// the pools the tokens complete, the head weights, the indexer query, the
-/// scores and the lists, five launches (module doc, 6–10). The tokens' index
-/// rows must be appended before it on a stream it is ordered after; a batch
-/// of prompt rows calls it with its `m` columns, the step with one.
+/// the head weights, the indexer query, the scores and the lists, four
+/// launches (module doc, 7–10). Every pool the tokens see must be written
+/// before it ([`pool`]) on a stream it is ordered after. The gemvs take at
+/// most [`bloomery_gpu::COL_GROUP`] tokens: the step calls it with one, a
+/// prompt batch with each chunk's.
 pub(crate) fn select(
     gpu: &Gpu,
     w: &Weights,
@@ -93,17 +130,6 @@ pub(crate) fn select(
     a: Select<'_>,
 ) -> Result<(), GpuError> {
     let ctx = a.index.rows();
-    k.latent.enqueue_index_pool(
-        a.stream,
-        IndexPoolArgs {
-            cache: a.index,
-            ape: f32v(w, &n.ape)?,
-            n_keys: a.cnt,
-            m: a.m,
-            fault: a.fault,
-            pooled: a.pooled,
-        },
-    )?;
     gpu.q8f32()
         .enqueue_f32_gemv(a.stream, f32t(w, &n.proj)?, a.xn, a.m, a.wi)?;
     let (qs, dd) = q8(w, &n.q_b)?;
@@ -215,6 +241,17 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         },
     )?;
     let fork = p.k.branch.fork(stream)?;
+    pool(
+        fork.stream(),
+        w,
+        p.k,
+        &n.sel,
+        index,
+        &s.cnt,
+        1,
+        fault,
+        pooled,
+    )?;
     select(
         gpu,
         w,

@@ -503,8 +503,8 @@ pub struct Body {
     /// Positions every store holds.
     ctx: usize,
     /// The most positions a latent layer attends whole
-    /// (`place::dense_positions`): the batch feed runs only a load whose
-    /// stores hold no more.
+    /// (`place::dense_positions`): a prompt chunk within them attends every
+    /// position, one past them through the selector.
     dense: usize,
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
