@@ -537,6 +537,11 @@ trace-router CORPUS *ARGS:
 trace-router-glm5next CORPUS *ARGS:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# Qwen3.8-Flash-Next의 라우터 추적: trace-router와 같고, 코퍼스는 $BLOOMERY_DATA/qwen4exp/corpus-<이름>.ids(Qwen3.8 토크나이저),
+# 세트 이름은 qwen4exp-<이름>이다.
+trace-router-qwen4exp CORPUS *ARGS:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
+
 # 라우터 세트들을 합쳐 층마다 뜨거운 expert를 순위대로 적은 목록(B12)을 $BLOOMERY_DATA/router/<OUT>에 쓴다. 적재는
 # BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(all = 세트의 expert 수, 전체 순위).
 # GLM: just hotlist all glm5next-hotlist.txt glm5next-prose

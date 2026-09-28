@@ -1,0 +1,30 @@
+# q38streamd (paper): R4's count >= m* rule streams, per ubatch and layer, the host experts whose own count in the
+# ubatch clears m* = copy / c: 3,072,000 B / 21.19 GB/s = 145.0 us over the tiled union's 5.15 us a column = 28.2
+# (22.7 at 26.28 GB/s from a pinned copy) [derived; rig-log 09-28#q38-union, #q38-dram-share]. Under q38pfd's lcg
+# assumption (each token's 10 picks uniform over 512: counts Poisson(10) at U = 512) the set is empty, P(m >= 23..28)
+# <= 3e-4, and R4 moves pp512 by 0 %. Real routing is skewed: the 512-window tables ideaverify measured on V4.1 and
+# GLM, fitted with a lognormal popularity (s 1.2 GLM-like, 2.0 V4.1-like), put 40..72 % of the slots on the 7..11 %
+# of experts that clear it, and R4's pp512 effect on plan (b)'s primary row (43 layers, f 0.90) at +12..+58 % [derived, q38streamd model]. No Qwen3.8
+# router trace exists, so the pp512 half of R4's verdict hangs on this one share.
+kind: calibration
+question: what share of a 512-token ubatch's routed slots, per layer of Qwen3.8, falls on experts whose count in that
+  ubatch is at least 28 (m* at 21.19 GB/s, tiled union)?
+term: slot share of experts with count >= 28 in 512-token windows, mean over the 48 layers and the windows,
+  Qwen3.8-Flash-Next UD-Q4_K_XL router set of a prose corpus in Qwen3.8's tokens, ik CPU prefill, box; the same
+  share at >= 23 printed beside it
+unit: %
+predict: 40..72
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38route-mstar.card' just trace-router-qwen4exp prose
+  --chunk 2048 --max-tokens 8192 (tools/ref/router-trace.sh under the CPU lease with its witness blocks, the profile
+  tools/ref/models/qwen4exp.sh, corpus $BLOOMERY_DATA/qwen4exp/corpus-prose.ids: 4 contexts, 16 windows of 512); the
+  set carries the # complete trailer with 48 layers; no other lease holder; the share computed per 512 window from the sets by
+  router-residency.py or a reader of the same sets, with the windows' count distribution printed beside it
+reason: sets the stream share behind R4's pp512 prediction under plan (b) and the count distribution every Qwen3.8
+  residency and streaming rule reads (ideaverify's Qwen3.8 checks and strataread's hot-301 coverage read the same
+  sets); why now: between uniform routing (0 %) and the V4.1/GLM shapes it moves R4's pp512 effect from 0 to +58 %
+decide-in: keep a prose pp512 arm in R4's timed A/B beside pp4096, with the prediction re-derived from the measured
+  share
+decide-below: the count rule is near-inert at U = 512: carry R4 at pp4096 only and price the balance rule (stream the
+  most-used host experts while the link is idle) for pp512 before any round
+decide-above: routing is burstier than V4.1's: the ring's capacity binds before the link; re-derive k per layer with
+  the ring size before R4's card is written
