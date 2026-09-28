@@ -133,9 +133,12 @@
 //!   prefill flash and the selection is the rule's (2,051 and 949, from
 //!   KEPT and POOL — a record, checked against the gate's own derivation);
 //!   the step after the ubatch as (t) holds a step set. A slot map with a
-//!   routed expert on the card is refused by name before anything moves,
-//!   the position kept and the model not poisoned; `auto` is the pass below
-//!   `Prompt38::GEMM_FROM` positions and the ubatch from it.
+//!   routed expert on the card (planted, `Body38::plant_slot_map`) is
+//!   refused by name — the walk, the layer and the count — by each of the
+//!   four walks (a graph step, an eager pass, a ubatch, a graph verify)
+//!   before anything moves, the position kept and the model not poisoned,
+//!   and the same call with the plant taken back runs; `auto` is the pass
+//!   below `Prompt38::GEMM_FROM` positions and the ubatch from it.
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
@@ -2055,47 +2058,102 @@ mod gate {
     const _: () =
         assert!(!SPLIT.is_multiple_of(POOL) && !(SPLIT - POOL * (KEPT + 1) + 1).is_multiple_of(8));
 
-    /// (g) the refusals: a slot map with a routed expert on the card
-    /// (planted for the next ubatch call) refused by name before anything
-    /// moves, the position kept and the model not poisoned, the plant
-    /// consumed; `auto` the passes below [`Prompt38::GEMM_FROM`] positions
-    /// and the ubatches from it.
-    fn gemm_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
-        fresh(m)?;
-        let mut rows = vec![HOST; N_LAYER * N_EXPERT];
-        rows[7 * N_EXPERT + 3] = 0;
-        let map = SlotMap::from_rows(0..N_LAYER, N_EXPERT, rows)?;
-        m.body_parts("gemm_refusals")?.2.plant_slot_map(map);
-        let before = m.pos();
-        let got = m.prompt38(toks, Prompt38::Gemm);
-        let named =
-            matches!(&got, Err(e) if e.to_string().contains("the ubatch walk has no card leg yet"));
-        let kept = m.pos() == before && m.poisoned().is_none();
-        let again = m.prompt38(toks, Prompt38::Gemm).is_ok();
-        let mut ok = named && kept && again;
-        println!(
-            "gemm refusal: a slot map with expert 3 of layer 7 on the card -> {}; position {} \
-             (kept: {kept}); the next ubatch call runs (the plant consumed): {again} {}",
-            match &got {
-                Ok(t) => format!("accepted, next {t}"),
-                Err(e) => e.to_string(),
-            },
-            m.pos(),
-            verdict(named && kept && again)
-        );
+    /// The walks (g)'s card-map refusal plants its map on, each from
+    /// position [`PREFIX`].
+    #[derive(Clone, Copy)]
+    enum Walk {
+        Step,
+        Pass,
+        Gemm,
+        Verify,
+    }
+
+    impl Walk {
+        /// The walk as its refusal names it.
+        fn name(self) -> &'static str {
+            match self {
+                Walk::Step => "step",
+                Walk::Pass => "pass",
+                Walk::Gemm => "ubatch",
+                Walk::Verify => "verify",
+            }
+        }
+
+        /// The call at [`PREFIX`]: a graph step, an eager pass of three
+        /// rows, a ubatch of the rest of `toks`, a graph verify of two rows;
+        /// its last row's token.
+        fn run(self, m: &mut Qwen38Model, toks: &[u32], rows: [u32; 2]) -> Result<u32, GpuError> {
+            match self {
+                Walk::Step => m.step(&toks[PREFIX..PREFIX + 1]),
+                Walk::Pass => m.prompt38(&toks[PREFIX..PREFIX + 3], Prompt38::Pass),
+                Walk::Gemm => m.prompt38(&toks[PREFIX..], Prompt38::Gemm),
+                Walk::Verify => m.step_rows::<2>(rows).map(|t| t[1]),
+            }
+        }
+    }
+
+    /// (g) the card-map refusals: with a slot map planted that holds expert
+    /// 3 of layer 7 on the card (`Body38::plant_slot_map`), each walk's call
+    /// after the prefix is refused by name — the walk, the layer and the
+    /// count — before anything moves, the position kept and the model not
+    /// poisoned; with the plant taken back the same call runs. The plant is
+    /// taken back before anything else can fail, so no line leaves it armed.
+    fn card_map_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        let mode = m.mode();
+        let (rows, _) = verify_rows(toks)?;
+        let rows = [rows[0], rows[1]];
+        let mut entries = vec![HOST; N_LAYER * N_EXPERT];
+        entries[7 * N_EXPERT + 3] = 0;
+        let map = SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?;
+        let mut ok = true;
+        for w in [Walk::Step, Walk::Pass, Walk::Gemm, Walk::Verify] {
+            Prefix::Steps(&toks[..PREFIX]).feed(m)?;
+            let before = m.pos();
+            m.body_parts("card_map_refusals")?
+                .2
+                .plant_slot_map(Some(map.clone()));
+            let got = w.run(m, toks, rows);
+            m.body_parts("card_map_refusals")?.2.plant_slot_map(None);
+            let want = format!(
+                "the {} walk has no card leg yet: layer 7 holds 1 routed experts on the card",
+                w.name()
+            );
+            let named = matches!(&got, Err(e) if e.to_string().contains(&want));
+            let pos = m.pos();
+            let kept = pos == before && m.poisoned().is_none();
+            let again = w.run(m, toks, rows);
+            let line_ok = named && kept && again.is_ok();
+            ok &= line_ok;
+            println!(
+                "card-map refusal, {}: a slot map with expert 3 of layer 7 on the card at \
+                 position {before} -> {}; position {pos} (kept, not poisoned: {kept}); the same \
+                 call with the plant taken back: {} {}",
+                w.name(),
+                text(&got),
+                text(&again),
+                verdict(line_ok)
+            );
+        }
+        m.reset()?;
+        m.set_mode(mode);
+        Ok(ok)
+    }
+
+    /// (g) `auto`: the pass below [`Prompt38::GEMM_FROM`] positions and the
+    /// ubatch from it.
+    fn gemm_auto() -> bool {
         let at = Prompt38::GEMM_FROM;
-        let auto_ok = Prompt38::Auto.resolve(at - 1) == Prompt38::Pass
+        let ok = Prompt38::Auto.resolve(at - 1) == Prompt38::Pass
             && Prompt38::Auto.resolve(at) == Prompt38::Gemm
             && Prompt38::Gemm.resolve(1) == Prompt38::Gemm;
-        ok &= auto_ok;
         println!(
             "gemm auto: {} positions -> {}, {at} -> {} {}",
             at - 1,
             Prompt38::Auto.resolve(at - 1).name(),
             Prompt38::Auto.resolve(at).name(),
-            verdict(auto_ok)
+            verdict(ok)
         );
-        Ok(ok)
+        ok
     }
 
     // ---------------------------------------------------- (r) refusals
@@ -2209,7 +2267,8 @@ mod gate {
         ok &= pass_selects(&mut m, &d3k)?;
         drop(d3k);
         ok &= gemm_d3k(&mut m, &mut ties)?;
-        ok &= gemm_refusals(&mut m, &toks)?;
+        ok &= card_map_refusals(&mut m, &toks)?;
+        ok &= gemm_auto();
         println!("step sets and the ubatch's D3K step: {ties} named tie(s)");
         ok &= verify_clause(&mut m, &toks)?;
         ok &= position_owner(&mut m, &toks)?;
