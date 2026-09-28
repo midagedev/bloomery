@@ -101,8 +101,9 @@
 //! beside `--plain`), the server runs plan (b′) — plan (a) on the A6000, the
 //! 3090 an expert tier holding the draft's reserve — with the DSpark draft,
 //! started as `--port 0 --place bp`, and the gate checks it against its own
-//! plan (b′) of the file (the reserve from the draft's header, as the server
-//! makes it) and nothing above:
+//! plan (b′) of the file (the draft's reserve from its header and the tier's
+//! prompt-batch bytes from the file's, as the server makes them) and nothing
+//! above:
 //!
 //! - `/props`' placement names three devices: the A6000 (`GPU<n>`, every
 //!   layer, the plan's stage-card bytes), the tier card (the 3090's
@@ -113,8 +114,9 @@
 //!   server applies; `args` are the ones this gate passed;
 //! - `/completion` of `--prompt` at temperature 0: its ids are `--gen`'s
 //!   `tokens` line (`generate_ds41 --place bp` under the same draft: the same
-//!   plan, the same card sets), and its `timings` carry `draft_n` above 0 and
-//!   `draft_n_accepted` at most that.
+//!   plan, the same card sets, the same prompt feed — both read
+//!   `BLOOMERY_PREFILL` from this environment), and its `timings` carry
+//!   `draft_n` above 0 and `draft_n_accepted` at most that.
 //!
 //! The server inherits this binary's environment, so the levers it acts on
 //! are the server's (`serve_levers::ACTS_ON`): one the server would refuse is
@@ -152,7 +154,7 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
-    use model::arch::deepseek41::place::PlanInputs;
+    use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::deepseek41::plan::Planner;
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
@@ -1268,7 +1270,9 @@ mod gate {
             .ok_or("plan (b′) made no draft reserve")?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = Place::Bp.machine(Some(reserve))?(inputs.model.layers);
+        let machine = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?(
+            inputs.model.layers,
+        );
         let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
         let ([stage], [tier], [card, tcard]) = (
             machine.cards.as_slice(),

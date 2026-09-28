@@ -1,26 +1,23 @@
 //! What a V4.1 binary's placement decides beside its plan
-//! (`bloomery_gpu_gates::generate::Place`): the prompt feed a placement holds
-//! every call to, and the `load` record's cards — the tier card's experts and
-//! resident bytes when the placement has one. `generate_ds41`,
+//! (`bloomery_gpu_gates::generate::Place`): the expert tier's prompt-batch
+//! bytes the plan reserves, and the `load` record's cards — the tier card's
+//! experts and resident bytes when the placement has one. `generate_ds41`,
 //! `bloomery-serve-ds41` and `bloomery-chat` read them here.
 
-use bloomery_gpu_deepseek41::body::{Deepseek41Model, OpenCfg, PrefillMode};
+use bloomery_gpu_deepseek41::body::Deepseek41Model;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
-use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::record::Record;
+use model::arch::deepseek41::hparams::Hparams;
+use model::placement::workstation::TierBatchBytes;
 
-/// `cfg` under `place`: where the placement decides the prompt feed
-/// ([`Place::steps_only`]), the feed is one decode step per id, and the
-/// `call feed` record says so and why; elsewhere `cfg` as parsed and no
-/// record.
-pub fn feed_under(place: Place, cfg: &mut OpenCfg) -> Option<Record> {
-    let why = place.steps_only()?;
-    cfg.body.prefill = PrefillMode::Steps;
-    Some(
-        Record::new(&record::CALL_FEED)
-            .w("feed", PrefillMode::Steps.name())
-            .w("why", why),
-    )
+/// The expert tier's prompt-batch bytes `place`'s plan reserves for the file
+/// of hyperparameters `hp` (`model::arch::deepseek41::place::tier_batch`),
+/// which `Place::machine` takes; `None` under a placement with no tier card.
+pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
+    place
+        .tier_card()
+        .map(|_| model::arch::deepseek41::place::tier_batch(hp))
 }
 
 /// `r` with the cards `place` loaded (`cards`) and, when it has an expert

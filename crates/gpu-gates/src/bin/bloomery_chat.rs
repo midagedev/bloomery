@@ -22,9 +22,9 @@
 //!
 //! `--place` is `generate_ds41`'s: `bp` loads plan (a) on the A6000 with the
 //! 3090 as its expert tier (the `load` line's `cards=` names both, with the
-//! tier's experts and bytes, and a `call feed` line after the `capture` says
-//! the prompt goes one step per id, as it always does here). A lost tier
-//! card is the step's named error and ends the run with a nonzero exit.
+//! tier's experts and bytes; the prompt goes one step per id, as it always
+//! does here). A lost tier card is the step's named error and ends the run
+//! with a nonzero exit.
 //!
 //! Everything but the text goes to stderr: the `prompt_ids` line, the plan,
 //! `load` and `capture` lines, then after the run the `ids` line (every
@@ -73,7 +73,8 @@ mod drive {
     };
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{HotList, PlanLevers, workstation};
+    use model::placement::workstation::{self, TierBatchBytes};
+    use model::placement::{HotList, PlanLevers};
     use sampler::{Sampler, SamplerParams};
     use tokenizer::{Decoder, Tokenizer};
 
@@ -246,8 +247,7 @@ mod drive {
         ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
-        let mut cfg = body::OpenCfg::from_levers(&levers)?;
-        let feed = place::feed_under(a.place, &mut cfg);
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let ds41 = Ds41Cfg {
             feed: cfg.body.prefill,
             open: cfg,
@@ -264,11 +264,13 @@ mod drive {
 
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
+        let tier_batch = place::tier_batch(a.place, &inputs.hp);
         drop(split);
-        print_plan(&inputs, a.place, a.ctx, &ds41.open.place)?;
+        print_plan(&inputs, a.place, tier_batch, a.ctx, &ds41.open.place)?;
         let want_top_k = inputs.hp.indexer.top_k;
         let open = OpenArgs {
             place: a.place,
+            tier_batch,
             ctx: a.ctx,
             mode: StepMode::Graph,
             pin_main: levers.pin_main(),
@@ -302,21 +304,20 @@ mod drive {
             },
             &mut std::io::stderr(),
         )?;
-        if let Some(r) = feed {
-            r.eprint();
-        }
         chat(&mut g, &a, &tok, &mut sampler, &ids)
     }
 
-    /// The plan the engine is about to load under the placement's `levers`,
+    /// The plan the engine is about to load under the placement's `levers`
+    /// (with `tier_batch`, the tier's prompt-batch bytes, on its tier card),
     /// on stderr.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
+        tier_batch: Option<TierBatchBytes>,
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<(), GateError> {
-        let machine = place.machine(None)?(inputs.model.layers);
+        let machine = place.machine(None, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         record::plan(place.name(), &machine, &plan, hot_list).eprint();

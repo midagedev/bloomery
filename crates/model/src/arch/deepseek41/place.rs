@@ -18,6 +18,7 @@ use super::hparams::Hparams;
 use super::kv::KvLayout;
 use super::{roles, spec};
 use crate::arch::coverage;
+use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{
     self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
 };
@@ -33,6 +34,21 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's cache and compressor bytes.
     pub kv: KvLayout,
+}
+
+/// The expert tier's prompt-batch bytes plan (b′) reserves for a file of
+/// hyperparameters `hp` (`workstation::plan_bp`): blocks of the host union's
+/// [`crate::moe::UNION_MAX_COLS`] columns of rows of `n_embd`, routed to
+/// `n_used` experts of `ff` rows — the sizes the tier's staging and tile
+/// scratch are allocated at ([`workstation::tier_batch_bytes`]).
+#[must_use]
+pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+    workstation::tier_batch_bytes(
+        hp.n_embd as u64,
+        hp.experts.ff as u64,
+        hp.experts.n_used as u64,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
 }
 
 /// Why a plan was refused.

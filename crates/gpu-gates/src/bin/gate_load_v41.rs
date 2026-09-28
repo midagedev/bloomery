@@ -62,10 +62,12 @@
 //!
 //! `--plan bp --draft <file>` is plan (b′) (`workstation::plan_bp`) with the
 //! DSpark draft's reserve on its tier card — the draft file's bytes from its
-//! header (`model::arch::dspark::card_bytes`); `--plan bp` without `--draft`
-//! is refused by name: the A6000 loads plan (a)'s segments and the 3090 the
-//! tier's, each checked as a stage card is; check 2's floor on the tier also
-//! holds the draft's reserve, which this gate does not load.
+//! header (`model::arch::dspark::card_bytes`) — and the tier's prompt-batch
+//! reserves on the tier card and the host (`deepseek41::place::tier_batch`,
+//! from the file's header); `--plan bp` without `--draft` is refused by name: the
+//! A6000 loads plan (a)'s segments and the 3090 the tier's, each checked as a
+//! stage card is; check 2's floor on the tier also holds the draft's and the
+//! batch's reserves, which this gate does not load.
 //!
 //! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
 //! layers over both cards (`workstation::plan_b`), and this gate is the tree's
@@ -233,6 +235,7 @@ mod gate {
             PlanId::Bp => workstation::plan_bp(
                 inputs.model.layers,
                 Some(draft_reserve(args.draft.as_deref(), &split)?),
+                model::arch::deepseek41::place::tier_batch(&inputs.hp),
             ),
         };
         let plan = inputs
