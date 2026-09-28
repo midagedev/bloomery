@@ -84,7 +84,7 @@ use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
 
 use super::slots::{HOST, Slot, SlotMap};
 use crate::GpuError;
-use crate::graph::{MappedHost, cu, mem_batch, op_wait_geq, op_write};
+use crate::graph::{MappedHost, cu, mem_batch, op_write};
 
 /// The residency lever: `off`, or the rule's `mid` parameters with `P`
 /// pinned seed experts a layer and `S` spare slots a layer (`mid-p<P>-s<S>`).
@@ -404,6 +404,64 @@ fn ring_ticket(n: u64) -> Result<(usize, u32), GpuError> {
     let ticket = u32::try_from(n / RING_SLOTS as u64 + 1)
         .map_err(|_| GpuError::protocol("SwapMachine staging", "the staging tickets passed u32"))?;
     Ok((ring, ticket))
+}
+
+/// The one way a wait on a staging word goes on the copy stream: a copy
+/// stream wait whose word only the staging thread raises is enqueued only
+/// for a job that thread already holds, so the thread enqueueing never waits
+/// on a wait it has yet to release.
+mod dispatch {
+    use std::sync::mpsc;
+
+    use cuda_core::CudaStream;
+
+    use super::{Job, WORD_STRIDE};
+    use crate::GpuError;
+    use crate::graph::{MappedHost, mem_batch, op_wait_geq};
+
+    /// A job the staging thread holds. Only [`send`] makes one.
+    pub(super) struct Dispatched {
+        ring: usize,
+        ticket: u32,
+    }
+
+    impl Dispatched {
+        pub(super) fn ring(&self) -> usize {
+            self.ring
+        }
+
+        pub(super) fn ticket(&self) -> u32 {
+            self.ticket
+        }
+    }
+
+    /// `job` to the staging thread over `tx`; refused by name as `what` when
+    /// the thread has stopped.
+    pub(super) fn send(
+        tx: Option<&mpsc::Sender<Job>>,
+        job: Job,
+        what: &'static str,
+    ) -> Result<Dispatched, GpuError> {
+        let (ring, ticket) = (job.ring, job.ticket);
+        tx.and_then(|tx| tx.send(job).ok())
+            .ok_or_else(|| GpuError::protocol(what, "the staging thread has stopped"))?;
+        Ok(Dispatched { ring, ticket })
+    }
+
+    /// Enqueue on `copy` the wait for `d`'s staging: its ring slot's staged
+    /// word in `words` at its ticket.
+    pub(super) fn wait_staged(
+        copy: &CudaStream,
+        words: &MappedHost,
+        d: &Dispatched,
+    ) -> Result<(), GpuError> {
+        let staged = words.dev_at(2 * d.ring * WORD_STRIDE);
+        mem_batch(
+            copy,
+            &mut [op_wait_geq(staged, d.ticket)],
+            "swap: wait for staging",
+        )
+    }
 }
 
 /// One expert's copy for the staging thread: first the victim to prepare,
@@ -1633,11 +1691,6 @@ impl SwapMachine {
             .collect::<Result<Vec<_>, _>>()?;
         let n = self.jobs_issued;
         let (ring, ticket) = ring_ticket(n)?;
-        // The job goes to the staging thread before its commands go on the
-        // copy stream: the first of them waits for the staging, so a job
-        // sent after them would leave this thread enqueueing behind a wait
-        // only it can release, and a job longer than the stream's queue
-        // would block the enqueue for good.
         let job = Job {
             n,
             layer: l,
@@ -1646,32 +1699,26 @@ impl SwapMachine {
             ring,
             ticket,
         };
-        self.tx
-            .as_ref()
-            .and_then(|tx| tx.send(job).ok())
-            .ok_or_else(|| GpuError::protocol(WHAT, "the staging thread has stopped"))?;
+        let d = dispatch::send(self.tx.as_ref(), job, WHAT)?;
         self.jobs_issued += 1;
         let copy = Arc::clone(&self.copy);
         if !self.copy_waits_boundary {
             copy.wait(&self.boundary_event)?;
             self.copy_waits_boundary = true;
         }
-        let staged = self.shared.words.dev_at(2 * ring * WORD_STRIDE);
-        let drained = self.shared.words.dev_at((2 * ring + 1) * WORD_STRIDE);
-        mem_batch(
-            &copy,
-            &mut [op_wait_geq(staged, ticket)],
-            "swap: wait for staging",
-        )?;
+        dispatch::wait_staged(&copy, &self.shared.words, &d)?;
+        let drained = self.shared.words.dev_at((2 * d.ring() + 1) * WORD_STRIDE);
         let mut at = 0usize;
         for (part, (&len, &dst)) in parts.iter().zip(&dsts).enumerate() {
-            self.shared.ring.copy_to_device(ring, at, len, dst, &copy)?;
+            self.shared
+                .ring
+                .copy_to_device(d.ring(), at, len, dst, &copy)?;
             source.convert(l, part, dst, &copy)?;
             at += len;
         }
         mem_batch(
             &copy,
-            &mut [op_write(drained, ticket)],
+            &mut [op_write(drained, d.ticket())],
             "swap: ring drained",
         )?;
         Ok(at as u64)
