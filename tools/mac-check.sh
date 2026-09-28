@@ -9,25 +9,30 @@
 # from the crate graph and the sources (its one owner; the rule is in its docstring): a crate with no
 # device root in its closure and no x86_64 or Linux-only code the Mac would build. Every other crate's
 # tests and every gate never run here: their binaries are Linux ones, and the box judges them. A Mac
-# result is development-loop evidence; landing evidence is the box's record.
+# result is development-loop evidence; landing evidence is the box's record. `combos` cross-checks, as
+# `check` does, every build shape the recipes compile — one `cargo check -p <package> [--profile test]
+# [--features …] <targets>` a shape, the list `tools/recipes.py combos` derives from every recipe's cargo
+# calls (its one owner; the rule is its «build shapes» paragraph): the check recipe builds one feature
+# set, the gate recipes others (`--features gpu` alone, a lib with no feature, a test build). It runs every
+# shape, a red one too, names each red shape at the end, and prints the ones the list leaves out by name.
 #
-#   tools/mac-check.sh check|lint|fmt|fmt-check|test
+#   tools/mac-check.sh check|lint|fmt|fmt-check|test|combos
 #   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory,
 #                                    the test totals and the toolchain and prerequisite checks against a
 #                                    fake HOME; runs no cargo (check-recipes runs it)
 #
-# Exit: cargo's own code (`test`: the first crate's that is not 0). `lint` also ends 1 when its
-# `^warning:` count (the box's ruler, one per target a warning appears in) is above the ratchet, the
-# one number in tools/lint-ratchet.txt. 64: a mode or a box command this script does not run, or not
-# on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
-# tools/lint-ratchet.txt (missing, or not exactly one number line), or no pure crate to test.
+# Exit: cargo's own code (`test`: the first crate's that is not 0; `combos`: the first red shape's).
+# `lint` also ends 1 when its `^warning:` count (the box's ruler, one per target a warning appears in)
+# is above the ratchet, the one number in tools/lint-ratchet.txt. 64: a mode or a box command this
+# script does not run, a malformed `recipes.py combos` line, or not on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
+# tools/lint-ratchet.txt (missing, or not exactly one number line), no pure crate to test, or no build shape (`combos`).
 #
 # The toolchain is this script's: the channel rust-toolchain.toml pins, at
 # $HOME/.rustup/toolchains/<channel>-<host>/bin, goes first on PATH, and cargo, cargo-clippy,
 # clippy-driver, cargo-fmt and rustfmt must each resolve there — a missing one is named, never taken
 # from Homebrew (whose cargo and rustfmt are other versions). RUSTC, when set, must be that rustc.
 # `fmt`, `fmt-check` and `test` need nothing else (`test`: the host std, which comes with the
-# toolchain). `check` and `lint` first source one file outside the
+# toolchain). `check`, `lint` and `combos` first source one file outside the
 # repository, $HOME/opt/bloomery-mac-env.sh (a fake HOME moves it; the self-test does), which sets
 #   CUDA_TOOLKIT_PATH   a directory whose include/cuda.h bindgen reads (headers only)
 #   BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu   `--sysroot=<dir>` with <dir>/usr/include/stdlib.h
@@ -83,6 +88,43 @@ test_argv() {
 totals() {
   awk '/^test result: /{ for (i = 1; i <= NF; i++) { if ($(i+1) ~ /^passed/) p += $i; if ($(i+1) ~ /^failed/) f += $i; if ($(i+1) ~ /^ignored/) g += $i }; n++ }
        END { if (!n) exit 1; printf "%d passed, %d failed, %d ignored in %d test binaries\n", p, f, g, n }' "$1"
+}
+
+# combo_lines: recipes.py combos' output on stdin, checked line by line — `combo<TAB>label<TAB>command`,
+# `skip<TAB>recipe<TAB>why`, one `total<TAB>counts` last — or 64 naming the first line that is not one,
+# and 70 when it lists no shape.
+combo_lines() {
+  local line kind a b n=0 no=0 total=0
+  while IFS= read -r line; do
+    no=$((no + 1))
+    IFS=$'\t' read -r kind a b <<< "$line"
+    if [ "$total" != 0 ]; then
+      say "mac-check.sh: recipes.py combos line $no follows its total line: $line"
+      return 64
+    fi
+    case $kind in
+      combo | skip)
+        if [ -z "$a" ] || [ -z "$b" ] || [ "$(printf '%s' "$line" | tr -cd '\t' | wc -c | tr -d ' ')" != 2 ]; then
+          say "mac-check.sh: recipes.py combos line $no is not $kind<TAB>…<TAB>…: $line"
+          return 64
+        fi
+        [ "$kind" = skip ] || n=$((n + 1))
+        ;;
+      total) total=1 ;;
+      *)
+        say "mac-check.sh: recipes.py combos line $no is not a combo, skip or total line: $line"
+        return 64
+        ;;
+    esac
+  done
+  if [ "$total" = 0 ]; then
+    say "mac-check.sh: recipes.py combos printed no total line (cut short?)"
+    return 64
+  fi
+  if [ "$n" = 0 ]; then
+    say "mac-check.sh: recipes.py combos lists no build shape"
+    return 70
+  fi
 }
 
 # derive MODE CMD: the cargo argv this script runs for the box command CMD, one word a line. CMD
@@ -198,7 +240,7 @@ prereqs() {
       miss=1
     fi
   fi
-  case $mode in check | lint) ;; *) [ "$miss" = 0 ] || return 69; return 0 ;; esac
+  case $mode in check | lint | combos) ;; *) [ "$miss" = 0 ] || return 69; return 0 ;; esac
   rlib=$(ls "$tc/../lib/rustlib/$TARGET/lib"/libstd-*.rlib 2> /dev/null | head -1 || true)
   if [ -z "$rlib" ]; then
     say "mac-check.sh: missing the $TARGET std in $tcname: rustup target add --toolchain $tcname $TARGET"
@@ -220,15 +262,15 @@ prereqs() {
   [ "$miss" = 0 ] || return 69
 }
 
-# setup MODE TOOLCHAIN_BIN ROOT: the environment a run of MODE gets — the env file for check and lint,
-# the pinned toolchain first on PATH, the prerequisites, and for check, lint and test the tree's own
-# CARGO_TARGET_DIR, whatever the environment held (a line names what it replaces). Runs in the caller's shell.
+# setup MODE TOOLCHAIN_BIN ROOT: the environment a run of MODE gets — the env file for check, lint and
+# combos, the pinned toolchain first on PATH, the prerequisites, and for check, lint, test and combos
+# the tree's own CARGO_TARGET_DIR, whatever the environment held (a line names what it replaces). Runs in the caller's shell.
 setup() {
-  case $1 in check | lint) load_env || return $? ;; esac
+  case $1 in check | lint | combos) load_env || return $? ;; esac
   export PATH="$2:$PATH"
   prereqs "$1" "$2" || return $?
   case $1 in
-    check | lint | test)
+    check | lint | test | combos)
       local own
       own=$(target_dir "$3")
       [ -z "${CARGO_TARGET_DIR:-}" ] || [ "$CARGO_TARGET_DIR" = "$own" ] ||
@@ -266,7 +308,7 @@ verdict() {
 }
 
 self_test() {
-  local fails=0 out t m cmd fake tc ch host a b
+  local fails=0 out t m cmd fake tc ch host a b tab why
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
   # the derivation from the real justfile: each mode's recipe gives `cargo <verb> …`, the cross
@@ -330,6 +372,35 @@ self_test() {
   [ -n "$out" ] || fail "recipes.py pure-crates --names lists no crate"
   for t in $out; do test_argv "$t" > /dev/null || fail "pure crate '$t' is not a name test takes"; done
 
+  # combos: the real list is well formed and each shape's command is one check derives; a malformed list
+  # is refused by name
+  tab=$'\t'
+  out=$(python3 "$HERE/tools/recipes.py" combos 2> /dev/null) || fail "recipes.py combos failed"
+  combo_lines <<< "$out" || fail "recipes.py combos' own output refused"
+  while IFS=$'\t' read -r t m cmd; do
+    [ "$t" = combo ] || continue
+    derive check "$cmd" > /dev/null 2>&1 || fail "the shape '$m' has a command check does not derive: $cmd"
+  done <<< "$out"
+  case $out in *"combo${tab}bloomery-gpu-gates build [gpu]: "*) ;; *) fail "recipes.py combos lists no bloomery-gpu-gates build shape with gpu alone" ;; esac
+  case $out in *"combo${tab}bloomery-gpu-gates test [no features]: "*) ;; *) fail "recipes.py combos lists no bloomery-gpu-gates test shape with no feature" ;; esac
+  a="combo${tab}p build [x]: 1 targets${tab}cargo check -p p --bin b"
+  b="total${tab}1 commands"
+  for t in "$a|nope${tab}x${tab}y|not a combo, skip or total" \
+    "$a|combo${tab}x|not combo<TAB>" \
+    "$a|skip${tab}${tab}why|not skip<TAB>" \
+    "$a|combo${tab}x${tab}y${tab}z|not combo<TAB>" \
+    "$a|$b|$a|follows its total" \
+    "$a|no total line" \
+    "skip${tab}r${tab}why|$b|lists no build shape"; do
+    why=${t##*|}
+    printf '%s\n' "${t%|*}" | tr '|' '\n' > "${TMPDIR:-/tmp}/mac-check-combos.$$"
+    out=$(combo_lines < "${TMPDIR:-/tmp}/mac-check-combos.$$" 2>&1) && fail "combo_lines accepted '${t%|*}'" || {
+      case $out in *"$why"*) ;; *) fail "combo_lines refused '${t%|*}' without naming '$why': $out" ;; esac
+    }
+  done
+  rm -f "${TMPDIR:-/tmp}/mac-check-combos.$$"
+  printf '%s\n' "$a" "$b" | combo_lines || fail "combo_lines refused a list of one shape and its total"
+
   # the host triple and the channel
   [ "$(host_triple Darwin arm64)" = aarch64-apple-darwin ] || fail "Darwin arm64 is not aarch64-apple-darwin"
   host_triple Linux x86_64 > /dev/null 2>&1 && fail "Linux accepted as the Mac" || { [ $? = 64 ] || fail "Linux refused with another rc"; }
@@ -386,7 +457,7 @@ EOF
       for t in cargo cargo-clippy rustfmt; do echo "resolved $t $(command -v "$t")"; done && echo "target ${CARGO_TARGET_DIR:-none}") 2>&1
   }
   write_env
-  for m in check lint fmt fmt-check test; do
+  for m in check lint fmt fmt-check test combos; do
     out=$(probe "$m") || fail "the complete fake HOME fails $m: $out"
     for t in cargo cargo-clippy rustfmt; do
       case $out in *"resolved $t $tc/$t"*) ;; *) fail "$m with Homebrew first on PATH resolves $t elsewhere: $out" ;; esac
@@ -411,7 +482,9 @@ EOF
     "fmt|$tc/cargo|rustup toolchain install $ch" \
     "test|$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$host/lib/libstd-0.rlib|missing the $host std" \
     "test|$tc/cargo|rustup toolchain install $ch" \
-    "check|$fake/opt/bloomery-mac-env.sh|missing $fake/opt/bloomery-mac-env.sh"; do
+    "check|$fake/opt/bloomery-mac-env.sh|missing $fake/opt/bloomery-mac-env.sh" \
+    "combos|$fake/opt/bloomery-mac-env.sh|missing $fake/opt/bloomery-mac-env.sh" \
+    "combos|$fake/opt/cuda-13.3/include/cuda.h|missing cuda.h"; do
     IFS='|' read -r m cmd why <<< "$t"
     mv "$cmd" "$cmd.away"
     out=$(probe "$m") && fail "$m passed without $cmd" || {
@@ -443,8 +516,8 @@ EOF
 
 case ${1:-} in
   --self-test) [ $# = 1 ] || { say "mac-check.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
-  check | lint | fmt | fmt-check | test) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
-  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test | --self-test"; exit 64 ;;
+  check | lint | fmt | fmt-check | test | combos) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
+  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test|combos | --self-test"; exit 64 ;;
 esac
 MODE=$1
 HOST=$(host_triple "$(uname -s)" "$(uname -m)") || exit $?
@@ -479,6 +552,47 @@ if [ "$MODE" = test ]; then
   cat "$LOG"
   [ "$(md5 -q "$HERE/Cargo.lock")" = "$LOCK0" ] || say "mac-check: cargo rewrote Cargo.lock in this tree (a dependency edit's lock refresh): commit it with the edit"
   echo "mac-check: test rc $rc; ${#ran[@]} crates (crate=rc): ${ran[*]}; $(totals "$LOG" || echo "no test result line")"
+  exit "$rc"
+fi
+if [ "$MODE" = combos ]; then
+  LIST=$(python3 "$HERE/tools/recipes.py" combos) || exit $?
+  combo_lines <<< "$LIST" || exit $?
+  setup combos "$TC" "$HERE" || exit $?
+  mkdir -p "$HERE/target"
+  LOG=$HERE/target/mac-check-combos.log
+  LOCK0=$(md5 -q "$HERE/Cargo.lock")
+  HEAD="mac-check: cargo check --target $TARGET for each build shape of tools/recipes.py combos ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
+  say "$HEAD; log $LOG"
+  echo "$HEAD" > "$LOG"
+  rc=0
+  n=0
+  TOTAL=
+  reds=()
+  while IFS=$'\t' read -r -u 3 kind label cmd; do
+    case $kind in
+      skip) echo "mac-check: left out by name: $label — $cmd" >> "$LOG" ;;
+      total) TOTAL=$label ;;
+      combo)
+        DERIVED=$(derive check "$cmd") || exit 64
+        ARGV=()
+        while IFS= read -r w; do ARGV+=("$w"); done <<< "$DERIVED"
+        echo "mac-check: shape $label: ${ARGV[*]}" >> "$LOG"
+        t0=$SECONDS
+        crc=0
+        (cd "$HERE" && "$TC/cargo" "${ARGV[@]:1}") >> "$LOG" 2>&1 || crc=$?
+        echo "mac-check: shape rc $crc in $((SECONDS - t0)) s: $label" >> "$LOG"
+        n=$((n + 1))
+        if [ "$crc" != 0 ]; then
+          reds+=("$label: ${ARGV[*]}")
+          [ "$rc" != 0 ] || rc=$crc
+        fi
+        ;;
+    esac
+  done 3<<< "$LIST"
+  cat "$LOG"
+  [ "$(md5 -q "$HERE/Cargo.lock")" = "$LOCK0" ] || say "mac-check: cargo rewrote Cargo.lock in this tree (a dependency edit's lock refresh): commit it with the edit"
+  for r in "${reds[@]+"${reds[@]}"}"; do echo "mac-check: red shape $r"; done
+  echo "mac-check: combos rc $rc; $n shapes run, ${#reds[@]} red, in $SECONDS s (recipes.py combos: $TOTAL)"
   exit "$rc"
 fi
 RECIPE=$(recipe_of "$MODE")

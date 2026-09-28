@@ -13,6 +13,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py pure-crates [--names]  # the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason
+    python3 tools/recipes.py combos           # every build shape a recipe compiles, one cargo check command each (tools/mac-check.sh combos)
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py --self-test
 
@@ -109,6 +110,21 @@ ignore, path or test, a test attribute from a macro crate (`#[tokio::test]`), a 
 macro or any other non-module item, a module-level `include!`, a test argument from a recipe parameter, a
 libtest option it does not know. Two gaps it does not see: tests a macro defined elsewhere expands into
 (its invocation carries no test attribute), and anything outside the workspace members.
+
+Build shapes (`combos`). Every cargo build a recipe runs on the box compiles one package under one feature set,
+in one of two modes: a plain build, or a test build (cfg(test): a lib's or a bin's unit tests under
+`cargo test`, a `--test` or `--bench` target under any subcommand). A shape is (package, mode, the package's
+enabled features — the closure, defaults included — and any `dep/feature` words for other packages); the
+recipes that share a shape share one command, `cargo check -p <package> [--profile test] [--features …]` over
+the union of their targets, so each shape is type-checked the way the box compiles it. One package a command:
+two in one invocation would unify a shared dependency's features and hide a feature one of them lacks. A
+shape that another covers (the same package with more features) is still its own command — a
+`cfg(not(feature))` or an optional dependency makes them different code. Named, never silent, and left out:
+the `check` and `lint` recipes (`tools/mac-check.sh check` and `lint` run their commands); an invocation
+whose package, features or targets come from a recipe parameter (`{{…}}`: known at run time only); a
+doctest (rustdoc compiles it and cargo check has no doctest mode — the lib it imports is checked in the
+package's plain shape). The profile is not part of a shape: no source in the tree reads
+`cfg(debug_assertions)`, and `cargo check` builds no code whose optimisation level matters.
 """
 
 from __future__ import annotations
@@ -2040,6 +2056,105 @@ def cmd_pure_crates(args: argparse.Namespace) -> int:
         for w in why:
             print(f"rejected  {n}  {w}")
     print(f"pure-crates: {sum(1 for _, w in rows if not w)} pure, {sum(1 for _, w in rows if w)} rejected, on {MAC_TARGET} (the rule: tools/recipes.py, section «pure crates»)")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------
+# build shapes: every (package, mode, features) a recipe compiles, for the Mac cross check (`combos`)
+# ----------------------------------------------------------------------------------------------
+# The rule is the module docstring's «build shapes» paragraph; tools/mac-check.sh combos runs the list.
+
+# The recipes whose command tools/mac-check.sh runs as a mode of its own.
+MAC_CHECKED = {"check": "tools/mac-check.sh check", "lint": "tools/mac-check.sh lint"}
+_SELECTOR_ORDER = {"lib": 0, "bin": 1, "test": 2, "example": 3, "bench": 4}
+
+
+@dataclass
+class Combo:
+    package: str
+    test: bool  # a test build (cfg(test)): checked under `--profile test`
+    enabled: tuple[str, ...]  # the package's enabled features, the closure with defaults: the shape's key
+    others: tuple[str, ...]  # `dep/feature` words for other packages
+    features: list[str]  # the package's own `--features` words, from the first call of this shape
+    no_default: bool
+    all_features: bool
+    selectors: set[tuple[str, str | None]] = field(default_factory=set)
+    recipes: list[str] = field(default_factory=list)
+
+    def command(self) -> str:
+        words = ["cargo", "check", "-p", self.package]
+        if self.test:
+            words += ["--profile", "test"]
+        if self.all_features:
+            words.append("--all-features")
+        if self.no_default:
+            words.append("--no-default-features")
+        feats = list(self.features) + list(self.others)
+        if feats and not self.all_features:
+            words += ["--features", ",".join(feats)]
+        for kind, name in sorted(self.selectors, key=lambda s: (_SELECTOR_ORDER[s[0]], s[1] or "")):
+            words += [f"--{kind}"] + ([name] if name else [])
+        return " ".join(words)
+
+    def label(self) -> str:
+        feats = ",".join(list(self.enabled) + list(self.others)) or "no features"
+        shown = ", ".join(self.recipes[:3]) + (f", +{len(self.recipes) - 3}" if len(self.recipes) > 3 else "")
+        return f"{self.package} {'test' if self.test else 'build'} [{feats}{', no defaults' if self.no_default else ''}]: {len(self.selectors)} targets, {len(self.recipes)} recipes ({shown})"
+
+
+def _has_param(inv: Invocation) -> bool:
+    return any("{{" in w for w in inv.packages + inv.features + [n or "" for _, n in inv.selectors])
+
+
+def build_shapes(tree: Tree, recipes: dict[str, Recipe]) -> tuple[list[Combo], list[tuple[str, str]], int]:
+    """(the shapes in package and mode order, [(recipe, why)] left out by name, the count of distinct
+    (package, target, mode, features) tuples). A call the tree cannot resolve is a RecipeError naming it."""
+    shapes: dict[tuple, Combo] = {}
+    skips: list[tuple[str, str]] = []
+    tuples: set[tuple] = set()
+    errors: list[str] = []
+    for rname in sorted(recipes):
+        for inv in recipe_commands(recipes[rname]).invocations:
+            call = " ".join(["cargo"] + ["oxide"] * inv.oxide + [inv.sub] + ["--workspace"] * inv.workspace + [f"-p {p}" for p in inv.packages] + [f"--features {','.join(inv.features)}"] * bool(inv.features))
+            if rname in MAC_CHECKED:
+                skips.append((rname, f"{call}: {MAC_CHECKED[rname]} runs this recipe's command"))
+                continue
+            if _has_param(inv):
+                skips.append((rname, f"{call}: a recipe parameter ({{{{…}}}}) decides its package, features or targets at run time"))
+                continue
+            targets, errs = tree.resolve(inv)
+            errors += [f"{rname}: {e}" for e in errs]
+            for pname, kind, name, feats in targets:
+                pkg = tree.packages[pname]
+                enabled, _, _ = tree.feature_closure(pkg, feats, not inv.no_default, inv.all_features)
+                others = tuple(sorted({f for f in inv.features if "/" in f and f.split("/", 1)[0] != pname}))
+                if kind == "doctest":
+                    skips.append((rname, f"doctests of {pname}: rustdoc compiles them and cargo check has no doctest mode; the lib they import is checked in {pname}'s build shape"))
+                    kind = "lib"
+                test = kind in ("libtest", "test", "bench") or (kind == "bin" and inv.sub in ("test", "bench"))
+                sel = ("lib", None) if kind in ("lib", "libtest") else (kind, name)
+                key = (pname, test, tuple(sorted(enabled)), others, inv.no_default, inv.all_features)
+                c = shapes.get(key)
+                if c is None:
+                    c = shapes[key] = Combo(pname, test, key[2], others, sorted(feats), inv.no_default, inv.all_features)
+                c.selectors.add(sel)
+                if rname not in c.recipes:
+                    c.recipes.append(rname)
+                tuples.add(key + (sel,))
+    if errors:
+        raise RecipeError("combos: calls the tree cannot resolve (just check-recipes names them too): " + "; ".join(sorted(set(errors))[:8]))
+    order = sorted(shapes, key=lambda k: (k[0], k[1], len(k[2]), k[2], k[3], k[4], k[5]))
+    return [shapes[k] for k in order], skips, len(tuples)
+
+
+def cmd_combos(args: argparse.Namespace) -> int:
+    tree = Tree(ROOT)
+    shapes, skips, n = build_shapes(tree, load_justfile(args.justfile or os.path.join(ROOT, "justfile")))
+    for c in shapes:
+        print(f"combo\t{c.label()}\t{c.command()}")
+    for r, why in skips:
+        print(f"skip\t{r}\t{why}")
+    print(f"total\t{len(shapes)} commands, {n} distinct (package, target, mode, features) tuples, {len(skips)} left out by name")
     return 0
 
 
@@ -4127,6 +4242,48 @@ def self_test() -> int:
     expect({512, 1536, 16384} <= depths, f"plans: records-refresh on the real justfile writes depths {sorted(depths)}")
     expect(all(d in depths for n in jf for d in counts_depths(jf[n])), "plans: a real --counts reader's depth that records-refresh does not write")
 
+    # build shapes: one command a (package, mode, enabled features), the targets of every call that shares
+    # it; a parameter, a doctest and the check recipe left out by name
+    with tempfile.TemporaryDirectory(prefix="recipes-combos-") as tmp:
+        p = os.path.join(tmp, "justfile")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(
+                "check:\n    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu'\n"
+                "a:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin generate_ds41'\n"
+                "b:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn'\n"
+                "c:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap'\n"
+                "d:\n    ./tools/box.sh 'bash tools/gate.sh -p bloomery-gpu-gates --release --lib -- --include-ignored'\n"
+                "e:\n    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --release --doc'\n"
+                "f FEATURES:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin gate_p1 && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx'\n"
+            )
+        try:
+            shapes, skips, n = build_shapes(Tree(ROOT), load_justfile(p))
+        except RecipeError as err:
+            shapes, skips, n = [], [], 0
+            fails.append(f"combos: the synthetic justfile raised {err}")
+        cmds = {c.command(): c.recipes for c in shapes}
+        want = {
+            "cargo check -p bloomery-gpu-gates --features deepseek41,gpu --bin gate_deepseek41_attn --bin generate_ds41": ["a", "b"],
+            "cargo check -p bloomery-gpu-gates --features gpu --bin gate_swap": ["c"],
+            "cargo check -p bloomery-gpu-gates --profile test --lib": ["d"],
+            "cargo check -p bloomery-model --lib": ["e"],
+            "cargo check -p bloomery-gpu-gates --bin oxart_ptx": ["f"],
+        }
+        expect(cmds == want, f"combos: the synthetic shapes are {cmds}")
+        expect(n == 6, f"combos: {n} distinct (package, target, mode, features) tuples, not 6")
+        why = {r: w for r, w in skips}
+        expect(sorted(why) == ["check", "e", "f"], f"combos: left out by name {sorted(why)}, not check, e, f")
+        expect("tools/mac-check.sh check" in why.get("check", ""), f"combos: the check recipe's reason {why.get('check')}")
+        expect("doctests of bloomery-model" in why.get("e", ""), f"combos: the doctest's reason {why.get('e')}")
+        expect("{{FEATURES}}" in why.get("f", "") and "recipe parameter" in why.get("f", ""), f"combos: the parameter's reason {why.get('f')}")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("g:\n    ./tools/box.sh 'cargo build -p bloomery-gpu-gates --bin no_such_bin'\n")
+        try:
+            build_shapes(Tree(ROOT), load_justfile(p))
+            fails.append("combos: a call naming no target accepted")
+        except RecipeError as err:
+            expect("g: --bin no_such_bin" in str(err), f"combos: an unresolvable call refused without its name: {err}")
+
     # the real tree
     side = make_side(ROOT)
     tree, recipes, graph = side.tree, side.recipes, side.graph
@@ -4137,6 +4294,14 @@ def self_test() -> int:
     problems = check(tree, recipes)
     expect(not problems, "check on the real justfile: " + "; ".join(problems[:5]))
     expect(not tree.unresolved, f"unresolved modules: {tree.unresolved[:3]}")
+    # the two shapes whose compile errors the workspace check could not see (2026-09-29): gate_swap with
+    # `gpu` alone, and the lib's tests with no feature
+    shapes, _, _ = build_shapes(tree, recipes)
+    by = {(c.package, c.test, c.enabled): c for c in shapes}
+    gs = by.get(("bloomery-gpu-gates", False, ("gpu",)))
+    expect(gs is not None and ("bin", "gate_swap") in gs.selectors and "gate-gpu-swap" in gs.recipes, "combos: no gpu-gates build shape of gpu alone with gate-gpu-swap's gate_swap")
+    gl = by.get(("bloomery-gpu-gates", True, ()))
+    expect(gl is not None and ("lib", None) in gl.selectors and "gate-gpu-gates-lib" in gl.recipes, "combos: no gpu-gates test shape with no feature for gate-gpu-gates-lib")
 
     def sel(f: str) -> set[str]:
         return {n for n in gates if graph.inputs(n).match(f)}
@@ -4464,6 +4629,8 @@ def main(argv: list[str]) -> int:
     ot.add_argument("--justfile")
     pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
     pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
+    cb = sub.add_parser("combos", help="every build shape a recipe compiles, one `cargo check` command each (tools/mac-check.sh combos): combo<TAB>label<TAB>command, skip<TAB>recipe<TAB>why, total<TAB>counts")
+    cb.add_argument("--justfile")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
@@ -4488,6 +4655,8 @@ def main(argv: list[str]) -> int:
             return cmd_orphan_tests(args)
         if args.cmd == "pure-crates":
             return cmd_pure_crates(args)
+        if args.cmd == "combos":
+            return cmd_combos(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
         ap.print_help()

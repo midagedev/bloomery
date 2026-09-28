@@ -42,8 +42,16 @@ fmt-check:
 # 정적 계층을 맥에서 돈다: check·lint 레시피의 박스 명령에 `--target x86_64-unknown-linux-gnu`를 붙인 교차
 # 검사(링크 없음), fmt-check의 명령은 고정 툴체인의 rustfmt로. 테스트와 게이트는 여기서 돌지 않는다.
 # 환경은 레포 밖 ~/opt/bloomery-mac-env.sh 하나다 — 준비물과 만드는 법은 tools/mac-check.sh 머리말.
+# check 다음에 mac-combos를 돈다: 박스 창 전에 라운드가 도는 이 한 줄이 게이트 레시피의 빌드 모양까지 본다.
 mac-check:
     ./tools/mac-check.sh check
+    ./tools/mac-check.sh combos
+
+# check 레시피는 피처 한 벌만 빌드하므로 `--features gpu` 단독이나 피처 없는 lib 테스트 빌드의 컴파일 오류는
+# 여기서만 잡힌다. 목록의 주인은 tools/recipes.py combos다.
+# 게이트·빌드 레시피가 컴파일하는 (패키지, 모드, 피처) 모양마다 `cargo check`를 같은 교차 검사로 한 번씩 돈다.
+mac-combos:
+    ./tools/mac-check.sh combos
 
 # lint의 `^warning:` 수를 AGENTS.md의 기준값과 비교한다. 넘으면 빨강.
 mac-lint:

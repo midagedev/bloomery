@@ -40,7 +40,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 
 `just check`, `just lint` and the `just gate-*` recipes are the maintainers' gates. They go through `tools/box.sh`; see `AGENTS.md` for what each one runs.
 
-On a Mac, `just mac-check` and `just mac-lint` run `check` and `lint` as an x86_64-linux cross check that links nothing (`cargo --target x86_64-unknown-linux-gnu`); they need the pinned nightly with the x86_64-linux std, the CUDA headers, a Linux sysroot's headers and libclang, set up in one environment file. `just fmt` and `just mac-fmt-check` format and check with the pinned nightly's rustfmt. The header of `tools/mac-check.sh` lists each piece and how it is made. Tests and gates run only on Linux.
+On a Mac, `just mac-check` and `just mac-lint` run `check` and `lint` as an x86_64-linux cross check that links nothing (`cargo --target x86_64-unknown-linux-gnu`); `just mac-check` then also cross-checks every build shape a gate or build recipe compiles (`just mac-combos`: one `cargo check` per package, mode and feature set, the list from `tools/recipes.py combos`). They need the pinned nightly with the x86_64-linux std, the CUDA headers, a Linux sysroot's headers and libclang, set up in one environment file. `just fmt` and `just mac-fmt-check` format and check with the pinned nightly's rustfmt. The header of `tools/mac-check.sh` lists each piece and how it is made. Tests and gates run only on Linux.
 
 ## The model file
 
