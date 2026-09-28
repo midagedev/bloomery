@@ -26,6 +26,8 @@ use std::fmt::{Debug, Display, Write as _};
 use std::sync::OnceLock;
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::host::swap::{PassReport, ResetReport};
+#[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
 use model::placement::{Machine, Plan};
 
@@ -871,6 +873,41 @@ pub static TIME_PROMPT: Kind = Kind {
     ],
 };
 
+/// A residency boundary ([`bloomery_gpu::host::swap::PassReport`]).
+pub static RESIDENCY_PASS: Kind = Kind {
+    name: "residency_pass",
+    head: "residency pass",
+    doc: "A residency boundary: its passes since the load or the last reset, the rows the pass \
+          before it kept, the flips that went live there (late: their copies had not completed and \
+          the engine stream waited), the flips the rule made, the flips in flight after it, and \
+          the bytes its flips copy.",
+    parts: &[
+        key("boundary", U64, ""),
+        key("kept", U64, ""),
+        key("landed", U64, ""),
+        key("late", U64, ""),
+        key("made", U64, ""),
+        key("in_flight", U64, ""),
+        key("bytes", U64, "B"),
+    ],
+};
+
+/// A residency reset ([`bloomery_gpu::host::swap::ResetReport`]).
+pub static RESIDENCY_RESET: Kind = Kind {
+    name: "residency_reset",
+    head: "residency reset",
+    doc: "A residency reset back to the seed: flips in flight cancelled, experts copied back onto \
+          the card, entries of the live map that differ from the seed after it (0 when it \
+          worked), and the host bytes released for the seed experts back on the card and the \
+          victims of cancelled flips, which stay on it.",
+    parts: &[
+        key("cancelled", U64, ""),
+        key("copies", U64, ""),
+        key("diff", U64, ""),
+        key("dropped_bytes", U64, "B"),
+    ],
+};
+
 /// A generated token.
 pub static STEP: Kind = Kind {
     name: "step",
@@ -1271,6 +1308,8 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &STAT_FINITE_SUMMARY,
     &DRAFT_SUMMARY,
     &SMOKE,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
 ];
 
 /// What `bloomery-chat` prints, all on stderr.
@@ -1323,6 +1362,8 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &TOKENS,
     &LOGITS,
     &SMOKE,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
 ];
 
 /// What `generate_qwen3moe --dump-taps` prints after its `load` line; the
@@ -1385,6 +1426,29 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
         );
     }
     out
+}
+
+/// A residency boundary's record.
+#[cfg(feature = "gpu")]
+pub fn residency_pass(r: &PassReport) -> Record {
+    Record::new(&RESIDENCY_PASS)
+        .u("boundary", r.boundary)
+        .u("kept", r.kept)
+        .u("landed", r.landed)
+        .u("late", r.late)
+        .u("made", r.made)
+        .u("in_flight", r.in_flight)
+        .u("bytes", r.bytes)
+}
+
+/// A residency reset's record.
+#[cfg(feature = "gpu")]
+pub fn residency_reset(r: &ResetReport) -> Record {
+    Record::new(&RESIDENCY_RESET)
+        .u("cancelled", r.cancelled)
+        .u("copies", r.copies)
+        .u("diff", r.diff)
+        .u("dropped_bytes", r.dropped_bytes)
 }
 
 #[cfg(test)]

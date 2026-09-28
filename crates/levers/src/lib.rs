@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, ROUTE_TRACE,
-    SPIN, STEP_STATS, THREADS,
+    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, RESIDENCY,
+    ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -718,6 +718,13 @@ impl Levers {
     #[must_use]
     pub fn check_finite(&self) -> bool {
         self.flag(CHECK_FINITE)
+    }
+
+    /// `BLOOMERY_RESIDENCY`: `off`, or the adaptive residency rule's word,
+    /// whose grammar is `bloomery_gpu::host::swap::Residency::parse`.
+    #[must_use]
+    pub fn residency(&self) -> &'static str {
+        Levers::defaulted(RESIDENCY, self.word(RESIDENCY))
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

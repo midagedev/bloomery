@@ -156,6 +156,12 @@ gate-gpu-e2e *ARGS:
 gate-gpu-hybrid *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
 
+# 적응형 residency 기계 게이트(모델 파일 없음, 합성 스택): 같은 이력 = 같은 값(복사 시점과 무관), 정적 재배치와 비트 동일,
+# 늦은 복사는 스트림이 기다림, 호스트·카드 맵이 한 id를 두 번 또는 0번 서비스하지 않음, reset은 시드로, 호스트 비상주
+# 희생자는 이름으로 거부, 고정 시드는 움직이지 않음(adaptres §4 c1–c5·c7).
+gate-gpu-swap *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_swap && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_swap {{ARGS}}'
+
 # 양자화 모델의 정확한 수학(가중치는 정확히 역양자화, 활성·어텐션은 f64, q8·f16 반올림 없음)으로 교사 강제 자의
 # 한 프롬프트를 푼다: 스텝마다 정확 top1·마진·ik 토큰 격차. 두 엔진(우리, ik)이 갈리는 자리의 심판이다.
 # CPU 64스레드를 쓰므로 기계 전역 임대를 잡는다. 예: `just exact-ref 12 --steps 23`, `--kv f16`은 캐시 f16 반올림 팔.

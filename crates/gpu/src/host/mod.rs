@@ -100,6 +100,7 @@ pub mod route_trace;
 pub mod run;
 pub mod slots;
 pub mod step;
+pub mod swap;
 pub mod tier;
 
 pub use leg::{BatchLeg, StepLeg};
