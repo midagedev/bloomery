@@ -237,7 +237,8 @@ impl Gemm32Kernels {
     /// first `n` columns of `x`, `w` an F32 weight of `rows × k` (module
     /// doc): every output bit for bit `Q8F32Kernels::enqueue_f32_gemv`'s for
     /// its row and column. `k` must be a positive multiple of 64 (the
-    /// staged line); another is a named `Shape` error. Asynchronous,
+    /// staged line) and `w` and `x` 16-byte aligned (the staged copies are
+    /// 16-byte pieces); another is a named `Shape` error. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_f32_tile(
         &self,
@@ -271,6 +272,13 @@ impl Gemm32Kernels {
                     x.len(),
                     y.len()
                 ),
+            ));
+        }
+        let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
+        if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
+            return Err(GpuError::shape(
+                what,
+                format!("w at {w_at:#x}, x at {x_at:#x}: both must be 16-byte aligned"),
             ));
         }
         let grid = n.div_ceil(TILE_COLS) * rows.div_ceil(TILE_ROWS);

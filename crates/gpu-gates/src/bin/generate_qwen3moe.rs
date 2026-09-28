@@ -406,11 +406,12 @@ mod cli {
         fn plan(m: &Qwen38Model, n: usize, path: Prompt38) -> Result<Units, GateError> {
             let path = path.resolve(n);
             Ok(match path {
-                Prompt38::Gemm | Prompt38::Auto => {
-                    let rows = m.body("plan")?.ubatch_rows();
+                Prompt38::Gemm => {
                     let plan = PrefillPlan {
-                        steps: (0..n.div_ceil(rows))
-                            .map(|i| PrefillStep::Ubatch(rows.min(n - i * rows)))
+                        steps: m
+                            .body("plan")?
+                            .ubatch_cut(n)
+                            .map(PrefillStep::Ubatch)
                             .collect(),
                     };
                     Units {
@@ -435,6 +436,12 @@ mod cli {
                         ..Units::from(&plan)
                     }
                 }
+                Prompt38::Auto => {
+                    return Err(format!(
+                        "prompt path auto at {n} positions: `Prompt38::resolve` returned `auto`"
+                    )
+                    .into());
+                }
             })
         }
 
@@ -448,17 +455,18 @@ mod cli {
             let after = m.body("prefill")?.hybrid().stats();
             let served = after.batch_served - before.batch_served;
             let ns = after.batch_ns - before.batch_ns;
+            // No service, no time a service: `-`, never a plausible 0.
+            let per_service = if served == 0 {
+                "-".to_string()
+            } else {
+                format!("{:.4}", ns as f64 / 1e6 / served as f64)
+            };
             println!(
                 "stat prompt host services={served} cols={} host_slots={} union_ms={:.3} \
-                 per_service_ms={:.4}",
+                 per_service_ms={per_service}",
                 after.batch_cols - before.batch_cols,
                 after.batch_host_slots - before.batch_host_slots,
                 ns as f64 / 1e6,
-                if served == 0 {
-                    0.0
-                } else {
-                    ns as f64 / 1e6 / served as f64
-                }
             );
             Ok(next)
         }

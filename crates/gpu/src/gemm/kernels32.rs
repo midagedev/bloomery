@@ -172,7 +172,9 @@ mod gemm32_kernels {
                 silu_mul(*g.get_unchecked(base + 3), *u.get_unchecked(base + 3)),
             ]
         };
-        // SAFETY: as in `quantize_gemm32`.
+        // SAFETY: the warp enters with one (col, gi), col < n_cols and gi <
+        // groups = ceil(blocks / 4); the planes' bounds are the launch
+        // contract's.
         let refused = unsafe {
             quant32_group(
                 v,
