@@ -883,8 +883,9 @@ pub static RESIDENCY_PASS: Kind = Kind {
           prompt call's rows are not counted — abandoned, or driver: the machine's own test \
           driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
-          the bytes its flips copy; the host's microseconds waiting for the landing jobs' \
-          staging and issuing the new flips' copies, and the staging thread's since the last \
+          the bytes its flips copy; the host's microseconds folding the pass into the rule and in \
+          the whole boundary call, of \
+          them waiting for the landing jobs' staging and issuing the new flips' copies, and the staging thread's since the last \
           boundary copying into the ring and preparing victims.",
     parts: &[
         key("pass", Word, ""),
@@ -895,6 +896,8 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("made", U64, ""),
         key("in_flight", U64, ""),
         key("bytes", U64, "B"),
+        key("end_us", U64, "us"),
+        key("boundary_us", U64, "us"),
         key("wait_us", U64, "us"),
         key("issue_us", U64, "us"),
         key("stage_us", U64, "us"),
@@ -1496,6 +1499,8 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("made", r.made)
         .u("in_flight", r.in_flight)
         .u("bytes", r.bytes)
+        .u("end_us", r.end_us)
+        .u("boundary_us", r.boundary_us)
         .u("wait_us", r.wait_us)
         .u("issue_us", r.issue_us)
         .u("stage_us", r.stage_us)

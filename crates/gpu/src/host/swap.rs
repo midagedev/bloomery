@@ -743,6 +743,12 @@ pub struct PassReport {
     pub in_flight: usize,
     /// Bytes this boundary's flips copy.
     pub bytes: u64,
+    /// Host microseconds of the pass's end before this boundary (the fold of
+    /// its kept rows into the rule).
+    pub end_us: u64,
+    /// Host microseconds of the whole boundary call: the wait, the landing,
+    /// the plan and the issue.
+    pub boundary_us: u64,
     /// Host microseconds this boundary waited for its landing jobs' staging.
     pub wait_us: u64,
     /// Host microseconds this boundary spent issuing its flips' copies (the
@@ -847,6 +853,9 @@ pub struct SwapMachine {
     /// The boundary planned last; `None` until the first.
     planned: Option<u64>,
     kept: usize,
+    /// Host microseconds the last pass's end took (the fold into the rule),
+    /// for the next boundary's report.
+    end_us: u64,
     ops: Vec<sys::CUstreamBatchMemOpParams>,
     changed: Vec<(usize, u32, u32)>,
     /// The error that broke the machine, named in every later refusal.
@@ -952,6 +961,7 @@ impl SwapMachine {
             events,
             jobs_issued: 0,
             planned: None,
+            end_us: 0,
             kept: 0,
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
@@ -1253,6 +1263,7 @@ impl SwapMachine {
     /// the experts. A failure of the fold itself breaks the machine.
     pub fn end_pass(&mut self, tally: &mut Tally, kept: usize) -> Result<(), GpuError> {
         const WHAT: &str = "SwapMachine::end_pass";
+        let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
         if self.planned != Some(self.rule.passes()) {
             return Err(GpuError::state(WHAT, "a boundary before the pass"));
@@ -1290,6 +1301,7 @@ impl SwapMachine {
         self.after_change(folded, &at)?;
         tally.clear();
         self.kept = kept;
+        self.end_us = micros(start);
         Ok(())
     }
 
@@ -1372,6 +1384,7 @@ impl SwapMachine {
         slots: &mut SlotMap,
     ) -> Result<PassReport, GpuError> {
         const WHAT: &str = "SwapMachine::boundary";
+        let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
         let b = self.rule.passes();
         if self.planned == Some(b) {
@@ -1383,6 +1396,7 @@ impl SwapMachine {
         let mut report = PassReport {
             boundary: b,
             kept: if b == 0 { 0 } else { self.kept },
+            end_us: std::mem::take(&mut self.end_us),
             ..PassReport::default()
         };
         for f in &landing {
@@ -1412,6 +1426,7 @@ impl SwapMachine {
         report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
         self.planned = Some(b);
+        report.boundary_us = micros(start);
         Ok(report)
     }
 
@@ -1826,6 +1841,7 @@ impl SwapMachine {
         self.rule.reset();
         self.planned = None;
         self.kept = 0;
+        self.end_us = 0;
         for (i, l) in self.layers.clone().enumerate() {
             let seed = self.rule.seed(i).map_err(|e| rule_err(WHAT, e))?;
             let live: Vec<u32> = (0..self.n_expert as u32)
