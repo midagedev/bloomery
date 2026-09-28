@@ -397,6 +397,19 @@ fn micros(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Where the staging thread runs: the SMT sibling of the pool's first
+/// worker. The copies are DRAM streams that sweep a ring slot's worth of L3,
+/// so not beside the dispatcher (the critical path, whose sibling the engram
+/// helper takes): the first worker's core sits on another CCD than the
+/// dispatcher's. The copies run while the pool waits for its go, so that
+/// worker only spins beside them. With no pinned pool, floating.
+fn staging_placement() -> threads::helper::Placement {
+    match threads::built().and_then(|p| p.worker_cpu(0)) {
+        Some(c) => threads::helper::Placement::Sibling(c),
+        None => threads::helper::Placement::Float,
+    }
+}
+
 /// Job `n`'s ring slot and its ticket there (its use of that slot, from 1):
 /// the one owner of the job → ring mapping.
 fn ring_ticket(n: u64) -> Result<(usize, u32), GpuError> {
@@ -1200,14 +1213,15 @@ impl SwapMachine {
         // may be pinned to one cpu, and the staging copies would take turns
         // with the step on it. The thread binds the context first: the
         // source's calls on it may reach the driver.
-        let (thread, _) = threads::helper::spawn_helper("swap-staging", None, move || {
-            let bound = ctx.bind_to_thread().map_err(GpuError::from);
-            let ok = bound.is_ok();
-            if bound_tx.send(bound).is_ok() && ok {
-                for_thread.run(&rx);
-            }
-        })
-        .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
+        let (thread, _) =
+            threads::helper::spawn_helper("swap-staging", staging_placement(), move || {
+                let bound = ctx.bind_to_thread().map_err(GpuError::from);
+                let ok = bound.is_ok();
+                if bound_tx.send(bound).is_ok() && ok {
+                    for_thread.run(&rx);
+                }
+            })
+            .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
         match bound_rx.recv() {
             Ok(Ok(())) => Ok(Staging { shared, tx, thread }),
             // The thread is ending: joined here, so its reference to the

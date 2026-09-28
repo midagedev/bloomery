@@ -1421,7 +1421,7 @@ mod drive {
                 }
             }
             for h in threads::helper::helpers() {
-                record::helper(&h.name, h.pinned, h.cpus).print();
+                record::helper(&h.name, h.asked, h.pinned, h.cpus).print();
             }
             Ok(())
         }
