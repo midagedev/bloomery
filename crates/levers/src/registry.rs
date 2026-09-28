@@ -567,8 +567,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("4096"),
-        doc: "Qwen3 GEMM prefill: tokens per ubatch, read at load; a token's bits do not \
-              depend on it. The `load` line prints `ubatch=`.",
+        doc: "Qwen3 and Qwen3.8 GEMM prefill: tokens per ubatch, read at load (Qwen3.8 sizes \
+              its ubatch arena by it); a token's bits do not depend on it. The `load` line \
+              prints `ubatch=`.",
         site: Site::Direct {
             at: &[InPlace {
                 file: "crates/gpu/src/arch/qwen3moe/ubatch.rs",

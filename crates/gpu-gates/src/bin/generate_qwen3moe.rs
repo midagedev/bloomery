@@ -42,16 +42,19 @@
 //! (`model::arch::qwen35moe::place`: every layer, the head and the embedding
 //! on one card, every routed expert on the host tier) on the card `--place`
 //! names — `a` the A6000 (the default), `gate` the 3090 — and printed as a
-//! `plan` line. Its `--prefill` is `pass` (the default: eager passes of up
-//! to eight positions through the host tier's batch port) or `step` (one
-//! captured step a position); `auto` and `gemm` are refused by name (it has
-//! no ubatch GEMM path), and so are `--seed-depth` (no synthetic depth) and
-//! `--prompt` (the tokenizer, as for qwen35moe). Its `load` line names
-//! `store_bytes=`, `prefill=` and `place=`; in graph mode its `capture` line
-//! counts the step graph's nodes by kind against the program's count, and a
-//! mismatch ends the run by name. Its plan prints as `step:1x<P>` or
-//! `pass:<sizes>`, and `time prompt`'s `kind=` is `step` or `pass`. `--place`
-//! on any other file is refused by name.
+//! `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
+//! of nine positions or more, `pass` below), `gemm` (ubatches of up to the
+//! load's size through the host tier's batch port at their width, the Q8_0
+//! projections on q8 activations), `pass` (eager passes of up to eight
+//! positions through the same port) or `step` (one captured step a
+//! position); `--seed-depth` is refused by name (no synthetic depth), and so
+//! is `--prompt` (the tokenizer, as for qwen35moe). Its `load` line names
+//! `store_bytes=`, `prefill=`, `ubatch=` and `place=`; in graph mode its
+//! `capture` line counts the step graph's nodes by kind against the
+//! program's count, and a mismatch ends the run by name. Its plan prints as
+//! `step:1x<P>`, `pass:<sizes>` or `ubatch:<sizes>`, and `time prompt`'s
+//! `kind=` is the path the prompt ran — `step`, `pass` or `gemm`, never
+//! `auto`. `--place` on any other file is refused by name.
 //!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
@@ -370,16 +373,31 @@ mod cli {
     impl Prompted for Body38 {
         type Path = Prompt38;
 
-        /// `pass` (the default) or `step`; `auto` and `gemm` are refused by
-        /// `Prompt38::parse`, naming what the ubatch path lacks here.
+        /// `auto` (the default), `gemm`, `pass` or `step`
+        /// (`Prompt38::parse`).
         fn path(arg: Option<&str>) -> Result<Prompt38, GateError> {
-            Ok(arg.map_or(Ok(Prompt38::Pass), Prompt38::parse)?)
+            Ok(arg.map_or(Ok(Prompt38::Auto), Prompt38::parse)?)
         }
 
-        /// `step:1x<n>` — one captured step a position — or the pass cut
-        /// `pass:<sizes>`.
-        fn plan(_: &Qwen38Model, n: usize, path: Prompt38) -> Result<Units, GateError> {
+        /// `step:1x<n>` — one captured step a position — the pass cut
+        /// `pass:<sizes>`, or the ubatch cut `ubatch:<sizes>`; the kind is
+        /// the path `auto` resolves to.
+        fn plan(m: &Qwen38Model, n: usize, path: Prompt38) -> Result<Units, GateError> {
+            let path = path.resolve(n);
             Ok(match path {
+                Prompt38::Gemm | Prompt38::Auto => {
+                    let rows = m.body("plan")?.ubatch_rows();
+                    let plan = PrefillPlan {
+                        steps: (0..n.div_ceil(rows))
+                            .map(|i| PrefillStep::Ubatch(rows.min(n - i * rows)))
+                            .collect(),
+                    };
+                    Units {
+                        kind: path.name(),
+                        ubatch_tokens: 0,
+                        ..Units::from(&plan)
+                    }
+                }
                 Prompt38::Step => Units {
                     text: if n == 1 {
                         "step:1".to_string()
@@ -400,8 +418,29 @@ mod cli {
             })
         }
 
+        /// The prompt by `path`, then a `stat prompt host` line: the host
+        /// tier's batch services the prompt took, their columns and host
+        /// slots, and the union calls' wall — the host term of a pass's or a
+        /// ubatch's layer.
         fn prefill(m: &mut Qwen38Model, ids: &[u32], path: Prompt38) -> Result<u32, GateError> {
-            Ok(m.prompt38(ids, path)?)
+            let before = m.body("prefill")?.hybrid().stats();
+            let next = m.prompt38(ids, path)?;
+            let after = m.body("prefill")?.hybrid().stats();
+            let served = after.batch_served - before.batch_served;
+            let ns = after.batch_ns - before.batch_ns;
+            println!(
+                "stat prompt host services={served} cols={} host_slots={} union_ms={:.3} \
+                 per_service_ms={:.4}",
+                after.batch_cols - before.batch_cols,
+                after.batch_host_slots - before.batch_host_slots,
+                ns as f64 / 1e6,
+                if served == 0 {
+                    0.0
+                } else {
+                    ns as f64 / 1e6 / served as f64
+                }
+            );
+            Ok(next)
         }
 
         /// No ubatch runs: no image.
@@ -751,12 +790,13 @@ mod cli {
         let body = m.body("generate_qwen3moe")?;
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} place={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.layers().len(),
             mode_name(mode),
             body.store_bytes(),
             path.name(),
+            body.ubatch_rows(),
             place.name(),
             t.elapsed().as_secs_f64()
         );
