@@ -106,7 +106,7 @@
 
 **GLM**: 배치 프리필 시간 측정 쌍 `glmppa-pp.card`(7–11분, glmwarm 러너 위). R2 제안: 층별 체크포인트 take + G = 2 → pp2048 +20…+27 %[유도]. chunked KDA는 밴드 게이트와 함께 R2 이후. 선택기 절 10은 ik CPU flash가 우리 밴드의 10–30배 밖이라 ik 거리를 출력만 한다 — ik 오차 모델(f16 누산)을 유도하면 단언으로 되돌린다(M).
 
-**V4.1**: `hotlist-384.txt`는 퇴역 requant(engramQ8-tokembdBF16-attnQ8)의 라우팅으로 학습됐다 — 03 시팅이 공개 파일로 다시 트레이스하고 [0, 24576)에서 held-out 목록(`hotlist-pub-seed.txt`)을 만든다; 공정 재측정 전 조건. 클립(toktape)은 serve + DSpark(servedraft)로 지금 구성에서도 찍을 수 있고, 드래프트가 켜지면 temperature > 0은 이름 붙은 400이라 `--temp 0`.
+**V4.1 hot list (사용자 결정 09-28).** 코퍼스에서 배운 hot list는 기본값에서 뺀다. 기본 배치는 id 접두(목록 없음)이고, 공개 헤드라인은 이 기본값으로 잰다. 방향은 사용자별 사용 프로필이다. 엔진이 자기 라우터 선택을 층마다 384개 카운트로 세고(디코드와 프리필 모두, 호스트가 이미 id를 갖고 있다), 다음 로드가 그 카운트로 순위를 매긴다. 재배치는 로드 때만 하고 생성 중에는 바꾸지 않으므로, 동시 세션은 같은 카운트에 더해질 뿐이다. 공개하는 "사용 N토큰 뒤" 행은 held-out으로 잰다: 대화 앞 절반으로 배우고 뒤 절반에서 잰다. 설계 라운드는 e1이 아래 숫자가 나온 뒤 연다. `hotlist-384.txt`로 돈 과거 prose·code 행은 목록이 같은 코퍼스에서 배웠으므로 in-sample이다. rig-log의 그 행들에 선을 긋고 "목록 in-sample" 주를 단다(e1). lcg 행은 잰 그대로 두지만 실사용 헤드라인이 아니다. 지금 정직한 채팅 디코드는 A6000에서 약 26–27 tok/s다[손 계측 진단, 임대 없음, e1 hotdiag]. 03의 조각 D: D1은 공개 파일 목록(`hotlist-pub-seed.txt`)을 제품으로 만들지 않고, 파일·빌드 분리(`router-attr.card`, 4k 추적 둘: 우리 엔진의 라우팅이 ik와 맞는지)만 남는다. D2 채팅 세트(자체 작성 프롬프트 약 80개, 프롬프트 단위 학습/held-out; 한국어 20개는 리드가 써 둠)는 사용자별 프로필의 held-out 측정 세트 후보로, 프로필 설계가 필요한 것을 정할 때까지 보류한다. 클립(toktape)은 serve + DSpark(servedraft)로 지금 구성에서도 찍을 수 있고, 드래프트가 켜지면 temperature > 0은 이름 붙은 400이라 `--temp 0`.
 
 **도구·게이트 (각 한 줄)**
 - `router-coverage.py`·`router-hotlist.py`의 모델 정체성 basename 비교 → 첫 샤드 전체 경로(toolfix·hotlistid가 닫음).
