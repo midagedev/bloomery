@@ -27,6 +27,7 @@ pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
 pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
+pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -292,6 +293,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `off` reads the source, the same-binary arm; both write the same bits. The load \
               prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
               (no sidecar at <path>: just r8-sidecar)`.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: RESIDENCY,
+        class: Class::C,
+        kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1"]),
+        default: Unset::Is("off"),
+        doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
+              model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
+              stage card's routed stacks, the first P seed experts of each layer never a victim \
+              and S slots a layer freed for flips in flight. No binary acts on it yet: each \
+              refuses it set, by name, until its model adapter lists it at `main`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

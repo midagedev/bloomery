@@ -18,6 +18,12 @@
 #    or a prefix, not a name.
 # 3. A registry row that is no lever names its owner: a script under tools/ that names the variable,
 #    or, with no script, a harness whose read is a line of the list.
+# 4. A lever read in place in crates/*/src sits in a function something in the crates calls — `main`
+#    and a `#[test]` count as reached: a registered reader nothing calls is a lever that reaches no
+#    binary, so a value set for it runs the default without a word. A caller is found by name: an
+#    associated function of an inherent impl as `Type::name` (or `Self::name` in its file), a method
+#    as `.name(` or `Type::name`, a free function as its name anywhere but its own `fn`. By name it
+#    can take another item of the same name for a caller, never miss one.
 # The registry's in-place rows and the list are held to each other by the levers crate's test
 # registry_and_allow_list_agree (just gate-levers), which reads this list at build time.
 set -euo pipefail
@@ -254,6 +260,167 @@ for name, script in env_rows:
         bad.append(f'{registry_path[len(root) + 1:]}: {name} names tools/{script} as its owner, '
                    'which does not name it')
 
+# 4. Every lever read in place in crates/*/src is reached.
+lever_names = rows - {name for name, _ in env_rows}
+
+
+def block_end(text, open_at):
+    """The index of the brace that closes the one at open_at; strings, char literals and comments
+    are skipped whole."""
+    depth, i, n = 0, open_at, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == "'":
+            m = re.match(r"'(?:\\.|[^\\'])'", text[i:])
+            if m:
+                i += m.end()
+                continue
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+IMPL = re.compile(r'\bimpl\b(?:\s*<(?:[^<>{]|<[^<>{]*>)*>)?\s+([^{;]+?)\s*(?:where\b[^{]*)?\{')
+
+
+def fn_spans(text):
+    """(start, end, name, takes self) of every fn with a body."""
+    out = []
+    for m in FN.finditer(text):
+        params = balanced(text, m.end() - 1)
+        if params is None:
+            continue
+        brace = text.find('{', m.end() - 1 + len(params) + 2)
+        semi = text.find(';', m.end() - 1 + len(params) + 2)
+        if brace < 0 or (0 <= semi < brace):
+            continue
+        first = split_args(params)[:1]
+        takes_self = bool(first) and re.search(r'\bself\b', first[0]) is not None
+        out.append((m.start(), block_end(text, brace), m.group(1), takes_self))
+    return out
+
+
+def impl_spans(text):
+    """(start, end, type, is a trait impl) of every impl block."""
+    out = []
+    for m in IMPL.finditer(text):
+        head = m.group(1)
+        trait = re.search(r'\bfor\b', head) is not None
+        ty = head.split(' for ')[-1].strip()
+        ty = re.sub(r'<.*', '', ty).split('::')[-1].strip()
+        out.append((m.start(), block_end(text, m.end() - 1), ty, trait))
+    return out
+
+
+def code_only(text):
+    """`text` with every comment and the inside of every string and char literal blanked, lines
+    and offsets kept: a name in a message or a doc is no call."""
+    out, i, n = list(text), 0, len(text)
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != '\n':
+                out[k] = ' '
+    while i < n:
+        if text.startswith('//', i):
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            blank(i + 1, j)
+            i = j + 1
+        elif text[i] == "'" and re.match(r"'(?:\\.|[^\\'])'", text[i:]):
+            j = i + re.match(r"'(?:\\.|[^\\'])'", text[i:]).end()
+            blank(i + 1, j - 1)
+            i = j
+        else:
+            i += 1
+    return ''.join(out)
+
+
+code_files = {}
+for path in sources():
+    code_files[os.path.relpath(path, root)] = open(path, encoding='utf-8').read()
+code_lines = {rel: text.split('\n') for rel, text in code_files.items()}
+bare = {rel: code_only(text) for rel, text in code_files.items()}
+
+
+def called(pattern, same_file=None, self_pattern=None):
+    rx = re.compile(pattern)
+    for rel, text in bare.items():
+        pats = [rx] + ([re.compile(self_pattern)] if self_pattern and rel == same_file else [])
+        for p in pats:
+            for m in p.finditer(text):
+                if re.search(r'\bfn\s+$', text[max(0, m.start() - 8):m.start()]):
+                    continue
+                return True
+    return False
+
+
+lever_reads = 0
+for rel in sorted(reads):
+    if not re.match(r'crates/[^/]+/src/', rel):
+        continue
+    text = code_files[rel]
+    fns = fn_spans(text)
+    impls = impl_spans(text)
+    for n, var, code in reads[rel]:
+        if var not in lever_names:
+            continue
+        lever_reads += 1
+        at = sum(len(l) + 1 for l in code_lines[rel][:n - 1])
+        encl = [f for f in fns if f[0] <= at <= f[1]]
+        if not encl:
+            bad.append(f'{rel}:{n}: reads lever {var} outside any function: {code}')
+            continue
+        start, _, name, takes_self = max(encl, key=lambda f: f[0])
+        head = text[:start].rstrip()
+        if name == 'main' or re.search(r'#\[test\]\s*(?:#\[[^\]]*\]\s*)*$', head):
+            continue
+        owner = [i for i in impls if i[0] <= start <= i[1]]
+        if owner:
+            _, _, ty, trait = max(owner, key=lambda i: i[0])
+            if trait or takes_self:
+                pattern = r'(?:\.' + name + r'\s*(?:::<[^>]*>)?\s*\(|\b' + ty + r'::' + name + r'\b)'
+            else:
+                pattern = r'\b' + ty + r'::' + name + r'\b'
+            reached = called(pattern, rel, r'\bSelf::' + name + r'\b')
+            who = f'{ty}::{name}'
+        else:
+            reached = called(r'(?<![\w])' + name + r'\b')
+            who = name
+        if not reached:
+            bad.append(f'{rel}:{n}: reads lever {var} in place in {who}, which nothing in crates/ '
+                       'calls: the lever reaches no binary and a value set for it runs the default '
+                       'without a word; call the reader, or make the row Parsed so every binary '
+                       'refuses it by name until one acts on it')
+
 if bad:
     for b in bad:
         print(b, file=sys.stderr)
@@ -265,5 +432,6 @@ if bad:
 count = sum(len(v) for v in reads.values())
 print(f'check-levers: ok ({count} reads in place in {len(reads)} files, all listed; '
       f'{len(names)} BLOOMERY_* names in tools/, the justfile and .cargo/, all rows; '
-      f'{len(env_rows)} rows that are no lever, each named by its owner)')
+      f'{len(env_rows)} rows that are no lever, each named by its owner; {lever_reads} lever '
+      'reads in crates/*/src, each in a function something calls)')
 PY

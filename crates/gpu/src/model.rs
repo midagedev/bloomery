@@ -136,6 +136,25 @@ pub trait HostServed {
     /// held by the host tier for its lifetime ([`GpuModel::load_placed`]);
     /// `None` on any other load.
     fn host_residency(&self) -> Option<&HostResidency>;
+
+    /// The residency boundary before a replay's launch, on the engine
+    /// stream `stream` ([`crate::host::swap::SwapMachine::boundary`]): the
+    /// flips live here land and the next ones are issued. A body with no
+    /// residency machine does nothing, the load's slot map for the model's
+    /// life.
+    ///
+    /// The contract a body with a machine relies on: it is called once
+    /// before every launch that reads the slot map, after the chain it
+    /// launches is known to exist, and after the previous pass's host
+    /// service has returned, so every host word the engine stream's enqueued
+    /// work waits on is written. `GpuModel::replay` is the only caller: the
+    /// eager path (`GpuModel::enqueue_chain_step`) and the prompt call
+    /// have no boundary, so a body with a machine must not run them until
+    /// each has its own.
+    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let _ = stream;
+        Ok(())
+    }
 }
 
 /// The host service of a body whose chain runs on the card alone: no value
@@ -673,15 +692,20 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// Launch the captured chain of `rows` rows and serve the host's share
     /// of the replay, as `chain`, when the body has a host service: the only
-    /// place a captured chain is replayed.
+    /// place a captured chain is replayed. The host service's residency
+    /// boundary runs first, once the chain is known to exist
+    /// ([`HostServed::at_boundary`]).
     fn replay(&mut self, rows: usize, chain: Chain) -> Result<(), GpuError> {
         let GpuModel {
             graphs, body, gpu, ..
         } = self;
-        graphs
+        let graph = graphs
             .get(rows)
-            .ok_or(GpuError::state("GpuModel::replay", "no captured chain"))?
-            .launch(gpu.stream())?;
+            .ok_or(GpuError::state("GpuModel::replay", "no captured chain"))?;
+        if let Some(host) = body.host() {
+            host.at_boundary(gpu.stream())?;
+        }
+        graph.launch(gpu.stream())?;
         match body.host() {
             Some(host) => host.serve_captured(chain),
             None => Ok(()),

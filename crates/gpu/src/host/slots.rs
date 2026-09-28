@@ -9,7 +9,7 @@ use std::ops::Range;
 pub const HOST: u32 = u32::MAX;
 
 /// The bit that marks an entry `TIER | s` as slot `s` of the tier card.
-/// `TIER | s` equals [`HOST`] only at `s = 2^31 - 1`, which `s < k_tier <=
+/// `TIER | s` equals [`HOST`] only at `s = 2^31 - 1`, which `s < capacity <=
 /// n_expert < 2^31` ([`SlotMap::from_rows`]) rules out.
 pub const TIER: u32 = 1 << 31;
 
@@ -44,15 +44,26 @@ impl Slot {
 /// the host serves an id exactly when [`SlotMap::slot`] says [`Slot::Host`],
 /// and a card copy is one device's view of the rows
 /// ([`SlotMap::stage_view`], [`SlotMap::tier_view`]), never the rows.
+///
+/// Per row and device the map holds a capacity — the slots of that device's
+/// stacks in the layer — and the live entries, which name distinct slots
+/// below it. A slot no live entry names is free: no id reaches it, so no
+/// kernel reads it, whatever its bytes are. A load's map has capacity = live
+/// ([`SlotMap::from_rows`]); the residency machine frees and fills slots
+/// between passes through [`SlotMap::evict`] and [`SlotMap::admit`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotMap {
     layers: Range<usize>,
     n_expert: usize,
     slots: Vec<u32>,
-    /// Per row, the experts on the stage card.
+    /// Per row, the experts on the stage card: its live count.
     on_card: Vec<usize>,
-    /// Per row, the experts on the tier card.
+    /// Per row, the experts on the tier card: its live count.
     on_tier: Vec<usize>,
+    /// Per row, the stage card's slots.
+    cap_card: Vec<usize>,
+    /// Per row, the tier card's slots.
+    cap_tier: Vec<usize>,
 }
 
 impl SlotMap {
@@ -72,11 +83,12 @@ impl SlotMap {
     }
 
     /// The map from its rows: `layers.len()` rows of `n_expert` entries, with
-    /// `n_expert < 2^31`. Per row and device, the slots of the row's `k`
-    /// experts on that device are `0..k`, each once; an expert has one entry,
-    /// so it is on one device at most. A row that breaks this — a gap, a slot
-    /// twice, a slot at or past its device's count, an entry past `n_expert`
-    /// that is not [`HOST`] — is refused by name.
+    /// `n_expert < 2^31`, each device's capacity in a row its live count.
+    /// Per row and device, the slots of the row's `k` experts on that device
+    /// are then `0..k`, each once; an expert has one entry, so it is on one
+    /// device at most. A row that breaks this — a gap, a slot twice, a slot at
+    /// or past its device's count, an entry past `n_expert` that is not
+    /// [`HOST`] — is refused by name.
     pub fn from_rows(
         layers: Range<usize>,
         n_expert: usize,
@@ -110,12 +122,12 @@ impl SlotMap {
             card_taken.fill(false);
             tier_taken.fill(false);
             for &e in row {
-                let (s, taken, count, device) = match Slot::of(e) {
+                let (s, taken, capacity, device) = match Slot::of(e) {
                     Slot::Host => continue,
                     Slot::Card(s) => (s, &mut card_taken, k, "the card"),
                     Slot::Tier(s) => (s, &mut tier_taken, k_tier, "the tier"),
                 };
-                take_slot(taken, s, count, device)
+                take_slot(taken, s, capacity, device)
                     .map_err(|why| GpuError::shape(what, format!("layer {l}: {why}")))?;
             }
             on_card.push(k);
@@ -125,6 +137,8 @@ impl SlotMap {
             layers,
             n_expert,
             slots,
+            cap_card: on_card.clone(),
+            cap_tier: on_tier.clone(),
             on_card,
             on_tier,
         })
@@ -272,6 +286,108 @@ impl SlotMap {
         self.slots.iter().map(|&e| of(Slot::of(e))).collect()
     }
 
+    /// Send layer `layer`'s expert `id`, which the host computes, to `slot`, a
+    /// free slot of the stage card or the tier: the entry `HOST` becomes the
+    /// slot and the device's live count grows by one. Refused by name, the map
+    /// unchanged: a layer or an id outside the map, an id a card holds,
+    /// [`Slot::Host`], a slot at or past its device's capacity in the row, and
+    /// a slot a live entry of the row names.
+    pub fn admit(&mut self, layer: usize, id: u32, slot: Slot) -> Result<(), GpuError> {
+        const WHAT: &str = "SlotMap::admit";
+        let (at, i) = self.entry_at(layer, id, WHAT)?;
+        let (s, cap, code) = match slot {
+            Slot::Card(s) => (s, self.cap_card[i], s),
+            Slot::Tier(s) => (s, self.cap_tier[i], TIER | s),
+            Slot::Host => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} expert {id} to the host: that is SlotMap::evict"),
+                ));
+            }
+        };
+        if self.slots[at] != HOST {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} expert {id} is on {:?} already",
+                    Slot::of(self.slots[at])
+                ),
+            ));
+        }
+        if !usize::try_from(s).is_ok_and(|s| s < cap) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer}: {slot:?} is past the device's {cap} slots in the row"),
+            ));
+        }
+        let row = i * self.n_expert..(i + 1) * self.n_expert;
+        if let Some(other) = self.slots[row.clone()].iter().position(|&e| e == code) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer}: {slot:?} holds expert {other}"),
+            ));
+        }
+        self.slots[at] = code;
+        match slot {
+            Slot::Card(_) => self.on_card[i] += 1,
+            Slot::Tier(_) => self.on_tier[i] += 1,
+            Slot::Host => {}
+        }
+        Ok(())
+    }
+
+    /// Send layer `layer`'s expert `id` from its slot to the host and return
+    /// the slot, now free: the device's live count drops by one and its
+    /// capacity stays. Refused by name, the map unchanged: a layer or an id
+    /// outside the map, and an id the host computes already.
+    pub fn evict(&mut self, layer: usize, id: u32) -> Result<Slot, GpuError> {
+        const WHAT: &str = "SlotMap::evict";
+        let (at, i) = self.entry_at(layer, id, WHAT)?;
+        let slot = Slot::of(self.slots[at]);
+        match slot {
+            Slot::Card(_) => self.on_card[i] -= 1,
+            Slot::Tier(_) => self.on_tier[i] -= 1,
+            Slot::Host => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} expert {id} is on the host already"),
+                ));
+            }
+        }
+        self.slots[at] = HOST;
+        Ok(slot)
+    }
+
+    /// The entry index of layer `layer`'s expert `id` and the row's index,
+    /// or the refusal of `what` naming which is outside the map.
+    fn entry_at(
+        &self,
+        layer: usize,
+        id: u32,
+        what: &'static str,
+    ) -> Result<(usize, usize), GpuError> {
+        let at = self
+            .row_offset(layer)
+            .ok_or_else(|| self.outside(layer, what))?;
+        let e = usize::try_from(id)
+            .ok()
+            .filter(|&e| e < self.n_expert)
+            .ok_or_else(|| {
+                GpuError::shape(what, format!("expert {id} of {} a layer", self.n_expert))
+            })?;
+        Ok((at + e, at / self.n_expert))
+    }
+
+    fn outside(&self, layer: usize, what: &'static str) -> GpuError {
+        GpuError::shape(
+            what,
+            format!(
+                "layer {layer} is outside the map's layers {:?}",
+                self.layers
+            ),
+        )
+    }
+
     /// Layer `layer`'s row's first entry in either view, the card copy's word
     /// offset a kernel adds an expert id to; `None` for a layer the map has
     /// no row for. The one owner of that offset: [`SlotMap::row`] reads the
@@ -303,6 +419,20 @@ impl SlotMap {
         self.count(&self.on_tier, layer, "SlotMap::on_tier")
     }
 
+    /// The stage card's slots in layer `layer`: its stacks' rows over the
+    /// rows an expert takes, at least [`SlotMap::on_card`]; a layer the map
+    /// has no row for is refused by name.
+    pub fn capacity(&self, layer: usize) -> Result<usize, GpuError> {
+        self.count(&self.cap_card, layer, "SlotMap::capacity")
+    }
+
+    /// The tier card's slots in layer `layer`, at least
+    /// [`SlotMap::on_tier`]; a layer the map has no row for is refused by
+    /// name.
+    pub fn tier_capacity(&self, layer: usize) -> Result<usize, GpuError> {
+        self.count(&self.cap_tier, layer, "SlotMap::tier_capacity")
+    }
+
     fn count(
         &self,
         per_row: &[usize],
@@ -313,25 +443,17 @@ impl SlotMap {
             .checked_sub(self.layers.start)
             .and_then(|i| per_row.get(i))
             .copied()
-            .ok_or_else(|| {
-                GpuError::shape(
-                    what,
-                    format!(
-                        "layer {layer} is outside the map's layers {:?}",
-                        self.layers
-                    ),
-                )
-            })
+            .ok_or_else(|| self.outside(layer, what))
     }
 }
 
-/// Marks slot `s` of a device whose row holds `count` experts: the row's
-/// slots on it must be `0..count`, each once, so a slot at or past `count` or
-/// taken before is refused, with why.
-fn take_slot(taken: &mut [bool], s: u32, count: usize, device: &str) -> Result<(), String> {
+/// Marks slot `s` of a device with `capacity` slots in the row: the row's
+/// live slots on it must be distinct and below `capacity`, so a slot at or
+/// past it or taken before is refused, with why.
+fn take_slot(taken: &mut [bool], s: u32, capacity: usize, device: &str) -> Result<(), String> {
     let Some(seen) = usize::try_from(s)
         .ok()
-        .filter(|&i| i < count)
+        .filter(|&i| i < capacity)
         .and_then(|i| taken.get_mut(i))
     else {
         return Err(
@@ -342,7 +464,7 @@ fn take_slot(taken: &mut [bool], s: u32, count: usize, device: &str) -> Result<(
                     taken.len()
                 )
             } else {
-                format!("slot {s} on {device}, and the row puts {count} experts there")
+                format!("slot {s} on {device}, and the row has {capacity} slots there")
             },
         );
     };
@@ -478,7 +600,109 @@ mod tests {
         for layer in [0, 3] {
             assert!(map.on_card(layer).is_err(), "on_card({layer})");
             assert!(map.on_tier(layer).is_err(), "on_tier({layer})");
+            assert!(map.capacity(layer).is_err(), "capacity({layer})");
+            assert!(map.tier_capacity(layer).is_err(), "tier_capacity({layer})");
         }
+    }
+
+    /// A map from its rows alone has each device's capacity at its live
+    /// count, the load's map: capacity = live, slots `0..k` each once.
+    #[test]
+    fn from_rows_has_capacity_equal_to_live() {
+        let t = |s: u32| TIER | s;
+        let map = SlotMap::from_rows(
+            0..2,
+            5,
+            vec![1, 0, t(0), HOST, HOST, HOST, HOST, 0, t(1), t(0)],
+        )
+        .expect("two rows");
+        assert_eq!(
+            (map.capacity(0).ok(), map.on_card(0).ok()),
+            (Some(2), Some(2))
+        );
+        assert_eq!(
+            (map.tier_capacity(0).ok(), map.on_tier(0).ok()),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            (map.capacity(1).ok(), map.on_card(1).ok()),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            (map.tier_capacity(1).ok(), map.on_tier(1).ok()),
+            (Some(2), Some(2))
+        );
+    }
+
+    /// An eviction frees its slot and an admission fills a free one: the live
+    /// count moves, the capacity stays, the stage card's copy follows; each
+    /// refusal leaves the map unchanged.
+    #[test]
+    fn evict_then_admit_moves_one_entry() {
+        let h = HOST;
+        let mut map = SlotMap::from_rows(4..5, 6, vec![0, 2, 1, h, TIER, h]).expect("a full row");
+        assert_eq!(map.evict(4, 1).ok(), Some(Slot::Card(2)));
+        assert_eq!(map.row(4), Some(&[0, h, 1, h, TIER, h][..]));
+        let before = map.clone();
+        let refused = |r: Result<(), crate::GpuError>, map: &SlotMap, why: &str| {
+            assert!(r.is_err(), "{why}");
+            assert_eq!(*map, before, "{why}: the map moved");
+        };
+        refused(map.admit(4, 0, Slot::Card(2)), &map, "an id on the card");
+        refused(map.admit(4, 4, Slot::Card(2)), &map, "an id on the tier");
+        refused(
+            map.admit(4, 1, Slot::Card(1)),
+            &map,
+            "a slot another id holds",
+        );
+        refused(
+            map.admit(4, 1, Slot::Card(3)),
+            &map,
+            "a slot at the capacity",
+        );
+        refused(
+            map.admit(4, 1, Slot::Tier(0)),
+            &map,
+            "a tier slot the tier holds",
+        );
+        refused(map.admit(4, 1, Slot::Host), &map, "the host");
+        refused(map.admit(3, 1, Slot::Card(2)), &map, "a layer outside");
+        refused(map.admit(4, 6, Slot::Card(2)), &map, "an id outside");
+        assert!(
+            map.evict(4, 1).is_err() && map == before,
+            "an id on the host"
+        );
+
+        map.admit(4, 1, Slot::Card(2)).expect("a free slot");
+        assert_eq!(map.row(4), Some(&[0, 2, 1, h, TIER, h][..]));
+        assert_eq!(
+            (map.on_card(4).ok(), map.capacity(4).ok()),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            map.stage_view(),
+            [0, 2, 1, h, h, h],
+            "the tier's entry is HOST in the stage card's copy"
+        );
+        assert_eq!(map.evict(4, 0).ok(), Some(Slot::Card(0)));
+        assert_eq!(map.evict(4, 4).ok(), Some(Slot::Tier(0)));
+        assert_eq!(map.row(4), Some(&[h, 2, 1, h, h, h][..]));
+        assert_eq!(
+            (map.on_card(4).ok(), map.capacity(4).ok()),
+            (Some(2), Some(3))
+        );
+        assert_eq!(
+            (map.on_tier(4).ok(), map.tier_capacity(4).ok()),
+            (Some(0), Some(1))
+        );
+        assert_eq!(map.stage_view(), [h, 2, 1, h, h, h]);
+        map.admit(4, 3, Slot::Card(0)).expect("the freed slot");
+        map.admit(4, 5, Slot::Tier(0)).expect("the freed tier slot");
+        assert_eq!(
+            SlotMap::from_rows(4..5, 6, map.row(4).expect("a row").to_vec()).ok(),
+            Some(map.clone()),
+            "the moved row, full again, is a load's map"
+        );
     }
 
     /// No KV cache: the synthetic model's card holds only its tensors.
