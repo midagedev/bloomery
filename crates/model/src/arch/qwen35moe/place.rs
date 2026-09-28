@@ -3,13 +3,19 @@
 //! GLM-5.3-Flash. The hyperparameters, every tensor's role, the typed
 //! description and each layer's recurrent and cache bytes ([`KvLayout`]) are
 //! read once ([`PlanInputs::read`]); a file with a feature the engine does not
-//! run is refused there by the coverage check; then the placement
-//! ([`PlanInputs::plan`]) keeps every routed expert on the host
-//! ([`placement::plan_host_routed`]: no card expert kernel serves the file's
-//! routed stacks yet) and the rest where its role says — the trunk, the
+//! run is refused there by the coverage check; then the placement puts every
+//! tensor but the routed stacks where its role says — the trunk, the
 //! hyper-connections, the PLE site's projections, the router, the shared
 //! expert and the head on the card, the PLE table on the host in its file
-//! bytes ([`ple_on_host`]), its rows gathered by the host.
+//! bytes ([`ple_on_host`]), its rows gathered by the host — and the routed
+//! experts where [`Experts`] says: every one on the host
+//! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
+//! ([`PlanInputs::plan_with`] under [`Experts::Card`]): the id prefix, spread
+//! evenly, on the layers whose three routed stacks the card experts read
+//! ([`card_routed`]: the Q4_K gate and up, the Q5_1 down in the file's
+//! blocks), the rest on the host. A layer with a stack they do not read keeps
+//! every expert on the host, each such stack named with the reason
+//! ([`PlanInputs::host_only`]).
 //!
 //! The attention layers select their positions by the mean-pool indexer at
 //! every position the program runs, so no count of positions is refused for
@@ -23,7 +29,10 @@
 //! the card, its dense store and the reduced head's gathered rows, counted in
 //! the draft's own heap; the target card's bound is checked on the sum. The
 //! draft borrows the target's `token_embd` and `output`, which the target's
-//! plan already holds on the card, so they add nothing.
+//! plan already holds on the card, so they add nothing. Under
+//! [`Experts::Card`] ([`PlanInputs::plan_mtp_with`]) the target's expert rule
+//! spreads within its card's budget less the draft's card bytes, so the sum
+//! fits.
 
 use std::path::Path;
 
@@ -52,6 +61,59 @@ pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 /// context as a `u32` launch argument and the selected flash reads `u32`
 /// cache rows, so a context past this is one those launches cannot name.
 pub const KERNEL_POSITIONS: u64 = u32::MAX as u64;
+
+/// Where a plan puts the file's routed experts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Experts {
+    /// Every routed expert on the host: the plan [`PlanInputs::plan`] makes.
+    Host,
+    /// The expert rule on the layers whose routed stacks [`card_routed`]
+    /// loads: each such layer's id prefix on the card, as many as the card's
+    /// budget holds, spread evenly over them; the rest on the host.
+    Card,
+}
+
+/// The routed stacks the card experts read, in their card format: the Q4_K
+/// gate and up (`kq_gate_up_act_q4k`) and the Q5_1 down (`q5_1_gemv_sel`),
+/// both as the file stores them ([`CardFormat::KQuant`]: the down's
+/// `block_q5_1`s, 24 bytes a 32 values, unpacked). A stack of any other type
+/// keeps its layer's experts on the host ([`host_only_reason`]).
+#[must_use]
+pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
+    match ty {
+        GgmlType::Q4_K | GgmlType::Q5_1 => Some(CardFormat::KQuant),
+        _ => None,
+    }
+}
+
+/// Why a routed stack of type `ty`, rows of `k` values, keeps its layer's
+/// experts on the host; `None` for a stack [`card_routed`] loads.
+#[must_use]
+pub fn host_only_reason(ty: GgmlType, k: u64) -> Option<String> {
+    if card_routed(ty).is_some() {
+        return None;
+    }
+    Some(match ty {
+        GgmlType::Q8_0 if !k.is_multiple_of(256) => format!(
+            "q8_0 rows of {k} values: `q8_0_gemv_sel` reads its columns as `Q8Act`, which \
+             takes a multiple of 256 values"
+        ),
+        GgmlType::Q5_K => "q5_K: this program's card experts read a Q4_K gate·up and a Q5_1 \
+                           down; the q5_K entries (`kq_gate_up_act_q5k`, `q5k_gemv_sel`) are \
+                           not admitted for this file"
+            .to_string(),
+        other => format!("{other}: no card expert kernel of this program reads it"),
+    })
+}
+
+/// A routed stack whose layer keeps every expert on the host under
+/// [`Experts::Card`], and why ([`host_only_reason`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostOnly {
+    pub layer: usize,
+    pub tensor: String,
+    pub why: String,
+}
 
 /// What a plan of a qwen4exp file is made from, read from its headers.
 #[derive(Debug)]
@@ -139,24 +201,101 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, every routed expert and the PLE table on the
-    /// host; refused past [`KERNEL_POSITIONS`], when it cannot be built, or
-    /// when it breaks an invariant.
+    /// host ([`PlanInputs::plan_with`] under [`Experts::Host`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_with(machine, ctx_max, levers, Experts::Host)
+    }
+
+    /// The placement of the file on `machine` at `ctx_max` positions under
+    /// the placement's `levers`, the routed experts where `experts` says and
+    /// the PLE table on the host; refused past [`KERNEL_POSITIONS`], when it
+    /// cannot be built, or when it breaks an invariant. Under
+    /// [`Experts::Card`] a hot list is refused by name: the card keeps each
+    /// layer's id prefix. A card plan whose budget leaves no expert on the
+    /// card is the [`Experts::Host`] plan of the same levers.
+    pub fn plan_with<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+    ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
         }
-        let plan = self.target(machine, ctx_max, levers)?;
+        let plan = self.target(machine, ctx_max, levers, experts, 0)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
         } else {
             Err(PlaceError::Broken(broken))
         }
+    }
+
+    /// The target's plan, unchecked: every routed expert on the host, or the
+    /// expert rule over [`card_routed`]'s layers within each card's budget
+    /// less `reserve` ([`placement::plan_routed_reserving`]); then the PLE
+    /// table moved to the host ([`ple_on_host`]).
+    fn target<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+        reserve: u64,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let mut plan = match experts {
+            Experts::Host => {
+                placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
+            }
+            Experts::Card => {
+                if let Some(h) = &levers.hot {
+                    return Err(PlacementError::HotList {
+                        path: h.path().to_string(),
+                        detail: "qwen4exp's card experts are each layer's id prefix: no hot \
+                                 list is admitted for this file"
+                            .to_string(),
+                    }
+                    .into());
+                }
+                placement::plan_routed_reserving(
+                    &self.model,
+                    machine,
+                    ctx_max,
+                    &self.kv,
+                    levers,
+                    card_routed,
+                    reserve,
+                )?
+            }
+        };
+        ple_on_host(&mut plan)?;
+        Ok(plan)
+    }
+
+    /// Every routed stack whose layer keeps all its experts on the host
+    /// under [`Experts::Card`] — a stack of a type [`card_routed`] does not
+    /// load — with the reason, in the file's tensor order.
+    #[must_use]
+    pub fn host_only(&self) -> Vec<HostOnly> {
+        self.model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::RoutedExperts)
+            .filter_map(|t| {
+                let why = host_only_reason(t.ty, t.dims.first().copied().unwrap_or(0))?;
+                Some(HostOnly {
+                    layer: t.layer?,
+                    tensor: t.name.clone(),
+                    why,
+                })
+            })
+            .collect()
     }
 
     /// [`PlanInputs::plan`] with the MTP draft `mtp` on the machine's one
@@ -175,6 +314,22 @@ impl PlanInputs {
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
     ) -> Result<MtpPlan<'a>, PlaceError> {
+        self.plan_mtp_with(machine, ctx_max, levers, mtp, Experts::Host)
+    }
+
+    /// [`PlanInputs::plan_mtp`] with the target's routed experts where
+    /// `experts` says: under [`Experts::Card`] the target's expert rule
+    /// spreads within its card's budget less the draft's card bytes
+    /// ([`MtpPlan::draft_card_bytes`]), so the sum keeps the card's bound;
+    /// the draft's plan is the same under either.
+    pub fn plan_mtp_with<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
         }
@@ -183,7 +338,6 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let plan = self.target(machine, ctx_max, levers)?;
         let draft = placement::plan_routed(
             &mtp.model,
             &mtp.machine,
@@ -199,6 +353,8 @@ impl PlanInputs {
                 experts: mtp.model.experts,
             });
         }
+        let reserve = draft_card_bytes(&draft.cards[0], mtp.map_bytes);
+        let plan = self.target(machine, ctx_max, levers, experts, reserve)?;
         let (t, d) = (&plan.cards[0], &draft.cards[0]);
         let total = [
             t.dense_bytes,
@@ -235,21 +391,6 @@ impl PlanInputs {
             draft,
             map_bytes: mtp.map_bytes,
         })
-    }
-
-    /// The target's placement, before its invariants are checked: every
-    /// routed expert on the host ([`placement::plan_host_routed`]), then the
-    /// PLE table moved to the host ([`ple_on_host`]).
-    fn target<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx_max: u64,
-        levers: &PlanLevers,
-    ) -> Result<Plan<'a>, PlacementError> {
-        let mut plan =
-            placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?;
-        ple_on_host(&mut plan)?;
-        Ok(plan)
     }
 }
 
@@ -316,8 +457,10 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// A qwen4exp plan with its MTP draft ([`PlanInputs::plan_mtp`]).
 #[derive(Debug)]
 pub struct MtpPlan<'a> {
-    /// The target's plan, [`PlanInputs::plan`]'s bit for bit: its card
-    /// totals and headroom are the target's alone.
+    /// The target's plan — under [`Experts::Host`] [`PlanInputs::plan`]'s
+    /// bit for bit, under [`Experts::Card`] its expert rule within the card's
+    /// budget less the draft's card bytes: its card totals and headroom are
+    /// the target's alone.
     pub plan: Plan<'a>,
     /// The draft's plan on [`MtpInputs::machine`]: its tensors' rows, its
     /// routed experts (every one on the card), its granules in its own heap
@@ -348,8 +491,8 @@ impl MtpPlan<'_> {
     }
 }
 
-/// The most positions a qwen4exp ubatch walk takes, the load's size at most:
-/// the card scratch the plan counts is the walk's at this size.
+/// The most positions a qwen4exp ubatch walk takes, and the size a load runs
+/// with its ubatch lever unset: the default [`machine`]'s `ubatch`.
 pub const UBATCH_PLANNED: u64 = 4096;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
@@ -382,19 +525,36 @@ pub const fn ubatch_scratch_bytes(u: u64) -> u64 {
     u * UBATCH_TOKEN_BYTES + UBATCH_FIXED_BYTES
 }
 
+/// The card scratch of a qwen4exp plan whose load runs ubatches of up to
+/// `ubatch` positions: the m = 1 scratch and the ubatch walk's
+/// ([`ubatch_scratch_bytes`]).
+#[must_use]
+pub const fn card_scratch_bytes(ubatch: u64) -> u64 {
+    SCRATCH + ubatch_scratch_bytes(ubatch)
+}
+
+/// The ubatch arena bytes a plan made on `card` counts: its scratch past the
+/// m = 1 scratch. The load of a ubatch whose arena holds more is refused by
+/// name.
+#[must_use]
+pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
+    card.scratch_bytes.saturating_sub(SCRATCH)
+}
+
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
-/// the card gathers), with this workstation's context, scratch, margin and
-/// host tier — the scratch with the ubatch walk's at [`UBATCH_PLANNED`]
-/// positions.
+/// the card gathers), with this workstation's context, margin and host tier
+/// and the scratch of a load that runs ubatches of up to `ubatch` positions
+/// ([`card_scratch_bytes`]): the size the load itself takes, read once by
+/// the caller that builds this machine and opens the load.
 #[must_use]
-pub fn machine(card: CardSpec, layers: usize) -> Machine {
+pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
     Machine {
         cards: vec![Card {
             name: card.name.to_string(),
             usable_bytes: card.usable_bytes(),
             context_bytes: CONTEXT,
-            scratch_bytes: SCRATCH + ubatch_scratch_bytes(UBATCH_PLANNED),
+            scratch_bytes: card_scratch_bytes(ubatch),
             margin_bytes: MARGIN,
             granule_bytes: GRANULE,
             layers: 0..layers,
@@ -1199,6 +1359,276 @@ mod tests {
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
+    }
+
+    /// The card rule over Qwen3.8's routed stacks ([`super::card_routed`]) on
+    /// six synthetic layers of the file's per-expert shapes (512 experts; a
+    /// Q4_K gate and up of 640 rows of 2560 values, a Q5_1 down of 2560 rows
+    /// of 640): layers 0, 1, 3 and 5 as the file's 43, layer 2 as its layer 2
+    /// (a q5_K gate and up, a q8_0 down), layer 4 as its layers 4, 30, 46 and
+    /// 47 (a q8_0 down); each layer a 2560-value F32 norm first.
+    mod card {
+        use std::num::NonZeroU64;
+
+        use gguf::GgmlType;
+
+        use super::super::{card_routed, host_only_reason};
+        use crate::placement::{
+            self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor,
+            ModelTensors, Plan, PlanLevers, Role,
+        };
+
+        const MIB: u64 = 1 << 20;
+        const EXPERTS: u64 = 512;
+        /// A Q4_K gate (or up) expert, 640 rows of ten 144-byte super-blocks.
+        const GATE: u64 = 640 * 10 * 144;
+        /// A Q5_1 down expert, 2560 rows of twenty 24-byte blocks.
+        const DOWN: u64 = 2560 * 20 * 24;
+
+        struct NoKv;
+
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+
+        fn tensor(layer: usize, name: &str, role: Role, ty: GgmlType, dims: &[u64]) -> ModelTensor {
+            let values: u64 = dims.iter().product();
+            let (blck, size) = (
+                ty.blck_size().expect("a block"),
+                ty.type_size().expect("a size"),
+            );
+            ModelTensor {
+                name: format!("blk.{layer}.{name}"),
+                shard: 0,
+                layer: Some(layer),
+                role,
+                ty,
+                dims: dims.to_vec(),
+                file_bytes: values / blck * size,
+                gathered_rows: None,
+            }
+        }
+
+        fn model() -> ModelTensors {
+            let mut tensors = Vec::new();
+            for l in 0..6 {
+                let (gu, down) = match l {
+                    2 => (GgmlType::Q5_K, GgmlType::Q8_0),
+                    4 => (GgmlType::Q4_K, GgmlType::Q8_0),
+                    _ => (GgmlType::Q4_K, GgmlType::Q5_1),
+                };
+                tensors.push(tensor(
+                    l,
+                    "ffn_norm.weight",
+                    Role::Attention,
+                    GgmlType::F32,
+                    &[2560],
+                ));
+                for stem in ["ffn_gate_exps.weight", "ffn_up_exps.weight"] {
+                    tensors.push(tensor(
+                        l,
+                        stem,
+                        Role::RoutedExperts,
+                        gu,
+                        &[2560, 640, EXPERTS],
+                    ));
+                }
+                tensors.push(tensor(
+                    l,
+                    "ffn_down_exps.weight",
+                    Role::RoutedExperts,
+                    down,
+                    &[640, 2560, EXPERTS],
+                ));
+            }
+            ModelTensors {
+                tensors,
+                layers: 6,
+                experts: EXPERTS,
+                experts_used: 10,
+            }
+        }
+
+        fn machine(usable: u64) -> Machine {
+            Machine {
+                cards: vec![Card {
+                    name: "card".to_string(),
+                    usable_bytes: usable,
+                    context_bytes: 0,
+                    scratch_bytes: 0,
+                    margin_bytes: 0,
+                    granule_bytes: NonZeroU64::new(2 * MIB).expect("2 MiB"),
+                    layers: 0..6,
+                    head: true,
+                    token_embedding: false,
+                    reserves: Vec::new(),
+                }],
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: u64::MAX,
+                    reserves: Vec::new(),
+                },
+            }
+        }
+
+        fn card_plan<'a>(
+            model: &'a ModelTensors,
+            machine: &'a Machine,
+            levers: &PlanLevers,
+            reserve: u64,
+        ) -> Plan<'a> {
+            placement::plan_routed_reserving(
+                model,
+                machine,
+                4096,
+                &NoKv,
+                levers,
+                card_routed,
+                reserve,
+            )
+            .expect("the card plan")
+        }
+
+        /// The card format of each routed type, and the named reason of each
+        /// type it leaves on the host; the Q5_1 down's card bytes are its file
+        /// bytes, and a whole Q5_1 tensor keeps its packed format.
+        #[test]
+        fn routed_types_and_their_reasons() {
+            assert_eq!(card_routed(GgmlType::Q4_K), Some(CardFormat::KQuant));
+            assert_eq!(card_routed(GgmlType::Q5_1), Some(CardFormat::KQuant));
+            for ty in [
+                GgmlType::Q5_K,
+                GgmlType::Q8_0,
+                GgmlType::Q6_K,
+                GgmlType::Q5_0,
+            ] {
+                assert_eq!(card_routed(ty), None, "{ty}");
+            }
+            assert_eq!(host_only_reason(GgmlType::Q4_K, 2560), None);
+            assert_eq!(host_only_reason(GgmlType::Q5_1, 640), None);
+            let q8 = host_only_reason(GgmlType::Q8_0, 640).expect("a q8_0 down is named");
+            assert!(q8.contains("640") && q8.contains("Q8Act"), "{q8}");
+            let q5k = host_only_reason(GgmlType::Q5_K, 2560).expect("a q5_K stack is named");
+            assert!(q5k.starts_with("q5_K"), "{q5k}");
+            let q6k = host_only_reason(GgmlType::Q6_K, 2560).expect("a q6_K stack is named");
+            assert!(q6k.starts_with("q6_K"), "{q6k}");
+            for n in [1, 3, 323] {
+                assert_eq!(
+                    CardFormat::KQuant.resident_bytes(GgmlType::Q5_1, 640, 2560 * n),
+                    Some(DOWN * n),
+                    "{n} experts"
+                );
+            }
+            assert_eq!(CardFormat::of(GgmlType::Q5_1), Some(CardFormat::Q5_1));
+        }
+
+        // PIN(2026-09-28): the card rule's counts on the synthetic model [derived: at ten experts a
+        // layer a gate and an up of 9,216,000 B take five 2 MiB granules each and a down of
+        // 12,288,000 B six, 32 MiB a layer; the six norms share one granule; four eligible
+        // layers make 130 MiB, and an eleventh expert on layer 0 moves its down to seven granules,
+        // 132 MiB, past 131 MiB. Under a reserve of 3 MiB the budget is 128 MiB: at nine experts a
+        // layer takes 28 MiB, the tenth adds 4 MiB, and layer 5's passes 128].
+        const N_L: [u64; 6] = [10, 10, 0, 10, 0, 10];
+        const N_L_RESERVED: [u64; 6] = [10, 10, 0, 10, 0, 9];
+        const HEAP: u64 = 130 * MIB;
+        const HEAP_RESERVED: u64 = 126 * MIB;
+
+        /// The id prefix on the layers whose stacks the card experts read,
+        /// none on the others; each card segment in the file's bytes as words,
+        /// its bytes the prefix's file bytes; the rest on the host; deepseek2's
+        /// `routed_row` still takes the packed q5_1.
+        #[test]
+        fn card_plan_holds_the_prefix_of_eligible_layers() {
+            let (model, machine) = (model(), machine(131 * MIB));
+            let plan = card_plan(&model, &machine, &PlanLevers::default(), 0);
+            assert_eq!(plan.n_l, N_L);
+            assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+            for r in &plan.rows {
+                let t = &model.tensors[r.tensor];
+                if t.role != Role::RoutedExperts {
+                    continue;
+                }
+                let n = N_L[t.layer.expect("a layer")];
+                let per = t.file_bytes / EXPERTS;
+                let host = r.segments.last().expect("a host segment");
+                assert_eq!(host.device, Device::Host, "{}", t.name);
+                assert_eq!(host.resident_bytes, (EXPERTS - n) * per, "{}", t.name);
+                match r.segments.as_slice() {
+                    [_] => assert_eq!(n, 0, "{}", t.name),
+                    [c, _] => {
+                        assert_eq!(c.device, Device::Card(0), "{}", t.name);
+                        assert_eq!(c.format, Format::Card(CardFormat::KQuant), "{}", t.name);
+                        assert_eq!(c.resident_bytes, n * per, "{}", t.name);
+                        let ids = c.experts.as_ref().map(|e| e.as_prefix());
+                        assert_eq!(ids, Some(Some(n)), "{}", t.name);
+                    }
+                    s => panic!("{}: {} segments", t.name, s.len()),
+                }
+            }
+            let c = &plan.cards[0];
+            assert_eq!(c.expert_bytes, 40 * (2 * GATE + DOWN));
+            assert_eq!(c.dense_bytes, 6 * 2560 * 4);
+            assert_eq!(c.dense_bytes + c.expert_bytes + c.rounding_bytes, HEAP);
+            let down = model
+                .tensors
+                .iter()
+                .position(|t| t.name == "blk.0.ffn_down_exps.weight")
+                .expect("layer 0's down");
+            let prefix = placement::ExpertList::prefix(10).expect("a prefix");
+            let row = placement::routed_row(down, &model.tensors[down], 0, prefix, &model)
+                .expect("routed_row");
+            assert_eq!(row.segments[0].format, Format::Card(CardFormat::Q5_1));
+        }
+
+        /// A reserve narrows the rule's budget and nothing else: the plan's
+        /// card budget stays unset and its headroom is the card's usable bytes
+        /// less its own heap.
+        #[test]
+        fn a_reserve_narrows_the_rule_alone() {
+            let (model, machine) = (model(), machine(131 * MIB));
+            let plan = card_plan(&model, &machine, &PlanLevers::default(), 3 * MIB);
+            assert_eq!(plan.n_l, N_L_RESERVED);
+            assert_eq!(plan.card_budget, None);
+            let c = &plan.cards[0];
+            assert_eq!(
+                c.dense_bytes + c.expert_bytes + c.rounding_bytes,
+                HEAP_RESERVED
+            );
+            assert_eq!(c.headroom_bytes, i128::from(131 * MIB - HEAP_RESERVED));
+            assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+        }
+
+        /// A card plan whose budget leaves no expert on the card is the
+        /// host-routed plan of the same levers, field for field.
+        #[test]
+        fn a_card_plan_of_no_expert_is_the_host_plan() {
+            let (model, machine) = (model(), machine(131 * MIB));
+            let levers = PlanLevers {
+                hot: None,
+                card_budget_bytes: Some(2 * MIB),
+            };
+            let card = card_plan(&model, &machine, &levers, 0);
+            let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
+                .expect("the host plan");
+            let view = |p: &Plan<'_>| {
+                format!(
+                    "{:?}",
+                    (
+                        &p.rows,
+                        &p.cards,
+                        &p.host,
+                        p.nvme_bytes,
+                        &p.n_l,
+                        p.ctx_max,
+                        p.card_budget
+                    )
+                )
+            };
+            assert_eq!(card.n_l, [0; 6]);
+            assert_eq!(view(&card), view(&host));
+        }
     }
 
     mod mtp {

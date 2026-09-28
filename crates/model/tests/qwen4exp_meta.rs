@@ -179,13 +179,23 @@ const KV_AT: [(u64, u64); 2] = [(4096, 586_293_824), (32_768, 1_401_037_376)];
 // granules − context − scratch − 469,901,888 B of recurrent bytes) over 28,416 B a position, the
 // last pool counted whole]. Printed beside the boundary the test finds from the plan's own totals;
 // the clause holds the placement to that boundary, not to this figure. PIN(2026-09-28): the
-// scratch counts the ubatch walk's [derived: CARD_SCRATCH − 64 MiB = 2,770,817,024 B over
-// 28,416 B a position, 97,509.05 positions, rounded up to 97,510].
+// scratch counts the ubatch walk's at U = 4,096 [derived: CARD_SCRATCH's 4,096 row − 64 MiB =
+// 2,770,817,024 B over 28,416 B a position, 97,509.05 positions, rounded up to 97,510].
 const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_410_846), ("3090", 509_873)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
-const CARD_SCRATCH: u64 = 2_837_925_888;
+// PIN(2026-09-28): and at the U the load runs, which `place::machine` now takes: at 512 positions
+// [derived: 67,108,864 + 512 · 668,277 + 33,554,432 = 442,821,120].
+const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_837_925_888), (512, 442_821_120)];
+
+/// The card scratch [`CARD_SCRATCH`] pins at ubatch `u`.
+fn scratch_at(u: u64) -> u64 {
+    CARD_SCRATCH
+        .iter()
+        .find(|&&(x, _)| x == u)
+        .map_or_else(|| panic!("CARD_SCRATCH has no row for U {u}"), |&(_, b)| b)
+}
 
 /// The plan of the Qwen3.8 file from its headers (`arch::qwen35moe::place`):
 /// `PlanInputs::read` refuses it with the coverage list; `describe` reads
@@ -326,7 +336,7 @@ fn hw_qwen4exp_plan() {
     );
     let levers = PlanLevers::default();
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, hp.n_layer);
+        let machine = place::machine(card, hp.n_layer, place::UBATCH_PLANNED);
         for (ctx, kv) in KV_AT {
             let plan = match inputs.plan(&machine, ctx, &levers) {
                 Ok(p) => p,
@@ -359,7 +369,11 @@ fn hw_qwen4exp_plan() {
                 ("card rounding", c.rounding_bytes, CARD_ROUNDING),
                 ("card experts", c.expert_bytes, 0),
                 ("card kv", c.kv_bytes, kv),
-                ("card scratch", c.scratch_bytes, CARD_SCRATCH),
+                (
+                    "card scratch",
+                    c.scratch_bytes,
+                    scratch_at(place::UBATCH_PLANNED),
+                ),
                 ("host experts", plan.host.expert_bytes, HOST_EXPERTS),
                 ("host tables", plan.host.table_bytes, HOST_TABLES),
                 ("nvme", plan.nvme_bytes, 0),
@@ -454,7 +468,7 @@ fn hw_qwen4exp_plan() {
             at_max && past,
         );
     }
-    let machine = place::machine(A6000, hp.n_layer);
+    let machine = place::machine(A6000, hp.n_layer, place::UBATCH_PLANNED);
     // The plan's host set, from the headers: the PLE table's pages once, beside the routed
     // stacks', each run grown to whole pages and merged per shard.
     match inputs.plan(&machine, KV_AT[0].0, &levers) {
@@ -516,6 +530,453 @@ fn hw_qwen4exp_plan() {
         let text = got.err().map_or("planned".to_string(), |e| e.to_string());
         check(&mut o, format!("ctx {ctx}: {text}"), named);
     }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} clause(s) failed:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
+
+// PIN(2026-09-28): the card rule's plan (`place::Experts::Card`) [derived: the id prefix spread
+// over the 43 layers whose gate, up and down are q4_K, q4_K and q5_1 (`place::card_routed`), an
+// expert 3,072,000 B on the card as in the file — a gate and an up of 640 rows of ten 144 B
+// super-blocks, 921,600 B each, a down of 2,560 rows of twenty 24 B blocks, 1,228,800 B — each
+// stack's buffer in whole 2 MiB granules after the dense ones (CARD_DENSE + CARD_ROUNDING); the
+// budget usable − the cache − context − scratch at U (CARD_SCRATCH) − margin, with the draft less
+// its 2,785,017,856 B of granules and 2,048 B a position of store (the full head). The spread stops
+// at the first expert that passes it, so the first `at_high` eligible layers, ascending, hold one
+// more than the rest. Rows: (card, ctx, with the draft, U, high, at_high, low, card expert bytes,
+// card rounding bytes).
+// PIN(2026-09-28): the ubatch arena in the budget, at the U the load runs (`place::machine`'s
+// `ubatch`): the rows before it counted 64 MiB of scratch, not the 2,770,817,024 B arena of
+// U = 4,096 every plan carries (A6000 4k 323 a layer, 32k 317/316, with the draft 302 and 296/295;
+// 3090 4k 130/129, 32k 123/122, with the draft 108/107 and 101/100). The budgets [derived: usable
+// 50,952,404,992 (A6000) or 25,350,373,376 (3090) − kv 586,293,824 (4k) or 1,401,037,376 (32k) −
+// context 536,870,912 − scratch 2,837,925,888 (U 4,096) or 442,821,120 (U 512) − margin
+// 1,073,741,824 − the draft 2,793,406,464 (4k) or 2,852,126,720 (32k)]: A6000 4k 45,917,572,544 /
+// 48,312,677,312, with the draft 43,124,166,080 / 45,519,270,848; A6000 32k 45,102,828,992 /
+// 47,497,933,760, with the draft 42,250,702,272 / 44,645,807,040; 3090 4k 20,315,540,928 /
+// 22,710,645,696, with the draft 17,522,134,464 / 19,917,239,232; 3090 32k 19,500,797,376 /
+// 21,895,902,144, with the draft 16,648,670,656 / 19,043,775,424 (U 4,096 / U 512). U 512 frees
+// 2,395,104,768 B, 779.7 experts at 3,072,000 B, 763 of them past the granules on the A6000 at 4k
+// (17.7 a layer).
+type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
+const CARD_PLANS: [CardPlanRow; 16] = [
+    (
+        "A6000",
+        4_096,
+        false,
+        4_096,
+        303,
+        4,
+        302,
+        39_905_280_000,
+        466_956_800,
+    ),
+    (
+        "A6000",
+        4_096,
+        false,
+        512,
+        320,
+        36,
+        319,
+        42_249_216_000,
+        517_968_384,
+    ),
+    (
+        "A6000",
+        4_096,
+        true,
+        4_096,
+        280,
+        33,
+        279,
+        36_956_160_000,
+        622_670_336,
+    ),
+    (
+        "A6000",
+        4_096,
+        true,
+        512,
+        299,
+        26,
+        298,
+        39_444_480_000,
+        525_103_616,
+    ),
+    (
+        "A6000",
+        32_768,
+        false,
+        4_096,
+        296,
+        17,
+        295,
+        39_020_544_000,
+        531_706_368,
+    ),
+    (
+        "A6000",
+        32_768,
+        false,
+        512,
+        315,
+        11,
+        314,
+        41_511_936_000,
+        437_359_104,
+    ),
+    (
+        "A6000",
+        32_768,
+        true,
+        4_096,
+        274,
+        37,
+        273,
+        36_175_872_000,
+        526_348_800,
+    ),
+    (
+        "A6000",
+        32_768,
+        true,
+        512,
+        292,
+        31,
+        291,
+        38_535_168_000,
+        564_097_536,
+    ),
+    (
+        "3090",
+        4_096,
+        false,
+        4_096,
+        108,
+        16,
+        107,
+        14_183_424_000,
+        586_781_184,
+    ),
+    (
+        "3090",
+        4_096,
+        false,
+        512,
+        126,
+        41,
+        125,
+        16_637_952_000,
+        525_103_616,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        4_096,
+        87,
+        30,
+        86,
+        11_452_416_000,
+        524_382_720,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        512,
+        105,
+        28,
+        104,
+        13_824_000_000,
+        547_746_304,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        4_096,
+        103,
+        4,
+        102,
+        13_486_080_000,
+        464_138_752,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        512,
+        120,
+        38,
+        119,
+        15_836_160_000,
+        513_200_640,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        4_096,
+        80,
+        36,
+        79,
+        10_546_176_000,
+        554_013_184,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        512,
+        98,
+        32,
+        97,
+        12_911_616_000,
+        583_520_768,
+    ),
+];
+// PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
+// layers' experts on the host [the header dump: layer 2's gate and up q5_K and its down q8_0, the
+// downs of layers 4, 30, 46 and 47 q8_0, every q8_0 down rows of 640 values].
+const HOST_ONLY: [(usize, &str); 7] = [
+    (2, "blk.2.ffn_down_exps.weight"),
+    (2, "blk.2.ffn_gate_exps.weight"),
+    (2, "blk.2.ffn_up_exps.weight"),
+    (4, "blk.4.ffn_down_exps.weight"),
+    (30, "blk.30.ffn_down_exps.weight"),
+    (46, "blk.46.ffn_down_exps.weight"),
+    (47, "blk.47.ffn_down_exps.weight"),
+];
+/// The draft that uses the target's embedding and output matrix.
+const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+
+/// The card rule's plan of the Qwen3.8 file (`place::PlanInputs::plan_with`
+/// under `Experts::Card`): the stacks it leaves on the host, each named with
+/// its reason; on each card at 4,096 and 32,768 positions, alone and beside
+/// the shared MTP draft (`plan_mtp_with`), each layer's card count, the card's
+/// expert and rounding bytes and the host's as predicted, each routed stack's
+/// card segment its layer's id prefix in the file's words and the rest on
+/// the host, and the draft's plan the host-routed one's; a card budget that
+/// leaves no expert makes the host-routed plan of the same levers, field for
+/// field; a hot list is refused by name.
+#[test]
+#[ignore = "needs the Qwen3.8-Flash-Next shards and the shared MTP file on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_card_plan() {
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{self, Experts, MtpInputs, PlanInputs};
+    use model::placement::workstation::{A6000, CONTEXT, MARGIN, RTX_3090};
+    use model::placement::{CardFormat, Device, Format, HotList, Plan, PlanLevers, Role};
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let split = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
+    let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
+    let mtp = MtpInputs::read(&draft, &split, &inputs, HeadRows::Full)
+        .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
+    let mut host_only = inputs.host_only();
+    host_only.sort_by(|x, y| (x.layer, &x.tensor).cmp(&(y.layer, &y.tensor)));
+    let named: Vec<(usize, &str)> = host_only
+        .iter()
+        .map(|h| (h.layer, h.tensor.as_str()))
+        .collect();
+    let reasons = host_only.iter().all(|h| {
+        let q8 = h.tensor.contains("down");
+        (q8 && h.why.contains("640") && h.why.contains("Q8Act"))
+            || (!q8 && h.why.starts_with("q5_K"))
+    });
+    for h in &host_only {
+        let _ = writeln!(o, "host only: layer {} {}: {}", h.layer, h.tensor, h.why);
+    }
+    check(
+        &mut o,
+        format!(
+            "the stacks the card experts do not read, by name with their reason ({reasons}): \
+             {named:?}"
+        ),
+        named == HOST_ONLY && reasons,
+    );
+    let off: Vec<usize> = HOST_ONLY.iter().map(|&(l, _)| l).collect();
+    let per_expert = |t: &model::placement::ModelTensor| t.file_bytes / inputs.model.experts;
+    let view = |p: &Plan<'_>| {
+        format!(
+            "{:?}",
+            (
+                &p.rows,
+                &p.cards,
+                &p.host,
+                p.nvme_bytes,
+                &p.n_l,
+                p.ctx_max,
+                p.card_budget
+            )
+        )
+    };
+    let levers = PlanLevers::default();
+    for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS {
+        let card = if name == A6000.name { A6000 } else { RTX_3090 };
+        let machine = place::machine(card, inputs.hp.n_layer, u);
+        let got = if with_draft {
+            inputs
+                .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
+                .map(|m| {
+                    let host = inputs.plan_mtp(&machine, ctx, &levers, &mtp).ok();
+                    let same = host.is_some_and(|h| view(&h.draft) == view(&m.draft));
+                    (m.plan, same)
+                })
+        } else {
+            inputs
+                .plan_with(&machine, ctx, &levers, Experts::Card)
+                .map(|p| (p, true))
+        };
+        let (plan, draft_same) = match got {
+            Ok(p) => p,
+            Err(e) => {
+                check(
+                    &mut o,
+                    format!("{name} ctx {ctx} draft {with_draft} U {u}: refused: {e}"),
+                    false,
+                );
+                continue;
+            }
+        };
+        let mut want = Vec::with_capacity(plan.n_l.len());
+        let mut eligible = 0usize;
+        for l in 0..plan.n_l.len() {
+            if off.contains(&l) {
+                want.push(0);
+            } else {
+                want.push(if eligible < at_high { high } else { low });
+                eligible += 1;
+            }
+        }
+        let mut segs_bad = Vec::new();
+        for r in &plan.rows {
+            let t = &inputs.model.tensors[r.tensor];
+            if t.role != Role::RoutedExperts {
+                continue;
+            }
+            let n = plan.n_l[t.layer.unwrap_or(0)];
+            let host_ok = r.segments.last().is_some_and(|s| {
+                s.device == Device::Host
+                    && s.resident_bytes == (inputs.model.experts - n) * per_expert(t)
+            });
+            let card_ok = match r.segments.as_slice() {
+                [_] => n == 0,
+                [c, _] => {
+                    c.device == Device::Card(0)
+                        && c.format == Format::Card(CardFormat::KQuant)
+                        && c.resident_bytes == n * per_expert(t)
+                        && c.experts.as_ref().and_then(|e| e.as_prefix()) == Some(n)
+                }
+                _ => false,
+            };
+            if !(host_ok && card_ok) {
+                segs_bad.push(t.name.clone());
+            }
+        }
+        let c = &plan.cards[0];
+        let kv = KV_AT
+            .iter()
+            .find(|&&(x, _)| x == ctx)
+            .map_or(0, |&(_, k)| k);
+        let figures = [
+            ("card dense", c.dense_bytes, CARD_DENSE),
+            ("card experts", c.expert_bytes, experts),
+            ("card rounding", c.rounding_bytes, rounding),
+            ("card kv", c.kv_bytes, kv),
+            (
+                "host experts",
+                plan.host.expert_bytes,
+                HOST_EXPERTS - experts,
+            ),
+            ("card scratch", c.scratch_bytes, scratch_at(u)),
+            ("host tables", plan.host.table_bytes, HOST_TABLES),
+            ("nvme", plan.nvme_bytes, 0),
+        ];
+        let bytes_ok = figures.iter().all(|&(_, g, w)| g == w);
+        let shown: Vec<String> = figures
+            .iter()
+            .map(|(what, g, w)| format!("{what} {g} (want {w})"))
+            .collect();
+        let held: u64 = plan.n_l.iter().sum();
+        check(
+            &mut o,
+            format!(
+                "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high} of the 43, \
+                 {low} on the rest, 0 on {off:?} ({}; {held} experts); segments off the rule \
+                 {segs_bad:?}; the draft's plan the host-routed one's {draft_same}; {}; headroom {}",
+                plan.n_l == want,
+                shown.join(", "),
+                c.headroom_bytes
+            ),
+            plan.n_l == want && segs_bad.is_empty() && draft_same && bytes_ok,
+        );
+    }
+    for card in [A6000, RTX_3090] {
+        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
+        let floor = CARD_DENSE
+            + CARD_ROUNDING
+            + KV_AT[0].1
+            + CONTEXT
+            + scratch_at(place::UBATCH_PLANNED)
+            + MARGIN;
+        let levers = PlanLevers {
+            hot: None,
+            card_budget_bytes: Some(floor),
+        };
+        let pair = (
+            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
+            inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Host),
+        );
+        let (ok, text) = match pair {
+            (Ok(c), Ok(h)) => (
+                c.n_l.iter().all(|&n| n == 0) && view(&c) == view(&h),
+                format!(
+                    "card experts {}, the host-routed plan's field for field {}",
+                    c.cards[0].experts,
+                    view(&c) == view(&h)
+                ),
+            ),
+            (c, h) => (false, format!("card {:?} host {:?}", c.err(), h.err())),
+        };
+        check(
+            &mut o,
+            format!(
+                "{} ctx {} under a card budget of its floor {floor}: {text}",
+                card.name, KV_AT[0].0
+            ),
+            ok,
+        );
+    }
+    let hot = HotList::parse("synthetic", "# n_expert\t512\n# order\trank\n")
+        .unwrap_or_else(|e| panic!("the empty list: {e}"));
+    let levers = PlanLevers {
+        hot: Some(hot),
+        card_budget_bytes: None,
+    };
+    let machine = place::machine(A6000, inputs.hp.n_layer, place::UBATCH_PLANNED);
+    let refused = inputs
+        .plan_with(&machine, KV_AT[0].0, &levers, Experts::Card)
+        .err()
+        .map_or("planned".to_string(), |e| e.to_string());
+    check(
+        &mut o,
+        format!("a hot list is refused by name: {refused}"),
+        refused.contains("no hot list is admitted for this file"),
+    );
     println!("{o}");
     assert!(
         b.is_empty(),

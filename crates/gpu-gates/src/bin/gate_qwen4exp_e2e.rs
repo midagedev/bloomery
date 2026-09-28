@@ -413,13 +413,14 @@ mod gate {
         // `describe`, not `read`: `read` refuses the chat surface's two
         // items too; `open_placed` refuses what `ALLOWED` does not name.
         let inputs = PlanInputs::describe(&file)?;
-        let machine = machine(RTX_3090, inputs.spec.layers.len());
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
         let plan = inputs.plan(&machine, CTX as u64, &PlanLevers::from_levers(&levers)?)?;
         println!(
             "plan card={} ctx_max={} host_experts={} card_experts={}",
             RTX_3090.name, plan.ctx_max, plan.host.experts, plan.cards[0].experts
         );
-        let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host())?;
+        let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
         m.set_mode(StepMode::Graph);
         println!(
             "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",

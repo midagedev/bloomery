@@ -1,7 +1,7 @@
 //! The record lines of the V4.1 binaries — `generate_ds41`, `bloomery-chat`,
 //! `bloomery-serve-ds41` and the prefill gate's stat line —, of
-//! `generate_glm5next` and of `generate_qwen3moe`'s tap dump, and the one
-//! owner of each line's syntax: its [`Kind`].
+//! `generate_glm5next` and of `generate_qwen3moe`'s tap dump and stat lines,
+//! and the one owner of each line's syntax: its [`Kind`].
 //!
 //! A kind is the words a line opens with (its head) and its parts in order:
 //! ` name=value`, a bare value, a flag word, or literal text between values.
@@ -1018,6 +1018,47 @@ pub static STAT_SUMMARY: Kind = Kind {
     ],
 };
 
+/// One generated step's host-tier counters on a body with no engram rows.
+pub static STAT_STEP_HOST: Kind = Kind {
+    name: "stat_step_host",
+    head: "stat step",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults and free device bytes (generate_qwen3moe's qwen4exp body).",
+    parts: &[
+        lit(" "),
+        pos("i", U64, ""),
+        flag("warm"),
+        key("served", U64, ""),
+        key("leg_us", F64(1), "us"),
+        key("straggle_us", F64(1), "us"),
+        key("straggle_max_us", F64(1), "us"),
+        key("host_slots", U64, ""),
+        key("host_w2", F64(4), ""),
+        key("go_early", U64, ""),
+        key("parks", U64, ""),
+        key("majflt", U64, ""),
+        key("minflt", U64, ""),
+        key("vram_free", U64, "B"),
+    ],
+};
+
+/// The steps' summary on a body with no engram rows.
+pub static STAT_SUMMARY_HOST: Kind = Kind {
+    name: "stat_summary_host",
+    head: "stat summary",
+    doc: "BLOOMERY_STEP_STATS: the kept steps' host-tier, fault and device-memory statistics (generate_qwen3moe's qwen4exp body).",
+    parts: &[
+        key("steps", U64, ""),
+        key("leg_us_mean", F64(1), "us"),
+        key("leg_us_p50", F64(1), "us"),
+        key("straggle_us_max", F64(1), "us"),
+        key("host_slots_mean", F64(1), ""),
+        key("majflt", U64, ""),
+        key("minflt", U64, ""),
+        key("vram_free_load", U64, "B"),
+        key("vram_free_min", U64, "B"),
+    ],
+};
+
 /// A generated step through the finite probe.
 pub static STAT_FINITE_STEP: Kind = Kind {
     name: "stat_finite_step",
@@ -1366,9 +1407,11 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_RESET,
 ];
 
-/// What `generate_qwen3moe --dump-taps` prints after its `load` line; the
-/// binary's other lines are its own.
-pub static GENERATE_QWEN3MOE: &[&Kind] = &[&TAPS_SEQ, &TAPS_DUMP];
+/// What `generate_qwen3moe` prints as records: under `--dump-taps`, after
+/// its `load` line, and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
+/// lines; the binary's other lines are its own.
+pub static GENERATE_QWEN3MOE: &[&Kind] =
+    &[&TAPS_SEQ, &TAPS_DUMP, &STAT_STEP_HOST, &STAT_SUMMARY_HOST];
 
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
 /// its name and the case's.

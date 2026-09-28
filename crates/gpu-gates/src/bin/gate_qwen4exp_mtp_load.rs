@@ -119,7 +119,8 @@ mod gate {
             digest: vocab_sha256(&file)?,
         };
         let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
-        let machine = machine(RTX_3090, inputs.spec.layers.len());
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
+        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
         let plan = inputs.plan_mtp(&machine, CTX, &PlanLevers::from_levers(&levers)?, &mtp)?;
         let d = &plan.draft.cards[0];
         println!(
@@ -134,7 +135,7 @@ mod gate {
             plan.headroom_bytes
         );
         let target = open(MODEL)?;
-        let m = Body38::open_placed_mtp(file, &plan, &inputs, 0, levers.host(), &draft, &mtp)?;
+        let m = Body38::open_placed_mtp(file, &plan, &inputs, 0, levers.host(), ub, &draft, &mtp)?;
         println!(
             "load resident_bytes={} in {:.1} s (runtime value)",
             m.resident_bytes(),

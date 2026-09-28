@@ -223,7 +223,7 @@ fn hw_qwen4exp_mtp_plan() {
         )
     };
     for card in [A6000, RTX_3090] {
-        let machine = place::machine(card, inputs.hp.n_layer);
+        let machine = place::machine(card, inputs.hp.n_layer, place::UBATCH_PLANNED);
         for ctx in [4096u64, 32_768] {
             let plain = inputs
                 .plan(&machine, ctx, &levers)
