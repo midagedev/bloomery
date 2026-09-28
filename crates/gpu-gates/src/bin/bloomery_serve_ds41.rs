@@ -963,6 +963,9 @@ mod drive {
                     r.eprint();
                 }
             }
+            for h in threads::helper::helpers() {
+                record::helper(&h.name, h.pinned, h.cpus).eprint();
+            }
             Ok(())
         }
 

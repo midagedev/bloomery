@@ -86,6 +86,8 @@
 //!   before the preparation ends; the machine dropped then leaves its
 //!   staging thread to finish, never that thread's to free, and reports the
 //!   leak by name.
+//! - placement: a machine built on a thread pinned to one cpu runs its
+//!   staging thread off that cpu.
 //! - leaks: once every machine is dropped, the stall arm's is the one leak
 //!   reported.
 //! - queue: with a source that adds [`INFLATE`] copy stream commands to each
@@ -379,6 +381,91 @@ mod gate {
             .lock()
             .map_err(|_| "gate_swap: the leak list")?
             .clone())
+    }
+
+    /// The tids of this process's threads named as the swap machine names
+    /// its staging thread.
+    fn staging_tids() -> Result<Vec<String>, GateError> {
+        let mut out = Vec::new();
+        for t in std::fs::read_dir("/proc/self/task")? {
+            let t = t?;
+            let comm = std::fs::read_to_string(t.path().join("comm"))?;
+            if comm.trim_end() == "swap-staging" {
+                out.push(t.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cpus in a kernel cpu list (`0-63`, `0,32`, `0-3,8`).
+    fn list_cpus(list: &str) -> Result<usize, GateError> {
+        let mut n = 0;
+        for part in list.trim().split(',') {
+            n += match part.split_once('-') {
+                Some((a, b)) => b.parse::<usize>()? - a.parse::<usize>()? + 1,
+                None => {
+                    part.parse::<usize>()?;
+                    1
+                }
+            };
+        }
+        Ok(n)
+    }
+
+    /// The calling thread's mask set to `cpus`.
+    fn set_mask(cpus: &[usize]) -> Result<(), GateError> {
+        // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET`
+        // with indices read from a mask of the same size, and
+        // `sched_setaffinity` reads it with the matching size.
+        let ok = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("gate_swap: sched_setaffinity to {cpus:?}").into())
+        }
+    }
+
+    /// placement: a machine built on a thread pinned to one cpu (as a
+    /// binary's step thread is) runs its staging thread off that cpu: the
+    /// staging copies never take turns with the step.
+    fn placement(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let wide = threads::helper::mask()?;
+        let Some(&c) = wide.first().filter(|_| wide.len() > 1) else {
+            println!("placement: the gate thread's mask is {wide:?}, too narrow to tell FAIL");
+            return Ok(false);
+        };
+        let before = staging_tids()?;
+        set_mask(&[c])?;
+        let built = plain(gpu, pm, Faults::default(), DELAY);
+        let restored = set_mask(&wide);
+        let r = built?;
+        restored?;
+        let tid = staging_tids()?
+            .into_iter()
+            .find(|t| !before.contains(t))
+            .ok_or("gate_swap: the machine's staging thread")?;
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .ok_or("gate_swap: Cpus_allowed_list")?
+            .trim()
+            .to_owned();
+        let cpus = list_cpus(&list)?;
+        drop(r);
+        let ok = cpus > 1;
+        println!(
+            "placement: a machine built on a thread pinned to cpu {c}: its staging thread {tid} \
+             Cpus_allowed_list {list} ({cpus} cpus) {}",
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// Threads of this process named as the swap machine names its staging
@@ -2027,6 +2114,7 @@ mod gate {
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= refusal(&gpu, &pm, &trace)?;
         ok &= stall(&gpu, &pm, &trace)?;
+        ok &= placement(&gpu, &pm)?;
         ok &= queue(&gpu, &pm, &trace, &a)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
