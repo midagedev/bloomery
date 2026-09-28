@@ -574,30 +574,36 @@ def routing(p, name, hot=True, P=512, G=1):
 
 # ============================================================================ the host union
 
+def kernel_t(a, c, w, f8, m):
+    """The host kernel's t(m) an expert (us, 32 threads): max(W, a + c m + f8 ceil(m / 8)). f8 is the tile's fixed
+    unpack per run of up to qdot::TILE_COLS columns (the r8 law); the older laws carry f8 0."""
+    return max(w, a + c * m + (f8 * math.ceil(m / 8.0 - 1e-9) if f8 else 0.0))
+
+
 @lru_cache(maxsize=None)
-def ecost(T, lam, a, c, w):
-    """(E[max(W, a + c m); m >= 1] in us, P(m >= 1)) for m ~ Binomial(T, lam / 512): the union's
-    t(m) with Binomial column counts (docs/plan.md 「비용 모델 (디코드 스텝)」 row 호스트 union(배치 프리필))."""
+def ecost(T, lam, a, c, w, f8=0.0):
+    """(E[t(m); m >= 1] in us, P(m >= 1)) for m ~ Binomial(T, lam / 512): the union's t(m) (kernel_t)
+    with Binomial column counts (docs/plan.md 「비용 모델 (디코드 스텝)」 row 호스트 union(배치 프리필))."""
     if T <= 0 or lam <= 0:
         return 0.0, 0.0
     q = min(lam / 512.0, 1.0)
     if q >= 1.0:
-        return max(w, a + c * T), 1.0
+        return kernel_t(a, c, w, f8, T), 1.0
     mu = T * q
     mmax = min(T, int(mu + 12 * math.sqrt(mu) + 30))
     lq, l1q, lg = math.log(q), math.log1p(-q), math.lgamma
     s = 0.0
     for m in range(1, mmax + 1):
-        s += math.exp(lg(T + 1) - lg(m + 1) - lg(T - m + 1) + m * lq + (T - m) * l1q) * max(w, a + c * m)
+        s += math.exp(lg(T + 1) - lg(m + 1) - lg(T - m + 1) + m * lq + (T - m) * l1q) * kernel_t(a, c, w, f8, m)
     return s, -math.expm1(T * l1q)
 
 
 @lru_cache(maxsize=None)
-def union_table(hostlist, T, a, c, w):
+def union_table(hostlist, T, a, c, w, f8=0.0):
     """Prefix sums over the host list, hottest first: counts, ms, touched experts, slots."""
     cn, cms, cact, cs, per = [0.0], [0.0], [0.0], [0.0], []
     for lam, n in hostlist:
-        e, act = ecost(T, round(lam, 6), a, c, w)
+        e, act = ecost(T, round(lam, 6), a, c, w, f8)
         s = T * lam / 512.0
         per.append((e / 1000.0, act, s))
         cn.append(cn[-1] + n)
@@ -620,24 +626,34 @@ def union_sum(tab, skip=0.0):
     return cms[-1] - cms[i] - f * e, cs[-1] - cs[i] - f * s, cact[-1] - cact[i] - f * act
 
 
-def union_kernel(p, cfg):
-    """(a, c) of the host kernel's t(m) = max(W, a + c m) an expert; `down` q8k takes dc_q8k_down off c."""
+def union_kernel(p, cfg, l=None):
+    """(a, c, f8) of the host kernel's t(m) = max(W, a + c m + f8 ceil(m / 8)) an expert of layer l (kernel_t); `down`
+    q8k takes dc_q8k_down off c.
+
+    union, hosttile: the bench's two-point fits at m 8 and 16, f8 0. r8: the lane cut's own cost model — the row-lane
+    tile's fixed unpack per run of up to 8 columns and its per-column share, summed over an expert's gate, up and down
+    (r8_tile_fix, r8_tile_col; the Q5_K down of Q5_LAYERS in the _q5 rows) — at r8_kappa us a unit on 32 threads, with no
+    intercept: an expert costs its tile work, linear in m past its first run, or its read, whichever is longer."""
     k = cfg.get("union", "union")
+    f8 = 0.0
     if k == "hosttile":
         a, c = p["a_hosttile"], p["c_hosttile"]
-    elif k == "r8":
+    elif k == "r8" and cfg.get("r8law") == "twopoint":        # the superseded fit, for backtest's diagnostics
         a, c = p["a_r8"], p["c_r8"]
+    elif k == "r8":
+        q5 = "_q5" if l in Q5_LAYERS else ""
+        a, c, f8 = 0.0, p["r8_kappa"] * p["r8_tile_col" + q5], p["r8_kappa"] * p["r8_tile_fix" + q5]
     else:
         a, c = p["a_union"], p["c_union"]
     if cfg.get("down") == "q8k":
         c -= p["dc_q8k_down"]
-    return a, c
+    return a, c, f8
 
 
 GU_SLOT_BYTES = 2 * 2304 * 4 + 2664   # the combine re-reads a slot's gate/up (f32) and writes qc (model/src/ops.rs UnionCall::combine)
 
 
-def cause_terms(p, flow, K, slots, touched, T, f, a, c):
+def cause_terms(p, flow, K, slots, touched, T, f, a, c, f8=0.0):
     """The union's time beyond its kernel sum K, by cause (ms), for one call of T columns.
 
     chunks (before 9626c7f, moe.rs serve_planned on 9626c7f^): x quantized once, then per chunk of 8
@@ -651,7 +667,7 @@ def cause_terms(p, flow, K, slots, touched, T, f, a, c):
     of a 144-row block each; the combine re-reads the gate/up slab; the scan is a pool pass."""
     wide = T > 8
     if flow == "five":
-        cost = max(p["w"], a + c * (slots / touched))          # one expert at its mean m, 32 threads, W its floor
+        cost = kernel_t(a, c, p["w"], f8, slots / touched)     # one expert at its mean m, 32 threads, W its floor
         share = p["gu_row_share"]
         trow = share * 32 * cost / 4608 + (1 - share) * 32 * cost / 5120
         return dict(tail=f * p["union_block_rows"] * trow / 1000.0,
@@ -733,14 +749,14 @@ def union_call(p, cfg, rt, l, T, U, skip=0.0):
     zero = dict(ms=0.0, raw=0.0, resid=0.0, expl=0.0, x=0.0, slots=0.0, touched=0.0, bytes=0.0, parts={})
     if T <= 0:
         return zero
-    a, c = union_kernel(p, cfg)
-    K, slots, touched = union_sum(union_table(rt.host[l], T, a, c, p["w"]), skip)
+    a, c, f8 = union_kernel(p, cfg, l)
+    K, slots, touched = union_sum(union_table(rt.host[l], T, a, c, p["w"], f8), skip)
     if touched <= 1e-12:
         return zero
     if U.get("off"):
         parts, x = {}, 0.0
     else:
-        parts = cause_terms(p, cfg.get("flow", "chunks"), K, slots, touched, T, U["f"], a, c)
+        parts = cause_terms(p, cfg.get("flow", "chunks"), K, slots, touched, T, U["f"], a, c, f8)
         x = x_of(U, cfg) * (slots if U["mode"] == "slot" else K)
     expl = sum(parts.values())
     res = expl + x + (p["unionreal_cut"] if cfg.get("unionreal_cut") else 0.0)
@@ -1480,10 +1496,10 @@ def settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring):
 
 def expert_saving_us(p, cfg, rt, l, Ts, lam, U):
     """Host us one streamed expert of list rate lam saves over batches of Ts columns: per 512-column call its
-    E[max(W, a + c m)] (the W floor is paid per call, hoststream-recal-report.md 「hoststream-recal 보고」 '호출마다 W 126 µs가 붙습니다') and X_u a slot."""
-    a, c = union_kernel(p, cfg)
+    E[t(m)] (the W floor is paid per call, hoststream-recal-report.md 「hoststream-recal 보고」 '호출마다 W 126 µs가 붙습니다') and X_u a slot."""
+    a, c, f8 = union_kernel(p, cfg, l)
     xs = x_of(U, cfg) * 1000.0 if U.get("mode") == "slot" else 0.0
-    return sum(ecost(T, round(lam, 6), a, c, p["w"])[0] + xs * T * lam / 512.0 for T in Ts if T)
+    return sum(ecost(T, round(lam, 6), a, c, p["w"], f8)[0] + xs * T * lam / 512.0 for T in Ts if T)
 
 
 def rule_k(p, cfg, rt, l, Ts, U, rule):
@@ -1494,11 +1510,11 @@ def rule_k(p, cfg, rt, l, Ts, U, rule):
     static = cfg.get("pick", "static") == "static"
     phi = rt.phi if static else 1.0
     fus = expert_bytes_stream(p, l) / (p["pcie_pinned"] * 1e9) * 1e6
-    a, c = union_kernel(p, cfg)
+    a, c, f8 = union_kernel(p, cfg, l)
     k = 0.0
     for lam, wgt in weighted_ranks(rt.host[l], rt.n_host(l) / phi, phi):
         if rule == "onecall":
-            save = phi * max(p["w"], a + c * sum(T * lam / 512.0 for T in Ts))
+            save = phi * kernel_t(a, c, p["w"], f8, sum(T * lam / 512.0 for T in Ts))
         else:
             save = phi * expert_saving_us(p, cfg, rt, l, Ts, lam, U)
         if save <= fus:
@@ -1808,6 +1824,12 @@ CONFIGS = {
                   marks4=True),
     "REL": dict(commit="53e2def", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, G=2, wrap=True,
                 union="r8"),
+    # the pfxprose lease (09-29#pfxprose): main e577ac9, the r8 flow at the id prefix (no hot list), the router sets' own
+    # windows as routing (routes-idprefix.tsv); S0 = its BLOOMERY_STEP_STATS=1 arms (card marks), S0pp = the arms without
+    "S0": dict(commit="e577ac9", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
+               marks4=True, union="r8", hot=False),
+    "S0pp": dict(commit="e577ac9", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, G=2, wrap=True,
+                 union="r8"),
 }
 DEFAULT_ANCHORS = dict(union="anchor_union_s13b", union_ud="anchor_union_ud512", resid_mode="slot")
 
@@ -1858,6 +1880,7 @@ PRS = "09-26#b1-pp-ab (cardin run.log;"
 CTS = "09-26#cardtile-ab (cardab run.log; rounds"
 PGS = "09-26#prefillgroup-ab (gab run.log; rounds"
 R8S = "09-27#r8host-pp (r8hostpp-sitting.log stat prefill split;"
+S0S = "09-29#pfxprose (flowfit s0-run.log stat prefill split; rounds"
 ROWS = [
     ("B.pp512", "ds41batch", 512, {}, "pp", 91.2, 2, "abs", "09-25#ds41batch-pp: 90.95, 91.46"),
     ("B.pp4096", "ds41batch", 4096, {}, "pp", 89.2, 2, "abs", "89.40, 89.02"),
@@ -2086,7 +2109,7 @@ ROWS = [
     # clean comparison
     ("R8.p512.lcg.pp", "R8", 512, {"pro": 67.0}, "pp", 190.99, 1, "abs", R8S + " round 1; round 2 185.38 [cold])"),
     ("R8.p512.lcg.chain", "R8", 512, {}, "chain", 2612.8, 1, "abs", "round 1 (round 2 2,645.2 [cold])"),
-    ("R8.p512.lcg.union", "R8", 512, {}, "union", 45.05, 1, "abs", "round 1: a_r8, c_r8's anchor"),
+    ("R8.p512.lcg.union", "R8", 512, {}, "union", 45.05, 1, "abs", "round 1 (a_r8, c_r8's anchor before r8_kappa)"),
     ("R8.p512.lcg.wait", "R8", 512, {}, "wait", 15.79, 1, "abs", ""),
     ("R8.p512.lcg.enqueue", "R8", 512, {}, "enqueue", 4.48, 1, "abs", ""),
     ("R8.p512.lcg.card_out", "R8", 512, {}, "card_out", 19.50, 1, "abs", ""),
@@ -2102,7 +2125,7 @@ ROWS = [
      "237.73, 236.93; prologue 109.2, 99.8"),
     ("R8.p512.prose.chain", "R8", 512, {"rt": "prose", "clk": "tile"}, "chain", 2051.9, 2, "abs", "2,043.5, 2,060.3"),
     ("R8.p512.prose.union", "R8", 512, {"rt": "prose", "clk": "tile"}, "union", 28.345, 2, "abs",
-     "27.99, 28.70: a_r8, c_r8's anchor"),
+     "27.99, 28.70 (a_r8, c_r8's anchor before r8_kappa)"),
     ("R8.p512.prose.wait", "R8", 512, {"rt": "prose", "clk": "tile"}, "wait", 18.50, 2, "abs", "18.94, 18.06"),
     ("R8.p512.prose.enqueue", "R8", 512, {"rt": "prose", "clk": "tile"}, "enqueue", 4.45, 2, "abs", "4.15, 4.75"),
     ("R8.p512.prose.card_out", "R8", 512, {"rt": "prose", "clk": "tile"}, "card_out", 20.48, 2, "abs", "20.50, 20.46"),
@@ -2134,6 +2157,34 @@ ROWS = [
     # (rig-log 09-28#release-sit): printed beside the model, not scored
     ("REL.pp512", "REL", 512, {}, "pp", 190.6, 1, "info", "09-28#v41-release, main 53e2def, lcg, no hot list"),
     ("REL.pp4096", "REL", 4096, {}, "pp", 358.4, 1, "info", ""),
+    # pfxprose (09-29#pfxprose), the lease's lines (flowfit's copy of the runner log, s0-run.log): the id prefix, 3 rounds, no
+    # [cpu-busy] or [cold] row; the first prose P 512 arm (the lease's first process, prologue 101.8 ms) is the runner's
+    # discarded warm-up. The stats arms carry union, chain and the card marks; the prose pp rows are the arms without stats,
+    # code's pp its stats arms (the only code arms), each with its measured prologues
+    ("S0.p512.prose.union", "S0", 512, {"rt": "prose"}, "union", 45.723, 3, "abs", S0S + " 46.12, 45.94, 45.11): r8_kappa's anchor"),
+    ("S0.p4096.prose.union", "S0", 4096, {"rt": "prose"}, "union", 44.19, 3, "abs", "44.22, 44.13, 44.22: r8_kappa's anchor"),
+    ("S0.p512.code.union", "S0", 512, {"rt": "code"}, "union", 43.287, 3, "abs", "44.07, 42.93, 42.86: r8_kappa's anchor"),
+    ("S0.p512.prose.chain", "S0", 512, {"rt": "prose"}, "chain", 2634.47, 3, "abs", "2,650.3, 2,644.1, 2,609.0"),
+    ("S0.p4096.prose.chain", "S0", 4096, {"rt": "prose"}, "chain", 10876.53, 3, "abs", "10,882.1, 10,868.2, 10,879.3"),
+    ("S0.p512.code.chain", "S0", 512, {"rt": "code"}, "chain", 2538.9, 3, "abs", "2,569.8, 2,524.6, 2,522.3"),
+    ("S0.p512.prose.pp", "S0pp", 512, {"rt": "prose", "pro": 32.70}, "pp", 193.19, 3, "abs",
+     "193.17, 194.05, 192.34 (no stats); prologue 42.3, 15.0, 40.8"),
+    ("S0.p4096.prose.pp", "S0pp", 4096, {"rt": "prose", "pro": 250.40}, "pp", 368.46, 3, "abs",
+     "369.41, 367.49, 368.47 (no stats); prologue 241.2, 271.3, 238.7"),
+    ("S0.p512.code.pp", "S0", 512, {"rt": "code", "pro": 37.10}, "pp", 198.72, 3, "abs",
+     "194.55, 200.89, 200.73 (stats); prologue 60.9, 23.1, 27.3"),
+    ("S0.p512.prose.wait", "S0", 512, {"rt": "prose"}, "wait", 16.233, 3, "abs", "16.09, 16.33, 16.28"),
+    ("S0.p512.prose.enqueue", "S0", 512, {"rt": "prose"}, "enqueue", 3.90, 3, "abs", "4.04, 3.83, 3.83"),
+    ("S0.p512.prose.card_out", "S0", 512, {"rt": "prose"}, "card_out", 19.38, 3, "abs", "19.37, 19.41, 19.36"),
+    ("S0.p512.prose.card_in", "S0", 512, {"rt": "prose"}, "card_in", 11.527, 3, "abs", "11.58, 11.54, 11.46"),
+    ("S0.p4096.prose.enqueue", "S0", 4096, {"rt": "prose"}, "enqueue", 4.36, 3, "abs", "4.35, 4.38, 4.35"),
+    ("S0.p4096.prose.card_out", "S0", 4096, {"rt": "prose"}, "card_out", 22.27, 3, "abs", "22.20, 22.34, 22.27"),
+    ("S0.p4096.prose.card_in", "S0", 4096, {"rt": "prose"}, "card_in", 12.443, 3, "abs", "12.37, 12.54, 12.42"),
+    ("S0.p512.code.card_in", "S0", 512, {"rt": "code"}, "card_in", 11.853, 3, "abs", "11.82, 11.87, 11.87"),
+    ("S0.p512.prose.slots", "S0", 512, {"rt": "prose"}, "host_slots", 96372, 3, "info",
+     "union_host_slots, every round: the set's windows against the prompt"),
+    ("S0.p4096.prose.slots", "S0", 4096, {"rt": "prose"}, "host_slots", 529103, 3, "info", ""),
+    ("S0.p512.code.slots", "S0", 512, {"rt": "code"}, "host_slots", 94155, 3, "info", ""),
     # 09-27#v41-ppdepth: the r8 flow on b684167, prose, hot list 384, STEP_STATS; its prologue 53.7-88.6 us a token
     ("PPD.p4096.prose.pp", "R8", 4096, {"rt": "prose", "clk": "tile"}, "pp", 373.2, 2, "info",
      "09-27#v41-ppdepth 373.0, 373.4 (prologue ~0.22 s, the model's 0.32)"),
@@ -2156,8 +2207,7 @@ ANCHOR_ROWS = {
     "prose_swap_4096": {"CT.p4096.slots"},
     "prose_phi_4096": {"CT.p4096.union"},
     "clk_tile_prose": {"CT.p512.tile.card_out"},
-    "a_r8": {"R8.p512.lcg.union", "R8.p512.prose.union"},
-    "c_r8": {"R8.p512.lcg.union", "R8.p512.prose.union"},
+    "r8_kappa": {"S0.p512.prose.union", "S0.p4096.prose.union", "S0.p512.code.union"},
 }
 
 # the term that breaks a red row, named after reading its terms (--explain <row>, the diagnostics below)
@@ -2186,6 +2236,23 @@ TERMS = {
                      " (enqueue 14.6). With the card-bound clock at the row's duty (clk_at 1.118, the band's term, not the"
                      " central) the chain reads 10,928 against 10,783 (+1.3 %): the SM clock sampled under a prose P 4096 arm"
                      " decides (the uncalibrated 'card-bound clock' row)",
+    "prose-phi-r8": "the hot-list prose rows of the r8 lease under r8_kappa: their routing is prose_swap / prose_phi_five /"
+                    " prose_phi_4096, which put the host columns on phi of the ranks at rates / phi, fitted to the union"
+                    " under the union kernel's own two-point law (c_union 22.2 a column); under a slope of 13.2 that"
+                    " concentration reads the union 12-15 % short. The prose router set's own windows with the card at"
+                    " hotlist-384's first n_l ids of each layer (no fitted routing constant) read the same rows at r8_kappa"
+                    " 27.62 (-2.6 %) at P 512 and 28.92 (-3.7 %, per-batch lists) at P 4096, with 4 % and 10 % fewer host"
+                    " slots than those leases: the routing term, not the law",
+    "glist": "P 4096 at the id prefix: routes-idprefix.tsv's group lists are rank means over windows of G x 512, read by"
+             " each batch as Binomial(512, lam / 512); an expert a window routes to in one of its batches is then touched in"
+             " both, so a G 2 list reads 209 host experts a batch-layer against the G 1 list's 175 and the set's exact"
+             " per-batch count 187 (prose, T 512 on every layer; code 186 / 160 / 172), the kernel sum +2.6 % (G 1 -2.8 %). With the G 1 list"
+             " the P 4096 prompt reads union 44.45 (+0.6 %), chain 10,926 (+0.5 %), pp 366.7 (-0.5 %); the lists' order"
+             " is the streaming pick's, so the fix is a per-batch count beside it (routes.py)",
+    "card_in-4096": "the tile shadow at P 4096 reads ~1.1 ms a layer-batch over the model on both leases that have the row: r8"
+                    " lcg with the hot list 13.44 against 12.31, pfxprose's id-prefix prose 12.44 against 11.39; their P 512"
+                    " rows hold (-4.0 %, -1.2 %). Both cells are host-bound (the union 44-47 over the card's 33-34): under"
+                    " its shadow, 0 to the wall",
     "card_in-lcg-hot-4096": "lcg with the hot list at P 4096: the tile shadow 13.44 against T's 12.31 (+1.1 ms); T's items were"
                             " validated on lcg without the list and on prose, and this is the one mix no earlier row held. The"
                             " host binds lcg (the union 44.3 over the card's 35.9), so the term is under its shadow: 0 to the wall",
@@ -2199,7 +2266,11 @@ BLAME = dict({r: "router_tok" for r in ("S13.pp4096.on", "S13.pp4096.off", "S13b
                                           "R8.p512.prose.wait", "R8.p512.prose.enqueue")},
              **{r: "r8-duty-clock" for r in ("R8.p4096.prose.pp", "R8.p4096.prose.chain", "R8.p4096.prose.wait",
                                              "R8.p4096.prose.enqueue", "R8.p4096.prose.card_out", "R8off.p4096.prose.chain")},
-             **{"R8.p4096.lcg.card_out": "route-4096", "R8.p4096.lcg.card_in": "card_in-lcg-hot-4096"})
+             **{"R8.p4096.lcg.card_out": "route-4096", "R8.p4096.lcg.card_in": "card_in-lcg-hot-4096"},
+             **{r: "prose-phi-r8" for r in ("R8.p512.prose.pp", "R8.p512.prose.chain", "R8.p512.prose.union",
+                                            "R8.p4096.prose.union", "R8.ratio512.prose")},
+             **{r: "glist" for r in ("S0.p4096.prose.chain", "S0.p4096.prose.pp")},
+             **{"S0.p4096.prose.card_in": "card_in-4096"})
 
 
 def cold_pp(p, res, P, frac):
@@ -2258,7 +2329,7 @@ def scored(rid, kind, q, skip, n=2):
 
 IN_USE = ("anchor_union_s13b", "anchor_union_ud512", "s_host_lcg", "prologue_tok", "ud_delta_512", "full_res_lat",
           "t_issue", "clk_cardbound", "prose_swap", "prose_phi_five", "prose_swap_4096", "prose_phi_4096", "clk_tile_prose",
-          "a_r8", "c_r8")
+          "r8_kappa")
 
 
 def backtest(verbose=True, out_rows=None):
@@ -2422,10 +2493,23 @@ def diagnostics(p):
                                                                          ("nonunion", 35.1))]
     out += tile_diagnostics(p)
     out += group_diagnostics(p)
+    old = twopoint_r8_rows(p)
+    out.append("the superseded two-point r8 law (a_r8 %.2f, c_r8 %.2f us, 09-27#r8host-pp) on the union rows: " % (p["a_r8"], p["c_r8"])
+               + ", ".join(f"{rid} {v:+.1f} %" for rid, v in old))
     out.append("P dependence: S14 at P 4096 reads " + ", ".join(f"{q} {v:.2f}/{m} ({(v - m) / m * 100:+.1f} %)"
                                                                   for q, v, m in s4)
                + f"; CED off P 4096/512 {evaluate(p, dict(CONFIGS['S13'], ced=False), 4096)['pp'] / evaluate(p, dict(CONFIGS['S13'], ced=False), 512)['pp']:.3f}"
                " against S13's 102.56/104.66 = 0.980")
+    return out
+
+
+def twopoint_r8_rows(p):
+    """The r8 union rows under the law r8_kappa replaced (r8law "twopoint": max(W, a_r8 + c_r8 m)) — (row, error %)."""
+    out = []
+    for row in ROWS:
+        if row[4] == "union" and CONFIGS[row[1]].get("union") == "r8":
+            v = predict_row(p, row[:3] + (dict(row[3], r8law="twopoint"),) + row[4:])[0]
+            out.append((row[0], (v - row[5]) / row[5] * 100.0))
     return out
 
 
@@ -2512,7 +2596,8 @@ STEPS = [
      "+ prefillgroup: the layer-first scheduler with the cross-layer wrap over pairs of batches (section 1.1)", None),
     ("r8", {"b1": True, "tile": True, "G": 2, "wrap": True, "union": "r8"},
      "+ r8 (r8land 1ad6599): the host union's gate/up from the row-lane sidecar; today's flow (G 2, no streaming), the"
-     " kernel law fitted to the r8host lease's stat lines (a_r8, c_r8); --levers re-derives each lever against it", None),
+     " kernel law the lane cut's tile work at r8_kappa, fitted to the pfxprose lease's stat lines; --levers re-derives each lever"
+     " against it", None),
     ("+stream", {"b1": True, "tile": True, "G": "auto", "wrap": True, "stream": True, "ring": 8, "union": "r8"},
      "+ host streaming on r8 (steps 2 and 3): the wrap over up to 8 batches, an unborrowed 8-slot ring, k(T) by resource"
      " balance, a static rank table, the streamed experts through T's kernels (bit rule b')",
@@ -2548,8 +2633,9 @@ MEASURED = {
             " hot list 200.4 at P 4096 (the prefillgroup lease's G 1 arm, the model 204.8)",
     "r8": "measured 09-27#r8host-pp (hot list 384, STEP_STATS): lcg 191.0 / 338.7, prose 237.3 / 358.8, with prologues of"
           " 67-983 ms (the model's 40-317); chain 2,613 / 11,163 and 2,052 / 10,783 ms (the R8 backtest rows); 09-28#v41-release"
-          " (lcg without the hot list): 190.6 / 358.4 (the model 189.7 / 350.8, the REL rows); 09-27#v41-ppdepth prose P 4096"
-          " 373.2 (prologue 0.22 s)",
+          " (lcg without the hot list): 190.6 / 358.4 (the model 193.0 / 358.4, the REL rows); 09-27#v41-ppdepth prose P 4096"
+          " 373.2 (prologue 0.22 s); 09-29#pfxprose (the id prefix, no hot list): prose 193.2 / 368.5, code 198.7 at P 512"
+          " (the model 196.8 / 350.7, 200.3 with each arm's prologue, the S0 rows; P 4096 reads the group-list term glist)",
     "B1+T+G": "measured 09-26#prefillgroup-ab on lcg without the hot list, P 4096: 247.5 (round 2; the model 251.6),"
               " G 2 / G 1 1.232 (round 2's pair; the model 1.228); the union 68.6-69.3 ms a layer-batch in both arms"
               " (the model 67.4) — it does not move with its share of the wall",
@@ -2946,9 +3032,9 @@ def stream_report():
     print("host streaming after B1 + T [derived]: A6000 300 W, plan (a), hot list 384, CED on; streamed experts priced at"
           " T's tile rate (bit rule b'), a static rank table (pick static), the fill gated by the layer's start, pinned"
           f" {p['pcie_pinned']:.2f} GB/s, fill {p['fill_crossings']:.0f} DRAM crossings under dram_eff {p['dram_eff']:.0f} GB/s.")
-    a, c = union_kernel(p, step_cfg(STREAM_BASE))
+    a, c, f8 = union_kernel(p, step_cfg(STREAM_BASE), 2)
     print(f"\n1. experts a layer that beat PCIe (fill {fus:.1f} us, {fus0:.1f} on the Q5_K layers 0-1), 512-column batches:"
-          f" 'onecall' = a + c x G x m > fill (a {a}, c {c}); 'serial' = sum over the G calls of E[max(W, a + c m)] + X_u m"
+          f" 'onecall' = t(G x m) > fill (layer 2: a {a:g}, c {c:.2f}, f8 {f8:.2f}); 'serial' = sum over the G calls of E[t(m)] + X_u m"
           f" > fill (W {p['w']}, X_u {U['x_ud'] * 1000:.2f} us a slot); prose static saves phi {p['prose_phi_five']} (P 512),"
           f" {p['prose_phi_4096']} (P 4096) of a streamed rank")
     print(f"   {'routing (count unit)':22} {'layer':>5} {'of':>6} " + " ".join(f"{'G' + str(G) + ' 1call/serial':>18}" for G in (1, 2, 4, 8)))
@@ -3104,9 +3190,9 @@ def lever_cell(p, over, pov, rn, hot, P, duty_clock):
 def levers():
     p = central()
     print("pp tok/s [derived] @ A6000 300 W, plan (a), CED on: today's flow = r8 (r8land), G 2 (prefillgroup's wrap), no"
-          " streaming, T's tile shadow, the r8 kernel law fitted to 09-27#r8host-pp (a_r8 %.2f, c_r8 %.2f us); the prose"
+          " streaming, T's tile shadow, the r8 kernel law: the lane cut's tile work at r8_kappa %.3f us/Mhu (09-29#pfxprose), %.2f us a column past the first run on layers 2-39; the prose"
           " prompt at clk_tile_prose. 'clk' = the card-bound clock at the run's duty (clk_at, the band's term) in place of the"
-          " central clock: it moves the cells where the card binds." % (p["a_r8"], p["c_r8"]))
+          " central clock: it moves the cells where the card binds." % (p["r8_kappa"], p["r8_kappa"] * (p["r8_tile_col"] + p["r8_tile_fix"] / 8)))
     meas = {r[0]: r[5] for r in ROWS}
     print("measured (the backtest rows): lcg no hot list %.1f / %.1f (REL.pp512 / REL.pp4096); lcg hot list %.1f / %.1f,"
           " prose %.1f / %.1f (R8.p512 / R8.p4096 .lcg.pp / .prose.pp, under STEP_STATS, each with its own prologue)"
@@ -3468,18 +3554,31 @@ def self_test():
     ks = [rule_k(p, cf, lc, 2, [512] * G, U, "serial") for G in (1, 2, 4)]
     check("lcg's uniform host experts: none beats PCIe serially at G 1-2, all 314 at G 4 (2 E[t] < 638 us < 4 E[t])",
           ks[0] == 0 and ks[1] == 0 and abs(ks[2] - lc.n_host(2)) < 1e-6, str(ks))
-    for rid, want in (("R8.p512.lcg.union", 45.05), ("R8.p512.prose.union", 28.345)):
-        row = next(x for x in ROWS if x[0] == rid)
-        got = predict_row(p, row)[0]
-        check(f"the r8 kernel law reproduces its anchor {rid} ({want}, 0.05 ms)", abs(got - want) < 0.05, f"{got:.3f}")
+    krows = [x for x in ROWS if x[0] in ANCHOR_ROWS["r8_kappa"]]
+
+    def krms(k):
+        q = p.but(r8_kappa=k)
+        return math.sqrt(sum(((predict_row(q, x)[0] - x[5]) / x[5]) ** 2 for x in krows) / len(krows))
+    k0 = p["r8_kappa"]
+    check("r8_kappa is its anchors' least-squares fit: a step of 0.002 either way reads a larger rms",
+          len(krows) == 3 and krms(k0) < krms(k0 - 0.002) and krms(k0) < krms(k0 + 0.002),
+          f"rms {krms(k0) * 100:.4f} % at {k0}, {krms(k0 - 0.002) * 100:.4f} / {krms(k0 + 0.002) * 100:.4f} % beside it")
+    ka, kc, kf = union_kernel(p, dict(union="r8"), 2)
+    t8, t9 = (kernel_t(ka, kc, 0.0, kf, m) for m in (8, 9))
+    check("the r8 law pays the fixed unpack once a run: t(9) - t(8) = kappa (r8_tile_col + r8_tile_fix) with W 0",
+          abs(t9 - t8 - p["r8_kappa"] * (p["r8_tile_col"] + p["r8_tile_fix"])) < 1e-9, f"{t9 - t8:.2f} us")
     check("the r8 flow issues PG2's queue entries (the r8host counter read equal at P 512 and 4096)",
           all(counts(P, "R8") == counts(P) for P in (512, 4096)))
     lo = cause_terms(p, "five", 1.0, 1.0, 1.0, 512, 1.0, -1e6, 0.0)["tail"]
     check("t(m)'s floor holds in the five-dispatch causes: an expert's tail is never priced under W",
           abs(lo - p["union_block_rows"] * (p["gu_row_share"] * 32 * p["w"] / 4608 + (1 - p["gu_row_share"]) * 32 * p["w"] / 5120)
               / 1000.0) < 1e-12, f"{lo:.6f}")
-    q8 = union_kernel(p, dict(union="r8", down="q8k"))
-    check("q8_K down takes dc_q8k_down off the kernel's c and leaves a", q8 == (p["a_r8"], p["c_r8"] - p["dc_q8k_down"]))
+    a8, c8, f8 = union_kernel(p, dict(union="r8"), 2)
+    q8 = union_kernel(p, dict(union="r8", down="q8k"), 2)
+    check("q8_K down takes dc_q8k_down off the kernel's c and leaves a and the fixed unpack",
+          q8 == (a8, c8 - p["dc_q8k_down"], f8))
+    check("the r8 law reads the Q5_K down's tile shape on layers 0-1",
+          union_kernel(p, dict(union="r8"), 0) == (0.0, p["r8_kappa"] * p["r8_tile_col_q5"], p["r8_kappa"] * p["r8_tile_fix_q5"]))
     rb = evaluate(p, TODAY, 512, "prose")["agg"]
     rw = evaluate(p.but(batchwide_ratio=1.0), dict(TODAY, batchwide=True), 512, "prose")["agg"]
     rh = evaluate(p.but(batchwide_ratio=0.5), dict(TODAY, batchwide=True), 512, "prose")["agg"]
