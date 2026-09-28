@@ -40,8 +40,9 @@
 #                   changes nothing the graph computes; the dump faults in what it touches
 #   ref_step_variant  the decode-step variants, below
 #
-#   IK_NCMOE        how many leading layers keep their routed experts on the host in IK_GPU_FLAGS
-#                   (--n-cpu-moe), sized exactly as LCPP_NCMOE is, per timing card: 33 on the A6000 and
+#   IK_NCMOE        how many layers keep their routed experts on the host in IK_GPU_FLAGS
+#                   (--n-cpu-moe; which layers is the binary's, IK_GPU_FLAGS below), sized exactly as
+#                   LCPP_NCMOE is, per timing card: 33 on the A6000 and
 #                   37 on the 3090 when MODEL is V41_PUBLIC [derived, LCPP_NCMOE's arithmetic below; no ik
 #                   load has been run at 33 or 37], and unset for any other file, which no count was
 #                   sized for — IK_GPU_FLAGS is then unset too, and a runner that reads it stops at the
@@ -58,7 +59,8 @@
 #                   [derived]. BLOOMERY_IK_NCMOE (ik-draft.sh) replaces it for one run.
 #   IK_GPU_FLAGS    ik's decode on the timing card, placed to mirror design §5 (a) (depth-ds41.sh reads
 #                   it): every layer offloaded, and the routed experts of the first IK_NCMOE layers on the
-#                   CPU, the rest of the layers' whole on the card. Plan (a) keeps a prefix of every
+#                   CPU (llama-bench's reading; llama-cli's is below), the rest of the layers' whole on
+#                   the card. Plan (a) keeps a prefix of every
 #                   layer's experts on the A6000, and ik moves a layer's 384 experts as one tensor, so
 #                   the closest it has is whole layers. V41_PUBLIC: plan (a)'s 2,668 card experts are
 #                   6.95 layers' worth, 33 keeps 7 (LCPP_NCMOE below).
@@ -67,6 +69,14 @@
 #                   cache. No flag sweep has been run: these are "at these flags".
 #                   llama-bench's --n-cpu-moe N is a list of CPU buffer-type overrides for layers
 #                   0..N-1 (the same thing -ot "...=CPU" gives), not the loader's own ncmoe.
+#                   llama-cli (ik-draft.sh) hands N to the loader's ncmoe instead, which counts from the
+#                   other end: with one visible device (or N at least the layer count) the last N layers
+#                   that carry experts go to the host; with two devices under the default layer split, N
+#                   is shared out over the devices in proportion to their layers and each device's share
+#                   is again its last layers (ik src/llama-load-tensors.cpp:279-358 at 41b17995, the
+#                   Mac checkout; the box's ik trees are other commits). The same IK_GPU_FLAGS thus keep
+#                   different layers on the card in llama-bench and in llama-cli, and the prefix
+#                   placement above is llama-bench's only.
 #   IK_GPU_ENV      the environment of every ik launch with IK_GPU_FLAGS, as NAME=VALUE words for
 #                   `env`. GGML_CUDA_NO_PINNED_WEIGHTS=1 is load-bearing: any override to the CPU
 #                   makes ik's loader drop mmap for the whole host context
@@ -170,8 +180,8 @@
 #                   the two cards (common/fit.cpp sets tensor_split per device). ik has no two-card line:
 #                   its -ts is a byte split over its own layer sizes (get_layer_sizes, src/llama.cpp:4575-4640
 #                   at db517b69), not a slot split, and whether those count a host-overridden expert is
-#                   unread; the public reference is llama.cpp. LCPP_CLI_FLAGS stays unset in the mode (its
-#                   reader, ik-draft.sh, has no two-card mode)
+#                   unread; the public reference is llama.cpp. LCPP_CLI_FLAGS carries the same -ts in the mode
+#                   (ik-draft.sh's lcpp arm, llama-completion, whose -ts reads `/` as llama-bench's does)
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
@@ -219,7 +229,7 @@ if [ -n "${IK_NCMOE:-}" ]; then
 fi
 if [ -n "${LCPP_NCMOE:-}" ]; then
   : "${LCPP_GPU_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 -nopo 1${LCPP_TS:+ -ts $LCPP_TS}}"
-  [ -n "$TWO_CARD_PLACEMENT" ] || : "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off}"
+  : "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off${LCPP_TS:+ -ts $LCPP_TS}}"
   : "${LCPP_NCMOE_SWEEP:=$LCPP_NCMOE $((LCPP_NCMOE + 1)) $((LCPP_NCMOE + 2))}"
 fi
 : "${REF_CTX:=512}"

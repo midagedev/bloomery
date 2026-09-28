@@ -66,8 +66,12 @@
 #   twocard      lcpp:6 lcpppp:4, one round, the preheat on: the decode row and the json prefill row (its
 #                device lines on stderr) carry `A6000+3090` and both cards, the stub llama-bench got -ts
 #                1.5/1.5, the witness's two-card lines; rc 0.
-#   twocard-arms 6, code:4, ik:6 and lcppsrv:6 each refused by name before anything runs (rc 64); ours under
-#                --place a naming its two-card placement, bp, the server arm naming the two-card checks it lacks.
+#   twocard-arms 6, code:4 and ik:6 each refused by name before anything runs (rc 64); ours under
+#                --place a naming its two-card placement, bp.
+#   twocard-srv  lcppsrv:6 lcppsrvpp:4, one round: the server arms run in the mode, the profile's -ts in each
+#                server's command line, each row `A6000+3090` and both cards as its device; rc 0.
+#   twocard-srv-one, twocard-srv-xid  a server that saw one CUDA device, one during which an Xid 79 line
+#                came: a FAIL row naming it, rc 1, no server left up.
 #   twocard-bp   BLOOMERY_GEN_PLACE=bp, lcpp:6 6, one round: ours runs (--place bp), its load record names
 #                both cards, its row reads `A6000+3090` and `place bp`; rc 0.
 #   twocard-bp-one  the same with a load record naming the A6000 alone (STUB_GEN_CARDS): ours is a FAIL row
@@ -308,6 +312,12 @@ srv_left() {
   [ -f "$tmp/tmp/stub-srv-pids" ] || return 0
   while read -r p; do ! kill -0 "$p" 2> /dev/null || left+="$p "; done < "$tmp/tmp/stub-srv-pids"
   echo "$left"
+}
+# none_left <name> <log>: no stub server of the last run is still up, else a FAIL naming their pids.
+none_left() {
+  local left
+  left=$(srv_left)
+  [ -z "$left" ] || { fail "$1" "servers left up: $left" "$2"; return 1; }
 }
 # want <name> <log> <count> <pattern>: the log holds exactly <count> lines matching grep -E <pattern>.
 want() {
@@ -613,7 +623,39 @@ twocard_refused() {
 twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 under --place a loads one card; its two-card placement is --place bp \(BLOOMERY_GEN_PLACE=bp\)$" lcpp:6 6
 twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 under --place a loads one card; " lcpp:6 code:4
 twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
-twocard_refused twocard-arms-srv "^depth-ds41.sh: arm 'lcppsrv:6': a llama-server arm has no two-card checks yet " lcpp:6 lcppsrv:6
+
+L=$tmp/twocard-srv.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" -- lcppsrv:6 lcppsrvpp:4
+if [ "$RC" != 0 ]; then
+  fail twocard-srv "rc $RC, want 0" "$L"
+elif want twocard-srv "$L" 1 '^ROW r1 lcppsrv d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| llama-server ids=lcg: .*\| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\) \| majflt ' &&
+  want twocard-srv "$L" 1 '^ROW r1 lcppsrvpp p=4 n=0 \| tok/s\(pp\) 40.00 @ n=0, prompt 4, A6000\+3090 \| llama-server ids=lcg: .*\| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\) \| majflt ' &&
+  want twocard-srv "$L" 0 '^FAIL ' &&
+  want twocard-srv "$L" 6 '^    3090 cap: ok ' &&
+  want twocard-srv "$tmp/tmp/stub-srv-argv" 2 ' -ts 1\.5/1\.5 ' &&
+  none_left twocard-srv "$L"; then
+  pass twocard-srv
+fi
+
+L=$tmp/twocard-srv-one.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_SRV_SEE_ONE=1 -- lcppsrv:6
+if [ "$RC" != 1 ]; then
+  fail twocard-srv-one "rc $RC, want 1" "$L"
+elif want twocard-srv-one "$L" 1 "^FAIL r1 lcppsrv d=6 rc=0 \| two cards: the engine saw 1 CUDA device\(s\) \(device 0 'NVIDIA RTX A6000 \(stub\)', device 1 '\?'\), not the A6000 and the 3090: a one-card run in the two-card table" &&
+  want twocard-srv-one "$L" 0 '^ROW ' &&
+  none_left twocard-srv-one "$L"; then
+  pass twocard-srv-one
+fi
+
+L=$tmp/twocard-srv-xid.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_SRV_XID=1 -- lcppsrv:6
+if [ "$RC" != 1 ]; then
+  fail twocard-srv-xid "rc $RC, want 1" "$L"
+elif want twocard-srv-xid "$L" 1 "^FAIL r1 lcppsrv d=6 rc=0 \| two cards: 1 NVRM Xid line\(s\) since the last arm.s check \(A6000 0, 3090 1 since the lease was taken\); last: .*Xid \(PCI:0000:41:00\): 79, " &&
+  want twocard-srv-xid "$L" 0 '^ROW ' &&
+  none_left twocard-srv-xid "$L"; then
+  pass twocard-srv-xid
+fi
 
 L=$tmp/twocard-bp.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp -- lcpp:6 6

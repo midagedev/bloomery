@@ -75,7 +75,9 @@
 # The flag table (llama-bench spelling -> llama-server's, common/arg.cpp in both trees): -ngl, -ncmoe,
 # --n-cpu-moe, -fa, -t, -ub, -b, -lzm, -ts, -ot, -ctk, -ctv (and their long forms) are one spelling in both;
 # -nopo 1 is --no-op-offload and -nopo 0 --op-offload; -fitt T is `-fit on -fitt T` and -v is -v. A value
-# with a comma in a flag that takes one value is several bench tests and refused, as is every other word.
+# with a comma in a flag that takes one value is several bench tests and refused, as is every other word;
+# so is a comma in -ts or -ot, which llama-bench reads as the next test and llama-server as the next
+# proportion or override (a two-card table's split would be read as a different split).
 # V4.1's translated flags plus -fit off are the profile's LCPP_CLI_FLAGS word for word (the self-test).
 # Unchanged defaults both engines share: mmap, the f16 K/V cache, -tb = -t (common.cpp: n_threads_batch
 # follows n_threads when unset; llama-bench sets both to -t).
@@ -129,6 +131,8 @@ lcpp_srv_flags() {
         ;;
       -ts | --tensor-split | -ot | --override-tensor)
         [ -n "$v" ] || { SRV_WHY="$w has no value ($1)"; return 1; }
+        # llama-bench reads a comma here as the next test; llama-server as the next proportion or override.
+        case $v in *,*) SRV_WHY="$w '$v': one bench test, not a comma list of them ($1)"; return 1 ;; esac
         SRV_FLAGS+=" $w $v"
         i=$((i + 2))
         ;;
@@ -300,7 +304,9 @@ lcpp_srv_device() { sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' "$1" | head -n 1; 
 # checks, dry line, run and row. The runner has, before calling them: its arm arrays A_ENG, A_DEP, A_LABEL,
 # A_IDS (lcg, or a corpus name whose ids are A_TOK's), N, BOUND, MODEL, LCPP, LCPP_GPU_FLAGS, CARD_NAME,
 # ARM_FAIL_STEM, SRVBIN (srv_preflight sets it), sums and pp_sums; the functions witness, ref_witness,
-# lcg_prompt, majflt_now, cold_check, cold_verdict, counted, arm_fail, count_row and lcpp_fit_col; and
+# lcg_prompt, majflt_now, cold_check, cold_verdict, counted, arm_fail, count_row, lcpp_fit_col and
+# timing_cards_arm (timing-card.sh: in the two-card mode a server that saw other than the A6000 and the 3090
+# as its devices 0 and 1, or an Xid, a lost card or a 3090 off its cap since the last arm, fails the arm); and
 #   srv_tail <wall s>   the end of a server row after its device column, in that runner's field order
 #   srv_after <round> <label> <key>   (optional) a guard after the server stopped
 # A server arm's engine (lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>]): srv_pp says whether it times the prompt,
@@ -376,7 +382,9 @@ srv_config() {
   if lcpp_srv_flags "$LCPP_GPU_FLAGS" fit 2> /dev/null; then echo "[config] lcppsrvfit: $SRVBIN $SRV_FLAGS $LCPP_SRV_FIXED (the server's fit places the model)"; fi
 }
 # One server arm: its llama-server, the warm-up request and the timed one between the
-# witness blocks, then the row (srv_row) or a FAIL row; the server stopped on every path. Under the warm
+# witness blocks, then the row (srv_row) or a FAIL row; the server stopped on every path. In the two-card
+# mode the server's log passes timing_cards_arm first, the bench arms' check, and the row's device column
+# names both cards. Under the warm
 # rows a timed request the cold tag marks is sent once more to the same server before it stops, and the
 # rows print after it: the first as COLD, then the retry's row or its FAIL row rc=cold. majflt counts from
 # the server's start, timed around the timed request; the wall runs from the start to that request's end.
@@ -417,10 +425,13 @@ srv_arm() {
   # whatever the server measured after it (it loads without the fit, as llama-bench does).
   if [ -n "$rc" ]; then
     arm_fail "$r" "$label" "$key" "$rc" "$why" "$(cat "$log")"
+  elif ! timing_cards_arm "$(cat "$log")"; then
+    arm_fail "$r" "$label" "$key" 0 "two cards: $TWOCARD_WHY" "$(cat "$log")"
   elif [[ $eng == *fit* ]] && ! lcpp_fit_col "$(cat "$log")"; then
     arm_fail "$r" "$label" "$key" 0 "$FIT_WHY" "$(cat "$log")"
   else
     [ -z "$FIT_COL" ] || echo "$FIT_LINES" | sed "s/^/    $label fit /"
+    [ -z "$TWOCARD_DEVS" ] || dev=$TWOCARD_DEVS
     COLD_TRY=0
     srv_row "$i" "$r" 0 "$build" "$dev"
     if [ "$COLD_QUEUED" = 1 ]; then
@@ -492,6 +503,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check flags-rest "$SRV_FLAGS" "-ngl 99 --op-offload -ub 4096 -b 4096 -ot blk\.1\.=CPU -fit off"
   lcpp_srv_flags '-ngl 99 -t 16,32' && r=0 || r=1
   check refuse-list "$r|$SRV_WHY" "1|-t '16,32': one value, not a list of bench tests (-ngl 99 -t 16,32)"
+  lcpp_srv_flags '-ngl 99 -ts 36.5/4.5,40/1' && r=0 || r=1
+  check refuse-ts-list "$r|$SRV_WHY" "1|-ts '36.5/4.5,40/1': one bench test, not a comma list of them (-ngl 99 -ts 36.5/4.5,40/1)"
+  lcpp_srv_flags '-ngl 99 -ts 36.5/4.5'
+  check flags-ts "$SRV_FLAGS" "-ngl 99 -ts 36.5/4.5 -fit off"
   lcpp_srv_flags '-ngl 99 -mmp 0' && r=0 || r=1
   check refuse-unknown "$r|$SRV_WHY" "1|'-mmp' has no llama-server spelling in lcpp-warm.sh's table (-ngl 99 -mmp 0)"
   lcpp_srv_flags '-ngl 99 -nopo 2' && r=0 || r=1

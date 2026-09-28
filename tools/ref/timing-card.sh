@@ -16,8 +16,8 @@
 #
 # The two-card mode (AGENTS.md, user 2026-09-28): a model that does not fit one card may carry a
 # second table, "A6000+3090", its own and never the A6000's. BLOOMERY_TIMING_CARDS=a6000+3090 turns it
-# on for a runner that opts in (TIMING_CARDS_RUNNER=1 before it sources this file: depth-ds41.sh and
-# depth-qwen3moe.sh); for any other runner, or any other value, TIMING_GPU and CUDA_VISIBLE_DEVICES are
+# on for a runner that opts in (TIMING_CARDS_RUNNER=1 before it sources this file: depth-ds41.sh,
+# depth-qwen3moe.sh and ik-draft.sh); for any other runner, or any other value, TIMING_GPU and CUDA_VISIBLE_DEVICES are
 # left empty and the reason printed, so lease_take refuses the run (64) instead of timing the A6000
 # alone. In the mode both cards are visible, the A6000 first (device 0, TIMING_GPU, the lease's
 # record) and the 3090 second (TIMING_GPU2); there is no other card (OTHER_GPU empty), so a compute
@@ -54,9 +54,10 @@ fi
 # TIMING_CARDS (a6000+3090, or empty: one card), TIMING_CARDS_NAME (the rows' card field),
 # TIMING_CARDS_WHY (why the value was refused), TIMING_GPU2 (the 3090 in the mode), the cards' PCI
 # addresses as the kernel's Xid lines print them (XID_BUS_A, XID_BUS_B, set by the precheck), the
-# lease's start instant the Xid count runs from (XID_T0) and the count the last arm ended at (XID_BASE).
+# lease's start instant the Xid count runs from (XID_T0), the count the last arm ended at (XID_BASE), and
+# the last check's reason and devices (TWOCARD_WHY, TWOCARD_DEVS: timing_cards_arm).
 TIMING_CARDS='' TIMING_CARDS_NAME='' TIMING_CARDS_WHY='' TIMING_GPU2=''
-XID_BUS_A='' XID_BUS_B='' XID_T0='' XID_BASE=0 TWOCARD_WHY=''
+XID_BUS_A='' XID_BUS_B='' XID_T0='' XID_BASE=0 TWOCARD_WHY='' TWOCARD_DEVS=''
 case ${BLOOMERY_TIMING_CARDS:-} in
   '') ;;
   a6000+3090)
@@ -189,9 +190,11 @@ __card_ok() {
 # timing_cards_arms <our binary> <arm> <kind> <engine> ...: in the two-card mode (0 at once without it),
 # before a dry run's lines or the lease: 64 and the reason when the profile has no two-card line
 # (TWO_CARD_PLACEMENT: the model fits one card, and the A6000+3090 table is for one that does not) or an
-# arm has none. Each arm is three words: the arm as given, its kind (ref for a reference engine; ours,
-# corpus or bin run <our binary>) and its engine. Only mainline llama.cpp's arms (lcpp..., the fit arms
-# too) have a two-card line: the profile's -ts split, or llama-bench's fit over both cards. A runner whose
+# arm has none. Each arm is three words: the arm as given, its kind (ref for a reference engine, srv for a
+# llama-server one; ours, corpus or bin run <our binary>) and its engine. Only mainline llama.cpp's arms
+# (lcpp..., the fit arms too, and its server arms lcppsrv...) have a two-card line: the profile's -ts split,
+# or the fit over both cards. A server arm is timed inside the same checks as a bench arm: its log passes
+# timing_cards_arm (lcpp-warm.sh srv_arm) after the server stopped. A runner whose
 # binary has a two-card placement names it in TIMING_CARDS_PLACE (depth-ds41.sh: bp, generate_ds41's plan
 # (b′)) and the placement its arms load by in TIMING_CARDS_PLACE_RAN: our arms pass when the two agree and
 # are refused with a hint naming it when they do not. Without TIMING_CARDS_PLACE our binaries load one
@@ -208,12 +211,8 @@ timing_cards_arms() {
     a=$1 kind=$2 eng=$3
     shift 3
     case $kind:$eng in
-      ref:lcpp*) ;;
-      srv:*)
-        echo "${0##*/}: arm '$a': a llama-server arm has no two-card checks yet (the Xid, cap and device checks run in the bench arms' path only); the A6000+3090 table takes llama-bench arms until they do" >&2
-        return 64
-        ;;
-      ref:*)
+      ref:lcpp* | srv:lcpp*) ;;
+      ref:* | srv:*)
         echo "${0##*/}: arm '$a': the two-card table's reference is mainline llama.cpp (the profile's two-card line: $TWO_CARD_PLACEMENT); $eng has no two-card arm" >&2
         return 64
         ;;

@@ -1319,10 +1319,11 @@ gate-gpu-p8b *ARGS:
 # 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
 # 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
 # BIN 뒤의 말은 ptx-scan.sh의 엔트리 부분 문자열 하나뿐이다. 자리로 준 피처(`gpu,deepseek41`, 피처 이름)나 플래그는
-# 빌드 전에 거절한다 — ARGS로 흘러 기본 피처로 빌드되면 트랙의 바이너리를 호스트 전용으로 덮어쓴다.
+# 빌드 전에 거절한다(tools/scan-args.sh, 세 스캔 레시피 공용) — ARGS로 흘러 기본 피처로 빌드되면 트랙의 바이너리를
+# 호스트 전용으로 덮어쓴다.
 [arg("FEATURES", long="features")]
 ptx-scan BIN FEATURES='gpu' *ARGS:
-    @set -- {{ARGS}}; for w in "$@"; do case "$w" in -*) why="tools/ptx-scan.sh takes no flag" ;; *,*) why="a comma list is a features list" ;; *) why=$(awk -v w="$w" '/^\[/ { f = ($0 == "[features]"); next } f && $1 == w { print "a cargo feature of crates/gpu-gates (an entry filter by this name needs a longer substring)" }' crates/gpu-gates/Cargo.toml) || { echo "ptx-scan: cannot read crates/gpu-gates/Cargo.toml for its feature names" >&2; exit 2; } ;; esac; [ $# -le 1 ] || why="${why:-tools/ptx-scan.sh takes one entry substring}"; [ -z "$why" ] || { echo "ptx-scan: '$w' after {{BIN}}: $why; features go through --features (just ptx-scan {{BIN}} --features <features> [entry substring])" >&2; exit 2; }; done
+    @bash tools/scan-args.sh ptx {{BIN}} {{ARGS}}
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
 
 # PTX 스필 래칫 — 빌드 시점 게이트. generate_ds41(deepseek41)과 gate_e2e(V2-Lite)의 ptx-scan 표에서 엔트리마다
@@ -1334,9 +1335,20 @@ gate-ptx-spill:
 
 # 인자: `<엔트리> n,t,…`(분기 결정 한 줄을 따라간 경로), `<엔트리> list`(목록).
 # SASS 스캔(ptx-scan의 짝, 계측기): 첫 대기 전에 발행된 전역 로드 수를 루프마다, 그리고 한 경로를 따라 센다.
+# 자리로 준 피처와 sass-scan.sh가 받지 않는 플래그는 ptx-scan처럼 빌드 전에 거절한다(tools/scan-args.sh).
 [arg("FEATURES", long="features")]
 sass-scan BIN FEATURES='gpu' *ARGS:
+    @bash tools/scan-args.sh sass {{BIN}} {{ARGS}}
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/sass-scan.sh {{BIN}} {{ARGS}}'
+
+# 공유 로드·스필 스캔(계측기, 게이트 아님): 엔트리마다 PTX 본문의 ld.shared(폭별)·ld.global·st.shared·shfl·fma·
+# cvt.f16 수와, ptxas가 만든 SASS의 STL·LDL·LDS(폭별) 수를 한 줄에 센다. ptx-scan의 spill 열(저장+적재 바이트)이
+# 어느 쪽에서 왔는지, 공유 로드가 벡터로 합쳐졌는지를 명령 한 줄로 가른다. 카드가 필요 없다(ptxas·cuobjdump만).
+# 자리로 준 피처는 ptx-scan처럼 빌드 전에 거절한다(tools/scan-args.sh). 예: `just lds-scan gate_hc_gated hc_gated_up_mix`.
+[arg("FEATURES", long="features")]
+lds-scan BIN FEATURES='gpu' *ARGS:
+    @bash tools/scan-args.sh lds {{BIN}} {{ARGS}}
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/lds-scan.sh {{BIN}} {{ARGS}}'
 
 # 판정 비교(맥에서 돈다): 두 트리에서 같은 레시피를 돌리고, 빌드 줄·시간·pid·스레드 id를 가린 뒤 출력을 비교한다.
 verdict-diff *ARGS:

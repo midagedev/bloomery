@@ -12,13 +12,16 @@ prompt_n the ids, prompt_ms 100, prompt_per_second 10 an id, predicted_ms 50 a s
 warm-up, 2 the timed request, 3 a retry), adds 1000000 to the fault counter file $STUB_MAJFLT at those;
 STUB_SRV_BADN answers request 2 with one predicted token too few; STUB_SRV_EXIT exits 5 before it listens;
 STUB_SRV_HANG never listens. A TERM ends it at once, as llama-server's own handler does.
+Under a CUDA_VISIBLE_DEVICES of two cards (the two-card mode) its device lines are ggml_cuda_init's for the
+A6000 and the 3090, as the stub llama-bench's (depth-stub-cards.sh); STUB_SRV_SEE_ONE=1 makes them one card,
+and STUB_SRV_XID=1 leaves an Xid 79 line of the 3090 in $TMPDIR/stub-xid, the stub kernel journal.
 """
 import http.server, json, os, signal, sys, time
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 tmp = os.environ.get("TMPDIR", "/tmp")
 if "--help" in sys.argv:
     for f in ("-m", "-ngl", "--n-cpu-moe", "-ncmoe", "-fa", "-t", "-ub", "-b", "-fit", "-fitt", "-v", "-np", "-ctxcp",
-              "--cache-ram", "-c", "--host", "--port", "--no-op-offload", "-lzm"):
+              "--cache-ram", "-c", "--host", "--port", "--no-op-offload", "-lzm", "-ts"):
         if f != os.environ.get("STUB_SRV_HELP_MISSING"):
             print(f"{f}, --x   stub")
     sys.exit(0)
@@ -27,7 +30,19 @@ with open(os.path.join(tmp, "stub-srv-argv"), "a") as f:
 with open(os.path.join(tmp, "stub-srv-pids"), "a") as f:
     f.write(f"{os.getpid()}\n")
 print("build: 1 (stub)", flush=True)
-print("  Device 0: Stub Card, compute capability 0.0, VMM: yes", flush=True)
+if "," in os.environ.get("CUDA_VISIBLE_DEVICES", ""):
+    if os.environ.get("STUB_SRV_SEE_ONE"):
+        print("ggml_cuda_init: found 1 CUDA devices (Total VRAM: 48539 MiB):", flush=True)
+        print("  Device 0: NVIDIA RTX A6000 (stub), compute capability 8.6, VMM: yes, VRAM: 48539 MiB", flush=True)
+    else:
+        print("ggml_cuda_init: found 2 CUDA devices (Total VRAM: 72663 MiB):", flush=True)
+        print("  Device 0: NVIDIA RTX A6000 (stub), compute capability 8.6, VMM: yes, VRAM: 48539 MiB", flush=True)
+        print("  Device 1: NVIDIA GeForce RTX 3090 (stub), compute capability 8.6, VMM: yes, VRAM: 24124 MiB", flush=True)
+    if os.environ.get("STUB_SRV_XID"):
+        with open(os.path.join(tmp, "stub-xid"), "a") as f:
+            f.write("1790428806.570394 ws kernel: NVRM: Xid (PCI:0000:41:00): 79, pid='<unknown>', name=<unknown>, GPU has fallen off the bus.\n")
+else:
+    print("  Device 0: Stub Card, compute capability 0.0, VMM: yes", flush=True)
 if "on" == (sys.argv[sys.argv.index("-fit") + 1] if "-fit" in sys.argv else "") and "-v" in sys.argv:
     for l in ("llama_model_loader: loaded meta data with 3 key-value pairs and 6 tensors from stub",
               "load_tensors: offloaded 3/3 layers to GPU", "load_tensors:        CUDA0 model buffer size =    12.00 MiB",

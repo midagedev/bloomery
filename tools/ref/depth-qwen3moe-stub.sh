@@ -60,6 +60,9 @@
 #                witness's two-card lines (each card, the 3090's cap, the Xid count), the [config] line; rc 0.
 #   twocard-dry  the same under BLOOMERY_DRY=1: both cards visible, the precheck's lines and `ok`, the lcpp
 #                command line with -ts.
+#   twocard-srv  lcppsrv:6 lcppsrvpp:4, one round: the server arms in the mode, the profile's -ts in each
+#                server's command line, each row `A6000+3090` with both cards as its device, no server left up;
+#                rc 0 (depth-ds41-stub.sh has the one-card and Xid failures of a server arm).
 #   twocard-arms[-bin|-ik|-mrs]  6, bin:<base>:6, ik:6 and mrs:6 each refused by name before anything
 #                runs (rc 64); ours naming --place b as the expected interface.
 #   twocard-profile  a profile with no two-card line (TWO_CARD_PLACEMENT empty): refused by name, rc 64.
@@ -649,6 +652,18 @@ elif want twocard "$L" 1 "^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6
   want twocard "$L" 1 '^\[timing-cards\] Xid count from @[0-9]+ ' &&
   want twocard "$L" 1 '^mean lcpp d=6 .*\(n=1\)'; then
   pass twocard
+fi
+
+L=$tmp/twocard-srv.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" -- lcppsrv:6 lcppsrvpp:4
+if [ "$RC" != 0 ]; then
+  fail twocard-srv "rc $RC, want 0" "$L"
+elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 lcppsrv d=6|ROW r1 lcppsrvpp p=4" ]; then
+  fail twocard-srv "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
+elif want twocard-srv "$L" 1 '^ROW r1 lcppsrv d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| llama-server ids=lcg: .*\| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\)( |$)' &&
+  want twocard-srv "$L" 1 '^ROW r1 lcppsrvpp p=4 n=0 \| tok/s\(pp\) 40.00 @ n=0, prompt 4, A6000\+3090 \| llama-server ids=lcg: .*\| device NVIDIA RTX A6000 \(stub\) \+ NVIDIA GeForce RTX 3090 \(stub\)( |$)' &&
+  want twocard-srv "$tmp/tmp/stub-srv-argv" 2 ' -ts 1\.5/1\.5 '; then
+  if [ -n "$(srv_left)" ]; then fail twocard-srv "servers left up: $(srv_left)" "$L"; else pass twocard-srv; fi
 fi
 
 L=$tmp/twocard-dry.log
