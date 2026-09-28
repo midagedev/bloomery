@@ -349,7 +349,8 @@
 # lease; the 3090 at its 250 W cap; the witness counting the kernel's Xid lines). Every row's card field
 # reads `A6000+3090`, so no reader puts it in the A6000 table. The profile's two-card line
 # (TWO_CARD_PLACEMENT, models/deepseek41.sh, V41_PUBLIC only) gives mainline its --n-cpu-moe and -ts;
-# the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], and the fit arms, whose fit places over both cards), and
+# the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], the fit arms, whose fit places over both cards, and the
+# server arms lcppsrv…, the same flags in the server's spellings), and
 # ours, corpus and bin: arms under BLOOMERY_GEN_PLACE=bp; under a or gate they are refused by name before
 # anything runs, with the hint to set bp (timing-card.sh's TIMING_CARDS_PLACE). After each of our arms its
 # `load` record's `cards` must name the A6000 and the 3090 (records.py), or the arm is a FAIL row. An ik
@@ -357,9 +358,9 @@
 # byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
 # placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
 # its cap or an unpatched lease.sh refuses the run; after every arm an Xid since the last arm, a card lost
-# or off its cap, or a llama-bench that did not see both cards (its ggml_cuda_init lines) makes the arm a
-# FAIL row. A compute process on either card as an arm starts is waited out (10 minutes, then rc 75). A
-# dry run prints the pre-lease checks' verdict and goes on.
+# or off its cap, or a llama-bench or llama-server that did not see both cards (its ggml_cuda_init lines)
+# makes the arm a FAIL row. A compute process on either card as an arm starts is waited out (10 minutes,
+# then rc 75). A dry run prints the pre-lease checks' verdict and goes on.
 set -uo pipefail
 # An ours arm's output is read by tools/bloomery/records.py, which owns the record kinds
 # crates/gpu-gates/src/record.rs declares; the runner names kinds and fields, never a column.
@@ -410,7 +411,7 @@ ours_row() {
     return 1
   fi
   pp_col "$kind" || return
-  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt) '
+  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm) '
   # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
   # and the `draft summary` line carries the positions-per-second rate the verdict reads.
   DRAFT=

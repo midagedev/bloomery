@@ -205,6 +205,22 @@ if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${psc##*$'\n'}"
+# scan-args.sh is the three scan recipes' refusal of a cargo feature given where the scan's own words go
+# (ptx-scan, sass-scan, lds-scan): its cases on a fixed feature list and the real crates/gpu-gates table.
+if ! sa=$(bash "$(dirname "$0")/scan-args.sh" --self-test 2>&1); then
+  echo "$sa" >&2
+  echo "check-recipes: the scan-args self-test failed" >&2
+  exit 1
+fi
+echo "${sa##*$'\n'}"
+# lds-scan.sh's rows (its PTX and SASS counts over a fixture binary, stub extractor, ptxas and cuobjdump),
+# its filter, its failed-scan banner and its usage refusal, no box.
+if ! ls=$(bash "$(dirname "$0")/lds-scan.sh" --self-test 2>&1); then
+  echo "$ls" >&2
+  echo "check-recipes: the lds-scan self-test failed" >&2
+  exit 1
+fi
+echo "${ls##*$'\n'}"
 # mutant-run.sh's kill, survive, not-built and no-Compiling verdicts, its restore checks (a broken copy, an
 # edit during the run, a TERM) and its refusals, in a temp git repo with a fake gate, no box.
 if ! mrt=$(bash "$(dirname "$0")/mutant-run.sh" --self-test 2>&1); then

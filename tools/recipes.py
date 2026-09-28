@@ -173,6 +173,26 @@ def _render_expr(expr) -> str:
     return "…"
 
 
+def join_continued(name: str, lines: list[str]) -> list[str]:
+    """A recipe's lines as just runs them: `just --dump` gives a line that ends in a backslash and the
+    next as two body lines, and just runs them as one, the backslash dropped and the next line's
+    leading whitespace with it (inside quotes too). A backslash on the recipe's last line continues
+    nothing and is refused by name."""
+    out: list[str] = []
+    acc: str | None = None
+    for ln in lines:
+        if acc is not None:
+            ln = acc + ln.lstrip()
+            acc = None
+        if ln.endswith("\\"):
+            acc = ln[:-1]
+            continue
+        out.append(ln)
+    if acc is not None:
+        raise RecipeError(f"recipe {name}: its last line ends in a backslash, a continuation of nothing: {acc[-120:]}\\")
+    return out
+
+
 def load_justfile(path: str) -> dict[str, Recipe]:
     if shutil.which("just") is None:
         raise RecipeError("`just` is not on PATH — recipes.py reads the justfile through `just --dump`")
@@ -197,6 +217,7 @@ def load_justfile(path: str) -> dict[str, Recipe]:
                 else:
                     out.append("{{" + " ".join(_render_expr(e) for e in frag) + "}}")
             lines.append("".join(out))
+        lines = join_continued(name, lines)
         deps = [d["recipe"] for d in rec["dependencies"]]
         text = json.dumps({"p": rec["parameters"], "d": rec["dependencies"], "b": rec["body"], "a": rec["attributes"]}, sort_keys=True)
         recipes[name] = Recipe(name=name, lines=lines, deps=deps, text=text)
@@ -403,6 +424,26 @@ _SCRIPT_EXT = (".sh", ".py")
 # -name '*.md'`) reads files no path in the script names: the directory is an input, a prefix. A bare
 # `find crates … -newer` (timing-card.sh's staleness probe) reads mtimes, not contents, and is not one.
 _SCRIPT_WALK = re.compile(r"\bfind\s+\"?\$\{?(?:ROOT|HERE)\}?\"?/((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*)\"?(?=[\s);|&]|$)")
+_SCRIPT_NAME = re.compile(r"([A-Za-z0-9_.-]+\.(?:sh|py|tsv|cpp|h|txt|json|jinja))\b")
+
+
+@functools.cache
+def _script_refs(text: str, c_like: bool, shell: bool) -> tuple[tuple[tuple[str, ...], ...], ...]:
+    """What each non-comment line of a script names, as three tuples of one entry a line: its repository
+    paths (normalized), its `find` roots (a shell script's only) and its bare file names, each as the
+    patterns read them and before the tree says which exist. A pure function of the text, cached by it:
+    every recipe's closure reads the same scripts again."""
+    paths: list[tuple[str, ...]] = []
+    walks: list[tuple[str, ...]] = []
+    names: list[tuple[str, ...]] = []
+    for line in text.split("\n"):
+        st = line.strip()
+        if not st or st.startswith("//" if c_like else "#"):
+            continue
+        paths.append(tuple(_norm(p) for p in _SCRIPT_PATH.findall(line)))
+        walks.append(tuple(_norm(d) for d in _SCRIPT_WALK.findall(line)) if shell else ())
+        names.append(tuple(_SCRIPT_NAME.findall(line)))
+    return tuple(paths), tuple(walks), tuple(names)
 
 
 @dataclass
@@ -1057,27 +1098,16 @@ class Graph:
                 continue
             seen.add(s)
             out.setdefault(s, f"script {rel}" if s != rel else "script")
-            c_like = s.endswith((".cpp", ".h", ".c", ".cc", ".hpp"))
             sdir = os.path.dirname(s)
-            for line in self.tree.read(s).split("\n"):
-                st = line.strip()
-                if not st:
-                    continue
-                if c_like:
-                    if st.startswith("//"):
-                        continue
-                elif st.startswith("#"):
-                    continue
-                for p in _SCRIPT_PATH.findall(line):
-                    p = _norm(p)
+            paths, walks, names = _script_refs(self.tree.read(s), s.endswith((".cpp", ".h", ".c", ".cc", ".hpp")), s.endswith((".sh", ".bash")))
+            for line_paths, line_walks, line_names in zip(paths, walks, names):
+                for p in line_paths:
                     if self.tree.exists(p):
                         stack.append(p)
-                if s.endswith((".sh", ".bash")):
-                    for d in _SCRIPT_WALK.findall(line):
-                        d = _norm(d)
-                        if d != "." and self.tree.isdir(d):
-                            out.setdefault(d + "/", f"find in {s}" if s == rel else f"find in {s} (script {rel})")
-                for b in re.findall(r"([A-Za-z0-9_.-]+\.(?:sh|py|tsv|cpp|h|txt|json|jinja))\b", line):
+                for d in line_walks:
+                    if d != "." and self.tree.isdir(d):
+                        out.setdefault(d + "/", f"find in {s}" if s == rel else f"find in {s} (script {rel})")
+                for b in line_names:
                     p = os.path.normpath(os.path.join(sdir, b))
                     if self.tree.exists(p):
                         stack.append(p)
@@ -1545,10 +1575,12 @@ def _blank(buf: list[str], a: int, b: int) -> None:
             buf[i] = " "
 
 
+@functools.cache
 def rust_lex(text: str) -> tuple[str, str]:
     """(code, shape), both as long as `text` with its newlines: `code` has the comments blanked, `shape`
     also the contents of string and char literals — brackets are counted on `shape`, patterns matched on
-    `code` (a path literal is in a string)."""
+    `code` (a path literal is in a string). A pure function of the text, cached by it: the scans lex the
+    same file once per tree copy and per purity pass."""
     code, shape = list(text), list(text)
     i, n = 0, len(text)
     while i < n:
@@ -1705,6 +1737,7 @@ def _item_end(shape: str, start: int) -> int:
     return len(shape)
 
 
+@functools.cache
 def mac_view(text: str, test: bool | None) -> str:
     """`text` as aarch64-apple-darwin compiles it: comments blanked, and every item or statement under a
     `#[cfg(…)]` false there (a file under a false `#![cfg(…)]`) blanked; newlines kept, so line numbers hold."""
@@ -1745,15 +1778,17 @@ def mac_view(text: str, test: bool | None) -> str:
     return "".join(out)
 
 
-def mac_hits(text: str, test: bool | None) -> list[tuple[int, str, str]]:
-    """(line, what, the line's code) for every use in `text` the Mac cannot build or run."""
+@functools.cache
+def mac_hits(text: str, test: bool | None) -> tuple[tuple[int, str, str], ...]:
+    """(line, what, the line's code) for every use in `text` the Mac cannot build or run; cached by the text,
+    as mac_view is."""
     hits = []
     for no, line in enumerate(mac_view(text, test).split("\n"), 1):
         for pat, what in _NOT_ON_MAC:
             m = pat.search(line)
             if m:
                 hits.append((no, f"{what} ({m.group(0).strip()})", line.strip()[:120]))
-    return hits
+    return tuple(hits)
 
 
 @dataclass
@@ -3865,6 +3900,33 @@ def self_test() -> int:
     expect(refused(["BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo check'"], "prefix (BLOOMERY_MODEL=deepseek41)"), "box-command: an env prefix accepted or not named")
     expect(refused(["./tools/box.sh 'cargo test {{ARGS}}'"]), "box-command: a {{…}} parameter accepted")
     expect(refused(["./tools/box.sh 'cargo check' && echo done"]), "box-command: a line that goes on after the argument accepted")
+    # a line continued with a backslash is one line to just, and one to the parser: the box.sh argument
+    # joined as just runs it (backslash and the next line's indentation dropped, inside the quotes too)
+    with tempfile.TemporaryDirectory(prefix="recipes-cont-") as tmp:
+        p = os.path.join(tmp, "justfile")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("cont:\n    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates \\\n"
+                     "        --features gpu --release --bin gate_a && bash tools/gpu-gate.sh \\\n        gate_a'\n"
+                     "mac:\n    python3 tools/ref/tdist.py \\\n        4\n")
+        try:
+            jc = load_justfile(p)
+            got = box_command(jc["cont"])
+            rc = recipe_commands(jc["cont"])
+            mac = recipe_commands(jc["mac"])
+        except RecipeError as err:
+            got, rc, mac = f"refused: {err}", None, None
+        expect(got == "cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_a && bash tools/gpu-gate.sh gate_a",
+               f"continued box.sh line: box-command gives {got!r}")
+        expect(rc is not None and rc.runs == ["gate_a"] and [(i.sub, i.selectors) for i in rc.invocations] == [("build", [("bin", "gate_a")])],
+               f"continued box.sh line: parsed as {rc and (rc.runs, [(i.sub, i.selectors) for i in rc.invocations])}")
+        expect(mac is not None and mac.scripts == ["tools/ref/tdist.py"], f"continued Mac line: scripts {mac and mac.scripts}")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("dangling:\n    echo a \\\n")
+        try:
+            load_justfile(p)
+            fails.append("a recipe whose last line ends in a backslash accepted")
+        except RecipeError as err:
+            expect("continuation of nothing" in str(err), f"dangling backslash refused without its name: {err}")
     # the recipes tools/mac-check.sh derives from: each gives one plain `cargo <subcommand> …` (mac-check
     # adds --target to it and refuses any other shape; its own self-test holds that side)
     jf = load_justfile(os.path.join(ROOT, "justfile"))

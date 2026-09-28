@@ -117,6 +117,11 @@ if [ -z "$NAME" ]; then
   echo "usage: ptx-scan.sh <gate_bin_name> [entry-substring]" >&2
   exit 2
 fi
+if [ $# -gt 2 ]; then
+  echo "ptx-scan.sh: '${*:3}' after the entry substring '$FILTER': the scan takes one binary and at most one entry substring" >&2
+  echo "usage: ptx-scan.sh <gate_bin_name> [entry-substring]" >&2
+  exit 2
+fi
 BIN=target/release/$NAME
 # A failed scan prints its banner and no rows: two failed scans must never diff as two equal tables.
 fail() { # fail <banner fields...>

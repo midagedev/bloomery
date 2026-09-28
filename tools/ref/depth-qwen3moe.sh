@@ -281,12 +281,13 @@
 # lease; the 3090 at its 250 W cap; the witness counting the kernel's Xid lines). Every row's card field
 # reads `A6000+3090`, so no reader puts it in the A6000 table. Only a profile with a two-card line
 # (TWO_CARD_PLACEMENT, models/qwen4exp.sh: its LCPP_GPU_FLAGS then carry -ts) runs in the mode, and only
-# its llama.cpp arms: lcpp, lcpppp[<U>] at the profile's split, and the fit arms, whose fit places over
-# both cards. An ours or bin: arm is refused by name before anything runs (generate_qwen3moe loads one
+# its llama.cpp arms: lcpp, lcpppp[<U>] at the profile's split, the fit arms, whose fit places over
+# both cards, and the server arms lcppsrv… on the same flags in the server's spellings. An ours or bin: arm is refused by name before anything runs (generate_qwen3moe loads one
 # card; --place b is its expected two-card interface), and so are ik and mistral.rs arms (no two-card
 # line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
 # refuses the run; after every arm an Xid since the last arm, a card lost or off its cap, or a
-# llama-bench that did not see both cards (its ggml_cuda_init lines) makes the arm a FAIL row. A compute
+# llama-bench or llama-server that did not see both cards (its ggml_cuda_init lines) makes the arm a FAIL
+# row. A compute
 # process on either card as an arm starts is waited out (10 minutes, then rc 75). A dry run prints the
 # pre-lease checks' verdict and goes on.
 set -uo pipefail
