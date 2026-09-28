@@ -9,10 +9,11 @@
 //! routed id reads its place in the card's copy of the map, as the handoff
 //! does, and a card place's slot's words through the stack, as the `_sel`
 //! launches do, into one sum. The host serves every id the host map sends
-//! it with the source's sum under another rule, so the pass's value depends
-//! on which experts the card holds, as the engine's bits do. A pass's value
-//! is the FNV-1a of every routed id's (id, side, parts); a card sum that is
-//! not its expert's is `stale`, an id both sides serve `double`, one neither
+//! it with the source's sum under another rule, and the tier every id the
+//! host map puts on the tier under a third, so the pass's value depends on
+//! which experts the card holds, as the engine's bits do. A pass's value is
+//! the FNV-1a of every routed id's (id, side, parts); a card sum that is not
+//! its expert's is `stale`, an id two sides serve `double`, one no side
 //! serves `miss`.
 //!
 //! The trace: 120 passes of the synthetic router (a hot set of 8 drifting
@@ -20,12 +21,12 @@
 //! which the first is kept. The rule: every 2, cap 6, margin 1, min count 2,
 //! decay 0.9, one spare, live delay 3, 4 pinned seed experts a layer.
 //!
-//! Clauses (adaptres §4; c6 needs the pair pass and is R3's):
 //! Each pass runs in the engine's order: the ids refreshed by a
 //! synchronizing copy, the boundary, the graph, then the engine stream
 //! drained by polling with a bound (a stream waiting on a copy nothing
 //! stages is a named failure, not a hang) and read back.
 //!
+//! Clauses (the residency design's bit contract c1–c7, and the machine's own):
 //! - c1: the same history twice with the copies prompt, and once with the
 //!   copy stream held (c3's run), gives the same pass values and the same
 //!   flips, and the run makes flips on every card layer.
@@ -34,15 +35,47 @@
 //!   ascending id (other slot numbers than the machine's) and a fresh map.
 //! - c3: with the staging window closed for the whole run, a copy is staged
 //!   only once its flip is due (its live boundary reached), so every landing
-//!   is late and the engine stream waits for it; no card sum is stale, no id
-//!   served twice or not at all.
+//!   is late; no card sum is stale, no id served twice or not at all.
+//! - c3 engine: with the machine's copy stream held by a host word from the
+//!   boundary that issues a flip until after the launch of the pass it lands
+//!   at, the engine stream is still waiting when the host looks, and after
+//!   the release the pass reads no stale sum (its mutant: no engine stream
+//!   wait on the flip's event).
+//! - c3 boundary event: with the engine stream held through a pass that reads
+//!   a victim, the next boundary lands the flip that frees the victim's slot
+//!   and issues a flip into it; after the release the held pass reads no
+//!   stale sum (its mutant: the copy does not wait for the boundary event).
+//!   Its arm runs at live delay 2, so a landing boundary is a planning one.
 //! - c4: (its mutant: the card's map word written when the flip is made) is
 //!   red in c3's run.
 //! - c5: every pass of every run has no double and no miss (its mutant: the
 //!   host map one pass late).
-//! - c7: a reset brings every layer's card set back to its seed (`residency
-//!   reset` diff=0, the live sets and the slot ledger's), and the trace after
-//!   it gives the fresh run's values.
+//! - c6: an independent rule fed every row of the trace and ended at the kept
+//!   rows makes, boundary for boundary, the flips the machine made (its
+//!   mutant: the machine ends each pass at every row it noted).
+//! - c7: a reset with flips in flight cancels them and brings every layer's
+//!   card set back to its seed (`residency reset` diff=0, the live sets and
+//!   the slot ledger's), releases the host pages of the seed experts it
+//!   copies back and of the cancelled flips' victims that stay on the card,
+//!   and the trace after it gives the fresh run's values.
+//! - tier: a map with tier entries runs with flips on every card layer, and
+//!   no flip admits or evicts a tier expert, though one of them is an expert
+//!   the stage-only run admits; every tier entry is unchanged after the run
+//!   (its mutant: the tier's experts in the rule's card set, so a victim).
+//! - staging failure: a source that fails a landing flip's expert under held
+//!   copies is a named error at the boundary it lands at, with no stale sum
+//!   in any pass before it (its mutant: the failure not read again after the
+//!   landing waits).
+//! - tally: a slot noted twice and a note outside the tally's shape are
+//!   refused by name, and so is a kept row with a slot missing, after which
+//!   the machine takes the full row (its mutant: a note that does not check
+//!   the slot's bit).
+//! - broken: a failure after a boundary's first change is a named error, and
+//!   every later boundary, end of pass and reset is refused naming it (its
+//!   mutant: the machine not marked broken).
+//! - panic: a source that panics on a flip's expert is a named error at or
+//!   before the boundary the flip lands at, within the deadline (its mutant:
+//!   no catch on the staging thread).
 //! - refusal: a flip whose victim the source cannot bring to the host is
 //!   refused by name at the boundary it would land at; a load whose spare
 //!   slot gives up such an expert is refused at construction.
@@ -70,17 +103,17 @@ mod gate {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
+    use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
         MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform,
     };
-    use bloomery_gpu::{Gpu, GpuError, Graph};
+    use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
-    use runtime::swaprule::{Flip, SwapParams};
+    use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
 
     const LAYERS: Range<usize> = 2..6;
     const L: usize = LAYERS.end - LAYERS.start;
@@ -91,6 +124,8 @@ mod gate {
     const N_L: [usize; L] = [12, 12, 10, 0];
     const PART_BYTES: [usize; 3] = [1024, 1024, 1536];
     const PARTS: usize = PART_BYTES.len();
+    /// Bytes one expert takes over its parts.
+    const EXPERT_BYTES: u64 = 1024 + 1024 + 1536;
     const PINNED: usize = 4;
     const PASSES: usize = 120;
     /// The machine's bound on every host wait in the arms that must pass.
@@ -100,10 +135,18 @@ mod gate {
     const SLOW: Duration = Duration::from_secs(2);
     /// The gate's own bound on a pass's engine stream.
     const ENGINE_DRAIN: Duration = Duration::from_secs(30);
+    /// How long a held arm lets the unheld side run before it looks: every
+    /// copy and launch here takes microseconds.
+    const HOLD_SETTLE: Duration = Duration::from_millis(200);
     const DELAY: u64 = 3;
+    /// The boundary-event arm's live delay: with `every` 2 a flip lands at a
+    /// planning boundary.
+    const DELAY_EVEN: u64 = 2;
     /// The host's rule: its sum is the card's under this mask, so a pass's
     /// value says which side served each id.
     const HOST_MASK: u32 = 0x1234_5678;
+    /// The tier's rule, as the host's.
+    const TIER_MASK: u32 = 0x0f0f_a5a5;
     /// A probe output for an id the card's map sends to the host.
     const OUT_HOST: u32 = u32::MAX;
     /// A probe output for a place past the stack.
@@ -216,27 +259,34 @@ mod gate {
         l - LAYERS.start
     }
 
+    /// What an arm's source does wrong: `stuck` experts never become
+    /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
+    /// `panic_source` fail or panic when their bytes are read, and every
+    /// stack destination of layer `fail_dest` is an error.
+    #[derive(Clone, Debug, Default)]
+    struct Faults {
+        stuck: Vec<(usize, u32)>,
+        slow: Vec<(usize, u32)>,
+        fail_source: Option<(usize, u32)>,
+        panic_source: Option<(usize, u32)>,
+        fail_dest: Option<usize>,
+    }
+
     /// The synthetic source: every expert's bytes on the host; the stacks'
     /// addresses; residency per expert, the card's experts not resident at
     /// load (their pages dropped), preparing makes an expert resident unless
-    /// it is in `stuck`.
+    /// it is stuck.
     struct Synth {
         bytes: Vec<Vec<u8>>,
         bases: Vec<[sys::CUdeviceptr; PARTS]>,
         caps: [usize; L],
         resident: Vec<AtomicBool>,
-        stuck: Vec<(usize, u32)>,
-        slow: Vec<(usize, u32)>,
+        faults: Faults,
         prepared: AtomicU32,
     }
 
     impl Synth {
-        fn new(
-            stacks: &Stacks,
-            caps: [usize; L],
-            stuck: Vec<(usize, u32)>,
-            slow: Vec<(usize, u32)>,
-        ) -> Synth {
+        fn new(stacks: &Stacks, caps: [usize; L], faults: Faults) -> Synth {
             let mut bytes = Vec::with_capacity(L * E * PARTS);
             for l in LAYERS {
                 for e in 0..E as u32 {
@@ -257,8 +307,7 @@ mod gate {
                 bases: stacks.bases(),
                 caps,
                 resident,
-                stuck,
-                slow,
+                faults,
                 prepared: AtomicU32::new(0),
             }
         }
@@ -270,6 +319,15 @@ mod gate {
         }
 
         fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
+            if self.faults.fail_source == Some((layer, id)) {
+                return Err(GpuError::Shape {
+                    what: "Synth::source",
+                    detail: format!("layer {layer} expert {id}: the source fails it"),
+                });
+            }
+            if self.faults.panic_source == Some((layer, id)) {
+                panic!("Synth::source panics on layer {layer} expert {id} (gate_swap's panic arm)");
+            }
             let at = (li(layer) * E + id as usize) * PARTS + part;
             Ok(Piece {
                 bytes: &self.bytes[at],
@@ -278,7 +336,8 @@ mod gate {
         }
 
         fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
-            if slot as usize >= self.caps[li(layer)].max(1) {
+            if slot as usize >= self.caps[li(layer)].max(1) || self.faults.fail_dest == Some(layer)
+            {
                 return Err(GpuError::Shape {
                     what: "Synth::dest",
                     detail: format!("layer {layer} slot {slot}"),
@@ -289,10 +348,10 @@ mod gate {
 
         fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
             self.prepared.fetch_add(1, Ordering::Relaxed);
-            if self.slow.contains(&(layer, id)) {
+            if self.faults.slow.contains(&(layer, id)) {
                 std::thread::sleep(SLOW);
             }
-            if !self.stuck.contains(&(layer, id)) {
+            if !self.faults.stuck.contains(&(layer, id)) {
                 self.resident[li(layer) * E + id as usize].store(true, Ordering::Release);
             }
             Ok(())
@@ -304,7 +363,7 @@ mod gate {
 
         fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
             self.resident[li(layer) * E + id as usize].store(false, Ordering::Release);
-            Ok(PART_BYTES.iter().sum::<usize>() as u64)
+            Ok(EXPERT_BYTES)
         }
     }
 
@@ -365,12 +424,21 @@ mod gate {
         }
     }
 
-    /// The seed: experts `0..n_l` of every layer in slots `0..n_l`.
-    fn seed_map() -> Result<SlotMap, GateError> {
+    /// The seed: experts `0..n_l` of every layer in slots `0..n_l`, and each
+    /// layer's `tier[i]` experts in tier slots `0..` in that order.
+    fn seed_map(tier: &[Vec<u32>]) -> Result<SlotMap, GateError> {
         let mut rows = vec![HOST; L * E];
         for (i, &n) in N_L.iter().enumerate() {
             for e in 0..n {
                 rows[i * E + e] = e as u32;
+            }
+            for (s, &e) in tier
+                .get(i)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .enumerate()
+            {
+                rows[i * E + e as usize] = TIER | s as u32;
             }
         }
         Ok(SlotMap::from_rows(LAYERS, E, rows)?)
@@ -416,7 +484,7 @@ mod gate {
         Trace { passes }
     }
 
-    fn params() -> SwapParams {
+    fn params(delay: u64) -> SwapParams {
         SwapParams {
             every: 2,
             cap: 6,
@@ -424,17 +492,18 @@ mod gate {
             min_count: 2.0,
             decay: 0.9,
             spares: 1,
-            delay: DELAY,
+            delay,
         }
     }
 
-    /// A card with the probe's graph over its own buffers.
+    /// A card with the probe's graph over its own buffers. The graph is
+    /// declared first so it drops before the buffers it reads.
     struct Card {
+        graph: Option<Graph>,
         stacks: Stacks,
         view: DeviceBuffer<u32>,
         ids: DeviceBuffer<u32>,
         out: DeviceBuffer<u32>,
-        graph: Option<Graph>,
     }
 
     impl Card {
@@ -449,11 +518,11 @@ mod gate {
                 }
             }
             Ok(Card {
+                graph: None,
                 stacks,
                 view: DeviceBuffer::from_host(s, &map.stage_view())?,
                 ids: DeviceBuffer::<u32>::zeroed(s, MAX_ROWS * L * K)?,
                 out: DeviceBuffer::<u32>::zeroed(s, L * PARTS * NIDS)?,
-                graph: None,
             })
         }
 
@@ -563,12 +632,14 @@ mod gate {
                     let j = r * K + k;
                     let card = (0..PARTS).map(|p| out[(i * PARTS + p) * NIDS + j]);
                     let on_card = out[i * PARTS * NIDS + j] != OUT_HOST;
-                    let on_host = slots.slot(l, id) == Some(Slot::Host);
+                    let entry = slots.slot(l, id);
+                    let on_host = entry == Some(Slot::Host);
+                    let on_tier = matches!(entry, Some(Slot::Tier(_)));
                     mix(id);
-                    match (on_card, on_host) {
-                        (true, true) => double += 1,
-                        (false, false) => miss += 1,
-                        _ => {}
+                    match u32::from(on_card) + u32::from(on_host) + u32::from(on_tier) {
+                        0 => miss += 1,
+                        1 => {}
+                        _ => double += 1,
                     }
                     if on_card {
                         mix(1);
@@ -583,6 +654,12 @@ mod gate {
                         mix(2);
                         for p in 0..PARTS {
                             mix(expect(l, id, p) ^ HOST_MASK);
+                        }
+                    }
+                    if on_tier {
+                        mix(3);
+                        for p in 0..PARTS {
+                            mix(expect(l, id, p) ^ TIER_MASK);
                         }
                     }
                 }
@@ -603,16 +680,50 @@ mod gate {
         Held,
     }
 
+    /// A stream an arm holds by a host flag ([`HostFlags::enqueue_wait`]).
+    #[derive(Clone, Copy)]
+    enum Hold<'a> {
+        None,
+        /// The machine's copy stream, from before boundary `from` until
+        /// after the launch of pass `to`; the arm looks whether the engine
+        /// stream is still waiting before it releases.
+        Copies {
+            flags: &'a HostFlags,
+            from: usize,
+            to: usize,
+        },
+        /// The engine stream, from before pass `at`'s launch until after
+        /// boundary `at + 1`.
+        Engine {
+            flags: &'a HostFlags,
+            at: usize,
+        },
+    }
+
+    impl Hold<'_> {
+        /// Raise the hold's flag: every path out of a held arm does.
+        fn release(self) -> Result<(), GateError> {
+            match self {
+                Hold::None => Ok(()),
+                Hold::Copies { flags, .. } | Hold::Engine { flags, .. } => Ok(flags.raise(0)?),
+            }
+        }
+    }
+
     /// What an adaptive run saw: per pass its value, its report and its
     /// card sets; the flips made, with the boundary; and the machine, the
     /// map and the card, for the arms that go on.
     struct Run {
+        delay: u64,
         values: Vec<Value>,
         reports: Vec<PassReport>,
         sets: Vec<Vec<Vec<u32>>>,
         flips: Vec<(u64, Flip)>,
         slot_moves: usize,
         pinned_kept: bool,
+        /// A held arm: whether the stream held on the other side was still
+        /// waiting when the arm looked.
+        held_waited: Option<bool>,
         err: Option<String>,
         machine: Option<SwapMachine>,
         slots: SlotMap,
@@ -629,9 +740,9 @@ mod gate {
             .collect()
     }
 
-    fn cfg(deadline: Duration) -> MachineCfg {
+    fn cfg(delay: u64, deadline: Duration) -> MachineCfg {
         MachineCfg {
-            params: params(),
+            params: params(delay),
             pinned: N_L
                 .iter()
                 .map(|&n| if n > 0 { PINNED } else { 0 })
@@ -663,70 +774,159 @@ mod gate {
         }
     }
 
+    /// Note every row of a pass into the tally.
+    fn note_rows(
+        tally: &mut bloomery_gpu::host::swap::Tally,
+        rows: &[[[u32; K]; L]],
+    ) -> Result<(), GateError> {
+        for (r, row) in rows.iter().enumerate() {
+            for (i, ids) in row.iter().enumerate() {
+                for (k, &id) in ids.iter().enumerate() {
+                    tally.note(LAYERS.start + i, r, k, id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drive `passes` of the trace through a machine, in the engine's order:
     /// per pass the ids refreshed (a synchronizing copy), the boundary, the
     /// graph, a bounded drain and the readback, the value, then the ids
-    /// noted and the pass's end with its kept rows. Held, the staging
-    /// window stays closed for the whole run, so every copy is staged only
-    /// once its flip is due.
+    /// noted and the pass's end with its kept rows. Held, the staging window
+    /// stays closed for the whole run, so every copy is staged only once its
+    /// flip is due. `hold` holds a stream for one stretch ([`Hold`]); an
+    /// engine hold takes the next boundary before the held pass is read, and
+    /// refreshes the next pass's ids only after the release.
     fn drive(
         gpu: &Gpu,
         run: &mut Run,
         trace: &Trace,
         passes: Range<usize>,
         copies: Copies,
+        hold: Hold<'_>,
+    ) -> Result<(), GateError> {
+        let r = drive_held(gpu, run, trace, passes, copies, hold);
+        if r.is_err() {
+            hold.release()?;
+        }
+        r
+    }
+
+    /// [`drive`]'s passes; `drive` raises the hold's flag when this fails.
+    fn drive_held(
+        gpu: &Gpu,
+        run: &mut Run,
+        trace: &Trace,
+        passes: Range<usize>,
+        copies: Copies,
+        hold: Hold<'_>,
     ) -> Result<(), GateError> {
         let stream = gpu.stream();
+        let delay = run.delay;
         let m = run.machine.as_mut().ok_or("gate_swap: no machine")?;
         let window = m.window();
         let mut tally = m.tally();
         if copies == Copies::Held {
             window.store(0, Ordering::Release);
         }
-        let pinned_slots: Vec<Vec<(u32, Option<Slot>)>> = LAYERS
-            .map(|l| {
-                (0..m.pinned(l))
-                    .map(|r| {
-                        let e = m.seed(l)[r];
-                        (e, run.slots.slot(l, e))
-                    })
-                    .collect()
-            })
-            .collect();
+        let mut pinned_slots: Vec<Vec<(u32, Option<Slot>)>> = Vec::with_capacity(L);
+        for l in LAYERS {
+            let seed = m.seed(l)?;
+            let pins = m.pinned(l)?;
+            pinned_slots.push(
+                seed[..pins]
+                    .iter()
+                    .map(|&e| (e, run.slots.slot(l, e)))
+                    .collect(),
+            );
+        }
+        let mut pre: Option<PassReport> = None;
+        let end = passes.end;
         for p in passes {
             let (rows, kept) = &trace.passes[p];
-            run.card.refresh(gpu, rows)?;
-            let report = match m.boundary(stream, &mut run.slots) {
-                Ok(r) => r,
-                Err(e) => {
-                    run.err = Some(e.to_string());
-                    window.store(1, Ordering::Release);
-                    return Ok(());
+            let report = match pre.take() {
+                Some(r) => {
+                    run.card.refresh(gpu, rows)?;
+                    r
+                }
+                None => {
+                    run.card.refresh(gpu, rows)?;
+                    if let Hold::Copies { flags, from, .. } = hold
+                        && p == from
+                    {
+                        flags.clear(0)?;
+                        flags.enqueue_wait(m.copy_stream(), 0)?;
+                    }
+                    match m.boundary(stream, &mut run.slots) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            run.err = Some(e.to_string());
+                            window.store(1, Ordering::Release);
+                            hold.release()?;
+                            return Ok(());
+                        }
+                    }
                 }
             };
             for f in m.rule().in_flight() {
-                if f.live_at == report.boundary + DELAY {
+                if f.live_at == report.boundary + delay {
                     run.flips.push((report.boundary, *f));
                 }
             }
             run.slot_moves += report.landed;
+            if let Hold::Engine { flags, at } = hold
+                && p == at
+            {
+                flags.clear(0)?;
+                flags.enqueue_wait(stream, 0)?;
+                run.card.launch(gpu)?;
+                note_rows(&mut tally, rows)?;
+                m.end_pass(&mut tally, *kept)?;
+                let held_map = run.slots.clone();
+                if p + 1 < end {
+                    match m.boundary(stream, &mut run.slots) {
+                        Ok(r) => pre = Some(r),
+                        Err(e) => {
+                            run.err = Some(format!("the boundary after held pass {p}: {e}"));
+                            window.store(1, Ordering::Release);
+                            hold.release()?;
+                            return Ok(());
+                        }
+                    }
+                }
+                std::thread::sleep(HOLD_SETTLE);
+                run.held_waited = Some(stream.query() == Ok(false));
+                hold.release()?;
+                if let Err(e) = drain(gpu) {
+                    run.err = Some(format!("pass {p}: {e}"));
+                    window.store(1, Ordering::Release);
+                    return Ok(());
+                }
+                let out = run.card.read(gpu)?;
+                run.values.push(value(rows, &out, &held_map));
+                run.reports.push(report);
+                run.sets.push(card_sets(&held_map));
+                continue;
+            }
             run.card.launch(gpu)?;
+            if let Hold::Copies { to, .. } = hold
+                && p == to
+            {
+                std::thread::sleep(HOLD_SETTLE);
+                run.held_waited = Some(stream.query() == Ok(false));
+                hold.release()?;
+            }
             if let Err(e) = drain(gpu) {
                 run.err = Some(format!("pass {p}: {e}"));
                 window.store(1, Ordering::Release);
+                hold.release()?;
                 return Ok(());
             }
             let out = run.card.read(gpu)?;
             run.values.push(value(rows, &out, &run.slots));
             run.reports.push(report);
             run.sets.push(card_sets(&run.slots));
-            for (r, row) in rows.iter().enumerate() {
-                for (i, ids) in row.iter().enumerate() {
-                    for (k, &id) in ids.iter().enumerate() {
-                        tally.note(LAYERS.start + i, r, k, id);
-                    }
-                }
-            }
+            note_rows(&mut tally, rows)?;
             m.end_pass(&mut tally, *kept)?;
         }
         window.store(1, Ordering::Release);
@@ -737,44 +937,55 @@ mod gate {
         Ok(())
     }
 
-    /// A fresh arm: its card, its captured probe and a machine over a source
-    /// whose `stuck` experts never become host-resident and whose `slow`
-    /// ones take `SLOW` to prepare, every host wait bounded by `deadline`.
+    /// A fresh arm over `slots`: its card, its captured probe and a machine
+    /// of `cfg` over a source with `faults`.
     fn start(
         gpu: &Gpu,
         pm: &probe_kernels::LoadedModule,
-        stuck: Vec<(usize, u32)>,
-        slow: Vec<(usize, u32)>,
-        deadline: Duration,
+        mut slots: SlotMap,
+        faults: Faults,
+        cfg: MachineCfg,
     ) -> Result<Run, GateError> {
-        let mut slots = seed_map()?;
         let mut card = Card::new(gpu, &slots)?;
         card.capture(gpu, pm)?;
-        let source = Arc::new(Synth::new(&card.stacks, N_L, stuck, slow));
+        let source = Arc::new(Synth::new(&card.stacks, N_L, faults));
+        let delay = cfg.params.delay;
         let machine = SwapMachine::new(
             gpu.context(),
             gpu.stream(),
             &mut slots,
             &card.view,
             source,
-            cfg(deadline),
+            cfg,
         );
         let (machine, err) = match machine {
             Ok(m) => (Some(m), None),
             Err(e) => (None, Some(e.to_string())),
         };
         Ok(Run {
+            delay,
             values: Vec::new(),
             reports: Vec::new(),
             sets: Vec::new(),
             flips: Vec::new(),
             slot_moves: 0,
             pinned_kept: false,
+            held_waited: None,
             err,
             machine,
             slots,
             card,
         })
+    }
+
+    /// A fresh stage-only arm at live delay `delay` with the pass deadline.
+    fn plain(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        faults: Faults,
+        delay: u64,
+    ) -> Result<Run, GateError> {
+        start(gpu, pm, seed_map(&[])?, faults, cfg(delay, DEADLINE))
     }
 
     fn clean(values: &[Value]) -> bool {
@@ -793,6 +1004,38 @@ mod gate {
         values.iter().map(|v| v.fnv).collect()
     }
 
+    fn show(e: &Option<String>) -> String {
+        e.as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string)
+    }
+
+    /// Per card layer, the flips `run` made there.
+    fn flips_per_layer(run: &Run) -> Vec<usize> {
+        LAYERS
+            .map(|l| {
+                run.flips
+                    .iter()
+                    .filter(|(_, f)| f.layer + LAYERS.start == l)
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Flips on every layer with card slots and on no other.
+    fn flips_everywhere(run: &Run) -> bool {
+        flips_per_layer(run)
+            .iter()
+            .zip(N_L)
+            .all(|(&n, cap)| (cap == 0) == (n == 0))
+    }
+
+    /// The first flip `run` made: its boundary, its layer in the map's
+    /// numbering and the flip.
+    fn first_flip(run: &Run) -> Result<(u64, usize, Flip), GateError> {
+        let &(b, f) = run.flips.first().ok_or("gate_swap: the run made no flip")?;
+        Ok((b, LAYERS.start + f.layer, f))
+    }
+
     /// The static replay: per pass, the adaptive run's card sets placed by
     /// synchronous copies, each layer's set in slots by ascending id, and a
     /// fresh map from those rows.
@@ -802,7 +1045,7 @@ mod gate {
         trace: &Trace,
         sets: &[Vec<Vec<u32>>],
     ) -> Result<Vec<Value>, GateError> {
-        let mut slots = seed_map()?;
+        let mut slots = seed_map(&[])?;
         let mut card = Card::new(gpu, &slots)?;
         card.capture(gpu, pm)?;
         let mut placed: Vec<Vec<u32>> = vec![Vec::new(); L];
@@ -830,43 +1073,73 @@ mod gate {
         Ok(values)
     }
 
-    fn show(e: &Option<String>) -> String {
-        e.as_ref()
-            .map_or_else(|| "none".to_string(), ToString::to_string)
+    /// The flips an independent rule makes over the trace at live delay
+    /// `delay`, boundary by boundary: every row observed, each pass ended at
+    /// its kept rows, each boundary after the first planned — the machine's
+    /// seed (slots `0..n_l` less one spare), pinned counts and parameters.
+    fn rule_replay(trace: &Trace, delay: u64) -> Result<Vec<(u64, Flip)>, GateError> {
+        let seeds: Vec<Vec<u32>> = N_L.iter().map(|&n| (0..n as u32).collect()).collect();
+        let refs: Vec<&[u32]> = seeds.iter().map(Vec::as_slice).collect();
+        let capacity: Vec<usize> = N_L.iter().map(|&n| n.saturating_sub(1)).collect();
+        let pinned = cfg(delay, DEADLINE).pinned;
+        let shape = Shape {
+            experts: E,
+            top_k: K,
+            max_rows: MAX_ROWS,
+        };
+        let mut r = SwapRule::new_pinned(params(delay), shape, &refs, &capacity, &pinned)?;
+        let mut flips = Vec::new();
+        for (p, (rows, kept)) in trace.passes.iter().enumerate() {
+            let b = p as u64;
+            if b > 0 {
+                flips.extend(r.plan(b)?.iter().map(|&f| (b, f)));
+            }
+            for (row, ids) in rows.iter().enumerate() {
+                for (i, layer_ids) in ids.iter().enumerate() {
+                    r.observe(i, row, layer_ids)?;
+                }
+            }
+            r.end_pass(*kept)?;
+        }
+        Ok(flips)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        let gpu = Gpu::new()?;
-        // SAFETY: the module is this binary's own, loaded once into the
-        // card's context before any launch.
-        let pm = unsafe { probe_kernels::load(gpu.context())? };
-        let trace = trace();
-        let mut ok = true;
-        println!(
-            "gate_swap: layers {LAYERS:?} of {E} experts, top-{K}, card slots {N_L:?}, parts \
-             {PART_BYTES:?} B, {PASSES} passes, rule every 2 cap 6 margin 1 min 2 decay 0.9, one \
-             spare, delay {DELAY}, {PINNED} pinned"
-        );
-
-        // c1: the same history, twice prompt and once held.
-        let mut a = start(&gpu, &pm, Vec::new(), Vec::new(), DEADLINE)?;
-        drive(&gpu, &mut a, &trace, 0..PASSES, Copies::Prompt)?;
-        let mut b = start(&gpu, &pm, Vec::new(), Vec::new(), DEADLINE)?;
-        drive(&gpu, &mut b, &trace, 0..PASSES, Copies::Prompt)?;
-        let mut h = start(&gpu, &pm, Vec::new(), Vec::new(), DEADLINE)?;
-        drive(&gpu, &mut h, &trace, 0..PASSES, Copies::Held)?;
-        let per_layer: Vec<usize> = LAYERS
-            .map(|l| {
-                a.flips
-                    .iter()
-                    .filter(|(_, f)| f.layer + LAYERS.start == l)
-                    .count()
+    /// Per card layer, two experts off the seed for the tier: the one the
+    /// trace's kept rows route most (the rule would admit it) and the one
+    /// they route least; lower id first on a tie.
+    fn tier_sets(trace: &Trace) -> Vec<Vec<u32>> {
+        let mut counts = vec![[0u32; E]; L];
+        for (rows, kept) in &trace.passes {
+            for row in &rows[..*kept] {
+                for (i, ids) in row.iter().enumerate() {
+                    for &id in ids {
+                        counts[i][id as usize] += 1;
+                    }
+                }
+            }
+        }
+        (0..L)
+            .map(|i| {
+                if N_L[i] == 0 {
+                    return Vec::new();
+                }
+                let off = N_L[i] as u32..E as u32;
+                let hot = off
+                    .clone()
+                    .max_by_key(|&e| (counts[i][e as usize], std::cmp::Reverse(e)))
+                    .expect("experts off the seed");
+                let cold = off
+                    .filter(|&e| e != hot)
+                    .min_by_key(|&e| (counts[i][e as usize], e))
+                    .expect("two experts off the seed");
+                vec![hot, cold]
             })
-            .collect();
-        let flips_everywhere = per_layer
-            .iter()
-            .zip(N_L)
-            .all(|(&n, cap)| (cap == 0) == (n == 0));
+            .collect()
+    }
+
+    // ------------------------------------------------------------ clauses
+
+    fn c1(a: &Run, b: &Run, h: &Run) -> bool {
         let c1 = a.err.is_none()
             && b.err.is_none()
             && h.err.is_none()
@@ -875,13 +1148,13 @@ mod gate {
             && fnvs(&a.values) == fnvs(&h.values)
             && a.flips == b.flips
             && a.flips == h.flips
-            && flips_everywhere;
-        ok &= c1;
+            && flips_everywhere(a);
         println!(
-            "c1 same history: {} passes, {} flips (per layer {per_layer:?}), landed {}; prompt twice \
+            "c1 same history: {} passes, {} flips (per layer {:?}), landed {}; prompt twice \
              equal {} flips equal {}; held equal {} flips equal {}; errors {} / {} / {} {}",
             a.values.len(),
             a.flips.len(),
+            flips_per_layer(a),
             a.slot_moves,
             fnvs(&a.values) == fnvs(&b.values),
             a.flips == b.flips,
@@ -892,15 +1165,21 @@ mod gate {
             show(&h.err),
             verdict(c1)
         );
+        c1
+    }
 
-        // c2: the static replay of the adaptive run's card sets.
-        let reference = static_replay(&gpu, &pm, &trace, &a.sets)?;
+    fn c2(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let reference = static_replay(gpu, pm, trace, &a.sets)?;
         let first_diff = fnvs(&a.values)
             .iter()
             .zip(fnvs(&reference))
             .position(|(x, y)| *x != y);
         let c2 = reference.len() == a.values.len() && first_diff.is_none() && clean(&reference);
-        ok &= c2;
         println!(
             "c2 static replay (slots by ascending id, synchronous copies): {} passes, first \
              differing pass {first_diff:?}, reference errors (stale, double, miss) {:?} {}",
@@ -908,40 +1187,162 @@ mod gate {
             errs(&reference),
             verdict(c2)
         );
+        Ok(c2)
+    }
 
-        // c3 (and c4's harness): with the window closed every copy is staged
-        // only once due, so every landing is late, and each is read right.
+    fn c3(a: &Run, h: &Run) -> bool {
         let late: usize = h.reports.iter().map(|r| r.late).sum();
         let c3 = h.err.is_none()
             && late > 0
             && late == h.slot_moves
             && clean(&h.values)
             && fnvs(&h.values) == fnvs(&a.values);
-        ok &= c3;
         println!(
-            "c3 held copies (window closed all run): late landings {late} of {} (the engine stream \
-             waited), errors (stale, double, miss) {:?}, values = the prompt run's {}, prompt run's \
-             late landings {} {}",
+            "c3 held copies (window closed all run): late landings {late} of {}, errors (stale, \
+             double, miss) {:?}, values = the prompt run's {}, prompt run's late landings {} {}",
             h.slot_moves,
             errs(&h.values),
             fnvs(&h.values) == fnvs(&a.values),
             a.reports.iter().map(|r| r.late).sum::<usize>(),
             verdict(c3)
         );
+        c3
+    }
 
-        // c5: no id served twice or not at all, in every run.
-        let c5 = [&a, &b, &h].iter().all(|r| clean(&r.values));
-        ok &= c5;
+    /// c3 engine: the copy stream held by a host word from the first flip's
+    /// boundary until after the launch of the pass it lands at.
+    fn c3_engine(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b0, l, f) = first_flip(a)?;
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        let (from, to) = (b0 as usize, (b0 + DELAY) as usize);
+        let mut e = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut e,
+            trace,
+            0..PASSES,
+            Copies::Prompt,
+            Hold::Copies {
+                flags: &flags,
+                from,
+                to,
+            },
+        )?;
+        let pass = e.values.get(to).copied().unwrap_or_default();
+        let ok = e.err.is_none()
+            && e.held_waited == Some(true)
+            && clean(&e.values)
+            && fnvs(&e.values) == fnvs(&a.values);
         println!(
-            "c5 host map and card map agree every pass: errors (stale, double, miss) prompt {:?} \
-             prompt {:?} held {:?} {}",
-            errs(&a.values),
-            errs(&b.values),
-            errs(&h.values),
+            "c3 engine waits: copy stream held from boundary {from} (layer {l} expert {} into the \
+             card) to after pass {to}'s launch: engine stream still waiting {:?}; pass {to} \
+             (stale, double, miss) ({}, {}, {}), run errors {:?}, values = the prompt run's {}; \
+             error {} {}",
+            f.admit,
+            e.held_waited,
+            pass.stale,
+            pass.double,
+            pass.miss,
+            errs(&e.values),
+            fnvs(&e.values) == fnvs(&a.values),
+            show(&e.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// c3 boundary event: at live delay 2, the engine stream held through
+    /// the pass before a boundary that lands a flip and issues one into the
+    /// slot its victim frees.
+    fn c3_event(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let mut q = plain(gpu, pm, Faults::default(), DELAY_EVEN)?;
+        drive(gpu, &mut q, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let reuse = q.flips.iter().find_map(|&(b, f)| {
+            q.flips
+                .iter()
+                .any(|&(b2, g)| b2 == b + DELAY_EVEN && g.layer == f.layer)
+                .then_some((b + DELAY_EVEN, f))
+        });
+        let Some((b, f)) = reuse else {
+            println!(
+                "c3 boundary event: no boundary at delay {DELAY_EVEN} lands a flip and issues one \
+                 in the same layer ({} flips) FAIL",
+                q.flips.len()
+            );
+            return Ok(false);
+        };
+        let at = (b - 1) as usize;
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        let mut v = plain(gpu, pm, Faults::default(), DELAY_EVEN)?;
+        drive(
+            gpu,
+            &mut v,
+            trace,
+            0..PASSES,
+            Copies::Prompt,
+            Hold::Engine { flags: &flags, at },
+        )?;
+        let pass = v.values.get(at).copied().unwrap_or_default();
+        let ok = q.err.is_none()
+            && v.err.is_none()
+            && v.held_waited == Some(true)
+            && clean(&v.values)
+            && fnvs(&v.values) == fnvs(&q.values);
+        println!(
+            "c3 boundary event: engine stream held through pass {at}, which reads layer {} victim \
+             {}; boundary {b} frees its slot and issues into it; held pass (stale, double, miss) \
+             ({}, {}, {}), run errors {:?}, values = the unheld run's {}; errors {} / {} {}",
+            LAYERS.start + f.layer,
+            f.evict,
+            pass.stale,
+            pass.double,
+            pass.miss,
+            errs(&v.values),
+            fnvs(&v.values) == fnvs(&q.values),
+            show(&q.err),
+            show(&v.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    fn c5(runs: &[&Run]) -> bool {
+        let c5 = runs.iter().all(|r| clean(&r.values));
+        let per: Vec<(u32, u32, u32)> = runs.iter().map(|r| errs(&r.values)).collect();
+        println!(
+            "c5 host map and card map agree every pass: errors (stale, double, miss) prompt, \
+             prompt, held {per:?} {}",
             verdict(c5)
         );
+        c5
+    }
 
-        // pinned: never a victim, never moved, while other seed experts leave.
+    fn c6(trace: &Trace, a: &Run) -> Result<bool, GateError> {
+        let want = rule_replay(trace, DELAY)?;
+        let first_diff = (0..want.len().max(a.flips.len()))
+            .find(|&i| want.get(i) != a.flips.get(i))
+            .map(|i| (want.get(i).copied(), a.flips.get(i).copied()));
+        let c6 = !want.is_empty() && first_diff.is_none();
+        println!(
+            "c6 kept rows only: an independent rule over every row, ended at the kept rows, makes \
+             {} flips, the machine {}; first difference (rule, machine) {first_diff:?} {}",
+            want.len(),
+            a.flips.len(),
+            verdict(c6)
+        );
+        Ok(c6)
+    }
+
+    fn pinned(a: &Run) -> bool {
         let pinned_victim = a
             .flips
             .iter()
@@ -953,114 +1354,431 @@ mod gate {
             .filter(|(_, f)| (PINNED..N_L[f.layer]).contains(&(f.evict as usize)))
             .count();
         let pinned = pinned_victim == 0 && a.pinned_kept && seed_victims > 0;
-        ok &= pinned;
         println!(
             "pinned: flips evicting a pinned seed expert {pinned_victim}, every pinned expert in its \
              load slot throughout {}, flips evicting an unpinned seed expert {seed_victims} {}",
             a.pinned_kept,
             verdict(pinned)
         );
-        let last = a.reports.last().copied().unwrap_or_default();
-        record::residency_pass(&last).print();
+        pinned
+    }
 
-        // c7: reset back to the seed, then the trace again from the seed.
-        let reset = {
-            let m = a.machine.as_mut().ok_or("gate_swap: no machine")?;
-            m.reset(gpu.stream(), &mut a.slots)
-        };
-        let c7 = match &reset {
-            Ok(r) => {
-                record::residency_reset(r).print();
-                let m = a.machine.as_ref().ok_or("gate_swap: no machine")?;
-                let sets_seed = LAYERS.enumerate().all(|(i, l)| {
-                    let mut seed = m.seed(l).to_vec();
-                    seed.sort_unstable();
-                    card_sets(&a.slots)[i] == seed
-                        && m.rule()
-                            .live(i)
-                            .is_ok_and(|live| live.collect::<Vec<_>>() == seed)
-                });
-                let ledger_seed = LAYERS.into_iter().all(|l| {
-                    let row = m.ledger().row(l);
-                    let live = row
-                        .iter()
-                        .filter(|s| matches!(s, SlotState::Live(_)))
-                        .count();
-                    let spare = row.iter().filter(|s| **s == SlotState::Spare).count();
-                    live == m.seed(l).len() && spare == row.len() - live
-                });
-                let fresh = fnvs(&a.values[..40]);
-                a.values.clear();
-                a.flips.clear();
-                drive(&gpu, &mut a, &trace, 0..40, Copies::Prompt)?;
-                let again = fnvs(&a.values) == fresh && a.err.is_none();
-                println!(
-                    "c7 reset: diff {} cancelled {} copies {} dropped_bytes {}; card sets = the seed \
-                     {sets_seed}, slot ledger = the seed's {ledger_seed}; 40 passes after it = the \
-                     fresh run's {again}",
-                    r.diff, r.cancelled, r.copies, r.dropped_bytes
-                );
-                r.diff == 0 && r.copies > 0 && sets_seed && ledger_seed && again
+    /// c7: a fresh arm driven to the last boundary that made flips, so they
+    /// are in flight, then reset, then the trace again from the seed.
+    fn c7(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_last as usize + 1,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let in_flight: Vec<Flip> = m.rule().in_flight().to_vec();
+        let mut stay = 0u64;
+        for f in &in_flight {
+            if m.seed(LAYERS.start + f.layer)?.contains(&f.evict) {
+                stay += 1;
             }
+        }
+        let reset = m.reset(gpu.stream(), &mut r.slots);
+        let rep = match reset {
+            Ok(rep) => rep,
             Err(e) => {
-                println!("c7 reset: {e}");
-                false
+                println!("c7 reset after boundary {b_last}: {e} FAIL");
+                return Ok(false);
             }
         };
-        ok &= c7;
-        println!("c7 {}", verdict(c7));
+        record::residency_reset(&rep).print();
+        let mut sets_seed = true;
+        let mut ledger_seed = true;
+        for (i, l) in LAYERS.enumerate() {
+            let mut seed = m.seed(l)?;
+            let seed_len = seed.len();
+            seed.sort_unstable();
+            sets_seed &= card_sets(&r.slots)[i] == seed
+                && m.rule()
+                    .live(i)
+                    .is_ok_and(|live| live.collect::<Vec<_>>() == seed);
+            let row = m.ledger().row(l).unwrap_or(&[]);
+            let live = row
+                .iter()
+                .filter(|s| matches!(s, SlotState::Live(_)))
+                .count();
+            let spare = row.iter().filter(|s| **s == SlotState::Spare).count();
+            ledger_seed &= live == seed_len && spare == row.len() - live;
+        }
+        let want_dropped = (rep.copies as u64 + stay) * EXPERT_BYTES;
+        r.values.clear();
+        r.flips.clear();
+        drive(gpu, &mut r, trace, 0..40, Copies::Prompt, Hold::None)?;
+        let again = r.err.is_none() && fnvs(&r.values) == fnvs(&a.values[..40]);
+        let c7 = driven
+            && rep.diff == 0
+            && rep.cancelled == in_flight.len()
+            && rep.cancelled > 0
+            && rep.copies > 0
+            && rep.dropped_bytes == want_dropped
+            && sets_seed
+            && ledger_seed
+            && again;
+        println!(
+            "c7 reset after boundary {b_last}: diff {} cancelled {} (in flight {}) copies {} \
+             dropped_bytes {} (want {want_dropped}: copies and {stay} cancelled victims that stay); \
+             card sets = the seed {sets_seed}, slot ledger = the seed's {ledger_seed}; 40 passes \
+             after it = the fresh run's {again} {}",
+            rep.diff,
+            rep.cancelled,
+            in_flight.len(),
+            rep.copies,
+            rep.dropped_bytes,
+            verdict(c7)
+        );
+        Ok(c7)
+    }
 
-        // refusal: a victim the source cannot bring to the host.
+    /// tier: a two-card map, each card layer's hottest and coldest expert off
+    /// the seed on the tier.
+    fn tier(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let tiers = tier_sets(trace);
+        let mut t = start(
+            gpu,
+            pm,
+            seed_map(&tiers)?,
+            Faults::default(),
+            cfg(DELAY, DEADLINE),
+        )?;
+        let built = t.err.is_none();
+        drive(gpu, &mut t, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let touches = t
+            .flips
+            .iter()
+            .filter(|(_, f)| tiers[f.layer].contains(&f.admit) || tiers[f.layer].contains(&f.evict))
+            .count();
+        let kept = LAYERS.enumerate().all(|(i, l)| {
+            tiers[i]
+                .iter()
+                .enumerate()
+                .all(|(s, &e)| t.slots.slot(l, e) == Some(Slot::Tier(s as u32)))
+        });
+        let bait = a
+            .flips
+            .iter()
+            .any(|(_, f)| tiers[f.layer].first() == Some(&f.admit));
+        let ok = built
+            && t.err.is_none()
+            && t.values.len() == PASSES
+            && flips_everywhere(&t)
+            && touches == 0
+            && kept
+            && bait
+            && clean(&t.values);
+        println!(
+            "tier: tier experts {tiers:?}; {} flips (per layer {:?}), flips admitting or evicting a \
+             tier expert {touches}, every tier entry unchanged {kept}, a tier expert the stage-only \
+             run admits {bait}, errors (stale, double, miss) {:?}; error {} {}",
+            t.flips.len(),
+            flips_per_layer(&t),
+            errs(&t.values),
+            show(&t.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// staging failure: held copies, the first flip's expert fails to read.
+    fn staging_failure(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b0, l, f) = first_flip(a)?;
+        let faults = Faults {
+            fail_source: Some((l, f.admit)),
+            ..Faults::default()
+        };
+        let mut g = plain(gpu, pm, faults, DELAY)?;
+        drive(gpu, &mut g, trace, 0..PASSES, Copies::Held, Hold::None)?;
+        let land = b0 + DELAY;
+        let said = show(&g.err);
+        let named = said.contains("staging failed for job")
+            && said.contains(&format!("layer {l} expert {}", f.admit))
+            && said.contains(&format!("found at boundary {land}"));
+        let ok = named && g.values.len() == land as usize && clean(&g.values);
+        println!(
+            "staging failure: layer {l} expert {}'s source fails, its flip made at {b0} lands at \
+             {land} under held copies: after {} passes \"{said}\" named {named}, errors (stale, \
+             double, miss) {:?} {}",
+            f.admit,
+            g.values.len(),
+            errs(&g.values),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tally: the refusals of a note and of a kept row with a slot missing.
+    fn tally_clause(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(gpu.stream(), &mut r.slots)?;
+        let (rows, _) = &trace.passes[0];
+        let mut t = m.tally();
+        t.note(LAYERS.start, 0, 0, rows[0][0][0])?;
+        let twice = t.note(LAYERS.start, 0, 0, rows[0][0][1]);
+        let twice_named = twice
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("noted twice"));
+        let shapes = [
+            (LAYERS.end, 0, 0),
+            (LAYERS.start - 1, 0, 0),
+            (LAYERS.start, MAX_ROWS, 0),
+            (LAYERS.start, 0, K),
+        ];
+        let outside = shapes
+            .iter()
+            .filter(|&&(l, row, k)| t.note(l, row, k, 0).is_err())
+            .count();
+        let mut t = m.tally();
+        let skip = (LAYERS.start + 1, 2usize);
+        for (i, ids) in rows[0].iter().enumerate() {
+            for (k, &id) in ids.iter().enumerate() {
+                if (LAYERS.start + i, k) != skip {
+                    t.note(LAYERS.start + i, 0, k, id)?;
+                }
+            }
+        }
+        let missing = m.end_pass(&mut t, 1);
+        let missing_named = missing.as_ref().is_err_and(|e| {
+            e.to_string()
+                .contains(&format!("row 0 at layer {}: slots [2]", skip.0))
+        });
+        let unbroken = m.broken().is_none();
+        t.note(skip.0, 0, skip.1, rows[0][1][2])?;
+        let taken = m.end_pass(&mut t, 1).is_ok();
+        let ok = twice_named && outside == shapes.len() && missing_named && unbroken && taken;
+        println!(
+            "tally: a slot noted twice {:?}; notes outside the shape refused {outside} of {}; a kept \
+             row missing a slot {:?}; not broken {unbroken}; the full row then taken {taken} {}",
+            twice.err().map(|e| e.to_string()),
+            shapes.len(),
+            missing.err().map(|e| e.to_string()),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// broken: every stack destination of the first flip's layer fails, so
+    /// its boundary fails after its first change.
+    fn broken(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b1, l, _) = first_flip(a)?;
+        let faults = Faults {
+            fail_dest: Some(l),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let first = show(&r.err);
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let again = m
+            .boundary(gpu.stream(), &mut r.slots)
+            .err()
+            .map(|e| e.to_string());
+        let mut t = m.tally();
+        let end = m.end_pass(&mut t, 0).err().map(|e| e.to_string());
+        let reset = m
+            .reset(gpu.stream(), &mut r.slots)
+            .err()
+            .map(|e| e.to_string());
+        let names = |s: &Option<String>| {
+            s.as_ref()
+                .is_some_and(|s| s.contains("broken") && s.contains(&format!("boundary {b1}")))
+        };
+        let ok = first.contains("Synth::dest")
+            && r.values.len() == b1 as usize
+            && m.broken().is_some()
+            && names(&again)
+            && names(&end)
+            && names(&reset);
+        println!(
+            "broken: layer {l}'s stacks fail at the flip made at boundary {b1}: \"{first}\"; then \
+             boundary {again:?}, end of pass {end:?}, reset {reset:?} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// panic: the source panics on the first flip's expert.
+    fn panic_clause(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b0, l, f) = first_flip(a)?;
+        let faults = Faults {
+            panic_source: Some((l, f.admit)),
+            ..Faults::default()
+        };
+        println!(
+            "panic: the staging thread's panic message below is this clause's (layer {l} expert \
+             {})",
+            f.admit
+        );
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        let t0 = Instant::now();
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let took = t0.elapsed();
+        let said = show(&r.err);
+        let ok = said.contains("panicked")
+            && said.contains(&format!("layer {l} expert {}", f.admit))
+            && r.values.len() <= (b0 + DELAY) as usize
+            && took < DEADLINE;
+        println!(
+            "panic: flip made at {b0}, lands at {}: after {} passes in {took:?} \"{said}\" {}",
+            b0 + DELAY,
+            r.values.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// refusal: a victim the source cannot bring to the host.
+    fn refusal(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
         let stuck: Vec<(usize, u32)> = (PINNED as u32..(N_L[0] - 1) as u32)
             .map(|e| (2, e))
             .collect();
-        let mut r = start(&gpu, &pm, stuck, Vec::new(), DEADLINE)?;
+        let faults = Faults {
+            stuck,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
         let built = r.err.is_none();
-        drive(&gpu, &mut r, &trace, 0..PASSES, Copies::Prompt)?;
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
         let said = show(&r.err);
         let named = said.contains("is not host-resident") && said.contains("layer 2 expert");
-        let tail = vec![(3usize, (N_L[1] - 1) as u32)];
-        let at_load = start(&gpu, &pm, tail, Vec::new(), DEADLINE)?;
+        let tail = Faults {
+            stuck: vec![(3usize, (N_L[1] - 1) as u32)],
+            ..Faults::default()
+        };
+        let at_load = plain(gpu, pm, tail, DELAY)?;
         let load_said = show(&at_load.err);
         let load_named = load_said.contains("is not host-resident")
             && load_said.contains("layer 3 expert 11")
             && at_load.machine.is_none();
         let refusal = built && named && load_named;
-        ok &= refusal;
         println!(
             "refusal: after {} passes \"{said}\" {named}; a spare slot's expert at load \"{load_said}\" \
              {load_named} {}",
             r.values.len(),
             verdict(refusal)
         );
+        Ok(refusal)
+    }
 
-        // stall: a victim that takes longer to prepare than the machine's
-        // deadline is a named error at the boundary it would land at, not a
-        // wait without end.
-        let slow = vec![(2usize, 7u32)];
-        let mut st = start(&gpu, &pm, Vec::new(), slow, STALL_DEADLINE)?;
+    /// stall: a victim that takes longer to prepare than the machine's
+    /// deadline is a named error at the boundary it would land at, not a
+    /// wait without end.
+    fn stall(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let faults = Faults {
+            slow: vec![(2usize, 7u32)],
+            ..Faults::default()
+        };
+        let mut st = start(gpu, pm, seed_map(&[])?, faults, cfg(DELAY, STALL_DEADLINE))?;
         let t0 = Instant::now();
-        drive(&gpu, &mut st, &trace, 0..PASSES, Copies::Prompt)?;
+        drive(gpu, &mut st, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
         let took = t0.elapsed();
         let stall_said = show(&st.err);
         let stall = stall_said.contains("was not prepared for the host")
             && stall_said.contains("layer 2: the victim 7")
             && took < SLOW;
-        ok &= stall;
         println!(
             "stall: a victim {SLOW:?} to prepare under a {STALL_DEADLINE:?} deadline: after {} passes \
              in {took:?} \"{stall_said}\" {}",
             st.values.len(),
             verdict(stall)
         );
+        Ok(stall)
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let gpu = Gpu::new()?;
+        // SAFETY: the module is this binary's own, loaded once into the
+        // card's context before any launch.
+        let pm = unsafe { probe_kernels::load(gpu.context())? };
+        let trace = trace();
+        println!(
+            "gate_swap: layers {LAYERS:?} of {E} experts, top-{K}, card slots {N_L:?}, parts \
+             {PART_BYTES:?} B, {PASSES} passes, rule every 2 cap 6 margin 1 min 2 decay 0.9, one \
+             spare, delay {DELAY}, {PINNED} pinned"
+        );
+        let mut a = plain(&gpu, &pm, Faults::default(), DELAY)?;
+        drive(&gpu, &mut a, &trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let mut b = plain(&gpu, &pm, Faults::default(), DELAY)?;
+        drive(&gpu, &mut b, &trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let mut h = plain(&gpu, &pm, Faults::default(), DELAY)?;
+        drive(&gpu, &mut h, &trace, 0..PASSES, Copies::Held, Hold::None)?;
+
+        let mut ok = c1(&a, &b, &h);
+        ok &= c2(&gpu, &pm, &trace, &a)?;
+        ok &= c3(&a, &h);
+        ok &= c3_engine(&gpu, &pm, &trace, &a)?;
+        ok &= c3_event(&gpu, &pm, &trace)?;
+        ok &= c5(&[&a, &b, &h]);
+        ok &= c6(&trace, &a)?;
+        ok &= pinned(&a);
+        record::residency_pass(&a.reports.last().copied().unwrap_or_default()).print();
+        ok &= c7(&gpu, &pm, &trace, &a)?;
+        ok &= tier(&gpu, &pm, &trace, &a)?;
+        ok &= staging_failure(&gpu, &pm, &trace, &a)?;
+        ok &= tally_clause(&gpu, &pm, &trace)?;
+        ok &= broken(&gpu, &pm, &trace, &a)?;
+        ok &= panic_clause(&gpu, &pm, &trace, &a)?;
+        ok &= refusal(&gpu, &pm, &trace)?;
+        ok &= stall(&gpu, &pm, &trace)?;
 
         if ok {
             println!(
                 "gate_swap: PASS — the same history gives the same values and flips whatever the \
-                 copies' timing, equal to a static replay of its card sets; late copies are waited \
-                 for; the host and card maps never serve an id twice or not at all; a reset returns \
-                 to the seed; a non-resident victim is refused by name; a host wait past its \
-                 deadline is a named error; pinned seed experts never move."
+                 copies' timing, equal to a static replay of its card sets and to an independent \
+                 rule over the kept rows; late copies are waited for by the engine stream, and a \
+                 copy into a freed slot by the boundary before it; the host and card maps never \
+                 serve an id twice or not at all; a reset with flips in flight returns to the \
+                 seed; tier entries never move; a staging failure, a panic, a broken machine, a \
+                 bad tally, a non-resident victim and a host wait past its deadline are each a \
+                 named error; pinned seed experts never move."
             );
             Ok(())
         } else {

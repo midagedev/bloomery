@@ -10,7 +10,7 @@ pub const HOST: u32 = u32::MAX;
 
 /// The bit that marks an entry `TIER | s` as slot `s` of the tier card.
 /// `TIER | s` equals [`HOST`] only at `s = 2^31 - 1`, which `s < capacity <=
-/// n_expert < 2^31` ([`SlotMap::with_capacity`]) rules out.
+/// n_expert < 2^31` ([`SlotMap::from_rows`]) rules out.
 pub const TIER: u32 = 1 << 31;
 
 /// One entry of the map, decoded ([`SlotMap::slot`]).
@@ -49,8 +49,8 @@ impl Slot {
 /// stacks in the layer — and the live entries, which name distinct slots
 /// below it. A slot no live entry names is free: no id reaches it, so no
 /// kernel reads it, whatever its bytes are. A load's map has capacity = live
-/// ([`SlotMap::from_rows`]); a residency ledger frees and fills slots between
-/// passes through [`SlotMap::evict`] and [`SlotMap::admit`].
+/// ([`SlotMap::from_rows`]); the residency machine frees and fills slots
+/// between passes through [`SlotMap::evict`] and [`SlotMap::admit`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotMap {
     layers: Range<usize>,
@@ -94,41 +94,7 @@ impl SlotMap {
         n_expert: usize,
         slots: Vec<u32>,
     ) -> Result<SlotMap, GpuError> {
-        SlotMap::build("SlotMap::from_rows", layers, n_expert, slots, None)
-    }
-
-    /// The map from its rows, as [`SlotMap::from_rows`] takes them, with each
-    /// device's capacity per row: `cap_card[i]` stage card slots and
-    /// `cap_tier[i]` tier slots in row `i`, each at most `n_expert`. Per row
-    /// and device, the live entries name distinct slots below that device's
-    /// capacity; the slots they leave are free. A capacity list of another
-    /// length than the rows, a capacity past `n_expert`, a slot twice and a
-    /// slot at or past its device's capacity are refused by name.
-    pub fn with_capacity(
-        layers: Range<usize>,
-        n_expert: usize,
-        slots: Vec<u32>,
-        cap_card: Vec<usize>,
-        cap_tier: Vec<usize>,
-    ) -> Result<SlotMap, GpuError> {
-        SlotMap::build(
-            "SlotMap::with_capacity",
-            layers,
-            n_expert,
-            slots,
-            Some((cap_card, cap_tier)),
-        )
-    }
-
-    /// The map of both constructors: `caps` the per-row capacities, `None`
-    /// for each row's live counts.
-    fn build(
-        what: &'static str,
-        layers: Range<usize>,
-        n_expert: usize,
-        slots: Vec<u32>,
-        caps: Option<(Vec<usize>, Vec<usize>)>,
-    ) -> Result<SlotMap, GpuError> {
+        let what = "SlotMap::from_rows";
         if n_expert == 0
             || n_expert >= TIER as usize
             || layers.len().checked_mul(n_expert) != Some(slots.len())
@@ -141,25 +107,10 @@ impl SlotMap {
                 ),
             ));
         }
-        if let Some((c, t)) = &caps
-            && (c.len() != layers.len() || t.len() != layers.len())
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{} card and {} tier capacities for the {} rows of layers {layers:?}",
-                    c.len(),
-                    t.len(),
-                    layers.len()
-                ),
-            ));
-        }
         let mut on_card = Vec::with_capacity(layers.len());
         let mut on_tier = Vec::with_capacity(layers.len());
-        let mut cap_card = Vec::with_capacity(layers.len());
-        let mut cap_tier = Vec::with_capacity(layers.len());
         let (mut card_taken, mut tier_taken) = (vec![false; n_expert], vec![false; n_expert]);
-        for (i, (row, l)) in slots.chunks_exact(n_expert).zip(layers.clone()).enumerate() {
+        for (row, l) in slots.chunks_exact(n_expert).zip(layers.clone()) {
             let (mut k, mut k_tier) = (0usize, 0usize);
             for &e in row {
                 match Slot::of(e) {
@@ -168,37 +119,28 @@ impl SlotMap {
                     Slot::Host => {}
                 }
             }
-            let (cap, cap_t) = caps.as_ref().map_or((k, k_tier), |(c, t)| (c[i], t[i]));
-            if cap > n_expert || cap_t > n_expert {
-                return Err(GpuError::shape(
-                    what,
-                    format!("layer {l}: {cap} card and {cap_t} tier slots for {n_expert} experts"),
-                ));
-            }
             card_taken.fill(false);
             tier_taken.fill(false);
             for &e in row {
                 let (s, taken, capacity, device) = match Slot::of(e) {
                     Slot::Host => continue,
-                    Slot::Card(s) => (s, &mut card_taken, cap, "the card"),
-                    Slot::Tier(s) => (s, &mut tier_taken, cap_t, "the tier"),
+                    Slot::Card(s) => (s, &mut card_taken, k, "the card"),
+                    Slot::Tier(s) => (s, &mut tier_taken, k_tier, "the tier"),
                 };
                 take_slot(taken, s, capacity, device)
                     .map_err(|why| GpuError::shape(what, format!("layer {l}: {why}")))?;
             }
             on_card.push(k);
             on_tier.push(k_tier);
-            cap_card.push(cap);
-            cap_tier.push(cap_t);
         }
         Ok(SlotMap {
             layers,
             n_expert,
             slots,
+            cap_card: on_card.clone(),
+            cap_tier: on_tier.clone(),
             on_card,
             on_tier,
-            cap_card,
-            cap_tier,
         })
     }
 
@@ -342,28 +284,6 @@ impl SlotMap {
 
     fn view(&self, of: impl Fn(Slot) -> u32) -> Vec<u32> {
         self.slots.iter().map(|&e| of(Slot::of(e))).collect()
-    }
-
-    /// Layer `layer`'s row of the stage card's copy ([`SlotMap::stage_view`])
-    /// into `out`, `n_expert` words: what a residency change re-uploads of
-    /// that copy. A layer the map has no row for, or an `out` of another
-    /// length, is refused by name.
-    pub fn stage_row_into(&self, layer: usize, out: &mut [u32]) -> Result<(), GpuError> {
-        const WHAT: &str = "SlotMap::stage_row_into";
-        let row = self.row(layer).ok_or_else(|| self.outside(layer, WHAT))?;
-        if out.len() != row.len() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("{} words for a row of {}", out.len(), row.len()),
-            ));
-        }
-        for (o, &e) in out.iter_mut().zip(row) {
-            *o = match Slot::of(e) {
-                Slot::Card(s) => s,
-                Slot::Tier(_) | Slot::Host => HOST,
-            };
-        }
-        Ok(())
     }
 
     /// Send layer `layer`'s expert `id`, which the host computes, to `slot`, a
@@ -714,62 +634,15 @@ mod tests {
         );
     }
 
-    /// With a capacity above the live count, the live slots are distinct and
-    /// below it, and the rest are free: a gap is taken, a slot twice, a slot
-    /// at the capacity, a capacity past the experts and a capacity list of
-    /// another length are refused.
-    #[test]
-    fn with_capacity_holds_live_slots_distinct_and_below_capacity() {
-        let t = |s: u32| TIER | s;
-        let map = SlotMap::with_capacity(
-            0..1,
-            6,
-            vec![3, HOST, 0, t(2), HOST, HOST],
-            vec![4],
-            vec![3],
-        )
-        .expect("two of four card slots and one of three tier slots live");
-        assert_eq!(
-            (map.capacity(0).ok(), map.on_card(0).ok()),
-            (Some(4), Some(2))
-        );
-        assert_eq!(
-            (map.tier_capacity(0).ok(), map.on_tier(0).ok()),
-            (Some(3), Some(1))
-        );
-        let with = |row: Vec<u32>, c: usize, ct: usize| {
-            SlotMap::with_capacity(0..1, 6, row, vec![c], vec![ct])
-        };
-        assert!(
-            with(vec![3, 3, HOST, HOST, HOST, HOST], 4, 0).is_err(),
-            "a slot twice"
-        );
-        assert!(
-            with(vec![4, 0, HOST, HOST, HOST, HOST], 4, 0).is_err(),
-            "a slot at the capacity"
-        );
-        assert!(
-            with(vec![0, t(1), HOST, HOST, HOST, HOST], 1, 1).is_err(),
-            "a tier slot at its capacity"
-        );
-        assert!(
-            with(vec![0, HOST, HOST, HOST, HOST, HOST], 7, 0).is_err(),
-            "7 slots for 6 experts"
-        );
-        assert!(
-            SlotMap::with_capacity(0..2, 6, vec![HOST; 12], vec![0], vec![0, 0]).is_err(),
-            "one card capacity for two rows"
-        );
-    }
-
     /// An eviction frees its slot and an admission fills a free one: the live
-    /// count moves, the capacity stays, the stage row the card copy re-uploads
-    /// follows; each refusal leaves the map unchanged.
+    /// count moves, the capacity stays, the stage card's copy follows; each
+    /// refusal leaves the map unchanged.
     #[test]
     fn evict_then_admit_moves_one_entry() {
         let h = HOST;
-        let mut map = SlotMap::with_capacity(4..5, 6, vec![0, h, 1, h, TIER, h], vec![3], vec![1])
-            .expect("two of three card slots live");
+        let mut map = SlotMap::from_rows(4..5, 6, vec![0, 2, 1, h, TIER, h]).expect("a full row");
+        assert_eq!(map.evict(4, 1).ok(), Some(Slot::Card(2)));
+        assert_eq!(map.row(4), Some(&[0, h, 1, h, TIER, h][..]));
         let before = map.clone();
         let refused = |r: Result<(), crate::GpuError>, map: &SlotMap, why: &str| {
             assert!(r.is_err(), "{why}");
@@ -806,12 +679,10 @@ mod tests {
             (map.on_card(4).ok(), map.capacity(4).ok()),
             (Some(3), Some(3))
         );
-        let mut row = [7u32; 6];
-        map.stage_row_into(4, &mut row).expect("a row");
         assert_eq!(
-            row,
+            map.stage_view(),
             [0, 2, 1, h, h, h],
-            "the tier's entry is HOST in the stage row"
+            "the tier's entry is HOST in the stage card's copy"
         );
         assert_eq!(map.evict(4, 0).ok(), Some(Slot::Card(0)));
         assert_eq!(map.evict(4, 4).ok(), Some(Slot::Tier(0)));
@@ -824,21 +695,14 @@ mod tests {
             (map.on_tier(4).ok(), map.tier_capacity(4).ok()),
             (Some(0), Some(1))
         );
-        map.stage_row_into(4, &mut row).expect("a row");
-        assert_eq!(row, [h, 2, 1, h, h, h]);
-        assert!(map.stage_row_into(4, &mut [0u32; 5]).is_err());
-        assert!(map.stage_row_into(5, &mut row).is_err());
+        assert_eq!(map.stage_view(), [h, 2, 1, h, h, h]);
         map.admit(4, 3, Slot::Card(0)).expect("the freed slot");
         map.admit(4, 5, Slot::Tier(0)).expect("the freed tier slot");
-        let back = SlotMap::with_capacity(
-            4..5,
-            6,
-            map.row(4).expect("a row").to_vec(),
-            vec![3],
-            vec![1],
-        )
-        .expect("the moved row is a map");
-        assert_eq!(back, map);
+        assert_eq!(
+            SlotMap::from_rows(4..5, 6, map.row(4).expect("a row").to_vec()).ok(),
+            Some(map.clone()),
+            "the moved row, full again, is a load's map"
+        );
     }
 
     /// No KV cache: the synthetic model's card holds only its tensors.

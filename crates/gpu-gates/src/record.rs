@@ -882,7 +882,7 @@ pub static RESIDENCY_PASS: Kind = Kind {
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
           the bytes its flips copy.",
     parts: &[
-        key("request_pass", U64, ""),
+        key("boundary", U64, ""),
         key("kept", U64, ""),
         key("landed", U64, ""),
         key("late", U64, ""),
@@ -898,7 +898,8 @@ pub static RESIDENCY_RESET: Kind = Kind {
     head: "residency reset",
     doc: "A residency reset back to the seed: flips in flight cancelled, experts copied back onto \
           the card, entries of the live map that differ from the seed after it (0 when it \
-          worked), and the host bytes released for the seed experts back on the card.",
+          worked), and the host bytes released for the seed experts back on the card and the \
+          victims of cancelled flips, which stay on it.",
     parts: &[
         key("cancelled", U64, ""),
         key("copies", U64, ""),
@@ -1431,7 +1432,7 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
 #[cfg(feature = "gpu")]
 pub fn residency_pass(r: &PassReport) -> Record {
     Record::new(&RESIDENCY_PASS)
-        .u("request_pass", r.boundary)
+        .u("boundary", r.boundary)
         .u("kept", r.kept)
         .u("landed", r.landed)
         .u("late", r.late)
