@@ -74,6 +74,9 @@ use crate::host::GlmHost;
 use crate::program;
 use crate::tensors::LayerNames;
 
+#[path = "prefill.rs"]
+pub mod prefill;
+
 /// What the body's errors name.
 const WHAT: &str = "glm5next Body";
 
@@ -499,8 +502,14 @@ pub struct Body {
     plant: Option<Plant>,
     /// Positions every store holds.
     ctx: usize,
+    /// The most positions a latent layer attends whole
+    /// (`place::dense_positions`): the batch feed runs only a load whose
+    /// stores hold no more.
+    dense: usize,
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
+    /// How a prompt is fed, and the batch feed's buffers.
+    prompt: prefill::PromptState,
 }
 
 /// Every KDA layer's state and conv ring, in layer order: the list the
@@ -720,6 +729,8 @@ impl Body {
                     place::ORACLE_POSITIONS
                 ))
             })?;
+        let dense = usize::try_from(place::dense_positions(hp))
+            .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let dims = dims_of(inputs)?;
         let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
@@ -789,7 +800,9 @@ impl Body {
             held: 0,
             plant: None,
             ctx,
+            dense,
             ckpt,
+            prompt: prefill::PromptState::new(),
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
@@ -1227,6 +1240,7 @@ impl ChainBody for Body {
             + self.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
             + self.card.bytes()
+            + self.prompt.bytes()
             + self
                 .taps
                 .as_ref()

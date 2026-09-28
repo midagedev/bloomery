@@ -99,6 +99,28 @@
 //!   the logits plain steps of the same ids from a reset give, bit for bit;
 //!   and a prompt call's takes leave those logits as they are.
 //!
+//! The prompt batch, on a second load at [`CTX_PP`] positions — every
+//! position the latent layers attend whole — in its own session fed in
+//! batches (`bloomery_gpu_glm5next::prefill`), the clauses above having run
+//! on the steps feed:
+//! - (pb) one run of plain steps over [`CTX_PP`] lcg ids from a reset, every
+//!   store digested and the logits and argmax kept after each of [`PP`]
+//!   positions; then for each, a batch call of that many ids from a reset:
+//!   every KDA layer's state and conv ring, every latent layer's latent and
+//!   index rows, the last logits and the argmax bit for bit the steps', and
+//!   the checkpoints at the multiples of 512 inside the call and its end —
+//!   the steps feed's marks, as (k) holds them.
+//! - (pr) a call one position past the stores is refused by name before any
+//!   launch, on either feed: the model stands at 0 and every store digests
+//!   as the reset's.
+//! - (pf) `blk.0.attn_norm.weight[0]` set to NaN: a step and a batch call of
+//!   nine ids each end in the same fault, at layer 0, the model poisoned and
+//!   the next call refused as such; a call of 513 ids (two batches) ends in
+//!   it after its first batch, no checkpoint taken of the faulted state; the
+//!   weight put back, a reset and the call give (pb)'s argmax.
+//!
+//! `--only main` runs the clauses above alone, `--only pp` these alone.
+//!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
 //! finite and clamps nothing; ik renormalizes the router's eight weights by
@@ -136,7 +158,10 @@ mod gate {
         ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, Plant, set_taps, step_launches};
+    use bloomery_gpu_glm5next::{
+        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill, set_taps,
+        step_launches, store_digests,
+    };
     use bloomery_levers::{CARD_BUDGET, HOT_LIST};
     use cuda_core::sys;
     use gguf::quant::dequant_row;
@@ -155,6 +180,16 @@ mod gate {
 
     /// Cache rows: the `--dsa` set's step at position 3,070, with room.
     const CTX: usize = 3136;
+
+    /// The prompt batch's load: every position the latent layers attend whole
+    /// (`place::dense_positions`: the indexer's top-k in whole pools of 512,
+    /// plus a pool's tail).
+    const CTX_PP: usize = 2051;
+
+    /// The prompt batch's calls, in positions: one; a chunk short, whole and
+    /// one past it; a batch whole and one past it; a mark with a short tail
+    /// after it; every position the stores hold.
+    const PP: [usize; 8] = [1, 7, 8, 9, 512, 513, 1030, CTX_PP];
 
     /// The file's shape, as the header states it (glmops-design §1): what
     /// the derivations below are written against.
@@ -306,6 +341,7 @@ mod gate {
     /// The open's records, as the gate prints them.
     struct Log {
         t: Instant,
+        ctx: usize,
         nodes: Option<usize>,
         /// The plan's card experts a layer.
         n_l: Vec<u64>,
@@ -329,8 +365,9 @@ mod gate {
 
         fn load(&mut self, m: &Glm5nextModel) -> Result<(), SessionError> {
             println!(
-                "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
+                "load resident_bytes={} ctx={} layers={} in {:.1} s (runtime value)",
                 m.resident_bytes(),
+                self.ctx,
                 m.layers().len(),
                 self.t.elapsed().as_secs_f64()
             );
@@ -355,23 +392,30 @@ mod gate {
         budgeted: bool,
     }
 
-    fn open() -> Result<(Session<Body>, Opened), GateError> {
-        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+    /// The session at `ctx` positions on the gate placement, its prompts fed
+    /// by `prefill`.
+    fn open(
+        levers: &bloomery_levers::Levers,
+        ctx: usize,
+        prefill: PrefillMode,
+    ) -> Result<(Session<Body>, Opened), GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let cfg = GlmCfg {
-            place: PlanLevers::from_levers(&levers)?,
+            place: PlanLevers::from_levers(levers)?,
             host: levers.host(),
+            prefill,
         };
         let budgeted = cfg.place.card_budget_bytes.is_some();
         let mut log = Log {
             t: Instant::now(),
+            ctx,
             nodes: None,
             n_l: Vec::new(),
         };
         let args = OpenArgs {
             place: "gate",
             machine: workstation::plan_gate,
-            ctx: CTX,
+            ctx,
             mode: StepMode::Graph,
             cfg,
         };
@@ -1492,8 +1536,35 @@ mod gate {
         Ok(ok)
     }
 
+    /// Which clauses a run takes: `--only main`, `--only pp`, or both.
+    fn only() -> Result<(bool, bool), GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        match args.iter().position(|a| a == "--only") {
+            None => Ok((true, true)),
+            Some(i) => match args.get(i + 1).map(String::as_str) {
+                Some("main") => Ok((true, false)),
+                Some("pp") => Ok((false, true)),
+                other => Err(format!("--only is main or pp, not {other:?}").into()),
+            },
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
-        let (mut s, opened) = open()?;
+        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+        let (main, pp) = only()?;
+        let mut ok = true;
+        if main {
+            ok &= main_clauses(&levers)?;
+        }
+        if pp {
+            ok &= prompt_batch(&levers)?;
+        }
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// Every clause on the steps feed, on the load at [`CTX`].
+    fn main_clauses(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
         let m = s.model_mut();
         let mut ok = structure(m, &opened)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
@@ -1527,6 +1598,237 @@ mod gate {
         }
         println!("step sets: {ties} named tie(s)");
         ok &= keep(&mut s)?;
-        if ok { Ok(()) } else { Err(checks_failed()) }
+        Ok(ok)
+    }
+
+    // ------------------------------------------- (pb) (pr) (pf) prompt batch
+
+    /// `n` ids of an lcg over the vocabulary: every id a row of the
+    /// embedding, the routing spread over the experts.
+    fn lcg_ids(n: usize) -> Vec<u32> {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((x >> 33) % N_VOCAB as u64) as u32
+            })
+            .collect()
+    }
+
+    /// FNV-1a over a row's bits.
+    fn fnv_row(row: &[f32]) -> u64 {
+        row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+            v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        })
+    }
+
+    /// What the plain steps leave after `p` positions.
+    struct After {
+        p: usize,
+        stores: Vec<StoreDigest>,
+        logits: u64,
+        argmax: u32,
+    }
+
+    /// The first store of `got` whose digest differs from `want`'s, named.
+    fn first_store_diff(got: &[StoreDigest], want: &[StoreDigest]) -> Option<String> {
+        if got.len() != want.len() {
+            return Some(format!("{} stores against {}", got.len(), want.len()));
+        }
+        got.iter()
+            .zip(want)
+            .find(|(g, w)| g != w)
+            .map(|(g, _)| format!("layer {} {}", g.layer, g.what))
+    }
+
+    /// The checkpoints a call of `p` positions from 0 leaves: the multiples of
+    /// 512 inside it and its end.
+    fn marks(p: usize) -> Vec<u32> {
+        let mut v: Vec<u32> = (1..)
+            .map(|k| 512 * k)
+            .take_while(|&k| k < p)
+            .map(|k| k as u32)
+            .collect();
+        v.push(p as u32);
+        v
+    }
+
+    /// (pb), (pr), (pf) on a load at [`CTX_PP`] whose session feeds in batches.
+    fn prompt_batch(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let (mut s, _) = open(levers, CTX_PP, PrefillMode::Batch)?;
+        let m = s.model_mut();
+        let ids = lcg_ids(CTX_PP + 1);
+        let mut ok = true;
+        // (pb): the steps' record, then one batch call a position count.
+        m.reset()?;
+        let t = Instant::now();
+        let mut after = Vec::new();
+        for (i, &id) in ids[..CTX_PP].iter().enumerate() {
+            let argmax = m.step(&[id])?;
+            if PP.contains(&(i + 1)) {
+                after.push(After {
+                    p: i + 1,
+                    stores: store_digests(m)?,
+                    logits: fnv_row(&m.logits()?),
+                    argmax,
+                });
+            }
+        }
+        println!(
+            "prompt batch: {CTX_PP} plain steps in {:.1} s (runtime value), {} stores digested \
+             at each of {PP:?}",
+            t.elapsed().as_secs_f64(),
+            after.first().map_or(0, |a| a.stores.len())
+        );
+        for a in &after {
+            m.reset()?;
+            let t = Instant::now();
+            let got = prefill(m, &ids[..a.p]);
+            let secs = t.elapsed().as_secs_f64();
+            let (argmax, stores, logits) = match got {
+                Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
+                Err(e) => {
+                    println!("prompt batch P={}: error \"{e}\" {}", a.p, verdict(false));
+                    ok = false;
+                    continue;
+                }
+            };
+            let points = m.body("prompt batch")?.checkpoints().positions();
+            let diff = first_store_diff(&stores, &a.stores);
+            let pass = diff.is_none()
+                && logits == a.logits
+                && argmax == a.argmax
+                && m.pos() as usize == a.p
+                && points == marks(a.p);
+            println!(
+                "prompt batch P={}: stores {} logits {} argmax {argmax} (steps {}) pos {} \
+                 checkpoints {points:?} (want {:?}), {secs:.2} s (runtime value) {}",
+                a.p,
+                diff.as_deref()
+                    .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+                if logits == a.logits {
+                    "bit for bit"
+                } else {
+                    "differ"
+                },
+                a.argmax,
+                m.pos(),
+                marks(a.p),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        ok &= refused_past(m, &ids)?;
+        let clean = after.iter().find(|a| a.p == 9).map(|a| a.argmax);
+        ok &= batch_fault(m, &ids[..9], &ids[..513], clean)?;
+        Ok(ok)
+    }
+
+    /// (pr): a call one position past the stores, on each feed.
+    fn refused_past(m: &mut Glm5nextModel, ids: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        let zero = store_digests(m)?;
+        let mut ok = true;
+        for mode in [PrefillMode::Batch, PrefillMode::Steps] {
+            set_prefill(m, mode)?;
+            let r = feed(m, &ids[..CTX_PP + 1]);
+            let named = matches!(&r, Err(GpuError::Shape { detail, .. })
+                if detail.contains(&format!("past the {CTX_PP} positions")));
+            let same = store_digests(m)? == zero;
+            let pass = named && m.pos() == 0 && same;
+            println!(
+                "prompt past the stores ({} feed): {} ids: {}; pos {} stores as the reset's {same} {}",
+                mode.name(),
+                CTX_PP + 1,
+                match &r {
+                    Ok(t) => format!("token {t}"),
+                    Err(e) => format!("error \"{e}\""),
+                },
+                m.pos(),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        set_prefill(m, PrefillMode::Batch)?;
+        Ok(ok)
+    }
+
+    /// The first layer's attention norm, whose first value (pf) sets to NaN.
+    fn patch_attn_norm(m: &mut Glm5nextModel, bytes: [u8; 4]) -> Result<[u8; 4], GateError> {
+        let name = names::attn_norm(0);
+        let (gpu, w, _) = m.body_parts("gate_glm5next_e2e patch_attn_norm")?;
+        let Some(DevWeight::F32 { w: gain, .. }) = w.get(&name) else {
+            return Err(format!("{name} is not resident as F32").into());
+        };
+        patch_bytes(gpu.stream(), gain.buf(), 0, bytes)
+    }
+
+    /// (pf): a NaN in layer 0's norm; a step and a batch call end in the same
+    /// fault at layer 0, the model poisoned; a call of two batches ends in it
+    /// after its first, with no checkpoint taken of the faulted state; the
+    /// weight put back, a reset and the batch call give `clean`, (pb)'s argmax
+    /// at nine positions.
+    fn batch_fault(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        two: &[u32],
+        clean: Option<u32>,
+    ) -> Result<bool, GateError> {
+        m.reset()?;
+        let old = patch_attn_norm(m, f32::NAN.to_le_bytes())?;
+        let step = m.step(&ids[..1]);
+        let step_poison = m.poisoned();
+        m.reset()?;
+        let batch = prefill(m, ids);
+        let batch_poison = m.poisoned();
+        let again = prefill(m, ids);
+        m.reset()?;
+        let zero_points = m.body("batch fault")?.checkpoints().positions();
+        let long = prefill(m, two);
+        let long_points = m.body("batch fault")?.checkpoints().positions();
+        patch_attn_norm(m, old)?;
+        m.reset()?;
+        let restored = prefill(m, ids);
+        m.reset()?;
+        let fault_of = |r: &Result<u32, GpuError>| match r {
+            Err(GpuError::Fault { fault, .. }) => Some(*fault),
+            _ => None,
+        };
+        let (fs, fb) = (fault_of(&step), fault_of(&batch));
+        let early = fault_of(&long) == fs && long_points == zero_points;
+        let named = fs.is_some()
+            && fs == fb
+            && fs.is_some_and(|f| f.layer == 0)
+            && step_poison == fs
+            && batch_poison == fb;
+        let refused = matches!(again, Err(GpuError::Poisoned { .. }));
+        let back = clean.is_some() && matches!(restored, Ok(t) if Some(t) == clean);
+        let ok = named && early && refused && back;
+        let show = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        println!(
+            "batch fault: NaN in blk.0.attn_norm.weight[0]: a step: {}; a batch of {}: {}; \
+             poisoned {} / {}; the next call: {}; a call of {}: {}, checkpoints {long_points:?} \
+             (the reset's {zero_points:?}); the weight put back and a reset: {} (want token {}) \
+             {}",
+            show(&step),
+            ids.len(),
+            show(&batch),
+            step_poison.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            batch_poison.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            show(&again),
+            two.len(),
+            show(&long),
+            show(&restored),
+            clean.map_or_else(|| "none".to_string(), |t| t.to_string()),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 }

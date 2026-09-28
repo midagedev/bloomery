@@ -1,0 +1,38 @@
+# Round glmppa (R1 glmpp-a), a smoke of the prediction, not a public number: GLM-5.3-Flash's prompt call in batches
+# of up to 512 positions (generate_glm5next --prefill batch, the default) against the step feed (--prefill steps),
+# one binary, both writing the same bits (gate-gpu-glm5next-e2e clause (b)).
+# Decomposition [derived, round report section 0]: the batch is one walk of the layer schedule, and without groups
+# (G = 1) its wall is the sum of the card front (0.88..1.05 s a batch: the m-column projections, the attention by
+# 8-token chunk, the router rows) and the host union over every routed layer (70..96 ms a layer-batch, centre 77, at
+# the plan's host share of about 0.78 of the slots); the card's own experts and the shared expert run under the
+# union. 3.85..5.11 s a batch of 512 -> pp512 100..133; the design report's band without the card share is
+# 82..110 (centre 100). The step feed reads 20.95 tok/s decode at depth 512 and 20.99 at 1024 (rig-log
+# 09-28#glm-release), flat in depth, so its prompt rate is ~21 at either P.
+# pp2048 is a screen, not the term: four batches, each cut at a checkpoint mark; the latent layers' attention over
+# up to 2,048 positions adds <= 5 % a batch [derived: 11 latent layers, one read of the cache a chunk], so
+# pp2048 95..133 and the steps arm there is the same ~21. The steps arm at 2048 is left out: ~100 s a round for a
+# number the decode rows already fix.
+kind: ab
+question: does the batched prompt call run GLM-5.3-Flash's prompt at the rate the sum of the card front and the
+  host union predicts, against the step feed of the same binary?
+term: pp tok/s @ P = 512, prose prompt (GLM_PROSE), no hot list, A6000, plan (a), --ctx 2051 - (batch - steps) /
+  steps, paired by round
+unit: %
+predict: +280..+550
+rounds: 2
+condition: one lease, the glmppa tree's binary, three arms a round, from /Users/hckim/repo/bloomery-glmppa:
+  BLOOMERY_REMOTE='~/repo/bloomery-glmppa' BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=2051
+  BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmppa-pp.card' just depth-gpu-glm5next 512 steps:512 2048, with
+  the runner patch that adds the steps:<D> arm applied first (--prefill steps; glmwarm owns the runner, and without
+  the patch steps:512 exits 64 before the lease). Each row's time prompt
+  record must name its kind (steps or batch) and passes (512 for steps, 1 at P = 512 and 4 at 2048 for batch); a row
+  marked [cold], [cpu-busy] or [other-busy] is void. Box time ~7..11 min [derived: 3 loads a round and the
+  discarded warm-up of the first arm, 7 loads at 45..75 s, a load time this round has not measured; 5 + 24 + 20 s of
+  prompt a round]
+decide-in: keep batch as the default feed; the next round is R2 (the card front's projections as int8 GEMM),
+  whose band this row re-bases; the rows go to rig-log as a smoke, not into the public table
+decide-below: the batch is slower than the sum says: time one batch under nsys (per-layer front, union, back) and
+  name the term past its band - the host union (union scratch sizing, the lanes) or the front (chunk launches)
+  - before R2 opens
+decide-above: the host union is under its band: re-derive the wall with the card front as the larger share and
+  move G (batches in pairs, which needs a per-layer checkpoint take) ahead of R2

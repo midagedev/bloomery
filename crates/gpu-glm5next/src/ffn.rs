@@ -38,9 +38,10 @@ use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
-use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, FfnBatchKernels, Handoff};
+use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
+use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use gguf::GgmlType;
 use model::arch::glm5next::names;
@@ -175,6 +176,11 @@ impl CardExperts {
     /// The card slots' weighted sum of the last card layer enqueued.
     pub(crate) fn acc(&self) -> &DeviceBuffer<f32> {
         &self.acc
+    }
+
+    /// The routed experts' width: a gate·up slot's rows.
+    pub(crate) fn ff(&self) -> usize {
+        self.ff
     }
 
     /// Device bytes of the buffers.
@@ -457,6 +463,138 @@ fn card_slots(
         n_used: N_USED,
     };
     k.batch.enqueue_card_acc(stream, &acc, &mut k.acc)
+}
+
+/// A prompt batch's card slots ([`card_rows`]): the batch's `t` normed rows
+/// and their routing, the places the call writes, and the buffers its chunks
+/// write — each chunk's rows in q8_1 ([`COL_GROUP`] columns), its gate·up
+/// rows a slot, per chunk width `c` the q8_1 of its `c · N_USED` slots'
+/// columns (`act_h[c - 1]`), its downs — and the card sums, `t` rows.
+pub(crate) struct CardRows<'a> {
+    pub normed: &'a DeviceBuffer<f32>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub weights: &'a DeviceBuffer<f32>,
+    pub t: usize,
+    pub sel: &'a mut DeviceBuffer<u32>,
+    pub act_x: &'a mut Q8Act,
+    pub h: &'a mut DeviceBuffer<f32>,
+    pub act_h: &'a mut [Q8Act],
+    pub down: &'a mut DeviceBuffer<f32>,
+    pub acc: &'a mut DeviceBuffer<f32>,
+}
+
+/// Layer `l`'s card slots over a prompt batch's `t` tokens into the card
+/// sums `io.acc` ([`card_slots`]'s launches): every slot's place from the
+/// slot map in one launch (`ds41_ffn_places`, the handoff's rule), then per
+/// chunk of up to [`COL_GROUP`] tokens the rows' q8_1 form, the gate·up
+/// `_sel` of its slots at `N_USED` a column, the q8_1 of its card slots'
+/// columns, the down `_sel` and the card sums — each slot and token what the
+/// one-token launches write for it, the host's slots left alone. Refused by
+/// name on a layer without card experts.
+pub(crate) fn card_rows(
+    gpu: &Gpu,
+    w: &Weights,
+    p: &mut Parts<'_>,
+    l: usize,
+    io: CardRows<'_>,
+) -> Result<(), GpuError> {
+    const W: &str = "glm5next card_rows";
+    let stream = gpu.stream();
+    let n = p.d.embd;
+    let fault = gpu.layer_sink(l)?;
+    let c = p.cfg[l];
+    let k = &*p.card;
+    let cl = k.layer(l).ok_or(GpuError::State {
+        what: W,
+        missing: "card experts on the layer",
+    })?;
+    let st = CardStacks::of(w, l)?;
+    let t = io.t;
+    k.batch.enqueue_places(
+        stream,
+        &Places {
+            ids: io.ids,
+            n: t * N_USED,
+            map: p.slots.buf(),
+            row_off: c.row_off,
+            n_expert: N_EXPERT,
+        },
+        fault,
+        &mut *io.sel,
+    )?;
+    let sel: &DeviceBuffer<u32> = &*io.sel;
+    for c0 in (0..t).step_by(COL_GROUP) {
+        let cn = COL_GROUP.min(t - c0);
+        let slots = cn * N_USED;
+        let x = span(W, io.normed, c0 * n, cn * n)?;
+        let sel_c = span(W, sel, c0 * N_USED, slots)?;
+        let w_c = span(W, io.weights, c0 * N_USED, slots)?;
+        gpu.enqueue_quantize_q8_1_cols(&x, &mut *io.act_x, cn, l)?;
+        let a = GateUpAct {
+            wg: st.gate.w,
+            wu: st.up.w,
+            act: &*io.act_x,
+            sel: &sel_c,
+            n_slots: slots,
+            rows_per_expert: k.ff,
+            slots_per_col: N_USED,
+            rule: Act::SwigluClamp { limit: cl.limit },
+        };
+        match st.gate.ty {
+            GgmlType::Q4_K => k.kq.enqueue_gate_up_q4k(stream, &a, fault, &mut *io.h)?,
+            GgmlType::Q5_K => k.kq.enqueue_gate_up_q5k(stream, &a, fault, &mut *io.h)?,
+            _ => return Err(unrun(&st.gate)),
+        }
+        let act_h = io.act_h.get_mut(cn - 1).ok_or(GpuError::State {
+            what: W,
+            missing: "the q8_1 columns of a chunk that wide",
+        })?;
+        let q = QuantSel {
+            x: &*io.h,
+            cols: 0..slots,
+            sel: &sel_c,
+            n_card: cl.n_card,
+        };
+        gpu.q4k_sel()
+            .enqueue_quantize_sel(stream, &q, fault, act_h)?;
+        match st.down.ty {
+            GgmlType::Q5_K => {
+                let a = SelDown {
+                    w: st.down.w,
+                    act: act_h,
+                    sel: &sel_c,
+                    n_slots: slots,
+                    rows_per_expert: n,
+                };
+                k.kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut *io.down)?;
+            }
+            GgmlType::Q4_K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                stream,
+                st.down.w,
+                act_h,
+                &sel_c,
+                slots,
+                n,
+                &mut *io.down,
+            )?,
+            _ => return Err(unrun(&st.down)),
+        }
+        let acc = CardAcc {
+            down: &*io.down,
+            w: &w_c,
+            sel: &sel_c,
+            n,
+            m: cn,
+            n_card: cl.n_card,
+            n_used: N_USED,
+        };
+        k.batch.enqueue_card_acc(
+            stream,
+            &acc,
+            &mut *span_mut(W, &mut *io.acc, c0 * n, cn * n)?,
+        )?;
+    }
+    Ok(())
 }
 
 /// A stack whose type [`card_routed`] names but no launch here runs.

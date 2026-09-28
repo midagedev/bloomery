@@ -2,11 +2,12 @@
 //! one card, the routed experts the card experts read by the expert rule
 //! (the hot list `BLOOMERY_HOT_LIST`, or the id prefix) and the rest on the
 //! host tier (`model::arch::glm5next::place`), loaded through the session
-//! (`app::Loaded`), the prompt fed one step a position, then `-n` greedy
+//! (`app::Loaded`), the prompt fed as `--prefill` says, then `-n` greedy
 //! steps.
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate]
-//! [--mode graph|eager] [--model PATH] [--time [--warm W]] [--logits] [--plan]`
+//! [--mode graph|eager] [--prefill batch|steps] [--model PATH] [--time [--warm W]]
+//! [--logits] [--plan]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
@@ -14,13 +15,17 @@
 //! - `--place`: `a` is the serving plan (`workstation::plan_a`, the A6000),
 //!   `gate` the gate card's (`workstation::plan_gate`, the 3090). Default
 //!   `gate`.
+//! - `--prefill`: `batch` feeds the prompt in batches
+//!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
+//!   the same bits; the same-binary arm. Default `batch`.
 //! - `--model`: the first shard; default the file the reference sets were
 //!   dumped from (`refset::arch::glm5next::MODEL`).
 //! - `--plan` prints the plan and exits before the load.
 //! - `--logits` prints the head's last logits row by its bits after the
 //!   tokens.
-//! - `--time` times the feed (`time prompt`, `kind=steps`: one step a fed
-//!   id, then the readback of generated token 0) and each generated step
+//! - `--time` times the feed (`time prompt`, `kind` the feed's mode and
+//!   `passes` its batches or steps, through the readback of generated token
+//!   0) and each generated step
 //!   after token 0 (`time step`, the step through its token's readback), and
 //!   ends with the `SMOKE` footer over the kept steps. `--warm W` drops the
 //!   first W of them from the footer. A measurement: it belongs under the
@@ -54,7 +59,7 @@ mod cli {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel};
+    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
@@ -110,6 +115,7 @@ mod cli {
         top_k: usize,
         place: &'static str,
         mode: StepMode,
+        prefill: PrefillMode,
         ctx: usize,
         stop_at_plan: bool,
         t: Instant,
@@ -138,7 +144,7 @@ mod cli {
                 .w("shadow", "none")
                 .u("shadow_bytes", 0)
                 .u("unified_addressing", 0)
-                .w("prefill", "steps")
+                .w("prefill", self.prefill.name())
                 .w("mode", mode_name(self.mode))
                 .w("place", self.place)
                 .w("pin_main", "off")
@@ -206,6 +212,11 @@ mod cli {
             Some("eager") => StepMode::Eager,
             Some(o) => return Err(format!("--mode is eager or graph, not {o}").into()),
         };
+        let prefill = match flag("--prefill")? {
+            None => PrefillMode::Batch,
+            Some(p) => PrefillMode::from_name(&p)
+                .ok_or_else(|| format!("--prefill is batch or steps, not {p}"))?,
+        };
         let path = flag("--model")?.unwrap_or_else(|| refset::arch::glm5next::MODEL.to_string());
         // The last generated token is read out, not fed: the run takes the
         // prompt's positions and one a step after the first token.
@@ -222,11 +233,13 @@ mod cli {
         let cfg = GlmCfg {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
+            prefill,
         };
         let mut log = Log {
             top_k: 0,
             place,
             mode,
+            prefill,
             ctx,
             stop_at_plan: has("--plan"),
             t,
@@ -254,6 +267,10 @@ mod cli {
             .list("last", &tail)
             .u("depth_sequence_from", ids.len())
             .print();
+        let passes = match prefill {
+            PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), ids.len())?.len(),
+            PrefillMode::Steps => ids.len(),
+        };
         let t_feed = Instant::now();
         let mut next = s.prompt(&ids, Want::Argmax)?.argmax();
         let feed = t_feed.elapsed();
@@ -279,8 +296,8 @@ mod cli {
                 .u("n", ids.len())
                 .f("ms", ms)
                 .f("tok/s", ids.len() as f64 * 1e3 / ms)
-                .u("passes", ids.len())
-                .w("kind", "steps")
+                .u("passes", passes)
+                .w("kind", prefill.name())
                 .print();
         }
         for &(i, pos, token, ms) in &rows {

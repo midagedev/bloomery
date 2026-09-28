@@ -240,6 +240,14 @@ pub trait LayerProgram {
         Ok(())
     }
 
+    /// Whether `at`'s layer has a host leg: the walk serves only those. A
+    /// layer with none (a dense layer ahead of the routed run) downloads
+    /// nothing, so a serve of it would meet another layer's exchange.
+    fn host_leg(&self, at: At) -> bool {
+        let _ = at;
+        true
+    }
+
     /// `at`'s front: the whole layer when it has no host leg.
     fn front(&mut self, port: &mut Self::Port, at: At) -> Result<(), Error<Self>>;
 
@@ -263,7 +271,8 @@ pub trait LayerProgram {
 }
 
 /// Run `prog` over `layers` layers in the order of `o` ([`order`]), `port`
-/// opened first and serving the [`Item::Serve`] entries.
+/// opened first and serving the [`Item::Serve`] entries of the layers with a
+/// host leg ([`LayerProgram::host_leg`]).
 pub fn walk<P: LayerProgram>(
     o: Overlap,
     layers: usize,
@@ -289,7 +298,8 @@ pub fn walk<P: LayerProgram>(
             Item::Begin(u) => prog.begin(u)?,
             Item::Front(at) => prog.front(port, at)?,
             Item::Shadow(at) => prog.shadow(port, at)?,
-            Item::Serve(at) => port.serve(at)?,
+            Item::Serve(at) if prog.host_leg(at) => port.serve(at)?,
+            Item::Serve(_) => {}
             Item::Back(at) => prog.back(port, at)?,
             Item::End(u) => prog.end(u)?,
         }
@@ -573,6 +583,36 @@ mod tests {
             walk(group(units), 5, &mut port, &mut Prog::<true>).unwrap();
             assert_eq!(port.0.opened, Some(group(units)));
             assert_eq!(port.0.seen, layers_parts(walked(group(units), 5)));
+        }
+    }
+
+    /// A program whose first layers have no host leg: the walk passes their
+    /// serves by and runs every other part as [`order`] lays it out.
+    #[test]
+    fn walk_serves_host_legs_only() {
+        struct Lead(usize);
+        impl LayerProgram for Lead {
+            type Port = RecPort<true>;
+            fn host_leg(&self, at: At) -> bool {
+                at.layer >= self.0
+            }
+            fn front(&mut self, port: &mut RecPort<true>, at: At) -> Result<(), Refused> {
+                port.0.seen.push(Front(at));
+                Ok(())
+            }
+        }
+        for units in 1..=3 {
+            let mut port = RecPort::<true>(Rec::default());
+            walk(group(units), 5, &mut port, &mut Lead(2)).unwrap();
+            let want: Vec<Item> = walked(group(units), 5)
+                .into_iter()
+                .filter(|i| match i {
+                    Front(_) => true,
+                    Serve(a) => a.layer >= 2,
+                    _ => false,
+                })
+                .collect();
+            assert_eq!(port.0.seen, want);
         }
     }
 

@@ -14,6 +14,11 @@
 //!   warp tree (each dot bit for bit `q8_0_gemv`'s at m = 1), then
 //!   [`swiglu_clamp`]. The down projection after it is `q8_0_gemv`.
 //!
+//! And its prompt shape, `ds41_shexp_gate_up_q8_0_mcol`: the same row over
+//! up to eight tokens, each weight word read once for every token
+//! (`q8f32::q8_0_lane_partials_mcol`), token `c` bit for bit the one-token
+//! launch on its column.
+//!
 //! Numeric contract, where it is ik's CPU rule op for op (the gate holds each
 //! kernel to this module's host functions, bit for bit):
 //! - SwiGLU: `min(silu(g), L) · clamp(u, -L, L)` with `L` the layer's
@@ -31,9 +36,9 @@
 
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::linear::expf_ik;
-use bloomery_gpu::q8f32::q8_0_lane_partial_1col;
+use bloomery_gpu::q8f32::{q8_0_lane_partial_1col, q8_0_lane_partials_mcol};
 use bloomery_gpu::weights::DevWeight;
-use bloomery_gpu::{DeviceTensor, GpuError, Q8Act, launch_u32};
+use bloomery_gpu::{DeviceTensor, GpuError, Q8Act, col_sums, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
@@ -62,6 +67,39 @@ pub fn swiglu_clamp(g: f32, u: f32, limit: f32) -> f32 {
         uc = if -limit < uc { uc } else { -limit };
     }
     uc * s
+}
+
+/// Lane `lane`'s partials of gate row `row` and up row `row` against `M`
+/// token columns of `x`, `k` values a column from 0: each
+/// [`q8_0_lane_partials_mcol`]'s, gate first.
+///
+/// # Safety
+///
+/// Both planes hold row `row` of `k` values in the q8f32 layout, `x.len() >=
+/// M·k`, `k` a positive multiple of 32, `M` in 1..=8, `lane < 32`.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+unsafe fn gate_up_partials<const M: usize>(
+    qs_g: &[u32],
+    d_g: &[u16],
+    qs_u: &[u32],
+    d_u: &[u16],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    lane: usize,
+) -> ([f32; 8], [f32; 8]) {
+    let kc = k as usize;
+    // SAFETY: this fn's contract is both calls'.
+    unsafe {
+        (
+            q8_0_lane_partials_mcol::<M>(qs_g, d_g, x, k, row, 0, kc, lane),
+            q8_0_lane_partials_mcol::<M>(qs_u, d_u, x, k, row, 0, kc, lane),
+        )
+    }
 }
 
 #[cuda_module]
@@ -193,6 +231,88 @@ mod experts_kernels {
             unsafe { *h.get_unchecked_mut(row) = v };
         }
     }
+
+    /// [`ds41_shexp_gate_up`] for `m_cols` (1..=8) tokens of `x` (`k`
+    /// values a token, token-major): both dots of row `r` against every
+    /// column, each weight word loaded once for all of them
+    /// (`q8_0_lane_partials_mcol`, column `c` term for term the
+    /// single-column body's), each column reduced by the warp tree, and
+    /// `h[c·n_rows + r] = swiglu_clamp(g_c, u_c, limit)` from lane 0 — token
+    /// `c` bit for bit the one-token launch on its column.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs_g.len() >= n_rows * k,
+            32 * d_g.len() >= n_rows * k,
+            4 * qs_u.len() >= n_rows * k,
+            32 * d_u.len() >= n_rows * k,
+            x.len() >= m_cols * k,
+            h.len() >= m_cols * n_rows,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn ds41_shexp_gate_up_q8_0_mcol(
+        qs_g: &[u32],
+        d_g: &[u16],
+        qs_u: &[u32],
+        d_u: &[u16],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        m_cols: u32,
+        limit: f32,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows puts the row's words and scales inside both
+        // planes (the contract's 4·qs.len() and 32·d.len() bounds), x.len()
+        // >= m_cols·k, the launcher passes k a positive multiple of 32, M is
+        // m_cols in 1..=8, and lane < 32.
+        let (fg, fu) = unsafe {
+            match m_cols {
+                1 => gate_up_partials::<1>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                2 => gate_up_partials::<2>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                3 => gate_up_partials::<3>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                4 => gate_up_partials::<4>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                5 => gate_up_partials::<5>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                6 => gate_up_partials::<6>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                7 => gate_up_partials::<7>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                8 => gate_up_partials::<8>(qs_g, d_g, qs_u, d_u, x, k, row, lane),
+                _ => return,
+            }
+        };
+        let m = m_cols as usize;
+        let g = col_sums(fg, m);
+        let u = col_sums(fu, m);
+        if lane == 0 {
+            let v = [
+                swiglu_clamp(g[0], u[0], limit),
+                swiglu_clamp(g[1], u[1], limit),
+                swiglu_clamp(g[2], u[2], limit),
+                swiglu_clamp(g[3], u[3], limit),
+                swiglu_clamp(g[4], u[4], limit),
+                swiglu_clamp(g[5], u[5], limit),
+                swiglu_clamp(g[6], u[6], limit),
+                swiglu_clamp(g[7], u[7], limit),
+            ];
+            // SAFETY: slots c·n_rows + row for c < m are inside h (h.len() >=
+            // m·n_rows) and belong to this row's warp alone.
+            unsafe { store_cols(&mut h, row, n_rows as usize, m, v) };
+        }
+    }
 }
 
 /// One token's routed gate·up·SwiGLU launch
@@ -317,47 +437,17 @@ impl ExpertKernels {
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up";
-        let shape = |detail: String| GpuError::Shape { what, detail };
-        let (
-            DevWeight::Q8_0 {
-                qs: qs_g,
-                d: d_g,
-                k,
-            },
-            DevWeight::Q8_0 {
-                qs: qs_u,
-                d: d_u,
-                k: k_u,
-            },
-        ) = (gate, up)
-        else {
-            return Err(shape("gate and up must both be q8_0 file tensors".into()));
-        };
-        let (n_rows, k) = (d_g.rows(), *k);
-        if *k_u != k
-            || d_u.rows() != n_rows
-            || k == 0
-            || !k.is_multiple_of(32)
-            || d_g.cols() * 32 != k
-            || d_u.cols() * 32 != k
-            || qs_g.rows() != n_rows
-            || qs_u.rows() != n_rows
-            || qs_g.cols() * 4 != k
-            || qs_u.cols() * 4 != k
-        {
-            return Err(shape(format!(
-                "gate {} rows x {k} and up {} rows x {k_u} must match, with k/4 code words \
-                 and k/32 scales per row",
-                d_g.rows(),
-                d_u.rows()
-            )));
-        }
-        if n_rows == 0 || x.len() < k || h.len() < n_rows {
-            return Err(shape(format!(
-                "{n_rows} rows need x.len() {} >= {k} and h.len() {} >= {n_rows}",
-                x.len(),
-                h.len()
-            )));
+        let p = q8_pair(what, gate, up)?;
+        let (n_rows, k) = (p.n_rows, p.k);
+        if x.len() < k || h.len() < n_rows {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{n_rows} rows need x.len() {} >= {k} and h.len() {} >= {n_rows}",
+                    x.len(),
+                    h.len()
+                ),
+            });
         }
         let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
@@ -368,10 +458,10 @@ impl ExpertKernels {
         self.module.ds41_shexp_gate_up(
             stream,
             &prep,
-            qs_g.buf(),
-            d_g.buf(),
-            qs_u.buf(),
-            d_u.buf(),
+            p.qs_g.buf(),
+            p.d_g.buf(),
+            p.qs_u.buf(),
+            p.d_u.buf(),
             x,
             n_rows,
             k,
@@ -380,4 +470,130 @@ impl ExpertKernels {
         )?;
         Ok(())
     }
+
+    /// [`ExpertKernels::enqueue_shexp_gate_up`] for `m` tokens (1..=8) in
+    /// one launch (`ds41_shexp_gate_up_q8_0_mcol`): `x` their `k` f32
+    /// activations each, token-major, and `h` their rows token-major, token
+    /// `c`'s at `c · rows` — each token's rows the one-token launch's bit
+    /// for bit. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue_shexp_gate_up's inputs and the token count (rust-quality R8)"
+    )]
+    pub fn enqueue_shexp_gate_up_mcol(
+        &self,
+        stream: &CudaStream,
+        gate: &DevWeight,
+        up: &DevWeight,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        limit: f32,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_shexp_gate_up_mcol";
+        let p = q8_pair(what, gate, up)?;
+        let (n_rows, k) = (p.n_rows, p.k);
+        if !(1..=8).contains(&m) || x.len() < m * k || h.len() < m * n_rows {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{m} tokens (1..=8) of {n_rows} rows need x.len() {} >= {} and h.len() {} \
+                     >= {}",
+                    x.len(),
+                    m * k,
+                    h.len(),
+                    m * n_rows
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_ds41_shexp_gate_up_q8_0_mcol(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.ds41_shexp_gate_up_q8_0_mcol(
+            stream,
+            &prep,
+            p.qs_g.buf(),
+            p.d_g.buf(),
+            p.qs_u.buf(),
+            p.d_u.buf(),
+            x,
+            n_rows,
+            k,
+            m,
+            limit,
+            h,
+        )?;
+        Ok(())
+    }
+}
+
+/// A shared expert's gate and up q8_0 planes, checked to match: the same
+/// rows of the same `k`, a positive multiple of 32, with `k/4` code words and
+/// `k/32` scales a row.
+struct Q8Pair<'a> {
+    qs_g: &'a DeviceTensor<u32>,
+    d_g: &'a DeviceTensor<u16>,
+    qs_u: &'a DeviceTensor<u32>,
+    d_u: &'a DeviceTensor<u16>,
+    n_rows: usize,
+    k: usize,
+}
+
+/// `gate` and `up` as a [`Q8Pair`], refused by name (as `what`'s error)
+/// unless both are q8_0 file tensors of the same non-empty shape.
+fn q8_pair<'a>(
+    what: &'static str,
+    gate: &'a DevWeight,
+    up: &'a DevWeight,
+) -> Result<Q8Pair<'a>, GpuError> {
+    let shape = |detail: String| GpuError::Shape { what, detail };
+    let (
+        DevWeight::Q8_0 {
+            qs: qs_g,
+            d: d_g,
+            k,
+        },
+        DevWeight::Q8_0 {
+            qs: qs_u,
+            d: d_u,
+            k: k_u,
+        },
+    ) = (gate, up)
+    else {
+        return Err(shape("gate and up must both be q8_0 file tensors".into()));
+    };
+    let (n_rows, k) = (d_g.rows(), *k);
+    if *k_u != k
+        || d_u.rows() != n_rows
+        || k == 0
+        || !k.is_multiple_of(32)
+        || d_g.cols() * 32 != k
+        || d_u.cols() * 32 != k
+        || qs_g.rows() != n_rows
+        || qs_u.rows() != n_rows
+        || qs_g.cols() * 4 != k
+        || qs_u.cols() * 4 != k
+    {
+        return Err(shape(format!(
+            "gate {} rows x {k} and up {} rows x {k_u} must match, with k/4 code words \
+             and k/32 scales per row",
+            d_g.rows(),
+            d_u.rows()
+        )));
+    }
+    if n_rows == 0 {
+        return Err(shape(format!("{n_rows} rows: at least one")));
+    }
+    Ok(Q8Pair {
+        qs_g,
+        d_g,
+        qs_u,
+        d_u,
+        n_rows,
+        k,
+    })
 }

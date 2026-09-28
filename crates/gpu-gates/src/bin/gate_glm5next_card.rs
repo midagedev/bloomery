@@ -517,6 +517,7 @@ mod gate {
         let cfg = GlmCfg {
             place,
             host: levers.host(),
+            prefill: bloomery_gpu_glm5next::PrefillMode::Steps,
         };
         let mut log = Log {
             t: Instant::now(),

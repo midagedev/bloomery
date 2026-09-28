@@ -11,6 +11,7 @@
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
+//! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
@@ -28,6 +29,10 @@ mod mla;
 mod program;
 mod tensors;
 
+pub use body::prefill::{
+    CHUNK, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill, prefill_mode,
+    set_prefill, store_digests,
+};
 pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, Plant, prompt, set_taps};
 pub use host::GlmHost;
 pub use program::{layer_launches, step_launches};

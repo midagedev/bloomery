@@ -3,15 +3,16 @@
 //! expert rule, the rest on the host) and loaded by
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
-//! A prompt is fed one step a position: the step walk is the only walk the
-//! body has. Each prompt call takes the KDA layers' checkpoints its marks
-//! name ([`bloomery_gpu_glm5next::prompt`]), and a cut keeps every fed
-//! position, the empty model, or a checkpoint: each KDA layer holds one
-//! recurrent state, and its history only in those copies.
+//! A prompt is fed as the configuration says ([`GlmCfg::prefill`]): in
+//! batches ([`bloomery_gpu_glm5next::prefill`]) or one step a position
+//! ([`bloomery_gpu_glm5next::prompt`]), the two leaving the same bits. Each
+//! prompt call takes the KDA layers' checkpoints its marks name, and a cut
+//! keeps every fed position, the empty model, or a checkpoint: each KDA
+//! layer holds one recurrent state, and its history only in those copies.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
-use bloomery_gpu_glm5next::Body;
+use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::glm5next::place::PlanInputs;
@@ -30,6 +31,8 @@ pub struct GlmCfg {
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,
+    /// How a prompt is fed: in batches, or one decode step per id.
+    pub prefill: PrefillMode,
 }
 
 impl Open for Body {
@@ -79,17 +82,17 @@ impl Open for Body {
         Body::open_placed(file, plan, inputs, 0, cfg.host)
     }
 
-    /// No prompt buffers: the prompt is fed by steps.
-    fn prepare(_m: &mut GpuModel<Body>, _cfg: &GlmCfg) -> Result<bool, GpuError> {
-        Ok(false)
+    /// The configuration's feed; the batch feed's buffers made here.
+    fn prepare(m: &mut GpuModel<Body>, cfg: &GlmCfg) -> Result<bool, GpuError> {
+        bloomery_gpu_glm5next::set_prefill(m, cfg.prefill)
     }
 }
 
 impl Prompt for Body {
-    /// One step per id, a readback at each checkpoint mark and after the
-    /// last ([`bloomery_gpu_glm5next::prompt`]).
+    /// The body's feed ([`bloomery_gpu_glm5next::feed`]): a call past the
+    /// stores' positions is refused before anything runs.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        bloomery_gpu_glm5next::prompt(m, ids)
+        bloomery_gpu_glm5next::feed(m, ids)
     }
 }
 

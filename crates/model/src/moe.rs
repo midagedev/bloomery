@@ -1900,11 +1900,13 @@ mod tests {
             match ty {
                 // block_q3_K: d f16 at 108.
                 GgmlType::Q3_K => blk[108..110].copy_from_slice(&0x2000u16.to_le_bytes()),
-                // block_q4_K: d f16 at 0, dmin f16 at 2.
-                GgmlType::Q4_K => {
+                // block_q4_K and block_q5_K: d f16 at 0, dmin f16 at 2.
+                GgmlType::Q4_K | GgmlType::Q5_K => {
                     blk[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
                     blk[2..4].copy_from_slice(&0x1C00u16.to_le_bytes());
                 }
+                // block_q6_K: d f16 at 208.
+                GgmlType::Q6_K => blk[208..210].copy_from_slice(&0x2000u16.to_le_bytes()),
                 GgmlType::F32 => {
                     let v = (next() >> 40) as f32 / 16_777_216.0 - 0.5;
                     blk.copy_from_slice(&v.to_le_bytes());
@@ -2079,6 +2081,80 @@ mod tests {
             );
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// GLM-5.3-Flash's routed stacks — Q4_K gates and ups over a Q5_K or a
+    /// Q6_K down, a clamped SwiGLU — through a union call write, column for
+    /// column and bit for bit, what the one-column call writes, narrow (3
+    /// columns) and wide (12).
+    #[test]
+    fn union_call_on_glm_stacks_matches_its_columns() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        for down in [GgmlType::Q5_K, GgmlType::Q6_K] {
+            let tys = [GgmlType::Q4_K, GgmlType::Q4_K, down];
+            let path = layer_file(&format!("glm-{down}"), tys, embd, ff, n_expert);
+            let split = gguf::Split::open(&path).unwrap();
+            let layer = HostLayer::build(
+                R8Source::rows(&split),
+                &HostLayerSpec {
+                    gate: "gate_exps",
+                    up: "up_exps",
+                    down: "down_exps",
+                    n_expert,
+                    embd,
+                    ff,
+                    swiglu_limit: 0.01,
+                },
+            )
+            .unwrap();
+            let mut us = UnionScratch::new_routed(embd, ff, 16, 3).unwrap();
+            let mut host = HostScratch::new(embd, ff, 3).unwrap();
+            for cols in [3, 12] {
+                let x = Tensor2::from_vec(
+                    embd,
+                    cols,
+                    (0..embd * cols)
+                        .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                        .collect(),
+                );
+                let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+                    .map(|j| {
+                        [0, 2, 5]
+                            .map(|s| (((j + s) % n_expert) as u32, 0.25 + 0.125 * s as f32))
+                            .to_vec()
+                    })
+                    .collect();
+                let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+                let mut want = vec![f32::NAN; embd * cols];
+                for (j, list) in lists.iter().enumerate() {
+                    let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
+                    layer
+                        .experts_into(
+                            R8Source::rows(&split),
+                            &xj,
+                            list,
+                            &mut want[j * embd..][..embd],
+                            &mut host,
+                        )
+                        .unwrap();
+                }
+                let mut got = vec![f32::NAN; embd * cols];
+                layer
+                    .experts_union_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
+                    .unwrap();
+                let diff = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!("glm stacks, {down} down, k={cols}: diff_cells={diff}");
+                assert_eq!(
+                    diff, 0,
+                    "{down} down, {cols} columns: the union differs from its columns"
+                );
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     /// A scratch made for a routed width holds that many slots a column and
