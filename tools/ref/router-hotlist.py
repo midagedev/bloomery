@@ -6,7 +6,9 @@
 
 Each <set> is a router_trace directory (tools/ref/router-coverage.py's docstring has the format); a set
 whose manifest has no `# complete` trailer is refused, and so are sets that disagree on n_expert,
-n_expert_used, the layer list or the model file. Per layer, every selection of every token of every
+n_expert_used, the layer list, the model file or the build. The model file is the `# model` line, the
+first shard's full path: two quantizations of one model share their shard names, so the basename
+(`# model_file`) cannot tell them apart; a set without `# model` or `# build` is refused by name. Per layer, every selection of every token of every
 set is counted together (the union of the sets' traffic), and the layer's experts are ranked hottest
 first, ties to the lower id (router-coverage.py's `hot`). The file keeps the first --n of each layer
 in that rank order:
@@ -17,6 +19,7 @@ in that rank order:
     # n_expert  <experts per routed stack>
     # order     rank
     # date      <UTC date>
+    # model     the sets' first shard, full path
     # model_file / # build   the sets' own manifest values
     <layer>\t<id>,<id>,...
 
@@ -46,8 +49,12 @@ def learn(set_dirs, n):
         for key in ("n_expert", "n_used", "layers"):
             if s[key] != first[key]:
                 raise rc.SetError(f"{s['dir']}: {key} {s[key]} is not {first['dir']}'s {first[key]}")
-        if s["header"].get("model_file") != first["header"].get("model_file"):
-            raise rc.SetError(f"{s['dir']}: model_file differs from {first['dir']}'s")
+    for s in sets:
+        for key in ("model", "build"):
+            if s["header"].get(key) is None:
+                raise rc.SetError(f"{s['dir']}: its manifest has no `# {key}` line, so what it was traced from is unknown")
+            if s["header"][key] != first["header"][key]:
+                raise rc.SetError(f"{s['dir']}: `# {key}` {s['header'][key]!r} is not {first['dir']}'s {first['header'][key]!r}")
     E = first["n_expert"]
     if n == "all":
         n = E
@@ -75,7 +82,7 @@ def write(path, sets, lists, n):
         "# order\trank",
         "# date\t" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
     ]
-    for key in ("model_file", "build"):
+    for key in ("model", "model_file", "build"):
         vals = sorted({s["header"].get(key, "?") for s in sets})
         lines.append(f"# {key}\t{','.join(vals)}")
     for layer in sorted(lists):
@@ -113,11 +120,17 @@ def main(argv):
     return 0
 
 
-def _fake_set(root, name, layers, rows, n_expert=8, n_used=2, complete=True):
+MODEL = "/models/q3/m-00001-of-00002.gguf"
+
+
+def _fake_set(root, name, layers, rows, n_expert=8, n_used=2, complete=True, model=MODEL):
     d = os.path.join(root, name)
     os.makedirs(d)
     with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
-        f.write("# router_trace — test\n# model_file\tm.gguf\n# build\tb0\n")
+        f.write("# router_trace — test\n")
+        if model is not None:
+            f.write(f"# model\t{model}\n")
+        f.write("# model_file\tm-00001-of-00002.gguf\n# build\tb0\n")
         f.write(f"# tokens\t{len(rows)}\n# n_expert\t{n_expert}\n# n_expert_used\t{n_used}\n")
         f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
         for l in layers:
@@ -147,6 +160,17 @@ def self_test():
         write(out, sets, lists, 4)
         text = open(out, encoding="utf-8").read()
         assert "# order\trank\n" in text and "# n_expert\t8\n" in text and "\n0\t3,5,1,0\n" in text, text
+        assert f"# model\t{MODEL}\n" in text, text
+        # Two quantizations of one model share their shard names: the full path tells them apart, and a
+        # set that states no path is refused, never compared as equal.
+        other = _fake_set(root, "other", [0, 1], [(3, 1)], model="/models/q3-requant/m-00001-of-00002.gguf")
+        for bad, what in ((other, "another file of the same basename"),
+                          (_fake_set(root, "nopath", [0, 1], [(3, 1)], model=None), "a set without # model")):
+            try:
+                learn([a, bad], 2)
+                raise AssertionError(f"{what} was accepted")
+            except rc.SetError:
+                pass
         c = _fake_set(root, "c", [0, 1], [(1, 2)], complete=False)
         try:
             learn([a, c], 2)
