@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use gguf::Split;
-use model::moe::{HostLayer, HostScratch, UnionScratch};
+use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
 use model::r8file::{R8Pair, R8Source};
 use model::{Tensor2, Tensor2View};
 
@@ -73,14 +73,22 @@ impl HostRun {
 
     /// The union's slabs for batch calls of up to `cols` columns of the
     /// run's routed width, made once: a load that never serves a batch never
-    /// holds them. A later call for no more columns than they hold keeps
-    /// them; one for more is refused by name (the slabs are the load's size).
-    /// Load-time only.
+    /// holds them. Past [`UNION_MAX_COLS`] they are a group tail's
+    /// ([`UnionScratch::new_tail`]) over whole batches of that many columns,
+    /// with room for every slot, so a call of `cols` columns runs as one. A
+    /// later call for no more columns than they hold keeps them; one for more
+    /// is refused by name (the slabs are the load's size). Load-time only.
     pub fn prepare_union(&mut self, cols: usize) -> Result<(), GpuError> {
         match &self.union {
             None => {
                 let w = self.widths;
-                self.union = Some(UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?);
+                self.union = Some(if cols <= UNION_MAX_COLS {
+                    UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?
+                } else {
+                    let groups = cols.div_ceil(UNION_MAX_COLS);
+                    let slots = groups * UNION_MAX_COLS * w.n_used;
+                    UnionScratch::new_tail(w.embd, w.ff, groups, slots, w.n_used)?
+                });
                 Ok(())
             }
             Some(u) if cols <= u.max_cols() => Ok(()),

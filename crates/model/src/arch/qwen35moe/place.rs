@@ -348,10 +348,45 @@ impl MtpPlan<'_> {
     }
 }
 
+/// The most positions a qwen4exp ubatch walk takes, the load's size at most:
+/// the card scratch the plan counts is the walk's at this size.
+pub const UBATCH_PLANNED: u64 = 4096;
+
+/// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
+/// arena's token-major rows, 136,996 f32 and 12 u32 a position — the
+/// embedding, the two stream buffers, the mix and sub-layer outputs, the
+/// attention and flash rows, the delta layer's, the selecting layer's and the
+/// PLE site's intermediates, the shared expert's — 548,032 B; the walk's own
+/// buffers, 110,000.125 B — the 32-value activations of the model-width, the
+/// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
+/// mixes' scratch (97,712 B: the normed streams and the up's rows at 40,960 B
+/// each, their activations, the down's and inject's dots, the bottleneck and
+/// its activations, the weights), the indexer keys, the slots and the
+/// one-expert table; the record's id word and the host sums (10,244 B);
+/// rounded up].
+pub const UBATCH_TOKEN_BYTES: u64 = 668_277;
+
+/// Card bytes a qwen4exp ubatch walk holds whatever its size, at a cache of
+/// up to 2,000,000 positions [derived, an upper bound: the router's buffers
+/// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
+/// the selected flash's partials for eight rows of 24 heads over 33 segments
+/// of 64 keys, 6,538,752 B; the selection's queries and lists, 82,048 B; its
+/// scores, 8 B a cache position, 16,000,000 B at 2,000,000; rounded up to
+/// 32 MiB]. A load past that cache refuses its ubatch arena by name.
+pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
+
+/// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
+/// its load's allocations may not pass.
+#[must_use]
+pub const fn ubatch_scratch_bytes(u: u64) -> u64 {
+    u * UBATCH_TOKEN_BYTES + UBATCH_FIXED_BYTES
+}
+
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
 /// the card gathers), with this workstation's context, scratch, margin and
-/// host tier.
+/// host tier — the scratch with the ubatch walk's at [`UBATCH_PLANNED`]
+/// positions.
 #[must_use]
 pub fn machine(card: CardSpec, layers: usize) -> Machine {
     Machine {
@@ -359,7 +394,7 @@ pub fn machine(card: CardSpec, layers: usize) -> Machine {
             name: card.name.to_string(),
             usable_bytes: card.usable_bytes(),
             context_bytes: CONTEXT,
-            scratch_bytes: SCRATCH,
+            scratch_bytes: SCRATCH + ubatch_scratch_bytes(UBATCH_PLANNED),
             margin_bytes: MARGIN,
             granule_bytes: GRANULE,
             layers: 0..layers,

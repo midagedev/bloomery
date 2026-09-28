@@ -1,7 +1,8 @@
 //! Qwen3.8's resident state on the card: each layer's store, and the arena
 //! every layer of one walk shares (they run in turn) for up to `rows` tokens
-//! — the decode step's one, an eager pass's up to [`PASS_ROWS`]. Everything
-//! is allocated once at load. Buffers are token-major (`[rows][width]`)
+//! — the decode step's one, an eager pass's up to [`PASS_ROWS`], a ubatch
+//! walk's up to its load-time size ([`Arena38::wide`]). Everything is
+//! allocated once at load. Buffers are token-major (`[rows][width]`)
 //! unless their comment names another layout; a unit of `m <= rows` tokens
 //! uses the first `m` rows.
 //!
@@ -29,13 +30,24 @@ use std::mem::ManuallyDrop;
 /// The most tokens an eager pass walks: the m-column kernels' width.
 pub(super) const PASS_ROWS: usize = 8;
 
+/// The most rows one selection and one selected flash take: a pass selects
+/// its rows in one launch, a ubatch walk its selecting rows in runs of this
+/// many.
+pub(super) const SELECT_ROWS: usize = qsa::MAX_ROWS;
+
+/// The most tokens one router launch of a ubatch walk takes, and so one
+/// routed table over them: 2,048 tokens at the router's eleven slots a token
+/// fit one GEMM route table, and a 4,096-token ubatch routes in two.
+pub(super) const ROUTE_ROWS: usize = 2048;
+
 // The card's rings keep the rows the plan counts them by.
 const _: () = assert!(
     linear::PASS_ROWS == stores::PASS_ROWS
         && linear::RING_ROWS == stores::conv_ring_rows(linear::CONV_TAPS)
         && ple::RING_ROWS == stores::ple_ring_rows(ple::TAPS, ple::DILATION)
-        && PASS_ROWS == qsa::MAX_ROWS
+        && PASS_ROWS <= SELECT_ROWS
         && PASS_ROWS <= stores::PASS_ROWS
+        && ROUTE_ROWS * (geo::N_USED + 1) <= crate::gemm::GEMM_MAX_SLOTS
 );
 
 /// Lanes of a delta store's state: a verify of up to this many rows keeps
@@ -307,6 +319,42 @@ impl Arena38 {
                 format!("{rows} rows; an arena holds 1..={PASS_ROWS}"),
             ));
         }
+        let route = RouterOut::with_tokens(stream, router, rows)?;
+        Arena38::alloc(stream, rows, rows, route, ctx)
+    }
+
+    /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
+    /// of `ctx` positions: every token-major buffer for `rows` tokens, the
+    /// selection's scratch and the selected flash's partials for
+    /// [`SELECT_ROWS`] (its selecting rows run in runs of that many), the
+    /// router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
+    /// Load-time only.
+    pub(super) fn wide(
+        stream: &CudaStream,
+        router: RouterDims,
+        rows: usize,
+        most: usize,
+        ctx: usize,
+    ) -> Result<Arena38, GpuError> {
+        if !(1..=most).contains(&rows) {
+            return Err(GpuError::shape(
+                "qwen4exp::Arena38::wide",
+                format!("{rows} rows; a ubatch arena holds 1..={most}"),
+            ));
+        }
+        let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
+        Arena38::alloc(stream, rows, rows.min(SELECT_ROWS), route, ctx)
+    }
+
+    /// The buffers for `rows` tokens, the selection's for `sel` rows, the
+    /// router's `route`.
+    fn alloc(
+        stream: &CudaStream,
+        rows: usize,
+        sel: usize,
+        route: RouterOut,
+        ctx: usize,
+    ) -> Result<Arena38, GpuError> {
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, rows * n);
         let (h, wide) = (geo::HIDDEN, geo::STREAMS * geo::HIDDEN);
@@ -341,12 +389,12 @@ impl Arena38 {
                 k: f(geo::KV)?,
                 v: f(geo::KV)?,
                 q: f(geo::ATTN)?,
-                part_v: DeviceBuffer::zeroed(stream, partials_v_len_256(rows, geo::N_HEAD, width))?,
-                part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(rows, geo::N_HEAD, width))?,
+                part_v: DeviceBuffer::zeroed(stream, partials_v_len_256(sel, geo::N_HEAD, width))?,
+                part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(sel, geo::N_HEAD, width))?,
                 kr: f(geo::IDX_DIM)?,
                 qr: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 qi: f(geo::IDX_HEADS * geo::IDX_DIM)?,
-                sel: QsaScratch::new(stream, rows, ctx, geo::KEPT)?,
+                sel: QsaScratch::new(stream, sel, ctx, geo::KEPT)?,
             },
             ple: Ple38 {
                 e: f(h)?,
@@ -356,7 +404,7 @@ impl Arena38 {
                 ngv: f(wide)?,
                 gate: f(geo::STREAMS)?,
             },
-            route: RouterOut::with_tokens(stream, router, rows)?,
+            route,
             sel: u(geo::N_USED)?,
             ffn_x: f(h)?,
             sh_g: f(geo::FF)?,
@@ -557,6 +605,90 @@ impl PassRecord {
             first: 0,
             lane: Some(&self.lane),
         })
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.inbox.bytes()
+    }
+}
+
+/// A ubatch walk's input record — its first position, up to `rows` ids and
+/// the lane word — and the window of the ids its last write holds.
+pub(super) struct WideRecord {
+    rows: usize,
+    ids: ManuallyDrop<DeviceBuffer<u32>>,
+    pos0: ManuallyDrop<DeviceBuffer<u32>>,
+    lane: ManuallyDrop<DeviceBuffer<u32>>,
+    inbox: Inbox,
+}
+
+impl WideRecord {
+    /// A zeroed record for up to `rows` ids. Load-time only.
+    pub(super) fn new(stream: &CudaStream, rows: usize) -> Result<WideRecord, GpuError> {
+        if rows == 0 {
+            return Err(GpuError::shape(
+                "qwen4exp::WideRecord::new",
+                "a record of no row",
+            ));
+        }
+        let inbox = Inbox::new(stream, IN_IDS + rows + 1)?;
+        // SAFETY: every window lies inside the inbox's `IN_IDS + rows + 1`
+        // device words, and the inbox moves into the struct beside them (a
+        // move of the handle, not of the allocation), where it outlives them.
+        let (ids, pos0, lane) = unsafe {
+            (
+                param_view::<u32>(inbox.dev(), IN_IDS, 1),
+                param_view::<u32>(inbox.dev(), IN_POS0, 1),
+                param_view::<u32>(inbox.dev(), IN_IDS + rows, 1),
+            )
+        };
+        Ok(WideRecord {
+            rows,
+            ids,
+            pos0,
+            lane,
+            inbox,
+        })
+    }
+
+    /// Write `tokens` (1..=`rows`) from position `pos` and the lane word,
+    /// enqueue the record's copy, and window its ids. Asynchronous: the walk
+    /// behind it reads it.
+    pub(super) fn write(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        let (n, rows) = (tokens.len(), self.rows);
+        if !(1..=rows).contains(&n) {
+            return Err(GpuError::shape(
+                "qwen4exp::WideRecord::write",
+                format!("{n} rows; a ubatch takes 1..={rows}"),
+            ));
+        }
+        let host = self.inbox.host_mut()?;
+        put_input(host, tokens, pos)?;
+        host[IN_IDS + rows] = LANE;
+        self.inbox.upload(stream, IN_IDS + rows + 1)?;
+        // SAFETY: `IN_IDS + n <= IN_IDS + rows`, inside the inbox's device
+        // words, which outlive the window (it lives in the struct beside
+        // them).
+        let ids = unsafe { param_view::<u32>(self.inbox.dev(), IN_IDS, n) };
+        let old = std::mem::replace(&mut self.ids, ids);
+        drop(ManuallyDrop::into_inner(old).into_raw_parts());
+        Ok(())
+    }
+
+    /// The input of the last write's ubatch, as its first launch reads it.
+    pub(super) fn io(&self) -> Io<'_> {
+        Io {
+            ids: &self.ids,
+            pos0: &self.pos0,
+            first: 0,
+            lane: Some(&self.lane),
+        }
     }
 
     /// Device bytes.
