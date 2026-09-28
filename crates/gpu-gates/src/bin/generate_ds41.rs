@@ -40,14 +40,15 @@
 //! ranks (`app::arch::deepseek41::tier_of`), with the DSpark draft's reserve
 //! when the draft runs (its header's bytes, read before the load; the draft
 //! then sits on the 3090, and a `BLOOMERY_DSPARK_CARD` naming another card is
-//! refused). Under `bp` every prompt goes one decode step per id — the tier
-//! has no batch port — and a `call feed` record after the `load` line says
-//! so; the `load` line's `cards=` names every card the placement loaded and,
-//! under `bp`, the tier's experts and resident bytes (`tier_experts=`,
-//! `tier_bytes=`). A lost tier card (it stops signalling within the go
-//! deadline) is the step's named error and ends the run with a nonzero
-//! exit. The card is found by
-//! name, so the box's card pin decides which placements can load. The ring
+//! refused), and the tier's prompt-batch bytes (its staging and tile scratch
+//! for blocks of the host union's columns, from the file's header): a prompt
+//! call under `bp` is fed as `BLOOMERY_PREFILL` says, as under `a`, the tier
+//! serving its experts' slots of each batch. The `load` line's `cards=`
+//! names every card the placement loaded and, under `bp`, the tier's experts
+//! and resident bytes (`tier_experts=`, `tier_bytes=`). A lost tier card (it
+//! stops signalling within the go deadline) is the step's or the call's named
+//! error and ends the run with a nonzero exit. The card is found by name, so
+//! the box's card pin decides which placements can load. The ring
 //! shadows are page-locked host memory: the `plan` line prints the plan's
 //! figure (`host_shadow=`), the `load` line the allocation
 //! (`shadow=host <bytes>`) and the card's unified addressing the load
@@ -620,8 +621,7 @@ mod drive {
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;
         let check_finite = finite_lever(&a, draft, &levers)?;
-        let mut cfg = body::OpenCfg::from_levers(&levers)?;
-        let feed = place::feed_under(a.place, &mut cfg);
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let batched = !check_finite && cfg.body.prefill == body::PrefillMode::Batch;
         if a.plan {
             refuse_plan(&a, draft, batched)?;
@@ -670,6 +670,10 @@ mod drive {
 
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let tier_batch = place::tier_batch(
+            a.place,
+            &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
+        );
         // The finite probe feeds step by step, outside the prompt call.
         let feed_mode = if check_finite {
             body::PrefillMode::Steps
@@ -678,7 +682,7 @@ mod drive {
         };
         let args = OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(reserve)?,
+            machine: a.place.machine(reserve, tier_batch)?,
             ctx: a.ctx,
             mode: a.mode,
             cfg: Ds41Cfg {
@@ -702,7 +706,6 @@ mod drive {
             hp: None,
             ctx_max: 0,
             call: None,
-            feed,
         };
         let Some(mut loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
             return Ok(());
@@ -919,8 +922,8 @@ mod drive {
             ),
             (
                 !batched,
-                "a feed of one step per id (BLOOMERY_PREFILL=steps, BLOOMERY_CHECK_FINITE=1 or \
-                 --place bp): it runs no batch",
+                "a feed of one step per id (BLOOMERY_PREFILL=steps or BLOOMERY_CHECK_FINITE=1): \
+                 it runs no batch",
             ),
         ];
         match beside.iter().find(|(set, _)| *set) {
@@ -1270,8 +1273,6 @@ mod drive {
         /// The plan's `ctx_max`, once planned.
         ctx_max: usize,
         call: Option<CallView>,
-        /// The placement's `call feed` record, printed after the `load`.
-        feed: Option<Record>,
     }
 
     impl OpenLog<Body> for Log<'_> {
@@ -1372,9 +1373,6 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.print();
                 }
-            }
-            if let Some(r) = self.feed.take() {
-                r.print();
             }
             Ok(())
         }

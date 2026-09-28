@@ -581,14 +581,6 @@ pub static LOAD_DRAFT: Kind = Kind {
     ],
 };
 
-/// A placement's prompt feed, when the placement decides it.
-pub static CALL_FEED: Kind = Kind {
-    name: "call_feed",
-    head: "call feed",
-    doc: "The prompt feed the placement holds every prompt call to, whatever BLOOMERY_PREFILL says, and why.",
-    parts: &[key("feed", Word, ""), key("why", Text, "")],
-};
-
 /// The step's capture.
 pub static CAPTURE: Kind = Kind {
     name: "capture",
@@ -1216,7 +1208,6 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
-    &CALL_FEED,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1254,7 +1245,6 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
     &CAPTURE,
-    &CALL_FEED,
     &IDS,
     &TEXT_CONSISTENT,
     &CHAT,
@@ -1268,7 +1258,6 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
-    &CALL_FEED,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,

@@ -19,7 +19,8 @@ use std::time::Instant;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
-use model::placement::{Machine, workstation};
+use model::placement::Machine;
+use model::placement::workstation::{self, TierBatchBytes};
 
 use crate::record::{self, Record};
 use crate::{GateError, ref_model_path};
@@ -54,11 +55,15 @@ impl Place {
 
     /// The machine the placement plans over, by layer count. `draft_bytes`
     /// is the DSpark draft's resident bytes when the draft is served on the
-    /// placement's tier card ([`Place::draft_card`]); only `bp` has one, and
-    /// a figure handed to another placement is refused by name.
+    /// placement's tier card ([`Place::draft_card`]); `batch` is the expert
+    /// tier's prompt-batch bytes the plan reserves on the tier card and the
+    /// host (the model's own figure, from its hyperparameters). Only `bp`
+    /// has a tier card: a figure handed to another placement is refused by
+    /// name, and `bp` without `batch` too.
     pub fn machine(
         self,
         draft_bytes: Option<u64>,
+        batch: Option<TierBatchBytes>,
     ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
         if draft_bytes.is_some() && self.draft_card().is_none() {
             return Err(format!(
@@ -67,10 +72,36 @@ impl Place {
             )
             .into());
         }
-        Ok(move |layers| match self {
-            Place::A => workstation::plan_a(layers),
-            Place::Gate => workstation::plan_gate(layers),
-            Place::Bp => workstation::plan_bp(layers, draft_bytes),
+        #[derive(Clone, Copy)]
+        enum Planned {
+            A,
+            Gate,
+            Bp(Option<u64>, TierBatchBytes),
+        }
+        let planned = match (self, batch) {
+            (Place::A, None) => Planned::A,
+            (Place::Gate, None) => Planned::Gate,
+            (Place::Bp, Some(b)) => Planned::Bp(draft_bytes, b),
+            (Place::A | Place::Gate, Some(_)) => {
+                return Err(format!(
+                    "--place {}: no tier card serves a prompt batch; the tier's batch reserve is \
+                     outside the plan",
+                    self.name()
+                )
+                .into());
+            }
+            (Place::Bp, None) => {
+                return Err(
+                    "--place bp: the plan reserves the expert tier's prompt-batch bytes, and none \
+                     were given"
+                        .into(),
+                );
+            }
+        };
+        Ok(move |layers| match planned {
+            Planned::A => workstation::plan_a(layers),
+            Planned::Gate => workstation::plan_gate(layers),
+            Planned::Bp(draft, b) => workstation::plan_bp(layers, draft, b),
         })
     }
 
@@ -111,28 +142,17 @@ impl Place {
     pub fn draft_card(self) -> Option<&'static str> {
         self.tier_card()
     }
-
-    /// Why a prompt under this placement is fed one decode step per id
-    /// whatever `BLOOMERY_PREFILL` says, or `None` where the lever decides:
-    /// the tier card has no batch port, and a prompt batch on a model with a
-    /// tier is refused by the host tier.
-    pub fn steps_only(self) -> Option<&'static str> {
-        match self {
-            Place::A | Place::Gate => None,
-            Place::Bp => Some(
-                "the expert tier card has no batch port (tierbatch): a prompt batch on a model \
-                 with a tier is refused, so the prompt goes one decode step per id",
-            ),
-        }
-    }
 }
 
-/// How [`Generator::open`] loads: the placement, the context the caches are
-/// sized for, the step mode, and whether the calling thread pins itself to
-/// the dispatcher's cpu slot (`BLOOMERY_PIN_MAIN` is the caller's to read).
+/// How [`Generator::open`] loads: the placement and the expert tier's
+/// prompt-batch bytes its plan reserves ([`Place::machine`]'s `batch`), the
+/// context the caches are sized for, the step mode, and whether the calling
+/// thread pins itself to the dispatcher's cpu slot (`BLOOMERY_PIN_MAIN` is
+/// the caller's to read).
 #[derive(Debug, Clone, Copy)]
 pub struct OpenArgs {
     pub place: Place,
+    pub tier_batch: Option<TierBatchBytes>,
     pub ctx: usize,
     pub mode: StepMode,
     pub pin_main: bool,
@@ -166,7 +186,7 @@ impl<B: ChainBody> Generator<B> {
         let path = ref_model_path()?;
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let machine = args.place.machine(None)?;
+        let machine = args.place.machine(None, args.tier_batch)?;
         let mut model = open(file, &machine, args.ctx)?;
         model.set_mode(args.mode);
         let load = Record::new(&record::LOAD_GENERATOR)

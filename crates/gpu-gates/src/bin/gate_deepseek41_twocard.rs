@@ -23,22 +23,29 @@
 //! (`PlanLevers::card_budget_bytes`, the field `BLOOMERY_CARD_BUDGET` sets;
 //! the lever itself is refused here so the environment cannot move the
 //! sets): it caps every card, the tier's too, so the A6000 holds the stage's
-//! and the tier's sets at once. Every prompt goes one decode step per id, the
-//! feed `--place bp` holds. The recipe ranks the experts by the serving hot
-//! list (`BLOOMERY_HOT_LIST`), so the tier holds each layer's next hot ranks
-//! and the precondition below is met by routing, not by chance.
+//! and the tier's sets at once. Every load feeds a prompt call as a prompt
+//! batch (`PrefillMode::Batch`, set here; `BLOOMERY_PREFILL` is refused, so
+//! the environment cannot move the feed, and the reference and the tiered
+//! loads run the same one): on a tiered load the tier serves its experts'
+//! slots of each batch. The recipe ranks the
+//! experts by the serving hot list (`BLOOMERY_HOT_LIST`), so the tier holds
+//! each layer's next hot ranks and the preconditions below are met by
+//! routing, not by chance.
 //!
-//! - `--union`: from a reset, the prose prompt [`PROMPT`] one step per id and
-//!   [`STEPS`] greedy steps, every position's argmax and logits read; then
-//!   from a reset with the draft started over, the prompt through the draft's
-//!   prompt call and [`PASSES`] DSpark passes, each pass's kept tokens and
-//!   its rows' logits read. Every token, kept count and logits vector of the
-//!   two-card run (and of the loopback) bit for bit the reference's, the
-//!   stage's step graph of the reference's node count. Precondition: every
-//!   layer the tier holds experts of was sent at least one routed slot over
-//!   the two-card run (the tier's per-layer hits), and the pair passes kept
-//!   and rejected a proposal each at least once, or the run proves nothing
-//!   and fails by name.
+//! - `--union`: from a reset, the first [`PROMPT`] ids of the prose prompt
+//!   one decode step per id and [`STEPS`] greedy steps, every position's
+//!   argmax and logits read; then from a reset with the draft started over,
+//!   the first [`CALL_PROMPT`] ids as one prompt call through the draft's
+//!   (one batch, the draft fed the call's feature rows) and [`PASSES`] DSpark
+//!   passes, each pass's kept tokens and its rows' logits read. Every token,
+//!   kept count and logits vector of the two-card run (and of the loopback)
+//!   bit for bit the reference's, the stage's step graph of the reference's
+//!   node count. Preconditions: every layer the tier holds experts of was
+//!   sent at least one routed slot over the two-card run (the tier's
+//!   per-layer hits), and by the prompt call alone, whose batch the tier
+//!   served (its batch services); the pair passes kept and rejected a
+//!   proposal each at least once; or the run proves nothing and fails by
+//!   name.
 //! - `--lost`: on the two-card model, the tier's stream held behind a host
 //!   flag before a step — the tier stops signalling: within the go deadline
 //!   and its grace the step fails naming the lost card, no token comes out,
@@ -75,6 +82,7 @@ mod gate {
     use app::arch::deepseek41::{CardDraft, Ds41Cfg};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::HostFlags;
+    use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::PoisonKind;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{
@@ -86,7 +94,7 @@ mod gate {
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
-    use model::arch::deepseek41::place::PlanInputs;
+    use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::dspark::DraftHparams;
     use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row, workstation};
     use runtime::{Advance, Speculative, Target};
@@ -101,6 +109,9 @@ mod gate {
     const BUDGET: u64 = 16 << 30;
     /// Prompt positions, fed one decode step each.
     const PROMPT: usize = 32;
+    /// Prompt positions of the DSpark leg's prompt call, one batch: sixteen
+    /// chunks, one sub-block of the batch-wide projections.
+    const CALL_PROMPT: usize = 128;
     /// Greedy steps after the prompt.
     const STEPS: usize = 48;
     /// DSpark passes after the prompt.
@@ -153,14 +164,11 @@ mod gate {
         Ok(ids)
     }
 
-    /// Plan (b′) with the draft's `reserve` on the tier card; with
-    /// `loopback`, the tier card renamed to the A6000, every figure kept.
-    fn machine(layers: usize, reserve: u64, loopback: bool) -> Machine {
-        let mut m = workstation::plan_bp(layers, Some(reserve));
-        if loopback {
-            for t in &mut m.tiers {
-                t.name = workstation::A6000.name.to_owned();
-            }
+    /// Plan (b′) `m` with its tier card renamed to the A6000, every figure
+    /// kept: the loopback's.
+    fn looped(mut m: Machine) -> Machine {
+        for t in &mut m.tiers {
+            t.name = workstation::A6000.name.to_owned();
         }
         m
     }
@@ -362,11 +370,11 @@ mod gate {
         Ok(o)
     }
 
-    /// The session's configuration: `cfg`, every prompt one step per id.
+    /// The session's configuration: `cfg`, its prompt feed the body's.
     fn ds41(cfg: &OpenCfg) -> Ds41Cfg {
         Ds41Cfg {
             open: cfg.clone(),
-            feed: PrefillMode::Steps,
+            feed: cfg.body.prefill,
             card_timing: false,
         }
     }
@@ -402,6 +410,42 @@ mod gate {
         /// Pair passes that kept their proposal, and that rejected it.
         accepts: usize,
         rejects: usize,
+        /// What the prompt call alone sent the tier; `None` without one.
+        call: Option<Sent>,
+    }
+
+    /// What a span of a run sent the tier: its hits per layer from the
+    /// tier's first layer, and the batch services it enqueued.
+    struct Sent {
+        first: usize,
+        hits: Vec<u64>,
+        stats: TierBatchStats,
+    }
+
+    /// The tier's per-layer hits and batch counters since load; `None`
+    /// without a tier.
+    fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
+        let hybrid = m.body(NAME)?.hybrid();
+        Ok(hybrid.tier().map(|t| Sent {
+            first: t.set().layers().start,
+            hits: t.stats().layer_hits,
+            stats: hybrid.tier_batch_stats(),
+        }))
+    }
+
+    /// The counters `after` less `before`: what the span between sent.
+    fn sent_between(before: Option<Sent>, after: Option<Sent>) -> Option<Sent> {
+        let (b, a) = (before?, after?);
+        Some(Sent {
+            first: a.first,
+            hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
+            stats: TierBatchStats {
+                served: a.stats.served - b.stats.served,
+                settles: a.stats.settles - b.stats.settles,
+                settle_early: a.stats.settle_early - b.stats.settle_early,
+                settle_ns: a.stats.settle_ns - b.stats.settle_ns,
+            },
+        })
     }
 
     /// The step run, then the DSpark run (module header).
@@ -411,7 +455,7 @@ mod gate {
         s.reset()?;
         spec.draft_mut().restart()?;
         let mut tok = 0;
-        for &id in prompt {
+        for &id in &prompt[..PROMPT] {
             tok = s.model_mut().step(&[id])?;
             run.tokens.push(tok);
             run.logits.push(s.model().logits()?);
@@ -424,7 +468,9 @@ mod gate {
         }
         s.reset()?;
         spec.draft_mut().restart()?;
-        let mut last = spec.draft_mut().feed_call(s, prompt)?;
+        let before = tier_counts(s.model())?;
+        let mut last = spec.draft_mut().feed_call(s, &prompt[..CALL_PROMPT])?;
+        run.call = sent_between(before, tier_counts(s.model())?);
         run.tokens.push(last);
         run.logits.push(s.model().logits()?);
         let mut out = Vec::with_capacity(PAIR_ROWS);
@@ -510,7 +556,7 @@ mod gate {
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.place.card_budget_bytes = Some(BUDGET);
-        cfg.body.prefill = PrefillMode::Steps;
+        cfg.body.prefill = PrefillMode::Batch;
         let draft = dspark::draft_hparams()?;
         let path = ref_model_path()?;
         let reserve = dspark::draft_reserve(Place::Bp, &draft.0, &path)?
@@ -518,13 +564,11 @@ mod gate {
         let inputs = PlanInputs::read(
             &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
         )?;
+        let bp = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
         let layers = inputs.model.layers;
-        let (two, looped) = (
-            machine(layers, reserve, false),
-            machine(layers, reserve, true),
-        );
+        let (two, lmachine) = (bp(layers), looped(bp(layers)));
         let plan = inputs.plan(&two, workstation::CTX_MAX, &cfg.place)?;
-        let lplan = inputs.plan(&looped, workstation::CTX_MAX, &cfg.place)?;
+        let lplan = inputs.plan(&lmachine, workstation::CTX_MAX, &cfg.place)?;
         let tier_n = plan.tier_n_l.first().ok_or("plan (b′) has no tier")?;
         let tier_layers: Vec<usize> = (0..layers)
             .filter(|&l| tier_n.get(l).is_some_and(|&n| n > 0))
@@ -570,7 +614,7 @@ mod gate {
                 .into());
             }
         }
-        let prompt = prose(PROMPT)?;
+        let prompt = prose(PROMPT.max(CALL_PROMPT))?;
 
         let reference = if args.union {
             let uplan = union_plan(&plan)?;
@@ -588,7 +632,7 @@ mod gate {
         if let (Some(want), true) = (&reference, args.loopback) {
             let mut o = open(
                 &path,
-                |l| machine(l, reserve, true),
+                |l| looped(bp(l)),
                 &cfg,
                 &draft,
                 workstation::A6000.name,
@@ -596,14 +640,9 @@ mod gate {
             let got = union_run(&mut o, &prompt)?;
             drop(o);
             pass &= same("loopback", want, &got);
+            pass &= call_sent_every("loopback", got.call.as_ref(), &tier_layers);
         }
-        let mut o = open(
-            &path,
-            |l| machine(l, reserve, false),
-            &cfg,
-            &draft,
-            workstation::RTX_3090.name,
-        )?;
+        let mut o = open(&path, bp, &cfg, &draft, workstation::RTX_3090.name)?;
         if let Some(want) = &reference {
             let got = union_run(&mut o, &prompt)?;
             pass &= same("two cards", want, &got);
@@ -658,6 +697,7 @@ mod gate {
                 );
                 pass = false;
             }
+            pass &= call_sent_every("two cards", got.call.as_ref(), &tier_layers);
         }
         if args.lost {
             pass &= lost_case(o.s.model_mut(), &prompt)?;
@@ -668,6 +708,51 @@ mod gate {
         }
         println!("PASSED: {NAME}");
         Ok(())
+    }
+
+    /// The prompt call's precondition on the load `what`: the call alone
+    /// sent every layer of `tier_layers` at least one routed slot and the
+    /// tier served its batch; prints its counters.
+    fn call_sent_every(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} call precondition: the load holds no tier card");
+            return false;
+        };
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let st = sent.stats;
+        println!(
+            "{what} call tier: {CALL_PROMPT} positions, {} batch services, {} settles ({} early, \
+             {:.2} ms waited), hits per layer {:?}",
+            st.served,
+            st.settles,
+            st.settle_early,
+            st.settle_ns as f64 / 1e6,
+            tier_layers.iter().map(|&l| hit(l)).collect::<Vec<_>>()
+        );
+        if missing.is_empty() && st.served > 0 {
+            println!(
+                "ok {what} call precondition: the prompt batch sent every tier layer a routed \
+                 slot, the tier served it"
+            );
+            true
+        } else {
+            println!(
+                "FAIL {what} call precondition: tier layers {missing:?} were sent no routed slot \
+                 by the prompt call, {} batch services; the batched clause proves nothing there",
+                st.served
+            );
+            false
+        }
     }
 
     /// `--lost`: the tier's stream held behind a host flag before a step.

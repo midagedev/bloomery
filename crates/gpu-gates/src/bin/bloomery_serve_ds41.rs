@@ -17,10 +17,10 @@
 //! nvidia-smi index — under `--place bp` (plan (b′): plan (a) on the A6000,
 //! the 3090 an expert tier; see `generate_ds41`) the tier card's row too,
 //! with no `layers`; when an index cannot be found the placement is left
-//! out, with the reason on stderr. Under `bp` every prompt goes one decode
-//! step per id (the `call feed` record after the `load` line says why), and
-//! a lost tier card is an engine error like any other: the request's 500 and
-//! `/health`'s 503 carry its message, which names the card.
+//! out, with the reason on stderr. Under `bp` a prompt call is fed as
+//! `BLOOMERY_PREFILL` says, the tier serving its experts' slots of each
+//! batch, and a lost tier card is an engine error like any other: the
+//! request's 500 and `/health`'s 503 carry its message, which names the card.
 //!
 //! The server serves the lesser of `--ctx` and the positions V4.1 is computed
 //! at (`Hparams::candidate_free_positions`): `/props`' `n_ctx` is that number,
@@ -131,7 +131,8 @@ mod drive {
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::dspark::DraftHparams;
-    use model::placement::{HotList, Machine, Plan, PlanLevers, workstation};
+    use model::placement::workstation::{self, TierBatchBytes};
+    use model::placement::{HotList, Machine, Plan, PlanLevers};
     use runtime::{Committed, Lookup, Speculative, Target, Want};
     use serve::{
         CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
@@ -212,8 +213,7 @@ mod drive {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
-        let mut cfg = body::OpenCfg::from_levers(&levers)?;
-        let feed = place::feed_under(a.place, &mut cfg);
+        let cfg = body::OpenCfg::from_levers(&levers)?;
         let draft = Draft::from_levers(&levers)?;
         // The draft's file is read before the target's load, which takes a minute.
         let draft_file = match draft {
@@ -243,8 +243,10 @@ mod drive {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         let model = model_props(&split, &inputs.model);
+        let tier_batch = place::tier_batch(a.place, &inputs.hp);
         drop(split);
-        let (card, placement, headroom) = print_plan(&inputs, a.place, reserve, a.ctx, &cfg.place)?;
+        let (card, placement, headroom) =
+            print_plan(&inputs, a.place, reserve, tier_batch, a.ctx, &cfg.place)?;
         let cache_ram = a.cache_ram.unwrap_or_else(|| {
             u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP))
         });
@@ -270,7 +272,7 @@ mod drive {
             draft,
             draft_file,
             reserve,
-            feed,
+            tier_batch,
         };
         let engine = Ds41Engine::spawn(
             move || V41::open(open),
@@ -299,7 +301,8 @@ mod drive {
     }
 
     /// The plan the engine is about to load under the placement's `levers`
-    /// (with `reserve`, the DSpark draft's, on its tier card), on stderr;
+    /// (with `reserve`, the DSpark draft's, and `tier_batch`, the tier's
+    /// prompt-batch bytes, on its tier card), on stderr;
     /// returns its cards' names, the plan's placement for `/props` (`None`,
     /// and a line saying why, when a card's nvidia-smi index cannot be found)
     /// and the plan's host headroom in bytes.
@@ -307,10 +310,11 @@ mod drive {
         inputs: &PlanInputs,
         place: Place,
         reserve: Option<u64>,
+        tier_batch: Option<TierBatchBytes>,
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
-        let machine = place.machine(reserve)?(inputs.model.layers);
+        let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         record::plan(place.name(), &machine, &plan, hot_list).eprint();
@@ -348,8 +352,8 @@ mod drive {
         draft_file: Option<(Split, DraftHparams)>,
         /// The draft's reserve on the placement's tier card.
         reserve: Option<u64>,
-        /// The placement's `call feed` record, printed after the `load`.
-        feed: Option<Record>,
+        /// The tier's prompt-batch bytes on the placement's tier card.
+        tier_batch: Option<TierBatchBytes>,
     }
 
     /// The draft the seat serves, verified by the pair pass.
@@ -402,15 +406,14 @@ mod drive {
         /// lines), the draft `a.draft` names on it (its `load draft=dspark`
         /// line before the capture, the pair pass's capture after it), on
         /// the calling thread, pinned to the dispatcher's cpu slot when asked.
-        fn open(mut a: SeatArgs) -> Result<V41, GateError> {
+        fn open(a: SeatArgs) -> Result<V41, GateError> {
             let pinned = a.pin_main && threads::pool().pin_caller();
             let t = Instant::now();
             let file =
                 Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
-            let feed = a.feed.take();
             let args = app::OpenArgs {
                 place: a.place.name(),
-                machine: a.place.machine(a.reserve)?,
+                machine: a.place.machine(a.reserve, a.tier_batch)?,
                 ctx: a.ctx,
                 mode: StepMode::Graph,
                 cfg: Ds41Cfg {
@@ -419,12 +422,7 @@ mod drive {
                     card_timing: false,
                 },
             };
-            let mut log = Log {
-                a: &a,
-                pinned,
-                t,
-                feed,
-            };
+            let mut log = Log { a: &a, pinned, t };
             let mut loaded = Loaded::<Body>::open(file, args, &mut log)?
                 .ok_or("bloomery-serve-ds41: the open planned nothing")?;
             let spark = match &a.draft_file {
@@ -765,8 +763,6 @@ mod drive {
         a: &'a SeatArgs,
         pinned: bool,
         t: Instant,
-        /// The placement's `call feed` record, printed after the `load`.
-        feed: Option<Record>,
     }
 
     impl OpenLog<Body> for Log<'_> {
@@ -814,9 +810,6 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.eprint();
                 }
-            }
-            if let Some(r) = self.feed.take() {
-                r.eprint();
             }
             Ok(())
         }
