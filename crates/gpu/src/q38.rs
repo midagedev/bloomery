@@ -37,7 +37,9 @@
 //!
 //! No silent failure: an embedding id past the table raises
 //! [`FaultSite::TokenId`] and writes a NaN row; a position at or past the
-//! raw plane raises [`FaultSite::CachePos`] and writes nothing; a raw key that
+//! raw plane raises [`FaultSite::CachePos`] and writes nothing; a card slot's
+//! place that is neither a card expert nor [`HOST`] raises
+//! [`FaultSite::ExpertId`] and writes its token's card sum NaN; a raw key that
 //! is not finite after its f16 rounding raises [`FaultSite::PoolSelect`]; an
 //! input or a result of the two f32 products, or of the combine with the card
 //! sum, that is not finite raises [`FaultSite::F32Product`] (a card slot's
@@ -46,6 +48,7 @@
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
+use crate::hybrid::HOST;
 use crate::route_core::sigmoid;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -322,7 +325,14 @@ mod q38_kernels {
     /// zero of `down[(10t + j)·n + d]` by `w[11t + j]`, in ascending `j <
     /// 10`, over the slots whose place `sel[10t + j]` is below `n_card` — this
     /// order is the gate (`runtime::combine::card_sum`). No other slot's
-    /// down row or weight is read.
+    /// down row or weight is read. A [`HOST`] place is the host's slot and
+    /// raises nothing; a place in `[n_card, HOST)` is no expert either side
+    /// serves: it raises [`FaultSite::ExpertId`] on `fault` and its token's
+    /// values are NaN.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -342,6 +352,7 @@ mod q38_kernels {
         n: u32,
         m: u32,
         n_card: u32,
+        fault: FaultSink,
         mut acc: DisjointSlice<f32>,
     ) {
         let (n, m) = (n as usize, m as usize);
@@ -368,6 +379,11 @@ mod q38_kernels {
                     )
                 };
                 a = ds.mul_add(ws, a);
+            } else if place != HOST {
+                if d == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+                a = f32::NAN;
             }
         }
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
@@ -473,7 +489,8 @@ pub struct SharedAddArgs<'a> {
 /// slots — their down outputs slot-major (`n` values a slot, token `t`'s
 /// slots from `SLOTS · t`), the router's weights ([`W_PITCH`] a token) and
 /// the slots' places (the card's below `n_card`, the layer's card expert
-/// count) — and the sum's output, `n` values a token.
+/// count; the host's [`HOST`]) — the sink a place that is neither raises
+/// on, and the sum's output, `n` values a token.
 pub struct CardAccArgs<'a> {
     pub down: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
@@ -481,6 +498,7 @@ pub struct CardAccArgs<'a> {
     pub n: usize,
     pub m: usize,
     pub n_card: usize,
+    pub fault: FaultSink,
     pub acc: &'a mut DeviceBuffer<f32>,
 }
 
@@ -754,7 +772,8 @@ impl Q38Kernels {
     /// Enqueue the card slots' sum ([`CardAccArgs`], module doc): `down`
     /// `SLOTS·n·m` values, `w` `W_PITCH·m`, `sel` `SLOTS·m`, `acc` `n·m`. A
     /// card of no expert is refused by name: a layer without card experts has
-    /// no card sum and keeps [`Q38Kernels::enqueue_shared_add`]. One launch.
+    /// no card sum and keeps [`Q38Kernels::enqueue_shared_add`]. A place in
+    /// `[n_card, HOST)` raises [`FaultSite::ExpertId`] on `a.fault`. One launch.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_card_acc(
         &self,
@@ -792,6 +811,7 @@ impl Q38Kernels {
             launch_u32(what, "n", a.n)?,
             launch_u32(what, "m", a.m)?,
             launch_u32(what, "n_card", a.n_card)?,
+            a.fault,
             a.acc,
         )?;
         Ok(())

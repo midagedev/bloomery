@@ -434,9 +434,11 @@ mod q5_kernels {
     /// quantizes column `c0 + j` of `x` into the same column of the outputs
     /// ([`q5_quant_group`], so a column's bytes are the plain quantizer's)
     /// when its slot's place `sel[j]` is below `n_card`, the card's experts,
-    /// and returns before any load otherwise: a slot the host serves has no
-    /// activation here, and its column keeps what it held. A non-finite value
-    /// of a card column raises [`FaultSite::Q5Quant`] on `fault`.
+    /// and returns before any load otherwise: a slot the host serves
+    /// ([`HOST`]) has no activation here, and its column keeps what it held.
+    /// A place in `[n_card, HOST)`, no expert either side serves, raises
+    /// [`FaultSite::ExpertId`] on `fault` first. A non-finite value of a card
+    /// column raises [`FaultSite::Q5Quant`] on `fault`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -475,10 +477,14 @@ mod q5_kernels {
         let (j, g) = (grp / n_groups as usize, grp % n_groups as usize);
         // SAFETY: j < m_cols <= sel.len() by the launch contract. The 32 lanes
         // share `grp`, hence `j`: the return is warp-uniform.
-        if unsafe { *sel.get_unchecked(j) } >= n_card {
+        let place = unsafe { *sel.get_unchecked(j) };
+        let lane = warp::lane_id() as usize;
+        if place >= n_card {
+            if place != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
             return;
         }
-        let lane = warp::lane_id() as usize;
         // SAFETY: column c0 + j < c0 + m_cols and g < n_groups by the lines
         // above; the launch contract bounds x, q, s8 and d8 at c0 + m_cols
         // columns, and the group index is warp-uniform.
@@ -1176,8 +1182,10 @@ impl Q5Kernels {
     /// Enqueue [`q5_kernels::q5_quantize_q8_sel`]: the 32-value q8_1 form of
     /// the columns `q.cols` of `q.x` whose slot's place is on the card
     /// ([`QuantSel`], the K-quant quantizer's selection), into the same
-    /// columns of `act`; every other column of `act` keeps what it held. The
-    /// input of a `_sel` down over the card's slots (`q5_1_gemv_sel`). One
+    /// columns of `act`; every other column of `act` keeps what it held, and
+    /// one whose place is in `[n_card, HOST)` raises [`FaultSite::ExpertId`]
+    /// on `fault`. The input of a `_sel` down over the card's slots
+    /// (`q5_1_gemv_sel`). One
     /// launch. Asynchronous, allocation-free, capturable.
     pub fn enqueue_quantize_q8_sel(
         &self,
