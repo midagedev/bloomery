@@ -1567,9 +1567,10 @@ impl SwapMachine {
         Ok(bytes)
     }
 
-    /// Enqueue on the copy stream, behind this boundary's event and the
-    /// staging word, layer `l`'s expert `id` into free slot `spare` of each
-    /// stack, and hand the staging thread its job (preparing `victim` first).
+    /// Hand the staging thread layer `l`'s expert `id` as a job (preparing
+    /// `victim` first), then enqueue on the copy stream, behind this
+    /// boundary's event and the job's staging word, its copy into free slot
+    /// `spare` of each stack.
     /// Every stack's destination is resolved before anything is enqueued.
     /// The bytes it copies.
     fn copy_into(
@@ -1615,6 +1616,24 @@ impl SwapMachine {
             .collect::<Result<Vec<_>, _>>()?;
         let n = self.jobs_issued;
         let (ring, ticket) = ring_ticket(n)?;
+        // The job goes to the staging thread before its commands go on the
+        // copy stream: the first of them waits for the staging, so a job
+        // sent after them would leave this thread enqueueing behind a wait
+        // only it can release, and a job longer than the stream's queue
+        // would block the enqueue for good.
+        let job = Job {
+            n,
+            layer: l,
+            id,
+            victim,
+            ring,
+            ticket,
+        };
+        self.tx
+            .as_ref()
+            .and_then(|tx| tx.send(job).ok())
+            .ok_or_else(|| GpuError::protocol(WHAT, "the staging thread has stopped"))?;
+        self.jobs_issued += 1;
         let copy = Arc::clone(&self.copy);
         copy.wait(&self.boundary_event)?;
         let staged = self.shared.words.dev_at(2 * ring * WORD_STRIDE);
@@ -1635,19 +1654,6 @@ impl SwapMachine {
             &mut [op_write(drained, ticket)],
             "swap: ring drained",
         )?;
-        self.jobs_issued += 1;
-        let job = Job {
-            n,
-            layer: l,
-            id,
-            victim,
-            ring,
-            ticket,
-        };
-        self.tx
-            .as_ref()
-            .and_then(|tx| tx.send(job).ok())
-            .ok_or_else(|| GpuError::protocol(WHAT, "the staging thread has stopped"))?;
         Ok(at as u64)
     }
 

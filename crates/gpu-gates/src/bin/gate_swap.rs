@@ -84,14 +84,17 @@
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
 //!   before the preparation ends.
-//! - queue: a reset under a closed window (as the engine's step port leaves
-//!   it between passes), with a source that adds [`INFLATE`] copy stream
-//!   commands to each part it copies, returns within [`QUEUE_BOUND`] with
-//!   every layer back at its seed: the reset's copies stage as they are
-//!   issued, a ring's worth at a time, so the host never blocks enqueuing
-//!   behind copies nothing stages (its mutant: the reset's copies all
-//!   enqueued, the flush turned on only after the last). A watchdog thread
-//!   names a reset past the bound, then ends the process.
+//! - queue: with a source that adds [`INFLATE`] copy stream commands to each
+//!   part it copies (one job then carries more than the stream queues), a
+//!   run to its last flip and a reset under a closed window (as the engine's
+//!   step port leaves it between passes) finish within [`QUEUE_BOUND`], every
+//!   layer back at its seed: a job reaches the staging thread before its
+//!   commands reach the copy stream, and the reset's copies stage as they
+//!   are issued, a ring's worth at a time, so the host never blocks
+//!   enqueuing behind copies nothing stages (its mutants: the job sent after
+//!   its commands; the reset's copies all enqueued with the flush turned on
+//!   only after the last). A watchdog thread names a clause past the bound,
+//!   then ends the process.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -151,13 +154,13 @@ mod gate {
     const HOLD_SETTLE: Duration = Duration::from_millis(200);
     const DELAY: u64 = 3;
     /// Copy stream commands the queue arm's source adds to each part it
-    /// copies: a reset's seed copies then carry tens of thousands, far past
-    /// what a stream queues before an enqueue blocks.
+    /// copies: one job then carries thousands and a reset's seed copies tens
+    /// of thousands, past what a stream queues before an enqueue blocks.
     const INFLATE: usize = 2048;
-    /// The queue arm's bound on its reset, which takes milliseconds when its
-    /// copies stage as they are issued.
+    /// The queue arm's bound on its run and reset, which take a few seconds
+    /// when every copy stages as it is issued.
     const QUEUE_BOUND: Duration = Duration::from_secs(20);
-    /// How long the queue arm's watchdog waits after naming a blocked reset
+    /// How long the queue arm's watchdog waits after naming a blocked clause
     /// before it ends the process: a stack watch (`BLOOMERY_GATE_STACKS`
     /// under this) dumps the blocked threads in between.
     const QUEUE_GRACE: Duration = Duration::from_secs(60);
@@ -1532,42 +1535,47 @@ mod gate {
         a: &Run,
     ) -> Result<bool, GateError> {
         let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
-        let faults = Faults {
-            inflate: INFLATE,
-            ..Faults::default()
-        };
-        let mut r = plain(gpu, pm, faults, DELAY)?;
-        drive(
-            gpu,
-            &mut r,
-            trace,
-            0..b_last as usize + 1,
-            Copies::Prompt,
-            Hold::None,
-        )?;
-        let driven = r.err.is_none();
-        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
-        let window = m.window();
-        window.store(0, Ordering::Release);
         let (done, watched) = mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
             if watched.recv_timeout(QUEUE_BOUND).is_err() {
-                // The reset is blocked inside the driver: nothing returns it,
+                // The host is blocked inside the driver: nothing returns it,
                 // so the process ends here, by name.
                 println!(
-                    "queue: the reset did not return in {QUEUE_BOUND:?}: the host blocked \
+                    "queue: the clause did not finish in {QUEUE_BOUND:?}: the host blocked \
                      enqueuing copies behind copies nothing stages FAIL"
                 );
                 std::thread::sleep(QUEUE_GRACE);
                 std::process::abort();
             }
         });
-        let t0 = Instant::now();
-        let reset = m.reset(gpu.stream(), &mut r.slots);
-        let took = t0.elapsed();
+        let run = || -> Result<_, GateError> {
+            let faults = Faults {
+                inflate: INFLATE,
+                ..Faults::default()
+            };
+            let mut r = plain(gpu, pm, faults, DELAY)?;
+            drive(
+                gpu,
+                &mut r,
+                trace,
+                0..b_last as usize + 1,
+                Copies::Prompt,
+                Hold::None,
+            )?;
+            let driven = r.err.is_none();
+            let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+            let window = m.window();
+            window.store(0, Ordering::Release);
+            let t0 = Instant::now();
+            let reset = m.reset(gpu.stream(), &mut r.slots);
+            let took = t0.elapsed();
+            window.store(1, Ordering::Release);
+            Ok((driven, reset, took))
+        };
+        let ran = run();
         let _ = done.send(());
         let _ = watchdog.join();
-        window.store(1, Ordering::Release);
+        let (driven, reset, took) = ran?;
         let rep = match reset {
             Ok(rep) => rep,
             Err(e) => {
