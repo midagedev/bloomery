@@ -28,7 +28,7 @@ pub const RELEASE: u32 = 1 << 30;
 
 /// How long a service waits for its go before it gives up and releases the
 /// stream.
-const GO_DEADLINE: Duration = Duration::from_secs(10);
+pub(super) const GO_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Spins between two clock reads while waiting for a go.
 const DEADLINE_POLL: u32 = 1 << 12;
@@ -457,6 +457,31 @@ impl Boundary {
         )
     }
 
+    /// The device addresses a go of row `row` writes: the row's layer word,
+    /// the generation and the region's sequence word.
+    pub(super) fn go_words(
+        &self,
+        row: usize,
+        what: &'static str,
+    ) -> Result<(sys::CUdeviceptr, sys::CUdeviceptr, sys::CUdeviceptr), GpuError> {
+        self.page_of(row, what)?;
+        Ok((
+            self.page.dev_at(Word::Lyr(row).offset()),
+            self.page.dev_at(Word::Gen.offset()),
+            self.region.cu_deviceptr() + 4 * self.layout.handoff().seq as u64,
+        ))
+    }
+
+    /// The device address of row `row`'s counter, which a wait takes back.
+    pub(super) fn cnt_word(
+        &self,
+        row: usize,
+        what: &'static str,
+    ) -> Result<sys::CUdeviceptr, GpuError> {
+        self.page_of(row, what)?;
+        Ok(self.page.dev_at(Word::Cnt(row).offset()))
+    }
+
     /// The region's sequence word, which every go adds one to.
     pub(super) fn seq_word(&self) -> &DeviceBuffer<u32> {
         &self.seq
@@ -594,6 +619,9 @@ pub struct StepPort {
     capturing: bool,
     /// A step service's refusal its step's caller has not yet named.
     pub(super) step_refusal: Option<Refusal>,
+    /// Routed slots the last one-column service's handoff sent to the tier
+    /// card: the tier's hits of that layer, which the host tier counts.
+    pub(super) tier_slots: u64,
     /// For the row overlap in `stats`: the layer whose host ids row 0 of a
     /// two-row pass served last ([`Chain::Pair`] services only), `None` until
     /// a pair's row 0 is served, and those ids, with room for `n_used` made
@@ -631,6 +659,7 @@ impl StepPort {
             chain: Chain::Step,
             capturing: false,
             step_refusal: None,
+            tier_slots: 0,
             pair_row0: None,
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
@@ -704,6 +733,11 @@ impl StepPort {
         if self.capturing {
             self.captured[self.chain.index()].push((layer, row));
         }
+        self.capturing
+    }
+
+    /// Whether the chain being enqueued is a capture.
+    pub(super) fn is_capturing(&self) -> bool {
         self.capturing
     }
 
@@ -853,6 +887,7 @@ impl StepPort {
         // list's room. A card's or the tier's id is theirs.
         self.list.clear();
         let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
+        let mut tier_slots = 0u64;
         let mut unknown = None;
         for s in 0..h.n_used {
             let (Some(id), Some(wb)) = (
@@ -868,10 +903,12 @@ impl StepPort {
                     self.list.push((id, w));
                     w2_host += f64::from(w) * f64::from(w);
                 }
-                Some(Slot::Card(_) | Slot::Tier(_)) => {}
+                Some(Slot::Card(_)) => {}
+                Some(Slot::Tier(_)) => tier_slots += 1,
                 None => unknown = unknown.or(Some((s, id))),
             }
         }
+        self.tier_slots = tier_slots;
         if !payload_f32_into(page, image_off, h.x, words, &mut self.x.data) {
             return Err(GpuError::shape(
                 what,

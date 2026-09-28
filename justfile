@@ -1003,6 +1003,18 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select':
 gate-gpu-ds41-skew *ARGS='--structure --sets --api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_skew && bash tools/gpu-gate.sh gate_deepseek41_skew {{ARGS}}'
 
+# V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
+# 게이트 계획은 핫 리스트(router/hotlist-384.txt)로 층마다 가장 뜨거운 n_l개를 카드에 두고, 층 계획은 그중 순위가 낮은
+# 23개(순위 n_l−23 … n_l)를 장치 1(층)로 옮긴 것이다((b′) 모양). 기준은 게이트 계획 자체(합집합이 한 카드에)다. 두 적재는
+# 차례로, 기준 먼저. --union(T1): 산문 프롬프트 16위치를 한 스텝씩, 탐욕 32스텝, 쌍 4번(그래프),
+# 프롬프트와 4스텝(eager)이 기준과 argmax·logits 비트까지 같고 스테이지 그래프 노드 수가 같다; 전제: 층이 가진 층마다
+# 라우팅된 슬롯이 한 번 이상 갔다. --fault(T2): 층 카드 폴트가 스텝의 오류·독, 리셋 뒤 기준과 같다. --lost(T3): 층
+# 스트림을 호스트 플래그 뒤에 묶으면 데드라인 안에 카드 상실 이름, CardLost 독, 다음 스텝·리셋 거절. --two(T7): 두 장치에
+# 같은 전문가가 있는 계획은 업로드 전에 이름으로 거절. 3090, 게이트 락.
+[group('v41-load')]
+gate-gpu-ds41-tier *ARGS='--union --fault --lost --two':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
+
 # V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
 # --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
 # six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any

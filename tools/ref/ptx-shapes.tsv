@@ -44,6 +44,7 @@ generate_ds41   ds41_ffn_handoff                        0          0
 generate_ds41   ds41_ffn_handoff_10                     0          0
 generate_ds41   ds41_ffn_handoff_10_cols                0          0
 generate_ds41   ds41_ffn_handoff_8                      0          0
+generate_ds41   ds41_ffn_handoff_tier                   0          0
 generate_ds41   ds41_ffn_places                         0          0
 generate_ds41   ds41_ffn_post                           0          0
 generate_ds41   ds41_ffn_post_8                         0          0
@@ -51,6 +52,8 @@ generate_ds41   ds41_ffn_post_batch                     0          0
 generate_ds41   ds41_ffn_post_batch_streams             0          0
 generate_ds41   ds41_ffn_post_streams                   0          0
 generate_ds41   ds41_ffn_post_streams_8                 0          0
+generate_ds41   ds41_ffn_post_streams_tier              0          0
+generate_ds41   ds41_ffn_post_tier                      0          0
 generate_ds41   ds41_glue_embed                         0          0
 generate_ds41   ds41_glue_embed_q3k                     0          0
 generate_ds41   ds41_glue_engram_rows                   0          0
@@ -217,6 +220,7 @@ generate_ds41   rope                                    0          0
 generate_ds41   router_topk                             0          0
 generate_ds41   swiglu                                  0          0
 generate_ds41   swiglu_quant32                          0          0
+generate_ds41   tier_fault_copy                         0          0
 generate_ds41   touch                                   0          0
 generate_ds41   weighted_sum                            0          0
 
@@ -367,5 +371,6 @@ gate_e2e        rope                                    0          0
 gate_e2e        router_topk                             0          0
 gate_e2e        swiglu                                  0          0
 gate_e2e        swiglu_quant32                          0          0
+gate_e2e        tier_fault_copy                         0          0
 gate_e2e        touch                                   0          0
 gate_e2e        weighted_sum                            0          0
