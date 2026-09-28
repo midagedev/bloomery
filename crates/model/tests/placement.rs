@@ -8,16 +8,23 @@
 //! per-type formats, the per-token read). `BLOOMERY_PLACEMENT_TABLE=1` also
 //! prints the per-tensor table.
 //!
+//! A (b′) test plans the A6000 as (a) with the 3090 as an expert tier, with
+//! and without the DSpark draft's reserve (`BLOOMERY_DSPARK_MODEL`, whose
+//! card bytes it pins too): the A6000's rows are plan (a)'s, and the tier
+//! holds each layer's next ranks, the per-layer totals even.
+//!
 //! A third test pins what a hot list changes: which experts a card keeps,
 //! never how many or at what bytes. A fourth pins what a card budget is: the
 //! card's usable bytes, so the A6000 under the 3090's budget plans the gate
 //! placement's experts, and a budget below the dense floor is refused.
 //!
-//! Two synthetic contracts need no file and run in the fast loop: a tensor
+//! Synthetic contracts need no file and run in the fast loop: a tensor
 //! its role puts on a card, of a type with no card format, is refused by
 //! name, while a routed stack of such a type stays on the host; a dense FFN
 //! sits on its layer's card and a never-loaded tensor is placed nowhere,
-//! even with a layer past the model's.
+//! even with a layer past the model's; the tier rule (the next ranks, the
+//! fewest-first fill, reserves), a tier that claims a stage refused by name,
+//! and an expert on two cards refused by name.
 //!
 //! `hw_`: needs the V4.1 shards on the box (`just gate-placement`);
 //! `BLOOMERY_V41_MODEL` names another first shard. The plan inputs are this
@@ -25,14 +32,16 @@
 //! gate (`gate_load_v41`) plans from too.
 
 use std::fmt::Write as _;
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
+use model::arch::dspark::{self, DraftCardBytes};
 use model::arch::glm5next::place::card_routed;
 use model::placement::{
-    self, CardFormat, CardTotals, Device, Format, HotList, KvBytes, Machine, ModelTensor,
-    ModelTensors, PlacementError, Plan, PlanLevers, Role, workstation,
+    self, Card, CardFormat, CardTotals, Device, ExpertList, Format, HotList, KvBytes, Machine,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -231,10 +240,10 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
     let _ = writeln!(out, "{title}, ctx_max {}", n(plan.ctx_max));
     let sources: Vec<String> = kv.sources().map(|(l, r)| format!("{l}(r={r})")).collect();
     let _ = writeln!(out, "  compressed-stream sources: {}", sources.join(" "));
-    for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
+    for (card, t) in plan.machine.all_cards().zip(&plan.cards) {
         let _ = writeln!(
             out,
-            "  {} layers {:?}{}: dense {}  experts {} ({})  rounding {}  KV {}  scratch {}  context {}  headroom {}",
+            "  {} layers {:?}{}: dense {}  experts {} ({})  rounding {}  KV {}  scratch {}  context {}  reserves {}  headroom {}",
             card.name,
             card.layers,
             if card.head { " +head" } else { "" },
@@ -245,6 +254,7 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
             n(t.kv_bytes),
             n(t.scratch_bytes),
             n(t.context_bytes),
+            n(t.reserve_bytes),
             n(t.headroom_bytes)
         );
     }
@@ -332,7 +342,10 @@ fn table(out: &mut String, plan: &Plan<'_>) {
         let t = &plan.model.tensors[r.tensor];
         for s in &r.segments {
             let device = match s.device {
-                Device::Card(c) => plan.machine.cards[c].name.clone(),
+                Device::Card(c) => plan
+                    .machine
+                    .card(c)
+                    .map_or(format!("#{c}"), |k| k.name.clone()),
                 Device::Host => "host".to_string(),
                 Device::Nvme => "nvme".to_string(),
                 Device::Unused => "-".to_string(),
@@ -600,6 +613,302 @@ fn hw_placement_3090_a6000_cut20() {
     );
 }
 
+/// An expert tier card's pinned side of a (b′) plan: its totals, and the
+/// band of its per-layer counts on the layers that can hold experts.
+struct TierPin {
+    experts: u64,
+    expert_bytes: u64,
+    rounding: u64,
+    reserve: u64,
+    headroom: i128,
+    n_l: (u64, u64),
+}
+
+// PIN(2026-09-28): the public file, plan (b′) with no draft: the 3090 as expert tier. The gate read the value derived on paper.
+const PUB_BP_TIER: TierPin = TierPin {
+    experts: 1_401,
+    expert_bytes: 23_499_141_120,
+    rounding: 165_122_048,
+    reserve: 0,
+    headroom: 1_082_130_432,
+    n_l: (36, 37),
+};
+// PIN(2026-09-28): the public file, plan (b′) with the DSpark draft's reserve on the 3090. The gate read the value derived on paper.
+const PUB_BP_TIER_DRAFT: TierPin = TierPin {
+    experts: 889,
+    expert_bytes: 14_911_303_680,
+    rounding: 114_790_400,
+    reserve: 8_629_780_480,
+    headroom: 1_090_519_040,
+    n_l: (23, 24),
+};
+
+// PIN(2026-09-28): the draft's card bytes from its header and the public file's head and mask row. The gate read the value derived on paper.
+const DRAFT_BYTES: DraftCardBytes = DraftCardBytes {
+    weights: 8_514_626_592,
+    kv: 393_216,
+    rounding: 47_651_808,
+    scratch: dspark::SCRATCH_ALLOWANCE,
+};
+
+/// The draft file `BLOOMERY_DSPARK_MODEL` names — the recipe exports the
+/// V4.1 profile's `DSPARK_MODEL` (`tools/ref/models/deepseek41.sh`), the one
+/// owner of its path — refused by name when unset; another file misses the
+/// [`DRAFT_BYTES`] pins.
+fn draft_bytes(target: &Split) -> DraftCardBytes {
+    let path = std::env::var("BLOOMERY_DSPARK_MODEL").unwrap_or_else(|e| {
+        panic!("BLOOMERY_DSPARK_MODEL: {e} — `just gate-placement` exports the V4.1 profile's DSPARK_MODEL")
+    });
+    println!("DSpark draft: {path}");
+    let draft = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    dspark::card_bytes(&draft, target, workstation::GRANULE)
+        .unwrap_or_else(|e| panic!("the draft's card bytes of {path}: {e}"))
+}
+
+/// The segments `plan` puts on card `c`, row by row: (tensor, format,
+/// experts, resident bytes).
+fn on_card(plan: &Plan<'_>, c: usize) -> Vec<(usize, Format, Option<String>, u64)> {
+    plan.rows
+        .iter()
+        .flat_map(|r| {
+            r.segments
+                .iter()
+                .filter(|s| s.device == Device::Card(c))
+                .map(|s| {
+                    (
+                        r.tensor,
+                        s.format,
+                        s.experts.as_ref().map(ToString::to_string),
+                        s.resident_bytes,
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Plan (b′) against plan (a) and its tier pins: no violation; the A6000's
+/// rows, `n_l` and totals exactly plan (a)'s; the tier holds per layer the
+/// ranks after the A6000's `n_l` — the id order's here, the hot list's under
+/// a synthetic list — the per-layer totals within one of each other, the
+/// host exactly the rest; and the tier's totals and per-layer band pinned,
+/// with no draft and with the draft's reserve (its card bytes pinned too).
+fn bp_failures(
+    title: &str,
+    model: &ModelTensors,
+    a: &Plan<'_>,
+    bp: &Plan<'_>,
+    hot: Option<&HotList>,
+    want: &TierPin,
+) -> Vec<String> {
+    let mut bad: Vec<String> = bp
+        .violations()
+        .iter()
+        .map(|v| format!("{title}: {v}"))
+        .collect();
+    if bp.n_l != a.n_l {
+        bad.push(format!(
+            "{title}: A6000 n_l {:?}, plan (a)'s {:?}",
+            bp.n_l, a.n_l
+        ));
+    }
+    if card_line(&bp.cards[0]) != card_line(&a.cards[0]) {
+        bad.push(format!(
+            "{title}: A6000 (dense, experts B, experts, rounding, KV, headroom) {:?}, plan (a)'s {:?}",
+            card_line(&bp.cards[0]),
+            card_line(&a.cards[0])
+        ));
+    }
+    if on_card(bp, 0) != on_card(a, 0) {
+        bad.push(format!(
+            "{title}: the A6000's segments differ from plan (a)'s"
+        ));
+    }
+    let tier = &bp.tier_n_l[0];
+    let t = &bp.cards[1];
+    let p = |bad: &mut Vec<String>, what: &str, got: i128, pinned: i128| {
+        pin(bad, &format!("{title}: tier {what}"), got, pinned);
+    };
+    p(&mut bad, "dense", t.dense_bytes.into(), 0);
+    p(&mut bad, "KV", t.kv_bytes.into(), 0);
+    p(&mut bad, "experts", t.experts.into(), want.experts.into());
+    p(
+        &mut bad,
+        "expert bytes",
+        t.expert_bytes.into(),
+        want.expert_bytes.into(),
+    );
+    p(
+        &mut bad,
+        "allocator rounding",
+        t.rounding_bytes.into(),
+        want.rounding.into(),
+    );
+    p(
+        &mut bad,
+        "reserves",
+        t.reserve_bytes.into(),
+        want.reserve.into(),
+    );
+    p(&mut bad, "headroom", t.headroom_bytes, want.headroom);
+    let eligible: Vec<usize> = (0..model.layers).filter(|&l| a.n_l[l] > 0).collect();
+    let held: Vec<u64> = eligible.iter().map(|&l| tier[l]).collect();
+    let (lo, hi) = (
+        held.iter().min().copied().unwrap_or(0),
+        held.iter().max().copied().unwrap_or(0),
+    );
+    if (lo, hi) != want.n_l {
+        bad.push(format!(
+            "{title}: tier n_l {lo}–{hi} on the A6000's {} expert layers, the pinned band {}–{}",
+            eligible.len(),
+            want.n_l.0,
+            want.n_l.1
+        ));
+    }
+    for l in (0..model.layers).filter(|l| !eligible.contains(l)) {
+        if tier[l] != 0 {
+            bad.push(format!(
+                "{title}: tier layer {l} holds {} experts, the A6000 none",
+                tier[l]
+            ));
+        }
+    }
+    let totals: Vec<u64> = eligible.iter().map(|&l| a.n_l[l] + tier[l]).collect();
+    let (tlo, thi) = (
+        totals.iter().min().copied().unwrap_or(0),
+        totals.iter().max().copied().unwrap_or(0),
+    );
+    if thi > tlo + 1 {
+        bad.push(format!("{title}: per-layer totals {tlo}–{thi}, not even"));
+    }
+    let e = model.experts;
+    for r in &bp.rows {
+        let tensor = &bp.model.tensors[r.tensor];
+        let (Role::RoutedExperts, Some(l)) = (tensor.role, tensor.layer) else {
+            continue;
+        };
+        let (n, k) = (a.n_l[l], tier[l]);
+        let ranks: Vec<u32> = match hot {
+            Some(h) => h.ranked(l).iter().copied().take((n + k) as usize).collect(),
+            None => (0..(n + k) as u32).collect(),
+        };
+        let mut want_tier = ranks[n as usize..].to_vec();
+        want_tier.sort_unstable();
+        let mut got_tier = Vec::new();
+        let mut host = 0u64;
+        for s in &r.segments {
+            let ids = s.experts.as_ref().map_or(&[][..], |x| x.ids());
+            match s.device {
+                Device::Card(1) => got_tier.extend_from_slice(ids),
+                Device::Host => host += ids.len() as u64,
+                _ => {}
+            }
+        }
+        if got_tier != want_tier || host != e - n - k {
+            bad.push(format!(
+                "{title}: {}: tier {} ids, host {host}; want the ranks {n}..{} ({} ids) and the rest",
+                tensor.name,
+                got_tier.len(),
+                n + k,
+                want_tier.len()
+            ));
+        }
+    }
+    let (ah, bh) = (&a.host, &bp.host);
+    if (ah.experts - bh.experts, ah.expert_bytes - bh.expert_bytes) != (t.experts, t.expert_bytes) {
+        bad.push(format!(
+            "{title}: the host lost {} experts ({} B), the tier holds {} ({} B)",
+            ah.experts - bh.experts,
+            ah.expert_bytes - bh.expert_bytes,
+            t.experts,
+            t.expert_bytes
+        ));
+    }
+    println!(
+        "{title}: tier {} experts ({} B), rounding {}, reserves {}, headroom {}; tier n_l {lo}–{hi}, \
+         per-layer totals {tlo}–{thi}; tier n_l {:?}",
+        n(t.experts),
+        n(t.expert_bytes),
+        n(t.rounding_bytes),
+        n(t.reserve_bytes),
+        n(t.headroom_bytes),
+        tier
+    );
+    bad
+}
+
+#[test]
+#[ignore = "hw: needs the V4.1 shards and the DSpark draft on the box"]
+fn hw_placement_bp() {
+    let (split, model, kv) = open();
+    let ctx = workstation::CTX_MAX;
+    let a_machine = workstation::plan_a(model.layers);
+    let a = placement::plan_with(&model, &a_machine, ctx, &kv, None, None).expect("plan (a)");
+    let mut bad = Vec::new();
+
+    let d = draft_bytes(&split);
+    println!(
+        "DSpark draft on its card: weights {}  KV {}  rounding {}  scratch {}  total {}",
+        n(d.weights),
+        n(d.kv),
+        n(d.rounding),
+        n(d.scratch),
+        n(d.total())
+    );
+    let dp = |bad: &mut Vec<String>, what: &str, got: u64, want: u64| {
+        pin(bad, &format!("draft {what}"), got, want);
+    };
+    dp(&mut bad, "weights", d.weights, DRAFT_BYTES.weights);
+    dp(&mut bad, "KV", d.kv, DRAFT_BYTES.kv);
+    dp(&mut bad, "rounding", d.rounding, DRAFT_BYTES.rounding);
+    dp(&mut bad, "scratch", d.scratch, DRAFT_BYTES.scratch);
+
+    let mut out = String::new();
+    for (title, draft, want) in [
+        ("plan (b′) no draft", None, &PUB_BP_TIER),
+        ("plan (b′) + draft", Some(d.total()), &PUB_BP_TIER_DRAFT),
+    ] {
+        let machine = workstation::plan_bp(model.layers, draft);
+        let bp = placement::plan_with(&model, &machine, ctx, &kv, None, None)
+            .unwrap_or_else(|e| panic!("{title}: {e}"));
+        summary(&mut out, title, &bp, &kv);
+        bad.extend(bp_failures(title, &model, &a, &bp, None, want));
+    }
+
+    // A synthetic scattered list: the tier takes the list's next ranks,
+    // with the same counts and bytes as the id order.
+    let e = model.experts;
+    let mut text = format!("# n_expert\t{e}\n# order\trank\n");
+    for l in 0..model.layers as u64 {
+        let ids: Vec<String> = (0..e).map(|r| ((7 * r + l) % e).to_string()).collect();
+        let _ = writeln!(text, "{l}\t{}", ids.join(","));
+    }
+    let hot = HotList::parse("synthetic", &text).expect("the synthetic list parses");
+    let a_hot = placement::plan_with(&model, &a_machine, ctx, &kv, Some(&hot), None)
+        .expect("plan (a), list");
+    let machine = workstation::plan_bp(model.layers, None);
+    let bp_hot = placement::plan_with(&model, &machine, ctx, &kv, Some(&hot), None)
+        .expect("plan (b′), list");
+    bad.extend(bp_failures(
+        "plan (b′) no draft, synthetic list",
+        &model,
+        &a_hot,
+        &bp_hot,
+        Some(&hot),
+        &PUB_BP_TIER,
+    ));
+    println!("{out}");
+    println!(
+        "plan (b′): twoeng §0 derived 1,404 tier experts without the draft and 873 with it; {} failures",
+        bad.len()
+    );
+    assert!(
+        bad.is_empty(),
+        "plan (b′): {} failures\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
 /// A hot list moves which experts a card keeps, not how many: plan (a) with
 /// a scattered synthetic list — layer `l`'s rank `r` is expert
 /// `(7r + l) mod n_expert`, a permutation, so a card's experts fall in many
@@ -808,13 +1117,14 @@ fn hw_placement_card_budget_is_usable_bytes() {
             kv,
             context,
             scratch,
+            reserves,
             margin,
             ..
         }) => {
-            if floor != dense + kv + context + scratch + margin {
+            if floor != dense + kv + context + scratch + reserves + margin {
                 bad.push(format!(
                     "floor {floor} is not dense {dense} + KV {kv} + context {context} + scratch \
-                     {scratch} + margin {margin}"
+                     {scratch} + reserves {reserves} + margin {margin}"
                 ));
             }
             floor
@@ -1073,4 +1383,232 @@ fn dense_ffn_on_card_and_unused_nowhere() {
         unused.segments
     );
     assert_eq!(unused.read_bytes, 0);
+}
+
+/// `layers` layers of one q4_K routed stack each — 8 experts of 4 rows of
+/// 256 values, 576 B an expert — between the token embedding and a q8_0
+/// head (4,352 B on its card).
+fn layered_model(layers: usize) -> ModelTensors {
+    let mut tensors = vec![synthetic(
+        "token_embd.weight",
+        None,
+        Role::TokenEmbedding,
+        GgmlType::Q8_0,
+        &[16],
+    )];
+    for l in 0..layers {
+        tensors.push(synthetic(
+            &format!("blk.{l}.ffn_up_exps.weight"),
+            Some(l),
+            Role::RoutedExperts,
+            GgmlType::Q4_K,
+            &[4, 8],
+        ));
+    }
+    tensors.push(synthetic(
+        "output.weight",
+        None,
+        Role::Head,
+        GgmlType::Q8_0,
+        &[16],
+    ));
+    ModelTensors {
+        tensors,
+        layers,
+        experts: 8,
+        experts_used: 2,
+    }
+}
+
+/// A card of `usable` bytes on granule 1, so every buffer costs its bytes:
+/// running `layers` with the head, or a tier when `layers` is empty.
+fn byte_card(name: &str, usable: u64, layers: Range<usize>) -> Card {
+    Card {
+        name: name.to_string(),
+        usable_bytes: usable,
+        context_bytes: 0,
+        scratch_bytes: 0,
+        margin_bytes: 0,
+        granule_bytes: NonZeroU64::MIN,
+        head: !layers.is_empty(),
+        layers,
+        token_embedding: false,
+        reserves: Vec::new(),
+    }
+}
+
+const HEAD_Q8: u64 = 4_352;
+const EXPERT_Q4K: u64 = 576;
+
+/// Each card's experts per layer, by device, from the rows.
+fn held_ids(plan: &Plan<'_>, layer: usize) -> Vec<(Device, Vec<u32>)> {
+    plan.rows
+        .iter()
+        .filter(|r| plan.model.tensors[r.tensor].layer == Some(layer))
+        .flat_map(|r| {
+            r.segments.iter().map(|s| {
+                (
+                    s.device,
+                    s.experts.as_ref().map_or(Vec::new(), |e| e.ids().to_vec()),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The tier rule on three layers: the stage card keeps 5 experts in the id
+/// order's cycle (n_l 2, 2, 1) exactly as with no tier; the first tier fits
+/// 4 and fills the layer with the fewest first (1, 1, 2 — every total 3);
+/// the second tier, with a reserve of one expert's bytes, fits 3 after both
+/// (1, 1, 1); each takes the ranks after the ones before it; the host holds
+/// the rest; the tiers' reserves count in their totals; no invariant breaks.
+/// Under a hot list the same counts take the list's ranks.
+#[test]
+fn tier_takes_the_next_ranks_evenly() {
+    let model = layered_model(3);
+    let stage = byte_card("stage", HEAD_Q8 + 5 * EXPERT_Q4K, 0..3);
+    let mut t2 = byte_card("tier2", 4 * EXPERT_Q4K, 0..0);
+    t2.reserves.push(("draft".to_string(), EXPERT_Q4K));
+    let machine = Machine {
+        cards: vec![stage.clone()],
+        tiers: vec![byte_card("tier1", 4 * EXPERT_Q4K, 0..0), t2],
+        host: workstation::host(),
+    };
+    let alone = Machine {
+        cards: vec![stage],
+        tiers: Vec::new(),
+        host: workstation::host(),
+    };
+    let base = placement::plan_with(&model, &alone, 4096, &NoKv, None, None).expect("no tier");
+    let plan = placement::plan_with(&model, &machine, 4096, &NoKv, None, None).expect("tiers");
+    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+    assert_eq!(base.n_l, vec![2, 2, 1]);
+    assert_eq!(plan.n_l, base.n_l, "the stage card plans as with no tier");
+    assert_eq!(card_line(&plan.cards[0]), card_line(&base.cards[0]));
+    assert_eq!(plan.tier_n_l, vec![vec![1, 1, 2], vec![1, 1, 1]]);
+    let experts: Vec<u64> = plan.cards.iter().map(|c| c.experts).collect();
+    assert_eq!(experts, vec![5, 4, 3]);
+    assert_eq!(plan.cards[2].reserve_bytes, EXPERT_Q4K);
+    assert_eq!(plan.cards[2].headroom_bytes, 0);
+    assert_eq!(plan.host.experts, 3 * 8 - 12);
+    assert_eq!(
+        held_ids(&plan, 2),
+        vec![
+            (Device::Card(0), vec![0]),
+            (Device::Card(1), vec![1, 2]),
+            (Device::Card(2), vec![3]),
+            (Device::Host, vec![4, 5, 6, 7]),
+        ]
+    );
+
+    let text = "# n_expert\t8\n# order\trank\n0\t7,6,5,4,3,2,1,0\n1\t0,2,4,6,1,3,5,7\n2\t3,1,4,0,5,2,6,7\n";
+    let hot = HotList::parse("t", text).expect("a hot list");
+    let listed =
+        placement::plan_with(&model, &machine, 4096, &NoKv, Some(&hot), None).expect("listed");
+    assert!(listed.violations().is_empty(), "{:?}", listed.violations());
+    assert_eq!(
+        (listed.n_l.clone(), listed.tier_n_l.clone()),
+        (plan.n_l.clone(), plan.tier_n_l.clone())
+    );
+    assert_eq!(
+        held_ids(&listed, 2),
+        vec![
+            (Device::Card(0), vec![3]),
+            (Device::Card(1), vec![1, 4]),
+            (Device::Card(2), vec![0]),
+            (Device::Host, vec![2, 5, 6, 7]),
+        ]
+    );
+}
+
+/// A tier card runs no stage: one with layers, the head or the token
+/// embedding is refused by name, before anything is planned.
+#[test]
+fn tier_card_runs_no_stage() {
+    let model = layered_model(1);
+    let stage = byte_card("stage", HEAD_Q8, 0..1);
+    for (tier, what) in [
+        (byte_card("t", 0, 0..1), "it runs layers 0..1"),
+        (
+            Card {
+                head: true,
+                ..byte_card("t", 0, 0..0)
+            },
+            "it carries the head",
+        ),
+        (
+            Card {
+                token_embedding: true,
+                ..byte_card("t", 0, 0..0)
+            },
+            "it holds the token embedding",
+        ),
+    ] {
+        let machine = Machine {
+            cards: vec![stage.clone()],
+            tiers: vec![tier],
+            host: workstation::host(),
+        };
+        match placement::plan_with(&model, &machine, 4096, &NoKv, None, None) {
+            Err(e @ PlacementError::Tier { .. }) => {
+                assert_eq!(
+                    e.to_string(),
+                    format!("tier card t: {what}; a tier card runs no stage")
+                );
+            }
+            Err(e) => panic!("{what}: {e}, not the tier refusal"),
+            Ok(_) => panic!("{what}: the tier was planned"),
+        }
+    }
+}
+
+/// An expert on two cards is refused by name, with the tensor, the expert and
+/// both cards; disjoint lists split the stack with the rest on the host.
+#[test]
+fn expert_on_two_cards_is_refused_by_name() {
+    let model = layered_model(1);
+    let t = &model.tensors[1];
+    let list = |ids: Vec<u32>| ExpertList::new(ids, 8).expect("a list");
+    match placement::routed_row_on(
+        1,
+        t,
+        0,
+        vec![(0, list(vec![0, 1])), (1, list(vec![1, 2]))],
+        &model,
+    ) {
+        Err(e @ PlacementError::ExpertOnTwoCards { .. }) => assert_eq!(
+            e.to_string(),
+            "tensor blk.0.ffn_up_exps.weight: expert 1 is on card #0 and on card #1"
+        ),
+        Err(e) => panic!("{e}, not the two-card refusal"),
+        Ok(r) => panic!("an expert on two cards was placed: {:?}", r.segments),
+    }
+    let row = placement::routed_row_on(
+        1,
+        t,
+        0,
+        vec![(0, list(vec![0, 1])), (1, list(vec![2]))],
+        &model,
+    )
+    .expect("disjoint lists");
+    let got: Vec<(Device, String)> = row
+        .segments
+        .iter()
+        .map(|s| {
+            (
+                s.device,
+                s.experts
+                    .as_ref()
+                    .map_or(String::new(), ToString::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Device::Card(0), "0..2".to_string()),
+            (Device::Card(1), "2..3".to_string()),
+            (Device::Host, "3..8".to_string()),
+        ]
+    );
 }
