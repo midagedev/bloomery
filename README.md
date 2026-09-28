@@ -35,7 +35,7 @@ The DSpark draft for V4.1 speculative decoding is not a public upload: it is con
 
 ## How it works
 
-- **Hot list.** A router-frequency list (`BLOOMERY_HOT_LIST`) picks which experts stay on the card.
+- **Placement.** Each layer keeps a fixed number of routed experts on the card, the lowest ids by default. A router-frequency list (`BLOOMERY_HOT_LIST`) can pick them instead, but our lists were learned from the same corpora as our test prompts, so the headline numbers use none. Adaptive residency, which moves experts by the engine's own routing as it runs, is in progress.
 - **Engram rows from NVMe.** V4.1's engram table is read from NVMe, 48 rows a token, prefetched by a helper thread.
 - **Skewed pass.** Speculative decoding runs two positions one layer apart in one step and verifies a draft token: the DSpark draft (`BLOOMERY_DRAFT=dspark`) or an n-gram lookup (`BLOOMERY_DRAFT=lookup`).
 - **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B runs ubatches of up to 4096 tokens through an int8 tensor-core GEMM.
@@ -67,16 +67,16 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 
 | Model | Setup | Decode, tok/s | Prompt, tok/s | vs llama.cpp | rig-log |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, hot list, prose prompt of 512 | 44.8; **51.3** with the DSpark draft on the 3090 | — | not measured | [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps) |
-| DeepSeek-V4.1-Flash `Q3_K_M` | RTX 3090 + CPU, hot list, synthetic ids | 28.14 (depth 6), 28.92 (depth 4096) | 329.3 (P = 4096) | decode faster; prompt not measured | [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release) |
+| DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, hot list (in-sample), prose prompt of 512 | 44.8; **51.3** with the DSpark draft on the 3090 | — | not measured | [dspark-loop-tps](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#dspark-loop-tps) |
+| DeepSeek-V4.1-Flash `Q3_K_M` | RTX 3090 + CPU, hot list (not the default), synthetic ids | 28.14 (depth 6), 28.92 (depth 4096) | 329.3 (P = 4096) | decode faster; prompt not measured | [e21ref-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#e21ref-release) |
 | GLM-5.3-Flash `UD-Q4_K_XL` | A6000 + CPU, prose prompt | 20.95 (depth 512), 20.99 (depth 1024) | — | decode faster, but slower than its MTP draft; prompt slower | [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release) |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + every routed expert on the CPU | 40.46 (depth 6), 40.90 (depth 1024) | 105.7 (P = 512), 104.0 (P = 4096) | slower | [q38-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q38-release) |
 | Qwen3.6-35B-A3B `Q4_K_M` | A6000, whole model | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | faster | [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
 | Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | faster; near par in decode at depth 4096 | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
 
 - "vs llama.cpp" is the direction in the same window as the linked rig-log entry (decode and prompt alike unless it says otherwise): mainline llama.cpp, or the model's llama.cpp pull request. The rows from 2026-09-28 are provisional, as above.
-- The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, and the prompt's 512 ids are inside the list's training range: the row is in-sample, its favorable case. The warm re-measure uses held-out prompts ([`docs/fair-measure.md`](docs/fair-measure.md) §4.2).
-- GLM-5.3's prompt runs one step per token for now (about 21 tok/s), so it has no prompt value. With a hot list its decode is at least 28.14 at depth 512; that row is a lower bound, because its page faults were counted over the whole process.
+- The V4.1 hot list was built from routing traces of the same corpora the prose prompt comes from, and the prompt's 512 ids are inside the list's training range: the row is in-sample, its favorable case. Since 2026-09-28 the default placement is the id prefix, and no headline uses a hot list. The warm re-measure uses held-out prompts ([`docs/fair-measure.md`](docs/fair-measure.md) §4.2).
+- GLM-5.3's prompt runs one step per token for now (about 21 tok/s), so it has no prompt value. With a hot list (learned from earlier text of the same corpus: held out by position, but in-domain) its decode is at least 28.14 at depth 512; that row is a lower bound, because its page faults were counted over the whole process.
 - Qwen3.8's prompt is fed eight positions at a time; batched prompts are next. The rig-log entries carry the other engines' rows from the same windows, including where llama.cpp is ahead.
 
 ## Target hardware
