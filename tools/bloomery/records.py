@@ -15,6 +15,7 @@ it). A reader names a kind and a field; the syntax is this file's and record.rs'
                                                  `.FIELD*` every record's, one a line
   records.py check [--bin B] FILE...             the lines a kind's head opens that no kind reads whole:
                                                  read loose, or not at all (exit 1 when there is one)
+  records.py --self-test                         every kind's line read whole, and `check`'s passes
   records.py refresh                             `just records-refresh`'s stdin into the tree: each
                                                  `--records-schema` output into schema/<bin>.jsonl, and
                                                  after a `#> <path> <what>` line the generate_ds41
@@ -28,7 +29,7 @@ draft=`). A line of an older text that its kind's pattern no longer matches — 
 dropped since — is read loose when it opens with the kind's first field, or with any of its fields
 when no other kind shares its head: its `name=value` pairs by name, `loose` set, the bare values left
 out, a name the kind does not have kept in `extra`. A line of no kind (a library's `load host_tier`,
-a runner's own) is not a record.
+a runner's own) is not a record; `check` passes over the ones that open a kind's head (NOT_RECORDS).
 
 Exit status: 0; 1 `check` found a line; 2 a named refusal (a schema file missing or of another
 version); 64 a usage error.
@@ -54,6 +55,9 @@ VALUE = {
     "csv": r"\[[^\]]*\]",
 }
 FLOAT = r"-?(?:\d+(?:\.\d+)?|inf|NaN)"
+# Lines the binaries print under a kind's head that are no record: crates/model's host tier says how it
+# reads its experts (r8file.rs, moe.rs) with `load host_tier …` on stderr, outside record.rs.
+NOT_RECORDS = ("load host_tier ",)
 # A `name=` in a loose read: a field name opens with a letter or `_` (`tok/s(p50)` is one), so the
 # `(BLOOMERY_CED=` inside a text value is not.
 LOOSE_KEY = re.compile(r" ([A-Za-z_][\w/()]*)=")
@@ -319,6 +323,19 @@ def cmd_sh(argv):
     return 0
 
 
+def check_lines(schema, lines):
+    """(line number, what, line) of each line a kind's head opens that no kind reads whole; a line of
+    NOT_RECORDS is no record and is passed over."""
+    out = []
+    for n, line in enumerate(lines, 1):
+        if not schema.candidates(line) or line.startswith(NOT_RECORDS):
+            continue
+        r = schema.read_line(line)
+        if r is None or r.loose:
+            out.append((n, "no kind reads it" if r is None else f"read loose as {r.kind}", line))
+    return out
+
+
 def cmd_check(argv):
     bin_name, files = take_bin(argv)
     if not files:
@@ -326,14 +343,9 @@ def cmd_check(argv):
     schema = load(bin_name)
     found = 0
     for f in files:
-        for n, line in enumerate(Path(f).read_text(errors="replace").splitlines(), 1):
-            if not schema.candidates(line):
-                continue
-            r = schema.read_line(line)
-            if r is None or r.loose:
-                found += 1
-                what = "no kind reads it" if r is None else f"read loose as {r.kind}"
-                print(f"{f}:{n}: {what}: {line}")
+        for n, what, line in check_lines(schema, Path(f).read_text(errors="replace").splitlines()):
+            found += 1
+            print(f"{f}:{n}: {what}: {line}")
     return 1 if found else 0
 
 
@@ -378,7 +390,46 @@ def usage():
     raise SystemExit(64)
 
 
+SAMPLE = {"u64": "1", "i64": "-1", "bool": "true", "word": "w", "text": "t", "list": "[1,2]", "csv": "[a,b]"}
+
+
+def sample_line(kind):
+    """A line of `kind` with every part present: a value of each field's type, each flag set."""
+    out = [kind.head]
+    for p in kind.parts:
+        if "key" in p:
+            out.append(f" {p['key']}={'1.5' if p['ty'].startswith('f64') else SAMPLE[p['ty']]}")
+        elif "pos" in p:
+            out.append("1.5" if p["ty"].startswith("f64") else SAMPLE[p["ty"]])
+        elif "flag" in p:
+            out.append(f" {p['flag']}")
+        else:
+            out.append(p["lit"])
+    return "".join(out)
+
+
+def self_test():
+    schema = load(DEFAULT_BIN)
+    for k in schema.kinds:
+        line = sample_line(k)
+        r = schema.read_line(line)
+        assert r is not None and r.kind == k.name and not r.loose, (k.name, line, r and r.kind)
+        assert check_lines(schema, [line]) == [], (k.name, line)
+    # the host tier's own lines open the `load` head and are no record: check passes them over
+    tier = ["load host_tier r8=on (/models/m-r8/m-r8.gguf)", "load host_tier r8=off (BLOOMERY_R8=off)",
+            "load host_tier type=iq3_xxs k=4096 path=fused"]
+    assert all(schema.read_line(x) is None for x in tier), tier
+    assert check_lines(schema, tier) == [], check_lines(schema, tier)
+    # a `load` record missing its fields is still found, and so is a head no kind reads whole
+    found = check_lines(schema, ["load resident_bytes=1", "load host_tierx=1"])
+    assert [w for _, w, _ in found] == ["read loose as load", "no kind reads it"], found
+    print(f"records: self-test ok ({len(schema.kinds)} kinds)")
+    return 0
+
+
 def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
     cmds = {"parse": cmd_parse, "lines": cmd_lines, "sh": cmd_sh, "check": cmd_check, "refresh": cmd_refresh}
     if not argv or argv[0] not in cmds:
         usage()

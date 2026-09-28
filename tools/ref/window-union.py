@@ -3,7 +3,7 @@
 
     tools/ref/window-union.py <set> [<set>...] --n-l <spec> [--hot <file>] [--k 2,3,4,6]
                               [--ranges 0-1,2-9,10-19,20-29,30-39]
-                              [--policy static|strata --expert-bytes B --step-ms S [--gbps 26.28]]
+                              [--policy static|strata [--rule R] [--expert-bytes B --step-ms S [--gbps 26.28]]]
     tools/ref/window-union.py --self-test
 
 Each <set> is a router_trace directory (tools/ref/router-coverage.py's docstring has the format); a set
@@ -17,12 +17,16 @@ line `generate_ds41` prints (`card_experts=`, `n_l=<min>..<max> on <n> layers`) 
 --hot is a router-hotlist.py file: layer l's card keeps the first n_l ids of its line (rank order);
 without it, the id prefix [0, n_l), as the placement does without BLOOMERY_HOT_LIST.
 
---policy says what the card holds at each position. `static` (the default): the n_l experts above, all the
-way. `strata`: those n_l as the start, then Strata's swap rule at the setting ideaverify adopted, replayed
-over every token of the set with the copies priced on one link of --gbps (tools/ref/router-residency.py
-`adaptive`, which needs numpy; --expert-bytes and --step-ms are the model's and have no default): a slot is
-a host slot when its expert is not resident at that step. Under strata the `predict` column still reads the
-starting card set.
+--policy says how the card set moves over a set's positions: static (the default) keeps the set above
+for every position; strata starts from it and replays the swap rule --rule (tools/ref/router-residency.py's
+presets: mid, the default, strata or knee) over every position of the set, one position a pass, with
+router-residency's continuous `adaptive` replay (Strata's evict-then-admit). With --expert-bytes and
+--step-ms (the model's; no default, both or neither) the copies are priced on one link of --gbps (default
+26.28) and an admitted expert serves from the pass its copy has landed by; without them there is no link:
+it serves from the pass after the boundary that admits it, the rule's ceiling. A row's host experts are
+then its selections off the card at that position — a starting expert the rule evicts is a host expert.
+The replay needs numpy; static does not. Under strata the `predict` column still reads the starting card
+set: independent routing over a card set that moves has no closed form here.
 
 A window is k consecutive positions of one chunk (a window across a chunk edge crosses a context reset
 and is skipped). Per window and layer, U = |union of the rows' host experts| and S = the sum of the
@@ -38,10 +42,12 @@ Per set and k:
 then, per layer range, the pooled ratio per k. The last block (`all`) pools every set's windows.
 """
 import importlib.util
+import io
 import os
 import sys
 import tempfile
 from array import array
+from contextlib import redirect_stdout
 
 _here = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("router_coverage", os.path.join(_here, "router-coverage.py"))
@@ -132,31 +138,11 @@ def pct(sorted_v, q):
     return sorted_v[min(len(sorted_v) - 1, int(q * (len(sorted_v) - 1) + 0.5))]
 
 
-def strata_hits(s, n_l, card, expert_bytes, step_ms, gbps):
-    """Per layer, per token, per slot: resident under Strata's rule from `card` (router-residency.py)."""
-    rr = _load_residency()
-    layers = [l for l in s["layers"] if n_l[l] > 0]
-    X = rr.np.stack([rr.read_ids(s, l) for l in layers], axis=1)
-    lists = [sorted(card[l]) for l in layers]
-    rec = rr.np.zeros(X.shape, dtype=bool)
-    rr.adaptive(X, lists, [n_l[l] for l in layers], s["n_expert"], link=rr.Link(expert_bytes, gbps, step_ms),
-                record=rec)
-    hits = {l: [[False] * s["n_used"] for _ in range(s["tokens"])] for l in s["layers"]}
-    for i, l in enumerate(layers):
-        hits[l] = rec[:, i, :].tolist()
-    return hits
-
-
-def _load_residency():
-    spec = importlib.util.spec_from_file_location("router_residency", os.path.join(_here, "router-residency.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def measure(s, card, ks, hits=None):
+def measure(s, card, ks, on_card=None):
     """Per k: per-window (U, S) summed over layers, and per-layer Σ U, Σ S. A slot is a host slot when its
-    expert is not in `card` and, given `hits` (layer -> per token, per slot, resident), not resident."""
+    expert is not in `card` and, given `on_card` (layer -> per token, per slot, True where the selection is
+    on the card at that position: the strata replay), not on the card there. The strata report passes an
+    empty `card`, so the mask alone decides."""
     T, K, E = s["tokens"], s["n_used"], s["n_expert"]
     chunk = int(s["header"].get("chunk", T)) or T
     starts = {k: [w for w in range(T - k + 1) if w // chunk == (w + k - 1) // chunk] for k in ks}
@@ -166,13 +152,13 @@ def measure(s, card, ks, hits=None):
     for l in s["layers"]:
         ids = rc.read_topk(s, l)
         bit = [0 if e in card[l] else 1 << e for e in range(E)]
+        hit = on_card[l] if on_card is not None else None
         masks = [0] * T
         pops = array("l", [0]) * (T + 1)  # prefix sums of per-row host slots
-        hl = hits[l] if hits is not None else None
         for t in range(T):
             m = 0
             for k, e in enumerate(ids[t * K:(t + 1) * K]):
-                if hl is None or not hl[t][k]:
+                if hit is None or not hit[t][k]:
                     m |= bit[e]
             masks[t] = m
             pops[t + 1] = pops[t] + m.bit_count()
@@ -194,6 +180,32 @@ def measure(s, card, ks, hits=None):
     return win, per_layer, row_slots
 
 
+def strata_on_card(s, n_l, hot, rule_name, link=None):
+    """Per layer, the [T][K] on-card mask of the rule's continuous replay from the placement's card set;
+    link None admits with no copy time, else dict(expert_bytes, step_ms, gbps) prices each copy."""
+    rr = _router_residency()
+    np = rr.np
+    layers, T, K, E = s["layers"], s["tokens"], s["n_used"], s["n_expert"]
+    X = np.stack([np.frombuffer(rc.read_topk(s, l), dtype=np.uint16).astype(np.int64).reshape(T, K)
+                  for l in layers], axis=1)
+    seed = [np.asarray(hot.get(l, []), dtype=np.int64) if hot is not None else np.arange(E) for l in layers]
+    record = np.zeros((T, len(layers), K), dtype=bool)
+    try:
+        rr.adaptive(X, seed, [n_l[l] for l in layers], E, rr.Rule(rule_name), record=record,
+                    link=None if link is None else rr.Link(link["expert_bytes"], link["gbps"], link["step_ms"]))
+    except rr.ToolError as e:
+        raise rc.SetError(str(e)) from None
+    return {l: record[:, i, :].tolist() for i, l in enumerate(layers)}
+
+
+def _router_residency():
+    """tools/ref/router-residency.py, loaded on first use: it loads this file itself, and it needs numpy."""
+    spec = importlib.util.spec_from_file_location("router_residency", os.path.join(_here, "router-residency.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def summary(win_k):
     wu, ws = win_k
     ratios = sorted(u / sl for u, sl in zip(wu, ws) if sl)
@@ -208,11 +220,17 @@ def summary(win_k):
 
 
 def report(set_dirs, spec, hot_path, ks, ranges, policy=None):
+    """policy None is static; strata is dict(rule=<preset>, link=None or dict(expert_bytes, step_ms, gbps))."""
     sets = [rc.read_manifest(d) for d in set_dirs]
     hot = read_hot(hot_path) if hot_path else None
     ranges = [parse_range(r) for r in ranges.split(",")]
-    print(f"# window-union — n_l {spec}, card list {hot_path or 'id prefix'}, k {','.join(map(str, ks))}, "
-          f"policy {'static' if policy is None else 'strata ' + ' '.join(f'{k}={v}' for k, v in policy.items())}")
+    if policy is None:
+        what = "policy static"
+    else:
+        link = policy["link"]
+        what = (f"policy strata: rule {policy['rule']} from that card set, "
+                + ("no link" if link is None else " ".join(f"{k}={v}" for k, v in link.items())))
+    print(f"# window-union — n_l {spec}, card list {hot_path or 'id prefix'}, k {','.join(map(str, ks))}, {what}")
     pooled_all = {k: ([], []) for k in ks}
     layers_all = {k: {} for k in ks}
     slots_all = {}
@@ -225,10 +243,11 @@ def report(set_dirs, spec, hot_path, ks, ranges, policy=None):
               f"{len(s['layers'])} layers, card {sum(n_l.values())} experts "
               f"(n_l {min(n_l.values())}..{max(n_l.values())}), model {s['header'].get('model_file', '?')}, "
               f"build {s['header'].get('build', '?')}")
-        hits = None
+        on_card = None
         if policy is not None:
-            hits = strata_hits(s, n_l, card, policy["expert_bytes"], policy["step_ms"], policy["gbps"])
-        win, per_layer, row_slots = measure(s, card, ks, hits)
+            on_card = strata_on_card(s, n_l, hot, policy["rule"], policy["link"])
+        win, per_layer, row_slots = measure(s, card if on_card is None else {l: set() for l in s["layers"]}, ks,
+                                            on_card)
         print(f"host slots per row {sum(row_slots.values()):.1f} of {len(s['layers']) * s['n_used']}")
         print("k\twindows\tpredict\tmean\tp10\tp90\tpooled\tunion/window\tslots/window")
         for k in ks:
@@ -274,8 +293,9 @@ def print_ranges(per_layer, row_slots, ks, ranges):
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
-    sets, spec, hot, ks, ranges = [], None, None, DEFAULT_K, DEFAULT_RANGES
-    policy, link = "static", {"expert_bytes": None, "step_ms": None, "gbps": 26.28}
+    sets, spec, hot, ks, ranges, policy, rule = [], None, None, DEFAULT_K, DEFAULT_RANGES, "static", None
+    link = {"expert_bytes": None, "step_ms": None, "gbps": 26.28}
+    gbps_set = False
     it = iter(argv)
     for a in it:
         if a == "--n-l":
@@ -286,8 +306,11 @@ def main(argv):
             policy = next(it)
             if policy not in ("static", "strata"):
                 sys.exit(f"window-union: --policy {policy!r}: static or strata")
+        elif a == "--rule":
+            rule = next(it)
         elif a in ("--expert-bytes", "--step-ms", "--gbps"):
             link[a[2:].replace("-", "_")] = float(next(it))
+            gbps_set |= a == "--gbps"
         elif a == "--k":
             ks = tuple(int(x) for x in next(it).split(","))
         elif a == "--ranges":
@@ -300,11 +323,21 @@ def main(argv):
         sys.exit(__doc__)
     strata = None
     if policy == "strata":
-        if link["expert_bytes"] is None or link["step_ms"] is None:
-            sys.exit("window-union: --policy strata prices its copies: --expert-bytes and --step-ms are the model's")
-        strata = dict(link, expert_bytes=int(link["expert_bytes"]))
-    elif link["expert_bytes"] is not None or link["step_ms"] is not None:
-        sys.exit("window-union: --expert-bytes and --step-ms price the strata policy's copies; --policy static moves none")
+        if (link["expert_bytes"] is None) != (link["step_ms"] is None):
+            sys.exit("window-union: --expert-bytes and --step-ms price the strata copies together: "
+                     "both (a link) or neither (no link)")
+        if gbps_set and link["expert_bytes"] is None:
+            sys.exit("window-union: --gbps prices a link: it needs --expert-bytes and --step-ms")
+        priced = None
+        if link["expert_bytes"] is not None:
+            priced = dict(link, expert_bytes=int(link["expert_bytes"]))
+        strata = dict(rule=rule or "mid", link=priced)
+    else:
+        if rule is not None:
+            sys.exit("window-union: --rule needs --policy strata")
+        if link["expert_bytes"] is not None or link["step_ms"] is not None or gbps_set:
+            sys.exit("window-union: --expert-bytes, --step-ms and --gbps price the strata policy's copies; "
+                     "--policy static moves none")
     try:
         report(sets, spec, hot, ks, ranges, strata)
     except rc.SetError as e:
@@ -393,6 +426,40 @@ def self_test():
             assert measure(s_, c_, (2, 3), none) == base
             member = {0: [[e in c_[0] for e in ids[t * K:(t + 1) * K]] for t in range(s_["tokens"])]}
             assert measure(s_, {0: set()}, (2, 3), member) == base
+        # strata with nothing on the card is the static host-only measure, number for number
+        n0 = parse_n_l("0:0", same["layers"])
+        assert measure(same, {0: set()}, (2, 4), strata_on_card(same, n0, None, "mid")) == \
+            measure(same, {0: set()}, (2, 4))
+        # the rule moves the card set: seed {0} (the id prefix, n_l 1), every row (3, 7), rule mid. Boundary 4
+        # admits 3 for 0 (count 4 >= 0 + 3, ties to the lower id), serving from row 4: rows 0-3 put 3 and 7 on
+        # the host, rows 4-7 only 7. Windows of 2: three of U 2 / S 4, one across the flip of U 2 / S 3, three
+        # of U 1 / S 2 -> 11 / 21; static keeps 0 and reads 2 / 4 every window.
+        rows37 = rc.read_manifest(_fake_set(root, "rows37", {0: [(3, 7)] * 8}, E, K))
+        n1 = parse_n_l("0:1", rows37["layers"])
+        c1 = card_sets(rows37["layers"], n1, E, None)
+        empty = {0: set()}
+        win, per_layer, slots = measure(rows37, empty, (2,), strata_on_card(rows37, n1, None, "mid"))
+        assert per_layer[2][0] == (11, 21) and slots[0] == 1.5, (per_layer[2][0], slots[0])
+        assert measure(rows37, c1, (2,))[1][2][0] == (14, 28)
+        # the link: a 2.5 MB copy at 1 GB/s against 1 ms steps, issued at boundary 4 (4 ms), lands at 6.5 ms,
+        # so 3 serves from row 7: rows 0-6 put 3 and 7 on the host, row 7 only 7 -> six windows of U 2 / S 4
+        # and one of U 2 / S 3 -> 14 / 27
+        slow = dict(expert_bytes=2_500_000, step_ms=1.0, gbps=1.0)
+        win, per_layer, slots = measure(rows37, empty, (2,), strata_on_card(rows37, n1, None, "mid", slow))
+        assert per_layer[2][0] == (14, 27) and slots[0] == 15 / 8, (per_layer[2][0], slots[0])
+        # an evicted starting expert is a host expert: rows37 then a row (0, 7). Boundary 4 evicted 0 for 3, and
+        # nothing admits 0 back before row 8, so row 8 puts both 0 and 7 on the host: slots per row
+        # (4 x 2 + 4 x 1 + 2) / 9. Over the starting card {0} the mask would read 0 as served (13 / 9): the
+        # report hands measure an empty card under strata for this.
+        rows037 = rc.read_manifest(_fake_set(root, "rows037", {0: [(3, 7)] * 8 + [(0, 7)]}, E, K))
+        rec = strata_on_card(rows037, n1, None, "mid")
+        assert rec[0][8] == [False, False], rec[0][8]
+        assert measure(rows037, empty, (2,), rec)[2][0] == 14 / 9
+        assert measure(rows037, c1, (2,), rec)[2][0] == 13 / 9
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report([rows037["dir"]], "0:1", None, (2,), "0-0", dict(rule="mid", link=None))
+        assert "host slots per row 1.6 of 2" in buf.getvalue(), buf.getvalue()
     print("window-union: self-test ok")
     return 0
 

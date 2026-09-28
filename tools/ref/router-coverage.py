@@ -58,11 +58,13 @@ oracle    Per layer, the set's ids against the oracle set's integer twin of ffn_
           difference.
 """
 import importlib.util
+import io
 import os
 import struct
 import sys
 import tempfile
 from array import array
+from contextlib import redirect_stdout
 
 _spec = importlib.util.spec_from_file_location(
     "manifest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py"))
@@ -627,6 +629,15 @@ def self_test():
                 except SetError:
                     pass
             bursts([two], 2)
+            # the held-out split sits on a chunk edge: 10 tokens in chunks of 4 split at 4, not at 5. Tokens
+            # 0-3 touch every expert once (the hot-2 list ties to {0, 1}); token 4 onward all pick {2, 3}.
+            # Split at 4, the list {0, 1} serves none of the rest; split at 5 it would learn {2, 3} and serve all.
+            edge = make("edge", {0: [[0, 1], [2, 3], [4, 5], [6, 7]] + [[2, 3]] * 6}, chunk=4)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                coverage([edge], (2,))
+            held_rows = buf.getvalue().split("held-out")[1]
+            assert "| 0 | 0.0 |" in held_rows and "share on [4, 10)" in buf.getvalue(), buf.getvalue()
         finally:
             sys.stdout = saved
             devnull.close()
