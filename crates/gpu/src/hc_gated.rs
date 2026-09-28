@@ -69,7 +69,7 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
 use runtime::hc_gated::card::{DOWN_WARPS, NORM_THREADS, NORM_WARPS};
-use runtime::hc_gated::{Geometry, HcRefused, INSTANCES, MAX_COLS};
+use runtime::hc_gated::{Geometry, HcRefused, INSTANCES, MAX_COLS, Sizes};
 use std::sync::Arc;
 
 /// Streams of the instance these kernels are built for.
@@ -789,6 +789,76 @@ fn refused(what: &'static str, e: HcRefused) -> GpuError {
     GpuError::shape(what, e.to_string())
 }
 
+/// The checks both arms' mixes run before their first launch, named `what`:
+/// the streams, the sub-layer's input `y` (when `before` reads one) and the
+/// mixed output hold the `z` of their columns, and the site's weights are
+/// `geo`'s — `γ` its `streams·hidden` values, the down `RANK` rows and the
+/// up `streams·hidden` rows of Q8_0 planes at the other's width, the inject
+/// (when there is one) `streams` rows of `streams·hidden`.
+fn check_mix(
+    what: &'static str,
+    (geo, z): (Geometry, Sizes),
+    (res, y, mixed): (
+        &DeviceBuffer<f32>,
+        Option<&DeviceBuffer<f32>>,
+        &DeviceBuffer<f32>,
+    ),
+    w: &SiteWeights<'_>,
+) -> Result<(), GpuError> {
+    let (wide, r) = (geo.wide(), geo.r());
+    let lens = [
+        ("res", res.len(), z.res),
+        ("gamma", w.gamma.len(), wide),
+        ("mixed", mixed.len(), z.mixed),
+        (
+            "y",
+            y.map_or(0, DeviceBuffer::len),
+            if y.is_some() { z.y } else { 0 },
+        ),
+    ];
+    if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+        return Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        ));
+    }
+    let planes = [
+        ("down", w.down_qs, w.down_d, r, wide),
+        ("up", w.up_qs, w.up_d, wide, r),
+    ];
+    for (name, qs, d, rows, k) in planes {
+        if qs.rows() != rows || qs.cols() != k / 4 || d.rows() != rows || d.cols() != k / 32 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{name} planes are qs {}x{} and d {}x{}, want {rows}x{} and {rows}x{} \
+                     ({rows} rows of {k} Q8_0 values)",
+                    qs.rows(),
+                    qs.cols(),
+                    d.rows(),
+                    d.cols(),
+                    k / 4,
+                    k / 32
+                ),
+            ));
+        }
+    }
+    if let Some(inj) = w.inject
+        && (inj.rows() != geo.s() || inj.cols() != wide)
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "inject is {}x{}, want {}x{wide}",
+                inj.rows(),
+                inj.cols(),
+                geo.s()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct HcGatedKernels {
     module: hc_kernels::LoadedModule,
@@ -813,61 +883,12 @@ impl HcGatedKernels {
         let what = "hc_gated::enqueue_mix";
         let geo = a.scratch.geo;
         let m = geo.cols(a.m).map_err(|e| refused(what, e))?;
-        let z = geo.sizes(m);
-        let (wide, r) = (geo.wide(), geo.r());
         let (y, combine, init) = match a.before {
             Before::Plain => (None, 0u32, 0u32),
             Before::Combine { y } => (Some(y), 1, 0),
             Before::Init { y } => (Some(y), 0, 1),
         };
-        let mut lens = vec![
-            ("res", a.res.len(), z.res),
-            ("gamma", a.w.gamma.len(), wide),
-            ("mixed", a.mixed.len(), z.mixed),
-        ];
-        if let Some(y) = y {
-            lens.push(("y", y.len(), z.y));
-        }
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        let planes = [
-            ("down", a.w.down_qs, a.w.down_d, r, wide),
-            ("up", a.w.up_qs, a.w.up_d, wide, r),
-        ];
-        for (name, qs, d, rows, k) in planes {
-            if qs.rows() != rows || qs.cols() != k / 4 || d.rows() != rows || d.cols() != k / 32 {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "{name} planes are qs {}x{} and d {}x{}, want {rows}x{} and {rows}x{} \
-                         ({rows} rows of {k} Q8_0 values)",
-                        qs.rows(),
-                        qs.cols(),
-                        d.rows(),
-                        d.cols(),
-                        k / 4,
-                        k / 32
-                    ),
-                ));
-            }
-        }
-        if let Some(inj) = a.w.inject
-            && (inj.rows() != geo.s() || inj.cols() != wide)
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "inject is {}x{}, want {}x{wide}",
-                    inj.rows(),
-                    inj.cols(),
-                    geo.s()
-                ),
-            ));
-        }
+        check_mix(what, (geo, geo.sizes(m)), (&*a.res, y, &*a.mixed), &a.w)?;
         let hidden = launch_u32(what, "hidden", geo.d())?;
         let mu = launch_u32(what, "m", m)?;
         let inject = u32::from(a.w.inject.is_some());
@@ -1076,8 +1097,10 @@ mod hc_wide_kernels {
         let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
         let mut i = tid;
         while i < hid {
-            // SAFETY: as above; s·hidden + i < 4·hidden <= gamma.len(). The
-            // value was written by this thread in the pass above.
+            // SAFETY: base + i < m·4·hidden <= res.len(), xn.len(), and
+            // s·hidden + i < 4·hidden <= gamma.len(), by the launch contract;
+            // this thread wrote res[base + i] in the pass above and is the
+            // only writer of xn[base + i].
             unsafe {
                 let x = *res.get_unchecked_mut(base + i);
                 *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
@@ -1160,7 +1183,8 @@ mod hc_wide_kernels {
             if !l.is_finite() {
                 fault.raise(SITE);
             }
-            // SAFETY: as above.
+            // SAFETY: i < m·320 <= lo.len() by the launch contract; this
+            // thread is value i's only writer.
             unsafe { *lo.get_unchecked_mut(i) = l };
             return;
         }
@@ -1174,7 +1198,8 @@ mod hc_wide_kernels {
         if !w.is_finite() {
             fault.raise(SITE);
         }
-        // SAFETY: as above.
+        // SAFETY: j < m·4 <= wgt.len() with inject 1, by the launch
+        // contract; this thread is weight j's only writer.
         unsafe { *wgt.get_unchecked_mut(j) = w };
     }
 
@@ -1295,7 +1320,8 @@ impl HcWideScratch {
 /// [`HcWideKernels::enqueue_mix`]'s arguments: [`MixArgs`]' over `m`
 /// columns of the wide scratch, and the GEMM family with the one-expert
 /// table its down and up read — filled for exactly `m` slots
-/// (`GemmKernels::enqueue_route_dense`), which the caller owns.
+/// (`GemmKernels::enqueue_route_dense`, refused by name otherwise), which
+/// the caller owns.
 pub struct WideMixArgs<'a> {
     pub res: &'a mut DeviceBuffer<f32>,
     pub before: Before<'a>,
@@ -1330,8 +1356,10 @@ impl HcWideKernels {
     /// the up GEMM, the mixed values — seven launches, eight at an inject
     /// site, in order on `stream`. An inject site leaves its combine weights
     /// in the scratch for the next site's [`Before::Combine`]. `m` outside
-    /// `1..=scratch.cols()`, a short buffer or planes of another shape are
-    /// refused by name before any launch. Asynchronous, allocation-free.
+    /// `1..=scratch.cols()`, a short buffer, planes of another shape
+    /// (the narrow arm's check, `check_mix`) or a table filled for another
+    /// count are refused by name before any launch. Asynchronous,
+    /// allocation-free.
     pub fn enqueue_mix(&self, stream: &CudaStream, a: WideMixArgs<'_>) -> Result<(), GpuError> {
         let what = "hc_gated::enqueue_mix_wide";
         let geo = a.scratch.geo;
@@ -1349,30 +1377,13 @@ impl HcWideKernels {
             Before::Combine { y } => (Some(y), 1, 0),
             Before::Init { y } => (Some(y), 0, 1),
         };
-        let mut lens = vec![
-            ("res", a.res.len(), z.res),
-            ("gamma", a.w.gamma.len(), wide),
-            ("mixed", a.mixed.len(), z.mixed),
-        ];
-        if let Some(y) = y {
-            lens.push(("y", y.len(), z.y));
-        }
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        if let Some(inj) = a.w.inject
-            && (inj.rows() != geo.s() || inj.cols() != wide)
-        {
+        check_mix(what, (geo, z), (&*a.res, y, &*a.mixed), &a.w)?;
+        if a.dense.filled() != Some(m) {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "inject is {}x{}, want {}x{wide}",
-                    inj.rows(),
-                    inj.cols(),
-                    geo.s()
+                    "the one-expert table is filled for {:?} slots, the mix has {m} columns",
+                    a.dense.filled()
                 ),
             ));
         }

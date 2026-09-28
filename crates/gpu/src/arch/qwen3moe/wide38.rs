@@ -42,7 +42,7 @@
 use super::body::ATTN_SCALE_256;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, q8};
-use super::scratch::{Io, KvPlanes, RecStore, f32_view};
+use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use crate::GpuError;
 use crate::fault::{FaultSink, LAYER_HEAD};
@@ -61,11 +61,10 @@ use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::q38::{EmbedQ8Args, KeyAppendArgs, OutGateArgs, SharedAddArgs};
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::tensor::{DeviceTensor, window};
+use crate::tensor::DeviceTensor;
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
-use std::mem::ManuallyDrop;
 
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
@@ -73,60 +72,42 @@ const WHAT: &str = "qwen4exp ubatch walk";
 /// The selected flash's pass: the tensor-core one.
 const MMA: bool = true;
 
+/// The indexer keys a select keeps, as `qsa::scored` takes them.
+const KEPT_U32: u32 = geo::KEPT as u32;
+const _: () = assert!(KEPT_U32 as usize == geo::KEPT);
+
 /// The rows of a selecting layer's unit of `m` rows from position `pos0`
 /// that select nothing — every key below their count, the prefill flash's
-/// rows — as `qsa::scored` decides: the leading rows it refuses. A row that
-/// does not select after one that does is refused by name (the predicate is
-/// monotone in the count below the cache's rows).
+/// rows — as `qsa::scored` decides: the leading rows it refuses. The
+/// predicate is monotone in the count below the cache's rows, so every row
+/// past them selects. One answer a walk, the same at every selecting layer.
 pub(super) fn dense_rows(pos0: usize, m: usize, ctx: usize) -> Result<usize, GpuError> {
-    let scored = |t: usize| -> Result<bool, GpuError> {
-        let count = u32::try_from(pos0 + t + 1)
-            .map_err(|_| GpuError::shape(WHAT, format!("position {}", pos0 + t)))?;
-        let (ctx, kept) = (
-            u32::try_from(ctx).map_err(|_| GpuError::shape(WHAT, format!("ctx {ctx}")))?,
-            geo::KEPT as u32,
-        );
-        Ok(qsa::scored(count, ctx, kept))
-    };
+    let ctx = u32::try_from(ctx).map_err(|_| GpuError::shape(WHAT, format!("ctx {ctx}")))?;
     let mut dense = 0;
-    while dense < m && !scored(dense)? {
-        dense += 1;
-    }
-    for t in dense..m {
-        if !scored(t)? {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("row {t} selects nothing after row {dense}, which selects"),
-            ));
+    while dense < m {
+        let count = u32::try_from(pos0 + dense + 1)
+            .map_err(|_| GpuError::shape(WHAT, format!("position {}", pos0 + dense)))?;
+        if qsa::scored(count, ctx, KEPT_U32) {
+            break;
         }
+        dense += 1;
     }
     Ok(dense)
 }
 
-/// A u32 window of `len` values of `parent` from value `off`.
-///
-/// # Safety
-/// `off + len <= parent.len()`, and `parent` stays in place while the
-/// window lives.
-unsafe fn u32_view(
-    parent: &DeviceBuffer<u32>,
-    off: usize,
-    len: usize,
-) -> ManuallyDrop<DeviceBuffer<u32>> {
-    let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
-    // SAFETY: the range is the caller's contract above, inside `parent`.
-    unsafe { window(ptr, len, parent.context()) }
-}
-
 /// A gate's route taps of a ubatch walk: each layer's router logits (its
 /// `logits()` a token) and routed slots (`N_USED + 1` a token) for up to
-/// `rows` tokens. Allocated when armed, never on the walk's path otherwise.
+/// `rows` tokens, and the positions the last walk wrote them for. Allocated
+/// when armed, never on the walk's path otherwise.
 pub(super) struct WideTaps {
     pub(super) rows: usize,
     pub(super) logits: Vec<DeviceBuffer<f32>>,
     pub(super) ids: Vec<DeviceBuffer<u32>>,
     /// The router's logits a token.
     pub(super) width: usize,
+    /// The last walk's first position and rows, set once it has walked
+    /// every layer: `None` while nothing since the arming (or a reset) did.
+    pub(super) walked: Option<(usize, usize)>,
 }
 
 impl WideTaps {
@@ -147,6 +128,7 @@ impl WideTaps {
                 .map(|_| DeviceBuffer::zeroed(stream, rows * (geo::N_USED + 1)))
                 .collect::<Result<Vec<_>, _>>()?,
             width,
+            walked: None,
         })
     }
 
@@ -157,6 +139,86 @@ impl WideTaps {
             .map(DeviceBuffer::num_bytes)
             .sum::<usize>()
             + self.ids.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+    }
+}
+
+/// A gate's planted routes ([`super::body38::Body38::plant_ubatch_routes`]):
+/// each layer's router logits of the positions `pos0 .. pos0 + rows`,
+/// [`geo::EXPERTS`] a token, which the walk's routing launch reads in place
+/// of the router's own. Allocated when planted, never on the walk's path
+/// otherwise.
+pub(super) struct WideForce {
+    pos0: usize,
+    rows: usize,
+    logits: Vec<DeviceBuffer<f32>>,
+}
+
+impl WideForce {
+    /// `routes[t][l]`'s logits for the positions from `pos0`, uploaded;
+    /// refused by name unless every position holds a route for each of
+    /// `layers` layers with [`geo::EXPERTS`] logits. Gate use.
+    pub(super) fn new(
+        stream: &CudaStream,
+        layers: usize,
+        pos0: usize,
+        routes: &[Vec<super::body38::RouteTap>],
+    ) -> Result<WideForce, GpuError> {
+        let rows = routes.len();
+        if rows == 0 {
+            return Err(GpuError::shape(WHAT, "planted routes of no position"));
+        }
+        let mut host = vec![Vec::with_capacity(rows * geo::EXPERTS); layers];
+        for (t, by_layer) in routes.iter().enumerate() {
+            if by_layer.len() != layers {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "planted routes of position {}: {} layers, the chain has {layers}",
+                        pos0 + t,
+                        by_layer.len()
+                    ),
+                ));
+            }
+            for (l, r) in by_layer.iter().enumerate() {
+                if r.logits.len() != geo::EXPERTS {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "planted route of position {} at layer {l}: {} logits, want {}",
+                            pos0 + t,
+                            r.logits.len(),
+                            geo::EXPERTS
+                        ),
+                    ));
+                }
+                host[l].extend_from_slice(&r.logits);
+            }
+        }
+        Ok(WideForce {
+            pos0,
+            rows,
+            logits: host
+                .iter()
+                .map(|h| DeviceBuffer::from_host(stream, h))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    /// Refused by name unless the positions `pos .. pos + n` lie inside the
+    /// planted ones.
+    pub(super) fn covers(&self, pos: usize, n: usize) -> Result<(), GpuError> {
+        if pos < self.pos0 || pos + n > self.pos0 + self.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a ubatch of positions {pos}..{} outside the planted routes' {}..{}",
+                    pos + n,
+                    self.pos0,
+                    self.pos0 + self.rows
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -184,6 +246,8 @@ pub(super) struct Wide38 {
     weights: DeviceBuffer<f32>,
     /// The route taps, when a gate armed them.
     pub(super) taps: Option<WideTaps>,
+    /// The planted routes, when a gate planted them.
+    pub(super) force: Option<WideForce>,
     /// The last walk's rows of each selecting layer: those the prefill flash
     /// ran and those the selection did.
     pub(super) split: Option<(usize, usize)>,
@@ -207,6 +271,7 @@ impl Wide38 {
             ids: DeviceBuffer::zeroed(stream, rows * slots)?,
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
             taps: None,
+            force: None,
             split: None,
         })
     }
@@ -233,7 +298,7 @@ fn plan_of(plans: &[Layer38], l: usize) -> Result<&Layer38, GpuError> {
 
 /// The parts of the body a ubatch walk writes: [`super::program38::Parts38`]'s
 /// over the wide arena and the walk's own buffers, the unit's first position
-/// on the host.
+/// and its rows that select nothing ([`dense_rows`]) on the host.
 pub(super) struct WideParts<'a> {
     pub(super) c: Ctx38<'a>,
     pub(super) plans: &'a [Layer38],
@@ -244,18 +309,30 @@ pub(super) struct WideParts<'a> {
     pub(super) io: &'a Io<'a>,
     pub(super) m: usize,
     pub(super) pos0: usize,
+    pub(super) dense: usize,
     pub(super) cur: usize,
 }
 
 /// `y = W · act` for the Q8_0 weight `name` over the first `m` columns of
-/// `act`, token-major, through the walk's one-expert table `dense`.
+/// `act`, token-major, through the walk's one-expert table `dense`, which
+/// must be filled for exactly those `m` slots (else refused by name: a table
+/// of fewer would leave the rest of `y` as another call left it).
 fn gemm_q8(
     c: &Ctx38<'_>,
     name: &str,
-    act: &GemmAct32,
+    (act, m): (&GemmAct32, usize),
     dense: &GemmRoute,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    if dense.filled() != Some(m) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{name}: the one-expert table is filled for {:?} slots, the unit has {m}",
+                dense.filled()
+            ),
+        ));
+    }
     let (qs, d) = q8(c.w, name)?;
     c.k.g32.enqueue_gemm32(
         c.gpu.stream(),
@@ -363,8 +440,8 @@ impl WideParts<'_> {
             let pl = &mut s.ple;
             c.k.g32
                 .enqueue_quantize_gemm32(stream, &pl.e, m, &mut x.act_hid, sink)?;
-            gemm_q8(c, &pp.key, &x.act_hid, &x.dense, &mut pl.key)?;
-            gemm_q8(c, &pp.value, &x.act_hid, &x.dense, &mut pl.value)?;
+            gemm_q8(c, &pp.key, (&x.act_hid, m), &x.dense, &mut pl.key)?;
+            gemm_q8(c, &pp.value, (&x.act_hid, m), &x.dense, &mut pl.value)?;
             let [r0, r1] = &mut s.res;
             let (xs, out) = if self.cur == 0 {
                 (&*r0, r1)
@@ -442,7 +519,7 @@ impl WideParts<'_> {
                 gdn(c, g, (rec, stamp, lane), (s, x), m, sink)
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, raw, pooled }) => {
-                let split = qsa(c, q, (kv, raw, pooled), (s, x), (m, self.pos0), sink)?;
+                let split = qsa(c, q, (kv, raw, pooled), (s, x), (m, self.dense), sink)?;
                 x.split = Some(split);
                 Ok(())
             }
@@ -472,8 +549,11 @@ impl WideParts<'_> {
     }
 
     /// Layer `l`'s router over the arena's `ffn_x`, in runs of
-    /// [`ROUTE_ROWS`] tokens, each run's slots copied into the walk's; its
-    /// logits and slots into layer `l`'s route taps when a gate armed them.
+    /// [`ROUTE_ROWS`] tokens, each run's slots copied into the walk's. When a
+    /// gate armed the route taps, each run's logits go into layer `l`'s tap
+    /// first; when a gate planted routes, the run is then routed again over
+    /// the planted logits of its positions (the shared expert's gate left the
+    /// router's); the slots the walk runs go into the tap last.
     fn route(&mut self, l: usize) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
         let sink = self.c.gpu.layer_sink(l)?;
@@ -485,33 +565,23 @@ impl WideParts<'_> {
         let mut c0 = 0;
         while c0 < m {
             let n = ROUTE_ROWS.min(m - c0);
-            // SAFETY: tokens c0 .. c0 + n of `ffn_x` (`rows · HIDDEN`, m <=
-            // rows) and of the walk's slots (`rows · slots`); the route's
-            // own buffers hold n <= ROUTE_ROWS tokens. Every buffer stays in
-            // place while the windows live (this layer's launches).
-            let (xw, mut iw, mut ww, ri, rw) = unsafe {
-                (
-                    f32_view(&s.ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
-                    u32_view(&x.ids, c0 * slots, n * slots),
-                    f32_view(&x.weights, c0 * slots, n * slots),
-                    u32_view(&s.route.ids, 0, n * slots),
-                    f32_view(&s.route.weights, 0, n * slots),
-                )
-            };
+            // SAFETY: tokens c0 .. c0 + n of `ffn_x` (`rows · HIDDEN` values,
+            // m <= rows); `ffn_x` stays in place while the window lives (this
+            // run's router launch).
+            let xw = unsafe { f32_view(&s.ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN) };
             self.c
                 .k
                 .router
                 .enqueue_ubatch(stream, router, &xw, n, sink, &mut s.route)?;
-            iw.copy_from_device_async(&ri, stream)?;
-            ww.copy_from_device_async(&rw, stream)?;
             if let Some(t) = x.taps.as_mut() {
                 let lt = t
                     .logits
                     .get_mut(l)
                     .ok_or(GpuError::state(WHAT, "a route tap for every layer"))?;
-                // SAFETY: tokens c0 .. c0 + n <= taps.rows (the walk refuses a
-                // unit past them) of `width` logits, inside the tap and the
-                // route's logits; both stay in place for the copy.
+                // SAFETY: tokens c0 .. c0 + n <= taps.rows (`plan_gemm` refuses
+                // a unit past them, `Gemm38::walk` again) of `width` logits,
+                // inside the tap and the route's logits (`n <= ROUTE_ROWS`
+                // tokens); both stay in place for the copy.
                 let (mut tw, lw) = unsafe {
                     (
                         f32_view(lt, c0 * width, n * width),
@@ -520,6 +590,46 @@ impl WideParts<'_> {
                 };
                 tw.copy_from_device_async(&lw, stream)?;
             }
+            if let Some(f) = &x.force {
+                let lf = f
+                    .logits
+                    .get(l)
+                    .ok_or(GpuError::state(WHAT, "a planted route for every layer"))?;
+                f.covers(self.pos0 + c0, n)?;
+                let at = self.pos0 + c0 - f.pos0;
+                for t in 0..n {
+                    // SAFETY: the plant holds positions pos0 + c0 .. + n
+                    // (checked above), so plant row at + t < f.rows, whose
+                    // EXPERTS logits lie inside `lf` (`rows · EXPERTS`); the
+                    // route's token t < n <= ROUTE_ROWS holds `width` logits,
+                    // the router's EXPERTS rows first and the shared gate's
+                    // last. Both stay in place for the copy.
+                    let (mut dw, pw) = unsafe {
+                        (
+                            f32_view(&s.route.logits, t * width, geo::EXPERTS),
+                            f32_view(lf, (at + t) * geo::EXPERTS, geo::EXPERTS),
+                        )
+                    };
+                    dw.copy_from_device_async(&pw, stream)?;
+                }
+                self.c
+                    .k
+                    .router
+                    .enqueue_route(stream, n, sink, &mut s.route)?;
+            }
+            // SAFETY: tokens c0 .. c0 + n of the walk's slots (`rows · slots`,
+            // m <= rows) and the route's first n (<= ROUTE_ROWS) tokens'; every
+            // buffer stays in place for the two copies.
+            let (mut iw, mut ww, ri, rw) = unsafe {
+                (
+                    param_view::<u32>(&x.ids, c0 * slots, n * slots),
+                    f32_view(&x.weights, c0 * slots, n * slots),
+                    param_view::<u32>(&s.route.ids, 0, n * slots),
+                    f32_view(&s.route.weights, 0, n * slots),
+                )
+            };
+            iw.copy_from_device_async(&ri, stream)?;
+            ww.copy_from_device_async(&rw, stream)?;
             c0 += n;
         }
         if let Some(t) = x.taps.as_mut() {
@@ -529,8 +639,12 @@ impl WideParts<'_> {
                 .ok_or(GpuError::state(WHAT, "a route tap for every layer"))?;
             // SAFETY: m <= taps.rows tokens of `slots` ids, inside the tap and
             // the walk's slots; both stay in place for the copy.
-            let (mut tw, iw) =
-                unsafe { (u32_view(it, 0, m * slots), u32_view(&x.ids, 0, m * slots)) };
+            let (mut tw, iw) = unsafe {
+                (
+                    param_view::<u32>(it, 0, m * slots),
+                    param_view::<u32>(&x.ids, 0, m * slots),
+                )
+            };
             tw.copy_from_device_async(&iw, stream)?;
         }
         Ok(())
@@ -546,11 +660,11 @@ impl WideParts<'_> {
         let (s, x) = (&mut *self.s, &mut *self.x);
         c.k.g32
             .enqueue_quantize_gemm32(stream, &s.ffn_x, m, &mut x.act_hid, sink)?;
-        gemm_q8(c, &p.ffn.gate_sh, &x.act_hid, &x.dense, &mut s.sh_g)?;
-        gemm_q8(c, &p.ffn.up_sh, &x.act_hid, &x.dense, &mut s.sh_u)?;
+        gemm_q8(c, &p.ffn.gate_sh, (&x.act_hid, m), &x.dense, &mut s.sh_g)?;
+        gemm_q8(c, &p.ffn.up_sh, (&x.act_hid, m), &x.dense, &mut s.sh_u)?;
         c.k.g32
             .enqueue_swiglu_quant32(stream, &s.sh_g, &s.sh_u, m, &mut x.act_ff, sink)?;
-        gemm_q8(c, &p.ffn.down_sh, &x.act_ff, &x.dense, &mut s.sh_y)
+        gemm_q8(c, &p.ffn.down_sh, (&x.act_ff, m), &x.dense, &mut s.sh_y)
     }
 
     /// Layer `l`'s block output into `y`: the host's routed sums `hsum` plus
@@ -598,20 +712,14 @@ fn gdn(
     } = s;
     c.k.g32
         .enqueue_quantize_gemm32(stream, mixed, m, &mut x.act_hid, sink)?;
-    gemm_q8(c, &gp.qkv, &x.act_hid, &x.dense, &mut g.x)?;
-    gemm_q8(c, &gp.z, &x.act_hid, &x.dense, &mut g.z)?;
+    gemm_q8(c, &gp.qkv, (&x.act_hid, m), &x.dense, &mut g.x)?;
+    gemm_q8(c, &gp.z, (&x.act_hid, m), &x.dense, &mut g.z)?;
     let ba = f32_tensor(w, &gp.beta_alpha)?;
     let k = ba.cols();
-    if ba.rows() != 2 * nv {
-        return Err(GpuError::tensor(
-            WHAT,
-            &gp.beta_alpha,
-            "2·n_v rows (β's, then α's)",
-        ));
-    }
-    // SAFETY: β's rows are the joined stack's first `nv · k` values and α's
-    // the next, inside its `2·nv · k`; the stack stays resident while the
-    // windows live (the two launches), which are given back below.
+    // SAFETY: the joined stack is `2·nv` rows of `k` (`plan38::plans`
+    // refuses another shape at load), β's rows its first `nv · k` values and
+    // α's the next; the stack stays resident while the windows live (the two
+    // launches), which are given back below.
     let (wb, wa) = unsafe {
         let at = ba.buf().cu_deviceptr();
         (
@@ -687,13 +795,14 @@ fn gdn(
     )?;
     c.k.g32
         .enqueue_quantize_gemm32(stream, attn, m, &mut x.act_attn, sink)?;
-    gemm_q8(c, &gp.ssm_out, &x.act_attn, &x.dense, y)
+    gemm_q8(c, &gp.ssm_out, (&x.act_attn, m), &x.dense, y)
 }
 
-/// A selecting attention layer's mixer at `m` rows from position `pos0`
-/// over its store (the K/V planes, the raw and pooled indexer keys), the
-/// attention site's mix in `s.mixed`, its output projection into `s.y`.
-/// Returns the rows the prefill flash ran and those the selection did.
+/// A selecting attention layer's mixer at `m` rows over its store (the K/V
+/// planes, the raw and pooled indexer keys), the first `dense` of them
+/// selecting nothing ([`dense_rows`]), the attention site's mix in
+/// `s.mixed`, its output projection into `s.y`. Returns the rows the
+/// prefill flash ran and those the selection did.
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
@@ -703,11 +812,10 @@ fn qsa(
         &mut DeviceBuffer<u16>,
     ),
     (s, x): (&mut Arena38, &mut Wide38),
-    (m, pos0): (usize, usize),
+    (m, dense): (usize, usize),
     sink: FaultSink,
 ) -> Result<(usize, usize), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
-    let dense = dense_rows(pos0, m, ctx)?;
     let Arena38 {
         mixed,
         qsa: q,
@@ -720,9 +828,9 @@ fn qsa(
     } = s;
     c.k.g32
         .enqueue_quantize_gemm32(stream, mixed, m, &mut x.act_hid, sink)?;
-    gemm_q8(c, &qp.q, &x.act_hid, &x.dense, &mut q.qg)?;
-    gemm_q8(c, &qp.k, &x.act_hid, &x.dense, &mut q.k)?;
-    gemm_q8(c, &qp.v, &x.act_hid, &x.dense, &mut q.v)?;
+    gemm_q8(c, &qp.q, (&x.act_hid, m), &x.dense, &mut q.qg)?;
+    gemm_q8(c, &qp.k, (&x.act_hid, m), &x.dense, &mut q.k)?;
+    gemm_q8(c, &qp.v, (&x.act_hid, m), &x.dense, &mut q.v)?;
     c.k.g32
         .enqueue_f32_tile(stream, f32_tensor(w, &qp.idx_k)?, mixed, m, &mut x.kr)?;
     // The append reads the keys row-major (`[IDX_DIM][m]`, the gemv's
@@ -784,7 +892,7 @@ fn qsa(
         let (qw, nw, mut yw) = unsafe {
             (
                 f32_view(&q.q, 0, dense * geo::ATTN),
-                u32_view(n_keys, 0, dense),
+                param_view::<u32>(n_keys, 0, dense),
                 f32_view(flash, 0, dense * geo::ATTN),
             )
         };
@@ -816,7 +924,7 @@ fn qsa(
         let (qi, nw, qw, mut yw) = unsafe {
             (
                 f32_view(&q.qi, t0 * idx, n * idx),
-                u32_view(n_keys, t0, n),
+                param_view::<u32>(n_keys, t0, n),
                 f32_view(&q.q, t0 * geo::ATTN, n * geo::ATTN),
                 f32_view(flash, t0 * geo::ATTN, n * geo::ATTN),
             )
@@ -873,7 +981,7 @@ fn qsa(
     )?;
     c.k.g32
         .enqueue_quantize_gemm32(stream, attn, m, &mut x.act_attn, sink)?;
-    gemm_q8(c, &qp.out, &x.act_attn, &x.dense, y)?;
+    gemm_q8(c, &qp.out, (&x.act_attn, m), &x.dense, y)?;
     Ok((dense, m - dense))
 }
 
@@ -887,11 +995,13 @@ impl<'a> Gemm38<'a> {
     /// Walk every layer at the unit's `m` columns through `leg`: the
     /// one-expert table filled for them first. A unit of no row, or past the
     /// arena's rows or the armed route taps', is refused by name before any
-    /// launch.
+    /// launch (`Body38::plan_gemm` refuses the taps' first, before the call
+    /// moves anything; this is the windows' own guard). Once every layer is
+    /// walked, armed taps record the unit's positions.
     pub(super) fn walk(&mut self, leg: &mut BatchLeg<'a, HostRun>) -> Result<(), GpuError> {
         let m = self.p.m;
         let taps = self.p.x.taps.as_ref().map_or(usize::MAX, |t| t.rows);
-        if m == 0 || m > self.p.s.rows || m > self.p.x.rows || m > taps {
+        if m == 0 || m > self.p.s.rows || m > self.p.x.rows || m > taps || self.p.dense > m {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
@@ -903,6 +1013,9 @@ impl<'a> Gemm38<'a> {
         }
         let gpu = self.p.c.gpu;
         self.p.x.split = None;
+        if let Some(t) = self.p.x.taps.as_mut() {
+            t.walked = None;
+        }
         self.p.c.k.gemm.enqueue_route_dense(
             gpu.stream(),
             m,
@@ -915,7 +1028,11 @@ impl<'a> Gemm38<'a> {
             port: PortKind::Batch,
         };
         let layers = self.p.plans.len();
-        sched::walk(o, layers, leg, self)
+        sched::walk(o, layers, leg, self)?;
+        if let Some(t) = self.p.x.taps.as_mut() {
+            t.walked = Some((self.p.pos0, m));
+        }
+        Ok(())
     }
 
     /// After the walk: the head's mix over the unit's columns (the last
@@ -979,18 +1096,43 @@ impl<'a> LayerProgram for Gemm38<'a> {
     }
 }
 
-/// Every layer's route taps of the last walk, read back: token `t`'s
-/// [`super::body38::RouteTap`] of layer `l` at `[t][l]`, for the `m` tokens
-/// the walk ran. Blocking.
+/// Every layer's route taps of the last walk, read back: position `pos0 +
+/// t`'s [`super::body38::RouteTap`] of layer `l` at `[t][l]`. Refused by
+/// name unless the last walk (since the taps were armed or the model reset)
+/// ran exactly the positions `pos0 .. pos0 + m`. Blocking.
 pub(super) fn route_taps_host(
     taps: &WideTaps,
     stream: &CudaStream,
+    pos0: usize,
     m: usize,
 ) -> Result<Vec<Vec<super::body38::RouteTap>>, GpuError> {
-    if m > taps.rows {
+    match taps.walked {
+        Some(w) if w == (pos0, m) => {}
+        Some((p, n)) => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "route taps of positions {pos0}..{}: the last ubatch walk ran {p}..{} and                      the taps hold that walk's alone",
+                    pos0 + m,
+                    p + n
+                ),
+            ));
+        }
+        None => {
+            return Err(GpuError::state(
+                WHAT,
+                "a ubatch walk since the route taps were armed (or the model reset)",
+            ));
+        }
+    }
+    if taps.width < geo::EXPERTS {
         return Err(GpuError::shape(
             WHAT,
-            format!("{m} tokens of route taps for {}", taps.rows),
+            format!(
+                "route taps of {} logits a token, fewer than the {} experts",
+                taps.width,
+                geo::EXPERTS
+            ),
         ));
     }
     let slots = geo::N_USED + 1;

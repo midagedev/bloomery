@@ -39,11 +39,13 @@
 //!    bottleneck, the weights, the mixed values — the card rule on the
 //!    card's readback of its inputs, bit for bit; each column's `xn`, `lo`,
 //!    weights and `mixed` within the bands the error model derives for the q8
-//!    step per 32 values (`WIDE_LO_BAND`, `WIDE_G_REL`) of `mix_ref`; four of
+//!    step per 32 values (`wide_lo_band`, `wide_g_rel`) of `mix_ref`; four of
 //!    the columns each its one-column mix bit for bit and a rerun
 //!    bit-identical; a NaN in one column raises the quantizer's site and the
 //!    mix's and leaves the others clean;
-//!    38 columns on a 37-column scratch refused by name.
+//!    38 columns on a 37-column scratch refused by name, and — before any
+//!    launch, the streams as they went in — planes of another shape and a
+//!    one-expert table filled for fewer slots than the mix's columns.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -66,7 +68,8 @@ mod gate {
     use bloomery_gpu::linear::{sigmoid, silu};
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
+    use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
@@ -759,20 +762,24 @@ mod gate {
     }
 
     /// PIN(2026-09-28): the wide mix's distance from the f64 rule, derived,
-    /// never measured: a q8 activation of 32 values (scale amax/127) moves a
-    /// value by at most half a step, uniformly, d/√12 in RMS, so a column's
-    /// RMS error over its RMS is at most √32/(127·√12) = 1.286e-2 (a block of
-    /// one nonzero value, the largest crest); the down reads one such
-    /// quantization (`xn`), the bottleneck `silu(·/4)` passes it with a slope
-    /// of at most 1.1, so `lo` sits within 1.1 · 1.286e-2 = 1.415e-2 in RMS;
-    /// the up reads a second (`lo`), so `g` sits within √2 · 1.415e-2 = 2.0e-2
-    /// of its rule in RMS relative; `mixed` is Σ xn·σ(g)/4, whose relative
-    /// error is at most the absolute error of `g` (σ'/σ = 1 − σ ≤ 1), so it
-    /// sits within 2.0e-2 · rms(g). The inject is the F32 tile on `xn`: no
+    /// never measured, from the q8-32 error model
+    /// (`bloomery_gpu_gates::rounding::q8_32_rel`, 1.2858e-2 of a column's
+    /// RMS): the down reads one such quantization (`xn`), the bottleneck
+    /// `silu(·/4)` passes it with a slope of at most 1.1, so `lo` sits within
+    /// 1.1 · 1.2858e-2 = 1.4144e-2 in RMS; the up reads a second (`lo`), so
+    /// `g` sits within √2 · 1.4144e-2 = 2.0003e-2 of its rule in RMS
+    /// relative; `mixed` is Σ xn·σ(g)/4, whose relative error is at most the
+    /// absolute error of `g` (σ'/σ = 1 − σ ≤ 1), so it sits within
+    /// 2.0003e-2 · rms(g). The inject is the F32 tile on `xn`: no
     /// quantization, the narrow arm's band.
-    const WIDE_Q: f64 = 1.286e-2;
-    const WIDE_LO_BAND: f64 = 1.1 * WIDE_Q;
-    const WIDE_G_REL: f64 = std::f64::consts::SQRT_2 * WIDE_LO_BAND;
+    fn wide_lo_band() -> f64 {
+        1.1 * q8_32_rel()
+    }
+
+    /// [`wide_lo_band`] through the up's second quantization.
+    fn wide_g_rel() -> f64 {
+        std::f64::consts::SQRT_2 * wide_lo_band()
+    }
 
     /// The wide arm's kernels and scratch.
     struct Wide {
@@ -847,6 +854,43 @@ mod gate {
             mixed: mixed_d.to_host_vec(st)?,
             fault: c.gpu.take_fault()?,
         })
+    }
+
+    /// One wide mix of `m` columns after a combine, the one-expert table
+    /// filled for `fill` slots and `weights` in place of the site's: the
+    /// call's result, and whether the streams came back as they went in.
+    fn wide_try(
+        c: &mut Ctx,
+        w: &mut Wide,
+        weights: SiteWeights<'_>,
+        fill: usize,
+        m: usize,
+    ) -> Result<(Result<(), GpuError>, bool), GateError> {
+        let st = c.gpu.stream();
+        let res = activations(WIDE, m, 0x3a05);
+        let mut res_d = DeviceBuffer::from_host(st, &res)?;
+        let y_d = DeviceBuffer::from_host(st, &activations(D, m, 0x3a06))?;
+        let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; c.geo.sizes(m).mixed])?;
+        w.gemm
+            .enqueue_route_dense(st, fill, &mut w.route, c.gpu.unlabelled_sink())?;
+        let got = w.hcw.enqueue_mix(
+            st,
+            WideMixArgs {
+                res: &mut res_d,
+                before: Before::Combine { y: &y_d },
+                w: weights,
+                eps: EPS,
+                m,
+                fault: c.gpu.unlabelled_sink(),
+                scratch: &mut w.scratch,
+                gemm: &w.g32,
+                dense: &w.route,
+                mixed: &mut mixed_d,
+            },
+        );
+        let kept = bits_equal(&res_d.to_host_vec(st)?, &res);
+        c.gpu.take_fault()?;
+        Ok((got, kept))
     }
 
     /// `‖a − b‖ / ‖b‖` in f64, infinite on a NaN or a length mismatch.
@@ -963,11 +1007,15 @@ mod gate {
                     f64::from(max_rel_err(col(&o.xn, WIDE, k), &as32(&r.xn))?),
                     f64::from(XN_BAND),
                 ),
-                ("lo", rms_rel(col(&o.lo, R, k), &as32(&r.lo)), WIDE_LO_BAND),
+                (
+                    "lo",
+                    rms_rel(col(&o.lo, R, k), &as32(&r.lo)),
+                    wide_lo_band(),
+                ),
                 (
                     "mixed",
                     rms_rel(col(&o.mixed, D, k), &as32(&r.mixed)),
-                    WIDE_G_REL * g_rms,
+                    wide_g_rel() * g_rms,
                 ),
                 (
                     "wgt",
@@ -1066,6 +1114,42 @@ mod gate {
             },
             verdict(named)
         );
+        // Refused before any launch, the streams as they went in: planes of
+        // another shape (the down's and the up's exchanged), and a one-expert
+        // table filled for fewer slots than the mix's columns.
+        let m = 5;
+        let sw = site.weights(true);
+        let swapped = SiteWeights {
+            down_qs: sw.up_qs,
+            down_d: sw.up_d,
+            up_qs: sw.down_qs,
+            up_d: sw.down_d,
+            ..sw
+        };
+        let cases = [
+            ("plane_shape", swapped, m, "down planes are"),
+            (
+                "table_short",
+                site.weights(true),
+                m - 1,
+                "the one-expert table is filled for Some(4) slots",
+            ),
+        ];
+        for (name, weights, fill, want) in cases {
+            let (got, kept) = wide_try(c, &mut w, weights, fill, m)?;
+            let named = matches!(&got, Err(e) if e.to_string().contains(want));
+            let p = named && kept;
+            ok &= p;
+            println!(
+                "wide[refuse:{name}] m={m}, the table filled for {fill} -> {}; the streams \
+                 as they went in: {kept} (want an error naming {want:?}) {}",
+                match &got {
+                    Ok(()) => "accepted".to_owned(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(p)
+            );
+        }
         Ok(ok)
     }
 }

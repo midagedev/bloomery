@@ -532,7 +532,10 @@ macro_rules! gemm32_block {
                         let i0 = unsafe { mma_m16n8k32_s32_s8([0; 4], a0, [bf[0], bf[1]]) };
                         epi32!($mins, i0, dw0, mw0, [x0[0], x1[0]], [x0[2], x1[2]], acc, nt);
                         if two {
-                            // SAFETY: as above; `two` is warp-uniform.
+                            // SAFETY: every lane of the warp reaches this
+                            // `mma.sync` (`two` and the branches around it are
+                            // warp-uniform) with its fragments in the
+                            // instruction's layout.
                             let i1 = unsafe { mma_m16n8k32_s32_s8([0; 4], a1, [bf[2], bf[3]]) };
                             epi32!($mins, i1, dw1, mw1, [x0[1], x1[1]], [x0[3], x1[3]], acc, nt);
                         }
@@ -601,6 +604,15 @@ pub struct Gemm32Args<'a> {
     pub route: &'a GemmRoute,
     pub input: GemmInput,
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+impl GemmRoute {
+    /// The slot count of the last enqueued fill; `None` before one. A caller
+    /// that owns a table for a known count holds its launches to it.
+    #[must_use]
+    pub fn filled(&self) -> Option<usize> {
+        self.filled
+    }
 }
 
 /// A launch's checked shape, as the entries take it.
@@ -721,6 +733,17 @@ impl Gemm32Launch {
                     "{n_slots} slots read {} activation columns, act holds {}",
                     n_slots / slot_div,
                     a.act.cols()
+                ),
+            ));
+        }
+        if a.act.filled() < n_slots / slot_div {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots read {} activation columns, the last quantizer launch \
+                     wrote {}",
+                    n_slots / slot_div,
+                    a.act.filled()
                 ),
             ));
         }

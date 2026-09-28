@@ -25,12 +25,18 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 /// The per-column pad to whole 64-value steps keeps every step's codes one
 /// 64-byte run and every step's two scales one 8-byte pair, which the GEMM
 /// stages with aligned copies.
+///
+/// The host remembers how many columns the last quantizer launch wrote
+/// ([`GemmAct32::filled`]): a GEMM that would read a column past them is
+/// refused by name rather than reading another call's bytes.
 pub struct GemmAct32 {
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
     pub(super) cols: usize,
     pub(super) k: usize,
+    /// The column count of the last enqueued quantizer launch; 0 before one.
+    pub(super) filled: usize,
 }
 
 impl GemmAct32 {
@@ -57,6 +63,7 @@ impl GemmAct32 {
             s: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
             cols,
             k,
+            filled: 0,
         })
     }
 
@@ -64,6 +71,13 @@ impl GemmAct32 {
     #[must_use]
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Columns the last quantizer launch wrote (0 before one): the most a
+    /// GEMM over this scratch may read.
+    #[must_use]
+    pub fn filled(&self) -> usize {
+        self.filled
     }
 
     /// Values per column.
@@ -168,6 +182,7 @@ impl Gemm32Kernels {
         self.module.quantize_gemm32(
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
+        act.filled = n_cols;
         Ok(())
     }
 
@@ -206,6 +221,7 @@ impl Gemm32Kernels {
             stream, &prep, g, u, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s,
             fault,
         )?;
+        act.filled = n_cols;
         Ok(())
     }
 }

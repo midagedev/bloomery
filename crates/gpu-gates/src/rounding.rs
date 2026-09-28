@@ -31,3 +31,31 @@ pub fn butterfly<T: Copy + std::ops::Add<Output = T>>(mut v: [T; 32]) -> T {
     }
     v[0]
 }
+
+/// A 32-value block's largest magnitude over its RMS, at most: a block of
+/// one nonzero value, √32 — the crest [`q8_32_rel`] takes.
+pub const CREST_MAX_32: f64 = 5.656_854_249_492_381;
+
+/// The error model of a q8 activation of 32 values (scale `d = amax/127`,
+/// codes rounded to nearest): each value moves by at most `d/2`, uniformly,
+/// so by `d/√12` in RMS, and the block's RMS error over its RMS is
+/// `crest/(127·√12)`, at most [`CREST_MAX_32`]`/(127·√12)` = 1.2858e-2. A
+/// projection passes that relative error to its output. Every band a gate
+/// derives for an input the 32-value quantizers made starts here.
+#[must_use]
+pub fn q8_32_rel() -> f64 {
+    CREST_MAX_32 / (127.0 * 12f64.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// √32 is the crest's bound, and the model's value is the one the
+    /// bands' derivations quote.
+    #[test]
+    fn the_q8_32_error_model() {
+        assert!((CREST_MAX_32 * CREST_MAX_32 - 32.0).abs() < 1e-12);
+        assert!((q8_32_rel() - 1.2858e-2).abs() < 1e-6, "{}", q8_32_rel());
+    }
+}

@@ -178,9 +178,9 @@ const KV_AT: [(u64, u64); 2] = [(4096, 586_293_824), (32_768, 1_401_037_376)];
 // The largest context each card holds, as predicted [derived: (usable − margin − the dense
 // granules − context − scratch − 469,901,888 B of recurrent bytes) over 28,416 B a position, the
 // last pool counted whole]. Printed beside the boundary the test finds from the plan's own totals;
-// the clause holds the placement to that boundary, not to this figure. PIN(2026-09-28): past the
-// ubatch walk's scratch [derived: CARD_SCRATCH − 64 MiB = 2,770,817,024 B over 28,416 B a
-// position, 97,509.05 positions; was 1,508,356 and 607,383, each now 97,510 lower].
+// the clause holds the placement to that boundary, not to this figure. PIN(2026-09-28): the
+// scratch counts the ubatch walk's [derived: CARD_SCRATCH − 64 MiB = 2,770,817,024 B over
+// 28,416 B a position, 97,509.05 positions, rounded up to 97,510].
 const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_410_846), ("3090", 509_873)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
