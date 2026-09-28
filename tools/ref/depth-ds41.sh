@@ -102,7 +102,7 @@
 # Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
 # position); generate_ds41 refuses only D + N - 1 > --ctx, and a refused arm is a FAIL row (Failures).
 #
-# Placement. BLOOMERY_GEN_PLACE (a, the default, or gate; anything else is refused) is the placement
+# Placement. BLOOMERY_GEN_PLACE (a, the default, gate or bp; anything else is refused) is the placement
 # every generate_ds41 arm — ours, the corpus arms, bin: — loads by, passed as --place; the [config]
 # line and every such row name it (`place <p>`), and a row whose SMOKE footer names another placement
 # is a FAIL row. Plan (a) loads on the card named A6000 and the gate plan on the one named 3090
@@ -110,7 +110,10 @@
 # so a placement whose card is not the timing card (BLOOMERY_TIMING_GPU, timing-card.sh) is refused
 # (64) before the lease and before a dry run's command lines — when an arm runs generate_ds41. With the
 # 3090 as the timing card the profile sizes the references' --n-cpu-moe for its 24 GB
-# (tools/ref/models/deepseek41.sh, LCPP_NCMOE). What follows describes plan (a).
+# (tools/ref/models/deepseek41.sh, LCPP_NCMOE). bp is plan (b′) (workstation::plan_bp: plan (a) on the
+# A6000, the 3090 its expert tier, the DSpark draft beside the tier), which loads both cards: it runs only
+# in the two-card mode (Two cards, below), and outside it is refused (64) as a and gate are inside it.
+# What follows describes plan (a).
 # Ours is plan (a): every layer and the head on the A6000, each routed layer's experts
 # [0, n_l) on the card (n_l 63-64 of 384, the budget's), the rest on the host tier — the plan line
 # generate_ds41 prints. ik moves experts by tensor, and a layer's 384 experts are one tensor, so it
@@ -346,9 +349,11 @@
 # lease; the 3090 at its 250 W cap; the witness counting the kernel's Xid lines). Every row's card field
 # reads `A6000+3090`, so no reader puts it in the A6000 table. The profile's two-card line
 # (TWO_CARD_PLACEMENT, models/deepseek41.sh, V41_PUBLIC only) gives mainline its --n-cpu-moe and -ts;
-# only the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], and the fit arms, whose fit places over both
-# cards). An ours, corpus or bin: arm is refused by name before anything runs (generate_ds41 loads one
-# card; plan (b), --place b, is its expected two-card interface), and so is an ik arm (ik's -ts is a
+# the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], and the fit arms, whose fit places over both cards), and
+# ours, corpus and bin: arms under BLOOMERY_GEN_PLACE=bp; under a or gate they are refused by name before
+# anything runs, with the hint to set bp (timing-card.sh's TIMING_CARDS_PLACE). After each of our arms its
+# `load` record's `cards` must name the A6000 and the 3090 (records.py), or the arm is a FAIL row. An ik
+# arm is refused by name (ik's -ts is a
 # byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
 # placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
 # its cap or an unpatched lease.sh refuses the run; after every arm an Xid since the last arm, a card lost
@@ -470,8 +475,8 @@ ab_order depth-ds41.sh
 warm_rows_init depth-ds41.sh
 PLACE=${BLOOMERY_GEN_PLACE:-a}
 case $PLACE in
-  a | gate) ;;
-  *) echo "depth-ds41.sh: BLOOMERY_GEN_PLACE is a (plan (a), on the A6000; the default) or gate (the gate plan, on the 3090), got '$PLACE'" >&2; exit 64 ;;
+  a | gate | bp) ;;
+  *) echo "depth-ds41.sh: BLOOMERY_GEN_PLACE is a (plan (a), on the A6000; the default), gate (the gate plan, on the 3090) or bp (plan (b′), on both cards), got '$PLACE'" >&2; exit 64 ;;
 esac
 # The preheat's default follows the order (the header's Preheat): the blocks' discards read the host set.
 PREHEAT_DEFAULT=1
@@ -625,12 +630,18 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
 TC_ARMS=()
 for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
+# shellcheck disable=SC2034 # read by timing_cards_arms (timing-card.sh)
+TIMING_CARDS_PLACE=bp TIMING_CARDS_PLACE_RAN=$PLACE
 timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
 # The placement's card must be the timing card, the only one the arms see: plan (a) loads on the card
 # named A6000, the gate plan on the one named 3090 (workstation::plan_a, plan_gate).
 if [ "$gen" = 1 ]; then
   if [ "$PLACE" = a ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
     echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=a is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): generate_ds41 would refuse every arm; set BLOOMERY_GEN_PLACE=gate" >&2
+    exit 64
+  fi
+  if [ "$PLACE" = bp ] && [ -z "$TIMING_CARDS" ]; then
+    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan (b′), which loads on both cards (the A6000 and its 3090 expert tier); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000+3090" >&2
     exit 64
   fi
   if [ "$PLACE" = gate ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
@@ -1063,6 +1074,12 @@ ours_post() {
   [ -z "$a" ] || SLOT_COL=" | slot $((${a% *} + 1))/${a#* }"
   if [ "$rc" -ne 0 ]; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "exited $rc" "$out"
+    return 0
+  fi
+  # Two cards: an Xid, a card lost or off its cap, or a load that did not name both cards fails the arm
+  # (a grouped arm's load record is its load's header).
+  if ! timing_cards_arm "$out"$'\n'"${LG_HEADER:-}" ours; then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "two cards: $TWOCARD_WHY" "$out"
     return 0
   fi
   ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {

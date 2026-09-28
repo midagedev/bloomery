@@ -202,11 +202,11 @@ pub trait Keep: ChainBody {
 
 /// How a session opens: the placement, the context the plan is asked for,
 /// the step mode and the body's own configuration.
-pub struct OpenArgs<C> {
+pub struct OpenArgs<C, M = fn(usize) -> Machine> {
     /// The placement's name, as the plan and load records print it.
     pub place: &'static str,
     /// The placement's machine, by layer count.
-    pub machine: fn(usize) -> Machine,
+    pub machine: M,
     pub ctx: usize,
     pub mode: StepMode,
     pub cfg: C,
@@ -254,9 +254,9 @@ impl<B: Open> Loaded<B> {
     /// Read `file`'s headers, plan once on `args`' placement and hand the
     /// plan to `log` (`false` stops here: `Ok(None)`), then load by that plan
     /// in `args`' step mode and hand `log` the model.
-    pub fn open(
+    pub fn open<M: Fn(usize) -> Machine>(
         file: Split,
-        args: OpenArgs<B::Cfg>,
+        args: OpenArgs<B::Cfg, M>,
         log: &mut impl OpenLog<B>,
     ) -> Result<Option<Loaded<B>>, SessionError> {
         let inputs = B::inputs(&file)?;
@@ -276,6 +276,13 @@ impl<B: Open> Loaded<B> {
             cfg: args.cfg,
             ctx,
         }))
+    }
+
+    /// A model its body's own constructor loaded by a plan the caller made
+    /// (a gate's hand-built plan), nothing captured, in `cfg`'s schedule,
+    /// whose caches hold `ctx` positions: what [`Loaded::open`] returns.
+    pub fn from_model(model: GpuModel<B>, cfg: B::Cfg, ctx: u32) -> Loaded<B> {
+        Loaded { model, cfg, ctx }
     }
 
     /// The model, before any capture.

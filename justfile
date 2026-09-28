@@ -313,11 +313,12 @@ gate-gpu-p10:
 # V4.1 적재 게이트 ②: 배치 계획이 카드마다 두는 세그먼트를, 이름으로 찾은 카드에 올리고 계획과 바이트 단위로 대조한다.
 # 할당기 반올림도 계획의 항과 바이트까지 같아야 한다. 정확성 실행이지 측정이 아니다. 계획 a는 --plan a.
 # 착륙 묶음이 고르지 않는 opt-in이다(gate-* 레시피가 아니라 `just affected`에 잡히지 않는다). 호스트 세트의 populate·lock
-# 경로나 두 카드 staging이 바뀌면 이름으로 돌린다 — 계획 (b)가 트리에서 유일한 두 카드 적재다.
+# 경로나 두 카드 staging이 바뀌면 이름으로 돌린다 — 계획 (b)가 트리에서 유일한 두 카드 적재다. `--plan bp`는 계획 (b′)
+# (A6000은 계획 (a), 3090은 전문가 층)이고, 드래프트 예약을 위해 프로필의 DSPARK_MODEL을 `--draft`로 넘긴다.
 [group('solo')]
 [group('v41-load')]
 stage-gpu-load-v41 *ARGS='--plan b':
-    BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && bash tools/gpu-gate.sh gate_load_v41 {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_load_v41 && __d=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && case " {{ARGS}} " in *" --plan bp "*) set -- --draft "$__d" ;; *) set -- ;; esac && bash tools/gpu-gate.sh gate_load_v41 {{ARGS}} "$@"'
 
 # 같은 게이트 ②의 호스트 절반: 계획 (b)의 호스트 세그먼트 전부(유도 약 196 GB)를 샤드 매핑째 잠근다. 리드 전용이고,
 # RAM을 크게 쓰는 트랙이 없을 때만 돈다.
@@ -1019,6 +1020,21 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
 gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault --blost':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
+# V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
+# The reference is the same plan with every tier set joined to the stage card's (one card, no tier code); --loopback adds
+# the plan with the tier on the A6000 beside the stage (two Gpus on one card). The draft is on the 3090 in every load; the
+# plans are made under a card budget so the A6000 holds both sets, ranked by the serving hot list (hotlist-384) so the tier
+# holds each layer's next hot ranks. --union: the prose prompt (32 ids) step by step, 48 greedy steps, then the prompt
+# through the draft and 16 DSpark passes, every token, kept count and logits row bit for bit the reference's, the stage
+# graph's node count too; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
+# --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
+# CardLost, the next step refused. Three loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks),
+# alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-ds41-twocard *ARGS='--union --loopback --lost':
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
+
 # V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
 # --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
 # six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any
@@ -1119,12 +1135,16 @@ gate-gpu-ds41-chat:
 # (BLOOMERY_DSPARK_CARD=A6000, the profile's DSPARK_MODEL): gate_ds41_serve --plain holds its greedy ids to the plain
 # server's and generate_ds41's, and checks /props' draft object and row, the draft counts in timings and /metrics, the
 # 400s for sampling and ignore_eos, and prefix reuse under the draft (a continuation, a cut, a resume) against
-# cache_prompt: false. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch
-# runs it alone). Three loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/.
+# cache_prompt: false. Then plan (b′) with the draft (--place bp: the A6000 plan (a), the 3090 the expert tier and the
+# draft): generate_ds41 --place bp under the draft, then gate_ds41_serve --place bp holds the server's greedy ids to it and
+# checks /props (the A6000, the tier card with the plan's tier bytes and the draft's class, the host) and the draft counts
+# in timings. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch runs it
+# alone). Five loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/, the
+# two-card run's in target/serve-gate/bp/.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
