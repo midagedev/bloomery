@@ -2,7 +2,7 @@
 //! driven over HTTP, as one process under the GPU gate lock.
 //!
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
-//!                     [--plain <the plain run's --dir>]
+//!                     [--plain <the plain run's --dir> | --place bp]
 //!
 //! Starts the server beside this binary (`--port 0 --place gate`), reads its
 //! address from its stderr, waits for `/health`, then checks:
@@ -97,6 +97,25 @@
 //!   cache after another one keeps the same bound;
 //! - `/metrics`' `spec_decode_num_draft_tokens_total` is above 0.
 //!
+//! With `--place bp`, under `BLOOMERY_DRAFT=dspark` (refused otherwise, and
+//! beside `--plain`), the server runs plan (b′) — plan (a) on the A6000, the
+//! 3090 an expert tier holding the draft's reserve — with the DSpark draft,
+//! started as `--port 0 --place bp`, and the gate checks it against its own
+//! plan (b′) of the file (the reserve from the draft's header, as the server
+//! makes it) and nothing above:
+//!
+//! - `/props`' placement names three devices: the A6000 (`GPU<n>`, every
+//!   layer, the plan's stage-card bytes), the tier card (the 3090's
+//!   `GPU<n>`, no `layers`, its `experts` class the plan's tier bytes and a
+//!   `draft` class above 0 and at most the reserve) and the host (`CPU`, the
+//!   plan's host bytes); `engine.draft` is the DSpark draft on the tier
+//!   card's device — the plan's tier card, not the draft card rule the
+//!   server applies; `args` are the ones this gate passed;
+//! - `/completion` of `--prompt` at temperature 0: its ids are `--gen`'s
+//!   `tokens` line (`generate_ds41 --place bp` under the same draft: the same
+//!   plan, the same card sets), and its `timings` carry `draft_n` above 0 and
+//!   `draft_n_accepted` at most that.
+//!
 //! The server inherits this binary's environment, so the levers it acts on
 //! are the server's (`serve_levers::ACTS_ON`): one the server would refuse is
 //! refused here, at `main`, before the server starts.
@@ -128,6 +147,7 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::bind::nvidia_smi_index;
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
@@ -139,7 +159,7 @@ mod gate {
 
     use crate::dspark;
 
-    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir>]";
+    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp]";
     /// Where the first `/completion`'s ids go in `--dir`, for the draft run.
     const COMPLETION_IDS: &str = "completion.ids";
     /// Where the probe's ids go in `--dir`, for the draft run.
@@ -148,6 +168,8 @@ mod gate {
     const DRAFT_PREDICT: usize = 32;
     /// The server's arguments after its path; `/props` must echo them.
     const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
+    /// The server's arguments under `--place bp`.
+    const BP_SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "bp"];
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -299,11 +321,13 @@ mod gate {
         dir: PathBuf,
         /// The plain run's `--dir`: the draft run.
         plain: Option<PathBuf>,
+        /// `--place bp`: the two-card run.
+        bp: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
-        let mut plain = None;
+        let (mut plain, mut bp) = (None, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -315,6 +339,17 @@ mod gate {
                 "--ids" => ids = Some(parse_ids(&v)?),
                 "--dir" => dir = Some(PathBuf::from(v)),
                 "--plain" => plain = Some(PathBuf::from(v)),
+                "--place" => match Place::parse(&v)? {
+                    Place::Bp => bp = true,
+                    Place::Gate => bp = false,
+                    Place::A => {
+                        return Err(format!(
+                            "--place a: this gate runs the server on the gate card, or on both \
+                             under bp: {USAGE}"
+                        )
+                        .into());
+                    }
+                },
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
@@ -325,6 +360,7 @@ mod gate {
                 ids,
                 dir,
                 plain,
+                bp,
             }),
             _ => Err(USAGE.into()),
         }
@@ -973,7 +1009,7 @@ mod gate {
         let plain_probe = read_ids(PROBE_IDS)?;
         let (_, hp) = dspark::draft_hparams()?;
         let draft_path = dspark::draft_path()?;
-        let draft_card = dspark::draft_card()?;
+        let draft_card = dspark::draft_card(Place::Gate)?;
         let draft_device = format!("GPU{}", nvidia_smi_index(draft_card)?);
         println!(
             "draft {} on {draft_card} ({draft_device}), window {}",
@@ -1221,6 +1257,138 @@ mod gate {
         Ok(ok)
     }
 
+    /// The two-card run (module header): the server under `--place bp` and
+    /// this process's `BLOOMERY_DRAFT=dspark`.
+    fn tiered(a: &Args, levers: &PlanLevers) -> Result<(), GateError> {
+        let reference = gen_tokens(&a.gen_log)?;
+        let (draft, _) = dspark::draft_hparams()?;
+        let draft_path = dspark::draft_path()?;
+        let path = ref_model_path()?;
+        let reserve = dspark::draft_reserve(Place::Bp, &draft, &path)?
+            .ok_or("plan (b′) made no draft reserve")?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine = Place::Bp.machine(Some(reserve))?(inputs.model.layers);
+        let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
+        let ([stage], [tier], [card, tcard]) = (
+            machine.cards.as_slice(),
+            machine.tiers.as_slice(),
+            plan.cards.as_slice(),
+        ) else {
+            return Err("plan (b′) is not one stage card and one tier card".into());
+        };
+        let gpu = |name: &str| -> Result<String, GateError> {
+            Ok(format!("GPU{}", nvidia_smi_index(name)?))
+        };
+        let (stage_device, tier_device) = (gpu(&stage.name)?, gpu(&tier.name)?);
+        let stage_bytes = card.dense_bytes + card.expert_bytes;
+        let tier_bytes = tcard.dense_bytes + tcard.expert_bytes;
+        let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;
+        println!(
+            "plan (b′): {} ({stage_device}) {stage_bytes} B, tier {} ({tier_device}) {} experts \
+             {tier_bytes} B with the draft's reserve {reserve} B, host {host_bytes} B",
+            stage.name, tier.name, tcard.experts
+        );
+        std::fs::create_dir_all(&a.dir)?;
+        let exe = Served::exe()?;
+        let err_log = a.dir.join("server.err");
+        let mut served = Served::spawn(&BP_SERVER_ARGS, &a.dir)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        println!("server listening on {addr}");
+        let mut ok = true;
+
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let e = json_of("/props", st, &body)?["engine"].clone();
+        println!("props engine {e}");
+        let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
+            .chain(BP_SERVER_ARGS.iter().map(|a| (*a).to_owned()))
+            .collect();
+        let devices = e["placement"]["devices"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let class = |d: &Value, c: &str| d["classes"][c].as_u64();
+        let layers = format!("{}-{}", stage.layers.start, stage.layers.end - 1);
+        check(&mut ok, "bp_props_args", e["args"] == json!(argv));
+        check(
+            &mut ok,
+            "bp_props_names_both_cards",
+            devices.len() == 3
+                && devices[0]["device"] == json!(stage_device)
+                && devices[0]["layers"] == json!(layers)
+                && devices[1]["device"] == json!(tier_device)
+                && devices[1].get("layers").is_none()
+                && devices[2]["device"] == "CPU",
+        );
+        let draft_bytes = devices.get(1).and_then(|d| class(d, "draft")).unwrap_or(0);
+        check(
+            &mut ok,
+            "bp_props_bytes_are_the_plans",
+            devices
+                .first()
+                .is_some_and(|d| d["bytes"] == json!(stage_bytes))
+                && devices.get(1).is_some_and(|d| {
+                    class(d, "experts") == Some(tier_bytes)
+                        && d["bytes"].as_u64() == Some(tier_bytes + draft_bytes)
+                })
+                && devices
+                    .get(2)
+                    .is_some_and(|d| d["bytes"] == json!(host_bytes))
+                && e["placement"]["vram_kv_bytes"]
+                    == json!(plan.cards.iter().map(|c| c.kv_bytes).sum::<u64>()),
+        );
+        let file = draft_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        check(
+            &mut ok,
+            "bp_props_draft_on_the_tier_card",
+            e["draft"]["kind"] == "dspark"
+                && e["draft"]["model"] == json!(file)
+                && e["draft"]["device"] == json!(tier_device)
+                && draft_bytes > 0
+                && draft_bytes <= reserve,
+        );
+
+        let completion = json!({
+            "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+        });
+        let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
+        let c1 = json_of("/completion", st, &body)?;
+        let ids = ids_of(&c1["tokens"]);
+        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let t = &c1["timings"];
+        println!("completion tokens {ids:?} stop_type={stop}");
+        println!("generate_ds41    {reference:?}");
+        println!("completion timings {t}");
+        check(
+            &mut ok,
+            "bp_completion_ids_are_generate_ds41",
+            agree(&ids, &stop, &reference),
+        );
+        let (n, acc) = (as_count(&t["draft_n"]), as_count(&t["draft_n_accepted"]));
+        check(
+            &mut ok,
+            "bp_timings_carry_the_drafts_counts",
+            n.zip(acc).is_some_and(|(n, acc)| n > 0 && acc <= n),
+        );
+        let (st, body) = curl(&url("/health"), None, false)?;
+        check(
+            &mut ok,
+            "bp_health_ok",
+            st == 200 && body.contains("\"ok\""),
+        );
+        println!("server stopped: {}", served.stop()?);
+        if ok {
+            println!("gate-gpu-ds41-serve bp: PASS");
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
+    }
+
     fn check(ok: &mut bool, name: &str, pass: bool) {
         println!("check {name}: {}", verdict(pass));
         *ok &= pass;
@@ -1231,6 +1399,16 @@ mod gate {
         let a = parse_args()?;
         let place = PlanLevers::from_levers(&levers)?;
         match (&a.plain, levers.draft()) {
+            (None, Some("dspark")) if a.bp => return tiered(&a, &place),
+            _ if a.bp => {
+                return Err(format!(
+                    "--place bp takes BLOOMERY_DRAFT=dspark and no --plain; got --plain {:?}, \
+                     BLOOMERY_DRAFT={:?}",
+                    a.plain,
+                    levers.draft()
+                )
+                .into());
+            }
             (Some(plain), Some("dspark")) => return drafted(&a, plain, &place),
             (None, None) => {}
             (plain, draft) => {

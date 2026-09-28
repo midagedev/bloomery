@@ -66,8 +66,13 @@
 #   twocard      lcpp:6 lcpppp:4, one round, the preheat on: the decode row and the json prefill row (its
 #                device lines on stderr) carry `A6000+3090` and both cards, the stub llama-bench got -ts
 #                1.5/1.5, the witness's two-card lines; rc 0.
-#   twocard-arms 6, code:4, ik:6 and lcppsrv:6 each refused by name before anything runs (rc 64); ours naming
-#                --place b, the server arm naming the two-card checks it lacks.
+#   twocard-arms 6, code:4, ik:6 and lcppsrv:6 each refused by name before anything runs (rc 64); ours under
+#                --place a naming its two-card placement, bp, the server arm naming the two-card checks it lacks.
+#   twocard-bp   BLOOMERY_GEN_PLACE=bp, lcpp:6 6, one round: ours runs (--place bp), its load record names
+#                both cards, its row reads `A6000+3090` and `place bp`; rc 0.
+#   twocard-bp-one  the same with a load record naming the A6000 alone (STUB_GEN_CARDS): ours is a FAIL row
+#                naming the cards it saw; rc 1.
+#   bp-onecard   BLOOMERY_GEN_PLACE=bp outside the two-card mode: refused by name, rc 64.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
 # The server arms and the warm rows (lcpp-warm.sh; red on the runner before them: arm usage, rc 64, or
@@ -220,7 +225,8 @@ cp "$T/bin/bench" "$T/bin/ik-bench"
 mv "$T/bin/bench" "$T/bin/lcpp-bench"
 touch "$T/Cargo.toml"
 # The stub generate_ds41: refuses depth STUB_GEN_FAIL_DEPTH the first time (a marker file), and names
-# STUB_GEN_PLACE in its SMOKE footer when set. Under --arm it runs the list after one `load` line, each
+# STUB_GEN_PLACE in its SMOKE footer when set. Under --place bp, or with STUB_GEN_CARDS, its load line
+# names the cards (`cards=`, both under bp unless STUB_GEN_CARDS says otherwise). Under --arm it runs the list after one `load` line, each
 # arm opening with its `arm` record and, under --arm-sync, waiting for a line on stdin; every process
 # appends a line to $TMPDIR/stub-gen-loads.
 cat > "$T/target/release/generate_ds41" << 'EOF'
@@ -237,7 +243,13 @@ echo "${arms[*]:-one}" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ -z "$tokens" ] || depth=$(echo "$tokens" | tr ',' '\n' | grep -c .)
 [ ${#arms[@]} -gt 0 ] || arms=("$depth")
 echo "plan place=$place (stub)"
-echo "load place=$place arms=${#arms[@]} (stub)"
+cards=${STUB_GEN_CARDS:-}
+[ -n "$cards" ] || [ "$place" != bp ] || cards='[A6000,3090]'
+if [ -n "$cards" ]; then
+  echo "load resident_bytes=0 place=$place cards=$cards arms=${#arms[@]} (stub)"
+else
+  echo "load place=$place arms=${#arms[@]} (stub)"
+fi
 for k in "${!arms[@]}"; do
   a=${arms[$k]} feed=lcg
   case $a in *:*) feed=${a%%:*} depth=${a#*:} ;; *) depth=$a ;; esac
@@ -598,10 +610,39 @@ twocard_refused() {
     pass "$name"
   fi
 }
-twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 loads one card \(--place a\|gate\); its two-card placement, plan \(b\) \(workstation::plan_b\), is expected as --place b and does not exist yet" lcpp:6 6
-twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 loads one card " lcpp:6 code:4
+twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 under --place a loads one card; its two-card placement is --place bp \(BLOOMERY_GEN_PLACE=bp\)$" lcpp:6 6
+twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 under --place a loads one card; " lcpp:6 code:4
 twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
 twocard_refused twocard-arms-srv "^depth-ds41.sh: arm 'lcppsrv:6': a llama-server arm has no two-card checks yet " lcpp:6 lcppsrv:6
+
+L=$tmp/twocard-bp.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp -- lcpp:6 6
+if [ "$RC" != 0 ]; then
+  fail twocard-bp "rc $RC, want 0" "$L"
+elif want twocard-bp "$L" 1 '^ROW r1 ours d=6 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place bp \| ' &&
+  want twocard-bp "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 ' &&
+  want twocard-bp "$L" 1 '^    load resident_bytes=0 place=bp cards=\[A6000,3090\] ' &&
+  want twocard-bp "$L" 0 '^FAIL '; then
+  pass twocard-bp
+fi
+
+L=$tmp/twocard-bp-one.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp 'STUB_GEN_CARDS=[A6000]' -- 6
+if [ "$RC" != 1 ]; then
+  fail twocard-bp-one "rc $RC, want 1" "$L"
+elif want twocard-bp-one "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names cards \[A6000\], not the A6000 and the 3090: a one-card run in the two-card table" &&
+  want twocard-bp-one "$L" 0 '^ROW '; then
+  pass twocard-bp-one
+fi
+
+L=$tmp/bp-onecard.log
+stub_run "$L" BLOOMERY_GEN_PLACE=bp -- 6
+if [ "$RC" != 64 ]; then
+  fail bp-onecard "rc $RC, want 64" "$L"
+elif want bp-onecard "$L" 1 '^depth-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan \(b′\), which loads on both cards .* it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$' &&
+  want bp-onecard "$L" 0 '^(ROW|FAIL) |^\[stub\] no lease'; then
+  pass bp-onecard
+fi
 
 L=$tmp/twocard-xid.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_BENCH_XID=pp4 -- lcpp:6 lcpppp:4
@@ -793,7 +834,7 @@ if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
-    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/srv*.log "$tmp"/warm*.log; do
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard.log "$tmp"/srv*.log "$tmp"/warm*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done
