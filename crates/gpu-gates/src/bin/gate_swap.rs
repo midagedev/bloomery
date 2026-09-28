@@ -84,6 +84,13 @@
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
 //!   before the preparation ends.
+//! - queue: a reset under a closed window (as the engine's step port leaves
+//!   it between passes), with a source that adds [`INFLATE`] copy stream
+//!   commands to each part it copies, returns within [`QUEUE_BOUND`] with
+//!   every layer back at its seed: the reset's copies stage as they are
+//!   issued, so the host never blocks enqueuing behind copies nothing stages
+//!   (its mutant: the reset's flush turned on only after its copies are
+//!   enqueued). A watchdog thread ends the process by name past the bound.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -99,8 +106,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use std::ops::Range;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
@@ -110,7 +117,7 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use cuda_core::{DeviceBuffer, LaunchConfig1D, sys};
+    use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
@@ -142,6 +149,13 @@ mod gate {
     /// copy and launch here takes microseconds.
     const HOLD_SETTLE: Duration = Duration::from_millis(200);
     const DELAY: u64 = 3;
+    /// Copy stream commands the queue arm's source adds to each part it
+    /// copies: a reset's seed copies then carry tens of thousands, far past
+    /// what a stream queues before an enqueue blocks.
+    const INFLATE: usize = 2048;
+    /// The queue arm's bound on its reset, which takes milliseconds when its
+    /// copies stage as they are issued.
+    const QUEUE_BOUND: Duration = Duration::from_secs(20);
     /// The boundary-event arm's live delay: with `every` 2 a flip lands at a
     /// planning boundary.
     const DELAY_EVEN: u64 = 2;
@@ -264,8 +278,9 @@ mod gate {
 
     /// What an arm's source does wrong: `stuck` experts never become
     /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
-    /// `panic_source` fail or panic when their bytes are read, and every
-    /// stack destination of layer `fail_dest` is an error.
+    /// `panic_source` fail or panic when their bytes are read, every stack
+    /// destination of layer `fail_dest` is an error, and each part a copy
+    /// moves carries `inflate` more copy stream commands.
     #[derive(Clone, Debug, Default)]
     struct Faults {
         stuck: Vec<(usize, u32)>,
@@ -273,6 +288,7 @@ mod gate {
         fail_source: Option<(usize, u32)>,
         panic_source: Option<(usize, u32)>,
         fail_dest: Option<usize>,
+        inflate: usize,
     }
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
@@ -347,6 +363,31 @@ mod gate {
                 });
             }
             Ok(self.bases[li(layer)][part] + (slot as usize * PART_BYTES[part]) as u64)
+        }
+
+        /// `inflate` one-word memsets on the stream, into the stack of the
+        /// layer with no card slot (one slot no probe reads).
+        fn convert(
+            &self,
+            _layer: usize,
+            _part: usize,
+            _dst: sys::CUdeviceptr,
+            stream: &CudaStream,
+        ) -> Result<(), GpuError> {
+            let scratch = self.bases[L - 1][0];
+            for _ in 0..self.faults.inflate {
+                // SAFETY: `scratch` is the first word of a live stack buffer
+                // of the arm's card, which outlives the machine; the memset
+                // writes that one word on the stream.
+                let rc = unsafe { sys::cuMemsetD32Async(scratch, 0, 1, stream.cu_stream()) };
+                if rc != sys::cudaError_enum_CUDA_SUCCESS {
+                    return Err(GpuError::Shape {
+                        what: "Synth::convert",
+                        detail: format!("cuMemsetD32Async rc {rc}"),
+                    });
+                }
+            }
+            Ok(())
         }
 
         fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
@@ -1477,6 +1518,70 @@ mod gate {
         Ok(c7)
     }
 
+    /// queue: an arm with an [`INFLATE`] source driven to the last boundary
+    /// that made flips, its window closed, then reset under a watchdog.
+    fn queue(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
+        let faults = Faults {
+            inflate: INFLATE,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_last as usize + 1,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let window = m.window();
+        window.store(0, Ordering::Release);
+        let (done, watched) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watched.recv_timeout(QUEUE_BOUND).is_err() {
+                // The reset is blocked inside the driver: nothing returns it,
+                // so the process ends here, by name.
+                println!(
+                    "queue: the reset did not return in {QUEUE_BOUND:?}: the host blocked \
+                     enqueuing copies behind copies nothing stages FAIL"
+                );
+                std::process::abort();
+            }
+        });
+        let t0 = Instant::now();
+        let reset = m.reset(gpu.stream(), &mut r.slots);
+        let took = t0.elapsed();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        window.store(1, Ordering::Release);
+        let rep = match reset {
+            Ok(rep) => rep,
+            Err(e) => {
+                println!("queue reset after boundary {b_last}: {e} FAIL");
+                return Ok(false);
+            }
+        };
+        let commands = rep.copies * PARTS * INFLATE;
+        let ok = driven && rep.diff == 0 && rep.copies > 0 && commands >= 10_000;
+        println!(
+            "queue: a reset under a closed window, {} seed copies carrying {commands} copy stream \
+             commands, returned in {:.1} ms, diff {}: {}",
+            rep.copies,
+            took.as_secs_f64() * 1e3,
+            rep.diff,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// tier: a two-card map, each card layer's hottest and coldest expert off
     /// the seed on the tier.
     fn tier(
@@ -1828,6 +1933,7 @@ mod gate {
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= refusal(&gpu, &pm, &trace)?;
         ok &= stall(&gpu, &pm, &trace)?;
+        ok &= queue(&gpu, &pm, &trace, &a)?;
 
         if ok {
             println!(

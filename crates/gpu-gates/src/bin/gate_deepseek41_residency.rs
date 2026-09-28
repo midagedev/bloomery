@@ -176,6 +176,11 @@ mod gate {
         Ok(loaded.ready(&mut Quiet)?)
     }
 
+    /// Milliseconds since `t`.
+    fn ms(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
     fn fnv(row: &[f32]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for v in row {
@@ -206,7 +211,9 @@ mod gate {
         ids: &[u32],
         hold: Option<&HostFlags>,
     ) -> Result<History, GateError> {
+        let t_clear = Instant::now();
         s.clear()?;
+        let clear_ms = ms(t_clear);
         take_passes(s)?;
         if let Some(flags) = hold {
             flags.clear(0)?;
@@ -218,8 +225,11 @@ mod gate {
                 .ok_or("the load runs no residency machine")?;
             flags.enqueue_wait(machine.copy_stream(), 0)?;
         }
-        let run = |s: &mut Session<Body>| -> Result<History, GateError> {
+        let mut walls = Vec::with_capacity(STEPS + 1);
+        let mut run = |s: &mut Session<Body>| -> Result<History, GateError> {
+            let t = Instant::now();
             let mut next = s.prompt(ids, Want::Argmax)?.argmax();
+            walls.push(ms(t));
             let mut h = History {
                 tokens: Vec::with_capacity(STEPS),
                 fnvs: Vec::with_capacity(STEPS),
@@ -227,7 +237,9 @@ mod gate {
                 landed: 0,
             };
             for _ in 0..STEPS {
+                let t = Instant::now();
                 let out = s.step(next, Want::Logits)?;
+                walls.push(ms(t));
                 if let runtime::Out::Logits { row, .. } = out {
                     h.fnvs.push(fnv(row));
                 }
@@ -250,6 +262,22 @@ mod gate {
         };
         let passes = take_passes(s)?;
         h.landed = passes.iter().map(|(_, r)| r.landed).sum();
+        let late: usize = passes.iter().map(|(_, r)| r.late).sum();
+        let steps = walls.get(1..).unwrap_or(&[]);
+        let (slowest, max) = steps
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, 0.0f64), |a, (i, w)| if w > a.1 { (i, w) } else { a });
+        println!(
+            "history: clear {clear_ms:.1} ms, prompt {:.1} ms, {} steps mean {:.2} ms, slowest \
+             step {slowest} {max:.1} ms, {} boundaries, {} flips landed, {late} late",
+            walls.first().copied().unwrap_or(f64::NAN),
+            steps.len(),
+            steps.iter().sum::<f64>() / steps.len().max(1) as f64,
+            passes.len(),
+            h.landed
+        );
         h.passes = passes.iter().map(|&(k, r)| (k, r.kept)).collect();
         Ok(h)
     }
@@ -453,6 +481,7 @@ mod gate {
 
     /// `resident`: the churn pool and the host experts in, the pinned out.
     fn resident_clause(s: &Session<Body>, seeds: &[(usize, Vec<u32>)]) -> Result<bool, GateError> {
+        let t = Instant::now();
         let m = s.model();
         let b = m.body(NAME)?;
         let source = b
@@ -484,7 +513,8 @@ mod gate {
         }
         let ok = asked > 0 && wrong.is_empty();
         println!(
-            "resident: {asked} experts asked, {} wrong{}: {}",
+            "resident: {asked} experts asked in {:.1} s, {} wrong{}: {}",
+            t.elapsed().as_secs_f64(),
             wrong.len(),
             wrong
                 .first()

@@ -1097,6 +1097,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          after its card lock(s); a recipe in the justfile's `v41-load` group exports it.",
     ),
     runner(
+        "BLOOMERY_GATE_STACKS",
+        Some("gpu-gate.sh"),
+        "Whole seconds: the GPU gate's binary runs under `tools/ref/stack-watch.sh`, which dumps \
+         its thread stacks and ends it once its output has stopped that long; unset, no watch.",
+    ),
+    runner(
         "BLOOMERY_BOX_CARD",
         Some("box.sh"),
         "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000` or \

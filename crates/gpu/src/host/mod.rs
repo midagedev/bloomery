@@ -269,6 +269,30 @@ pub struct Refusal {
     pub detail: String,
 }
 
+/// The bound on a host wait for a stream to drain at a quiet point (a
+/// residency reset, a tier's reset): the same bound as the residency
+/// machine's own drain of its copy stream.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Wait, polling, until `stream` has drained; past [`DRAIN_DEADLINE`] the
+/// error names the wait `what`.
+fn drain_within(stream: &CudaStream, what: &'static str) -> Result<(), GpuError> {
+    let t0 = Instant::now();
+    while !stream_idle(stream)? {
+        if t0.elapsed() > DRAIN_DEADLINE {
+            return Err(GpuError::protocol(
+                what,
+                format!(
+                    "the stream did not drain in {:?} (deadline {DRAIN_DEADLINE:?})",
+                    t0.elapsed()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    Ok(())
+}
+
 /// What a residency pass was, as its caller names it when it keeps its rows
 /// ([`HostTier::keep_rows`]); the `residency pass` record's `pass` word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -679,9 +703,15 @@ impl<H: HostExperts> HostTier<H> {
         let Some(m) = self.swap.as_mut() else {
             return Ok(None);
         };
-        stream.synchronize()?;
+        drain_within(
+            stream,
+            "HostTier::swap_reset: the engine stream before the reset",
+        )?;
         let r = m.reset(stream, &mut self.slots)?;
-        stream.synchronize()?;
+        drain_within(
+            stream,
+            "HostTier::swap_reset: the engine stream after the reset",
+        )?;
         self.step.tally.clear();
         self.swap_kept = None;
         Ok(Some(r))
@@ -1083,7 +1113,7 @@ impl<H: HostExperts> HostTier<H> {
             }
             let w = self.words();
             if let Some(t) = self.tier.as_mut() {
-                t.gpu().stream().synchronize()?;
+                drain_within(t.gpu().stream(), "Hybrid::reset: the expert tier's stream")?;
                 if !t.at_rest() {
                     return Err(GpuError::protocol(
                         WHAT,
