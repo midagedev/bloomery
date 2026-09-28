@@ -206,9 +206,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::M,
         kind: Kind::Words(&["lookup", "dspark"]),
         default: Unset::Means("the plain path, one token a step"),
-        doc: "`generate_ds41`: `lookup` serves an n-gram lookup draft, `dspark` the DSpark \
-              draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed two-row pass; the \
-              `tokens` line is the plain run's.",
+        doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
+              draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
+              two-row pass; the greedy ids are the plain run's. The server refuses a request \
+              that samples or bans an id (a 400 naming the field).",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
@@ -611,9 +612,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::Text,
         default: Unset::Means("the 3090"),
-        doc: "`generate_ds41` under `BLOOMERY_DRAFT=dspark`: the placement card the DSpark \
-              draft loads on, by its name; it may be the target's own card. Any other name \
-              is refused by name.",
+        doc: "`generate_ds41` and `bloomery-serve-ds41` under `BLOOMERY_DRAFT=dspark`: the \
+              placement card the DSpark draft loads on, by its name; it may be the target's \
+              own card. Any other name is refused by name.",
         site: Site::Direct {
             at: &[InPlace {
                 file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",
@@ -699,8 +700,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("ref/timing-card.sh"),
         "The DSpark draft file: the V4.1 profile's `DSPARK_MODEL` \
          (`tools/ref/models/deepseek41.sh`), which the DSpark recipes and \
-         `tools/ref/timing-card.sh` export; a binary that needs it and finds it unset \
-         says so.",
+         `tools/ref/timing-card.sh` export; `generate_ds41` and `bloomery-serve-ds41` \
+         under `BLOOMERY_DRAFT=dspark` read it, and a binary that needs it and finds it \
+         unset says so.",
     ),
     path(
         "BLOOMERY_ENGRAM_BIN",

@@ -1115,10 +1115,16 @@ gate-gpu-ds41-chat:
 # end-of-generation id), a chat turn streamed and not streamed (same content, [DONE] last), /tokenize of the row's text
 # against the row's ids, the same /completion again after those (reset leaves nothing behind), and /props' engine
 # object (name and version, the file's header facts, each device's bytes = the plan's, the KV bytes); then kills the
-# server it spawned and waits for it. Two loads; logs and the raw stream in target/serve-gate/.
+# server it spawned and waits for it. Then the same server under BLOOMERY_DRAFT=dspark with the draft on the A6000
+# (BLOOMERY_DSPARK_CARD=A6000, the profile's DSPARK_MODEL): gate_ds41_serve --plain holds its greedy ids to the plain
+# server's and generate_ds41's, and checks /props' draft object and row, the draft counts in timings and /metrics, the
+# 400s for sampling and ignore_eos, and prefix reuse under the draft (a continuation, a cut, a resume) against
+# cache_prompt: false. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch
+# runs it alone). Three loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/.
+[group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D'
 
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
