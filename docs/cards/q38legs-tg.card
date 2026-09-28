@@ -1,0 +1,36 @@
+# Round q38legs (D1b-a): Qwen3.8's card leg on the step. Same binary, two arms by the plan lever:
+# BLOOMERY_QWEN38_EXPERTS=host (every routed expert on the host tier, today's 40.46 tok/s at depth 6,
+# rig-log 09-28#q38-release) against =card (place::Experts::Card: each of the 43 eligible layers' id
+# prefix on the card, 303 on the first 4 and 302 on the rest at ctx 4096, U 4096 — qwen4exp_meta's
+# CARD_PLANS). Per layer the step is a sum across layers and a max inside one: card front 194 us (the
+# mixes, mixer, router; C_front / 48) -> go -> [host bridge over the host slots || card shadow: shared
+# expert 24 us + the leg's five launches 14 us + 5.3 us a card slot] -> wait -> combine. The leg sits
+# under the host's window (the shadow passes the bridge only at K* >= 8..9 card slots of 10,
+# P 0.04..0.15), so its own time is worth 0; the gain is the host's slots, 10 -> ~4.1 a layer at a
+# card hit of 0.59 (uniform routing over 303/512). Step 24.72 ms -> 16.28..18.47 ms, 54.1..61.4
+# tok/s, +34..+52 % [derived, q38d1bd §4, pred.py]. The hit a greedy continuation of the lcg prompt
+# reaches is not measured: at h 0.20 / 0.30 / 0.45 the same model gives 44.3..45.8 / 46.5..49.0 /
+# 50.2..54.8 tok/s, so the band is widened down to h 0.20: +9..+52 %.
+# Waits on tools/ref/depth-qwen3moe.sh taking a per-arm lever (an `@K=V` suffix on ours arms, as
+# depth-ds41.sh's `prose:<P>[@K=V,...]`): BLOOMERY_BOX_ENV reaches every arm, so today the runner
+# cannot pair the two arms in one lease. Not to be sat before that change lands.
+kind: ab
+question: does the card leg shorten Qwen3.8's decode step by the host slots its card experts remove?
+term: tg tok/s @ n=96, depth 6 (the lcg prompt), ctx 4096 (BLOOMERY_GEN_CTX=4096, so the card
+  plan's ubatch is 4,096 and its counts are CARD_PLANS' row), A6000, plan a,
+  BLOOMERY_QWEN38_EXPERTS=card against =host, same binary, paired by round
+unit: %
+predict: +9..+52
+rounds: 2
+condition: one binary, both arms through the lever in one lease, a fresh process per arm, the host
+  set and the PLE table warm before each timed window (majflt in the window near 0), no [cpu-busy]
+  or [other-busy] row; the card arm's plan line prints experts=card and card_experts 12,990 (4 x 303
+  + 39 x 302), its load line card_layers=43; the host arm's plan line experts=host, card_experts 0
+decide-in: land q38legs's plan lever as measured; run one untimed BLOOMERY_STEP_STATS=1 card arm for
+  the realized host slots a step (the card hit) and write it beside the tok/s in rig-log; open
+  q38route (R2)
+decide-below: read the realized card hit from one BLOOMERY_STEP_STATS=1 run: a hit under 0.20 is the
+  routing, not the leg (open the hot/adaptive placement question); a hit near 0.59 with the step
+  still long means the leg left the host's window: nsys one card step before any change
+decide-above: the host bridge's per-slot cost was over-counted: price it from the step stats' leg_us
+  against host_slots before opening q38route

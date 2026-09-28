@@ -227,6 +227,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.mtp_head_rows(), None);
     assert_eq!(unset.route_trace(), None);
     assert!(!unset.check_finite());
+    assert_eq!(unset.qwen38_experts(), "host");
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -258,6 +259,7 @@ fn accessors_read_their_rows() {
             (CARD_DONTNEED, "0"),
             (R8, "off"),
             (RESIDENCY, "mid-p40-s1"),
+            (QWEN38_EXPERTS, "card"),
             (PREFILL_GROUP, "8"),
         ]),
         Scope::Every,
@@ -278,6 +280,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), "mid-p40-s1");
+    assert_eq!(set.qwen38_experts(), "card");
     assert_eq!(
         set.host(),
         HostCfg {
@@ -310,7 +313,8 @@ fn accessors_read_their_rows() {
             HOST_LOCK,
             CARD_DONTNEED,
             R8,
-            RESIDENCY
+            RESIDENCY,
+            QWEN38_EXPERTS
         ]
     );
 }

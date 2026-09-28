@@ -18,20 +18,26 @@
 //!   attention ([`QsaPlan`]); the feed-forward site's mix, its combine of the
 //!   mixer's output first; the router; the host leg's send (the step's
 //!   handoff and go, the pass's download);
-//! - the shadow: the shared expert;
+//! - the shadow: on a layer with card experts the card leg ([`Card38`]:
+//!   the routed experts the slot map puts on the card, from the places the
+//!   step's and the verify's handoff wrote beside the ids, or the pass's
+//!   places launch in its front), then the shared expert;
 //! - the back: the join (the step's wait; the pass's serve and upload are the
-//!   walk's), and the routed sum plus the gated shared expert into `y`, the
-//!   next site's combine input.
+//!   walk's), and the host's routed sum, the card's on a layer with card
+//!   experts, plus the gated shared expert into `y`, the next site's combine
+//!   input.
 //!
 //! After the last layer the head's mix (its norm applies the last combine)
 //! writes the head's input. Launches of the captured step
 //! ([`step_launches`]): the embedding; per layer the two mixes' three, the
 //! mixer's ([`GDN_LAUNCHES`] or [`QSA_LAUNCHES`]), the PLE site's
-//! [`PLE_LAUNCHES`] on its layer, and the block's [`FFN_LAUNCHES`] — two of
+//! [`PLE_LAUNCHES`] on its layer, the block's [`FFN_LAUNCHES`] — two of
 //! them the go and the wait, stream memory-operation batches
-//! ([`STEP_MEMOPS`] a layer); then the head's mix, projection and argmax.
+//! ([`STEP_MEMOPS`] a layer) — and the card leg's [`CARD_LAUNCHES`] on a
+//! layer with card experts; then the head's mix, projection and argmax.
 
 use super::body::ATTN_SCALE_256;
+use super::card38::{CARD_LAUNCHES, Card38};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::proj::ProjKernels;
 use super::router::gated;
@@ -43,7 +49,7 @@ use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::hc_gated::{Before, HcGatedKernels, HcScratch, HcWideKernels, MixArgs, SiteWeights};
 use crate::head::Head;
-use crate::host::handoff::{Handoff, HandoffKernels};
+use crate::host::handoff::{Handoff, HandoffKernels, Places};
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
 use crate::linear::conv::ConvArgs;
@@ -53,7 +59,9 @@ use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
-use crate::q38::{EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs};
+use crate::q38::{
+    CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
+};
 use crate::qsa::{PoolArgs, QsaKernels, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::tensor::DeviceTensor;
@@ -98,29 +106,35 @@ pub(super) const GDN_ROWS_LAUNCHES: usize = 2;
 /// the indexer queries copied token-major.
 pub(super) const QSA_ROWS_LAUNCHES: usize = 1;
 
-/// The captured decode step's launches for `plans` (module doc).
-pub(super) fn step_launches(plans: &[Layer38]) -> usize {
-    walk_launches(plans, 1)
+/// The captured decode step's launches for `plans` with `card`'s card
+/// experts (module doc).
+pub(super) fn step_launches(plans: &[Layer38], card: &Card38) -> usize {
+    walk_launches(plans, card, 1)
 }
 
-/// The captured verify's launches for `plans` at `m >= 2` rows: the step's,
-/// plus each mixer's token-major copies ([`GDN_ROWS_LAUNCHES`],
-/// [`QSA_ROWS_LAUNCHES`]); the handoff, the go, the wait and the head are
-/// one each whatever `m`.
-pub(super) fn verify_launches(plans: &[Layer38], m: usize) -> usize {
-    walk_launches(plans, m)
+/// The captured verify's launches for `plans` with `card`'s card experts at
+/// `m >= 2` rows: the step's, plus each mixer's token-major copies
+/// ([`GDN_ROWS_LAUNCHES`], [`QSA_ROWS_LAUNCHES`]); the handoff, the go, the
+/// wait, the card leg and the head are one each whatever `m`.
+pub(super) fn verify_launches(plans: &[Layer38], card: &Card38, m: usize) -> usize {
+    walk_launches(plans, card, m)
 }
 
-fn walk_launches(plans: &[Layer38], m: usize) -> usize {
+fn walk_launches(plans: &[Layer38], card: &Card38, m: usize) -> usize {
     let rows = m > 1;
     1 + plans
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(l, p)| {
             let mixer = match p.mixer {
                 Mixer38::Gdn(_) => GDN_LAUNCHES + usize::from(rows) * GDN_ROWS_LAUNCHES,
                 Mixer38::Qsa(_) => QSA_LAUNCHES + usize::from(rows) * QSA_ROWS_LAUNCHES,
             };
-            MIX_LAUNCHES + mixer + FFN_LAUNCHES + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
+            MIX_LAUNCHES
+                + mixer
+                + FFN_LAUNCHES
+                + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
+                + usize::from(card.has(l)) * CARD_LAUNCHES
         })
         .sum::<usize>()
         + HEAD_LAUNCHES
@@ -284,8 +298,8 @@ impl Ctx38<'_> {
 
 /// The parts of the body one walk writes: the plans, the stores, the PLE
 /// ring, the arena, the unit's input record, its width, the stream buffer
-/// the next site reads, the layer taps when a gate armed them, and the slot
-/// map's card copy.
+/// the next site reads, the layer taps when a gate armed them, the slot
+/// map's card copy and the card leg.
 pub(super) struct Parts38<'a> {
     pub(super) c: Ctx38<'a>,
     pub(super) plans: &'a [Layer38],
@@ -297,6 +311,7 @@ pub(super) struct Parts38<'a> {
     pub(super) cur: usize,
     pub(super) taps: Option<&'a mut Taps38>,
     pub(super) slots: &'a DeviceTensor<u32>,
+    pub(super) card: &'a mut Card38,
     /// A verify's row mode: each row's delta state into a lane of its own
     /// (`linear::delta`'s `gdn_delta_lanes`); else the last row's back into
     /// the committed lane.
@@ -524,25 +539,59 @@ impl Parts38<'_> {
         c.q8_gemv(&p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
     }
 
-    /// Layer `l`'s block output into `y`: the host's routed sum `hsum` plus
-    /// the shared expert's output times its gate weight.
+    /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`), when it
+    /// has card experts: the places in the arena's `sel`, the router's
+    /// weights, into the card sum ([`Card38::enqueue`]).
+    fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+        if !self.card.has(l) {
+            return Ok(());
+        }
+        let s = &*self.s;
+        let x = x.unwrap_or(&s.ffn_x);
+        self.card
+            .enqueue(&self.c, l, x, self.m, &s.sel, &s.route.weights)
+    }
+
+    /// Layer `l`'s block output into `y`: the host's routed sum `hsum`, on a
+    /// layer with card experts the card's, plus the shared expert's output
+    /// times its gate weight.
     fn shared_add(&mut self, l: usize, hsum: &DeviceBuffer<f32>) -> Result<(), GpuError> {
         let sink = self.c.gpu.layer_sink(l)?;
         let s = &mut *self.s;
-        self.c.k.q38.enqueue_shared_add(
-            self.c.gpu.stream(),
-            SharedAddArgs {
-                hsum,
-                sh: &s.sh_y,
-                w: &s.route.weights,
-                slot: geo::N_USED,
-                slots: geo::N_USED + 1,
-                n: geo::HIDDEN,
-                m: self.m,
-                fault: sink,
-                y: &mut s.y,
-            },
-        )
+        let (stream, q38) = (self.c.gpu.stream(), &self.c.k.q38);
+        let (slot, slots, n, m) = (geo::N_USED, geo::N_USED + 1, geo::HIDDEN, self.m);
+        if self.card.has(l) {
+            q38.enqueue_card_shared_add(
+                stream,
+                CardSharedAddArgs {
+                    hsum,
+                    acc: self.card.acc()?,
+                    sh: &s.sh_y,
+                    w: &s.route.weights,
+                    slot,
+                    slots,
+                    n,
+                    m,
+                    fault: sink,
+                    y: &mut s.y,
+                },
+            )
+        } else {
+            q38.enqueue_shared_add(
+                stream,
+                SharedAddArgs {
+                    hsum,
+                    sh: &s.sh_y,
+                    w: &s.route.weights,
+                    slot,
+                    slots,
+                    n,
+                    m,
+                    fault: sink,
+                    y: &mut s.y,
+                },
+            )
+        }
     }
 
     /// The head's mix over the unit's columns, the last layer's combine
@@ -854,10 +903,11 @@ impl<'a> LayerProgram for Step38<'a> {
         hy.boundary().enqueue_go_of(stream, l, 0)
     }
 
-    /// The shared expert over the boundary's activation.
+    /// The card leg, then the shared expert, over the boundary's activation.
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p
-            .shared(at.layer, Some(port.hybrid().boundary().normed()))
+        let x = port.hybrid().boundary().normed();
+        self.p.card(at.layer, Some(x))?;
+        self.p.shared(at.layer, Some(x))
     }
 
     /// The wait, the gated sum, and the host tier told the layer is enqueued
@@ -954,10 +1004,12 @@ impl<'a> LayerProgram for Verify38<'a> {
         hy.boundary().enqueue_go_of(stream, l, 0)
     }
 
-    /// The shared expert over the boundary's activations.
+    /// The card leg, then the shared expert, over the boundary's
+    /// activations.
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p
-            .shared(at.layer, Some(port.hybrid().boundary().normed()))
+        let x = port.hybrid().boundary().normed();
+        self.p.card(at.layer, Some(x))?;
+        self.p.shared(at.layer, Some(x))
     }
 
     /// The wait, the gated sum over the `m` columns' host sums, and the host
@@ -1029,7 +1081,9 @@ impl<'a> LayerProgram for Pass38<'a> {
 
     /// The layer up to its router, the mix into the arena's `ffn_x`, then
     /// the download of the unit's activations and routed slots (the router's
-    /// `N_USED + 1` a token, the routed `N_USED` of them).
+    /// `N_USED + 1` a token, the routed `N_USED` of them), and on a layer
+    /// with card experts each routed slot's place into the arena's `sel`
+    /// from the slot map's card copy.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.front(l)?;
@@ -1037,18 +1091,36 @@ impl<'a> LayerProgram for Pass38<'a> {
         self.p.route(l, None)?;
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
-        let s = &*self.p.s;
+        let s = &mut *self.p.s;
         port.hybrid().enqueue_download_pitched(
             stream,
             [&s.ffn_x, &s.route.weights],
             &s.route.ids,
             geo::N_USED + 1,
             key,
+        )?;
+        if !self.p.card.has(l) {
+            return Ok(());
+        }
+        let p = Places {
+            ids: &s.route.ids,
+            map: self.p.slots.buf(),
+            row_off: l * geo::EXPERTS,
+            n_expert: geo::EXPERTS,
+        };
+        self.p.c.k.handoff.enqueue_places_cols(
+            stream,
+            &p,
+            geo::N_USED + 1,
+            self.p.m,
+            self.p.c.gpu.layer_sink(l)?,
+            &mut s.sel,
         )
     }
 
-    /// The shared expert over the arena's `ffn_x`.
+    /// The card leg, then the shared expert, over the arena's `ffn_x`.
     fn shadow(&mut self, _: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        self.p.card(at.layer, None)?;
         self.p.shared(at.layer, None)
     }
 

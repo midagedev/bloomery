@@ -29,6 +29,7 @@ pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
+pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -311,6 +312,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               clear, the server's `POST /residency/reset`), with a `residency reset` record. \
               `bloomery-serve-ds41` refuses it beside `BLOOMERY_ROUTE_TRACE`, which records a \
               fixed placement's routing. Every other binary refuses it set, by name.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: QWEN38_EXPERTS,
+        class: Class::A,
+        kind: Kind::Words(&["host", "card"]),
+        default: Unset::Is("host"),
+        doc: "Qwen3.8 (`generate_qwen3moe`): `host` plans every routed expert on the host \
+              tier; `card` plans each layer's id prefix on the card as its budget holds \
+              (`place::Experts::Card`), run by the step's, the verify's and the pass's card \
+              leg — the same-binary arm. The ubatch walk refuses a card plan by name, so a \
+              card-plan prompt runs as passes (`--prefill pass`). The `plan` line prints \
+              `experts=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
