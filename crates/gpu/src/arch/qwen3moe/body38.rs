@@ -19,9 +19,13 @@
 //! no walk reads it.
 //!
 //! The walk is `program38`'s. The decode step is captured; a prompt runs
-//! either as captured steps, one a position ([`Prompt38::Step`]), or as
-//! eager passes of up to eight positions through the batch port
-//! ([`Prompt38::Pass`]) — each row bit for bit its step.
+//! as captured steps, one a position ([`Prompt38::Step`]), as eager passes
+//! of up to eight positions through the batch port ([`Prompt38::Pass`]) —
+//! each row bit for bit its step — or as ubatches of up to the load's size
+//! (`BLOOMERY_QWEN3_UBATCH`, at most 4,096 positions) through the same port
+//! at their width (`wide38`, [`Prompt38::Gemm`]), each position's bits a
+//! function of its own inputs and not bit for bit the pass's: its Q8_0
+//! projections read q8 activations.
 //!
 //! A verify ([`Rows`]) runs 2 to [`VERIFY_ROWS`] consecutive positions as
 //! one captured pass through the step port's `Cols` chain into one head of
@@ -64,9 +68,11 @@ use super::program38::{
 };
 use super::scratch::{Io, LANE, RopeRows, StepParams, f32_view};
 use super::scratch38::{
-    Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, dims, kept_lane,
-    store_rule_bytes,
+    Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
+    dims, kept_lane, store_rule_bytes,
 };
+use super::ubatch::UBATCH as UBATCH_MOST;
+use super::wide38::{Gemm38, Wide38, WideParts, WideTaps, card_leg, route_taps_host};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
@@ -102,40 +108,48 @@ pub const ALLOWED: &[&str] = &[
 pub type Qwen38Model = GpuModel<Body38>;
 
 /// How a prompt runs: captured steps, one a position — the decode step's
-/// graph — or eager passes of up to eight positions through the host tier's
-/// batch port. Both leave every position's state and logits bit for bit.
+/// graph — eager passes of up to eight positions through the host tier's
+/// batch port, both leaving every position's state and logits bit for bit;
+/// or ubatches of up to the load's size through the same port at their
+/// width, the Q8_0 projections on q8 activations (`wide38`). `Auto` is the
+/// ubatches from [`Prompt38::GEMM_FROM`] positions on and the passes below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt38 {
     Step,
     Pass,
+    Gemm,
+    Auto,
 }
 
 impl Prompt38 {
     /// Positions an eager pass takes at most.
     pub const PASS_ROWS: usize = PASS_ROWS;
+    /// The fewest positions `Auto` runs as ubatches: one past a pass.
+    pub const GEMM_FROM: usize = PASS_ROWS + 1;
 
-    /// The path a command line names: `step` or `pass`. The ubatch GEMM
-    /// paths (`gemm`, `auto`) are refused by name with what they lack here,
-    /// as is anything else.
+    /// The path a command line names: `step`, `pass`, `gemm` or `auto`;
+    /// anything else is refused by name.
     pub fn parse(s: &str) -> Result<Prompt38, GpuError> {
         match s {
             "step" => Ok(Prompt38::Step),
             "pass" => Ok(Prompt38::Pass),
-            "gemm" | "auto" => Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "prompt path {s:?}: qwen4exp has no ubatch GEMM path — no gemm_q8_0 entry \
-                     (every card matrix is Q8_0 with f32 activations), GemmAct takes K a \
-                     multiple of 256 (the shared expert's down reads K 640, the \
-                     hyper-connection up K 320), and GEMM_MAX_SLOTS bounds one route table; \
-                     the prompt runs `step` (captured steps) or `pass` (eager passes of up to \
-                     {PASS_ROWS})"
-                ),
-            )),
+            "gemm" => Ok(Prompt38::Gemm),
+            "auto" => Ok(Prompt38::Auto),
             other => Err(GpuError::shape(
                 WHAT,
-                format!("prompt path {other:?}: `step` or `pass`"),
+                format!("prompt path {other:?}: `step`, `pass`, `gemm` or `auto`"),
             )),
+        }
+    }
+
+    /// The path a prompt of `n` positions runs: `Auto` resolved, any other
+    /// itself.
+    #[must_use]
+    pub fn resolve(self, n: usize) -> Prompt38 {
+        match self {
+            Prompt38::Auto if n >= Prompt38::GEMM_FROM => Prompt38::Gemm,
+            Prompt38::Auto => Prompt38::Pass,
+            p => p,
         }
     }
 
@@ -145,6 +159,8 @@ impl Prompt38 {
         match self {
             Prompt38::Step => "step",
             Prompt38::Pass => "pass",
+            Prompt38::Gemm => "gemm",
+            Prompt38::Auto => "auto",
         }
     }
 }
@@ -170,8 +186,9 @@ struct PleHost {
     rows: usize,
     width: usize,
     row_bytes: usize,
-    /// Row ids of up to a pass's positions, the count the last fill or keep
-    /// named, and the fill's decoded values (`HIDDEN` a position).
+    /// Row ids of up to a call's positions (a pass's or a ubatch's), the
+    /// count the last fill or keep named, and the fill's decoded values
+    /// (`HIDDEN` a position).
     ids: Vec<u32>,
     named: usize,
     e: Vec<f32>,
@@ -179,8 +196,9 @@ struct PleHost {
 
 impl PleHost {
     /// The table `per_layer_token_embd` of `file`, IQ4_NL rows of the hash's
-    /// width, and the hash from the first shard's keys. Load-time only.
-    fn new(file: Arc<Split>, n_vocab: usize) -> Result<PleHost, GpuError> {
+    /// width, and the hash from the first shard's keys, for calls of up to
+    /// `cap` positions. Load-time only.
+    fn new(file: Arc<Split>, n_vocab: usize, cap: usize) -> Result<PleHost, GpuError> {
         let name = model::arch::qwen35moe::names::per_layer_token_embd();
         let refuse = |need: &'static str| GpuError::Tensor {
             what: WHAT,
@@ -225,9 +243,9 @@ impl PleHost {
             rows,
             width,
             row_bytes,
-            ids: vec![0; PASS_ROWS * per_token],
+            ids: vec![0; cap * per_token],
             named: 0,
-            e: vec![0.0; PASS_ROWS * geo::HIDDEN],
+            e: vec![0.0; cap * geo::HIDDEN],
         })
     }
 
@@ -443,6 +461,14 @@ pub struct Body38 {
     k: Kernels38,
     /// The slot map's card copy: every place the host's.
     slots: DeviceTensor<u32>,
+    /// A ubatch walk's arena, record, host sums and own buffers, for
+    /// ubatches of up to `wide.rows` positions.
+    wa: Arena38,
+    wr: WideRecord,
+    wide_hsum: DeviceBuffer<f32>,
+    wide: Wide38,
+    /// A slot map a gate planted for the next ubatch call's card-leg check.
+    plant_map: Option<SlotMap>,
     /// The lane word every delta launch reads, and the verify waiting for
     /// its commit.
     lane: LaneWord,
@@ -664,6 +690,22 @@ impl Body38 {
         let a = Arena38::new(stream, router_dims, PASS_ROWS, ctx)?;
         let rp = PassRecord::new(stream)?;
         let pass_hsum = DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?;
+        let ub = super::ubatch::ubatch_size()?.min(ctx);
+        let wa = Arena38::wide(stream, router_dims, ub, UBATCH_MOST, ctx)?;
+        let wr = WideRecord::new(stream, ub)?;
+        let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
+        let wide = Wide38::new(stream, ub)?;
+        let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
+        let counted = model::arch::qwen35moe::place::ubatch_scratch_bytes(ub as u64);
+        if wide_bytes > counted {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a ubatch of {ub} holds {wide_bytes} card bytes, the plan counts {counted}"
+                ),
+            ));
+        }
+        let host_cols = ub.max(PASS_ROWS);
         let run = 0..n;
         let map = SlotMap::prefix(run.clone(), geo::EXPERTS, 0)?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), n, geo::EXPERTS)?;
@@ -686,12 +728,12 @@ impl Body38 {
         let mut experts = HostRun::build(Arc::clone(&file), 0, host.r8, widths, |src| {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
-        experts.prepare_union(PASS_ROWS)?;
+        experts.prepare_union(host_cols)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
-        hybrid.prepare_batch(gpu.context(), PASS_ROWS)?;
-        let ple = PleHost::new(file, spec.vocab as usize)?;
+        hybrid.prepare_batch(gpu.context(), host_cols)?;
+        let ple = PleHost::new(file, spec.vocab as usize, host_cols)?;
         let mut body = Body38 {
             hybrid,
             plans,
@@ -706,6 +748,11 @@ impl Body38 {
             pass_hsum,
             k: Kernels38::load(gpu)?,
             slots,
+            wa,
+            wr,
+            wide_hsum,
+            wide,
+            plant_map: None,
             lane: LaneWord::new(stream)?,
             pending: None,
             taps: None,
@@ -1137,6 +1184,154 @@ impl Body38 {
     }
 }
 
+impl Body38 {
+    /// Plan a ubatch of `tokens` (1..=the load's size) at `pos`, where the
+    /// stores stand: the card-leg check (a slot map with a routed expert on
+    /// the card is refused by name, [`card_leg`]), its PLE rows, its record
+    /// and its rows' copy to the ubatch arena, staged for
+    /// [`Body38::walk_gemm`]'s launch.
+    fn plan_gemm(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        let n = tokens.len();
+        let planted = self.plant_map.take();
+        card_leg(planted.as_ref().unwrap_or(self.hybrid.slots()))?;
+        if self.taps.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "layer taps off (a ubatch writes none)",
+            ));
+        }
+        self.check_next(pos, n)?;
+        let hist = self.ple.fill(pos, tokens)?;
+        self.wr.write(stream, tokens, pos)?;
+        // SAFETY: the ubatch arena holds `wide.rows · HIDDEN` values of `e`
+        // and `n <= wide.rows` (the record's write refused more), and `e`
+        // stays in place while the window lives (one synchronous copy).
+        let mut e = unsafe { f32_view(&self.wa.ple.e, 0, n * geo::HIDDEN) };
+        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.stage(pos, n, hist, None)
+    }
+
+    /// Launch the planned ubatch of `m` rows from `pos` through the batch
+    /// port at its width, then the head of its last row into `head` when
+    /// given.
+    fn walk_gemm(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        m: usize,
+        pos: u32,
+        head: Option<&mut Head>,
+    ) -> Result<(), GpuError> {
+        if !(1..=self.wide.rows).contains(&m) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a ubatch of {m} rows on an arena of {}", self.wide.rows),
+            ));
+        }
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.launch(pos, m)?;
+        let io = Io {
+            lane: Some(self.lane.word()),
+            ..self.wr.io()
+        };
+        let Body38 {
+            hybrid,
+            plans,
+            stores,
+            ple_ring,
+            rope,
+            wa,
+            wide_hsum,
+            wide,
+            k,
+            eps,
+            ctx,
+            plant,
+            ..
+        } = self;
+        let mut prog = Gemm38 {
+            p: WideParts {
+                c: Ctx38 {
+                    gpu,
+                    w,
+                    k,
+                    eps: *eps,
+                    table: &rope.table,
+                    ctx: *ctx,
+                },
+                plans,
+                stores,
+                ple_ring,
+                s: wa,
+                x: wide,
+                io: &io,
+                m,
+                pos0: pos as usize,
+                cur: 0,
+            },
+        };
+        let cap = prog.p.x.rows;
+        let mut leg = BatchLeg::new(gpu.stream(), hybrid, wide_hsum, cap);
+        prog.walk(&mut leg)?;
+        planted(plant, Plant::AfterLaunch)?;
+        match head {
+            Some(h) => prog.head(h),
+            None => Ok(()),
+        }
+    }
+
+    /// Positions one ubatch takes at most: the load's size
+    /// (`BLOOMERY_QWEN3_UBATCH`, at most the stores' positions).
+    #[must_use]
+    pub fn ubatch_rows(&self) -> usize {
+        self.wide.rows
+    }
+
+    /// The next ubatch call's card-leg check reads `map` instead of the tier's
+    /// own, once: a gate's stand-in for a placement with routed experts on
+    /// the card, which the ubatch walk refuses by name. Gate use.
+    pub fn plant_slot_map(&mut self, map: SlotMap) {
+        self.plant_map = Some(map);
+    }
+
+    /// The last ubatch walk's rows of each selecting layer: those the
+    /// prefill flash ran (selecting nothing) and those the selection did;
+    /// `None` before a walk reached a selecting layer. Gate use.
+    #[must_use]
+    pub fn ubatch_split(&self) -> Option<(usize, usize)> {
+        self.wide.split
+    }
+
+    /// Arm the ubatch walk's route taps for units of up to `rows` tokens
+    /// (`0` disarms them): each layer's router logits and routed ids, which
+    /// [`Body38::ubatch_route_taps`] reads back; a walk of more rows is
+    /// refused by name. Load-time allocation; gate use.
+    pub fn set_ubatch_route_taps(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
+        self.wide.taps = if rows == 0 {
+            None
+        } else {
+            Some(WideTaps::new(
+                gpu.stream(),
+                self.plans.len(),
+                rows,
+                self.wa.route.dims().logits(),
+            )?)
+        };
+        Ok(())
+    }
+
+    /// The last ubatch walk's route taps for its first `m` tokens: token
+    /// `t`'s route at layer `l` at `[t][l]`. Blocking; refused when the taps
+    /// are not armed or hold fewer tokens.
+    pub fn ubatch_route_taps(&self, gpu: &Gpu, m: usize) -> Result<Vec<Vec<RouteTap>>, GpuError> {
+        let taps = self.wide.taps.as_ref().ok_or(GpuError::state(
+            WHAT,
+            "armed ubatch route taps (set_ubatch_route_taps)",
+        ))?;
+        route_taps_host(taps, gpu.stream(), m)
+    }
+}
+
 impl GpuModel<Body38> {
     /// Arm (or disarm) the per-layer taps: after each layer the step copies
     /// its streams into the layer's tap, which [`Body38::taps`] reads back,
@@ -1153,9 +1348,11 @@ impl GpuModel<Body38> {
 
     /// Feed `tokens` from where the model stands by `path` and return the
     /// greedy next token after the last one: captured steps, one a position,
-    /// or eager passes of up to eight positions, the last one ending in its
-    /// last row's head. Either leaves every position's state and logits bit
-    /// for bit. A prompt past the stores, or with an id the embedding or the
+    /// eager passes of up to eight positions, or ubatches of up to
+    /// [`Body38::ubatch_rows`], the last pass or ubatch ending in its last
+    /// row's head. Steps and passes leave every position's state and logits
+    /// bit for bit; ubatches leave a position's bits a function of its own
+    /// inputs, the same whatever the ubatches' cut. A prompt past the stores, or with an id the embedding or the
     /// PLE hash does not take (one past the vocabulary, the image
     /// placeholder), is refused before any launch, so either path leaves the
     /// model where it stood; the layer taps must be off for passes.
@@ -1183,8 +1380,30 @@ impl GpuModel<Body38> {
                 ),
             ));
         }
-        match path {
+        match path.resolve(tokens.len()) {
             Prompt38::Step => self.step(tokens),
+            Prompt38::Gemm | Prompt38::Auto => {
+                let rows = self.body(WHAT_P)?.wide.rows;
+                let n = tokens.len().div_ceil(rows);
+                let mut next = None;
+                for (i, chunk) in tokens.chunks(rows).enumerate() {
+                    let last = i + 1 == n;
+                    let pos = self.pos();
+                    {
+                        let (gpu, _, body) = self.body_parts(WHAT_P)?;
+                        body.plan_gemm(gpu.stream(), chunk, pos)?;
+                    }
+                    let m = chunk.len();
+                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
+                        body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
+                        Ok(last)
+                    })?;
+                }
+                next.ok_or(GpuError::state(
+                    WHAT_P,
+                    "a token read after the last ubatch",
+                ))
+            }
             Prompt38::Pass => {
                 let n = tokens.len().div_ceil(PASS_ROWS);
                 let mut next = None;
@@ -1343,6 +1562,11 @@ impl ChainBody for Body38 {
             + self.a.bytes()
             + self.rp.bytes()
             + self.pass_hsum.num_bytes()
+            + self.wa.bytes()
+            + self.wr.bytes()
+            + self.wide_hsum.num_bytes()
+            + self.wide.bytes()
+            + self.wide.taps.as_ref().map_or(0, WideTaps::bytes)
             + self.slots.buf().num_bytes()
             + self.lane.bytes()
             + self.hybrid.boundary().device_bytes()

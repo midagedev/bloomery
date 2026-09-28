@@ -36,6 +36,7 @@ mod taps;
 mod taps35;
 pub mod ubatch;
 mod wide;
+mod wide38;
 
 pub use body::{Body, DecodeInput, FlashKind, OpenOpts};
 pub use body35::{Body35, DecodeInput35, LayerKind35, Open35};

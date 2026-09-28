@@ -1,0 +1,36 @@
+# q38wide lands the Qwen3.8 prompt's ubatch walk (Prompt38::Gemm, flow (a)): a prompt of P >= 9 runs in ubatches of
+# up to U = BLOOMERY_QWEN3_UBATCH (default 4096) through the 32-value int8 GEMM family, every routed expert in the
+# host union at U columns, where the base (cf3fbbf, `auto` = the 8-row pass walk) runs ceil(P/8) passes of 8.
+# Per layer-batch (48 of them a ubatch) the wall is a sum: the card front F, the leg's PCIe down + up, the host
+# union t(m) = max(W, a + c.m), the back. F(512) 2.2..2.8 ms, F(4096) 18.6..22 ms (q38pfd's 18.6 plus ~2.6 ms of
+# the HC glue passes this round adds); PCIe 0.4 / 3.2 ms (42 MB each way at 26.28 GB/s); t(512) 20.5..26.1 ms,
+# t(4096) 150..191 ms (q38pfd's a and c; q38-union.card measures them) [derived]. The shared expert (~0.7 ms at
+# 4096) runs under the union's shadow: worth 0. So pp512 368..457 and pp4096 398..494 tok/s [derived], against the
+# pass walk's ~104 at kind=pass (the release sitting, q38-warm.card's note): +283..+375 % at 4096, the term; P = 512
+# at +248..+332 % is a screen of the same terms at 1/8 the columns; the decode rows are screens for 0 (the step
+# path is not touched).
+# The band's formula, for a re-derivation when q38-union.card's a and c land: at P = U, pp(U) = U / (48 (F(U) +
+# PCIe(U) + max(W, a + c U))) over the pass row at the same P; the head and the embed are under 1 %. The pass rate at
+# P = 512 is assumed equal to the 4096 one (~104; the pass walk's attention grows with P, so its 512 row sits at or
+# above it and the screen's ratio at or below the band). BLOOMERY_WARM_ROWS=1 primes the bin: arm as well (its kind
+# takes run_unit's ours branch), so neither side reads cold PLE rows in a counted row.
+# Wall [derived]: per round and warm prime (BLOOMERY_WARM_ROWS=1 runs each of our arms twice), bin:512 ~16 s,
+# bin:4096 ~50 s, 512 ~12 s, 4096 ~22 s: ~200 s a round, three rounds ~10 min, plus lease and preheat: ~12 min.
+kind: ab
+question: does the ubatch walk run Qwen3.8's prompt at the speed the flow-(a) timeline predicts, at P = 4096?
+term: pp tok/s @ P = 4096, n = 0, A6000, Qwen3.8-Flash-Next (qwen4exp) - (gemm - pass) / pass, the pass arm the
+  cf3fbbf build, paired by round
+unit: %
+predict: +283..+375
+rounds: 3
+condition: the q38wide tree and the base (cf3fbbf by git archive into /root/repo/bloomery-q38wide-base, its
+  release generate_qwen3moe, a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_BOX_ENV='BLOOMERY_WARM_ROWS=1 BLOOMERY_LEASE_CARD=docs/cards/q38wide-pp.card' just depth-gpu-qwen4exp
+  512 bin:<base>:512 4096 bin:<base>:4096, the order rotated every round; our rows' plan text reads ubatch:, the
+  base's pass; no counted row [cold], [cpu-busy] or [other-busy]; the full output to a file first
+decide-in: the flow-(a) sum holds at U = 4096: the union is the wall's bulk, and q38stream (flow (c), hot experts
+  streamed to the card) is priced against this row's union ms from `stat prompt host`
+decide-below: a term of the sum is larger than the timeline says: read `stat prompt host` union_ms per service
+  against t(4096) and take one nsys of the P = 4096 prompt before q38stream is priced
+decide-above: the union runs under t(m)'s a + c.m (the fit q38-union.card reports is optimistic here or the
+  pass base is slower than 104): re-fit a and c from this row's union_ms before q38stream's prediction

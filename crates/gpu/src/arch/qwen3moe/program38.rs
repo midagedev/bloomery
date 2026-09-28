@@ -6,7 +6,8 @@
 //! card launch ([`Parts38`]); they differ in how a layer's routed experts
 //! reach the host and come back, and a verify keeps each row's delta state
 //! in a lane of its own where the step and the pass write the last row's
-//! back into the committed lane.
+//! back into the committed lane. A prompt's ubatch walk `(1, m, Batch)` over
+//! the ubatch's rows is `wide38`'s, its launches the wide family's.
 //!
 //! A layer's parts, by its plan ([`Layer38`]), never its number:
 //! - the front: the embedding in front of layer 0; the attention site's mix
@@ -38,7 +39,9 @@ use super::scratch::{Io, f32_view};
 use super::scratch38::{Arena38, Store38, Taps38};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
-use crate::hc_gated::{Before, HcGatedKernels, HcScratch, MixArgs, SiteWeights};
+use crate::flash_gqa_prefill::FlashGqaPrefill;
+use crate::gemm::{Gemm32Kernels, GemmKernels};
+use crate::hc_gated::{Before, HcGatedKernels, HcScratch, HcWideKernels, MixArgs, SiteWeights};
 use crate::head::Head;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::HostRun;
@@ -136,6 +139,12 @@ pub(super) struct Kernels38 {
     pub(super) handoff: HandoffKernels,
     /// The token-major copy of a row-major gemv output.
     pub(super) proj: ProjKernels,
+    /// The ubatch walk's: the one-expert table's fill, the 32-value GEMM
+    /// family, the prefill flash and the wide mixes.
+    pub(super) gemm: GemmKernels,
+    pub(super) g32: Gemm32Kernels,
+    pub(super) prefill: FlashGqaPrefill,
+    pub(super) hcw: HcWideKernels,
 }
 
 impl Kernels38 {
@@ -153,6 +162,10 @@ impl Kernels38 {
             router: gated::RouterKernels::load(ctx)?,
             handoff: HandoffKernels::load(ctx)?,
             proj: ProjKernels::load(ctx)?,
+            gemm: GemmKernels::load(ctx)?,
+            g32: Gemm32Kernels::load(ctx)?,
+            prefill: FlashGqaPrefill::load(ctx)?,
+            hcw: HcWideKernels::load(ctx)?,
         })
     }
 }

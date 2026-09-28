@@ -40,9 +40,24 @@
 //! No silent failure: a stream whose sum of squares is not finite, a partial
 //! dot, a bottleneck value, a combine weight or a mixed value that is not
 //! finite raises [`SITE`]; every value is written as computed.
+//!
+//! The wide arm ([`HcWideKernels`], a device module of its own) runs a mix
+//! over a whole ubatch of `m` columns, any count: the norm and the combine
+//! are the entries above with the eight-column cap lifted
+//! (`hc_gated_norm_4w`, `hc_gated_combine_4w`, the same bodies); the down
+//! and the up are the 32-value GEMM (`crate::gemm`'s `gemm_q8_0p` over a
+//! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
+//! the inject rows are the wide F32 tile; two glue entries finish the rule —
+//! `hc_gated_lo_4x320` (`silu(·/4)` of each down row, `2·σ(·/4)` of each
+//! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
+//! the up's order). A column's values are a function of that column alone;
+//! against the narrow arm the down and the up read q8 activations and sum
+//! each row whole, so the two arms agree to the error of that quantization
+//! and are not bit-equal. The same values raise [`SITE`].
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
+use crate::gemm::{Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{f32_lane_partial_1col, gemv_lane_sums, q8_0_lane_partials_mcol};
 use crate::tensor::DeviceTensor;
@@ -962,6 +977,521 @@ impl HcGatedKernels {
             0,
         ))?;
         self.module.hc_gated_combine_4(
+            stream,
+            &prep,
+            y,
+            &scratch.wgt,
+            launch_u32(what, "hidden", geo.d())?,
+            launch_u32(what, "m", m)?,
+            fault,
+            res,
+        )?;
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------ the wide arm
+
+/// Threads of a wide glue block, a value each.
+const GLUE_THREADS: u32 = 256;
+
+#[cuda_module]
+mod hc_wide_kernels {
+    use super::*;
+
+    /// [`hc_kernels::hc_gated_norm_4`] over any number of columns: block `b`
+    /// is stream `b % 4` of column `b / 4`, the same body.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            combine + init <= 1,
+            y.len() >= (combine + init) * m * hidden,
+            wgt.len() >= combine * m * 4,
+            gamma.len() >= 4 * hidden,
+            res.len() >= m * 4 * hidden,
+            xn.len() >= m * 4 * hidden
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_norm_4w(
+        y: &[f32],
+        wgt: &[f32],
+        gamma: &[f32],
+        hidden: u32,
+        eps: f32,
+        m: u32,
+        combine: u32,
+        init: u32,
+        fault: FaultSink,
+        mut res: DisjointSlice<f32>,
+        mut xn: DisjointSlice<f32>,
+    ) {
+        static mut WS: SharedArray<f32, NORM_WARPS> = SharedArray::UNINIT;
+        let b = thread::blockIdx_x() as usize;
+        let (s, c) = (b % STREAMS, b / STREAMS);
+        if c >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let hid = hidden as usize;
+        let base = (c * STREAMS + s) * hid;
+        // SAFETY: this block's own shared allocation, reached without a
+        // reference; `block_sum` is its only user.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
+        let w = if combine == 1 {
+            // SAFETY: c·4 + s < m·4 <= wgt.len().
+            unsafe { *wgt.get_unchecked(c * STREAMS + s) }
+        } else {
+            0.0
+        };
+        let mut acc = 0.0f32;
+        let mut i = tid;
+        while i < hid {
+            // SAFETY: base + i < m·4·hidden <= res.len(), c·hidden + i <
+            // m·hidden <= y.len(); this block owns stream s of column c and
+            // this thread value i of it.
+            let x = unsafe {
+                let r = res.get_unchecked_mut(base + i);
+                if combine == 1 {
+                    *r = f32::mul_add(w, *y.get_unchecked(c * hid + i), *r);
+                } else if init == 1 {
+                    *r = *y.get_unchecked(c * hid + i);
+                }
+                *r
+            };
+            acc = f32::mul_add(x, x, acc);
+            i += NORM_THREADS;
+        }
+        // SAFETY: `ws` is NORM_WARPS f32 of this block's shared memory.
+        let sum = unsafe { block_sum(acc, tid, ws) };
+        if tid == 0 && !sum.is_finite() {
+            fault.raise(SITE);
+        }
+        let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
+        let mut i = tid;
+        while i < hid {
+            // SAFETY: as above; s·hidden + i < 4·hidden <= gamma.len(). The
+            // value was written by this thread in the pass above.
+            unsafe {
+                let x = *res.get_unchecked_mut(base + i);
+                *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
+            }
+            i += NORM_THREADS;
+        }
+    }
+
+    /// [`hc_kernels::hc_gated_combine_4`] over any number of columns: value
+    /// `i` of `res` becomes `fma(wgt[c·4 + s], y[c][i % hidden], res[i])`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            y.len() >= m * hidden,
+            wgt.len() >= m * 4,
+            res.len() >= m * 4 * hidden
+        )
+    )]
+    pub fn hc_gated_combine_4w(
+        y: &[f32],
+        wgt: &[f32],
+        hidden: u32,
+        m: u32,
+        fault: FaultSink,
+        mut res: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let hid = hidden as usize;
+        if i >= m as usize * STREAMS * hid {
+            return;
+        }
+        let (cs, v) = (i / hid, i % hid);
+        let c = cs / STREAMS;
+        // SAFETY: i < m·4·hidden <= res.len(), cs < m·4 <= wgt.len(), c·hidden
+        // + v < m·hidden <= y.len(); one thread a value.
+        let out = unsafe {
+            let r = res.get_unchecked_mut(i);
+            *r = f32::mul_add(*wgt.get_unchecked(cs), *y.get_unchecked(c * hid + v), *r);
+            *r
+        };
+        if !out.is_finite() {
+            fault.raise(SITE);
+        }
+    }
+
+    /// The bottleneck and the combine's weights of `m` columns: thread `i <
+    /// m·320` writes `lo[i] = silu(down[i]·¼)`, `down` the down rows'
+    /// whole dots `[m][320]`; with `inject` 1, thread `m·320 + j` writes
+    /// `wgt[j] = 2·σ(inj[j]·¼)`, `inj` the inject rows' dots `[m][4]`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            inject <= 1,
+            down.len() >= m * 320,
+            inj.len() >= inject * m * 4,
+            lo.len() >= m * 320,
+            wgt.len() >= inject * m * 4
+        )
+    )]
+    pub fn hc_gated_lo_4x320(
+        down: &[f32],
+        inj: &[f32],
+        m: u32,
+        inject: u32,
+        fault: FaultSink,
+        mut lo: DisjointSlice<f32>,
+        mut wgt: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n = m as usize * RANK;
+        if i < n {
+            // SAFETY: i < m·320 <= down.len(), lo.len(); one thread a value.
+            let l = unsafe { silu(*down.get_unchecked(i) * INV) };
+            if !l.is_finite() {
+                fault.raise(SITE);
+            }
+            // SAFETY: as above.
+            unsafe { *lo.get_unchecked_mut(i) = l };
+            return;
+        }
+        let j = i - n;
+        if inject == 0 || j >= m as usize * STREAMS {
+            return;
+        }
+        // SAFETY: j < m·4 <= inj.len(), wgt.len() with inject 1; one thread a
+        // weight.
+        let w = 2.0 * sigmoid(unsafe { *inj.get_unchecked(j) } * INV);
+        if !w.is_finite() {
+            fault.raise(SITE);
+        }
+        // SAFETY: as above.
+        unsafe { *wgt.get_unchecked_mut(j) = w };
+    }
+
+    /// The mixed values of `m` columns: value `i = c·hidden + h` is `(xn_0·
+    /// σ(g_0), then fma(xn_s, σ(g_s), ·) for s = 1, 2, 3)·¼`, `xn_s` and
+    /// `g_s` value `s·hidden + h` of column `c` of the normed streams and of
+    /// the up's rows (`[m][4·hidden]` both).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            xn.len() >= m * 4 * hidden,
+            g.len() >= m * 4 * hidden,
+            mixed.len() >= m * hidden
+        )
+    )]
+    pub fn hc_gated_mix_4(
+        xn: &[f32],
+        g: &[f32],
+        hidden: u32,
+        m: u32,
+        fault: FaultSink,
+        mut mixed: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let hid = hidden as usize;
+        if i >= m as usize * hid {
+            return;
+        }
+        let (c, h) = (i / hid, i % hid);
+        let mut acc = 0.0f32;
+        for s in 0..STREAMS {
+            thread::__unroll_config::<0>();
+            let at = (c * STREAMS + s) * hid + h;
+            // SAFETY: at < m·4·hidden <= xn.len(), g.len().
+            let (x, gv) = unsafe { (*xn.get_unchecked(at), *g.get_unchecked(at)) };
+            let sg = sigmoid(gv);
+            acc = if s == 0 {
+                x * sg
+            } else {
+                f32::mul_add(x, sg, acc)
+            };
+        }
+        let out = acc * INV;
+        if !out.is_finite() {
+            fault.raise(SITE);
+        }
+        // SAFETY: i < m·hidden <= mixed.len(); one thread a value.
+        unsafe { *mixed.get_unchecked_mut(i) = out };
+    }
+}
+
+/// The intermediates of a wide mix, allocated once for up to `cols` columns
+/// and shared by every site of a walk, as [`HcScratch`] is: the normed
+/// streams and their 32-value activations, the down's and the inject's whole
+/// dots, the bottleneck and its activations, the up's rows, and the last
+/// inject site's combine weights.
+pub struct HcWideScratch {
+    /// `[m][streams][hidden]`.
+    pub xn: DeviceBuffer<f32>,
+    pub xq: GemmAct32,
+    /// `[m][RANK]`: the down rows' dots.
+    pub down: DeviceBuffer<f32>,
+    /// `[m][streams]`: the inject rows' dots.
+    pub inj: DeviceBuffer<f32>,
+    /// `[m][RANK]`: the bottleneck after its silu.
+    pub lo: DeviceBuffer<f32>,
+    pub loq: GemmAct32,
+    /// `[m][streams·hidden]`: the up's rows.
+    pub g: DeviceBuffer<f32>,
+    /// `[m][streams]`: the last inject site's combine weights.
+    pub wgt: DeviceBuffer<f32>,
+    cols: usize,
+    geo: Geometry,
+}
+
+impl HcWideScratch {
+    /// Allocate for `geo` at `cols` (1..=`GEMM_MAX_SLOTS`) columns. Load-time
+    /// only.
+    pub fn new(stream: &CudaStream, geo: Geometry, cols: usize) -> Result<HcWideScratch, GpuError> {
+        let z = geo.sizes(cols);
+        Ok(HcWideScratch {
+            xn: DeviceBuffer::zeroed(stream, z.xn)?,
+            xq: GemmAct32::new(stream, cols, geo.wide())?,
+            down: DeviceBuffer::zeroed(stream, z.lo)?,
+            inj: DeviceBuffer::zeroed(stream, z.wgt)?,
+            lo: DeviceBuffer::zeroed(stream, z.lo)?,
+            loq: GemmAct32::new(stream, cols, geo.r())?,
+            g: DeviceBuffer::zeroed(stream, z.xn)?,
+            wgt: DeviceBuffer::zeroed(stream, z.wgt)?,
+            cols,
+            geo,
+        })
+    }
+
+    /// Columns it holds.
+    #[must_use]
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Device bytes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        [
+            &self.xn, &self.down, &self.inj, &self.lo, &self.g, &self.wgt,
+        ]
+        .iter()
+        .map(|b| b.num_bytes())
+        .sum::<usize>()
+            + self.xq.bytes()
+            + self.loq.bytes()
+    }
+}
+
+/// [`HcWideKernels::enqueue_mix`]'s arguments: [`MixArgs`]' over `m`
+/// columns of the wide scratch, and the GEMM family with the one-expert
+/// table its down and up read — filled for exactly `m` slots
+/// (`GemmKernels::enqueue_route_dense`), which the caller owns.
+pub struct WideMixArgs<'a> {
+    pub res: &'a mut DeviceBuffer<f32>,
+    pub before: Before<'a>,
+    pub w: SiteWeights<'a>,
+    pub eps: f32,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub scratch: &'a mut HcWideScratch,
+    pub gemm: &'a Gemm32Kernels,
+    pub dense: &'a GemmRoute,
+    pub mixed: &'a mut DeviceBuffer<f32>,
+}
+
+/// The wide arm's loaded module. Owns no stream: each enqueue takes the
+/// engine stream.
+pub struct HcWideKernels {
+    module: hc_wide_kernels::LoadedModule,
+}
+
+impl HcWideKernels {
+    /// Load the wide module's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<HcWideKernels, GpuError> {
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; the launchers check its launch contracts.
+        let module = unsafe { hc_wide_kernels::load(ctx)? };
+        Ok(HcWideKernels { module })
+    }
+
+    /// Enqueue one site's mix over `m` columns (module doc's wide arm): the
+    /// norm after `before`, `xn` quantized, the down GEMM, the inject tile at
+    /// an inject site, the bottleneck and weights, the bottleneck quantized,
+    /// the up GEMM, the mixed values — seven launches, eight at an inject
+    /// site, in order on `stream`. An inject site leaves its combine weights
+    /// in the scratch for the next site's [`Before::Combine`]. `m` outside
+    /// `1..=scratch.cols()`, a short buffer or planes of another shape are
+    /// refused by name before any launch. Asynchronous, allocation-free.
+    pub fn enqueue_mix(&self, stream: &CudaStream, a: WideMixArgs<'_>) -> Result<(), GpuError> {
+        let what = "hc_gated::enqueue_mix_wide";
+        let geo = a.scratch.geo;
+        let m = a.m;
+        if m == 0 || m > a.scratch.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("{m} columns; the wide scratch holds 1..={}", a.scratch.cols),
+            ));
+        }
+        let z = geo.sizes(m);
+        let (wide, r) = (geo.wide(), geo.r());
+        let (y, combine, init) = match a.before {
+            Before::Plain => (None, 0u32, 0u32),
+            Before::Combine { y } => (Some(y), 1, 0),
+            Before::Init { y } => (Some(y), 0, 1),
+        };
+        let mut lens = vec![
+            ("res", a.res.len(), z.res),
+            ("gamma", a.w.gamma.len(), wide),
+            ("mixed", a.mixed.len(), z.mixed),
+        ];
+        if let Some(y) = y {
+            lens.push(("y", y.len(), z.y));
+        }
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        if let Some(inj) = a.w.inject
+            && (inj.rows() != geo.s() || inj.cols() != wide)
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "inject is {}x{}, want {}x{wide}",
+                    inj.rows(),
+                    inj.cols(),
+                    geo.s()
+                ),
+            ));
+        }
+        let hidden = launch_u32(what, "hidden", geo.d())?;
+        let mu = launch_u32(what, "m", m)?;
+        let inject = u32::from(a.w.inject.is_some());
+        let s = &mut *a.scratch;
+        let prep = self.module.prepare_hc_gated_norm_4w(LaunchConfig1D::new(
+            launch_u32(what, "norm grid", STREAMS * m)?,
+            NORM_THREADS as u32,
+            0,
+        ))?;
+        // Without a combine or an init the norm reads neither `y` nor `wgt`:
+        // `γ` stands in.
+        self.module.hc_gated_norm_4w(
+            stream,
+            &prep,
+            y.unwrap_or(a.w.gamma),
+            &s.wgt,
+            a.w.gamma,
+            hidden,
+            a.eps,
+            mu,
+            combine,
+            init,
+            a.fault,
+            a.res,
+            &mut s.xn,
+        )?;
+        a.gemm
+            .enqueue_quantize_gemm32(stream, &s.xn, m, &mut s.xq, a.fault)?;
+        a.gemm.enqueue_gemm32(
+            stream,
+            Gemm32Args {
+                w: Gemm32Weight::Q8_0Plane {
+                    qs: a.w.down_qs,
+                    d: a.w.down_d,
+                },
+                rows_per_expert: r,
+                act: &s.xq,
+                route: a.dense,
+                input: GemmInput::PerSlot,
+                y: &mut s.down,
+            },
+        )?;
+        if let Some(inj) = a.w.inject {
+            a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut s.inj)?;
+        }
+        let n_lo = m * r + if inject == 1 { m * STREAMS } else { 0 };
+        let prep = self.module.prepare_hc_gated_lo_4x320(LaunchConfig1D::new(
+            launch_u32(what, "lo grid", n_lo.div_ceil(GLUE_THREADS as usize))?,
+            GLUE_THREADS,
+            0,
+        ))?;
+        // Without an inject the launch reads no `inj` and writes no `wgt`:
+        // the scratch's own buffers stand in, their lengths untested.
+        self.module.hc_gated_lo_4x320(
+            stream, &prep, &s.down, &s.inj, mu, inject, a.fault, &mut s.lo, &mut s.wgt,
+        )?;
+        a.gemm
+            .enqueue_quantize_gemm32(stream, &s.lo, m, &mut s.loq, a.fault)?;
+        a.gemm.enqueue_gemm32(
+            stream,
+            Gemm32Args {
+                w: Gemm32Weight::Q8_0Plane {
+                    qs: a.w.up_qs,
+                    d: a.w.up_d,
+                },
+                rows_per_expert: wide,
+                act: &s.loq,
+                route: a.dense,
+                input: GemmInput::PerSlot,
+                y: &mut s.g,
+            },
+        )?;
+        let prep = self.module.prepare_hc_gated_mix_4(LaunchConfig1D::new(
+            launch_u32(what, "mix grid", z.mixed.div_ceil(GLUE_THREADS as usize))?,
+            GLUE_THREADS,
+            0,
+        ))?;
+        self.module
+            .hc_gated_mix_4(stream, &prep, &s.xn, &s.g, hidden, mu, a.fault, a.mixed)?;
+        Ok(())
+    }
+
+    /// Enqueue the combine alone over `m` columns with the wide scratch's
+    /// weights (the last inject site's): `res += wgt · y` per stream. One
+    /// launch. Asynchronous, allocation-free.
+    pub fn enqueue_combine(
+        &self,
+        stream: &CudaStream,
+        res: &mut DeviceBuffer<f32>,
+        y: &DeviceBuffer<f32>,
+        m: usize,
+        fault: FaultSink,
+        scratch: &HcWideScratch,
+    ) -> Result<(), GpuError> {
+        let what = "hc_gated::enqueue_combine_wide";
+        if m == 0 || m > scratch.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("{m} columns; the wide scratch holds 1..={}", scratch.cols),
+            ));
+        }
+        let geo = scratch.geo;
+        let z = geo.sizes(m);
+        for (name, got, need) in [("res", res.len(), z.res), ("y", y.len(), z.y)] {
+            if got < need {
+                return Err(GpuError::shape(
+                    what,
+                    format!("{name}.len() {got} < {need}"),
+                ));
+            }
+        }
+        let grid = launch_u32(what, "grid", z.res.div_ceil(COMBINE_THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_hc_gated_combine_4w(LaunchConfig1D::new(grid, COMBINE_THREADS, 0))?;
+        self.module.hc_gated_combine_4w(
             stream,
             &prep,
             y,
