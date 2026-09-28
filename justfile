@@ -585,9 +585,10 @@ gate-profile:
 
 # B1a 배치 게이트: V4.1 샤드 아홉의 헤더만으로 텐서마다 역할·장치·형식·상주 바이트를 정하고, 설계 §5의 두 안
 # ((a) A6000 + DDR4, (b) A6000 0–19층 + 3090 20–39층)이 설계의 핀과 같은지 본다. 텐서 바이트·GPU·임대 없이 초 단위다.
-# BLOOMERY_PLACEMENT_TABLE=1이면 텐서별 표도 찍는다.
+# BLOOMERY_PLACEMENT_TABLE=1이면 텐서별 표도 찍는다. (b′) 시험은 DSpark 드래프트 헤더에서 3090 예약을 읽으므로
+# 프로필의 DSPARK_MODEL을 내보낸다.
 gate-placement:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture'
 
 # B5 메타 게이트. 먼저 층 표 단위 시험을 돌린다: 일부러 깨뜨린 층 표 일곱 개를 ik 적재기의 검사 넷과 우리 거부 둘이
 # 각각 깨진 그 층에서 거부해야 한다. 이어서 V4.1의 하이퍼파라미터·층 종류·텐서 이름(arch/deepseek41/{hparams,names}.rs)을
