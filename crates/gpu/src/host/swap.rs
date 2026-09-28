@@ -1196,18 +1196,18 @@ impl SwapMachine {
         let (bound_tx, bound_rx) = mpsc::channel::<Result<(), GpuError>>();
         let for_thread = Arc::clone(&shared);
         let ctx = Arc::clone(ctx);
-        // The thread binds the context first: the source's calls on it may
-        // reach the driver.
-        let thread = std::thread::Builder::new()
-            .name("swap-staging".into())
-            .spawn(move || {
-                let bound = ctx.bind_to_thread().map_err(GpuError::from);
-                let ok = bound.is_ok();
-                if bound_tx.send(bound).is_ok() && ok {
-                    for_thread.run(&rx);
-                }
-            })
-            .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
+        // A helper, not a plain spawn: the step thread that builds the machine
+        // may be pinned to one cpu, and the staging copies would take turns
+        // with the step on it. The thread binds the context first: the
+        // source's calls on it may reach the driver.
+        let (thread, _) = threads::helper::spawn_helper("swap-staging", None, move || {
+            let bound = ctx.bind_to_thread().map_err(GpuError::from);
+            let ok = bound.is_ok();
+            if bound_tx.send(bound).is_ok() && ok {
+                for_thread.run(&rx);
+            }
+        })
+        .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
         match bound_rx.recv() {
             Ok(Ok(())) => Ok(Staging { shared, tx, thread }),
             // The thread is ending: joined here, so its reference to the

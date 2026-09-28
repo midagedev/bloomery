@@ -1420,6 +1420,9 @@ mod drive {
                     r.print();
                 }
             }
+            for h in threads::helper::helpers() {
+                record::helper(&h.name, h.pinned, h.cpus).print();
+            }
             Ok(())
         }
 

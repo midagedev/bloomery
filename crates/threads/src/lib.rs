@@ -21,6 +21,8 @@
 //! spawns nothing at all and the caller runs the whole range inline, so the
 //! single-threaded path pays no barrier cost.
 
+pub mod helper;
+
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::ops::Range;

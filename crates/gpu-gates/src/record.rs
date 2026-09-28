@@ -948,6 +948,20 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// A helper thread the load spawned (`threads::helper::helpers`).
+pub static HELPER: Kind = Kind {
+    name: "helper",
+    head: "helper",
+    doc: "A helper thread the load spawned beside the step thread: its name, the cpu it is \
+          pinned to (float when none) and the cpus in its mask once placed — one cpu for a \
+          floating helper would share its spawner's.",
+    parts: &[
+        key("name", Word, ""),
+        key("pinned", Word, ""),
+        key("cpus", U64, ""),
+    ],
+};
+
 /// A dropped residency machine's leak ([`bloomery_gpu::host::swap::Leak`]),
 /// on stderr from the drop.
 pub static RESIDENCY_LEAK: Kind = Kind {
@@ -1339,6 +1353,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1393,6 +1408,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &HELPER,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1533,6 +1549,18 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("issue_us", r.issue_us)
         .u("stage_us", r.stage_us)
         .u("prepare_us", r.prepare_us)
+}
+
+/// A helper thread's record: `name`, the cpu it is pinned to, the cpus in
+/// its mask.
+pub fn helper(name: &str, pinned: Option<usize>, cpus: usize) -> Record {
+    Record::new(&HELPER)
+        .w("name", name)
+        .w(
+            "pinned",
+            pinned.map_or_else(|| "float".to_owned(), |c| c.to_string()),
+        )
+        .u("cpus", cpus)
 }
 
 /// A dropped residency machine's leak record.
