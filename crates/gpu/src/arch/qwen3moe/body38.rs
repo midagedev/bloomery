@@ -14,9 +14,10 @@
 //! stores, two arenas (the step's one row, an eager pass's
 //! [`PASS_ROWS`](super::scratch38::PASS_ROWS)), the input records, and the
 //! host tier over every layer's routed stacks (no routed expert on the
-//! card). [`Body38::open_placed_mtp`] also opens the MTP draft layer on the
-//! same card ([`Mtp38`]: its weights, its store, the reduced head's rows);
-//! no walk reads it.
+//! card; every walk refuses by name a slot map that holds one, `card38`).
+//! [`Body38::open_placed_mtp`] also opens the MTP draft layer on the same
+//! card ([`Mtp38`]: its weights, its store, the reduced head's rows); no
+//! walk reads it.
 //!
 //! The walk is `program38`'s. The decode step is captured; a prompt runs
 //! as captured steps, one a position ([`Prompt38::Step`]), as eager passes
@@ -60,6 +61,7 @@
 //! recurrent stores one call on, so a call at that position is refused by
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
+use super::card38::refuse_card_map;
 use super::mtp38::Mtp38;
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -72,7 +74,7 @@ use super::scratch38::{
     dims, kept_lane, store_rule_bytes,
 };
 use super::ubatch::UBATCH as UBATCH_MOST;
-use super::wide38::{Gemm38, Wide38, WideParts, WideTaps, card_leg, route_taps_host};
+use super::wide38::{Gemm38, Wide38, WideParts, WideTaps, route_taps_host};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
@@ -467,7 +469,8 @@ pub struct Body38 {
     wr: WideRecord,
     wide_hsum: DeviceBuffer<f32>,
     wide: Wide38,
-    /// A slot map a gate planted for the next ubatch call's card-leg check.
+    /// A slot map a gate planted for every walk's card-leg check, in place
+    /// of the tier's, until it is taken back or the model reset.
     plant_map: Option<SlotMap>,
     /// The lane word every delta launch reads, and the verify waiting for
     /// its commit.
@@ -1097,9 +1100,11 @@ impl Body38 {
     }
 
     /// Plan an eager pass of `tokens` (1..=8) at `pos`, where the stores
-    /// stand: its PLE rows, its record and its rows' copy to the pass arena,
-    /// staged for [`Body38::walk_pass`]'s launch.
+    /// stand: the card-leg check ([`refuse_card_map`]), its PLE rows, its
+    /// record and its rows' copy to the pass arena, staged for
+    /// [`Body38::walk_pass`]'s launch.
     fn plan_pass(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        refuse_card_map(self.card_map(), "pass")?;
         let n = tokens.len();
         if self.taps.is_some() {
             return Err(GpuError::state(WHAT, "layer taps off (a pass writes none)"));
@@ -1186,14 +1191,12 @@ impl Body38 {
 
 impl Body38 {
     /// Plan a ubatch of `tokens` (1..=the load's size) at `pos`, where the
-    /// stores stand: the card-leg check (a slot map with a routed expert on
-    /// the card is refused by name, [`card_leg`]), its PLE rows, its record
-    /// and its rows' copy to the ubatch arena, staged for
+    /// stores stand: the card-leg check ([`refuse_card_map`]), its PLE rows,
+    /// its record and its rows' copy to the ubatch arena, staged for
     /// [`Body38::walk_gemm`]'s launch.
     fn plan_gemm(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        refuse_card_map(self.card_map(), "ubatch")?;
         let n = tokens.len();
-        let planted = self.plant_map.take();
-        card_leg(planted.as_ref().unwrap_or(self.hybrid.slots()))?;
         if self.taps.is_some() {
             return Err(GpuError::state(
                 WHAT,
@@ -1287,11 +1290,18 @@ impl Body38 {
         self.wide.rows
     }
 
-    /// The next ubatch call's card-leg check reads `map` instead of the tier's
-    /// own, once: a gate's stand-in for a placement with routed experts on
-    /// the card, which the ubatch walk refuses by name. Gate use.
-    pub fn plant_slot_map(&mut self, map: SlotMap) {
-        self.plant_map = Some(map);
+    /// Every walk's card-leg check reads `map` instead of the tier's own
+    /// until a call with `None` takes it back or the model is reset: a
+    /// gate's stand-in for a placement with routed experts on the card, which
+    /// every walk refuses by name. Gate use.
+    pub fn plant_slot_map(&mut self, map: Option<SlotMap>) {
+        self.plant_map = map;
+    }
+
+    /// The slot map the walks' card-leg checks read: a planted one, else
+    /// the tier's.
+    fn card_map(&self) -> &SlotMap {
+        self.plant_map.as_ref().unwrap_or(self.hybrid.slots())
     }
 
     /// The last ubatch walk's rows of each selecting layer: those the
@@ -1434,9 +1444,12 @@ impl ChainBody for Body38 {
         Arch::Qwen35moe
     }
 
-    /// The step at `pos`, where the stores stand: its PLE rows read from the
-    /// file, staged for the refresh's launch.
+    /// The step at `pos`, where the stores stand: the card-leg check
+    /// ([`refuse_card_map`], at every step: a planted map may change between
+    /// two replays of one capture), its PLE rows read from the file, staged
+    /// for the refresh's launch.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput38, GpuError> {
+        refuse_card_map(self.card_map(), "step")?;
         self.check_next(pos, 1)?;
         let hist = self.ple.fill(pos, &[token])?;
         self.stage(pos, 1, hist, None)?;
@@ -1539,6 +1552,7 @@ impl ChainBody for Body38 {
         self.held = 0;
         self.staged = None;
         self.plant = None;
+        self.plant_map = None;
         self.sp.write(stream, 0, 0)?;
         debug_assert_eq!(LANE, 0);
         stream.synchronize()?;
@@ -1604,7 +1618,8 @@ impl Body38 {
     /// record and the rows' copy to the pass arena, then the verify launched
     /// ([`Body38::launch`]) and left waiting for its commit — its graph's
     /// launch follows this plan with no body call between. Refused by name
-    /// before anything moves: another row count, the taps armed, a verify
+    /// before anything moves: a slot map with a routed expert on the card
+    /// ([`refuse_card_map`]), another row count, the taps armed, a verify
     /// already waiting, a position other than the stores' or past them, an
     /// id the embedding or the PLE hash does not take; a failure before the
     /// launch leaves no verify waiting and the lane word where it stood.
@@ -1615,6 +1630,7 @@ impl Body38 {
         pos: u32,
     ) -> Result<(), GpuError> {
         const WHAT_V: &str = "qwen4exp verify";
+        refuse_card_map(self.card_map(), "verify")?;
         let n = tokens.len();
         if !(2..=VERIFY_ROWS).contains(&n) {
             return Err(GpuError::shape(

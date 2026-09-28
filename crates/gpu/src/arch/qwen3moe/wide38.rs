@@ -37,8 +37,7 @@
 //! to the error of that quantization and are not bit-equal.
 //!
 //! The walk has no card leg: a slot map with a routed expert on the card is
-//! refused by name ([`card_leg`]) before anything moves, where a walk that
-//! ran it would leave that expert's contribution out.
+//! refused by name at its entry (`card38`), before anything moves.
 
 use super::body::ATTN_SCALE_256;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
@@ -54,7 +53,6 @@ use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::run::HostRun;
-use crate::hybrid::SlotMap;
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -74,25 +72,6 @@ const WHAT: &str = "qwen4exp ubatch walk";
 
 /// The selected flash's pass: the tensor-core one.
 const MMA: bool = true;
-
-/// Refused by name when `map` holds a routed expert on the card: the ubatch
-/// walk serves every routed expert on the host and has no card leg, so a
-/// walk over such a map would leave those experts out of the sum.
-pub(super) fn card_leg(map: &SlotMap) -> Result<(), GpuError> {
-    for l in map.layers() {
-        let on = map.on_card(l);
-        if on > 0 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the ubatch walk has no card leg yet: layer {l} holds {on} routed experts on \
-                     the card"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
 
 /// The rows of a selecting layer's unit of `m` rows from position `pos0`
 /// that select nothing — every key below their count, the prefill flash's
