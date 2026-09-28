@@ -4,8 +4,9 @@
 //! step, and — where the model can — a pass of several rows ([`Verify`]) that
 //! verifies a draft's proposal. How a generation moves on is an [`Advance`]:
 //! [`Plain`] steps once a pass, [`Speculative`] runs a [`Draft`]'s proposal
-//! through a verify and keeps the rows the target agrees with. [`generate`] is
-//! the one loop over both, until the [`Stop`] rule ends it.
+//! through a verify and keeps the rows the target agrees with, and [`Gated`]
+//! lets a draft's verify passes run only while they pay. [`generate`] is the
+//! one loop over both, until the [`Stop`] rule ends it.
 //!
 //! Everything here is greedy: a pass keeps the target's argmax, so a draft
 //! changes which passes run and never a token. Sampling — the sampler chain,
@@ -19,6 +20,7 @@
 //! [`layer`], the sub-layer programs a layer's description names.
 
 pub mod combine;
+pub mod gate;
 pub mod hc_gated;
 pub mod layer;
 mod lookup;
@@ -31,6 +33,7 @@ mod stop;
 pub mod stores;
 pub mod swaprule;
 
+pub use gate::Gated;
 pub use lookup::Lookup;
 pub use speculative::{
     Draft, NotBuilt, Program, Speculative, TapNeed, Tapped, Width, Widths, Window, program,
