@@ -159,6 +159,14 @@ pub enum GpuError {
     /// A model refused a step because an earlier step raised `fault`; its
     /// state is condemned until a `reset`.
     Poisoned { what: &'static str, fault: Fault },
+    /// The hybrid host tier refused `what` because an earlier service failed
+    /// and poisoned it: `poison` is why — refused input, which a reset lifts,
+    /// or a failure, a panic or a lost expert tier card, which only a reload
+    /// clears.
+    HostPoisoned {
+        what: &'static str,
+        poison: Box<host::Poison>,
+    },
 }
 
 impl GpuError {
@@ -448,6 +456,10 @@ impl std::fmt::Display for GpuError {
                 f,
                 "{what}: the model is poisoned by an earlier device fault at {fault:#}; reset() \
                  clears it"
+            ),
+            GpuError::HostPoisoned { what, poison } => write!(
+                f,
+                "{what}: an earlier hybrid service failed and released the stream: {poison}"
             ),
         }
     }

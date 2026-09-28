@@ -112,9 +112,13 @@ impl CardExperts {
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
         for (l, spec) in layers.iter().enumerate() {
-            // A layer outside the host run (a dense block) has no row: no card
-            // experts, which the resident-rows check below holds it to.
-            let n_card = map.on_card(l).unwrap_or(0);
+            // A dense block is outside the host run and has no row: no card
+            // experts, which the resident-rows check below holds it to. A
+            // routed layer the map has no row for is refused by name.
+            let n_card = match spec.ffn {
+                Ffn::Dense { .. } => 0,
+                Ffn::Moe(_) => map.on_card(l)?,
+            };
             let names = stack_names(l);
             if n_card == 0 {
                 if let Some(n) = names.iter().find(|n| w.get(n).is_some()) {

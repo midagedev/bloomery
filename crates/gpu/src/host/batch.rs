@@ -28,6 +28,8 @@ use crate::graph::{MappedHost, cu};
 use crate::tensor::window;
 use crate::{Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
+use model::placement::Machine;
+use model::placement::workstation::{TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE};
 use model::{Tensor2, Tensor2View};
 use std::mem::{ManuallyDrop, size_of};
 use std::ops::Range;
@@ -294,7 +296,8 @@ impl BatchPort {
     }
 
     /// Both sets free, the next download into the first: at a group's
-    /// start, when neither card's stream holds a copy of an earlier group
+    /// start. Host bookkeeping only; the sets are next written by the group's
+    /// downloads, when neither card's stream holds a copy of an earlier group
     /// (the group's prologue waits for the stage's stream; a group that
     /// failed drained the tier's, or lost the tier, after which the host
     /// tier serves nothing more).
@@ -902,7 +905,8 @@ impl<H: HostExperts> HostTier<H> {
     /// ([`HostTier::prepare_batch`]) and an expert tier: per set the places,
     /// the rows and the tier's event, and the tier card's staging
     /// ([`BatchPort::attach_tier`]). Nothing without a tier; made once.
-    /// Load-time or first-prompt only.
+    /// Load-time or first-prompt only; what it holds is checked against the
+    /// plan by [`HostTier::check_tier_reserves`].
     pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::prepare_tier_batch";
         let stage = Arc::clone(self.step.boundary.region.context());
@@ -916,29 +920,74 @@ impl<H: HostExperts> HostTier<H> {
         let back = stage.bind_to_thread();
         r?;
         back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
-        let (n, s, cap) = (port.n_embd as u64, port.n_used as u64, port.cap as u64);
-        let want = [
-            model::placement::workstation::tier_batch_staging_bytes(n, s, cap),
-            model::placement::workstation::tier_batch_host_bytes(n, s, cap),
-        ];
-        let got = [
-            port.tier_device_bytes() as u64,
-            port.tier_host_bytes() as u64,
-        ];
-        if got != want {
-            return Err(GpuError::shape(
+        Ok(())
+    }
+
+    /// The expert tier's prompt-batch bytes against the reserves `machine`'s
+    /// plan carries for them: on the tier card, index `tier` of
+    /// [`Machine::all_cards`], the batch staging and the architecture's block
+    /// scratch ([`TierCard::block_bytes`]) against its [`TIER_BATCH_RESERVE`]
+    /// row; on the host, the tier leg's rows and places against the host's
+    /// [`TIER_BATCH_HOST_RESERVE`] row. A missing row, a row named twice, or
+    /// a difference is refused by name, naming the reserve. Load-time only,
+    /// once [`HostTier::prepare_batch`] has made the leg.
+    pub fn check_tier_reserves(&self, machine: &Machine, tier: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::check_tier_reserves";
+        let t = self.tier_ref(WHAT)?;
+        let port = self.port.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch port's sets (HostTier::prepare_batch)",
+        })?;
+        let card = machine.card(tier).ok_or_else(|| {
+            GpuError::shape(
                 WHAT,
                 format!(
-                    "the tier's batch staging holds {} B on the tier card and {} B on the host; \
-                     the plan's reserves ({}, {}) are {} and {} B",
-                    got[0],
-                    got[1],
-                    model::placement::workstation::TIER_BATCH_RESERVE,
-                    model::placement::workstation::TIER_BATCH_HOST_RESERVE,
-                    want[0],
-                    want[1]
+                    "the placement has no card {tier} for the expert tier {}",
+                    t.name()
                 ),
-            ));
+            )
+        })?;
+        let rows = [
+            (
+                card.name.as_str(),
+                &card.reserves,
+                TIER_BATCH_RESERVE,
+                port.tier_device_bytes() + t.block_bytes(),
+            ),
+            (
+                "the host",
+                &machine.host.reserves,
+                TIER_BATCH_HOST_RESERVE,
+                port.tier_host_bytes(),
+            ),
+        ];
+        for (on, reserves, name, got) in rows {
+            let want = match reserves
+                .iter()
+                .filter(|(n, _)| n == name)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [(_, b)] => *b,
+                named => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the plan names the reserve {name:?} on {on} {} times, not once",
+                            named.len()
+                        ),
+                    ));
+                }
+            };
+            if got as u64 != want {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the expert tier's prompt batch holds {got} B on {on}; the plan's reserve \
+                         {name:?} there is {want} B"
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -1037,19 +1086,15 @@ impl<H: HostExperts> HostTier<H> {
         let deadline = Instant::now() + GO_DEADLINE;
         let landed = self.port_mut(WHAT)?.settle_tier(key, deadline)?.is_some();
         if !landed {
-            let detail = self.tier.as_ref().map_or_else(
-                || "no tier".to_string(),
-                |t| {
-                    format!(
-                        "the expert tier on {} did not finish its service of the prompt block's \
-                         columns {}..{} in {GO_DEADLINE:?}: the card is lost",
-                        t.name(),
-                        key.at,
-                        key.u
-                    )
-                },
-            );
-            return Err(self.lose_tier_as(key.layer, detail));
+            return Err(self.lose_tier_as(SERVE_BATCH, key.layer, |t| {
+                format!(
+                    "the expert tier on {} did not finish its service of the prompt block's \
+                     columns {}..{} in {GO_DEADLINE:?}: the card is lost",
+                    t.name(),
+                    key.at,
+                    key.u
+                )
+            }));
         }
         self.port_mut(WHAT)?
             .settle_tier(key, deadline)?
@@ -1059,8 +1104,9 @@ impl<H: HostExperts> HostTier<H> {
     /// The expert tier's fault word once its stream has drained; `None`
     /// without a tier or while it is clean, and for a tier lost as a card
     /// ([`super::PoisonKind::CardLost`]), whose stream may never drain — the
-    /// loss is the error, and no reset lifts it, so no later call reuses a
-    /// set its stream could still touch. The stage card's context is current
+    /// loss is the error, no reset lifts it, and every later call is refused
+    /// at its group's start ([`HostTier::begin_group`]) before it touches a
+    /// set that stream could still touch. The stage card's context is current
     /// again on return. A prompt call reads it at a group's end and when a
     /// group fails, beside the stage card's.
     pub fn tier_fault(&mut self) -> Result<Option<Fault>, GpuError> {

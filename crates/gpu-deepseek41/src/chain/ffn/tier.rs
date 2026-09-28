@@ -773,23 +773,7 @@ impl Ds41Tier {
             cfg.push((k, kind.swiglu_limit));
         }
         let stream = gpu.stream();
-        let slots = UNION_MAX_COLS * N_USED;
-        let tile = TileScratch::new(stream, slots, n, ff)?;
-        let want = model::placement::workstation::tier_block_scratch_bytes(
-            n as u64,
-            ff as u64,
-            slots as u64,
-        );
-        if tile.device_bytes() as u64 != want {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "the tile scratch holds {} B; the plan's reserve ({}) counts {want} B",
-                    tile.device_bytes(),
-                    model::placement::workstation::TIER_BATCH_RESERVE
-                ),
-            });
-        }
+        let tile = TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff)?;
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
             h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
@@ -818,16 +802,15 @@ impl Ds41Tier {
                 detail: format!("layer {layer} holds no tier expert"),
             })
     }
-
-    /// Device bytes of the scratch a prompt batch's block uses: the tile
-    /// path's.
-    #[must_use]
-    pub fn block_bytes(&self) -> usize {
-        self.tile.device_bytes()
-    }
 }
 
 impl TierExperts for Ds41Tier {
+    /// The tile path's scratch, for blocks of up to [`UNION_MAX_COLS`]
+    /// tokens.
+    fn block_bytes(&self) -> usize {
+        self.tile.device_bytes()
+    }
+
     fn enqueue_block(
         &mut self,
         gpu: &Gpu,

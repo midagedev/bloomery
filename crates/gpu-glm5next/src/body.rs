@@ -43,7 +43,7 @@ use std::sync::Arc;
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
+    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
 };
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
@@ -619,9 +619,9 @@ impl Body {
     /// segments, the projections that read one input joined into one row
     /// stream each ([`Body::derive`]), and the body over them with the host
     /// tier over the file's routed layers, holding the load's host set as
-    /// `host` asks. Refused by name: a plan of more than one card, a layer
-    /// kind or a width no kernel here runs, routed layers that are not one
-    /// run.
+    /// `host` asks. Refused by name: a plan with an expert tier card (before
+    /// anything uploads), a plan of more than one card, a layer kind or a
+    /// width no kernel here runs, routed layers that are not one run.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -629,6 +629,7 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<Glm5nextModel, GpuError> {
+        refuse_expert_tiers(WHAT, plan.machine)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         GpuModel::load_placed(
             file,

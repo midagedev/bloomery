@@ -413,6 +413,10 @@ pub trait TierExperts {
         layer: usize,
         io: TierBlock<'_>,
     ) -> Result<(), GpuError>;
+
+    /// Device bytes of the scratch [`TierExperts::enqueue_block`] made at
+    /// load: part of the tier card's prompt-batch reserve.
+    fn block_bytes(&self) -> usize;
 }
 
 /// A block of a prompt batch as the tier's batch service hands it to the
@@ -607,6 +611,13 @@ impl TierCard {
         &self.name
     }
 
+    /// Device bytes of the architecture's prompt-batch block scratch on the
+    /// tier card ([`TierExperts::block_bytes`]).
+    #[must_use]
+    pub fn block_bytes(&self) -> usize {
+        self.experts.block_bytes()
+    }
+
     /// Which experts the tier holds.
     #[must_use]
     pub fn set(&self) -> &TierSet {
@@ -711,9 +722,35 @@ impl TierCard {
     }
 
     /// Make the stage-side windows in `stage`'s context and keep its
-    /// stream and fault word. The host tier's load-time call.
+    /// stream and fault word. The windows and the stage card's waits on the
+    /// tier's counters take the page's device address from the tier's
+    /// context, so the page must sit at that address in `stage`'s context
+    /// too (unified addressing), else the call is refused by name. The
+    /// host tier's load-time call; `stage`'s context is current on return.
     pub(super) fn bind_stage(&mut self, stage: &Gpu) -> Result<(), GpuError> {
+        const BIND: &str = "TierCard::bind_stage";
         let ctx = stage.context();
+        ctx.bind_to_thread()?;
+        let mut dev: sys::CUdeviceptr = 0;
+        // SAFETY: `stage`'s context is current on this thread (bound above),
+        // `dev` is a live local the call writes, and the page's first byte is
+        // the start of its live mapped allocation; the flags must be 0.
+        let rc =
+            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, self.page.host_at(0).cast(), 0) };
+        cu(
+            rc,
+            "cuMemHostGetDevicePointer_v2 (tier page, stage context)",
+        )?;
+        if dev != self.page.dev_at(0) {
+            return Err(GpuError::shape(
+                BIND,
+                format!(
+                    "the tier page is at {:#x} in the tier's context and at {dev:#x} in the stage \
+                     card's: its windows and the stage's waits need one address",
+                    self.page.dev_at(0)
+                ),
+            ));
+        }
         let img = self.layout.image();
         for (r, row) in self.rows.iter_mut().enumerate() {
             // SAFETY: as in `open`: row r's image and routed rows lie inside
@@ -923,7 +960,8 @@ impl TierCard {
     }
 
     fn issue(&mut self, n: usize) {
-        let n32 = u32::try_from(n).unwrap_or(u32::MAX);
+        let n32 =
+            u32::try_from(n).expect("a pass lists at most two rows a layer, far below u32::MAX");
         self.issued = self.issued.wrapping_add(n32);
         self.stats.issued += n as u64;
     }
@@ -991,10 +1029,11 @@ impl TierCard {
         true
     }
 
-    /// The loss of the tier as an error's detail: how far it got.
-    pub(super) fn lost_detail(&self, deadline: Duration) -> String {
+    /// The loss of the tier as an error's detail: how far it got, and how
+    /// long the host `waited` for it.
+    pub(super) fn lost_detail(&self, waited: Duration) -> String {
         format!(
-            "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {deadline:?}: the card is lost",
+            "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost",
             self.name,
             self.progress(),
             self.issued

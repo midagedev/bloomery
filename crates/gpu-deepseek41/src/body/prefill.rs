@@ -71,9 +71,9 @@
 //! launches write it is one buffer, since the stream runs them in order; the
 //! host copies — the host tier's batch port's — come in two sets, since the
 //! host reads them outside that order. The batch's buffers ([`Batch`]) and
-//! the port's sets are made by the first group, or before it by
-//! [`prepare_prefill`], never per group; the decode step's buffers and
-//! launches do not change.
+//! the port's sets are made at load by [`prepare_prefill`], never inside a
+//! call: a call on a body without them is refused by name. The decode step's
+//! buffers and launches do not change.
 //!
 //! A call's plan — its batches, chunks, groups, the triangle's needs and each
 //! layer-batch's starts and sub-blocks — is [`CallPlan`], read off the same
@@ -152,11 +152,13 @@ impl PrefillMode {
     }
 }
 
-/// Make the batch's buffers now, so the first [`prefill`] allocates nothing:
-/// a timed prompt then times the batch alone. Idempotent.
+/// Make the batch's buffers: the one maker, a load-time call — a prompt
+/// call ([`prefill`]) on a body without them is refused by name, so no call
+/// loads a module or allocates. A load with an expert tier and the batch feed
+/// makes them itself ([`super::Body::open_placed_tiered`]). Idempotent.
 pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    body.batch_mut(gpu).map(|_| ())
+    body.make_batch_once(gpu)
 }
 
 /// Feed `ids` from the model's position on as [`batches`] and return the
@@ -509,8 +511,8 @@ fn feed(
         None => (None, None),
     };
     let group = {
-        let (gpu, _, body) = m.body_parts(WHAT)?;
-        let group = body.batch_mut(gpu)?.group;
+        let (_, _, body) = m.body_parts(WHAT)?;
+        let group = body.batch_mut()?.group;
         body.begin_call(first, end, &starts, window)?;
         group
     };
@@ -1065,23 +1067,31 @@ fn chunks(b: usize, u: usize) -> Vec<Range<usize>> {
 }
 
 impl Body {
-    /// The batch's buffers, made by the first call: the attention piece over
+    /// The batch's buffers, once [`prepare_prefill`] has made them; refused
+    /// by name before, since making them inside a call loads modules and
+    /// allocates — driver calls that may wait for a card's streams, where a
+    /// stalled tier would hang the call instead of failing it by name.
+    fn batch_mut(&mut self) -> Result<&mut Batch, GpuError> {
+        self.batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the prompt batch's buffers, made at load (body::prepare_prefill)",
+        })
+    }
+
+    /// Make the batch's buffers when none are held: the attention piece over
     /// the batch layout, the glue's and the MoE sub-layer's scratch, each
     /// batch's streams, folds, lists and images for a group of the most
     /// batches `BLOOMERY_PREFILL_GROUP` gives, the staging, the host tier's
     /// batch sets for as many tokens as the MoE scratch takes, the host
-    /// union's scratch.
-    fn batch_mut(&mut self, gpu: &Gpu) -> Result<&mut Batch, GpuError> {
+    /// union's scratch. Load-time only ([`prepare_prefill`]).
+    fn make_batch_once(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         if self.batch.is_none() {
             let b = self.make_batch(gpu)?;
             self.hybrid.prepare_batch(gpu.context(), b.ffn.cap())?;
             self.hybrid.host_mut().prepare_union()?;
             self.batch = Some(Box::new(b));
         }
-        self.batch.as_deref_mut().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the batch's buffers",
-        })
+        Ok(())
     }
 
     fn make_batch(&self, gpu: &Gpu) -> Result<Batch, GpuError> {
@@ -1170,17 +1180,15 @@ impl Body {
     }
 
     /// Per layer index of the body, the experts the host tier's expert tier
-    /// holds of the layer, as the slot map says now; all 0 without a tier. A
-    /// layer the slot map has no row for holds none. Read once per group.
+    /// holds of the layer, as the slot map says now; all 0 without a tier.
+    /// With a tier, a layer the slot map has no row for is refused by name.
+    /// Read once per group.
     fn tier_counts(&self) -> Result<Vec<usize>, GpuError> {
         let map = self.slot_map();
         let tier = self.hybrid.tier().is_some();
         self.layers
             .clone()
-            .map(|l| match map.row_offset(l) {
-                Some(_) if tier => map.on_tier(l),
-                _ => Ok(0),
-            })
+            .map(|l| if tier { map.on_tier(l) } else { Ok(0) })
             .collect()
     }
 
@@ -1197,25 +1205,26 @@ impl Body {
     }
 
     /// Time each layer-batch's card work with events from the next group on
-    /// ([`PrefillStats`]); off, no event is recorded. Makes the batch's
-    /// buffers.
+    /// ([`PrefillStats`]); off, no event is recorded. Refused before the
+    /// batch's buffers are made ([`prepare_prefill`]).
     pub fn set_prefill_card_timing(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
         let layers = self.layers.len();
-        let batch = self.batch_mut(gpu)?;
+        let batch = self.batch_mut()?;
         batch.card_timing = on;
         let layer_batches = layers * batch.sets.len();
         batch.proj.set_card_timing(gpu, on, layer_batches)
     }
 
-    /// Device bytes of the batch's buffers; 0 before the first batch.
+    /// Device bytes of the batch's buffers; 0 before they are made
+    /// ([`prepare_prefill`]).
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.device_bytes())
     }
 
     /// The part of [`Body::batch_bytes`] the batch-wide attention
-    /// projections hold ([`crate::chain::attn::AttnBatch`]); 0 before the
-    /// first batch.
+    /// projections hold ([`crate::chain::attn::AttnBatch`]); 0 before they are
+    /// made.
     #[must_use]
     pub fn batch_proj_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.proj.device_bytes())
@@ -1355,6 +1364,7 @@ impl Body {
             batch,
             last,
         } = run;
+        self.admit(WHAT, Entry::Group)?;
         let stream = gpu.stream();
         if capturing(stream)? {
             return Err(GpuError::State {
@@ -1362,16 +1372,9 @@ impl Body {
                 missing: "an eager stream: a batch is served while it is enqueued",
             });
         }
-        if self.rows_failed {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "a reset: an earlier step's engram rows failed after its launch, and \
-                          the card ran that step on stale rows",
-            });
-        }
         self.arrive()?;
         self.rows.finish()?;
-        let sets = self.batch_mut(gpu)?.sets.len();
+        let sets = self.batch_mut()?.sets.len();
         let b = runs.first().map_or(0, |r| r.start);
         let end = runs.last().map_or(b, |r| r.end);
         let joined = runs.windows(2).all(|p| p[0].end == p[1].start);
@@ -1638,7 +1641,6 @@ impl Body {
             what: WHAT,
             missing: "the call's needs",
         })?;
-        hybrid.begin_group()?;
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
             gpu,

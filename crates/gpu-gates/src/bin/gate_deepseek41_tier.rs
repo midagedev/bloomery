@@ -5,9 +5,11 @@
 //! list is its hottest `n_l`. The tiered plan moves the coldest [`K3`] of
 //! them, ranks `n_l - K3 .. n_l`, from card 0 to device 1 (the tier) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
-//! stage the hottest ranks and the tier the next ones. The reference is the
-//! gate plan itself, whose card holds the union — the same experts on one
-//! card. Loads run one after the other, the reference first.
+//! stage the hottest ranks and the tier the next ones, on the gate machine
+//! with (b′)'s tier card and its prompt-batch reserves beside the stage card
+//! (`tier_machine`). The reference is the gate plan itself, whose card holds
+//! the union — the same experts on one card. Loads run one after the other,
+//! the reference first.
 //!
 //! - `--union` (T1): the prose prompt [`PROMPT`] fed one decode step per
 //!   position, then [`STEPS`] greedy steps, then [`PAIRS`] pair passes, all
@@ -23,11 +25,12 @@
 //!   reference's.
 //! - `--lost` (T3): the tier's stream held behind a host flag before a
 //!   step: within the go deadline and its grace the step fails naming the
-//!   lost card, the host tier is poisoned as a lost card, the next step and
-//!   a reset are refused by name; the flag is then raised and both streams
-//!   drain.
+//!   lost card, the host tier is poisoned as a lost card, the next step is
+//!   refused by that poison (`GpuError::HostPoisoned`, a lost card) and a
+//!   reset by name; the flag is then raised and both streams drain.
 //! - `--two` (T7): a tiered plan with one expert on both devices is refused
-//!   by name before anything is uploaded.
+//!   by name before anything is uploaded: as the load's check before the
+//!   uploads (`body::TIER_MAP_BEFORE_UPLOAD`), not the one after them.
 //! - `--batch` (B7): the prose prompt of [`BATCH_P`] positions fed as one
 //!   prompt batch (`body::prefill`), then [`BATCH_STEPS`] greedy steps, bit
 //!   for bit the same prompt fed one decode step per position on the tiered
@@ -48,9 +51,15 @@
 //! - `--blost` (B3): the tier's stream held behind a host flag before a
 //!   prompt call: within the go deadline and its grace the call fails naming
 //!   the lost card, the host tier is poisoned as a lost card, the next call
-//!   and a reset are refused by name; the flag is then raised and both
-//!   streams drain. A lost tier stays lost, so with `--lost` too the tiered
-//!   plan is loaded again for T3.
+//!   is refused by that poison at its group's start (`HostTier::begin_group`,
+//!   before it enqueues anything) and a reset by name; the flag is then
+//!   raised and both streams drain. A lost tier stays lost, so with `--lost`
+//!   too the tiered plan is loaded again for T3.
+//! - `--bfirst` (B3f): B3 as the first prompt call of a fresh tiered load,
+//!   before anything else runs on it: the call must still fail by name
+//!   within the same bound, so nothing the call would make for itself (a
+//!   module load, an allocation) waits on the held tier stream. The tiered
+//!   plan is loaded again for any clause after it.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -70,24 +79,31 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::host::batch::TierBatchStats;
-    use bloomery_gpu::hybrid::{Chain, PoisonKind};
+    use bloomery_gpu::hybrid::{BEGIN_GROUP, Chain, PoisonKind};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::{Fault, FaultSite, GpuError, HostFlags, Q8Act};
-    use bloomery_gpu_deepseek41::body::{self, Body, BodyMeta, Deepseek41Model, OpenCfg, TierOpen};
+    use bloomery_gpu_deepseek41::body::{
+        self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PrefillMode,
+        TIER_MAP_BEFORE_UPLOAD, TierOpen,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
+    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{self, Device, ExpertList, HotList, Plan, Role, Row, workstation};
+    use model::arch::deepseek41::place::tier_batch;
+    use model::placement::{
+        self, Device, ExpertList, HotList, Machine, Plan, Role, Row, workstation,
+    };
 
     const NAME: &str = "gate_deepseek41_tier";
     /// Experts per routed layer the tier takes from the cold end of the gate
     /// plan's card list: the (b′) plan's tier depth, 873 tier experts over
-    /// its 38 hybrid layers ≈ 23 a layer [derived, twoeng]. A carve from the
+    /// its 38 hybrid layers ≈ 23 a layer [derived]. A carve from the
     /// gate plan's own card list costs no card bytes, so the 3090's free
     /// bytes after the load bound nothing here.
     const K3: usize = 23;
@@ -115,9 +131,6 @@ mod gate {
     const TIER_DEVICE: usize = 1;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
-    /// A refusal before any upload returns within this; a V4.1 upload alone
-    /// takes longer.
-    const REFUSE_BOUND_S: f64 = 20.0;
 
     struct Args {
         union: bool,
@@ -128,11 +141,25 @@ mod gate {
         batch2: bool,
         bfault: bool,
         blost: bool,
+        bfirst: bool,
+    }
+
+    impl Args {
+        /// Whether a clause other than T7 and B3f runs on the tiered load.
+        fn on_load(&self) -> bool {
+            self.union
+                || self.fault
+                || self.lost
+                || self.batch
+                || self.batch2
+                || self.bfault
+                || self.blost
+        }
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
-                             [--batch] [--batch2] [--bfault] [--blost]";
+                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst]";
         let mut a = Args {
             union: false,
             fault: false,
@@ -142,6 +169,7 @@ mod gate {
             batch2: false,
             bfault: false,
             blost: false,
+            bfirst: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -153,10 +181,11 @@ mod gate {
                 "--batch2" => a.batch2 = true,
                 "--bfault" => a.bfault = true,
                 "--blost" => a.blost = true,
+                "--bfirst" => a.bfirst = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.fault || a.lost || a.two || a.batch || a.batch2 || a.bfault || a.blost) {
+        if !(a.on_load() || a.two || a.bfirst) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -180,20 +209,71 @@ mod gate {
         Ok(ids)
     }
 
-    /// `plan` with the coldest `k3` experts of each routed stack's card-0
-    /// list by `hot`'s ranks moved to device [`TIER_DEVICE`]; a stack whose
-    /// card list holds `k3` or fewer is refused by name. With `twice`, the
-    /// first stack's tier list also keeps its first expert on card 0 (an
+    /// The gate plan's machine `machine` with the (b′) tier card beside its
+    /// one stage card, at index [`TIER_DEVICE`]: the tier card and the host
+    /// carry the tier's prompt-batch reserves for the file of `hp`
+    /// (`workstation::plan_bp`'s), which a tiered load checks its
+    /// allocations against. The tier card is the gate card by name: the
+    /// stage and the tier share it.
+    fn tier_machine(machine: &Machine, hp: &Hparams) -> Result<Machine, GateError> {
+        if machine.cards.len() != TIER_DEVICE || !machine.tiers.is_empty() {
+            return Err(format!(
+                "the gate machine has {} stage cards and {} tiers; the tier goes at index \
+                 {TIER_DEVICE}, after one stage card",
+                machine.cards.len(),
+                machine.tiers.len()
+            )
+            .into());
+        }
+        let bp = workstation::plan_bp(hp.n_layer, None, tier_batch(hp));
+        if bp
+            .tiers
+            .iter()
+            .map(|t| t.name.as_str())
+            .ne([machine.cards[0].name.as_str()])
+        {
+            return Err(format!(
+                "plan (b′)'s tier cards {:?} are not the gate card {}",
+                bp.tiers.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                machine.cards[0].name
+            )
+            .into());
+        }
+        let mut out = machine.clone();
+        out.tiers = bp.tiers;
+        out.host = bp.host;
+        Ok(out)
+    }
+
+    /// Whether `r` is the host tier's refusal ([`GpuError::HostPoisoned`])
+    /// for the poison of a lost card, as `what`: the entry that refuses it
+    /// before it enqueues anything.
+    fn lost_refusal<T>(r: &Result<T, GpuError>, what: &str) -> bool {
+        matches!(
+            r,
+            Err(GpuError::HostPoisoned { what: w, poison })
+                if *w == what
+                    && poison.mark().kind == PoisonKind::CardLost
+        )
+    }
+
+    /// `plan` on `machine` (the gate plan's with the tier card,
+    /// [`tier_machine`]) with the coldest `k3` experts of each routed stack's
+    /// card-0 list by `hot`'s ranks moved to device [`TIER_DEVICE`]; a stack
+    /// whose card list holds `k3` or fewer is refused by name. With `twice`,
+    /// the first stack's tier list also keeps its first expert on card 0 (an
     /// expert on two devices). The host segments stay as they are, so the
     /// host set is the plan's.
     fn tiered<'a>(
         plan: &Plan<'a>,
+        machine: &'a Machine,
         hot: &HotList,
         k3: usize,
         twice: bool,
     ) -> Result<Plan<'a>, GateError> {
         let model = plan.model;
         let mut out = plan.clone();
+        out.machine = machine;
         let mut doubled = false;
         for row in &mut out.rows {
             let t = &model.tensors[row.tensor];
@@ -501,7 +581,10 @@ mod gate {
             R8,
         ])?;
         let args = parse_args()?;
-        let cfg = OpenCfg::from_levers(&levers)?;
+        let mut cfg = OpenCfg::from_levers(&levers)?;
+        // The batch clauses run the prompt call, so the tiered load makes its
+        // buffers (`Body::open_placed_tiered`).
+        cfg.body.prefill = PrefillMode::Batch;
         let path = workstation::model_v41();
         let split = || Split::open(&path).map_err(|e| format!("open {path}: {e}"));
         let inputs = PlanInputs::read(&split()?)?;
@@ -521,7 +604,8 @@ mod gate {
             card: TIER_DEVICE,
             name: card.clone(),
         };
-        let tplan = tiered(&plan, hot, K3, false)?;
+        let tmachine = tier_machine(&machine, &inputs.hp)?;
+        let tplan = tiered(&plan, &tmachine, hot, K3, false)?;
         let tier_layers: Vec<usize> = (0..inputs.model.layers)
             .filter(|&l| tplan.n_l.get(l) != plan.n_l.get(l))
             .collect();
@@ -536,12 +620,11 @@ mod gate {
         let mut pass = true;
 
         if args.two {
-            let bad = tiered(&plan, hot, K3, true)?;
+            let bad = tiered(&plan, &tmachine, hot, K3, true)?;
             let t0 = Instant::now();
             match open(split()?, &bad, Some(tier_open()), &meta) {
-                Err(e)
-                    if e.to_string().contains("placed twice")
-                        && t0.elapsed().as_secs_f64() < REFUSE_BOUND_S =>
+                Err(e @ GpuError::Plan { what, .. })
+                    if what == TIER_MAP_BEFORE_UPLOAD && e.to_string().contains("placed twice") =>
                 {
                     println!(
                         "ok T7: an expert on two devices refused before any upload in {:.2} s: {e}",
@@ -550,9 +633,8 @@ mod gate {
                 }
                 Err(e) => {
                     println!(
-                        "FAIL T7: refused after {:.1} s (want the two-device rule within \
-                         {REFUSE_BOUND_S} s): {e}",
-                        t0.elapsed().as_secs_f64()
+                        "FAIL T7: refused, but not as {TIER_MAP_BEFORE_UPLOAD} naming an expert \
+                         placed twice: {e}"
                     );
                     pass = false;
                 }
@@ -564,7 +646,7 @@ mod gate {
         }
 
         let prompt = prose(PROMPT)?;
-        let long = if args.batch || args.batch2 || args.bfault || args.blost {
+        let long = if args.batch || args.batch2 || args.bfault || args.blost || args.bfirst {
             prose(BATCH_P2)?
         } else {
             Vec::new()
@@ -581,6 +663,7 @@ mod gate {
                 want.union = Some(union_run(&mut m, &prompt)?);
             }
             if args.batch2 {
+                body::prepare_prefill(&mut m)?;
                 want.batch2 = Some(batch_run(&mut m, &long)?.0);
             }
             drop(m);
@@ -598,6 +681,13 @@ mod gate {
             Ok(m)
         };
         let mut m = load()?;
+        if args.bfirst {
+            pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P], "B3f")?;
+            if args.on_load() {
+                drop(m);
+                m = load()?;
+            }
+        }
 
         if let Some(want) = &want.union {
             if args.union {
@@ -691,7 +781,7 @@ mod gate {
             pass &= batch_fault_case(&mut m, &long[..BATCH_FAULT_P], first)?;
         }
         if args.blost {
-            pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P])?;
+            pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P], "B3")?;
             if args.lost {
                 drop(m);
                 m = load()?;
@@ -817,8 +907,13 @@ mod gate {
         Ok(ok)
     }
 
-    /// B3: the tier's stream held behind a host flag before a prompt call.
-    fn batch_lost_case(m: &mut Deepseek41Model, ids: &[u32]) -> Result<bool, GateError> {
+    /// B3 (B3f on a fresh load, clause `what`): the tier's stream held behind
+    /// a host flag before a prompt call.
+    fn batch_lost_case(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        what: &str,
+    ) -> Result<bool, GateError> {
         m.set_mode(StepMode::Graph);
         m.reset()?;
         let flags = {
@@ -834,32 +929,47 @@ mod gate {
         let secs = t0.elapsed().as_secs_f64();
         let mut ok = match &r {
             Err(e) if e.to_string().contains("the card is lost") && secs < LOST_BOUND_S => {
-                println!("ok B3: the prompt call fails in {secs:.1} s naming the lost card: {e}");
+                println!(
+                    "ok {what}: the prompt call fails in {secs:.1} s naming the lost card: {e}"
+                );
                 true
             }
             other => {
                 println!(
-                    "FAIL B3: after {secs:.1} s the prompt call gave {other:?}, want the lost card"
+                    "FAIL {what}: after {secs:.1} s the prompt call gave {other:?}, want the lost card"
                 );
                 false
             }
         };
         let kind = m.body(NAME)?.hybrid().last_poison().map(|p| p.mark().kind);
         if kind != Some(PoisonKind::CardLost) {
-            println!("FAIL B3: the host tier's poison is {kind:?}, want CardLost");
+            println!("FAIL {what}: the host tier's poison is {kind:?}, want CardLost");
             ok = false;
         }
-        match body::prefill(m, ids) {
-            Err(e) => println!("ok B3: the next prompt call is refused: {e}"),
-            Ok(t) => {
-                println!("FAIL B3: the next prompt call gave token {t}");
-                ok = false;
-            }
+        let next = body::prefill(m, ids);
+        if lost_refusal(&next, BEGIN_GROUP) {
+            println!(
+                "ok {what}: the next prompt call is refused at its group's start by the lost card's \
+                 poison: {}",
+                next.as_ref()
+                    .err()
+                    .map_or_else(String::new, ToString::to_string)
+            );
+        } else {
+            println!(
+                "FAIL {what}: the next prompt call gave {next:?}, want the host tier's refusal as \
+                 {BEGIN_GROUP} naming the lost card"
+            );
+            ok = false;
         }
         match m.reset() {
-            Err(e) if e.to_string().contains("lost") => println!("ok B3: a reset is refused: {e}"),
+            Err(e) if e.to_string().contains("lost") => {
+                println!("ok {what}: a reset is refused: {e}")
+            }
             other => {
-                println!("FAIL B3: a reset gave {other:?}, want a refusal naming the lost card");
+                println!(
+                    "FAIL {what}: a reset gave {other:?}, want a refusal naming the lost card"
+                );
                 ok = false;
             }
         }
@@ -872,7 +982,7 @@ mod gate {
             .stream()
             .synchronize()?;
         m.gpu().stream().synchronize()?;
-        println!("B3: flag raised, both streams drained");
+        println!("{what}: flag raised, both streams drained");
         Ok(ok)
     }
 
@@ -906,12 +1016,20 @@ mod gate {
             println!("FAIL T3: the host tier's poison is {kind:?}, want CardLost");
             ok = false;
         }
-        match m.step(&[prompt[5]]) {
-            Err(e) => println!("ok T3: the next step is refused: {e}"),
-            Ok(t) => {
-                println!("FAIL T3: the next step gave token {t}");
-                ok = false;
-            }
+        let next = m.step(&[prompt[5]]);
+        if lost_refusal(&next, DECODE_INPUT) {
+            println!(
+                "ok T3: the next step is refused by the lost card's poison: {}",
+                next.as_ref()
+                    .err()
+                    .map_or_else(String::new, ToString::to_string)
+            );
+        } else {
+            println!(
+                "FAIL T3: the next step gave {next:?}, want the host tier's refusal as \
+                 {DECODE_INPUT} naming the lost card"
+            );
+            ok = false;
         }
         match m.reset() {
             Err(e) if e.to_string().contains("lost") => println!("ok T3: a reset is refused: {e}"),

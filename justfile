@@ -1024,7 +1024,7 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
 # 리셋 뒤 스텝과 같다; --blost(B3) 층 스트림을 묶은 채 프롬프트 호출이 데드라인 안에 카드 상실 이름과 CardLost 독으로 끝난다.
 # 3090, 게이트 락.
 [group('v41-load')]
-gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault --blost':
+gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault --blost --bfirst':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
