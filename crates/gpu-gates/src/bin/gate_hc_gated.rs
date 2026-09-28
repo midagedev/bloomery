@@ -41,7 +41,8 @@
 //!    weights and `mixed` within the bands the error model derives for the q8
 //!    step per 32 values (`WIDE_LO_BAND`, `WIDE_G_REL`) of `mix_ref`; four of
 //!    the columns each its one-column mix bit for bit and a rerun
-//!    bit-identical; a NaN in one column raises and leaves the others clean;
+//!    bit-identical; a NaN in one column raises the quantizer's site and the
+//!    mix's and leaves the others clean;
 //!    38 columns on a 37-column scratch refused by name.
 
 #[cfg(not(feature = "gpu"))]
@@ -749,6 +750,14 @@ mod gate {
     /// count for the independence clause.
     const WIDE_COLS: usize = 37;
 
+    /// `v` followed by zeros to `len` values: a device buffer's copy takes its
+    /// whole length, and the wide scratch holds more columns than a site's run.
+    fn padded(v: &[f32], len: usize) -> Vec<f32> {
+        let mut out = vec![0.0; len];
+        out[..v.len()].copy_from_slice(v);
+        out
+    }
+
     /// PIN(2026-09-28): the wide mix's distance from the f64 rule, derived,
     /// never measured: a q8 activation of 32 values (scale amax/127) moves a
     /// value by at most half a step, uniformly, d/√12 in RMS, so a column's
@@ -874,7 +883,9 @@ mod gate {
         // The wide scratch's weights are the wide site's, not the narrow
         // one's: seed them with the narrow first site's so the combines read
         // the same weights.
-        w.scratch.wgt.copy_from_host(c.gpu.stream(), &first.wgt)?;
+        w.scratch
+            .wgt
+            .copy_from_host(c.gpu.stream(), &padded(&first.wgt, w.scratch.wgt.len()))?;
         let wide = wide_mix(c, &mut w, site, true, &res, Pre::Combine(&y), m)?;
         let p = bits_equal(&wide.res, &narrow.res) && bits_equal(&wide.xn, &narrow.xn);
         ok &= p;
@@ -884,7 +895,9 @@ mod gate {
         );
         let mut want = res.clone();
         combine(c.geo, m, &mut want, &y, &first.wgt);
-        w.scratch.wgt.copy_from_host(c.gpu.stream(), &first.wgt)?;
+        w.scratch
+            .wgt
+            .copy_from_host(c.gpu.stream(), &padded(&first.wgt, w.scratch.wgt.len()))?;
         let st = c.gpu.stream();
         let mut res_d = DeviceBuffer::from_host(st, &res)?;
         let y_d = DeviceBuffer::from_host(st, &y)?;
@@ -1016,14 +1029,14 @@ mod gate {
             m - 1,
             verdict(same && rerun)
         );
-        // (e) no silent failure: a NaN in one stream of one column raises (the
-        // quantizer's QuantColumn, the lowest code the launches raise) and
-        // leaves the other columns their clean bits; a column count past the
-        // scratch is refused by name.
+        // (e) no silent failure: a NaN in one stream of one column raises the
+        // quantizer's QuantColumn and, as that column's NaN reaches the mix,
+        // the mix's site, and leaves the other columns their clean bits; a
+        // column count past the scratch is refused by name.
         let mut bad = res.clone();
         bad[2 * WIDE + D + 11] = f32::NAN;
         let o2 = wide_mix(c, &mut w, site, true, &bad, Pre::Plain, m)?;
-        let want = Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+        let want = Some(Fault::of_sites(LAYER_NONE, &[FaultSite::QuantColumn, SITE]));
         let others = (0..m).filter(|&k| k != 2).all(|k| {
             bits_equal(col(&o2.mixed, D, k), col(&o.mixed, D, k))
                 && bits_equal(col(&o2.wgt, S, k), col(&o.wgt, S, k))
@@ -1038,7 +1051,11 @@ mod gate {
         );
         let past_cols = WIDE_COLS + 1;
         let res_long = activations(WIDE, past_cols, 0x3a04);
+        // A route as wide as the call, so the refusal is the scratch's own.
+        let mut route = GemmRoute::new(c.gpu.stream(), past_cols, 1)?;
+        std::mem::swap(&mut w.route, &mut route);
         let got = wide_mix(c, &mut w, site, true, &res_long, Pre::Plain, past_cols);
+        std::mem::swap(&mut w.route, &mut route);
         let named = matches!(&got, Err(e) if e.to_string().contains("the wide scratch holds"));
         ok &= named;
         println!(
