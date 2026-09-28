@@ -75,7 +75,7 @@ use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -816,6 +816,49 @@ pub struct PassReport {
     /// bytes into the ring, and preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
+}
+
+/// Why a dropped machine leaked its shared state ([`Leak`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeakReason {
+    /// The staging thread was still inside the source past the deadline.
+    Join,
+    /// The copies waiting on staging words could not be let through.
+    Release,
+    /// The copy stream did not drain within the deadline.
+    Drain,
+}
+
+impl LeakReason {
+    /// The reason as the `residency leak` record's word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            LeakReason::Join => "join",
+            LeakReason::Release => "release",
+            LeakReason::Drain => "drain",
+        }
+    }
+}
+
+/// What a dropped machine leaked rather than free under a copy or a thread
+/// that may still use it: the staging ring's and the staging words' pinned
+/// bytes, and with them the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leak {
+    pub reason: LeakReason,
+    pub ring_bytes: u64,
+    pub words_bytes: u64,
+}
+
+/// Where a dropped machine reports a leak; set once a process.
+static LEAK_SINK: OnceLock<fn(&Leak)> = OnceLock::new();
+
+/// Report every leak of a dropped machine to `sink` (the binaries' `residency
+/// leak` record). Unset, the drop names the leak on stderr. `false` when a
+/// sink is set already.
+pub fn set_leak_sink(sink: fn(&Leak)) -> bool {
+    LEAK_SINK.set(sink).is_ok()
 }
 
 /// What a reset did ([`SwapMachine::reset`]), for the `residency reset`
@@ -1996,8 +2039,32 @@ impl Drop for SwapMachine {
         // reference, and the shared state is leaked too: its last owner would
         // free pinned pages and the source on that thread, inside the driver
         // beside whatever this process runs next.
-        if !joined || !released || poll_drained(&self.copy, deadline).is_err() {
+        let reason = if !joined {
+            Some(LeakReason::Join)
+        } else if !released {
+            Some(LeakReason::Release)
+        } else if poll_drained(&self.copy, deadline).is_err() {
+            Some(LeakReason::Drain)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             std::mem::forget(Arc::clone(&self.shared));
+            let leak = Leak {
+                reason,
+                ring_bytes: (RING_SLOTS * self.shared.ring.slot_bytes) as u64,
+                words_bytes: (2 * RING_SLOTS * WORD_STRIDE) as u64,
+            };
+            match LEAK_SINK.get() {
+                Some(sink) => sink(&leak),
+                None => eprintln!(
+                    "SwapMachine drop: leaked the staging ring ({} B), the staging words ({} B) \
+                     and the source: {}",
+                    leak.ring_bytes,
+                    leak.words_bytes,
+                    reason.word()
+                ),
+            }
         }
     }
 }

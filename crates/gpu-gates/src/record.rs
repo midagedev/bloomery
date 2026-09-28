@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::host::PassKind;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::host::swap::{PassReport, ResetReport};
+use bloomery_gpu::host::swap::{Leak, PassReport, ResetReport};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
 use model::placement::{Machine, Plan};
@@ -244,6 +244,14 @@ pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
         "record::at_main({bin}): the process registered {}'s kinds already",
         held.bin
     );
+    if kinds.iter().any(|k| std::ptr::eq(*k, &RESIDENCY_LEAK)) {
+        bloomery_gpu::host::swap::set_leak_sink(eprint_leak);
+    }
+}
+
+/// The residency machine's leak sink: its `residency leak` line on stderr.
+fn eprint_leak(l: &Leak) {
+    residency_leak(l).eprint();
 }
 
 /// The schema of `bin`'s lines on stdout ([`schema`]).
@@ -940,6 +948,23 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// A dropped residency machine's leak ([`bloomery_gpu::host::swap::Leak`]),
+/// on stderr from the drop.
+pub static RESIDENCY_LEAK: Kind = Kind {
+    name: "residency_leak",
+    head: "residency leak",
+    doc: "A dropped residency machine kept its staging ring, its staging words and its source \
+          rather than free them under a copy or a thread that may still use them: why (join: the \
+          staging thread was still inside the source past the deadline; release: the copies \
+          waiting on staging could not be let through; drain: the copy stream did not drain \
+          within the deadline) and the pinned bytes of the ring and the words.",
+    parts: &[
+        key("reason", Word, ""),
+        key("ring", U64, "B"),
+        key("words", U64, "B"),
+    ],
+};
+
 /// A generated token.
 pub static STEP: Kind = Kind {
     name: "step",
@@ -1343,6 +1368,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `bloomery-chat` prints, all on stderr.
@@ -1380,6 +1406,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -1400,6 +1427,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &SMOKE,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
 ];
 
 /// What `generate_qwen3moe --dump-taps` prints after its `load` line; the
@@ -1505,6 +1533,14 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("issue_us", r.issue_us)
         .u("stage_us", r.stage_us)
         .u("prepare_us", r.prepare_us)
+}
+
+/// A dropped residency machine's leak record.
+pub fn residency_leak(l: &Leak) -> Record {
+    Record::new(&RESIDENCY_LEAK)
+        .w("reason", l.reason.word())
+        .u("ring", l.ring_bytes)
+        .u("words", l.words_bytes)
 }
 
 /// A residency reset's record.
