@@ -7,6 +7,11 @@
 # holds any: 13.2..17.2 ms of kernel time a replay; attention at the window's mean depth ~260 adds
 # little. The report's alternative is the 8.10 GB read at ~447 GB/s: 9.22 / 447 = 20.6 ms or more.
 # The two bands do not overlap, so one trace decides where the 4.7..6.5 ms gap is.
+# Placement: the id prefix. Nothing on this job's path sets BLOOMERY_HOT_LIST (its BLOOMERY_BOX_ENV is the card alone,
+# nsys-glm5next.sh sets none); glm5next-hotlist.txt reaches a binary only through depth-glm5next.sh's hot: arm. The
+# traced prompt is GLM_PROSE's first 512 ids, inside that list's trace, which does not matter without the list; the
+# 47.7 ms row fed ids from GLM_PROSE_FROM (50,000, depth-glm5next.sh's default). The two prompts differ only in their
+# routing, which at the id prefix moves the routed card expert rows, at most the 1.9 ms above [derived].
 # Minutes: 15 [the spec's estimate; one GLM load + 519 traced replays + the sqlite export].
 kind: profile
 question: is the GLM decode step's gap to the model (47.7 against 41.2..43.0 ms) on the card, in the
@@ -14,7 +19,8 @@ question: is the GLM decode step's gap to the model (47.7 against 41.2..43.0 ms)
 term: kernel time per step (nsys-table.py's header at --steps 519, kernel time us/step) of generate_glm5next --tokens <first 512 prose ids> -n 8 --ctx 2048 --place a, A6000
 unit: ms
 predict: 13.2..17.5
-condition: just nsys-gpu-glm5next 512 under the lease on the A6000; the term is read from the
+condition: just nsys-gpu-glm5next 512 under the lease on the A6000, no BLOOMERY_HOT_LIST (the id
+  prefix: generate_glm5next's default placement); the term is read from the
   --steps 519 header (512 prompt steps + 7); the cuGraphLaunch header must say N = 518 or 519 (one
   replay a step; a capture pass may stand for one), else the step is more than one graph and the
   rows are read per launch instead;

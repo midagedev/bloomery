@@ -22,8 +22,9 @@ condition: just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 
   unionr8:4x8u0.125,unionr8:4x16u0.0625 under the lease, both arms' outputs bit-equal to the union
   shape (the bench's pre-timing check), the witness io pressure under 1 % and no other heavy
   process; the fit is t = 160 x (a + c m) per dispatch kind, as 09-25#h3tile-ab fitted the whole
-decide-in: open the q8_K down round: flow model lcg P 4096 +7.8..+10.3 % (list 384) at the
-  measured c_down, with its sigma and e2e count pin cost named in the spec
+decide-in: open the q8_K down round at the measured c_down, its band re-run in the flow model at the
+  id prefix (the +7.8..+10.3 % at lcg P 4096 was the list-384 row's; the prefix's union carries more
+  host columns), with its sigma and e2e count pin cost named in the spec
 decide-below: the down share is small: q8_K saves under 1.1 us a column; re-run the flow model at
   the measured split and rank q8_K behind (c') if its gain drops under +5 %
 decide-above: down carries more than its instruction share: q8_K's gain is larger than the 22 %

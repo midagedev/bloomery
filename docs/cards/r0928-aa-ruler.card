@@ -17,25 +17,30 @@
 # Resolution [derived, chi-square quantiles]: a 95 % interval on an SD estimated at df 4 (V4.1, 3 rounds a arm) is
 # 0.60 s .. 2.87 s, wider than the whole band below; at df 10 (Qwen3, 6 rounds) it is 0.70 s .. 1.75 s. The Qwen3
 # half is the one that can move the constant; the V4.1 half says whether V4.1 scatters on another scale.
+# The V4.1 half runs the default placement, the id prefix (no hot list). The prediction does not move with it: the band
+# comes from the Qwen3.6 and GLM windows, not from a V4.1 row. The id prefix does lengthen the V4.1 host leg (host slots
+# a token about 197.6 on prose against 105.4 with the list [derived from the prose router trace; 105.4 measured, rig-log
+# 09-28#hotlist-chat]), so a V4.1 scatter off the Qwen3 scale is a finding of this half, not a void.
 # Minutes: 17 [derived]. aav41 12: seven V4.1 processes (the runner's default warm-up and 3 rounds x 2 arms), each a
-# load of 75-117 s (the split card's range, from the rows' wall column) plus a 512-id prose prompt, 96 steps and the
-# witness blocks, about 6 s: 10-15 min. aaq3 5: twelve Qwen3 processes (6 rounds x 2 arms, no warm-up: the runner's
-# default), each a load of about 20 s (the s card's figure) and under a second of prompt and steps plus the witness
-# blocks: about 24 s.
+# load of 75-117 s (rig-log 09-26 nsyspp: 74.6 s; r8host-pp: 33 min for 16 loads) plus a 512-id prose prompt, 96 steps
+# and the witness blocks: at the id prefix the lcg rows give 512 / 190.6 = 2.7 s of prompt and 96 / 29.66 = 3.2 s of
+# steps (rig-log 09-28#v41-release, [cpu-busy] rows), about 6-8 s with the witness: 10-15 min. aaq3 5: twelve Qwen3
+# processes (6 rounds x 2 arms, no warm-up: the runner's default), each a load of about 20 s (the s card's figure) and
+# under a second of prompt and steps plus the witness blocks: about 24 s.
 kind: profile
 question: how far does one same-binary run scatter on the A6000, so that the ruler every GPU A/B is sized by
   (sd_same_binary, card.py's SD_DEFAULT, AGENTS.md's 0.6 %) is the card's own and not a host-CPU decode's?
 term: per-run SD of one arm in % of its mean, the two identical arms pooled, the largest of four terms: V4.1 decode
-  tok/s(mean) @ n=96, prose prompt P = 512, hot list 384, plan (a), A6000, and its pp tok/s @ P = 512; Qwen3-30B-A3B
-  decode tok/s(mean) @ n=96, depth 512 (lcg), ctx 768, A6000, and its pp tok/s @ P = 512
+  tok/s(mean) @ n=96, prose prompt P = 512, id prefix (no hot list), plan (a), A6000, and its pp tok/s @ P = 512;
+  Qwen3-30B-A3B decode tok/s(mean) @ n=96, depth 512 (lcg), ctx 768, A6000, and its pp tok/s @ P = 512
 unit: %
 predict: 0.35..0.63
 condition: aaq3 = BLOOMERY_AB_ROUNDS=6 just depth-gpu-qwen3moe 512 bin:$PWD/target/release/generate_qwen3moe:512,
-  aav41 = BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_AB_LOAD=arm with
-  BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt, each with BLOOMERY_LEASE_CARD=docs/cards/r0928-aa-ruler.card,
+  aav41 = BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_AB_LOAD=arm with no BLOOMERY_HOT_LIST,
+  each with BLOOMERY_LEASE_CARD=docs/cards/r0928-aa-ruler.card,
   under the lease on the A6000, one binary for both arms of a model, the arm order rotated each round. A row tagged
   [cold], [cpu-busy] or [other-busy], and a FAIL row, is void and printed with its value; a V4.1 row is also void
-  when its plan record is not place a with the hot list above, or its time prompt record's tok/s is not its row's
+  when its plan record is not place a with hot_list none (the id prefix), or its time prompt record's tok/s is not its row's
   pp_tok/s. A term with fewer than two clean rounds in either arm is void and named; the verdict runs over the rest.
   Per term: each arm's per-round values, SD and mean, the pooled SD and df, the mean difference b / a - 1 and its h,
   inside or outside

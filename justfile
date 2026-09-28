@@ -257,14 +257,6 @@ ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
 ncu-gpu-ds41-pp P='512':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
 
-# The V4.1 prompt batch's card-expert tile kernels (ncu, A6000, under the lease, lead-only): DRAM bytes and duration of
-# every ds41_expert_gate_up_tiles and q4k_gemv_tiles launch of one prose prompt call (the first P ids of
-# corpus-prose.ids, default 512, --place a), and each kernel's full-block medians. Pass the hot list through
-# BLOOMERY_BOX_ENV (BLOOMERY_HOT_LIST=..., required). The header of tools/ref/ncu-ds41-gt.sh has the form. Under
-# BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
-ncu-gpu-ds41-gt P='512':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && bash tools/ref/ncu-ds41-gt.sh {{P}}'
-
 # The Qwen3 prompt's counters (ncu, A6000, under the lease, lead-only): one KERNEL launch (gqa_prefill_flash, the one the
 # form's table holds) in layer LAYER of a P-token prompt, in the process of depth-qwen3moe.sh's `<P>` arm (-n 1), at the
 # card's own clock. The launch skip is derived from the code (tools/ref/q3pp.py plan: 24 at P = 4096) and the profiled
