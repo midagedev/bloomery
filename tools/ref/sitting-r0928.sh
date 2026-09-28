@@ -2,6 +2,8 @@
 # Sitting r0928: the research probes of the 2026-09-28 idea audit, in one run from the Mac (lead-only).
 # Each job is an existing recipe or runner with its prediction card (docs/cards/r0928-<slug>.card);
 # this script owns only the order, the hold, the logs and the post-reads.
+# Predicted: 58 min of jobs, the cards' minutes summed (54 while the union job is skipped; --dry-run sums the
+# jobs that run), plus the builds each recipe runs before its lease.
 #
 #   tools/ref/sitting-r0928.sh             # the sitting: the hold up, every job, the hold down
 #   tools/ref/sitting-r0928.sh --dry-run   # each job's command and card check; nothing reaches the box
@@ -15,8 +17,10 @@
 # inside its runner, card first (lease_take); the builds run before each lease, under the hold.
 #
 # Order (the page cache): the Qwen3 jobs, then the V4.1 jobs, the engram residency read right after them
-# (its card asks for the cache the V4.1 prompts left), GLM, and last the two-card probes, whose 8 GiB
-# host chunks would evict the model files ahead of the loads.
+# (its card asks for the cache the V4.1 prompts left), the V4.1 split proxy (its split arm's host set holds
+# the tier's 23 experts a layer beyond hot list 384's, so it runs after the engram read and while the hot
+# arm's set is still cached), GLM, and last the two-card probes, whose 8 GiB host chunks would evict the
+# model files ahead of the loads.
 #
 # Logs: every job's whole stdout and stderr go to <dir>/<job>.log before anything reads them (never
 # through a pipe that could cut them); the post-reads read those files and write <dir>/<job>.post;
@@ -46,6 +50,7 @@ JOBS=(
   "enqueue|r0928-enqueue-g2|5|mac=BLOOMERY_AB_ROUNDS=1;box=BLOOMERY_HOT_LIST=$HOT;BLOOMERY_STEP_STATS=1|just depth-gpu-ds41 4096"
   "gt|r0928-gt-ncu|5|box=BLOOMERY_HOT_LIST=$HOT|just ncu-gpu-ds41-gt 512"
   "engram|r0928-engram-resident|3||engram_cmd"
+  "split|r0928-split-proxy|8|mac=BLOOMERY_AB_ROUNDS=2;box=BLOOMERY_HOT_LIST=$HOT;BLOOMERY_STEP_STATS=1;BLOOMERY_AB_WARMUP=0|split_cmd"
   "union|r0928-union-split|4||just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms unionr8:4x8u0.125,unionr8:4x16u0.0625"
   "glm|r0928-glm-nsys|15||just nsys-gpu-glm5next 512"
   "tred|r0928-tred|1|box=BLOOMERY_OTHER_STRICT=1|just time-gpu-probe-tred"
@@ -70,6 +75,18 @@ ENGRAM_RUNS="./target/release/probe_engram --ids \$BLOOMERY_DATA/engram/corpus-t
 engram_cmd() {
   BLOOMERY_BOX_ENV='' just probe-engram --check || return $?
   BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash -s' <<< "$ENGRAM_RUNS"
+}
+
+# The split proxy: the box's hot list cut by tools/ref/hotlist-split.py into (b')'s every:2 A6000 set per
+# layer (the tier's 23 on the host), written on the box before the lease, then the hot and the split arms
+# of one binary interleaved in one lease (card r0928-split-proxy).
+SPLIT=/tmp/bloomery-r0928-split/hotlist-384-every2-tier23.txt
+SPLIT_GEN="mkdir -p ${SPLIT%/*} && python3 tools/ref/hotlist-split.py $HOT $SPLIT --pick every:2 --tier 23 --plan a"
+SPLIT_ARMS="prose:512 prose:512@BLOOMERY_HOT_LIST=$SPLIT prose:4096 prose:4096@BLOOMERY_HOT_LIST=$SPLIT"
+split_cmd() {
+  ./tools/box.sh "$SPLIT_GEN" || return $?
+  # shellcheck disable=SC2086 # the arms are a word list
+  just depth-gpu-ds41 $SPLIT_ARMS
 }
 
 # The union split needs bench_v41_host to tally the r8 union's gate-up and down apart (kinds
@@ -181,6 +198,108 @@ for r in rows[hdr + 1:]:
 PY
 )
 
+# The split job's card_in: every counted row (tag ROW) of the hot arm (`prose`) and the split arm
+# (`prose@BLOOMERY_HOT_LIST=<proxy>`), each with the plan record of its load and the stat prefill split and
+# time prompt records echoed just before it, all read by tools/bloomery/records.py by kind and field (the
+# runner indents a load's records under its `[load]` line). A row is void when its plan does not match the
+# proxy's summary line or its own hot list, when it has not exactly one stat prefill split record with
+# card_in_lb, or when it is [other-busy]. Per P: the per-round ratios split / hot, the ratio of the two
+# arms' means over the rounds that have both, and its verdict (split_decide).
+SPLIT_POST=$(cat << 'PY'
+import importlib.util, re, statistics, sys
+records_py, log, hot, split = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("records", records_py)
+R = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(R)
+schema = R.load()
+TAG = re.compile(r"^(ROW|WARMUP|DISCARD|PRIME|COLD|FAIL) r(\d+) (\S+) [dp]=(\d+)")
+SUMMARY = re.compile(r"^hotlist-split: wrote (\S+) .*card_experts=(\d+) n_l=(\S+) n_l_layers=(\d+)")
+want = {"prose": hot, f"prose@BLOOMERY_HOT_LIST={split}": split}
+PREDICTED = {512: 0.754, 4096: 0.824}
+expect, plan, pending, rows = None, None, [], []
+for raw in open(log, errors="replace"):
+    line = raw.strip()
+    m = SUMMARY.match(line)
+    if m:
+        if m.group(1) != split:
+            sys.exit(f"the proxy was written to {m.group(1)}, the arms read {split}")
+        expect = (int(m.group(2)), m.group(3), int(m.group(4)))
+        continue
+    m = TAG.match(line)
+    if m:
+        if m.group(1) == "ROW" and m.group(3) in want:
+            rows.append((int(m.group(2)), m.group(3), int(m.group(4)), plan, pending,
+                         [t for t in ("[cold]", "[cpu-busy]", "[other-busy]") if t in line]))
+        pending = []
+        continue
+    rec = schema.read_line(line)
+    if rec is None:
+        continue
+    if rec.kind == "plan":
+        plan = rec
+    elif rec.kind in ("stat_prefill_split", "time_prompt"):
+        pending.append(rec)
+if expect is None:
+    sys.exit("no `hotlist-split: wrote` line: the proxy's plan is unknown, no row can be checked")
+val = {}
+for r, label, P, pl, recs, tags in rows:
+    arm = "hot" if label == "prose" else "split"
+    split_recs = [x for x in recs if x.kind == "stat_prefill_split"]
+    pp = next((x["tok/s"] for x in recs if x.kind == "time_prompt"), None)
+    why = None
+    if pl is None:
+        why = "no plan record before it"
+    elif pl.get("hot_list") != want[label] or pl.get("place") != "a":
+        why = f"its plan ran place={pl.get('place')} hot_list={pl.get('hot_list')}"
+    elif (pl.get("card_experts"), pl.get("n_l"), pl.get("n_l_layers")) != expect:
+        why = (f"its plan card_experts={pl.get('card_experts')} n_l={pl.get('n_l')} n_l_layers={pl.get('n_l_layers')}"
+               f" is not the proxy's {expect}")
+    elif len(split_recs) != 1 or "card_in_lb" not in split_recs[0]:
+        why = f"{len(split_recs)} stat prefill split record(s), card_in_lb {'present' if split_recs and 'card_in_lb' in split_recs[0] else 'absent'}"
+    elif "[other-busy]" in tags:
+        why = "[other-busy]"
+    ci = split_recs[0]["card_in_lb"] if len(split_recs) == 1 and "card_in_lb" in split_recs[0] else None
+    print(f"r{r} P{P} {arm:5} card_in_lb {ci} ms  pp {pp} tok/s{' ' + ' '.join(tags) if tags else ''}"
+          f"{'  VOID: ' + why if why else ''}")
+    if why is None:
+        val[(P, r, arm)] = (ci, pp)
+verdicts = []
+for P in (512, 4096):
+    pairs = sorted(r for (p, r, a) in val if p == P and a == "hot" and (P, r, "split") in val)
+    if not pairs:
+        print(f"P{P}: no round with both arms valid: no ratio")
+        verdicts.append(None)
+        continue
+    per = [val[(P, r, "split")][0] / val[(P, r, "hot")][0] for r in pairs]
+    ratio = statistics.fmean(val[(P, r, "split")][0] for r in pairs) / statistics.fmean(val[(P, r, "hot")][0] for r in pairs)
+    pps = [(val[(P, r, "split")][1], val[(P, r, "hot")][1]) for r in pairs]
+    pp = "?" if not all(a and b for a, b in pps) else \
+        f"{statistics.fmean(a for a, _ in pps) / statistics.fmean(b for _, b in pps):.3f}"
+    print(f"P{P}: card_in split / hot per round {' '.join(f'{x:.4f}' for x in per)}; over {len(pairs)} round(s) "
+          f"{ratio:.4f} (predicted {PREDICTED[P]}) | pp split / hot {pp} (printed, not judged)")
+    verdicts.append(ratio)
+if None in verdicts:
+    sys.exit("split verdict: void (a P has no ratio)")
+print(f"ratios {verdicts[0]:.4f} {verdicts[1]:.4f}")
+PY
+)
+# split_decide <ratio at 512> <ratio at 4096>: the card's rule, per P (<= 0.85 go, >= 0.95 stay, else hold),
+# and the job's: go only when both go, stay only when both stay, else hold.
+split_decide() {
+  awk -v a="$1" -v b="$2" 'function v(r) { return r <= 0.85 ? "go" : (r >= 0.95 ? "stay" : "hold") }
+    BEGIN { va = v(a); vb = v(b); j = (va == vb && va != "hold") ? va : "hold"
+            printf "split verdict: P512 %s (%.4f), P4096 %s (%.4f): %s\n", va, a, vb, b, j }'
+}
+split_post() { # split_post <log>
+  local out r
+  out=$(python3 - "$ROOT/tools/bloomery/records.py" "$1" "$HOT" "$SPLIT" <<< "$SPLIT_POST") || { echo "$out"; return 1; }
+  echo "$out"
+  r=$(sed -nE 's/^ratios ([0-9.]+) ([0-9.]+)$/\1 \2/p' <<< "$out")
+  [ -n "$r" ] || { echo "post split: no ratio line"; return 1; }
+  # shellcheck disable=SC2086 # the two ratios
+  split_decide $r
+}
+
 ro_box() { # ro_box <command>, the script on stdin: a read-only box command (syncs nothing, builds nothing)
   BLOOMERY_BOX_READONLY=1 ./tools/box.sh "$1"
 }
@@ -220,6 +339,7 @@ post() { # post <job> <log>: the job's post-read into stdout
     gt) grep -E '^summary ' "$log" ;;
     imma) grep -E '^probe (check|imma) ' "$log" ;;
     engram) grep -E '^probe (check|engram) ' "$log" ;;
+    split) split_post "$log" ;;
     union) grep -E 'unionr8' "$log" ;;
     glm) grep -E '^(#|--- |    time |    SMOKE)' "$log" | grep -vE '^--- sources' ;;
     tred) grep -E '^probe (check|peer|tred) ' "$log" ;;
@@ -255,8 +375,50 @@ EOF
   echo "--- 원본: /root/bloomery-data/nsys/x.nsys-rep, /root/bloomery-data/nsys/x.sqlite" > "$d/n.log"
   got=$(path_in "$d/n.log" .sqlite)
   [ "$got" = /root/bloomery-data/nsys/x.sqlite ] || { echo "self-test: path_in read '$got'" >&2; fail=1; }
+  # The header's total is the job table's.
+  got=$(printf '%s\n' "${JOBS[@]}" | awk -F'|' '{ s += $3 } END { print s }')
+  grep -q "^# Predicted: $got min of jobs," "$ROOT/tools/ref/sitting-r0928.sh" || { echo "self-test: the header's total is not the job table's $got min" >&2; fail=1; }
   got=$(skip_reason kv512)
   [ -z "$got" ] || { echo "self-test: kv512 has a skip reason: $got" >&2; fail=1; }
+  # split: two rounds; round 2's P 512 split row is [other-busy] (void), so P 512 pairs round 1 alone.
+  # P 512: 17.25 / 23.00 = 0.7500; P 4096: (17.22 + 17.60) / (21.00 + 21.20) = 0.8251, both go.
+  split_rows() { # split_rows <round> <label> <hot list> <P card_in pairs...>
+    local r=$1 label=$2 hl=$3 P ci tag
+    shift 3
+    echo "[load] r$r 2 arm(s): - one process, one load"
+    echo "    plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44000000000 B) host_experts=12692 (214000000000 B) host_shadow=0 B n_l=70..71 on 38 layers card_budget=none hot_list=$hl"
+    while [ $# -gt 0 ]; do
+      P=$1 ci=$2 tag=${3#-}
+      shift 3
+      echo "time prompt n=$P ms=1000.0000 tok/s=$((P / 2)).00 passes=1 kind=batch"
+      echo "stat prefill split group=2 batches=1 layer_batches=40 prologue_ms=1.0 chain_ms=900.0 union_ms=1.0 wait_ms=1.0 enqueue_ms=1.0 copy_ms=1.0 union_lb=1.00 wait_lb=1.00 wait_first_lb=1.00 enqueue_lb=1.00 copy_lb=1.00 entries_route=9.0 entries_shadow=3.0 excluded_lb=0.0 card_out_ms=1.0 card_in_ms=1.0 card_proj_ms=1.0 card_out_lb=1.00 card_in_lb=$ci card_proj_lb=1.00"
+      echo "ROW r$r $label d=$P n=96 | tok/s(mean) 44.6 @ n=96, depth $P, A6000 | place a | wall 90s${tag:+ $tag}"
+    done
+  }
+  {
+    echo "hotlist-split: wrote $SPLIT pick=every:2 tier=23 plan=a card_experts=2668 n_l=70..71 n_l_layers=38"
+    split_rows 1 prose "$HOT" 512 23.00 - 4096 21.00 -
+    split_rows 1 "prose@BLOOMERY_HOT_LIST=$SPLIT" "$SPLIT" 512 17.25 - 4096 17.22 -
+    split_rows 2 "prose@BLOOMERY_HOT_LIST=$SPLIT" "$SPLIT" 4096 17.60 - 512 16.00 '[other-busy]'
+    split_rows 2 prose "$HOT" 4096 21.20 - 512 23.10 -
+  } > "$d/split.log"
+  got=$(split_post "$d/split.log" 2>&1)
+  grep -q '^P512: card_in split / hot per round 0.7500; over 1 round(s) 0.7500 ' <<< "$got" || { echo "self-test: split P512: $got" >&2; fail=1; }
+  grep -q '^P4096: card_in split / hot per round 0.8200 0.8302; over 2 round(s) 0.8251 ' <<< "$got" || { echo "self-test: split P4096: $got" >&2; fail=1; }
+  grep -q '^r2 P512 split .*VOID: \[other-busy\]$' <<< "$got" || { echo "self-test: split did not void the [other-busy] row: $got" >&2; fail=1; }
+  grep -q '^split verdict: P512 go (0.7500), P4096 go (0.8251): go$' <<< "$got" || { echo "self-test: split verdict: $got" >&2; fail=1; }
+  # A plan the proxy was not cut for voids its load's rows (round 1's split load here).
+  awk '/^    plan / && ++n == 2 { sub(/card_experts=2668/, "card_experts=2667") } { print }' "$d/split.log" > "$d/split-plan.log"
+  got=$(split_post "$d/split-plan.log" 2>&1)
+  grep -q "^r1 P512 split .*VOID: its plan card_experts=2667" <<< "$got" || { echo "self-test: split kept a row of another plan: $got" >&2; fail=1; }
+  got=$(split_decide 0.85 0.80)
+  [ "$got" = "split verdict: P512 go (0.8500), P4096 go (0.8000): go" ] || { echo "self-test: split_decide at the go edge: $got" >&2; fail=1; }
+  got=$(split_decide 0.95 0.99)
+  [ "${got##*: }" = stay ] || { echo "self-test: split_decide at the stay edge: $got" >&2; fail=1; }
+  got=$(split_decide 0.80 0.90)
+  [ "${got##*: }" = hold ] || { echo "self-test: split_decide with one P between: $got" >&2; fail=1; }
+  got=$(split_decide 0.80 0.96)
+  [ "${got##*: }" = hold ] || { echo "self-test: split_decide with the two P apart: $got" >&2; fail=1; }
   rm -rf "$d"
   [ "$fail" = 0 ] && echo "sitting-r0928 self-test: ok"
   return "$fail"
@@ -300,6 +462,7 @@ for j in "${JOBS[@]}"; do
     case $cmd in
       q6k_cmd) cmd="ncu-gpu.sh's generic form on generate_qwen3moe (the box command: --dry-run)" ;;
       engram_cmd) cmd="just probe-engram --check, then probe_engram twice read-only (--dry-run)" ;;
+      split_cmd) cmd="hotlist-split.py on the box, then just depth-gpu-ds41 $SPLIT_ARMS" ;;
     esac
     printf '%-9s %-24s %4s  %s%s\n' "$name" "$card" "$min" "${envs:+[$envs] }" "$cmd"
   fi
@@ -349,6 +512,10 @@ if [ "$MODE" = dry ]; then
     case $cmd in
       q6k_cmd) echo "[dry] command: ${menv:+$menv }./tools/box.sh '$Q6K_BOX'" ;;
       engram_cmd) echo "[dry] command: just probe-engram --check, then BLOOMERY_BOX_READONLY=1 ./tools/box.sh 'bash -s' with stdin: $ENGRAM_RUNS" ;;
+      split_cmd)
+        echo "[dry] command: ./tools/box.sh '$SPLIT_GEN'"
+        echo "[dry] command: ${menv:+$menv }just depth-gpu-ds41 $SPLIT_ARMS"
+        ;;
       *) echo "[dry] command: ${menv:+$menv }$cmd" ;;
     esac
   done
@@ -386,7 +553,7 @@ for j in "${JOBS[@]}"; do
     t0=$(date +%s)
     # shellcheck disable=SC2086 # the command and the Mac env are word lists
     case $cmd in
-      q6k_cmd | engram_cmd) (for kv in $menv; do export "${kv?}"; done; BLOOMERY_BOX_ENV=$benv "$cmd") > "$log" 2>&1 ;;
+      q6k_cmd | engram_cmd | split_cmd) (for kv in $menv; do export "${kv?}"; done; BLOOMERY_BOX_ENV=$benv "$cmd") > "$log" 2>&1 ;;
       *) env $menv BLOOMERY_BOX_ENV="$benv" $cmd > "$log" 2>&1 ;;
     esac
     rc=$?

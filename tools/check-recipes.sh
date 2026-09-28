@@ -204,6 +204,7 @@ selftests=(
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/draft-vocab.py --self-test"
   "tools/ref/gguf-ranges.py --self-test"
+  "tools/ref/hotlist-split.py --self-test"
   "tools/ref/ptx-canon.py --self-test"
   "tools/ref/ds41pp.py self-test"
   "tools/ref/router-coverage.py --self-test"

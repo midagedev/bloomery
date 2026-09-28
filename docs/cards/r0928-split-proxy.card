@@ -1,0 +1,47 @@
+# Sitting r0928, job `split` (tieropt-report.md §1-A, rank 1; scripts tierpp.py prose_split and split_band.py in the
+# tieropt scratch). In two-card (b'), the 3090's tier takes 23 of each layer's hot union (layers 2-39). twoeng gives it
+# the union's cold end, the ranks right after the A6000's n_l; every:2 gives it union positions 1, 3, ..., 45, so the
+# A6000 keeps positions 0, 2, ..., 44 and 46 .. n_l + 22. The flow model prices the A6000's shadow by column mass
+# (card_tile_us = kappa (84 tiles + 24 slots) + L2 spill, ds41_prefill.py:1055, cardtile-verified within -0.8 %):
+# every:2 takes more column mass off the A6000 than the cold end, so prose pp512 +8.7 % and pp4096 +8.3 % over the cold
+# split [derived]. The one term that needs the box is the shadow itself, and it can be read today on the A6000 alone:
+# the same generate_ds41 binary, the hot list replaced by its proxy (tools/ref/hotlist-split.py --pick every:2 --tier 23
+# --plan a), whose first n_l ids of every layer are exactly (b')'s every:2 A6000 set; the tier's experts fall to the
+# host. split_band.py's one-card proxy row: card_in x0.754 at P = 512 and x0.824 at P = 4096 of plan (a) [derived];
+# the proxy's pp 232 against 252 at P = 512 (the host grows) and 397 against 368 at P = 4096 [derived], printed, not
+# judged; its decode rows mean nothing (the hottest experts are on the host) and are not read.
+# Rounds: 2. With the ruler's default sd 0.6 % (a card_in scatter of its own has not been measured), card.py's h at
+# 2 rounds is 2.58 % (t 4.303, df 2) against a predicted effect of -17.6 % / -24.6 % and a 10-point gap between the two
+# decision edges; 1 round has no interval, 3 rounds (h 1.36 %) would add two V4.1 loads. Per-round ratios are printed.
+# Minutes: 8 [derived: two rounds of two loads (the hot and the split arms differ in their hot list, a load-time
+# lever), no warm-up; a V4.1 load 75-117 s and the two prompt arms about 20-30 s of each process; the proxy file is
+# written on the box in seconds before the lease; generate_ds41 is the one the enqueue job built].
+kind: profile
+question: does the A6000's shadow on the prose prompt shrink by the column mass the every:2 split moves to the 3090, as
+  tieropt §1-A derives, so that the split rule (cold | every:k | hot) goes into the plan?
+term: card_in_lb of stat prefill split (ms a layer-batch, the shadow's event pair), as the ratio split / hot of the two
+  arms at the same P — per round, then the mean of each arm's rounds; prose (corpus-prose.ids, first P ids), P = 512 and
+  4096, plan (a), CED on, G 2, r8 on, A6000; hot = hot list 384, split = its every:2 proxy with tier 23
+unit: ratio
+predict: 0.75..0.83
+condition: BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_HOT_LIST=<proxy> prose:4096
+  prose:4096@BLOOMERY_HOT_LIST=<proxy> with BLOOMERY_BOX_ENV='BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt
+  BLOOMERY_STEP_STATS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_LEASE_CARD=docs/cards/r0928-split-proxy.card', under the lease on
+  the A6000, one binary for both arms, the two loads rotated each round. The proxy is written on the box by
+  hotlist-split.py from the box's hot list before the lease; its summary line names the plan it was cut for
+  (card_experts, n_l min..max, n_l_layers). Every counted row's plan record must read those three values, place a and
+  the arm's own hot_list path, and its arm must print exactly one stat prefill split record with card_in_lb; a row that
+  does not, a FAIL row or an [other-busy] row is void, and a P with no valid round pair has no ratio. card_in is the
+  card's event time around the shadow's launches, card work only, so host paging and host CPU load do not enter it
+  [derived]: that is why there is no warm-up, and a [cold] or [cpu-busy] tag is printed beside its row's value but does
+  not void it. Verdict per P: at or below 0.85 go, at or above 0.95 stay, between hold; the job goes only when both P
+  go and stays only when both stay
+decide-in: both ratios at or below 0.85: the split rule goes ahead — R1 puts the pick (cold | every:k | hot) into the
+  plan as its parameter, every:2 the default for (b'), and R4's 3090 batch port takes the tile path (buckets, tiles,
+  gather, GT/DT) for the tier's 20-30 % of the card column mass
+decide-below: under 0.75 at a P: go as decide-in, and fit the measured shadow into tierpp.py's tile price before ranking
+  every:2 against the hot end (the column-mass price then under-reads what a tile costs the A6000)
+decide-above: above 0.83 at a P: at or below 0.85 at both P still go as decide-in; both at or above 0.95: the shadow
+  does not follow the column mass, the cold end stays and R4 ports the tier as twoeng designed; any other pair (one
+  between 0.85 and 0.95, or one on each side): hold — report both ratios and the per-round values to aa, the split
+  stays out of R1 until the term the flow model missed is named

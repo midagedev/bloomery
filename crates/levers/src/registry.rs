@@ -1422,6 +1422,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          refuses.",
     ),
     runner(
+        "BLOOMERY_SITTING_DIR",
+        Some("ref/sitting-r0928.sh"),
+        "`tools/ref/sitting-r0928.sh`: the directory its job logs, post-reads and \
+         `sitting.log` go to; unset, `target/sitting-r0928-<UTC stamp>` on the Mac.",
+    ),
+    runner(
         "BLOOMERY_SPLITK_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \
