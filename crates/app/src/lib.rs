@@ -29,6 +29,8 @@
 
 pub mod arch;
 
+use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::swap::ResetReport;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, StepMode};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
@@ -317,6 +319,7 @@ impl<B: Open> Loaded<B> {
             ctx,
             rows: None,
             logits: Vec::new(),
+            cleared: None,
         })
     }
 }
@@ -336,6 +339,8 @@ pub struct Session<B: ChainBody> {
     rows: Option<RowsInFlight>,
     /// The last logits row read back ([`Want::Logits`]).
     logits: Vec<f32>,
+    /// The residency reset the last clear made, until taken.
+    cleared: Option<ResetReport>,
 }
 
 impl<B: ChainBody> Session<B> {
@@ -348,6 +353,7 @@ impl<B: ChainBody> Session<B> {
             ctx,
             rows: None,
             logits: Vec::new(),
+            cleared: None,
         }
     }
 
@@ -355,7 +361,9 @@ impl<B: ChainBody> Session<B> {
     /// and its captures, so a prompt run after it gives the tokens, logits
     /// and counters that prompt gives in a fresh process ([`GpuModel::reset`]
     /// is the body's half, the verify in flight and the kept logits row the
-    /// session's). The weights, the captured chains and the prompt call's
+    /// session's, and a residency machine goes back to its seed,
+    /// [`Session::take_cleared`] holding the reset's report). The weights,
+    /// the captured chains and the prompt call's
     /// buffers stay: that is the load. Refused on a model a fault poisoned:
     /// a fault ends the load, it is not cleared into the next prompt.
     pub fn clear(&mut self) -> Result<(), SessionError> {
@@ -363,7 +371,24 @@ impl<B: ChainBody> Session<B> {
         self.model.reset()?;
         self.rows = None;
         self.logits.clear();
+        self.cleared = self.model.residency_reset()?;
         Ok(())
+    }
+
+    /// The residency back to its seed ([`GpuModel::residency_reset`]), the
+    /// sequence left where it stands: the explicit call a runner makes
+    /// before a timed request, which no other call makes
+    /// ([`Target::reset`] keeps the residency use has built). `None` on a
+    /// model with no residency machine.
+    pub fn residency_reset(&mut self) -> Result<Option<ResetReport>, SessionError> {
+        self.idle("residency reset")?;
+        Ok(self.model.residency_reset()?)
+    }
+
+    /// The report of the residency reset the last [`Session::clear`] made,
+    /// once: `None` when it made none (no machine) or it was taken.
+    pub fn take_cleared(&mut self) -> Option<ResetReport> {
+        self.cleared.take()
     }
 
     /// Several arms after one load: `run` of each of `arms` in order, the
@@ -496,6 +521,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
                 })?;
             self.model.rollback(back)?;
         }
+        self.model.keep_rows(accepted, PassKind::Pair);
         Ok(())
     }
 }

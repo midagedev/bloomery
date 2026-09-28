@@ -25,10 +25,11 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::engine::{
-    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, SavedState, StateError,
-    Tokenizer,
+    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, SavedState,
+    StateError, Tokenizer,
 };
 use crate::slotfile;
 
@@ -61,6 +62,9 @@ pub struct MockEngine {
     tok: Arc<MockTokenizer>,
     nexts: usize,
     fail_at: Option<usize>,
+    /// Counts [`Engine::residency_reset`] calls when the mock has a
+    /// residency ([`MockEngine::with_residency`]).
+    resets: Option<Arc<AtomicUsize>>,
 }
 
 impl MockEngine {
@@ -73,6 +77,17 @@ impl MockEngine {
             tok: Arc::new(MockTokenizer),
             nexts: 0,
             fail_at: None,
+            resets: None,
+        }
+    }
+
+    /// A mock with a residency: each [`Engine::residency_reset`] adds one to
+    /// `resets` and reports a reset that left nothing differing.
+    #[must_use]
+    pub fn with_residency(ctx_max: usize, resets: Arc<AtomicUsize>) -> Self {
+        MockEngine {
+            resets: Some(resets),
+            ..MockEngine::new(ctx_max)
         }
     }
 
@@ -235,6 +250,13 @@ impl Engine for MockEngine {
 
     fn ctx_max(&self) -> usize {
         self.ctx_max
+    }
+
+    fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
+        Ok(self.resets.as_ref().map(|r| {
+            r.fetch_add(1, Ordering::SeqCst);
+            ResidencyReset::default()
+        }))
     }
 
     fn describe(&self) -> String {
