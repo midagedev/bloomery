@@ -189,7 +189,7 @@ panic with the widths listed, b/c/d/e1/e2/e3/j finish, f warns
 shrink), the `unroll_smoke` control finishes. The `b-u32-counter` build was
 also run on the 3090: `PASSED: all 32 elements == 1`.
 
-The independent muse arm (`REPRO-arm-muse.md`, a 8-trip reproducer with an
+An independent second reproducer (8 trips, with an
 accumulator) reached the same frames (`const_fold.rs:200` via
 `unroll.rs:387` → sccp) and adds one row worth carrying into the issue: with
 the `usize` counter and `#[unroll]` held fixed, `i << 1u64` compiles and
