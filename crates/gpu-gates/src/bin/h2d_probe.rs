@@ -46,7 +46,7 @@
 //!   known complete; then one `h2d loop arm=<a> summary …` line.
 //!
 //! Every copy arm samples each of its cards'
-//! `current_link_speed`/`current_link_width` from sysfs every 20 ms while
+//! `current_link_speed`/`current_link_width` from sysfs every `SAMPLE_EVERY` while
 //! its copies are in flight (an idle link trains down) and prints `h2d link
 //! arm=<a> card= bdf= samples=<n> [<speed> x<width>: <count>, …]`.
 //!
