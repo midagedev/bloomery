@@ -67,8 +67,8 @@ const _: () = assert!(
 /// the vocabulary: V2-Lite's 102,400, V4.1's 129,280, Qwen3's 151,936
 /// logits) wait on one another, and more threads mean fewer loads each. The
 /// scan is strided by this width, the merge is a per-warp butterfly then a
-/// fixed ascending walk of the warp slots. `argmax_fault` and
-/// `argmax_rows_fault` declare the same width in their launch contracts.
+/// fixed ascending walk of the warp slots. Every argmax kernel here declares
+/// the same width in its launch contract.
 pub const ARGMAX_THREADS: usize = 1024;
 /// [`ARGMAX_THREADS`] as the `u32` block width a launch takes.
 const ARGMAX_THREADS_U32: u32 = ARGMAX_THREADS as u32;
@@ -928,6 +928,100 @@ mod elem_kernels {
         }
     }
 
+    /// [`argmax_rows_fault`] for a head whose logits no quantizer checked
+    /// ([`argmax_finite_fault`]'s case at `m` rows): block c first walks row
+    /// c for a value that is not finite and its thread 0 raises
+    /// [`FaultSite::Logit`], then the same walk, butterfly and tie rule write
+    /// the row's argmax to `out[c]`. Each block then draws one ticket from
+    /// `done[0]`; the block that draws the `m`-th copies the word and its
+    /// site mask to `out[m]` and `out[m + 1]` past every block's raise, and
+    /// puts the count back to zero for the next launch or graph replay.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(
+        domain = 1,
+        block = (1024, 1, 1),
+        requires = (x.len() >= n * m, out.len() >= m + 2, done.len() >= 1)
+    )]
+    pub fn argmax_rows_finite_fault(
+        x: &[f32],
+        n: u32,
+        m: u32,
+        fault: FaultSink,
+        mut out: DisjointSlice<u32>,
+        mut done: DisjointSlice<u32>,
+    ) {
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BAD: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        let c = thread::blockIdx_x();
+        if c >= m {
+            return;
+        }
+        let tid = thread::threadIdx_x();
+        let mut finite = true;
+        let mut i = tid;
+        while i < n {
+            // SAFETY: i < n and c < m, so i*m + c < n*m <= x.len() by the
+            // launch contract.
+            let v = unsafe { *x.get_unchecked((i * m + c) as usize) };
+            finite &= v.is_finite();
+            i += ARGMAX_THREADS as u32;
+        }
+        let bad = warp::ballot(!finite);
+        // SAFETY: all three arrays are this block's own shared allocations;
+        // the raw form is the only way to reach them without a reference to
+        // a `static mut`.
+        let (bv, bi, bw) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+                SharedArray::as_raw_mut_ptr(&raw mut BAD),
+            )
+        };
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < ARGMAX_WARPS; one lane per warp writes its
+            // own slot, which thread 0 reads past argmax_block's barrier.
+            unsafe { *bw.add(tid as usize / 32) = bad };
+        }
+        // SAFETY: bv and bi are this block's shared arrays, and element
+        // i*m + c of every i < n is below n*m <= x.len() because c < m.
+        let fi = unsafe { argmax_block(x, n, m, c, bv, bi) };
+        if tid != 0 {
+            return;
+        }
+        let mut any = 0u32;
+        let mut w = 0usize;
+        while w < ARGMAX_WARPS {
+            // SAFETY: w < ARGMAX_WARPS, written above, past the barrier.
+            any |= unsafe { *bw.add(w) };
+            w += 1;
+        }
+        if any != 0 {
+            fault.raise(FaultSite::Logit);
+        }
+        // SAFETY: c < m < out.len(); block c's thread 0 alone writes it.
+        unsafe { *out.get_unchecked_mut(c as usize) = fi };
+        // SAFETY: done.len() >= 1 by the launch contract; every access to
+        // done[0] on the card is atomic.
+        let count = unsafe { DeviceAtomicU32::from_ptr(done.as_mut_ptr()) };
+        // The ticket's release orders this block's raise before it; the last
+        // block's acquire sees every block's.
+        if count.fetch_add(1, AtomicOrdering::AcqRel) + 1 != m {
+            return;
+        }
+        count.store(0, AtomicOrdering::Relaxed);
+        let word = fault.read();
+        let sites = fault.read_sites(word);
+        // SAFETY: m + 1 < out.len() by the launch contract; the last block's
+        // thread 0 alone writes both.
+        unsafe {
+            *out.get_unchecked_mut(m as usize) = word;
+            *out.get_unchecked_mut(m as usize + 1) = sites;
+        }
+    }
+
     /// The argmax of `x[i·stride + col]` for `i < n`, as [`argmax_fault`]
     /// documents its walk, meaningful on thread 0 of the block; every thread of the
     /// block must call it (it holds a block barrier).
@@ -1572,6 +1666,46 @@ impl ElemKernels {
                 .prepare_argmax_rows_fault(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
         self.module
             .argmax_rows_fault(stream, &prep, x, n, m, fault, out)?;
+        Ok(())
+    }
+
+    /// [`Self::enqueue_argmax_rows_fault`] that also raises
+    /// [`FaultSite::Logit`] on `fault` when a value of any row is not finite,
+    /// its readback carrying every row's raise ([`argmax_rows_finite_fault`]):
+    /// the head of `m` rows of a projection no quantizer checks the input of.
+    /// `done` is the launch's ticket count, one u32 at zero before the launch
+    /// and back at zero after it; launches sharing it must be ordered on one
+    /// stream. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_argmax_rows_finite_fault(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        (n, m): (usize, usize),
+        fault: FaultSink,
+        out: &mut DeviceBuffer<u32>,
+        done: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_argmax_rows_finite_fault";
+        if n == 0 || m == 0 || x.len() < n * m || out.len() < m + 2 || done.is_empty() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "n={n} m={m}, x.len() {}, out.len() {} (need m+2), done.len() {} (need 1)",
+                    x.len(),
+                    out.len(),
+                    done.len()
+                ),
+            ));
+        }
+        // The walk indexes i*m + c in u32.
+        launch_u32(WHAT, "n*m", n * m)?;
+        let n = launch_u32(WHAT, "n", n)?;
+        let m = launch_u32(WHAT, "m", m)?;
+        let prep = self
+            .module
+            .prepare_argmax_rows_finite_fault(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
+        self.module
+            .argmax_rows_finite_fault(stream, &prep, x, n, m, fault, out, done)?;
         Ok(())
     }
 }
