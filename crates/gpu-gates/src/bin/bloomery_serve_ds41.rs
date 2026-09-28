@@ -1,6 +1,6 @@
 //! `bloomery-serve-ds41` — the llama-server-compatible HTTP API on the V4.1 engine.
 //!
-//!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place a|gate]
+//!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place a|gate|bp]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
@@ -13,9 +13,14 @@
 //! ids `generate_ds41 --tokens <the prompt's ids>` prints.
 //!
 //! `/props`' `engine` object carries the file's header facts and the printed
-//! plan's resident bytes per device and class, the card named by its
-//! nvidia-smi index; when that index cannot be found the placement is left
-//! out, with the reason on stderr.
+//! plan's resident bytes per device and class, each card named by its
+//! nvidia-smi index — under `--place bp` (plan (b′): plan (a) on the A6000,
+//! the 3090 an expert tier; see `generate_ds41`) the tier card's row too,
+//! with no `layers`; when an index cannot be found the placement is left
+//! out, with the reason on stderr. Under `bp` every prompt goes one decode
+//! step per id (the `call feed` record after the `load` line says why), and
+//! a lost tier card is an engine error like any other: the request's 500 and
+//! `/health`'s 503 carry its message, which names the card.
 //!
 //! The server serves the lesser of `--ctx` and the positions V4.1 is computed
 //! at (`Hparams::candidate_free_positions`): `/props`' `n_ctx` is that number,
@@ -47,7 +52,8 @@
 //! `Loaded::ready`), and `BLOOMERY_DRAFT=lookup|dspark` serves its draft the
 //! same way (`shared/ds41_draft.rs`): the DSpark draft's file is
 //! `$BLOOMERY_DSPARK_MODEL` and its card `BLOOMERY_DSPARK_CARD` (the 3090
-//! when unset), loaded once, its `load draft=dspark` line after the `load`
+//! when unset; under `bp` the tier card, whose plan reserves the draft's
+//! bytes, and the lever may name no other), loaded once, its `load draft=dspark` line after the `load`
 //! line, the pair pass captured after the step. Every greedy token after a
 //! request's first then comes out of a pass (`serve::Engine::advance`), and
 //! a request that needs the logits row — `temperature` above 0 (llama-server's
@@ -101,6 +107,10 @@ mod dspark;
 mod draft;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_place.rs"]
+mod place;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::any::Any;
     use std::path::{Path, PathBuf};
@@ -130,9 +140,9 @@ mod drive {
     use tokenizer::Tokenizer;
 
     use crate::draft::{Draft, open_dspark};
-    use crate::dspark;
+    use crate::{dspark, place};
 
-    const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] [--place a|gate] \
+    const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] [--place a|gate|bp] \
                          [--ctx C] [--alias NAME] [--cache-ram MIB]";
 
     /// The token V4.1's chat template opens every user and tool message with.
@@ -202,7 +212,8 @@ mod drive {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        let feed = place::feed_under(a.place, &mut cfg);
         let draft = Draft::from_levers(&levers)?;
         // The draft's file is read before the target's load, which takes a minute.
         let draft_file = match draft {
@@ -210,6 +221,10 @@ mod drive {
             Draft::Off | Draft::Lookup => None,
         };
         let path = ref_model_path()?;
+        let reserve = match &draft_file {
+            Some((d, _)) => dspark::draft_reserve(a.place, d, &path)?,
+            None => None,
+        };
         let vocab =
             Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
         let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -229,7 +244,7 @@ mod drive {
         let inputs = PlanInputs::read(&split)?;
         let model = model_props(&split, &inputs.model);
         drop(split);
-        let (card, placement, headroom) = print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
+        let (card, placement, headroom) = print_plan(&inputs, a.place, reserve, a.ctx, &cfg.place)?;
         let cache_ram = a.cache_ram.unwrap_or_else(|| {
             u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP))
         });
@@ -254,6 +269,8 @@ mod drive {
             path: path.clone(),
             draft,
             draft_file,
+            reserve,
+            feed,
         };
         let engine = Ds41Engine::spawn(
             move || V41::open(open),
@@ -281,23 +298,24 @@ mod drive {
         Ok(server.run())
     }
 
-    /// The plan the engine is about to load under the placement's `levers`,
-    /// on stderr; returns the card's name, the plan's placement for `/props`
-    /// (`None`, and a line saying why, when a card's nvidia-smi index cannot
-    /// be found) and the plan's host headroom in bytes.
+    /// The plan the engine is about to load under the placement's `levers`
+    /// (with `reserve`, the DSpark draft's, on its tier card), on stderr;
+    /// returns its cards' names, the plan's placement for `/props` (`None`,
+    /// and a line saying why, when a card's nvidia-smi index cannot be found)
+    /// and the plan's host headroom in bytes.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
+        reserve: Option<u64>,
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
-        let machine = place.machine()(inputs.model.layers);
+        let machine = place.machine(reserve)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         record::plan(place.name(), &machine, &plan, hot_list).eprint();
         let gpus: Result<Vec<String>, String> = machine
-            .cards
-            .iter()
+            .all_cards()
             .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
             .collect();
         let placement = gpus.and_then(|g| placement_props(&plan, &g));
@@ -310,7 +328,8 @@ mod drive {
                 plan.host.headroom_bytes
             )
         })?;
-        Ok((machine.cards[0].name.to_string(), placement.ok(), headroom))
+        let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
+        Ok((cards.join("+"), placement.ok(), headroom))
     }
 
     const WHAT: &str = "bloomery-serve-ds41";
@@ -327,6 +346,10 @@ mod drive {
         path: PathBuf,
         draft: Draft,
         draft_file: Option<(Split, DraftHparams)>,
+        /// The draft's reserve on the placement's tier card.
+        reserve: Option<u64>,
+        /// The placement's `call feed` record, printed after the `load`.
+        feed: Option<Record>,
     }
 
     /// The draft the seat serves, verified by the pair pass.
@@ -379,14 +402,15 @@ mod drive {
         /// lines), the draft `a.draft` names on it (its `load draft=dspark`
         /// line before the capture, the pair pass's capture after it), on
         /// the calling thread, pinned to the dispatcher's cpu slot when asked.
-        fn open(a: SeatArgs) -> Result<V41, GateError> {
+        fn open(mut a: SeatArgs) -> Result<V41, GateError> {
             let pinned = a.pin_main && threads::pool().pin_caller();
             let t = Instant::now();
             let file =
                 Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+            let feed = a.feed.take();
             let args = app::OpenArgs {
                 place: a.place.name(),
-                machine: a.place.machine(),
+                machine: a.place.machine(a.reserve)?,
                 ctx: a.ctx,
                 mode: StepMode::Graph,
                 cfg: Ds41Cfg {
@@ -395,12 +419,18 @@ mod drive {
                     card_timing: false,
                 },
             };
-            let mut log = Log { a: &a, pinned, t };
+            let mut log = Log {
+                a: &a,
+                pinned,
+                t,
+                feed,
+            };
             let mut loaded = Loaded::<Body>::open(file, args, &mut log)?
                 .ok_or("bloomery-serve-ds41: the open planned nothing")?;
             let spark = match &a.draft_file {
                 Some(file) => {
-                    let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT)?;
+                    let (d, load) =
+                        open_dspark(&mut loaded, file, &a.path, WHAT, a.place, a.reserve)?;
                     load.eprint();
                     Some(d)
                 }
@@ -735,6 +765,8 @@ mod drive {
         a: &'a SeatArgs,
         pinned: bool,
         t: Instant,
+        /// The placement's `call feed` record, printed after the `load`.
+        feed: Option<Record>,
     }
 
     impl OpenLog<Body> for Log<'_> {
@@ -761,14 +793,16 @@ mod drive {
                     a.want_top_k
                 )));
             }
-            Record::new(&record::LOAD_GENERATOR)
+            let load = Record::new(&record::LOAD_GENERATOR)
                 .u("resident_bytes", m.resident_bytes())
                 .u("ctx", a.ctx)
                 .u("layers", a.n_layer)
                 .u("top_k", top_k)
                 .w("shadow", "host")
                 .u("shadow_bytes", shadow.bytes)
-                .u("unified_addressing", shadow.unified_addressing)
+                .u("unified_addressing", shadow.unified_addressing);
+            place::with_cards(m, a.place, WHAT, load)
+                .map_err(|e| SessionError::Refused(e.to_string()))?
                 .w("prefill", b.prefill_mode().name())
                 .w("mode", mode_name(StepMode::Graph))
                 .w("place", a.place.name())
@@ -780,6 +814,9 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.eprint();
                 }
+            }
+            if let Some(r) = self.feed.take() {
+                r.eprint();
             }
             Ok(())
         }

@@ -274,18 +274,22 @@ pub fn model_props(split: &Split, model: &ModelTensors) -> ModelProps {
 }
 
 /// `/props`' `engine.placement` of `plan`, the plan the engine loads by: per
-/// card, named `gpus[c]` (`GPU<n>`, see [`nvidia_smi_index`]), the resident
-/// bytes of its segments by class and its stage's layers; then the host's
-/// (`CPU`) the same way; and the cards' KV bytes, cache and shadow. Only the
-/// plan's own rows are summed, so a card's classes add up to its
-/// `dense_bytes + expert_bytes` and the host's to its `expert_bytes +
-/// table_bytes`. The NVMe tier holds no resident bytes and is no device here.
+/// card of the machine — the stage cards, then the expert tier cards — named
+/// `gpus[c]` (`GPU<n>`, see [`nvidia_smi_index`]), the resident bytes of its
+/// segments by class and a stage card's layers (a tier card runs none, and
+/// its row has no `layers`); then the host's (`CPU`) the same way; and the
+/// cards' KV bytes, cache and shadow. Only the plan's own rows are summed, so
+/// a card's classes add up to its `dense_bytes + expert_bytes` and the host's
+/// to its `expert_bytes + table_bytes`. The NVMe tier holds no resident bytes
+/// and is no device here.
 pub fn placement_props(plan: &Plan<'_>, gpus: &[String]) -> Result<PlacementProps, String> {
-    if gpus.len() != plan.cards.len() {
+    let machine: Vec<_> = plan.machine.all_cards().collect();
+    if gpus.len() != plan.cards.len() || machine.len() != plan.cards.len() {
         return Err(format!(
-            "{} card names for a plan of {} cards",
+            "{} card names for a plan of {} cards on a machine of {}",
             gpus.len(),
-            plan.cards.len()
+            plan.cards.len(),
+            machine.len()
         ));
     }
     let mut cards = vec![BTreeMap::<String, u64>::new(); plan.cards.len()];
@@ -307,14 +311,16 @@ pub fn placement_props(plan: &Plan<'_>, gpus: &[String]) -> Result<PlacementProp
             }
         }
     }
+    let stages = plan.machine.cards.len();
     let mut devices: Vec<DeviceProps> = cards
         .into_iter()
         .zip(gpus)
-        .zip(&plan.machine.cards)
-        .map(|((class_bytes, gpu), card)| DeviceProps {
+        .zip(machine)
+        .enumerate()
+        .map(|(i, ((class_bytes, gpu), card))| DeviceProps {
             device: gpu.clone(),
             class_bytes,
-            layers: Some(layer_range(&card.layers)),
+            layers: (i < stages).then(|| layer_range(&card.layers)),
         })
         .collect();
     devices.push(DeviceProps {

@@ -614,7 +614,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("the 3090"),
         doc: "`generate_ds41` and `bloomery-serve-ds41` under `BLOOMERY_DRAFT=dspark`: the \
               placement card the DSpark draft loads on, by its name; it may be the target's \
-              own card. Any other name is refused by name.",
+              own card. Any other name is refused by name. Under `--place bp` the draft sits \
+              on the expert tier card (the 3090), whose plan reserves its bytes, and a name \
+              other than that card's is refused.",
         site: Site::Direct {
             at: &[InPlace {
                 file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",
@@ -1081,7 +1083,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_GEN_PLACE",
         Some("ref/depth-ds41.sh"),
         "The depth runners: our arms' `--place` — `a` (plan (a), the A6000; the \
-         default) or `gate` (the gate plan, the 3090); anything else is refused.",
+         default), `gate` (the gate plan, the 3090) or `bp` (plan (b′), both cards; only \
+         under `BLOOMERY_TIMING_CARDS=a6000+3090`, which refuses `a` and `gate`); anything \
+         else is refused.",
     ),
     runner(
         "BLOOMERY_PREHEAT",

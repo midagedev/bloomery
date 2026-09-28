@@ -31,24 +31,47 @@ pub enum Place {
     A,
     /// The step gate's plan (`workstation::plan_gate`), on the 3090.
     Gate,
+    /// Plan (b′) (`workstation::plan_bp`): plan (a) on the A6000, the 3090
+    /// an expert tier under the host tier, holding the DSpark draft's
+    /// reserve when a draft is served there.
+    Bp,
 }
 
 impl Place {
-    /// The flag value's placement: `a` or `gate`.
+    /// The flag value's placement: `a`, `gate` or `bp`.
     pub fn parse(v: &str) -> Result<Place, GateError> {
         match v {
             "a" => Ok(Place::A),
             "gate" => Ok(Place::Gate),
-            other => Err(format!("--place is a or gate, not {other}").into()),
+            "bp" => Ok(Place::Bp),
+            other => Err(format!(
+                "--place is a, gate or bp (plan (b′): the 3090 as the A6000's expert tier), not \
+                 {other}"
+            )
+            .into()),
         }
     }
 
-    /// The machine the placement plans over, by layer count.
-    pub fn machine(self) -> fn(usize) -> Machine {
-        match self {
-            Place::A => workstation::plan_a,
-            Place::Gate => workstation::plan_gate,
+    /// The machine the placement plans over, by layer count. `draft_bytes`
+    /// is the DSpark draft's resident bytes when the draft is served on the
+    /// placement's tier card ([`Place::draft_card`]); only `bp` has one, and
+    /// a figure handed to another placement is refused by name.
+    pub fn machine(
+        self,
+        draft_bytes: Option<u64>,
+    ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+        if draft_bytes.is_some() && self.draft_card().is_none() {
+            return Err(format!(
+                "--place {}: no tier card holds a draft reserve; the draft's card is outside the plan",
+                self.name()
+            )
+            .into());
         }
+        Ok(move |layers| match self {
+            Place::A => workstation::plan_a(layers),
+            Place::Gate => workstation::plan_gate(layers),
+            Place::Bp => workstation::plan_bp(layers, draft_bytes),
+        })
     }
 
     /// The flag value, as the `plan` and `load` lines print it.
@@ -56,6 +79,50 @@ impl Place {
         match self {
             Place::A => "a",
             Place::Gate => "gate",
+            Place::Bp => "bp",
+        }
+    }
+
+    /// The cards the placement loads, stage cards then the tier, by the
+    /// names the engine finds them by: the `load` record's `cards`.
+    pub fn cards(self) -> &'static [&'static str] {
+        const A: &[&str] = &[workstation::A6000.name];
+        const GATE: &[&str] = &[workstation::RTX_3090.name];
+        const BP: &[&str] = &[workstation::A6000.name, workstation::RTX_3090.name];
+        match self {
+            Place::A => A,
+            Place::Gate => GATE,
+            Place::Bp => BP,
+        }
+    }
+
+    /// The placement's expert tier card, by the name the engine finds it
+    /// by: the 3090 under `bp`, none under `a` and `gate`.
+    pub fn tier_card(self) -> Option<&'static str> {
+        match self {
+            Place::A | Place::Gate => None,
+            Place::Bp => Some(workstation::RTX_3090.name),
+        }
+    }
+
+    /// The card a DSpark draft must sit on under this placement: the tier
+    /// card, whose plan reserves the draft's bytes; `None` where the plan
+    /// reserves nothing and the draft's card is the caller's choice.
+    pub fn draft_card(self) -> Option<&'static str> {
+        self.tier_card()
+    }
+
+    /// Why a prompt under this placement is fed one decode step per id
+    /// whatever `BLOOMERY_PREFILL` says, or `None` where the lever decides:
+    /// the tier card has no batch port, and a prompt batch on a model with a
+    /// tier is refused by the host tier.
+    pub fn steps_only(self) -> Option<&'static str> {
+        match self {
+            Place::A | Place::Gate => None,
+            Place::Bp => Some(
+                "the expert tier card has no batch port (tierbatch): a prompt batch on a model \
+                 with a tier is refused, so the prompt goes one decode step per id",
+            ),
         }
     }
 }
@@ -92,14 +159,15 @@ impl<B: ChainBody> Generator<B> {
         log: &mut dyn Write,
     ) -> Result<Generator<B>, GateError>
     where
-        O: FnOnce(Split, fn(usize) -> Machine, usize) -> Result<GpuModel<B>, GpuError>,
+        O: FnOnce(Split, &dyn Fn(usize) -> Machine, usize) -> Result<GpuModel<B>, GpuError>,
         C: FnOnce(&GpuModel<B>, Record) -> Result<Record, GateError>,
     {
         let pinned = args.pin_main && threads::pool().pin_caller();
         let path = ref_model_path()?;
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut model = open(file, args.place.machine(), args.ctx)?;
+        let machine = args.place.machine(None)?;
+        let mut model = open(file, &machine, args.ctx)?;
         model.set_mode(args.mode);
         let load = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", model.resident_bytes())

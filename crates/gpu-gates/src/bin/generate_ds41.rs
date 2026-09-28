@@ -2,10 +2,10 @@
 //! its timing ruler: `generate`'s shape over `bloomery_gpu_deepseek41::body`.
 //!
 //!     generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N]
-//!                   [--ctx C] [--place a|gate] [--mode eager|graph]
+//!                   [--ctx C] [--place a|gate|bp] [--mode eager|graph]
 //!                   [--time [--warm W]] [--plan] [--logits]
 //!     generate_ds41 --arm SPEC [--arm SPEC ...] [--arm-sync] [-n N] [--ctx C]
-//!                   [--place a|gate] [--mode eager|graph] [--time [--warm W]]
+//!                   [--place a|gate|bp] [--mode eager|graph] [--time [--warm W]]
 //!                   [--logits]
 //!     generate_ds41 --records-schema
 //!
@@ -34,7 +34,19 @@
 //! (`workstation::plan_a`, every layer and the head on the A6000, each routed
 //! layer's expert prefix the budget allows on the card, the rest on the host
 //! tier) and the one the timing runners use; `gate` is the step gate's
-//! (`workstation::plan_gate`, the same on the 3090). The card is found by
+//! (`workstation::plan_gate`, the same on the 3090); `bp` is plan (b′)
+//! (`workstation::plan_bp`): plan (a) on the A6000 byte for byte, and the
+//! 3090 an expert tier under the host tier holding each layer's next hot
+//! ranks (`app::arch::deepseek41::tier_of`), with the DSpark draft's reserve
+//! when the draft runs (its header's bytes, read before the load; the draft
+//! then sits on the 3090, and a `BLOOMERY_DSPARK_CARD` naming another card is
+//! refused). Under `bp` every prompt goes one decode step per id — the tier
+//! has no batch port — and a `call feed` record after the `load` line says
+//! so; the `load` line's `cards=` names every card the placement loaded and,
+//! under `bp`, the tier's experts and resident bytes (`tier_experts=`,
+//! `tier_bytes=`). A lost tier card (it stops signalling within the go
+//! deadline) is the step's named error and ends the run with a nonzero
+//! exit. The card is found by
 //! name, so the box's card pin decides which placements can load. The ring
 //! shadows are page-locked host memory: the `plan` line prints the plan's
 //! figure (`host_shadow=`), the `load` line the allocation
@@ -235,6 +247,10 @@ mod draft;
 mod split;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_place.rs"]
+mod place;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::ops::Range;
     use std::time::{Duration, Instant};
@@ -263,10 +279,10 @@ mod drive {
     };
 
     use crate::draft::{Draft, open_dspark};
-    use crate::{dspark, finite, split};
+    use crate::{dspark, finite, place, split};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
-                         [-n N] [--ctx C] [--place a|gate] [--mode eager|graph] \
+                         [-n N] [--ctx C] [--place a|gate|bp] [--mode eager|graph] \
                          [--time [--warm W]] [--plan] [--logits], or --arm SPEC [--arm SPEC ...] \
                          [--arm-sync] in place of the prompt flags";
 
@@ -604,7 +620,8 @@ mod drive {
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;
         let check_finite = finite_lever(&a, draft, &levers)?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        let feed = place::feed_under(a.place, &mut cfg);
         let batched = !check_finite && cfg.body.prefill == body::PrefillMode::Batch;
         if a.plan {
             refuse_plan(&a, draft, batched)?;
@@ -645,8 +662,12 @@ mod drive {
             Draft::Dspark => Some(dspark::draft_hparams()?),
             _ => None,
         };
-
         let path = ref_model_path()?;
+        let reserve = match &draft_file {
+            Some((d, _)) => dspark::draft_reserve(a.place, d, &path)?,
+            None => None,
+        };
+
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         // The finite probe feeds step by step, outside the prompt call.
@@ -657,7 +678,7 @@ mod drive {
         };
         let args = OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(),
+            machine: a.place.machine(reserve)?,
             ctx: a.ctx,
             mode: a.mode,
             cfg: Ds41Cfg {
@@ -681,6 +702,7 @@ mod drive {
             hp: None,
             ctx_max: 0,
             call: None,
+            feed,
         };
         let Some(mut loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
             return Ok(());
@@ -693,7 +715,8 @@ mod drive {
         // capture: the captured step then carries the tap.
         let spark = match &draft_file {
             Some(file) => {
-                let (d, load) = open_dspark(&mut loaded, file, &path, "generate_ds41")?;
+                let (d, load) =
+                    open_dspark(&mut loaded, file, &path, "generate_ds41", a.place, reserve)?;
                 load.print();
                 Some(d)
             }
@@ -896,8 +919,8 @@ mod drive {
             ),
             (
                 !batched,
-                "a feed of one step per id (BLOOMERY_PREFILL=steps or BLOOMERY_CHECK_FINITE=1): \
-                 it runs no batch",
+                "a feed of one step per id (BLOOMERY_PREFILL=steps, BLOOMERY_CHECK_FINITE=1 or \
+                 --place bp): it runs no batch",
             ),
         ];
         match beside.iter().find(|(set, _)| *set) {
@@ -1247,6 +1270,8 @@ mod drive {
         /// The plan's `ctx_max`, once planned.
         ctx_max: usize,
         call: Option<CallView>,
+        /// The placement's `call feed` record, printed after the `load`.
+        feed: Option<Record>,
     }
 
     impl OpenLog<Body> for Log<'_> {
@@ -1317,11 +1342,13 @@ mod drive {
                     hp.indexer.top_k
                 )));
             }
-            Record::new(&record::LOAD)
+            let load = Record::new(&record::LOAD)
                 .u("resident_bytes", m.resident_bytes())
                 .w("shadow", "host")
                 .u("shadow_bytes", shadow.bytes)
-                .u("unified_addressing", shadow.unified_addressing)
+                .u("unified_addressing", shadow.unified_addressing);
+            place::with_cards(m, a.place, "generate_ds41", load)
+                .map_err(|e| SessionError::Refused(e.to_string()))?
                 .u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)
@@ -1345,6 +1372,9 @@ mod drive {
                 for r in record::host_residency(h) {
                     r.print();
                 }
+            }
+            if let Some(r) = self.feed.take() {
+                r.print();
             }
             Ok(())
         }

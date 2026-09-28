@@ -471,13 +471,16 @@ pub static PLAN: Kind = Kind {
 pub static LOAD: Kind = Kind {
     name: "load",
     head: "load",
-    doc: "The load: device bytes, the ring shadows' host bytes, the context, and the modes and levers the body holds.",
+    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("shadow", Word, ""),
         lit(" "),
         pos("shadow_bytes", U64, "B"),
         key("unified_addressing", I64, ""),
+        key("cards", Csv, ""),
+        opt("tier_experts", U64, "experts"),
+        opt("tier_bytes", U64, "B"),
         key("ctx", U64, "positions"),
         key("layers", U64, ""),
         key("top_k", U64, ""),
@@ -498,7 +501,7 @@ pub static LOAD: Kind = Kind {
 pub static LOAD_GENERATOR: Kind = Kind {
     name: "load_generator",
     head: "load",
-    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the step mode and the pin.",
+    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 binary's; an expert tier card's experts and resident bytes), the step mode and the pin.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("ctx", U64, "positions"),
@@ -508,6 +511,9 @@ pub static LOAD_GENERATOR: Kind = Kind {
         lit(" "),
         pos("shadow_bytes", U64, "B"),
         key("unified_addressing", I64, ""),
+        opt("cards", Csv, ""),
+        opt("tier_experts", U64, "experts"),
+        opt("tier_bytes", U64, "B"),
         opt("prefill", Word, ""),
         key("mode", Word, ""),
         key("place", Word, ""),
@@ -557,13 +563,15 @@ pub static HOST_LOCK: Kind = Kind {
 pub static LOAD_DRAFT: Kind = Kind {
     name: "load_draft",
     head: "load",
-    doc: "The DSpark draft's load: its card, width, the target's tapped layers and the draft card's free bytes.",
+    doc: "The DSpark draft's load: its card, width, the target's tapped layers, the device bytes it took, the reserve the placement made for it on a tier card, and the draft card's free bytes.",
     parts: &[
         key("draft", Word, ""),
         key("card", Word, ""),
         key("width", U64, "positions"),
         key("target_layers", List, ""),
         key("feature_width", U64, ""),
+        key("resident", U64, "B"),
+        opt("reserve", U64, "B"),
         key("draft_card_free", U64, "B"),
         lit(" of "),
         pos("draft_card_total", U64, "B"),
@@ -571,6 +579,14 @@ pub static LOAD_DRAFT: Kind = Kind {
         pos("load_s", F64(1), "s"),
         lit(" s (runtime value)"),
     ],
+};
+
+/// A placement's prompt feed, when the placement decides it.
+pub static CALL_FEED: Kind = Kind {
+    name: "call_feed",
+    head: "call feed",
+    doc: "The prompt feed the placement holds every prompt call to, whatever BLOOMERY_PREFILL says, and why.",
+    parts: &[key("feed", Word, ""), key("why", Text, "")],
 };
 
 /// The step's capture.
@@ -1200,6 +1216,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &CALL_FEED,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,
@@ -1237,6 +1254,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
     &CAPTURE,
+    &CALL_FEED,
     &IDS,
     &TEXT_CONSISTENT,
     &CHAT,
@@ -1250,6 +1268,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
+    &CALL_FEED,
     &LOAD_DRAFT,
     &CAPTURE,
     &CAPTURE_PAIR,

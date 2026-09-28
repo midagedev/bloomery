@@ -1,7 +1,7 @@
 //! `bloomery-chat` — text in, text out, on the V4.1 engine.
 //!
 //!     bloomery-chat (--prompt <text> | --prompt-file <path> | --prompt-stdin)
-//!                   [-n N] [--place a|gate] [--ctx C] [--no-special]
+//!                   [-n N] [--place a|gate|bp] [--ctx C] [--no-special]
 //!                   [--greedy | [--temp T] [--top-k K] [--top-p P] [--min-p M]
 //!                    [--repeat-penalty R] [--repeat-last-n L] [--seed S]]
 //!
@@ -19,6 +19,12 @@
 //! engine's own argmax of the same step: the generated ids are then the ones
 //! `generate_ds41 --tokens <the prompt's ids>` prints on its `tokens` line.
 //! It refuses the sampling flags beside it.
+//!
+//! `--place` is `generate_ds41`'s: `bp` loads plan (a) on the A6000 with the
+//! 3090 as its expert tier (the `load` line's `cards=` names both, with the
+//! tier's experts and bytes, and a `call feed` line after the `capture` says
+//! the prompt goes one step per id, as it always does here). A lost tier
+//! card is the step's named error and ends the run with a nonzero exit.
 //!
 //! Everything but the text goes to stderr: the `prompt_ids` line, the plan,
 //! `load` and `capture` lines, then after the run the `ids` line (every
@@ -48,11 +54,17 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_place.rs"]
+mod place;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::io::{Read, Write};
 
+    use app::Open;
+    use app::arch::deepseek41::Ds41Cfg;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model};
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -65,8 +77,10 @@ mod drive {
     use sampler::{Sampler, SamplerParams};
     use tokenizer::{Decoder, Tokenizer};
 
+    use crate::place;
+
     const USAGE: &str = "usage: bloomery-chat (--prompt <text> | --prompt-file <path> | \
-                         --prompt-stdin) [-n N] [--place a|gate] [--ctx C] [--no-special] \
+                         --prompt-stdin) [-n N] [--place a|gate|bp] [--ctx C] [--no-special] \
                          [--greedy | [--temp T] [--top-k K] [--top-p P] [--min-p M] \
                          [--repeat-penalty R] [--repeat-last-n L] [--seed S]]";
 
@@ -232,7 +246,13 @@ mod drive {
         ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        let feed = place::feed_under(a.place, &mut cfg);
+        let ds41 = Ds41Cfg {
+            feed: cfg.body.prefill,
+            open: cfg,
+            card_timing: false,
+        };
         let mut sampler = Sampler::new(a.sampling)?;
         let path = ref_model_path()?;
         let tok = Tokenizer::from_gguf(&path)?;
@@ -245,7 +265,7 @@ mod drive {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         drop(split);
-        print_plan(&inputs, a.place, a.ctx, &cfg.place)?;
+        print_plan(&inputs, a.place, a.ctx, &ds41.open.place)?;
         let want_top_k = inputs.hp.indexer.top_k;
         let open = OpenArgs {
             place: a.place,
@@ -255,7 +275,12 @@ mod drive {
         };
         let mut g = Generator::open(
             open,
-            |file, machine, ctx| body::open(file, machine, ctx, &cfg),
+            |file, machine, ctx| {
+                let inputs = Body::inputs(&file)?;
+                let machine = machine(Body::layer_count(&inputs));
+                let plan = Body::plan(&inputs, &machine, ctx, &ds41)?;
+                Body::open(file, &inputs, &plan, &ds41)
+            },
             |m: &Deepseek41Model, load: Record| {
                 let body = m.body("bloomery-chat")?;
                 let top_k = body.indexer_top_k();
@@ -267,15 +292,19 @@ mod drive {
                     )
                     .into());
                 }
-                Ok(load
+                let load = load
                     .u("layers", inputs.hp.n_layer)
                     .u("top_k", top_k)
                     .w("shadow", "host")
                     .u("shadow_bytes", shadow.bytes)
-                    .u("unified_addressing", shadow.unified_addressing))
+                    .u("unified_addressing", shadow.unified_addressing);
+                place::with_cards(m, a.place, "bloomery-chat", load)
             },
             &mut std::io::stderr(),
         )?;
+        if let Some(r) = feed {
+            r.eprint();
+        }
         chat(&mut g, &a, &tok, &mut sampler, &ids)
     }
 
@@ -287,7 +316,7 @@ mod drive {
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<(), GateError> {
-        let machine = place.machine()(inputs.model.layers);
+        let machine = place.machine(None)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
         record::plan(place.name(), &machine, &plan, hot_list).eprint();

@@ -60,6 +60,13 @@
 //! sidecar's header, every other from its shard's — exactly. Lock wall time
 //! per file and in total is printed, never asserted.
 //!
+//! `--plan bp --draft <file>` is plan (b′) (`workstation::plan_bp`) with the
+//! DSpark draft's reserve on its tier card — the draft file's bytes from its
+//! header (`model::arch::dspark::card_bytes`); `--plan bp` without `--draft`
+//! is refused by name: the A6000 loads plan (a)'s segments and the 3090 the
+//! tier's, each checked as a stage card is; check 2's floor on the tier also
+//! holds the draft's reserve, which this gate does not load.
+//!
 //! `--plan a|b` picks design §5's plan, b by default: plan (b) splits the
 //! layers over both cards (`workstation::plan_b`), and this gate is the tree's
 //! one run of that two-card staging, the exercise ahead of the two-card tier
@@ -95,6 +102,7 @@ mod gate {
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
+    use model::arch::dspark;
     use model::placement::host_lock::{HostFile, HostSet, PageDrop, page_bytes};
     use model::placement::{
         Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
@@ -102,11 +110,12 @@ mod gate {
     };
     use model::r8file::{HostR8, R8Source};
 
-    /// Design §5's two plans.
+    /// Design §5's two plans, and plan (b′).
     #[derive(Clone, Copy)]
     enum PlanId {
         A,
         B,
+        Bp,
     }
 
     impl fmt::Display for PlanId {
@@ -114,6 +123,7 @@ mod gate {
             f.write_str(match self {
                 PlanId::A => "a",
                 PlanId::B => "b",
+                PlanId::Bp => "bp",
             })
         }
     }
@@ -141,13 +151,17 @@ mod gate {
     struct Args {
         plan: PlanId,
         lock: Option<Lock>,
+        /// The DSpark draft file whose reserve plan (b′) makes.
+        draft: Option<String>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_load_v41 [--plan a|b] [--lock | --lock-layers L0..L1]";
+        const USAGE: &str = "usage: gate_load_v41 [--plan a|b|bp [--draft <DSpark file>]] \
+                             [--lock | --lock-layers L0..L1]";
         let mut args = Args {
             plan: PlanId::B,
             lock: None,
+            draft: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -156,10 +170,17 @@ mod gate {
                     args.plan = match it.next().as_deref() {
                         Some("a") => PlanId::A,
                         Some("b") => PlanId::B,
+                        Some("bp") => PlanId::Bp,
                         other => return Err(format!("--plan {other:?}: {USAGE}").into()),
                     }
                 }
                 "--lock" => args.lock = Some(Lock::All),
+                "--draft" => {
+                    args.draft = Some(
+                        it.next()
+                            .ok_or_else(|| format!("--draft needs a file: {USAGE}"))?,
+                    );
+                }
                 "--lock-layers" => {
                     let v = it.next().unwrap_or_default();
                     let range = v
@@ -209,6 +230,10 @@ mod gate {
         let machine = match args.plan {
             PlanId::A => workstation::plan_a(inputs.model.layers),
             PlanId::B => workstation::plan_b(inputs.model.layers),
+            PlanId::Bp => workstation::plan_bp(
+                inputs.model.layers,
+                Some(draft_reserve(args.draft.as_deref(), &split)?),
+            ),
         };
         let plan = inputs
             .plan(&machine, workstation::CTX_MAX, &place)
@@ -217,9 +242,9 @@ mod gate {
             "plan ({}) of {path}: {} layers, ctx_max {}",
             args.plan, plan.model.layers, plan.ctx_max
         );
-        for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
+        for (card, t) in plan.machine.all_cards().zip(&plan.cards) {
             println!(
-                "  {} layers {:?}{}: dense {} experts {} ({}) rounding {} KV {} scratch {} context {} headroom {}",
+                "  {} layers {:?}{}: dense {} experts {} ({}) rounding {} KV {} scratch {} context {} reserves {} headroom {}",
                 card.name,
                 card.layers,
                 if card.head { " +head" } else { "" },
@@ -230,6 +255,7 @@ mod gate {
                 t.kv_bytes,
                 t.scratch_bytes,
                 t.context_bytes,
+                t.reserve_bytes,
                 t.headroom_bytes
             );
         }
@@ -282,6 +308,24 @@ mod gate {
         Ok(())
     }
 
+    /// The DSpark draft's reserve on plan (b′)'s tier card: the draft file
+    /// `path`'s resident bytes from its header and `target`'s; refused by
+    /// name without a file.
+    fn draft_reserve(path: Option<&str>, target: &Split) -> Result<u64, GateError> {
+        let path = path.filter(|p| !p.is_empty()).ok_or(
+            "--plan bp reserves the DSpark draft's bytes on the 3090: name the draft file with \
+             --draft (the V4.1 profile's DSPARK_MODEL, as the recipe passes it)",
+        )?;
+        let draft = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let bytes = dspark::card_bytes(&draft, target, workstation::GRANULE)
+            .map_err(|e| format!("the DSpark draft's card bytes: {e}"))?;
+        println!(
+            "DSpark draft {path}: {} B reserved on the tier card",
+            bytes.total()
+        );
+        Ok(bytes.total())
+    }
+
     /// A plan card's device, and its memory once its context exists.
     struct OnCard {
         gpu: Gpu,
@@ -292,9 +336,9 @@ mod gate {
     /// Every plan card's device, found by name, each with the bytes the plan
     /// puts on it besides the context free — or the refusal, before any upload.
     fn open_cards(plan: &Plan<'_>) -> Result<Vec<OnCard>, GateError> {
-        let mut out = Vec::with_capacity(plan.machine.cards.len());
+        let mut out = Vec::with_capacity(plan.cards.len());
         let mut short = Vec::new();
-        for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
+        for (card, t) in plan.machine.all_cards().zip(&plan.cards) {
             let gpu = Gpu::for_card(&card.name).map_err(|e| {
                 format!(
                     "refusing before any upload: plan card {} is not here: {e}",
@@ -338,7 +382,7 @@ mod gate {
         on: &OnCard,
         card_dontneed: bool,
     ) -> Result<bool, GateError> {
-        let card = &plan.machine.cards[c];
+        let card = plan.machine.card(c).ok_or("a plan card past the machine")?;
         let start = Instant::now();
         let w = Weights::load_placed(on.gpu.stream(), split, plan, c, card_dontneed)?;
         let wall = start.elapsed();
@@ -366,7 +410,7 @@ mod gate {
     /// nothing else is resident, and the total is the card's dense + expert
     /// bytes.
     fn check_resident(plan: &Plan<'_>, c: usize, w: &Weights) -> bool {
-        let name = &plan.machine.cards[c].name;
+        let name = plan.machine.card(c).map_or("?", |k| k.name.as_str());
         let (mut segments, mut bad) = (0usize, Vec::new());
         for row in &plan.rows {
             let t = &plan.model.tensors[row.tensor];
@@ -421,10 +465,13 @@ mod gate {
     /// plan's usable bytes are the card's free bytes with no process on it, so
     /// the context took usable − free after it.
     fn check_memory(card: &Card, t: &CardTotals, m: &Memory, w: &Weights) -> bool {
-        let floor = t.headroom_bytes + i128::from(t.kv_bytes) + i128::from(t.scratch_bytes);
+        let floor = t.headroom_bytes
+            + i128::from(t.kv_bytes)
+            + i128::from(t.scratch_bytes)
+            + i128::from(t.reserve_bytes);
         let pass = i128::from(m.free_load) >= floor;
         println!(
-            "check 2 {}: {} B free after the load, the plan's headroom + KV + scratch {floor} B: {}",
+            "check 2 {}: {} B free after the load, the plan's headroom + KV + scratch + reserves {floor} B: {}",
             card.name,
             m.free_load,
             verdict(pass)
@@ -625,7 +672,7 @@ mod gate {
         gpu: &Gpu,
         w: &Weights,
     ) -> Result<bool, GateError> {
-        let name = &plan.machine.cards[c].name;
+        let name = plan.machine.card(c).map_or("?", |k| k.name.as_str());
         gpu.context().bind_to_thread()?;
         let mut pass = true;
         for s in samples(plan, c) {
