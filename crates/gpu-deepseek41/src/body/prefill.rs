@@ -155,7 +155,11 @@ impl PrefillMode {
 /// Make the batch's buffers: the one maker, a load-time call — a prompt
 /// call ([`prefill`]) on a body without them is refused by name, so no call
 /// loads a module or allocates. A load with an expert tier and the batch feed
-/// makes them itself ([`super::Body::open_placed_tiered`]). Idempotent.
+/// makes them itself ([`super::Body::open_placed_tiered`]), before a draft
+/// can attach its feature tap ([`attach_features`]); a call after the attach
+/// gives the held buffers the tap's rows, which a call that hands features
+/// over needs (refused by name without them). Once the buffers hold what the
+/// body's tap needs, a call does nothing.
 pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
     body.make_batch_once(gpu)
@@ -649,6 +653,16 @@ struct BatchSet {
 }
 
 impl BatchSet {
+    /// A batch's feature rows for a tap of `width` values a row: [`T_MAX`]
+    /// rows; none without a tap (`width` 0). Batch sets made before the tap
+    /// get theirs from [`Body::complete_batch_taps`].
+    fn tap_rows(stream: &CudaStream, width: usize) -> Result<Option<DeviceBuffer<f32>>, GpuError> {
+        (width > 0)
+            .then(|| DeviceBuffer::<f32>::zeroed(stream, T_MAX * width))
+            .transpose()
+            .map_err(GpuError::from)
+    }
+
     fn device_bytes(&self) -> usize {
         self.hc.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
             + self
@@ -811,6 +825,21 @@ impl PrefillStats {
 }
 
 impl Batch {
+    /// Refused by name ([`no_tap_rows`]) unless every batch set holds the
+    /// feature rows of a tap of `width`: checked before a call that hands
+    /// features over enqueues anything.
+    fn check_taps(&self, width: usize, tiered: bool) -> Result<(), GpuError> {
+        let sets = self.sets.len();
+        match self
+            .sets
+            .iter()
+            .position(|s| s.taps.as_ref().map(DeviceBuffer::len) != Some(T_MAX * width))
+        {
+            Some(k) => Err(no_tap_rows(k, sets, width, tiered)),
+            None => Ok(()),
+        }
+    }
+
     pub(super) fn set_top_k(&mut self, gpu: &Gpu, top_k: usize) -> Result<(), GpuError> {
         self.attn.set_top_k(gpu, top_k)
     }
@@ -1083,7 +1112,9 @@ impl Body {
     /// batch's streams, folds, lists and images for a group of the most
     /// batches `BLOOMERY_PREFILL_GROUP` gives, the staging, the host tier's
     /// batch sets for as many tokens as the MoE scratch takes, the host
-    /// union's scratch. Load-time only ([`prepare_prefill`]).
+    /// union's scratch. Held buffers made before the feature tap get its
+    /// rows ([`Body::complete_batch_taps`]). Load-time only
+    /// ([`prepare_prefill`]).
     fn make_batch_once(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         if self.batch.is_none() {
             let b = self.make_batch(gpu)?;
@@ -1091,6 +1122,49 @@ impl Body {
             self.hybrid.host_mut().prepare_union()?;
             self.batch = Some(Box::new(b));
         }
+        self.complete_batch_taps(gpu)
+    }
+
+    /// Give every batch set of the held buffers that has no feature rows the
+    /// tap's ([`BatchSet::tap_rows`]), and the host rows their width: a
+    /// tiered load makes the buffers before a draft can attach its tap
+    /// ([`super::Body::open_placed_tiered`], then [`attach_features`]). A set
+    /// whose rows are of another width is refused by name; nothing to do
+    /// without a tap or without buffers.
+    fn complete_batch_taps(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        let width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        let Some(batch) = self.batch.as_deref_mut() else {
+            return Ok(());
+        };
+        if width == 0 {
+            return Ok(());
+        }
+        let (group, sets) = (batch.group, batch.sets.len());
+        for (k, set) in batch.sets.iter_mut().enumerate() {
+            match set.taps.as_ref().map(DeviceBuffer::len) {
+                Some(len) if len == T_MAX * width => {}
+                Some(len) => {
+                    return Err(GpuError::Shape {
+                        what: WHAT,
+                        detail: format!(
+                            "batch {k} of a group of {sets} holds {len} feature values, the tap's \
+                             {T_MAX} rows of {width}"
+                        ),
+                    });
+                }
+                None => {
+                    set.taps =
+                        BatchSet::tap_rows(gpu.stream(), width).map_err(|e| GpuError::Shape {
+                            what: WHAT,
+                            detail: format!(
+                                "the feature rows of batch {k} of a group of {sets} \
+                                 (BLOOMERY_PREFILL_GROUP={group}) do not fit on the card: {e}"
+                            ),
+                        })?;
+                }
+            }
+        }
+        batch.taps_host.resize(T_MAX * width, 0.0);
         Ok(())
     }
 
@@ -1135,7 +1209,7 @@ impl Body {
                                 .collect::<Result<Vec<_>, _>>()
                         })
                         .collect::<Result<Vec<_>, _>>()?,
-                    taps: (tap_width > 0).then(|| z(T_MAX * tap_width)).transpose()?,
+                    taps: BatchSet::tap_rows(stream, tap_width)?,
                 })
             };
             made().map_err(|e| GpuError::Shape {
@@ -1282,7 +1356,12 @@ impl Body {
                     missing: "a feature tap (attach_features)",
                 });
             }
-            (Some(_), Some(tap)) => Some(tap.after.iter().map(Option::is_some).collect()),
+            (Some(_), Some(tap)) => {
+                if let Some(b) = self.batch.as_deref() {
+                    b.check_taps(tap.width(), self.tier.is_some())?;
+                }
+                Some(tap.after.iter().map(Option::is_some).collect())
+            }
         };
         let taps = after.as_deref().zip(window);
         self.need = Some(self.ced.need(first, end, starts, taps));
@@ -1310,18 +1389,17 @@ impl Body {
             .as_ref()
             .map_or(run.end, |n| n.features)
             .max(run.start);
+        let tiered = self.tier.is_some();
         let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "a batch that ran",
         })?;
+        let sets = batch.sets.len();
         let dev = batch
             .sets
             .get(set)
             .and_then(|s| s.taps.as_ref())
-            .ok_or(GpuError::State {
-                what: WHAT,
-                missing: "a feature tap (attach_features) on the group's batch",
-            })?;
+            .ok_or_else(|| no_tap_rows(set, sets, width, tiered))?;
         if run.is_empty() || run.len() > T_MAX {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -2073,6 +2151,7 @@ impl<'a> GroupCx<'a> {
         let n_tier = self.on_tier(i)?;
         let tiered = n_tier > 0;
         let batch = &mut *self.batch;
+        let sets = batch.sets.len();
         let own = set_of(&mut batch.sets, m.set)?;
         if r.block.is_some() {
             let key = m.key(l, r.at);
@@ -2129,10 +2208,14 @@ impl<'a> GroupCx<'a> {
         // The tap of the kept rows: every one of them is in the block.
         let kept = self.need.features.max(m.b) - m.b;
         if kept < m.u
-            && let (Some(tap), Some(dev)) = (self.tap, own.taps.as_mut())
+            && let Some(tap) = self.tap
             && let Some(slot) = tap.after.get(i).copied().flatten()
         {
             let width = tap.width();
+            let dev = own
+                .taps
+                .as_mut()
+                .ok_or_else(|| no_tap_rows(m.set, sets, width, self.tier.is_some()))?;
             let k = m.u - kept;
             let s = span(WHAT, &own.hc[m.cur.s], kept * s4, k * s4)?;
             let mut rows = span_mut(WHAT, dev, kept * width, k * width)?;
@@ -2173,6 +2256,26 @@ fn fault_or(gpu: &Gpu, tier: Result<Option<Fault>, GpuError>, b: usize, e: GpuEr
                  reading the fault word failed too ({s})"
             ),
         },
+    }
+}
+
+/// The refusal of a call that hands features over while batch `set` of a
+/// group of `sets` holds no feature rows of the tap's `width`, naming the
+/// load: its buffers were made before the tap and never completed
+/// ([`Body::complete_batch_taps`]).
+fn no_tap_rows(set: usize, sets: usize, width: usize, tiered: bool) -> GpuError {
+    let load = if tiered {
+        "a load with an expert tier card"
+    } else {
+        "a load with no tier card"
+    };
+    GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "batch {set} of a group of {sets} holds no feature rows of the tap's {T_MAX} rows of \
+             {width}, on {load}: the batch's buffers were made before the tap (attach_features) \
+             and prepare_prefill did not run after it"
+        ),
     }
 }
 

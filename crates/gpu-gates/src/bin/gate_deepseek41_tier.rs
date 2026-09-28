@@ -60,6 +60,19 @@
 //!   within the same bound, so nothing the call would make for itself (a
 //!   module load, an allocation) waits on the held tier stream. The tiered
 //!   plan is loaded again for any clause after it.
+//! - `--bfeat` (B8): on a load of its own, the DSpark draft's feature tap
+//!   (`body::attach_features`, the layers of `$BLOOMERY_DSPARK_MODEL`'s
+//!   `target_layers`, header only: no draft is loaded) attached after the
+//!   tiered load made the prompt batch's buffers, then `body::prepare_prefill`
+//!   again — the order `--place bp` opens a draft in (`app::Loaded::open`,
+//!   `CardDraft::open`, `Loaded::ready`). Then the [`BATCH_P2`] prose ids fed
+//!   one decode step each, each position's features read after its step
+//!   (`Body::read_features`); against them, a prompt call of the same ids
+//!   (`body::prefill_with`) handing over its last `window` positions' rows,
+//!   for the draft's `attention.sliding_window` and for every position: the
+//!   positions and every row bit for bit. Preconditions: the calls ran two
+//!   batches as one group of [`BATCH_GROUP`], the wide call handed rows over
+//!   from both batches, and it sent every tier layer a routed slot.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -75,6 +88,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_dspark.rs"]
+#[allow(
+    dead_code,
+    reason = "B8 reads the draft's header only; the loop half serves generate_ds41"
+)]
+mod dspark;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::time::Instant;
 
@@ -84,7 +105,7 @@ mod gate {
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::{Fault, FaultSite, GpuError, HostFlags, Q8Act};
     use bloomery_gpu_deepseek41::body::{
-        self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PrefillMode,
+        self, Body, BodyMeta, DECODE_INPUT, Deepseek41Model, FeatureRows, OpenCfg, PrefillMode,
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
@@ -99,6 +120,8 @@ mod gate {
     use model::placement::{
         self, Device, ExpertList, HotList, Machine, Plan, Role, Row, workstation,
     };
+
+    use crate::dspark;
 
     const NAME: &str = "gate_deepseek41_tier";
     /// Experts per routed layer the tier takes from the cold end of the gate
@@ -142,6 +165,7 @@ mod gate {
         bfault: bool,
         blost: bool,
         bfirst: bool,
+        bfeat: bool,
     }
 
     impl Args {
@@ -159,7 +183,7 @@ mod gate {
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
-                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst]";
+                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat]";
         let mut a = Args {
             union: false,
             fault: false,
@@ -170,6 +194,7 @@ mod gate {
             bfault: false,
             blost: false,
             bfirst: false,
+            bfeat: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -182,10 +207,11 @@ mod gate {
                 "--bfault" => a.bfault = true,
                 "--blost" => a.blost = true,
                 "--bfirst" => a.bfirst = true,
+                "--bfeat" => a.bfeat = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.on_load() || a.two || a.bfirst) {
+        if !(a.on_load() || a.two || a.bfirst || a.bfeat) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -435,6 +461,22 @@ mod gate {
         }))
     }
 
+    /// The counters `after` less `before`: what the span between sent the
+    /// tier; `None` without a tier.
+    fn sent_between(before: Option<Sent>, after: Option<Sent>) -> Option<Sent> {
+        let (b, a) = (before?, after?);
+        Some(Sent {
+            first: a.first,
+            hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
+            stats: TierBatchStats {
+                served: a.stats.served - b.stats.served,
+                settles: a.stats.settles - b.stats.settles,
+                settle_early: a.stats.settle_early - b.stats.settle_early,
+                settle_ns: a.stats.settle_ns - b.stats.settle_ns,
+            },
+        })
+    }
+
     /// From a reset in graph mode: `ids` fed as one prompt call, then
     /// [`BATCH_STEPS`] greedy steps; the call's last position and each step,
     /// and on a tiered load what the call alone sent the tier.
@@ -444,19 +486,7 @@ mod gate {
         m.reset()?;
         let before = tier_counts(m)?;
         let mut tok = body::prefill(m, ids)?;
-        let sent = match (before, tier_counts(m)?) {
-            (Some(b), Some(a)) => Some(Sent {
-                first: a.first,
-                hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
-                stats: TierBatchStats {
-                    served: a.stats.served - b.stats.served,
-                    settles: a.stats.settles - b.stats.settles,
-                    settle_early: a.stats.settle_early - b.stats.settle_early,
-                    settle_ns: a.stats.settle_ns - b.stats.settle_ns,
-                },
-            }),
-            _ => None,
-        };
+        let sent = sent_between(before, tier_counts(m)?);
         run.push(tok, m.logits()?);
         for _ in 0..BATCH_STEPS {
             tok = m.step(&[tok])?;
@@ -646,7 +676,13 @@ mod gate {
         }
 
         let prompt = prose(PROMPT)?;
-        let long = if args.batch || args.batch2 || args.bfault || args.blost || args.bfirst {
+        let long = if args.batch
+            || args.batch2
+            || args.bfault
+            || args.blost
+            || args.bfirst
+            || args.bfeat
+        {
             prose(BATCH_P2)?
         } else {
             Vec::new()
@@ -680,6 +716,21 @@ mod gate {
             );
             Ok(m)
         };
+        if args.bfeat {
+            let (_, dhp) = dspark::draft_hparams()?;
+            let mut f = load()?;
+            pass &= batch_feature_case(
+                &mut f,
+                &long,
+                &dhp.target_layers,
+                &[dhp.window, long.len()],
+                &tier_layers,
+            )?;
+            drop(f);
+            if !(args.on_load() || args.bfirst) {
+                return verdict(pass);
+            }
+        }
         let mut m = load()?;
         if args.bfirst {
             pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P], "B3f")?;
@@ -791,11 +842,130 @@ mod gate {
             pass &= lost_case(&mut m, &prompt)?;
         }
         drop(m);
+        verdict(pass)
+    }
+
+    fn verdict(pass: bool) -> Result<(), GateError> {
         if !pass {
             return Err(checks_failed());
         }
         println!("PASSED: {NAME}");
         Ok(())
+    }
+
+    /// B8 (module header): the tap attached to the fresh tiered load `m`,
+    /// whose prompt batch's buffers the load made, then those buffers
+    /// prepared again; `ids` fed one step each against a prompt call of them
+    /// for each of `windows`.
+    fn batch_feature_case(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        layers: &[usize],
+        windows: &[usize],
+        tier_layers: &[usize],
+    ) -> Result<bool, GateError> {
+        body::attach_features(m, layers)?;
+        body::prepare_prefill(m)?;
+        let width = m.body(NAME)?.feature_width();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut want: Vec<Vec<f32>> = Vec::with_capacity(ids.len());
+        for (p, &id) in ids.iter().enumerate() {
+            m.step(&[id])?;
+            let (gpu, _, b) = m.body_parts(NAME)?;
+            let f = b.read_features(gpu, 1)?;
+            if f.pos as usize != p || f.values.len() != width {
+                return Err(format!(
+                    "B8: the step at position {p} read features of position {} ({} values, the \
+                     tap's {width})",
+                    f.pos,
+                    f.values.len()
+                )
+                .into());
+            }
+            want.push(f.values.to_vec());
+        }
+        let mut ok = true;
+        let batches = body::batch_count(ids.len());
+        for &window in windows {
+            let what = format!("B8 (window {window})");
+            m.reset()?;
+            let before = tier_counts(m)?;
+            let mut got: Vec<(usize, Vec<f32>)> = Vec::new();
+            let mut sink = |first: u32, rows: &[f32]| -> Result<(), GpuError> {
+                for (r, row) in rows.chunks_exact(width).enumerate() {
+                    got.push((first as usize + r, row.to_vec()));
+                }
+                Ok(())
+            };
+            let call = body::prefill_with(
+                m,
+                ids,
+                Some(FeatureRows {
+                    window,
+                    sink: &mut sink,
+                }),
+            );
+            if let Err(e) = call {
+                println!("FAIL {what}: the prompt call that hands features over failed: {e}");
+                ok = false;
+                continue;
+            }
+            let sent = sent_between(before, tier_counts(m)?);
+            let from = ids.len() - window.min(ids.len());
+            let positions: Vec<usize> = got.iter().map(|(p, _)| *p).collect();
+            if positions.iter().copied().ne(from..ids.len()) {
+                println!(
+                    "FAIL {what}: rows of positions {:?}..{:?} ({} rows), want {from}..{}",
+                    positions.first(),
+                    positions.last(),
+                    positions.len(),
+                    ids.len()
+                );
+                ok = false;
+                continue;
+            }
+            let apart = got.iter().find_map(|(p, row)| {
+                row.iter()
+                    .zip(&want[*p])
+                    .position(|(a, b)| a.to_bits() != b.to_bits())
+                    .map(|v| (*p, v))
+            });
+            if let Some((p, v)) = apart {
+                println!("FAIL {what}: position {p}'s features apart from the step's at value {v}");
+                ok = false;
+            } else {
+                println!(
+                    "ok {what}: {} positions' features, {from}..{}, bit for bit the steps'",
+                    got.len(),
+                    ids.len()
+                );
+            }
+            if window >= ids.len() {
+                ok &= sent_every(&what, sent.as_ref(), tier_layers);
+                let first_batch = body::batches(0, ids.len()).first().map_or(0, |r| r.end);
+                if from < first_batch {
+                    println!("ok {what} precondition: the first batch handed its rows over too");
+                } else {
+                    println!(
+                        "FAIL {what} precondition: no row from the first batch (ends at \
+                         {first_batch}); the group's first set's rows are not exercised"
+                    );
+                    ok = false;
+                }
+            }
+        }
+        let group = m.body(NAME)?.prefill_group().map(|(g, _)| g);
+        if group == Some(BATCH_GROUP) && batches == BATCH_GROUP {
+            println!("ok B8 structure: {batches} batches, one group of {BATCH_GROUP}");
+        } else {
+            println!(
+                "FAIL B8 structure: {batches} batches under a group of {group:?}, want \
+                 {BATCH_GROUP} of each"
+            );
+            ok = false;
+        }
+        Ok(ok)
     }
 
     /// T2: a fault on the tier card's word at `layer` before a step.
