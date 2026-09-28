@@ -189,6 +189,18 @@ def self_test():
         s = summary(write("rows", "\n".join(got) + "\n"), write("alone", "staged-loop 25.00\n"))
         assert s == ["P2 summary arm=engine:6 U_alone=120.00 | pageable U=- C=- k=- n=0 | staged U=90.00 C=2.00 "
                      "k=15.00 n=1 | copy alone pageable=- staged=25.00"], s
+        # the probe's two shapes around a stop-file written after the bench's time line (11000): the copy's
+        # full intervals end at 10600 and it stops at 11300. The old probe printed nothing for the last 700 ms,
+        # so the span was never covered to its end; the probe now flushes that partial interval at the stop.
+        full = [f"h2d loop arm=staged-loop t_ms={t} interval_ms=1000.0 bytes=2000000000 GB/s=2\n"
+                for t in range(1600, 11000, 1000)]
+        tail = "h2d loop arm=staged-loop t_ms=11300 interval_ms=700.0 bytes=1400000000 GB/s=2\n"
+        old_probe = rows(1, "staged", bench, write("op", "".join(full)), "3,7")
+        new_probe = rows(1, "staged", bench, write("np", "".join(full) + tail), "3,7")
+        assert old_probe == ["P2 round=1 cond=staged arm=engine:6 union_gbps=90.00 copy_gbps=2.00 admissible=yes "
+                             "[copy-gap]"], old_probe
+        assert new_probe == ["P2 round=1 cond=staged arm=engine:6 union_gbps=90.00 copy_gbps=2.00 admissible=yes"], \
+            new_probe
         assert rows(1, "x", write("n", "1\tv41host model=m\n"), "-", "") == [
             "P2 round=1 cond=x arm=- union_gbps=- copy_gbps=- admissible=no [no-time-line]"]
         # a thread the pool could not pin, a failed pin, or no thread line at all: the cores are not known
