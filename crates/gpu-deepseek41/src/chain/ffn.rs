@@ -102,10 +102,12 @@ use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use crate::transpose::TransposeKernels;
 
 mod batch;
+mod tier;
 pub use batch::{
     BatchLayer, BlockIo, CardAcc, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places,
     TiledGateUp,
 };
+pub use tier::{Ds41Tier, TierPiece};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
@@ -1454,27 +1456,10 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let n = self.n_embd;
+        let fault = gpu.layer_sink(layer)?;
+        self.enqueue_route(gpu, row, lw, io, hybrid, layer)?;
         let c = &self.cfg[i];
         let r = &mut self.rows[row];
-        let fault = gpu.layer_sink(layer)?;
-        self.fused.enqueue_norm_quant(
-            stream,
-            io.fold_in,
-            lw.gain,
-            self.rms_eps,
-            &mut r.act_x,
-            hybrid.boundary_mut().normed_mut(),
-            fault,
-        )?;
-        self.router.enqueue_router(
-            stream,
-            lw.router,
-            hybrid.boundary().normed(),
-            lw.bias,
-            self.scale,
-            &mut r.rout,
-            fault,
-        )?;
         let target = hybrid.boundary_mut().handoff_target_of(row)?;
         let lay = target.layout;
         if lay.n_used != N_USED || lay.hidden != n {
@@ -1496,6 +1481,40 @@ impl FfnPiece {
         self.kernels
             .enqueue_handoff(stream, &h, target, fault, &mut r.sel)?;
         hybrid.boundary().enqueue_go_of(stream, layer, row)
+    }
+
+    /// The norm (its q8_1 form into row `row`'s scratch, the f32 activation
+    /// into the boundary's handoff region) and the router, of layer `layer`.
+    fn enqueue_route<H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        row: usize,
+        lw: &LayerWeights<'_>,
+        io: &FfnIo<'_>,
+        hybrid: &mut Hybrid<H>,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        let stream = gpu.stream();
+        let r = &mut self.rows[row];
+        let fault = gpu.layer_sink(layer)?;
+        self.fused.enqueue_norm_quant(
+            stream,
+            io.fold_in,
+            lw.gain,
+            self.rms_eps,
+            &mut r.act_x,
+            hybrid.boundary_mut().normed_mut(),
+            fault,
+        )?;
+        self.router.enqueue_router(
+            stream,
+            lw.router,
+            hybrid.boundary().normed(),
+            lw.bias,
+            self.scale,
+            &mut r.rout,
+            fault,
+        )
     }
 
     /// The piece's own work in the shadow of the host's leg, on row `row`'s
