@@ -634,6 +634,37 @@ V4.1 `--place gate` 게이트는 카드 이름 "3090"이 박혀 `BLOOMERY_GATE_C
 - **AVX2 호스트 커널: 새 레버 없음.** KT #2212의 L2 M-타일링은 m_e ≳ 110부터 효과가 나는데, 우리는 G8에서도 m_e ≤ 86[유도]이다. 기각.
 - **VAMP(2609.13537), Routide(2609.29032): 기각.** VAMP의 expert → KV 전환은 단일 스트림에서 적중 < 1점이다. Routide는 adaptres 게이트에 "용량 < 순환 작업 집합" 합성 케이스 하나를 남긴다.
 
+**처분 규칙(사용자 09-28, "어드바이저와 상담해서 실험하고 이득이 명확하면 하는거지")**: 원장 항목은 항목마다 사용자에게 묻지 않는다. 어드바이저와 상담하고, 잴 항을 잰 뒤, 같은 임대 A/B의 구간 하한이 0보다 크고 효과가 예측 안에 들면 착륙한다. 프로브는 항을 정할 뿐이고, 이득의 증명은 구현 뒤 A/B다. 출력을 바꾸는 손실 근사(skip-softmax, MoE-Spec, 가지치기, 재양자화)는 이 규칙 밖이라 계속 사용자 결정이다.
+
+**modeltools** (조사 라운드, 09-28; 공개 draft·학습기·보정 도구. 보고 원문 `specs/research/modeltools-report.md`, 리드 세션 사본):
+- **Qwen3-30B-A3B-Instruct-2507용 공개 DFlash(RedHatAI, 06-16, Apache-2.0): 채택 후보, 두 항을 잰다.** 5층 llama형, aux 층 [1, 12, 23, 34, 45] + 최종 은닉, block 8, draft 어휘 32,000. `plan-ledger.md:1152`의 "Instruct-2507용 공개 드래프터가 없다"는 틀렸다(당시 조사가 놓쳤다). 그래서 09-25 사용자 결정 목록의 "DFlash 타깃을 Coder-30B로 둘지, 드래프터 학습인지"는 전제가 무너졌고, 그대로의 모델에 공개 draft를 쓰는 셋째 길이 생겼다. 예측[유도, 상한]은 코드·수학 +14…+57 %, 대화 −8…+20 %다. 폭을 가르는 항은 검증 위치 하나의 비용 s(오늘 m행 패스가 슬롯마다 expert를 다시 읽어 스텝의 0.46배, 바이트 바닥 0.30배; `crates/gpu/src/arch/qwen3moe/experts.rs:9-19`)와 우리 Q4_K_M 탐욕 출력에 대한 수락이다. s는 박스 pp P = 2–5, 수락은 탭 덤프(`qwen3taps`) → Mac 재생(`macverify`). 코드 전제: 패스 머리가 지금 마지막 행 하나뿐이라 행별 argmax가 필요하다(`docs/research/audit/qwen3.md:138`). 받기로 한 EAGLE-3(lmsys)도 같은 두 항으로 가른다.
+- **unsloth imatrix의 층×expert 카운트: 채택(XS–S).** 우리 GLM·Qwen3.8 첫 샤드 헤더의 `quantize.imatrix.file`이 공개된 `imatrix_unsloth.gguf`를 가리키고, 그 안의 `blk.N.ffn_*_exps.weight.counts`가 라우팅 카운트다. GLM에 없던 held-out 정적 목록이다(예측 적중 38–50 % @ f 0.233[유추]). 적응형 residency에는 이득이 약 0이다(시드 무관). 검증은 `macverify`의 GLM 트레이스 재생.
+- **V4.1 DSpark의 다른 학습본: 없다.** 전부 `mtp.*` 재포장이다. 다른 변환기(JigSawPT)도 `dflash.target_layers = [37, 38, 39]`를 쓴다. 다만 같은 PR 포크의 변환기라 완전히 독립된 확인은 아니다.
+- **GLM DSpark(RedHat): 보류.** k = 1 천장이 네이티브 MTP와 같고, `glmmtp` 사슬이 이미 있다. **Qwen3.8 DFlash(PixelML): 기각**(NVFP4 타깃 전용, `q38mtpd`가 이 모델의 draft). **Qwen3.6 draft들: 보류**(Qwen3-30B의 두 항과 `deltalanes` 뒤).
+- **draft 트레이너(speculators, SpecForge, DeepSpec): 보류.** 셋 다 오프라인 은닉 상태 파일로 학습하고, A6000 한 장에 들어간다. 한계는 데이터량(30B 탭 24.6 KB/토큰)이다. 공개 draft의 수락이 공개 수치보다 크게 낮을 때만 연다.
+- **k-quant 보정 도구(AutoRound의 GGUF 출력): 기각.** 같은 크기에서 더 낫다는 KLD 증거가 없고, 파일 교체는 사용자 결정이다. TorchAO·llm-compressor는 GGUF를 쓰지 않는다.
+
+**ideaaudit-models** (우리 조사 22개의 점검, 09-28; 보고 원문 `specs/research/ideaaudit-models-report.md`):
+- **고아, 박스 프로브 카드로:**
+  - B′(gate·up GEMM + SwiGLU-q8_1 에필로그, 512스레드): Qwen3 pp4096 +3.3…+7.3 %[유도]. "B′는 지연 모형으로 다시 계산한다"는 약속이 이행되지 않았다. 잴 항은 배리어 항(ncu).
+  - gemm_q6k: −2…−20 ms[유도]. A-Q6K 기각(`:559`, "Q4_K와 같은 읽기")과 q3gemmb 보고의 "q6k는 이제 L1에 묶였다"가 부딪힌다. 잴 항은 병목 단위(ncu).
+  - GLM 디코드 틈(실측 47.7 대 예측 41–43 ms): 카드 쪽이면 약 +13 %[유도]. `:59`가 "GLM 시팅 nsys"로 미룬 뒤 돌리지 않았다. 잴 항은 q8_0 gemv GB/s(nsys).
+  - Qwen3 QKV 한 런치: pp512 +2…+4 %[유도]. 잴 항은 P = 512 k·v 런치 시간(nsys).
+- **고아, 빌드만:** Qwen3 flash SM당 3블록(레지스터 196 → ≤ 168): pp4096 +1.4…+2.8 %[유도]. 잴 항은 ptxas 레지스터와 스필. 잣대 가장자리라, 카드 캡처 안에서 나오는 경우에만 쓴다.
+- **전제 변화:** glmops G3와 qwen4arch Q6-③의 "검증하면 호스트 바이트가 m개 토큰에 나뉜다"는 실측 합집합(k = 2에서 0.906)과 모순이다. GLM MTP k = 1은 +2…+17 %[유도]로 줄고, 순서(선택기 ‖ 프리필 ‖ 적응형 → MTP)는 그대로다.
+- **보류:** 접착 사다리 F2·F3·F4(+4.7…+5.3 %, act 평면 뒤), H1(head_norm f64 → f32, +1.7…+2.3 %, 비트 재핀), gemmpipe c1a(act 평면 뒤), pf/pf2(흔적 0, 출처를 다시 읽는다).
+- **산술로 기각:** ubatch 그래프 캡처 0.37 %, GLM hc_post 접기 0.7 %, 디코드 스텝마다 ProMoE식 프리페치(PCIe 0.64 ms 대 호스트 계산 120 µs), 로드 때 slab 재배치·A2 BN128(GEMM이 지연에 묶임).
+
+**ideaaudit-card** (우리 조사 36개의 점검, 09-28; 보고 원문 `specs/research/ideaaudit-card-report.md`):
+- **전제 변화 — r8(`1ad6599`) 뒤 V4.1 프롬프트의 병목이 바뀌었다[유도].** lcg P = 512는 route 창이 직렬로 드러난 합(67.2 ms/층-배치)이고, lcg P = 4096은 호스트가 묶고(카드 여유 약 16), prose P = 4096은 카드가 묶는다(호스트 35 대 카드 44–46). 같은 칸의 레버는 헤드룸 하나를 나눠 써서 더해지지 않는다.
+- **B4(프로젝션 넷 IMMA): 순서를 t_IMMA 실측으로 정한다.** 09-26 결정(B1 → G → 스트리밍 → B4)은 "lcg는 호스트에 묶인다"는 전제 위에 있었다. 새 예측은 lcg P = 512 +14…+18 %, prose P = 4096 단독 +14…+28 %[유도]다. 반면 hoststream은 r8 뒤 상한 +15…+20 %로 절반이 됐다. 프로브에서 m = 128 네 프로젝션의 t_IMMA를 재고, 예측이 서면 B4를 스트리밍 앞으로 옮긴다(위 처분 규칙). 비트 틀(off 팔 불변식, on 팔 밴드 + PIN)은 09-26 결정 그대로다.
+- **비트 동일, prose P = 4096 카드 헤드룸(약 10–12 ms/층-배치)을 나눠 씀:** batchwide shadow(+9…+14 %, `cardnext:249`), GT (e, ρ, t) 블록 순서(+4…+6 %, S, gtdram ncu). 둘을 합치면 헤드룸이 거의 찬다. IMMA shadow는 그 뒤 약 0이다.
+- **down 활성값 q8_K:** 사용자 조건("h3tile을 먼저 올려 c를 실측")의 앞 절반이 r8로 섰다. 잴 항은 r8 뒤 union 벤치 m 8·16의 c다. 예측은 lcg +5…+20 %, prose 0[유도].
+- **장부에만 있던 열린 레버:** 디코드 join 고정 비용 36 µs × 40층 = 1.44 ms, 목록 켠 스텝의 6.5 %(`plan-ledger:1018`). 잴 항은 목록 켠 디코드 nsys다. L2 프리페치는 0.7–1.3 %로 잣대 가장자리라 보류.
+- **보류:** draft-ahead(+0.7…+3.9 %), conf_proj 적응형 k, populate를 업로드 밑에 겹치기, 뜨거운 engram 행 고정.
+- **기각:** 상주 expert 자기 초안(수락 1이어도 plain과 같다), b4hc(`ac250bb`가 임계 경로 밖으로 옮김), 다중 블록 argmax 0.22 %, K9, KV fp8/fp4(손실, 디코드가 깊이에 평평), MoE-Spec(손실).
+- **흐름 모형:** 오늘 흐름(r8, G2, 스트리밍 없음)을 재현하는 칸이 없다. `macverify`가 r8 상수 행을 넣고 위 예측을 다시 낸다.
+
 ### 재판정 잔여 (revisit)
 
 R2 Q3_K 밀집 m ≤ 8 대역(m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드 — DSpark 패스 +4.7 ms 위험; uniongroup 앞); R5 0·1층 Q5_K `_sel`을 카드로(순 −0.15…−0.4 ms); R6 목록 주장 확인·R7 DSpark 재유도(합집합 0.753로)·R8 rows % 4(plainfile이 덮었는지); N1·N2·N3·N4·N5는 시팅 큐와 사용자 결정.
