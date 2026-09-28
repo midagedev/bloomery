@@ -51,6 +51,16 @@
 //! 3. after the last layer, only in the group that holds the prompt's last
 //!    position: the head, for that position alone.
 //!
+//! With an expert tier, a layer whose tier holds experts is tiered: its
+//! route also writes each slot's tier place and hands them to the host with
+//! the rest; the host's serve enqueues the tier's service of the block on the
+//! tier card before the union ([`bloomery_gpu::hybrid::Hybrid::serve_port`]);
+//! the shadow leaves out the card sum, which the post runs once the host has
+//! seen the tier's rows land ([`FfnPiece::enqueue_batch_acc_tier`]) — each
+//! token's slots in slot order from either card — before the upload and the
+//! join. The tier's fault word is read beside the card's at a group's end and
+//! when a group fails, the tier's stream drained first.
+//!
 //! Every launch writes, per token, what its one-token launch writes, and the
 //! ops that carry state from a position to the next (the ring, the
 //! compressor's pooling, each token's visible counts) run in position order,
@@ -98,6 +108,8 @@ use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
 use crate::span::{span, span_mut};
+use bloomery_gpu::Fault;
+use bloomery_gpu::fault::read_cards;
 
 /// Positions one batch runs at most: the host union's columns.
 pub const T_MAX: usize = UNION_MAX_COLS;
@@ -1013,8 +1025,9 @@ fn reads_q8(w: &Weights, name: &str) -> bool {
 /// form when the down reads one, the down and past one token its copy
 /// token-major; then over the block the buckets, the tile table, the gather
 /// into run order, the gate·up, its q8_1 form and the down when there are
-/// card experts, and the card sum.
-fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool) -> u64 {
+/// card experts, and the card sum — or, on a `tiered` layer, whose card sum
+/// the post runs, the three copies of the block's routing it holds for it.
+fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, tiered: bool) -> u64 {
     let q3k = |name: &str| {
         matches!(
             w.get(name),
@@ -1035,7 +1048,7 @@ fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool) ->
             2 + routed + gate_up + u64::from(down_q8) + 1 + u64::from(m > 1)
         })
         .sum();
-    per_chunk + if card { 7 } else { 1 }
+    per_chunk + if card { 6 } else { 0 } + if tiered { 3 } else { 1 }
 }
 
 /// The positions `b .. b + u` cut into chunks: at every multiple of
@@ -1098,7 +1111,7 @@ impl Body {
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
         let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
         let glue = self.glue.batch(gpu, image.layout())?;
-        let ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets])?;
+        let ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
         let set = |k: usize| -> Result<BatchSet, GpuError> {
             let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
             let made = || -> Result<BatchSet, GpuError> {
@@ -1154,6 +1167,21 @@ impl Body {
             attn,
             proj,
         })
+    }
+
+    /// Per layer index of the body, the experts the host tier's expert tier
+    /// holds of the layer, as the slot map says now; all 0 without a tier. A
+    /// layer the slot map has no row for holds none. Read once per group.
+    fn tier_counts(&self) -> Result<Vec<usize>, GpuError> {
+        let map = self.slot_map();
+        let tier = self.hybrid.tier().is_some();
+        self.layers
+            .clone()
+            .map(|l| match map.row_offset(l) {
+                Some(_) if tier => map.on_tier(l),
+                _ => Ok(0),
+            })
+            .collect()
     }
 
     /// The prompt batches' time since the last call, and zero again; the
@@ -1414,11 +1442,17 @@ impl Body {
         let chain = nanos(t1.elapsed());
         let (mut sums, tally) = match chained {
             Ok(done) => done,
-            Err(e) => return Err(fault_or(gpu, b, e)),
+            Err(e) => {
+                let tier = self.hybrid.tier_fault();
+                return Err(fault_or(gpu, tier, b, e));
+            }
         };
-        // Before anything else can fail: a fault the group raised is the
-        // call's error, never the next call's.
-        if let Some(fault) = gpu.fault()? {
+        // Before anything else can fail: a fault the group raised on either
+        // card is the call's error, never the next call's; the first layer
+        // wins.
+        let card = gpu.fault()?;
+        let tier = self.hybrid.tier_fault()?;
+        if let Some(fault) = read_cards(&[card, tier]) {
             return Err(GpuError::fault(WHAT, fault));
         }
         sums.chain_ns = chain;
@@ -1579,6 +1613,7 @@ impl Body {
         last: bool,
         observe: &mut BatchObserver<'_>,
     ) -> Result<(PrefillStats, Tally), GpuError> {
+        let on_tier = self.tier_counts()?;
         let Body {
             layers,
             kv,
@@ -1592,6 +1627,7 @@ impl Body {
             batch,
             hp,
             need,
+            tier,
             ..
         } = self;
         let batch = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1618,6 +1654,8 @@ impl Body {
             tap: tap.as_ref(),
             batch: &mut *batch,
             need,
+            tier: tier.as_ref(),
+            on_tier,
             n: hp.n_embd,
             sums: PrefillStats::default(),
             tally: Tally::new(first, members.len(), layers.clone()),
@@ -1687,12 +1725,31 @@ struct GroupCx<'a> {
     tap: Option<&'a FeatureTap>,
     batch: &'a mut Batch,
     need: &'a Need,
+    /// The stage card's tier piece, and per layer index the experts the
+    /// expert tier holds of the layer.
+    tier: Option<&'a TierPiece>,
+    on_tier: Vec<usize>,
     n: usize,
     sums: PrefillStats,
     tally: Tally,
 }
 
 impl<'a> GroupCx<'a> {
+    /// The experts the expert tier holds of layer index `i`
+    /// ([`Body::tier_counts`], read at the group's start); a layer with any
+    /// is tiered.
+    fn on_tier(&self, i: usize) -> Result<usize, GpuError> {
+        self.on_tier.get(i).copied().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the layer's tier count: the group reads one for each of the body's layers",
+        })
+    }
+
+    /// Whether layer index `i` is tiered.
+    fn tiered(&self, i: usize) -> Result<bool, GpuError> {
+        Ok(self.on_tier(i)? > 0)
+    }
+
     /// Event `k` of the layer-batch (layer index `i`, batch `set`).
     fn mark(&self, set: usize, i: usize, k: usize) -> Result<(), GpuError> {
         let at = CARD_MARKS * (set * self.layers.len() + i) + k;
@@ -1751,6 +1808,7 @@ impl<'a> GroupCx<'a> {
         let l = self.layers.start + i;
         let step = self.steps[i];
         let timed = self.batch.card_timing;
+        let tiered = self.tiered(i)?;
         let served = m.set * self.layers.len() + i;
         if timed {
             self.mark(m.set, i, 0)?;
@@ -1846,9 +1904,22 @@ impl<'a> GroupCx<'a> {
         // places.
         self.tally
             .route(i, m.set, (m.cuts.len() - full) as u64 + 3)?;
-        batch.ffn.enqueue_download(gpu, self.hybrid, m.key(l, at))?;
-        // The three copies to the host and the event the host waits on.
-        self.tally.route(i, m.set, 4)?;
+        if tiered {
+            let map = self.tier.map(TierPiece::places).ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the stage card's tier piece of a body with a tiered layer",
+            })?;
+            self.ffn
+                .enqueue_batch_tier_places(gpu, &bl, &mut batch.ffn, &block, map)?;
+            // The slots' tier places.
+            self.tally.route(i, m.set, 1)?;
+        }
+        batch
+            .ffn
+            .enqueue_download(gpu, self.hybrid, m.key(l, at), tiered)?;
+        // The three copies to the host — four on a tiered layer, its tier
+        // places — and the event the host waits on.
+        self.tally.route(i, m.set, 4 + u64::from(tiered))?;
         if timed {
             self.mark(m.set, i, 1)?;
             self.tally.route(i, m.set, 1)?;
@@ -1934,6 +2005,7 @@ impl<'a> GroupCx<'a> {
         let (gpu, w) = (self.gpu, self.w);
         let l = self.layers.start + i;
         let timed = self.batch.card_timing;
+        let tiered = self.tiered(i)?;
         if timed {
             self.mark(m.set, i, 2)?;
             self.tally.shadow(i, m.set, 1)?;
@@ -1941,7 +2013,7 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         let card = CardStacks::of(w, l)?;
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some());
+        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
         let block = BlockIo {
             set: m.set,
             chunks: &m.cuts[r.full..],
@@ -1950,7 +2022,7 @@ impl<'a> GroupCx<'a> {
             fold_in: &own.folds[m.cur.f],
         };
         self.ffn
-            .enqueue_batch_shadow(gpu, bl, card, &mut batch.ffn, &block)?;
+            .enqueue_batch_shadow(gpu, bl, card, &mut batch.ffn, &block, tiered)?;
         self.tally.shadow(i, m.set, entries)?;
         if timed {
             self.mark(m.set, i, 3)?;
@@ -1996,10 +2068,25 @@ impl<'a> GroupCx<'a> {
         let l = self.layers.start + i;
         let step = self.steps[i];
         let s4 = HC_STREAMS * n;
+        let n_tier = self.on_tier(i)?;
+        let tiered = n_tier > 0;
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         if r.block.is_some() {
-            batch.ffn.enqueue_upload(gpu, self.hybrid, m.key(l, r.at))?;
+            let key = m.key(l, r.at);
+            if tiered {
+                let rows = self.hybrid.tier_rows_of(key)?;
+                self.ffn.enqueue_batch_acc_tier(
+                    gpu,
+                    &mut batch.ffn,
+                    [l, m.set, n_tier],
+                    [r.at, m.u],
+                    rows,
+                )?;
+                // The card sum over both cards' slots, one launch.
+                self.tally.route(i, m.set, 1)?;
+            }
+            batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
             // The host sums' copy to the card.
             self.tally.route(i, m.set, 1)?;
             let (sin, sout) = ping(&mut own.hc, m.cur.s);
@@ -2058,15 +2145,16 @@ impl<'a> GroupCx<'a> {
 }
 
 /// The error of a group from position `b` that failed with `e` after its
-/// first launch: the stream waited for, then the fault word read — a fault
-/// any of the group's launches raised is the error whatever `e` was, with
-/// `e` behind it, so it poisons the model, never reaches a later call, and
-/// keeps `e`'s text (a host refusal's layer, say). A fault `e` that names
-/// the same fault stays as it is: it names the reader that met it first. A
-/// failed wait or read names `e` beside its own error, and a fault `e`
-/// stays.
-fn fault_or(gpu: &Gpu, b: usize, e: GpuError) -> GpuError {
-    let read = gpu.fault();
+/// first launch: the stream waited for, then the fault word read, merged
+/// with `tier`, the expert tier's word as read after its stream drained
+/// (the first layer wins) — a fault any of the group's launches raised on
+/// either card is the error whatever `e` was, with `e` behind it, so it
+/// poisons the model, never reaches a later call, and keeps `e`'s text (a
+/// host refusal's layer, say). A fault `e` that names the same fault stays as
+/// it is: it names the reader that met it first. A failed wait or read names
+/// `e` beside its own error, and a fault `e` stays.
+fn fault_or(gpu: &Gpu, tier: Result<Option<Fault>, GpuError>, b: usize, e: GpuError) -> GpuError {
+    let read = gpu.fault().and_then(|card| Ok(read_cards(&[card, tier?])));
     match read {
         Ok(Some(fault)) if matches!(&e, GpuError::Fault { fault: seen, .. } if *seen == fault) => e,
         Ok(Some(fault)) => GpuError::Fault {

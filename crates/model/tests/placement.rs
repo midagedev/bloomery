@@ -625,21 +625,23 @@ struct TierPin {
 }
 
 // PIN(2026-09-28): the public file, plan (b′) with no draft: the 3090 as expert tier. The gate read the value derived on paper.
+// PIN(2026-09-28): re-pinned for the tier prompt batch's reserve, 152,511,496 B (workstation::tier_batch_bytes at n_embd 5120, ff 2304, 512 columns): past the 1,401-expert plan's slack it frees ⌈(152,511,496 − slack) / 16,773,120⌉ = 9 experts, 1,401 → 1,392; headroom −1,516,552 = −reserve + 9 experts + 36,864 rounding.
 const PUB_BP_TIER: TierPin = TierPin {
-    experts: 1_401,
-    expert_bytes: 23_499_141_120,
-    rounding: 165_122_048,
-    reserve: 0,
-    headroom: 1_082_130_432,
+    experts: 1_392,
+    expert_bytes: 23_348_183_040,
+    rounding: 165_085_184,
+    reserve: 152_511_496,
+    headroom: 1_080_613_880,
     n_l: (36, 37),
 };
 // PIN(2026-09-28): the public file, plan (b′) with the DSpark draft's reserve on the 3090. The gate read the value derived on paper.
+// PIN(2026-09-28): re-pinned for the tier prompt batch's reserve beside the draft's, 152,511,496 B: 8 experts, 889 → 881, and 16,809,984 B of rounding free it; headroom −1,516,552.
 const PUB_BP_TIER_DRAFT: TierPin = TierPin {
-    experts: 889,
-    expert_bytes: 14_911_303_680,
-    rounding: 114_790_400,
-    reserve: 8_629_780_480,
-    headroom: 1_090_519_040,
+    experts: 881,
+    expert_bytes: 14_777_118_720,
+    rounding: 97_980_416,
+    reserve: 8_782_291_976,
+    headroom: 1_089_002_488,
     n_l: (23, 24),
 };
 
@@ -846,6 +848,20 @@ fn hw_placement_bp() {
     let mut bad = Vec::new();
 
     let d = draft_bytes(&split);
+    let hp = Hparams::read(&split).expect("the hyperparameters open() read");
+    let batch = workstation::tier_batch_bytes(
+        hp.n_embd as u64,
+        hp.experts.ff as u64,
+        hp.experts.n_used as u64,
+        model::moe::UNION_MAX_COLS as u64,
+    );
+    println!(
+        "tier prompt batch: staging {}  tile scratch {}  card {}  host {}",
+        n(batch.staging),
+        n(batch.scratch),
+        n(batch.card()),
+        n(batch.host)
+    );
     println!(
         "DSpark draft on its card: weights {}  KV {}  rounding {}  scratch {}  total {}",
         n(d.weights),
@@ -867,7 +883,7 @@ fn hw_placement_bp() {
         ("plan (b′) no draft", None, &PUB_BP_TIER),
         ("plan (b′) + draft", Some(d.total()), &PUB_BP_TIER_DRAFT),
     ] {
-        let machine = workstation::plan_bp(model.layers, draft);
+        let machine = workstation::plan_bp(model.layers, draft, batch);
         let bp = placement::plan_with(&model, &machine, ctx, &kv, None, None)
             .unwrap_or_else(|e| panic!("{title}: {e}"));
         summary(&mut out, title, &bp, &kv);
@@ -885,7 +901,7 @@ fn hw_placement_bp() {
     let hot = HotList::parse("synthetic", &text).expect("the synthetic list parses");
     let a_hot = placement::plan_with(&model, &a_machine, ctx, &kv, Some(&hot), None)
         .expect("plan (a), list");
-    let machine = workstation::plan_bp(model.layers, None);
+    let machine = workstation::plan_bp(model.layers, None, batch);
     let bp_hot = placement::plan_with(&model, &machine, ctx, &kv, Some(&hot), None)
         .expect("plan (b′), list");
     bad.extend(bp_failures(

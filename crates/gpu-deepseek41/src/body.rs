@@ -2150,6 +2150,9 @@ impl Body {
         let tier = match tier_card {
             Some(t) => {
                 hybrid.attach_tier(t, gpu)?;
+                // The tier's batch staging is reserved on its card by the plan,
+                // so it is made at load, not at the first prompt.
+                hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
                 Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
             }
             None => None,

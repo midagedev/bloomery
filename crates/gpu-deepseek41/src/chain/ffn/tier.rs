@@ -18,10 +18,14 @@
 //! The tier's own layer ([`Ds41Tier`], the architecture's
 //! [`TierExperts`]) is the stage card's routed launches over the tier's
 //! stacks: the `_sel` gate·up on the staged activation, the q8_1 of the tier
-//! slots' columns of `h`, and the `_sel` down into the tier's rows.
+//! slots' columns of `h`, and the `_sel` down into the tier's rows; over a
+//! prompt batch's block, the stage card's tile path over its own scratch
+//! ([`super::batch::enqueue_tiled_experts`]).
 
 use bloomery_gpu::FaultSite;
-use bloomery_gpu::host::tier::{TierExperts, TierIo, TierSet, TierTarget};
+use bloomery_gpu::host::tier::{TierBlock, TierExperts, TierIo, TierSet, TierTarget};
+
+use super::batch::{FfnBatchKernels, TileScratch, TiledBlock, enqueue_tiled_experts};
 
 use super::*;
 
@@ -437,6 +441,14 @@ impl TierPiece {
         self.tsel.iter().map(DeviceBuffer::num_bytes).sum::<usize>() + self.places.buf().num_bytes()
     }
 
+    /// The card copy of the map's tier view, a row of places per layer at
+    /// the card copy's row offsets: what a prompt batch's route reads its
+    /// slots' tier places from.
+    #[must_use]
+    pub fn places(&self) -> &DeviceTensor<u32> {
+        &self.places
+    }
+
     fn tsel(&self, row: usize) -> Result<&DeviceBuffer<u32>, GpuError> {
         self.tsel.get(row).ok_or_else(|| GpuError::Shape {
             what: TIER_WHAT,
@@ -688,12 +700,15 @@ fn enqueue_handoff_tier(
 
 /// The V4.1 tier card's computation ([`TierExperts`]): per tier layer the
 /// stage card's routed launches over the tier's stacks, into the tier's
-/// rows. Its scratch — the slots' SwiGLU outputs and their q8_1 — is made
-/// at load.
+/// rows; over a prompt batch's block, the tile path. Its scratch — the
+/// slots' SwiGLU outputs and their q8_1, and the tile path's for a block of
+/// the host union's columns — is made at load.
 pub struct Ds41Tier {
     experts: ExpertKernels,
     h: DeviceBuffer<f32>,
     act_h: Q8Act,
+    batch: FfnBatchKernels,
+    tile: TileScratch,
     layers: Range<usize>,
     /// Per layer of `layers`, the experts the tier holds and the layer's
     /// `swiglu_clamp_exp`.
@@ -758,10 +773,29 @@ impl Ds41Tier {
             cfg.push((k, kind.swiglu_limit));
         }
         let stream = gpu.stream();
+        let slots = UNION_MAX_COLS * N_USED;
+        let tile = TileScratch::new(stream, slots, n, ff)?;
+        let want = model::placement::workstation::tier_block_scratch_bytes(
+            n as u64,
+            ff as u64,
+            slots as u64,
+        );
+        if tile.device_bytes() as u64 != want {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the tile scratch holds {} B; the plan's reserve ({}) counts {want} B",
+                    tile.device_bytes(),
+                    model::placement::workstation::TIER_BATCH_RESERVE
+                ),
+            });
+        }
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
             h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
             act_h: Q8Act::with_k(stream, N_USED, ff)?,
+            batch: FfnBatchKernels::load(gpu.context())?,
+            tile,
             layers,
             cfg,
             n_embd: n,
@@ -770,7 +804,57 @@ impl Ds41Tier {
     }
 }
 
+impl Ds41Tier {
+    /// Layer `layer`'s tier experts and SwiGLU clamp; a layer the tier
+    /// holds none of is refused by name.
+    fn tier_layer(&self, layer: usize, what: &'static str) -> Result<(usize, f32), GpuError> {
+        layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.cfg.get(i))
+            .copied()
+            .filter(|&(k, _)| k > 0)
+            .ok_or_else(|| GpuError::Shape {
+                what,
+                detail: format!("layer {layer} holds no tier expert"),
+            })
+    }
+
+    /// Device bytes of the scratch a prompt batch's block uses: the tile
+    /// path's.
+    #[must_use]
+    pub fn block_bytes(&self) -> usize {
+        self.tile.device_bytes()
+    }
+}
+
 impl TierExperts for Ds41Tier {
+    fn enqueue_block(
+        &mut self,
+        gpu: &Gpu,
+        weights: &Weights,
+        layer: usize,
+        io: TierBlock<'_>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Ds41Tier::enqueue_block";
+        let (_, limit) = self.tier_layer(layer, WHAT)?;
+        let stacks = CardStacks::of(weights, layer)?.ok_or_else(|| GpuError::Tensor {
+            what: WHAT,
+            name: names::ffn_down_exps(layer),
+            need: "the tier's routed stacks of a tier layer",
+        })?;
+        let t = TiledBlock {
+            stacks,
+            q3: io.act.q3(),
+            d8: io.act.d8(),
+            col0: 0,
+            cols: io.cols,
+            sel: io.sel,
+            layer,
+            limit,
+        };
+        enqueue_tiled_experts(gpu, &self.batch, &t, &mut self.tile, io.down)
+    }
+
     fn enqueue_layer(
         &mut self,
         gpu: &Gpu,
@@ -779,15 +863,7 @@ impl TierExperts for Ds41Tier {
         io: TierIo<'_>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Ds41Tier::enqueue_layer";
-        let (k, limit) = layer
-            .checked_sub(self.layers.start)
-            .and_then(|i| self.cfg.get(i))
-            .copied()
-            .filter(|&(k, _)| k > 0)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} holds no tier expert"),
-            })?;
+        let (k, limit) = self.tier_layer(layer, WHAT)?;
         let s = CardStacks::of(weights, layer)?.ok_or_else(|| GpuError::Tensor {
             what: WHAT,
             name: names::ffn_down_exps(layer),

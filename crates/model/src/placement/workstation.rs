@@ -135,20 +135,116 @@ pub fn plan_b(layers: usize) -> Machine {
 /// What the DSpark draft's reserve on a card is called.
 pub const DRAFT_RESERVE: &str = "DSpark draft";
 
+/// What the expert tier's prompt-batch service is called as a reserve: on
+/// the tier card, its staging and its tile scratch; on the host, the rows it
+/// hands back and the places it reads.
+pub const TIER_BATCH_RESERVE: &str = "tier prompt batch";
+pub const TIER_BATCH_HOST_RESERVE: &str = "tier prompt batch rows";
+
+/// The expert tier's prompt-batch service in bytes ([`tier_batch_bytes`]):
+/// on the tier card, the staging a block is copied into — the activations,
+/// the tier places, their q8_1 form, the down outputs by slot — and the tile
+/// path's scratch; on the host, per exchange set, the rows it hands back and
+/// the places it reads. The GPU side checks its allocations against these at
+/// load and refuses a difference by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierBatchBytes {
+    pub staging: u64,
+    pub scratch: u64,
+    pub host: u64,
+}
+
+impl TierBatchBytes {
+    /// The tier card's part.
+    #[must_use]
+    pub const fn card(&self) -> u64 {
+        self.staging + self.scratch
+    }
+}
+
+/// Experts the tile path's bucket table takes a layer at most, and the
+/// columns a tile holds: the tile path's shapes, which size its scratch.
+const TILE_BUCKET_EXPERTS: u64 = 1024;
+const TILE_COLS: u64 = 8;
+
+/// The q8_1 activation of `m` columns of `k` values as the card lays it out:
+/// its Q3_K, Q4_K and Q6_K codes, its sums and its scales.
+const fn q8_act_bytes(m: u64, k: u64) -> u64 {
+    let n_sb = k / 256;
+    8 * m * 64 * n_sb.div_ceil(2)
+        + 4 * m * 256 * n_sb.div_ceil(4)
+        + 4 * m * 128 * n_sb.div_ceil(2)
+        + 4 * m * 8 * n_sb
+        + 4 * m * 2 * n_sb
+}
+
+/// The tier card's staging of the tier's prompt-batch service for blocks of
+/// up to `cols` tokens of rows of `n_embd`, `n_used` slots a token: the
+/// activations, the tier places, their q8_1 form, the down outputs by slot.
+#[must_use]
+pub const fn tier_batch_staging_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
+    let slots = cols * n_used;
+    4 * cols * n_embd + 4 * slots + q8_act_bytes(cols, n_embd) + 4 * slots * n_embd
+}
+
+/// The tile path's scratch for blocks of up to `slots` slots of rows of
+/// `n_embd` through experts of `ff`: the bucket table, the tiles, the q8_1
+/// planes by entry, the SwiGLU outputs and their q8_1 form.
+#[must_use]
+pub const fn tier_block_scratch_bytes(n_embd: u64, ff: u64, slots: u64) -> u64 {
+    let n_sb = n_embd / 256;
+    let tile_cap = {
+        let spread = (slots + (TILE_COLS - 1) * TILE_BUCKET_EXPERTS) / TILE_COLS;
+        if slots < spread { slots } else { spread }
+    };
+    4 * slots
+        + 4 * (TILE_BUCKET_EXPERTS + 1)
+        + 4 * (tile_cap + 1)
+        + 8 * slots * 64 * n_sb.div_ceil(2)
+        + 4 * slots * 2 * n_sb
+        + 4 * slots * ff
+        + q8_act_bytes(slots, ff)
+}
+
+/// The host's part of the tier's prompt-batch service: per exchange set, the
+/// rows the tier hands back and the places it reads.
+#[must_use]
+pub const fn tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> u64 {
+    let slots = cols * n_used;
+    2 * (4 * slots * n_embd + 4 * slots)
+}
+
+/// The expert tier's prompt-batch bytes for blocks of up to `cols` tokens of
+/// rows of `n_embd`, routed to `n_used` experts of `ff` rows each.
+#[must_use]
+pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> TierBatchBytes {
+    TierBatchBytes {
+        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
+        scratch: tier_block_scratch_bytes(n_embd, ff, cols * n_used),
+        host: tier_batch_host_bytes(n_embd, n_used, cols),
+    }
+}
+
 /// Plan (b′): the A6000 runs all `layers` and the head as in [`plan_a`];
 /// the 3090 is an expert tier beside the host, holding each layer's next hot
 /// ranks, with `draft_bytes` — the DSpark draft's resident bytes
 /// (`model::arch::dspark::card_bytes`), when the draft lives there — as a
-/// named reserve.
+/// named reserve, and the tier's prompt-batch service `batch`
+/// ([`tier_batch_bytes`]) as named reserves on the tier and the host.
 #[must_use]
-pub fn plan_bp(layers: usize, draft_bytes: Option<u64>) -> Machine {
+pub fn plan_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
     let mut t = tier(RTX_3090);
     t.reserves
         .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
+    t.reserves
+        .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+    let mut h = host();
+    h.reserves
+        .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
     Machine {
         cards: vec![card(A6000, 0..layers, true)],
         tiers: vec![t],
-        host: host(),
+        host: h,
     }
 }
 
@@ -170,4 +266,23 @@ pub fn plan_gate(layers: usize) -> Machine {
 #[must_use]
 pub fn spec_of(card: &Card) -> Option<CardSpec> {
     [A6000, RTX_3090].into_iter().find(|s| s.name == card.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tier_batch_bytes;
+
+    /// V4.1's tier batch at the host union's 512 columns: the allocation
+    /// sizes of the tier's staging and tile scratch, summed by hand.
+    #[test]
+    fn v41_tier_batch_bytes() {
+        let b = tier_batch_bytes(5120, 2304, 6, 512);
+        assert_eq!(b.staging, 10_485_760 + 12_288 + 8_273_920 + 62_914_560);
+        assert_eq!(
+            b.scratch,
+            12_288 + 4_100 + 5_124 + 15_728_640 + 491_520 + 28_311_552 + 26_271_744
+        );
+        assert_eq!(b.card(), 152_511_496);
+        assert_eq!(b.host, 2 * (62_914_560 + 12_288));
+    }
 }

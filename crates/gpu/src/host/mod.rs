@@ -616,19 +616,38 @@ impl<H: HostExperts> HostTier<H> {
         ))
     }
 
-    /// The refusal of a prompt batch on a tier whose batch port is not
-    /// built.
+    /// The refusal of the direct batch service on a host tier with an
+    /// expert tier: it has no tier path, so it would leave the tier's
+    /// experts uncomputed. Prompt batches go through the port
+    /// ([`HostTier::serve_key`]).
     fn refuse_tier_batch(&self, what: &'static str) -> Result<(), GpuError> {
         match &self.tier {
             Some(t) => Err(GpuError::protocol(
                 what,
                 format!(
-                    "the tier's batch port is not built: tierbatch (a prompt batch would leave the experts on {} uncomputed)",
+                    "the direct batch service has no tier path (it would leave the experts on {} \
+                     uncomputed): a model with an expert tier serves prompt batches through the \
+                     port (HostTier::serve_key)",
                     t.name()
                 ),
             )),
             None => Ok(()),
         }
+    }
+
+    /// The refusal of an untiered route of a layer whose expert tier holds
+    /// experts: without its tier places the tier would not serve the block.
+    fn refuse_untiered_route(&self, what: &'static str, layer: usize) -> Result<(), GpuError> {
+        if self.tier.is_some() && self.slots.on_tier(layer)? > 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: a tiered layer's route without its tier places \
+                     (HostTier::enqueue_download_tiered)"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Hold `residency`, the host set the placed load read in and locked,
@@ -658,15 +677,26 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// The batch port's two sets, for blocks of up to `cap` tokens, made
-    /// once: a decode that never prefills a batch never holds them.
-    /// Load-time or first-prompt only.
+    /// once, and with an expert tier its tier leg
+    /// ([`HostTier::prepare_tier_batch`]): a decode that never prefills a
+    /// batch never holds them, unless a body with a tier makes them at load.
+    /// Load-time or first-prompt only; a port already made for another `cap`
+    /// is refused by name.
     pub fn prepare_batch(&mut self, ctx: &Arc<CudaContext>, cap: usize) -> Result<(), GpuError> {
-        self.refuse_tier_batch("HostTier::prepare_batch")?;
-        if self.port.is_none() {
-            let h = self.step.boundary.layout.handoff();
-            self.port = Some(BatchPort::new(ctx, h.hidden, h.n_used, cap)?);
+        match self.port.as_ref().map(BatchPort::cap) {
+            None => {
+                let h = self.step.boundary.layout.handoff();
+                self.port = Some(BatchPort::new(ctx, h.hidden, h.n_used, cap)?);
+            }
+            Some(made) if made != cap => {
+                return Err(GpuError::shape(
+                    "HostTier::prepare_batch",
+                    format!("the batch port holds blocks of {made} tokens, asked for {cap}"),
+                ));
+            }
+            Some(_) => {}
         }
-        Ok(())
+        self.prepare_tier_batch()
     }
 
     /// The batch port, once [`HostTier::prepare_batch`] has made it.
@@ -693,6 +723,7 @@ impl<H: HostExperts> HostTier<H> {
         ids: &DeviceBuffer<u32>,
         key: BatchKey,
     ) -> Result<(), GpuError> {
+        self.refuse_untiered_route("HostTier::enqueue_download", key.layer)?;
         self.port_mut("HostTier::enqueue_download")?
             .download(stream, xw, ids, key)
     }
@@ -708,6 +739,7 @@ impl<H: HostExperts> HostTier<H> {
         pitch: usize,
         key: BatchKey,
     ) -> Result<(), GpuError> {
+        self.refuse_untiered_route("HostTier::enqueue_download_pitched", key.layer)?;
         self.port_mut("HostTier::enqueue_download_pitched")?
             .download_pitched(stream, xw, ids, pitch, key)
     }
@@ -715,29 +747,11 @@ impl<H: HostExperts> HostTier<H> {
     /// Wait for the oldest download not served yet — `key`'s, else refused
     /// by name — and serve its layer's host experts for its tokens in one
     /// union call ([`HostTier::serve_batch`]'s service), the sums into the
-    /// set the upload sends. Returns the host time outside the union call.
+    /// set the upload sends; a tiered set's tier service is enqueued between
+    /// the wait and the union ([`HostTier::serve_port`]). Returns the host
+    /// time outside the union call.
     pub fn serve_key(&mut self, key: BatchKey) -> Result<ServeTimes, GpuError> {
-        self.refuse_tier_batch("HostTier::serve_key")?;
-        let h = self.step.boundary.layout.handoff();
-        let Some(port) = self.port.as_mut() else {
-            return Err(GpuError::State {
-                what: "HostTier::serve_key",
-                missing: "the batch port's sets (HostTier::prepare_batch)",
-            });
-        };
-        let (batch, experts, health) = (&mut self.batch, &mut self.experts, &mut self.health);
-        let (slots, fault) = (&self.slots, self.fault.as_ref());
-        port.serve(key, |layer, x, ids, w, out| {
-            let t = Tier {
-                experts,
-                health,
-                slots,
-                fault,
-                hidden: h.hidden,
-                n_used: h.n_used,
-            };
-            batch.serve_guarded(t, layer, x, ids, w, &[], out)
-        })
+        self.serve_port(key)
     }
 
     /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
@@ -1144,10 +1158,20 @@ impl<H: HostExperts> HostTier<H> {
     /// The expert tier is lost at layer `layer`: poison the tier as a lost
     /// card, release both cards' waits, and name the card.
     fn lose_tier(&mut self, layer: usize) -> GpuError {
-        let (name, detail) = match self.tier.as_ref() {
-            Some(t) => (t.name().to_string(), t.lost_detail(GO_DEADLINE)),
-            None => (String::new(), "no tier".to_string()),
-        };
+        let detail = self
+            .tier
+            .as_ref()
+            .map_or_else(|| "no tier".to_string(), |t| t.lost_detail(GO_DEADLINE));
+        self.lose_tier_as(layer, detail)
+    }
+
+    /// [`HostTier::lose_tier`], the loss named by `detail`.
+    fn lose_tier_as(&mut self, layer: usize, detail: String) -> GpuError {
+        let name = self
+            .tier
+            .as_ref()
+            .map(|t| t.name().to_string())
+            .unwrap_or_default();
         self.health.set_lost(SERVE, &name, layer, &detail);
         self.release_all();
         GpuError::protocol(SERVE, format!("layer {layer}: {detail}"))
