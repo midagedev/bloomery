@@ -11,13 +11,15 @@
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
-//!   latent layers attend whole. Default 2048.
+//!   deepest context a reference set checks the selector at
+//!   (`place::ORACLE_POSITIONS`). Default 2048.
 //! - `--place`: `a` is the serving plan (`workstation::plan_a`, the A6000),
 //!   `gate` the gate card's (`workstation::plan_gate`, the 3090). Default
 //!   `gate`.
 //! - `--prefill`: `batch` feeds the prompt in batches
 //!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
-//!   the same bits; the same-binary arm. Default `batch`.
+//!   the same bits at any `--ctx`, past the positions the latent layers
+//!   attend whole too; the same-binary arm. Default `batch`.
 //! - `--model`: the first shard; default the file the reference sets were
 //!   dumped from (`refset::arch::glm5next::MODEL`).
 //! - `--plan` prints the plan and exits before the load.
@@ -33,11 +35,11 @@
 //!   step` records print after the last step, so no write sits between two
 //!   timed steps.
 //!
-//! The `load` line's `top_k` is the file's indexer top-k: at the contexts the
-//! plan allows every position is within it, so the latent layers attend all
-//! of them. The levers it acts on are parsed once, at `main`; every line is a record
-//! of a kind `bloomery_gpu_gates::record` declares (`--records-schema`
-//! prints them).
+//! The `load` line's `top_k` is the file's indexer top-k: a position whose
+//! whole pools hold at most `top_k` positions attends every position; past
+//! that, the ones its selector lists. The levers it acts on are parsed once,
+//! at `main`; every line is a record of a kind `bloomery_gpu_gates::record`
+//! declares (`--records-schema` prints them).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {

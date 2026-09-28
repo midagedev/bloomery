@@ -2,8 +2,8 @@
 //! [`T_MAX`] positions ([`prefill`]), which leaves the model where `P`
 //! decode steps over the same ids leave it, bit for bit, in everything a
 //! later step reads: every KDA layer's state and conv ring, every latent
-//! layer's latent and index rows, the checkpoints, and the last position's
-//! logits.
+//! layer's latent and index rows and pool plane, the checkpoints, and the
+//! last position's logits.
 //!
 //! A call is cut at its checkpoint marks
 //! ([`bloomery_gpu::checkpoint::Checkpoints::marks`]: its start, every
@@ -35,13 +35,22 @@
 //! - one launch over the batch's `T` rows where the kernel takes any count:
 //!   the RMS norms, `hc_pre` (in its token groups), the fold and `hc_post`,
 //!   the KDA conv and prep, the delta step, the gated norm, the latent and
-//!   index appends, the router's two launches, the card places, the sums;
+//!   index appends, the pool keys the batch's tokens complete, the router's
+//!   two launches, the card places, the sums;
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
 //!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`), the
 //!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the card experts'
-//!   launches, and the attention, each token over the positions at and
-//!   before its own — the batch's own rows appended before the first chunk
-//!   attends.
+//!   launches, the k-pool selector, and the attention, each token over the
+//!   positions at and before its own — the batch's own rows and pools
+//!   written before the first chunk attends.
+//!
+//! A latent layer's chunk attends as the step does at its tokens'
+//! positions: while its last token sees at most the positions the indexer
+//! keeps whole (`place::dense_positions`), every position at and before
+//! each token's, which is the list the selector gives there; past them the
+//! selector runs over the chunk's tokens (`crate::mla::select`) and the
+//! attention reads the positions each token's list names, a token of the
+//! chunk still within them listing every one of its positions.
 //!
 //! A latent layer's joined projection runs as its two row ranges — the
 //! query's low rank, then the latent, the index key and the pool gate — so
@@ -57,14 +66,16 @@ use std::ops::Range;
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
-use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows};
+use bloomery_gpu::kpool;
+use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
 use bloomery_gpu::linear::conv::KdaConvArgs;
 use bloomery_gpu::linear::delta::DeltaArgs;
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
+use bloomery_gpu::qsa::list_width;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, Q8Act};
-use bloomery_gpu_deepseek41::attn::{self, AttnArgs};
+use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
 use bloomery_gpu_deepseek41::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcPostArgs, HcPreScratch, HcQ8Params, HcQ8PreArgs,
 };
@@ -83,6 +94,7 @@ use super::{
 };
 use crate::ffn::{self, CardRows};
 use crate::host::GlmHost;
+use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
 
 /// What the prompt batch's errors name.
@@ -167,9 +179,11 @@ struct Bufs {
     /// The embedding rows on the host, four copies a token, before their
     /// upload.
     rows: Vec<f32>,
-    /// Each token's position, and the attention's visible counts (no window
-    /// row, then every position at and before its own), on the host.
+    /// Each token's position, its live count (the position plus one), and
+    /// the attention's visible counts (no window row, then every position at
+    /// and before its own), on the host.
     pos_host: Vec<u32>,
+    cnt_host: Vec<u32>,
     vis_host: Vec<u32>,
     /// The four streams per token, ping-ponged as the step's.
     streams: [DeviceBuffer<f32>; 2],
@@ -182,6 +196,7 @@ struct Bufs {
     hc: DeviceBuffer<f32>,
     hc_scratch: HcPreScratch,
     pos: DeviceBuffer<u32>,
+    cnt: DeviceBuffer<u32>,
     vis: DeviceBuffer<u32>,
     // A KDA mixer's, per token.
     qkv: DeviceBuffer<f32>,
@@ -205,6 +220,12 @@ struct Bufs {
     av: DeviceBuffer<f32>,
     part_v: DeviceBuffer<f32>,
     part_ms: DeviceBuffer<f32>,
+    // The k-pool selector's, per chunk: the indexer query and head weights
+    // (a token a column), the pools' scores and the lists.
+    qi: DeviceBuffer<f32>,
+    wi: DeviceBuffer<f32>,
+    scores: DeviceBuffer<f32>,
+    list: DeviceBuffer<u32>,
     // The feed-forward blocks': the SwiGLU rows per chunk, the rest per
     // token.
     h: DeviceBuffer<f32>,
@@ -227,8 +248,10 @@ struct Bufs {
 impl Bufs {
     /// The buffers for batches of up to `cap` tokens of `d`'s widths, `ff`
     /// the widest dense or shared-expert width, `expert_ff` a routed
-    /// expert's, over stores of `ctx` positions. Load-time or first-prompt
-    /// only.
+    /// expert's, over stores of `ctx` positions. The attention's partials
+    /// cover `ctx` keys: a chunk selects only on stores past the dense
+    /// positions, which are a list's width, so they cover a list too.
+    /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
         d: &Dims,
@@ -254,6 +277,7 @@ impl Bufs {
             cap,
             rows: vec![0.0; cap * HC_STREAMS * n],
             pos_host: vec![0; cap],
+            cnt_host: vec![0; cap],
             vis_host: vec![0; 2 * cap],
             streams: [z(cap * HC_STREAMS * n)?, z(cap * HC_STREAMS * n)?],
             x: z(cap * n)?,
@@ -264,6 +288,7 @@ impl Bufs {
             hc: z(cap * HC_MIX)?,
             hc_scratch: HcPreScratch::with_groups(stream, HC_STREAMS * n, groups)?,
             pos: zu(cap)?,
+            cnt: zu(cap)?,
             vis: zu(2 * cap)?,
             qkv: z(cap * ch)?,
             conv: z(cap * ch)?,
@@ -285,6 +310,10 @@ impl Bufs {
             av: z(CHUNK * d.heads * d.head_v)?,
             part_v: z(attn::partials_v_len(rows, segs))?,
             part_ms: z(attn::partials_ms_len(rows, segs))?,
+            qi: z(CHUNK * kpool::HEADS * kpool::DIM)?,
+            wi: z(CHUNK * kpool::HEADS)?,
+            scores: z(CHUNK * pools_for(ctx))?,
+            list: zu(CHUNK * list_width(d.kept))?,
             h: z(CHUNK * ff)?,
             normed: z(cap * n)?,
             sh_y: z(cap * n)?,
@@ -333,6 +362,9 @@ impl Bufs {
             &self.av,
             &self.part_v,
             &self.part_ms,
+            &self.qi,
+            &self.wi,
+            &self.scores,
             &self.h,
             &self.normed,
             &self.sh_y,
@@ -344,10 +376,12 @@ impl Bufs {
             &self.card_down,
         ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
-            + [&self.pos, &self.vis, &self.ids, &self.sel]
-                .iter()
-                .map(|b| b.num_bytes())
-                .sum::<usize>()
+            + [
+                &self.pos, &self.cnt, &self.vis, &self.ids, &self.sel, &self.list,
+            ]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
             + self.hc_scratch.device_bytes()
             + self.act_x.device_bytes()
             + self.act_h.iter().map(Q8Act::device_bytes).sum::<usize>()
@@ -429,23 +463,6 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
     Ok(to)
 }
 
-/// The batch feed on this load, refused by name when the stores hold more
-/// positions than a latent layer attends whole: past them a token attends
-/// the positions its selector lists, over pool keys the batch does not
-/// write, and the steps feed is the one that runs such a load.
-fn check_batch(body: &Body) -> Result<(), GpuError> {
-    if body.ctx() > body.dense {
-        return Err(shape(format!(
-            "the batch feed on a load of {} positions: past the {} positions a latent layer \
-             attends whole (place::dense_positions) a token selects its keys over pool keys the \
-             batch does not write; feed this load with the steps feed (--prefill steps)",
-            body.ctx(),
-            body.dense
-        )));
-    }
-    Ok(())
-}
-
 /// Feed `ids` from where `m` stands by the body's mode ([`set_prefill`]) and
 /// return the argmax after the last: [`prefill`] or the steps ([`prompt`]),
 /// each call refused by name before anything runs when it would pass the
@@ -465,14 +482,9 @@ pub fn prefill_mode(m: &Glm5nextModel) -> Result<PrefillMode, GpuError> {
 
 /// Set `m`'s feed to `mode`; the batch feed's buffers, the host tier's batch
 /// sets and the host union's slabs are made here, once, so that a timed
-/// prompt allocates nothing. Returns whether it made any. The batch feed on
-/// a load past the positions a latent layer attends whole is refused by
-/// name, the mode left as it was.
+/// prompt allocates nothing. Returns whether it made any.
 pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
-    if mode == PrefillMode::Batch {
-        check_batch(body)?;
-    }
     body.prompt.mode = mode;
     if mode == PrefillMode::Steps || body.prompt.batch.is_some() {
         return Ok(false);
@@ -482,13 +494,11 @@ pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, Gpu
 }
 
 /// Feed `ids` from where `m` stands in batches (module doc) and return the
-/// argmax after the last. Refused by name before anything runs: on a load
-/// past the positions a latent layer attends whole, on a poisoned model,
-/// past the stores' positions, with the taps armed (a tap holds one token's
-/// streams, and a batch runs many). The batch's buffers
+/// argmax after the last. Refused by name before anything runs: on a
+/// poisoned model, past the stores' positions, with the taps armed (a tap
+/// holds one token's streams, and a batch runs many). The batch's buffers
 /// are made by the first call when [`set_prefill`] has not made them.
 pub fn prefill(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
-    check_batch(m.body(WHAT)?)?;
     let to = check_call(m, ids)?;
     let from = m.pos();
     {
@@ -556,15 +566,15 @@ fn take_back(m: &mut Glm5nextModel, from: u32, e: GpuError) -> GpuError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreDigest {
     pub layer: usize,
-    /// `state`, `ring`, `latent` or `index`.
+    /// `state`, `ring`, `latent`, `index` or `pooled`.
     pub what: &'static str,
     /// FNV-1a over the store's words, in order.
     pub fnv: u64,
 }
 
 /// Every layer's stores read back and digested, in layer order: a KDA
-/// layer's state and conv ring, a latent layer's latent and index rows (all
-/// the rows the stores hold, fed or not). Blocking.
+/// layer's state and conv ring, a latent layer's latent and index rows and
+/// its pool plane (all the rows the stores hold, fed or not). Blocking.
 pub fn store_digests(m: &mut Glm5nextModel) -> Result<Vec<StoreDigest>, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
     let stream = gpu.stream();
@@ -584,9 +594,9 @@ pub fn store_digests(m: &mut Glm5nextModel) -> Result<Vec<StoreDigest>, GpuError
             Store::Latent {
                 latent,
                 index,
-                pooled: _,
+                pooled,
             } => {
-                for (what, b) in [("latent", latent), ("index", index)] {
+                for (what, b) in [("latent", latent), ("index", index), ("pooled", pooled)] {
                     let words = b.buf().to_host_vec(stream)?;
                     out.push(StoreDigest {
                         layer,
@@ -610,28 +620,29 @@ fn fnv(words: impl Iterator<Item = u64>) -> u64 {
 }
 
 /// Which cached positions a chunk's tokens attend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Keys {
     /// Every one at and before each token's position.
     Dense,
+    /// The ones each token's selector list names.
+    Selected,
 }
 
-/// The keys the chunk at `positions` attends, over the index rows `index`
-/// holds for them: every cached position while the chunk ends within
-/// `dense`, the positions the indexer keeps whole (the batch feed refuses a
-/// load past them). The selector's prompt rows go here: past `dense` a token
-/// selects its keys from these rows. Refused by name there.
-fn prompt_keys(
-    index: &DeviceTensor<u16>,
-    positions: Range<usize>,
-    dense: usize,
-) -> Result<Keys, GpuError> {
-    if positions.end <= dense && positions.end <= index.rows() {
-        return Ok(Keys::Dense);
+/// The keys the chunk at `positions` attends over index rows `rows`: every
+/// cached position while the chunk ends within `dense`, the positions the
+/// indexer keeps whole (the step's list there is every position, in order);
+/// the selector's lists past them. A chunk past the rows is refused by name.
+fn prompt_keys(rows: usize, positions: Range<usize>, dense: usize) -> Result<Keys, GpuError> {
+    if positions.end > rows {
+        return Err(shape(format!(
+            "a prompt chunk at positions {positions:?} past the {rows} index rows"
+        )));
     }
-    Err(shape(format!(
-        "a prompt chunk at positions {positions:?}: past the {dense} positions the indexer keeps \
-         whole a token selects its keys from the index rows, which the prompt batch does not run"
-    )))
+    Ok(if positions.end <= dense {
+        Keys::Dense
+    } else {
+        Keys::Selected
+    })
 }
 
 impl Body {
@@ -704,6 +715,7 @@ impl Body {
         for i in 0..t {
             let p = pos + i as u32;
             bufs.pos_host[i] = p;
+            bufs.cnt_host[i] = p + 1;
             bufs.vis_host[2 * i] = 0;
             bufs.vis_host[2 * i + 1] = p + 1;
         }
@@ -711,6 +723,7 @@ impl Body {
         span_mut(WHAT, &mut bufs.streams[0], 0, t * HC_STREAMS * n)?
             .copy_from_host(stream, &bufs.rows[..t * HC_STREAMS * n])?;
         span_mut(WHAT, &mut bufs.pos, 0, t)?.copy_from_host(stream, &bufs.pos_host[..t])?;
+        span_mut(WHAT, &mut bufs.cnt, 0, t)?.copy_from_host(stream, &bufs.cnt_host[..t])?;
         span_mut(WHAT, &mut bufs.vis, 0, 2 * t)?.copy_from_host(stream, &bufs.vis_host[..2 * t])?;
         *held = pos + t as u32;
         let cap = bufs.cap;
@@ -1100,8 +1113,9 @@ impl PromptProgram<'_> {
     /// Layer `l`'s latent mixer over the batch (`mla::mla`'s launches): the
     /// norm, the joined projection by its two row ranges and chunk, the
     /// query's norm, every token's latent and index rows appended at its
-    /// position, then chunk by chunk the heads, the attention over every
-    /// position at and before each token's, and the output projection.
+    /// position and the pools the tokens complete, then chunk by chunk the
+    /// heads, the selector past the dense positions ([`prompt_keys`]), the
+    /// attention and the output projection.
     fn mla(&mut self, l: usize) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill mla";
         let (gpu, w, t) = (self.gpu, self.w, self.t);
@@ -1114,7 +1128,7 @@ impl PromptProgram<'_> {
         let Some(Store::Latent {
             latent,
             index,
-            pooled: _,
+            pooled,
         }) = self.p.stores.get_mut(l)
         else {
             return Err(GpuError::State {
@@ -1199,8 +1213,12 @@ impl PromptProgram<'_> {
                 cache: index,
             },
         )?;
+        mla::pool(
+            stream, w, self.p.k, &nm.sel, index, &b.cnt, t, fault, pooled,
+        )?;
         let first = b.pos_host[0] as usize;
-        let Keys::Dense = prompt_keys(index, first..first + t, self.dense)?;
+        let rows = index.rows();
+        let kept = d.kept;
         let (qs_kb, d_kb) = q8(w, &nm.k_b)?;
         let (qs_vb, d_vb) = q8(w, &nm.v_b)?;
         // SAFETY: a view of no rows at the address of the layer's own latent
@@ -1230,6 +1248,34 @@ impl PromptProgram<'_> {
                         y: &mut b.qabs,
                     },
                 )?;
+                let keys = prompt_keys(rows, first + c0..first + c0 + c, self.dense)?;
+                if keys == Keys::Selected {
+                    let xn = span(W, &b.xn, c0 * n, c * n)?;
+                    let cnt = span(W, &b.cnt, c0, c)?;
+                    let mut vis = span_mut(W, &mut b.vis, 2 * c0, 2 * c)?;
+                    mla::select(
+                        gpu,
+                        w,
+                        self.p.k,
+                        &nm.sel,
+                        Select {
+                            stream,
+                            m: c,
+                            xn: &xn,
+                            qr: &qr,
+                            cnt: &cnt,
+                            index,
+                            pooled,
+                            qi: &mut b.qi,
+                            wi: &mut b.wi,
+                            scores: &mut b.scores,
+                            list: &mut b.list,
+                            vis: &mut vis,
+                            kept,
+                            fault,
+                        },
+                    )?;
+                }
                 let vis = span(W, &b.vis, 2 * c0, 2 * c)?;
                 self.p.k.attn.enqueue(
                     stream,
@@ -1237,7 +1283,10 @@ impl PromptProgram<'_> {
                         q: &b.qabs,
                         window: &window,
                         compressed: Some(&*latent),
-                        selected: None,
+                        selected: (keys == Keys::Selected).then_some(SelectedRows {
+                            rows: &b.list,
+                            stride: list_width(kept),
+                        }),
                         vis: &vis,
                         sinks: &s.sinks,
                         scale: 1.0 / (d.head_k as f32).sqrt(),
