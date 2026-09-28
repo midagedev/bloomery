@@ -1,0 +1,25 @@
+# The id-prefix placement's host union on real text, never measured: every prose row in rig-log since
+# 09-25 ran with the corpus hot list 384, and the hot list is retired as the default (the id prefix
+# keeps ids 0..69 on the card, uncorrelated with heat, so the hottest host experts carry m of 100-400
+# columns a layer-batch). The flow model (round streamdesign, rows lcg 189.7 / 350.8 against the
+# release's measured 190.6 / 358.4) predicts the prose union from the r8 law t(m) = max(W, a + c m),
+# fitted at m <= 15 (constants.tsv a_r8, c_r8): at m 100-400 it is a ~20x extrapolation. This one
+# reading closes that term and the router sets' concentration together, and it is the value the
+# prompt-call streaming design (callstream) is sized on. Arms: main's generate_ds41, no hot list,
+# `prose:512@BLOOMERY_STEP_STATS=1 prose:4096@BLOOMERY_STEP_STATS=1 code:512@BLOOMERY_STEP_STATS=1`
+# for the `stat prefill split` union_lb, and `prose:512 prose:4096` without stats for the pp rows.
+kind: calibration
+question: does the r8 union law hold at the hot host experts' column counts the id prefix leaves on the host
+term: union_lb ms a layer-batch @ prose prompt P 512 (`corpus-prose.ids`, the first 512), main binary,
+  A6000 plan (a), id prefix (no hot list), CED on, G 2, BLOOMERY_STEP_STATS=1
+unit: ms
+predict: 51..54
+condition: one lease through depth-ds41.sh, no other card work, no [cpu-busy] or [other-busy] on the row;
+  also read: host slots a layer-batch 2,529 [derived], pp512 174 [171..178] and pp4096 305 [299..313]
+  on the arms without stats
+decide-in: size callstream on the flow model as it stands (prose pp512 256 [238..258], pp4096 403
+  [375..407] with the stream pool)
+decide-below: the hot experts run under the law (the c m slope bends at large m): streaming's gain
+  shrinks; re-derive it before callstream opens, and re-read q8_K down against it
+decide-above: the union pays more at large m than the law says: streaming's gain grows; callstream first
+reason: the id prefix's host union on real text has no measured row, and the r8 law is extrapolated there
