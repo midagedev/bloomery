@@ -5,9 +5,11 @@
                                   [--rule mid|strata|knee] [--every N] [--link-gbps G]
                                   [--policies static,adaptive,lru,belady] [--json PATH]
     tools/ref/router-residency.py hit <family> [<set>...] --window N [--prompt P] [--open M|all
-                                  [--stage K]] [--seed <seed>] [--d D] [--copies K] [--json PATH]
+                                  [--stage K] [--open-from all|last:N]] [--seed <seed>] [--d D]
+                                  [--copies K] [--json PATH]
     tools/ref/router-residency.py gen <family> <trace> [--prompt P] [--window N] [--short skip] [--seed <seed>]
-                                  [--open M|all] [--stage K] [--d D] [--copies K] [--json PATH]
+                                  [--open M|all] [--stage K] [--open-from all|last:N] [--d D]
+                                  [--copies K] [--json PATH]
     tools/ref/router-residency.py fixture --out PATH [--passes N] [--lcg SEED]
     tools/ref/router-residency.py --self-test
 
@@ -44,9 +46,11 @@ hit      Without --window, the continuous replay over the eval half, one markdow
          flips a boundary, in flight not counted, planned before the landing, as window4). --open M
          adds the opening reshuffle before decode step 0: per layer the prompt's most-used
          non-resident experts against the least-used residents (whole-prompt counts, ties to the
-         seed's rank), kept while in > out, the M largest gains over all layers;
-         --stage 0 copies them inside the prompt call (live at step 0), --stage K from step 0 at K a
-         step. The rule then counts from the prompt's decayed counts. Prints the static arm and the
+         seed's rank), kept while in > out, the M largest gains over all layers; --open-from last:N
+         pairs by the counts of the prompt's last N positions only (the streaming design's opening:
+         the prompt call's last group leaves its pick on the card), `all` (the default) by the whole
+         prompt's; --stage 0 copies them inside the prompt call (live at step 0), --stage K from step 0
+         at K a step. The rule then counts from the whole prompt's decayed counts either way. Prints the static arm and the
          asked arm: hit, the mean of six 16-step blocks, swaps a token, opening swaps a request.
 gen      The router-gen replay: <trace> holds prompt + generation in one context per manifest
          `chunk`; positions [0, P) of each context are the prompt (--prompt P). A route trace with a
@@ -57,8 +61,8 @@ gen      The router-gen replay: <trace> holds prompt + generation in one context
          Over the window [P, P + N) of each context (N = --window, 96):
            (a) static    the seed's card set
            (b) adaptive  the rule from zero counts, reset to the seed at P
-           (c) open      the opening reshuffle over [0, P) (M = --open, the family's default), then
-                         the rule
+           (c) open      the opening reshuffle over [0, P) (M = --open, the family's default; by the
+                         last N of it under --open-from last:N), then the rule
          plus (a) over the whole generation [P, end) and the steady rule (continuous from the seed
          over every position of the trace, hit over [P, end) of each context), then the verdict
          line of adaptres §6: (c)-(a) >= 10 points -> R5 with R3; < 3 -> drop R5; steady < 70 % ->
@@ -591,9 +595,10 @@ def belady(X, seed, n_l):
 # --- the timed window and the opening reshuffle ---------------------------------------------------
 
 
-def opening(Xp, seed, n_l, E, M, rule):
+def opening(Xp, seed, n_l, E, M, rule, last=None):
     """The opening reshuffle over prompt Xp: (seed card set, the prompt's decayed counts, pairs
-    (gain, layer, in, out) largest gain first, at most M)."""
+    (gain, layer, in, out) largest gain first, at most M). last N: the pairs rank and gain by the counts of
+    the prompt's last N positions; the decayed counts stay the whole prompt's."""
     L = Xp.shape[1]
     ar = np.arange(L)[:, None]
     resident = np.zeros((L, E), dtype=bool)
@@ -604,8 +609,12 @@ def opening(Xp, seed, n_l, E, M, rule):
         prior[i, idx] = (E - np.arange(len(idx))) / (E + 1.0)  # < 1: breaks count ties by seed rank
     raw = np.zeros((L, E))
     dec = np.zeros((L, E))
+    if last is not None and not 1 <= last <= Xp.shape[0]:
+        raise ToolError(f"--open-from last:{last} on a prompt of {Xp.shape[0]} positions")
+    first = 0 if last is None else Xp.shape[0] - last
     for t in range(Xp.shape[0]):
-        raw[ar, Xp[t]] += 1.0
+        if t >= first:
+            raw[ar, Xp[t]] += 1.0
         dec[ar, Xp[t]] += 1.0
         if (t + 1) % rule.every == 0:
             dec *= rule.decay
@@ -622,7 +631,8 @@ def opening(Xp, seed, n_l, E, M, rule):
     return resident, dec, pairs[:M] if M is not None else pairs
 
 
-def window_arm(Xp, Xd, seed, n_l, E, rule, *, arm, M=None, stage=0, d=1, copies=COPIES, spares=1, per_pass=False):
+def window_arm(Xp, Xd, seed, n_l, E, rule, *, arm, M=None, stage=0, d=1, copies=COPIES, spares=1, per_pass=False,
+               last=None):
     """One timed request: (hits per decode step, rule swaps, opening swaps). arm: static, zero (the rule
     from zero counts) or open (the opening reshuffle, then the rule from the prompt's decayed counts)."""
     res0 = seed_resident(seed, n_l, E)
@@ -634,7 +644,7 @@ def window_arm(Xp, Xd, seed, n_l, E, rule, *, arm, M=None, stage=0, d=1, copies=
         return r.per_row, r.swaps, 0
     if arm != "open":
         raise ToolError(f"no window arm {arm!r}")
-    resident, dec, pairs = opening(Xp, seed, n_l, E, M, rule)
+    resident, dec, pairs = opening(Xp, seed, n_l, E, M, rule, last)
     L = Xd.shape[1]
     ar = np.arange(L)[:, None]
     res = resident.copy()
@@ -670,7 +680,8 @@ def window_arm(Xp, Xd, seed, n_l, E, rule, *, arm, M=None, stage=0, d=1, copies=
     return hits, sw, len(pairs)
 
 
-def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, copies=COPIES, spares=1, per_pass=False):
+def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, copies=COPIES, spares=1, per_pass=False,
+                    last=None):
     """X [T, L, K] cut into requests of P prompt then N decode tokens, each from the seed: the mean hit per
     decode step over the requests, its 16-step blocks, rule swaps a token, opening swaps a request."""
     R = P + N
@@ -681,7 +692,8 @@ def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, cop
     sw = op = 0
     for r in range(nreq):
         h, a, b = window_arm(X[r * R: r * R + P], X[r * R + P: (r + 1) * R], lists, n_l, E, rule,
-                             arm=arm, M=M, stage=stage, d=d, copies=copies, spares=spares, per_pass=per_pass)
+                             arm=arm, M=M, stage=stage, d=d, copies=copies, spares=spares, per_pass=per_pass,
+                             last=last)
         per += h
         sw += a
         op += b
@@ -694,7 +706,7 @@ def window_requests(X, P, N, lists, n_l, E, rule, arm, M=None, stage=0, d=1, cop
 
 
 def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spares=1, per_pass=False,
-               skipped=None):
+               skipped=None, last=None):
     """Per context (start, end) of X [T, L, K]: (a), (b), (c) over [start + P, start + P + N), (a) over
     [start + P, end); and the steady rule's hit over every [start + P, end). A context (start, end, p)
     carries its own P. A context shorter than P + N is refused by name, unless `skipped` is a list: then
@@ -712,7 +724,7 @@ def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spare
         a = window_arm(Xp, Xw, seed, n_l, E, rule, arm="static")[0].mean()
         kw = dict(d=d, copies=copies, spares=spares, per_pass=per_pass)
         b = window_arm(Xp, Xw, seed, n_l, E, rule, arm="zero", **kw)[0].mean()
-        ch, _, op = window_arm(Xp, Xw, seed, n_l, E, rule, arm="open", M=M, stage=stage, **kw)
+        ch, _, op = window_arm(Xp, Xw, seed, n_l, E, rule, arm="open", M=M, stage=stage, last=last, **kw)
         a_all = replay(X[t0 + P:t1], res0, n_l, E).per_row.mean()
         rows.append(dict(context=c, a=float(a), b=float(b), c=float(ch.mean()), open=op, a_all=float(a_all)))
     steady = replay(X, res0, n_l, E, rule, sem="flip", spares=spares, in_flight_cap=not per_pass, d=d,
@@ -977,12 +989,30 @@ def parse_open(text):
     return True, m
 
 
+def parse_open_from(text, P, what="the prompt's positions"):
+    """--open-from: None for `all` (the whole prompt), N for `last:N` with 1 <= N <= P."""
+    if text is None or text == "all":
+        return None
+    head, sep, n = text.partition(":")
+    try:
+        last = int(n) if head == "last" and sep else None
+    except ValueError:
+        last = None
+    if last is None:
+        raise ToolError(f"--open-from {text!r}: `all` or `last:N`")
+    if not 1 <= last <= P:
+        raise ToolError(f"--open-from {text}: N must be within 1..{P}, {what}")
+    return last
+
+
 def cmd_hit(a, out):
     F = family(a.family)
     if a.open is not None and a.window is None:
         raise ToolError("--open needs --window: the opening reshuffle is a timed-window replay")
     if a.stage is not None and a.open is None:
         raise ToolError("--stage needs --open")
+    if a.open_from is not None and a.open is None:
+        raise ToolError("--open-from needs --open")
     if a.window is None and a.prompt is not None:
         raise ToolError("--prompt needs --window (hit) — gen takes its own --prompt")
     names = a.sets or list(F["sets"])
@@ -993,9 +1023,11 @@ def cmd_hit(a, out):
             raise ToolError(f"--window {a.window}: at least 1")
         has_open, M = parse_open(a.open)
         P = 512 if a.prompt is None else a.prompt
+        last = parse_open_from(a.open_from, P)
         seedname = a.seed or "pooled"
         out.write(f"# router-residency hit --window: data={a.data} family={a.family} rule {rule.text()} flip {spares_text(a)} "
-                  f"d {a.d} copies/step {a.copies}\n")
+                  f"d {a.d} copies/step {a.copies}" + (f" open from the last {last} prompt positions" if last else "")
+                  + "\n")
         for n in names:
             s = Set(set_dir(a.data, n), a.family)
             n_l = n_cap(a.family, a.cap, s.E)
@@ -1005,8 +1037,10 @@ def cmd_hit(a, out):
                 r = dict(fam=a.family, set=s.name, seed=seedname, P=P, N=a.window, arm=arm,
                          M=M if arm == "open" else None, K=(a.stage or 0) if arm == "open" else None, d=a.d,
                          copies=a.copies)
+                if last is not None and arm == "open":
+                    r["open_from"] = f"last:{last}"
                 r.update(window_requests(X, P, a.window, lists, n_l, s.E, rule, arm, M, a.stage or 0, a.d, a.copies,
-                                         a.spares, a.spares_per_pass))
+                                         a.spares, a.spares_per_pass, last))
                 rows.append(r)
                 out.write(window_line(r) + "\n")
                 out.flush()
@@ -1080,6 +1114,10 @@ def cmd_gen(a, out):
     else:
         contexts = [(t0, min(t0 + s.chunk, s.T), a.prompt) for t0 in range(0, s.T, s.chunk)]
         shape = f"x {s.chunk} prompt={a.prompt}"
+    # bounded by the contexts that get window arms (--short skip drops the others before the opening runs)
+    armed = [p for t0, t1, p in contexts if t1 - t0 >= p + N] or [p for _, _, p in contexts]
+    last = parse_open_from(a.open_from, min(armed),
+                           "the prompt's positions" if requests is None else "the shortest prompt in contexts.tsv")
     if a.open is None:
         M = F["open_m"]
     else:
@@ -1098,14 +1136,15 @@ def cmd_gen(a, out):
     X = s.stack(F["eligible"])
     skipped = [] if a.short == "skip" else None
     rows, steady = gen_values(X, contexts, a.prompt, N, lists, n_l, s.E, rule, M, stage, a.d, a.copies, a.spares,
-                              a.spares_per_pass, skipped)
+                              a.spares_per_pass, skipped, last)
     if not rows:
         raise ToolError(f"every one of the {len(contexts)} contexts is shorter than its P + window {N}")
     kept = [contexts[r["context"]] for r in rows]
     out.write(f"# router-residency gen: data={a.data} trace={s.dir} family={a.family} tokens={s.T} contexts="
               f"{len(contexts)} {shape} window={N}\n")
     out.write(f"# seed {seedname}, n_l {min(n_l)}..{max(n_l)} on {len(n_l)} layers, rule {rule.text()}, flip {spares_text(a)}, "
-              f"d {a.d}, copies/step {a.copies}; open M={'all' if M is None else M} stage {stage}\n")
+              f"d {a.d}, copies/step {a.copies}; open M={'all' if M is None else M} stage {stage}"
+              + (f" from the last {last} prompt positions" if last else "") + "\n")
     if skipped is not None:
         lengths = ", ".join(f"{c}:{n}<{w}" for c, n, w in skipped) or "none"
         out.write(f"skipped {len(skipped)} of {len(contexts)} contexts shorter than P+N (lengths context:positions<P+N "
@@ -1127,6 +1166,8 @@ def cmd_gen(a, out):
     res = dict(contexts=rows, mean=mean, a_all=a_all, steady=steady, verdict=verdict(mean["a"], mean["c"], steady))
     if skipped is not None:
         res["skipped"] = [dict(context=c, positions=n, need=w) for c, n, w in skipped]
+    if last is not None:
+        res["open_from"] = f"last:{last}"
     return res
 
 
@@ -1203,6 +1244,7 @@ def parser():
         q.add_argument("--copies", type=int, default=COPIES)
         q.add_argument("--open")
         q.add_argument("--stage", type=int)
+        q.add_argument("--open-from")
         q.add_argument("--window", type=int)
         q.add_argument("--prompt", type=int)
         q.add_argument("--json")
@@ -1391,6 +1433,40 @@ def case_open():
     assert [(float(g), i, int(a), int(b)) for g, i, a, b in pairs] == [(2.0, 0, 3, 1), (2.0, 0, 4, 0)], pairs
 
 
+def case_open_last():
+    # case_open's prompt and seed, the pairs by the last 4 positions (1 x4): 1 (4 uses) goes in, and of the
+    # residents 0 and 4 (no use there) the worse seed rank, 4, leaves: gain 4. The whole prompt's pair was 3
+    # for 4. The decayed counts stay the whole prompt's. Decode 1 1 1 1 then hits every step (whole prompt: none).
+    rule = Rule("mid")
+    seed = [[0, 4, 1, 2, 3, 5]]
+    Xp = X_of([[(3,)]] * 5 + [[(0,)]] * 32 + [[(1,)]] * 4)
+    Xd = X_of([[(1,)]] * 4)
+    _, dec_all, _ = opening(Xp, seed, [2], 6, 1, rule)
+    _, dec, pairs = opening(Xp, seed, [2], 6, 1, rule, last=4)
+    assert [(float(g), i, int(a), int(b)) for g, i, a, b in pairs] == [(4.0, 0, 1, 4)], pairs
+    assert (dec == dec_all).all(), (dec, dec_all)
+    h, _, op = window_arm(Xp, Xd, seed, [2], 6, rule, arm="open", M=1, last=4)
+    assert h.tolist() == [1, 1, 1, 1] and op == 1, (h, op)
+    # a window past the prompt is refused, not read as the whole prompt
+    try:
+        opening(Xp, seed, [2], 6, 1, rule, last=Xp.shape[0] + 1)
+    except ToolError as e:
+        assert "on a prompt of 41 positions" in str(e), e
+    else:
+        raise AssertionError("--open-from past the prompt was taken")
+    # last:P is the whole prompt
+    assert opening(Xp, seed, [2], 6, 1, rule, last=Xp.shape[0])[2] == opening(Xp, seed, [2], 6, 1, rule)[2]
+    assert parse_open_from(None, 8) is None and parse_open_from("all", 8) is None and parse_open_from("last:8", 8) == 8
+    for bad, why in (("last:0", "within 1..8"), ("last:9", "within 1..8"), ("first:4", "`all` or `last:N`"),
+                     ("last:x", "`all` or `last:N`")):
+        try:
+            parse_open_from(bad, 8)
+        except ToolError as e:
+            assert why in str(e), (bad, e)
+        else:
+            raise AssertionError(f"--open-from {bad} was taken")
+
+
 def case_gen():
     # one context of 16: prompt 3 x8, generation 2 2 2 2 0 2 2 2 (the window, N 8). Seed card set {0}.
     # (a) static: step 4 only, 1/8. (b) from zero counts: 1/2 (case_window). (c) the opening puts 3 (8 uses)
@@ -1452,6 +1528,23 @@ def case_gen_contexts():
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             code = main(argv[:-2] + ["--prompt", "4"])
         assert code == 1 and "--prompt is refused beside it" in err.getvalue(), err.getvalue()
+        # --open-from is bounded by the shortest prompt in contexts.tsv (3), not by a --prompt it has none of
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = main(argv[:-2] + ["--open-from", "last:4"])
+        assert code == 1 and "within 1..3, the shortest prompt in contexts.tsv" in err.getvalue(), err.getvalue()
+        # last:3 reaches the opening of every context: the (c) arms are gen_values' with last 3, which on context
+        # 0 (prompt 4) differ from the whole prompt's
+        js3 = os.path.join(root, "gen3.json")
+        with redirect_stderr(io.StringIO()) as e3, redirect_stdout(io.StringIO()) as o3:
+            code = main(argv[:-2] + ["--open-from", "last:3", "--json", js3])
+        assert code == 0 and "from the last 3 prompt positions" in o3.getvalue(), e3.getvalue()
+        with open(js3, encoding="utf-8") as f:
+            got3 = json.load(f)
+        want3, _ = gen_values(s.stack(family("v41")["eligible"]), [(0, 10, 4), (10, 17, 3)], None, 2,
+                              seed_lists("v41", s, "prefix", root, n_l), n_l, 384, Rule("mid"),
+                              family("v41")["open_m"], 0, 1, COPIES, last=3)
+        assert got3["contexts"] == want3 and want3 != want and got3["open_from"] == "last:3", (got3, want3)
 
 
 def case_gen_short():
@@ -1502,6 +1595,14 @@ def case_gen_short():
                      link=Budget(COPIES)).per_row
         want = float(np.concatenate([per[t0 + p:t1] for t0, t1, p in spans]).mean())
         assert got["steady"] == want and got["skipped"] == [dict(context=1, positions=3, need=4)], got
+        # --open-from is bounded by the contexts that keep their arms: the skipped one's prompt 2 does not refuse
+        # last:3, which the two kept prompts (4 and 3) hold; last:4 is past the kept prompt 3
+        with redirect_stderr(io.StringIO()) as e3, redirect_stdout(io.StringIO()):
+            code = main(argv + ["--short", "skip", "--open-from", "last:3"])
+        assert code == 0, e3.getvalue()
+        with redirect_stderr(io.StringIO()) as e4, redirect_stdout(io.StringIO()):
+            code = main(argv + ["--short", "skip", "--open-from", "last:4"])
+        assert code == 1 and "within 1..3" in e4.getvalue(), e4.getvalue()
 
 
 def case_fixture():
@@ -1604,6 +1705,8 @@ def case_refusals():
             (["hit", "v41", "nosuch", "--data", root], "no router set 'nosuch'"),
             (["hit", "qwen9", "--data", root], "family 'qwen9' is not in the table"),
             (["hit", "v41", "prose", "--data", root, "--open", "400"], "--open needs --window"),
+            (["hit", "v41", "prose", "--data", root, "--window", "96", "--open-from", "last:512"],
+             "--open-from needs --open"),
             (["hit", "v41", d, "--data", root], "384 x top-6"),
             (["gen", "v41", d, "--data", root], "gen needs --prompt"),
         ]
@@ -1617,8 +1720,8 @@ def case_refusals():
 
 
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
-         case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open, case_gen,
-         case_gen_contexts, case_gen_short, case_fixture, case_refusals]
+         case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open,
+         case_open_last, case_gen, case_gen_contexts, case_gen_short, case_fixture, case_refusals]
 
 
 def self_test():

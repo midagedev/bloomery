@@ -3985,8 +3985,10 @@ def self_test() -> int:
     # check and lint compile both (--all-targets)
     lev = sel("tools/levers-direct.txt")
     expect(lev == {"gate-levers"}, f"tools/levers-direct.txt selects {sorted(lev)}")
+    # gate-gpu-ds41-flowcounts reads it through a script: ds41_prefill.py --counts parses the engine's log with
+    # records.py, which loads the schema (the scan reaches records.py by routes.py's chain of tools)
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl")
-    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind"}, f"a record schema selects {sorted(schema)}")
+    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 

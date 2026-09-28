@@ -62,7 +62,9 @@ plan of it (plans/, `generate_ds41 --plan` records).
     --stream           host streaming after B1 + T: the per-expert rules, pp by G and ring, the card bytes,
                        the timeline per layer of a group, the DRAM term and its variants
     --levers           today's flow (r8, G 2, no streaming) against its measured rows, and each lever re-derived against
-                       it: host streaming, q8_K down, B4 over its GEMM time, the batch-wide shadow, GT's block order
+                       it: host streaming, q8_K down, B4 over its GEMM time, the batch-wide shadow, GT's block order;
+                       per cell of the lcg prompt (hot list or not), the hot-list prose prompt, and the real texts at
+                       today's default placement, the id prefix: prose, code and korean (routes-idprefix.tsv)
     --counts LOG       a generate_ds41 run's queue-entry counter (BLOOMERY_STEP_STATS=1: `stat prefill front`,
                        `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch
 
@@ -83,6 +85,7 @@ import records  # noqa: E402 - the engine's record lines, read by kind and field
 
 CONSTANTS = os.path.join(HERE, "constants.tsv")
 PROSE_COUNTS = os.path.join(HERE, "prose-counts.tsv")
+ROUTES = os.path.join(HERE, "routes-idprefix.tsv")
 GPU_AB = os.path.join(HERE, "..", "gpu-ab.py")
 
 
@@ -162,10 +165,10 @@ def central(log=None):
 # ============================================================================ geometry
 
 # The engine's own plans of the prompt calls this model evaluates, as records (tools/bloomery/records.py):
-# `generate_ds41 --plan --depth P --place a` under BLOOMERY_CED=on and off, for P 128, 256, 384, 512 and 4096, in
-# plans/ (`just records-refresh` writes them). Each carries the call's batches and their chunks, the
-# triangle's needs, each layer-batch's starts and sub-blocks, the groups under every group lever, each
-# layer's facts and the sizes it cuts by — body/prefill.rs BodyLevers::call_plan, the functions the call's
+# `generate_ds41 --plan --depth P --place a` under BLOOMERY_CED=on and off, for the P values `just records-refresh`
+# lists, in plans/ (that recipe writes them; a P with no file there is refused by name). Each carries the call's
+# batches and their chunks, the triangle's needs, each layer-batch's starts and sub-blocks, the groups under every
+# group lever, each layer's facts and the sizes it cuts by — body/prefill.rs BodyLevers::call_plan, the functions the call's
 # enqueue runs by. Nothing below re-derives them; chunk_cuts and sub_blocks cut hypothetical blocks, and
 # the self-test holds them to every plan.
 PLANS = os.path.join(HERE, "plans")
@@ -519,14 +522,54 @@ def routing_prose(p, P=512):
     return Routing("prose", host, card, phi)
 
 
-def routing(p, name, hot=True, P=512):
+REAL_TEXTS = ("prose", "code", "korean")
+
+
+@lru_cache(maxsize=None)
+def _routes():
+    spec = importlib.util.spec_from_file_location("routes", os.path.join(HERE, "routes.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    try:
+        return mod.read(ROUTES)
+    except mod.RouteError as e:
+        raise SystemExit(f"ds41_prefill.py: {e}") from None
+
+
+def routing_idprefix(name, G):
+    """A real text (the router set `name`: prose, code, korean) at today's default placement, the id prefix
+    (no hot list), for groups of G batches (routes.py build writes routes-idprefix.tsv from the router sets): per
+    layer the host experts in the order a causal pick at the group's first route sees them and the card's
+    [0, n_l), each at its rank's mean columns per 512 positions over the set's windows of G x 512. The
+    lists are the set's own, so the card's share is its id prefix's (about n_l / 384), not a hot list's."""
+    table, n_l = _routes()
+    if (name, G) not in table:
+        raise SystemExit(f"ds41_prefill.py: {ROUTES} holds no {name} routing for groups of {G} batches "
+                         f"(groups {sorted(g for n, g in table if n == name) or 'none'}): tools/flow/routes.py build "
+                         f"--groups writes it")
+    nw, host, card = table[(name, G)]
+    if len(n_l) != L:
+        raise SystemExit(f"ds41_prefill.py: {ROUTES} places {len(n_l)} layers, the plans {L}")
+    per = float(nw * G)
+    return Routing(f"{name}-id-G{G}", [tuple((x / per, 1.0) for x in host[l]) for l in range(L)],
+                   [tuple((x / per, 1.0) for x in card[l] if x > 0) for l in range(L)])
+
+
+def routing(p, name, hot=True, P=512, G=1):
+    """The routing a prompt runs: lcg (with the hot list or at the id prefix); prose with the hot list (the
+    trace's curve, routing_prose); prose, code or korean at the id prefix (hot False: routing_idprefix, which
+    reads the list of the prompt's group of G batches); prose-in."""
     if name == "lcg":
         return routing_lcg(p, hot)
+    if name in REAL_TEXTS and not hot:
+        return routing_idprefix(name, G)
     if name == "prose":
         return routing_prose(p, P)
+    if name in REAL_TEXTS:
+        raise SystemExit(f"ds41_prefill.py: no {name} routing with the hot list; {name} runs at the id prefix (hot False)")
     if name == "prose-in":
         return routing_prose_trace(p)
-    raise SystemExit(f"ds41_prefill.py: no routing {name!r} (lcg, prose, prose-in)")
+    raise SystemExit(f"ds41_prefill.py: no routing {name!r} (lcg, prose, prose-in; code and korean without the hot list)")
 
 
 # ============================================================================ the host union
@@ -1777,7 +1820,12 @@ def evaluate(p, cfg, P, rname="lcg", anchors=None, kfix=None):
         cfg = dict(cfg, _tile_us=shadow_tile_us(p))
     if anchors.get("l2"):
         cfg = dict(cfg, _l2=anchors["l2"])
-    r = run_prompt(p, cfg, P, routing(p, rname, cfg.get("hot", True), P), U, kfix)
+    hot = cfg.get("hot", True)
+    if rname in REAL_TEXTS and not hot and cfg.get("pick", "static") != "static":
+        raise SystemExit(f"ds41_prefill.py: pick {cfg['pick']!r} on {rname} at the id prefix: its lists hold the causal "
+                         "(static) pick's order only")
+    G = min(resolve_cfg(cfg, P)["G"], batch_count(P, cfg.get("ced", True)))
+    r = run_prompt(p, cfg, P, routing(p, rname, hot, P, G), U, kfix)
     r["U"] = U
     return r
 
@@ -3012,7 +3060,9 @@ def stream_report():
 
 TODAY = dict(CONFIGS["REL"], hot=True)        # the r8 flow as it runs without STEP_STATS (no card marks)
 LEVER_CELLS = (("lcg", False, 512), ("lcg", False, 4096), ("lcg", True, 512), ("lcg", True, 4096),
-               ("prose", True, 512), ("prose", True, 4096))
+               ("prose", True, 512), ("prose", True, 4096),
+               ("prose", False, 512), ("prose", False, 4096), ("code", False, 512), ("code", False, 4096),
+               ("korean", False, 512), ("korean", False, 4096))
 
 
 def t_imma_tops(t_ms):
@@ -3041,7 +3091,7 @@ def lever_rows(p):
 def lever_cell(p, over, pov, rn, hot, P, duty_clock):
     cfg = dict(TODAY, hot=hot, **over)
     q = p.but(**pov) if pov else p
-    if rn == "prose":
+    if rn == "prose" and hot:               # the clock the hot-list prose prompt ran its card at
         cfg["_clk"] = p["clk_tile_prose"]
     r = evaluate(q, cfg, P, rn)
     if duty_clock:
@@ -3064,8 +3114,13 @@ def levers():
                                     "R8.p4096.prose.pp")))
     rows = lever_rows(p)
     base = {}
+    said = set()
     for rn, hot, P in LEVER_CELLS:
-        cell = f"{rn}{'' if rn == 'prose' else (' hot' if hot else ' no hot')} P {P}"
+        cell = f"{rn}{'' if rn == 'prose' and hot else (' hot' if hot else ' no hot')} P {P}"
+        if rn in REAL_TEXTS and not hot and rn not in said:
+            said.add(rn)
+            print(f"\n{rn} without the hot list: the router set's own windows at the id prefix (routes-idprefix.tsv),"
+                  " the central clock ('pp clk' moves it by the run's duty); no measured row")
         print(f"\n== {cell}")
         print(f"   {'lever':34} {'pp':>7} {'gain':>7} {'pp clk':>7} {'gain':>7} | per served lb (ms): {'host':>5} {'card':>5}"
               f" {'wall':>5} {'union':>5} {'route':>5} {'shadow':>6} {'wait':>5} {'enq':>5}  layers bound")
@@ -3433,6 +3488,33 @@ def self_test():
           f"launches {rw['acts_s']:.0f} < {rb['acts_s']:.0f}; shadow {rh['card_in']:.2f} (x0.5) < {rw['card_in']:.2f} (x1)"
           f" <= {rb['card_in']:.2f} (per chunk)")
     check("GT's (e, rho, t) order spills nothing", spill_us(p, {"_l2": "order"}, 1e5, 1e3) == 0.0)
+    table, n_l = _routes()
+    n0 = int(p["card_first_layer"])
+    per, extra = divmod(int(p["n_card_total"]), L - n0)
+    check("the id-prefix lists place plan (a)'s card: n_card_total spread over layers card_first_layer on, one more"
+          " a layer in ascending order", n_l == [0] * n0 + [per + (i < extra) for i in range(L - n0)],
+          f"{sum(n_l)}: {min(n_l[n0:])}..{max(n_l)} from layer {n0}")
+    bad, shares = [], []
+    for name, G in sorted(table):
+        rt = routing_idprefix(name, G)
+        for l in range(L):
+            tot = rt.host_slots_tok(l) + rt.card_slots_tok(l)
+            ranks = [lam for lam, _ in rt.card[l]]
+            if abs(tot - N_USED) > 1e-9 or rt.n_card(l) > n_l[l] or ranks != sorted(ranks, reverse=True) \
+                    or (l < n0 and rt.n_card(l)):
+                bad.append(f"{name} G{G} l{l} ({tot:.6f} slots)")
+        shares.append(sum(rt.card_slots_tok(l) for l in range(n0, L)) / (N_USED * (L - n0)))
+    idp = p["n_card_total"] / (L - n0) / N_EXPERT
+    check("the id-prefix routing: six slots a position on every layer, the card's list inside n_l and hottest first,"
+          " no card on layers 0-1, and the card's share of layers 2-39 within 0.02 of n_l / 384 (the prefix is"
+          " not a hot list)", not bad and all(abs(x - idp) < 0.02 for x in shares),
+          (", ".join(bad[:3]) or "") + f" shares {min(shares):.3f}..{max(shares):.3f} against {idp:.3f}")
+    try:
+        routing(p, "code", True)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("code and korean have no hot-list arm: asked for one, the routing is refused by name", refused)
     print(f"self-test: {len(fails)} failed")
     return fails
 
