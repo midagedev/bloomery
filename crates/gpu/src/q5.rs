@@ -1,13 +1,16 @@
 //! Q5_0 / Q5_1 gemv (package P2): the legacy 32-value block types against
 //! q8_1 activations quantized on the device. Cores live here outside this
 //! file's `#[cuda_module]` (docs/gpu-design.md decision 6), the module holds
-//! the activation quantizer and the two gemv wrappers, and the host side owns
-//! the load-time weight repack, the activation scratch and the enqueue API.
+//! the activation quantizers — every column, or the card's expert slots'
+//! columns alone (`q5_quantize_q8_sel`) — and the gemv wrappers, and the host
+//! side owns the load-time weight repack, the activation scratch and the
+//! enqueue API.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE, quad_finite};
 use crate::hybrid::HOST;
 use crate::launch_u32;
+use crate::q4k_sel::QuantSel;
 use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -422,6 +425,75 @@ mod q5_kernels {
         unsafe {
             q5_quant_group(
                 x, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8, fault,
+            )
+        }
+    }
+
+    /// [`q5_quantize_q8`] of the columns the card's expert slots read: one
+    /// warp per (column `c0 + j`, group of four blocks), `j < m_cols`, which
+    /// quantizes column `c0 + j` of `x` into the same column of the outputs
+    /// ([`q5_quant_group`], so a column's bytes are the plain quantizer's)
+    /// when its slot's place `sel[j]` is below `n_card`, the card's experts,
+    /// and returns before any load otherwise: a slot the host serves has no
+    /// activation here, and its column keeps what it held. A non-finite value
+    /// of a card column raises [`FaultSite::Q5Quant`] on `fault`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= (c0 + m_cols) * k_blocks * 32,
+            sel.len() >= m_cols,
+            q.len() >= (c0 + m_cols) * q_stride,
+            s8.len() >= (c0 + m_cols) * k_blocks,
+            d8.len() >= (c0 + m_cols) * k_blocks
+        )
+    )]
+    pub fn q5_quantize_q8_sel(
+        x: &[f32],
+        sel: &[u32],
+        c0: u32,
+        m_cols: u32,
+        n_card: u32,
+        n_groups: u32,
+        k_blocks: u32,
+        q_stride: u32,
+        mut q: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        if grp >= m_cols as usize * n_groups as usize {
+            return;
+        }
+        let (j, g) = (grp / n_groups as usize, grp % n_groups as usize);
+        // SAFETY: j < m_cols <= sel.len() by the launch contract. The 32 lanes
+        // share `grp`, hence `j`: the return is warp-uniform.
+        if unsafe { *sel.get_unchecked(j) } >= n_card {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: column c0 + j < c0 + m_cols and g < n_groups by the lines
+        // above; the launch contract bounds x, q, s8 and d8 at c0 + m_cols
+        // columns, and the group index is warp-uniform.
+        unsafe {
+            q5_quant_group(
+                x,
+                c0 as usize + j,
+                g,
+                k_blocks,
+                q_stride,
+                lane,
+                &mut q,
+                &mut s8,
+                &mut d8,
+                fault,
             )
         }
     }
@@ -1093,6 +1165,66 @@ impl Q5Kernels {
             n_groups,
             k_blocks,
             q_stride,
+            &mut act.q,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q5_kernels::q5_quantize_q8_sel`]: the 32-value q8_1 form of
+    /// the columns `q.cols` of `q.x` whose slot's place is on the card
+    /// ([`QuantSel`], the K-quant quantizer's selection), into the same
+    /// columns of `act`; every other column of `act` keeps what it held. The
+    /// input of a `_sel` down over the card's slots (`q5_1_gemv_sel`). One
+    /// launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_quantize_q8_sel(
+        &self,
+        stream: &CudaStream,
+        q: &QuantSel<'_>,
+        act: &mut Q8Blocks32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_quantize_q8_sel";
+        let (k, m) = (act.k(), q.cols.len());
+        if m == 0
+            || q.cols.end > act.m()
+            || q.x.len() < q.cols.end * k
+            || q.sel.len() < m
+            || q.n_card == 0
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "columns {:?} of {k} values from {} into {} columns, {} places, a card of \
+                     {} experts: the columns non-empty and inside both, a place a column, at \
+                     least one expert",
+                    q.cols,
+                    q.x.len(),
+                    act.m(),
+                    q.sel.len(),
+                    q.n_card
+                ),
+            ));
+        }
+        let (k_blocks, q_stride) = (k / 32, act.q_stride());
+        let n_groups = k_blocks.div_ceil(4);
+        let grid = launch_u32(what, "grid", m * n_groups)?;
+        let prep = self
+            .module
+            .prepare_q5_quantize_q8_sel(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.q5_quantize_q8_sel(
+            stream,
+            &prep,
+            q.x,
+            q.sel,
+            launch_u32(what, "c0", q.cols.start)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "n_card", q.n_card)?,
+            launch_u32(what, "n_groups", n_groups)?,
+            launch_u32(what, "k_blocks", k_blocks)?,
+            launch_u32(what, "q_stride", q_stride)?,
             &mut act.q,
             &mut act.s8,
             &mut act.d8,

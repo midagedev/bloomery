@@ -68,6 +68,23 @@
 //!    are `silu_mul` and `swiglu_clamp` at two limits on the sums of the same
 //!    rows, an id past the stack raises `ExpertId` and NaNs its rows, `HOST`
 //!    leaves them, a NaN column NaNs every row.
+//! 10. q38_card: Qwen3.8's card leg over two tokens of ten slots, seven card
+//!     experts, three slots the host serves (their gate·up rows poisoned NaN):
+//!     the Q4_K gate·up `_sel` (640 × 2560, a column a token), the card
+//!     columns' 32-value q8_1 (`q5_quantize_q8_sel`), the Q5_1 down `_sel`
+//!     (2560 × 640), the card sum (`q38_card_acc`) and the combine with the
+//!     host's sum and the gated shared expert (`q38_card_shared_add`). The
+//!     quantizer's card columns are the plain quantizer's bytes of the same
+//!     columns, its host columns keep a pattern written before it, and it
+//!     raises nothing on their NaNs; the sum is `runtime::combine::card_sum`
+//!     of the ten slots at the router's pitch of eleven, each token its own
+//!     weights, and the combine `(hsum + sum) + sh · w[10]` (host, card,
+//!     shared: `runtime::combine::combine`), bit for bit, no fault. The five
+//!     launches captured replay as five nodes and follow places overwritten
+//!     between replays, the host slots moved. A NaN in a card column raises
+//!     `Q5Quant`, a NaN card sum `F32Product` from the combine; the launchers
+//!     refuse a card of no expert, weights at a pitch of ten, columns past the
+//!     scratch and a slot past the weights.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -88,8 +105,10 @@ mod gate {
     use bloomery_gpu::kquant::{
         Act, GateUpAct, KquantKernels, Q4k, Q5k, Q8_0, SbDecode, SelDown, act, walk_a_planes,
     };
+    use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
+    use bloomery_gpu::q38::{CardAccArgs, CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
     use bloomery_gpu::{
         DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_sums,
     };
@@ -856,6 +875,7 @@ mod gate {
         ok &= check_q5_1(&c)?;
         ok &= check_q8_0(&c)?;
         ok &= check_q4k_gate_up(&c)?;
+        ok &= check_q38_card(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -873,7 +893,10 @@ mod gate {
              FFN among them) with their probe decoding as the host, their gate·up the rule on \
              their down's sums, their faults as Q5_K's, and each launcher refusing the other \
              format's rows; the Q4_K gate·up the rule on Walk A's Q4_K sums, its faults as \
-             Q5_K's"
+             Q5_K's; Qwen3.8's card leg over two tokens: the card columns' q8_1 the plain \
+             quantizer's, the host columns untouched, the card sum and the combine the \
+             runtime's rule bit for bit, five nodes replaying moved places, q5_quant and \
+             f32_product named, the launchers' refusals"
         );
         Ok(())
     }
@@ -1917,6 +1940,413 @@ mod gate {
             };
             println!(
                 "q8_0_host[{what}:{case}] want=Err(Shape {what}) got={seen} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        stream.synchronize()?;
+        Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
+    /// Clause 10's card experts: Qwen3.8's shapes, [`E51`] experts a stack.
+    const E38: usize = E51;
+    /// Clause 10's tokens.
+    const M38: usize = 2;
+    /// Clause 10's hidden width and routed expert width.
+    const N38: usize = 2560;
+    const FF38: usize = 640;
+    /// Clause 10's places, ten a token: token 0 [`SEL51`], token 1 two host
+    /// slots and a repeat.
+    const SEL38: [u32; 20] = [
+        6, 0, 3, 3, HOST, 1, 6, 2, 5, 4, //
+        1, HOST, 5, 0, HOST, 2, 4, 6, 3, 3,
+    ];
+    /// The places the graph replays after its capture: the host slots moved.
+    const SEL38_B: [u32; 20] = [
+        HOST, 0, 3, 5, 1, 1, 6, HOST, 5, 4, //
+        1, 2, 5, 0, 4, 2, HOST, 6, 3, HOST,
+    ];
+
+    /// The router's weights of clause 10's tokens: each token's own ten, then
+    /// its shared expert's gate, none two alike across the tokens.
+    fn weights38() -> Vec<f32> {
+        (0..M38 * W_PITCH)
+            .map(|i| {
+                let (t, j) = (i / W_PITCH, i % W_PITCH);
+                if j == SLOTS {
+                    [0.71, 0.23][t]
+                } else {
+                    0.013 * (j + 1) as f32 + 0.37 * t as f32 + 0.001
+                }
+            })
+            .collect()
+    }
+
+    /// Clause 10's buffers: the stacks, the tokens' q8_1 columns, the places
+    /// and weights, and every launch's output.
+    struct Leg38 {
+        q38: Q38Kernels,
+        gate: Stack,
+        up: Stack,
+        down: Stack51,
+        act_x: Q8Act,
+        sel: DeviceBuffer<u32>,
+        w: DeviceBuffer<f32>,
+        hsum: DeviceBuffer<f32>,
+        sh: DeviceBuffer<f32>,
+        h: DeviceBuffer<f32>,
+        act_h: Q8Blocks32,
+        y_down: DeviceBuffer<f32>,
+        acc: DeviceBuffer<f32>,
+        y: DeviceBuffer<f32>,
+    }
+
+    impl Leg38 {
+        fn new(c: &Ctx) -> Result<Leg38, GateError> {
+            let stream = c.gpu.stream();
+            let slots = SEL38.len();
+            let x = activations(N38, M38, 9101);
+            Ok(Leg38 {
+                q38: Q38Kernels::load(c.gpu.context())?,
+                gate: Stack::with_experts(c, "q38_gate", GgmlType::Q4_K, E38, FF38, N38, 0x38a1)?,
+                up: Stack::with_experts(c, "q38_up", GgmlType::Q4_K, E38, FF38, N38, 0x38a2)?,
+                down: Stack51::new(c, N38, FF38, 0x38a3)?,
+                act_x: quantize(c, &x, M38, N38)?,
+                sel: DeviceBuffer::from_host(stream, &SEL38)?,
+                w: DeviceBuffer::from_host(stream, &weights38())?,
+                hsum: DeviceBuffer::from_host(stream, &activations(N38, M38, 9102))?,
+                sh: DeviceBuffer::from_host(stream, &activations(N38, M38, 9103))?,
+                h: DeviceBuffer::from_host(stream, &vec![f32::NAN; slots * FF38])?,
+                act_h: Q8Blocks32::with_slots(stream, FF38, slots)?,
+                y_down: DeviceBuffer::from_host(stream, &vec![f32::NAN; slots * N38])?,
+                acc: DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?,
+                y: DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?,
+            })
+        }
+
+        /// The leg's five launches on `s`, in the step's order.
+        fn enqueue(&mut self, c: &Ctx, s: &cuda_core::CudaStream) -> Result<(), GpuError> {
+            let slots = SEL38.len();
+            let sink = c.gpu.unlabelled_sink();
+            let a = GateUpAct {
+                wg: &self.gate.w,
+                wu: &self.up.w,
+                act: &self.act_x,
+                sel: &self.sel,
+                n_slots: slots,
+                rows_per_expert: FF38,
+                slots_per_col: SLOTS,
+                rule: Act::SiluMul,
+            };
+            c.kq.enqueue_gate_up_q4k(s, &a, sink, &mut self.h)?;
+            let q = QuantSel {
+                x: &self.h,
+                cols: 0..slots,
+                sel: &self.sel,
+                n_card: E38,
+            };
+            c.gpu
+                .q5()
+                .enqueue_quantize_q8_sel(s, &q, &mut self.act_h, sink)?;
+            let d = Q51SelDown {
+                w: &self.down.w,
+                act: &self.act_h,
+                sel: &self.sel,
+                n_slots: slots,
+                rows_per_expert: N38,
+            };
+            c.q51.enqueue_gemv_q5_1_sel(s, &d, sink, &mut self.y_down)?;
+            self.q38.enqueue_card_acc(
+                s,
+                CardAccArgs {
+                    down: &self.y_down,
+                    w: &self.w,
+                    sel: &self.sel,
+                    n: N38,
+                    m: M38,
+                    n_card: E38,
+                    acc: &mut self.acc,
+                },
+            )?;
+            self.q38.enqueue_card_shared_add(
+                s,
+                CardSharedAddArgs {
+                    hsum: &self.hsum,
+                    acc: &self.acc,
+                    sh: &self.sh,
+                    w: &self.w,
+                    slot: SLOTS,
+                    slots: W_PITCH,
+                    n: N38,
+                    m: M38,
+                    fault: sink,
+                    y: &mut self.y,
+                },
+            )
+        }
+
+        /// The runtime's rule on the leg's own down outputs for places `sel`:
+        /// each value's card sum and its combine. A host slot's down value is
+        /// NaN here, so reading it would show.
+        fn host_rule(&self, c: &Ctx, sel: &[u32; 20]) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+            let stream = c.gpu.stream();
+            let down = self.y_down.to_host_vec(stream)?;
+            let w = weights38();
+            let (hsum, sh) = (self.hsum.to_host_vec(stream)?, self.sh.to_host_vec(stream)?);
+            let (mut acc, mut y) = (vec![0.0f32; M38 * N38], vec![0.0f32; M38 * N38]);
+            for t in 0..M38 {
+                let card: [bool; SLOTS] =
+                    std::array::from_fn(|j| (sel[t * SLOTS + j] as usize) < E38);
+                let wv: [f32; SLOTS] = std::array::from_fn(|j| w[t * W_PITCH + j]);
+                for d in 0..N38 {
+                    let dv: [f32; SLOTS] = std::array::from_fn(|j| {
+                        if card[j] {
+                            down[(t * SLOTS + j) * N38 + d]
+                        } else {
+                            f32::NAN
+                        }
+                    });
+                    let i = t * N38 + d;
+                    acc[i] = runtime::combine::card_sum(dv, wv, card);
+                    let shexp = sh[i] * w[t * W_PITCH + SLOTS];
+                    y[i] = runtime::combine::combine(dv, wv, card, hsum[i], shexp);
+                }
+            }
+            Ok((acc, y))
+        }
+    }
+
+    /// One column of a q8_1 scratch read back: its code words, block sums and
+    /// scales' bits.
+    fn column38(x: &bloomery_gpu::q5::Q8Blocks32Host, s: usize) -> (Vec<u32>, Vec<i32>, Vec<u32>) {
+        let (kb, slots) = (FF38 / 32, SEL38.len());
+        let qs = x.q.len() / slots;
+        (
+            x.q[s * qs..(s + 1) * qs].to_vec(),
+            x.s8[s * kb..(s + 1) * kb].to_vec(),
+            x.d8[s * kb..(s + 1) * kb]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+        )
+    }
+
+    /// Clause 10 (module doc).
+    fn check_q38_card(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let slots = SEL38.len();
+        let mut leg = Leg38::new(c)?;
+        let mut ok = true;
+        // The pattern: every column of the q8_1 scratch the plain quantizer's
+        // bytes of 3.0, which no column of the gate·up's output is.
+        let pattern = DeviceBuffer::from_host(stream, &vec![3.0f32; slots * FF38])?;
+        c.gpu
+            .q5()
+            .enqueue_quantize_q8(stream, &pattern, &mut leg.act_h, sink)?;
+        stream.synchronize()?;
+        let before = leg.act_h.readback(stream)?;
+        leg.enqueue(c, stream)?;
+        stream.synchronize()?;
+        let fault = c.gpu.take_fault()?;
+        let after = leg.act_h.readback(stream)?;
+        // The plain quantizer over the same columns, the host ones zeroed.
+        let mut h = leg.h.to_host_vec(stream)?;
+        let host_slots: Vec<usize> = (0..slots).filter(|&s| SEL38[s] == HOST).collect();
+        let host_nan = host_slots
+            .iter()
+            .all(|&s| h[s * FF38..(s + 1) * FF38].iter().all(|v| v.is_nan()));
+        for &s in &host_slots {
+            h[s * FF38..(s + 1) * FF38].fill(0.0);
+        }
+        let (plain, _) = quantize51(c, &h, slots, FF38)?;
+        let want = plain.readback(stream)?;
+        let card_cols = (0..slots)
+            .filter(|s| !host_slots.contains(s))
+            .all(|s| column38(&after, s) == column38(&want, s));
+        let host_cols = host_slots
+            .iter()
+            .all(|&s| column38(&after, s) == column38(&before, s));
+        let (acc_ref, y_ref) = leg.host_rule(c, &SEL38)?;
+        let acc = leg.acc.to_host_vec(stream)?;
+        let y = leg.y.to_host_vec(stream)?;
+        let (acc_same, y_same) = (bits_equal(&acc, &acc_ref), bits_equal(&y, &y_ref));
+        let pass = fault.is_none() && host_nan && card_cols && host_cols && acc_same && y_same;
+        ok &= pass;
+        println!(
+            "q38_card[{M38} tokens x {SLOTS} slots, {E38} card experts, host slots \
+             {host_slots:?}] host_rows_poisoned={host_nan} \
+             quantize_sel_card_columns_are_plain={card_cols} host_columns_untouched={host_cols} \
+             card_sum_is_runtime_card_sum={acc_same} combine_is_runtime_combine={y_same} \
+             max_ulps_sum={} max_ulps_combine={} fault=\"{}\" {}{}{}",
+            max_ulps(&acc, &acc_ref),
+            max_ulps(&y, &y_ref),
+            shown(fault),
+            verdict(pass),
+            mismatch("first_mismatch_sum", &acc, &acc_ref, N38),
+            mismatch("first_mismatch_combine", &y, &y_ref, N38),
+        );
+        // The graph: the five launches captured with SEL38, replayed, then the
+        // places overwritten outside it and replayed again.
+        let graph = c.gpu.capture(|s| leg.enqueue(c, s))?;
+        let nodes = graph.node_count();
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let ya = leg.y.to_host_vec(stream)?;
+        leg.sel.copy_from_host(stream, &SEL38_B)?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let yb = leg.y.to_host_vec(stream)?;
+        let (_, yb_ref) = leg.host_rule(c, &SEL38_B)?;
+        drop(graph);
+        let (a_same, b_same) = (bits_equal(&ya, &y_ref), bits_equal(&yb, &yb_ref));
+        let pass = a_same && b_same && nodes == 5 && c.gpu.take_fault()?.is_none();
+        ok &= pass;
+        println!(
+            "q38_card_graph replay_a_bit_identical={a_same} \
+             replay_b_moved_places_is_the_rule={b_same} graph_nodes={nodes} (want 5) {}{}{}",
+            verdict(pass),
+            mismatch("first_mismatch_a", &ya, &y_ref, N38),
+            mismatch("first_mismatch_b", &yb, &yb_ref, N38),
+        );
+        leg.sel.copy_from_host(stream, &SEL38)?;
+        // A NaN in card column 0 (slot 0 is expert 6): the `_sel` quantizer raises.
+        let q5_quant = Some(Fault::at(LAYER_NONE, FaultSite::Q5Quant));
+        let mut hn = h.clone();
+        hn[77] = f32::NAN;
+        let hn = DeviceBuffer::from_host(stream, &hn)?;
+        let q = QuantSel {
+            x: &hn,
+            cols: 0..slots,
+            sel: &leg.sel,
+            n_card: E38,
+        };
+        c.gpu
+            .q5()
+            .enqueue_quantize_q8_sel(stream, &q, &mut leg.act_h, sink)?;
+        stream.synchronize()?;
+        let qf = c.gpu.take_fault()?;
+        // A NaN card sum: the combine raises.
+        let f32_product = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let mut an = acc.clone();
+        an[N38 + 5] = f32::NAN;
+        let an = DeviceBuffer::from_host(stream, &an)?;
+        leg.q38.enqueue_card_shared_add(
+            stream,
+            CardSharedAddArgs {
+                hsum: &leg.hsum,
+                acc: &an,
+                sh: &leg.sh,
+                w: &leg.w,
+                slot: SLOTS,
+                slots: W_PITCH,
+                n: N38,
+                m: M38,
+                fault: sink,
+                y: &mut leg.y,
+            },
+        )?;
+        stream.synchronize()?;
+        let cf = c.gpu.take_fault()?;
+        let pass = qf == q5_quant && cf == f32_product;
+        ok &= pass;
+        println!(
+            "q38_card_fault quantize_sel_nan_card_column=\"{}\" (want \"{}\") \
+             combine_nan_sum=\"{}\" (want \"{}\") {}",
+            shown(qf),
+            shown(q5_quant),
+            shown(cf),
+            shown(f32_product),
+            verdict(pass)
+        );
+        ok &= check_q38_card_host_contract(c, &mut leg)?;
+        Ok(ok)
+    }
+
+    /// Clause 10's refusals: each a `Shape` error of its launcher.
+    fn check_q38_card_host_contract(c: &Ctx, leg: &mut Leg38) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let slots = SEL38.len();
+        let w10 = DeviceBuffer::from_host(stream, &[0.5f32; M38 * SLOTS])?;
+        let mut r_acc = Vec::with_capacity(2);
+        for (w, n_card) in [(&leg.w, 0), (&w10, E38)] {
+            r_acc.push(leg.q38.enqueue_card_acc(
+                stream,
+                CardAccArgs {
+                    down: &leg.y_down,
+                    w,
+                    sel: &leg.sel,
+                    n: N38,
+                    m: M38,
+                    n_card,
+                    acc: &mut leg.acc,
+                },
+            ));
+        }
+        let mut r_quant = Vec::with_capacity(2);
+        for (cols, n_card) in [(0..slots, 0), (1..slots + 1, E38)] {
+            let q = QuantSel {
+                x: &leg.h,
+                cols,
+                sel: &leg.sel,
+                n_card,
+            };
+            r_quant.push(
+                c.gpu
+                    .q5()
+                    .enqueue_quantize_q8_sel(stream, &q, &mut leg.act_h, sink),
+            );
+        }
+        let r_slot = leg.q38.enqueue_card_shared_add(
+            stream,
+            CardSharedAddArgs {
+                hsum: &leg.hsum,
+                acc: &leg.acc,
+                sh: &leg.sh,
+                w: &leg.w,
+                slot: W_PITCH,
+                slots: W_PITCH,
+                n: N38,
+                m: M38,
+                fault: sink,
+                y: &mut leg.y,
+            },
+        );
+        let [r_card0, r_pitch10]: [Result<(), GpuError>; 2] = r_acc
+            .try_into()
+            .map_err(|_| "gate_kquant: two card-sum cases")?;
+        let [r_quant_card0, r_quant_past]: [Result<(), GpuError>; 2] = r_quant
+            .try_into()
+            .map_err(|_| "gate_kquant: two quantizer cases")?;
+        let cases: [(&str, &str, Result<(), GpuError>); 5] = [
+            ("q38::enqueue_card_acc", "a_card_of_no_expert", r_card0),
+            (
+                "q38::enqueue_card_acc",
+                "weights_at_a_pitch_of_10",
+                r_pitch10,
+            ),
+            (
+                "enqueue_quantize_q8_sel",
+                "a_card_of_no_expert",
+                r_quant_card0,
+            ),
+            (
+                "enqueue_quantize_q8_sel",
+                "columns_past_the_scratch",
+                r_quant_past,
+            ),
+            ("q38::enqueue_card_shared_add", "slot_11_of_11", r_slot),
+        ];
+        let mut ok = true;
+        for (what, case, r) in cases {
+            let pass = matches!(&r, Err(GpuError::Shape { what: w, .. }) if *w == what);
+            let seen = match &r {
+                Ok(()) => "Ok (accepted)".to_string(),
+                Err(e) => format!("Err: {e}"),
+            };
+            println!(
+                "q38_card_host[{case}] want=Err(Shape {what}) got={seen} {}",
                 verdict(pass)
             );
             ok &= pass;

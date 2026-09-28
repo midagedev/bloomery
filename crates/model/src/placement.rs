@@ -217,11 +217,15 @@ pub enum Device {
 /// upload by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CardFormat {
-    /// q3_K/q4_K/q5_K/q6_K: the rows' byte stream as u32 words, zero-padded at
-    /// its end to `rows · ceil(words / rows)` words. The kernels address a
-    /// row by its byte offset in the stream, so a row need not start on a
-    /// word (q6_K at k = 768 is 630 bytes); the padding only makes the
-    /// buffer a whole number of words per row.
+    /// The file's rows as they are stored, their byte stream as u32 words,
+    /// zero-padded at its end to `rows · ceil(words / rows)` words: every
+    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1 stack a program's card
+    /// experts read in the file's `block_q5_1` bytes (a program's
+    /// [`RoutedFormat`] names it; [`CardFormat::of`] keeps q5_1 in
+    /// [`CardFormat::Q5_1`]). The kernels address a row by its byte offset in
+    /// the stream, so a row need not start on a word (q6_K at k = 768 is 630
+    /// bytes); the padding only makes the buffer a whole number of words per
+    /// row.
     KQuant,
     /// q5_0 in the gemv's layout: per row one byte per 5-bit code in 1024-value
     /// windows, then one f32 scale per 32-value block.
@@ -343,10 +347,12 @@ impl CardFormat {
         }
     }
 
-    /// The format an expert stack of type `ty` loads in on a card: the
-    /// formats a card expert kernel reads — [`CardFormat::of`] less q5_K,
-    /// which only a dense gemv reads. A stack of a type with none stays on
-    /// the host.
+    /// The format an expert stack of type `ty` loads in on a card under the
+    /// default expert rule ([`plan_with`]): [`CardFormat::of`] less q5_K,
+    /// which this rule does not admit. A card expert kernel does read q5_K
+    /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), and the program that runs
+    /// them names q5_K in its own [`RoutedFormat`] (glm5next's
+    /// `card_routed`). A stack of a type with none stays on the host.
     #[must_use]
     pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
         CardFormat::of(ty).filter(|_| ty != GgmlType::Q5_K)
@@ -354,14 +360,16 @@ impl CardFormat {
 
     /// A file tensor of type `ty` can be laid out in this format: the
     /// format [`CardFormat::of`] names for `ty`, [`CardFormat::Bf16AsF32`] for
-    /// a K-quant ([`CardFormat::of_role`]'s engram gain), or
+    /// a K-quant ([`CardFormat::of_role`]'s engram gain),
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
-    /// uses.
+    /// uses, or [`CardFormat::KQuant`] for q5_1, the file's blocks, which
+    /// only a program's [`RoutedFormat`] picks.
     #[must_use]
     pub fn holds(self, ty: GgmlType) -> bool {
         CardFormat::of(ty) == Some(self)
             || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
             || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
+            || (self == CardFormat::KQuant && ty == GgmlType::Q5_1)
     }
 
     /// Device bytes of `rows` rows of `k` values of file type `ty` in this
@@ -1046,14 +1054,27 @@ fn card_heaps(model: &ModelTensors, cards: &[&Card], rows: &[Row]) -> (Vec<Heap>
     (heaps, bad)
 }
 
-/// A card segment of `rows` rows of `t` — all of it, or an expert slice.
+/// A card segment of `rows` rows of `t` — all of it, or an expert slice —
+/// in the format its role gives its type ([`CardFormat::of_role`]).
 fn card_segment(
     t: &ModelTensor,
     card: usize,
     rows: u64,
     experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
-    let Some(format) = CardFormat::of_role(t.ty, t.role) else {
+    card_segment_as(t, card, rows, experts, CardFormat::of_role(t.ty, t.role))
+}
+
+/// [`card_segment`] in `format`; `None` is the refusal of a tensor no card
+/// format loads.
+fn card_segment_as(
+    t: &ModelTensor,
+    card: usize,
+    rows: u64,
+    experts: Option<ExpertList>,
+    format: Option<CardFormat>,
+) -> Result<Segment, PlacementError> {
+    let Some(format) = format else {
         return Err(PlacementError::NoCardFormat {
             name: t.name.clone(),
             ty: t.ty,
@@ -1194,6 +1215,27 @@ pub fn routed_row_on(
     on_cards: Vec<(usize, ExpertList)>,
     model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
+    routed_row_on_as(
+        i,
+        t,
+        stage,
+        on_cards,
+        model,
+        CardFormat::of_role(t.ty, t.role),
+    )
+}
+
+/// [`routed_row_on`] with the card segments in `format`: the expert rule's
+/// rows, in the format the plan's [`RoutedFormat`] counted them in. `None`
+/// is refused only when a list of `on_cards` holds an expert.
+fn routed_row_on_as(
+    i: usize,
+    t: &ModelTensor,
+    stage: usize,
+    on_cards: Vec<(usize, ExpertList)>,
+    model: &ModelTensors,
+    format: Option<CardFormat>,
+) -> Result<Row, PlacementError> {
     let (rows_per_expert, file_per_expert) = per_expert(t, model.experts)?;
     let mut owner: Vec<(u32, usize)> = on_cards
         .iter()
@@ -1214,7 +1256,7 @@ pub fn routed_row_on(
     for (card, list) in on_cards {
         if !list.is_empty() {
             let rows = list.len() * rows_per_expert;
-            segments.push(card_segment(t, card, rows, Some(list))?);
+            segments.push(card_segment_as(t, card, rows, Some(list), format)?);
         }
     }
     if !host.is_empty() {
@@ -1452,6 +1494,7 @@ pub fn plan_with<'a>(
         hot,
         card_budget,
         Some(CardFormat::of_routed),
+        0,
     )
 }
 
@@ -1475,6 +1518,34 @@ pub fn plan_routed<'a>(
         levers.hot.as_ref(),
         levers.card_budget_bytes,
         Some(routed),
+        0,
+    )
+}
+
+/// [`plan_routed`] with `reserve` bytes of every card kept for what the
+/// caller plans beside this plan on the same card — an MTP draft's granules
+/// and store: the expert rule spreads within the card's budget less
+/// `reserve`, and nothing else sees it. The plan's usable bytes, card budget,
+/// headroom and violations are its own; the caller checks the card's bound
+/// on the sum.
+pub fn plan_routed_reserving<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    levers: &PlanLevers,
+    routed: RoutedFormat,
+    reserve: u64,
+) -> Result<Plan<'a>, PlacementError> {
+    plan_rule(
+        model,
+        machine,
+        ctx_max,
+        kv,
+        levers.hot.as_ref(),
+        levers.card_budget_bytes,
+        Some(routed),
+        reserve,
     )
 }
 
@@ -1504,11 +1575,18 @@ pub fn plan_host_routed<'a>(
         None,
         levers.card_budget_bytes,
         None,
+        0,
     )
 }
 
 /// [`plan_with`], the expert rule run on each card's layers eligible under
-/// `routed`, and on none without it.
+/// `routed`, and on none without it, within each card's budget less
+/// `reserve` ([`plan_routed_reserving`]); the routed stacks' card segments
+/// in the format `routed` gives them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the planners' one body: the model, machine, context and cache, and the rule's four inputs"
+)]
 fn plan_rule<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1517,6 +1595,7 @@ fn plan_rule<'a>(
     hot: Option<&HotList>,
     card_budget: Option<u64>,
     routed: Option<RoutedFormat>,
+    reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
     if let Some(h) = hot {
         h.check_model(model)?;
@@ -1553,6 +1632,7 @@ fn plan_rule<'a>(
             routed,
             card_budget,
             kv: kv_card,
+            reserve,
         };
         fill.run(&mut n_l, &none_held)?;
         kv_bytes.push((kv_card, shadow));
@@ -1577,6 +1657,7 @@ fn plan_rule<'a>(
             routed,
             card_budget,
             kv: kv_tier,
+            reserve,
         };
         let mut own = vec![0u64; model.layers];
         fill.run(&mut own, &held)?;
@@ -1598,7 +1679,14 @@ fn plan_rule<'a>(
         }
         for &i in layer_stacks {
             let t = &model.tensors[i];
-            rows[i] = Some(routed_row_on(i, t, stage, lists.clone(), model)?);
+            rows[i] = Some(routed_row_on_as(
+                i,
+                t,
+                stage,
+                lists.clone(),
+                model,
+                routed.and_then(|f| f(t.ty)),
+            )?);
         }
     }
     let rows: Vec<Row> = rows.into_iter().flatten().collect();
@@ -1664,7 +1752,7 @@ fn check_tiers(tiers: &[Card]) -> Result<(), PlacementError> {
 }
 
 /// One card's expert rule: card `c` of [`Machine::all_cards`], its budget
-/// usable − KV − set-aside − margin, its uploads over `eligible`.
+/// usable − KV − set-aside − margin − `reserve`, its uploads over `eligible`.
 struct Fill<'m, 'r> {
     model: &'m ModelTensors,
     card: &'m Card,
@@ -1674,6 +1762,9 @@ struct Fill<'m, 'r> {
     routed: Option<RoutedFormat>,
     card_budget: Option<u64>,
     kv: u64,
+    /// What the caller plans beside this plan on the card
+    /// ([`plan_routed_reserving`]).
+    reserve: u64,
 }
 
 impl Fill<'_, '_> {
@@ -1686,7 +1777,8 @@ impl Fill<'_, '_> {
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
             - i128::from(card.set_aside_bytes())
-            - i128::from(card.margin_bytes);
+            - i128::from(card.margin_bytes)
+            - i128::from(self.reserve);
         if let Some(b) = self.card_budget {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
             check_floor(card, b, dense, self.kv)?;

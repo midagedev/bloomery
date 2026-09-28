@@ -1,6 +1,7 @@
 //! Qwen3.8's own element kernels, the ones no other body launches: the Q8_0
 //! embedding row, the attention output under its sigmoid gate in f32, the
-//! selector's raw key append, and the shared expert's gated sum.
+//! selector's raw key append, and the shared expert's gated sum, alone or
+//! with the card's routed slots' sum.
 //!
 //! - [`q38_kernels::embed_rows_q8_0`] — one thread per value: row `ids[t]`
 //!   of the Q8_0 table in the q8f32 planes (`crate::weights::q8_0_planes`),
@@ -19,13 +20,29 @@
 //!   rounded, then added to the host tier's routed sum and rounded — ggml's
 //!   MUL then ADD, each an explicit round-to-nearest intrinsic so the device
 //!   build does not contract them into one fused multiply-add.
+//! - [`q38_kernels::q38_card_acc`] — one thread per value: the card's routed
+//!   slots' sum, each of a token's [`SLOTS`] slots whose place is on the card
+//!   (below the layer's card expert count) by a fused multiply-add from zero,
+//!   in slot order (`runtime::combine::card_sum`), its weight the router's at
+//!   pitch [`W_PITCH`] (the routed slots, then the shared expert's gate); a
+//!   slot the host serves is never read.
+//! - [`q38_kernels::q38_card_shared_add`] — `q38_shared_add` with the card
+//!   sum: `(hsum + acc) + sh · w`, the host's sum, then the card's, then the
+//!   shared expert's rounded product, each step rounded.
+//!
+//! The card sum runs in the layer's host-leg shadow and the combine after the
+//! wait in `q38_shared_add`'s place, so the card leg adds no launch after the
+//! wait. A layer without card experts keeps `q38_shared_add`: `hsum + 0.0`
+//! would turn a `-0.0` sum into `+0.0`.
 //!
 //! No silent failure: an embedding id past the table raises
 //! [`FaultSite::TokenId`] and writes a NaN row; a position at or past the
 //! raw plane raises [`FaultSite::CachePos`] and writes nothing; a raw key that
 //! is not finite after its f16 rounding raises [`FaultSite::PoolSelect`]; an
-//! input or a result of the two f32 products that is not finite raises
-//! [`FaultSite::F32Product`]. Every value is written as computed.
+//! input or a result of the two f32 products, or of the combine with the card
+//! sum, that is not finite raises [`FaultSite::F32Product`] (a card slot's
+//! non-finite down or weight reaches it through the sum). Every value is
+//! written as computed.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
@@ -46,6 +63,12 @@ pub const DIM: usize = crate::qsa::DIM;
 /// Threads per block of every kernel here.
 const THREADS: u32 = 256;
 const _: () = assert!(HEAD == 256 && DIM == 128);
+/// Routed slots a token: the card sum's slot count, which its launch
+/// contract spells as a literal.
+pub const SLOTS: usize = 10;
+/// Router weights a token: the routed slots, then the shared expert's gate.
+pub const W_PITCH: usize = SLOTS + 1;
+const _: () = assert!(SLOTS == 10 && W_PITCH == 11);
 
 /// `v` as a position or live key count word: `v` while it fits a u32, else
 /// `u32::MAX` — a value past every cache, which the rope and the flash
@@ -293,6 +316,125 @@ mod q38_kernels {
             *y.get_unchecked_mut(i) = out;
         }
     }
+
+    /// The card slots' sum of `m` tokens: thread `i < n·m`, token `t = i /
+    /// n`, value `d = i % n`, writes to `acc[i]` the fused multiply-adds from
+    /// zero of `down[(10t + j)·n + d]` by `w[11t + j]`, in ascending `j <
+    /// 10`, over the slots whose place `sel[10t + j]` is below `n_card` — this
+    /// order is the gate (`runtime::combine::card_sum`). No other slot's
+    /// down row or weight is read.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 10 * n * m,
+            w.len() >= 11 * m,
+            sel.len() >= 10 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn q38_card_acc(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let (t, d) = (i / n, i % n);
+        let mut a = 0.0f32;
+        for j in 0..SLOTS {
+            cuda_device::thread::__unroll_config::<0>();
+            let s = t * SLOTS + j;
+            // SAFETY: t < m and j < 10 put s below 10m <= sel.len() by the
+            // launch contract.
+            let place = unsafe { *sel.get_unchecked(s) };
+            if place < n_card {
+                // SAFETY: t < m and j < 10 put 11t + j below 11m <= w.len(),
+                // and s·n + d below 10nm <= down.len(), by the launch
+                // contract.
+                let (ws, ds) = unsafe {
+                    (
+                        *w.get_unchecked(t * W_PITCH + j),
+                        *down.get_unchecked(s * n + d),
+                    )
+                };
+                a = ds.mul_add(ws, a);
+            }
+        }
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe {
+            *acc.get_unchecked_mut(i) = a;
+        }
+    }
+
+    /// `y = (hsum + acc) + sh · w[t·slots + slot]` over `m` tokens of `n`
+    /// values: the host tier's routed sum, then the card's
+    /// ([`q38_card_acc`]), then the shared expert's output times its gate
+    /// weight, the product and each sum rounded — this order is the gate. A
+    /// non-finite input or result raises [`FaultSite::F32Product`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            slots >= slot + 1,
+            hsum.len() >= n * m,
+            acc.len() >= n * m,
+            sh.len() >= n * m,
+            w.len() >= slots * m,
+            y.len() >= n * m
+        )
+    )]
+    pub fn q38_card_shared_add(
+        hsum: &[f32],
+        acc: &[f32],
+        sh: &[f32],
+        w: &[f32],
+        slot: u32,
+        slots: u32,
+        n: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize * m as usize {
+            return;
+        }
+        let t = i / n as usize;
+        // SAFETY: i < n·m bounds hsum, acc and sh; t < m and slot < slots put
+        // t·slots + slot below slots·m <= w.len(); by the launch contract.
+        let (h, a, s, wt) = unsafe {
+            (
+                *hsum.get_unchecked(i),
+                *acc.get_unchecked(i),
+                *sh.get_unchecked(i),
+                *w.get_unchecked(t * slots as usize + slot as usize),
+            )
+        };
+        let out = add_rn_f32(add_rn_f32(h, a), mul_rn_f32(s, wt));
+        if !(h.is_finite() & a.is_finite() & s.is_finite() & wt.is_finite() & out.is_finite()) {
+            fault.raise(FaultSite::F32Product);
+        }
+        // SAFETY: i < n·m <= y.len() by the launch contract.
+        unsafe {
+            *y.get_unchecked_mut(i) = out;
+        }
+    }
 }
 
 /// [`Q38Kernels::enqueue_embed_rows`]'s arguments: the Q8_0 table's planes,
@@ -317,6 +459,36 @@ pub struct EmbedQ8Args<'a> {
 /// the output.
 pub struct SharedAddArgs<'a> {
     pub hsum: &'a DeviceBuffer<f32>,
+    pub sh: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub slot: usize,
+    pub slots: usize,
+    pub n: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q38Kernels::enqueue_card_acc`]'s arguments: `m` tokens' [`SLOTS`]
+/// slots — their down outputs slot-major (`n` values a slot, token `t`'s
+/// slots from `SLOTS · t`), the router's weights ([`W_PITCH`] a token) and
+/// the slots' places (the card's below `n_card`, the layer's card expert
+/// count) — and the sum's output, `n` values a token.
+pub struct CardAccArgs<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub acc: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q38Kernels::enqueue_card_shared_add`]'s arguments: [`SharedAddArgs`]'s
+/// and the card slots' sum `acc` (`[m][n]`, [`Q38Kernels::enqueue_card_acc`]).
+pub struct CardSharedAddArgs<'a> {
+    pub hsum: &'a DeviceBuffer<f32>,
+    pub acc: &'a DeviceBuffer<f32>,
     pub sh: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
     pub slot: usize,
@@ -567,6 +739,100 @@ impl Q38Kernels {
             stream,
             &prep,
             a.hsum,
+            a.sh,
+            a.w,
+            launch_u32(what, "slot", a.slot)?,
+            launch_u32(what, "slots", a.slots)?,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            a.fault,
+            a.y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the card slots' sum ([`CardAccArgs`], module doc): `down`
+    /// `SLOTS·n·m` values, `w` `W_PITCH·m`, `sel` `SLOTS·m`, `acc` `n·m`. A
+    /// card of no expert is refused by name: a layer without card experts has
+    /// no card sum and keeps [`Q38Kernels::enqueue_shared_add`]. One launch.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_card_acc(
+        &self,
+        stream: &CudaStream,
+        a: CardAccArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_card_acc";
+        let nm = a.n * a.m;
+        if nm == 0 || a.n_card == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} values of {} tokens over a card of {} experts: at least one of each",
+                    a.n, a.m, a.n_card
+                ),
+            ));
+        }
+        short(
+            what,
+            &[
+                ("down", a.down.len(), SLOTS * nm),
+                ("w", a.w.len(), W_PITCH * a.m),
+                ("sel", a.sel.len(), SLOTS * a.m),
+                ("acc", a.acc.len(), nm),
+            ],
+        )?;
+        let cfg = grid(what, nm)?;
+        let prep = self.module.prepare_q38_card_acc(cfg)?;
+        self.module.q38_card_acc(
+            stream,
+            &prep,
+            a.down,
+            a.w,
+            a.sel,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+            a.acc,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the combine with the card sum ([`CardSharedAddArgs`], module
+    /// doc): the host's sum, then the card's, then the shared expert's gated
+    /// output. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_card_shared_add(
+        &self,
+        stream: &CudaStream,
+        a: CardSharedAddArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_card_shared_add";
+        let nm = a.n * a.m;
+        if nm == 0 || a.slot >= a.slots {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} values of {} tokens, slot {} of {}",
+                    a.n, a.m, a.slot, a.slots
+                ),
+            ));
+        }
+        short(
+            what,
+            &[
+                ("hsum", a.hsum.len(), nm),
+                ("acc", a.acc.len(), nm),
+                ("sh", a.sh.len(), nm),
+                ("w", a.w.len(), a.slots * a.m),
+                ("y", a.y.len(), nm),
+            ],
+        )?;
+        let cfg = grid(what, nm)?;
+        let prep = self.module.prepare_q38_card_shared_add(cfg)?;
+        self.module.q38_card_shared_add(
+            stream,
+            &prep,
+            a.hsum,
+            a.acc,
             a.sh,
             a.w,
             launch_u32(what, "slot", a.slot)?,

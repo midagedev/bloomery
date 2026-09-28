@@ -499,28 +499,38 @@ impl Body38 {
     /// Card `card` of `plan`, which `inputs` made, resident: the plan's
     /// segments, the joins ([`Body38::derive`]) and the body over them with
     /// the host tier over every layer's routed experts, holding the load's
-    /// host set as `host` asks. Refused by name: a coverage item past
-    /// [`ALLOWED`], a plan with an expert tier card, a plan of more than one
-    /// card or not every layer, a layer or a width the kernels do not take.
+    /// host set as `host` asks, its ubatches of up to `ubatch` positions —
+    /// the value the plan's machine was built with (`place::machine`).
+    /// Refused by name: a coverage item past [`ALLOWED`], a plan with an
+    /// expert tier card, a plan of more than one card or not every layer, a
+    /// layer or a width the kernels do not take, a `ubatch` outside
+    /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
+    /// scratch counts.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
         host: HostCfg,
+        ubatch: usize,
     ) -> Result<Qwen38Model, GpuError> {
-        Body38::open_with(file, plan, inputs, card, host, None)
+        Body38::open_with(file, plan, inputs, card, host, ubatch, None)
     }
 
     /// [`Body38::open_placed`] of `plan`'s target plan with the MTP draft
     /// of `draft` (the draft file `mtp` was read from) opened on the same
     /// card beside it ([`Mtp38::open`]); refused as either refuses.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed's six and the draft's file and inputs (rust-quality R8)"
+    )]
     pub fn open_placed_mtp(
         file: Split,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
         host: HostCfg,
+        ubatch: usize,
         draft: &Split,
         mtp: &model::arch::qwen35moe::place::MtpInputs,
     ) -> Result<Qwen38Model, GpuError> {
@@ -530,6 +540,7 @@ impl Body38 {
             inputs,
             card,
             host,
+            ubatch,
             Some((draft, mtp, plan)),
         )
     }
@@ -542,6 +553,7 @@ impl Body38 {
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
         host: HostCfg,
+        ubatch: usize,
         mtp: Option<(
             &Split,
             &model::arch::qwen35moe::place::MtpInputs,
@@ -570,12 +582,13 @@ impl Body38 {
             ));
         }
         let n = inputs.spec.layers.len();
-        let layers = plan
+        let spec = plan
             .machine
             .cards
             .get(card)
-            .map(|c| c.layers.clone())
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
+        let layers = spec.layers.clone();
+        let counted = model::arch::qwen35moe::place::counted_ubatch_bytes(spec);
         if plan.machine.cards.len() != 1 || layers != (0..n) {
             return Err(GpuError::shape(
                 WHAT,
@@ -597,8 +610,17 @@ impl Body38 {
                 let draft = mtp
                     .map(|(d, m, p)| Mtp38::open(gpu, &file, w, d, m, p, host.card_dontneed))
                     .transpose()?;
-                let mut body =
-                    Body38::load_placed(gpu, file, w, plan, inputs, &shape, host, residency)?;
+                let mut body = Body38::load_placed(
+                    gpu,
+                    file,
+                    w,
+                    plan,
+                    inputs,
+                    &shape,
+                    host,
+                    residency,
+                    (ubatch, counted),
+                )?;
                 body.mtp = draft;
                 Ok(body)
             },
@@ -637,7 +659,7 @@ impl Body38 {
     /// The body of the plan's one card over the chain's `shape` (module doc).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file, weights, plan, inputs and chain shape, and the host tier's residency and levers (rust-quality R8)"
+        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, and the ubatch with the arena bytes the plan counts (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -648,6 +670,7 @@ impl Body38 {
         shape: &Shape38,
         host: HostCfg,
         residency: HostResidency,
+        (ub, counted): (usize, u64),
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
         let n = spec.layers.len();
@@ -655,6 +678,15 @@ impl Body38 {
             .ok()
             .filter(|&c| c > 0)
             .ok_or_else(|| GpuError::shape(WHAT, format!("ctx_max {}", plan.ctx_max)))?;
+        if ub == 0 || ub > UBATCH_MOST.min(ctx) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a ubatch of {ub} positions: the load takes 1..={} at a cache of {ctx}",
+                    UBATCH_MOST.min(ctx)
+                ),
+            ));
+        }
         let Shape38 {
             kinds,
             router: router_dims,
@@ -697,13 +729,11 @@ impl Body38 {
         let a = Arena38::new(stream, router_dims, PASS_ROWS, ctx)?;
         let rp = PassRecord::new(stream)?;
         let pass_hsum = DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?;
-        let ub = super::ubatch::ubatch_size()?.min(ctx);
         let wa = Arena38::wide(stream, router_dims, ub, UBATCH_MOST, ctx)?;
         let wr = WideRecord::new(stream, ub)?;
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
         let wide = Wide38::new(stream, ub)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
-        let counted = model::arch::qwen35moe::place::ubatch_scratch_bytes(ub as u64);
         if wide_bytes > counted {
             return Err(GpuError::shape(
                 WHAT,

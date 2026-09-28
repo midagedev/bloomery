@@ -104,6 +104,17 @@ pub fn ubatch_size() -> Result<usize, GpuError> {
     .map_err(|e| GpuError::shape(WHAT, e))
 }
 
+/// The ubatch size a load of a cache of `ctx` positions runs: [`ubatch_size`]
+/// clipped to the cache. A qwen4exp caller reads it once and hands the one
+/// value to the plan's machine (`place::machine`) and to the load
+/// (`Body38::open_placed`).
+pub fn ubatch_for(ctx: usize) -> Result<usize, GpuError> {
+    Ok(ubatch_size()?.min(ctx))
+}
+
+// The default ubatch is the one a default qwen4exp machine counts.
+const _: () = assert!(UBATCH as u64 == model::arch::qwen35moe::place::UBATCH_PLANNED);
+
 /// The GEMM's type for a qwen3moe projection.
 fn gemm_ty(kq: Kq) -> GemmWeight {
     match kq {

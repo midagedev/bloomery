@@ -29,14 +29,18 @@ use std::ops::Range;
 /// new variant: derived weights have their own (`Q8_0Derived`) and never
 /// travel as a file tensor.
 pub enum DevWeight {
-    /// Q3_K/Q4_K/Q6_K file tensor: the raw row stream as little-endian u32
-    /// words, zero-padded at its end to a whole number of words per row
-    /// (`CardFormat::KQuant`) — the kernels address rows by BYTE offset
-    /// (`row * row_bytes`), so the words are the flat stream, never per-row
-    /// padded. A 3-D expert stack
+    /// A file tensor as the file stores its rows (`CardFormat::KQuant`): a
+    /// Q3_K/Q4_K/Q5_K/Q6_K tensor, or a routed Q5_1 stack a program's plan
+    /// puts on the card in the file's `block_q5_1`s, which `q5_1_gemv_sel`
+    /// reads (`ty` says which). The raw row stream as little-endian u32
+    /// words, zero-padded at its end to a whole number of words per row —
+    /// the kernels address rows by BYTE offset (`row * row_bytes`), so the
+    /// words are the flat stream, never per-row padded. A 3-D expert stack
     /// stays one flat tensor of `dims[1]·dims[2]` rows: the `_sel` kernels
     /// address expert e as rows `e·R .. (e+1)·R`, which is the same flat
-    /// layout. `k` is a multiple of 256; row bytes are `type_size · k/256`.
+    /// layout. `k` is a multiple of the type's block; row bytes are
+    /// `type_size · k / blck_size` (a Q5_1 row of 640 values is 480 bytes,
+    /// 120 words).
     KQuant {
         ty: GgmlType,
         w: DeviceTensor<u32>,
@@ -782,7 +786,8 @@ fn upload_rows(
     let dw = match format {
         // The gates' packing verbatim (gate_p1/gate_p9): the whole row span as
         // one word stream, so the kernels' byte-offset row addressing sees
-        // contiguous rows.
+        // contiguous rows. A routed Q5_1 stack's span is its experts' 24-byte
+        // blocks in slot order, the layout `q5_1_gemv_sel` reads.
         CardFormat::KQuant => {
             let mut words = words_of(bytes);
             words.resize(words.len().div_ceil(rows) * rows, 0);
