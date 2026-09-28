@@ -83,7 +83,11 @@
 //!   the whole run, while flips evict other seed experts.
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
-//!   before the preparation ends.
+//!   before the preparation ends; the machine dropped then leaves its
+//!   staging thread to finish, never that thread's to free, and reports the
+//!   leak by name.
+//! - leaks: once every machine is dropped, the stall arm's is the one leak
+//!   reported.
 //! - queue: with a source that adds [`INFLATE`] copy stream commands to each
 //!   part it copies (one job then carries more than the stream queues), a
 //!   run to its last flip and a reset under a closed window (as the engine's
@@ -116,7 +120,8 @@ mod gate {
 
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
-        MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform,
+        Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
+        Transform, set_leak_sink,
     };
     use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
@@ -355,6 +360,25 @@ mod gate {
                 *on = Some(name);
             }
         }
+    }
+
+    /// Every leak a dropped machine of this process reported, in order.
+    static LEAKS: Mutex<Vec<Leak>> = Mutex::new(Vec::new());
+
+    /// The gate's leak sink: the `residency leak` record, and the leak kept
+    /// for the clauses.
+    fn note_leak(l: &Leak) {
+        record::residency_leak(l).print();
+        if let Ok(mut v) = LEAKS.lock() {
+            v.push(*l);
+        }
+    }
+
+    fn leaks() -> Result<Vec<Leak>, GateError> {
+        Ok(LEAKS
+            .lock()
+            .map_err(|_| "gate_swap: the leak list")?
+            .clone())
     }
 
     /// Threads of this process named as the swap machine names its staging
@@ -1902,6 +1926,7 @@ mod gate {
         };
         let dropped_on = Arc::clone(&faults.dropped_on);
         let threads = staging_threads()?;
+        let leaks_before = leaks()?.len();
         let mut st = start(gpu, pm, seed_map(&[])?, faults, cfg(DELAY, STALL_DEADLINE))?;
         let t0 = Instant::now();
         drive(gpu, &mut st, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
@@ -1930,17 +1955,20 @@ mod gate {
             .lock()
             .map_err(|_| "gate_swap: the drop cell")?
             .clone();
+        let leaked: Vec<LeakReason> = leaks()?[leaks_before..].iter().map(|l| l.reason).collect();
         let stall = stall_said.contains("was not prepared for the host")
             && stall_said.contains("layer 2: the victim 7")
             && took < SLOW
             && drained
             && dropped < SLOW
             && joined
-            && on.as_deref() != Some("swap-staging");
+            && on.as_deref() != Some("swap-staging")
+            && leaked == [LeakReason::Join];
         println!(
             "stall: a victim {SLOW:?} to prepare under a {STALL_DEADLINE:?} deadline: after {} passes \
              in {took:?} \"{stall_said}\"; dropped in {dropped:?}, the copy stream {}; its staging \
-             thread {} {:?} after the drop, the source dropped on {on:?} (never swap-staging) {}",
+             thread {} {:?} after the drop, the source dropped on {on:?} (never swap-staging), \
+             leaks reported {leaked:?} (want [Join]) {}",
             st.values.len(),
             if drained {
                 format!("drained {drain_took:?} after it")
@@ -1962,6 +1990,9 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        if !set_leak_sink(note_leak) {
+            return Err("gate_swap: a leak sink was set before the gate's".into());
+        }
         let gpu = Gpu::new()?;
         // SAFETY: the module is this binary's own, loaded once into the
         // card's context before any launch.
@@ -1997,6 +2028,15 @@ mod gate {
         ok &= refusal(&gpu, &pm, &trace)?;
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= queue(&gpu, &pm, &trace, &a)?;
+        drop((a, b, h));
+        let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
+        let only_stall = all == [LeakReason::Join];
+        println!(
+            "leaks: every machine dropped, leaks reported {all:?} (want the stall arm's [Join] \
+             alone) {}",
+            verdict(only_stall)
+        );
+        ok &= only_stall;
 
         if ok {
             println!(
