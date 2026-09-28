@@ -742,10 +742,51 @@ pub fn read(word: &cuda_core::DeviceBuffer<u32>) -> Result<Option<Fault>, crate:
     Ok(Fault::from_words(first, sites))
 }
 
+/// The fault of several cards' words as read, for a step that ran on more
+/// than one: the first layer wins — the smallest first-layer word — and a
+/// layer two cards both raised in keeps the smaller code and both masks.
+/// `None` when every card is clean.
+#[must_use]
+pub fn read_cards(cards: &[Option<Fault>]) -> Option<Fault> {
+    cards
+        .iter()
+        .flatten()
+        .copied()
+        .fold(None, |acc, f| match acc {
+            None => Some(f),
+            Some(a) if a.layer == f.layer => Some(Fault {
+                code: a.code.min(f.code),
+                sites: a.sites | f.sites,
+                ..a
+            }),
+            Some(a) if f.word() < a.word() => Some(f),
+            Some(a) => Some(a),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use model::arch::Arch;
+
+    /// Of two cards' faults the first layer wins; one layer raised on both
+    /// keeps the smaller code and both masks; clean cards read clean.
+    #[test]
+    fn read_cards_takes_the_first_layer() {
+        let a = Fault::at(9, FaultSite::QuantColumn);
+        let b = Fault::at(4, FaultSite::ExpertId);
+        assert_eq!(read_cards(&[Some(a), Some(b)]), Some(b));
+        assert_eq!(read_cards(&[Some(b), None, Some(a)]), Some(b));
+        assert_eq!(read_cards(&[None, None]), None);
+        let c = Fault::at(4, FaultSite::QuantColumn);
+        assert_eq!(
+            read_cards(&[Some(b), Some(c)]),
+            Some(Fault::of_sites(
+                4,
+                &[FaultSite::ExpertId, FaultSite::QuantColumn]
+            ))
+        );
+    }
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
