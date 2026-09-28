@@ -9,6 +9,8 @@
 //!                       [--prefill auto|pass|gemm|step] [--place a|gate]
 //!                       [--time [--warm W]] [--logits]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
+//!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
+//!                       --seqs S --prompt-len P [-n N] [--ctx C]
 //!
 //! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. A flag given twice
 //! takes its last value. `--prompt` tokenizes the text with the file's own vocabulary
@@ -112,6 +114,18 @@
 //! `--logits` prints `logits n= argmax= fnv64=` after the `tokens` line: the
 //! head's last logits row, read back once, by its f32 bits (FNV-1a 64).
 //!
+//! `--dump-taps DIR` (a qwen3moe file only) writes the layer-tap dump of
+//! `shared/qwen3moe_taps.rs` into DIR, an empty or new directory: from each
+//! `--tokens-file` (one id a line) `S` prompts of `P` ids, windows spread
+//! over the file, each run from a reset one eager step per id with the layer
+//! taps on, then `N` greedy steps. The steps are the decode path the pass
+//! prefill equals bit for bit, so a sequence's ids are what `--tokens <its
+//! prompt> -n N --prefill pass --ctx C` prints; the GEMM ubatches, which `auto`
+//! takes for a prompt of more than eight ids, have no taps. It prints the
+//! `load` line, then a `taps seq` record per sequence and a `taps dump`
+//! record (`record::GENERATE_QWEN3MOE`), and mixes with no flag but `-n` and
+//! `--ctx`.
+//!
 //! `--time` is a MEASUREMENT and belongs under the machine-wide lease
 //! (`tools/ref/time-gate.sh`), never at a bare prompt. The cache's
 //! height is `--ctx`: the flash's segment grid is fixed by it, so a timed
@@ -129,7 +143,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen3moe_taps.rs"]
+mod taps;
+
+#[cfg(feature = "gpu")]
 mod cli {
+    use super::taps;
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_size};
@@ -140,6 +159,7 @@ mod cli {
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::Levers;
     use cuda_core::sys;
@@ -149,6 +169,7 @@ mod cli {
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
     use std::num::NonZeroUsize;
+    use std::path::Path;
     use std::time::Instant;
     use tokenizer::Tokenizer;
 
@@ -528,6 +549,10 @@ mod cli {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
         let levers = bloomery_levers::at_main(&[])?;
+        record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
+        if let Some(dir) = flag("--dump-taps")? {
+            return dump_taps(&dir);
+        }
         let timed = std::env::args().any(|a| a == "--time");
         let sync = std::env::args().any(|a| a == "--arm-sync");
         let logits = std::env::args().any(|a| a == "--logits");
@@ -663,6 +688,113 @@ mod cli {
                 drive(m, &run, path, &arms, listed, sync)
             }
         }
+    }
+
+    /// The flags `--dump-taps` refuses by name: every other mode's.
+    const NOT_WITH_DUMP: [&str; 11] = [
+        "--prompt",
+        "--tokens",
+        "--seed-depth",
+        "--arm",
+        "--arm-sync",
+        "--time",
+        "--warm",
+        "--logits",
+        "--prefill",
+        "--mode",
+        "--place",
+    ];
+
+    /// `--dump-taps DIR`: the tap dump of every `--tokens-file`'s windows on
+    /// a qwen3moe file, eager, then the manifest read back.
+    fn dump_taps(dir: &str) -> Result<(), GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(f) = NOT_WITH_DUMP.iter().find(|f| args.iter().any(|a| a == *f)) {
+            return Err(format!(
+                "--dump-taps runs each prompt one eager step per id; {f} does not apply to it"
+            )
+            .into());
+        }
+        let files = flags("--tokens-file")?;
+        if files.is_empty() {
+            return Err("--dump-taps needs at least one --tokens-file".into());
+        }
+        let seqs: usize = flag("--seqs")?
+            .ok_or("--dump-taps needs --seqs (prompts per --tokens-file)")?
+            .parse()?;
+        let len: usize = flag("--prompt-len")?
+            .ok_or("--dump-taps needs --prompt-len")?
+            .parse()?;
+        let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
+        let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
+        if len + n_gen > ctx {
+            return Err(format!("--prompt-len {len} + -n {n_gen} pass --ctx {ctx}").into());
+        }
+        let mut all = Vec::new();
+        for f in &files {
+            all.extend(taps::windows(Path::new(f), seqs, len)?);
+        }
+        let t = Instant::now();
+        let (file, family) = open_file()?;
+        if family != Family::Qwen3 {
+            return Err(format!(
+                "--dump-taps runs a qwen3moe file (the taps are its chain's), not a {}",
+                file.architecture().unwrap_or("?")
+            )
+            .into());
+        }
+        let mut m = open_qwen3(file, ctx, StepMode::Eager, t)?;
+        let hidden = m.body("generate_qwen3moe")?.hparams().n_embd;
+        let out = Path::new(dir);
+        let mut dump = taps::Dump::create(out, &ref_model_path()?, hidden)?;
+        let t = Instant::now();
+        for s in &all {
+            let t_seq = Instant::now();
+            let row = dump.seq(&mut m, s, n_gen)?;
+            let (ids_b, taps_b) = taps::sizes(row, hidden);
+            println!(
+                "{}",
+                Record::new(&record::TAPS_SEQ)
+                    .u("k", row.seq)
+                    .w("source", s.source.display())
+                    .u("offset", s.offset)
+                    .u("n_prompt", row.n_prompt)
+                    .u("n_total", row.n_total)
+                    .u("bytes", ids_b + taps_b)
+                    .f("wall_s", t_seq.elapsed().as_secs_f64())
+                    .line()
+            );
+        }
+        let rows = taps::read_manifest(out, hidden)?;
+        if rows.len() != all.len() {
+            return Err(format!(
+                "{}: the manifest reads back {} rows of {} sequences",
+                out.display(),
+                rows.len(),
+                all.len()
+            )
+            .into());
+        }
+        let bytes: u64 = rows
+            .iter()
+            .map(|r| {
+                let (a, b) = taps::sizes(r, hidden);
+                a + b
+            })
+            .sum();
+        println!(
+            "{}",
+            Record::new(&record::TAPS_DUMP)
+                .w("dir", out.display())
+                .u("seqs", rows.len())
+                .u("positions", rows.iter().map(|r| r.n_total).sum::<usize>())
+                .u("bytes", bytes)
+                .csv("layers", taps::TAPS)
+                .w("prefill", "step")
+                .f("wall_s", t.elapsed().as_secs_f64())
+                .line()
+        );
+        Ok(())
     }
 
     /// The engine and its `--prefill` path (and, for qwen4exp, its card),

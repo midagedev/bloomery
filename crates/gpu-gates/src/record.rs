@@ -1,6 +1,7 @@
 //! The record lines of the V4.1 binaries — `generate_ds41`, `bloomery-chat`,
-//! `bloomery-serve-ds41` and the prefill gate's stat line — and the one owner
-//! of each line's syntax: its [`Kind`].
+//! `bloomery-serve-ds41` and the prefill gate's stat line —, of
+//! `generate_glm5next` and of `generate_qwen3moe`'s tap dump, and the one
+//! owner of each line's syntax: its [`Kind`].
 //!
 //! A kind is the words a line opens with (its head) and its parts in order:
 //! ` name=value`, a bare value, a flag word, or literal text between values.
@@ -1195,6 +1196,42 @@ pub static PREFILL_SPLIT: Kind = Kind {
     ],
 };
 
+/// One sequence of a layer-tap dump written.
+pub static TAPS_SEQ: Kind = Kind {
+    name: "taps_seq",
+    head: "taps seq",
+    doc: "A tap dump's sequence, its files written and their sizes checked: where its prompt was cut \
+          from, its prompt and total positions, its bytes, and the host wall it took (a runtime \
+          value).",
+    parts: &[
+        key("k", U64, ""),
+        key("source", Word, ""),
+        key("offset", U64, "positions"),
+        key("n_prompt", U64, "positions"),
+        key("n_total", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("wall_s", F64(1), "s"),
+    ],
+};
+
+/// A layer-tap dump finished.
+pub static TAPS_DUMP: Kind = Kind {
+    name: "taps_dump",
+    head: "taps dump",
+    doc: "A tap dump's directory, its sequences, positions and bytes as its manifest reads back, the \
+          layers each position's row holds, the path its prompts ran on, and the host wall (a \
+          runtime value).",
+    parts: &[
+        key("dir", Word, ""),
+        key("seqs", U64, ""),
+        key("positions", U64, "positions"),
+        key("bytes", U64, "B"),
+        key("layers", Csv, ""),
+        key("prefill", Word, ""),
+        key("wall_s", F64(1), "s"),
+    ],
+};
+
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLAN,
@@ -1288,6 +1325,10 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &SMOKE,
 ];
 
+/// What `generate_qwen3moe --dump-taps` prints after its `load` line; the
+/// binary's other lines are its own.
+pub static GENERATE_QWEN3MOE: &[&Kind] = &[&TAPS_SEQ, &TAPS_DUMP];
+
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
 /// its name and the case's.
 pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
@@ -1360,6 +1401,7 @@ mod tests {
             BLOOMERY_CHAT,
             BLOOMERY_SERVE_DS41,
             GENERATE_GLM5NEXT,
+            GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
@@ -1457,6 +1499,11 @@ mod tests {
                 "generate_glm5next",
                 GENERATE_GLM5NEXT,
                 include_str!("../../../tools/bloomery/schema/generate_glm5next.jsonl"),
+            ),
+            (
+                "generate_qwen3moe",
+                GENERATE_QWEN3MOE,
+                include_str!("../../../tools/bloomery/schema/generate_qwen3moe.jsonl"),
             ),
             (
                 "gate_deepseek41_prefill",

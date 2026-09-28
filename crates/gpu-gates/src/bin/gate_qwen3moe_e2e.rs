@@ -38,6 +38,15 @@
 //!   layer's `l_out` against ik's, `‖ours − ik‖ / ‖ik‖` within
 //!   [`FREE_BAND`]; the last position's logits against ik's
 //!   `result_output`: the same argmax, the relative distance printed.
+//! - (d) the tap dump (`shared/qwen3moe_taps.rs`, `generate_qwen3moe
+//!   --dump-taps`): [`TAP_SEQS`] windows of the prose, [`TAP_PROMPT`] ids
+//!   each and [`TAP_GEN`] greedy steps, dumped into a fresh directory and
+//!   read back. Every position's row of every tapped layer equals, bit for
+//!   bit, that layer's `layer_taps` copy after an independent eager step of
+//!   the file's id at that position (the copies (c) holds to ik's `l_out`,
+//!   the last layer's before the output norm); and each ids file is the
+//!   prompt, then the tokens of the plain run — graph mode, the prompt on the
+//!   pass path, `TAP_GEN − 1` steps — at the same cache height.
 //! - (g) greedy: prompts `0..PROMPTS` of `tools/ref/prompts.tsv` under this
 //!   model's tokenizer (`just ik-greedy-qwen3moe` writes them and ik's
 //!   continuations), [`GEN`] tokens each in graph mode: no prompt diverges
@@ -100,7 +109,8 @@
 //!   `reset` leaves the word clean and the next step a token.
 //!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
-//! `--rope-only` the load and (t), `--fault-only` the load and (x).
+//! `--rope-only` the load and (t), `--fault-only` the load and (x),
+//! `--taps-only` the load and (d).
 //!
 //! The chain runs the tensor-core flash pass, the engine's; the scalar pass
 //! runs only eagerly as (u)'s ruler (`set_flash_mma`), and the kernel itself
@@ -135,7 +145,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen3moe_taps.rs"]
+mod taps;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use super::taps;
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
@@ -152,7 +167,7 @@ mod gate {
     };
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
-        ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_tensor_logical_in,
+        ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_model_path, ref_tensor_logical_in,
         topk_ids_logical_within, verdict,
     };
     use cuda_core::sys;
@@ -376,6 +391,14 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--taps-only") {
+            let ok = tap_dump(&mut m)?;
+            println!("gate_qwen3moe_e2e --taps-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--gemm-only") {
             let mut ok = gemm_prefill(&mut m, dump.as_deref())?;
             ok &= rope_table(&mut m, CTX)?;
@@ -396,6 +419,7 @@ mod gate {
         let man = o.open(Set::Cpu)?;
         ok &= forced(m, &man)?;
         ok &= free(m, &man)?;
+        ok &= tap_dump(m)?;
         ok &= greedy(m, dump.as_deref())?;
         ok &= rope_table(m, CTX)?;
         ok &= fault_layer(m)?;
@@ -829,6 +853,108 @@ mod gate {
         println!(
             "free: {t_n} tokens {toks:?}, worst l_out_rel={worst:.3e} (band {FREE_BAND:.0e}); last \
              position argmax ours={last} ik={ik_top} logits_rel={lrel:.3e} (printed) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // --------------------------------------------------- (d) the tap dump
+
+    /// The tap clause's windows of the prose, their prompt ids and greedy
+    /// steps: two passes' worth of prompt (a pass of `MAX_TOKENS`, then a
+    /// shorter one) on the plain run's pass path.
+    const TAP_SEQS: usize = 2;
+    const TAP_PROMPT: usize = 12;
+    const TAP_GEN: usize = 6;
+
+    /// (d) (module doc). Leaves the taps off and the model in graph mode; the
+    /// dump directory is removed on a pass and kept, named, on a failure.
+    fn tap_dump(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        let hidden = m.body("gate_qwen3moe_e2e")?.hparams().n_embd;
+        prose(TAP_PROMPT)?;
+        let src = data_dir().join("qwen3moe").join(PROSE);
+        let seqs = taps::windows(&src, TAP_SEQS, TAP_PROMPT)?;
+        let dir =
+            std::env::temp_dir().join(format!("gate_qwen3moe_e2e-taps-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let mut dump = taps::Dump::create(&dir, &ref_model_path()?, hidden)?;
+        for s in &seqs {
+            dump.seq(m, s, TAP_GEN)?;
+        }
+        let rows = taps::read_manifest(&dir, hidden)?;
+        let mut ok = rows.len() == seqs.len();
+        let width = taps::TAPS.len() * hidden;
+        for (row, s) in rows.iter().zip(&seqs) {
+            let ids: Vec<u32> = std::fs::read(dir.join(&row.ids))?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect();
+            let file: Vec<f32> = std::fs::read(dir.join(&row.taps))?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            m.set_layer_taps(true)?;
+            m.reset()?;
+            let mut differing = Vec::new();
+            for (p, &id) in ids.iter().enumerate() {
+                m.step(&[id])?;
+                let all = m.layer_taps()?;
+                for (j, &l) in taps::TAPS.iter().enumerate() {
+                    let got = &file[p * width + j * hidden..][..hidden];
+                    if !bits_equal(got, &all[l]) {
+                        differing.push((p, l));
+                    }
+                }
+            }
+            m.set_layer_taps(false)?;
+            m.set_mode(StepMode::Graph);
+            m.reset()?;
+            let mut plain = vec![m.prefill_with(&s.prompt, PrefillPath::Pass)?];
+            for _ in 1..TAP_GEN {
+                let last = plain[plain.len() - 1];
+                plain.push(m.step(&[last])?);
+            }
+            let (head, tail) = ids.split_at(row.n_prompt.min(ids.len()));
+            let ids_ok = row.n_prompt == TAP_PROMPT
+                && row.n_total == TAP_PROMPT + TAP_GEN
+                && head == s.prompt.as_slice()
+                && tail == plain.as_slice();
+            let taps_ok = differing.is_empty();
+            ok &= ids_ok && taps_ok;
+            println!(
+                "taps seq={} offset={} positions={}: rows of layers {:?} against the layer taps bit \
+                 for bit, {} of {} differ{} {}; ids the prompt, then the plain run's {:?} {}",
+                row.seq,
+                s.offset,
+                row.n_total,
+                taps::TAPS,
+                differing.len(),
+                row.n_total * taps::TAPS.len(),
+                differing.first().map_or(String::new(), |(p, l)| format!(
+                    " (first at position {p}, layer {l})"
+                )),
+                verdict(taps_ok),
+                plain,
+                verdict(ids_ok)
+            );
+        }
+        m.set_layer_taps(false)?;
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        if ok {
+            std::fs::remove_dir_all(&dir)?;
+        } else {
+            println!("taps: the dump is kept in {}", dir.display());
+        }
+        println!(
+            "taps: {} sequences of {TAP_PROMPT} prose ids and {TAP_GEN} greedy steps dumped and read back {}",
+            rows.len(),
             verdict(ok)
         );
         Ok(ok)
