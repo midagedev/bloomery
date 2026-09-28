@@ -1,0 +1,81 @@
+# Round cprobe: c, the host-leg time one residency copy (one V4.1 expert, 16,773,120 B, host to card)
+# costs, in host-slot equivalents: the adaptive-residency design's one unknown.
+#
+# Why k = 0.24 is not c. rig-log 09-28#q38-dram-share measured k = 0.24 (union bytes lost per copied byte)
+# beside Qwen3.8's union5:8x40u0.1 at 28 threads, which reads ~43 GB/s and is compute-bound: DRAM had
+# ~100 GB/s of headroom, so that loss is not bandwidth. V4.1's decode host leg is DRAM-bound (engine:5/6
+# read 132-137 GB/s alone, rig-log 09-24; read ceiling 140-145, STREAM 147.7), with no headroom, so c is
+# predicted from the DRAM-bound case below and measured beside engine:5, not taken from that k.
+#
+# Paper [derived]. Beside a DRAM-bound leg a slot and a copy are both one expert's bytes, so
+# c = crossings x k_eff, crossings = DRAM passes the path makes per copied byte, k_eff = host read bytes
+# one such pass displaces (the one term arithmetic cannot close: 0 if the controller absorbs it in the
+# leg's 3-8 % headroom under the read ceiling, 1 if it takes an equal read, more if a write costs the bus
+# more than a read). Band k_eff 0.5..1.
+#   staging (crates/gpu/src/host/swap.rs: one thread memcpys the expert into a pinned ring of 4, the copy
+#   stream DMAs it): the source read 1; the ring write, which glibc does with temporal stores here
+#   (box read: x86_non_temporal_threshold 0x1800000 = 24 MiB > the 16.77 MB block and each of its parts),
+#   so a read-for-ownership 1 and the write-back 1; the DMA read 1, or 0 for the lines it finds still in
+#   the writer's L3 (32 MiB a CCD): 3..4. c_staging 1.5..4.
+#   direct (the source registered, one DMA read): 1. c_direct 0.5..1.
+#   Consistency read: c(staging:max) / c(direct:max) = the crossings, 3..4, whatever k_eff is.
+# Per arm, the effect on the leg's time = c x C / U_with, U_alone 125..137 at 28 threads [derived]:
+#   staging:3  C 1.342 GB/s  c 1.5..4  effect +1.5..+4.4 %
+#   staging:6  C 2.684 GB/s  c 1.5..4  effect +2.9..+9.4 %   <- this card's term
+#   direct:3   C 1.342       c 0.5..1  effect +0.5..+1.1 %   (inside the ruler: read as its c interval)
+#   direct:6   C 2.684       c 0.5..1  effect +1.0..+2.2 %
+#   staging:max, direct:max  unpaced: the loops' own rate beside the leg (not predicted closer than the
+#   V4.1 dma-dram-share card's proportional split, C 12..24); c at saturation, k_eff near 1: staging 3..4,
+#   direct 0.7..1.
+# Timeline of one chat decode token [37.5 ms, 199.2 host slots, measured hand diagnosis outside a lease,
+# rig-log 09-28#hotlist-chat]: host DRAM busy 24.7 ms reading 3.34 GB (199.2 x 0.124 ms a slot, engine:5's
+# 24.8-25.5 ms for 201 slots, rig-log 09-24), the leg on the step's critical path (the card's experts and
+# shared expert run under it); host wait 12.8 ms over 40 layer waits (~0.32 ms each); PCIe idle but the
+# copies (3 copies 50.3 MB = 2.1 ms at the staged 24.4 GB/s, 6 copies 4.1 ms); NVMe 0. The wall is the
+# sum of the layers' card-serial time and the host leg, so a displaced host byte is wall. Staging's DRAM
+# demand is 3..4 x 50.3 MB = 151..201 MB at 3 copies (4.5..6.0 % of the leg's bytes), 302..402 MB at 6;
+# direct 50 / 101 MB. Ungated upper bound: this run copies beside a leg that never waits; the machine
+# stages in the leg's wait window (swap.rs `SwapMachine::window`), which can take the source read and the
+# RFO off the leg but not the write-back or the DMA read, so the machine's c is 1..2 crossings x k_eff
+# [derived, not measured here].
+# Wall [derived]: the bench's start-up is its check, 18 s for engine:5 (functional run on the box, no
+# lease, 00:01 KST 09-29); 7 conditions x 4 rounds x (18 s + 3 warm-up tokens + 8 s + copy start ~1 s)
+# = 12.6 min, the copies alone 6 x (5 s + ~1 s) 0.6 min, witnesses and the two warm builds ~0.5 min:
+# ~14 min, under the 15 the window allows (5 rounds would be 16.5). The addendum's prompt-shaped arm
+# (unionr8:6x48u0.1112 beside staging:max and direct:max) is not in this lease: its start-up check is
+# 38 s, so it needs its own ~7 min (docs/cards/cprobe-prompt.card is not written; the lead decides).
+kind: ab
+question: beside V4.1's DRAM-bound decode host leg, how much longer does the leg take while the
+  residency machine's staging path copies 6 experts a token, and so what is c?
+term: bench_v41_host --time --arms engine:5 (the decode service's experts_into shape, 5 host slots a
+  layer, ~200 a token like the chat decode) at 28 threads, V4.1 public Q3_K_M, its ms a token beside
+  h2d_probe staged-loop over an anonymous 1,006,387,200 B window (16,773,120 B blocks, ring 4, one fill
+  thread, A6000) paced at 160 blocks a second (6 copies a 37.5 ms token) against the same bench alone,
+  per round in one lease (dma-dram-share.sh, conds staging:6 against alone); the effect is
+  U_alone / U_with - 1, and c = (U_alone - U_with) / C_with, the runner's `P2 c … cond=staging:6` line
+unit: %
+predict: 2.9..9.4
+rounds: 4
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/cprobe.card' just time-dma-dram --arms
+  engine:5 --conds alone,staging:3,staging:6,direct:3,direct:6,staging:max,direct:max --rounds 4
+  --seconds 8 --copy-alone 5, one lease (the runner's lease_take; the bench under 600 s, the copy
+  under 660 s and its stop file, pids from spawn); every row admissible (BLOOMERY_HOST_LEASE=1, the
+  working set resident, no major fault), the copy pinned by taskset to the cores the 28-thread pool
+  leaves free ([overlap] rows out), the copy running through each span ([copy-gap] rows out), the pool's
+  threads pinned ([unpinned] rows out); the order rotated every round; witness blocks pre and post.
+  Three reads before the band: each paced copy alone holds its pace (staging:6 and direct:6 at 2.68,
+  staging:3 and direct:3 at 1.34 GB/s, within 2 %), so C is the design's rate and not the loop's
+  limit; U_alone within 10 % of engine:5's 135-137 at 32 threads (rig-log 09-24), so the leg is at
+  the DRAM ceiling and not in headroom; and the direct loop registered its window (a refusal ends the
+  run: no direct row, and the third decision loses its alternative)
+decide-in: c of staging:6 between 1.5 and 4: at c <= 3, lower the swaprule cap or pay a flip only
+  where router-residency.py's replay gain exceeds 6 x c x 0.124 ms a token; at c > 3, change the copy
+  path before the V4.1 adapter (registered source, no staging memcpy, priced at direct:6's c), after
+  one read of how much of the memcpy the machine's wait window takes (12.8 ms of wait a token against
+  6 memcpys)
+decide-below: c of staging:6 under 1.5: the online cache pays at its current cap (6 copies a token);
+  the V4.1 adapter (adaptres R3) is built on the staging path as swap.rs has it
+decide-above: c of staging:6 over 4, more than the path's four crossings: a written byte costs the
+  bus more than a read or the copy thread takes a pool core; read staging:max against direct:max (the
+  crossings) and the rows' tags first, then change the copy path to a registered source before the
+  V4.1 adapter

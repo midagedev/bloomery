@@ -2,11 +2,20 @@
 """The reading side of tools/ref/dma-dram-share.sh (its header has the run): the rows, the close, the copy's
 rate alone and the box's core layout. Reads logs only; takes no lease and starts no process.
 
+    dma-dram-share.py plan <conds> <token ms> <chunk> <ring> <fill threads> <block> <anon bytes>
     dma-dram-share.py row <round> <cond> <bench log> <copy log|-> <copy cpus>
-    dma-dram-share.py summary <rows file> <alone file>
+    dma-dram-share.py summary <rows file> <alone file> [<conds> [<block>]]
     dma-dram-share.py alone <copy log>
     dma-dram-share.py topology
     dma-dram-share.py --self-test
+
+plan      The conditions' grammar, its one parser: a comma list, each once, `alone` among them, of alone,
+          pageable, staged, staging:<n|max> and direct:<n|max> (n copies a token, a positive number). One
+          line a condition, `cond=<c> <h2d_probe arguments>`: pageable and staged copy the shard's map
+          in <chunk>s with <ring> and <fill threads>; staging is the residency machine's copy path, a
+          staged-loop over an anonymous window of <anon bytes> in <block>s, a ring of MACHINE_RING and
+          one fill thread; direct a direct-loop over the same window, MACHINE_RING in flight; n paces
+          them at n x 1000 / <token ms> blocks a second (--rate), max leaves them unpaced.
 
 row       One bench run's rows. The bench log is the runner's: every line `<epoch ms>\t<line>`. Per `time`
           line (one arm-round) the span runs from the line before it (the previous `time` line, or the
@@ -18,9 +27,15 @@ row       One bench run's rows. The bench log is the runner's: every line `<epoc
           inside it, [no-time-line] when the bench printed none.
             P2 round=<r> cond=<c> arm=<a> union_gbps=<U> copy_gbps=<C|-> admissible=<yes|no>[ tags]
 summary   The medians over rows with admissible=yes and no tag, and per round k = (U_alone - U_with) /
-          C_with against that round's alone row:
+          C_with against that round's alone row, a cell per condition of <conds> (default
+          alone,pageable,staged) but alone:
             P2 summary arm=<a> U_alone=<> | pageable U=<> C=<> k=<> n=<> | staged U=<> C=<> k=<> n=<> |
             copy alone pageable=<> staged=<>
+          and per staging or direct condition c, the mean of its per-round k, with the 95 % t interval
+          of that mean (tools/ref/tdist.py; `-` under two rounds) and its copies a second at <block>
+          bytes (default 16773120, one V4.1 expert):
+            P2 c arm=<a> cond=<c> C=<median> copies_per_s=<> c=<mean> lo=<> hi=<> n=<>
+          Beside a DRAM-bound leg k is c, the host-slot equivalents one copy costs (dma-dram-share.sh).
 alone     The mean GB/s of a copy log's intervals after its first (the first holds the loop's start).
 topology  `<threads> <cpus>`: the physical cores (the first cpu of each thread_siblings_list) less one per
           L3 group, and each group's last physical core, groups in cpu order — the bench's default thread
@@ -28,11 +43,68 @@ topology  `<threads> <cpus>`: the physical cores (the first cpu of each thread_s
           groups, physical cores first).
 """
 import glob
+import math
 import os
 import re
 import statistics
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tdist import t975  # noqa: E402  (tools/ref/tdist.py, beside this file)
+
+# The residency machine's staging ring (crates/gpu/src/host/swap.rs RING_SLOTS), and one V4.1 routed
+# expert's bytes, the block a staging or direct copy moves.
+MACHINE_RING = 4
+EXPERT_BYTES = 16773120
+DEFAULT_CONDS = "alone,pageable,staged"
+
+
+def plan(conds, token_ms, chunk, ring, fill, block, anon):
+    """`cond=<c> <h2d_probe arguments>` per condition, or SystemExit naming what the grammar refuses."""
+    def refuse(why):
+        raise SystemExit(f"dma-dram-share: --conds {conds}: {why}")
+    try:
+        tms = float(token_ms)
+    except ValueError:
+        tms = float("nan")
+    if not (math.isfinite(tms) and tms > 0):
+        raise SystemExit(f"dma-dram-share: --token-ms {token_ms}: a positive number of milliseconds")
+    chunk, ring, fill, block, anon = (int(v) for v in (chunk, ring, fill, block, anon))
+    if block % 4096 or anon % 4096 or anon < block:
+        raise SystemExit(f"dma-dram-share: --block {block} and --anon-bytes {anon}: multiples of 4096, "
+                         "the window at least one block")
+    names = conds.split(",")
+    if len(set(names)) != len(names):
+        refuse("a condition twice")
+    if "alone" not in names:
+        refuse("no alone condition: k is read against each round's alone row")
+    out = []
+    for c in names:
+        if c == "alone":
+            out.append("cond=alone")
+        elif c in ("pageable", "staged"):
+            out.append(f"cond={c} --arm {c}-loop --chunk {chunk} --ring {ring} --fill-threads {fill}")
+        else:
+            path, _, n = c.partition(":")
+            if path not in ("staging", "direct"):
+                refuse(f"unknown condition {c!r}; the conditions are alone, pageable, staged, "
+                       "staging:<n|max>, direct:<n|max>")
+            if n == "max":
+                rate = ""
+            else:
+                try:
+                    per_token = float(n)
+                except ValueError:
+                    per_token = float("nan")
+                if not (math.isfinite(per_token) and per_token > 0):
+                    refuse(f"{c}: n is a positive number of copies a token, or max")
+                rate = f" --rate {per_token * 1000 / tms:.6g}"
+            arm = "--arm staged-loop" if path == "staging" else "--arm direct-loop"
+            fills = " --fill-threads 1" if path == "staging" else ""
+            out.append(f"cond={c} {arm} --source anon --bytes {anon} --chunk {block} "
+                       f"--ring {MACHINE_RING}{fills}{rate}")
+    return out
 
 
 def fields(line):
@@ -93,7 +165,10 @@ def rows(rnd, cond, bench, copy, cpus):
     return out
 
 
-def summary(rows_path, alone_path):
+def summary(rows_path, alone_path, conds=DEFAULT_CONDS, block=EXPERT_BYTES):
+    plan(conds, "1", 4096, 2, 1, EXPERT_BYTES, EXPERT_BYTES)  # refuses a <conds> outside the grammar by name
+    names = [c for c in conds.split(",") if c != "alone"]
+    block = int(block)
     recs = []
     with open(rows_path, encoding="utf-8") as f:
         for line in f:
@@ -114,7 +189,8 @@ def summary(rows_path, alone_path):
         mine = [r for r in recs if r["arm"] == arm and r["clean"]]
         base = {r["round"]: float(r["union_gbps"]) for r in mine if r["cond"] == "alone"}
         cells = [f"P2 summary arm={arm} U_alone={med(list(base.values()))}"]
-        for cond in ("pageable", "staged"):
+        cs = []
+        for cond in names:
             u, c, k = [], [], []
             for r in mine:
                 if r["cond"] != cond or r["copy_gbps"] == "-":
@@ -124,9 +200,29 @@ def summary(rows_path, alone_path):
                 if r["round"] in base:
                     k.append((base[r["round"]] - u[-1]) / c[-1])
             cells.append(f"{cond} U={med(u)} C={med(c)} k={med(k)} n={len(u)}")
-        cells.append(f"copy alone pageable={alone.get('pageable-loop', '-')} staged={alone.get('staged-loop', '-')}")
+            if cond.startswith(("staging:", "direct:")):
+                cs.append(c_line(arm, cond, c, k, block))
+        cells.append("copy alone " + " ".join(f"{n}={alone.get(n, '-')}" for n in names))
         out.append(" | ".join(cells))
+        out.extend(cs)
     return out
+
+
+def c_line(arm, cond, c, k, block):
+    """The P2 c line: the mean of the per-round k with its 95 % t interval, and the copy's rate."""
+    rate = f"{statistics.median(c):.2f}" if c else "-"
+    per_s = f"{statistics.median(c) * 1e9 / block:.1f}" if c else "-"
+    if not k:
+        mean = lo = hi = "-"
+    else:
+        m = statistics.fmean(k)
+        mean = f"{m:.3f}"
+        if len(k) < 2:
+            lo = hi = "-"
+        else:
+            h = t975(len(k) - 1) * statistics.stdev(k) / math.sqrt(len(k))
+            lo, hi = f"{m - h:.3f}", f"{m + h:.3f}"
+    return f"P2 c arm={arm} cond={cond} C={rate} copies_per_s={per_s} c={mean} lo={lo} hi={hi} n={len(k)}"
 
 
 def alone_rate(path):
@@ -186,9 +282,60 @@ def self_test():
         ]
         assert got == want, got
         # k = (120 - 90) / 2 = 15 from round 1 against its alone row; rounds 2 and 3 carry tags and stay out
-        s = summary(write("rows", "\n".join(got) + "\n"), write("alone", "staged-loop 25.00\n"))
+        s = summary(write("rows", "\n".join(got) + "\n"), write("alone", "staged 25.00\n"))
         assert s == ["P2 summary arm=engine:6 U_alone=120.00 | pageable U=- C=- k=- n=0 | staged U=90.00 C=2.00 "
                      "k=15.00 n=1 | copy alone pageable=- staged=25.00"], s
+        # a block size passed where the conditions go is refused, not read as a condition named 16773120
+        try:
+            summary(write("rows2", "\n".join(got) + "\n"), write("alone2", "staged 25.00\n"), "16773120")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("summary took 16773120 for its conditions")
+        # the default conditions keep the probe's arguments the runner passed before --conds existed
+        assert plan(DEFAULT_CONDS, "37.5", 67108864, 4, 4, EXPERT_BYTES, 1006387200) == [
+            "cond=alone",
+            "cond=pageable --arm pageable-loop --chunk 67108864 --ring 4 --fill-threads 4",
+            "cond=staged --arm staged-loop --chunk 67108864 --ring 4 --fill-threads 4"], "default plan"
+        # 6 copies a token at 37.5 ms a token is 160 a second; 3 is 80; max is unpaced
+        got = plan("alone,staging:6,direct:3,staging:max,direct:max", "37.5", 67108864, 4, 4, EXPERT_BYTES,
+                   1006387200)
+        anon = "--source anon --bytes 1006387200 --chunk 16773120 --ring 4"
+        assert got == ["cond=alone",
+                       f"cond=staging:6 --arm staged-loop {anon} --fill-threads 1 --rate 160",
+                       f"cond=direct:3 --arm direct-loop {anon} --rate 80",
+                       f"cond=staging:max --arm staged-loop {anon} --fill-threads 1",
+                       f"cond=direct:max --arm direct-loop {anon}"], got
+        for bad in ("staging:6", "alone,alone", "alone,copy:3", "alone,staging:0", "alone,direct:x",
+                    "alone,staging:"):
+            try:
+                plan(bad, "37.5", 67108864, 4, 4, EXPERT_BYTES, 1006387200)
+            except SystemExit:
+                continue
+            raise AssertionError(f"plan accepted --conds {bad}")
+        # c: per round k against that round's alone row, then the mean and its t interval. Staging: round 1
+        # (120 - 114) / 2 = 3, round 2 (118 - 113) / 2.5 = 2, round 3's row is tagged and stays out; direct:
+        # 0.5 and 1.0, and round 3's row counts in U and C but has no clean alone row to give a k: n = 2
+        # each. t975(1) = 12.706: staging h = 12.706 * 0.7071 / sqrt(2) = 6.353, direct 3.176.
+        rows_c = [
+            "P2 round=1 cond=alone arm=engine:5 union_gbps=120.00 copy_gbps=- admissible=yes",
+            "P2 round=1 cond=staging:6 arm=engine:5 union_gbps=114.00 copy_gbps=2.00 admissible=yes",
+            "P2 round=1 cond=direct:6 arm=engine:5 union_gbps=119.00 copy_gbps=2.00 admissible=yes",
+            "P2 round=2 cond=alone arm=engine:5 union_gbps=118.00 copy_gbps=- admissible=yes",
+            "P2 round=2 cond=staging:6 arm=engine:5 union_gbps=113.00 copy_gbps=2.50 admissible=yes",
+            "P2 round=2 cond=direct:6 arm=engine:5 union_gbps=116.00 copy_gbps=2.00 admissible=yes",
+            "P2 round=3 cond=alone arm=engine:5 union_gbps=90.00 copy_gbps=- admissible=yes [unpinned]",
+            "P2 round=3 cond=staging:6 arm=engine:5 union_gbps=60.00 copy_gbps=2.00 admissible=yes [copy-gap]",
+            "P2 round=3 cond=direct:6 arm=engine:5 union_gbps=80.00 copy_gbps=2.00 admissible=yes",
+        ]
+        s = summary(write("rc", "\n".join(rows_c) + "\n"), write("ac", "staging:6 2.70\ndirect:6 2.68\n"),
+                    "alone,staging:6,direct:6", "16773120")
+        assert s == [
+            "P2 summary arm=engine:5 U_alone=119.00 | staging:6 U=113.50 C=2.25 k=2.50 n=2 | direct:6 U=116.00 "
+            "C=2.00 k=0.75 n=3 | copy alone staging:6=2.70 direct:6=2.68",
+            "P2 c arm=engine:5 cond=staging:6 C=2.25 copies_per_s=134.1 c=2.500 lo=-3.853 hi=8.853 n=2",
+            "P2 c arm=engine:5 cond=direct:6 C=2.00 copies_per_s=119.2 c=0.750 lo=-2.426 hi=3.926 n=2",
+        ], s
         # the probe's two shapes around a stop-file written after the bench's time line (11000): the copy's
         # full intervals end at 10600 and it stops at 11300. The old probe printed nothing for the last 700 ms,
         # so the span was never covered to its end; the probe now flushes that partial interval at the stop.
@@ -228,10 +375,12 @@ def self_test():
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
-    if len(argv) == 6 and argv[0] == "row":
+    if len(argv) == 8 and argv[0] == "plan":
+        print("\n".join(plan(*argv[1:])))
+    elif len(argv) == 6 and argv[0] == "row":
         print("\n".join(rows(*argv[1:])))
-    elif len(argv) == 3 and argv[0] == "summary":
-        print("\n".join(summary(argv[1], argv[2])))
+    elif 3 <= len(argv) <= 5 and argv[0] == "summary":
+        print("\n".join(summary(*argv[1:])))
     elif len(argv) == 2 and argv[0] == "alone":
         print(alone_rate(argv[1]))
     elif argv == ["topology"]:

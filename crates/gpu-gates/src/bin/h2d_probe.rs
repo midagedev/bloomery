@@ -32,18 +32,37 @@
 //!   origin), and their sum. Needs two cards in view.
 //! - `attach`: `nvidia-smi topo -m`, each line as `h2d topo | <line>`, then
 //!   every card in view's card line with its link as it reads idle.
-//! - `pageable-loop`, `staged-loop`: the copy side of
+//! - `pageable-loop`, `staged-loop`, `direct-loop`: the copy side of
 //!   `tools/ref/dma-dram-share.sh`. They run alone, until `--stop-file`
 //!   exists or `--seconds` pass (required, the bound), over a warm window of
-//!   `--bytes` (1,600,000,000) of the V4.1 first shard's map, `--chunk` (64
-//!   MiB) at a time, cycling. `pageable-loop` copies each chunk from the map
-//!   (the driver stages it); `staged-loop` is the streaming design: a ring of
-//!   `--ring` (4) pinned chunks, each filled from the map by `--fill-threads`
-//!   (4) threads with plain `copy_from_slice` and then copied to the card
-//!   while the next one fills, a slot refilled only after its copy's event.
-//!   Every `--interval-ms` (1000): `h2d loop arm=<a> t_ms=<unix epoch ms>
+//!   `--bytes` (1,600,000,000) of `--source`, `--chunk` (64 MiB) at a time,
+//!   cycling. `--source shard` (the default) is the V4.1 first shard's map;
+//!   `--source anon` is an anonymous mapping of the window, every word
+//!   written once with a pattern of its offset before the loop (no page is
+//!   the shared zero page, and a misplaced byte reads as a different value),
+//!   so the loop touches no model file. `pageable-loop` copies each chunk
+//!   from the source (the driver stages it); `staged-loop` is the streaming
+//!   design and the residency machine's copy path: a ring of `--ring` (4)
+//!   pinned chunks, each filled from the source by `--fill-threads` (4)
+//!   threads with plain `copy_from_slice` (one thread copies on the loop's
+//!   own thread, as the machine's single staging thread does) and then
+//!   copied to the card while the next one fills, a slot refilled only after
+//!   its copy's event; `direct-loop` registers the source with
+//!   `cuMemHostRegister` once (read-only for the shard's map, which this box
+//!   refuses) and copies each chunk from it with no host copy, `--ring`
+//!   copies in flight. `--rate R` paces a loop at R chunks a second (chunk
+//!   `i` starts no earlier than `i / R` seconds after the first; a loop
+//!   behind its pace starts the next at once, and the interval lines give
+//!   the rate it held); without it a loop copies as fast as it can. Every
+//!   `--interval-ms` (1000): `h2d loop arm=<a> t_ms=<unix epoch ms>
 //!   interval_ms=<ms> bytes=<b> GB/s=<v>`, bytes counted when their copy is
 //!   known complete; then one `h2d loop arm=<a> summary …` line.
+//!   `--check` runs one pass over the window instead, each chunk into its
+//!   own device buffer (no `--seconds` needed), reads every buffer back and
+//!   compares it with its chunk of the source byte for byte, and counts the
+//!   bytes the loop's accounting claims against the pass's:
+//!   `h2d check arm=<a> … mismatched_chunks=<n> counted=<b> want=<b>`; a
+//!   mismatch or a count off ends the run with an error.
 //!
 //! Every copy arm samples each of its cards'
 //! `current_link_speed`/`current_link_width` from sysfs every `SAMPLE_EVERY` while
@@ -80,7 +99,7 @@ mod probe {
     use cuda_core::{
         CudaContext, CudaEvent, CudaStream, DeviceBuffer, IntoResult, PinnedHostBuffer, sys,
     };
-    use memmap2::Mmap;
+    use memmap2::{Mmap, MmapMut};
 
     /// Bytes of the three one-shot paths unless `--bytes` says otherwise: 1 GiB.
     const PATH_BYTES: usize = 1 << 30;
@@ -100,6 +119,8 @@ mod probe {
     const RING: usize = 4;
     const FILL_THREADS: usize = 4;
     const INTERVAL_MS: u64 = 1000;
+    /// The seed of an anonymous source's pattern.
+    const PATTERN_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
     /// How often the link sampler reads sysfs.
     const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 
@@ -113,10 +134,11 @@ mod probe {
         Attach,
         PageableLoop,
         StagedLoop,
+        DirectLoop,
     }
 
     impl Arm {
-        const ALL: [(&'static str, Arm); 8] = [
+        const ALL: [(&'static str, Arm); 9] = [
             ("pinned", Arm::Pinned),
             ("pageable", Arm::Pageable),
             ("registered", Arm::Registered),
@@ -125,6 +147,7 @@ mod probe {
             ("attach", Arm::Attach),
             ("pageable-loop", Arm::PageableLoop),
             ("staged-loop", Arm::StagedLoop),
+            ("direct-loop", Arm::DirectLoop),
         ];
 
         fn parse(name: &str) -> Result<Arm, GateError> {
@@ -147,7 +170,7 @@ mod probe {
         }
 
         fn is_loop(self) -> bool {
-            matches!(self, Arm::PageableLoop | Arm::StagedLoop)
+            matches!(self, Arm::PageableLoop | Arm::StagedLoop | Arm::DirectLoop)
         }
 
         fn default_bytes(self) -> usize {
@@ -165,6 +188,15 @@ mod probe {
         }
     }
 
+    /// Where a loop's window lives.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum SourceKind {
+        /// The V4.1 first shard's read-only map.
+        Shard,
+        /// An anonymous mapping, first-touched with a pattern.
+        Anon,
+    }
+
     struct Args {
         arms: Vec<Arm>,
         bytes: Option<usize>,
@@ -175,10 +207,15 @@ mod probe {
         ring: usize,
         fill_threads: usize,
         interval_ms: u64,
+        source: SourceKind,
+        /// Chunks a second a loop is paced at; `None` copies as fast as it can.
+        rate: Option<f64>,
+        check: bool,
     }
 
     const USAGE: &str = "usage: h2d_probe [--arm A[,B…]] [--bytes N] [--reps K] [--seconds S] \
-        [--stop-file PATH] [--chunk N] [--ring R] [--fill-threads T] [--interval-ms M]";
+        [--stop-file PATH] [--chunk N] [--ring R] [--fill-threads T] [--interval-ms M] \
+        [--source shard|anon] [--rate R] [--check]";
 
     fn args() -> Result<Args, GateError> {
         let mut a = Args {
@@ -191,6 +228,9 @@ mod probe {
             ring: RING,
             fill_threads: FILL_THREADS,
             interval_ms: INTERVAL_MS,
+            source: SourceKind::Shard,
+            rate: None,
+            check: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -233,6 +273,24 @@ mod probe {
                         .parse()
                         .map_err(|e| format!("--interval-ms {v}: {e}; {USAGE}"))?;
                 }
+                "--source" => {
+                    a.source = match value("--source")?.as_str() {
+                        "shard" => SourceKind::Shard,
+                        "anon" => SourceKind::Anon,
+                        v => return Err(format!("--source {v}: shard or anon; {USAGE}").into()),
+                    }
+                }
+                "--rate" => {
+                    let v = value("--rate")?;
+                    let r: f64 = v.parse().map_err(|e| format!("--rate {v}: {e}; {USAGE}"))?;
+                    if !(r.is_finite() && r > 0.0) {
+                        return Err(
+                            format!("--rate {v}: a positive number of chunks a second").into()
+                        );
+                    }
+                    a.rate = Some(r);
+                }
+                "--check" => a.check = true,
                 other => return Err(format!("unknown argument {other}; {USAGE}").into()),
             }
         }
@@ -244,18 +302,33 @@ mod probe {
         let loops = a.arms.iter().filter(|x| x.is_loop()).count();
         if loops > 0 && a.arms.len() > 1 {
             return Err(
-                "a loop arm (pageable-loop, staged-loop) runs alone: it copies until its stop \
+                "a loop arm (pageable-loop, staged-loop, direct-loop) runs alone: it copies until its stop \
                         file or its seconds, beside another process"
                     .into(),
             );
         }
-        if loops > 0 && a.seconds.is_none() {
+        if loops > 0 && !a.check && a.seconds.is_none() {
             return Err(
                 "a loop arm needs --seconds, the bound it stops at without its stop file".into(),
             );
         }
-        if loops == 0 && (a.seconds.is_some() || a.stop_file.is_some()) {
-            return Err("--seconds and --stop-file belong to the loop arms".into());
+        if a.check && (a.seconds.is_some() || a.stop_file.is_some()) {
+            return Err(
+                "--check runs one pass over the window: it takes neither --seconds nor --stop-file"
+                    .into(),
+            );
+        }
+        if loops == 0
+            && (a.seconds.is_some()
+                || a.stop_file.is_some()
+                || a.rate.is_some()
+                || a.check
+                || a.source != SourceKind::Shard)
+        {
+            return Err(
+                "--seconds, --stop-file, --rate, --check and --source belong to the loop arms"
+                    .into(),
+            );
         }
         for &arm in &a.arms {
             let bytes = a.bytes.unwrap_or(arm.default_bytes());
@@ -469,15 +542,59 @@ mod probe {
         Ok(ms)
     }
 
+    /// A source's pages: the shard's read-only map, or an anonymous mapping.
+    enum Backing {
+        Shard(Mmap),
+        Anon(MmapMut),
+    }
+
     /// The first `bytes` of the V4.1 first shard's read-only map, every page
-    /// read once so the range is resident.
+    /// read once so the range is resident; or an anonymous window of `bytes`
+    /// (`--source anon`), every word written once.
     struct Source {
         path: String,
-        map: Mmap,
+        map: Backing,
         bytes: usize,
     }
 
+    /// Word `w` of an anonymous source: distinct for every word of the
+    /// window, so a chunk copied to the wrong place or half-copied differs.
+    fn pattern(w: u64) -> u64 {
+        let mut z = w.wrapping_add(PATTERN_SEED);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
     impl Source {
+        fn of(kind: SourceKind, bytes: usize) -> Result<Source, GateError> {
+            match kind {
+                SourceKind::Shard => Source::open(bytes),
+                SourceKind::Anon => Source::anon(bytes),
+            }
+        }
+
+        fn anon(bytes: usize) -> Result<Source, GateError> {
+            let mut map =
+                MmapMut::map_anon(bytes).map_err(|e| format!("anonymous map of {bytes}: {e}"))?;
+            for (w, word) in map.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                *word = pattern(w as u64).to_le_bytes();
+            }
+            Ok(Source {
+                path: "anon".into(),
+                map: Backing::Anon(map),
+                bytes,
+            })
+        }
+
+        /// The source as the start line names it.
+        fn label(&self) -> String {
+            match self.map {
+                Backing::Shard(_) => format!("source=shard shard={}", self.path),
+                Backing::Anon(_) => "source=anon".into(),
+            }
+        }
+
         fn open(bytes: usize) -> Result<Source, GateError> {
             let path = gguf::v41::model();
             let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -495,11 +612,18 @@ mod probe {
                 .step_by(PAGE)
                 .fold(0u64, |s, &b| s.wrapping_add(u64::from(b)));
             std::hint::black_box(warm);
-            Ok(Source { path, map, bytes })
+            Ok(Source {
+                path,
+                map: Backing::Shard(map),
+                bytes,
+            })
         }
 
         fn window(&self) -> &[u8] {
-            &self.map[..self.bytes]
+            match &self.map {
+                Backing::Shard(m) => &m[..self.bytes],
+                Backing::Anon(m) => &m[..self.bytes],
+            }
         }
     }
 
@@ -850,73 +974,188 @@ mod probe {
         }
     }
 
+    /// When a loop stops and when its next chunk may start.
+    struct Pace {
+        started: Instant,
+        /// The bound without a stop file; `None` under `--check`.
+        seconds: Option<f64>,
+        /// Chunks a second; `None` copies as fast as it can.
+        rate: Option<f64>,
+        /// `--check`: the chunks of the one pass.
+        pass: Option<usize>,
+    }
+
+    impl Pace {
+        fn new(a: &Args, started: Instant, chunks: usize) -> Pace {
+            Pace {
+                started,
+                seconds: a.seconds,
+                rate: a.rate,
+                pass: a.check.then_some(chunks),
+            }
+        }
+
+        /// Why the loop stops before chunk `i`, or `None` once chunk `i` may
+        /// start: under `--rate`, no earlier than `i / rate` seconds in.
+        fn before(&self, a: &Args, i: usize) -> Option<&'static str> {
+            match (self.pass, self.seconds) {
+                (Some(n), _) if i >= n => return Some("pass"),
+                (None, Some(s)) => {
+                    if let Some(why) = stop(a, self.started, s) {
+                        return Some(why);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(r) = self.rate {
+                let due = self.started + Duration::from_secs_f64(i as f64 / r);
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+            }
+            None
+        }
+    }
+
+    /// What a loop copies: the chunks of the window in order, cycling, chunk
+    /// `i` into device buffer `i % dests.len()` (one buffer, or one per chunk
+    /// under `--check`).
+    struct Work<'a> {
+        src: &'a Source,
+        offsets: &'a [usize],
+        chunk: usize,
+    }
+
+    impl Work<'_> {
+        fn from(&self, i: usize) -> &[u8] {
+            let off = self.offsets[i % self.offsets.len()];
+            &self.src.window()[off..off + self.chunk]
+        }
+    }
+
     fn copy_loop(ctx: &Arc<CudaContext>, card: &Card, arm: Arm, a: &Args) -> Result<(), GateError> {
-        let seconds = a
-            .seconds
-            .expect("check_args requires --seconds for a loop arm");
         let bytes = a.bytes.unwrap_or(arm.default_bytes());
         let chunk = a.chunk_bytes;
-        let src = Source::open(bytes)?;
+        let src = Source::of(a.source, bytes)?;
         let offsets: Vec<usize> = (0..bytes / chunk).map(|i| i * chunk).collect();
         let stream = ctx.new_stream()?;
-        let mut dev = DeviceBuffer::<u8>::zeroed(&stream, chunk)?;
-        let window = src.window();
+        let buffers = if a.check { offsets.len() } else { 1 };
+        let mut dests: Vec<DeviceBuffer<u8>> = (0..buffers)
+            .map(|_| DeviceBuffer::<u8>::zeroed(&stream, chunk))
+            .collect::<Result<_, _>>()?;
+        let work = Work {
+            src: &src,
+            offsets: &offsets,
+            chunk,
+        };
         let sampler = Sampler::start(card);
         let mut meter = Meter::new(arm, a.interval_ms);
+        let pace = Pace::new(a, meter.started, offsets.len());
         println!(
             "h2d loop arm={} {} start t_ms={} window={bytes} chunk={chunk} ring={} fill_threads={} \
-             fill_bytes_per_thread={} shard={}",
+             fill_bytes_per_thread={} rate={} check={} {}",
             arm.name(),
             card.tag(),
             epoch_ms()?,
             a.ring,
             a.fill_threads,
             chunk.div_ceil(a.fill_threads),
-            src.path
+            a.rate.map_or_else(|| "max".to_string(), |r| format!("{r}")),
+            a.check,
+            src.label()
         );
-        let why = if arm == Arm::PageableLoop {
-            let mut i = 0;
-            loop {
-                if let Some(why) = stop(a, meter.started, seconds) {
-                    break why;
+        let (why, chunks) = match arm {
+            Arm::PageableLoop => {
+                let mut i = 0;
+                loop {
+                    if let Some(why) = pace.before(a, i) {
+                        break (why, i);
+                    }
+                    let n = dests.len();
+                    dests[i % n].copy_from_host(&stream, work.from(i))?;
+                    meter.done(chunk)?;
+                    i += 1;
                 }
-                let off = offsets[i % offsets.len()];
-                dev.copy_from_host(&stream, &window[off..off + chunk])?;
-                meter.done(chunk)?;
-                i += 1;
             }
-        } else {
-            staged(ctx, &stream, &mut dev, window, &offsets, a, &mut meter)?
+            Arm::StagedLoop => staged(ctx, &stream, &mut dests, &work, a, &pace, &mut meter)?,
+            _ => direct(ctx, &stream, &mut dests, &work, a, &pace, &mut meter)?,
         };
         meter.flush()?;
         sampler.finish(arm, card)?;
         let s = meter.started.elapsed().as_secs_f64();
         println!(
-            "h2d loop arm={} {} summary t_ms={} seconds={s:.2} bytes={} GB/s={:.2} stopped={why}",
+            "h2d loop arm={} {} summary t_ms={} seconds={s:.2} bytes={} GB/s={:.2} chunks={chunks} \
+             chunks_per_s={:.2} stopped={why}",
             arm.name(),
             card.tag(),
             epoch_ms()?,
             meter.bytes,
-            meter.bytes as f64 / s / 1e9
+            meter.bytes as f64 / s / 1e9,
+            chunks as f64 / s
         );
+        if a.check {
+            check_pass(arm, card, &stream, &dests, &work, meter.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// `--check`: every chunk of the pass read back from its own device
+    /// buffer and compared with its chunk of the source, and the bytes the
+    /// loop counted against the pass's.
+    fn check_pass(
+        arm: Arm,
+        card: &Card,
+        stream: &CudaStream,
+        dests: &[DeviceBuffer<u8>],
+        work: &Work<'_>,
+        counted: usize,
+    ) -> Result<(), GateError> {
+        let want = dests.len() * work.chunk;
+        let mut bad = Vec::new();
+        for (j, d) in dests.iter().enumerate() {
+            if d.to_host_vec(stream)? != work.from(j) {
+                bad.push(j);
+            }
+        }
+        println!(
+            "h2d check arm={} {} chunks={} chunk={} mismatched_chunks={} first_bad={} counted={counted} \
+             want={want}",
+            arm.name(),
+            card.tag(),
+            dests.len(),
+            work.chunk,
+            bad.len(),
+            bad.first()
+                .map_or_else(|| "-".to_string(), usize::to_string)
+        );
+        if !bad.is_empty() || counted != want {
+            return Err(format!(
+                "h2d check arm={}: {} of {} chunks differ from the source on the card (first {:?}), \
+                 and the loop counted {counted} bytes of the pass's {want}",
+                arm.name(),
+                bad.len(),
+                dests.len(),
+                bad.first()
+            )
+            .into());
+        }
         Ok(())
     }
 
     /// The streaming design's copy: a ring of pinned chunks, each filled by
-    /// the fill threads and copied to the card while the next fills.
+    /// the fill threads and copied to the card while the next fills. The
+    /// chunks it started, and why it stopped.
     fn staged(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
-        dev: &mut DeviceBuffer<u8>,
-        window: &[u8],
-        offsets: &[usize],
+        dests: &mut [DeviceBuffer<u8>],
+        work: &Work<'_>,
         a: &Args,
+        pace: &Pace,
         meter: &mut Meter,
-    ) -> Result<&'static str, GateError> {
-        let seconds = a
-            .seconds
-            .expect("check_args requires --seconds for a loop arm");
-        let chunk = a.chunk_bytes;
+    ) -> Result<(&'static str, usize), GateError> {
+        let chunk = work.chunk;
         let per_thread = chunk.div_ceil(a.fill_threads);
         let mut ring: Vec<PinnedHostBuffer<u8>> = (0..a.ring)
             .map(|_| PinnedHostBuffer::<u8>::zeroed(ctx, chunk))
@@ -924,9 +1163,10 @@ mod probe {
         let events: Vec<CudaEvent> = (0..a.ring)
             .map(|_| ctx.new_event(None))
             .collect::<Result<_, _>>()?;
+        let n = dests.len();
         let mut i = 0;
         let why = loop {
-            if let Some(why) = stop(a, meter.started, seconds) {
+            if let Some(why) = pace.before(a, i) {
                 break why;
             }
             let slot = i % a.ring;
@@ -934,27 +1174,112 @@ mod probe {
                 events[slot].synchronize()?;
                 meter.done(chunk)?;
             }
-            let off = offsets[i % offsets.len()];
-            let from = &window[off..off + chunk];
-            std::thread::scope(|s| {
-                for (dst, src) in ring[slot]
-                    .as_mut_slice()
-                    .chunks_mut(per_thread)
-                    .zip(from.chunks(per_thread))
-                {
-                    s.spawn(move || dst.copy_from_slice(src));
-                }
-            });
+            let from = work.from(i);
+            if a.fill_threads == 1 {
+                ring[slot].as_mut_slice().copy_from_slice(from);
+            } else {
+                std::thread::scope(|s| {
+                    for (dst, src) in ring[slot]
+                        .as_mut_slice()
+                        .chunks_mut(per_thread)
+                        .zip(from.chunks(per_thread))
+                    {
+                        s.spawn(move || dst.copy_from_slice(src));
+                    }
+                });
+            }
             // SAFETY: `ring[slot]` is not written again until `events[slot]`,
             // recorded after this copy, has been synchronized, and the ring
             // outlives the stream's last copy (synchronized below).
-            unsafe { dev.copy_from_pinned_host_async(stream, &ring[slot])? };
+            unsafe { dests[i % n].copy_from_pinned_host_async(stream, &ring[slot])? };
             events[slot].record(stream)?;
             i += 1;
         };
         stream.synchronize()?;
         meter.done(chunk * i.min(a.ring))?;
-        Ok(why)
+        Ok((why, i))
+    }
+
+    /// The copy with no staging: the source registered once, each chunk
+    /// copied from it by the card's DMA, `--ring` copies in flight. The
+    /// chunks it started, and why it stopped; the source is unregistered on
+    /// every path, after the stream has drained.
+    fn direct(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        dests: &mut [DeviceBuffer<u8>],
+        work: &Work<'_>,
+        a: &Args,
+        pace: &Pace,
+        meter: &mut Meter,
+    ) -> Result<(&'static str, usize), GateError> {
+        let src = work.src;
+        let flags = match src.map {
+            Backing::Shard(_) => sys::CU_MEMHOSTREGISTER_READ_ONLY,
+            Backing::Anon(_) => 0,
+        };
+        let at = src.window().as_ptr().cast_mut().cast::<c_void>();
+        ctx.bind_to_thread()?;
+        let t = Instant::now();
+        // SAFETY: `at .. at + bytes` is the live source's window, page-aligned
+        // (a map starts on a page) and whole pages; the unregister below runs
+        // on every path before `src` can drop, after the stream has drained.
+        let rc = unsafe { sys::cuMemHostRegister_v2(at, src.bytes, flags) };
+        rc.result().map_err(|e| {
+            format!(
+                "cuMemHostRegister({flags}) of the {} source: {e:?}",
+                src.path
+            )
+        })?;
+        println!(
+            "h2d loop arm={} registered bytes={} flags={flags} register_ms={:.1}",
+            Arm::DirectLoop.name(),
+            src.bytes,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        let copies = direct_copies(ctx, stream, dests, work, a, pace, meter);
+        let drained = stream.synchronize();
+        // SAFETY: `at` is the base the register call above took, and no copy
+        // from it is in flight: the stream is synchronized.
+        let rc = unsafe { sys::cuMemHostUnregister(at) };
+        let (why, i) = copies?;
+        drained?;
+        rc.result()
+            .map_err(|e| format!("cuMemHostUnregister of the {} source: {e:?}", src.path))?;
+        meter.done(work.chunk * i.min(a.ring))?;
+        Ok((why, i))
+    }
+
+    fn direct_copies(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        dests: &mut [DeviceBuffer<u8>],
+        work: &Work<'_>,
+        a: &Args,
+        pace: &Pace,
+        meter: &mut Meter,
+    ) -> Result<(&'static str, usize), GateError> {
+        let events: Vec<CudaEvent> = (0..a.ring)
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<_, _>>()?;
+        let n = dests.len();
+        let mut i = 0;
+        let why = loop {
+            if let Some(why) = pace.before(a, i) {
+                break why;
+            }
+            let slot = i % a.ring;
+            if i >= a.ring {
+                events[slot].synchronize()?;
+                meter.done(work.chunk)?;
+            }
+            // SAFETY: the chunk is inside the registered window, which stays
+            // registered and alive until `direct` has drained the stream.
+            unsafe { dests[i % n].copy_from_host_async_unchecked(stream, work.from(i))? };
+            events[slot].record(stream)?;
+            i += 1;
+        };
+        Ok((why, i))
     }
 
     pub fn run() -> Result<(), GateError> {

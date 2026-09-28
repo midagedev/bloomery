@@ -303,6 +303,10 @@ time-gpu-h2d:
 # 고정하고, 라운드마다 두 율과 k = (U_alone − U_with) / C_with를 찍는다. ARGS는 tools/ref/dma-dram-share.sh로 간다(--arms는
 # 벤치의 팔을 그대로 넘기고 --rounds, --seconds, --chunk, --fill-threads …). 카드는 docs/cards/dma-dram-share.card다.
 # 예: `BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/dma-dram-share.card' just time-dma-dram --arms engine:6`.
+# `--conds`로 조건을 고른다: residency 머신의 복사 경로(staging:<n|max>, 익명 원본에서 expert 하나씩 memcpy → pinned 링 → DMA)와
+# 등록 원본의 직접 DMA(direct:<n|max>)를 토큰당 n개(--token-ms 기준)로 맞춰 돌리면, DRAM에 묶인 V4.1 engine:5 옆에서
+# k가 곧 c(복사 하나가 먹는 호스트 슬롯 수)다. 카드는 docs/cards/cprobe.card다. 예: `BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/cprobe.card'
+# just time-dma-dram --arms engine:5 --conds alone,staging:3,staging:6,direct:3,direct:6,staging:max,direct:max --rounds 4 --seconds 8 --copy-alone 5`.
 time-dma-dram *ARGS:
     BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/dma-dram-share.sh {{ARGS}}'
 
