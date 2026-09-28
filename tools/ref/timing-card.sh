@@ -367,8 +367,9 @@ guard_cards() {
 # when a card stopped answering or the 3090 left its cap, or when the engine's log does not show exactly
 # the two cards as its devices 0 and 1 (ggml_cuda_init's `found N CUDA devices` and `Device i:` lines): a
 # llama-bench that sees one card spreads nothing and would be timed as if it were one card. With `ours`
-# the log is one of our binaries': its first `load` record's `cards` (read by tools/bloomery/records.py)
-# must name the A6000 and the 3090. TWOCARD_DEVS is `<device 0> + <device 1>` for the row.
+# the log is one of our binaries': its first `load` record's `cards` (read by tools/bloomery/records.py),
+# the devices' own names, must be exactly two, the A6000's then the 3090's (the stage card, then the
+# tier). TWOCARD_DEVS is `<device 0> + <device 1>` for the row.
 timing_cards_arm() {
   local n d0 d1 rec CARDS
   TWOCARD_WHY='' TWOCARD_DEVS=''
@@ -390,8 +391,9 @@ timing_cards_arm() {
       return 1
     }
     eval "$rec"
-    d0=${CARDS#\[} d0=${d0%\]}
-    if [[ ,$d0, == *,A6000,* && ,$d0, == *,3090,* ]]; then
+    # The record's cards are the devices' own names, each space written `_`.
+    d0=${CARDS#\[} d0=${d0%\]} d0=${d0//_/ }
+    if [[ $d0 =~ ^[^,]*A6000[^,]*,[^,]*3090[^,]*$ ]]; then
       # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
       TWOCARD_DEVS="${d0//,/ + }"
       return 0

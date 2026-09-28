@@ -1,7 +1,8 @@
 //! What a V4.1 binary's placement decides beside its plan
 //! (`bloomery_gpu_gates::generate::Place`): the expert tier's prompt-batch
-//! bytes the plan reserves, and the `load` record's cards — the tier card's
-//! experts and resident bytes when the placement has one. `generate_ds41`,
+//! bytes the plan reserves, and the `load` record's cards — the devices the
+//! model runs on, and the tier card's experts and resident bytes when the
+//! placement has one. `generate_ds41`,
 //! `bloomery-serve-ds41` and `bloomery-chat` read them here.
 
 use bloomery_gpu_deepseek41::body::Deepseek41Model;
@@ -20,19 +21,35 @@ pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
         .map(|_| model::arch::deepseek41::place::tier_batch(hp))
 }
 
-/// `r` with the cards `place` loaded (`cards`) and, when it has an expert
-/// tier card, the tier's experts and resident bytes. A model whose tier
-/// does not match the placement — none where the placement names one, one
-/// where it names none, or a tier on another card — is refused by name.
+/// `r` with the devices the model runs on (`cards`: the stage card, then
+/// the tier card), by the names their drivers report — each space written
+/// `_`, since the field is one word — and, when the placement has an expert
+/// tier card, the tier's experts and resident bytes. A device whose name does
+/// not hold the placement's card name, and a model whose tier does not match
+/// the placement — none where the placement names one, one where it names
+/// none, or a tier on another card — are refused by name.
 pub fn with_cards(
     m: &Deepseek41Model,
     place: Place,
     what: &'static str,
     r: Record,
 ) -> Result<Record, GateError> {
-    let cards = place.cards();
     let tier = m.body(what)?.hybrid().tier();
-    let r = r.csv("cards", cards.iter());
+    let mut devices = vec![m.gpu().device_name()?];
+    if let Some(t) = tier {
+        devices.push(t.gpu().device_name()?);
+    }
+    let planned = place.cards();
+    let named =
+        devices.len() == planned.len() && devices.iter().zip(planned).all(|(d, p)| d.contains(p));
+    if !named {
+        return Err(format!(
+            "--place {}: the model runs on {devices:?}, the placement's cards are {planned:?}",
+            place.name()
+        )
+        .into());
+    }
+    let r = r.csv("cards", devices.iter().map(|d| d.replace(' ', "_")));
     match (tier, place.tier_card()) {
         (None, None) => Ok(r),
         (Some(t), Some(name)) if t.name() == name => Ok(r

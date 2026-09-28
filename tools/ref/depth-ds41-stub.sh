@@ -244,7 +244,7 @@ echo "${arms[*]:-one}" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ ${#arms[@]} -gt 0 ] || arms=("$depth")
 echo "plan place=$place (stub)"
 cards=${STUB_GEN_CARDS:-}
-[ -n "$cards" ] || [ "$place" != bp ] || cards='[A6000,3090]'
+[ -n "$cards" ] || [ "$place" != bp ] || cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]'
 if [ -n "$cards" ]; then
   echo "load resident_bytes=0 place=$place cards=$cards arms=${#arms[@]} (stub)"
 else
@@ -621,16 +621,16 @@ if [ "$RC" != 0 ]; then
   fail twocard-bp "rc $RC, want 0" "$L"
 elif want twocard-bp "$L" 1 '^ROW r1 ours d=6 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place bp \| ' &&
   want twocard-bp "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 ' &&
-  want twocard-bp "$L" 1 '^    load resident_bytes=0 place=bp cards=\[A6000,3090\] ' &&
+  want twocard-bp "$L" 1 '^    load resident_bytes=0 place=bp cards=\[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\] ' &&
   want twocard-bp "$L" 0 '^FAIL '; then
   pass twocard-bp
 fi
 
 L=$tmp/twocard-bp-one.log
-stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp 'STUB_GEN_CARDS=[A6000]' -- 6
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp 'STUB_GEN_CARDS=[NVIDIA_RTX_A6000]' -- 6
 if [ "$RC" != 1 ]; then
   fail twocard-bp-one "rc $RC, want 1" "$L"
-elif want twocard-bp-one "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names cards \[A6000\], not the A6000 and the 3090: a one-card run in the two-card table" &&
+elif want twocard-bp-one "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000\], not the A6000 and the 3090: a one-card run in the two-card table" &&
   want twocard-bp-one "$L" 0 '^ROW '; then
   pass twocard-bp-one
 fi

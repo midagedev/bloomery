@@ -49,8 +49,10 @@
 //! - `--lost`: on the two-card model, the tier's stream held behind a host
 //!   flag before a step — the tier stops signalling: within the go deadline
 //!   and its grace the step fails naming the lost card, no token comes out,
-//!   the host tier is poisoned as a lost card, and the next step is refused;
-//!   the flag is then raised and both streams drain.
+//!   the host tier is poisoned as a lost card, and the next step is refused
+//!   by that poison at its entry (`GpuError::HostPoisoned` as
+//!   `DECODE_INPUT`, a lost card); the flag is then
+//!   raised and both streams drain.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -81,12 +83,12 @@ mod gate {
 
     use app::arch::deepseek41::{CardDraft, Ds41Cfg};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
-    use bloomery_gpu::HostFlags;
     use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::hybrid::PoisonKind;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::{GpuError, HostFlags};
     use bloomery_gpu_deepseek41::body::{
-        Body, BodyMeta, Deepseek41Model, OpenCfg, PAIR_ROWS, PrefillMode,
+        Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PAIR_ROWS, PrefillMode,
     };
     use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::generate::Place;
@@ -793,9 +795,18 @@ mod gate {
             ok = false;
         }
         match m.step(&[prompt[5]]) {
-            Err(e) => println!("ok lost: the next step is refused: {e}"),
-            Ok(t) => {
-                println!("FAIL lost: the next step gave token {t}");
+            Err(GpuError::HostPoisoned { what, poison })
+                if what == DECODE_INPUT && poison.mark().kind == PoisonKind::CardLost =>
+            {
+                println!(
+                    "ok lost: the next step is refused by the lost card's poison: {what}: {poison}"
+                );
+            }
+            other => {
+                println!(
+                    "FAIL lost: the next step gave {other:?}, want the host tier's refusal as \
+                     {DECODE_INPUT} naming the lost card"
+                );
                 ok = false;
             }
         }

@@ -499,8 +499,8 @@ impl Body38 {
     /// segments, the joins ([`Body38::derive`]) and the body over them with
     /// the host tier over every layer's routed experts, holding the load's
     /// host set as `host` asks. Refused by name: a coverage item past
-    /// [`ALLOWED`], a plan of more than one card or not every layer, a layer
-    /// or a width the kernels do not take.
+    /// [`ALLOWED`], a plan with an expert tier card, a plan of more than one
+    /// card or not every layer, a layer or a width the kernels do not take.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -547,6 +547,9 @@ impl Body38 {
             &model::arch::qwen35moe::place::MtpPlan<'_>,
         )>,
     ) -> Result<Qwen38Model, GpuError> {
+        // The routed experts are the host's past the card's prefix: an expert
+        // tier's would be computed on the host unasked.
+        crate::host::refuse_expert_tiers(WHAT, plan.machine)?;
         let refused: Vec<String> = inputs
             .unimplemented()
             .into_iter()

@@ -16,8 +16,8 @@ pub use crate::host::residency::HostResidency;
 pub use crate::host::slots::{HOST, Slot, SlotMap, TIER};
 pub use crate::host::step::{Boundary, BoundaryShape, Chain, HandoffTarget, RELEASE, StepPort};
 pub use crate::host::{
-    HostExperts, HostTier, HybridStats, HybridWords, Poison, PoisonKind, PoisonMark, Refusal,
-    name_refusal,
+    BEGIN_GROUP, HostExperts, HostTier, HybridStats, HybridWords, Poison, PoisonKind, PoisonMark,
+    Refusal, name_refusal, refuse_expert_tiers,
 };
 
 /// The host tier under its call sites' name.

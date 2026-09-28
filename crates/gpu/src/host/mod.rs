@@ -107,15 +107,43 @@ use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
 use residency::HostResidency;
 use slots::SlotMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use step::{Boundary, Chain, GO_DEADLINE, HandoffTarget, SERVE, StepPort, stream_idle, word};
 use tier::{Pass, TierCard, TierTarget};
+
+/// What a prompt group's start ([`HostTier::begin_group`]) is named as in its
+/// refusals.
+pub const BEGIN_GROUP: &str = "HostTier::begin_group";
+
+/// Refuse, as `what`, a placement `machine` with an expert tier card, for a
+/// load path that hangs no tier under its host tier: before any upload,
+/// since the tier's experts would otherwise be served by nobody or by the
+/// host unasked.
+pub fn refuse_expert_tiers(what: &'static str, machine: &Machine) -> Result<(), GpuError> {
+    match machine.tiers.as_slice() {
+        [] => Ok(()),
+        tiers => Err(GpuError::shape(
+            what,
+            format!(
+                "the placement names {} expert tier card(s) ({}); this load hangs no tier under its \
+                 host tier",
+                tiers.len(),
+                tiers
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
 
 /// What one host service computes, supplied by the architecture: the
 /// weighted sum of the listed routed experts of layer `layer` for the
@@ -450,14 +478,19 @@ impl Health {
         self.poison = Some(cause);
     }
 
+    /// Refuse `what` on a poisoned tier, naming the poison.
     fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
-        if self.poisoned {
-            return Err(GpuError::state(
-                what,
-                "an earlier hybrid service failed and released the stream",
-            ));
+        if !self.poisoned {
+            return Ok(());
         }
-        Ok(())
+        let poison = self
+            .poison
+            .clone()
+            .expect("a poisoned tier holds its poison: set_poison and set_lost set both");
+        Err(GpuError::HostPoisoned {
+            what,
+            poison: Box::new(poison),
+        })
     }
 }
 
@@ -707,10 +740,12 @@ impl<H: HostExperts> HostTier<H> {
         })
     }
 
-    /// Both batch sets free: at a group's start, once the stream holds
-    /// nothing an earlier group enqueued ([`BatchPort::begin`]).
+    /// Both batch sets free, at a group's start ([`BatchPort::begin`]); a
+    /// poisoned tier is refused first, as [`BEGIN_GROUP`], so a call after a
+    /// failed service — a lost tier card among them — enqueues nothing.
     pub fn begin_group(&mut self) -> Result<(), GpuError> {
-        self.port_mut("HostTier::begin_group")?.begin();
+        self.health.refuse_if_poisoned(BEGIN_GROUP)?;
+        self.port_mut(BEGIN_GROUP)?.begin();
         Ok(())
     }
 
@@ -787,6 +822,14 @@ impl<H: HostExperts> HostTier<H> {
     #[must_use]
     pub fn last_poison(&self) -> Option<&Poison> {
         self.health.poison.as_ref()
+    }
+
+    /// Refuse `what` while a failed service has the tier poisoned
+    /// ([`GpuError::HostPoisoned`], naming the poison): what a body checks
+    /// before anything else a call of its own would refuse, since after a
+    /// failed service the poison is the cause.
+    pub fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
+        self.health.refuse_if_poisoned(what)
     }
 
     /// The protocol's words as they stand now. On a drained stream a sound
@@ -1043,9 +1086,9 @@ impl<H: HostExperts> HostTier<H> {
             return Ok(());
         }
         let chain = self.step.chain();
-        let tiered = self.tier.is_some() && self.on_tier(layer)? > 0;
+        self.health.refuse_if_poisoned(SERVE)?;
+        let tiered = self.tiered_in_service(layer)?;
         if tiered {
-            self.health.refuse_if_poisoned(SERVE)?;
             self.feed_tier(layer, row)?;
         }
         self.serve(layer, row, false, chain)?;
@@ -1075,10 +1118,12 @@ impl<H: HostExperts> HostTier<H> {
         let mut pass = Pass::Graph;
         if self.tier.is_some() {
             self.health.refuse_if_poisoned(SERVE)?;
-            for (l, r) in (0..).map_while(|i| self.step.captured(chain, i)) {
-                if self.slots.on_tier(l)? > 0 {
+            let mut i = 0;
+            while let Some((l, r)) = self.step.captured(chain, i) {
+                if self.tiered_in_service(l)? {
                     list.push((l, r));
                 }
+                i += 1;
             }
             let r = self
                 .tier
@@ -1087,16 +1132,13 @@ impl<H: HostExperts> HostTier<H> {
             pass = match r {
                 Ok(p) => p,
                 Err(e) => {
-                    self.health
-                        .set_poison(SERVE, list.first().map_or(0, |p| p.0), Some(&e), None);
-                    self.release_all();
-                    return Err(e);
+                    return Err(self.fail_released(SERVE, list.first().map_or(0, |p| p.0), e));
                 }
             };
         }
         let mut i = 0;
         while let Some((layer, row)) = self.step.captured(chain, i) {
-            if pass == Pass::Feed && self.on_tier(layer)? > 0 {
+            if pass == Pass::Feed && self.tiered_in_service(layer)? {
                 self.feed_tier(layer, row)?;
             }
             self.serve(layer, row, i == 0, chain)?;
@@ -1112,9 +1154,7 @@ impl<H: HostExperts> HostTier<H> {
                 .as_mut()
                 .map_or(Ok(()), |t| t.capture(chain, &list));
             if let Err(e) = r {
-                self.health.set_poison(SERVE, last, Some(&e), None);
-                self.release_all();
-                return Err(e);
+                return Err(self.fail_released(SERVE, last, e));
             }
         }
         Ok(())
@@ -1129,11 +1169,33 @@ impl<H: HostExperts> HostTier<H> {
             .as_mut()
             .map_or(Ok(()), |t| t.enqueue_eager(layer, row));
         if let Err(e) = r {
-            self.health.set_poison(SERVE, layer, Some(&e), None);
-            self.release_all();
-            return Err(e);
+            return Err(self.fail_released(SERVE, layer, e));
         }
         Ok(())
+    }
+
+    /// Whether layer `layer` is a tier layer (false without a tier), asked
+    /// while a step's service is under way: the stage card may wait at that
+    /// layer already, so a layer the slot map has no row for fails the
+    /// service — the tier poisoned, both cards' waits released — instead of
+    /// returning with the card left waiting.
+    fn tiered_in_service(&mut self, layer: usize) -> Result<bool, GpuError> {
+        if self.tier.is_none() {
+            return Ok(false);
+        }
+        match self.slots.on_tier(layer) {
+            Ok(n) => Ok(n > 0),
+            Err(e) => Err(self.fail_released(SERVE, layer, e)),
+        }
+    }
+
+    /// A service `what` of layer `layer` failed with `e` after either card
+    /// may have been given work: poison the tier, release both cards' waits,
+    /// and return `e`.
+    fn fail_released(&mut self, what: &'static str, layer: usize, e: GpuError) -> GpuError {
+        self.health.set_poison(what, layer, Some(&e), None);
+        self.release_all();
+        e
     }
 
     /// Wait under the go deadline for the expert tier to serve every layer
@@ -1146,8 +1208,9 @@ impl<H: HostExperts> HostTier<H> {
         let Some(t) = self.tier.as_mut() else {
             return Ok(());
         };
-        if !t.wait_caught_up(Instant::now() + GO_DEADLINE) {
-            return Err(self.lose_tier(layer));
+        let t0 = Instant::now();
+        if !t.wait_caught_up(t0 + GO_DEADLINE) {
+            return Err(self.lose_tier(SERVE, layer, t0.elapsed()));
         }
         match t.merged_fault()? {
             Some(f) => Err(GpuError::fault(SERVE, f)),
@@ -1155,26 +1218,30 @@ impl<H: HostExperts> HostTier<H> {
         }
     }
 
-    /// The expert tier is lost at layer `layer`: poison the tier as a lost
-    /// card, release both cards' waits, and name the card.
-    fn lose_tier(&mut self, layer: usize) -> GpuError {
-        let detail = self
-            .tier
-            .as_ref()
-            .map_or_else(|| "no tier".to_string(), |t| t.lost_detail(GO_DEADLINE));
-        self.lose_tier_as(layer, detail)
+    /// The expert tier is lost to service `what` at layer `layer`, after the
+    /// host `waited` for it: poison the tier as a lost card, release both
+    /// cards' waits, and name the card.
+    fn lose_tier(&mut self, what: &'static str, layer: usize, waited: Duration) -> GpuError {
+        self.lose_tier_as(what, layer, |t| t.lost_detail(waited))
     }
 
-    /// [`HostTier::lose_tier`], the loss named by `detail`.
-    fn lose_tier_as(&mut self, layer: usize, detail: String) -> GpuError {
-        let name = self
-            .tier
-            .as_ref()
-            .map(|t| t.name().to_string())
-            .unwrap_or_default();
-        self.health.set_lost(SERVE, &name, layer, &detail);
+    /// [`HostTier::lose_tier`], the loss named by `detail` of the tier. With
+    /// no tier attached there is none to lose: the service fails by name
+    /// instead, the tier poisoned and both cards' waits released.
+    fn lose_tier_as(
+        &mut self,
+        what: &'static str,
+        layer: usize,
+        detail: impl FnOnce(&TierCard) -> String,
+    ) -> GpuError {
+        let Some(t) = self.tier.as_ref() else {
+            let e = GpuError::state(what, "an expert tier to lose (HostTier::attach_tier)");
+            return self.fail_released(what, layer, e);
+        };
+        let (name, detail) = (t.name().to_string(), detail(t));
+        self.health.set_lost(what, &name, layer, &detail);
         self.release_all();
-        GpuError::protocol(SERVE, format!("layer {layer}: {detail}"))
+        GpuError::protocol(what, format!("layer {layer}: {detail}"))
     }
 
     /// Release every wait still pending on both cards.
@@ -1254,7 +1321,7 @@ impl<H: HostExperts> HostTier<H> {
         }));
         match r {
             Ok(Ok(())) => {
-                if self.tier.is_some() && self.slots.on_tier(layer)? > 0 {
+                if self.tiered_in_service(layer)? {
                     self.tier_goes = self.tier_goes.wrapping_add(1);
                     let hits = self.step.tier_slots;
                     if let Some(t) = self.tier.as_mut() {
@@ -1268,16 +1335,15 @@ impl<H: HostExperts> HostTier<H> {
                 // while the tier has not: past the grace, the tier is the
                 // one behind.
                 let want = self.tier_goes;
+                let t0 = Instant::now();
                 if self
                     .tier
                     .as_ref()
-                    .is_some_and(|t| !t.wait_for(want, Instant::now() + tier::TIER_GRACE))
+                    .is_some_and(|t| !t.wait_for(want, t0 + tier::TIER_GRACE))
                 {
-                    return Err(self.lose_tier(layer));
+                    return Err(self.lose_tier(SERVE, layer, t0.elapsed()));
                 }
-                self.health.set_poison(SERVE, layer, Some(&e), None);
-                self.release_all();
-                Err(e)
+                Err(self.fail_released(SERVE, layer, e))
             }
             Err(p) => {
                 self.health.set_poison(SERVE, layer, None, Some(&*p));

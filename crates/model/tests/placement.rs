@@ -914,7 +914,7 @@ fn hw_placement_bp() {
     ));
     println!("{out}");
     println!(
-        "plan (b′): twoeng §0 derived 1,404 tier experts without the draft and 873 with it; {} failures",
+        "plan (b′): derived 1,404 tier experts without the draft and 873 with it; {} failures",
         bad.len()
     );
     assert!(

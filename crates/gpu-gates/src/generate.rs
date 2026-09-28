@@ -115,7 +115,8 @@ impl Place {
     }
 
     /// The cards the placement loads, stage cards then the tier, by the
-    /// names the engine finds them by: the `load` record's `cards`.
+    /// names the engine finds them by; each device the `load` record's
+    /// `cards` names must hold its name.
     pub fn cards(self) -> &'static [&'static str] {
         const A: &[&str] = &[workstation::A6000.name];
         const GATE: &[&str] = &[workstation::RTX_3090.name];

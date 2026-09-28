@@ -75,7 +75,7 @@ use std::sync::Arc;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
 use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
+    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
@@ -117,6 +117,24 @@ pub use seq::{KeepLimit, SeqSnapshot, resume, snapshot};
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;
 
+/// Which call opens on the body ([`Body::admit`]): a step's input, or a
+/// prompt group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Step,
+    Group,
+}
+
+/// What a tiered load's slot-map check before any upload is named as in its
+/// refusal ([`Body::open_placed_tiered`]): an expert on two devices, among
+/// the rest of [`SlotMap::of_plan`]'s rules.
+pub const TIER_MAP_BEFORE_UPLOAD: &str = "deepseek41 Body::open_placed_tiered (before upload)";
+
+/// What a step refused at its entry ([`Body::admit`]) is named as: a step
+/// after a failed service, a lost tier card among them, is refused under
+/// this name before it enqueues anything.
+pub const DECODE_INPUT: &str = "deepseek41 Body::decode_input";
+
 /// Tokens one decode step runs.
 pub const STEP_TOKENS: usize = 1;
 
@@ -131,7 +149,9 @@ pub struct BodyLevers {
     /// A prompt call runs the CED triangle where the file allows it
     /// (`BLOOMERY_CED`).
     pub ced: bool,
-    /// How a binary feeds a prompt (`BLOOMERY_PREFILL`).
+    /// How a binary feeds a prompt (`BLOOMERY_PREFILL`); under the batch
+    /// feed a tiered load makes the prompt batch's buffers itself
+    /// ([`Body::open_placed_tiered`]).
     pub prefill: PrefillMode,
     /// Batches a prompt group holds, 1 to `bloomery_levers::PREFILL_GROUP_MAX`
     /// (`BLOOMERY_PREFILL_GROUP`); the load refuses any other.
@@ -188,9 +208,10 @@ pub struct BodyMeta {
 /// headers read once ([`Hparams`]), its tensors classified and planned at
 /// `ctx_max` positions under `cfg`'s placement levers, and the plan's card
 /// loaded with its layers and the head ([`Body::open_placed`]) under
-/// `cfg`'s body levers. A plan that breaks its invariants, or that spreads
-/// the layers over more than one card, is refused before anything is
-/// uploaded.
+/// `cfg`'s body levers. A plan that breaks its invariants, that spreads
+/// the layers over more than one card, or that names an expert tier card
+/// (this load hangs none: [`Body::open_placed_tiered`] does) is refused
+/// before anything is uploaded.
 pub fn open(
     file: Split,
     machine: fn(usize) -> Machine,
@@ -209,6 +230,7 @@ pub fn open(
             ),
         });
     }
+    refuse_expert_tiers(WHAT, &machine)?;
     let plan = inputs
         .plan(&machine, ctx_max as u64, &cfg.place)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -700,7 +722,8 @@ pub struct Body {
     hp: Hparams,
     /// The levers the body was loaded with.
     levers: BodyLevers,
-    /// The prompt batch's buffers ([`prefill`]), made by the first batch.
+    /// The prompt batch's buffers ([`prefill`]), made at load by
+    /// [`prefill::prepare_prefill`].
     batch: Option<Box<prefill::Batch>>,
     /// The stage card's side of the tier layers, on a load with a tier card
     /// ([`Body::open_placed_tiered`]).
@@ -921,6 +944,28 @@ impl Body {
     /// stores it.
     fn positions(&self) -> usize {
         self.planner.ctx_max() as usize
+    }
+
+    /// The checks a call on the body makes before anything else, in this
+    /// order: first the host tier's poison — after a failed service, a lost
+    /// tier card among them, the poison is the call's cause, and a later
+    /// check (the history the failed step already grew) would name a
+    /// symptom — then the engram rows' failure. A prompt group opens its batch
+    /// sets here ([`Hybrid::begin_group`], which makes the poison check
+    /// first), before it enqueues anything.
+    fn admit(&mut self, what: &'static str, entry: Entry) -> Result<(), GpuError> {
+        match entry {
+            Entry::Step => self.hybrid.refuse_if_poisoned(what)?,
+            Entry::Group => self.hybrid.begin_group()?,
+        }
+        if self.rows_failed {
+            return Err(GpuError::State {
+                what,
+                missing: "a reset: an earlier step's engram rows failed after its launch, and \
+                          the card ran that step on stale rows",
+            });
+        }
+        Ok(())
     }
 
     /// Err when a call of `what` would leave positions up to `end`
@@ -1184,6 +1229,7 @@ impl Body {
         tokens: [u32; PAIR_ROWS],
         pos: u32,
     ) -> Result<(), GpuError> {
+        self.admit("deepseek41 Body::decode_pair", Entry::Step)?;
         if self.lanes.len() < PAIR_ROWS {
             return Err(GpuError::State {
                 what: "deepseek41 Body::decode_pair",
@@ -1983,8 +2029,11 @@ impl Body {
     /// tier when given: the plan's routed segments on `tier.card` load onto
     /// that card ([`Weights::load_placed`]), the slot map sends their
     /// experts to it ([`SlotMap::of_plan`]), and each layer that holds one
-    /// runs as a tier layer ([`crate::chain::ffn`]'s tier entries). Without a
-    /// tier it is [`Body::open_placed`], launch for launch.
+    /// runs as a tier layer ([`crate::chain::ffn`]'s tier entries), and under
+    /// the batch feed the prompt batch's buffers are made here
+    /// ([`prefill::prepare_prefill`]): making them inside a prompt call loads
+    /// modules, which waits on a context whose tier stream a lost card holds.
+    /// Without a tier it is [`Body::open_placed`], launch for launch.
     pub fn open_placed_tiered(
         file: Split,
         plan: &Plan<'_>,
@@ -1993,7 +2042,9 @@ impl Body {
         meta: &BodyMeta,
     ) -> Result<Deepseek41Model, GpuError> {
         if let Some(t) = &tier {
-            // The map refuses an expert on two devices before anything uploads.
+            // The map refuses an expert on two devices before anything
+            // uploads, under a name of its own: the load's map is checked again
+            // after the uploads (`Body::load_placed`).
             let layers = plan
                 .machine
                 .cards
@@ -2004,9 +2055,11 @@ impl Body {
                 })?
                 .layers
                 .clone();
-            SlotMap::of_plan(plan, card, Some(t.card), layers, meta.hp.experts.n_expert)?;
+            SlotMap::of_plan(plan, card, Some(t.card), layers, meta.hp.experts.n_expert)
+                .map_err(|e| GpuError::plan(TIER_MAP_BEFORE_UPLOAD, e))?;
         }
-        GpuModel::load_placed(
+        let tiered = tier.is_some();
+        let mut m = GpuModel::load_placed(
             file,
             plan,
             card,
@@ -2015,7 +2068,11 @@ impl Body {
             |gpu, file, _, residency| {
                 Body::load_placed(gpu, file, plan, card, tier, meta, residency)
             },
-        )
+        )?;
+        if tiered && meta.levers.prefill == PrefillMode::Batch {
+            prefill::prepare_prefill(&mut m)?;
+        }
+        Ok(m)
     }
 
     /// V4.1 derives no new values at load: it moves the attention's Q3_K
@@ -2132,6 +2189,7 @@ impl Body {
         )?;
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
+        let tier_index = tier.as_ref().map(|t| t.card);
         let tier_card = match tier {
             Some(t) => Some(open_tier(
                 gpu,
@@ -2147,15 +2205,16 @@ impl Body {
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
-        let tier = match tier_card {
-            Some(t) => {
+        let tier = match (tier_card, tier_index) {
+            (Some(t), Some(index)) => {
                 hybrid.attach_tier(t, gpu)?;
                 // The tier's batch staging is reserved on its card by the plan,
                 // so it is made at load, not at the first prompt.
                 hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
+                hybrid.check_tier_reserves(plan.machine, index)?;
                 Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
             }
-            None => None,
+            _ => None,
         };
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
@@ -2246,18 +2305,13 @@ impl ChainBody for Body {
     /// helper reads its engram rows ([`StepRows::begin`]), and its image built
     /// without them — they reach the card after the launch
     /// ([`RowsArrival`]). Rows still due from before (a pair's first row, or
-    /// a step whose chain never ran) are delivered first. A position other
-    /// than the next one is refused, and so is every step after one whose
-    /// rows failed, until a reset.
+    /// a step whose chain never ran) are delivered first. A poisoned host
+    /// tier is refused first ([`Body::admit`]); then every step after one
+    /// whose rows failed, until a reset, and a position other than the next
+    /// one.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        const WHAT: &str = "deepseek41 Body::decode_input";
-        if self.rows_failed {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "a reset: an earlier step's engram rows failed after its launch, and \
-                          the card ran that step on stale rows",
-            });
-        }
+        const WHAT: &str = DECODE_INPUT;
+        self.admit(WHAT, Entry::Step)?;
         self.arrive()?;
         self.rows.finish()?;
         if self.history.len() != pos as usize || self.history.len() >= self.positions() {

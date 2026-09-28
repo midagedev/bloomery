@@ -12,6 +12,7 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::hybrid::refuse_expert_tiers;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
@@ -48,7 +49,8 @@ impl Open for Body {
     }
 
     /// The plan on `machine`, refused unless its layers sit on one card: the
-    /// chain runs on one.
+    /// chain runs on one. A placement with an expert tier card is refused:
+    /// the load hangs no tier under its host tier.
     fn plan<'a>(
         inputs: &'a PlanInputs,
         machine: &'a Machine,
@@ -64,6 +66,7 @@ impl Open for Body {
                 ),
             });
         }
+        refuse_expert_tiers(WHAT, machine)?;
         let ctx = u64::try_from(ctx).map_err(|_| GpuError::Shape {
             what: WHAT,
             detail: format!("a context of {ctx} positions passes u64"),

@@ -1066,10 +1066,17 @@ mod gate {
         )?;
         let ids = op.rout.ids.to_host_vec(stream)?;
         let weights = op.rout.weights.to_host_vec(stream)?;
-        let sel: Vec<u32> = ids
+        let sel = ids
             .iter()
-            .map(|&id| lc.row.get(id as usize).copied().unwrap_or(HOST))
-            .collect();
+            .map(|&id| {
+                lc.row.get(id as usize).copied().ok_or_else(|| {
+                    format!(
+                        "layer {l}: the router picked expert {id}, past the slot map's {} entries",
+                        lc.row.len()
+                    )
+                })
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
         op.sel.copy_from_host(stream, &sel)?;
         if let Some(s) = lc.stacks {
             let args = ExpertGateUp {

@@ -247,7 +247,10 @@ mod drive {
         ])?;
         record::at_main("bloomery-chat", record::BLOOMERY_CHAT);
         let a = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let mut cfg = body::OpenCfg::from_levers(&levers)?;
+        // The chat feeds its prompt one step per id (`Generator::prefill`), so
+        // its load makes no prompt batch's buffers, tiered or not.
+        cfg.body.prefill = body::PrefillMode::Steps;
         let ds41 = Ds41Cfg {
             feed: cfg.body.prefill,
             open: cfg,
