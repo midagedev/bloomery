@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 pub use crate::host::batch::{BatchKey, BatchPort, ServeTimes};
 pub use crate::host::page::{HandoffLayout, MAX_ROWS, PageError, PageLayout};
 pub use crate::host::residency::HostResidency;
-pub use crate::host::slots::{HOST, SlotMap};
+pub use crate::host::slots::{HOST, Slot, SlotMap, TIER};
 pub use crate::host::step::{Boundary, BoundaryShape, Chain, HandoffTarget, RELEASE, StepPort};
 pub use crate::host::{
     HostExperts, HostTier, HybridStats, HybridWords, Poison, PoisonKind, PoisonMark, Refusal,

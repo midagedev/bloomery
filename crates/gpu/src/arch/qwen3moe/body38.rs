@@ -616,7 +616,7 @@ impl Body38 {
         let pass_hsum = DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?;
         let run = 0..n;
         let map = SlotMap::prefix(run.clone(), geo::EXPERTS, 0)?;
-        let slots = DeviceTensor::upload(stream, map.as_slice(), n, geo::EXPERTS)?;
+        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, geo::EXPERTS)?;
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
