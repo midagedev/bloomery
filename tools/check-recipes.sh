@@ -209,6 +209,7 @@ selftests=(
   "tools/ref/router-hotlist.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
+  "tools/check-comment-only.py --self-test"
 )
 root="$(cd "$(dirname "$0")/.." && pwd)"
 listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)

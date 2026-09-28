@@ -1,6 +1,6 @@
 //! Oracle gate for stage 1, round 1-1. The tests are `hw_` (model files +
 //! box) and `#[ignore]`d: `cargo nextest` is not installed on the box
-//! (checked 2026-09-19), so `just gate-1-1` runs them through `tools/box.sh`
+//! so `just gate-1-1` runs them through `tools/box.sh`
 //! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref`, every
 //! type of V4.1's first shard into `$BLOOMERY_DATA/ref-v41_plain`, and its
 //! synthetic q2_K and i-quant rows into `$BLOOMERY_DATA/ref-synth`.

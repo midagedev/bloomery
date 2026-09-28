@@ -678,7 +678,7 @@ fn report(name: &str, a: &mut Arm, args: &Args, source: &str, used_bytes: u64, l
     let n = a.total.len() as f64;
     let majflt = a.faults.major as f64 / n;
     let read_per_token = a.read_bytes as f64 / n;
-    // The number that tests the assumed device latency, and ik's implied 384 us.
+    // The number that tests the assumed device latency, and the per-fault cost ik's timings imply.
     let us_per_majflt = if a.faults.major > 0 {
         format!("{:.1}", pct(&a.total, 0.5) as f64 / 1000.0 / majflt)
     } else {

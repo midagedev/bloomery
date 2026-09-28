@@ -1,7 +1,7 @@
 //! Gate for allocator traffic: how often a steady-state decode step goes to malloc.
 //!
 //! No gate guards speed, but this is the one speed cause that reduces to an integer.
-//! The main thread's steady-state profile (2026-09-20) had a quarter of its samples in
+//! The main thread's steady-state profile had a quarter of its samples in
 //! `memset` and the malloc family — every op returned a fresh zeroed `Vec` — and the
 //! workers idle while the main thread does that. The count is over every thread, so a
 //! worker closure that allocates per chunk shows up here too.

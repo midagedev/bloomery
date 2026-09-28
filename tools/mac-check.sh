@@ -18,9 +18,9 @@
 #
 # Exit: cargo's own code (`test`: the first crate's that is not 0). `lint` also ends 1 when its
 # `^warning:` count (the box's ruler, one per target a warning appears in) is above the ratchet, the
-# last `**N on main` of AGENTS.md's Known state. 64: a mode or a box command this script does not run,
-# or not on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
-# AGENTS.md, or no pure crate to test.
+# one number in tools/lint-ratchet.txt. 64: a mode or a box command this script does not run, or not
+# on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
+# tools/lint-ratchet.txt (missing, or not exactly one number line), or no pure crate to test.
 #
 # The toolchain is this script's: the channel rust-toolchain.toml pins, at
 # $HOME/.rustup/toolchains/<channel>-<host>/bin, goes first on PATH, and cargo, cargo-clippy,
@@ -238,26 +238,30 @@ setup() {
   esac
 }
 
-# ratchet FILE: the last `**N on main` of the file (AGENTS.md's Known state), or 70.
+# ratchet FILE: the one number line of FILE (tools/lint-ratchet.txt; `#` lines are its rule), or 70.
 ratchet() {
-  local n
-  n=$(grep -oE '\*\*[0-9]+ on main' "$1" | tail -1 | grep -oE '[0-9]+' || true)
-  if [ -z "$n" ]; then
-    say "mac-check.sh: no \`**N on main\` warning count in $1 to hold the lint to"
+  local lines
+  if [ ! -f "$1" ]; then
+    say "mac-check.sh: no ratchet file $1 to hold the lint to"
     return 70
   fi
-  echo "$n"
+  lines=$(grep -vE '^[[:space:]]*(#|$)' "$1" || true)
+  if ! [[ $lines =~ ^[0-9]+$ ]]; then
+    say "mac-check.sh: $1 must hold exactly one line with the warning count, a bare number; it holds: ${lines:-nothing}"
+    return 70
+  fi
+  echo "$lines"
 }
 
 # verdict COUNT RATCHET: the lint's last line; 1 when COUNT is above RATCHET.
 verdict() {
   if [ "$1" -gt "$2" ]; then
-    echo "mac-check: lint ^warning: $1, above the ratchet $2 in AGENTS.md — red"
+    echo "mac-check: lint ^warning: $1, above the ratchet $2 in tools/lint-ratchet.txt — red"
     return 1
   elif [ "$1" -lt "$2" ]; then
-    echo "mac-check: lint ^warning: $1, below the ratchet $2 in AGENTS.md — the recorded value can come down"
+    echo "mac-check: lint ^warning: $1, below the ratchet $2 in tools/lint-ratchet.txt — the recorded value can come down"
   else
-    echo "mac-check: lint ^warning: $1 = the ratchet $2 in AGENTS.md"
+    echo "mac-check: lint ^warning: $1 = the ratchet $2 in tools/lint-ratchet.txt"
   fi
 }
 
@@ -338,11 +342,18 @@ self_test() {
 
   # the ratchet and the verdict
   t=$(mktemp -d)
-  printf '%s\n' 'x **175 on main `a`** (y), 169 through, **48 on main after `del2`** (z).' > "$t/a.md"
-  [ "$(ratchet "$t/a.md")" = 48 ] || fail "the ratchet of a Known-state line is not its last bold count"
-  printf '%s\n' 'no count here' > "$t/b.md"
-  ratchet "$t/b.md" > /dev/null 2>&1 && fail "a file without a count gave a ratchet" || { [ $? = 70 ] || fail "no ratchet ended with another rc"; }
-  ratchet "$HERE/AGENTS.md" | grep -qxE '[0-9]+' || fail "AGENTS.md gives no ratchet"
+  printf '%s\n' '48' '# the rule' > "$t/a"
+  [ "$(ratchet "$t/a")" = 48 ] || fail "the ratchet of a file with one number line is not that number"
+  for m in 'missing' '' '# only the rule' '48 on main' '48|49' 'x48'; do
+    rm -f "$t/b"
+    [ "$m" = missing ] || printf '%s\n' "$m" | tr '|' '\n' > "$t/b"
+    ratchet "$t/b" > /dev/null 2>&1 && fail "a ratchet file '$m' gave a ratchet" || { [ $? = 70 ] || fail "the ratchet file '$m' ended with another rc"; }
+  done
+  if a=$(ratchet "$HERE/tools/lint-ratchet.txt"); then
+    verdict $((a + 1)) "$a" > /dev/null && fail "$((a + 1)) warnings over the file's ratchet of $a passed"
+  else
+    fail "tools/lint-ratchet.txt gives no ratchet"
+  fi
   verdict 49 48 > /dev/null && fail "49 warnings over a ratchet of 48 passed"
   verdict 48 48 > /dev/null || fail "48 warnings at a ratchet of 48 failed"
   verdict 47 48 | grep -q 'can come down' || fail "47 under 48 does not say the value can come down"
@@ -495,10 +506,10 @@ case $MODE in
   check) echo "mac-check: check rc $rc; $(built)"; exit "$rc" ;;
   fmt | fmt-check) echo "mac-check: $MODE rc $rc"; exit "$rc" ;;
 esac
-RATCHET=$(ratchet "$HERE/AGENTS.md") || exit $?
+RATCHET=$(ratchet "$HERE/tools/lint-ratchet.txt") || exit $?
 COUNT=$(grep -c '^warning:' "$LOG" || true)
 if [ "$rc" != 0 ]; then
-  echo "mac-check: lint rc $rc (^warning: $COUNT, the ratchet $RATCHET in AGENTS.md); $(built)"
+  echo "mac-check: lint rc $rc (^warning: $COUNT, the ratchet $RATCHET in tools/lint-ratchet.txt); $(built)"
   exit "$rc"
 fi
 vrc=0
