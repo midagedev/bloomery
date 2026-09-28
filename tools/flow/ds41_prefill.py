@@ -18,13 +18,13 @@ and stream waits cost the host a call and take no slot. The union is the kernel 
 causes (join tails, wakes, stash, zero fill, scan, preparation, per flow) plus one named residual.
 
 Today the host issues a layer-batch's route and shadow, waits for the route and then runs the union,
-so the wall is a sum (cardroute-design-report.md:142-153; body/prefill.rs Body::enqueue_group_chain). The
+so the wall is a sum (cardroute-design-report.md 「2. 자원 타임라인」 '오늘 벽시계는 합이다'; body/prefill.rs Body::enqueue_group_chain). The
 card runs the route while the host issues it (an eager stream, body/prefill.rs Body::enqueue_group), so the
 issue sits inside the route window unless the launch queue is full; the batch's prologue ends in a
 synchronous H2D (body/prefill.rs Body::plan_group) and is serial. The G scheduler (layer-first over G
-batches, hoststream-design-report.md:37-49) issues batch b+1's route before batch b's union, which is
+batches, hoststream-design-report.md 「1. 시간선」 table) issues batch b+1's route before batch b's union, which is
 a max once the host is not blocked in the queue. Host streaming adds a PCIe pipe and a ring, and its
-k per layer is the resource-balance choice (hoststream-design-report.md:92).
+k per layer is the resource-balance choice (hoststream-design-report.md 「2. 분할 규칙, 링, 메모리」 'k = k(T_l)은 적재 때 상수로 계산합니다').
 
 Configuration knobs beyond the recorded commits: `b1` (the projections per 128-token sub-block,
 chain/attn/batch.rs sub_pre, sub_post), `tile` (cardtile: the grouped shadow per (card expert, 8-column tile) item),
@@ -204,7 +204,7 @@ IDX_ONLY = frozenset(x["l"] for x in _LAYERS if x["indexer"]) - SOURCES
 INDEXERS = SOURCES | IDX_ONLY
 ENGRAM = frozenset(x["l"] for x in _LAYERS if x["engram"])
 _RATIO = {x["l"]: x["ratio"] for x in _LAYERS}
-# The two layers whose routed down is Q5_K (docs/facts.md:13; docs/plan-ledger.md:206 '0·1층 down'): their
+# The two layers whose routed down is Q5_K (docs/facts.md 「이 모델에 실제로 들어 있는 것」 row Q5_K (13); docs/plan-ledger.md 「「지금」에서 옮긴 것 (2026-09-23)」 row b5host '0·1층 q5_K'): their
 # experts are expert_gu_bytes + expert_down_q5_bytes, the ring's largest slot.
 Q5_LAYERS = frozenset({0, 1})
 
@@ -316,7 +316,7 @@ def attn_kernels(l):
     """Kernels of one staged attention chunk (chain/attn.rs AttnChain::enqueue_layer_of): hc_pre, norm_quant, joint qkv
     gemv + 2 transposes, q_a norm, q_b gemv + transpose, rope tail, kv append, seg, merge, commit,
     rope back, quantize, wo_a, quantize, wo_b + transpose, hc_post = 20; the indexer adds 2 and a
-    source's compressor and index key 8 (7 ungated) (docs/research/cardroute-design-report.md:66-77)."""
+    source's compressor and index key 8 (7 ungated) (docs/research/cardroute-design-report.md 「1. 분해와 판정」 '항목 수. P 512' table, '청크 커널 21.2는 층 종류별 커널 수의 평균이다')."""
     return 30 if l in SRC_GATED else 29 if l in SRC_PLAIN else 22 if l in IDX_ONLY else 20
 
 
@@ -335,11 +335,11 @@ SHADOW_TILE_BLOCK = 7          # cardtile, enqueue_tiled_experts: buckets, group
 # (b = g + tile_cap x rho, chain/ffn/batch.rs ds41_expert_gate_up_tiles), so each row tile's sweep reads every item's
 # activation columns again
 GT_ROW_TILES = 2304 // 8
-ACT_GT_BYTES = 5120 // 128 * 132     # one q8_1 column at 128 values a block, 5,280 B (cardnext-design-report.md:139)
+ACT_GT_BYTES = 5120 // 128 * 132     # one q8_1 column at 128 values a block, 5,280 B (cardnext-design-report.md 「2. grouped shadow」 '2.3 제안' '열당 5,280 B')
 GT_ROW_W_BYTES = 8 * 2 * 5120 // 256 * 110   # a GT row tile's gate + up weights (8 rows, Q3_K 110 B a 256 block)
 SHADOW_NOCARD_CHUNK = 5        # the trace, layers 0-1 (no card expert): N_s 321 = 64 x 5 + 1
 SHADOW_NOCARD_BLOCK = 1
-SHADOW_SLOT_CHUNK = 10         # cardroute-design-report.md:73 (per slot: gu, quantize_sel, q4k_sel, acc + shexp)
+SHADOW_SLOT_CHUNK = 10         # cardroute-design-report.md 「1. 분해와 판정」 row 'shadow N_s, slot arm' (per slot: gu, quantize_sel, q4k_sel, acc + shexp)
 
 
 def part_acts(l):
@@ -441,7 +441,7 @@ class Routing:
 
 def routing_lcg(p, hot=True):
     """The timing runner's lcg prompt: per layer one host rate and one card rate (lcg is uniform to
-    first order, hoststream-recal-report.md:160). Layers below card_first_layer hold no card expert
+    first order, hoststream-recal-report.md 「5. 못 한 것과 규칙 이탈」 'lcg 곡선 자체는 실측이 없습니다'). Layers below card_first_layer hold no card expert
     (plan (a)), so all six slots of a token go to the host there; the recorded mean host rate
     (s_host_lcg with the hot list, s_host_lcg_nohot without) sets the other layers'."""
     s = p["s_host_lcg"] if hot else p["s_host_lcg_nohot"]
@@ -473,7 +473,7 @@ def _prose_counts():
 
 
 def routing_prose_trace(p):
-    """prose-in: each layer's card set is the trace's own top n_l (hoststream-recal-report.md:30-33),
+    """prose-in: each layer's card set is the trace's own top n_l (hoststream-recal-report.md 「hoststream-recal 보고」 'prose 자체 top-70'),
     the in-sample (optimistic) arm; zero-count host experts are never touched. Every layer keeps n_l
     card experts (the trace's curve), unlike plan (a)'s host-only layers 0-1. The trace's own
     identities (the self-test) and a comparison arm; the prose prompt is routing_prose."""
@@ -534,7 +534,7 @@ def routing(p, name, hot=True, P=512):
 @lru_cache(maxsize=None)
 def ecost(T, lam, a, c, w):
     """(E[max(W, a + c m); m >= 1] in us, P(m >= 1)) for m ~ Binomial(T, lam / 512): the union's
-    t(m) with Binomial column counts (docs/plan.md:76)."""
+    t(m) with Binomial column counts (docs/plan.md 「비용 모델 (디코드 스텝)」 row 호스트 union(배치 프리필))."""
     if T <= 0 or lam <= 0:
         return 0.0, 0.0
     q = min(lam / 512.0, 1.0)
@@ -714,7 +714,7 @@ KERN = {
     "wo_a": (8192, 4096, "heads_bps", "proj_woa_us", "woa", False),
     "wo_b": (5120, 8192, "q3k_bps", "proj_wob_us", "wob", True),
 }
-QB_ROWS, QB_ROWS_IDX = 32768, 36864   # 64 heads x 512; joined with the indexer's query (cardroute:84)
+QB_ROWS, QB_ROWS_IDX = 32768, 36864   # 64 heads x 512; joined with the indexer's query (cardroute-design-report.md 「1. 분해와 판정」 row 'q_b gemv')
 WEIGHT_BYTES_BLOCK_STEP = 8 * 2 * 110  # 8 rows x two Q3_K super-blocks a warp-iteration
 
 
@@ -842,7 +842,7 @@ VISREF_L2 = sum(chunk_keys(2, s, 8)[1] for s in range(0, 512, 8)) / 64
 
 
 def attn_seg(p, l, pos, m):
-    """seg over a chunk (us): 40 blocks a token at 1 block/SM (docs/plan-ledger.md:1176, A2); a block's
+    """seg over a chunk (us): 40 blocks a token at 1 block/SM (docs/plan-ledger.md 「커널 리뷰 넷」 row A2); a block's
     time is layer 2's prompt-batch measurement moved along the decode slope in keys."""
     slope = (p["attn_seg_d1024"] - p["attn_seg_d6"]) / (K1024 - K6)
     waves = -(-40 * m // int(p["n_sm"]))
@@ -1111,7 +1111,7 @@ def post_parts(p, lb):
 def queue_split(A_r, A_s, E, C_r, C_s, Q, t_i):
     """Closed form of one burst: the host issues A_r route activities (and E events) then A_s shadow
     activities and waits for the route. The queue holds Q activities, so the host is blocked until the
-    card has consumed A_r + A_s - Q of them (cardroute-design-report.md:285-296). Units of C_r; t_i
+    card has consumed A_r + A_s - Q of them (cardroute-design-report.md 「4. 큐 판정」 'enqueue = (N_r + N_s − Q) × t_c'). Units of C_r; t_i
     per call (activity or event) in the same unit."""
     N = A_r + A_s
     K = N - Q
@@ -1206,9 +1206,9 @@ def issue(p, st, jobs, Q):
 def dram_stretch(p, s0, compute, byts, fills):
     """Union duration (ms) when its kernel model says `compute` ms and it reads `byts` of DRAM, while
     the ring fill takes fill_crossings x PCIe of DRAM inside the `fills` intervals
-    (hoststream-design-report.md:124): inside them the union runs at the fraction of its own speed the
+    (hoststream-design-report.md 「2. 분할 규칙, 링, 메모리」 'DRAM 수치(G8 전 층)'): inside them the union runs at the fraction of its own speed the
     remaining DRAM allows, and at most 1 - fill_steal (the fill threads on its cores' SMT siblings,
-    hoststream-design-report.md:50). Outside them its own model, W floor included, holds."""
+    hoststream-design-report.md 「1. 시간선」 'union 코어의 4 %를 뺏는다'). Outside them its own model, W floor included, holds."""
     if not fills or compute <= 0:
         return compute
     rate = byts / 1e6 / compute                   # GB/s the union reads at on its own
@@ -1437,7 +1437,7 @@ def settle_layer(p, cfg, lbs, rt, work, U, Q, st, k, ring):
 
 def expert_saving_us(p, cfg, rt, l, Ts, lam, U):
     """Host us one streamed expert of list rate lam saves over batches of Ts columns: per 512-column call its
-    E[max(W, a + c m)] (the W floor is paid per call, hoststream-recal-report.md:24) and X_u a slot."""
+    E[max(W, a + c m)] (the W floor is paid per call, hoststream-recal-report.md 「hoststream-recal 보고」 '호출마다 W 126 µs가 붙습니다') and X_u a slot."""
     a, c = union_kernel(p, cfg)
     xs = x_of(U, cfg) * 1000.0 if U.get("mode") == "slot" else 0.0
     return sum(ecost(T, round(lam, 6), a, c, p["w"])[0] + xs * T * lam / 512.0 for T in Ts if T)
@@ -1446,7 +1446,7 @@ def expert_saving_us(p, cfg, rt, l, Ts, lam, U):
 def rule_k(p, cfg, rt, l, Ts, U, rule):
     """Streamed ranks of layer l under a per-expert rule: 'serial', a rank whose host saving (phi of it for a
     static pick) exceeds its fill time; 'onecall', the lead's rule a + c x (the group's columns) > fill time
-    (one call a group, no W floor per call: hoststream-design-report.md:11-12). Both ignore that PCIe runs
+    (one call a group, no W floor per call: the lead's note atop hoststream-design-report.md, '22.98·G·m > 641.6'). Both ignore that PCIe runs
     beside the host (the balance rule prices that)."""
     static = cfg.get("pick", "static") == "static"
     phi = rt.phi if static else 1.0
@@ -1466,7 +1466,7 @@ def rule_k(p, cfg, rt, l, Ts, U, rule):
 
 def best_k(step, st, n):
     """The layer's streamed count that minimizes its wall: the resource-balance rule of
-    hoststream-design-report.md:92, a load-time constant per (layer, T)."""
+    hoststream-design-report.md 「2. 분할 규칙, 링, 메모리」 'k = k(T_l)은 적재 때 상수로 계산합니다', a load-time constant per (layer, T)."""
     memo = {}
 
     def wall(k):
@@ -1499,7 +1499,7 @@ def choose_k(p, cfg, rt, lbs, U, step, st):
 
 def resolve_cfg(cfg, P):
     """The per-prompt choices of a configuration: G (G = 'auto' is every batch, at most 8) and the ring
-    (128 borrowed from P >= borrow_min_p, else the unborrowed 8; docs/plan-triage.md:43)."""
+    (128 borrowed from P >= borrow_min_p, else the unborrowed 8; docs/plan-triage.md 「열린 라운드 카드」 row hoststream)."""
     c = dict(cfg)
     nb = batch_count(P, cfg.get("ced", True))
     g = c.get("G", 1)
@@ -2115,7 +2115,7 @@ ANCHOR_ROWS = {
 # the term that breaks a red row, named after reading its terms (--explain <row>, the diagnostics below)
 TERMS = {
     "router_tok": "the pre-ds41bulk one-token router launch, 15.1 us derived from ds41router's prediction"
-                  " (plan-ledger.md:1167); S14's pre - post non-union difference implies ~21 us (21.56 was measured"
+                  " (plan-ledger.md 「커널 리뷰 넷」 row R1); S14's pre - post non-union difference implies ~21 us (21.56 was measured"
                   " before ds41router); only pre-ds41bulk rows read it",
     "union-T": "S15's clean P 384 union sits 4.9 ms over its kernel sum, less than the join tails alone (f 0.48 x K / 4 ="
                " 6.1 ms): the cause model does not scale to it; the kernel sum at m-bar 5.4 (t(m) fitted at m 8 and 16, the"
@@ -3124,7 +3124,7 @@ def uncal_rows(p):
         ("dram_eff, fill_crossings, fill_steal", "126 GB/s ceiling, 3 crossings of 26.3 GB/s, 4 % of the union's cores;"
          " the fill keeps its rate and the union takes the room left",
          "the DRAM probe: bench_v41_host union5:4x8u0.125 beside two fill threads and a 26 GB/s pinned reader"
-         " (hoststream-design-report.md:144-146; the bench has no such arm yet)",
+         " (hoststream-design-report.md 「5. 예측과 열린 항 하나」 '유도가 못 닫는 항은 DRAM 겹침 경합입니다'; the bench has no such arm yet)",
          "union ~81 GB/s alone; beside the fill it runs at 0.58 of its speed (+72 %) if the pair is capped at 126 GB/s;"
          " the design report's '4-10 %' holds only if the pair's ceiling is >= ~150 GB/s", "5, no GPU"),
         ("the streamed experts' card cost (sgemm tile)", "a streamed expert costs card_tile_us's items per batch (its m"
@@ -3268,9 +3268,9 @@ def self_test():
           per[14]["acts_r"] == 2886 and per[0]["acts_s"] == 321, f"{per[14]['acts_r']}, {per[0]['acts_s']}")
     rs = evaluate(p, dict(CONFIGS["S14"], arm="slot"), 512)
     r384 = evaluate(p, CONFIGS["S15"], 384)
-    # cardroute:337 counted 8 shadow entries a chunk on every layer; the trace has 5 on layers 0-1 (48 chunks each
+    # cardroute-design-report.md 「1. 분해와 판정」 row 'shadow N_s, expert arm' counted 8 shadow entries a chunk on every layer; the trace has 5 on layers 0-1 (48 chunks each
     # at P 384, and 1 instead of 5 a layer-batch): 371 - 2 x (3 x 48 + 4) / 40 = 363.6
-    check("P 384 calls ~ 1,243 route (cardroute:337, calls = activities + events), 363.6 shadow, 1 %",
+    check("P 384 calls ~ 1,243 route (cardroute-design-report.md 「4. 큐 판정」 'N_r ≈1,243', calls = activities + events), 363.6 shadow, 1 %",
           abs(r384["agg"]["acts_r"] + r384["agg"]["ev_r"] - 1243) / 1243 < 0.01
           and abs(r384["agg"]["acts_s"] - 363.6) / 363.6 < 0.01,
           f"{r384['agg']['acts_r'] + r384['agg']['ev_r']:.1f}, {r384['agg']['acts_s']:.1f}")
@@ -3322,7 +3322,7 @@ def self_test():
     sh = [sum(sum(lam for lam, _ in pr.host[l][:k]) / (pr.host_slots_tok(l) * 512) for l in range(L)) / L
           for k in (40, 80, 120, 160)]
     tgt = [p["prose_share40"], p["prose_share80"], p["prose_share120"], p["prose_share160"]]
-    check("prose-in: 1,011.2 host columns per 512 tokens, shares 0.353/0.595/0.760/0.871 (hoststream-recal:48-49)",
+    check("prose-in: 1,011.2 host columns per 512 tokens, shares 0.353/0.595/0.760/0.871 (hoststream-recal-report.md 「2. 실행한 것과 판정 줄」 'n_l=70: card avg cols/512', 'host share of hottest')",
           abs(hc - p["prose_host_cols"]) / p["prose_host_cols"] < 0.001 and all(abs(x - y) < 0.0015 for x, y in zip(sh, tgt)),
           f"{hc:.1f}; " + " ".join(f"{x:.3f}" for x in sh))
     card_cols = sum(sum(lam for lam, _ in pr.card[l]) for l in range(L)) / L / p["prose_n_l"]
@@ -3389,7 +3389,7 @@ def self_test():
     ra = evaluate(inf, stream_cfg(2, 8, krule=384), 4096)
     check("every host expert streamed over an infinite PCIe leaves no union (G 2 wrap)",
           sum(x["union"] for x in ra["recs"]) < 1e-9, f"{sum(x['union'] for x in ra['recs']):.3g} ms")
-    check("expert bytes: 18,247,680 on the Q5_K layers 0-1, 16,773,120 elsewhere (facts.md:9-13)",
+    check("expert bytes: 18,247,680 on the Q5_K layers 0-1, 16,773,120 elsewhere (facts.md 「이 모델에 실제로 들어 있는 것」 rows Q3_K (11) to Q5_K (13))",
           (expert_bytes_stream(p, 0), expert_bytes_stream(p, 1), expert_bytes_stream(p, 2)) == (18247680, 18247680, 16773120))
     check("group bytes: (sets - 1) sets, G + 1 from 2 on; G 2 = its load line's 238,191,200 B; G 1 leaves 1,020,264,448 free",
           group_bytes(p, 1) == 0 and group_bytes(p, 2) == 238191200 and group_bytes(p, 8) == 8 * group_bytes(p, 2) / 2

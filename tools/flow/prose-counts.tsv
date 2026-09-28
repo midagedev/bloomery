@@ -1,6 +1,6 @@
 # The ik router trace of a prose text (50,000 tokens, top-6): routed count per (layer, expert), 300,000 a layer.
 # Read from the box file /root/bloomery-data/router/prose/counts.tsv by the hoststream-recal round on 2026-09-25
-# (docs/research/hoststream-recal-report.md:37-39: rc 0, 15361 lines); copied here so the prose arm does not live in a scratchpad.
+# (docs/research/hoststream-recal-report.md 「2. 실행한 것과 판정 줄」, its first command line: rc 0, 15361 lines); copied here so the prose arm does not live in a scratchpad.
 # layer	expert	count
 0	0	478
 0	1	174

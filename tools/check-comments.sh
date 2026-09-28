@@ -7,6 +7,11 @@
 # inside a string). Two rules, each outside a `PIN(` line:
 #   crates/*/src and crates/*/tests: no issue number (MUL-N) and no date in a comment;
 #   crates/*/src: no measured value in a comment — a number with a time, rate or bandwidth unit.
+# A third rule reads every text file under tools/, comment or not: no `<doc>.md:<line>` citation (ranges and
+# comma lists start the same way). A line number goes silently wrong the moment the doc is edited above it;
+# cite a section heading plus a table row's first cell or a quoted phrase, or the rig-log
+# `log/<date>.md#<anchor>` the value was measured in. An exception is a CITE_ALLOW entry, named with its reason.
+# It sees the `.md:` form only: a doc named without its extension (`<report>:<line>`) is not caught.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -50,5 +55,30 @@ if [ -n "$meas" ]; then
   echo "check-comments: $n comment line(s) in crates/*/src carry a measured value — the number belongs in rig-log (AGENTS.md Conventions: measured ms/GB/s/tok/s)" >&2
   fail=1
 fi
+# CITE_ALLOW: `<path>|<fixed text on the line>|<reason>`, one per allowed line; an entry that matches no
+# citation is an error, so a stale exception cannot linger.
+CITE_ALLOW=()
+cites=$(g -rnIE '[A-Za-z0-9_./-]+\.md:[0-9]+' tools)
+unmatched=()
+allowed=0
+for a in ${CITE_ALLOW[@]+"${CITE_ALLOW[@]}"}; do
+  p=${a%%|*}; rest=${a#*|}; t=${rest%%|*}
+  [ -n "$p" ] && [ -n "$t" ] && [ "$rest" != "$t" ] && [ -n "${rest#*|}" ] \
+    || { echo "check-comments: CITE_ALLOW entry '$a' is not <path>|<text>|<reason>" >&2; exit 64; }
+  hit=$(printf '%s\n' "$cites" | g -F -- "$t" | while IFS= read -r l; do case $l in ("$p:"*) printf '%s\n' "$l" ;; esac; done)
+  if [ -z "$hit" ]; then unmatched+=("$a"); continue; fi
+  allowed=$((allowed + $(printf '%s\n' "$hit" | wc -l)))
+  cites=$(printf '%s\n' "$cites" | g -v -xF -- "$hit")
+done
+if [ "${#unmatched[@]}" -gt 0 ]; then
+  printf 'check-comments: CITE_ALLOW entry matches no citation: %s\n' "${unmatched[@]}" >&2
+  fail=1
+fi
+if [ -n "$cites" ]; then
+  n=$(printf '%s\n' "$cites" | wc -l | tr -d ' ')
+  printf '%s\n' "$cites" | head -40 >&2
+  echo "check-comments: $n line(s) under tools/ cite a doc by line number — cite its section heading plus a table row's first cell or a quoted phrase, or a rig-log anchor" >&2
+  fail=1
+fi
 [ "$fail" = 0 ] || exit 1
-echo "check-comments: ok (${#files[@]} files, $(printf '%s\n' "$comments" | wc -l | tr -d ' ') comment lines)"
+echo "check-comments: ok (${#files[@]} files, $(printf '%s\n' "$comments" | wc -l | tr -d ' ') comment lines; tools/ cites no doc by line number, $allowed allowed by CITE_ALLOW)"
