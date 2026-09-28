@@ -696,6 +696,9 @@ pub struct Body {
     /// A step's rows failed after its launch: the card ran it on the rows
     /// the staging held before, and every step is refused until a reset.
     rows_failed: bool,
+    /// Host time in the step's synchronous copy of its parameters to the
+    /// card, summed over steps (ns).
+    params_ns: u64,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
     /// The positions this body computes the reference at
@@ -964,6 +967,12 @@ impl Body {
     #[must_use]
     pub fn step_rows(&self) -> &StepRows {
         &self.rows
+    }
+
+    /// Host time in the steps' synchronous parameter copies since load (ns).
+    #[must_use]
+    pub fn params_ns(&self) -> u64 {
+        self.params_ns
     }
 
     /// Kernel launches layer `layer`'s MoE sub-layer enqueues, besides its
@@ -1401,7 +1410,9 @@ impl Body {
         })?;
         // Synchronizes the stream: no launched copy of the staging is
         // pending from here on.
+        let t0 = std::time::Instant::now();
         lane.params.copy_from_host(stream, self.image.words())?;
+        self.params_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(tap) = self.tap.as_mut() {
             tap.pos[row] = Some(input.pos);
         }
@@ -2322,6 +2333,7 @@ impl Body {
             arrival,
             due: None,
             rows_failed: false,
+            params_ns: 0,
             history: Vec::with_capacity(ctx_max),
             defined: hp.candidate_free_positions(),
             holds,

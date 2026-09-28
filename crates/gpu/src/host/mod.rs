@@ -236,6 +236,8 @@ pub struct HybridStats {
     /// columns they carried, summed. Both count in `served` too.
     pub cols_served: u64,
     pub cols_cols: u64,
+    /// Go waits written ([`HostTier::gap_summary`] of a span of them).
+    pub gaps: u64,
     /// Batch services ([`HostTier::serve_batch`]): layers served, the columns
     /// they carried, the host slots those columns listed and the service
     /// computed, and the host wall time of the union calls (ns), summed. None
@@ -1231,6 +1233,13 @@ impl<H: HostExperts> HostTier<H> {
         &self.step
     }
 
+    /// The go waits of step services `from..to` (counts of
+    /// [`HybridStats::gaps`]): the card's time between the host's signal and
+    /// the next go, per service. No allocation.
+    pub fn gap_summary(&self, from: u64, to: u64) -> Result<step::GapSummary, GpuError> {
+        self.step.gap_summary(from, to)
+    }
+
     /// What the host side has done since load: the step port's, the batch
     /// service's and the tier's own counters, as one view.
     #[must_use]
@@ -1251,6 +1260,7 @@ impl<H: HostExperts> HostTier<H> {
             host_calls: s.host_calls,
             cols_served: s.cols_served,
             cols_cols: s.cols_cols,
+            gaps: s.gaps,
             batch_served: b.batch_served,
             batch_cols: b.batch_cols,
             batch_host_slots: b.batch_host_slots,

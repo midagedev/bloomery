@@ -1665,7 +1665,8 @@ mod drive {
         fn begin(&mut self, t: &Session<Body>) -> Result<(), GateError> {
             if self.stats {
                 self.probes.reserve_exact(self.n_gen);
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1679,7 +1680,8 @@ mod drive {
         ) -> Result<(), GateError> {
             self.rows.push((c.pos, tokens[0], wall.as_secs_f64() * 1e3));
             if self.stats {
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1851,7 +1853,8 @@ mod drive {
         fn begin(&mut self, t: &Session<Body>) -> Result<(), GateError> {
             if self.stats {
                 self.probes.reserve_exact(self.n_gen);
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1869,7 +1872,8 @@ mod drive {
             self.passes
                 .push((PassKind::of(c), wall.as_secs_f64() * 1e3));
             if self.stats {
-                self.probes.push(Probe::read(t.model())?);
+                self.probes
+                    .push(Probe::read(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -1998,6 +2002,9 @@ mod drive {
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
+        /// The go waits of the services since the probe before.
+        gap: bloomery_gpu::host::step::GapSummary,
+        params_ns: u64,
         eng: bloomery_gpu_deepseek41::chain::glue::EngramStats,
         eng_helper: Option<Option<usize>>,
         majflt: u64,
@@ -2006,9 +2013,14 @@ mod drive {
     }
 
     impl Probe {
-        fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
+        fn read(m: &Deepseek41Model, prev: Option<&Probe>) -> Result<Probe, GateError> {
             let body = m.body("generate_ds41")?;
             let hybrid = body.hybrid().stats();
+            let gap = match prev {
+                Some(p) => body.hybrid().gap_summary(p.hybrid.gaps, hybrid.gaps)?,
+                None => bloomery_gpu::host::step::GapSummary::default(),
+            };
+            let params_ns = body.params_ns();
             let eng = body.step_rows().engram_stats();
             let eng_helper = body.step_rows().helper_cpu();
             let vram_free = u64::try_from(m.gpu().mem_info()?.0)?;
@@ -2024,6 +2036,8 @@ mod drive {
             }
             Ok(Probe {
                 hybrid,
+                gap,
+                params_ns,
                 eng,
                 eng_helper,
                 majflt: u64::try_from(ru.ru_majflt)?,
@@ -2044,7 +2058,11 @@ mod drive {
     /// `eng_wait_us` the step thread's time in the engram read (the wait on
     /// the helper, or the direct copy), `eng_helper_us` the helper's own and
     /// `eng_classify_us` the time the warm/cold count itself took (inside
-    /// `eng_wait_us` with the helper on, outside it off). `overlap` is the
+    /// `eng_wait_us` with the helper on, outside it off). `gap_min_us`,
+    /// `gap_p50_us` and `gap_max_us` are the step's go waits, one per
+    /// service: the card's time from the host's signal to the next go (the
+    /// lower median); `params_us` the host time in the step's synchronous
+    /// parameter copy. `overlap` is the
     /// step's host slot ids of a two-row pass's row 1 that row 0 also sent
     /// to the host at the same layer, `union` the distinct host slots of the
     /// step's rows per layer, summed (`host_slots − overlap`: a one-row step
@@ -2104,6 +2122,10 @@ mod drive {
                 .f("eng_wait_us", wait_us)
                 .f("eng_helper_us", helper_ns as f64 / 1e3)
                 .f("eng_classify_us", classify_ns as f64 / 1e3)
+                .f("gap_min_us", w[1].gap.min_ns as f64 / 1e3)
+                .f("gap_p50_us", w[1].gap.p50_ns as f64 / 1e3)
+                .f("gap_max_us", w[1].gap.max_ns as f64 / 1e3)
+                .f("params_us", (w[1].params_ns - w[0].params_ns) as f64 / 1e3)
                 .print();
             if i > warm {
                 waits.push(wait_us);
