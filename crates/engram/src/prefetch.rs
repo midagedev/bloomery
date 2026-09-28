@@ -193,14 +193,20 @@ impl Prefetcher {
 
         let (job_tx, job_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Filled>();
-        let (handle, cpu) =
-            threads::helper::spawn_helper("engram-prefetch", options.cpu, move || {
+        let (handle, cpu) = threads::helper::spawn_helper(
+            "engram-prefetch",
+            options.cpu.map_or(
+                threads::helper::Placement::Float,
+                threads::helper::Placement::Pin,
+            ),
+            move || {
                 helper(&engram, options, &job_rx, &done_tx);
-            })
-            .map_err(|e| match e {
-                threads::helper::HelperError::Spawn(e) => EngramError::Io(e),
-                e => EngramError::Prefetch(e.what()),
-            })?;
+            },
+        )
+        .map_err(|e| match e {
+            threads::helper::HelperError::Spawn(e) => EngramError::Io(e),
+            e => EngramError::Prefetch(e.what()),
+        })?;
 
         Ok(Prefetcher {
             jobs: Some(job_tx),

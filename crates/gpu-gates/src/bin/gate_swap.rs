@@ -433,7 +433,8 @@ mod gate {
 
     /// placement: a machine built on a thread pinned to one cpu (as a
     /// binary's step thread is) runs its staging thread off that cpu: the
-    /// staging copies never take turns with the step.
+    /// staging copies never take turns with the step. With no pool built the
+    /// staging thread floats, its mask wider than the one cpu.
     fn placement(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
         let wide = threads::helper::mask()?;
         let Some(&c) = wide.first().filter(|_| wide.len() > 1) else {
@@ -459,7 +460,7 @@ mod gate {
             .to_owned();
         let cpus = list_cpus(&list)?;
         drop(r);
-        let ok = cpus > 1;
+        let ok = !(cpus == 1 && list == c.to_string());
         println!(
             "placement: a machine built on a thread pinned to cpu {c}: its staging thread {tid} \
              Cpus_allowed_list {list} ({cpus} cpus) {}",

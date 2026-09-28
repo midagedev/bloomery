@@ -952,11 +952,13 @@ pub static RESIDENCY_RESET: Kind = Kind {
 pub static HELPER: Kind = Kind {
     name: "helper",
     head: "helper",
-    doc: "A helper thread the load spawned beside the step thread: its name, the cpu it is \
-          pinned to (float when none) and the cpus in its mask once placed — one cpu for a \
-          floating helper would share its spawner's.",
+    doc: "A helper thread the load spawned beside the step thread: its name, where it asked to \
+          run (pin:<cpu>, sibling:<cpu> — the SMT sibling of that cpu — or float), the cpu it is \
+          pinned to (float when none: a refused pin or a core without a sibling floats) and the \
+          cpus in its mask once placed.",
     parts: &[
         key("name", Word, ""),
+        key("asked", Word, ""),
         key("pinned", Word, ""),
         key("cpus", U64, ""),
     ],
@@ -1551,11 +1553,17 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("prepare_us", r.prepare_us)
 }
 
-/// A helper thread's record: `name`, the cpu it is pinned to, the cpus in
-/// its mask.
-pub fn helper(name: &str, pinned: Option<usize>, cpus: usize) -> Record {
+/// A helper thread's record: `name`, where it asked to run, the cpu it is
+/// pinned to, the cpus in its mask.
+pub fn helper(
+    name: &str,
+    asked: impl std::fmt::Display,
+    pinned: Option<usize>,
+    cpus: usize,
+) -> Record {
     Record::new(&HELPER)
         .w("name", name)
+        .w("asked", asked)
         .w(
             "pinned",
             pinned.map_or_else(|| "float".to_owned(), |c| c.to_string()),

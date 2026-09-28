@@ -4,13 +4,16 @@
 //! A thread inherits its spawner's affinity mask. A binary that pins its step
 //! thread to one cpu ([`crate::Pool::pin_caller`]) would hand every helper it
 //! spawns later that one cpu, and the helper's work would take turns with the
-//! step on it. [`spawn_helper`] places the new thread before its body runs:
-//! pinned to the cpu asked for when the kernel allows it, else floating, and
-//! floating off an inherited one-cpu mask widens the mask to every cpu (the
-//! kernel keeps it inside the process's cpuset). A mask that cannot be read or
-//! widened is a named error and the body never runs. Every placed helper is
-//! listed ([`helpers`]) with its mask's size, for the binaries' `helper`
-//! records.
+//! step on it. [`spawn_helper`] places the new thread before its body runs, as
+//! its [`Placement`] says: on a cpu, on the SMT sibling of a cpu (the pool
+//! runs one thread a physical core, so each core's other logical cpu idles),
+//! or floating. A pin the kernel refuses, or a sibling a core does not have,
+//! floats instead, and the list says so; floating off an inherited one-cpu
+//! mask widens the mask to every cpu (the kernel keeps it inside the
+//! process's cpuset). A mask that cannot be read or widened is a named error
+//! and the body never runs. Every placed helper is listed ([`helpers`]) with
+//! what it asked for, where it runs and its mask's size, for the binaries'
+//! `helper` records.
 
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -64,10 +67,33 @@ impl std::error::Error for HelperError {
     }
 }
 
+/// Where a helper asks to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Pinned to this cpu.
+    Pin(usize),
+    /// Pinned to the SMT sibling of this cpu.
+    Sibling(usize),
+    /// Floating.
+    Float,
+}
+
+impl std::fmt::Display for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Placement::Pin(c) => write!(f, "pin:{c}"),
+            Placement::Sibling(c) => write!(f, "sibling:{c}"),
+            Placement::Float => f.write_str("float"),
+        }
+    }
+}
+
 /// A placed helper as [`helpers`] lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Helper {
     pub name: String,
+    /// What it asked for.
+    pub asked: Placement,
     /// The cpu it is pinned to; `None` when it floats.
     pub pinned: Option<usize>,
     /// Cpus in its mask once placed.
@@ -82,14 +108,14 @@ pub fn helpers() -> Vec<Helper> {
     HELPERS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-/// Spawn thread `name`, place it (pinned to `cpu` when one is asked for and
-/// the kernel allows it, else floating off any one-cpu mask it inherited),
-/// then run `body` on it. Returns once the thread is placed: its handle and
-/// the cpu it is pinned to (`None` when it floats). A placement error ends
-/// the thread before `body` runs and is returned once it has ended.
+/// Spawn thread `name`, place it as `asked` (a pin the kernel refuses or a
+/// sibling the core lacks floats, off any one-cpu mask it inherited), then
+/// run `body` on it. Returns once the thread is placed: its handle and the
+/// cpu it is pinned to (`None` when it floats). A placement error ends the
+/// thread before `body` runs and is returned once it has ended.
 pub fn spawn_helper<F>(
     name: &str,
-    cpu: Option<usize>,
+    asked: Placement,
     body: F,
 ) -> Result<(JoinHandle<()>, Option<usize>), HelperError>
 where
@@ -99,6 +125,11 @@ where
     let handle = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
+            let cpu = match asked {
+                Placement::Pin(c) => Some(c),
+                Placement::Sibling(c) => sibling_of(c),
+                Placement::Float => None,
+            };
             let placed = place(cpu).and_then(|p| Ok((p, mask()?.len())));
             let ok = placed.is_ok();
             if placed_tx.send(placed).is_ok() && ok {
@@ -112,6 +143,7 @@ where
             if let Ok(mut v) = HELPERS.lock() {
                 v.push(Helper {
                     name: name.to_owned(),
+                    asked,
                     pinned,
                     cpus,
                 });
@@ -125,12 +157,18 @@ where
     }
 }
 
-/// The calling thread's SMT sibling when it is pinned to one cpu
-/// (`/sys/devices/system/cpu/cpu<c>/topology/thread_siblings_list`). `None`
-/// for a floating caller or a core without SMT.
+/// The calling thread's SMT sibling when it is pinned to one cpu. `None` for
+/// a floating caller or a core without SMT.
 #[must_use]
 pub fn caller_sibling() -> Option<usize> {
-    let cpu = sole_cpu().ok()??;
+    sibling_of(sole_cpu().ok()??)
+}
+
+/// The other logical cpu of `cpu`'s core
+/// (`/sys/devices/system/cpu/cpu<c>/topology/thread_siblings_list`); `None`
+/// for a core without SMT.
+#[must_use]
+pub fn sibling_of(cpu: usize) -> Option<usize> {
     let list = std::fs::read_to_string(format!(
         "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
     ))
