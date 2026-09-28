@@ -82,8 +82,8 @@
 //! prologue inside that wall before the first ubatch launch: the prompt
 //! image's fill and the enqueue of its copy to the card, which the launches
 //! behind it wait for, not the host; runtime values read from three clock
-//! reads the engine takes on every prompt; `ubatch_tokens=0` when no ubatch
-//! ran),
+//! reads the engine takes on every prompt; a body that writes no image, or a
+//! prompt no ubatch ran, prints `ubatch_tokens=<n> (no prompt image)`),
 //! per feedback step `step i pos tok` (and `time step i ms=` under
 //! `--time`); then
 //! `tokens [..]`, `text` for a `--prompt` run, and under `--time` the
@@ -394,7 +394,6 @@ mod cli {
                     };
                     Units {
                         kind: path.name(),
-                        ubatch_tokens: 0,
                         ..Units::from(&plan)
                     }
                 }
@@ -443,7 +442,7 @@ mod cli {
             Ok(next)
         }
 
-        /// No ubatch runs: no image.
+        /// The Qwen3.8 walks write no prompt image.
         fn image(_: &Qwen38Model, _: &Units) -> Result<Option<ImageWrite>, GateError> {
             Ok(None)
         }
@@ -934,7 +933,10 @@ mod cli {
                 w.fill.as_secs_f64() * 1e6,
                 w.copy.as_secs_f64() * 1e6
             ),
-            None => println!("stat prompt ubatch_tokens=0 (no ubatch ran)"),
+            None => println!(
+                "stat prompt ubatch_tokens={} (no prompt image)",
+                plan.ubatch_tokens
+            ),
         }
         for (k, &(pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;
