@@ -11,7 +11,8 @@
 //! takes every key with no defaults, [`names`] owns the draft's tensor names,
 //! [`tensors`] states the shape and type of every tensor the draft reads, and
 //! [`inventory`] checks the file against that statement and counts its bytes
-//! by group, next to the two tensors borrowed from the target.
+//! by group, next to the two tensors borrowed from the target, and
+//! [`card_bytes`] states what the draft takes on its card before any load.
 //!
 //! Two keys the file carries are not read. The rope keys of YaRN
 //! (`rope.scaling.*`) and `attention.compress_rope_freq_base`: every block's
@@ -19,6 +20,8 @@
 //! rope at `rope.freq_base` (the reference `model.py` and ik both ignore the
 //! scaling on such a layer). And the indexer keys (`attention.indexer.*`): no
 //! block carries an indexer.
+
+use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
 
@@ -601,6 +604,141 @@ pub fn inventory(
         rows,
         unread,
         borrowed,
+    })
+}
+
+/// The body's device bytes beside its weights and rings — the block pass's
+/// buffers for its widest block, the head's logits, the append's staging and
+/// the kernel modules its context loads — an allowance [assumed].
+pub const SCRATCH_ALLOWANCE: u64 = 64 << 20;
+
+/// What the draft takes on its card, from the two files' headers alone
+/// ([`card_bytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftCardBytes {
+    /// Every weight buffer the load allocates: the draft's tensors in their
+    /// card formats (MXFP4 in its two planes) and, from the target, the head
+    /// and the mask token's embedding row.
+    pub weights: u64,
+    /// Every layer's window ring: `window` rows of `head_dim` f16. A ring,
+    /// so it does not grow with the serving context.
+    pub kv: u64,
+    /// The allocator's granules past `weights + kv`.
+    pub rounding: u64,
+    /// [`SCRATCH_ALLOWANCE`].
+    pub scratch: u64,
+}
+
+impl DraftCardBytes {
+    /// The draft's resident bytes on its card: the sum of the four.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.weights + self.kv + self.rounding + self.scratch
+    }
+}
+
+/// An MXFP4 stack's two card planes of `values` values: 16 code bytes and
+/// one scale byte per 32-value block.
+fn mxfp4_planes(t: &DraftTensor) -> Result<[u64; 2], PlacementError> {
+    let values: u64 = t.dims.iter().product();
+    if values == 0 || !values.is_multiple_of(32) {
+        return Err(PlacementError::Tensor {
+            name: t.name.clone(),
+            detail: format!("dims {:?} are not whole 32-value MXFP4 blocks", t.dims),
+        });
+    }
+    let blocks = values / 32;
+    Ok([16 * blocks, blocks])
+}
+
+/// `rows` rows of the first dim of `dims`, in `format`: the buffers the
+/// upload allocates, or the refusal naming `name`.
+fn format_buffers(
+    name: &str,
+    format: Option<CardFormat>,
+    ty: GgmlType,
+    dims: &[u64],
+    rows: u64,
+) -> Result<Vec<u64>, PlacementError> {
+    let k = dims.first().copied().unwrap_or(0);
+    format
+        .and_then(|f| f.buffer_bytes(ty, k, rows))
+        .ok_or_else(|| PlacementError::Tensor {
+            name: name.to_string(),
+            detail: format!("{rows} rows of {k} {ty} values have no card buffers"),
+        })
+}
+
+/// The draft's resident bytes on a card of allocation granule `granule`,
+/// before any load: `draft`'s header checked against [`tensors`] and the
+/// target's borrowed tensors read from `target`'s ([`inventory`]), then the
+/// load's buffers in its allocation order — the GPU loader's tensors in file
+/// order, the target's head, the Markov weights and the MXFP4 stacks in
+/// [`tensors`]' order, the mask row, then the rings — through the plan's
+/// allocator model ([`crate::placement::allocator_bytes`]), and the scratch
+/// allowance. A file the inventory refuses is refused.
+pub fn card_bytes(
+    draft: &Split,
+    target: &Split,
+    granule: NonZeroU64,
+) -> Result<DraftCardBytes, PlacementError> {
+    let hp = DraftHparams::read(draft)?;
+    let inv = inventory(draft, &hp, target)?;
+    inv.check()?;
+    let rows_of = |dims: &[u64]| dims.iter().skip(1).product::<u64>();
+    let want = tensors(&hp);
+    let by_loader =
+        |t: &DraftTensor| card_format(t).is_some_and(|f| CardFormat::of(t.ty) == Some(f));
+    let mut weights = Vec::new();
+    for (_, f) in draft.iter_tensors() {
+        if let Some(t) = want.iter().find(|w| w.name == f.name && by_loader(w)) {
+            let bufs = format_buffers(&t.name, card_format(t), t.ty, &t.dims, rows_of(&t.dims))?;
+            weights.extend(bufs);
+        }
+    }
+    let (copied, sources): (Vec<&Borrowed>, Vec<&Borrowed>) = inv
+        .borrowed
+        .iter()
+        .partition(|b| b.borrow == Borrow::Copied);
+    for b in copied {
+        weights.extend(format_buffers(
+            &b.name,
+            b.card_format(),
+            b.ty,
+            &b.dims,
+            rows_of(&b.dims),
+        )?);
+    }
+    for t in want.iter().filter(|t| !by_loader(t)) {
+        match card_format(t) {
+            Some(f) => weights.extend(format_buffers(
+                &t.name,
+                Some(f),
+                t.ty,
+                &t.dims,
+                rows_of(&t.dims),
+            )?),
+            None if t.ty == GgmlType::MXFP4 => weights.extend(mxfp4_planes(t)?),
+            None => {
+                return Err(PlacementError::Tensor {
+                    name: t.name.clone(),
+                    detail: format!("{} has no card format the draft loads", t.ty),
+                });
+            }
+        }
+    }
+    for b in sources {
+        weights.extend(format_buffers(&b.name, b.card_format(), b.ty, &b.dims, 1)?);
+    }
+    let ring = (hp.window * hp.head_dim * 2) as u64;
+    let rings = vec![ring; hp.n_layer];
+    let (w, kv): (u64, u64) = (weights.iter().sum(), rings.iter().sum());
+    let taken = crate::placement::allocator_bytes(granule, weights.into_iter().chain(rings));
+    Ok(DraftCardBytes {
+        weights: w,
+        kv,
+        rounding: taken - w - kv,
+        scratch: SCRATCH_ALLOWANCE,
     })
 }
 

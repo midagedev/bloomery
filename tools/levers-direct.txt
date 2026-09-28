@@ -49,7 +49,7 @@ crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file th
 crates/model/tests/ds41_meta.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/mt.rs	BLOOMERY_MT_CHILD_DUMP	stays: the gate's handshake with the child it runs
-crates/model/tests/placement.rs	BLOOMERY_PLACEMENT_TABLE	stays: the gate's own print switch
+crates/model/tests/placement.rs	BLOOMERY_PLACEMENT_TABLE,BLOOMERY_DSPARK_MODEL	stays: the gate's own print switch, and the DSpark draft file
 crates/model/tests/profile.rs	BLOOMERY_PROFILE_CHILD_DUMP,BLOOMERY_PROFILE	stays: the gate's handshake with the child it runs, and the level the child prints
 crates/model/tests/prompts.rs	BLOOMERY_MODEL,BLOOMERY_DATA	stays: the model file and the data directory
 crates/model/tests/qwen3moe_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens

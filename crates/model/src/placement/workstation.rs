@@ -1,6 +1,7 @@
 //! This workstation's figures for a plan (`docs/v41-placement.md` §4–§5): its
 //! two cards, the host's RAM and reserves, the serving context, the two layer
-//! maps of design §5 and the gate placement, and where the V4.1 file lies. The
+//! maps of design §5, the expert-tier map (b′) and the gate placement, and
+//! where the V4.1 file lies. The
 //! placement gate and the GPU load gates build their plans from here, so they
 //! check the same plans.
 
@@ -85,7 +86,14 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
         layers,
         head,
         token_embedding: false,
+        reserves: Vec::new(),
     }
+}
+
+/// `spec` as an expert tier card: no stage, this machine's context, scratch
+/// and margin.
+fn tier(spec: CardSpec) -> Card {
+    card(spec, 0..0, false)
 }
 
 /// The host tier with its reserves.
@@ -105,6 +113,7 @@ pub fn host() -> Host {
 pub fn plan_a(layers: usize) -> Machine {
     Machine {
         cards: vec![card(A6000, 0..layers, true)],
+        tiers: Vec::new(),
         host: host(),
     }
 }
@@ -118,6 +127,27 @@ pub fn plan_b(layers: usize) -> Machine {
             card(A6000, 0..CUT, false),
             card(RTX_3090, CUT..layers, true),
         ],
+        tiers: Vec::new(),
+        host: host(),
+    }
+}
+
+/// What the DSpark draft's reserve on a card is called.
+pub const DRAFT_RESERVE: &str = "DSpark draft";
+
+/// Plan (b′): the A6000 runs all `layers` and the head as in [`plan_a`];
+/// the 3090 is an expert tier beside the host, holding each layer's next hot
+/// ranks, with `draft_bytes` — the DSpark draft's resident bytes
+/// (`model::arch::dspark::card_bytes`), when the draft lives there — as a
+/// named reserve.
+#[must_use]
+pub fn plan_bp(layers: usize, draft_bytes: Option<u64>) -> Machine {
+    let mut t = tier(RTX_3090);
+    t.reserves
+        .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
+    Machine {
+        cards: vec![card(A6000, 0..layers, true)],
+        tiers: vec![t],
         host: host(),
     }
 }
@@ -131,6 +161,7 @@ pub fn plan_b(layers: usize) -> Machine {
 pub fn plan_gate(layers: usize) -> Machine {
     Machine {
         cards: vec![card(RTX_3090, 0..layers, true)],
+        tiers: Vec::new(),
         host: host(),
     }
 }

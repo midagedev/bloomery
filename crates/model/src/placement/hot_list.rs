@@ -1,6 +1,7 @@
 //! A hot list: per layer, routed expert ids in rank order, hottest first —
 //! which experts a card keeps when the plan's count for the layer is `n_l`
-//! (its first `n_l`). The plan decides how many, the file decides which.
+//! (its first `n_l`), and which an expert tier card keeps after it (the next
+//! ranks). The plan decides how many, the file decides which.
 //!
 //! The file is text, written by `tools/ref/router-hotlist.py`: `# key<TAB>value`
 //! header lines, then one line per layer, `layer<TAB>id,id,…`. `# n_expert`
@@ -9,6 +10,7 @@
 //! id is below `n_expert` and appears once; a layer appears at most once.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 
 use super::{ExpertList, ModelTensors, PlacementError};
@@ -126,17 +128,32 @@ impl HotList {
         n: u64,
         experts: u64,
     ) -> Result<ExpertList, PlacementError> {
+        self.ranked_list(layer, 0..n, experts)
+    }
+
+    /// The layer's ids at rank positions `ranks`, as a list of a stack of
+    /// `experts`: `0..n` is a stage card's, the ranks after it a tier's.
+    /// Refused when the file holds fewer than `ranks.end` for the layer.
+    pub fn ranked_list(
+        &self,
+        layer: usize,
+        ranks: Range<u64>,
+        experts: u64,
+    ) -> Result<ExpertList, PlacementError> {
         let ids = self.layers.get(&layer).map_or(&[][..], Vec::as_slice);
-        let take = usize::try_from(n)
-            .ok()
-            .filter(|&n| n <= ids.len())
-            .ok_or_else(|| {
-                self.refuse(format!(
-                    "layer {layer} lists {} experts, the plan keeps {n} on its card",
-                    ids.len()
-                ))
-            })?;
-        ExpertList::new(ids[..take].to_vec(), experts)
+        let (start, end) = (usize::try_from(ranks.start), usize::try_from(ranks.end));
+        let take = match (start, end) {
+            (Ok(s), Ok(e)) if s <= e && e <= ids.len() => s..e,
+            _ => {
+                return Err(self.refuse(format!(
+                    "layer {layer} lists {} experts, the plan keeps ranks {}..{} on cards",
+                    ids.len(),
+                    ranks.start,
+                    ranks.end
+                )));
+            }
+        };
+        ExpertList::new(ids[take].to_vec(), experts)
     }
 
     /// The file's path.
