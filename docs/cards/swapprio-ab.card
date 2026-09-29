@@ -14,8 +14,8 @@ predict: +8..+17
 rounds: 3
 sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round ratios, one run's SD about 0.55 and 1.1 %; the
   larger
-condition: from /Users/hckim/repo/bloomery-swapprio, the base binary built in ~/repo/bloomery-prio-base (main
-  da3eba79): BLOOMERY_REMOTE='~/repo/bloomery-swapprio' BLOOMERY_AB_ROUNDS=3 BLOOMERY_DECODE_N=96
+condition: from /Users/hckim/repo/bloomery-v41res (swapprio + unpacksimt + r3fix's stop-first teardown), the base binary built in ~/repo/bloomery-prio-base (main
+  da3eba79): BLOOMERY_REMOTE='~/repo/bloomery-v41res' BLOOMERY_AB_ROUNDS=3 BLOOMERY_DECODE_N=96
   BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_RESIDENCY=mid-p40-s1
   BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/swapprio-ab.card' just depth-gpu-ds41 prose:512
   bin:/root/repo/bloomery-prio-base/target/release/generate_ds41:prose:512; the witness blocks show no Xid; no
