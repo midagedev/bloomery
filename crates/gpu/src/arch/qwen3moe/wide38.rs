@@ -960,6 +960,9 @@ impl WideParts<'_> {
     /// walk's shadow only — after the front's download, the stream order the
     /// route's buffers exist under.
     fn route_card(&mut self, l: usize) -> Result<(), GpuError> {
+        if !self.card.has(l) {
+            return Ok(());
+        }
         let (c, m) = (&self.c, self.m);
         let s = &*self.s;
         let x = &mut *self.x;

@@ -765,20 +765,6 @@ mod cli {
                 );
             }
         }
-        if let Chosen::Qwen38(path, _) = chosen
-            && experts == Experts::Card
-            && let Some(a) = arms
-                .iter()
-                .find(|a| path.resolve(a.ids.len()) == Prompt38::Gemm)
-        {
-            return Err(format!(
-                "BLOOMERY_QWEN38_EXPERTS=card with a prompt of {} ids by --prefill {}: the \
-                 ubatch walk has no card leg yet; --prefill pass runs it",
-                a.ids.len(),
-                path.name()
-            )
-            .into());
-        }
         if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass))
             && logits
             && arms.iter().any(|a| a.n_gen == 1)
