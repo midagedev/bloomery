@@ -43,8 +43,17 @@
 //! launch is bit for bit the `m = 1` launch of that column, and each weight
 //! word is read once for all `m` columns. `q8_0_gemv_heads_mcol` is the same
 //! body over per-head activation windows.
+//!
+//! `q8_0_gemv_sel_f32` is the expert-select form over a stack of experts in
+//! the two planes: slot `s` dots the rows of expert `sel[s]` with activation
+//! column `s / slots_per_col`, each row `q8_0_gemv`'s lane walk and
+//! butterfly, so a slot's rows are bit for bit `q8_0_gemv` of that expert's
+//! rows on that column. An id at or past the stack's experts raises
+//! [`FaultSite::ExpertId`] and writes its slot's rows NaN; no slot is the
+//! host's here.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
@@ -1328,6 +1337,84 @@ mod q8f32_kernels {
             unsafe { store_sums(&mut y, base, y_col_stride as usize, m_cols as usize, &sums) };
         }
     }
+
+    /// Q8_0 expert-select gemv against f32 activations (module doc): thread
+    /// row `n = slot · rows_per_expert + r` dots weight row `sel[slot] ·
+    /// rows_per_expert + r` of the stack with activation column `slot /
+    /// slots_per_col` through [`q8_0_lane_partial_1col`] and the butterfly,
+    /// and lane 0 stores `y[n]`. One warp a row, eight rows a 256-thread
+    /// block, as `q8_0_gemv`. The id load and its refusal are warp-uniform
+    /// (a warp's lanes share `row`): an id at or past `n_experts` raises
+    /// [`FaultSite::ExpertId`], reads no weight word and stores NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_experts * rows_per_expert * k,
+            32 * d.len() >= n_experts * rows_per_expert * k,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            x.len() >= m_cols * k,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_sel_f32(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        k: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots · rows_per_expert <= y.len(); lane 0
+                // of the row's warp alone writes y[row].
+                unsafe { *y.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        let row_abs = id as usize * rpe + row % rpe;
+        let col = slot / slots_per_col as usize;
+        // SAFETY: row_abs < n_experts · rows_per_expert puts the row's words
+        // and scales inside qs and d (the contract's 4·qs.len() and 32·d.len()
+        // bounds), and col < m_cols (slot < n_slots <= m_cols · slots_per_col)
+        // puts the column's k values at col·k inside x.len() >= m_cols·k; the
+        // host passes k a positive multiple of 32.
+        let f = unsafe { q8_0_lane_partial_1col(qs, d, x, k, row_abs, col * k as usize, lane) };
+        let s = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: row < n_slots · rows_per_expert <= y.len() by the launch
+            // contract; lane 0 of the row's warp alone writes y[row].
+            unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
 }
 
 /// The loaded P3 device module: `f32_gemv`, `q8_0_gemv` and the two
@@ -1568,6 +1655,99 @@ impl Q8F32Kernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue the Q8_0 expert-select gemv ([`Q8_0SelArgs`], the module
+    /// doc's `q8_0_gemv_sel_f32`): slot `s` writes `y[s · rows_per_expert
+    /// ..][..rows_per_expert]` as the rows of expert `sel[s]` of the stack
+    /// dotted with activation column `s / slots_per_col`, `k = d.cols() · 32`
+    /// values a column. An id past the stack raises on `fault` and writes its
+    /// slot NaN. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_q8_0_gemv_sel_f32(
+        &self,
+        stream: &CudaStream,
+        a: &Q8_0SelArgs<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_q8_0_gemv_sel_f32";
+        let (qs, d) = (a.qs, a.d);
+        let (rows, k) = (d.rows(), d.cols() * 32);
+        let (n_slots, rpe, spc) = (a.n_slots, a.rows_per_expert, a.slots_per_col);
+        if k == 0 || qs.rows() != rows || qs.cols() != d.cols() * 8 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "Q8_0 planes qs {}x{} and d {}x{}: equal rows, 8 words a scale, k >= 32",
+                    qs.rows(),
+                    qs.cols(),
+                    d.rows(),
+                    d.cols()
+                ),
+            ));
+        }
+        if rpe == 0 || rows == 0 || !rows.is_multiple_of(rpe) {
+            return Err(GpuError::shape(
+                what,
+                format!("{rows} stack rows are not a positive multiple of {rpe} rows an expert"),
+            ));
+        }
+        let m_cols = n_slots.div_ceil(spc.max(1));
+        if n_slots == 0
+            || spc == 0
+            || a.sel.len() < n_slots
+            || a.x.len() < m_cols * k
+            || y.len() < n_slots * rpe
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_slots} slots (at least one) at {spc} a column (at least one): sel.len() {} \
+                     >= {n_slots}, x.len() {} >= {m_cols} columns of {k}, y.len() {} >= {}",
+                    a.sel.len(),
+                    a.x.len(),
+                    y.len(),
+                    n_slots * rpe
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(8))?;
+        let prep = self
+            .module
+            .prepare_q8_0_gemv_sel_f32(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.q8_0_gemv_sel_f32(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            a.x,
+            a.sel,
+            launch_u32(what, "n_experts", rows / rpe)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "m_cols", m_cols)?,
+            launch_u32(what, "slots_per_col", spc)?,
+            launch_u32(what, "k", k)?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+}
+
+/// [`Q8F32Kernels::enqueue_q8_0_gemv_sel_f32`]'s arguments: a stack of
+/// experts in the Q8_0 planes (`rows_per_expert` rows an expert), the f32
+/// activation columns, an id a slot (read on the device at each launch),
+/// the slots, and how many consecutive slots read one column (a token's
+/// routed slots for a gate or an up; 1 for a down, which reads its slot's
+/// own column).
+pub struct Q8_0SelArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
+    pub slots_per_col: usize,
 }
 
 /// Where an m-column gemv writes row r's column c.

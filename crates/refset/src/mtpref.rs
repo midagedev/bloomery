@@ -6,8 +6,10 @@
 //! rows with four more columns on every `tensor`, `input` and `int` row —
 //! `block`, `row`, `accepted`, `graph` — and the `draft`, `verify` and
 //! `plain` rows. What is its own: the graph labels, the MTP op ik ran
-//! ([`Graph`]); no draft file, since the NextN block is the target file's; and
-//! one proposal a block, which must equal the target's token at the draft row
+//! ([`Graph`]); a draft file only for a family that names one
+//! (`# draft_model`: Qwen3.8's shared draft beside its target; GLM's NextN
+//! block is the target file's, and its sets state none); and one proposal a
+//! block, which must equal the target's token at the draft row
 //! exactly when ik accepted it. A file is named
 //! `<b<block> | w>.<graph>.<stem>.<occurrence>[.input][.logical].<ext>`: `w`
 //! for the prompt warmup, block −1.
@@ -96,12 +98,18 @@ impl Deref for MtpInt {
 pub struct MtpSet {
     /// The set's directory; every file a row names resolves under it.
     pub dir: PathBuf,
-    /// `# model`: the file the set was dumped from, target and NextN block.
+    /// `# model`: the target file the set was dumped from (for GLM, with
+    /// its NextN block).
     pub model: Option<String>,
+    /// `# draft_model`: the draft file beside the target, for a family with
+    /// one.
+    pub draft_model: Option<String>,
     /// `# build`: the ik tree's commit.
     pub build: Option<String>,
     /// `# arch`.
     pub arch: Option<String>,
+    /// `# tokens`: the prompt's ids, the target's warmup.
+    pub tokens: Option<Vec<u32>>,
     /// `# complete <written> <skipped>`; `None` when the dump died.
     pub complete: Option<(u64, u64)>,
     /// `tensor` and `input` rows, in file order.
@@ -177,8 +185,10 @@ impl MtpSet {
         let mut set = MtpSet {
             dir: dir.to_path_buf(),
             model: None,
+            draft_model: None,
             build: None,
             arch: None,
+            tokens: None,
             complete: None,
             rows: Vec::new(),
             ints: Vec::new(),
@@ -209,8 +219,10 @@ impl MtpSet {
     }
 
     /// This set against its family's row: the completion trailer
-    /// ([`RefError::Unfinished`]), the file it states ([`RefError::Stale`]),
-    /// then its `# arch` and `# build` ([`RefError::Foreign`]).
+    /// ([`RefError::Unfinished`]), the file it states and, for a family
+    /// with a draft file, the draft file ([`RefError::Stale`]), then its
+    /// `# arch` and `# build` ([`RefError::Foreign`]). A set that states a
+    /// draft file for a family without one is foreign by its `draft_model`.
     pub fn check_family(&self, family: &Family) -> Result<(), RefError> {
         if self.complete.is_none() {
             return Err(RefError::Unfinished {
@@ -218,6 +230,19 @@ impl MtpSet {
             });
         }
         family.check_file(&self.dir, "# model", self.model.as_deref())?;
+        match (family.draft_runs, &self.draft_model) {
+            (Some(_), stated) => family.check_draft(&self.dir, stated.as_deref())?,
+            (None, Some(stated)) => {
+                return Err(RefError::Foreign {
+                    set: self.dir.display().to_string(),
+                    family: family.name,
+                    field: "draft_model",
+                    got: stated.clone(),
+                    want: "(no draft file: the target file carries the draft layer)".to_string(),
+                });
+            }
+            (None, None) => {}
+        }
         family.check_arch(&self.dir, self.arch.as_deref())?;
         family.check_build(&self.dir, self.build.as_deref())
     }
@@ -299,8 +324,22 @@ impl MtpSet {
         };
         match key {
             "model" => once(&mut self.model),
+            "draft_model" => once(&mut self.draft_model),
             "build" => once(&mut self.build),
             "arch" => once(&mut self.arch),
+            "tokens" => {
+                let ids = if v == "-" {
+                    Vec::new()
+                } else {
+                    v.split(',')
+                        .map(|t| crate::columns::parse_field(t, "tokens", at))
+                        .collect::<Result<Vec<u32>, _>>()?
+                };
+                if self.tokens.replace(ids).is_some() {
+                    return Err(RefError::malformed(at, "a second # tokens line"));
+                }
+                Ok(())
+            }
             "complete" => {
                 let (w, s) = v.split_once('\t').ok_or_else(|| {
                     RefError::malformed(at, format!("complete {v:?}: not two counts"))

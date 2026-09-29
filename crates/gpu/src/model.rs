@@ -975,7 +975,11 @@ impl<B: ChainBody> GpuModel<B> {
     /// call's error whatever else failed: any other error is read behind
     /// ([`GpuModel::fault_behind`]). The fault prints its site mask in this
     /// body's step order.
-    fn note_fault<T>(&mut self, what: &'static str, r: Result<T, GpuError>) -> Result<T, GpuError> {
+    pub(crate) fn note_fault<T>(
+        &mut self,
+        what: &'static str,
+        r: Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
         let mut e = match r {
             Ok(v) => return Ok(v),
             Err(e @ GpuError::Fault { .. }) => e,

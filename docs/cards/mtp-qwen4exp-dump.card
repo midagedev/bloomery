@@ -1,0 +1,33 @@
+# Round mtpprog: the Qwen3.8-Flash-Next MTP draft oracle set, ref-mtp/qwen4exp_prose64_n64_k1 (refset
+# family mtp-qwen4exp). One run under this card, `just dump-ref-mtp-qwen4exp`, after the dumper's rebuild
+# (`just build-ref-dump-mtp` under glmmtpref-dump.card: dump_mtp.cpp changed, so dump-mtp.sh refuses the
+# installed binary as stale until then). ik on 32 CPU threads, CUDA hidden, the target and its MTP context
+# over the shared draft file (-md): 64 prose ids, then 64 positions at one draft token a round. The phases
+# run one after the other, so the wall is their sum [derived]:
+#   fixed     lease, witnesses, metadata over four target shards and the draft file, two contexts: 3-15 s
+#             (q38ref's dumps of this file)
+#   populate  the loader pages in the 111.3 GB split set and the ~2.8 GB draft (512 experts x 3 x 640 x
+#             2560 at Q8_0's 1.0625 B, the dense tensors beside them): warm <= 10 s as q38ref scaled it;
+#             cold 67-107 s at 1.07-1.72 GB/s (q38ref's priors)
+#   prompt    64 ids x ~13 GFLOP at 1.25-3 TFLOP/s: < 1 s; the MTP warmup graph over 64 rows node by node
+#             (~0.8 GFLOP a row, the output projection 636 M of it): < 1 s
+#   rounds    R = 61 / (1 + alpha) + 1 = 33-42 at alpha 0.45-0.9 (not measured on this model): per round
+#             a 2-row verify on the target, ~6-8 GB (the non-expert weights and the k = 2 routed union over
+#             48 layers) at 100-150 GB/s, 40-80 ms, plus the update graph (the draft layer's ~0.1 GB of
+#             experts and dense rows, the shared 0.68 GB output, ~400 nodes alone) 20-50 ms: 2.3-5.5 s;
+#             a rejected round may add a 1-row re-decode (20-40 ms)
+#   dump      warmup ~0.2 GB (64 rows of every node, 64 full-vocabulary logits rows), R x 5-8 MB = 0.2-0.35
+#             GB, at the 0.5 GB/s glmref wrote: ~1 s
+#     warm 0.3-0.6 min, cold 1.3-2.2 min.
+# What the dump itself checks (no trailer otherwise): one warmup graph; every committed block ran one
+# update graph; in every block the proposal equals the target's token exactly when ik accepted it; ik's
+# draft sampler names each update graph's result_output argmax; the draft file is a qwen4exp file. Then
+# `just gate-refset` (no lease): red before the dump on this family's set (Missing), green after, the set
+# stating the target and the draft file the family names.
+kind: exclusive
+reason: dump_mtp runs ik on 32 CPU threads and populates the whole 111.3 GB split set and the draft
+  file into the page cache, evicting that much of what else is cached; beside a timed run or a gate
+  batch it would take their cores, their memory bandwidth and their cache, so it holds the lease; why
+  now: the oracle the Qwen3.8 MTP draft program (round mtpprog) is judged against by
+  gate-gpu-qwen4exp-mtp
+minutes: 0.3..2.3

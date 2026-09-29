@@ -513,9 +513,10 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
-# GLM-5.3-Flash MTP draft oracle: dump_mtp linked against the ik tree that carries the glm5next MTP graph (the profile's
-# GLM_MTP_IK at GLM_MTP_SHA, checked clean); `cmake --build` of its libllama and libcommon first (nothing to do when
-# current). Under the CPU lease: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmmtpref-dump.card'.
+# The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
+# carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
+# clean); `cmake --build` of its libllama and libcommon first (nothing to do when current). Under the CPU lease:
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmmtpref-dump.card'.
 build-ref-dump-mtp:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/build-dump-mtp.sh'
 
@@ -524,6 +525,15 @@ build-ref-dump-mtp:
 # under the CPU lease and the same card; the set is installed from staging only with its `# complete` trailer.
 dump-ref-mtp-glm5next:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/dump-mtp.sh'
+
+# Qwen3.8-Flash-Next MTP draft oracle: the same dump_mtp (built by `just build-ref-dump-mtp`) under the qwen4exp profile,
+# the shared draft file beside the target (-md): every node ik's MTP context computes while the target decodes 64
+# positions after the first 64 prose ids, one draft token a round, into $BLOOMERY_DATA/ref-mtp/qwen4exp_prose64_n64_k1/
+# (refset family mtp-qwen4exp). ik on the CPU, CUDA hidden, under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mtp-qwen4exp-dump.card'); installed from staging only with its
+# `# complete` trailer.
+dump-ref-mtp-qwen4exp:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/dump-mtp.sh'
 
 # Qwen3.8-Flash-Next(qwen4exp) 오라클: 같은 덤프 도구를 qwen4exp 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_qwen4exp/에 뜬다. VARIANT(step4, d1k, d3k와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
@@ -687,6 +697,16 @@ gate-gpu-qwen4exp-e2e:
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp-load:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp_load && bash tools/gpu-gate.sh gate_qwen4exp_mtp_load'
+
+# Qwen3.8's MTP draft program on the 3090 beside the target: every graph of ik's MTP draft set (mtp-qwen4exp) replayed
+# teacher-forced — eh_proj, l_out and the head's logits within their derived bands, the router's flips named, the argmax
+# ik's where its margin clears the band — the row-list head against the full head, the target's streams paired with
+# ik's hidden rows, the captured walks = the eager ones, and the refusals and the NaN fault. Loads the whole host set:
+# alone in a batch, under the big-load lock.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-qwen4exp-mtp:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && bash tools/gpu-gate.sh gate_qwen4exp_mtp'
 
 gate-gpu-qwen3moe-down:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_down'

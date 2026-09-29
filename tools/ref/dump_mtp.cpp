@@ -1,6 +1,6 @@
 // dump_mtp — write ik_llama.cpp's MTP (NextN) draft tensors to disk as raw f32, one set per decode.
 //
-// The oracle of the GLM-5.3-Flash MTP port. The target decodes a fixed prompt greedily with ik's MTP
+// The oracle of the GLM-5.3-Flash and Qwen3.8-Flash-Next MTP ports. The target decodes a fixed prompt greedily with ik's MTP
 // speculative stage at one draft token (the loop this tree's llama-spec-bench runs for an MTP stage:
 // prompt warmup, then common_speculative_run_round per step). ik computes the NextN block (the file's last block) on a
 // context of its own over the target's model, ctx_mtp; the eval callback is on that context only, so
@@ -14,6 +14,12 @@
 // and graph scratch as `skip-input` rows, BLOOMERY_REF_WRITE=1 or nothing is written, a `.partial`
 // manifest renamed only after the decode returns, `# build` in the header, and the
 // `# complete <written> <skipped>` trailer only when every file was written.
+//
+// The two architectures differ in where the draft layer lives. GLM's NextN block is the target file's
+// last block (no -md). Qwen3.8's is a companion file of its own, the shared draft that borrows the
+// target's token_embd and output (-md, its architecture the target's, stated in `# draft_model`); ik's
+// ctx_mtp then runs build_qwen4exp's MTP graph over the companion, whose nodes mtp_eh_proj-<l>, l_out-<l>
+// and result_output (the target's output over the whole vocabulary) are what the gate replays.
 //
 // What is its own:
 //
@@ -614,11 +620,22 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "dump_mtp: bad arguments\n");
         return 2;
     }
-    // The NextN block is the target file's own: no -md, an MTP stage, one draft token a round (the
-    // draft rows and the accept check are a one-token rule).
-    if (!params.speculative.model.empty() || !params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
+    // An MTP stage, one draft token a round (the draft rows and the accept check are a one-token rule).
+    // GLM's NextN block is the target file's own: no -md. Qwen3.8's draft layer is a companion file: -md
+    // names it.
+    const bool companion = expect_arch == "qwen4exp";
+    if (!params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
         params.speculative.get_max_stage_n_max() != 1) {
-        fprintf(stderr, "dump_mtp: needs --spec-type mtp:n_max=1 and no -md (the target file carries the NextN block)\n");
+        fprintf(stderr, "dump_mtp: needs --spec-type mtp:n_max=1\n");
+        return 2;
+    }
+    if (companion == params.speculative.model.empty()) {
+        if (companion) {
+            fprintf(stderr, "dump_mtp: --expect-arch qwen4exp needs -md <the shared MTP draft file>\n");
+        } else {
+            fprintf(stderr, "dump_mtp: --expect-arch %s takes no -md (the target file carries the NextN block)\n",
+                    expect_arch.c_str());
+        }
         return 2;
     }
     const int n_predict = params.n_predict;
@@ -655,6 +672,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "dump_mtp: the target %s is a '%s' model, expected '%s' -- not loading it\n",
                 params.model.c_str(), got_arch.c_str(), expect_arch.c_str());
         return 2;
+    }
+    if (companion) {
+        const std::string draft_arch = file_arch(params.speculative.model);
+        if (draft_arch != expect_arch) {
+            fprintf(stderr, "dump_mtp: the draft %s is a '%s' model, expected '%s' -- not loading it\n",
+                    params.speculative.model.c_str(), draft_arch.c_str(), expect_arch.c_str());
+            return 2;
+        }
     }
 
     dump_ctx d;
@@ -723,6 +748,7 @@ int main(int argc, char ** argv) {
     if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) snprintf(arch, sizeof arch, "unknown");
     fprintf(d.manifest, "# dump_mtp — ik_llama.cpp MTP (NextN) draft tensors, raw f32, little-endian\n");
     fprintf(d.manifest, "# model\t%s\n", params.model.c_str());
+    if (companion) fprintf(d.manifest, "# draft_model\t%s\n", params.speculative.model.c_str());
     if (const char * b = getenv("BLOOMERY_REF_BUILD")) fprintf(d.manifest, "# build\t%s\n", b);
     fprintf(d.manifest, "# arch\t%s\n", arch);
     fprintf(d.manifest, "# model_file\t%s\n", basename_of(params.model));

@@ -57,6 +57,7 @@ use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
+use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::q38::{
@@ -74,7 +75,7 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 const WHAT: &str = "qwen4exp program";
 
 /// The selected flash's pass: the tensor-core one.
-const MMA: bool = true;
+pub(super) const MMA: bool = true;
 
 /// A delta layer's mixer launches at one row: the q·k·v, `z` and joined
 /// β·α projections, the conv, the delta step, the gated norm and the output
@@ -159,6 +160,8 @@ pub(super) struct Kernels38 {
     pub(super) g32: Gemm32Kernels,
     pub(super) prefill: FlashGqaPrefill,
     pub(super) hcw: HcWideKernels,
+    /// The MTP draft layer's input pack and head argmax (`mtp38`).
+    pub(super) mtp: MtpKernels,
 }
 
 impl Kernels38 {
@@ -180,6 +183,7 @@ impl Kernels38 {
             g32: Gemm32Kernels::load(ctx)?,
             prefill: FlashGqaPrefill::load(ctx)?,
             hcw: HcWideKernels::load(ctx)?,
+            mtp: MtpKernels::load(ctx)?,
         })
     }
 }
@@ -210,7 +214,7 @@ pub(super) struct Ctx38<'a> {
 
 impl Ctx38<'_> {
     /// `y = W · x` for the Q8_0 weight `name` over `m` columns, token-major.
-    fn q8_gemv(
+    pub(super) fn q8_gemv(
         &self,
         name: &str,
         x: &DeviceBuffer<f32>,
@@ -256,7 +260,7 @@ impl Ctx38<'_> {
         clippy::too_many_arguments,
         reason = "one site's streams, rule, width, sink and two outputs (rust-quality R8)"
     )]
-    fn mix(
+    pub(super) fn mix(
         &self,
         site: &HcSite,
         res: &mut DeviceBuffer<f32>,

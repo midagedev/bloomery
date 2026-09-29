@@ -1,8 +1,12 @@
 //! The Qwen3.8-Flash-Next families. The node dumps are dumped from
 //! unsloth's UD-Q4_K_XL split set, [`MODEL`], by the ik tree [`IK_BUILD`]
-//! (`tools/ref/models/qwen4exp.sh`).
+//! (`tools/ref/models/qwen4exp.sh`); the MTP draft set from the same file
+//! and the shared draft file by the ik tree that carries the MTP graph
+//! ([`mtp`]).
 
 use crate::family::{Build, Family, Identity};
+
+pub mod mtp;
 
 /// The first shard of the split set every qwen4exp set is dumped from and
 /// the tree runs: the identity each set's `# model` line states. The family
@@ -57,7 +61,7 @@ pub static IK: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK];
+pub static FAMILIES: &[&Family] = &[&IK, &mtp::MTP];
 
 #[cfg(test)]
 mod tests;

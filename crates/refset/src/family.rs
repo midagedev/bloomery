@@ -21,7 +21,9 @@ pub enum Identity {
     /// `# model\t<path>` and `# draft_model\t<path>` (`dump_draft`).
     ManifestAndDraft,
     /// `# model\t<path>` in an MTP draft set's `MANIFEST.tsv` (`dump_mtp`):
-    /// the target file, which carries the NextN block.
+    /// the target file, which carries the NextN block; with
+    /// `# draft_model\t<path>` too for a family whose draft is a file of its
+    /// own (`Family::draft_runs`).
     MtpManifest,
     /// `model=<path>` in the `# argmax_ref` line heading the tsv (`argmax_ref`).
     ArgmaxHeader,
@@ -88,7 +90,8 @@ pub struct Family {
     pub build: Option<Build>,
     /// The model file the tree runs, for a family whose identity is a file.
     pub runs: Option<fn() -> String>,
-    /// The draft file the tree runs, for [`Identity::ManifestAndDraft`].
+    /// The draft file the tree runs, for [`Identity::ManifestAndDraft`] and
+    /// an [`Identity::MtpManifest`] family whose draft is its own file.
     pub draft_runs: Option<fn() -> Result<String, RefError>>,
     /// The gate recipes that read the family.
     pub consumers: &'static [&'static str],
@@ -202,7 +205,8 @@ impl Family {
 pub struct Provenance {
     /// The model file (or, for a checkpoint family, the checkpoint) it states.
     pub dumped_from: String,
-    /// The draft file, for [`Identity::ManifestAndDraft`].
+    /// The draft file, for [`Identity::ManifestAndDraft`] and an MTP family
+    /// with one.
     pub draft: Option<String>,
     /// The ik build it names, where the family's sets record one.
     pub build: Option<String>,
@@ -236,7 +240,7 @@ impl Family {
                 let set = crate::mtpref::MtpSet::open(path, self)?;
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),
-                    draft: None,
+                    draft: set.draft_model,
                     build: set.build,
                 })
             }

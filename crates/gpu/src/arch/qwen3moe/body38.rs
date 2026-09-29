@@ -22,8 +22,10 @@
 //! route (`wide38`) — and every walk refuses by name a map with an expert
 //! on a tier card.
 //! [`Body38::open_placed_mtp`] also opens the MTP draft layer on the same
-//! card ([`Mtp38`]: its weights, its store, the reduced head's rows); no
-//! walk reads it.
+//! card ([`Mtp38`]: its weights, its store, the reduced head's rows) and
+//! arms its program's arena; its walks ([`GpuModel::mtp_draft`]) read the
+//! target's weights and streams and write only the draft's store and
+//! arena, so no target walk reads what they leave.
 //!
 //! The walk is `program38`'s. The decode step is captured; a prompt runs
 //! as captured steps, one a position ([`Prompt38::Step`]), as eager passes
@@ -68,7 +70,9 @@
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
 use super::card38::{Card38, MapCheck, Walk38};
-use super::mtp38::Mtp38;
+use super::mtp38::{
+    Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps, TargetRows,
+};
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
@@ -636,7 +640,11 @@ impl Body38 {
                     residency,
                     (ubatch, counted),
                 )?;
-                body.mtp = draft;
+                if let Some(mut d) = draft {
+                    let rows = body.rope.table.len() / body.rope.width;
+                    d.arm(gpu.stream(), body.s.route.dims(), body.vocab, rows)?;
+                    body.mtp = Some(d);
+                }
                 Ok(body)
             },
         )
@@ -857,6 +865,95 @@ impl Body38 {
     #[must_use]
     pub fn mtp(&self) -> Option<&Mtp38> {
         self.mtp.as_ref()
+    }
+
+    /// The streams' buffer that holds the target's hidden rows after a walk
+    /// of `walk`'s arena ran its head: the walk's current buffer flips once
+    /// at each PLE layer past layer 0.
+    fn final_streams(&self, walk: TargetRows) -> &DeviceBuffer<f32> {
+        final_streams(&self.plans, [&self.s, &self.a, &self.wa], walk)
+    }
+
+    /// The target's hidden rows `0..rows` after a walk of `walk`'s arena
+    /// that ran its head, four streams of [`geo::HIDDEN`] a row. Blocking;
+    /// gate use.
+    pub fn target_streams(
+        &self,
+        gpu: &Gpu,
+        walk: TargetRows,
+        rows: usize,
+    ) -> Result<Vec<f32>, GpuError> {
+        let buf = self.final_streams(walk);
+        let wide = geo::STREAMS * geo::HIDDEN;
+        if rows == 0 || rows * wide > buf.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{rows} rows of an arena of {}", buf.len() / wide),
+            ));
+        }
+        let mut v = buf.to_host_vec(gpu.stream())?;
+        v.truncate(rows * wide);
+        Ok(v)
+    }
+
+    fn draft_mut(&mut self) -> Result<&mut Mtp38, GpuError> {
+        self.mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))
+    }
+
+    fn draft_ref(&self) -> Result<&Mtp38, GpuError> {
+        self.mtp.as_ref().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))
+    }
+
+    /// One walk of the draft's program ([`Mtp38::run`]) beside this body.
+    fn mtp_run(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        feed: MtpFeed<'_>,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<MtpDraft, GpuError> {
+        let Body38 {
+            mtp,
+            k,
+            rope,
+            eps,
+            plans,
+            s,
+            a,
+            wa,
+            ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        let target = match feed {
+            MtpFeed::Rows {
+                hidden: MtpHidden::Target { walk, .. },
+                ..
+            } => Some(final_streams(plans, [s, a, wa], walk)),
+            _ => None,
+        };
+        d.run(
+            &MtpCtx {
+                gpu,
+                tw: w,
+                k,
+                eps: *eps,
+                table: &rope.table,
+            },
+            target,
+            feed,
+            head,
+            mode,
+        )
     }
 
     /// Tokens of the vocabulary.
@@ -1621,6 +1718,83 @@ impl GpuModel<Body38> {
     }
 }
 
+/// The streams' buffer of `walk`'s arena (the step's, the pass's, the
+/// ubatch walk's) that holds the target's hidden rows once the walk ran its
+/// head: a walk's current buffer flips once at each PLE layer past layer 0.
+fn final_streams<'b>(
+    plans: &[Layer38],
+    [s, a, wa]: [&'b Arena38; 3],
+    walk: TargetRows,
+) -> &'b DeviceBuffer<f32> {
+    let cur = plans.iter().skip(1).filter(|p| p.ple.is_some()).count() % 2;
+    let arena = match walk {
+        TargetRows::Step => s,
+        TargetRows::Pass => a,
+        TargetRows::Ubatch => wa,
+    };
+    &arena.res[cur]
+}
+
+/// The MTP draft's calls ([`Mtp38::run`]); each is refused by name on a load
+/// without a draft.
+impl GpuModel<Body38> {
+    /// One walk of the draft (module doc of `mtp38`): `feed`'s rows into
+    /// `head`, eager or captured, and each row's token and probability. A
+    /// poisoned model is refused; a fault the walk raises is its error and
+    /// stays on the card's word, which the target's next readback names.
+    pub fn mtp_draft(
+        &mut self,
+        feed: MtpFeed<'_>,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<MtpDraft, GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_draft";
+        if let Some(fault) = self.poisoned() {
+            return Err(GpuError::Poisoned {
+                what: WHAT_D,
+                fault,
+            });
+        }
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        let r = body.mtp_run(gpu, w, feed, head, mode);
+        // A fault the draft raised poisons the model as the target's would.
+        self.note_fault(WHAT_D, r)
+    }
+
+    /// Arm (or disarm) the draft's taps ([`Mtp38::set_taps`]); its captured
+    /// walks are dropped first. Load-time allocation.
+    pub fn set_mtp_taps(&mut self, on: bool) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen4exp set_mtp_taps")?;
+        body.draft_mut()?.set_taps(gpu.stream(), on)
+    }
+
+    /// The last draft walk's taps ([`Mtp38::taps`]). Blocking.
+    pub fn mtp_taps(&self) -> Result<MtpTaps, GpuError> {
+        let body = self.body("qwen4exp mtp_taps")?;
+        body.draft_ref()?.taps(self.gpu().stream())
+    }
+
+    /// The last draft walk's `l_out` rows ([`Mtp38::l_out`]). Blocking.
+    pub fn mtp_l_out(&self) -> Result<Vec<f32>, GpuError> {
+        let body = self.body("qwen4exp mtp_l_out")?;
+        body.draft_ref()?.l_out(self.gpu().stream())
+    }
+
+    /// The last draft walk's head logits and the head's rows
+    /// ([`Mtp38::logits`]). Blocking.
+    pub fn mtp_logits(&self) -> Result<(Vec<f32>, usize), GpuError> {
+        let body = self.body("qwen4exp mtp_logits")?;
+        body.draft_ref()?.logits(self.gpu().stream())
+    }
+
+    /// The target's hidden rows after a walk of `walk`'s arena
+    /// ([`Body38::target_streams`]). Blocking.
+    pub fn target_streams(&self, walk: TargetRows, rows: usize) -> Result<Vec<f32>, GpuError> {
+        let body = self.body("qwen4exp target_streams")?;
+        body.target_streams(self.gpu(), walk, rows)
+    }
+}
+
 impl ChainBody for Body38 {
     type Input = DecodeInput38;
     type Host = Body38;
@@ -1738,6 +1912,9 @@ impl ChainBody for Body38 {
             .ple
             .reset_ring(stream, &mut self.ple_ring, geo::STREAMS)?;
         self.ple.restart()?;
+        if let Some(d) = self.mtp.as_mut() {
+            d.forget();
+        }
         self.held = 0;
         self.staged = None;
         self.plant = None;
@@ -1780,7 +1957,10 @@ impl ChainBody for Body38 {
             + self.lane.bytes()
             + self.hybrid.boundary().device_bytes()
             + self.taps.as_ref().map_or(0, Taps38::bytes)
-            + self.mtp.as_ref().map_or(0, Mtp38::resident_bytes)
+            + self
+                .mtp
+                .as_ref()
+                .map_or(0, |d| d.resident_bytes() + d.arena_bytes())
     }
 
     fn layers(&self) -> Range<usize> {

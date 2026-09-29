@@ -2,7 +2,7 @@
 //! placement on the gate card with the shared MTP draft file beside it
 //! (`Body38::open_placed_mtp`), the draft's head reduced to a list of
 //! [`LIST_ROWS`] rows over the target's tokenizer. No step runs; the draft's
-//! program is not built yet.
+//! program is `gate_qwen4exp_mtp`'s.
 //!
 //! What is asserted:
 //! - (l) the draft is open: its weights, its store and the row map hold the
