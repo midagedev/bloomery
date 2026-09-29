@@ -735,10 +735,15 @@ impl Levers {
     }
 
     /// `BLOOMERY_HOSTSTREAM`: a V4.1 prompt call streams its hottest host
-    /// experts into the residency's pool.
+    /// experts into the residency's pool; `None` when unset, which follows
+    /// the residency (the body resolves it).
     #[must_use]
-    pub fn hoststream(&self) -> bool {
-        self.flag(HOSTSTREAM)
+    pub fn hoststream(&self) -> Option<bool> {
+        match self.entry(HOSTSTREAM).value {
+            None => None,
+            Some(Value::Flag(b)) => Some(b),
+            ref v => panic!("{HOSTSTREAM} holds {v:?}, not a flag"),
+        }
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

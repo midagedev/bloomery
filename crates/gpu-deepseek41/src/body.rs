@@ -202,6 +202,20 @@ fn refuse_steps_under_residency(
     }
 }
 
+/// `BLOOMERY_HOSTSTREAM` as the load takes it: unset follows the residency
+/// (on under one, off without one), and `on` without one is refused by name.
+fn hoststream_under(set: Option<bool>, residency: Residency) -> Result<bool, GpuError> {
+    match (set, residency) {
+        (Some(true), Residency::Off) => Err(GpuError::State {
+            what: "BLOOMERY_HOSTSTREAM=on",
+            missing: "a residency (BLOOMERY_RESIDENCY=mid-p<P>-s<S>): the streamed experts go \
+                      into its churn pool",
+        }),
+        (Some(on), _) => Ok(on),
+        (None, r) => Ok(r != Residency::Off),
+    }
+}
+
 /// What [`open`] takes besides the file, the placement and the context: the
 /// body's levers and the placement's.
 #[derive(Clone, Debug)]
@@ -221,21 +235,16 @@ impl OpenCfg {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
-        if levers.hoststream() && Residency::parse(levers.residency())? == Residency::Off {
-            return Err(GpuError::State {
-                what: "BLOOMERY_HOSTSTREAM=on",
-                missing: "a residency (BLOOMERY_RESIDENCY=mid-p<P>-s<S>): the streamed experts \
-                          go into its churn pool",
-            });
-        }
+        let residency = Residency::parse(levers.residency())?;
+        let hoststream = hoststream_under(levers.hoststream(), residency)?;
         let body = BodyLevers {
             ced: levers.ced(),
             prefill,
             group: levers.prefill_group(),
             rows: RowsLevers::from_levers(levers),
             host: levers.host(),
-            residency: Residency::parse(levers.residency())?,
-            hoststream: levers.hoststream(),
+            residency,
+            hoststream,
         };
         body.check()?;
         Ok(OpenCfg {
@@ -2936,5 +2945,30 @@ mod tests {
             refuse_steps_under_residency(prefill, residency)
                 .unwrap_or_else(|e| panic!("{prefill:?} under {residency:?}: {e}"));
         }
+    }
+
+    #[test]
+    fn hoststream_unset_follows_the_residency() {
+        let mid = Residency::Mid {
+            pinned: 4,
+            spares: 1,
+        };
+        for (set, residency, want) in [
+            (None, mid, true),
+            (None, Residency::Off, false),
+            (Some(true), mid, true),
+            (Some(false), mid, false),
+            (Some(false), Residency::Off, false),
+        ] {
+            let got = hoststream_under(set, residency)
+                .unwrap_or_else(|e| panic!("{set:?} under {residency:?}: {e}"));
+            assert_eq!(got, want, "{set:?} under {residency:?}");
+        }
+        let refused = hoststream_under(Some(true), Residency::Off)
+            .expect_err("streaming on without a residency");
+        assert!(
+            refused.to_string().contains("BLOOMERY_RESIDENCY"),
+            "the refusal names the lever: {refused}"
+        );
     }
 }

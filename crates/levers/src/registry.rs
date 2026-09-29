@@ -337,15 +337,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: HOSTSTREAM,
         class: Class::A,
         kind: Kind::OnOff,
-        default: Unset::Is("off"),
+        default: Unset::Means(
+            "on under a residency (`BLOOMERY_RESIDENCY` not `off`), off without one",
+        ),
         doc: "V4.1 prompt calls under adaptive residency (`BLOOMERY_RESIDENCY=mid-…`): `on` \
               streams each group's hottest host experts into the residency's churn pool at \
               every layer (`host::swap` call mode: a batch's counts pick them, the coldest pool \
               residents go to the host, and the call's picks stay for the decode after it), \
               at or past the prompt length the body names (`body::prefill`'s `STREAM_MIN_P`); \
               the prompt's bits are then the band's, not the decode steps'. `off` keeps a \
-              prompt call bit for bit the decode steps' state, the same-binary arm. Refused \
-              by name at the load beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
+              prompt call bit for bit the decode steps' state, the same-binary arm. Unset follows \
+              the residency: on under one, off without one. `on` is refused by name at the load \
+              beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
               stream`, every call `call stream end`.",
         site: Site::Parsed { left: &[] },
     },
