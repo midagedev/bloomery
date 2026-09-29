@@ -1,2 +1,2 @@
-48
+41
 # The `^warning:` count of `just lint` on main that `just mac-lint` holds a tree to. Lower it when main's count comes down; never raise it to make a lint pass (AGENTS.md Never).
