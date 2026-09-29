@@ -28,11 +28,6 @@ never assume the delegate reads that file. A delegate's report is not evidence: 
 transcript and read `git status` of its worktree. After a round, the lead re-runs the gates under its own ownership.
 Commits and pushes are lead-only.
 
-## Language in this repo
-
-New writing is English (user, 2026-09-30; `AGENTS.md` Conventions). Existing Korean is not translated.
-English prose may be delegated like any other spec-able work.
-
 ## Writing to rig-log
 
 Measurement records go in `log/` of `~/repo/rig-log`. That repo's rules are not loaded automatically in this session,
@@ -41,4 +36,4 @@ so read `~/repo/rig-log/CLAUDE.md` before writing a record. Three things that ar
 - **It is a public repo.** Before committing, grep for `192.168`, addresses in the `100.` range, `.ts.net` and `admin`. Never
   include BMC addresses or credentials, or the nvidia-bug-report archive from the box's `/root` (it contains the hostname).
 - Write only what was measured; when something is wrong, do not delete it — strike it through and correct it.
-- Prose in Korean, bodies headed upstream in English (disclose AI help in prose; no Claude badge).
+- Disclose AI help in prose; no Claude badge.

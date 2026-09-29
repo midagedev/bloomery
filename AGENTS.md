@@ -427,9 +427,6 @@ first suspect is a hung gate on the box, not the agent.
   unit-carrying types, error enums per crate, clippy ratchet, refactor = bit-identical gates +
   same-lease A/B). Review reports cite rule numbers; the warning baseline in Known state only
   goes down.
-- New writing in this repository is English: code comments, docs, justfile and recipe
-  text, card and commit prose (user, 2026-09-30). Korean already in the tree stays as it
-  is; it is not translated, and a line that is edited for another reason may stay Korean.
 - **Comments state what is true now, not how we got here.** Keep: `// SAFETY:`
   (the invariant, one to three lines); one line of *why* for a non-obvious
   choice; "this order is the gate" on a load-bearing float reduction; the
