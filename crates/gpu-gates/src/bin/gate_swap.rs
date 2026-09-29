@@ -1314,7 +1314,12 @@ mod gate {
         );
         let (machine, err) = match machine {
             Ok(m) => (Some(m), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => {
+                // A clause that expects no machine reads `err`; every other
+                // clause stops at "no machine", so the refusal is named here.
+                eprintln!("gate_swap: SwapMachine::new refused: {e}");
+                (None, Some(e.to_string()))
+            }
         };
         Ok(Run {
             delay,
