@@ -169,6 +169,9 @@ pub struct BodyLevers {
     /// load's slot map; otherwise the load holds the churn pool in its host
     /// set and runs the residency machine over the stage card ([`swap`]).
     pub residency: Residency,
+    /// A prompt call streams its hottest host experts into the residency's
+    /// pool (`BLOOMERY_HOSTSTREAM`, [`prefill`]); only under a residency.
+    pub hoststream: bool,
 }
 
 /// What [`open`] takes besides the file, the placement and the context: the
@@ -190,6 +193,13 @@ impl OpenCfg {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
+        if levers.hoststream() && Residency::parse(levers.residency())? == Residency::Off {
+            return Err(GpuError::State {
+                what: "BLOOMERY_HOSTSTREAM=on",
+                missing: "a residency (BLOOMERY_RESIDENCY=mid-p<P>-s<S>): the streamed experts \
+                          go into its churn pool",
+            });
+        }
         Ok(OpenCfg {
             body: BodyLevers {
                 ced: levers.ced(),
@@ -198,6 +208,7 @@ impl OpenCfg {
                 rows: RowsLevers::from_levers(levers),
                 host: levers.host(),
                 residency: Residency::parse(levers.residency())?,
+                hoststream: levers.hoststream(),
             },
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })

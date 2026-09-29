@@ -126,6 +126,90 @@ mod ffn_batch_kernels {
         unsafe { *sel.get_unchecked_mut(i) = place };
     }
 
+    /// A block's places again after a prompt call's pick moved the layer's
+    /// map, for the streamed pass: thread `i < n` reads slot `i`'s place
+    /// under the map before the pick, `sel[i]`, and under the map now,
+    /// `map[row_off + ids[i]]`. An id the pick admitted — its place was
+    /// [`HOST`] and is a card slot now — goes to `ssel[i]` with `sel[i] =`
+    /// [`HOST`] (its slot is landing); every other id's place now goes to
+    /// `sel[i]` with `ssel[i] =` [`HOST`] (a victim's is [`HOST`]). An id not
+    /// below `n_expert` raises [`FaultSite::ExpertId`] on `fault` and both
+    /// places are [`HOST`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids.len() >= n,
+            map.len() >= row_off + n_expert,
+            sel.len() >= n,
+            ssel.len() >= n
+        )
+    )]
+    pub fn ds41_ffn_replace(
+        ids: &[u32],
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        n: u32,
+        fault: FaultSink,
+        mut sel: DisjointSlice<u32>,
+        mut ssel: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= ids.len() by the launch contract.
+        let id = unsafe { *ids.get_unchecked(i) };
+        // SAFETY: i < n <= sel.len() by the launch contract; thread i is
+        // sel[i]'s only reader and writer.
+        let was = unsafe { *sel.get_unchecked_mut(i) };
+        let now = if id < n_expert {
+            // SAFETY: id < n_expert, so row_off + id < map.len() by the launch
+            // contract.
+            unsafe { *map.get_unchecked(row_off as usize + id as usize) }
+        } else {
+            fault.raise(FaultSite::ExpertId);
+            HOST
+        };
+        let fresh = was == HOST && now != HOST;
+        // SAFETY: i < n <= sel.len(), ssel.len(); thread i is the only writer
+        // of both entries.
+        unsafe {
+            *sel.get_unchecked_mut(i) = if fresh { HOST } else { now };
+            *ssel.get_unchecked_mut(i) = if fresh { now } else { HOST };
+        }
+    }
+
+    /// The streamed places back into the block's places once the streamed
+    /// pass has run: thread `i < n` writes `ssel[i]` into `sel[i]` when it is
+    /// not [`HOST`], so the card sum reads every card slot of the block.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (ssel.len() >= n, sel.len() >= n)
+    )]
+    pub fn ds41_ffn_sel_merge(ssel: &[u32], n: u32, mut sel: DisjointSlice<u32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= ssel.len() by the launch contract.
+        let s = unsafe { *ssel.get_unchecked(i) };
+        if s != HOST {
+            // SAFETY: i < n <= sel.len(); thread i is sel[i]'s only writer.
+            unsafe { *sel.get_unchecked_mut(i) = s };
+        }
+    }
+
     /// The card slots of a block of `n_slots` slots grouped by expert, in one
     /// block of [`BUCKET_THREADS`]: `start[e] .. start[e + 1]` of `order` are
     /// the slots whose place `sel[s]` is `e`, in increasing `s`, for every
@@ -1138,6 +1222,57 @@ impl FfnBatchKernels {
         Ok(())
     }
 
+    /// Enqueue `ds41_ffn_replace`: the `p.n` places `sel` the route wrote
+    /// under the map before a call's pick, split under the map now into
+    /// `sel` (every slot but the admitted ids') and `ssel` (the admitted
+    /// ids'). One launch. Asynchronous, allocation-free.
+    pub fn enqueue_replace(
+        &self,
+        stream: &CudaStream,
+        p: &Places<'_>,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+        ssel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_replace";
+        let grid = launch_u32(what, "grid", p.n.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_ffn_replace(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_ffn_replace(
+            stream,
+            &prep,
+            p.ids,
+            p.map,
+            launch_u32(what, "row_off", p.row_off)?,
+            launch_u32(what, "n_expert", p.n_expert)?,
+            launch_u32(what, "n", p.n)?,
+            fault,
+            sel,
+            ssel,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_ffn_sel_merge`: the `n` streamed places `ssel` that are
+    /// not [`HOST`] into `sel`. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_sel_merge(
+        &self,
+        stream: &CudaStream,
+        ssel: &DeviceBuffer<u32>,
+        n: usize,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_sel_merge";
+        let grid = launch_u32(what, "grid", n.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_ffn_sel_merge(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module
+            .ds41_ffn_sel_merge(stream, &prep, ssel, launch_u32(what, "n", n)?, sel)?;
+        Ok(())
+    }
+
     /// Enqueue `ds41_card_buckets`: the table of the `n_slots` places `sel`
     /// grouped by their `n_experts` card experts, into `order` and `start`.
     /// One launch. Asynchronous, allocation-free.
@@ -1476,6 +1611,10 @@ pub struct FfnBatch {
     /// batch-wide ones before this one's post.
     tsel: Option<DeviceBuffer<u32>>,
     held: Vec<HeldRouting>,
+    /// Under host streaming, per token each slot's streamed place
+    /// ([`FfnPiece::enqueue_batch_replace`]); made by
+    /// [`FfnBatch::enable_stream`].
+    ssel: Option<DeviceBuffer<u32>>,
 }
 
 /// A tiered block's routing as the shadow left it for the post's card sum
@@ -1621,7 +1760,27 @@ impl FfnBatch {
             } else {
                 Vec::new()
             },
+            ssel: None,
         })
+    }
+
+    /// The streamed places a prompt call under host streaming writes, one a
+    /// slot of the batch; a second call is refused by name. Load-time only.
+    pub fn enable_stream(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if self.ssel.is_some() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a batch without its streamed places (FfnBatch::enable_stream once)",
+            });
+        }
+        self.ssel = Some(DeviceBuffer::zeroed(stream, self.cap * N_USED)?);
+        Ok(())
+    }
+
+    /// Whether the batch holds the streamed places.
+    #[must_use]
+    pub fn streams(&self) -> bool {
+        self.ssel.is_some()
     }
 
     /// Tokens a batch takes at most.
@@ -1676,6 +1835,7 @@ impl FfnBatch {
             + self.q3_all.num_bytes()
             + self.tile.device_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self
                 .held
                 .iter()
@@ -2142,8 +2302,23 @@ impl FfnPiece {
         io: &BlockIo<'_>,
         tiered: bool,
     ) -> Result<(), GpuError> {
+        self.enqueue_batch_shadow_chunks(gpu, bl, card, b, io)?;
+        self.enqueue_batch_block(gpu, bl, card, b, io, tiered)
+    }
+
+    /// The first part of [`FfnPiece::enqueue_batch_shadow`]: each chunk's
+    /// HC_PRE, norm and shared expert, which read no place. Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_batch_shadow_chunks(
+        &mut self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+    ) -> Result<(), GpuError> {
         let (layer, lw) = (bl.layer, &bl.lw);
-        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let (i, _, _) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
         let n = self.n_embd;
         for r in io.chunks {
@@ -2160,7 +2335,124 @@ impl FfnPiece {
             self.batch_layer(layer, b, &chunk)?;
             self.enqueue_batch_shadow_chunk(gpu, lw, i, card, b, layer, &chunk)?;
         }
+        Ok(())
+    }
+
+    /// The second part of [`FfnPiece::enqueue_batch_shadow`]: the block's
+    /// card experts by tile items and the card sum, or for a `tiered` layer
+    /// the held routing ([`FfnPiece::enqueue_grouped_block`]). Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_batch_block(
+        &self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+        tiered: bool,
+    ) -> Result<(), GpuError> {
+        let layer = bl.layer;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let card = self.check_card(layer, i, card)?;
         self.enqueue_grouped_block(gpu, i, card, b, [layer, io.set], [at, u], tiered)
+    }
+
+    /// Under host streaming, the block's places again after the call's pick
+    /// moved `bl`'s layer in `slots`, the map's card copy
+    /// (`ds41_ffn_replace`): the ids the pick admitted into the streamed
+    /// places, the rest into the block's places under the map now. One
+    /// launch. Refused by name on a batch without streamed places.
+    /// Asynchronous, allocation-free.
+    pub fn enqueue_batch_replace(
+        &self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+        slots: &DeviceTensor<u32>,
+    ) -> Result<(), GpuError> {
+        let layer = bl.layer;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let c = &self.cfg[i];
+        let fault = gpu.layer_sink(layer)?;
+        let slots_n = (u - at) * N_USED;
+        let FfnBatch {
+            kernels,
+            ids,
+            sel,
+            ssel,
+            ..
+        } = b;
+        let ssel = ssel.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the streamed places of a batch under host streaming (FfnBatch::enable_stream)",
+        })?;
+        let ids = span(WHAT, ids, at * N_USED, slots_n)?;
+        let mut sel = span_mut(WHAT, sel, at * N_USED, slots_n)?;
+        let mut ssel = span_mut(WHAT, ssel, at * N_USED, slots_n)?;
+        let places = Places {
+            ids: &ids,
+            n: slots_n,
+            map: slots.buf(),
+            row_off: c.row_off,
+            n_expert: self.n_expert,
+        };
+        kernels.enqueue_replace(gpu.stream(), &places, fault, &mut sel, &mut ssel)
+    }
+
+    /// Under host streaming, the block's card experts but those the call's
+    /// pick admitted, by tile items (the tile part of
+    /// [`FfnPiece::enqueue_batch_block`] over the replaced places), after
+    /// [`FfnPiece::enqueue_batch_replace`]; the streamed pass follows.
+    /// Asynchronous, allocation-free.
+    pub fn enqueue_batch_block_kept(
+        &self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+    ) -> Result<(), GpuError> {
+        let layer = bl.layer;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let card = self.check_card(layer, i, card)?;
+        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], false)
+    }
+
+    /// Under host streaming, the streamed pass of the block, once the engine
+    /// stream waits for the pick's copies: the admitted ids' experts by tile
+    /// items over the streamed places, those places merged into the block's
+    /// (`ds41_ffn_sel_merge`), then the card sum in slot order over every
+    /// card slot, or for a `tiered` layer the held routing. Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_batch_stream(
+        &self,
+        gpu: &Gpu,
+        bl: &BatchLayer<'_>,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        io: &BlockIo<'_>,
+        tiered: bool,
+    ) -> Result<(), GpuError> {
+        let layer = bl.layer;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let card = self.check_card(layer, i, card)?;
+        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], true)?;
+        let slots_n = (u - at) * N_USED;
+        {
+            let FfnBatch {
+                kernels, sel, ssel, ..
+            } = &mut *b;
+            let ssel = ssel.as_ref().ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the streamed places of a batch under host streaming \
+                          (FfnBatch::enable_stream)",
+            })?;
+            let ssel = span(WHAT, ssel, at * N_USED, slots_n)?;
+            let mut sel = span_mut(WHAT, sel, at * N_USED, slots_n)?;
+            kernels.enqueue_sel_merge(gpu.stream(), &ssel, slots_n, &mut sel)?;
+        }
+        self.enqueue_block_finish(gpu, i, b, io.set, [at, u], tiered)
     }
 
     /// The block's launches for tokens `at .. u` of the group's batch `set`,
@@ -2185,11 +2477,41 @@ impl FfnPiece {
         [at, u]: [usize; 2],
         tiered: bool,
     ) -> Result<(), GpuError> {
-        let (stream, n) = (gpu.stream(), self.n_embd);
+        self.enqueue_block_tiles(gpu, i, card, b, layer, [at, u], false)?;
+        self.enqueue_block_finish(gpu, i, b, set, [at, u], tiered)
+    }
+
+    /// With card experts, the tile path over the block's card slots
+    /// ([`enqueue_tiled_experts`]) into the block's down outputs by slot:
+    /// over the block's places, or with `streamed` over its streamed places.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stacks, buffers, tokens and places (rust-quality R8)"
+    )]
+    fn enqueue_block_tiles(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        layer: usize,
+        [at, u]: [usize; 2],
+        streamed: bool,
+    ) -> Result<(), GpuError> {
+        let n = self.n_embd;
         let c = &self.cfg[i];
         let slots_n = (u - at) * N_USED;
         if let Some(s) = card {
-            let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+            let places = if streamed {
+                b.ssel.as_ref().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the streamed places of a batch under host streaming \
+                              (FfnBatch::enable_stream)",
+                })?
+            } else {
+                &b.sel
+            };
+            let sel = span(WHAT, places, at * N_USED, slots_n)?;
             let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
             let t = TiledBlock {
                 stacks: s,
@@ -2203,6 +2525,24 @@ impl FfnPiece {
             };
             enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)?;
         }
+        Ok(())
+    }
+
+    /// The block's card sum of every token, or for a `tiered` layer, whose
+    /// card sum waits for the tier's rows, the copy of the block's weights,
+    /// card places and tier places into the batch's held routing.
+    fn enqueue_block_finish(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        b: &mut FfnBatch,
+        set: usize,
+        [at, u]: [usize; 2],
+        tiered: bool,
+    ) -> Result<(), GpuError> {
+        let (stream, n) = (gpu.stream(), self.n_embd);
+        let c = &self.cfg[i];
+        let slots_n = (u - at) * N_USED;
         if tiered {
             return hold_routing(stream, b, set, at * N_USED, slots_n);
         }

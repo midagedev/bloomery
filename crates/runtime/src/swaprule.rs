@@ -189,6 +189,24 @@ pub enum SwapRuleError {
         len: usize,
         want: usize,
     },
+    /// A call pick's counts of another length than the layer's experts.
+    PickCountsShape {
+        layer: usize,
+        len: usize,
+        want: usize,
+    },
+    /// A settled flip admitting an expert that is not off the card: live,
+    /// pinned, away, or in a flip in flight.
+    SettleAdmit {
+        layer: usize,
+        id: u32,
+    },
+    /// A settled flip evicting an expert that is not a live, unpinned
+    /// resident outside every flip in flight.
+    SettleEvict {
+        layer: usize,
+        id: u32,
+    },
 }
 
 impl fmt::Display for SwapRuleError {
@@ -276,6 +294,22 @@ impl fmt::Display for SwapRuleError {
             SwapRuleError::CountsShape { len, want } => {
                 write!(f, "{len} opening counts, not layers × experts = {want}")
             }
+            SwapRuleError::PickCountsShape { layer, len, want } => {
+                write!(
+                    f,
+                    "{len} call pick counts at layer {layer}, not its {want} experts"
+                )
+            }
+            SwapRuleError::SettleAdmit { layer, id } => write!(
+                f,
+                "a settled flip admits layer {layer}'s expert {id}, which is not off the card \
+                 (live, pinned, away or in a flip in flight)"
+            ),
+            SwapRuleError::SettleEvict { layer, id } => write!(
+                f,
+                "a settled flip evicts layer {layer}'s expert {id}, which is not a live unpinned \
+                 resident outside every flip in flight"
+            ),
         }
     }
 }
@@ -939,6 +973,122 @@ impl SwapRule {
             self.slot[f.layer * e + f.evict as usize] = Slot::Off;
         }
         Ok(flips)
+    }
+
+    /// A prompt call's pick at layer `layer` from `counts`, the ids its
+    /// batch routes there (one count per expert): the pool — the layer's
+    /// live, unpinned residents outside every flip in flight — and the
+    /// experts off the card whose count is at least `floor` rank together by
+    /// (count descending, id ascending); the first `cap`, at most the pool's
+    /// size, are the pool the call wants. Its off-card experts are admitted,
+    /// hottest first, each in place of the coldest pool resident it leaves
+    /// out (count ascending, id ascending), while the admitted count is
+    /// higher than the victim's. The flips are live at the rule's current
+    /// boundary; the rule does not move ([`SwapRule::settle`] applies them).
+    /// Returns the pool residents the wanted pool keeps. Away experts, pinned
+    /// ones and those in a flip in flight take no part.
+    pub fn call_pick(
+        &self,
+        layer: usize,
+        counts: &[u32],
+        cap: usize,
+        floor: u32,
+        flips: &mut Vec<Flip>,
+    ) -> Result<usize, SwapRuleError> {
+        self.check_layer(layer)?;
+        let e = self.shape.experts;
+        if counts.len() != e {
+            return Err(SwapRuleError::PickCountsShape {
+                layer,
+                len: counts.len(),
+                want: e,
+            });
+        }
+        flips.clear();
+        let slots = &self.slot[layer * e..(layer + 1) * e];
+        // (count, pool resident, id), wanted order first.
+        let mut ranked: Vec<(u32, bool, u32)> = slots
+            .iter()
+            .zip(counts)
+            .zip(0u32..)
+            .filter_map(|((&s, &c), id)| match s {
+                Slot::Live => Some((c, true, id)),
+                Slot::Off if c >= floor => Some((c, false, id)),
+                _ => None,
+            })
+            .collect();
+        let pool = ranked.iter().filter(|r| r.1).count();
+        ranked.sort_unstable_by_key(|&(c, _, id)| (Reverse(c), id));
+        let (wanted, left) = ranked.split_at(cap.min(pool).min(ranked.len()));
+        let kept = wanted.iter().filter(|r| r.1).count();
+        let mut victims: Vec<(u32, u32)> = left
+            .iter()
+            .filter(|r| r.1)
+            .map(|&(c, _, id)| (c, id))
+            .collect();
+        victims.sort_unstable();
+        let admits = wanted.iter().filter(|r| !r.1);
+        for (&(c, _, admit), &(v, evict)) in admits.zip(&victims) {
+            if c <= v {
+                break;
+            }
+            flips.push(Flip {
+                layer,
+                admit,
+                evict,
+                live_at: self.passes,
+            });
+        }
+        Ok(kept)
+    }
+
+    /// Apply `flips`, moves the rule did not make (a prompt call's picks),
+    /// live at once: each admit joins its layer's card set and each evict
+    /// leaves it. All or nothing: each admit must be off the card, each evict
+    /// a live unpinned resident outside every flip in flight, in the state
+    /// the flips before it leave; else refused by name, the rule unchanged.
+    /// The counts do not move.
+    pub fn settle(&mut self, flips: &[Flip]) -> Result<(), SwapRuleError> {
+        let e = self.shape.experts;
+        let mut done: Vec<(usize, Slot)> = Vec::with_capacity(2 * flips.len());
+        let mut r = Ok(());
+        for f in flips {
+            let (a, v) = match (
+                self.check_layer(f.layer)
+                    .and_then(|()| Self::index_of(f.layer, f.admit, e)),
+                Self::index_of(f.layer, f.evict, e),
+            ) {
+                (Ok(a), Ok(v)) => (a, v),
+                (Err(x), _) | (_, Err(x)) => {
+                    r = Err(x);
+                    break;
+                }
+            };
+            if self.slot[a] != Slot::Off {
+                r = Err(SwapRuleError::SettleAdmit {
+                    layer: f.layer,
+                    id: f.admit,
+                });
+                break;
+            }
+            if self.slot[v] != Slot::Live {
+                r = Err(SwapRuleError::SettleEvict {
+                    layer: f.layer,
+                    id: f.evict,
+                });
+                break;
+            }
+            done.push((a, Slot::Off));
+            done.push((v, Slot::Live));
+            self.slot[a] = Slot::Live;
+            self.slot[v] = Slot::Off;
+        }
+        if r.is_err() {
+            for &(i, s) in done.iter().rev() {
+                self.slot[i] = s;
+            }
+        }
+        r
     }
 
     /// Back to the seed: every layer's card set, its away experts away, no
@@ -1935,5 +2085,123 @@ mod tests {
             assert!(all.len() > m, "m cuts the pairs");
             assert_eq!(fresh().open(&counts, usize::MAX).unwrap(), all);
         }
+    }
+
+    /// A call pick over a pool of four (seed ranks 1..5, rank 0 pinned):
+    /// the pool the call wants is the top of pool and off-card experts at or
+    /// over the floor, by count then id; its off-card experts come in, the
+    /// hottest first, each for the coldest resident left out, ties by id; a
+    /// hot resident stays; an expert under the floor never ranks.
+    #[test]
+    fn a_call_pick_wants_the_hottest_pool_and_evicts_the_coldest() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3, 4]];
+        let shape = Shape {
+            experts: 10,
+            top_k: 1,
+            max_rows: 1,
+        };
+        let r = SwapRule::new_pinned(SwapParams::mid(0), shape, &seed, &[5], &[1]).unwrap();
+        //            0   1  2  3  4   5  6   7  8  9
+        let counts = [99, 40, 0, 7, 0, 50, 7, 30, 3, 0];
+        let mut flips = Vec::new();
+        let kept = r.call_pick(0, &counts, usize::MAX, 5, &mut flips).unwrap();
+        // wanted: 5 (50), 1 (40), 7 (30), 3 (7, resident, id before 6); 6 left out.
+        assert_eq!(kept, 2, "residents 1 and 3 stay");
+        assert_eq!(flips, [flip(0, 5, 2, 0), flip(0, 7, 4, 0)]);
+        // A cap of two: only 5 and 1 wanted; 7 comes in for the next coldest.
+        r.call_pick(0, &counts, 2, 5, &mut flips).unwrap();
+        assert_eq!(flips, [flip(0, 5, 2, 0)]);
+        // The floor over 50: nothing comes in, every resident stays.
+        let kept = r.call_pick(0, &counts, usize::MAX, 51, &mut flips).unwrap();
+        assert_eq!((kept, flips.len()), (4, 0));
+        // An admitted count must beat its victim's: 6 ties 3 at 7 and stays out.
+        let tied = [0, 9, 9, 7, 9, 0, 7, 0, 0, 0];
+        r.call_pick(0, &tied, usize::MAX, 1, &mut flips).unwrap();
+        assert_eq!(flips, []);
+    }
+
+    /// The pick reads only its arguments and the rule's card set: the same
+    /// (counts, set, cap, floor) gives the same flips, and the rule does not
+    /// move until the flips are settled.
+    #[test]
+    fn a_call_pick_is_a_function_of_counts_set_and_cap() {
+        let seed: [&[u32]; 2] = [&[0, 1, 2], &[3, 4, 5]];
+        let fresh = || rule(params(4, 24, 3.0, 2.0, 0.9), 8, 1, &seed);
+        let r = fresh();
+        let counts = [0, 0, 0, 0, 0, 0, 12, 11];
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        r.call_pick(1, &counts, 3, 1, &mut a).unwrap();
+        r.call_pick(1, &counts, 3, 1, &mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(r, fresh(), "a pick moves nothing");
+        // A cap of three keeps resident 3 (the tie at 0 goes to the lower id).
+        assert_eq!(a, [flip(1, 6, 4, 0), flip(1, 7, 5, 0)]);
+    }
+
+    /// Settled flips move the card set at once and nothing else; a flip
+    /// whose admit is on the card or whose evict is pinned, away, off or in
+    /// a flip in flight is refused by name with the rule unchanged, even
+    /// after earlier flips of the same call applied.
+    #[test]
+    fn settle_moves_the_card_set_all_or_nothing() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3]];
+        let shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 1,
+        };
+        let fresh =
+            || SwapRule::new_placed(SwapParams::mid(0), shape, &seed, &[3], &[1], &[&[7]]).unwrap();
+        let mut r = fresh();
+        r.settle(&[flip(0, 5, 2, 0)]).unwrap();
+        assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 1, 5]);
+        let before = r.clone();
+        for (bad, want) in [
+            (
+                flip(0, 5, 2, 0),
+                SwapRuleError::SettleAdmit { layer: 0, id: 5 },
+            ),
+            (
+                flip(0, 0, 5, 0),
+                SwapRuleError::SettleAdmit { layer: 0, id: 0 },
+            ),
+            (
+                flip(0, 7, 5, 0),
+                SwapRuleError::SettleAdmit { layer: 0, id: 7 },
+            ),
+            (
+                flip(0, 4, 0, 0),
+                SwapRuleError::SettleEvict { layer: 0, id: 0 },
+            ),
+            (
+                flip(0, 4, 2, 0),
+                SwapRuleError::SettleEvict { layer: 0, id: 2 },
+            ),
+        ] {
+            assert_eq!(r.settle(&[flip(0, 6, 1, 0), bad]).unwrap_err(), want);
+            assert_eq!(r, before, "{bad:?}: the rule moved");
+        }
+        assert!(matches!(
+            r.settle(&[flip(1, 6, 1, 0)]).unwrap_err(),
+            SwapRuleError::LayerOutOfRange { .. }
+        ));
+        assert!(matches!(
+            r.settle(&[flip(0, 8, 1, 0)]).unwrap_err(),
+            SwapRuleError::ExpertOutOfRange { .. }
+        ));
+        let mut counts = vec![0; 7];
+        assert_eq!(
+            r.call_pick(0, &counts, 1, 1, &mut Vec::new()).unwrap_err(),
+            SwapRuleError::PickCountsShape {
+                layer: 0,
+                len: 7,
+                want: 8
+            }
+        );
+        counts.push(0);
+        assert!(r.call_pick(1, &counts, 1, 1, &mut Vec::new()).is_err());
+        // A settled flip is the rule's from here: a planning pass may evict it.
+        r.settle(&[flip(0, 2, 5, 0)]).unwrap();
+        assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 1, 2]);
     }
 }
