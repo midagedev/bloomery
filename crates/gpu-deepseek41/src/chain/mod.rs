@@ -16,14 +16,9 @@
 //! layer against buffers it allocated itself; the step's assembly passes the
 //! body's.
 
-use std::time::Duration;
-
 pub mod attn;
 pub mod ffn;
 pub mod glue;
 
-/// `d` in whole nanoseconds, saturating: the host-side sums of the prompt
-/// batch's time.
-pub(crate) fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
+// The prompt batch's host-side sums count in the host tier's nanoseconds.
+pub(crate) use bloomery_gpu::host::nanos;

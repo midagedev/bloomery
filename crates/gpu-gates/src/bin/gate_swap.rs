@@ -106,6 +106,15 @@
 //!   last (the light arm's refusal, then with the bound removed the heavy
 //!   arm's block). A watchdog thread names a clause past the bound, then
 //!   ends the process.
+//! - dropq: a machine left with a copy queued behind a staging word (the
+//!   first flip boundary issued under a closed window, its jobs not due),
+//!   inside a wrapper whose first field synchronizes the context on drop, as
+//!   the V4.1 body's ring shadows do: the wrapper's drop stops the machine
+//!   first ([`bloomery_gpu::host::HostTier::stop_swap`]'s order), so the
+//!   whole drop ends within the machine's deadline with no leak. Its mutant:
+//!   the wrapper without that drop, today's field order, which waits in the
+//!   synchronize for ever — the queue arm's watchdog names it and ends the
+//!   process.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -133,7 +142,7 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
+    use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
@@ -1676,6 +1685,24 @@ mod gate {
         Ok(c7)
     }
 
+    /// `run` on this thread under a watchdog: past [`QUEUE_BOUND`] the
+    /// watchdog prints `fail` and, after [`QUEUE_GRACE`], ends the process —
+    /// a host blocked inside the driver has nothing that returns it.
+    fn watched<T>(fail: String, run: impl FnOnce() -> T) -> T {
+        let (done, watched) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watched.recv_timeout(QUEUE_BOUND).is_err() {
+                println!("{fail}");
+                std::thread::sleep(QUEUE_GRACE);
+                std::process::abort();
+            }
+        });
+        let ran = run();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        ran
+    }
+
     /// queue: an arm whose source adds `inflate` commands a part, driven to
     /// the last boundary that made flips, its window closed, then reset under
     /// a watchdog; `heavy` also asks for the tens of thousands of commands
@@ -1690,19 +1717,6 @@ mod gate {
     ) -> Result<bool, GateError> {
         let arm = if inflate == LIGHT { "light" } else { "heavy" };
         let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
-        let (done, watched) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            if watched.recv_timeout(QUEUE_BOUND).is_err() {
-                // The host is blocked inside the driver: nothing returns it,
-                // so the process ends here, by name.
-                println!(
-                    "queue ({arm}): the clause did not finish in {QUEUE_BOUND:?}: the host \
-                     blocked enqueuing copies behind copies nothing stages FAIL"
-                );
-                std::thread::sleep(QUEUE_GRACE);
-                std::process::abort();
-            }
-        });
         let run = || -> Result<_, GateError> {
             let faults = Faults {
                 inflate,
@@ -1727,10 +1741,13 @@ mod gate {
             window.store(1, Ordering::Release);
             Ok((driven, reset, took))
         };
-        let ran = run();
-        let _ = done.send(());
-        let _ = watchdog.join();
-        let (driven, reset, took) = ran?;
+        let (driven, reset, took) = watched(
+            format!(
+                "queue ({arm}): the clause did not finish in {QUEUE_BOUND:?}: the host blocked \
+                 enqueuing copies behind copies nothing stages FAIL"
+            ),
+            run,
+        )?;
         let rep = match reset {
             Ok(rep) => rep,
             Err(e) => {
@@ -2097,6 +2114,89 @@ mod gate {
         Ok(stall)
     }
 
+    /// Synchronizes the context when it drops, as the V4.1 body's ring
+    /// shadows do.
+    struct CtxSync(Arc<CudaContext>);
+
+    impl Drop for CtxSync {
+        fn drop(&mut self) {
+            if let Err(e) = self.0.synchronize() {
+                println!("dropq: the context synchronize failed: {e}");
+            }
+        }
+    }
+
+    /// An owner that drops the context's synchronize before its machine, as
+    /// `Body` declares `shadows` before `hybrid`: its drop stops the machine
+    /// first, as `HostTier::stop_swap` does for `Body`, `GpuModel` and the
+    /// host tier.
+    struct Dropq {
+        _sync: CtxSync,
+        machine: Option<SwapMachine>,
+    }
+
+    impl Drop for Dropq {
+        fn drop(&mut self) {
+            drop(self.machine.take());
+        }
+    }
+
+    /// dropq: `a`'s first flip boundary issued under a closed window, so its
+    /// copies wait on staging words the staging thread will not raise until
+    /// the flips are due; then the machine dropped inside a [`Dropq`] under
+    /// the queue arm's watchdog ([`watched`]).
+    fn dropq(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b_first, _, _) = first_flip(a)?;
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_first as usize,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let mut m = r.machine.take().ok_or("gate_swap: no machine")?;
+        let window = m.window();
+        window.store(0, Ordering::Release);
+        let made = m.boundary(gpu.stream(), &mut r.slots)?.made;
+        std::thread::sleep(HOLD_SETTLE);
+        let waiting = m.copy_stream().query() == Ok(false);
+        let leaks_before = leaks()?.len();
+        let owner = Dropq {
+            _sync: CtxSync(Arc::clone(gpu.context())),
+            machine: Some(m),
+        };
+        let took = watched(
+            format!(
+                "dropq: the drop did not finish in {QUEUE_BOUND:?}: the context synchronized \
+                 while a copy waited on a staging word the machine had not released FAIL"
+            ),
+            || {
+                let t0 = Instant::now();
+                drop(owner);
+                t0.elapsed()
+            },
+        );
+        let leaked = leaks()?.len() - leaks_before;
+        let ok = driven && made > 0 && waiting && took < DEADLINE && leaked == 0;
+        println!(
+            "dropq: boundary {b_first} made {made} flips under a closed window, the copy stream \
+             {} before the drop; the machine dropped before the context synchronize in {:.1} ms \
+             (deadline {DEADLINE:?}), {leaked} leaks: {}",
+            if waiting { "waiting" } else { "idle" },
+            took.as_secs_f64() * 1e3,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -2146,6 +2246,7 @@ mod gate {
                  process on the same defect FAIL"
             );
         }
+        ok &= dropq(&gpu, &pm, &trace, &a)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];

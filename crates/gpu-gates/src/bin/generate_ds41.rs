@@ -748,7 +748,13 @@ mod drive {
         // nothing.
         let mut s = loaded.ready(&mut log)?;
         if cfg.body.residency != Residency::Off {
-            s.model_mut().body_parts("generate_ds41")?.2.log_residency();
+            // An arm's boundaries: its prompt call's, then at most one a
+            // generated token.
+            let passes = runs.iter().map(|r| r.a.n_gen).max().unwrap_or(0) + 2;
+            s.model_mut()
+                .body_parts("generate_ds41")?
+                .2
+                .log_residency(passes);
         }
         let mut check = if check_finite {
             let (gpu, w, _) = s.model_mut().body_parts("generate_ds41")?;
@@ -779,8 +785,7 @@ mod drive {
                     let view = pre.arm(i, r)?;
                     let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), s)?;
                     let ran = decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {});
-                    print_passes(s)?;
-                    ran
+                    after_passes(s, ran)
                 })
                 .map_err(|f| Box::new(f) as GateError);
         }
@@ -807,8 +812,7 @@ mod drive {
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()));
-                print_passes(&mut s)?;
-                ran
+                after_passes(&mut s, ran)
             }
             (Draft::Dspark, Some(d), _) => {
                 let mut spec = s.with_draft::<_, PAIR_ROWS>(d, &mut log)?;
@@ -817,10 +821,22 @@ mod drive {
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
                     Ok(d.draft_mut().check_fault()?)
                 });
-                print_passes(&mut s)?;
-                ran
+                after_passes(&mut s, ran)
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
+        }
+    }
+
+    /// A run's result `ran`, with the `residency pass` records of its
+    /// boundaries printed after it ([`print_passes`]): a failed print is the
+    /// run's error, and when the run failed too the error names both.
+    fn after_passes<T>(s: &mut Session<Body>, ran: Result<T, GateError>) -> Result<T, GateError> {
+        match (ran, print_passes(s)) {
+            (ran, Ok(())) => ran,
+            (Ok(_), Err(p)) => Err(p),
+            (Err(r), Err(p)) => {
+                Err(format!("{r}; then printing the residency passes after it: {p}").into())
+            }
         }
     }
 
