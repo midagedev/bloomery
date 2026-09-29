@@ -1773,6 +1773,41 @@ fn clean_fault_words() -> Vec<u32> {
     v
 }
 
+/// Which work a stream carries, and so the priority it is created at.
+///
+/// On one card the block scheduler places a pending block of a higher
+/// priority stream first; between streams of one priority it drains a
+/// launched grid's pending blocks in launch order, so a background grid of
+/// thousands of blocks holds the engine's next launch until its last block is
+/// placed. Every stream the engine's chain runs on is [`StreamRole::Engine`]
+/// (one priority, so their relative order is launch order); a stream whose
+/// work only has to finish before a later event wait is
+/// [`StreamRole::Background`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamRole {
+    /// The context's greatest priority.
+    Engine,
+    /// The context's least priority; refused on a device whose range has one
+    /// value, where it could not stay behind the engine.
+    Background,
+}
+
+/// A stream of `ctx` at `role`'s priority. Load-time only.
+pub fn role_stream(ctx: &Arc<CudaContext>, role: StreamRole) -> Result<Arc<CudaStream>, GpuError> {
+    let range = ctx.stream_priority_range()?;
+    let priority = match role {
+        StreamRole::Engine => range.greatest(),
+        StreamRole::Background if range.is_supported() => range.least(),
+        StreamRole::Background => {
+            return Err(GpuError::state(
+                "role_stream (Background)",
+                "a device with stream priorities",
+            ));
+        }
+    };
+    Ok(ctx.new_stream_with_priority(priority)?)
+}
+
 impl Gpu {
     /// `with_device(0)`: under the box environment device 0 is the dev card.
     pub fn new() -> Result<Gpu, GpuError> {
@@ -1784,7 +1819,7 @@ impl Gpu {
     /// K-quant module here and one per kernel file. Load-time only.
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
         let ctx = CudaContext::new(device)?;
-        let stream = ctx.new_stream()?;
+        let stream = role_stream(&ctx, StreamRole::Engine)?;
         // First: the modules below that raise are given it at load.
         let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
         // SAFETY: this package owns the embedded device bundle produced for
