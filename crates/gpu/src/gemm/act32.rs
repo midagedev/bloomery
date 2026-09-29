@@ -1,7 +1,8 @@
-//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the two
-//! launches that fill them: the quantizer (`quantize_gemm32`) and the
-//! SwiGLU quantizer between a gate·up pair and its down (`swiglu_quant32`).
-//! Both entries are declared in `kernels32.rs`.
+//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the three
+//! launches that fill them: the quantizer (`quantize_gemm32`), the SwiGLU
+//! quantizer between a gate·up pair and its down (`swiglu_quant32`), and its
+//! card-slots-only form over a remapped route (`swiglu_quant32_sel`). All
+//! entries are declared in `kernels32.rs`.
 
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
@@ -220,6 +221,64 @@ impl Gemm32Kernels {
         self.module.swiglu_quant32(
             stream, &prep, g, u, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s,
             fault,
+        )?;
+        act.filled = n_cols;
+        Ok(())
+    }
+
+    /// Enqueue `act = q8_1_32(silu(g) · u)` over the first `n_cols` slot
+    /// columns a remapped route left the card — the slots whose place
+    /// `sel[0..n_cols]` is below `n_card` (`swiglu_quant32_sel`, declared in
+    /// `kernels32.rs`): a host slot's column (`crate::hybrid::HOST`) is
+    /// left exactly as it stands — a GEMM over the route reads only the
+    /// listed (card) columns — and a place in `[n_card, HOST)` raises
+    /// [`FaultSite::ExpertId`] on `fault` with nothing stored. The written
+    /// columns' bytes are [`Gemm32Kernels::enqueue_swiglu_quant32`]'s.
+    /// Asynchronous, allocation-free, capturable; the scratch's filled count
+    /// is `n_cols`, the most a GEMM over the same route may read.
+    ///
+    /// [`FaultSite::ExpertId`]: crate::FaultSite::ExpertId
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
+    pub fn enqueue_swiglu_quant32_sel(
+        &self,
+        stream: &CudaStream,
+        g: &DeviceBuffer<f32>,
+        u: &DeviceBuffer<f32>,
+        sel: &DeviceBuffer<u32>,
+        n_card: usize,
+        n_cols: usize,
+        act: &mut GemmAct32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_swiglu_quant32_sel";
+        let (grid, m, blocks, groups, steps) = act.quant_launch(what, n_cols)?;
+        if g.len() < n_cols * act.k || u.len() < n_cols * act.k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "g.len() {} and u.len() {} need n_cols*k = {n_cols}*{}",
+                    g.len(),
+                    u.len(),
+                    act.k
+                ),
+            ));
+        }
+        if sel.len() < n_cols {
+            return Err(GpuError::shape(
+                what,
+                format!("sel.len() {} < n_cols {n_cols}", sel.len()),
+            ));
+        }
+        let n_card = launch_u32(what, "n_card", n_card)?;
+        let prep = self
+            .module
+            .prepare_swiglu_quant32_sel(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.swiglu_quant32_sel(
+            stream, &prep, g, u, sel, n_card, m, blocks, groups, steps, &mut act.q, &mut act.d,
+            &mut act.s, fault,
         )?;
         act.filled = n_cols;
         Ok(())

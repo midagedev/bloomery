@@ -8,24 +8,26 @@
 //! slots a column, the 32-value q8_1 of the card slots' columns, the Q5_1
 //! down `_sel` and the card slots' weighted sum (`q38_card_acc`) —
 //! [`CARD_LAUNCHES`] — and the back combines `(hsum + acc) + sh·w`
-//! (`q38_card_shared_add`). A layer without card experts launches none of
-//! them and keeps `q38_shared_add`. The slot places each launch reads are the
-//! ones the walk's handoff or places launch wrote beside the ids from the
-//! slot map's card copy, and the host tier skips the same slots by the same
-//! map, so which expert runs where has one owner.
+//! (`q38_card_shared_add`). The ubatch walk runs the card route
+//! (`wide38`'s, over the same stacks through the grouped GEMMs) on a layer
+//! with card experts and the same back. A layer without card experts
+//! launches none of them and keeps `q38_shared_add`. The slot places each
+//! launch reads are the ones the walk's handoff or places launch wrote
+//! beside the ids from the slot map's card copy, and the host tier skips
+//! the same slots by the same map, so which expert runs where has one
+//! owner.
 //!
 //! Each layer's card count is the map's ([`SlotMap::on_card`]), read once at
 //! load, where each of the layer's three routed stacks is held to that
 //! count's rows ([`Card38::new`]): a stack of other rows would leave slots
 //! that neither side sums.
 //!
-//! The ubatch walk has no card leg: a map with a routed expert on the card
-//! is refused by name at its entry. No walk has a tier leg: a map with an
-//! expert on the tier card is refused by name at every walk's entry — the
-//! card copy marks those experts [`crate::hybrid::HOST`] and the host skips
-//! them, so a walk that ran would leave them out of the sum. The check's
-//! answer is read when the map is set — at the load, when a gate plants one
-//! and at reset — so a walk reads one field.
+//! No walk has a tier leg: a map with an expert on the tier card is refused
+//! by name at every walk's entry — the card copy marks those experts
+//! [`crate::hybrid::HOST`] and the host skips them, so a walk that ran
+//! would leave them out of the sum. The check's answer is read when the map
+//! is set — at the load, when a gate plants one and at reset — so a walk
+//! reads one field.
 
 use super::plan38::geo;
 use super::program38::Ctx38;
@@ -80,22 +82,18 @@ struct First {
 }
 
 /// A slot map's answer to the walks' check: its first layer with routed
-/// experts on the card, and its first with routed experts on the tier card.
+/// experts on the tier card.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct MapCheck {
-    card: Option<First>,
     tier: Option<First>,
 }
 
 impl MapCheck {
-    /// `map`'s answer. Reads two counts a layer.
+    /// `map`'s answer. Reads one count a layer.
     pub(super) fn of(map: &SlotMap) -> Result<MapCheck, GpuError> {
         let mut out = MapCheck::default();
         for l in map.layers() {
-            let (on, tier) = (map.on_card(l)?, map.on_tier(l)?);
-            if on > 0 && out.card.is_none() {
-                out.card = Some(First { layer: l, on });
-            }
+            let tier = map.on_tier(l)?;
             if tier > 0 && out.tier.is_none() {
                 out.tier = Some(First { layer: l, on: tier });
             }
@@ -104,19 +102,16 @@ impl MapCheck {
     }
 
     /// Refused by name, before anything moves: a map with an expert on the
-    /// tier card at any walk, and one with an expert on the card at the
-    /// ubatch walk; the error names the walk, the layer and its count.
-    /// Allocates nothing unless it refuses.
+    /// tier card at any walk; the error names the walk, the layer and its
+    /// count. Allocates nothing unless it refuses.
     pub(super) fn refuse(self, walk: Walk38) -> Result<(), GpuError> {
-        let (first, device, leg) = match (self.tier, self.card, walk) {
-            (Some(t), _, _) => (t, "the tier card", "tier leg"),
-            (None, Some(c), Walk38::Ubatch) => (c, "the card", "card leg yet"),
-            _ => return Ok(()),
+        let Some(first) = self.tier else {
+            return Ok(());
         };
         Err(GpuError::shape(
             WHAT,
             format!(
-                "the {} walk has no {leg}: layer {} holds {} routed experts on {device}",
+                "the {} walk has no tier leg: layer {} holds {} routed experts on the tier card",
                 walk.name(),
                 first.layer,
                 first.on
@@ -132,6 +127,15 @@ struct CardLayer {
     gate: String,
     up: String,
     down: String,
+}
+
+/// A layer's card experts as the ubatch route reads them: their count and
+/// the three resident stacks ([`Card38::stacks`]).
+pub(super) struct Stacks38<'w> {
+    pub(super) n_card: usize,
+    pub(super) gate: &'w DeviceTensor<u32>,
+    pub(super) up: &'w DeviceTensor<u32>,
+    pub(super) down: &'w DeviceTensor<u32>,
 }
 
 /// The leg's modules and the buffers every walk's card layers write, for up
@@ -258,6 +262,37 @@ impl Card38 {
     /// Layers with card experts.
     pub(super) fn card_layers(&self) -> usize {
         self.layers.iter().flatten().count()
+    }
+
+    /// The distinct card counts of the layers with card experts, ascending:
+    /// what the ubatch route builds its route tables over. The placement's
+    /// spread keeps every eligible layer's count within one, so a plan of
+    /// this program holds at most two.
+    pub(super) fn card_counts(&self) -> Vec<usize> {
+        let mut counts: Vec<usize> = self.layers.iter().flatten().map(|c| c.n_card).collect();
+        counts.sort_unstable();
+        counts.dedup();
+        counts
+    }
+
+    /// Layer `l`'s card experts for the ubatch route (`wide38`'s): their
+    /// count, the three routed stacks the grouped GEMMs read (the gate and
+    /// up Q4_K at `n_card · FF` rows, the down Q5_1 at `n_card · HIDDEN`),
+    /// refused by name as [`Card38::new`] refuses. The leg's own buffers are
+    /// not touched — the route owns its own.
+    pub(super) fn stacks<'w>(&self, w: &'w Weights, l: usize) -> Result<Stacks38<'w>, GpuError> {
+        let cl = self.layer(l).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!("a card route on layer {l}, which has no card experts"),
+            )
+        })?;
+        Ok(Stacks38 {
+            n_card: cl.n_card,
+            gate: stack(w, &cl.gate, GgmlType::Q4_K, cl.n_card * geo::FF)?,
+            up: stack(w, &cl.up, GgmlType::Q4_K, cl.n_card * geo::FF)?,
+            down: stack(w, &cl.down, GgmlType::Q5_1, cl.n_card * geo::HIDDEN)?,
+        })
     }
 
     /// The card slots' weighted sum the last card layer enqueued wrote, a
