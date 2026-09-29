@@ -2,7 +2,8 @@
 # shellcheck shell=bash
 # The machine-wide lease and what the runners under it share. Sourced, never executed: it defines
 # functions and variables and exports nothing, and nothing here may exit or fail at top level
-# (most runners run under `set -e`).
+# (most runners run under `set -e`). The one execution is its own `--self-test`, the last block,
+# which a sourcing runner never enters.
 #
 #   source "${BASH_SOURCE[0]%/*}/lease.sh"
 #   WITNESS=(head loadavg pressure-io lock-holder model)   # this runner's witness fields, in order
@@ -11,6 +12,9 @@
 #
 # What it owns, so that the runners cannot drift apart:
 #   the lease's take: its descriptor (9), the 30-minute wait, exit 75 when the wait runs out;
+#   the take's timing-card check (lease_gpu_idle): the machine lock excludes lease runners only, so
+#   a compute process that started before the lease is waited out — the lease held — or the run ends
+#   at 75, and an nvidia-smi that cannot read the card ends it at 69;
 #   the read side, from tools/ref/lease-probe.sh, which this file sources first: the lease's file
 #   (LEASE_LOCK), its probe (lease_free, a shared lock), the holds (/root/bloomery-<owner>-hold),
 #   tools/box.sh's guard (lease_guard) and naming the lease's holder to a waiter (lease_holders);
@@ -29,7 +33,8 @@
 #   head-open       --- witness <tag> <utc>
 #   head-epoch      --- witness <tag> <utc> epoch <seconds> ---
 #   head-load       --- witness <tag> <utc> load=<1 5 15> io=<some avg10> gpu=<utilization per card>
-#   card            the timing card's lines: timing-card.sh's witness_card
+#   card            the timing card's lines: timing-card.sh's witness_card; an apps line of a card
+#                   this run times ends with ` [timing-card-busy]` when it lists a process
 #   loadavg pressure-cpu pressure-io pressure-io-avg10
 #   gpus            index, name, utilization and power of every card
 #   gpu-apps        the compute processes on every card
@@ -86,6 +91,87 @@ unset __lease_dir
 # doubt, and so refuses a gate forced onto either card and passes both by under `any`.
 # LEASE_CARDS_RECORD says so to timing-card.sh, whose two-card precheck refuses a lease.sh without it.
 LEASE_CARDS_RECORD=1
+# A compute process on a card this run times voids the numbers: a gate that started before the
+# lease (gpu-gate.sh refuses a new gate on the timing card only while the lease is held, so a
+# pre-lease process is the hole), a hung one inside the gate runners' 900 s + 10 s bound.
+# lease_gpu_idle waits such a process out, polling every LEASE_GPU_POLL s and reprinting the holder
+# list every LEASE_GPU_REPORT s, for up to LEASE_GPU_WAIT s (inside which a hung gate ends), the
+# lease held while it waits; still busy at the end is contention (75), and an nvidia-smi that is
+# missing or fails is a card whose emptiness cannot be read, so the run ends (69). Not BLOOMERY_*
+# names — those are the binaries', refused by name when the levers registry does not know them;
+# these are the lease's own, and its self-test scales its waits with them.
+LEASE_GPU_WAIT=${LEASE_GPU_WAIT:-900}
+LEASE_GPU_POLL=${LEASE_GPU_POLL:-15}
+LEASE_GPU_REPORT=${LEASE_GPU_REPORT:-60}
+
+# __lease_gpu_holders <uuid> <compute-apps csv>: one line per process nvidia-smi listed — its pid,
+# its exe and cwd, its age in seconds, its card memory — what a waiter, or the log of a run that
+# ended beside the process, needs to name the co-tenant.
+__lease_gpu_holders() {
+  local row pid mem etime exe cwd
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    pid=${row%%,*} mem=${row#*,}
+    pid=${pid// /}
+    etime=$(ps -o etimes= -p "$pid" 2> /dev/null | tr -d ' ') || true
+    exe=$(readlink "/proc/$pid/exe" 2> /dev/null) || true
+    cwd=$(readlink "/proc/$pid/cwd" 2> /dev/null) || true
+    echo "[lease]   pid $pid etime=${etime:-?} s exe=${exe:-?} cwd=${cwd:-?} mem=${mem# }"
+  done <<< "$2"
+}
+
+lease_gpu_idle() {
+  local uuid waited reported pids v
+  [ -n "${TIMING_GPU:-}" ] || return 0
+  for v in LEASE_GPU_WAIT LEASE_GPU_POLL LEASE_GPU_REPORT; do
+    case ${!v} in
+      '' | *[!0-9]* | 0)
+        echo "[lease] $v is whole seconds above 0, got '${!v}'" >&2
+        exit 64
+        ;;
+    esac
+  done
+  if ! command -v nvidia-smi > /dev/null 2>&1; then
+    echo "[lease] nvidia-smi is not on PATH: the timing card's compute processes cannot be read, so no timed run starts beside them (exit 69)" >&2
+    exit 69
+  fi
+  for uuid in $TIMING_GPU ${TIMING_GPU2:-}; do
+    waited=0 reported=-1
+    while :; do
+      # Bounded (__witness_smi): a card off the bus can hang nvidia-smi, and this loop is inside
+      # the lease.
+      __witness_smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$uuid"
+      if [ "$__witness_rc" != 0 ]; then
+        echo "[lease] nvidia-smi on the timing card ($uuid) failed (rc $__witness_rc): its compute processes cannot be read, so no timed run starts beside them (exit 69)" >&2
+        exit 69
+      fi
+      if [ -z "$__witness_out" ]; then
+        if [ "$waited" = 0 ]; then
+          echo "[lease] timing card idle: $uuid"
+        else
+          echo "[lease] timing card idle after ${waited} s: $uuid"
+        fi
+        break
+      fi
+      if [ "$reported" -lt 0 ] || [ $((waited - reported)) -ge "$LEASE_GPU_REPORT" ]; then
+        echo "[lease] compute process(es) on the timing card ($uuid); waiting up to ${LEASE_GPU_WAIT} s, the lease held while it waits:"
+        __lease_gpu_holders "$uuid" "$__witness_out"
+        reported=$waited
+      fi
+      if [ "$waited" -lt "$LEASE_GPU_WAIT" ]; then
+        sleep "$LEASE_GPU_POLL"
+        waited=$((waited + LEASE_GPU_POLL))
+      else
+        pids=$(printf '%s\n' "$__witness_out" | cut -d, -f1 | tr -d ' ' | tr '\n' ' ')
+        echo "[lease] the timing card ($uuid) still runs compute process(es) after ${LEASE_GPU_WAIT} s (pid $pids): contention, the run ends (exit 75)" >&2
+        if [ "$reported" != "$waited" ]; then
+          __lease_gpu_holders "$uuid" "$__witness_out"
+        fi
+        exit 75
+      fi
+    done
+  done
+}
 lease_take() {
   if [ -n "${BLOOMERY_LEASE_HELD:-}" ]; then
     echo "[lease] refused: this run is inside tools/ref/lease-hold.sh (pid $BLOOMERY_LEASE_HELD), which holds the lease; a second lease would wait on it" >&2
@@ -122,6 +208,7 @@ lease_take() {
       lease_holders "$LEASE_LOCK"
     done
   fi
+  lease_gpu_idle
   # The timing-card record tools/gpu-gate.sh reads while the lease is held: this runner and its card (both
   # cards in the two-card mode, the A6000 first), `none` for one that times no GPU.
   { printf 'pid=%s timing_gpu=%s\n' "$$" "${TIMING_GPU:-none}${TIMING_GPU2:+,$TIMING_GPU2}" > "$LEASE_LOCK.card.$$" && mv -f "$LEASE_LOCK.card.$$" "$LEASE_LOCK.card"; } ||
@@ -396,7 +483,45 @@ __witness_head_load() {
   if [ "$__witness_rc" = 0 ]; then gpu=$(__witness_joined ' '); else gpu="unavailable (rc $__witness_rc)"; fi
   echo "--- witness $1 $(now) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$gpu"
 }
-__witness_card() { witness_card; }
+# __lease_timing_labels: the `card` field's apps-line labels of the cards this run times (`a6000`,
+# `3090`) — TIMING_GPU and TIMING_GPU2 against the UUIDs tools/ref/cards.sh resolved for whoever
+# sourced this file; empty when no timed card is one of them (its apps lines stay untagged; a card
+# cards.sh could not name is named in those lines themselves).
+__lease_timing_labels() {
+  local uuid out=''
+  for uuid in ${TIMING_GPU:-} ${TIMING_GPU2:-}; do
+    if [ -n "${GPU_A6000:-}" ] && [ "$uuid" = "$GPU_A6000" ]; then out="$out a6000"; fi
+    if [ -n "${GPU_3090:-}" ] && [ "$uuid" = "$GPU_3090" ]; then out="$out 3090"; fi
+  done
+  printf '%s' "$out"
+}
+# The `card` field's lines are timing-card.sh's witness_card; the tag is the lease's view of them.
+# An apps line of a card this run times that lists a process is a witness block taken beside a
+# co-tenant (the take refused one in lease_gpu_idle; guard_other and guard_cards police the arms),
+# so those lines end with ` [timing-card-busy]` and one log grep finds the runs whose numbers were
+# measured beside one. The regex rides in a variable: in [[ =~ ]] an unquoted \[ would lose its
+# backslash to quote removal and open a bracket expression.
+__witness_card() {
+  local line label re out labels
+  out=$(witness_card)
+  labels=$(__lease_timing_labels)
+  if [ -z "$out" ] || [ -z "$labels" ]; then
+    [ -z "$out" ] || printf '%s\n' "$out"
+    return 0
+  fi
+  while IFS= read -r line; do
+    for label in $labels; do
+      re="^( *${label}-apps): \[(.+)\]$"
+      if [[ $line =~ $re ]]; then
+        if [ -n "${BASH_REMATCH[2]}" ]; then
+          line="$line [timing-card-busy]"
+        fi
+        break
+      fi
+    done
+    printf '%s\n' "$line"
+  done <<< "$out"
+}
 __witness_loadavg() { echo "${__witness_indent}loadavg: $(cat /proc/loadavg)"; }
 __witness_pressure_cpu() { echo "${__witness_indent}pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"; }
 __witness_pressure_io() { echo "${__witness_indent}pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"; }
@@ -495,3 +620,98 @@ lcg_prompt() {
 # command from the track's own directory), `decode_bin <tree>` in a sibling tree under ~/repo on the box.
 DECODE_BIN=target/release/bloomery-decode
 decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
+
+# `bash tools/ref/lease.sh --self-test`: lease_gpu_idle and the witness tag, on a stub nvidia-smi
+# first on PATH in a temp dir (the made-up UUIDs the stub tests use, never the box's), with no
+# card, no lock and no /proc — the holder lines name a pid that does not resolve. The waits scale
+# to seconds (LEASE_GPU_POLL/REPORT/WAIT of 1/1/2), and the four lease_gpu_idle cases sleep 4 s
+# between them. just check-recipes runs this on the Mac.
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
+  fails=0
+  check() {
+    if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fails=$((fails + 1)); fi
+  }
+  matches() { # <name> <ERE> <text>: the text has a line matching the ERE
+    if printf '%s\n' "$3" | grep -Eq -- "$2"; then echo "ok $1"; else echo "FAIL $1: no line matches /$2/ in [$3]"; fails=$((fails + 1)); fi
+  }
+  t=$(mktemp -d "${TMPDIR:-/tmp}/lease-self-test.XXXXXX") || exit 70
+  trap 'rm -rf "$t"' EXIT
+  mkdir "$t/bin" "$t/nothing"
+  # The stub nvidia-smi: rc $STUB_RC when set; its call count in $t/calls; the compute apps of
+  # $STUB_APPS, suppressed once the count reaches $STUB_VANISH_AT.
+  cat > "$t/bin/nvidia-smi" << 'EOF'
+#!/bin/sh
+n=$(cat "$STUB_DIR/calls" 2> /dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$STUB_DIR/calls"
+[ "${STUB_RC:-0}" = 0 ] || exit "$STUB_RC"
+if [ -n "${STUB_VANISH_AT:-}" ] && [ "$n" -ge "$STUB_VANISH_AT" ]; then exit 0; fi
+[ -z "${STUB_APPS:-}" ] || printf '%s\n' "$STUB_APPS"
+exit 0
+EOF
+  chmod +x "$t/bin/nvidia-smi"
+  A6000=GPU-00000000-0000-0000-0000-000000000000
+  # idle <K=V…>: lease_gpu_idle in a subshell (its refusal exits stay there) with the stub first on
+  # PATH, TIMING_GPU=$A6000 and the waits scaled; its output in OUT, its rc in RC.
+  idle() {
+    local k
+    RC=0
+    OUT=$(
+      export STUB_DIR="$t"
+      for k in "$@"; do export "$k"; done
+      export PATH="$t/bin:$PATH" TIMING_GPU="$A6000" LEASE_GPU_POLL=1 LEASE_GPU_REPORT=1 LEASE_GPU_WAIT=2
+      lease_gpu_idle 2>&1
+    ) || RC=$?
+  }
+  idle
+  check a-idle-rc "$RC" 0
+  matches a-idle-line "^\[lease\] timing card idle: $A6000\$" "$OUT"
+  idle 'STUB_APPS=4242, 100 MiB' 'STUB_VANISH_AT=3'
+  check b-vanish-rc "$RC" 0
+  matches b-idle-after "^\[lease\] timing card idle after [0-9]+ s: $A6000\$" "$OUT"
+  matches b-holder-named '^\[lease\]   pid 4242 etime=' "$OUT"
+  idle 'STUB_APPS=4242, 100 MiB'
+  check c-stay-rc "$RC" 75
+  matches c-final-line "^\[lease\] the timing card \($A6000\) still runs compute process\(es\) after 2 s \(pid 4242 \): contention, the run ends \(exit 75\)" "$OUT"
+  matches c-holder-named '^\[lease\]   pid 4242 etime=' "$OUT"
+  idle 'STUB_RC=9'
+  check d-smi-fail-rc "$RC" 69
+  matches d-smi-fail-line "nvidia-smi on the timing card \($A6000\) failed \(rc 9\)" "$OUT"
+  # No nvidia-smi anywhere (an empty PATH: the branch runs builtins only — command -v, echo, exit).
+  RC=0
+  OUT=$(export PATH="$t/nothing" TIMING_GPU="$A6000"; lease_gpu_idle 2>&1) || RC=$?
+  check e-no-smi-rc "$RC" 69
+  matches e-no-smi-line '^\[lease\] nvidia-smi is not on PATH' "$OUT"
+  # The witness tag: a busy apps line of a timed card ends with ` [timing-card-busy]`, an empty
+  # one and the other card's stay as they are, both cards carry it in the two-card mode, and a
+  # runner that times no card tags nothing.
+  GPU_A6000=$A6000 GPU_3090=GPU-11111111-1111-1111-1111-111111111111
+  witness_card() {
+    printf '    3090-apps: [%s]\n' "${W3090_APPS:-}"
+    printf '    a6000-apps: [%s]\n' "${WA6000_APPS:-}"
+  }
+  TIMING_GPU=$A6000 W3090_APPS='' WA6000_APPS='4242, 100 MiB;'
+  RC=0
+  OUT=$(__witness_card 2>&1) || RC=$?
+  check tag-rc "$RC" 0
+  matches tag-busy '^    a6000-apps: \[4242, 100 MiB;\] \[timing-card-busy\]$' "$OUT"
+  matches tag-other-card-untouched '^    3090-apps: \[\]$' "$OUT"
+  WA6000_APPS=''
+  OUT=$(__witness_card 2>&1)
+  matches tag-empty-untouched '^    a6000-apps: \[\]$' "$OUT"
+  WA6000_APPS='4242, 100 MiB;' W3090_APPS='4243, 64 MiB;' TIMING_GPU2=$GPU_3090
+  OUT=$(__witness_card 2>&1)
+  matches tag-twocard-a6000 '^    a6000-apps: \[4242, 100 MiB;\] \[timing-card-busy\]$' "$OUT"
+  matches tag-twocard-3090 '^    3090-apps: \[4243, 64 MiB;\] \[timing-card-busy\]$' "$OUT"
+  unset TIMING_GPU2
+  TIMING_GPU='' WA6000_APPS='4242, 100 MiB;'
+  OUT=$(__witness_card 2>&1)
+  matches tag-no-timing-passthrough '^    a6000-apps: \[4242, 100 MiB;\]$' "$OUT"
+  TIMING_GPU=$A6000
+  witness_card() { echo '    a6000-apps: unresolved (no A6000 UUID)'; }
+  OUT=$(__witness_card 2>&1)
+  matches tag-unresolved-untouched '^    a6000-apps: unresolved \(no A6000 UUID\)$' "$OUT"
+  echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
+  [ "$fails" = 0 ]
+  exit
+fi
