@@ -583,6 +583,9 @@ fn window_bytes(len: usize) -> usize {
 /// bytes are written and read here only.
 struct Ring {
     page: MappedHost,
+    /// Byte of the page slot 0 starts at: the first [`DIRECT`]-aligned
+    /// address in it, which the allocation does not promise itself.
+    base: usize,
     slot_bytes: usize,
     /// Each part's window at byte `windows[part]` of a slot.
     windows: Vec<usize>,
@@ -605,8 +608,15 @@ impl Ring {
             windows.push(slot_bytes);
             slot_bytes += window_bytes(len);
         }
+        let page = MappedHost::new(
+            ctx,
+            RING_SLOTS * slot_bytes + DIRECT,
+            "cuMemHostAlloc (swap ring)",
+        )?;
+        let base = page.host_at(0).addr().next_multiple_of(DIRECT) - page.host_at(0).addr();
         let ring = Ring {
-            page: MappedHost::new(ctx, RING_SLOTS * slot_bytes, "cuMemHostAlloc (swap ring)")?,
+            page,
+            base,
             slot_bytes,
             windows,
             od_bytes: AtomicU64::new(0),
@@ -614,7 +624,7 @@ impl Ring {
         };
         for k in 0..RING_SLOTS {
             for (p, &at) in ring.windows.iter().enumerate() {
-                let base = ring.page.host_at(k * ring.slot_bytes + at);
+                let base = ring.page.host_at(ring.base + k * ring.slot_bytes + at);
                 if !base.addr().is_multiple_of(DIRECT) {
                     return Err(GpuError::shape(
                         WHAT,
@@ -641,7 +651,7 @@ impl Ring {
                 ),
             ));
         }
-        Ok(k * self.slot_bytes + at)
+        Ok(self.base + k * self.slot_bytes + at)
     }
 
     /// Part `part`'s window at byte `skew` in: where the part's staged bytes
