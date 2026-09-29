@@ -13,8 +13,9 @@
 # recipe, word-split (shell quoting allowed). Env comes before ARGS, e.g.
 #   gate-gpu-ds41-prefill@BLOOMERY_PREFILL_GROUP=1:--cases 512 --no-split --no-extra
 # --list FILE: one item per line (blank lines and `#` lines skipped), or the raw output of `just
-# affected …` (first line `affected:`): then only lines starting with two spaces and `gate-` count, the
-# first word is the recipe, everything else is ignored — the `always:` checks are not taken from it.
+# affected …` (first line `affected:`, or just's echoed `./tools/affected-gates.sh …` line and then it): then
+# only lines starting with two spaces and `gate-` count, the first word is the recipe, everything else is
+# ignored — the `always:` checks are not taken from it.
 # --smoke: the fixed smoke list (SMOKE below; docs/gates-plan.md 3.1). An unknown recipe, a malformed
 # item, ARGS given to a recipe with no parameters, or an empty list is a named error before anything
 # runs.
@@ -527,8 +528,11 @@ def fail(msg):
 if src == "list":
     with open(listfile, encoding="utf-8") as fh:
         lines = fh.read().split("\n")
-    first = next((ln for ln in lines if ln.strip()), "")
-    if first.startswith("affected:"):
+    head = [ln for ln in lines if ln.strip()][:2]
+    # `just affected … 2>&1` puts just's echo of the recipe line above the output's `affected:` line.
+    if head and head[0].startswith("./tools/affected-gates.sh ") and len(head) > 1:
+        head = head[1:]
+    if head and head[0].startswith("affected:"):
         raw_items = [ln.split()[0] for ln in lines if ln.startswith("  gate-")]
         where = [f"{listfile} (just affected output)"] * len(raw_items)
     else:
