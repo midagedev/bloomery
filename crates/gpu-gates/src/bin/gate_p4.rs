@@ -14,6 +14,7 @@
 //!   from these numbers by the lead, not chosen here). `swiglu` has no
 //!   isolated oracle row (the reference fuses it with the matmul) and
 //!   `argmax` compares indices, so those print `ik_rel=n/a`.
+//!
 //! Real inputs come from the CUDA oracle dump wherever it holds the op's
 //! input; synthetic `activations()` only for shapes the dump cannot supply
 //! (swiglu). Every chain is proven from MANIFEST.tsv (dims + op) before use;
