@@ -453,10 +453,10 @@
 5. **스칼라 flash 세그먼트 패스와 탐침**
    - 대상: `flash_latent_seg`(1103), `seg_pass`(1166), `enqueue_flash_latent_seg`(2933), 탐침 커널 다섯(1423-1760), `flash_merge2_q8`(1947), `TWICE_*`(290-302)와 `latent_range`·`merge_row`의 `TWICE` 분기, `enqueue_flash_latent_seg_twice`(3105), `enqueue_flash_merge2_q8`(3318), `StepProbe`의 flash 팔과 `keyaxis_arms`(model/probe.rs:245-287), `BLOOMERY_FLASH_MMA=0`.
    - 지우지 않는 것: `flash_latent`·`flash_latent_q8`은 짧은 캐시의 기본 경로라 남는다(dispatch.rs:440, 451).
-   - 근거: `log/2026-09-22-n-the-mma-pass-became-the-default.md:37` "스칼라 세그먼트 패스와 그 계기 8개는 이제 두 번째 경로다. 지울지는 다음 결정이다." 그리고 AGENTS "Performance first".
+   - 근거: rig-log `d62f650:log/2026-09-22-n-the-mma-pass-became-the-default.md:37` (the file before the 09-22 merge) "스칼라 세그먼트 패스와 그 계기 8개는 이제 두 번째 경로다. 지울지는 다음 결정이다." 그리고 AGENTS "Performance first".
    - 커버리지: gate-gpu-e2e의 둘째 프로세스와 keyaxis 팔이 없어진다(justfile:112-116). MMA의 ik 대조는 남는다.
 6. **`StepProbe`의 split 팔 넷**: `split_heads`, `split_kqvc`, `split_flash_quant`, `split_moe_quant`(dispatch.rs:177, 586-587, 660, 1298-1355)
-   - 근거: `log/2026-09-22-b-the-barrier-got-a-price.md:32-40`. 접기가 −31.9, −35.9, 둘 다 하면 −69.3 µs/스텝으로 판정됐다(8바퀴, 노드 701 → 648). 이 팔들은 "value-neutral rollback lever"로 남았다(gate_e2e.rs:209-215: 648/702/729/755).
+   - 근거: rig-log `d62f650:log/2026-09-22-b-the-barrier-got-a-price.md:32-40` (the file before the 09-22 merge). 접기가 −31.9, −35.9, 둘 다 하면 −69.3 µs/스텝으로 판정됐다(8바퀴, 노드 701 → 648). 이 팔들은 "value-neutral rollback lever"로 남았다(gate_e2e.rs:209-215: 648/702/729/755).
    - 커버리지: gate_e2e의 중첩 팔 검사, gate_p8.rs:342, generate.rs의 레버 37곳이 바뀐다.
 7. **Q3_K split-K 가족**: `q3k_gemv_split`, `_split_mcol`, `_split_groups`(lib.rs:1698, 1770, 1976), `Q3K_SPLIT_*`(207-263), 레시피 `gate-gpu-ds41-prefill-q3ksplit`(justfile:930-936)
    - 근거: 설계상 판정할 수 없다(1장 11번).

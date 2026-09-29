@@ -23,7 +23,7 @@ The decode step has three legs that overlap: the GPU kernels, the host expert le
 
 **The GPU kernels** are bandwidth-bound matrix-vector products. Large launches read at 567–701 GB/s on the A6000 (`docs/plan.md`, cost model).
 
-**engram rows come from NVMe.** The table is about 195 GiB and is memory-mapped. One token reads 48 rows of 272 bytes. Read cold as page faults, they took 4.69 ms (median); with each row's read-ahead issued one token early, 0.31 ms (rig-log [2026-09-22](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22-p-the-engram-path-costs-a-third-of-a-millisecond-and-it-is-syscalls.md)). On real text more rows are cold than on the synthetic depth prompt: a 4096-token prose prompt added 3.3 ms per step outside the host leg (A6000, depth 4096, prefix placement, instrumentation on, the earlier mixed-quantization file; rig-log 2026-09-24).
+**engram rows come from NVMe.** The table is about 195 GiB and is memory-mapped. One token reads 48 rows of 272 bytes. Read cold as page faults, they took 4.69 ms (median); with each row's read-ahead issued one token early, 0.31 ms (rig-log [2026-09-22](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22.md#p-the-engram-path-costs-a-third-of-a-millisecond-and-it-is-syscalls)). On real text more rows are cold than on the synthetic depth prompt: a 4096-token prose prompt added 3.3 ms per step outside the host leg (A6000, depth 4096, prefix placement, instrumentation on, the earlier mixed-quantization file; rig-log 2026-09-24).
 
 ## RAM floor
 
