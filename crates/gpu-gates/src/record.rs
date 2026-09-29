@@ -482,6 +482,22 @@ pub static PLAN: Kind = Kind {
     ],
 };
 
+/// Where a qwen4exp placement puts the routed experts, before the load.
+pub static PLAN38: Kind = Kind {
+    name: "plan38",
+    head: "plan",
+    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, where the routed experts sit, and the hot list file the card's experts were ranked by (none: each layer's id prefix).",
+    parts: &[
+        key("place", Word, ""),
+        key("card", Word, ""),
+        key("experts", Word, ""),
+        key("ctx_max", U64, "positions"),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("hot_list", Text, ""),
+    ],
+};
+
 /// The loaded model.
 pub static LOAD: Kind = Kind {
     name: "load",
@@ -1582,6 +1598,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// its `load` line, and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
 /// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
+    &PLAN38,
     &TAPS_SEQ,
     &TAPS_DUMP,
     &STAT_STEP_HOST,
@@ -1799,6 +1816,19 @@ mod tests {
             .u("sidecar_bytes", 4096)
             .line();
         assert_eq!(lock, "host_lock=8192 B sidecar_bytes=4096");
+        let plan38 = Record::new(&PLAN38)
+            .w("place", "a")
+            .w("card", "A6000")
+            .w("experts", "card")
+            .u("ctx_max", 4096)
+            .u("host_experts", 11_735)
+            .u("card_experts", 12_841)
+            .w("hot_list", "none")
+            .line();
+        assert_eq!(
+            plan38,
+            "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841 hot_list=none"
+        );
         let smoke = Record::new(&SMOKE)
             .w("mode", "graph")
             .w("place", "a")

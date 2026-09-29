@@ -172,7 +172,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Placement: a hot list file (`tools/ref/router-hotlist.py`); each routed \
               layer's card keeps the file's first `n_l` ranked ids instead of the id \
               prefix, the same counts and bytes. A layer listing fewer than the plan's \
-              `n_l` is refused. The `plan` line prints `hot_list=`.",
+              `n_l` is refused. Read by `generate_ds41`, `bloomery-chat`, \
+              `bloomery-serve-ds41`, `generate_glm5next` and `generate_qwen3moe` (a \
+              qwen4exp card plan, `BLOOMERY_QWEN38_EXPERTS=card`; a host plan ranks \
+              none). The `plan` line of the V4.1 binaries and `generate_qwen3moe` prints `hot_list=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
