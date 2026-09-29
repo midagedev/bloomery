@@ -129,6 +129,14 @@
 //!   timed on its own thread: whether a free blocks behind a copy nothing
 //!   stages, which the stop-before-any-free order rests on. A measurement,
 //!   not a verdict — the line names the outcome either way.
+//! - odirect: a source whose parts are file runs read with O_DIRECT — one
+//!   file beside the gate binary (the box's target directory is ext4, where
+//!   /tmp may be tmpfs and refuse O_DIRECT), its experts at a stride an odd
+//!   multiple of 2048 so an odd id's run begins 2048 B into a page — drives
+//!   the same trace as the in-memory arm: the same flips and pass values,
+//!   its card slots bit-identical once every copy has landed, every staged
+//!   byte read with O_DIRECT and none written by the CPU (its mutant: a
+//!   file run that falls back to a CPU copy).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -143,7 +151,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use std::io::Write;
     use std::ops::Range;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
@@ -151,8 +161,8 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
-        Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
-        Transform, set_leak_sink,
+        DIRECT, FileId, Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine,
+        SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
@@ -220,6 +230,10 @@ mod gate {
     /// an unstaged job before it releases the machine behind it: past this
     /// the free is blocked, and only the machine's drop ends the block.
     const FREE_LOOK: Duration = Duration::from_secs(2);
+    /// The stride between two experts' parts in the odirect arm's file: an
+    /// odd multiple of 2048, so an odd expert's run begins 2048 B into a
+    /// page — the misalignment an odd expert of the r8 sidecar carries.
+    const OD_STRIDE: usize = 6144;
     /// The host's rule: its sum is the card's under this mask, so a pass's
     /// value says which side served each id.
     const HOST_MASK: u32 = 0x1234_5678;
@@ -539,7 +553,7 @@ mod gate {
                 panic!("Synth::source panics on layer {layer} expert {id} (gate_swap's panic arm)");
             }
             let at = (li(layer) * E + id as usize) * PARTS + part;
-            Ok(Piece {
+            Ok(Piece::Memory {
                 bytes: &self.bytes[at],
                 transform: Transform::Identity,
             })
@@ -599,6 +613,82 @@ mod gate {
         fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
             self.resident[li(layer) * E + id as usize].store(false, Ordering::Release);
             Ok(EXPERT_BYTES)
+        }
+    }
+
+    /// The odirect arm's source: [`Synth`]'s stacks, residency and drops,
+    /// its parts served as runs of one file — layer `li(layer)`'s part `p`
+    /// holding expert `e` at `base[li(layer)][p] + e · [`OD_STRIDE`]`, a
+    /// stride an odd multiple of 2048 so an odd expert's run begins 2048 B
+    /// into a page.
+    struct FileSynth {
+        inner: Synth,
+        path: PathBuf,
+        base: Vec<[usize; PARTS]>,
+    }
+
+    impl FileSynth {
+        /// The source over `stacks` of `caps` whose file is `path`, which
+        /// the caller has written the experts' bytes to.
+        fn new(stacks: &Stacks, caps: [usize; L], path: &Path) -> FileSynth {
+            let mut base = Vec::with_capacity(L);
+            let mut at = 0usize;
+            for _ in 0..L {
+                let mut row = [0usize; PARTS];
+                for b in &mut row {
+                    *b = at;
+                    at += E * OD_STRIDE;
+                }
+                base.push(row);
+            }
+            FileSynth {
+                inner: Synth::new(stacks, caps, Faults::default()),
+                path: path.to_path_buf(),
+                base,
+            }
+        }
+
+        /// Expert `id`'s part `part` in the file.
+        fn run(&self, layer: usize, id: u32, part: usize) -> Range<u64> {
+            let at = self.base[li(layer)][part] + id as usize * OD_STRIDE;
+            at as u64..at as u64 + PART_BYTES[part] as u64
+        }
+    }
+
+    impl SwapSource for FileSynth {
+        fn part_bytes(&self) -> &[usize] {
+            self.inner.part_bytes()
+        }
+
+        fn files(&self) -> Vec<PathBuf> {
+            vec![self.path.clone()]
+        }
+
+        fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
+            Ok(Piece::File {
+                file: FileId(0),
+                range: self.run(layer, id, part),
+            })
+        }
+
+        fn skew(&self, layer: usize, id: u32, part: usize) -> Result<usize, GpuError> {
+            Ok((self.run(layer, id, part).start % DIRECT as u64) as usize)
+        }
+
+        fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
+            self.inner.dest(layer, part, slot)
+        }
+
+        fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
+            self.inner.prepare_victim(layer, id)
+        }
+
+        fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError> {
+            self.inner.host_resident(layer, id)
+        }
+
+        fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
+            self.inner.release_host(layer, id)
         }
     }
 
@@ -1181,13 +1271,38 @@ mod gate {
     fn start(
         gpu: &Gpu,
         pm: &probe_kernels::LoadedModule,
-        mut slots: SlotMap,
+        slots: SlotMap,
         faults: Faults,
         cfg: MachineCfg,
     ) -> Result<Run, GateError> {
         let mut card = Card::new(gpu, &slots)?;
         card.capture(gpu, pm)?;
         let source = Arc::new(Synth::new(&card.stacks, N_L, faults));
+        arm(gpu, card, slots, source, cfg)
+    }
+
+    /// A fresh arm over a file-backed source at `path`: the same shape as
+    /// [`start`]'s, its parts runs of the file.
+    fn start_file(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        slots: SlotMap,
+        path: &Path,
+    ) -> Result<Run, GateError> {
+        let mut card = Card::new(gpu, &slots)?;
+        card.capture(gpu, pm)?;
+        let source = Arc::new(FileSynth::new(&card.stacks, N_L, path));
+        arm(gpu, card, slots, source, cfg(DELAY, DEADLINE))
+    }
+
+    /// [`start`]'s machine and run over `source`.
+    fn arm(
+        gpu: &Gpu,
+        card: Card,
+        mut slots: SlotMap,
+        source: Arc<dyn SwapSource>,
+        cfg: MachineCfg,
+    ) -> Result<Run, GateError> {
         let delay = cfg.params.delay;
         let machine = SwapMachine::new(
             gpu.context(),
@@ -2484,6 +2599,124 @@ mod gate {
         Ok(ok)
     }
 
+    /// Wait for a run's copy stream to drain, polling with the gate's bound:
+    /// the flips its last boundaries made are still in flight when the trace
+    /// ends, and their copies land before the stacks are read.
+    fn wait_copies(run: &Run) -> Result<(), GateError> {
+        let m = run.machine.as_ref().ok_or("gate_swap: no machine")?;
+        let t0 = Instant::now();
+        loop {
+            match m.copy_stream().query() {
+                Ok(true) => return Ok(()),
+                Ok(false) if t0.elapsed() > ENGINE_DRAIN => {
+                    return Err("gate_swap: the copy stream did not drain".into());
+                }
+                Ok(false) => std::thread::sleep(Duration::from_micros(50)),
+                Err(e) => return Err(format!("cuStreamQuery: {e}").into()),
+            }
+        }
+    }
+
+    /// odirect: the same trace over a source whose parts are file runs (the
+    /// synthetic experts' bytes in one file beside the gate binary) as the
+    /// in-memory arm runs: the same flips, the same pass values, its card
+    /// slots bit-identical once every copy has landed, every staged byte
+    /// read with O_DIRECT and none written by the CPU, and odd experts'
+    /// misaligned runs exercised.
+    fn odirect(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let dir = std::env::current_exe()?
+            .parent()
+            .ok_or("gate_swap: the binary's directory")?
+            .to_path_buf();
+        let path = dir.join("gate_swap-odirect.bin");
+        let mut bytes = vec![0u8; L * PARTS * E * OD_STRIDE];
+        for l in LAYERS {
+            for e in 0..E as u32 {
+                for (p, &n) in PART_BYTES.iter().enumerate() {
+                    let at = ((li(l) * PARTS + p) * E + e as usize) * OD_STRIDE;
+                    for i in 0..n / 4 {
+                        bytes[at + 4 * i..at + 4 * i + 4]
+                            .copy_from_slice(&word(l, e, p, i).to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(&bytes)?;
+        // The direct read bypasses the page cache, so the buffered write
+        // reaches the disk before any run reads it.
+        f.sync_all()?;
+        drop((f, bytes));
+        let r = start_file(gpu, pm, seed_map(&[])?, &path);
+        let _ = std::fs::remove_file(&path);
+        let mut r = r?;
+        if r.err.is_some() {
+            println!(
+                "odirect: the machine over the file source: {} FAIL",
+                show(&r.err)
+            );
+            return Ok(false);
+        }
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        wait_copies(&r)?;
+        wait_copies(a)?;
+        let (mut od, mut cpu) = r
+            .machine
+            .as_ref()
+            .ok_or("gate_swap: no machine")?
+            .staged_bytes();
+        for p in &r.reports {
+            od += p.od_bytes;
+            cpu += p.cpu_bytes;
+        }
+        let odd = a.flips.iter().any(|(_, f)| f.admit % 2 == 1);
+        let mut diff = None;
+        for i in 0..L {
+            for p in 0..PARTS {
+                let want = a.card.stacks.bufs[i][p].to_host_vec(gpu.stream())?;
+                let got = r.card.stacks.bufs[i][p].to_host_vec(gpu.stream())?;
+                if diff.is_none() {
+                    diff = want
+                        .iter()
+                        .zip(&got)
+                        .position(|(x, y)| x != y)
+                        .map(|w| (LAYERS.start + i, p, w));
+                }
+            }
+        }
+        let ok = r.err.is_none()
+            && r.values.len() == PASSES
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values)
+            && odd
+            && cpu == 0
+            && od == a.flips.len() as u64 * EXPERT_BYTES
+            && diff.is_none();
+        println!(
+            "odirect: the trace over file runs ({}, stride {OD_STRIDE} B): {} passes, flips = the \
+             memory arm's {}, values = the memory arm's {}, card slots first differ at {diff:?}, \
+             {} B staged with O_DIRECT (want {} B, {} flips), {cpu} B written by the CPU, an odd \
+             expert among the admits {odd}, errors (stale, double, miss) {:?}; error {} {}",
+            path.display(),
+            r.values.len(),
+            r.flips == a.flips,
+            fnvs(&r.values) == fnvs(&a.values),
+            od,
+            a.flips.len() as u64 * EXPERT_BYTES,
+            a.flips.len(),
+            errs(&r.values),
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -2538,6 +2771,7 @@ mod gate {
         ok &= dropq(&gpu, &pm, &trace, &a)?;
         ok &= dropq_tier(&gpu, &trace, &a)?;
         ok &= dropq_free(&gpu, &pm, &trace, &a)?;
+        ok &= odirect(&gpu, &pm, &trace, &a)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];

@@ -1,0 +1,30 @@
+# Lead odswap, 2026-09-29: one residency expert copy (16,773,120 B) costs 7.72 [7.63, 7.81] host slots through
+# the staging memcpy and 1.74 [1.59, 1.90] read with O_DIRECT straight into the pinned ring (rig-log
+# 09-29#odprobe, beside bench_v41_host engine:5). With the swap source now the file itself the staging thread's
+# CPU copy is gone: the post-hold-fix heavy-step excess ~9-10 ms a 4-step cycle under nsys (09-29#resnsys) ×
+# (1 - 1.74/7.72) ≈ 7 ms a cycle ≈ 1.8 ms a step on a ~28 ms step, widened for the nsys inflation: +3..+9 %
+# [derived]. One thread's ungated O_DIRECT reads run 6.12 GB/s alone and 6.03 beside the engine (card odmax,
+# c = 1.57 slots a copy), against the ~4 GB/s the flips need [derived].
+kind: ab
+question: does reading the residency swap's expert bytes with O_DIRECT into the pinned ring, with no staging
+  memcpy, raise residency decode?
+term: decode tok/s @ -n 96 after prose:512, BLOOMERY_RESIDENCY=mid-p40-s1, plan (b′) A6000+3090 (the 3090 at
+  its 250 W cap) - (odswap - v41res) / v41res, the two binaries paired by round
+unit: %
+predict: +3..+9
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round ratios; the larger
+condition: from /Users/hckim/repo/bloomery-odswap, the base binary built in /root/repo/bloomery-v41res (the
+  v41res tree this one builds on): BLOOMERY_REMOTE='~/repo/bloomery-odswap' BLOOMERY_AB_ROUNDS=3
+  BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090
+  BLOOMERY_RESIDENCY=mid-p40-s1 BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/odswap-ab.card' just
+  depth-gpu-ds41 prose:512 bin:/root/repo/bloomery-v41res/target/release/generate_ds41:prose:512; the witness
+  blocks show no Xid; no row carries [cold], [cpu-busy] or [other-busy]. Box time 12..18 min [derived: 2
+  two-card loads a round at 60..110 s, 3 rounds]
+decide-in: land odswap; the staging memcpy is out of the machine's path - re-derive the residency's remaining
+  DRAM share from the step stats
+decide-below: read the residency pass records' od_bytes and cpu_bytes and the late counts: cpu_bytes not 0
+  means the read did not go direct; late landings mean the single staging thread's read rate is the term to
+  split (card odmax)
+decide-above: the static rows moved too: read whether the prompt call's placement changed with the residency
+  source before crediting the swap

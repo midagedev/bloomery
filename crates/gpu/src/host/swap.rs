@@ -32,8 +32,10 @@
 //! staging ring into the slot's place in its stack and the source's convert
 //! step ([`SwapSource::convert`]), a word back to the staging thread, and the
 //! flip's event; the staging thread prepares the victim for the host
-//! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
-//! ring, gated to the host leg's wait window ([`SwapMachine::window`]).
+//! ([`SwapSource::prepare_victim`]), then stages the expert's parts into the
+//! ring — a file run read with O_DIRECT into its window, a piece in memory
+//! written there — gated to the host leg's wait window
+//! ([`SwapMachine::window`]).
 //!
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
@@ -75,8 +77,12 @@
 //! [`Tally`] and folded into the rule at [`SwapMachine::end_pass`] for the
 //! pass's kept rows only, so a rejected row leaves no trace.
 
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::ops::Range;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -167,12 +173,30 @@ pub enum Transform {
     Identity,
 }
 
-/// One part of an expert as its source holds it: `bytes`, turned into the
-/// slot's by `transform`.
-#[derive(Clone, Copy, Debug)]
-pub struct Piece<'a> {
-    pub bytes: &'a [u8],
-    pub transform: Transform,
+/// The alignment an O_DIRECT read needs: the file offset, the buffer and
+/// the length multiples of this many bytes, which the box's files' logical
+/// block size divides.
+pub const DIRECT: usize = 4096;
+
+/// One of the files a source's runs read ([`Piece::File`]): its index among
+/// [`SwapSource::files`]'s paths, which the machine opens with O_DIRECT at
+/// [`SwapMachine::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileId(pub usize);
+
+/// One part of an expert as its source holds it.
+#[derive(Clone, Debug)]
+pub enum Piece<'a> {
+    /// `bytes` in memory, turned into the slot's by `transform`.
+    Memory {
+        bytes: &'a [u8],
+        transform: Transform,
+    },
+    /// A run of file `file`: its `range` holds
+    /// [`SwapSource::part_bytes`]`[part]` bytes the staging thread reads
+    /// with O_DIRECT into the part's window of the ring slot, from the page
+    /// the run begins in.
+    File { file: FileId, range: Range<u64> },
 }
 
 /// A model's side of the machine: where an expert's bytes come from, where
@@ -188,8 +212,29 @@ pub trait SwapSource: Send + Sync {
     fn part_bytes(&self) -> &[usize];
 
     /// Part `part` of layer `layer`'s expert `id` as its source holds it:
-    /// [`SwapSource::part_bytes`]`[part]` bytes once transformed.
+    /// [`SwapSource::part_bytes`]`[part]` bytes once transformed, in memory
+    /// or as a run of a file ([`Piece::File`]).
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError>;
+
+    /// The distinct files this source's runs read, their paths; the machine
+    /// opens each once with O_DIRECT at [`SwapMachine::new`] and a
+    /// [`Piece::File`] names its [`FileId`] by index here. A source whose
+    /// parts are all in memory reads none.
+    fn files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// Where part `part` of layer `layer`'s expert `id` lands in its window
+    /// of the ring slot: a file run is read into the window's start from
+    /// the page its bytes begin in, so they land the run's skew in
+    /// (`range.start %` [`DIRECT`]); bytes in memory land at the window's
+    /// start. The thread that drives the machine reads this when it
+    /// enqueues the copy; [`SwapSource::source`] is the staging thread's
+    /// alone.
+    fn skew(&self, layer: usize, id: u32, part: usize) -> Result<usize, GpuError> {
+        let _ = (layer, id, part);
+        Ok(0)
+    }
 
     /// The device address slot `slot` of layer `layer`'s stack `part` starts
     /// at. The stacks stay allocated and in place until the machine's copy
@@ -496,19 +541,92 @@ struct Job {
     ticket: u32,
 }
 
-/// The staging ring: [`RING_SLOTS`] experts of `slot_bytes`, pinned and
-/// device-mapped. Its bytes are written and read here only.
+/// Linux's `O_DIRECT` (`0o40000` on x86-64), the flag [`OpenOptions`]'s
+/// `custom_flags` takes for a read the page cache does not serve.
+const O_DIRECT: i32 = 0o40000;
+
+/// One of a source's files, opened for reading with O_DIRECT: the path, for
+/// the staging failures that name it, beside the file itself.
+struct DirectFile {
+    path: PathBuf,
+    file: File,
+}
+
+/// `source`'s files ([`SwapSource::files`]), each opened once for reading
+/// with O_DIRECT. A file that refuses it (a tmpfs, a filesystem without
+/// direct IO) is a named error naming the path and the errno — never a
+/// silent fall back to a CPU copy, a second path the engine does not carry.
+fn open_direct(source: &dyn SwapSource) -> Result<Vec<DirectFile>, GpuError> {
+    const WHAT: &str = "SwapMachine::new";
+    source
+        .files()
+        .into_iter()
+        .map(|path| {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECT)
+                .open(&path)
+                .map_err(|e| GpuError::shape(WHAT, format!("{}: O_DIRECT: {e}", path.display())))?;
+            Ok(DirectFile { path, file })
+        })
+        .collect()
+}
+
+/// The bytes a part's window takes in a ring slot: the part's own bytes and
+/// the two partial pages an O_DIRECT read of them can span.
+fn window_bytes(len: usize) -> usize {
+    (len + 2 * DIRECT).div_ceil(DIRECT) * DIRECT
+}
+
+/// The staging ring: [`RING_SLOTS`] experts, each part of each in its own
+/// [`DIRECT`]-aligned window of its slot, pinned and device-mapped. Its
+/// bytes are written and read here only.
 struct Ring {
     page: MappedHost,
     slot_bytes: usize,
+    /// Each part's window at byte `windows[part]` of a slot.
+    windows: Vec<usize>,
+    /// Bytes read into the ring with O_DIRECT ([`Ring::read_direct`]) and
+    /// written into it with a CPU copy ([`Ring::write`]), since a boundary
+    /// last took them.
+    od_bytes: AtomicU64,
+    cpu_bytes: AtomicU64,
 }
 
 impl Ring {
-    fn new(ctx: &Arc<CudaContext>, slot_bytes: usize) -> Result<Ring, GpuError> {
-        Ok(Ring {
+    /// The ring over parts of `parts` bytes. Refused by name: a window
+    /// whose base in the pinned page is not [`DIRECT`]-aligned, which an
+    /// O_DIRECT read of it needs.
+    fn new(ctx: &Arc<CudaContext>, parts: &[usize]) -> Result<Ring, GpuError> {
+        const WHAT: &str = "SwapMachine ring";
+        let mut windows = Vec::with_capacity(parts.len());
+        let mut slot_bytes = 0usize;
+        for &len in parts {
+            windows.push(slot_bytes);
+            slot_bytes += window_bytes(len);
+        }
+        let ring = Ring {
             page: MappedHost::new(ctx, RING_SLOTS * slot_bytes, "cuMemHostAlloc (swap ring)")?,
             slot_bytes,
-        })
+            windows,
+            od_bytes: AtomicU64::new(0),
+            cpu_bytes: AtomicU64::new(0),
+        };
+        for k in 0..RING_SLOTS {
+            for (p, &at) in ring.windows.iter().enumerate() {
+                let base = ring.page.host_at(k * ring.slot_bytes + at);
+                if !base.addr().is_multiple_of(DIRECT) {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "part {p}'s window of ring slot {k} at {:#x}: not aligned to {DIRECT}",
+                            base.addr()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(ring)
     }
 
     /// The byte offset of `[at, at + len)` of ring slot `k`, or the refusal
@@ -526,11 +644,30 @@ impl Ring {
         Ok(k * self.slot_bytes + at)
     }
 
-    /// `bytes` into ring slot `k` at byte `at`. The caller is the ring's one
-    /// host writer and writes slot `k` only once the copy stream has read
-    /// its previous use (`drained`).
-    fn write(&self, k: usize, at: usize, bytes: &[u8]) -> Result<(), GpuError> {
-        let off = self.span(k, at, bytes.len(), "SwapMachine ring write")?;
+    /// Part `part`'s window at byte `skew` in: where the part's staged bytes
+    /// land. Refused by name: a part the ring holds no window for.
+    fn at(&self, part: usize, skew: usize, what: &'static str) -> Result<usize, GpuError> {
+        self.windows
+            .get(part)
+            .and_then(|&at| at.checked_add(skew))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!("part {part} at {skew} of the {} staged", self.windows.len()),
+                )
+            })
+    }
+
+    /// `bytes` into part `part`'s window of ring slot `k`. The caller is the
+    /// ring's one host writer and writes slot `k` only once the copy stream
+    /// has read its previous use (`drained`).
+    fn write(&self, k: usize, part: usize, bytes: &[u8]) -> Result<(), GpuError> {
+        let off = self.span(
+            k,
+            self.at(part, 0, "SwapMachine ring write")?,
+            bytes.len(),
+            "SwapMachine ring write",
+        )?;
         // SAFETY: [off, off + len) lies inside the page (checked above); no
         // copy reads ring slot k until the staging word publishes this use,
         // and the staging thread is the only host writer. The word's Release
@@ -541,20 +678,103 @@ impl Ring {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.page.host_at(off), bytes.len());
         }
+        self.cpu_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Enqueue on `stream` the copy of `len` bytes at byte `at` of ring slot
-    /// `k` to device address `dst`.
+    /// Read `len` bytes of `file` at `at` into part `part`'s window of ring
+    /// slot `k`, with O_DIRECT: the read covers the pages
+    /// `[align_down(at), align_up(at + len))` into the window's start, so
+    /// the part's bytes land its skew in. Short reads advance and `EINTR`
+    /// retries; any other error, or the file ending before the part's own
+    /// end, is the refusal of `WHAT` naming the file, the offset and the
+    /// errno. The caller is the ring's one host writer and writes slot `k`
+    /// only once the copy stream has read its previous use (`drained`).
+    fn read_direct(
+        &self,
+        k: usize,
+        part: usize,
+        file: &File,
+        path: &Path,
+        at: u64,
+        len: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine ring read";
+        let page = DIRECT as u64;
+        let start = at - at % page;
+        let skew = at - start;
+        let end = (at + len as u64).div_ceil(page) * page;
+        let bytes = (end - start) as usize;
+        let off = self.span(k, self.at(part, 0, WHAT)?, bytes, WHAT)?;
+        let mut got = 0u64;
+        while got < end - start {
+            // SAFETY: [off + got, off + bytes) lies inside the page (the
+            // span check above); the staging thread is the ring's only host
+            // writer of slot k, which it writes only once drained, and the
+            // staging word's Release store follows the read in program
+            // order, which x86 keeps in the coherent pinned page, so the
+            // copy the word lets through reads these bytes. The borrow ends
+            // before the next command the thread runs.
+            let read = unsafe {
+                file.read_at(
+                    std::slice::from_raw_parts_mut(
+                        self.page.host_at(off + got as usize),
+                        bytes - got as usize,
+                    ),
+                    start + got,
+                )
+            };
+            match read {
+                Ok(0) => break,
+                Ok(n) => got += n as u64,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{}, {} bytes at {:#x}: {e}",
+                            path.display(),
+                            end - start - got,
+                            start + got
+                        ),
+                    ));
+                }
+            }
+        }
+        if got < skew + len as u64 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{}: the run [{:#x}, {:#x}) ends {got} bytes in: the file is shorter than \
+                     the expert",
+                    path.display(),
+                    at,
+                    at + len as u64
+                ),
+            ));
+        }
+        self.od_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Enqueue on `stream` the copy of `len` bytes of part `part` of ring
+    /// slot `k`, `skew` bytes into its window, to device address `dst`.
     fn copy_to_device(
         &self,
         k: usize,
-        at: usize,
+        part: usize,
+        skew: usize,
         len: usize,
         dst: sys::CUdeviceptr,
         stream: &CudaStream,
     ) -> Result<(), GpuError> {
-        let off = self.span(k, at, len, "SwapMachine ring copy")?;
+        let off = self.span(
+            k,
+            self.at(part, skew, "SwapMachine ring copy")?,
+            len,
+            "SwapMachine ring copy",
+        )?;
         // SAFETY: the source span lies inside the page (checked above), which
         // stays allocated until the copy stream has drained (the machine's
         // drop leaks it otherwise); the source vouches that `dst` holds `len`
@@ -616,6 +836,9 @@ impl std::error::Error for StagingFailed {
 struct Shared {
     source: Arc<dyn SwapSource>,
     ring: Ring,
+    /// The source's files, opened with O_DIRECT ([`open_direct`]); a run's
+    /// [`FileId`] indexes them.
+    direct: Vec<DirectFile>,
     /// Per ring slot: `staged` (the thread's ticket once the slot holds the
     /// expert, or once its failure is recorded) at `2k`, `drained` (the copy
     /// stream's ticket once it has read the slot) at `2k + 1`.
@@ -685,27 +908,66 @@ impl Shared {
         Ok(true)
     }
 
-    /// Copy `job`'s expert from its source into its ring slot, part after
-    /// part.
+    /// Stage `job`'s expert into its ring slot, part after part: a file run
+    /// read with O_DIRECT into its window, a piece in memory written there.
     fn stage(&self, job: &Job) -> Result<(), GpuError> {
-        let mut at = 0usize;
+        const WHAT: &str = "SwapMachine staging";
         for (part, &want) in self.source.part_bytes().iter().enumerate() {
-            let piece = self.source.source(job.layer, job.id, part)?;
-            if piece.bytes.len() != want {
-                return Err(GpuError::shape(
-                    "SwapMachine staging",
-                    format!(
-                        "layer {} expert {} part {part}: {} source bytes for a slot of {want}",
-                        job.layer,
-                        job.id,
-                        piece.bytes.len()
-                    ),
-                ));
+            match self.source.source(job.layer, job.id, part)? {
+                Piece::Memory { bytes, transform } => {
+                    if bytes.len() != want {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "layer {} expert {} part {part}: {} source bytes for a slot of \
+                                 {want}",
+                                job.layer,
+                                job.id,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    match transform {
+                        Transform::Identity => self.ring.write(job.ring, part, bytes)?,
+                    }
+                }
+                Piece::File { file, range } => {
+                    let d = self.direct.get(file.0).ok_or_else(|| {
+                        GpuError::shape(
+                            WHAT,
+                            format!(
+                                "file {} of the {} the machine opened",
+                                file.0,
+                                self.direct.len()
+                            ),
+                        )
+                    })?;
+                    let len = range
+                        .end
+                        .checked_sub(range.start)
+                        .and_then(|l| usize::try_from(l).ok());
+                    let len = match len {
+                        Some(len) if len == want => len,
+                        _ => {
+                            return Err(GpuError::shape(
+                                WHAT,
+                                format!(
+                                    "layer {} expert {} part {part}: [{:#x}, {:#x}) of {}, not {} \
+                                     bytes for a slot",
+                                    job.layer,
+                                    job.id,
+                                    range.start,
+                                    range.end,
+                                    d.path.display(),
+                                    want
+                                ),
+                            ));
+                        }
+                    };
+                    self.ring
+                        .read_direct(job.ring, part, &d.file, &d.path, range.start, len)?;
+                }
             }
-            match piece.transform {
-                Transform::Identity => self.ring.write(job.ring, at, piece.bytes)?,
-            }
-            at += want;
         }
         Ok(())
     }
@@ -840,6 +1102,10 @@ pub struct PassReport {
     /// bytes into the ring, and preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
+    /// Bytes the staging thread read with O_DIRECT and wrote with a CPU copy
+    /// since the last boundary: the pass's share of each.
+    pub od_bytes: u64,
+    pub cpu_bytes: u64,
 }
 
 /// Why a dropped machine leaked its shared state ([`Leak`]).
@@ -1082,14 +1348,13 @@ impl SwapMachine {
                 ),
             ));
         }
-        let parts = source.part_bytes();
+        let parts = source.part_bytes().to_vec();
         if parts.is_empty() || parts.iter().any(|&b| b == 0 || b % 4 != 0) {
             return Err(GpuError::shape(
                 WHAT,
                 format!("expert parts of {parts:?} bytes: each a nonzero multiple of 4"),
             ));
         }
-        let slot_bytes: usize = parts.iter().sum();
         let layout = SwapMachine::layout(slots, &cfg.pinned, cfg.params.spares)?;
         for &(l, id) in &layout.freed {
             source.prepare_victim(l, id)?;
@@ -1104,10 +1369,11 @@ impl SwapMachine {
         let ledger = SlotLedger::of_map(slots)?;
         let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
         let boundary_event = ctx.new_event(None)?;
+        let direct = open_direct(source.as_ref())?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
         let Staging { shared, tx, thread } =
-            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg)?;
+            SwapMachine::start_staging(ctx, source, &parts, direct, &cfg)?;
         let mut m = SwapMachine {
             rule,
             ledger,
@@ -1227,16 +1493,19 @@ impl SwapMachine {
             .map_err(|e| rule_err("SwapMachine::new", e))
     }
 
-    /// The ring, the staging words and the staging thread over `source`.
+    /// The ring, the staging words and the staging thread over `source`,
+    /// reading its `direct` files.
     fn start_staging(
         ctx: &Arc<CudaContext>,
         source: Arc<dyn SwapSource>,
-        slot_bytes: usize,
+        parts: &[usize],
+        direct: Vec<DirectFile>,
         cfg: &MachineCfg,
     ) -> Result<Staging, GpuError> {
         let shared = Arc::new(Shared {
             source,
-            ring: Ring::new(ctx, slot_bytes)?,
+            ring: Ring::new(ctx, parts)?,
+            direct,
             words: MappedHost::new(
                 ctx,
                 2 * RING_SLOTS * WORD_STRIDE,
@@ -1607,6 +1876,8 @@ impl SwapMachine {
         self.after_change(changed, || format!("boundary {b}"))?;
         report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
+        report.od_bytes = self.shared.ring.od_bytes.swap(0, Ordering::Relaxed);
+        report.cpu_bytes = self.shared.ring.cpu_bytes.swap(0, Ordering::Relaxed);
         self.planned = Some(b);
         report.boundary_us = micros(start);
         Ok(report)
@@ -1816,20 +2087,21 @@ impl SwapMachine {
         }
         dispatch::wait_staged(&copy, &self.shared.words, &d)?;
         let drained = self.shared.words.dev_at((2 * d.ring() + 1) * WORD_STRIDE);
-        let mut at = 0usize;
+        let mut bytes = 0u64;
         for (part, (&len, &dst)) in parts.iter().zip(&dsts).enumerate() {
+            let skew = source.skew(l, id, part)?;
             self.shared
                 .ring
-                .copy_to_device(d.ring(), at, len, dst, &copy)?;
+                .copy_to_device(d.ring(), part, skew, len, dst, &copy)?;
             source.convert(l, part, dst, &copy)?;
-            at += len;
+            bytes += len as u64;
         }
         mem_batch(
             &copy,
             &mut [op_write(drained, d.ticket())],
             "swap: ring drained",
         )?;
-        Ok(at as u64)
+        Ok(bytes)
     }
 
     /// Layer `layer`'s host map, ledger and rule agree, else refused by name:
@@ -2109,6 +2381,18 @@ impl SwapMachine {
     #[must_use]
     pub fn deadline(&self) -> Duration {
         self.shared.deadline
+    }
+
+    /// The bytes the staging thread has read with O_DIRECT and written with
+    /// a CPU copy since the machine started, beside what the passes'
+    /// reports already took: their sum is the whole run's share, which a
+    /// gate holds to a source's promise.
+    #[must_use]
+    pub fn staged_bytes(&self) -> (u64, u64) {
+        (
+            self.shared.ring.od_bytes.load(Ordering::Relaxed),
+            self.shared.ring.cpu_bytes.load(Ordering::Relaxed),
+        )
     }
 }
 

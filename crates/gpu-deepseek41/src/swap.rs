@@ -11,8 +11,11 @@
 //!
 //! **Sources.** The host reads its routed gates and ups from the r8 sidecar
 //! when the load reads one (`BLOOMERY_R8`), so those are the bytes the load's
-//! host set holds, and the down from the source file. A staged gate or up is
-//! then the r8 row-lane layout, not Q3_K: once its bytes are in the slot,
+//! host set holds, and the down from the source file; a flip's copy reads
+//! those same file bytes with O_DIRECT, straight into the pinned ring's
+//! window for the part — no CPU copy between the file and the card, and no
+//! second copy of the model in memory ([`Piece::File`]). A staged gate or up
+//! is then the r8 row-lane layout, not Q3_K: once its bytes are in the slot,
 //! [`R8Kernels`] turns them into the Q3_K bytes in place on the copy stream
 //! (`ds41_r8_q3k_groups`, the inverse of `qdot::repack_q3k_r8`, bit for bit
 //! `qdot::unpack_q3k_r8`). A group of eight rows is the same byte range in
@@ -34,10 +37,11 @@
 //! its stage card experts past the pinned ones ([`ChurnPool`]) — in the set.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bloomery_gpu::host::swap::{MachineCfg, Piece, Residency, SwapSource, Transform};
+use bloomery_gpu::host::swap::{DIRECT, FileId, MachineCfg, Piece, Residency, SwapSource};
 use bloomery_gpu::hybrid::SlotMap;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{GpuError, launch_u32, window};
@@ -629,6 +633,9 @@ pub struct Ds41Swap {
     first: usize,
     layers: Vec<Option<LayerParts>>,
     parts: [usize; 3],
+    /// The distinct files the experts' parts run in, with the paths the
+    /// machine opens with O_DIRECT; a run's [`FileId`] is its index.
+    direct: Vec<(HostFile, PathBuf)>,
     /// Super-blocks of each row of a gate or up part.
     nb: usize,
     /// The unpack, when the host's gates and ups are the sidecar's.
@@ -751,6 +758,35 @@ impl Ds41Swap {
             }
             None => None,
         };
+        let src = pair.source();
+        let mut direct: Vec<(HostFile, PathBuf)> = Vec::new();
+        for p in out.iter().flatten() {
+            for (part, t) in p.tensors.iter().enumerate() {
+                let (file, _) = expert_run(src, t, experts, 0, part < 2)
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                if part < 2 && unpack.is_some() && !matches!(file, HostFile::Sidecar(_)) {
+                    return Err(shape(
+                        WHAT,
+                        format!(
+                            "{}: not in the r8 sidecar, whose row-lane layout the unpack expects",
+                            t.name
+                        ),
+                    ));
+                }
+                if direct.iter().any(|(f, _)| *f == file) {
+                    continue;
+                }
+                let path = match &file {
+                    HostFile::Shard(s) => src
+                        .split()
+                        .shard_path(*s)
+                        .ok_or_else(|| shape(WHAT, format!("shard {s} of the split, for its path")))
+                        .map(Path::to_path_buf),
+                    HostFile::Sidecar(p) => Ok(p.clone()),
+                };
+                direct.push((file, path?));
+            }
+        }
         Ok(Ds41Swap {
             pair,
             set,
@@ -758,6 +794,7 @@ impl Ds41Swap {
             first: layers.start,
             layers: out,
             parts,
+            direct,
             nb,
             unpack,
         })
@@ -830,45 +867,38 @@ impl SwapSource for Ds41Swap {
         &self.parts
     }
 
+    /// The files a flip's copy reads with O_DIRECT: the shards and the
+    /// sidecar its experts' parts run in, the paths the machine opens.
+    fn files(&self) -> Vec<PathBuf> {
+        self.direct.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    /// Part `part` of layer `layer`'s expert `id` as the run of the file it
+    /// lives in: the sidecar's for a gate or an up when the host reads one,
+    /// else the shard's — the same bytes the load's host set holds.
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
         const WHAT: &str = "Ds41Swap::source";
-        let t = &self.layer(layer, WHAT)?.tensors[part];
-        let per = *self
-            .parts
-            .get(part)
-            .ok_or_else(|| shape(WHAT, format!("part {part} of an expert of three")))?;
-        let src = self.pair.source();
-        let whole = match src.sidecar().filter(|_| part < 2) {
-            Some(side) => side.data(&t.name).map_err(|e| GpuError::plan(WHAT, e))?,
-            None => {
-                let split = src.split();
-                let (s, info) = split.find(&t.name).ok_or(GpuError::Tensor {
-                    what: WHAT,
-                    name: t.name.clone(),
-                    need: "a routed stack of the split",
-                })?;
-                split
-                    .shard(s)
-                    .ok_or_else(|| shape(WHAT, format!("shard {s} of the split")))?
-                    .data(info)
-                    .map_err(|e| GpuError::plan(WHAT, e))?
-            }
-        };
-        let at = id as usize * per;
-        let bytes = whole.get(at..at + per).ok_or_else(|| {
-            shape(
-                WHAT,
-                format!(
-                    "layer {layer} expert {id}: past the {} bytes of {}",
-                    whole.len(),
-                    t.name
-                ),
-            )
-        })?;
-        Ok(Piece {
-            bytes,
-            transform: Transform::Identity,
+        if self.parts.get(part).is_none() {
+            return Err(shape(WHAT, format!("part {part} of an expert of three")));
+        }
+        let (file, at) = self.run(layer, id, part, WHAT)?;
+        let i = self
+            .direct
+            .iter()
+            .position(|(f, _)| *f == file)
+            .ok_or_else(|| shape(WHAT, format!("{file}: not one of the source's files")))?;
+        Ok(Piece::File {
+            file: FileId(i),
+            range: at,
         })
+    }
+
+    /// A run's bytes land its file offset's skew in the window
+    /// ([`DIRECT`]).
+    fn skew(&self, layer: usize, id: u32, part: usize) -> Result<usize, GpuError> {
+        const WHAT: &str = "Ds41Swap::skew";
+        let (_, at) = self.run(layer, id, part, WHAT)?;
+        Ok((at.start % DIRECT as u64) as usize)
     }
 
     fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
