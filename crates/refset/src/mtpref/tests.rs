@@ -67,6 +67,7 @@ fn write_set(dir: &Path, model: &str, build: &str, arch: &str, rows: &[&str], co
         format!("# build\t{build}"),
         format!("# arch\t{arch}"),
         "# model_file\tM-00001-of-00006.gguf".to_string(),
+        "# tokens\t4,8,15".to_string(),
         "# spec\tmtp:n_max=1".to_string(),
     ];
     lines.extend(COLUMNS.iter().map(|c| c.to_string()));
@@ -164,6 +165,7 @@ fn an_mtp_set_reads_by_its_column_lines() {
     assert_eq!((v1.carry, v1.accepted, v1.targets()), (1, 0, &[21][..]));
     assert_eq!(set.blocks(), [0, 1]);
     assert_eq!(set.plain, [Plain { pos: 130, token: 7 }]);
+    assert_eq!(set.tokens.as_deref(), Some(&[4, 8, 15][..]));
     let p = MTP.check_set(&dir).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
         (p.dumped_from.as_str(), p.build.as_deref(), p.draft),
@@ -223,6 +225,27 @@ fn an_mtp_set_of_another_arch_is_foreign() {
             field: "arch", got, ..
         }) if got == "x" => {}
         r => panic!("a set of architecture x: {r:?}"),
+    }
+    remove(&dir);
+}
+
+/// A family whose draft layer is the target file's takes no draft file: a
+/// set stating one is foreign by its `draft_model`, never read past it.
+#[test]
+fn a_draft_file_for_a_family_without_one_is_foreign() {
+    let dir = set_dir("draft");
+    write_set(&dir, MODEL, MTP_BUILD, ARCH, &own_rows(), true);
+    let path = dir.join("MANIFEST.tsv");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+    let text = text.replacen("# build", "# draft_model\t/models/P/draft.gguf\n# build", 1);
+    std::fs::write(&path, text).unwrap_or_else(|e| panic!("{e}"));
+    match MtpSet::open(&dir, &MTP) {
+        Err(RefError::Foreign {
+            field: "draft_model",
+            got,
+            ..
+        }) if got == "/models/P/draft.gguf" => {}
+        r => panic!("a set stating a draft file: {r:?}"),
     }
     remove(&dir);
 }

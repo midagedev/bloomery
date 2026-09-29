@@ -52,6 +52,7 @@ pub mod latent;
 pub mod linear;
 pub mod model;
 pub mod moe_fused;
+pub mod mtp;
 pub mod mxfp4;
 pub mod ple;
 pub mod probe;

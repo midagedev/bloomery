@@ -11,6 +11,7 @@
 generate_ds41   add                                     0          0
 generate_ds41   argmax_fault                            0          0
 generate_ds41   argmax_finite_fault                     0          0
+generate_ds41   argmax_p_rows_fault                     0          0
 generate_ds41   argmax_rows_fault                       0          0
 generate_ds41   argmax_rows_finite_fault                0          0
 generate_ds41   cand_block_max                          0          0
@@ -171,6 +172,7 @@ generate_ds41   kv_append_pos_buf                       0          0
 generate_ds41   kv_norm_rope_append                     0          0
 generate_ds41   latent_rms_append                       0          0
 generate_ds41   moe_combine                             0          0
+generate_ds41   mtp_input                               0          0
 generate_ds41   norm_quant                              0          0
 generate_ds41   ple_conv                                0          0
 generate_ds41   ple_gate                                0          0
@@ -202,6 +204,7 @@ generate_ds41   q8_0_gemv_heads                         0          0
 generate_ds41   q8_0_gemv_heads_mcol                    0          0
 generate_ds41   q8_0_gemv_mcol                          0          0
 generate_ds41   q8_0_gemv_sel                           0          0
+generate_ds41   q8_0_gemv_sel_f32                       0          0
 generate_ds41   q8_1_quantize_ord                       0          0
 generate_ds41   q8_1_quantize_gated                         0          0
 generate_ds41   q8_1_quantize_sel                       0          0
@@ -242,6 +245,7 @@ generate_ds41   weighted_sum                            0          0
 gate_e2e        add                                     0          0
 gate_e2e        argmax_fault                            0          0
 gate_e2e        argmax_finite_fault                     0          0
+gate_e2e        argmax_p_rows_fault                     0          0
 gate_e2e        argmax_rows_fault                       0          0
 gate_e2e        argmax_rows_finite_fault                0          0
 gate_e2e        cand_block_max                          0          0
@@ -330,6 +334,7 @@ gate_e2e        kv_append_pos_buf                       0          0
 gate_e2e        kv_norm_rope_append                     0          0
 gate_e2e        latent_rms_append                       0          0
 gate_e2e        moe_combine                             0          0
+gate_e2e        mtp_input                               0          0
 gate_e2e        norm_quant                              0          0
 gate_e2e        ple_conv                                0          0
 gate_e2e        ple_gate                                0          0
@@ -361,6 +366,7 @@ gate_e2e        q8_0_gemv_heads                         0          0
 gate_e2e        q8_0_gemv_heads_mcol                    0          0
 gate_e2e        q8_0_gemv_mcol                          0          0
 gate_e2e        q8_0_gemv_sel                           0          0
+gate_e2e        q8_0_gemv_sel_f32                       0          0
 gate_e2e        q8_1_quantize_ord                       0          0
 gate_e2e        q8_1_quantize_gated                         0          0
 gate_e2e        q8_1_quantize_sel                       0          0

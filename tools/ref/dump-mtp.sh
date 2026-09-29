@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Produce the GLM-5.3-Flash MTP draft oracle set: every node ik computes on its MTP context while the
+# Produce an MTP draft oracle set — GLM-5.3-Flash's or Qwen3.8-Flash-Next's, by the profile: every node ik computes on its MTP context while the
 # target decodes a fixed prompt greedily with one MTP draft token a round, as raw f32, into
 # $BLOOMERY_DATA/ref-mtp/<set>/ (dump_mtp.cpp's header describes the files and the manifest).
 #
@@ -15,26 +15,50 @@
 # REF_DUMP_ARGS, so the loader populates the split set. IK_PREGATE (an instrumentation read in the
 # tree's target graph) is removed from the dumper's environment.
 #
+# The qwen4exp profile's set is the same loop over Qwen3.8: the first 64 ids of its prose (the d1k
+# variant's ids file, models/qwen4exp.sh, sha256 checked), 64 positions at n_max = 1, the shared draft
+# file beside the target (-md, QWEN38_MTP_DRAFT; ik's ctx_mtp runs build_qwen4exp's MTP graph over it and
+# the target's token_embd and output), into ref-mtp/qwen4exp_prose64_n64_k1 (refset family mtp-qwen4exp).
+# One dump_mtp serves both profiles: the tree the glm5next profile names (GLM_MTP_IK at GLM_MTP_SHA) is
+# upstream's qwen4exp MTP graph with glm5next's merged on, and this script reads the two names from that
+# profile, their one owner; build it with `just build-ref-dump-mtp`.
+#
 # The dump runs under the machine-wide CPU lease (32 threads, the whole split set paged in). Pick the
-# profile on the Mac side: BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/dump-mtp.sh'.
-#   MTP_SET_NAME     the set's name under ref-mtp (default prose64_n64_k1)
+# profile on the Mac side: BLOOMERY_MODEL=glm5next|qwen4exp ./tools/box.sh 'bash tools/ref/dump-mtp.sh'.
+#   MTP_SET_NAME     the set's name under ref-mtp (default prose64_n64_k1, qwen4exp_prose64_n64_k1)
 #   REF_THREADS      ik's -t (default 32)
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-[ "$MODEL_NAME" = glm5next ] ||
-  { echo "dump-mtp.sh: the MTP oracle is GLM-5.3-Flash's; this command picked the $MODEL_NAME profile" >&2; exit 2; }
-IK=$GLM_MTP_IK
+DRAFT_ARGS=()
+case $MODEL_NAME in
+  glm5next)
+    MTP_IK=$GLM_MTP_IK MTP_SHA=$GLM_MTP_SHA
+    TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE TOKENS_SHA256=$GLM_PROSE_SHA256
+    SET=${MTP_SET_NAME:-prose64_n64_k1} ;;
+  qwen4exp)
+    read -r MTP_IK MTP_SHA < <(bash -c 'source "$1" && printf "%s %s\n" "$GLM_MTP_IK" "$GLM_MTP_SHA"' _ \
+      "${BASH_SOURCE[0]%/*}/models/glm5next.sh")
+    [ -n "${MTP_IK:-}" ] && [ -n "${MTP_SHA:-}" ] ||
+      { echo "dump-mtp.sh: models/glm5next.sh names no GLM_MTP_IK and GLM_MTP_SHA" >&2; exit 2; }
+    ref_step_variant d1k || { echo "dump-mtp.sh: the qwen4exp profile has no d1k variant" >&2; exit 2; }
+    TOKENS_FILE=$STEP_TOKENS_FILE TOKENS_SHA256=$STEP_TOKENS_SHA256
+    # The refset family's DRAFT (crates/refset/src/arch/qwen4exp/mtp.rs): the set's `# draft_model` must name it.
+    QWEN38_MTP_DRAFT=/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+    [ -f "$QWEN38_MTP_DRAFT" ] || { echo "dump-mtp.sh: no draft file at $QWEN38_MTP_DRAFT" >&2; exit 2; }
+    DRAFT_ARGS=(-md "$QWEN38_MTP_DRAFT")
+    SET=${MTP_SET_NAME:-qwen4exp_prose64_n64_k1} ;;
+  *) echo "dump-mtp.sh: the MTP oracle is GLM-5.3-Flash's or Qwen3.8-Flash-Next's; this command picked the" \
+       "$MODEL_NAME profile" >&2; exit 2 ;;
+esac
+IK=$MTP_IK
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 
-TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
-TOKENS_SHA256=$GLM_PROSE_SHA256
 N_PROMPT=64
 N_PREDICT=64
 SPEC=mtp:n_max=1
 CTX=512
-SET=${MTP_SET_NAME:-prose64_n64_k1}
 THREADS=${REF_THREADS:-32}
 case $SET in
   */*|.*|*.staging|*.old|'') echo "dump-mtp.sh: '$SET' cannot name a set" >&2; exit 2 ;;
@@ -63,7 +87,7 @@ SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
 rec() { awk -v k="$1" '$1 == k { print $2 }' "$BIN.build" 2>/dev/null || true; }
 stale=()
 [ "$(rec source_sha256)" = "$SRC_SHA" ] || stale+=("$SRC (sha256 ${SRC_SHA:0:12}; the binary's record names '$(rec source_sha256 | cut -c1-12)')")
-[ "$(rec build)" = "$GLM_MTP_SHA" ] || stale+=("the ik build (the record names '$(rec build)', the profile $GLM_MTP_SHA)")
+[ "$(rec build)" = "$MTP_SHA" ] || stale+=("the ik build (the record names '$(rec build)', the profile $MTP_SHA)")
 for lib in "${LIBS[@]}"; do
   if [ "$lib" -nt "$BIN" ]; then stale+=("$lib (mtime $(date -u -r "$lib" +%Y-%m-%dT%H:%M:%SZ))"); fi
 done
@@ -76,11 +100,11 @@ fi
 # Read-only as root in the serving user's tree: no optional index refresh, so no root-owned .git file.
 ikgit() { GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' -C "$IK" "$@"; }
 head=$(ikgit rev-parse --short=8 HEAD)
-if [ "$head" != "$GLM_MTP_SHA" ] || ! ikgit diff --quiet HEAD; then
-  echo "dump-mtp.sh: $IK is at $head (or changed), not a clean $GLM_MTP_SHA — rebuild: just build-ref-dump-mtp" >&2
+if [ "$head" != "$MTP_SHA" ] || ! ikgit diff --quiet HEAD; then
+  echo "dump-mtp.sh: $IK is at $head (or changed), not a clean $MTP_SHA — rebuild: just build-ref-dump-mtp" >&2
   exit 3
 fi
-BUILD=$GLM_MTP_SHA
+BUILD=$MTP_SHA
 
 [ -f "$TOKENS_FILE" ] || { echo "dump-mtp.sh: no ids file at $TOKENS_FILE" >&2; exit 2; }
 got=$(sha256sum "$TOKENS_FILE" | cut -d' ' -f1)
@@ -112,15 +136,16 @@ t0=$(date +%s)
 # than hold the lease.
 lease_bounded "${BLOOMERY_DUMP_BOUND:-1800}" env -u IK_PREGATE CUDA_VISIBLE_DEVICES= \
   BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
-  "$BIN" -m "$MODEL" --expect-arch glm5next --tokens-file "$TOKENS_FILE" --tokens-count "$N_PROMPT" \
-    -n "$N_PREDICT" --spec-type "$SPEC" -ngl 0 -c "$CTX" -t "$THREADS"
+  "$BIN" -m "$MODEL" "${DRAFT_ARGS[@]}" --expect-arch "$MODEL_NAME" --tokens-file "$TOKENS_FILE" \
+    --tokens-count "$N_PROMPT" -n "$N_PREDICT" --spec-type "$SPEC" -ngl 0 -c "$CTX" -t "$THREADS"
 echo "dump-mtp.sh: dump in $(($(date +%s) - t0)) s"
 witness post-dump
 
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" ||
   { echo "dump-mtp.sh: the staged set has no completion trailer — not installing it" >&2; exit 1; }
-# A set names its model by the first shard's full path (`# model`); a set of another file is not replaced.
-model_of() { awk -F'\t' '$1 == "# model" { print $2 }' "$1"; }
+# A set names its model by the first shard's full path (`# model`) and, for Qwen3.8, its draft file
+# (`# draft_model`); a set of other files is not replaced.
+model_of() { awk -F'\t' '$1 == "# model" || $1 == "# draft_model" { print $2 }' "$1" | paste -sd' ' -; }
 if [ -f "$REF/MANIFEST.tsv" ] && [ "$(model_of "$REF/MANIFEST.tsv")" != "$(model_of "$STAGE/MANIFEST.tsv")" ]; then
   echo "dump-mtp.sh: $REF holds a set of $(model_of "$REF/MANIFEST.tsv"), this dump is of" \
     "$(model_of "$STAGE/MANIFEST.tsv") — not replacing it (the staged set stays in $STAGE)" >&2

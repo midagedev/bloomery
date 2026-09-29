@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Build the GLM-5.3-Flash MTP oracle on the box: dump_mtp linked against the ik tree that carries the
-# glm5next MTP graph, the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA (tools/ref/models/glm5next.sh).
+# Build the MTP oracle on the box: dump_mtp linked against the ik tree that carries the glm5next MTP
+# graph, the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA (tools/ref/models/glm5next.sh). The tree is
+# upstream's, whose qwen4exp graph builds the MTP layer, with glm5next's merged on: the one binary serves
+# the qwen4exp profile's dump too (dump-mtp.sh), and it is built under the glm5next profile only.
 # Runs under tools/box.sh (as root); the ik tree belongs to `user`, so every git and cmake step in it
 # runs as that user.
 #
@@ -19,7 +21,8 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
 [ "$MODEL_NAME" = glm5next ] ||
-  { echo "build-dump-mtp: the MTP oracle is GLM-5.3-Flash's; this command picked the $MODEL_NAME profile" >&2; exit 2; }
+  { echo "build-dump-mtp: dump_mtp is built under the glm5next profile (it serves the qwen4exp dump too); this" \
+      "command picked the $MODEL_NAME profile" >&2; exit 2; }
 export IK=$GLM_MTP_IK
 # shellcheck source=tools/ref/ref-build-common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
