@@ -1,0 +1,31 @@
+# Where the Qwen3.8 ubatch walk's layer-batch loses the 51-55 ms at P = 4096 that the flow-(a) model leaves out
+# (rig-log 09-29 #q38wide-pp: measured 287.6, model 232.5-237 a layer-batch; 33.1 vs 28.8 at P = 512), read from the
+# BLOOMERY_STEP_STATS records `stat prompt38 split` and `stat prompt38 lb`, ours only, one lease. The paper's brackets
+# (reports/q38gap Part A): the union in situ 211-225 ms a layer-batch (the 210.1 fit of 09-28 #q38-union's tiled
+# t(m) = 49.91 + 5.15 (m - 10) us an expert, plus the serve's serial routing scan and plan build, 1-3 ms); the front's
+# GEMM rate 12-15 ms a GDN layer at the model's implied 31 TOPS, 23-41 at 15-25 TOPS; the 12 QSA layers' selection
+# attention 12.9 GB each at P = 4096 (quadratic: 6.29M key-reads x 2 KiB), 12-45 ms each at 350-700 GB/s; the PCIe
+# down 1.7-2.0 ms (the model counted 0.4); the upload 1.7-2.0 and the back ~0.2. The paper's sum brackets the gap
+# (34.6-61 at 4096, 3.4-6.4 at 512) without pinning its split: this row is the split.
+# Wall [derived]: the two arms ~35 s with warm rows, lease and preheat: under 5 min (the build runs before the lease).
+kind: calibration
+question: where does the Qwen3.8 ubatch walk's P = 4096 layer-batch lose the 51-55 ms the flow-(a) model leaves out?
+term: stat prompt38 split union_lb @ P = 4096, BLOOMERY_STEP_STATS=1, A6000, ours (generate_qwen3moe, the ubatch walk,
+  the lcg prompt), the 48 layer-batches' mean
+unit: ms
+predict: 211..225
+condition: BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_WARM_ROWS=1 BLOOMERY_THREADS=32
+  BLOOMERY_LEASE_CARD=docs/cards/q38gap-split.card' just depth-gpu-qwen4exp 512 4096, the full output to a file
+  first; the arms' plan text reads ubatch:512 and ubatch:4096; every lb line carries its card fields; no counted row
+  [cold] or [other-busy]
+decide-in: the union sits on the fit plus the serial serve, so the gap is the front and the copies: read card_front_lb
+  by layer kind (GDN rows 12-15 ms confirm the model's 31 TOPS, 23-41 the front hypothesis; the QSA rows' excess over
+  the GDN rows is the selection attention, 12-45 confirms it) and card_down_lb (1.7-2.0 confirms the pinned copy rate,
+  ~0.4 the model's term); re-derive F from the measured fronts and re-price q38stream's flows on the measured terms
+decide-below: the union runs under the fit: the routing's real spread or the in-situ slope is cheaper than the bench's;
+  re-fit t(m) from this row's union_ms and slots before q38stream's k(U)
+decide-above: the union is slower in situ: the serial serve prices as union_ms(512) - 25.6 (the known fit), scaled by
+  the column count; what is left past it is slope or skew x convexity, and needs the route taps or one nsys of the
+  P = 4096 prompt before q38stream is priced
+reason: the flow-(a) model's terms (union t(m), F, PCIe) are constants every Qwen3.8 prefill prediction reads; this
+  row re-measures them in situ after the q38wide-pp row fell under its band
