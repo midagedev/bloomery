@@ -1284,8 +1284,10 @@ pub(super) struct WideTiming {
 impl WideTiming {
     /// Timing for `layers` layers over one stream's context. Load-time only.
     pub(super) fn new(ctx: &Arc<CudaContext>, layers: usize) -> Result<WideTiming, GpuError> {
+        // Timed events: `new_event(None)` makes a sync-only event, whose
+        // `elapsed_ms` the driver refuses.
         let marks = (0..layers * MARKS)
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WideTiming {
             marks,
