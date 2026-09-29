@@ -101,6 +101,7 @@ pub mod run;
 pub mod slots;
 pub mod step;
 pub mod swap;
+pub mod swap_source;
 pub mod tier;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};

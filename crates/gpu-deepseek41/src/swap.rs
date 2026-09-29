@@ -1,7 +1,8 @@
 //! V4.1's side of adaptive expert residency ([`bloomery_gpu::host::swap`]):
-//! where a routed expert's bytes come from when the machine moves it onto the
-//! stage card, where they go, and whether the host can serve an expert the
-//! card gives up ([`Ds41Swap`], the model's [`SwapSource`]).
+//! the model's [`FileStacks`] for the common file source
+//! (`bloomery_gpu::host::swap_source::FileSwap`) — [`Ds41Stacks`], its gate,
+//! up and down and the r8 unpack of a staged gate or up — with the load's
+//! churn pool ([`churn`]) and the machine's live delay and deadline.
 //!
 //! **Parts.** An expert is three parts in stack order: gate and up (Q3_K,
 //! `ff` rows of `n_embd` values each) and down (Q4_K, `n_embd` rows of `ff`).
@@ -9,50 +10,35 @@
 //! byte `s · part` of its layer's stack, which the placed load uploads as
 //! file bytes in slot order.
 //!
-//! **Sources.** The host reads its routed gates and ups from the r8 sidecar
-//! when the load reads one (`BLOOMERY_R8`), so those are the bytes the load's
-//! host set holds, and the down from the source file. A staged gate or up is
-//! then the r8 row-lane layout, not Q3_K: once its bytes are in the slot,
-//! [`R8Kernels`] turns them into the Q3_K bytes in place on the copy stream
-//! (`ds41_r8_q3k_groups`, the inverse of `qdot::repack_q3k_r8`, bit for bit
-//! `qdot::unpack_q3k_r8`). A group of eight rows is the same byte range in
-//! both layouts, so one block reads its group into shared memory and writes
-//! it back as Q3_K rows: no scratch part and no device-to-device copy. The
-//! host alternative, `qdot::unpack_q3k_r8` on the staging thread, is a scalar
-//! bit gather of about 6.7k operations per 110-byte block, ~6·10⁸ for the
-//! 92,160 blocks of a gate and an up [derived]: several steps' worth a flip.
-//! Under `BLOOMERY_R8=off` every part is the source's bytes and nothing is
-//! converted.
-//!
-//! **Host residency.** The host serves an expert from resident pages when
-//! every byte it reads for it — the sidecar's (or source's) gate and up and
-//! the source's down — lies in the load's host set and is in the page cache
-//! now ([`HostSet::serves`], `mincore`): the set says what the load read in
-//! and locked, the page cache what a step would fault on. A victim outside
-//! the set is not host-resident whatever the page cache holds, so the
-//! machine refuses its flip by name. The load puts each layer's churn pool —
-//! its stage card experts past the pinned ones ([`ChurnPool`]) — in the set.
+//! **The unpack.** The host reads its routed gates and ups from the r8
+//! sidecar when the load reads one (`BLOOMERY_R8`), so those are the bytes
+//! the load's host set holds, and the down from the source file. A staged
+//! gate or up is then the r8 row-lane layout, not Q3_K: once its bytes are in
+//! the slot, [`R8Kernels`] turns them into the Q3_K bytes in place on the
+//! copy stream (`ds41_r8_q3k_groups`, the inverse of `qdot::repack_q3k_r8`,
+//! bit for bit `qdot::unpack_q3k_r8`). A group of eight rows is the same byte
+//! range in both layouts, so one block reads its group into shared memory and
+//! writes it back as Q3_K rows: no scratch part and no device-to-device
+//! copy. The host alternative, `qdot::unpack_q3k_r8` on the staging thread,
+//! is a scalar bit gather of about 6.7k operations per 110-byte block, ~6·10⁸
+//! for the 92,160 blocks of a gate and an up [derived]: several steps' worth
+//! a flip. Under `BLOOMERY_R8=off` every part is the source's bytes and
+//! nothing is converted.
 
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bloomery_gpu::host::swap::{MachineCfg, Piece, Residency, SwapSource, Transform};
-use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::weights::Weights;
+use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::host::swap_source::{Convert, FileStacks};
 use bloomery_gpu::{GpuError, launch_u32, window};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::vector::U32x4;
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
-use gguf::Split;
+use gguf::quant::GgmlType;
 use model::arch::deepseek41::names;
+use model::placement::Plan;
 use model::placement::churn::ChurnPool;
-use model::placement::host_lock::{HostFile, HostSet, expert_run};
-use model::placement::{ModelTensor, Plan};
-use model::r8file::R8Pair;
-
-use crate::chain::ffn::CardStacks;
 
 /// Passes from the boundary that makes a flip to the one it lands at. The
 /// victims are host-resident (the churn pool), so a flip waits on no NVMe
@@ -591,17 +577,16 @@ impl R8Kernels {
 /// The unpack's shape of a gate or an up of `ff` rows of `n_embd`, else
 /// refused by name: whole super-blocks of 256 a row, and gate and up parts
 /// (`parts[0]`, `parts[1]`) of exactly those rows as Q3_K.
-fn unpack_shape(n_embd: usize, ff: usize, parts: [usize; 3]) -> Result<(), GpuError> {
+fn unpack_shape(n_embd: usize, ff: usize, parts: &[usize]) -> Result<(), GpuError> {
     let q3k = ff * (n_embd / 256) * Q3K_BLOCK;
-    if n_embd.is_multiple_of(256) && parts[0] == q3k && parts[1] == q3k {
+    if n_embd.is_multiple_of(256) && parts.first() == Some(&q3k) && parts.get(1) == Some(&q3k) {
         return Ok(());
     }
     Err(shape(
-        "Ds41Swap::new",
+        "Ds41Stacks::open",
         format!(
             "the unpack of gates and ups of {ff} rows of {n_embd}: whole super-blocks of 256 and \
-             parts of {q3k} bytes, the stacks hold {:?}",
-            &parts[..2]
+             parts of {q3k} bytes, the stacks hold {parts:?}"
         ),
     ))
 }
@@ -613,352 +598,74 @@ fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
     }
 }
 
-/// One layer's parts: the file tensors, the stage stacks' base addresses and
-/// slots, and each part's bytes.
-struct LayerParts {
-    tensors: [ModelTensor; 3],
-    base: [sys::CUdeviceptr; 3],
-    slots: usize,
+/// The K-quant types of V4.1's three stacks, in stack order: the Q3_K gate
+/// and up and the Q4_K down its kernels read.
+const TYPES: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
+
+/// V4.1's [`FileStacks`] for the common file source: each layer's gate, up
+/// and down by name, and under the r8 sidecar the unpack of a staged gate or
+/// up into its slot's Q3_K bytes ([`R8Unpack`]).
+pub struct Ds41Stacks;
+
+impl FileStacks for Ds41Stacks {
+    fn names(&self, layer: usize) -> Vec<String> {
+        vec![
+            names::ffn_gate_exps(layer),
+            names::ffn_up_exps(layer),
+            names::ffn_down_exps(layer),
+        ]
+    }
+
+    fn types(&self) -> &'static [GgmlType] {
+        &TYPES
+    }
+
+    fn open(
+        &self,
+        dims: &[u64],
+        parts: &[usize],
+        sidecar: bool,
+        ctx: &Arc<CudaContext>,
+    ) -> Result<Option<Arc<dyn Convert>>, GpuError> {
+        if !sidecar {
+            return Ok(None);
+        }
+        let (n_embd, ff) = (dims[0] as usize, dims[1] as usize);
+        unpack_shape(n_embd, ff, parts)?;
+        let nb = n_embd / 256;
+        let kernels = R8Kernels::load(ctx)?;
+        Ok(Some(Arc::new(R8Unpack {
+            kernels,
+            parts: parts.to_vec(),
+            nb,
+        })))
+    }
 }
 
-/// V4.1's [`SwapSource`] over one placed load's stage card.
-pub struct Ds41Swap {
-    pair: R8Pair,
-    set: HostSet,
-    experts: u64,
-    first: usize,
-    layers: Vec<Option<LayerParts>>,
-    parts: [usize; 3],
+/// The r8 unpack as a [`Convert`]: a gate or an up staged from the sidecar
+/// holds the r8 row-lane layout, unpacked in place into Q3_K
+/// ([`R8Kernels::enqueue_in_place`]).
+struct R8Unpack {
+    kernels: R8Kernels,
+    parts: Vec<usize>,
     /// Super-blocks of each row of a gate or up part.
     nb: usize,
-    /// The unpack, when the host's gates and ups are the sidecar's.
-    unpack: Option<R8Kernels>,
 }
 
-// SAFETY: the stack addresses are plain device pointers into allocations the
-// model keeps in place until the machine's copy stream has drained (the
-// model's drop stops the machine before it frees them); the unpack kernels
-// are used from the one thread that drives the machine (`convert`), and
-// everything the staging thread reads (`source`, `prepare_victim`) is the
-// split's and the sidecar's read-only mappings and the set.
-unsafe impl Send for Ds41Swap {}
-// SAFETY: as for `Send`: no call mutates shared state.
-unsafe impl Sync for Ds41Swap {}
-
-impl Ds41Swap {
-    /// The source of `plan`'s card `card`, whose layers `layers` hold their
-    /// routed stacks in `w`: the split `file` and the host reading `r8` the
-    /// load took (the same sidecar open as the host set's), and `set`, the
-    /// host set the load read in. Refused by name: a set the load did not
-    /// populate (`populated`), a layer whose stacks are not the plan's
-    /// experts, parts not whole words, and under the r8 sidecar a gate or an
-    /// up part that is not its rows of whole Q3_K super-blocks (the unpack's
-    /// shape). Load-time only.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the load's plan, layers, file, host reading, set, stacks and context (rust-quality R8)"
-    )]
-    pub fn new(
-        plan: &Plan<'_>,
-        layers: Range<usize>,
-        file: Arc<Split>,
-        r8: bool,
-        set: HostSet,
-        populated: bool,
-        w: &Weights,
-        ctx: &Arc<CudaContext>,
-    ) -> Result<Ds41Swap, GpuError> {
-        const WHAT: &str = "Ds41Swap::new";
-        if !populated {
-            return Err(shape(
-                WHAT,
-                "adaptive residency on a load whose host set was not read in \
-                 (BLOOMERY_HOST_POPULATE=0): no expert would be host-resident",
-            ));
-        }
-        let pair = R8Pair::at_load(file, r8).map_err(|e| GpuError::plan(WHAT, e))?;
-        let experts = plan.model.experts;
-        let find = |name: String| {
-            plan.model
-                .tensors
-                .iter()
-                .find(|t| t.name == name)
-                .cloned()
-                .ok_or(GpuError::Tensor {
-                    what: WHAT,
-                    name,
-                    need: "a routed stack of the plan",
-                })
-        };
-        let mut out = Vec::with_capacity(layers.len());
-        let mut parts: Option<[usize; 3]> = None;
-        for l in layers.clone() {
-            let Some(s) = CardStacks::of(w, l)? else {
-                out.push(None);
-                continue;
-            };
-            let tensors = [
-                find(names::ffn_gate_exps(l))?,
-                find(names::ffn_up_exps(l))?,
-                find(names::ffn_down_exps(l))?,
-            ];
-            let per: [usize; 3] = std::array::from_fn(|i| {
-                usize::try_from(tensors[i].file_bytes / experts.max(1)).unwrap_or(0)
-            });
-            let stacks = [s.gate, s.up, s.down];
-            let slots = s.down.rows() / tensors[2].dims[1].max(1) as usize;
-            for (i, st) in stacks.iter().enumerate() {
-                if per[i] == 0 || !per[i].is_multiple_of(4) || st.buf().len() * 4 < slots * per[i] {
-                    return Err(shape(
-                        WHAT,
-                        format!(
-                            "layer {l} part {i}: {} bytes an expert, a stack of {} words for {slots} \
-                             slots",
-                            per[i],
-                            st.buf().len()
-                        ),
-                    ));
-                }
-            }
-            match parts {
-                Some(p) if p != per => {
-                    return Err(shape(
-                        WHAT,
-                        format!("layer {l}: parts of {per:?} bytes, earlier layers {p:?}"),
-                    ));
-                }
-                _ => parts = Some(per),
-            }
-            out.push(Some(LayerParts {
-                tensors,
-                base: stacks.map(|st| st.buf().cu_deviceptr()),
-                slots,
-            }));
-        }
-        let parts = parts.ok_or_else(|| shape(WHAT, "no layer of the card holds routed stacks"))?;
-        let t0 = out
-            .iter()
-            .flatten()
-            .next()
-            .map(|p| p.tensors[0].clone())
-            .ok_or_else(|| shape(WHAT, "no layer of the card holds routed stacks"))?;
-        let (n_embd, ff) = (t0.dims[0] as usize, t0.dims[1] as usize);
-        let nb = n_embd / 256;
-        let unpack = match pair.r8().sidecar() {
-            Some(_) => {
-                unpack_shape(n_embd, ff, parts)?;
-                Some(R8Kernels::load(ctx)?)
-            }
-            None => None,
-        };
-        Ok(Ds41Swap {
-            pair,
-            set,
-            experts,
-            first: layers.start,
-            layers: out,
-            parts,
-            nb,
-            unpack,
-        })
-    }
-
-    /// The host reads the gates and ups from the r8 sidecar, so a flip
-    /// unpacks them on the card ([`R8Kernels`]).
-    pub fn unpacks(&self) -> bool {
-        self.unpack.is_some()
-    }
-
-    /// Part `part` of layer `layer`'s expert `id` as a static load uploads
-    /// it to a card slot: the source file's bytes (gate and up Q3_K, down
-    /// Q4_K), whatever the host reads.
-    pub fn card_bytes(&self, layer: usize, id: u32, part: usize) -> Result<&[u8], GpuError> {
-        const WHAT: &str = "Ds41Swap::card_bytes";
-        let t = &self.layer(layer, WHAT)?.tensors[part.min(2)];
-        let per = *self
-            .parts
-            .get(part)
-            .ok_or_else(|| shape(WHAT, format!("part {part} of an expert of three")))?;
-        let split = self.pair.source().split();
-        let (s, info) = split.find(&t.name).ok_or(GpuError::Tensor {
-            what: WHAT,
-            name: t.name.clone(),
-            need: "a routed stack of the split",
-        })?;
-        let whole = split
-            .shard(s)
-            .ok_or_else(|| shape(WHAT, format!("shard {s} of the split")))?
-            .data(info)
-            .map_err(|e| GpuError::plan(WHAT, e))?;
-        let at = id as usize * per;
-        whole
-            .get(at..at + per)
-            .ok_or_else(|| shape(WHAT, format!("layer {layer} expert {id}: past {}", t.name)))
-    }
-
-    fn layer(&self, layer: usize, what: &'static str) -> Result<&LayerParts, GpuError> {
-        layer
-            .checked_sub(self.first)
-            .and_then(|i| self.layers.get(i))
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                shape(
-                    what,
-                    format!("layer {layer} holds no routed stack on the stage card"),
-                )
-            })
-    }
-
-    /// Where the host reads part `part` of layer `layer`'s expert `id`: the
-    /// sidecar's run for a gate or an up when the load reads one, else the
-    /// source's.
-    fn run(
-        &self,
-        layer: usize,
-        id: u32,
-        part: usize,
-        what: &'static str,
-    ) -> Result<(HostFile, Range<u64>), GpuError> {
-        let t = &self.layer(layer, what)?.tensors[part];
-        expert_run(self.pair.source(), t, self.experts, id, part < 2)
-            .map_err(|e| GpuError::plan(what, e))
-    }
-}
-
-impl SwapSource for Ds41Swap {
-    fn part_bytes(&self) -> &[usize] {
-        &self.parts
-    }
-
-    fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
-        const WHAT: &str = "Ds41Swap::source";
-        let t = &self.layer(layer, WHAT)?.tensors[part];
-        let per = *self
-            .parts
-            .get(part)
-            .ok_or_else(|| shape(WHAT, format!("part {part} of an expert of three")))?;
-        let src = self.pair.source();
-        let whole = match src.sidecar().filter(|_| part < 2) {
-            Some(side) => side.data(&t.name).map_err(|e| GpuError::plan(WHAT, e))?,
-            None => {
-                let split = src.split();
-                let (s, info) = split.find(&t.name).ok_or(GpuError::Tensor {
-                    what: WHAT,
-                    name: t.name.clone(),
-                    need: "a routed stack of the split",
-                })?;
-                split
-                    .shard(s)
-                    .ok_or_else(|| shape(WHAT, format!("shard {s} of the split")))?
-                    .data(info)
-                    .map_err(|e| GpuError::plan(WHAT, e))?
-            }
-        };
-        let at = id as usize * per;
-        let bytes = whole.get(at..at + per).ok_or_else(|| {
-            shape(
-                WHAT,
-                format!(
-                    "layer {layer} expert {id}: past the {} bytes of {}",
-                    whole.len(),
-                    t.name
-                ),
-            )
-        })?;
-        Ok(Piece {
-            bytes,
-            transform: Transform::Identity,
-        })
-    }
-
-    fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
-        const WHAT: &str = "Ds41Swap::dest";
-        let p = self.layer(layer, WHAT)?;
-        if slot as usize >= p.slots || part >= 3 {
-            return Err(shape(
-                WHAT,
-                format!(
-                    "layer {layer} part {part} slot {slot}: {} slots of 3 parts",
-                    p.slots
-                ),
-            ));
-        }
-        Ok(p.base[part] + (slot as usize * self.parts[part]) as u64)
-    }
-
-    /// A gate or an up staged from the sidecar is its r8 layout: unpacked in
-    /// place into Q3_K ([`R8Kernels::enqueue_in_place`]).
+impl Convert for R8Unpack {
     fn convert(
         &self,
-        _layer: usize,
         part: usize,
         dst: sys::CUdeviceptr,
         stream: &CudaStream,
     ) -> Result<(), GpuError> {
-        match (&self.unpack, part) {
-            (Some(k), 0 | 1) => {
-                let words = self.parts[part] / 4;
-                k.enqueue_in_place(stream, dst, words, self.nb)
-            }
+        match part {
+            0 | 1 => self
+                .kernels
+                .enqueue_in_place(stream, dst, self.parts[part] / 4, self.nb),
             _ => Ok(()),
         }
     }
-
-    fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
-        const WHAT: &str = "Ds41Swap::prepare_victim";
-        for part in 0..3 {
-            let (file, at) = self.run(layer, id, part, WHAT)?;
-            self.set
-                .populate_run(self.pair.source(), &file, &at)
-                .map_err(|e| GpuError::plan(WHAT, e))?;
-        }
-        Ok(())
-    }
-
-    fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError> {
-        const WHAT: &str = "Ds41Swap::host_resident";
-        for part in 0..3 {
-            let (file, at) = self.run(layer, id, part, WHAT)?;
-            let serves = self
-                .set
-                .serves(self.pair.source(), &file, &at)
-                .map_err(|e| GpuError::plan(WHAT, e))?;
-            if !serves {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Nothing: every stage card expert the machine can move is the churn
-    /// pool's, which the load's host set holds for the model's life, and
-    /// the host never reads the rest of a card expert's bytes (the source's
-    /// gate and up under the sidecar), which the load already released. The
-    /// reset lets go of no byte the host set held, so it reports 0.
-    fn release_host(&self, _layer: usize, _id: u32) -> Result<u64, GpuError> {
-        Ok(0)
-    }
-}
-
-/// The machine's shape for a V4.1 load under `residency` over `map`: the
-/// `mid` rule at [`LIVE_DELAY`], `pinned` of it per layer (a layer's card
-/// holds fewer is the machine's refusal), `top_k` ids a row, passes of up to
-/// `max_rows` rows. `None` for `off`.
-#[must_use]
-pub fn machine_cfg(
-    residency: Residency,
-    map: &SlotMap,
-    top_k: usize,
-    max_rows: usize,
-) -> Option<MachineCfg> {
-    let (params, pinned) = residency.params(LIVE_DELAY)?;
-    Some(MachineCfg {
-        params,
-        pinned: vec![pinned; map.layers().len()],
-        top_k,
-        max_rows,
-        deadline: DEADLINE,
-    })
 }
 
 /// The churn pool a V4.1 load under `residency` holds in its host set: card
@@ -1037,13 +744,13 @@ mod tests {
     fn the_unpack_shape_is_whole_q3k_rows() {
         let (n_embd, ff) = (4096, 2048);
         let q3k = ff * (n_embd / 256) * Q3K_BLOCK;
-        unpack_shape(n_embd, ff, [q3k, q3k, 7]).expect("whole Q3_K rows");
+        unpack_shape(n_embd, ff, &[q3k, q3k, 7]).expect("whole Q3_K rows");
         for (n, parts, why) in [
             (n_embd + 128, [q3k, q3k, 7], "a row past whole super-blocks"),
             (n_embd, [q3k + 4, q3k, 7], "a gate part of another size"),
             (n_embd, [q3k, q3k - 4, 7], "an up part of another size"),
         ] {
-            assert!(unpack_shape(n, ff, parts).is_err(), "{why} is refused");
+            assert!(unpack_shape(n, ff, &parts).is_err(), "{why} is refused");
         }
     }
 
