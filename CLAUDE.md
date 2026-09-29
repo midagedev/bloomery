@@ -13,7 +13,9 @@ machine changes and upstream work. It is `GADAK_HOME=$HOME/.gadak gadak --worksp
 on the Mac use `/opt/homebrew/bin/gadak` (the dev build on PATH cannot read the mirror schema).
 Comments are `gadak --workspace gdk comment <KEY> "<body>"` — not `issue comment`.
 One issue per stage (MUL-1 to MUL-5), machine changes in MUL-6, upstream in MUL-7.
-Measured numbers are written first in `log/` of [rig-log](https://github.com/midagedev/rig-log) and linked from the triage item or the issue.
+A round's detail (sitting tables, [derived] predictions, round and sitting names, per-commit history) lives in this
+repo's docs. A [rig-log](https://github.com/midagedev/rig-log) `log/` section holds only what was measured on this machine,
+how much, and what it showed, and links here for the detail; the triage item or the issue links that section.
 Do not open `TODO.md`.
 
 ## Delegation
@@ -31,9 +33,10 @@ Commits and pushes are lead-only.
 ## Writing to rig-log
 
 Measurement records go in `log/` of `~/repo/rig-log`. That repo's rules are not loaded automatically in this session,
-so read `~/repo/rig-log/CLAUDE.md` before writing a record. Three things that are easy to miss:
+so read `~/repo/rig-log/CLAUDE.md` before writing a record. Four things that are easy to miss:
 
 - **It is a public repo.** Before committing, grep for `192.168`, addresses in the `100.` range, `.ts.net` and `admin`. Never
   include BMC addresses or credentials, or the nvidia-bug-report archive from the box's `/root` (it contains the hostname).
 - Write only what was measured; when something is wrong, do not delete it — strike it through and correct it.
 - Disclose AI help in prose; no Claude badge.
+- rig-log commits pass `tools/check-log.py` (its pre-commit hook); that file's header holds the limits.
