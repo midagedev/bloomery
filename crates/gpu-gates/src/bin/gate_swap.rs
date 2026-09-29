@@ -1626,6 +1626,25 @@ mod gate {
         pinned
     }
 
+    /// priority: the machine's copy stream runs behind the engine's. At one
+    /// priority the card places a launched unpack grid's pending blocks before
+    /// the engine's next launch, and the engine waits the unpack out.
+    fn priority(gpu: &Gpu, a: &Run) -> Result<bool, GateError> {
+        let m = a
+            .machine
+            .as_ref()
+            .ok_or("priority: the arm has no machine")?;
+        let engine = gpu.stream().priority()?;
+        let copy = m.copy_stream().priority()?;
+        let ok = copy > engine;
+        println!(
+            "priority: copy stream {copy}, engine stream {engine} (a larger value is a lower \
+             priority) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// c7: a fresh arm driven to the last boundary that made flips, so they
     /// are in flight, then reset, then the trace again from the seed.
     fn c7(
@@ -2494,6 +2513,7 @@ mod gate {
         ok &= c5(&[&a, &b, &h]);
         ok &= c6(&trace, &a)?;
         ok &= pinned(&a);
+        ok &= priority(&gpu, &a)?;
         record::residency_pass(&a.reports.last().copied().unwrap_or_default()).print();
         ok &= c7(&gpu, &pm, &trace, &a)?;
         ok &= tier(&gpu, &pm, &trace, &a)?;

@@ -1,0 +1,27 @@
+# Lead e1, 2026-09-29: residency mid-p40-s1 on --place bp decodes at about 34 tok/s after a prose prompt, its
+# steps by step mod 4 at 31 / 30 / 30 / 24 ms. The nsys split (swapprio-nsys.card) put 4.5-5.5 ms of each heavy
+# step's excess in the engine's hold behind the unpack's pending blocks, and 1.3 ms in the host leg (DMA and
+# staging share host DRAM with the tier). With the hold gone a heavy step is 24 + 1.3..2.5 ms, the cycle mean
+# 25.0..25.9 ms against 28.75: +11..+15 % [derived]; the band widens that by the trace's inflation (nsys ran the
+# steps 20 % long) to +8..+17.
+kind: ab
+question: does the swapprio tree (group unpack, copy stream behind the engine) raise residency decode by the
+  hold's share of the heavy steps?
+term: decode tok/s @ -n 96 after prose:512, BLOOMERY_RESIDENCY=mid-p40-s1, plan (b′) A6000+3090 (the 3090 at its
+  250 W cap) - (v41res - base) / base, base = main + r3fix, the two binaries paired by round
+unit: %
+predict: +8..+17
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round ratios, one run's SD about 0.55 and 1.1 %; the
+  larger
+condition: from /Users/hckim/repo/bloomery-v41res (swapprio + unpacksimt + r3fix's stop-first teardown), the base binary built in ~/repo/bloomery-v41res-base (main
+  178b06d1 + r3fix, the unpack as on main): BLOOMERY_REMOTE='~/repo/bloomery-v41res' BLOOMERY_AB_ROUNDS=3 BLOOMERY_DECODE_N=96
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_RESIDENCY=mid-p40-s1
+  BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/swapprio-ab.card' just depth-gpu-ds41 prose:512
+  bin:/root/repo/bloomery-v41res-base/target/release/generate_ds41:prose:512; the witness blocks show no Xid; no
+  row carries [cold], [cpu-busy] or [other-busy]. Box time 12..18 min [derived: 2 two-card loads a round at
+  60..110 s, 3 rounds]
+decide-in: land swapprio with unpacksimt; the residency's remaining cost is its DRAM share - re-derive it
+decide-below: read the step stats by step mod 4: if the heavy steps still run long, the hold is not the whole
+  excess - split the rest with the nsys table before any other lever
+decide-above: the static rows moved too: read whether the priority change reordered the prompt call's branches

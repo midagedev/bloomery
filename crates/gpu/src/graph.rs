@@ -305,7 +305,7 @@ impl Branch {
     /// A branch of streams of `ctx`. Load-time only.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Branch, GpuError> {
         Ok(Branch {
-            stream: ctx.new_stream()?,
+            stream: crate::role_stream(ctx, crate::StreamRole::Engine)?,
             forked: ctx.new_event(None)?,
             joined: ctx.new_event(None)?,
         })

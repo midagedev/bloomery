@@ -1102,7 +1102,7 @@ impl SwapMachine {
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
         let ledger = SlotLedger::of_map(slots)?;
-        let copy = ctx.new_stream()?;
+        let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
         let boundary_event = ctx.new_event(None)?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
