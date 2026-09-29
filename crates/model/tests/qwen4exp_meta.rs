@@ -189,12 +189,32 @@ const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_410_846), ("3090", 509_873)]
 // [derived: 67,108,864 + 512 · 668,277 + 33,554,432 = 442,821,120].
 const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_837_925_888), (512, 442_821_120)];
 
-/// The card scratch [`CARD_SCRATCH`] pins at ubatch `u`.
+// PIN(2026-09-29): the card scratch of a card-experts machine
+// (`place::machine_for_experts` under `Experts::Card`): the host rows' plus
+// the ubatch walk's card route [derived:
+// `place::card_route_scratch_bytes`: at 4,096 positions
+// 2,048 · 170,360 + 4,096 · 10,240 = 390,840,320; at 512
+// 512 · 170,360 + 512 · 10,240 = 92,467,200 — the run-token bound's
+// derivation is `place::CARD_ROUTE_RUN_TOKEN_BYTES`'s].
+const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_228_766_208), (512, 535_288_320)];
+
+/// The card scratch [`CARD_SCRATCH`] pins at ubatch `u` (a host-routed plan).
 fn scratch_at(u: u64) -> u64 {
     CARD_SCRATCH
         .iter()
         .find(|&&(x, _)| x == u)
         .map_or_else(|| panic!("CARD_SCRATCH has no row for U {u}"), |&(_, b)| b)
+}
+
+/// The card scratch [`CARD_ROUTE_SCRATCH`] pins at ubatch `u`.
+fn card_scratch_at(u: u64) -> u64 {
+    CARD_ROUTE_SCRATCH
+        .iter()
+        .find(|&&(x, _)| x == u)
+        .map_or_else(
+            || panic!("CARD_ROUTE_SCRATCH has no row for U {u}"),
+            |&(_, b)| b,
+        )
 }
 
 /// The plan of the Qwen3.8 file from its headers (`arch::qwen35moe::place`):
@@ -563,39 +583,53 @@ fn hw_qwen4exp_plan() {
 // 2,395,104,768 B, 779.7 experts at 3,072,000 B, 763 of them past the granules on the A6000 at 4k
 // (17.7 a layer).
 type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
+// PIN(2026-09-29): every row re-pinned for the ubatch walk's card route, whose
+// scratch a card-experts machine now counts beside the ubatch's
+// (`place::machine_for_experts`, `place::card_route_scratch_bytes`): 390,840,320 B
+// at U 4,096 and 92,467,200 B at 512 off every budget above [derived: the
+// budgets the rows were pinned at before the route, less its scratch, the
+// spread replayed over the 43 eligible layers — three stacks each (921,600 +
+// 921,600 + 1,228,800 B an expert) in whole 2 MiB granules past CARD_DENSE +
+// CARD_ROUNDING — by a replica that first reproduced all sixteen old rows
+// exactly, so its rows are the pins — its rounding column counted only the
+// experts' granules, and each row's rounding is the dense part's 398,422,528 B
+// plus those, as the host plans' rows carry; the biggest moves are the A6000 4k rows
+// at U 4,096 (303/302 → 299/298, 149 experts off the card) and the 3090 32k
+// row at U 4,096 (103/102 → 98, 176 experts), the smallest the rows whose
+// budget slack absorbed the term].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
         4_096,
         false,
         4_096,
-        303,
-        4,
-        302,
-        39_905_280_000,
-        466_956_800,
+        299,
+        27,
+        298,
+        39_447_552_000,
+        528_323_072,
     ),
     (
         "A6000",
         4_096,
         false,
         512,
-        320,
-        36,
         319,
-        42_249_216_000,
-        517_968_384,
+        39,
+        318,
+        42_126_336_000,
+        548_573_696,
     ),
     (
         "A6000",
         4_096,
         true,
         4_096,
-        280,
-        33,
-        279,
-        36_956_160_000,
-        622_670_336,
+        278,
+        20,
+        277,
+        36_652_032_000,
+        532_533_760,
     ),
     (
         "A6000",
@@ -603,43 +637,43 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         299,
-        26,
+        12,
         298,
-        39_444_480_000,
-        525_103_616,
+        39_401_472_000,
+        480_031_232,
     ),
     (
         "A6000",
         32_768,
         false,
         4_096,
-        296,
-        17,
-        295,
-        39_020_544_000,
-        531_706_368,
+        292,
+        41,
+        291,
+        38_565_888_000,
+        596_292_096,
     ),
     (
         "A6000",
         32_768,
         false,
         512,
-        315,
-        11,
-        314,
-        41_511_936_000,
-        437_359_104,
+        313,
+        33,
+        312,
+        41_315_328_000,
+        543_789_568,
     ),
     (
         "A6000",
         32_768,
         true,
         4_096,
-        274,
-        37,
-        273,
-        36_175_872_000,
-        526_348_800,
+        271,
+        27,
+        270,
+        35_748_864_000,
+        563_286_528,
     ),
     (
         "A6000",
@@ -647,21 +681,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         292,
-        31,
+        16,
         291,
-        38_535_168_000,
-        564_097_536,
+        38_489_088_000,
+        515_805_696,
     ),
     (
         "3090",
         4_096,
         false,
         4_096,
-        108,
-        16,
-        107,
-        14_183_424_000,
-        586_781_184,
+        105,
+        29,
+        104,
+        13_827_072_000,
+        550_965_760,
     ),
     (
         "3090",
@@ -669,21 +703,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         126,
-        41,
+        19,
         125,
-        16_637_952_000,
-        525_103_616,
+        16_570_368_000,
+        500_412_928,
     ),
     (
         "3090",
         4_096,
         true,
         4_096,
-        87,
-        30,
-        86,
-        11_452_416_000,
-        524_382_720,
+        85,
+        1,
+        84,
+        11_099_136_000,
+        485_495_296,
     ),
     (
         "3090",
@@ -691,43 +725,43 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         105,
-        28,
+        13,
         104,
-        13_824_000_000,
-        547_746_304,
+        13_777_920_000,
+        499_454_464,
     ),
     (
         "3090",
         32_768,
         false,
         4_096,
-        103,
-        4,
-        102,
-        13_486_080_000,
-        464_138_752,
+        98,
+        43,
+        98,
+        12_945_408_000,
+        618_934_784,
     ),
     (
         "3090",
         32_768,
         false,
         512,
-        120,
-        38,
         119,
-        15_836_160_000,
-        513_200_640,
+        40,
+        118,
+        15_710_208_000,
+        546_877_952,
     ),
     (
         "3090",
         32_768,
         true,
         4_096,
-        80,
-        36,
-        79,
-        10_546_176_000,
-        554_013_184,
+        78,
+        8,
+        77,
+        10_195_968_000,
+        516_248_064,
     ),
     (
         "3090",
@@ -735,10 +769,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         98,
-        32,
+        17,
         97,
-        12_911_616_000,
-        583_520_768,
+        12_865_536_000,
+        535_228_928,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
@@ -827,7 +861,7 @@ fn hw_qwen4exp_card_plan() {
     let levers = PlanLevers::default();
     for (name, ctx, with_draft, u, high, at_high, low, experts, rounding) in CARD_PLANS {
         let card = if name == A6000.name { A6000 } else { RTX_3090 };
-        let machine = place::machine(card, inputs.hp.n_layer, u);
+        let machine = place::machine_for_experts(card, inputs.hp.n_layer, u, Experts::Card);
         let got = if with_draft {
             inputs
                 .plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card)
@@ -902,7 +936,7 @@ fn hw_qwen4exp_card_plan() {
                 plan.host.expert_bytes,
                 HOST_EXPERTS - experts,
             ),
-            ("card scratch", c.scratch_bytes, scratch_at(u)),
+            ("card scratch", c.scratch_bytes, card_scratch_at(u)),
             ("host tables", plan.host.table_bytes, HOST_TABLES),
             ("nvme", plan.nvme_bytes, 0),
         ];

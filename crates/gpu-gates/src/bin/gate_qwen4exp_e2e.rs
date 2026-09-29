@@ -150,11 +150,10 @@
 //!   the step after the ubatch as (t) holds a step set. A slot map with a
 //!   routed expert on a tier card (planted, `Body38::plant_slot_map`) is
 //!   refused by name — the walk, the layer and the count — by each of the
-//!   four walks (a graph step, an eager pass, a ubatch, a graph verify), and
-//!   one with a routed expert on the card by the ubatch walk, before
-//!   anything moves, the position kept and the model not poisoned, and the
-//!   same call with the plant taken back runs; `auto` is the pass below
-//!   `Prompt38::GEMM_FROM` positions and the ubatch from it.
+//!   four walks (a graph step, an eager pass, a ubatch, a graph verify),
+//!   before anything moves, the position kept and the model not poisoned,
+//!   and the same call with the plant taken back runs; `auto` is the pass
+//!   below `Prompt38::GEMM_FROM` positions and the ubatch from it.
 //! - (k) the card leg: after every clause above, the host plan's model
 //!   dropped, the card rule's plan (`place::Experts::Card`: each eligible
 //!   layer's id prefix on the card) loaded on the same card. Its step graph
@@ -171,8 +170,14 @@
 //!   eager steps the graph steps' bits, one pass of the five rows the steps'
 //!   last token, logits and every store bit for bit, and verifies of 2, 3
 //!   and 4 rows kept whole every row bit for bit the steps' (each graph
-//!   [`NODES_VERIFY_CARD`] nodes). (iii) A ubatch refused by name before
-//!   anything moves, the same ids by passes run.
+//!   [`NODES_VERIFY_CARD`] nodes). (iii) The ubatch walk — the card route's
+//!   — with the pass's routes planted against the pass of the same plan
+//!   within [`gemm_band`] (the forced arm's shape: the card route
+//!   quantizes the same blocks the pass's card leg quantizes), and the
+//!   batch set and D3K's prefill each as two cut ubatches against one, bit
+//!   for bit — a token's bits depend neither on the ubatch it lands in nor
+//!   on the route's run (D3K's 3,001 tokens run two at the load's ubatch
+//!   of 4,096).
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
@@ -224,7 +229,7 @@ mod gate {
     use cuda_core::{DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::half_to_f32;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine};
+    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
@@ -305,7 +310,8 @@ mod gate {
     /// layer 2's q5_K stacks, the q8_0 downs of 640-value rows of layers 4,
     /// 30, 46 and 47), each of the 43 holding over a hundred experts on the
     /// 3090 at this cache (the card rule's plans, `qwen4exp_meta`'s
-    /// `CARD_PLANS`: 108/107 at 4,096 positions and a ubatch of 4,096).
+    /// `CARD_PLANS`: 105/104 at 4,096 positions and a ubatch of 4,096, the
+    /// ubatch walk's card route in the budget).
     const CARD_LAYERS: usize = 43;
 
     /// PIN(2026-09-29): the captured step's and verify's node counts under
@@ -463,7 +469,12 @@ mod gate {
         // items too; `open_placed` refuses what `ALLOWED` does not name.
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine = machine_for_experts(
+            RTX_3090,
+            inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            experts,
+        );
         let plan = inputs.plan_with(
             &machine,
             CTX as u64,
@@ -2579,9 +2590,8 @@ mod gate {
     /// (g) the map refusals: with a slot map planted (`Body38::plant_slot_map`)
     /// that holds expert 3 of layer 7 on the tier card, each walk's call after
     /// the prefix is refused by name — the walk, the layer and the count —
-    /// before anything moves, the position kept and the model not poisoned;
-    /// with one that holds it on the card, the ubatch walk's call is. With
-    /// the plant taken back the same call runs. The plant is taken back
+    /// before anything moves, the position kept and the model not poisoned.
+    /// With the plant taken back the same call runs. The plant is taken back
     /// before anything else can fail, so no line leaves it armed.
     fn map_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
         let mode = m.mode();
@@ -2592,13 +2602,12 @@ mod gate {
             entries[7 * N_EXPERT + 3] = entry;
             Ok(SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?)
         };
-        let (tier, card) = (planted(TIER)?, planted(0)?);
+        let tier = planted(TIER)?;
         let cases = [
             (Walk::Step, &tier, "tier card", "tier leg"),
             (Walk::Pass, &tier, "tier card", "tier leg"),
             (Walk::Gemm, &tier, "tier card", "tier leg"),
             (Walk::Verify, &tier, "tier card", "tier leg"),
-            (Walk::Gemm, &card, "card", "card leg yet"),
         ];
         let mut ok = true;
         for (w, map, device, leg) in cases {
@@ -2930,27 +2939,127 @@ mod gate {
         Ok(ok)
     }
 
-    /// (k) (iii): under the card plan a ubatch after the prefix is refused by
-    /// name — the walk, the first card layer and its count — before anything
-    /// moves, the position kept and the model not poisoned, and the same ids
-    /// by passes run.
-    fn card_ubatch_refused(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
-        Prefix::Steps(&toks[..PREFIX]).feed(m)?;
-        let before = m.pos();
-        let got = m.prompt38(&toks[PREFIX..], Prompt38::Gemm);
-        let want = "the ubatch walk has no card leg yet: layer 0 holds";
-        let named = matches!(&got, Err(e) if e.to_string().contains(want));
-        let kept = m.pos() == before && m.poisoned().is_none();
-        let again = m.prompt38(&toks[PREFIX..], Prompt38::Pass);
-        let ok = named && kept && again.is_ok();
+    /// (k) (iii): under the card plan the ubatch walk — the card route's —
+    /// against the pass of the same plan, (g)'s forced arm: the pass's own
+    /// routes planted (`eager`'s taps), so no flip can separate the two and
+    /// the error model alone does — every tapped id the pass's, the last
+    /// argmax equal to ik's, the last logits and every layer's live store
+    /// and the PLE ring within [`gemm_band`] of the pass's (the card route
+    /// quantizes the same blocks the pass's card leg quantizes — a q8_1 of
+    /// 128 values for the gate·up's input, a 32-value q8_1 of the SwiGLU —
+    /// so the two card legs differ only in their sums' order). Then the
+    /// batch set cut in two, and D3K's prefill cut at [`SPLIT`], against
+    /// one ubatch of each, bit for bit: a token's bits depend neither on
+    /// the ubatch it lands in nor on the route's run (D3K's 3,001 tokens
+    /// run two) — the routing free, as (g)'s D3K clause runs it.
+    fn card_gemm(m: &mut Qwen38Model, man: &RefManifest, toks: &[u32]) -> Result<bool, GateError> {
+        let eager = run_steps(m, toks, StepMode::Eager, true)?;
+        let pass = run_pass(m, toks)?;
+        let n = toks.len();
+        let (forced, routes) = gemm_walk(m, toks, Some(&eager.routes))?;
+        gemm_taps_off(m)?;
+        let mut taken = 0usize;
+        for (ours, theirs) in routes.iter().zip(&eager.routes) {
+            for (o, p) in ours.iter().zip(theirs) {
+                taken += usize::from(o.ids == p.ids);
+            }
+        }
+        let cells = n * N_LAYER;
+        let ids_ok = routes.len() == n && taken == cells;
+        let mut ok = ids_ok;
         println!(
-            "card leg: a ubatch of {} ids under the card plan at position {before} -> {} (want \
-             {want:?}); position {} (kept, not poisoned: {kept}); the same ids by passes: {} {}",
-            toks.len() - PREFIX,
-            text(&got),
-            m.pos(),
-            text(&again),
-            verdict(ok)
+            "card leg gemm: the planted routes' ids taken at {taken} of {cells} (layer, position) \
+             cells {}",
+            verdict(ids_ok)
+        );
+        let vocab = m.body("card_gemm")?.vocab();
+        let ik_top = argmax(&ik_last(man, vocab)?);
+        let (last, top) = (forced.tokens[0], argmax(&forced.logits[0]));
+        let argmax_ok = top == ik_top && last == top;
+        ok &= argmax_ok;
+        let logits_rel = rel(
+            &forced.logits[0],
+            pass.logits.last().ok_or("no pass logits")?,
+        );
+        let head_band = gemm_band(N_LAYER - 1);
+        let logits_ok = logits_rel <= head_band;
+        ok &= logits_ok;
+        println!(
+            "card leg gemm: last argmax ours={top} (returned {last}) ik={ik_top}; last logits' \
+             distance from the pass's {logits_rel:.3e} (band {head_band:.3e}) {}",
+            verdict(argmax_ok && logits_ok)
+        );
+        let (layers, ple) = live_rel(&forced, &pass, n);
+        let past: Vec<usize> = layers
+            .iter()
+            .enumerate()
+            .filter(|&(l, &e)| e > gemm_band(l) || e.is_nan())
+            .map(|(l, _)| l)
+            .collect();
+        let ple_ok = ple <= gemm_band(1);
+        let stores_ok = layers.len() == N_LAYER && past.is_empty() && ple_ok;
+        ok &= stores_ok;
+        println!(
+            "card leg gemm: every layer's store within its band, past it at {past:?}; PLE ring \
+             {ple:.3e} (band {:.3e}) {}",
+            gemm_band(1),
+            verdict(stores_ok)
+        );
+        // The batch set, one free walk and two cut, bit for bit.
+        let one = gemm_walk(m, toks, None)?.0;
+        gemm_taps_off(m)?;
+        fresh(m)?;
+        m.prompt38(&toks[..2], Prompt38::Gemm)?;
+        let last = m.prompt38(&toks[2..], Prompt38::Gemm)?;
+        let logits = m.logits()?;
+        let (two_stores, two_ring) = stores(m)?;
+        let cut = Run {
+            tokens: vec![last],
+            logits: vec![logits],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: two_stores,
+            ple_ring: two_ring,
+        };
+        ok &= same_run(
+            "card plan: the batch set by two ubatches vs one ubatch",
+            &cut,
+            &one,
+            true,
+        );
+        // D3K's prefill, one walk and two cut inside the selecting rows, bit
+        // for bit — the only walk that crosses the route's run boundary.
+        let d3k = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (_, _, prefill) = d3k.step()?;
+        let prefill = prefill.to_vec();
+        fresh(m)?;
+        let last = m.prompt38(&prefill, Prompt38::Gemm)?;
+        let (one_stores, one_ring) = stores(m)?;
+        let one = Run {
+            tokens: vec![last],
+            logits: vec![m.logits()?],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: one_stores,
+            ple_ring: one_ring,
+        };
+        fresh(m)?;
+        m.prompt38(&prefill[..SPLIT], Prompt38::Gemm)?;
+        let last = m.prompt38(&prefill[SPLIT..], Prompt38::Gemm)?;
+        let (cut_stores, cut_ring) = stores(m)?;
+        let cut = Run {
+            tokens: vec![last],
+            logits: vec![m.logits()?],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: cut_stores,
+            ple_ring: cut_ring,
+        };
+        ok &= same_run(
+            &format!("card plan: {D3K} by ubatches cut at {SPLIT} vs one ubatch"),
+            &cut,
+            &one,
+            true,
         );
         m.reset()?;
         Ok(ok)
@@ -2959,7 +3068,7 @@ mod gate {
     /// (k): the card plan loaded on the gate card (the host plan's model
     /// dropped first), then its structure, the places entry's rule, (i)
     /// against `host`, (ii) and (iii).
-    fn card_leg(toks: &[u32], host: &Run) -> Result<bool, GateError> {
+    fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
         let mut m = match open(Experts::Card) {
             Ok(m) => m,
             Err(e) => {
@@ -2974,7 +3083,7 @@ mod gate {
         ok &= guarded("places rule", &mut m, places_rule)?;
         ok &= guarded("vs host", &mut m, |m| card_vs_host(m, toks, host))?;
         ok &= guarded("rows", &mut m, |m| card_rows(m, toks))?;
-        ok &= guarded("ubatch", &mut m, |m| card_ubatch_refused(m, toks))?;
+        ok &= guarded("gemm", &mut m, |m| card_gemm(m, man, toks))?;
         Ok(ok)
     }
 
@@ -3094,7 +3203,7 @@ mod gate {
         ok &= position_owner(&mut m, &toks)?;
         ok &= refusals(&mut m)?;
         drop(m);
-        ok &= card_leg(&toks, &eager)?;
+        ok &= card_leg(&toks, &eager, &man)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

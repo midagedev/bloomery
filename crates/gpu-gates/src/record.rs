@@ -894,7 +894,8 @@ pub static STAT_PROMPT38_LB: Kind = Kind {
           union call's wall, which carries the routing scan and the plan build in front of it; the \
           serve's whole wall, the upload's enqueue in it), the host wall its front, shared expert \
           and gated sum took to enqueue, and its card time by part (the front's launches, the \
-          route's downloads, the shared expert under the union, the sums' upload, the gated sum).",
+          route's downloads, the card route on a card layer and the shared expert under the union, \
+          the sums' upload, the gated sum).",
     parts: &[
         key("b", U64, ""),
         key("layer", U64, ""),

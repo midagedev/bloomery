@@ -31,9 +31,8 @@
 //! A qwen4exp file's plan puts every routed expert on the host tier, or
 //! with `BLOOMERY_QWEN38_EXPERTS=card` each layer's id prefix on the card as
 //! its budget holds (`place::Experts::Card`), which the step's, the verify's
-//! and the pass's card leg run; the `plan` line prints `experts=` and the
-//! `load` line `card_layers=`. The ubatch walk has no card leg: a card plan
-//! with a prompt `--prefill` sends to it is refused by name before the load.
+//! and the pass's card leg and the ubatch walk's card route run; the `plan`
+//! line prints `experts=` and the `load` line `card_layers=`.
 //!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
@@ -186,7 +185,7 @@ mod cli {
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine};
+    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
     use std::num::NonZeroUsize;
@@ -766,20 +765,6 @@ mod cli {
                 );
             }
         }
-        if let Chosen::Qwen38(path, _) = chosen
-            && experts == Experts::Card
-            && let Some(a) = arms
-                .iter()
-                .find(|a| path.resolve(a.ids.len()) == Prompt38::Gemm)
-        {
-            return Err(format!(
-                "BLOOMERY_QWEN38_EXPERTS=card with a prompt of {} ids by --prefill {}: the \
-                 ubatch walk has no card leg yet; --prefill pass runs it",
-                a.ids.len(),
-                path.name()
-            )
-            .into());
-        }
         if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass))
             && logits
             && arms.iter().any(|a| a.n_gen == 1)
@@ -1060,7 +1045,8 @@ mod cli {
             Place38::Gate => RTX_3090,
         };
         let ub = ubatch_for(ctx)?;
-        let machine = machine(card, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let machine =
+            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
         let plan = inputs.plan_with(
             &machine,
             u64::try_from(ctx)?,

@@ -98,7 +98,10 @@
 //!   4096 columns; a NaN and an infinity each refuse their block (NaN
 //!   scale, zero codes and sum) and raise `QuantColumn`; `swiglu_quant32`
 //!   bit for bit `ElemKernels::enqueue_swiglu` then `quantize_gemm32`, its
-//!   NaN refused the same way.
+//!   NaN refused the same way; `swiglu_quant32_sel` over a places row — the
+//!   card columns the plain launch's bits, the host columns a first plain
+//!   launch's, untouched, a NaN in a host column raising nothing and a
+//!   place in `[n_card, HOST)` `ExpertId` with nothing written.
 //! - `g32_dense`: at every K above and m ∈ {1, 8, 9, 512, 4096}, one
 //!   quantization and the three entries over the dense table, 272 rows (two
 //!   full slabs and one of 16): every output inside its band of the f64
@@ -2790,6 +2793,161 @@ mod gate {
                     );
                     ok &= pass;
                 }
+            }
+            // The card-slots-only SwiGLU (`swiglu_quant32_sel`) over a
+            // remapped route's places: a first plain launch seeds every
+            // column's bytes, then the `_sel` launch over other rows — the
+            // card columns the plain launch's bits over those rows, the host
+            // columns the seed's, untouched; a NaN in a host column raising
+            // nothing; a place in [n_card, HOST) `ExpertId` with nothing
+            // written.
+            {
+                let (k, n, n_card) = (640usize, 33usize, 20usize);
+                let place = |c: usize| {
+                    if c.is_multiple_of(3) {
+                        HOST
+                    } else {
+                        ((c * 7) % n_card) as u32
+                    }
+                };
+                let sel: Vec<u32> = (0..n).map(place).collect();
+                let sel_d = DeviceBuffer::from_host(stream, &sel)?;
+                let mut plain = GemmAct32::new(stream, n, k)?;
+                let mut sela = GemmAct32::new(stream, n, k)?;
+                let seed = |s: u32| -> Vec<f32> {
+                    activations(k, n, s).into_iter().map(|v| 4.0 * v).collect()
+                };
+                let (g0, u0, g1, u1) = (
+                    DeviceBuffer::from_host(stream, &seed(9600))?,
+                    DeviceBuffer::from_host(stream, &activations(k, n, 9601))?,
+                    DeviceBuffer::from_host(stream, &seed(9602))?,
+                    DeviceBuffer::from_host(stream, &activations(k, n, 9603))?,
+                );
+                dev.g32.enqueue_swiglu_quant32(
+                    stream,
+                    &g0,
+                    &u0,
+                    n,
+                    &mut sela,
+                    gpu.unlabelled_sink(),
+                )?;
+                stream.synchronize()?;
+                let steps = sela.steps();
+                let row = |a: &GemmAct32| -> Result<Planes32, GateError> {
+                    Ok((
+                        a.q().to_host_vec(stream)?,
+                        a.d().to_host_vec(stream)?,
+                        a.s().to_host_vec(stream)?,
+                    ))
+                };
+                let before = row(&sela)?;
+                dev.g32.enqueue_swiglu_quant32_sel(
+                    stream,
+                    &g1,
+                    &u1,
+                    &sel_d,
+                    n_card,
+                    n,
+                    &mut sela,
+                    gpu.unlabelled_sink(),
+                )?;
+                dev.g32.enqueue_swiglu_quant32(
+                    stream,
+                    &g1,
+                    &u1,
+                    n,
+                    &mut plain,
+                    gpu.unlabelled_sink(),
+                )?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let (got, want) = (row(&sela)?, row(&plain)?);
+                let eq = |a: &[u32], b: &[u32], c: usize| {
+                    a[c * 16 * steps..][..16 * steps] == b[c * 16 * steps..][..16 * steps]
+                };
+                let mut card = 0usize;
+                let mut host_ok = true;
+                let mut card_ok = true;
+                for c in 0..n {
+                    let same = eq(&got.0, &want.0, c)
+                        && got.1[c * 2 * steps..][..2 * steps]
+                            == want.1[c * 2 * steps..][..2 * steps]
+                        && got.2[c * 2 * steps..][..2 * steps]
+                            == want.2[c * 2 * steps..][..2 * steps];
+                    if sel[c] == HOST {
+                        let kept = eq(&got.0, &before.0, c)
+                            && got.1[c * 2 * steps..][..2 * steps]
+                                == before.1[c * 2 * steps..][..2 * steps]
+                            && got.2[c * 2 * steps..][..2 * steps]
+                                == before.2[c * 2 * steps..][..2 * steps];
+                        host_ok &= kept;
+                    } else {
+                        card += 1;
+                        card_ok &= same;
+                    }
+                }
+                let pass = card_ok && host_ok && fault.is_none();
+                println!(
+                    "gemm32 case=g32_quant swiglu_sel K={k} cols={n} card_cols_eq_plain={card_ok} \
+                     ({card} of them) host_cols_untouched={host_ok} fault={} {}",
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
+                // A NaN in a host column is never read: no fault, the host
+                // column still the seed's, the card columns still written.
+                let mut gn = seed(9604);
+                let host_col = (0..n).find(|&c| sel[c] == HOST).unwrap_or(0);
+                gn[host_col * k + 5] = f32::NAN;
+                let gn = DeviceBuffer::from_host(stream, &gn)?;
+                dev.g32.enqueue_swiglu_quant32_sel(
+                    stream,
+                    &gn,
+                    &u1,
+                    &sel_d,
+                    n_card,
+                    n,
+                    &mut sela,
+                    gpu.unlabelled_sink(),
+                )?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let got = row(&sela)?;
+                let host_kept = eq(&got.0, &before.0, host_col);
+                let pass = fault.is_none() && host_kept;
+                println!(
+                    "gemm32 case=g32_quant swiglu_sel_nan_host K={k} col={host_col} \
+                     host_col_untouched={host_kept} fault={} {}",
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
+                // A place in [n_card, HOST): `ExpertId`, its column unwritten.
+                let mut stray = sel.clone();
+                stray[host_col] = n_card as u32;
+                let stray_d = DeviceBuffer::from_host(stream, &stray)?;
+                dev.g32.enqueue_swiglu_quant32_sel(
+                    stream,
+                    &g1,
+                    &u1,
+                    &stray_d,
+                    n_card,
+                    n,
+                    &mut sela,
+                    gpu.unlabelled_sink(),
+                )?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let got = row(&sela)?;
+                let unwritten = eq(&got.0, &before.0, host_col);
+                let pass = fault == Some(Fault::at(LAYER_NONE, FaultSite::ExpertId)) && unwritten;
+                println!(
+                    "gemm32 case=g32_quant swiglu_sel_stray K={k} col={host_col} \
+                     col_unwritten={unwritten} fault={} {}",
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
             }
             Ok(ok)
         }

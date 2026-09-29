@@ -17,9 +17,10 @@
 //! map of the plan (`SlotMap::of_plan`: each layer's routed experts the plan
 //! puts on the card, the rest the host's), the card leg over the card's
 //! stacks (`card38`), and the host tier over every layer's routed stacks,
-//! which serves the map's host slots. The step, the verify and the pass run
-//! the card leg; the ubatch walk refuses by name a map with a routed expert
-//! on the card, and every walk one with an expert on a tier card.
+//! which serves the map's host slots. Every walk runs its card side — the
+//! step, the verify and the pass the card leg, the ubatch walk its card
+//! route (`wide38`) — and every walk refuses by name a map with an expert
+//! on a tier card.
 //! [`Body38::open_placed_mtp`] also opens the MTP draft layer on the same
 //! card ([`Mtp38`]: its weights, its store, the reduced head's rows); no
 //! walk reads it.
@@ -746,7 +747,13 @@ impl Body38 {
         let wa = Arena38::wide(stream, router_dims, ub, UBATCH_MOST, ctx)?;
         let wr = WideRecord::new(stream, ub)?;
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
-        let wide = Wide38::new(stream, ub)?;
+        let host_cols = ub.max(PASS_ROWS);
+        let run = 0..n;
+        let map = SlotMap::of_plan(plan, 0, None, run.clone(), geo::EXPERTS)?;
+        let card_leg = MapCheck::of(&map)?;
+        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, geo::EXPERTS)?;
+        let card = Card38::new(gpu, w, &map, n)?;
+        let wide = Wide38::new(stream, ub, &card)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
             return Err(GpuError::shape(
@@ -756,12 +763,6 @@ impl Body38 {
                 ),
             ));
         }
-        let host_cols = ub.max(PASS_ROWS);
-        let run = 0..n;
-        let map = SlotMap::of_plan(plan, 0, None, run.clone(), geo::EXPERTS)?;
-        let card_leg = MapCheck::of(&map)?;
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, geo::EXPERTS)?;
-        let card = Card38::new(gpu, w, &map, n)?;
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
@@ -1339,6 +1340,8 @@ impl Body38 {
             wide,
             wide_timing,
             k,
+            slots,
+            card,
             eps,
             ctx,
             plant,
@@ -1360,6 +1363,8 @@ impl Body38 {
                 s: wa,
                 x: wide,
                 io: &io,
+                slots,
+                card,
                 m,
                 pos0: pos as usize,
                 dense,
@@ -1393,8 +1398,8 @@ impl Body38 {
     /// Every walk's map check reads `map` instead of the tier's own until a
     /// call with `None` takes it back or the model is reset: a gate's
     /// stand-in for a placement the walks refuse by name — an expert on a
-    /// tier card at every walk, one on the card at the ubatch walk. The
-    /// check alone reads it; the walks run the loaded map. Gate use.
+    /// tier card at every walk. The check alone reads it; the walks run the
+    /// loaded map. Gate use.
     pub fn plant_slot_map(&mut self, map: Option<SlotMap>) -> Result<(), GpuError> {
         self.card_leg = MapCheck::of(map.as_ref().unwrap_or(self.hybrid.slots()))?;
         Ok(())

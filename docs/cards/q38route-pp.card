@@ -1,0 +1,35 @@
+# Qwen3.8's ubatch walk with the card route (q38route): the same binary, two arms by the plan lever,
+# BLOOMERY_QWEN38_EXPERTS=host (the all-host ubatch walk) against =card (the walk's shadow runs the card route per
+# ROUTE_ROWS run after the download; the back adds the card sums). Per layer-batch the wall is the sum rest + host
+# union, the card route G (5..8 ms a layer-batch) under the union's shadow, so the gain is the host union's slots.
+# Derived on measured terms (rig-log 09-29 #q38wide-pp, #q38gap-union): the host arm runs pp512 322.1, pp4096 296.7
+# (33.1 / 287.6 ms a layer-batch), its union 29.53 / 259.75 ms, so the rest (front, copies, back) is 3.6 / 27.9 ms.
+# The card plan (CARD_PLANS at ctx 4096, U 4096: 12,841 card experts, 27 layers of 299 and 16 of 298; about 12,830
+# at the runner's C of 4,352 and 13,000 at 768, the KV taken as linear in C [derived]) serves 0.58
+# of the routed slots under the lcg prompt's near-uniform routing, leaving 2,150 / 17,203 host slot-columns a
+# layer-batch at P = 512 / 4096. Their cost is 5.77 / 6.34 us a slot-column if the engine's excess over the bench
+# is per expert (the scattered private column sets), or toward the bench's 4.99 / 5.13 us if it is the call's width:
+# union 10.7..12.4 / 88..109 ms, a layer-batch 14.3..16.0 / 116..137 ms, pp512 667..746 and pp4096 623..736 tok/s
+# [derived], +107..+132 % / +110..+148 % against the host arm. Where the result falls inside the band says which of
+# the two the excess is.
+# Wall [derived]: 4 arms x 2 rounds = 8 fresh Qwen3.8 loads of 40..90 s (the card arm's load uploads its 43 layers'
+# card stacks) plus each prompt (0.7..14 s) and its warm prime, and the witness blocks: 15..22 min.
+kind: ab
+question: does the ubatch card route lift Qwen3.8's prefill by the host slots its card plan removes?
+term: pp tok/s @ P = U = 512 and P = U = 4096 (the lcg prompt), A6000, BLOOMERY_QWEN38_EXPERTS=card against =host,
+  same binary, paired by round
+unit: %
+predict: +107..+148
+rounds: 2
+condition: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_WARM_ROWS=1
+  BLOOMERY_LEASE_CARD=docs/cards/q38route-pp.card' just depth-gpu-qwen4exp 512 512@BLOOMERY_QWEN38_EXPERTS=card
+  4096 4096@BLOOMERY_QWEN38_EXPERTS=card (the plain arm is the host plan, the lever's default), the full output to
+  a file first; the runner's C (768 at P 512, 4,352 at P 4096); the card arm's plan line experts=card and
+  card_experts 12,800..13,050 (12,841 at ctx 4,096 less or plus the KV the other height frees [derived]), its load
+  line card_layers=43; the host arm's experts=host; no counted row [cold], [cpu-busy] or [other-busy]
+decide-in: land q38route; propose the card plan as Qwen3.8's default with these rows; write the measured rows beside
+  the bands in rig-log and read where each P falls in its band (per-expert excess at the low end, width at the high)
+decide-below: the card route left the union's shadow or the card's hit share is under 0.58: compute from the code
+  and the plan the route's per-layer-batch time and the lcg prompt's card share before any further run
+decide-above: the host union's excess shrinks faster than its slots (the width term): re-derive q38insitu's terms
+  with that before the next prefill round

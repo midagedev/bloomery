@@ -13,6 +13,14 @@
 //!   tile, bit for bit the decode path's gemv for each row and token;
 //! - the router the ubatch instance of the 512-expert router, in runs of
 //!   [`ROUTE_ROWS`] tokens, bit for bit the fused launch for each token;
+//! - the routed experts the slot map puts on the card, on a layer with card
+//!   experts, the card route ([`CardRoute38`]): per [`ROUTE_ROWS`] run, in
+//!   the shadow after the front's download, the compressed ids and the
+//!   places from the walk's ids, the remapped route table, the Q4_K gate
+//!   and up GEMMs, the card slots' SwiGLU (`swiglu_quant32_sel`), the Q5_1
+//!   down GEMM and the card sum into the unit-wide acc — the host tier
+//!   serves the rest of the slots, and the back adds the card sum on a
+//!   layer with card experts (`q38_card_shared_add`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
 //!   selected flash in runs of [`SELECT_ROWS`] from the first row that
@@ -34,12 +42,18 @@
 //! several leaves the same bits. Against the pass the Q8_0 projections read
 //! q8 activations (32 values a scale) where the pass reads the f32 row, and
 //! the unselected rows' attention runs the prefill flash, so the two agree
-//! to the error of that quantization and are not bit-equal.
+//! to the error of that quantization and are not bit-equal; the card route
+//! quantizes the same blocks the pass's card leg quantizes (a q8_1 of 128
+//! values a scale for the gate·up's input, a 32-value q8_1 of the SwiGLU),
+//! so the two card legs differ only in their sums' order.
 //!
-//! The walk has no card leg: a slot map with a routed expert on the card is
-//! refused by name at its entry (`card38`), before anything moves.
+//! The walk runs the card route ([`CardRoute38`]) on a layer with card
+//! experts, and holds no card buffers on a map without them: a slot map with
+//! an expert on a tier card is refused by name at its entry (`card38`),
+//! before anything moves.
 
 use super::body::ATTN_SCALE_256;
+use super::card38::Card38;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, q8};
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
@@ -48,9 +62,12 @@ use crate::GpuError;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaSelArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
-use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
+use crate::gemm::{
+    Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
+};
 use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
+use crate::host::handoff::Places;
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, LegTimer, ServeNote};
 use crate::linear::conv::ConvArgs;
@@ -58,7 +75,9 @@ use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
-use crate::q38::{EmbedQ8Args, KeyAppendArgs, OutGateArgs, SharedAddArgs};
+use crate::q38::{
+    CardAccArgs, CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, SharedAddArgs,
+};
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::DeviceTensor;
@@ -224,6 +243,259 @@ impl WideForce {
     }
 }
 
+/// The ubatch walk's card route: the routed experts the slot map puts on the
+/// card, through the grouped GEMMs, in runs of [`ROUTE_ROWS`] tokens (the
+/// walk's module doc). Holds its own buffers for one run of `run`
+/// (`min(walk rows, ROUTE_ROWS)`) tokens and the unit-wide card sum; the
+/// stacks are the leg's ([`Card38`]'s), read through [`Card38::stacks`], and
+/// the route tables are one per distinct card count (the placement's spread
+/// keeps every eligible layer's count within one, so a plan of this program
+/// holds at most two).
+///
+/// Stream order is a contract: the route is enqueued in the walk's shadow,
+/// after the front's download of the unit's activations and slots — enqueued
+/// before the download, the d2h would queue behind the route's card GEMMs on
+/// the one stream and the host tier would start serving late by their whole
+/// time, turning the layer's max(host, card) into a sum.
+pub(super) struct CardRoute38 {
+    run: usize,
+    /// The compressed routed ids, ten a run token: the places launch over
+    /// the walk's ids (a pitch of eleven) with an identity map, whose bytes
+    /// are the remapped route's input.
+    ids: DeviceBuffer<u32>,
+    /// The slots' places, ten a run token: the places launch over the same
+    /// ids with the slot map's layer row.
+    sel: DeviceBuffer<u32>,
+    /// The run's normed rows (`[run][HIDDEN]`) in the K-quant GEMM's
+    /// activation form — the same q8_1 bytes a `Q8Act` of the same values
+    /// holds, the gate and up GEMMs' input.
+    x: GemmAct,
+    /// The gate and up GEMMs' outputs, ten slots a run token of [`geo::FF`]
+    /// values, slot-major.
+    g: DeviceBuffer<f32>,
+    u: DeviceBuffer<f32>,
+    /// The card slots' SwiGLU in the 32-value GEMM's activation form, ten
+    /// columns a run token; a host slot's column is never written and never
+    /// read (the route leaves it to the host tier).
+    act: GemmAct32,
+    /// The down GEMM's output, ten slots a run token of [`geo::HIDDEN`]
+    /// values, slot-major.
+    down: DeviceBuffer<f32>,
+    /// The card slots' weighted sums, a row a token of the whole unit.
+    acc: DeviceBuffer<f32>,
+    /// One route table per distinct card count, in `counts`' order.
+    routes: Vec<GemmRoute>,
+    counts: Vec<usize>,
+    /// The identity map over the experts (`e -> e`): the ids compression's
+    /// stand-in for the places rule's map.
+    ids_map: DeviceBuffer<u32>,
+}
+
+impl CardRoute38 {
+    /// The route's buffers for ubatches of up to `rows` tokens over `card`'s
+    /// card experts: a run of `min(rows, ROUTE_ROWS)` tokens, the sums a
+    /// token of the whole unit, and one route table per distinct card count
+    /// (refused by name past two, naming them). Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        rows: usize,
+        card: &Card38,
+    ) -> Result<CardRoute38, GpuError> {
+        let run = rows.min(ROUTE_ROWS);
+        let counts = card.card_counts();
+        if counts.len() > 2 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a card route over {} distinct card counts {:?}: the walk's route tables are \
+                     built for two (the placement's spread keeps every count within one)",
+                    counts.len(),
+                    counts
+                ),
+            ));
+        }
+        let slots = run * geo::N_USED;
+        Ok(CardRoute38 {
+            run,
+            ids: DeviceBuffer::zeroed(stream, slots)?,
+            sel: DeviceBuffer::zeroed(stream, slots)?,
+            x: GemmAct::new(stream, run, geo::HIDDEN)?,
+            g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
+            u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
+            act: GemmAct32::new(stream, slots, geo::FF)?,
+            down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
+            acc: DeviceBuffer::zeroed(stream, rows * geo::HIDDEN)?,
+            routes: counts
+                .iter()
+                .map(|&n| GemmRoute::new(stream, slots, n))
+                .collect::<Result<_, _>>()?,
+            counts,
+            ids_map: DeviceBuffer::from_host(
+                stream,
+                &(0..geo::EXPERTS as u32).collect::<Vec<_>>(),
+            )?,
+        })
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.ids.num_bytes()
+            + self.sel.num_bytes()
+            + self.x.bytes()
+            + self.g.num_bytes()
+            + self.u.num_bytes()
+            + self.act.bytes()
+            + self.down.num_bytes()
+            + self.acc.num_bytes()
+            + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
+            + self.ids_map.num_bytes()
+    }
+
+    /// The route table's index for the experts' count `n_card`, refused by
+    /// name when the route holds none for it.
+    fn table_at(&self, n_card: usize) -> Result<usize, GpuError> {
+        self.counts
+            .iter()
+            .position(|&n| n == n_card)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!(
+                        "a card route table of {n_card} experts; the walk holds {:?}",
+                        self.counts
+                    ),
+                )
+            })
+    }
+
+    /// Enqueue layer `l`'s card route over the unit's `m` tokens (module
+    /// doc): per run of at most `run` tokens, the compressed ids and the
+    /// places from the walk's ids (`ids`, eleven slots a token, the shared
+    /// expert's last — never read), the remapped route table over the slot
+    /// map's layer row (`slots`), the q8_1 of the run's normed rows
+    /// (`ffn_x`, `[m][HIDDEN]`), the Q4_K gate and up GEMMs over the unit's
+    /// ten slots a token, the card slots' SwiGLU, the Q5_1 down GEMM and
+    /// the card sum by the router's weights (`weights`, eleven a token)
+    /// into the unit-wide acc's rows for the run. Nine launches a run.
+    /// Refused by name on a layer without card experts. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the route's ids, weights, normed rows, the slot map, the layer and the unit's width (rust-quality R8)"
+    )]
+    pub(super) fn enqueue(
+        &mut self,
+        c: &Ctx38<'_>,
+        card: &Card38,
+        l: usize,
+        (ffn_x, ids, weights): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>),
+        slots: &DeviceTensor<u32>,
+        m: usize,
+    ) -> Result<(), GpuError> {
+        let st = card.stacks(c.w, l)?;
+        let (n_card, gate, up, down) = (st.n_card, st.gate, st.up, st.down);
+        let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
+        let pitch = geo::N_USED + 1;
+        // SAFETY: layer l's row of the slot map's card copy (`EXPERTS` words
+        // a row), which stays resident while the window lives (this layer's
+        // route launches).
+        let map = unsafe { param_view::<u32>(slots.buf(), l * geo::EXPERTS, geo::EXPERTS) };
+        let mut c0 = 0;
+        while c0 < m {
+            let n = self.run.min(m - c0);
+            // SAFETY: tokens c0 .. c0 + n <= m <= rows of the walk's ids and
+            // weights (`rows · pitch` each) and the arena's `ffn_x`
+            // (`rows · HIDDEN`); every buffer stays in place for this run's
+            // launches.
+            let (ids_w, w_w, x_w, mut acc_w) = unsafe {
+                (
+                    param_view::<u32>(ids, c0 * pitch, n * pitch),
+                    f32_view(weights, c0 * pitch, n * pitch),
+                    f32_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                    f32_view(&self.acc, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                )
+            };
+            let places = |map: &DeviceBuffer<u32>, out: &mut DeviceBuffer<u32>| {
+                c.k.handoff.enqueue_places_cols(
+                    stream,
+                    &Places {
+                        ids: &ids_w,
+                        map,
+                        row_off: 0,
+                        n_expert: geo::EXPERTS,
+                    },
+                    pitch,
+                    n,
+                    sink,
+                    out,
+                )
+            };
+            places(&self.ids_map, &mut self.ids)?;
+            places(&map, &mut self.sel)?;
+            let at = self.table_at(n_card)?;
+            c.k.g32.enqueue_route_remap(
+                stream,
+                &self.ids,
+                &map,
+                n * geo::N_USED,
+                &mut self.routes[at],
+                sink,
+            )?;
+            gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
+            for (w, y) in [(gate, &mut self.g), (up, &mut self.u)] {
+                c.k.gemm.enqueue_gemm(
+                    stream,
+                    GemmArgs {
+                        ty: GemmWeight::Q4K,
+                        w,
+                        rows_per_expert: geo::FF,
+                        act: &self.x,
+                        route: &self.routes[at],
+                        input: GemmInput::Shared { top_k: geo::N_USED },
+                        y,
+                    },
+                )?;
+            }
+            c.k.g32.enqueue_swiglu_quant32_sel(
+                stream,
+                &self.g,
+                &self.u,
+                &self.sel,
+                n_card,
+                n * geo::N_USED,
+                &mut self.act,
+                sink,
+            )?;
+            c.k.g32.enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: Gemm32Weight::Q5_1File(down),
+                    rows_per_expert: geo::HIDDEN,
+                    act: &self.act,
+                    route: &self.routes[at],
+                    input: GemmInput::PerSlot,
+                    y: &mut self.down,
+                },
+            )?;
+            c.k.q38.enqueue_card_acc(
+                stream,
+                CardAccArgs {
+                    down: &self.down,
+                    w: &w_w,
+                    sel: &self.sel,
+                    n: geo::HIDDEN,
+                    m: n,
+                    n_card,
+                    fault: sink,
+                    acc: &mut acc_w,
+                },
+            )?;
+            c0 += n;
+        }
+        Ok(())
+    }
+}
+
 /// What a ubatch walk reads and writes besides the arena: the one-expert
 /// table, the GEMMs' activations, the wide mixes' scratch, the indexer keys
 /// token-major, the unit's routed slots, and the last walk's cut of its
@@ -250,18 +522,24 @@ pub(super) struct Wide38 {
     pub(super) taps: Option<WideTaps>,
     /// The planted routes, when a gate planted them.
     pub(super) force: Option<WideForce>,
+    /// The card route, when the slot map puts routed experts on the card.
+    pub(super) card: Option<CardRoute38>,
     /// The last walk's rows of each selecting layer: those the prefill flash
     /// ran and those the selection did.
     pub(super) split: Option<(usize, usize)>,
 }
 
 impl Wide38 {
-    /// The walk's own buffers for units of up to `rows` rows. Load-time
-    /// only.
-    pub(super) fn new(stream: &CudaStream, rows: usize) -> Result<Wide38, GpuError> {
+    /// The walk's own buffers for units of up to `rows` rows over `card`'s
+    /// card experts: the card route's buffers beside them when a layer has
+    /// card experts. Load-time only.
+    pub(super) fn new(stream: &CudaStream, rows: usize, card: &Card38) -> Result<Wide38, GpuError> {
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, geo::HIDDEN as u32)
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
         let slots = geo::N_USED + 1;
+        let card = (card.card_layers() > 0)
+            .then(|| CardRoute38::new(stream, rows, card))
+            .transpose()?;
         Ok(Wide38 {
             rows,
             dense: GemmRoute::new(stream, rows, 1)?,
@@ -274,6 +552,7 @@ impl Wide38 {
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
             taps: None,
             force: None,
+            card,
             split: None,
         })
     }
@@ -288,6 +567,7 @@ impl Wide38 {
             + self.kr.num_bytes()
             + self.ids.num_bytes()
             + self.weights.num_bytes()
+            + self.card.as_ref().map_or(0, CardRoute38::bytes)
     }
 }
 
@@ -309,6 +589,10 @@ pub(super) struct WideParts<'a> {
     pub(super) s: &'a mut Arena38,
     pub(super) x: &'a mut Wide38,
     pub(super) io: &'a Io<'a>,
+    /// The slot map's card copy and the card leg's stacks, read by the card
+    /// route on a layer with card experts.
+    pub(super) slots: &'a DeviceTensor<u32>,
+    pub(super) card: &'a Card38,
     pub(super) m: usize,
     pub(super) pos0: usize,
     pub(super) dense: usize,
@@ -669,25 +953,79 @@ impl WideParts<'_> {
         gemm_q8(c, &p.ffn.down_sh, (&x.act_ff, m), &x.dense, &mut s.sh_y)
     }
 
-    /// Layer `l`'s block output into `y`: the host's routed sums `hsum` plus
-    /// the shared expert's output times its gate weight.
+    /// Layer `l`'s card route over the arena's `ffn_x`, when it has card
+    /// experts ([`CardRoute38::enqueue`], the walk's module doc): the places
+    /// from the walk's ids, the grouped gate·up, SwiGLU and down over the
+    /// run's tokens, the card sums into the unit-wide acc. Called from the
+    /// walk's shadow only — after the front's download, the stream order the
+    /// route's buffers exist under.
+    fn route_card(&mut self, l: usize) -> Result<(), GpuError> {
+        if !self.card.has(l) {
+            return Ok(());
+        }
+        let (c, m) = (&self.c, self.m);
+        let s = &*self.s;
+        let x = &mut *self.x;
+        let Some(r) = x.card.as_mut() else {
+            return Ok(());
+        };
+        r.enqueue(
+            c,
+            self.card,
+            l,
+            (&s.ffn_x, &x.ids, &x.weights),
+            self.slots,
+            m,
+        )
+    }
+
+    /// Layer `l`'s block output into `y`: the host's routed sums `hsum`, on
+    /// a layer with card experts the card route's sums too, plus the shared
+    /// expert's output times its gate weight.
     fn shared_add(&mut self, l: usize, hsum: &DeviceBuffer<f32>) -> Result<(), GpuError> {
         let sink = self.c.gpu.layer_sink(l)?;
         let s = &mut *self.s;
-        self.c.k.q38.enqueue_shared_add(
-            self.c.gpu.stream(),
-            SharedAddArgs {
-                hsum,
-                sh: &s.sh_y,
-                w: &self.x.weights,
-                slot: geo::N_USED,
-                slots: geo::N_USED + 1,
-                n: geo::HIDDEN,
-                m: self.m,
-                fault: sink,
-                y: &mut s.y,
-            },
-        )
+        let x = &mut *self.x;
+        let (stream, q38) = (self.c.gpu.stream(), &self.c.k.q38);
+        let (slot, slots, n, m) = (geo::N_USED, geo::N_USED + 1, geo::HIDDEN, self.m);
+        // A layer with card experts has the walk's card route (both read the
+        // one loaded map); a layer without them keeps the plain sum — its
+        // rows of the acc were never this walk's.
+        match (self.card.has(l), x.card.as_ref()) {
+            (true, Some(r)) => q38.enqueue_card_shared_add(
+                stream,
+                CardSharedAddArgs {
+                    hsum,
+                    acc: &r.acc,
+                    sh: &s.sh_y,
+                    w: &x.weights,
+                    slot,
+                    slots,
+                    n,
+                    m,
+                    fault: sink,
+                    y: &mut s.y,
+                },
+            ),
+            (false, _) => q38.enqueue_shared_add(
+                stream,
+                SharedAddArgs {
+                    hsum,
+                    sh: &s.sh_y,
+                    w: &x.weights,
+                    slot,
+                    slots,
+                    n,
+                    m,
+                    fault: sink,
+                    y: &mut s.y,
+                },
+            ),
+            (true, None) => Err(GpuError::state(
+                WHAT,
+                "the walk's card route over a map with card experts",
+            )),
+        }
     }
 }
 
@@ -1095,18 +1433,25 @@ impl<'a> LayerProgram for Gemm38<'a> {
         marked
     }
 
-    /// The shared expert over the arena's `ffn_x`.
+    /// The card route on a layer with card experts, then the shared expert
+    /// over the arena's `ffn_x`. The route is enqueued here and nowhere
+    /// else — after the front's download, the stream order the route's
+    /// buffers exist under (its module doc): enqueued before the download,
+    /// the d2h would queue behind the route's card GEMMs and the host tier
+    /// would start late by their whole time.
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = self
             .p
-            .shared(at.layer)
+            .route_card(at.layer)
+            .and_then(|()| self.p.shared(at.layer))
             .and_then(|()| port.mark(at.layer, Mark::Shadow as usize));
         port.part_end(at.layer, enq);
         r
     }
 
-    /// The gated sum over the host sums the walk's serve uploaded.
+    /// The gated sum over the host sums the walk's serve uploaded, the card
+    /// route's beside them on a layer with card experts.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = self
@@ -1184,8 +1529,9 @@ const WHAT_TIMING: &str = "qwen4exp ubatch walk timing";
 
 /// A card mark of a layer-batch's stream, in the order the walk enqueues
 /// them: the front's first launch, the front's last launch before the route's
-/// downloads, the downloads' end (the shared expert's launches follow), the
-/// shared expert's last launch, the sums' upload, the gated sum.
+/// downloads, the downloads' end (the card route, on a card layer, and the
+/// shared expert's launches follow), the shared expert's last launch, the
+/// sums' upload, the gated sum.
 #[derive(Clone, Copy)]
 enum Mark {
     Front = 0,
