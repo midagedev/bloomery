@@ -28,10 +28,10 @@ never assume the delegate reads that file. A delegate's report is not evidence: 
 transcript and read `git status` of its worktree. After a round, the lead re-runs the gates under its own ownership.
 Commits and pushes are lead-only.
 
-## Korean in this repo
+## Language in this repo
 
-Prose is written in Korean. `AGENTS.md`, code comments and documents headed upstream are English.
-Korean prose is never delegated; the lead writes it.
+New writing is English (user, 2026-09-30; `AGENTS.md` Conventions). Existing Korean is not translated.
+English prose may be delegated like any other spec-able work.
 
 ## Writing to rig-log
 
