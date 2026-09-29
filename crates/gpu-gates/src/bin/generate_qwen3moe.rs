@@ -1072,14 +1072,20 @@ mod cli {
             &PlanLevers::from_levers(levers)?,
             experts,
         )?;
+        let hot_list = levers
+            .hot_list()
+            .map_or_else(|| "none".to_string(), |p| p.display().to_string());
         println!(
-            "plan place={} card={} experts={} ctx_max={} host_experts={} card_experts={}",
-            place.name(),
-            card.name,
-            experts_name(experts),
-            plan.ctx_max,
-            plan.host.experts,
-            plan.cards[0].experts
+            "{}",
+            Record::new(&record::PLAN38)
+                .w("place", place.name())
+                .w("card", card.name)
+                .w("experts", experts_name(experts))
+                .u("ctx_max", plan.ctx_max)
+                .u("host_experts", plan.host.experts)
+                .u("card_experts", plan.cards[0].experts)
+                .w("hot_list", hot_list)
+                .line()
         );
         let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
         m.set_mode(mode);

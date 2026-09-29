@@ -175,7 +175,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `n_l` is refused. Read by `generate_ds41`, `bloomery-chat`, \
               `bloomery-serve-ds41`, `generate_glm5next` and `generate_qwen3moe` (a \
               qwen4exp card plan, `BLOOMERY_QWEN38_EXPERTS=card`; a host plan ranks \
-              none). The V4.1 binaries' `plan` line prints `hot_list=`.",
+              none). The `plan` line of the V4.1 binaries and `generate_qwen3moe` prints `hot_list=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
