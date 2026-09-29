@@ -13,7 +13,7 @@
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::sched::{At, Overlap, Port, PortKind, Refused};
 
-use super::batch::{BatchKey, ServeTimes};
+use super::batch::{BatchKey, ServeTimes, UnionCols};
 use super::{HostExperts, HostTier};
 use crate::GpuError;
 use std::time::{Duration, Instant};
@@ -68,8 +68,9 @@ impl<H: HostExperts> Port for StepLeg<'_, H> {
 
 /// One serve of a batch walk's host exchange, timed, for the [`LegTimer`]
 /// that asked for it: which layer over how many columns of the open walk, the
-/// slots its host experts listed and the wall of their union call, the
-/// serve's own host times and its whole wall (the upload's enqueue in it).
+/// slots its host experts listed and their per-expert counts, the wall of
+/// their union call, the serve's own host times and its whole wall (the
+/// upload's enqueue in it).
 pub struct ServeNote {
     /// The served layer.
     pub layer: usize,
@@ -77,6 +78,8 @@ pub struct ServeNote {
     pub cols: usize,
     /// Host slots the union listed.
     pub slots: u64,
+    /// The union's per-expert column counts.
+    pub union_cols: UnionCols,
     /// The union call's wall.
     pub union_ns: u64,
     /// The serve's host times ([`HostTier::serve_key`]).
@@ -254,7 +257,9 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
 
     /// Wait for `at`'s download, serve its host experts in one union call and
     /// enqueue the upload of their sums into the leg's `hsum`, the serve
-    /// timed and the upload marked for the walk's timer when it has one.
+    /// timed — its per-expert column counts ([`HostTier::served_union_cols`])
+    /// read between the serve and the upload — and the upload marked for the
+    /// walk's timer when it has one.
     fn serve(&mut self, at: At) -> Result<(), GpuError> {
         let key = self.key(at);
         let Some(t) = self.timer.as_deref_mut() else {
@@ -264,6 +269,7 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
         let t0 = Instant::now();
         let before = self.hybrid.stats();
         let times = self.hybrid.serve_key(key)?;
+        let union_cols = self.hybrid.served_union_cols(key)?;
         self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
         t.upload_mark(self.stream, at.layer)?;
         let after = self.hybrid.stats();
@@ -273,6 +279,7 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
             slots: after
                 .batch_host_slots
                 .saturating_sub(before.batch_host_slots),
+            union_cols,
             union_ns: after.batch_ns.saturating_sub(before.batch_ns),
             times,
             serve_ns: nanos(t0.elapsed()),

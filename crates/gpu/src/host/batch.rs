@@ -65,6 +65,31 @@ pub struct ServeTimes {
     pub copy_ns: u64,
 }
 
+/// Where one listed expert's columns of a layer-batch turn hot: past this
+/// many, the expert's activation set no longer fits a core's L2 beside the
+/// weight stream — the L2's capacity less the streaming margin, over the
+/// bytes one quantized activation column occupies.
+pub const HOT_COLS: usize = 136;
+
+/// What one served layer-batch's union held, per listed expert: how many
+/// experts its columns listed, the widest expert's columns, the experts past
+/// [`HOT_COLS`] columns and the columns they took, and `Σ m²` over the
+/// listed experts, which with the slots the serve listed gives the routing's
+/// spread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnionCols {
+    /// Distinct experts the layer-batch's columns listed.
+    pub experts: usize,
+    /// The most columns one listed expert took.
+    pub m_max: usize,
+    /// Listed experts past [`HOT_COLS`] columns.
+    pub m_hot: usize,
+    /// The columns those experts took.
+    pub cols_hot: usize,
+    /// `Σ m²` over the listed experts.
+    pub m_sq: u64,
+}
+
 /// Where a set stands: free, holding a layer-batch's route copies, or
 /// holding its host sums before their upload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1071,6 +1096,38 @@ impl<H: HostExperts> HostTier<H> {
         r
     }
 
+    /// The last batch service's [`UnionCols`] — the per-expert column counts
+    /// of the layer-batch `key`'s serve listed — read between that serve and
+    /// its upload by a walk that times its serves (the batch leg's timed
+    /// serve): the service must still be the port's oldest served, which
+    /// proves the lists the counts come from are exactly that serve's. Any
+    /// other state is refused by name.
+    pub fn served_union_cols(&mut self, key: BatchKey) -> Result<UnionCols, GpuError> {
+        const WHAT: &str = "HostTier::served_union_cols";
+        let port = self.port.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch port's sets (HostTier::prepare_batch)",
+        })?;
+        let cols = key.u.checked_sub(key.at).ok_or(GpuError::shape(
+            WHAT,
+            format!(
+                "the counts of {key:?}: its columns run {}..{}",
+                key.at, key.u
+            ),
+        ))?;
+        if port.sets[port.up].stage != Stage::Served(key) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the counts of {key:?}; the oldest served set holds {:?}",
+                    port.sets[port.up].stage
+                ),
+            ));
+        }
+        let n_used = self.step.boundary.layout.handoff().n_used;
+        Ok(self.batch.col_counts(cols, n_used))
+    }
+
     /// The tier's rows of `key`'s set as the stage card's card sum reads
     /// them ([`BatchPort::settle_tier`]), once the host has seen the tier's
     /// service complete, under the go deadline: a tier that has not finished
@@ -1167,6 +1224,11 @@ pub(super) struct BatchService {
     /// The storage of the per-column list slices, empty between services
     /// ([`reuse_slices`]).
     slices: Vec<&'static [(u32, f32)]>,
+    /// The per-expert column counts of the last served layer-batch, a column
+    /// a listed expert: [`BatchService::col_counts`]'s scratch, grown once to
+    /// the widest expert id any serve listed and read only by a walk that
+    /// times its serves.
+    counts: Vec<u32>,
     pub(super) stats: BatchStats,
 }
 
@@ -1371,6 +1433,44 @@ impl BatchService {
         s.batch_host_slots += host_slots;
         s.batch_excluded_slots += excluded;
         s.batch_ns += nanos(t0.elapsed());
+    }
+
+    /// The last served layer-batch's [`UnionCols`], counted over the lists
+    /// [`BatchService::serve_one`] built for its `cols` columns of the routed
+    /// width `n_used` — the same (expert, column) pairs its union plan
+    /// sorts, a column that names an expert twice counting it once, as the
+    /// plan does. The scratch grows once, to the widest expert id a serve
+    /// listed; no serve allocates and no lock is taken.
+    fn col_counts(&mut self, cols: usize, n_used: usize) -> UnionCols {
+        let (lens, lists, counts) = (&self.lens, &self.lists, &mut self.counts);
+        counts.fill(0);
+        for j in 0..cols {
+            let list = &lists[j * n_used..][..lens[j]];
+            for (i, &(id, _)) in list.iter().enumerate() {
+                if list[..i].iter().any(|&(seen, _)| seen == id) {
+                    continue;
+                }
+                let id = id as usize;
+                if id >= counts.len() {
+                    counts.resize(id + 1, 0);
+                }
+                counts[id] += 1;
+            }
+        }
+        let mut r = UnionCols::default();
+        for &m in counts.iter() {
+            if m == 0 {
+                continue;
+            }
+            r.experts += 1;
+            r.m_max = r.m_max.max(m as usize);
+            if m as usize > HOT_COLS {
+                r.m_hot += 1;
+                r.cols_hot += m as usize;
+            }
+            r.m_sq += u64::from(m) * u64::from(m);
+        }
+        r
     }
 }
 

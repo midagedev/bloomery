@@ -215,6 +215,7 @@ mod gate {
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
     };
     use bloomery_gpu::head::Head;
+    use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
     use bloomery_gpu::hybrid::{HOST, SlotMap, TIER};
     use bloomery_gpu::model::{ChainBody, StepMode};
@@ -2495,7 +2496,13 @@ mod gate {
 
     /// (g) with the walk's timing armed (`BLOOMERY_STEP_STATS`): the same
     /// ubatch writes `one`'s bits, and its record holds one ubatch and a row
-    /// for every layer with every card span read, finite and not negative.
+    /// for every layer with every card span read, finite and not negative,
+    /// whose routing counts hold: each row's slots are every position's
+    /// [`N_USED`] (D3K's experts all host, none left out), its widest expert
+    /// at least the mean (`m_max · experts ≥ slots`), its hot experts'
+    /// columns a sub-sum of consistent shape (`cols_hot ≤ slots`, none hot
+    /// exactly when none summed, each hot expert past [`HOT_COLS`]), and
+    /// `Σ m² ≥ slots²/experts` (Cauchy–Schwarz).
     fn gemm_timed(m: &mut Qwen38Model, prefill: &[u32], one: &Run) -> Result<bool, GateError> {
         m.set_prompt38_stats(true)?;
         fresh(m)?;
@@ -2541,6 +2548,34 @@ mod gate {
             verdict(rec_ok)
         );
         ok &= rec_ok;
+        // Σ slots over the rows against every position's ten host slots, and
+        // each row's counts against the sums they claim to come from.
+        let (mut sum, mut bad, mut m_max) = (0u64, 0usize, 0usize);
+        if let Some(s) = &stats {
+            for r in &s.rows {
+                let e = r.experts as u64;
+                sum += r.slots;
+                m_max = m_max.max(r.m_max);
+                bad += usize::from(
+                    r.cols != prefill.len()
+                        || r.slots != r.cols as u64 * N_USED as u64
+                        || r.m_max as u64 * e < r.slots
+                        || r.cols_hot as u64 > r.slots
+                        || (r.m_hot == 0) != (r.cols_hot == 0)
+                        || (r.m_hot > 0
+                            && (r.cols_hot as u64) < r.m_hot as u64 * (HOT_COLS as u64 + 1))
+                        || r.m_sq * e < r.slots * r.slots,
+                );
+            }
+        }
+        let want = rows as u64 * prefill.len() as u64 * N_USED as u64;
+        let counts_ok = rec_ok && bad == 0 && sum == want;
+        println!(
+            "gemm {D3K}: the timed walk's routing counts: {bad} layer row(s) off of {rows} (Σ slots \
+             {sum}, want rows·P·N_USED {want}; m_max {m_max}) {}",
+            verdict(counts_ok)
+        );
+        ok &= counts_ok;
         Ok(ok)
     }
 

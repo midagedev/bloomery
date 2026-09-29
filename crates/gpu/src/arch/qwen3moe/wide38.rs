@@ -1550,7 +1550,8 @@ pub(super) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// One layer-batch of a ubatch walk's timing: the serve's host time. The card
+/// One layer-batch of a ubatch walk's timing: the serve's host time and the
+/// union's per-expert column counts. The card
 /// times and the parts' enqueue walls are read once the walk's last mark is
 /// waited for.
 struct WideLb {
@@ -1558,13 +1559,21 @@ struct WideLb {
     layer: usize,
     cols: usize,
     slots: u64,
+    experts: usize,
+    m_max: usize,
+    m_hot: usize,
+    cols_hot: usize,
+    m_sq: u64,
     wait_ns: u64,
     union_ns: u64,
     serve_ns: u64,
 }
 
 /// One layer-batch of a Qwen3.8 ubatch walk under
-/// [`GpuModel::set_prompt38_stats`]: its columns and listed host slots, its
+/// [`GpuModel::set_prompt38_stats`]: its columns, listed host slots and their
+/// per-expert counts (the listed experts, the widest one's columns, the hot
+/// ones past an L2-sized activation set and their columns, and `Σ m²` over
+/// the listed experts), its
 /// serve's host time (the wait on the route's copies; the union call's wall,
 /// which carries the routing scan and the plan build in front of it; the
 /// serve's whole wall, the upload's enqueue in it), the host wall its parts
@@ -1582,6 +1591,16 @@ pub struct Prompt38Lb {
     pub cols: usize,
     /// Host slots the union listed.
     pub slots: u64,
+    /// Distinct experts the layer-batch's columns listed.
+    pub experts: usize,
+    /// The most columns one listed expert took.
+    pub m_max: usize,
+    /// Listed experts past [`HOT_COLS`](crate::host::batch::HOT_COLS)
+    /// columns, and the columns they took.
+    pub m_hot: usize,
+    pub cols_hot: usize,
+    /// `Σ m²` over the listed experts.
+    pub m_sq: u64,
     pub wait_ns: u64,
     pub union_ns: u64,
     pub serve_ns: u64,
@@ -1697,6 +1716,11 @@ impl WideTiming {
                 layer: row.layer,
                 cols: row.cols,
                 slots: row.slots,
+                experts: row.experts,
+                m_max: row.m_max,
+                m_hot: row.m_hot,
+                cols_hot: row.cols_hot,
+                m_sq: row.m_sq,
                 wait_ns: row.wait_ns,
                 union_ns: row.union_ns,
                 serve_ns: row.serve_ns,
@@ -1741,6 +1765,11 @@ impl LegTimer for WideTiming {
             layer: note.layer,
             cols: note.cols,
             slots: note.slots,
+            experts: note.union_cols.experts,
+            m_max: note.union_cols.m_max,
+            m_hot: note.union_cols.m_hot,
+            cols_hot: note.union_cols.cols_hot,
+            m_sq: note.union_cols.m_sq,
             wait_ns: note.times.wait_ns,
             union_ns: note.union_ns,
             serve_ns: note.serve_ns,

@@ -889,8 +889,11 @@ pub static TIME_PROMPT: Kind = Kind {
 pub static STAT_PROMPT38_LB: Kind = Kind {
     name: "stat_prompt38_lb",
     head: "stat prompt38 lb",
-    doc: "One layer-batch of a Qwen3.8 ubatch walk under BLOOMERY_STEP_STATS: its columns and the \
-          host slots its union listed, its serve's host time (the wait on the route's copies; the \
+    doc: "One layer-batch of a Qwen3.8 ubatch walk under BLOOMERY_STEP_STATS: its columns, the \
+          host slots its union listed and their per-expert counts (the listed experts, the widest \
+          one's columns, the hot ones past an L2-sized activation set and their columns, and Σ m² \
+          over the listed experts, which with the slots gives the routing's spread), its serve's \
+          host time (the wait on the route's copies; the \
           union call's wall, which carries the routing scan and the plan build in front of it; the \
           serve's whole wall, the upload's enqueue in it), the host wall its front, shared expert \
           and gated sum took to enqueue, and its card time by part (the front's launches, the \
@@ -901,6 +904,11 @@ pub static STAT_PROMPT38_LB: Kind = Kind {
         key("layer", U64, ""),
         key("cols", U64, ""),
         key("slots", U64, "slots"),
+        key("experts", U64, ""),
+        key("m_max", U64, "columns"),
+        key("m_hot", U64, "experts"),
+        key("cols_hot", U64, "columns"),
+        key("m_sq", U64, "columns^2"),
         key("wait_ms", F64(2), "ms"),
         key("union_ms", F64(2), "ms"),
         key("serve_ms", F64(2), "ms"),
@@ -920,7 +928,9 @@ pub static STAT_PROMPT38_SPLIT: Kind = Kind {
     doc: "A Qwen3.8 prompt's ubatch walks under BLOOMERY_STEP_STATS, summed: the ubatches and \
           layer-batches that ran, the host prologue every walk's plan took (the PLE rows, the \
           record, their copy) and the walks' whole wall, the serves' union and wait and the host \
-          slots they listed, the walks' wall less the serves' as the enqueue's share, and the card \
+          slots they listed with their per-expert counts (the mean listed experts, hot experts \
+          and their columns and Σ m² a layer-batch, and the widest one expert's columns over the \
+          prompt), the walks' wall less the serves' as the enqueue's share, and the card \
           time by part summed (the fronts, the route downloads, the shared experts, the uploads, \
           the gated sums) with per layer-batch means.",
     parts: &[
@@ -938,6 +948,11 @@ pub static STAT_PROMPT38_SPLIT: Kind = Kind {
         key("serve_lb", F64(2), "ms/lb"),
         key("enqueue_lb", F64(2), "ms/lb"),
         key("slots_lb", F64(1), "slots/lb"),
+        key("experts_lb", F64(1), "experts/lb"),
+        key("m_max", U64, "columns"),
+        key("m_hot_lb", F64(1), "experts/lb"),
+        key("cols_hot_lb", F64(1), "columns/lb"),
+        key("m_sq_lb", F64(1), "columns^2/lb"),
         key("card_front_ms", F64(1), "ms"),
         key("card_down_ms", F64(1), "ms"),
         key("card_shadow_ms", F64(1), "ms"),
@@ -1806,6 +1821,11 @@ mod tests {
             .u("layer", 3)
             .u("cols", 4096)
             .u("slots", 40960)
+            .u("experts", 512)
+            .u("m_max", 97)
+            .u("m_hot", 0)
+            .u("cols_hot", 0)
+            .u("m_sq", 3_312_000)
             .f("wait_ms", 21.53)
             .f("union_ms", 214.87)
             .f("serve_ms", 236.71)
@@ -1818,7 +1838,8 @@ mod tests {
             .line();
         assert_eq!(
             lb,
-            "stat prompt38 lb b=0 layer=3 cols=4096 slots=40960 wait_ms=21.53 union_ms=214.87 \
+            "stat prompt38 lb b=0 layer=3 cols=4096 slots=40960 experts=512 m_max=97 m_hot=0 \
+             cols_hot=0 m_sq=3312000 wait_ms=21.53 union_ms=214.87 \
              serve_ms=236.71 enqueue_ms=0.94 card_front_ms=19.62 card_down_ms=1.84 \
              card_shadow_ms=0.71 card_upload_ms=1.79 card_back_ms=0.21"
         );
@@ -1837,6 +1858,11 @@ mod tests {
             .f("serve_lb", 236.75)
             .f("enqueue_lb", 0.94)
             .f("slots_lb", 40960.0)
+            .f("experts_lb", 512.0)
+            .u("m_max", 97)
+            .f("m_hot_lb", 0.0)
+            .f("cols_hot_lb", 0.0)
+            .f("m_sq_lb", 3312000.0)
             .f("card_front_ms", 941.8)
             .f("card_down_ms", 88.3)
             .f("card_shadow_ms", 34.1)
@@ -1853,7 +1879,8 @@ mod tests {
             "stat prompt38 split ubatches=1 layer_batches=48 prologue_ms=18.4 walk_ms=13780.9 \
              union_ms=10313.8 wait_ms=1033.4 serve_ms=11364.1 enqueue_ms=2416.8 \
              host_slots=1966080 union_lb=214.87 wait_lb=21.53 serve_lb=236.75 enqueue_lb=0.94 \
-             slots_lb=40960.0 card_front_ms=941.8 card_down_ms=88.3 card_shadow_ms=34.1 \
+             slots_lb=40960.0 experts_lb=512.0 m_max=97 m_hot_lb=0.0 cols_hot_lb=0.0 \
+             m_sq_lb=3312000.0 card_front_ms=941.8 card_down_ms=88.3 card_shadow_ms=34.1 \
              card_upload_ms=85.9 card_back_ms=10.1 card_front_lb=19.62 card_down_lb=1.84 \
              card_shadow_lb=0.71 card_upload_lb=1.79 card_back_lb=0.21"
         );

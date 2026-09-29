@@ -1,0 +1,25 @@
+# The lcg prompt's routing spread on the Qwen3.8 ubatch walk, read from the five routing fields the batch port now
+# counts on every served layer-batch (`stat prompt38 lb`: experts, m_max, m_hot, cols_hot, m_sq; the split's means).
+# The paper (reports/q38insitu3 §3-§5): the union's +49.6 ms a layer-batch at P = 4096 over the bench fit closes only
+# through skew — experts past HOT_COLS = 136 columns spill their activation set out of L2 — and the working skew that
+# closes it is Zipf a ~ 0.7 over 512 experts. The spread ratio R = m_sq_lb * experts_lb / slots_lb^2 (1 for an even
+# spread) is the one number that separates the two readings [derived, Zipf over 512 experts, 40,960 slots]:
+# uniform ids 1.000 (multinomial noise adds 0.0125; m_max ~ 106, m_hot 0), a = 0.5 1.82 (47 hot, 28 % of the columns),
+# a = 0.7 4.16 (52 hot, 43 %), a = 1.0 capped at P columns an expert.
+# Wall [derived]: two arms ~35 s with warm rows, lease and preheat: under 5 min (the build runs before the lease).
+kind: calibration
+question: is the lcg prompt's routing skewed enough (R ~ 4, a ~ 0.7) that L2 spill explains the union's in-situ excess?
+term: stat prompt38 split spread ratio m_sq_lb * experts_lb / slots_lb^2 @ P = 4096, BLOOMERY_STEP_STATS=1, A6000,
+  ours (generate_qwen3moe, the ubatch walk, all-host, the lcg prompt)
+unit: ratio
+predict: 3.0..5.5
+condition: BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_WARM_ROWS=1 BLOOMERY_THREADS=32
+  BLOOMERY_LEASE_CARD=docs/cards/q38mhist-read.card' just depth-gpu-qwen4exp 512 4096, the full output to a file
+  first; the arms' plan text reads ubatch:512 and ubatch:4096; no counted row [cold] or [other-busy]
+decide-in: the skew-spill account holds: price the hot-column block (HOT_COLS) on the measured m_hot and cols_hot, and
+  the hot list's card share from the same histogram (q38reuse §2 rows at the measured a)
+decide-below: the spread is near even (R under 1.5): L2 spill is not the excess; the in-situ cost is per column —
+  re-derive from the serve's serial scan and the per-column slope in code, and drop the column-block design
+decide-above: heavier than a = 0.7: the hot experts dominate; price the hot list first (its card share is the top-n_l
+  mass), then the column block on what stays host
+reason: every Qwen3.8 union and hot-list prediction reads the routing spread; the code cannot give it, the records now do
