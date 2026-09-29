@@ -1,4 +1,5 @@
-# Fixture: an sd override with its source: 0.45 % at 3 rounds gives h 1.020 % < 1.1 %.
+# Fixture: an sd override with its source: 0.45 % at 3 rounds gives h 1.118 % >= 1.1 %,
+# resolved at 4.
 kind: ab
 question: does the fixture lever shorten the decode step?
 term: decode tok/s @ n=96, depth 6, A6000 — (changed − base) / base, paired by round

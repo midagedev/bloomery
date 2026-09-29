@@ -432,11 +432,11 @@ timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
-# The t quantiles of the ratio intervals, df 1..ROUNDS: tools/ref/tdist.py, the table gpu-ab.py and
-# card.py read.
-T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
+# The ratio intervals' multipliers, one per round count 1..ROUNDS: tools/ref/ruler.py, the one owner
+# of the interval the tables print (f(c) = t975(c - 1) / sqrt(c)); card.py's ruler reads the same.
+RULER_FACTORS=$(python3 "${BASH_SOURCE[0]%/*}/ruler.py" factors "$ROUNDS") || {
   rc=$?
-  echo "depth-qwen3moe.sh: tools/ref/tdist.py gave no t quantiles for ROUNDS=$ROUNDS (rc $rc; ROUNDS is a positive integer)" >&2
+  echo "depth-qwen3moe.sh: tools/ref/ruler.py gave no interval factors for ROUNDS=$ROUNDS (rc $rc; ROUNDS is a positive integer)" >&2
   exit "$rc"
 }
 # Each engine's binary matters only to its own arms: a reference-only run neither builds ours (the
@@ -982,18 +982,19 @@ dry_cmd() {
 
 # ratio_table <prefix> <keys> <labels> <tagged> <tag field>: records `label|key|round|value|…` on stdin;
 # for every key and every label but ours, each round's ours / label ratio (arms that ran more than once
-# in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1 degrees of
-# freedom, T975) and the ratio of the arm means. With tagged = 1 field 5 is the row's tags, and the
+# in a round averaged first), their mean with its 95 % interval (the paired t at rounds - 1 degrees
+# of freedom, RULER_FACTORS — tools/ref/ruler.py, the card's ruler too) and the ratio of the arm
+# means. With tagged = 1 field 5 is the row's tags, and the
 # line ends with each side's count of [other-busy]; a <tag field> above 0 is the record's field that
 # holds its tags, and the line then ends with each side's count of [cold].
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v rounds="$ROUNDS" -v t975="$T975" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v rounds="$ROUNDS" -v factors="$RULER_FACTORS" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
   if (tagged && $5 ~ /other-busy/) bo[a]++
   if (tf && $tf ~ /cold/) bk[a]++
 } END {
-  nt = split(t975, t, " ")
+  nf = split(factors, f, " ")
   nd = split(deps, d, " ")
   nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
@@ -1010,8 +1011,8 @@ ratio_table() {
     m /= c; ss = 0
     for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
     if (c < 2) ci = "(one round: no interval)"
-    else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
-    else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
+    else if (c > nf || f[c] == "-") ci = sprintf("(no interval factor for %d rounds)", c)
+    else ci = sprintf("± %.4f", f[c] * sqrt(ss / (c - 1)))
     ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
     busy = tagged ? sprintf("  busy: ours [other-busy %d/%d], %s [other-busy %d/%d]", bo[ao], an[ao], ref, bo[ar], an[ar]) : ""
     cold = tf ? sprintf("  cold: ours %d/%d, %s %d/%d", bk[ao], an[ao], ref, bk[ar], an[ar]) : ""

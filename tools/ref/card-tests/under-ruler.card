@@ -1,4 +1,4 @@
-# Fixture: the HC_PRE band at three rounds: h 1.360 % >= 0.9 %, resolved at 5.
+# Fixture: the HC_PRE band at three rounds: h 2.108 % >= 0.9 %, resolved at 6.
 kind: ab
 question: does the fixture lever shorten the decode step?
 term: decode tok/s @ n=96, depth 6, A6000 — (changed − base) / base, paired by round

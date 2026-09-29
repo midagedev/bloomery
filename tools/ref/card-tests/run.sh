@@ -31,13 +31,13 @@ n=0 failed=0
 T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/docs/cards" "$tmp/old/tools" "$tmp/nocard/tools/ref"
 cp "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease-hold.sh" "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" \
-  "$ROOT/tools/ref/card-precheck.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/ruler.py" "$ROOT/tools/ref/card-precheck.sh" "$T/tools/ref/"
 cp "$ROOT/tools/gpu-ab.py" "$T/tools/"
 cp "$ROOT"/docs/cards/*.card "$HERE/hcpre-ab.card" "$HERE/exclusive.card" "$T/docs/cards/"
 echo 'BLOOMERY_BOX_ENV' > "$T/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/old/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/nocard/tools/box.sh"
-cp "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" "$tmp/nocard/tools/ref/"
+cp "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/ruler.py" "$tmp/nocard/tools/ref/"
 
 pass() { n=$((n + 1)); echo "ok $1"; }
 fail() {
@@ -156,17 +156,27 @@ fakeproc() {
   echo "1: FLOCK  ADVISORY  WRITE 4241 $key 0 EOF" > "$p/locks"
 }
 
-# card.py on the fixtures: every refusal names its code, every pass its verdict.
-card valid-ab.card 0 'ok kind=ab h = 1\.038 % at 4 rounds \(the card; t 2\.447, df 6'
-card hcpre-ab.card 0 'ok kind=ab h = 0\.875 % at 5 rounds \(the card; t 2\.306, df 8'
+# card.py on the fixtures: every refusal names its code, every pass its verdict. The ruler's values
+# come from tools/ref/ruler.py, the paired interval the depth runners' ratio tables print:
+# h = t975(N - 1) * sd / sqrt(N), sd one round's ratio scatter, its default sqrt(2) x the same-binary
+# 0.6 % = 0.848528 % (both arms' scatter in quadrature, none shared within the round):
+#   N = 2: 12.706 * 0.6 * sqrt(2/2) = 7.624 %   N = 3: 4.303 * 0.6 * sqrt(2/3) = 2.108 %
+#   N = 5: 2.776 * 0.6 * sqrt(2/5) = 1.053 %    an sd override plugs straight in: 0.45 % at N = 3 is
+#   4.303 * 0.45 / sqrt(3) = 1.118 %
+# [derived; the runners' tables print the same h from their ratios' sample SD]
+card valid-ab.card 0 'ok kind=ab h = 1\.350 % at 4 rounds \(the card; t 3\.182, df 3'
+card ruler-n2.card 0 'ok kind=ab h = 7\.624 % at 2 rounds \(the card; t 12\.706, df 1'
+card hcpre-ab.card 0 'ok kind=ab h = 1\.053 % at 5 rounds \(the card; t 2\.776, df 4'
 card under-ruler.card 68 'refused CARD_UNDER_RULER \(rc 68\)'
-card under-ruler.card 68 'resolves at 5 rounds: h = 0\.875 % < 0\.9 %'
-card under-ruler.card 68 'box minutes at 5 rounds: 5 x 2\.5 = 12\.5 min' --round-minutes 2.5
+card under-ruler.card 68 'h = 2\.108 % at 3 rounds \(the card; t 4\.303, df 2'
+card under-ruler.card 68 'resolves at 6 rounds: h = 0\.891 % < 0\.9 %'
+card under-ruler.card 68 'box minutes at 6 rounds: 6 x 2\.5 = 15 min' --round-minutes 2.5
 card under-ruler.card 68 'box minutes: unknown'
-card under-ruler.card 0 'the runner runs 5 rounds and the card says 3: checked at 5' --rounds 5
+card under-ruler.card 68 'the runner runs 5 rounds and the card says 3: checked at 5' --rounds 5
 card valid-ab.card 68 'the runner runs 2 rounds and the card says 4: checked at 2' --rounds 2
 card straddle.card 68 'contains 0, so its nearest edge is 0: no round count resolves it'
-card sd-override.card 0 'h = 1\.020 % at 3 rounds .*sd 0\.45 % — a paired ratio SD'
+card sd-override.card 68 'h = 1\.118 % at 3 rounds .*sd 0\.45 % — a paired ratio SD'
+card sd-override.card 68 'resolves at 4 rounds: h = 0\.716 % < 1\.1 %'
 card sd-no-source.card 65 'names no source'
 card same-decisions.card 67 'refused CARD_UNDECIDABLE \(rc 67\)'
 card no-condition.card 65 'no `condition` \(kind ab requires it\)'
@@ -191,10 +201,15 @@ run 'check usage' 64 'usage' python3 "$ROOT/tools/ref/card.py" check
 run 'check bad --rounds' 64 '--rounds takes a positive integer' python3 "$ROOT/tools/ref/card.py" check "$HERE/valid-ab.card" --rounds three
 
 # The cards the tree carries: every one passes check; lease mode takes the self-test card and refuses
-# the examples, which document the format and predict nothing.
+# the examples, which document the format and predict nothing. The example ab card's +0.9..+1.3 band
+# at 5 rounds sits inside the paired ruler (h 1.053 %; it resolves at 6) — its refusal is pinned as
+# what it is, the example the format's default sd now refuses, not a card to fix here.
 for f in "$ROOT"/docs/cards/*.card; do
+  [ "${f##*/}" = example-ab.card ] && continue
   run "docs/cards/${f##*/}" 0 '^card: ok kind=' python3 "$ROOT/tools/ref/card.py" check "$f"
 done
+run 'docs/cards/example-ab.card' 68 'resolves at 6 rounds: h = 0\.891 % < 0\.9 %' \
+  python3 "$ROOT/tools/ref/card.py" check "$ROOT/docs/cards/example-ab.card"
 run 'lease mode refuses an example card' 66 'docs/cards/example-ab\.card is an example: the format.s documentation, not a prediction' \
   python3 "$ROOT/tools/ref/card.py" lease docs/cards/example-ab.card
 run 'lease mode takes the self-test card' 0 '^\[lease\] card: ok kind=exclusive minutes=1 ' \
@@ -255,7 +270,7 @@ else
     BLOOMERY_LEASE_CARD=tools/ref/card-tests/valid-ab.card
   take "$T" 'lease_take refuses an example card' 66 'is an example' "$tmp/l1.lock" BLOOMERY_LEASE_CARD=docs/cards/example-profile.card
   take "$T" 'lease_take refuses a missing card' 66 'no such card in' "$tmp/l1.lock" BLOOMERY_LEASE_CARD=docs/cards/no-such.card
-  take "$T" 'lease_take checks an ab card at the runner ROUNDS' 68 'h = 1\.360 % at 3 rounds \(the runner' "$tmp/l1.lock" \
+  take "$T" 'lease_take checks an ab card at the runner ROUNDS' 68 'h = 2\.108 % at 3 rounds \(the runner' "$tmp/l1.lock" \
     BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card ROUNDS=3
   take "$T" 'lease_take falls back to BLOOMERY_AB_ROUNDS' 68 'the runner runs 3 rounds and the card says 5' "$tmp/l1.lock" \
     BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_AB_ROUNDS=3
@@ -266,7 +281,7 @@ else
   absent 'refused runs open no lease file' "$tmp/l1.lock"
   take "$T" 'lease_take prints the card, then holds' 0 '^\[lease\] card \| kind: ab$' "$tmp/l2.lock" \
     BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card ROUNDS=5
-  for pat in '^\[lease\] card: docs/cards/hcpre-ab\.card sha256=[0-9a-f]{64}$' '^\[lease\] card: ok kind=ab h = 0\.875 % at 5 rounds \(the runner' \
+  for pat in '^\[lease\] card: docs/cards/hcpre-ab\.card sha256=[0-9a-f]{64}$' '^\[lease\] card: ok kind=ab h = 1\.053 % at 5 rounds \(the runner' \
     'is not the machine lease' '^\[lease\] held by pid' '^\[test\] lease_take returned$'; do
     has "lease_take ok prints /$pat/" "$pat"
   done
@@ -527,7 +542,7 @@ pre() {
 }
 pre 'precheck without a card refuses before any build' 66 'refused CARD_ABSENT \(rc 66\): BLOOMERY_LEASE_CARD is empty' \
   "$T/tools/ref/card-precheck.sh"
-pre 'precheck passes the environment card' 0 '^\[lease\] card: ok kind=ab h = 0\.875 % at 5 rounds' \
+pre 'precheck passes the environment card' 0 '^\[lease\] card: ok kind=ab h = 1\.053 % at 5 rounds' \
   BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_AB_ROUNDS=5 "$T/tools/ref/card-precheck.sh"
 pre 'precheck checks an ab card at BLOOMERY_AB_ROUNDS' 68 'refused CARD_UNDER_RULER' \
   BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_AB_ROUNDS=3 "$T/tools/ref/card-precheck.sh"

@@ -69,12 +69,18 @@ counted() { [ "$ROW_TAG" = ROW ]; }
 FAILED=() FAILED_KEYS=()
 # arm_fail <round> <label> <d=|p=key> <rc> <why> [<output>]: the FAIL row in place of the arm's row; the
 # output, when there is one, goes whole to a file (a loader's reason is many lines above its tail).
+# Its `last line` is the last non-blank line of the arm's own output, not of the load's: a load prints
+# the clear's report — a `residency reset` record, the one the next arm's seed condition reads
+# (LG_PREV_OUT) — after this arm's own lines and before the next `arm` line, and that record names the
+# next arm, not the failure. The rule: the last non-blank line that is not a `residency reset` record
+# (a reset the arm printed inside its own work, before a line of another kind, is the runner's
+# residency failure and says so in `why`; one at the end is the clear's, either way).
 arm_fail() {
   local r=$1 label=$2 key=$3 rc=$4 why=$5 out=${6:-} f='' last
   if [ -n "$out" ]; then
     f=${TMPDIR:-/tmp}/$ARM_FAIL_STEM-${label//[^A-Za-z0-9_.=-]/_}-${key/=/}-r$r.log
     printf '%s\n' "$out" > "$f"
-    last=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+    last=$(printf '%s\n' "$out" | awk '$0 !~ /^residency reset / && NF { l = $0 } END { print l }')
     echo "$out" | tail -n 20 >&2
     [ -z "$last" ] || why="$why; last line: $last"
   fi
@@ -355,6 +361,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   row=$(arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" "$(printf 'load\nggml_cuda_error: x\n\n')" 2> /dev/null)
   check fail-row "$row" "FAIL r1 lcpppp4096 p=4096 rc=134 | no 'pp4096' row; last line: ggml_cuda_error: x | full output: $TMPDIR/runner-lcpppp4096-p4096-r1.log [other-busy]"
   check fail-file "$(cat "$TMPDIR/runner-lcpppp4096-p4096-r1.log" 2> /dev/null | head -n 2 | paste -sd'|' -)" "load|ggml_cuda_error: x"
+  # A load's arm output ends with the clear's report for the next arm (`residency reset`, the record
+  # the next arm's seed reads): the last line is the arm's own, before that record.
+  row=$(arm_fail 2 'ours@R' d=6 1 "no SMOKE line" "$(printf 'arm i=1 arms=2 depth=6\nfed n=6\n\nresidency reset cancelled=1 copies=2 diff=0 dropped_bytes=0\n')" 2> /dev/null)
+  check fail-last-skips-next-arm "$row" "FAIL r2 ours@R d=6 rc=1 | no SMOKE line; last line: fed n=6 | full output: $TMPDIR/runner-ours_R-d6-r2.log [other-busy]"
   arm_fail 1 lcpppp4096 p=4096 134 "no 'pp4096' row" > /dev/null
   ROW_TAG=DISCARD
   row=$(arm_fail 0 'ours@X=1' d=6 3 "exited 3")

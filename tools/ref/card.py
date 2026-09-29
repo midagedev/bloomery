@@ -39,9 +39,12 @@ that does not parse is CARD_MALFORMED.
                 followed by the unit. For ab it is the effect in percent, signed: (changed - base) /
                 base of `term`, so + means the changed arm's value is the larger one
   rounds        ab only, required: rounds per arm; a round runs every arm once
-  sd            ab only, optional: the scatter of one run in percent, then where it comes from, e.g.
-                `sd: 0.45 % <rig-log entry>, paired ratio SD over 5 rounds`; a number with no source
-                is malformed. Default: 0.6 %, AGENTS.md 「Know the ruler」
+  sd            ab only, optional: the scatter of one round's ratio of the two arms, in percent,
+                then where it comes from, e.g. `sd: 0.45 % <rig-log entry>, paired ratio SD over 5
+                rounds`; a number with no source is malformed. Default: 0.848528 % = sqrt(2) x the
+                same-binary 0.6 % of AGENTS.md 「Know the ruler」 (18 runs) — both arms' scatter in
+                quadrature, none of it shared within the round, the conservative end (the pairing
+                cancels what they share)
   condition     what must happen inside the measured window, and how the run ensures it
   decide-in     the next action when the measured value falls inside the band
   decide-below  the next action when it falls below lo
@@ -58,16 +61,19 @@ condition and the three decisions, plus the keys named above for it.
 
 Checks, in this order. The text parses (CARD_MALFORMED). At least two of the three decisions differ,
 compared with case and whitespace folded (CARD_UNDECIDABLE). An ab card meets the ruler: the 95 %
-half-width of a difference of two arm means at N rounds per arm,
+half-width of the mean of the sitting's N per-round ratios — the interval the depth runners' ratio
+tables print (the round pairs the two arms' rows, cancelling what the round's machine state does to
+both),
 
-    h = t(0.975, 2N - 2) * sd * sqrt(2 / N)
+    h = t(0.975, N - 1) * sd / sqrt(N)
 
-the pooled two-sample interval tools/gpu-ab.py reports (both read the t table in
-tools/ref/tdist.py), which is the form that gives AGENTS.md's ±1.0 % at four rounds and ±0.8 % at
-six with sd 0.6 % — the normal quantile 1.96 in place of t gives 0.83 % and 0.68 %. The card is
-refused (CARD_UNDER_RULER) when the band's edge nearest zero is inside h, |edge| <= h; a band that
-contains 0 has its nearest edge at 0, and no round count resolves it. The refusal names the smallest
-N that resolves the band and, given --round-minutes, the box minutes those rounds cost.
+tools/ref/ruler.py owns the form, the runners' tables reading the same function (the paired df
+N - 1, one per round, is what a two-round sitting pays for: t 12.706 against the two-sample 4.303
+of two independent arm means, which under-predicted a two-round table's interval by ~3x). With the
+default sd the ruler is ±7.624 % at two rounds, ±1.350 % at four and ±0.891 % at six [derived].
+The card is refused (CARD_UNDER_RULER) when the band's edge nearest zero is inside h, |edge| <= h;
+a band that contains 0 has its nearest edge at 0, and no round count resolves it. The refusal names
+the smallest N that resolves the band and, given --round-minutes, the box minutes those rounds cost.
 
 Exit codes (never 75, which is lease contention):
    0  the card passes
@@ -77,7 +83,7 @@ Exit codes (never 75, which is lease contention):
                         tree, an example card, or no such file; (check) no such file
   67  CARD_UNDECIDABLE  the three decisions are one action
   68  CARD_UNDER_RULER  an ab card's predicted effect is inside the ruler at its rounds
-  70  the t table in tools/ref/tdist.py does not load
+  70  the ruler module (tools/ref/ruler.py, with the t table tools/ref/tdist.py) does not load
 """
 import hashlib
 import importlib.util
@@ -102,7 +108,9 @@ REQUIRED = {'ab': ('kind',) + PREDICTION + ('rounds',), 'profile': ('kind',) + P
 OPTIONAL = {'ab': ('sd',)}
 KEYS = {'kind', 'rounds', 'sd', 'reason', 'minutes'} | set(PREDICTION)
 DECISIONS = ('decide-in', 'decide-below', 'decide-above')
-SD_DEFAULT = (0.6, 'the default, AGENTS.md 「Know the ruler」: same-binary runs scatter with SD 0.6 % (18 runs)')
+SD_DEFAULT = (0.6 * math.sqrt(2), 'the default, sqrt(2) x the same-binary 0.6 % of AGENTS.md 「Know the ruler」'
+                                 ' (18 runs): both arms\' scatter in quadrature, none shared within a round —'
+                                 ' the pairing cancels what they share')
 ROUNDS_CAP = 100000
 
 NUM = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
@@ -229,21 +237,18 @@ def fold(text):
     return re.sub(r'\s+', ' ', text).strip().rstrip('.').casefold()
 
 
-def t_table():
-    path = os.path.join(TREE, 'tools', 'ref', 'tdist.py')
+def ruler_mod():
+    """tools/ref/ruler.py, the interval's one owner — the depth runners' ratio tables read the same
+    function."""
+    path = os.path.join(TREE, 'tools', 'ref', 'ruler.py')
     try:
-        spec = importlib.util.spec_from_file_location('tdist', path)
+        spec = importlib.util.spec_from_file_location('ruler', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.t975
-    except Exception as e:  # a missing or broken tdist.py must stop the check, never skip it
-        print(f'card.py: the t table ({path}, t975) does not load: {e}', file=sys.stderr)
+        return module
+    except Exception as e:  # a missing or broken ruler (with its t table) must stop the check, never skip it
+        print(f'card.py: the ruler module ({path}, which reads tools/ref/tdist.py) does not load: {e}', file=sys.stderr)
         sys.exit(SOFTWARE)
-
-
-def half_width(t975, sd, n):
-    df = 2 * n - 2
-    return t975(df) * sd * math.sqrt(2 / n), t975(df), df
 
 
 def ruler(card, runner_rounds, round_minutes):
@@ -260,8 +265,8 @@ def ruler(card, runner_rounds, round_minutes):
     edge = 0.0 if lo <= 0 <= hi else min(abs(lo), abs(hi))
     if n < 2:
         raise Refused(UNDER_RULER, notes + [f'{n} round has no interval: an ab run needs 2 rounds or more'])
-    t975 = t_table()
-    h, t, df = half_width(t975, sd, n)
+    mod = ruler_mod()
+    h, t, df = mod.half_width(sd, n)
     ruler_text = f'h = {h:.3f} % at {n} rounds ({source}; t {t:.3f}, df {df}; sd {sd:g} % — {sd_source})'
     if edge > h:
         return notes, f'{ruler_text}; the band\'s edge nearest zero, {edge:g} %, is outside h'
@@ -270,11 +275,11 @@ def ruler(card, runner_rounds, round_minutes):
     if edge == 0:
         lines.append(f'the band {lo:g}..{hi:g} contains 0, so its nearest edge is 0: no round count resolves it')
         raise Refused(UNDER_RULER, lines)
-    need = next((m for m in range(2, ROUNDS_CAP + 1) if half_width(t975, sd, m)[0] < edge), None)
+    need = next((m for m in range(2, ROUNDS_CAP + 1) if mod.half_width(sd, m)[0] < edge), None)
     if need is None:
         lines.append(f'more than {ROUNDS_CAP} rounds would be needed to resolve {edge:g} %')
         raise Refused(UNDER_RULER, lines)
-    lines.append(f'resolves at {need} rounds: h = {half_width(t975, sd, need)[0]:.3f} % < {edge:g} %')
+    lines.append(f'resolves at {need} rounds: h = {mod.half_width(sd, need)[0]:.3f} % < {edge:g} %')
     if round_minutes is None:
         lines.append('box minutes: unknown — the runner does not state its minutes per round (ROUND_MINUTES, --round-minutes)')
     else:

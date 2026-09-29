@@ -228,8 +228,8 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-$CPU_BUSY_COMMS generate_glm5next generate_qwen3moe python3}
 WITNESS=(head-open indent card busiest model mem pgmajfault)
-T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
-  echo "depth-glm5next.sh: tools/ref/tdist.py gave no t quantiles for ROUNDS=$ROUNDS" >&2
+RULER_FACTORS=$(python3 "${BASH_SOURCE[0]%/*}/ruler.py" factors "$ROUNDS") || {
+  echo "depth-glm5next.sh: tools/ref/ruler.py gave no interval factors for ROUNDS=$ROUNDS" >&2
   exit 2
 }
 # Plan (a) is made for the card named A6000, the gate plan for the 3090; the arms see the timing card only.
@@ -776,14 +776,15 @@ run_row() {
 }
 
 # ratio_table <prefix> <keys> <labels>: records `label|key|round|value` on stdin; for every key and
-# every label, each round's ours / label ratio, their mean with its 95 % interval (Student t at rounds
-# - 1 degrees of freedom) and the ratio of the arm means (depth-qwen3moe.sh's table).
+# every label, each round's ours / label ratio, their mean with its 95 % interval (the paired t at
+# rounds - 1 degrees of freedom, RULER_FACTORS — tools/ref/ruler.py, the card's ruler too) and the
+# ratio of the arm means (depth-qwen3moe.sh's table).
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v rounds="$ROUNDS" -v t975="$T975" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v rounds="$ROUNDS" -v factors="$RULER_FACTORS" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
 } END {
-  nt = split(t975, t, " "); nd = split(deps, d, " "); nr = split(refs, rf, " ")
+  nf = split(factors, f, " "); nd = split(deps, d, " "); nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
     ref = rf[j]
     if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
@@ -798,8 +799,8 @@ ratio_table() {
     m /= c; ss = 0
     for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
     if (c < 2) ci = "(one round: no interval)"
-    else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
-    else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
+    else if (c > nf || f[c] == "-") ci = sprintf("(no interval factor for %d rounds)", c)
+    else ci = sprintf("± %.4f", f[c] * sqrt(ss / (c - 1)))
     printf "%s%-5s ours/%-16s mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", prefix, d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
   }
 }'

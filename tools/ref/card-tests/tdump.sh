@@ -2,11 +2,12 @@
 # The t dump: the two-sided 95 % t quantile each of the four readers of the t table uses, df 1..40,
 # one row per df:
 #   df  gpu-ab  card  depth-ds41  depth-qwen3moe
-# gpu-ab is tools/gpu-ab.py's t975, card is tools/ref/card.py's t_table(), and the last two are what
+# gpu-ab is tools/gpu-ab.py's t975, card is tools/ref/card.py's ruler (tools/ref/ruler.py's t975),
+# and the last two are what
 # each depth runner's ratio_table prints: its awk runs on 41 rounds of records whose per-round ratios
 # have a sample SD of sqrt(c) over c rounds, so the interval it prints for c rounds is t at
 # df = c - 1 itself (4 decimals). The function runs as the runner holds it (cut out of the script)
-# with T975 made the way the runner makes it.
+# with RULER_FACTORS made the way the runner makes it.
 #
 #   tools/ref/card-tests/tdump.sh [TREE]     (TREE defaults to this tree)
 #
@@ -35,7 +36,7 @@ def load(name, path):
 
 
 gpu_ab = load('gpu_ab', os.path.join(tree, 'tools', 'gpu-ab.py')).t975
-card = load('card', os.path.join(tree, 'tools', 'ref', 'card.py')).t_table()
+card = load('card', os.path.join(tree, 'tools', 'ref', 'card.py')).ruler_mod().t975
 for df in range(1, maxdf + 1):
     print(df, f'{gpu_ab(df):.4f}', f'{card(df):.4f}')
 PY
@@ -61,13 +62,13 @@ for runner in depth-ds41 depth-qwen3moe; do
     echo "tdump: no ratio_table() in $src" >&2
     exit 1
   fi
-  T975=
-  if [ -f "$TREE/tools/ref/tdist.py" ]; then
-    T975=$(python3 "$TREE/tools/ref/tdist.py" "$ROUNDS") || exit 1
+  RULER_FACTORS=
+  if [ -f "$TREE/tools/ref/ruler.py" ]; then
+    RULER_FACTORS=$(python3 "$TREE/tools/ref/ruler.py" factors "$ROUNDS") || exit 1
   fi
-  # shellcheck disable=SC2030,SC2031 # ROUNDS and T975 are what the cut-out function reads
+  # shellcheck disable=SC2030,SC2031 # ROUNDS and RULER_FACTORS are what the cut-out function reads
   (
-    export T975 ROUNDS
+    export RULER_FACTORS ROUNDS
     eval "$fn"
     ratio_table '' "$keys" ik 0 < "$tmp/records"
   ) | sed -n 's/^ *\([0-9][0-9]*\) *ours\/ik *mean [0-9.]* ± \([0-9.]*\) (n=\([0-9]*\)).*/\3 \2/p' |

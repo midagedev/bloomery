@@ -2,7 +2,7 @@
 # The depth-glm5next.sh stub test: the runner's arms with no lease, no card and no model. It copies the
 # runner (DEPTH_GLM5NEXT_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
-# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, cold-blocks.sh, gguf-ranges.py, records.py with
+# timing-card.sh, lease-probe.sh, tdist.py, ruler.py, lcpp-fit.sh, cold-blocks.sh, gguf-ranges.py, records.py with
 # generate_glm5next's checked-in schema, and a copy of lease.sh whose lease_take is replaced by a line
 # that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The profile keeps a
 # caller's values, so the two PR trees' llama-bench and
@@ -75,7 +75,7 @@ mkdir -p "$T/tools/ref/models" "$T/tools/bloomery/schema" "$T/bin" "$T/pr27752" 
   "$T/target/release" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-glm5next.sh"
 cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" \
-  "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
+  "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/ruler.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/gguf-ranges.py" "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
