@@ -1,0 +1,20 @@
+# Lead e1, 2026-09-29: the O_DIRECT swap source's unpaced read rate. odprobe (docs/cards/odprobe.card) put its c at
+# 1.74 host slots a copy at a paced 2.68 GB/s and never ran it unpaced. The residency moves 24 x 16,773,120 B = 402.6 MB
+# a 4-step cycle; at ~25 ms a step a flip that must land inside the rule's delay needs ~4 GB/s sustained [derived]. The
+# model file (/models, ext4) sits on a Phison E18 PCIe 4.0 x4 NVMe behind the chipset switch (root port 20:01.1 x8,
+# GPP 22:00.0 x4; lspci, 2026-09-29): 7.88 GB/s raw link, the drive's rated sequential read ~7 GB/s, one thread's
+# pread of 16 MB blocks into a 4-deep pinned ring [derived: 3..6.5 GB/s].
+kind: profile
+question: does one thread's O_DIRECT pread of 16,773,120-byte expert blocks from the model file keep up with the
+  residency's swap rate (~4 GB/s), or does the O_DIRECT source need parallel reads?
+term: copy-alone GB/s of odirect:max (dma-dram-share's `copy alone odirect:max=` field), one thread, ring 4,
+  blocks at a fixed stride over the model's first shard, the A6000
+unit: GB/s
+predict: 3..6.5
+condition: BLOOMERY_REMOTE='~/repo/bloomery-odprobe' BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/odmax.card'
+  just time-dma-dram --arms engine:5 --conds alone,odirect:max --rounds 2 --seconds 8 --copy-alone 8; rows
+  admissible, apps empty on both cards; box time ~3 min [derived from odprobe's 6.5 min for 5 conditions x 4 rounds]
+decide-in: 4 GB/s or more: the (d) spec keeps one reader thread; name late/forced as the keep-up check
+decide-below: under 4 GB/s: the (d) spec reads each part in chunks across 2..4 threads (or several preads in
+  flight) and prices the NVMe's own ceiling with a second run at 2 threads
+decide-above: over 6.5: record; the page cache is not in the path (check the file's size against the stride)
