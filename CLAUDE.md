@@ -2,39 +2,43 @@
 
 @AGENTS.md
 
-위 파일이 이 레포의 작업 계약이고 정본이다. 여기에는 Claude 세션에만 해당하는 것만 적는다.
-같은 사실을 두 곳에 적지 않는다.
+The file above is this repo's working contract and the source of truth. This file holds only what applies to Claude sessions.
+No fact is written in two places.
 
-## 추적
+## Tracking
 
-열린 일의 주인은 `docs/plan-triage.md` 하나다(사용자 결정 2026-09-27, `docs/rebuild.md` §7 결정 2).
-트리아지 항목을 MUL로 옮기거나 베끼지 않는다. 셀프호스트 트래커 **MUL** 프로젝트에는 단계 이정표,
-기계 변경, 업스트림만 둔다. `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`이고
-Mac에서는 `/opt/homebrew/bin/gadak`을 쓴다(PATH의 dev 빌드는 미러 스키마를 못 읽는다).
-댓글은 `gadak --workspace gdk comment <KEY> "<본문>"`이다 — `issue comment`가 아니다.
-단계마다 이슈 하나(MUL-1 ~ MUL-5), 기계 변경은 MUL-6, 업스트림은 MUL-7.
-측정 수치는 [rig-log](https://github.com/midagedev/rig-log)의 `log/`에 먼저 쓰고 트리아지 항목이나 이슈에서 링크한다.
-`TODO.md`를 열지 않는다.
+Open work has one owner, `docs/plan-triage.md` (user decision 2026-09-27, `docs/rebuild.md` §7 decision 2).
+Triage items are never moved or copied into MUL. The self-hosted tracker's **MUL** project holds only stage milestones,
+machine changes and upstream work. It is `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`, and
+on the Mac use `/opt/homebrew/bin/gadak` (the dev build on PATH cannot read the mirror schema).
+Comments are `gadak --workspace gdk comment <KEY> "<body>"` — not `issue comment`.
+One issue per stage (MUL-1 to MUL-5), machine changes in MUL-6, upstream in MUL-7.
+Measured numbers are written first in `log/` of [rig-log](https://github.com/midagedev/rig-log) and linked from the triage item or the issue.
+Do not open `TODO.md`.
 
-## 위임
+## Delegation
 
-~~구현 라운드는 `outsource` 스킬로 내보낸다.~~ 2026-09-22부터 위임은 opus 서브에이전트(Agent 도구, `model:"opus"` 명시)다.
-라운드 운영(파동)은 `docs/plan.md`의 「라운드 운영」, 열린 항목(카드·트리아지)은 `docs/plan-triage.md`, 예측·증명 규칙은 `AGENTS.md`의
-"Derive first, measure the gap"이 정본이다. 워크트리를 트랙마다 따로 주고, 스펙에는
-`AGENTS.md`의 해당 조항을 복사해 넣는다 — 위임받는 모델이 그 파일을 읽는다고 가정하지 않는다.
-게이트는 위임 결과를 받은 뒤 리드가 자기 소유로 다시 돌린다. 커밋·푸시는 리드 전용이다.
+Rounds that can be written as a spec (implementation, gate authoring, investigation, reports) go to GLM-5.3 through the
+`outsource` skill, at `--effort max` on the claude-code harness, one worktree per track (user, 2026-09-29).
+Investigation-only rounds may go to agy. Opus subagents (Agent tool, `model:"opus"` stated) are for the exceptions:
+vision, multi-turn cause narrowing, re-judging a verdict that disagrees with its instrument.
+Round operation (waves) is `docs/plan.md` 「라운드 운영」, open items (cards, triage) are `docs/plan-triage.md`, and the prediction
+and proof rules are "Derive first, measure the gap" in `AGENTS.md`. Copy the relevant clauses of `AGENTS.md` into the spec —
+never assume the delegate reads that file. A delegate's report is not evidence: before reading it, count the tool calls in its
+transcript and read `git status` of its worktree. After a round, the lead re-runs the gates under its own ownership.
+Commits and pushes are lead-only.
 
-## 이 레포의 한국어
+## Korean in this repo
 
-산문은 한국어로 쓴다. `AGENTS.md`와 코드 주석, 업스트림으로 나가는 문서는 영어다.
-한국어 산문은 위임하지 않고 리드가 직접 쓴다.
+Prose is written in Korean. `AGENTS.md`, code comments and documents headed upstream are English.
+Korean prose is never delegated; the lead writes it.
 
-## rig-log에 쓸 때
+## Writing to rig-log
 
-측정 기록은 `~/repo/rig-log`의 `log/`에 쓴다. 이 세션에서는 그 레포의 규칙이 자동으로 로드되지 않으므로,
-기록을 쓰기 전에 `~/repo/rig-log/CLAUDE.md`를 먼저 읽는다. 놓치기 쉬운 것 셋:
+Measurement records go in `log/` of `~/repo/rig-log`. That repo's rules are not loaded automatically in this session,
+so read `~/repo/rig-log/CLAUDE.md` before writing a record. Three things that are easy to miss:
 
-- **공개 레포다.** 커밋 전에 `192.168`, `100.` 대역 주소, `.ts.net`, `admin`을 grep한다. BMC 주소·자격증명,
-  박스 `/root`의 nvidia-bug-report 아카이브(호스트명 포함)는 넣지 않는다.
-- 측정한 것만 쓰고, 틀리면 지우지 않고 선을 그어 정정한다.
-- 산문은 한국어, 업스트림으로 나가는 본문은 영어(AI 도움은 산문으로 밝히고 Claude 배지는 넣지 않는다).
+- **It is a public repo.** Before committing, grep for `192.168`, addresses in the `100.` range, `.ts.net` and `admin`. Never
+  include BMC addresses or credentials, or the nvidia-bug-report archive from the box's `/root` (it contains the hostname).
+- Write only what was measured; when something is wrong, do not delete it — strike it through and correct it.
+- Prose in Korean, bodies headed upstream in English (disclose AI help in prose; no Claude badge).
