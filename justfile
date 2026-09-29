@@ -1261,22 +1261,29 @@ depth-gpu-ds41 *ARMS:
 # mistral.rs arms: `mrs:<D>` (mistralrs bench --depth D, PagedAttention pool at the cache height) and `mrspa0:<D>` (--paged-attn off).
 # Prefill: every `<D>` row also carries pp_tok/s from generate_qwen3moe's `time prompt` row, and `ikpp:<P>`/`lcpppp:<P>`
 # (llama-bench -p P -n 0; `ikpp<U>`/`lcpppp<U>`: -ub U) and `mrspp:<P>` (mistralrs bench --prompt-len P) with a per-P table.
+# `prose:<P>[@NAME=VALUE,...]`는 우리 팔이다. 이 프로필의 $BLOOMERY_DATA/qwen3moe/corpus-prose.ids에서 앞 P개 id를
+# --tokens로 넣는다(행 라벨 ours@prose). prose 팔은 같은 P의 prose 팔하고만, 자기 표에서 비교한다.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.6-35B-A3B(qwen35moe) 같은 표: depth-gpu-qwen3moe의 러너·팔·표를 qwen35moe 프로필로 돈다. 우리 팔은 같은
 # generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다. 프리필은 8위치 패스뿐이라 pp 열은 `kind=prefill`이다
-# (ubatch 경로 없음). 참조 트리와 플래그는 tools/ref/models/qwen35moe.sh. BLOOMERY_DRY=1이면 명령줄만, 빌드 없음.
+# (ubatch 경로 없음). `prose:<P>`는 depth-gpu-qwen3moe의 prose 팔과 같다. 이 프로필의
+# $BLOOMERY_DATA/qwen35moe/corpus-prose.ids 앞 P개 id를 --tokens로 넣고(행 라벨 ours@prose), prose 표에서만 비교한다.
+# 참조 트리와 플래그는 tools/ref/models/qwen35moe.sh. BLOOMERY_DRY=1이면 명령줄만, 빌드 없음.
 depth-gpu-qwen35moe *ARMS:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.8-Flash-Next (qwen4exp), the same table: depth-gpu-qwen3moe's runner, arms and tables under the qwen4exp
 # profile. Our arm is generate_qwen3moe opening Body38 on the A6000, every routed expert on the host tier, its prompt
 # by passes of up to eight (`kind=pass`); the reference is mainline llama.cpp, hand-set -ncmoe and fit (models/qwen4exp.sh).
-# Each arm pages the ~111 GB host set in when it is cold. BLOOMERY_DRY=1 prints the command lines only, nothing built.
+# `prose:<P>[@NAME=VALUE,...]` is ours on the first P ids of $BLOOMERY_DATA/qwen4exp/corpus-prose.ids (--tokens), row
+# label ours@prose, compared only with prose arms of the same P in prose's own tables — the lcg prompt's pseudo-random
+# ids route heavily skewed, so a lever tuned on it can mean nothing on real text. Each arm pages the ~111 GB host set
+# in when it is cold. BLOOMERY_DRY=1 prints the command lines only, nothing built.
 depth-gpu-qwen4exp *ARMS:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(산문 첫 D개 id를 스텝마다 먹임, pp는
 # `kind=steps`)·`hot:<D>`(BLOOMERY_HOT_LIST), llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
