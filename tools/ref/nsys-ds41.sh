@@ -68,7 +68,10 @@
 # and the batch embed launches ds41_glue_embed_q3k once a prompt token, so over all kernels that one
 # name alone counts D + N − 1 under the batch feed and would open each window at the replay's second
 # node. The trace's own eager kernels decide the feed: the run log's `time prompt` row must say the
-# same, or no table. The batch feed is what depth-ds41.sh times and leaves the caches as the steps
+# same, or no table. Under BLOOMERY_RESIDENCY the engine streams also run eager kernels between the
+# replays (the boundary work): the batch is the eager engine-stream kernels that end before the
+# first replay's first kernel, and the rest are named as boundary work, not a refusal.
+# The batch feed is what depth-ds41.sh times and leaves the caches as the steps
 # would; at depth 1024 the step feed would add ≈ 1024 replays of wall and trace. The capture before
 # the prompt executes no kernel.
 #
@@ -155,23 +158,23 @@ db = sqlite3.connect(sys.argv[1])
 depth, ngen, last, top = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[5]), int(sys.argv[6])
 runlog = sys.argv[4]
 names = dict(db.execute("SELECT id, value FROM StringIds"))
-rows = db.execute("SELECT start, end, shortName, streamId, graphNodeId FROM CUPTI_ACTIVITY_KIND_KERNEL "
-                  "ORDER BY start").fetchall()
-# The batch feed's kernels run outside the graph on the engine stream — the stream the replays'
-# graph kernels run on. A kernel outside the graph on another stream (the copy stream's unpack,
+rows = db.execute("SELECT start, end, shortName, streamId, deviceId, graphNodeId "
+                  "FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start").fetchall()
+# The batch feed's kernels run outside the graph on the engine streams — the (deviceId, streamId)
+# pairs the replays' graph kernels run on; a streamId alone is per-context, and the two cards'
+# contexts reuse ids. A kernel outside the graph on another stream (the copy stream's unpack,
 # a draft's) is neither: under BLOOMERY_RESIDENCY the copy stream works inside the replays, and
 # counting its kernels as the prompt's would refuse the trace and misread the feed.
-eng = sorted({r[3] for r in rows if r[4] is not None})
-eager = [r for r in rows if r[4] is None and r[3] in eng]
-side = [r for r in rows if r[4] is None and r[3] not in eng]
-ks = [(s, e, names.get(n, str(n)).split("(")[0]) for s, e, n, st, g in rows if g is not None]
+eng = sorted({(r[4], r[3]) for r in rows if r[5] is not None})
+eager = [r for r in rows if r[5] is None and (r[4], r[3]) in eng]
+side = [r for r in rows if r[5] is None and (r[4], r[3]) not in eng]
+ks = [(s, e, names.get(n, str(n)).split("(")[0]) for s, e, n, st, dv, g in rows if g is not None]
 def rows_of(table):
     try:
         return db.execute(f"SELECT start, end, bytes FROM {table} ORDER BY start").fetchall()
     except sqlite3.OperationalError:
         return []
 copies, sets = rows_of("CUPTI_ACTIVITY_KIND_MEMCPY"), rows_of("CUPTI_ACTIVITY_KIND_MEMSET")
-feed = "batch" if eager else "steps"
 kind = None
 try:
     for line in open(runlog):
@@ -180,15 +183,26 @@ try:
             kind = m.group(1)
 except OSError:
     pass
+# Under a residency the engine streams also run eager kernels between the replays (the boundary
+# work), so the prompt batch is the eager engine-stream kernels that end before the first replay's
+# first kernel; the rest are named on their own line below, not a refusal.
+batch = [k for k in eager if not ks or k[1] <= ks[0][0]]
+after = [k for k in eager if ks and k[1] > ks[0][0]]
+feed = "batch" if batch else "steps"
 side_note = f", {len(side)} on other streams (the copy stream's)" if side else ""
-print(f"    kernels {len(rows)} ({len(eager)} outside the graph on the engine stream(s) {eng}: "
+print(f"    kernels {len(rows)} ({len(batch)} outside the graph on the engine stream(s) {eng}: "
       f"the prompt's feed is {feed}{side_note})  memcpy {len(copies)}  memset {len(sets)}  "
       f"(stream memory operations leave no record)")
+after_note = ""
+if after:
+    acnt = defaultdict(int)
+    for k in after:
+        acnt[names.get(k[2], str(k[2])).split("(")[0]] += 1
+    after_note = " (" + ", ".join(f"{c} {n}" for n, c in sorted(acnt.items(), key=lambda x: -x[1])[:5]) + ")"
+print(f"    eager engine-stream kernels after the first replay (boundary work under a residency): "
+      f"{len(after)}{after_note}")
 if kind is not None and kind != feed:
     print(f"    NO TABLE: the run log's time prompt row says kind={kind}, the trace's kernels say {feed}")
-    raise SystemExit(3)
-if eager and ks and eager[-1][0] > ks[0][0]:
-    print("    NO TABLE: a graph replay runs before the batch's last eager kernel")
     raise SystemExit(3)
 fed = depth if feed == "steps" else 0
 replays = fed + ngen - 1
@@ -210,8 +224,8 @@ print(f"[boundary] kernel {marker}: {len(bounds)} replay launches, expected {exp
 if len(bounds) != replays:
     raise SystemExit(3)
 bounds.append(len(ks))
-if eager:
-    print(f"    the batch: {len(eager)} eager kernels, first to last {(eager[-1][1] - eager[0][0]) / 1e6:.1f} ms")
+if batch:
+    print(f"    the batch: {len(batch)} eager kernels, first to last {(batch[-1][1] - batch[0][0]) / 1e6:.1f} ms")
 
 # The run's own lines: `time step i` is replay i - 1 under the batch feed; under the step feed
 # token 0 comes out of replay depth - 1 and `time step i` is replay depth - 1 + i.
