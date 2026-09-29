@@ -353,6 +353,9 @@ plain-any:
 host:
     ./tools/box.sh 'bash tools/gate.sh -p x'
 
+gate-x:
+    ./tools/box.sh 'bash tools/gate.sh -p y'
+
 nested *ARGS:
     ./tools/gate-batch.sh --smoke {{ARGS}}
 JF
@@ -402,6 +405,14 @@ DF
   check "items: a solo recipe's arm through another recipe is refused, naming the solo recipe" 65 \
     "'v41-a:--faults' hands gen_y --faults, the arm of the solo recipe v41-solo" "${gb[@]}" --dry-run 'v41-a:--faults'
   check 'items: other ARGS of the same binary pass' 0 "^lane A  v41-a-2 " "${gb[@]}" --dry-run v41-a 'v41-a:--sets'
+  # `just affected … 2>&1` output: just's echoed recipe line, then the `affected:` header and the recipe lines.
+  printf '%s\n' './tools/affected-gates.sh main --no-box' 'affected: a..b — 2 changed files, 2 of 6 gate-recipes selected' \
+    '  gate-x                      crates/x/src/lib.rs (+1)' 'unmapped: none' > "$t/aff-echo.txt"
+  check "list: just affected output behind just's echoed line takes its recipe lines" 0 '^lane [AB]  gate-x ' \
+    "${gb[@]}" --dry-run --list "$t/aff-echo.txt"
+  printf '%s\n' 'something else' 'affected: a..b — 1 changed file' '  gate-x  crates/x/src/lib.rs (+1)' > "$t/aff-other.txt"
+  check 'list: any other line above the affected: header is a malformed item' 65 "aff-other.txt:1: malformed item 'something else'" \
+    "${gb[@]}" --dry-run --list "$t/aff-other.txt"
   # Cold builds: the final try's section only; a local crate is the tree's, a registry or git one is not.
   printf '%s\n' '=== try 1 x' '   Compiling libc v0.2.155' '=== try 2 x' '   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery/crates/gpu)' > "$t/warm.log"
   printf '%s\n' '=== try 1 x' '   Compiling cuda-core v0.1.0 (https://github.com/x/cuda-oxide?branch=b#abc)' '    Finished `release`' > "$t/cold.log"
