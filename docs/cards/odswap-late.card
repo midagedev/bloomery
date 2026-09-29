@@ -1,0 +1,22 @@
+# Lead e1, 2026-09-30: odswap-ab (rig-log 09-29#odswap-ab) was 1.006 +- 0.009, but two-sided by window: the
+# first two 16-pass windows faster in all 3 rounds (31.7 / 35.9 against 30.4 / 34.4), the last two slower (39.6 /
+# 42.7 against 42.0 / 44.4). The runner dropped each arm's residency pass records; since armkeep it keeps them.
+# Hypothesis [derived, unmeasured]: a flip's copy now waits on an NVMe read (16.8 MB at ~6 GB/s, ~2.8 ms, one
+# reader) where the staging memcpy read the host set's pages from DRAM, so late in the run, when flips come one
+# or two a boundary, a flip lands a pass later more often (late > 0) and the card serves its expert later.
+kind: profile
+question: in odswap's last two windows, do its flips land late (the residency pass records' `late`) more often
+  than the main binary's, or does the per-pass staging time (`stage_us`) rise instead?
+term: late flips per pass, passes 64..95, odswap arm minus main arm, one round, from the kept outputs
+unit: flips/pass
+predict: 0.1..1.0
+condition: from /Users/hckim/repo/bloomery-odswap2 (main 2f3a6809 + odswap), the base binary built in
+  ~/repo/bloomery-armkeep (main 2f3a6809): BLOOMERY_REMOTE='~/repo/bloomery-odswap2' BLOOMERY_AB_ROUNDS=1
+  BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090
+  BLOOMERY_RESIDENCY=mid-p40-s1 BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/odswap-late.card' just
+  depth-gpu-ds41 prose:512 bin:/root/repo/bloomery-armkeep/target/release/generate_ds41:prose:512; box time
+  ~10 min [derived: two builds from a seeded target, then a warmup and one round of two two-card loads]
+decide-in: late flips explain the late windows: the O_DIRECT source needs its reads in flight earlier (issue
+  the pread at plan time, or two readers) before it is judged again
+decide-below: no extra late flips: read stage_us and the host leg by window; the late-window loss is elsewhere
+decide-above: flips land late most passes: one reader cannot keep up late in the run; price two readers
