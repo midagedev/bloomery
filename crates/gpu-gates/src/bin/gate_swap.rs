@@ -81,6 +81,9 @@
 //!   slot gives up such an expert is refused at construction.
 //! - pinned: no flip evicts a pinned seed expert and each keeps its slot for
 //!   the whole run, while flips evict other seed experts.
+//! - fault code: the driver error the copy stream's query returns at a drop
+//!   is a fault leak that carries its code, and the `residency leak` record
+//!   prints it (its mutant: the code dropped, the word `fault` alone).
 //! - stall: a victim that takes longer to prepare than the machine's
 //!   deadline is a named error at the boundary it would land at, returned
 //!   before the preparation ends; the machine dropped then leaves its
@@ -155,7 +158,7 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
-    use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
+    use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use model::Tensor2;
@@ -2052,6 +2055,43 @@ mod gate {
         Ok(refusal)
     }
 
+    /// fault code: a driver error the copy stream's query returns at a drop
+    /// is a fault leak that carries the error's `CUresult`, and the
+    /// `residency leak` record prints it — the driver's own text asks the
+    /// context at print time, which a faulted context may not answer, so the
+    /// code it already gave is the fact to keep. The drop's arm is
+    /// `Leak::fault`, driven here with the code a sticky context fault
+    /// carries; no card has to fault for the clause.
+    fn fault_code() -> Result<bool, GateError> {
+        const CODE: sys::cudaError_enum = sys::cudaError_enum_CUDA_ERROR_ILLEGAL_ADDRESS;
+        let (ring, words) = (65536u64, 512u64);
+        let leak = Leak::fault(
+            &GpuError::Driver {
+                op: None,
+                source: DriverError(CODE),
+            },
+            ring,
+            words,
+        );
+        let line = record::residency_leak(&leak).line();
+        let ok = leak
+            == Leak {
+                reason: LeakReason::Fault,
+                code: Some(CODE),
+                ring_bytes: ring,
+                words_bytes: words,
+            }
+            && line == format!("residency leak reason=fault code={CODE} ring={ring} words={words}");
+        println!(
+            "fault code: a query returning {CODE}: the leak's reason {:?} code {:?}, the record \
+             \"{line}\" {}",
+            leak.reason.word(),
+            leak.code,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// stall: a victim that takes longer to prepare than the machine's
     /// deadline is a named error at the boundary it would land at, not a
     /// wait without end; and the machine, dropped with that preparation in
@@ -2462,6 +2502,7 @@ mod gate {
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= refusal(&gpu, &pm, &trace)?;
+        ok &= fault_code()?;
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= placement(&gpu, &pm)?;
         let light = queue(&gpu, &pm, &trace, &a, LIGHT)?;
