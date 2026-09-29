@@ -128,7 +128,11 @@
 //! card's free device bytes, and prints, after the arm's other lines, one
 //! `stat step` record a step (`record::STAT_STEP_HOST`: `served` layers,
 //! their summed `leg_us` and `host_slots`) and a `stat summary` over the
-//! steps past `--warm`. Unset, or on another file, nothing is read.
+//! steps past `--warm`. It also arms the ubatch walk's timing: after a
+//! prompt's `stat prompt host` line, one `stat prompt38 lb` record a
+//! layer-batch its ubatches served and a `stat prompt38 split` over them
+//! (the serve's wait and union beside the card time of every part). Unset,
+//! or on another file, nothing is read and nothing recorded.
 //!
 //! `--dump-taps DIR` (a qwen3moe file only) writes the layer-tap dump of
 //! `shared/qwen3moe_taps.rs` into DIR, an empty or new directory: from each
@@ -470,7 +474,10 @@ mod cli {
         /// The prompt by `path`, then a `stat prompt host` line: the host
         /// tier's batch services the prompt took, their columns and host
         /// slots, and the union calls' wall — the host term of a pass's or a
-        /// ubatch's layer.
+        /// ubatch's layer. With the ubatch walk's timing armed
+        /// (`BLOOMERY_STEP_STATS`), the prompt's `stat prompt38` records
+        /// follow: one `stat prompt38 lb` a layer-batch the ubatches served,
+        /// then the `stat prompt38 split` over them.
         fn prefill(m: &mut Qwen38Model, ids: &[u32], path: Prompt38) -> Result<u32, GateError> {
             let before = m.body("prefill")?.hybrid().stats();
             let next = m.prompt38(ids, path)?;
@@ -490,6 +497,68 @@ mod cli {
                 after.batch_host_slots - before.batch_host_slots,
                 ns as f64 / 1e6,
             );
+            if let Some(s) = m.take_prompt38_stats()? {
+                let ms = |ns: u64| ns as f64 / 1e6;
+                let lbs = s.rows.len() as u64;
+                let (mut union, mut wait, mut serve, mut enqueue, mut slots) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64);
+                let (mut front, mut down, mut shadow, mut up, mut back) =
+                    (0.0_f64, 0.0, 0.0, 0.0, 0.0);
+                for r in &s.rows {
+                    union += r.union_ns;
+                    wait += r.wait_ns;
+                    serve += r.serve_ns;
+                    enqueue += r.enqueue_ns;
+                    slots += r.slots;
+                    front += r.front_ms;
+                    down += r.down_ms;
+                    shadow += r.shadow_ms;
+                    up += r.upload_ms;
+                    back += r.back_ms;
+                    Record::new(&record::STAT_PROMPT38_LB)
+                        .u("b", r.b)
+                        .u("layer", r.layer as u64)
+                        .u("cols", r.cols as u64)
+                        .u("slots", r.slots)
+                        .f("wait_ms", ms(r.wait_ns))
+                        .f("union_ms", ms(r.union_ns))
+                        .f("serve_ms", ms(r.serve_ns))
+                        .f("enqueue_ms", ms(r.enqueue_ns))
+                        .f("card_front_ms", r.front_ms)
+                        .f("card_down_ms", r.down_ms)
+                        .f("card_shadow_ms", r.shadow_ms)
+                        .f("card_upload_ms", r.upload_ms)
+                        .f("card_back_ms", r.back_ms)
+                        .print();
+                }
+                let per = |v: f64| if lbs == 0 { 0.0 } else { v / lbs as f64 };
+                Record::new(&record::STAT_PROMPT38_SPLIT)
+                    .u("ubatches", s.ubatches)
+                    .u("layer_batches", lbs)
+                    .f("prologue_ms", ms(s.prologue_ns))
+                    .f("walk_ms", ms(s.walk_ns))
+                    .f("union_ms", ms(union))
+                    .f("wait_ms", ms(wait))
+                    .f("serve_ms", ms(serve))
+                    .f("enqueue_ms", ms(s.walk_ns.saturating_sub(serve)))
+                    .u("host_slots", slots)
+                    .f("union_lb", per(ms(union)))
+                    .f("wait_lb", per(ms(wait)))
+                    .f("serve_lb", per(ms(serve)))
+                    .f("enqueue_lb", per(ms(enqueue)))
+                    .f("slots_lb", per(slots as f64))
+                    .f("card_front_ms", front)
+                    .f("card_down_ms", down)
+                    .f("card_shadow_ms", shadow)
+                    .f("card_upload_ms", up)
+                    .f("card_back_ms", back)
+                    .f("card_front_lb", per(front))
+                    .f("card_down_lb", per(down))
+                    .f("card_shadow_lb", per(shadow))
+                    .f("card_upload_lb", per(up))
+                    .f("card_back_lb", per(back))
+                    .print();
+            }
             Ok(next)
         }
 
@@ -753,7 +822,8 @@ mod cli {
                 sync,
             ),
             Chosen::Qwen38(path, place) => {
-                let m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                let mut m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                m.set_prompt38_stats(run.stats)?;
                 drive(m, &run, path, &arms, listed, sync)
             }
         }
