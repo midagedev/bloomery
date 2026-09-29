@@ -550,7 +550,9 @@ mod drive {
                     .attach_route_trace(t)?;
             }
             if a.cfg.body.residency != Residency::Off {
-                s.model_mut().body_parts(WHAT)?.2.log_residency();
+                // A request's passes are not known at load, and no request
+                // is a timed window: the log grows as it must.
+                s.model_mut().body_parts(WHAT)?.2.log_residency(0);
             }
             let draft = match (a.draft, spark) {
                 (Draft::Off, _) => Served::Off,

@@ -1040,9 +1040,11 @@ pub static RESIDENCY_LEAK: Kind = Kind {
           rather than free them under a copy or a thread that may still use them: why (join: the \
           staging thread was still inside the source past the deadline; release: the copies \
           waiting on staging could not be let through; drain: the copy stream did not drain \
-          within the deadline) and the pinned bytes of the ring and the words.",
+          within the deadline; fault: the copy stream's query returned a driver error, whose \
+          code the code part carries) and the pinned bytes of the ring and the words.",
     parts: &[
         key("reason", Word, ""),
+        opt("code", U64, ""),
         key("ring", U64, "B"),
         key("words", U64, "B"),
     ],
@@ -1694,10 +1696,12 @@ pub fn helper(
 /// A dropped residency machine's leak record.
 #[cfg(feature = "gpu")]
 pub fn residency_leak(l: &Leak) -> Record {
-    Record::new(&RESIDENCY_LEAK)
-        .w("reason", l.reason.word())
-        .u("ring", l.ring_bytes)
-        .u("words", l.words_bytes)
+    let r = Record::new(&RESIDENCY_LEAK).w("reason", l.reason.word());
+    let r = match l.code {
+        Some(code) => r.u("code", code),
+        None => r,
+    };
+    r.u("ring", l.ring_bytes).u("words", l.words_bytes)
 }
 
 /// A residency reset's record.

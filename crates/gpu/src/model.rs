@@ -176,6 +176,11 @@ pub trait HostServed {
         let _ = stream;
         Ok(None)
     }
+
+    /// Stop the residency machine before anything of the model is freed
+    /// ([`crate::host::HostTier::stop_swap`]): the model's drop calls it
+    /// first. A body with no machine does nothing.
+    fn stop_residency(&mut self) {}
 }
 
 /// The host service of a body whose chain runs on the card alone: no value
@@ -356,7 +361,8 @@ pub struct Resident<B> {
 /// One resident model on one card. Everything `step` touches is allocated at
 /// load, never per step. A second card is another `GpuModel` (a draft's).
 ///
-/// Fields drop in declaration order, and a graph must be destroyed while
+/// Fields drop in declaration order, after the drop has stopped the body's
+/// residency machine, and a graph must be destroyed while
 /// every buffer it addresses is still alive: the captured chains first, then
 /// the heads, the body (which drops its own captures first, and its host
 /// tier's lock over the host set before the mappings under it),
@@ -387,6 +393,17 @@ pub struct GpuModel<B: ChainBody> {
     /// The fault a step read back (crate::fault): the caches and rings hold
     /// what it condemned, so every later step refuses until `reset`.
     poisoned: Option<Fault>,
+}
+
+impl<B: ChainBody> Drop for GpuModel<B> {
+    /// The residency machine stops first ([`HostServed::stop_residency`]):
+    /// the chains, the heads and the body free card memory as they drop, and
+    /// a free waits for a copy the machine left queued behind a staging word.
+    fn drop(&mut self) {
+        if let Some(host) = self.body.host() {
+            host.stop_residency();
+        }
+    }
 }
 
 impl<B: ChainBody> GpuModel<B> {

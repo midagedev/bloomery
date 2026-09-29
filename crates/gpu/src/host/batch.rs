@@ -22,7 +22,7 @@
 use super::slots::{HOST, Slot, SlotMap};
 use super::step::GO_DEADLINE;
 use super::tier::{TierBlock, TierCard};
-use super::{Health, HostExperts, HostTier, Refusal, name_refusal, non_finite, unknown_id};
+use super::{Health, HostExperts, HostTier, Refusal, name_refusal, nanos, non_finite, unknown_id};
 use crate::fault::Fault;
 use crate::graph::{MappedHost, cu};
 use crate::tensor::window;
@@ -642,11 +642,6 @@ impl BatchPort {
         self.up ^= 1;
         Ok(())
     }
-}
-
-/// `d` in whole nanoseconds, saturating.
-fn nanos(d: std::time::Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Enqueue the copy of values `at` of `src` to the same values of `dst`.

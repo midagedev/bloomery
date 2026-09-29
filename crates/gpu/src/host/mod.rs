@@ -271,28 +271,78 @@ pub struct Refusal {
     pub detail: String,
 }
 
-/// The bound on a host wait for a stream to drain at a quiet point (a
-/// residency reset, a tier's reset): the same bound as the residency
-/// machine's own drain of its copy stream.
+/// The bound on a host wait for an expert tier's stream to drain at its
+/// reset.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Wait, polling, until `stream` has drained; past [`DRAIN_DEADLINE`] the
-/// error names the wait `what`.
-fn drain_within(stream: &CudaStream, what: &'static str) -> Result<(), GpuError> {
+/// `d` in whole nanoseconds, saturated at `u64::MAX`.
+#[must_use]
+pub fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Why [`poll_drained`] stopped short.
+pub(crate) enum Drain {
+    /// The query returned a driver error.
+    Driver(GpuError),
+    /// The stream was still running past the deadline, after this long.
+    Late(Duration),
+}
+
+/// Poll `stream` until it has drained, at most `deadline`.
+pub(crate) fn poll_drained(stream: &CudaStream, deadline: Duration) -> Result<(), Drain> {
     let t0 = Instant::now();
-    while !stream_idle(stream)? {
-        if t0.elapsed() > DRAIN_DEADLINE {
-            return Err(GpuError::protocol(
-                what,
-                format!(
-                    "the stream did not drain in {:?} (deadline {DRAIN_DEADLINE:?})",
-                    t0.elapsed()
-                ),
-            ));
+    loop {
+        match stream.query() {
+            Ok(true) => return Ok(()),
+            Ok(false) if t0.elapsed() > deadline => return Err(Drain::Late(t0.elapsed())),
+            Ok(false) => std::thread::sleep(Duration::from_micros(50)),
+            Err(e) => return Err(Drain::Driver(e.into())),
         }
-        std::thread::sleep(Duration::from_micros(50));
     }
-    Ok(())
+}
+
+/// Wait, polling, until `stream` has drained, at most `deadline`; past it
+/// the error names the wait `what`.
+pub(crate) fn drain_within(
+    stream: &CudaStream,
+    deadline: Duration,
+    what: &'static str,
+) -> Result<(), GpuError> {
+    poll_drained(stream, deadline).map_err(|e| match e {
+        Drain::Driver(e) => e,
+        Drain::Late(waited) => GpuError::protocol(
+            what,
+            format!("the stream did not drain in {waited:?} (deadline {deadline:?})"),
+        ),
+    })
+}
+
+/// The kept rows the boundary ends the open pass with, from what its
+/// caller gave ([`HostTier::keep_rows`]): `None` when no pass is `open`.
+/// Refused by name: an open pass with no kept count, and a kept count with
+/// no pass open, which no boundary would fold.
+fn pass_kept(
+    open: bool,
+    kept: Option<(usize, PassKind)>,
+) -> Result<Option<(usize, PassKind)>, GpuError> {
+    const WHAT: &str = "HostTier::swap_boundary";
+    match (open, kept) {
+        (true, Some(k)) => Ok(Some(k)),
+        (true, None) => Err(GpuError::state(
+            WHAT,
+            "the last pass's kept rows (HostTier::keep_rows)",
+        )),
+        (false, None) => Ok(None),
+        (false, Some((rows, kind))) => Err(GpuError::protocol(
+            WHAT,
+            format!(
+                "{rows} rows kept as a {} pass with no pass open: no boundary opened the pass \
+                 they would end",
+                kind.word()
+            ),
+        )),
+    }
 }
 
 /// What a residency pass was, as its caller names it when it keeps its rows
@@ -563,7 +613,9 @@ impl Health {
 /// called through, with what they share.
 ///
 /// Field order is drop order: the host set's lock (`residency`) spans pages
-/// of the mappings `experts` keeps alive, so it is released first.
+/// of the mappings `experts` keeps alive, so it is released first. The drop
+/// stops the residency machine before any field goes
+/// ([`HostTier::stop_swap`]).
 pub struct HostTier<H> {
     /// What the placed load did to the plan's host set, when the tier holds
     /// it ([`HostTier::keep_residency`]).
@@ -593,6 +645,39 @@ pub struct HostTier<H> {
     /// The stage card's copy of the map the machine writes: after `swap`, so
     /// it outlives the machine that holds its address.
     swap_view: Option<Arc<DeviceTensor<u32>>>,
+}
+
+impl<H> HostTier<H> {
+    /// Stop the residency machine, if one runs, and drop it: its staging
+    /// thread stops, every copy waiting on a staging word is let through and
+    /// the copy stream drains, each within the machine's deadline, or the
+    /// drop leaks and names what it could not free ([`swap::SwapMachine`]'s
+    /// `Drop`). A copy queued behind a job not yet due waits for as long as
+    /// the staging window stays closed, and a context synchronize or a free
+    /// on the card waits with it: every owner of a running machine calls
+    /// this before it frees anything on the card. Idempotent.
+    pub fn stop_swap(&mut self) {
+        drop(self.swap.take());
+        self.swap_kept = None;
+    }
+
+    /// The step port's residency tally, the machine's shape once one runs:
+    /// what a served pass's routed ids are noted into and the next
+    /// [`HostTier::swap_boundary`] folds. A gate that drives a machine's
+    /// passes without the handoff protocol notes into it through here;
+    /// `None` without a machine. No engine caller: the step port's services
+    /// note as they serve.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn swap_tally(&mut self) -> Option<&mut swap::Tally> {
+        self.swap.is_some().then_some(&mut self.step.tally)
+    }
+}
+
+impl<H> Drop for HostTier<H> {
+    fn drop(&mut self) {
+        self.stop_swap();
+    }
 }
 
 impl<H: HostExperts> HostTier<H> {
@@ -661,7 +746,8 @@ impl<H: HostExperts> HostTier<H> {
 
     /// The pass that just ran, a `kind`, keeps its first `kept` rows (a
     /// step 1, a verify its accepted rows, a prompt call 0): what the next
-    /// boundary folds. Nothing without a machine.
+    /// boundary folds, which refuses by name a count given with no pass open.
+    /// Nothing without a machine.
     pub fn keep_rows(&mut self, kept: usize, kind: PassKind) {
         if self.swap.is_some() {
             self.swap_kept = Some((kept, kind));
@@ -672,8 +758,8 @@ impl<H: HostExperts> HostTier<H> {
     /// ([`swap::SwapMachine::boundary`]): the open pass ends with its kept
     /// rows, then the machine lands and plans; its report, with the kind of
     /// the pass it ended ([`PassKind::None`] when none was open). `None`
-    /// without a machine; a pass that ran with no kept count is refused by
-    /// name.
+    /// without a machine; a pass that ran with no kept count, and a kept
+    /// count given with no pass open, are refused by name.
     pub fn swap_boundary(
         &mut self,
         stream: &CudaStream,
@@ -681,13 +767,8 @@ impl<H: HostExperts> HostTier<H> {
         let Some(m) = self.swap.as_mut() else {
             return Ok(None);
         };
-        let kept = self.swap_kept.take();
         let mut kind = PassKind::None;
-        if m.pass_open() {
-            let (rows, of) = kept.ok_or(GpuError::state(
-                "HostTier::swap_boundary",
-                "the last pass's kept rows (HostTier::keep_rows)",
-            ))?;
+        if let Some((rows, of)) = pass_kept(m.pass_open(), self.swap_kept.take())? {
             m.end_pass(&mut self.step.tally, rows)?;
             kind = of;
         }
@@ -705,13 +786,16 @@ impl<H: HostExperts> HostTier<H> {
         let Some(m) = self.swap.as_mut() else {
             return Ok(None);
         };
+        let deadline = m.deadline();
         drain_within(
             stream,
+            deadline,
             "HostTier::swap_reset: the engine stream before the reset",
         )?;
         let r = m.reset(stream, &mut self.slots)?;
         drain_within(
             stream,
+            deadline,
             "HostTier::swap_reset: the engine stream after the reset",
         )?;
         self.step.tally.clear();
@@ -1115,7 +1199,11 @@ impl<H: HostExperts> HostTier<H> {
             }
             let w = self.words();
             if let Some(t) = self.tier.as_mut() {
-                drain_within(t.gpu().stream(), "Hybrid::reset: the expert tier's stream")?;
+                drain_within(
+                    t.gpu().stream(),
+                    DRAIN_DEADLINE,
+                    "Hybrid::reset: the expert tier's stream",
+                )?;
                 if !t.at_rest() {
                     return Err(GpuError::protocol(
                         WHAT,
@@ -1662,4 +1750,26 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
             r.layer, r.detail
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PassKind, pass_kept};
+
+    #[test]
+    fn a_boundary_takes_kept_rows_only_for_an_open_pass() {
+        let step = Some((1, PassKind::Step));
+        assert_eq!(pass_kept(true, step).ok(), Some(step));
+        assert_eq!(pass_kept(false, None).ok(), Some(None));
+        let open_unkept = pass_kept(true, None).expect_err("an open pass with no kept count");
+        assert!(
+            open_unkept.to_string().contains("kept rows"),
+            "{open_unkept}"
+        );
+        let kept_closed = pass_kept(false, step).expect_err("rows kept with no pass open");
+        assert!(
+            kept_closed.to_string().contains("no pass open"),
+            "{kept_closed}"
+        );
+    }
 }

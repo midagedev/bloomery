@@ -57,8 +57,9 @@ use crate::chain::ffn::CardStacks;
 /// Passes from the boundary that makes a flip to the one it lands at. The
 /// victims are host-resident (the churn pool), so a flip waits on no NVMe
 /// read, only on its staging and its copy: a planning pass makes at most
-/// `cap` = 24 flips, each one expert's memcpy into the pinned ring on one
-/// thread and one H2D copy, which together stay under four passes' wall
+/// the rule's `cap` flips ([`runtime::swaprule::SwapParams::mid`]), each one
+/// expert's memcpy into the pinned ring on one thread and one H2D copy,
+/// which together stay under four passes' wall
 /// [derived]; the staging runs in the host leg's wait window, about a
 /// third of a step, and a late copy only makes the engine stream wait at the
 /// landing.
@@ -66,8 +67,9 @@ pub const LIVE_DELAY: u64 = 4;
 
 /// The bound on every host wait of the machine. Every boundary follows a
 /// pass's readback, so the engine stream has drained and a wait is for the
-/// staging thread and the copy stream alone: at most a planning pass's 24
-/// experts, far inside this bound.
+/// staging thread and the copy stream alone: at most a planning pass's
+/// `cap` experts ([`runtime::swaprule::SwapParams::mid`]), far inside this
+/// bound.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// Threads per block of the reference unpack (`ds41_r8_q3k`): one output
@@ -111,7 +113,9 @@ const R8_GROUP_WORDS_MAX: usize = R8_BLOCK_WORDS * R8_NB_MAX;
 
 /// Byte `o` of `src`, little-endian words.
 ///
-/// SAFETY: `o / 4 < src.len()`.
+/// # Safety
+///
+/// `o / 4 < src.len()`.
 #[inline(always)]
 unsafe fn byte_at(src: &[u32], o: usize) -> u32 {
     // SAFETY: the caller's bound.
@@ -121,7 +125,9 @@ unsafe fn byte_at(src: &[u32], o: usize) -> u32 {
 /// Code `u = value + 4` of value `i` of row `r`, off the group super-block
 /// at byte `blk` (`qdot`'s `r8_code`).
 ///
-/// SAFETY: `blk + R8_BLOCK <= 4 · src.len()`.
+/// # Safety
+///
+/// `blk + R8_BLOCK <= 4 · src.len()`.
 #[inline(always)]
 unsafe fn r8_code(src: &[u32], blk: usize, r: usize, i: usize) -> u32 {
     let (j, t) = (i / 16, i % 16);
@@ -150,7 +156,9 @@ unsafe fn r8_code(src: &[u32], blk: usize, r: usize, i: usize) -> u32 {
 /// The six-bit scale `s + 32` of sub-block `j` of row `r`, off the group
 /// super-block at byte `blk` (`qdot`'s `r8_scale` plus 32).
 ///
-/// SAFETY: `blk + R8_BLOCK <= 4 · src.len()`.
+/// # Safety
+///
+/// `blk + R8_BLOCK <= 4 · src.len()`.
 #[inline(always)]
 unsafe fn r8_scale6(src: &[u32], blk: usize, r: usize, j: usize) -> u32 {
     let p = j / 2;
@@ -169,7 +177,9 @@ unsafe fn r8_scale6(src: &[u32], blk: usize, r: usize, j: usize) -> u32 {
 /// `hmask` (0..32), `qs` (32..96), the scales (96..108) and `d` (108..110),
 /// as `qdot`'s `q3k_put_codes` and `q3k_put_scales6` write them.
 ///
-/// SAFETY: `blk + R8_BLOCK <= 4 · src.len()`, `r < 8`, `b < 110`.
+/// # Safety
+///
+/// `blk + R8_BLOCK <= 4 · src.len()`, `r < 8`, `b < 110`.
 #[inline(always)]
 unsafe fn q3k_byte(src: &[u32], blk: usize, r: usize, b: usize) -> u32 {
     // SAFETY: every call's `i < 256` and the caller's bounds on `blk`, `r`.
@@ -253,7 +263,9 @@ fn q3k_block_at(r: usize, sb: usize, nb: usize) -> usize {
 /// `L0 = X_0 | X_1 << 4`, `L1 = X_2 | X_3 << 4` and the high pairs `X_q >> 4`
 /// at bits `2q`.
 ///
-/// SAFETY: `s` holds words `blk .. blk + 28`, `r < 8`.
+/// # Safety
+///
+/// `s` holds words `blk .. blk + 28`, `r < 8`.
 #[inline(always)]
 unsafe fn r8_scale_word(s: *const u32, blk: usize, r: usize, w: usize) -> u32 {
     let at = blk + R8_SCALE_WORDS + r / 2;
@@ -278,7 +290,9 @@ unsafe fn r8_scale_word(s: *const u32, blk: usize, r: usize, w: usize) -> u32 {
 /// `c / 4` of the pairs, four bytes a word, and the hmask bit of pair `p`
 /// is bit `p`.
 ///
-/// SAFETY: `s` holds the group's super-block `sb` (words `220 sb ..
+/// # Safety
+///
+/// `s` holds the group's super-block `sb` (words `220 sb ..
 /// 220 (sb + 1)`), `r < 8`, `f < 8`.
 #[inline(always)]
 unsafe fn r8_task_words(s: *const u32, sb: usize, r: usize, f: usize) -> [(usize, u32, usize); 4] {
@@ -327,7 +341,9 @@ unsafe fn r8_task_words(s: *const u32, sb: usize, r: usize, f: usize) -> [(usize
 /// The low `n` bytes (4, 2 or 0) of `w` at byte `o` of `base`, `o` even: one
 /// word store where `o` is a whole word, else halves.
 ///
-/// SAFETY: bytes `o .. o + n` lie in the allocation `base` points into, and
+/// # Safety
+///
+/// bytes `o .. o + n` lie in the allocation `base` points into, and
 /// this thread is their only writer.
 #[inline(always)]
 unsafe fn put(base: *mut u32, o: usize, w: u32, n: usize) {
@@ -517,8 +533,9 @@ impl R8Kernels {
         }
         let groups = words / group_words;
         // SAFETY: `at` is a slot of a stage stack (the source's `dest`), which
-        // holds `words` words and stays allocated for the machine's life, of
-        // this context; only this stream touches it while the unpack runs.
+        // holds `words` words and stays allocated until the copy stream has
+        // drained, of this context; only this stream touches it while the
+        // unpack runs.
         let mut part = unsafe { window::<u32>(at, words, &self.ctx) };
         let grid = launch_u32(WHAT, "grid", groups.min(GROUP_BLOCKS))?;
         let (groups32, nb32) = (
@@ -571,6 +588,24 @@ impl R8Kernels {
     }
 }
 
+/// The unpack's shape of a gate or an up of `ff` rows of `n_embd`, else
+/// refused by name: whole super-blocks of 256 a row, and gate and up parts
+/// (`parts[0]`, `parts[1]`) of exactly those rows as Q3_K.
+fn unpack_shape(n_embd: usize, ff: usize, parts: [usize; 3]) -> Result<(), GpuError> {
+    let q3k = ff * (n_embd / 256) * Q3K_BLOCK;
+    if n_embd.is_multiple_of(256) && parts[0] == q3k && parts[1] == q3k {
+        return Ok(());
+    }
+    Err(shape(
+        "Ds41Swap::new",
+        format!(
+            "the unpack of gates and ups of {ff} rows of {n_embd}: whole super-blocks of 256 and \
+             parts of {q3k} bytes, the stacks hold {:?}",
+            &parts[..2]
+        ),
+    ))
+}
+
 fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
     GpuError::Shape {
         what,
@@ -594,15 +629,15 @@ pub struct Ds41Swap {
     first: usize,
     layers: Vec<Option<LayerParts>>,
     parts: [usize; 3],
-    /// Rows of a gate or up part, and super-blocks of each of its rows.
-    ff: usize,
+    /// Super-blocks of each row of a gate or up part.
     nb: usize,
     /// The unpack, when the host's gates and ups are the sidecar's.
     unpack: Option<R8Kernels>,
 }
 
 // SAFETY: the stack addresses are plain device pointers into allocations the
-// model keeps in place for the machine's life; the kernels and the scratch
+// model keeps in place until the machine's copy stream has drained (the
+// model's drop stops the machine before it frees them); the unpack kernels
 // are used from the one thread that drives the machine (`convert`), and
 // everything the staging thread reads (`source`, `prepare_victim`) is the
 // split's and the sidecar's read-only mappings and the set.
@@ -616,7 +651,9 @@ impl Ds41Swap {
     /// load took (the same sidecar open as the host set's), and `set`, the
     /// host set the load read in. Refused by name: a set the load did not
     /// populate (`populated`), a layer whose stacks are not the plan's
-    /// experts, parts not whole words. Load-time only.
+    /// experts, parts not whole words, and under the r8 sidecar a gate or an
+    /// up part that is not its rows of whole Q3_K super-blocks (the unpack's
+    /// shape). Load-time only.
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's plan, layers, file, host reading, set, stacks and context (rust-quality R8)"
@@ -708,7 +745,10 @@ impl Ds41Swap {
         let (n_embd, ff) = (t0.dims[0] as usize, t0.dims[1] as usize);
         let nb = n_embd / 256;
         let unpack = match pair.r8().sidecar() {
-            Some(_) => Some(R8Kernels::load(ctx)?),
+            Some(_) => {
+                unpack_shape(n_embd, ff, parts)?;
+                Some(R8Kernels::load(ctx)?)
+            }
             None => None,
         };
         Ok(Ds41Swap {
@@ -718,7 +758,6 @@ impl Ds41Swap {
             first: layers.start,
             layers: out,
             parts,
-            ff,
             nb,
             unpack,
         })
@@ -859,7 +898,6 @@ impl SwapSource for Ds41Swap {
         match (&self.unpack, part) {
             (Some(k), 0 | 1) => {
                 let words = self.parts[part] / 4;
-                debug_assert_eq!(self.parts[part], self.ff * self.nb * Q3K_BLOCK);
                 k.enqueue_in_place(stream, dst, words, self.nb)
             }
             _ => Ok(()),
@@ -993,6 +1031,20 @@ mod tests {
                 unsafe { q3k_byte(group, (x / Q3K_BLOCK) * R8_BLOCK, r, x % Q3K_BLOCK) as u8 }
             })
             .collect()
+    }
+
+    #[test]
+    fn the_unpack_shape_is_whole_q3k_rows() {
+        let (n_embd, ff) = (4096, 2048);
+        let q3k = ff * (n_embd / 256) * Q3K_BLOCK;
+        unpack_shape(n_embd, ff, [q3k, q3k, 7]).expect("whole Q3_K rows");
+        for (n, parts, why) in [
+            (n_embd + 128, [q3k, q3k, 7], "a row past whole super-blocks"),
+            (n_embd, [q3k + 4, q3k, 7], "a gate part of another size"),
+            (n_embd, [q3k, q3k - 4, 7], "an up part of another size"),
+        ] {
+            assert!(unpack_shape(n, ff, parts).is_err(), "{why} is refused");
+        }
     }
 
     #[test]

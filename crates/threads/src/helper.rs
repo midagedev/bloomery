@@ -15,8 +15,8 @@
 //! what it asked for, where it runs and its mask's size, for the binaries'
 //! `helper` records.
 
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 /// Why a helper was not placed.
@@ -105,7 +105,10 @@ static HELPERS: Mutex<Vec<Helper>> = Mutex::new(Vec::new());
 /// Every helper [`spawn_helper`] placed in this process, in spawn order.
 #[must_use]
 pub fn helpers() -> Vec<Helper> {
-    HELPERS.lock().map(|v| v.clone()).unwrap_or_default()
+    HELPERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Spawn thread `name`, place it as `asked` (a pin the kernel refuses or a
@@ -140,14 +143,15 @@ where
     let placed = placed_rx.recv().map_err(|_| HelperError::Exited);
     match placed {
         Ok(Ok((pinned, cpus))) => {
-            if let Ok(mut v) = HELPERS.lock() {
-                v.push(Helper {
+            HELPERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Helper {
                     name: name.to_owned(),
                     asked,
                     pinned,
                     cpus,
                 });
-            }
             Ok((handle, pinned))
         }
         Ok(Err(e)) | Err(e) => {

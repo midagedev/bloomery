@@ -26,11 +26,12 @@
 //!
 //! **Flips.** A flip made at boundary `b` admits an expert into a spare slot
 //! while its victim stays live; both change at boundary `b + delay`. At `b`
-//! the machine enqueues on its copy stream, behind the event of boundary `b`
-//! (the slot's last reader has run), a wait for the staging thread's word,
-//! the expert's parts from the staging ring into the slot's place in each
-//! stack, a word back to the staging thread, and the flip's event; the
-//! staging thread prepares the victim for the host
+//! the machine sends the staging thread the flip's job, then enqueues on its
+//! copy stream, behind the event of boundary `b` (the slot's last reader has
+//! run), a wait for the staging thread's word, per part the copy from the
+//! staging ring into the slot's place in its stack and the source's convert
+//! step ([`SwapSource::convert`]), a word back to the staging thread, and the
+//! flip's event; the staging thread prepares the victim for the host
 //! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
 //! ring, gated to the host leg's wait window ([`SwapMachine::window`]).
 //!
@@ -58,8 +59,11 @@
 //! makes — for a landing job, for a ring slot's last copy, for the copy
 //! stream at a reset or a drop — ends by [`MachineCfg::deadline`] with a
 //! named error; only a job not yet due waits for the window as long as the
-//! window stays closed. A panic on the staging thread is a staging failure
-//! of its job, published like any other.
+//! window stays closed, and with it its copy and any context synchronize or
+//! card free behind that copy: the machine's owner drops it before it frees
+//! anything ([`crate::host::HostTier::stop_swap`]), and the drop releases
+//! every such copy. A panic on the staging thread is a staging failure of its
+//! job, published like any other.
 //!
 //! **Broken.** An error after a call's first change — a boundary's first
 //! engine stream wait, `end_pass`'s first fold into the rule, a reset's first
@@ -83,6 +87,7 @@ use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
 use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
 
 use super::slots::{HOST, Slot, SlotMap};
+use super::{Drain, drain_within, poll_drained};
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_write};
 
@@ -187,7 +192,9 @@ pub trait SwapSource: Send + Sync {
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError>;
 
     /// The device address slot `slot` of layer `layer`'s stack `part` starts
-    /// at. The stacks stay allocated and in place for the machine's life.
+    /// at. The stacks stay allocated and in place until the machine's copy
+    /// stream has drained: its owner stops the machine before it frees them
+    /// ([`crate::host::HostTier::stop_swap`]).
     fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError>;
 
     /// Enqueue on `stream`, the machine's copy stream, whatever turns part
@@ -387,9 +394,9 @@ pub const RING_SLOTS: usize = 4;
 /// Bytes between two words of the staging page: a cache line each.
 const WORD_STRIDE: usize = 64;
 
-/// Nanoseconds since `t0`, saturated.
+/// Nanoseconds since `t0`, saturated ([`super::nanos`]).
 fn nanos(t0: Instant) -> u64 {
-    u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    super::nanos(t0.elapsed())
 }
 
 /// Whole microseconds since `t0`, saturated.
@@ -526,7 +533,11 @@ impl Ring {
         let off = self.span(k, at, bytes.len(), "SwapMachine ring write")?;
         // SAFETY: [off, off + len) lies inside the page (checked above); no
         // copy reads ring slot k until the staging word publishes this use,
-        // and the staging thread is the only host writer.
+        // and the staging thread is the only host writer. The word's Release
+        // store follows these stores in program order, which x86 (TSO) keeps
+        // in the coherent write-back pinned page, and the copy engine reads
+        // the page over PCIe with no SM cache between: the copy the word
+        // lets through reads these bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.page.host_at(off), bytes.len());
         }
@@ -547,7 +558,7 @@ impl Ring {
         // SAFETY: the source span lies inside the page (checked above), which
         // stays allocated until the copy stream has drained (the machine's
         // drop leaks it otherwise); the source vouches that `dst` holds `len`
-        // bytes of an allocation alive for the machine's life.
+        // bytes of an allocation alive until the copy stream has drained.
         let rc = unsafe {
             sys::cuMemcpyHtoDAsync_v2(
                 dst,
@@ -840,6 +851,9 @@ pub enum LeakReason {
     Release,
     /// The copy stream did not drain within the deadline.
     Drain,
+    /// The copy stream's query returned a driver error: a sticky fault of
+    /// the context, not a wait.
+    Fault,
 }
 
 impl LeakReason {
@@ -850,6 +864,7 @@ impl LeakReason {
             LeakReason::Join => "join",
             LeakReason::Release => "release",
             LeakReason::Drain => "drain",
+            LeakReason::Fault => "fault",
         }
     }
 }
@@ -860,8 +875,36 @@ impl LeakReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Leak {
     pub reason: LeakReason,
+    /// The driver error's `CUresult` on a fault ([`Leak::fault`]), kept for
+    /// the `residency leak` record: the one fact of the fault the driver
+    /// already reported. `None` on every other reason, which names no driver
+    /// error.
+    pub code: Option<u32>,
     pub ring_bytes: u64,
     pub words_bytes: u64,
+}
+
+impl Leak {
+    /// The leak for the driver error the copy stream's query returned at a
+    /// drop: the reason `fault` with the error's `CUresult` as `code`, so
+    /// the record names which fault, not only that there was one. The
+    /// driver's own text it asks the context for at print time, which a
+    /// faulted context may not answer; the code it already gave. A drain's
+    /// error is a driver error always (the poll builds it from the query),
+    /// so a codeless fault is an error of another kind, which that path
+    /// cannot make.
+    #[must_use]
+    pub fn fault(e: &GpuError, ring_bytes: u64, words_bytes: u64) -> Leak {
+        Leak {
+            reason: LeakReason::Fault,
+            code: match e {
+                GpuError::Driver { source, .. } => Some(source.0),
+                _ => None,
+            },
+            ring_bytes,
+            words_bytes,
+        }
+    }
 }
 
 /// Where a dropped machine reports a leak; set once a process.
@@ -994,7 +1037,7 @@ impl SwapMachine {
     /// host now (their slots free) and its first `pinned[l]` are never a
     /// victim; its tier experts stay where they are. A layer with no card
     /// slot takes no part. `view` and the stacks stay allocated and in place
-    /// for the machine's life.
+    /// until the machine is dropped and its copy stream has drained.
     ///
     /// Refused by name: a layer whose stage card capacity is not its live
     /// count, a layer with card slots fewer than `pinned + spares + 1`, a
@@ -1101,7 +1144,11 @@ impl SwapMachine {
             m.changed.push((l, id, HOST));
         }
         m.write_changed(stream)?;
-        stream.synchronize()?;
+        drain_within(
+            stream,
+            m.shared.deadline,
+            "SwapMachine::new: the engine stream after the spare slots' words",
+        )?;
         Ok(m)
     }
 
@@ -1221,7 +1268,7 @@ impl SwapMachine {
                     for_thread.run(&rx);
                 }
             })
-            .map_err(|e| GpuError::shape("SwapMachine::new", format!("the staging thread: {e}")))?;
+            .map_err(|e| GpuError::plan("SwapMachine::new: the staging thread", e))?;
         match bound_rx.recv() {
             Ok(Ok(())) => Ok(Staging { shared, tx, thread }),
             // The thread is ending: joined here, so its reference to the
@@ -1335,12 +1382,16 @@ impl SwapMachine {
     }
 
     /// `r`, breaking the machine when it is an error: the call made a change
-    /// before it failed.
-    fn after_change<T>(&mut self, r: Result<T, GpuError>, at: &str) -> Result<T, GpuError> {
+    /// before it failed. `at` names the call, made only on an error.
+    fn after_change<T>(
+        &mut self,
+        r: Result<T, GpuError>,
+        at: impl FnOnce() -> String,
+    ) -> Result<T, GpuError> {
         if let Err(e) = &r
             && self.broken.is_none()
         {
-            self.broken = Some(format!("{at}: {e}"));
+            self.broken = Some(format!("{}: {e}", at()));
         }
         r
     }
@@ -1427,9 +1478,9 @@ impl SwapMachine {
             ));
         }
         self.check_tally(tally, kept, WHAT)?;
-        let at = format!("the end of pass {}", self.rule.passes());
+        let pass = self.rule.passes();
         let folded = self.fold(tally, kept, WHAT);
-        self.after_change(folded, &at)?;
+        self.after_change(folded, || format!("the end of pass {pass}"))?;
         tally.clear();
         self.kept = kept;
         self.end_us = micros(start);
@@ -1523,7 +1574,7 @@ impl SwapMachine {
         }
         self.refuse_staging_failure(WHAT, Some(b))?;
         let landing = self.landing(b);
-        let landing = self.after_change(landing, &format!("boundary {b}"))?;
+        let landing = self.after_change(landing, || format!("boundary {b}"))?;
         let mut report = PassReport {
             boundary: b,
             kept: if b == 0 { 0 } else { self.kept },
@@ -1553,7 +1604,7 @@ impl SwapMachine {
             }
         }
         let changed = self.land_and_plan(b, stream, slots, &landing, &mut report);
-        self.after_change(changed, &format!("boundary {b}"))?;
+        self.after_change(changed, || format!("boundary {b}"))?;
         report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
         self.planned = Some(b);
@@ -1869,17 +1920,30 @@ impl SwapMachine {
         self.drain_copies(WHAT)?;
         self.refuse_staging_failure(WHAT, None)?;
         let r = self.relayout(stream, slots);
-        self.after_change(r, "reset")
+        self.after_change(r, || "reset".to_string())
     }
 
-    /// The reset's changes, the first on ([`SwapMachine::reset`]).
+    /// The reset's changes, the first on ([`SwapMachine::reset`]): the flips
+    /// in flight cancelled, the admitted experts sent back to the host, the
+    /// seed experts copied back onto the card, then the maps, the ledger and
+    /// the rule at the seed.
     fn relayout(
         &mut self,
         stream: &CudaStream,
         slots: &mut SlotMap,
     ) -> Result<ResetReport, GpuError> {
-        const WHAT: &str = "SwapMachine::reset";
         let mut report = ResetReport::default();
+        let cancelled = self.cancel_in_flight(&mut report)?;
+        let back = self.send_back(slots)?;
+        let placed = self.copy_back(stream, slots, &back)?;
+        self.commit(stream, slots, &placed, &cancelled, &mut report)?;
+        Ok(report)
+    }
+
+    /// Every filling slot back to spare, its event free: the flips the rule
+    /// has in flight, which the ledger must hold one a slot.
+    fn cancel_in_flight(&mut self, report: &mut ResetReport) -> Result<Vec<Flip>, GpuError> {
+        const WHAT: &str = "SwapMachine::reset";
         let cancelled: Vec<Flip> = self.rule.in_flight().to_vec();
         for l in self.layers.clone() {
             for st in self.ledger.row_mut(l).iter_mut() {
@@ -1900,6 +1964,14 @@ impl SwapMachine {
                 ),
             ));
         }
+        Ok(cancelled)
+    }
+
+    /// Every live expert not in its layer's seed to the host (prepared, and
+    /// refused by name unless host-resident), its slot spare; the seed
+    /// experts not live, per layer, which the reset copies back.
+    fn send_back(&mut self, slots: &mut SlotMap) -> Result<Vec<(usize, u32)>, GpuError> {
+        const WHAT: &str = "SwapMachine::reset";
         let mut back = Vec::new();
         for (i, l) in self.layers.clone().enumerate() {
             let seed = self.rule.seed(i).map_err(|e| rule_err(WHAT, e))?;
@@ -1927,6 +1999,18 @@ impl SwapMachine {
                     .map(|&id| (l, id)),
             );
         }
+        Ok(back)
+    }
+
+    /// The copies of `back`'s seed experts into spare slots, reserved, behind
+    /// this call's boundary event on `stream`, drained; the placements.
+    fn copy_back(
+        &mut self,
+        stream: &CudaStream,
+        slots: &SlotMap,
+        back: &[(usize, u32)],
+    ) -> Result<Vec<(usize, u32, u32)>, GpuError> {
+        const WHAT: &str = "SwapMachine::reset";
         self.boundary_event.record(stream)?;
         self.copy_waits_boundary = false;
         // The seed's copies stage as they are issued, whatever the window
@@ -1938,7 +2022,7 @@ impl SwapMachine {
         // an error in between the flush stays on, which only stages sooner.
         self.shared.flush.store(true, Ordering::Release);
         let mut placed = Vec::with_capacity(back.len());
-        for &(l, id) in &back {
+        for &(l, id) in back {
             if !placed.is_empty() && placed.len() % RING_SLOTS == 0 {
                 self.drain_copies(WHAT)?;
             }
@@ -1955,13 +2039,29 @@ impl SwapMachine {
         self.drain_copies(WHAT)?;
         self.shared.flush.store(false, Ordering::Release);
         self.refuse_staging_failure(WHAT, None)?;
-        for &(l, id, spare) in &placed {
+        Ok(placed)
+    }
+
+    /// The copied seed experts live in the host map, the ledger and the
+    /// card's copy, the host pages of those and of the cancelled flips'
+    /// victims still on the card released, the rule at its seed; then every
+    /// layer's diff from the seed counted and its maps agreeing.
+    fn commit(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        placed: &[(usize, u32, u32)],
+        cancelled: &[Flip],
+        report: &mut ResetReport,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::reset";
+        for &(l, id, spare) in placed {
             slots.admit(l, id, Slot::Card(spare))?;
             self.ledger.row_mut(l)[spare as usize] = SlotState::Live(id);
             self.changed.push((l, id, spare));
             report.dropped_bytes += self.shared.source.release_host(l, id)?;
         }
-        for f in &cancelled {
+        for f in cancelled {
             let l = f.layer_of(self.layers.start);
             if matches!(slots.slot(l, f.evict), Some(Slot::Card(_))) {
                 report.dropped_bytes += self.shared.source.release_host(l, f.evict)?;
@@ -1982,7 +2082,7 @@ impl SwapMachine {
             report.diff += seed.iter().filter(|id| !live.contains(id)).count();
             self.agree(l, slots, WHAT)?;
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Stage every queued job whatever the window says and wait, within the
@@ -2003,24 +2103,12 @@ impl SwapMachine {
         self.shared.flush.store(was, Ordering::Release);
         r
     }
-}
 
-/// Why [`poll_drained`] stopped short.
-enum Drain {
-    Driver(GpuError),
-    Late(Duration),
-}
-
-/// Poll `stream` until it has drained, at most `deadline`.
-fn poll_drained(stream: &CudaStream, deadline: Duration) -> Result<(), Drain> {
-    let t0 = Instant::now();
-    loop {
-        match stream.query() {
-            Ok(true) => return Ok(()),
-            Ok(false) if t0.elapsed() > deadline => return Err(Drain::Late(t0.elapsed())),
-            Ok(false) => std::thread::sleep(Duration::from_micros(50)),
-            Err(e) => return Err(Drain::Driver(e.into())),
-        }
+    /// The bound on every host wait the machine makes
+    /// ([`MachineCfg::deadline`]).
+    #[must_use]
+    pub fn deadline(&self) -> Duration {
+        self.shared.deadline
     }
 }
 
@@ -2053,22 +2141,36 @@ impl Drop for SwapMachine {
         // reference, and the shared state is leaked too: its last owner would
         // free pinned pages and the source on that thread, inside the driver
         // beside whatever this process runs next.
-        let reason = if !joined {
-            Some(LeakReason::Join)
+        let ring_bytes = (RING_SLOTS * self.shared.ring.slot_bytes) as u64;
+        let words_bytes = (2 * RING_SLOTS * WORD_STRIDE) as u64;
+        let leak = if !joined {
+            Some(Leak {
+                reason: LeakReason::Join,
+                code: None,
+                ring_bytes,
+                words_bytes,
+            })
         } else if !released {
-            Some(LeakReason::Release)
-        } else if poll_drained(&self.copy, deadline).is_err() {
-            Some(LeakReason::Drain)
+            Some(Leak {
+                reason: LeakReason::Release,
+                code: None,
+                ring_bytes,
+                words_bytes,
+            })
         } else {
-            None
+            match poll_drained(&self.copy, deadline) {
+                Ok(()) => None,
+                Err(Drain::Late(_)) => Some(Leak {
+                    reason: LeakReason::Drain,
+                    code: None,
+                    ring_bytes,
+                    words_bytes,
+                }),
+                Err(Drain::Driver(e)) => Some(Leak::fault(&e, ring_bytes, words_bytes)),
+            }
         };
-        if let Some(reason) = reason {
+        if let Some(leak) = leak {
             std::mem::forget(Arc::clone(&self.shared));
-            let leak = Leak {
-                reason,
-                ring_bytes: (RING_SLOTS * self.shared.ring.slot_bytes) as u64,
-                words_bytes: (2 * RING_SLOTS * WORD_STRIDE) as u64,
-            };
             match LEAK_SINK.get() {
                 Some(sink) => sink(&leak),
                 None => eprintln!(
@@ -2076,7 +2178,7 @@ impl Drop for SwapMachine {
                      and the source: {}",
                     leak.ring_bytes,
                     leak.words_bytes,
-                    reason.word()
+                    leak.reason.word()
                 ),
             }
         }

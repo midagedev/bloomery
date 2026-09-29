@@ -9,7 +9,7 @@
 use super::page::{HandoffLayout, PageLayout, Word};
 use super::route_trace::RouteTrace;
 use super::slots::{Slot, SlotMap};
-use super::{Health, HostExperts, Refusal, non_finite, unknown_id};
+use super::{Health, HostExperts, Refusal, nanos, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::{
     MappedHost, capturing, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
@@ -870,7 +870,7 @@ impl StepPort {
             w.store(1, Ordering::Release);
         }
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
-        let gap = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let gap = nanos(entered.elapsed());
         if let Some(w) = &self.window {
             w.store(0, Ordering::Release);
         }
@@ -936,7 +936,7 @@ impl StepPort {
         self.served = self.served.wrapping_add(1);
         let s = &mut self.stats;
         s.served += 1;
-        s.leg_ns += u64::try_from(go.t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        s.leg_ns += nanos(go.t0.elapsed());
         s.parks_in_service += threads::pool()
             .stats()
             .worker_parks
@@ -1250,11 +1250,11 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
             std::hint::spin_loop();
         }
         if chunk.start == caller {
-            let ns = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let ns = nanos(base.elapsed());
             seen_at.store(ns, Ordering::Relaxed);
         }
     });
-    let end = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let end = nanos(base.elapsed());
     (
         generation.load(Ordering::Acquire),
         end.saturating_sub(seen_at.load(Ordering::Relaxed)),
