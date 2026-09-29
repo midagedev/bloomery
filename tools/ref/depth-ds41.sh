@@ -1267,6 +1267,19 @@ ours_arm() {
   [ -z "$fed" ] || MAJ_TIMED=$((f1 - fed))
   ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
 }
+# keep_out <label> <round> <output>: every ours arm's whole output under one directory a run, so the
+# records the row does not carry (residency pass, stat step, helper) stay readable after the run —
+# `--parse` reads one back. The directory is made at the first arm and named once.
+KEEP_DIR=
+keep_out() {
+  if [ -z "$KEEP_DIR" ]; then
+    KEEP_DIR="target/depth-ds41/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    mkdir -p "$KEEP_DIR" || { echo "depth-ds41: cannot make $KEEP_DIR for the arms' outputs" >&2; exit 2; }
+    echo "[keep] every ours arm's output: $KEEP_DIR/<label>-r<round>.log"
+  fi
+  printf '%s\n' "$3" > "$KEEP_DIR/$(tr -c 'A-Za-z0-9._@=-' '_' <<< "$1" | sed 's/_$//')-r$2.log" ||
+    { echo "depth-ds41: cannot write $1 r$2's output under $KEEP_DIR" >&2; exit 2; }
+}
 # ours_pre <index> <round>: the witness block before a generate_ds41 arm.
 ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
 # ours_post <index> <round> <rc> <output> <wall s>: the witness block after a generate_ds41 arm, then its
@@ -1275,6 +1288,7 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
 ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a slot
   dep=${A_DEP[$i]} label=${A_LABEL[$i]}
+  keep_out "$label" "$r" "$out"
   witness "post r$r $label d=$dep n=$N"
   guard_cpu "post r$r $label d=$dep"
   SLOT_COL=

@@ -1190,6 +1190,20 @@ elif want bin-prose-res "$L" 1 "^ROW r1 bin:base@prose@$R d=4 .*\| slot 1/2 \| w
   fi
 fi
 
+# arm-keep: the bin-prose-res run above named its keep directory once and left each ours arm's whole
+# output there, the residency pass records the rows do not carry among them.
+L=$tmp/bin-prose-res.log
+K=$(sed -nE 's/^\[keep\] every ours arm.s output: (.*)\/<label>-r<round>\.log$/\1/p' "$L")
+if [ "$(grep -c '^\[keep\] ' "$L")" != 1 ]; then
+  fail arm-keep "want one [keep] line" "$L"
+elif [ "$(ls "$T/$K"/*-r1.log 2>/dev/null | wc -l | tr -d ' ')" != 2 ]; then
+  fail arm-keep "want 2 kept outputs under $K, found: $(ls "$T/$K" 2>&1 | tr '\n' ' ')" "$L"
+elif ! grep -q '^residency pass ' "$T/$K"/*prose*-r1.log; then
+  fail arm-keep "no residency pass record in the kept outputs under $K" "$L"
+else
+  pass arm-keep
+fi
+
 L=$tmp/bin-prose-dry.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- prose:4 "bin:$BASEBIN:prose:4@$R" "bin:$BASEBIN:prose:8@$R" \
   "bin:$BASEBIN:prose:4@BLOOMERY_AB_LOAD=arm"
