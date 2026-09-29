@@ -112,6 +112,14 @@
 //!   `made × per_job` chunks, each behind the pace word, and the goes release
 //!   some of them before their landing (its mutant: the copies issued with no
 //!   pace wait).
+//! - stagewin: with a source that takes [`SLOW_PART`] to resolve each part,
+//!   the window opened once after the first planning boundary's jobs are
+//!   issued and closed again, no job due, the fill threads write no ring
+//!   byte for [`WIN_HOLD`]; with the window then opened in short pulses the
+//!   jobs stage completely, and the run's values and flips are the prompt
+//!   run's (its mutant: the window looked at once per job); prompt runs at 1
+//!   and at [`FILL_MAX`] fill threads (most of them with no piece of a job
+//!   here) give the same values and flips too.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -133,8 +141,8 @@ mod gate {
 
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
-        Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
-        Transform, set_leak_sink,
+        FILL_MAX, Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine,
+        SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
@@ -174,6 +182,8 @@ mod gate {
     /// copy and launch here takes microseconds.
     const HOLD_SETTLE: Duration = Duration::from_millis(200);
     const DELAY: u64 = 3;
+    /// Fill threads every arm's machine runs: the engine's default.
+    const FILL: usize = 2;
     /// Copy stream commands the queue arm's source adds to each part it
     /// copies: one job then carries thousands and a reset's seed copies tens
     /// of thousands, past what a stream queues before an enqueue blocks.
@@ -314,8 +324,9 @@ mod gate {
     /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
     /// `panic_source` fail or panic when their bytes are read, every stack
     /// destination of layer `fail_dest` is an error, and each part a copy
-    /// moves carries `inflate` more copy stream commands. `dropped_on` gets
-    /// the name of the thread that drops the source.
+    /// moves carries `inflate` more copy stream commands; every part's
+    /// bytes take `slow_part` to resolve. `dropped_on` gets the name of the
+    /// thread that drops the source.
     #[derive(Clone, Debug, Default)]
     struct Faults {
         dropped_on: Arc<Mutex<Option<String>>>,
@@ -325,6 +336,7 @@ mod gate {
         panic_source: Option<(usize, u32)>,
         fail_dest: Option<usize>,
         inflate: usize,
+        slow_part: Option<Duration>,
     }
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
@@ -502,6 +514,9 @@ mod gate {
         }
 
         fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
+            if let Some(d) = self.faults.slow_part {
+                std::thread::sleep(d);
+            }
             if self.faults.fail_source == Some((layer, id)) {
                 return Err(GpuError::Shape {
                     what: "Synth::source",
@@ -961,6 +976,7 @@ mod gate {
             top_k: K,
             max_rows: MAX_ROWS,
             deadline,
+            fill: FILL,
         }
     }
 
@@ -2143,6 +2159,7 @@ mod gate {
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= placement(&gpu, &pm)?;
         ok &= pace_clause(&gpu, &pm, &trace, &a)?;
+        ok &= stagewin_clause(&gpu, &pm, &trace, &a)?;
         let light = queue(&gpu, &pm, &trace, &a, LIGHT)?;
         ok &= light;
         if light {
@@ -2241,6 +2258,146 @@ mod gate {
             planning.len(),
             pace.per_job,
             pace.per_go,
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// How long the stagewin arm's source takes to resolve each part's
+    /// bytes: a fill thread holds each part that long before its look at the
+    /// window, so the arm closes the window between one piece and the next.
+    const SLOW_PART: Duration = Duration::from_millis(20);
+    /// How long the stagewin arm holds the window closed with no job due:
+    /// several parts' worth of [`SLOW_PART`].
+    const WIN_HOLD: Duration = Duration::from_millis(300);
+    /// How long the stagewin arm leaves the window open once: many of a
+    /// waiting thread's polls, so it sees the window, and well short of
+    /// [`SLOW_PART`].
+    const WIN_OPEN: Duration = Duration::from_millis(5);
+    /// How soon after its close the stagewin arm reads the ring: a piece
+    /// that passed its look just before the close lands in microseconds.
+    const WIN_SETTLE: Duration = Duration::from_millis(2);
+    /// The stagewin arm's pulses: the window open this long after each go's
+    /// closed stretch of the same length, as a short host-leg wait.
+    const PULSE: Duration = Duration::from_micros(500);
+    /// The stagewin arm's bound on its jobs staging under the pulses.
+    const PULSE_BOUND: Duration = Duration::from_secs(10);
+
+    /// stagewin: the fill threads stage only while the window is open.
+    /// `a`'s trace to its first planning boundary with the window closed (the
+    /// boundary's jobs issued, none due), then the window opened for
+    /// [`WIN_OPEN`] and closed: with each part [`SLOW_PART`] to resolve, a
+    /// thread is then between its look and its next piece, and no ring byte may be written for
+    /// [`WIN_HOLD`] after [`WIN_SETTLE`]. Then a ticker opens the window in
+    /// pulses as the step port does (open, then a go): the boundary's jobs
+    /// stage completely within [`PULSE_BOUND`], and the rest of the trace
+    /// gives the prompt run's values and flips. The mutant — the window
+    /// looked at once per job — writes its later parts inside the hold.
+    fn stagewin_clause(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let first = a
+            .reports
+            .iter()
+            .find(|p| p.made > 0)
+            .ok_or("gate_swap: the prompt run made no flip")?;
+        let (b0, made) = (first.boundary as usize, first.made as u64);
+        let faults = Faults {
+            slow_part: Some(SLOW_PART),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(gpu, &mut r, trace, 0..b0 + 1, Copies::Held, Hold::None)?;
+        let m = r.machine.as_ref().ok_or("gate_swap: no machine")?;
+        let window = m.window();
+        // The drive leaves the window open: each thread passes its look at
+        // its first piece, then resolves that part, and the window closes.
+        std::thread::sleep(WIN_OPEN);
+        window.store(0, Ordering::Release);
+        std::thread::sleep(WIN_SETTLE);
+        let at_close = m.ring_bytes();
+        std::thread::sleep(WIN_HOLD);
+        let after_hold = m.ring_bytes();
+        let want = made * EXPERT_BYTES;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (pulsed, stopped) = (m.window(), Arc::clone(&stop));
+        let (ticker, _) = threads::helper::spawn_helper(
+            "stagewin-ticker",
+            threads::helper::Placement::Float,
+            move || {
+                while !stopped.load(Ordering::Acquire) {
+                    pulsed.store(1, Ordering::Release);
+                    std::thread::sleep(PULSE);
+                    pulsed.go();
+                    std::thread::sleep(PULSE);
+                }
+            },
+        )
+        .map_err(|e| format!("gate_swap: the stagewin arm's ticker: {e}"))?;
+        let t0 = Instant::now();
+        while m.ring_bytes() < want && t0.elapsed() < PULSE_BOUND {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (staged, staged_in) = (m.ring_bytes(), t0.elapsed());
+        let driven = if r.err.is_none() {
+            drive(
+                gpu,
+                &mut r,
+                trace,
+                b0 + 1..PASSES,
+                Copies::Prompt,
+                Hold::None,
+            )
+        } else {
+            Ok(())
+        };
+        stop.store(true, Ordering::Release);
+        ticker
+            .join()
+            .map_err(|_| "gate_swap: the stagewin arm's ticker panicked")?;
+        driven?;
+        let quiet = after_hold == at_close && at_close < want;
+        let complete = staged == want;
+        let same = r.err.is_none()
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values);
+        let mut fills = Vec::new();
+        for fill in [1, FILL_MAX] {
+            let mut f = start(
+                gpu,
+                pm,
+                seed_map(&[])?,
+                Faults::default(),
+                MachineCfg {
+                    fill,
+                    ..cfg(DELAY, DEADLINE)
+                },
+            )?;
+            drive(gpu, &mut f, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+            let eq = f.err.is_none()
+                && fnvs(&f.values) == fnvs(&a.values)
+                && f.flips == a.flips
+                && clean(&f.values);
+            fills.push((fill, eq, show(&f.err)));
+        }
+        let fills_same = fills.iter().all(|&(_, eq, _)| eq);
+        let ok = quiet && complete && same && fills_same;
+        println!(
+            "stagewin: prompt runs at {:?} fill threads: values and flips = the {FILL}-thread \
+             run's {fills_same}",
+            fills
+        );
+        println!(
+            "stagewin: boundary {b0} made {made} flips ({want} B to stage), parts {SLOW_PART:?} \
+             each to resolve, {FILL} fill threads; window closed with no job due: ring bytes \
+             {at_close} {WIN_SETTLE:?} after the close, {after_hold} {WIN_HOLD:?} later (want \
+             equal, below {want}) {quiet}; under {PULSE:?} pulses {staged} B in {staged_in:?} \
+             (want {want}) {complete}; values and flips = the prompt run's {same}, error {}: {}",
             show(&r.err),
             verdict(ok)
         );

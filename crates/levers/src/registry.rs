@@ -28,11 +28,16 @@ pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
+pub const SWAP_FILL: &str = "BLOOMERY_SWAP_FILL";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
 pub const PREFILL_GROUP_MAX: u64 = 8;
+
+/// The largest `BLOOMERY_SWAP_FILL`: the residency machine's fill threads at
+/// most, one per worker it places them beside.
+pub const SWAP_FILL_MAX: u64 = 8;
 
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
@@ -311,6 +316,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               clear, the server's `POST /residency/reset`), with a `residency reset` record. \
               `bloomery-serve-ds41` refuses it beside `BLOOMERY_ROUTE_TRACE`, which records a \
               fixed placement's routing. Every other binary refuses it set, by name.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: SWAP_FILL,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: SWAP_FILL_MAX,
+            trim: false,
+        },
+        default: Unset::Is("2"),
+        doc: "Adaptive expert residency (`host::swap`): the fill threads that stage each flip's \
+              expert into the staging ring, its parts cut into pieces and split among them, each \
+              piece begun only while the host leg waits for the card's go (or once the flip is \
+              due); thread k runs on the SMT sibling of the pool's worker k when the pool is \
+              pinned, else floating. Read where \
+              `BLOOMERY_RESIDENCY` is (`generate_ds41`, `bloomery-serve-ds41`) and only when \
+              it is not `off`; every value writes the same bits. Every other binary refuses it \
+              set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

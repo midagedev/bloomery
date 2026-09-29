@@ -341,8 +341,9 @@ pub struct Ds41Swap {
 // SAFETY: the stack addresses are plain device pointers into allocations the
 // model keeps in place for the machine's life; the kernels and the scratch
 // are used from the one thread that drives the machine (`convert`), and
-// everything the staging thread reads (`source`, `prepare_victim`) is the
-// split's and the sidecar's read-only mappings and the set.
+// everything the fill threads read, several at once (`source`,
+// `prepare_victim_part`), is the split's and the sidecar's read-only mappings
+// and the set.
 unsafe impl Send for Ds41Swap {}
 // SAFETY: as for `Send`: no call mutates shared state.
 unsafe impl Sync for Ds41Swap {}
@@ -615,6 +616,38 @@ impl SwapSource for Ds41Swap {
         Ok(())
     }
 
+    /// Bytes `bytes` of the part's host run, whose length is the part's
+    /// (both are the source tensor's bytes an expert): a sub-range of what
+    /// [`Ds41Swap::prepare_victim`] populates for that part.
+    fn prepare_victim_part(
+        &self,
+        layer: usize,
+        id: u32,
+        part: usize,
+        bytes: Range<usize>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Ds41Swap::prepare_victim_part";
+        let (file, at) = self.run(layer, id, part, WHAT)?;
+        let (start, end) = (bytes.start as u64, bytes.end as u64);
+        if start >= end || end > at.end - at.start {
+            return Err(shape(
+                WHAT,
+                format!(
+                    "layer {layer} expert {id} part {part}: bytes {bytes:?} of a run of {}",
+                    at.end - at.start
+                ),
+            ));
+        }
+        self.set
+            .populate_run(
+                self.pair.source(),
+                &file,
+                &(at.start + start..at.start + end),
+            )
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        Ok(())
+    }
+
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError> {
         const WHAT: &str = "Ds41Swap::host_resident";
         for part in 0..3 {
@@ -643,13 +676,14 @@ impl SwapSource for Ds41Swap {
 /// The machine's shape for a V4.1 load under `residency` over `map`: the
 /// `mid` rule at [`LIVE_DELAY`], `pinned` of it per layer (a layer's card
 /// holds fewer is the machine's refusal), `top_k` ids a row, passes of up to
-/// `max_rows` rows. `None` for `off`.
+/// `max_rows` rows, `fill` fill threads. `None` for `off`.
 #[must_use]
 pub fn machine_cfg(
     residency: Residency,
     map: &SlotMap,
     top_k: usize,
     max_rows: usize,
+    fill: usize,
 ) -> Option<MachineCfg> {
     let (params, pinned) = residency.params(LIVE_DELAY)?;
     Some(MachineCfg {
@@ -658,6 +692,7 @@ pub fn machine_cfg(
         top_k,
         max_rows,
         deadline: DEADLINE,
+        fill,
     })
 }
 

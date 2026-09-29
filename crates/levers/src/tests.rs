@@ -258,6 +258,7 @@ fn accessors_read_their_rows() {
             (CARD_DONTNEED, "0"),
             (R8, "off"),
             (RESIDENCY, "mid-p40-s1"),
+            (SWAP_FILL, "4"),
             (PREFILL_GROUP, "8"),
         ]),
         Scope::Every,
@@ -278,6 +279,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), "mid-p40-s1");
+    assert_eq!(set.swap_fill(), 4);
     assert_eq!(
         set.host(),
         HostCfg {
@@ -310,7 +312,8 @@ fn accessors_read_their_rows() {
             HOST_LOCK,
             CARD_DONTNEED,
             R8,
-            RESIDENCY
+            RESIDENCY,
+            SWAP_FILL
         ]
     );
 }

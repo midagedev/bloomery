@@ -259,6 +259,7 @@ selftests=(
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-hotlist.py --self-test"
   "tools/ref/router-residency.py --self-test"
+  "tools/ref/swappace-table.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
 )

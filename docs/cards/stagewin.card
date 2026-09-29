@@ -1,0 +1,49 @@
+# Round stagewin: the residency swap stages only while the host leg waits for the card's go, in pieces of
+# STAGE_PIECE = 256 KiB, split among BLOOMERY_SWAP_FILL fill threads (host/swap.rs, Staging).
+# Base (swappace c826d483, diagnostic arm, --place bp, prose:64, mid-p40-s1, arm 1 steps 20-95, not a timed
+# number): step ms by step mod 4 = 32.3 / 30.6 / 29.9 / 23.5, leg_us 15.4 / 15.9 / 14.7 / 13.5 ms, gap_p50
+# 205 / 206 / 209 / 188 us, 24 flips a 4-step cycle, late 0, forced 0: cycle excess ~22.8 ms. rig-log
+# 2026-09-29#cprobe: one 16,773,120 B copy staged by a memcpy thread beside the DRAM-bound host leg costs
+# c = 7.8 host slots of leg time (~119.5 us a slot), a DMA from a pinned source 0.83; 24 x 7.8 x 119.5 us
+# = 22.4 ms [derived] is the excess: the memcpy that runs on past the go, not the link. Today serve() looks
+# at the window once per job and then copies the whole 16.77 MB.
+# Capacity [derived]: the window is the gap, ~40 a step: 40 x (205+206+209+188) us = 32.3 ms a cycle.
+# Demand 24 x 16,773,120 = 402.6 MB a cycle. One thread copies 13.43 GB/s alone (cprobe's staging-alone
+# rate; 2.94 GB/s beside the leg), and sees an opened window one poll late (a 20 us sleep plus the default
+# 50 us timer slack: ~35 us of a ~200 us gap), so ~0.82 of each gap: 13.43 x 32.3 ms x 0.82 = 356 MB < 402.6
+# — one thread cannot, the rest turns due at the landing and stages outside the window; two threads on two
+# CCDs 712 MB (57 % busy). The pace releases 2 chunks = 4.19 MB a go, only for staged jobs; two threads
+# stage ~4.4 MB a gap, one ~2.2 MB, so one thread also holds back the paced DMA. Default 2.
+# Residual at fill 2 [derived]: (a) the DMA's own reads in the host leg, 24 x 0.83 x 119.5 us = 2.4 ms;
+# (b) the overrun, half a piece on average per busy thread at each go run beside the leg: 131 KB x
+# (7.8 x 119.5 us / 16.77 MB = 55.6 us/MB) = 7.3 us, over ~182 busy thread-gaps (30.0 ms of copying at
+# 13.43 GB/s / 0.165 ms) = 1.3 ms; (c) the victims' page walks, now in the window: ~0. Sum ~3.7 ms; the band
+# 3..8 ms leaves room for (b) at four threads and for a gap the in-window copies lengthen. Step mean
+# 23.5 + (3..8)/4 = 24.3..25.5 ms. fill 1: above the band (the ~46 MB it cannot stage in the window
+# stages at the landing, where the host waits: stage_out_bytes > 0, wait_us up). fill 4: in the band.
+# Wall: tools/ref/swappace-diag.sh — one build (~2 min), then fill 1, 2, 4, each one bp load and two arms
+# (~3 min, bounded at 480 s): 11..29 min, a gate-lock run, no lease (not a timed number); this card is its
+# written prediction.
+kind: profile
+question: does staging only inside the host leg's wait window, in 256 KiB pieces split over two fill
+  threads, remove the residency cycle's leg excess?
+term: cycle excess ms @ --place bp, residency mid-p40-s1, BLOOMERY_SWAP_FILL=2, prose:64, A6000 — arm 1,
+  steps 20-95: the four step-mod-4 median step ms summed, less four times the least of them
+  (tools/ref/swappace-table.py's `cycle excess`)
+unit: ms
+predict: 3..8 ms
+condition: tools/ref/swappace-diag.sh on this tree (FILLS "1 2 4"), both cards under gpu-gate.sh's two gate
+  locks and the V4.1 load lock, the witness lines before and after each run show no compute process of
+  another round and no build on the box; the fill 2 arm's `residency pass` records show made 24 at every
+  planning boundary, and its late, forced and stage_out_bytes are read beside the excess
+decide-in: keep: land stagewin with BLOOMERY_SWAP_FILL=2 as the default, then run the sitting card
+  docs/cards/swappace-sit.card for the table
+decide-below: fine: keep and land as in-band, and note that the paced DMA reads cost less than cprobe's
+  0.83 slots a copy, which re-prices the registered-region design's gain downward
+decide-above: read the table's fields before any other run: stage_out_bytes > 0 at fill 2 means the window
+  is too small for two threads — take the fill 4 arm's excess, and raise the default if it is in the band;
+  stage_out_bytes 0 with the mod 0-2 leg_us still above the quiet mod's by more than 1 ms means DRAM
+  contention even inside the window — open the registered-region design (the churn pool in registered
+  anonymous memory, a direct DMA with no staging memcpy); gap_p50 on the staging mods more than 20 us above
+  the quiet mod's means the in-window copies delay the card leg's host round trips — try fill 1 with 64
+  KiB pieces next

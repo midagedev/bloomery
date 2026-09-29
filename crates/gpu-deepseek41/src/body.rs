@@ -169,6 +169,8 @@ pub struct BodyLevers {
     /// load's slot map; otherwise the load holds the churn pool in its host
     /// set and runs the residency machine over the stage card ([`swap`]).
     pub residency: Residency,
+    /// The residency machine's fill threads (`BLOOMERY_SWAP_FILL`).
+    pub swap_fill: usize,
 }
 
 /// What [`open`] takes besides the file, the placement and the context: the
@@ -198,6 +200,7 @@ impl OpenCfg {
                 rows: RowsLevers::from_levers(levers),
                 host: levers.host(),
                 residency: Residency::parse(levers.residency())?,
+                swap_fill: levers.swap_fill(),
             },
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })
@@ -2300,8 +2303,14 @@ impl Body {
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         if let Some(source) = &swap_source {
-            let mc = swap::machine_cfg(cfg.residency, hybrid.slots(), hp.experts.n_used, PAIR_ROWS)
-                .ok_or_else(|| refuse("a residency machine with no rule".to_string()))?;
+            let mc = swap::machine_cfg(
+                cfg.residency,
+                hybrid.slots(),
+                hp.experts.n_used,
+                PAIR_ROWS,
+                cfg.swap_fill,
+            )
+            .ok_or_else(|| refuse("a residency machine with no rule".to_string()))?;
             hybrid.start_swap(
                 gpu.context(),
                 stream,

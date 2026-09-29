@@ -31,7 +31,7 @@ use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
     HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, RESIDENCY,
-    ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    ROUTE_TRACE, SPIN, STEP_STATS, SWAP_FILL, SWAP_FILL_MAX, THREADS,
 };
 
 #[cfg(test)]
@@ -725,6 +725,14 @@ impl Levers {
     #[must_use]
     pub fn residency(&self) -> &'static str {
         Levers::defaulted(RESIDENCY, self.word(RESIDENCY))
+    }
+
+    /// `BLOOMERY_SWAP_FILL`: the residency machine's fill threads, 1 to
+    /// [`SWAP_FILL_MAX`].
+    #[must_use]
+    pub fn swap_fill(&self) -> usize {
+        let n = Levers::defaulted(SWAP_FILL, self.count(SWAP_FILL));
+        Levers::usize_of(SWAP_FILL, n)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

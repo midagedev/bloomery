@@ -271,7 +271,7 @@ mod drive {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
         HOST_POPULATE, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
-        STEP_STATS,
+        STEP_STATS, SWAP_FILL,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -617,6 +617,7 @@ mod drive {
         CARD_DONTNEED,
         R8,
         RESIDENCY,
+        SWAP_FILL,
     ];
 
     pub fn run() -> Result<(), GateError> {
