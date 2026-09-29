@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The depth-qwen3moe.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_QWEN3MOE_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh and
-# lcpp-warm.sh, and a copy of lease.sh whose lease_take is replaced by a line that takes nothing;
+# timing-card.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh and
+# lcpp-warm.sh, and a copy of lease.sh whose lease_take is replaced by a line that takes nothing; cards.sh
+# there is depth-stub-cards.sh's, two made-up UUIDs;
 # ref-paths.sh there is a stub qwen4exp profile whose engines are stub scripts (llama-bench as lcpp and ik,
 # llama-server, generate_qwen3moe, mistralrs, nvidia-smi). Nothing it starts loads a model or touches a
 # card. The fault counter every copy reads is a file the stub engines add to when a case makes them fault
@@ -96,7 +97,7 @@ trap 'rm -rf "$tmp"' EXIT
 T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/target/release" "$T/base/target/release" "$T/bin" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-qwen3moe.sh"
-cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
+cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
@@ -629,7 +630,7 @@ fi
 
 # The two-card mode (red on the runner before it).
 TC=BLOOMERY_TIMING_CARDS=a6000+3090
-TWO_CVD="GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4,GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1"
+TWO_CVD="$STUB_GPU_A6000,$STUB_GPU_3090"
 L=$tmp/twocard.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" -- lcpp:6 lcpppp:4 lcppfit:6
 if [ "$RC" != 0 ]; then
@@ -648,7 +649,7 @@ elif want twocard "$L" 1 "^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6
   want twocard "$L" 8 '^    3090 cap: ok \(3090: NVIDIA GeForce RTX 3090 \(stub\), power.limit 250.00 W, enforced 250.00 W, bus 00000000:41:00.0 \(the 250 W cap: ok\)\)$' &&
   want twocard "$L" 8 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken \(@[0-9]+\): A6000 0, 3090 0, other 0; last: none$' &&
   want twocard "$L" 1 '^\[config\] two cards: A6000\+3090, the profile.s two-card line: the stub two-card line: ' &&
-  want twocard "$L" 1 "^\[config\] arms=lcpp:6 lcpppp:4 lcppfit:6 timing_gpu=GPU-8c129fa6-[^ ]* other_gpu= CUDA_VISIBLE_DEVICES=$TWO_CVD$" &&
+  want twocard "$L" 1 "^\[config\] arms=lcpp:6 lcpppp:4 lcppfit:6 timing_gpu=$STUB_GPU_A6000 other_gpu= CUDA_VISIBLE_DEVICES=$TWO_CVD$" &&
   want twocard "$L" 1 '^\[timing-cards\] Xid count from @[0-9]+ ' &&
   want twocard "$L" 1 '^mean lcpp d=6 .*\(n=1\)'; then
   pass twocard
@@ -705,7 +706,7 @@ twocard_refused twocard-profile 64 "^depth-qwen3moe.sh: BLOOMERY_TIMING_CARDS=a6
   "$TC" STUB_NO_TWO_CARD=1 -- lcpp:6
 twocard_refused twocard-cap 78 "^depth-qwen3moe.sh: two cards, refused before the lease: the 3090.s power limit reads 300.00 W \(enforced 300.00 W\), not its 250 W cap" \
   "$TC" STUB_3090_LIMIT=300.00 -- lcpp:6
-twocard_refused twocard-gone 69 "^depth-qwen3moe.sh: two cards, refused before the lease: the 3090 \(GPU-307fa0f6-[^)]*\) does not answer nvidia-smi \(rc 15\)" \
+twocard_refused twocard-gone 69 "^depth-qwen3moe.sh: two cards, refused before the lease: the 3090 \($STUB_GPU_3090\) does not answer nvidia-smi \(rc 15\)" \
   "$TC" STUB_3090_GONE=1 -- lcpp:6
 twocard_refused twocard-lease 64 "^depth-qwen3moe.sh: two cards, refused before the lease: tools/ref/lease.sh records one timing card" \
   "$TC" STUB_ONE_CARD_LEASE=1 -- lcpp:6
@@ -738,7 +739,7 @@ L=$tmp/twocard-busy.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" STUB_BUSY_ONCE=3090 -- lcpp:6
 if [ "$RC" != 0 ]; then
   fail twocard-busy "rc $RC, want 0" "$L"
-elif want twocard-busy "$L" 1 '^\[cards-busy\] .* compute apps on a timed card: \[GPU-307fa0f6-[^,]*, 4242, 100 MiB;\]; waiting up to 10 min$' &&
+elif want twocard-busy "$L" 1 "^\[cards-busy\] .* compute apps on a timed card: \[$STUB_GPU_3090, 4242, 100 MiB;\]; waiting up to 10 min$" &&
   want twocard-busy "$L" 1 '^\[cards-busy\] .* both cards are free after 1 s$' &&
   want twocard-busy "$L" 1 '^--- witness wait-cards ' &&
   want twocard-busy "$L" 1 '^ROW r1 lcpp d=6 '; then

@@ -91,12 +91,22 @@
 #            and code are the corpus arms (CORPORA): corpus-<name>.ids, one id per line; a corpus is
 #            compared only with arms of its own name and P, never with another corpus, ours or the
 #            references.
-#   bin:<path>:<D>  a second generate_ds41 (an absolute path on the box, a base tree's build) at depth
-#            D, row label `bin:<basename of its tree>` (the tree is the path above `target/`). It is a
+#   bin:<path>:<D>[@NAME=VALUE[,NAME=VALUE...]]  a second generate_ds41 (an absolute path on the box, a
+#            base tree's build) at depth D with those variables set, row label `bin:<basename of its
+#            tree>` (the tree is the path above `target/`), plus `@NAME=VALUE[,...]` when given. It is a
 #            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
-#            files) is printed with the references'.
+#            files) is printed with the references'. Its arms share loads as ours do (Loads below).
+#   bin:<path>:prose:<P>[@…], bin:<path>:code:<P>[@…]  the second binary fed the corpus's first P ids, as a
+#            prose:<P> or code:<P> arm feeds this tree's binary: row label `bin:<tree>@prose` (`@code`),
+#            plus `@NAME=VALUE[,...]` when given, in that corpus's tables — <corpus> / each label, at the
+#            same P, beside the <corpus>@ arms.
 # Every label is its own engine in the per-arm means and in the ratio table (ours / each other label,
-# the corpus labels excepted; <corpus> / each <corpus>@ label in that corpus's tables).
+# the corpus labels excepted; <corpus> / each <corpus>@ label, and each label on that corpus, in that
+# corpus's tables). A bin: arm with variables is also paired with this binary's arm on the same prompt with
+# the same variables (their order aside) — `prose@X=1` / `bin:<tree>@prose@X=1`, `ours@X=1` /
+# `bin:<tree>@X=1` — in the across-binaries tables (`ratio xbin <corpus or ours> d=`, `ratio pp xbin …
+# p=`), each round's pair as in the others; a bin: arm with variables and no such arm says so there. A
+# dry run prints the pairs.
 # Prefill values (ours' `time prompt`, the pp arms) have their own means and ratio table per prompt
 # length P, never the decode ones'.
 # Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
@@ -241,9 +251,9 @@
 # load shared with other arms ends that process: the arms after it in the round re-run in a fresh load
 # (Loads below), never on the failed one.
 #
-# Loads. A round's ours and corpus arms that share a load key — this binary, --place and the arm's
-# NAME=VALUE list, every variable of which the binary consumes at its load — run in one process:
-# generate_ds41 --arm <D|prose:P|code:P> ... --arm-sync, the engine cleared between two arms
+# Loads. A round's ours, corpus and bin: arms that share a load key — the arm's binary (this tree's, or a
+# bin: arm's), --place and the arm's NAME=VALUE list, every variable of which the binary consumes at its
+# load — run in one process: generate_ds41 --arm <D|prose:P|code:P> ... --arm-sync, the engine cleared between two arms
 # (app::Session::clear, bit for bit a fresh process's state). The binary waits after each arm's `arm`
 # line, so the guards and witness blocks stand before and after every arm as before; the row's wall,
 # majflt (from the go) and timed majflt (from its fed line) are the arm's own, and the row carries
@@ -253,8 +263,9 @@
 # process of its own, and an arm's own `@BLOOMERY_AB_LOAD=arm` runs that arm alone (its label keeps
 # it: `prose:512 512 prose:512@BLOOMERY_AB_LOAD=arm` is the A/A of the clear, the fresh process against
 # the in-load arm). A BLOOMERY_DRAFT or BLOOMERY_CHECK_FINITE arm always runs alone (a draft's state has
-# no clear), and a bin: arm is its own process with the one-arm command line. The warm-up and the
-# blocks' discards are one arm in a process of its own.
+# no clear). A bin: arm's own @BLOOMERY_AB_LOAD=arm runs it with the one-arm command line instead (--depth
+# D, or --tokens <the corpus ids>; no --arm), for a base binary that knows no --arm. The warm-up and the blocks' discards are one arm in a
+# process of its own.
 #
 # Residency. An arm whose environment turns adaptive residency on — BLOOMERY_RESIDENCY set to anything
 # but off, by its own @ list, else inherited by the runner (the lever's words are off, mid-p0-s1 and
@@ -295,7 +306,7 @@
 # arms' order rotated by one slot each round. Any other value is refused. The blocks:
 #   ours         every <D> and <D>@… arm: this tree's binary on the LCG prompt
 #   prose, code  each corpus's arms, its @ arms included: the same binary on that corpus's ids
-#   bin:<tree>   each second binary's arms
+#   bin:<tree>, bin:<tree>@<corpus>  each second binary's arms on the LCG prompt, and on each corpus
 #   lcpp         every mainline arm, lcpp, lcpp<K>, lcpppp and lcpppp<U>: one binary and one token
 #                stream; a sweep value only moves whole layers between the card and the host, and
 #                every K reads the same non-lazy bytes of the file
@@ -640,7 +651,7 @@ corpus_file() { echo "${BLOOMERY_DATA:-}/engram/corpus-$1.ids"; }
 pp_eng() { case $1 in ikpp* | lcpppp*) return 0 ;; *) return 1 ;; esac; }
 pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; echo "${u#fit}"; }
 arm_usage() {
-  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, lcppsrv[fit]:[prose:|code:]<D>, lcppsrvpp[fit][<U>]:[prose:|code:]<P> or bin:<path>:<D>" >&2
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, lcppsrv[fit]:[prose:|code:]<D>, lcppsrvpp[fit][<U>]:[prose:|code:]<P> or bin:<path>:[prose:|code:]<D>[@NAME=VALUE,...]" >&2
   exit 64
 }
 # arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
@@ -694,12 +705,21 @@ for a in "${ARMS[@]}"; do
       ours=1 gen=1
       ;;
     bin:*)
+      # bin:<path>:[<corpus>:]<D>[@NAME=VALUE,...]: the variables first (a path carries no @), then the
+      # depth and the corpus from the right, so a colon inside the path is kept.
       kind=bin eng=bin bin=${a#bin:}
+      case $bin in *@*) envs=${bin#*@} bin=${bin%%@*} && arm_envs_ok "$a" "$envs" ;; esac
       dep=${bin##*:} bin=${bin%:*}
+      case " $CORPORA " in *" ${bin##*:} "*) ids=${bin##*:} bin=${bin%:*} ;; esac
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
+      case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
-      label=bin:${tree##*/}
+      label=bin:${tree##*/}${ids:+@$ids}${envs:+@$envs}
+      if [ -n "$ids" ]; then
+        corpus_check "$a" "$ids" "$dep"
+        tok=$(head -n "$dep" "$(corpus_file "$ids")" | paste -sd, -)
+      fi
       gen=1
       ;;
     *@*)
@@ -740,14 +760,19 @@ for a in "${ARMS[@]}"; do
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok") A_IDS+=("$ids")
 done
-# The load keys (the header's Loads): an ours or corpus arm's binary, placement and variables, the solo
-# marker left out; `|solo` on an arm that runs alone. A reference or bin: arm has none.
+# The load keys (the header's Loads): an ours, corpus or bin: arm's binary, placement and variables, the
+# solo marker left out; `|solo` on an arm that runs alone. A reference or server arm has none, and neither
+# has a bin: arm that runs alone: it runs the one-arm command line (ours_arm).
 # shellcheck source=tools/ref/load-groups.sh
 source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
 for i in "${!ARMS[@]}"; do
+  if [ "${A_KIND[$i]}" = bin ] && lg_is_solo "${A_ENV[$i]}"; then
+    LG_KEY[i]=
+    continue
+  fi
   case ${A_KIND[$i]} in
-    ours | corpus)
-      LG_KEY[i]="$BIN|place=$PLACE|$(lg_env_key "$(lg_strip_solo "${A_ENV[$i]}")")"
+    ours | corpus | bin)
+      LG_KEY[i]="${A_BIN[$i]}|place=$PLACE|$(lg_env_key "$(lg_strip_solo "${A_ENV[$i]}")")"
       if lg_is_solo "${A_ENV[$i]}" || [[ ,${A_ENV[$i]}, =~ ,BLOOMERY_(DRAFT|CHECK_FINITE)= ]]; then
         LG_KEY[i]+='|solo'
       fi
@@ -864,13 +889,17 @@ IK_LINE='' LCPP_LINE='' BIN_LINES=()
 # The server's launcher is a few KB; what it runs is the tree's libllama-server-impl.so beside it.
 SRV_LINE=
 [ "$srv" = 0 ] || SRV_LINE=$(srv_tree "$(tree_line "$SRVBIN" "$LCPP")")
+# One tree line a second binary, however many arms run it.
+bin_seen=' '
 for i in "${!ARMS[@]}"; do
   [ "${A_KIND[$i]}" = bin ] || continue
-  b=${A_BIN[$i]}
-  [ -x "$b" ] || { echo "depth-ds41.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
-  t=${b%/target/*}
-  [ "$t" != "$b" ] || t=${b%/*}
-  BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
+  gb=${A_BIN[$i]}
+  [ -x "$gb" ] || { echo "depth-ds41.sh: arm '${ARMS[$i]}': no binary at $gb" >&2; exit 2; }
+  case $bin_seen in *" $gb "*) continue ;; esac
+  bin_seen+="$gb "
+  t=${gb%/target/*}
+  [ "$t" != "$gb" ] || t=${gb%/*}
+  BIN_LINES+=("bin:${t##*/}: $(tree_line "$gb" "$t")")
 done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
@@ -1001,7 +1030,11 @@ arm_block() {
     srv) case ${A_ENG[$1]} in *fit*) echo lcppsrvfit ;; *) echo lcppsrv ;; esac ;;
     ours) echo ours ;;
     corpus) echo "${A_ENG[$1]}" ;;
-    *) echo "${A_LABEL[$1]}" ;;
+    *)
+      local t=${A_BIN[$1]%/target/*}
+      [ "$t" != "${A_BIN[$1]}" ] || t=${A_BIN[$1]%/*}
+      echo "bin:${t##*/}${A_IDS[$1]:+@${A_IDS[$1]}}"
+      ;;
   esac
 }
 # arm_draws <i>: how many token ids arm <i>'s process takes — a reference arm's std::rand() draws, an
@@ -1180,13 +1213,21 @@ arm_envs() {
     ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
   fi
 }
-# The prompt arm <i> of ours feeds, into ARM_FEED: --tokens <the corpus ids> for a corpus arm, else
-# --depth <D> (the binary's LCG prompt).
+# The prompt generate_ds41 arm <i> feeds, into ARM_FEED: --tokens <the corpus ids> for a corpus arm or a
+# bin: arm on a corpus, else --depth <D> (the binary's LCG prompt).
 arm_feed() {
-  if [ "${A_KIND[$1]}" = corpus ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "${A_DEP[$1]}"); fi
+  if [ -n "$(arm_corpus "$1")" ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "${A_DEP[$1]}"); fi
+}
+# arm_corpus <i>: the corpus generate_ds41 arm <i> is fed from (a corpus arm's name, a bin: arm's ids), or
+# nothing for the LCG prompt.
+arm_corpus() {
+  case ${A_KIND[$1]} in
+    corpus) echo "${A_ENG[$1]}" ;;
+    bin) echo "${A_IDS[$1]}" ;;
+  esac
 }
 # One arm of a generate_ds41 at --place PLACE in a process of its own, with the one-arm command line:
-# a bin: arm (a second binary, which may know no --arm). The row and the sum under the arm's label, or
+# a bin: arm whose @ list holds BLOOMERY_AB_LOAD=arm (a base binary that may know no --arm). The row and the sum under the arm's label, or
 # a FAIL row (ours_post). The output passes through majflt_mark on its way into `out`, so the fault
 # count at the prompt timer's start is known: MAJ_WHOLE over the process, MAJ_TIMED from the fed line on.
 # ours_arm <index> <round>
@@ -1269,15 +1310,14 @@ ours_post() {
 # and prompt buffer lines.
 LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host) '
 lg_cmd() {
-  local i
+  local i c
   arm_envs "$1"
   LG_ENV=("${ARM_ENVS[@]}")
-  LG_CMD=("$BIN")
+  # The unit's arms share a load key, which holds the binary: the first arm's is every arm's.
+  LG_CMD=("${A_BIN[$1]}")
   for i in "$@"; do
-    case ${A_KIND[$i]} in
-      corpus) LG_CMD+=(--arm "${A_ENG[$i]}:${A_DEP[$i]}") ;;
-      *) LG_CMD+=(--arm "${A_DEP[$i]}") ;;
-    esac
+    c=$(arm_corpus "$i")
+    LG_CMD+=(--arm "${c:+$c:}${A_DEP[$i]}")
   done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
   LG_CMD+=(-n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} --arm-sync)
@@ -1344,9 +1384,53 @@ ratio_table() {
 }'
 }
 
+# xbin_pairs: every bin: arm with variables and this binary's arm on the same prompt (the corpus, or the
+# LCG walk) with the same variables, compared as a sorted list (the header's pairing), into XB_PAIRS, one
+# `<prompt>|<this binary's label>|<the bin: label>` a pair (`ours` for the LCG walk), and XB_NONE, the bin:
+# labels with no such arm.
+xbin_pairs() {
+  local i j c key base pair
+  XB_PAIRS=() XB_NONE=()
+  for i in "${!ARMS[@]}"; do
+    [ "${A_KIND[$i]}" = bin ] && [ -n "${A_ENV[$i]}" ] || continue
+    c=${A_IDS[$i]:-ours} key=$(lg_env_key "${A_ENV[$i]}") base=''
+    for j in "${!ARMS[@]}"; do
+      case ${A_KIND[$j]} in
+        ours) [ "$c" = ours ] || continue ;;
+        corpus) [ "${A_ENG[$j]}" = "$c" ] || continue ;;
+        *) continue ;;
+      esac
+      [ -n "${A_ENV[$j]}" ] && [ "$(lg_env_key "${A_ENV[$j]}")" = "$key" ] && base=${A_LABEL[$j]}
+    done
+    if [ -z "$base" ]; then
+      [[ " ${XB_NONE[*]} " == *" ${A_LABEL[$i]} "* ]] || XB_NONE+=("${A_LABEL[$i]}")
+      continue
+    fi
+    pair="$c|$base|${A_LABEL[$i]}"
+    [[ " ${XB_PAIRS[*]} " == *" $pair "* ]] || XB_PAIRS+=("$pair")
+  done
+}
+# xbin_tables <decode|prefill> <records array name> <prefix> <keys> <tag field>: the across-binaries table
+# of those records, one ratio_table a pair of XB_PAIRS (xbin_pairs first), and a line per XB_NONE label.
+xbin_tables() {
+  local what=$1 prefix=$3 keys=$4 tf=$5 pair c base lab
+  local -n recs=$2
+  [ ${#XB_PAIRS[@]} -gt 0 ] || [ ${#XB_NONE[@]} -gt 0 ] || return 0
+  echo
+  echo "=== across binaries, $what: this binary's arm / the bin: arm on the same prompt with the same variables,"
+  echo "    per $([ "$what" = decode ] && echo 'D or P' || echo P), the same statistics ==="
+  for pair in "${XB_PAIRS[@]}"; do
+    IFS='|' read -r c base lab <<< "$pair"
+    [ ${#recs[@]} -eq 0 ] || printf '%s\n' "${recs[@]}" | ratio_table "$prefix $c $([ "$what" = decode ] && echo d || echo p)=" "$keys" "$lab" "$tf" "$base"
+  done
+  for lab in "${XB_NONE[@]}"; do
+    echo "$prefix: $lab has no arm of this binary on its prompt with its variables to pair with"
+  done
+}
+
 # dry_cmd <i>: arm <i>'s command line as the dry run prints it (a reference arm at REF_K when set).
 dry_cmd() {
-  local i=$1 dep=${A_DEP[$1]} note='' feedline var
+  local i=$1 dep=${A_DEP[$1]} note='' feedline var c
   if [ "${A_KIND[$i]}" = srv ]; then
     srv_dry_cmd "$i"
     return
@@ -1363,9 +1447,10 @@ dry_cmd() {
   fi
   feedline="--depth $dep"
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
-  if [ "${A_KIND[$i]}" = corpus ]; then
-    var=CORPUS_N_${A_ENG[$i]}
-    feedline="--tokens \"\$(head -n $dep $(corpus_file "${A_ENG[$i]}") | paste -sd, -)\""
+  c=$(arm_corpus "$i")
+  if [ -n "$c" ]; then
+    var=CORPUS_N_$c
+    feedline="--tokens \"\$(head -n $dep $(corpus_file "$c") | paste -sd, -)\""
     note="$note, $dep of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
   arm_envs "$i"
@@ -1498,6 +1583,12 @@ if [ -n "$DRY" ]; then
   fi
   [ "$WARM_ROWS" = 0 ] || echo "[dry] warm rows: each of our arms after a same-id PRIME in its load; a counted row tagged [cold] prints as COLD and runs once more (cold-blocks.sh)"
   [ "$gen" = 0 ] || echo "[dry] $(res_config)"
+  xbin_pairs
+  for pair in "${XB_PAIRS[@]}"; do
+    IFS='|' read -r c base lab <<< "$pair"
+    echo "[dry] across binaries ($c): $base / $lab"
+  done
+  for lab in "${XB_NONE[@]}"; do echo "[dry] across binaries: $lab has no arm of this binary on its prompt with its variables to pair with"; done
   if [ "$ORDER" = rotate ]; then
     if [ "$AB_WARMUP" = 1 ]; then
       echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
@@ -1591,15 +1682,17 @@ echo "    the ratio of the arm means, and each side's tagged rows ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 # The corpus labels have their own tables: their prompt is not the one ours and the references ran.
 corpus_re=${CORPORA// /|}
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)$" | sort -u | tr '\n' ' ')
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)(@|$)" | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 6 ours
 for c in $CORPORA; do
-  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "^$c@|@$c$" | sort -u | tr '\n' ' ')
+  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "^$c@|@$c(@|$)" | sort -u | tr '\n' ' ')
   [ -n "$c_refs" ] || continue
   echo
   echo "=== the $c prompt: $c / each $c@ arm per P, the same statistics ==="
   printf '%s\n' "${sums[@]}" | ratio_table "ratio $c d=" "$deps" "$c_refs" 6 "$c"
 done
+xbin_pairs
+xbin_tables decode sums "ratio xbin" "$deps" 6
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
   echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
@@ -1616,15 +1709,16 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [cpu-busy], [other-busy] and [cold] ==="
   pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)$" | sort -u | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)(@|$)" | sort -u | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 5 ours
   for c in $CORPORA; do
-    c_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E "^$c@|@$c$" | sort -u | tr '\n' ' ')
+    c_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E "^$c@|@$c(@|$)" | sort -u | tr '\n' ' ')
     [ -n "$c_refs" ] || continue
     echo
     echo "=== the $c prompt's prefill: $c / each $c@ arm per P, the same statistics ==="
     printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp $c p=" "$pp_keys" "$c_refs" 5 "$c"
   done
+  xbin_tables prefill pp_sums "ratio pp xbin" "$pp_keys" 5
 fi
 if [ ${#slot_sums[@]} -gt 0 ]; then
   echo
