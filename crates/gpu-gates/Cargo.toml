@@ -113,6 +113,15 @@ path = "src/bin/bloomery_serve_ds41.rs"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "bloomery-serve-qwen38"
+path = "src/bin/bloomery_serve_qwen38.rs"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_qwen38_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "soak_ds41_serve"
 required-features = ["deepseek41"]
 

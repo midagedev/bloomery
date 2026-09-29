@@ -1440,6 +1440,19 @@ pub static LISTENING: Kind = Kind {
     ],
 };
 
+/// The Qwen3.8 server's address.
+pub static LISTENING38: Kind = Kind {
+    name: "listening38",
+    head: "bloomery-serve-qwen38:",
+    doc: "The Qwen3.8 server's placement, context and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {
@@ -1656,6 +1669,9 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
 ];
+
+/// What `bloomery-serve-qwen38` prints, all on stderr.
+pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[&PLAN38, &LISTENING38, &CACHE_REUSE];
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
@@ -1918,6 +1934,7 @@ mod tests {
             GENERATE_DS41,
             BLOOMERY_CHAT,
             BLOOMERY_SERVE_DS41,
+            BLOOMERY_SERVE_QWEN38,
             GENERATE_GLM5NEXT,
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,

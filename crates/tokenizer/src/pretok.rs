@@ -1,6 +1,7 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`) and [`Pre::Glm4`] (`glm4`).
+//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`), [`Pre::Glm4`] (`glm4`) and
+//! [`Pre::Qwen35`] (`qwen35`).
 //!
 //! ## deepseek-v3
 //!
@@ -56,6 +57,21 @@
 //! the function here one word per visit; a visit that starts on a number takes
 //! the number branch (the contraction needs `'` and the letter branch refuses a
 //! number), so the words are the same.
+//!
+//! ## qwen35
+//!
+//! One regex, qwen2's with `\p{M}` joined to the letter classes — the letter
+//! run is `[\p{L}\p{M}]+` and the "other" run's class drops marks — and the
+//! reference runs it as a regex, not a hand-written splitter: its
+//! `unicode_regex_split_custom` does not know it, so it goes to the
+//! `std::regex` fallback on the collapsed text like the deepseek-v3 regexes,
+//! with the same piece-local semantics (a lookahead at a piece's end sees the
+//! end of input, and the unmatched runs between matches stay pieces of their
+//! own). A mark therefore reaches the pre-tokenizer as its own collapsed byte,
+//! and the letter run's optional prefix `[^\r\n\p{L}\p{N}]?` — which the
+//! regex leaves as qwen2's — takes one as readily as a space or an apostrophe.
+//! [`match_qwen35`] is that regex under ECMAScript semantics, written out by
+//! hand, and [`split_qwen35`] its one pass over the fragment.
 
 use crate::unicode::collapse;
 
@@ -115,6 +131,84 @@ fn run(c: &[u8], i: usize, hi: usize, pred: impl Fn(u8) -> bool) -> usize {
 /// Regex 1 at `i`: one to three numbers.
 fn match_number(c: &[u8], i: usize, hi: usize) -> usize {
     run(c, i, hi, is_number).min(3)
+}
+
+/// `[^\s\p{L}\p{M}\p{N}]`: the qwen35 "other" run's class, which unlike
+/// qwen2's drops the marks.
+fn is_other_qwen35(c: u8) -> bool {
+    !is_space(c) && !is_letter_or_mark(c) && !is_number(c)
+}
+
+/// The `qwen35` regex at `i`: the first of its alternatives that matches,
+/// under ECMAScript semantics (alternatives in order, greedy quantifiers that
+/// back off). None of them can match the empty string, and a mark is a plain
+/// codepoint of its own class here: the regex runs on the collapsed bytes.
+fn match_qwen35(c: &[u8], i: usize, hi: usize) -> usize {
+    let at = |k: usize| c[k];
+
+    // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])` — each
+    // letter a literal two-member class, so only its ASCII cases match.
+    if at(i) == b'\'' && i + 1 < hi {
+        let one = |x: u8| at(i + 1).eq_ignore_ascii_case(&x);
+        if one(b's') || one(b't') || one(b'm') || one(b'd') {
+            return 2;
+        }
+        let two = |a: u8, b: u8| {
+            i + 2 < hi && at(i + 1).eq_ignore_ascii_case(&a) && at(i + 2).eq_ignore_ascii_case(&b)
+        };
+        if two(b'r', b'e') || two(b'v', b'e') || two(b'l', b'l') {
+            return 3;
+        }
+    }
+
+    // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` — the prefix first (a greedy `?`
+    // backs off only when the run after it fails), then the run alone. The
+    // prefix class takes a mark, a space or an apostrophe as readily as
+    // qwen2's does.
+    let x = at(i);
+    if !is_newline(x) && !is_letter(x) && !is_number(x) && i + 1 < hi {
+        let n = run(c, i + 1, hi, is_letter_or_mark);
+        if n > 0 {
+            return 1 + n;
+        }
+    }
+    let n = run(c, i, hi, is_letter_or_mark);
+    if n > 0 {
+        return n;
+    }
+
+    // `\p{N}` — one number, however long the run.
+    if is_number(x) {
+        return 1;
+    }
+
+    // ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` — a space is none of the four, so
+    // backing the space off never helps.
+    let start = if x == b' ' { i + 1 } else { i };
+    if start < hi {
+        let n = run(c, start, hi, is_other_qwen35);
+        if n > 0 {
+            let end = start + n;
+            return end + run(c, end, hi, is_newline) - i;
+        }
+    }
+
+    // `\s*[\r\n]+`: through the last newline of the whitespace run.
+    let w = run(c, i, hi, is_space);
+    if let Some(last) = c[i..i + w].iter().rposition(|&x| is_newline(x)) {
+        return last + 1;
+    }
+
+    // `\s+(?!\S)`: the whole run at the piece's end, else all but its last.
+    if w > 0 && i + w == hi {
+        return w;
+    }
+    if w > 1 {
+        return w - 1;
+    }
+
+    // `\s+`.
+    w
 }
 
 /// Regex 3 at `i`: the first of its six alternatives that matches.
@@ -220,16 +314,20 @@ pub(crate) enum Pre {
     /// `glm4`: the reference's llama3 splitter, qwen2's with up to three
     /// numbers a word.
     Glm4,
+    /// `qwen35`: qwen2's regex with `\p{M}` joined to the letter classes,
+    /// run as a regex, not a hand-written splitter.
+    Qwen35,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 5] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 6] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
         ("qwen2", Pre::Qwen2),
         ("glm4", Pre::Glm4),
+        ("qwen35", Pre::Qwen35),
     ];
 
     /// The pre-tokenizer `name` stands for; `None` for one this crate does
@@ -260,7 +358,20 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_custom(cpts, &s.collapsed, 3, &mut s.b);
             &s.b
         }
+        Pre::Qwen35 => split_qwen35(cpts, s),
     }
+}
+
+/// [`split`] for [`Pre::Qwen35`]: its one regex over the collapsed bytes, the
+/// whole fragment one piece, as the reference's fallback runs it.
+fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    let c = &s.collapsed;
+    s.a.clear();
+    if !cpts.is_empty() {
+        s.a.push(cpts.len());
+    }
+    resplit(&s.a, &mut s.b, |i, hi| match_qwen35(c, i, hi));
+    &s.b
 }
 
 /// [`split`] for [`Pre::DeepseekV3`]: the three regexes in turn.
@@ -467,6 +578,50 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Glm4, text), want, "{text:?}");
+        }
+    }
+
+    /// The qwen35 splitter's alternatives beside qwen2's, one case each: a
+    /// combining mark after a letter joins its word, a script whose vowels
+    /// and virama are marks stays one word, a mark after punctuation joins
+    /// the word the punctuation opens, and a lone mark before punctuation is
+    /// a word of its own — the pieces below are the regex's, derived by hand
+    /// (`[\p{L}\p{M}]+` takes every mark beside a letter, and a mark serves
+    /// as the letter run's optional prefix as any non-letter does). Every
+    /// case is checked against qwen2 on the same string too, whose splitter
+    /// treats a mark as neither letter nor number — a "other" run member and
+    /// a possible letter-run prefix — and cuts there.
+    ///
+    /// FAIL-first: with `\p{M}` left out of the two classes the regex adds
+    /// it to — the letter run's and the "other" run's — every row below
+    /// fails: a mark no longer joins the letter word ("e\u{301}" splits into
+    /// "e" and the mark) and a mark after punctuation no longer opens a
+    /// letter word (".\u{301}a" splits at the "a").
+    #[test]
+    fn qwen35_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              qwen35                    qwen2
+            ("e\u{301}", &["e\u{301}"], &["e", "\u{301}"]),
+            (
+                "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}",
+                &["\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}"],
+                &["\u{928}\u{92e}\u{938}", "\u{94d}\u{924}", "\u{947}"],
+            ),
+            (
+                "\u{e17}\u{e35}\u{e48}",
+                &["\u{e17}\u{e35}\u{e48}"],
+                &["\u{e17}", "\u{e35}\u{e48}"],
+            ),
+            (".\u{301}a", &[".\u{301}a"], &[".\u{301}", "a"]),
+            ("\u{301}.", &["\u{301}", "."], &["\u{301}."]),
+            ("it's", &["it", "'s"], &["it", "'s"]),
+            ("1234", &["1", "2", "3", "4"], &["1", "2", "3", "4"]),
+            ("a  b", &["a", " ", " b"], &["a", " ", " b"]),
+            ("x = y;", &["x", " =", " y", ";"], &["x", " =", " y", ";"]),
+        ];
+        for &(text, want35, want2) in cases {
+            assert_eq!(words(Pre::Qwen35, text), want35, "qwen35 {text:?}");
+            assert_eq!(words(Pre::Qwen2, text), want2, "qwen2 {text:?}");
         }
     }
 }

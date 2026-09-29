@@ -9,6 +9,11 @@
 # The card check a timed recipe runs first in its box command, before any build (tools/ref/card-precheck.sh).
 precheck := 'bash tools/ref/card-precheck.sh'
 
+# serve-qwen38's placement (a the A6000, gate the 3090) and the card it puts
+# in box.sh's view.
+serve_place := env_var_or_default('SERVE_PLACE', 'a')
+serve_card := if serve_place == 'gate' { '3090' } else { 'a6000' }
+
 default:
     @just --list
 
@@ -1156,7 +1161,7 @@ gen-ds41 *ARGS:
 # (generate_ds41 --plan, placement (a), P 128/256/384/512/1536/4096/16384, CED on and off) into tools/flow/plans/:
 # P 1536 is gate-gpu-ds41-flowcounts' three-batch arm, P 16384 the prefill headline's prompt. Loads nothing onto a card.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 gate_deepseek41_prefill generate_glm5next generate_qwen3moe; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), at --depth 512 once at the default
@@ -1227,6 +1232,35 @@ gate-gpu-ds41-chat:
 [group('v41-load')]
 gate-gpu-ds41-serve:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
+
+# The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
+# ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
+# vocabulary, never our own tokenizer (the gate's /tokenize clause would be circular; the derivation command is
+# the profile comment's) — and five is at most the eight the gate needs: below Prompt38::GEMM_FROM both engines
+# feed the prompt by bit-for-bit passes, so the server's greedy ids are generate_qwen3moe's; at nine or more each
+# runs the prompt's last position through a different arm of the ubatch walk. generate_qwen3moe --tokens <those
+# ids> -n 16 under its own gate-lock hold, then gate_qwen38_serve under another: it starts bloomery-serve-qwen38
+# --port 0 --place gate, and checks /props' engine object against its own plan of the file (architecture
+# qwen4exp, each device's bytes = the plan's, the KV bytes), /completion's ids at temperature 0 against
+# generate_qwen3moe's (all 16, or a prefix ending in the end-of-generation id), the same /completion again and
+# once more after the other requests (a request keeps no prefix: every request prefills from a reset), a chat
+# turn streamed and not streamed (same content, [DONE] last), /tokenize of the prompt against REF_TOKENS, and a
+# prompt of the served context a 400 the server survives. Two loads; logs and the raw stream in
+# target/q38-serve-gate/. The build takes the deepseek41 feature, not the qwen family's plain gpu:
+# the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
+# that feature today — `just affected` and the recipes.py pins scope it so.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-qwen38-serve:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D'
+
+# bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
+# default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless
+# BLOOMERY_GATE_BOUND, further ARGS pass through (--alias, --ctx-size, --chat-template-file, and the Qwen3.8 levers
+# through the environment). gpu-gate.sh takes the card's gate lock, so no other gate lands on the card it serves
+# from, and bounds the run; the address is on the server's stderr.
+serve-qwen38 *ARGS:
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD={{serve_card}} ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-qwen38 && BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-14400} bash tools/gpu-gate.sh bloomery-serve-qwen38 --port ${SERVE_PORT:-8080} --place {{serve_place}} {{ARGS}}'
 
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
