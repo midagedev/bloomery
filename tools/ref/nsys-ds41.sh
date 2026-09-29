@@ -5,7 +5,12 @@
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/nsys-ds41.sh 6 1024'
 #   just nsys-gpu-ds41 6 1024
 #   BLOOMERY_BOX_ENV='BLOOMERY_RESIDENCY=mid-p40-s1' just nsys-gpu-ds41 prose:64
-#   bash tools/ref/nsys-ds41.sh --analyze <out>.sqlite <depth or P> <n> [<out>.txt]   # tables again, no profile
+#   bash tools/ref/nsys-ds41.sh --analyze <out>.sqlite <depth, P or arm> <n> [<out>.txt]
+#       tables again, no profile; the depth argument is the number the analysis reads, and a
+#       corpus arm (prose:<P>, code:<P>, the run form's spelling) is accepted as its P
+#   bash tools/ref/nsys-ds41.sh --self-test
+#       the decode-form analysis held to synthetic traces (no box, no nsys: the fixtures are
+#       ds41copy.py's Synth, and every case runs this script's own --analyze)
 #
 # The V4.1 sibling of nsys-gpu.sh. Its step boundary is the same (a kernel that runs exactly once
 # per replay, counted against the replays the run makes) and so is its refusal: no table when the
@@ -150,13 +155,34 @@ corpus_check() {
 
 # The analysis: sqlite, depth, n, the run's own output (for SMOKE and `time step`), last, top,
 # and the copy-stream analyzer's path (ds41copy.py, its own last argument).
+# python3 bounded by the arm bound where timeout exists (the box, every profile); a Mac has no
+# timeout, and there --analyze and --self-test read a saved sqlite with no bound — the box's
+# contract is unchanged.
+py_bounded() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$@"
+  else
+    python3 "$@"
+  fi
+}
 analyze() {
-  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 - "$@" << 'PY'
-import os, sqlite3, statistics, sys, re
+  py_bounded - "$@" << 'PY'
+import os, sqlite3, statistics, sys
 from collections import defaultdict
 db = sqlite3.connect(sys.argv[1])
 depth, ngen, last, top = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[5]), int(sys.argv[6])
 runlog = sys.argv[4]
+# ds41copy.py owns more than the copy-stream tables: the handoff kernel family the join cut
+# matches below is its one definition, shared by both tools. Its module not loading refuses the
+# whole analysis here, before any table: the join cut cannot run without it.
+sys.path.insert(0, os.path.dirname(sys.argv[7]))
+sys.path.insert(0, os.path.join(os.path.dirname(sys.argv[7]), "..", "bloomery"))
+try:
+    import ds41copy
+except Exception as exc:
+    print(f"    NO TABLE: the copy-stream analyzer ({sys.argv[7]}) did not load: {exc}")
+    raise SystemExit(3)
+import records
 names = dict(db.execute("SELECT id, value FROM StringIds"))
 rows = db.execute("SELECT start, end, shortName, streamId, deviceId, graphNodeId "
                   "FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start").fetchall()
@@ -175,14 +201,20 @@ def rows_of(table):
     except sqlite3.OperationalError:
         return []
 copies, sets = rows_of("CUPTI_ACTIVITY_KIND_MEMCPY"), rows_of("CUPTI_ACTIVITY_KIND_MEMSET")
-kind = None
+# The run's own lines go through the record reader (tools/bloomery/records.py) — the record
+# schema's one owner — not through a regex of this script's own: a row whose fields have drifted
+# is still read there, by field name, and a run log that holds no `time prompt` row is named
+# below instead of quietly skipping the feed check.
+log_lines = None
 try:
-    for line in open(runlog):
-        m = re.match(r"time prompt n=\d+ ms=\S+ tok/s=\S+ passes=\d+ kind=(\w+)", line)
-        if m:
-            kind = m.group(1)
+    with open(runlog) as f:
+        log_lines = f.read().splitlines()
 except OSError:
     pass
+recs = records.read(log_lines) if log_lines is not None else []
+runlog_given = bool(log_lines) and any(x.strip() for x in log_lines)
+tp = records.first(recs, "time_prompt")
+kind = tp["kind"] if tp is not None and "kind" in tp else None
 # Under a residency the engine streams also run eager kernels between the replays (the boundary
 # work), so the prompt batch is the eager engine-stream kernels that end before the first replay's
 # first kernel; the rest are named on their own line below, not a refusal.
@@ -201,6 +233,9 @@ if after:
     after_note = " (" + ", ".join(f"{c} {n}" for n, c in sorted(acnt.items(), key=lambda x: -x[1])[:5]) + ")"
 print(f"    eager engine-stream kernels after the first replay (boundary work under a residency): "
       f"{len(after)}{after_note}")
+if runlog_given and kind is None:
+    print("    NOTE: the run log carries no `time prompt` row the record reader reads: the check "
+          "of the feed against the trace's kernels is skipped")
 if kind is not None and kind != feed:
     print(f"    NO TABLE: the run log's time prompt row says kind={kind}, the trace's kernels say {feed}")
     raise SystemExit(3)
@@ -231,17 +266,13 @@ if batch:
 # token 0 comes out of replay depth - 1 and `time step i` is replay depth - 1 + i.
 timed = {}
 smoke = ""
-try:
-    for line in open(runlog):
-        m = re.match(r"time step (\d+)( warm)? ms=([0-9.]+)", line)
-        if m:
-            timed[fed - 1 + int(m.group(1))] = float(m.group(3))
-        if line.startswith("SMOKE"):
-            smoke = line.rstrip()
-        elif line.startswith(("plan ", "load ", "capture ", "fed ", "time prompt ")):
-            print("    " + line.rstrip())
-except OSError:
-    pass
+for x in recs:
+    if x.kind == "time_step":
+        timed[fed - 1 + x["i"]] = x["ms"]
+    elif x.kind == "smoke":
+        smoke = x.line.rstrip()
+    elif x.kind in ("plan", "load", "capture", "fed", "time_prompt"):
+        print("    " + x.line.rstrip())
 if smoke:
     print("    " + smoke)
 
@@ -252,13 +283,17 @@ def replay(r):
     w = ks[bounds[r]:bounds[r + 1]]
     t0 = w[0][0]
     t_next = ks[bounds[r + 1]][0] if bounds[r + 1] < len(ks) else None
+    # The last replay has no next one to bound its copies, so they are collected only to its
+    # last kernel's end: the run's teardown after that (the readback, the runtime's own
+    # transfers) belongs to no step.
+    t_hi = t_next if t_next is not None else w[-1][1]
     wall = (w[-1][1] - t0) / 1e3
     ksum = sum(e - s for s, e, _ in w) / 1e3
     gaps = [(w[i][0] - w[i - 1][1]) / 1e3 for i in range(1, len(w))]
     joins, j_idx, jgaps = [], set(), []
     last_handoff = None
     for i, (s, e, n) in enumerate(w):
-        if n == "ds41_ffn_handoff":
+        if ds41copy.is_handoff(n):
             last_handoff = i
         elif is_post(n) and last_handoff is not None:
             h = last_handoff
@@ -271,12 +306,16 @@ def replay(r):
             last_handoff = None
     other = [gaps[i - 1] for i in range(1, len(w)) if i not in j_idx]
     base = statistics.median(other) if other else 0.0
-    big = max(range(1, len(w)), key=lambda i: w[i][0] - w[i - 1][1])
-    c_in = [c for c in copies if t0 <= c[0] < (t_next or float("inf"))]
-    s_in = [c for c in sets if t0 <= c[0] < (t_next or float("inf"))]
+    if len(w) > 1:
+        big_i = max(range(1, len(w)), key=lambda i: w[i][0] - w[i - 1][1])
+        big = (gaps[big_i - 1], w[big_i - 1][2], w[big_i][2], big_i in j_idx)
+    else:
+        big = (0.0, w[0][2], w[0][2], False)  # a one-kernel replay has no gap to name
+    c_in = [c for c in copies if t0 <= c[0] < t_hi]
+    s_in = [c for c in sets if t0 <= c[0] < t_hi]
     return dict(w=w, wall=wall, ksum=ksum, gap=wall - ksum, joins=joins, base=base,
                 period=(t_next - t0) / 1e3 if t_next else float("nan"),
-                big=(gaps[big - 1], w[big - 1][2], w[big][2], big in j_idx),
+                big=big,
                 other_gap=sum(other), copies=c_in, sets=s_in, t0=t0, t1=t_next, jgaps=jgaps)
 
 lo = max(0, replays - last)
@@ -285,7 +324,7 @@ print()
 print(f"=== per replay (last {replays - lo}; µs unless noted; `time step` in ms from the same run)")
 print(f"  {'replay':>6s} {'depth':>5s} {'time step':>10s} {'period':>9s} {'wall':>9s} {'kern sum':>9s} {'gap':>8s} "
       f"{'joins':>5s} {'bridge':>8s} {'overlap':>8s} {'exposed':>8s} {'exp-base':>8s} {'base':>5s} {'other gap':>9s} "
-      f"{'H2D/D2H':>8s}  largest gap")
+      f"{'mem µs':>8s}  largest gap")
 for r, x in R.items():
     j = x["joins"]
     b, o, e = (sum(t[k] for t in j) for k in range(3))
@@ -298,6 +337,17 @@ for r, x in R.items():
           f"{g:.1f} ({a} -> {bb}{', join' if isj else ''})")
 
 dec = [r for r in R if r in timed]
+if not dec:
+    print()
+    if not runlog_given:
+        print("=== no run log was given: the `time step` column and the mean tables need one "
+              "(--analyze's <run log> argument)")
+    elif not timed:
+        print("=== the run log carries no `time step` rows the record reader reads: the mean "
+              "tables are skipped")
+    else:
+        print(f"=== the {len(timed)} timed steps map to no replay among the {len(R)} tabled "
+              f"(the depth argument does not match the run?): the mean tables are skipped")
 if dec:
     def mean(f):
         return statistics.fmean(f(R[r]) for r in dec)
@@ -357,12 +407,6 @@ if dec:
 
 # The copy stream beside the engine stream (the header's copy-stream paragraph): the windows
 # and the host-wait gaps this cut found, the sqlite and the run log re-read by ds41copy.py.
-sys.path.insert(0, os.path.dirname(sys.argv[7]))
-try:
-    import ds41copy
-except Exception as exc:
-    print(f"    NO TABLE: the copy-stream analyzer ({sys.argv[7]}) did not load: {exc}")
-    raise SystemExit(3)
 print()
 ds41copy.tables(sys.argv[1], runlog,
                 [(r, R[r]["t0"], R[r]["t1"]) for r in R], {r: R[r]["jgaps"] for r in R}, top)
@@ -371,7 +415,113 @@ PY
 
 # The prefill form's tables: sqlite, P, n, the run log, then ds41pp.py's --plan FILE when given.
 analyze_prefill() {
-  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$PP" tables "$@" --layer "$LAYER" --blocked-us "$BLOCKED_US"
+  py_bounded "$PP" tables "$@" --layer "$LAYER" --blocked-us "$BLOCKED_US"
+}
+
+# The decode-form analysis held to synthetic traces, no box and no nsys: ds41copy.py's Synth
+# writes the sqlite tables the analyzer queries, and every case runs this script's own --analyze
+# and holds its exit code, its refusals and the numbers it prints.
+self_test() {
+  local t out rc n=0 bad=0 lastcp
+  t=$(mktemp -d)
+  trap 'rm -rf "$t"' RETURN
+  python3 - "$t" "${BASH_SOURCE[0]%/*}/ds41copy.py" << 'FIX'
+import os
+import sys
+
+t, cp = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.dirname(cp))
+from ds41copy import CPY, ENG, MS, Synth  # its import also puts records' directory on the path
+import records
+
+RUNLOG = (
+    "plan place=a card=A6000 ctx_max=4096 card_experts=200 (100 B) host_experts=88 (100 B) "
+    "host_shadow=1 B 40 on 40 layers 20000000000 hot_list=none\n"
+    "load resident_bytes=1 shadow=host 0 unified_addressing=1 cards=[A6000] ctx=4096 layers=40 "
+    "top_k=512 mode=graph place=a pin_main=on pinned=true prefill=batch ced=on group=1 in 1.0 s "
+    "(runtime value)\n"
+    "capture graph_nodes=784\n"
+    "fed ids=6 first=[1,2,3,4] last=[5,6] depth_sequence_from=0\n"
+    "time prompt n=6 ms=1.0000 tok/s=6.00 passes=1 kind=batch\n"
+    "time step 1 ms=0.7000\n"
+    "time step 2 ms=0.7000\n"
+    "time step 3 ms=0.7000\n"
+    "SMOKE mode=graph place=a prompt_tokens=6 depth=6 generated=3 warm=0 steps=3 p50_ms=0.7000 "
+    "mean_ms=0.7000 tok/s(p50)=8.57\n")
+# Every line of both logs must be a record the reader reads (the analysis echoes and checks
+# them through it), or the fixture itself is wrong.
+EVOLVED = RUNLOG.replace("time prompt n=6 ms=", "time prompt n=6 warm=0 ms=").replace(
+    "kind=batch\n", "kind=steps\n")
+for text in (RUNLOG, EVOLVED):
+    unread = [x for x in text.splitlines() if records.read([x]) == []]
+    assert not unread, f"fixture lines no record reads: {unread}"
+open(os.path.join(t, "run.txt"), "w").write(RUNLOG)
+open(os.path.join(t, "evolved.txt"), "w").write(EVOLVED)
+
+
+def decode_synth(handoff, bare_last=False):
+    """Three replays after one eager batch kernel (the batch feed); a D2H inside replay 0 and
+    replay 2 each, and a teardown D2H after the last kernel, which no replay owns. `bare_last`
+    leaves the last replay its marker kernel alone."""
+    s = Synth()
+    s.kern(0.90 * MS, 0.95 * MS, "ds41_glue_embed_q3k", ENG)
+    for r in range(3):
+        t0 = (1.0 + r) * MS
+        if bare_last and r == 2:
+            s.kern(t0 + 0.95 * MS, t0 + 0.98 * MS, "ds41_head_logits", ENG, graph=104)
+            break
+        s.kern(t0, t0 + 0.05 * MS, handoff, ENG, graph=101 + 10 * r)
+        s.kern(t0 + 0.05 * MS, t0 + 0.15 * MS, "ds41_card_gate", ENG, graph=102 + 10 * r)
+        s.kern(t0 + 0.60 * MS, t0 + 0.70 * MS, "ds41_ffn_post", ENG, graph=103 + 10 * r)
+        s.kern(t0 + 0.95 * MS, t0 + 0.98 * MS, "ds41_head_logits", ENG, graph=104 + 10 * r)
+    s.copy(1.20 * MS, 1.25 * MS, 2, 4096, CPY)
+    s.copy(3.20 * MS, 3.25 * MS, 2, 4096, CPY)
+    s.copy(5.00 * MS, 5.50 * MS, 2, 65536, CPY)
+    return s
+
+
+decode_synth("ds41_ffn_handoff").write(os.path.join(t, "plain.sqlite"))
+decode_synth("ds41_ffn_handoff_tier").write(os.path.join(t, "tier.sqlite"))
+decode_synth("ds41_ffn_handoff", bare_last=True).write(os.path.join(t, "one.sqlite"))
+FIX
+  case_() { # <name> <want_rc> <must contain> [<must not contain>]
+    n=$((n + 1))
+    if [ "$rc" = "$2" ] && printf '%s\n' "$out" | grep -qF -- "$3" \
+       && { [ $# -lt 4 ] || ! printf '%s\n' "$out" | grep -qF -- "$4"; }; then
+      echo "ok $1"
+    else
+      bad=$((bad + 1))
+      echo "FAIL $1: rc $rc (want $2)"
+      printf '%s\n' "$out" | sed 's/^/    got | /'
+    fi
+  }
+  rc=0; out=$(bash "$0" --analyze "$t/plain.sqlite" 6 4 "$t/run.txt" 2>&1) || rc=$?
+  case_ plain-handoff-joins 0 ": 1 joins per replay" ": 0 joins per replay"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" 6 4 "$t/run.txt" 2>&1) || rc=$?
+  case_ tier-handoff-joins 0 ": 1 joins per replay" ": 0 joins per replay"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" 6 4 "$t/run.txt" 2>&1) || rc=$?
+  lastcp=$(printf '%s\n' "$out" | awk '$1 == 2 && $2 == 8 {print $15}')
+  n=$((n + 1))
+  if [ "$rc" = 0 ] && [ "$lastcp" = "50.0" ]; then
+    echo "ok teardown-not-billed"
+  else
+    bad=$((bad + 1))
+    echo "FAIL teardown-not-billed: rc $rc, the last replay's mem µs is '${lastcp:-<no row>}' (want 50.0)"
+  fi
+  rc=0; out=$(bash "$0" --analyze "$t/plain.sqlite" 6 4 "$t/run.txt" 2>&1) || rc=$?
+  case_ runlog-lines-echo 0 "plan place=a card=A6000"
+  rc=0; out=$(bash "$0" --analyze "$t/one.sqlite" 6 4 "$t/run.txt" 2>&1) || rc=$?
+  case_ one-kernel-replay 0 "0.0 (ds41_head_logits -> ds41_head_logits"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" 6 4 "$t/evolved.txt" 2>&1) || rc=$?
+  case_ drifted-feed-refused 3 "NO TABLE: the run log's time prompt row says kind=steps"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" 6 4 2>&1) || rc=$?
+  case_ no-log-named 0 "=== no run log was given" "=== mean of the"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" prose:64 4 "$t/run.txt" 2>&1) || rc=$?
+  case_ arm-accepted 0 "-> OK"
+  rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" prose:x 4 2>&1) || rc=$?
+  case_ arm-refused 64 "got 'prose:x'"
+  echo "nsys-ds41.sh: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
+  [ "$bad" = 0 ]
 }
 
 if [ "${1:-}" = --analyze ]; then
@@ -387,8 +537,23 @@ if [ "${1:-}" = --analyze ]; then
     analyze_prefill "$2" "$3" "$4" "$5" "${PLAN[@]}"
     exit $?
   fi
-  [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth or P> <n> [<run log>]" >&2; exit 64; }
-  analyze "$2" "$3" "$4" "${5:-/dev/null}" "$LAST" "$TOP" "$CP"
+  [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth, P or arm> <n> [<run log>]" >&2; exit 64; }
+  # The depth argument is the number the analysis reads; a corpus arm (prose:<P>, code:<P>, the
+  # run form's spelling of the same number) is accepted with its prefix stripped — anything else
+  # non-numeric would die inside the analyzer's int() with a traceback instead of this refusal.
+  A_DEPTH=$3
+  case $A_DEPTH in
+    prose:* | code:*) A_DEPTH=${A_DEPTH#*:} ;;
+  esac
+  case $A_DEPTH in
+    '' | 0 | *[!0-9]*) echo "nsys-ds41.sh: --analyze's depth is a number >= 1 or a corpus arm prose:<P>/code:<P>, got '$3'" >&2; exit 64 ;;
+  esac
+  analyze "$2" "$A_DEPTH" "$4" "${5:-/dev/null}" "$LAST" "$TOP" "$CP"
+  exit $?
+fi
+
+if [ "${1:-}" = --self-test ]; then
+  self_test
   exit $?
 fi
 

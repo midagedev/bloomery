@@ -29,10 +29,10 @@ found; this module owns the other side of the river:
   - the unpack hold, printed when the copy stream runs the swap's r8 unpack (a kernel whose
     name starts `ds41_r8_q3k`, the plain and the group form): per unpack kernel its launches
     against the stage card's engine kernels (how many start during one launch, how long after
-    a launch's end the next one waits), and the stage-card layer periods (one
-    `ds41_ffn_handoff_tier` end to the next) split by (heavy/light step, the step's
-    copy-stream H2D bytes) x (an unpack overlaps the period's longest engine gap) — the wait
-    an unpack holds open. The stage card is the unpack kernels' device, and the steps are
+    a launch's end the next one waits), and the stage-card layer periods (one handoff kernel
+    end to the next, whatever form the engine launched it in) split by (heavy/light step, the
+    step's copy-stream H2D bytes) x (an unpack overlaps the period's longest engine gap) — the
+    wait an unpack holds open. The stage card is the unpack kernels' device, and the steps are
     bounded by the graph `argmax_fault` kernel's ends; a trace missing the handoff or the
     step-end kernel names it and skips only the layer split.
 
@@ -65,10 +65,20 @@ from ds41pp import MEMCPY_KIND, Trace  # noqa: E402 - the trace tables' one read
 # a step. A step is heavy when its copy-stream H2D passes HEAVY_H2D_BYTES, and the first
 # WARMUP_STEPS steps are the load's tail, before the rule's first flip.
 UNPACK_PREFIX = "ds41_r8_q3k"
-HANDOFF_KERNEL = "ds41_ffn_handoff_tier"
 STEP_END_KERNEL = "argmax_fault"
 WARMUP_STEPS = 10
 HEAVY_H2D_BYTES = 60 * 1000 * 1000
+# The routed layer's handoff kernel, every form the engine launches it in: the plain one (six
+# slots a token on V4.1) and its eight- and ten-slot and multi-column forms
+# (gpu/src/host/handoff.rs `enqueue_handoff`), and the two-card tier card's
+# (gpu-deepseek41/src/chain/ffn/tier.rs). A prefix, not a list: which form runs is the engine's
+# shape and placement choice, and nsys-ds41.sh's join cut reads this same definition.
+HANDOFF_PREFIX = "ds41_ffn_handoff"
+
+
+def is_handoff(name):
+    """Whether `name` is a routed layer's handoff kernel (the family `HANDOFF_PREFIX` names)."""
+    return name.startswith(HANDOFF_PREFIX)
 
 
 def residency_word(runlog):
@@ -113,6 +123,24 @@ class Union:
             tot += min(e, hi) - s
         return tot
 
+    def minus(self, other):
+        """These intervals minus `other`'s, as a Union: what `overlap` counts over the parts of
+        this union the other one does not cover."""
+        out = []
+        for s, e in self.iv:
+            cur = s
+            for gs, ge in other.iv:
+                if ge <= cur or gs >= e:
+                    continue
+                if gs > cur:
+                    out.append((cur, min(gs, e)))
+                cur = max(cur, ge)
+                if cur >= e:
+                    break
+            if cur < e:
+                out.append((cur, e))
+        return Union(out)
+
 
 def engine_streams(tr):
     """The (deviceId, streamId) pairs the graph replays run on (kernels with a graph node)."""
@@ -141,6 +169,10 @@ def window_rows(tr, engine, windows, joins):
         hi_i = bisect.bisect_left(eng_starts, hi)
         kern_u = Union([(max(s, t0), min(e, hi)) for s, e in eng_k[lo_i:hi_i] if e > t0 and s < hi])
         gap_u = Union(joins.get(r, []))
+        # The two classes must be disjoint: under a residency the engine streams run eager
+        # kernels between the replays and under two cards another card's kernel can sit inside
+        # a host-wait gap, and the gap wins — the copy's time there hides the step's wait.
+        kern_off_gap = kern_u.minus(gap_u)
         rows[r] = {}
         for act in tr.copies:
             s, e = max(act["s"], t0), min(act["e"], hi)
@@ -160,13 +192,15 @@ def window_rows(tr, engine, windows, joins):
                     c = context["kind"][act["name"]]
                     c[0] += 1
                     c[1] += act["bytes"] or 0
-                    c[2] += dur
+                    # the whole copy, not its clipped part: this window is the only one that
+                    # bills it, and a copy that runs past the window's end keeps its tail
+                    c[2] += (act["e"] - act["s"]) / 1e3
                 else:
                     context["other"][act["name"]] = context["other"].get(act["name"], 0) + 1
                 continue
             d = rows[r].setdefault((act["dev"], act["stream"]), _blank(act["dev"]))
             if act["name"] == "H2D":
-                in_gap, in_kern = gap_u.overlap(s, e) / 1e3, kern_u.overlap(s, e) / 1e3
+                in_gap, in_kern = gap_u.overlap(s, e) / 1e3, kern_off_gap.overlap(s, e) / 1e3
                 d["h2d"][2] += dur
                 d["h2d"][3] += in_gap
                 d["h2d"][4] += in_kern
@@ -187,10 +221,15 @@ def window_rows(tr, engine, windows, joins):
                 continue
             s, e = max(k["s"], t0), min(k["e"], hi)
             d = rows[r].setdefault((k["dev"], k["stream"]), _blank(k["dev"]))
-            d["kern"][0] += 1
+            # A straddling kernel's launch counts once, in the window its start falls in (as a
+            # straddling copy's does); its time is clipped to each window it touches.
+            starts_here = t0 <= k["s"] < hi
+            if starts_here:
+                d["kern"][0] += 1
             d["kern"][1] += (e - s) / 1e3
             n = d["by_name"].setdefault(k["name"], [0, 0.0])
-            n[0] += 1
+            if starts_here:
+                n[0] += 1
             n[1] += (e - s) / 1e3
     return rows, context
 
@@ -244,11 +283,11 @@ def unpack_hold(tr, engine):
                   if k["graph"] is not None and k["dev"] == dev and k["name"] == STEP_END_KERNEL)
     d0 = sorted((k for k in tr.kernels if k["graph"] is not None and k["dev"] == dev),
                 key=lambda k: k["s"])
-    ho = [i for i, k in enumerate(d0) if k["name"] == HANDOFF_KERNEL]
+    ho = [i for i, k in enumerate(d0) if is_handoff(k["name"])]
     if not ends:
         res["missing"].append(f"no {STEP_END_KERNEL} graph kernel on device {dev}: the layer split is skipped")
     if not ho:
-        res["missing"].append(f"no {HANDOFF_KERNEL} graph kernel on device {dev}: the layer split is skipped")
+        res["missing"].append(f"no {HANDOFF_PREFIX}* graph kernel on device {dev}: the layer split is skipped")
     if res["missing"]:
         return res
     step_h2d = Counter()
@@ -511,14 +550,15 @@ def synth():
     return s, windows, joins, want
 
 
-def synth_hold():
+def synth_hold(handoff="ds41_ffn_handoff_tier"):
     """The unpack-hold synthetic: twelve steps bounded by `argmax_fault` ends (the first ten the
     load's tail, skipped), a heavy step with two layers — the first period's longest engine gap
     held open by an unpack launch that spans the starts of two engine kernels, the second clean —
-    and a light clean step. A tier-card kernel with a graph node runs on (device 1, stream 9):
-    the copy stream's streamId under an engine stream's, so keying the streams by streamId alone
-    (the mutant this trace must fail) would call the copy stream an engine stream and lose the
-    unpack table whole."""
+    and a light clean step. `handoff` is the handoff kernel's name: the tier card's (plan (b′))
+    or the plain one (plan (a)), the same cut read for both. A tier-card kernel with a graph
+    node runs on (device 1, stream 9): the copy stream's streamId under an engine stream's, so
+    keying the streams by streamId alone (the mutant this trace must fail) would call the copy
+    stream an engine stream and lose the unpack table whole."""
     s = Synth()
     for i in range(12):
         t = i * MS
@@ -527,21 +567,21 @@ def synth_hold():
     # Step 10, heavy (a 70 MB H2D on the copy stream): period 1 has its 200 µs gap [10.06, 10.26]
     # overlapped by the unpack [10.005, 10.265] (two engine starts under it: 10.010, 10.260; the
     # next engine start, 10.310, waits 45 µs after its end); period 2 is clean.
-    s.kern(10.00 * MS, 10.01 * MS, "ds41_ffn_handoff_tier", ENG, graph=210)
+    s.kern(10.00 * MS, 10.01 * MS, handoff, ENG, graph=210)
     s.kern(10.01 * MS, 10.06 * MS, "ds41_card_gate", ENG, graph=211)
     s.kern(10.26 * MS, 10.31 * MS, "ds41_card_gate", ENG, graph=212)
-    s.kern(10.31 * MS, 10.32 * MS, "ds41_ffn_handoff_tier", ENG, graph=213)
+    s.kern(10.31 * MS, 10.32 * MS, handoff, ENG, graph=213)
     s.kern(10.32 * MS, 10.36 * MS, "ds41_card_gate", ENG, graph=214)
     s.kern(10.46 * MS, 10.50 * MS, "ds41_card_gate", ENG, graph=215)
-    s.kern(10.50 * MS, 10.51 * MS, "ds41_ffn_handoff_tier", ENG, graph=216)
+    s.kern(10.50 * MS, 10.51 * MS, handoff, ENG, graph=216)
     s.kern(10.005 * MS, 10.265 * MS, "ds41_r8_q3k", CPY, grid=(4950, 1, 1))
     s.copy(10.60 * MS, 10.70 * MS, 1, 70 * 1000 * 1000, CPY)
     # Step 11, light (10 MB) and clean; a group unpack outside its gaps changes no class (the
     # first engine start after its end, the step's argmax at 11.98, waits 380 µs).
-    s.kern(11.00 * MS, 11.01 * MS, "ds41_ffn_handoff_tier", ENG, graph=310)
+    s.kern(11.00 * MS, 11.01 * MS, handoff, ENG, graph=310)
     s.kern(11.01 * MS, 11.06 * MS, "ds41_card_gate", ENG, graph=311)
     s.kern(11.16 * MS, 11.21 * MS, "ds41_card_gate", ENG, graph=312)
-    s.kern(11.21 * MS, 11.22 * MS, "ds41_ffn_handoff_tier", ENG, graph=313)
+    s.kern(11.21 * MS, 11.22 * MS, handoff, ENG, graph=313)
     s.kern(11.50 * MS, 11.60 * MS, "ds41_r8_q3k_groups", CPY, grid=(64, 1, 1))
     s.copy(11.60 * MS, 11.70 * MS, 1, 10 * 1000 * 1000, CPY)
     return s
@@ -553,6 +593,24 @@ def synth_bare():
     s = Synth()
     s.kern(1.00 * MS, 1.05 * MS, "ds41_card_gate", ENG, graph=1)
     s.kern(2.00 * MS, 2.10 * MS, "ds41_r8_q3k", CPY)
+    return s
+
+
+def synth_edges():
+    """The window edges: a copy-stream kernel straddling the boundary (one launch, its time
+    split), an engine-stream copy that runs past the window's end (its context µs whole), and
+    an eager engine kernel inside a join gap (the H2D split's classes disjoint, the gap first)."""
+    s = Synth()
+    s.kern(1.00 * MS, 1.05 * MS, "ds41_ffn_handoff", ENG, graph=101)
+    s.kern(1.05 * MS, 1.15 * MS, "ds41_card_gate", ENG, graph=102)
+    s.kern(1.60 * MS, 1.70 * MS, "ds41_ffn_post", ENG, graph=103)
+    s.kern(1.95 * MS, 1.97 * MS, "ds41_head_logits", ENG, graph=104)
+    s.kern(2.00 * MS, 2.05 * MS, "ds41_ffn_handoff", ENG, graph=201)
+    s.kern(2.90 * MS, 2.95 * MS, "ds41_head_logits", ENG, graph=202)
+    s.kern(1.97 * MS, 2.03 * MS, "ds41_stage_thing", CPY)
+    s.copy(1.90 * MS, 2.10 * MS, 1, 4096, ENG)
+    s.kern(1.30 * MS, 1.40 * MS, "ds41_boundary_work", ENG)
+    s.copy(1.25 * MS, 1.55 * MS, 1, 1024, CPY)
     return s
 
 
@@ -692,7 +750,7 @@ def cmd_self_test(argv):
         check(b[0] == 1 and b[7] is None and b[8] is None and b[9] is None,
               f"the bare trace's after-stats {b[7:]} expected None (no engine kernel follows)")
         check(hold3["missing"] == [f"no {STEP_END_KERNEL} graph kernel on device 0: the layer split is skipped",
-                                   f"no {HANDOFF_KERNEL} graph kernel on device 0: the layer split is skipped"],
+                                   f"no {HANDOFF_PREFIX}* graph kernel on device 0: the layer split is skipped"],
               f"the bare trace's missing lines {hold3['missing']}")
         check(hold3["split"] == {} and hold3["hold_us"] is None, "the bare trace printed a layer split")
         out = io.StringIO()
@@ -700,6 +758,47 @@ def cmd_self_test(argv):
             tables(db3, log3, [], {})
         check("ds41_r8_q3k" in out.getvalue() and "the layer split is skipped" in out.getvalue(),
               "the bare trace's printed table does not name the skip")
+        # The same hold cut over the plain handoff name (plan (a)'s trace): the family reads both
+        # forms, and the split is the tier trace's.
+        db4, log4 = os.path.join(d, "plain.sqlite"), os.path.join(d, "plain.txt")
+        synth_hold("ds41_ffn_handoff").write(db4)
+        with open(log4, "w") as f:
+            f.write(RUNLOG_ON)
+        tr4 = Trace(db4)
+        hold4 = unpack_hold(tr4, engine_streams(tr4))
+        check(hold4 is not None and hold4["missing"] == [],
+              f"the plain-handoff trace's layer split was skipped: {hold4['missing'] if hold4 else None}")
+        if hold4 is not None and not hold4["missing"]:
+            for key in (("heavy", True), ("heavy", False), ("light", False)):
+                check(hold4["split"][key][0] == hold["split"][key][0],
+                      f"the plain-handoff trace's {key} count {hold4['split'][key][0]}, "
+                      f"the tier trace's {hold['split'][key][0]}")
+            close(hold4["hold_us"], hold["hold_us"], "the plain-handoff trace's unpack hold µs")
+        # The window edges: a straddling copy-stream kernel counts its launch once, an
+        # engine-stream copy keeps the tail that runs past the window's end, and the H2D
+        # split's classes stay disjoint when an eager kernel sits inside a join gap.
+        db5 = os.path.join(d, "edges.sqlite")
+        synth_edges().write(db5)
+        tr5 = Trace(db5)
+        rows5, ctx5 = window_rows(tr5, engine_streams(tr5),
+                                  [(100, 1.00 * MS, 2.00 * MS), (101, 2.00 * MS, None)],
+                                  {100: [(1.15 * MS, 1.60 * MS)]})
+        e100, e101 = rows5[100][(0, CPY)], rows5[101][(0, CPY)]
+        check(e100["kern"][0] == 1 and e101["kern"][0] == 0,
+              f"a straddling kernel's launch count {e100['kern'][0]} + {e101['kern'][0]}, expected 1")
+        check(e100["by_name"]["ds41_stage_thing"][0] == 1 and e101["by_name"]["ds41_stage_thing"][0] == 0,
+              f"a straddling kernel's by-name count {e100['by_name']} / {e101['by_name']}, expected 1 launch")
+        close(e100["kern"][1] + e101["kern"][1], 60.0, "the straddling kernel's clipped time sums to its whole")
+        check(ctx5["kind"]["H2D"] == [1, 4096, 200.0],
+              f"an engine-stream copy that runs past the window's end: {ctx5['kind']['H2D']}, "
+              f"expected [1, 4096, 200.0] (its whole duration)")
+        h = e100["h2d"]
+        check(h[0] == 1 and h[1] == 1024, f"the edges trace's H2D count/bytes {h[:2]}")
+        close(h[2], 300.0, "the edges trace's H2D busy")
+        close(h[3], 300.0, "the edges trace's H2D in gap (an eager kernel inside the gap is gap time)")
+        close(h[4], 0.0, "the edges trace's H2D in kern (none outside the gap)")
+        close(h[5], 0.0, "the edges trace's H2D rest (never negative)")
+        check(h[5] >= -0.001, f"the H2D rest is negative: {h[5]}")
     for f in fails:
         print(f"self-test FAIL: {f}")
     print(f"self-test: {'ok' if not fails else 'FAIL'} ({checks} checks, {len(fails)} failures)")
