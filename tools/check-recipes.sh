@@ -252,6 +252,7 @@ selftests=(
   "tools/ref/dma-dram-share.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/draft-vocab.py --self-test"
+  "tools/ref/ds41copy.py --self-test"
   "tools/ref/ds41pp.py self-test"
   "tools/ref/gguf-ranges.py --self-test"
   "tools/ref/ptx-canon.py --self-test"

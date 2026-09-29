@@ -1295,9 +1295,13 @@ nsys-gpu-qwen3moe *DEPTHS:
 nsys-gpu-qwen3moe-prefill *PROMPTS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
 
-# V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
+# V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록
+# 또는 말뭉치 팔(prose:<P>, code:<P> — depth-ds41.sh의 말뭉치 팔이 먹이는 같은 id). BLOOMERY_GEN_PLACE(a|gate|bp)와
+# BLOOMERY_TIMING_CARDS=a6000+3090(bp의 두 카드 모드), BLOOMERY_RESIDENCY 등 BLOOMERY_BOX_ENV로 실은 레버가
+# 프로파일 대상에 그대로 전해지고 [levers] 줄로 찍힌다; 레지던시가 켜진 실행은 엔진 스트림 옆 복사 스트림 표
+# (tools/ref/ds41copy.py)를 더한다. BLOOMERY_BOX_ENV=BLOOMERY_DRY=1이면 빌드도 임대도 없이 명령줄만 찍는다.
 nsys-gpu-ds41 *DEPTHS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
 
 # V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches

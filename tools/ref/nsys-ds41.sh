@@ -4,7 +4,8 @@
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/nsys-ds41.sh 6 1024'
 #   just nsys-gpu-ds41 6 1024
-#   bash tools/ref/nsys-ds41.sh --analyze <out>.sqlite <depth> <n> [<out>.txt]   # tables again, no profile
+#   BLOOMERY_BOX_ENV='BLOOMERY_RESIDENCY=mid-p40-s1' just nsys-gpu-ds41 prose:64
+#   bash tools/ref/nsys-ds41.sh --analyze <out>.sqlite <depth or P> <n> [<out>.txt]   # tables again, no profile
 #
 # The V4.1 sibling of nsys-gpu.sh. Its step boundary is the same (a kernel that runs exactly once
 # per replay, counted against the replays the run makes) and so is its refusal: no table when the
@@ -24,6 +25,39 @@
 #       exposed  = post.start − end of the kernel before it (what the step waited for the host)
 #     and exposed − the replay's median inter-kernel gap is the part the host tier added.
 #
+# Arms (the decode form's arguments): a numeric depth feeds lease.sh's lcg_prompt; `prose:<P>` /
+# `code:<P>` feed the first P ids of $BLOOMERY_DATA/engram/corpus-<name>.ids (one id a line) as
+# `--tokens`, depth-ds41.sh's corpus arms, whose routing is the corpus's. Under the batch feed a
+# corpus prompt of P ids behaves exactly as depth P — the replays are N − 1, the boundary count
+# and the run log's `time prompt` row are checked the same — so the analysis needs no case of its
+# own; a P the file cannot supply (P < 1, or past its line count) is refused before the lease.
+#
+# Placement: BLOOMERY_GEN_PLACE (a, the default, gate or bp) is the --place every profiled
+# generate_ds41 loads by, named in the [config] line. Plan (a) loads on the card named A6000 and
+# the gate plan on the one named 3090 (workstation::plan_a, plan_gate), so with the 3090 as the
+# one timing card a is refused (64) and with the A6000 gate is. bp is plan (b′), both cards: it
+# runs only in the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, timing-card.sh; the profile's
+# two-card line says what loads where), is refused (64) outside it, and inside it a and gate are
+# (bp is the placement that sees both cards). The two-card precheck runs before the lease and the
+# per-run check after each profile (an Xid, a card lost or off its cap, a load that named one
+# card: that run's tables are refused, rc 1).
+#
+# Levers: whatever the caller exports through BLOOMERY_BOX_ENV reaches the profiled binary
+# through the environment. The runner runs `generate_ds41 --levers` once before the lease and
+# echoes the rows it reports as set — the binary's own reading of its own registry — and its
+# refusal of a name no row names or a value a kind does not take is the runner's refusal, before
+# the lease is waited for. A dry run prints BLOOMERY_RESIDENCY's value in its first line.
+#
+# The copy stream (BLOOMERY_RESIDENCY on, decode form): beside the per-replay tables the
+# analysis tables what the swap's copy stream did — per step the H2D chunks (count, bytes, busy
+# µs, and that busy split by what the engine stream was doing under it: its host-wait gaps, the
+# waits in front of each `ds41_ffn_post*`; its kernels; neither), the D2D copies, the unpack
+# kernels by name (`ds41_r8_q3k`), and the means per step mod 4 (the rule plans its flips at
+# every fourth boundary). The copy stream is identified as a stream that is not the one the
+# graph replays run on (the streamId of kernels with a graphNodeId, which only a replay's
+# kernels carry); the cut is tools/ref/ds41copy.py's, and its self-test holds it to a synthetic
+# trace. With the lever off the analysis prints the one line that says so instead of the tables.
+#
 # Replays: generate_ds41 feeds its D ids as the `load` line's `prefill=` says. `batch` (the default)
 # runs them eagerly through body::prefill — kernels with no graph node, one `time prompt ...
 # kind=batch` row — so the replays are the N − 1 generated steps: replay r is `time step r + 1` at
@@ -34,7 +68,10 @@
 # and the batch embed launches ds41_glue_embed_q3k once a prompt token, so over all kernels that one
 # name alone counts D + N − 1 under the batch feed and would open each window at the replay's second
 # node. The trace's own eager kernels decide the feed: the run log's `time prompt` row must say the
-# same, or no table. The batch feed is what depth-ds41.sh times and leaves the caches as the steps
+# same, or no table. Under BLOOMERY_RESIDENCY the engine streams also run eager kernels between the
+# replays (the boundary work): the batch is the eager engine-stream kernels that end before the
+# first replay's first kernel, and the rest are named as boundary work, not a refusal.
+# The batch feed is what depth-ds41.sh times and leaves the caches as the steps
 # would; at depth 1024 the step feed would add ≈ 1024 replays of wall and trace. The capture before
 # the prompt executes no kernel.
 #
@@ -66,9 +103,10 @@
 #
 # Environment: BLOOMERY_NSYS_N (N, default 8, 2 in the prefill form), BLOOMERY_NSYS_LAST (replays
 # tabled, default 8), BLOOMERY_NSYS_TOP (kernel rows, default 24), BLOOMERY_NSYS_OUT (default
-# $BLOOMERY_DATA/nsys), BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
-# (seconds one profile may run, default 900), BLOOMERY_DRY=1 (the command lines, then exit before the
-# binary check and the lease).
+# $BLOOMERY_DATA/nsys), BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE
+# and BLOOMERY_TIMING_CARDS (Placement above), BLOOMERY_ARM_BOUND (seconds one profile may run,
+# default 900), BLOOMERY_DRY=1 (the command lines, then exit before the binary check and the
+# lease; the decode recipe builds nothing under it either, like the prefill one).
 set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -86,27 +124,57 @@ LAYER=${BLOOMERY_NSYS_LAYER:-2}
 BLOCKED_US=${BLOOMERY_NSYS_BLOCKED_US:-8}
 DRY=${BLOOMERY_DRY:-}
 PP=${BASH_SOURCE[0]%/*}/ds41pp.py
+CP=${BASH_SOURCE[0]%/*}/ds41copy.py
+PLACE=${BLOOMERY_GEN_PLACE:-a}
+case $PLACE in
+  a | gate | bp) ;;
+  *) echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE is a (plan (a), on the A6000; the default), gate (the gate plan, on the 3090) or bp (plan (b′), on both cards), got '$PLACE'" >&2; exit 64 ;;
+esac
+# The corpus arms (prose:<P>, code:<P>): corpus-<name>.ids under $BLOOMERY_DATA/engram, one id a
+# line; each file's id count is read once, into CORPUS_N_<name>, when an arm names it.
+CORPORA="prose code"
+corpus_file() { echo "${BLOOMERY_DATA:-}/engram/corpus-$1.ids"; }
+# corpus_check <arm> <name> <P>: the file's id count read once; P outside 1..count is refused.
+corpus_check() {
+  local file var
+  file=$(corpus_file "$2") var=CORPUS_N_$2
+  if [ -z "${!var:-}" ]; then
+    [ -r "$file" ] || { echo "nsys-ds41.sh: arm '$1': no $2 prompt file at $file (BLOOMERY_DATA)" >&2; exit 2; }
+    printf -v "$var" '%s' "$(($(wc -l < "$file")))"
+  fi
+  if [ "$3" -lt 1 ] || [ "$3" -gt "${!var}" ]; then
+    echo "nsys-ds41.sh: arm '$1': a $2 prompt of $3 ids; $file holds ${!var} (1..${!var})" >&2
+    exit 64
+  fi
+}
 
-# The analysis: sqlite, depth, n, the run's own output (for SMOKE and `time step`), last, top.
+# The analysis: sqlite, depth, n, the run's own output (for SMOKE and `time step`), last, top,
+# and the copy-stream analyzer's path (ds41copy.py, its own last argument).
 analyze() {
   timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 - "$@" << 'PY'
-import sqlite3, statistics, sys, re
+import os, sqlite3, statistics, sys, re
 from collections import defaultdict
 db = sqlite3.connect(sys.argv[1])
 depth, ngen, last, top = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[5]), int(sys.argv[6])
 runlog = sys.argv[4]
 names = dict(db.execute("SELECT id, value FROM StringIds"))
-rows = db.execute("SELECT start, end, shortName, graphNodeId FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start").fetchall()
-# The batch feed's kernels run outside the graph; the replays' are its nodes.
-eager = [r for r in rows if r[3] is None]
-ks = [(s, e, names.get(n, str(n)).split("(")[0]) for s, e, n, g in rows if g is not None]
+rows = db.execute("SELECT start, end, shortName, streamId, deviceId, graphNodeId "
+                  "FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start").fetchall()
+# The batch feed's kernels run outside the graph on the engine streams — the (deviceId, streamId)
+# pairs the replays' graph kernels run on; a streamId alone is per-context, and the two cards'
+# contexts reuse ids. A kernel outside the graph on another stream (the copy stream's unpack,
+# a draft's) is neither: under BLOOMERY_RESIDENCY the copy stream works inside the replays, and
+# counting its kernels as the prompt's would refuse the trace and misread the feed.
+eng = sorted({(r[4], r[3]) for r in rows if r[5] is not None})
+eager = [r for r in rows if r[5] is None and (r[4], r[3]) in eng]
+side = [r for r in rows if r[5] is None and (r[4], r[3]) not in eng]
+ks = [(s, e, names.get(n, str(n)).split("(")[0]) for s, e, n, st, dv, g in rows if g is not None]
 def rows_of(table):
     try:
         return db.execute(f"SELECT start, end, bytes FROM {table} ORDER BY start").fetchall()
     except sqlite3.OperationalError:
         return []
 copies, sets = rows_of("CUPTI_ACTIVITY_KIND_MEMCPY"), rows_of("CUPTI_ACTIVITY_KIND_MEMSET")
-feed = "batch" if eager else "steps"
 kind = None
 try:
     for line in open(runlog):
@@ -115,13 +183,26 @@ try:
             kind = m.group(1)
 except OSError:
     pass
-print(f"    kernels {len(rows)} ({len(eager)} outside the graph: the prompt's feed is {feed})  memcpy "
-      f"{len(copies)}  memset {len(sets)}  (stream memory operations leave no record)")
+# Under a residency the engine streams also run eager kernels between the replays (the boundary
+# work), so the prompt batch is the eager engine-stream kernels that end before the first replay's
+# first kernel; the rest are named on their own line below, not a refusal.
+batch = [k for k in eager if not ks or k[1] <= ks[0][0]]
+after = [k for k in eager if ks and k[1] > ks[0][0]]
+feed = "batch" if batch else "steps"
+side_note = f", {len(side)} on other streams (the copy stream's)" if side else ""
+print(f"    kernels {len(rows)} ({len(batch)} outside the graph on the engine stream(s) {eng}: "
+      f"the prompt's feed is {feed}{side_note})  memcpy {len(copies)}  memset {len(sets)}  "
+      f"(stream memory operations leave no record)")
+after_note = ""
+if after:
+    acnt = defaultdict(int)
+    for k in after:
+        acnt[names.get(k[2], str(k[2])).split("(")[0]] += 1
+    after_note = " (" + ", ".join(f"{c} {n}" for n, c in sorted(acnt.items(), key=lambda x: -x[1])[:5]) + ")"
+print(f"    eager engine-stream kernels after the first replay (boundary work under a residency): "
+      f"{len(after)}{after_note}")
 if kind is not None and kind != feed:
     print(f"    NO TABLE: the run log's time prompt row says kind={kind}, the trace's kernels say {feed}")
-    raise SystemExit(3)
-if eager and ks and eager[-1][0] > ks[0][0]:
-    print("    NO TABLE: a graph replay runs before the batch's last eager kernel")
     raise SystemExit(3)
 fed = depth if feed == "steps" else 0
 replays = fed + ngen - 1
@@ -143,8 +224,8 @@ print(f"[boundary] kernel {marker}: {len(bounds)} replay launches, expected {exp
 if len(bounds) != replays:
     raise SystemExit(3)
 bounds.append(len(ks))
-if eager:
-    print(f"    the batch: {len(eager)} eager kernels, first to last {(eager[-1][1] - eager[0][0]) / 1e6:.1f} ms")
+if batch:
+    print(f"    the batch: {len(batch)} eager kernels, first to last {(batch[-1][1] - batch[0][0]) / 1e6:.1f} ms")
 
 # The run's own lines: `time step i` is replay i - 1 under the batch feed; under the step feed
 # token 0 comes out of replay depth - 1 and `time step i` is replay depth - 1 + i.
@@ -174,7 +255,7 @@ def replay(r):
     wall = (w[-1][1] - t0) / 1e3
     ksum = sum(e - s for s, e, _ in w) / 1e3
     gaps = [(w[i][0] - w[i - 1][1]) / 1e3 for i in range(1, len(w))]
-    joins, j_idx = [], set()
+    joins, j_idx, jgaps = [], set(), []
     last_handoff = None
     for i, (s, e, n) in enumerate(w):
         if n == "ds41_ffn_handoff":
@@ -186,6 +267,7 @@ def replay(r):
             exposed = (s - w[i - 1][1]) / 1e3
             joins.append((bridge, over, exposed, w[i - 1][2]))
             j_idx.add(i)
+            jgaps.append((w[i - 1][1], s))
             last_handoff = None
     other = [gaps[i - 1] for i in range(1, len(w)) if i not in j_idx]
     base = statistics.median(other) if other else 0.0
@@ -195,7 +277,7 @@ def replay(r):
     return dict(w=w, wall=wall, ksum=ksum, gap=wall - ksum, joins=joins, base=base,
                 period=(t_next - t0) / 1e3 if t_next else float("nan"),
                 big=(gaps[big - 1], w[big - 1][2], w[big][2], big in j_idx),
-                other_gap=sum(other), copies=c_in, sets=s_in)
+                other_gap=sum(other), copies=c_in, sets=s_in, t0=t0, t1=t_next, jgaps=jgaps)
 
 lo = max(0, replays - last)
 R = {r: replay(r) for r in range(lo, replays)}
@@ -272,6 +354,18 @@ if dec:
     print(f"  memcpy per step: {len(cps) / len(dec):.1f} ({sum(c[1] - c[0] for c in cps) / 1e3 / len(dec):.1f} µs, "
           f"{sum(c[2] for c in cps) / len(dec):.0f} B)  memset per step: {len(sts) / len(dec):.1f} "
           f"({sum(c[1] - c[0] for c in sts) / 1e3 / len(dec):.1f} µs)")
+
+# The copy stream beside the engine stream (the header's copy-stream paragraph): the windows
+# and the host-wait gaps this cut found, the sqlite and the run log re-read by ds41copy.py.
+sys.path.insert(0, os.path.dirname(sys.argv[7]))
+try:
+    import ds41copy
+except Exception as exc:
+    print(f"    NO TABLE: the copy-stream analyzer ({sys.argv[7]}) did not load: {exc}")
+    raise SystemExit(3)
+print()
+ds41copy.tables(sys.argv[1], runlog,
+                [(r, R[r]["t0"], R[r]["t1"]) for r in R], {r: R[r]["jgaps"] for r in R}, top)
 PY
 }
 
@@ -293,8 +387,8 @@ if [ "${1:-}" = --analyze ]; then
     analyze_prefill "$2" "$3" "$4" "$5" "${PLAN[@]}"
     exit $?
   fi
-  [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth> <n> [<run log>]" >&2; exit 64; }
-  analyze "$2" "$3" "$4" "${5:-/dev/null}" "$LAST" "$TOP"
+  [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth or P> <n> [<run log>]" >&2; exit 64; }
+  analyze "$2" "$3" "$4" "${5:-/dev/null}" "$LAST" "$TOP" "$CP"
   exit $?
 fi
 
@@ -303,12 +397,16 @@ fi
   exit 64
 }
 DEPTHS=("$@")
+# Per argument, by its index in DEPTHS: the depth or prompt length (A_DEP), the corpus its ids
+# come from (A_CORP, empty for the lcg prompt a --depth feeds) and the label in output names.
+A_DEP=() A_CORP=() A_NAME=()
 if [ "$FORM" = prefill ]; then
   [ ${#DEPTHS[@]} -gt 0 ] || DEPTHS=(512)
   for d in "${DEPTHS[@]}"; do
     case $d in
       '' | *[!0-9]* | [0-8]) echo "nsys-ds41.sh: prompt length '$d' is an integer >= 9 in the prefill form" >&2; exit 64 ;;
     esac
+    A_DEP+=("$d") A_CORP+=('') A_NAME+=("d$d")
   done
   case $NGEN in
     '' | *[!0-9]* | [01]) echo "nsys-ds41.sh: BLOOMERY_NSYS_N is at least 2 in the prefill form (a replay closes the window), got '$NGEN'" >&2; exit 64 ;;
@@ -317,36 +415,93 @@ else
   [ ${#DEPTHS[@]} -gt 0 ] || DEPTHS=(6)
   for d in "${DEPTHS[@]}"; do
     case $d in
-      '' | *[!0-9]*) echo "nsys-ds41.sh: depth '$d' is not a number" >&2; exit 64 ;;
+      prose:* | code:*)
+        c=${d%%:*} p=${d#*:}
+        case $p in '' | *[!0-9]*) echo "nsys-ds41.sh: arm '$d' is <name>:<P>, P the count of ids the corpus file's head feeds" >&2; exit 64 ;; esac
+        corpus_check "$d" "$c" "$p"
+        A_DEP+=("$p") A_CORP+=("$c") A_NAME+=("$c$p")
+        ;;
+      '' | *[!0-9]*)
+        echo "nsys-ds41.sh: depth '$d' is not a number (the corpus arms are prose:<P>, code:<P>)" >&2; exit 64 ;;
+      *)
+        [ "$d" -ge 1 ] || { echo "nsys-ds41.sh: depth $d: the run feeds at least one id" >&2; exit 64; }
+        A_DEP+=("$d") A_CORP+=('') A_NAME+=("d$d")
+        ;;
     esac
-    [ "$d" -ge 1 ] || { echo "nsys-ds41.sh: depth $d: the run feeds at least one id" >&2; exit 64; }
   done
 fi
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_ds41}
 NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
 OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
-# The card pin, the card's witness lines, the other-card guard and the binary's freshness.
+# The card pin, the card's witness lines, the other-card guard and the binary's freshness; this
+# runner has the two-card mode (the header's Placement).
+# shellcheck disable=SC2034 # read by timing-card.sh when it is sourced next
+TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
+# In the two-card mode the profiled binary loads by bp alone; with one card, plan (a) needs the
+# A6000 as the timing card and the gate plan the 3090 (workstation::plan_a, plan_gate).
+TC_ARMS=()
+for i in "${!A_NAME[@]}"; do TC_ARMS+=("${DEPTHS[$i]}" ours ours); done
+# shellcheck disable=SC2034 # read by timing_cards_arms (timing-card.sh)
+TIMING_CARDS_PLACE=bp TIMING_CARDS_PLACE_RAN=$PLACE
+timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
+if [ "$PLACE" = a ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
+  echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=a is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): generate_ds41 would refuse the run; set BLOOMERY_GEN_PLACE=gate" >&2
+  exit 64
+fi
+if [ "$PLACE" = bp ] && [ -z "$TIMING_CARDS" ]; then
+  echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan (b′), which loads on both cards (the A6000 and its 3090 expert tier); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000+3090" >&2
+  exit 64
+fi
+if [ "$PLACE" = gate ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
+  echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is $TIMING_GPU, not the 3090 ($GPU_3090): name the 3090 in BLOOMERY_TIMING_GPU, or leave BLOOMERY_GEN_PLACE at a" >&2
+  exit 64
+fi
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 
-# The profiled command for depth or prompt length $1, into CMD; the report path is $out.
+# arm_feed <i>: the feed arguments of arm <i> into FEED — a depth's `--depth D`, a corpus arm's
+# `--tokens` over the first P ids of its file (a dry run prints the phrase it would run).
+arm_feed() {
+  local c=${A_CORP[$1]}
+  if [ -z "$c" ]; then
+    FEED=(--depth "${A_DEP[$1]}")
+  elif [ -n "$DRY" ]; then
+    FEED=(--tokens "\$(head -n ${A_DEP[$1]} $(corpus_file "$c") | paste -sd, -)")
+  else
+    FEED=(--tokens "$(head -n "${A_DEP[$1]}" "$(corpus_file "$c")" | paste -sd, -)")
+  fi
+}
+
+# The profiled command for arm <i>, into CMD; the report path is $out.
 profile_cmd() {
+  arm_feed "$1"
   CMD=(timeout --kill-after=10 "$BOUND"
        "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
        --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
-       "$BIN" --depth "$1" -n "$NGEN" --mode graph --time)
+       "$BIN" "${FEED[@]}" -n "$NGEN" --mode graph --time --place "$PLACE")
 }
 
 if [ -n "$DRY" ]; then
-  echo "[dry] form=$FORM bin=$BIN n=$NGEN args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
-  for d in "${DEPTHS[@]}"; do
+  echo "[dry] form=$FORM bin=$BIN n=$NGEN place=$PLACE residency=${BLOOMERY_RESIDENCY:-<unset>} args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+  if [ -n "$TIMING_CARDS" ]; then
+    echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
+    tc_rc=0
+    timing_cards_precheck '[dry] ' || tc_rc=$?
+    if [ "$tc_rc" = 0 ]; then
+      echo "[dry] two-card precheck: ok"
+    else
+      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
+    fi
+  fi
+  for i in "${!A_NAME[@]}"; do
     out="$OUTDIR/<name>"
-    profile_cmd "$d"
-    echo "[dry] $d: ${CMD[*]}"
+    profile_cmd "$i"
+    echo "[dry] ${DEPTHS[$i]}: ${CMD[*]}"
   done
   exit 0
 fi
@@ -355,42 +510,78 @@ assert_fresh_binary "$BIN" || exit $?
 [ -x "$NSYS" ] || { echo "no nsys at $NSYS" >&2; exit 2; }
 mkdir -p "$OUTDIR"
 
+# The binary's own reading of the levers the caller exported (BLOOMERY_BOX_ENV reaches the
+# profiled run through the environment): the rows it reports as set are the [levers] lines, and
+# its refusal of a name no row names or a value a kind does not take stops the runner here,
+# before the lease is waited for. The full table stays beside the reports.
+LEVERS_TXT="$OUTDIR/nsys-ds41-levers.txt"
+if ! "$BIN" --levers > "$LEVERS_TXT" 2>&1; then
+  echo "[levers] generate_ds41 --levers refused the environment:" >&2
+  sed 's/^/    /' "$LEVERS_TXT" >&2
+  exit 64
+fi
+
 # shellcheck disable=SC2034 # read by lease.sh's witness()
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 
 lease_take
-echo "[config] form=$FORM nsys=$($NSYS --version) n=$NGEN args='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
+timing_cards_start
+echo "[config] form=$FORM nsys=$($NSYS --version) n=$NGEN place=$PLACE args='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
+[ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+LEVER_SET=$(awk '$3 == "set"' "$LEVERS_TXT")
+if [ -n "$LEVER_SET" ]; then
+  sed 's/^/[levers] /' <<< "$LEVER_SET"
+else
+  echo "[levers] none set beyond the defaults (the binary's full table: $LEVERS_TXT)"
+fi
+for c in $CORPORA; do
+  var=CORPUS_N_$c
+  [ -z "${!var:-}" ] || echo "[config] $c: the first P ids of $(corpus_file "$c") (${!var} ids)"
+done
 witness pre
 guard_other
 
 rc_all=0
-for d in "${DEPTHS[@]}"; do
+for i in "${!A_NAME[@]}"; do
+  d=${A_DEP[$i]}
   if [ "$FORM" = prefill ]; then
     out="$OUTDIR/nsys-ds41-pp${d}-n${NGEN}-$(date -u +%H%M%S)"
     echo
     echo "=== prompt $d (n $NGEN: the prompt's batches, then $((NGEN - 1)) replay(s)) -> $out.nsys-rep"
+  elif [ -n "${A_CORP[$i]}" ]; then
+    out="$OUTDIR/nsys-ds41-${A_CORP[$i]}${d}-n${NGEN}-$(date -u +%H%M%S)"
+    echo
+    echo "=== ${A_CORP[$i]} $d (n $NGEN: the corpus's first $d ids as a batch, then $((NGEN - 1)) replay(s)) -> $out.nsys-rep"
   else
     out="$OUTDIR/nsys-ds41-d${d}-n${NGEN}-$(date -u +%H%M%S)"
     echo
     echo "=== depth $d (n $NGEN: $((NGEN - 1)) replays after a batch feed, $((d + NGEN - 1)) after a step feed) -> $out.nsys-rep"
   fi
-  profile_cmd "$d"
+  profile_cmd "$i"
   guard_other
-  witness "pre d=$d"
+  witness "pre ${A_NAME[$i]}"
   t0=$(date +%s)
   "${CMD[@]}" > "$out.txt" 2>&1
   rc=$?
   t1=$(date +%s)
-  witness "post d=$d"
+  witness "post ${A_NAME[$i]}"
   echo "[rc] $rc wall $((t1 - t0))s"
   [ $rc -eq 0 ] || { rc_all=$rc; echo "--- last 20 lines of $out.txt"; tail -n 20 "$out.txt"; continue; }
+  # Two cards: an Xid, a card lost or off its cap, or a load that named one card refuses this
+  # run's tables (timing_cards_arm; nothing to check with one card).
+  if ! timing_cards_arm "$(cat "$out.txt")" ours; then
+    rc_all=1
+    echo "[two-cards] run refused: $TWOCARD_WHY"
+    continue
+  fi
   if [ "$FORM" = prefill ]; then
     {
       echo "bin=$BIN_PATH"
       echo "sha256=$BIN_SHA"
       echo "P=$d"
       echo "n=$NGEN"
+      echo "place=$PLACE"
       echo "hot_list=${BLOOMERY_HOT_LIST:-}"
       echo "cmd=${CMD[*]}"
     } > "$out.meta"
@@ -403,7 +594,7 @@ for d in "${DEPTHS[@]}"; do
     analyze_prefill "$out.sqlite" "$d" "$NGEN" "$out.txt" || rc_all=$?
     echo "--- files: $out.nsys-rep, $out.sqlite, $out.txt, $out.meta"
   else
-    analyze "$out.sqlite" "$d" "$NGEN" "$out.txt" "$LAST" "$TOP" || rc_all=$?
+    analyze "$out.sqlite" "$d" "$NGEN" "$out.txt" "$LAST" "$TOP" "$CP" || rc_all=$?
     echo "--- files: $out.nsys-rep, $out.sqlite, $out.txt"
   fi
 done
