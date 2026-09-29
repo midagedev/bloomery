@@ -2307,10 +2307,11 @@ mod gate {
         let leaked = leaks()?.len() - leaks_before;
         let ok = made > 0 && waiting && took < DEADLINE && leaked == 0;
         println!(
-            "dropq (tier): the tier's own keep_rows and swap_boundary drove the trace to boundary \
-             {b_first}, which made {made} flips under a closed window (the copy stream {} before \
-             the drop); the tier dropped, its machine stopped first, in {:.1} ms (deadline \
-             {DEADLINE:?}), {leaked} leaks: {}",
+            "dropq (tier): a HostTier whose boundary, map and passes drove {} flips (boundary \
+             {b_first} made {made} under a closed window, the copy stream {} before the drop): the \
+             tier dropped, its machine stopped first, in {:.1} ms (deadline {DEADLINE:?}), \
+             {leaked} leaks: {}",
+            a.flips.len(),
             if waiting { "waiting" } else { "idle" },
             took.as_secs_f64() * 1e3,
             verdict(ok)
