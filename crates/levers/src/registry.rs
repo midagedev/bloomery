@@ -331,9 +331,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Qwen3.8 (`generate_qwen3moe`): `host` plans every routed expert on the host \
               tier; `card` plans each layer's id prefix on the card as its budget holds \
               (`place::Experts::Card`), run by the step's, the verify's and the pass's card \
-              leg — the same-binary arm. The ubatch walk refuses a card plan by name, so a \
-              card-plan prompt runs as passes (`--prefill pass`). The `plan` line prints \
-              `experts=`.",
+              leg and by the ubatch walk's card route — the same-binary arm. The `plan` line \
+              prints `experts=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
