@@ -51,9 +51,8 @@ use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
 use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
-use crate::host::HostTier;
 use crate::host::run::HostRun;
-use crate::hybrid::{BatchKey, ServeTimes};
+use crate::host::{BatchLeg, LegTimer, ServeNote};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -65,7 +64,7 @@ use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
-use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
+use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1001,7 +1000,7 @@ impl<'a> Gemm38<'a> {
     /// launch (`Body38::plan_gemm` refuses the taps' first, before the call
     /// moves anything; this is the windows' own guard). Once every layer is
     /// walked, armed taps record the unit's positions.
-    pub(super) fn walk(&mut self, leg: &mut WideLeg<'a>) -> Result<(), GpuError> {
+    pub(super) fn walk(&mut self, leg: &mut BatchLeg<'a, HostRun>) -> Result<(), GpuError> {
         let m = self.p.m;
         let taps = self.p.x.taps.as_ref().map_or(usize::MAX, |t| t.rows);
         if m == 0 || m > self.p.s.rows || m > self.p.x.rows || m > taps || self.p.dense > m {
@@ -1070,18 +1069,18 @@ impl<'a> Gemm38<'a> {
 }
 
 impl<'a> LayerProgram for Gemm38<'a> {
-    type Port = WideLeg<'a>;
+    type Port = BatchLeg<'a, HostRun>;
 
     /// The layer up to its router, the mix into the arena's `ffn_x`, then
     /// the download of the unit's activations and routed slots.
-    fn front(&mut self, port: &mut WideLeg<'a>, at: At) -> Result<(), GpuError> {
+    fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
-        port.mark(l, Mark::Front)?;
+        port.mark(l, Mark::Front as usize)?;
         self.p.front(l)?;
         self.p.ffn_mix(l)?;
         self.p.route(l)?;
-        port.mark(l, Mark::FrontEnd)?;
+        port.mark(l, Mark::FrontEnd as usize)?;
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
         let r = port.hybrid().enqueue_download_pitched(
@@ -1091,29 +1090,29 @@ impl<'a> LayerProgram for Gemm38<'a> {
             geo::N_USED + 1,
             key,
         );
-        let marked = r.and_then(|()| port.mark(l, Mark::Down));
+        let marked = r.and_then(|()| port.mark(l, Mark::Down as usize));
         port.part_end(l, enq);
         marked
     }
 
     /// The shared expert over the arena's `ffn_x`.
-    fn shadow(&mut self, port: &mut WideLeg<'a>, at: At) -> Result<(), GpuError> {
+    fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = self
             .p
             .shared(at.layer)
-            .and_then(|()| port.mark(at.layer, Mark::Shadow));
+            .and_then(|()| port.mark(at.layer, Mark::Shadow as usize));
         port.part_end(at.layer, enq);
         r
     }
 
     /// The gated sum over the host sums the walk's serve uploaded.
-    fn back(&mut self, port: &mut WideLeg<'a>, at: At) -> Result<(), GpuError> {
+    fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
         let r = self
             .p
             .shared_add(at.layer, port.hsum())
-            .and_then(|()| port.mark(at.layer, Mark::Back));
+            .and_then(|()| port.mark(at.layer, Mark::Back as usize));
         port.part_end(at.layer, enq);
         r
     }
@@ -1180,8 +1179,8 @@ pub(super) fn route_taps_host(
 
 // ------------------------------------------------------------------ timing
 
-/// What a walk the leg refuses names.
-const WHAT_LEG: &str = "qwen4exp ubatch walk leg";
+/// What the walk's timing refuses names.
+const WHAT_TIMING: &str = "qwen4exp ubatch walk timing";
 
 /// A card mark of a layer-batch's stream, in the order the walk enqueues
 /// them: the front's first launch, the front's last launch before the route's
@@ -1300,18 +1299,6 @@ impl WideTiming {
         })
     }
 
-    /// The walk's rows so far, in serve order.
-    fn note_serve(&mut self, row: WideLb) {
-        self.rows.push(row);
-    }
-
-    /// A part of layer `layer`'s host enqueue wall.
-    fn note_enqueue(&mut self, layer: usize, ns: u64) {
-        if let Some(at) = self.enqueue_ns.get_mut(layer) {
-            *at += ns;
-        }
-    }
-
     /// A walk's plan's host wall added to the prompt's prologue.
     pub(super) fn add_prologue(&mut self, ns: u64) {
         self.prologue_ns += ns;
@@ -1349,7 +1336,7 @@ impl WideTiming {
                 .and_then(|m| m.get(..MARKS))
             else {
                 return Err(GpuError::state(
-                    WHAT_LEG,
+                    WHAT_TIMING,
                     "a card mark for every layer of the walk",
                 ));
             };
@@ -1380,155 +1367,60 @@ impl WideTiming {
     }
 }
 
-/// A ubatch walk's host leg, the walk's own [`Port`]: the stream, the tier,
-/// the host sums and the most columns a unit may hold — the batch leg's
-/// exchange, with the serve timed and the stream marked at every part's
-/// boundary, which the plain [`crate::host::BatchLeg`] does not surface. A
-/// walk without timing armed exchanges exactly as that one does.
-pub(super) struct WideLeg<'a> {
-    stream: &'a CudaStream,
-    hybrid: &'a mut HostTier<HostRun>,
-    hsum: &'a mut DeviceBuffer<f32>,
-    cap: usize,
-    cols: usize,
-    timing: &'a mut Option<WideTiming>,
+/// Mark `site` of `layer` on the stream, in [`Mark`]'s layout.
+fn record_mark(
+    marks: &[CudaEvent],
+    stream: &CudaStream,
+    layer: usize,
+    site: usize,
+) -> Result<(), GpuError> {
+    Ok(marks[layer * MARKS + site].record(stream)?)
 }
 
-impl<'a> WideLeg<'a> {
-    /// The leg of a walk enqueued on `stream` whose host legs `hybrid`'s batch
-    /// port serves into `hsum`, for units of up to `cap` columns, its timing
-    /// `timing`'s.
-    pub(super) fn new(
-        stream: &'a CudaStream,
-        hybrid: &'a mut HostTier<HostRun>,
-        hsum: &'a mut DeviceBuffer<f32>,
-        cap: usize,
-        timing: &'a mut Option<WideTiming>,
-    ) -> WideLeg<'a> {
-        WideLeg {
-            stream,
-            hybrid,
-            hsum,
-            cap,
-            cols: 0,
-            timing,
+/// The ubatch walk's timing behind the batch leg's [`LegTimer`]: the serve's
+/// host times and walls as its rows, the parts' card marks and enqueue walls,
+/// the walk's own wall.
+impl LegTimer for WideTiming {
+    /// The sums' upload ([`Mark::Upload`]).
+    fn upload_mark(&mut self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
+        record_mark(&self.marks, stream, layer, Mark::Upload as usize)
+    }
+
+    /// The serve's row, in serve order for [`WideTiming::close`].
+    fn served(&mut self, note: ServeNote) {
+        self.rows.push(WideLb {
+            b: self.walks,
+            layer: note.layer,
+            cols: note.cols,
+            slots: note.slots,
+            wait_ns: note.times.wait_ns,
+            union_ns: note.union_ns,
+            serve_ns: note.serve_ns,
+        });
+    }
+
+    /// A part boundary's mark, in [`Mark`]'s layout.
+    fn mark(&mut self, stream: &CudaStream, layer: usize, site: usize) -> Result<(), GpuError> {
+        record_mark(&self.marks, stream, layer, site)
+    }
+
+    /// A part of layer `layer`'s host enqueue wall.
+    fn note_part(&mut self, layer: usize, ns: u64) {
+        if let Some(at) = self.enqueue_ns.get_mut(layer) {
+            *at += ns;
         }
     }
 
-    /// The tier, for a layer program's download.
-    fn hybrid(&mut self) -> &mut HostTier<HostRun> {
-        self.hybrid
-    }
-
-    /// The host sums the last upload sent, `cols` rows of the model width.
-    fn hsum(&self) -> &DeviceBuffer<f32> {
-        self.hsum
-    }
-
-    /// `at`'s exchange key over the open walk's columns.
-    fn key(&self, at: At) -> BatchKey {
-        BatchKey {
-            layer: at.layer,
-            set: at.unit,
-            at: 0,
-            u: self.cols,
-        }
-    }
-
-    /// Mark `m` of `layer` on the stream; nothing with the timing unarmed.
-    fn mark(&mut self, layer: usize, m: Mark) -> Result<(), GpuError> {
-        let Some(t) = self.timing.as_mut() else {
-            return Ok(());
-        };
-        let at = layer * MARKS + m as usize;
-        t.marks[at].record(self.stream)?;
-        Ok(())
-    }
-
-    /// The start of a part of layer `layer`'s host enqueue wall;
-    /// [`WideLeg::part_end`] closes it. `None` with the timing unarmed.
-    fn part_start(&self) -> Option<Instant> {
-        self.timing.as_ref().map(|_| Instant::now())
-    }
-
-    /// The wall of a part started at `t` added to layer `layer`'s enqueue.
-    fn part_end(&mut self, layer: usize, t: Option<Instant>) {
-        if let (Some(t), Some(w)) = (t, self.timing.as_mut()) {
-            w.note_enqueue(layer, nanos(t.elapsed()));
-        }
-    }
-
-    /// A walk begins: its rows taken back, its wall started with the timing
-    /// armed. A walk that fails leaves no rows: the next one clears them.
+    /// A walk begins: its rows taken back, its wall started. A walk that
+    /// fails leaves no rows: the next one clears them.
     fn begin_walk(&mut self) {
-        if let Some(t) = self.timing.as_mut() {
-            t.rows.clear();
-            t.walk_t0 = Some(Instant::now());
-        }
+        self.rows.clear();
+        self.walk_t0 = Some(Instant::now());
     }
 
-    /// A walk ends: its card marks read and its rows filed. Blocking with the
-    /// timing armed — the stream's tail, the last upload and gated sum, is
-    /// waited for — and nothing without it.
+    /// A walk ends: its card marks read and its rows filed. Blocking — the
+    /// stream's tail, the last upload and gated sum, is waited for.
     fn end_walk(&mut self) -> Result<(), GpuError> {
-        match self.timing.as_mut() {
-            None => Ok(()),
-            Some(t) => t.close(),
-        }
-    }
-}
-
-impl Port for WideLeg<'_> {
-    type Error = GpuError;
-    const KIND: PortKind = PortKind::Batch;
-
-    /// One unit of `1..=cap` columns, both sets of the port free
-    /// ([`HostTier::begin_group`]), as the batch leg refuses it.
-    fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        if o.units != 1 || !(1..=self.cap).contains(&o.cols) {
-            return Err(GpuError::Shape {
-                what: WHAT_LEG,
-                detail: format!(
-                    "{} units of {} columns; the walk's leg takes one unit of 1..={} columns",
-                    o.units, o.cols, self.cap
-                ),
-            });
-        }
-        self.cols = o.cols;
-        self.hybrid.begin_group()
-    }
-
-    /// Wait for `at`'s download, serve its host experts in one union call and
-    /// enqueue the upload of their sums into the leg's `hsum`, the serve's
-    /// host times and the walk's row kept with the timing armed.
-    fn serve(&mut self, at: At) -> Result<(), GpuError> {
-        let key = self.key(at);
-        let t0 = self.timing.as_ref().map(|_| Instant::now());
-        let before = self.hybrid.stats();
-        let times: ServeTimes = self.hybrid.serve_key(key)?;
-        self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
-        self.mark(at.layer, Mark::Upload)?;
-        if let (Some(t0), Some(t)) = (t0, self.timing.as_mut()) {
-            let after = self.hybrid.stats();
-            t.note_serve(WideLb {
-                b: t.walks,
-                layer: at.layer,
-                cols: self.cols,
-                slots: after
-                    .batch_host_slots
-                    .saturating_sub(before.batch_host_slots),
-                wait_ns: times.wait_ns,
-                union_ns: after.batch_ns.saturating_sub(before.batch_ns),
-                serve_ns: nanos(t0.elapsed()),
-            });
-        }
-        Ok(())
-    }
-
-    fn refused(why: Refused) -> GpuError {
-        GpuError::Shape {
-            what: WHAT_LEG,
-            detail: why.to_string(),
-        }
+        self.close()
     }
 }

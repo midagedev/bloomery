@@ -80,8 +80,8 @@ use super::scratch38::{
 };
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, Prompt38Stats, Wide38, WideForce, WideLeg, WideParts, WideTaps, WideTiming, dense_rows,
-    nanos, route_taps_host,
+    Gemm38, Prompt38Stats, Wide38, WideForce, WideParts, WideTaps, WideTiming, dense_rows, nanos,
+    route_taps_host,
 };
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
@@ -1367,7 +1367,8 @@ impl Body38 {
             },
         };
         let cap = prog.p.x.rows;
-        let mut leg = WideLeg::new(gpu.stream(), hybrid, wide_hsum, cap, wide_timing);
+        let mut leg = BatchLeg::new(gpu.stream(), hybrid, wide_hsum, cap);
+        leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
         planted(plant, Plant::AfterLaunch)?;
         match head {
