@@ -2282,7 +2282,6 @@ impl Body {
                 residency.populated().is_some(),
                 w,
                 gpu.context(),
-                stream,
             )?)),
         };
         hybrid.keep_residency(residency);

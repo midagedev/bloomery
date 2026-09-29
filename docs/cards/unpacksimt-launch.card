@@ -1,0 +1,24 @@
+# Round unpacksimt: the group unpack's time per launch in a residency decode run. The band is the
+# round's paper count: 288 groups of 17,600 B on at most 42 blocks (7 rounds on the busiest block),
+# each round a staged read (~1.1 us, 42 x 17,600 B at <= 700 GB/s), the decode (~5,100
+# warp-instructions a group, ALU pipe ~1.1 us on one block of 8 warps) and the stores; 10.14 MB a
+# launch at 700 GB/s is 14.5 us on its own [derived].
+kind: profile
+question: does ds41_r8_q3k_groups turn a 5,068,800-byte V4.1 gate or up in the time its DRAM
+  bytes take, so that a flip's unpack costs the engine its bytes and not its SMs?
+term: ds41_r8_q3k_groups duration per launch (nsys), us @ generate_ds41 --place bp, prose:64
+  decode, BLOOMERY_RESIDENCY=mid-p40-s1, A6000 stage card
+unit: us
+predict: 14..30
+condition: nsys takes the decode steps of one residency run under the lease, at least 48
+  launches of the entry (one boundary's flips x 2 parts) inside the traced window; the trace
+  records, per launch, whether engine-stream kernels ran beside it; the runner's witness blocks
+  record other compute processes on either card
+decide-in: land the rewrite; the unpack's remaining cost to the engine is its DRAM bytes, 0.70 ms
+  a boundary, and the next lever on the staging steps is stageflow's rank 1 (window-only staging)
+decide-below: the r8 read hits L2 behind its H2D: write the lower DRAM term into the cost model
+  and change nothing
+decide-above: split by the trace: launches with no engine kernel beside them above 30 us mean one
+  block's read, decode and stores do not overlap: raise GROUP_BLOCKS to 84 and read the launch
+  again; launches above 30 us only beside engine kernels mean DRAM shared with the engine: write
+  that share into the stageflow model as the unpack's cost and change no code

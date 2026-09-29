@@ -193,6 +193,10 @@ name = "gate_deepseek41_residency"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_deepseek41_unpack"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_deepseek41_step"
 required-features = ["deepseek41"]
 
