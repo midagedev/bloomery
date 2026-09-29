@@ -41,6 +41,7 @@ use crate::GpuError;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// What every error of the trace names.
@@ -98,11 +99,23 @@ pub struct TraceHeader {
     pub n_expert: usize,
     /// Routed ids a position selects.
     pub n_used: usize,
-    /// Layers `0 .. n_layer`, each a hybrid layer every step serves.
+    /// The first hybrid layer: the files and the manifest's layer rows carry
+    /// the model's own layer numbers, as a reference engine's set does.
+    pub first_layer: usize,
+    /// Layers `first_layer .. first_layer + n_layer`, each a hybrid layer
+    /// every step serves.
     pub n_layer: usize,
     /// The placement and the levers that move the routing's numerics, as
     /// header lines in order.
     pub extra: Vec<(String, String)>,
+}
+
+impl TraceHeader {
+    /// The model layers the trace holds.
+    #[must_use]
+    pub fn layers(&self) -> Range<usize> {
+        self.first_layer..self.first_layer + self.n_layer
+    }
 }
 
 /// A prompt call: `prompt` positions from `first` ran its ids, the first at
@@ -189,7 +202,7 @@ impl RouteTrace {
             )
         })?;
         let mut files = Vec::with_capacity(h.n_layer);
-        for l in 0..h.n_layer {
+        for l in h.layers() {
             let open = |name: String| {
                 let p = dir.join(name);
                 OpenOptions::new()
@@ -243,14 +256,13 @@ impl RouteTrace {
     /// `n_expert` experts, and its handoff carry `n_used` ids.
     pub(crate) fn fits(&self, slots: &SlotMap, n_used: usize) -> Result<(), GpuError> {
         let h = &self.header;
-        if slots.layers() != (0..h.n_layer) || slots.n_expert() != h.n_expert || n_used != h.n_used
-        {
+        if slots.layers() != h.layers() || slots.n_expert() != h.n_expert || n_used != h.n_used {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "a trace of layers 0..{} of {} experts, {} a position, on a host tier of \
+                    "a trace of layers {:?} of {} experts, {} a position, on a host tier of \
                      layers {:?} of {} experts, {n_used} a position",
-                    h.n_layer,
+                    h.layers(),
                     h.n_expert,
                     h.n_used,
                     slots.layers(),
@@ -349,13 +361,12 @@ impl RouteTrace {
                 "a step before any prompt call: the trace has no call its position belongs to",
             ));
         }
-        if layer != self.next {
+        let at = self.next;
+        let want = self.header.first_layer + at;
+        if layer != want {
             return Err(GpuError::shape(
                 WHAT,
-                format!(
-                    "layer {layer}'s service while the position expects layer {}",
-                    self.next
-                ),
+                format!("layer {layer}'s service while the position expects layer {want}"),
             ));
         }
         let k = self.header.n_used;
@@ -375,8 +386,8 @@ impl RouteTrace {
             };
             let id = u16::try_from(id)
                 .map_err(|_| GpuError::shape(WHAT, format!("expert {id} passes u16")))?;
-            self.ids[layer * k + s] = id;
-            self.kinds[layer * k + s] = kind;
+            self.ids[at * k + s] = id;
+            self.kinds[at * k + s] = kind;
         }
         self.next += 1;
         if self.next == self.header.n_layer {
@@ -424,6 +435,7 @@ impl RouteTrace {
     fn append_row(&mut self) -> Result<(), GpuError> {
         let k = self.header.n_used;
         let mut bytes = [0u8; 2 * MAX_USED];
+        let first = self.header.first_layer;
         for (l, f) in self.files.iter_mut().enumerate() {
             for (b, id) in bytes
                 .as_chunks_mut::<2>()
@@ -436,10 +448,10 @@ impl RouteTrace {
             let at = |name: String| self.dir.join(name);
             f.topk
                 .write_all(&bytes[..2 * k])
-                .map_err(|e| io_err(&at(format!("topk-{l}.u16")), &e))?;
+                .map_err(|e| io_err(&at(format!("topk-{}.u16", first + l)), &e))?;
             f.slots
                 .write_all(&self.kinds[l * k..][..k])
-                .map_err(|e| io_err(&at(format!("slots-{l}.u8")), &e))?;
+                .map_err(|e| io_err(&at(format!("slots-{}.u8", first + l)), &e))?;
         }
         Ok(())
     }
@@ -449,7 +461,7 @@ impl RouteTrace {
     /// at the new end.
     fn cut_back(&self, rows: u64) -> Result<(), GpuError> {
         let k = self.header.n_used as u64;
-        for l in 0..self.header.n_layer {
+        for l in self.header.layers() {
             for (name, len) in [
                 (format!("topk-{l}.u16"), rows * 2 * k),
                 (format!("slots-{l}.u8"), rows * k),
@@ -516,7 +528,7 @@ impl RouteTrace {
             let _ = writeln!(m, "# {k}\t{v}");
         }
         let _ = writeln!(m, "# layer\tlayer\ttokens\tfile\tslots");
-        for l in 0..h.n_layer {
+        for l in h.layers() {
             let _ = writeln!(m, "layer\t{l}\t{}\ttopk-{l}.u16\tslots-{l}.u8", self.rows);
         }
         let _ = writeln!(m, "# call\tindex\tfirst\tprompt_call\tend\tpos0");
@@ -557,7 +569,9 @@ pub struct TraceSet {
     /// The `# tokens` line.
     pub tokens: u64,
     pub n_used: usize,
-    /// Per layer `0 .. n`, its ids and slot kinds, position-major.
+    /// The first `layer` row: the rows run on from it, one a layer.
+    pub first_layer: usize,
+    /// Per layer from `first_layer`, its ids and slot kinds, position-major.
     pub ids: Vec<Vec<u16>>,
     pub kinds: Vec<Vec<u8>>,
     /// The `call` rows: first, prompt_call, end, pos0.
@@ -639,12 +653,17 @@ impl TraceSet {
             (Some(t), Some(k)) => (t, usize::try_from(k).unwrap_or(usize::MAX)),
             _ => return Err(bad(0, "no # tokens or # n_expert_used".to_string())),
         };
-        if layers != (0..layers.len() as u64).collect::<Vec<_>>() {
-            return Err(bad(0, format!("the layer rows are {layers:?}, not 0..n")));
+        let first = layers.first().copied().unwrap_or(0);
+        if layers != (first..first + layers.len() as u64).collect::<Vec<_>>() {
+            return Err(bad(
+                0,
+                format!("the layer rows are {layers:?}, not a run of consecutive layers"),
+            ));
         }
+        let first_layer = usize::try_from(first).unwrap_or(usize::MAX);
         let want = usize::try_from(tokens).unwrap_or(usize::MAX) * n_used;
         let (mut ids, mut kinds) = (Vec::new(), Vec::new());
-        for l in 0..layers.len() {
+        for l in first_layer..first_layer + layers.len() {
             let t = dir.join(format!("topk-{l}.u16"));
             let s = dir.join(format!("slots-{l}.u8"));
             let tb = fs::read(&t).map_err(|e| io_err(&t, &e))?;
@@ -671,6 +690,7 @@ impl TraceSet {
         Ok(TraceSet {
             tokens,
             n_used,
+            first_layer,
             ids,
             kinds,
             calls,
@@ -698,6 +718,7 @@ mod tests {
             build: "test".to_owned(),
             n_expert: 8,
             n_used: 2,
+            first_layer: 0,
             n_layer: 2,
             extra: Vec::new(),
         };
@@ -736,6 +757,36 @@ mod tests {
         let set = TraceSet::read(&dir).unwrap();
         assert_eq!((set.positions, set.complete), (Some(2), Some(2)));
         assert_eq!(set.ids[1], [1, 2, 3, 4]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trace whose run starts past layer 0 names its files and rows by
+    /// the model's layers, and the reader takes the run back from them.
+    #[test]
+    fn layers_keep_the_model_numbers() {
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-route-trace-{}-first", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let header = TraceHeader {
+            model: PathBuf::from("/models/t/m-00001-of-00001.gguf"),
+            arch: "test".to_owned(),
+            build: "test".to_owned(),
+            n_expert: 8,
+            n_used: 2,
+            first_layer: 3,
+            n_layer: 2,
+            extra: Vec::new(),
+        };
+        let mut t = RouteTrace::create(&dir, header).unwrap();
+        t.prompt(0, 1).unwrap();
+        row(&mut t, 1).unwrap();
+        assert!(dir.join("topk-3.u16").exists() && dir.join("slots-4.u8").exists());
+        assert!(!dir.join("topk-0.u16").exists());
+        assert!(manifest(&t).contains("layer\t3\t1\ttopk-3.u16\tslots-3.u8\n"));
+        assert_eq!(t.finish().unwrap(), 1);
+        let set = TraceSet::read(&dir).unwrap();
+        assert_eq!((set.first_layer, set.ids.len()), (3, 2));
+        assert_eq!(set.ids[1], [1, 2]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

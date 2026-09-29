@@ -877,6 +877,11 @@ impl Body38 {
         &self.hybrid
     }
 
+    /// The host tier, for a caller that attaches or marks its route trace.
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
     /// Arm (or disarm) the per-layer taps ([`GpuModel::set_layer_taps`], the
     /// one caller, drops the captures first). Load-time allocation.
     fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {

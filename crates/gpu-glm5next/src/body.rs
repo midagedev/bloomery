@@ -840,6 +840,11 @@ impl Body {
         &self.hybrid
     }
 
+    /// The host tier, for a caller that attaches or marks its route trace.
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<GlmHost> {
+        &mut self.hybrid
+    }
+
     /// The slot map's card copy the handoff reads, a routed layer's row at
     /// the map's [`SlotMap::row_offset`].
     #[must_use]

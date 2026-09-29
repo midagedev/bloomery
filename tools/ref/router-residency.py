@@ -130,9 +130,18 @@ DATA = "/Users/hckim/data/bloomery-router"
 SPLIT = 24576  # 12 whole chunks of 2048: learn on [0, SPLIT), evaluate on [SPLIT, tokens)
 
 # Model facts the replays price with. plan_total / plan_n: the card experts of V4.1 plan (a) (spread over
-# the eligible layers) and GLM glmcard; step_ms: the decode step the link is timed against [derived:
-# V4.1 from 39.6 tok/s, GLM 40 ms]; open_m: gen's default opening cap (V4.1's victims come back from
-# NVMe, GLM's whole routed set is in host memory).
+# the eligible layers), GLM glmcard and the Qwen3.8 card plan; step_ms: the decode step the link is timed
+# against [derived: V4.1 from 39.6 tok/s, GLM 40 ms, q38 53.85 tok/s at depth 512 —
+# rig-log log/2026-09-29.md#q38prose-pp]; open_m: gen's default opening cap (V4.1's victims come back from
+# NVMe, GLM's and q38's whole routed sets are in host memory).
+# q38's eligible layers are the ones whose routed stacks a card expert kernel reads (`card_routed`: the
+# Q4_K gate·up and the Q5_1 down) — every layer but the host-only 2, 4, 30, 46, 47, pinned in
+# crates/model/tests/qwen4exp_meta.rs (HOST_ONLY); plan_total is the A6000 card plan's 12,841 experts at
+# ctx 4,096 (299 on 27 layers, 298 on 16 — the same spread `placement.rs` makes); expert_bytes
+# 3,072,000 = gate 921,600 + up 921,600 + down 1,228,800. Its engine traces are the sets
+# `generate_qwen3moe --prefill step` writes under BLOOMERY_ROUTE_TRACE (all 48 layers, `call` rows per
+# prompt, a `chunk` header line per arm); no corpus set exists yet, so `sets` is empty and a set is always
+# named.
 FAMILY = {
     "v41": dict(sets=("prose", "code", "korean"), n_expert=384, n_used=6, expert_bytes=16_773_120,
                 eligible=list(range(2, 40)), plan_total=2668, step_ms=25.3, seeds=("cross", "in"),
@@ -140,6 +149,9 @@ FAMILY = {
     "glm": dict(sets=("glm5next-prose",), n_expert=288, n_used=8, expert_bytes=15_204_352,
                 eligible=list(range(3, 11)) + list(range(13, 44)), plan_n=67, step_ms=40.0,
                 seeds=("in", "prefix"), open_m=None),
+    "q38": dict(sets=(), n_expert=512, n_used=10, expert_bytes=3_072_000,
+                eligible=[l for l in range(48) if l not in (2, 4, 30, 46, 47)], plan_total=12_841,
+                step_ms=18.6, seeds=("in", "prefix"), open_m=None),
 }
 RULES = {
     "mid": dict(every=4, cap=24, margin=3.0, min_count=2.0, decay=0.9),
@@ -237,6 +249,15 @@ class Set:
     def counts(self, layer, t0=0, t1=None):
         t1 = self.T if t1 is None else t1
         return np.bincount(self.ids(layer)[t0:t1].ravel(), minlength=self.E)
+
+
+def hit_eval_stack(s, F):
+    """hit's eval half [SPLIT, tokens) of the family's eligible layers, refused by name for a set that
+    ends at or before SPLIT — an engine decode trace is that short; gen replays those by their contexts."""
+    if s.T <= SPLIT:
+        raise ToolError(f"{s.dir}: {s.T} tokens; hit evaluates [{SPLIT}, tokens), which it holds none "
+                        "of — gen replays a trace this short by its contexts")
+    return s.stack(F["eligible"], SPLIT, s.T)
 
 
 def rank(counts):
@@ -1069,8 +1090,8 @@ def cmd_hit(a, out):
         for n in names:
             s = Set(set_dir(a.data, n), a.family)
             n_l = n_cap(a.family, a.cap, s.E)
+            X = hit_eval_stack(s, F)
             lists = seed_lists(a.family, s, seedname, a.data, n_l)
-            X = s.stack(F["eligible"], SPLIT, s.T)
             for arm in ("static", "open" if has_open else "zero"):
                 r = dict(fam=a.family, set=s.name, seed=seedname, P=P, N=a.window, arm=arm,
                          M=M if arm == "open" else None, K=(a.stage or 0) if arm == "open" else None, d=a.d,
@@ -1098,7 +1119,7 @@ def cmd_hit(a, out):
         for n in names:
             s = Set(set_dir(a.data, n), a.family)
             n_l = n_cap(a.family, a.cap, s.E)
-            X = s.stack(F["eligible"], SPLIT, s.T)
+            X = hit_eval_stack(s, F)
             seeds = [a.seed] if a.seed else list(F["seeds"])
             lists = {sd: seed_lists(a.family, s, sd, a.data, n_l) for sd in seeds}
             if "static" in pol and not a.seed:
@@ -1735,6 +1756,98 @@ def case_gen_short():
         assert code == 1 and "within 1..3" in e4.getvalue(), e4.getvalue()
 
 
+def q38_engine_set(root, name, rows, chunk=None, complete=True, n_expert=512):
+    """A set in the engine route trace's shape (crates/gpu/src/host/route_trace.rs): header lines by
+    key, `layer` rows with a slots column, a `call` row per prompt, `# chunk` when given and
+    slots-<layer>.u8 beside the topk files (their kinds unread here, so all H)."""
+    d = os.path.join(root, name)
+    os.makedirs(d)
+    T = len(next(iter(rows.values())))
+    K = len(next(iter(rows.values()))[0])
+    L = sorted(rows)
+    for l, rs in rows.items():
+        np.asarray(rs, dtype="<u2").tofile(os.path.join(d, f"topk-{l}.u16"))
+        with open(os.path.join(d, f"slots-{l}.u8"), "wb") as f:
+            f.write(b"H" * (T * K))
+    lines = [
+        "# router_trace — bloomery engine: the routed ids of every position the engine ran, in step "
+        "order, as the host step port read them",
+        "# model\t/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "# model_file\tQwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "# arch\tqwen4exp",
+        "# build\tgenerate_qwen3moe",
+        "# engine\tbloomery (not an ik build)",
+        f"# tokens\t{T}",
+        f"# n_expert\t{n_expert}",
+        f"# n_expert_used\t{K}",
+        f"# n_layer\t{len(L)}",
+        "# feed\tone step per position: a prompt call's ids one step each (call rows)",
+        "# slots\tslots-<layer>.u8 beside topk-<layer>.u16: C stage card, T tier card, H host",
+        "# place\ta",
+        "# experts\tcard",
+        "# hot_list\tnone",
+        "# prefill\tstep",
+    ]
+    if chunk:
+        lines.append(f"# chunk\t{chunk}")
+    lines.append("# layer\tlayer\ttokens\tfile\tslots")
+    lines += [f"layer\t{l}\t{T}\ttopk-{l}.u16\tslots-{l}.u8" for l in L]
+    lines.append("# call\tindex\tfirst\tprompt_call\tend\tpos0")
+    lines.append(f"call\t0\t0\t{min(8, T)}\t{T}\t0")
+    lines.append(f"# positions\t{T}")
+    if complete:
+        lines.append(f"# complete\t{T}\t{len(L)}")
+    with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return d
+
+
+def case_q38_family():
+    # The q38 row's facts (Qwen3.8-Flash-Next: 512 x top-10, the 43 card layers of 48, the card plan's
+    # 12,841 experts spread 299 on 27 layers and 298 on 16) and the engine trace shape its sets come
+    # in: a set the engine wrote (a slots column, a call row, a chunk line) opens as family q38 and
+    # gen replays it by its chunk, the values gen_values gives.
+    F = family("q38")
+    assert (F["n_expert"], F["n_used"], F["expert_bytes"]) == (512, 10, 3_072_000)
+    assert F["eligible"] == [l for l in range(48) if l not in (2, 4, 30, 46, 47)]
+    n_l = n_plan("q38")
+    assert n_l == [299] * 27 + [298] * 16 and sum(n_l) == 12_841
+    assert n_l == list(spread(12_841, F["eligible"]).values())
+    with tempfile.TemporaryDirectory() as root:
+        rows = {l: [tuple((7 * t + l + 50 * j) % 512 for j in range(10)) for t in range(17)]
+                for l in range(48)}
+        d = q38_engine_set(root, "q38trace", rows, chunk=17)
+        s = Set(d, "q38")
+        assert s.chunk == 17 and s.layers == list(range(48)) and s.T == 17
+        js = os.path.join(root, "gen.json")
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()) as err:
+            code = main(["gen", "q38", d, "--data", root, "--seed", "prefix", "--prompt", "8",
+                         "--window", "4", "--json", js], out)
+        assert code == 0, err.getvalue()
+        text = out.getvalue()
+        assert "contexts=1 x 17 prompt=8 window=4" in text and "n_l 298..299 on 43 layers" in text, text
+        with open(js, encoding="utf-8") as f:
+            got = json.load(f)
+        X = s.stack(F["eligible"])
+        want, steady = gen_values(X, [(0, 17, 8)], 8, 4, seed_lists("q38", s, "prefix", root, n_l),
+                                  n_l, 512, Rule("mid"), None, 0, 1, COPIES)
+        assert got["contexts"] == want and got["steady"] == steady, (got["contexts"], want)
+        # refusals: a set that lacks an eligible layer, and one of another experts x top-k
+        short = q38_engine_set(root, "q38short", {l: rows[l] for l in range(48) if l != 5}, chunk=17)
+        narrow = q38_engine_set(
+            root, "q38narrow",
+            {l: [tuple((7 * t + l + 50 * j) % 256 for j in range(10)) for t in range(17)]
+             for l in range(48)}, n_expert=256)
+        for path, why in ((short, "family q38's eligible layers [5] are not in the set"),
+                          (narrow, "256 experts x top-10, family q38 is 512 x top-10"),
+                          (d, "hit evaluates [24576, tokens)")):
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                code = main(["hit", "q38", path, "--data", root])
+            assert code == 1 and why in err.getvalue(), (path, err.getvalue())
+
+
 def case_fixture():
     # one layer, E=4, n_l 1 seeded {0}; each pass two rows, 2 then 1, only the first kept: 1 is never
     # counted (counted, it would tie 2 at 4 and win by the lower id). Boundary 4: 2 in, 0 out, live 5.
@@ -1851,7 +1964,8 @@ def case_refusals():
 
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
          case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open,
-         case_open_last, case_gen, case_gen_contexts, case_gen_split, case_gen_short, case_fixture, case_refusals]
+         case_open_last, case_gen, case_gen_contexts, case_gen_split, case_gen_short, case_q38_family,
+         case_fixture, case_refusals]
 
 
 def self_test():
