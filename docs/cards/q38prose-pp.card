@@ -1,0 +1,27 @@
+# Qwen3.8's ubatch card route on real text: the same binary, BLOOMERY_QWEN38_EXPERTS=card against the all-host plan,
+# both arms fed the first P ids of the profile's prose corpus (prose:<P>), under BLOOMERY_STEP_STATS=1 so the host
+# arms' `stat prompt38 lb` rows carry the prose routing's per-expert column counts (the lcg prompt's routing is
+# heavily skewed — rig-log 09-29 #q38mhist-read — and pseudo-random ids say nothing about text).
+# Derived on the lcg rows (rig-log 09-29 #q38route-pp): a layer-batch is rest + union, rest 3.5 / 36 ms at
+# P = 512 / 4096, all-host union 29.1 / 252 ms, the card route under the union's shadow. With the card's share s of
+# the routed slots on the 43 card layers, their union is about 1.03 (1 - s) of the all-host one (the lcg ratio of
+# union to slots) and the five host-only layers stay whole: at s = 0.45..0.65, +53..+105 % at P = 512 and
+# +51..+100 % at P = 4096 [derived]. The lcg prompt's s was 0.554 / 0.522.
+# Wall [derived]: 4 arms x 2 rounds of fresh loads (40..90 s) plus prompts and warm primes: 15..22 min.
+kind: ab
+question: does the ubatch card route lift Qwen3.8's prefill on prose as the card's share of the prose routing says?
+term: pp tok/s @ P = U = 512 and 4096 on corpus-prose.ids (prose:<P>), A6000, BLOOMERY_QWEN38_EXPERTS=card against
+  the host plan, same binary, paired by round, BLOOMERY_STEP_STATS=1 on both arms
+unit: %
+predict: +50..+105
+rounds: 2
+condition: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_WARM_ROWS=1 BLOOMERY_THREADS=32
+  BLOOMERY_LEASE_CARD=docs/cards/q38prose-pp.card' just depth-gpu-qwen4exp prose:512
+  prose:512@BLOOMERY_QWEN38_EXPERTS=card prose:4096 prose:4096@BLOOMERY_QWEN38_EXPERTS=card, the full output to a file
+  first; the card arms' plan line experts=card, load line card_layers=43; no counted row [cold] or [other-busy]
+decide-in: the card share on prose is what the host slots say: land nothing new; read the host arms' spread
+  (m_hot, cols_hot, R) as the prose histogram and price the hot list and q38down (reports/q38hostonly §2) on it
+decide-below: the prose routing puts less than 0.45 of its mass on the id prefix: the hot list is the next lever
+  (its worth is the top-n_l mass the host rows give); compute it before any run
+decide-above: more than 0.65 on the prefix: the prefix is near the list's value on prose; q38down (the five
+  host-only layers) and the prefill group come before the hot list
