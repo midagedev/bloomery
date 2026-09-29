@@ -798,7 +798,10 @@ const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q
 /// card segment its layer's id prefix in the file's words and the rest on
 /// the host, and the draft's plan the host-routed one's; a card budget that
 /// leaves no expert makes the host-routed plan of the same levers, field for
-/// field; a hot list is refused by name.
+/// field; a hot list keeps the no-list plan's counts and bytes while each
+/// card layer holds the list's first `n_l` ranks — the host-only layers none
+/// either way — and a list of another expert count, or a host plan with one,
+/// is refused by name.
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards and the shared MTP file on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_card_plan() {
@@ -995,21 +998,137 @@ fn hw_qwen4exp_card_plan() {
             ok,
         );
     }
-    let hot = HotList::parse("synthetic", "# n_expert\t512\n# order\trank\n")
-        .unwrap_or_else(|e| panic!("the empty list: {e}"));
-    let levers = PlanLevers {
-        hot: Some(hot),
+    // PIN(2026-09-29): this pin was the refusal of a hot list ("no hot list is admitted for
+    // this file"), which documented the default — the id prefix — as a constraint; the lever
+    // now reaches the card plan as it does V4.1's and GLM's, so the pin holds the rule's
+    // promise instead: the same counts and bytes, the list's ranks as the card ids.
+    let e = inputs.model.experts;
+    let mut text = format!("# n_expert\t{e}\n# order\trank\n");
+    for l in 0..inputs.hp.n_layer as u64 {
+        let ids: Vec<String> = (0..e).map(|r| ((7 * r + l) % e).to_string()).collect();
+        let _ = writeln!(text, "{l}\t{}", ids.join(","));
+    }
+    let hot = HotList::parse("synthetic", &text).unwrap_or_else(|e| panic!("the list: {e}"));
+    let listed_levers = PlanLevers {
+        hot: Some(hot.clone()),
         card_budget_bytes: None,
     };
-    let machine = place::machine(A6000, inputs.hp.n_layer, place::UBATCH_PLANNED);
+    let machine = place::machine_for_experts(
+        A6000,
+        inputs.hp.n_layer,
+        place::UBATCH_PLANNED,
+        Experts::Card,
+    );
+    let (plain, listed) = match (
+        inputs.plan_with(&machine, KV_AT[0].0, &levers, Experts::Card),
+        inputs.plan_with(&machine, KV_AT[0].0, &listed_levers, Experts::Card),
+    ) {
+        (Ok(p), Ok(l)) => (p, l),
+        (a, b) => panic!(
+            "the card plan under a hot list: no-list {:?}, listed {:?}",
+            a.err(),
+            b.err()
+        ),
+    };
+    let (p, q) = (&plain.cards[0], &listed.cards[0]);
+    let counts_ok = listed.n_l == plain.n_l
+        && (
+            p.dense_bytes,
+            p.expert_bytes,
+            p.rounding_bytes,
+            p.headroom_bytes,
+        ) == (
+            q.dense_bytes,
+            q.expert_bytes,
+            q.rounding_bytes,
+            q.headroom_bytes,
+        )
+        && (plain.host.expert_bytes, plain.host.headroom_bytes)
+            == (listed.host.expert_bytes, listed.host.headroom_bytes);
+    check(
+        &mut o,
+        format!(
+            "a hot list keeps the no-list plan's counts and bytes: n_l sum {} (the no-list {}), \
+             card experts {} B ({}), rounding {} B ({}), host experts {} B ({})",
+            listed.n_l.iter().sum::<u64>(),
+            plain.n_l.iter().sum::<u64>(),
+            q.expert_bytes,
+            p.expert_bytes,
+            q.rounding_bytes,
+            p.rounding_bytes,
+            listed.host.expert_bytes,
+            plain.host.expert_bytes
+        ),
+        counts_ok,
+    );
+    let mut ids_bad = Vec::new();
+    for r in &listed.rows {
+        let t = &inputs.model.tensors[r.tensor];
+        if t.role != Role::RoutedExperts {
+            continue;
+        }
+        let l = t.layer.unwrap_or(0);
+        let n = usize::try_from(listed.n_l[l]).expect("n_l fits usize");
+        let card = r.segments.iter().find(|s| s.device == Device::Card(0));
+        let want = || {
+            let mut ids = hot.ranked(l)[..n].to_vec();
+            ids.sort_unstable();
+            ids
+        };
+        let id_ok = match card {
+            None => n == 0,
+            Some(s) => n > 0 && s.experts.as_ref().is_some_and(|x| x.ids() == want()),
+        };
+        if !id_ok {
+            ids_bad.push(t.name.clone());
+        }
+    }
+    check(
+        &mut o,
+        format!(
+            "each card layer holds the list's first n_l ranks (a permutation, not the id \
+             order): stacks off it {ids_bad:?}"
+        ),
+        ids_bad.is_empty(),
+    );
+    check(
+        &mut o,
+        format!(
+            "the host-only layers hold no card experts under the list: n_l on {off:?} = {:?}",
+            off.iter().map(|&l| listed.n_l[l]).collect::<Vec<_>>()
+        ),
+        off.iter().all(|&l| listed.n_l[l] == 0),
+    );
+    let other = HotList::parse(
+        "other count",
+        &format!("# n_expert\t{}\n# order\trank\n0\t0,1,2\n", e - 1),
+    )
+    .unwrap_or_else(|e| panic!("the other-count list: {e}"));
     let refused = inputs
-        .plan_with(&machine, KV_AT[0].0, &levers, Experts::Card)
+        .plan_with(
+            &machine,
+            KV_AT[0].0,
+            &PlanLevers {
+                hot: Some(other),
+                card_budget_bytes: None,
+            },
+            Experts::Card,
+        )
         .err()
         .map_or("planned".to_string(), |e| e.to_string());
     check(
         &mut o,
-        format!("a hot list is refused by name: {refused}"),
-        refused.contains("no hot list is admitted for this file"),
+        format!("a list of another expert count is refused by name: {refused}",),
+        refused.contains(&format!("n_expert {} is not the model's {}", e - 1, e)),
+    );
+    let refused = inputs
+        .plan_with(&machine, KV_AT[0].0, &listed_levers, Experts::Host)
+        .err()
+        .map_or("planned".to_string(), |e| e.to_string());
+    check(
+        &mut o,
+        format!("a hot list on the host plan is refused by name: {refused}"),
+        refused.contains("a hot list ranks none"),
     );
     println!("{o}");
     assert!(

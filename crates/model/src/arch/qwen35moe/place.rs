@@ -10,8 +10,9 @@
 //! bytes ([`ple_on_host`]), its rows gathered by the host — and the routed
 //! experts where [`Experts`] says: every one on the host
 //! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
-//! ([`PlanInputs::plan_with`] under [`Experts::Card`]): the id prefix, spread
-//! evenly, on the layers whose three routed stacks the card experts read
+//! ([`PlanInputs::plan_with`] under [`Experts::Card`]): each eligible layer's
+//! `n_l` hottest ids from a hot list ([`PlanLevers::hot`]) or its id prefix,
+//! spread evenly, on the layers whose three routed stacks the card experts read
 //! ([`card_routed`]: the Q4_K gate and up, the Q5_1 down in the file's
 //! blocks), the rest on the host. A layer with a stack they do not read keeps
 //! every expert on the host, each such stack named with the reason
@@ -68,8 +69,9 @@ pub enum Experts {
     /// Every routed expert on the host: the plan [`PlanInputs::plan`] makes.
     Host,
     /// The expert rule on the layers whose routed stacks [`card_routed`]
-    /// loads: each such layer's id prefix on the card, as many as the card's
-    /// budget holds, spread evenly over them; the rest on the host.
+    /// loads: each such layer's `n_l` hottest ids from a hot list
+    /// ([`PlanLevers::hot`]) or its id prefix on the card, as many as the
+    /// card's budget holds, spread evenly over them; the rest on the host.
     Card,
 }
 
@@ -215,9 +217,10 @@ impl PlanInputs {
     /// the placement's `levers`, the routed experts where `experts` says and
     /// the PLE table on the host; refused past [`KERNEL_POSITIONS`], when it
     /// cannot be built, or when it breaks an invariant. Under
-    /// [`Experts::Card`] a hot list is refused by name: the card keeps each
-    /// layer's id prefix. A card plan whose budget leaves no expert on the
-    /// card is the [`Experts::Host`] plan of the same levers.
+    /// [`Experts::Host`] a hot list is refused by name: that plan keeps
+    /// every routed expert on the host, so one ranks nothing. A card plan
+    /// whose budget leaves no expert on the card is the [`Experts::Host`]
+    /// plan of the same levers.
     pub fn plan_with<'a>(
         &'a self,
         machine: &'a Machine,
@@ -253,26 +256,15 @@ impl PlanInputs {
             Experts::Host => {
                 placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
             }
-            Experts::Card => {
-                if let Some(h) = &levers.hot {
-                    return Err(PlacementError::HotList {
-                        path: h.path().to_string(),
-                        detail: "qwen4exp's card experts are each layer's id prefix: no hot \
-                                 list is admitted for this file"
-                            .to_string(),
-                    }
-                    .into());
-                }
-                placement::plan_routed_reserving(
-                    &self.model,
-                    machine,
-                    ctx_max,
-                    &self.kv,
-                    levers,
-                    card_routed,
-                    reserve,
-                )?
-            }
+            Experts::Card => placement::plan_routed_reserving(
+                &self.model,
+                machine,
+                ctx_max,
+                &self.kv,
+                levers,
+                card_routed,
+                reserve,
+            )?,
         };
         ple_on_host(&mut plan)?;
         Ok(plan)

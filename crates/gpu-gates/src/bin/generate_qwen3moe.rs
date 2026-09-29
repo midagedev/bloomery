@@ -29,10 +29,13 @@
 //! the load runs it.
 //!
 //! A qwen4exp file's plan puts every routed expert on the host tier, or
-//! with `BLOOMERY_QWEN38_EXPERTS=card` each layer's id prefix on the card as
-//! its budget holds (`place::Experts::Card`), which the step's, the verify's
-//! and the pass's card leg and the ubatch walk's card route run; the `plan`
-//! line prints `experts=` and the `load` line `card_layers=`.
+//! with `BLOOMERY_QWEN38_EXPERTS=card` each layer's `n_l` hottest ids from
+//! `BLOOMERY_HOT_LIST` or its id prefix on the card as its budget holds
+//! (`place::Experts::Card`), which the step's, the verify's
+//! and the pass's card leg and the ubatch walk's card route run; a hot list
+//! is refused on a host plan (one ranks nothing) and on the other families'
+//! files; the `plan` line prints `experts=` and the `load` line
+//! `card_layers=`.
 //!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
@@ -655,6 +658,7 @@ mod cli {
         let levers = bloomery_levers::at_main(&[
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
+            bloomery_levers::HOT_LIST,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         let experts = experts38(&levers)?;
@@ -665,6 +669,14 @@ mod cli {
                      --dump-taps runs a qwen3moe file"
                         .into(),
                 );
+            }
+            if let Some(h) = levers.hot_list() {
+                return Err(format!(
+                    "BLOOMERY_HOT_LIST={} ranks a qwen4exp card plan's routed experts; \
+                     --dump-taps runs a qwen3moe file",
+                    h.display()
+                )
+                .into());
             }
             return dump_taps(&dir);
         }
@@ -723,6 +735,13 @@ mod cli {
             return Err(
                 "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
                  qwen3moe or qwen35moe file has no host tier"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && levers.hot_list().is_some() {
+            return Err(
+                "BLOOMERY_HOT_LIST ranks a qwen4exp card plan's routed experts; a qwen3moe or \
+                 qwen35moe plan holds every one on the card"
                     .into(),
             );
         }
