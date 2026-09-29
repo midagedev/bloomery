@@ -11,6 +11,7 @@
 #   just depth-gpu-qwen3moe 512 ikpp:512 lcpppp:512 mrspp:512 4096 ikpp:4096 lcpppp:4096 mrspp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-qwen3moe 6 lcpp:6 mrs:6    # the command lines, no lease, no load
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-qwen4exp 6 lcpp:6 512 lcpppp:512   # engine blocks
+#   just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card   # the prose corpus's first 512 ids, prose's own tables
 #   just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-<track>-base/target/release/generate_qwen3moe:6 lcpp:6
 #
 # depth-ds41.sh's shape, and it blocks the same failure: a ratio read at one depth and quoted as
@@ -54,10 +55,29 @@
 #             every arm, so the plain rows' labels would hide it); and `@` on a reference, server or bin:
 #             arm — a lever of ours is not a reference's.
 #             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
-#             run does and prints each arm's kind, depth, label, variables and load key, each round's
+#             run does and prints each arm's kind, depth, label, variables and load key — a prose arm's
+#             line also its corpus path and the file's first three ids (`-` when the file is not readable
+#             where it runs: the box's path, read on the Mac — a run refuses it) — each round's
 #             order and round 1's load command lines (`env NAME=VALUE ...` first), then exits 0 before the card, the binaries and the lease (it runs on the Mac);
 #             `--self-test` runs it on fixed arms, on the Mac. check-recipes does not run it: a script it
 #             names that calls lease_take makes gate-batch.sh refuse the check as a timed recipe.
+#   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
+#            $BLOOMERY_DATA/$MODEL_NAME/corpus-prose.ids (the profile's own prose corpus, one id a line —
+#            the file its d1k reference set is cut from) through --tokens instead of the LCG prompt, the
+#            NAME=VALUE list read as a <D> arm's: row label `ours@prose` (`ours@prose@NAME=VALUE[,...]`),
+#            the depth column P. The prompt's routing, and so its host and card work, is the prose's,
+#            not the LCG walk's (V4.1's lcg and prose prompts moved its card experts differently, so a
+#            lever tuned on one can mean nothing on the other): a prose arm is compared only with prose
+#            arms of the same P — `prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card` is the same-binary
+#            A/B on the prose prompt — in its own decode and prefill tables (ours@prose / each
+#            ours@prose@ label), never with an lcg arm or a reference. The ids arrive at the prompt, so
+#            the load is an lcg arm's: C is P + N rounded up to 256 as for a <D> arm, and a prose arm
+#            shares a load (and its key: binary, C, variables) with an lcg arm of the same C and
+#            variables. Refused by name before anything runs: a corpus file that is missing or
+#            unreadable (under --parse-arms one names itself on the arm's line instead), a P past its
+#            line count, a P < 1, a line among its first P that is not one id, and prose: on a
+#            reference, server or bin: arm — a corpus arm feeds our binary (depth-ds41.sh's
+#            lcppsrv…:prose:<P> and bin:…:prose:<P> are not this runner's arms).
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
@@ -208,6 +228,8 @@
 # rounds together, after one discarded process (`DISCARD r0`, in no mean, ratio or row count) — the
 # rule and its reasoning are depth-ds41.sh's (Order, Discard). The blocks:
 #   ours         every <D> arm
+#   prose        every prose:<P> arm, its lever arms with them: the corpus's ids are not the LCG
+#                walk's, so its discard reads its own prompt's pages, not the lcg block's
 #   bin:<tree>   each second binary's arms
 #   lcpp         lcpp, lcpppp, lcpppp<U>: one binary at one placement (the profile's --n-cpu-moe)
 #   lcppfit      lcppfit, lcppppfit, lcppppfit<U>: llama-bench's fit keeps the last layers' experts on
@@ -215,7 +237,7 @@
 #   ik           ik, ikdef, ikpp, ikpp<U>
 #   mrs          mrs, mrspa0, mrspp
 #   lcppsrv      lcppsrv, lcppsrvpp[<U>]; lcppsrvfit: the fit twins. Their discard is the longest prompt
-# A block's discard is its arm with the longest prompt (ours, bin) or the most token ids its process
+# A block's discard is its arm with the longest prompt (ours, prose, bin) or the most token ids its process
 # takes (a reference block): at -r 1 mainline draws 2P for a pp arm (its warm-up is the whole prompt)
 # and D + N + 3 for a decode arm, ik P + 1 and D + N + 4 (N + 3 at D = 0), mistral.rs feeds 2 (P + 1)
 # and 2 (D + N) ids (its warm-up request, then the timed one), and the discard runs at the block's
@@ -315,7 +337,9 @@
 # pre-lease checks' verdict and goes on.
 set -uo pipefail
 # q3_self_test: `depth-qwen3moe.sh --self-test`, the lever arms' parse and refusals (the header's
-# <D>@NAME=VALUE) on fixed arms against this tree's lever registry, each a --parse-arms run of this file
+# <D>@NAME=VALUE) on fixed arms against this tree's lever registry, and the prose arms' grammar and
+# refusals (the header's prose:<P>) against a temp corpus file in the self-test's own temp dir, each a
+# --parse-arms run of this file
 # in a clean environment under the qwen3moe profile: no card, no binary, no lease (it runs on the Mac,
 # under bash 3.2). One line per check, `ok <name>` or `FAIL <name>: …`; the last
 # line is the verdict.
@@ -420,6 +444,47 @@ q3_self_test() {
   run_parse -- --registry "${TMPDIR:-/tmp}/q3arm-registry.$$.rs" 6@BLOOMERY_THREADS=8
   rm -f "${TMPDIR:-/tmp}/q3arm-registry.$$.rs"
   want registry-shape 2 "1 LeverSpec rows, 0 read with a name and a site"
+  # The prose arms (the header's prose:<P>): the grammar and the load it shares with an lcg arm of
+  # the same C against a temp corpus in this self-test's own temp dir, then every refusal.
+  local pt
+  pt=$(mktemp -d "${TMPDIR:-/tmp}/q3arm-prose.XXXXXX")
+  mkdir -p "$pt/data/qwen3moe" "$pt/bad/qwen3moe" "$pt/none"
+  seq 100 800 > "$pt/data/qwen3moe/corpus-prose.ids"
+  { head -n 4 "$pt/data/qwen3moe/corpus-prose.ids"; echo x1; tail -n +5 "$pt/data/qwen3moe/corpus-prose.ids"; } > "$pt/bad/qwen3moe/corpus-prose.ids"
+  run_parse BLOOMERY_DATA="$pt/data" -- 512 prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card 4 prose:4 prose:4@BLOOMERY_AB_LOAD=arm
+  want prose-arm 0 \
+    "[parse] prose:512: kind=ours depth=512 label=ours@prose env=- load=$bin|ctx=768 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] prose:512@BLOOMERY_QWEN38_EXPERTS=card: kind=ours depth=512 label=ours@prose@BLOOMERY_QWEN38_EXPERTS=card env=BLOOMERY_QWEN38_EXPERTS=card load=$bin|ctx=768|BLOOMERY_QWEN38_EXPERTS=card corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] prose:4: kind=ours depth=4 label=ours@prose env=- load=$bin|ctx=256 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] prose:4@BLOOMERY_AB_LOAD=arm: kind=ours depth=4 label=ours@prose@BLOOMERY_AB_LOAD=arm env=- load=$bin|ctx=256|solo corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] round 1 loads: [512 prose:512] [prose:512@BLOOMERY_QWEN38_EXPERTS=card] [4 prose:4] [prose:4@BLOOMERY_AB_LOAD=arm]" \
+    "[parse] load: $bin --arm <lcg_prompt 512> --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
+    "[parse] load: env BLOOMERY_QWEN38_EXPERTS=card $bin --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
+    "[parse] load: $bin --arm <lcg_prompt 4> --arm <prose_prompt 4> -n 96 --ctx 256 --time --arm-sync"
+  # Under --parse-arms a corpus that is not readable (the box's path, read on the Mac) is named on
+  # the arm's line, not refused; a run refuses it before anything else.
+  run_parse BLOOMERY_DATA="$pt/none" -- prose:512
+  want prose-parse-nofile 0 "[parse] prose:512: kind=ours depth=512 label=ours@prose env=- load=$bin|ctx=768 corpus=$pt/none/qwen3moe/corpus-prose.ids ids=-"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen3moe BLOOMERY_DATA="$pt/none" "$BASH" "$me" prose:512 2>&1)
+  rc=$?
+  want prose-nofile 2 "no prose corpus at $pt/none/qwen3moe/corpus-prose.ids"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:702
+  want prose-past 64 "a prose prompt of 702 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:0
+  want prose-zero 64 "a prose prompt of 0 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  run_parse BLOOMERY_DATA="$pt/bad" -- prose:6
+  want prose-notid 2 "line 5 of the first 6 of $pt/bad/qwen3moe/corpus-prose.ids ('x1') is no id"
+  # A prose arm's NAME=VALUE list is a <D> arm's: the registry still gates it.
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4@FOO=1
+  want prose-lever 64 "FOO is no row of the lever registry"
+  # prose: is ours' corpus arm, never a reference's, a server's or a bin:'s.
+  run_parse -- ik:prose:512
+  want prose-ref 64 "ik: is a reference engine, which feeds its own prompt ids"
+  run_parse -- lcppsrv:prose:512
+  want prose-srv 64 "a server arm of this runner sends the LCG prompt's ids"
+  run_parse -- bin:/root/r/t/release/generate_qwen3moe:prose:512
+  want prose-bin 64 "a bin: arm is another build, run as it is (on the LCG prompt)"
+  rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
 }
@@ -487,13 +552,47 @@ ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_IDS=()
 # A lever arm's NAME=VALUE list as given (comma-separated; empty for every other arm).
 A_ENV=()
+# A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
+# every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
+A_TOK=()
 arm_usage() {
-  echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
 }
 arm_refuse() {
   echo "depth-qwen3moe.sh: arm '$1': $2" >&2
   exit 64
+}
+# The prose corpus (the header's prose:<P>): the profile's own file, one id a line — the file its d1k
+# reference set is cut from. PROSE_N, its line count, is read once, when the first prose arm names it.
+PROSE_N=
+corpus_file() { echo "${BLOOMERY_DATA:-}/$MODEL_NAME/corpus-prose.ids"; }
+# corpus_check <arm> <P>: the corpus file's checks, each refusal by name before anything runs: the
+# file readable, P within 1..its line count, and every one of its first P lines one id. Under
+# --parse-arms a file that is not readable (the box's path, read on the Mac) is named on the arm's
+# line, not refused: a run reads it, and refuses.
+corpus_check() {
+  local file bad
+  file=$(corpus_file)
+  if [ ! -r "$file" ]; then
+    [ -z "$PARSE_ONLY" ] || return 0
+    echo "depth-qwen3moe.sh: arm '$1': no prose corpus at $file (\$BLOOMERY_DATA/$MODEL_NAME/corpus-prose.ids, one id a line)" >&2
+    exit 2
+  fi
+  [ -n "$PROSE_N" ] || PROSE_N=$(($(wc -l < "$file")))
+  if [ "$2" -lt 1 ] || [ "$2" -gt "$PROSE_N" ]; then
+    arm_refuse "$1" "a prose prompt of $2 ids; $file holds $PROSE_N (1..$PROSE_N)"
+  fi
+  bad=$(head -n "$2" "$file" | grep -nvE '^[0-9]+$' | head -n 1)
+  if [ -n "$bad" ]; then
+    echo "depth-qwen3moe.sh: arm '$1': line ${bad%%:*} of the first $2 of $file ('${bad#*:}') is no id: the file is one id a line" >&2
+    exit 2
+  fi
+}
+# corpus_ids <P>: the corpus's first P ids, comma-separated, as --tokens takes them; under
+# --parse-arms the placeholder `<prose_prompt P>`, as the load lines print `<lcg_prompt D>`.
+corpus_ids() {
+  if [ -n "$PARSE_ONLY" ]; then echo "<prose_prompt $1>"; else head -n "$1" "$(corpus_file)" | paste -sd, -; fi
 }
 # lever_rows_py <registry.rs>: every row of the lever registry as `<name> <site>` — Parsed or Direct (a
 # lever), Retired, or Env (a runner's, a harness's or a path's own variable: the path() and runner()
@@ -591,14 +690,17 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs=''
-  # `@` is ours only: split at it first, so a value with a `:` is not read as a reference's arm.
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok=''
+  # `@` is ours only (a <D> arm's or a prose arm's list): split at it first, so a value with a `:` is
+  # not read as a reference's arm.
   case ${a%%@*} in
     "$a") ;;
+    prose:*) ;;
     bin:*) arm_refuse "$a" "'@' sets a lever of this tree's binary, and a bin: arm is another build, run as it is" ;;
     *:*) arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's" ;;
   esac
   if srv_eng "$eng"; then
+    case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and a server arm of this runner sends the LCG prompt's ids" ;; esac
     case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
     [ "$dep" -ge 1 ] || { echo "depth-qwen3moe.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
@@ -610,16 +712,31 @@ for a in "${ARMS[@]}"; do
     bin:*)
       kind=bin eng=bin bin=${a#bin:}
       dep=${bin##*:} bin=${bin%:*}
+      if [ "${bin##*:}" = prose ] || [ "$dep" = prose ]; then
+        arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and a bin: arm is another build, run as it is (on the LCG prompt)"
+      fi
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
       label=bin:${tree##*/}
+      ;;
+    prose:*)
+      # prose:<P>[@NAME=VALUE,...]: ours on the corpus's first P ids (the header's prose:<P>).
+      kind=ours eng=prose bin=$BIN
+      dep=${a#prose:}
+      label=ours@prose
+      case $dep in *@*) envs=${dep#*@} dep=${dep%%@*} label=ours@prose@$envs && arm_envs_ok "$a" "$envs" ;; esac
+      case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+      corpus_check "$a" "$dep"
+      tok=$(corpus_ids "$dep")
+      ours=1
       ;;
     *@*)
       kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@${a#*@} ours=1
       arm_envs_ok "$a" "$envs"
       ;;
     *:*)
+      case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and ${eng}: is a reference engine, which feeds its own prompt ids" ;; esac
       case $eng in
         ik | ikdef | ikpp | ikpp[1-9]*) ik=1 ;;
         lcpp | lcpppp | lcpppp[1-9]*) lcpp=1 ;;
@@ -658,7 +775,7 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' needs 1 <= D <= 20000 (D fed ids in one --tokens argument)" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok")
 done
 # The load keys (tools/ref/load-groups.sh): an ours arm's binary and its --ctx, the cache height and the
 # flash grid the load fixes, so ours arms share a load when they share C (BLOOMERY_GEN_CTX, or one D).
@@ -668,8 +785,19 @@ source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
 # start of its measured window (the header's Cold tag).
 LG_FED_RE='^prompt_ids '
 arm_ctx() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
-# arm_env_list <i>: the variables arm <i> runs with, comma-separated, the solo marker left out.
-arm_env_list() { [ -z "${A_ENV[$1]}" ] || lg_strip_solo "${A_ENV[$1]}"; }
+# arm_prompt <i>: the prompt ids arm <i> feeds: a prose arm's corpus ids (A_TOK), else the LCG walk of
+# its depth.
+arm_prompt() {
+  if [ -n "${A_TOK[$1]}" ]; then printf '%s' "${A_TOK[$1]}"; else lcg_prompt "${A_DEP[$1]}"; fi
+}
+# arm_env_list <i>: the variables arm <i> runs with, comma-separated, the solo marker left out. A
+# list of the marker alone answers the empty string without lg_strip_solo: bash 3.2 (the Mac) reads
+# the ${out[*]} of its emptied array as unbound under set -u.
+arm_env_list() {
+  [ -z "${A_ENV[$1]}" ] && return 0
+  [ "${A_ENV[$1]}" = "$LG_SOLO" ] && return 0
+  lg_strip_solo "${A_ENV[$1]}"
+}
 # A lever arm's variables are load-time, so they go into its key, sorted; `|solo` on an arm whose list
 # holds BLOOMERY_AB_LOAD=arm.
 for i in "${!ARMS[@]}"; do
@@ -696,7 +824,7 @@ lg_cmd() {
   arm_envs "$1"
   LG_ENV=(${ARM_ENVS[@]+"${ARM_ENVS[@]}"})
   LG_CMD=("$BIN")
-  for i in "$@"; do LG_CMD+=(--arm "$(lcg_prompt "${A_DEP[$i]}")"); done
+  for i in "$@"; do LG_CMD+=(--arm "$(arm_prompt "$i")"); done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
   LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
@@ -706,7 +834,13 @@ if [ -n "$PARSE_ONLY" ]; then
   # Each load of round 1 as the driver starts it (lg_cmd), its prompts by name: lease.sh is not sourced here.
   lcg_prompt() { echo "<lcg_prompt $1>"; }
   for i in "${!ARMS[@]}"; do
-    echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}"
+    extra=
+    if [ "${A_ENG[$i]}" = prose ]; then
+      f=$(corpus_file)
+      if [ -r "$f" ]; then three=$(head -n 3 "$f" | paste -sd, -); else three=-; fi
+      extra=" corpus=$f ids=$three"
+    fi
+    echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}$extra"
   done
   echo "[parse] order: $ORDER"
   if [ "$ORDER" = rotate ]; then
@@ -1053,7 +1187,7 @@ ours_arm() {
   ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
-  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(lcg_prompt "${A_DEP[$i]}")" -n "$N" --ctx "$(arm_ctx "$i")" --time ${WARM:+--warm "$WARM"} 2>&1)
+  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" --time ${WARM:+--warm "$WARM"} 2>&1)
   rc=$?
   f1=$(majflt_now)
   t1=$(date +%s)
@@ -1241,7 +1375,7 @@ arm_block() {
       esac
       ;;
     srv) case ${A_ENG[$1]} in *fit*) echo lcppsrvfit ;; *) echo lcppsrv ;; esac ;;
-    ours) echo ours ;;
+    ours) case ${A_ENG[$1]} in prose) echo prose ;; *) echo ours ;; esac ;;
     *) echo "${A_LABEL[$1]}" ;;
   esac
 }
@@ -1266,9 +1400,12 @@ arm_draws() {
 }
 [ "$ORDER" = rotate ] || blocks_plan
 
-# dry_cmd <i>: arm <i>'s command line as the dry run prints it (a reference arm at REF_K when set).
+# dry_cmd <i>: arm <i>'s command line as the dry run prints it (a reference arm at REF_K when set). A
+# prose arm always runs in a load (an ours arm has a load key), and its feed prints as
+# `<prose_prompt P>`, as an lcg arm's prints `<lcg_prompt D>`, with the file's count and its first and
+# last of the P ids in the note.
 dry_cmd() {
-  local i=$1 dep=${A_DEP[$1]} ctx note=''
+  local i=$1 dep=${A_DEP[$1]} ctx note='' feed
   if [ "${A_KIND[$i]}" = srv ]; then
     srv_dry_cmd "$i"
     return
@@ -1280,22 +1417,29 @@ dry_cmd() {
   fi
   ctx=$(arm_ctx "$i")
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
+  feed="<lcg_prompt $dep>"
+  facts=
+  if [ -n "${A_TOK[$i]}" ]; then
+    feed="<prose_prompt $dep>"
+    facts=", $dep of the file's ${PROSE_N:-?} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
+  fi
   if lg_grouped "$i"; then
     arm_envs "$i"
-    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm <lcg_prompt $dep> ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
-    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens <lcg_prompt $dep> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
+    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
   fi
 }
 
-# ratio_table <prefix> <keys> <labels> <tagged> <tag field>: records `label|key|round|value|…` on stdin;
-# for every key and every label but ours, each round's ours / label ratio (arms that ran more than once
-# in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1 degrees of
-# freedom, T975) and the ratio of the arm means. With tagged = 1 field 5 is the row's tags, and the
+# ratio_table <prefix> <keys> <labels> <tagged> <tag field> [base]: records `label|key|round|value|…` on
+# stdin; for every key and every label of <labels>, each round's base / label ratio (arms that ran more
+# than once in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1
+# degrees of freedom, T975) and the ratio of the arm means. The base is ours (the default) or
+# ours@prose for the prose table. With tagged = 1 field 5 is the row's tags, and the
 # line ends with each side's count of [other-busy]; a <tag field> above 0 is the record's field that
 # holds its tags, and the line then ends with each side's count of [cold].
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v rounds="$ROUNDS" -v t975="$T975" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v tf="${5:-0}" -v base="${6:-ours}" -v rounds="$ROUNDS" -v t975="$T975" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
   if (tagged && $5 ~ /other-busy/) bo[a]++
@@ -1306,10 +1450,10 @@ ratio_table() {
   nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
     ref = rf[j]
-    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    if (!((base SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
     c = 0; m = 0; list = ""
     for (r = 1; r <= rounds; r++) {
-      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      ko = base SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
       if (!(ko in rn) || !(kr in rn)) continue
       q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
       list = list sprintf(" r%d %.4f", r, q)
@@ -1320,10 +1464,10 @@ ratio_table() {
     if (c < 2) ci = "(one round: no interval)"
     else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
     else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
-    ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
-    busy = tagged ? sprintf("  busy: ours [other-busy %d/%d], %s [other-busy %d/%d]", bo[ao], an[ao], ref, bo[ar], an[ar]) : ""
-    cold = tf ? sprintf("  cold: ours %d/%d, %s %d/%d", bk[ao], an[ao], ref, bk[ar], an[ar]) : ""
-    printf "%s%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
+    ao = base SUBSEP d[i]; ar = ref SUBSEP d[i]
+    busy = tagged ? sprintf("  busy: %s [other-busy %d/%d], %s [other-busy %d/%d]", base, bo[ao], an[ao], ref, bo[ar], an[ar]) : ""
+    cold = tf ? sprintf("  cold: %s %d/%d, %s %d/%d", base, bk[ao], an[ao], ref, bk[ar], an[ar]) : ""
+    printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
   }
 }'
 }
@@ -1367,6 +1511,7 @@ timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
+[ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config
 echo "[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 # Each engine's line only when it has arms: a profile names only the engines it runs (qwen35moe.sh).
@@ -1420,8 +1565,15 @@ echo "=== ours / reference per depth: each round's ratio of the pair measured in
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
 echo "    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
+# The prose labels have their own table: their prompt is not the one ours and the references ran.
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE '^ours@prose(@|$)' | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0 6
+prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E '^ours@prose@' | sort -u | tr '\n' ' ')
+if [ -n "$prose_refs" ]; then
+  echo
+  echo "=== the prose prompt: ours@prose / each ours@prose@ arm per P, the same statistics ==="
+  printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 6 ours@prose
+fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
   echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
@@ -1438,8 +1590,14 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [other-busy] and [cold] ==="
   pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | sort -u | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE '^ours@prose(@|$)' | sort -u | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1 5
+  pp_prose=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E '^ours@prose@' | sort -u | tr '\n' ' ')
+  if [ -n "$pp_prose" ]; then
+    echo
+    echo "=== the prose prompt's prefill: ours@prose / each ours@prose@ arm per P, the same statistics ==="
+    printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp prose p=" "$pp_keys" "$pp_prose" 1 5 ours@prose
+  fi
 fi
 witness post
 ref_witness
