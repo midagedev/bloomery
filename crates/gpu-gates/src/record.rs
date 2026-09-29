@@ -885,6 +885,71 @@ pub static TIME_PROMPT: Kind = Kind {
     ],
 };
 
+/// One layer-batch of a Qwen3.8 ubatch walk.
+pub static STAT_PROMPT38_LB: Kind = Kind {
+    name: "stat_prompt38_lb",
+    head: "stat prompt38 lb",
+    doc: "One layer-batch of a Qwen3.8 ubatch walk under BLOOMERY_STEP_STATS: its columns and the \
+          host slots its union listed, its serve's host time (the wait on the route's copies; the \
+          union call's wall, which carries the routing scan and the plan build in front of it; the \
+          serve's whole wall, the upload's enqueue in it), the host wall its front, shared expert \
+          and gated sum took to enqueue, and its card time by part (the front's launches, the \
+          route's downloads, the shared expert under the union, the sums' upload, the gated sum).",
+    parts: &[
+        key("b", U64, ""),
+        key("layer", U64, ""),
+        key("cols", U64, ""),
+        key("slots", U64, "slots"),
+        key("wait_ms", F64(2), "ms"),
+        key("union_ms", F64(2), "ms"),
+        key("serve_ms", F64(2), "ms"),
+        key("enqueue_ms", F64(2), "ms"),
+        key("card_front_ms", F64(2), "ms"),
+        key("card_down_ms", F64(2), "ms"),
+        key("card_shadow_ms", F64(2), "ms"),
+        key("card_upload_ms", F64(2), "ms"),
+        key("card_back_ms", F64(2), "ms"),
+    ],
+};
+
+/// Where a Qwen3.8 prompt's ubatch walks spent their time.
+pub static STAT_PROMPT38_SPLIT: Kind = Kind {
+    name: "stat_prompt38_split",
+    head: "stat prompt38 split",
+    doc: "A Qwen3.8 prompt's ubatch walks under BLOOMERY_STEP_STATS, summed: the ubatches and \
+          layer-batches that ran, the host prologue every walk's plan took (the PLE rows, the \
+          record, their copy) and the walks' whole wall, the serves' union and wait and the host \
+          slots they listed, the walks' wall less the serves' as the enqueue's share, and the card \
+          time by part summed (the fronts, the route downloads, the shared experts, the uploads, \
+          the gated sums) with per layer-batch means.",
+    parts: &[
+        key("ubatches", U64, ""),
+        key("layer_batches", U64, ""),
+        key("prologue_ms", F64(1), "ms"),
+        key("walk_ms", F64(1), "ms"),
+        key("union_ms", F64(1), "ms"),
+        key("wait_ms", F64(1), "ms"),
+        key("serve_ms", F64(1), "ms"),
+        key("enqueue_ms", F64(1), "ms"),
+        key("host_slots", U64, "slots"),
+        key("union_lb", F64(2), "ms/lb"),
+        key("wait_lb", F64(2), "ms/lb"),
+        key("serve_lb", F64(2), "ms/lb"),
+        key("enqueue_lb", F64(2), "ms/lb"),
+        key("slots_lb", F64(1), "slots/lb"),
+        key("card_front_ms", F64(1), "ms"),
+        key("card_down_ms", F64(1), "ms"),
+        key("card_shadow_ms", F64(1), "ms"),
+        key("card_upload_ms", F64(1), "ms"),
+        key("card_back_ms", F64(1), "ms"),
+        key("card_front_lb", F64(2), "ms/lb"),
+        key("card_down_lb", F64(2), "ms/lb"),
+        key("card_shadow_lb", F64(2), "ms/lb"),
+        key("card_upload_lb", F64(2), "ms/lb"),
+        key("card_back_lb", F64(2), "ms/lb"),
+    ],
+};
+
 /// A residency boundary ([`bloomery_gpu::host::swap::PassReport`]).
 pub static RESIDENCY_PASS: Kind = Kind {
     name: "residency_pass",
@@ -1498,8 +1563,14 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// What `generate_qwen3moe` prints as records: under `--dump-taps`, after
 /// its `load` line, and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
 /// lines; the binary's other lines are its own.
-pub static GENERATE_QWEN3MOE: &[&Kind] =
-    &[&TAPS_SEQ, &TAPS_DUMP, &STAT_STEP_HOST, &STAT_SUMMARY_HOST];
+pub static GENERATE_QWEN3MOE: &[&Kind] = &[
+    &TAPS_SEQ,
+    &TAPS_DUMP,
+    &STAT_STEP_HOST,
+    &STAT_SUMMARY_HOST,
+    &STAT_PROMPT38_SPLIT,
+    &STAT_PROMPT38_LB,
+];
 
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
 /// its name and the case's.
@@ -1724,6 +1795,62 @@ mod tests {
             smoke,
             "SMOKE mode=graph place=a prompt_tokens=0 depth=512 generated=2 warm=0 steps=1 \
              p50_ms=37.3698 mean_ms=37.3698 tok/s(p50)=26.76"
+        );
+        let lb = Record::new(&STAT_PROMPT38_LB)
+            .u("b", 0)
+            .u("layer", 3)
+            .u("cols", 4096)
+            .u("slots", 40960)
+            .f("wait_ms", 21.53)
+            .f("union_ms", 214.87)
+            .f("serve_ms", 236.71)
+            .f("enqueue_ms", 0.94)
+            .f("card_front_ms", 19.62)
+            .f("card_down_ms", 1.84)
+            .f("card_shadow_ms", 0.71)
+            .f("card_upload_ms", 1.79)
+            .f("card_back_ms", 0.21)
+            .line();
+        assert_eq!(
+            lb,
+            "stat prompt38 lb b=0 layer=3 cols=4096 slots=40960 wait_ms=21.53 union_ms=214.87 \
+             serve_ms=236.71 enqueue_ms=0.94 card_front_ms=19.62 card_down_ms=1.84 \
+             card_shadow_ms=0.71 card_upload_ms=1.79 card_back_ms=0.21"
+        );
+        let split = Record::new(&STAT_PROMPT38_SPLIT)
+            .u("ubatches", 1)
+            .u("layer_batches", 48)
+            .f("prologue_ms", 18.4)
+            .f("walk_ms", 13780.9)
+            .f("union_ms", 10313.8)
+            .f("wait_ms", 1033.4)
+            .f("serve_ms", 11364.1)
+            .f("enqueue_ms", 2416.8)
+            .u("host_slots", 1966080)
+            .f("union_lb", 214.87)
+            .f("wait_lb", 21.53)
+            .f("serve_lb", 236.75)
+            .f("enqueue_lb", 0.94)
+            .f("slots_lb", 40960.0)
+            .f("card_front_ms", 941.8)
+            .f("card_down_ms", 88.3)
+            .f("card_shadow_ms", 34.1)
+            .f("card_upload_ms", 85.9)
+            .f("card_back_ms", 10.1)
+            .f("card_front_lb", 19.62)
+            .f("card_down_lb", 1.84)
+            .f("card_shadow_lb", 0.71)
+            .f("card_upload_lb", 1.79)
+            .f("card_back_lb", 0.21)
+            .line();
+        assert_eq!(
+            split,
+            "stat prompt38 split ubatches=1 layer_batches=48 prologue_ms=18.4 walk_ms=13780.9 \
+             union_ms=10313.8 wait_ms=1033.4 serve_ms=11364.1 enqueue_ms=2416.8 \
+             host_slots=1966080 union_lb=214.87 wait_lb=21.53 serve_lb=236.75 enqueue_lb=0.94 \
+             slots_lb=40960.0 card_front_ms=941.8 card_down_ms=88.3 card_shadow_ms=34.1 \
+             card_upload_ms=85.9 card_back_ms=10.1 card_front_lb=19.62 card_down_lb=1.84 \
+             card_shadow_lb=0.71 card_upload_lb=1.79 card_back_lb=0.21"
         );
     }
 

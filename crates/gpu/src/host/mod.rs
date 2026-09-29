@@ -103,7 +103,7 @@ pub mod step;
 pub mod swap;
 pub mod tier;
 
-pub use leg::{BatchLeg, StepLeg};
+pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};

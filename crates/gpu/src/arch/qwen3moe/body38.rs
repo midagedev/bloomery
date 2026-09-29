@@ -79,7 +79,10 @@ use super::scratch38::{
     dims, kept_lane, store_rule_bytes,
 };
 use super::ubatch::UBATCH as UBATCH_MOST;
-use super::wide38::{Gemm38, Wide38, WideForce, WideParts, WideTaps, dense_rows, route_taps_host};
+use super::wide38::{
+    Gemm38, Prompt38Stats, Wide38, WideForce, WideParts, WideTaps, WideTiming, dense_rows, nanos,
+    route_taps_host,
+};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::{BatchLeg, StepLeg};
@@ -99,6 +102,7 @@ use model::placement::Plan;
 use runtime::seqstate::{Kept, Why};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 const WHAT: &str = "qwen4exp Body38";
 
@@ -475,6 +479,10 @@ pub struct Body38 {
     wr: WideRecord,
     wide_hsum: DeviceBuffer<f32>,
     wide: Wide38,
+    /// The ubatch walk's timing, when a caller armed it
+    /// ([`GpuModel::set_prompt38_stats`]); unarmed, the walk records and
+    /// waits for nothing.
+    wide_timing: Option<WideTiming>,
     /// The map check every walk reads ([`MapCheck::refuse`]): the tier's
     /// slot map's, or the one a gate planted in its place until it is taken
     /// back or the model reset.
@@ -798,6 +806,7 @@ impl Body38 {
             wr,
             wide_hsum,
             wide,
+            wide_timing: None,
             card_leg,
             lane: LaneWord::new(stream)?,
             pending: None,
@@ -1243,8 +1252,24 @@ impl Body38 {
     /// route taps' rows and the planted routes' positions, its PLE rows, its
     /// record and its rows' copy to the ubatch arena, staged for
     /// [`Body38::walk_gemm`]'s launch. Each refusal comes before anything
-    /// moves.
+    /// moves. With the timing armed, the plan's host wall is the prompt's
+    /// prologue.
     fn plan_gemm(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        let t0 = self.wide_timing.as_ref().map(|_| Instant::now());
+        let r = self.stage_gemm(stream, tokens, pos);
+        if let (Some(t0), Some(w)) = (t0, self.wide_timing.as_mut()) {
+            w.add_prologue(nanos(t0.elapsed()));
+        }
+        r
+    }
+
+    /// [`Body38::plan_gemm`]'s staging, untimed.
+    fn stage_gemm(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
         self.card_leg.refuse(Walk38::Ubatch)?;
         let n = tokens.len();
         if self.taps.is_some() {
@@ -1312,6 +1337,7 @@ impl Body38 {
             wa,
             wide_hsum,
             wide,
+            wide_timing,
             k,
             eps,
             ctx,
@@ -1342,6 +1368,7 @@ impl Body38 {
         };
         let cap = prog.p.x.rows;
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, wide_hsum, cap);
+        leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
         planted(plant, Plant::AfterLaunch)?;
         match head {
@@ -1474,6 +1501,29 @@ impl GpuModel<Body38> {
         self.drop_captures();
         let (gpu, _, body) = self.body_parts("qwen4exp set_layer_taps")?;
         body.set_taps(gpu, on)
+    }
+
+    /// Arm (or disarm) the ubatch walk's timing: one event a part boundary a
+    /// layer, the serve's host times and the prompt's walls, which
+    /// [`GpuModel::take_prompt38_stats`] reads. Load-time allocation; unarmed,
+    /// a walk records no event, keeps no time and waits for nothing beyond
+    /// its own serves.
+    pub fn set_prompt38_stats(&mut self, on: bool) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen4exp set_prompt38_stats")?;
+        body.wide_timing = if on {
+            Some(WideTiming::new(gpu.context(), body.plans.len())?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// The prompt's ubatch-walk stats, taken — the next prompt starts clean.
+    /// `Ok(None)` with the timing unarmed or no ubatch walked (a prompt by
+    /// steps or passes keeps none).
+    pub fn take_prompt38_stats(&mut self) -> Result<Option<Prompt38Stats>, GpuError> {
+        let (_, _, body) = self.body_parts("qwen4exp take_prompt38_stats")?;
+        Ok(body.wide_timing.as_mut().and_then(WideTiming::take))
     }
 
     /// Feed `tokens` from where the model stands by `path` and return the

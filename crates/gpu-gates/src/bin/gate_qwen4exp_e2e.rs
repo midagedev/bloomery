@@ -144,6 +144,9 @@
 //!   lands in; the walk's cut of the selecting layers' rows between the
 //!   prefill flash and the selection is the rule's (2,051 and 949, from
 //!   KEPT and POOL — a record, checked against the gate's own derivation);
+//!   the one ubatch again with the walk's timing armed
+//!   (`GpuModel::set_prompt38_stats`) writes the same bits, and its record
+//!   holds one ubatch and a row for every layer with every card span read;
 //!   the step after the ubatch as (t) holds a step set. A slot map with a
 //!   routed expert on a tier card (planted, `Body38::plant_slot_map`) is
 //!   refused by name — the walk, the layer and the count — by each of the
@@ -2474,7 +2477,59 @@ mod gate {
             &one,
             true,
         );
+        ok &= gemm_timed(m, &prefill, &one)?;
         ok &= step_set(m, D3K, Prompt38::Gemm, None, ties)?.0;
+        Ok(ok)
+    }
+
+    /// (g) with the walk's timing armed (`BLOOMERY_STEP_STATS`): the same
+    /// ubatch writes `one`'s bits, and its record holds one ubatch and a row
+    /// for every layer with every card span read, finite and not negative.
+    fn gemm_timed(m: &mut Qwen38Model, prefill: &[u32], one: &Run) -> Result<bool, GateError> {
+        m.set_prompt38_stats(true)?;
+        fresh(m)?;
+        let tok = m.prompt38(prefill, Prompt38::Gemm)?;
+        let logits = m.logits()?;
+        let (st, ring) = stores(m)?;
+        let stats = m.take_prompt38_stats()?;
+        m.set_prompt38_stats(false)?;
+        let timed = Run {
+            tokens: vec![tok],
+            logits: vec![logits],
+            taps: Vec::new(),
+            routes: Vec::new(),
+            stores: st,
+            ple_ring: ring,
+        };
+        let mut ok = same_run(
+            "D3K by one ubatch, timing armed vs unarmed",
+            &timed,
+            one,
+            true,
+        );
+        let (ubatches, rows, spans) = match &stats {
+            Some(s) => (
+                s.ubatches,
+                s.rows.len(),
+                s.rows
+                    .iter()
+                    .filter(|r| {
+                        [r.front_ms, r.down_ms, r.shadow_ms, r.upload_ms, r.back_ms]
+                            .iter()
+                            .all(|v| v.is_finite() && *v >= 0.0)
+                            && r.front_ms > 0.0
+                    })
+                    .count(),
+            ),
+            None => (0, 0, 0),
+        };
+        let rec_ok = ubatches == 1 && rows == N_LAYER && spans == N_LAYER;
+        println!(
+            "gemm {D3K}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
+             (want {N_LAYER}), {spans} with every card span read (want {N_LAYER}) {}",
+            verdict(rec_ok)
+        );
+        ok &= rec_ok;
         Ok(ok)
     }
 
