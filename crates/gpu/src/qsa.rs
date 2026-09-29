@@ -250,8 +250,10 @@ unsafe fn block_scan(v: u32, lane: u32, wid: usize, wsum: *mut u32) -> (u32, u32
 
 /// The bin that holds the `need`-th largest key, counting down from bin
 /// `top`, and how many keys lie in the bins above it. Thread `tid` owns the
-/// `PER` bins `top − PER·tid − j`, counts `c[j]`; they total at least `need
-/// >= 1`. Every thread calls it and gets the same pair.
+/// `PER` bins `top − PER·tid − j`, counts `c[j]`; they total at least
+/// `need >= 1`. Every thread calls it and gets the same pair. This module's
+/// top-k passes and V4.1's indexer (`bloomery_gpu_deepseek41::indexer`) pick
+/// their bins through it.
 ///
 /// # Safety
 /// As [`block_scan`]; `pick` points at two words of this block's shared
@@ -261,7 +263,7 @@ unsafe fn block_scan(v: u32, lane: u32, wid: usize, wsum: *mut u32) -> (u32, u32
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn pick_bin<const PER: usize>(
+pub unsafe fn pick_bin<const PER: usize>(
     c: [u32; PER],
     top: u32,
     need: u32,
@@ -296,8 +298,8 @@ unsafe fn pick_bin<const PER: usize>(
     out
 }
 
-/// The order keys of pools `base + tid + 512·m`, `m < LANE_ROWS`, of one
-/// row's scores at `scores[sbase ..]`; a pool at or past `end` gives 0.
+/// The order keys of entries `base + tid + 512·m`, `m < LANE_ROWS`, of the
+/// scores at `scores[sbase ..]`; an entry at or past `end` gives 0.
 ///
 /// # Safety
 /// `sbase + end <= scores.len()`.
@@ -442,8 +444,9 @@ unsafe fn coarse(
 }
 
 /// One refining pass: count into `fine`, by the bits `(key >> shift) &
-/// 0x7ff`, the keys of the row's `n` pools whose bits above `shift + 11`
-/// equal `prefix`; then this thread's bins.
+/// 0x7ff`, the keys of the `n` scores at `scores[sbase ..]` whose bits above
+/// `shift + 11` equal `prefix`; then this thread's bins. This module's top-k
+/// passes and V4.1's indexer (`bloomery_gpu_deepseek41::indexer`) refine through it.
 ///
 /// # Safety
 /// `fine` points at [`FINE_BINS`] words of this block's shared memory used by
@@ -454,7 +457,7 @@ unsafe fn coarse(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn refine(
+pub unsafe fn refine(
     scores: &[f32],
     sbase: usize,
     n: usize,
