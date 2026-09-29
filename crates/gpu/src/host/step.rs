@@ -638,8 +638,9 @@ pub struct StepPort {
     /// ([`super::swap::Tally`]); off without a residency machine.
     pub(super) tally: super::swap::Tally,
     /// The residency machine's staging window, held open while the pool
-    /// waits for a go; `None` without a machine.
-    pub(super) window: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// waits for a go and closed by the go, which paces the machine's copies
+    /// ([`super::swap::Window::go`]); `None` without a machine.
+    pub(super) window: Option<super::swap::Window>,
     /// Each service's wait for its go, from the host's start of the wait to
     /// the go seen (ns): the card's time between the host's last signal and
     /// this layer's go. A ring of [`GAP_RING`] made at load; `stats.gaps`
@@ -872,7 +873,7 @@ impl StepPort {
         let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
         let gap = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(w) = &self.window {
-            w.store(0, Ordering::Release);
+            w.go();
         }
         self.gaps[(self.stats.gaps % GAP_RING as u64) as usize] = gap;
         self.stats.gaps += 1;

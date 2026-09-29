@@ -896,7 +896,10 @@ pub static RESIDENCY_PASS: Kind = Kind {
           the bytes its flips copy; the host's microseconds folding the pass into the rule and in \
           the whole boundary call, of \
           them waiting for the landing jobs' staging and issuing the new flips' copies, and the staging thread's since the last \
-          boundary copying into the ring and preparing victims.",
+          boundary copying into the ring and preparing victims; the new flips' copies of a pace \
+          chunk or less and of them the ones behind the pace word, the chunks the step port's \
+          goes released since the last boundary, and the ones this boundary released for the \
+          flips it lands, which no go had.",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -912,6 +915,10 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("issue_us", U64, "us"),
         key("stage_us", U64, "us"),
         key("prepare_us", U64, "us"),
+        key("chunks", U64, ""),
+        key("gated", U64, ""),
+        key("ticked", U64, ""),
+        key("forced", U64, ""),
     ],
 };
 
@@ -1600,6 +1607,10 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("issue_us", r.issue_us)
         .u("stage_us", r.stage_us)
         .u("prepare_us", r.prepare_us)
+        .u("chunks", r.chunks)
+        .u("gated", r.gated)
+        .u("ticked", r.ticked)
+        .u("forced", r.forced)
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is

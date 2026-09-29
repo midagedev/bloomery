@@ -1,0 +1,43 @@
+# Round swappace, the sitting: V4.1 decode and prefill on plan (b′) (A6000 + 3090, the separate
+# "A6000+3090" table), the residency on (mid-p40-s1) in both arms, the base tree 7f3eeed2's binary
+# (copies unpaced) against swappace's (paced). No lever: the pacing is the engine's one path (a same-
+# binary arm needs a parsed lever handed from main through the V4.1 cfg into the machine, outside the
+# round's files), and the predicted effect is far outside the ruler, so two builds are admissible.
+# Decode [derived from window A′, docs/cards/swappace.card]: the residency cycle costs 16.2 + 4.3 ms of
+# card-side excess and ~3.4 ms of host legs a 4-step cycle; paced it costs <= 1.5 + 3.4 + 2.7 (the DMA in
+# the host leg): -16 ms a cycle, ~-4 ms a step. At a clean step of 23-28 ms (prose:512 and 4096 deepen
+# attention; the excess per cycle does not depend on depth) that is +13..+17 % decode tok/s; the band
+# is widened to +8..+22 for the prose prompts' routing (flips a cycle may be under the cap 24) and the
+# depth's unmeasured step on bp.
+# Prefill: 0 by the code. generate_ds41's prompt is boundary 1, and the machine plans only at a
+# boundary > 0 that is a multiple of 4 (swap.rs land_and_plan, swaprule.rs plan), so no flip, no job and
+# no copy exists during the prompt in either arm. (In a server's later prompt call the step port makes
+# no go — body/prefill.rs has no enqueue_go — so the window stays closed as the last go left it and a
+# job not due stages nothing, Shared::serve; paced chunks wait for the next go or landing.) pp512
+# and pp4096 of the same arms predict 1.00 ± the ruler; a |Δ| over 1 % is a finding (link layout, or a
+# swap cost in the prompt the code reading missed), not a pacing effect.
+# Wall [derived]: 3 rounds x 2 arms x 2 prompts = 12 bp loads (60-100 s each) + prompts (4096 ids at
+# ~250 tok/s, 16 s) + 96 steps (3 s): 14-22 min, under 30, plus the base tree's build before the lease.
+kind: ab
+question: does pacing the residency machine's copies raise V4.1 decode on plan (b′) with the
+  residency on, and leave prefill unchanged?
+term: decode tok/s @ n=96 after prose:512 and after prose:4096 (the first P ids of corpus-prose.ids),
+  A6000+3090, plan (b′), mid-p40-s1, r8 sidecar — (swappace − base 7f3eeed2) / base, paired by round
+unit: %
+predict: +8..+22
+rounds: 3
+condition: one lease, BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_GEN_PLACE=bp,
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/swappace-sit.card BLOOMERY_RESIDENCY=mid-p40-s1
+  BLOOMERY_STEP_STATS=1' BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512 prose:4096 with the base
+  binary as a second arm at the same prompts (depth-ds41.sh's bin: arm takes a depth only today: it
+  needs bin:<path>:prose:<P>, the lead's runner change, before this runs), the arm order rotated every
+  round; every arm a fresh process; no row [cpu-busy], [other-busy] or [cold]; the witness blocks show
+  no Xid; the paced arm's `residency pass` records show chunks = gated at every planning boundary, the
+  base's gated 0 (its binary prints no such field) and late read in both
+decide-in: land swappace and put the paced residency on bp into the serve default question with this
+  table (decode and pp512/pp4096 rows)
+decide-below: the paced arm keeps a card-side excess: read its stat step gaps by step mod 4 and the
+  forced/ticked records, then the diagnostic arm's next probe (per_go 1, 1 MiB chunks) before any
+  other sitting
+decide-above: the unpaced copies cost more than window A′ showed at these depths: re-derive the
+  cycle's excess from the base arm's stat step lines and re-price the residency's net gain upward

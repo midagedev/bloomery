@@ -34,6 +34,20 @@
 //! ([`SwapSource::prepare_victim`]), then copies the source bytes into the
 //! ring, gated to the host leg's wait window ([`SwapMachine::window`]).
 //!
+//! **Pacing.** A flip's parts cross the stage card's link in chunks of at
+//! most [`PACE_CHUNK`] bytes. Once a step port ticks the window at each go it
+//! sees ([`Window::go`]), each chunk's copy waits on the copy stream for the
+//! pace word, a word of the staging page only the host side raises: every go
+//! releases the next [`Pace::per_go`] chunks, never past the jobs staged so
+//! far, so a chunk crosses in the host leg that follows a go, while the card
+//! waits on the host. The card's own leg — from the host's signal to the next
+//! go — is a chain of round trips to host memory (the back-wait's polls, the
+//! host sum's reads, the go's system barriers), and each of them waits behind
+//! a copy in flight on the same link. A landing boundary releases every chunk
+//! of the flips it lands before it waits for their staging; a reset, a drain
+//! and the drop release every chunk issued. A machine no step port ticks (a
+//! driver of its own) issues its chunks with no pace wait.
+//!
 //! **Boundaries.** [`SwapMachine::boundary`] runs before each pass's launch,
 //! in this order: the jobs of the flips live here are made due, and the host
 //! waits until the staging thread has published each (its victim prepared,
@@ -58,8 +72,11 @@
 //! makes — for a landing job, for a ring slot's last copy, for the copy
 //! stream at a reset or a drop — ends by [`MachineCfg::deadline`] with a
 //! named error; only a job not yet due waits for the window as long as the
-//! window stays closed. A panic on the staging thread is a staging failure
-//! of its job, published like any other.
+//! window stays closed, and a job whose ring slot's last copy waits on the
+//! pace word short of its last chunk waits as long as no go and no release
+//! raises it (no pass runs); its bound starts once that chunk is released.
+//! A panic on the staging thread is a staging failure of its job, published
+//! like any other.
 //!
 //! **Broken.** An error after a call's first change — a boundary's first
 //! engine stream wait, `end_pass`'s first fold into the rule, a reset's first
@@ -84,7 +101,7 @@ use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
 
 use super::slots::{HOST, Slot, SlotMap};
 use crate::GpuError;
-use crate::graph::{MappedHost, cu, mem_batch, op_write};
+use crate::graph::{MappedHost, cu, mem_batch, op_wait_geq, op_write};
 
 /// The residency lever: `off`, or the rule's `mid` parameters with `P`
 /// pinned seed experts a layer and `S` spare slots a layer (`mid-p<P>-s<S>`).
@@ -387,6 +404,64 @@ pub const RING_SLOTS: usize = 4;
 /// Bytes between two words of the staging page: a cache line each.
 const WORD_STRIDE: usize = 64;
 
+/// The pace word's place in the staging page, after each ring slot's staged
+/// and drained words.
+const PACE_WORD: usize = 2 * RING_SLOTS;
+
+/// Words of the staging page.
+const WORDS: usize = PACE_WORD + 1;
+
+/// The most bytes one copy of a flip moves: a part crosses the link in
+/// chunks of at most this. A round trip of the card's leg that meets a copy
+/// in flight waits for it, so the chunk bounds that wait; the chunks' copies
+/// and their pace waits keep a planning boundary's copy stream commands far
+/// under what a stream queues (`gate_swap`'s `queue` clause).
+pub const PACE_CHUNK: usize = 2 << 20;
+
+/// The machine's pacing ([`Window::go`]), one value a machine, derived from
+/// its source's parts and its rule's parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pace {
+    /// Chunks of at most [`PACE_CHUNK`] one job copies: every job is one
+    /// expert, the same parts.
+    pub per_job: u64,
+    /// Chunks each go releases: enough that a planning pass's `cap` flips
+    /// cross in `delay − 1` passes (one when the delay is 1) of one go a
+    /// layer, so the last of them is copied a pass before they go live.
+    pub per_go: u64,
+}
+
+impl Pace {
+    /// The pacing of experts of `parts` bytes, a rule that makes at most
+    /// `cap` flips a planning pass live `delay` passes later, over `layers`
+    /// layers.
+    fn of(parts: &[usize], cap: usize, delay: u64, layers: usize) -> Pace {
+        let per_job: u64 = parts.iter().map(|&b| b.div_ceil(PACE_CHUNK) as u64).sum();
+        let gos = delay.saturating_sub(1).max(1) * (layers.max(1) as u64);
+        Pace {
+            per_job,
+            per_go: (cap as u64 * per_job).div_ceil(gos).max(1),
+        }
+    }
+
+    /// Chunk `i` of job `n` on the pace word: jobs in issue order, each
+    /// job's chunks in copy order, counted from 1 (wrapping).
+    fn chunk(self, n: u64, i: u64) -> u32 {
+        n.wrapping_mul(self.per_job).wrapping_add(i + 1) as u32
+    }
+
+    /// The pace word once every chunk of the jobs before `n` is released.
+    fn through(self, n: u64) -> u32 {
+        n.wrapping_mul(self.per_job) as u32
+    }
+}
+
+/// Serial-number order on the pace word, as the copy stream's wait reads it
+/// (`(i32)(word - value) >= 0` passes): `a` comes strictly before `b`.
+fn before(a: u32, b: u32) -> bool {
+    a != b && b.wrapping_sub(a) < 1 << 31
+}
+
 /// Nanoseconds since `t0`, saturated.
 fn nanos(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -487,6 +562,9 @@ struct Job {
     victim: Option<u32>,
     ring: usize,
     ticket: u32,
+    /// The pace word's number of the last chunk of the slot's previous use,
+    /// when that use's copies wait on the pace word.
+    after: Option<u32>,
 }
 
 /// The staging ring: [`RING_SLOTS`] experts of `slot_bytes`, pinned and
@@ -607,10 +685,17 @@ struct Shared {
     ring: Ring,
     /// Per ring slot: `staged` (the thread's ticket once the slot holds the
     /// expert, or once its failure is recorded) at `2k`, `drained` (the copy
-    /// stream's ticket once it has read the slot) at `2k + 1`.
+    /// stream's ticket once it has read the slot) at `2k + 1`; the pace word
+    /// at [`PACE_WORD`]: every chunk numbered up to it is released.
     words: MappedHost,
     /// The host leg's wait window: staging runs while it is nonzero.
-    window: Arc<AtomicU32>,
+    window: AtomicU32,
+    pace: Pace,
+    /// A step port ticks the window at its goes ([`Window::go`]): the
+    /// copies issued from then on wait on the pace word.
+    paced: AtomicBool,
+    /// Chunks the goes released since a boundary last took them.
+    ticked: AtomicU64,
     /// Jobs below this are due: their flips land at a boundary the host has
     /// reached, so they stage whatever the window says.
     due: AtomicU64,
@@ -635,7 +720,7 @@ impl Shared {
     fn word(&self, i: usize) -> &AtomicU32 {
         self.words
             .atomic_u32(i * WORD_STRIDE)
-            .expect("the staging page holds 2 * RING_SLOTS words")
+            .expect("the staging page holds WORDS words")
     }
 
     fn staged(&self, k: usize) -> &AtomicU32 {
@@ -644,6 +729,51 @@ impl Shared {
 
     fn drained(&self, k: usize) -> &AtomicU32 {
         self.word(2 * k + 1)
+    }
+
+    fn pace_word(&self) -> &AtomicU32 {
+        self.word(PACE_WORD)
+    }
+
+    /// Release every chunk of the jobs before `n`; the chunks this released.
+    fn release_through(&self, n: u64) -> u64 {
+        let target = self.pace.through(n);
+        let w = self.pace_word();
+        let mut cur = w.load(Ordering::Acquire);
+        while before(cur, target) {
+            match w.compare_exchange_weak(cur, target, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return u64::from(target.wrapping_sub(cur)),
+                Err(seen) => cur = seen,
+            }
+        }
+        0
+    }
+
+    /// A go: release the next [`Pace::per_go`] chunks, never past the jobs
+    /// staged so far, so no released chunk waits on its staging and then
+    /// crosses whenever that ends.
+    fn tick(&self) {
+        let limit = self.pace.through(self.served.load(Ordering::Acquire));
+        let step = u32::try_from(self.pace.per_go).unwrap_or(u32::MAX >> 1);
+        let w = self.pace_word();
+        let mut cur = w.load(Ordering::Acquire);
+        loop {
+            let mut next = cur.wrapping_add(step);
+            if before(limit, next) {
+                next = limit;
+            }
+            if !before(cur, next) {
+                return;
+            }
+            match w.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.ticked
+                        .fetch_add(u64::from(next.wrapping_sub(cur)), Ordering::Relaxed);
+                    return;
+                }
+                Err(seen) => cur = seen,
+            }
+        }
     }
 
     /// Wait until `ready`: `Ok(true)` when it is, `Ok(false)` when the
@@ -738,6 +868,15 @@ impl Shared {
         }
         let prev = job.ticket - 1;
         let drained = || self.drained(job.ring).load(Ordering::Acquire) >= prev;
+        // The slot's last copy waits on the pace word until its last chunk
+        // is released: a go, a landing or a drain raises it, none of which a
+        // quiet engine makes, so the bound starts at the release.
+        if let Some(last) = job.after {
+            let released = || drained() || !before(self.pace_word().load(Ordering::Acquire), last);
+            if self.wait_until(released, None) != Ok(true) {
+                return Ok(false);
+            }
+        }
         match self.wait_until(drained, Some(self.deadline)) {
             Ok(true) => {}
             Ok(false) => return Ok(false),
@@ -829,6 +968,48 @@ pub struct PassReport {
     /// bytes into the ring, and preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
+    /// Copies of [`PACE_CHUNK`] or less this boundary's flips issue, and of
+    /// them the ones behind a wait on the pace word.
+    pub chunks: u64,
+    pub gated: u64,
+    /// Chunks the goes released since the last boundary, and the ones this
+    /// boundary released for the flips it lands, which no go had.
+    pub ticked: u64,
+    pub forced: u64,
+}
+
+/// What [`SwapMachine::copy_into`] enqueued.
+#[derive(Clone, Copy, Debug, Default)]
+struct Issued {
+    bytes: u64,
+    chunks: u64,
+    gated: u64,
+}
+
+/// The staging window as the step port holds it ([`SwapMachine::window`]):
+/// the window word, which it derefs to — the staging thread copies while it
+/// is nonzero — and the go that closes it and paces the copies.
+pub struct Window {
+    shared: Arc<Shared>,
+}
+
+impl std::ops::Deref for Window {
+    type Target = AtomicU32;
+
+    fn deref(&self) -> &AtomicU32 {
+        &self.shared.window
+    }
+}
+
+impl Window {
+    /// The step port saw a go: the window closes and the next
+    /// [`Pace::per_go`] chunks are released. The first go makes every later
+    /// copy wait on the pace word.
+    pub fn go(&self) {
+        self.shared.window.store(0, Ordering::Release);
+        self.shared.paced.store(true, Ordering::Release);
+        self.shared.tick();
+    }
 }
 
 /// Why a dropped machine leaked its shared state ([`Leak`]).
@@ -967,6 +1148,9 @@ pub struct SwapMachine {
     free: Vec<usize>,
     /// Jobs issued: job `n` stages through [`ring_ticket`]`(n)`.
     jobs_issued: u64,
+    /// Per ring slot, the pace word's number of its last use's last chunk,
+    /// when that use's copies wait on the pace word.
+    ring_last: [Option<u32>; RING_SLOTS],
     /// The boundary planned last; `None` until the first.
     planned: Option<u64>,
     kept: usize,
@@ -1063,8 +1247,9 @@ impl SwapMachine {
         let boundary_event = ctx.new_event(None)?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
+        let pace = Pace::of(parts, cfg.params.cap, cfg.params.delay, layers.len());
         let Staging { shared, tx, thread } =
-            SwapMachine::start_staging(ctx, source, slot_bytes, &cfg)?;
+            SwapMachine::start_staging(ctx, source, slot_bytes, pace, &cfg)?;
         let mut m = SwapMachine {
             rule,
             ledger,
@@ -1083,6 +1268,7 @@ impl SwapMachine {
             event_job: vec![0; events.len()],
             events,
             jobs_issued: 0,
+            ring_last: [None; RING_SLOTS],
             planned: None,
             end_us: 0,
             kept: 0,
@@ -1185,17 +1371,17 @@ impl SwapMachine {
         ctx: &Arc<CudaContext>,
         source: Arc<dyn SwapSource>,
         slot_bytes: usize,
+        pace: Pace,
         cfg: &MachineCfg,
     ) -> Result<Staging, GpuError> {
         let shared = Arc::new(Shared {
             source,
             ring: Ring::new(ctx, slot_bytes)?,
-            words: MappedHost::new(
-                ctx,
-                2 * RING_SLOTS * WORD_STRIDE,
-                "cuMemHostAlloc (swap words)",
-            )?,
-            window: Arc::new(AtomicU32::new(1)),
+            words: MappedHost::new(ctx, WORDS * WORD_STRIDE, "cuMemHostAlloc (swap words)")?,
+            window: AtomicU32::new(1),
+            pace,
+            paced: AtomicBool::new(false),
+            ticked: AtomicU64::new(0),
             due: AtomicU64::new(0),
             deadline: cfg.deadline,
             flush: AtomicBool::new(false),
@@ -1240,13 +1426,22 @@ impl SwapMachine {
         }
     }
 
-    /// The host leg's wait window word: the staging thread copies while it
+    /// The host leg's wait window: the staging thread copies while its word
     /// is nonzero. The step port holds it open while its pool waits for a
-    /// go, so the staging memcpy does not take DRAM from the host leg; a
-    /// machine nobody gates leaves it at 1.
+    /// go, so the staging memcpy does not take DRAM from the host leg, and
+    /// closes it with [`Window::go`], which paces the copies; a machine
+    /// nobody gates leaves it at 1.
     #[must_use]
-    pub fn window(&self) -> Arc<AtomicU32> {
-        Arc::clone(&self.shared.window)
+    pub fn window(&self) -> Window {
+        Window {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// The machine's pacing.
+    #[must_use]
+    pub fn pace(&self) -> Pace {
+        self.shared.pace
     }
 
     /// The machine's copy stream, for a gate that holds its copies to show
@@ -1536,6 +1731,11 @@ impl SwapMachine {
             }
             self.shared.due.fetch_max(f.job + 1, Ordering::AcqRel);
         }
+        // Before the staging wait: a landing job's ring slot may wait on the
+        // copies of an earlier landing job.
+        if let Some(last) = landing.iter().map(|f| f.job).max() {
+            report.forced = self.shared.release_through(last + 1);
+        }
         let t0 = Instant::now();
         for f in &landing {
             self.wait_staged(f, WHAT)?;
@@ -1556,6 +1756,7 @@ impl SwapMachine {
         self.after_change(changed, &format!("boundary {b}"))?;
         report.stage_us = self.shared.stage_ns.swap(0, Ordering::Relaxed) / 1000;
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
+        report.ticked = self.shared.ticked.swap(0, Ordering::Relaxed);
         self.planned = Some(b);
         report.boundary_us = micros(start);
         Ok(report)
@@ -1661,7 +1862,10 @@ impl SwapMachine {
             let made: Vec<Flip> = self.rule.plan(b).map_err(|e| rule_err(WHAT, e))?.to_vec();
             let t0 = Instant::now();
             for f in &made {
-                report.bytes += self.issue(slots, f)?;
+                let i = self.issue(slots, f)?;
+                report.bytes += i.bytes;
+                report.chunks += i.chunks;
+                report.gated += i.gated;
             }
             report.issue_us = micros(t0);
             report.made = made.len();
@@ -1676,9 +1880,8 @@ impl SwapMachine {
     }
 
     /// Issue flip `f`, made at this boundary, into its layer's lowest spare
-    /// slot, with an event for its landing ([`SwapMachine::copy_into`]). The
-    /// bytes it copies.
-    fn issue(&mut self, slots: &SlotMap, f: &Flip) -> Result<u64, GpuError> {
+    /// slot, with an event for its landing ([`SwapMachine::copy_into`]).
+    fn issue(&mut self, slots: &SlotMap, f: &Flip) -> Result<Issued, GpuError> {
         const WHAT: &str = "SwapMachine::issue";
         let l = f.layer_of(self.layers.start);
         let spare = self.ledger.spare(l).ok_or_else(|| {
@@ -1689,22 +1892,24 @@ impl SwapMachine {
             .pop()
             .ok_or_else(|| GpuError::protocol(WHAT, "more flips in flight than spares"))?;
         self.event_job[event] = self.jobs_issued;
-        let bytes = self.copy_into(slots, l, f.admit, spare, Some(f.evict))?;
+        let issued = self.copy_into(slots, l, f.admit, spare, Some(f.evict))?;
         self.events[event].record(&self.copy)?;
         self.ledger.row_mut(l)[spare as usize] = SlotState::Filling {
             e: f.admit,
             live_at: f.live_at,
             event,
         };
-        Ok(bytes)
+        Ok(issued)
     }
 
     /// Hand the staging thread layer `l`'s expert `id` as a job (preparing
     /// `victim` first), then enqueue on the copy stream, behind this
     /// boundary's event and the job's staging word, its copy into free slot
-    /// `spare` of each stack.
+    /// `spare` of each stack, part after part in chunks of at most
+    /// [`PACE_CHUNK`], each behind its number on the pace word once a step
+    /// port paces the copies and no flush is on. A job whose chunks do not
+    /// wait is released on the pace word as it is issued.
     /// Every stack's destination is resolved before anything is enqueued.
-    /// The bytes it copies.
     fn copy_into(
         &mut self,
         slots: &SlotMap,
@@ -1712,7 +1917,7 @@ impl SwapMachine {
         id: u32,
         spare: u32,
         victim: Option<u32>,
-    ) -> Result<u64, GpuError> {
+    ) -> Result<Issued, GpuError> {
         const WHAT: &str = "SwapMachine::copy_into";
         if slots.slot(l, id) != Some(Slot::Host) {
             return Err(GpuError::protocol(
@@ -1748,6 +1953,9 @@ impl SwapMachine {
             .collect::<Result<Vec<_>, _>>()?;
         let n = self.jobs_issued;
         let (ring, ticket) = ring_ticket(n)?;
+        let pace = self.shared.pace;
+        let gated =
+            self.shared.paced.load(Ordering::Acquire) && !self.shared.flush.load(Ordering::Acquire);
         let job = Job {
             n,
             layer: l,
@@ -1755,9 +1963,11 @@ impl SwapMachine {
             victim,
             ring,
             ticket,
+            after: self.ring_last[ring],
         };
         let d = dispatch::send(self.tx.as_ref(), job, WHAT)?;
         self.jobs_issued += 1;
+        self.ring_last[ring] = gated.then(|| pace.chunk(n, pace.per_job - 1));
         let copy = Arc::clone(&self.copy);
         if !self.copy_waits_boundary {
             copy.wait(&self.boundary_event)?;
@@ -1765,11 +1975,30 @@ impl SwapMachine {
         }
         dispatch::wait_staged(&copy, &self.shared.words, &d)?;
         let drained = self.shared.words.dev_at((2 * d.ring() + 1) * WORD_STRIDE);
+        let pace_word = self.shared.words.dev_at(PACE_WORD * WORD_STRIDE);
         let mut at = 0usize;
+        let mut chunks = 0u64;
         for (part, (&len, &dst)) in parts.iter().zip(&dsts).enumerate() {
-            self.shared
-                .ring
-                .copy_to_device(d.ring(), at, len, dst, &copy)?;
+            let mut off = 0usize;
+            while off < len {
+                let piece = (len - off).min(PACE_CHUNK);
+                if gated {
+                    mem_batch(
+                        &copy,
+                        &mut [op_wait_geq(pace_word, pace.chunk(n, chunks))],
+                        "swap: wait for the pace",
+                    )?;
+                }
+                self.shared.ring.copy_to_device(
+                    d.ring(),
+                    at + off,
+                    piece,
+                    dst + off as u64,
+                    &copy,
+                )?;
+                off += piece;
+                chunks += 1;
+            }
             source.convert(l, part, dst, &copy)?;
             at += len;
         }
@@ -1778,7 +2007,23 @@ impl SwapMachine {
             &mut [op_write(drained, d.ticket())],
             "swap: ring drained",
         )?;
-        Ok(at as u64)
+        if chunks != pace.per_job {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {l} expert {id}: {chunks} chunks copied, the pace counts {} a job",
+                    pace.per_job
+                ),
+            ));
+        }
+        if !gated {
+            self.shared.release_through(n + 1);
+        }
+        Ok(Issued {
+            bytes: at as u64,
+            chunks,
+            gated: if gated { chunks } else { 0 },
+        })
     }
 
     /// Layer `layer`'s host map, ledger and rule agree, else refused by name:
@@ -1985,10 +2230,11 @@ impl SwapMachine {
         Ok(report)
     }
 
-    /// Stage every queued job whatever the window says and wait, within the
-    /// deadline, for the copy stream to drain; past it the refusal of
+    /// Release every chunk issued, stage every queued job whatever the window
+    /// says and wait, within the deadline, for the copy stream to drain; past it the refusal of
     /// `what` names the wait. The flush is as it was after.
     fn drain_copies(&self, what: &'static str) -> Result<(), GpuError> {
+        self.shared.release_through(self.jobs_issued);
         let was = self.shared.flush.swap(true, Ordering::AcqRel);
         let r = poll_drained(&self.copy, self.shared.deadline).map_err(|e| match e {
             Drain::Driver(e) => e,
@@ -2042,8 +2288,10 @@ impl Drop for SwapMachine {
                 joined = false;
             }
         }
-        // A copy still waiting for a ticket the thread never published is let
-        // through, so the stream can drain before the ring is freed.
+        // A copy still waiting for a ticket the thread never published, or
+        // for its chunk on the pace word, is let through, so the stream can
+        // drain before the ring is freed.
+        self.shared.release_through(self.jobs_issued);
         let released = self.release_staging_waits().is_ok();
         // The copy stream waits on no host word now, only on boundary events
         // of the engine stream. Past the deadline (an engine stream held by
@@ -2067,7 +2315,7 @@ impl Drop for SwapMachine {
             let leak = Leak {
                 reason,
                 ring_bytes: (RING_SLOTS * self.shared.ring.slot_bytes) as u64,
-                words_bytes: (2 * RING_SLOTS * WORD_STRIDE) as u64,
+                words_bytes: (WORDS * WORD_STRIDE) as u64,
             };
             match LEAK_SINK.get() {
                 Some(sink) => sink(&leak),
@@ -2113,7 +2361,7 @@ fn not_resident(what: &'static str, layer: usize, id: u32, which: &str) -> GpuEr
 
 #[cfg(test)]
 mod tests {
-    use super::{RESIDENCY, Residency, Tally};
+    use super::{PACE_CHUNK, Pace, RESIDENCY, Residency, Tally, before};
 
     /// The lever registry's words for [`RESIDENCY`], from its table
     /// (`bloomery_levers::markdown`): the one list of the values a binary
@@ -2180,5 +2428,22 @@ mod tests {
         t.clear();
         t.note(2, 0, 1, 8)
             .expect("a cleared tally takes the slot again");
+    }
+
+    /// A job's chunks are its parts' chunks of at most [`PACE_CHUNK`], and a
+    /// go releases enough that a planning pass's cap crosses in `delay − 1`
+    /// passes of one go a layer; chunk numbers run on across jobs from 1 and
+    /// compare as the copy stream's wait does, across the wrap.
+    #[test]
+    fn pace_counts_chunks_by_part_and_go() {
+        let engine = Pace::of(&[5_068_800, 5_068_800, 6_635_520], 24, 4, 40);
+        assert_eq!((engine.per_job, engine.per_go), (10, 2));
+        let small = Pace::of(&[1024, 1024, 1536], 6, 3, 4);
+        assert_eq!((small.per_job, small.per_go), (3, 3));
+        let whole = Pace::of(&[PACE_CHUNK, PACE_CHUNK + 4], 1, 1, 1);
+        assert_eq!((whole.per_job, whole.per_go), (3, 3));
+        assert_eq!((engine.chunk(0, 0), engine.chunk(2, 9)), (1, 30));
+        assert_eq!(engine.through(3), 30);
+        assert!(before(u32::MAX, 0) && !before(0, u32::MAX) && !before(7, 7));
     }
 }

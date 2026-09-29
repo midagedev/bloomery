@@ -1,0 +1,40 @@
+# Round swappace: the residency machine's copies paced by the step port's goes (host/swap.rs, Pacing).
+# Window A′ (resv41, 2026-09-29, arm 1 steps 20-95 by step mod 4, --place bp, mid-p40-s1, prose:64): a
+# planning boundary (every 4 passes, cap 24) issues 24 flips of 16,773,120 B; each copy follows its
+# staging (stage_us 28 + 12 ms a cycle, 1.67 ms a job) at the link's 26.28 GB/s (facts.md, pinned H2D,
+# A6000), so the mod-0 step carries ~17 bursts of 193/193/252 µs [derived]. The card's leg of each
+# layer (host signal -> next go) is a chain of round trips to host memory: step.rs:456 (the back-wait's
+# poll and its op_add), ffn.rs:1642 (the post reads the host sum), step.rs:434,436 (two system
+# barriers) and the gen add; tier layers add tier.rs:797-805 and 823-827 [counted from code]: 5-6 a plain
+# layer. Mod 0's gap_p50 607 vs 188 µs is +415 µs a layer, 70-85 µs a trip [derived] — more than a
+# tag-window queue (~15 µs) and about a residual of a whole part's copy, so a trip waits behind a copy
+# in flight. Paced: every part in chunks of 2 MiB (10 a job), each behind the pace word; every go
+# releases 2 chunks (24 x 10 / (3 passes x 40 gos)), capped at the jobs staged, so each crosses in the
+# host leg after a go (160 µs of a 328 µs leg [derived]) and none in the card's leg. Residual [derived]:
+# the DMA moves into the DRAM-bound host leg (111 host slots x 16.77 MB in 13.1 ms ~ 143 of 147.7
+# GB/s), <= 402.5 MB / 147.7 GB/s = 2.7 ms a cycle over all four mods; the staging memcpy is unchanged.
+# Prediction on the diagnostic arm: mod-0 card-side excess 16.2 -> 0..2 ms, mod-1 4.3 -> ~0; gap_p50
+# every mod 185-230 µs; per planning boundary chunks = gated = 240; forced 0 at every landing, hence
+# late 0 (a flip whose chunks a landing still releases is late too): 240 chunks at 2 a go take 120 of
+# the 160 gos before the landing, plus the ~3-6 goes whose ticks the staged cap drops while the first
+# job stages (a dropped tick is not carried) — ~34 gos of slack [derived].
+# Wall: tools/ref/swappace-diag.sh, one build (~2 min) and one gpu-gate.sh run of two bp loads (~3 min),
+# no lease (a gate-lock run like A′, not a timed number); this card is its written prediction.
+kind: profile
+question: does pacing the swap copies into the host leg remove the mod-0 card-side excess of the
+  residency cycle?
+term: mod-0 card-side excess ms @ --place bp, residency mid-p40-s1, prose:64, A6000 — per-step mean over
+  steps 20-95 of arm 1 of (step − leg) at step mod 4 = 0, less the same at mod 3
+unit: ms
+predict: 0..2 ms
+condition: tools/ref/swappace-diag.sh on this tree, both cards under gpu-gate.sh's two gate locks and
+  the V4.1 load lock, the witness lines before and after the run show no compute process of another
+  round and no build on the box; arm 1's `residency pass` records show made 24 at every planning
+  boundary with chunks = gated = 240 and ticked > 0, and its late counts are read
+decide-in: land swappace (the paced copies are the one path) and run the sitting card
+  docs/cards/swappace-sit.card for the table
+decide-below: a negative excess means mod 3 is not clean; re-read the per-step legs and gaps by mod
+  before any other run
+decide-above: split by the records: gap_p50 at mod 0 still far above 190 µs with forced near 0 means
+  released chunks still cross in the card's leg — probe per_go 1 and 1 MiB chunks next; forced near
+  240 or late > 0 means the goes do not release them (staging lags) — read stage_us and the ticks

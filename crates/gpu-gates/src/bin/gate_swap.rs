@@ -106,6 +106,12 @@
 //!   last (the light arm's refusal, then with the bound removed the heavy
 //!   arm's block). A watchdog thread names a clause past the bound, then
 //!   ends the process.
+//! - pace: a run whose window a ticker thread drives as the step port does —
+//!   open, then a go ([`bloomery_gpu::host::swap::Window::go`]) — gives the
+//!   prompt run's values and flips; every boundary that makes flips issues
+//!   `made × per_job` chunks, each behind the pace word, and the goes release
+//!   some of them before their landing (its mutant: the copies issued with no
+//!   pace wait).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -2136,6 +2142,7 @@ mod gate {
         ok &= refusal(&gpu, &pm, &trace)?;
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= placement(&gpu, &pm)?;
+        ok &= pace_clause(&gpu, &pm, &trace, &a)?;
         let light = queue(&gpu, &pm, &trace, &a, LIGHT)?;
         ok &= light;
         if light {
@@ -2171,5 +2178,72 @@ mod gate {
         } else {
             Err(checks_failed())
         }
+    }
+
+    /// How long the pace arm's ticker holds the window open, then closed
+    /// after its go: a pass here takes longer, so goes fall inside every pass.
+    const TICK: Duration = Duration::from_micros(200);
+
+    /// pace: `a`'s trace again with the window driven by a ticker thread as
+    /// the step port drives it, the copies paced from the first boundary.
+    fn pace_clause(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        let m = r.machine.as_ref().ok_or("gate_swap: no machine")?;
+        let pace = m.pace();
+        m.window().go();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (window, stopped) = (m.window(), Arc::clone(&stop));
+        let (ticker, _) = threads::helper::spawn_helper(
+            "pace-ticker",
+            threads::helper::Placement::Float,
+            move || {
+                while !stopped.load(Ordering::Acquire) {
+                    window.store(1, Ordering::Release);
+                    std::thread::sleep(TICK);
+                    window.go();
+                    std::thread::sleep(TICK);
+                }
+            },
+        )
+        .map_err(|e| format!("gate_swap: the pace arm's ticker: {e}"))?;
+        let driven = drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None);
+        stop.store(true, Ordering::Release);
+        ticker
+            .join()
+            .map_err(|_| "gate_swap: the pace arm's ticker panicked")?;
+        driven?;
+        let planning: Vec<&PassReport> = r.reports.iter().filter(|p| p.made > 0).collect();
+        let shaped = planning
+            .iter()
+            .all(|p| p.chunks == p.made as u64 * pace.per_job && p.gated == p.chunks);
+        let (chunks, gated, ticked, forced) = r.reports.iter().fold((0, 0, 0, 0), |t, p| {
+            (
+                t.0 + p.chunks,
+                t.1 + p.gated,
+                t.2 + p.ticked,
+                t.3 + p.forced,
+            )
+        });
+        let same = r.err.is_none()
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values);
+        let ok = same && !planning.is_empty() && shaped && ticked > 0;
+        println!(
+            "pace: {} planning boundaries, {chunks} chunks ({} a job, {} a go), {gated} behind the \
+             pace word, {ticked} released by goes, {forced} by landings; values and flips = the \
+             prompt run's {same}, error {}: {}",
+            planning.len(),
+            pace.per_job,
+            pace.per_go,
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 }
