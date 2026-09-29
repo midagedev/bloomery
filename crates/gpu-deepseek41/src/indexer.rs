@@ -22,14 +22,16 @@
 //!   in the xor butterfly over lanes 4, 8, 16. Block `(t, 0)` also writes the
 //!   query (after the transform, before the split) and the scaled weights.
 //!   The score of every row below `n_vis` lands in the scores buffer, and
-//!   the top ten bits of its order-preserving key ([`order_key`]) are counted
-//!   in the token's histogram.
+//!   the top ten bits of its order-preserving key
+//!   ([`bloomery_gpu::qsa::order_key`]) are counted in the token's histogram.
 //! - `ds41_indexer_topk` — one block per token: the histogram (returned to
 //!   zero as it is read) picks the bin of the k-th key, two more passes over
-//!   the scores refine it by eleven bits each to the exact k-th key `T`, and
-//!   an ordered pass writes every row whose key is above `T`, then the first
-//!   rows equal to `T` in row order until `k` rows are taken — ascending
-//!   rows, ties at the threshold going to the lower row.
+//!   the scores refine it by eleven bits each to the exact k-th key `T` —
+//!   `bloomery_gpu::qsa`'s radix select (`pick_bin`, `refine`), shared with
+//!   the token-pool selectors — and an ordered pass writes every row whose
+//!   key is above `T`, then the first rows equal to `T` in row order until
+//!   `k` rows are taken — ascending rows, ties at the threshold going to the
+//!   lower row.
 //!
 //! The counts are device words, read per launch: token `t`'s `n_vis` at
 //! `ints[n_vis_at + t]` and `top_k` at `ints[top_k_at]`, so a captured step
@@ -44,6 +46,7 @@
 //! zeroes what it reads. Both passes of a step must therefore run, in order,
 //! on one stream.
 
+use bloomery_gpu::qsa::{order_key, pick_bin, refine};
 use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32, DeviceAtomicU32};
@@ -99,8 +102,6 @@ const TOPK_THREADS: u32 = 512;
 const TOPK_WARPS: usize = TOPK_THREADS as usize / 32;
 /// Rows one top-k thread reads per batch: sixteen loads in flight.
 const LANE_ROWS: usize = 16;
-/// Rows the block reads per batch of a refining pass, `tid + 512·m`.
-const ROUND_ROWS: usize = TOPK_THREADS as usize * LANE_ROWS;
 /// Bins of the two refining passes: eleven bits each.
 const FINE_BINS: usize = 2048;
 /// Bins a top-k thread owns in the coarse and the fine histograms.
@@ -119,113 +120,10 @@ pub fn weights_scale(n_head: usize, head_dim: usize) -> f32 {
 
 // ------------------------------------------------------------------ cores
 
-/// The order-preserving key of a score: an unsigned integer that orders as
-/// the score does, `-0.0` first made `+0.0` so the two tie.
-#[inline(always)]
-#[must_use]
-pub fn order_key(v: f32) -> u32 {
-    let b = v.to_bits();
-    let b = if b == 0x8000_0000 { 0 } else { b };
-    if b & 0x8000_0000 != 0 {
-        !b
-    } else {
-        b | 0x8000_0000
-    }
-}
-
 /// `x` where it is above zero, `+0` elsewhere (NaN included).
 #[inline(always)]
 fn relu(x: f32) -> f32 {
     if x > 0.0 { x } else { 0.0 }
-}
-
-/// A block-wide exclusive prefix sum of `v` over thread order in a
-/// [`TOPK_THREADS`] block, and the block's total. `wsum` is block-shared
-/// scratch of [`TOPK_WARPS`] words. Every thread of the block calls it (it
-/// holds two barriers).
-///
-/// # Safety
-/// `wsum` points at [`TOPK_WARPS`] words of this block's shared memory that
-/// nothing else uses across the call.
-#[inline(always)]
-unsafe fn block_scan(v: u32, lane: u32, wid: usize, wsum: *mut u32) -> (u32, u32) {
-    let mut x = v;
-    let mut off = 1u32;
-    while off < 32 {
-        let y = warp::shuffle_up(x, off);
-        if lane >= off {
-            x += y;
-        }
-        off <<= 1;
-    }
-    if lane == 31 {
-        // SAFETY: wid < TOPK_WARPS words of `wsum` (this fn's contract);
-        // lane 31 of warp wid is the slot's only writer.
-        unsafe { *wsum.add(wid) = x };
-    }
-    thread::sync_threads();
-    let (mut before, mut total) = (0u32, 0u32);
-    let mut w = 0usize;
-    while w < TOPK_WARPS {
-        // SAFETY: w < TOPK_WARPS; the barrier above published every slot.
-        let s = unsafe { *wsum.add(w) };
-        if w < wid {
-            before += s;
-        }
-        total += s;
-        w += 1;
-    }
-    thread::sync_threads();
-    (before + x - v, total)
-}
-
-/// The bin that holds the `need`-th largest key, counting down from the top
-/// bin, and how many keys lie in the bins above it. Thread `tid` owns the
-/// `PER` bins `top − PER·tid − j`, `j = 0 .. PER`, with counts `c[j]`. The
-/// counts must total at least `need >= 1`. Every thread of the block calls
-/// it and gets the same pair.
-///
-/// # Safety
-/// As [`block_scan`]; `pick` points at two words of this block's shared
-/// memory that nothing else uses across the call.
-#[inline(always)]
-unsafe fn pick_bin<const PER: usize>(
-    c: [u32; PER],
-    top: u32,
-    need: u32,
-    lane: u32,
-    tid: usize,
-    wsum: *mut u32,
-    pick: *mut u32,
-) -> (u32, u32) {
-    let mut sum = 0u32;
-    let mut j = 0usize;
-    while j < PER {
-        thread::__unroll_config::<0>();
-        sum += c[j];
-        j += 1;
-    }
-    // SAFETY: forwarded from this fn's contract.
-    let (mut before, _) = unsafe { block_scan(sum, lane, tid / 32, wsum) };
-    let mut j = 0usize;
-    while j < PER {
-        thread::__unroll_config::<0>();
-        if before < need && need <= before + c[j] {
-            // SAFETY: two words of `pick` (this fn's contract); exactly one
-            // (thread, bin) holds the need-th key, so one thread writes.
-            unsafe {
-                *pick = top - (PER * tid + j) as u32;
-                *pick.add(1) = before;
-            }
-        }
-        before += c[j];
-        j += 1;
-    }
-    thread::sync_threads();
-    // SAFETY: written before the barrier above.
-    let out = unsafe { (*pick, *pick.add(1)) };
-    thread::sync_threads();
-    out
 }
 
 // ---------------------------------------------------------------- kernels
@@ -671,42 +569,9 @@ mod indexer_kernels {
         let need2 = need - above1;
 
         // ---- the next eleven bits, among the keys in bin b1.
-        // SAFETY: FINE is used by this pass alone until the next barrier pair.
-        unsafe { fine_count(fine, tid) };
-        let mut base = 0usize;
-        while base < n {
-            let mut kk = [0u32; LANE_ROWS];
-            let mut m = 0usize;
-            while m < LANE_ROWS {
-                thread::__unroll_config::<0>();
-                let i = base + tid + TOPK_THREADS as usize * m;
-                if i < n {
-                    // SAFETY: i < n <= rows: sbase + i < tokens·rows <=
-                    // scores.len() (launch contract); the score pass wrote
-                    // it and is ordered before this launch.
-                    kk[m] = order_key(unsafe { *scores.get_unchecked(sbase + i) });
-                }
-                m += 1;
-            }
-            let mut m = 0usize;
-            while m < LANE_ROWS {
-                thread::__unroll_config::<0>();
-                let i = base + tid + TOPK_THREADS as usize * m;
-                if i < n && kk[m] >> 22 == b1 {
-                    // SAFETY: the bin is below FINE_BINS; every access to
-                    // FINE between the barriers is atomic.
-                    unsafe {
-                        BlockAtomicU32::from_ptr(fine.add(((kk[m] >> 11) & 0x7ff) as usize))
-                            .fetch_add(1, AtomicOrdering::Relaxed)
-                    };
-                }
-                m += 1;
-            }
-            base += ROUND_ROWS;
-        }
-        thread::sync_threads();
-        // SAFETY: FINE was published by the barrier above.
-        let fc = unsafe { fine_bins(fine, tid) };
+        // SAFETY: sbase + n <= scores.len() (n <= rows, the launch
+        // contract); FINE is this pass's alone across the call.
+        let fc = unsafe { refine(scores, sbase, n, b1, 11, fine, tid) };
         // SAFETY: WSUM and PICK are used by nothing else across the call.
         let (b2, above2) =
             unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick) };
@@ -714,44 +579,8 @@ mod indexer_kernels {
         let prefix = (b1 << 11) | b2;
 
         // ---- the last eleven bits, among the keys with that prefix.
-        // SAFETY: `fine` is FINE, FINE_BINS words of this block's shared
-        // memory; every thread reaches this call, and FINE is used by this
-        // pass alone until the next barrier pair.
-        unsafe { fine_count(fine, tid) };
-        let mut base = 0usize;
-        while base < n {
-            let mut kk = [0u32; LANE_ROWS];
-            let mut m = 0usize;
-            while m < LANE_ROWS {
-                thread::__unroll_config::<0>();
-                let i = base + tid + TOPK_THREADS as usize * m;
-                if i < n {
-                    // SAFETY: i < n <= rows: sbase + i < tokens·rows <=
-                    // scores.len() (launch contract); the score pass wrote
-                    // it and is ordered before this launch.
-                    kk[m] = order_key(unsafe { *scores.get_unchecked(sbase + i) });
-                }
-                m += 1;
-            }
-            let mut m = 0usize;
-            while m < LANE_ROWS {
-                thread::__unroll_config::<0>();
-                let i = base + tid + TOPK_THREADS as usize * m;
-                if i < n && kk[m] >> 11 == prefix {
-                    // SAFETY: the bin `kk & 0x7ff` is below FINE_BINS; every
-                    // access to FINE between the barriers is atomic.
-                    unsafe {
-                        BlockAtomicU32::from_ptr(fine.add((kk[m] & 0x7ff) as usize))
-                            .fetch_add(1, AtomicOrdering::Relaxed)
-                    };
-                }
-                m += 1;
-            }
-            base += ROUND_ROWS;
-        }
-        thread::sync_threads();
-        // SAFETY: FINE was published by the barrier above.
-        let fc = unsafe { fine_bins(fine, tid) };
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, prefix, 0, fine, tid) };
         // SAFETY: WSUM and PICK are used by nothing else across the call.
         let (b3, above3) =
             unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick) };
@@ -865,43 +694,6 @@ unsafe fn lane_keys(
         m += 1;
     }
     kk
-}
-
-/// Zero the fine histogram and publish it.
-///
-/// # Safety
-/// `fine` points at [`FINE_BINS`] words of this block's shared memory; every
-/// thread of the block calls it.
-#[inline(always)]
-unsafe fn fine_count(fine: *mut u32, tid: usize) {
-    let mut j = 0usize;
-    while j < FINE_PER {
-        thread::__unroll_config::<0>();
-        // SAFETY: FINE_PER·tid + j < FINE_BINS (this fn's contract); thread
-        // tid alone writes these bins before the barrier.
-        unsafe { *fine.add(FINE_PER * tid + j) = 0 };
-        j += 1;
-    }
-    thread::sync_threads();
-}
-
-/// This thread's [`FINE_PER`] bins of the fine histogram, from the top bin
-/// down: bins `FINE_BINS − 1 − (FINE_PER·tid + j)`.
-///
-/// # Safety
-/// `fine` points at [`FINE_BINS`] published words of this block's shared
-/// memory.
-#[inline(always)]
-unsafe fn fine_bins(fine: *const u32, tid: usize) -> [u32; FINE_PER] {
-    let mut c = [0u32; FINE_PER];
-    let mut j = 0usize;
-    while j < FINE_PER {
-        thread::__unroll_config::<0>();
-        // SAFETY: the index is below FINE_BINS (this fn's contract).
-        c[j] = unsafe { *fine.add(FINE_BINS - 1 - (FINE_PER * tid + j)) };
-        j += 1;
-    }
-    c
 }
 
 // -------------------------------------------------------------- launchers
@@ -1146,34 +938,11 @@ impl IndexerKernels {
 
 #[cfg(test)]
 mod tests {
-    use super::{order_key, weights_scale};
+    use super::weights_scale;
 
     /// The weights' scale for the file's indexer is exactly 2⁻⁶.
     #[test]
     fn weights_scale_is_a_power_of_two() {
         assert_eq!(weights_scale(32, 128).to_bits(), (1.0f32 / 64.0).to_bits());
-    }
-
-    /// Keys order as the scores do, and the two zeros tie.
-    #[test]
-    fn order_key_orders() {
-        let v = [
-            f32::NEG_INFINITY,
-            -3.5,
-            -1e-30,
-            -0.0,
-            0.0,
-            1e-30,
-            2.0,
-            f32::INFINITY,
-        ];
-        for p in v.windows(2) {
-            let (a, b) = (order_key(p[0]), order_key(p[1]));
-            if p[0] == p[1] {
-                assert_eq!(a, b);
-            } else {
-                assert!(a < b, "{} {}", p[0], p[1]);
-            }
-        }
     }
 }
