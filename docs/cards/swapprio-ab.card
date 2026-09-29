@@ -8,17 +8,17 @@ kind: ab
 question: does the swapprio tree (group unpack, copy stream behind the engine) raise residency decode by the
   hold's share of the heavy steps?
 term: decode tok/s @ -n 96 after prose:512, BLOOMERY_RESIDENCY=mid-p40-s1, plan (b′) A6000+3090 (the 3090 at its
-  250 W cap) - (swapprio - main) / main, the two binaries paired by round
+  250 W cap) - (v41res - base) / base, base = main + r3fix, the two binaries paired by round
 unit: %
 predict: +8..+17
 rounds: 3
 sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round ratios, one run's SD about 0.55 and 1.1 %; the
   larger
-condition: from /Users/hckim/repo/bloomery-v41res (swapprio + unpacksimt + r3fix's stop-first teardown), the base binary built in ~/repo/bloomery-prio-base (main
-  da3eba79): BLOOMERY_REMOTE='~/repo/bloomery-v41res' BLOOMERY_AB_ROUNDS=3 BLOOMERY_DECODE_N=96
+condition: from /Users/hckim/repo/bloomery-v41res (swapprio + unpacksimt + r3fix's stop-first teardown), the base binary built in ~/repo/bloomery-v41res-base (main
+  178b06d1 + r3fix, the unpack as on main): BLOOMERY_REMOTE='~/repo/bloomery-v41res' BLOOMERY_AB_ROUNDS=3 BLOOMERY_DECODE_N=96
   BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_RESIDENCY=mid-p40-s1
   BLOOMERY_STEP_STATS=1 BLOOMERY_LEASE_CARD=docs/cards/swapprio-ab.card' just depth-gpu-ds41 prose:512
-  bin:/root/repo/bloomery-prio-base/target/release/generate_ds41:prose:512; the witness blocks show no Xid; no
+  bin:/root/repo/bloomery-v41res-base/target/release/generate_ds41:prose:512; the witness blocks show no Xid; no
   row carries [cold], [cpu-busy] or [other-busy]. Box time 12..18 min [derived: 2 two-card loads a round at
   60..110 s, 3 rounds]
 decide-in: land swapprio with unpacksimt; the residency's remaining cost is its DRAM share - re-derive it
