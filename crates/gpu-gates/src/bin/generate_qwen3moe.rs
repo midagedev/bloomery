@@ -47,8 +47,7 @@
 //! pass of one id a step. Its `load` line names `ubatch=`; its `stat prompt`
 //! line's `ubatch_tokens=` counts the ubatches' ids, and its `image_bytes=`
 //! is the whole prompt's image, which the passes after them read too.
-//! `--prompt` is refused by the tokenizer (its pre-tokenizer `qwen35` is not
-//! one the crate runs).
+//! `--prompt` is tokenized with the file's pre-tokenizer (`qwen35`).
 //!
 //! A qwen4exp file runs through `Body38`, placed by its own plan
 //! (`model::arch::qwen35moe::place`: every layer, the head and the embedding
@@ -59,9 +58,9 @@
 //! load's size through the host tier's batch port at their width, the Q8_0
 //! projections on q8 activations), `pass` (eager passes of up to eight
 //! positions through the same port) or `step` (one captured step a
-//! position); `--seed-depth` is refused by name (no synthetic depth), and so
-//! is `--prompt` (the tokenizer, as for qwen35moe). Its `load` line names
-//! `store_bytes=`, `prefill=`, `ubatch=` and `place=`; in graph mode its
+//! position); `--seed-depth` is refused by name (no synthetic depth). Its
+//! `load` line names `store_bytes=`, `prefill=`, `ubatch=` and `place=`; in
+//! graph mode its
 //! `capture` line counts the step graph's nodes by kind against the
 //! program's count, and a mismatch ends the run by name. Its plan prints as
 //! `step:1x<P>`, `pass:<sizes>` or `ubatch:<sizes>`, and `time prompt`'s
