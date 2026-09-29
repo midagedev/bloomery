@@ -137,6 +137,16 @@
 #   res-leak     the off arm 6 prints residency pass records: FAIL rc=residency naming the leak; rc 1.
 #   res-noprofile  a profile without RESIDENCY_RESET_DROPPED_BYTES: refused by name before anything runs, rc 64.
 #   res-dry      the dry run names the residency arms and the reset bytes, rc 0.
+# Under STUB_RES_UNSET=place the stub resolves an unset lever as generate_ds41 does (red on the runner
+# before it, which read the lever from the arm's environment, unset as off):
+#   res-default  6 6@BLOOMERY_RESIDENCY=off 4, one round: the unset arms are one load whose residency host
+#                record is in its load lines, not in either arm's output; both are residency rows with their
+#                curve lines (slot 2 with the reset), the explicit off arm is an off row with no curve, and
+#                the [config] line names the arm that sets the lever; rc 0.
+#   res-gate     BLOOMERY_GEN_PLACE=gate, 6: the unset lever resolves to off (residency lever why=fixed_place,
+#                no residency host), an off row with no curve line; rc 0.
+#   res-mismatch 6@BLOOMERY_RESIDENCY=off on a binary that runs the residency anyway (STUB_RES_IGNORE_SET):
+#                FAIL rc=residency naming the value the arm sets and the word the record names; rc 1.
 # The bin: arms on a corpus, a base binary (the stub generate_ds41 in a tree named base; red on the runner
 # before them, which takes no @ list on a bin: arm — each case has one — and refuses it as arm usage, rc 64):
 #   bin-prose    prose:4 bin:<base>:prose:4 bin:<base>:prose:4@BLOOMERY_AB_LOAD=arm 4, one round: the base's
@@ -287,7 +297,10 @@ touch "$T/Cargo.toml"
 # STUB_GEN_PLACE in its SMOKE footer when set. Under --place bp, or with STUB_GEN_CARDS, its load line
 # names the cards (`cards=`, both under bp unless STUB_GEN_CARDS says otherwise). Under --arm it runs the list after one `load` line, each
 # arm opening with its `arm` record and, under --arm-sync, waiting for a line on stdin; every process
-# appends a line to $TMPDIR/stub-gen-loads. Under BLOOMERY_RESIDENCY (not off) it prints `residency host`
+# appends a line to $TMPDIR/stub-gen-loads. BLOOMERY_RESIDENCY unset is off, as in a binary from before the
+# placement default (a bin: base); under STUB_RES_UNSET=place it resolves as generate_ds41 does — mid-p40-s1
+# under --place a and bp, off under gate, beside BLOOMERY_CHECK_FINITE=1 and beside BLOOMERY_PREFILL=steps —
+# and prints the `residency lever` record. Under a residency (not off) it prints `residency host`
 # with its load, a `residency reset` (diff STUB_RES_DIFF and dropped_bytes STUB_RES_DROP, 0 by default)
 # before every arm past the first
 # unless STUB_RES_NORESET is set, and after each arm's SMOKE line one `residency pass` per generated token,
@@ -317,7 +330,21 @@ if [ -n "$cards" ]; then
 else
   echo "load place=$place arms=${#arms[@]} (stub)"
 fi
-res=${BLOOMERY_RESIDENCY:-off} b=0
+# STUB_RES_IGNORE_SET: the stub reads the lever as unset whatever it is (a binary that disagrees with it).
+res=${BLOOMERY_RESIDENCY:-} b=0
+[ -z "${STUB_RES_IGNORE_SET:-}" ] || res=''
+if [ -n "$res" ]; then
+  [ "${STUB_RES_UNSET:-off}" != place ] || echo "residency lever residency=$res why=set"
+elif [ "${STUB_RES_UNSET:-off}" = place ]; then
+  why=place res=mid-p40-s1
+  if [ "$place" = gate ]; then why=fixed_place res=off
+  elif [ "${BLOOMERY_CHECK_FINITE:-0}" = 1 ]; then why=check_finite res=off
+  elif [ "${BLOOMERY_PREFILL:-batch}" = steps ]; then why=prefill_steps res=off
+  fi
+  echo "residency lever residency=$res why=$why"
+else
+  res=off
+fi
 [ "$res" = off ] || echo "residency host residency=$res pinned=40 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
 [ -z "${STUB_RES_WARM:-}" ] || b=1
 for k in "${!arms[@]}"; do
@@ -1066,7 +1093,7 @@ elif want res-ok "$L" 1 "^ROW r1 ours@$R d=6 .*\| slot 1/2 \| wall " &&
   want res-ok "$L" 1 "^residency curve ours@$R r1 d=6 windows=1 tok/s=30.30 flips=2 \| ROW slot 1 \| seed first pass none/0$" &&
   want res-ok "$L" 1 "^residency curve ours@$R r1 d=4 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
   want res-ok "$L" 2 '^residency curve ' &&
-  want res-ok "$L" 1 "^\[config\] residency: 6@$R 4@$R run with BLOOMERY_RESIDENCY on: .* dropped_bytes=0, the profile's" &&
+  want res-ok "$L" 1 "^\[config\] residency: arms that set BLOOMERY_RESIDENCY: 6@$R 4@$R; each of 6 6@$R 4@$R runs as its binary's residency host record says .* dropped_bytes=0, the profile's" &&
   want res-ok "$L" 1 '^    residency host residency=mid-p40-s1 ' &&
   want res-ok "$L" 1 '^ROW r1 ours d=6 ' &&
   want res-ok "$L" 0 '^FAIL '; then
@@ -1124,7 +1151,7 @@ stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_LEAK=1 -- 6
 if [ "$RC" != 1 ]; then
   fail res-leak "rc $RC, want 1" "$L"
 elif want res-leak "$L" 1 '^FAIL r1 ours d=6 rc=residency \| 4 residency pass record\(s\) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm; last line: ' &&
-  want res-leak "$L" 1 '^\[config\] residency: no arm runs with BLOOMERY_RESIDENCY on; ' &&
+  want res-leak "$L" 1 '^\[config\] residency: arms that set BLOOMERY_RESIDENCY: none; each of 6 runs ' &&
   want res-leak "$L" 0 '^ROW '; then
   pass res-leak
 fi
@@ -1132,7 +1159,7 @@ L=$tmp/res-noprofile.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_NO_RES_BYTES=1 -- 6 "6@$R"
 if [ "$RC" != 64 ]; then
   fail res-noprofile "rc $RC, want 64" "$L"
-elif want res-noprofile "$L" 1 "^depth-ds41.sh: arms 6@$R run with BLOOMERY_RESIDENCY on, and the profile deepseek41 gives no RESIDENCY_RESET_DROPPED_BYTES " &&
+elif want res-noprofile "$L" 1 "^depth-ds41.sh: arms 6 6@$R may run with BLOOMERY_RESIDENCY on \(the binary resolves it: set, or unset by its placement\), and the profile deepseek41 gives no RESIDENCY_RESET_DROPPED_BYTES " &&
   want res-noprofile "$L" 0 '^(ROW|FAIL|\[config\]) '; then
   pass res-noprofile
 fi
@@ -1140,9 +1167,48 @@ L=$tmp/res-dry.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 6 "6@$R" "4@$R"
 if [ "$RC" != 0 ]; then
   fail res-dry "rc $RC, want 0" "$L"
-elif want res-dry "$L" 1 "^\[dry\] residency: 6@$R 4@$R run with BLOOMERY_RESIDENCY on: " &&
+elif want res-dry "$L" 1 "^\[dry\] residency: arms that set BLOOMERY_RESIDENCY: 6@$R 4@$R; each of 6 6@$R 4@$R runs " &&
   want res-dry "$L" 1 "^\[dry\] round 1 loads: \[6\] \[6@$R 4@$R\]$"; then
   pass res-dry
+fi
+
+OFF=BLOOMERY_RESIDENCY=off
+L=$tmp/res-default.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_UNSET=place -- 6 "6@$OFF" 4
+if [ "$RC" != 0 ]; then
+  fail res-default "rc $RC, want 0" "$L"
+elif want res-default "$L" 1 "^ROW r1 ours d=6 .*\| slot 1/2 \| wall " &&
+  want res-default "$L" 1 "^ROW r1 ours d=4 .*\| slot 2/2 \| wall " &&
+  want res-default "$L" 1 "^residency curve ours r1 d=6 windows=1 tok/s=30.30 flips=2 \| ROW slot 1 \| seed first pass none/0$" &&
+  want res-default "$L" 1 "^residency curve ours r1 d=4 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
+  want res-default "$L" 1 "^ROW r1 ours@$OFF d=6 " &&
+  want res-default "$L" 0 "^residency curve ours@$OFF " &&
+  want res-default "$L" 1 '^    residency lever residency=mid-p40-s1 why=place$' &&
+  want res-default "$L" 1 '^    residency lever residency=off why=set$' &&
+  want res-default "$L" 1 '^    residency host residency=mid-p40-s1 ' &&
+  want res-default "$L" 1 "^\[config\] residency: arms that set BLOOMERY_RESIDENCY: 6@$OFF; each of 6 6@$OFF 4 runs " &&
+  want res-default "$L" 0 '^FAIL '; then
+  pass res-default
+fi
+L=$tmp/res-gate.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_UNSET=place BLOOMERY_GEN_PLACE=gate \
+  "BLOOMERY_TIMING_GPU=$STUB_GPU_3090" -- 6
+if [ "$RC" != 0 ]; then
+  fail res-gate "rc $RC, want 0" "$L"
+elif want res-gate "$L" 1 '^ROW r1 ours d=6 .*\| place gate \| ' &&
+  want res-gate "$L" 1 '^    residency lever residency=off why=fixed_place$' &&
+  want res-gate "$L" 0 '^    residency host ' &&
+  want res-gate "$L" 0 '^residency curve ' &&
+  want res-gate "$L" 0 '^FAIL '; then
+  pass res-gate
+fi
+L=$tmp/res-mismatch.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_UNSET=place STUB_RES_IGNORE_SET=1 -- "6@$OFF"
+if [ "$RC" != 1 ]; then
+  fail res-mismatch "rc $RC, want 1" "$L"
+elif want res-mismatch "$L" 1 "^FAIL r1 ours@$OFF d=6 rc=residency \| the arm sets BLOOMERY_RESIDENCY=off and its binary resolved mid-p40-s1 \(its residency host record\); last line: " &&
+  want res-mismatch "$L" 0 '^ROW '; then
+  pass res-mismatch
 fi
 
 FEEDS=$tmp/tmp/stub-gen-feeds
@@ -1175,7 +1241,7 @@ elif want bin-prose-res "$L" 1 "^ROW r1 bin:base@prose@$R d=4 .*\| slot 1/2 \| w
   want bin-prose-res "$L" 1 "^ROW r1 bin:base@prose@$R d=8 .*\| slot 2/2 \| wall " &&
   want bin-prose-res "$L" 1 "^residency curve bin:base@prose@$R r1 d=4 windows=1 tok/s=30.30 flips=2 \| ROW slot 1 \| seed first pass none/0$" &&
   want bin-prose-res "$L" 1 "^residency curve bin:base@prose@$R r1 d=8 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
-  want bin-prose-res "$L" 1 "^\[config\] residency: prose:4@$R bin:$BASEBIN:prose:4@$R bin:$BASEBIN:prose:8@$R run with BLOOMERY_RESIDENCY on: " &&
+  want bin-prose-res "$L" 1 "^\[config\] residency: arms that set BLOOMERY_RESIDENCY: prose:4@$R bin:$BASEBIN:prose:4@$R bin:$BASEBIN:prose:8@$R; " &&
   want bin-prose-res "$L" 2 '^    residency host residency=mid-p40-s1 ' &&
   want bin-prose-res "$L" 0 '^FAIL ' &&
   want "bin-prose-res feeds" "$FEEDS" 1 "^$BASEBIN prose:8 ids=201,202,203,204,205,206,207,208$"; then

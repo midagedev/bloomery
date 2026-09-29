@@ -139,6 +139,7 @@ mod drive {
     use bloomery_gpu_gates::generate::{Place, mode_name};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
+    use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::dspark::DraftHparams;
@@ -224,12 +225,21 @@ mod drive {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
         let a = parse_args()?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let at = ResidencyAt {
+            serving_place: !matches!(a.place, Place::Gate),
+            check_finite: false,
+            route_trace: levers.route_trace().is_some(),
+            prefill_steps: body::PrefillMode::from_name(levers.prefill())
+                == Some(body::PrefillMode::Steps),
+        };
+        let residency = levers.residency_at(at);
+        record::residency_lever(residency).eprint();
+        let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
         if cfg.body.residency != Residency::Off && matches!(a.place, Place::Gate) {
             return Err(format!(
                 "BLOOMERY_RESIDENCY={} under --place gate: the residency machine runs under \
                  --place a and bp only",
-                levers.residency()
+                residency.word
             )
             .into());
         }
@@ -264,7 +274,7 @@ mod drive {
         let model = model_props(&split, &inputs.model);
         let tier_batch = place::tier_batch(a.place, &inputs.hp);
         drop(split);
-        let trace = route_trace(&levers, &cfg, draft, a.place, &path, &inputs)?;
+        let trace = route_trace(&levers, &cfg, residency, draft, a.place, &path, &inputs)?;
         let (card, placement, headroom) = print_plan(
             &inputs,
             a.place,
@@ -272,7 +282,7 @@ mod drive {
             tier_batch,
             a.ctx,
             &cfg.place,
-            (cfg.body.residency, levers.residency()),
+            (cfg.body.residency, residency),
         )?;
         let cache_ram = a.cache_ram.unwrap_or_else(|| {
             u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP))
@@ -334,6 +344,7 @@ mod drive {
     fn route_trace(
         levers: &bloomery_levers::Levers,
         cfg: &body::OpenCfg,
+        residency: ResidencyPick,
         draft: Draft,
         place: Place,
         path: &Path,
@@ -365,7 +376,7 @@ mod drive {
             return Err(format!(
                 "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
                  BLOOMERY_RESIDENCY={} moves the slot map under it",
-                levers.residency()
+                residency.word
             )
             .into());
         }
@@ -406,9 +417,9 @@ mod drive {
     /// returns its cards' names, the plan's placement for `/props` (`None`,
     /// and a line saying why, when a card's nvidia-smi index cannot be found)
     /// and the plan's host headroom in bytes. Under `residency` (the rule and
-    /// the lever's word) the churn pool's record follows the plan's, and the
-    /// headroom is what the pool leaves; a pool that does not fit is refused
-    /// by name.
+    /// the lever as resolved) the churn pool's record follows the plan's, and
+    /// the headroom is what the pool leaves; a pool that does not fit is
+    /// refused by name, naming the lever when it is the placement's default.
     fn print_plan(
         inputs: &PlanInputs,
         place: Place,
@@ -416,7 +427,7 @@ mod drive {
         tier_batch: Option<TierBatchBytes>,
         ctx: usize,
         levers: &PlanLevers,
-        residency: (Residency, &str),
+        residency: (Residency, ResidencyPick),
     ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
         let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
@@ -424,8 +435,20 @@ mod drive {
         record::plan(place.name(), &machine, &plan, hot_list).eprint();
         let mut host_headroom = plan.host.headroom_bytes;
         if let Some(pool) = swap::churn(&plan, 0, residency.0)? {
-            record::residency_host(residency.1, &pool, &plan).eprint();
-            host_headroom = pool.check(&plan)?;
+            let pick = residency.1;
+            record::residency_host(pick.word, &pool, &plan).eprint();
+            host_headroom = match pool.check(&plan) {
+                Err(e) if pick.why == ResidencyWhy::Place => {
+                    return Err(format!(
+                        "BLOOMERY_RESIDENCY unset is {} under --place {}: {e}; \
+                         BLOOMERY_RESIDENCY=off loads the fixed placement",
+                        pick.word,
+                        place.name()
+                    )
+                    .into());
+                }
+                r => r?,
+            };
         }
         let gpus: Result<Vec<String>, String> = machine
             .all_cards()

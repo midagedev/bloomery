@@ -227,7 +227,9 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.mtp_head_rows(), None);
     assert_eq!(unset.route_trace(), None);
     assert!(!unset.check_finite());
-    assert_eq!(unset.qwen38_experts(), "host");
+    assert_eq!(unset.qwen38_experts(), "card");
+    assert_eq!(unset.qwen38_experts_set(), None);
+    assert_eq!(unset.residency(), None);
     assert_eq!(unset.hoststream(), None);
     assert_eq!(
         unset.host(),
@@ -281,8 +283,9 @@ fn accessors_read_their_rows() {
     assert_eq!(set.mtp_head_rows(), Some(Path::new("/data/rows.txt")));
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
-    assert_eq!(set.residency(), "mid-p40-s1");
+    assert_eq!(set.residency(), Some("mid-p40-s1"));
     assert_eq!(set.qwen38_experts(), "card");
+    assert_eq!(set.qwen38_experts_set(), Some("card"));
     assert_eq!(set.hoststream(), Some(true));
     assert_eq!(
         set.host(),
@@ -321,6 +324,91 @@ fn accessors_read_their_rows() {
             HOSTSTREAM
         ]
     );
+}
+
+/// `BLOOMERY_RESIDENCY` unset follows the placement: the serving word under a
+/// serving placement, `off` where the machine does not run, the first
+/// condition that holds named; set, it is the load's word wherever it is.
+#[test]
+fn residency_unset_follows_the_placement() {
+    let at = |serving_place, check_finite, route_trace, prefill_steps| ResidencyAt {
+        serving_place,
+        check_finite,
+        route_trace,
+        prefill_steps,
+    };
+    let unset = read(&[], Scope::Every).expect("nothing is set");
+    for (at, word, why) in [
+        (
+            at(true, false, false, false),
+            "mid-p40-s1",
+            ResidencyWhy::Place,
+        ),
+        (
+            at(false, false, false, false),
+            "off",
+            ResidencyWhy::FixedPlace,
+        ),
+        (ResidencyAt::FIXED, "off", ResidencyWhy::FixedPlace),
+        (at(false, true, true, true), "off", ResidencyWhy::FixedPlace),
+        (
+            at(true, true, false, false),
+            "off",
+            ResidencyWhy::CheckFinite,
+        ),
+        (at(true, true, true, true), "off", ResidencyWhy::CheckFinite),
+        (
+            at(true, false, true, false),
+            "off",
+            ResidencyWhy::RouteTrace,
+        ),
+        (at(true, false, true, true), "off", ResidencyWhy::RouteTrace),
+        (
+            at(true, false, false, true),
+            "off",
+            ResidencyWhy::PrefillSteps,
+        ),
+    ] {
+        assert_eq!(
+            unset.residency_at(at),
+            ResidencyPick { word, why },
+            "unset at {at:?}"
+        );
+    }
+    for w in ["off", "mid-p0-s1", "mid-p40-s1"] {
+        let set = read(&env(&[(RESIDENCY, w)]), Scope::Every).expect("a word the row takes");
+        for at in [at(true, false, false, false), ResidencyAt::FIXED] {
+            assert_eq!(
+                set.residency_at(at),
+                ResidencyPick {
+                    word: w,
+                    why: ResidencyWhy::Set
+                },
+                "{w} at {at:?}"
+            );
+        }
+    }
+    let row = spec(RESIDENCY).expect("the row");
+    row.kind
+        .parse(RESIDENCY_SERVING)
+        .unwrap_or_else(|e| panic!("the serving word is not one the row takes: {e}"));
+}
+
+/// `BLOOMERY_QWEN38_EXPERTS` unset is the card plan; set, as set.
+#[test]
+fn qwen38_experts_unset_is_card() {
+    let unset = read(&[], Scope::Every).expect("nothing is set");
+    assert_eq!(
+        (unset.qwen38_experts(), unset.qwen38_experts_set()),
+        ("card", None)
+    );
+    for w in ["host", "card"] {
+        let set = read(&env(&[(QWEN38_EXPERTS, w)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(
+            (set.qwen38_experts(), set.qwen38_experts_set()),
+            (w, Some(w))
+        );
+    }
 }
 
 /// Every Parsed lever refuses, naming itself, each value its kind does not

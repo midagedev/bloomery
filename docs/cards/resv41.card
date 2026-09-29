@@ -27,8 +27,10 @@ unit: %
 predict: +8..+24
 rounds: 3
 condition: one lease, BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resv41.card
-  BLOOMERY_STEP_STATS=1' BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512
-  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1, the arm order rotated every round; every arm a fresh process
+  BLOOMERY_STEP_STATS=1 BLOOMERY_HOSTSTREAM=off' BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512
+  prose:512@BLOOMERY_RESIDENCY=off (the bare arm is mid-p40-s1, the lever's plan (a) default, and
+  BLOOMERY_HOSTSTREAM=off keeps its prompt call off the pool as when this card was written; the ratio table's
+  ours@prose/ours@prose@BLOOMERY_RESIDENCY=off line is mid/off), the arm order rotated every round; every arm a fresh process
   (the seed), its `residency host` record printed before the load and no `residency reset` needed; no
   row [cpu-busy], [other-busy] or [cold]; the residency arm's `residency pass` records show landed > 0
   and every flip's late count read

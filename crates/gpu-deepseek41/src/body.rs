@@ -83,7 +83,7 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
@@ -228,15 +228,26 @@ pub struct OpenCfg {
 }
 
 impl OpenCfg {
-    /// The open's levers of a binary's one parse (`bloomery_levers::at_main`);
-    /// the hot list file is read here.
+    /// The open's levers of a binary's one parse (`bloomery_levers::at_main`)
+    /// for a load the residency machine does not run over, where
+    /// `BLOOMERY_RESIDENCY` unset is `off`; the hot list file is read here.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<OpenCfg, GpuError> {
+        OpenCfg::from_levers_at(levers, ResidencyAt::FIXED)
+    }
+
+    /// [`OpenCfg::from_levers`] for a load at `at`: `BLOOMERY_RESIDENCY`
+    /// unset resolves there (`bloomery_levers::residency_unset`), and
+    /// `BLOOMERY_HOSTSTREAM` unset follows what it resolved to.
+    pub fn from_levers_at(
+        levers: &bloomery_levers::Levers,
+        at: ResidencyAt,
+    ) -> Result<OpenCfg, GpuError> {
         const WHAT: &str = "deepseek41 OpenCfg";
         let prefill = PrefillMode::from_name(levers.prefill()).ok_or(GpuError::State {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
-        let residency = Residency::parse(levers.residency())?;
+        let residency = Residency::parse(levers.residency_at(at).word)?;
         let hoststream = hoststream_under(levers.hoststream(), residency)?;
         let body = BodyLevers {
             ced: levers.ced(),
@@ -2921,6 +2932,40 @@ mod tests {
         ] {
             refuse_steps_under_residency(prefill, residency)
                 .unwrap_or_else(|e| panic!("{prefill:?} under {residency:?}: {e}"));
+        }
+    }
+
+    /// The serving default is the residency and prompt streaming together:
+    /// the word `BLOOMERY_RESIDENCY` unset resolves to under `--place a` and
+    /// `bp` parses to a residency, and `BLOOMERY_HOSTSTREAM` unset is on
+    /// under it; where it resolves to `off`, streaming is off.
+    #[test]
+    fn the_serving_default_streams() {
+        let serving = ResidencyAt {
+            serving_place: true,
+            ..ResidencyAt::FIXED
+        };
+        for (at, stream) in [
+            (serving, true),
+            (ResidencyAt::FIXED, false),
+            (
+                ResidencyAt {
+                    prefill_steps: true,
+                    ..serving
+                },
+                false,
+            ),
+        ] {
+            let residency = Residency::parse(bloomery_levers::residency_unset(at).word)
+                .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+            assert_eq!(residency != Residency::Off, stream, "{at:?}");
+            assert_eq!(
+                hoststream_under(None, residency).ok(),
+                Some(stream),
+                "{at:?}"
+            );
+            refuse_steps_under_residency(PrefillMode::Batch, residency)
+                .unwrap_or_else(|e| panic!("{at:?}: {e}"));
         }
     }
 

@@ -17,7 +17,8 @@ predict: +50..+105
 rounds: 2
 condition: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_WARM_ROWS=1 BLOOMERY_THREADS=32
   BLOOMERY_LEASE_CARD=docs/cards/q38prose-pp.card' just depth-gpu-qwen4exp prose:512
-  prose:512@BLOOMERY_QWEN38_EXPERTS=card prose:4096 prose:4096@BLOOMERY_QWEN38_EXPERTS=card, the full output to a file
+  prose:512@BLOOMERY_QWEN38_EXPERTS=host prose:4096 prose:4096@BLOOMERY_QWEN38_EXPERTS=host (the bare arms are the
+  card plan, the lever's default; the ratio lines are card/host), the full output to a file
   first; the card arms' plan line experts=card, load line card_layers=43; no counted row [cold] or [other-busy]
 decide-in: the card share on prose is what the host slots say: land nothing new; read the host arms' spread
   (m_hot, cols_hot, R) as the prose histogram and price the hot list and q38down (reports/q38hostonly §2) on it

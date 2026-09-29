@@ -1217,7 +1217,8 @@ gate-gpu-ds41-chat:
 # server's and generate_ds41's, and checks /props' draft object and row, the draft counts in timings and /metrics, the
 # 400s for sampling and ignore_eos, and prefix reuse under the draft (a continuation, a cut, a resume) against
 # cache_prompt: false. Then plan (b′) with the draft (--place bp: the A6000 plan (a), the 3090 the expert tier and the
-# draft): generate_ds41 --place bp under the draft, then gate_ds41_serve --place bp holds the server's greedy ids to it and
+# draft): generate_ds41 --place bp under the draft, then gate_ds41_serve --place bp holds the server's greedy ids to it
+# (both under BLOOMERY_RESIDENCY=off: the fixed placement, whose card and host rounding do not move with a flip's timing) and
 # checks /props (the A6000, the tier card with the plan's tier bytes and the draft's class, the host) and the draft counts
 # in timings. Both cards in view (BLOOMERY_CARD=both: gpu-gate.sh takes both cards' gate locks, and the batch runs it
 # alone). Five loads; logs and the raw stream in target/serve-gate/, the draft run's in target/serve-gate/draft/, the
@@ -1225,7 +1226,7 @@ gate-gpu-ds41-chat:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
@@ -1259,7 +1260,9 @@ time-lcpp-prompt CORPUS N:
 # `code:<P>` the same on corpus-code.ids. BLOOMERY_GEN_PLACE=a|gate picks our arms' --place (gate: the 3090 as
 # BLOOMERY_TIMING_GPU); under the default order each reference arm's host set is preheated first (BLOOMERY_PREHEAT=0:
 # off), rows carry majflt with the measured window's count (lcpp arms through llama-bench --progress) and [cold], and a
-# failed arm is a FAIL row the runner goes past (rc 1 at the end).
+# failed arm is a FAIL row the runner goes past (rc 1 at the end). An ours arm under --place a or bp with no
+# BLOOMERY_RESIDENCY runs the residency and prompt streaming (the lever's placement default; `@BLOOMERY_RESIDENCY=off`
+# is the fixed placement's arm), and the runner holds each arm to what its binary's `residency host` record says.
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
@@ -1286,8 +1289,10 @@ depth-gpu-qwen35moe *ARMS:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.8-Flash-Next (qwen4exp), the same table: depth-gpu-qwen3moe's runner, arms and tables under the qwen4exp
-# profile. Our arm is generate_qwen3moe opening Body38 on the A6000, every routed expert on the host tier, its prompt
-# by passes of up to eight (`kind=pass`); the reference is mainline llama.cpp, hand-set -ncmoe and fit (models/qwen4exp.sh).
+# profile. Our arm is generate_qwen3moe opening Body38 on the A6000, each layer's routed expert prefix on the card as
+# its budget holds (BLOOMERY_QWEN38_EXPERTS unset is `card`; `@BLOOMERY_QWEN38_EXPERTS=host` puts every routed expert
+# on the host tier), its prompt as its `--prefill` default runs it (`kind=` in the row); the reference is mainline
+# llama.cpp, hand-set -ncmoe and fit (models/qwen4exp.sh).
 # `prose:<P>[@NAME=VALUE,...]` is ours on the first P ids of $BLOOMERY_DATA/qwen4exp/corpus-prose.ids (--tokens), row
 # label ours@prose, compared only with prose arms of the same P in prose's own tables — the lcg prompt's pseudo-random
 # ids route heavily skewed, so a lever tuned on it can mean nothing on real text. Each arm pages the ~111 GB host set

@@ -28,14 +28,14 @@
 //! clipped to the cache, read once: the plan counts that ubatch's arena and
 //! the load runs it.
 //!
-//! A qwen4exp file's plan puts every routed expert on the host tier, or
-//! with `BLOOMERY_QWEN38_EXPERTS=card` each layer's `n_l` hottest ids from
+//! A qwen4exp file's plan puts each layer's `n_l` hottest ids from
 //! `BLOOMERY_HOT_LIST` or its id prefix on the card as its budget holds
-//! (`place::Experts::Card`), which the step's, the verify's
-//! and the pass's card leg and the ubatch walk's card route run; a hot list
-//! is refused on a host plan (one ranks nothing) and on the other families'
-//! files; the `plan` line prints `experts=` and the `load` line
-//! `card_layers=`.
+//! (`place::Experts::Card`, `BLOOMERY_QWEN38_EXPERTS` unset or `card`),
+//! which the step's, the verify's and the pass's card leg and the ubatch
+//! walk's card route run, or with `BLOOMERY_QWEN38_EXPERTS=host` every
+//! routed expert on the host tier; a hot list is refused on a host plan (one
+//! ranks nothing) and on the other families' files, as a set `card` is there;
+//! the `plan` line prints `experts=` and the `load` line `card_layers=`.
 //!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
@@ -52,7 +52,7 @@
 //!
 //! A qwen4exp file runs through `Body38`, placed by its own plan
 //! (`model::arch::qwen35moe::place`: every layer, the head and the embedding
-//! on one card, every routed expert on the host tier) on the card `--place`
+//! on one card, its routed experts as above) on the card `--place`
 //! names — `a` the A6000 (the default), `gate` the 3090 — and printed as a
 //! `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
 //! of nine positions or more, `pass` below), `gemm` (ubatches of up to the
@@ -732,8 +732,11 @@ mod cli {
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         let experts = experts38(&levers)?;
+        // Unset, the lever is a qwen4exp plan's card experts and nothing on
+        // another family's file; only a set `card` is refused there.
+        let card_set = levers.qwen38_experts_set() == Some("card");
         if let Some(dir) = flag("--dump-taps")? {
-            if experts == Experts::Card {
+            if card_set {
                 return Err(
                     "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; \
                      --dump-taps runs a qwen3moe file"
@@ -808,7 +811,7 @@ mod cli {
                     .into(),
             );
         }
-        if family != Family::Qwen38 && experts == Experts::Card {
+        if family != Family::Qwen38 && card_set {
             return Err(
                 "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
                  qwen3moe or qwen35moe file has no host tier"
@@ -1127,7 +1130,8 @@ mod cli {
         Ok(m)
     }
 
-    /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule.
+    /// `BLOOMERY_QWEN38_EXPERTS` as a qwen4exp plan's expert rule: as set,
+    /// else the card experts.
     fn experts38(levers: &Levers) -> Result<Experts, GateError> {
         match levers.qwen38_experts() {
             "host" => Ok(Experts::Host),

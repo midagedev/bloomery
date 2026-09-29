@@ -26,7 +26,9 @@ condition: the callstream tree's generate_ds41, both arms in one lease through t
   /Users/hckim/repo/bloomery-callstream2 (main d3d54385 + callstream): BLOOMERY_REMOTE='~/repo/bloomery-callstream2' BLOOMERY_AB_ROUNDS=2
   BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_RESIDENCY=mid-p40-s1 BLOOMERY_STEP_STATS=1
   BLOOMERY_LEASE_CARD=docs/cards/callstream-pp-a.card' just depth-gpu-ds41 prose:512 prose:4096
-  prose:512@BLOOMERY_HOSTSTREAM=on prose:4096@BLOOMERY_HOSTSTREAM=on. Two load keys a round (off, on), each arm
+  prose:512@BLOOMERY_HOSTSTREAM=off prose:4096@BLOOMERY_HOSTSTREAM=off (the bare arms stream: HOSTSTREAM unset
+  follows the residency; the ratio table's ours@prose/ours@prose@BLOOMERY_HOSTSTREAM=off line is on/off). Two
+  load keys a round (on, off), each arm
   from Session::clear (the residency back to its seed); every on row carries `call stream end` with admitted > 0
   and kept 1, every off row none; no row carries [cold], [cpu-busy] or [other-busy]. Box time 9..13 min [derived:
   4 loads and one warm-up at 60..90 s (74.6 s measured on plan (a), rig-log 09-26), 2 rounds of 4 prompts, 26 s,

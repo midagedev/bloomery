@@ -271,7 +271,7 @@ mod drive {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
         HOST_POPULATE, HOSTSTREAM, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
-        RESIDENCY, STEP_STATS,
+        RESIDENCY, ResidencyAt, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -626,12 +626,21 @@ mod drive {
         let a = parse_args(&levers)?;
         let draft = Draft::from_levers(&levers)?;
         let check_finite = finite_lever(&a, draft, &levers)?;
-        let cfg = body::OpenCfg::from_levers(&levers)?;
+        let at = ResidencyAt {
+            serving_place: a.place != Place::Gate,
+            check_finite,
+            route_trace: false,
+            prefill_steps: body::PrefillMode::from_name(levers.prefill())
+                == Some(body::PrefillMode::Steps),
+        };
+        let residency = levers.residency_at(at);
+        record::residency_lever(residency).print();
+        let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
         if cfg.body.residency != Residency::Off && (a.place == Place::Gate || check_finite) {
             return Err(format!(
                 "BLOOMERY_RESIDENCY={} {}: the residency machine runs under --place a and bp, \
                  on the engine's own passes",
-                levers.residency(),
+                residency.word,
                 if check_finite {
                     "beside BLOOMERY_CHECK_FINITE=1"
                 } else {
@@ -724,7 +733,7 @@ mod drive {
             plan: None,
             pin_main,
             pinned,
-            residency: levers.residency(),
+            residency,
             hp: None,
             ctx_max: 0,
             call: None,
@@ -1334,8 +1343,9 @@ mod drive {
         plan: Option<Duration>,
         pin_main: bool,
         pinned: bool,
-        /// `BLOOMERY_RESIDENCY`'s word, for the `residency host` record.
-        residency: &'static str,
+        /// `BLOOMERY_RESIDENCY` as resolved, for the `residency host` record
+        /// and the churn pool's refusal under the placement's default.
+        residency: ResidencyPick,
         /// The hyperparameters the plan was made from.
         hp: Option<Hparams>,
         /// The plan's `ctx_max`, once planned.
@@ -1361,7 +1371,16 @@ mod drive {
             record::plan(place, machine, plan, hot_list).print();
             let residency = self.cfg.body.residency;
             if let Some(pool) = swap::churn(plan, 0, residency)? {
-                record::residency_host(self.residency, &pool, plan).print();
+                record::residency_host(self.residency.word, &pool, plan).print();
+                if self.residency.why == ResidencyWhy::Place {
+                    pool.check(plan).map_err(|e| {
+                        SessionError::Refused(format!(
+                            "BLOOMERY_RESIDENCY unset is {} under --place {place}: {e}; \
+                             BLOOMERY_RESIDENCY=off loads the fixed placement",
+                            self.residency.word
+                        ))
+                    })?;
+                }
             }
             // The caches hold the plan's ctx_max positions, the value the
             // model is loaded with; --ctx only asks for it.

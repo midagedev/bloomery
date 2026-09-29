@@ -22,8 +22,9 @@ unit: %
 predict: +107..+148
 rounds: 2
 condition: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_WARM_ROWS=1
-  BLOOMERY_LEASE_CARD=docs/cards/q38route-pp.card' just depth-gpu-qwen4exp 512 512@BLOOMERY_QWEN38_EXPERTS=card
-  4096 4096@BLOOMERY_QWEN38_EXPERTS=card (the plain arm is the host plan, the lever's default), the full output to
+  BLOOMERY_LEASE_CARD=docs/cards/q38route-pp.card' just depth-gpu-qwen4exp 512 512@BLOOMERY_QWEN38_EXPERTS=host
+  4096 4096@BLOOMERY_QWEN38_EXPERTS=host (the plain arm is the card plan, the lever's default; the ratio lines are
+  card/host), the full output to
   a file first; the runner's C (768 at P 512, 4,352 at P 4096); the card arm's plan line experts=card and
   card_experts 12,800..13,050 (12,841 at ctx 4,096 less or plus the KV the other height frees [derived]), its load
   line card_layers=43; the host arm's experts=host; no counted row [cold], [cpu-busy] or [other-busy]

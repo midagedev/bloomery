@@ -1034,6 +1034,16 @@ pub static RESIDENCY_PASS: Kind = Kind {
     ],
 };
 
+/// What `BLOOMERY_RESIDENCY` resolved to ([`bloomery_levers::ResidencyPick`]).
+pub static RESIDENCY_LEVER: Kind = Kind {
+    name: "residency_lever",
+    head: "residency lever",
+    doc: "What BLOOMERY_RESIDENCY resolved to before the load: the word the load runs by, and why: \
+          set, or unset and what picked it (place: the serving placement's default; off under \
+          fixed_place, check_finite, route_trace or prefill_steps, where the machine does not run).",
+    parts: &[key("residency", Word, ""), key("why", Word, "")],
+};
+
 /// Adaptive residency's host share at the plan
 /// ([`model::placement::churn::ChurnPool`]).
 pub static RESIDENCY_HOST: Kind = Kind {
@@ -1596,6 +1606,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &STAT_FINITE_SUMMARY,
     &DRAFT_SUMMARY,
     &SMOKE,
+    &RESIDENCY_LEVER,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
@@ -1639,6 +1650,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &CACHE_EVICT,
     &CACHE_SKIP,
     &PREFILL_SPLIT,
+    &RESIDENCY_LEVER,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
@@ -1774,6 +1786,13 @@ pub fn host_residency(h: &HostResidency) -> Vec<Record> {
         );
     }
     out
+}
+
+/// The resolved residency lever's record.
+pub fn residency_lever(pick: bloomery_levers::ResidencyPick) -> Record {
+    Record::new(&RESIDENCY_LEVER)
+        .w("residency", pick.word)
+        .w("why", pick.why.name())
 }
 
 /// The churn pool's record under the residency word `residency`, against

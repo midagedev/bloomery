@@ -13,7 +13,7 @@
 # 50.2..54.8 tok/s, so the band is widened down to h 0.20: +9..+52 %.
 # The runner pairs the two arms in one lease through q3arm's lever arms:
 # BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38legs-tg.card BLOOMERY_GEN_CTX=4096' BLOOMERY_AB_ROUNDS=2
-# just depth-gpu-qwen4exp 6 6@BLOOMERY_QWEN38_EXPERTS=card.
+# just depth-gpu-qwen4exp 6 6@BLOOMERY_QWEN38_EXPERTS=host (the plain arm is the card plan, the lever's default).
 # Wall [derived]: 2 arms x 2 rounds = 4 fresh processes, each a Qwen3.8 load of 40..90 s with the host
 # set warm (the e2e gate's loads) plus its warm-up and ~2.5 s of 96 tokens, and the witness blocks: about
 # 5..8 min; with a cold host set the first load reads ~111 GB at 2..3 GB/s, +40..60 s once. Under 30 min.

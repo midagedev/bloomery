@@ -715,10 +715,17 @@ impl Levers {
     }
 
     /// `BLOOMERY_QWEN38_EXPERTS`: where a Qwen3.8 plan puts the routed
-    /// experts, `host` or `card`.
+    /// experts, `host` or `card` — as set, else [`QWEN38_EXPERTS_UNSET`].
     #[must_use]
     pub fn qwen38_experts(&self) -> &'static str {
-        Levers::defaulted(QWEN38_EXPERTS, self.word(QWEN38_EXPERTS))
+        self.qwen38_experts_set().unwrap_or(QWEN38_EXPERTS_UNSET)
+    }
+
+    /// `BLOOMERY_QWEN38_EXPERTS` as set; `None` unset, which another
+    /// family's file reads as nothing to refuse.
+    #[must_use]
+    pub fn qwen38_experts_set(&self) -> Option<&'static str> {
+        self.word(QWEN38_EXPERTS)
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.
@@ -727,11 +734,25 @@ impl Levers {
         self.flag(CHECK_FINITE)
     }
 
-    /// `BLOOMERY_RESIDENCY`: `off`, or the adaptive residency rule's word,
-    /// whose grammar is `bloomery_gpu::host::swap::Residency::parse`.
+    /// `BLOOMERY_RESIDENCY` as set: `off`, or the adaptive residency rule's
+    /// word, whose grammar is `bloomery_gpu::host::swap::Residency::parse`;
+    /// `None` unset, which [`Levers::residency_at`] resolves.
     #[must_use]
-    pub fn residency(&self) -> &'static str {
-        Levers::defaulted(RESIDENCY, self.word(RESIDENCY))
+    pub fn residency(&self) -> Option<&'static str> {
+        self.word(RESIDENCY)
+    }
+
+    /// `BLOOMERY_RESIDENCY` as a load at `at` runs it: as set, else what
+    /// [`residency_unset`] picks there.
+    #[must_use]
+    pub fn residency_at(&self, at: ResidencyAt) -> ResidencyPick {
+        match self.residency() {
+            Some(word) => ResidencyPick {
+                word,
+                why: ResidencyWhy::Set,
+            },
+            None => residency_unset(at),
+        }
     }
 
     /// `BLOOMERY_HOSTSTREAM`: a V4.1 prompt call streams its hottest host
@@ -786,6 +807,107 @@ impl Levers {
         }
         out
     }
+}
+
+/// What a Qwen3.8 plan runs by with [`QWEN38_EXPERTS`] unset: the card
+/// experts.
+pub const QWEN38_EXPERTS_UNSET: &str = "card";
+
+/// The residency word a serving placement runs by with [`RESIDENCY`] unset.
+pub const RESIDENCY_SERVING: &str = "mid-p40-s1";
+
+/// What decides [`RESIDENCY`] unset, as the binary that reads it knows its
+/// load before it opens anything ([`Levers::residency_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyAt {
+    /// The load's placement is one the residency machine runs over: V4.1's
+    /// `--place a` or `bp`.
+    pub serving_place: bool,
+    /// `BLOOMERY_CHECK_FINITE=1`: the probe steps every position outside
+    /// the engine's passes.
+    pub check_finite: bool,
+    /// `BLOOMERY_ROUTE_TRACE` is set: the trace records a fixed placement's
+    /// routing.
+    pub route_trace: bool,
+    /// `BLOOMERY_PREFILL=steps`: each prompt id would end a decode pass the
+    /// residency rule counts.
+    pub prefill_steps: bool,
+}
+
+impl ResidencyAt {
+    /// A load the residency machine does not run over: unset is `off`.
+    pub const FIXED: ResidencyAt = ResidencyAt {
+        serving_place: false,
+        check_finite: false,
+        route_trace: false,
+        prefill_steps: false,
+    };
+}
+
+/// Why a load runs the residency word it does ([`ResidencyPick`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidencyWhy {
+    /// [`RESIDENCY`] is set.
+    Set,
+    /// Unset under a serving placement: [`RESIDENCY_SERVING`].
+    Place,
+    /// Unset under a placement the machine does not run over.
+    FixedPlace,
+    /// Unset beside the finite probe.
+    CheckFinite,
+    /// Unset beside the route trace.
+    RouteTrace,
+    /// Unset beside the step feed.
+    PrefillSteps,
+}
+
+impl ResidencyWhy {
+    /// The word the `residency lever` record prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ResidencyWhy::Set => "set",
+            ResidencyWhy::Place => "place",
+            ResidencyWhy::FixedPlace => "fixed_place",
+            ResidencyWhy::CheckFinite => "check_finite",
+            ResidencyWhy::RouteTrace => "route_trace",
+            ResidencyWhy::PrefillSteps => "prefill_steps",
+        }
+    }
+}
+
+/// The residency word a load runs by, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyPick {
+    /// `off` or `mid-p<P>-s<S>`.
+    pub word: &'static str,
+    /// Set, or what picked it unset.
+    pub why: ResidencyWhy,
+}
+
+/// What [`RESIDENCY`] unset means at `at`: [`RESIDENCY_SERVING`] under a
+/// serving placement, `off` where the machine does not run — the first of a
+/// fixed placement, the finite probe, the route trace and the step feed
+/// names why.
+#[must_use]
+pub fn residency_unset(at: ResidencyAt) -> ResidencyPick {
+    let why = if !at.serving_place {
+        ResidencyWhy::FixedPlace
+    } else if at.check_finite {
+        ResidencyWhy::CheckFinite
+    } else if at.route_trace {
+        ResidencyWhy::RouteTrace
+    } else if at.prefill_steps {
+        ResidencyWhy::PrefillSteps
+    } else {
+        ResidencyWhy::Place
+    };
+    let word = if why == ResidencyWhy::Place {
+        RESIDENCY_SERVING
+    } else {
+        "off"
+    };
+    ResidencyPick { word, why }
 }
 
 /// The host tier's load settings, from a binary's one reading

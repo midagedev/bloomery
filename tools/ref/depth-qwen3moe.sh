@@ -11,7 +11,7 @@
 #   just depth-gpu-qwen3moe 512 ikpp:512 lcpppp:512 mrspp:512 4096 ikpp:4096 lcpppp:4096 mrspp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-qwen3moe 6 lcpp:6 mrs:6    # the command lines, no lease, no load
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-qwen4exp 6 lcpp:6 512 lcpppp:512   # engine blocks
-#   just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card   # the prose corpus's first 512 ids, prose's own tables
+#   just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=host   # the prose corpus's first 512 ids, prose's own tables
 #   just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-<track>-base/target/release/generate_qwen3moe:6 lcpp:6
 #
 # depth-ds41.sh's shape, and it blocks the same failure: a ratio read at one depth and quoted as
@@ -40,7 +40,7 @@
 #             those variables set for this arm only (`env NAME=VALUE ... <binary>`; depth-ds41.sh's
 #             grammar): a lever arm, row label `ours@NAME=VALUE[,...]`, in the same tables as the ours
 #             rows of that depth. Beside a plain `<D>` arm it is the same-binary A/B, paired by round in
-#             the ratio table's `ours/ours@…` line, e.g. `6 6@BLOOMERY_QWEN38_EXPERTS=card`. A lever arm is
+#             the ratio table's `ours/ours@…` line, e.g. `6 6@BLOOMERY_QWEN38_EXPERTS=host`. A lever arm is
 #             compared only with ours arms of the same binary, never with a bin: arm or a reference: under
 #             1 % two builds differ by link layout alone (AGENTS.md). The label is what its witness blocks
 #             and its row print, so both name the variables. The variables are load-time
@@ -68,7 +68,7 @@
 #            the depth column P. The prompt's routing, and so its host and card work, is the prose's,
 #            not the LCG walk's (V4.1's lcg and prose prompts moved its card experts differently, so a
 #            lever tuned on one can mean nothing on the other): a prose arm is compared only with prose
-#            arms of the same P — `prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card` is the same-binary
+#            arms of the same P — `prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=host` is the same-binary
 #            A/B on the prose prompt — in its own decode and prefill tables (ours@prose / each
 #            ours@prose@ label), never with an lcg arm or a reference. The ids arrive at the prompt, so
 #            the load is an lcg arm's: C is P + N rounded up to 256 as for a <D> arm, and a prose arm
@@ -201,8 +201,8 @@
 #
 # Paging. The witness prints the page cache and the major fault count before and after every arm:
 # the file is 18.6 GB, and another round's host set can evict it between two arms. Qwen3.8 is not
-# card-resident: our engine keeps its routed experts on the host tier and reads the PLE table's rows
-# a token at a time, and mainline keeps the first --n-cpu-moe layers' experts on the host, read
+# card-resident: our engine keeps the routed experts past each layer's card prefix on the host tier
+# (all of them under BLOOMERY_QWEN38_EXPERTS=host) and reads the PLE table's rows a token at a time, and mainline keeps the first --n-cpu-moe layers' experts on the host, read
 # through the file mapping inside its timer; after another model's host set has evicted its pages, a
 # row reads the file cold. The cold tag and the blocks below are what tell such a row apart and keep
 # it out of the table.
@@ -315,9 +315,11 @@
 #
 # Qwen3.8-Flash-Next runs under the qwen4exp profile (`just depth-gpu-qwen4exp`, BLOOMERY_MODEL=qwen4exp)
 # the same way: generate_qwen3moe opens Body38, its plan on the A6000 (`--place a`, the default),
-# every routed expert on the host tier. Its prompt runs as eager passes of up to eight positions
-# through the host tier's batch port (`--prefill pass`, the default: `kind=pass`, `plan=pass:8x<k>…`);
-# it has no ubatch path, and `--seed-depth` is refused. Its reference is mainline llama.cpp at
+# each layer's routed expert prefix on the card as its budget holds and the rest on the host tier
+# (BLOOMERY_QWEN38_EXPERTS unset is `card`; an arm with no such variable is a card arm, and `…=host`
+# every routed expert on the host tier, the same-binary arm; a row of one does not share a table with
+# a row from before the card default). Its prompt runs as the binary's `--prefill` says (`kind=`,
+# `plan=` in its `time prompt` row), and `--seed-depth` is refused. Its reference is mainline llama.cpp at
 # its profile's hand-set -ncmoe placement and llama-bench's fit (models/qwen4exp.sh).
 #
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
@@ -451,15 +453,15 @@ q3_self_test() {
   mkdir -p "$pt/data/qwen3moe" "$pt/bad/qwen3moe" "$pt/none"
   seq 100 800 > "$pt/data/qwen3moe/corpus-prose.ids"
   { head -n 4 "$pt/data/qwen3moe/corpus-prose.ids"; echo x1; tail -n +5 "$pt/data/qwen3moe/corpus-prose.ids"; } > "$pt/bad/qwen3moe/corpus-prose.ids"
-  run_parse BLOOMERY_DATA="$pt/data" -- 512 prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=card 4 prose:4 prose:4@BLOOMERY_AB_LOAD=arm
+  run_parse BLOOMERY_DATA="$pt/data" -- 512 prose:512 prose:512@BLOOMERY_QWEN38_EXPERTS=host 4 prose:4 prose:4@BLOOMERY_AB_LOAD=arm
   want prose-arm 0 \
     "[parse] prose:512: kind=ours depth=512 label=ours@prose env=- load=$bin|ctx=768 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
-    "[parse] prose:512@BLOOMERY_QWEN38_EXPERTS=card: kind=ours depth=512 label=ours@prose@BLOOMERY_QWEN38_EXPERTS=card env=BLOOMERY_QWEN38_EXPERTS=card load=$bin|ctx=768|BLOOMERY_QWEN38_EXPERTS=card corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
+    "[parse] prose:512@BLOOMERY_QWEN38_EXPERTS=host: kind=ours depth=512 label=ours@prose@BLOOMERY_QWEN38_EXPERTS=host env=BLOOMERY_QWEN38_EXPERTS=host load=$bin|ctx=768|BLOOMERY_QWEN38_EXPERTS=host corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
     "[parse] prose:4: kind=ours depth=4 label=ours@prose env=- load=$bin|ctx=256 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
     "[parse] prose:4@BLOOMERY_AB_LOAD=arm: kind=ours depth=4 label=ours@prose@BLOOMERY_AB_LOAD=arm env=- load=$bin|ctx=256|solo corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102" \
-    "[parse] round 1 loads: [512 prose:512] [prose:512@BLOOMERY_QWEN38_EXPERTS=card] [4 prose:4] [prose:4@BLOOMERY_AB_LOAD=arm]" \
+    "[parse] round 1 loads: [512 prose:512] [prose:512@BLOOMERY_QWEN38_EXPERTS=host] [4 prose:4] [prose:4@BLOOMERY_AB_LOAD=arm]" \
     "[parse] load: $bin --arm <lcg_prompt 512> --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
-    "[parse] load: env BLOOMERY_QWEN38_EXPERTS=card $bin --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
+    "[parse] load: env BLOOMERY_QWEN38_EXPERTS=host $bin --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync" \
     "[parse] load: $bin --arm <lcg_prompt 4> --arm <prose_prompt 4> -n 96 --ctx 256 --time --arm-sync"
   # Under --parse-arms a corpus that is not readable (the box's path, read on the Mac) is named on
   # the arm's line, not refused; a run refuses it before anything else.

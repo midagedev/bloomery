@@ -309,7 +309,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: RESIDENCY,
         class: Class::C,
         kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1"]),
-        default: Unset::Is("off"),
+        default: Unset::Means(
+            "follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under `gate`, \
+             beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or `BLOOMERY_PREFILL=steps`, \
+             and in every other binary",
+        ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
@@ -319,20 +323,28 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               name when the plan's host headroom cannot take it, and prints `residency host`; \
               every pass prints `residency pass`; only an explicit call resets it (an arm's \
               clear, the server's `POST /residency/reset`), with a `residency reset` record. \
-              `bloomery-serve-ds41` refuses it beside `BLOOMERY_ROUTE_TRACE`, which records a \
-              fixed placement's routing. Every other binary refuses it set, by name.",
+              Unset follows the placement (`bloomery_levers::residency_unset`): the serving \
+              default `mid-p40-s1` under `--place a` and `bp`, and `off` where the machine \
+              does not run — `--place gate`, beside `BLOOMERY_CHECK_FINITE=1`, beside \
+              `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing) and beside \
+              `BLOOMERY_PREFILL=steps` (each prompt id would end a pass the rule counts); both \
+              binaries print the word and why as a `residency lever` record before the load. \
+              Set, `mid-…` is refused by name under `--place gate`, beside the finite probe, \
+              the route trace and the step feed. Every other binary refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
         name: QWEN38_EXPERTS,
         class: Class::A,
         kind: Kind::Words(&["host", "card"]),
-        default: Unset::Is("host"),
-        doc: "Qwen3.8 (`generate_qwen3moe`): `host` plans every routed expert on the host \
-              tier; `card` plans each layer's id prefix on the card as its budget holds \
+        default: Unset::Means("`card` on a qwen4exp file; nothing on another family's"),
+        doc: "Qwen3.8 (`generate_qwen3moe`): `card` plans each layer's id prefix (or its \
+              `BLOOMERY_HOT_LIST` ranks) on the card as its budget holds \
               (`place::Experts::Card`), run by the step's, the verify's and the pass's card \
-              leg and by the ubatch walk's card route — the same-binary arm. The `plan` line \
-              prints `experts=`.",
+              leg and the ubatch walk's card route; `host` plans every routed expert on the \
+              host tier, the same-binary arm. Unset is `card` on a qwen4exp file; set to \
+              `card`, a qwen3moe or qwen35moe file refuses it by name. The `plan` line prints \
+              `experts=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

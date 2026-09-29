@@ -267,9 +267,12 @@
 # D, or --tokens <the corpus ids>; no --arm), for a base binary that knows no --arm. The warm-up and the blocks' discards are one arm in a
 # process of its own.
 #
-# Residency. An arm whose environment turns adaptive residency on — BLOOMERY_RESIDENCY set to anything
-# but off, by its own @ list, else inherited by the runner (the lever's words are off, mid-p0-s1 and
-# mid-p40-s1; unset is off) — must start its timed work from the seed map, the load's placement
+# Residency. An arm whose binary runs adaptive residency — its `residency host` record, which generate_ds41
+# prints before its load when the lever it resolved is not off (BLOOMERY_RESIDENCY as its own @ list or the
+# runner sets it, else unset by the placement: mid-p40-s1 under --place a and bp, off under gate, beside
+# BLOOMERY_CHECK_FINITE=1 and beside BLOOMERY_PREFILL=steps; the binary's `residency lever` record names the
+# word and why; a bin: arm's older binary resolves by its own rule) — must start its timed work from the
+# seed map, the load's placement
 # (docs/fair-measure.md 2.5). The runner holds each such arm to the engine's own records, per
 # generate_ds41 process: the arm's first `residency pass` is pass=none boundary=0 (the first boundary
 # after the load or after a reset: at slot 1 the fresh load's, at a later slot the one after its clear);
@@ -280,10 +283,12 @@
 # kind, fails that arm too. The rotate warm-up and the blocks' discards are processes of their own, so
 # they warm no timed arm's map; a same-id PRIME (Warm rows), or any arm before this one in its load, is
 # what the reset clause covers: with no reset between, the arm's first pass is not none/0 and there is no
-# reset record, and it fails. An arm with residency off that prints a `residency pass` or `residency
-# reset` record fails as well (the lever leaked into an off arm). A failure is `FAIL r<r> <label> d=<D>
+# reset record, and it fails. An arm with no `residency host` record that prints a `residency pass` or
+# `residency reset` record fails as well (the lever leaked into an off arm), and so does an arm that sets
+# the lever to a value its binary's record does not name (off: no record). A failure is `FAIL r<r> <label> d=<D>
 # rc=residency | <each clause that failed> | full output: <file>` in place of the row. A residency arm
-# under a profile without RESIDENCY_RESET_DROPPED_BYTES is refused (64) before the lease. Every
+# under a profile without RESIDENCY_RESET_DROPPED_BYTES — any generate_ds41 arm, since only its binary knows
+# whether it runs the machine — is refused (64) before the lease. Every
 # residency row is followed by `residency curve <label> r<r> d=<D> windows=<w> tok/s=<a>,<b>,…
 # flips=<n> | <its row's tag> slot <k> | seed <what held>`: the arm's timed passes (`time step`, one
 # position each; under a draft `time pass`, its positions) in windows of RES_WINDOW (16) passes, in
@@ -447,7 +452,7 @@ ours_row() {
     return 1
   fi
   pp_col "$kind" || return
-  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm|residency host) '
+  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm|residency host|residency lever) '
   # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
   # and the `draft summary` line carries the positions-per-second rate the verdict reads.
   DRAFT=
@@ -471,7 +476,8 @@ ours_row() {
 # The residency seed condition and curve (the header's Residency). RES_WINDOW: the passes a curve window
 # holds.
 RES_WINDOW=16
-# res_value <index>: the BLOOMERY_RESIDENCY arm <index> runs with — its own @ list's, else the runner's.
+# res_value <index>: the BLOOMERY_RESIDENCY arm <index> sets — its own @ list's, else the runner's; empty
+# when neither sets it (the binary resolves unset: its `residency host` record, res_read's RH_WORD, says).
 res_value() {
   local e v=${BLOOMERY_RESIDENCY:-}
   local -a kv=()
@@ -481,37 +487,42 @@ res_value() {
   done
   echo "$v"
 }
-# res_on <index>: whether arm <index> runs with adaptive residency on.
-res_on() {
-  local v
-  v=$(res_value "$1")
-  [ -n "$v" ] && [ "$v" != off ]
-}
-# res_read <output>: the residency records and timed passes of an arm's output, by kind and field, into
-# RP_PASS, RP_BOUNDARY, RP_MADE (every `residency pass`, one a line), RR_ALL (every `residency reset`'s
-# diff) and RR_TAIL (the `residency reset` lines after the last record of another kind: the report of a
-# clear that follows the arm), CV_STEP (the `time step` walls), CV_PASS and CV_POS (the `time pass`
-# walls and positions). Returns 2 with RES_WHY set when records.py cannot read the output.
+# res_read <output> [<its load's lines>]: the residency records and timed passes of an arm's output, by
+# kind and field, into RH_WORD (the word of the `residency host` record the binary printed before its load,
+# in the output or, for an arm of a shared load, in the load's lines; empty when there is none: the binary
+# resolved the lever to off), RP_PASS, RP_BOUNDARY, RP_MADE (every `residency pass`, one a line), RR_ALL
+# (every `residency reset`'s diff) and RR_TAIL (the `residency reset` lines after the last record of
+# another kind: the report of a clear that follows the arm), CV_STEP (the `time step` walls), CV_PASS and
+# CV_POS (the `time pass` walls and positions). Returns 2 with RES_WHY set when records.py cannot read
+# the output.
 res_read() {
-  local rec
+  local rec rh
   RES_WHY="records.py did not read the output"
   rec=$(python3 "$RECORDS" sh - 'RP_PASS=residency_pass.pass*' 'RP_BOUNDARY=residency_pass.boundary*' \
     'RP_MADE=residency_pass.made*' 'RR_ALL=residency_reset.diff*' 'CV_STEP=time_step.ms*' \
     'CV_PASS=time_pass.ms*' 'CV_POS=time_pass.positions*' <<< "$1") || return 2
   RR_TAIL=$(python3 "$RECORDS" tail - residency_reset <<< "$1") || return 2
+  rh=$(python3 "$RECORDS" sh - 'RH_WORD=residency_host.residency*' <<< "$1"$'\n'"${2:-}") || return 2
   RES_WHY=''
   eval "$rec"
+  eval "$rh"
+  RH_WORD=$(head -n 1 <<< "$RH_WORD")
 }
 # res_seed <index> <slot>: the seed condition of the output res_read read, arm <index>'s at its slot in its
 # load (1 for a process of its own), the previous arm's output in LG_PREV_OUT when the slot is past 1.
 # Returns 1 with RES_WHY naming every clause that failed; on success RES_SEED says what held.
 res_seed() {
-  local i=$1 slot=$2 first b0 n_all n_tail rec
+  local i=$1 slot=$2 first b0 n_all n_tail rec asked
   local -a why=()
   RES_WHY='' RES_SEED=''
   n_all=$(grep -c . <<< "$RR_ALL")
   n_tail=$(grep -c . <<< "$RR_TAIL")
-  if ! res_on "$i"; then
+  # An arm that sets the lever holds the binary to it: the word the record names, or no record for off.
+  asked=$(res_value "$i")
+  if [ -n "$asked" ] && [ "$asked" != "${RH_WORD:-off}" ]; then
+    why+=("the arm sets BLOOMERY_RESIDENCY=$asked and its binary resolved ${RH_WORD:-off} (its residency host record$([ -n "$RH_WORD" ] || echo ": none"))")
+  fi
+  if [ -z "$RH_WORD" ]; then
     [ -z "$RP_PASS" ] || why+=("$(grep -c . <<< "$RP_PASS") residency pass record(s) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm")
     [ "$n_all" = 0 ] || why+=("$n_all residency reset record(s) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm")
     if [ ${#why[@]} -gt 0 ]; then
@@ -522,7 +533,7 @@ res_seed() {
     return 0
   fi
   if [ -z "$RP_PASS" ]; then
-    why+=("no residency pass record: BLOOMERY_RESIDENCY=$(res_value "$i") ran no residency machine")
+    why+=("no residency pass record: BLOOMERY_RESIDENCY=$RH_WORD ran no residency machine")
   else
     first=$(head -n 1 <<< "$RP_PASS") b0=$(head -n 1 <<< "$RP_BOUNDARY")
     if [ "$first" != none ] || [ "$b0" != 0 ]; then
@@ -780,18 +791,23 @@ for i in "${!ARMS[@]}"; do
     *) LG_KEY[i]= ;;
   esac
 done
-# The residency arms (the header's Residency), and the profile's reset bytes their later slots are held to:
-# refused before the lease when the profile gives none.
-RES_ARMS=()
+# The arms that may run the residency machine (the header's Residency): every generate_ds41 arm, since the
+# binary resolves an unset lever by its placement and prints what it resolved; the ones that set it, and the
+# profile's reset bytes a residency arm's later slots are held to: refused before the lease when the profile
+# gives none.
+RES_ARMS=() RES_SET=()
 for i in "${!ARMS[@]}"; do
   case ${A_KIND[$i]} in
-    ours | corpus | bin) if res_on "$i"; then RES_ARMS+=("${ARMS[$i]}"); fi ;;
+    ours | corpus | bin)
+      RES_ARMS+=("${ARMS[$i]}")
+      [ -z "$(res_value "$i")" ] || RES_SET+=("${ARMS[$i]}")
+      ;;
   esac
 done
 if [ ${#RES_ARMS[@]} -gt 0 ]; then
   case ${RESIDENCY_RESET_DROPPED_BYTES:-} in
     '' | *[!0-9]*)
-      echo "depth-ds41.sh: arms ${RES_ARMS[*]} run with BLOOMERY_RESIDENCY on, and the profile $MODEL_NAME gives no RESIDENCY_RESET_DROPPED_BYTES (the host bytes a residency reset releases, which every later slot's reset must carry; got '${RESIDENCY_RESET_DROPPED_BYTES:-}'): set it in tools/ref/models/$MODEL_NAME.sh" >&2
+      echo "depth-ds41.sh: arms ${RES_ARMS[*]} may run with BLOOMERY_RESIDENCY on (the binary resolves it: set, or unset by its placement), and the profile $MODEL_NAME gives no RESIDENCY_RESET_DROPPED_BYTES (the host bytes a residency reset releases, which every later slot's reset must carry; got '${RESIDENCY_RESET_DROPPED_BYTES:-}'): set it in tools/ref/models/$MODEL_NAME.sh" >&2
       exit 64
       ;;
   esac
@@ -799,9 +815,9 @@ fi
 # res_config: the residency check's [config] and [dry] line.
 res_config() {
   if [ ${#RES_ARMS[@]} -eq 0 ]; then
-    echo "residency: no arm runs with BLOOMERY_RESIDENCY on; an arm that prints a residency pass or reset record is a FAIL rc=residency row (the lever leaked)"
+    echo "residency: no generate_ds41 arm"
   else
-    echo "residency: ${RES_ARMS[*]} run with BLOOMERY_RESIDENCY on: each starts from the seed (its first residency pass none/0, and at slot k > 1 one residency reset before its arm line with diff=0 and dropped_bytes=$RESIDENCY_RESET_DROPPED_BYTES, the profile's) or is a FAIL rc=residency row; a residency curve line after each row, windows of $RES_WINDOW passes"
+    echo "residency: arms that set BLOOMERY_RESIDENCY: ${RES_SET[*]:-none}; each of ${RES_ARMS[*]} runs as its binary's residency host record says (unset follows the placement): an arm with the record starts from the seed (its first residency pass none/0, and at slot k > 1 one residency reset before its arm line with diff=0 and dropped_bytes=$RESIDENCY_RESET_DROPPED_BYTES, the profile's) or is a FAIL rc=residency row, with a residency curve line after each row, windows of $RES_WINDOW passes; an arm without it that prints a residency pass or reset record, or one whose record disagrees with the value it sets, is a FAIL rc=residency row"
   fi
 }
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
@@ -1306,7 +1322,8 @@ ours_post() {
   fi
   # The residency seed condition (the header's Residency): the slot from the arm record, 1 for a process
   # of its own; LG_PREV_OUT is read only past slot 1, which only the load driver's processes have.
-  res_read "$out" || {
+  # An arm of a shared load (an `arm` record opens its output) has its load's lines in LG_HEADER.
+  res_read "$out" "$([ -z "$a" ] || printf '%s' "${LG_HEADER:-}")" || {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$RES_WHY" "$out"
     return 0
   }
@@ -1332,7 +1349,7 @@ ours_post() {
 # The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment, and an arm's
 # guards and witness blocks around it. The load's lines echoed once: its plan, load, host set, capture
 # and prompt buffer lines.
-LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host) '
+LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host|residency lever) '
 lg_cmd() {
   local i c
   arm_envs "$1"
