@@ -533,6 +533,42 @@ pub const fn card_scratch_bytes(ubatch: u64) -> u64 {
     SCRATCH + ubatch_scratch_bytes(ubatch)
 }
 
+/// The most tokens one routed run of a ubatch walk's card route takes, and
+/// so the run buffers' width: the walk routes in runs of this many tokens
+/// (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s `ROUTE_ROWS`, restated
+/// here — the model crate does not read the gpu crate).
+pub const CARD_ROUTE_ROWS: u64 = 2_048;
+
+/// Card bytes a ubatch walk's card route holds a run token, an upper bound
+/// [derived: the compressed ids and the places 80 B (ten u32 each); the
+/// gate·up input `GemmAct` at K = 2,560, 8,592 B a column (q3 2,560 + q4
+/// 3,072 + q6 2,560 + s8 320 + d8 80); the gate and up f32 rows
+/// 2 · 10 · 640 · 4 = 51,200 B; the SwiGLU `GemmAct32` at K = 640, 800 B a
+/// column, 8,000 B; the down f32 rows 10 · 2,560 · 4 = 102,400 B; two route
+/// tables — the cols list 2 · 40 B, their tile words at the most experts
+/// 2 · 8 · (320 + 512) / 2,048 = 3.25 B, the counts; the identity map of
+/// the ids compression 512 words = 1 B: 170,272 + 87.6 + 1, rounded up].
+pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
+
+/// Card bytes a ubatch walk's card route holds a token of the whole unit
+/// [derived: the card slots' weighted sums, `HIDDEN` f32 a row].
+pub const CARD_ROUTE_ACC_TOKEN_BYTES: u64 = 10_240;
+
+/// The card bytes a qwen4exp ubatch walk's card route holds at ubatches of
+/// up to `u` positions: the run buffers and route tables once
+/// `min(u, CARD_ROUTE_ROWS)` run tokens, the sums a token of the whole
+/// unit. Counted under [`Experts::Card`] only
+/// ([`machine_for_experts`]): a host-routed plan's walk holds none of it.
+#[must_use]
+pub const fn card_route_scratch_bytes(u: u64) -> u64 {
+    let run = if u < CARD_ROUTE_ROWS {
+        u
+    } else {
+        CARD_ROUTE_ROWS
+    };
+    run * CARD_ROUTE_RUN_TOKEN_BYTES + u * CARD_ROUTE_ACC_TOKEN_BYTES
+}
+
 /// The ubatch arena bytes a plan made on `card` counts: its scratch past the
 /// m = 1 scratch. The load of a ubatch whose arena holds more is refused by
 /// name.
@@ -546,15 +582,35 @@ pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
 /// the card gathers), with this workstation's context, margin and host tier
 /// and the scratch of a load that runs ubatches of up to `ubatch` positions
 /// ([`card_scratch_bytes`]): the size the load itself takes, read once by
-/// the caller that builds this machine and opens the load.
+/// the caller that builds this machine and opens the load. A host-routed
+/// plan's load ([`Experts::Host`]); a card one's
+/// ([`machine_for_experts`]) beside the ubatch walk's card route.
 #[must_use]
 pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
+    machine_for_experts(card, layers, ubatch, Experts::Host)
+}
+
+/// [`machine`] for a plan whose routed experts go where `experts` says: under
+/// [`Experts::Card`] the ubatch walk's card route scratch
+/// ([`card_route_scratch_bytes`]) is counted beside the ubatch's — the walk
+/// holds those buffers when the plan puts experts on the card.
+#[must_use]
+pub fn machine_for_experts(
+    card: CardSpec,
+    layers: usize,
+    ubatch: u64,
+    experts: Experts,
+) -> Machine {
+    let route = match experts {
+        Experts::Host => 0,
+        Experts::Card => card_route_scratch_bytes(ubatch),
+    };
     Machine {
         cards: vec![Card {
             name: card.name.to_string(),
             usable_bytes: card.usable_bytes(),
             context_bytes: CONTEXT,
-            scratch_bytes: card_scratch_bytes(ubatch),
+            scratch_bytes: card_scratch_bytes(ubatch) + route,
             margin_bytes: MARGIN,
             granule_bytes: GRANULE,
             layers: 0..layers,

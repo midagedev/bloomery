@@ -193,6 +193,100 @@ mod gemm32_kernels {
         }
     }
 
+    /// [`swiglu_quant32`] over the slots a route left the card: a column
+    /// whose place `sel[col]` is `HOST` is the host's — nothing of it is
+    /// read, written or refused, so a stale column a reset left raises
+    /// nothing; one whose place is below `n_card` is quantized as
+    /// `swiglu_quant32` quantizes it; one in `[n_card, HOST)` is no expert
+    /// either side serves and raises [`FaultSite::ExpertId`] without a
+    /// store.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            g.len() >= n_cols * 32 * blocks,
+            u.len() >= n_cols * 32 * blocks,
+            sel.len() >= n_cols,
+            2 * steps >= blocks,
+            q.len() >= n_cols * 16 * steps,
+            d.len() >= n_cols * 2 * steps,
+            s.len() >= n_cols * 2 * steps
+        )
+    )]
+    pub fn swiglu_quant32_sel(
+        g: &[f32],
+        u: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        n_cols: u32,
+        blocks: u32,
+        groups: u32,
+        steps: u32,
+        mut q: DisjointSlice<u32>,
+        mut d: DisjointSlice<f32>,
+        mut s: DisjointSlice<i32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        let groups = groups as usize;
+        if grp >= n_cols as usize * groups {
+            return; // warp-uniform: one warp per block
+        }
+        let col = grp / groups;
+        let gi = grp - col * groups;
+        // SAFETY: col < n_cols <= sel.len() by the launch contract; the
+        // column is warp-uniform, so the branch is too.
+        let place = unsafe { *sel.get_unchecked(col) };
+        if place == crate::hybrid::HOST {
+            return;
+        }
+        if place >= n_card {
+            if warp::lane_id() == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let blocks = blocks as usize;
+        let b = (4 * gi + (lane >> 3)).min(blocks - 1);
+        let base = col * 32 * blocks + 32 * b + 4 * (lane & 7);
+        // SAFETY: b < blocks, so base + 3 < (col + 1)·32·blocks, inside g and
+        // u by the launch contract.
+        let v = unsafe {
+            [
+                silu_mul(*g.get_unchecked(base), *u.get_unchecked(base)),
+                silu_mul(*g.get_unchecked(base + 1), *u.get_unchecked(base + 1)),
+                silu_mul(*g.get_unchecked(base + 2), *u.get_unchecked(base + 2)),
+                silu_mul(*g.get_unchecked(base + 3), *u.get_unchecked(base + 3)),
+            ]
+        };
+        // SAFETY: the warp enters with one (col, gi), col < n_cols and gi <
+        // groups = ceil(blocks / 4); the planes' bounds are the launch
+        // contract's.
+        let refused = unsafe {
+            quant32_group(
+                v,
+                col,
+                gi,
+                blocks,
+                steps as usize,
+                lane,
+                &mut q,
+                &mut d,
+                &mut s,
+            )
+        };
+        if refused && lane & 7 == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
+    }
+
     /// The 32-value GEMM for a Q8_0 stack in the q8f32 planes (`gemm32.rs`):
     /// `qs` is `n_experts · rows` rows of `8 · blocks` words, `wd` their
     /// `blocks` f16 scale bits each; the activations are a `GemmAct32` of
