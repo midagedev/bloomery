@@ -68,6 +68,19 @@
 //! `kind=` is the path the prompt ran — `step`, `pass` or `gemm`, never
 //! `auto`. `--place` on any other file is refused by name.
 //!
+//! `BLOOMERY_ROUTE_TRACE=<dir>` (a qwen4exp file only, refused by name on
+//! the others) writes the engine's route trace of the run into `dir`, a new
+//! directory made before the load (`crates/gpu/src/host/route_trace.rs`):
+//! every position's routed ids per layer and the slot each ran in, as a
+//! router set. The prompt's ids run one step each and are recorded as the
+//! call's positions — `--prefill step` is required, `--prefill pass` and
+//! `gemm` (and the unset `auto`) refused by name, and so is `--time` (the
+//! trace rewrites its manifest after every position, so a timed run's
+//! numbers are not a measurement). A `--arm` list writes one `call` row an
+//! arm under one set, and the set's `chunk` header line names the positions
+//! every arm writes when they all write the same count. The run ends with
+//! `route trace <dir> positions=<n> complete` once the set is sealed.
+//!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
 //! `ubatch_attn=gqa_prefill_flash`, and their size,
@@ -178,6 +191,7 @@ mod cli {
         Body, Body35, Body38, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model,
     };
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
@@ -192,7 +206,7 @@ mod cli {
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
     use std::num::NonZeroUsize;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
     use tokenizer::Tokenizer;
 
@@ -325,6 +339,20 @@ mod cli {
         /// The host tier's counters since load, for `BLOOMERY_STEP_STATS`;
         /// `None` for a body with no host tier.
         fn host_stats(_: &GpuModel<Self>) -> Result<Option<HybridStats>, GateError> {
+            Ok(None)
+        }
+
+        /// Mark a prompt call of `n` ids from cache position `pos` on the
+        /// host tier's route trace (`Hybrid::route_prompt`), before the ids
+        /// run; nothing for a body with no host tier.
+        fn mark_prompt(_m: &mut GpuModel<Self>, _pos: u32, _n: usize) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        /// Take the route trace the body's host tier holds, if one, finish
+        /// it and return its directory and the positions it wrote; `None`
+        /// with no trace.
+        fn finish_trace(_m: &mut GpuModel<Self>) -> Result<Option<(PathBuf, u64)>, GateError> {
             Ok(None)
         }
     }
@@ -593,6 +621,30 @@ mod cli {
         fn host_stats(m: &Qwen38Model) -> Result<Option<HybridStats>, GateError> {
             Ok(Some(m.body("generate_qwen3moe")?.hybrid().stats()))
         }
+
+        /// The trace's `call` row: the arm's prompt ids one step each from
+        /// `pos` ([`Hybrid::route_prompt`]).
+        fn mark_prompt(m: &mut Qwen38Model, pos: u32, n: usize) -> Result<(), GateError> {
+            Ok(m.body_parts("generate_qwen3moe")?
+                .2
+                .hybrid_mut()
+                .route_prompt(pos, n)?)
+        }
+
+        /// [`Hybrid::take_route_trace`], the set sealed by
+        /// [`RouteTrace::finish`].
+        fn finish_trace(m: &mut Qwen38Model) -> Result<Option<(PathBuf, u64)>, GateError> {
+            let Some(t) = m
+                .body_parts("generate_qwen3moe")?
+                .2
+                .hybrid_mut()
+                .take_route_trace()
+            else {
+                return Ok(None);
+            };
+            let dir = t.dir().to_path_buf();
+            Ok(Some((dir, t.finish()?)))
+        }
     }
 
     /// The refusal of `--seed-depth D` on a qwen4exp file.
@@ -676,6 +728,7 @@ mod cli {
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::HOT_LIST,
+            bloomery_levers::ROUTE_TRACE,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         let experts = experts38(&levers)?;
@@ -694,6 +747,13 @@ mod cli {
                     h.display()
                 )
                 .into());
+            }
+            if levers.route_trace().is_some() {
+                return Err(
+                    "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's steps; --dump-taps runs \
+                     a qwen3moe file"
+                        .into(),
+                );
             }
             return dump_taps(&dir);
         }
@@ -758,6 +818,13 @@ mod cli {
         if family != Family::Qwen38 && levers.hot_list().is_some() {
             return Err(
                 "BLOOMERY_HOT_LIST ranks a qwen4exp card plan's routed experts; a qwen3moe or \
+                 qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && levers.route_trace().is_some() {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
                  qwen35moe plan holds every one on the card"
                     .into(),
             );
@@ -843,7 +910,20 @@ mod cli {
                 sync,
             ),
             Chosen::Qwen38(path, place) => {
+                let trace = trace38(
+                    &levers,
+                    &file,
+                    (path, place, experts),
+                    arms_chunk(&arms),
+                    timed,
+                )?;
                 let mut m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                if let Some(t) = trace {
+                    m.body_parts("generate_qwen3moe")?
+                        .2
+                        .hybrid_mut()
+                        .attach_route_trace(t)?;
+                }
                 m.set_prompt38_stats(run.stats)?;
                 drive(m, &run, path, &arms, listed, sync)
             }
@@ -1064,6 +1144,80 @@ mod cli {
         }
     }
 
+    /// The positions every arm of the run writes — its prompt's ids one
+    /// step each, then its generated tokens less the first, which the
+    /// prompt's last step already answered — when they all write the same
+    /// count, for the trace's `chunk` header line; `None` when they differ
+    /// (the line names one context shape, so a run of unequal arms writes
+    /// none and the replay tool refuses the set's unknown contexts by name).
+    fn arms_chunk(arms: &[Arm]) -> Option<usize> {
+        let of = |a: &Arm| a.ids.len() + a.n_gen - 1;
+        let first = of(arms.first()?);
+        arms.iter().all(|a| of(a) == first).then_some(first)
+    }
+
+    /// The route trace `BLOOMERY_ROUTE_TRACE` asks for on a qwen4exp file,
+    /// its directory made here, before the load: every position's routed
+    /// ids per layer and the slot each ran in
+    /// (`crates/gpu/src/host/route_trace.rs`), the prompt's ids one step
+    /// each recorded as the call's positions. Refused by name under a
+    /// prompt path but `step` — a pass runs a multi-row service and a
+    /// ubatch a prompt batch, and the trace records one-row steps — and
+    /// beside `--time`: the trace rewrites its manifest after every
+    /// position, so a timed run's numbers would not be a measurement.
+    fn trace38(
+        levers: &Levers,
+        file: &Split,
+        (path, place, experts): (Prompt38, Place38, Experts),
+        chunk: Option<usize>,
+        timed: bool,
+    ) -> Result<Option<RouteTrace>, GateError> {
+        let Some(dir) = levers.route_trace() else {
+            return Ok(None);
+        };
+        if path != Prompt38::Step {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records one-row steps: pass --prefill step (a pass runs a \
+                 multi-row service and a ubatch a prompt batch, which the trace does not record)"
+                    .into(),
+            );
+        }
+        if timed {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE rewrites its manifest after every position, so --time \
+                 beside it is not a measurement: run the trace without --time"
+                    .into(),
+            );
+        }
+        let inputs = PlanInputs::describe(file)?;
+        let hp = &inputs.hp;
+        let mut extra = vec![
+            ("place".to_owned(), place.name().to_owned()),
+            ("experts".to_owned(), experts_name(experts).to_owned()),
+            (
+                "hot_list".to_owned(),
+                levers
+                    .hot_list()
+                    .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
+            ),
+            ("prefill".to_owned(), path.name().to_owned()),
+        ];
+        if let Some(n) = chunk {
+            extra.push(("chunk".to_owned(), n.to_string()));
+        }
+        let header = TraceHeader {
+            model: ref_model_path()?,
+            arch: "qwen4exp".to_owned(),
+            build: "generate_qwen3moe".to_owned(),
+            n_expert: hp.n_expert,
+            n_used: hp.n_used,
+            first_layer: 0,
+            n_layer: inputs.spec.layers.len(),
+            extra,
+        };
+        Ok(Some(RouteTrace::create(dir, header)?))
+    }
+
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
     /// card `place` names, its routed experts where `experts` says: the
     /// `plan` and `load` lines, and in graph mode the step captured and its
@@ -1159,6 +1313,9 @@ mod cli {
 
     /// Every arm of the run on the loaded model `m`, in a session over it;
     /// `listed` for an `--arm` list, whose arms open with their `arm` lines.
+    /// A run whose model holds a route trace ends by sealing the set
+    /// ([`Prompted::finish_trace`]) once every arm ran; a failed arm leaves
+    /// the set without its `complete` line, as a killed run's is.
     fn drive<B: Prompted>(
         m: GpuModel<B>,
         run: &Run,
@@ -1169,7 +1326,7 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let count = arms.len();
-        s.arms(arms, |s, i, arm| {
+        let ran = s.arms(arms, |s, i, arm| {
             if listed {
                 println!(
                     "arm i={i} arms={count} ids={} n={}",
@@ -1187,8 +1344,12 @@ mod cli {
                 println!("prompt_ids {:?}", arm.ids);
             }
             run_arm(s.model_mut(), run, path, arm)
-        })
-        .map_err(|f| Box::new(f) as GateError)
+        });
+        ran.map_err(|f| Box::new(f) as GateError)?;
+        if let Some((dir, rows)) = B::finish_trace(s.model_mut())? {
+            println!("route trace {} positions={rows} complete", dir.display());
+        }
+        Ok(())
     }
 
     fn mode_name(mode: StepMode) -> &'static str {
@@ -1213,6 +1374,7 @@ mod cli {
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
         let depth = run.seed_depth.unwrap_or(ids.len());
+        B::mark_prompt(m, m.pos(), ids.len())?;
         let plan = B::plan(m, ids.len(), path)?;
         let t = Instant::now();
         let mut next = B::prefill(m, ids, path)?;

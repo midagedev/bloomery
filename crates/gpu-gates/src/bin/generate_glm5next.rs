@@ -40,6 +40,17 @@
 //! that, the ones its selector lists. The levers it acts on are parsed once,
 //! at `main`; every line is a record of a kind `bloomery_gpu_gates::record`
 //! declares (`--records-schema` prints them).
+//!
+//! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
+//! into `dir`, a new directory made before the load
+//! (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per
+//! layer and the slot each ran in, as a router set. The prompt's ids run one
+//! step each and are recorded as the call's positions — `--prefill steps` is
+//! required (the batched call is a prompt batch, which the trace does not
+//! record) and `--time` is refused, each by name. The trace holds the host
+//! tier's routed run, past the dense lead, under the file's own layer
+//! numbers, as a reference engine's set of the same file. The run ends with
+//! `route trace <dir> positions=<n> complete` once the set is sealed.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -54,18 +65,23 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "glm5next")]
 mod cli {
+    use std::path::PathBuf;
     use std::time::Instant;
 
     use app::arch::glm5next::GlmCfg;
     use app::{Loaded, OpenArgs, OpenLog, SessionError};
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
-    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8, ROUTE_TRACE,
+    };
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use runtime::layer::hosted;
     use runtime::{Target, Want};
 
     const ACTS_ON: &[&str] = &[
@@ -75,6 +91,7 @@ mod cli {
         HOST_LOCK,
         CARD_DONTNEED,
         R8,
+        ROUTE_TRACE,
     ];
 
     /// The last value of flag `name`, if given.
@@ -232,6 +249,15 @@ mod cli {
         }
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let trace = trace_of(
+            &levers,
+            &file,
+            prefill,
+            place,
+            &path,
+            ids.len() + n_gen.saturating_sub(1),
+            timed,
+        )?;
         let cfg = GlmCfg {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
@@ -257,6 +283,13 @@ mod cli {
             return Ok(());
         };
         let mut s = loaded.ready(&mut log)?;
+        if let Some(t) = trace {
+            s.model_mut()
+                .body_parts("generate_glm5next")?
+                .2
+                .hybrid_mut()
+                .attach_route_trace(t)?;
+        }
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids
             .iter()
@@ -274,6 +307,14 @@ mod cli {
             PrefillMode::Steps => ids.len(),
         };
         let t_feed = Instant::now();
+        if prefill == PrefillMode::Steps {
+            let pos = s.pos();
+            s.model_mut()
+                .body_parts("generate_glm5next")?
+                .2
+                .hybrid_mut()
+                .route_prompt(pos, ids.len())?;
+        }
         let mut next = s.prompt(&ids, Want::Argmax)?.argmax();
         let feed = t_feed.elapsed();
         Record::new(&record::STEP0)
@@ -354,6 +395,87 @@ mod cli {
                 .f("tok/s(p50)", 1e3 / p50)
                 .print();
         }
+        if let Some(t) = s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .hybrid_mut()
+            .take_route_trace()
+        {
+            let dir = t.dir().to_path_buf();
+            println!(
+                "route trace {} positions={} complete",
+                dir.display(),
+                t.finish()?
+            );
+        }
         Ok(())
+    }
+
+    /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
+    /// here, before the load: every position's routed ids per layer and the
+    /// slot each ran in (`crates/gpu/src/host/route_trace.rs`), the prompt's
+    /// ids one step each recorded as the call's positions. The trace covers
+    /// the routed layers the host tier serves, as many as its slot map holds
+    /// ([`hosted`]). Refused by name under the batched feed — a batch is a
+    /// prompt batch, which the trace does not record — and beside `--time`:
+    /// the trace rewrites its manifest after every position, so a timed
+    /// run's numbers would not be a measurement.
+    fn trace_of(
+        levers: &bloomery_levers::Levers,
+        file: &Split,
+        prefill: PrefillMode,
+        place: &'static str,
+        path: &str,
+        chunk: usize,
+        timed: bool,
+    ) -> Result<Option<RouteTrace>, GateError> {
+        let Some(dir) = levers.route_trace() else {
+            return Ok(None);
+        };
+        if prefill != PrefillMode::Steps {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records one-row steps: pass --prefill steps (the batched \
+                 call is a prompt batch, which the trace does not record)"
+                    .into(),
+            );
+        }
+        if timed {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE rewrites its manifest after every position, so --time \
+                 beside it is not a measurement: run the trace without --time"
+                    .into(),
+            );
+        }
+        let inputs = PlanInputs::describe(file)?;
+        let run = hosted(&inputs.spec.layers)
+            .map_err(|e| format!("the file's layers hold no host run: {e}"))?;
+        let header = TraceHeader {
+            model: PathBuf::from(path),
+            arch: "glm5next".to_owned(),
+            build: "generate_glm5next".to_owned(),
+            n_expert: inputs.hp.n_expert,
+            n_used: inputs.hp.n_used,
+            first_layer: run.start,
+            n_layer: run.len(),
+            extra: vec![
+                ("place".to_owned(), place.to_owned()),
+                (
+                    "hot_list".to_owned(),
+                    levers
+                        .hot_list()
+                        .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
+                ),
+                (
+                    "card_budget".to_owned(),
+                    levers
+                        .card_budget_bytes()
+                        .map_or_else(|| "each card's own".to_owned(), |b| b.to_string()),
+                ),
+                ("prefill".to_owned(), prefill.name().to_owned()),
+                ("chunk".to_owned(), chunk.to_string()),
+            ],
+        };
+        Ok(Some(RouteTrace::create(dir, header)?))
     }
 }

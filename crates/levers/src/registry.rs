@@ -239,12 +239,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::D,
         kind: Kind::Path,
         default: Unset::Means("no trace"),
-        doc: "`bloomery-serve-ds41`: the directory, created at `main` as a new directory \
+        doc: "`bloomery-serve-ds41`, `generate_qwen3moe` (a qwen4exp file) and \
+              `generate_glm5next`: the directory, created at `main` as a new directory \
               (an existing path or a missing parent is refused by name), the host tier \
               writes a route trace into (`crates/gpu/src/host/route_trace.rs`): every \
               position's routed ids per layer and the slot each ran in, as a router set, \
-              a `call` row per prompt call. Needs `BLOOMERY_PREFILL=steps` and no \
-              `BLOOMERY_DRAFT`, each refused by name otherwise.",
+              a `call` row per prompt call. The server needs `BLOOMERY_PREFILL=steps` \
+              and no `BLOOMERY_DRAFT`; the generators need their step feed \
+              (`--prefill step` / `--prefill steps`) and refuse `--time`, each refused \
+              by name otherwise.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

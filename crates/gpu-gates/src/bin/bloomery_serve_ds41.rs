@@ -377,6 +377,7 @@ mod drive {
             build: format!("bloomery-serve-ds41 {}", serve::VERSION),
             n_expert: hp.experts.n_expert,
             n_used: hp.experts.n_used,
+            first_layer: 0,
             n_layer: hp.n_layer,
             extra: vec![
                 ("placement".to_owned(), place.name().to_owned()),

@@ -785,6 +785,7 @@ mod gate {
             build: TRACE_BUILD.to_owned(),
             n_expert: hp.experts.n_expert,
             n_used: hp.experts.n_used,
+            first_layer: 0,
             n_layer: hp.n_layer,
             extra: vec![("placement".to_owned(), "gate".to_owned())],
         };
