@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The depth-glm5next.sh stub test: the runner's arms with no lease, no card and no model. It copies the
 # runner (DEPTH_GLM5NEXT_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags), cards.sh,
+# ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
 # timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, cold-blocks.sh, gguf-ranges.py, records.py with
 # generate_glm5next's checked-in schema, and a copy of lease.sh whose lease_take is replaced by a line
-# that takes nothing. The profile keeps a caller's values, so the two PR trees' llama-bench and
+# that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The profile keeps a
+# caller's values, so the two PR trees' llama-bench and
 # llama-server and generate_glm5next are stub scripts here, and MODEL a path nothing opens — or, for
 # the preheat cases, gguf-ranges.py's two-shard fixture. Every case runs with BLOOMERY_PREHEAT=0 unless
 # it sets 1. Nothing it starts loads a model or touches a card.
@@ -73,11 +74,16 @@ T=$tmp/tree
 mkdir -p "$T/tools/ref/models" "$T/tools/bloomery/schema" "$T/bin" "$T/pr27752" "$T/pr27754" "$T/data" \
   "$T/target/release" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-glm5next.sh"
-cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" \
+cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" \
   "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/gguf-ranges.py" "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
+# The tree's cards.sh only: this test writes its own nvidia-smi below.
+STUB_CARDS_FILE_ONLY=1
+# shellcheck source=tools/ref/depth-stub-cards.sh
+. "$HERE/depth-stub-cards.sh"
+unset STUB_CARDS_FILE_ONLY
 cp "$ROOT/tools/bloomery/schema/generate_glm5next.jsonl" "$T/tools/bloomery/schema/"
 # The preheat cases' model: gguf-ranges.py's fixture (block_count 2: token_embd and layer 0's experts in
 # shard 1, layer 1's in shard 2).
@@ -387,7 +393,7 @@ if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next" "$T/data/router"
   cp "$PROSE_SRC" "$T/data/glm5next/"
   echo "stub hot list" > "$T/data/router/glm5next-hotlist.txt"
-  GPU_A=$(sed -n 's/^GPU_A6000=//p' "$ROOT/tools/ref/cards.sh")
+  GPU_A=$STUB_GPU_A6000
   L=$tmp/ours-timed.log
   stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6 hot:6
   L2=$tmp/ours-nofed.log

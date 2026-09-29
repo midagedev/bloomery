@@ -1,6 +1,8 @@
 # shellcheck shell=bash
-# The two stub tests' cards (depth-qwen3moe-stub.sh, depth-ds41-stub.sh): sourced with T set to the stub
-# tree, it writes three stubs into $T/bin. It runs nothing else.
+# The stub tests' cards (depth-qwen3moe-stub.sh, depth-ds41-stub.sh, depth-glm5next-stub.sh): sourced with
+# T set to the stub tree, it writes the tree's cards.sh — two made-up UUIDs, STUB_GPU_A6000 and
+# STUB_GPU_3090, never the box's — and, unless STUB_CARDS_FILE_ONLY is set, three stubs into $T/bin. It
+# runs nothing else.
 #   nvidia-smi         the one-card queries answer as they always did in the stubs (any card's name is
 #                      the A6000's, no compute process, `stub` fields); a query that names a card by -i
 #                      and asks the two-card fields answers for that card: its name, power limit (the
@@ -15,6 +17,15 @@
 #                      device when STUB_SEE_ONE names the label); an Xid 79 line of the 3090 into
 #                      $TMPDIR/stub-xid when STUB_BENCH_XID names it (the first time only). Under one card
 #                      it prints nothing, so the one-card checks read what they always read.
+STUB_GPU_A6000=GPU-00000000-0000-0000-0000-000000000000
+STUB_GPU_3090=GPU-11111111-1111-1111-1111-111111111111
+cat > "$T/tools/ref/cards.sh" << CARDSFILE
+# shellcheck shell=bash
+# The stub tree's cards: made-up UUIDs that the stub nvidia-smi answers to.
+GPU_3090=$STUB_GPU_3090
+GPU_A6000=$STUB_GPU_A6000
+CARDSFILE
+[ -z "${STUB_CARDS_FILE_ONLY:-}" ] || return 0
 cat > "$T/bin/nvidia-smi" << 'SMI'
 #!/usr/bin/env bash
 id='' q=''
@@ -26,8 +37,8 @@ for ((a = 1; a <= $#; a++)); do
   esac
 done
 case $id in
-  GPU-307fa0f6-*) card=3090 name='NVIDIA GeForce RTX 3090 (stub)' lim=${STUB_3090_LIMIT:-250.00} bus=00000000:41:00.0 ;;
-  GPU-8c129fa6-*) card=a6000 name='NVIDIA RTX A6000 (stub)' lim=300.00 bus=00000000:61:00.0 ;;
+  GPU-11111111-*) card=3090 name='NVIDIA GeForce RTX 3090 (stub)' lim=${STUB_3090_LIMIT:-250.00} bus=00000000:41:00.0 ;;
+  GPU-00000000-*) card=a6000 name='NVIDIA RTX A6000 (stub)' lim=300.00 bus=00000000:61:00.0 ;;
   *) card='' ;;
 esac
 if [ "$card" = 3090 ] && [ -n "${STUB_3090_GONE:-}" ]; then

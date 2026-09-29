@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, cards.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh,
+# timing-card.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh,
 # cold-blocks.sh, lcpp-warm.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a
-# line that takes nothing; ref-paths.sh there is a stub
+# line that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs; ref-paths.sh there
+# is a stub
 # profile whose engines are stub scripts (llama-bench, llama-server, generate_ds41, nvidia-smi) and whose
 # MODEL is gguf-ranges.py's two-shard fixture. Nothing it starts loads a model or touches a card. The
 # fault counter every copy reads (majflt_now, majflt_mark, lg_majflt, lcpp_srv_majflt) is a file the stub
@@ -120,6 +121,25 @@
 #   res-leak     the off arm 6 prints residency pass records: FAIL rc=residency naming the leak; rc 1.
 #   res-noprofile  a profile without RESIDENCY_RESET_DROPPED_BYTES: refused by name before anything runs, rc 64.
 #   res-dry      the dry run names the residency arms and the reset bytes, rc 0.
+# The bin: arms on a corpus, a base binary (the stub generate_ds41 in a tree named base; red on the runner
+# before them, which takes no @ list on a bin: arm — each case has one — and refuses it as arm usage, rc 64):
+#   bin-prose    prose:4 bin:<base>:prose:4 bin:<base>:prose:4@BLOOMERY_AB_LOAD=arm 4, one round: the base's
+#                rows under bin:base@prose and bin:base@prose@BLOOMERY_AB_LOAD=arm, each paired with prose in
+#                the prose decode and prefill ratio tables and in neither of ours; every generate_ds41 arm fed
+#                the file's first 4 ids (201..204): ours' and the grouped base arm's `--arm prose:4`, the lone
+#                one's --tokens; one tree line for the base binary; rc 0.
+#   bin-prose-res  prose:4@R bin:<base>:prose:4@R bin:<base>:prose:8@R: the base's two arms one load (its
+#                --arm list, R in its environment), slot 1 and slot 2 each clean with its curve line (slot 2
+#                with the reset's diff=0 dropped_bytes=0), and the [config] residency line naming them; rc 0.
+#                Then the base's two arms under STUB_RES_NORESET: FAIL rc=residency for slot 2; rc 1.
+#   bin-prose-dry  the dry run: the grouped base arm's --arm prose:4 line on the base binary with R in its
+#                environment and its load key, the lone arm's one-arm line with --tokens, and the loads; rc 0.
+#   bin-env-ratio  two rounds of prose:4@R 4@STUB_Y=2,R and a slow base (a tree named slow whose stub steps
+#                take 66 ms and whose prompt rate is half) at bin:<slow>:prose:4@R, bin:<slow>:4@R,STUB_Y=2
+#                and bin:<slow>:prose:8@STUB_X=1: the across-binaries tables pair each slow arm with this
+#                binary's arm on its prompt with its variables, their order aside — decode and prefill, 2.0000
+#                ± 0.0000 over 2 rounds — and name the arm with no partner; the dry run prints the pairs; rc 0.
+#                Red on the runner before those tables too (no xbin line).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -130,7 +150,7 @@ trap 'rm -rf "$tmp"' EXIT
 T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/bin" "$T/data/engram" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
-cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/cards.sh" "$ROOT/tools/ref/lease-probe.sh" \
+cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
   "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
@@ -148,6 +168,7 @@ echo 'lg_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/load-groups.sh"
 [ ! -f "$T/tools/ref/lcpp-warm.sh" ] || echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"
 python3 "$T/tools/ref/gguf-ranges.py" fixture "$tmp/m-00001-of-00002.gguf" || exit 2
 seq 101 110 > "$T/data/engram/corpus-code.ids"
+seq 201 212 > "$T/data/engram/corpus-prose.ids"
 cat > "$T/tools/ref/ref-paths.sh" << EOF
 # shellcheck shell=bash
 MODEL_NAME=deepseek41
@@ -255,7 +276,9 @@ touch "$T/Cargo.toml"
 # before every arm past the first
 # unless STUB_RES_NORESET is set, and after each arm's SMOKE line one `residency pass` per generated token,
 # the boundary counted from the load or the last reset (from 1 under STUB_RES_WARM: a warm map); under
-# STUB_RES_LEAK the passes print with the lever off too.
+# STUB_RES_LEAK the passes print with the lever off too. Every arm appends `<its path> <arm> ids=<the ids it
+# fed>` to $TMPDIR/stub-gen-feeds — `lcg`, the --tokens list (arm `tokens`), or a corpus arm's first P ids of
+# $STUB_ENGRAM/corpus-<name>.ids — and a fed id list prints in its `fed` line's first and last.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
 depth='' n=32 place=a tokens='' sync='' arms=()
@@ -297,7 +320,18 @@ for k in "${!arms[@]}"; do
     echo "error: the stub refuses depth $depth once" >&2
     exit 3
   fi
-  echo "fed ids=$depth first=[1,2,3,4] last=[5,6,7,8] depth_sequence_from=0"
+  fedids=lcg
+  if [ -n "$tokens" ] && [ "$a" = "$depth" ] && [ "$feed" = lcg ]; then
+    fedids=$tokens a=tokens
+  elif [ "$feed" != lcg ]; then
+    fedids=$(head -n "$depth" "$STUB_ENGRAM/corpus-$feed.ids" | paste -sd, -)
+  fi
+  echo "$0 $a ids=$fedids" >> "${TMPDIR:-/tmp}/stub-gen-feeds"
+  if [ "$fedids" = lcg ]; then
+    echo "fed ids=$depth first=[1,2,3,4] last=[5,6,7,8] depth_sequence_from=0"
+  else
+    echo "fed ids=$depth first=[${fedids%%,*}] last=[${fedids##*,}] depth_sequence_from=0"
+  fi
   # STUB_COLD_GEN=<depth>:<K>: the first K arms of that depth add 100000 faults after their fed line.
   cm=${TMPDIR:-/tmp}/stub-cold-gen-$depth
   if [ "${STUB_COLD_GEN%%:*}" = "$depth" ] && [ "$(cat "$cm" 2> /dev/null || echo 0)" -lt "${STUB_COLD_GEN#*:}" ]; then
@@ -323,6 +357,15 @@ EOF
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
 cp "$ROOT/tools/ref/stub-llama-server.py" "$T/bin/llama-server"
 chmod +x "$T/bin/"* "$T/target/release/generate_ds41"
+# A second binary's tree for the bin: arms: the stub generate_ds41 under a tree named base.
+mkdir -p "$tmp/base/target/release"
+cp "$T/target/release/generate_ds41" "$tmp/base/target/release/"
+BASEBIN=$tmp/base/target/release/generate_ds41
+# A slow one for the across-binaries tables: its steps take twice as long, its prompt half the rate.
+mkdir -p "$tmp/slow/target/release"
+sed 's/33\.0000/66.0000/g; s/depth \* 10/depth * 5/' "$T/target/release/generate_ds41" > "$tmp/slow/target/release/generate_ds41"
+chmod +x "$tmp/slow/target/release/generate_ds41"
+SLOWBIN=$tmp/slow/target/release/generate_ds41
 
 n=0 failed=0
 pass() { n=$((n + 1)); echo "ok $1"; }
@@ -338,11 +381,11 @@ stub_run() {
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
   rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp/stub-xid" \
-    "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
+    "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-* "$tmp/tmp/stub-gen-feeds"
   echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     BLOOMERY_CPU_BUSY_COMMS=none STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 \
-    STUB_MAJFLT="$tmp/tmp/stub-majflt" "${e[@]}" bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
+    STUB_MAJFLT="$tmp/tmp/stub-majflt" STUB_ENGRAM="$T/data/engram" "${e[@]}" bash tools/ref/depth-ds41.sh "$@") > "$log" 2>&1
   RC=$?
 }
 # srv_left: the stub servers of the last run still up (pids from their own file), none when all stopped.
@@ -739,7 +782,7 @@ L=$tmp/twocard-dry.log
 stub_run "$L" BLOOMERY_DRY=1 "$TC" -- lcpp:6
 if [ "$RC" != 0 ]; then
   fail twocard-dry "rc $RC, want 0" "$L"
-elif want twocard-dry "$L" 1 '^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE_DEVICES=GPU-8c129fa6-[^,]*,GPU-307fa0f6-[^ ]* place=a ' &&
+elif want twocard-dry "$L" 1 "^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE_DEVICES=$STUB_GPU_A6000,$STUB_GPU_3090 place=a " &&
   want twocard-dry "$L" 1 '^\[dry\] two-card precheck: ok$' &&
   want twocard-dry "$L" 1 "^\[dry\] lcpp:6: timeout --kill-after=10 60 env  [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5 --progress "; then
   pass twocard-dry
@@ -1000,12 +1043,93 @@ elif want res-dry "$L" 1 "^\[dry\] residency: 6@$R 4@$R run with BLOOMERY_RESIDE
   pass res-dry
 fi
 
+FEEDS=$tmp/tmp/stub-gen-feeds
+L=$tmp/bin-prose.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- prose:4 "bin:$BASEBIN:prose:4" \
+  "bin:$BASEBIN:prose:4@BLOOMERY_AB_LOAD=arm" 4
+if [ "$RC" != 0 ]; then
+  fail bin-prose "rc $RC, want 0" "$L"
+elif want bin-prose "$L" 1 '^ROW r1 bin:base@prose d=4 n=4 \| tok/s\(mean\) 30.30 @ n=4, depth 4, .* \| pp_tok/s 40.00 \(n=4, passes=1, kind=batch\) .*\| slot 1/1 \| wall ' &&
+  want bin-prose "$L" 1 '^ROW r1 bin:base@prose@BLOOMERY_AB_LOAD=arm d=4 n=4 \| tok/s\(mean\) 30.30 @ n=4, depth 4, ' &&
+  want bin-prose "$L" 1 '^ratio prose d=4 +prose/bin:base@prose +mean 1.0000 ' &&
+  want bin-prose "$L" 1 '^ratio prose d=4 +prose/bin:base@prose@BLOOMERY_AB_LOAD=arm +mean 1.0000 ' &&
+  want bin-prose "$L" 1 '^ratio pp prose p=4 +prose/bin:base@prose +mean 1.0000 ' &&
+  want bin-prose "$L" 1 '^ratio pp prose p=4 +prose/bin:base@prose@BLOOMERY_AB_LOAD=arm +mean 1.0000 ' &&
+  want bin-prose "$L" 0 '^ratio (pp )?(d|p)=4 +ours/bin' &&
+  want bin-prose "$L" 3 '^fed ids=4 first=\[201\] last=\[204\] ' &&
+  want bin-prose "$L" 2 "^    bin:base: $BASEBIN sha256=" &&
+  want "bin-prose feeds" "$FEEDS" 1 '^target/release/generate_ds41 prose:4 ids=201,202,203,204$' &&
+  want "bin-prose feeds" "$FEEDS" 1 "^$BASEBIN prose:4 ids=201,202,203,204$" &&
+  want "bin-prose feeds" "$FEEDS" 1 "^$BASEBIN tokens ids=201,202,203,204$" &&
+  want "bin-prose feeds" "$FEEDS" 4 ' ids='; then
+  pass bin-prose
+fi
+
+L=$tmp/bin-prose-res.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- "prose:4@$R" "bin:$BASEBIN:prose:4@$R" "bin:$BASEBIN:prose:8@$R"
+if [ "$RC" != 0 ]; then
+  fail bin-prose-res "rc $RC, want 0" "$L"
+elif want bin-prose-res "$L" 1 "^ROW r1 bin:base@prose@$R d=4 .*\| slot 1/2 \| wall " &&
+  want bin-prose-res "$L" 1 "^ROW r1 bin:base@prose@$R d=8 .*\| slot 2/2 \| wall " &&
+  want bin-prose-res "$L" 1 "^residency curve bin:base@prose@$R r1 d=4 windows=1 tok/s=30.30 flips=2 \| ROW slot 1 \| seed first pass none/0$" &&
+  want bin-prose-res "$L" 1 "^residency curve bin:base@prose@$R r1 d=8 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
+  want bin-prose-res "$L" 1 "^\[config\] residency: prose:4@$R bin:$BASEBIN:prose:4@$R bin:$BASEBIN:prose:8@$R run with BLOOMERY_RESIDENCY on: " &&
+  want bin-prose-res "$L" 2 '^    residency host residency=mid-p40-s1 ' &&
+  want bin-prose-res "$L" 0 '^FAIL ' &&
+  want "bin-prose-res feeds" "$FEEDS" 1 "^$BASEBIN prose:8 ids=201,202,203,204,205,206,207,208$"; then
+  L2=$tmp/bin-prose-res-noreset.log
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_NORESET=1 -- "bin:$BASEBIN:prose:4@$R" "bin:$BASEBIN:prose:8@$R"
+  if [ "$RC" != 1 ]; then
+    fail bin-prose-res "the STUB_RES_NORESET run's rc $RC, want 1" "$L2"
+  elif want bin-prose-res "$L2" 1 "^FAIL r1 bin:base@prose@$R d=8 rc=residency \| its first residency pass is pass=step boundary=4, not the seed's none/0 \(slot 2: the first boundary after its clear\); 0 residency reset record\(s\) between the previous arm and its arm line, want 1: its map did not start from the seed; last line: " &&
+    want bin-prose-res "$L2" 1 "^ROW r1 bin:base@prose@$R d=4 " &&
+    want bin-prose-res "$L2" 1 "^failed arms: r1 bin:base@prose@$R d=8 rc=residency; $"; then
+    pass bin-prose-res
+  fi
+fi
+
+L=$tmp/bin-prose-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- prose:4 "bin:$BASEBIN:prose:4@$R" "bin:$BASEBIN:prose:8@$R" \
+  "bin:$BASEBIN:prose:4@BLOOMERY_AB_LOAD=arm"
+if [ "$RC" != 0 ]; then
+  fail bin-prose-dry "rc $RC, want 0" "$L"
+elif want bin-prose-dry "$L" 1 "^\[dry\] bin:$BASEBIN:prose:4@$R: one arm of a load: timeout --kill-after=10 \\\$\(\(BOUND x arms \+ BOUND\)\) env $R $BASEBIN --arm prose:4 -n 4 --place a --time --arm-sync   # row label 'bin:base@prose@$R', load key $BASEBIN\|place=a\|$R$" &&
+  want bin-prose-dry "$L" 1 "^\[dry\] bin:$BASEBIN:prose:4@BLOOMERY_AB_LOAD=arm: timeout --kill-after=10 60 $BASEBIN --tokens \"\\\$\(head -n 4 $T/data/engram/corpus-prose.ids \| paste -sd, -\)\" -n 4 --place a --time   # row label 'bin:base@prose@BLOOMERY_AB_LOAD=arm', 4 of the file's 12 ids, first 201, last 204$" &&
+  want bin-prose-dry "$L" 1 "^\[dry\] round 1 loads: \[prose:4\] \[bin:$BASEBIN:prose:4@$R bin:$BASEBIN:prose:8@$R\] bin:$BASEBIN:prose:4@BLOOMERY_AB_LOAD=arm$" &&
+  want bin-prose-dry "$L" 1 "^\[dry\] bin:base: $BASEBIN sha256="; then
+  pass bin-prose-dry
+fi
+
+L=$tmp/bin-env-ratio.log
+XB=("prose:4@$R" "4@STUB_Y=2,$R" "bin:$SLOWBIN:prose:4@$R" "bin:$SLOWBIN:4@$R,STUB_Y=2" "bin:$SLOWBIN:prose:8@STUB_X=1")
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 -- "${XB[@]}"
+if [ "$RC" != 0 ]; then
+  fail bin-env-ratio "rc $RC, want 0" "$L"
+elif want bin-env-ratio "$L" 1 "^ratio xbin prose d=4 +prose@$R/bin:slow@prose@$R +mean 2.0000 ± 0.0000 \(n=2\) " &&
+  want bin-env-ratio "$L" 1 "^ratio xbin ours d=4 +ours@STUB_Y=2,$R/bin:slow@$R,STUB_Y=2 +mean 2.0000 ± 0.0000 \(n=2\) " &&
+  want bin-env-ratio "$L" 1 "^ratio pp xbin prose p=4 +prose@$R/bin:slow@prose@$R +mean 2.0000 ± 0.0000 \(n=2\) " &&
+  want bin-env-ratio "$L" 1 "^ratio pp xbin ours p=4 +ours@STUB_Y=2,$R/bin:slow@$R,STUB_Y=2 +mean 2.0000 ± 0.0000 \(n=2\) " &&
+  want bin-env-ratio "$L" 4 "^ratio (pp )?xbin " &&
+  want bin-env-ratio "$L" 1 "^ratio xbin: bin:slow@prose@STUB_X=1 has no arm of this binary on its prompt with its variables to pair with$" &&
+  want bin-env-ratio "$L" 1 "^ratio pp xbin: bin:slow@prose@STUB_X=1 has no arm " &&
+  want bin-env-ratio "$L" 0 '^FAIL '; then
+  L2=$tmp/bin-env-ratio-dry.log
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- "${XB[@]}"
+  if [ "$RC" != 0 ]; then
+    fail bin-env-ratio "the dry run's rc $RC, want 0" "$L2"
+  elif want bin-env-ratio "$L2" 1 "^\[dry\] across binaries \(prose\): prose@$R / bin:slow@prose@$R$" &&
+    want bin-env-ratio "$L2" 1 "^\[dry\] across binaries \(ours\): ours@STUB_Y=2,$R / bin:slow@$R,STUB_Y=2$" &&
+    want bin-env-ratio "$L2" 1 "^\[dry\] across binaries: bin:slow@prose@STUB_X=1 has no arm "; then
+    pass bin-env-ratio
+  fi
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
     "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard.log "$tmp"/srv*.log "$tmp"/warm*.log \
-    "$tmp"/res-*.log; do
+    "$tmp"/res-*.log "$tmp"/bin-*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done
