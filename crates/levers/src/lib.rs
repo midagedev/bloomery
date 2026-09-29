@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, R8, RESIDENCY,
-    ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, QWEN38_EXPERTS,
+    R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -712,6 +712,13 @@ impl Levers {
             Some(Value::Path(p)) => Some(p),
             v => panic!("{ROUTE_TRACE} holds {v:?}, not a path"),
         }
+    }
+
+    /// `BLOOMERY_QWEN38_EXPERTS`: where a Qwen3.8 plan puts the routed
+    /// experts, `host` or `card`.
+    #[must_use]
+    pub fn qwen38_experts(&self) -> &'static str {
+        Levers::defaulted(QWEN38_EXPERTS, self.word(QWEN38_EXPERTS))
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.

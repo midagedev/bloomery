@@ -1,9 +1,10 @@
 //! The Qwen3.8-Flash-Next (`qwen4exp`) end-to-end gate: the whole program —
 //! 36 sigmoid-gated delta-rule layers and 12 selecting attention layers, every
 //! block in the four gated-residual streams, the PLE site on layer 1, 48
-//! MoE blocks whose 512 routed experts all run on the host tier beside a
+//! MoE blocks whose 512 routed experts run on the host tier (under (k)'s
+//! card plan each eligible layer's id prefix on the card) beside a
 //! sigmoid-gated shared expert on the card, the head's mix, the q8_0 head and
-//! the argmax — loaded once by its placement on the gate card, against ik's
+//! the argmax — loaded by its placement on the gate card, against ik's
 //! CPU oracle sets (`refset::arch::qwen4exp`: the 5-token batch set, the step
 //! after a fused 4-token prefill, the same after a prefill run node by node,
 //! the steps at positions 1,024 and 3,000 of the prose), every set read
@@ -144,12 +145,31 @@
 //!   prefill flash and the selection is the rule's (2,051 and 949, from
 //!   KEPT and POOL — a record, checked against the gate's own derivation);
 //!   the step after the ubatch as (t) holds a step set. A slot map with a
-//!   routed expert on the card (planted, `Body38::plant_slot_map`) is
+//!   routed expert on a tier card (planted, `Body38::plant_slot_map`) is
 //!   refused by name — the walk, the layer and the count — by each of the
-//!   four walks (a graph step, an eager pass, a ubatch, a graph verify)
-//!   before anything moves, the position kept and the model not poisoned,
-//!   and the same call with the plant taken back runs; `auto` is the pass
-//!   below `Prompt38::GEMM_FROM` positions and the ubatch from it.
+//!   four walks (a graph step, an eager pass, a ubatch, a graph verify), and
+//!   one with a routed expert on the card by the ubatch walk, before
+//!   anything moves, the position kept and the model not poisoned, and the
+//!   same call with the plant taken back runs; `auto` is the pass below
+//!   `Prompt38::GEMM_FROM` positions and the ubatch from it.
+//! - (k) the card leg: after every clause above, the host plan's model
+//!   dropped, the card rule's plan (`place::Experts::Card`: each eligible
+//!   layer's id prefix on the card) loaded on the same card. Its step graph
+//!   holds [`NODES_DECODE_CARD`] nodes over [`CARD_LAYERS`] card layers, the
+//!   program's count. The pass's places entry, on synthetic ids at the
+//!   router's pitch, writes each slot's place, [`HOST`] and `expert_id` for
+//!   an id past the experts, and reads no shared expert's word
+//!   ([`places_rule`]). (i) The batch set's five eager steps against the
+//!   host plan's eager steps of (p): each flip of the routing excused as
+//!   (g)'s free arm excuses one; off every flip's path each layer output
+//!   within [`card_band`] and each position's logits within the last
+//!   layer's band, its argmax the host plan's or a named tie; on a flip's
+//!   path printed. (ii) Its
+//!   eager steps the graph steps' bits, one pass of the five rows the steps'
+//!   last token, logits and every store bit for bit, and verifies of 2, 3
+//!   and 4 rows kept whole every row bit for bit the steps' (each graph
+//!   [`NODES_VERIFY_CARD`] nodes). (iii) A ubatch refused by name before
+//!   anything moves, the same ids by passes run.
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
@@ -187,7 +207,8 @@ mod gate {
         Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Store38Host,
     };
     use bloomery_gpu::head::Head;
-    use bloomery_gpu::hybrid::{HOST, SlotMap};
+    use bloomery_gpu::host::handoff::{HandoffKernels, Places};
+    use bloomery_gpu::hybrid::{HOST, SlotMap, TIER};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
@@ -197,10 +218,10 @@ mod gate {
         GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
         topk_ids_logical_within, verdict,
     };
-    use cuda_core::sys;
+    use cuda_core::{DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::half_to_f32;
-    use model::arch::qwen35moe::place::{PlanInputs, machine};
+    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
@@ -274,6 +295,29 @@ mod gate {
     const NODES_VERIFY: usize = 1235;
 
     const _: () = assert!(NODES_VERIFY == NODES_DECODE + N_GDN * 2 + N_QSA);
+
+    /// PIN(2026-09-29): the layers the gate card's card plan puts routed
+    /// experts on, derived before the leg was built: the 48 less the five
+    /// whose routed stacks the card experts do not read (`place::host_only`:
+    /// layer 2's q5_K stacks, the q8_0 downs of 640-value rows of layers 4,
+    /// 30, 46 and 47), each of the 43 holding over a hundred experts on the
+    /// 3090 at this cache (the card rule's plans, `qwen4exp_meta`'s
+    /// `CARD_PLANS`: 108/107 at 4,096 positions and a ubatch of 4,096).
+    const CARD_LAYERS: usize = 43;
+
+    /// PIN(2026-09-29): the captured step's and verify's node counts under
+    /// the card plan, derived before the leg was built: each card layer's
+    /// shadow adds the leg's five launches (the normed rows' q8_1, the
+    /// gate·up, the q8_1 of the card slots' columns, the down, the card sum),
+    /// and its back combines the card sum in the gated sum's launch:
+    /// 1151 + 5·43 and 1235 + 5·43.
+    const NODES_DECODE_CARD: usize = 1366;
+    const NODES_VERIFY_CARD: usize = 1450;
+
+    const _: () = assert!(
+        NODES_DECODE_CARD == NODES_DECODE + 5 * CARD_LAYERS
+            && NODES_VERIFY_CARD == NODES_VERIFY + 5 * CARD_LAYERS
+    );
 
     /// Lanes of a delta layer's state, a verify's rows at most.
     const LANES: usize = 4;
@@ -403,7 +447,9 @@ mod gate {
         Ok(ik[at..].to_vec())
     }
 
-    fn open() -> Result<Qwen38Model, GateError> {
+    /// The model placed on the gate card by its plan, the routed experts
+    /// where `experts` says.
+    fn open(experts: Experts) -> Result<Qwen38Model, GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         if file.architecture() != Some("qwen4exp") {
@@ -415,9 +461,16 @@ mod gate {
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
-        let plan = inputs.plan(&machine, CTX as u64, &PlanLevers::from_levers(&levers)?)?;
+        let plan = inputs.plan_with(
+            &machine,
+            CTX as u64,
+            &PlanLevers::from_levers(&levers)?,
+            experts,
+        )?;
+        let held = plan.n_l.iter().filter(|&&n| n > 0).count();
         println!(
-            "plan card={} ctx_max={} host_experts={} card_experts={}",
+            "plan card={} experts={experts:?} ctx_max={} host_experts={} card_experts={} \
+             card_layers={held}",
             RTX_3090.name, plan.ctx_max, plan.host.experts, plan.cards[0].experts
         );
         let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
@@ -1211,7 +1264,10 @@ mod gate {
 
     /// The structure of the captured verify of `T` rows: the node count, its
     /// batch mem ops, its argmax and handoff launches.
-    fn verify_structure<const T: usize>(m: &mut Qwen38Model) -> Result<bool, GateError> {
+    fn verify_structure<const T: usize>(
+        m: &mut Qwen38Model,
+        want: usize,
+    ) -> Result<bool, GateError> {
         let nodes = m.capture_rows::<T>()?;
         let counted = m.body("verify_structure")?.verify_launches(T);
         let list = m.rows_graph_nodes::<T>()?;
@@ -1226,15 +1282,15 @@ mod gate {
         let argmax = named(&|n| n.contains("argmax"));
         let cols = named(&|n| n == "ds41_ffn_handoff_10_cols");
         let one = named(&|n| n == "ds41_ffn_handoff_10");
-        let ok = nodes == NODES_VERIFY
-            && counted == NODES_VERIFY
+        let ok = nodes == want
+            && counted == want
             && b == MEMOPS
             && other == 0
             && argmax == 1
             && cols == N_LAYER
             && one == 0;
         println!(
-            "verify structure T={T}: graph_nodes={nodes} (want {NODES_VERIFY}; the program counts \
+            "verify structure T={T}: graph_nodes={nodes} (want {want}; the program counts \
              {counted}) batch_mem_op={b} (want {MEMOPS}) other={other}; argmax launches {argmax} \
              (want 1: one head of {T} rows); ds41_ffn_handoff_10_cols {cols} (want {N_LAYER}), \
              ds41_ffn_handoff_10 {one} (want 0) {}",
@@ -1295,9 +1351,9 @@ mod gate {
     fn verify_clause(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
         let (rows, next) = verify_rows(toks)?;
         let mut ok = true;
-        ok &= verify_structure::<2>(m)?;
-        ok &= verify_structure::<3>(m)?;
-        ok &= verify_structure::<4>(m)?;
+        ok &= verify_structure::<2>(m, NODES_VERIFY)?;
+        ok &= verify_structure::<3>(m, NODES_VERIFY)?;
+        ok &= verify_structure::<4>(m, NODES_VERIFY)?;
         let refs = (1..=LANES)
             .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1794,14 +1850,15 @@ mod gate {
     /// pass's is excused while each exchanged pair's gap in the pass's logits
     /// lies within our two logits' distance there, and that distance within
     /// six standard deviations of the router's error at the layer: a logit
-    /// is a dot of the layer's input, which carries [`gemm_band`] of relative
-    /// error, so a logit moves by about that times the logits' RMS; two
+    /// is a dot of the layer's input, which carries `band` of relative error
+    /// ([`gemm_band`] at the layer for the ubatch walk, [`card_band`] for the
+    /// card leg), so a logit moves by about that times the logits' RMS; two
     /// logits, three deviations each.
-    fn flip_cap(l: usize, logits: &[f32]) -> f64 {
+    fn flip_cap(band: f64, logits: &[f32]) -> f64 {
         let rms = (logits.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
             / logits.len().max(1) as f64)
             .sqrt();
-        6.0 * gemm_band(l) * rms
+        6.0 * band * rms
     }
 
     /// The deviation of `v` about its mean: the spread a ranking reads (a
@@ -1817,15 +1874,15 @@ mod gate {
     }
 
     /// The widest gap in the pass's logits a flip may exchange where no
-    /// earlier flip lies on its path, derived: a logit moves by about
-    /// [`gemm_band`] times the logits' [`spread`] (the error of the layer's
+    /// earlier flip lies on its path, derived: a logit moves by about the
+    /// layer's `band` times the logits' [`spread`] (the error of the layer's
     /// input, read through the router's rows; the logits' common offset,
     /// which [`flip_cap`]'s RMS carries, moves no rank), and a pair's gap is
     /// crossed only by the two logits' errors together: three deviations
     /// each. A flip at a wider gap is a pick the error model does not
     /// explain.
-    fn margin_cap(l: usize, logits: &[f32]) -> f64 {
-        6.0 * gemm_band(l) * spread(logits)
+    fn margin_cap(band: f64, logits: &[f32]) -> f64 {
+        6.0 * band * spread(logits)
     }
 
     /// Each layer's relative distance between two runs' live stores at count
@@ -1943,6 +2000,100 @@ mod gate {
             && store_diff(a, b) == (Vec::new(), false)
     }
 
+    /// Each flip of one run's routes (`ours`, `[token][layer]`) against
+    /// another's (`theirs`, the reference), judged as (g)'s free arm judges
+    /// them, and the tally.
+    struct FlipTally {
+        /// Each flip, its pair cap ([`flip_cap`]) and its margin bound
+        /// ([`margin_cap`]).
+        flips: Vec<(Flip, f64, f64)>,
+        refused: usize,
+        first: usize,
+        wide: usize,
+        smallest: f64,
+    }
+
+    impl FlipTally {
+        /// Every flip allowed by the pair rule, none first on its path at a
+        /// wide margin.
+        fn ok(&self) -> bool {
+            self.refused == 0 && self.wide == 0
+        }
+
+        /// Whether a flip lies on the path of position `t`'s last layer: at
+        /// any layer, at `t` or before.
+        fn on_path(&self, t: usize) -> bool {
+            self.flips.iter().any(|(f, _, _)| f.token <= t)
+        }
+    }
+
+    /// The flips of `ours` against `theirs` (each `[token][layer]`), each
+    /// printed with `arm`: excused by the pair rule under [`flip_cap`] and,
+    /// where no earlier flip lies on its path, only at a gap within
+    /// [`margin_cap`], both at the layer's `band`.
+    fn judge_flips(
+        arm: &str,
+        ours: &[Vec<RouteTap>],
+        theirs: &[Vec<RouteTap>],
+        band: fn(usize) -> f64,
+    ) -> FlipTally {
+        let mut flips = Vec::new();
+        for (t, (ours, theirs)) in ours.iter().zip(theirs).enumerate() {
+            for (l, (o, p)) in ours.iter().zip(theirs).enumerate() {
+                let ids: Vec<i32> = p.ids.iter().map(|&e| e as i32).collect();
+                let margin = flip::margin(&p.logits, &ids);
+                if let Some(f) =
+                    Flip::between((l, t), (&o.ids, &o.logits), (&ids, &p.logits), margin)
+                {
+                    let b = band(l);
+                    flips.push((f, flip_cap(b, &p.logits), margin_cap(b, &p.logits)));
+                }
+            }
+        }
+        let (mut refused, mut first, mut wide) = (0usize, 0usize, 0usize);
+        for (f, cap, bound) in &flips {
+            let prior = flips
+                .iter()
+                .any(|(g, _, _)| g.layer < f.layer && g.token <= f.token);
+            let widest = f
+                .pairs
+                .iter()
+                .map(|p| p.2)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let at_wide = !prior && (widest > *bound || widest.is_nan());
+            refused += usize::from(!f.allowed(*cap));
+            first += usize::from(!prior);
+            wide += usize::from(at_wide);
+            println!(
+                "{}; {}",
+                f.line(arm, *cap),
+                if prior {
+                    "past an earlier flip on its path (margin rule not applied)".to_owned()
+                } else {
+                    format!(
+                        "first on its path: widest gap {widest:.3e} (margin bound {bound:.3e}) {}",
+                        if at_wide {
+                            "FAIL: a flip at a wide margin"
+                        } else {
+                            "within"
+                        }
+                    )
+                }
+            );
+        }
+        let smallest = flips
+            .iter()
+            .map(|(f, _, _)| f.margin)
+            .fold(f64::INFINITY, f64::min);
+        FlipTally {
+            flips,
+            refused,
+            first,
+            wide,
+            smallest,
+        }
+    }
+
     /// (g) on the batch set, the free arm: the ubatch walk ([`gemm_walk`],
     /// its own routing), then the pass (by passes from [`fresh`]), the walk
     /// against the pass (`eager`, the eager steps' taps, bit for bit the
@@ -2013,61 +2164,18 @@ mod gate {
             &inconsistent[..inconsistent.len().min(8)],
             verdict(taps_ok)
         );
-        let mut flips = Vec::new();
-        for (t, (ours, theirs)) in routes.iter().zip(&eager.routes).enumerate() {
-            for (l, (o, p)) in ours.iter().zip(theirs).enumerate() {
-                let ids: Vec<i32> = p.ids.iter().map(|&e| e as i32).collect();
-                let margin = flip::margin(&p.logits, &ids);
-                if let Some(f) =
-                    Flip::between((l, t), (&o.ids, &o.logits), (&ids, &p.logits), margin)
-                {
-                    flips.push((f, flip_cap(l, &p.logits), margin_cap(l, &p.logits)));
-                }
-            }
-        }
-        let (mut refused, mut first, mut wide) = (0usize, 0usize, 0usize);
-        for (f, cap, bound) in &flips {
-            let prior = flips
-                .iter()
-                .any(|(g, _, _)| g.layer < f.layer && g.token <= f.token);
-            let widest = f
-                .pairs
-                .iter()
-                .map(|p| p.2)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let at_wide = !prior && (widest > *bound || widest.is_nan());
-            refused += usize::from(!f.allowed(*cap));
-            first += usize::from(!prior);
-            wide += usize::from(at_wide);
-            println!(
-                "{}; {}",
-                f.line("gemm", *cap),
-                if prior {
-                    "past an earlier flip on its path (margin rule not applied)".to_owned()
-                } else {
-                    format!(
-                        "first on its path: widest gap {widest:.3e} (margin bound {bound:.3e}) {}",
-                        if at_wide {
-                            "FAIL: a flip at a wide margin"
-                        } else {
-                            "within"
-                        }
-                    )
-                }
-            );
-        }
-        let smallest = flips
-            .iter()
-            .map(|(f, _, _)| f.margin)
-            .fold(f64::INFINITY, f64::min);
-        let flips_ok = refused == 0 && wide == 0;
+        let tally = judge_flips("gemm", &routes, &eager.routes, gemm_band);
+        let flips_ok = tally.ok();
         ok &= flips_ok;
         println!(
-            "gemm free: {} flip(s) against the pass's routing, {} allowed by the pair rule; {first} \
-             first on their path, {wide} of them at a wide margin; the smallest pass margin that \
-             flipped {smallest:.3e} {}",
-            flips.len(),
-            flips.len() - refused,
+            "gemm free: {} flip(s) against the pass's routing, {} allowed by the pair rule; {} \
+             first on their path, {} of them at a wide margin; the smallest pass margin that \
+             flipped {:.3e} {}",
+            tally.flips.len(),
+            tally.flips.len() - tally.refused,
+            tally.first,
+            tally.wide,
+            tally.smallest,
             verdict(flips_ok)
         );
         let (layers, ple) = live_rel(&free, pass, n);
@@ -2379,7 +2487,7 @@ mod gate {
     const _: () =
         assert!(!SPLIT.is_multiple_of(POOL) && !(SPLIT - POOL * (KEPT + 1) + 1).is_multiple_of(8));
 
-    /// The walks (g)'s card-map refusal plants its map on, each from
+    /// The walks (g)'s map refusals plant their maps on, each from
     /// position [`PREFIX`].
     #[derive(Clone, Copy)]
     enum Walk {
@@ -2413,30 +2521,41 @@ mod gate {
         }
     }
 
-    /// (g) the card-map refusals: with a slot map planted that holds expert
-    /// 3 of layer 7 on the card (`Body38::plant_slot_map`), each walk's call
-    /// after the prefix is refused by name — the walk, the layer and the
-    /// count — before anything moves, the position kept and the model not
-    /// poisoned; with the plant taken back the same call runs. The plant is
-    /// taken back before anything else can fail, so no line leaves it armed.
-    fn card_map_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+    /// (g) the map refusals: with a slot map planted (`Body38::plant_slot_map`)
+    /// that holds expert 3 of layer 7 on the tier card, each walk's call after
+    /// the prefix is refused by name — the walk, the layer and the count —
+    /// before anything moves, the position kept and the model not poisoned;
+    /// with one that holds it on the card, the ubatch walk's call is. With
+    /// the plant taken back the same call runs. The plant is taken back
+    /// before anything else can fail, so no line leaves it armed.
+    fn map_refusals(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
         let mode = m.mode();
         let (rows, _) = verify_rows(toks)?;
         let rows = [rows[0], rows[1]];
-        let mut entries = vec![HOST; N_LAYER * N_EXPERT];
-        entries[7 * N_EXPERT + 3] = 0;
-        let map = SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?;
+        let planted = |entry: u32| -> Result<SlotMap, GateError> {
+            let mut entries = vec![HOST; N_LAYER * N_EXPERT];
+            entries[7 * N_EXPERT + 3] = entry;
+            Ok(SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?)
+        };
+        let (tier, card) = (planted(TIER)?, planted(0)?);
+        let cases = [
+            (Walk::Step, &tier, "tier card", "tier leg"),
+            (Walk::Pass, &tier, "tier card", "tier leg"),
+            (Walk::Gemm, &tier, "tier card", "tier leg"),
+            (Walk::Verify, &tier, "tier card", "tier leg"),
+            (Walk::Gemm, &card, "card", "card leg yet"),
+        ];
         let mut ok = true;
-        for w in [Walk::Step, Walk::Pass, Walk::Gemm, Walk::Verify] {
+        for (w, map, device, leg) in cases {
             Prefix::Steps(&toks[..PREFIX]).feed(m)?;
             let before = m.pos();
-            m.body_parts("card_map_refusals")?
+            m.body_parts("map_refusals")?
                 .2
                 .plant_slot_map(Some(map.clone()))?;
             let got = w.run(m, toks, rows);
-            m.body_parts("card_map_refusals")?.2.plant_slot_map(None)?;
+            m.body_parts("map_refusals")?.2.plant_slot_map(None)?;
             let want = format!(
-                "the {} walk has no card leg yet: layer 7 holds 1 routed experts on the card",
+                "the {} walk has no {leg}: layer 7 holds 1 routed experts on the {device}",
                 w.name()
             );
             let named = matches!(&got, Err(e) if e.to_string().contains(&want));
@@ -2446,7 +2565,7 @@ mod gate {
             let line_ok = named && kept && again.is_ok();
             ok &= line_ok;
             println!(
-                "card-map refusal, {}: a slot map with expert 3 of layer 7 on the card at \
+                "map refusal, {}: a slot map with expert 3 of layer 7 on the {device} at \
                  position {before} -> {}; position {pos} (kept, not poisoned: {kept}); the same \
                  call with the plant taken back: {} {}",
                 w.name(),
@@ -2475,6 +2594,333 @@ mod gate {
             verdict(ok)
         );
         ok
+    }
+
+    // --------------------------------------------------- (k) the card leg
+
+    /// `f` on `m`, its error a named FAIL line (the model reset behind it)
+    /// rather than the gate's end: a clause that failed does not stop the
+    /// ones after it.
+    fn guarded(
+        label: &str,
+        m: &mut Qwen38Model,
+        f: impl FnOnce(&mut Qwen38Model) -> Result<bool, GateError>,
+    ) -> Result<bool, GateError> {
+        match f(m) {
+            Ok(ok) => Ok(ok),
+            Err(e) => {
+                println!("card leg {label}: FAILED: {e} {}", verdict(false));
+                m.reset()?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// (k) structure under the card plan: [`CARD_LAYERS`] layers run the
+    /// leg, and the captured step holds [`NODES_DECODE_CARD`] nodes,
+    /// [`MEMOPS`] of them batch mem ops, as the program counts.
+    fn card_structure(m: &mut Qwen38Model) -> Result<bool, GateError> {
+        let nodes = m.capture_step()?;
+        let body = m.body("card_structure")?;
+        let (layers, (counted, memops)) = (body.card_layers(), body.step_launches());
+        let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
+        let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
+        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
+        let ok = layers == CARD_LAYERS
+            && nodes == NODES_DECODE_CARD
+            && counted == NODES_DECODE_CARD
+            && memops == MEMOPS
+            && b == MEMOPS
+            && k == NODES_DECODE_CARD - MEMOPS
+            && other == 0;
+        println!(
+            "card leg structure: card layers {layers} (want {CARD_LAYERS}); decode graph_nodes=\
+             {nodes} (want {NODES_DECODE_CARD}; the program counts {counted}, {memops} of them \
+             batch_mem_op) kernel={k} batch_mem_op={b} (want {MEMOPS}) other={other} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// PIN(2026-09-29): the card plan's layer outputs against the host
+    /// plan's where both take the same experts, derived before the leg was
+    /// built. The two differ only in the card experts' activations: the
+    /// card's gate·up reads its input as q8_1 of 128 values a scale (the
+    /// q8_1 quantizer's block), the host's as q8_2 of 32 (`block_q8_2_x4`);
+    /// both read the SwiGLU output as 32-value q8 blocks. A q8 block of `n`
+    /// values errs by at most `crest/(127·√12)` relative, the crest at most
+    /// √n: [`q8_32_rel`] = q at 32 values, 2q at 128. The two sides' errors
+    /// are independent, so an expert's output differs by at most
+    /// `√((2q)² + q² + q² + q²) = √7·q` relative, the card slots' share of
+    /// the routed sum at most all of it, 3.402e-2 a layer; layers add
+    /// independently, √(l + 1) of it at layer `l`, and the head reads the
+    /// last layer's, √48 · 3.402e-2 = 0.236.
+    fn card_band(l: usize) -> f64 {
+        ((l + 1) as f64).sqrt() * 7f64.sqrt() * q8_32_rel()
+    }
+
+    /// A place the places rule's map holds for expert `e` of its read row:
+    /// [`HOST`] for every third expert, a card slot for the rest.
+    fn place_of(e: usize) -> u32 {
+        if e.is_multiple_of(3) {
+            HOST
+        } else {
+            (e as u32 * 7) % 300
+        }
+    }
+
+    /// (k) the places entry's own rule (`HandoffKernels::enqueue_places_cols`,
+    /// the pass's places), at layer 9's sink: two columns of routed ids at the
+    /// router's pitch of eleven, each column's eleventh word the shared
+    /// expert's id [`N_EXPERT`], column 1's slot 3 an id past the experts, a
+    /// map of two rows read at row 1, a guard word past the twenty places.
+    /// Every place is the map's at its id, the bad id's [`HOST`], the guard
+    /// untouched, and `expert_id` alone raised at layer 9 — once the pitch's
+    /// eleventh word were read it would raise too and move a place.
+    fn places_rule(m: &mut Qwen38Model) -> Result<bool, GateError> {
+        const PITCH: usize = N_USED + 1;
+        const GUARD: u32 = 0xdead_beef;
+        let gpu = m.gpu();
+        let stream = gpu.stream();
+        let k = HandoffKernels::load(gpu.context())?;
+        let mut ids = vec![0u32; 2 * PITCH];
+        for c in 0..2 {
+            for e in 0..N_USED {
+                ids[c * PITCH + e] = ((37 * (c * N_USED + e) + 11) % N_EXPERT) as u32;
+            }
+            ids[c * PITCH + N_USED] = N_EXPERT as u32;
+        }
+        ids[PITCH + 3] = N_EXPERT as u32 + 88;
+        let mut map = vec![7u32; 2 * N_EXPERT];
+        for (e, p) in map[N_EXPERT..].iter_mut().enumerate() {
+            *p = place_of(e);
+        }
+        let ids_d = DeviceBuffer::from_host(stream, &ids)?;
+        let map_d = DeviceBuffer::from_host(stream, &map)?;
+        let mut sel = DeviceBuffer::from_host(stream, &[GUARD; 2 * N_USED + 1])?;
+        k.enqueue_places_cols(
+            stream,
+            &Places {
+                ids: &ids_d,
+                map: &map_d,
+                row_off: N_EXPERT,
+                n_expert: N_EXPERT,
+            },
+            PITCH,
+            2,
+            gpu.layer_sink(9)?,
+            &mut sel,
+        )?;
+        stream.synchronize()?;
+        let got = sel.to_host_vec(stream)?;
+        let want: Vec<u32> = (0..2 * N_USED)
+            .map(|k| {
+                let id = ids[k / N_USED * PITCH + k % N_USED] as usize;
+                if id < N_EXPERT { place_of(id) } else { HOST }
+            })
+            .chain([GUARD])
+            .collect();
+        let fault = gpu.take_fault()?;
+        let raised = fault.is_some_and(|f| {
+            f.layer == 9
+                && f.site() == Some(FaultSite::ExpertId)
+                && f.sites == 1 << FaultSite::ExpertId as u32
+        });
+        let places_ok = got == want;
+        let ok = places_ok && raised;
+        println!(
+            "card leg places rule: two columns at a pitch of {PITCH}, column 1's slot 3 id {}: \
+             places the map's, the bad id's HOST, the guard untouched: {places_ok} (got {got:?}); \
+             the fault word {fault:?} (want expert_id alone at layer 9) {}",
+            N_EXPERT + 88,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (k) (i): the batch set's tokens as eager steps under the card plan
+    /// against the host plan's (`host`, the eager run of (p)): layer 0's
+    /// routes bit for bit the host run's (its router reads what the same
+    /// launches wrote from the same inputs); each flip of
+    /// the card run's routing against the host run's excused as (g)'s free
+    /// arm excuses one, at [`card_band`]; off every flip's path each layer
+    /// output within [`card_band`] of the host run's, and each position's
+    /// logits within the last layer's band with its argmax the host run's —
+    /// or, named and counted, the host run's runner-up with the host run's
+    /// margin between the two within twice the two runs' distance at those
+    /// ids, as (t) excuses a tie; on a flip's path printed.
+    fn card_vs_host(m: &mut Qwen38Model, toks: &[u32], host: &Run) -> Result<bool, GateError> {
+        let card = run_steps(m, toks, StepMode::Eager, true)?;
+        // Layer 0's router reads what the same launches wrote from the same
+        // inputs in both plans: its route cannot differ.
+        let first_same = card.routes.len() == host.routes.len()
+            && card.routes.iter().zip(&host.routes).all(|(a, b)| {
+                matches!((a.first(), b.first()), (Some(x), Some(y))
+                    if x.ids == y.ids && same_bits(&x.logits, &y.logits))
+            });
+        println!(
+            "card leg vs host: layer 0's routes bit for bit the host plan's at every position: \
+             {first_same} {}",
+            verdict(first_same)
+        );
+        let tally = judge_flips("card", &card.routes, &host.routes, card_band);
+        let mut ok = first_same && tally.ok() && card.routes.len() == host.routes.len();
+        println!(
+            "card leg vs host: {} flip(s) of the card plan's routing against the host plan's, {} \
+             allowed by the pair rule; {} first on their path, {} of them at a wide margin {}",
+            tally.flips.len(),
+            tally.flips.len() - tally.refused,
+            tally.first,
+            tally.wide,
+            verdict(tally.ok())
+        );
+        let row = STREAMS * HIDDEN;
+        let path = |l: usize, t: usize| {
+            tally
+                .flips
+                .iter()
+                .any(|(f, _, _)| f.layer <= l && f.token <= t)
+        };
+        let (mut held, mut past, mut worst) = (0usize, Vec::new(), 0.0f64);
+        for (t, (a, b)) in card.taps.iter().zip(&host.taps).enumerate() {
+            for l in 0..N_LAYER {
+                let e = match (a.get(l * row..(l + 1) * row), b.get(l * row..(l + 1) * row)) {
+                    (Some(x), Some(y)) => rel(x, y),
+                    _ => f64::INFINITY,
+                };
+                if path(l, t) {
+                    continue;
+                }
+                held += 1;
+                worst = worst.max(e / card_band(l));
+                if e > card_band(l) {
+                    past.push((l, t, e));
+                }
+            }
+        }
+        let layers_ok = past.is_empty() && card.taps.len() == host.taps.len();
+        ok &= layers_ok;
+        println!(
+            "card leg vs host: {held} layer outputs off every flip's path, their worst distance \
+             {worst:.3} of the band (card_band(l)); past it {:?} {}",
+            &past[..past.len().min(8)],
+            verdict(layers_ok)
+        );
+        let band = card_band(N_LAYER - 1);
+        let mut ties = 0usize;
+        for (t, (a, b)) in card.logits.iter().zip(&host.logits).enumerate() {
+            let (top, want) = (argmax(a), argmax(b));
+            let runner = second(b, want);
+            let margin = f64::from(b[want as usize]) - f64::from(b[runner as usize]);
+            let dist = [want, runner]
+                .iter()
+                .map(|&i| (f64::from(a[i as usize]) - f64::from(b[i as usize])).abs())
+                .fold(0.0, f64::max);
+            let tie = top != want && top == runner && margin <= 2.0 * dist;
+            let d = rel(a, b);
+            let on = tally.on_path(t);
+            ties += usize::from(tie && !on);
+            let pos_ok = on || ((top == want || tie) && d <= band);
+            ok &= pos_ok;
+            println!(
+                "card leg vs host position {t}: argmax card={top} host={want} (the host's \
+                 runner-up {runner}, margin {margin:.4}, the runs' distance at the two \
+                 {dist:.4}{}), logits_rel {d:.3e} (band {band:.3e}){} {}",
+                if tie { ", a named tie" } else { "" },
+                if on {
+                    " on a flip's path (printed)"
+                } else {
+                    ""
+                },
+                verdict(pos_ok)
+            );
+        }
+        println!("card leg vs host: {ties} named tie(s)");
+        ok &= card.logits.len() == host.logits.len() && card.logits.len() == toks.len();
+        Ok(ok)
+    }
+
+    /// (k) (ii): under the card plan the eager steps are the graph steps'
+    /// bits, a pass of the batch set's five rows leaves the steps' last token,
+    /// logits and every store bit for bit, and a verify of 2, 3 and 4 rows
+    /// kept whole returns every row's token and logits bit for bit the
+    /// steps' — the leg's kernels are independent per slot and column; each
+    /// verify's graph holds [`NODES_VERIFY_CARD`] nodes.
+    fn card_rows(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        let eager = run_steps(m, toks, StepMode::Eager, true)?;
+        let graph = run_steps(m, toks, StepMode::Graph, true)?;
+        let mut ok = same_run(
+            "card plan: five eager steps vs five graph replays",
+            &eager,
+            &graph,
+            false,
+        );
+        let pass = run_pass(m, toks)?;
+        ok &= same_run(
+            "card plan: one pass of five rows vs five graph steps",
+            &pass,
+            &graph,
+            true,
+        );
+        ok &= verify_structure::<2>(m, NODES_VERIFY_CARD)?;
+        ok &= verify_structure::<3>(m, NODES_VERIFY_CARD)?;
+        ok &= verify_structure::<4>(m, NODES_VERIFY_CARD)?;
+        let (rows, next) = verify_rows(toks)?;
+        let refs = (1..=LANES)
+            .map(|k| ref_run(m, Prefix::Steps(&toks[..PREFIX]), &[&rows[..k]], next))
+            .collect::<Result<Vec<_>, _>>()?;
+        ok &= verify_case::<2>(m, toks, rows, next, 2, &refs)?;
+        ok &= verify_case::<3>(m, toks, rows, next, 3, &refs)?;
+        ok &= verify_case::<4>(m, toks, rows, next, 4, &refs)?;
+        Ok(ok)
+    }
+
+    /// (k) (iii): under the card plan a ubatch after the prefix is refused by
+    /// name — the walk, the first card layer and its count — before anything
+    /// moves, the position kept and the model not poisoned, and the same ids
+    /// by passes run.
+    fn card_ubatch_refused(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        Prefix::Steps(&toks[..PREFIX]).feed(m)?;
+        let before = m.pos();
+        let got = m.prompt38(&toks[PREFIX..], Prompt38::Gemm);
+        let want = "the ubatch walk has no card leg yet: layer 0 holds";
+        let named = matches!(&got, Err(e) if e.to_string().contains(want));
+        let kept = m.pos() == before && m.poisoned().is_none();
+        let again = m.prompt38(&toks[PREFIX..], Prompt38::Pass);
+        let ok = named && kept && again.is_ok();
+        println!(
+            "card leg: a ubatch of {} ids under the card plan at position {before} -> {} (want \
+             {want:?}); position {} (kept, not poisoned: {kept}); the same ids by passes: {} {}",
+            toks.len() - PREFIX,
+            text(&got),
+            m.pos(),
+            text(&again),
+            verdict(ok)
+        );
+        m.reset()?;
+        Ok(ok)
+    }
+
+    /// (k): the card plan loaded on the gate card (the host plan's model
+    /// dropped first), then its structure, the places entry's rule, (i)
+    /// against `host`, (ii) and (iii).
+    fn card_leg(toks: &[u32], host: &Run) -> Result<bool, GateError> {
+        let mut m = match open(Experts::Card) {
+            Ok(m) => m,
+            Err(e) => {
+                println!(
+                    "card leg: the card plan's load FAILED: {e} {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let mut ok = guarded("structure", &mut m, card_structure)?;
+        ok &= guarded("places rule", &mut m, places_rule)?;
+        ok &= guarded("vs host", &mut m, |m| card_vs_host(m, toks, host))?;
+        ok &= guarded("rows", &mut m, |m| card_rows(m, toks))?;
+        ok &= guarded("ubatch", &mut m, |m| card_ubatch_refused(m, toks))?;
+        Ok(ok)
     }
 
     // ---------------------------------------------------- (r) refusals
@@ -2558,7 +3004,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let mut m = open()?;
+        let mut m = open(Experts::Host)?;
         let mut ok = structure(&mut m)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
@@ -2570,7 +3016,6 @@ mod gate {
         let (free_ok, firsts) = free(&man, &eager, vocab)?;
         ok &= free_ok;
         ok &= gemm_batch(&mut m, &man, &toks, &eager)?;
-        drop(eager);
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
@@ -2587,12 +3032,14 @@ mod gate {
         ok &= pass_selects(&mut m, &d3k)?;
         drop(d3k);
         ok &= gemm_d3k(&mut m, &mut ties)?;
-        ok &= card_map_refusals(&mut m, &toks)?;
+        ok &= map_refusals(&mut m, &toks)?;
         ok &= gemm_auto();
         println!("step sets and the ubatch's D3K step: {ties} named tie(s)");
         ok &= verify_clause(&mut m, &toks)?;
         ok &= position_owner(&mut m, &toks)?;
         ok &= refusals(&mut m)?;
+        drop(m);
+        ok &= card_leg(&toks, &eager)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

@@ -28,6 +28,13 @@
 //! clipped to the cache, read once: the plan counts that ubatch's arena and
 //! the load runs it.
 //!
+//! A qwen4exp file's plan puts every routed expert on the host tier, or
+//! with `BLOOMERY_QWEN38_EXPERTS=card` each layer's id prefix on the card as
+//! its budget holds (`place::Experts::Card`), which the step's, the verify's
+//! and the pass's card leg run; the `plan` line prints `experts=` and the
+//! `load` line `card_layers=`. The ubatch walk has no card leg: a card plan
+//! with a prompt `--prefill` sends to it is refused by name before the load.
+//!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
 //! layer program over the ubatch arena, eager in either mode — a ubatch of
@@ -175,7 +182,7 @@ mod cli {
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::qwen35moe::place::{PlanInputs, machine};
+    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine};
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
     use std::num::NonZeroUsize;
@@ -577,9 +584,20 @@ mod cli {
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
-        let levers = bloomery_levers::at_main(&[bloomery_levers::STEP_STATS])?;
+        let levers = bloomery_levers::at_main(&[
+            bloomery_levers::STEP_STATS,
+            bloomery_levers::QWEN38_EXPERTS,
+        ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
+        let experts = experts38(&levers)?;
         if let Some(dir) = flag("--dump-taps")? {
+            if experts == Experts::Card {
+                return Err(
+                    "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; \
+                     --dump-taps runs a qwen3moe file"
+                        .into(),
+                );
+            }
             return dump_taps(&dir);
         }
         let timed = std::env::args().any(|a| a == "--time");
@@ -633,6 +651,13 @@ mod cli {
                     .into(),
             );
         }
+        if family != Family::Qwen38 && experts == Experts::Card {
+            return Err(
+                "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
+                 qwen3moe or qwen35moe file has no host tier"
+                    .into(),
+            );
+        }
         let arms: Vec<Arm> = if arm_specs.is_empty() {
             let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
                 (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
@@ -671,6 +696,20 @@ mod cli {
                     format!("depth {depth} + {} tokens pass --ctx {ctx}", arm.n_gen).into(),
                 );
             }
+        }
+        if let Chosen::Qwen38(path, _) = chosen
+            && experts == Experts::Card
+            && let Some(a) = arms
+                .iter()
+                .find(|a| path.resolve(a.ids.len()) == Prompt38::Gemm)
+        {
+            return Err(format!(
+                "BLOOMERY_QWEN38_EXPERTS=card with a prompt of {} ids by --prefill {}: the \
+                 ubatch walk has no card leg yet; --prefill pass runs it",
+                a.ids.len(),
+                path.name()
+            )
+            .into());
         }
         if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass))
             && logits
@@ -714,7 +753,7 @@ mod cli {
                 sync,
             ),
             Chosen::Qwen38(path, place) => {
-                let m = open_qwen38(file, &levers, (ctx, mode), (path, place), t)?;
+                let m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
                 drive(m, &run, path, &arms, listed, sync)
             }
         }
@@ -828,7 +867,8 @@ mod cli {
     }
 
     /// The engine and its `--prefill` path (and, for qwen4exp, its card),
-    /// chosen before the load.
+    /// chosen before the load; a qwen4exp plan's expert rule is
+    /// `BLOOMERY_QWEN38_EXPERTS`'s.
     #[derive(Clone, Copy)]
     enum Chosen {
         Qwen3(PrefillPath),
@@ -916,15 +956,32 @@ mod cli {
         Ok(m)
     }
 
+    /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule.
+    fn experts38(levers: &Levers) -> Result<Experts, GateError> {
+        match levers.qwen38_experts() {
+            "host" => Ok(Experts::Host),
+            "card" => Ok(Experts::Card),
+            other => Err(format!("BLOOMERY_QWEN38_EXPERTS={other}: host or card").into()),
+        }
+    }
+
+    /// The name the `plan` line prints for `experts`.
+    fn experts_name(experts: Experts) -> &'static str {
+        match experts {
+            Experts::Host => "host",
+            Experts::Card => "card",
+        }
+    }
+
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
-    /// card `place` names: the `plan` and `load` lines, and in graph mode the
-    /// step captured and its `capture` line, its node kinds held to the
-    /// program's count.
+    /// card `place` names, its routed experts where `experts` says: the
+    /// `plan` and `load` lines, and in graph mode the step captured and its
+    /// `capture` line, its node kinds held to the program's count.
     fn open_qwen38(
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
-        (path, place): (Prompt38, Place38),
+        (path, place, experts): (Prompt38, Place38, Experts),
         t: Instant,
     ) -> Result<Qwen38Model, GateError> {
         let inputs = PlanInputs::describe(&file)?;
@@ -934,15 +991,17 @@ mod cli {
         };
         let ub = ubatch_for(ctx)?;
         let machine = machine(card, inputs.spec.layers.len(), u64::try_from(ub)?);
-        let plan = inputs.plan(
+        let plan = inputs.plan_with(
             &machine,
             u64::try_from(ctx)?,
             &PlanLevers::from_levers(levers)?,
+            experts,
         )?;
         println!(
-            "plan place={} card={} ctx_max={} host_experts={} card_experts={}",
+            "plan place={} card={} experts={} ctx_max={} host_experts={} card_experts={}",
             place.name(),
             card.name,
+            experts_name(experts),
             plan.ctx_max,
             plan.host.experts,
             plan.cards[0].experts
@@ -952,7 +1011,7 @@ mod cli {
         let body = m.body("generate_qwen3moe")?;
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} ubatch={} place={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.layers().len(),
             mode_name(mode),
@@ -960,6 +1019,7 @@ mod cli {
             path.name(),
             body.ubatch_rows(),
             place.name(),
+            body.card_layers(),
             t.elapsed().as_secs_f64()
         );
         if mode == StepMode::Graph {
