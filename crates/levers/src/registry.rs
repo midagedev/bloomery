@@ -1145,6 +1145,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "`tools/ref/depth-gpu.sh`: its arms, in the order a lease runs them.",
     ),
     runner(
+        "BLOOMERY_H2D_ARMS",
+        Some("ref/h2d-pcie.sh"),
+        "`tools/ref/h2d-pcie.sh`: `backleg` runs the decode step's back-leg arms (the \
+         four forward, then reversed) instead of the link steps; unset, the link steps.",
+    ),
+    runner(
         "BLOOMERY_HOLD_OWNER",
         Some("box.sh"),
         "The owner of the hold a sitting put up (`/root/bloomery-<owner>-hold`); a box \

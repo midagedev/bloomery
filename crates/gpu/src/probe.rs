@@ -15,14 +15,25 @@
 //! the trio at one grid: `gap_coop − gap_plain` is what the cooperative
 //! launch costs, `gap_coop_sync − gap_coop` is what the barrier costs, and
 //! `gap_plain` itself is a node of that shape.
+//!
+//! The host-side helpers at the end ([`BacklegPage`],
+//! [`enqueue_wait_geq`], [`enqueue_write`], [`launch_window`]) are the gate
+//! bins' reach into the stream memory operations and the host-mapped page —
+//! `graph`'s own items are crate-private because only the engine should use
+//! them freely. They change no engine path; a gate names them through
+//! `bloomery_gpu::probe`.
 
 use crate::GpuError;
+use crate::graph::{MappedHost, mem_batch, op_wait_geq, op_write};
+use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, cooperative_launch, grid, kernel, launch_bounds, launch_contract, thread,
 };
 use cuda_host::cuda_module;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 #[cuda_module]
 mod probe_kernels {
@@ -187,5 +198,164 @@ impl Probe {
             }
         }
         Ok(())
+    }
+}
+
+// --------------------------------------------------------- gate-bin helpers
+
+/// A stream memory operation a gate's probe enqueues: one wait until the u32
+/// at `word` is at least `value`, on any device-reachable address — a
+/// host-mapped word or a VRAM one. `#[doc(hidden)]`: a probe helper of the
+/// gate bins, not engine API.
+#[doc(hidden)]
+pub fn enqueue_wait_geq(
+    stream: &CudaStream,
+    word: cuda_core::sys::CUdeviceptr,
+    value: u32,
+) -> Result<(), GpuError> {
+    let mut ops = [op_wait_geq(word, value)];
+    mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (probe wait)")
+}
+
+/// A stream memory operation a gate's probe enqueues: one write of `value`
+/// to the u32 at `word`, on any device-reachable address. `#[doc(hidden)]`:
+/// a probe helper of the gate bins, not engine API.
+#[doc(hidden)]
+pub fn enqueue_write(
+    stream: &CudaStream,
+    word: cuda_core::sys::CUdeviceptr,
+    value: u32,
+) -> Result<(), GpuError> {
+    let mut ops = [op_write(word, value)];
+    mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (probe write)")
+}
+
+/// A non-owning launch window of `len` `T` at device address `ptr`: what a
+/// gate's probe hands a launch for a span inside another allocation — a
+/// host-mapped page, a copy's payload buffer. Never dropped, so it frees
+/// nothing. `#[doc(hidden)]`: a probe helper of the gate bins, not engine
+/// API. Safety: the span is device memory of `ctx`, and the owning
+/// allocation outlives every launch handed the window.
+#[doc(hidden)]
+pub fn launch_window<T>(
+    ptr: cuda_core::sys::CUdeviceptr,
+    len: usize,
+    ctx: &Arc<CudaContext>,
+) -> ManuallyDrop<DeviceBuffer<T>> {
+    // SAFETY: the caller meets the contract above.
+    unsafe { window(ptr, len, ctx) }
+}
+
+/// The host-mapped page a back-leg probe runs its crossings over:
+/// `values_len` f32 the host writes and the card reads through the mapping,
+/// then two words of their own cache line each — a counter the stream's
+/// wait holds on and an ack word the probe's kernel writes back. The
+/// round-trip protocol: the host fills the values, bumps the counter
+/// (Release), and spins on the ack (Acquire); the card, between a wait on
+/// the counter and its ack write, reads the values exactly once. The
+/// protocol, not the type, keeps the two sides off the values span — the
+/// argument [`MappedHost`]'s `Sync` impl makes for its plain accesses.
+/// `#[doc(hidden)]`: a probe helper of the gate bins, not engine API.
+#[doc(hidden)]
+pub struct BacklegPage {
+    page: MappedHost,
+    cnt_off: usize,
+    ack_off: usize,
+    values_len: usize,
+}
+
+/// Bytes each of the page's two flag words owns: a line of its own, so the
+/// host's stores to one never share a line with the other.
+const BACKLEG_WORD_LINE: usize = 64;
+
+impl BacklegPage {
+    /// A zeroed page of `ctx` for `values_len` f32 (at least one) and the
+    /// two flag words behind them. Load-time only.
+    pub fn new(ctx: &Arc<CudaContext>, values_len: usize) -> Result<BacklegPage, GpuError> {
+        const WHAT: &str = "BacklegPage::new";
+        if values_len == 0 {
+            return Err(GpuError::shape(WHAT, "no values"));
+        }
+        let round_line = |bytes: usize| -> Option<usize> {
+            Some(bytes.checked_add(BACKLEG_WORD_LINE - 1)? & !(BACKLEG_WORD_LINE - 1))
+        };
+        let values_bytes = values_len
+            .checked_mul(4)
+            .ok_or_else(|| GpuError::shape(WHAT, "the values span passes usize bytes"))?;
+        let cnt_off = round_line(values_bytes)
+            .ok_or_else(|| GpuError::shape(WHAT, "the values span passes the page"))?;
+        let ack_off = cnt_off
+            .checked_add(BACKLEG_WORD_LINE)
+            .ok_or_else(|| GpuError::shape(WHAT, "the ack word's line passes the page"))?;
+        let bytes = ack_off
+            .checked_add(BACKLEG_WORD_LINE)
+            .ok_or_else(|| GpuError::shape(WHAT, "the page passes usize bytes"))?;
+        Ok(BacklegPage {
+            page: MappedHost::new(ctx, bytes, "cuMemHostAlloc (backleg page)")?,
+            cnt_off,
+            ack_off,
+            values_len,
+        })
+    }
+
+    /// The values span's device address, byte 0 of the page.
+    #[must_use]
+    pub fn values_dev(&self) -> cuda_core::sys::CUdeviceptr {
+        self.page.dev_at(0)
+    }
+
+    /// The counter word's device address.
+    #[must_use]
+    pub fn cnt_dev(&self) -> cuda_core::sys::CUdeviceptr {
+        self.page.dev_at(self.cnt_off)
+    }
+
+    /// The ack word's device address.
+    #[must_use]
+    pub fn ack_dev(&self) -> cuda_core::sys::CUdeviceptr {
+        self.page.dev_at(self.ack_off)
+    }
+
+    /// Fill the values span with `v`, between the ack of the previous round
+    /// and the next bump — the owner's protocol keeps the card off the span
+    /// meanwhile.
+    pub fn fill_values(&self, v: f32) {
+        // SAFETY: `values_len` f32 at byte 0, inside the allocation and
+        // 4-aligned (a cuMemHostAlloc allocation is page-aligned); this page
+        // hands its values span to no one else, so this is the only host
+        // reference to it.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.page.host_at(0).cast::<f32>(), self.values_len)
+                .fill(v);
+        }
+    }
+
+    /// Add one to the counter and answer its new value: the round's go.
+    pub fn cnt_bump(&self) -> u32 {
+        self.cnt_word().fetch_add(1, Ordering::Release) + 1
+    }
+
+    /// Set the counter far past anything a round bumps it to: every wait
+    /// still pending in the stream passes, so a probe that stops driving
+    /// mid-run drains instead of hanging.
+    pub fn release(&self) {
+        self.cnt_word().store(1 << 30, Ordering::Release);
+    }
+
+    /// The ack word as the host sees it.
+    pub fn ack_value(&self) -> u32 {
+        self.ack_word().load(Ordering::Acquire)
+    }
+
+    fn cnt_word(&self) -> &std::sync::atomic::AtomicU32 {
+        self.page
+            .atomic_u32(self.cnt_off)
+            .expect("the counter word lies in the page, on its own line")
+    }
+
+    fn ack_word(&self) -> &std::sync::atomic::AtomicU32 {
+        self.page
+            .atomic_u32(self.ack_off)
+            .expect("the ack word lies in the page, on its own line")
     }
 }

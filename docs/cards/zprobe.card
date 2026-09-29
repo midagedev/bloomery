@@ -1,0 +1,48 @@
+# Round zprobe: the decode step's back-leg — a device-resident wait against today's host-mapped
+# wait. On a V4.1 decode step each routed layer makes the card wait once on the host: the engine
+# stream waits on a counter in the host-mapped pinned page, then the post kernel reads the host's
+# 20,480 B sum (5120 f32) from the same page. The candidate: the host writes the sum plus a tail
+# counter into a pinned buffer and issues one cuMemcpyHtoDAsync into VRAM; the card waits on the
+# VRAM counter word and reads VRAM.
+# Paper [derived]: the clean host-mapped round trip (bump to ack, the 20,480 B read through the
+# mapping) 5..9 µs — one posted-write crossing for the go, a 20 KB zero-copy read, the wait's
+# release and one posted write back; the clean device-resident round trip 3..6 µs — a 20,484 B
+# DMA (~2 µs at the link's pinned rate) plus the wait's release and the ack write; the copy
+# call's own host time <= 5 µs. Under a concurrent 2 MiB chunk loop on the same link the
+# host-mapped arm inflates +40..+120 µs over its clean value (the zero-copy reads and the wait's
+# polls cross beside the DMA stream) and the device-resident arm <= +40 µs (its crossing is one
+# DMA among the chunks). The largest unknowns the run prices: whether the wait on the copied VRAM
+# word releases within ~1..2 µs of the copy landing, and whether a memory-op wait on the copy's
+# own last word orders the copy's values — the arms' on-card check catches a stale read by name.
+# Wall [derived]: the build 2..5 min warm; the sitting 8 arms x 10,200 rounds x ~3..150 µs
+# ~ 1..10 s of crossings plus two process starts; under 15 min, under 30.
+kind: profile
+question: does the decode step's per-layer back-leg — the host's 20,480 B sum and its go crossing
+  to the card — run cheaper device-resident (one 20,484 B pinned H2D copy whose last word the
+  engine stream waits on in VRAM) than today's host-mapped wait-and-read, clean and under a
+  concurrent 2 MiB chunk stream, and does a stream memory-op wait on the copied word order the
+  copy's values?
+term: rt_us_median of `h2d arm=backleg-dev` (tools/ref/h2d-pcie.sh under
+  BLOOMERY_H2D_ARMS=backleg, the forward pass; the reversed rotation pass beside it): the
+  host-clock interval from a round's cuMemcpyHtoDAsync call's return to the ack word seen, 10,000
+  rounds after 200 warm, one card (the A6000), 20,484 bytes a crossing
+unit: µs
+predict: 3..6 µs
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/zprobe.card
+  BLOOMERY_H2D_ARMS=backleg' just time-gpu-h2d, one lease (witness pre and post, the Xid count
+  around the run); the runner runs the four arms forward then reversed and prints both passes;
+  every round checks all 5120 values on the card and a stale read ends its arm with a named error
+  — that error is itself an outcome, not a void run; each arm's `h2d arm=…` line carries its
+  iters, warm, bytes and the submit/chunks numbers, the conditions of its median
+decide-in: the clean dev round trip sits in the band: read the clean host arm beside it — dev
+  under host says the crossing itself is cheaper device-resident, and the contended arms then
+  decide: dev+chunks well under host+chunks opens the device-resident back-leg round;
+  dev+chunks near host+chunks keeps the idea to the clean step only
+decide-below: the clean dev round trip is under the band: the copy-and-wait crossing is cheaper
+  than derived — re-derive the step's back-leg share (40 crossings a step) at the measured value
+  before opening any round; the same contended relation still gates it
+decide-above: the clean dev round trip is over the band: at or past 10 µs the clean-step value of
+  the idea is dead and only the contended value remains, priced against the swap pacing result;
+  between 6 and 10, re-derive the wait-release and submit terms first; a correctness error on a
+  dev arm overrides every number — the design needs a signal other than a memory-op wait on a
+  copied word (an event the values' reader waits on, or a flag the copy's completion raises)

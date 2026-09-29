@@ -15,7 +15,7 @@ crates/model/src/r8file.rs 2 PENDING (triage): the r8 repack and check at load; 
 crates/model/src/bin/bench_v41_host.rs 1 a bench binary
 crates/qdot/src/bin/qdot-rate-mt.rs 2 a rate probe binary
 crates/gpu-gates/src/bin/exact_ref.rs 1 a referee binary, never pinned
-crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
+crates/gpu-gates/src/bin/h2d_probe.rs 5 a probe binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 4 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_glue.rs 2 a gate binary, never pinned

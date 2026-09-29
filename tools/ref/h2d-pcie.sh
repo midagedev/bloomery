@@ -13,6 +13,12 @@
 #   step 4  (both only) sustained on the other card alone, then `both`: the two loops released
 #                        together, each card's rate and the sum over the window where both ran
 #
+# BLOOMERY_H2D_ARMS=backleg (through BLOOMERY_BOX_ENV, with BLOOMERY_LEASE_CARD=docs/cards/zprobe.card)
+# replaces the steps above with the decode step's back-leg sitting: the four arms backleg-host,
+# backleg-dev, backleg-host+chunks, backleg-dev+chunks on the timing card, then the same four
+# reversed (the rotation), both passes printed — the arm's `h2d arm=backleg-…` lines carry the
+# round-trip, submit and chunk numbers (h2d_probe's header has the protocol).
+#
 # The cards are named by name and PCI address, never by ordinal: box.sh puts the 3090 first under
 # BLOOMERY_CARD=both, this runner puts the timing card first (CUDA_VISIBLE_DEVICES per step). The
 # timing card is timing-card.sh's (the A6000; BLOOMERY_TIMING_GPU moves it). Step 4 runs only when
@@ -24,7 +30,7 @@
 #
 # Arguments: --parse-only prints the steps and exits 0 before any check, lease or run. Each step is
 # bounded by lease_bounded (BLOOMERY_ARM_BOUND, default 900 s). The run's card: BLOOMERY_LEASE_CARD
-# through BLOOMERY_BOX_ENV (docs/cards/pcie-a6000.card).
+# through BLOOMERY_BOX_ENV (docs/cards/pcie-a6000.card; the backleg mode's is docs/cards/zprobe.card).
 set -euo pipefail
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
@@ -36,12 +42,26 @@ while [ $# -gt 0 ]; do
     *) echo "h2d-pcie.sh: unknown argument '$1' (only --parse-only)" >&2; exit 64 ;;
   esac
 done
+ARMS_MODE="${BLOOMERY_H2D_ARMS:-default}"
+BACKLEG_FOUR="backleg-host,backleg-dev,backleg-host+chunks,backleg-dev+chunks"
+BACKLEG_FOUR_REVERSED="backleg-dev+chunks,backleg-host+chunks,backleg-dev,backleg-host"
 BOTH=0
 [ "${BLOOMERY_BOX_CARD:-}" = both ] && BOTH=1
-steps=("attach" "pinned,pageable" "sustained")
-[ "$BOTH" = 1 ] && steps+=("sustained on the other card" "both")
+case "$ARMS_MODE" in
+  default)
+    steps=("attach" "pinned,pageable" "sustained")
+    [ "$BOTH" = 1 ] && steps+=("sustained on the other card" "both")
+    ;;
+  backleg)
+    steps=("$BACKLEG_FOUR" "$BACKLEG_FOUR_REVERSED (rotation)")
+    ;;
+  *)
+    echo "h2d-pcie.sh: unknown BLOOMERY_H2D_ARMS='$ARMS_MODE' (default or backleg)" >&2
+    exit 64
+    ;;
+esac
 if [ "$PARSE_ONLY" = 1 ]; then
-  echo "[parse] both=$BOTH steps: ${steps[*]}"
+  echo "[parse] both=$BOTH mode=$ARMS_MODE steps: ${steps[*]}"
   exit 0
 fi
 assert_fresh_binary "$BIN" || exit $?
@@ -75,19 +95,24 @@ step() {
   echo "--- h2d $* rc=$r"
   [ "$r" = 0 ] || rc=$r
 }
-step "$VIEW" --arm attach
-step "$TIMING_GPU" --arm pinned,pageable
-step "$TIMING_GPU" --arm sustained
-if [ "$BOTH" = 1 ]; then
-  # Another round's gate may hold the other card (the lease stops timing runs, not gates): the two-card
-  # steps then run beside it, so they do not run.
-  guard_other
-  if [ -n "$OTHER_BUSY_TAG" ]; then
-    echo "[other-busy] step 4 not run: the other card has compute processes" >&2
-    rc=75
-  else
-    step "$OTHER_GPU" --arm sustained
-    step "$VIEW" --arm both
+if [ "$ARMS_MODE" = backleg ]; then
+  step "$TIMING_GPU" --arm "$BACKLEG_FOUR"
+  step "$TIMING_GPU" --arm "$BACKLEG_FOUR_REVERSED"
+else
+  step "$VIEW" --arm attach
+  step "$TIMING_GPU" --arm pinned,pageable
+  step "$TIMING_GPU" --arm sustained
+  if [ "$BOTH" = 1 ]; then
+    # Another round's gate may hold the other card (the lease stops timing runs, not gates): the two-card
+    # steps then run beside it, so they do not run.
+    guard_other
+    if [ -n "$OTHER_BUSY_TAG" ]; then
+      echo "[other-busy] step 4 not run: the other card has compute processes" >&2
+      rc=75
+    else
+      step "$OTHER_GPU" --arm sustained
+      step "$VIEW" --arm both
+    fi
   fi
 fi
 witness post

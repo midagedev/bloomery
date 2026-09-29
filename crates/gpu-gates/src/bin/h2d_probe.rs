@@ -44,6 +44,33 @@
 //!   Every `--interval-ms` (1000): `h2d loop arm=<a> t_ms=<unix epoch ms>
 //!   interval_ms=<ms> bytes=<b> GB/s=<v>`, bytes counted when their copy is
 //!   known complete; then one `h2d loop arm=<a> summary …` line.
+//! - `backleg-host`, `backleg-dev`, `backleg-host+chunks`,
+//!   `backleg-dev+chunks`: the decode step's back-leg as a per-round host
+//!   clock round trip, `--iters` (10,000) rounds after `--warm` (200)
+//!   untimed, one card (device 0). Per round i the host sends its sum — the
+//!   20,480 bytes (5120 f32) a routed layer's handoff carries, every value
+//!   `i as f32` — plus a go counter, the card waits for the go, checks every
+//!   value on the card and answers one ack word the host spins on; the arm
+//!   prints `h2d arm=<a> card=… bdf=… iters=N warm=W bytes=B
+//!   rt_us_median= rt_us_p90= rt_us_p99= rt_us_max=` (the bump-to-ack
+//!   interval), the dev arms also `submit_us_median= submit_us_p99=` (the
+//!   copy call's own host time), the +chunks arms also `chunks_GB/s=`.
+//!   `backleg-host` is today's protocol: the sum lives in a host-mapped
+//!   page, the host `fetch_add`s a mapped counter and the engine stream's
+//!   `wait_geq` releases on it, the kernel reading the sum through the
+//!   mapping. `backleg-dev` is the device-resident candidate: the host
+//!   writes the sum plus the counter as the last word into a pinned buffer
+//!   and issues one `cuMemcpyHtoDAsync` of the 20,484 bytes into VRAM on a
+//!   copy stream; the engine stream waits on the VRAM counter word and the
+//!   kernel reads the sum from VRAM — whether that wait releases only once
+//!   the whole copy has landed is what the arm's on-card check tests, and a
+//!   stale read ends the arm with a named error (that failure is a finding,
+//!   not a broken run). The `+chunks` arms run a third thread looping 2 MiB
+//!   pinned→VRAM copies on their own stream for the arm's duration — the
+//!   paced-copy load a streaming back-leg design puts on the link. All the
+//!   stream work is enqueued by a second thread ahead of the driving one, so
+//!   the driver never blocks on a full queue and a round's interval measures
+//!   the crossing, not an enqueue.
 //!
 //! Every copy arm samples each of its cards'
 //! `current_link_speed`/`current_link_width` from sysfs every `SAMPLE_EVERY` while
@@ -76,10 +103,17 @@ mod probe {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bloomery_gpu::probe::{BacklegPage, enqueue_wait_geq, enqueue_write, launch_window};
     use bloomery_gpu_gates::GateError;
     use cuda_core::{
-        CudaContext, CudaEvent, CudaStream, DeviceBuffer, IntoResult, PinnedHostBuffer, sys,
+        CudaContext, CudaEvent, CudaStream, DeviceBuffer, IntoResult, LaunchConfig1D,
+        PinnedHostBuffer, sys,
     };
+    use cuda_device::{
+        DisjointSlice, cooperative_launch, grid, kernel, launch_bounds, launch_contract, ptx_asm,
+        thread,
+    };
+    use cuda_host::cuda_module;
     use memmap2::Mmap;
 
     /// Bytes of the three one-shot paths unless `--bytes` says otherwise: 1 GiB.
@@ -103,6 +137,92 @@ mod probe {
     /// How often the link sampler reads sysfs.
     const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 
+    // --------------------------------------------------------- back-leg arms
+
+    /// The sum a back-leg round crosses: one routed layer's handoff, 5120 f32.
+    const BACKLEG_VALUES: usize = 5120;
+    /// Back-leg rounds an arm times unless `--iters` says otherwise.
+    const BACKLEG_ITERS: usize = 10_000;
+    /// Untimed back-leg rounds ahead of the timed ones unless `--warm` says
+    /// otherwise.
+    const BACKLEG_WARM: usize = 200;
+    /// Threads a back-leg round's check runs: 5120 values, 20 blocks of 256.
+    const BACKLEG_THREADS: u32 = 256;
+    const BACKLEG_GRID: u32 = (BACKLEG_VALUES / BACKLEG_THREADS as usize) as u32;
+    /// The dev arms' crossing: the sum plus the counter as its last word.
+    const BACKLEG_DEV_WORDS: usize = BACKLEG_VALUES + 1;
+    /// The +chunks arms' paced-copy load: the chunk size the device
+    /// residency design's paced host→card copies carry.
+    const BACKLEG_CHUNK: usize = 2 << 20;
+    /// How many of the chunk loop's copies may be in flight at once.
+    const BACKLEG_CHUNK_RING: usize = 8;
+    /// How long the driving thread waits for a round's ack before naming the
+    /// failure: a wait that never arrives is a protocol failure, not a hang.
+    const BACKLEG_ACK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The back-leg round's check, one thread a value, then one grid-wide
+    /// join and one ack word: the host's spin from its go to that word is
+    /// what the arms price. A thread whose value is not the round's reduces
+    /// the round into `fault[0]` (`min`) and the bits it read into `fault[1]`
+    /// (`max`) — both order-independent, so any number of mismatching
+    /// threads leaves the first failing round and the freshest stale value.
+    #[cuda_module]
+    mod backleg_kernels {
+        use super::*;
+
+        #[cooperative_launch]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (vals.len() >= n, ack.len() >= 1)
+        )]
+        pub fn backleg_check(
+            vals: &[f32],
+            n: u32,
+            want: f32,
+            round: u32,
+            fault: *mut u32,
+            mut ack: DisjointSlice<u32>,
+            ack_value: u32,
+        ) {
+            let i = thread::index_1d().get();
+            if i < n as usize {
+                // SAFETY: i < n <= vals.len() by the launch contract.
+                let got = unsafe { *vals.get_unchecked(i) };
+                if got.to_bits() != want.to_bits() {
+                    // SAFETY: `fault` addresses two live device u32s of this
+                    // context (the arm's fault word) for every launch of this
+                    // module, and the generic-to-global conversion is exact —
+                    // the fault sink's own raise makes the same argument.
+                    unsafe {
+                        ptx_asm!(
+                            "{ .reg .b64 g;\n\t\
+                               cvta.to.global.u64 g, %0;\n\t\
+                               red.relaxed.gpu.global.min.u32 [g], %1;\n\t\
+                               add.u64 g, g, 4;\n\t\
+                               red.relaxed.gpu.global.max.u32 [g], %2; }",
+                            in("l") fault,
+                            in("r") round + 1,
+                            in("r") got.to_bits(),
+                            clobber("memory")
+                        );
+                    }
+                }
+            }
+            // Every thread reaches the join: the guarded read above is the
+            // only early shape, and it skips nothing past here.
+            grid::sync();
+            if i == 0 {
+                // SAFETY: ack.len() >= 1 by the launch contract; the grid
+                // joined above, so every read this ack answers for has
+                // happened.
+                unsafe { *ack.get_unchecked_mut(0) = ack_value };
+            }
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Arm {
         Pinned,
@@ -113,10 +233,14 @@ mod probe {
         Attach,
         PageableLoop,
         StagedLoop,
+        BacklegHost,
+        BacklegDev,
+        BacklegHostChunks,
+        BacklegDevChunks,
     }
 
     impl Arm {
-        const ALL: [(&'static str, Arm); 8] = [
+        const ALL: [(&'static str, Arm); 12] = [
             ("pinned", Arm::Pinned),
             ("pageable", Arm::Pageable),
             ("registered", Arm::Registered),
@@ -125,6 +249,10 @@ mod probe {
             ("attach", Arm::Attach),
             ("pageable-loop", Arm::PageableLoop),
             ("staged-loop", Arm::StagedLoop),
+            ("backleg-host", Arm::BacklegHost),
+            ("backleg-dev", Arm::BacklegDev),
+            ("backleg-host+chunks", Arm::BacklegHostChunks),
+            ("backleg-dev+chunks", Arm::BacklegDevChunks),
         ];
 
         fn parse(name: &str) -> Result<Arm, GateError> {
@@ -150,6 +278,23 @@ mod probe {
             matches!(self, Arm::PageableLoop | Arm::StagedLoop)
         }
 
+        fn is_backleg(self) -> bool {
+            matches!(
+                self,
+                Arm::BacklegHost | Arm::BacklegDev | Arm::BacklegHostChunks | Arm::BacklegDevChunks
+            )
+        }
+
+        /// The back-leg arms whose sum crosses by one host→card copy the
+        /// host itself issues each round.
+        fn is_dev(self) -> bool {
+            matches!(self, Arm::BacklegDev | Arm::BacklegDevChunks)
+        }
+
+        fn is_chunks(self) -> bool {
+            matches!(self, Arm::BacklegHostChunks | Arm::BacklegDevChunks)
+        }
+
         fn default_bytes(self) -> usize {
             match self {
                 Arm::Pinned | Arm::Pageable | Arm::Registered => PATH_BYTES,
@@ -169,6 +314,8 @@ mod probe {
         arms: Vec<Arm>,
         bytes: Option<usize>,
         reps: Option<usize>,
+        iters: Option<usize>,
+        warm: Option<usize>,
         seconds: Option<f64>,
         stop_file: Option<PathBuf>,
         chunk_bytes: usize,
@@ -177,14 +324,17 @@ mod probe {
         interval_ms: u64,
     }
 
-    const USAGE: &str = "usage: h2d_probe [--arm A[,B…]] [--bytes N] [--reps K] [--seconds S] \
-        [--stop-file PATH] [--chunk N] [--ring R] [--fill-threads T] [--interval-ms M]";
+    const USAGE: &str = "usage: h2d_probe [--arm A[,B…]] [--bytes N] [--reps K] [--iters N] \
+        [--warm W] [--seconds S] [--stop-file PATH] [--chunk N] [--ring R] [--fill-threads T] \
+        [--interval-ms M]";
 
     fn args() -> Result<Args, GateError> {
         let mut a = Args {
             arms: vec![Arm::Pinned, Arm::Pageable, Arm::Registered],
             bytes: None,
             reps: None,
+            iters: None,
+            warm: None,
             seconds: None,
             stop_file: None,
             chunk_bytes: CHUNK,
@@ -211,6 +361,8 @@ mod probe {
                 }
                 "--bytes" => a.bytes = Some(int("--bytes", value("--bytes")?)?),
                 "--reps" => a.reps = Some(int("--reps", value("--reps")?)?),
+                "--iters" => a.iters = Some(int("--iters", value("--iters")?)?),
+                "--warm" => a.warm = Some(int("--warm", value("--warm")?)?),
                 "--seconds" => {
                     let v = value("--seconds")?;
                     let s: f64 = v
@@ -257,7 +409,30 @@ mod probe {
         if loops == 0 && (a.seconds.is_some() || a.stop_file.is_some()) {
             return Err("--seconds and --stop-file belong to the loop arms".into());
         }
+        let backlegs = a.arms.iter().filter(|x| x.is_backleg()).count();
+        if backlegs > 0 && (a.bytes.is_some() || a.reps.is_some()) {
+            return Err(
+                "--bytes and --reps belong to the copy arms; a backleg arm crosses the handoff's \
+                 own 20,484 bytes a round and takes --iters and --warm"
+                    .into(),
+            );
+        }
+        if backlegs < a.arms.len() && (a.iters.is_some() || a.warm.is_some()) {
+            return Err("--iters and --warm belong to the backleg arms".into());
+        }
         for &arm in &a.arms {
+            if arm.is_backleg() {
+                let iters = a.iters.unwrap_or(BACKLEG_ITERS);
+                if iters < MIN_REPS {
+                    return Err(format!(
+                        "arm {}: --iters {iters}, at least {MIN_REPS} (a percentile line needs \
+                         its ranks)",
+                        arm.name()
+                    )
+                    .into());
+                }
+                continue;
+            }
             let bytes = a.bytes.unwrap_or(arm.default_bytes());
             let reps = a.reps.unwrap_or(arm.default_reps());
             if bytes == 0 || !bytes.is_multiple_of(PAGE) {
@@ -957,6 +1132,340 @@ mod probe {
         Ok(why)
     }
 
+    // ------------------------------------------------------------ back-leg arms
+
+    /// The `p`-quantile (0..=1) of `sorted`: the element at rank `ceil(p·n)`.
+    fn pct(sorted: &[f64], p: f64) -> f64 {
+        let n = sorted.len();
+        let rank = ((p * n as f64).ceil() as usize).clamp(1, n);
+        sorted[rank - 1]
+    }
+
+    /// Spin on the page's ack word until it reaches `v`, at most
+    /// [`BACKLEG_ACK_DEADLINE`]: a round whose ack never arrives is a named
+    /// failure, not a hang.
+    fn wait_ack(page: &BacklegPage, arm: Arm, v: u32) -> Result<(), GateError> {
+        let deadline = Instant::now() + BACKLEG_ACK_DEADLINE;
+        while page.ack_value() < v {
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "arm {}: the ack word never reached {v} within {BACKLEG_ACK_DEADLINE:?}: the \
+                     wait behind it, or the check kernel after that, stopped",
+                    arm.name()
+                )
+                .into());
+            }
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// The dev arms' copy side: the pinned staging words (the sum plus the
+    /// counter as its last word) and the copy stream the per-round
+    /// `cuMemcpyHtoDAsync` runs on. One copy is in flight at a time — the
+    /// round's ack proves the previous one landed before the host rewrites
+    /// the staging, and one stream's copies serialize anyway.
+    struct DevLeg {
+        stream: Arc<CudaStream>,
+        pin: PinnedHostBuffer<u32>,
+        vram: DeviceBuffer<u32>,
+    }
+
+    impl DevLeg {
+        fn new(ctx: &Arc<CudaContext>, engine: &CudaStream) -> Result<DevLeg, GateError> {
+            let vram = DeviceBuffer::<u32>::zeroed(engine, BACKLEG_DEV_WORDS)?;
+            engine.synchronize()?;
+            Ok(DevLeg {
+                stream: ctx.new_stream()?,
+                pin: PinnedHostBuffer::<u32>::zeroed(ctx, BACKLEG_DEV_WORDS)?,
+                vram,
+            })
+        }
+
+        /// Round `i`'s crossing; the call's own host time is the submit the
+        /// dev arms report beside the round trip.
+        fn submit(&mut self, i: u32) -> Result<(), GateError> {
+            // SAFETY: `pin` holds BACKLEG_DEV_WORDS live pinned words, whose
+            // bytes go into `vram`'s BACKLEG_DEV_WORDS words of the same
+            // context; the previous round's copy has landed (its ack was
+            // seen) and this stream's copies serialize, so nothing reads the
+            // staging while a copy runs, and `vram` outlives the stream's
+            // work (the arm synchronizes before it drops).
+            let rc = unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    self.vram.cu_deviceptr(),
+                    self.pin.as_ptr().cast(),
+                    4 * BACKLEG_DEV_WORDS,
+                    self.stream.cu_stream(),
+                )
+            };
+            rc.result()
+                .map_err(|e| format!("cuMemcpyHtoDAsync_v2 (backleg round {i}): {e:?}"))?;
+            Ok(())
+        }
+    }
+
+    /// The paced-copy load a streaming back-leg design puts on the link: 2
+    /// MiB pinned→VRAM copies back to back on their own stream until `stop`,
+    /// each counted once its copy is known complete. Answers the bytes it
+    /// moved and the seconds it ran.
+    fn chunk_loop(ctx: &Arc<CudaContext>, stop: &AtomicBool) -> Result<(u64, f64), String> {
+        let stream = ctx.new_stream().map_err(|e| e.to_string())?;
+        let pinned =
+            PinnedHostBuffer::<u8>::zeroed(ctx, BACKLEG_CHUNK).map_err(|e| e.to_string())?;
+        let mut dst =
+            DeviceBuffer::<u8>::zeroed(&stream, BACKLEG_CHUNK).map_err(|e| e.to_string())?;
+        stream.synchronize().map_err(|e| e.to_string())?;
+        let events: Vec<CudaEvent> = (0..BACKLEG_CHUNK_RING)
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        let (mut bytes, mut i) = (0u64, 0usize);
+        while !stop.load(Ordering::Relaxed) {
+            let slot = i % BACKLEG_CHUNK_RING;
+            if i >= BACKLEG_CHUNK_RING {
+                // The event this slot still carries is the copy a ring's
+                // worth of copies ago: waiting it counts that copy's bytes.
+                events[slot].synchronize().map_err(|e| e.to_string())?;
+                bytes += BACKLEG_CHUNK as u64;
+            }
+            // SAFETY: `pinned` outlives the stream's copies — every event is
+            // synchronized below before `pinned` drops.
+            unsafe { dst.copy_from_pinned_host_async(&stream, &pinned) }
+                .map_err(|e| e.to_string())?;
+            events[slot].record(&stream).map_err(|e| e.to_string())?;
+            i += 1;
+        }
+        for k in i.saturating_sub(BACKLEG_CHUNK_RING)..i {
+            events[k % BACKLEG_CHUNK_RING]
+                .synchronize()
+                .map_err(|e| e.to_string())?;
+            bytes += BACKLEG_CHUNK as u64;
+        }
+        Ok((bytes, t0.elapsed().as_secs_f64()))
+    }
+
+    /// One back-leg arm: `--warm` untimed rounds, then `--iters` timed, each
+    /// round a full crossing (the sum and its go out, the card checks every
+    /// value, one ack word comes back) whose host-clock go-to-ack interval
+    /// the arm reports. A second thread enqueues every round's stream work
+    /// ahead of the driving one, so the queue's backpressure lands there,
+    /// never between a round's go and its ack; a third (the `+chunks` arms)
+    /// loads the link with paced copies for the arm's duration.
+    fn backleg(ctx: &Arc<CudaContext>, card: &Card, arm: Arm, a: &Args) -> Result<(), GateError> {
+        let iters = a.iters.unwrap_or(BACKLEG_ITERS);
+        let warm = a.warm.unwrap_or(BACKLEG_WARM);
+        let total = warm + iters;
+        let dev = arm.is_dev();
+        // SAFETY: this binary's own module, loaded once into the card's
+        // context before any launch.
+        let pm = unsafe { backleg_kernels::load(ctx)? };
+        let engine = ctx.new_stream()?;
+        let page = BacklegPage::new(ctx, BACKLEG_VALUES)?;
+        let fault = DeviceBuffer::<u32>::zeroed(&engine, 2)?;
+        engine.synchronize()?;
+        // A raw pointer is not `Send`; the address crosses the threads as a
+        // number and becomes a pointer again inside the enqueue thread.
+        let fault_addr = fault.cu_deviceptr() as usize;
+        let prep =
+            pm.prepare_backleg_check(LaunchConfig1D::new(BACKLEG_GRID, BACKLEG_THREADS, 0))?;
+        let mut ack_win = launch_window::<u32>(page.ack_dev(), 1, ctx);
+        let mut dev_leg = dev.then(|| DevLeg::new(ctx, &engine)).transpose()?;
+        let vals_win = match dev_leg.as_ref() {
+            Some(d) => launch_window::<f32>(d.vram.cu_deviceptr(), BACKLEG_VALUES, ctx),
+            None => launch_window::<f32>(page.values_dev(), BACKLEG_VALUES, ctx),
+        };
+        let cnt_word = match dev_leg.as_ref() {
+            Some(d) => d.vram.cu_deviceptr() + 4 * BACKLEG_VALUES as u64,
+            None => page.cnt_dev(),
+        };
+
+        let mut rt: Vec<f64> = Vec::with_capacity(iters);
+        let mut submit: Vec<f64> = Vec::with_capacity(iters);
+        let finished = AtomicBool::new(false);
+        // What the arm's three threads hand back, as text: the arm's own
+        // error type is not `Send`.
+        type ThreadsRan = (
+            Result<(), String>,
+            Result<(), String>,
+            Result<Option<(u64, f64)>, String>,
+        );
+        let (enq_r, drive_r, chunk_r): ThreadsRan = std::thread::scope(|s| {
+            // The enqueue thread: every round's wait and check, ahead of the
+            // driver. It drives no go, so it can only run ahead — a full
+            // queue holds it until the stream drains, which the driver's
+            // rounds do.
+            let enq = s.spawn(|| {
+                let mut r = Ok(());
+                for i in 0..total as u32 {
+                    if finished.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    r = enqueue_wait_geq(&engine, cnt_word, i + 1)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| {
+                            pm.backleg_check(
+                                &engine,
+                                &prep,
+                                &vals_win,
+                                BACKLEG_VALUES as u32,
+                                i as f32,
+                                i,
+                                fault_addr as *mut u32,
+                                &mut ack_win,
+                                i + 1,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                r
+            });
+            let chunks = arm
+                .is_chunks()
+                .then(|| s.spawn(|| chunk_loop(ctx, &finished)));
+            // The driving thread — this one: what lands between a round's go
+            // and its ack is the arm's number.
+            let mut drive: Result<(), String> = Ok(());
+            for i in 0..total as u32 {
+                let t0 = if dev {
+                    let d = dev_leg.as_mut().expect("the dev arms carry a copy leg");
+                    let words = d.pin.as_mut_slice();
+                    words[..BACKLEG_VALUES].fill((i as f32).to_bits());
+                    words[BACKLEG_VALUES] = i + 1;
+                    let ts = Instant::now();
+                    let sent = d.submit(i);
+                    let t0 = Instant::now();
+                    if let Err(e) = sent {
+                        drive = Err(e.to_string());
+                        break;
+                    }
+                    if i as usize >= warm {
+                        submit.push((t0 - ts).as_secs_f64() * 1e6);
+                    }
+                    t0
+                } else {
+                    page.fill_values(i as f32);
+                    let t0 = Instant::now();
+                    let v = page.cnt_bump();
+                    if v != i + 1 {
+                        drive = Err(format!(
+                            "arm {}: the counter jumped to {v} at round {i}",
+                            arm.name()
+                        ));
+                        break;
+                    }
+                    t0
+                };
+                if let Err(e) = wait_ack(&page, arm, i + 1) {
+                    drive = Err(e.to_string());
+                    break;
+                }
+                if i as usize >= warm {
+                    rt.push(t0.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+            // However the driving loop ended, the stream must be able to
+            // drain: the counter goes far past anything a round bumps it to,
+            // so every wait still pending passes and the enqueue thread —
+            // which may be sitting in a full queue — goes home; the chunk
+            // thread is told to stop.
+            finished.store(true, Ordering::Release);
+            page.release();
+            if let Some(d) = dev_leg.as_ref()
+                && let Err(e) = enqueue_write(&d.stream, cnt_word, 1 << 30)
+            {
+                drive = Err(format!("arm {}: releasing the waits: {e}", arm.name()));
+            }
+            let enq = match enq.join() {
+                Ok(r) => r,
+                Err(_) => Err("the enqueue thread panicked".to_string()),
+            };
+            let chunk = match chunks {
+                Some(h) => match h.join() {
+                    Ok(r) => r.map(Some),
+                    Err(_) => Err("the chunk thread panicked".to_string()),
+                },
+                None => Ok(None),
+            };
+            (enq, drive, chunk)
+        });
+        enq_r.map_err(GateError::from)?;
+        drive_r.map_err(GateError::from)?;
+        let chunk_gbps = match chunk_r.map_err(GateError::from)? {
+            Some((bytes, secs)) if secs > 0.0 => Some(bytes as f64 / secs / 1e9),
+            Some(_) => {
+                return Err(format!(
+                    "arm {}: the chunk loop ran no time, so no load it put on the link",
+                    arm.name()
+                )
+                .into());
+            }
+            None => None,
+        };
+        engine.synchronize()?;
+        let f = fault.to_host_vec(&engine)?;
+        if f[0] != 0 {
+            // The card caught a value that was not its round's: the arm's
+            // whole point — the named error says which crossing let it by.
+            let got = f32::from_bits(f[1]);
+            return Err(if dev {
+                format!(
+                    "arm {}: the card read a stale value: round {} of {total} read {got} where \
+                     the round's value was {} — the wait on the copy's own counter word released \
+                     before the copy's values were visible, so a device-resident back-leg needs a \
+                     signal other than a memory-op wait on a copied word (an event the values' \
+                     reader waits on, or a flag the copy's completion raises)",
+                    arm.name(),
+                    f[0],
+                    f[0] - 1,
+                )
+            } else {
+                format!(
+                    "arm {}: the card read a stale value: round {} of {total} read {got} where \
+                     the round's value was {} — the kernel read the mapped page before the host's \
+                     stores of the round were visible to it",
+                    arm.name(),
+                    f[0],
+                    f[0] - 1,
+                )
+            }
+            .into());
+        }
+        let mut sorted = rt.clone();
+        sorted.sort_by(f64::total_cmp);
+        let mut line = format!(
+            "iters={iters} warm={warm} bytes={} rt_us_median={:.2} rt_us_p90={:.2} \
+             rt_us_p99={:.2} rt_us_max={:.2}",
+            4 * if dev {
+                BACKLEG_DEV_WORDS
+            } else {
+                BACKLEG_VALUES
+            },
+            pct(&sorted, 0.5),
+            pct(&sorted, 0.9),
+            pct(&sorted, 0.99),
+            sorted[sorted.len() - 1],
+        );
+        if dev {
+            let mut submits = submit.clone();
+            submits.sort_by(f64::total_cmp);
+            line = format!(
+                "{line} submit_us_median={:.2} submit_us_p99={:.2}",
+                pct(&submits, 0.5),
+                pct(&submits, 0.99),
+            );
+        }
+        if let Some(g) = chunk_gbps {
+            line = format!("{line} chunks_GB/s={g:.2}");
+        }
+        println!("h2d arm={} {} {line}", arm.name(), card.tag());
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let a = args()?;
         for &arm in &a.arms {
@@ -969,6 +1478,8 @@ mod probe {
                     card.print()?;
                     if arm.is_loop() {
                         copy_loop(&ctx, &card, arm, &a)?;
+                    } else if arm.is_backleg() {
+                        backleg(&ctx, &card, arm, &a)?;
                     } else {
                         one_shot(&ctx, &card, arm, &a)?;
                     }
