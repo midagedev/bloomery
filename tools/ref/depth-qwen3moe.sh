@@ -1086,8 +1086,9 @@ ours_post() {
   fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
   # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
-  # lines are the arm's configuration, the prefill's time and its host prologue.
-  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt) '
+  # lines are the arm's configuration, the prefill's time and its host prologue; under
+  # BLOOMERY_STEP_STATS the ubatch walk's split and per-layer-batch records follow.
+  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt|stat prompt38 split|stat prompt38 lb) '
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
