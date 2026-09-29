@@ -1,0 +1,27 @@
+# Lead e1, 2026-09-29: the nsys trace of the residency decode (nsysres-v41.card, tree nsysres on swappace + stagewin)
+# split the heavy steps' excess: engine kernel time rose 0.5 ms a step, engine idle 5-7 ms. While one r8 -> Q3_K
+# unpack (ds41_r8_q3k, 4,950 blocks of 256, 584 us) ran, a median 2 engine kernels started, and the first engine
+# kernel after it started a median 5.2 us after its end: at one stream priority the card places the unpack's
+# pending blocks before the engine's next launch. A layer whose host wait an unpack overlapped ran 895-905 us,
+# one without 532-621 us. This tree carries two levers against it: the group unpack (unpacksimt: at most 42
+# blocks, 14..30 us a launch by its card) and the engine streams at the greatest priority with the copy stream
+# at the least (swapprio). Either alone should end the hold; the per-layer split below says whether they did.
+kind: profile
+question: with the group unpack and the copy stream behind the engine, does a layer whose host wait an unpack
+  overlaps run as long as one without?
+term: median layer period (handoff to handoff on the stage card) of layers whose longest gap an unpack overlaps,
+  minus that of heavy-step layers with no unpack, steps 10-39 of `generate_ds41 --place bp --tokens <prose:64>
+  -n 40 --mode graph --time`, residency mid-p40-s1, A6000 stage card
+unit: us
+predict: -40..60
+condition: BLOOMERY_REMOTE='~/repo/bloomery-swapprio' BLOOMERY_BOX_ENV='BLOOMERY_GEN_PLACE=bp
+  BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_RESIDENCY=mid-p40-s1 BLOOMERY_NSYS_N=40
+  BLOOMERY_LEASE_CARD=docs/cards/swapprio-nsys.card' just nsys-gpu-ds41 prose:64; the split is the lead's
+  sqlite script (specs/release/nsys-an/nsq9.py), read beside the unpack's duration per launch and the engine
+  kernel starts during a launch
+decide-in: run the cross-binary A/B (swapprio-ab.card)
+decide-below: the overlapped layers are now shorter: the unpack no longer shares the engine's SMs at all; run
+  the A/B
+decide-above: the hold remains: read whether graph kernels took the launch stream's priority
+  (cuStreamGetPriority on the replay stream, the node attribute) and whether the group unpack ran; cap the
+  unpack's grid before any A/B
