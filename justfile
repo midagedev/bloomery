@@ -396,6 +396,10 @@ box-gc *ARGS='--kill':
 box-tracks *ARGS:
     ./tools/box-tracks.sh {{ARGS}}
 
+# 이 Mac의 워크트리마다 크기와 착륙 상태를 보인다. 인자 없이 목록, `just mac-disk clean|retire NAME…`로 준 이름만 정리(retire는 LANDED·PRUNABLE일 때만).
+mac-disk *ARGS:
+    python3 tools/mac-disk.py {{ARGS}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
