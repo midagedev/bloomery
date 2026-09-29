@@ -23,8 +23,10 @@
 # card in its view: name, PCI address, power limit (the 3090's 250 W cap) and max SM clock.
 #
 # Arguments: --parse-only prints the steps and exits 0 before any check, lease or run. Each step is
-# bounded by lease_bounded (BLOOMERY_ARM_BOUND, default 900 s). The run's card: BLOOMERY_LEASE_CARD
-# through BLOOMERY_BOX_ENV (docs/cards/pcie-a6000.card).
+# bounded by lease_bounded (BLOOMERY_ARM_BOUND, default 900 s). BLOOMERY_H2D_ARMS (through the box
+# env, like the lease card) names further h2d_probe arms (register-slope) as steps on the timing card
+# after the fixed ones, in the same lease. The run's card: BLOOMERY_LEASE_CARD through
+# BLOOMERY_BOX_ENV (docs/cards/pcie-a6000.card).
 set -euo pipefail
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
@@ -40,6 +42,11 @@ BOTH=0
 [ "${BLOOMERY_BOX_CARD:-}" = both ] && BOTH=1
 steps=("attach" "pinned,pageable" "sustained")
 [ "$BOTH" = 1 ] && steps+=("sustained on the other card" "both")
+EXTRA_ARMS=${BLOOMERY_H2D_ARMS:-}
+if [ -n "$EXTRA_ARMS" ]; then
+  IFS=',' read -r -a extras <<< "$EXTRA_ARMS"
+  steps+=("${extras[@]}")
+fi
 if [ "$PARSE_ONLY" = 1 ]; then
   echo "[parse] both=$BOTH steps: ${steps[*]}"
   exit 0
@@ -90,6 +97,10 @@ if [ "$BOTH" = 1 ]; then
     step "$VIEW" --arm both
   fi
 fi
+for arm in ${EXTRA_ARMS//,/ }; do
+  [ -n "$arm" ] || continue
+  step "$TIMING_GPU" --arm "$arm"
+done
 witness post
 xid_post=$(xid_lines)
 echo "    xid-lines: $xid_post"

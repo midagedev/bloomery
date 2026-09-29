@@ -1,0 +1,64 @@
+# Round odprobe: the O_DIRECT swap source — read the expert's bytes from the model file straight into
+# the pinned ring — beside V4.1's DRAM-bound host leg, and the anonymous region's registration slope,
+# the registered-region design's entry price.
+#
+# Why (d). rig-log 09-29#cprobe measured c, the host-leg time one residency copy (one V4.1 expert,
+# 16,773,120 B) costs in host-slot equivalents, at 7.8 on the staging path (one thread memcpys into a
+# pinned ring, then H2D) and 0.83 from a cuMemHostRegistered anonymous source — a ratio of 10, which
+# the crossings count (3..4 against 1) does not explain; the hypothesis there [derived, unmeasured] is
+# that the memcpy thread loads a CCD link the host leg waits on and DMA reads do not ride that link.
+# The engine's swap source is the model's r8 sidecar file mapping, which this box refuses to register
+# in place (rc 801, docs/facts.md). The registered-region design (b-full) would copy the sidecar
+# (~204 GiB) into an anonymous registered region: its registration cost is unmeasured, and it doubles
+# the bytes whenever the file is page-cached. Candidate (d): read each expert's bytes from the file
+# with O_DIRECT into the pinned ring the staging path already fills — the NVMe controller's DMA writes
+# host DRAM once, the card's DMA reads it once, no CPU copy, no second copy of the model, no change to
+# how the host tier reads experts.
+#
+# Paper [derived]. Same leg, same c = (U_alone - U_with) / C_with as cprobe. odirect crosses DRAM
+# twice a copied byte — the NVMe DMA's write, the card DMA's read — where direct crosses once (its
+# 0.83 is one crossing at k_eff below 1, the leg's headroom absorbing part of it). A write costing the
+# bus like a read puts c near 2 x 0.83; a write the controller absorbs under the leg's headroom, or
+# lines still resident when the card reads them, put it near 0.6. The NVMe read adds no host DRAM
+# traffic beyond its write, and the pacing (3 and 6 copies a 37.5 ms token, 80 and 160 a second)
+# matches cprobe's rows, so C is the design's rate (2.68 GB/s at 6 a token) and the rows compare like
+# for like: expect odirect:3 c = odirect:6 c, as staging and direct each held theirs across rates.
+# The registration slope is read, not predicted: touch (first fault of every 4 KiB page), register,
+# one expert-sized H2D and unregister per GiB of a MADV_HUGEPAGE anonymous region at 4, 8 and 16 GiB (the default: at most 16 GiB of the model's page cache pushed out, peers load it warm)
+# — the terms b-full's wall and steady-state cost are made of. The arm refuses a mapping over half of
+# MemAvailable by name (peers load models on this box).
+# Wall [derived]: cprobe ran 7 conditions x 4 rounds in 6.2 min (15:30:00-15:36:11 UTC); this run is 5
+# conditions (alone among them), so ~4.5 min, plus 4 copies alone (~6 s each) and the register-slope
+# arm in the pcie runner's lease (its fixed steps ~2 min, the arm itself: touch 28 GiB, register,
+# one H2D and unregister each size) ~3 min: ~8 min, under the 15 the window allows.
+kind: profile
+question: does reading each expert's bytes from the model file with O_DIRECT into the pinned ring
+  hold c near the direct arm's one crossing, and what does an anonymous region cost to register per
+  GiB — the two numbers the swap source choice turns on?
+term: c of odirect:6, the runner's `P2 c … cond=odirect:6` beside V4.1's DRAM-bound decode host leg
+  (bench_v41_host --time --arms engine:5 at 28 threads, V4.1 public Q3_K_M, A6000; h2d_probe
+  odirect-loop over the model's first shard as the recipe resolves it, 16,773,120 B blocks at a fixed
+  stride over the file, ring 4, paced at 160 a second — 6 copies a 37.5 ms token)
+unit: host slots
+predict: 0.6..2.0
+condition: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/odprobe.card' just time-dma-dram --arms
+  engine:5 --conds alone,odirect:3,odirect:6,direct:6,staging:6 --rounds 4 --seconds 8 --copy-alone 5
+  (cprobe's spelling, its seconds and copy-alone; the runner's lease_take, the bench under 600 s, the
+  copy under 660 s and its stop file, the order rotated every round, witness blocks pre and post),
+  then the register-slope arm in the same sitting:
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/odprobe.card BLOOMERY_H2D_ARMS=register-slope'
+  just time-gpu-h2d (the pcie runner's own lease_take, after the share runner releases its lease —
+  one sitting, two takes). Three reads before the band: every row admissible and untagged
+  ([overlap], [copy-gap], [unpinned] rows out, as cprobe's were); each paced copy alone holds its pace
+  within 2 % (odirect:6 and direct:6 at 2.68, odirect:3 at 1.34 GB/s), so C is the design's rate; and
+  the odirect loop's start line reads odirect=yes with the file it opened (a filesystem that refuses
+  O_DIRECT, a ring slot off a page boundary or a short pread is a named error that ends the arm)
+decide-in: c of odirect:6 between 0.6 and 2: land (d) as the swap source path — the r8 sidecar read
+  with O_DIRECT into the pinned ring, no staging memcpy and no second copy of the model
+decide-below: c of odirect:6 under 0.6, cheaper than direct's one crossing: record the row beside
+  cprobe's table and re-read the rows' tags and the copy's own GB/s before believing it (a leak in
+  the copy's accounting reads the same); (d) stays the landing candidate either way
+decide-above: c of odirect:6 over 2: the NVMe DMA's write costs the bus like the staging memcpy's
+  crossings — the file cannot serve the swap directly; read this run's register-slope lines
+  (touch_s, register_s, h2d_GBps, unregister_s per GiB) and price b-full, whose steady-state c is
+  direct's 0.83, before the V4.1 adapter

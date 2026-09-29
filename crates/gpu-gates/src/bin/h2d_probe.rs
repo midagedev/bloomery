@@ -32,7 +32,16 @@
 //!   origin), and their sum. Needs two cards in view.
 //! - `attach`: `nvidia-smi topo -m`, each line as `h2d topo | <line>`, then
 //!   every card in view's card line with its link as it reads idle.
-//! - `pageable-loop`, `staged-loop`, `direct-loop`: the copy side of
+//! - `register-slope`: for each N of `--reg-gib` (4,8,16 GiB): an anonymous
+//!   mapping under `MADV_HUGEPAGE`, first-touched a page at a time, registered
+//!   with `cuMemHostRegister(READ_ONLY)`, one expert-sized H2D out of it, then
+//!   unregistered — each timed — with the `AnonHugePages` delta:
+//!   `h2d arm=register-slope gib=N touch_s= register_s= h2d_GBps=
+//!   unregister_s= anon_huge_kb=`. The registered-region design's entry price
+//!   per GiB. The largest N must not exceed half of `MemAvailable` when the
+//!   arm starts (peers load models on this box).
+//! - `pageable-loop`, `staged-loop`, `direct-loop`, `odirect-loop`: the copy
+//!   side of
 //!   `tools/ref/dma-dram-share.sh`. They run alone, until `--stop-file`
 //!   exists or `--seconds` pass (required, the bound), over a warm window of
 //!   `--bytes` (1,600,000,000) of `--source`, `--chunk` (64 MiB) at a time,
@@ -50,7 +59,16 @@
 //!   its copy's event; `direct-loop` registers the source with
 //!   `cuMemHostRegister` once (read-only for the shard's map, which this box
 //!   refuses) and copies each chunk from it with no host copy, `--ring`
-//!   copies in flight. `--rate R` paces a loop at R chunks a second (chunk
+//!   copies in flight; `odirect-loop` reads each chunk (a block) with
+//!   `pread` from `--od-file` (default: the V4.1 first shard, as `--source
+//!   shard` resolves it) opened `O_DIRECT` straight into a pinned ring slot —
+//!   the NVMe controller's DMA writes host DRAM and the card's DMA reads it,
+//!   no CPU copy — on the loop's own thread, then copies the block's bytes to
+//!   the card. Its blocks sit at a fixed stride spread over the file, each
+//!   read as its page-aligned superset into the slot, so one round reads no
+//!   block twice and the page cache serves nothing (a filesystem that
+//!   refuses `O_DIRECT`, or a ring slot not page-aligned, is a named error).
+//!   `--rate R` paces a loop at R chunks a second (chunk
 //!   `i` starts no earlier than `i / R` seconds after the first; a loop
 //!   behind its pace starts the next at once, and the interval lines give
 //!   the rate it held); without it a loop copies as fast as it can. Every
@@ -59,7 +77,8 @@
 //!   known complete; then one `h2d loop arm=<a> summary …` line.
 //!   `--check` runs one pass over the window instead, each chunk into its
 //!   own device buffer (no `--seconds` needed), reads every buffer back and
-//!   compares it with its chunk of the source byte for byte, and counts the
+//!   compares it with its chunk of the source byte for byte (for
+//!   `odirect-loop`, a fresh aligned read of the file's block), and counts the
 //!   bytes the loop's accounting claims against the pass's:
 //!   `h2d check arm=<a> … mismatched_chunks=<n> counted=<b> want=<b>`; a
 //!   mismatch or a count off ends the run with an error.
@@ -89,6 +108,8 @@ mod probe {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -114,6 +135,14 @@ mod probe {
     const MIN_REPS: usize = 5;
     /// The page size: a mapped range starts on a page and spans whole pages.
     const PAGE: usize = 4096;
+    /// One V4.1 routed expert's bytes: the residency copy's block, and the
+    /// register-slope arm's one H2D.
+    const EXPERT_BYTES: usize = 16_773_120;
+    /// The register-slope arm's mappings, in GiB, unless `--reg-gib` says
+    /// otherwise.
+    const REG_GIB: [usize; 3] = [4, 8, 16];
+    /// KiB in a GiB.
+    const KIB_PER_GIB: u64 = 1 << 20;
     /// A loop's chunk, its ring depth and its fill threads unless flags say otherwise.
     const CHUNK: usize = 64 << 20;
     const RING: usize = 4;
@@ -132,22 +161,26 @@ mod probe {
         Sustained,
         Both,
         Attach,
+        RegisterSlope,
         PageableLoop,
         StagedLoop,
         DirectLoop,
+        OdirectLoop,
     }
 
     impl Arm {
-        const ALL: [(&'static str, Arm); 9] = [
+        const ALL: [(&'static str, Arm); 11] = [
             ("pinned", Arm::Pinned),
             ("pageable", Arm::Pageable),
             ("registered", Arm::Registered),
             ("sustained", Arm::Sustained),
             ("both", Arm::Both),
             ("attach", Arm::Attach),
+            ("register-slope", Arm::RegisterSlope),
             ("pageable-loop", Arm::PageableLoop),
             ("staged-loop", Arm::StagedLoop),
             ("direct-loop", Arm::DirectLoop),
+            ("odirect-loop", Arm::OdirectLoop),
         ];
 
         fn parse(name: &str) -> Result<Arm, GateError> {
@@ -170,6 +203,14 @@ mod probe {
         }
 
         fn is_loop(self) -> bool {
+            matches!(
+                self,
+                Arm::PageableLoop | Arm::StagedLoop | Arm::DirectLoop | Arm::OdirectLoop
+            )
+        }
+
+        /// Whether the arm copies a mapped `--source` window.
+        fn takes_source(self) -> bool {
             matches!(self, Arm::PageableLoop | Arm::StagedLoop | Arm::DirectLoop)
         }
 
@@ -208,6 +249,11 @@ mod probe {
         fill_threads: usize,
         interval_ms: u64,
         source: SourceKind,
+        /// The file the `odirect-loop` arm reads; `None` is the V4.1 first
+        /// shard, as `--source shard` resolves it.
+        od_file: Option<PathBuf>,
+        /// The register-slope arm's mappings in GiB; `None` is [`REG_GIB`].
+        reg_gib: Option<Vec<usize>>,
         /// Chunks a second a loop is paced at; `None` copies as fast as it can.
         rate: Option<f64>,
         check: bool,
@@ -215,7 +261,7 @@ mod probe {
 
     const USAGE: &str = "usage: h2d_probe [--arm A[,B…]] [--bytes N] [--reps K] [--seconds S] \
         [--stop-file PATH] [--chunk N] [--ring R] [--fill-threads T] [--interval-ms M] \
-        [--source shard|anon] [--rate R] [--check]";
+        [--source shard|anon] [--od-file PATH] [--reg-gib G[,G…]] [--rate R] [--check]";
 
     fn args() -> Result<Args, GateError> {
         let mut a = Args {
@@ -229,6 +275,8 @@ mod probe {
             fill_threads: FILL_THREADS,
             interval_ms: INTERVAL_MS,
             source: SourceKind::Shard,
+            od_file: None,
+            reg_gib: None,
             rate: None,
             check: false,
         };
@@ -280,6 +328,22 @@ mod probe {
                         v => return Err(format!("--source {v}: shard or anon; {USAGE}").into()),
                     }
                 }
+                "--od-file" => a.od_file = Some(PathBuf::from(value("--od-file")?)),
+                "--reg-gib" => {
+                    let v = value("--reg-gib")?;
+                    let list = v
+                        .split(',')
+                        .map(|g| {
+                            g.parse::<usize>().map_err(|e| {
+                                GateError::from(format!("--reg-gib {v}: {e}; {USAGE}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if list.contains(&0) {
+                        return Err(format!("--reg-gib {v}: positive gibibytes; {USAGE}").into());
+                    }
+                    a.reg_gib = Some(list);
+                }
                 "--rate" => {
                     let v = value("--rate")?;
                     let r: f64 = v.parse().map_err(|e| format!("--rate {v}: {e}; {USAGE}"))?;
@@ -302,8 +366,8 @@ mod probe {
         let loops = a.arms.iter().filter(|x| x.is_loop()).count();
         if loops > 0 && a.arms.len() > 1 {
             return Err(
-                "a loop arm (pageable-loop, staged-loop, direct-loop) runs alone: it copies until its stop \
-                        file or its seconds, beside another process"
+                "a loop arm (pageable-loop, staged-loop, direct-loop, odirect-loop) runs alone: it \
+                        copies until its stop file or its seconds, beside another process"
                     .into(),
             );
         }
@@ -330,6 +394,19 @@ mod probe {
                     .into(),
             );
         }
+        if a.arms.iter().all(|x| !x.takes_source()) && loops > 0 && a.source != SourceKind::Shard {
+            return Err(
+                "--source belongs to the pageable, staged and direct loops; odirect-loop reads \
+                 --od-file"
+                    .into(),
+            );
+        }
+        if a.od_file.is_some() && !a.arms.contains(&Arm::OdirectLoop) {
+            return Err("--od-file belongs to the odirect-loop arm".into());
+        }
+        if a.reg_gib.is_some() && !a.arms.contains(&Arm::RegisterSlope) {
+            return Err("--reg-gib belongs to the register-slope arm".into());
+        }
         for &arm in &a.arms {
             let bytes = a.bytes.unwrap_or(arm.default_bytes());
             let reps = a.reps.unwrap_or(arm.default_reps());
@@ -340,7 +417,8 @@ mod probe {
                 )
                 .into());
             }
-            if !arm.is_loop() && arm != Arm::Attach && reps < MIN_REPS {
+            if !arm.is_loop() && !matches!(arm, Arm::Attach | Arm::RegisterSlope) && reps < MIN_REPS
+            {
                 return Err(
                     format!("arm {}: --reps {reps}, at least {MIN_REPS}", arm.name()).into(),
                 );
@@ -1282,6 +1360,384 @@ mod probe {
         Ok((why, i))
     }
 
+    /// `pread` until `buf` is full: short reads advance, `EINTR` retries, and
+    /// any other failure — a misaligned buffer, offset or length among them —
+    /// is a named error, not a retry.
+    fn pread_full(fd: libc::c_int, buf: &mut [u8], at: u64) -> Result<(), GateError> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            // SAFETY: the kernel writes at most `buf.len() - done` bytes into
+            // the live range `buf[done..]`, at file offset `at + done`.
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    buf[done..].as_mut_ptr().cast(),
+                    buf.len() - done,
+                    (at + done as u64) as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(format!("pread {} at {at} of fd {fd}: {e}", buf.len()).into());
+            }
+            if n == 0 {
+                return Err(format!(
+                    "pread at {at} of fd {fd}: EOF after {done} of {} bytes",
+                    buf.len()
+                )
+                .into());
+            }
+            done += n as usize;
+        }
+        Ok(())
+    }
+
+    /// The O_DIRECT candidate: the source is a file, each block read by
+    /// `pread` with `O_DIRECT` straight into a pinned ring slot — the NVMe
+    /// controller's DMA writes host DRAM and the card's DMA reads it, no CPU
+    /// copy — then one async copy of the block's bytes. The blocks sit at a
+    /// fixed stride spread over the file, so one round reads no block twice
+    /// and the page cache serves nothing.
+    fn odirect_loop(
+        ctx: &Arc<CudaContext>,
+        card: &Card,
+        arm: Arm,
+        a: &Args,
+    ) -> Result<(), GateError> {
+        let bytes = a.bytes.unwrap_or(arm.default_bytes());
+        let block = a.chunk_bytes;
+        let path = a
+            .od_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(gguf::v41::model()));
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .map_err(|e| {
+                format!(
+                    "open O_DIRECT {}: {e} (a filesystem that refuses O_DIRECT names itself here)",
+                    path.display()
+                )
+            })?;
+        let file_bytes = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if file_bytes < block as u64 {
+            return Err(format!(
+                "{} holds {file_bytes} bytes, one block is {block}",
+                path.display()
+            )
+            .into());
+        }
+        let file_bytes = file_bytes as usize;
+        let blocks = bytes / block;
+        let stride = ((file_bytes / blocks) & !(PAGE - 1)).max(block);
+        let offsets: Vec<usize> = (0..blocks)
+            .map(|i| i * stride)
+            .take_while(|&o| o + block <= file_bytes)
+            .collect();
+        let stream = ctx.new_stream()?;
+        let buffers = if a.check { offsets.len() } else { 1 };
+        let mut dests: Vec<DeviceBuffer<u8>> = (0..buffers)
+            .map(|_| DeviceBuffer::<u8>::zeroed(&stream, block))
+            .collect::<Result<_, _>>()?;
+        // A block's page-aligned superset is at most the block and a page at
+        // each end; the read lands at the slot's page-aligned base.
+        let slot_bytes = block + 2 * (PAGE - 1);
+        let mut ring: Vec<PinnedHostBuffer<u8>> = (0..a.ring)
+            .map(|_| PinnedHostBuffer::<u8>::zeroed(ctx, slot_bytes))
+            .collect::<Result<_, _>>()?;
+        for (j, slot) in ring.iter().enumerate() {
+            if !(slot.as_ptr() as usize).is_multiple_of(PAGE) {
+                return Err(format!(
+                    "ring slot {j} sits at {:p}, not a multiple of {PAGE}: O_DIRECT needs a \
+                     page-aligned buffer",
+                    slot.as_ptr()
+                )
+                .into());
+            }
+        }
+        let events: Vec<CudaEvent> = (0..a.ring)
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<_, _>>()?;
+        let fd = file.as_raw_fd();
+        let sampler = Sampler::start(card);
+        let mut meter = Meter::new(arm, a.interval_ms);
+        let pace = Pace::new(a, meter.started, offsets.len());
+        println!(
+            "h2d loop arm={} {} start t_ms={} window={bytes} chunk={block} ring={} rate={} check={} \
+             od_file={} file_bytes={file_bytes} blocks={} stride={stride} odirect=yes",
+            arm.name(),
+            card.tag(),
+            epoch_ms()?,
+            a.ring,
+            a.rate.map_or_else(|| "max".to_string(), |r| format!("{r}")),
+            a.check,
+            path.display(),
+            offsets.len()
+        );
+        let n = dests.len();
+        let mut i = 0;
+        let why = loop {
+            if let Some(why) = pace.before(a, i) {
+                break why;
+            }
+            let slot = i % a.ring;
+            if i >= a.ring {
+                events[slot].synchronize()?;
+                meter.done(block)?;
+            }
+            let off = offsets[i % offsets.len()];
+            let begin = off & !(PAGE - 1);
+            let end = (off + block + PAGE - 1) & !(PAGE - 1);
+            pread_full(
+                fd,
+                &mut ring[slot].as_mut_slice()[..end - begin],
+                begin as u64,
+            )?;
+            // SAFETY: `ring[slot]` is not written again until `events[slot]`,
+            // recorded after this copy, has been synchronized, and the ring
+            // outlives the stream's last copy (synchronized below).
+            unsafe {
+                dests[i % n].copy_from_host_async_unchecked(
+                    &stream,
+                    &ring[slot].as_slice()[off - begin..off - begin + block],
+                )?;
+            }
+            events[slot].record(&stream)?;
+            i += 1;
+        };
+        stream.synchronize()?;
+        meter.done(block * i.min(a.ring))?;
+        meter.flush()?;
+        sampler.finish(arm, card)?;
+        let chunks = i;
+        let s = meter.started.elapsed().as_secs_f64();
+        println!(
+            "h2d loop arm={} {} summary t_ms={} seconds={s:.2} bytes={} GB/s={:.2} chunks={chunks} \
+             chunks_per_s={:.2} stopped={why}",
+            arm.name(),
+            card.tag(),
+            epoch_ms()?,
+            meter.bytes,
+            meter.bytes as f64 / s / 1e9,
+            chunks as f64 / s
+        );
+        if a.check {
+            odirect_check_pass(arm, card, &stream, &dests, fd, &offsets, block, meter.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// `--check` for the O_DIRECT arm: every block of the pass read back from
+    /// its own device buffer and compared with a fresh aligned read of the
+    /// file's block, and the bytes the loop counted against the pass's.
+    #[allow(clippy::too_many_arguments, reason = "one check pass's inputs, named")]
+    fn odirect_check_pass(
+        arm: Arm,
+        card: &Card,
+        stream: &CudaStream,
+        dests: &[DeviceBuffer<u8>],
+        fd: libc::c_int,
+        offsets: &[usize],
+        block: usize,
+        counted: usize,
+    ) -> Result<(), GateError> {
+        let want = dests.len() * block;
+        let mut verify = PinnedHostBuffer::<u8>::zeroed(stream.context(), block + 2 * (PAGE - 1))?;
+        let mut bad = Vec::new();
+        for (j, d) in dests.iter().enumerate() {
+            let off = offsets[j % offsets.len()];
+            let begin = off & !(PAGE - 1);
+            let end = (off + block + PAGE - 1) & !(PAGE - 1);
+            pread_full(fd, &mut verify.as_mut_slice()[..end - begin], begin as u64)?;
+            if d.to_host_vec(stream)? != verify.as_slice()[off - begin..off - begin + block] {
+                bad.push(j);
+            }
+        }
+        println!(
+            "h2d check arm={} {} chunks={} chunk={} mismatched_chunks={} first_bad={} \
+             counted={counted} want={want}",
+            arm.name(),
+            card.tag(),
+            dests.len(),
+            block,
+            bad.len(),
+            bad.first()
+                .map_or_else(|| "-".to_string(), usize::to_string)
+        );
+        if !bad.is_empty() || counted != want {
+            return Err(format!(
+                "h2d check arm={}: {} of {} blocks differ from a fresh read of the file on the \
+                 card (first {:?}), and the loop counted {counted} bytes of the pass's {want}",
+                arm.name(),
+                bad.len(),
+                dests.len(),
+                bad.first()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// `MemAvailable` of /proc/meminfo, in kB.
+    fn mem_available_kib() -> Result<u64, GateError> {
+        let text =
+            std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                return rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("/proc/meminfo: MemAvailable {rest}: {e}").into());
+            }
+        }
+        Err("no MemAvailable line in /proc/meminfo".into())
+    }
+
+    /// `AnonHugePages` of /proc/self/smaps_rollup, in kB.
+    fn anon_huge_kb() -> Result<u64, GateError> {
+        let text = std::fs::read_to_string("/proc/self/smaps_rollup")
+            .map_err(|e| format!("/proc/self/smaps_rollup: {e}"))?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+                return rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .map_err(|e| {
+                        format!("/proc/self/smaps_rollup: AnonHugePages {rest}: {e}").into()
+                    });
+            }
+        }
+        Err("no AnonHugePages line in /proc/self/smaps_rollup".into())
+    }
+
+    /// An anonymous mapping that unmaps itself on drop, on every path.
+    struct AnonMap {
+        at: *mut c_void,
+        len: usize,
+    }
+
+    impl Drop for AnonMap {
+        fn drop(&mut self) {
+            // SAFETY: `at..at+len` is the one mmap this guard was built from,
+            // never unmapped elsewhere; the arm unregisters it before
+            // dropping the guard, on every path.
+            unsafe { libc::munmap(self.at, self.len) };
+        }
+    }
+
+    /// The registered-region design's entry price: for each N of `--reg-gib`,
+    /// an anonymous N-GiB mapping under `MADV_HUGEPAGE`, first-touched a page
+    /// at a time, registered `READ_ONLY`, one expert-sized H2D out of it,
+    /// then unregistered — each timed, with the `AnonHugePages` delta.
+    fn register_slope(ctx: &Arc<CudaContext>, card: &Card, a: &Args) -> Result<(), GateError> {
+        let gibs = a.reg_gib.clone().unwrap_or_else(|| REG_GIB.to_vec());
+        let avail = mem_available_kib()?;
+        let largest = gibs.iter().copied().max().unwrap_or(0);
+        if u64::try_from(largest)? * KIB_PER_GIB > avail / 2 {
+            return Err(format!(
+                "--reg-gib {largest}: {largest} GiB over half of MemAvailable ({avail} kB): peers \
+                 load models on this box"
+            )
+            .into());
+        }
+        let stream = ctx.new_stream()?;
+        let mut dev = DeviceBuffer::<u8>::zeroed(&stream, EXPERT_BYTES)?;
+        for &n in &gibs {
+            let len = n << 30;
+            let huge_before = anon_huge_kb()?;
+            // SAFETY: an anonymous private mapping of `len` bytes; the guard
+            // unmaps it on every path.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if at == libc::MAP_FAILED {
+                return Err(format!(
+                    "mmap {n} GiB anonymous: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            let map = AnonMap { at, len };
+            // SAFETY: `at..at+len` is the live mapping above; MADV_HUGEPAGE
+            // is advice the kernel may take or leave.
+            if unsafe { libc::madvise(at, len, libc::MADV_HUGEPAGE) } != 0 {
+                return Err(format!(
+                    "madvise MADV_HUGEPAGE of {n} GiB: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            let t = Instant::now();
+            for off in (0..len).step_by(PAGE) {
+                // SAFETY: one byte of the live writable mapping's page at
+                // `off`, written once to fault it in.
+                unsafe { at.cast::<u8>().byte_add(off).write_volatile(1) };
+            }
+            let touch_s = t.elapsed().as_secs_f64();
+            let huge_after = anon_huge_kb()?;
+            ctx.bind_to_thread()?;
+            let t = Instant::now();
+            // SAFETY: `at..at+len` is the live mapping's whole range,
+            // page-aligned (mmap returns page-aligned) and whole pages; the
+            // unregister below runs before the guard unmaps, after the
+            // stream has drained.
+            let rc =
+                unsafe { sys::cuMemHostRegister_v2(at, len, sys::CU_MEMHOSTREGISTER_READ_ONLY) };
+            let register_s = t.elapsed().as_secs_f64();
+            rc.result()
+                .map_err(|e| format!("cuMemHostRegister(READ_ONLY) of {n} GiB: {e:?}"))?;
+            let h2d = (|| -> Result<f64, GateError> {
+                let (start, end) = (timing_event(ctx)?, timing_event(ctx)?);
+                start.record(&stream)?;
+                // SAFETY: the first `EXPERT_BYTES` of the registered mapping
+                // stay registered and alive until the synchronize below.
+                unsafe {
+                    dev.copy_from_host_async_unchecked(
+                        &stream,
+                        std::slice::from_raw_parts(at.cast::<u8>(), EXPERT_BYTES),
+                    )?;
+                }
+                end.record(&stream)?;
+                stream.synchronize()?;
+                Ok(EXPERT_BYTES as f64 / (f64::from(start.elapsed_ms(&end)?) * 1e-3) / 1e9)
+            })();
+            let t = Instant::now();
+            // SAFETY: `at` is the base the register call above took, and no
+            // copy from it is in flight: the stream is synchronized.
+            let rc = unsafe { sys::cuMemHostUnregister(at) };
+            let unregister_s = t.elapsed().as_secs_f64();
+            let h2d = h2d?;
+            rc.result()
+                .map_err(|e| format!("cuMemHostUnregister of {n} GiB: {e:?}"))?;
+            drop(map);
+            println!(
+                "h2d arm=register-slope {} gib={n} touch_s={touch_s:.2} register_s={register_s:.2} \
+                 h2d_GBps={h2d:.2} unregister_s={unregister_s:.2} anon_huge_kb={}",
+                card.tag(),
+                huge_after.saturating_sub(huge_before)
+            );
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let a = args()?;
         for &arm in &a.arms {
@@ -1292,10 +1748,11 @@ mod probe {
                     let ctx = CudaContext::new(0)?;
                     let card = Card::of(&ctx)?;
                     card.print()?;
-                    if arm.is_loop() {
-                        copy_loop(&ctx, &card, arm, &a)?;
-                    } else {
-                        one_shot(&ctx, &card, arm, &a)?;
+                    match arm {
+                        Arm::OdirectLoop => odirect_loop(&ctx, &card, arm, &a)?,
+                        Arm::RegisterSlope => register_slope(&ctx, &card, &a)?,
+                        _ if arm.is_loop() => copy_loop(&ctx, &card, arm, &a)?,
+                        _ => one_shot(&ctx, &card, arm, &a)?,
                     }
                 }
             }

@@ -983,6 +983,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          it.",
     ),
     runner(
+        "BLOOMERY_H2D_ARMS",
+        Some("ref/h2d-pcie.sh"),
+        "`tools/ref/h2d-pcie.sh`: further h2d_probe arms (register-slope), a comma \
+         list, run as steps on the timing card after the fixed ones, in the same lease.",
+    ),
+    runner(
         "BLOOMERY_BOX",
         Some("box.sh"),
         "Mac side: the box's ssh host.",

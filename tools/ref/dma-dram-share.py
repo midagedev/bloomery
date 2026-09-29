@@ -10,12 +10,16 @@ rate alone and the box's core layout. Reads logs only; takes no lease and starts
     dma-dram-share.py --self-test
 
 plan      The conditions' grammar, its one parser: a comma list, each once, `alone` among them, of alone,
-          pageable, staged, staging:<n|max> and direct:<n|max> (n copies a token, a positive number). One
-          line a condition, `cond=<c> <h2d_probe arguments>`: pageable and staged copy the shard's map
-          in <chunk>s with <ring> and <fill threads>; staging is the residency machine's copy path, a
-          staged-loop over an anonymous window of <anon bytes> in <block>s, a ring of MACHINE_RING and
-          one fill thread; direct a direct-loop over the same window, MACHINE_RING in flight; n paces
-          them at n x 1000 / <token ms> blocks a second (--rate), max leaves them unpaced.
+          pageable, staged, staging:<n|max>, direct:<n|max> and odirect:<n|max> (n copies a token, a
+          positive number). One line a condition, `cond=<c> <h2d_probe arguments>`: pageable and
+          staged copy the shard's map in <chunk>s with <ring> and <fill threads>; staging is the
+          residency machine's copy path, a staged-loop over an anonymous window of <anon bytes> in
+          <block>s, a ring of MACHINE_RING and one fill thread; direct a direct-loop over the same
+          window, MACHINE_RING in flight; odirect an odirect-loop — each <block> read with O_DIRECT
+          from the model file (h2d_probe's --od-file default) into a pinned ring slot, blocks at a
+          fixed stride over the file, MACHINE_RING deep, <anon bytes> a round — so it reads the model
+          file, unlike the anonymous conditions; n paces them at n x 1000 / <token ms> blocks a
+          second (--rate), max leaves them unpaced.
 
 row       One bench run's rows. The bench log is the runner's: every line `<epoch ms>\t<line>`. Per `time`
           line (one arm-round) the span runs from the line before it (the previous `time` line, or the
@@ -31,9 +35,9 @@ summary   The medians over rows with admissible=yes and no tag, and per round k 
           alone,pageable,staged) but alone:
             P2 summary arm=<a> U_alone=<> | pageable U=<> C=<> k=<> n=<> | staged U=<> C=<> k=<> n=<> |
             copy alone pageable=<> staged=<>
-          and per staging or direct condition c, the mean of its per-round k, with the 95 % t interval
-          of that mean (tools/ref/tdist.py; `-` under two rounds) and its copies a second at <block>
-          bytes (default 16773120, one V4.1 expert):
+          and per staging, direct or odirect condition c, the mean of its per-round k, with the 95 % t
+          interval of that mean (tools/ref/tdist.py; `-` under two rounds) and its copies a second at
+          <block> bytes (default 16773120, one V4.1 expert):
             P2 c arm=<a> cond=<c> C=<median> copies_per_s=<> c=<mean> lo=<> hi=<> n=<>
           Beside a DRAM-bound leg k is c, the host-slot equivalents one copy costs (dma-dram-share.sh).
 alone     The mean GB/s of a copy log's intervals after its first (the first holds the loop's start).
@@ -87,9 +91,9 @@ def plan(conds, token_ms, chunk, ring, fill, block, anon):
             out.append(f"cond={c} --arm {c}-loop --chunk {chunk} --ring {ring} --fill-threads {fill}")
         else:
             path, _, n = c.partition(":")
-            if path not in ("staging", "direct"):
+            if path not in ("staging", "direct", "odirect"):
                 refuse(f"unknown condition {c!r}; the conditions are alone, pageable, staged, "
-                       "staging:<n|max>, direct:<n|max>")
+                       "staging:<n|max>, direct:<n|max>, odirect:<n|max>")
             if n == "max":
                 rate = ""
             else:
@@ -100,9 +104,11 @@ def plan(conds, token_ms, chunk, ring, fill, block, anon):
                 if not (math.isfinite(per_token) and per_token > 0):
                     refuse(f"{c}: n is a positive number of copies a token, or max")
                 rate = f" --rate {per_token * 1000 / tms:.6g}"
-            arm = "--arm staged-loop" if path == "staging" else "--arm direct-loop"
+            arm = {"staging": "--arm staged-loop", "direct": "--arm direct-loop",
+                   "odirect": "--arm odirect-loop"}[path]
+            source = "" if path == "odirect" else " --source anon"
             fills = " --fill-threads 1" if path == "staging" else ""
-            out.append(f"cond={c} {arm} --source anon --bytes {anon} --chunk {block} "
+            out.append(f"cond={c} {arm}{source} --bytes {anon} --chunk {block} "
                        f"--ring {MACHINE_RING}{fills}{rate}")
     return out
 
@@ -200,7 +206,7 @@ def summary(rows_path, alone_path, conds=DEFAULT_CONDS, block=EXPERT_BYTES):
                 if r["round"] in base:
                     k.append((base[r["round"]] - u[-1]) / c[-1])
             cells.append(f"{cond} U={med(u)} C={med(c)} k={med(k)} n={len(u)}")
-            if cond.startswith(("staging:", "direct:")):
+            if cond.startswith(("staging:", "direct:", "odirect:")):
                 cs.append(c_line(arm, cond, c, k, block))
         cells.append("copy alone " + " ".join(f"{n}={alone.get(n, '-')}" for n in names))
         out.append(" | ".join(cells))
@@ -306,8 +312,16 @@ def self_test():
                        f"cond=direct:3 --arm direct-loop {anon} --rate 80",
                        f"cond=staging:max --arm staged-loop {anon} --fill-threads 1",
                        f"cond=direct:max --arm direct-loop {anon}"], got
+        # odirect: the same window, pacing and ring, the model file itself the source (no --source
+        # anon, no fill threads)
+        got = plan("alone,odirect:3,odirect:max", "37.5", 67108864, 4, 4, EXPERT_BYTES, 1006387200)
+        assert got == ["cond=alone",
+                       "cond=odirect:3 --arm odirect-loop --bytes 1006387200 --chunk 16773120 "
+                       "--ring 4 --rate 80",
+                       "cond=odirect:max --arm odirect-loop --bytes 1006387200 --chunk 16773120 "
+                       "--ring 4"], got
         for bad in ("staging:6", "alone,alone", "alone,copy:3", "alone,staging:0", "alone,direct:x",
-                    "alone,staging:"):
+                    "alone,staging:", "alone,odirect:0", "alone,odirect:x", "alone,odirect:"):
             try:
                 plan(bad, "37.5", 67108864, 4, 4, EXPERT_BYTES, 1006387200)
             except SystemExit:
@@ -335,6 +349,21 @@ def self_test():
             "C=2.00 k=0.75 n=3 | copy alone staging:6=2.70 direct:6=2.68",
             "P2 c arm=engine:5 cond=staging:6 C=2.25 copies_per_s=134.1 c=2.500 lo=-3.853 hi=8.853 n=2",
             "P2 c arm=engine:5 cond=direct:6 C=2.00 copies_per_s=119.2 c=0.750 lo=-2.426 hi=3.926 n=2",
+        ], s
+        # odirect's c line, the same reading: round 1 (120 - 118.4) / 2 = 0.8, round 2
+        # (118 - 117) / 2 = 0.5; mean 0.65, h = 12.706 * 0.2121 / sqrt(2) = 1.906
+        rows_od = [
+            "P2 round=1 cond=alone arm=engine:5 union_gbps=120.00 copy_gbps=- admissible=yes",
+            "P2 round=1 cond=odirect:6 arm=engine:5 union_gbps=118.40 copy_gbps=2.00 admissible=yes",
+            "P2 round=2 cond=alone arm=engine:5 union_gbps=118.00 copy_gbps=- admissible=yes",
+            "P2 round=2 cond=odirect:6 arm=engine:5 union_gbps=117.00 copy_gbps=2.00 admissible=yes",
+        ]
+        s = summary(write("ro", "\n".join(rows_od) + "\n"), write("ao", "odirect:6 2.71\n"),
+                    "alone,odirect:6", "16773120")
+        assert s == [
+            "P2 summary arm=engine:5 U_alone=119.00 | odirect:6 U=117.70 C=2.00 k=0.65 n=2 | "
+            "copy alone odirect:6=2.71",
+            "P2 c arm=engine:5 cond=odirect:6 C=2.00 copies_per_s=119.2 c=0.650 lo=-1.256 hi=2.556 n=2",
         ], s
         # the probe's two shapes around a stop-file written after the bench's time line (11000): the copy's
         # full intervals end at 10600 and it stops at 11300. The old probe printed nothing for the last 700 ms,

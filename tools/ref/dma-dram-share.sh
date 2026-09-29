@@ -13,9 +13,15 @@
 #                (n x 1000 / token-ms copies a second); `staging:max` unpaced
 #   direct:<n>   the same source registered (cuMemHostRegister), each block one DMA read with no host
 #                copy, 4 in flight; `direct:max` unpaced
+#   odirect:<n>  the O_DIRECT candidate: each block pread from the model file (h2d_probe's --od-file
+#                default) into a pinned ring slot and one DMA to the card — the NVMe controller's DMA
+#                writes host DRAM, the card's DMA reads it, no CPU copy — blocks at a fixed stride
+#                over the file, n copies a token paced as the others; `odirect:max` unpaced
 #
 # The staging and direct conditions read an anonymous window of --anon-bytes (60 blocks), first-touched
-# by the probe before its loop starts: they touch no model file. Against a DRAM-bound leg (V4.1's
+# by the probe before its loop starts: they touch no model file. The odirect condition reads the model
+# file itself with O_DIRECT — no page cache, the only condition that touches a model file. Against a
+# DRAM-bound leg (V4.1's
 # engine:5, ~200 host slots a token like the chat decode) their k is the design's c: host-slot
 # equivalents one copy costs, since a slot and a copy are both one expert's bytes and the leg's time is
 # its bytes over its rate, c = Δt × H / (copies a token × t_off) / B = (U_alone - U_with) / C_with.
@@ -39,10 +45,10 @@
 #
 # Rows:   P2 round=<r> cond=<c> arm=<a> union_gbps=<U> copy_gbps=<C|-> admissible=<yes|no>[ tags]
 # Close:  P2 summary arm=<a> U_alone=<median> | <cond> U=<> C=<> k=<> n=<> | … | copy alone <cond>=<> …
-#         P2 c arm=<a> cond=<staging:n|direct:n> C=<> copies_per_s=<> c=<mean> lo=<> hi=<> n=<>
+#         P2 c arm=<a> cond=<staging:n|direct:n|odirect:n> C=<> copies_per_s=<> c=<mean> lo=<> hi=<> n=<>
 # Medians over the rounds without tags and with admissible=yes; k per round against that round's alone;
-# c the mean of those per-round k with its 95 % t interval (tools/ref/tdist.py), for the staging and
-# direct conditions.
+# c the mean of those per-round k with its 95 % t interval (tools/ref/tdist.py), for the staging,
+# direct and odirect conditions.
 #
 # Arguments (all optional): --rounds N (4), --seconds S (24, the bench's timed seconds per arm), --warmup W
 # (3), --arms A,B (engine:6; bench_v41_host's arm grammar, passed through), --threads T, --copy-cpus LIST,
