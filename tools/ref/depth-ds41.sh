@@ -818,6 +818,12 @@ timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
 # The placement's card must be the timing card, the only one the arms see: plan (a) loads on the card
 # named A6000, the gate plan on the one named 3090 (workstation::plan_a, plan_gate).
 if [ "$gen" = 1 ]; then
+  # The placement checks below compare the timing card with the 3090's UUID; a card cards.sh
+  # could not name makes that undecidable unless the timing card is the resolved A6000.
+  if [ "$PLACE" != bp ] && [ -z "$GPU_3090" ] && [ "$TIMING_GPU" != "$GPU_A6000" ]; then
+    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=$PLACE loads on a named card, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 cannot be told" >&2
+    exit 64
+  fi
   if [ "$PLACE" = a ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
     echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=a is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): generate_ds41 would refuse every arm; set BLOOMERY_GEN_PLACE=gate" >&2
     exit 64
@@ -827,7 +833,11 @@ if [ "$gen" = 1 ]; then
     exit 64
   fi
   if [ "$PLACE" = gate ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
-    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is $TIMING_GPU, not the 3090 ($GPU_3090): name the 3090 in BLOOMERY_TIMING_GPU, or leave BLOOMERY_GEN_PLACE at a" >&2
+    if [ -n "$GPU_3090" ]; then
+      echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is $TIMING_GPU, not the 3090 ($GPU_3090): name the 3090 in BLOOMERY_TIMING_GPU, or leave BLOOMERY_GEN_PLACE at a" >&2
+    else
+      echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is the A6000 while tools/ref/cards.sh cannot name the 3090 (${CARDS_ERROR:-no reason given}): leave BLOOMERY_GEN_PLACE at a, or wait for the 3090" >&2
+    fi
     exit 64
   fi
 fi

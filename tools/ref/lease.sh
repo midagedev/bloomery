@@ -418,6 +418,13 @@ __witness_stage0_gpus() {
   if [ "$__witness_rc" = 0 ]; then __witness_lines; else echo "${__witness_indent}stage0-gpus: unavailable (rc $__witness_rc)"; fi
 }
 __witness_stage0_apps() {
+  # The 3090's UUID comes from tools/ref/cards.sh through whoever sourced this file; a card it
+  # could not name is named here, not queried with an empty -i (an empty list would read as
+  # "no process").
+  if [ -z "${GPU_3090:-}" ]; then
+    echo "${__witness_indent}compute-apps-3090: unresolved (no 3090 UUID${CARDS_ERROR:+: $CARDS_ERROR})"
+    return 0
+  fi
   __witness_smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_3090"
   if [ "$__witness_rc" = 0 ]; then
     echo "${__witness_indent}compute-apps-3090:"

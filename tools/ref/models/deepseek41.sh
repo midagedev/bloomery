@@ -215,6 +215,13 @@ source "$__v41_dir/../cards.sh"
 unset __v41_dir
 TWO_CARD_PLACEMENT=
 if [ "$MODEL" = "$V41_PUBLIC" ]; then
+  # The 3090-vs-A6000 sizing below turns on GPU_3090; a timing card that is not the resolved
+  # A6000 with no 3090 UUID is undecidable — refuse rather than size the references for the
+  # wrong card (ref-paths.sh's refusal code).
+  if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ -z "${GPU_3090:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "${GPU_A6000:-}" ]; then
+    echo "models/deepseek41.sh: BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 sizes the references' --n-cpu-moe (37 vs 33)" >&2
+    exit 64
+  fi
   if [ "${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ]; then
     # ik has no two-card arm; its one-card count keeps IK_GPU_FLAGS defined for the runner's lines.
     : "${IK_NCMOE:=33}"

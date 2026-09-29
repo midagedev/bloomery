@@ -167,6 +167,13 @@ __glm_dir=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/cards.sh
 source "$__glm_dir/../cards.sh"
 unset __glm_dir
+# The 3090-vs-A6000 sizing below turns on GPU_3090; a timing card that is not the resolved
+# A6000 with no 3090 UUID is undecidable — refuse rather than size the references for the
+# wrong card (ref-paths.sh's refusal code).
+if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ -z "${GPU_3090:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "${GPU_A6000:-}" ]; then
+  echo "models/glm5next.sh: BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 sizes GLM_NCMOE (42 vs 36)" >&2
+  exit 64
+fi
 if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
   : "${GLM_NCMOE:=42}"
 else

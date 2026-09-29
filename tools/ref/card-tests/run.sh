@@ -3,8 +3,9 @@
 # (tools/ref/lease.sh) and its holder naming, tools/ref/lease-hold.sh, the lease's probe (lease_free),
 # the holds and box.sh's guard (lease_guard), tools/box.sh's remote command and its read-only
 # refusals (stub ssh), tools/ref/card-precheck.sh, tools/gpu-ab.py's card check, the witness fields
-# with a failing nvidia-smi, the t table's four readers (tdump.sh), tools/gate-batch.sh's script
-# walker (--classes on a stub tree) and the cpu guard (cpu-guard.sh).
+# with a failing nvidia-smi, tools/ref/cards.sh's name→UUID resolution (a fake nvidia-smi on
+# PATH: the repository is public and carries no UUID), the t table's four readers (tdump.sh),
+# tools/gate-batch.sh's script walker (--classes on a stub tree) and the cpu guard (cpu-guard.sh).
 #
 #   tools/ref/card-tests/run.sh
 #
@@ -550,6 +551,50 @@ for fields in 'head indent gpus' 'head indent stage0-gpus' 'head indent stage0-a
     _ "$T/tools/ref/lease.sh" "$fields"
   has "witness ($fields) names the failure" '(gpus|stage0-gpus|compute-apps-3090|gpu-apps): unavailable \(rc 3\)$|gpu=unavailable \(rc 3\)$'
 done
+
+# tools/ref/cards.sh: the two cards' UUIDs resolved from their names with one nvidia-smi query —
+# the repository is public and carries no UUID. A name that matches no card, or two, leaves its
+# variable empty with the reason in CARDS_ERROR, and sourcing never exits: a runner that needs
+# only the other card still runs. A fake nvidia-smi on PATH answers each case (the made-up UUIDs
+# depth-stub-cards.sh uses, never the box's).
+FAKE_3090=GPU-11111111-1111-1111-1111-111111111111
+FAKE_A6000=GPU-00000000-0000-0000-0000-000000000000
+C=$tmp/cards
+mknvidia() { # <dir>: a stub nvidia-smi that prints the "name, uuid" lines stdin gives
+  mkdir -p "$1"
+  { echo '#!/bin/sh'; echo "cat << 'EOF'"; cat; echo 'EOF'; } > "$1/nvidia-smi"
+  chmod +x "$1/nvidia-smi"
+}
+mknvidia "$C/both" << EOF
+NVIDIA GeForce RTX 3090, $FAKE_3090
+NVIDIA RTX A6000, $FAKE_A6000
+EOF
+mknvidia "$C/no3090" << EOF
+NVIDIA RTX A6000, $FAKE_A6000
+EOF
+mknvidia "$C/twice" << EOF
+NVIDIA GeForce RTX 3090, $FAKE_3090
+NVIDIA GeForce RTX 3090, $FAKE_3090
+NVIDIA RTX A6000, $FAKE_A6000
+EOF
+mkdir -p "$C/failed"
+{ echo '#!/bin/sh'; echo 'echo "nvidia-smi: driver not loaded (stub)" >&2'; echo 'exit 9'; } > "$C/failed/nvidia-smi"
+chmod +x "$C/failed/nvidia-smi"
+cards_src='source "$1" && printf "3090=[%s] a6000=[%s] err=[%s]\n" "$GPU_3090" "$GPU_A6000" "$CARDS_ERROR"'
+cards() { # <name> <rc> <pattern> <dir>: the tree's cards.sh sourced with <dir>'s stub nvidia-smi on PATH
+  run "$1" "$2" "$3" env PATH="$4:$PATH" bash -c "$cards_src" _ "$ROOT/tools/ref/cards.sh"
+}
+cards 'cards: both names resolve' 0 "^3090=\[$FAKE_3090\] a6000=\[$FAKE_A6000\] err=\[\]$" "$C/both"
+cards 'cards: the 3090 missing leaves its variable empty, named' 0 \
+  "^3090=\[\] a6000=\[$FAKE_A6000\] err=\[.*'NVIDIA GeForce RTX 3090' matched 0 cards\]$" "$C/no3090"
+cards 'cards: a name twice leaves that card empty, named' 0 \
+  "^3090=\[\] a6000=\[$FAKE_A6000\] err=\[.*'NVIDIA GeForce RTX 3090' matched 2 cards\]$" "$C/twice"
+cards 'cards: a failing nvidia-smi leaves both empty, named' 0 \
+  '^3090=\[\] a6000=\[\] err=\[nvidia-smi --query-gpu=name,uuid failed \(rc 9\): nvidia-smi: driver not loaded \(stub\)\]$' "$C/failed"
+# No nvidia-smi anywhere on PATH (bash by absolute path: the stub PATH has no tools in it).
+run 'cards: no nvidia-smi on PATH leaves both empty, named' 0 \
+  '^3090=\[\] a6000=\[\] err=\[nvidia-smi is not on PATH\]$' \
+  env PATH="$C/none" /bin/bash -c "$cards_src" _ "$ROOT/tools/ref/cards.sh"
 
 # The t table: the four readers print the same t for df 1..40 (tdump.sh), and it is tdist.py's.
 if "$HERE/tdump.sh" "$ROOT" > "$tmp/tdump" 2>&1; then

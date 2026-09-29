@@ -35,11 +35,13 @@ self_test() {
   # shellcheck disable=SC2064 # the path is fixed now
   trap "rm -rf '$t'" EXIT
   mkdir -p "$t/bin" "$t/tree/target/release"
-  # The stub cards carry the tree's UUIDs (tools/ref/cards.sh), the ones timing-card.sh's default names.
-  local GPU_3090 GPU_A6000
-  # shellcheck source=tools/ref/cards.sh
-  . "$(dirname "$self")/ref/cards.sh"
-  printf '%s\n' '#!/bin/sh' "case \"\$*\" in *query-gpu=*) printf '%s, NVIDIA GeForce RTX 3090\\n%s, NVIDIA RTX A6000\\n' $GPU_3090 $GPU_A6000 ;; esac" > "$t/bin/nvidia-smi"
+  # The stub nvidia-smi is written before the tree's cards.sh is sourced (below, once PATH holds
+  # it), so the resolution reads made-up UUIDs (depth-stub-cards.sh's, never the box's) and the
+  # self-test needs no card: name,uuid is cards.sh's query, uuid,name uuid_of's further down.
+  printf '%s\n' '#!/bin/sh' 'case "$*" in' \
+    '  *query-gpu=name,uuid*) printf "NVIDIA GeForce RTX 3090, GPU-11111111-1111-1111-1111-111111111111\nNVIDIA RTX A6000, GPU-00000000-0000-0000-0000-000000000000\n" ;;' \
+    '  *query-gpu=*) printf "GPU-11111111-1111-1111-1111-111111111111, NVIDIA GeForce RTX 3090\nGPU-00000000-0000-0000-0000-000000000000, NVIDIA RTX A6000\n" ;;' \
+    'esac' > "$t/bin/nvidia-smi"
   printf '%s\n' '#!/bin/sh' 'sleep "${STUB_SLEEP:-0}"' 'echo "ran on $CUDA_VISIBLE_DEVICES"' > "$t/tree/target/release/ok"
   chmod +x "$t/bin/nvidia-smi" "$t/tree/target/release/ok"
   # Where util-linux flock or coreutils timeout is missing (the Mac), stand-ins for the forms this runner
@@ -80,6 +82,15 @@ PY
     chmod +x "$t/bin/timeout"
   fi
   PATH=$t/bin:$PATH
+  # The tree's cards resolve through the stub above: timing-card.sh's two names are what it
+  # answers, and the UUIDs the cases below compare against are the stub's.
+  local GPU_3090 GPU_A6000
+  # shellcheck source=tools/ref/cards.sh
+  . "$(dirname "$self")/ref/cards.sh"
+  { [ -n "$GPU_3090" ] && [ -n "$GPU_A6000" ]; } || {
+    echo "FAIL: the self-test's stub cards did not resolve (CARDS_ERROR: ${CARDS_ERROR:-none})"
+    return 1
+  }
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc
   gate() {
     local o=$1 c=$2 l=$3

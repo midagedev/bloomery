@@ -236,6 +236,10 @@ T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
 if [ "$ours" = 1 ]; then
   want=$GPU_A6000
   [ "$PLACE" = a ] || want=$GPU_3090
+  if [ -z "$want" ]; then
+    echo "depth-glm5next.sh: --place $PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and tools/ref/cards.sh resolved no $([ "$PLACE" = a ] && echo A6000 || echo 3090) UUID (${CARDS_ERROR:-no reason given})" >&2
+    exit 64
+  fi
   [ "$TIMING_GPU" = "$want" ] || {
     echo "depth-glm5next.sh: --place $PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), but the timing card is $TIMING_GPU (BLOOMERY_TIMING_GPU)" >&2
     exit 64

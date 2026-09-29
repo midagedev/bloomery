@@ -63,6 +63,12 @@ case ${BLOOMERY_TIMING_CARDS:-} in
   a6000+3090)
     if [ "${TIMING_CARDS_RUNNER:-}" != 1 ]; then
       TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=a6000+3090, and ${0##*/} has no two-card mode (a runner opts in with TIMING_CARDS_RUNNER=1): it would time the A6000 alone"
+    elif [ -z "$GPU_A6000" ] || [ -z "$GPU_3090" ]; then
+      __cards_missing=''
+      [ -n "$GPU_A6000" ] || __cards_missing='the A6000'
+      [ -n "$GPU_3090" ] || __cards_missing="${__cards_missing:+$__cards_missing and }the 3090"
+      TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=a6000+3090 times both cards, and tools/ref/cards.sh resolved no UUID for $__cards_missing (${CARDS_ERROR:-no reason given})"
+      unset __cards_missing
     elif [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "$GPU_A6000" ]; then
       TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=a6000+3090 makes the A6000 device 0 and the timing card; BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU names another"
     else
@@ -71,6 +77,21 @@ case ${BLOOMERY_TIMING_CARDS:-} in
     ;;
   *) TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS is a6000+3090 (the two-card mode) or unset (one card), got '$BLOOMERY_TIMING_CARDS'" ;;
 esac
+# One card, and a card tools/ref/cards.sh could not name (its variable empty, the reason in
+# CARDS_ERROR): the timing card is the A6000 by default, and which of the two it is decides the
+# other card, the lease's record and the model profiles' reference sizing — undecidable when the
+# timing card is neither card cards.sh named and a UUID is missing. A run on the card that did
+# resolve still runs (the other card's witness lines name the miss; a card off the bus must not
+# take the healthy one down with it). The refusal rides TIMING_CARDS_WHY, the branch below
+# prints it and lease_take ends the run on it (64): this file is sourced under set -e and may
+# not exit itself.
+if [ -z "$TIMING_CARDS_WHY" ]; then
+  if [ -z "$TIMING_GPU" ]; then
+    TIMING_CARDS_WHY="the default timing card, the A6000, has no UUID (tools/ref/cards.sh: ${CARDS_ERROR:-no reason given})"
+  elif [ "$TIMING_GPU" != "$GPU_A6000" ] && [ "$TIMING_GPU" != "$GPU_3090" ] && { [ -z "$GPU_3090" ] || [ -z "$GPU_A6000" ]; }; then
+    TIMING_CARDS_WHY="the timing card ($TIMING_GPU) is neither card tools/ref/cards.sh named, and a card is missing ($CARDS_ERROR): whether it is the 3090 cannot be told"
+  fi
+fi
 if [ -n "$TIMING_CARDS" ]; then
   # shellcheck disable=SC2034 # TIMING_GPU2 is read by lease.sh's lease_take (the lease's record)
   TIMING_GPU=$GPU_A6000 TIMING_GPU2=$GPU_3090 OTHER_GPU=
@@ -109,8 +130,16 @@ witness_card() {
   echo "    timing-card clocks: $(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,clocks_event_reasons.active,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,temperature.gpu,power.draw --format=csv,noheader,nounits -i "$TIMING_GPU" | awk -F', ' '{ printf "sm=%s max=%s MHz event_reasons=%s capped_us sw_power=%s sw_thermal=%s hw_thermal=%s temp=%s C power=%s W", $1, $2, $3, $4, $5, $6, $7, $8 }')"
   echo "    cpu-freq: $(cpu_freq_summary)"
   [ -z "${BIN_SHA:-}" ] || echo "    binary: ${BIN_PATH:-?} sha256=$BIN_SHA mtime=${BIN_MTIME:-?}"
-  echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
-  echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
+  if [ -n "$GPU_3090" ]; then
+    echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
+  else
+    echo "    3090-apps: unresolved (no 3090 UUID${CARDS_ERROR:+: $CARDS_ERROR})"
+  fi
+  if [ -n "$GPU_A6000" ]; then
+    echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
+  else
+    echo "    a6000-apps: unresolved (no A6000 UUID${CARDS_ERROR:+: $CARDS_ERROR})"
+  fi
   echo "    gpu: $(nvidia-smi --query-gpu=index,utilization.gpu,power.draw,clocks.sm --format=csv,noheader | tr '\n' ';')"
   echo "    load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) llm.service=$(systemctl is-active llm.service || true)"
 }
@@ -133,6 +162,12 @@ guard_other() {
   local apps
   if [ -n "$TIMING_CARDS" ]; then
     guard_cards
+    return 0
+  fi
+  if [ -z "$OTHER_GPU" ]; then
+    # A card cards.sh could not name has no compute process to read; the witness lines name the
+    # miss, and the run goes on — the other card must not take the timed one down with it.
+    echo "[other-card] $(now) the other card has no UUID (tools/ref/cards.sh${CARDS_ERROR:+: $CARDS_ERROR}): no compute apps read on it" >&2
     return 0
   fi
   apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
@@ -317,8 +352,16 @@ witness_cards() {
   fi
   echo "    cpu-freq: $(cpu_freq_summary)"
   [ -z "${BIN_SHA:-}" ] || echo "    binary: ${BIN_PATH:-?} sha256=$BIN_SHA mtime=${BIN_MTIME:-?}"
-  echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
-  echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
+  if [ -n "$GPU_3090" ]; then
+    echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
+  else
+    echo "    3090-apps: unresolved (no 3090 UUID${CARDS_ERROR:+: $CARDS_ERROR})"
+  fi
+  if [ -n "$GPU_A6000" ]; then
+    echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
+  else
+    echo "    a6000-apps: unresolved (no A6000 UUID${CARDS_ERROR:+: $CARDS_ERROR})"
+  fi
   echo "    gpu: $(nvidia-smi --query-gpu=index,utilization.gpu,power.draw,clocks.sm --format=csv,noheader | tr '\n' ';')"
   echo "    load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) llm.service=$(systemctl is-active llm.service || true)"
 }

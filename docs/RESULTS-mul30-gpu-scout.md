@@ -30,7 +30,7 @@ export PATH=$HOME/.cargo/bin:$HOME/opt/LLVM-21.1.8-Linux-X64/bin:/usr/local/cuda
 export LIBCLANG_PATH=$HOME/opt/LLVM-21.1.8-Linux-X64/lib
 export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.0
 export CUDA_OXIDE_LLC=$HOME/opt/LLVM-21.1.8-Linux-X64/bin/llc
-export CUDA_VISIBLE_DEVICES=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+export CUDA_VISIBLE_DEVICES=$GPU_3090   # tools/ref/cards.sh
 ```
 
 마지막 줄이 3090을 UUID로 고정한다 — A6000(index 1)은 이 환경에서 보이지 않는다. 배경 메모의 "CUDA 13.3 툴킷 추가가 필요할 것"은 여전히 유효하되 **아직 실행되지 않았다**(13.0만 설치됨).
@@ -108,7 +108,7 @@ cuda-core   = "0.3.1"
 1. **설치: 없음.** 드라이버 615.71.09(≥R580)·툴킷 13.0·cargo-oxide 0.2.1·llc 21.1.8·nightly-2026-08-28 전부 확인됨. 설치가 필요한 유일한 시나리오는 cutile 병행 시 툴킷 13.2+/13.3(디스크 991G 가용, `bloomery-env.sh`의 툴킷 경로 갱신 필요 — 지금은 13.0 하드코딩).
 2. **빌드**: `just build-gpu` (box.sh `cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv`) — rsync 트리 /root/repo/bloomery에서. 빌드 게이트는 이미 `just gate`에 포함(fmt-check lint build-gpu build-cpu gate-1-1).
 3. **참조 세팅**: `tools/ref/build.sh`(ik c10fbbcc의 libggml 링크, 산출물은 $BLOOMERY_DATA/bin — 이미 14개 바이너리 있음). ik 빌드가 바뀌면 오라클 재생성(oracle 규약).
-4. **측정 하네스**: `tools/ref/measure.sh` 그대로 — 3090 UUID `GPU-307fa0f6…` 고정, `wait_gpu` 유휴 대기, 전후 증인 블록, ggml 먼저 Rust 나중 같은 호출. 오차 게이트 ≤ 1e-2(q8_1 설계, MUL-9 전례), 대역폭 게이트 stack M=1 ≥ 0.9배 ggml.
+4. **측정 하네스**: `tools/ref/measure.sh` 그대로 — 3090 UUID `$GPU_3090` 고정, `wait_gpu` 유휴 대기, 전후 증인 블록, ggml 먼저 Rust 나중 같은 호출. 오차 게이트 ≤ 1e-2(q8_1 설계, MUL-9 전례), 대역폭 게이트 stack M=1 ≥ 0.9배 ggml.
 5. **본라운드(1-5 GPU) 범위**: q3k-gemv(이제 q4k·q6k 포함)를 엔진 배선에 붙이는 것 — plan.md 게이트 "같은 logits, 3090에서 ik 대비 tok/s". CPU 1-5 종료 시점 스테이지 표가 스텝의 머리를 더 이상 양자화 사이트가 아니라 배칭 사이트 대역폭으로 지목했으므로(2026-09-20 MUL-34), GPU 라운드의 첫 질문은 "q3k-gemv 런치를 디코드 루프에 넣어 ik 대비 tok/s가 몇인가"다.
 6. **cutile 스파이크(선택, MUL-6 뒤)**: 툴킷 13.3 설치 → 별도 워크트리 + `CUDA_TOOLKIT_PATH`만 바꾼 env → cutile 0.3.1로 Q4_K 타일 커널 시도 → 같은 measure.sh 하네스로 q4k_gemv(1.06배)와 대조. 벤더링 또는 네트워크 필요(레지스트리 캐시 없음). 판정 기준: 같은 게이트 통과 여부 + 코드량/복잡도.
 7. **위생**: 핀 rev는 그대로(=HEAD, 드리프트 0). cutile 도입 시에도 cuda-core는 공유되므로 Cargo.toml 핀 구조는 유지. A6000은 어떤 명령으로도 건드리지 않는다(UUID 고정이 기계적으로 방어).
