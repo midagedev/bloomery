@@ -673,6 +673,8 @@ V4.1 `--place gate` 게이트는 카드 이름 "3090"이 박혀 `BLOOMERY_GATE_C
 - **익명 등록 영역 b-전체: 보류.** 직접 DMA c는 0.62로 가장 싸다. 그러나 모델 파일이 페이지 캐시에 있으면 204 GiB 사본이 RAM에 들어가지 않고, 참조 엔진의 따뜻한 로드와 부딪힌다. 등록 비용 팔은 `READ_ONLY` 익명 등록에서 801로 실패해 값이 없다.
 - **GDS: 보류, 사용자 판단.** A6000은 지원하고 3090은 지원하지 않는다(GDR). NVMe P2PDMA 경로는 모듈 옵션 둘과 설정 하나, 재부팅이 필요하다(원장 B3의 정정 줄). (d)가 착륙한 뒤 남은 초과를 보고 판단한다.
 
+- **Host streaming in a prompt call (callstream, `BLOOMERY_HOSTSTREAM`): landed off by default; the default is the user's call.** Two rounds each, same binary (rig-log 09-30#callstream-pp-a, #callstream-pp-bp): pp4096 +3.8 % on plan (a) and −1.5 % on (b′), under both cards' bands (+10…+22, +8…+19); pp512 flat. The decode after the call is +20 % / +16 % on (a) and +18 % / +12 % on (b′) after 512 / 4096 prose tokens, because the call's picks stay for the decode. The pp miss is not staging (backlog 0): time one streamed layer-batch under nsys before any change to the pp claim.
+
 ### 재판정 잔여 (revisit)
 
 R2 Q3_K 밀집 m ≤ 8 대역(m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드 — DSpark 패스 +4.7 ms 위험; uniongroup 앞); R5 0·1층 Q5_K `_sel`을 카드로(순 −0.15…−0.4 ms); R6 목록 주장 확인·R7 DSpark 재유도(합집합 0.753로)·R8 rows % 4(plainfile이 덮었는지); N1·N2·N3·N4·N5는 시팅 큐와 사용자 결정.
