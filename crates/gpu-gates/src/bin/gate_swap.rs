@@ -129,6 +129,32 @@
 //!   timed on its own thread: whether a free blocks behind a copy nothing
 //!   stages, which the stop-before-any-free order rests on. A measurement,
 //!   not a verdict — the line names the outcome either way.
+//!
+//! Calls (the prompt call mode, `SwapMachine::begin_call` .. `end_call`):
+//! an arm runs 40 passes of the trace, then a call of 8 steps, each step a
+//! pick of every layer from its ids' counts (floor 1) and a probe after the
+//! engine stream waits for each layer's landed event, each layer's reader
+//! after the readback; every expert is host-resident from the load (the
+//! churn pool is in the host set).
+//! - s1 scripted: a kept call's step values equal a static replay of the
+//!   card sets its picks left, no pick is left landing at its end, and the
+//!   passes after it run clean; a call not kept returns every layer to its
+//!   start set, and the passes after it run clean (its mutant: the host map
+//!   admits each expert into another pair's slot).
+//! - s2 landing wait: with the copy stream held over the first step's picks
+//!   (two wanted a layer), the engine stream is still waiting when the arm
+//!   looks after the probe's launch, and no step reads a stale sum (its
+//!   mutant: the landed event recorded before the pick's copies).
+//! - s3 host map at the pick: no step of the kept call serves an id twice or
+//!   not at all (its mutant: the host map moves at the layer's reader, one
+//!   layer late).
+//! - s4 victim refusal: a pick whose victim the source cannot serve from
+//!   resident pages is refused by name, the machine unbroken and the host
+//!   map unmoved (its mutant: the victims not checked).
+//! - s5 floor: a call whose floor is raised between two picks admits no
+//!   expert whose count is under the new floor, and a floor set with no call
+//!   open is refused by name (its mutant: the pick reads the floor the call
+//!   began with, not the one set since).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -151,8 +177,8 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
-        Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
-        Transform, set_leak_sink,
+        CallCfg, CallPick, CallReport, Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState,
+        SwapMachine, SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
@@ -352,6 +378,9 @@ mod gate {
         panic_source: Option<(usize, u32)>,
         fail_dest: Option<usize>,
         inflate: usize,
+        /// Every expert host-resident from the load (a churn pool the load's
+        /// host set holds), bar the stuck ones.
+        all_resident: bool,
     }
 
     /// The synthetic source: every expert's bytes on the host; the stacks'
@@ -382,7 +411,11 @@ mod gate {
                 }
             }
             let resident = (0..L * E)
-                .map(|x| AtomicBool::new(x % E >= caps[x / E]))
+                .map(|x| {
+                    let (l, e) = (LAYERS.start + x / E, (x % E) as u32);
+                    let all = faults.all_resident && !faults.stuck.contains(&(l, e));
+                    AtomicBool::new(all || x % E >= caps[x / E])
+                })
                 .collect();
             Synth {
                 bytes,
@@ -2484,6 +2517,398 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------------------- calls
+
+    /// The trace passes a call arm runs before its call, and the call's
+    /// steps: each a pick of every layer from the step's ids, then a probe.
+    const CALL_BEFORE: usize = 40;
+    const CALL_STEPS: Range<usize> = 40..48;
+    /// Passes a call arm runs after its call.
+    const CALL_AFTER: Range<usize> = 48..68;
+
+    /// What a call arm saw: per step its value and its card sets after the
+    /// step's picks, the picks, whether the held engine stream was still
+    /// waiting when the arm looked, the call's report and its error.
+    #[derive(Default)]
+    struct CallSeen {
+        values: Vec<Value>,
+        sets: Vec<Vec<Vec<u32>>>,
+        picks: Vec<CallPick>,
+        start: Vec<Vec<u32>>,
+        held_waited: Option<bool>,
+        report: Option<CallReport>,
+        err: Option<String>,
+    }
+
+    /// One call on `run`'s machine over `steps`, in the prefill's order: a
+    /// boundary opens the call's pass; per step the ids refreshed, each
+    /// layer's pick from the step's counts (at most `cap` wanted, floor 1),
+    /// the engine stream's wait for each layer's landed event, the probe, a
+    /// bounded drain and the readback, then each layer's reader; the call
+    /// ends `kept` or not, and its pass with no row kept. `hold` holds the
+    /// copy stream from before the first step's picks until after its
+    /// probe's launch.
+    fn call(
+        gpu: &Gpu,
+        run: &mut Run,
+        steps: &[(Vec<[[u32; K]; L]>, usize)],
+        cap: usize,
+        kept: bool,
+        hold: Option<&HostFlags>,
+    ) -> Result<CallSeen, GateError> {
+        let r = call_held(gpu, run, steps, cap, kept, hold);
+        if let Some(flags) = hold {
+            flags.raise(0)?;
+        }
+        r
+    }
+
+    /// [`call`]'s steps; `call` raises the hold's flag after.
+    fn call_held(
+        gpu: &Gpu,
+        run: &mut Run,
+        steps: &[(Vec<[[u32; K]; L]>, usize)],
+        cap: usize,
+        kept: bool,
+        hold: Option<&HostFlags>,
+    ) -> Result<CallSeen, GateError> {
+        let stream = gpu.stream();
+        let mut seen = CallSeen {
+            start: card_sets(&run.slots),
+            ..CallSeen::default()
+        };
+        let m = run.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let fail = |seen: &mut CallSeen, e: String| seen.err = Some(e);
+        if let Err(e) = m.boundary(stream, &mut run.slots) {
+            fail(&mut seen, format!("the call's boundary: {e}"));
+            return Ok(seen);
+        }
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        for (step, (rows, _)) in steps.iter().enumerate() {
+            run.card.refresh(gpu, rows)?;
+            if step == 0
+                && let Some(flags) = hold
+            {
+                flags.clear(0)?;
+                flags.enqueue_wait(m.copy_stream(), 0)?;
+            }
+            for (i, l) in LAYERS.enumerate() {
+                let mut counts = vec![0u32; E];
+                for row in rows {
+                    for &id in &row[i] {
+                        counts[id as usize] += 1;
+                    }
+                }
+                match m.call_pick(stream, &mut run.slots, l, &counts, cap) {
+                    Ok(p) => seen.picks.push(p),
+                    Err(e) => {
+                        fail(&mut seen, format!("step {step} layer {l}: {e}"));
+                        return Ok(seen);
+                    }
+                }
+            }
+            for l in LAYERS {
+                stream.wait(m.call_landed(l)?)?;
+            }
+            run.card.launch(gpu)?;
+            if step == 0
+                && let Some(flags) = hold
+            {
+                std::thread::sleep(HOLD_SETTLE);
+                seen.held_waited = Some(stream.query() == Ok(false));
+                flags.raise(0)?;
+            }
+            if let Err(e) = drain(gpu) {
+                fail(&mut seen, format!("step {step}: {e}"));
+                return Ok(seen);
+            }
+            let out = run.card.read(gpu)?;
+            seen.values.push(value(rows, &out, &run.slots));
+            seen.sets.push(card_sets(&run.slots));
+            for l in LAYERS {
+                m.call_reader(l, stream)?;
+            }
+        }
+        match m.end_call(stream, &mut run.slots, kept) {
+            Ok(rep) => seen.report = Some(rep),
+            Err(e) => {
+                fail(&mut seen, format!("end_call: {e}"));
+                return Ok(seen);
+            }
+        }
+        let mut tally = m.tally();
+        m.end_pass(&mut tally, 0)?;
+        Ok(seen)
+    }
+
+    /// A call arm: every expert host-resident (the churn pool is in the
+    /// host set), `CALL_BEFORE` passes of the trace, then its call.
+    fn call_arm(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        faults: Faults,
+        cap: usize,
+        kept: bool,
+        hold: Option<&HostFlags>,
+    ) -> Result<(Run, CallSeen), GateError> {
+        let faults = Faults {
+            all_resident: true,
+            ..faults
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..CALL_BEFORE,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: the call arm before its call: {e}").into());
+        }
+        let steps = &trace.passes[CALL_STEPS];
+        let seen = call(gpu, &mut r, steps, cap, kept, hold)?;
+        Ok((r, seen))
+    }
+
+    /// s1 scripted and s3 host map: a kept call's steps, pick by pick,
+    /// equal a static replay of the card sets they left (synchronous copies,
+    /// other slot numbers, a fresh map), with no stale sum and no id served
+    /// twice or not at all — the host map moves at the pick, never a layer
+    /// later — and every pick lands before the passes after the call, which
+    /// run clean; a call not kept returns every layer to its start set, and
+    /// the passes after it run clean too (its mutants: the host map admits
+    /// each expert into another pair's slot; the host map moves at the
+    /// layer's reader).
+    fn s1_s3(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+    ) -> Result<bool, GateError> {
+        let (mut r, seen) = call_arm(gpu, pm, trace, Faults::default(), usize::MAX, true, None)?;
+        let sub = Trace {
+            passes: trace.passes[CALL_STEPS].to_vec(),
+        };
+        let replay = static_replay(gpu, pm, &sub, &seen.sets)?;
+        let admitted: usize = seen.picks.iter().map(|p| p.admitted).sum();
+        let landed = LAYERS.clone().all(|l| {
+            r.machine
+                .as_ref()
+                .and_then(|m| m.ledger().landing(l))
+                .is_none()
+        });
+        let before_after = r.values.len();
+        drive(gpu, &mut r, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let after = r.values[before_after..].to_vec();
+        let s1 = seen.err.is_none()
+            && r.err.is_none()
+            && admitted > 0
+            && seen.values.len() == CALL_STEPS.len()
+            && fnvs(&seen.values) == fnvs(&replay)
+            && clean(&replay)
+            && landed
+            && clean(&after);
+        let s3 = seen.err.is_none() && clean(&seen.values);
+        let (mut n, restored) =
+            call_arm(gpu, pm, trace, Faults::default(), usize::MAX, false, None)?;
+        let back = n.err.is_none()
+            && restored.err.is_none()
+            && card_sets(&n.slots) == restored.start
+            && restored
+                .report
+                .is_some_and(|rep| !rep.kept && rep.restored > 0);
+        let before_n = n.values.len();
+        drive(gpu, &mut n, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        let back = back && n.err.is_none() && clean(&n.values[before_n..]);
+        if let Some(rep) = seen.report {
+            record::call_report(&rep).print();
+        }
+        println!(
+            "s1 scripted: a kept call of {} steps, {admitted} experts admitted: step values = the \
+             static replay's {}, replay clean {}, every pick landed by the end {landed}, {} passes \
+             after it (stale, double, miss) {:?}; not kept: every layer back at its start set, then \
+             clean {back}; errors {} / {} / {} {}",
+            CALL_STEPS.len(),
+            fnvs(&seen.values) == fnvs(&replay),
+            clean(&replay),
+            after.len(),
+            errs(&after),
+            show(&seen.err),
+            show(&r.err),
+            show(&restored.err),
+            verdict(s1 && back)
+        );
+        println!(
+            "s3 host map at the pick: the call's steps (stale, double, miss) {:?} {}",
+            errs(&seen.values),
+            verdict(s3)
+        );
+        Ok(s1 && back && s3)
+    }
+
+    /// s2 landing wait: the copy stream held from before a call's first
+    /// picks (two wanted a layer) until after the first step's probe launch:
+    /// the engine stream is still waiting on the layers' landed events when
+    /// the arm looks, and after the release the probe reads no stale sum
+    /// (its mutant: the landed event recorded before the pick's copies).
+    fn s2(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        let flags = HostFlags::new(gpu.context(), 1)?;
+        // Two wanted a layer: the first step's jobs stay under the machine's
+        // backlog bound while the copy stream holds the ring.
+        let (r, seen) = call_arm(gpu, pm, trace, Faults::default(), 2, true, Some(&flags))?;
+        let first = seen.values.first().copied().unwrap_or_default();
+        let admitted = seen.picks.iter().take(L).map(|p| p.admitted).sum::<usize>();
+        let ok = seen.err.is_none()
+            && r.err.is_none()
+            && admitted > 0
+            && seen.held_waited == Some(true)
+            && clean(&seen.values);
+        println!(
+            "s2 landing wait: copy stream held over the first step's picks ({admitted} admitted): \
+             engine stream still waiting {:?}; first step (stale, double, miss) ({}, {}, {}), all \
+             steps {:?}; error {} {}",
+            seen.held_waited,
+            first.stale,
+            first.double,
+            first.miss,
+            errs(&seen.values),
+            show(&seen.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// s4 victim refusal: a pool resident the source cannot serve from
+    /// resident pages is refused by name at the pick that would evict it,
+    /// with the machine unbroken and the host map unmoved (its mutant: the
+    /// victims not checked).
+    fn s4(gpu: &Gpu, pm: &probe_kernels::LoadedModule, trace: &Trace) -> Result<bool, GateError> {
+        // Layer 2's pool residents; its spare's expert (the last seed slot)
+        // must be resident for the machine to start. No pass before the
+        // call: a flip would refuse the same victims at its boundary.
+        let stuck: Vec<(usize, u32)> = (PINNED as u32..(N_L[0] - 1) as u32)
+            .map(|e| (2, e))
+            .collect();
+        let faults = Faults {
+            stuck,
+            all_resident: true,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s4's machine: {e}").into());
+        }
+        let before = r.slots.clone();
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let (rows, _) = &trace.passes[CALL_STEPS.start];
+        let mut counts = vec![0u32; E];
+        for row in rows {
+            for &id in &row[0] {
+                counts[id as usize] += 1;
+            }
+        }
+        let said = match m.call_pick(stream, &mut r.slots, LAYERS.start, &counts, usize::MAX) {
+            Ok(p) => format!("picked, {} admitted", p.admitted),
+            Err(e) => e.to_string(),
+        };
+        let named = said.contains("is not host-resident") && said.contains("layer 2 expert");
+        let unbroken = m.broken().is_none();
+        let unmoved = r.slots == before;
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        let s4 = named && unbroken && unmoved && ended;
+        println!(
+            "s4 victim refusal: \"{said}\" named {named}, machine unbroken {unbroken}, host map \
+             unmoved {unmoved}, the call ends {ended} {}",
+            verdict(s4)
+        );
+        Ok(s4)
+    }
+
+    /// s5 floor: a call whose floor is raised between two picks admits no
+    /// expert whose count is under the new floor, and a floor set with no
+    /// call open is refused by name (its mutant: the pick reads the floor
+    /// the call began with, not the one set since). `set_call_floor` refuses
+    /// no floor value itself — 0 is a floor every count passes.
+    fn s5(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        // Counts built for the clause, not the trace's: the contract is the
+        // floor against the ranking, and the ranking needs counts the trace
+        // need not give. Layer 2's pool at the call's start is the seed's
+        // experts 4..=10 (the pinned 0..=3 never a victim, the spare's
+        // expert 11 off the card).
+        const HOT: u32 = 20;
+        const WARM: u32 = 21;
+        const UNDER: u32 = 22;
+        const OVER: u32 = 23;
+        const FLOOR2: u32 = 2;
+        let faults = Faults {
+            all_resident: true,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s5's machine: {e}").into());
+        }
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        let refused = match m.set_call_floor(0) {
+            Ok(()) => "set".to_string(),
+            Err(e) => e.to_string(),
+        };
+        let refused_named = refused.contains("SwapMachine::set_call_floor")
+            && refused.contains("a prompt call open");
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        // The first pick at floor 1: two off-seed experts over zero-count
+        // victims, counts 10 and 1.
+        let mut c1 = vec![0u32; E];
+        c1[HOT as usize] = 10;
+        c1[WARM as usize] = 1;
+        let first = m.call_pick(stream, &mut r.slots, LAYERS.start, &c1, usize::MAX)?;
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        let between = card_sets(&r.slots);
+        m.set_call_floor(FLOOR2)?;
+        // The second pick at floor 2: of its off-card counts, 5 passes the
+        // floor and 1 does not.
+        let mut c2 = vec![0u32; E];
+        c2[UNDER as usize] = 1;
+        c2[OVER as usize] = 5;
+        let second = m.call_pick(stream, &mut r.slots, LAYERS.start, &c2, usize::MAX)?;
+        let after = card_sets(&r.slots);
+        let gained: Vec<u32> = after[0]
+            .iter()
+            .filter(|id| !between[0].contains(id))
+            .copied()
+            .collect();
+        let under: Vec<u32> = gained
+            .iter()
+            .filter(|&&id| c2[id as usize] < FLOOR2)
+            .copied()
+            .collect();
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        let ok = refused_named
+            && first.admitted == 2
+            && second.admitted == 1
+            && gained == [OVER]
+            && under.is_empty()
+            && ended;
+        println!(
+            "s5 floor: floor 1 then {FLOOR2}: the first pick admitted {} experts, the second \
+             admitted {} (gained {gained:?}, of them under the floor {under:?}); set_call_floor(0) \
+             with no call open \"{refused}\" named {refused_named}, the call ends {ended} {}",
+            first.admitted,
+            second.admitted,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -2538,6 +2963,10 @@ mod gate {
         ok &= dropq(&gpu, &pm, &trace, &a)?;
         ok &= dropq_tier(&gpu, &trace, &a)?;
         ok &= dropq_free(&gpu, &pm, &trace, &a)?;
+        ok &= s1_s3(&gpu, &pm, &trace)?;
+        ok &= s2(&gpu, &pm, &trace)?;
+        ok &= s4(&gpu, &pm, &trace)?;
+        ok &= s5(&gpu, &pm)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];
@@ -2560,7 +2989,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next."
             );
             Ok(())
         } else {

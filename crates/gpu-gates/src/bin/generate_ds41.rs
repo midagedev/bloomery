@@ -270,8 +270,8 @@ mod drive {
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
-        HOST_POPULATE, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
-        STEP_STATS,
+        HOST_POPULATE, HOSTSTREAM, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
+        RESIDENCY, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -617,6 +617,7 @@ mod drive {
         CARD_DONTNEED,
         R8,
         RESIDENCY,
+        HOSTSTREAM,
     ];
 
     pub fn run() -> Result<(), GateError> {
@@ -1480,7 +1481,8 @@ mod drive {
     /// The host tier's batch services since `base`, the arm's start, one
     /// line: the layers served, the columns and host slots they carried, and the union calls'
     /// wall — the part of a batched feed the card waits on the host; then
-    /// the last call's needs and its split.
+    /// the last call's needs and its split, then its host-streaming picks
+    /// and end when it streamed.
     fn print_union(m: &mut Deepseek41Model, base: &HybridStats) -> Result<(), GateError> {
         let stats = m.body_parts("generate_ds41")?.2.take_prefill_stats();
         let b = m.body("generate_ds41")?;
@@ -1508,6 +1510,13 @@ mod drive {
                 .print();
         }
         split::split(&stats, b.prefill_counts())?.print();
+        let (picks, end) = m.body_parts("generate_ds41")?.2.take_stream_records();
+        for (g, p) in &picks {
+            record::call_stream(*g, p).print();
+        }
+        if let Some(r) = end {
+            record::call_report(&r).print();
+        }
         Ok(())
     }
 

@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, QWEN38_EXPERTS,
-    R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOSTSTREAM, HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX,
+    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -732,6 +732,13 @@ impl Levers {
     #[must_use]
     pub fn residency(&self) -> &'static str {
         Levers::defaulted(RESIDENCY, self.word(RESIDENCY))
+    }
+
+    /// `BLOOMERY_HOSTSTREAM`: a V4.1 prompt call streams its hottest host
+    /// experts into the residency's pool.
+    #[must_use]
+    pub fn hoststream(&self) -> bool {
+        self.flag(HOSTSTREAM)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

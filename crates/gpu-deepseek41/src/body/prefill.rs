@@ -61,6 +61,27 @@
 //! join. The tier's fault word is read beside the card's at a group's end and
 //! when a group fails, the tier's stream drained first.
 //!
+//! Under host streaming (`BLOOMERY_HOSTSTREAM=on`, a residency machine, a
+//! call of at least [`STREAM_MIN_P`] positions) a group moves each layer's
+//! residency pool toward the experts its first batch with a block routes
+//! most, at that layer-batch: the chunks' shadow part is enqueued, the host
+//! waits for the route's copies and counts the batch's ids, the machine's
+//! pick sends the pool's coldest to the host and copies the hottest host
+//! experts over them (`SwapMachine::call_pick`, [`STREAM_FLOOR`] a batch of
+//! the group the least count admitted); the block's places are taken again
+//! under the moved map, its kept card experts run, then — the engine stream
+//! waiting for the pick's copies — the admitted experts run over the
+//! streamed places, merged back, and the card sum reads every card slot in
+//! slot order; only then is the next layer-batch's route enqueued, since it
+//! writes the norm, routing and places every batch of the group shares at
+//! the same offsets (the host still serves this layer-batch while the card
+//! routes the next). The group's later
+//! batches route under the moved map. After a layer's last batch of a group
+//! the layer's reader event is recorded, which the next group's pick copies
+//! wait for. The call's placement stays for the decode after it; a call that
+//! fails returns each layer to the set it started with. The bits are then the
+//! band's, not the decode steps'.
+//!
 //! Every launch writes, per token, what its one-token launch writes, and the
 //! ops that carry state from a position to the next (the ring, the
 //! compressor's pooling, each token's visible counts) run in position order,
@@ -97,6 +118,7 @@ use gguf::quant::GgmlType;
 use model::moe::UNION_MAX_COLS;
 
 use bloomery_gpu::COL_GROUP;
+use bloomery_gpu::host::swap::{CallCfg, CallPick, CallReport};
 use bloomery_gpu::hybrid::BatchKey;
 use bloomery_gpu::weights::DevWeight;
 
@@ -121,6 +143,19 @@ const _: () = assert!(CHUNK == COL_GROUP);
 
 /// Chunks a batch cuts into at most: an unaligned first position adds one.
 const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
+
+/// The shortest prompt a call streams host experts for: the shortest the
+/// flow model has a call plan of (`tools/flow/plans`), where it still gains
+/// (prose, plan (a), +9 % at 128 positions [derived]); below it no plan
+/// prices the streamed pass, so the call does not stream.
+pub const STREAM_MIN_P: usize = 128;
+
+/// The least count an expert's first batch with a block routes to it for
+/// the pick to admit it, per batch the group holds (the batches the admitted
+/// expert then serves from the card): the flow model's best threshold at
+/// groups of one and two over P 128..16384, prose and code, plan (a) and bp,
+/// which no uniform (lcg) routing's expert clears [derived].
+pub const STREAM_FLOOR: u32 = 32;
 
 const WHAT: &str = "deepseek41 prefill";
 
@@ -515,9 +550,10 @@ fn feed(
         None => (None, None),
     };
     let group = {
-        let (_, _, body) = m.body_parts(WHAT)?;
+        let (gpu, _, body) = m.body_parts(WHAT)?;
         let group = body.batch_mut()?.group;
         body.begin_call(first, end, &starts, window)?;
+        body.stream_begin(gpu, ids.len())?;
         group
     };
     let mut token = None;
@@ -554,13 +590,43 @@ fn feed(
             });
         match ran {
             Ok(t) => token = t,
-            Err(e) => return Err(take_back(m, first, e)),
+            Err(e) => {
+                let e = stream_failed(m, e);
+                return Err(take_back(m, first, e));
+            }
         }
     }
-    token.ok_or(GpuError::State {
+    let done = token.ok_or(GpuError::State {
         what: WHAT,
         missing: "the head of the group that holds the prompt's last position",
-    })
+    });
+    let ended = m
+        .body_parts(WHAT)
+        .and_then(|(gpu, _, body)| body.stream_end(gpu, done.is_ok()));
+    match (done, ended) {
+        (Ok(t), Ok(())) => Ok(t),
+        (Ok(_), Err(e)) => Err(take_back(m, first, e)),
+        (Err(e), _) => Err(take_back(m, first, e)),
+    }
+}
+
+/// A call that failed with `e` under host streaming: the machine's call
+/// ended, each layer back at the set the call started with. A failure to end
+/// it is named beside `e`; a fault stays `e`.
+fn stream_failed(m: &mut Deepseek41Model, e: GpuError) -> GpuError {
+    let ended = m
+        .body_parts(WHAT)
+        .and_then(|(gpu, _, body)| body.stream_end(gpu, false));
+    match ended {
+        Ok(()) => e,
+        Err(_) if matches!(e, GpuError::Fault { .. }) => e,
+        Err(s) => GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a prompt call failed ({e}), and ending its host streaming failed too ({s})"
+            ),
+        },
+    }
 }
 
 /// A call that failed with `e`: its positions taken back, so the model
@@ -719,6 +785,20 @@ pub(super) struct Batch {
     card_served: Vec<bool>,
     /// The last call's queue entries, per batch and layer-batch.
     counts: PromptCounts,
+    /// The call's host streaming ([`Body::stream_begin`]).
+    stream: StreamCall,
+}
+
+/// A call's host streaming: whether this call streams, the group it is at,
+/// each pick so far with its group, and the last call's end.
+#[derive(Default)]
+struct StreamCall {
+    on: bool,
+    group: usize,
+    picks: Vec<(usize, CallPick)>,
+    end: Option<CallReport>,
+    /// A pick's counts, one an expert of the layer.
+    counts: Vec<u32>,
 }
 
 /// Events a layer-batch records while [`Body::set_prefill_card_timing`] is
@@ -1195,7 +1275,10 @@ impl Body {
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
         let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
         let glue = self.glue.batch(gpu, image.layout())?;
-        let ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
+        let mut ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
+        if self.levers.hoststream {
+            ffn.enable_stream(stream)?;
+        }
         let set = |k: usize| -> Result<BatchSet, GpuError> {
             let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
             let made = || -> Result<BatchSet, GpuError> {
@@ -1247,6 +1330,7 @@ impl Body {
             card_marks,
             card_served: vec![false; self.layers.len() * sets],
             counts: PromptCounts::default(),
+            stream: StreamCall::default(),
             image,
             attn,
             proj,
@@ -1287,6 +1371,29 @@ impl Body {
         batch.card_timing = on;
         let layer_batches = layers * batch.sets.len();
         batch.proj.set_card_timing(gpu, on, layer_batches)
+    }
+
+    /// Whether the next prompt calls stream host experts: the load's
+    /// `BLOOMERY_HOSTSTREAM` until set here, so one load can run both arms.
+    /// Refused by name: before the batch's buffers are made
+    /// ([`prepare_prefill`]), on a batch made without the streamed places
+    /// (the lever off at the load), and while a call streams.
+    pub fn set_hoststream(&mut self, on: bool) -> Result<(), GpuError> {
+        let batch = self.batch_mut()?;
+        if batch.stream.on {
+            return Err(GpuError::State {
+                what: "Body::set_hoststream",
+                missing: "no call streaming",
+            });
+        }
+        if on && !batch.ffn.streams() {
+            return Err(GpuError::State {
+                what: "Body::set_hoststream",
+                missing: "a batch made with the streamed places (BLOOMERY_HOSTSTREAM=on at the load)",
+            });
+        }
+        self.levers.hoststream = on;
+        Ok(())
     }
 
     /// Device bytes of the batch's buffers; 0 before they are made
@@ -1370,6 +1477,67 @@ impl Body {
             b.counts.lbs.clear();
         }
         Ok(())
+    }
+
+    /// A call of `n` positions under host streaming: with the lever on and
+    /// `n` at least [`STREAM_MIN_P`], the residency machine opens its call
+    /// ([`Hybrid::call_begin`]) at [`STREAM_FLOOR`] a batch of the lever's
+    /// group, and the call streams; else it does not. Refused by name: a call
+    /// streaming already, and the lever on with no machine (the load refuses
+    /// it beside `BLOOMERY_RESIDENCY=off`).
+    fn stream_begin(&mut self, gpu: &Gpu, n: usize) -> Result<(), GpuError> {
+        let group = self.levers.group;
+        let on = self.levers.hoststream && n >= STREAM_MIN_P;
+        let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's buffers",
+        })?;
+        if batch.stream.on {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "no call streaming (stream_end)",
+            });
+        }
+        batch.stream.picks.clear();
+        batch.stream.group = 0;
+        if !on {
+            return Ok(());
+        }
+        let floor = STREAM_FLOOR.saturating_mul(u32::try_from(group).unwrap_or(u32::MAX));
+        // Each group sets its own floor before its picks
+        // (`enqueue_group_chain`); this one stands for none.
+        if !self.hybrid.call_begin(gpu.stream(), CallCfg { floor })? {
+            return Err(GpuError::State {
+                what: "BLOOMERY_HOSTSTREAM=on",
+                missing: "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
+            });
+        }
+        batch.stream.on = true;
+        Ok(())
+    }
+
+    /// The streaming call's end ([`Hybrid::call_end`]): its placement `kept`
+    /// for the decode after it, else each layer back at the set the call
+    /// started with. Nothing for a call that does not stream.
+    fn stream_end(&mut self, gpu: &Gpu, kept: bool) -> Result<(), GpuError> {
+        let Some(batch) = self.batch.as_deref_mut() else {
+            return Ok(());
+        };
+        if !std::mem::take(&mut batch.stream.on) {
+            return Ok(());
+        }
+        batch.stream.end = self.hybrid.call_end(gpu.stream(), kept)?;
+        Ok(())
+    }
+
+    /// The last streaming call's picks, each with its group, and its end;
+    /// empty and `None` after a call that did not stream. Taken: a second
+    /// read is empty.
+    pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
+        match self.batch.as_deref_mut() {
+            Some(b) => (std::mem::take(&mut b.stream.picks), b.stream.end.take()),
+            None => (Vec::new(), None),
+        }
     }
 
     /// The feature rows the group's batch `set` of positions `run` kept —
@@ -1709,6 +1877,7 @@ impl Body {
             hp,
             need,
             tier,
+            picked,
             ..
         } = self;
         let batch = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1719,6 +1888,10 @@ impl Body {
             what: WHAT,
             missing: "the call's needs",
         })?;
+        if batch.stream.on {
+            let n = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            hybrid.call_floor(STREAM_FLOOR.saturating_mul(n))?;
+        }
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
             gpu,
@@ -1751,6 +1924,10 @@ impl Body {
         // layer-batch is another batch's: in a group of one it reads this
         // one's join.
         let ahead = g >= 2;
+        let streaming = cx.batch.stream.on;
+        // Per layer index, whether this group's pick has run there: the
+        // body's load-sized bitset, zeroed for this group.
+        *picked = 0;
         let mut next = match items.first() {
             Some(&(i, j)) => Some(cx.route(&mut members[j], i, observe)?),
             None => None,
@@ -1760,9 +1937,24 @@ impl Body {
                 what: WHAT,
                 missing: "the route of the layer-batch the group serves",
             })?;
-            cx.shadow(&members[j], i, &now)?;
+            let l = layers.start + i;
+            let card = streaming && CardStacks::of(w, l)?.is_some();
+            if card && (*picked >> i) & 1 == 0 && now.block.is_some() {
+                *picked |= 1 << i;
+                cx.shadow_pick(&members[j], i, &now)?;
+                cx.shadow_stream(&members[j], i, &now)?;
+            } else {
+                cx.shadow(&members[j], i, &now)?;
+            }
+            // The next route writes the block buffers (its norm, routing and
+            // places) every batch of the group shares at the same offsets:
+            // it follows this layer-batch's last reader of them, the card
+            // sum (or the held routing's copy).
             if ahead && let Some(&(i2, j2)) = items.get(x + 1) {
                 next = Some(cx.route(&mut members[j2], i2, observe)?);
+            }
+            if card && j + 1 == g {
+                cx.hybrid.call_reader(l, gpu.stream())?;
             }
             cx.serve(&members[j], i, &now)?;
             cx.post(&mut members[j], i, &now, observe)?;
@@ -1771,6 +1963,9 @@ impl Body {
             }
         }
         let GroupCx { sums, tally, .. } = cx;
+        if streaming {
+            batch.stream.group += 1;
+        }
         if last && let Some(m) = members.last() {
             let s4 = HC_STREAMS * hp.n_embd;
             let t = m.u - 1;
@@ -2105,6 +2300,102 @@ impl<'a> GroupCx<'a> {
             .enqueue_batch_shadow(gpu, bl, card, &mut batch.ffn, &block, tiered)?;
         self.tally.shadow(i, m.set, entries)?;
         if timed {
+            self.mark(m.set, i, 3)?;
+            self.tally.shadow(i, m.set, 1)?;
+        }
+        Ok(())
+    }
+
+    /// Under host streaming, layer index `i`'s shadow of the batch `m`'s
+    /// block, the group's first at the layer, up to its streamed pass: each
+    /// chunk's part, then — the host waiting for the route's copies — the
+    /// layer's pick from the block's routed ids, the block's places taken
+    /// again under the moved map, and its kept card experts.
+    fn shadow_pick(&mut self, m: &Member, i: usize, r: &Routed<'_>) -> Result<(), GpuError> {
+        let bl = r.block.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a block for the layer's pick",
+        })?;
+        let (gpu, w) = (self.gpu, self.w);
+        let l = self.layers.start + i;
+        let tiered = self.tiered(i)?;
+        if self.batch.card_timing {
+            self.mark(m.set, i, 2)?;
+            self.tally.shadow(i, m.set, 1)?;
+        }
+        let batch = &mut *self.batch;
+        let own = set_of(&mut batch.sets, m.set)?;
+        let card = CardStacks::of(w, l)?;
+        let block = BlockIo {
+            set: m.set,
+            chunks: &m.cuts[r.full..],
+            base: m.b,
+            streams: &own.hc[m.cur.s],
+            fold_in: &own.folds[m.cur.f],
+        };
+        self.ffn
+            .enqueue_batch_shadow_chunks(gpu, bl, card, &mut batch.ffn, &block)?;
+        let n_expert = self.hybrid.slots().n_expert();
+        let counts = &mut batch.stream.counts;
+        counts.clear();
+        counts.resize(n_expert, 0);
+        for &id in self.hybrid.routed_ids(m.key(l, r.at))? {
+            let c = usize::try_from(id)
+                .ok()
+                .and_then(|id| counts.get_mut(id))
+                .ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("layer {l}: a routed id {id} of {n_expert} experts"),
+                })?;
+            *c += 1;
+        }
+        let pick = self
+            .hybrid
+            .call_pick(gpu.stream(), l, &batch.stream.counts, usize::MAX)?;
+        batch.stream.picks.push((batch.stream.group, pick));
+        self.ffn
+            .enqueue_batch_replace(gpu, bl, &mut batch.ffn, &block, self.slots)?;
+        self.ffn
+            .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block)?;
+        // The shadow's entries and the places taken again.
+        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
+        self.tally.shadow(i, m.set, entries + 1)
+    }
+
+    /// Under host streaming, the streamed pass of layer index `i`'s block of
+    /// the batch `m` after [`GroupCx::shadow_pick`]: the engine stream waits
+    /// for the pick's copies, then the admitted experts, the places merged
+    /// and the card sum (or the held routing).
+    fn shadow_stream(&mut self, m: &Member, i: usize, r: &Routed<'_>) -> Result<(), GpuError> {
+        let bl = r.block.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a block for the layer's streamed pass",
+        })?;
+        let (gpu, w) = (self.gpu, self.w);
+        let l = self.layers.start + i;
+        let tiered = self.tiered(i)?;
+        let landed = self.hybrid.call_landed(l)?.ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a residency machine's call for the streamed pass",
+        })?;
+        gpu.stream().wait(landed)?;
+        let batch = &mut *self.batch;
+        let own = set_of(&mut batch.sets, m.set)?;
+        let card = CardStacks::of(w, l)?;
+        let block = BlockIo {
+            set: m.set,
+            chunks: &m.cuts[r.full..],
+            base: m.b,
+            streams: &own.hc[m.cur.s],
+            fold_in: &own.folds[m.cur.f],
+        };
+        self.ffn
+            .enqueue_batch_stream(gpu, bl, card, &mut batch.ffn, &block, tiered)?;
+        // The wait, the tile path's six launches over the streamed places
+        // with card experts, and the merge.
+        self.tally
+            .shadow(i, m.set, 2 + if card.is_some() { 6 } else { 0 })?;
+        if self.batch.card_timing {
             self.mark(m.set, i, 3)?;
             self.tally.shadow(i, m.set, 1)?;
         }

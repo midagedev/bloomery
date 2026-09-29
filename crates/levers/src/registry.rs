@@ -28,6 +28,7 @@ pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
+pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 
@@ -330,6 +331,22 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               leg — the same-binary arm. The ubatch walk refuses a card plan by name, so a \
               card-plan prompt runs as passes (`--prefill pass`). The `plan` line prints \
               `experts=`.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: HOSTSTREAM,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("off"),
+        doc: "V4.1 prompt calls under adaptive residency (`BLOOMERY_RESIDENCY=mid-…`): `on` \
+              streams each group's hottest host experts into the residency's churn pool at \
+              every layer (`host::swap` call mode: a batch's counts pick them, the coldest pool \
+              residents go to the host, and the call's picks stay for the decode after it), \
+              at or past the prompt length the body names (`body::prefill`'s `STREAM_MIN_P`); \
+              the prompt's bits are then the band's, not the decode steps'. `off` keeps a \
+              prompt call bit for bit the decode steps' state, the same-binary arm. Refused \
+              by name at the load beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
+              stream`, every call `call stream end`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

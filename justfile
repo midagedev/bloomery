@@ -1102,6 +1102,16 @@ gate-gpu-ds41-residency *ARGS:
 gate-gpu-ds41-unpack:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'
 
+# V4.1 host streaming in a prompt call (BLOOMERY_HOSTSTREAM, set on in the gate) over the residency at mid-p40-s1, plan
+# (b′), groups of 2, both cards, one load: s2 (a call that streams, then the same call on the placement it left admits
+# nothing and gives the same argmax and logits), s1 (a 1,536-id call and 8 steps free and with the copy stream held 1 s:
+# the same picks per group and layer, tokens and logits), s3 (4 prose and 4 code windows of 512 ids, streaming off and
+# on: where they first differ, on's top-1 margin below 1.5). Both cards, alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-ds41-callstream *ARGS:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
+
 # V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
 # --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
 # six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any

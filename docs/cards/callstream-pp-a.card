@@ -1,0 +1,41 @@
+# Round callstream (S1 callpool + S2 callstream), the landing A/B on plan (a): a prompt call that streams its
+# hottest host experts into the residency's churn pool (BLOOMERY_HOSTSTREAM=on) against the same binary and the same
+# residency with streaming off, one lease. Flow model (tools/flow/ds41_prefill.py, flowfit's refit; the round's
+# re-derivation on the R3 tip, CED on, G 2, the pool 1,148 experts / 19.26 GB, each admitted expert's fill priced at
+# the staging thread, 16.77 MB / 1.50 ms): the threshold pick (32 ids a batch of the group, cap = the pool) moves the
+# prose P = 4096 wall from 348.8 to 404.4 tok/s, +16.0 %; the balance oracle +20.0 % [derived]. The model's base
+# sits 4.6 % under the measured 367.5-369.4 (its glist term), so the band is the rule's gain in tok/s over the
+# measured base at the low edge (+15 %) widened by the model's own misses (5 points each side) [derived].
+# P = 512 (+31.2 % rule, +31.9 % oracle [derived]) is read beside against +24..+34. lcg moves 0 (no expert clears
+# the floor [derived]) and is not an arm. Decode after the call (the -n 96 rows of the same arms) is read beside
+# against 0..+25 %: the call leaves the pool holding the prompt's hottest experts where off leaves the id-prefix
+# seed, and the rule adapts from there in both arms, so the on arm starts at or above off's card hit rate; the top
+# is the step model's (10 ms + 0.139 ms a host slot, rig-log 09-29) move from the in-request 46.5 % hit to the
+# steady 78 % (09-28#residency-replay) over the first planning passes only [derived].
+kind: ab
+question: does streaming the call's hottest host experts into the residency pool raise plan (a)'s prose prompt rate
+  by the flow model's threshold-pick gain, with the decode after the call no slower?
+term: pp tok/s @ P = 4096, prose prompt (corpus-prose.ids, the first 4096), no hot list, BLOOMERY_RESIDENCY=
+  mid-p40-s1, A6000, plan (a), CED on, G 2 - (on - off) / off, paired by round
+unit: %
+predict: +10..+22
+rounds: 2
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, one run's SD about 0.55 and 1.1 %; the
+  larger
+condition: the callstream tree's generate_ds41, both arms in one lease through the load-time lever, from
+  /Users/hckim/repo/bloomery-callstream2 (main d3d54385 + callstream): BLOOMERY_REMOTE='~/repo/bloomery-callstream2' BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_RESIDENCY=mid-p40-s1 BLOOMERY_STEP_STATS=1
+  BLOOMERY_LEASE_CARD=docs/cards/callstream-pp-a.card' just depth-gpu-ds41 prose:512 prose:4096
+  prose:512@BLOOMERY_HOSTSTREAM=on prose:4096@BLOOMERY_HOSTSTREAM=on. Two load keys a round (off, on), each arm
+  from Session::clear (the residency back to its seed); every on row carries `call stream end` with admitted > 0
+  and kept 1, every off row none; no row carries [cold], [cpu-busy] or [other-busy]. Box time 9..13 min [derived:
+  4 loads and one warm-up at 60..90 s (74.6 s measured on plan (a), rig-log 09-26), 2 rounds of 4 prompts, 26 s,
+  and 4 decodes of 96 at ~26 tok/s, 15 s, and the guards' idle waits]
+decide-in: land S2 with streaming off by default; sit bp (callstream-pp-bp.card) and propose on as the default
+  under a residency, with the decode rows beside
+decide-below: read the on rows' call stream records: backlog_us near pick_us means the staging thread paces the
+  call (fill at the link, not the thread: the direct-DMA source rig-log 09-29 prices at 0.83 host slots a copy);
+  otherwise the card's streamed pass costs more than the tile model says - time one layer-batch under nsys before
+  any default change
+decide-above: the host union shrank past the rule's share: re-fit the flow model's union law on the on rows'
+  union_ms and move the floor down (STREAM_FLOOR 16) before bp sits

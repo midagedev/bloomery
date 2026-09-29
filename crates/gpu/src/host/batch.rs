@@ -464,6 +464,27 @@ impl BatchPort {
         Ok(())
     }
 
+    /// Wait for the oldest unserved set's copies, which must be `key`'s, and
+    /// hand back its routed ids (`n_used` a token of its tokens `at .. u`)
+    /// without serving it: what a prompt call's pick counts before the
+    /// serve. Refused by name when the oldest unserved set is not `key`'s.
+    pub fn routed_ids(&mut self, key: BatchKey) -> Result<&[u32], GpuError> {
+        let s = self.n_used;
+        let BatchKey { at, u, .. } = key;
+        let set = &mut self.sets[self.serve];
+        if set.stage != Stage::Routed(key) {
+            return Err(GpuError::Shape {
+                what: PORT,
+                detail: format!(
+                    "the routed ids of {key:?}; the oldest unserved exchange set holds {:?}",
+                    set.stage
+                ),
+            });
+        }
+        set.routed.synchronize()?;
+        Ok(&set.ids[at * s..u * s])
+    }
+
     /// Wait for the oldest unserved set's copies, which must be `key`'s,
     /// then have `serve` compute its layer's host sums for its tokens: the
     /// layer, the activations as a view, the routing, and the set's sums the

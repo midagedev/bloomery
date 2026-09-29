@@ -169,6 +169,9 @@ pub struct BodyLevers {
     /// load's slot map; otherwise the load holds the churn pool in its host
     /// set and runs the residency machine over the stage card ([`swap`]).
     pub residency: Residency,
+    /// A prompt call streams its hottest host experts into the residency's
+    /// pool (`BLOOMERY_HOSTSTREAM`, [`prefill`]); only under a residency.
+    pub hoststream: bool,
 }
 
 impl BodyLevers {
@@ -218,6 +221,13 @@ impl OpenCfg {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
+        if levers.hoststream() && Residency::parse(levers.residency())? == Residency::Off {
+            return Err(GpuError::State {
+                what: "BLOOMERY_HOSTSTREAM=on",
+                missing: "a residency (BLOOMERY_RESIDENCY=mid-p<P>-s<S>): the streamed experts \
+                          go into its churn pool",
+            });
+        }
         let body = BodyLevers {
             ced: levers.ced(),
             prefill,
@@ -225,6 +235,7 @@ impl OpenCfg {
             rows: RowsLevers::from_levers(levers),
             host: levers.host(),
             residency: Residency::parse(levers.residency())?,
+            hoststream: levers.hoststream(),
         };
         body.check()?;
         Ok(OpenCfg {
@@ -774,6 +785,11 @@ pub struct Body {
     /// The prompt batch's buffers ([`prefill`]), made at load by
     /// [`prefill::prepare_prefill`].
     batch: Option<Box<prefill::Batch>>,
+    /// Per layer of `layers`, one bit: whether the group a prompt call is
+    /// enqueuing has run its pick there ([`Body::enqueue_group_chain`]).
+    /// Zeroed at each group's start; the load refuses more layers than its
+    /// bits.
+    picked: u64,
     /// The stage card's side of the tier layers, on a load with a tier card
     /// ([`Body::open_placed_tiered`]).
     tier: Option<TierPiece>,
@@ -2226,6 +2242,13 @@ impl Body {
                 plan.model.layers, hp.n_layer
             )));
         }
+        if layers.len() > usize::BITS as usize {
+            return Err(refuse(format!(
+                "the card runs {} layers; the group pick flags hold {}",
+                layers.len(),
+                usize::BITS
+            )));
+        }
         let ctx_max = usize::try_from(plan.ctx_max)
             .map_err(|_| refuse(format!("ctx_max {} passes usize", plan.ctx_max)))?;
         gpu.context().bind_to_thread()?;
@@ -2389,6 +2412,7 @@ impl Body {
             hp: hp.clone(),
             levers: cfg,
             batch: None,
+            picked: 0,
             tier,
             residency_log: None,
             swap_source,

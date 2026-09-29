@@ -109,7 +109,7 @@ use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
 use crate::tensor::DeviceTensor;
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
 use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
@@ -776,6 +776,79 @@ impl<H: HostExperts> HostTier<H> {
         Ok(Some((kind, report)))
     }
 
+    /// Open a prompt call on the residency machine
+    /// ([`swap::SwapMachine::begin_call`]) inside the pass the last boundary
+    /// opened. `false` without a machine: the map stays the load's.
+    pub fn call_begin(
+        &mut self,
+        stream: &CudaStream,
+        cfg: swap::CallCfg,
+    ) -> Result<bool, GpuError> {
+        match self.swap.as_mut() {
+            Some(m) => m.begin_call(stream, cfg).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// The open call's pick at layer `layer` from the batch counts `counts`
+    /// ([`swap::SwapMachine::call_pick`]) over this tier's map. Refused by
+    /// name without a machine.
+    pub fn call_pick(
+        &mut self,
+        stream: &CudaStream,
+        layer: usize,
+        counts: &[u32],
+        cap: usize,
+    ) -> Result<swap::CallPick, GpuError> {
+        let m = self.swap.as_mut().ok_or(GpuError::state(
+            "HostTier::call_pick",
+            "a residency machine (HostTier::start_swap)",
+        ))?;
+        m.call_pick(stream, &mut self.slots, layer, counts, cap)
+    }
+
+    /// The open call's floor from its next pick on
+    /// ([`swap::SwapMachine::set_call_floor`]). Refused by name without a
+    /// machine.
+    pub fn call_floor(&mut self, floor: u32) -> Result<(), GpuError> {
+        self.swap
+            .as_mut()
+            .ok_or(GpuError::state(
+                "HostTier::call_floor",
+                "a residency machine (HostTier::start_swap)",
+            ))?
+            .set_call_floor(floor)
+    }
+
+    /// The open call's landed event of layer `layer`
+    /// ([`swap::SwapMachine::call_landed`]); `None` without a machine.
+    pub fn call_landed(&self, layer: usize) -> Result<Option<&CudaEvent>, GpuError> {
+        self.swap.as_ref().map(|m| m.call_landed(layer)).transpose()
+    }
+
+    /// Layer `layer`'s last read of the call so far on `stream`
+    /// ([`swap::SwapMachine::call_reader`]); nothing without a machine.
+    pub fn call_reader(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
+        match self.swap.as_mut() {
+            Some(m) => m.call_reader(layer, stream),
+            None => Ok(()),
+        }
+    }
+
+    /// End the open call ([`swap::SwapMachine::end_call`]), its placement
+    /// `kept` for the passes after it or returned to the call's start; its
+    /// report. `None` without a machine.
+    pub fn call_end(
+        &mut self,
+        stream: &CudaStream,
+        kept: bool,
+    ) -> Result<Option<swap::CallReport>, GpuError> {
+        match self.swap.as_mut() {
+            Some(m) => m.end_call(stream, &mut self.slots, kept).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// The residency back to its seed at a quiet boundary on `stream`
     /// ([`swap::SwapMachine::reset`]), the tally cleared and no pass open;
     /// its report. `None` without a machine.
@@ -1085,6 +1158,13 @@ impl<H: HostExperts> HostTier<H> {
         self.refuse_untiered_route("HostTier::enqueue_download_pitched", key.layer)?;
         self.port_mut("HostTier::enqueue_download_pitched")?
             .download_pitched(stream, xw, ids, pitch, key)
+    }
+
+    /// Wait for the oldest download not served yet — `key`'s, else refused
+    /// by name — and hand back its routed ids without serving it
+    /// ([`BatchPort::routed_ids`]).
+    pub fn routed_ids(&mut self, key: BatchKey) -> Result<&[u32], GpuError> {
+        self.port_mut("HostTier::routed_ids")?.routed_ids(key)
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused

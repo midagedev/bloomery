@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::host::PassKind;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::host::swap::{Leak, PassReport, ResetReport};
+use bloomery_gpu::host::swap::{CallPick, CallReport, Leak, PassReport, ResetReport};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
 use model::placement::{Machine, Plan};
@@ -1047,6 +1047,51 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// A prompt call's pick at one (group, layer)
+/// ([`bloomery_gpu::host::swap::CallPick`]).
+pub static CALL_STREAM: Kind = Kind {
+    name: "call_stream",
+    head: "call stream",
+    doc: "A prompt call's pick at one layer of one group (host streaming: the residency pool \
+          takes the group's hottest host experts): the group, the layer, the experts admitted \
+          (each in place of a pool resident sent to the host) and the pool residents kept, the \
+          bytes the admitted experts' copies move, the pick's input (FNV-1a 64 of its counts, \
+          hex), and the host's microseconds in the pick, of them waiting for the staging thread \
+          to take in the call's earlier jobs.",
+    parts: &[
+        key("group", U64, ""),
+        key("layer", U64, ""),
+        key("admitted", U64, ""),
+        key("kept", U64, ""),
+        key("bytes", U64, "B"),
+        key("counts", Word, ""),
+        key("pick_us", U64, "us"),
+        key("backlog_us", U64, "us"),
+    ],
+};
+
+/// A prompt call's end on the residency machine
+/// ([`bloomery_gpu::host::swap::CallReport`]).
+pub static CALL_STREAM_END: Kind = Kind {
+    name: "call_stream_end",
+    head: "call stream end",
+    doc: "A prompt call's end on the residency machine: the picks that admitted an expert, the \
+          experts admitted and their bytes, the host's microseconds in the picks and of them \
+          waiting for the staging thread, whether the call's placement stays for the passes \
+          after it (1) or went back to the call's start (0) with the experts copied back, and \
+          the host's microseconds in the end.",
+    parts: &[
+        key("picks", U64, ""),
+        key("admitted", U64, ""),
+        key("bytes", U64, "B"),
+        key("pick_us", U64, "us"),
+        key("backlog_us", U64, "us"),
+        key("kept", U64, ""),
+        key("restored", U64, ""),
+        key("end_us", U64, "us"),
+    ],
+};
+
 /// A helper thread the load spawned (`threads::helper::helpers`).
 pub static HELPER: Kind = Kind {
     name: "helper",
@@ -1532,6 +1577,8 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
+    &CALL_STREAM,
+    &CALL_STREAM_END,
 ];
 
 /// What `bloomery-chat` prints, all on stderr.
@@ -1735,6 +1782,34 @@ pub fn residency_leak(l: &Leak) -> Record {
         None => r,
     };
     r.u("ring", l.ring_bytes).u("words", l.words_bytes)
+}
+
+/// A prompt call's pick record, of group `group`.
+#[cfg(feature = "gpu")]
+pub fn call_stream(group: usize, p: &CallPick) -> Record {
+    Record::new(&CALL_STREAM)
+        .u("group", group)
+        .u("layer", p.layer)
+        .u("admitted", p.admitted)
+        .u("kept", p.kept)
+        .u("bytes", p.bytes)
+        .w("counts", format!("{:016x}", p.counts))
+        .u("pick_us", p.pick_us)
+        .u("backlog_us", p.backlog_us)
+}
+
+/// A prompt call's end record.
+#[cfg(feature = "gpu")]
+pub fn call_report(r: &CallReport) -> Record {
+    Record::new(&CALL_STREAM_END)
+        .u("picks", r.picks)
+        .u("admitted", r.admitted)
+        .u("bytes", r.bytes)
+        .u("pick_us", r.pick_us)
+        .u("backlog_us", r.backlog_us)
+        .u("kept", u64::from(r.kept))
+        .u("restored", r.restored)
+        .u("end_us", r.end_us)
 }
 
 /// A residency reset's record.

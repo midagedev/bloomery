@@ -74,6 +74,28 @@
 //! **Counting.** The ids a pass routes are noted per (layer, row) into a
 //! [`Tally`] and folded into the rule at [`SwapMachine::end_pass`] for the
 //! pass's kept rows only, so a rejected row leaves no trace.
+//!
+//! **Calls.** A prompt call is one pass whose map moves inside it: between
+//! [`SwapMachine::begin_call`] and [`SwapMachine::end_call`] the rule makes
+//! no plan and every boundary, end of pass and reset is refused, and each
+//! [`SwapMachine::call_pick`] moves one layer's pool — its live, unpinned
+//! residents outside the rule's flips in flight — toward the hottest experts
+//! of the counts it is given ([`SwapRule::call_pick`]), all at once: the
+//! admitted experts' jobs go to the staging thread, which stages whatever the
+//! window says for the call; the copy stream waits for the layer's reader
+//! event (the last engine stream read of the layer's slots,
+//! [`SwapMachine::call_reader`], or the call's start) and copies them in; the
+//! layer's landed event follows; then the host map, the rule and the card's
+//! copy of the layer's words change, the victims to the host (which serves
+//! them from resident pages from this pick on) and each admitted expert to
+//! its victim's slot, `Landing` in the ledger. No engine stream kernel may
+//! read a landing slot before the engine stream waits for the layer's landed
+//! event ([`SwapMachine::call_landed`]); the layer's next reader event makes
+//! that wait itself and turns its landing slots `Live`, and a pick of a layer
+//! whose last pick no reader has waited for is refused by name. The call
+//! ends with every landing slot waited for and live, and either keeps its
+//! placement for the passes after it or returns each layer to the set it
+//! started with.
 
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -335,6 +357,10 @@ pub enum SlotState {
     /// Being written for seed expert `e` by a reset, live once the reset's
     /// copies have landed. No map entry names it.
     Reserved(u32),
+    /// Named by the map for expert `e`, admitted by a call's pick whose
+    /// copies no engine stream wait covers yet: `event` is the machine's
+    /// landed event for it ([`SwapMachine::call_landed`]).
+    Landing { e: u32, event: usize },
 }
 
 /// Per layer, the state of each stage card slot below the layer's capacity:
@@ -375,6 +401,69 @@ impl SlotLedger {
 
     fn row_mut(&mut self, layer: usize) -> &mut Vec<SlotState> {
         &mut self.rows[layer - self.layers.start]
+    }
+
+    /// A call's pick sends slot `slot` of layer `layer` from victim `victim`
+    /// to expert `e`, landing behind landed event `event`. Refused by name,
+    /// the ledger unchanged: a layer or a slot outside it, and a slot that is
+    /// not `Live(victim)`.
+    pub fn to_landing(
+        &mut self,
+        layer: usize,
+        slot: u32,
+        victim: u32,
+        e: u32,
+        event: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SlotLedger::to_landing";
+        let st = layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.rows.get_mut(i))
+            .and_then(|row| row.get_mut(slot as usize))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("layer {layer} slot {slot} is outside the ledger"),
+                )
+            })?;
+        if *st != SlotState::Live(victim) {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!("layer {layer} slot {slot} is {st:?}, not live with the victim {victim}"),
+            ));
+        }
+        *st = SlotState::Landing { e, event };
+        Ok(())
+    }
+
+    /// Layer `layer`'s landing slots turn `Live`: the engine stream waits for
+    /// their landed event from here on. Whether it held any; a layer outside
+    /// the ledger holds none.
+    pub fn land(&mut self, layer: usize) -> bool {
+        let Some(row) = layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.rows.get_mut(i))
+        else {
+            return false;
+        };
+        let mut any = false;
+        for st in row.iter_mut() {
+            if let SlotState::Landing { e, .. } = *st {
+                *st = SlotState::Live(e);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Layer `layer`'s first landing slot, if any.
+    #[must_use]
+    pub fn landing(&self, layer: usize) -> Option<(u32, SlotState)> {
+        self.row(layer)?
+            .iter()
+            .enumerate()
+            .find(|(_, s)| matches!(s, SlotState::Landing { .. }))
+            .map(|(i, &s)| (i as u32, s))
     }
 
     /// Layer `layer`'s lowest spare slot.
@@ -934,6 +1023,73 @@ pub struct ResetReport {
     pub dropped_bytes: u64,
 }
 
+/// What a prompt call asks of the machine ([`SwapMachine::begin_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallCfg {
+    /// The least count an admitted expert has in a pick's counts.
+    pub floor: u32,
+}
+
+/// What one pick did ([`SwapMachine::call_pick`]), for the `call stream`
+/// record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallPick {
+    pub layer: usize,
+    /// Experts admitted, each in place of a pool resident sent to the host.
+    pub admitted: usize,
+    /// Pool residents the pick wanted and kept.
+    pub kept: usize,
+    /// Bytes the admitted experts' copies move.
+    pub bytes: u64,
+    /// The pick's input: FNV-1a 64 over its counts (each a little-endian
+    /// `u32`, expert order). Two calls whose picks differ at a layer with
+    /// equal digests differ in the card set they picked from, not the ids.
+    pub counts: u64,
+    /// Host microseconds the pick took: the choice, the jobs, the copy
+    /// stream's enqueues and the words.
+    pub pick_us: u64,
+    /// Of those, host microseconds it waited for the staging thread to take
+    /// in enough of the call's earlier jobs.
+    pub backlog_us: u64,
+}
+
+/// What a call did ([`SwapMachine::end_call`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallReport {
+    /// Picks that admitted at least one expert.
+    pub picks: usize,
+    pub admitted: usize,
+    pub bytes: u64,
+    pub pick_us: u64,
+    pub backlog_us: u64,
+    /// Whether the call's placement stays for the passes after it.
+    pub kept: bool,
+    /// Experts copied back onto the card when it did not.
+    pub restored: usize,
+    /// Host microseconds the end took.
+    pub end_us: u64,
+}
+
+/// An open call: what it asked, each layer's card set at its start (in the
+/// rule's layer numbering, ascending ids), and its sums so far.
+struct Call {
+    cfg: CallCfg,
+    start: Vec<Vec<u32>>,
+    report: CallReport,
+    /// The flush as the call found it.
+    flush_was: bool,
+}
+
+/// Where a copy's wait for the readers of its slot comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// This boundary's event, enqueued once for every copy issued behind it.
+    Boundary,
+    /// Enqueued by the caller already (a call's pick: the layer's reader
+    /// event).
+    Waited,
+}
+
 /// The shape a machine is built for.
 #[derive(Clone, Debug)]
 pub struct MachineCfg {
@@ -1020,6 +1176,13 @@ pub struct SwapMachine {
     changed: Vec<(usize, u32, u32)>,
     /// The error that broke the machine, named in every later refusal.
     broken: Option<String>,
+    /// Per layer of the map: a call's landed event (on the copy stream,
+    /// after a pick's copies) and reader event (on the engine stream, after
+    /// the call's last read of the layer's slots); the open call.
+    call_landed: Vec<CudaEvent>,
+    call_read: Vec<CudaEvent>,
+    call: Option<Call>,
+    picks: Vec<Flip>,
     tx: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
@@ -1104,6 +1267,12 @@ impl SwapMachine {
         let ledger = SlotLedger::of_map(slots)?;
         let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
         let boundary_event = ctx.new_event(None)?;
+        let call_landed = (0..layers.len())
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let call_read = (0..layers.len())
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<Vec<_>, _>>()?;
         // The staging thread starts last: from here the machine's drop owns
         // it, and nothing can fail between.
         let Staging { shared, tx, thread } =
@@ -1132,6 +1301,10 @@ impl SwapMachine {
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
             broken: None,
+            call_landed,
+            call_read,
+            call: None,
+            picks: Vec::new(),
             tx: Some(tx),
             thread: Some(thread),
             shared,
@@ -1381,6 +1554,15 @@ impl SwapMachine {
         }
     }
 
+    /// Refuse `what` while a prompt call is open: its map moves until
+    /// [`SwapMachine::end_call`].
+    fn refuse_in_call(&self, what: &'static str) -> Result<(), GpuError> {
+        if self.call.is_some() {
+            return Err(GpuError::state(what, "no prompt call open (end_call)"));
+        }
+        Ok(())
+    }
+
     /// `r`, breaking the machine when it is an error: the call made a change
     /// before it failed. `at` names the call, made only on an error.
     fn after_change<T>(
@@ -1447,6 +1629,7 @@ impl SwapMachine {
         const WHAT: &str = "SwapMachine::end_pass";
         let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
         if self.planned != Some(self.rule.passes()) {
             return Err(GpuError::state(WHAT, "a boundary before the pass"));
         }
@@ -1568,6 +1751,7 @@ impl SwapMachine {
         const WHAT: &str = "SwapMachine::boundary";
         let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
         let b = self.rule.passes();
         if self.planned == Some(b) {
             return Err(GpuError::state(WHAT, "a pass since the last boundary"));
@@ -1740,7 +1924,7 @@ impl SwapMachine {
             .pop()
             .ok_or_else(|| GpuError::protocol(WHAT, "more flips in flight than spares"))?;
         self.event_job[event] = self.jobs_issued;
-        let bytes = self.copy_into(slots, l, f.admit, spare, Some(f.evict))?;
+        let bytes = self.copy_into(slots, l, f.admit, spare, Some(f.evict), Gate::Boundary)?;
         self.events[event].record(&self.copy)?;
         self.ledger.row_mut(l)[spare as usize] = SlotState::Filling {
             e: f.admit,
@@ -1751,9 +1935,9 @@ impl SwapMachine {
     }
 
     /// Hand the staging thread layer `l`'s expert `id` as a job (preparing
-    /// `victim` first), then enqueue on the copy stream, behind this
-    /// boundary's event and the job's staging word, its copy into free slot
-    /// `spare` of each stack.
+    /// `victim` first), then enqueue on the copy stream, behind the wait for
+    /// the slot's readers (`gate`) and the job's staging word, its copy into
+    /// slot `spare` of each stack.
     /// Every stack's destination is resolved before anything is enqueued.
     /// The bytes it copies.
     fn copy_into(
@@ -1763,6 +1947,7 @@ impl SwapMachine {
         id: u32,
         spare: u32,
         victim: Option<u32>,
+        gate: Gate,
     ) -> Result<u64, GpuError> {
         const WHAT: &str = "SwapMachine::copy_into";
         if slots.slot(l, id) != Some(Slot::Host) {
@@ -1780,7 +1965,10 @@ impl SwapMachine {
         // thread must never enqueue so much behind unstaged jobs that the
         // stream's queue fills and the enqueue blocks. A boundary issues at
         // most the flips the rule keeps in flight (one event each); a reset
-        // stages whatever the window says. Past that the call is refused.
+        // stages whatever the window says. Past that the call is refused. A
+        // prompt call's picks stage whatever the window says too, and wait,
+        // within the deadline, until the staging thread has taken in all but
+        // that many of them ([`SwapMachine::call_backlog`]).
         let waiting = self.jobs_issued - self.shared.served.load(Ordering::Acquire);
         if !self.shared.flush.load(Ordering::Acquire) && waiting >= self.events.len() as u64 {
             return Err(GpuError::protocol(
@@ -1810,7 +1998,7 @@ impl SwapMachine {
         let d = dispatch::send(self.tx.as_ref(), job, WHAT)?;
         self.jobs_issued += 1;
         let copy = Arc::clone(&self.copy);
-        if !self.copy_waits_boundary {
+        if gate == Gate::Boundary && !self.copy_waits_boundary {
             copy.wait(&self.boundary_event)?;
             self.copy_waits_boundary = true;
         }
@@ -1854,7 +2042,7 @@ impl SwapMachine {
         let row = self.ledger.row(layer).unwrap_or(&[]);
         let mut live = 0usize;
         for (s, st) in row.iter().enumerate() {
-            if let SlotState::Live(e) = *st {
+            if let SlotState::Live(e) | SlotState::Landing { e, .. } = *st {
                 live += 1;
                 if slots.slot(layer, e) != Some(Slot::Card(s as u32)) {
                     return Err(GpuError::protocol(
@@ -1917,6 +2105,7 @@ impl SwapMachine {
     ) -> Result<ResetReport, GpuError> {
         const WHAT: &str = "SwapMachine::reset";
         self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
         self.drain_copies(WHAT)?;
         self.refuse_staging_failure(WHAT, None)?;
         let r = self.relayout(stream, slots);
@@ -2032,7 +2221,7 @@ impl SwapMachine {
                     format!("layer {l}: no free slot for seed expert {id}"),
                 )
             })?;
-            self.copy_into(slots, l, id, spare, None)?;
+            self.copy_into(slots, l, id, spare, None, Gate::Boundary)?;
             self.ledger.row_mut(l)[spare as usize] = SlotState::Reserved(id);
             placed.push((l, id, spare));
         }
@@ -2085,6 +2274,411 @@ impl SwapMachine {
         Ok(())
     }
 
+    /// Open a prompt call on the engine stream `stream`, inside the pass the
+    /// last boundary opened: the rule makes no plan and every boundary, end
+    /// of pass and reset is refused until [`SwapMachine::end_call`]; the
+    /// staging thread stages every job whatever the window says; each
+    /// layer's reader event is recorded here, after every pass before the
+    /// call. Refused by name, the machine unchanged: a call open already and
+    /// no pass open (a boundary first).
+    pub fn begin_call(&mut self, stream: &CudaStream, cfg: CallCfg) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::begin_call";
+        self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
+        if !self.pass_open() {
+            return Err(GpuError::state(WHAT, "a boundary before the call"));
+        }
+        let mut start = Vec::with_capacity(self.layers.len());
+        for i in 0..self.layers.len() {
+            let live = self.rule.live(i).map_err(|e| rule_err(WHAT, e))?;
+            start.push(live.collect());
+        }
+        for ev in &self.call_read {
+            ev.record(stream)?;
+        }
+        let flush_was = self.shared.flush.swap(true, Ordering::AcqRel);
+        self.call = Some(Call {
+            cfg,
+            start,
+            report: CallReport::default(),
+            flush_was,
+        });
+        Ok(())
+    }
+
+    /// The layer's landed event of the open call: the engine stream waits for
+    /// it before any read of the slots the layer's last pick admitted into.
+    /// A layer outside the map is refused by name.
+    pub fn call_landed(&self, layer: usize) -> Result<&CudaEvent, GpuError> {
+        let i = self.rule_layer(layer, "SwapMachine::call_landed")?;
+        Ok(&self.call_landed[i])
+    }
+
+    /// Layer `layer`'s slots have had their last read of the call so far on
+    /// the engine stream `stream`: the stream waits for the layer's landed
+    /// event, which turns its landing slots `Live`, and records the layer's
+    /// reader event, which the layer's next pick's copies wait for. Refused
+    /// by name: no call open, a layer outside the map.
+    pub fn call_reader(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::call_reader";
+        self.refuse_if_broken(WHAT)?;
+        if self.call.is_none() {
+            return Err(GpuError::state(WHAT, "a prompt call open (begin_call)"));
+        }
+        let i = self.rule_layer(layer, WHAT)?;
+        let r = self.land_layer(layer, stream);
+        self.after_change(r, || format!("the call's reader of layer {layer}"))?;
+        let r = self.call_read[i].record(stream).map_err(GpuError::from);
+        self.after_change(r, || format!("the call's reader of layer {layer}"))
+    }
+
+    /// Layer `layer`'s landing slots, if any: the engine stream `stream`
+    /// waits for the layer's landed event and they turn `Live`.
+    fn land_layer(&mut self, layer: usize, stream: &CudaStream) -> Result<(), GpuError> {
+        if self.ledger.landing(layer).is_none() {
+            return Ok(());
+        }
+        stream.wait(&self.call_landed[layer - self.layers.start])?;
+        self.ledger.land(layer);
+        Ok(())
+    }
+
+    /// The most of a call's jobs the staging thread has not taken in when a
+    /// pick issues another: the flips a boundary may keep in flight, and a
+    /// ring's worth at least, so the copy stream never holds so many copies
+    /// behind unstaged jobs that an enqueue blocks inside the driver.
+    fn call_backlog(&self) -> u64 {
+        self.events.len().max(RING_SLOTS) as u64
+    }
+
+    /// Wait, within the deadline, until the staging thread has taken in all
+    /// but [`SwapMachine::call_backlog`] of the jobs issued.
+    fn wait_backlog(&self, what: &'static str) -> Result<(), GpuError> {
+        let (bound, issued) = (self.call_backlog(), self.jobs_issued);
+        let shared = &self.shared;
+        let fits = || issued - shared.served.load(Ordering::Acquire) < bound;
+        match shared.wait_until(fits, Some(shared.deadline)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(GpuError::protocol(what, "the staging thread has stopped")),
+            Err(waited) => Err(GpuError::protocol(
+                what,
+                format!(
+                    "the staging thread took in no job of the call's last {bound} in {waited:?} \
+                     (deadline {:?})",
+                    shared.deadline
+                ),
+            )),
+        }
+    }
+
+    /// The open call's pick at layer `layer` from `counts`, the ids a batch
+    /// of the call routes there (one count per expert of the layer), at most
+    /// `cap` experts wanted ([`SwapRule::call_pick`], the call's floor): on
+    /// the engine stream `stream` and the host map `slots`, each admitted
+    /// expert's job goes to the staging thread and its copy onto the copy
+    /// stream behind the layer's reader event, the layer's landed event
+    /// after the last; then each victim goes to the host and each admitted
+    /// expert to its victim's slot, `Landing`, in the host map, the rule and
+    /// the card's copy of the layer's words (written on `stream`). Refused by
+    /// name, the machine unchanged: no call open, a layer outside the map,
+    /// counts of another length, a layer whose last pick no reader has
+    /// waited for ([`SwapMachine::call_reader`]), and a victim the host
+    /// cannot serve from resident pages. Any error after the first job is
+    /// sent breaks the machine.
+    pub fn call_pick(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        layer: usize,
+        counts: &[u32],
+        cap: usize,
+    ) -> Result<CallPick, GpuError> {
+        const WHAT: &str = "SwapMachine::call_pick";
+        let t0 = Instant::now();
+        self.refuse_if_broken(WHAT)?;
+        let floor = match &self.call {
+            Some(c) => c.cfg.floor,
+            None => return Err(GpuError::state(WHAT, "a prompt call open (begin_call)")),
+        };
+        let i = self.rule_layer(layer, WHAT)?;
+        if let Some((s, st)) = self.ledger.landing(layer) {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "layer {layer}: slot {s} is {st:?} from its last pick, which no reader has \
+                     waited for (call_reader)"
+                ),
+            ));
+        }
+        let mut picks = std::mem::take(&mut self.picks);
+        let kept = self
+            .rule
+            .call_pick(i, counts, cap, floor, &mut picks)
+            .map_err(|e| rule_err(WHAT, e));
+        let kept = match kept {
+            Ok(k) => k,
+            Err(e) => {
+                self.picks = picks;
+                return Err(e);
+            }
+        };
+        let mut report = CallPick {
+            layer,
+            kept,
+            counts: counts_digest(counts),
+            ..CallPick::default()
+        };
+        let checked = self.check_victims(slots, layer, &picks, WHAT);
+        if let Err(e) = checked {
+            self.picks = picks;
+            return Err(e);
+        }
+        let moved = self.move_pool(stream, slots, layer, &picks, &mut report);
+        let moved = self.after_change(moved, || format!("the call's pick of layer {layer}"));
+        report.admitted = picks.len();
+        self.picks = picks;
+        moved?;
+        report.pick_us = micros(t0);
+        if let Some(c) = self.call.as_mut() {
+            let r = &mut c.report;
+            r.picks += usize::from(report.admitted > 0);
+            r.admitted += report.admitted;
+            r.bytes += report.bytes;
+            r.pick_us += report.pick_us;
+            r.backlog_us += report.backlog_us;
+        }
+        Ok(report)
+    }
+
+    /// Every victim of `picks` is on the stage card in the host map and
+    /// served by the host from resident pages, else refused by name as
+    /// `what`.
+    fn check_victims(
+        &self,
+        slots: &SlotMap,
+        layer: usize,
+        picks: &[Flip],
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        for f in picks {
+            if !matches!(slots.slot(layer, f.evict), Some(Slot::Card(_))) {
+                return Err(GpuError::protocol(
+                    what,
+                    format!(
+                        "layer {layer}: victim {} of expert {} is on {:?} in the host map, not \
+                         the stage card",
+                        f.evict,
+                        f.admit,
+                        slots.slot(layer, f.evict)
+                    ),
+                ));
+            }
+            if !self.shared.source.host_resident(layer, f.evict)? {
+                return Err(not_resident(
+                    what,
+                    layer,
+                    f.evict,
+                    &format!("the victim of expert {} in a call's pick", f.admit),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A pick's changes, the first on ([`SwapMachine::call_pick`]).
+    fn move_pool(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        layer: usize,
+        picks: &[Flip],
+        report: &mut CallPick,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::call_pick";
+        if picks.is_empty() {
+            return Ok(());
+        }
+        let i = layer - self.layers.start;
+        let mut to = Vec::with_capacity(picks.len());
+        for f in picks {
+            let Some(Slot::Card(s)) = slots.slot(layer, f.evict) else {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!("layer {layer}: victim {} left the stage card", f.evict),
+                ));
+            };
+            to.push(s);
+        }
+        self.copy.wait(&self.call_read[i])?;
+        for (f, &s) in picks.iter().zip(&to) {
+            let t = Instant::now();
+            self.wait_backlog(WHAT)?;
+            report.backlog_us += micros(t);
+            report.bytes += self.copy_into(slots, layer, f.admit, s, None, Gate::Waited)?;
+        }
+        self.call_landed[i].record(&self.copy)?;
+        let moves: Vec<Flip> = picks.iter().map(|f| Flip { layer: i, ..*f }).collect();
+        self.rule.settle(&moves).map_err(|e| rule_err(WHAT, e))?;
+        for (f, &s) in picks.iter().zip(&to) {
+            self.ledger.to_landing(layer, s, f.evict, f.admit, i)?;
+            slots.evict(layer, f.evict)?;
+            slots.admit(layer, f.admit, Slot::Card(s))?;
+            self.changed.push((layer, f.evict, HOST));
+            self.changed.push((layer, f.admit, s));
+        }
+        self.write_changed(stream)?;
+        self.agree(layer, slots, WHAT)
+    }
+
+    /// End the open call on the engine stream `stream` with the host map
+    /// `slots`: every landing slot's landed event waited for and the slot
+    /// `Live`; then, when `kept`, the placement stays for the passes after
+    /// the call, else every layer returns to the set it started the call
+    /// with, the experts the call sent to the host copied back behind a
+    /// boundary event of `stream` into the slots of those it admitted, which
+    /// go back to the host. The staging window gates the staging thread
+    /// again. Refused by name, the machine unchanged: no call open. Any
+    /// error after the first change breaks the machine.
+    pub fn end_call(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        kept: bool,
+    ) -> Result<CallReport, GpuError> {
+        const WHAT: &str = "SwapMachine::end_call";
+        let t0 = Instant::now();
+        self.refuse_if_broken(WHAT)?;
+        let Some(call) = self.call.take() else {
+            return Err(GpuError::state(WHAT, "a prompt call open (begin_call)"));
+        };
+        let r = self.close_call(stream, slots, &call, kept);
+        let restored = self.after_change(r, || "the end of a call".to_string())?;
+        self.shared.flush.store(call.flush_was, Ordering::Release);
+        Ok(CallReport {
+            kept,
+            restored,
+            end_us: micros(t0),
+            ..call.report
+        })
+    }
+
+    /// The end's changes ([`SwapMachine::end_call`]); the experts restored.
+    fn close_call(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        call: &Call,
+        kept: bool,
+    ) -> Result<usize, GpuError> {
+        const WHAT: &str = "SwapMachine::end_call";
+        for l in self.layers.clone() {
+            self.land_layer(l, stream)?;
+        }
+        if kept {
+            for l in self.layers.clone() {
+                self.agree(l, slots, WHAT)?;
+            }
+            return Ok(0);
+        }
+        self.restore(stream, slots, &call.start)
+    }
+
+    /// Every layer back to `start`, its card set at the call's start (the
+    /// rule's layer numbering, ascending ids): per layer the experts the call
+    /// admitted and the ones it sent to the host pair up in ascending ids;
+    /// each admitted one goes to the host, and its slot takes the other,
+    /// copied behind a boundary event of `stream` a ring's worth at a time.
+    /// The experts copied back.
+    fn restore(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        start: &[Vec<u32>],
+    ) -> Result<usize, GpuError> {
+        const WHAT: &str = "SwapMachine::end_call";
+        let mut back = Vec::new();
+        let mut undo = Vec::new();
+        for (i, l) in self.layers.clone().enumerate() {
+            let now: Vec<u32> = self.rule.live(i).map_err(|e| rule_err(WHAT, e))?.collect();
+            let was = &start[i];
+            let came: Vec<u32> = now.iter().copied().filter(|id| !was.contains(id)).collect();
+            let went: Vec<u32> = was.iter().copied().filter(|id| !now.contains(id)).collect();
+            if came.len() != went.len() {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "layer {l}: the call admitted {came:?} and sent {went:?} to the host, \
+                         not one for one"
+                    ),
+                ));
+            }
+            for (&a, &v) in came.iter().zip(&went) {
+                if !self.shared.source.host_resident(l, a)? {
+                    return Err(not_resident(WHAT, l, a, "an expert a call admitted"));
+                }
+                let Slot::Card(s) = slots.evict(l, a)? else {
+                    return Err(GpuError::protocol(
+                        WHAT,
+                        format!("layer {l}: expert {a} the call admitted is off the stage card"),
+                    ));
+                };
+                self.ledger.row_mut(l)[s as usize] = SlotState::Reserved(v);
+                self.changed.push((l, a, HOST));
+                back.push((l, v, s));
+                undo.push(Flip {
+                    layer: i,
+                    admit: v,
+                    evict: a,
+                    live_at: self.rule.passes(),
+                });
+            }
+        }
+        self.write_changed(stream)?;
+        self.boundary_event.record(stream)?;
+        self.copy_waits_boundary = false;
+        for (n, &(l, v, s)) in back.iter().enumerate() {
+            if n > 0 && n % RING_SLOTS == 0 {
+                self.drain_copies(WHAT)?;
+            }
+            self.copy_into(slots, l, v, s, None, Gate::Boundary)?;
+        }
+        self.drain_copies(WHAT)?;
+        self.refuse_staging_failure(WHAT, None)?;
+        for &(l, v, s) in &back {
+            slots.admit(l, v, Slot::Card(s))?;
+            self.ledger.row_mut(l)[s as usize] = SlotState::Live(v);
+            self.changed.push((l, v, s));
+        }
+        self.write_changed(stream)?;
+        self.rule.settle(&undo).map_err(|e| rule_err(WHAT, e))?;
+        for l in self.layers.clone() {
+            self.agree(l, slots, WHAT)?;
+        }
+        Ok(back.len())
+    }
+
+    /// The open call's floor from its next pick on: the least count an
+    /// admitted expert has in a pick's counts ([`CallCfg::floor`]). Refused
+    /// by name with no call open.
+    pub fn set_call_floor(&mut self, floor: u32) -> Result<(), GpuError> {
+        match self.call.as_mut() {
+            Some(c) => {
+                c.cfg.floor = floor;
+                Ok(())
+            }
+            None => Err(GpuError::state(
+                "SwapMachine::set_call_floor",
+                "a prompt call open (begin_call)",
+            )),
+        }
+    }
+
+    /// Whether a prompt call is open.
+    #[must_use]
+    pub fn call_open(&self) -> bool {
+        self.call.is_some()
+    }
+
     /// Stage every queued job whatever the window says and wait, within the
     /// deadline, for the copy stream to drain; past it the refusal of
     /// `what` names the wait. The flush is as it was after.
@@ -2110,6 +2704,19 @@ impl SwapMachine {
     pub fn deadline(&self) -> Duration {
         self.shared.deadline
     }
+}
+
+/// FNV-1a 64 over `counts`, each a little-endian `u32`: a pick's input
+/// ([`CallPick::counts`]).
+fn counts_digest(counts: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in counts {
+        for b in c.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 impl Drop for SwapMachine {
@@ -2215,7 +2822,8 @@ fn not_resident(what: &'static str, layer: usize, id: u32, which: &str) -> GpuEr
 
 #[cfg(test)]
 mod tests {
-    use super::{RESIDENCY, Residency, Tally};
+    use super::super::slots::{HOST, SlotMap};
+    use super::{RESIDENCY, Residency, SlotLedger, SlotState, Tally};
 
     /// The lever registry's words for [`RESIDENCY`], from its table
     /// (`bloomery_levers::markdown`): the one list of the values a binary
@@ -2282,5 +2890,43 @@ mod tests {
         t.clear();
         t.note(2, 0, 1, 8)
             .expect("a cleared tally takes the slot again");
+    }
+
+    /// A call's pick takes a live slot from its victim to `Landing`, and the
+    /// layer's reader makes it `Live`: the slot is named throughout, only a
+    /// slot live with the named victim takes a landing, and landing touches
+    /// its own layer alone.
+    #[test]
+    fn a_pick_lands_through_landing_to_live() {
+        let h = HOST;
+        let map = SlotMap::from_rows(3..5, 4, vec![0, 1, h, h, 1, h, 0, h]).expect("two rows");
+        let mut ledger = SlotLedger::of_map(&map).expect("a ledger");
+        assert_eq!(
+            ledger.row(3),
+            Some(&[SlotState::Live(0), SlotState::Live(1)][..])
+        );
+        ledger
+            .to_landing(3, 1, 1, 3, 0)
+            .expect("slot 1 holds victim 1");
+        assert_eq!(
+            ledger.landing(3),
+            Some((1, SlotState::Landing { e: 3, event: 0 }))
+        );
+        assert_eq!(ledger.landing(4), None);
+        let before = ledger.clone();
+        for (layer, slot, victim) in [(3, 1, 1), (3, 0, 1), (4, 0, 0), (5, 0, 0), (3, 2, 0)] {
+            assert!(
+                ledger.to_landing(layer, slot, victim, 2, 0).is_err(),
+                "layer {layer} slot {slot} victim {victim}"
+            );
+            assert_eq!(ledger, before);
+        }
+        assert!(!ledger.land(4), "layer 4 holds no landing");
+        assert!(ledger.land(3));
+        assert_eq!(
+            ledger.row(3),
+            Some(&[SlotState::Live(0), SlotState::Live(3)][..])
+        );
+        assert!(!ledger.land(3) && !ledger.land(9));
     }
 }
