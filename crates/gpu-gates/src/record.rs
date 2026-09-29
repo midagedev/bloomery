@@ -975,7 +975,8 @@ pub static RESIDENCY_LEAK: Kind = Kind {
           rather than free them under a copy or a thread that may still use them: why (join: the \
           staging thread was still inside the source past the deadline; release: the copies \
           waiting on staging could not be let through; drain: the copy stream did not drain \
-          within the deadline) and the pinned bytes of the ring and the words.",
+          within the deadline; fault: the copy stream's query returned a driver error) and the \
+          pinned bytes of the ring and the words.",
     parts: &[
         key("reason", Word, ""),
         key("ring", U64, "B"),

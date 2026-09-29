@@ -546,7 +546,7 @@ mod gate {
 
         let t0 = Instant::now();
         let mut s = open(&path, bp, &cfg)?;
-        s.model_mut().body_parts(NAME)?.2.log_residency();
+        s.model_mut().body_parts(NAME)?.2.log_residency(0);
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
         let tier_at_load = tier_entries(&s)?;
         let seeds = seeds(&s)?;

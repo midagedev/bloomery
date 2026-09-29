@@ -171,6 +171,34 @@ pub struct BodyLevers {
     pub residency: Residency,
 }
 
+impl BodyLevers {
+    /// The levers a load takes together, else refused by name: a feed of one
+    /// decode step per prompt id under the residency machine. Each such step
+    /// ends as a decode pass that keeps its row (`GpuModel::step`), so the
+    /// rule would count the prompt's positions as decode rows, where the
+    /// prompt call keeps 0.
+    pub fn check(&self) -> Result<(), GpuError> {
+        refuse_steps_under_residency(self.prefill, self.residency)
+    }
+}
+
+/// [`BodyLevers::check`]'s rule over the two levers it reads.
+fn refuse_steps_under_residency(
+    prefill: PrefillMode,
+    residency: Residency,
+) -> Result<(), GpuError> {
+    match (prefill, residency) {
+        (PrefillMode::Steps, Residency::Mid { .. }) => Err(GpuError::Shape {
+            what: "BLOOMERY_PREFILL",
+            detail: "steps beside BLOOMERY_RESIDENCY: each prompt id would end a decode pass \
+                     the residency rule counts, where the prompt call keeps 0 rows; use \
+                     BLOOMERY_PREFILL=batch or BLOOMERY_RESIDENCY=off"
+                .to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// What [`open`] takes besides the file, the placement and the context: the
 /// body's levers and the placement's.
 #[derive(Clone, Debug)]
@@ -190,15 +218,17 @@ impl OpenCfg {
             what: "BLOOMERY_PREFILL",
             missing: "batch or steps",
         })?;
+        let body = BodyLevers {
+            ced: levers.ced(),
+            prefill,
+            group: levers.prefill_group(),
+            rows: RowsLevers::from_levers(levers),
+            host: levers.host(),
+            residency: Residency::parse(levers.residency())?,
+        };
+        body.check()?;
         Ok(OpenCfg {
-            body: BodyLevers {
-                ced: levers.ced(),
-                prefill,
-                group: levers.prefill_group(),
-                rows: RowsLevers::from_levers(levers),
-                host: levers.host(),
-                residency: Residency::parse(levers.residency())?,
-            },
+            body,
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })
     }
@@ -493,10 +523,17 @@ impl Drop for Shadows {
     fn drop(&mut self) {
         // The appends write the allocation and a restore reads it, both in
         // stream order: the context finishes that work before `host` frees
-        // it. A failure on the drop path is unreportable; the context records
-        // it.
+        // it. The body's drop has stopped the residency machine first, so no
+        // copy waits on a staging word here ([`Hybrid::stop_swap`]). A drop
+        // returns no error: a failed synchronize is named on stderr.
         let ctx = self.host.context();
-        ctx.record_err(ctx.synchronize());
+        if let Err(e) = ctx.synchronize() {
+            eprintln!(
+                "deepseek41 Body drop: the context did not synchronize before the ring shadows \
+                 ({} B) were freed: {e}",
+                self.host.len() * size_of::<u16>()
+            );
+        }
         for w in self.windows.drain(..) {
             DeviceTensor::release(w);
         }
@@ -941,9 +978,13 @@ impl Body {
 
     /// Keep every residency boundary's report from now on, for
     /// [`Body::take_residency_passes`]: a binary that prints the `residency
-    /// pass` records asks once. Nothing is kept until then.
-    pub fn log_residency(&mut self) {
-        self.residency_log.get_or_insert_with(Vec::new);
+    /// pass` records asks once, with the boundaries it takes at most between
+    /// two takes, `passes`, so a pass logs its report without growing the
+    /// log. Nothing is kept until then.
+    pub fn log_residency(&mut self, passes: usize) {
+        self.residency_log
+            .get_or_insert_with(Vec::new)
+            .reserve(passes);
     }
 
     /// The residency machine's source, when the load runs one.
@@ -953,11 +994,11 @@ impl Body {
     }
 
     /// The residency boundaries' reports since the last take, in order,
-    /// each with the kind of the pass it ended.
+    /// each with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
         self.residency_log
             .as_mut()
-            .map(std::mem::take)
+            .map(|log| std::mem::replace(log, Vec::with_capacity(log.capacity())))
             .unwrap_or_default()
     }
 
@@ -2095,6 +2136,7 @@ impl Body {
         tier: Option<TierOpen>,
         meta: &BodyMeta,
     ) -> Result<Deepseek41Model, GpuError> {
+        meta.levers.check()?;
         if let Some(t) = &tier {
             // The map refuses an expert on two devices before anything
             // uploads, under a name of its own: the load's map is checked again
@@ -2555,6 +2597,20 @@ impl HostServed for Body {
     fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
         self.hybrid.swap_reset(stream)
     }
+
+    fn stop_residency(&mut self) {
+        self.hybrid.stop_swap();
+    }
+}
+
+impl Drop for Body {
+    /// The residency machine stops before any field frees card or pinned
+    /// memory ([`Hybrid::stop_swap`]): `shadows` synchronizes the context,
+    /// and a copy the machine left queued behind a staging word would hold
+    /// that wait until the machine's own drop, which comes later.
+    fn drop(&mut self) {
+        self.hybrid.stop_swap();
+    }
 }
 
 impl Rows for Body {
@@ -2830,4 +2886,31 @@ pub fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
     }
     let row = bytes.ok_or_else(|| refuse("the model has no engram site".to_string()))?;
     usize::try_from(row).map_err(|_| refuse(format!("rows of {row} bytes")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_step_feed_under_residency_is_refused() {
+        let mid = Residency::Mid {
+            pinned: 4,
+            spares: 1,
+        };
+        let refused = refuse_steps_under_residency(PrefillMode::Steps, mid)
+            .expect_err("a step feed under the residency machine");
+        assert!(
+            refused.to_string().contains("BLOOMERY_RESIDENCY"),
+            "the refusal names the lever: {refused}"
+        );
+        for (prefill, residency) in [
+            (PrefillMode::Batch, mid),
+            (PrefillMode::Steps, Residency::Off),
+            (PrefillMode::Batch, Residency::Off),
+        ] {
+            refuse_steps_under_residency(prefill, residency)
+                .unwrap_or_else(|e| panic!("{prefill:?} under {residency:?}: {e}"));
+        }
+    }
 }
