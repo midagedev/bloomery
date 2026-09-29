@@ -3,7 +3,9 @@
 //! (`--place bp`), the residency machine over the stage card's routed stacks
 //! at `mid-p40-s1`, groups of [`GROUP`] batches, streaming on at the load
 //! (set here; the lever itself is refused, so the environment cannot move
-//! it). One load. Each clause starts from a clear (the residency back to its
+//! it), the host set locked (set here too, `BLOOMERY_HOST_LOCK` refused: a
+//! pick refuses a victim the host would serve from the file, and another
+//! process's reads reclaim populated pages). One load. Each clause starts from a clear (the residency back to its
 //! seed) and names its mutant:
 //!
 //! - `s2` (DEMOTE: a streamed expert gives the bits a card-resident one
@@ -18,15 +20,19 @@
 //!   after B are those after A (mutant: the card sum launched before the
 //!   streamed pass).
 //! - `s1` (scripted replay: the placement a call reaches is a function of
-//!   its ids and its start, not of when the copies land): [`S1_P`] prose ids
-//!   in groups past the first, then [`S1_STEPS`] greedy steps, twice — free,
-//!   and with the machine's copy stream held by a host flag for [`HOLD`] from
-//!   before the call, so every pick's copies land late. The two give the
-//!   same picks per (group, layer) (admitted, kept, bytes), the same call
-//!   argmax and logits and the same steps' tokens and logits; the free call
-//!   admitted at least one expert and picked in a group past the first
-//!   (mutant: the engine stream does not wait for a pick's copies before the
-//!   streamed pass).
+//!   its ids and its start, not of when the copies land): [`S1_HALF`] prose
+//!   ids then as many code ids, two groups, then [`S1_STEPS`] greedy steps,
+//!   twice — free, and with the machine's copy stream held by a host flag
+//!   for [`HOLD`] from before the call, so every pick's copies land late (a
+//!   guard raises the flag on every path out of the clause). The two give
+//!   the same picks per (group, layer) (admitted, kept, bytes, the counts'
+//!   digest), the same call argmax and logits and the same steps' tokens and
+//!   logits; the free call admitted at least one expert and admitted in a
+//!   group past the first (mutant: `s4`'s, under which the call reads
+//!   what the call before it left in the block buffers a group shares, and
+//!   the two arms follow different calls). Both arms read a slot alike when
+//!   the engine does not wait for a pick's copies, so that mutant is `s2`'s:
+//!   its call A reads slots mid-copy and faults.
 //! - `s3` (end to end against `off`): on [`S3_WINDOWS`] windows of [`S3_P`]
 //!   ids each of the prose and the code corpus, the call's argmax and
 //!   [`S3_STEPS`] greedy steps with streaming off and on, each from a clear;
@@ -34,6 +40,27 @@
 //!   [`GREEDY_MARGIN`] (a near tie, the long gate's rule), and every `on`
 //!   call admitted at least one expert (mutant: the pick's admitted experts
 //!   left out of the streamed places).
+//! - `s4` (a group of two streams what it runs off: a streamed pass that
+//!   admits nothing is the plain pass, bit for bit): [`S4_P`] prose ids,
+//!   two batches, one group of two, so the next batch's route is enqueued
+//!   ahead of this one's host serve while the batches share the block's
+//!   norm, routing and places. Call A streams and admits; the seat's reset
+//!   keeps its placement; call B, the same ids streaming, admits none; after
+//!   another reset call C, the same ids with streaming off, runs on the same
+//!   placement. B's argmax and logits equal C's. Premises, each named: A
+//!   admitted an expert; B admitted none; the card sets after C are those
+//!   after B (mutant: the next batch's route enqueued between the pick and
+//!   the streamed pass, which then reads that batch's routing and places;
+//!   `s3`'s near-tie rule did not see it on four windows of this size).
+//!
+//! Each clause runs under a watchdog ([`watched`]): past [`CLAUSE_BOUND`] it
+//! names the clause, waits [`CLAUSE_GRACE`] (a stack watch,
+//! `BLOOMERY_GATE_STACKS`, dumps the threads in between) and ends the
+//! process, so a wait with no bound is a named red, not the runner's bound.
+//! So does the teardown, after a reset: a flip's copy waiting for the
+//! staging of a job not yet due holds the machine's copy stream, and every
+//! free of device or pinned memory (a `DeviceBuffer`'s drop synchronizes the
+//! context) waits for it.
 //!
 //! `off` keeps a prompt call bit for bit the decode steps' (the prefill
 //! gate); this gate judges `on`, whose bits are the band's.
@@ -59,6 +86,7 @@ mod ds41_open;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use crate::ds41_open::{fnv, open};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use app::Session;
@@ -71,7 +99,7 @@ mod gate {
     use bloomery_gpu_gates::{
         GREEDY_MARGIN, GateError, checks_failed, data_dir, ref_model_path, verdict,
     };
-    use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
+    use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_POPULATE, R8};
     use gguf::Split;
     use model::arch::deepseek41::place::{self, PlanInputs};
     use runtime::{Out, Target, Want};
@@ -86,8 +114,17 @@ mod gate {
     const GROUP: usize = 2;
     /// `s2`'s prompt: one batch, one group, one pick a layer.
     const S2_P: usize = 512;
-    /// `s1`'s prompt: three batches, two groups, so a layer picks twice.
-    const S1_P: usize = 1536;
+    /// Half of `s1`'s prompt: prose ids, then as many code ids. A lone last
+    /// batch joins the group before it, so a second group needs four
+    /// batches: 2048 ids are four of 512, groups {0, 1} and {2, 3}, each
+    /// picking from its first batch at a floor of 64 (`STREAM_FLOOR` a batch
+    /// of the group). The first group's pick moves each pool toward what
+    /// prose routes most; the second counts a code batch, whose hottest
+    /// experts are others (why code windows are their own tables), so an
+    /// expert off the card clears the floor and a pool resident's count in
+    /// a later group [derived]. At 1536 prose ids (three batches, one group
+    /// of three) no later group exists.
+    const S1_HALF: usize = 1024;
     /// Greedy steps after `s1`'s call.
     const S1_STEPS: usize = 8;
     /// How long `s1` holds the copy stream: past the call's first picks, far
@@ -99,6 +136,62 @@ mod gate {
     const S3_P: usize = 512;
     /// Greedy steps after each of `s3`'s calls.
     const S3_STEPS: usize = 8;
+    /// `s4`'s prompt: two batches, one group of two.
+    const S4_P: usize = 1024;
+    /// A clause's bound: several times the slowest clause's time in a clean
+    /// run (each prints its own), so past it one waits on something that
+    /// will not come.
+    const CLAUSE_BOUND: Duration = Duration::from_secs(300);
+    /// How long the watchdog waits after naming a clause past its bound
+    /// before it ends the process.
+    const CLAUSE_GRACE: Duration = Duration::from_secs(60);
+
+    /// `f`, the clause `clause`, under a watchdog: past [`CLAUSE_BOUND`] it
+    /// names the clause red and, [`CLAUSE_GRACE`] later, ends the process —
+    /// a host blocked with no bound (inside the driver, say) never returns.
+    fn watched<T>(
+        clause: &'static str,
+        f: impl FnOnce() -> Result<T, GateError>,
+    ) -> Result<T, GateError> {
+        let (done, watch) = mpsc::channel::<()>();
+        let dog = std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(CLAUSE_BOUND) {
+                println!(
+                    "{clause}: the clause did not finish in {CLAUSE_BOUND:?}: a wait with no \
+                     bound: FAIL"
+                );
+                std::thread::sleep(CLAUSE_GRACE);
+                std::process::abort();
+            }
+        });
+        let t0 = Instant::now();
+        let r = f();
+        let _ = done.send(());
+        dog.join()
+            .map_err(|_| format!("{clause}: the watchdog thread panicked"))?;
+        println!("{clause}: {:.1} s", t0.elapsed().as_secs_f64());
+        r
+    }
+
+    /// The hold on the machine's copy stream: flag 0 of the flags a copy
+    /// stream wait was enqueued on, raised by [`Hold::release`] and again on
+    /// drop, so every path out of the clause — a FAIL, an early `?`, a
+    /// panic — lets the stream go on.
+    struct Hold<'a>(&'a HostFlags);
+
+    impl Hold<'_> {
+        fn release(&self) {
+            if let Err(e) = self.0.raise(0) {
+                eprintln!("{NAME}: the copy stream's hold was not released: {e}");
+            }
+        }
+    }
+
+    impl Drop for Hold<'_> {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     /// Ids `skip .. skip + n` of `$BLOOMERY_DATA/engram/corpus-<name>.ids`.
     fn corpus(name: &str, skip: usize, n: usize) -> Result<Vec<u32>, GateError> {
@@ -160,8 +253,8 @@ mod gate {
     }
 
     /// A pick's record without its times: (group, layer, admitted, kept,
-    /// bytes).
-    type Pick = (usize, usize, usize, usize, u64);
+    /// bytes, the counts' digest).
+    type Pick = (usize, usize, usize, usize, u64, u64);
 
     /// A prompt call and the steps after it.
     struct Run {
@@ -197,7 +290,7 @@ mod gate {
             out,
             picks: picks
                 .iter()
-                .map(|(g, p)| (*g, p.layer, p.admitted, p.kept, p.bytes))
+                .map(|(g, p)| (*g, p.layer, p.admitted, p.kept, p.bytes, p.counts))
                 .collect(),
             end,
         })
@@ -267,14 +360,16 @@ mod gate {
         Ok(ok)
     }
 
-    /// `s1`: the call and its steps, free and with the copy stream held.
-    fn s1(s: &mut Session<Body>) -> Result<bool, GateError> {
-        let ids = corpus("prose", 0, S1_P)?;
+    /// `s1`: the call and its steps, free and with the copy stream held on
+    /// flag 0 of `flags`.
+    fn s1(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateError> {
+        let mut ids = corpus("prose", 0, S1_HALF)?;
+        ids.extend(corpus("code", 0, S1_HALF)?);
         s.clear()?;
         let free = call(s, &ids, S1_STEPS)?;
         s.clear()?;
-        let flags = HostFlags::new(s.model().gpu().context(), 1)?;
         flags.clear(0)?;
+        let hold = Hold(flags);
         {
             let m = s.model();
             let machine = m
@@ -288,13 +383,23 @@ mod gate {
         let held = std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(HOLD);
-                // A raise that fails leaves the stream held: the machine's
-                // deadline names it.
-                let _ = flags.raise(0);
+                hold.release();
             });
             call(s, &ids, S1_STEPS)
-        })?;
+        });
+        drop(hold);
+        let held = held?;
         let held_ms = t.elapsed().as_secs_f64() * 1e3;
+        if let Some(k) = (0..free.picks.len().max(held.picks.len()))
+            .find(|&k| free.picks.get(k) != held.picks.get(k))
+        {
+            println!(
+                "s1: first pick that differs, #{k} (group, layer, admitted, kept, bytes, \
+                 counts): free {:x?}, held {:x?}",
+                free.picks.get(k),
+                held.picks.get(k)
+            );
+        }
         let later = free.picks.iter().any(|p| p.0 >= 1 && p.2 > 0);
         let kept = free.end.is_some_and(|r| r.kept && r.restored == 0);
         let ok = free.picks == held.picks
@@ -315,13 +420,67 @@ mod gate {
         Ok(ok)
     }
 
-    /// `s3`: each window with streaming off, then on.
-    fn s3(s: &mut Session<Body>) -> Result<bool, GateError> {
+    /// `s4`: a streaming call that admits, then the same call streaming on
+    /// its placement and with streaming off.
+    fn s4(s: &mut Session<Body>) -> Result<bool, GateError> {
+        let ids = corpus("prose", 0, S4_P)?;
+        s.clear()?;
+        let a = call(s, &ids, 0)?;
+        Target::reset(s)?;
+        let b = call(s, &ids, 0)?;
+        let after_b = card_sets(s)?;
+        Target::reset(s)?;
+        set_stream(s, false)?;
+        let c = call(s, &ids, 0);
+        set_stream(s, true)?;
+        let c = c?;
+        let after_c = card_sets(s)?;
+        let premises = [
+            ("A admitted an expert", a.admitted() > 0),
+            ("B admitted none", b.admitted() == 0),
+            ("the card sets after C are B's", after_b == after_c),
+        ];
+        let failed: Vec<&str> = premises
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(what, _)| *what)
+            .collect();
+        let same = b.out == c.out;
+        let ok = failed.is_empty() && same;
+        println!(
+            "s4: {S4_P} ids in a group of two; call A admitted {} experts over {} picks, B {}; \
+             B (streaming) argmax {} and logits {:016x} against C (off) {} {:016x}: same \
+             {same}{}: {}",
+            a.admitted(),
+            a.picks.len(),
+            b.admitted(),
+            b.out[0].argmax,
+            b.out[0].fnv,
+            c.out[0].argmax,
+            c.out[0].fnv,
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("; premises failed: {}", failed.join(", "))
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `s3`: [`S3_STEPS`] steps after each of `windows` windows of `p` ids of
+    /// each corpus, with streaming off, then on, each from a clear.
+    fn on_off(
+        s: &mut Session<Body>,
+        clause: &str,
+        p: usize,
+        windows: usize,
+    ) -> Result<bool, GateError> {
         let mut ok = true;
         let (mut differ, mut idle) = (0, 0);
         for name in ["prose", "code"] {
-            for w in 0..S3_WINDOWS {
-                let ids = corpus(name, w * S3_P, S3_P)?;
+            for w in 0..windows {
+                let ids = corpus(name, w * p, p)?;
                 set_stream(s, false)?;
                 s.clear()?;
                 let off = call(s, &ids, S3_STEPS)?;
@@ -354,7 +513,7 @@ mod gate {
                     }
                 };
                 println!(
-                    "s3 {name} window {w}: on admitted {} over {} picks; {line}",
+                    "{clause} {name} window {w}: on admitted {} over {} picks; {line}",
                     on.admitted(),
                     on.picks.len()
                 );
@@ -362,27 +521,30 @@ mod gate {
         }
         ok &= idle == 0;
         println!(
-            "s3: {} windows, {differ} differ from off within the call and {S3_STEPS} steps, {idle} \
-             calls admitted nothing; every difference a near tie below {GREEDY_MARGIN}: {}",
-            2 * S3_WINDOWS,
+            "{clause}: {} windows of {p} ids, {differ} differ from off within the call and \
+             {S3_STEPS} steps, {idle} calls admitted nothing; every difference a near tie below \
+             {GREEDY_MARGIN}: {}",
+            2 * windows,
             verdict(ok)
         );
         Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[
-            ENGRAM_HELPER,
-            HOST_POPULATE,
-            HOST_LOCK,
-            CARD_DONTNEED,
-            R8,
-        ])?;
+        let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOST_POPULATE, CARD_DONTNEED, R8])?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = RESIDENCY;
         cfg.body.prefill = PrefillMode::Batch;
         cfg.body.group = GROUP;
         cfg.body.hoststream = true;
+        // Every pick's victims must be host-resident, and populated pages
+        // alone are reclaimed under another process's reads.
+        cfg.body.host.lock = true;
+        // Declared before the session, so freed after it: freeing mapped
+        // host memory waits for every stream of the context, and the
+        // machine's copy stream holds copies whose staging waits for the
+        // next pass (a job not yet due) until the machine drops.
+        let flags: HostFlags;
         let path = ref_model_path()?;
         let inputs = PlanInputs::read(
             &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
@@ -391,14 +553,35 @@ mod gate {
         let t0 = Instant::now();
         let mut s = open(&path, bp, &cfg)?;
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
-        let mut pass = s2(&mut s)?;
-        pass &= s1(&mut s)?;
-        pass &= s3(&mut s)?;
-        if pass {
-            println!("{NAME}: every clause passed");
+        flags = HostFlags::new(s.model().gpu().context(), 1)?;
+        let clauses = |s: &mut Session<Body>| -> Result<bool, GateError> {
+            let mut pass = watched("s2", || s2(s))?;
+            pass &= watched("s1", || s1(s, &flags))?;
+            pass &= watched("s3", || on_off(s, "s3", S3_P, S3_WINDOWS))?;
+            pass &= watched("s4", || s4(s))?;
+            Ok(pass)
+        };
+        let pass = clauses(&mut s);
+        // Every free of device or pinned host memory waits for every stream
+        // of the context, and the machine's copy stream can hold a copy that
+        // waits for the staging of a flip not yet due, which only a pass or
+        // a reset lets through: the reset stages and drains it before the
+        // session frees anything.
+        // Workaround: r3fix's stop-first Drop (HostTier::stop_swap) removes it.
+        let down = watched("teardown", move || {
+            s.clear()?;
+            drop(s);
             Ok(())
-        } else {
-            Err(checks_failed())
+        });
+        match (pass, down) {
+            (Ok(true), Ok(())) => {
+                println!("{NAME}: every clause passed");
+                Ok(())
+            }
+            (Ok(false), Ok(())) => Err(checks_failed()),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(_), Err(t)) => Err(t),
+            (Err(e), Err(t)) => Err(format!("{e}; then the teardown: {t}").into()),
         }
     }
 }

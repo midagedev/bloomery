@@ -69,10 +69,13 @@
 //! pick sends the pool's coldest to the host and copies the hottest host
 //! experts over them (`SwapMachine::call_pick`, [`STREAM_FLOOR`] a batch of
 //! the group the least count admitted); the block's places are taken again
-//! under the moved map, its kept card experts run, the next layer-batch's
-//! route is enqueued, then — the engine stream waiting for the pick's
-//! copies — the admitted experts run over the streamed places, merged back,
-//! and the card sum reads every card slot in slot order. The group's later
+//! under the moved map, its kept card experts run, then — the engine stream
+//! waiting for the pick's copies — the admitted experts run over the
+//! streamed places, merged back, and the card sum reads every card slot in
+//! slot order; only then is the next layer-batch's route enqueued, since it
+//! writes the norm, routing and places every batch of the group shares at
+//! the same offsets (the host still serves this layer-batch while the card
+//! routes the next). The group's later
 //! batches route under the moved map. After a layer's last batch of a group
 //! the layer's reader event is recorded, which the next group's pick copies
 //! wait for. The call's placement stays for the decode after it; a call that
@@ -1939,15 +1942,16 @@ impl Body {
             if card && (*picked >> i) & 1 == 0 && now.block.is_some() {
                 *picked |= 1 << i;
                 cx.shadow_pick(&members[j], i, &now)?;
-                if ahead && let Some(&(i2, j2)) = items.get(x + 1) {
-                    next = Some(cx.route(&mut members[j2], i2, observe)?);
-                }
                 cx.shadow_stream(&members[j], i, &now)?;
             } else {
                 cx.shadow(&members[j], i, &now)?;
-                if ahead && let Some(&(i2, j2)) = items.get(x + 1) {
-                    next = Some(cx.route(&mut members[j2], i2, observe)?);
-                }
+            }
+            // The next route writes the block buffers (its norm, routing and
+            // places) every batch of the group shares at the same offsets:
+            // it follows this layer-batch's last reader of them, the card
+            // sum (or the held routing's copy).
+            if ahead && let Some(&(i2, j2)) = items.get(x + 1) {
+                next = Some(cx.route(&mut members[j2], i2, observe)?);
             }
             if card && j + 1 == g {
                 cx.hybrid.call_reader(l, gpu.stream())?;

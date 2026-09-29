@@ -958,14 +958,16 @@ pub static CALL_STREAM: Kind = Kind {
     doc: "A prompt call's pick at one layer of one group (host streaming: the residency pool \
           takes the group's hottest host experts): the group, the layer, the experts admitted \
           (each in place of a pool resident sent to the host) and the pool residents kept, the \
-          bytes the admitted experts' copies move, and the host's microseconds in the pick, of \
-          them waiting for the staging thread to take in the call's earlier jobs.",
+          bytes the admitted experts' copies move, the pick's input (FNV-1a 64 of its counts, \
+          hex), and the host's microseconds in the pick, of them waiting for the staging thread \
+          to take in the call's earlier jobs.",
     parts: &[
         key("group", U64, ""),
         key("layer", U64, ""),
         key("admitted", U64, ""),
         key("kept", U64, ""),
         key("bytes", U64, "B"),
+        key("counts", Word, ""),
         key("pick_us", U64, "us"),
         key("backlog_us", U64, "us"),
     ],
@@ -1683,6 +1685,7 @@ pub fn call_stream(group: usize, p: &CallPick) -> Record {
         .u("admitted", p.admitted)
         .u("kept", p.kept)
         .u("bytes", p.bytes)
+        .w("counts", format!("{:016x}", p.counts))
         .u("pick_us", p.pick_us)
         .u("backlog_us", p.backlog_us)
 }

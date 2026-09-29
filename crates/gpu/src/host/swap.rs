@@ -58,8 +58,12 @@
 //! makes — for a landing job, for a ring slot's last copy, for the copy
 //! stream at a reset or a drop — ends by [`MachineCfg::deadline`] with a
 //! named error; only a job not yet due waits for the window as long as the
-//! window stays closed. A panic on the staging thread is a staging failure
-//! of its job, published like any other.
+//! window stays closed. While such a job's copy is queued, the copy stream
+//! does not drain until the next pass or a reset, so any call that
+//! synchronizes the context — a `DeviceBuffer` drop, `cuMemFreeHost` —
+//! waits for it: a caller frees device or pinned memory only after a reset
+//! or once the machine has dropped. A panic on the staging thread is a
+//! staging failure of its job, published like any other.
 //!
 //! **Broken.** An error after a call's first change — a boundary's first
 //! engine stream wait, `end_pass`'s first fold into the rule, a reset's first
@@ -998,6 +1002,10 @@ pub struct CallPick {
     pub kept: usize,
     /// Bytes the admitted experts' copies move.
     pub bytes: u64,
+    /// The pick's input: FNV-1a 64 over its counts (each a little-endian
+    /// `u32`, expert order). Two calls whose picks differ at a layer with
+    /// equal digests differ in the card set they picked from, not the ids.
+    pub counts: u64,
     /// Host microseconds the pick took: the choice, the jobs, the copy
     /// stream's enqueues and the words.
     pub pick_us: u64,
@@ -2321,6 +2329,7 @@ impl SwapMachine {
         let mut report = CallPick {
             layer,
             kept,
+            counts: counts_digest(counts),
             ..CallPick::default()
         };
         let checked = self.check_victims(slots, layer, &picks, WHAT);
@@ -2592,6 +2601,19 @@ impl SwapMachine {
         self.shared.flush.store(was, Ordering::Release);
         r
     }
+}
+
+/// FNV-1a 64 over `counts`, each a little-endian `u32`: a pick's input
+/// ([`CallPick::counts`]).
+fn counts_digest(counts: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in counts {
+        for b in c.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 /// Why [`poll_drained`] stopped short.
