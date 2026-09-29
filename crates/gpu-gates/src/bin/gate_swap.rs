@@ -115,6 +115,17 @@
 //!   the wrapper without that drop, today's field order, which waits in the
 //!   synchronize for ever — the queue arm's watchdog names it and ends the
 //!   process.
+//! - dropq (tier): the same machine inside a real [`HostTier`] — a boundary,
+//!   a seed map, a started machine, the passes driven through the tier's own
+//!   `keep_rows` and `swap_boundary` — dropped as the engine drops the tier:
+//!   its `Drop` stops the machine before any field frees, so the drop ends
+//!   within the deadline with no leak. Its mutant: production `stop_swap`'s
+//!   body emptied, which leaves the drop freeing the boundary's buffers
+//!   while the copy still waits — the clause's watchdog names it.
+//! - dropq (free): a plain [`DeviceBuffer`] free with the same copy queued,
+//!   timed on its own thread: whether a free blocks behind a copy nothing
+//!   stages, which the stop-before-any-free order rests on. A measurement,
+//!   not a verdict — the line names the outcome either way.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -134,17 +145,20 @@ mod gate {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
     use bloomery_gpu::host::swap::{
         Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState, SwapMachine, SwapSource,
         Transform, set_leak_sink,
     };
-    use bloomery_gpu::{Gpu, GpuError, Graph, HostFlags};
+    use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
+    use model::Tensor2;
     use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
 
     const LAYERS: Range<usize> = 2..6;
@@ -196,6 +210,13 @@ mod gate {
     /// The boundary-event arm's live delay: with `every` 2 a flip lands at a
     /// planning boundary.
     const DELAY_EVEN: u64 = 2;
+    /// The tier arm's boundary width: nothing serves on it, it only has to
+    /// allocate and free as the engine's does.
+    const TIER_HIDDEN: usize = 256;
+    /// How long the free arm looks at a plain free with a copy queued behind
+    /// an unstaged job before it releases the machine behind it: past this
+    /// the free is blocked, and only the machine's drop ends the block.
+    const FREE_LOOK: Duration = Duration::from_secs(2);
     /// The host's rule: its sum is the card's under this mask, so a pass's
     /// value says which side served each id.
     const HOST_MASK: u32 = 0x1234_5678;
@@ -2126,6 +2147,23 @@ mod gate {
         }
     }
 
+    /// Host experts for the tier arm's `HostTier`: no service runs there, so
+    /// one writes the zeros an empty list does.
+    struct NoExperts;
+
+    impl HostExperts for NoExperts {
+        fn experts_into(
+            &mut self,
+            _layer: usize,
+            _x: &Tensor2,
+            _experts: &[(u32, f32)],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            out.fill(0.0);
+            Ok(())
+        }
+    }
+
     /// An owner that drops the context's synchronize before its machine, as
     /// `Body` declares `shadows` before `hybrid`: its drop stops the machine
     /// first, as `HostTier::stop_swap` does for `Body`, `GpuModel` and the
@@ -2197,6 +2235,195 @@ mod gate {
         Ok(ok)
     }
 
+    /// dropq (tier): the tier arm of the drop order — a real [`HostTier`]
+    /// holding a machine with a copy queued behind a staging word, driven to
+    /// the first flip boundary through the tier's own `keep_rows` and
+    /// `swap_boundary`, then dropped as the engine drops a tier: its `Drop`
+    /// stops the machine before any field frees, so the drop ends within the
+    /// machine's deadline with no leak.
+    fn dropq_tier(gpu: &Gpu, trace: &Trace, a: &Run) -> Result<bool, GateError> {
+        let (b_first, _, _) = first_flip(a)?;
+        // The stacks and the map outlive the tier, as the model's weights
+        // and its map copy do; the tier is dropped inside the clause.
+        let stacks = Stacks::new(gpu)?;
+        let source = Arc::new(Synth::new(&stacks, N_L, Faults::default()));
+        let slots = seed_map(&[])?;
+        let view = Arc::new(DeviceTensor::upload(
+            gpu.stream(),
+            &slots.stage_view(),
+            L,
+            E,
+        )?);
+        let boundary = Boundary::with_rows(
+            gpu.context(),
+            gpu.stream(),
+            BoundaryShape {
+                hidden: TIER_HIDDEN,
+                n_used: K,
+            },
+            MAX_ROWS,
+        )?;
+        let mut tier = HostTier::new(boundary, slots, NoExperts, L)?;
+        tier.start_swap(
+            gpu.context(),
+            gpu.stream(),
+            view,
+            source,
+            cfg(DELAY, DEADLINE),
+        )?;
+        let window = tier.swap().ok_or("gate_swap: the tier's machine")?.window();
+        for (rows, kept) in &trace.passes[..b_first as usize] {
+            tier.swap_boundary(gpu.stream())?
+                .ok_or("gate_swap: the tier's boundary")?;
+            note_rows(
+                tier.swap_tally().ok_or("gate_swap: the tier's tally")?,
+                rows,
+            )?;
+            tier.keep_rows(*kept, PassKind::Driver);
+        }
+        window.store(0, Ordering::Release);
+        let made = tier
+            .swap_boundary(gpu.stream())?
+            .ok_or("gate_swap: the tier's boundary")?
+            .1
+            .made;
+        std::thread::sleep(HOLD_SETTLE);
+        let waiting = tier
+            .swap()
+            .is_some_and(|m| m.copy_stream().query() == Ok(false));
+        let leaks_before = leaks()?.len();
+        let took = watched(
+            format!(
+                "dropq (tier): the drop did not finish in {QUEUE_BOUND:?}: the tier freed its \
+                 boundary while a copy waited on a staging word the machine had not released — \
+                 production stop_swap's order FAIL"
+            ),
+            || {
+                let t0 = Instant::now();
+                drop(tier);
+                t0.elapsed()
+            },
+        );
+        let leaked = leaks()?.len() - leaks_before;
+        let ok = made > 0 && waiting && took < DEADLINE && leaked == 0;
+        println!(
+            "dropq (tier): the tier's own keep_rows and swap_boundary drove the trace to boundary \
+             {b_first}, which made {made} flips under a closed window (the copy stream {} before \
+             the drop); the tier dropped, its machine stopped first, in {:.1} ms (deadline \
+             {DEADLINE:?}), {leaked} leaks: {}",
+            if waiting { "waiting" } else { "idle" },
+            took.as_secs_f64() * 1e3,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// dropq (free): a plain [`DeviceBuffer`] free with the same copy queued
+    /// behind a staging word, timed on its own thread so the main thread can
+    /// still drop the machine — the only thing that would end a block. The
+    /// line names the outcome either way; it never fails the clause, for the
+    /// stop-before-any-free order rests on what it measures.
+    fn dropq_free(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let (b_first, _, _) = first_flip(a)?;
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_first as usize,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let mut machine = Some(r.machine.take().ok_or("gate_swap: no machine")?);
+        let window = machine.as_ref().ok_or("gate_swap: no machine")?.window();
+        window.store(0, Ordering::Release);
+        let made = machine
+            .as_mut()
+            .ok_or("gate_swap: no machine")?
+            .boundary(gpu.stream(), &mut r.slots)?
+            .made;
+        std::thread::sleep(HOLD_SETTLE);
+        let waiting = machine
+            .as_ref()
+            .is_some_and(|m| m.copy_stream().query() == Ok(false));
+        let leaks_before = leaks()?.len();
+        // A small synchronous allocation, its zeroing done: a plain cuMemFree
+        // in `DeviceBuffer`'s drop, the free the model's graphs and heads
+        // make — of memory the queued copy never touches.
+        let buf = DeviceBuffer::<u32>::zeroed(gpu.stream(), 1)?;
+        gpu.stream().synchronize()?;
+        let (freed, back) = mpsc::channel::<Duration>();
+        let freeing = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            drop(buf);
+            let _ = freed.send(t0.elapsed());
+        });
+        let release = format!(
+            "dropq (free): the machine's drop did not finish in {QUEUE_BOUND:?}: the stop that \
+             releases every staging wait did not return FAIL"
+        );
+        let stop = |machine: &mut Option<SwapMachine>| {
+            watched(release, || {
+                let t0 = Instant::now();
+                drop(machine.take());
+                t0.elapsed()
+            })
+        };
+        let (free_took, blocked, machine_ms) = match back.recv_timeout(FREE_LOOK) {
+            Ok(took) => {
+                let _ = freeing.join();
+                let ms = stop(&mut machine).as_secs_f64() * 1e3;
+                (Some(took), false, ms)
+            }
+            Err(_) => {
+                // The free is still behind the queued copy: the machine's
+                // drop releases the staging waits, the copy runs, and the
+                // block ends — the free's own thread reports when.
+                let ms = stop(&mut machine).as_secs_f64() * 1e3;
+                let took = back.recv_timeout(QUEUE_BOUND).ok();
+                if took.is_some() {
+                    let _ = freeing.join();
+                }
+                (took, true, ms)
+            }
+        };
+        let leaked = leaks()?.len() - leaks_before;
+        let ok = driven && made > 0 && waiting && leaked == 0;
+        let free = if !blocked {
+            format!(
+                "returned in {:.0} µs while the copy was queued",
+                free_took.map_or(0.0, |d| d.as_secs_f64() * 1e6)
+            )
+        } else {
+            format!(
+                "blocked for at least {FREE_LOOK:?}, the machine's drop ({machine_ms:.1} ms) {} \
+                 it",
+                if free_took.is_some() {
+                    format!(
+                        "then ended it, the free returning in {:.0} µs",
+                        free_took.map_or(0.0, |d| d.as_secs_f64() * 1e6)
+                    )
+                } else {
+                    format!("did not end it within {QUEUE_BOUND:?}")
+                }
+            )
+        };
+        println!(
+            "dropq (free): boundary {b_first} made {made} flips under a closed window, the copy \
+             stream {} before it; a plain free of an unrelated buffer {free}; the machine's own \
+             drop took {machine_ms:.1} ms, {leaked} leaks: {}",
+            if waiting { "waiting" } else { "idle" },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -2247,6 +2474,8 @@ mod gate {
             );
         }
         ok &= dropq(&gpu, &pm, &trace, &a)?;
+        ok &= dropq_tier(&gpu, &trace, &a)?;
+        ok &= dropq_free(&gpu, &pm, &trace, &a)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];
@@ -2266,7 +2495,10 @@ mod gate {
                  serve an id twice or not at all; a reset with flips in flight returns to the \
                  seed; tier entries never move; a staging failure, a panic, a broken machine, a \
                  bad tally, a non-resident victim and a host wait past its deadline are each a \
-                 named error, and a dropped machine leaves no copy waiting on the card; pinned seed experts never move."
+                 named error, and a dropped machine leaves no copy waiting on the card; an owner \
+                 that syncs or frees after its machine, and the host tier itself, drop within \
+                 the machine's deadline (dropq), and a plain free against a queued copy is named \
+                 (dropq free); pinned seed experts never move."
             );
             Ok(())
         } else {

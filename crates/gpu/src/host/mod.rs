@@ -660,6 +660,18 @@ impl<H> HostTier<H> {
         drop(self.swap.take());
         self.swap_kept = None;
     }
+
+    /// The step port's residency tally, the machine's shape once one runs:
+    /// what a served pass's routed ids are noted into and the next
+    /// [`HostTier::swap_boundary`] folds. A gate that drives a machine's
+    /// passes without the handoff protocol notes into it through here;
+    /// `None` without a machine. No engine caller: the step port's services
+    /// note as they serve.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn swap_tally(&mut self) -> Option<&mut swap::Tally> {
+        self.swap.is_some().then_some(&mut self.step.tally)
+    }
 }
 
 impl<H> Drop for HostTier<H> {
