@@ -1874,6 +1874,7 @@ impl Body {
             hp,
             need,
             tier,
+            picked,
             ..
         } = self;
         let batch = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1921,8 +1922,9 @@ impl Body {
         // one's join.
         let ahead = g >= 2;
         let streaming = cx.batch.stream.on;
-        // Per layer index, whether this group's pick has run there.
-        let mut picked = vec![false; layers.len()];
+        // Per layer index, whether this group's pick has run there: the
+        // body's load-sized bitset, zeroed for this group.
+        *picked = 0;
         let mut next = match items.first() {
             Some(&(i, j)) => Some(cx.route(&mut members[j], i, observe)?),
             None => None,
@@ -1934,8 +1936,8 @@ impl Body {
             })?;
             let l = layers.start + i;
             let card = streaming && CardStacks::of(w, l)?.is_some();
-            if card && !picked[i] && now.block.is_some() {
-                picked[i] = true;
+            if card && (*picked >> i) & 1 == 0 && now.block.is_some() {
+                *picked |= 1 << i;
                 cx.shadow_pick(&members[j], i, &now)?;
                 if ahead && let Some(&(i2, j2)) = items.get(x + 1) {
                     next = Some(cx.route(&mut members[j2], i2, observe)?);

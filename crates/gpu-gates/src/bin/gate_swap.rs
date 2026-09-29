@@ -128,6 +128,10 @@
 //! - s4 victim refusal: a pick whose victim the source cannot serve from
 //!   resident pages is refused by name, the machine unbroken and the host
 //!   map unmoved (its mutant: the victims not checked).
+//! - s5 floor: a call whose floor is raised between two picks admits no
+//!   expert whose count is under the new floor, and a floor set with no call
+//!   open is refused by name (its mutant: the pick reads the floor the call
+//!   began with, not the one set since).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -2438,6 +2442,86 @@ mod gate {
         Ok(s4)
     }
 
+    /// s5 floor: a call whose floor is raised between two picks admits no
+    /// expert whose count is under the new floor, and a floor set with no
+    /// call open is refused by name (its mutant: the pick reads the floor
+    /// the call began with, not the one set since). `set_call_floor` refuses
+    /// no floor value itself — 0 is a floor every count passes.
+    fn s5(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        // Counts built for the clause, not the trace's: the contract is the
+        // floor against the ranking, and the ranking needs counts the trace
+        // need not give. Layer 2's pool at the call's start is the seed's
+        // experts 4..=10 (the pinned 0..=3 never a victim, the spare's
+        // expert 11 off the card).
+        const HOT: u32 = 20;
+        const WARM: u32 = 21;
+        const UNDER: u32 = 22;
+        const OVER: u32 = 23;
+        const FLOOR2: u32 = 2;
+        let faults = Faults {
+            all_resident: true,
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: s5's machine: {e}").into());
+        }
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.boundary(stream, &mut r.slots)?;
+        let refused = match m.set_call_floor(0) {
+            Ok(()) => "set".to_string(),
+            Err(e) => e.to_string(),
+        };
+        let refused_named = refused.contains("SwapMachine::set_call_floor")
+            && refused.contains("a prompt call open");
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        // The first pick at floor 1: two off-seed experts over zero-count
+        // victims, counts 10 and 1.
+        let mut c1 = vec![0u32; E];
+        c1[HOT as usize] = 10;
+        c1[WARM as usize] = 1;
+        let first = m.call_pick(stream, &mut r.slots, LAYERS.start, &c1, usize::MAX)?;
+        for l in LAYERS {
+            m.call_reader(l, stream)?;
+        }
+        let between = card_sets(&r.slots);
+        m.set_call_floor(FLOOR2)?;
+        // The second pick at floor 2: of its off-card counts, 5 passes the
+        // floor and 1 does not.
+        let mut c2 = vec![0u32; E];
+        c2[UNDER as usize] = 1;
+        c2[OVER as usize] = 5;
+        let second = m.call_pick(stream, &mut r.slots, LAYERS.start, &c2, usize::MAX)?;
+        let after = card_sets(&r.slots);
+        let gained: Vec<u32> = after[0]
+            .iter()
+            .filter(|id| !between[0].contains(id))
+            .copied()
+            .collect();
+        let under: Vec<u32> = gained
+            .iter()
+            .filter(|&&id| c2[id as usize] < FLOOR2)
+            .copied()
+            .collect();
+        let ended = m.end_call(stream, &mut r.slots, true).is_ok();
+        let ok = refused_named
+            && first.admitted == 2
+            && second.admitted == 1
+            && gained == [OVER]
+            && under.is_empty()
+            && ended;
+        println!(
+            "s5 floor: floor 1 then {FLOOR2}: the first pick admitted {} experts, the second \
+             admitted {} (gained {gained:?}, of them under the floor {under:?}); set_call_floor(0) \
+             with no call open \"{refused}\" named {refused_named}, the call ends {ended} {}",
+            first.admitted,
+            second.admitted,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -2490,6 +2574,7 @@ mod gate {
         ok &= s1_s3(&gpu, &pm, &trace)?;
         ok &= s2(&gpu, &pm, &trace)?;
         ok &= s4(&gpu, &pm, &trace)?;
+        ok &= s5(&gpu, &pm)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];
@@ -2509,7 +2594,7 @@ mod gate {
                  serve an id twice or not at all; a reset with flips in flight returns to the \
                  seed; tier entries never move; a staging failure, a panic, a broken machine, a \
                  bad tally, a non-resident victim and a host wait past its deadline are each a \
-                 named error, and a dropped machine leaves no copy waiting on the card; pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick and refuse a victim the host cannot serve."
+                 named error, and a dropped machine leaves no copy waiting on the card; pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next."
             );
             Ok(())
         } else {

@@ -748,6 +748,11 @@ pub struct Body {
     /// The prompt batch's buffers ([`prefill`]), made at load by
     /// [`prefill::prepare_prefill`].
     batch: Option<Box<prefill::Batch>>,
+    /// Per layer of `layers`, one bit: whether the group a prompt call is
+    /// enqueuing has run its pick there ([`Body::enqueue_group_chain`]).
+    /// Zeroed at each group's start; the load refuses more layers than its
+    /// bits.
+    picked: u64,
     /// The stage card's side of the tier layers, on a load with a tier card
     /// ([`Body::open_placed_tiered`]).
     tier: Option<TierPiece>,
@@ -2195,6 +2200,13 @@ impl Body {
                 plan.model.layers, hp.n_layer
             )));
         }
+        if layers.len() > usize::BITS as usize {
+            return Err(refuse(format!(
+                "the card runs {} layers; the group pick flags hold {}",
+                layers.len(),
+                usize::BITS
+            )));
+        }
         let ctx_max = usize::try_from(plan.ctx_max)
             .map_err(|_| refuse(format!("ctx_max {} passes usize", plan.ctx_max)))?;
         gpu.context().bind_to_thread()?;
@@ -2359,6 +2371,7 @@ impl Body {
             hp: hp.clone(),
             levers: cfg,
             batch: None,
+            picked: 0,
             tier,
             residency_log: None,
             swap_source,
