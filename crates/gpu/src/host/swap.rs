@@ -875,8 +875,36 @@ impl LeakReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Leak {
     pub reason: LeakReason,
+    /// The driver error's `CUresult` on a fault ([`Leak::fault`]), kept for
+    /// the `residency leak` record: the one fact of the fault the driver
+    /// already reported. `None` on every other reason, which names no driver
+    /// error.
+    pub code: Option<u32>,
     pub ring_bytes: u64,
     pub words_bytes: u64,
+}
+
+impl Leak {
+    /// The leak for the driver error the copy stream's query returned at a
+    /// drop: the reason `fault` with the error's `CUresult` as `code`, so
+    /// the record names which fault, not only that there was one. The
+    /// driver's own text it asks the context for at print time, which a
+    /// faulted context may not answer; the code it already gave. A drain's
+    /// error is a driver error always (the poll builds it from the query),
+    /// so a codeless fault is an error of another kind, which that path
+    /// cannot make.
+    #[must_use]
+    pub fn fault(e: &GpuError, ring_bytes: u64, words_bytes: u64) -> Leak {
+        Leak {
+            reason: LeakReason::Fault,
+            code: match e {
+                GpuError::Driver { source, .. } => Some(source.0),
+                _ => None,
+            },
+            ring_bytes,
+            words_bytes,
+        }
+    }
 }
 
 /// Where a dropped machine reports a leak; set once a process.
@@ -2113,24 +2141,36 @@ impl Drop for SwapMachine {
         // reference, and the shared state is leaked too: its last owner would
         // free pinned pages and the source on that thread, inside the driver
         // beside whatever this process runs next.
-        let reason = if !joined {
-            Some(LeakReason::Join)
+        let ring_bytes = (RING_SLOTS * self.shared.ring.slot_bytes) as u64;
+        let words_bytes = (2 * RING_SLOTS * WORD_STRIDE) as u64;
+        let leak = if !joined {
+            Some(Leak {
+                reason: LeakReason::Join,
+                code: None,
+                ring_bytes,
+                words_bytes,
+            })
         } else if !released {
-            Some(LeakReason::Release)
+            Some(Leak {
+                reason: LeakReason::Release,
+                code: None,
+                ring_bytes,
+                words_bytes,
+            })
         } else {
             match poll_drained(&self.copy, deadline) {
                 Ok(()) => None,
-                Err(Drain::Late(_)) => Some(LeakReason::Drain),
-                Err(Drain::Driver(_)) => Some(LeakReason::Fault),
+                Err(Drain::Late(_)) => Some(Leak {
+                    reason: LeakReason::Drain,
+                    code: None,
+                    ring_bytes,
+                    words_bytes,
+                }),
+                Err(Drain::Driver(e)) => Some(Leak::fault(&e, ring_bytes, words_bytes)),
             }
         };
-        if let Some(reason) = reason {
+        if let Some(leak) = leak {
             std::mem::forget(Arc::clone(&self.shared));
-            let leak = Leak {
-                reason,
-                ring_bytes: (RING_SLOTS * self.shared.ring.slot_bytes) as u64,
-                words_bytes: (2 * RING_SLOTS * WORD_STRIDE) as u64,
-            };
             match LEAK_SINK.get() {
                 Some(sink) => sink(&leak),
                 None => eprintln!(
@@ -2138,7 +2178,7 @@ impl Drop for SwapMachine {
                      and the source: {}",
                     leak.ring_bytes,
                     leak.words_bytes,
-                    reason.word()
+                    leak.reason.word()
                 ),
             }
         }
