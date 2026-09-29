@@ -43,7 +43,7 @@ B3가 남긴 숫자(rig-log 09-22-p: 토큰당 310 µs, 그중 발행 209 µs)�
    재는 것이고, 그것은 실제 해시(B0a 상수)가 먼저다.
 6. 안 되는 것(6.8·이 하드웨어): `RWF_DONTCACHE`(6.14), ext4 큰 폴리오(미머지, 방향도 반대 — 272 B에 64 KiB), P2PDMA
    유저 NVMe(6.2이되 CMB 있는 장치만), BaM/SCADA(드라이브를 커널에서 떼야 함, SCADA는 BlueField-4), GDS(4 KiB 단위,
-   3090 미지원), CXL(5975WX는 PCIe 4), NVMe KV/FDP/ZNS(그런 드라이브 없음), SQPOLL(유휴 깨움 ~30 µs — 스텝 사이
+   3090 미지원 — 정정 2026-09-29: 3090 미지원은 CUDA 13.3의 `gdscheck`가 확인했다(`GDR=unsupported`). 4 KiB 단위는 engram의 작은 행 읽기에만 걸린다. residency 교체의 16 MB 연속 읽기에는 걸리지 않는다. 막는 것은 NVMe 쪽 조건이다(rig-log 09-29#odprobe)), CXL(5975WX는 PCIe 4), NVMe KV/FDP/ZNS(그런 드라이브 없음), SQPOLL(유휴 깨움 ~30 µs — 스텝 사이
    10–40 ms 유휴라 토큰마다 낸다), `IOPOLL`(부트 파라미터 `nvme.poll_queues`, 이미 숨은 지연을 산다).
 
 ## 비용 분해 (우리 팔에서 파생)
