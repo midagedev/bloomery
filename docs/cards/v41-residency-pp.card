@@ -1,0 +1,38 @@
+# Round resv41's landing sitting (R3), carded by round resrunner: adaptive residency (mid-p40-s1)
+# against the static id-prefix seed on the two-card plan (b′), prose prompts of 512 and 4096 ids, one
+# binary, one lease. The lever is in the load key, so the off arms share one load a round and the on
+# arms another (depth-ds41.sh Loads); every on arm is held to the seed condition by the runner
+# (depth-ds41.sh Residency: first residency pass none/0, a residency reset with diff=0 and
+# dropped_bytes=0 before slot 2) and prints its 16-pass warm-up curve.
+# Decode [derived by resv41]: on 29.4-29.5 ms a step, measured in window A′ past boundary 20; off
+# 32-34 ms, a proxy, not measured in this binary — so +10..+15 % at depth 512. This is the term.
+# Prefill [derived by resv41, tools/flow/ds41_prefill.py with one card expert per layer lent to the
+# host]: pp512 and pp4096 on/off within -0.24..+0.18 %, inside every ruler here — a no-regression
+# check, not a term. At 2 rounds the pooled ruler is ±2.58 % (t(0.975, 2) 4.303 × 0.6 × √(2/2)) and
+# the runner's paired interval uses t(0.975, 1) 12.706, so "pp lower bound ≥ -1 %" is not readable at
+# 2 rounds [derived]: the pp check reads the mean ratio only, and a lower bound of -1 % needs 5 rounds
+# (t(0.975, 8) 2.306 × 0.6 × √(2/5) = 0.88 %).
+# Wall [derived]: 5 processes (2 rounds × 2 loads + the rotate warm-up's prose:512 alone) × ~112 s load,
+# the arms 2 × (2 × (2.5 + 3) + 2 × (14..17 + 3)) = 90..102 s plus the warm-up's 5.5 s, witness blocks
+# ~40 s: ~11.5-12 min, under 30.
+kind: ab
+question: does adaptive residency (mid-p40-s1) raise V4.1 decode after a prose prompt on plan (b′)
+  over the static seed, without costing prefill?
+term: decode tok/s @ n=96 after prose:512 (depth 512), A6000+3090, plan (b′) (BLOOMERY_GEN_PLACE=bp) -
+  (mid-p40-s1 - off) / off, paired by round
+unit: %
+predict: +10..+15
+rounds: 2
+condition: one lease, BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/v41-residency-pp.card
+  BLOOMERY_GEN_PLACE=bp BLOOMERY_TIMING_CARDS=a6000+3090' just depth-gpu-ds41 prose:512 prose:4096
+  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1 prose:4096@BLOOMERY_RESIDENCY=mid-p40-s1, the units and
+  arms rotated each round; every on row clean of FAIL rc=residency (its seed condition held: a clean
+  row is the runner's proof) with its residency curve line; no row [cpu-busy], [other-busy] or [cold];
+  no Xid in the witness blocks; the prose pp ratios on/off at P = 512 and 4096 read as a
+  no-regression check against a mean of -1 %
+decide-in: land R3 when both pp mean ratios on/off are at or above -1 %; a pp mean below -1 %
+  holds R3 and opens the spare-slot pick and the prompt call's boundary wait_us first
+decide-below: at +5 % or more, land R3 as in decide-in; under +5 %, run the spike-fix round before
+  landing and read the on arms' residency curves for which windows lost the time
+decide-above: land R3 (as in decide-in) and measure the off arm's step in this binary: the 32-34 ms
+  off proxy was low, so the flow model's host-slot term is re-fit before R5 is sized
