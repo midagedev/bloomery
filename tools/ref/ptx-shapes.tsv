@@ -56,6 +56,8 @@ generate_ds41   ds41_ffn_post_streams                   0          0
 generate_ds41   ds41_ffn_post_streams_8                 0          0
 generate_ds41   ds41_ffn_post_streams_tier              0          0
 generate_ds41   ds41_ffn_post_tier                      0          0
+generate_ds41   ds41_ffn_replace                        0          0
+generate_ds41   ds41_ffn_sel_merge                      0          0
 generate_ds41   ds41_glue_embed                         0          0
 generate_ds41   ds41_glue_embed_q3k                     0          0
 generate_ds41   ds41_glue_engram_rows                   0          0
