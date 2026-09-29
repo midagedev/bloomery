@@ -3010,11 +3010,11 @@ mod gate {
         gemm_taps_off(m)?;
         fresh(m)?;
         m.prompt38(&toks[..2], Prompt38::Gemm)?;
-        m.prompt38(&toks[2..], Prompt38::Gemm)?;
+        let last = m.prompt38(&toks[2..], Prompt38::Gemm)?;
         let logits = m.logits()?;
         let (two_stores, two_ring) = stores(m)?;
         let cut = Run {
-            tokens: vec![m.pos()],
+            tokens: vec![last],
             logits: vec![logits],
             taps: Vec::new(),
             routes: Vec::new(),
@@ -3030,13 +3030,13 @@ mod gate {
         // D3K's prefill, one walk and two cut inside the selecting rows, bit
         // for bit — the only walk that crosses the route's run boundary.
         let d3k = RefManifest::open(&data_dir().join(D3K), &IK)?;
-        let (_, prefill, _) = d3k.step()?;
+        let (_, _, prefill) = d3k.step()?;
         let prefill = prefill.to_vec();
         fresh(m)?;
-        m.prompt38(&prefill, Prompt38::Gemm)?;
+        let last = m.prompt38(&prefill, Prompt38::Gemm)?;
         let (one_stores, one_ring) = stores(m)?;
         let one = Run {
-            tokens: vec![m.pos()],
+            tokens: vec![last],
             logits: vec![m.logits()?],
             taps: Vec::new(),
             routes: Vec::new(),
@@ -3045,10 +3045,10 @@ mod gate {
         };
         fresh(m)?;
         m.prompt38(&prefill[..SPLIT], Prompt38::Gemm)?;
-        m.prompt38(&prefill[SPLIT..], Prompt38::Gemm)?;
+        let last = m.prompt38(&prefill[SPLIT..], Prompt38::Gemm)?;
         let (cut_stores, cut_ring) = stores(m)?;
         let cut = Run {
-            tokens: vec![m.pos()],
+            tokens: vec![last],
             logits: vec![m.logits()?],
             taps: Vec::new(),
             routes: Vec::new(),
