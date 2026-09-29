@@ -67,6 +67,7 @@ pub mod rope_table;
 pub mod route_core;
 pub mod router;
 pub(crate) mod tensor;
+pub(crate) mod upload;
 pub mod weights;
 
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};

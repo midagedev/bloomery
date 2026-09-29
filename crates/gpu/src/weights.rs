@@ -11,13 +11,15 @@
 use crate::GpuError;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::{DeviceTensor, window};
+use crate::upload::{Stage, UploadRing, bytes_of};
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
-    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span,
+    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
 };
-use cuda_core::CudaStream;
+use cuda_core::{CudaStream, DeviceCopy};
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
+use runtime::words::stream_words;
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use gguf::quant::Q8Block;
 use std::borrow::Cow;
@@ -181,13 +183,14 @@ impl Weights {
     }
 
     /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
-    /// of the plan's rows), and — when `card_dontneed` — release
-    /// each uploaded segment's file pages from the page cache as soon as it
-    /// is on the card ([`PageDrop`]): the plan names every later reader of
-    /// the file, and none of them reads a card segment's bytes. Whole pages
-    /// inside the segment's bytes only, so a page shared with a host segment
-    /// or a neighbouring tensor stays; the token embedding and the engram
-    /// tables, read from the file by every step, are never released.
+    /// of the plan's rows), and — when `card_dontneed` — release each
+    /// uploaded segment's file pages from the page cache as soon as its
+    /// bytes are staged ([`PageDrop`]; the device copies read the ring's
+    /// pinned slots, not the file, so no copy reads a released page): the plan names every later reader of the file, and none of them reads
+    /// a card segment's bytes. Whole pages inside the segment's bytes only,
+    /// so a page shared with a host segment or a neighbouring tensor stays;
+    /// the token embedding and the engram tables, read from the file by
+    /// every step, are never released.
     pub fn load_placed(
         stream: &CudaStream,
         split: &Split,
@@ -232,6 +235,8 @@ impl Weights {
     /// uploader of a file without a placement plan: [`Weights::load`]'s layer
     /// range, or the one layer or one piece of a step a gate makes resident.
     /// A kept tensor whose type has no device format is an error naming it.
+    /// One staging ring carries the whole load's copies, and one synchronize
+    /// ends them.
     pub fn load_where(
         stream: &CudaStream,
         split: &Split,
@@ -239,18 +244,30 @@ impl Weights {
     ) -> Result<Weights, GpuError> {
         stream.context().bind_to_thread()?;
         let mut by_name = BTreeMap::new();
+        let mut kept: Vec<(usize, &TensorInfo)> = Vec::new();
         for (shard, t) in split.iter_tensors() {
-            if !keep(&t.name) {
-                continue;
+            if keep(&t.name) {
+                kept.push((shard, t));
             }
+        }
+        // The ring is made after `by_name` and drops before it: its drop
+        // drains the copies, so no buffer of a refused load is freed while a
+        // copy still writes it.
+        let budget = kept.iter().map(|&(_, t)| upload_budget(t)).sum();
+        let mut ring = UploadRing::new(stream, budget)?;
+        for (shard, t) in kept {
             let gguf = split.shard(shard).ok_or_else(|| {
                 GpuError::shape(
                     "Weights::load_where",
                     format!("{} names shard {shard}, which the split lacks", t.name),
                 )
             })?;
-            by_name.insert(t.name.clone(), upload_file_tensor(stream, gguf, t)?);
+            by_name.insert(
+                t.name.clone(),
+                upload_file_tensor_with(&mut ring, stream, gguf, t)?,
+            );
         }
+        ring.finish(stream)?;
         Ok(Weights { by_name })
     }
 
@@ -604,13 +621,19 @@ pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
 /// The `what` of every refusal `Weights::load_placed` makes.
 const PLACED: &str = "Weights::load_placed";
 
+/// The file bytes a segment's upload may release once its bytes are staged:
+/// each entry the shard and the bytes within its mapping.
+type PendingRelease = Vec<(usize, Range<u64>)>;
+
 /// `load_placed`'s refusal of tensor `t`.
 fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
     GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
 }
 
 /// [`Weights::load_rows`], releasing each uploaded segment's file pages
-/// through `release` when there is one.
+/// through `release` when there is one, each as soon as its bytes are
+/// staged. One staging ring carries the whole load's copies and one
+/// synchronize ends them.
 fn load_segments(
     stream: &CudaStream,
     split: &Split,
@@ -621,6 +644,16 @@ fn load_segments(
 ) -> Result<Weights, GpuError> {
     stream.context().bind_to_thread()?;
     let mut by_name = BTreeMap::new();
+    // The ring is made after `by_name` and drops before it: its drop drains
+    // the copies, so no buffer of a refused load is freed while a copy still
+    // writes it.
+    let budget = rows
+        .iter()
+        .flat_map(|row| row.segments.iter())
+        .filter(|seg| seg.device == Device::Card(card))
+        .map(|seg| seg.resident_bytes)
+        .sum::<u64>();
+    let mut ring = UploadRing::new(stream, usize::try_from(budget).unwrap_or(usize::MAX))?;
     for row in rows {
         let t = model.tensors.get(row.tensor).ok_or_else(|| {
             GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
@@ -630,31 +663,46 @@ fn load_segments(
             .iter()
             .filter(|s| s.device == Device::Card(card))
         {
-            let dw = upload_segment(stream, split, model.experts, t, seg, release.as_deref_mut())?;
+            let (dw, release_ranges) =
+                upload_segment(&mut ring, stream, split, model.experts, t, seg)?;
             if by_name.insert(t.name.clone(), dw).is_some() {
                 return Err(placed_refusal(
                     t,
                     format!("has two segments on card {card}"),
                 ));
             }
+            // The ring's copies read its pinned slots, never the file: once a
+            // segment's pieces are staged, its pages can go at once, which
+            // keeps the load's page-cache footprint to one segment rather
+            // than letting a card's whole upload evict the host set.
+            if let Some(release) = release.as_mut() {
+                for (shard, at) in release_ranges {
+                    release
+                        .release(shard, at)
+                        .map_err(|e| GpuError::plan(PLACED, e))?;
+                }
+            }
         }
     }
+    ring.finish(stream)?;
     Ok(Weights { by_name })
 }
 
 /// Upload placement segment `seg` of tensor `t`, a stack of `experts` when
 /// it is one: find the tensor in `split`, confirm it is the tensor the
-/// placement was made from, upload the rows the segment holds, and hand
-/// their file bytes to `release` when there is one and no step reads the
-/// tensor from the file.
+/// placement was made from, upload the rows the segment holds (their file
+/// bytes as one borrowed slice per span, so a whole-tensor segment uploads
+/// from the mapping itself and an expert stack streams its spans without a
+/// gathered copy), and hand back the file bytes the caller may release now
+/// that they are staged — empty for a tensor a step reads from the file.
 fn upload_segment(
+    ring: &mut UploadRing,
     stream: &CudaStream,
     split: &Split,
     experts: u64,
     t: &ModelTensor,
     seg: &Segment,
-    release: Option<&mut PageDrop<'_>>,
-) -> Result<DevWeight, GpuError> {
+) -> Result<(DevWeight, PendingRelease), GpuError> {
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
     };
@@ -677,14 +725,26 @@ fn upload_segment(
     let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
     let rows =
         usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
-    let bytes = gather(g.data(info)?, &spans).ok_or_else(|| {
-        placed_refusal(
-            t,
-            format!("spans {spans:?} run past its {} file bytes", info.nbytes),
-        )
-    })?;
-    let dw = upload_rows(stream, PLACED, format, info, rows, &bytes)?;
+    let data = g.data(info)?;
+    let mut src = Vec::with_capacity(spans.len());
+    for span in &spans {
+        let range = (|| {
+            Some(usize::try_from(span.bytes.start).ok()?..usize::try_from(span.bytes.end).ok()?)
+        })()
+        .and_then(|r| data.get(r));
+        let slice = range.ok_or_else(|| {
+            placed_refusal(
+                t,
+                format!("spans {spans:?} run past its {} file bytes", info.nbytes),
+            )
+        })?;
+        src.push(slice);
+    }
+    let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src)?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
+        // The upload's copies may still be running into the buffers this
+        // error is about to drop; drain before they do.
+        let _ = stream.synchronize();
         let detail = format!(
             "uploaded {} device bytes, the plan has {}",
             dw.resident_bytes(),
@@ -693,40 +753,35 @@ fn upload_segment(
         return Err(placed_refusal(t, detail));
     }
     let read_by_steps = matches!(t.role, Role::TokenEmbedding | Role::EngramTable);
-    if let Some(release) = release.filter(|_| !read_by_steps) {
+    let release = if read_by_steps {
+        PendingRelease::new()
+    } else {
         let base = g.data_base() + info.offset;
-        for span in &spans {
-            release
-                .release(s, base + span.bytes.start..base + span.bytes.end)
-                .map_err(|e| GpuError::plan(PLACED, e))?;
-        }
-    }
+        spans
+            .iter()
+            .map(|span| (s, base + span.bytes.start..base + span.bytes.end))
+            .collect()
+    };
+    Ok((dw, release))
+}
+
+/// Pack and upload one file tensor in its kernel's device format, on a
+/// staging ring of its own (a caller uploading many tensors makes one ring
+/// for them all through [`Weights::load_where`]).
+pub fn upload_file_tensor(
+    stream: &CudaStream,
+    gguf: &Gguf,
+    t: &TensorInfo,
+) -> Result<DevWeight, GpuError> {
+    let mut ring = UploadRing::new(stream, upload_budget(t))?;
+    let dw = upload_file_tensor_with(&mut ring, stream, gguf, t)?;
+    ring.finish(stream)?;
     Ok(dw)
 }
 
-/// The file bytes of `spans` of a tensor whose bytes are `data`, one after
-/// another in span order: a borrow of `data` when the only span starts at
-/// the tensor's first byte, a gathered copy otherwise. `None` when a span
-/// runs past `data`.
-fn gather<'d>(data: &'d [u8], spans: &[Span]) -> Option<Cow<'d, [u8]>> {
-    let range = |s: &Span| -> Option<Range<usize>> {
-        Some(usize::try_from(s.bytes.start).ok()?..usize::try_from(s.bytes.end).ok()?)
-    };
-    match spans {
-        [s] if s.bytes.start == 0 => data.get(range(s)?).map(Cow::Borrowed),
-        _ => {
-            let len: u64 = spans.iter().map(|s| s.bytes.end - s.bytes.start).sum();
-            let mut out = Vec::with_capacity(usize::try_from(len).ok()?);
-            for s in spans {
-                out.extend_from_slice(data.get(range(s)?)?);
-            }
-            Some(Cow::Owned(out))
-        }
-    }
-}
-
-/// Pack and upload one file tensor in its kernel's device format.
-pub fn upload_file_tensor(
+/// [`upload_file_tensor`] on a caller's ring, which the caller synchronizes.
+fn upload_file_tensor_with(
+    ring: &mut UploadRing,
     stream: &CudaStream,
     gguf: &Gguf,
     t: &TensorInfo,
@@ -739,27 +794,46 @@ pub fn upload_file_tensor(
     };
     upload_rows(
         stream,
+        ring,
         "Weights::load",
         format,
         t,
         tensor_rows(t),
-        gguf.data(t)?,
+        &[gguf.data(t)?],
     )
 }
 
+/// The bytes `t`'s upload moves, for sizing a load's staging ring: its
+/// resident size where its type has a device layout, its file bytes
+/// otherwise — a sizing hint, never a contract (the uploads check their own
+/// lengths).
+fn upload_budget(t: &TensorInfo) -> usize {
+    usize::try_from(t.dims[0])
+        .ok()
+        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
+        .or_else(|| usize::try_from(t.nbytes).ok())
+        .unwrap_or(usize::MAX)
+}
+
 /// Pack `rows` rows of file tensor `t` — all of them, or an expert stack's
-/// listed experts, gathered — from `bytes` (those rows' file bytes, or a
-/// run starting with them) in card format `format`, and upload them.
-/// Refuses exactly where [`CardFormat::resident_bytes`] has no size for the
-/// rows, and checks the upload's device bytes against that size; `what`
-/// names the caller in both errors.
+/// listed experts — from `src` (those rows' file bytes as one borrowed slice
+/// per span, in span order) in card format `format`, and upload them through
+/// `ring`. The formats whose device bytes are the file bytes verbatim
+/// ([`CardFormat::KQuant`], [`CardFormat::F32`] — the host is little-endian,
+/// the module refuses to build otherwise) stage the slices themselves into a
+/// zeroed buffer, so no word is packed on the host; every other format packs
+/// its run on the host and stages the packed words. Refuses exactly where
+/// [`CardFormat::resident_bytes`] has no size for the rows, and checks the
+/// upload's device bytes against that size; `what` names the caller in both
+/// errors.
 fn upload_rows(
     stream: &CudaStream,
+    ring: &mut UploadRing,
     what: &'static str,
     format: CardFormat,
     t: &TensorInfo,
     rows: usize,
-    bytes: &[u8],
+    src: &[&[u8]],
 ) -> Result<DevWeight, GpuError> {
     let name = t.name.as_str();
     let all_rows: u64 = t.dims[1..].iter().product();
@@ -776,45 +850,73 @@ fn upload_rows(
     };
     // File bytes per row: exact, because the reader sized the tensor from its type.
     let need = t.nbytes / all_rows * rows as u64;
-    let Some(bytes) = usize::try_from(need).ok().and_then(|n| bytes.get(..n)) else {
-        let detail = format!(
-            "tensor {name} holds {} bytes, {rows} rows need {need}",
-            bytes.len()
-        );
+    let held: usize = src.iter().map(|s| s.len()).sum();
+    let Some(take) = usize::try_from(need).ok().filter(|&n| held >= n) else {
+        let detail = format!("tensor {name} holds {held} bytes, {rows} rows need {need}");
         return Err(GpuError::shape(what, detail));
     };
     let dw = match format {
         // The gates' packing verbatim (gate_p1/gate_p9): the whole row span as
         // one word stream, so the kernels' byte-offset row addressing sees
         // contiguous rows. A routed Q5_1 stack's span is its experts' 24-byte
-        // blocks in slot order, the layout `q5_1_gemv_sel` reads.
+        // blocks in slot order, the layout `q5_1_gemv_sel` reads. The words
+        // are the file's bytes themselves on this host, so the rows stream
+        // into the zeroed buffer and only the layout's zero tail is packed —
+        // by the buffer's memset.
         CardFormat::KQuant => {
-            let mut words = words_of(bytes);
-            words.resize(words.len().div_ceil(rows) * rows, 0);
-            DevWeight::KQuant {
-                ty: t.ty,
-                w: DeviceTensor::upload(stream, &words, rows, words.len() / rows)?,
-                k,
+            let words = stream_words(need, rows as u64)
+                .and_then(|w| usize::try_from(w).ok())
+                .ok_or_else(|| {
+                    GpuError::shape(what, format!("tensor {name}: its word stream passes usize"))
+                })?;
+            let w = DeviceTensor::<u32>::zeroed(stream, rows, words / rows)?;
+            let stage = Stage {
+                what,
+                name,
+                dst: w.buf().cu_deviceptr(),
+                dst_bytes: w.buf().num_bytes(),
+            };
+            ring.copy_bytes(stream, &stage, src, take)?;
+            DevWeight::KQuant { ty: t.ty, w, k }
+        }
+        CardFormat::F32 => {
+            // The file's f32 bytes are the device's f32 bytes on this host;
+            // a run that is not the rows' whole values is a broken file, the
+            // layout's size and the run's need disagreeing.
+            if take != rows * k * 4 {
+                let detail = format!(
+                    "tensor {name}: {take} bytes are not its {rows} rows of {k} f32 values"
+                );
+                return Err(GpuError::shape(what, detail));
             }
+            let w = DeviceTensor::<f32>::zeroed(stream, rows, k)?;
+            let stage = Stage {
+                what,
+                name,
+                dst: w.buf().cu_deviceptr(),
+                dst_bytes: w.buf().num_bytes(),
+            };
+            ring.copy_bytes(stream, &stage, src, take)?;
+            DevWeight::F32 { w, k }
         }
         CardFormat::Q5_0 => {
-            let packed = pack_q5_0(bytes, k, rows)?;
+            let packed = pack_q5_0(&flat_of(src, take)?, k, rows)?;
             let cols = packed.len() / rows;
             DevWeight::Q5_0 {
-                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
+                w: upload_packed(stream, ring, what, name, &packed, rows, cols)?,
                 k,
             }
         }
         CardFormat::Q5_1 => {
-            let packed = pack_q5_1(bytes, k, rows)?;
+            let packed = pack_q5_1(&flat_of(src, take)?, k, rows)?;
             let cols = packed.len() / rows;
             DevWeight::Q5_1 {
-                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
+                w: upload_packed(stream, ring, what, name, &packed, rows, cols)?,
                 k,
             }
         }
         CardFormat::Q8_0Planes => {
-            let blocks: Vec<Q8Block> = bytes
+            let blocks: Vec<Q8Block> = flat_of(src, take)?
                 .as_chunks::<34>()
                 .0
                 .iter()
@@ -822,20 +924,8 @@ fn upload_rows(
                 .collect();
             let (qs, d) = q8_0_planes(&blocks);
             DevWeight::Q8_0 {
-                qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
-                d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
-                k,
-            }
-        }
-        CardFormat::F32 => {
-            let vals: Vec<f32> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect();
-            DevWeight::F32 {
-                w: DeviceTensor::upload(stream, &vals, rows, k)?,
+                qs: upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
+                d: upload_packed(stream, ring, what, name, &d, rows, k / 32)?,
                 k,
             }
         }
@@ -848,14 +938,18 @@ fn upload_rows(
         }
         CardFormat::Bf16AsF32 => {
             let mut vals = vec![0.0f32; rows * k];
-            dequant_row(t.ty, bytes, &mut vals).map_err(::model::ModelError::from)?;
+            dequant_row(t.ty, &flat_of(src, take)?, &mut vals)
+                .map_err(::model::ModelError::from)?;
             DevWeight::F32 {
-                w: DeviceTensor::upload(stream, &vals, rows, k)?,
+                w: upload_packed(stream, ring, what, name, &vals, rows, k)?,
                 k,
             }
         }
     };
     if u64::try_from(dw.resident_bytes()).ok() != Some(size) {
+        // The upload's copies may still be running into the buffers this
+        // error is about to drop; drain before they do.
+        let _ = stream.synchronize();
         return Err(GpuError::shape(
             what,
             format!(
@@ -867,18 +961,58 @@ fn upload_rows(
     Ok(dw)
 }
 
-/// Raw little-endian bytes as u32 words; a length not divisible by 4
-/// zero-pads the last word. Same semantics as the gates' `bytes_to_words`
-/// (that helper lives in bloomery-gpu-gates, which depends on this crate —
-/// the dependency direction forbids sharing it the other way).
-fn words_of(b: &[u8]) -> Vec<u32> {
-    b.chunks(4)
-        .map(|c| {
-            let mut w = [0u8; 4];
-            w[..c.len()].copy_from_slice(c);
-            u32::from_le_bytes(w)
-        })
-        .collect()
+/// The first `take` bytes of `src`'s slices as one run, for a format that
+/// packs on the host: the slice itself when there is one, a copy of the
+/// spans' bytes in order when there are several.
+fn flat_of<'a>(src: &[&'a [u8]], take: usize) -> Result<Cow<'a, [u8]>, GpuError> {
+    match src {
+        [one] => Ok(Cow::Borrowed(&one[..take])),
+        _ => {
+            let mut out = Vec::with_capacity(take);
+            for slice in src {
+                let len = slice.len().min(take - out.len());
+                out.extend_from_slice(&slice[..len]);
+                if out.len() == take {
+                    break;
+                }
+            }
+            Ok(Cow::Owned(out))
+        }
+    }
+}
+
+/// `data` — exactly `rows * cols` elements, a format's finished packing — as
+/// a device tensor staged through `ring`, the buffer zeroed first so a short
+/// packing would leave a zero tail rather than stale bytes (the packed
+/// formats always fill theirs).
+fn upload_packed<T: DeviceCopy>(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    what: &'static str,
+    name: &str,
+    data: &[T],
+    rows: usize,
+    cols: usize,
+) -> Result<DeviceTensor<T>, GpuError> {
+    if data.len() != rows * cols {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: {} elements for {rows} rows of {cols}",
+                data.len()
+            ),
+        ));
+    }
+    let t = DeviceTensor::zeroed(stream, rows, cols)?;
+    let bytes = bytes_of(data);
+    let stage = Stage {
+        what,
+        name,
+        dst: t.buf().cu_deviceptr(),
+        dst_bytes: t.buf().num_bytes(),
+    };
+    ring.copy_bytes(stream, &stage, &[bytes], bytes.len())?;
+    Ok(t)
 }
 
 /// The q8f32 two-plane layout of Q8_0 blocks: per block 8 code words (code j

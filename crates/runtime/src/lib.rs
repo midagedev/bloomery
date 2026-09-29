@@ -18,6 +18,9 @@
 //! sizes, [`seqstate`], the
 //! checkpoints of the recurrent ones and which cuts they serve, and
 //! [`layer`], the sub-layer programs a layer's description names.
+//! [`words`] is smaller and sits below all of them: the word count of a
+//! flat weight stream, the one count the loader's staging and the packings
+//! that pin it must agree on.
 
 pub mod combine;
 pub mod gate;
@@ -32,6 +35,7 @@ pub mod state;
 mod stop;
 pub mod stores;
 pub mod swaprule;
+pub mod words;
 
 pub use gate::Gated;
 pub use lookup::Lookup;
