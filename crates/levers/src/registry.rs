@@ -1205,6 +1205,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Seconds between the box guard's polls; the tools' stub tests shorten it.",
     ),
     runner(
+        "BLOOMERY_MIN_FREE_GIB",
+        Some("gate-batch.sh"),
+        "Mac side: the disk floor in GiB `tools/gate-batch.sh` checks before its first lane \
+         and `tools/mac-check.sh` before its first cargo command; unset means each script's \
+         own constant.",
+    ),
+    runner(
         "BLOOMERY_MT_CHILD_DUMP",
         None,
         "The model threading gate's handshake with the child it runs of its own test \

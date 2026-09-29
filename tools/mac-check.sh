@@ -18,13 +18,14 @@
 #
 #   tools/mac-check.sh check|lint|fmt|fmt-check|test|combos
 #   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory,
-#                                    the test totals and the toolchain and prerequisite checks against a
-#                                    fake HOME; runs no cargo (check-recipes runs it)
+#                                    the test totals, the toolchain and prerequisite checks against a
+#                                    fake HOME, and the disk floor against a fake df; runs no cargo
+#                                    (check-recipes runs it)
 #
 # Exit: cargo's own code (`test`: the first crate's that is not 0; `combos`: the first red shape's).
 # `lint` also ends 1 when its `^warning:` count (the box's ruler, one per target a warning appears in)
 # is above the ratchet, the one number in tools/lint-ratchet.txt. 64: a mode or a box command this
-# script does not run, a malformed `recipes.py combos` line, or not on macOS. 69: a prerequisite is missing (named, with how it is made). 70: no ratchet in
+# script does not run, a malformed `recipes.py combos` line, or not on macOS. 69: a prerequisite is missing (named, with how it is made), or the volume that holds target/ is below the disk floor (the `mac-check: disk:` line). 70: no ratchet in
 # tools/lint-ratchet.txt (missing, or not exactly one number line), no pure crate to test, or no build shape (`combos`).
 #
 # The toolchain is this script's: the channel rust-toolchain.toml pins, at
@@ -41,6 +42,14 @@
 # env file: cargo's metadata hash of a workspace member leaves its absolute path out, so two trees in
 # one target directory reuse each other's rmeta files. An inherited CARGO_TARGET_DIR is overridden,
 # with a line that names it.
+#
+# Disk floor. Before its first cargo command, every mode that writes target/ (check, lint, test,
+# combos; fmt and fmt-check write nothing there and skip this) reads the free bytes of the volume
+# that holds the tree's target/ with df -Pk: below MIN_FREE_GIB the mode stops with exit 69 and one
+# `mac-check: disk:` line naming the free GiB, the floor and the mount point — a run must never
+# start and die of ENOSPC halfway. A df that fails or does not parse is also 69, naming why, never a
+# pass. BLOOMERY_MIN_FREE_GIB overrides the floor; an override that is not a positive integer is a
+# named error (64).
 # How each piece is made, once per Mac (the box is `ws`):
 #   toolchain  rustup toolchain install <channel> --profile minimal -c clippy,rustfmt \
 #                -t x86_64-unknown-linux-gnu      (the x86_64-linux std is what --target needs)
@@ -52,6 +61,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TARGET=x86_64-unknown-linux-gnu
+MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/, rounded up to a whole GiB
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -194,6 +204,59 @@ target_dir() {
   echo "${1%/}/target"
 }
 
+# The disk floor, the header's «Disk floor». floor_gib resolves it (the constant, or
+# BLOOMERY_MIN_FREE_GIB, which must be a positive integer of GiB or a named 64). df_able walks up to
+# the deepest existing ancestor of a path — df errors on a path that does not exist, and the volume
+# of the deepest existing ancestor is where mkdir -p creates the rest (a symlink or mount inside the
+# missing span cannot change it). disk_ok reads the Available column of `df -Pk` (POSIX output,
+# macOS and Linux alike) and prints one verdict line: 0 above the floor, 69 below it or when df
+# fails or does not parse — named, never a pass.
+floor_gib() {
+  if [ -n "${BLOOMERY_MIN_FREE_GIB+x}" ]; then
+    case $BLOOMERY_MIN_FREE_GIB in
+      '' | 0 | *[!0-9]*) say "mac-check.sh: BLOOMERY_MIN_FREE_GIB='$BLOOMERY_MIN_FREE_GIB' is not a positive integer of GiB"; return 64 ;;
+    esac
+    echo $((10#$BLOOMERY_MIN_FREE_GIB))
+  else
+    echo "$MIN_FREE_GIB"
+  fi
+}
+
+df_able() { # the deepest existing ancestor of $1
+  local p=$1
+  while [ ! -e "$p" ]; do
+    case $p in
+      / | '') echo /; return ;;
+      *) p=${p%/*} ;;
+    esac
+  done
+  echo "$p"
+}
+
+disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line, 0 or 69
+  local probe out rc=0 floor line
+  floor=$(floor_gib) || return $?
+  probe=$(df_able "$1")
+  out=$(df -Pk "$probe" 2>&1) || rc=$?
+  [ "$rc" = 0 ] || { say "mac-check: disk: df -Pk $probe failed (rc $rc): $(printf '%s\n' "$out" | tail -1)"; return 69; }
+  rc=0
+  line=$(printf '%s\n' "$out" | awk -v kib=$((10#$floor * 1048576)) -v floor="$floor" -v probe="$probe" '
+    END {
+      if (NR < 2 || $4 !~ /^[0-9]+$/) {
+        printf "mac-check: disk: df -Pk %s output does not parse (the Available column): %s\n", probe, $0 > "/dev/stderr"
+        exit 1
+      }
+      mount = $6; for (i = 7; i <= NF; i++) mount = mount " " $i
+      if ($4 + 0 < kib) {
+        printf "mac-check: disk: %.1f GiB free on %s (for %s), below the %s GiB floor — free space and run again\n", $4 / 1048576, mount, probe, floor > "/dev/stderr"
+        exit 1
+      }
+      printf "mac-check: disk: %.1f GiB free on %s (for %s), above the %s GiB floor\n", $4 / 1048576, mount, probe, floor
+    }') || rc=$?
+  [ "$rc" = 0 ] || return 69
+  say "$line"
+}
+
 # load_env: source $HOME/opt/bloomery-mac-env.sh, or 69 naming it.
 load_env() {
   local f=$HOME/opt/bloomery-mac-env.sh
@@ -263,8 +326,9 @@ prereqs() {
 }
 
 # setup MODE TOOLCHAIN_BIN ROOT: the environment a run of MODE gets — the env file for check, lint and
-# combos, the pinned toolchain first on PATH, the prerequisites, and for check, lint, test and combos
-# the tree's own CARGO_TARGET_DIR, whatever the environment held (a line names what it replaces). Runs in the caller's shell.
+# combos, the pinned toolchain first on PATH, the prerequisites, the disk floor, and for check, lint,
+# test and combos the tree's own CARGO_TARGET_DIR, whatever the environment held (a line names what
+# it replaces). Runs in the caller's shell.
 setup() {
   case $1 in check | lint | combos) load_env || return $? ;; esac
   export PATH="$2:$PATH"
@@ -276,6 +340,7 @@ setup() {
       [ -z "${CARGO_TARGET_DIR:-}" ] || [ "$CARGO_TARGET_DIR" = "$own" ] ||
         say "mac-check: CARGO_TARGET_DIR=$CARGO_TARGET_DIR from the environment is overridden with the tree's own $own (a shared directory serves another tree's rmeta)"
       export CARGO_TARGET_DIR=$own
+      disk_ok "$own" || return $? # the disk floor: no mode that writes target/ starts below it
       ;;
   esac
 }
@@ -308,7 +373,7 @@ verdict() {
 }
 
 self_test() {
-  local fails=0 out t m cmd fake tc ch host a b tab why
+  local fails=0 out t m cmd fake tc ch host a b tab why drc
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
   # the derivation from the real justfile: each mode's recipe gives `cargo <verb> …`, the cross
@@ -444,6 +509,16 @@ self_test() {
   chmod +x "$tc"/* "$fake/brew/bin"/*
   touch "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$TARGET/lib/libstd-0.rlib" "$fake/.rustup/toolchains/$ch-$host/lib/rustlib/$host/lib/libstd-0.rlib" "$fake/opt/cuda-13.3/include/cuda.h" \
     "$fake/opt/linux-sysroot/usr/include/stdlib.h" "$fake/clt/lib/libclang.dylib"
+  # a fake df first on the probe's PATH (brew/bin is first there): the disk floor's verdict must not
+  # depend on the host's real disk. One POSIX data line whose Available column is DISK_KB KiB on
+  # /fake/mount; DISK_RC makes df fail, DISK_BAD output that does not parse.
+  cat > "$fake/brew/bin/df" << 'DF'
+#!/bin/sh
+if [ -n "${DISK_RC:-}" ]; then echo "df: fake failure" >&2; exit "$DISK_RC"; fi
+if [ -n "${DISK_BAD:-}" ]; then printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\ngarbage line\n'; exit 0; fi
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100000000 1000 %s 1%% /fake/mount\n' "${DISK_KB:-999999999}"
+DF
+  chmod +x "$fake/brew/bin/df"
   write_env() { # RUSTC
     cat > "$fake/opt/bloomery-mac-env.sh" << EOF
 export PATH=\$HOME/brew/bin:\$PATH${1:+ RUSTC=$1}
@@ -471,6 +546,34 @@ EOF
   case $out in *"target none"*) ;; *) fail "fmt sets a target directory: $out" ;; esac
   out=$(probe test) || true
   case $out in *"target /x/bloomery-foo/target"*) ;; *) fail "test does not build in the tree's own target directory: $out" ;; esac
+  # the disk floor: the modes that write target/ print the verdict line and stop below the floor
+  # with 69 and the named line; fmt and fmt-check, which write nothing there, do not ask; a failing
+  # or unparsable df is a named 69; the override is honored when positive, a named 64 when not
+  for m in check lint test combos; do
+    out=$(probe "$m") || fail "the complete fake HOME fails $m: $out"
+    case $out in *"mac-check: disk: "*" GiB free on /fake/mount "*" floor"*) ;; *) fail "$m prints no disk verdict line: $out" ;; esac
+  done
+  for m in fmt fmt-check; do
+    out=$(probe "$m") || fail "the complete fake HOME fails $m: $out"
+    case $out in *"mac-check: disk:"*) fail "$m asks for the disk floor it cannot need: $out" ;; esac
+  done
+  drc=0; out=$(DISK_KB=1024 probe check) || drc=$?
+  [ "$drc" = 69 ] || fail "check below the floor ended rc $drc, not 69: $out"
+  case $out in *"mac-check: disk: "*" below the "*" GiB floor"*) ;; *) fail "check below the floor names no disk line: $out" ;; esac
+  drc=0; out=$(DISK_RC=1 probe lint) || drc=$?
+  [ "$drc" = 69 ] || fail "lint with a failing df ended rc $drc, not 69: $out"
+  case $out in *"failed (rc 1): df: fake failure"*) ;; *) fail "a failing df is not named: $out" ;; esac
+  drc=0; out=$(DISK_BAD=1 probe combos) || drc=$?
+  [ "$drc" = 69 ] || fail "combos with unparsable df output ended rc $drc, not 69: $out"
+  case $out in *"output does not parse"*) ;; *) fail "unparsable df output is not named: $out" ;; esac
+  drc=0; out=$(BLOOMERY_MIN_FREE_GIB=abc probe check) || drc=$?
+  [ "$drc" = 64 ] || fail "BLOOMERY_MIN_FREE_GIB=abc ended rc $drc, not 64: $out"
+  case $out in *"is not a positive integer of GiB"*) ;; *) fail "a bad override is not named: $out" ;; esac
+  drc=0; out=$(BLOOMERY_MIN_FREE_GIB=0 probe test) || drc=$?
+  [ "$drc" = 64 ] || fail "BLOOMERY_MIN_FREE_GIB=0 ended rc $drc, not 64: $out"
+  drc=0; out=$(BLOOMERY_MIN_FREE_GIB=999999 probe check) || drc=$?
+  [ "$drc" = 69 ] || fail "an override above the free space ended rc $drc, not 69: $out"
+  case $out in *"below the 999999 GiB floor"*) ;; *) fail "the override's floor is not the one named: $out" ;; esac
   # each piece removed in turn: MODE|path|what the line names
   for t in "check|$fake/opt/cuda-13.3/include/cuda.h|missing cuda.h" \
     "check|$fake/opt/linux-sysroot/usr/include/stdlib.h|stdlib.h" \

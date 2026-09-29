@@ -5,7 +5,8 @@
 # second bound.
 #   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
-#   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile (check-recipes runs it)
+#   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
+#                                      against a fake df (check-recipes runs it)
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
@@ -92,9 +93,11 @@
 # <s>s try=<t> lane=<A|B|X>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
 # times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> wall=<s>s laneA=<s>s laneB=<s>s`
 # (`laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log). Exit 0
-# iff every rc is 0. DIR defaults to target/gate-batch/<stamp> of this tree: under target/ it is
-# gitignored and outside box.sh's rsync, so the logs neither ship to the box nor mark the tree dirty.
-# A DIR inside the tree but outside target/ is refused for that reason.
+# iff every rc is 0. DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
+# basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
+# cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
+# --out is still taken: under the tree's target/ it is gitignored and accepted, a DIR inside the
+# tree but outside target/ is refused (box.sh would ship the logs and mark the tree dirty).
 #
 # Refuses to start while the timing lease (/root/bloomery-cpu.lock) or a hold
 # (/root/bloomery-<owner>-hold, other than BLOOMERY_HOLD_OWNER's) is up, naming what is up (exit 75);
@@ -107,6 +110,15 @@
 # lock and V4.1 load lock), which the item line prints as `waited=<s>s`. --dry-run validates, prints each item's lane, command and
 # plan (fixed, balanced or solo, with its expected seconds) and the predicted lane sums, and touches
 # neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
+#
+# Disk floor. Before anything starts — after argument parsing, before the log directory and the first
+# lane — the free space of the volume that holds the tree's target/ and of the volume that holds OUT
+# must each be at least MIN_FREE_GIB (giB). Below the floor: exit 69 and one `gate-batch: disk:` line
+# naming the free GiB, the floor and the mount point — not 75, which is lock contention a batch
+# retries. A df that fails or whose output does not parse is also 69, naming why. --dry-run prints
+# the same verdict lines and does not fail: a dry run shows what a real run would do.
+# BLOOMERY_MIN_FREE_GIB overrides the floor; an override that is not a positive integer is a named
+# error (64), never silently ignored.
 #
 # Ledgers. Two files, one format, written only by this script: the lead's (--ledger, the lead's
 # batches) and the rounds' (--round-ledger, a delegated round's batches). A round never passes --ledger:
@@ -191,6 +203,7 @@ SMOKE=(
 TRIES_MAX=11
 RETRY_WAIT=30
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
+MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/ (tools/mac-check.sh), rounded up to a whole GiB
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 
@@ -252,6 +265,62 @@ try_waits() {
     END { print w + 0 }' "$1"
 }
 
+# The disk floor, the header's «Disk floor». floor_gib resolves the floor once (the constant, or
+# BLOOMERY_MIN_FREE_GIB, which must be a positive integer of GiB or a named 64). df_able walks up to
+# the deepest existing ancestor of a path — df errors on a path that does not exist, and the volume
+# of the deepest existing ancestor is where mkdir -p creates the rest (a symlink or mount inside the
+# missing span cannot change it). disk_ok reads the Available column of `df -Pk` (POSIX output,
+# macOS and Linux alike) and prints one verdict line: 0 above the floor, 1 below it (a real run
+# turns that into 69; a dry run names it and continues), 69 when df fails or does not parse — a
+# named failure in a dry run too, whose verdict line must be a verdict and not a guess.
+floor_gib() {
+  if [ -n "${BLOOMERY_MIN_FREE_GIB+x}" ]; then
+    case $BLOOMERY_MIN_FREE_GIB in
+      '' | 0 | *[!0-9]*) RC=64 die "BLOOMERY_MIN_FREE_GIB='$BLOOMERY_MIN_FREE_GIB' is not a positive integer of GiB" ;;
+    esac
+    printf '%s\n' "$((10#$BLOOMERY_MIN_FREE_GIB))"
+  else
+    printf '%s\n' "$MIN_FREE_GIB"
+  fi
+}
+
+df_able() { # the deepest existing ancestor of $1
+  local p=$1
+  while [ ! -e "$p" ]; do
+    case $p in
+      / | '') printf '/\n'; return ;;
+      *) p=${p%/*} ;;
+    esac
+  done
+  printf '%s\n' "$p"
+}
+
+disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line, then 0 / 1 / 69
+  local path=$1 probe out rc=0 line
+  local floor
+  floor=$(floor_gib) || return $?
+  probe=$(df_able "$path")
+  out=$(df -Pk "$probe" 2>&1) || rc=$?
+  [ "$rc" = 0 ] || RC=69 die "disk: df -Pk $probe failed (rc $rc): $(printf '%s\n' "$out" | tail -1)"
+  rc=0
+  line=$(printf '%s\n' "$out" | awk -v kib=$((10#$floor * 1048576)) -v floor="$floor" -v probe="$probe" '
+    END {
+      if (NR < 2 || $4 !~ /^[0-9]+$/) {
+        printf "gate-batch: disk: df -Pk %s output does not parse (the Available column): %s\n", probe, $0 > "/dev/stderr"
+        exit 2
+      }
+      mount = $6; for (i = 7; i <= NF; i++) mount = mount " " $i
+      if ($4 + 0 < kib) {
+        printf "gate-batch: disk: %.1f GiB free on %s (for %s), below the %s GiB floor — free space and run again\n", $4 / 1048576, mount, probe, floor > "/dev/stderr"
+        exit 1
+      }
+      printf "gate-batch: disk: %.1f GiB free on %s (for %s), above the %s GiB floor\n", $4 / 1048576, mount, probe, floor
+    }') || rc=$?
+  [ "$rc" = 2 ] && rc=69
+  [ "$rc" = 0 ] || return "$rc"
+  printf '%s\n' "$line"
+}
+
 # --self-test: the rules of items 1 and 4 on a fixture justfile and fixture times rows, in a temporary
 # tree holding a copy of this script (no box, no ssh; `just` and python3 only). One line per case,
 # `ok <name>` or `FAIL <name>: <why>` with the output; exit 0 iff none failed. check-recipes runs it.
@@ -289,10 +358,22 @@ JF
   # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
   printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
     plain-any B a6000 10 2026-09-27T10:00:00+0900 host B none 5 2026-09-27T10:00:00+0900 > "$t/times.tsv"
+  # A fake df first on PATH for the whole self-test — the disk floor's verdict must not depend on
+  # the host's real disk. One POSIX data line whose Available column is DISK_KB KiB on /fake/mount;
+  # DISK_RC makes df fail, DISK_BAD output that does not parse.
+  mkdir -p "$t/fakebin"
+  cat > "$t/fakebin/df" << 'DF'
+#!/bin/sh
+if [ -n "${DISK_RC:-}" ]; then echo "df: fake failure" >&2; exit "$DISK_RC"; fi
+if [ -n "${DISK_BAD:-}" ]; then printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\ngarbage line\n'; exit 0; fi
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 100000000 1000 %s 1%% /fake/mount\n' "${DISK_KB:-999999999}"
+DF
+  chmod +x "$t/fakebin/df"
+  export PATH="$t/fakebin:$PATH"
   pass() { n=$((n + 1)); echo "ok $1"; }
   fail() {
     n=$((n + 1)) bad=$((bad + 1))
-    echo "FAIL $1: $2"
+    echo "FAIL $1: ${2:-}"
     printf '%s\n' "$out" | sed 's/^/    | /'
   }
   # check <name> <want rc> <ERE the output must hold> <command…>
@@ -346,6 +427,37 @@ JF
   printf '%s\n' '' 'plain-v41:' "    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh other'" >> "$t/justfile"
   check 'export without the group: a named error' 65 'recipe plain-v41: names BLOOMERY_GATE_V41_LOAD without' "${gb[@]}" --classes
   cp "$t/justfile.good" "$t/justfile"
+  # The disk floor: above the floor a run proceeds on the verdict line; below it a real run stops at
+  # 69 with the named line (nothing created — the fake HOME's tree would show it), a dry run shows
+  # the same verdict and continues; df failing or unparsable is 69 in a dry run too; the override is
+  # honored when positive and a named 64 when not; the default OUT lands outside every tree.
+  check 'disk: above the floor, the verdict line and a dry run that proceeds' 0 \
+    '^gate-batch: disk: [0-9.]+ GiB free on /fake/mount \(for .*\), above the [0-9]+ GiB floor$' "${gb[@]}" --dry-run host
+  check 'disk: below the floor, a real run stops with 69 and the named line' 69 \
+    '^gate-batch: disk: [0-9.]+ GiB free on /fake/mount .* below the [0-9]+ GiB floor' \
+    env HOME=$t/home-low DISK_KB=1024 "${gb[@]}" host
+  check "disk: below the floor, the real run's OUT is not created" 69 '^gate-batch: disk:' \
+    env HOME=$t/home-low2 DISK_KB=1024 "${gb[@]}" host
+  [ ! -e "$t/home-low2" ] || fail "a refused run created its OUT under $t/home-low2"
+  check 'disk: a failing df is a named 69 in a dry run too' 69 \
+    '^gate-batch: disk: df -Pk .* failed \(rc 1\): df: fake failure$' env DISK_RC=1 "${gb[@]}" --dry-run host
+  check 'disk: df output that does not parse is a named 69' 69 'output does not parse' \
+    env DISK_BAD=1 "${gb[@]}" --dry-run host
+  check 'disk: BLOOMERY_MIN_FREE_GIB=abc is a named 64' 64 \
+    "^gate-batch: BLOOMERY_MIN_FREE_GIB='abc' is not a positive integer of GiB$" \
+    env BLOOMERY_MIN_FREE_GIB=abc "${gb[@]}" --dry-run host
+  check 'disk: BLOOMERY_MIN_FREE_GIB=0 is a named 64 too' 64 'is not a positive integer of GiB' \
+    env BLOOMERY_MIN_FREE_GIB=0 "${gb[@]}" --dry-run host
+  check 'disk: a positive override raises the floor (the fake disk is below it)' 0 'below the 999999 GiB floor' \
+    env BLOOMERY_MIN_FREE_GIB=999999 "${gb[@]}" --dry-run host
+  check 'disk: below the floor, --dry-run prints the verdict and exits 0' 0 'below the [0-9]+ GiB floor' \
+    env DISK_KB=1024 "${gb[@]}" --dry-run host
+  out=$(env HOME=$t/home-dry "${gb[@]}" --dry-run host 2>&1) || fail "a dry run under a fake HOME failed: $out"
+  case $out in
+    *"logs would go to $t/home-dry/.cache/bloomery/batches/$(basename "$t")/"*) pass 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' ;;
+    *) fail 'disk: the default OUT is $HOME/.cache/bloomery/batches/<tree>/<stamp>' "the dry run says: $out" ;;
+  esac
+  [ ! -e "$t/home-dry" ] || fail "the dry run created its OUT tree under $t/home-dry"
   echo "gate-batch self-test: $((n - bad)) of $n ok"
   [ "$bad" = 0 ]
 }
@@ -1148,13 +1260,25 @@ ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose ke
 }
 
 if [ -z "$OUT" ]; then
-  OUT="$ROOT/target/gate-batch/$(date +%Y%m%d-%H%M%S)"
+  OUT="$HOME/.cache/bloomery/batches/$(basename "$ROOT")/$(date +%Y%m%d-%H%M%S)"
 fi
 case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 case "$OUT/" in
   "$ROOT"/target/*) ;;
   "$ROOT"/*) die "--out $OUT is inside the tree but not under target/: box.sh would ship the logs and mark the tree dirty" ;;
 esac
+
+# The disk floor (the header): both volumes before the log directory exists and any lane starts. A
+# below-floor verdict (rc 1, the line printed by disk_ok) ends a real run at 69; a dry run says so
+# and continues, and a df that could not be read (69) fails it too.
+rc=0; disk_ok "$ROOT/target" || rc=$?
+case $rc in 0) ;; 1) below=1 ;; *) exit "$rc" ;; esac
+rc=0; disk_ok "$OUT" || rc=$?
+case $rc in 0) ;; 1) below=1 ;; *) exit "$rc" ;; esac
+if [ "${below:-0}" = 1 ]; then
+  if [ "$DRY" = 0 ]; then exit 69; fi
+  echo "gate-batch: dry run — a real run would not start (the disk floor above)" >&2
+fi
 
 if [ "$DRY" = 0 ]; then
   mkdir -p "$OUT" || RC=73 die "cannot create the log directory $OUT"
