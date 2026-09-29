@@ -18,6 +18,8 @@
 #   the read side, from tools/ref/lease-probe.sh, which this file sources first: the lease's file
 #   (LEASE_LOCK), its probe (lease_free, a shared lock), the holds (/root/bloomery-<owner>-hold),
 #   tools/box.sh's guard (lease_guard) and naming the lease's holder to a waiter (lease_holders);
+#   which process on a card is the runner's own (lease_pid_is_ours): the one rule the card guards
+#   share, so a load group's engine between its arms is not read as a co-tenant;
 #   the bound on every process a runner starts under the lease (lease_bounded);
 #   the card every lease needs (tools/ref/card.py, at lease_take below): no card, no lease;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
@@ -104,6 +106,98 @@ LEASE_GPU_WAIT=${LEASE_GPU_WAIT:-900}
 LEASE_GPU_POLL=${LEASE_GPU_POLL:-15}
 LEASE_GPU_REPORT=${LEASE_GPU_REPORT:-60}
 
+# lease_pid_is_ours <pid>: 0 when <pid> is this runner's own process — the one rule the card guards
+# share (lease_gpu_idle here, guard_other and guard_cards in timing-card.sh). A load group
+# (tools/ref/load-groups.sh) keeps one engine process across a round's arms, resident on the card
+# between them, so a guard must tell it from a co-tenant. Two proofs, either closes it: the process
+# holds the lease's descriptor 9 — the same file, compared as device and inode, not by path, because
+# a path can be recreated where an inode cannot — or it descends from the runner (LEASE_OWNER_PID,
+# recorded at the take: $$ in a subshell stays the runner's, so a helper called from one compares
+# against the runner). While this runner holds the lease's flock no other runner's process can hold
+# that descriptor: an inherited descriptor keeps the lock, so a leftover of an earlier sitting blocks
+# the take instead of reading as ours here. A pid whose /proc entry is gone or unreadable cannot be
+# proven ours, so it is waited on as foreign; a pid that is not a number is named and waited on the
+# same way. BLOOMERY_LEASE_PROC names another /proc tree, as it does for guard_cpu (the self-test,
+# which runs where /proc does not exist).
+lease_pid_is_ours() {
+  local proc=${BLOOMERY_LEASE_PROC:-/proc} owner=${LEASE_OWNER_PID:-$$} ppid id mine seen=0
+  case $1 in
+    '' | *[!0-9]* | 0)
+      echo "[lease] lease_pid_is_ours: a pid is a positive number, got '$1': it cannot be proven ours, so it counts as busy" >&2
+      return 1
+      ;;
+  esac
+  if mine=$(__lease_file_id "$proc/$owner/fd/9"); then
+    if id=$(__lease_file_id "$proc/$1/fd/9"); then
+      [ "$id" = "$mine" ] && return 0
+    fi
+  fi
+  # The ppid walk, bounded as guard_cpu's is: a chain longer than this is not a process tree.
+  ppid=$1
+  while [ "$ppid" -gt 1 ] && [ "$seen" -lt 256 ]; do
+    [ "$ppid" != "$owner" ] || return 0
+    ppid=$(__lease_ppid "$proc" "$ppid") || return 1
+    seen=$((seen + 1))
+  done
+  return 1
+}
+# __lease_file_id <path>: `<device>:<inode>` of the file the path names, following symlinks (a
+# /proc fd entry). GNU stat and BSD stat spell it differently, and the self-test runs on both.
+__lease_file_id() {
+  local id
+  id=$(stat -Lc '%d:%i' "$1" 2> /dev/null) || id=$(stat -L -f '%d:%i' "$1" 2> /dev/null) || return 1
+  printf '%s' "$id"
+}
+# __lease_ppid <proc root> <pid>: the pid's ppid from its stat line, read past the comm (which can
+# hold spaces and parens: everything through the last ')' is the pid and the comm). 1 when the line
+# is gone or is not a stat line.
+__lease_ppid() {
+  local s
+  [ -r "$1/$2/stat" ] || return 1
+  read -r s < "$1/$2/stat" || return 1
+  s=${s##*)}
+  set -- $s
+  case ${2:-} in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$2"
+}
+# __lease_apps_split_own <rows> <pid field>: nvidia-smi compute-apps csv rows split by
+# lease_pid_is_ours — the runner's own rows into LEASE_APPS_OWN, the rest (foreign, or a pid that
+# cannot be proven ours) into LEASE_APPS_FOREIGN, each row unchanged. The pid field is 2 in
+# guard_cards's gpu_uuid,pid,used_memory rows and 1 in the pid,used_memory rows.
+__lease_apps_split_own() {
+  local row pid
+  LEASE_APPS_OWN='' LEASE_APPS_FOREIGN=''
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    pid=$(printf '%s\n' "$row" | cut -d, -f"$2" | tr -d ' ')
+    if lease_pid_is_ours "$pid"; then
+      LEASE_APPS_OWN+="${LEASE_APPS_OWN:+$'\n'}$row"
+    else
+      LEASE_APPS_FOREIGN+="${LEASE_APPS_FOREIGN:+$'\n'}$row"
+    fi
+  done <<< "$1"
+}
+# __lease_apps_own_line <rows> <pid field> <where>: one line naming the runner's own process(es) a
+# guard did not count, each pid once with its exe (one process spans both cards as one pid), so the
+# log still shows what was on the card.
+__lease_apps_own_line() {
+  local row pid exe said='' list=''
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    pid=$(printf '%s\n' "$row" | cut -d, -f"$2" | tr -d ' ')
+    case ",$said," in
+      *",$pid,"*) continue ;;
+    esac
+    said+="${said:+,}$pid"
+    exe=$(readlink "/proc/$pid/exe" 2> /dev/null) || exe='?'
+    list+="${list:+, }pid $pid (${exe:-?})"
+  done <<< "$1"
+  [ -n "$list" ] || return 0
+  echo "[cards-own] $(now) the runner's own process(es) on $3, not counted: $list"
+}
+
 # __lease_gpu_holders <uuid> <compute-apps csv>: one line per process nvidia-smi listed — its pid,
 # its exe and cwd, its age in seconds, its card memory — what a waiter, or the log of a run that
 # ended beside the process, needs to name the co-tenant.
@@ -145,6 +239,11 @@ lease_gpu_idle() {
         echo "[lease] nvidia-smi on the timing card ($uuid) failed (rc $__witness_rc): its compute processes cannot be read, so no timed run starts beside them (exit 69)" >&2
         exit 69
       fi
+      # The runner's own rows are not co-tenants (lease_pid_is_ours) — the rule the guards between
+      # arms use; at the take no child of the runner exists yet, so this drops nothing here.
+      __lease_apps_split_own "$__witness_out" 1
+      [ -z "$LEASE_APPS_OWN" ] || __lease_apps_own_line "$LEASE_APPS_OWN" 1 'the timing card' >&2
+      __witness_out=$LEASE_APPS_FOREIGN
       if [ -z "$__witness_out" ]; then
         if [ "$waited" = 0 ]; then
           echo "[lease] timing card idle: $uuid"
@@ -190,6 +289,9 @@ lease_take() {
   lease_card || exit $?
   [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ] ||
     echo "[lease] BLOOMERY_LEASE_LOCK=$LEASE_LOCK is not the machine lease: nothing measured under it is admissible"
+  # The runner the card guards compare against (lease_pid_is_ours): recorded once, so a helper
+  # called from a subshell still compares against the runner.
+  LEASE_OWNER_PID=$$
   exec 9>"$LEASE_LOCK"
   if ! flock -n 9; then
     local waited=0
@@ -711,6 +813,43 @@ EOF
   witness_card() { echo '    a6000-apps: unresolved (no A6000 UUID)'; }
   OUT=$(__witness_card 2>&1)
   matches tag-unresolved-untouched '^    a6000-apps: unresolved \(no A6000 UUID\)$' "$OUT"
+  # ---- lease_pid_is_ours ----
+  # A made-up /proc tree (BLOOMERY_LEASE_PROC, as the card tests use it: this runs on the Mac too):
+  # pid 101 holds the lease's descriptor 9 as the runner does, 102 descends from it without the
+  # descriptor, 103 is foreign under init, and nothing holds 4000000. The runner is this shell,
+  # which opens the lease on its own descriptor 9.
+  proc=$t/proc
+  mkdir -p "$proc/$$/fd" "$proc/101/fd" "$proc/102" "$proc/103"
+  exec 9>"$t/lease"
+  ln -s "$t/lease" "$proc/$$/fd/9"
+  ln -s "$t/lease" "$proc/101/fd/9"
+  printf '101 (own child) S %s 1 0 0 0 0\n' "$$" > "$proc/101/stat"
+  printf '102 (own grandchild) S 101 1 0 0 0 0\n' > "$proc/102/stat"
+  printf '103 (foreign) S 1 1 0 0 0 0\n' > "$proc/103/stat"
+  LEASE_OWNER_PID=$$ BLOOMERY_LEASE_PROC=$proc
+  # A numeric pid is answered in silence: a guard asks per row and per poll, so the not-ours path
+  # prints nothing (the named line is the non-numeric pid's alone).
+  RC=0 OUT=$(lease_pid_is_ours 101 2>&1) || RC=$?
+  check own-fd9-rc "$RC" 0
+  check own-fd9-silent "$OUT" ''
+  RC=0 OUT=$(lease_pid_is_ours 102 2>&1) || RC=$?
+  check own-descend-rc "$RC" 0
+  RC=0 OUT=$(lease_pid_is_ours 103 2>&1) || RC=$?
+  check foreign-rc "$RC" 1
+  check foreign-silent "$OUT" ''
+  RC=0 OUT=$(lease_pid_is_ours 4000000 2>&1) || RC=$?
+  check gone-rc "$RC" 1
+  check gone-silent "$OUT" ''
+  # The runner itself (a runner that execs into its engine keeps LEASE_OWNER_PID's pid) is ours.
+  RC=0 OUT=$(lease_pid_is_ours $$ 2>&1) || RC=$?
+  check own-self-rc "$RC" 0
+  RC=0
+  OUT=$(lease_pid_is_ours not-a-pid 2>&1) || RC=$?
+  check nonnumeric-rc "$RC" 1
+  matches nonnumeric-line "^\[lease\] lease_pid_is_ours: a pid is a positive number, got 'not-a-pid': it cannot be proven ours, so it counts as busy\$" "$OUT"
+  unset LEASE_OWNER_PID BLOOMERY_LEASE_PROC
+  exec 9>&-
+  # ---- end lease_pid_is_ours ----
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit

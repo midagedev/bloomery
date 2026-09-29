@@ -171,6 +171,13 @@ guard_other() {
     return 0
   fi
   apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
+  if [ -n "$apps" ]; then
+    # The runner's own rows are not co-tenants (lease_pid_is_ours, lease.sh) — the same rule
+    # guard_cards uses, so the runner never tags its own process [other-busy].
+    __lease_apps_split_own "$apps" 1
+    [ -z "$LEASE_APPS_OWN" ] || __lease_apps_own_line "$LEASE_APPS_OWN" 1 'the other card' >&2
+    apps=$LEASE_APPS_FOREIGN
+  fi
   # shellcheck disable=SC2034 # read by the runners that source this file
   OTHER_BUSY_TAG=${apps:+ [other-busy]}
   [ -n "$apps" ] || return 0
@@ -369,25 +376,33 @@ witness_cards() {
 # guard_cards: guard_other in the two-card mode. Both cards are timed, so a compute process on either as
 # an arm starts (another round's functional run or an `any` gate finishing: minutes) is waited out,
 # polling every 10 s, and after 10 minutes ends the run: a witness block and rc 75, contention, not a
-# result. Every two-card arm is a process of its own, so none of the runner's own is on a card here.
+# result. A load group keeps one process of the runner's own across a round's arms, resident on both
+# cards between them: lease_pid_is_ours (lease.sh) tells it from a co-tenant, its rows are not counted
+# and one [cards-own] line names what was dropped. A query that fails counts as busy, named, so the
+# wait ends at 75 instead of timing a lost card.
 # TIMING_CARDS_POLL (seconds, default 10) is the stub tests' (tools/ref/depth-*-stub.sh) short poll.
 guard_cards() {
-  local apps i uuid poll=${TIMING_CARDS_POLL:-10}
+  local apps own i uuid poll=${TIMING_CARDS_POLL:-10} own_named=0
   # shellcheck disable=SC2034 # read by the runners that source this file
   OTHER_BUSY_TAG=
   for ((i = 0; i < 60; i++)); do
     # Bounded (__witness_smi): a card off the bus can hang the query, and this loop is inside the lease.
-    # A query that fails counts as busy, named, so the wait ends at 75 instead of timing a lost card.
-    apps=''
+    apps='' own=''
     for uuid in "$GPU_A6000" "$GPU_3090"; do
       __witness_smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader -i "$uuid"
       if [ "$__witness_rc" != 0 ]; then
         apps+="$uuid: nvidia-smi rc $__witness_rc"$'\n'
       elif [ -n "$__witness_out" ]; then
-        apps+="$__witness_out"$'\n'
+        __lease_apps_split_own "$__witness_out" 2
+        own+="${LEASE_APPS_OWN:+$LEASE_APPS_OWN$'\n'}"
+        [ -z "$LEASE_APPS_FOREIGN" ] || apps+="$LEASE_APPS_FOREIGN"$'\n'
       fi
     done
-    apps=${apps%$'\n'}
+    apps=${apps%$'\n'} own=${own%$'\n'}
+    if [ -n "$own" ] && [ "$own_named" = 0 ]; then
+      __lease_apps_own_line "$own" 2 'a timed card' >&2
+      own_named=1
+    fi
     if [ -z "$apps" ]; then
       [ "$i" = 0 ] || echo "[cards-busy] $(now) both cards are free after $((i * poll)) s" >&2
       return 0

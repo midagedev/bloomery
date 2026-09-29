@@ -80,6 +80,22 @@
 #   bp-onecard   BLOOMERY_GEN_PLACE=bp outside the two-card mode: refused by name, rc 64.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
+#   twocard-own  BLOOMERY_GEN_PLACE=bp, 6 4, one round: one load of both ours arms in one process, and a
+#                nvidia-smi wrapper this case installs (STUB_CARD_PIDS, the file the stub generate_ds41
+#                appends its pid to) reports that pid on both cards whenever it lives: each arm's guard
+#                drops it as the runner's own — one [cards-own] line per arm, no [cards-busy] — and both
+#                rows land; rc 0. Red on the runner before the rule: the pid is foreign, [cards-busy],
+#                rc 75 after the wait.
+#   twocard-own-arm  the same two arms under BLOOMERY_AB_LOAD=arm: every arm a one-arm unit, still one
+#                process a unit driven with --arm-sync, so the guard between each unit's load and its
+#                go sees that unit's own pid. Each arm runs in its own process (two distinct pids in
+#                the pids file), one [cards-own] line a unit, no [cards-busy]; rc 0. Red on the runner
+#                before the rule as twocard-own is.
+#   twocard-foreign  the same load with a foreign pid beside the engine's (a sleep this script starts
+#                outside the runner's tree, recorded by $! and killed at the end: STUB_CARD_FOREIGN;
+#                the wrapper reports both only once the engine lives): the engine's pid is dropped
+#                ([cards-own]), the foreign one is waited on — [cards-busy] naming it alone, on both
+#                cards — and the run ends at rc 75 after the shortened wait (TIMING_CARDS_POLL).
 # The server arms and the warm rows (lcpp-warm.sh; red on the runner before them: arm usage, rc 64, or
 # BLOOMERY_WARM_ROWS ignored):
 #   srv          6 lcppsrv:6 4 lcppsrvpp:4 lcppsrvpp8:4, one round: each server arm's row (ids=lcg, its
@@ -290,6 +306,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "${arms[*]:-one}" >> "${TMPDIR:-/tmp}/stub-gen-loads"
+echo $$ >> "${TMPDIR:-/tmp}/stub-gen-pids"
 [ -z "$tokens" ] || depth=$(echo "$tokens" | tr ',' '\n' | grep -c .)
 [ ${#arms[@]} -gt 0 ] || arms=("$depth")
 echo "plan place=$place (stub)"
@@ -381,7 +398,7 @@ stub_run() {
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
   rm -f "$tmp/tmp"/stub-gen-failed-* "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp/stub-xid" \
-    "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-* "$tmp/tmp/stub-gen-feeds"
+    "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-* "$tmp/tmp/stub-gen-feeds" "$tmp/tmp/stub-gen-pids"
   echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
     BLOOMERY_CPU_BUSY_COMMS=none STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 \
@@ -787,6 +804,91 @@ elif want twocard-dry "$L" 1 "^\[dry\] model=.* card=A6000\+3090 .* CUDA_VISIBLE
   want twocard-dry "$L" 1 "^\[dry\] lcpp:6: timeout --kill-after=10 60 env  [^ ]*/lcpp-bench -m [^ ]* -p 0 -n 4 -d 6 -r 1 -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5 --progress "; then
   pass twocard-dry
 fi
+
+# The runner's own process between a load's arms. The nvidia-smi wrapper these cases run under
+# (the stub's own is kept as nvidia-smi.base and restored after) answers the two-card guard's
+# compute-apps query — the one with gpu_uuid — with the pids $STUB_CARD_PIDS lists while they live
+# (the stub generate_ds41 appends its pid there) plus $STUB_CARD_FOREIGN once the engine lives, and
+# delegates every other query to the stub's own nvidia-smi unchanged.
+mv "$T/bin/nvidia-smi" "$T/bin/nvidia-smi.base"
+cat > "$T/bin/nvidia-smi" << 'EOF'
+#!/usr/bin/env bash
+id=''
+for ((a = 1; a <= $#; a++)); do
+  case ${!a} in
+    -i) b=$((a + 1)); id=${!b} ;;
+  esac
+done
+case $* in
+  *gpu_uuid*)
+    if [ -n "${STUB_CARD_PIDS:-}" ]; then
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        kill -0 "$p" 2> /dev/null && echo "$id, $p, 100 MiB"
+      done < "$STUB_CARD_PIDS"
+      if [ -n "${STUB_CARD_FOREIGN:-}" ] && [ -s "$STUB_CARD_PIDS" ] && kill -0 "$STUB_CARD_FOREIGN" 2> /dev/null; then
+        echo "$id, $STUB_CARD_FOREIGN, 100 MiB"
+      fi
+      exit 0
+    fi
+    ;;
+esac
+exec "${0%/*}/nvidia-smi.base" "$@"
+EOF
+chmod +x "$T/bin/nvidia-smi"
+
+L=$tmp/twocard-own.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp \
+  STUB_CARD_PIDS="$tmp/tmp/stub-gen-pids" -- 6 4
+if [ "$RC" != 0 ]; then
+  fail twocard-own "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 4" ]; then
+  fail twocard-own "the load's --arm list: $(paste -sd'|' - < "$LOADS"), want 6 4 (one process, both arms)" "$L"
+elif want twocard-own "$L" 2 '^ROW r1 ours d=[46] n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth [46], A6000\+3090 \| place bp ' &&
+  want twocard-own "$L" 2 '^\[cards-own\] .* the runner.s own process\(es\) on a timed card, not counted: pid [0-9]+ \(.*\)$' &&
+  want twocard-own "$L" 0 '^\[cards-busy\]' &&
+  want twocard-own "$L" 1 '^\[load\] r1 2 arm\(s\): 6 4 - one process, one load$' &&
+  want twocard-own "$L" 0 '^FAIL '; then
+  pass twocard-own
+fi
+
+# The same two arms under BLOOMERY_AB_LOAD=arm: every arm a one-arm unit, still one process a unit
+# driven with --arm-sync, so the guard between the unit's load and its go sees that unit's own pid.
+L=$tmp/twocard-own-arm.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp \
+  BLOOMERY_AB_LOAD=arm STUB_CARD_PIDS="$tmp/tmp/stub-gen-pids" -- 6 4
+if [ "$RC" != 0 ]; then
+  fail twocard-own-arm "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6|4" ]; then
+  fail twocard-own-arm "the units' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6|4 (a process an arm)" "$L"
+elif [ "$(grep -c . "$tmp/tmp/stub-gen-pids")" != 2 ] || [ "$(sort -u "$tmp/tmp/stub-gen-pids" | grep -c .)" != 2 ]; then
+  fail twocard-own-arm "the units' pids: $(paste -sd, - < "$tmp/tmp/stub-gen-pids"), want two distinct" "$L"
+elif want twocard-own-arm "$L" 2 '^ROW r1 ours d=[46] n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth [46], A6000\+3090 \| place bp ' &&
+  want twocard-own-arm "$L" 2 '^\[cards-own\] .* the runner.s own process\(es\) on a timed card, not counted: pid [0-9]+ \(.*\)$' &&
+  want twocard-own-arm "$L" 0 '^\[cards-busy\]' &&
+  want twocard-own-arm "$L" 2 '^\[load\] r1 1 arm\(s\): [46] - one process, one load$' &&
+  want twocard-own-arm "$L" 0 '^FAIL '; then
+  pass twocard-own-arm
+fi
+
+# The foreign pid: a sleep this script starts outside the runner's tree (a sibling of the runner, not
+# a descendant, and it holds no lease descriptor), recorded by $! and killed at the end.
+sleep 300 & FPID=$!
+L=$tmp/twocard-foreign.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp \
+  STUB_CARD_PIDS="$tmp/tmp/stub-gen-pids" STUB_CARD_FOREIGN="$FPID" -- 6 4
+kill "$FPID" 2> /dev/null
+wait "$FPID" 2> /dev/null
+if [ "$RC" != 75 ]; then
+  fail twocard-foreign "rc $RC, want 75" "$L"
+elif want twocard-foreign "$L" 1 '^\[cards-own\] .* the runner.s own process\(es\) on a timed card, not counted: pid [0-9]+ \(.*\)$' &&
+  want twocard-foreign "$L" 1 "^\[cards-busy\] .* compute apps on a timed card: \[$STUB_GPU_A6000, $FPID, 100 MiB;$STUB_GPU_3090, $FPID, 100 MiB;\]; waiting up to 10 min$" &&
+  want twocard-foreign "$L" 1 '^\[cards-busy\] .* still busy after 60 s: ' &&
+  want twocard-foreign "$L" 0 '^ROW '; then
+  pass twocard-foreign
+fi
+
+mv "$T/bin/nvidia-smi.base" "$T/bin/nvidia-smi"
 SRVROW='\| llama-server ids=lcg: warm-up 20.00 tok/s majflt 0, continuation same \| prompt_n 6 prompt tok/s 60.00 \| build 1 \(stub\) \| device Stub Card \| majflt 0 \(timed 0; ≤ 0.0 % of W 0.2500 s\) \| wall [0-9]+s$'
 L=$tmp/srv.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 lcppsrv:6 4 lcppsrvpp:4 lcppsrvpp8:4
