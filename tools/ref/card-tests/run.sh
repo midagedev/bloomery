@@ -277,19 +277,24 @@ else
     fail 'lease_take prints the whole body' "$card_lines [lease] card | lines for a $body_lines-line card" "$tmp/out"; fi
   free 'the lease ends with the shell that took it' "$tmp/l2.lock"
   # The timing-card record beside the lock (tools/gpu-gate.sh reads it while the lease is held): the
-  # runner's pid and its TIMING_GPU, `none` for a runner that times no GPU.
+  # runner's pid and its TIMING_GPU, `none` for a runner that times no GPU. lease_gpu_idle reads the
+  # timing card's compute apps through nvidia-smi, so the two runs below that name a timing card
+  # carry a stub that answers none (rc 0, no output).
+  mkdir -p "$tmp/idle"
+  printf '#!/bin/sh\nexit 0\n' > "$tmp/idle/nvidia-smi"
+  chmod +x "$tmp/idle/nvidia-smi"
   run 'lease_take records a CPU runner as timing no GPU' 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
     BLOOMERY_LEASE_LOCK="$tmp/g1.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
     bash -c 'source "$1" && lease_take > /dev/null && r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" &&
       [ "$r" = "pid=$$ timing_gpu=none" ] && echo "record matches"' _ "$T/tools/ref/lease.sh"
   run "lease_take records a GPU runner's timing card" 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
-    BLOOMERY_LEASE_LOCK="$tmp/g2.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+    BLOOMERY_LEASE_LOCK="$tmp/g2.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card PATH="$tmp/idle:$PATH" \
     bash -c 'source "$1" && witness_card() { :; } && TIMING_GPU=GPU-test && lease_take > /dev/null &&
       r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-test" ] && echo "record matches"' \
     _ "$T/tools/ref/lease.sh"
   # timing-card.sh's two-card mode: both cards, the A6000 (TIMING_GPU) first; gpu-gate.sh reads it as a doubt.
   run "lease_take records both cards of a two-card run" 0 '^record matches$' env -u BLOOMERY_LEASE_HELD \
-    BLOOMERY_LEASE_LOCK="$tmp/g3.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card \
+    BLOOMERY_LEASE_LOCK="$tmp/g3.lock" BLOOMERY_LEASE_CARD=docs/cards/exclusive.card PATH="$tmp/idle:$PATH" \
     bash -c 'source "$1" && [ "$LEASE_CARDS_RECORD" = 1 ] && witness_card() { :; } && TIMING_GPU=GPU-a && TIMING_GPU2=GPU-b &&
       lease_take > /dev/null && r=$(cat "$BLOOMERY_LEASE_LOCK.card") && echo "$r" && [ "$r" = "pid=$$ timing_gpu=GPU-a,GPU-b" ] &&
       echo "record matches"' _ "$T/tools/ref/lease.sh"

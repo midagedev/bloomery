@@ -132,6 +132,14 @@ if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
   exit 1
 fi
 echo "${cards##*$'\n'}"
+# lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
+# stub nvidia-smi in a temp dir, no card, no lock, no /proc.
+if ! lse=$(bash "$(dirname "$0")/ref/lease.sh" --self-test 2>&1); then
+  echo "$lse" >&2
+  echo "check-recipes: the lease self-test failed" >&2
+  exit 1
+fi
+echo "${lse##*$'\n'}"
 # box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
 # the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.
 if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
