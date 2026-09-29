@@ -591,7 +591,9 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // spread replayed over the 43 eligible layers — three stacks each (921,600 +
 // 921,600 + 1,228,800 B an expert) in whole 2 MiB granules past CARD_DENSE +
 // CARD_ROUNDING — by a replica that first reproduced all sixteen old rows
-// exactly, so its rows are the pins; the biggest moves are the A6000 4k rows
+// exactly, so its rows are the pins — its rounding column counted only the
+// experts' granules, and each row's rounding is the dense part's 398,422,528 B
+// plus those, as the host plans' rows carry; the biggest moves are the A6000 4k rows
 // at U 4,096 (303/302 → 299/298, 149 experts off the card) and the 3090 32k
 // row at U 4,096 (103/102 → 98, 176 experts), the smallest the rows whose
 // budget slack absorbed the term].
@@ -605,7 +607,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         27,
         298,
         39_447_552_000,
-        129_900_544,
+        528_323_072,
     ),
     (
         "A6000",
@@ -616,7 +618,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         39,
         318,
         42_126_336_000,
-        150_151_168,
+        548_573_696,
     ),
     (
         "A6000",
@@ -627,7 +629,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         20,
         277,
         36_652_032_000,
-        134_111_232,
+        532_533_760,
     ),
     (
         "A6000",
@@ -638,7 +640,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         12,
         298,
         39_401_472_000,
-        81_608_704,
+        480_031_232,
     ),
     (
         "A6000",
@@ -649,7 +651,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         41,
         291,
         38_565_888_000,
-        197_869_568,
+        596_292_096,
     ),
     (
         "A6000",
@@ -660,7 +662,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         33,
         312,
         41_315_328_000,
-        145_367_040,
+        543_789_568,
     ),
     (
         "A6000",
@@ -671,7 +673,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         27,
         270,
         35_748_864_000,
-        164_864_000,
+        563_286_528,
     ),
     (
         "A6000",
@@ -682,7 +684,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         16,
         291,
         38_489_088_000,
-        117_383_168,
+        515_805_696,
     ),
     (
         "3090",
@@ -693,7 +695,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         29,
         104,
         13_827_072_000,
-        152_543_232,
+        550_965_760,
     ),
     (
         "3090",
@@ -704,7 +706,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         19,
         125,
         16_570_368_000,
-        101_990_400,
+        500_412_928,
     ),
     (
         "3090",
@@ -715,7 +717,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         1,
         84,
         11_099_136_000,
-        87_072_768,
+        485_495_296,
     ),
     (
         "3090",
@@ -726,7 +728,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         13,
         104,
         13_777_920_000,
-        101_031_936,
+        499_454_464,
     ),
     (
         "3090",
@@ -737,7 +739,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         43,
         98,
         12_945_408_000,
-        220_512_256,
+        618_934_784,
     ),
     (
         "3090",
@@ -748,7 +750,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         40,
         118,
         15_710_208_000,
-        148_455_424,
+        546_877_952,
     ),
     (
         "3090",
@@ -759,7 +761,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         8,
         77,
         10_195_968_000,
-        117_825_536,
+        516_248_064,
     ),
     (
         "3090",
@@ -770,7 +772,7 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         17,
         97,
         12_865_536_000,
-        136_806_400,
+        535_228_928,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
