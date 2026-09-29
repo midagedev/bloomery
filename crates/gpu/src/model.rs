@@ -35,6 +35,8 @@ pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
+use crate::host::swap::{MachineCfg, Residency};
+use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -42,8 +44,10 @@ use bloomery_levers::HostCfg;
 use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
+use model::placement::churn::ChurnPool;
 use model::placement::{ExpertList, Plan};
 use std::ops::Range;
+use std::sync::Arc;
 
 // -------------------------------------------------------------- chain body
 
@@ -181,6 +185,16 @@ pub trait HostServed {
     /// ([`crate::host::HostTier::stop_swap`]): the model's drop calls it
     /// first. A body with no machine does nothing.
     fn stop_residency(&mut self) {}
+
+    /// Start the residency machine the load prepared
+    /// ([`crate::host::HostTier::start_swap`]), once the body's pieces are
+    /// sized: the machine empties each layer's spare slots, so every piece
+    /// that sizes itself from the map's capacity is made first. Load-time
+    /// only. A body with no machine does nothing.
+    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        let _ = gpu;
+        Ok(())
+    }
 }
 
 /// The host service of a body whose chain runs on the card alone: no value
@@ -358,6 +372,16 @@ pub struct Resident<B> {
     pub ctx_max: usize,
 }
 
+/// The placed load's pieces between its prelude and its body
+/// ([`GpuModel::placed_pre`]).
+struct PlacedPre {
+    gpu: Gpu,
+    weights: Weights,
+    layers: Range<usize>,
+    head: bool,
+    ctx_max: usize,
+}
+
 /// One resident model on one card. Everything `step` touches is allocated at
 /// load, never per step. A second card is another `GpuModel` (a draft's).
 ///
@@ -489,7 +513,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// a host expert page; `host` also says whether
     /// the card segments' file pages are released once uploaded. The caches hold the plan's `ctx_max` rows, the
     /// context its budget was made for. The card is found by its name in the
-    /// plan ([`Gpu::for_card`]), never by ordinal.
+    /// plan ([`Gpu::for_card`]), never by ordinal. A load under adaptive
+    /// residency goes through [`GpuModel::load_placed_with`], which hands the
+    /// body the file as one `Arc` the machine's source shares.
     pub fn load_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -498,59 +524,81 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        GpuModel::load_placed_with(file, plan, card, host, &[], derive, body)
+        let (p, residency) = placed_pre(&file, plan, card, host, &[], derive)?;
+        let body = body(&p.gpu, file, &p.weights, residency)?;
+        placed_done(p, body)
     }
 
-    /// [`GpuModel::load_placed`] whose host set also holds `extra`, experts
-    /// of the card's segments the host must serve too (adaptive residency's
-    /// churn pool, [`HostResidency::at_load_with`]): read in after the card
-    /// segments' pages were released, so a pool expert's host bytes are
-    /// resident again before the body's machine asks.
+    /// [`GpuModel::load_placed`] under `residency` ([`ResidencySpec`]): the
+    /// plan's host set also holds each layer's churn pool — the card's
+    /// experts past the pinned ones ([`ChurnPool`]), checked before anything
+    /// uploads — and the body is handed the file as one `Arc` the machine's
+    /// source shares, the host set, and the [`ResidencyGlue`] that starts the
+    /// machine over its slot map ([`HostServed::start_residency`], called
+    /// once the body's pieces are sized) and carries its boundary calls.
     #[allow(
         clippy::too_many_arguments,
-        reason = "load_placed's arguments and the host set's extra runs (rust-quality R8)"
+        reason = "load_placed's arguments and the residency spec (rust-quality R8)"
     )]
     pub fn load_placed_with(
         file: Split,
         plan: &Plan<'_>,
         card: usize,
         host: HostCfg,
-        extra: &[(usize, ExpertList)],
+        residency: ResidencySpec,
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
-        body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
+        body: impl FnOnce(
+            &Gpu,
+            &Arc<Split>,
+            &Weights,
+            HostResidency,
+            ResidencyGlue,
+        ) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let what = "GpuModel::load_placed";
-        let spec = plan
-            .machine
-            .cards
-            .get(card)
-            .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
-        let ctx_max = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0)
-            .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
-        let layers = spec.layers.clone();
-        let gpu = Gpu::for_card(&spec.name)?;
-        let mut weights =
-            Weights::load_placed(gpu.stream(), &file, plan, card, host.card_dontneed)?;
-        derive(gpu.stream(), &file, layers, &mut weights)?;
-        // After the uploads, so the card's file bytes have left the page
-        // cache before the host set is read in; before the body, which
-        // takes `file`.
-        let residency = HostResidency::at_load_with(&file, plan, |_| true, host, extra)?;
-        let body = body(&gpu, file, &weights, residency)?;
-        let head = if spec.head {
-            Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
-        } else {
-            None
+        const WHAT: &str = "GpuModel::load_placed_with";
+        let churn = match residency.lever {
+            Residency::Off => None,
+            Residency::Mid { pinned, .. } => {
+                Some(ChurnPool::of(plan, card, pinned).map_err(|e| GpuError::plan(WHAT, e))?)
+            }
         };
-        Ok(GpuModel::new(Resident {
-            gpu,
-            weights,
-            body,
-            head,
-            ctx_max,
-        }))
+        if let Some(p) = &churn {
+            p.check(plan).map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        let extra = churn.as_ref().map_or(&[][..], |p| p.runs.as_slice());
+        let file = Arc::new(file);
+        let (p, set) = placed_pre(&file, plan, card, host, extra, derive)?;
+        let glue = match residency.lever {
+            Residency::Off => ResidencyGlue::off(),
+            lever @ Residency::Mid { .. } => {
+                let (params, pinned) = lever
+                    .params(residency.delay)
+                    .ok_or_else(|| GpuError::shape(WHAT, "a residency machine with no rule"))?;
+                let source = FileSwap::new(
+                    plan,
+                    p.layers.clone(),
+                    Arc::clone(&file),
+                    host.r8,
+                    set.set().clone(),
+                    set.populated().is_some(),
+                    &p.weights,
+                    residency.stacks.as_ref(),
+                    p.gpu.context(),
+                )?;
+                ResidencyGlue::new(
+                    source,
+                    MachineCfg {
+                        params,
+                        pinned: vec![pinned; p.layers.len()],
+                        top_k: residency.top_k,
+                        max_rows: residency.max_rows,
+                        deadline: residency.deadline,
+                    },
+                )
+            }
+        };
+        let body = body(&p.gpu, &file, &p.weights, set, glue)?;
+        placed_done(p, body)
     }
 
     /// What the load did to the plan's host set — populated, locked — on a
@@ -1048,6 +1096,68 @@ impl<B: ChainBody> GpuModel<B> {
         self.stand_at(pos + n);
         Ok(token)
     }
+}
+
+/// The steps of a placed load before its body: the plan's card and context
+/// budget, the card, its weights with `derive`'s filings, and — after the
+/// uploads, so the card's file bytes have left the page cache first — the
+/// plan's host set read in and locked as `host` asks, with `extra` beside
+/// it. The pieces, and the host set.
+fn placed_pre(
+    file: &Split,
+    plan: &Plan<'_>,
+    card: usize,
+    host: HostCfg,
+    extra: &[(usize, ExpertList)],
+    derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+) -> Result<(PlacedPre, HostResidency), GpuError> {
+    let what = "GpuModel::load_placed";
+    let spec = plan
+        .machine
+        .cards
+        .get(card)
+        .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+    let ctx_max = usize::try_from(plan.ctx_max)
+        .ok()
+        .filter(|&c| c > 0)
+        .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
+    let layers = spec.layers.clone();
+    let gpu = Gpu::for_card(&spec.name)?;
+    let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
+    derive(gpu.stream(), file, layers.clone(), &mut weights)?;
+    let residency = HostResidency::at_load_with(file, plan, |_| true, host, extra)?;
+    Ok((
+        PlacedPre {
+            gpu,
+            weights,
+            layers,
+            head: spec.head,
+            ctx_max,
+        },
+        residency,
+    ))
+}
+
+/// The placed load after its body: the output head the card carries, over the
+/// body's weights, and the model over all of it.
+fn placed_done<B: ChainBody>(p: PlacedPre, body: B) -> Result<GpuModel<B>, GpuError> {
+    let PlacedPre {
+        gpu,
+        weights,
+        layers: _,
+        head,
+        ctx_max,
+    } = p;
+    let head = head
+        .then(|| Head::of(&gpu, &weights, body.head_eps(), body.head_norm()))
+        .transpose()?;
+    Ok(GpuModel::new(Resident {
+        gpu,
+        weights,
+        body,
+        head,
+        ctx_max,
+    }))
 }
 
 // -------------------------------------------------------- the capabilities
