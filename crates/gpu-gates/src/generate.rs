@@ -170,7 +170,8 @@ impl<B: ChainBody> Generator<B> {
     /// loader (the file, the placement's machine and the context), run `check`
     /// on the loaded model (it refuses a body that cannot run this file, and
     /// adds the body's fields to the `load` record it is handed), then write
-    /// the `load` record ([`record::LOAD_GENERATOR`]), the host set's records
+    /// the `load` record ([`record::LOAD_GENERATOR`]), the load's phases when
+    /// the load timed them ([`record::LOAD_PHASES`]), the host set's records
     /// of a placed load, and in graph mode capture the step before any token
     /// (the `capture` record) — all to `log`.
     pub fn open<O, C>(
@@ -188,18 +189,35 @@ impl<B: ChainBody> Generator<B> {
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let machine = args.place.machine(None, args.tier_batch)?;
+        let headers = t.elapsed();
         let mut model = open(file, &machine, args.ctx)?;
         model.set_mode(args.mode);
         let load = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", model.resident_bytes())
             .u("ctx", args.ctx);
-        let load = check(&model, load)?
+        let load = check(&model, load)?;
+        let total = t.elapsed();
+        let load = load
             .w("mode", mode_name(args.mode))
             .w("place", args.place.name())
             .w("pin_main", if args.pin_main { "on" } else { "off" })
             .w("pinned", pinned)
-            .f("load_s", t.elapsed().as_secs_f64());
+            .f("load_s", total.as_secs_f64());
         writeln!(log, "{}", load.line())?;
+        if let Some(times) = model.load_times() {
+            let phases = record::load_phases(
+                total.as_secs_f64(),
+                headers.as_secs_f64(),
+                times.plan.map(|d| d.as_secs_f64()),
+                times.context.as_secs_f64(),
+                times.upload.as_secs_f64(),
+                times.derive.as_secs_f64(),
+                times.host_set.as_secs_f64(),
+                times.body.as_secs_f64(),
+                times.head.as_secs_f64(),
+            );
+            writeln!(log, "{}", phases.line())?;
+        }
         if let Some(h) = model.host_residency() {
             for r in record::host_residency(h) {
                 writeln!(log, "{}", r.line())?;

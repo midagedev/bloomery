@@ -281,10 +281,14 @@ mod drive {
         let mut g = Generator::open(
             open,
             |file, machine, ctx| {
+                let t = std::time::Instant::now();
                 let inputs = Body::inputs(&file)?;
                 let machine = machine(Body::layer_count(&inputs));
                 let plan = Body::plan(&inputs, &machine, ctx, &ds41)?;
-                Body::open(file, &inputs, &plan, &ds41)
+                let planned = t.elapsed();
+                let mut model = Body::open(file, &inputs, &plan, &ds41)?;
+                model.note_load_plan(planned);
+                Ok(model)
             },
             |m: &Deepseek41Model, load: Record| {
                 let body = m.body("bloomery-chat")?;

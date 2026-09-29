@@ -48,6 +48,7 @@ use model::placement::churn::ChurnPool;
 use model::placement::{ExpertList, Plan};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // -------------------------------------------------------------- chain body
 
@@ -380,6 +381,37 @@ struct PlacedPre {
     layers: Range<usize>,
     head: bool,
     ctx_max: usize,
+    /// The prelude's phases; the body and the head are timed after it.
+    times: LoadTimes,
+}
+
+/// The wall of each phase of a placed load ([`GpuModel::load_placed`],
+/// [`GpuModel::load_placed_with`]): what it spent on the card's context and
+/// device modules, the weights upload, the derived weights, the plan's host
+/// set, the body's build and the output head. Each is the wall of the
+/// host-side call, so work a phase only enqueues (a cache's zeroing memset)
+/// completes inside whichever later phase first waits on the stream. The
+/// placement plan's wall is the body's loader's to stamp
+/// ([`GpuModel::note_load_plan`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadTimes {
+    /// The inputs read and the placement plan, when the loader stamped it.
+    pub plan: Option<Duration>,
+    /// The card's context, its engine stream and this crate's device modules.
+    pub context: Duration,
+    /// The card segments' upload: the staging and the host-to-device copies.
+    pub upload: Duration,
+    /// The architecture's derived weights.
+    pub derive: Duration,
+    /// The plan's host set: its r8 source, and the populate walk and the
+    /// lock when the load ran them.
+    pub host_set: Duration,
+    /// The body over the weights: the residency glue when the load runs a
+    /// machine, the caches, the ring shadows, the chain pieces, the host
+    /// tier, and a tier card's load when the plan hangs one under it.
+    pub body: Duration,
+    /// The output head, when the card carries it.
+    pub head: Duration,
 }
 
 /// One resident model on one card. Everything `step` touches is allocated at
@@ -417,6 +449,9 @@ pub struct GpuModel<B: ChainBody> {
     /// The fault a step read back (crate::fault): the caches and rings hold
     /// what it condemned, so every later step refuses until `reset`.
     poisoned: Option<Fault>,
+    /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
+    /// on a load that timed none.
+    load_times: Option<LoadTimes>,
 }
 
 impl<B: ChainBody> Drop for GpuModel<B> {
@@ -453,6 +488,7 @@ impl<B: ChainBody> GpuModel<B> {
             mode: StepMode::Graph,
             pos: 0,
             poisoned: None,
+            load_times: None,
         }
     }
 
@@ -525,8 +561,9 @@ impl<B: ChainBody> GpuModel<B> {
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
         let (p, residency) = placed_pre(&file, plan, card, host, &[], derive)?;
+        let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
-        placed_done(p, body)
+        placed_done(p, body, t_body.elapsed())
     }
 
     /// [`GpuModel::load_placed`] under `residency` ([`ResidencySpec`]): the
@@ -568,6 +605,7 @@ impl<B: ChainBody> GpuModel<B> {
         let extra = churn.as_ref().map_or(&[][..], |p| p.runs.as_slice());
         let file = Arc::new(file);
         let (p, set) = placed_pre(&file, plan, card, host, extra, derive)?;
+        let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
             lever @ Residency::Mid { .. } => {
@@ -598,7 +636,7 @@ impl<B: ChainBody> GpuModel<B> {
             }
         };
         let body = body(&p.gpu, &file, &p.weights, set, glue)?;
-        placed_done(p, body)
+        placed_done(p, body, t_body.elapsed())
     }
 
     /// What the load did to the plan's host set — populated, locked — on a
@@ -609,6 +647,22 @@ impl<B: ChainBody> GpuModel<B> {
             .host()
             .map(|h| &*h)
             .and_then(HostServed::host_residency)
+    }
+
+    /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
+    /// on a load that timed none.
+    #[must_use]
+    pub fn load_times(&self) -> Option<&LoadTimes> {
+        self.load_times.as_ref()
+    }
+
+    /// Stamp the placement plan's wall `plan` into the load's phases,
+    /// overwriting one already stamped. A load that timed no phases drops
+    /// it: a blocks load has no phases to add it to.
+    pub fn note_load_plan(&mut self, plan: Duration) {
+        if let Some(times) = &mut self.load_times {
+            times.plan = Some(plan);
+        }
     }
 
     /// The card this model runs on.
@@ -1122,10 +1176,18 @@ fn placed_pre(
         .filter(|&c| c > 0)
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
+    let t = Instant::now();
     let gpu = Gpu::for_card(&spec.name)?;
+    let context = t.elapsed();
+    let t = Instant::now();
     let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
+    let upload = t.elapsed();
+    let t = Instant::now();
     derive(gpu.stream(), file, layers.clone(), &mut weights)?;
+    let derived = t.elapsed();
+    let t = Instant::now();
     let residency = HostResidency::at_load_with(file, plan, |_| true, host, extra)?;
+    let host_set = t.elapsed();
     Ok((
         PlacedPre {
             gpu,
@@ -1133,31 +1195,51 @@ fn placed_pre(
             layers,
             head: spec.head,
             ctx_max,
+            times: LoadTimes {
+                plan: None,
+                context,
+                upload,
+                derive: derived,
+                host_set,
+                body: Duration::ZERO,
+                head: Duration::ZERO,
+            },
         },
         residency,
     ))
 }
 
-/// The placed load after its body: the output head the card carries, over the
-/// body's weights, and the model over all of it.
-fn placed_done<B: ChainBody>(p: PlacedPre, body: B) -> Result<GpuModel<B>, GpuError> {
+/// The placed load after its body, which took `built`: the output head the
+/// card carries, over the body's weights, and the model over all of it, with
+/// the load's phases.
+fn placed_done<B: ChainBody>(
+    p: PlacedPre,
+    body: B,
+    built: Duration,
+) -> Result<GpuModel<B>, GpuError> {
     let PlacedPre {
         gpu,
         weights,
         layers: _,
         head,
         ctx_max,
+        mut times,
     } = p;
+    let t = Instant::now();
     let head = head
         .then(|| Head::of(&gpu, &weights, body.head_eps(), body.head_norm()))
         .transpose()?;
-    Ok(GpuModel::new(Resident {
+    times.body = built;
+    times.head = t.elapsed();
+    let mut model = GpuModel::new(Resident {
         gpu,
         weights,
         body,
         head,
         ctx_max,
-    }))
+    });
+    model.load_times = Some(times);
+    Ok(model)
 }
 
 // -------------------------------------------------------- the capabilities

@@ -556,6 +556,28 @@ pub static LOAD_GENERATOR: Kind = Kind {
     ],
 };
 
+/// The load's phases, each the wall of its span inside the load line's
+/// `load_s`: the file's headers, the placement plan when its loader timed
+/// it, the card's context and device modules, the weights upload, the
+/// derived weights, the plan's host set, the body's build, the output head,
+/// and the rest of the span.
+pub static LOAD_PHASES: Kind = Kind {
+    name: "load_phases",
+    head: "load phases",
+    doc: "The load's phases, each the wall of its span inside the load line's load_s: the file's headers, the placement plan when its loader timed it, the card's context and device modules, the weights upload, the derived weights, the plan's host set, the body's build, the output head, and the rest of the span.",
+    parts: &[
+        key("open_s", F64(2), "s"),
+        opt("plan_s", F64(2), "s"),
+        key("context_s", F64(2), "s"),
+        key("upload_s", F64(2), "s"),
+        key("derive_s", F64(2), "s"),
+        key("host_set_s", F64(2), "s"),
+        key("body_s", F64(2), "s"),
+        key("head_s", F64(2), "s"),
+        key("other_s", F64(2), "s"),
+    ],
+};
+
 /// The host set read in at load.
 pub static HOST_POPULATE: Kind = Kind {
     name: "host_populate",
@@ -1543,6 +1565,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &CALL_NEED,
     &CALL_LB,
     &LOAD,
+    &LOAD_PHASES,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -1586,6 +1609,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &PROMPT_IDS,
     &PLAN,
     &LOAD_GENERATOR,
+    &LOAD_PHASES,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -1600,6 +1624,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &PLAN,
     &CACHE_CONFIG,
     &LOAD_GENERATOR,
+    &LOAD_PHASES,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -1624,6 +1649,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &PLAN,
     &LOAD_GENERATOR,
+    &LOAD_PHASES,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -1689,6 +1715,44 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>, hot_list: &str) -> 
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
         )
         .w("hot_list", hot_list)
+}
+
+/// The load's phases record: `open` the file's headers' wall, `plan` the
+/// placement plan's when its loader timed it, then the walls a placed load
+/// timed, each in seconds — and `other_s` the rest of `total`, the load
+/// line's `load_s`. The walls must not outrun the total: the record refuses,
+/// naming the kind, when they do.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the load phases record's fields, one an argument (rust-quality R8)"
+)]
+pub fn load_phases(
+    total: f64,
+    open: f64,
+    plan: Option<f64>,
+    context: f64,
+    upload: f64,
+    derive: f64,
+    host_set: f64,
+    body: f64,
+    head: f64,
+) -> Record {
+    let sum = open + plan.unwrap_or(0.0) + context + upload + derive + host_set + body + head;
+    let other = total - sum;
+    if other < 0.0 {
+        panic!("record load_phases: its phases sum to {sum:.2} s, past the load's {total:.2} s");
+    }
+    let mut r = Record::new(&LOAD_PHASES).f("open_s", open);
+    if let Some(plan) = plan {
+        r = r.f("plan_s", plan);
+    }
+    r.f("context_s", context)
+        .f("upload_s", upload)
+        .f("derive_s", derive)
+        .f("host_set_s", host_set)
+        .f("body_s", body)
+        .f("head_s", head)
+        .f("other_s", other)
 }
 
 /// A placed load's host-set records: the set read in, with its wall, or not;

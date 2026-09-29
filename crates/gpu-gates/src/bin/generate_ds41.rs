@@ -692,6 +692,7 @@ mod drive {
             a.place,
             &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
         );
+        let headers = t.elapsed();
         // The finite probe feeds step by step, outside the prompt call.
         let feed_mode = if check_finite {
             body::PrefillMode::Steps
@@ -719,6 +720,8 @@ mod drive {
             fed,
             fed_n,
             t,
+            headers,
+            plan: None,
             pin_main,
             pinned,
             residency: levers.residency(),
@@ -1323,6 +1326,12 @@ mod drive {
         fed_n: usize,
         /// Before the file was opened: the `load` line's `load_s`.
         t: Instant,
+        /// The file's headers (`Split::open` and the hparams read): the
+        /// phases line's `open_s`.
+        headers: Duration,
+        /// The inputs read and the placement plan, once `plan` ran: the
+        /// phases line's `plan_s`.
+        plan: Option<Duration>,
         pin_main: bool,
         pinned: bool,
         /// `BLOOMERY_RESIDENCY`'s word, for the `residency host` record.
@@ -1344,6 +1353,9 @@ mod drive {
             machine: &Machine,
             plan: &Plan<'_>,
         ) -> Result<bool, SessionError> {
+            // The inputs read and the placement plan end here; the load
+            // follows.
+            self.plan = Some(self.t.elapsed() - self.headers);
             let a = self.a;
             let hot_list = self.cfg.place.hot.as_ref().map_or("none", HotList::path);
             record::plan(place, machine, plan, hot_list).print();
@@ -1389,7 +1401,7 @@ mod drive {
         }
 
         /// The body's selection checked against the file's, then the `load`
-        /// record and the host set's.
+        /// record, the load's phases and the host set's.
         fn load(&mut self, m: &Deepseek41Model) -> Result<(), SessionError> {
             let a = self.a;
             let hp = self
@@ -1411,9 +1423,10 @@ mod drive {
                 .w("shadow", "host")
                 .u("shadow_bytes", shadow.bytes)
                 .u("unified_addressing", shadow.unified_addressing);
-            place::with_cards(m, a.place, "generate_ds41", load)
-                .map_err(|e| SessionError::Refused(e.to_string()))?
-                .u("ctx", a.ctx)
+            let load = place::with_cards(m, a.place, "generate_ds41", load)
+                .map_err(|e| SessionError::Refused(e.to_string()))?;
+            let total = self.t.elapsed();
+            load.u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)
                 .w("mode", mode_name(a.mode))
@@ -1430,8 +1443,22 @@ mod drive {
                 )
                 .w("ced", b.ced())
                 .u("group", b.prefill_group_lever())
-                .f("load_s", self.t.elapsed().as_secs_f64())
+                .f("load_s", total.as_secs_f64())
                 .print();
+            if let Some(times) = m.load_times() {
+                record::load_phases(
+                    total.as_secs_f64(),
+                    self.headers.as_secs_f64(),
+                    self.plan.map(|d| d.as_secs_f64()),
+                    times.context.as_secs_f64(),
+                    times.upload.as_secs_f64(),
+                    times.derive.as_secs_f64(),
+                    times.host_set.as_secs_f64(),
+                    times.body.as_secs_f64(),
+                    times.head.as_secs_f64(),
+                )
+                .print();
+            }
             if let Some(h) = b.hybrid().residency() {
                 for r in record::host_residency(h) {
                     r.print();
