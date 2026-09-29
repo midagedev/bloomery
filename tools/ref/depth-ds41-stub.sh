@@ -103,6 +103,23 @@
 #                PRIME); the ours arm at depth 4 faults twice (its prime and its row) and lcpp:6 once: a
 #                COLD row each, then a fresh load of 4 4 and a second llama-bench, both rows clean, rc 0.
 #   warm-fail    the same, cold again on the retry: FAIL rc=cold for ours at 4 and lcpp at 6, rc 1.
+# The residency seed condition (the runner's Residency; red on the runner before it, which reads no residency
+# record: rc 0 and no curve line). R below is BLOOMERY_RESIDENCY=mid-p40-s1; under it the stub generate_ds41
+# prints `residency host` with its load, a `residency reset` before every arm past the first, and N residency
+# pass records after each arm's SMOKE line, the first none/0 after the load or a reset:
+#   res-ok       6 6@R 4@R, one round: the off arm alone, the two R arms one load; both R rows clean, each
+#                followed by its curve line (windows=1 tok/s=30.30 flips=2, slot 1 seed `first pass none/0`,
+#                slot 2 also the reset's diff=0 dropped_bytes=0), the [config] residency line; rc 0.
+#   res-noreset  the same with no reset before slot 2 (its first pass is then step/4): FAIL rc=residency for
+#                4@R naming both clauses, the slot-1 row clean; rc 1.
+#   res-diff     the reset carries diff=3: FAIL rc=residency for 4@R naming it; rc 1.
+#   res-drop     the reset carries dropped_bytes=1 against the profile's 0: FAIL rc=residency naming both; rc 1.
+#   res-prime    BLOOMERY_WARM_ROWS=1, 6@R: one load of the PRIME and the row, the row at slot 2 after the
+#                reset; both clean, each with its curve line (PRIME slot 1, ROW slot 2 with the reset); rc 0.
+#   res-warm     slot 1's first pass is step/1, a warm map: FAIL rc=residency for 6@R; rc 1.
+#   res-leak     the off arm 6 prints residency pass records: FAIL rc=residency naming the leak; rc 1.
+#   res-noprofile  a profile without RESIDENCY_RESET_DROPPED_BYTES: refused by name before anything runs, rc 64.
+#   res-dry      the dry run names the residency arms and the reset bytes, rc 0.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -139,6 +156,7 @@ IK=$T IKBIN=$T/bin/ik-bench LCPP=$T LCPPBIN=$T/bin/lcpp-bench
 IK_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -t 4' IK_GPU_ENV=''
 LCPP_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -fa on -t 4'
 BLOOMERY_DATA=$T/data
+[ -n "\${STUB_NO_RES_BYTES:-}" ] || RESIDENCY_RESET_DROPPED_BYTES=0
 TWO_CARD_PLACEMENT=
 if [ "\${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ]; then
   LCPP_GPU_FLAGS='-ngl 999 --n-cpu-moe 1 -fa on -t 4 -ts 1.5/1.5'
@@ -232,7 +250,12 @@ touch "$T/Cargo.toml"
 # STUB_GEN_PLACE in its SMOKE footer when set. Under --place bp, or with STUB_GEN_CARDS, its load line
 # names the cards (`cards=`, both under bp unless STUB_GEN_CARDS says otherwise). Under --arm it runs the list after one `load` line, each
 # arm opening with its `arm` record and, under --arm-sync, waiting for a line on stdin; every process
-# appends a line to $TMPDIR/stub-gen-loads.
+# appends a line to $TMPDIR/stub-gen-loads. Under BLOOMERY_RESIDENCY (not off) it prints `residency host`
+# with its load, a `residency reset` (diff STUB_RES_DIFF and dropped_bytes STUB_RES_DROP, 0 by default)
+# before every arm past the first
+# unless STUB_RES_NORESET is set, and after each arm's SMOKE line one `residency pass` per generated token,
+# the boundary counted from the load or the last reset (from 1 under STUB_RES_WARM: a warm map); under
+# STUB_RES_LEAK the passes print with the lever off too.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
 depth='' n=32 place=a tokens='' sync='' arms=()
@@ -254,9 +277,16 @@ if [ -n "$cards" ]; then
 else
   echo "load place=$place arms=${#arms[@]} (stub)"
 fi
+res=${BLOOMERY_RESIDENCY:-off} b=0
+[ "$res" = off ] || echo "residency host residency=$res pinned=40 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
+[ -z "${STUB_RES_WARM:-}" ] || b=1
 for k in "${!arms[@]}"; do
   a=${arms[$k]} feed=lcg
   case $a in *:*) feed=${a%%:*} depth=${a#*:} ;; *) depth=$a ;; esac
+  if [ "$res" != off ] && [ "$k" -gt 0 ] && [ -z "${STUB_RES_NORESET:-}" ]; then
+    echo "residency reset cancelled=1 copies=2 diff=${STUB_RES_DIFF:-0} dropped_bytes=${STUB_RES_DROP:-0}"
+    b=0
+  fi
   if [ -n "$sync" ]; then
     echo "arm i=$k arms=${#arms[@]} feed=$feed ids=$depth n=$n"
     read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }
@@ -279,6 +309,15 @@ for k in "${!arms[@]}"; do
   for i in $(seq 0 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; done
   for i in $(seq 1 $((n - 1))); do echo "time step $i ms=33.0000"; done
   echo "SMOKE mode=graph place=${STUB_GEN_PLACE:-$place} prompt_tokens=0 depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=33.0000 mean_ms=33.0000 tok/s(p50)=30.30"
+  if [ "$res" != off ] || [ -n "${STUB_RES_LEAK:-}" ]; then
+    for j in $(seq 0 $((n - 1))); do
+      if [ "$b" = 0 ]; then p=none; elif [ "$j" = 1 ]; then p=prompt; else p=step; fi
+      made=0
+      [ "$j" != 2 ] || made=2
+      echo "residency pass pass=$p boundary=$b kept=$((j > 1 ? 1 : 0)) landed=0 late=0 made=$made in_flight=$made bytes=$((made * 4096)) end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=3 prepare_us=0"
+      b=$((b + 1))
+    done
+  fi
 done
 EOF
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers and the cases).
@@ -872,11 +911,101 @@ elif want warm-bad "$L" 1 "^depth-ds41.sh: BLOOMERY_WARM_ROWS is 0 .* or 1 .*, g
   pass warm-bad
 fi
 
+R=BLOOMERY_RESIDENCY=mid-p40-s1
+L=$tmp/res-ok.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 0 ]; then
+  fail res-ok "rc $RC, want 0" "$L"
+elif want res-ok "$L" 1 "^ROW r1 ours@$R d=6 .*\| slot 1/2 \| wall " &&
+  want res-ok "$L" 1 "^ROW r1 ours@$R d=4 .*\| slot 2/2 \| wall " &&
+  want res-ok "$L" 1 "^residency curve ours@$R r1 d=6 windows=1 tok/s=30.30 flips=2 \| ROW slot 1 \| seed first pass none/0$" &&
+  want res-ok "$L" 1 "^residency curve ours@$R r1 d=4 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
+  want res-ok "$L" 2 '^residency curve ' &&
+  want res-ok "$L" 1 "^\[config\] residency: 6@$R 4@$R run with BLOOMERY_RESIDENCY on: .* dropped_bytes=0, the profile's" &&
+  want res-ok "$L" 1 '^    residency host residency=mid-p40-s1 ' &&
+  want res-ok "$L" 1 '^ROW r1 ours d=6 ' &&
+  want res-ok "$L" 0 '^FAIL '; then
+  pass res-ok
+fi
+L=$tmp/res-noreset.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_NORESET=1 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 1 ]; then
+  fail res-noreset "rc $RC, want 1" "$L"
+elif want res-noreset "$L" 1 "^FAIL r1 ours@$R d=4 rc=residency \| its first residency pass is pass=step boundary=4, not the seed's none/0 \(slot 2: the first boundary after its clear\); 0 residency reset record\(s\) between the previous arm and its arm line, want 1: its map did not start from the seed; last line: .* \| full output: " &&
+  want res-noreset "$L" 1 "^ROW r1 ours@$R d=6 " &&
+  want res-noreset "$L" 1 "^    dropped: ours@$R at 4$" &&
+  want res-noreset "$L" 1 "^failed arms: r1 ours@$R d=4 rc=residency; $"; then
+  pass res-noreset
+fi
+L=$tmp/res-diff.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_DIFF=3 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 1 ]; then
+  fail res-diff "rc $RC, want 1" "$L"
+elif want res-diff "$L" 1 "^FAIL r1 ours@$R d=4 rc=residency \| the reset before it left diff=3 map entries off the seed, want 0; last line: " &&
+  want res-diff "$L" 1 "^ROW r1 ours@$R d=6 "; then
+  pass res-diff
+fi
+L=$tmp/res-drop.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_DROP=1 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 1 ]; then
+  fail res-drop "rc $RC, want 1" "$L"
+elif want res-drop "$L" 1 "^FAIL r1 ours@$R d=4 rc=residency \| the reset before it released dropped_bytes=1, the profile's RESIDENCY_RESET_DROPPED_BYTES is 0; last line: " &&
+  want res-drop "$L" 1 "^ROW r1 ours@$R d=6 "; then
+  pass res-drop
+fi
+L=$tmp/res-prime.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_WARM_ROWS=1 -- "6@$R"
+if [ "$RC" != 0 ]; then
+  fail res-prime "rc $RC, want 0" "$L"
+elif [ "$(paste -sd'|' - < "$LOADS")" != "6 6" ]; then
+  fail res-prime "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 6" "$L"
+elif want res-prime "$L" 1 "^PRIME r1 ours@$R d=6 .*\| slot 1/2 \| wall " &&
+  want res-prime "$L" 1 "^ROW r1 ours@$R d=6 .*\| slot 2/2 \| wall " &&
+  want res-prime "$L" 1 "^residency curve ours@$R r1 d=6 windows=1 tok/s=30.30 flips=2 \| PRIME slot 1 \| seed first pass none/0$" &&
+  want res-prime "$L" 1 "^residency curve ours@$R r1 d=6 windows=1 tok/s=30.30 flips=2 \| ROW slot 2 \| seed first pass none/0, reset diff=0 dropped_bytes=0$" &&
+  want res-prime "$L" 1 '^mean ours@BLOOMERY_RESIDENCY=mid-p40-s1 d=6 .*\(n=1\)'; then
+  pass res-prime
+fi
+L=$tmp/res-warm.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_WARM=1 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 1 ]; then
+  fail res-warm "rc $RC, want 1" "$L"
+elif want res-warm "$L" 1 "^FAIL r1 ours@$R d=6 rc=residency \| its first residency pass is pass=step boundary=1, not the seed's none/0 \(slot 1: the load's first boundary\); last line: " &&
+  want res-warm "$L" 1 "^ROW r1 ours@$R d=4 .*\| slot 2/2 "; then
+  pass res-warm
+fi
+L=$tmp/res-leak.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_RES_LEAK=1 -- 6
+if [ "$RC" != 1 ]; then
+  fail res-leak "rc $RC, want 1" "$L"
+elif want res-leak "$L" 1 '^FAIL r1 ours d=6 rc=residency \| 4 residency pass record\(s\) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm; last line: ' &&
+  want res-leak "$L" 1 '^\[config\] residency: no arm runs with BLOOMERY_RESIDENCY on; ' &&
+  want res-leak "$L" 0 '^ROW '; then
+  pass res-leak
+fi
+L=$tmp/res-noprofile.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_NO_RES_BYTES=1 -- 6 "6@$R"
+if [ "$RC" != 64 ]; then
+  fail res-noprofile "rc $RC, want 64" "$L"
+elif want res-noprofile "$L" 1 "^depth-ds41.sh: arms 6@$R run with BLOOMERY_RESIDENCY on, and the profile deepseek41 gives no RESIDENCY_RESET_DROPPED_BYTES " &&
+  want res-noprofile "$L" 0 '^(ROW|FAIL|\[config\]) '; then
+  pass res-noprofile
+fi
+L=$tmp/res-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 6 "6@$R" "4@$R"
+if [ "$RC" != 0 ]; then
+  fail res-dry "rc $RC, want 0" "$L"
+elif want res-dry "$L" 1 "^\[dry\] residency: 6@$R 4@$R run with BLOOMERY_RESIDENCY on: " &&
+  want res-dry "$L" 1 "^\[dry\] round 1 loads: \[6\] \[6@$R 4@$R\]$"; then
+  pass res-dry
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
-    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard.log "$tmp"/srv*.log "$tmp"/warm*.log; do
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard.log "$tmp"/srv*.log "$tmp"/warm*.log \
+    "$tmp"/res-*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done

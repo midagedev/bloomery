@@ -13,6 +13,9 @@ it). A reader names a kind and a field; the syntax is this file's and record.rs'
   records.py sh [--bin B] FILE VAR=KIND.FIELD... shell assignments, quoted: the field as printed, of the
                                                  first record of KIND (`a|b` takes either kind); with
                                                  `.FIELD*` every record's, one a line
+  records.py tail [--bin B] FILE KIND...         the lines of those kinds after the file's last record of any
+                                                 other kind, as printed, in order: what a process prints
+                                                 between one unit of its output and the next
   records.py check [--bin B] FILE...             the lines a kind's head opens that no kind reads whole:
                                                  read loose, or not at all (exit 1 when there is one)
   records.py --self-test                         every kind's line read whole, and `check`'s passes
@@ -257,6 +260,14 @@ def first(recs, *kinds):
     return next((r for r in recs if r.kind in kinds), None)
 
 
+def tail(recs, *kinds):
+    """The records of `kinds` after the last record of any other kind, in order."""
+    out = []
+    for r in recs:
+        out = out + [r] if r.kind in kinds else []
+    return out
+
+
 # ---- the command line ----
 
 def take_bin(argv):
@@ -293,6 +304,20 @@ def cmd_lines(argv):
     for r in read(rest[0], schema=schema):
         if r.kind in kinds:
             print(r.line)
+    return 0
+
+
+def cmd_tail(argv):
+    bin_name, rest = take_bin(argv)
+    if len(rest) < 2:
+        usage()
+    kinds = rest[1:]
+    schema = load(bin_name)
+    unknown = set(kinds) - set(schema.by_name)
+    if unknown:
+        refuse(f"{bin_name} prints no kind {', '.join(sorted(unknown))}")
+    for r in tail(read(rest[0], schema=schema), *kinds):
+        print(r.line)
     return 0
 
 
@@ -423,6 +448,12 @@ def self_test():
     # a `load` record missing its fields is still found, and so is a head no kind reads whole
     found = check_lines(schema, ["load resident_bytes=1", "load host_tierx=1"])
     assert [w for _, w, _ in found] == ["read loose as load", "no kind reads it"], found
+    # tail: the run of a kind after the last record of another, not the same kind earlier in the text
+    reset = sample_line(schema.by_name["residency_reset"])
+    step = sample_line(schema.by_name["time_step"])
+    recs = read([reset, step, "a line of no kind", reset, reset], schema=schema)
+    assert [r.line for r in tail(recs, "residency_reset")] == [reset, reset], recs
+    assert tail(read([reset, step], schema=schema), "residency_reset") == []
     print(f"records: self-test ok ({len(schema.kinds)} kinds)")
     return 0
 
@@ -430,7 +461,8 @@ def self_test():
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
-    cmds = {"parse": cmd_parse, "lines": cmd_lines, "sh": cmd_sh, "check": cmd_check, "refresh": cmd_refresh}
+    cmds = {"parse": cmd_parse, "lines": cmd_lines, "tail": cmd_tail, "sh": cmd_sh, "check": cmd_check,
+            "refresh": cmd_refresh}
     if not argv or argv[0] not in cmds:
         usage()
     return cmds[argv[0]](argv[1:])

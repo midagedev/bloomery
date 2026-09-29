@@ -182,6 +182,11 @@
 #                   at db517b69), not a slot split, and whether those count a host-overridden expert is
 #                   unread; the public reference is llama.cpp. LCPP_CLI_FLAGS carries the same -ts in the mode
 #                   (ik-draft.sh's lcpp arm, llama-completion, whose -ts reads `/` as llama-bench's does)
+#   RESIDENCY_RESET_DROPPED_BYTES  the dropped_bytes a `residency reset` record carries when the reset
+#                   worked, which depth-ds41.sh holds every later slot of a residency arm's load to (its
+#                   Residency): 0. The churn pool is part of the load's host set (`residency host`) and stays
+#                   resident for the model's life, so a reset releases no host page: the V4.1 expert
+#                   source's release_host returns 0 (crates/gpu-deepseek41/src/swap.rs)
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
@@ -243,6 +248,7 @@ fi
 REF_TOKENS=671,6102,294,8760,344
 REF_DUMP_LEASE=1
 REF_DUMP_ARGS=(--defer-experts)
+RESIDENCY_RESET_DROPPED_BYTES=0
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-v41 <variant>`): one decode step dumped
 # after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh refuses

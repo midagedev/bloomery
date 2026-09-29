@@ -44,7 +44,10 @@
 #   lg_post <i> <round> <rc> <output> <wall s>   the arm's witness block after it and its row (or its
 #                           FAIL row); MAJ_WHOLE and MAJ_TIMED are set for it
 # and LG_HEADER_RE, the ERE of the load lines echoed under `[load]`. LG_HEADER holds the running load's
-# lines before its arm 0, for a row that reads one of them. LG_FED_RE, the ERE of the arm's line that
+# lines before its arm 0, for a row that reads one of them. LG_PREV_OUT holds, as lg_post runs, the output
+# of the arm before it in the same process (empty for a process's first arm): the lines a binary prints
+# after one arm's work and before the next arm's `arm` line — a clear's report — close that output, so a
+# row that reads them reads them there. LG_FED_RE, the ERE of the arm's line that
 # opens its measured window (MAJ_TIMED counts from it), defaults to generate_ds41's `fed` record;
 # a runner sets its own after sourcing this file (depth-qwen3moe.sh).
 LG_FED_RE='^fed '
@@ -54,7 +57,7 @@ case $LG_MODE in
   *) echo "load-groups.sh: BLOOMERY_AB_LOAD is key (the default: a round's arms of one load key in one process) or arm (every arm a process of its own), got '$LG_MODE'" >&2; exit 64 ;;
 esac
 LG_SOLO=BLOOMERY_AB_LOAD=arm
-LG_KEY=() LG_HEADER=
+LG_KEY=() LG_HEADER='' LG_PREV_OUT=''
 
 # lg_strip_solo <NAME=VALUE list>: the list without BLOOMERY_AB_LOAD=arm (comma-separated in and out).
 lg_strip_solo() {
@@ -134,7 +137,7 @@ lg_process() {
   local r=$1
   shift
   local -a arms=("$@")
-  local n=${#arms[@]} k=-1 line rc=0 st out='' header='' t0=0 f0=0 fed='' bound pid dir rfd wfd i
+  local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' t0=0 f0=0 fed='' bound pid dir rfd wfd i
   LG_LEFT=()
   lg_cmd "${arms[@]}"
   bound=$((BOUND * (n + 1)))
@@ -155,7 +158,9 @@ lg_process() {
     t1=$(date +%s)
     MAJ_WHOLE=$((f1 - f0)) MAJ_TIMED=
     [ -z "$fed" ] || MAJ_TIMED=$((f1 - fed))
+    LG_PREV_OUT=$prev_out
     lg_post "$1" "$r" "$2" "$out" "$((t1 - t0))"
+    prev_out=$out
   }
   while :; do
     if ! IFS= read -r -t "$BOUND" -u "$rfd" line; then
@@ -202,7 +207,7 @@ lg_process() {
     [ "$rc" != 0 ] || rc=70
     for i in "${arms[@]}"; do
       lg_pre "$i" "$r"
-      t0=$(date +%s) f0=$(lg_majflt) fed='' out="$header"
+      t0=$(date +%s) f0=$(lg_majflt) fed='' out="$header" prev_out=''
       lg_end_arm "$i" "$rc"
     done
     return 0

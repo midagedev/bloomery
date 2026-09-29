@@ -11,7 +11,7 @@
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512   # engine blocks
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512 lcppfit:6 lcppppfit:512
-#   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines and row from a saved generate_ds41 output
+#   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines, row and residency curve from a saved output
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
 # quoted as "decode is faster" — a step's attention term grows with the cached keys, so the depth
@@ -231,7 +231,8 @@
 # command; lcpppp<U> keeps -nopo 1.
 #
 # Failures. An arm that exits non-zero, prints no row (no SMOKE line, no time prompt row, no
-# llama-bench value), fails its preheat, or ran another placement than it was given prints
+# llama-bench value), fails its preheat, ran another placement than it was given, or broke the residency
+# seed condition (Residency below, rc=residency) prints
 # `FAIL r<r> <label> d=<D>|p=<P> rc=<rc> | <why or its last line> | full output: <file>` where its
 # row would be, and the runner goes on with the next arm. That label at that depth or P drops out of
 # the means and the ratios (the tables name what they dropped), and the runner ends with `failed arms:
@@ -254,6 +255,30 @@
 # the in-load arm). A BLOOMERY_DRAFT or BLOOMERY_CHECK_FINITE arm always runs alone (a draft's state has
 # no clear), and a bin: arm is its own process with the one-arm command line. The warm-up and the
 # blocks' discards are one arm in a process of its own.
+#
+# Residency. An arm whose environment turns adaptive residency on — BLOOMERY_RESIDENCY set to anything
+# but off, by its own @ list, else inherited by the runner (the lever's words are off, mid-p0-s1 and
+# mid-p40-s1; unset is off) — must start its timed work from the seed map, the load's placement
+# (docs/fair-measure.md 2.5). The runner holds each such arm to the engine's own records, per
+# generate_ds41 process: the arm's first `residency pass` is pass=none boundary=0 (the first boundary
+# after the load or after a reset: at slot 1 the fresh load's, at a later slot the one after its clear);
+# and at slot k > 1 the lines between the previous arm's work and this arm's `arm` line — where
+# generate_ds41 prints the clear's report, load-groups.sh's LG_PREV_OUT — hold exactly one `residency
+# reset`, with diff=0 and dropped_bytes equal to the profile's RESIDENCY_RESET_DROPPED_BYTES (V4.1: 0,
+# models/deepseek41.sh). A `residency reset` among an arm's own lines, before the last record of another
+# kind, fails that arm too. The rotate warm-up and the blocks' discards are processes of their own, so
+# they warm no timed arm's map; a same-id PRIME (Warm rows), or any arm before this one in its load, is
+# what the reset clause covers: with no reset between, the arm's first pass is not none/0 and there is no
+# reset record, and it fails. An arm with residency off that prints a `residency pass` or `residency
+# reset` record fails as well (the lever leaked into an off arm). A failure is `FAIL r<r> <label> d=<D>
+# rc=residency | <each clause that failed> | full output: <file>` in place of the row. A residency arm
+# under a profile without RESIDENCY_RESET_DROPPED_BYTES is refused (64) before the lease. Every
+# residency row is followed by `residency curve <label> r<r> d=<D> windows=<w> tok/s=<a>,<b>,…
+# flips=<n> | <its row's tag> slot <k> | seed <what held>`: the arm's timed passes (`time step`, one
+# position each; under a draft `time pass`, its positions) in windows of RES_WINDOW (16) passes, in
+# order, the last window short when they do not divide, and the flips its `residency pass` records made
+# (the sum of `made`) — a printed line in no mean; the prompt call is not in it (the row's pp column is
+# its rate).
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE and
@@ -411,7 +436,7 @@ ours_row() {
     return 1
   fi
   pp_col "$kind" || return
-  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm) '
+  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt|call|arm|residency host) '
   # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
   # and the `draft summary` line carries the positions-per-second rate the verdict reads.
   DRAFT=
@@ -432,6 +457,110 @@ ours_row() {
   fi
   echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
+# The residency seed condition and curve (the header's Residency). RES_WINDOW: the passes a curve window
+# holds.
+RES_WINDOW=16
+# res_value <index>: the BLOOMERY_RESIDENCY arm <index> runs with — its own @ list's, else the runner's.
+res_value() {
+  local e v=${BLOOMERY_RESIDENCY:-}
+  local -a kv=()
+  [ -z "${A_ENV[$1]}" ] || IFS=, read -r -a kv <<< "${A_ENV[$1]}"
+  for e in "${kv[@]}"; do
+    case $e in BLOOMERY_RESIDENCY=*) v=${e#*=} ;; esac
+  done
+  echo "$v"
+}
+# res_on <index>: whether arm <index> runs with adaptive residency on.
+res_on() {
+  local v
+  v=$(res_value "$1")
+  [ -n "$v" ] && [ "$v" != off ]
+}
+# res_read <output>: the residency records and timed passes of an arm's output, by kind and field, into
+# RP_PASS, RP_BOUNDARY, RP_MADE (every `residency pass`, one a line), RR_ALL (every `residency reset`'s
+# diff) and RR_TAIL (the `residency reset` lines after the last record of another kind: the report of a
+# clear that follows the arm), CV_STEP (the `time step` walls), CV_PASS and CV_POS (the `time pass`
+# walls and positions). Returns 2 with RES_WHY set when records.py cannot read the output.
+res_read() {
+  local rec
+  RES_WHY="records.py did not read the output"
+  rec=$(python3 "$RECORDS" sh - 'RP_PASS=residency_pass.pass*' 'RP_BOUNDARY=residency_pass.boundary*' \
+    'RP_MADE=residency_pass.made*' 'RR_ALL=residency_reset.diff*' 'CV_STEP=time_step.ms*' \
+    'CV_PASS=time_pass.ms*' 'CV_POS=time_pass.positions*' <<< "$1") || return 2
+  RR_TAIL=$(python3 "$RECORDS" tail - residency_reset <<< "$1") || return 2
+  RES_WHY=''
+  eval "$rec"
+}
+# res_seed <index> <slot>: the seed condition of the output res_read read, arm <index>'s at its slot in its
+# load (1 for a process of its own), the previous arm's output in LG_PREV_OUT when the slot is past 1.
+# Returns 1 with RES_WHY naming every clause that failed; on success RES_SEED says what held.
+res_seed() {
+  local i=$1 slot=$2 first b0 n_all n_tail rec
+  local -a why=()
+  RES_WHY='' RES_SEED=''
+  n_all=$(grep -c . <<< "$RR_ALL")
+  n_tail=$(grep -c . <<< "$RR_TAIL")
+  if ! res_on "$i"; then
+    [ -z "$RP_PASS" ] || why+=("$(grep -c . <<< "$RP_PASS") residency pass record(s) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm")
+    [ "$n_all" = 0 ] || why+=("$n_all residency reset record(s) in an arm with BLOOMERY_RESIDENCY off: the lever leaked into an off arm")
+    if [ ${#why[@]} -gt 0 ]; then
+      RES_WHY=$(printf '%s; ' "${why[@]}")
+      RES_WHY=${RES_WHY%; }
+      return 1
+    fi
+    return 0
+  fi
+  if [ -z "$RP_PASS" ]; then
+    why+=("no residency pass record: BLOOMERY_RESIDENCY=$(res_value "$i") ran no residency machine")
+  else
+    first=$(head -n 1 <<< "$RP_PASS") b0=$(head -n 1 <<< "$RP_BOUNDARY")
+    if [ "$first" != none ] || [ "$b0" != 0 ]; then
+      why+=("its first residency pass is pass=$first boundary=$b0, not the seed's none/0 ($([ "$slot" = 1 ] && echo "slot 1: the load's first boundary" || echo "slot $slot: the first boundary after its clear"))")
+    fi
+  fi
+  [ $((n_all - n_tail)) = 0 ] || why+=("$((n_all - n_tail)) residency reset record(s) among its own lines: a reset inside its timed work")
+  RES_SEED="first pass ${first:-?}/${b0:-?}"
+  if [ "$slot" != 1 ]; then
+    local tail_prev R_DIFF='' R_DROP='' r_n
+    RES_WHY="records.py did not read the previous arm's output"
+    tail_prev=$(python3 "$RECORDS" tail - residency_reset <<< "$LG_PREV_OUT") || return 1
+    rec=$(python3 "$RECORDS" sh - 'R_DIFF=residency_reset.diff*' 'R_DROP=residency_reset.dropped_bytes*' <<< "$tail_prev") || return 1
+    RES_WHY=''
+    eval "$rec"
+    r_n=$(grep -c . <<< "$R_DIFF")
+    if [ "$r_n" != 1 ]; then
+      why+=("$r_n residency reset record(s) between the previous arm and its arm line, want 1: its map did not start from the seed")
+    else
+      [ "$R_DIFF" = 0 ] || why+=("the reset before it left diff=$R_DIFF map entries off the seed, want 0")
+      [ "$R_DROP" = "$RESIDENCY_RESET_DROPPED_BYTES" ] || why+=("the reset before it released dropped_bytes=$R_DROP, the profile's RESIDENCY_RESET_DROPPED_BYTES is $RESIDENCY_RESET_DROPPED_BYTES")
+    fi
+    RES_SEED+=", reset diff=${R_DIFF:-?} dropped_bytes=${R_DROP:-?}"
+  fi
+  if [ ${#why[@]} -gt 0 ]; then
+    RES_WHY=$(printf '%s; ' "${why[@]}")
+    RES_WHY=${RES_WHY%; }
+    return 1
+  fi
+}
+# res_curve <label> <round> <depth> <slot>: the curve line of an output res_read read (the header's
+# Residency), when it holds a `residency pass` record.
+res_curve() {
+  local w
+  [ -n "$RP_PASS" ] || return 0
+  if [ -n "$CV_PASS" ]; then
+    w=$(paste -d' ' <(echo "$CV_PASS") <(echo "$CV_POS"))
+  else
+    w=$(awk 'NF { print $1, 1 }' <<< "$CV_STEP")
+  fi
+  w=$(awk -v n="$RES_WINDOW" 'NF {
+    ms += $1; pos += $2; c++
+    if (c == n) { out = out sep sprintf("%.2f", 1e3 * pos / ms); sep = ","; k++; ms = pos = c = 0 }
+  } END {
+    if (c) { out = out sep sprintf("%.2f", 1e3 * pos / ms); k++ }
+    printf "windows=%d tok/s=%s", k, (k ? out : "-")
+  }' <<< "$w")
+  echo "residency curve $1 r$2 d=$3 $w flips=$(awk '{ s += $1 } END { print s + 0 }' <<< "$RP_MADE") | $ROW_TAG slot $4 | seed ${RES_SEED:-not checked}"
+}
 # The cold tag's constants and cold_check, the fault counter and majflt_mark, ROW_TAG and counted, the
 # order and the blocks' planner and loops: shared with depth-qwen3moe.sh.
 # shellcheck source=tools/ref/cold-blocks.sh
@@ -444,6 +573,9 @@ if [ "${1:-}" = --parse ]; then
   ours_parse <<< "$out" || { echo "$2: $FAIL_WHY" >&2; exit 2; }
   ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG='' PLACE=-
   ours_row ours ours "${DEPTH:--}" - "$out" - || { echo "$2: $FAIL_WHY" >&2; exit 1; }
+  # No arm environment here: the curve without the seed verdict.
+  res_read "$out" || { echo "$2: $RES_WHY" >&2; exit 2; }
+  res_curve ours - "${DEPTH:--}" -
   exit 0
 fi
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
@@ -623,6 +755,30 @@ for i in "${!ARMS[@]}"; do
     *) LG_KEY[i]= ;;
   esac
 done
+# The residency arms (the header's Residency), and the profile's reset bytes their later slots are held to:
+# refused before the lease when the profile gives none.
+RES_ARMS=()
+for i in "${!ARMS[@]}"; do
+  case ${A_KIND[$i]} in
+    ours | corpus | bin) if res_on "$i"; then RES_ARMS+=("${ARMS[$i]}"); fi ;;
+  esac
+done
+if [ ${#RES_ARMS[@]} -gt 0 ]; then
+  case ${RESIDENCY_RESET_DROPPED_BYTES:-} in
+    '' | *[!0-9]*)
+      echo "depth-ds41.sh: arms ${RES_ARMS[*]} run with BLOOMERY_RESIDENCY on, and the profile $MODEL_NAME gives no RESIDENCY_RESET_DROPPED_BYTES (the host bytes a residency reset releases, which every later slot's reset must carry; got '${RESIDENCY_RESET_DROPPED_BYTES:-}'): set it in tools/ref/models/$MODEL_NAME.sh" >&2
+      exit 64
+      ;;
+  esac
+fi
+# res_config: the residency check's [config] and [dry] line.
+res_config() {
+  if [ ${#RES_ARMS[@]} -eq 0 ]; then
+    echo "residency: no arm runs with BLOOMERY_RESIDENCY on; an arm that prints a residency pass or reset record is a FAIL rc=residency row (the lever leaked)"
+  else
+    echo "residency: ${RES_ARMS[*]} run with BLOOMERY_RESIDENCY on: each starts from the seed (its first residency pass none/0, and at slot k > 1 one residency reset before its arm line with diff=0 and dropped_bytes=$RESIDENCY_RESET_DROPPED_BYTES, the profile's) or is a FAIL rc=residency row; a residency curve line after each row, windows of $RES_WINDOW passes"
+  fi
+}
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
 # has the two-card mode (the header's Two cards).
 TIMING_CARDS_RUNNER=1
@@ -1066,7 +1222,7 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
 # row and sums, or its FAIL row; MAJ_WHOLE and MAJ_TIMED are the arm's. An output that opens with an
 # `arm` record (an --arm list's) gives the row its slot in the load.
 ours_post() {
-  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a slot
   dep=${A_DEP[$i]} label=${A_LABEL[$i]}
   witness "post r$r $label d=$dep n=$N"
   guard_cpu "post r$r $label d=$dep"
@@ -1083,10 +1239,23 @@ ours_post() {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "two cards: $TWOCARD_WHY" "$out"
     return 0
   fi
+  # The residency seed condition (the header's Residency): the slot from the arm record, 1 for a process
+  # of its own; LG_PREV_OUT is read only past slot 1, which only the load driver's processes have.
+  res_read "$out" || {
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$RES_WHY" "$out"
+    return 0
+  }
+  slot=1
+  [ -z "$a" ] || slot=$((${a% *} + 1))
+  res_seed "$i" "$slot" || {
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" residency "$RES_WHY" "$out"
+    return 0
+  }
   ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {
     [ $? = 3 ] || arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
   }
+  res_curve "$label" "$r" "$dep" "$slot"
   counted || return 0
   count_row
   tags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
@@ -1098,7 +1267,7 @@ ours_post() {
 # The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment, and an arm's
 # guards and witness blocks around it. The load's lines echoed once: its plan, load, host set, capture
 # and prompt buffer lines.
-LG_HEADER_RE='^(plan|load|host|capture|prefill) '
+LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host) '
 lg_cmd() {
   local i
   arm_envs "$1"
@@ -1328,6 +1497,7 @@ if [ -n "$DRY" ]; then
     echo "[dry] preheat: $(preheat_off)"
   fi
   [ "$WARM_ROWS" = 0 ] || echo "[dry] warm rows: each of our arms after a same-id PRIME in its load; a counted row tagged [cold] prints as COLD and runs once more (cold-blocks.sh)"
+  [ "$gen" = 0 ] || echo "[dry] $(res_config)"
   if [ "$ORDER" = rotate ]; then
     if [ "$AB_WARMUP" = 1 ]; then
       echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"
@@ -1376,6 +1546,7 @@ fi
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
 [ "$srv" = 0 ] || srv_config
 warm_rows_config
+[ "$gen" = 0 ] || echo "[config] $(res_config)"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 witness pre
