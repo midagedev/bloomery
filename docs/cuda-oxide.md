@@ -1,6 +1,6 @@
 # How bloomery uses cuda-oxide
 
-bloomery is an LLM inference engine for MoE models that splits the experts between GPU and CPU. Its GPU kernels are Rust, compiled with [cuda-oxide](https://github.com/NVlabs/cuda-oxide). This page shows how a larger project is put together on it: how the kernels are laid out, how the host launches them and how the build is pinned. It is written for people who have finished a first cuda-oxide kernel and want to see the next step.
+bloomery is an LLM inference engine for MoE models that splits the experts between GPU and CPU. Its GPU kernels are Rust, compiled with [cuda-oxide](https://github.com/NVIDIA/cuda-rust). This page shows how a larger project is put together on it: how the kernels are laid out, how the host launches them and how the build is pinned. It is written for people who have finished a first cuda-oxide kernel and want to see the next step.
 
 bloomery is still in active development, and this page describes the tree as it is now. Everything here runs on Ampere (sm_86) only.
 
@@ -128,7 +128,7 @@ The raise itself is a few lines of `ptx_asm!` (`red.relaxed.gpu.global.min.u32`)
 ## Build and pinning
 
 - **Only `cargo oxide` builds device crates.** A plain `cargo build` of such a crate compiles, but produces a binary without the device code.
-- **cuda-oxide is pinned by git revision.** `Cargo.toml` declares the NVlabs revision, and a `[patch]` section takes the source from [our fork](https://github.com/midagedev/cuda-oxide) (`bloomery` branch), which is that revision plus a few small patches on their way upstream (`THIRD_PARTY_NOTICES.md` lists them). `just deny` fails if either revision floats. The Rust nightly moves only when this pin moves.
+- **cuda-oxide is pinned by git revision.** `Cargo.toml` declares the upstream revision (the URL still reads NVlabs/cuda-oxide, which GitHub redirects to [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust), the repository's new name), and a `[patch]` section takes the source from [our fork](https://github.com/midagedev/cuda-oxide) (`bloomery` branch), which is that revision plus a few small patches on their way upstream (`THIRD_PARTY_NOTICES.md` lists them). `just deny` fails if either revision floats. The Rust nightly moves only when this pin moves.
 - **One codegen backend per revision.** On the build machine each revision's backend sits in its own directory with a `source-rev.txt`. `tools/box.sh` sets `CUDA_OXIDE_BACKEND` to it and stops when the file is missing or names another revision.
 - **Host code gets the same CPU flags as a plain cargo build.** `cargo oxide` sets its own `CARGO_ENCODED_RUSTFLAGS`, which hides `.cargo/config.toml`. So `.cargo/cuda-oxide.toml` repeats `-C target-cpu=znver3` in `extra-rustflags`, and `just check-rustflags` fails when the two files disagree.
 
@@ -141,7 +141,7 @@ Register use and spills do not change any output bit, only speed, so the bit-exa
 
 ## Upstream
 
-A few small fixes found along the way went upstream: [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) and [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321) (merged), [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329) and [#1346](https://github.com/NVlabs/cuda-oxide/pull/1346) (open).
+A few small fixes found along the way went upstream: [#1314](https://github.com/NVIDIA/cuda-rust/pull/1314) and [#1321](https://github.com/NVIDIA/cuda-rust/pull/1321) (merged), [#1329](https://github.com/NVIDIA/cuda-rust/pull/1329) and [#1346](https://github.com/NVIDIA/cuda-rust/pull/1346) (open).
 
 ## Where to start reading
 

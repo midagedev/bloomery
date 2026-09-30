@@ -11,7 +11,7 @@ MoE inference in Rust, from the HTTP server down to the CUDA kernels.
 
 DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s decode at depth 6 and 30.04 at depth 4096, 358.4 tok/s prompt at P = 4096; provisional until the warm re-measure ([conditions](#against-llamacpp-deepseek-v41-flash), [all numbers](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md)).
 
-- More than 200 CUDA kernels, all written in Rust with [cuda-oxide](https://github.com/NVlabs/cuda-oxide) ([how](docs/cuda-oxide.md)).
+- More than 200 CUDA kernels, all written in Rust with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) ([how](docs/cuda-oxide.md)).
 - Experts on the GPU and the AVX2 CPU in one CUDA graph step.
 - Adaptive residency: routed experts move between the card and the host by the engine's own routing as it runs.
 - Speculative decoding with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP head for Qwen3.8.
@@ -131,7 +131,7 @@ See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model
 ## Upstream
 
 - ik_llama.cpp: DeepSeek-V4.1 support ([#2455](https://github.com/ikawrakow/ik_llama.cpp/pull/2455)), `GGML_CUDA_NO_PINNED_WEIGHTS` ([#2444](https://github.com/ikawrakow/ik_llama.cpp/pull/2444)), V4.1 DSpark drafts ([#2522](https://github.com/ikawrakow/ik_llama.cpp/pull/2522), [#2546](https://github.com/ikawrakow/ik_llama.cpp/pull/2546)), and eleven more fixes, merged; [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507) and [#2562](https://github.com/ikawrakow/ik_llama.cpp/pull/2562) open.
-- cuda-oxide: [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) and [#1321](https://github.com/NVlabs/cuda-oxide/pull/1321) merged; [#1329](https://github.com/NVlabs/cuda-oxide/pull/1329) and [#1346](https://github.com/NVlabs/cuda-oxide/pull/1346) open. Unfiled toolchain issues: [`docs/upstream/nvlabs-ledger.md`](docs/upstream/nvlabs-ledger.md).
+- cuda-oxide: [#1314](https://github.com/NVIDIA/cuda-rust/pull/1314) and [#1321](https://github.com/NVIDIA/cuda-rust/pull/1321) merged; [#1329](https://github.com/NVIDIA/cuda-rust/pull/1329) and [#1346](https://github.com/NVIDIA/cuda-rust/pull/1346) open. Unfiled toolchain issues: [`docs/upstream/nvlabs-ledger.md`](docs/upstream/nvlabs-ledger.md).
 - llama.cpp [#29008](https://github.com/ggml-org/llama.cpp/pull/29008) merged; mistral.rs [#2430](https://github.com/EricLBuehler/mistral.rs/pull/2430) and cutile-rs [#309](https://github.com/NVlabs/cutile-rs/pull/309) open.
 
 ## More
@@ -144,7 +144,7 @@ See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model
 
 ## References and credits
 
-[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and ggml are the numerical reference: the kernels were written by reading ggml's k-quant code and ik_llama.cpp's `iqk_mul_mat`, and accuracy is defined against their output. [exllamav3](https://github.com/turboderp-org/exllamav3) and [mistral.rs](https://github.com/EricLBuehler/mistral.rs) are design references, cited where used. All four are MIT. The GPU kernels compile with [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Apache-2.0).
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and ggml are the numerical reference: the kernels were written by reading ggml's k-quant code and ik_llama.cpp's `iqk_mul_mat`, and accuracy is defined against their output. [exllamav3](https://github.com/turboderp-org/exllamav3) and [mistral.rs](https://github.com/EricLBuehler/mistral.rs) are design references, cited where used. All four are MIT. The GPU kernels compile with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) (Apache-2.0).
 
 AI assistants helped write the code and the documentation. Every number here was measured by the runners in `tools/ref/`.
 

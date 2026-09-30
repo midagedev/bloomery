@@ -9,7 +9,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 | Piece | Version | Where it is pinned |
 |---|---|---|
 | Rust | `nightly-2026-08-28`, with `rust-src`, `rustc-dev`, `llvm-tools`, `clippy`, `rustfmt` | `rust-toolchain.toml` |
-| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `ec4aa4797956534578a1af010f86252a0b6d8626` (NVlabs), source rev `0af1016c72c2224857d02bead7bdb7cbc10e580b` | `[workspace.dependencies]` in `Cargo.toml` (NVlabs), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
+| cuda-oxide (`cuda-device`, `cuda-host`) | declared rev `ec4aa4797956534578a1af010f86252a0b6d8626` (upstream: NVlabs/cuda-oxide, now NVIDIA/cuda-rust), source rev `0af1016c72c2224857d02bead7bdb7cbc10e580b` | `[workspace.dependencies]` in `Cargo.toml` (NVlabs), source from the `[patch]` fork `midagedev/cuda-oxide` at that rev (the declared rev plus the patches `THIRD_PARTY_NOTICES.md` lists); `just deny` fails if either floats |
 | `cargo-oxide` | 0.2.1, from the same fork and rev | the install command below; `cargo oxide doctor` must pass |
 | LLVM | 21 (`llc` with the NVPTX target); the development machine uses 21.1.8 from the LLVM release tarball | on `PATH`, or `CUDA_OXIDE_LLC` |
 | Clang | 21 with its resource headers (`clang-21` or `libclang-common-21-dev` on Ubuntu), for bindgen | on `PATH` |
@@ -22,7 +22,7 @@ The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remot
 
 The nightly moves only when the cuda-oxide pin moves. Other CUDA versions, drivers and GPU architectures are not tested.
 
-Install `cargo-oxide` from the fork at the pinned rev, not from NVlabs' main branch:
+Install `cargo-oxide` from the fork at the pinned rev, not from upstream's main branch (NVIDIA/cuda-rust, formerly NVlabs/cuda-oxide):
 
 ```sh
 cargo +nightly-2026-08-28 install --git https://github.com/midagedev/cuda-oxide.git \
