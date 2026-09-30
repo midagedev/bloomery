@@ -1059,10 +1059,14 @@ fn batch_table(
     set: usize,
     table: Table,
     rows: Range<usize>,
-) -> Result<View<'_, f32>, GpuError> {
+) -> Result<Window<'_, f32>, GpuError> {
     let TableDims { tokens, nd } = dims;
     let t = set * Table::ALL.len() + table_index(table);
-    view::<f32, f32>(tables, (t * tokens + rows.start) * nd, rows.len() * nd)
+    Window::<f32>::of(
+        tables,
+        (t * tokens + rows.start) * nd * size_of::<f32>(),
+        rows.len() * nd,
+    )
 }
 
 /// Chunk `k`'s launches in position order (module doc, step 3), its tokens
@@ -1109,8 +1113,13 @@ fn chunk_rows(
             // geometry's tokens, not the chunk's: the step words name the
             // chunk's rows alone, and the view runs to the geometry's extent.
             let gt = ccx.words.layout.streams[sp.stream].geom.tokens;
-            let kv = view::<f32, f32>(comp.part(COMP_KV), o * width, gt * width)?;
-            let score = view::<f32, f32>(comp.part(COMP_SCORE), o * width, gt * width)?;
+            let kv =
+                Window::<f32>::of(comp.part(COMP_KV), o * width * size_of::<f32>(), gt * width)?;
+            let score = Window::<f32>::of(
+                comp.part(COMP_SCORE),
+                o * width * size_of::<f32>(),
+                gt * width,
+            )?;
             let raw_key = s.raw.as_mut().and_then(|r| r.key.as_mut());
             // The pooled rows, one launch; with index keys their quantize,
             // gemv and key, and past one token the gemv's copy token-major.
@@ -1153,7 +1162,7 @@ fn chunk_rows(
             });
         }
     }
-    let kv = view::<f32, f32>(&b.kv, o * d.head_dim, m * d.head_dim)?;
+    let kv = Window::<f32>::of(&b.kv, o * d.head_dim * size_of::<f32>(), m * d.head_dim)?;
     let pos = ccx.words.view::<u32>(ccx.words.layout.pos, m)?;
     let table = ccx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
     let Some(staging) = staging else {
@@ -1223,8 +1232,16 @@ fn chunk_rows(
             // its block sits at `rows · o`, row-major over its m tokens.
             let (w_at, w_rows) = (d.q_lora_rank + d.head_dim, indexer::HEADS);
             let (q_at, q_len) = (d.n_head * d.head_dim, indexer::HEADS * indexer::HEAD_DIM);
-            let q_in = view::<f32, f32>(&b.raw_q, cx.q_rows() * o + q_at * m, q_len * m)?;
-            let w_in = view::<f32, f32>(&b.raw_qkv, cx.qkv_rows() * o + w_at * m, w_rows * m)?;
+            let q_in = Window::<f32>::of(
+                &b.raw_q,
+                (cx.q_rows() * o + q_at * m) * size_of::<f32>(),
+                q_len * m,
+            )?;
+            let w_in = Window::<f32>::of(
+                &b.raw_qkv,
+                (cx.qkv_rows() * o + w_at * m) * size_of::<f32>(),
+                w_rows * m,
+            )?;
             // The indexer's score and its top-k.
             ent.of(
                 2,
@@ -1262,7 +1279,7 @@ fn chunk_rows(
         }
     };
     let q_w = d.n_head * d.head_dim;
-    let q = view::<f32, f32>(&b.q, o * q_w, m * q_w)?;
+    let q = Window::<f32>::of(&b.q, o * q_w * size_of::<f32>(), m * q_w)?;
     let mut y = span_mut(WHAT_BATCH, &mut b.y, o * q_w, m * q_w)?;
     let vis = ccx.words.view::<u32>(vis_at, 2 * m)?;
     let args = AttnArgs {

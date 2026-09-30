@@ -4,76 +4,14 @@
 //! at fixed addresses; the copy runs on the engine stream right before the
 //! launch or the replay, outside any graph.
 
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
+use std::mem::size_of;
 
-use bloomery_gpu::{Gpu, GpuError, window};
+use bloomery_gpu::{Gpu, GpuError, Window};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 
+use crate::span::span_mut;
+
 const WHAT: &str = "draft::stage";
-
-/// A non-owning window of a device buffer, borrowed for its lifetime.
-pub(super) struct View<'a, T> {
-    buf: ManuallyDrop<DeviceBuffer<T>>,
-    _parent: PhantomData<&'a ()>,
-}
-
-impl<T> Deref for View<'_, T> {
-    type Target = DeviceBuffer<T>;
-    fn deref(&self) -> &DeviceBuffer<T> {
-        &self.buf
-    }
-}
-
-impl<T> DerefMut for View<'_, T> {
-    fn deref_mut(&mut self) -> &mut DeviceBuffer<T> {
-        &mut self.buf
-    }
-}
-
-/// `len` values of `T` from value `off` of `parent`, whatever its element
-/// type. The launches read and write a view as a buffer of their own; a
-/// mutable view needs `parent` exclusively ([`view_mut`]).
-pub(super) fn view<T, P>(
-    parent: &DeviceBuffer<P>,
-    off: usize,
-    len: usize,
-) -> Result<View<'_, T>, GpuError> {
-    let size = size_of::<T>();
-    let end = off.checked_add(len).and_then(|end| end.checked_mul(size));
-    if len == 0 || end.is_none_or(|end| end > parent.num_bytes()) {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "a view of {len} × {size} B at {off} in {} B",
-                parent.num_bytes()
-            ),
-        });
-    }
-    let bytes = u64::try_from(off * size).map_err(|_| GpuError::Shape {
-        what: WHAT,
-        detail: format!("offset {off}"),
-    })?;
-    // SAFETY: `off .. off + len` values of `T` lie inside `parent`'s
-    // allocation (checked above), at a multiple of `T`'s size from its
-    // (256-aligned) start; `parent` is borrowed for the view's lifetime, so
-    // the memory outlives it and stays in place.
-    let buf = unsafe { window::<T>(parent.cu_deviceptr() + bytes, len, parent.context()) };
-    Ok(View {
-        buf,
-        _parent: PhantomData,
-    })
-}
-
-/// [`view`] of a buffer the caller holds exclusively.
-pub(super) fn view_mut<T, P>(
-    parent: &mut DeviceBuffer<P>,
-    off: usize,
-    len: usize,
-) -> Result<View<'_, T>, GpuError> {
-    view(parent, off, len)
-}
 
 /// A pass's per-call inputs: `words` u32 on the host (pinned) and on the
 /// card. The host side is written between calls, one copy moves a span of
@@ -111,7 +49,7 @@ impl Inbox {
             what: WHAT,
             detail: format!("an upload of {words} words of {}", self.host.len()),
         })?;
-        let mut dst = view_mut::<u32, u32>(&mut self.dev, 0, words)?;
+        let mut dst = span_mut(WHAT, &mut self.dev, 0, words)?;
         // SAFETY: `src` is pinned memory this inbox owns; it is not written
         // before `copied` (recorded right below, after the copy) has passed
         // ([`Inbox::host_mut`]), nor freed before it ([`Inbox`]'s drop), so
@@ -122,13 +60,13 @@ impl Inbox {
     }
 
     /// `len` f32 of the device image from word `off`.
-    pub(super) fn f32s(&self, off: usize, len: usize) -> Result<View<'_, f32>, GpuError> {
-        view(&self.dev, off, len)
+    pub(super) fn f32s(&self, off: usize, len: usize) -> Result<Window<'_, f32>, GpuError> {
+        Window::of(&self.dev, off * size_of::<u32>(), len)
     }
 
     /// `len` u32 of the device image from word `off`.
-    pub(super) fn u32s(&self, off: usize, len: usize) -> Result<View<'_, u32>, GpuError> {
-        view(&self.dev, off, len)
+    pub(super) fn u32s(&self, off: usize, len: usize) -> Result<Window<'_, u32>, GpuError> {
+        Window::of(&self.dev, off * size_of::<u32>(), len)
     }
 }
 
