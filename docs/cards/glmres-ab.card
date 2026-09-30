@@ -1,63 +1,56 @@
-# Round glmrescli: GLM-5.3-Flash's decode under adaptive residency on plan (a) (A6000), the same
-# binary, BLOOMERY_RESIDENCY unset (off) against mid-p33-s1 (33 pinned, 1 spare a layer).
-# P: plan (a) holds card experts on the 39 routed layers whose stacks card_routed takes (3-10,
-# 13-43; model::arch::glm5next::place::card_routed, placement::plan_routed), n_l = 67 of 288 at
-# the fewest [derived, glmtrace.card: 40.09 GB over 39 x 15,204,352 B = 67.6 a layer]; P = 67 / 2
-# = 33 (Qwen3.8's rule, bloomery_levers::residency38_at_plan), P + S + 1 = 35 <= 67. The churn
-# pool is 39 x (67..68 - 33) = 1,326..1,365 experts, 20.2..20.8 GB beside the host set.
-# The step (S1 = 47.7 ms, 20.95 tok/s @ n=96, depth 512, A6000, rig-log 09-28#glm-release): the
-# host serves 39 x 8 x (1 - 0.233) + 3 x 8 = 263 routed slots a token at the id prefix (hit ~
-# 67 / 288 on prose), 4.0 GB at 130-137 GB/s = 29-31 ms, plus 42 x 60-80 us; a slot is 0.111-0.117
-# ms of it [derived]. The card experts run in the host leg's shadow, and stay there at any hit
-# below: 5 card slots a layer at ~700 GB/s are 0.11 ms against a 0.40 ms host leg.
-# Steady state (ideaverify's replay, 25,424 held-out tokens: mid 63.4 %, 5.24 swaps a token): 312 x
-# (0.55..0.634 - 0.233) = 99..125 slots off, 11.0-14.6 ms, less the swaps' DRAM share (80 MB a
-# token, three passes, 0-1.8 ms: none if the staging fits the card fronts, all if it meets the
-# host leg) = -9.2..-14.6 ms, +24..+44 %.
-# This window is not the steady state. The prompt call keeps 0 rows, so the rule learns nothing
-# from the 512 ids and starts at the id prefix; it plans every 4 passes, at most 24 flips a pass
-# over 39 layers and one a layer in flight, a flip live 2 passes after it is made: at most ~22
-# planning passes land inside the 95 timed steps, ~13.5 flips a layer against the ~30 the
-# steady state needs. Largest gain first, a local profile as skewed as the replay's (the top 13
-# non-pinned experts about 0.35 of a layer's routing) and early passes held back by margin 3:
-# the window's mean hit 0.35..0.51, 37..87 slots off, 4.1-10.2 ms, less 0-2.1 ms of swap DRAM
-# (the ramp is cap-bound, 6 flips a step) = 2.0-10.2 ms off 47.7: +4..+27 % [derived].
-# The measured anchor for the ramp's low edge: ideaverify's V4.1 domain switch under mid, the 64
-# steps after it at 56.5 % against 81.3 % steady and 47.2 % static, a quarter of the gain; on GLM
-# a quarter of 0.233 -> 0.634 is ~11 points, 34 slots, 3.8 ms, 1.7-3.8 ms net: +3.7..+8.6 %.
-# late / wait_us: a planning pass's 24 flips stage on one thread, 24 x 15.2 MB at a one-thread
-# copy of 6-12 GB/s = 30-61 ms, inside two steps (74-92 ms at the band's step): late 0 on every
-# boundary and wait_us under 1,000 at a landing boundary [derived]. At a one-thread rate of 4
-# GB/s (130 GB/s over 32 threads) the pass takes 91 ms: late > 0 at the ramp's landings.
-# Prerequisites, none of them in this round's files: the registry word mid-p33-s1
-# (crates/levers/src/registry.rs), RESIDENCY_LEVER and RESIDENCY_HOST in GENERATE_GLM5NEXT
-# (crates/gpu-gates/src/record.rs, then just records-refresh), and the `<D>@NAME=VALUE` lever
-# arm in tools/ref/depth-glm5next.sh (depth-qwen3moe.sh's grammar). Without the last the runner
-# refuses the second arm (rc 64) before the lease.
-# Runner: BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmres-ab.card'
-#   just depth-gpu-glm5next 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 > <log> 2>&1
-# Wall [derived]: 2 arms x (3 rounds + 1 warm-up), each a load (host set populate, ~1-2 min
-# preheated) plus 512 ids and 95 steps (~5 s): 8 processes, 10-18 min.
+# Round glmpaper-replay's correction of glmrescli's card: GLM-5.3-Flash's decode under adaptive residency on
+# plan (a) (A6000), the same binary, BLOOMERY_RESIDENCY unset (off) against mid-p0-s1 (0 pinned, 1 spare).
+# The replay (glmreplay/glmreplay.py over the ik router set glm5next-prose, 24 contexts of 2048, 512 prompt
+# positions kept 0, then the engine's rule: mid, live at b + 2, spares 1, n_l 67 less the spare): the off
+# arm hits 23.1 %, the residency arm 39.5 % over the 95 timed steps (p10..p90 over contexts 35.5..44.2),
+# 96.7 % of the 23 plans at cap 24 (5.75 flips a step); P changes nothing inside 95 steps (P 0, 16, 33:
+# 39.5 each). Host slots a step 264.0 -> 212.8 (first 10: 261.3, last 10: 185.9), at 0.111..0.117 ms a slot
+# 5.7..6.0 ms off S1 = 47.7 ms (rig-log 09-28#glm-release). Less tau a flip x 5.75: tau 0.13 (V4.1 bp
+# after swapprio, 3.40 ms / 24 flips, rig-log 09-29#swapprio-ab, by bytes) .. 0.60 (cprobe's staging c 7.8
+# host slots a copy, rig-log 09-29#cprobe, on the ~70 % of a memcpy that overlaps GLM's host leg):
+# +4.9..+12.4 % at the mean context; the timed prompt (ids 50000..50511) is one context, p25..p75 over the
+# 24 at the band's edges +3.0..+15.3 [derived]. Break-even tau 0.99..1.04 ms a flip.
+# The in-engine anchor on the same common machine (rig-log 09-30#q38res-hit, #q38res-mtp; Qwen3.8, A6000,
+# plan (a), P 512): host slots a step 237 off, 229 -> 188 -> 147 on, 49 fewer at 23.6 us = 1.16 ms, the
+# step 18.95 -> 18.00 ms (+3..+7 % paired: 0.55..1.24 ms), so 0.21 (-0.08..0.61) ms a step past the slots
+# at 6 flips of 3.07 MB: 0.011 (<= 0.033) ms a MB; at GLM's 15.2 MB 0.17 (<= 0.50) ms a flip by bytes,
+# 0.37..0.41 with the host leg's share of the step (q38 ~0.30, GLM 0.65..0.72) [derived].
+# The replay's spread over contexts (35.5..44.2 % hit, +-1.6 ms) is as wide as the tau band, so the ratio
+# reads tau only beside the timed prompt's own hit: the arm's host slots a token (BLOOMERY_STEP_STATS=1,
+# which tools/ref/depth-glm5next.sh drops today: it keeps only plan|load|capture|fed|step 0|time prompt
+# lines), or a route trace of ids 50000..50511 + 96 generated replayed through glmreplay.py.
+# Staging: a plan's 24 x 15.2 MB = 365 MB against LIVE_DELAY 2 (two steps, 95 ms): 30..61 ms at one
+# thread's 6..12 GB/s plus ~9 ms of window waits between jobs, none late; at 4.1 GB/s (130 GB/s over 32
+# threads, swap.rs's own rate) 98 ms, the last job due at the landing: wait_us 0..3,000 there [derived].
+# Runner (prerequisite: the `<D>@NAME=VALUE` lever arm in tools/ref/depth-glm5next.sh, depth-qwen3moe.sh's
+# grammar; without it the second arm is refused, rc 64, before the lease):
+#   BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmres-ab.card'
+#   just depth-gpu-glm5next 512 512@BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+# Wall [derived]: 2 arms x (3 rounds + 1 warm-up), each a load plus 512 ids and 95 steps: 10..18 min.
 kind: ab
-question: does adaptive residency from the id-prefix seed lift GLM-5.3-Flash's decode on plan (a)
-  inside a 96-token window by the ramp model's band?
+question: at the replay's ramp (hit 23.1 -> 39.5 % over 95 steps, 5.75 flips a step), what does one
+  flip's staging cost GLM's decode step on plan (a)?
 term: tok/s(mean) @ n=96, depth 512, A6000, plan (a), prose ids (GLM_PROSE from GLM_PROSE_FROM),
-  ctx 2048, BLOOMERY_RESIDENCY=mid-p33-s1 against unset, same binary, paired by round
+  ctx 2048, BLOOMERY_RESIDENCY=mid-p0-s1 against unset, same binary, paired by round
 unit: %
-predict: +4..+27
+predict: +3..+15
 rounds: 3
 sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
-condition: one binary, both arms in one lease, a fresh process a run (each residency run starts at
-  the seed), each arm's host set preheated and its row not [cold], no [cpu-busy] or [other-busy]
-  row; the residency arm prints `residency lever residency=mid-p33-s1 why=set`, a `residency host`
-  record with pinned=33 and headroom_after > 0, and 96 `residency pass` records (pass=none before
-  the prompt call, pass=prompt kept=0, then 94 of pass=step kept=1) whose landed sum is > 0; the
-  off arm prints no residency record
-decide-in: set the GLM default to mid-p<P>-s1 under --place a (P half the plan's fewest, as
-  Qwen3.8's), then take the steady-state row at n = 512 with --warm 256 before any public table
-decide-below: read the residency pass records: landed near 0 means the margin holds the ramp back
-  (the rule's min_count or margin at GLM's width, not the copy); late > 0 or wait_us over 1,000
-  means the staging sits on the step: one nsys window of the residency arm before any change
-decide-above: the ramp is faster than cap 24 over 4 passes predicts, so the locality is sharper
-  than the replay's: re-derive the steady-state band from a longer window (n = 512) before the
-  default decision
+condition: one binary, both arms in one lease, a fresh process a run (each residency run starts at the
+  seed), each arm's host set preheated and its row not [cold], no [cpu-busy] or [other-busy] row; the
+  residency arm prints `residency lever residency=mid-p0-s1 why=set`, a `residency host` record with
+  pinned=0 and headroom_after > 0 (the churn pool 39 x 67 experts, 39.7 GB), and 96 `residency pass`
+  records (pass=none, pass=prompt kept=0, 94 of pass=step kept=1) whose landed sum is 500..560 (23
+  landings of 23.75); the off arm prints no residency record
+decide-in: read tau = (d_slots x 0.114 - (S_off - S_on)) / flips a step, d_slots and flips the timed
+  prompt's own (its host slots a token, or its route trace through glmreplay.py; the mean context's
+  d_slots is 51.1 and flips 5.75);
+  set plan (a)'s default to mid-p0-s1, and open the prompt-call pick (a port of V4.1's callstream pick at
+  floor 32: n = 96 at 58.3 % hit, +23..+34 % [derived]) before any public row
+decide-below: tau is above 0.6 ms a flip, the memcpy's host-leg interference at cprobe's size: one nsys
+  window of the residency arm (where the staging thread's memcpy lands against the step port's go
+  waits) before the default; wait_us over 1,000 at the landings says the staging thread runs under
+  ~5 GB/s, and LIVE_DELAY 3 or a second staging thread comes first; the rule levers that price it out are the knee preset (1.3..1.5 flips a
+  step, plateau +30..+33 % at any tau) and a staging that pauses outside the window
+decide-above: tau is under 0.13 or the held-out prompt routes more locally than the router set's windows:
+  take the n = 512 row with BLOOMERY_GEN_WARM=256 (replay +27..+39 % at P 0) before the default decision
