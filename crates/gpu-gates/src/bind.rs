@@ -1,4 +1,4 @@
-//! The server's engine over a [`Seat`]: [`Ds41Engine`] implements
+//! The server's engine over a [`Seat`]: [`SeatEngine`] implements
 //! `serve::Engine`, [`Vocab`] implements `serve::Tokenizer` over the file's
 //! own vocabulary, and [`sampler_factory`] builds each request's sampler from
 //! the sampler crate.
@@ -8,12 +8,13 @@
 //! from whichever connection thread holds the slot; the model's device state
 //! and the pinned dispatcher slot belong to the thread that opened them, so
 //! every step runs on that thread and the engine is a handle that sends it
-//! commands. The opener comes in as a closure, and the seat as a trait the
-//! binary implements, because this library does not name a device crate (see
-//! [`crate::generate`]) or the session crate.
+//! commands. The opener comes in as a closure, and the seat as a trait this
+//! library leaves open (the serve binaries' seat tree, `shared/serve_seats/`,
+//! holds its implementers, the device crates' seats), because this module
+//! names no device crate (see [`crate::generate`]) or the session crate.
 //!
 //! How long a prefix of the cache can be kept, and why no longer, is the
-//! seat's rule, which the engine thread answers ([`Ds41Engine`]'s `keepable`
+//! seat's rule, which the engine thread answers ([`SeatEngine`]'s `keepable`
 //! and `keep_limit`); so are the prompt feed, a pass of the draft
 //! ([`Seat::pass`]), where a prompt call is cut, and the state the server's
 //! prompt cache saves and puts back ([`Seat::snapshot`], [`Seat::resume`]). How
@@ -440,7 +441,7 @@ struct Reply {
 
 /// What the engine thread runs every command on: the model standing at a
 /// position, the draft that follows it if one runs, and the body's rules
-/// ([`Ds41Engine::spawn`] opens it on the thread). A failed call says what
+/// ([`SeatEngine::spawn`] opens it on the thread). A failed call says what
 /// failed; the thread adds the command and the position.
 pub trait Seat: 'static {
     /// The position the next fed id lands in.
@@ -502,7 +503,7 @@ pub trait Seat: 'static {
 
 /// `serve::Engine` over a [`Seat`] that lives on its own thread. The
 /// position is the model's alone: every question about it goes to the thread.
-pub struct Ds41Engine {
+pub struct SeatEngine {
     link: Link,
     worker: Option<JoinHandle<()>>,
     vocab: Arc<Vocab>,
@@ -525,7 +526,7 @@ struct Link {
     logits: Vec<f32>,
 }
 
-impl Ds41Engine {
+impl SeatEngine {
     /// Start the engine thread, open the seat on it with `open` (which
     /// writes the load lines), and wait until it is loaded. `defined` is how
     /// many positions the body computes the model at; the engine serves the
@@ -541,7 +542,7 @@ impl Ds41Engine {
         card: String,
         props: EngineProps,
         cache_ram: u64,
-    ) -> Result<Ds41Engine, GateError>
+    ) -> Result<SeatEngine, GateError>
     where
         S: Seat,
         F: FnOnce() -> Result<S, GateError> + Send + 'static,
@@ -639,7 +640,7 @@ impl Ds41Engine {
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
-        Ok(Ds41Engine {
+        Ok(SeatEngine {
             link: Link {
                 tx: Some(tx),
                 rx,
@@ -833,7 +834,7 @@ fn next_row<S: Seat>(
     Ok(arg)
 }
 
-impl Engine for Ds41Engine {
+impl Engine for SeatEngine {
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         self.vocab.clone()
     }
@@ -964,7 +965,7 @@ impl Engine for Ds41Engine {
     }
 }
 
-impl Drop for Ds41Engine {
+impl Drop for SeatEngine {
     fn drop(&mut self) {
         // Closing the channel ends the thread's loop; the model is dropped there.
         self.link.tx = None;
