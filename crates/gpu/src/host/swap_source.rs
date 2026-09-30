@@ -245,6 +245,30 @@ fn layer_parts(
     Ok(Some((per, slots)))
 }
 
+/// The one convert step is built from the first card layer's parts: a card
+/// layer of other parts would be unpacked with the wrong sizes, so a load
+/// with a convert step refuses it by name. `first` is the layer `layers[0]`
+/// holds.
+fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuError> {
+    let mut held = layers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.as_ref().map(|p| (first + i, p)));
+    let Some((l0, p0)) = held.next() else {
+        return Ok(());
+    };
+    match held.find(|(_, p)| p.parts != p0.parts) {
+        None => Ok(()),
+        Some((l, p)) => Err(GpuError::shape(
+            "FileSwap::new",
+            format!(
+                "layer {l}: parts {:?} beside layer {l0}'s {:?}, which the convert step unpacks",
+                p.parts, p0.parts
+            ),
+        )),
+    }
+}
+
 /// A placed load's [`SwapSource`] over its model file: each part of an expert
 /// as the file (or the r8 sidecar the host reads) holds it, into the slot's
 /// place in the layer's stage stack, with the load's host set saying what the
@@ -347,6 +371,9 @@ impl FileSwap {
             .ok_or_else(|| GpuError::shape(WHAT, "no layer of the card holds routed stacks"))?;
         let t0 = first.tensors[0].clone();
         let convert = stacks.open(&t0.dims, &first.parts, pair.r8().sidecar().is_some(), ctx)?;
+        if convert.is_some() {
+            one_layout(layers.start, &out)?;
+        }
         Ok(FileSwap {
             pair,
             set,
@@ -374,7 +401,7 @@ impl FileSwap {
             .parts
             .get(part)
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
-        let t = &p.tensors[part.min(p.tensors.len() - 1)];
+        let t = &p.tensors[part];
         let split = self.pair.source().split();
         let (s, info) = split.find(&t.name).ok_or(GpuError::tensor(
             WHAT,
@@ -886,6 +913,44 @@ mod tests {
                 "layer 0 part 0: 4096 bytes an expert, a stack of 8191 words for 8 slots"
             ),
             other => panic!("a stack too short for its slots is refused, got {other:?}"),
+        }
+    }
+
+    /// Layer parts of `parts` bytes: no tensors or stacks, only what the
+    /// convert-layout check reads.
+    fn held(parts: &[usize]) -> Option<LayerParts> {
+        Some(LayerParts {
+            tensors: Vec::new(),
+            base: Vec::new(),
+            slots: 8,
+            parts: parts.to_vec(),
+        })
+    }
+
+    /// A load with a convert step takes card layers of one layout only, and
+    /// names the first layer of another layout. Mutant: the check skipped (or
+    /// comparing only neighbours past the first) — the layer 7 arm catches it.
+    #[test]
+    fn a_convert_step_refuses_a_layer_of_other_parts_by_name() {
+        let same = [None, held(&[4096, 4096, 8192]), held(&[4096, 4096, 8192])];
+        assert!(one_layout(4, &same).is_ok(), "one layout passes");
+        assert!(one_layout(4, &[None, None]).is_ok(), "no held layer passes");
+        let other = [
+            held(&[4096, 4096, 8192]),
+            None,
+            held(&[4096, 4096, 8192]),
+            held(&[6144, 6144, 16384]),
+        ];
+        match one_layout(4, &other) {
+            Err(GpuError::Shape { what, detail }) => {
+                assert_eq!(what, "FileSwap::new");
+                assert_eq!(
+                    detail,
+                    "layer 7: parts [6144, 6144, 16384] beside layer 4's [4096, 4096, 8192], \
+                     which the convert step unpacks"
+                );
+            }
+            r => panic!("a layer of other parts is refused, got {r:?}"),
         }
     }
 }
