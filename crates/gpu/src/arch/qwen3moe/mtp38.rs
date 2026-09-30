@@ -61,6 +61,10 @@
 //! sequence wrote). A new sequence ([`Mtp38::forget`], the body's reset)
 //! holds no position and no own row.
 //!
+//! A store walk ([`MtpMode::Store`], the prompt's warmup) stops after the
+//! append: a later row reads a row's keys and values and nothing else of
+//! it, so its first `2 + ⌈4m/8⌉ + 3 + 3 + 1` launches are the whole walk.
+//!
 //! Launches of a walk at `m` rows: [`walk_launches`]. The arena is the
 //! program's, allocated once beside the body ([`Mtp38::arm`]) and counted
 //! apart from the plan's bytes ([`Mtp38::arena_bytes`]).
@@ -319,6 +323,32 @@ impl Mtp38 {
     pub fn ctx(&self) -> usize {
         self.ctx
     }
+
+    /// The store's keys and values at positions `0..n`, position-major:
+    /// `[n][n_kv][head]` f16 bits each (the store's own layout is
+    /// `[n_kv][ctx][head]`). Blocking; gate use.
+    pub fn store_host(
+        &self,
+        stream: &CudaStream,
+        n: usize,
+    ) -> Result<(Vec<u16>, Vec<u16>), GpuError> {
+        if n > self.ctx {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("positions 0..{n} of a store of {}", self.ctx),
+            ));
+        }
+        let (ctx, head) = (self.ctx, geo::HEAD);
+        let plane = |b: &DeviceBuffer<u16>| -> Result<Vec<u16>, GpuError> {
+            let all = b.to_host_vec(stream)?;
+            Ok((0..n)
+                .flat_map(|p| (0..geo::N_KV).map(move |kv| (kv * ctx + p) * head))
+                .flat_map(|at| &all[at..at + head])
+                .copied()
+                .collect())
+        };
+        Ok((plane(&self.store.k)?, plane(&self.store.v)?))
+    }
 }
 
 /// A Q8_0 weight's two planes' device addresses; `None` for another format.
@@ -540,6 +570,21 @@ pub enum MtpMode {
     Eager,
     /// Replayed from its capture, captured on first use.
     Graph,
+    /// Enqueued launch by launch through the store's append and no
+    /// further: the rows' keys and values, which are all a later row reads
+    /// of them (a row's input is its token and the target's hidden row,
+    /// never the draft's output). No flash, feed-forward block or head, no
+    /// readback and no own row: the prompt's warmup. The store's bits are
+    /// an [`MtpMode::Eager`] walk's.
+    Store,
+}
+
+/// Where a walk's launches stop: after the head (a walk a readback or an
+/// own row may follow), or after the store's append ([`MtpMode::Store`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkEnd {
+    Head,
+    Store,
 }
 
 /// A captured walk's key: its rows, whether it reads its own last row, its
@@ -727,7 +772,7 @@ struct MtpArena {
     chain: DeviceBuffer<u32>,
     taps: Option<TapBufs>,
     /// The rows of the last walk, which the readbacks and the next own row
-    /// read.
+    /// read; `None` before a walk of the sequence and after a store walk.
     last: Option<(usize, MtpHead)>,
     /// Positions of this sequence the store holds: the last walk's end. A
     /// walk may start at or below it, never past it.
@@ -1059,8 +1104,9 @@ impl Mtp38 {
     /// values, a token past the vocabulary, positions past the store, an
     /// own row before any walk of this sequence, a walk starting past the
     /// positions the store holds for the sequence, a row-list head on a
-    /// full-head load, a captured walk with the taps armed. A fault a
-    /// launch raised is [`GpuError::Fault`], not a token.
+    /// full-head load, a captured walk with the taps armed, a store walk
+    /// ([`MtpMode::Store`] reads nothing back). A fault a launch raised is
+    /// [`GpuError::Fault`], not a token.
     pub(super) fn run(
         &mut self,
         c: &MtpCtx<'_>,
@@ -1070,16 +1116,23 @@ impl Mtp38 {
         mode: MtpMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
+        refuse_store(
+            mode,
+            "a walk with a head to read back (MtpMode::Store writes the store alone)",
+        )?;
         let m = self.run_walk(c, target, feed, head, mode)?;
         let a = self.arena_ref()?;
         read_draft(a, stream, m)
     }
 
-    /// One walk of the program over `feed`'s rows into `head`, eager or
-    /// replayed from its capture, with no readback: [`Mtp38::run`]'s checks
-    /// and launches, the arena's last-walk bookkeeping moved and the walk's
-    /// rows returned. A fault the walk raised stays on the fault word, which
-    /// the next readback names ([`read_draft`], a chain's).
+    /// One walk of the program over `feed`'s rows into `head`, eager,
+    /// replayed from its capture or through the store's append alone
+    /// ([`MtpMode::Store`]), with no readback: [`Mtp38::run`]'s checks and
+    /// launches, the arena's last-walk bookkeeping moved and the walk's rows
+    /// returned. A store walk leaves no last walk: an own row after it, and
+    /// the readbacks of its rows, are refused by name. A fault the walk
+    /// raised stays on the fault word, which the next readback names
+    /// ([`read_draft`], a chain's).
     pub(super) fn run_walk(
         &mut self,
         c: &MtpCtx<'_>,
@@ -1105,7 +1158,7 @@ impl Mtp38 {
             MtpFeed::Own { pos0 } => (1, true, pos0),
         };
         let most = match mode {
-            MtpMode::Eager => MTP_ROWS,
+            MtpMode::Eager | MtpMode::Store => MTP_ROWS,
             MtpMode::Graph => MTP_GRAPH_ROWS,
         };
         if !(1..=most).contains(&m) {
@@ -1191,13 +1244,14 @@ impl Mtp38 {
         }
         let key = MtpKey { m, own, head };
         match mode {
-            MtpMode::Eager => self.walk(c, key)?,
+            MtpMode::Eager => self.walk(c, key, WalkEnd::Head)?,
+            MtpMode::Store => self.walk(c, key, WalkEnd::Store)?,
             MtpMode::Graph => {
                 let mut graphs = std::mem::take(&mut self.graphs);
                 let found = graphs.iter().position(|(k, _)| *k == key);
                 let r = match found {
                     Some(i) => Ok(i),
-                    None => Graph::capture(stream, |_| self.walk(c, key)).map(|g| {
+                    None => Graph::capture(stream, |_| self.walk(c, key, WalkEnd::Head)).map(|g| {
                         graphs.push((key, g));
                         graphs.len() - 1
                     }),
@@ -1208,7 +1262,9 @@ impl Mtp38 {
             }
         }
         let a = self.arena()?;
-        a.last = Some((m, head));
+        // A store walk wrote no own row, no streams past its attention's
+        // input and no head: nothing of it is there to read.
+        a.last = (mode != MtpMode::Store).then_some((m, head));
         a.held = pos0 as usize + m;
         Ok(m)
     }
@@ -1233,6 +1289,10 @@ impl Mtp38 {
         mode: MtpMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
+        refuse_store(
+            mode,
+            "a chain's walks with a head (MtpMode::Store writes the store alone)",
+        )?;
         let MtpFeed::Rows { tokens, pos0, .. } = refresh else {
             return Err(GpuError::shape(
                 WHAT,
@@ -1339,9 +1399,9 @@ impl Mtp38 {
         })
     }
 
-    /// The walk itself: every launch of the module doc's list, enqueued on
-    /// the card's stream (what a capture records).
-    fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey) -> Result<(), GpuError> {
+    /// The walk itself: every launch of the module doc's list through
+    /// `end`, enqueued on the card's stream (what a capture records).
+    fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey, end: WalkEnd) -> Result<(), GpuError> {
         let MtpKey { m, own, head } = key;
         let (embd, output) = self.borrowed(c.tw)?;
         let Mtp38 {
@@ -1479,6 +1539,9 @@ impl Mtp38 {
                 cache_v: &mut store.v,
             },
         )?;
+        if end == WalkEnd::Store {
+            return Ok(());
+        }
         k.flash.enqueue_pass_256_p4(
             stream,
             GqaArgs {
@@ -1761,6 +1824,15 @@ impl Mtp38 {
             nodes,
         })
     }
+}
+
+/// Refuse by name a store walk ([`MtpMode::Store`]) where the head's rows
+/// are read back, `why` naming the call.
+fn refuse_store(mode: MtpMode, why: &'static str) -> Result<(), GpuError> {
+    if mode == MtpMode::Store {
+        return Err(GpuError::state(WHAT, why));
+    }
+    Ok(())
 }
 
 /// The readback of a walk of `m` rows: the tokens, then the probabilities'

@@ -56,12 +56,17 @@
 //!   after a reset, no rows, nine rows eager, five captured, rows past the
 //!   store, a walk past the positions the store holds for the sequence, a
 //!   token past the vocabulary, a hidden slice of the wrong length, a capture
-//!   with the taps armed — and a NaN in a hidden row raised on the fault
-//!   word as the draft layer's `hc_mix`, the walk's error.
+//!   with the taps armed; a store walk (`MtpMode::Store`) read back or
+//!   chained, and the own row and the streams after one — and a NaN in a
+//!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
+//!   walk's error.
 //! - (w) the windows end to end: first the drafted session's prompt call
 //!   walks the draft as walks fed the target's hidden rows from the host
 //!   (position 0 beside a zero row, each later position beside the row of
-//!   the one before it), the anchor walk after them bit for bit; then
+//!   the one before it): its warmup, which walks the store alone, leaves
+//!   every prompt position's keys and values those eager walks stored, bit
+//!   for bit, over a store other ids overwrote first, and the anchor walk
+//!   after them is bit for bit the same; then
 //!   against the plain run at the set's prompt
 //!   and D3K's (depth 3,000 after it): under `app::arch::qwen4exp`'s `Draft`
 //!   impl the drafted greedy ids are the plain run's for 64 tokens, with a
@@ -1512,6 +1517,30 @@ mod gate {
             m.mtp_draft(MtpFeed::Own { pos0: 0 }, h, e),
             "a walk before the draft's own row",
         );
+        // A store walk writes the store alone: nothing of it is read back,
+        // and it leaves no own row for the next walk.
+        let store = MtpMode::Store;
+        ok &= refused(
+            "a store walk read back",
+            m.mtp_draft(feed(1, 0), h, store),
+            "a walk with a head to read back",
+        );
+        ok &= refused(
+            "a chain of store walks",
+            m.mtp_chain(feed(1, 0), 1, h, store),
+            "a chain's walks with a head",
+        );
+        m.mtp_walk(feed(1, 0), h, store)?;
+        ok &= refused(
+            "the draft's own row after a store walk",
+            m.mtp_draft(MtpFeed::Own { pos0: 1 }, h, e),
+            "a walk before the draft's own row",
+        );
+        ok &= refused(
+            "the streams of a store walk",
+            m.mtp_l_out(),
+            "a walk to read",
+        );
         Ok(ok && raised)
     }
 
@@ -1840,14 +1869,19 @@ mod gate {
     /// (w)'s first clause: the draft's walks over a prompt call are the
     /// walks the module doc of `app::arch::qwen3moe` names. From a reset,
     /// the prompt by passes with every unit's hidden rows read to the host,
-    /// then the draft walked from the host as the prompt call walks it —
-    /// position 0 with a zero hidden row, each unit's rows from its second
-    /// position on (the last unit's last excepted) each beside the hidden
-    /// row of the position before it, in runs of eight — and one anchor walk
-    /// at the prompt's end; against the drafted session's prompt call by
-    /// the same passes and the same anchor walk: the anchor's token, streams
-    /// and logits bit for bit — the anchor's attention reads every key the
-    /// walks before it wrote.
+    /// then the draft walked eagerly (every launch, the head's included)
+    /// from the host as the prompt call walks it — position 0 with a zero
+    /// hidden row, each unit's rows from its second position on (the last
+    /// unit's last excepted) each beside the hidden row of the position
+    /// before it, in runs of eight — and one anchor walk at the prompt's
+    /// end; against the drafted session's prompt call by the same passes,
+    /// whose warmup walks the store alone (`MtpMode::Store`): the store's
+    /// keys and values at every prompt position bit for bit, then the same
+    /// anchor walk's token, streams and logits bit for bit — the anchor's
+    /// attention reads every key the walks before it wrote. Between the two,
+    /// eager walks of other ids over the same positions overwrite every
+    /// stored row, so a position the prompt call does not write reads as
+    /// another sequence's, not as the host run's.
     fn prompt_walks(
         m: Qwen38Model,
         prompt: &[u32],
@@ -1913,7 +1947,37 @@ mod gate {
                 e,
             )
         };
+        let host_store = store_of(&m, n)?;
         let host = anchor(&mut m)?;
+        // Other ids over the same positions, from position 0: every row the
+        // host walks stored is overwritten.
+        let vocab = u32::try_from(m.body("prompt_walks")?.vocab())?;
+        let other: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &other[..1],
+                pos0: 0,
+                hidden: MtpHidden::Host(&zeros),
+            },
+            h,
+            e,
+        )?;
+        for (i, run) in other[1..].chunks(MTP_ROWS).enumerate() {
+            let q = 1 + i * MTP_ROWS;
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: run,
+                    pos0: u32::try_from(q)?,
+                    hidden: MtpHidden::Host(&streams[(q - 1) * WIDE..(q - 1 + run.len()) * WIDE]),
+                },
+                h,
+                e,
+            )?;
+        }
+        let overwritten = same_rows(&host_store, &store_of(&m, n)?, n)
+            .iter()
+            .filter(|&&same| !same)
+            .count();
         let cfg = app::arch::qwen3moe::Q38Cfg {
             prompt: path,
             draft: MtpMode::Eager,
@@ -1921,18 +1985,43 @@ mod gate {
         let (mut s, mut spec) = drafted_session(m, cfg, ctx)?;
         spec.prompt(&mut s, prompt)?;
         let mut m = s.into_model();
+        let same_at = same_rows(&host_store, &store_of(&m, n)?, n);
+        let stored = same_at.iter().filter(|&&same| same).count();
+        let store_ok = overwritten == n && stored == n;
+        let first_off = same_at.iter().position(|&same| !same);
         let call = anchor(&mut m)?;
         let same = same_bits(&host, &call);
         println!(
             "(w) the prompt call ({path:?}) walks the draft over {n} positions in {} units as the \
-             walks fed from the host: the anchor's token {} (host {}), streams and logits bit \
-             for bit {}",
+             walks fed from the host: other ids overwrote {overwritten} of {n} stored rows, then \
+             the call's warmup stored {} of {n} as the host's (first other at {first_off:?}) {}; \
+             the anchor's token {} (host {}), streams and logits bit for bit {}",
             units.len(),
+            stored,
+            verdict(store_ok),
             call.draft.tokens[0],
             host.draft.tokens[0],
             verdict(same)
         );
-        Ok((m, same))
+        Ok((m, store_ok && same))
+    }
+
+    /// The draft's stored keys and values at positions `0..n`, position-major.
+    fn store_of(m: &Qwen38Model, n: usize) -> Result<(Vec<u16>, Vec<u16>), GateError> {
+        let d = m.body("store")?.mtp().ok_or("the load opened no draft")?;
+        Ok(d.store_host(m.gpu().stream(), n)?)
+    }
+
+    /// Whether each position below `n` holds bit for bit the same keys and
+    /// values in `a` and `b` (two [`store_of`] reads of `n` positions).
+    fn same_rows(a: &(Vec<u16>, Vec<u16>), b: &(Vec<u16>, Vec<u16>), n: usize) -> Vec<bool> {
+        let row = a.0.len() / n.max(1);
+        (0..n)
+            .map(|p| {
+                let r = p * row..(p + 1) * row;
+                a.0[r.clone()] == b.0[r.clone()] && a.1[r.clone()] == b.1[r]
+            })
+            .collect()
     }
 
     /// The drafted session's cfg, its prompt path `path`.

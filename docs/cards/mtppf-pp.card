@@ -1,0 +1,51 @@
+# Round mtppf: the MTP arm's prompt call walks the draft's warmup through the store's append alone
+# (MtpMode::Store) instead of whole eager walks. Same binary, two arms by the draft lever, as the
+# q38mtp-tg sitting (docs/cards/q38mtp-tg.card; its log: plain pp512 619.2 / pp4096 612.9,
+# mtp 473.6 / 458.3, 3 rounds, prose, A6000 plan a, C 4352).
+# Decomposing that sitting's gap, per round from its `stat prompt host` and `time prompt` rows:
+# - the union term: the draft's card reserve (place.rs plan_mtp_with, the draft's 2.82 GB) moves
+#   target slots to the host, host_slots 115,726 -> 123,608 (P 512) and 908,274 -> 981,105 (P 4096)
+#   in every round; union_ms +27..+35 (mean +29.8) and +330..+435 (mean +375.8) ms. This round does
+#   not touch it.
+# - the warmup: the rest, +224 ms (P 512) and +1,881 ms (P 4096) over 65 and 513 eager walks of up
+#   to 8 rows, 3.45 and 3.67 ms a walk (the ubatch is the whole prompt, so the walks run after the
+#   target's one unit, serial on the card, with nothing under them). A warm row's only lasting
+#   effect is its keys and values; the store walk keeps embed, pack, eh_proj (4 launches of the
+#   13.9 MB matrix), the attention site's mix, q, k, v and the append: 13 launches and ~95 MB a
+#   walk, against the whole walk's ~39 launches and ~1.2 GB (the full head's 675 MB, ~80 routed
+#   slots of 5.2 MB, the dense rest). At the whole walk's measured 2x over its byte floor the store
+#   walk is 0.15-0.35 ms [derived]; band 0.10-0.50 ms, 51-257 ms at P 4096 and 7-33 ms at P 512.
+# New MTP arm [derived]: P 4096 6,682 + 330..435 + 51..257 = 7,063..7,374 ms against 6,682:
+# -9.4..-5.4 %; P 512 827 + 27..35 + 7..33 = 861..895 ms against 827: -7.5..-3.9 % (printed, not
+# decided: the last sitting's plain pp512 rows scatter ~1.9 %, h ~4 % at 3 rounds). The band below is
+# P 4096's, the headline row with the smaller scatter.
+# The runner (wall: the q38mtp-tg sitting took 6 min for the same 12 processes, 22:21:50-22:27:44):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mtppf-pp.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
+# just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_DRAFT=mtp prose:4096 prose:4096@BLOOMERY_DRAFT=mtp
+kind: ab
+question: does walking the draft's warmup through the store's append alone close the MTP arm's
+  prompt gap down to the draft's card reserve (the union term), as the store walk's cost predicts?
+term: pp tok/s @ P=4096 (prose:4096, the time prompt row), n=96, ctx 4352 (BLOOMERY_GEN_CTX=4352),
+  A6000, plan a (card experts), BLOOMERY_DRAFT=mtp against unset, same binary, paired by round
+unit: %
+predict: -9.5..-5.0
+rounds: 3
+sd: 0.55 % the q38mtp-tg sitting's pp4096 rows (docs/cards/q38mtp-tg.card), plain/mtp paired ratio
+  SD 0.75 % over 3 rounds, divided by the square root of 2
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set
+  and the PLE table warm (majflt near 0), no [cpu-busy] or [other-busy] row; the mtp arm's load line
+  names draft=mtp and head=full; each arm's stat prompt host line gives host_slots 908,274 (plain)
+  and 981,105 (mtp) at P 4096, 115,726 and 123,608 at P 512 — the same placement as the q38mtp-tg
+  sitting, so the union term is that sitting's; the store the warmup leaves reads as before: the mtp
+  arm's decode at prose:512 near that sitting's 81.94 tok/s (a store off by bits drops the
+  acceptance toward the plain 51.4) and each arm's distinct_tokens the plain arm's (70 at P 512, 61
+  at P 4096)
+decide-in: land mtppf; the warmup is closed to the store walk's and the gap left is the draft's card
+  reserve; the MTP default is then decode +26..+59 % against this pp, and the next lever is the
+  reserve (the draft's 2.67 GB of routed experts on the card), a placement round
+decide-below: the store walk costs more than 0.5 ms or a term outside the walk and the union moved:
+  read each arm's stat prompt host union_ms first (+330..+435 ms at P 4096); inside that band, nsys
+  one MTP prompt call at P 4096 before any change
+decide-above: the union term landed less than +330 ms on the wall or the store walk is under 0.1 ms:
+  compare both arms' host_slots and union_ms with this card's, then re-derive the union's share of
+  the prompt wall from one BLOOMERY_STEP_STATS=1 run before the next round

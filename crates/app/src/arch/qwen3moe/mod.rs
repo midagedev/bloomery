@@ -10,7 +10,8 @@
 //!
 //! - the prompt call ([`MtpDraft::prompt`]) walks the draft over the prompt
 //!   as its units complete — a unit's arena holds its rows' hidden rows
-//!   until the next unit overwrites them — filling the draft's store from
+//!   until the next unit overwrites them — through the store's append alone
+//!   ([`MtpMode::Store`]), filling the draft's store from
 //!   position 0 (the row at 0 reads a zero hidden row: the target holds
 //!   nothing before it) and leaving the last unit's last row for
 //!   [`MtpDraft`'s `begin`](Draft::begin), whose walk is the next window's
@@ -304,9 +305,10 @@ impl MtpDraft {
     }
 
     /// One run of the warmup: `tokens` at `pos0`, their hidden rows the
-    /// arena `walk`'s from `first` on, walked eagerly with no readback — a
-    /// fault stays on the fault word, which the next readback (the first
-    /// chain's) names.
+    /// arena `walk`'s from `first` on, walked through the store's append
+    /// alone ([`MtpMode::Store`]: a warm row's keys and values are all a
+    /// later row reads of it) with no readback — a fault stays on the fault
+    /// word, which the next readback (the first chain's) names.
     fn warm(
         &self,
         m: &mut Qwen38Model,
@@ -328,7 +330,7 @@ impl MtpDraft {
                     },
                 },
                 self.head,
-                MtpMode::Eager,
+                MtpMode::Store,
             )?;
         }
         Ok(())
@@ -400,7 +402,7 @@ impl Draft<Session<Body38>> for MtpDraft {
                         hidden: MtpHidden::Host(&self.zeros),
                     },
                     head,
-                    MtpMode::Eager,
+                    MtpMode::Store,
                 )?;
             }
             let end = first + rows as u32 + 1 - u32::from(last);
