@@ -7,7 +7,7 @@ use crate::GpuError;
 use crate::model::StepProbe;
 use crate::model::lookup::{f32_gain, kq_weight, q8_derived};
 use crate::q5::Q8Blocks32;
-use crate::tensor::Q8Act;
+use crate::tensor::{Q8Act, Window};
 use crate::weights::{DevWeight, Weights};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
@@ -147,27 +147,6 @@ const SP_TOKEN: usize = 0;
 pub(super) const SP_POS: usize = 1;
 pub(super) const SP_N_KEYS: usize = 2;
 const SP_CS: usize = 3;
-
-/// A non-owning window of `len` `T` over `parent`, starting at element `off`
-/// of the parent's u32 grid. The launches read it exactly as they read a
-/// buffer of its own.
-///
-/// # Safety
-///
-/// - `off * 4 + len * size_of::<T>()` must be within `parent`'s allocation,
-///   and `off * 4` must be a multiple of `align_of::<T>()`.
-/// - `parent` must outlive the window and must not be reallocated: a captured
-///   graph bakes the address in.
-unsafe fn param_view<T>(
-    parent: &DeviceBuffer<u32>,
-    off: usize,
-    len: usize,
-) -> ManuallyDrop<DeviceBuffer<T>> {
-    let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
-    // SAFETY: the range is the caller's contract above, inside `parent`, a
-    // `DeviceBuffer::from_host` allocation of the context passed here.
-    unsafe { crate::tensor::window(ptr, len, parent.context()) }
-}
 
 /// The layer scratch arena and the device-side step parameters, sized at
 /// load for m = 1 (decision 4: nothing here is allocated per step). One
@@ -706,17 +685,20 @@ impl ParamImage {
         let mut params_host = vec![0u32; SP_CS + rope];
         params_host[SP_N_KEYS] = 1;
         let step_params = DeviceBuffer::from_host(stream, &params_host)?;
-        // SAFETY: each window is inside `step_params`'s extent by the `SP_*`
-        // layout, every offset is a u32 multiple and so four-byte aligned, and
-        // `step_params` moves into the arena beside them (a move of the handle,
-        // not of the allocation), where it outlives them and is never
-        // reallocated.
+        // The four windows the launches take as their own buffers: cut from
+        // the image by the `SP_*` layout, checked, then kept as handles — the
+        // image moves beside them into the arena, a move of the handle, not
+        // of the allocation.
+        // SAFETY: the handles and their parent `step_params` live and drop
+        // together as `LayerScratch` fields (`pos_buf`…`cs_buf` beside
+        // `step_params`): its `Drop` releases each handle once before any
+        // field drops, so the parent's free happens after they are gone.
         let (cs_buf, token_buf, pos_buf, n_keys_buf) = unsafe {
             (
-                param_view::<f32>(&step_params, SP_CS, rope),
-                param_view::<u32>(&step_params, SP_TOKEN, 1),
-                param_view::<u32>(&step_params, SP_POS, 1),
-                param_view::<u32>(&step_params, SP_N_KEYS, 1),
+                Window::<f32>::of(&step_params, SP_CS * size_of::<u32>(), rope)?.into_handle(),
+                Window::<u32>::of(&step_params, SP_TOKEN * size_of::<u32>(), 1)?.into_handle(),
+                Window::<u32>::of(&step_params, SP_POS * size_of::<u32>(), 1)?.into_handle(),
+                Window::<u32>::of(&step_params, SP_N_KEYS * size_of::<u32>(), 1)?.into_handle(),
             )
         };
         Ok(ParamImage {

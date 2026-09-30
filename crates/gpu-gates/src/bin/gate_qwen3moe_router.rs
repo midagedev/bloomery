@@ -97,7 +97,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::{
-        DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, window,
+        DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, Window,
     };
     use bloomery_gpu_gates::qwen3moe::sets;
     use bloomery_gpu_gates::rounding::gamma;
@@ -111,7 +111,6 @@ mod gate {
     use model::arch::models::shape::{MoeShape, rules};
     use model::arch::qwen3moe::hparams::{Hparams, Score};
     use model::arch::qwen3moe::names;
-    use std::mem::ManuallyDrop;
 
     /// Probabilities and weights against the host rule, absolute: both are
     /// in [0, 1] and the only divergence is `exp`'s last ulps.
@@ -777,25 +776,14 @@ mod gate {
         // one f32 into an allocation is aligned for f32 and not for that.
         let w_pad = DeviceBuffer::from_host(stream, &[w, &[0.0f32; 4][..]].concat())?;
         let x_pad = DeviceBuffer::<f32>::zeroed(stream, 8 * k + 4)?;
-        let ctx = gpu.context();
-        // SAFETY: each window is the f32 span after the first element of its
-        // own live allocation, which holds four more than the span; both
-        // allocations outlive the calls below, and the windows are given
-        // back right after them.
-        let (w_off, x_off) = unsafe {
-            (
-                DeviceTensor::<f32>::window(w_pad.cu_deviceptr() + 4, N_EXPERT, k, ctx),
-                window::<f32>(x_pad.cu_deviceptr() + 4, 8 * k, ctx),
-            )
-        };
+        let w_off = DeviceTensor::<f32>::window_of(&w_pad, 4, N_EXPERT, k)?;
+        let x_off = Window::<f32>::of(&x_pad, 4, 8 * k)?;
         let weight_misaligned = rk
             .enqueue_ubatch(stream, &w_off, &x, 8, sink, &mut ub)
             .is_err();
         let input_misaligned = rk
             .enqueue_ubatch(stream, &wd, &x_off, 8, sink, &mut ub)
             .is_err();
-        DeviceTensor::release(w_off);
-        drop(ManuallyDrop::into_inner(x_off).into_raw_parts());
         let refusals = [
             (
                 "tokens_past_buffers",
