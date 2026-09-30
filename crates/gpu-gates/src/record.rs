@@ -2129,6 +2129,11 @@ mod tests {
                 include_str!("../../../tools/bloomery/schema/bloomery-serve-ds41.jsonl"),
             ),
             (
+                "bloomery-serve-qwen38",
+                BLOOMERY_SERVE_QWEN38,
+                include_str!("../../../tools/bloomery/schema/bloomery-serve-qwen38.jsonl"),
+            ),
+            (
                 "generate_glm5next",
                 GENERATE_GLM5NEXT,
                 include_str!("../../../tools/bloomery/schema/generate_glm5next.jsonl"),
