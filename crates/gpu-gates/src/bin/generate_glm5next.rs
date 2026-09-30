@@ -128,7 +128,7 @@ mod cli {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::{Lever38, residency38};
+    use bloomery_gpu_gates::residency38::residency_set;
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{
@@ -217,7 +217,7 @@ mod cli {
             self.top_k = inputs.hp.indexer.top_k;
             if let Some((r, word)) = self.residency {
                 residency_room(plan, r, word).map_err(SessionError::Caller)?;
-                residency38(plan, Lever38::Set(r, word), Record::print)
+                residency_set(plan, GLM_CARD, r, word, Record::print)
                     .map_err(SessionError::Caller)?;
             }
             Ok(!self.stop_at_plan)
@@ -876,6 +876,9 @@ mod cli {
         }
         Ok(Some((r, word)))
     }
+
+    /// The plan's card GLM's residency machine runs over: plan (a)'s one card.
+    const GLM_CARD: usize = 0;
 
     /// `word`'s pinned experts, its spares and one that moves fit every
     /// layer's card experts in `plan`, else a named refusal before the load.
