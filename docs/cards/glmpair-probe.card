@@ -19,7 +19,11 @@ question: what does the two-row verify cost over one plain step on the same load
 term: V2/S1 @ n=97, depth 512, A6000: the p50 of `time pass kind=pair` over the p50 of `time step`
   (smoke p50_ms), both from one generate_glm5next --time --pair process, plan (a), prose ids
 unit: ratio
-predict: 1.13..1.51
+# Corrected 2026-10-01 (paper round glmpaper-verify, trace replay of 49,975 windows at n_l 67 on 39 layers):
+# ~~1.13..1.51, center 1.32~~. rho is not the union share: row 1 shares 0.288 of its host bytes with row 0 and
+# 0.119 on the same CCD, so rho 0.93-1.0 (0.88 tail); h is 29.6-31.4 ms (4,055 MB a row at 129-137 GB/s), not
+# 25.7-31.7. V2/S1 = 1.34-1.52, center 1.44 [derived]; its dominant term is (1 + rho) h, ~88 % of V2.
+predict: 1.34..1.52
 condition: one lease, one process, 96 plain steps then 48 verifies of two rows at the same positions
   (the pair cut back to the prompt's end, its capture before the first pass); every pass's two tokens
   equal the plain run's (else the process ends in a named error, no row); no row carries [cpu-busy] or
