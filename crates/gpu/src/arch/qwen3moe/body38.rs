@@ -17,7 +17,11 @@
 //! map of the plan (`SlotMap::of_plan`: each layer's routed experts the plan
 //! puts on the card, the rest the host's), the card leg over the card's
 //! stacks (`card38`), and the host tier over every layer's routed stacks,
-//! which serves the map's host slots. Every walk runs its card side — the
+//! which serves the map's host slots. Under an explicit `BLOOMERY_RESIDENCY`
+//! word the load also runs the residency machine over the card's stacks
+//! (`swap38`: the common machine, Qwen3.8's parts and live delay), which
+//! moves the map between passes; unset keeps the load's map. Every walk runs
+//! its card side — the
 //! step, the verify and the pass the card leg, the ubatch walk its card
 //! route (`wide38`) — and every walk refuses by name a map with an expert
 //! on a tier card.
@@ -83,6 +87,7 @@ use super::scratch38::{
     Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
     dims, kept_lane, store_rule_bytes,
 };
+use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
     Gemm38, Prompt38Stats, Wide38, WideForce, WideParts, WideTaps, WideTiming, dense_rows, nanos,
@@ -90,7 +95,9 @@ use super::wide38::{
 };
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
-use crate::host::{BatchLeg, StepLeg};
+use crate::host::swap::{PassReport, ResetReport, Residency};
+use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
+use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
 use crate::rope_table::{RopeSpec, RopeTable};
@@ -475,8 +482,10 @@ pub struct Body38 {
     rp: PassRecord,
     pass_hsum: DeviceBuffer<f32>,
     k: Kernels38,
-    /// The slot map's card copy, and the card leg over its card experts.
-    slots: DeviceTensor<u32>,
+    /// The slot map's card copy, and the card leg over its card experts. The
+    /// host tier holds the host copy, and its residency machine, when it runs
+    /// one, this `Arc`: the buffer lives until both let go.
+    slots: Arc<DeviceTensor<u32>>,
     card: Card38,
     /// A ubatch walk's arena, record, host sums and own buffers, for
     /// ubatches of up to `wide.rows` positions.
@@ -517,6 +526,10 @@ pub struct Body38 {
     plant: Option<Plant>,
     /// The MTP draft layer, when the load opened one ([`Body38::open_placed_mtp`]).
     mtp: Option<Mtp38>,
+    /// The load's residency side ([`ResidencyGlue`]): the machine, when the
+    /// lever runs one, over `hybrid`'s slot map through `slots`; every call
+    /// nothing without one.
+    residency_glue: ResidencyGlue,
 }
 
 impl Body38 {
@@ -524,8 +537,9 @@ impl Body38 {
     /// segments, the joins ([`Body38::derive`]) and the body over them with
     /// the host tier over every layer's routed experts, holding the load's
     /// host set as `host` asks, its ubatches of up to `ubatch` positions —
-    /// the value the plan's machine was built with (`place::machine`).
-    /// Refused by name: a coverage item past [`ALLOWED`], a plan with an
+    /// the value the plan's machine was built with (`place::machine`). The
+    /// load's slot map for the model's life ([`Residency::Off`]); refused by
+    /// name: a coverage item past [`ALLOWED`], a plan with an
     /// expert tier card, a plan of more than one card or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
     /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
@@ -538,12 +552,33 @@ impl Body38 {
         host: HostCfg,
         ubatch: usize,
     ) -> Result<Qwen38Model, GpuError> {
-        Body38::open_with(file, plan, inputs, card, host, ubatch, None)
+        Body38::open_with(file, plan, inputs, card, host, ubatch, Residency::Off, None)
+    }
+
+    /// [`Body38::open_placed`] under `residency`: `mid-p<P>-s<S>` runs the
+    /// residency machine over the card's routed stacks
+    /// ([`crate::host::swap`], [`Qwen38Stacks`]) — the load's host set also
+    /// holds each layer's churn pool (the card's experts past the first `P`),
+    /// refused by name when the plan's host headroom cannot take it — while
+    /// `off` is [`Body38::open_placed`] itself. The lever's word a load runs
+    /// by is the registry's, read by the caller
+    /// (`bloomery_levers::Levers::residency_at`).
+    pub fn open_placed_residency(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        residency: Residency,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(file, plan, inputs, card, host, ubatch, residency, None)
     }
 
     /// [`Body38::open_placed`] of `plan`'s target plan with the MTP draft
     /// of `draft` (the draft file `mtp` was read from) opened on the same
-    /// card beside it ([`Mtp38::open`]); refused as either refuses.
+    /// card beside it ([`Mtp38::open`]); refused as either refuses. The
+    /// load's slot map for the model's life ([`Residency::Off`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "open_placed's six and the draft's file and inputs (rust-quality R8)"
@@ -565,12 +600,46 @@ impl Body38 {
             card,
             host,
             ubatch,
+            Residency::Off,
             Some((draft, mtp, plan)),
         )
     }
 
-    /// The load both constructors share; `mtp` the draft's file, inputs and
-    /// plan, when there is one.
+    /// [`Body38::open_placed_mtp`] under `residency`, as
+    /// [`Body38::open_placed_residency`] is [`Body38::open_placed`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed_mtp's eight and the residency (rust-quality R8)"
+    )]
+    pub fn open_placed_mtp_residency(
+        file: Split,
+        plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        draft: &Split,
+        mtp: &model::arch::qwen35moe::place::MtpInputs,
+        residency: Residency,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file,
+            &plan.plan,
+            inputs,
+            card,
+            host,
+            ubatch,
+            residency,
+            Some((draft, mtp, plan)),
+        )
+    }
+
+    /// The load every constructor shares, under `residency`; `mtp` the
+    /// draft's file, inputs and plan, when there is one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed's six, the residency and the draft's file, inputs and plan (rust-quality R8)"
+    )]
     fn open_with(
         file: Split,
         plan: &Plan<'_>,
@@ -578,6 +647,7 @@ impl Body38 {
         card: usize,
         host: HostCfg,
         ubatch: usize,
+        residency: Residency,
         mtp: Option<(
             &Split,
             &model::arch::qwen35moe::place::MtpInputs,
@@ -624,15 +694,24 @@ impl Body38 {
             ));
         }
         let shape = plan38::read(&inputs.spec)?;
-        GpuModel::load_placed(
+        let spec = ResidencySpec {
+            lever: residency,
+            delay: LIVE_DELAY,
+            deadline: DEADLINE,
+            top_k: geo::N_USED,
+            max_rows: PASS_ROWS,
+            stacks: Arc::new(Qwen38Stacks),
+        };
+        GpuModel::load_placed_with(
             file,
             plan,
             card,
             host,
+            spec,
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
-            |gpu, file, w, residency| {
+            |gpu, file, w, set, glue| {
                 let draft = mtp
-                    .map(|(d, m, p)| Mtp38::open(gpu, &file, w, d, m, p, host.card_dontneed))
+                    .map(|(d, m, p)| Mtp38::open(gpu, file, w, d, m, p, host.card_dontneed))
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,
@@ -642,7 +721,8 @@ impl Body38 {
                     inputs,
                     &shape,
                     host,
-                    residency,
+                    set,
+                    glue,
                     (ubatch, counted),
                 )?;
                 if let Some(mut d) = draft {
@@ -691,19 +771,23 @@ impl Body38 {
     }
 
     /// The body of the plan's one card over the chain's `shape` (module doc).
+    /// `set` is the load's host set and `residency_glue` its residency side:
+    /// the machine, when the lever runs one, is started once the pieces are
+    /// sized ([`HostServed::start_residency`], the load's last step).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, and the ubatch with the arena bytes the plan counts (rust-quality R8)"
+        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
-        file: Split,
+        file: &Arc<Split>,
         w: &Weights,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         shape: &Shape38,
         host: HostCfg,
-        residency: HostResidency,
+        set: HostResidency,
+        residency_glue: ResidencyGlue,
         (ub, counted): (usize, u64),
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
@@ -770,7 +854,12 @@ impl Body38 {
         let run = 0..n;
         let map = SlotMap::of_plan(plan, 0, None, run.clone(), geo::EXPERTS)?;
         let card_leg = MapCheck::of(&map)?;
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, geo::EXPERTS)?;
+        let slots = Arc::new(DeviceTensor::upload(
+            stream,
+            &map.stage_view(),
+            n,
+            geo::EXPERTS,
+        )?);
         let card = Card38::new(gpu, w, &map, n)?;
         let wide = Wide38::new(stream, ub, &card)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
@@ -792,21 +881,20 @@ impl Body38 {
             1,
             VERIFY_ROWS,
         )?;
-        let file = Arc::new(file);
         let widths = HostWidths {
             embd: geo::HIDDEN,
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        let mut experts = HostRun::build(Arc::clone(&file), 0, host.r8, widths, |src| {
+        let mut experts = HostRun::build(Arc::clone(file), 0, host.r8, widths, |src| {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
         experts.prepare_union(host_cols)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
-        hybrid.keep_residency(residency);
+        hybrid.keep_residency(set);
         hybrid.prepare_batch(gpu.context(), host_cols)?;
-        let ple = PleHost::new(file, spec.vocab as usize, host_cols)?;
+        let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols)?;
         let mut body = Body38 {
             hybrid,
             plans,
@@ -839,8 +927,12 @@ impl Body38 {
             last_walk: TargetRows::Step,
             plant: None,
             mtp: None,
+            residency_glue,
         };
         body.sp.write(stream, 0, 0)?;
+        // Last: the machine frees each layer's spare slots, and every piece
+        // above sized itself from the load's map, capacity = live.
+        body.start_residency(gpu)?;
         stream.synchronize()?;
         Ok(body)
     }
@@ -1063,6 +1155,26 @@ impl Body38 {
     /// The host tier, for a caller that attaches or marks its route trace.
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
         &mut self.hybrid
+    }
+
+    /// Keep every residency boundary's report from now on, for
+    /// [`Body38::take_residency_passes`]: a binary that prints the `residency
+    /// pass` records asks once, with the boundaries it takes at most between
+    /// two takes. Nothing is kept until then.
+    pub fn log_residency(&mut self, passes: usize) {
+        self.residency_glue.log_passes(passes);
+    }
+
+    /// The residency machine's source, when the load runs one.
+    #[must_use]
+    pub fn residency_source(&self) -> Option<&FileSwap> {
+        self.residency_glue.source()
+    }
+
+    /// The residency boundaries' reports since the last take, in order, each
+    /// with the kind of the pass it ended; the log keeps its capacity.
+    pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
+        self.residency_glue.take_passes()
     }
 
     /// Arm (or disarm) the per-layer taps ([`GpuModel::set_layer_taps`], the
@@ -1743,11 +1855,18 @@ impl GpuModel<Body38> {
     /// overwrites them. A `None` sink is [`GpuModel::prompt38`] itself: the
     /// steps run as one call of the whole prompt; a sink's per-token steps
     /// leave the same bits, a head readback a token.
+    ///
+    /// The call is one residency pass ([`crate::host::swap`]): its boundary
+    /// before it and none inside — the passes and the ubatches run through
+    /// `run_rows`, which opens none — and 0 rows kept after it, whatever it
+    /// returned: the rule counts decode rows only, and the batch service
+    /// notes no id. A step-fed prompt is refused by name under a running
+    /// machine: each prompt id would end a decode pass the rule counts.
     pub fn prompt38_with(
         &mut self,
         tokens: &[u32],
         path: Prompt38,
-        mut sink: Option<&mut Prompt38Sink<'_>>,
+        sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         if tokens.is_empty() {
@@ -1772,8 +1891,38 @@ impl GpuModel<Body38> {
                 ),
             ));
         }
+        let resolved = path.resolve(tokens.len());
+        if resolved == Prompt38::Step && body.hybrid().swap().is_some() {
+            return Err(GpuError::shape(
+                WHAT_P,
+                "a step-fed prompt beside the residency machine: each prompt id \
+                 would end a decode pass the rule counts, where the prompt call keeps \
+                 0; feed the prompt by passes or ubatches (a `pass`, `gemm` or `auto` \
+                 path) or load with BLOOMERY_RESIDENCY=off",
+            ));
+        }
+        self.pass_boundary()?;
+        let r = self.feed38(tokens, resolved, sink);
+        // The call's own error first: a keep refused after a failed call is
+        // its echo.
+        let kept = self.keep_rows(0, PassKind::Prompt);
+        let next = r?;
+        kept?;
+        Ok(next)
+    }
+
+    /// [`GpuModel::prompt38_with`]'s paths once its checks have passed, its
+    /// path resolved and its residency pass open: the resolved `path`'s
+    /// units.
+    fn feed38(
+        &mut self,
+        tokens: &[u32],
+        path: Prompt38,
+        mut sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
+        const WHAT_P: &str = "qwen4exp prompt";
         let tapped = sink.is_some();
-        match path.resolve(tokens.len()) {
+        match path {
             Prompt38::Step => {
                 if !tapped {
                     // The plain call: every token's body, one readback at the
@@ -2201,6 +2350,34 @@ impl HostServed for Body38 {
 
     fn host_residency(&self) -> Option<&HostResidency> {
         self.hybrid.residency()
+    }
+
+    /// The host tier's residency boundary
+    /// ([`ResidencyGlue::at_boundary`]), its report logged when a binary
+    /// asked ([`Body38::log_residency`]).
+    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.residency_glue.at_boundary(&mut self.hybrid, stream)
+    }
+
+    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
+    }
+
+    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
+        self.residency_glue.reset(&mut self.hybrid, stream)
+    }
+
+    fn stop_residency(&mut self) {
+        self.residency_glue.stop(&mut self.hybrid);
+    }
+
+    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.residency_glue.start(
+            &mut self.hybrid,
+            gpu.context(),
+            gpu.stream(),
+            Arc::clone(&self.slots),
+        )
     }
 }
 
