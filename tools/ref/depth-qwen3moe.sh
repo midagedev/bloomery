@@ -1271,6 +1271,10 @@ ours_post() {
   RS_WORD='' RS_COL=''
   if [ "$Q_RES" = 0 ]; then
     res_sums generate_qwen3moe "$out" "${LG_HEADER:-}" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$RS_WHY" "$out"; return 0; }
+    if [ -z "$RS_WORD" ] && [ -n "$(res_asked "$i")" ]; then
+      arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i") and printed no residency lever record, which its schema declares" "$out"
+      return 0
+    fi
   elif [ -n "$(res_asked "$i")" ]; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i"), and generate_qwen3moe's checked-in schema (tools/bloomery/schema/generate_qwen3moe.jsonl) declares no residency record, so its row cannot carry them: refresh the schema from the binary that prints them (just records-refresh)" "$out"
     return 0
