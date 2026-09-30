@@ -94,6 +94,17 @@
   the `Draft` trait removes it (`crates/app/src/arch/qwen3moe/mod.rs` `stepped`, S–M). `gate_qwen38_serve.rs`'s
   `join_of` is the one place Rust parses a record line; a kind reader in `record.rs` keeps records to one owner (S).
   `crates/gpu-gates/src/bind.rs:842` could say that an empty prefill never reaches the Seat (XS).
+- **V4.1 server: the prompt stream's early edge is small, and the server prints no call records** (resvideo sitting,
+  2026-09-30, `4e77f89b`; data in the lead's specs `release/resvideo/pack/`). Under `generate_ds41` on prose P 512 the
+  streaming arm's first 16 passes run at 41.5 tok/s against the rule arm's 27.1 (card hit 0.57 against 0.23); under
+  `bloomery-serve-ds41` on the 507-token RateLimiter review its first 50 tokens run at 31.6 against 27.8, although its
+  TTFT (3,061 against 2,636 ms) shows the call streamed. The server prints `residency pass` records but not `call
+  stream` or `call stream end`, so which of the chat template, the code prompt or the call's kept picks explains it
+  cannot be read from its log. First step: print the call records from the server as `generate_ds41` does (S), then
+  rerun one tape pair.
+- **`tools/ref/depth-ds41.sh` `keep_out` keys an arm's kept log by label and round, not P** (XS): two P of one arm
+  label overwrite each other (resvideo: each timed arm kept P 512 of round 2 and P 4096 of round 1 only). Add P
+  to the file name and a stub case with two P of one label.
 - **Qwen3.8 레버 순서: 배치 프리필 → 두 카드 residency → raw Q5_1 → MTP.** 격차가 pp 쪽(llama.cpp의 약 0.3배)이 decode(약 0.9배)보다 크고 프리필은 헤드라인 축이다. Qwen3.6의 ubatch GEMM 경로 재사용 여부가 첫 라운드의 종이 분해 항목이다.
 - **출시 범위**: 네 모델(V4.1·Qwen3.6·GLM·Qwen3.8) 모두 싣는다. Qwen3.8은 진 숫자 그대로, 캡션에 이유(호스트 전용 경로, 배치 프리필 없음). GLM은 "깊이 ≤ 2k" 캡션, hot 행은 하한.
 - **down 활성값 q8_K: 위 기본 추천대로.** h3tile(비트 동일)을 먼저 올려 c를 실측하고, 실측이 예측 안이면 q8_K 라운드를 연다.
