@@ -11,10 +11,12 @@
 //! layer holds one recurrent state, and its history only in those copies.
 //!
 //! [`open_nextn`] opens the same session with the file's next-token layer
-//! beside the target: the body the MTP window drafts on (`MtpBody`).
+//! beside the target: the body the MTP window drafts on (`MtpBody`);
+//! [`open_resident`] opens the plain session under adaptive expert residency.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::hybrid::refuse_expert_tiers;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
@@ -131,6 +133,37 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
         ))
     })?;
     let mut model = Body::open_placed_nextn(file, &plan, &inputs, &nextn, 0, args.cfg.host)?;
+    model.set_mode(args.mode);
+    log.load(&model)?;
+    Loaded::from_model(model, args.cfg, ctx)
+        .ready(log)
+        .map(Some)
+}
+
+/// The GLM session under adaptive expert residency, as [`Loaded::open`]
+/// then [`Loaded::ready`] open the plain one: `file`'s headers read once,
+/// the plan made once on `args`' placement ([`Open::plan`]) and handed to
+/// `log` (`false` stops there: `Ok(None)`), then the load by that plan under
+/// `residency` ([`Body::open_placed_with`]: the host set also holds each
+/// layer's churn pool) in `args`' step mode, handed to `log`, the step
+/// captured and the prompt call's buffers made. Refused as [`Open::plan`]
+/// refuses, and as the residency machine refuses at the load.
+pub fn open_resident<M: Fn(usize) -> Machine>(
+    file: Split,
+    args: OpenArgs<GlmCfg, M>,
+    residency: Residency,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
+    let inputs = <Body as Open>::inputs(&file)?;
+    let machine = (args.machine)(<Body as Open>::layer_count(&inputs));
+    let plan = <Body as Open>::plan(&inputs, &machine, args.ctx, &args.cfg)?;
+    if !log.plan(args.place, &inputs, &machine, &plan)? {
+        return Ok(None);
+    }
+    let ctx = u32::try_from(plan.ctx_max).map_err(|_| {
+        SessionError::Refused(format!("the plan's ctx_max {} passes u32", plan.ctx_max))
+    })?;
+    let mut model = Body::open_placed_with(file, &plan, &inputs, 0, args.cfg.host, residency)?;
     model.set_mode(args.mode);
     log.load(&model)?;
     Loaded::from_model(model, args.cfg, ctx)
