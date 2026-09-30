@@ -66,7 +66,7 @@ fn payload_f32_into(
     words: usize,
     dst: &mut [f32],
 ) -> bool {
-    if from + dst.len() > words {
+    if from.checked_add(dst.len()).is_none_or(|end| end > words) {
         return false;
     }
     // SAFETY: the span is inside the image (checked above), which is
