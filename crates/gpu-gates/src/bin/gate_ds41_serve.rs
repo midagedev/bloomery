@@ -72,7 +72,8 @@
 //! waited for. Logs and the raw stream go to `--dir`, the first
 //! `/completion`'s ids to `completion.ids` in it, and the greedy ids of the
 //! probe — [`DRAFT_PREDICT`] ids after a long document, a prompt whose
-//! continuation both keeps and rejects DSpark proposals — to `probe.ids`.
+//! continuation both keeps and rejects DSpark proposals — to `probe.ids`,
+//! and the first sampled request's ids to `sampled.ids`.
 //!
 //! With `--plain`, under `BLOOMERY_DRAFT=dspark` (refused otherwise), the gate
 //! checks the server's DSpark draft instead, and nothing above:
@@ -87,8 +88,10 @@
 //!   `generate_ds41`'s, and its `timings` carry `draft_n` above 0 and
 //!   `draft_n_accepted` at most that; the probe's ids are the plain run's
 //!   (`probe.ids`), over passes that kept a proposal and passes that did not;
-//! - a request that samples (llama-server's default temperature) or sets
-//!   `ignore_eos` is a 400 naming the field, and the server serves on;
+//! - a request that samples or sets `ignore_eos` is served by plain steps
+//!   and drafts nothing (no `draft_n`): the plain run's sampled request
+//!   (`sampled.ids` in `--plain`) with the plain server's ids, the
+//!   `ignore_eos` one with all its ids; the server serves on;
 //! - prefix reuse under the draft, each request's ids those of the same prompt
 //!   with `cache_prompt: false`: a continuation of what the cache holds keeps
 //!   all but its last id (the draft follows); a long prompt cut back inside
@@ -166,6 +169,8 @@ mod gate {
     const COMPLETION_IDS: &str = "completion.ids";
     /// Where the probe's ids go in `--dir`, for the draft run.
     const PROBE_IDS: &str = "probe.ids";
+    /// Where the first sampled request's ids go in `--dir`, for the draft run.
+    const SAMPLED_IDS: &str = "sampled.ids";
     /// The draft run's greedy requests' length: long enough for several passes.
     const DRAFT_PREDICT: usize = 32;
     /// The server's arguments after its path; `/props` must echo them.
@@ -997,6 +1002,57 @@ mod gate {
         Ok((ids, counted.map(|(c, _)| c), t))
     }
 
+    /// The requests that need the logits row, served under the draft by
+    /// plain steps: the plain run's sampled request ([`sampled`]'s body at
+    /// [`SAMPLED_SEED`], top_k 40) is served with the plain server's ids
+    /// (`plain_sampled`, [`SAMPLED_IDS`] in `--plain`) and drafts nothing,
+    /// and a request that sets `ignore_eos` is served, all its 4 ids, and
+    /// drafts nothing. Mutant of each: the refusal of a sampled or id-banning
+    /// request under a draft restored (a 400).
+    fn drafted_steps(
+        url: &dyn Fn(&str) -> String,
+        prompt: &str,
+        plain_sampled: &[u32],
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let cases = [
+            (
+                "sampled",
+                json!({
+                    "prompt": prompt, "n_predict": N_PREDICT,
+                    "temperature": SAMPLED_TEMPERATURE, "top_k": 40, "seed": SAMPLED_SEED,
+                    "return_tokens": true, "cache_prompt": false,
+                }),
+            ),
+            (
+                "ignore_eos",
+                json!({
+                    "prompt": prompt, "n_predict": 4, "temperature": 0, "ignore_eos": true,
+                    "return_tokens": true, "cache_prompt": false,
+                }),
+            ),
+        ];
+        for (what, body) in cases {
+            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let ids = ids_of(&v["tokens"]);
+            println!(
+                "{what} under the draft: HTTP {st} tokens {ids:?} draft_n={} error={}",
+                v["timings"]["draft_n"], v["error"]
+            );
+            let served = st == 200 && v["timings"].get("draft_n").is_none();
+            let (name, pass) = match what {
+                "sampled" => (
+                    "draft_serves_a_sampled_request_with_the_plain_ids",
+                    served && !ids.is_empty() && ids == plain_sampled,
+                ),
+                _ => ("draft_serves_ignore_eos", served && ids.len() == 4),
+            };
+            check(&mut ok, name, pass);
+        }
+        Ok(ok)
+    }
+
     /// The draft run (module header), on a server started with this
     /// process's `BLOOMERY_DRAFT=dspark`.
     fn drafted(a: &Args, plain: &Path, levers: &PlanLevers) -> Result<(), GateError> {
@@ -1071,29 +1127,11 @@ mod gate {
             n.zip(acc).is_some_and(|(n, acc)| 0 < acc && acc < n),
         );
 
-        for (body, field) in [
-            (json!({"prompt": a.prompt, "n_predict": 4}), "temperature"),
-            (
-                json!({"prompt": a.prompt, "n_predict": 4, "temperature": 0, "ignore_eos": true}),
-                "ignore_eos",
-            ),
-        ] {
-            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            println!("refused {field}: HTTP {st} {}", v["error"]);
-            check(
-                &mut ok,
-                &format!("draft_refuses_{field}"),
-                st == 400
-                    && v["error"]["message"]
-                        .as_str()
-                        .is_some_and(|m| m.starts_with(field) && m.contains("with a draft")),
-            );
-        }
+        ok &= drafted_steps(&url, &a.prompt, &read_ids(SAMPLED_IDS)?)?;
         let (st, body) = curl(&url("/health"), None, false)?;
         check(
             &mut ok,
-            "draft_health_after_the_400s",
+            "draft_health_after_the_stepped_requests",
             st == 200 && body.contains("\"ok\""),
         );
 
@@ -1470,6 +1508,7 @@ mod gate {
         check(&mut ok, "completion_ids_are_generate_ds41", matches);
 
         let s1 = sampled(&url, &a.prompt, SAMPLED_SEED, 40)?;
+        std::fs::write(a.dir.join(SAMPLED_IDS), serde_json::to_string(&s1)?)?;
         let s2 = sampled(&url, &a.prompt, SAMPLED_SEED, 40)?;
         let k1 = sampled(&url, &a.prompt, SAMPLED_SEED, 1)?;
         check(

@@ -2303,41 +2303,88 @@ fn hw_a_draft_stops_at_the_plain_context_end() {
     }
 }
 
-/// What a draft's pass cannot serve — sampling, and a banned end-of-generation
-/// id — is a 400 naming the field, llama-server's default temperature
-/// included; the server serves the next request.
+/// A `/completion` of `body` with `return_tokens`, which must be served: its
+/// ids and its reply.
+fn served_ids(addr: std::net::SocketAddr, body: &Value) -> (Vec<u64>, Value) {
+    let mut b = body.clone();
+    b["return_tokens"] = json!(true);
+    let r = post(addr, "/completion", &b);
+    assert_eq!(r.status, 200, "{b}: {}", r.body);
+    let v = r.json();
+    let ids = v["tokens"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tokens: {v}"))
+        .iter()
+        .map(|t| t.as_u64().expect("an id"))
+        .collect();
+    (ids, v)
+}
+
+/// A drafting engine serves what needs the logits row — sampling, and a banned
+/// end-of-generation id — through plain steps, llama-server's default
+/// temperature included: each request's ids are the plain engine's, and it
+/// drafts nothing (no draft counts in its `timings`, `/metrics`' draft sums
+/// unmoved); a greedy request after them still drafts. The sampled requests
+/// branch: some seed's ids are not the greedy ones. Mutant: the refusal of a
+/// sampled or id-banning request under a draft restored (a 400).
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_a_draft_refuses_what_needs_the_logits() {
-    let addr = common::start_with(Box::new(serve::DraftMock::new(4096)));
-    let cases = [
-        (json!({"prompt": "abc", "n_predict": 4}), "temperature 0.8"),
-        (
-            json!({"prompt": "abc", "n_predict": 4, "temperature": 0.5}),
-            "temperature 0.5",
-        ),
-        (
-            json!({"prompt": "abc", "n_predict": 4, "temperature": 0, "ignore_eos": true}),
-            "ignore_eos",
-        ),
-    ];
-    for (body, field) in cases {
-        let r = post(addr, "/completion", &body);
-        assert_error(&r, 400, "invalid_request_error", field);
-        assert!(r.body.contains("with a draft is not built"), "{}", r.body);
-        let r = post(
-            addr,
-            "/v1/chat/completions",
-            &json!({
-                "messages": [{"role": "user", "content": "hi"}],
-                "temperature": body.get("temperature").cloned().unwrap_or(Value::Null),
-                "ignore_eos": body.get("ignore_eos").cloned().unwrap_or(json!(false)),
-            }),
+fn hw_a_draft_serves_what_needs_the_logits() {
+    let plain = start(4096);
+    let drafted = common::start_with(Box::new(serve::DraftMock::new(4096)));
+    // `a` has four followers here, so a sampler at T = 1.5 branches; min_p
+    // 0.01 keeps only those followers (the rest sit 12 logits down).
+    let prompt = "abacadaeabacada";
+    let sampled = |seed: u64| {
+        json!({"prompt": prompt, "n_predict": 24, "temperature": 1.5, "top_k": 0,
+               "top_p": 1.0, "min_p": 0.01, "seed": seed})
+    };
+    let no_draft = |v: &Value| {
+        assert!(
+            v["timings"].get("draft_n").is_none(),
+            "a stepped request drafts nothing: {v}"
         );
-        assert_error(&r, 400, "invalid_request_error", field);
+    };
+    let (greedy, _) = served_ids(
+        plain,
+        &json!({"prompt": prompt, "n_predict": 24, "temperature": 0}),
+    );
+    let mut branched = false;
+    for seed in 1..=4 {
+        let (want, _) = served_ids(plain, &sampled(seed));
+        let (got, v) = served_ids(drafted, &sampled(seed));
+        assert_eq!(got, want, "seed {seed}: {v}");
+        no_draft(&v);
+        branched |= got != greedy;
     }
-    let (ids, _) = drafted_ids(addr, &json!("abcabc"), 4, true);
-    assert_eq!(ids.len(), 4);
+    assert!(branched, "no seed sampled off the greedy ids {greedy:?}");
+    let eos = json!({"prompt": "xyz", "ignore_eos": true, "n_predict": 4, "temperature": 0});
+    let (want, _) = served_ids(plain, &eos);
+    let (got, v) = served_ids(drafted, &eos);
+    assert_eq!(got.len(), 4, "{v}");
+    assert_eq!(got, want, "{v}");
+    no_draft(&v);
+    let chat = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8,
+                      "seed": 7});
+    let content = |addr| {
+        let r = post(addr, "/v1/chat/completions", &chat);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = r.json();
+        no_draft(&v);
+        v["choices"][0]["message"]["content"].clone()
+    };
+    assert_eq!(content(drafted), content(plain));
+    let m = get(drafted, "/metrics").body;
+    assert_eq!(metric(&m, "spec_decode_num_draft_tokens_total"), 0.0);
+    assert_eq!(metric(&m, "spec_decode_num_drafts_total"), 0.0);
+    let greedy_body = json!({"prompt": "abcabcabcab", "n_predict": 12, "temperature": 0});
+    let (want, _) = served_ids(plain, &greedy_body);
+    let (got, v) = served_ids(drafted, &greedy_body);
+    assert_eq!(got, want, "{v}");
+    assert!(
+        v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+        "a greedy request drafts: {v}"
+    );
 }
 
 /// `POST /residency/reset`: an engine with no residency is a 501; one with a

@@ -456,6 +456,16 @@ pub trait Seat: 'static {
     fn step(&mut self, last: u32) -> Result<u32, GateError>;
     /// The head's logits after the last step into `row` (`n_vocab` f32).
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError>;
+    /// One step on `last` at `pos` ([`Seat::step`]) and, into `row`, the
+    /// target's logits of that step ([`Seat::logits_into`]). A seat whose step
+    /// runs a draft after the target's step overrides it to read the row
+    /// between the two, so the row is the target's whatever the draft writes.
+    fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
+        let arg = self.step(last)?;
+        self.logits_into(row)
+            .map_err(|e| format!("logits of the step: {e}"))?;
+        Ok(arg)
+    }
     /// One pass from `last` (`serve::Engine::advance`): the kept tokens into
     /// `out`, and what the draft proposed and kept. Without a draft, one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
@@ -798,8 +808,9 @@ fn serve_cmd<S: Seat>(
     (result, None)
 }
 
-/// One step and, into `row`, its logits. The row is checked here: one of the
-/// wrong length or holding a NaN is the step's error, not the sampler's to
+/// One step and, into `row`, the target's logits of it ([`Seat::step_row`]).
+/// The row is checked here: one of the wrong length is refused before the
+/// step runs, and one holding a NaN is the step's error, not the sampler's to
 /// absorb.
 fn next_row<S: Seat>(
     g: &mut S,
@@ -814,11 +825,10 @@ fn next_row<S: Seat>(
             g.ctx_max()
         ));
     }
-    let arg = g
-        .step(last)
-        .map_err(|e| format!("step at position {at}: {e}"))?;
     let Some(row) = row else {
-        return Ok(arg);
+        return g
+            .step(last)
+            .map_err(|e| format!("step at position {at}: {e}"));
     };
     if row.len() != n_vocab {
         return Err(format!(
@@ -826,8 +836,9 @@ fn next_row<S: Seat>(
             row.len()
         ));
     }
-    g.logits_into(row)
-        .map_err(|e| format!("logits after position {at}: {e}"))?;
+    let arg = g
+        .step_row(last, row)
+        .map_err(|e| format!("step at position {at}: {e}"))?;
     if let Some(i) = row.iter().position(|v| v.is_nan()) {
         return Err(format!("logit {i} is NaN after position {at}"));
     }

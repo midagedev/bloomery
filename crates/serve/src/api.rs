@@ -187,7 +187,6 @@ impl Server {
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
-            draft_rows: engine.advance_rows(),
             bos_text: tok.decode(&[tok.bos()]),
             eos_text: tok.decode(&[tok.eos()]),
         };
@@ -289,8 +288,6 @@ impl Server {
 struct ModelInfo {
     n_vocab: usize,
     ctx_max: usize,
-    /// [`Engine::advance_rows`]: past 1 the engine drafts.
-    draft_rows: usize,
     bos_text: String,
     eos_text: String,
 }
@@ -763,30 +760,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
     };
-    if state.info.draft_rows > 1 {
-        drafted(&p)?;
-    }
     Ok(p)
-}
-
-/// A request a drafting engine cannot serve as asked, refused by the field
-/// that asks it: a draft's pass keeps the target's argmax and reads no logits
-/// row, so neither sampling nor a banned id has a pass to run on.
-fn drafted(p: &GenParams) -> Result<(), ApiError> {
-    let t = p.sampling.temperature;
-    if t > 0.0 {
-        return Err(invalid(format!(
-            "temperature {t}: sampling with a draft is not built (the draft's pass keeps the \
-             target's argmax); send temperature 0"
-        )));
-    }
-    if p.ignore_eos {
-        return Err(invalid(
-            "ignore_eos: banning the end-of-generation ids with a draft is not built (the \
-             draft's pass keeps the target's argmax)",
-        ));
-    }
-    Ok(())
 }
 
 /// llama-server's `generation_settings`, with the values this server applies.

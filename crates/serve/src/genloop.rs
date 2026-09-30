@@ -13,7 +13,9 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept.
+//! and kept. A request that samples or bans an id reads the logits row every
+//! token, which a pass does not give, so on the same engine it takes one
+//! [`Engine::next`] a token and carries no draft counts.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
