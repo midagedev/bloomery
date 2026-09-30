@@ -1411,8 +1411,8 @@ pub static MTP_SUMMARY: Kind = Kind {
     name: "mtp_summary",
     head: "mtp summary",
     doc: "BLOOMERY_DRAFT=mtp: the windows' proposals and the rows each kept (a count a kept \
-          length, 1 to 4), the positions and passes over the run, and the kept passes' \
-          positions per second.",
+          length, 1 to the window's rows: 4 for Qwen3.8, 2 for GLM-5.3), the positions and \
+          passes over the run, and the kept passes' positions per second.",
     parts: &[
         key("proposals", U64, ""),
         key("kept", List, "windows"),
@@ -1767,6 +1767,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &TIME_PASS,
     &TOKENS,
     &LOGITS,
+    &MTP_SUMMARY,
     &SMOKE,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
