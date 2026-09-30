@@ -110,9 +110,11 @@ mod gate {
     const BUDGET: u64 = 16 << 30;
     /// Prompt positions, fed one decode step each.
     const PROMPT: usize = 32;
-    /// Prompt positions of the DSpark leg's prompt call, one batch: sixteen
-    /// chunks, one sub-block of the batch-wide projections.
-    const CALL_PROMPT: usize = 128;
+    /// Prompt positions of the DSpark leg's prompt call, one whole batch:
+    /// with each layer's tier on the ids after its stage prefix, the call's
+    /// routing must reach every tier layer, and 128 positions left a layer's
+    /// ten tier experts with no slot on the prose prompt.
+    const CALL_PROMPT: usize = 512;
     /// Greedy steps after the prompt.
     const STEPS: usize = 48;
     /// DSpark passes after the prompt.
