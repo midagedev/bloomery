@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, QWEN38_EXPERTS,
-    R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOSTSTREAM, MTP_DRAFT, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX,
+    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -91,6 +91,8 @@ pub(crate) enum Kind {
     Bytes,
     /// A non-empty path.
     Path,
+    /// The path of a regular file that exists when the value is read.
+    File,
     /// What the name's owner takes: a name no reading here parses.
     Text,
 }
@@ -154,7 +156,9 @@ impl Kind {
                 BytesError::Overflow(_) => refused(Some(e.reason())),
             }),
             Kind::Path if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
-            Kind::Path | Kind::Text => Err(refused(None)),
+            Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
+            Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
+            Kind::Path | Kind::File | Kind::Text => Err(refused(None)),
         }
     }
 
@@ -182,6 +186,7 @@ impl Kind {
                 "bytes, or a whole number of MiB or GiB with an M or G suffix".to_string()
             }
             Kind::Path => "a non-empty path".to_string(),
+            Kind::File => "the path of an existing regular file".to_string(),
             Kind::Text => "what its owner takes".to_string(),
         }
     }
@@ -198,7 +203,7 @@ pub(crate) enum Value {
     Count(u64),
     /// A [`Kind::Bytes`] count.
     Bytes(u64),
-    /// A [`Kind::Path`].
+    /// A [`Kind::Path`] or [`Kind::File`].
     Path(PathBuf),
 }
 
@@ -690,6 +695,18 @@ impl Levers {
             None => None,
             Some(Value::Path(p)) => Some(p),
             v => panic!("{MTP_HEAD_ROWS} holds {v:?}, not a path"),
+        }
+    }
+
+    /// `BLOOMERY_MTP_DRAFT`: the MTP draft file, which existed when the
+    /// reading ran; `None` unset (the shared draft beside the target, else
+    /// the family's path — `refset::arch::qwen4exp::mtp::draft_file`).
+    #[must_use]
+    pub fn mtp_draft(&self) -> Option<&Path> {
+        match &self.entry(MTP_DRAFT).value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{MTP_DRAFT} holds {v:?}, not a path"),
         }
     }
 

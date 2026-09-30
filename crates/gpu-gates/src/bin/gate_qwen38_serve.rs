@@ -41,7 +41,8 @@
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
 //!   each drafts, with the plain run's ids (the generated ones) or the same
-//!   prompt's fed fresh.
+//!   prompt's fed fresh; `/props`' `engine.draft` names the draft file
+//!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -81,7 +82,7 @@ mod gate {
     };
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
-    use refset::arch::qwen4exp::mtp::DRAFT;
+    use refset::arch::qwen4exp::mtp::draft_file;
     use serde_json::{Value, json};
 
     /// The levers the server acts on — the same list
@@ -98,6 +99,7 @@ mod gate {
         bloomery_levers::R8,
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_HEAD_ROWS,
+        bloomery_levers::MTP_DRAFT,
     ];
 
     const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
@@ -303,6 +305,7 @@ mod gate {
             Some(p) => Some(read_head_rows(p, &split, inputs.spec.vocab)?),
             None => None,
         };
+        let (draft_path, from) = draft_file(levers.mtp_draft(), &path);
         let terms = |dense: u64, experts_at: u64, host: u64, tables: u64, kv: u64, draft: u64| {
             (dense + experts_at + draft, host + tables, kv, draft)
         };
@@ -322,8 +325,13 @@ mod gate {
             }
             true => {
                 let rows = rows.unwrap_or(HeadRows::Full);
-                let draft =
-                    Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+                let draft = Split::open(&draft_path).map_err(|e| {
+                    format!(
+                        "open the MTP draft {} ({}): {e}",
+                        draft_path.display(),
+                        from.describe()
+                    )
+                })?;
                 let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
                 let with = inputs.plan_mtp_with(
                     &machine,
@@ -431,9 +439,10 @@ mod gate {
                     "props_engine_names_the_draft",
                     d["kind"] == json!("mtp")
                         && d["n_max"] == json!(3)
-                        && d["model"]
-                            .as_str()
-                            .is_some_and(|m| m.starts_with("mtp-Qwen3.8"))
+                        && draft_path
+                            .file_name()
+                            .is_some_and(|n| d["model"] == json!(n.to_string_lossy()))
+                        && d["path"] == json!(draft_path.display().to_string())
                         && devices
                             .first()
                             .is_some_and(|d| d["classes"]["draft"].as_u64() == Some(draft_bytes)),
@@ -676,6 +685,11 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
+        if levers.draft() != Some("mtp") && levers.mtp_draft().is_some() {
+            return Err(
+                "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp".into(),
+            );
+        }
         let a = parse_args()?;
         let reference = gen_tokens(&a.gen_log)?;
         std::fs::create_dir_all(&a.dir)?;

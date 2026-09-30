@@ -26,6 +26,7 @@ pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
 pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
+pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
@@ -217,9 +218,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
               two-row pass; `generate_qwen3moe` and `bloomery-serve-qwen38` on a qwen4exp \
-              file: `mtp` serves the file's MTP draft (the shared draft file beside the \
-              target, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`) through a four-row \
-              window; the greedy ids are the plain run's. A server refuses a request that \
+              file: `mtp` serves the file's MTP draft (`BLOOMERY_MTP_DRAFT`, else the shared \
+              draft file beside the target, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`) \
+              through a four-row window; the greedy ids are the plain run's. A server refuses a request that \
               samples or bans an id (a 400 naming the field). Every other binary and family \
               refuses each word by name.",
         site: Site::Parsed { left: &[] },
@@ -235,6 +236,21 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               digest; a list of another tokenizer, unsorted, with an id repeated or past the \
               vocabulary, or of no row is refused by name. It moves the drafts' acceptance, \
               never the emitted tokens.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: MTP_DRAFT,
+        class: Class::C,
+        kind: Kind::File,
+        default: Unset::Means(
+            "the shared draft file beside the target, by the name the qwen4exp MTP family's \
+             path gives it; with no such file there, that path",
+        ),
+        doc: "Qwen3.8's MTP draft under `BLOOMERY_DRAFT=mtp`: the draft file \
+              `generate_qwen3moe` and `bloomery-serve-qwen38` open (and `gate_qwen38_serve`, \
+              which starts that server). A path with no regular file is refused at `main`, and \
+              the lever set without `BLOOMERY_DRAFT=mtp` by each of them. The MTP draft gate \
+              opens the file its reference set states and does not act on it.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

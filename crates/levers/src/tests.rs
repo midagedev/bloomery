@@ -11,6 +11,9 @@ const ALLOW_LIST: &str = include_str!("../../../tools/levers-direct.txt");
 /// names from it.
 const REGISTRY_SOURCE: &str = include_str!("registry.rs");
 
+/// A regular file on every host the tests run on: this crate's manifest.
+const A_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
 /// The runners' one parser of `BLOOMERY_GATE_BOUND`.
 const GATE_BOUND_PARSER: &str = include_str!("../../../tools/gate-bound.sh");
 
@@ -60,6 +63,7 @@ fn sample(kind: Kind) -> String {
         Kind::Multiple { of } => of.to_string(),
         Kind::Bytes => "38G".into(),
         Kind::Path => "/data/set".into(),
+        Kind::File => A_FILE.into(),
         Kind::Text => "text".into(),
     }
 }
@@ -112,6 +116,10 @@ fn garbage(kind: Kind) -> Vec<String> {
         Kind::Bytes => {
             g.extend(["38g", "38 G", "-1", "38GB", "1.5G", "G", "17179869184G"].map(String::from))
         }
+        Kind::File => g.extend([
+            "/no/such/file".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+        ]),
         Kind::Path | Kind::Text => {}
     }
     g
@@ -224,6 +232,7 @@ fn accessors_read_their_rows() {
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
     assert_eq!(unset.mtp_head_rows(), None);
+    assert_eq!(unset.mtp_draft(), None);
     assert_eq!(unset.route_trace(), None);
     assert!(!unset.check_finite());
     assert_eq!(unset.qwen38_experts(), "card");
@@ -253,6 +262,7 @@ fn accessors_read_their_rows() {
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (MTP_HEAD_ROWS, "/data/rows.txt"),
+            (MTP_DRAFT, A_FILE),
             (ROUTE_TRACE, "/data/trace"),
             (CHECK_FINITE, "1"),
             (HOST_POPULATE, "0"),
@@ -278,6 +288,7 @@ fn accessors_read_their_rows() {
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
     assert_eq!(set.mtp_head_rows(), Some(Path::new("/data/rows.txt")));
+    assert_eq!(set.mtp_draft(), Some(Path::new(A_FILE)));
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), Some("mid-p40-s1"));
@@ -309,6 +320,7 @@ fn accessors_read_their_rows() {
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,
+            MTP_DRAFT,
             ROUTE_TRACE,
             CHECK_FINITE,
             HOST_POPULATE,
@@ -332,6 +344,25 @@ fn draft_row_takes_mtp() {
         panic!("a word the row does not take is refused");
     };
     assert!(other.to_string().contains("BLOOMERY_DRAFT"), "{other}");
+}
+
+/// `BLOOMERY_MTP_DRAFT` set to a path with nothing there, or to a
+/// directory, is refused saying why, beside what the kind takes
+/// (`parsed_levers_refuse_what_their_kind_does_not_take` holds the rest).
+#[test]
+fn mtp_draft_refusal_says_no_file_is_there() {
+    for value in ["/no/such/draft.gguf", env!("CARGO_MANIFEST_DIR")] {
+        let Err(e) = read(&env(&[(MTP_DRAFT, value)]), Scope::Every) else {
+            panic!("{value:?} is refused");
+        };
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "BLOOMERY_MTP_DRAFT={value:?} is refused: no regular file is at that path; it \
+                 takes the path of an existing regular file"
+            )
+        );
+    }
 }
 
 /// `BLOOMERY_RESIDENCY` unset follows the placement: the serving word under a

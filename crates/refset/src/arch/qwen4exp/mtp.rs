@@ -6,6 +6,8 @@
 //! borrows the target's `token_embd` and `output`: a set states both files,
 //! `# model` and `# draft_model`.
 
+use std::path::{Path, PathBuf};
+
 use super::{ARCH, MODEL};
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -13,6 +15,54 @@ use crate::family::{Build, Family, Identity};
 /// The shared MTP draft file every set of the family is dumped with and
 /// the tree runs: its one layer, no embedding and no output of its own.
 pub const DRAFT: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+
+/// Where the MTP draft file a run opens came from ([`draft_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftFrom {
+    /// `BLOOMERY_MTP_DRAFT`.
+    Lever,
+    /// The file of [`DRAFT`]'s name in the target's directory.
+    Beside,
+    /// [`DRAFT`] itself: the lever unset and no file of its name beside the
+    /// target.
+    Family,
+}
+
+impl DraftFrom {
+    /// Where the file came from, as an error about opening it says.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            DraftFrom::Lever => "BLOOMERY_MTP_DRAFT",
+            DraftFrom::Beside => "the shared draft's name beside the target",
+            DraftFrom::Family => {
+                "the family's path: BLOOMERY_MTP_DRAFT is unset and no file of the shared draft's \
+                 name is beside the target"
+            }
+        }
+    }
+}
+
+/// The MTP draft file a run of `target` opens: `set` when given (the lever,
+/// which its reading has proven a file); else the file of [`DRAFT`]'s name in
+/// `target`'s directory, when one is there; else [`DRAFT`]. The family's
+/// identity stays [`DRAFT`] whichever the run opens: a set is checked
+/// against that path ([`MTP`]'s `draft_runs`), never against this one.
+#[must_use]
+pub fn draft_file(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
+    if let Some(p) = set {
+        return (p.to_path_buf(), DraftFrom::Lever);
+    }
+    let beside = Path::new(DRAFT)
+        .file_name()
+        .zip(target.parent())
+        .map(|(name, dir)| dir.join(name))
+        .filter(|p| p.is_file());
+    match beside {
+        Some(p) => (p, DraftFrom::Beside),
+        None => (PathBuf::from(DRAFT), DraftFrom::Family),
+    }
+}
 
 /// The ik tree the MTP draft set is dumped from: ik's glm5next MTP graph
 /// merged onto the upstream commit whose qwen4exp graph builds the MTP
@@ -50,3 +100,36 @@ pub static MTP: Family = Family {
     draft_runs: Some(draft),
     consumers: &["gate-gpu-qwen4exp-mtp"],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{DRAFT, DraftFrom, draft_file};
+    use std::path::{Path, PathBuf};
+
+    /// The lever wins; unset, the file of the shared draft's name beside the
+    /// target is the run's, and with none there the family's path is.
+    #[test]
+    fn draft_file_is_the_lever_then_beside_the_target_then_the_family_path() {
+        let dir = std::env::temp_dir().join(format!("bloomery-mtp-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let target = dir.join("target-00001-of-00004.gguf");
+        let name = Path::new(DRAFT).file_name().expect("DRAFT names a file");
+        let beside = dir.join(name);
+
+        assert_eq!(
+            draft_file(None, &target),
+            (PathBuf::from(DRAFT), DraftFrom::Family)
+        );
+        std::fs::write(&beside, b"").unwrap_or_else(|e| panic!("{}: {e}", beside.display()));
+        assert_eq!(
+            draft_file(None, &target),
+            (beside.clone(), DraftFrom::Beside)
+        );
+        let other = dir.join("elsewhere.gguf");
+        assert_eq!(
+            draft_file(Some(&other), &target),
+            (other.clone(), DraftFrom::Lever)
+        );
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    }
+}
