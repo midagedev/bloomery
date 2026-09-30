@@ -131,6 +131,31 @@ pub(super) const NEXTN: &[Stem] = &[
 /// Every stem a trunk layer may carry, by group.
 const TRUNK: [&[Stem]; 6] = [KDA, LATENT, DENSE, MOE, SHARED, HC];
 
+/// The groups a next-token layer carries besides its own stems: a latent
+/// mixer, a routed block and a shared expert, no hyper-connection.
+const NEXTN_BLOCK: [&[Stem]; 3] = [LATENT, MOE, SHARED];
+
+/// The role a next-token layer's stem takes in the NextN load's own plan
+/// (`place::NextnInputs`), where the layer is loaded: its mixer, routed block
+/// and shared expert in their trunk roles, the input projection and its two
+/// norms on the card as the mixer's input, the head's norm as the head's.
+/// `None` for a stem no next-token layer carries. The file's own plan keeps
+/// every such tensor [`Role::Unused`] ([`classify`]).
+#[must_use]
+pub fn nextn_role(stem: &str) -> Option<Role> {
+    if stem == "nextn.shared_head_norm.weight" {
+        return Some(Role::Head);
+    }
+    if nextn_stem(stem) {
+        return Some(Role::Attention);
+    }
+    NEXTN_BLOCK
+        .iter()
+        .flat_map(|g| g.iter())
+        .find(|s| s.name == stem)
+        .map(|s| s.role)
+}
+
 /// The names of `stems` the file must carry.
 pub(super) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
     stems.iter().filter(|s| s.required).map(|s| s.name)
@@ -203,7 +228,8 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
 
 #[cfg(test)]
 mod tests {
-    use super::{KDA, LATENT, NEXTN, Stem, TRUNK, layer_role};
+    use super::{KDA, LATENT, NEXTN, Stem, TRUNK, layer_role, nextn_role};
+    use crate::placement::Role;
 
     /// A stem in two groups (the norm and output every mixer carries, the
     /// pre-FFN norm) names one role, and no group lists a stem twice.
@@ -222,5 +248,28 @@ mod tests {
         // The header check refuses the other mixer's stems by name: each is
         // one the file must carry where its kind is.
         assert!(KDA.iter().chain(LATENT).all(|s| s.required));
+    }
+
+    /// A next-token layer loads its mixer, routed block and shared expert in
+    /// their trunk roles, its own stems on the card and the head's norm as
+    /// the head's; a hyper-connection or KDA stem is none of its.
+    #[test]
+    fn nextn_roles() {
+        assert_eq!(nextn_role("nextn.eh_proj.weight"), Some(Role::Attention));
+        assert_eq!(nextn_role("nextn.enorm.weight"), Some(Role::Attention));
+        assert_eq!(nextn_role("nextn.hnorm.weight"), Some(Role::Attention));
+        assert_eq!(
+            nextn_role("nextn.shared_head_norm.weight"),
+            Some(Role::Head)
+        );
+        assert_eq!(nextn_role("attn_kv_a_mqa.weight"), Some(Role::Attention));
+        assert_eq!(nextn_role("ffn_gate_inp.weight"), Some(Role::Router));
+        assert_eq!(nextn_role("ffn_up_exps.weight"), Some(Role::RoutedExperts));
+        assert_eq!(
+            nextn_role("ffn_down_shexp.weight"),
+            Some(Role::SharedExpert)
+        );
+        assert_eq!(nextn_role("hc_attn_fn.weight"), None);
+        assert_eq!(nextn_role("ssm_a"), None);
     }
 }

@@ -14,6 +14,8 @@
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
 //! - `body::pair`: the verify of two rows behind `Rows`, bit for bit two
 //!   steps, and its commit over the KDA lanes;
+//! - [`body::nextn`]: the next-token (MTP) layer beside the chain on a NextN
+//!   load, and its walks;
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
@@ -33,9 +35,13 @@ mod program;
 mod swap;
 mod tensors;
 
+pub use body::nextn::{
+    GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS, nextn_chain,
+    nextn_hidden, nextn_logits, nextn_store, nextn_walk,
+};
 pub use body::prefill::{
-    CHUNK, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill, prefill_mode,
-    set_prefill, store_digests,
+    CHUNK, GlmPromptSink, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill,
+    prefill_mode, prompt_with, set_prefill, store_digests,
 };
 pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, prompt, set_taps};
 pub use host::GlmHost;

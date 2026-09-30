@@ -206,6 +206,9 @@ impl Body {
             waiting: None,
         };
         self.held = pos;
+        if let Some(n) = self.nextn.as_deref_mut() {
+            n.cut(pos);
+        }
         Ok(())
     }
 
@@ -230,6 +233,9 @@ impl Body {
         self.ckpt.cut(pos, self.held)?;
         self.s.lanes.waiting = None;
         self.held = pos;
+        if let Some(n) = self.nextn.as_deref_mut() {
+            n.cut(pos);
+        }
         Ok(())
     }
 
@@ -266,6 +272,13 @@ impl Rows for Body {
         }
         let (parts, hybrid) = self.parts();
         program::walk_pair(gpu, w, parts, hybrid, [a, b])?;
+        // A NextN load keeps row 0's streams past the step that writes its
+        // buffers next (`nextn::GlmArena::Pair`): one copy more in the pass.
+        if let Some(n) = self.nextn.as_deref_mut() {
+            let fin = program::final_streams(self.cfg.len());
+            n.pair0_mut()
+                .copy_from_device_async(&self.s.rows[0].streams[fin], gpu.stream())?;
+        }
         self.planted(Plant::AfterLaunch)
     }
 }
