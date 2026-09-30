@@ -37,7 +37,7 @@ mod tensors;
 
 pub use body::nextn::{
     GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS, nextn_chain,
-    nextn_hidden, nextn_logits, nextn_store, nextn_walk,
+    nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
 };
 pub use body::prefill::{
     CHUNK, GlmPromptSink, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill,
@@ -45,5 +45,6 @@ pub use body::prefill::{
 };
 pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, prompt, set_taps};
 pub use host::GlmHost;
+pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};
 pub use swap::{DEADLINE, LIVE_DELAY};

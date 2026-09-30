@@ -45,10 +45,10 @@ use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::arch::glm5next::names;
-use model::arch::glm5next::place::card_routed;
+use model::arch::glm5next::place::{KdaLanes, card_routed};
 use models::{Ffn, LayerSpec};
 
-use crate::body::{PAIR_ROWS, Parts, f32t, f32v, gemv, weight};
+use crate::body::{Parts, f32t, f32v, gemv, weight};
 use crate::host::GlmHost;
 use crate::tensors::{FfnNames, LayerNames, other_kind};
 
@@ -86,8 +86,8 @@ pub(crate) struct CardExperts {
     layers: Vec<Option<CardLayer>>,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
-    /// Each row's buffers, row 0 the step's.
-    rows: [CardRow; PAIR_ROWS],
+    /// Each row's buffers, row 0 the step's: a row a KDA lane of the load.
+    rows: Vec<CardRow>,
 }
 
 /// One row's buffers of the card experts' shadow.
@@ -129,8 +129,8 @@ impl CardRow {
 
 impl CardExperts {
     /// The card experts of `layers` (the description) as `map` places them
-    /// and `w` holds them, `n_embd` wide with routed experts `ff` wide.
-    /// Load-time only.
+    /// and `w` holds them, `n_embd` wide with routed experts `ff` wide, a
+    /// row's buffers for each of the load's `lanes`. Load-time only.
     pub(crate) fn new(
         gpu: &Gpu,
         w: &Weights,
@@ -138,6 +138,7 @@ impl CardExperts {
         map: &SlotMap,
         n_embd: usize,
         ff: usize,
+        lanes: KdaLanes,
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
         for (l, spec) in layers.iter().enumerate() {
@@ -188,10 +189,9 @@ impl CardExperts {
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
             ff,
-            rows: [
-                CardRow::new(stream, n_embd, ff)?,
-                CardRow::new(stream, n_embd, ff)?,
-            ],
+            rows: (0..lanes.count())
+                .map(|_| CardRow::new(stream, n_embd, ff))
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -205,8 +205,8 @@ impl CardExperts {
     }
 
     /// Row 0's card slots' weighted sum of the last card layer enqueued.
-    pub(crate) fn acc(&self) -> &DeviceBuffer<f32> {
-        &self.rows[0].acc
+    pub(crate) fn acc(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
+        Ok(&card_row(&self.rows, 0)?.acc)
     }
 
     /// The routed experts' width: a gate·up slot's rows.
@@ -222,6 +222,25 @@ impl CardExperts {
 
 /// What the card experts' errors name.
 const CARD: &str = "glm5next CardExperts";
+
+/// Row `row`'s card buffers; a row past the load's is refused by name.
+fn card_row(rows: &[CardRow], row: usize) -> Result<&CardRow, GpuError> {
+    rows.get(row).ok_or_else(|| past_rows(rows.len(), row))
+}
+
+/// Row `row`'s card buffers, to write; a row past the load's is refused by
+/// name.
+fn card_row_mut(rows: &mut [CardRow], row: usize) -> Result<&mut CardRow, GpuError> {
+    let n = rows.len();
+    rows.get_mut(row).ok_or_else(|| past_rows(n, row))
+}
+
+fn past_rows(n: usize, row: usize) -> GpuError {
+    GpuError::Shape {
+        what: CARD,
+        detail: format!("row {row} of the card experts' {n} rows"),
+    }
+}
 
 /// Layer `l`'s routed gate, up and down names.
 fn stack_names(l: usize) -> [String; 3] {
@@ -410,7 +429,7 @@ pub(crate) fn shadow(
     )?;
     gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
     if card.is_some() {
-        let k = &mut p.card.rows[p.row];
+        let k = card_row_mut(&mut p.card.rows, p.row)?;
         gpu.elem()
             .enqueue_add(gpu.stream(), &k.acc, &s.sh_y, n, &mut k.pre)?;
     }
@@ -438,7 +457,7 @@ fn card_slots(
         rows,
         ..
     } = &mut *p.card;
-    let k = &mut rows[p.row];
+    let k = card_row_mut(rows, p.row)?;
     let st = CardStacks::of(w, l)?;
     gpu.enqueue_quantize_q8_1_layer(boundary.normed(), &mut k.act_x, l)?;
     let a = GateUpAct {
@@ -652,7 +671,7 @@ pub(crate) fn back(
     let n = p.d.embd;
     let s = &mut *p.s;
     let shadowed = if p.card.has(l) {
-        &p.card.rows[p.row].pre
+        &card_row(&p.card.rows, p.row)?.pre
     } else {
         &s.sh_y
     };

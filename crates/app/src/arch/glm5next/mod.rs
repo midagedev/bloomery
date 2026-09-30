@@ -10,9 +10,12 @@
 //! keeps every fed position, the empty model, or a checkpoint: each KDA
 //! layer holds one recurrent state, and its history only in those copies.
 //!
-//! [`open_nextn`] opens the same session with the file's next-token layer
-//! beside the target: the body the MTP window drafts on (`MtpBody`);
-//! [`open_resident`] opens the plain session under adaptive expert residency.
+//! A session opens at one KDA lane: its loads run one row a pass and pay
+//! nothing for a verify. [`open_nextn`] opens the same session with the
+//! file's next-token layer beside the target — the body the MTP window drafts
+//! on (`MtpBody`) — and [`open_pair`] with no layer, for the two-row verify
+//! probe; both hold two lanes. [`open_resident`] opens the plain session under
+//! adaptive expert residency, at one lane.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -21,7 +24,7 @@ use bloomery_gpu::hybrid::refuse_expert_tiers;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
-use model::arch::glm5next::place::{NextnInputs, PlanInputs};
+use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::seqstate::Kept;
 
@@ -54,9 +57,9 @@ impl Open for Body {
         inputs.model.layers
     }
 
-    /// The plan on `machine`, refused unless its layers sit on one card: the
-    /// chain runs on one. A placement with an expert tier card is refused:
-    /// the load hangs no tier under its host tier.
+    /// The plan on `machine` at one KDA lane, refused unless its layers sit
+    /// on one card: the chain runs on one. A placement with an expert tier
+    /// card is refused: the load hangs no tier under its host tier.
     fn plan<'a>(
         inputs: &'a PlanInputs,
         machine: &'a Machine,
@@ -101,10 +104,10 @@ impl Open for Body {
 /// target, as [`Loaded::open`] then [`Loaded::ready`] open the plain one:
 /// `file`'s headers and its NextN layer read once, the plan made once on
 /// `args`' placement ([`PlanInputs::plan_nextn`]: the target's expert rule
-/// within the card less the layer's bytes) and its target plan handed to
-/// `log` (`false` stops there: `Ok(None)`), then the load by that plan
-/// ([`Body::open_placed_nextn`]) in `args`' step mode, handed to `log`, the
-/// step captured and the prompt call's buffers made. Refused as
+/// within the card less the layer's bytes, two KDA lanes) and its target plan
+/// handed to `log` (`false` stops there: `Ok(None)`), then the load by that
+/// plan ([`Body::open_placed_nextn`]) in `args`' step mode, handed to `log`,
+/// the step captured and the prompt call's buffers made. Refused as
 /// [`Open::plan`] refuses, and by name for a file of other than one
 /// next-token layer and a plan the layer breaks.
 pub fn open_nextn<M: Fn(usize) -> Machine>(
@@ -114,30 +117,94 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
     let nextn = NextnInputs::read(&inputs).map_err(|e| GpuError::plan(WHAT, e))?;
-    let machine = (args.machine)(<Body as Open>::layer_count(&inputs));
-    refuse_expert_tiers(WHAT, &machine)?;
-    let ctx = u64::try_from(args.ctx).map_err(|_| GpuError::Shape {
-        what: WHAT,
-        detail: format!("a context of {} positions passes u64", args.ctx),
-    })?;
+    let (machine, ctx) = one_card(&args, &inputs)?;
     let plan = inputs
         .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
         .map_err(|e| GpuError::plan(WHAT, e))?;
     if !log.plan(args.place, &inputs, &machine, &plan.plan)? {
         return Ok(None);
     }
-    let ctx = u32::try_from(plan.plan.ctx_max).map_err(|_| {
-        SessionError::Refused(format!(
-            "the plan's ctx_max {} passes u32",
-            plan.plan.ctx_max
-        ))
+    let ctx = ctx_of(&plan.plan)?;
+    let model = Body::open_placed_nextn(file, &plan, &inputs, &nextn, 0, args.cfg.host)?;
+    ready(model, args.mode, args.cfg, ctx, log)
+}
+
+/// The GLM session of [`Loaded::open`] at two KDA lanes, with no next-token
+/// layer: the load the two-row verify (`Rows`) runs on, planned by
+/// [`PlanInputs::plan_lanes`] at [`KdaLanes::Two`] and loaded by
+/// [`Body::open_placed_lanes`], `log` as [`open_nextn`] takes it. Refused as
+/// [`Open::plan`] refuses. A plain session is [`Loaded::open`]'s, at one
+/// lane.
+pub fn open_pair<M: Fn(usize) -> Machine>(
+    file: Split,
+    args: OpenArgs<GlmCfg, M>,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
+    let inputs = <Body as Open>::inputs(&file)?;
+    let (machine, ctx) = one_card(&args, &inputs)?;
+    let plan = inputs
+        .plan_lanes(&machine, ctx, &args.cfg.place, KdaLanes::Two)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    if !log.plan(args.place, &inputs, &machine, &plan)? {
+        return Ok(None);
+    }
+    let ctx = ctx_of(&plan)?;
+    let model = Body::open_placed_lanes(
+        file,
+        &plan,
+        &inputs,
+        0,
+        args.cfg.host,
+        Residency::Off,
+        KdaLanes::Two,
+    )?;
+    ready(model, args.mode, args.cfg, ctx, log)
+}
+
+/// `args`' machine for `inputs` and its context, refused by name unless the
+/// machine is one card without an expert tier ([`Open::plan`]'s rule).
+fn one_card<M: Fn(usize) -> Machine>(
+    args: &OpenArgs<GlmCfg, M>,
+    inputs: &PlanInputs,
+) -> Result<(Machine, u64), SessionError> {
+    let machine = (args.machine)(<Body as Open>::layer_count(inputs));
+    if machine.cards.len() != 1 {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the placement puts the layers on {} cards; the chain runs on one",
+                machine.cards.len()
+            ),
+        }
+        .into());
+    }
+    refuse_expert_tiers(WHAT, &machine)?;
+    let ctx = u64::try_from(args.ctx).map_err(|_| GpuError::Shape {
+        what: WHAT,
+        detail: format!("a context of {} positions passes u64", args.ctx),
     })?;
-    let mut model = Body::open_placed_nextn(file, &plan, &inputs, &nextn, 0, args.cfg.host)?;
-    model.set_mode(args.mode);
+    Ok((machine, ctx))
+}
+
+/// The plan's context in positions, refused past u32.
+fn ctx_of(plan: &Plan<'_>) -> Result<u32, SessionError> {
+    u32::try_from(plan.ctx_max).map_err(|_| {
+        SessionError::Refused(format!("the plan's ctx_max {} passes u32", plan.ctx_max))
+    })
+}
+
+/// `model` in step `mode`, handed to `log`, its step captured and the
+/// prompt call's buffers made ([`Loaded::ready`]).
+fn ready(
+    mut model: GpuModel<Body>,
+    mode: bloomery_gpu::model::StepMode,
+    cfg: GlmCfg,
+    ctx: u32,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
+    model.set_mode(mode);
     log.load(&model)?;
-    Loaded::from_model(model, args.cfg, ctx)
-        .ready(log)
-        .map(Some)
+    Loaded::from_model(model, cfg, ctx).ready(log).map(Some)
 }
 
 /// The GLM session under adaptive expert residency, as [`Loaded::open`]

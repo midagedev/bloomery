@@ -19,6 +19,10 @@
 //! rows and the conv ring are indexed by position: a taken-back row 1 is
 //! written again by the next step at `pos + 1` before any launch reads it,
 //! the pool key it completed too.
+//!
+//! Only a load of two KDA lanes verifies (`place::KdaLanes::Two`: the NextN
+//! load, [`Body::open_placed_lanes`] at two); on a load of one lane a verify
+//! is refused by name before anything moves, its plan and its capture alike.
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::Chain;
@@ -28,6 +32,8 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, capturing};
 use cuda_core::CudaStream;
 use runtime::seqstate::{Kept, Why};
+
+use model::arch::glm5next::place::KdaLanes;
 
 use super::{Body, LANES, Plant, StepInput, shape};
 use crate::program;
@@ -105,7 +111,7 @@ impl Body {
     /// embedding's four stream copies, the position, the visible counts and
     /// the live count. Row 0 first carries out a waiting cut
     /// ([`Body::apply_cut`]). Once the copies are sent the stores count the
-    /// position.
+    /// position, and row 0's buffers — the step arena — hold it.
     pub(super) fn refresh_row(
         &mut self,
         stream: &CudaStream,
@@ -116,31 +122,36 @@ impl Body {
             self.apply_cut(stream)?;
         }
         let p = input.pos;
+        let rows = 1 + usize::from(self.s.row1.is_some());
         let r = self
             .s
-            .rows
-            .get_mut(row)
-            .ok_or_else(|| shape(format!("row {row} of a pass of {PAIR_ROWS}")))?;
+            .row_mut(row)
+            .ok_or_else(|| shape(format!("row {row} of a pass on a load of {rows} rows")))?;
         r.streams[0].copy_from_host(stream, &self.embd.streams)?;
         r.pos.copy_from_host(stream, &[p])?;
         r.vis.copy_from_host(stream, &[0, p + 1])?;
         r.cnt.copy_from_host(stream, &[p + 1])?;
         self.held = p + 1;
+        if row == 0 {
+            self.wrote.step = super::nextn::Held::at(p, 1);
+        }
         Ok(())
     }
 
     /// The verify's host half: `tokens[r]` at `pos + r` into row `r`'s
-    /// buffers, in row order, then the verify left waiting for its commit.
-    /// Refused by name before anything moves: another row count, the taps
-    /// armed (a tap holds one row), an id past the vocabulary, a verify
-    /// already waiting, a position other than the stores' or whose rows pass
-    /// them, a failure planted before the launch.
+    /// buffers, in row order, then the verify left waiting for its commit and
+    /// the pair arena holding its rows. Refused by name before anything
+    /// moves: a load of one KDA lane, another row count, the taps armed (a
+    /// tap holds one row), an id past the vocabulary, a verify already
+    /// waiting, a position other than the stores' or whose rows pass them, a
+    /// failure planted before the launch.
     pub(super) fn plan_pair(
         &mut self,
         stream: &CudaStream,
         tokens: &[u32],
         pos: u32,
     ) -> Result<(), GpuError> {
+        self.refuse_one_lane()?;
         if tokens.len() != PAIR_ROWS {
             return Err(shape(format!(
                 "a verify of {} rows; the lanes hold {PAIR_ROWS}",
@@ -181,7 +192,21 @@ impl Body {
             pos0: pos,
             rows: PAIR_ROWS as u32,
         });
+        self.wrote.pair = super::nextn::Held::at(pos, PAIR_ROWS as u32);
         Ok(())
+    }
+
+    /// Refused by name on a load of one KDA lane: a verify's row 1 writes a
+    /// lane the load does not hold.
+    fn refuse_one_lane(&self) -> Result<(), GpuError> {
+        match self.lanes {
+            KdaLanes::Two => Ok(()),
+            KdaLanes::One => Err(shape(format!(
+                "a verify of {PAIR_ROWS} rows on a load of one KDA lane: only a load that \
+                 verifies holds the second (Body::open_placed_lanes at KdaLanes::Two, or the \
+                 NextN load)"
+            ))),
+        }
     }
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit:
@@ -197,7 +222,7 @@ impl Body {
             return self.cut(pos);
         }
         let c = self.s.lanes.committed;
-        let lane = row_lane(c, pos - w.pos0 - 1, LANES as u32);
+        let lane = row_lane(c, pos - w.pos0 - 1, self.lanes.count() as u32);
         if lane != c {
             self.s.lane.copy_from_host(gpu.stream(), &[lane])?;
         }
@@ -206,6 +231,7 @@ impl Body {
             waiting: None,
         };
         self.held = pos;
+        self.wrote.cut(pos);
         if let Some(n) = self.nextn.as_deref_mut() {
             n.cut(pos);
         }
@@ -233,6 +259,7 @@ impl Body {
         self.ckpt.cut(pos, self.held)?;
         self.s.lanes.waiting = None;
         self.held = pos;
+        self.wrote.cut(pos);
         if let Some(n) = self.nextn.as_deref_mut() {
             n.cut(pos);
         }
@@ -258,7 +285,9 @@ impl Rows for Body {
     /// The verify's walk into its two heads, row `r` into `heads[r]`. Outside
     /// a capture it needs its plan ([`Body::plan_pair`]); a capture records
     /// the launches, which read every per-row value from the rows' words.
+    /// Refused by name on a load of one KDA lane, a capture too.
     fn enqueue_rows(&mut self, gpu: &Gpu, w: &Weights, heads: &mut [Head]) -> Result<(), GpuError> {
+        self.refuse_one_lane()?;
         let [a, b] = heads else {
             return Err(shape(format!(
                 "{} heads; the verify runs {PAIR_ROWS}",
@@ -277,7 +306,7 @@ impl Rows for Body {
         if let Some(n) = self.nextn.as_deref_mut() {
             let fin = program::final_streams(self.cfg.len());
             n.pair0_mut()
-                .copy_from_device_async(&self.s.rows[0].streams[fin], gpu.stream())?;
+                .copy_from_device_async(&self.s.row0.streams[fin], gpu.stream())?;
         }
         self.planted(Plant::AfterLaunch)
     }

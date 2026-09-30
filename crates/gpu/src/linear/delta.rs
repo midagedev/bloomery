@@ -1375,9 +1375,11 @@ mod tests {
     /// The launcher's refusals: no token or lane, a row past the lanes, a
     /// later row in place, row mode past the lanes; the step (row 0 in
     /// place, any m) and each row of a two-row verify (row mode, m = 1) are
-    /// taken.
+    /// taken, and on a state of one lane the step alone.
     #[test]
     fn the_lanes_launch_takes_the_step_and_each_verify_row() {
+        assert!(lanes_refusal(1, 1, false, 0).is_none());
+        assert!(lanes_refusal(512, 1, false, 0).is_none());
         assert!(lanes_refusal(1, 2, false, 0).is_none());
         assert!(lanes_refusal(512, 2, false, 0).is_none());
         assert!(lanes_refusal(1, 2, true, 0).is_none());
@@ -1389,6 +1391,8 @@ mod tests {
             (1, 2, true, 2, "row 2 over 2 lanes"),
             (1, 2, false, 1, "only row 0"),
             (2, 2, true, 1, "rows 1..3 over 2 lanes"),
+            (1, 1, true, 1, "row 1 over 1 lanes"),
+            (2, 1, true, 0, "rows 0..2 over 1 lanes"),
         ] {
             let why = lanes_refusal(m, lanes, each, row).expect("refused");
             assert!(why.contains(says), "{m} {lanes} {each} {row}: {why}");

@@ -80,6 +80,9 @@ impl Body {
         ffn_x: Option<&[f32]>,
     ) -> Result<ForcedRow, GpuError> {
         let ctx = self.ctx();
+        // The row writes the step's buffers: the step arena holds no
+        // position until the next step.
+        self.overwrote_step_arena();
         let (mut p, hybrid) = self.parts();
         let stream = gpu.stream();
         let n = p.d.embd;
@@ -144,7 +147,7 @@ impl Body {
                     weights: r.weights.to_host_vec(stream)?,
                     routed: hybrid.boundary().hsum_of(0)?.to_host_vec(stream)?,
                     card: if p.card.has(l) {
-                        p.card.acc().to_host_vec(stream)?
+                        p.card.acc()?.to_host_vec(stream)?
                     } else {
                         vec![0.0; n]
                     },

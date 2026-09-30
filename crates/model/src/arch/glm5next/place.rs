@@ -31,10 +31,31 @@ const F32_BYTES: u64 = 4;
 /// kernels' own constant.
 pub const PASS_ROWS: usize = 8;
 
-/// Lanes of a KDA layer's recurrent state: a verify of up to this many rows
-/// keeps the state after each row in a lane of its own, each lane stamped
-/// with its position. The card body binds it to its own constant.
-pub const KDA_LANES: usize = 2;
+/// Lanes of every KDA layer's recurrent state, fixed at load, each lane
+/// stamped with its position: one on a load that runs one row a pass, two on
+/// one that verifies two rows (the NextN load, the two-row verify probe),
+/// the state after each of a verify's rows in a lane of its own. A load pays
+/// for the second lane only when it verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KdaLanes {
+    One,
+    Two,
+}
+
+impl KdaLanes {
+    /// The most lanes a load holds. The card body binds it to its own
+    /// constant.
+    pub const MAX: usize = 2;
+
+    /// The lanes' count.
+    #[must_use]
+    pub const fn count(self) -> usize {
+        match self {
+            KdaLanes::One => 1,
+            KdaLanes::Two => 2,
+        }
+    }
+}
 
 /// The routed stacks the program's card experts run, in their file bytes
 /// ([`CardFormat::KQuant`]): Q4_K (the gate·up) and Q5_K (a gate·up or the
@@ -57,7 +78,8 @@ pub struct PlanInputs {
     pub model: ModelTensors,
     /// The typed model description the coverage check reads.
     pub spec: ModelSpec,
-    /// Each trunk layer's recurrent and cache bytes.
+    /// Each trunk layer's recurrent and cache bytes, at one KDA lane
+    /// ([`KvLayout::with_lanes`] for more).
     pub kv: KvLayout,
 }
 
@@ -144,15 +166,29 @@ impl PlanInputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`: the expert rule on the layers whose routed
-    /// stacks [`card_routed`] runs, each layer's id prefix;
-    /// refused past [`ORACLE_POSITIONS`], when it cannot be built, or when it
-    /// breaks an invariant.
+    /// the placement's `levers`, each KDA layer's state one lane
+    /// ([`PlanInputs::plan_lanes`] at [`KdaLanes::One`]): the plan of a load
+    /// that runs one row a pass.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_lanes(machine, ctx_max, levers, KdaLanes::One)
+    }
+
+    /// The placement of the file on `machine` at `ctx_max` positions under
+    /// the placement's `levers`, each KDA layer's state `lanes` lanes: the
+    /// expert rule on the layers whose routed stacks [`card_routed`] runs,
+    /// each layer's id prefix; refused past [`ORACLE_POSITIONS`], when it
+    /// cannot be built, or when it breaks an invariant.
+    pub fn plan_lanes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        lanes: KdaLanes,
     ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max > ORACLE_POSITIONS {
             return Err(PlaceError::PastOracle {
@@ -160,8 +196,8 @@ impl PlanInputs {
                 served: ORACLE_POSITIONS,
             });
         }
-        let plan =
-            placement::plan_routed(&self.model, machine, ctx_max, &self.kv, levers, card_routed)?;
+        let kv = self.kv.with_lanes(lanes);
+        let plan = placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, card_routed)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
@@ -411,9 +447,10 @@ impl PlanInputs {
     /// [`PlanInputs::plan`] with the next-token layer `nextn` loaded on the
     /// machine's one card: the NextN layer's own plan (its routed stacks on
     /// the host), the target's expert rule within the card's budget less the
-    /// NextN layer's card bytes and arena, the card's bound checked on the
-    /// sum and the host's on the target's host set and the NextN layer's
-    /// routed experts. Refused as [`PlanInputs::plan`] refuses and on a
+    /// NextN layer's card bytes and arena, each KDA layer's state two lanes
+    /// ([`KdaLanes::Two`]: the load verifies the draft's rows), the card's
+    /// bound checked on the sum and the host's on the target's host set and
+    /// the NextN layer's routed experts. Refused as [`PlanInputs::plan`] refuses and on a
     /// machine of other than one card; every violation of either plan is
     /// listed, the card's and the host's bound once.
     pub fn plan_nextn<'a>(
@@ -443,11 +480,12 @@ impl PlanInputs {
         )?;
         let arena = NEXTN_ARENA_BYTES;
         let reserve = nextn_card_bytes(&draft.cards[0]) + arena;
+        let kv = self.kv.with_lanes(KdaLanes::Two);
         let plan = placement::plan_routed_reserving(
             &self.model,
             machine,
             ctx_max,
-            &self.kv,
+            &kv,
             levers,
             card_routed,
             reserve,
@@ -508,18 +546,20 @@ impl PlanInputs {
 }
 
 /// One file's per-layer bytes beside the weights: a KDA layer's recurrent
-/// state ([`KDA_LANES`] lanes of `n_head` heads of `d × d` f32, a u32 stamp
-/// a lane) and conv ring (`conv − 1 + PASS_ROWS` rows of the q, k and v
-/// channels in f32), both fixed by the file; a latent layer's cache, a latent row and an index row
-/// (`[key; gate]`, twice the indexer's key width) in f16 a position, and a
-/// pool key (the indexer's key width in f16) every `kpool` positions, the
-/// last pool whole.
+/// state (`lanes` lanes of `n_head` heads of `d × d` f32, a u32 stamp a
+/// lane) and conv ring (`conv − 1 + PASS_ROWS` rows of the q, k and v
+/// channels in f32), fixed by the file and the load's lanes; a latent layer's
+/// cache, a latent row and an index row (`[key; gate]`, twice the indexer's
+/// key width) in f16 a position, and a pool key (the indexer's key width in
+/// f16) every `kpool` positions, the last pool whole.
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per trunk layer: its kind.
     kinds: Vec<Kind>,
-    /// A KDA layer's state and ring, in bytes.
-    recurrent: u64,
+    /// A KDA layer's heads, their width and the conv's taps.
+    kda: (usize, usize, usize),
+    /// The lanes of a KDA layer's state.
+    lanes: KdaLanes,
     /// A latent layer's cache bytes a position.
     row: u64,
     /// A latent layer's pool key bytes, and the positions a pool holds.
@@ -528,28 +568,51 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The layout `hp` describes.
+    /// The layout `hp` describes, each KDA layer's state one lane.
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
         KvLayout {
             kinds: hp.kinds[..hp.n_trunk].to_vec(),
-            recurrent: recurrent_bytes(hp.n_head, hp.kda_head_dim, hp.conv),
+            kda: (hp.n_head, hp.kda_head_dim, hp.conv),
+            lanes: KdaLanes::One,
             row: row_bytes(hp.kv_lora, hp.indexer.head_dim),
             pool_row: hp.indexer.head_dim as u64 * F16_BYTES,
             kpool: hp.indexer.kpool as u64,
         }
     }
+
+    /// The same layout with each KDA layer's state `lanes` lanes.
+    #[must_use]
+    pub fn with_lanes(&self, lanes: KdaLanes) -> KvLayout {
+        KvLayout {
+            lanes,
+            ..self.clone()
+        }
+    }
+
+    /// The lanes of a KDA layer's state.
+    #[must_use]
+    pub fn lanes(&self) -> KdaLanes {
+        self.lanes
+    }
+
+    /// The bytes of layers `layers` at `ctx_max` positions: what a card that
+    /// runs them holds beside its weights ([`KvBytes::layer_bytes`] summed).
+    #[must_use]
+    pub fn bytes(&self, layers: std::ops::Range<usize>, ctx_max: u64) -> u64 {
+        layers.map(|l| self.layer_bytes(l, ctx_max)).sum()
+    }
 }
 
-/// A KDA layer's state of [`KDA_LANES`] lanes with their stamps and its conv
-/// ring over `heads` heads `d` wide with a `conv`-tap conv, in bytes: the
-/// lanes past the first counted by `runtime::stores`, the rule the delta
-/// stores are allocated by.
-fn recurrent_bytes(heads: usize, d: usize, conv: usize) -> u64 {
-    let lanes = stores::delta_lane_bytes(heads, d, KDA_LANES);
+/// A KDA layer's state of `lanes` lanes with their stamps and its conv ring
+/// over `heads` heads `d` wide with a `conv`-tap conv, in bytes: the lanes
+/// past the first and the stamps counted by `runtime::stores`, the rule the
+/// delta stores are allocated by.
+fn recurrent_bytes(heads: usize, d: usize, conv: usize, lanes: KdaLanes) -> u64 {
+    let more = stores::delta_lane_bytes(heads, d, lanes.count());
     let (heads, d) = (heads as u64, d as u64);
     let ring_rows = (conv as u64).saturating_sub(1) + PASS_ROWS as u64;
-    heads * d * d * F32_BYTES + lanes + ring_rows * 3 * heads * d * F32_BYTES
+    heads * d * d * F32_BYTES + more + ring_rows * 3 * heads * d * F32_BYTES
 }
 
 /// A latent layer's cache bytes a position: the `latent`-wide row and the
@@ -561,7 +624,10 @@ fn row_bytes(latent: usize, index_d: usize) -> u64 {
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         match self.kinds.get(layer) {
-            Some(Kind::Kda) => self.recurrent,
+            Some(Kind::Kda) => {
+                let (heads, d, conv) = self.kda;
+                recurrent_bytes(heads, d, conv, self.lanes)
+            }
             Some(Kind::Latent) => ctx_max * self.row + ctx_max.div_ceil(self.kpool) * self.pool_row,
             None => 0,
         }
@@ -570,29 +636,40 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, KvBytes, KvLayout, recurrent_bytes, row_bytes};
+    use super::{KdaLanes, Kind, KvBytes, KvLayout, recurrent_bytes, row_bytes};
 
-    /// GLM-5.3-Flash's sizes: a KDA layer holds two lanes of 64 heads of 128
-    /// × 128 f32, a u32 stamp a lane, and eleven conv rows of 24,576 f32
-    /// channels; a latent layer 512 + 256 f16 a position and 128 f16 a pool
-    /// of four, the last one whole; a layer past the trunk nothing.
+    /// GLM-5.3-Flash's sizes: a KDA layer holds one lane of 64 heads of 128
+    /// × 128 f32 and its u32 stamp, or two lanes and two stamps on a load
+    /// that verifies, and eleven conv rows of 24,576 f32 channels; a latent
+    /// layer 512 + 256 f16 a position and 128 f16 a pool of four, the last
+    /// one whole; a layer past the trunk nothing.
     #[test]
     fn glm_layer_bytes() {
         assert_eq!(
-            recurrent_bytes(64, 128, 4),
+            recurrent_bytes(64, 128, 4, KdaLanes::One),
+            4_194_304 + 4 + 11 * 24_576 * 4
+        );
+        assert_eq!(
+            recurrent_bytes(64, 128, 4, KdaLanes::Two),
             2 * 4_194_304 + 2 * 4 + 11 * 24_576 * 4
         );
         assert_eq!(row_bytes(512, 128), 1536);
         let kv = KvLayout {
             kinds: vec![Kind::Kda, Kind::Kda, Kind::Kda, Kind::Latent],
-            recurrent: recurrent_bytes(64, 128, 4),
+            kda: (64, 128, 4),
+            lanes: KdaLanes::One,
             row: row_bytes(512, 128),
             pool_row: 256,
             kpool: 4,
         };
-        assert_eq!(kv.layer_bytes(0, 2051), 9_469_960);
+        assert_eq!(kv.layer_bytes(0, 2051), 5_275_652);
+        assert_eq!(kv.with_lanes(KdaLanes::Two).layer_bytes(0, 2051), 9_469_960);
         assert_eq!(kv.layer_bytes(3, 2051), 2051 * 1536 + 513 * 256);
         assert_eq!(kv.layer_bytes(3, 16_384), 16_384 * (1536 + 64));
         assert_eq!(kv.layer_bytes(4, 2051), 0);
+        assert_eq!(
+            kv.bytes(0..5, 2051),
+            3 * 5_275_652 + 2051 * 1536 + 513 * 256
+        );
     }
 }

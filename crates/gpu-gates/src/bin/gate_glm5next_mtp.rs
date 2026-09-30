@@ -25,30 +25,40 @@
 //! - (p) the pairing: the hidden rows a walk fed the target's arenas reads
 //!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
 //!   set's prompt in batches and by steps leaves the same rows in the
-//!   prompt-batch and step arenas, bit for bit; the row at position `q`
-//!   closer to ik's warmup row at `q + 1` than to its rows `q` and `q + 2`,
-//!   each row's three distances printed, not held (no band in the tree
-//!   derives a row past a flip, and the set carries no routing to tell the
-//!   rows off every flip's path; the rows' value is held by (o), the drafts
-//!   = ik's); a verify of two
+//!   prompt-batch and step arenas, bit for bit; each value of every row
+//!   within its derived bound of the f64 replica of the gather — the four
+//!   streams' mean, then `output_norm`'s RMS at the file's eps — on the
+//!   target streams the row was made from (`nextn_target_streams`; the
+//!   bound is `HiddenRef`'s); the row at position `q` closer to ik's warmup
+//!   row at `q + 1` than to its rows `q` and `q + 2`, each row's three
+//!   distances printed, not held (no band in the tree derives a row past a
+//!   flip, and the set carries no routing to tell the rows off every flip's
+//!   path); a verify of two
 //!   rows leaves in the pair arena the rows two plain steps leave, bit for
-//!   bit, and keeps them past its commit and the next step.
+//!   bit, and keeps them past its commit and the next step; a verify whose
+//!   commit keeps row 0 alone leaves that row readable and row 1 refused by
+//!   name (the arena holds the kept position alone).
 //! - (t) the target is the NextN load's own: the plain run of the set's
 //!   prompt and [`N`] greedy ids on a load of the NextN plan's target plan
-//!   without the layer, and the same on the NextN load, give the same ids
-//!   and every step's logits bit for bit. ik's committed stream beside them
-//!   is printed, not held.
+//!   without the layer (two KDA lanes, as the plan counts them), and the
+//!   same on the NextN load, give the same ids and every step's logits bit
+//!   for bit. ik's committed stream beside them is printed, not held.
 //! - (w) the windows end to end, the prompt fed in batches and by steps:
 //!   under `Speculative<MtpDraft<Body>, 2>` the drafted greedy ids are the
 //!   plain run's for [`N`] tokens, with a rejected row and an accepted
 //!   proposal among the windows — else either path never ran and the clause
 //!   is red.
-//! - (f) the walk's refusals by name: a walk on a load without the layer, a
-//!   captured walk, no rows, [`WALK_ROWS`] + 1 rows, a walk from past the
-//!   positions the store holds, a token past the vocabulary, a host hidden
-//!   slice of the wrong length, target rows past the arena's, and a chain
-//!   with own walks, in the store walk's mode or into no place; each leaves
-//!   the store's positions where they were.
+//! - (f) the walk's refusals by name: a walk on a load without the layer,
+//!   and the MTP window opened over it (`MtpBody::head`), a captured walk, no
+//!   rows, [`WALK_ROWS`] + 1 rows, a walk from past the positions the store
+//!   holds, a token past the vocabulary, a host hidden slice of the wrong
+//!   length, target rows past the arena's, and a chain with own walks, in
+//!   the store walk's mode or into no place; each leaves the store's
+//!   positions where they were. Then the target's rows by position
+//!   (`nextn_hidden`, the walk's own gather): the pair arena before any
+//!   verify, the step arena for a walk at position 0, and after a prompt of
+//!   [`FED`] ids in one batch the prompt-batch arena's row past the batch's
+//!   last and its rows read as other positions, each refused by name.
 //! - (h) a fault in a chain poisons the model at once: the layer's
 //!   `shared_head_norm` gain's first value set to NaN, a chain from a reset
 //!   is a fault by name and leaves the model poisoned by that fault before
@@ -76,18 +86,19 @@ mod gate {
     use app::mtp::MtpDraft;
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead, NextnHidden, NextnMode,
-        PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits, nextn_walk,
-        prompt_with, set_prefill,
+        PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits,
+        nextn_target_streams, nextn_walk, prompt_with, set_prefill,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::{NextnInputs, PlanInputs};
+    use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
     use model::placement::{PlanLevers, workstation};
     use refset::arch::glm5next::{MODEL, MTP, MTP_SET};
     use refset::ik::Layout;
@@ -96,6 +107,8 @@ mod gate {
 
     /// Cache rows: the e2e gate's main load.
     const CTX: usize = 3136;
+    /// (f)'s prompt in one batch: its rows are the prompt-batch arena's.
+    const FED: usize = 12;
     /// Generated ids a plain or drafted run holds: the set's.
     const N: usize = 64;
     /// The verify's rows: a proposal of one id and the token before it.
@@ -468,39 +481,158 @@ mod gate {
     }
 
     /// Every hidden row a prompt call's units leave, in position order, read
-    /// by [`nextn_hidden`] from the unit's arena in runs of [`WALK_ROWS`].
+    /// by [`nextn_hidden`] from the unit's arena in runs of [`WALK_ROWS`],
+    /// and the target streams each run was made from
+    /// ([`nextn_target_streams`]).
     fn unit_rows(
         m: &mut Glm5nextModel,
         prompt: &[u32],
         path: PrefillMode,
-    ) -> Result<Vec<f32>, GateError> {
+    ) -> Result<(Vec<f32>, Vec<f32>), GateError> {
         m.reset()?;
         set_prefill(m, path)?;
         let mut got: Vec<f32> = Vec::new();
-        let mut units = |m: &mut Glm5nextModel, arena: GlmArena, _: u32, rows: usize| {
+        let mut streams: Vec<f32> = Vec::new();
+        let mut units = |m: &mut Glm5nextModel, arena: GlmArena, first: u32, rows: usize| {
             let mut c0 = 0;
             while c0 < rows {
                 let r = WALK_ROWS.min(rows - c0);
-                got.extend(nextn_hidden(
-                    m,
-                    NextnHidden::Target {
-                        walk: arena,
-                        first: c0,
-                    },
-                    r,
-                )?);
+                // The walk from the position after the unit's row c0 reads it.
+                let pos0 = first + c0 as u32 + 1;
+                let target = NextnHidden::Target {
+                    walk: arena,
+                    first: c0,
+                };
+                got.extend(nextn_hidden(m, pos0, target, r)?);
+                streams.extend(nextn_target_streams(m, pos0, target, r)?);
                 c0 += r;
             }
             Ok(())
         };
         let sink: &mut GlmPromptSink<'_> = &mut units;
         prompt_with(m, prompt, path, Some(sink))?;
-        Ok(got)
+        Ok((got, streams))
+    }
+
+    /// The unit roundoff of f32.
+    const U: f64 = 1.0 / (1u64 << 24) as f64;
+
+    /// PIN(2026-10-01): the bound on one hidden value the walk's gather
+    /// writes — `ds41_hc_mean` over the four streams, then `rms_norm` over
+    /// `n` = 4,096 values with `output_norm`'s gain — against its f64
+    /// replica on the same f32 streams, first order in `u` = 2^-24, derived
+    /// from the kernels' own order:
+    /// - the mean `(((a + b) + c) + d) · 0.25`: three additions, the product
+    ///   exact, so `|δm_i| <= 3u · S_i`, `S_i` the mean of the four `|s|`
+    ///   (absolute: the streams may cancel);
+    /// - the sum of squares of the device's own means: each of 256 threads
+    ///   sums its 16 squares in order, then a five-level warp butterfly and
+    ///   the three-level warp tree — every term through at most 23 additions
+    ///   and its square's rounding, all terms positive: relative `24u`; the
+    ///   means' error moves it by at most `6u · ρ` relative, `ρ = Σ|m_i|S_i /
+    ///   Σm_i²`;
+    /// - `/ n` exact (a power of two), `+ eps` `u`, the square root halves its
+    ///   argument's error and adds its own, and the reciprocal its own, each
+    ///   2u (the approximate forms' bound): `ε_scale = (25u + 6u·ρ) / 2 +
+    ///   4u`;
+    /// - `(scale · g_i) · m_i`: two roundings, `2u`.
+    ///
+    /// So `|y_i − ŷ_i| <= b_i`, with `b_i = |g_i| · scale · (3u · S_i +
+    /// |m_i| · (ε_scale + 2u))`. The clause holds every value within `2 ·
+    /// b_i` (the second order and the replica's own f64 error are below
+    /// 10^-6 of `b_i`) plus `2^-126 · (1 + |g_i| · scale)`, a flushed
+    /// subnormal. A value is bounded, not a row's norm: the bound is
+    /// componentwise.
+    struct HiddenRef {
+        /// The replica's values and each value's bound, `2 · b_i` plus the
+        /// subnormal floor.
+        y: Vec<f64>,
+        bound: Vec<f64>,
+        /// The row's mean square before the norm.
+        ms: f64,
+    }
+
+    /// Row `streams` (`4 · n`, stream-major) through the walk's gather in
+    /// f64, with the bound on each value ([`HiddenRef`]).
+    fn hidden_ref(streams: &[f32], gain: &[f32], eps: f32) -> HiddenRef {
+        let n = gain.len();
+        let at = |j: usize, i: usize| f64::from(streams[j * n + i]);
+        let m: Vec<f64> = (0..n)
+            .map(|i| (at(0, i) + at(1, i) + at(2, i) + at(3, i)) * 0.25)
+            .collect();
+        let s: Vec<f64> = (0..n)
+            .map(|i| (0..4).map(|j| at(j, i).abs()).sum::<f64>() * 0.25)
+            .collect();
+        let sq: f64 = m.iter().map(|v| v * v).sum();
+        let ms = sq / n as f64;
+        let scale = 1.0 / (ms + f64::from(eps)).sqrt();
+        let rho = if sq > 0.0 {
+            m.iter().zip(&s).map(|(a, b)| a.abs() * b).sum::<f64>() / sq
+        } else {
+            0.0
+        };
+        let e_scale = (25.0 * U + 6.0 * U * rho) / 2.0 + 4.0 * U;
+        let floor = f64::from(f32::MIN_POSITIVE);
+        let mut y = Vec::with_capacity(n);
+        let mut bound = Vec::with_capacity(n);
+        for i in 0..n {
+            let g = f64::from(gain[i]).abs() * scale;
+            y.push(f64::from(gain[i]) * scale * m[i]);
+            bound.push(
+                2.0 * g * (3.0 * U * s[i] + m[i].abs() * (e_scale + 2.0 * U)) + floor * (1.0 + g),
+            );
+        }
+        HiddenRef { y, bound, ms }
+    }
+
+    /// (p) the value held: every hidden row a prompt call's units leave, as
+    /// the walk's gather wrote it, within its derived bound of the f64
+    /// replica on the target streams it read ([`HiddenRef`]); the worst
+    /// value's distance over its bound, the rows' rel-L2, their mean squares
+    /// and the bit-equal count printed.
+    fn hidden_held(rows: &[f32], streams: &[f32], gain: &[f32], eps: f32, path: &str) -> bool {
+        let n = gain.len();
+        let count = rows.len() / n.max(1);
+        let shape_ok = n > 0 && rows.len() == count * n && streams.len() == count * 4 * n;
+        let (mut worst, mut num, mut den) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut out, mut bits, mut ms_lo, mut ms_hi) = (0usize, 0usize, f64::MAX, 0.0f64);
+        if shape_ok {
+            for r in 0..count {
+                let h = hidden_ref(&streams[r * 4 * n..(r + 1) * 4 * n], gain, eps);
+                ms_lo = ms_lo.min(h.ms);
+                ms_hi = ms_hi.max(h.ms);
+                for i in 0..n {
+                    let got = f64::from(rows[r * n + i]);
+                    let d = (got - h.y[i]).abs();
+                    worst = worst.max(d / h.bound[i]);
+                    if d.is_nan() || d > h.bound[i] {
+                        out += 1;
+                    }
+                    if got.to_bits() == (h.y[i] as f32 as f64).to_bits() {
+                        bits += 1;
+                    }
+                    num += d * d;
+                    den += h.y[i] * h.y[i];
+                }
+            }
+        }
+        let ok = shape_ok && count > 0 && out == 0;
+        println!(
+            "(p) the gather's value ({path}): {count} rows of {n} against the f64 replica of \
+             mean-then-norm on their target streams: {out} values past their bound, the worst at \
+             {worst:.3e} of it (held <= 1), rel-L2 {:.3e}, mean square {ms_lo:.3e}..{ms_hi:.3e}, \
+             {bits} values the replica's f32 bits (printed) {}",
+            (num / den.max(f64::MIN_POSITIVE)).sqrt(),
+            verdict(ok)
+        );
+        ok
     }
 
     /// (p) the pairing: the hidden rows a walk fed the target's arenas reads.
     /// A prompt call's units in batches (the prompt-batch arena) and by steps
-    /// (the step arena) leave the same rows bit for bit; the row at position
+    /// (the step arena) leave the same rows bit for bit, each value within
+    /// its bound of the gather's f64 replica on the rows' target streams
+    /// ([`hidden_held`], at the file's `eps`); the row at position
     /// `q` lies closer to ik's warmup row at `q + 1` — ik's MTP row `p` reads
     /// the target's hidden of `p − 1` — than to its rows `q` and `q + 2`, the
     /// distances printed. Then a verify of two rows after the prompt leaves in the
@@ -513,16 +645,27 @@ mod gate {
         set: &MtpSet,
         prompt: &[u32],
         hidden: usize,
+        eps: f32,
     ) -> Result<bool, GateError> {
-        let batch = unit_rows(m, prompt, PrefillMode::Batch)?;
-        let steps = unit_rows(m, prompt, PrefillMode::Steps)?;
+        let (batch, batch_streams) = unit_rows(m, prompt, PrefillMode::Batch)?;
+        let (steps, steps_streams) = unit_rows(m, prompt, PrefillMode::Steps)?;
+        let gain = {
+            let (gpu, w, _) = m.body_parts("pairing")?;
+            let name = names::output_norm();
+            let Some(DevWeight::F32 { w: g, .. }) = w.get(&name) else {
+                return Err(format!("{name} is not resident as F32").into());
+            };
+            g.buf().to_host_vec(gpu.stream())?
+        };
+        let held_ok = hidden_held(&batch, &batch_streams, &gain, eps, "batches")
+            & hidden_held(&steps, &steps_streams, &gain, eps, "steps");
         let n = prompt.len();
         let same = batch.len() == n * hidden
             && batch
                 .iter()
                 .map(|x| x.to_bits())
                 .eq(steps.iter().map(|x| x.to_bits()));
-        let mut ok = same;
+        let mut ok = same && held_ok;
         println!(
             "(p) the prompt's {n} units' hidden rows, in batches = by steps, bit for bit {}",
             verdict(same)
@@ -565,8 +708,10 @@ mod gate {
         m.reset()?;
         set_prefill(m, PrefillMode::Batch)?;
         let step_row = |m: &mut Glm5nextModel| -> Result<Vec<f32>, GpuError> {
+            let pos0 = m.pos();
             nextn_hidden(
                 m,
+                pos0,
                 NextnHidden::Target {
                     walk: GlmArena::Step,
                     first: 0,
@@ -590,6 +735,7 @@ mod gate {
         let pair_row = |m: &mut Glm5nextModel| {
             nextn_hidden(
                 m,
+                p + 1,
                 NextnHidden::Target {
                     walk: GlmArena::Pair,
                     first: 0,
@@ -611,6 +757,34 @@ mod gate {
             [t1, t2],
             verdict(verify_ok),
             verdict(kept_ok)
+        );
+        // A verify whose row 1 its commit takes back: the pair arena then
+        // holds the kept row's position alone.
+        let q = m.pos();
+        m.step_rows::<2>([t2, t2])?;
+        m.rollback(q + 1)?;
+        m.keep_rows(1, PassKind::Pair)?;
+        let pair = |first: usize| NextnHidden::Target {
+            walk: GlmArena::Pair,
+            first,
+        };
+        let one = nextn_hidden(m, q + 1, pair(0), 1);
+        let both = nextn_hidden(m, q + 1, pair(0), 2);
+        let held = format!("the arena holds positions {q}..{}", q + 1);
+        let cut_ok = one.is_ok() && matches!(&both, Err(e) if e.to_string().contains(&held));
+        ok &= cut_ok;
+        println!(
+            "(p) a verify at {q} with row 0 kept alone: the kept row {}, both rows {} (want \
+             refused: {held}) {}",
+            match &one {
+                Ok(v) => format!("{} values", v.len()),
+                Err(e) => format!("error \"{e}\""),
+            },
+            match &both {
+                Ok(_) => "accepted".to_string(),
+                Err(e) => format!("error \"{e}\""),
+            },
+            verdict(cut_ok)
         );
         m.reset()?;
         Ok(ok)
@@ -889,6 +1063,59 @@ mod gate {
             "(f) the store's positions after the refusals: {held} {}",
             verdict(held_ok)
         );
+        ok &= by_position(m, &toks)?;
+        Ok(ok)
+    }
+
+    /// (f) the target's rows by position, through the walk's own gather:
+    /// the pair arena from a reset (no verify has written it), the step arena
+    /// for a walk at position 0, then, after [`FED`] ids in one batch, the
+    /// prompt-batch arena's row [`FED`] (past the batch's rows, inside its
+    /// buffers) for the walk that follows, and its rows 0 and 1 for a walk
+    /// from 5, which reads positions 4 and 5: each refused by name. The model
+    /// left reset.
+    fn by_position(m: &mut Glm5nextModel, toks: &[u32]) -> Result<bool, GateError> {
+        let target = |walk: GlmArena, first: usize| NextnHidden::Target { walk, first };
+        m.reset()?;
+        let mut ok = refused(
+            "the pair arena before any verify",
+            nextn_hidden(m, 1, target(GlmArena::Pair, 0), 1),
+            "of the Pair arena as positions 0..1 for a walk from 1: the arena holds no position",
+        );
+        ok &= refused(
+            "the step arena for a walk at position 0",
+            nextn_hidden(m, 0, target(GlmArena::Step, 0), 1),
+            "for a walk at position 0",
+        );
+        set_prefill(m, PrefillMode::Batch)?;
+        let ids: Vec<u32> = toks.iter().copied().cycle().take(FED).collect();
+        feed(m, &ids)?;
+        let fed = FED as u32;
+        ok &= refused(
+            "a prompt-batch row past the batch's last",
+            nextn_hidden(m, fed + 1, target(GlmArena::Prefill, FED), 1),
+            &format!(
+                "for a walk from {}: the arena holds positions 0..{FED}",
+                FED + 1
+            ),
+        );
+        ok &= refused(
+            "prompt-batch rows read as other positions",
+            nextn_hidden(m, 5, target(GlmArena::Prefill, 0), 2),
+            "as positions 4..6",
+        );
+        let good = nextn_hidden(m, fed, target(GlmArena::Prefill, FED - 1), 1);
+        let good_ok = good.is_ok();
+        ok &= good_ok;
+        println!(
+            "(f) the batch's last row for the walk after it: {} {}",
+            match &good {
+                Ok(v) => format!("{} values", v.len()),
+                Err(e) => format!("error \"{e}\""),
+            },
+            verdict(good_ok)
+        );
+        m.reset()?;
         Ok(ok)
     }
 
@@ -999,9 +1226,18 @@ mod gate {
         );
         drop(file);
 
-        // (t) the target's plan loaded without the layer: the reference run.
+        // (t) the target's plan loaded without the layer: the reference run,
+        // at the two KDA lanes the plan counts.
         let t = Instant::now();
-        let mut m = Body::open_placed(open(MODEL)?, &np.plan, &inputs, 0, levers.host())?;
+        let mut m = Body::open_placed_lanes(
+            open(MODEL)?,
+            &np.plan,
+            &inputs,
+            0,
+            levers.host(),
+            Residency::Off,
+            KdaLanes::Two,
+        )?;
         m.set_mode(StepMode::Graph);
         println!(
             "load without the layer: {:.1} s, {} resident bytes",
@@ -1022,6 +1258,16 @@ mod gate {
                 NextnMode::Eager,
             ),
             "without the NextN layer",
+        );
+        ok &= refused(
+            "the MTP window over a load without the layer",
+            MtpDraft::<Body>::open(&m, PrefillMode::Batch, StepMode::Eager).map_err(|e| {
+                GpuError::Shape {
+                    what: "MtpDraft::open",
+                    detail: e.to_string(),
+                }
+            }),
+            "an MTP draft on a load without the NextN layer",
         );
         let reference = plain(&mut m, &prompt, PrefillMode::Batch)?;
         drop(m);
@@ -1046,7 +1292,7 @@ mod gate {
         ok &= pos_mask(&set, hidden)?;
         ok &= refusals(&mut m, hidden)?;
         ok &= chain_fault(&mut m, nextn.index, hidden)?;
-        ok &= pairing(&mut m, &set, &prompt, hidden)?;
+        ok &= pairing(&mut m, &set, &prompt, hidden, inputs.hp.rms_eps)?;
         ok &= oracle(&mut m, &set, hidden)?;
 
         let with = plain(&mut m, &prompt, PrefillMode::Batch)?;

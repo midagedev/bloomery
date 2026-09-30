@@ -2,8 +2,9 @@
 //! the sub-layer's own mix) in, the update into `out`, the layer's conv ring
 //! written at the token's position and its state read from the committed
 //! lane: the step (row 0) writes it back in place, a verify's row 1 into the
-//! next lane ([`crate::body::LANES`]). The store keeps no history past its
-//! lanes: an earlier position comes back only through a checkpoint.
+//! next lane, on a load of two (`place::KdaLanes`). The store keeps no
+//! history past its lanes: an earlier position comes back only through a
+//! checkpoint.
 //!
 //! The launches, in order (ik `src/llama-kda.cpp`):
 //! 1. `attn_norm` RMS;
@@ -30,7 +31,7 @@ use bloomery_gpu::linear::norm_gate::NormGateArgs;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 
-use crate::body::{LANES, Parts, Store, f32v, gemv};
+use crate::body::{Parts, Store, f32v, gemv};
 use crate::tensors::{MixerNames, other_kind};
 
 /// The launches [`kda`] makes.
@@ -98,7 +99,7 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
                     decay: &s.decay,
                     lane: p.lane,
                     lane_at: 0,
-                    lanes: LANES,
+                    lanes: state.lanes().count(),
                     shape: d.kda,
                     m: 1,
                     fault,
