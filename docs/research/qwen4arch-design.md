@@ -60,9 +60,9 @@
 - **ik**: `/home/user/ik_llama.cpp` @`c10fbbcc`.
 - **ex**: exllamav3 `/home/user/exllamav3-src` @`0740edc`.
 - **tf**: transformers 5.17.0 `modeling_qwen4_exp.py` (md5 `edbc627d…`, 박스의 세 사본이 같음).
-- **ms**: 리더 팔 `/Users/hckim/repo/bloomery-modelspec` @`8641b17`.
+- **ms**: 리더 팔 `~/repo/bloomery-modelspec` @`8641b17`.
 
-메모리 규칙상 스크래치에 둔 사본은 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/qwen4arch/{lc,ex,tf,hf}/`입니다.
+메모리 규칙상 스크래치에 둔 사본은 `<scratch>/qwen4arch/{lc,ex,tf,hf}/`입니다.
 
 ## §0 권고 한 줄씩
 

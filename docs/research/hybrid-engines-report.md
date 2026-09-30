@@ -207,7 +207,7 @@ with the R3 hit-rate measurement (router-id replay, no GPU needed) running in pa
 
 ### 4.1 ik_llama.cpp — serial, and it knows it (READ)
 
-Paths below are `/Users/hckim/repo/upstream/v41-ports/mine/` (our PR #2455 branch, ik main `3bb386eb`).
+Paths below are `~/repo/upstream/v41-ports/mine/` (our PR #2455 branch, ik main `3bb386eb`).
 
 - **The default executor is a serial loop.** `ggml/src/ggml-backend.cpp:2483-2531`:
   `for (i in splits) { copy_inputs(split); eval(split); }`. No overlap construct anywhere in it.
@@ -606,29 +606,29 @@ classification so capture survives. Two things this round adds:
 
 ## 8. Improvement opportunities noticed outside the asked scope (report only, nothing touched)
 
-1. `/Users/hckim/repo/bloomery/docs/roofline.md:96-98` — states V4.1 attention is MLA
+1. `docs/roofline.md:96-98` — states V4.1 attention is MLA
    ("kv_lora 512 + rope 64"), contradicted by `docs/research/v41-ops.md:40-44` (not MLA: one 512-d
    latent is K *and* V, ≤640 gathered rows). Stale line that survived the B0a correction; ~3 lines.
-2. `/Users/hckim/repo/bloomery/docs/roofline.md:161` — "engram … 상주시켜도 처리량은 안 바뀐다 (지연만)"
+2. `docs/roofline.md:161` — "engram … 상주시켜도 처리량은 안 바뀐다 (지연만)"
    is contradicted by the measured 13.6 → 18.4 tok/s from cutting major faults
    (`docs/research/v41-ports.md:12`). At this scale fault count *is* throughput; ~2 lines.
-3. `/Users/hckim/repo/bloomery/docs/orchestration.md:92` — the B2 card's gate column names "왕복 µs"
+3. `docs/orchestration.md:92` — the B2 card's gate column names "왕복 µs"
    but no idle-time metric and no sync-mechanism decision. §2.4 says the round will be judged on the
    wrong axis if it optimises the round trip instead of the overlap; ~2 lines, and this report is the
    input.
-4. `/Users/hckim/repo/bloomery/docs/plan.md:63` — the B2 card's gate is "층·토큰당 호스트 항 ms 대
+4. `docs/plan.md:63` — the B2 card's gate is "층·토큰당 호스트 항 ms 대
    roofline 하한 (3.34 GB ÷ 147.7 = 22.6 ms)". That bound is only reachable if the host leg is the
    *only* thing on the critical path, which is what R1 is for; the card should also carry a GPU-idle
    fraction so a round that hits the host bound while leaving the GPU 40 % idle does not read as green;
    ~2 lines.
-5. `/Users/hckim/repo/bloomery/docs/roofline.md:50-56` — the serving placement table (A6000 4⅓ / 3090
+5. `docs/roofline.md:50-56` — the serving placement table (A6000 4⅓ / 3090
    2⅔ / DDR4 33 blocks) predates both the "A6000 usable for development" decision (HANDOFF §7) and the
    expert-cache design; placement should become a function of the cache, not a fixed block split;
    ~5 lines.
-6. `/Users/hckim/repo/upstream/v41-ports/mine/ggml/src/ggml-backend.cpp:2398` — a stray
+6. `~/repo/upstream/v41-ports/mine/ggml/src/ggml-backend.cpp:2398` — a stray
    `printf("Recording event %d, %d\n", ...)` sits in the hot loop of the non-OpenMP parallel split
    executor (debug leftover; the OpenMP arm at `:2321` has no such printf). 1-line upstream candidate.
-7. `/Users/hckim/repo/upstream/v41-ports/mine/ggml/src/ggml-backend.cpp:2019` —
+7. `~/repo/upstream/v41-ports/mine/ggml/src/ggml-backend.cpp:2019` —
    `constexpr bool k_set_sync = false;` makes every `needs_sync[...] = k_set_sync` a dead store of
    `false`, while the surrounding logic reads as if the flag were meant to be settable. Either a
    deliberate kill-switch that deserves a comment or a bug that suppresses a needed sync; worth an

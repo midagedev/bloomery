@@ -27,7 +27,6 @@
 
 ---
 
-== /Users/hckim/.claude/projects/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/subagents/agent-ahoststream-design-8b09993b6eb7f542.jsonl ==
 ## hoststream-design 보고 (조사 라운드, 저장소 변경 없음, opus)
 
 **결론.** 스트리밍 단위가 한 512 배치이면 PCIe는 이기지 못합니다. 전문가 한 개를 옮기는 데 641.6 µs가 들고, 호스트는 512열에서 그 전문가를 약 240 µs에 계산합니다. 이득이 크려면 프롬프트를 **층 우선**으로 돌려야 합니다. G개 배치가 한 층을 함께 지나가게 하면 스트리밍한 전문가 하나가 G×512열에 쓰입니다. 이 스케줄은 파트 B의 어긋내기를 흡수합니다. 배치 k+1의 카드 어텐션이 배치 k의 호스트 union과 겹치기 때문입니다.

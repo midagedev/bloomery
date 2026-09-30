@@ -2,7 +2,7 @@
 
 2026-09-26. opus 서브에이전트 조사 라운드 `prefilllit2`의 보고 원문이다(스펙 `specs/wave-m6/spec-prefilllit2.md`, 박스 없음). 인용은 라운드가 이번에 받은 원문의 한 줄이다. 리드가 표본 둘을 대조했다: llama.cpp `4e74811` `ggml/src/ggml-cuda/mmvq.cuh:3`(GitHub raw를 직접 받아 같은 줄 확인)과 `mmvq.cu:185`. [유도] 수치는 라운드의 추론이다. 처분은 `docs/plan-triage.md`에 있다.
 
-박스, 저장소, git은 건드리지 않았고 산출물은 모두 스크래치에만 두었습니다. 인용한 줄은 전부 이번 라운드에 받은 원문에 있습니다. 코드는 SHA를 고정한 raw 파일이고, 논문·글은 `fetch.py`로 받은 텍스트에서 grep으로 확인했습니다. 원문은 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/prefilllit2/`의 `lcpp/ vllm/ exl3/ mrs/ ik/ papers/ gh/` 아래에 있고, 조사한 커밋 SHA는 `heads.txt`에 적었습니다.
+박스, 저장소, git은 건드리지 않았고 산출물은 모두 스크래치에만 두었습니다. 인용한 줄은 전부 이번 라운드에 받은 원문에 있습니다. 코드는 SHA를 고정한 raw 파일이고, 논문·글은 `fetch.py`로 받은 텍스트에서 grep으로 확인했습니다. 원문은 `<scratch>/prefilllit2/`의 `lcpp/ vllm/ exl3/ mrs/ ik/ papers/ gh/` 아래에 있고, 조사한 커밋 SHA는 `heads.txt`에 적었습니다.
 
 ## 요약
 

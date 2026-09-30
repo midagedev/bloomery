@@ -16,7 +16,7 @@ hostserve 라운드 보고입니다(보고 대상 `bloomery-ee`). 세 가지를 
 
 ## 1. 변경 파일
 
-모두 `/Users/hckim/repo/bloomery-hostserve` 아래이고, `git diff --stat` 기준 8개 파일, +892 / −159입니다.
+모두 `~/repo/bloomery-hostserve` 아래이고, `git diff --stat` 기준 8개 파일, +892 / −159입니다.
 
 - `crates/model/src/ops.rs`
   - `Tensor2View<'a>`를 새로 만들었습니다. `Tensor2::view()`와 `From<&Tensor2>`로 한 블록을 빌려줍니다.

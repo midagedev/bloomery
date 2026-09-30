@@ -8,7 +8,6 @@
 
 ---
 
-== /Users/hckim/.claude/projects/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/subagents/agent-aquality-v4meta-7b4407a5efc822f6.jsonl ==
 # quality-v4meta 리뷰 보고 (착륙한 `8bfa287`, 정적 독해만)
 
 **결론.** 스펙 정의대로의 HIGH는 없습니다. 조용히 기본값으로 바뀌는 누락 키는 없고, 체인·디스패치 코드에서 `Model`로 가지를 치는 곳도 없습니다. 가장 무거운 발견은 커밋 메시지와 코드가 어긋나는 한 곳입니다. 메시지는 V4 파일의 V4.1 전용 텐서를 이름으로 거절한다고 적었지만, 코드는 `indexer.attn_k`와 `engram_embd`만 거절합니다. 지금은 `PlanInputs::read`가 파일 전체를 거절하므로 닿지 않습니다. 거절 목록이 줄어드는 순간 조용한 수용이 됩니다.

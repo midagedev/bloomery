@@ -1059,7 +1059,7 @@ CACM 31(5), 1988 — no scaled-problem argument exists here (§2.4).
 
 **Our own measurements (primary sources in this repo)**
 
-`/Users/hckim/repo/bloomery/docs/roofline.md`, `docs/plan.md`, `docs/research/v41-ops.md`,
+`docs/roofline.md`, `docs/plan.md`, `docs/research/v41-ops.md`,
 `docs/research/v41-ports.md`, `docs/research/fusion.md`; rig-log WKS-35, WKS-36,
 `log/2026-09-19-verification-does-not-amortise.md`.
 

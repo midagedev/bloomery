@@ -232,4 +232,4 @@ BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV="<the router-frequency list lever, since d
    - plan.md 「흐름 모델」의 "창 안 ≈ 2"와 "+7 ms"는 정정이 필요합니다. 문서는 리드가 씁니다.
 6. **모델.** opus로 실행했습니다.
 
-모사 스크립트는 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/ovl/` 아래 `union.py`, `sim.py`, `p4096.py`입니다.
+모사 스크립트는 `<scratch>/ovl/` 아래 `union.py`, `sim.py`, `p4096.py`입니다.

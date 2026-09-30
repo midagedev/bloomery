@@ -45,7 +45,7 @@ WebFetch summaries; ~~the lead did not re-read the pages~~ the lead re-read the 
 
 # machineaxes 메모: 기계 축(GPU 세대·AVX-512·DGX Spark)과 기계 서술
 
-코드를 읽고 NVIDIA 문서 몇 개를 fetch해서 답했습니다. 박스에서는 읽기 명령만 썼습니다(`nvidia-smi --query-gpu`, ptxas 바이너리 문자열 `grep`, `/proc/cpuinfo`·env 파일 `grep`). 빌드, 바이너리 실행, 임대, 게이트는 하나도 하지 않았습니다. 트리는 `/Users/hckim/repo/bloomery-machineaxes`(`e2ecc4a`), 포크는 핀 `e589793a`를 `git grep`/`git show`로 읽었고 체크아웃은 하지 않았습니다.
+코드를 읽고 NVIDIA 문서 몇 개를 fetch해서 답했습니다. 박스에서는 읽기 명령만 썼습니다(`nvidia-smi --query-gpu`, ptxas 바이너리 문자열 `grep`, `/proc/cpuinfo`·env 파일 `grep`). 빌드, 바이너리 실행, 임대, 게이트는 하나도 하지 않았습니다. 트리는 `~/repo/bloomery-machineaxes`(`e2ecc4a`), 포크는 핀 `e589793a`를 `git grep`/`git show`로 읽었고 체크아웃은 하지 않았습니다.
 
 ## §0 요약
 

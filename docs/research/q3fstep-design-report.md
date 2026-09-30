@@ -384,7 +384,7 @@
    - sha256 f8290678…
 
 - 구현 카드 `q3swz-ncu.card`(sha256 f8df4c25…)는 앞 보고 그대로이고, 조건에 섹터 69.34 M ±0.1 %가 들어 있습니다.
-- 경로: `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/q3fstep/{q3flash-srcpage,q3row72-ncu,q3swz-ncu}.card`
+- 경로: `<scratch>/q3fstep/{q3flash-srcpage,q3row72-ncu,q3swz-ncu}.card`
 
 ## 스펙 밖 개선 지점(추가분, 보고만)
 

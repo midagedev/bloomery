@@ -21,8 +21,8 @@ measured from the file, rather than inferred from a name.
 
 | mark | tree / commit | note |
 |---|---|---|
-| `[ik]` | **our own port, PR #2455**, at `c10fbbcc`. Checked out on the Mac at `/Users/hckim/repo/upstream/v41-ports/mine` **and** on the box at `/home/user/ik_llama.cpp` — same commit, so it reads locally. | Three V4.1 commits on top of ik `main`: `0c6e934a model : add DeepSeek-V4.1 (deepseek41)`, `b63c33e1` engram prefetch, `c10fbbcc` (stream naming). Cited `file:line`; every `[ik]` claim below is from `c10fbbcc` unless a commit is named. |
-| `[ref]` | `/Users/hckim/repo/upstream/deepseek-v41-inference/config.json`, read directly for this document. | |
+| `[ik]` | **our own port, PR #2455**, at `c10fbbcc`. Checked out on the Mac at `~/repo/upstream/v41-ports/mine` **and** on the box at `/home/user/ik_llama.cpp` — same commit, so it reads locally. | Three V4.1 commits on top of ik `main`: `0c6e934a model : add DeepSeek-V4.1 (deepseek41)`, `b63c33e1` engram prefetch, `c10fbbcc` (stream naming). Cited `file:line`; every `[ik]` claim below is from `c10fbbcc` unless a commit is named. |
+| `[ref]` | `~/repo/upstream/deepseek-v41-inference/config.json`, read directly for this document. | |
 | `[ref*]` | a claim about `model.py`/`kernel.py` that I did **not** read here; taken from `v41-ops-report.md`, which cites it. | Two hops — weaker evidence, marked so it can be re-checked. |
 | `[gguf]` | `docs/v41-inventory.md` — measured from the 9 shards by `gguf-inventory` (B0b, `e63caf3`). | Ground truth for what the file contains. |
 | `[derived]` | arithmetic; the steps are shown. | |

@@ -4,8 +4,8 @@
 
 ## 1. 변경 파일
 
-- `/Users/hckim/repo/bloomery-markov/crates/model/src/bin/markov-accept.rs`: 새 bin입니다. bf16을 f32로 한 번 넓혀 헤드를 로드하고, AVX2 FMA 커널로 위치별 경로와 이전 토큰별 argmax 표를 계산합니다. E5 markov1 재계산, `--tokens`·`--table-out`·`--self-test`가 들어 있습니다. 이 crate는 bin 목록을 두지 않고 자동으로 찾으므로 `Cargo.toml`은 고치지 않았습니다.
-- `/Users/hckim/repo/bloomery-markov/justfile`: 맨 끝에 `markov-accept` 레시피를 추가했습니다. self-test를 돌린 뒤 다섯 코퍼스를 실행하고, 둘 다 `tools/host-gate.sh`를 거칩니다.
+- `~/repo/bloomery-markov/crates/model/src/bin/markov-accept.rs`: 새 bin입니다. bf16을 f32로 한 번 넓혀 헤드를 로드하고, AVX2 FMA 커널로 위치별 경로와 이전 토큰별 argmax 표를 계산합니다. E5 markov1 재계산, `--tokens`·`--table-out`·`--self-test`가 들어 있습니다. 이 crate는 bin 목록을 두지 않고 자동으로 찾으므로 `Cargo.toml`은 고치지 않았습니다.
+- `~/repo/bloomery-markov/justfile`: 맨 끝에 `markov-accept` 레시피를 추가했습니다. self-test를 돌린 뒤 다섯 코퍼스를 실행하고, 둘 다 `tools/host-gate.sh`를 거칩니다.
 
 ## 2. 증명
 

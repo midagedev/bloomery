@@ -182,7 +182,7 @@
 
 ### 2.1 KDA (34층)
 
-**있는 것(03, `/Users/hckim/repo/bloomery-q35gdn`, `61979df`).**
+**있는 것(03, `~/repo/bloomery-q35gdn`, `61979df`).**
 - `crates/gpu/src/linear/delta.rs`의 `delta_body<const DECAY>`는 DECAY_KEY 경로가 이미 몸체에 있습니다(`:225-253`). 엔트리는 `gdn_delta`(DECAY_HEAD)뿐입니다(`:308-330`).
 - `linear/mod.rs:94-103`에 `DECAY_KEY`와 `GATE_SIGMOID` 상수가 있지만 "no entry is built"입니다.
 - `norm_gate.rs:41-47`에 `act::<GATE_SIGMOID>`가 있습니다.

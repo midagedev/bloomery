@@ -14,8 +14,8 @@
     tools/ref/router-residency.py fixture --out PATH [--passes N] [--lcg SEED]
     tools/ref/router-residency.py --self-test
 
-Every command takes --data DIR (default /Users/hckim/data/bloomery-router): the directory the router
-sets live in. A set is a router_trace directory, read through tools/ref/router-coverage.py
+Every command takes --data DIR: the directory the router sets live in. It has no default; a set named
+without --data is refused by name. A set is a router_trace directory, read through tools/ref/router-coverage.py
 (read_manifest over tools/bloomery/manifest.py, read_topk), which refuses a set without its
 `# complete` trailer. A <set> is a name under --data or a directory path.
 
@@ -123,7 +123,6 @@ _spec = importlib.util.spec_from_file_location("route_trace", os.path.join(_here
 rt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rt)
 
-DATA = "/Users/hckim/data/bloomery-router"
 SPLIT = 24576  # 12 whole chunks of 2048: learn on [0, SPLIT), evaluate on [SPLIT, tokens)
 
 # Model facts the replays price with. plan_total / plan_n: the card experts of V4.1 plan (a) (spread over
@@ -197,6 +196,8 @@ def family(name):
 def set_dir(data, name):
     if os.path.isdir(name) and os.path.isfile(os.path.join(name, "MANIFEST.tsv")):
         return name
+    if data is None:
+        raise ToolError(f"router set {name!r} is not a set directory, and no --data DIR names where sets live")
     d = os.path.join(data, name)
     if not os.path.isdir(d):
         raise ToolError(f"no router set {name!r}: {d} is not a directory (--data {data})")
@@ -1272,7 +1273,7 @@ def parser():
     sub = p.add_subparsers(dest="cmd")
 
     def common(q):
-        q.add_argument("--data", default=DATA)
+        q.add_argument("--data")
         q.add_argument("--seed")
         q.add_argument("--rule", default="mid")
         q.add_argument("--d", type=int, default=1)
@@ -1893,6 +1894,7 @@ def case_refusals():
              "--open-from needs --open"),
             (["hit", "v41", d, "--data", root], "384 x top-6"),
             (["gen", "v41", d, "--data", root], "gen needs --prompt"),
+            (["hit", "v41", "prose"], "no --data DIR"),
         ]
         os.makedirs(os.path.join(root, "nomanifest"))
         cases.append((["hit", "v41", "nomanifest", "--data", root], "no manifest"))

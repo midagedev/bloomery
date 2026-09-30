@@ -118,6 +118,6 @@ cuda-core   = "0.3.1"
 ### 부록: 이 문서의 출처 목록
 
 - 박스: `tools/box.sh`로 실행한 `nvidia-smi`, `nvcc --version`, `ls /usr/local/`, `which cargo-oxide && cargo-oxide --version`, `df -h /root`, `free -g`, `cat /root/bloomery-env.sh`, `ls /root/bloomery-data/bin`, `find /root -maxdepth 2 -name bloomery-env.sh`, `llc --version`, `rustc --version`, `cat /root/repo/bloomery/...`, `/home/user/ik_llama.cpp`의 mmvq.cu·mmvq-templates.cuh·git log
-- Mac: `/Users/hckim/repo/bloomery/Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `justfile`, `crates/q3k-gemv/{Cargo.toml,README.md,src/main.rs,RESULTS-q4k-q6k.md}`, `tools/ref/{measure.sh,build.sh}`, `docs/plan.md`, `git log`
+- Mac: `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `justfile`, `crates/q3k-gemv/{Cargo.toml,README.md,src/main.rs,RESULTS-q4k-q6k.md}`, `tools/ref/{measure.sh,build.sh}`, `docs/plan.md`, `git log`
 - rig-log: `log/2026-09-19-a-first-rust-kernel-two-arms.md`, `log/2026-09-19-g-the-fused-kernel-runs.md`, `log/2026-09-17-a-rust-engine-on-the-same-card.md` (grep 'gpu|sm_86|3090')
 - 웹: github.com/NVlabs/cutile-rs (README·CHANGELOG), api.github.com/repos/NVlabs/cutile-rs/commits, crates.io/api/v1/crates/cutile, github.com/NVlabs/cuda-oxide (README), api.github.com/repos/NVlabs/cuda-oxide/commits(+핀 rev 조회)

@@ -24,10 +24,10 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 | Model | File | Runs as |
 |---|---|---|
 | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` |
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions; `generate_glm5next` |
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts; `generate_qwen3moe`, `bloomery-serve-qwen38` |
-| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole model on one GPU |
-| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole model on one GPU |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole model on one GPU; `generate_qwen3moe` |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole model on one GPU; `generate_qwen3moe` |
 | [DeepSeek-V2-Lite-Chat](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat) | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 
 Each file is the public upload as downloaded. For GLM-5.3, Qwen3.8 and Qwen3.6 the files were checked against the uploads on 2026-09-28 (every shard's size, the first shard's sha256); the others have no recorded sha256 check yet.
@@ -53,7 +53,7 @@ Adaptive residency on one A6000, V4.1-Flash `Q3_K_M`, 96 decode steps after a 51
 
 ## Status
 
-V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` serve llama-server's HTTP API (streaming, prefix reuse, reasoning, tool calls; one request at a time). The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
+V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` serve llama-server's HTTP API, streaming, one request at a time. The V4.1 server also reuses a cached prompt prefix, splits reasoning and returns tool calls; the Qwen3.8 server keeps no prefix (every request prefills from a reset). GLM-5.3 and Qwen3.6 run from their generator bins and have no server yet.<!-- pending: no-glm-qwen36-server --> The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
 In progress: the warm re-measure against llama.cpp (below); Qwen3.8's MTP draft speed; GLM-5.3's prompt speed since batching; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
 
@@ -100,12 +100,14 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 
 | | Minimum | Extended |
 |---|---|---|
-| GPU | RTX 3090 24 GB (sm_86) | a second RTX 3090 for the DSpark draft |
+| GPU | RTX 3090 24 GB (sm_86) | an RTX A6000 48 GB with the RTX 3090 (`--place bp`) |
 | CPU | AVX2, 8 DDR4 channels | same |
 | RAM | 256 GB | same |
 | Storage | NVMe for the engram table | same |
 
-The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels, 264 GB) with an RTX A6000 and an RTX 3090. V4.1 decode is bound by host memory bandwidth, 135–137 GB/s at 32 threads. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
+The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels, 264 GB) with an RTX A6000 and an RTX 3090. A card is picked by its name (`A6000`, `3090`), so two RTX 3090s are not supported: make one visible with `CUDA_VISIBLE_DEVICES`. The CPU build targets Zen 3 (`target-cpu=znver3`); another CPU needs the flag changed ([`docs/BUILD.md`](docs/BUILD.md#the-cpu-flag)).
+
+Every throughput number in this README ran on the A6000: the one-card rows on the A6000 alone, the two-card rows on the A6000 with the 3090 (`--place bp`). No row ran on a 3090 alone yet; those rows come with the release re-measure. V4.1 decode is bound by host memory bandwidth, 135–137 GB/s at 32 threads. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
 ## How it is verified
 
@@ -116,15 +118,15 @@ The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels,
 
 ## Limits
 
-- **sm_86 only.** The tooling (`tools/box.sh`) assumes our development setup; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
+- **sm_86 only.** The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remote workstation; [`docs/BUILD.md`](docs/BUILD.md) gives the direct commands for your own host.
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
-- **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch. The server reuses a cached prompt prefix.
-- **One request at a time** in both servers.
+- **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch. The V4.1 server reuses a cached prompt prefix; the Qwen3.8 server does not.
+- **One request at a time** in both servers. GLM-5.3 and Qwen3.6 have no server yet.<!-- pending: no-glm-qwen36-server -->
 - **Qwen3.8** keeps the routed experts past its card share on the CPU, and its MTP draft's speed is not measured yet.
 
 ## Build
 
-See [`docs/BUILD.md`](docs/BUILD.md). In short: Linux x86-64 with AVX2, CUDA 13.3, LLVM 21 and `cargo-oxide`, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41`.
+See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model (download, build, generate, serve, and `--place gate` on a single RTX 3090), and the CPU flag. In short: Linux x86-64 (the build targets Zen 3), CUDA 13.3, LLVM 21, Clang 21 and `cargo-oxide` from our cuda-oxide fork, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41` and `BLOOMERY_REF_MODEL=<first shard> target/release/generate_ds41 --place gate --tokens 671,6102,294,8760,344`.
 
 ## Upstream
 

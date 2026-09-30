@@ -1,4 +1,3 @@
-== /Users/hckim/.claude/projects/-Users-hckim-repo-bloomery/e5714b41-3850-42be-a722-79e1f225c3b5/subagents/agent-aspots-2239ec560b5d0d21.jsonl ==
 스펙 밖 개선 항목 177개를 모두 main 트리와 대조했습니다. 트리아지 ①–⑫(`plan.md:467–587`)는 리드가 이미 구조화한 트래커라 다시 세지 않았습니다. 필요하면 두 번째 패스로 하겠습니다.
 
 **결과 요약**
@@ -227,7 +226,7 @@
 
 행 160 번호는 없고 176에서 178로 이어집니다. 전체 행 수는 177개입니다. 같은 표를 저장해 둔 파일은 다음입니다.
 
-`/private/tmp/claude-501/-Users-hckim-repo-bloomery/e5714b41-3850-42be-a722-79e1f225c3b5/scratchpad/improvement-spots.md`
+`<scratch>/improvement-spots.md`
 
 git 상태와 박스는 건드리지 않았습니다.
 

@@ -2,7 +2,7 @@ E5 결과, 한 줄: 텍스트 자체를 목표로 삼은 대리 척도에서 **�
 
 ## 1. 변경 파일
 
-- `/Users/hckim/repo/bloomery-ngram/tools/ref/draft-accept.py`를 새로 만들었다. 초안은 lookup-recent, lookup-frequent, markov1 셋이고 k=2 표와 n별 분해 표를 내며 `--tokens`, `--chunk`, `--self-test`를 받는다. 입력 토큰이 모자라거나 정수가 아닌 줄이 있으면 거부한다.
+- `~/repo/bloomery-ngram/tools/ref/draft-accept.py`를 새로 만들었다. 초안은 lookup-recent, lookup-frequent, markov1 셋이고 k=2 표와 n별 분해 표를 내며 `--tokens`, `--chunk`, `--self-test`를 받는다. 입력 토큰이 모자라거나 정수가 아닌 줄이 있으면 거부한다.
 
 ```
 $ git status --short

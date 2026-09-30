@@ -18,13 +18,13 @@ F2와 F1 둘 다 넣었고 D(`srcpage.py`)와 카드도 만들었습니다. 네 
 도중에 하나를 고쳤습니다. 처음 판은 풀타일과 부분타일 모두 n-타일 1 뒤에 복사를 냈습니다. 그러면 부분타일에서 복사 지연을 덮을 계산이 모자랍니다. 그래서 부분타일은 배리어 직후에 복사를 내도록 바꾸고 전 게이트를 다시 돌렸습니다. 처음 판도 게이트를 모두 통과했으니(e2e 두 패스, dump 6/6) 되돌릴 때 폴백으로 쓸 수 있습니다.
 
 ### 1. 바뀐 파일
-- `/Users/hckim/repo/bloomery-q3gemmc/crates/gpu/src/gemm.rs`
+- `~/repo/bloomery-q3gemmc/crates/gpu/src/gemm.rs`
   - F2: `gemm_stage_cols!`가 스테이징 열 오프셋을 타일당 한 번, u32 바이트 오프셋으로 계산합니다(청크 2개와 d8 블록 1개). 스텝은 여기에 자기 오프셋만 더합니다.
   - `STAGE_CHUNKS`, `STAGE_OFF_MAX`와 그 경계 증명 `const assert`를 추가했습니다.
   - F1: `gemm_step`이 `wait_group(0)` → 배리어 → compute 순서가 됐고 스텝 끝에서 한 번 commit합니다. 다음 스텝 복사는 풀타일이면 n-타일 `STAGE_NT`(=1) 뒤에 한 묶음으로, 부분타일이면 배리어 직후에 냅니다. 행이 없는 워프는 계산 없이 복사만 합니다.
   - `GEMM_THREADS` 주석(옛 77-83)과 `gemm_step`, `STAGE_NT` 주석을 지금 참인 내용으로 다시 썼습니다.
-- `/Users/hckim/repo/bloomery-q3gemmc/tools/ref/srcpage.py` (새 파일): 소스 페이지 판독기.
-- `/Users/hckim/repo/bloomery-q3gemmc/docs/cards/q3gemmc-ncu.card` (새 파일): profile 카드.
+- `~/repo/bloomery-q3gemmc/tools/ref/srcpage.py` (새 파일): 소스 페이지 판독기.
+- `~/repo/bloomery-q3gemmc/docs/cards/q3gemmc-ncu.card` (새 파일): profile 카드.
 
 ### 2. 종이 위 분해
 
@@ -153,7 +153,7 @@ F2와 F1 둘 다 넣었고 D(`srcpage.py`)와 카드도 만들었습니다. 네 
 - 임대 확인을 처음에는 `flock -n`으로 했고, common.md가 바뀐 18:4x 이후 `flock -s -n`으로 바꿨습니다.
 - `just affected 56c1b47`은 게이트 61개와 상시 검사 7개를 고릅니다. 이 라운드에서는 gemm, qwen3moe-kernels, qwen3moe-e2e, ptx-spill 게이트 넷과 상시 검사 7개만 돌렸습니다. V4.1과 dspark 게이트 등 나머지는 리드의 착륙 배치 몫입니다.
 - 박스에 남은 것(정리 대상): aux 디렉터리 `bloomery-q3gemmc-base`, `bloomery-q3gemmc-dump`, 그리고 `~/q3gemmc-dump/{base,mine,split}`. 워크트리와 원격 디렉터리 제거는 리드가 합니다. box-gc는 처음과 끝에 돌렸고 둘 다 0개였습니다.
-- 스크래치에 둔 증거(세션이 다시 시작되면 지워짐): `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/q3gemmc/`
+- 스크래치에 둔 증거(세션이 다시 시작되면 지워짐): `<scratch>/q3gemmc/`
   - `*-q4k.raw`: 각 판의 SASS
   - `s-*.txt`: 게이트 로그
   - `nt1-fmt.diff`: 폴백 판

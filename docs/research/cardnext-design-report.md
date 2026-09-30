@@ -2,11 +2,11 @@
 
 2026-09-26. opus 서브에이전트 설계 라운드 `cardnext`의 보고 원문이다(스펙 `specs/wave-m6/spec-cardnext.md`, 박스 없음; 흐름 모형 `tools/flow/ds41_prefill.py`를 Mac에서 돌리고 모형에 없는 스케줄·커널 모양은 스크래치 확장으로 더함 — 확장은 G = 1에서 원 모형과 소수점까지 같음). [유도] 수치는 라운드의 추론이다. 요지: grouped shadow는 잔류 부족이 아니다 — gate·up은 슬롯마다 가중치를 DRAM에서 다시 읽고(R), down은 캐시에 상주한 채 지연에 묶였다. 권고 순서는 T(전문가 × 행 타일 × 8열 타일, 비트 그대로, prose pp512 +31 %) 먼저, 그다음 G(층을 넘는 발행, lcg pp4096 +26 %). 처분은 `docs/plan-triage.md`에 있다.
 
-## 보고 (`cardnext`, 워크트리 `/Users/hckim/repo/bloomery-cardnext`, base `74fe84c`)
+## 보고 (`cardnext`, 워크트리 `~/repo/bloomery-cardnext`, base `74fe84c`)
 
 ## cardnext 보고 — G 스케줄러와 grouped shadow 설계
 
-박스, 저장소 파일, git 상태는 건드리지 않았습니다. 수치는 Mac에서 흐름 모형(`tools/flow/ds41_prefill.py`, 74fe84c, 수정 없음)을 돌려 얻었고, 모형에 없는 스케줄과 커널 모양은 스크래치 확장으로 더했습니다. 파일은 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/cardnext/`에 있습니다.
+박스, 저장소 파일, git 상태는 건드리지 않았습니다. 수치는 Mac에서 흐름 모형(`tools/flow/ds41_prefill.py`, 74fe84c, 수정 없음)을 돌려 얻었고, 모형에 없는 스케줄과 커널 모양은 스크래치 확장으로 더했습니다. 파일은 `<scratch>/cardnext/`에 있습니다.
 - `flowx.py`: 확장 코드
 - `table2.txt`: pp 표
 - `timeline.txt`: 층-배치당 자원 시간선

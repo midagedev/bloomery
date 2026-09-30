@@ -8,12 +8,12 @@ numbers are marked **derived**; facts about our quantized file are marked **infe
 
 | alias | path |
 |---|---|
-| `model.py` | `/Users/hckim/repo/upstream/deepseek-v41-inference/model.py` (1309 lines) |
-| `kernel.py` | `/Users/hckim/repo/upstream/deepseek-v41-inference/kernel.py` (591 lines) |
-| `config.json` | `/Users/hckim/repo/upstream/deepseek-v41-inference/config.json` |
-| `ik` | `/Users/hckim/repo/ik_llama.cpp/src/…` |
-| `fork` | `/Users/hckim/repo/llama.cpp-fork/src/…` and `/Users/hckim/repo/llama.cpp-fork/conversion/deepseek.py` |
-| `bloomery` | `/Users/hckim/repo/bloomery/crates/model/src/attn.rs`, `moe.rs` |
+| `model.py` | `~/repo/upstream/deepseek-v41-inference/model.py` (1309 lines) |
+| `kernel.py` | `~/repo/upstream/deepseek-v41-inference/kernel.py` (591 lines) |
+| `config.json` | `~/repo/upstream/deepseek-v41-inference/config.json` |
+| `ik` | `~/repo/ik_llama.cpp/src/…` |
+| `fork` | `~/repo/llama.cpp-fork/src/…` and `~/repo/llama.cpp-fork/conversion/deepseek.py` |
+| `bloomery` | `crates/model/src/attn.rs`, `moe.rs` |
 
 **Which source wins where.** For the math: the reference (`model.py`/`kernel.py`). For GGUF tensor
 names of the file we have: the mainline fork (`conversion/deepseek.py` writes it; `fork`'s

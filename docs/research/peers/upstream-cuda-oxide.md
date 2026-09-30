@@ -47,11 +47,11 @@ Searched upstream issues, pull requests, and discussions via GitHub CLI read-onl
     `/*\n * SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n * SPDX-License-Identifier: Apache-2.0\n */`
 - **Does upstream accept external PRs?**
   - **Yes, actively.** Multiple external (non-NVIDIA) contributors have had PRs merged. Representative merged PRs from non-NVIDIA authors:
-    1. PR #1288: "fix(atomics): support core AtomicPtr lowering" by `@YunusMutlu` (`mutluyunus708@gmail.com`).
-    2. PR #1282: "fix(debug): support runtime-indexed fixed-array references" by `@uurl` (`raulestradaa@gmail.com`).
-    3. PR #1275: "refactor(llvm): use upstream global constant semantics" by `@uurl` (`raulestradaa@gmail.com`).
-    4. PR #1270: "fix(cuda-device): pack coalesced ballot masks" by `@YunusMutlu` (`mutluyunus708@gmail.com`).
-    5. PR #1264: "fix(mir-lower): lower redux.sync results to signless integers" by `@sachinsharma3191` (`sachinsharma3191@gmail.com`).
+    1. PR #1288: "fix(atomics): support core AtomicPtr lowering" by `@YunusMutlu`.
+    2. PR #1282: "fix(debug): support runtime-indexed fixed-array references" by `@uurl`.
+    3. PR #1275: "refactor(llvm): use upstream global constant semantics" by `@uurl`.
+    4. PR #1270: "fix(cuda-device): pack coalesced ballot masks" by `@YunusMutlu`.
+    5. PR #1264: "fix(mir-lower): lower redux.sync results to signless integers" by `@sachinsharma3191`.
 - **Classification**: **Bug Report**. Device codegen crashes with an ICE during compilation (`rustc_codegen_cuda` assertion failure). Matches `.github/ISSUE_TEMPLATE/bug_report.md` (labels: `bug`, `TBD`).
 
 ### 4. Merged Sibling Precedent

@@ -361,11 +361,11 @@ expert arm의 wait 하나만으로도 세 가설의 예측이 겹치지 않는�
 이 라운드는 opus, 즉 Opus 5.5로 돌았다.
 
 산출물:
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/hs/cardroute-levers.py`와 `cardroute-levers.out`: 레버 행
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/hs/cardroute-timeline.py`와 `cardroute-timeline.out`: 자원별 합과 묶는 자원
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/hs/cardroute-queue.py`와 `cardroute-queue.out`: 큐 적합과 P 384 예측
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/cpg-11.1.1.html`: 가이드 표 원본
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/forum-33866.json`, `forum-218750.json`, `forum-246254.json`: 포럼 원문
+- `<scratch>/hs/cardroute-levers.py`와 `cardroute-levers.out`: 레버 행
+- `<scratch>/hs/cardroute-timeline.py`와 `cardroute-timeline.out`: 자원별 합과 묶는 자원
+- `<scratch>/hs/cardroute-queue.py`와 `cardroute-queue.out`: 큐 적합과 P 384 예측
+- `<scratch>/cpg-11.1.1.html`: 가이드 표 원본
+- `<scratch>/forum-33866.json`, `forum-218750.json`, `forum-246254.json`: 포럼 원문
 
 Sources:
 - [NVIDIA forum: Kernel launches blocking when 1024 kernels in a queue](https://forums.developer.nvidia.com/t/kernel-launches-blocking-when-1024-kernels-in-a-queue/33866)

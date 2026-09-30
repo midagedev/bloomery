@@ -4,7 +4,7 @@
 
 Labels: **[m]** measured (source given), **[d]** derived (arithmetic given or from the named script), **[asm]** assumption. Every tok/s is for n=1 (a single stream) with ctx_max 32,768 and the engram lookup kept off the step thread, unless a row says otherwise.
 
-Compliance: I edited no file and changed no git state. I took no lease, ran no benchmark, no GPU gate and no `box.sh`. On the box I ran only read-only commands over `ssh ws`: `nvidia-smi --query-gpu=…`, `free -b`, `numactl -H`, and two read-only NVML queries that are not in your literal list (`nvidia-smi topo -p2p r` and `nvidia-smi topo -m`). The scripts are in `/private/tmp/claude-501/-Users-hckim-repo-bloomery/e5714b41-3850-42be-a722-79e1f225c3b5/scratchpad/b1d/`:
+Compliance: I edited no file and changed no git state. I took no lease, ran no benchmark, no GPU gate and no `box.sh`. On the box I ran only read-only commands over `ssh ws`: `nvidia-smi --query-gpu=…`, `free -b`, `numactl -H`, and two read-only NVML queries that are not in your literal list (`nvidia-smi topo -p2p r` and `nvidia-smi topo -m`). The scripts are in `<scratch>/b1d/`:
 - `inv.py` parses `docs/v41-inventory.md` into `inv.json`.
 - `derive.py` gives per-type and per-role bytes.
 - `v2lite.py` checks the resident formula against the V2-Lite records.

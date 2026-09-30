@@ -2,7 +2,7 @@
 
 2026-09-26. opus 서브에이전트 설계 라운드 `fixture`의 보고 원문이다(스펙 `specs/wave-m6/spec-fixture.md`, 박스 없음). [유도] 수치는 라운드의 추론이다. 리드가 원본에서 확인한 것과 처분은 `docs/plan-triage.md`의 fixture 항목에 적는다.
 
-## 보고 (`fixture`, 워크트리 `/Users/hckim/repo/bloomery-fixture`, base `d2e25a5`)
+## 보고 (`fixture`, 워크트리 `~/repo/bloomery-fixture`, base `d2e25a5`)
 
 박스는 쓰지 않았고 파일도 쓰지 않았습니다. git 상태는 바꾸지 않았고, 사용자 직접 입력은 없었습니다.
 

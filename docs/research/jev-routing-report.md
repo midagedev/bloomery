@@ -181,13 +181,13 @@ and compare it against **22.8 tok/s**, which is what the *exact* draft+verify pa
 
 Report only — I changed nothing.
 
-- `/Users/hckim/repo/bloomery/docs/plan.md:25` — stage-4's "빠른/느린 모델 라우팅" is the whole (b) category compressed to five words with no pass criterion for what decides or what the decision may cost.
-- `/Users/hckim/repo/bloomery/docs/plan.md:81` — C4 says "k* ≈ 2.2 실측" while `:124` opens MUL-43 with a τ threshold of 1.3/1.5; two speculative-decoding numbers in one file with no line relating them.
-- `/Users/hckim/repo/bloomery/docs/plan.md:121` — the CPU tok/s table stops at 2026-09-20 and delegates to `HANDOFF.md`; plan.md is no longer the single owner of its own scoreboard.
-- `/Users/hckim/repo/bloomery/docs/plan.md:246` — a measured negative result (THP never fired, `AnonHugePages` 0 kB, effect unconfirmed) is buried *inside the argument list of a code span*, `madvise(MADV_HUGEPAGE — …)`; it reads as a code sample and is easy to miss as a finding.
-- `/Users/hckim/repo/bloomery/docs/research/hybrid.md:49` — every multiplier in that doc is gated on WKS-35 (β_h 147.7 vs 215–233) with no owner or date on the blocker.
-- `/Users/hckim/repo/bloomery/docs/research/hybrid-lit-report.md:424` — the ReMoE row carries +26.4 %/+27.2 % numbers in a table while its own read-level column says "abstract/secondary only — not obtained".
-- `/Users/hckim/repo/bloomery/docs/research/hybrid-lit-report.md:576` — CoX-MoE (arXiv 2605.17889) is the one paper that might pre-empt our row-splitting lever and its PDF would not extract; still unread.
-- `/Users/hckim/repo/bloomery/docs/research/hybrid-engines.md:47` — the `model.py` read pass on V4.1's one-sublayer-late hyper-connection is an open TODO with no owner, and it is the only thing standing between "cross-layer overlap is impossible" and a possible exact win.
+- `docs/plan.md:25` — stage-4's "빠른/느린 모델 라우팅" is the whole (b) category compressed to five words with no pass criterion for what decides or what the decision may cost.
+- `docs/plan.md:81` — C4 says "k* ≈ 2.2 실측" while `:124` opens MUL-43 with a τ threshold of 1.3/1.5; two speculative-decoding numbers in one file with no line relating them.
+- `docs/plan.md:121` — the CPU tok/s table stops at 2026-09-20 and delegates to `HANDOFF.md`; plan.md is no longer the single owner of its own scoreboard.
+- `docs/plan.md:246` — a measured negative result (THP never fired, `AnonHugePages` 0 kB, effect unconfirmed) is buried *inside the argument list of a code span*, `madvise(MADV_HUGEPAGE — …)`; it reads as a code sample and is easy to miss as a finding.
+- `docs/research/hybrid.md:49` — every multiplier in that doc is gated on WKS-35 (β_h 147.7 vs 215–233) with no owner or date on the blocker.
+- `docs/research/hybrid-lit-report.md:424` — the ReMoE row carries +26.4 %/+27.2 % numbers in a table while its own read-level column says "abstract/secondary only — not obtained".
+- `docs/research/hybrid-lit-report.md:576` — CoX-MoE (arXiv 2605.17889) is the one paper that might pre-empt our row-splitting lever and its PDF would not extract; still unread.
+- `docs/research/hybrid-engines.md:47` — the `model.py` read pass on V4.1's one-sublayer-late hyper-connection is an open TODO with no owner, and it is the only thing standing between "cross-layer overlap is impossible" and a possible exact win.
 
 DONE-jev

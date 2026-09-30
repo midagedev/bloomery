@@ -271,9 +271,9 @@ LDGSTS와 LDG만 보면 ×1.693입니다.
 **모델**: opus(Opus 5.5)로 스폰되어 돌았고, 사용자 직접 입력은 없었습니다.
 
 **산출물**
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/ncu/parse.py`
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/ncu/phases.py`
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/ncu/loop.txt` (루프 명령별 덤프)
-- `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/ncu/gemm_q4k.cond` (소스 페이지 SASS 요약 리스팅)
+- `<scratch>/ncu/parse.py`
+- `<scratch>/ncu/phases.py`
+- `<scratch>/ncu/loop.txt` (루프 명령별 덤프)
+- `<scratch>/ncu/gemm_q4k.cond` (소스 페이지 SASS 요약 리스팅)
 
 세션 스크래치라 세션이 다시 시작되면 지워집니다.

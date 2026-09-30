@@ -377,5 +377,5 @@
 ## 7. 실행 모델
 - Opus 5.5(`claude-opus-5-5[1m]`)로 돌았다. 사람 사용자는 이 세션에 아무것도 입력하지 않았다.
 - 박스에 쓴 것은 `/root/bloomery-scratch/b4plan/`뿐이다. GGUF에서 추출한 작은 텐서 바이트와 스크립트 둘, 28 MB이고 지워도 된다.
-- 검증 스크립트는 세션 스크래치 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/e5714b41-3850-42be-a722-79e1f225c3b5/scratchpad/b4plan/`에 있다: `chk1.py`–`chk10.py`, `chk8b.py`, `ggufti.py`, `sweep.py`, `d/`는 복사한 덤프 파일.
+- 검증 스크립트는 세션 스크래치 `<scratch>/b4plan/`에 있다: `chk1.py`–`chk10.py`, `chk8b.py`, `ggufti.py`, `sweep.py`, `d/`는 복사한 덤프 파일.
 - 리드에게는 인덱스 키 발견을 한 줄로 먼저 보냈다.

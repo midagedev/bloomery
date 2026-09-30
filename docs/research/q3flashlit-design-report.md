@@ -222,7 +222,7 @@ q3fa/FA2 비는 측정이 1.50이고 모형은 모두 ≤ 1.24입니다. **세 �
   - llama.cpp: `fattn-mma-f16.cuh:62, :642-644, :803, :994-1003, :1090, :1908-1924`, `fattn.cu:190`, `CMakeLists.txt:186`
   - 백서: 로컬 사본 `ga102.txt:355`(L2 6,144 KB), `:378`(L0, 크기 표기 없음), `:997`(텐서코어당 128 FMA), A6000 표 `:559-582`
   - 측정: rig-log `log/2026-09-26.md` #mrs-nsys·#q3fa-ab, `log/2026-09-25.md:565`
-- **산출물(스크래치)** `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/`
+- **산출물(스크래치)** `<scratch>/`
   - SASS 목록: `fa2.sass`, `main_flash.sass`, `q3fa_flash.sass`
   - 스크립트: `seg.py`, `sim.py`, `sim4.py`, `runsim.py`, `sched.py`, `sched2.py`, `l2lru.py`
 - **편차**

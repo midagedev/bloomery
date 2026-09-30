@@ -1,6 +1,6 @@
 # Intel CPU 기반 LLM 구동 — 최근 자료 조사 (2025~2026 중심)
 
-작성 2026-09-20. 조사 범위: 웹 공개 자료만(WebSearch/WebFetch). 대상: Intel의 CPU LLM 추론 기술 중 **알고리즘/스케줄링/메모리 계층 자산**. 산출 기준 원장: `/Users/hckim/repo/bloomery/docs/RESULTS-mul35-saturation.md`(2026-09-20).
+작성 2026-09-20. 조사 범위: 웹 공개 자료만(WebSearch/WebFetch). 대상: Intel의 CPU LLM 추론 기술 중 **알고리즘/스케줄링/메모리 계층 자산**. 산출 기준 원장: `docs/RESULTS-mul35-saturation.md`(2026-09-20).
 
 **우리 박스 제약(이식성 판정 기준)**: AMD 5975WX Zen 3, 32코어 단일 소켓·단일 NUMA, AVX2+FMA+F16C+BMI2+VAES+VPCLMULQDQ까지(AVX-512·VNNI·AMX·GFNI 없음), STREAM 147.7 GB/s.
 **원장 병목 코드**: (A) flash_attn_latent 스칼라 벽 #1 사이트 18.8% — (B) 오케스트레이션 잔여 ~10.2 ms/step(예측 변수 = 디스패치당 바이트) — (C) 직렬 activation quant 4.03 ms — (D) swiglu 직렬 1.37 ms — (E) lm_head Q6_K 유일 대역폭 벽(81% STREAM) — (F) q_nope2 Q8_0 스칼라. **진행 중(본 조사에서 중복 취급 금지)**: flash SIMD화, 직렬 quant 풀 이양, Q8_0 내적 maddubs화.

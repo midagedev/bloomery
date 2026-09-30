@@ -147,7 +147,7 @@ IMMA R36←R28,R40 8(SB1 대기) · IMMA R40←R32,R42 11 · UIADD3 5 · IMAD×8
 
 ## E. 모형과 적합 (Q3)
 
-**모형:** GA10x SM 하나를 사이클 단위로 도는 이산 사건 시뮬레이션입니다. 스크립트는 레포 밖 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m6/q3gemmlat-model/`에 있습니다(리드가 세션 스크래치에서 옮김).
+**모형:** GA10x SM 하나를 사이클 단위로 도는 이산 사건 시뮬레이션입니다. 스크립트는 레포 밖 `<specs>/wave-m6/q3gemmlat-model/`에 있습니다(리드가 세션 스크래치에서 옮김).
 - 추출한 SASS 경로를 명령 단위로 돌립니다(ptxas stall, 스코어보드).
 - 서브코어 4개가 각각 사이클당 1 발행(LRR/GTO). 텐서 16, IMAD/ALU 2(IMAD.WIDE 4).
 - L1TEX는 사이클당 1 파면이고, 공유 메모리 요청(포트 64 B/clk, LDS 21 + 2k)과 전역 반환(L2 200 / L1 33)이 나눠 씁니다. 중재는 fifo / rr / split.
@@ -312,7 +312,7 @@ base 커널에 PC 샘플링을 겁니다(`gate_p8 --bench-kernels --bench-arm ge
 
 ## 1. 바뀐 파일
 
-없습니다(레포, 박스 모두). 박스 `/tmp/q3gemmlat-sass`는 만들었다가 지웠습니다. 모형 스크립트는 레포 밖 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m6/q3gemmlat-model/`에 있습니다(리드가 세션 스크래치에서 옮김).
+없습니다(레포, 박스 모두). 박스 `/tmp/q3gemmlat-sass`는 만들었다가 지웠습니다. 모형 스크립트는 레포 밖 `<specs>/wave-m6/q3gemmlat-model/`에 있습니다(리드가 세션 스크래치에서 옮김).
 
 ## 2. 실행한 명령과 실제 출력
 

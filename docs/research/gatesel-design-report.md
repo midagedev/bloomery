@@ -2,9 +2,9 @@
 
 2026-09-26. opus 서브에이전트 설계 라운드 `gatesel`의 보고 원문이다(스펙 `specs/wave-m6/spec-gatesel.md`, 박스 없음, git과 착륙 로그만 읽음). [유도] 수치는 라운드의 추론이다. 리드가 원본에서 확인한 것: `Gpu::with_device`가 같은 번들을 아홉 번 적재한다(`crates/gpu/src/lib.rs:1877-1886` — `kernels::load`와 `XKernels::load` 여덟), `ptx::normalize`가 번호 붙은 생성 심볼을 줄기로 지워 엔트리 digest가 전역 초기값·공유 메모리 크기를 보지 않는다(`crates/gpu-gates/src/ptx.rs:418-442`). 처분은 `docs/plan-triage.md`의 gatesel 항목에 있다.
 
-## 보고 (`gatesel`, 워크트리 `/Users/hckim/repo/bloomery-gatesel`, base `af929ae`)
+## 보고 (`gatesel`, 워크트리 `~/repo/bloomery-gatesel`, base `af929ae`)
 
-**gatesel 설계 보고.** 박스는 쓰지 않았고 저장소에는 아무것도 쓰지 않았습니다. git은 읽기만 했고, 사용자가 제 세션에 직접 입력한 것은 없습니다. 스크래치 파일은 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/gatesel/`에 있습니다: `rustitems.py`, `backtest.py`, `wall.py`, `bt-all2.tsv`, `aff-*.txt`, `dry-all.txt`.
+**gatesel 설계 보고.** 박스는 쓰지 않았고 저장소에는 아무것도 쓰지 않았습니다. git은 읽기만 했고, 사용자가 제 세션에 직접 입력한 것은 없습니다. 스크래치 파일은 `<scratch>/gatesel/`에 있습니다: `rustitems.py`, `backtest.py`, `wall.py`, `bt-all2.tsv`, `aff-*.txt`, `dry-all.txt`.
 
 **결론:** 지금까지의 착륙 이력에서는 증명으로 건너뛸 수 있는 항목이 아주 적습니다.
 - 소스 수준 방안(c)은 백테스트에서 사실상 0이라 만들지 않는 것이 맞습니다.

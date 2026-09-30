@@ -1,7 +1,7 @@
 # Three ik_llama.cpp ports of DeepSeek-V4.1-Flash, read side by side
 
 Investigation only. Nothing was modified in any source tree; no git write commands were run.
-Read against `/Users/hckim/repo/bloomery/docs/research/v41-ops.md` and `v41-ops-report.md` — the
+Read against `docs/research/v41-ops.md` and `v41-ops-report.md` — the
 reference math is taken from there and not re-derived. Claims marked **inferred** are mine, not
 the trees'.
 
@@ -9,9 +9,9 @@ the trees'.
 
 | alias | tree | HEAD | `main` |
 |---|---|---|---|
-| `mine` | `/Users/hckim/repo/upstream/v41-ports/mine` | `c10fbbcc` | `3bb386eb` |
-| `skel` | `/Users/hckim/repo/upstream/v41-ports/skelectric` | `2154c9fc` | `3bb386eb` |
-| `phyl` | `/Users/hckim/repo/upstream/v41-ports/phylliida` | `0b9a772a` | `3bb386eb` |
+| `mine` | `~/repo/upstream/v41-ports/mine` | `c10fbbcc` | `3bb386eb` |
+| `skel` | `~/repo/upstream/v41-ports/skelectric` | `2154c9fc` | `3bb386eb` |
+| `phyl` | `~/repo/upstream/v41-ports/phylliida` | `0b9a772a` | `3bb386eb` |
 
 `git rev-parse 3bb386eb` resolves in all three (`3bb386eb68ffee0a5dc7db21da0735d594929eeb`), so the
 spec's premise holds. But **`main..HEAD` is not the port's work**: each branch also carries ik

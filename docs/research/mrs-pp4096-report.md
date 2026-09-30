@@ -256,7 +256,7 @@ A6000에서, 임대 안에서 돌립니다. 벽시계는 적재 + 요청 두 번
 
 ## 8. common.md 절
 
-1. **변경 파일: 없음.** 스크래치에만 사본을 두었습니다: `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/{gh-issues.txt,gh-prs.txt,master/,tree/,ga102.txt,ampere-tuning.html}`
+1. **변경 파일: 없음.** 스크래치에만 사본을 두었습니다: `<scratch>/{gh-issues.txt,gh-prs.txt,master/,tree/,ga102.txt,ampere-tuning.html}`
 
 2. **판정을 싣는 읽기 전용 명령의 출력.** 게이트는 없는 조사 라운드입니다.
    - `mistralrs-cli-89b1636c39f8875b/bin-mistralrs.json features= ["code-execution", "cuda", "default"]`

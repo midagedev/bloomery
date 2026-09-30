@@ -1,6 +1,6 @@
 # MUL-35 트랙 A 원장 — 스텝의 각 사이트는 대역폭 한계인가, 커널 한계인가, 오케스트레이션 한계인가
 
-작성 2026-09-20. 입력: `/tmp/mul35/satdiag-n96.txt`(96스텝 디코드, BLOOMERY_PROFILE=1·=2, 임대 06:04:01Z), `/tmp/mul35/satdiag-n8.txt`(동일 형식, 임대 06:04:57Z), `/Users/hckim/repo/rig-log/log/2026-09-20-{a,d,e,f}-*.md`, `/Users/hckim/repo/bloomery/crates/qdot/src/lib.rs`, `/Users/hckim/repo/bloomery/crates/model/src/{attn,ops,moe,ffn,profile}.rs`, `/Users/hckim/repo/bloomery/crates/threads/src/lib.rs`. 박스 미접촉, 저장소 미기록.
+작성 2026-09-20. 입력: `/tmp/mul35/satdiag-n96.txt`(96스텝 디코드, BLOOMERY_PROFILE=1·=2, 임대 06:04:01Z), `/tmp/mul35/satdiag-n8.txt`(동일 형식, 임대 06:04:57Z), `~/repo/rig-log/log/2026-09-20-{a,d,e,f}-*.md`, `crates/qdot/src/lib.rs`, `crates/model/src/{attn,ops,moe,ffn,profile}.rs`, `crates/threads/src/lib.rs`. 박스 미접촉, 저장소 미기록.
 
 **실행 요약.** N=96 디코드 96스텝: 레벨1 3,064.93 ms = **31.3221 tok/s(스텝 평균 31.93 ms)**, 스텝 27.5–37.2 ms, 스프레드 35.3%; 레벨2 2,897.75 ms = 33.1291 tok/s(30.19 ms), 스프레드 49.7%(n96:150-151, 339-340). 커버리지 97.9/98.1%. 위트니스: loadavg 0.33, PSI cpu/io avg10 0.00, GPU 2장 0%/30W/20W — 측정 중 외부 간섭 없음(n96:5-11, 184-190). 같은 임대 ik 82.78 ± 0.10(rig-log 2026-09-20-f:5) → 배수 산술: 82.78/31.32 = **2.64**(N=96 페어링, 계산값). 로그의 "남은 배수 2.30"은 N=8 페어링(82.78/35.999, 2026-09-20-f:5)이며 이 원장은 2.64를 N=96 격차로 사용한다.
 

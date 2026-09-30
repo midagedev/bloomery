@@ -2,7 +2,7 @@ ktok 라운드를 마쳤습니다. 지도, 설계 셋, 측정 하나가 모두 �
 
 ## 1. 바꾼 파일
 
-- `/Users/hckim/repo/bloomery-ktok/crates/model/src/bin/bench_v41_host.rs` 한 파일만 바꿨고, 탐침 코드는 전부 여기에 있습니다.
+- `~/repo/bloomery-ktok/crates/model/src/bin/bench_v41_host.rs` 한 파일만 바꿨고, 탐침 코드는 전부 여기에 있습니다.
   - 팔 문법에 `<shape>:<n_host>x<rows>`를 더했고, 새 모양 `engine-sep`(행마다 따로 호출)와 `engine_rows_layer`(모든 행을 그룹 하나로)를 넣었습니다.
   - 기본 팔과 `--check`는 그대로입니다. 행 1의 추첨 `draw(n_host·1)`은 이전 추첨과 같고, `check()`는 `engine_layer`를 직접 부릅니다.
   - 행들은 작업 집합 24슬롯에서 한 번에 뽑은 `n_host·rows`개의 서로 다른 expert를 나눠 가져서 겹치지 않습니다. 행마다 활성 열도 다릅니다. 스펙이 제안한 `+i·64 mod 384`와 같은 효과입니다. 브랜치를 버릴지 레버로 남길지는 리드가 정합니다.

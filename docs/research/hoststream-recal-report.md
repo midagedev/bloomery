@@ -13,7 +13,6 @@
 
 ---
 
-== /Users/hckim/.claude/projects/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/subagents/agent-ahoststream-recal-f5ff670d7f9010a9.jsonl ==
 어드바이저 점검을 반영해 보고를 씁니다. 하나를 추가로 확인했습니다. 보고서의 "링 185 = 디코드 약 −6 %"는 601개 전문가 구간의 기울기를 185슬롯에 그대로 쓴 값이라 약 3배 과대로 보입니다. 이 점은 스펙 밖 항목에 넣습니다.
 
 ## hoststream-recal 보고 (조사, 저장소 변경 없음, opus)
@@ -31,7 +30,7 @@
 - **lcg-uni**는 보고서의 균등 모형이고, 타이밍 러너가 재는 프롬프트입니다.
 
 ### 1. 바꾼 파일
-저장소 파일은 하나도 바꾸지 않았습니다. 스크래치 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/02d044bc-8d2a-4055-91fa-4ae541a4916f/scratchpad/hs/`에 만든 것:
+저장소 파일은 하나도 바꾸지 않았습니다. 스크래치 `<scratch>/hs/`에 만든 것:
 - `counts.tsv`: 박스에서 한 번 읽은 원본입니다.
 - `recal-curve.py`: 층별 순위 곡선을 만듭니다.
 - `recal-model.py`: sim.py를 전문가별 Binomial(T, λ_e/512)로 바꾸고, 그룹 union 꼬리와 오늘의 카드 창 안 항을 더했습니다.

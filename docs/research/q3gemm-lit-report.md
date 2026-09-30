@@ -32,14 +32,14 @@ mistral.rs 쪽 리서치"를 물어 연 라운드이고, `q3next-design`의 레�
 - `XM=/home/user/exllamav3-src/exllamav3/modules/`
 - `C=/home/user/.cudaforge/git/checkouts/cutlass-7127592069c2fe01/include/cutlass/`
 - `L=/home/user/llama.cpp-mainline/ggml/src/ggml-cuda/`
-- `G=/Users/hckim/repo/bloomery/crates/gpu/src/gemm.rs`
+- `G=crates/gpu/src/gemm.rs`
 
 ## 1. 바뀐 파일
 없습니다. 연구 라운드라 편집, 빌드, 게이트, 시간 재는 실행이 없습니다. 다른 에이전트에게 메시지도 보내지 않았습니다.
 
 ## 2. 실행한 것 (읽기만)
 
-박스 읽기는 약 15회이고, 모두 `/Users/hckim/repo/bloomery`에서 `./tools/box.sh '<read>'`로 했습니다. 참조 소스는 `tar | base64`로 스크래치패드에 복사해 읽었고, 박스에는 아무것도 쓰지 않았습니다. 트리 커밋은 다음과 같습니다(git log 대신 `.git/HEAD`와 ref 파일로 확인, git 설정은 건드리지 않음).
+박스 읽기는 약 15회이고, 모두 `~/repo/bloomery`에서 `./tools/box.sh '<read>'`로 했습니다. 참조 소스는 `tar | base64`로 스크래치패드에 복사해 읽었고, 박스에는 아무것도 쓰지 않았습니다. 트리 커밋은 다음과 같습니다(git log 대신 `.git/HEAD`와 ref 파일로 확인, git 설정은 건드리지 않음).
 
 | 트리 | 커밋 |
 |---|---|
@@ -65,7 +65,7 @@ mistral.rs 바이너리는 이 트리에서 빌드된 것입니다. `.git/logs/H
 
 ### 종이 위 분해와 자원 시간선 (round 규칙)
 - **단위:** T=4096의 꽉 찬 Q4_K 블록-스텝 하나(128×64×128)입니다.
-- **항:** 설계 라운드의 L1TEX 파면 예산(`/Users/hckim/repo/bloomery/docs/research/q3next-design-report.md` §3)을 그대로 씁니다. 2,496 = 가중치 1,024 + B 프래그먼트 LDS 512 + s8 LDS 512 + d8 128 + 활성값 cp.async 약 320. A 뒤에는 1,880입니다.
+- **항:** 설계 라운드의 L1TEX 파면 예산(`docs/research/q3next-design-report.md` §3)을 그대로 씁니다. 2,496 = 가중치 1,024 + B 프래그먼트 LDS 512 + s8 LDS 512 + d8 128 + 활성값 cp.async 약 320. A 뒤에는 1,880입니다.
 - **시간선(GEMM 런치 하나):**
   - 호스트 CPU: enqueue 몇 µs뿐이고 카드와 겹칩니다.
   - PCIe, 호스트 DRAM, NVMe: 0.
@@ -163,7 +163,7 @@ regs는 모두 미측정입니다(빌드와 `ptxas -v`를 돌리지 않았습니
 - 우리 쪽 선례: last-arrival 티켓 방식은 디코드 커널에서 +133 µs로 측정됐습니다(rig-log `log/2026-09-25.md#qwen3fuse-regression-nsys`의 (c)).
 - **B′가 비트 동일인 이유(구성상):**
   - `GEMM_BM` = 128이 down 입력의 q8_1 128값 블록과 정확히 겹치므로, 한 블록이 열의 128값을 모두 가집니다.
-  - `q8_1_quant_vals`(`/Users/hckim/repo/bloomery/crates/gpu/src/lib.rs:420`)는 레지스터의 값을 받는 코어입니다. `gemm_swiglu_quant`도 이 함수를 부릅니다(`G:1487`).
+  - `q8_1_quant_vals`(`crates/gpu/src/lib.rs:420`)는 레지스터의 값을 받는 코어입니다. `gemm_swiglu_quant`도 이 함수를 부릅니다(`G:1487`).
   - amax는 max라 순서에 무관하고, s8은 정수 합이며, 코드는 값마다 독립입니다.
 
 ## Q4. 전문가 불균형과 타일 스케줄
@@ -200,7 +200,7 @@ regs는 모두 미측정입니다(빌드와 `ptxas -v`를 돌리지 않았습니
 | 요소 (출처) | 계약 | L1TEX Δ / A 파라미터 | 판정 |
 |---|---|---|---|
 | 가중치 cp.async → smem, 활성값과 같은 commit 그룹 (셋 모두) | 바이트 동일 | 가중치 1,024 → 약 408 (설계) | **A 그 자체, go** |
-| 단 수 4 (Marlin, CUTLASS) / 3 (exl3 MoE) | — | 3단 = 3 × (10,496 + 10,240) + 512 = 62,720 B → 2 × 63,744 > 102,400이라 **1블록/SM**. 우리 스텝 벽시계는 2 × 3,780–4,000 ≈ 7,600–8,000 cyc(A 뒤 ≈5,700–6,000)로 전역 지연(수백–1,000 cyc [가정])의 5배 이상. CUTLASS 스텝은 k=32 = 128×128×32/512 MAC/clk ≈ 1,024 cyc라 4단이 필요. 동적 smem은 레포에 선례 있음(`/Users/hckim/repo/bloomery/crates/gpu/src/flash.rs:1247` `dynamic_shared = 56064,`), 막는 것은 점유율뿐 | **2단 유지** |
+| 단 수 4 (Marlin, CUTLASS) / 3 (exl3 MoE) | — | 3단 = 3 × (10,496 + 10,240) + 512 = 62,720 B → 2 × 63,744 > 102,400이라 **1블록/SM**. 우리 스텝 벽시계는 2 × 3,780–4,000 ≈ 7,600–8,000 cyc(A 뒤 ≈5,700–6,000)로 전역 지연(수백–1,000 cyc [가정])의 5배 이상. CUTLASS 스텝은 k=32 = 128×128×32/512 MAC/clk ≈ 1,024 cyc라 4단이 필요. 동적 smem은 레포에 선례 있음(`crates/gpu/src/flash.rs:1247` `dynamic_shared = 56064,`), 막는 것은 점유율뿐 | **2단 유지** |
 | `ldmatrix` (참조는 f16 A에만 씀. 양자화 B는 Marlin/exl3 모두 재배열 + LDS) | 동일 바이트 | qs에 `ldmatrix.x4` 두 번(행 g, g+8 × 청크 4개. 행 주소 16 B 단위 5g+c mod 8이 모두 다름) = 8파면 = LDS.32 8개와 **동일**. issue만 워프-스텝당 −6(752의 0.8 %) | 0 |
 | swizzle 대신 20워드 피치 (CUTLASS `:185`, exl3 `:133`, Marlin `:578`은 모두 2의 거듭제곱 f16 행) | — | WT 피치 20워드는 헤더 16 + qs 64 B로 **패딩이 0**. 뱅크 {0,20,8,28,16,4,24,12}+t가 LDS.32에서 모두 다르고, LDS.128은 5g mod 8로 모두 다름 | 0 (피치 유지) |
 | 활성값 패딩 제거 (`G:99` 36 → 32워드 + XOR) | — | 0파면, 단당 −1,024 B. s8을 i16으로 바꾸면(A3) 활성값 2단 + 가중치 3단 = 17,920 + 30,720 + 512 = 49,152 ≤ 50,176이 되지만, 3단 자체가 불필요 | 보류 |
@@ -259,7 +259,7 @@ regs는 모두 미측정입니다(빌드와 `ptxas -v`를 돌리지 않았습니
 ## 5. 스펙 밖 개선 지점 (보고만)
 - `G:76-78`: "sixteen warps … hides a step's weight loads"는 A 뒤에 사실이 아니게 됩니다. A와 함께 고칠 주석입니다. XS.
 - `G:99`: `B_COL_W` 4워드 패딩은 단당 1,024 B입니다. smem이 묶일 때(3단, B′+BN128) XOR swizzle로 회수할 수 있습니다. S.
-- `/Users/hckim/repo/bloomery/docs/research/q3next-design-report.md:89`, `:206`, `:207`, `:208`: 위 정정 (2), (4), (3), (1)입니다. 리드 문서라 손대지 않았습니다. XS.
+- `docs/research/q3next-design-report.md:89`, `:206`, `:207`, `:208`: 위 정정 (2), (4), (3), (1)입니다. 리드 문서라 손대지 않았습니다. XS.
 - 업스트림 후보(mistral.rs): pp4096이 pp512보다 토큰당 2.6배 느린데 MoE GEMM 경로는 같습니다. nsys 한 번으로 P² 항인지 확인하면 이슈가 될 수 있습니다. S(조사).
 - 업스트림 참고(mistral.rs packed affine): Q4_K의 `d·sc`를 그룹마다 f16으로 반올림합니다(`repack.cu:265`, `:411`). 설계상 선택이라 결함은 아니지만, 정밀도 비교 때 알아둘 반올림입니다. XS.
 

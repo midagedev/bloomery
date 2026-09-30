@@ -46,7 +46,7 @@
 ## 1. 바꾼 파일
 
 저장소 파일은 없습니다. 계산 스크립트는 스크래치에만 있습니다.
-- 스크립트: `/private/tmp/claude-501/-Users-hckim-repo-bloomery/b4e4a3ef-e524-4e47-91af-3afadc891c1e/scratchpad/h3b/{pred.py,pred_add.py,timeline.py,dma.py,partc.py}`
+- 스크립트: `<scratch>/h3b/{pred.py,pred_add.py,timeline.py,dma.py,partc.py}`
 - 출력: 같은 디렉터리의 `*.out`
 - hoststream-recal 모형(`…/02d044bc…/scratchpad/hs/recal-model.py` 등)은 읽기 전용으로 import했습니다(`dont_write_bytecode`).
 

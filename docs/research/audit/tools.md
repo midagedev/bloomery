@@ -1,6 +1,6 @@
 # audit-tools (TL) 보고
 
-경로는 모두 `/Users/hckim/repo/bloomery` 기준 상대 경로입니다. rig-log는 `/Users/hckim/repo/rig-log`(`9e223e4`)입니다.
+경로는 모두 `~/repo/bloomery` 기준 상대 경로입니다. rig-log는 `~/repo/rig-log`(`9e223e4`)입니다.
 
 ## 0. 읽은 범위
 

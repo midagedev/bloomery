@@ -213,11 +213,11 @@ Queries executed across issues and PRs (both open and closed) via GitHub Search 
 
 ### 3.4 External PR Acceptance (Evidence of Non-NVIDIA Merged PRs)
 External PRs are actively merged. Five verified merged PRs by non-NVIDIA authors:
-1. **PR #291** ([https://github.com/NVlabs/cutile-rs/pull/291](https://github.com/NVlabs/cutile-rs/pull/291)): *"doc: fix data parallel MLP tutorial"* by `@notbowen` (Hu Bowen, `contact@hubowen.dev`). Signed-off.
-2. **PR #282** ([https://github.com/NVlabs/cutile-rs/pull/282](https://github.com/NVlabs/cutile-rs/pull/282)): *"fix: expose kernel cache eviction without autotuning"* by `@arcusbuilds` (Srijan Keshri, `srijankeshri007@gmail.com`). Signed-off.
-3. **PR #277** ([https://github.com/NVlabs/cutile-rs/pull/277](https://github.com/NVlabs/cutile-rs/pull/277)): *"fix(cuda-bindings): add WSL2 and multiarch driver paths to dynamic loader"* by `@emersonbusson` (Emerson Busson, `emersonbusson@gmail.com`).
-4. **PR #241** ([https://github.com/NVlabs/cutile-rs/pull/241](https://github.com/NVlabs/cutile-rs/pull/241)): *"fix: version persisted tuning cache keys"* by `@almightychang` (Sam, Joochul Chang, `almightychang@icloud.com`, RLWRLD, Inc.). Signed-off.
-5. **PR #204** ([https://github.com/NVlabs/cutile-rs/pull/204](https://github.com/NVlabs/cutile-rs/pull/204)): *"fix: adapt CUDA driver flag types"* by `@Heltion` (Heltion, `heltion@qq.com`). Signed-off.
+1. **PR #291** ([https://github.com/NVlabs/cutile-rs/pull/291](https://github.com/NVlabs/cutile-rs/pull/291)): *"doc: fix data parallel MLP tutorial"* by `@notbowen` (Hu Bowen). Signed-off.
+2. **PR #282** ([https://github.com/NVlabs/cutile-rs/pull/282](https://github.com/NVlabs/cutile-rs/pull/282)): *"fix: expose kernel cache eviction without autotuning"* by `@arcusbuilds` (Srijan Keshri). Signed-off.
+3. **PR #277** ([https://github.com/NVlabs/cutile-rs/pull/277](https://github.com/NVlabs/cutile-rs/pull/277)): *"fix(cuda-bindings): add WSL2 and multiarch driver paths to dynamic loader"* by `@emersonbusson` (Emerson Busson).
+4. **PR #241** ([https://github.com/NVlabs/cutile-rs/pull/241](https://github.com/NVlabs/cutile-rs/pull/241)): *"fix: version persisted tuning cache keys"* by `@almightychang` (Sam, Joochul Chang, RLWRLD, Inc.). Signed-off.
+5. **PR #204** ([https://github.com/NVlabs/cutile-rs/pull/204](https://github.com/NVlabs/cutile-rs/pull/204)): *"fix: adapt CUDA driver flag types"* by `@Heltion` (Heltion). Signed-off.
 *(Additional external merges: PR #190 by `@svenstaro` / Arch Linux, PR #188 by `@ivarflakstad`, PR #183 by `@Firestar99` / Vectorware Inc, PR #169 by `@fallintoplace`).*
 
 ### 3.5 Release Cadence of `cuda-core` on crates.io
@@ -397,7 +397,7 @@ fix(tests): use the upstream volatility interface
 
 Update the control-flow regression to query StoreOp through VolatilityOpInterface after the upstream volatility migration. Include vecadd and abi_hmm in the tracked rust-analyzer project settings.
 
-Signed-off-by: nihalpasham <nihalp@nvidia.com>
+Signed-off-by: nihalpasham <email removed>
 2026-09-20T10:52:57Z
 ```
 

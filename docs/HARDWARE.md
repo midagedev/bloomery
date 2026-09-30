@@ -1,12 +1,12 @@
 # Hardware
 
-bloomery is built for one kind of machine: one or two RTX 3090 cards, an AVX2 host with many memory channels, 256 GB of RAM and an NVMe drive. This page says what each part costs in a decode step. Every number carries its source; a number marked [derived] was computed, not measured.
+bloomery is built for one kind of machine: one RTX 3090, or an RTX A6000 with an RTX 3090, an AVX2 host with many memory channels, 256 GB of RAM and an NVMe drive. This page says what each part costs in a decode step. Every number carries its source; a number marked [derived] was computed, not measured.
 
 ## Target profile
 
 | | T1, the minimum | T2, extended | The development machine |
 |---|---|---|---|
-| GPU | RTX 3090 24 GB ×1, placement `gate`: ~~dense weights 7.66 GB plus 888 experts, 14.9 GB~~ 1,146 routed experts on the card (19.2 GB of expert weights), 14,214 on the host (rig-log [2026-09-27](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#e21-3090)) | RTX 3090 ×2: the second card runs the DSpark draft. Splitting the model across two cards is not built | RTX A6000 48 GB, placement (a): ~~2,414 routed experts, 40.5 GB,~~ 2,668 routed experts on the card, 12,692 on the host (rig-log [2026-09-24](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-first-timing)) |
+| GPU | RTX 3090 24 GB ×1, placement `gate`: ~~dense weights 7.66 GB plus 888 experts, 14.9 GB~~ 1,146 routed experts on the card (19.2 GB of expert weights), 14,214 on the host (rig-log [2026-09-27](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#e21-3090)) | RTX A6000 with an RTX 3090, placement `bp`: the model on the A6000, more routed experts and the DSpark draft on the 3090. Two RTX 3090s are not supported: a card is picked by its name, and two cards of one name are an error | RTX A6000 48 GB, placement (a): ~~2,414 routed experts, 40.5 GB,~~ 2,668 routed experts on the card, 12,692 on the host (rig-log [2026-09-24](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-first-timing)) |
 | CPU | AVX2, 8 DDR4 channels | same | Threadripper PRO 5975WX, 32 cores, 8 × DDR4-3600 |
 | RAM | 256 GB | same | 264 GB |
 | Storage | NVMe, for the engram table; the model's r8 sidecar needs 155.7 GB beside it ([`BUILD.md`](BUILD.md)) | same | NVMe |

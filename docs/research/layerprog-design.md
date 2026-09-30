@@ -15,7 +15,7 @@
 
 # `layerprogdesign` 보고 — 층 프로그램(DS6) 설계와 03의 Qwen3.6 본체가 지금 맞출 인터페이스
 
-읽기 전용 라운드로 끝났습니다. 트리는 `/Users/hckim/repo/bloomery-lpd`(`e039209`)이고, 편집·git·빌드·게이트·임대는 없었습니다. 박스에서는 참조 트리 읽기(`cat`, `sed -n`, `grep`, `ls`, `find`)와 `/usr/local/cuda/include/cuda.h` grep 한 번만 했습니다. 참조 트리의 커밋은 이렇습니다: ik `db517b69`(`ik-idxkey`, 브랜치 `v41/idxkey-fix`), llama.cpp mainline `53ed051ce`, mistral.rs `d5ae0f18f`, exllamav3 `0740edc`. 사용자가 이 세션에 직접 입력한 것은 없었습니다.
+읽기 전용 라운드로 끝났습니다. 트리는 `~/repo/bloomery-lpd`(`e039209`)이고, 편집·git·빌드·게이트·임대는 없었습니다. 박스에서는 참조 트리 읽기(`cat`, `sed -n`, `grep`, `ls`, `find`)와 `/usr/local/cuda/include/cuda.h` grep 한 번만 했습니다. 참조 트리의 커밋은 이렇습니다: ik `db517b69`(`ik-idxkey`, 브랜치 `v41/idxkey-fix`), llama.cpp mainline `53ed051ce`, mistral.rs `d5ae0f18f`, exllamav3 `0740edc`. 사용자가 이 세션에 직접 입력한 것은 없었습니다.
 
 **종이 위 분해.** 이 라운드의 항은 모두 코드에서 센 값이거나 이미 기록된 값입니다.
 - 층당 런치 수: `dispatch.rs:199-205`
