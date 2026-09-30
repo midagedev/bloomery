@@ -21,12 +21,14 @@ sd: 1.1 % rig-log 09-25#v41-prefill-s14, the larger of two per-round ratio SDs
 condition: the landed tree's generate_ds41, every arm with its levers set explicitly (no default decides an arm):
   BLOOMERY_AB_ROUNDS=2 BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resvideo-v41.card'
   just depth-gpu-ds41 prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=0
-  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=on and the same three at prose:4096; then one round
-  of the six with BLOOMERY_STEP_STATS=1 for the per-step host_slots (the hit curve). Every residency arm starts
+  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=on, the same three at prose:4096, and the three
+  prose:512 arms again with BLOOMERY_STEP_STATS=1 added for the per-step host_slots (the hit curve; their tok/s is
+  not read). Every residency arm starts
   from the seed (a `residency reset` or a fresh process, resrunner's check); every streaming row carries `call
   stream end` with admitted > 0 and kept 1, no other row one; no row [cold], [cpu-busy] or [other-busy]. Box time
-  14..20 min [derived: 18 arm processes at 16..36 s a load (fastupload, rig-log 09-30) plus the prompt (<= 11 s at
-  4096) and 96 decode steps (3 s), and the guards' idle waits]
+  18..27 min [derived: 18 arm processes (9 arms, 2 rounds) at 16..36 s a load (fastupload, rig-log 09-30) plus the prompt (<= 11 s at
+  4096) and 96 decode steps (3 s), and the guards' idle waits; callstream-pp-a took 12 min for 8 processes
+  with 75 s loads]
 decide-in: hand the rows, the per-step host_slots with their record paths and the call records to rig-log-6a for
   the video
 decide-below: split by arm: if the decode-rule arm is under +8 % over no residency, read its residency pass
