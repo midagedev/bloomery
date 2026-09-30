@@ -95,6 +95,9 @@ pub(crate) enum Kind {
     File,
     /// What the name's owner takes: a name no reading here parses.
     Text,
+    /// `off`, or the adaptive residency rule's `mid-p<P>-s<S>`
+    /// ([`residency_word`]).
+    Residency,
 }
 
 /// Why [`whole`] refused a number.
@@ -158,6 +161,15 @@ impl Kind {
             Kind::Path if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
             Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
             Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
+            Kind::Residency => match residency_word(v) {
+                Some(ResidencyWord::Off) => Ok(Value::Word("off")),
+                // Parsed once at `main`: the word lives for the process, as
+                // a listed word would.
+                Some(ResidencyWord::Mid { .. }) => {
+                    Ok(Value::Word(Box::leak(v.to_owned().into_boxed_str())))
+                }
+                None => Err(refused(None)),
+            },
             Kind::Path | Kind::File | Kind::Text => Err(refused(None)),
         }
     }
@@ -188,7 +200,36 @@ impl Kind {
             Kind::Path => "a non-empty path".to_string(),
             Kind::File => "the path of an existing regular file".to_string(),
             Kind::Text => "what its owner takes".to_string(),
+            Kind::Residency => {
+                format!("off, or mid-p<P>-s<S> with P and S whole numbers ({DIGITS}), S at least 1")
+            }
         }
+    }
+}
+
+/// A [`Kind::Residency`] value: what `BLOOMERY_RESIDENCY` asks a load for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidencyWord {
+    /// No machine: the load's slot map for the model's life.
+    Off,
+    /// The rule's `mid` parameters: `pinned` seed experts a layer never a
+    /// victim, `spares` free slots a layer.
+    Mid { pinned: usize, spares: usize },
+}
+
+/// `v` in the residency lever's grammar, the one owner of it: `off`, or
+/// `mid-p<P>-s<S>` with `P` and `S` whole numbers in base 10 with no sign or
+/// leading zero and `S` at least 1; `None` for anything else.
+#[must_use]
+pub fn residency_word(v: &str) -> Option<ResidencyWord> {
+    if v == "off" {
+        return Some(ResidencyWord::Off);
+    }
+    let (p, s) = v.strip_prefix("mid-p")?.split_once("-s")?;
+    let num = |t: &str| usize::try_from(whole(t).ok()?).ok();
+    match (num(p)?, num(s)?) {
+        (pinned, spares) if spares >= 1 => Some(ResidencyWord::Mid { pinned, spares }),
+        _ => None,
     }
 }
 
@@ -742,7 +783,7 @@ impl Levers {
     }
 
     /// `BLOOMERY_RESIDENCY` as set: `off`, or the adaptive residency rule's
-    /// word, whose grammar is `bloomery_gpu::host::swap::Residency::parse`;
+    /// word, whose grammar is [`residency_word`];
     /// `None` unset, which [`Levers::residency_at`] resolves.
     #[must_use]
     pub fn residency(&self) -> Option<&'static str> {
