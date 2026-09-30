@@ -186,12 +186,14 @@
 //!
 //! `BLOOMERY_STEP_STATS=1` on a qwen4exp file reads, before the first
 //! generated step and after each one, the host tier's counters
-//! (`HybridStats`), the process's page faults (`/proc/self/stat`) and the
-//! card's free device bytes, and prints, after the arm's other lines, one
+//! (`HybridStats`) with the go waits of the services since the read before,
+//! the process's page faults (`/proc/self/stat`) and the card's free device
+//! bytes (`host_stats::Probe`), and prints, after the arm's other lines, one
 //! `stat step` record a step (`record::STAT_STEP_HOST`: `served` layers,
-//! their summed `leg_us` and `host_slots`) and a `stat summary` over the
-//! steps past `--warm`. It also arms the ubatch walk's timing: after a
-//! prompt's `stat prompt host` line, one `stat prompt38 lb` record a
+//! their summed `leg_us` and `host_slots`, the go waits) and a
+//! `stat summary` over the steps past `--warm`. It also arms the ubatch
+//! walk's timing: after a prompt's `stat prompt host` line, one
+//! `stat prompt38 lb` record a
 //! layer-batch its ubatches served and a `stat prompt38 split` over them
 //! (the serve's wait and union beside the card time of every part). Unset,
 //! or on another file, nothing is read and nothing recorded.
@@ -246,6 +248,7 @@ mod cli {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
+    use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -396,9 +399,15 @@ mod cli {
         /// Fill the first `rows` cache rows with the body's synthetic
         /// pattern (`--seed-depth`).
         fn seed(m: &mut GpuModel<Self>, rows: usize) -> Result<(), GateError>;
-        /// The host tier's counters since load, for `BLOOMERY_STEP_STATS`;
-        /// `None` for a body with no host tier.
-        fn host_stats(_: &GpuModel<Self>) -> Result<Option<HybridStats>, GateError> {
+        /// One `BLOOMERY_STEP_STATS` probe of the body's host tier — its
+        /// counters since load, the go waits of the services since the probe
+        /// before, the process's page faults and the card's free device
+        /// bytes (`host_stats::Probe::read`); `None` for a body with no
+        /// host tier.
+        fn host_probe(
+            _: &GpuModel<Self>,
+            _prev: Option<&Probe>,
+        ) -> Result<Option<Probe>, GateError> {
             Ok(None)
         }
 
@@ -694,8 +703,8 @@ mod cli {
             Err(no_seed38(rows + 1))
         }
 
-        fn host_stats(m: &Qwen38Model) -> Result<Option<HybridStats>, GateError> {
-            Ok(Some(m.body("generate_qwen3moe")?.hybrid().stats()))
+        fn host_probe(m: &Qwen38Model, prev: Option<&Probe>) -> Result<Option<Probe>, GateError> {
+            Ok(Some(probe38(m, prev)?))
         }
 
         /// The trace's `call` row: the arm's prompt ids one step each from
@@ -1887,7 +1896,7 @@ mod cli {
         fn begin(&mut self, t: &Session<Body38>) -> Result<(), GateError> {
             if self.stats {
                 self.probes.reserve_exact(self.n_gen);
-                self.probes.push(probe38(t.model())?);
+                self.probes.push(probe38(t.model(), None)?);
             }
             Ok(())
         }
@@ -1909,7 +1918,7 @@ mod cli {
                 wall,
             ));
             if self.stats {
-                self.probes.push(probe38(t.model())?);
+                self.probes.push(probe38(t.model(), self.probes.last())?);
             }
             Ok(())
         }
@@ -2104,14 +2113,14 @@ mod cli {
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(n_gen - 1);
         let mut probes: Vec<Probe> = Vec::with_capacity(if run.stats { n_gen } else { 0 });
         if run.stats {
-            probes.extend(Probe::read(m)?);
+            probes.extend(B::host_probe(m, probes.last())?);
         }
         for _ in 1..n_gen {
             let t0 = Instant::now();
             next = m.step(&[next])?;
             rows.push((m.pos() - 1, next, t0.elapsed().as_secs_f64() * 1e3));
             if run.stats {
-                probes.extend(Probe::read(m)?);
+                probes.extend(B::host_probe(m, probes.last())?);
             }
         }
         let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
@@ -2184,126 +2193,8 @@ mod cli {
         Ok(())
     }
 
-    /// The counters one `BLOOMERY_STEP_STATS` read takes: the host tier's
-    /// since load, the process's page faults since start, and the card's
-    /// free device bytes now.
-    struct Probe {
-        hybrid: HybridStats,
-        majflt: u64,
-        minflt: u64,
-        vram_free: u64,
-    }
-
-    impl Probe {
-        /// One read of `m`; `None` for a body with no host tier.
-        fn read<B: Prompted>(m: &GpuModel<B>) -> Result<Option<Probe>, GateError> {
-            let Some(hybrid) = B::host_stats(m)? else {
-                return Ok(None);
-            };
-            let (minflt, majflt) = faults()?;
-            Ok(Some(Probe {
-                hybrid,
-                majflt,
-                minflt,
-                vram_free: u64::try_from(m.gpu().mem_info()?.0)?,
-            }))
-        }
-    }
-
     /// [`Probe::read`] of the qwen4exp body, which always has a host tier.
-    fn probe38(m: &Qwen38Model) -> Result<Probe, GateError> {
-        let (minflt, majflt) = faults()?;
-        Ok(Probe {
-            hybrid: m.body("generate_qwen3moe")?.hybrid().stats(),
-            majflt,
-            minflt,
-            vram_free: u64::try_from(m.gpu().mem_info()?.0)?,
-        })
-    }
-
-    /// The process's minor and major page faults since start: fields 10 and
-    /// 12 of `/proc/self/stat`, counted past the command's closing
-    /// parenthesis.
-    fn faults() -> Result<(u64, u64), GateError> {
-        let stat = std::fs::read_to_string("/proc/self/stat")?;
-        let rest = stat
-            .rsplit_once(')')
-            .map(|(_, r)| r)
-            .ok_or("/proc/self/stat: no command field")?;
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let at = |i: usize| -> Result<u64, GateError> {
-            Ok(fields
-                .get(i)
-                .ok_or_else(|| {
-                    format!("/proc/self/stat: {} fields past the command", fields.len())
-                })?
-                .parse::<u64>()?)
-        };
-        Ok((at(7)?, at(9)?))
-    }
-
-    /// One `stat step` record per generated step from the deltas of `probes`
-    /// (one read before the first generated step, one after each), then the
-    /// `stat summary` over the steps past `warm`; nothing without two reads.
-    /// `leg_us` and `host_slots` are summed over the step's `served` layers;
-    /// `vram_free` is the read after the step, not a delta.
-    fn print_stats(probes: &[Probe], warm: usize) {
-        let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
-        let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
-        let mut vram_free_min = u64::MAX;
-        for (k, w) in probes.windows(2).enumerate() {
-            let i = k + 1;
-            let (p, q) = (&w[0].hybrid, &w[1].hybrid);
-            let served = q.served - p.served;
-            let leg_us = (q.leg_ns - p.leg_ns) as f64 / 1e3;
-            let straggle_us = (q.straggle_ns - p.straggle_ns) as f64 / 1e3;
-            let host_slots = q.host_slots - p.host_slots;
-            let host_w2 = if served == 0 {
-                0.0
-            } else {
-                (q.host_w2 - p.host_w2) / served as f64
-            };
-            let (dmaj, dmin) = (w[1].majflt - w[0].majflt, w[1].minflt - w[0].minflt);
-            Record::new(&record::STAT_STEP_HOST)
-                .u("i", i)
-                .flag("warm", i <= warm)
-                .u("served", served)
-                .f("leg_us", leg_us)
-                .f("straggle_us", straggle_us)
-                .f("straggle_max_us", q.straggle_max_ns as f64 / 1e3)
-                .u("host_slots", host_slots)
-                .f("host_w2", host_w2)
-                .u("go_early", q.go_early - p.go_early)
-                .u("parks", q.parks_in_service - p.parks_in_service)
-                .u("majflt", dmaj)
-                .u("minflt", dmin)
-                .u("vram_free", w[1].vram_free)
-                .print();
-            if i > warm {
-                legs.push(leg_us);
-                straggle_max = straggle_max.max(straggle_us);
-                slots += host_slots;
-                majflt += dmaj;
-                minflt += dmin;
-                vram_free_min = vram_free_min.min(w[1].vram_free);
-            }
-        }
-        let n = legs.len();
-        if n == 0 {
-            return;
-        }
-        let mean = legs.iter().sum::<f64>() / n as f64;
-        legs.sort_by(f64::total_cmp);
-        Record::new(&record::STAT_SUMMARY_HOST)
-            .u("steps", n)
-            .f("leg_us_mean", mean)
-            .f("leg_us_p50", legs[n / 2])
-            .f("straggle_us_max", straggle_max)
-            .f("host_slots_mean", slots as f64 / n as f64)
-            .u("majflt", majflt)
-            .u("minflt", minflt)
-            .u("vram_free_load", probes[0].vram_free)
-            .u("vram_free_min", vram_free_min)
-            .print();
+    fn probe38(m: &Qwen38Model, prev: Option<&Probe>) -> Result<Probe, GateError> {
+        Probe::read(m.body("generate_qwen3moe")?.hybrid(), m.gpu(), prev)
     }
 }

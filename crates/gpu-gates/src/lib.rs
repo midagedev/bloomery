@@ -22,6 +22,8 @@ pub mod flip;
 #[cfg(feature = "deepseek41")]
 pub mod generate;
 pub mod hc_host;
+#[cfg(feature = "gpu")]
+pub mod host_stats;
 pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod kld;
