@@ -936,9 +936,10 @@ unsafe fn gated_norm_body<const PER_LANE: usize>(
     let n_sb = n_sb as usize;
 
     // Phase A: `norm_quant`'s sum of squares on this block's threads.
-    // tid < RMS_THREADS: the block is RMS_THREADS wide (the const assert
-    // beside FUSED_THREADS); x.len() >= k by this fn's contract.
-    let part = warp::reduce_sum_f32(rms_partial_sq(x, 0, k, tid));
+    // SAFETY: 0 + k <= x.len() by this fn's contract; tid < RMS_THREADS, the
+    // block being FUSED_THREADS = RMS_THREADS wide (the const assert beside
+    // FUSED_THREADS).
+    let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(x, 0, k, tid) });
     if lane == 0 {
         // SAFETY: wi < RMS_WARPS; one lane per warp writes its slot.
         unsafe { *ws.add(wi) = part };
@@ -1452,9 +1453,10 @@ mod qwen3moe_router_kernels {
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
-        // tid < RMS_THREADS: the block is RMS_THREADS wide (the const
-        // assert beside FUSED_THREADS); x.len() >= k by the launch contract.
-        let part = warp::reduce_sum_f32(rms_partial_sq(x, 0, k, tid));
+        // SAFETY: 0 + k <= x.len() (the launcher-checked `requires`); tid <
+        // RMS_THREADS, the contract's exact block width (the const assert
+        // beside FUSED_THREADS).
+        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(x, 0, k, tid) });
         if lane == 0 {
             // SAFETY: wi < RMS_WARPS; one lane per warp writes its slot.
             unsafe { *ws.add(wi) = part };
