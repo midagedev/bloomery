@@ -76,12 +76,13 @@
 #            variables. Refused by name before anything runs: a corpus file that is missing or
 #            unreadable (under --parse-arms one names itself on the arm's line instead), a P past its
 #            line count, a P < 1, a line among its first P that is not one id, and prose: on a
-#            reference or bin: arm — a corpus arm feeds our binary or a server (bin:…:prose:<P> is not
-#            this runner's arm; lcppsrv…:prose:<P> is, below).
+#            reference arm — a corpus arm feeds our binary, a second build (bin:<path>:prose:<P>) or a
+#            server (lcppsrv…:prose:<P>, below).
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
-#             two builds. It is a base by construction, so its freshness is not asked; its tree line
+#             two builds. bin:<path>:prose:<P> feeds it the prose arms' prompt, row label
+#             `bin:<tree>@prose`, in the prose table beside `prose:<P>`. It is a base by construction, so its freshness is not asked; its tree line
 #             (sha256, HEAD, dirty files) is printed with the references'. Every label is its own
 #             engine in the per-arm means and in the ratio table (ours / each other label).
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
@@ -529,8 +530,13 @@ q3_self_test() {
     "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --time --arm-sync"
   run_parse BLOOMERY_GEN_PLACE=b -- 6
   want place-bad 64 "BLOOMERY_GEN_PLACE is a (the A6000's plan) or gate (the 3090's)"
-  run_parse -- bin:/root/r/t/release/generate_qwen3moe:prose:512
-  want prose-bin 64 "a bin: arm is another build, run as it is (on the LCG prompt)"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
+  want prose-bin 0 \
+    "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
+  run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose
+  want prose-bin-nop 64 "bin:<path>:prose:<P> takes a prompt length P after prose:"
+  run_parse BLOOMERY_DATA="$pt/data" -- bin:/root/r/t/release/generate_qwen3moe:prose:900
+  want prose-bin-past 64 "a prose prompt of 900 ids"
   rm -rf "$pt"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
   [ "$fails" = 0 ]
@@ -696,13 +702,23 @@ for a in "${ARMS[@]}"; do
     bin:*)
       kind=bin eng=bin bin=${a#bin:}
       dep=${bin##*:} bin=${bin%:*}
-      if [ "${bin##*:}" = prose ] || [ "$dep" = prose ]; then
-        arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and a bin: arm is another build, run as it is (on the LCG prompt)"
+      corpus=''
+      if [ "${bin##*:}" = prose ]; then
+        # bin:<path>:prose:<P>: the other build on the corpus's first P ids, the prose arms' prompt.
+        corpus=1 bin=${bin%:prose}
+      elif [ "$dep" = prose ]; then
+        arm_refuse "$a" "bin:<path>:prose:<P> takes a prompt length P after prose:"
       fi
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
       label=bin:${tree##*/}
+      if [ -n "$corpus" ]; then
+        case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+        corpus_check "$a" "$dep"
+        tok=$(corpus_ids "$dep")
+        label+=@prose
+      fi
       ;;
     prose:*)
       # prose:<P>[@NAME=VALUE,...]: ours on the corpus's first P ids (the header's prose:<P>).
@@ -823,7 +839,7 @@ if [ -n "$PARSE_ONLY" ]; then
   lcg_prompt() { echo "<lcg_prompt $1>"; }
   for i in "${!ARMS[@]}"; do
     extra=
-    if [ "${A_ENG[$i]}" = prose ]; then
+    if [ "${A_ENG[$i]}" = prose ] || { [ "${A_KIND[$i]}" = bin ] && [ -n "${A_TOK[$i]}" ]; }; then
       f=$(corpus_file)
       if [ -r "$f" ]; then three=$(head -n 3 "$f" | paste -sd, -); else three=-; fi
       extra=" corpus=$f ids=$three"
