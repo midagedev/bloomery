@@ -40,6 +40,30 @@
 #             says which. Its row's tok/s is the SMOKE mean's, as ours'. After the tables, `ratio mtp d=`:
 #             ours / oursmtp per depth, paired by round (below 1: the draft is faster); oursmtp is in no
 #             other ratio table.
+#   <D>@NAME=VALUE[,NAME=VALUE...], oursmtp:<D>@NAME=VALUE[,...]   ours (or oursmtp) with those
+#             variables set for this arm's process only (`env NAME=VALUE ... <binary>`, after oursmtp's
+#             BLOOMERY_DRAFT=mtp): a lever arm, row label `ours@NAME=VALUE[,...]` (`oursmtp@…`), so two
+#             arms of one depth are two rows and two means. Beside a plain `<D>` arm it is the same-binary
+#             A/B, paired by round in the ratio table's `ours/ours@…` line, e.g. `512
+#             512@BLOOMERY_RESIDENCY=mid-p40-s1`; an oursmtp lever arm is in no ratio table, as oursmtp is
+#             in none but its own. Every arm here is a process of its own, so arms whose variables differ
+#             never share one. The list is checked as depth-qwen3moe.sh's is (tools/ref/lever-arms.sh), each
+#             refusal by name before anything runs: an empty list, item, name or value; white space; an
+#             item that is no NAME=VALUE; a bad variable name; `@` or `|` in a value; a name given twice; a
+#             name the runner's own environment already sets; a name that is no lever row of
+#             crates/levers/src/registry.rs (BLOOMERY_AB_LOAD included: this runner has no load driver).
+#             Also refused: BLOOMERY_DRAFT in any list (oursmtp:<D> is the drafted arm, and sets it), and
+#             `@` on a reference arm, whose engine takes no lever of ours. Before the lease the binary's
+#             `--levers` under each lever arm's variables (oursmtp's with BLOOMERY_DRAFT=mtp) must pass: a
+#             binary that does not act on a lever, or a value its kind does not take, refuses it by name.
+#             A lever arm is not in the greedy cross-check (below): its lever may move the arithmetic.
+#             Residency records: when generate_glm5next's checked-in schema declares the `residency
+#             lever` and `residency pass` records, every ours row carries them through records.py
+#             (cold-blocks.sh's residency sums: ` | residency <word> (<why>) passes n kept k landed l late
+#             t made m bytes b`), with each label's per-pass means after the tables, and an arm that runs
+#             BLOOMERY_RESIDENCY and prints no lever record is a FAIL row; a schema that declares none reads
+#             none, and an arm that runs BLOOMERY_RESIDENCY under it is a FAIL row naming the schema
+#             (depth-qwen3moe.sh's rule).
 #   lcpp27752:<D>, lcpp27754:<D>   the PR branch's llama-bench -p 0 -n N -d D -r 1 at the profile's
 #             LCPP27752_GPU_FLAGS / LCPP27754_GPU_FLAGS (the second under LCPP27754_ENV). -d prefills
 #             D of llama-bench's own std::rand() ids before its clock starts; its row label is `tgN @
@@ -197,13 +221,21 @@ case $WARM in '' | [0-9] | [1-9][0-9]*) ;; *) echo "depth-glm5next.sh: BLOOMERY_
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(512 lcpp27754:512)
 # Per arm: the engine (ours, oursmtp, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
-# ubatch lever, its depth or prompt length, and its row label (a prefill arm's names its ubatch).
-A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=()
-ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
+# ubatch lever, its depth or prompt length, its row label (a prefill arm's names its ubatch, a lever arm's
+# its variables) and a lever arm's NAME=VALUE list as given (comma-separated; empty for every other arm).
+A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=() A_ENV=()
+ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0 levers=0
 usage() {
-  echo "depth-glm5next.sh: arm '$1' is <D>, oursmtp:<D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
+  echo "depth-glm5next.sh: arm '$1' is <D>[@NAME=VALUE,...], oursmtp:<D>[@NAME=VALUE,...], lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
   exit 64
 }
+# A lever arm's list checks (the header's <D>@NAME=VALUE): tools/ref/lever-arms.sh, shared with
+# depth-qwen3moe.sh; a refusal is this runner's usage line with its reason.
+arm_refuse() { usage "$1" "$2"; }
+LEVER_ARM_RUNNER=depth-glm5next.sh
+LEVER_REGISTRY=${BASH_SOURCE[0]%/*}/../../crates/levers/src/registry.rs
+# shellcheck source=tools/ref/lever-arms.sh
+source "${BASH_SOURCE[0]%/*}/lever-arms.sh" || exit 2
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
 # shellcheck source=tools/ref/lcpp-fit.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
@@ -216,8 +248,25 @@ fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1
 # gpu_flags <engine>: the profile's llama-bench flags of that engine's branch.
 gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
 for a in "${ARMS[@]}"; do
-  eng=${a%%:*} dep=${a#*:} pp=0 ub=''
-  [ "$a" != "$eng" ] || { eng=ours dep=$a; }
+  # `@` is ours only: split at it first, so a value with a `:` is not read as an engine's arm.
+  arm_head=${a%%@*} envs=''
+  eng=${arm_head%%:*} dep=${arm_head#*:} pp=0 ub=''
+  [ "$arm_head" != "$eng" ] || { eng=ours dep=$arm_head; }
+  if [ "$arm_head" != "$a" ]; then
+    case $eng in ours | oursmtp) ;; *) arm_refuse "$a" "'@' sets a lever of ours, and $eng: is a reference engine's arm — a lever of ours is not a reference's" ;; esac
+    envs=${a#*@}
+    arm_envs_ok "$a" "$envs"
+    case ,$envs in
+      *,BLOOMERY_DRAFT=*)
+        if [ "$eng" = oursmtp ]; then
+          arm_refuse "$a" "BLOOMERY_DRAFT is the oursmtp arm's own (it sets BLOOMERY_DRAFT=mtp): give the arm its other variables only"
+        else
+          arm_refuse "$a" "BLOOMERY_DRAFT is the oursmtp arm's own: the drafted arm is oursmtp:${dep}[@…], which sets BLOOMERY_DRAFT=mtp"
+        fi
+        ;;
+    esac
+    levers=1
+  fi
   case $dep in '' | *[!0-9]*) usage "$a" ;; esac
   if [ "${eng%%+*}" != "$eng" ]; then
     srv_glm "$eng" || usage "$a" "+t<N>, +nopo<0|1> and +k<K> are a server arm's flags"
@@ -268,7 +317,7 @@ for a in "${ARMS[@]}"; do
     case $eng in lcpp27752*) fit27752=1 ;; *) fit27754=1 ;; esac
   fi
   case $eng in exl3*) ;; *) gguf=1 ;; esac
-  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng")
+  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${envs:+@$envs}") A_ENV+=("$envs")
 done
 # The draft is the oursmtp arm's alone: set here, every ours arm would draft and their ratio would read 1.
 if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
@@ -348,6 +397,57 @@ if [ "$ours_mtp" = 1 ]; then
     esac
   fi
 fi
+# arm_envs <i>: arm <i>'s own variables, into ARM_ENVS (NAME=VALUE words; none for an arm without a list).
+arm_envs() {
+  ARM_ENVS=()
+  [ -z "${A_ENV[$1]}" ] || IFS=, read -r -a ARM_ENVS <<< "${A_ENV[$1]}"
+}
+# A lever arm's variables: its binary takes them (at_main refuses a lever the binary does not act on, and
+# a value its kind does not take, --levers included), probed once per engine and list.
+if [ "$levers" = 1 ] && [ -x "$BIN" ]; then
+  probed='|'
+  for i in "${!ARMS[@]}"; do
+    [ -n "${A_ENV[$i]}" ] || continue
+    case $probed in *"|${A_ENG[$i]}@${A_ENV[$i]}|"*) continue ;; esac
+    probed+="${A_ENG[$i]}@${A_ENV[$i]}|"
+    arm_envs "$i"
+    draft=()
+    [ "${A_ENG[$i]}" = ours ] || draft=(BLOOMERY_DRAFT=mtp)
+    lv=$(env ${draft[@]+"${draft[@]}"} "${ARM_ENVS[@]}" "$BIN" --levers 2>&1) ||
+      check 2 "arm ${ARMS[$i]}: $BIN refuses ${draft[*]:+${draft[*]} }${ARM_ENVS[*]} (its --levers under them: ${lv##*$'\n'}): the arm cannot run as written"
+  done
+fi
+# The residency records (cold-blocks.sh's residency sums): G_RES 0 when generate_glm5next's checked-in
+# schema declares them, 1 when it declares none (an arm that runs BLOOMERY_RESIDENCY then fails by name).
+G_RES=1
+if [ "$ours" = 1 ]; then
+  G_RES=0
+  res_kinds generate_glm5next || G_RES=$?
+  [ "$G_RES" != 2 ] || check 2 "$RS_WHY"
+fi
+# res_asked <i>: the BLOOMERY_RESIDENCY arm <i> runs with (its own list's, else the runner's), empty when
+# neither sets it.
+res_asked() {
+  local e v=${BLOOMERY_RESIDENCY:-}
+  arm_envs "$1"
+  for e in ${ARM_ENVS[@]+"${ARM_ENVS[@]}"}; do
+    case $e in BLOOMERY_RESIDENCY=*) v=${e#*=} ;; esac
+  done
+  echo "$v"
+}
+# RS_NOTE: what the rows carry of the residency records, printed in [config] (and [dry]) when an arm runs
+# BLOOMERY_RESIDENCY.
+RS_NOTE=''
+for i in "${!ARMS[@]}"; do
+  case ${A_ENG[$i]} in ours | oursmtp) ;; *) continue ;; esac
+  [ -n "$(res_asked "$i")" ] || continue
+  if [ "$G_RES" = 0 ]; then
+    RS_NOTE="generate_glm5next's checked-in schema declares the residency records: each ours row carries its residency lever and passes"
+  else
+    RS_NOTE="generate_glm5next's checked-in schema declares no residency lever record: every row of an arm that runs BLOOMERY_RESIDENCY is a FAIL row naming it"
+  fi
+  break
+done
 case " ${A_ENG[*]}" in *" lcpp27752"*) [ -x "$LCPP27752BIN" ] || check 2 "no llama-bench at $LCPP27752BIN (PR #27752's tree)" ;; esac
 case " ${A_ENG[*]}" in *" lcpp27754"*) [ -x "$LCPP27754BIN" ] || check 2 "no llama-bench at $LCPP27754BIN (PR #27754's tree)" ;; esac
 # A fit arm needs its branch's llama-bench to have the fit (lcpp_fit_probe runs its --help with no card).
@@ -397,7 +497,14 @@ arm_cmd() {
   case ${eng%%+*} in
     ours | oursmtp)
       CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
-      [ "$eng" = ours ] || CMD=(env BLOOMERY_DRAFT=mtp "${CMD[@]}")
+      # A lever arm's variables, after oursmtp's draft.
+      arm_envs "$i"
+      [ ${#ARM_ENVS[@]} -eq 0 ] || CMD=("${ARM_ENVS[@]}" "${CMD[@]}")
+      if [ "$eng" = ours ]; then
+        [ ${#ARM_ENVS[@]} -eq 0 ] || CMD=(env "${CMD[@]}")
+      else
+        CMD=(env BLOOMERY_DRAFT=mtp "${CMD[@]}")
+      fi
       ;;
     lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
       # The branch's bench flags (its GLM_NCMOE_MTP for the MTP arm) with the arm's own, in the server's
@@ -569,6 +676,7 @@ if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE"
   [ "$ours_mtp" = 0 ] || echo "[dry] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; ${MTP_NOTE:-the schema of the mtp summary record was not read (the check lines)}"
+  [ -z "$RS_NOTE" ] || echo "[dry] residency: $RS_NOTE"
   echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM"
   ref_witness | sed 's/^   /[dry]/'
   [ ${#CHECKS[@]} -eq 0 ] || printf '[dry] check: %s\n' "${CHECKS[@]}"
@@ -658,7 +766,7 @@ cold_pass() {
 }
 # fail_row <tag> <round> <index> <rc> <why> <output>
 fail_row() {
-  local f=${TMPDIR:-/tmp}/depth-glm5next-${A_LABEL[$3]}-${A_DEP[$3]}-r$2.log key=d
+  local f=${TMPDIR:-/tmp}/depth-glm5next-${A_LABEL[$3]//\//_}-${A_DEP[$3]}-r$2.log key=d
   [ "${A_PP[$3]}" = 0 ] || key=p
   echo "$6" > "$f"
   echo "FAIL r$2 ${A_LABEL[$3]} $key=${A_DEP[$3]} rc=$4 | $5 | full output: $f$CPU_BUSY_TAG$OTHER_BUSY_TAG"
@@ -767,6 +875,18 @@ run_arm() {
         [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return; }
         MTP_COL=" | mtp positions/pass $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
       fi
+      # The residency records: the lever and the timed passes' sums (cold-blocks.sh's residency sums).
+      RS_WORD='' RS_COL=''
+      if [ "$G_RES" = 0 ]; then
+        res_sums generate_glm5next "$out" || { fail_row "" "${r_tag#r}" "$i" 0 "$RS_WHY" "$out"; return; }
+        if [ -z "$RS_WORD" ] && [ -n "$(res_asked "$i")" ]; then
+          fail_row "" "${r_tag#r}" "$i" 0 "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i") and printed no residency lever record, which its schema declares" "$out"
+          return
+        fi
+      elif [ -n "$(res_asked "$i")" ]; then
+        fail_row "" "${r_tag#r}" "$i" 0 "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i"), and generate_glm5next's checked-in schema (tools/bloomery/schema/generate_glm5next.jsonl) declares no residency record, so its row cannot carry them: refresh the schema from the binary that prints them (just records-refresh)" "$out"
+        return
+      fi
       echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
       local h10 t10 uniq tps tps50
       h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
@@ -783,12 +903,17 @@ run_arm() {
       cold_pass "$tag" "$r" "$i"
       prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       sums+=("$label|$dep|$r|$tps")
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
-      # The drafted run's ids are held to ours' as a server row's are; it is never the ours side.
-      if [ "$eng" = ours ]; then xc_add ours prose "$dep" "$r" ours "$XTOK"; else xc_add srv prose "$dep" "$r" "$label" "$XTOK"; fi
+      res_sums_add "$label" "$dep" "$r"
+      # The drafted run's ids are held to ours' as a server row's are; it is never the ours side. A lever
+      # arm is in no cross-check: its lever may move the arithmetic.
+      case $label in
+        ours) xc_add ours prose "$dep" "$r" ours "$XTOK" ;;
+        oursmtp) xc_add srv prose "$dep" "$r" "$label" "$XTOK" ;;
+      esac
       ;;
     lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
       local acc prps wtps w
@@ -917,6 +1042,7 @@ lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
 [ "$ours_mtp" = 0 ] || echo "[config] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; $MTP_NOTE"
+[ -z "$RS_NOTE" ] || echo "[config] residency: $RS_NOTE"
 [ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
 for e in 27752 27754; do
@@ -970,7 +1096,7 @@ echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours its
 # share a routing condition: ours and the server arms feed the same prose ids, ours places card experts by
 # id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not depend on
 # the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
-same_file() { grep -vE '^exl3' | grep -vxE 'ours|oursmtp'; }
+same_file() { grep -vE '^exl3|^oursmtp(@|$)' | grep -vx ours; }
 if [ ${#sums[@]} -gt 0 ]; then
   echo
   echo "=== ours / each engine on the same file, per depth: each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
@@ -992,6 +1118,7 @@ if [[ " ${sums[*]+${sums[*]}}" == *" oursmtp|"* ]]; then
   keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
   printf '%s\n' "${sums[@]}" | ratio_table "ratio mtp d=" "$keys" oursmtp
 fi
+res_sums_table
 witness post
 ref_witness
 if [ ${#failed[@]} -gt 0 ]; then
