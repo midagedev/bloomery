@@ -107,6 +107,8 @@ mod gate {
     const STREAMS: usize = 4;
     const HIDDEN: usize = 2560;
     const WIDE: usize = STREAMS * HIDDEN;
+    /// ggml's IMROPE position streams per row.
+    const POS_SECTIONS: usize = 4;
     /// The router's experts and routed picks.
     const N_EXPERT: usize = 512;
     const N_USED: usize = 10;
@@ -284,7 +286,22 @@ mod gate {
                     .collect()
             };
             let tokens = unsigned("inp_tokens")?;
-            let pos = unsigned("inp_pos")?;
+            let n = tokens.len();
+            // ggml's multi-section positions (IMROPE): four streams of n, the
+            // first the text position; a text row's second and third equal it.
+            let sections = unsigned("inp_pos")?;
+            if sections.len() != POS_SECTIONS * n
+                || sections[n..3 * n].chunks(n).any(|s| s != &sections[..n])
+            {
+                return Err(format!(
+                    "block {block} {}: inp_pos holds {} values, not {POS_SECTIONS} sections of \
+                     {n} with the second and third the first's",
+                    graph.as_str(),
+                    sections.len()
+                )
+                .into());
+            }
+            let pos = sections[..n].to_vec();
             let out_ids = unsigned("inp_out_ids")?
                 .into_iter()
                 .map(|v| v as usize)
@@ -304,7 +321,6 @@ mod gate {
                 pos,
                 out_ids,
             };
-            let n = g.tokens.len();
             let shapes = [
                 ("inp_pos", g.pos.len(), n),
                 ("inp_mtp_states", g.states.len(), n * WIDE),

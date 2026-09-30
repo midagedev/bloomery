@@ -1,0 +1,405 @@
+{
+  "template": "tokenizer.chat_template of Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf (the first shard), read from the GGUF header; the fixture qwen38-chat-template.jinja, md5 f82b108fbe7637ad08e39b5141e763a7",
+  "reference": "jinja2 3.1.2 (Python 3.12.3, on the box), the HF chat-template environment of ik_llama.cpp tests/test-jinja.cpp (SandboxedEnvironment with trim_blocks, lstrip_blocks and the loopcontrols extension; tojson = json.dumps with ensure_ascii=False, indent=None, separators=None, sort_keys=False as defaults; globals strftime_now and raise_exception); each case rendered with the variables bloomery-serve's /apply-template passes (messages with a content array flattened to its text parts, add_generation_prompt default true, the mock's bos_token and eos_token, tools and reasoning_effort when not null, chat_template_kwargs merged); every body has its keys sorted at every level (jinja2 keeps insertion order, bloomery iterates keys sorted, so only a sorted body is one both render alike); a case jinja2 refused carries its error in place of a prompt. Script: crates/serve/tests/fixtures/render_glm5.py, run as `python3 render_glm5.py qwen38-chat-template.jinja > qwen38-renders.json`",
+  "cases": [
+    {
+      "name": "system and user",
+      "body": {
+        "messages": [
+          {
+            "content": "You are terse.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "three turns",
+      "body": {
+        "messages": [
+          {
+            "content": "What is the capital of France?",
+            "role": "user"
+          },
+          {
+            "content": "Paris.",
+            "role": "assistant"
+          },
+          {
+            "content": "And of Italy?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>\n<|im_start|>user\nAnd of Italy?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "past reasoning kept, clear_thinking absent",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\nThe user greets.\n</think>\n\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "past reasoning cleared, clear_thinking true",
+      "body": {
+        "chat_template_kwargs": {
+          "clear_thinking": true
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\nThe user greets.\n</think>\n\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "think span in the answer, no generation prompt",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "2+2?",
+            "role": "user"
+          },
+          {
+            "content": "<think>Add them.</think>\n\n4",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>Add them.</think>\n\n4<|im_end|>\n"
+    },
+    {
+      "name": "reasoning_effort low",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_effort outside the list",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}, \"strict\": true}, \"type\": \"function\"}\n{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "two calls, their results in the other order",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather and time in Seoul?",
+            "role": "user"
+          },
+          {
+            "content": "Checking both.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "days": 3,
+                    "location": "Seoul"
+                  },
+                  "name": "get_weather"
+                },
+                "id": "call_a",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_b",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_b"
+          },
+          {
+            "content": "{\"temp\": 21}",
+            "role": "tool",
+            "tool_call_id": "call_a"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}, \"strict\": true}, \"type\": \"function\"}\n{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather and time in Seoul?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking both.\n\n<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n<parameter=location>\nSeoul\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "a tool result without an id",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_c",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nTime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "non-ASCII and nested arguments",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "filter": {
+                      "n": [
+                        1,
+                        2
+                      ],
+                      "q": "서울 ☃"
+                    },
+                    "text": "a<b & \"c\""
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_d",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nNote it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=save_note>\n<parameter=filter>\n{\"n\": [1, 2], \"q\": \"서울 ☃\"}\n</parameter>\n<parameter=text>\na<b & \"c\"\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    },
+    {
+      "name": "string arguments",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{}",
+                  "name": "get_time"
+                },
+                "id": "call_e",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "error": "TemplateError: Tool call arguments for function \"get_time\" were passed as a JSON string. Parse them into an object before calling apply_chat_template."
+    }
+  ]
+}

@@ -12,13 +12,14 @@
 //! sees its arguments and the template's top-level names as they are at the
 //! call, never the caller's loop names; the call's value is the body's output
 //! as a string), the conditional expression, `and`/`or`/`not`/`in`,
-//! comparisons, `+`/`-`/`*`/`/`/`//`/`%`/`~` (Python's rounding of `//` and
+//! comparisons (a tuple literal only as the right side of `in`/`not in`,
+//! where it reads as a list), `+`/`-`/`*`/`/`/`//`/`%`/`~` (Python's rounding of `//` and
 //! `%`), subscripts (a string's by character) and slices `[start:stop:step]`
 //! (Python's rules), string literals with Python's escapes,
 //! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
 //! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()` with Python's
 //! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
-//! `lower`/`upper`/`capitalize`, tests `defined`/`undefined`/`none`/`true`/
+//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`, tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
 //! `raise_exception`/`range`. Whitespace is Python's `str.isspace`, and
 //! `{{ value }}` is Python's `str()`: a list or dict as its `repr`, a float in
@@ -527,6 +528,9 @@ const OPS: [&str; 24] = [
 struct Lexer {
     toks: Vec<Tok>,
     at: usize,
+    /// The next primary is the right side of `in`/`not in`, the one place a
+    /// tuple literal is read (as a list).
+    tuple_in: bool,
 }
 
 /// One escape of a string literal after its backslash (`cs[at]` onwards), as
@@ -675,7 +679,11 @@ impl Lexer {
                 i += op.chars().count();
             }
         }
-        Ok(Lexer { toks, at: 0 })
+        Ok(Lexer {
+            toks,
+            at: 0,
+            tuple_in: false,
+        })
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -787,7 +795,10 @@ impl Lexer {
                 _ => return Ok(e),
             };
             self.at += 1;
-            e = Expr::Bin(Box::new(e), op, Box::new(self.concat()?));
+            self.tuple_in = matches!(op, BinOp::In | BinOp::NotIn);
+            let rhs = self.concat();
+            self.tuple_in = false;
+            e = Expr::Bin(Box::new(e), op, Box::new(rhs?));
         }
     }
 
@@ -925,6 +936,7 @@ impl Lexer {
     }
 
     fn primary(&mut self) -> Result<Expr, TemplateError> {
+        let tuple_ok = std::mem::take(&mut self.tuple_in);
         let Some(t) = self.toks.get(self.at).cloned() else {
             return err("expression ends early");
         };
@@ -941,6 +953,22 @@ impl Lexer {
             },
             Tok::Op("(") => {
                 let e = self.expr()?;
+                if self.peek() == Some(&Tok::Op(",")) {
+                    if !tuple_ok {
+                        return err(
+                            "a tuple literal outside the right side of `in` is not supported",
+                        );
+                    }
+                    let mut items = vec![e];
+                    while self.eat_op(",") && !self.eat_op(")") {
+                        items.push(self.expr()?);
+                        if self.peek() != Some(&Tok::Op(",")) {
+                            self.expect_op(")")?;
+                            break;
+                        }
+                    }
+                    return Ok(Expr::List(items));
+                }
                 self.expect_op(")")?;
                 e
             }
@@ -2230,6 +2258,9 @@ fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, Templ
             style.dumps(&v.into_json(JsonUse::ToJson)?),
         )));
     }
+    if name == "default" {
+        return default_filter(v, args, kwargs);
+    }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
     }
@@ -2259,12 +2290,52 @@ fn filter(v: V, name: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<V, Templ
                 return err(format!("|{name}: {kind} has no length"));
             }
         })),
+        // jinja2's `do_items`: a mapping's pairs, nothing for undefined.
+        "items" => V::J(Value::Array(match v {
+            V::J(Value::Object(m)) => m
+                .into_iter()
+                .map(|(k, v)| Value::Array(vec![Value::String(k), v]))
+                .collect(),
+            V::Undef => Vec::new(),
+            other => return err(format!("|items needs a mapping, not {other:?}")),
+        })),
         "trim" => V::J(Value::String(to_str(&v)?.trim_matches(py_space).to_owned())),
-        "string" => V::J(Value::String(to_str(&v)?)),
+        // No autoescape, so jinja2's `Markup(value)`: the value's `str()`.
+        "string" | "safe" => V::J(Value::String(to_str(&v)?)),
         "lower" => V::J(Value::String(to_str(&v)?.to_lowercase())),
         "upper" => V::J(Value::String(to_str(&v)?.to_uppercase())),
         "capitalize" => V::J(Value::String(capitalize(&to_str(&v)?)?)),
         other => return err(format!("unsupported filter |{other}")),
+    })
+}
+
+/// jinja2's `default(default_value='', boolean=False)`: the value, or the
+/// default when the value is undefined (or, under `boolean`, false).
+fn default_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let mut slots: [Option<&V>; 2] = [args.first(), args.get(1)];
+    if args.len() > 2 {
+        return err("|default takes at most two arguments");
+    }
+    for (k, x) in kwargs {
+        let at = match *k {
+            "default_value" => 0,
+            "boolean" => 1,
+            other => return err(format!("|default takes no argument {other}")),
+        };
+        if slots[at].replace(x).is_some() {
+            return err(format!("|default: {k} given twice"));
+        }
+    }
+    let boolean = match slots[1] {
+        None => false,
+        Some(V::J(Value::Bool(b))) => *b,
+        Some(other) => return err(format!("|default: boolean is {other:?}, not a bool")),
+    };
+    let missing = matches!(v, V::Undef) || (boolean && !v.truthy());
+    Ok(match (missing, slots[0]) {
+        (false, _) => v,
+        (true, Some(d)) => d.clone(),
+        (true, None) => V::J(Value::String(String::new())),
     })
 }
 
@@ -2514,6 +2585,49 @@ mod tests {
                    {%- for k, v in d.items() -%}{%- set outer = 'inner' -%}\
                    {%- set ns.n = ns.n + v -%}{{ loop.index0 }}{{ k }}{%- endfor -%}|{{ ns.n }}|{{ outer }}";
         assert_eq!(render(src, json!({"d": {"a": 1, "b": 2}})), "0a1b|3|o");
+    }
+
+    #[test]
+    fn a_tuple_reads_as_a_list_on_the_right_of_in_only() {
+        let src = "{{ 'a' in ('a', 'b') }}{{ 'c' not in ('a', 'b',) }}{{ 'a' in ('a') }}";
+        assert_eq!(render(src, json!({})), "TrueTrueTrue");
+        let Err(e) = ChatTemplate::parse("{{ ('a', 'b') }}") else {
+            panic!("a tuple outside `in` parses")
+        };
+        assert!(e.0.contains("tuple literal"), "{e:?}");
+    }
+
+    #[test]
+    fn items_and_safe_are_jinja2s() {
+        let src = "{%- for k, v in d|items %}{{ k }}={{ v }};{% endfor %}|{{ u|items|length }}";
+        assert_eq!(render(src, json!({"d": {"b": 1, "a": 2}})), "b=1;a=2;|0");
+        let t = ChatTemplate::parse("{{ 's'|items }}").expect("parses");
+        let e = t.render(&Map::new()).expect_err("items of a string");
+        assert!(e.0.contains("|items needs a mapping"), "{e:?}");
+        assert_eq!(
+            render("{{ d|tojson|safe }}|{{ d|safe }}", json!({"d": {"a": 1}})),
+            "{\"a\": 1}|{'a': 1}"
+        );
+    }
+
+    #[test]
+    fn default_is_jinja2s() {
+        let src = "{{ u|default('d') }}|{{ x|default('d') }}|{{ e|default('d') }}|\
+                   {{ e|default('d', true) }}|{{ u|default }}|{{ e|default(boolean=true, default_value='k') }}";
+        assert_eq!(render(src, json!({"x": "v", "e": ""})), "d|v||d||k");
+        for (src, want) in [
+            ("{{ u|default(1, true, 2) }}", "at most two"),
+            ("{{ u|default(other=1) }}", "no argument other"),
+            (
+                "{{ u|default(1, boolean=true, default_value=2) }}",
+                "given twice",
+            ),
+            ("{{ u|default(1, 'yes') }}", "not a bool"),
+        ] {
+            let t = ChatTemplate::parse(src).expect("parses");
+            let e = t.render(&Map::new()).expect_err(src);
+            assert!(e.0.contains(want), "{src}: {e:?}");
+        }
     }
 
     const V41: &str = include_str!("../tests/fixtures/v41-chat-template.jinja");

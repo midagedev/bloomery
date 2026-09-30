@@ -58,10 +58,9 @@ const DEFAULTS: &[&str] = &[
 // (`moe_fits`), the QK norm and rope of head 256 (IMROPE sections covering the 64 turned values),
 // the output gate, the recurrent-state slot and the mixed trunk; gate-gpu-qwen35moe-e2e runs each.
 // The chat surface's two items stay: the program does not run them.
-const COVERAGE_Q4KM: &[&str] = &[
-    "pre-tokenizer qwen35",
-    "a tool-call parser for this template",
-];
+// PIN(2026-09-30): the pre-tokenizer item left both lists with the tokenizer's qwen35 pre-tokenizer
+// (`crates/tokenizer/src/pretok.rs`), which gate-tokenizer holds to the reference's split.
+const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
 
 // PIN(2026-09-27): the same for the UD-Q4_K_XL file, with its Q8_0 and Q5_K format items, which
 // Body35 does not read.
@@ -70,7 +69,6 @@ const COVERAGE_UD: &[&str] = &[
     "q8_0 token embedding (the card reads q4_K rows)",
     "q8_0 attention matrices (the body reads q4_K and q6_K): 0-39",
     "q5_K routed experts on a card: 0-33,35-37",
-    "pre-tokenizer qwen35",
     "a tool-call parser for this template",
 ];
 

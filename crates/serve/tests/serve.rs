@@ -1246,6 +1246,41 @@ fn hw_glm5_template_renders_as_jinja2() {
     }
 }
 
+/// Qwen3.8's chat template renders as jinja2 does: every case of the fixture
+/// through `/apply-template` equals its reference render byte for byte, and
+/// the case the template refuses (tool-call `arguments` given as a JSON
+/// string) is refused by name. The cases reach `reasoning_effort|default`
+/// against a tuple, the reasoning effort's system turn, and the tool calls.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen38_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/qwen38-chat-template.jinja"),
+    );
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/qwen38-renders.json")).expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 12, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if case["error"].is_string() {
+            assert_eq!(r.status, 500, "{}: {}", case["name"], r.body);
+            let message = r.json()["error"]["message"].clone();
+            assert!(
+                message
+                    .as_str()
+                    .is_some_and(|m| m.contains("passed as a JSON string")),
+                "{}: {message} does not name the JSON string",
+                case["name"]
+            );
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
 /// Every id the vocabulary names as a stop ends a generation, not only its
 /// EOS: with GLM-5.3-Flash's three (the header's eos, eot and eom), a
 /// generation that emits any one of them stops there, reports `stopped_eos`,

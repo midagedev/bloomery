@@ -85,10 +85,9 @@ const TENSORS: &[&str] = &[
 // mean-pool indexer, the image placeholder's refusal; its type pins read the q8_0 and bf16
 // attention matrices; the routed q5_K stacks are served on the host (`CardFormat::of`). The two
 // left are the chat surface's, which the program does not use (`Body38`'s `ALLOWED`).
-const COVERAGE: &[&str] = &[
-    "pre-tokenizer qwen35",
-    "a tool-call parser for this template",
-];
+// PIN(2026-09-30): the pre-tokenizer item left with the tokenizer's qwen35 pre-tokenizer
+// (`crates/tokenizer/src/pretok.rs`); the tool-call parser is the one item left.
+const COVERAGE: &[&str] = &["a tool-call parser for this template"];
 
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards on the box (just gate-qwen4exp-meta)"]
