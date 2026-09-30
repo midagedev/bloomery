@@ -42,7 +42,11 @@
 //!   up at the kept position, nothing skipped — and none prints a skip, and
 //!   each drafts, with the plain run's ids (the generated ones) or the same
 //!   prompt's fed fresh; `/props`' `engine.draft` names the draft file
-//!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path.
+//!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
+//!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
+//!   through plain steps, drafting nothing, with the ids of the same request
+//!   on a plain server (`BLOOMERY_DRAFT=off`) started once the drafted one
+//!   has stopped.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -118,6 +122,9 @@ mod gate {
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
     const CHAT_PREDICT: usize = 32;
+    /// The sampled request's temperature (llama-server's default) and seed.
+    const SAMPLED_TEMPERATURE: f64 = 0.8;
+    const SAMPLED_SEED: u64 = 42;
 
     /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule — the server's
     /// reading of the inherited environment.
@@ -147,8 +154,13 @@ mod gate {
         /// child is killed when this process dies, so a runner's bound that
         /// ends this process does not leave the server holding a card.
         fn spawn(args: &[&str], dir: &Path) -> Result<Served38, GateError> {
+            Self::spawn_with(args, dir, &mut Command::new(Self::exe()?))
+        }
+
+        /// [`Served38::spawn`] on `cmd`, `bloomery-serve-qwen38` with the
+        /// environment the caller set on it.
+        fn spawn_with(args: &[&str], dir: &Path, cmd: &mut Command) -> Result<Served38, GateError> {
             let exe = Self::exe()?;
-            let mut cmd = Command::new(&exe);
             cmd.args(args)
                 .stdin(Stdio::null())
                 .stdout(File::create(dir.join("server.out"))?)
@@ -683,6 +695,54 @@ mod gate {
         Ok(ok)
     }
 
+    /// The drafted server's sampled request (`sampled`, answered `st`
+    /// `body`), served through plain steps, against the same request on a
+    /// plain server this starts once the drafted one has stopped
+    /// (`BLOOMERY_DRAFT=off`, the MTP levers removed; its logs in
+    /// `<dir>/plain`): served, the same ids, and no draft counts. Mutant: the
+    /// refusal of a sampled request under a draft restored (the drafted
+    /// server's 400).
+    fn sampled_as_plain(
+        dir: &Path,
+        sampled: &Value,
+        st: u16,
+        body: &str,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let drafted = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+        let got = ids_of(&drafted["tokens"]);
+        println!("sampled on the drafted server: HTTP {st} tokens {got:?}");
+        check(
+            &mut ok,
+            "drafted_serves_a_sampled_request",
+            st == 200 && !got.is_empty(),
+        );
+        check(
+            &mut ok,
+            "drafted_sampled_request_drafts_nothing",
+            drafted["timings"].get("draft_n").is_none(),
+        );
+        let plain_dir = dir.join("plain");
+        std::fs::create_dir_all(&plain_dir)?;
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "off")
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT);
+        let mut plain = Served38::spawn_with(&SERVER_ARGS, &plain_dir, &mut cmd)?;
+        println!("plain server pid {}", plain.child.id());
+        let addr = plain.address(&plain_dir.join("server.err"), POLLS, POLL)?;
+        let (st, body) = curl(&format!("http://{addr}/completion"), Some(sampled), false)?;
+        let want = ids_of(&json_of("/completion", st, &body)?["tokens"]);
+        println!("sampled on the plain server: tokens {want:?}");
+        println!("plain server stopped: {}", plain.stop()?);
+        check(
+            &mut ok,
+            "drafted_sampled_ids_are_the_plain_ids",
+            got == want,
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         if levers.draft() != Some("mtp") && levers.mtp_draft().is_some() {
@@ -823,11 +883,21 @@ mod gate {
 
         let id = a.ids.iter().copied().min().ok_or("--ids is empty")?;
         ok &= position_limit(&url, id)?;
-        if levers.draft() == Some("mtp") {
+        let sampled = json!({
+            "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
+            "seed": SAMPLED_SEED, "return_tokens": true,
+        });
+        let drafted_sampled = if levers.draft() == Some("mtp") {
             ok &= continued(&url, &err_log, &a.ids, &reference)?;
-        }
+            Some(curl(&url("/completion"), Some(&sampled), false)?)
+        } else {
+            None
+        };
 
         println!("server stopped: {}", served.stop()?);
+        if let Some((st, body)) = drafted_sampled {
+            ok &= sampled_as_plain(&a.dir, &sampled, st, &body)?;
+        }
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

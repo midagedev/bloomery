@@ -136,9 +136,11 @@ pub trait Engine: Send {
         Ok(Drafted::default())
     }
     /// The most positions one [`Engine::advance`] evaluates: 1 for an engine
-    /// without a draft. Past 1 the engine drafts, and a request that needs the
-    /// logits row (sampling, a banned id) is refused: a draft's pass keeps the
-    /// target's argmax.
+    /// without a draft. Past 1 the engine drafts its greedy requests; a request
+    /// that needs the logits row (sampling, a banned id) takes plain
+    /// [`Engine::next`] steps instead, since a draft's pass keeps the target's
+    /// argmax and reads no row. Under a draft, `next` with `Some(out)` writes
+    /// the target's row of the step it ran.
     fn advance_rows(&self) -> usize {
         1
     }

@@ -39,19 +39,16 @@
 //! rule. Where the body does take positions back — a verify's commit — no
 //! request path reaches.
 //!
-//! The seat an MTP draft would extend is `Q38` below: its `pass` and
-//! `pass_rows` are the engine's defaults (no draft), which is where a draft
-//! plugs in.
-//!
 //! Under `BLOOMERY_DRAFT=mtp` the seat drives the session through the
 //! runtime's speculative loop with the shared window `app::mtp::MtpDraft` (the
 //! shared draft file beside the target or `BLOOMERY_MTP_DRAFT`'s, its head
 //! reduced under `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
-//! plain server's, `pass_rows` 4 and a sampling or id-banning request
-//! refused while a draft runs (the engine's own rule, a 400 naming the
-//! field). A `load draft=mtp` line follows the `load` line, and
-//! `/props`' `engine.draft` names the draft with its resident bytes as the
-//! card's `draft` class. Unset and `off` are the plain path; every other
+//! plain server's, `pass_rows` 4. A sampling or id-banning request takes
+//! plain steps (the server's loop asks a pass only of a greedy request with
+//! no banned id), each step's row the target's, read before the step is told
+//! to the draft; its ids are the plain server's. A `load draft=mtp` line
+//! follows the `load` line, and `/props`' `engine.draft` names the draft
+//! with its resident bytes as the card's `draft` class. Unset and `off` are the plain path; every other
 //! word of the lever is refused by name.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
@@ -571,6 +568,12 @@ impl Seat for Q38 {
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
         Ok(self.s.model().logits_into(row)?)
+    }
+
+    /// One step and the target's row of it, read before the step is told
+    /// to the draft ([`DraftedSeat::step_with_row`]).
+    fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
+        self.drafted.step_with_row(&mut self.s, last, row)
     }
 
     fn reset(&mut self) -> Result<(), GateError> {
