@@ -9,6 +9,9 @@
 //! prompt call takes the KDA layers' checkpoints its marks name, and a cut
 //! keeps every fed position, the empty model, or a checkpoint: each KDA
 //! layer holds one recurrent state, and its history only in those copies.
+//!
+//! [`open_nextn`] opens the same session with the file's next-token layer
+//! beside the target: the body the MTP window drafts on (`MtpBody`).
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -16,11 +19,11 @@ use bloomery_gpu::hybrid::refuse_expert_tiers;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
-use model::arch::glm5next::place::PlanInputs;
+use model::arch::glm5next::place::{NextnInputs, PlanInputs};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::seqstate::Kept;
 
-use crate::{Keep, Open, Prompt};
+use crate::{Keep, Loaded, Open, OpenArgs, OpenLog, Prompt, Session, SessionError};
 
 mod mtp;
 
@@ -90,6 +93,49 @@ impl Open for Body {
     fn prepare(m: &mut GpuModel<Body>, cfg: &GlmCfg) -> Result<bool, GpuError> {
         bloomery_gpu_glm5next::set_prefill(m, cfg.prefill)
     }
+}
+
+/// The GLM session with the file's next-token layer loaded beside the
+/// target, as [`Loaded::open`] then [`Loaded::ready`] open the plain one:
+/// `file`'s headers and its NextN layer read once, the plan made once on
+/// `args`' placement ([`PlanInputs::plan_nextn`]: the target's expert rule
+/// within the card less the layer's bytes) and its target plan handed to
+/// `log` (`false` stops there: `Ok(None)`), then the load by that plan
+/// ([`Body::open_placed_nextn`]) in `args`' step mode, handed to `log`, the
+/// step captured and the prompt call's buffers made. Refused as
+/// [`Open::plan`] refuses, and by name for a file of other than one
+/// next-token layer and a plan the layer breaks.
+pub fn open_nextn<M: Fn(usize) -> Machine>(
+    file: Split,
+    args: OpenArgs<GlmCfg, M>,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
+    let inputs = <Body as Open>::inputs(&file)?;
+    let nextn = NextnInputs::read(&inputs).map_err(|e| GpuError::plan(WHAT, e))?;
+    let machine = (args.machine)(<Body as Open>::layer_count(&inputs));
+    refuse_expert_tiers(WHAT, &machine)?;
+    let ctx = u64::try_from(args.ctx).map_err(|_| GpuError::Shape {
+        what: WHAT,
+        detail: format!("a context of {} positions passes u64", args.ctx),
+    })?;
+    let plan = inputs
+        .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    if !log.plan(args.place, &inputs, &machine, &plan.plan)? {
+        return Ok(None);
+    }
+    let ctx = u32::try_from(plan.plan.ctx_max).map_err(|_| {
+        SessionError::Refused(format!(
+            "the plan's ctx_max {} passes u32",
+            plan.plan.ctx_max
+        ))
+    })?;
+    let mut model = Body::open_placed_nextn(file, &plan, &inputs, &nextn, 0, args.cfg.host)?;
+    model.set_mode(args.mode);
+    log.load(&model)?;
+    Loaded::from_model(model, args.cfg, ctx)
+        .ready(log)
+        .map(Some)
 }
 
 impl Prompt for Body {
