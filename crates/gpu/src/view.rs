@@ -37,7 +37,7 @@ use cuda_device::thread::{Index1D, ThreadIndex};
 /// row-global read (one value per column of the row), `x` and `y` are the
 /// calling block's own row at `base`, and the pass strides `step` from the
 /// calling thread's own index up to the row's `k` values.
-/// [`next_cell`](Apply::next_cell) is the accessor; it takes no index.
+/// [`map`](Apply::map) runs the pass; it takes no index.
 #[must_use]
 pub(crate) struct Apply<'g, 'x, 's, 'a, T> {
     gain: *const T,
@@ -98,9 +98,12 @@ impl<'g, 'x, 's, 'a, T> Apply<'g, 'x, 's, 'a, T> {
         }
     }
 
-    /// The next `(gain[it], x[base + it], &mut y[base + it])` of the pass,
-    /// `None` once the row is exhausted. The `it < end` compare is the loop
-    /// condition the kernel's own pass had; no other check runs per step.
+    /// Run the pass: `y[base + it] = f(gain[it], x[base + it])` for every
+    /// `it` of this thread's stride below the row's `k` values. The loop is
+    /// the kernel's own (`it < end`, then `it += step`); no other check runs
+    /// per step. Taking `f` rather than handing out `Option<&mut T>` keeps
+    /// the loop free of a per-step `Some`/`None` test and keeps the store
+    /// addressed from `y` itself, so the backend keeps its global state space.
     ///
     /// Sound for every `Apply` safe code can name: an `Apply` can only be
     /// built by [`new`](Self::new), and the state that constructor fixes —
@@ -109,30 +112,27 @@ impl<'g, 'x, 's, 'a, T> Apply<'g, 'x, 's, 'a, T> {
     /// stays inside `x` and `y`, and (c) this thread's cells are its alone:
     /// no other thread of the block shares its `it` (distinct `threadIdx_x`
     /// below `step`, one residue class of the stride each) and no other
-    /// block's pass names this row (`base` uniform, one row per block). The
-    /// `&mut` borrows this `Apply`, so one cell reference is live per thread
-    /// at a time. The counter cannot wrap: `it < end` and `it = it + step`
-    /// stay below `end + step`, and `end <= len` of a real buffer leaves
-    /// that far under `usize::MAX`.
+    /// block's pass names this row (`base` uniform, one row per block). `f`
+    /// receives values, never a reference into a buffer, and the pass
+    /// consumes the `Apply`, so it runs once. The counter cannot wrap:
+    /// `it < end` and `it = it + step` stay below `end + step`, and
+    /// `end <= len` of a real buffer leaves that far under `usize::MAX`.
     #[inline(always)]
-    pub(crate) fn next_cell(&mut self) -> Option<(T, T, &mut T)>
+    pub(crate) fn map(self, mut f: impl FnMut(T, T) -> T)
     where
         T: Copy,
     {
-        let it = self.it;
-        if it < self.end {
-            self.it = it + self.step;
+        let mut it = self.it;
+        while it < self.end {
             // SAFETY: `it < end`, and the constructing `new` proved every
-            // buffer covers `end` values from this row's `base`.
-            Some(unsafe {
-                (
-                    *self.gain.add(it),
-                    *self.x.add(self.base + it),
-                    &mut *self.y.add(self.base + it),
-                )
-            })
-        } else {
-            None
+            // buffer covers `end` values from this row's `base`; the cell
+            // `base + it` is this thread's alone (the doc above).
+            unsafe {
+                let g = *self.gain.add(it);
+                let v = *self.x.add(self.base + it);
+                *self.y.add(self.base + it) = f(g, v);
+            }
+            it += self.step;
         }
     }
 }

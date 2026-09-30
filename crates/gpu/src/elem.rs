@@ -512,7 +512,7 @@ mod elem_kernels {
         // host before enqueue), `base = t*k` past the `t < m` guard and `k`,
         // `tid`, `RMS_THREADS` are this kernel's own inputs, and the launch's
         // block is the contract's exact 1-D `(RMS_THREADS, 1, 1)`.
-        let mut apply = unsafe { Apply::new(gain, x, &mut y, base, k, tid, RMS_THREADS) };
+        let apply = unsafe { Apply::new(gain, x, &mut y, base, k, tid, RMS_THREADS) };
         // SAFETY: WSUM is this block's own shared allocation; the raw form is
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
@@ -540,9 +540,7 @@ mod elem_kernels {
             ]
         };
         let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
-        while let Some((g, v, out)) = apply.next_cell() {
-            *out = (scale * g) * v;
-        }
+        apply.map(move |g, v| (scale * g) * v);
     }
 
     /// Apply the host-computed rope cos/sin cache: one thread per (column,
