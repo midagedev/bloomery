@@ -43,6 +43,14 @@ The DSpark draft for V4.1 speculative decoding is not a public upload: it is con
 - **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B and Qwen3.6 run ubatches of up to 4096 tokens through an int8 tensor-core GEMM; Qwen3.8 runs ubatches of up to 4096 with its card experts beside the host tier; GLM-5.3 runs its prompt in batches, its sparse-attention selector included.
 - **Loading.** A load streams the file's bytes to the card through a pinned ring with one sync; a warm V4.1 load takes about 16 s ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#v41-load-upload)).
 
+<p align="center">
+  <a href="https://github.com/midagedev/rig-log/blob/main/assets/residency-explainer-v5.mp4">
+    <img src="https://raw.githubusercontent.com/midagedev/rig-log/main/assets/residency-explainer-v5-poster.png" width="420" alt="Adaptive expert residency explainer (42 s video)">
+  </a>
+</p>
+
+Adaptive residency on one A6000, V4.1-Flash `Q3_K_M`, 96 decode steps after a 512-token prose prompt: 29.48 tok/s with it off, 35.70 with the swap rule, 43.86 with the prompt call's streaming as well (the default). The card served 18 % of the routed calls with it off; with streaming it served 57 % over the first 16 steps and 71 % over the last 16 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#residency-clip); the video's source and a source for every number: [`tools/clip/residency`](https://github.com/midagedev/rig-log/tree/main/tools/clip/residency)).
+
 ## Status
 
 V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` serve llama-server's HTTP API (streaming, prefix reuse, reasoning, tool calls; one request at a time). The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
