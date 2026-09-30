@@ -108,6 +108,11 @@ path = "src/bin/bloomery_chat.rs"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "bloomery-serve"
+path = "src/bin/bloomery_serve.rs"
+required-features = ["glm5next"]
+
+[[bin]]
 name = "bloomery-serve-ds41"
 path = "src/bin/bloomery_serve_ds41.rs"
 required-features = ["deepseek41"]

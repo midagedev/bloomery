@@ -1481,6 +1481,19 @@ pub static LISTENING38: Kind = Kind {
     ],
 };
 
+/// The GLM server's address.
+pub static LISTENING_GLM: Kind = Kind {
+    name: "listening_glm",
+    head: "bloomery-serve-glm:",
+    doc: "The GLM server's placement, context and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {

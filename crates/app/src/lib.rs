@@ -28,6 +28,7 @@
 //! a later call could read before writing it; it never lifts a fault.
 
 pub mod arch;
+pub mod mtp;
 
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::ResetReport;
