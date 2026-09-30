@@ -2,8 +2,8 @@
 # The depth-glm5next.sh stub test: the runner's arms with no lease, no card and no model. It copies the
 # runner (DEPTH_GLM5NEXT_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
-# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, gguf-ranges.py, records.py with
-# generate_glm5next's checked-in schema, and a copy of lease.sh whose lease_take is replaced by a line
+# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, gguf-ranges.py,
+# records.py with generate_glm5next's checked-in schema, the lever registry, and a copy of lease.sh whose lease_take is replaced by a line
 # that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The profile keeps a
 # caller's values, so the two PR trees' llama-bench and generate_glm5next are stub scripts here, their
 # llama-server tools/ref/stub-llama-server.py, and MODEL a path nothing opens — or, for
@@ -100,6 +100,30 @@
 #                none, the oursmtp row is a FAIL row naming it, rc 1.
 #   mtp-lever    a generate_glm5next that refuses BLOOMERY_DRAFT (STUB_GEN_NODRAFT=1): oursmtp:6 refused
 #                before the lease by name with the binary's line, rc 2, no row.
+#   lever-refuse each refusal of a lever arm's list (the runner's header's <D>@NAME=VALUE), one run an arm
+#                beside a plain 512: rc 64 and the usage line ending in its reason, no [config], no lease, no
+#                row, and no stub generate_glm5next run ($TMPDIR/stub-gen-env stays empty). Red on the runner
+#                before the lever arms: its usage names no reason.
+#   lever-dry    512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off's
+#                dry run: the lever arms' command lines under env with their variables (oursmtp's after
+#                BLOOMERY_DRAFT=mtp), the plain one with none, and the `[dry] residency:` line saying the
+#                checked-in schema declares no residency lever record.
+#   lever-pair   512 512@BLOOMERY_RESIDENCY=mid-p33-s1, two rounds, no warm-up, on a schema copy that
+#                declares the residency lever and host records (generate_qwen3moe's): four processes, the
+#                stub engine seeing the variable in the lever arm's alone, in the rotation's order (none,
+#                mid, mid, none); the lever rows' residency column (three step passes, kept 30), the plain
+#                rows' none; two means with distinct labels, the ratio line ours/ours@… 1.0000 over two
+#                rounds, the residency mean line of the lever label alone, no xcheck line for it; rc 0.
+#                Needs the prose ids, as ours-timed; so do the three below.
+#   lever-res-nolever  the same arms on that schema copy, the stub printing no residency lever record
+#                (STUB_GEN_NORESLEVER=1): the lever row a FAIL row naming it, the plain row a ROW, rc 1.
+#   lever-res-none  the same arms on the checked-in schema (no residency lever record): each lever row a FAIL
+#                row naming the schema, the plain row a ROW, rc 1.
+#   mtp-lever-arm  512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1 on the residency schema copy: the stub engine
+#                sees both BLOOMERY_DRAFT=mtp and the variable in the oursmtp process; its row under its label,
+#                with its residency column; no ratio line and no xcheck line for it; rc 0.
+#   lever-levers a generate_glm5next whose --levers refuses BLOOMERY_R8 (STUB_GEN_REFUSE): 512@BLOOMERY_R8=off
+#                refused before the lease by name with the binary's line, rc 2, no row.
 #   dry-same     DEPTH_GLM5NEXT_BASE set: the dry run of every arm kind the base runner knows, under the
 #                base and under the runner tested, byte for byte less the lines this runner changed on
 #                purpose: `[dry] preheat:`, `[dry] prompt:`, `[dry] WARMUP r0:`, `[dry] server arms:`, the
@@ -120,9 +144,13 @@ cp "$RUNNER" "$T/tools/ref/depth-glm5next.sh"
 cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" \
   "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/lcpp-warm.sh" "$ROOT/tools/ref/cold-blocks.sh" \
-  "$ROOT/tools/ref/gguf-ranges.py" "$T/tools/ref/"
+  "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
+# The lever registry, which a lever arm's NAME=VALUE list is checked against (before the stub binaries are
+# written, so they are newer than every crates/ source).
+mkdir -p "$T/crates/levers/src"
+cp "$ROOT/crates/levers/src/registry.rs" "$T/crates/levers/src/"
 # The tree's cards.sh only: this test writes its own nvidia-smi below.
 STUB_CARDS_FILE_ONLY=1
 # shellcheck source=tools/ref/depth-stub-cards.sh
@@ -203,8 +231,12 @@ cp "$T/pr27752/llama-bench" "$T/pr27754/llama-bench"
 cp "$ROOT/tools/ref/stub-llama-server.py" "$T/pr27752/llama-server"
 cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # The stub generate_glm5next: --records-schema prints the checked-in schema; --levers prints a line, or
-# under STUB_GEN_NODRAFT=1 with BLOOMERY_DRAFT set refuses it (exit 1), as a run does then; a run appends
-# `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft, times its steps at half under
+# under STUB_GEN_NODRAFT=1 with BLOOMERY_DRAFT set refuses it (exit 1), as a run does then, and so for the
+# variable STUB_GEN_REFUSE names when it is set; a run appends
+# `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft and `draft=<…> residency=<BLOOMERY_RESIDENCY
+# or none> depth=<ids>` to $TMPDIR/stub-gen-env; under BLOOMERY_RESIDENCY it prints a `residency lever`
+# record (why=set) before its plan (none under STUB_GEN_NORESLEVER=1), a `residency pass` of pass none before its feed and one of pass step
+# (kept 10, landed 1, late 0, made 1, bytes 100) after each timed step; it times its steps at half under
 # BLOOMERY_DRAFT=mtp, and prints there an `mtp summary` record when STUB_GEN_MTP_REC=1; it prints the
 # records a timed run prints, the `fed` line left out under
 # STUB_GEN_NOFED=1; its load record names --ctx (STUB_GEN_LOAD_CTX in its stead), its tokens record token 0
@@ -219,6 +251,10 @@ if [ -n "${STUB_GEN_NODRAFT:-}" ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
   echo "Error: BLOOMERY_DRAFT is set, and generate_glm5next does not act on it (stub)" >&2
   exit 1
 fi
+if [ -n "${STUB_GEN_REFUSE:-}" ] && printenv "$STUB_GEN_REFUSE" > /dev/null; then
+  echo "Error: $STUB_GEN_REFUSE is set, and generate_glm5next does not act on it (stub)" >&2
+  exit 1
+fi
 [ "${1:-}" != --levers ] || { echo "lever table (stub)"; exit 0; }
 n=32 place=gate depth=0 ctx=2048
 while [ $# -gt 0 ]; do
@@ -229,9 +265,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "draft=${BLOOMERY_DRAFT:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-draft"
+echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-env"
+rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
+[ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
 echo "load resident_bytes=0 ctx=${STUB_GEN_LOAD_CTX:-$ctx} (stub)"
 echo "capture graph_nodes=1348"
+rp none 0 0 0 0
 [ -n "${STUB_GEN_NOFED:-}" ] || echo "fed ids=$depth first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$depth"
 pms=100.0000 sms=33.0000
 [ "${BLOOMERY_DRAFT:-}" != mtp ] || sms=16.5000
@@ -256,7 +296,7 @@ fi
 echo "step 0 $((depth - 1)) 12 (the $depth fed steps in 0.1 s, runtime value)"
 echo "time prompt n=$depth ms=$pms tok/s=$((depth * 10)).00 passes=$depth kind=steps"
 for i in $(seq 1 $((n - 1))); do echo "step $i $((depth + i - 1)) $((1000 + i))"; done
-for i in $(seq 1 $((n - 1))); do echo "time step $i ms=$sms"; done
+for i in $(seq 1 $((n - 1))); do echo "time step $i ms=$sms"; rp step "$i" 10 1 100; done
 echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${STUB_GEN_TOKEN0:-1000}" || printf ', %s' $((1000 + i)); done)]"
 [ -z "${STUB_GEN_MTP_REC:-}" ] || [ "${BLOOMERY_DRAFT:-}" != mtp ] ||
   echo "mtp summary proposals=3 kept=[1, 1, 1, 1] positions=10 passes=4 tok/s(positions)=200.00"
@@ -510,6 +550,56 @@ elif want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_D
   want mtp-dry "$L" 1 '^\[dry\] round 1 gguf order: 6 oursmtp:6 $'; then
   pass mtp-dry
 fi
+# The lever arms' refusals: each an arm beside a plain 512, refused by name before anything runs.
+REG=tools/ref/../../crates/levers/src/registry.rs
+# refuse_case <name> <arm> <reason> [NAME=VALUE...]: rc 64, the usage line of <arm> ending in ` — <reason>`,
+# nothing past the parse.
+refuse_case() {
+  local name=$1 arm=$2 why=$3 log=$tmp/lever-refuse-$1.log
+  shift 3
+  : > "$tmp/tmp/stub-gen-env"
+  stub_run "$log" BLOOMERY_AB_ROUNDS=1 "$@" -- 512 "$arm"
+  if [ "$RC" != 64 ]; then
+    fail "lever-refuse $name" "rc $RC, want 64" "$log"
+  elif ! grep -F -- "depth-glm5next.sh: arm '$arm' is " "$log" | grep -qF -- " — $why"; then
+    fail "lever-refuse $name" "no usage line of '$arm' ending in: $why" "$log"
+  elif want "lever-refuse $name" "$log" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+    want "lever-refuse $name" "$tmp/tmp/stub-gen-env" 0 '.'; then
+    pass "lever-refuse $name"
+  fi
+}
+refuse_case empty-list '512@' "an empty NAME=VALUE list after '@'"
+refuse_case space '512@BLOOMERY_RESIDENCY=off BLOOMERY_R8=off' "white space in 'BLOOMERY_RESIDENCY=off BLOOMERY_R8=off' (a value holds none)"
+refuse_case empty-item '512@BLOOMERY_RESIDENCY=off,,BLOOMERY_R8=off' "an empty item in 'BLOOMERY_RESIDENCY=off,,BLOOMERY_R8=off' (NAME=VALUE items are separated by one ',')"
+refuse_case not-kv '512@BLOOMERY_RESIDENCY' "'BLOOMERY_RESIDENCY' is no NAME=VALUE (a ',' separates two variables, so a value holds none)"
+refuse_case empty-name '512@=off' "'=off' has an empty name"
+refuse_case empty-value '512@BLOOMERY_RESIDENCY=' "BLOOMERY_RESIDENCY has an empty value"
+refuse_case bad-name '512@1BLOOMERY=off' "'1BLOOMERY' is no variable name"
+refuse_case at-value '512@BLOOMERY_RESIDENCY=mid@p33' "the value of BLOOMERY_RESIDENCY holds '@', which opens an arm's variables"
+refuse_case pipe-value '512@BLOOMERY_RESIDENCY=mid|p33' "the value of BLOOMERY_RESIDENCY holds '|', the separator of this runner's records"
+refuse_case twice '512@BLOOMERY_RESIDENCY=off,BLOOMERY_RESIDENCY=mid-p33-s1' "BLOOMERY_RESIDENCY is given twice"
+refuse_case ref-lcpp 'lcpp27754:512@BLOOMERY_RESIDENCY=off' "'@' sets a lever of ours, and lcpp27754: is a reference engine's arm — a lever of ours is not a reference's"
+refuse_case ref-exl3 'exl3:256@BLOOMERY_RESIDENCY=off' "'@' sets a lever of ours, and exl3: is a reference engine's arm — a lever of ours is not a reference's"
+refuse_case mtp-draft 'oursmtp:512@BLOOMERY_DRAFT=x' "BLOOMERY_DRAFT is the oursmtp arm's own (it sets BLOOMERY_DRAFT=mtp): give the arm its other variables only"
+refuse_case ours-draft '512@BLOOMERY_DRAFT=mtp' "BLOOMERY_DRAFT is the oursmtp arm's own: the drafted arm is oursmtp:512[@…], which sets BLOOMERY_DRAFT=mtp"
+# A name no registry row names, spelt in two parts so check-levers does not read it as one.
+NOPE="BLOOMERY""_NOPE"
+refuse_case no-row "512@$NOPE=1" "$NOPE is no row of the lever registry ($REG): a lever arm sets a lever"
+refuse_case ab-load '512@BLOOMERY_AB_LOAD=arm' "BLOOMERY_AB_LOAD is no lever: its row in $REG is a runner's, a harness's or a path's own variable, not a setting of the binary's"
+refuse_case runner-env '512@BLOOMERY_RESIDENCY=off' "BLOOMERY_RESIDENCY is set in the runner's own environment (BLOOMERY_RESIDENCY=off), which every arm inherits, so the plain arms' labels would not show it: give it per arm only" BLOOMERY_RESIDENCY=off
+
+L=$tmp/lever-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off
+if [ "$RC" != 0 ]; then
+  fail lever-dry "rc $RC, want 0" "$L"
+elif want lever-dry "$L" 1 '^\[dry\] 512@BLOOMERY_RESIDENCY=mid-p33-s1:$' &&
+  want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_RESIDENCY=mid-p33-s1 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
+  want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p33-s1 BLOOMERY_R8=off target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
+  want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
+  want lever-dry "$L" 1 "^\\[dry\\] residency: generate_glm5next's checked-in schema declares no residency lever record: every row of an arm that runs BLOOMERY_RESIDENCY is a FAIL row naming it$" &&
+  want lever-dry "$L" 1 '^\[dry\] round 1 gguf order: 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off $'; then
+  pass lever-dry
+fi
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next"
@@ -725,8 +815,99 @@ PY
     want mtp-lever "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
     pass mtp-lever
   fi
+
+  # The lever arms. A schema copy that declares the residency lever and host records (generate_qwen3moe's)
+  # for lever-pair and mtp-lever-arm; the checked-in one, which declares no residency lever, for lever-res-none.
+  cp "$SCH" "$tmp/schema-glm5next.jsonl"
+  python3 - "$tmp/schema-glm5next.jsonl" "$ROOT/tools/bloomery/schema/generate_qwen3moe.jsonl" "$tmp/schema-glm5next-res.jsonl" << 'PY'
+import json, sys
+glm, qwen, out = sys.argv[1:]
+lines = open(glm).read().splitlines()
+head = json.loads(lines[0])
+have = {json.loads(l).get("kind") for l in lines[1:]}
+kinds = [l for l in open(qwen).read().splitlines()
+         if json.loads(l).get("kind") in ("residency_lever", "residency_host") and json.loads(l).get("kind") not in have]
+head["kinds"] += len(kinds)
+open(out, "w").write("\n".join([json.dumps(head, separators=(",", ":"))] + lines[1:] + kinds) + "\n")
+PY
+  cp "$tmp/schema-glm5next-res.jsonl" "$SCH"
+  L=$tmp/lever-pair.log
+  : > "$tmp/tmp/stub-gen-env"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  cp "$tmp/tmp/stub-gen-env" "$tmp/lever-pair-env.txt"
+  L2=$tmp/mtp-lever-arm.log
+  RC1=$RC
+  : > "$tmp/tmp/stub-gen-env"
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1
+  cp "$tmp/tmp/stub-gen-env" "$tmp/mtp-lever-arm-env.txt"
+  RC2=$RC
+  L3=$tmp/lever-res-nolever.log
+  stub_run "$L3" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NORESLEVER=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  RC3=$RC
+  cp "$tmp/schema-glm5next.jsonl" "$SCH"
+  LV=ours@BLOOMERY_RESIDENCY=mid-p33-s1
+  if [ "$RC1" != 0 ]; then
+    fail lever-pair "rc $RC1, want 0" "$L"
+  elif [ "$(paste -sd' ' "$tmp/lever-pair-env.txt")" != "draft=none residency=none depth=512 draft=none residency=mid-p33-s1 depth=512 draft=none residency=mid-p33-s1 depth=512 draft=none residency=none depth=512" ]; then
+    fail lever-pair "the stub engine's environment per process, want none, mid, mid, none (two loads a round)" "$tmp/lever-pair-env.txt"
+  elif want lever-pair "$L" 1 "^ROW r1 $LV d=512 n=4 ctx=2048 \\| tok/s\\(mean\\) 30\\.30 @ n=4, depth 512, A6000 \\(stub\\) \\| .*\\| residency mid-p33-s1 \\(set\\) passes 3 kept 30 landed 3 late 0 made 3 bytes 300 \\| majflt " &&
+    want lever-pair "$L" 1 "^ROW r2 $LV d=512 .*\\| residency mid-p33-s1 \\(set\\) passes 3 " &&
+    want lever-pair "$L" 2 '^ROW r[12] ours d=512 n=4 ' &&
+    want lever-pair "$L" 0 '^ROW r[12] ours d=512 .*\| residency ' &&
+    want lever-pair "$L" 1 '^mean ours 512 +30\.30 tok/s ' &&
+    want lever-pair "$L" 1 "^mean $LV 512 +30\\.30 tok/s " &&
+    want lever-pair "$L" 1 "^ratio d=512 +ours/$LV +mean 1\\.0000 ± 0\\.0000 \\(n=2\\)  of means 1\\.0000  per round: r1 1\\.0000 r2 1\\.0000$" &&
+    want lever-pair "$L" 1 "^ratio pp p=512 +ours/$LV " &&
+    want lever-pair "$L" 1 "^residency mean $LV d=512 mid-p33-s1: rows 2, passes/row 3\\.0, kept/pass 10\\.00, landed/pass 1\\.000, late/pass 0\\.000, made/pass 1\\.000$" &&
+    want lever-pair "$L" 1 '^residency mean ' &&
+    want lever-pair "$L" 0 '^(FAIL )?xcheck .*ours@' &&
+    want lever-pair "$L" 1 "^\\[config\\] residency: generate_glm5next's checked-in schema declares the residency records: " &&
+    want lever-pair "$L" 0 '^failed arms'; then
+    pass lever-pair
+  fi
+  if [ "$RC2" != 0 ]; then
+    fail mtp-lever-arm "rc $RC2, want 0" "$L2"
+  elif [ "$(paste -sd' ' "$tmp/mtp-lever-arm-env.txt")" != "draft=none residency=none depth=512 draft=mtp residency=mid-p33-s1 depth=512" ]; then
+    fail mtp-lever-arm "the stub engine's environment per process, want the plain arm's none and the oursmtp arm's both" "$tmp/mtp-lever-arm-env.txt"
+  elif want mtp-lever-arm "$L2" 1 '^ROW r1 oursmtp@BLOOMERY_RESIDENCY=mid-p33-s1 d=512 n=4 ctx=2048 \| tok/s\(mean\) 60\.61 @ .*\| residency mid-p33-s1 \(set\) passes 3 kept 30 ' &&
+    want mtp-lever-arm "$L2" 1 '^mean oursmtp@BLOOMERY_RESIDENCY=mid-p33-s1 512 +60\.61 tok/s ' &&
+    want mtp-lever-arm "$L2" 0 '^ratio ' &&
+    want mtp-lever-arm "$L2" 0 '^(FAIL )?xcheck .*oursmtp' &&
+    want mtp-lever-arm "$L2" 0 '^failed arms'; then
+    pass mtp-lever-arm
+  fi
+
+  if [ "$RC3" != 1 ]; then
+    fail lever-res-nolever "rc $RC3, want 1" "$L3"
+  elif want lever-res-nolever "$L3" 1 "^FAIL r1 $LV d=512 rc=0 \\| the arm runs BLOOMERY_RESIDENCY=mid-p33-s1 and printed no residency lever record, which its schema declares \\| full output: " &&
+    want lever-res-nolever "$L3" 1 '^ROW r1 ours d=512 ' &&
+    want lever-res-nolever "$L3" 1 "^failed arms: r1:$LV@d=512$"; then
+    pass lever-res-nolever
+  fi
+
+  L=$tmp/lever-res-none.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  if [ "$RC" != 1 ]; then
+    fail lever-res-none "rc $RC, want 1" "$L"
+  elif want lever-res-none "$L" 1 "^FAIL r1 $LV d=512 rc=0 \\| the arm runs BLOOMERY_RESIDENCY=mid-p33-s1, and generate_glm5next's checked-in schema \\(tools/bloomery/schema/generate_glm5next\\.jsonl\\) declares no residency record, so its row cannot carry them: " &&
+    want lever-res-none "$L" 1 '^ROW r1 ours d=512 ' &&
+    want lever-res-none "$L" 1 "^failed arms: r1:$LV@d=512$" &&
+    want lever-res-none "$L" 1 "^\\[config\\] residency: generate_glm5next's checked-in schema declares no residency lever record: "; then
+    pass lever-res-none
+  fi
+
+  L=$tmp/lever-levers.log
+  : > "$tmp/tmp/stub-gen-env"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_REFUSE=BLOOMERY_R8 -- 512 512@BLOOMERY_R8=off
+  if [ "$RC" != 2 ]; then
+    fail lever-levers "rc $RC, want 2" "$L"
+  elif want lever-levers "$L" 1 '^depth-glm5next.sh: arm 512@BLOOMERY_R8=off: target/release/generate_glm5next refuses BLOOMERY_R8=off \(its --levers under them: Error: BLOOMERY_R8 is set, and generate_glm5next does not act on it \(stub\)\): the arm cannot run as written$' &&
+    want lever-levers "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
+    want lever-levers "$tmp/tmp/stub-gen-env" 0 '.'; then
+    pass lever-levers
+  fi
 else
-  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec and mtp-lever: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none and lever-levers: no prose ids at $PROSE_SRC (the profile pins their sha256)"
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).
