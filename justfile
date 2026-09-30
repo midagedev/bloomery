@@ -1264,12 +1264,12 @@ weekly-gpu-ds41-serve:
 # Qwen3.8's adaptive expert residency on one card (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P from the plan's
 # card experts): the churn pool's host refusal at load, a verify keeping its counted rows only, the same history twice
 # with flips landed, every admitted slot byte for byte a static load's, the passes' kinds and kept rows (the prompt one
-# pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Loads the whole host set: alone
-# in a batch, under the big-load lock.
+# pass keeping 0, each step 1, a verify its accepted rows), and a reset back to the seed. Plan (a) on the A6000 (the
+# gate plans with the A6000 machine). Loads the whole host set: alone in a batch, under the big-load lock.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-residency:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
