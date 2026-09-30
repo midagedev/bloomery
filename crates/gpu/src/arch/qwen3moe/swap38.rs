@@ -63,7 +63,8 @@ impl FileStacks for Qwen38Stacks {
         ]
     }
 
-    fn types(&self) -> &'static [GgmlType] {
+    /// Every layer's stacks hold the same types.
+    fn types(&self, _layer: usize) -> &[GgmlType] {
         &TYPES
     }
 
